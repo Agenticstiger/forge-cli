@@ -15,7 +15,7 @@
 """A credential-bearing request never follows a redirect off its own origin.
 
 The Command Center reporter sends ``X-API-Key`` (and, for a bearer credential,
-``Authorization``) as session headers. ``requests`` follows redirects by
+``Authorization``) as session headers. ``httpx`` follows redirects by
 default and drops only ``Authorization`` when the host changes, so a Command
 Center (or anything in front of it) answering ``307 Location: <elsewhere>``
 used to receive the run, and the key, at the second address. Two real loopback
@@ -28,13 +28,13 @@ OpenMetadata registrars) use httpx with redirects off; the last tests pin that.
 
 from __future__ import annotations
 
-import io
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pytest
+import respx
 
 pytestmark = pytest.mark.unit
 
@@ -168,38 +168,18 @@ def test_the_reporter_still_follows_a_redirect_on_its_own_origin(two_origins):
     assert reporter.stats == {"sent": 2, "failed": 0}
 
 
-class _TlsRedirect:
-    """A requests transport adapter standing in for the TLS hop: answers 307 to ``location``."""
-
-    def __init__(self, location: str) -> None:
-        self.location = location
-
-    def send(self, request: Any, **_kwargs: Any) -> Any:
-        import requests
-
-        response = requests.Response()
-        response.status_code = 307
-        response.reason = "Temporary Redirect"
-        response.headers["Location"] = self.location
-        response.url = request.url
-        response.request = request
-        response.raw = io.BytesIO(b"")
-        response.connection = self
-        return response
-
-    def close(self) -> None:
-        pass
-
-
 def test_the_reporter_does_not_follow_https_down_to_http_on_the_same_host(two_origins):
     _, plain = two_origins
     port = plain.url.rsplit(":", 1)[1]
     reporter = _reporter(f"https://127.0.0.1:{port}")
     # Only the TLS answer is staged; the http hop it redirects to is the real listener.
-    reporter.session.mount(f"https://127.0.0.1:{port}", _TlsRedirect(f"{plain.url}/api/v1/x"))
+    with respx.mock(assert_all_called=False, assert_all_mocked=False) as router:
+        tls = router.route(scheme="https", host="127.0.0.1", port=int(port)).respond(
+            307, headers={"Location": f"{plain.url}/api/v1/x"}
+        )
+        _report_a_run(reporter)
 
-    _report_a_run(reporter)
-
+    assert tls.called
     assert plain.carrying(_KEY, _TOKEN) == []
     assert plain.requests == []
     assert reporter.stats["sent"] == 0

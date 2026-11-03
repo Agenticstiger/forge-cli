@@ -54,25 +54,13 @@ from fluid_build.util.contract import (
 )
 
 if TYPE_CHECKING:
-    import requests as requests_typing
+    import httpx as httpx_typing
 
-    RequestsSession = requests_typing.Session
-    RequestsResponse = requests_typing.Response
+    HttpClient = httpx_typing.Client
+    HttpResponse = httpx_typing.Response
 else:
-    RequestsSession = Any
-    RequestsResponse = Any
-
-try:
-    import requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-
-    REQUESTS_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    requests = None  # type: ignore[assignment]
-    HTTPAdapter = None  # type: ignore[assignment,misc]
-    Retry = None  # type: ignore[assignment,misc]
-    REQUESTS_AVAILABLE = False
+    HttpClient = Any
+    HttpResponse = Any
 
 LOG = logging.getLogger(__name__)
 
@@ -184,13 +172,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             default=False,
         )
 
-        if not REQUESTS_AVAILABLE:
-            raise ProviderError(
-                "The 'requests' library is required for the Data Mesh Manager provider.\n"
-                "Install it with:  pip install requests"
-            )
-
-        self._session_instance: Optional[RequestsSession] = None
+        self._session_instance: Optional[HttpClient] = None
 
     # ---- BaseProvider abstract methods ------------------------------------
 
@@ -1246,19 +1228,21 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
 
     # ---- HTTP helpers -----------------------------------------------------
 
-    def _session(self) -> RequestsSession:
+    def _session(self) -> HttpClient:
+        # Follows redirects, honours the proxy environment and retries 429/5xx on
+        # GET/PUT/DELETE (not POST) with exponential backoff -- what the
+        # ``requests`` session with a urllib3 ``Retry`` did. See util/http_client.
         if self._session_instance is None:
-            s = requests.Session()
-            retry = Retry(
-                total=3,
-                backoff_factor=0.5,
-                status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["GET", "PUT", "DELETE"],
+            from fluid_build.util.http_client import new_client
+
+            self._session_instance = new_client(
+                retry={
+                    "total": 3,
+                    "backoff_factor": 0.5,
+                    "status_forcelist": [429, 500, 502, 503, 504],
+                    "allowed_methods": ["GET", "PUT", "DELETE"],
+                },
             )
-            adapter = HTTPAdapter(max_retries=retry)
-            s.mount("https://", adapter)
-            s.mount("http://", adapter)
-            self._session_instance = s
         return self._session_instance
 
     def _headers(self) -> Dict[str, str]:
@@ -1274,7 +1258,9 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         path: str,
         *,
         json_body: Any = None,
-    ) -> RequestsResponse:
+    ) -> HttpResponse:
+        import httpx
+
         url = f"{self.api_url}{path}"
         self._log.debug("%s %s", method, url)
         try:
@@ -1285,11 +1271,16 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 json=json_body,
                 timeout=_TIMEOUT,
             )
-        except requests.ConnectionError as exc:
+        except (
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            httpx.ProxyError,
+            httpx.ConnectTimeout,  # requests' ConnectTimeout was a ConnectionError first
+        ) as exc:
             raise ProviderError(f"Connection failed: {url} — {exc}") from exc
-        except requests.Timeout as exc:
+        except httpx.TimeoutException as exc:
             raise ProviderError(f"Request timed out: {url}") from exc
-        except requests.RequestException as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise ProviderError(f"HTTP request failed: {url} — {exc}") from exc
 
         if resp.status_code >= 400:

@@ -33,36 +33,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-# NOTE: ``requests`` (~107 modules incl urllib3/certifi/charset_normalizer) is
-# resolved lazily — at import time it would land on the cold ``fluid --help``
-# path (this module is imported at registration). ``_resolve_requests`` performs
-# the import on first use and caches it into the module global, and the PEP 562
-# ``__getattr__`` exposes ``requests`` as a module attribute so the
-# ``patch("…cli.marketplace.requests")`` test seam keeps working. See the A++
-# Light CLI startup card.
-_REQUESTS_UNRESOLVED = object()  # sentinel: import not yet attempted
-
-
-def _resolve_requests():
-    """Import ``requests`` lazily, caching the module (or ``None``) in globals.
-
-    Honors a test ``patch("…cli.marketplace.requests")``: once the module
-    attribute is set, that value is returned unchanged.
-    """
-    current = globals().get("requests", _REQUESTS_UNRESOLVED)
-    if current is not _REQUESTS_UNRESOLVED:
-        return current
-    try:
-        import requests as _requests
-    except ImportError:
-        _requests = None  # type: ignore[assignment]
-    globals()["requests"] = _requests
-    return _requests
+# NOTE: ``httpx`` is imported lazily, inside the functions that make a request:
+# this module is imported at registration, and ``httpx`` must stay off the cold
+# ``fluid --help`` path. The HTTP calls go through ``fluid_build.util.http_client``.
 
 
 def __getattr__(name: str):
-    if name == "requests":
-        return _resolve_requests()
     if name == "get_command_center_client":
         from ._command_center import get_command_center_client
 
@@ -85,10 +61,10 @@ except ImportError:
 from ._common import CLIError
 from .console import cprint
 
-# NOTE: ``get_command_center_client`` lives in ``cli._command_center``, which
-# imports ``requests`` (~107 modules) at module scope. Importing it here eagerly
-# would pull ``requests`` onto the cold ``fluid --help`` path (this module is
-# imported at registration). It's resolved lazily via ``__getattr__`` below — and
+# NOTE: ``get_command_center_client`` lives in ``cli._command_center``.
+# Importing it here eagerly would pull the Command Center client onto the cold
+# ``fluid --help`` path (this module is imported at registration). It's resolved
+# lazily via ``__getattr__`` above — and
 # exposing it as a module attribute keeps the
 # ``patch("…cli.marketplace.get_command_center_client")`` test seam working. See
 # the A++ Light CLI startup card.
@@ -110,19 +86,23 @@ FALLBACK_OPTIONS = {
 console = Console() if RICH_AVAILABLE else None
 
 
-def _requests_exception_type(name: str) -> type[BaseException] | None:
-    """Return a requests exception class, tolerating patched test doubles."""
-    requests = _resolve_requests()
-    exceptions = getattr(requests, "exceptions", None)
-    exc_type = getattr(exceptions, name, None)
-    if isinstance(exc_type, type) and issubclass(exc_type, BaseException):
-        return exc_type
-    return None
+def _http_errors() -> tuple:
+    """What a failed marketplace request raises (``requests.RequestException``'s role)."""
+    import httpx
+
+    return (httpx.HTTPError, httpx.InvalidURL)
 
 
-def _is_requests_exception(exc: BaseException, name: str) -> bool:
-    exc_type = _requests_exception_type(name)
-    return bool(exc_type and isinstance(exc, exc_type))
+def _is_timeout(exc: BaseException) -> bool:
+    import httpx
+
+    return isinstance(exc, httpx.TimeoutException)
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    import httpx
+
+    return isinstance(exc, (httpx.NetworkError, httpx.RemoteProtocolError, httpx.ProxyError))
 
 
 class NamedRegistryURL(str):
@@ -139,19 +119,19 @@ class NamedRegistryURL(str):
     __slots__ = ()
 
 
-# The headers ``requests`` sends on every request of its own accord
-# (``requests.utils.default_headers``,
-# https://github.com/psf/requests/blob/main/src/requests/utils.py). Any other
-# header may carry a credential, and on a hop to another host ``requests``
-# re-derives only ``Authorization`` (``Session.rebuild_auth``) and ``Cookie``
-# (``Session.resolve_redirects``): an ``X-API-Key`` would go on with it. So a
-# request with any other header counts as carrying one.
-_DEFAULT_REQUEST_HEADERS = frozenset({"user-agent", "accept-encoding", "accept", "connection"})
+# The headers ``httpx`` sends on every request of its own accord (``Host``,
+# plus the client defaults in ``httpx._client``). Any other header may carry a
+# credential, and on a hop to another origin ``httpx`` strips only
+# ``Authorization``: an ``X-API-Key`` would go on with it. So a request with
+# any other header counts as carrying one.
+_DEFAULT_REQUEST_HEADERS = frozenset(
+    {"host", "user-agent", "accept-encoding", "accept", "connection"}
+)
 
 
 def _carries_anything(request: Any) -> bool:
-    """Whether a prepared request has a body or a header beyond requests' defaults."""
-    return request.body is not None or any(
+    """Whether a request has a body or a header beyond the client's defaults."""
+    return bool(request.content) or any(
         name.lower() not in _DEFAULT_REQUEST_HEADERS for name in request.headers
     )
 
@@ -160,28 +140,20 @@ def _named_registry_redirect_hook() -> Callable[..., Any]:
     """A response hook for one call to a named registry: ``refuse_foreign_redirect``
     if the call's first request carries a body or a header of its own.
 
-    A call whose first request has neither (only ``requests``' default
+    A call whose first request has neither (only the client's default
     headers) is followed wherever it goes, as main did: nothing in it is the
     operator's. One with a body (the instantiate POST, the operator's
-    parameters) or any other header (Authorization from ``auth`` or
-    ``~/.netrc``, X-API-Key, a cookie the caller passes) still stops at the
-    origin.
+    parameters) or any other header (Authorization from ``~/.netrc``,
+    X-API-Key, a cookie the caller passes) still stops at the origin.
 
-    Judged once, on the first request: ``requests`` runs a call's response
-    hooks on every hop, the first response's first. A later hop's prepared
-    request may carry headers ``requests`` adds of its own accord, none of
-    them the operator's for the next origin, and each recomputed for each
-    next URL: the ``Cookie`` it builds from the call's own jar, which holds
-    the cookies this redirect chain set (``Session.resolve_redirects``;
-    ``requests.get`` uses a fresh session); for an http:// URL, the
-    ``Proxy-Authorization`` of the operator's proxy
-    (``Session.rebuild_proxies``), which goes to the proxy, not the origin;
-    and an ``Authorization`` that ``~/.netrc`` binds to the hop's own host
-    (``Session.rebuild_auth``, which drops it when the host changes).
-    Judging every hop afresh read the first two as the operator's and
-    stopped a registry that set a cookie, or was reached through an
-    authenticated proxy, before it moved host. One hook per call: the
-    verdict belongs to that call's redirect chain.
+    Judged once, on the first request: ``httpx`` runs a call's response hooks
+    on every hop, the first response's first. A later hop's request may carry a
+    ``Cookie`` the client builds of its own accord from the cookies this
+    redirect chain set, none of them the operator's for the next origin;
+    judging every hop afresh read that as the operator's and stopped a registry
+    that set a cookie before it moved host. One hook per call (and one client
+    per call, as ``requests.get`` used a fresh session): the verdict belongs to
+    that call's redirect chain.
     """
     from fluid_build.observability.reporter import refuse_foreign_redirect
 
@@ -198,46 +170,42 @@ def _named_registry_redirect_hook() -> Callable[..., Any]:
 
 
 def _marketplace_request(
-    request_func, url: str, logger: logging.Logger, *, named_registry: bool = False, **kwargs
+    method: str, url: str, logger: logging.Logger, *, named_registry: bool = False, **kwargs
 ):
     """Run a marketplace HTTP request with bounded timeout and one transient retry.
 
-    A redirect is followed only within the marketplace's origin (the
-    reporter's redirect rule, ``refuse_foreign_redirect``, as for the Command
-    Center client's probes): neither a search nor the instantiate POST, which
-    carries the operator's parameters, goes on to another origin. The refusal
-    is raised as a ``RequestException``, which every caller reports.
+    Redirects are followed (as ``requests`` did) but only within the
+    marketplace's origin (the reporter's redirect rule,
+    ``refuse_foreign_redirect``, as for the Command Center client's probes):
+    neither a search nor the instantiate POST, which carries the operator's
+    parameters, goes on to another origin. The refusal is raised as an
+    ``httpx.HTTPError``, which every caller reports.
 
     ``named_registry`` says ``url`` is in a registry the operator named
     (:class:`NamedRegistryURL`), not the Command Center: there a request with
     no body and no header of its own follows a redirect to another origin, as
     on main (:func:`_named_registry_redirect_hook`).
     """
+    import httpx
+
     from fluid_build.observability.reporter import (
         CredentialRedirectRefused,
         refuse_foreign_redirect,
     )
+    from fluid_build.util.http_client import new_client
 
     timeout = kwargs.pop("timeout", MARKETPLACE_HTTP_TIMEOUT_SECONDS)
-    request_error = _requests_exception_type("RequestException") or Exception
-    transient_errors = tuple(
-        exc_type
-        for exc_type in (
-            _requests_exception_type("Timeout"),
-            _requests_exception_type("ConnectionError"),
-        )
-        if exc_type is not None
-    )
 
     for attempt in range(MARKETPLACE_HTTP_RETRIES + 1):
         # A retry is a new redirect chain, judged afresh.
         hook = _named_registry_redirect_hook() if named_registry else refuse_foreign_redirect
         try:
-            return request_func(url, timeout=timeout, hooks={"response": hook}, **kwargs)
+            with new_client(timeout=timeout, response_hooks=[hook]) as client:
+                return client.request(method, url, **kwargs)
         except CredentialRedirectRefused as exc:
-            raise request_error(f"not following the redirect: {exc}") from exc
-        except request_error as exc:
-            is_transient = bool(transient_errors and isinstance(exc, transient_errors))
+            raise httpx.HTTPError(f"not following the redirect: {exc}") from exc
+        except _http_errors() as exc:
+            is_transient = _is_timeout(exc) or _is_connection_error(exc)
             if not is_transient or attempt >= MARKETPLACE_HTTP_RETRIES:
                 raise
             logger.warning("Marketplace request failed transiently; retrying once: %s", exc)
@@ -246,22 +214,20 @@ def _marketplace_request(
 
 
 def _marketplace_get(url: str, logger: logging.Logger, **kwargs):
-    requests = _resolve_requests()
-    return _marketplace_request(requests.get, url, logger, **kwargs)
+    return _marketplace_request("GET", url, logger, **kwargs)
 
 
 def _marketplace_post(url: str, logger: logging.Logger, **kwargs):
-    requests = _resolve_requests()
-    return _marketplace_request(requests.post, url, logger, **kwargs)
+    return _marketplace_request("POST", url, logger, **kwargs)
 
 
 def _format_marketplace_error(exc: BaseException) -> str:
-    if _is_requests_exception(exc, "Timeout"):
+    if _is_timeout(exc):
         return (
             "Marketplace API request timed out after "
             f"{MARKETPLACE_HTTP_TIMEOUT_SECONDS}s. Check the API URL or try again."
         )
-    if _is_requests_exception(exc, "ConnectionError"):
+    if _is_connection_error(exc):
         return "Could not connect to the marketplace API. Check Command Center or FLUID_API_URL."
 
     response = getattr(exc, "response", None)
@@ -538,7 +504,6 @@ def _bundled_blueprints_matching(args) -> list:
 
 def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
     """Search marketplace blueprints (bundled + registry)."""
-    requests = _resolve_requests()
     # ``--format json`` (mirrors the catalog discovery path in market.py): emit a
     # clean machine-parseable array on stdout and suppress every decorative print
     # so a script piping the output gets pure JSON, no rich-table contamination.
@@ -582,7 +547,7 @@ def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
             data = response.json()
             registry = data.get("items", [])
             registry_total = data.get("total", len(registry))
-        except requests.exceptions.RequestException as e:
+        except _http_errors() as e:
             message = _format_marketplace_error(e)
             # A bundled-only result is still useful; only hard-fail when there
             # is nothing at all to show.
@@ -669,7 +634,6 @@ def search_blueprints(args, logger: logging.Logger, api_url: str) -> int:
 
 def show_blueprint_info(args, logger: logging.Logger, api_url: str) -> int:
     """Show detailed blueprint information."""
-    requests = _resolve_requests()
     console.print(f"[cyan]ℹ️  Fetching blueprint: {args.blueprint_id}...[/cyan]\n")
 
     from fluid_build.cli._market_bundled_blueprints import get_bundled_blueprint, is_bundled
@@ -690,7 +654,7 @@ def show_blueprint_info(args, logger: logging.Logger, api_url: str) -> int:
             )
             response.raise_for_status()
             bp = response.json()
-        except requests.exceptions.RequestException as e:
+        except _http_errors() as e:
             message = _format_marketplace_error(e)
             console.print(f"[red]❌ {message}[/red]")
             logger.error("Failed to get blueprint info: %s", message, exc_info=True)
@@ -787,7 +751,6 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
         render_bundled_contract,
     )
 
-    requests = _resolve_requests()
     console.print(f"[cyan]⚙️  Instantiating blueprint: {args.blueprint_id}...[/cyan]\n")
 
     bundled_bp = get_bundled_blueprint(args.blueprint_id) if is_bundled(args.blueprint_id) else None
@@ -805,7 +768,7 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
             )
             response.raise_for_status()
             bp = response.json()
-        except requests.exceptions.RequestException as e:
+        except _http_errors() as e:
             message = _format_marketplace_error(e)
             console.print(f"[red]❌ Failed to fetch blueprint: {message}[/red]")
             logger.error("Failed to fetch blueprint: %s", message, exc_info=True)
@@ -859,7 +822,7 @@ def instantiate_blueprint(args, logger: logging.Logger, api_url: str) -> int:
             result = response.json()
             contract = result["contract"]
             cost_estimate = result.get("cost_estimate", "N/A")
-        except requests.exceptions.RequestException as e:
+        except _http_errors() as e:
             message = _format_marketplace_error(e)
             console.print(f"[red]❌ Failed to instantiate blueprint: {message}[/red]")
             logger.error("Blueprint instantiation failed: %s", message, exc_info=True)

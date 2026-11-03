@@ -15,8 +15,9 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
-import requests
+import respx
 
 from fluid_build.cli.datamesh_manager import _cmd_publish, _publish_exit_code
 from fluid_build.providers.base import ProviderError
@@ -704,14 +705,14 @@ def test_cmd_publish_fail_on_contract_error_returns_non_zero():
 
 def test_request_wraps_retry_error_as_provider_error():
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
-    session = MagicMock()
-    session.request.side_effect = requests.exceptions.RetryError("too many 500 responses")
-    provider._session_instance = session
 
-    with pytest.raises(ProviderError) as excinfo:
-        provider._request("PUT", "/api/datacontracts/x.y", json_body={"id": "x.y"})
+    with respx.mock() as router:
+        route = router.put("https://api.entropy-data.com/api/datacontracts/x.y").respond(500)
+        with pytest.raises(ProviderError) as excinfo:
+            provider._request("PUT", "/api/datacontracts/x.y", json_body={"id": "x.y"})
 
     assert "HTTP request failed" in str(excinfo.value)
+    assert route.call_count > 1  # the 500s were retried before giving up
 
 
 def test_provider_rejects_plain_http_remote_api_url():
@@ -723,13 +724,13 @@ def test_provider_rejects_plain_http_remote_api_url():
 
 def test_request_redacts_secret_like_error_body():
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
-    response = MagicMock(status_code=403, text='{"api_key":"ed_live_supersecret"}')
-    session = MagicMock()
-    session.request.return_value = response
-    provider._session_instance = session
 
-    with pytest.raises(ProviderError) as excinfo:
-        provider._request("PUT", "/api/dataproducts/x", json_body={"id": "x"})
+    with respx.mock() as router:
+        router.put("https://api.entropy-data.com/api/dataproducts/x").mock(
+            return_value=httpx.Response(403, text='{"api_key":"ed_live_supersecret"}')
+        )
+        with pytest.raises(ProviderError) as excinfo:
+            provider._request("PUT", "/api/dataproducts/x", json_body={"id": "x"})
 
     message = str(excinfo.value)
     assert "ed_live_supersecret" not in message

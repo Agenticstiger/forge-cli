@@ -131,7 +131,7 @@ def moto_endpoint(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     ``/moto-api/reset`` admin endpoint clears them, giving each test the clean
     account it expects.
     """
-    import requests
+    import httpx
     from moto.server import ThreadedMotoServer
 
     server = ThreadedMotoServer(port=0, verbose=False)
@@ -141,7 +141,7 @@ def moto_endpoint(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         endpoint = f"http://127.0.0.1:{port}"
         monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint)
         with contextlib.suppress(Exception):
-            requests.post(f"{endpoint}/moto-api/reset", timeout=5)
+            httpx.post(f"{endpoint}/moto-api/reset", timeout=5)
         yield endpoint
     finally:
         server.stop()

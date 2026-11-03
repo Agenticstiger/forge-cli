@@ -1034,6 +1034,23 @@ class TestBuildSearchFiltersExtra:
 # ---------------------------------------------------------------------------
 
 
+def _cc_filters(query):
+    """The attributes the Command Center connector reads off a filter object."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        query=query,
+        domains=[],
+        owners=[],
+        tags=[],
+        layers=[],
+        statuses=[],
+        min_quality_score=0,
+        limit=None,
+        offset=None,
+    )
+
+
 class TestCommandCenterConnectorConnect:
     """``_connect_impl`` reaches ``fluid_build.cli._command_center``.
 
@@ -1054,40 +1071,132 @@ class TestCommandCenterConnectorConnect:
         cc.get_catalog_url.return_value = self._URL
         return cc
 
-    def _connect(self, cc):
+    def _connect(self, cc, *, then=None):
+        """Connect the real connector; ``then`` (a coroutine function taking the
+        connector) runs on the same loop, before the session is closed."""
         from fluid_build.cli.market_catalogs.command_center import CommandCenterConnector
+        from fluid_build.util import http_client
 
         connector = CommandCenterConnector({}, logging.getLogger("test_cc_connector"))
-        # aiohttp is only a transitive dependency; stub it so this test pins
-        # the client import, not whether aiohttp happens to be installed.
-        fake_aiohttp = MagicMock()
+
+        async def scenario():
+            ok = await connector._connect_impl()
+            result = await then(connector) if then and ok else None
+            if getattr(connector, "session", None) is not None:
+                await connector.session.aclose()
+            return ok, result
+
         with (
             patch(
                 "fluid_build.cli._command_center.get_command_center_client",
                 return_value=cc,
             ) as factory,
-            patch.dict("sys.modules", {"aiohttp": fake_aiohttp}),
+            patch(
+                "fluid_build.util.http_client.new_async_client",
+                wraps=http_client.new_async_client,
+            ) as new_client,
         ):
-            ok = _run(connector._connect_impl())
-        return ok, connector, factory, fake_aiohttp
+            ok, result = _run(scenario())
+        return ok, connector, factory, new_client, result
 
     def test_connects_through_the_cli_command_center_client(self, caplog):
+        import httpx
+
+        from fluid_build.observability.reporter import refuse_foreign_redirect
+
         cc = self._client()
         with caplog.at_level(logging.INFO, logger="test_cc_connector"):
-            ok, connector, factory, fake_aiohttp = self._connect(cc)
+            ok, connector, factory, new_client, _ = self._connect(cc)
 
         assert "Failed to import Command Center client" not in caplog.text
         assert ok is True
         factory.assert_called_once()
         assert connector.cc_client is cc
         assert connector.base_url == self._URL
-        assert connector.session is fake_aiohttp.ClientSession.return_value
+        assert isinstance(connector.session, httpx.AsyncClient)
+        # The session refuses a redirect to another origin (the reporter's rule).
+        new_client.assert_called_once()
+        assert new_client.call_args.kwargs["response_hooks"] == [refuse_foreign_redirect]
 
     def test_catalog_unavailable_is_reported_as_such(self, caplog):
         with caplog.at_level(logging.INFO, logger="test_cc_connector"):
-            ok, _connector, factory, _aiohttp = self._connect(self._client(catalog=False))
+            ok, _connector, factory, new_client, _ = self._connect(self._client(catalog=False))
 
         assert ok is False
         factory.assert_called_once()
+        new_client.assert_not_called()
         assert "Failed to import Command Center client" not in caplog.text
         assert "Command Center catalog not available" in caplog.text
+
+    def test_search_sends_the_query_and_maps_an_empty_catalog(self):
+        import httpx
+        import respx
+
+        async def search(connector):
+            return await connector._search_data_products_impl(_cc_filters("orders"))
+
+        with respx.mock(assert_all_called=False) as router:
+            route = router.get(self._URL).mock(return_value=httpx.Response(200, json={"items": []}))
+            ok, _connector, _factory, _new_client, products = self._connect(
+                self._client(), then=search
+            )
+
+        assert ok is True
+        assert route.call_count == 1
+        assert route.calls.last.request.url.params["query"] == "orders"
+        assert products == []
+
+    def test_search_non_200_returns_no_products(self):
+        import httpx
+        import respx
+
+        async def search(connector):
+            return await connector._search_data_products_impl(_cc_filters(None))
+
+        with respx.mock(assert_all_called=False) as router:
+            router.get(self._URL).mock(return_value=httpx.Response(503))
+            ok, _connector, _factory, _new_client, products = self._connect(
+                self._client(), then=search
+            )
+
+        assert ok is True
+        assert products == []
+
+    def test_stats_come_back_as_the_catalog_json(self):
+        import httpx
+        import respx
+
+        stats = {"total_products": 3, "total_domains": 2, "avg_quality_score": 0.9}
+
+        async def get_stats(connector):
+            return await connector._get_catalog_stats_impl()
+
+        with respx.mock(assert_all_called=False) as router:
+            router.get(f"{self._URL}/stats").mock(return_value=httpx.Response(200, json=stats))
+            _ok, _c, _f, _n, result = self._connect(self._client(), then=get_stats)
+
+        assert result == stats
+
+    def test_search_refuses_a_redirect_to_another_origin(self):
+        import httpx
+        import respx
+
+        async def search(connector):
+            return await connector._search_data_products_impl(_cc_filters(None))
+
+        with respx.mock(assert_all_called=False) as router:
+            router.get(self._URL).mock(
+                return_value=httpx.Response(
+                    302, headers={"Location": "https://elsewhere.example.test/collect"}
+                )
+            )
+            other = router.get("https://elsewhere.example.test/collect").mock(
+                return_value=httpx.Response(200, json={"items": []})
+            )
+            ok, _connector, _factory, _new_client, products = self._connect(
+                self._client(), then=search
+            )
+
+        assert ok is True
+        assert products == []
+        assert other.call_count == 0

@@ -46,14 +46,23 @@ from fluid_build.observability.reporter import (
 # the same host moved up to https): the reporter's redirect rule. A Command
 # Center that answers with a redirect to another origin, a private or a cloud
 # metadata address included, is not followed there.
-_PROBE_HOOKS = {"response": refuse_foreign_redirect}
+_PROBE_HOOKS = [refuse_foreign_redirect]
 
-try:
-    import requests
 
-    REQUESTS_AVAILABLE = True
-except ImportError:
-    REQUESTS_AVAILABLE = False
+def _probe(method: str, url: str, *, timeout: float, **kwargs: Any) -> Any:
+    """One probe request: a fresh client, the redirect rule on every hop.
+
+    Imported lazily: ``httpx`` stays off the cold ``fluid --help`` path. A HEAD
+    does not follow redirects (as ``requests.head`` did not); a GET does.
+    """
+    from fluid_build.util.http_client import new_client
+
+    with new_client(
+        timeout=timeout,
+        response_hooks=_PROBE_HOOKS,
+        follow_redirects=method.upper() != "HEAD",
+    ) as client:
+        return client.request(method, url, **kwargs)
 
 
 @dataclass
@@ -182,10 +191,6 @@ class CommandCenterClient:
         Performs a health check and queries available endpoints.
         Sets self.available and self.features.
         """
-        if not REQUESTS_AVAILABLE:
-            self.logger.warning("requests library not available, skipping Command Center detection")
-            return
-
         # The reporter's host gate, before any request leaves the process:
         # the URL is user/config-supplied, and the credential goes to it
         # elsewhere. The warning names the origin only.
@@ -199,10 +204,12 @@ class CommandCenterClient:
             self.available = False
             return
 
+        import httpx  # lazy: off the cold --help path
+
         try:
             # Quick health check with timeout
             health_url = f"{self.url}/health"
-            response = requests.get(health_url, timeout=2, hooks=_PROBE_HOOKS)
+            response = _probe("GET", health_url, timeout=2)
 
             if response.status_code == 200:
                 self.available = True
@@ -214,11 +221,11 @@ class CommandCenterClient:
                 self.logger.debug(f"Command Center health check failed: {response.status_code}")
                 self.available = False
 
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             self.logger.debug(f"Command Center health check timeout: {self.url}")
             self.available = False
 
-        except requests.exceptions.ConnectionError:
+        except (httpx.NetworkError, httpx.RemoteProtocolError, httpx.ProxyError):
             self.logger.debug(f"Command Center not reachable: {self.url}")
             self.available = False
 
@@ -264,7 +271,7 @@ class CommandCenterClient:
             url = f"{self.url}{endpoint}"
 
             # Try HEAD request first (faster)
-            response = requests.head(url, timeout=1, hooks=_PROBE_HOOKS)
+            response = _probe("HEAD", url, timeout=1)
 
             # 200 OK or 405 Method Not Allowed (HEAD not supported but endpoint exists)
             if response.status_code in (200, 405):
@@ -275,7 +282,7 @@ class CommandCenterClient:
                 return False
 
             # For other status codes, try GET with limit
-            response = requests.get(url, params={"limit": 1}, timeout=1, hooks=_PROBE_HOOKS)
+            response = _probe("GET", url, timeout=1, params={"limit": 1})
             return response.status_code in (200, 401, 403)  # Exists (may need auth)
 
         except Exception as e:
@@ -290,7 +297,7 @@ class CommandCenterClient:
             Version string or "unknown"
         """
         try:
-            response = requests.get(f"{self.url}/api/v1/version", timeout=1, hooks=_PROBE_HOOKS)
+            response = _probe("GET", f"{self.url}/api/v1/version", timeout=1)
             if response.status_code == 200:
                 data = response.json()
                 return data.get("version", "unknown")

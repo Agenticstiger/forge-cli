@@ -25,11 +25,6 @@ from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urljoin, urlparse, urlsplit
 
-try:
-    import requests
-except ImportError:
-    requests = None  # type: ignore
-
 # Reuse the canonical SSRF post-DNS-resolution gate (RFC1918,
 # link-local 169.254.0.0/16 — AWS/GCP metadata — loopback, reserved;
 # fails closed on DNS errors). Sourced from the tier-0 ``_net`` module
@@ -171,8 +166,8 @@ def credential_redirect_refusal(source: str, target: str) -> Optional[str]:
 
     ``None`` when it may: ``target`` (absolute) is on the same origin (scheme,
     host and port), or is the same host moved from http to https on the
-    default ports, the one cross-origin hop for which ``requests`` keeps
-    ``Authorization`` (``should_strip_auth``). Every other hop is refused
+    default ports, the one cross-origin hop for which the HTTP client keeps
+    ``Authorization``. Every other hop is refused
     rather than followed with the credential stripped: the request body is the
     run's report, which is not for another origin either. An https request is
     never followed down to http.
@@ -193,60 +188,28 @@ def credential_redirect_refusal(source: str, target: str) -> Optional[str]:
 
 
 def refuse_foreign_redirect(response: Any, *_args: Any, **_kwargs: Any) -> Any:
-    """A ``requests`` response hook: raise :class:`CredentialRedirectRefused` for
-    a redirect :func:`credential_redirect_refusal` refuses, before it is followed.
+    """An ``httpx`` ``response`` event hook: raise :class:`CredentialRedirectRefused`
+    for a redirect :func:`credential_redirect_refusal` refuses, before it is followed.
 
-    ``requests`` runs a request's response hooks on every hop, so passing
-    ``hooks={"response": refuse_foreign_redirect}`` to one call guards that
-    call; :func:`guard_credential_redirects` installs it on a whole session.
+    ``httpx`` runs a client's ``response`` hooks on every hop, so a client built
+    with ``response_hooks=[refuse_foreign_redirect]``
+    (:func:`fluid_build.util.http_client.new_client`) guards every request it
+    makes, and the hook sees each redirect before the client follows it.
     """
     if not response.is_redirect:
         return response
-    target = urljoin(response.url, response.headers.get("location", ""))
-    refusal = credential_redirect_refusal(response.url, target)
+    source = str(response.url)
+    target = urljoin(source, response.headers.get("location", ""))
+    refusal = credential_redirect_refusal(source, target)
     if refusal is None:
         return response
-    response.close()
+    try:
+        response.close()
+    except RuntimeError:
+        # An async client's stream cannot be closed synchronously; the async
+        # wrapper (util.http_client.new_async_client) closes it with aclose().
+        pass
     raise CredentialRedirectRefused(refusal)
-
-
-def guard_credential_redirects(session: Any) -> Any:
-    """Make ``session`` (a ``requests.Session``) refuse a redirect its credentials may not follow.
-
-    ``requests`` follows redirects by default and, when the host changes, drops
-    only ``Authorization``: a credential in any other header (``X-API-Key``)
-    went on to wherever the endpoint redirected. A response hook
-    (:func:`refuse_foreign_redirect`) sees every hop before ``requests``
-    follows it, and raises :class:`CredentialRedirectRefused` for one
-    :func:`credential_redirect_refusal` refuses. Returns ``session``.
-    """
-    session.hooks["response"].append(refuse_foreign_redirect)
-    return session
-
-
-def foreign_redirect_trace_config() -> Any:
-    """An ``aiohttp.TraceConfig`` that refuses what :func:`refuse_foreign_redirect` refuses.
-
-    The same rule for an ``aiohttp.ClientSession``, which follows redirects by
-    default: built with ``trace_configs=[foreign_redirect_trace_config()]``, a
-    session raises :class:`CredentialRedirectRefused` for every hop
-    :func:`credential_redirect_refusal` refuses, on every request it makes,
-    before ``aiohttp`` follows it.
-    """
-    import aiohttp
-
-    async def _on_redirect(_session: Any, _context: Any, params: Any) -> None:
-        response = params.response
-        source = str(response.url)
-        location = response.headers.get("Location") or response.headers.get("URI") or ""
-        refusal = credential_redirect_refusal(source, urljoin(source, location))
-        if refusal is not None:
-            response.close()
-            raise CredentialRedirectRefused(refusal)
-
-    trace = aiohttp.TraceConfig()
-    trace.on_request_redirect.append(_on_redirect)
-    return trace
 
 
 class CircuitState(Enum):
@@ -339,7 +302,7 @@ class CircuitBreaker:
             self.last_failure_time = time.time()
 
             if self.state == CircuitState.HALF_OPEN:
-                # The type only: a requests exception's text repeats the URL.
+                # The type only: an HTTP client exception's text repeats the URL.
                 logger.warning(
                     "Circuit breaker transitioning HALF_OPEN → OPEN (recovery failed: %s)",
                     type(error).__name__,
@@ -409,23 +372,19 @@ class CommandCenterReporter:
         # Session for connection pooling. Every request carries the credential,
         # so a redirect is followed only within the endpoint's own origin.
         self.session: Optional[Any] = None
-        if self.enabled and requests:
-            self.session = guard_credential_redirects(requests.Session())
+        if self.enabled:
+            from fluid_build.util.http_client import new_client
+
             headers = {"Content-Type": "application/json"}
             if config.api_key:
                 headers["X-API-Key"] = config.api_key
             headers.update(config.headers or {})
-            self.session.headers.update(headers)
+            self.session = new_client(headers=headers, response_hooks=[refuse_foreign_redirect])
 
     def start(self):
         """Start background worker thread."""
         if not self.enabled:
             logger.debug("Command Center not configured, reporter disabled")
-            return
-
-        if not requests:
-            logger.warning("requests library not installed, Command Center integration disabled")
-            self.enabled = False
             return
 
         # SSRF gate: ``config.url`` is user/config-supplied and every
@@ -669,7 +628,7 @@ class CommandCenterReporter:
                 # Its text names the origins only.
                 outcome = f"not followed, {e}"
             else:
-                # The type and the status only: a requests exception's text
+                # The type and the status only: an HTTP client exception's text
                 # repeats the URL, and nothing here needs the response body.
                 status = getattr(getattr(e, "response", None), "status_code", None)
                 outcome = str(status or type(e).__name__)
