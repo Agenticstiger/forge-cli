@@ -277,6 +277,15 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Run 'fluid plan <contract>' and inspect the emitted plan for the failing action"],
         None,
     ),
+    "opentofu_apply_failed": (
+        [
+            "OpenTofu records state as it goes, so resources created before the failure are "
+            + "normally tracked",
+            "Fix the cause named above, then re-run 'fluid apply' to continue",
+            "Re-run with --debug to see the raw tofu output",
+        ],
+        None,
+    ),
     "opentofu_adoption_failed": (
         [
             "Check the provider credentials and network access, then re-run 'fluid apply'",

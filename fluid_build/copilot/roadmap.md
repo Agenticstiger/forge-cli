@@ -1,13 +1,15 @@
 # forge-cli roadmap
 
-forge-cli v1.0 shipped 2026-04-23. The Lean v1 scope previewed several v1.1+
-milestones early; they are listed under "Shipped in v1.0" below and have been
-retargeted out of the upcoming-milestone track so the banner and `fluid
-roadmap` point at the next truly unshipped milestone.
+forge-cli is a 0.x Beta release. The "v1.0" milestones below are internal roadmap
+labels: the Lean v1 scope was completed 2026-04-23, but no 1.0 package has been
+published. The Lean v1 scope previewed several v1.1+ milestones early; they are
+listed under "Completed in the Lean v1 milestone" below and have been retargeted out of the
+upcoming-milestone track so the banner and `fluid roadmap` point at the next
+truly unshipped milestone.
 
-## Shipped in v1.0 (previewed from v1.1+ roadmap)
+## Completed in the Lean v1 milestone (previewed from v1.1+ roadmap)
 
-The following milestones were pulled forward into v1.0 and need no further
+The following milestones were pulled forward into the Lean v1 milestone and need no further
 work:
 
 - **v1.1 — Team Collaboration** · shared cache backends (`SqliteBackend`,
@@ -22,11 +24,11 @@ work:
   favour of `LogicalAgent`.
 - **v1.4 — Richer CLI Surface** · `fluid forge data-model diff`,
   `--emit-dimensional-variants`, `--emit-ddl-dir`, `--emit-osi-sidecar`
-  (default on), and `--deterministic` all ship in v1.0.
+  (default on), and `--deterministic` all landed in the Lean v1 milestone.
 
 ### v1.0.1 follow-up (landed 2026-04-24)
 
-Sprint-local hardening that shipped the day after v1.0, driven by live
+Sprint-local hardening that landed the day after the Lean v1 milestone, driven by live
 Phase-4 Gemini integration findings:
 
 - **Retry envelope on every staged LLM call** — `BaseStageAgent.call()`
@@ -140,7 +142,7 @@ below. Directive from the user: "nothing left behind."
 ### V1 world-class hardening (landed 2026-04-25)
 
 Closes the rest of the original-plan gaps that were "shipped without
-tests" and pins the v1.0 public API surface so v1.x users can rely on
+tests" and pins the Lean v1 public API surface so later 1.x users can rely on
 their imports surviving any internal refactor.
 
 - **Plan gap A2 closed** — `forge_datamodel/dv2/hash_keys.py` and

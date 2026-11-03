@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid doctor --strict` turns the "Action needed" summary into exit 1.** `fluid doctor` printed
+  "Action needed" for a copilot that is not ready and still exited 0, so a CI gate could not tell.
+  With `--strict` it exits 1 whenever the summary says "Action needed", in the text report and with
+  `--json`, whose payload now carries `action_needed` and `copilot_ready`. The default exit code is
+  unchanged, and `--strict` has no effect with `--features-only`, which prints no summary.
+
 - **`fluid publish` tells the Command Center which workspace holds a Databricks table.** The
   product's `metadata.workspace_host` is now `https://<host>[:port]` taken from `DATABRICKS_HOST`,
   normalised and checked as the provider checks it (https, or plain http only to a loopback
@@ -17,6 +23,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not acceptable, malformed or carrying user-info (`https://{user}:{password}@host`), when the expose is
   not Databricks, and when the checkout's project config named the endpoint (the runner's
   environment is not the checkout's to send, as for `{{ env.* }}` and the operator's credential).
+
+- **A Databricks contract's column restrictions and row filters are enforced by Unity Catalog,
+  where they were refused.** `exposes[].policy.authz.columnRestrictions` and `rowFilters` were
+  `databricks-governance-unmapped`; they are now SQL functions bound on the table, so a query
+  by a restricted principal is rewritten by the engine whichever tool sends it, with the
+  semantics GCP and AWS give the same fields. `access: deny` becomes a mask that returns NULL
+  for the principal: Unity Catalog has no column-level grant, so a denied column stays listed
+  in the table's schema and reads NULL (the founder accepted that). `access: mask` returns
+  `last_four` (`XXXXX` and the last four characters), `first_four`, or NULL for `nullify`; a
+  value of four characters or fewer is its SHA-256 and a NULL stays NULL, as on AWS. One mask
+  per column (the Unity Catalog limit) combines every restriction on it, a principal in a deny
+  and a mask gets the deny, and everyone else reads the value. A mask rule belongs to the
+  principal that names it, not to the column (on Databricks a column may be masked by
+  `nullify` for one principal and `last_four` for another; GCP and AWS still refuse that): the
+  function has one branch per rule, strictest first (deny, `nullify`, `first_four`,
+  `last_four`), so a member of several groups gets the strictest that matches, and each text
+  rule is type-checked against the column. One row filter per table: its
+  principals' members read the union of those principals' predicates, everyone else every row.
+  Logical principals resolve through `binding.principals`, and every resolved identity is
+  tested both ways, `(is_account_group_member('<name>') OR current_user() = '<name>')`,
+  whatever the principal's prefix: a `group:` principal may be mapped to a service principal's
+  application ID or a user's email, and a test of the wrong kind would match no one while the
+  grant to that identity still applied (a name that is both a group and a user is restricted
+  either way, which errs closed). A principal with no prefix or a `domain:` one is
+  `databricks-principal-kind`, and `access: allow` (which would blind every reader it does not
+  name, the owner and the pipelines included), a text mask on a non-string column
+  (`databricks-mask-type`) and anything else this cannot express are refused rather than
+  dropped. A predicate is contract text that becomes a function body, so it is parsed as one
+  boolean expression (sqlglot, Databricks dialect), checked node by node against an allowlist
+  (comparisons, `AND` / `OR` / `NOT`, `IS NULL`, `IN`, `BETWEEN`, `LIKE`, literals, `CAST`, the
+  table's columns and `lower`, `upper`, `length`, `trim`, `coalesce`, `abs`) and written back
+  from the tree, never spliced: a `;`, a comment, a subquery, a session function such as
+  `current_user()`, an undeclared column or a predicate that reads no column is
+  `databricks-row-filter-invalid`. The functions are created once, as `CREATE FUNCTION IF NOT
+  EXISTS ... fluid_rf_<table>_<hash8>` and `fluid_mask_<table>_<column>_<hash8>`, named by a
+  hash of their definition: Unity Catalog refuses to replace a function a filter or mask uses,
+  so a changed predicate or rule is a new function bound in place of the old one, and the same
+  contract always names the same function. Superseded functions are not dropped (harmless
+  metadata; cleaning them up is a follow-up). The provider (1.140.0) has no function resource
+  and no mask or filter attribute on `databricks_sql_table` (terraform-provider-databricks#4550),
+  so `ALTER TABLE ... SET ROW FILTER ... ON (...)` and `ALTER COLUMN ... SET MASK` run on the
+  SQL warehouse (`DATABRICKS_WAREHOUSE_ID`) through the SQL Statement Execution API, outside
+  OpenTofu, in two hooks `fluid apply` calls around `tofu apply`: a `pre_apply` that binds the
+  tables that already exist, so a grant the apply adds lands on a protected table, and a
+  `post_apply` that binds the tables the apply created, empty. Databricks keeps a table's row
+  filter and masks across the `CREATE OR REPLACE TABLE` a dbt build runs (its docs say so), so
+  rebuilds keep them. The live bindings are read from the Tables API and only what differs
+  runs, so a second apply executes no statement; `--mode dry-run` prints the statements and
+  runs none. A restriction removed from the contract is dropped (`DROP ROW FILTER`, `DROP
+  MASK`) after the apply, printed as an access-widening change and not gated as data loss; only
+  a filter or mask whose function carries this module's name prefix is ever dropped, so one an
+  admin set by hand is left alone, and one is never replaced silently either: where the contract
+  asks for its own row filter or mask and the table has one whose function lacks the `fluid_`
+  prefix, the run stops before any change, on any table, naming the table, the column and the
+  live function (remove it, or move its rule into the contract). A content-hashed name can be
+  computed from the contract, so anyone with `CREATE FUNCTION` on the schema could take it first
+  with a body that returns the value unmasked, and `CREATE FUNCTION IF NOT EXISTS` would keep
+  theirs: after each create and before any bind the function is read
+  (`GET /api/2.1/unity-catalog/functions/{name}`) and its owner (the identity the run
+  authenticates as, `userName` of `scim/v2/Me`, who `CREATE FUNCTION` makes the owner), body,
+  parameters and return type must be the expected ones, whitespace-normalised; a mismatch is
+  not bound and is printed with what differs. It fails closed: a pre-apply failure stops the run
+  before `tofu apply`. When `post_apply` cannot bind a table (a failed statement, a hostile
+  function, a row filter set by hand, or a Tables API read that fails, which is tried per table
+  so one 503 does not stop the others), it binds a fixed-purpose deny-all row filter for the
+  restricted identities (a zero-column function, `RETURN NOT <any restricted identity>`, bound
+  `ON ()`, content-hashed and checked like the others), which blocks them whatever grant path
+  gives them the table: a group they are also in, a schema or catalog grant. If that cannot be
+  bound, or would replace a row filter not made here, it revokes `SELECT` (and `ALL PRIVILEGES`)
+  on the table from every grantee but its owner, listed through the permissions API, and names
+  every path still open, a grant on the schema or catalog that a table-level `REVOKE` cannot
+  close, with the statement to run. The message says exactly what was done, and the run exits
+  non-zero. The same bind-only pass runs when `tofu apply` itself fails part way, before the
+  apply's own error is raised: a table the apply created, its grants and the dbt job that fills
+  it can exist with no mask or filter. It binds what exists, closes what it cannot bind, skips a
+  table that was never created and drops nothing (dropping widens access and waits for an apply
+  that succeeded); a failure there is printed and the run still exits with
+  `opentofu_apply_failed`. When a row filter needs a column the apply adds, `pre_apply` holds the
+  table, which has rows, behind the same deny-all filter until `post_apply` binds the real one.
+  A dbt job that writes a restricted table which is not yet protected (the table is missing, a
+  binding is missing or differs, a bound function is not the expected one, or the live state
+  cannot be read) is created with `pause_status: PAUSED` on its schedule or continuous block,
+  so it cannot fill the table before it is bound; the next `fluid apply`, once the bindings
+  match, unpauses it in place, with no drift from unpausing it by hand, and the apply says so
+  (an explicit run-now works meanwhile). A manual job has nothing to pause, and `fluid validate`
+  and the pure compile never read the workspace. Re-running `fluid apply` once the cause of a
+  failed bind is fixed binds first (replacing a deny-all filter) and grants again.
+  `fluid generate iac` refuses a Databricks contract that compiles any mask or row filter
+  (`databricks-enforcement-outside-module`): they are bound by `fluid apply` around `tofu
+  apply`, not in the module, and a plain `tofu apply` of it would grant unmasked access;
+  `fluid apply`, `plan` and `validate` are unaffected. A contract with restrictions now needs
+  the `[databricks]` extra (databricks-sdk) at apply, and says so when it is missing. `fluid
+  verify` gains a row-filter-and-masks dimension: the expected function names (content-hashed)
+  against the live `row_filter` and each column's `mask` from the GetTable it already reads, and
+  each bound function read back for its owner (this verify's identity or the table's owner),
+  body, parameters and return type; a missing or different binding is CRITICAL with `fluid
+  apply` as the fix, and a contract that restricts nothing skips it. `policy.privacy.masking`
+  (landing-time masking), `rowLevelPolicy` and `binding.governance` are still refused. Proven
+  against the in-process stand-in with a real `tofu` apply, and the function bodies evaluated
+  in DuckDB; not run against a live workspace: that `CREATE FUNCTION IF NOT EXISTS`, `SET ROW
+  FILTER` (with `ON ()` as well) and `SET MASK` behave as the stand-in models them, that `SET`
+  replaces a binding already on the table (if it does not, a changed predicate or the interim
+  filter fails closed with the old binding in place; a `DROP` first was not used because it
+  leaves a window with no filter), that FunctionInfo's `routine_definition` is the body as
+  written, that `current_user()` is a service principal's application ID, and what a warehouse
+  of each type enforces are unproven.
 
 ### Fixed
 
@@ -35,6 +147,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sensitivity`. A 0.7.x primary key is not recognised either, so a key column that becomes
   nullable is reported as non-breaking.
 
+- **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
+  `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the
+  diagnostic (the summary, the resource address and the provider's detail) and says that OpenTofu
+  records state as it goes, so fixing the cause and re-running `fluid apply` normally continues;
+  `tofu state list` in the working directory shows what exists, and a state-lock error also
+  points at `tofu force-unlock`, as does a plan that fails on a held state lock. The raw output
+  tail is logged under `--debug`. Every value a `CLIError` prints (context and suggestions) now
+  goes through the full secret redactor, so a provider message carrying an access key id, a
+  bearer token or a URL password is masked, and has its control characters spelled out, as the
+  other error handlers already did.
+- **`fluid roadmap` claimed a 1.0 release and the package description left providers out.** The
+  roadmap said "forge-cli v1.0 shipped"; the package is 0.x Beta, and the roadmap now says so and
+  calls its "v1" headings an internal milestone. A test fails if it announces a 1.x release while
+  the package is below 1.0. The package description named GCP, Snowflake and Local and now names
+  AWS and Databricks too.
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
   never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
   sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP
