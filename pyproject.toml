@@ -389,11 +389,6 @@ ai = [
   "data-product-forge[litellm]",
 ]
 
-# OpenLineage emission needs openlineage-python, which is in the base install
-# today. This empty alias lets ``pip install 'data-product-forge[lineage]'``
-# resolve now; step 6 of the dependency diet fills it.
-lineage = []
-
 # V1.5 metadata-source catalog adapters.
 #
 # Each ``[<name>]`` extra installs ONE catalog adapter's SDK. The
