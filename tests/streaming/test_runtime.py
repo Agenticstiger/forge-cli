@@ -22,6 +22,7 @@ import httpx
 import pytest
 
 from fluid_build.streaming.compiler import compile_contract
+from fluid_build.streaming.policy import SECRET_REF_ALLOWLIST_ENV
 from fluid_build.streaming.runtime import (
     Kubectl,
     StreamingError,
@@ -268,6 +269,7 @@ def test_catalog_auth_is_resolved_locally_and_sent_only_as_headers(
     if auth_type == "bearer":
         cfg["catalogAuth"] = {"type": "bearer", "tokenEnv": "CATALOG_TOKEN"}
         monkeypatch.setenv("CATALOG_TOKEN", "synthetic-token")
+        monkeypatch.setenv(SECRET_REF_ALLOWLIST_ENV, "CATALOG_TOKEN@catalog.example")
     else:
         cfg["catalogAuth"] = {
             "type": "oauth2",
@@ -278,6 +280,7 @@ def test_catalog_auth_is_resolved_locally_and_sent_only_as_headers(
             "resource": "warehouse",
         }
         monkeypatch.setenv("CATALOG_CREDENTIAL", "synthetic-client:synthetic-secret")
+        monkeypatch.setenv(SECRET_REF_ALLOWLIST_ENV, "CATALOG_CREDENTIAL@identity.example")
     (artifact,) = compile_contract(contract)
     calls = []
 

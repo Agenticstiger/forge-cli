@@ -17,8 +17,32 @@ from pathlib import Path
 import pytest
 import yaml
 
+from fluid_build.streaming.policy import (
+    CONTEXT_ALLOWLIST_ENV,
+    IMAGE_ALLOWLIST_ENV,
+    NAMESPACE_ALLOWLIST_ENV,
+    SECRET_ALLOWLIST_ENV,
+    SERVICE_ACCOUNT_ALLOWLIST_ENV,
+)
+
+#: What an operator lists to deploy examples/flink-iceberg (deny unless listed).
+EXAMPLE_ALLOWLISTS = {
+    CONTEXT_ALLOWLIST_ENV: "development",
+    NAMESPACE_ALLOWLIST_ENV: "data-products",
+    IMAGE_ALLOWLIST_ENV: "forge-flink",
+    SERVICE_ACCOUNT_ALLOWLIST_ENV: "data-products/flink",
+    SECRET_ALLOWLIST_ENV: "data-products/flink-storage",  # pragma: allowlist secret - a name
+}
+
 
 @pytest.fixture
 def contract():
     root = Path(__file__).resolve().parents[2]
     return yaml.safe_load((root / "examples/flink-iceberg/contract.fluid.yaml").read_text())
+
+
+@pytest.fixture(autouse=True)
+def operator_allows_the_example(monkeypatch):
+    """The example's deployment targets, listed as its operator would list them."""
+    for name, value in EXAMPLE_ALLOWLISTS.items():
+        monkeypatch.setenv(name, value)

@@ -40,5 +40,24 @@ contract, replace development endpoints/context, and provision the prerequisite
 operator, RBAC, buckets, catalog, Kafka and secrets. The all-zero digest is an
 intentional placeholder, not a deployable image.
 
+`fluid apply` (`--dry-run` included), `fluid diff` and `fluid verify` refuse a
+managed deployment until the operator lists its targets. A contract names them,
+so only the operator may allow them, and an unset list allows nothing. Set these
+in the shell or CI that runs fluid; a project `.env` is ignored for them:
+
+```bash
+export FLUID_FLINK_KUBE_CONTEXT_ALLOWLIST=development
+export FLUID_FLINK_NAMESPACE_ALLOWLIST=data-products
+export FLUID_FLINK_IMAGE_ALLOWLIST=registry.example.com/forge-flink   # or a prefix ending in /
+export FLUID_FLINK_SERVICE_ACCOUNT_ALLOWLIST=data-products/flink
+export FLUID_FLINK_SECRET_ALLOWLIST=data-products/flink-storage
+```
+
+`fluid verify` also calls the catalog. A public catalog host needs an entry in
+`FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST`, and a link-local host is always
+refused. A `catalogAuth` token variable needs `NAME@host` in
+`FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, for example
+`LAKEKEEPER_TOKEN@catalog.example.com`, before fluid reads it.
+
 This fixture proves task recovery and nested-value fidelity. It does not certify
 Kubernetes deployment, savepoint upgrades, job-manager failover or production HA.

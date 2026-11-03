@@ -127,6 +127,68 @@ def _on_allowlist(host: str, suffixes: List[str]) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class HostVerdict:
+    """Why the policy refuses a URL, without wording.
+
+    ``code`` is ``missing``, ``scheme``, ``no-host``, ``link-local``, ``mixed``
+    or ``public``. Each caller phrases it for its own case, so the decision has
+    one home and only the message differs.
+    """
+
+    code: str
+    host: Optional[str] = None
+    scheme: str = ""
+
+
+def host_verdict(
+    url: Optional[str],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    operator_supplied: bool = False,
+) -> Optional[HostVerdict]:
+    """The policy's decision for ``url``: ``None`` when it may be used.
+
+    :func:`host_refusal` words it for an acquisition orchestrator; the managed
+    Flink lane words it for an Iceberg catalog (``streaming/policy.py``).
+    """
+    if not url or not str(url).strip():
+        return HostVerdict("missing")
+    parts = urlsplit(str(url).strip())
+    scheme = (parts.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        return HostVerdict("scheme", scheme=scheme)
+    try:
+        host = parts.hostname
+    except ValueError:
+        host = None
+    if not host:
+        return HostVerdict("no-host", scheme=scheme)
+    # First, and not overridable: this is where instance metadata lives, and no
+    # orchestrator is ever legitimately there.
+    if _hostname_is_link_local(host):
+        return HostVerdict("link-local", host, scheme)
+    if operator_supplied or _on_allowlist(host, allowlist(environ)):
+        return None
+    scope = hostname_scope(host)
+    if scope == "non_public":
+        return None
+    if scope == "mixed":
+        return HostVerdict("mixed", host, scheme)
+    if scope == "unresolved":
+        # Not this gate's refusal to make. A name that does not resolve cannot
+        # receive anything, and refusing it here turns "that host is not
+        # running" into a security error. Note what this does NOT buy: both
+        # clients pass the URL to safe_httpx_client, whose resolve_and_validate
+        # raises UnsafeURLError("cannot resolve hostname") at construction, so
+        # an unresolvable host is still refused -- by the transport layer, with
+        # an accurate message. This branch matters for a caller that reaches the
+        # policy without that layer, and for the resolve-later race that
+        # request_guard closes.
+        return None
+    return HostVerdict("public", host, scheme)
+
+
 def host_refusal(
     url: Optional[str],
     *,
@@ -149,52 +211,32 @@ def host_refusal(
     ``fluid import airbyte --server-url https://...`` did when this check was
     first written. The scheme and metadata-address rules still apply, because
     neither is ever what an operator meant."""
-    if not url or not str(url).strip():
+    verdict = host_verdict(url, environ=environ, operator_supplied=operator_supplied)
+    if verdict is None:
+        return None
+    if verdict.code == "missing":
         return "no deployment.server_url is configured"
-    parts = urlsplit(str(url).strip())
-    scheme = (parts.scheme or "").lower()
-    if scheme not in _ALLOWED_SCHEMES:
+    if verdict.code == "scheme":
         return (
-            f"its scheme is {scheme or 'missing'}; the {engine} orchestrator must be an "
+            f"its scheme is {verdict.scheme or 'missing'}; the {engine} orchestrator must be an "
             "http:// or https:// URL"
         )
-    try:
-        host = parts.hostname
-    except ValueError:
-        host = None
-    if not host:
+    if verdict.code == "no-host":
         return "it has no host"
-    # First, and not overridable: this is where instance metadata lives, and no
-    # orchestrator is ever legitimately there.
-    if _hostname_is_link_local(host):
+    host = verdict.host
+    if verdict.code == "link-local":
         return (
             f"host {host!r} is link-local or unspecified, where cloud instance metadata "
             "lives; no orchestrator is there, and this is refused even with an allowlist "
             "entry"
         )
-    if operator_supplied or _on_allowlist(host, allowlist(environ)):
-        return None
-    scope = hostname_scope(host)
-    if scope == "non_public":
-        return None
-    if scope == "mixed":
+    if verdict.code == "mixed":
         return (
             f"host {host!r} resolves to both public and non-public addresses, and the "
             "connection is pinned to a public one. One private record beside a public "
             "one is how an unnamed host is made to look internal, so a mixed answer "
             "needs an allowlist entry like any other public host"
         )
-    if scope == "unresolved":
-        # Not this gate's refusal to make. A name that does not resolve cannot
-        # receive anything, and refusing it here turns "that host is not
-        # running" into a security error. Note what this does NOT buy: both
-        # clients pass the URL to safe_httpx_client, whose resolve_and_validate
-        # raises UnsafeURLError("cannot resolve hostname") at construction, so
-        # an unresolvable host is still refused -- by the transport layer, with
-        # an accurate message. This branch matters for a caller that reaches the
-        # policy without that layer, and for the resolve-later race that
-        # request_guard closes.
-        return None
     return (
         f"host {host!r} is public, and the config posted to it carries the source "
         "credential in clear text"
