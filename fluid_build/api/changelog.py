@@ -15,8 +15,8 @@
 """Contract-vs-contract semantic diff (the version-history side of ``fluid diff``).
 
 Public entry point: :func:`compare_contracts(baseline, new) -> ChangelogReport`.
-The output is the structured envelope from ``changelog_types``; CLI/render
-formatting lives in ``cli/diff.py`` (text / json / markdown emitters).
+The output is the structured envelope from ``changelog_types``; the text and
+Markdown renderers are below, and ``cli/diff.py`` picks one and prints it.
 
 The classifier is fluid-schema-native — it understands acquisition engines,
 ``agentPolicy``, ``sovereignty``, and the SDP/ADP/CDP × Bronze/Silver/Gold
@@ -220,8 +220,9 @@ def _code(value: Any) -> str:
     ``~label`` and ``%milestone``. Inside a code span every character is
     literal on every host. The fence is one backtick longer than the longest
     run of backticks in the text, and the text is padded with a space when it
-    holds a backtick or starts and ends with one, as mdformat's ``code_inline``
-    writes it (MIT, github.com/hukkin/mdformat). The text is spelled by
+    holds a backtick, or when it starts and ends with a space (CommonMark then
+    strips one space from each end), as mdformat's ``code_inline`` writes it
+    (MIT, github.com/hukkin/mdformat); empty text becomes one space. The text is spelled by
     :func:`_text` first, so it holds no line break, which would let the next
     line start a heading before the span is ever parsed.
     """

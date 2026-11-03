@@ -165,7 +165,8 @@ def register(subparsers: argparse._SubParsersAction):
         help=(
             "Path to a baseline (old) contract.fluid.yaml. When set, switches "
             "from drift mode to contract-vs-contract version diff and emits a "
-            "breaking-change classification."
+            "breaking-change classification. Both contracts must be schema-valid: "
+            "an invalid one exits 2 (diff_contract_invalid) before any output."
         ),
     )
     p.add_argument(
