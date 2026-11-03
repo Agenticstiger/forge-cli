@@ -144,7 +144,11 @@ class CommandCenterConnector(BaseCatalogConnector):
                         try:
                             layer = DataProductLayer(item["layer"])
                         except ValueError:
-                            pass
+                            self.logger.debug(
+                                "Command Center product %r has an unknown layer %r; left unset",
+                                item.get("id"),
+                                item["layer"],
+                            )
 
                     # Parse status
                     status = DataProductStatus.ACTIVE  # Default
@@ -152,7 +156,12 @@ class CommandCenterConnector(BaseCatalogConnector):
                         try:
                             status = DataProductStatus(item["status"])
                         except ValueError:
-                            pass
+                            self.logger.debug(
+                                "Command Center product %r has an unknown status %r; kept %s",
+                                item.get("id"),
+                                item["status"],
+                                status.value,
+                            )
 
                     # Create metadata
                     product = DataProductMetadata(

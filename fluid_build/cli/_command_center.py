@@ -304,7 +304,7 @@ class CommandCenterClient:
                 data = response.json()
                 return data.get("version", "unknown")
         except Exception:
-            pass
+            pass  # the version is informational; an unreachable server reads "unknown"
 
         return "unknown"
 

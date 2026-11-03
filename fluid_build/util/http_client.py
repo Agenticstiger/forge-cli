@@ -139,7 +139,7 @@ def parse_retry_after(raw: Optional[str]) -> Optional[float]:
         # An integer too large for a float (hundreds of digits): unusable.
         return None
     except ValueError:
-        pass
+        pass  # not a number of seconds; try the HTTP-date form below
     try:
         parsed = email.utils.parsedate_to_datetime(raw)
     except (ValueError, TypeError, OverflowError):
