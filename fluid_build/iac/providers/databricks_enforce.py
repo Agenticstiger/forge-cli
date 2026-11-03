@@ -761,6 +761,9 @@ class FailSafe:
     checked: bool = False
     #: Whether the table's grants could be listed (else only the restricted identities were revoked).
     listed: bool = True
+    #: The table's owner could not be read, so the lock could not skip it (only this run's own
+    #: identity was skipped).
+    owner_unknown: bool = False
 
 
 _READ = frozenset({"SELECT", "ALL_PRIVILEGES"})
@@ -913,8 +916,16 @@ def _lock(
     result: FailSafe,
     say: Say,
 ) -> None:
-    """Revoke SELECT (and ALL PRIVILEGES) on the table from every grantee but its owner."""
+    """Revoke SELECT (and ALL PRIVILEGES) on the table from every grantee but its owner and the
+    identity this run is: revoking from the deploy identity would lock the run out of the table
+    it has to repair."""
     owner = str((live or {}).get("owner") or "")
+    result.owner_unknown = not owner
+    try:
+        me = session.identity
+    except Exception:  # noqa: BLE001 — unreadable: nothing to skip but the owner
+        me = ""
+    skip = {p.lower() for p in (owner, me) if p}
     grantees: Dict[str, set] = {}
     try:
         for entry in _list_pages(
@@ -931,7 +942,7 @@ def _lock(
         )
         grantees = {p: {"SELECT"} for p in enforcement.restricted}
     for principal, held in sorted(grantees.items()):
-        if owner and principal.lower() == owner.lower():
+        if principal.lower() in skip:
             continue
         statements = []
         if "SELECT" in held:
@@ -992,10 +1003,15 @@ def _describe(target: Target, fs: FailSafe) -> str:
     done = f"The deny-all row filter could not be bound ({fs.deny_all_problem}). " + (
         "SELECT (and ALL PRIVILEGES where held) was revoked on the table from "
         + ", ".join(sorted({s.rsplit(" FROM ", 1)[1] for s in fs.revoked}))
-        + " (every grantee but its owner). "
+        + " (every grantee but its owner and this run's own identity). "
         if fs.revoked
         else "Nothing was revoked. "
     )
+    if fs.owner_unknown:
+        done += (
+            "The table's owner could not be read, so it could not be skipped: if the owner held "
+            "SELECT through a grant, it was revoked too. "
+        )
     if not fs.listed:
         done += "Its grants could not be listed, so only the restricted identities were revoked. "
     if fs.unrevoked:

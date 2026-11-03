@@ -1087,7 +1087,7 @@ class FakeDatabricks:
             "data_source_format": "DELTA",
             "table_id": f"tid-{full}",
             "metastore_id": "ms-fake",
-            "owner": _USER,
+            "owner": t.get("owner", _USER),
             "columns": cols,
             "properties": t["properties"],
             "comment": t.get("comment"),

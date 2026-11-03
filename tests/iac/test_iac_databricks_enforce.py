@@ -1129,6 +1129,33 @@ def test_when_the_deny_all_filter_fails_select_is_revoked_from_every_grantee_but
     assert "No grant inherited from the schema or the catalog was found open" in message
 
 
+def test_the_lock_never_revokes_from_the_deploy_identity_when_the_owner_is_unreadable(fake):
+    seed(fake)
+    fake.grant("table", TABLE, DEPLOY_USER, "SELECT")  # this run's own identity
+    fake.grant("table", TABLE, "other-group", "SELECT")
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    fake.fail_route("GET", r"/tables/main\.cp360\.profile$", 503, "unavailable")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        run.post(contract())
+    revokes = [s for s in fake.sql_log if s.startswith("REVOKE")]
+    assert not any(DEPLOY_USER in s for s in revokes), "the run must not lock itself out"
+    assert any("other-group" in s for s in revokes)
+    assert fake.grants[("table", TABLE)][DEPLOY_USER] == ["SELECT"]
+    assert "owner could not be read, so it could not be skipped" in str(exc.value)
+
+
+def test_the_lock_skips_the_deploy_identity_when_it_is_not_the_owner(fake):
+    seed(fake)
+    fake.tables[TABLE]["owner"] = "someone-else@example.test"
+    fake.grant("table", TABLE, DEPLOY_USER, "SELECT")
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    with pytest.raises(UnsupportedBindingError) as exc:
+        Run(fake).post(contract())
+    assert fake.grants[("table", TABLE)][DEPLOY_USER] == ["SELECT"]
+    assert "could not be skipped" not in str(exc.value)
+
+
 def test_a_grant_inherited_from_the_schema_or_catalog_is_named_with_what_to_run(fake):
     seed(fake)
     fake.grant("schema", "main.cp360", "schema-readers", "SELECT")
