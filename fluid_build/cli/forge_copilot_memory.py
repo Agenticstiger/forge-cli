@@ -404,7 +404,7 @@ def _coerce_memory_document(raw: Any, *, project_root: Path) -> CopilotProjectMe
     if schema_version > MEMORY_SCHEMA_VERSION:
         raise ValueError(
             f"unsupported schema_version {schema_version}; expected {MEMORY_SCHEMA_VERSION}. "
-            "Upgrade fluid-build to read this memory file."
+            "Upgrade data-product-forge to read this memory file."
         )
     if schema_version < MEMORY_SCHEMA_VERSION:
         # Future: add migration logic here (e.g. v0 -> v1 transforms).

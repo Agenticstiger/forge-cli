@@ -55,6 +55,7 @@ def _wait_json(url, predicate, timeout=120):
             if predicate(last):
                 return last
         except OSError:
+            # The fixture is still starting (connection refused or reset); poll again.
             pass
         time.sleep(1)
     raise AssertionError(f"Fixture did not become ready: {url}; last response: {last}")

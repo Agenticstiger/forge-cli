@@ -287,8 +287,8 @@ pipeline {
     stages {
         stage('Setup') {
             steps {
-                // Ensure Python + fluid-build are available on the agent.
-                // If your agent image pre-installs fluid-build, this step
+                // Ensure Python + data-product-forge are available on the agent.
+                // If your agent image pre-installs data-product-forge, this step
                 // is a no-op.
                 sh '''
                     python3 -m pip install --user --quiet data-product-forge

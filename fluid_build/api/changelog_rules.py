@@ -175,6 +175,52 @@ def _columns_by_name(columns: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[
     return out
 
 
+def _expose_schema(expose: Mapping[str, Any]) -> Tuple[Sequence[Any], Optional[str]]:
+    """Return an expose's columns and where, below the expose, they were found.
+
+    Pre-0.7 contracts keep their columns at ``schema``; 0.7.x contracts keep
+    them at ``contract.schema``. The flat ``schema`` is read when it is
+    present and ``contract.schema`` only when it is absent, so a contract
+    that carries both is read as it was before 0.7.x. The location is
+    ``None`` when the expose carries no schema at all.
+    """
+    columns = expose.get("schema")
+    if columns is not None:
+        return columns or [], "schema"
+    contract = expose.get("contract")
+    columns = contract.get("schema") if isinstance(contract, Mapping) else None
+    if columns is not None:
+        return columns or [], "contract.schema"
+    return [], None
+
+
+def _is_nullable(column: Mapping[str, Any]) -> bool:
+    """Whether *column* admits NULL.
+
+    Pre-0.7 columns spell NOT NULL ``nullable: false``. A 0.7.x column has no
+    ``nullable`` key and spells it ``required: true``. A column is NOT NULL
+    when either says so: the IaC emitters read ``required`` alone, by
+    truthiness, so a column that declares both and contradicts itself must not
+    be read as nullable.
+    """
+    return column.get("nullable") is not False and not column.get("required")
+
+
+def _nullability_key(old: Mapping[str, Any], new: Mapping[str, Any]) -> str:
+    """The key a nullability change is reported at: the one the contract uses.
+
+    A 0.7.x column says ``required``, a pre-0.7 one ``nullable``. The new
+    column decides; the old one does when the new says neither. A column that
+    carries both is reported at ``nullable``.
+    """
+    for column in (new, old):
+        if "nullable" in column:
+            return "nullable"
+        if "required" in column:
+            return "required"
+    return "nullable"
+
+
 def _primary_key_set(expose: Mapping[str, Any]) -> frozenset[str]:
     """Extract the set of primary-key column names from an expose dict.
 
@@ -187,7 +233,7 @@ def _primary_key_set(expose: Mapping[str, Any]) -> frozenset[str]:
         for n in expose_pk:
             if isinstance(n, str):
                 pk.add(n)
-    for col in expose.get("schema", []) or []:
+    for col in _expose_schema(expose)[0]:
         if isinstance(col, Mapping) and col.get("primaryKey") is True:
             name = col.get("name")
             if isinstance(name, str):
@@ -201,16 +247,19 @@ def diff_columns(
     expose_id: str,
     expose_idx: int,
 ) -> List[Change]:
-    """Classify per-column changes between two versions of the same expose."""
-    base_cols = (
-        baseline_expose.get("schema", (baseline_expose.get("contract") or {}).get("schema", []))
-        or []
-    )
-    new_cols = new_expose.get("schema", (new_expose.get("contract") or {}).get("schema", [])) or []
+    """Classify per-column changes between two versions of the same expose.
+
+    Columns are read from ``schema`` or, in a 0.7.x contract, from
+    ``contract.schema`` (see :func:`_expose_schema`).
+    """
+    base_cols, base_at = _expose_schema(baseline_expose)
+    new_cols, new_at = _expose_schema(new_expose)
     base_by_name = _columns_by_name(base_cols)
     new_by_name = _columns_by_name(new_cols)
     pk = _primary_key_set(new_expose) | _primary_key_set(baseline_expose)
-    path_prefix = f"exposes[{expose_idx}].schema"
+    # Paths follow the layout the new contract uses (the baseline's, when the
+    # new one gave the expose no schema).
+    path_prefix = f"exposes[{expose_idx}].{new_at or base_at or 'schema'}"
 
     changes: List[Change] = []
 
@@ -231,7 +280,7 @@ def diff_columns(
     # (downstream pipelines may insert rows that fail the NOT NULL check).
     for col_name in new_by_name.keys() - base_by_name.keys():
         col = new_by_name[col_name]
-        is_nullable = col.get("nullable", not col.get("required", False)) is not False
+        is_nullable = _is_nullable(col)
         severity = "non_breaking" if is_nullable else "breaking"
         description = (
             f"column '{col_name}' added to expose '{expose_id}'"
@@ -334,14 +383,15 @@ def diff_columns(
             )
 
         # Nullability changes.
-        old_null = old.get("nullable", not old.get("required", False)) is not False
-        new_null = new.get("nullable", not new.get("required", False)) is not False
+        old_null = _is_nullable(old)
+        new_null = _is_nullable(new)
         if old_null != new_null:
+            key = _nullability_key(old, new)
             if new_null and col_name in pk:
                 # PK column became nullable — breaking.
                 changes.append(
                     Change(
-                        path=f"{path_prefix}.{col_name}.nullable",
+                        path=f"{path_prefix}.{col_name}.{key}",
                         kind="primary_key_nullable",
                         severity="breaking",
                         description=(
@@ -356,7 +406,7 @@ def diff_columns(
                 # NOT NULL added to a previously-nullable column — breaking.
                 changes.append(
                     Change(
-                        path=f"{path_prefix}.{col_name}.nullable",
+                        path=f"{path_prefix}.{col_name}.{key}",
                         kind="column_nullable_tightened",
                         severity="breaking",
                         description=(
@@ -371,7 +421,7 @@ def diff_columns(
                 # Loosening to nullable on a non-PK — non-breaking.
                 changes.append(
                     Change(
-                        path=f"{path_prefix}.{col_name}.nullable",
+                        path=f"{path_prefix}.{col_name}.{key}",
                         kind="column_nullable_loosened",
                         severity="non_breaking",
                         description=f"column '{col_name}' is now nullable",
@@ -696,7 +746,7 @@ def _diff_nested_fields(
 
     for fname in new_by_name.keys() - base_by_name.keys():
         field = new_by_name[fname]
-        is_nullable = field.get("nullable", not field.get("required", False)) is not False
+        is_nullable = _is_nullable(field)
         severity = "non_breaking" if is_nullable else "breaking"
         changes.append(
             Change(
@@ -730,12 +780,12 @@ def _diff_nested_fields(
                     after=new_type,
                 )
             )
-        old_null = old.get("nullable", not old.get("required", False)) is not False
-        new_null = new.get("nullable", not new.get("required", False)) is not False
+        old_null = _is_nullable(old)
+        new_null = _is_nullable(new)
         if old_null != new_null:
             changes.append(
                 Change(
-                    path=f"{path_prefix}.{fname}.required",
+                    path=f"{path_prefix}.{fname}.{_nullability_key(old, new)}",
                     kind="nested_nullable_loosened" if new_null else "nested_nullable_tightened",
                     severity="non_breaking" if new_null else "breaking",
                     description=f"nested field '{fname}' nullability changed",
@@ -770,9 +820,11 @@ def _diff_container_children(
         before, after = old.get(key), new.get(key)
         if isinstance(before, Mapping) or isinstance(after, Mapping):
             changes.extend(
+                # The slot name wins over any `name` the child carries, so the
+                # child is never dropped or reported at the wrong path.
                 _diff_nested_fields(
-                    [{"name": key, **before}] if isinstance(before, Mapping) else [],
-                    [{"name": key, **after}] if isinstance(after, Mapping) else [],
+                    [{**before, "name": key}] if isinstance(before, Mapping) else [],
+                    [{**after, "name": key}] if isinstance(after, Mapping) else [],
                     expose_id=expose_id,
                     path_prefix=path_prefix,
                 )

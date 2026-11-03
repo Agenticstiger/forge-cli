@@ -52,6 +52,22 @@ resources, with no new schema field (fluid-schema 0.7.6):
   existing assignment is imported best-effort before the first apply, and removing a
   label destroys only its assignment, which holds no data. Whether a tag survives a
   dbt ``CREATE OR REPLACE`` is undocumented, so ``fluid verify`` is the gate.
+* ``policy.authz.columnRestrictions`` and ``policy.authz.rowFilters`` are enforced by Unity
+  Catalog: SQL functions bound on the table, with the semantics GCP and AWS give them
+  (``databricks_access.py``). ``deny`` is a mask that returns NULL (Unity Catalog has no
+  column grant, so the column stays listed), ``mask`` returns ``last_four`` / ``first_four`` /
+  NULL, and a row filter (one per table) is the union of its principals' predicates for the
+  members of those principals and every row for everyone else. The functions are created once
+  under names that carry a hash of their definition, since Unity Catalog refuses to replace one
+  a filter uses, and are bound with ``ALTER TABLE`` on the SQL warehouse through the SQL
+  Statement Execution API, outside OpenTofu: the provider has no function resource and no mask
+  or filter attribute (terraform-provider-databricks#4550). :meth:`DatabricksIacPlugin.pre_apply`
+  binds on the tables that exist before ``tofu apply`` runs, :meth:`~DatabricksIacPlugin.post_apply`
+  on the ones it created (revoking ``SELECT`` from the restricted principals of a table it
+  cannot bind) and drops what the contract no longer restricts (``databricks_enforce.py``).
+  A predicate that is not one boolean expression over the table's columns is
+  ``databricks-row-filter-invalid``; ``access: allow``, a principal with no SQL test and a text
+  mask on a non-string column are refused too. ``fluid verify`` checks the bindings.
 * A dbt build that runs on Databricks (``execution.runtime.platform:
   databricks``) becomes a serverless ``databricks_job`` with a ``dbt_task``, and
   a local project its ``databricks_workspace_file`` uploads
@@ -111,7 +127,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ...providers._sql_safety import validate_ident, validate_sql_type_param_payload
 from ...util.contract import is_databricks_job_build
@@ -129,7 +145,9 @@ from ..principals import (
 )
 from ..provider_match import canonical_cloud, is_cloud
 from ..versions import required_providers
+from .databricks_access import TableEnforcement, compile_enforcement
 from .databricks_auth import tofu_env_overlay
+from .databricks_enforce import Target, post_apply, pre_apply, preview, unprotected
 from .databricks_jobs import (
     CompiledJobs,
     DbtJob,
@@ -239,6 +257,8 @@ class _Table:
     exposure: Mapping[str, Any]
     #: The declared workspace region, lower-cased and validated; ``""`` if none.
     region: str = ""
+    #: The column masks and row filter Unity Catalog enforces on it, if the expose has any.
+    enforcement: Optional[TableEnforcement] = None
 
     @property
     def full_name(self) -> str:
@@ -429,8 +449,6 @@ def _refuse_governance(
         for name, value in (
             ("policy.privacy.masking", privacy.get("masking")),
             ("policy.privacy.rowLevelPolicy", privacy.get("rowLevelPolicy")),
-            ("policy.authz.rowFilters", authz.get("rowFilters")),
-            ("policy.authz.columnRestrictions", authz.get("columnRestrictions")),
             ("binding.governance", binding.get("governance")),
         )
         if _set(value)
@@ -442,8 +460,10 @@ def _refuse_governance(
                 f"{where} declares {', '.join(unmapped)}, which the Databricks emitter does not "
                 "map yet. Applied anyway, the table would be readable without the mask, filter "
                 "or restriction the contract promises.",
-                "Remove them from this expose until Unity Catalog column masks, row filters "
-                "and ABAC policies are mapped, and enforce access with grants.",
+                "Remove them from this expose until they are mapped (landing-time masking and "
+                "ABAC policies are not), and enforce access with grants. policy.authz."
+                "columnRestrictions and policy.authz.rowFilters are mapped: they become Unity "
+                "Catalog column masks and a row filter.",
             )
         )
     if _set(binding.get("encryption")):
@@ -666,6 +686,21 @@ def _resolve_table(
     partitions = _partitions(where, loc, columns, refusals, validating=validating)
     region = _region(where, loc, refusals)
     _refuse_governance(where, binding, exposure, refusals)
+    enforcement: Optional[TableEnforcement] = None
+    if len(refusals) == before:
+        try:
+            enforcement = compile_enforcement(
+                where=where,
+                index=index,
+                exposure=exposure,
+                binding=binding,
+                catalog=names["database"],
+                schema=names["schema"],
+                table=names["table"],
+                columns=columns,
+            )
+        except UnsupportedBindingError as exc:
+            refusals.append(exc)
     if len(refusals) > before:
         return None
     return _Table(
@@ -679,6 +714,7 @@ def _resolve_table(
         binding=binding,
         exposure=exposure,
         region=region,
+        enforcement=enforcement,
     )
 
 
@@ -1526,6 +1562,8 @@ class DatabricksIacPlugin:
         if compiled.refusals:
             raise compiled.refusals[0]
         _enforce_sovereignty(contract, compiled.tables)
+        for job, _tables in _jobs_to_pause(compiled, contract):
+            _pause(compiled, job)
         return compiled.resources
 
     def emit_data(
@@ -1605,9 +1643,94 @@ class DatabricksIacPlugin:
         hides, in the shape the engine reports (``_report_suppressed_drift``)."""
         return _dbt_column_drift(_compile(contract, os.environ), prior_resources)
 
+    def standalone_module_refusal(
+        self, contract: Mapping[str, Any]
+    ) -> Optional[UnsupportedBindingError]:
+        """Why this contract's module must not be applied on its own, or ``None``.
+
+        Column masks and row filters are not in the module: they are bound on the SQL
+        warehouse around ``tofu apply`` (``pre_apply`` / ``post_apply``). A module written for
+        review and a plain ``tofu apply`` would create the table and grant SELECT with none of
+        them. ``fluid generate iac`` asks this before it writes one; ``emit`` stays pure, and
+        ``fluid apply``, ``plan`` and ``validate`` are unaffected. A contract that does not
+        compile is left to ``emit``, which raises its own refusal.
+        """
+        compiled = _compile(contract, os.environ)
+        if compiled.refusals:
+            return None
+        guarded = [t for t in compiled.tables if t.enforcement is not None]
+        if not guarded:
+            return None
+        return _refusal(
+            "enforcement-outside-module",
+            f"{', '.join(t.where for t in guarded)} declare column restrictions or row filters, "
+            "which Unity Catalog enforces through functions bound on the SQL warehouse by "
+            "fluid apply, around tofu apply. They are not in the module generate iac writes, "
+            "and a plain tofu apply of it would create the table and grant SELECT with no mask "
+            "or row filter, exposing unmasked data to the principals the contract restricts.",
+            "Use fluid apply, which binds the masks and row filters before it grants and "
+            "revokes access when it cannot (fluid apply --mode dry-run shows the statements).",
+            "Or remove the column restrictions and row filters from the contract.",
+        )
+
+    @staticmethod
+    def _enforcement_targets(contract: Mapping[str, Any]) -> List[Target]:
+        compiled = _compile(contract, os.environ)
+        if compiled.refusals:
+            raise compiled.refusals[0]
+        return [Target(table.full_name, table.enforcement) for table in compiled.tables]
+
+    def pre_apply(
+        self,
+        contract: Mapping[str, Any],
+        say: Optional[Callable[[str], None]] = None,
+        dry_run: bool = False,
+        client_factory: Optional[Callable[[], Any]] = None,
+    ) -> None:
+        """Before ``tofu apply``: bind the contract's column masks and row filter on the
+        tables that already exist (``databricks_enforce.pre_apply``), so a grant the apply
+        adds lands on a protected table. With ``dry_run`` it prints every statement either
+        hook would run, and runs none. Raises :class:`UnsupportedBindingError` to stop the
+        run before the apply."""
+        targets = self._enforcement_targets(contract)
+        say = say or print
+        if dry_run:
+            preview(targets, say, client_factory)
+        else:
+            pre_apply(targets, say, client_factory)
+
+    def post_apply(
+        self,
+        contract: Mapping[str, Any],
+        say: Optional[Callable[[str], None]] = None,
+        client_factory: Optional[Callable[[], Any]] = None,
+        after_failed_apply: bool = False,
+    ) -> None:
+        """After ``tofu apply``: bind on the tables it created, drop what the contract no
+        longer restricts, and revoke ``SELECT`` from the restricted principals of any table
+        it could not bind (``databricks_enforce.post_apply``). ``after_failed_apply`` is the
+        bind-only mode for an apply that failed part way: it drops nothing and skips a table
+        that was never created."""
+        post_apply(
+            self._enforcement_targets(contract),
+            say or print,
+            client_factory,
+            after_failed_apply=after_failed_apply,
+        )
+
     def plan_notices(self, contract: Mapping[str, Any]) -> List[str]:
-        """What the apply cannot do itself and someone must: ``USE CATALOG``."""
-        return _use_catalog_notices(_compile(contract, os.environ))
+        """What the apply cannot do itself and someone must: ``USE CATALOG``; and the dbt jobs
+        it creates paused until the tables they write are protected."""
+        compiled = _compile(contract, os.environ)
+        notices = _use_catalog_notices(compiled)
+        for job, tables in _jobs_to_pause(compiled, contract):
+            notices.append(
+                f"job {job.name!r} is created paused (pause_status PAUSED): it writes "
+                f"{', '.join(sorted(tables))}, whose masks and row filter are not bound yet, and "
+                "a run before that would fill an unprotected table. The next fluid apply, once "
+                "they are bound, starts its schedule; an explicit run-now works meanwhile."
+            )
+        return notices
 
     def explain_plan_failure(
         self,
@@ -1717,6 +1840,59 @@ class DatabricksIacPlugin:
             if full in live:
                 out.extend(f"{full}.{line}" for line in _changed_columns(live[full], declared))
         return out
+
+
+def _jobs_to_pause(
+    compiled: _Compiled, contract: Mapping[str, Any]
+) -> List[Tuple[DbtJob, Dict[str, str]]]:
+    """``(job, {table: why})`` for each dbt job that writes a table that is not yet protected.
+
+    The masks and row filters are bound around ``tofu apply``, not by it, so a job created in
+    the same apply as its table and the grant on it could run (continuous, or a frequent cron)
+    and fill the table before ``post_apply`` binds them. Such a job is created paused and
+    started by the next apply, once the live bindings match. A manual job has nothing to pause.
+    Read live, only for a contract with both a restricted table and a job; unreadable counts as
+    not protected.
+    """
+    from ...util.contract import builds_writing_expose
+
+    guarded = [t for t in compiled.tables if t.enforcement is not None]
+    if not guarded or not compiled.jobs:
+        return []
+    builds = [b for b in contract.get("builds") or [] if isinstance(b, Mapping)]
+    writes = {
+        t.full_name: {
+            str(b.get("id")) for b in builds_writing_expose(t.exposure.get("exposeId"), builds)
+        }
+        for t in guarded
+    }
+    candidates = [
+        job
+        for job in compiled.jobs
+        if job.trigger != "manual" and any(job.build_id in ids for ids in writes.values())
+    ]
+    if not candidates:
+        return []
+    open_tables = unprotected([Target(t.full_name, t.enforcement) for t in guarded])
+    out: List[Tuple[DbtJob, Dict[str, str]]] = []
+    for job in candidates:
+        why = {
+            name: reason
+            for name, reason in open_tables.items()
+            if job.build_id in writes.get(name, ())
+        }
+        if why:
+            out.append((job, why))
+    return out
+
+
+def _pause(compiled: _Compiled, job: DbtJob) -> None:
+    """``pause_status: PAUSED`` on the job's schedule or continuous block."""
+    key = job.address.split(".", 1)[1]
+    body = compiled.resources.get("databricks_job", {}).get(key) or {}
+    for block in ("schedule", "continuous"):
+        if isinstance(body.get(block), dict):
+            body[block]["pause_status"] = "PAUSED"
 
 
 def _job_actions(jobs: Sequence[DbtJob]) -> List[Dict[str, Any]]:
@@ -1848,6 +2024,13 @@ class ManagedTable:
     #: ``databricks_entity_tag_assignment`` resources), sorted by key.
     tags: Tuple[Tuple[str, str], ...] = ()
     schema_tags: Tuple[Tuple[str, str], ...] = ()
+    #: The row filter Unity Catalog must have bound: ``(function full name, input columns)``.
+    row_filter: Optional[Tuple[str, Tuple[str, ...]]] = None
+    #: ``(column, function full name)`` per column mask it must have bound.
+    masks: Tuple[Tuple[str, str], ...] = ()
+    #: The whole expectation, with each function's definition: what ``fluid verify`` checks
+    #: a bound function's owner, body, parameters and return type against.
+    enforcement: Optional[TableEnforcement] = None
 
 
 def managed_objects(
@@ -1880,6 +2063,19 @@ def managed_objects(
             schema_tags=tuple(
                 sorted(tagged.get(("schemas", f"{table.catalog}.{table.schema}"), ()))
             ),
+            row_filter=(
+                (
+                    table.enforcement.row_filter.function.full_name,
+                    table.enforcement.row_filter.columns,
+                )
+                if table.enforcement and table.enforcement.row_filter
+                else None
+            ),
+            masks=tuple(
+                (mask.column, mask.function.full_name)
+                for mask in (table.enforcement.masks if table.enforcement else ())
+            ),
+            enforcement=table.enforcement,
         )
         for table in compiled.tables
     ]

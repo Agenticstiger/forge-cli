@@ -32,7 +32,7 @@ from fluid_build.cli._welcome_scan import (
     run_welcome_scan,
 )
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("deterministic_welcome_scan")]
 
 
 def _which_factory(present):

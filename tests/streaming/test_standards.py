@@ -75,3 +75,15 @@ def test_array_element_nullability_tightening_is_breaking(contract):
     new["exposes"][0]["contract"]["schema"][2]["element"]["required"] = True
     report = compare_contracts(contract, new)
     assert report.has_breaking
+
+
+def test_a_container_child_carrying_its_own_name_is_still_diffed_at_its_slot():
+    # A `name` inside element/key/value (schema-invalid, but the diff never
+    # validates) must not drop the child or move it to another path.
+    def contract(value_type):
+        child = {"name": 7, "type": value_type}
+        column = {"name": "tags", "type": "map", "key": {"type": "string"}, "value": child}
+        return {"exposes": [{"exposeId": "e", "contract": {"schema": [column]}}]}
+
+    report = compare_contracts(contract("int"), contract("string"))
+    assert [c.path for c in report.breaking] == ["exposes[0].contract.schema.tags.value.type"]

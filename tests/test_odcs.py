@@ -548,6 +548,19 @@ class TestRunOdcsValidate:
             code = _run_odcs_validate(self._args(odcs_file))
         assert code == 0
 
+    def test_vowl_missing_hint_keeps_its_extra(self, tmp_path, capsys):
+        # cprint renders Rich markup, which swallowed ``[odcs-strict]`` and told
+        # users to install the base package, which does not bring vowl.
+        odcs_file = tmp_path / "c.yaml"
+        odcs_file.write_text(yaml.dump(_odcs_contract()))
+        with (
+            patch("fluid_build.providers.odcs.validation.collect_errors", return_value=[]),
+            patch("fluid_build.providers.odcs.validation.validate_via_vowl", return_value=None),
+        ):
+            code = _run_odcs_validate(self._args(odcs_file, vowl=True))
+        assert code == 0
+        assert "pip install 'data-product-forge[odcs-strict]'" in capsys.readouterr().out
+
 
 # ---------------------------------------------------------------------------
 # _run_odcs_info (argparse helper)
