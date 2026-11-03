@@ -301,6 +301,26 @@ def _create_project_agent_loop(
         return False
 
 
+def _is_missing_optional(exc: BaseException) -> bool:
+    """True when *exc* is, or was caused by, a missing optional dependency."""
+    from fluid_build._optional import MissingOptionalDependency
+
+    cur: Optional[BaseException] = exc
+    for _ in range(8):
+        if cur is None:
+            return False
+        if isinstance(cur, MissingOptionalDependency):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _rich_escape(text: str) -> str:
+    from rich.markup import escape
+
+    return escape(text)
+
+
 def _emit_incomplete_forge_span(logger: logging.Logger) -> None:
     """Emit a ``run_completed=False`` ``forge.invocation`` span on failure.
 
@@ -1018,13 +1038,18 @@ def _create_project_minimal(
         return True
 
     except CopilotGenerationError as exc:
-        logger.exception("AI Copilot minimal flow failed")
+        if _is_missing_optional(exc):
+            # An absent optional package is an install problem, not a crash:
+            # the message and hint are the whole story, so no traceback.
+            logger.error("AI Copilot minimal flow unavailable: %s", exc.message)
+        else:
+            logger.exception("AI Copilot minimal flow failed")
         _emit_incomplete_forge_span(logger)
         if console:
             try:
                 console.print(f"[red]❌ {exc.message}[/red]")
                 for suggestion in getattr(exc, "suggestions", []) or []:
-                    console.print(f"[dim]• {suggestion}[/dim]")
+                    console.print(f"[dim]• {_rich_escape(str(suggestion))}[/dim]")
             except Exception:  # noqa: BLE001
                 pass
         else:

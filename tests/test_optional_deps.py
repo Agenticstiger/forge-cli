@@ -252,10 +252,10 @@ def test_doctor_imports_neither_litellm_mcp_nor_openlineage_and_reports_versions
         """
         import sys
         from fluid_build.cli import main
-        for top in ("litellm", "mcp", "openlineage"):
+        for top in ("litellm", "mcp", "openlineage.client"):
             assert top not in sys.modules, top
         main(["doctor", "--verbose"])
-        print("IMPORTED=%s" % [t for t in ("litellm", "mcp", "openlineage") if t in sys.modules])
+        print("IMPORTED=%s" % [t for t in ("litellm", "mcp", "openlineage.client") if t in sys.modules])
         print("NMODS=%d" % len(sys.modules))
         """
     )
@@ -329,10 +329,21 @@ def test_mcp_generation_probe_survives_a_missing_sdk(block):
         _mcp_compat.is_v2.cache_clear()
 
 
-def test_output_port_server_without_the_sdk_names_the_extra(block, monkeypatch):
+@pytest.fixture
+def _restore_output_port_modules():
+    """Put ``sys.modules`` back exactly: keep what existed, drop what was added."""
+    prefix = "fluid_build.output_ports.mcp"
+    before = {k: v for k, v in sys.modules.items() if k.startswith(prefix)}
+    yield
+    for key in [k for k in sys.modules if k.startswith(prefix)]:
+        del sys.modules[key]
+    sys.modules.update(before)
+
+
+def test_output_port_server_without_the_sdk_names_the_extra(block, _restore_output_port_modules):
     block("mcp")
     for key in [k for k in sys.modules if k.startswith("fluid_build.output_ports.mcp")]:
-        monkeypatch.delitem(sys.modules, key)
+        del sys.modules[key]
     pkg = importlib.import_module("fluid_build.output_ports.mcp")
     with pytest.raises(MissingOptionalDependency) as info:
         pkg.OutputPortMcpServer()
@@ -578,3 +589,92 @@ def test_empty_credential_registry_warns(block, caplog):
     assert module._CREDENTIAL_CLASSES == {}
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("pydantic-settings could not be imported" in w for w in warnings), warnings
+
+
+# ── review fixes ─────────────────────────────────────────────────────────────
+
+
+def test_missing_optional_dependency_survives_pickle_and_copy():
+    import copy
+    import pickle
+
+    exc = MissingOptionalDependency("litellm", "litellm", "AI-assisted authoring")
+    for clone in (
+        pickle.loads(pickle.dumps(exc)),
+        copy.copy(exc),
+        copy.deepcopy(exc),
+    ):
+        assert type(clone) is MissingOptionalDependency
+        assert str(clone) == str(exc)
+        assert (clone.module, clone.extra, clone.feature) == (
+            "litellm",
+            "litellm",
+            "AI-assisted authoring",
+        )
+
+
+def test_broken_litellm_is_a_typed_error_not_a_raw_import_error(monkeypatch):
+    from fluid_build import _optional
+    from fluid_build.llm import litellm_backend as lb
+
+    def boom(module, extra, feature):
+        raise ImportError("installed but failed to import")
+
+    monkeypatch.setattr(_optional, "require", boom)
+    with pytest.raises(Exception) as info:
+        lb._get_litellm()
+    assert type(info.value).__name__ == "CopilotGenerationError"
+    assert "installed but failed to import" in str(info.value.message)
+
+
+def test_mcp_delegate_dispatch_returns_the_install_hint():
+    from fluid_build.cli import dbt_mcp
+
+    exc = MissingOptionalDependency("mcp", "mcp", "The dbt MCP delegate")
+
+    class Boom:
+        def __init__(self, env=None):
+            pass
+
+        def call_tool(self, *a, **k):
+            raise exc
+
+    orig = dbt_mcp.DbtMcpClient
+    dbt_mcp.DbtMcpClient = Boom
+    try:
+        out = dbt_mcp.dispatch_dbt_mcp_tool("dbt.x", {})
+    finally:
+        dbt_mcp.DbtMcpClient = orig
+    assert "data-product-forge[mcp]" in out["message"]
+
+
+def test_lineage_warning_keeps_the_install_line_alone():
+    import re
+
+    from fluid_build._optional import MissingOptionalDependency as M
+
+    msg = f"Lineage is not being emitted.\n{M('openlineage.client', 'lineage', 'Lineage emission')}"
+    assert any(
+        re.fullmatch(r"\s*pip install 'data-product-forge\[lineage\]'", ln)
+        for ln in msg.splitlines()
+    )
+
+
+def test_doctor_probes_the_openlineage_client_not_the_namespace(monkeypatch):
+    """``openlineage`` is a namespace package: any ``openlineage-*`` dist makes it
+    importable. Hiding only ``openlineage.client`` must read as not installed."""
+    real_find_spec = importlib.util.find_spec
+
+    def find_spec(name, package=None):
+        if name == "openlineage.client":
+            return None
+        return real_find_spec(name, package)
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    monkeypatch.delitem(sys.modules, "openlineage.client", raising=False)
+    from fluid_build.cli.doctor import _check_fluid_features
+
+    _ok, checks = _check_fluid_features()
+    row = next(c for c in checks if c["check"] == "OpenLineage client")
+    assert "Not installed" in row["status"]
+    assert "data-product-forge[lineage]" in row["details"]

@@ -113,9 +113,9 @@ class AwsProvider(BaseProvider):
         if not is_available("boto3"):
             raise MissingOptionalDependency("boto3", "aws", "Resolving the AWS account id")
         raise ProviderError(
-            "Could not resolve the AWS account id: no AWS credentials were found. "
-            "Set AWS_ACCOUNT_ID, or configure credentials (AWS_PROFILE, "
-            "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or 'aws sso login')."
+            "Could not resolve the AWS account id through STS GetCallerIdentity. "
+            "Check your credentials with 'aws sts get-caller-identity', "
+            "or set AWS_ACCOUNT_ID."
         )
 
     def capabilities(self) -> Mapping[str, bool]:

@@ -1215,7 +1215,13 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
     for label, module, dist, extra, note in (
         ("LiteLLM backend", "litellm", "litellm", "litellm", "routing every provider"),
         ("MCP SDK", "mcp", "mcp", "mcp", "fluid mcp serve / MCP delegates"),
-        ("OpenLineage client", "openlineage", "openlineage-python", "lineage", "lineage emission"),
+        (
+            "OpenLineage client",
+            "openlineage.client",
+            "openlineage-python",
+            "lineage",
+            "lineage emission",
+        ),
     ):
         if is_available(module):
             try:

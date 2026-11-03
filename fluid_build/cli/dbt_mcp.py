@@ -55,6 +55,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
 
 from fluid_build._mcp_compat import attr as _mcp_attr
+from fluid_build._optional import MissingOptionalDependency
 
 LOG = logging.getLogger("fluid.cli.dbt_mcp")
 
@@ -253,7 +254,12 @@ def dbt_mcp_tool_definitions(env: Optional[Mapping[str, str]] = None) -> List[Di
     except Exception as exc:  # noqa: BLE001 - never break tool listing
         # Type-only log (no message interpolation) — the dbt-mcp server's
         # stderr may carry connection-string-shaped text.
-        LOG.warning("dbt MCP tool discovery unavailable: %s", type(exc).__name__)
+        if isinstance(exc, MissingOptionalDependency):
+            # Carries no secrets (a fixed install hint), and it is the one
+            # thing the user needs to see.
+            LOG.warning("dbt MCP tool discovery unavailable: %s", exc)
+        else:
+            LOG.warning("dbt MCP tool discovery unavailable: %s", type(exc).__name__)
         return []
 
 
@@ -272,6 +278,9 @@ def dispatch_dbt_mcp_tool(
     try:
         return DbtMcpClient(env=env).call_tool(bare, arguments or {})
     except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, MissingOptionalDependency):
+            LOG.warning("dbt MCP tool %s failed: %s", name, exc)
+            return {"error": type(exc).__name__, "message": str(exc)}
         LOG.warning("dbt MCP tool %s failed: %s", name, type(exc).__name__)
         return {
             "error": type(exc).__name__,

@@ -410,7 +410,7 @@ class HttpLineageEmitter(LineageEmitter):
             if isinstance(exc, MissingOptionalDependency):
                 # Not a transport failure: the receiver is configured and the
                 # client library that builds the event is absent. Name the extra.
-                _warn_once("missing-openlineage", f"{exc} (lineage is not being emitted)")
+                _warn_once("missing-openlineage", f"Lineage is not being emitted.\n{exc}")
                 return
             # Class-only, because httpx error messages can echo the endpoint URL.
             # Surfaced on the CLI too: "lineage configured but nothing shipped"

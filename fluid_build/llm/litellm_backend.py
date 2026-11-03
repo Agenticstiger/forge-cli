@@ -98,6 +98,18 @@ def _get_litellm() -> Any:
             f"{exc.feature} needs {exc.package}, which is not installed.",
             suggestions=[f"pip install 'data-product-forge[{exc.extra}]'"],
         ) from exc
+    except ImportError as exc:
+        # Present but broken (e.g. litellm >= 1.98 on Python 3.10): same typed
+        # error as "missing", so every existing caller degrades the same way.
+        # ``require`` already wrote "... installed but failed to import: <why>".
+        raise CopilotGenerationError(
+            "copilot_litellm_unavailable",
+            str(exc),
+            suggestions=[
+                "pip install 'data-product-forge[litellm]' "
+                "(installs the litellm version this Python supports)"
+            ],
+        ) from exc
     return litellm
 
 

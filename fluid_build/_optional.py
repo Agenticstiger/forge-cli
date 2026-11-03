@@ -80,6 +80,11 @@ class MissingOptionalDependency(ImportError):
             name=module,
         )
 
+    def __reduce__(self) -> tuple:  # type: ignore[type-arg]
+        # ``__init__`` takes (module, extra, feature) but ``args`` holds the
+        # message, so the default reduce could not rebuild it (pickle, copy).
+        return (type(self), (self.module, self.extra, self.feature))
+
 
 def _present(module: str) -> bool:
     """True when *module* can be located, without importing it."""

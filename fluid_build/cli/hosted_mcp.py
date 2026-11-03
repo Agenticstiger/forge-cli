@@ -76,6 +76,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Tuple
 
 from fluid_build._mcp_compat import attr as _mcp_attr
+from fluid_build._optional import MissingOptionalDependency
 
 # Reuse dbt-mcp's async bridge + result coercion verbatim (borrow, no drift).
 from fluid_build.cli.dbt_mcp import _result_to_payload, _run_async
@@ -400,7 +401,10 @@ def hosted_mcp_tool_definitions(
         except Exception as exc:  # noqa: BLE001 - never break tool listing
             # Type-only log (no message interpolation) — the server's stderr may
             # carry connection-string-shaped text.
-            LOG.warning("%s tool discovery unavailable: %s", spec.name, type(exc).__name__)
+            if isinstance(exc, MissingOptionalDependency):
+                LOG.warning("%s tool discovery unavailable: %s", spec.name, exc)
+            else:
+                LOG.warning("%s tool discovery unavailable: %s", spec.name, type(exc).__name__)
             continue
         for name, description, schema in tools:
             safe_desc = demote_markers(f"[{spec.label}] {description}".strip())
@@ -432,6 +436,9 @@ def dispatch_hosted_mcp_tool(
     try:
         payload = HostedMcpClient(spec, env=env).call_tool(bare, arguments or {})
     except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, MissingOptionalDependency):
+            LOG.warning("hosted MCP tool %s failed: %s", name, exc)
+            return {"error": type(exc).__name__, "message": str(exc)}
         LOG.warning("hosted MCP tool %s failed: %s", name, type(exc).__name__)
         return {
             "error": type(exc).__name__,
