@@ -295,9 +295,11 @@ def _warn_once(key: str, message: str) -> None:
     _WARNED.add(key)
     LOG.warning("%s", message)
     try:
-        from fluid_build._console import warning as console_warning
+        from fluid_build._console import cprint, literal_text
 
-        console_warning(message)
+        # Literal: the message names an install extra such as ``[lineage]``,
+        # which Rich markup would read as a tag and drop.
+        cprint(literal_text(f"⚠️  {message}", style="yellow"))
     except Exception:  # pragma: no cover — console is best-effort
         pass
 

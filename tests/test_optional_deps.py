@@ -492,7 +492,7 @@ def test_verify_without_credentials_reports_them_not_a_none_bucket(cli, monkeypa
 
 
 def test_lineage_without_openlineage_warns_once_naming_the_extra_and_does_not_raise(
-    block, monkeypatch, caplog
+    block, monkeypatch, caplog, capsys
 ):
     block("openlineage")
     monkeypatch.setenv("OPENLINEAGE_URL", "http://127.0.0.1:5000")
@@ -517,6 +517,9 @@ def test_lineage_without_openlineage_warns_once_naming_the_extra_and_does_not_ra
     assert len(warnings) == 1, warnings
     assert "OpenLineage emission needs openlineage-python, which is not installed" in warnings[0]
     assert "pip install 'data-product-forge[lineage]'" in warnings[0]
+    # The console copy too: Rich markup used to swallow ``[lineage]`` there.
+    shown = capsys.readouterr()
+    assert "pip install 'data-product-forge[lineage]'" in shown.out + shown.err
 
 
 # ── duckdb / vowl ────────────────────────────────────────────────────────────
