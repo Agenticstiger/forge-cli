@@ -1,0 +1,63 @@
+import copy
+import json
+from pathlib import Path
+
+import jsonschema
+
+from fluid_build.api.changelog import compare_contracts
+from fluid_build.providers.odcs.mappers.schema import _field_to_property, _property_to_field
+
+
+def test_recursive_odcs_native_shape_and_lossless_extension(contract):
+    for field in contract["exposes"][0]["contract"]["schema"]:
+        prop = _field_to_property(field, None, include_quality=False)
+        schema_path = (
+            Path(__file__).parents[2] / "fluid_build/providers/odcs/odcs-schema-v3.1.0.json"
+        )
+        schema = json.loads(schema_path.read_text())
+        jsonschema.Draft201909Validator(
+            {
+                "$ref": "#/$defs/SchemaProperty",
+                "$defs": schema["$defs"],
+            }
+        ).validate(prop)
+        recovered = _property_to_field(prop)
+        for key in ("type", "fields", "element", "key", "value"):
+            if key in field:
+                assert recovered[key] == field[key]
+        if field["type"] == "struct":
+            assert prop["logicalType"] == "object"
+            assert prop["properties"][1]["properties"][0]["name"] == "country"
+        elif field["type"] == "array":
+            assert prop["items"]["logicalType"] == "object"
+        elif field["type"] == "map":
+            assert prop["customProperties"][0]["property"] == "fluid.recursiveType"
+
+
+def test_recursive_field_diff_in_canonical_contract(contract):
+    new = copy.deepcopy(contract)
+    items = new["exposes"][0]["contract"]["schema"][2]["element"]
+    items["fields"][1]["type"] = "string"
+    report = compare_contracts(contract, new)
+    assert report.has_breaking
+    assert any("items.element.fields.price.type" in change.path for change in report.breaking)
+
+
+def test_nested_required_field_addition_is_breaking(contract):
+    new = copy.deepcopy(contract)
+    new["exposes"][0]["contract"]["schema"][1]["fields"].append(
+        {
+            "name": "new_required",
+            "type": "string",
+            "required": True,
+        }
+    )
+    report = compare_contracts(contract, new)
+    assert report.has_breaking
+
+
+def test_array_element_nullability_tightening_is_breaking(contract):
+    new = copy.deepcopy(contract)
+    new["exposes"][0]["contract"]["schema"][2]["element"]["required"] = True
+    report = compare_contracts(contract, new)
+    assert report.has_breaking

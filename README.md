@@ -55,6 +55,12 @@ global install, [pipx](https://pipx.pypa.io/) works too:
 
 ## What makes it different
 
+**Preview:** [Managed Flink -> Iceberg streaming](docs/flink-iceberg.md) adds
+recursive schemas, generated operator resources, plan/apply/drift integration,
+and checkpoint/catalog verification. The [runnable example](examples/flink-iceberg/)
+includes an opt-in Kafka-to-Iceberg recovery and nested-value fidelity test.
+This lane is opt-in under schema 0.7.7; existing external Flink behavior is unchanged.
+
 Four properties, each with the command that demonstrates it. Everything below was run against
 `data-product-forge` 0.15.0 installed from PyPI, offline, with no cloud credentials configured.
 

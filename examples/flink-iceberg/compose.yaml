@@ -1,0 +1,72 @@
+services:
+  kafka:
+    image: redpandadata/redpanda:v24.3.9
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - 512M
+      - --reserve-memory
+      - 0M
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - 0.0.0.0:9092
+      - --advertise-kafka-addr
+      - kafka:9092
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin # pragma: allowlist secret - disposable local fixture
+  init-storage:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on: [minio]
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        until mc alias set test http://minio:9000 minioadmin minioadmin; do sleep 1; done
+        mc mb --ignore-existing test/warehouse
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    depends_on:
+      init-storage:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin # pragma: allowlist secret - disposable local fixture
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports: ["127.0.0.1:0:8181"]
+  jobmanager:
+    image: ${FLUID_FLINK_TEST_IMAGE:-forge-flink:test}
+    command: jobmanager
+    environment: &flink-env
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin # pragma: allowlist secret - disposable local fixture
+      AWS_REGION: us-east-1
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        parallelism.default: 1
+        execution.checkpointing.interval: 2s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        state.checkpoints.dir: file:///tmp/forge-checkpoints
+        restart-strategy.type: fixed-delay
+        restart-strategy.fixed-delay.attempts: 10
+        restart-strategy.fixed-delay.delay: 1s
+    volumes: ["./job.properties:/etc/forge/job.properties:ro"]
+    ports: ["127.0.0.1:0:8081"]
+  taskmanager:
+    image: ${FLUID_FLINK_TEST_IMAGE:-forge-flink:test}
+    command: taskmanager
+    depends_on: [jobmanager]
+    environment: *flink-env

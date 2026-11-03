@@ -1897,6 +1897,47 @@ def run(args, logger: logging.Logger) -> int:
         _log_apply_failure(logger, start_time, Exception("User interrupted"))
         logger.warning("⚠️ Execution interrupted by user")
         return 130
+    from fluid_build.streaming.compiler import compile_contract
+
+    try:
+        streaming = compile_contract(source_contract)
+    except ValueError as exc:
+        raise CLIError(1, "apply_streaming_invalid", {"error": str(exc)}) from exc
+    if streaming:
+        from fluid_build.streaming.runtime import reconcile
+
+        _gate_contract_for_apply(source_contract, logger)
+        if verified_plan_data is not None and verified_plan_data.get("actions") != [
+            artifact.plan_action(step) for step, artifact in enumerate(streaming, 1)
+        ]:
+            raise CLIError(
+                1,
+                "apply_streaming_artifact_mismatch",
+                {"error": "Compiled streaming resources differ from the bound plan; regenerate it"},
+            )
+        if getattr(args, "build_id", None):
+            raise CLIError(
+                1,
+                "apply_streaming_build_selection",
+                {
+                    "error": "Apply the whole managed streaming contract; partial build selection is not supported",
+                },
+            )
+        hook_rc = _run_apply_hooks_for_source(args, source_contract, logger)
+        if hook_rc:
+            return hook_rc
+        try:
+            results = reconcile(
+                source_contract, mode=resolved_mode.value, dry_run=effective_dry_run
+            )
+        except (ValueError, OSError) as exc:
+            raise CLIError(1, "apply_streaming_failed", {"error": str(exc)}) from exc
+        for result in results:
+            cprint(
+                f"Flink {result['build']}: {result['status']} (delivery requires fluid verify)",
+                markup=False,
+            )
+        return 0
     apply_engine = resolve_apply_engine(args, logger, contract=source_contract)
 
     gate = check_data_loss_gate(

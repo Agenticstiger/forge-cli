@@ -1,0 +1,76 @@
+name: Flink Iceberg preview
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/flink-iceberg.yml"
+      - "fluid_build/streaming/**"
+      - "fluid_build/cli/*flink*"
+      - "fluid_build/cli/generate.py"
+      - "fluid_build/cli/plan.py"
+      - "fluid_build/cli/apply.py"
+      - "fluid_build/cli/diff.py"
+      - "fluid_build/cli/verify.py"
+      - "fluid_build/schema_manager.py"
+      - "fluid_build/schemas/fluid-schema-0.7.7.json"
+      - "fluid_build/providers/odcs/**"
+      - "fluid_build/providers/_iceberg*.py"
+      - "fluid_build/iac/providers/aws.py"
+      - "fluid_build/build_runners/base.py"
+      - "fluid_build/api/changelog_rules.py"
+      - "examples/flink-iceberg/**"
+      - "tests/streaming/**"
+      - "tests/integration/test_flink_iceberg_live.py"
+      - "pyproject.toml"
+  workflow_dispatch:
+    inputs:
+      run_live:
+        description: Run the Docker Kafka-to-Iceberg recovery proof
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Lint, format and type checks
+        run: |
+          ruff check fluid_build/streaming fluid_build/cli/generate_flink.py tests/streaming tests/integration/test_flink_iceberg_live.py
+          black --check fluid_build/streaming fluid_build/cli/generate_flink.py tests/streaming tests/integration/test_flink_iceberg_live.py
+          mypy --strict --follow-imports=silent fluid_build/streaming fluid_build/cli/generate_flink.py
+      - name: Regression tests and streaming coverage gate
+        run: |
+          pytest -q tests/streaming tests/test_diff_changelog.py tests/test_odcs_roundtrip.py tests/test_schema_manager.py tests/test_schema_manager_ext.py tests/test_flink_engine.py \
+            --cov=fluid_build.streaming --cov=fluid_build.cli.generate_flink \
+            --cov-report=term-missing:skip-covered --cov-fail-under=90
+
+  live:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Build matching Flink and Iceberg runtime
+        run: docker build -t forge-flink:test examples/flink-iceberg/runtime
+      - name: Verify nested fidelity, task recovery and schema-drift refusal
+        env:
+          FLUID_TEST_FLINK_ICEBERG: "1"
+        run: pytest -q tests/integration/test_flink_iceberg_live.py

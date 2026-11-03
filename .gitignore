@@ -193,3 +193,6 @@ runtime/
 #   .fluid/ci-state.json    — records inputs that produced committed CI files
 # --- end fluid-cli -------------------------------------------------------
 .verify-logs/
+
+# Versioned Flink runtime sources; its Maven target/ stays locally ignored.
+!examples/flink-iceberg/runtime/

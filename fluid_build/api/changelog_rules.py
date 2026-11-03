@@ -202,8 +202,11 @@ def diff_columns(
     expose_idx: int,
 ) -> List[Change]:
     """Classify per-column changes between two versions of the same expose."""
-    base_cols = baseline_expose.get("schema", []) or []
-    new_cols = new_expose.get("schema", []) or []
+    base_cols = (
+        baseline_expose.get("schema", (baseline_expose.get("contract") or {}).get("schema", []))
+        or []
+    )
+    new_cols = new_expose.get("schema", (new_expose.get("contract") or {}).get("schema", [])) or []
     base_by_name = _columns_by_name(base_cols)
     new_by_name = _columns_by_name(new_cols)
     pk = _primary_key_set(new_expose) | _primary_key_set(baseline_expose)
@@ -228,7 +231,7 @@ def diff_columns(
     # (downstream pipelines may insert rows that fail the NOT NULL check).
     for col_name in new_by_name.keys() - base_by_name.keys():
         col = new_by_name[col_name]
-        is_nullable = col.get("nullable", True) is not False
+        is_nullable = col.get("nullable", not col.get("required", False)) is not False
         severity = "non_breaking" if is_nullable else "breaking"
         description = (
             f"column '{col_name}' added to expose '{expose_id}'"
@@ -302,6 +305,11 @@ def diff_columns(
                     path_prefix=f"{path_prefix}.{col_name}.fields",
                 )
             )
+        changes.extend(
+            _diff_container_children(
+                old, new, expose_id=expose_id, path_prefix=f"{path_prefix}.{col_name}"
+            )
+        )
 
         # PII annotation drift. A column gaining ``pii: true`` is a
         # governance signal — downstream consumers may have access
@@ -326,8 +334,8 @@ def diff_columns(
             )
 
         # Nullability changes.
-        old_null = old.get("nullable", True) is not False
-        new_null = new.get("nullable", True) is not False
+        old_null = old.get("nullable", not old.get("required", False)) is not False
+        new_null = new.get("nullable", not new.get("required", False)) is not False
         if old_null != new_null:
             if new_null and col_name in pk:
                 # PK column became nullable — breaking.
@@ -688,7 +696,7 @@ def _diff_nested_fields(
 
     for fname in new_by_name.keys() - base_by_name.keys():
         field = new_by_name[fname]
-        is_nullable = field.get("nullable", True) is not False
+        is_nullable = field.get("nullable", not field.get("required", False)) is not False
         severity = "non_breaking" if is_nullable else "breaking"
         changes.append(
             Change(
@@ -722,6 +730,19 @@ def _diff_nested_fields(
                     after=new_type,
                 )
             )
+        old_null = old.get("nullable", not old.get("required", False)) is not False
+        new_null = new.get("nullable", not new.get("required", False)) is not False
+        if old_null != new_null:
+            changes.append(
+                Change(
+                    path=f"{path_prefix}.{fname}.required",
+                    kind="nested_nullable_loosened" if new_null else "nested_nullable_tightened",
+                    severity="non_breaking" if new_null else "breaking",
+                    description=f"nested field '{fname}' nullability changed",
+                    before=old_null,
+                    after=new_null,
+                )
+            )
         # Deeper nesting (struct of struct).
         if isinstance(old.get("fields"), Sequence) or isinstance(new.get("fields"), Sequence):
             changes.extend(
@@ -732,7 +753,30 @@ def _diff_nested_fields(
                     path_prefix=f"{path_prefix}.{fname}.fields",
                 )
             )
+        changes.extend(
+            _diff_container_children(
+                old, new, expose_id=expose_id, path_prefix=f"{path_prefix}.{fname}"
+            )
+        )
 
+    return changes
+
+
+def _diff_container_children(
+    old: Mapping[str, Any], new: Mapping[str, Any], *, expose_id: str, path_prefix: str
+) -> List[Change]:
+    changes: List[Change] = []
+    for key in ("element", "key", "value"):
+        before, after = old.get(key), new.get(key)
+        if isinstance(before, Mapping) or isinstance(after, Mapping):
+            changes.extend(
+                _diff_nested_fields(
+                    [{"name": key, **before}] if isinstance(before, Mapping) else [],
+                    [{"name": key, **after}] if isinstance(after, Mapping) else [],
+                    expose_id=expose_id,
+                    path_prefix=path_prefix,
+                )
+            )
     return changes
 
 

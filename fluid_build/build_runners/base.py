@@ -108,6 +108,15 @@ def _report_externally_run_build(build: Dict[str, Any], build_id: str, report: A
     from skips; the run report, whose statuses are succeeded, failed and
     skipped, records it as skipped with ``reason: runs_outside_forge``.
     """
+    from fluid_build.streaming.compiler import managed_config
+
+    if managed_config(build) is not None:
+        cprint(
+            f"\nBuild '{build_id}' is managed by fluid apply on the Flink Operator; "
+            "no local or batch execution is performed."
+        )
+        _record_run_elsewhere(build_id, report)
+        return
     platform = embedded_sql_platform(build) or "its own platform"
     cprint(
         f"\n⏭️  Build '{build_id}' - {describe_externally_run_build(build)} runs on "

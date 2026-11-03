@@ -34,6 +34,7 @@ from ._common import (
     write_json,
 )
 from ._logging import info, warn
+from .console import cprint
 
 if TYPE_CHECKING:
     from fluid_build.iac.drift import StateDriftReport
@@ -235,6 +236,41 @@ def run(args, logger: logging.Logger) -> int:
         # refused it ("Invalid GCP project ID") wrapping an embedded-SQL build
         # into ``CREATE OR REPLACE TABLE <project>...``: every silver and gold.
         contract = resolve_env_templates_in_contract(copy.deepcopy(dict(contract)))
+
+        from fluid_build.streaming.compiler import managed_builds
+
+        if managed_builds(contract):
+            from fluid_build.cli.plan import _gate_contract_for_plan_or_apply
+            from fluid_build.streaming.runtime import StreamingError, inspect_drift
+
+            _gate_contract_for_plan_or_apply(contract, logger, command="plan")
+            if getattr(args, "state", None) or not getattr(args, "live", True):
+                raise CLIError(
+                    1,
+                    "flink_diff_requires_live",
+                    {
+                        "error": "Managed Flink drift requires live Kubernetes reads; omit --state/--no-live",
+                    },
+                )
+            try:
+                results = inspect_drift(contract)
+            except StreamingError as exc:
+                raise CLIError(
+                    EXIT_INSPECTION_FAILED, "flink_diff_inspection_failed", {"error": str(exc)}
+                ) from exc
+            has_drift = any(result["has_drift"] for result in results)
+            write_json(
+                args.out,
+                {
+                    "contract": args.contract,
+                    "drift_source": "flink-operator",
+                    "summary": {"has_drift": has_drift},
+                    "builds": results,
+                    "scope": "operator specification; use verify for Iceberg schema and commit health",
+                },
+            )
+            cprint(f"Managed Flink: {'drift detected' if has_drift else 'no deployment drift'}")
+            return EXIT_DRIFT if has_drift and args.exit_on_drift else 0
 
         # Bug 5a: infer the provider from ``binding.platform`` when the
         # operator didn't pass ``--provider`` and ``FLUID_PROVIDER`` env

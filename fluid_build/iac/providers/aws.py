@@ -231,7 +231,13 @@ def _hive_type(raw: Any) -> str:
 def _columns(schema: List[Mapping[str, Any]]) -> List[Dict[str, str]]:
     columns: List[Dict[str, str]] = []
     for col in schema or []:
-        entry: Dict[str, str] = {"name": col.get("name"), "type": _hive_type(col.get("type"))}
+        if {"fields", "element", "key", "value"} & col.keys():
+            from fluid_build.streaming.types import parse_type
+
+            physical_type = parse_type(col, path=str(col.get("name"))).sql("hive")
+        else:
+            physical_type = _hive_type(col.get("type"))
+        entry: Dict[str, str] = {"name": col.get("name"), "type": physical_type}
         if col.get("description"):
             entry["comment"] = col["description"]
         columns.append(entry)

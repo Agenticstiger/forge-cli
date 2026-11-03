@@ -36,6 +36,7 @@ along with every other quality surface when the provider's
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
@@ -131,6 +132,26 @@ def _property_to_field(prop: Mapping[str, Any]) -> Dict[str, Any]:
             prop.get("logicalTypeOptions"),
         ),
     }
+    recursive = [
+        item.get("value")
+        for item in prop.get("customProperties") or []
+        if isinstance(item, Mapping) and item.get("property") == "fluid.recursiveType"
+    ]
+    if recursive:
+        if len(recursive) != 1 or not isinstance(recursive[0], Mapping):
+            raise ValueError("ODCS fluid.recursiveType must contain exactly one typed object")
+        from fluid_build.streaming.types import parse_type
+
+        parse_type(recursive[0], path=str(fld["name"]))
+        fld.update(
+            copy.deepcopy(
+                {
+                    key: value
+                    for key, value in recursive[0].items()
+                    if key in {"type", "fields", "element", "key", "value"}
+                }
+            )
+        )
     if prop.get("description"):
         fld["description"] = prop["description"]
     if prop.get("classification"):
@@ -422,5 +443,39 @@ def _field_to_property(
         prop["primaryKey"] = True
     elif fld.get("tags") and any(t in ("primary-key", "primaryKey") for t in fld["tags"]):
         prop["primaryKey"] = True
+
+    raw_type = str(fld.get("type", "")).strip().lower()
+    if {"fields", "element", "key", "value"} & fld.keys() or raw_type.startswith(
+        ("timestamp_ltz", "timestamptz", "timestamp(")
+    ):
+        from fluid_build.streaming.types import parse_type
+
+        dtype = parse_type(fld, path=str(fld.get("name")))
+        if dtype.kind == "struct":
+            prop["properties"] = [
+                _field_to_property(child, provider, include_quality) for child in fld["fields"]
+            ]
+        elif dtype.kind == "array":
+            prop["items"] = _field_to_property(
+                {"name": "element", **fld["element"]}, provider, include_quality
+            )
+        # ODCS has native object/array trees, but no typed-map/key nullability
+        # model. Preserve the canonical FLUID type alongside that native view.
+        extension = {
+            "property": "fluid.recursiveType",
+            "value": copy.deepcopy(
+                {
+                    key: value
+                    for key, value in fld.items()
+                    if key in {"type", "fields", "element", "key", "value"}
+                }
+            ),
+        }
+        custom = [
+            item
+            for item in prop.get("customProperties") or []
+            if item.get("property") != "fluid.recursiveType"
+        ]
+        prop["customProperties"] = [*custom, extension]
 
     return prop

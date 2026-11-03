@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://open-data-protocol.github.io/fluid/schema/fluid-schema-0.7.7.json",
-  "title": "FLUID 0.7.7 — Next preview (opened at 0.7.6 GA; no changes yet)",
-  "description": "FLUID contract schema 0.7.7 — the next PREVIEW version, opened when 0.7.6 was promoted to stable. Identical to 0.7.6 at open; additive preview fields land here.",
+  "title": "FLUID 0.7.7 — Preview: recursive streaming types",
+  "description": "Opt-in preview. Adds recursive struct fields, array elements and map key/value types. Stable 0.7.6 is unchanged.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -932,6 +932,15 @@
         "type"
       ],
       "properties": {
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/column"},
+          "description": "Typed child columns of a struct/row/record."
+        },
+        "element": {"$ref": "#/$defs/nestedType"},
+        "key": {"$ref": "#/$defs/nestedType"},
+        "value": {"$ref": "#/$defs/nestedType"},
         "name": {
           "type": "string",
           "minLength": 1
@@ -1159,6 +1168,23 @@
           "$ref": "#/$defs/labels",
           "description": "Field-level labels for metadata and automation."
         }
+      }
+    },
+    "nestedType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {"$ref": "#/$defs/column/properties/type"},
+        "required": {"type": "boolean"},
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/column"}
+        },
+        "element": {"$ref": "#/$defs/nestedType"},
+        "key": {"$ref": "#/$defs/nestedType"},
+        "value": {"$ref": "#/$defs/nestedType"}
       }
     },
     "dqSpec": {

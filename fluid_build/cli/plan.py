@@ -325,7 +325,26 @@ def run(args, logger: logging.Logger) -> int:
         )
 
         # Version-aware routing
-        if _should_use_provider_actions(contract, logger):
+        from fluid_build.streaming.compiler import compile_contract
+
+        streaming = compile_contract(contract)
+        if streaming:
+            plan = {
+                "format_version": fluid_version,
+                "generated_at": time.time(),
+                "mode": getattr(args, "mode", None),
+                "contract": contract,
+                "contract_metadata": {
+                    "id": contract.get("id"),
+                    "version": fluid_version,
+                    "source_path": str(Path(args.contract).resolve()),
+                },
+                "actions": [
+                    artifact.plan_action(step) for step, artifact in enumerate(streaming, 1)
+                ],
+                "total_actions": len(streaming),
+            }
+        elif _should_use_provider_actions(contract, logger):
             plan = _plan_with_provider_actions(contract, args, logger)
         else:
             plan = _plan_legacy(contract, args, logger)

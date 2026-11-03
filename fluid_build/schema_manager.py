@@ -744,7 +744,21 @@ class FluidSchemaManager:
             for error in errors:
                 result.add_error(f"{_error_path(error, locate)}: {format_schema_error(error)}")
 
-            return len(errors) == 0
+            if not errors:
+                from fluid_build.streaming.compiler import validation_errors
+                from fluid_build.streaming.types import parse_type
+
+                for expose in contract.get("exposes") or []:
+                    for column in (expose.get("contract") or {}).get("schema") or []:
+                        if {"fields", "element", "key", "value"} & column.keys():
+                            try:
+                                parse_type(column, path=column["name"])
+                            except ValueError as exc:
+                                result.add_error(str(exc))
+                for message in validation_errors(contract):
+                    result.add_error(message)
+
+            return not result.errors
 
         except Exception as e:
             result.add_error(f"JSON Schema validation error: {str(e)}")
