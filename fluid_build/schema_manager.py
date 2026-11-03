@@ -186,12 +186,16 @@ def _end_anchored_validator(validator_class: Any) -> Any:
 
 def schema_validator(schema: Dict[str, Any]) -> Any:
     """A jsonschema validator for ``schema``, in the dialect it declares, whose
-    ``pattern`` ends at the end of the value (:func:`_end_anchored`).
+    ``pattern`` ends at the end of the value (:func:`_end_anchored`). Validate
+    against a FLUID schema through this, never ``validator_for`` directly.
 
     The keyword is replaced the way check-jsonschema replaces it, with
-    ``jsonschema.validators.extend``. ``patternProperties`` keys keep
-    jsonschema's ``re.search``, as its ``additionalProperties`` and
-    :func:`_locate_error` read them: no FLUID schema uses the keyword.
+    ``jsonschema.validators.extend``. Two places keep jsonschema's own
+    ``re.search``: ``patternProperties`` keys, as its ``additionalProperties``
+    and :func:`_locate_error` read them, and a subschema that declares its own
+    ``$schema`` (or a ``$ref`` to the root, which does), for which jsonschema
+    picks that dialect's own class. No FLUID schema has either; a test fails if
+    one does.
     """
     return _end_anchored_validator(jsonschema.validators.validator_for(schema))(schema)
 

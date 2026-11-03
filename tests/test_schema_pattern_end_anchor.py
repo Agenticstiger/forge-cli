@@ -144,6 +144,19 @@ def test_bundle_validation_refuses_an_id_that_ends_in_a_newline() -> None:
     assert any(m.startswith("at id: ") for m in messages), messages
 
 
+def test_bundle_validation_without_jsonschema_is_an_error(monkeypatch: Any) -> None:
+    """The check reads the flag ``schema_validator`` needs: a jsonschema that is found but
+    fails to import is the library-missing error, not a skipped check."""
+    import fluid_build.schema_manager as schema_manager
+    from fluid_build.forge.core.validators import validate_json_schema
+
+    monkeypatch.setattr(schema_manager, "JSONSCHEMA_AVAILABLE", False)
+    issues = validate_json_schema(
+        "contract.resolved.yaml", _contract("0.7.6"), schema_manager=FluidSchemaManager()
+    )
+    assert [(i.code, i.severity) for i in issues] == [("SCHEMA-LIB-MISSING", "error")]
+
+
 def test_the_error_says_the_value_ends_in_a_line_break() -> None:
     errors = _errors(_contract("0.7.6", "orders\n"))
     assert len(errors) == 1, errors
@@ -167,6 +180,17 @@ def test_the_json_schema_test_suite_case() -> None:
     }
     assert schema_validator(schema).is_valid("abc")
     assert not schema_validator(schema).is_valid("abc\n")
+
+
+def test_a_not_pattern_reads_the_end_anchor_the_same_way() -> None:
+    """``not: {pattern: ...}`` now matches fewer values, as in ECMA-262: a deny rule that
+    has to catch a line break must name one (catalogAuth refuses ``[\\x00-\\x1f\\x7f]``)."""
+    schema = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "not": {"pattern": "^x$"},
+    }
+    assert not schema_validator(schema).is_valid("x")
+    assert schema_validator(schema).is_valid("x\n")
 
 
 # ── the rewrite ─────────────────────────────────────────────────────────────

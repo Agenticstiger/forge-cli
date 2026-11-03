@@ -214,7 +214,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under every bundled schema version (0.7.1 to 0.7.7). Contract, fragment and bundle validation
   now read `$` as the end of the value. Such a value is refused at its path, with a hint when
   the line break is the only problem: `(it ends in a line break, which a YAML | or > block keeps
-  and |- or >- drops)`. The schemas themselves are unchanged.
+  and |- or >- drops)`. A `sink.catalogAuth` field gets no hint, since its value is never shown.
+  The schemas themselves are unchanged.
 
 ## [0.26.0] — 2026-11-01
 
