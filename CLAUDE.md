@@ -118,7 +118,7 @@ The `feat/cli-pipeline-and-publish-hardening` branch (15 commits) landed the **1
 A multi-phase push landed comprehensive UX + architecture upgrades on `feat/source-aligned-acquisition`. Key surfaces and where they live:
 
 - **Mode picker (`fluid forge`).** Bare invocation surfaces a 5-mode menu (AI / Compose / Refine / Template / Blank) instead of dropping into AI. Lives at `cli/_forge_mode_picker.py`. Skipped via `FLUID_FORGE_NO_PICKER=1`. Picker default is highlighted by the welcome scan; user always sees the menu.
-- **Welcome scan.** Detect-first parallel scan runs in <50ms before any prompt — workspace state, AI configured, CLIs installed, sample data, cloud creds, return-user state. Lives at `cli/_welcome_scan.py`. `~/.fluid/usage.json` carries `forge_count`.
+- **Welcome scan.** Detect-first parallel scan runs before any prompt (budget: see the 2026-11-03 section) — workspace state, AI configured, CLIs installed, sample data, cloud creds, return-user state. Lives at `cli/_welcome_scan.py`. `~/.fluid/usage.json` carries `forge_count`.
 - **Mode-aware interviews.** `forge_copilot_interview.py::run_adaptive_copilot_interview` short-circuits to `_run_compose_interview` (3 questions max for `--from-product`) or `_run_refine_interview` (1 question for `--refine`) when the runtime resolved upstreams or loaded an existing contract. Standard mode runs the world-class bootstrap (below).
 - **World-class bootstrap.** New default fresh-product interview at `cli/_world_class_interview.py`. Inferences first (`InterviewSignals`), examples in every prompt, productType-first, `:auto` escape, schema-coverage gate. Toggle via `FLUID_INTERVIEW_LEGACY=1` to revert to the legacy bootstrap.
 - **Slash commands inside the interview.** `cli/_interview_slash_commands.py` — `:ai-setup`, `:override`, `:show-work`, `:doctor`, `:help`, `:quit`. Wrapped into `forge_dialogs.ask_friendly_text` so every prompt accepts them.
@@ -415,6 +415,15 @@ Client Protocol) is the noted v2 transport — `_run_agent` is the only seam it
 would replace; when building it, **depend on the official `agent-client-protocol`
 PyPI SDK** (Pydantic models + async base classes + stdio JSON-RPC) rather than
 hand-rolling the protocol.
+
+## Recent architectural changes worth knowing (2026-11-03, welcome-scan budget)
+
+`cli/_welcome_scan.py::run_welcome_scan` now has a budget that means what it says:
+
+- **One wall-clock cap.** `_TOTAL_TIMEOUT_S` (1.0 s) is the only scan budget; the old per-probe `_PROBE_TIMEOUT_S` is gone. Probes run on daemon threads (`_spawn_probe`: one `Future` each, deliberately not a `ThreadPoolExecutor`, whose non-daemon workers are joined at interpreter exit and would hold the CLI open for an abandoned probe). The scan returns at the deadline and drops stragglers. Python cannot kill a thread, so an abandoned probe keeps running in the background until it finishes; the one that can run long is `_probe_specialization_suggestion` (unbounded `rglob`), and the picker, the interview signals and the welcome panel each start a scan, so up to three walkers can overlap on a huge cwd. Probes must not write to stdout/stderr (a daemon thread caught mid-write at interpreter exit can abort the process).
+- **Cold imports are off the clock.** `_warm_probe_imports` imports `_WARM_MODULES` (the AI-config pydantic chain, the dbt runner) from the main thread while the probes run, then the budget starts. Probe imports stay function-local: if a probe starts importing something new, list it in `_WARM_MODULES` or `tests/test_welcome_scan_budget.py::test_probes_import_nothing_new_after_the_warm_up` fails. NB `build_parser()` already imports `ai_setup`, the dbt runner and pydantic, so in a real CLI process only `copilot.unified_config` is still cold; the warm-up matters for tests and library callers.
+- **dbt has its own cap.** `_DBT_VERSION_TIMEOUT_S` (0.32 s) sizes the `dbt --version` subprocess and is not derived from the scan budget and must stay below it, so the child is killed by its own timeout instead of being orphaned. With Python dbt-core on PATH it usually waits out that cap, which is the scan's floor (~0.35 s).
+- `scan_duration_ms` is the real wall-clock of the call, imports included. Pins: `tests/test_welcome_scan_budget.py`.
 
 ## Working style
 

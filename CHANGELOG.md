@@ -209,6 +209,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tofu force-unlock <ID>` in the workdir (the ID is in tofu's error) clears it. A run that
   hits `FLUID_TOFU_TIMEOUT_SECONDS` is now interrupted (SIGINT) so tofu releases the lock, and
   killed only if it ignores that for 30 seconds.
+- **A column type AWS Glue or BigQuery could not hold was written anyway, and `fluid validate
+  --strict` passed.** The Glue emitter mapped 22 type names and turned every other one into
+  `string`: 47 of the 79 types the schema admits, among them `smallint`, `tinyint`, `int2`,
+  `int4`, `int8`, `real`, `money`, `bit`, `year`, `datetime2`, `timestamptz` and the other
+  timestamp spellings, `varbinary` and `blob`, and every array, struct, map, object, record and
+  row. The BigQuery emitter wrote `ARRAY` for an array, which is not a BigQuery column type (an
+  array is a REPEATED column of an element type), and a `STRUCT` with no fields, which BigQuery
+  rejects at apply, after the dataset was created; the element type of `array(string)` was
+  dropped on both clouds. Every type is now classified for each cloud. Each scalar with a Hive or
+  Athena type gets it (`smallint`, `int`, `bigint`, `float`, `double`, `timestamp`, `binary`,
+  `money` as `decimal(19,4)`, `bit` as `boolean`, `year` as `smallint`; the zone-aware
+  timestamps are `timestamp`, which keeps the UTC instant and not the offset; a bare `number` is
+  `decimal(38,9)`, as a bare `decimal` always was). A type Glue has no form for but that keeps
+  its value as text (`json`, `jsonb`, `variant`, `super`, `time`, `interval`, `bignumeric`) is
+  still written as `string`, and `fluid validate` now warns for it, so `--strict` fails; BigQuery
+  warns for `geometry` and `geom`, which are planar and become the spherical `GEOGRAPHY`, and
+  for a `decimal(p,s)` wider than a BigQuery NUMERIC holds (29 integer and 9 fractional digits;
+  declare `bignumeric`). A
+  type with no faithful form at all is refused with kind `column-type`: an array, struct, map,
+  object, record or row (also `array(string)`), a `bit(n)` wider than one bit and a type no
+  table maps, on both clouds, and on Glue also `geography`, `geometry`, `geom`, `point` and
+  `hll`, and a decimal Hive would reject (precision over 38 or 0, a scale over the precision
+  or below 0). The
+  refusal names the expose, each column, its declared type and why, and the fix (declare `json`
+  or `string` for now; typed nested columns are planned). `fluid validate`, `fluid generate iac`
+  and `fluid apply` raise the same refusal from the same function, so a contract that passes
+  validate cannot fail generate on a type. A BigQuery view carries no schema and is not checked.
+  `fluid verify` and `fluid diff` compare the live table with the new mapping, so a Glue table
+  applied by an earlier version reports type mismatches (verify: CRITICAL; diff: drift) on those
+  columns until `fluid apply` runs; verify's "require table recreation" wording is wrong for
+  these columns, a re-apply updates them in place. Changing a Glue column's type in place is
+  held by the data-loss gate: `fluid apply` (and its dry run) refuses, naming each table and
+  `column: old -> new`, until `--allow-data-loss`, because Parquet written under the old type
+  (Athena INSERT or CTAS, dbt) may stop reading until it is rewritten, and reverting the type
+  restores reads; a difference in spacing alone (`decimal(10, 2)`) is no change. The 0.16.2
+  note that only a bare `array` has no BigQuery form is superseded: an array of any element type and every
+  struct-like type are refused until the contract schema can declare element and field types.
+  BigQuery decimal precision and scale are still not emitted.
+
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
   never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
   sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP
@@ -258,6 +297,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dimension that reads the workspace's metastore summary for every table the module manages: it
   passes when the region matches the declaration, fails with the fix when it does not, and is
   skipped when the contract declares none.
+- **An AWS contract's schedule was dropped without a word, and the one it got was not labelled.**
+  The workflow Lambda was named `fluid-workflow-<id>` raw, so a dotted id (the schema's own
+  example is `gold.hr.employee_360_v1`, and 27 of 28 examples use dots) or one over about 49
+  characters failed the plan validator, and `native_actions` swallowed the refusal at DEBUG:
+  `fluid generate iac` and `fluid apply` logged "Planned EventBridge schedule", wrote the Glue and
+  S3 resources and no `aws_lambda_function`, `aws_lambda_permission` or `aws_scheduler_schedule`,
+  exit 0. Every name the schedule planner derives from an id (Lambda functions, permission
+  statement ids, the schedule, event rules, the state machine, the MWAA environment) now goes
+  through one helper that replaces what the service refuses with `-` and, when it had to change
+  the name at all (a replacement, or a cut to the service limit), ends it in a hash of the whole
+  id, so `a.b` and `a-b` cannot share one Lambda and two long ids stay apart; a name the service
+  already accepts is left as written, so nothing deployed is renamed. A plan its own validator
+  rejects, an orchestration task the planner rejects and a schedule-planner failure are a typed
+  `PlanValidationError`, matched by type through the cause chain like a sovereignty refusal:
+  `generate iac` exits non-zero and `apply` raises, where a planner that could not run (no SDK,
+  no credentials) stays best-effort. This holds for every AWS plan-validator refusal, so a
+  contract with no schedule that the validator refuses (a bad Glue name, say) now fails
+  `generate iac` and `apply` too, where it used to emit the module without a word (`fluid plan`
+  already refused it). The scheduled Lambda only logs each
+  task and runs no build, and both roles it names (`fluid-workflow-execution`,
+  `EventBridgeSchedulerRole`) are never created, so every plan that emits it now warns
+  `schedule_placeholder_lambda`. When no AWS account can be resolved (no `AWS_ACCOUNT_ID`, no
+  credentials for `sts:GetCallerIdentity`), a contract that declares orchestration (a schedule,
+  triggers or tasks) is refused by name, before any name is derived from it, rather than as a Glue
+  or S3 name `None-fluid-staging` the validator would reject, and the message says so when the
+  cause is a missing boto3 (`pip install 'data-product-forge[aws]'`) rather than credentials. A
+  contract without orchestration needs no native plan and applies its exposes as before; the
+  sovereignty check still runs first either way.
+- **The AWS plan validator refused dotted S3 bucket names.** S3 allows lowercase letters, digits,
+  dots and hyphens (3-63 characters, a letter or digit at each end, no `..`, `.-` or `-.`, not
+  shaped like an IP address); the validator allowed no dot, which was harmless while its refusals
+  were swallowed and is not now that they stop `generate iac` and `apply`.
+- **A contract value could run as code in the AWS workflow Lambda.** The schedule planner spliced
+  task params and the contract id into the Lambda's Python source inside quote marks, so a task
+  param such as `'''+__import__('os').system('id')+'''` (the schema accepts any task params)
+  closed the literal and ran on every schedule tick under `fluid-workflow-execution`, and an id
+  with a trailing newline left a Lambda that was a SyntaxError. Every value now reaches the
+  source as a `repr()` literal.
+- **The same AWS contract could emit a different module from one run to the next.** The AWS
+  planner ordered its actions through a `set`, so the order changed with Python's hash seed, and
+  with it the emitted module: a Lambda permission, schedule target, event-source mapping or S3
+  notification named the function by literal ARN in one run and by
+  `${aws_lambda_function.<name>.arn}` in the next (the reference only when the function happened
+  to be planned first), so tofu sometimes had no ordering edge to the function. Actions now keep
+  the order they were planned in. Measured on 21 AWS contracts: modules without a Lambda are
+  byte-identical to before; scheduled ones now always emit the reference.
 
 ### Removed
 
@@ -280,6 +365,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into `main.tf.json`. The module's allowlists now end in `\Z`, so such a name is refused with
   `Invalid SQL identifier: 'spectrum_events\n'`. That includes a name that reaches it with a
   trailing newline from an environment variable or a file; strip the value where it is set.
+### Upgrade notes
+
+- A contract with a column typed `array`, `struct`, `map`, `object`, `record` or `row` (or
+  `array(...)`) on an `aws` Glue table or a `gcp` BigQuery table now fails `fluid validate`,
+  `fluid generate iac` and `fluid apply` with `column-type`, where it validated and wrote a
+  `string` column (Glue) or an invalid one (BigQuery). Declare the column `json` (BigQuery's
+  JSON type; Glue stores it as `string` and validate warns) or `string` until typed nested
+  columns are supported.
+- Other new refusals (kind `column-type`): on Glue, `geography`, `geometry`, `geom`, `point` and
+  `hll` (previously a silent `string`; declare `string` or `binary`) and a decimal Hive rejects
+  (precision over 38 or 0, scale over the precision or below 0); on both clouds, `bit(n)` with
+  n over 1 and any type no table maps.
+- New validate warnings, so `--strict` fails: on Glue, `json`, `jsonb`, `variant`, `super`,
+  `time`, `interval` and `bignumeric` (written as `string`, as before; declare `string` to say
+  so); on BigQuery, `geometry` and `geom` (planar, written as the spherical `GEOGRAPHY`) and a
+  `decimal(p,s)` wider than a NUMERIC holds (29 integer or 9 fractional digits; declare
+  `bignumeric`).
+- A Glue table's `smallint`, `tinyint`, `real`, `money`, `timestamptz` and the other types that
+  used to become `string` now get their Hive type, which is a column type change on a table an
+  earlier version applied. `fluid apply` refuses it, and so does its dry run, until
+  `--allow-data-loss`: the refusal names each table and `column: old -> new`. Parquet files
+  written under the old `string` schema (by Athena INSERT or CTAS, or dbt) hold strings, so
+  after `string` -> `smallint` Athena fails every read of them until they are rewritten (files
+  forge's own DuckDB build wrote are fixed by the change). Reverting the column type in the
+  contract restores reads, and `--allow-data-loss` proceeds (measured against moto with real
+  `tofu`: refused without the flag, `~1` applied with it). A difference in spacing alone, such as
+  `decimal(10, 2)` and `decimal(10,2)`, never trips the gate, and neither does an added or
+  removed column, which the gate did not cover before. Consumers that compare these columns as
+  strings (`small = '5'`) may need changes. Until the apply, `fluid verify` and `fluid diff`
+  report the mismatch. With the plan's change list unreadable, an AWS apply that updates
+  anything in place now also needs the flag, as a Databricks apply already did.
+- `decimal(10, 2)` is now written `decimal(10,2)`. Against moto, that alone applies without the
+  flag; real Glue was not measured.
 
 - **Other validators let a value with a trailing newline through, too.** The same `$` ended other
   whole-string patterns, so a value written as a YAML `|` block, read from a `.env` file or decoded
@@ -294,6 +412,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row-filter names, Singer tap and target names, prompt profile and overlay names, mission
   predicate paths, AWS and GCP resource names, Snowflake account segments, Databricks git refs,
   and the identifier and version checks of ODCS and ODPS imports.
+
+- **Schema validation let a value with a trailing newline through a `pattern`.** JSON Schema
+  writes `pattern` in ECMA-262, where `$` matches only at the end of the value, but the
+  jsonschema library runs it with Python's `re.search`, whose `$` also matches before a final
+  newline. So `fluid validate` accepted `id: "orders\n"`, which an `id: |` block scalar produces,
+  under every bundled schema version (0.7.1 to 0.7.7). Contract, fragment and bundle validation
+  now read `$` as the end of the value. Such a value is refused at its path, with a hint when
+  the line break is the only problem: `(it ends in a line break, which a YAML | or > block keeps
+  and |- or >- drops)`. A `sink.catalogAuth` field gets no hint, since its value is never shown.
+  The schemas themselves are unchanged.
 
 - **`fluid diff --baseline` compared contracts that no schema accepts.** Its rules read only the
   shapes a schema allows, so a value of the wrong type hid a change: a column retyped from
@@ -316,9 +444,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is not enough there, because GitHub still links `\@user`, `\#1` and `\:smile\:` after
   rendering. The fence is one backtick longer than any run of backticks in the name, and the
   document is redacted per value before it is written, so a redaction cannot take the closing
-  fence with it. A Markdown
-  entry now reads ``- **column_added** `exposes[0].contract.schema.email` — `column 'email' added
-  to expose 'orders'` ``. The `fluid forge --refine` preview prints the same text without markup.
+  fence with it. A Markdown entry now reads
+  ``- **column_added** `exposes[0].contract.schema.email` — `column 'email' added to expose 'orders'` ``.
+  The `fluid forge --refine` preview prints the same text without markup.
 
 ## [0.26.0] — 2026-11-01
 

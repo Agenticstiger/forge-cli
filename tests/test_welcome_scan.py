@@ -46,7 +46,7 @@ def isolate_home(tmp_path, monkeypatch):
 def test_welcome_scan_returns_findings_under_one_second(tmp_path: Path):
     findings = run_welcome_scan(start=tmp_path)
     assert isinstance(findings, WelcomeFindings)
-    assert findings.scan_duration_ms < 1500  # 50ms budget + slack for CI
+    assert findings.scan_duration_ms < 1500  # budget is lifted by the fixture: real probe latency
 
 
 def test_welcome_scan_detects_workspace(tmp_path: Path):
