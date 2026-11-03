@@ -27,16 +27,17 @@ from fluid_build.build_runners import base
 from fluid_build.providers.odcs.mappers.schema import _field_to_property
 from fluid_build.schema_manager import FluidSchemaManager
 from fluid_build.streaming.compiler import (
+    compile_build,
     compile_contract,
     managed_builds,
     validation_errors,
     validation_warnings,
 )
-from tests.test_flink_engine import _contract as _stable_flink_contract
+from tests._flink_support import flink_contract
 
 
 def _stable(parameters):
-    contract = _stable_flink_contract("0.7.6")
+    contract = flink_contract("0.7.6")
     contract["builds"][0]["properties"]["parameters"] = parameters
     return contract
 
@@ -75,6 +76,9 @@ def test_preview_contract_is_managed_and_an_older_one_is_not(contract):
     assert compile_contract(older) == ()
     (warning,) = validation_warnings(older)
     assert "needs fluidVersion 0.7.7 or later" in warning
+    # compile_build has its own check, for a caller that skips managed_builds.
+    with pytest.raises(ValueError, match="0.7.7 or later"):
+        compile_build(older, older["builds"][0])
 
 
 @pytest.mark.parametrize("version", ["0.7.8", "0.8", "1.0.0", "0.7.7-rc1", "0.7.7 ", 0.8, None])
