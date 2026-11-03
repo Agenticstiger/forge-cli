@@ -244,6 +244,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `fluid forge` welcome scan kept walking the whole directory tree after it had returned.**
+  Its type-suggestion probe listed contracts with `sorted(cwd.rglob("contract.fluid.yaml"))[:8]`,
+  which reads every file under the current directory (279 s under a folder holding many repos) and
+  goes into `.venv`, `.git` and `node_modules`. The scan returns at its 1.0 s budget, but Python
+  cannot kill a thread, so the walker went on at about half a core, and the mode picker, the
+  interview and the welcome panel each start a scan: up to three overlapped. The walk is now
+  bounded and ends with its scan. It skips the directories `util/upstream_discovery` already skips
+  (`.git`, `.venv`, `site-packages`, `node_modules`, `dist`, `build`, ...), lists at most 6 levels
+  below the current directory, reads at most 10,000 directory entries, and stops at its next
+  directory once the scan has returned; one walk runs at a time per process. It tallies the same
+  first 8 contracts as before wherever those limits do not cut the walk. A symlink named
+  `contract.fluid.yaml`, or one that is not a regular file (a FIFO, a device), is no longer
+  opened.
+
 - **`fluid apply --mode amend-and-build` provisioned a product, then refused its id.** The build
   phase keeps run records, cursors and watermarks under `.fluid/runs/<contract.id>/<build.id>/`,
   so its ids must start with a letter or underscore, use only letters, digits, `_`, `.` and `-`,

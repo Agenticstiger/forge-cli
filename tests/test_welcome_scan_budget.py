@@ -14,13 +14,15 @@
 
 """Welcome-scan budget semantics.
 
-Two promises, both measured against a real clock rather than a mocked one:
+Three promises, all measured against a real clock rather than a mocked one:
 
 * the cold imports the probes trigger are paid before the budget starts, so the
   first scan of a process returns what a warm scan returns (on a loaded machine
   the AI probe's pydantic import used to blow the old per-probe window);
 * ``_TOTAL_TIMEOUT_S`` is a real cap: the scan returns on time and a probe it
-  gave up on cannot keep the process alive.
+  gave up on cannot keep the process alive;
+* the one probe that can run long, the tree walk, ends when its scan does, and a
+  process holds at most one walker however many scans it runs.
 """
 
 from __future__ import annotations
@@ -139,6 +141,144 @@ def test_abandoned_probe_does_not_keep_the_process_alive(tmp_path):
         f"process lingered {exited - scan_returned:.1f}s after the scan returned; "
         "an abandoned probe thread is keeping it alive"
     )
+
+
+# ---------------------------------------------------------------------------
+# The tree walk ends with its scan
+# ---------------------------------------------------------------------------
+
+
+def _walkers():
+    return [t for t in threading.enumerate() if t.name.startswith("welcome-scan-specialization")]
+
+
+def _wait_until(predicate, timeout):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def _fan_tree(root: Path, fan: int = 20) -> int:
+    """``fan`` directories under ``root`` holding ``fan`` empty ones each; no contract anywhere.
+
+    Returns how many directories a complete walk would list.
+    """
+    for i in range(fan):
+        for j in range(fan):
+            (root / f"d{i:02d}" / f"e{j:02d}").mkdir(parents=True)
+    return 1 + fan + fan * fan
+
+
+class _Listing:
+    """``os.scandir`` for the walker thread only; every other caller gets the real one.
+
+    Each directory the walker lists waits ``delay`` seconds first. With ``hang`` the
+    first listing waits for ``release`` instead, as a call stuck on a dead network
+    mount would. ``release`` cuts every wait short, so cleanup is instant.
+    """
+
+    def __init__(self, delay: float = 0.0, hang: bool = False):
+        self.delay, self.hang = delay, hang
+        self.release = threading.Event()
+        self.listed: list = []
+        self._real = os.scandir
+
+    def __call__(self, path="."):
+        if threading.current_thread().name.startswith("welcome-scan-specialization"):
+            self.listed.append(str(path))
+            self.release.wait(60 if self.hang and len(self.listed) == 1 else self.delay)
+        return self._real(path)
+
+
+@pytest.fixture
+def short_scan(monkeypatch):
+    """A 0.3s scan with no dbt and the imports paid: it returns at the cap while a walk is going."""
+    monkeypatch.setattr(ws, "_TOTAL_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(
+        "fluid_build.build_runners.dbt.runner._resolve_dbt_executable", lambda: None
+    )
+    ws._warm_probe_imports()
+    assert _wait_until(lambda: not _walkers(), 2.0), "a walker from an earlier test is still alive"
+
+
+def test_a_walk_the_scan_gave_up_on_ends_within_a_second_of_the_scan(
+    tmp_path, monkeypatch, short_scan
+):
+    """Python cannot kill the walker, so the scan tells it to stop and it ends at its next directory.
+
+    The tree takes 21s to walk at 50 ms a directory and the scan gives up after 0.3s.
+    Without the stop flag the walker reads on for the other 20s.
+    """
+    directories = _fan_tree(tmp_path)
+    stand_in = _Listing(delay=0.05)
+    monkeypatch.setattr(os, "scandir", stand_in)
+    try:
+        ws.run_welcome_scan(start=tmp_path)
+        returned = time.monotonic()
+        gone = _wait_until(lambda: not _walkers(), timeout=2.0)
+        ended_after = time.monotonic() - returned
+        listed = len(stand_in.listed)
+        time.sleep(0.3)
+        assert gone, f"the walker was still reading {ended_after:.1f}s after the scan returned"
+        assert len(stand_in.listed) == listed  # not one more directory once it ended
+        assert listed < directories / 4  # nowhere near the whole tree
+    finally:
+        stand_in.release.set()
+
+
+def test_consecutive_scans_never_have_two_walks_reading_at_once(tmp_path, monkeypatch, short_scan):
+    """Each scan abandons its walk; the next scan's walk waits for it instead of overlapping."""
+    _fan_tree(tmp_path)
+    stand_in = _Listing(delay=0.05)
+    monkeypatch.setattr(os, "scandir", stand_in)
+    reading = {"now": 0, "most": 0, "walks": 0}
+    lock = threading.Lock()
+    real_walk = ws._walk_contracts
+
+    def counted(start, stop):
+        with lock:
+            reading["now"] += 1
+            reading["walks"] += 1
+            reading["most"] = max(reading["most"], reading["now"])
+        try:
+            return real_walk(start, stop)
+        finally:
+            with lock:
+                reading["now"] -= 1
+
+    monkeypatch.setattr(ws, "_walk_contracts", counted)
+    try:
+        for _ in range(3):
+            ws.run_welcome_scan(start=tmp_path)
+            assert _wait_until(lambda: len(_walkers()) <= 1, timeout=1.0)
+        assert _wait_until(lambda: not _walkers(), timeout=2.0)  # none outlives the last scan
+    finally:
+        stand_in.release.set()
+
+    assert reading["walks"] >= 1
+    assert reading["most"] == 1
+
+
+def test_three_scans_over_a_hung_filesystem_leave_one_walker(tmp_path, monkeypatch, short_scan):
+    """A walk stuck inside a filesystem call (a dead network mount) cannot be stopped.
+
+    The scans after it must not add a stuck thread each: their walks wait behind the
+    first one and leave with their own scan. Before the gate: three walkers.
+    """
+    _fan_tree(tmp_path, fan=2)
+    stand_in = _Listing(hang=True)
+    monkeypatch.setattr(os, "scandir", stand_in)
+    try:
+        for _ in range(3):
+            ws.run_welcome_scan(start=tmp_path)
+        assert _wait_until(lambda: len(_walkers()) == 1, timeout=2.0), _walkers()
+        assert len(stand_in.listed) == 1  # only the first walker ever reached the filesystem
+    finally:
+        stand_in.release.set()
+    assert _wait_until(lambda: not _walkers(), timeout=2.0)  # unstuck, it sees its stop and ends
 
 
 # ---------------------------------------------------------------------------
