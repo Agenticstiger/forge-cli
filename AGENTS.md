@@ -371,7 +371,7 @@ Cost is visible before it's spent: every run renders `.fluid/agents/<run-id>/{co
 Opt into the **LiteLLM unified backend** for one API across OpenAI / Anthropic / Gemini / Bedrock / Azure / Vertex / Groq / Cohere / Mistral / Ollama:
 
 ```bash
-pip install "fluid-build[litellm]"
+pip install "data-product-forge[litellm]"
 export FLUID_LLM_BACKEND=litellm
 fluid forge --llm-provider gemini --llm-model gemini-2.5-flash
 ```

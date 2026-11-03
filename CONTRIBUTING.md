@@ -372,9 +372,8 @@ class AtlasCatalogAdapter(CatalogAdapter):
                 import atlasclient  # type: ignore[import-not-found]
             except ImportError as exc:
                 raise CatalogConfigError(
-                    "atlasclient missing. Install with: "
-                    'pip install "data-product-forge[atlas]"',
-                    suggestions=['pip install "data-product-forge[atlas]"'],
+                    "atlasclient missing. Install with: pip install atlasclient",
+                    suggestions=["pip install atlasclient"],
                 ) from exc
             self._client = atlasclient.Atlas(...)
         return self._client

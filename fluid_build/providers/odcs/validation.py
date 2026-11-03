@@ -100,7 +100,7 @@ def validate_via_vowl(odcs: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
 
     Why: ``jsonschema`` alone misses format-level (uuid/email/...) and
     unevaluated-properties enforcement; vowl is the Bitol-vendor-listed
-    validator that catches them. Pip-extra: ``fluid-build[odcs-strict]``.
+    validator that catches them. Pip-extra: ``data-product-forge[odcs-strict]``.
 
     Returns ``None`` when vowl isn't installed (so callers can skip
     cleanly). Returns ``{api_version, schemas, total_checks}`` on
