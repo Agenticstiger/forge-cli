@@ -49,8 +49,17 @@ Jobs and workspace files are kept as sent (``jobs[id]["settings"]``, ``workspace
 so a test asserts on exactly what the provider submitted; ``add_job`` / ``add_workspace_file``
 seed brownfield objects.
 
+It also serves the Files API on Unity Catalog volumes (``add_volume``): PUT / DELETE of a file,
+PUT / GET / DELETE of a directory, backed by a temporary directory so the bytes a client uploads
+are really on disk (``volume_files`` lists them, ``file_ops`` orders the calls). Two data
+statements run over those files: ``INSERT OVERWRITE <table> SELECT <columns> FROM
+read_files('<dir>', format => 'parquet')`` reads the Parquet with DuckDB and REPLACES the table's
+rows (``rows``; the table's definition, row filter and masks are left as they are, as the real
+statement leaves them), reporting ``num_affected_rows`` / ``num_inserted_rows`` as Databricks does
+unless ``insert_reports_count`` is False, and ``SELECT COUNT(*) FROM <table>``.
+
 Not proven here: what real Databricks accepts (SQL dialect, warehouse state, the privilege
-model, Unity Catalog storage), whether a job's settings are valid (the fake stores any), job
+model, Unity Catalog storage, ``read_files`` itself), whether a job's settings are valid (the fake stores any), job
 runs, and any workspace-level setting.
 
 The provider is pointed at it with ``host`` and a dummy ``token``. Standalone:
@@ -62,10 +71,14 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -300,6 +313,7 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
                 if col["name"] in kept:
                     col["mask"] = kept[col["name"]]
         fake.tables[full] = new
+        fake.table_rows.pop(full, None)  # a new table holds no rows
         return True, ""
 
     m = re.match(
@@ -371,6 +385,7 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
         if full not in fake.tables:
             return (True, "") if ie else (False, f"[TABLE_OR_VIEW_NOT_FOUND] {full}")
         del fake.tables[full]
+        fake.table_rows.pop(full, None)
         fake.grants.pop(("table", full), None)
         return True, ""
 
@@ -554,6 +569,109 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
     return False, f"fake_databricks: unsupported statement: {s[:200]}"
 
 
+def _count_doc(n: int) -> Dict[str, Any]:
+    """The result of a one-column query: a row of strings, as the Statement Execution API sends."""
+    return {
+        "manifest": {
+            "format": "JSON_ARRAY",
+            "schema": {
+                "column_count": 1,
+                "columns": [{"name": "count(1)", "type_name": "LONG", "position": 0}],
+            },
+            "total_row_count": 1,
+        },
+        "result": {"row_count": 1, "data_array": [[str(n)]]},
+    }
+
+
+def _insert_doc(n: int, report: bool) -> Dict[str, Any]:
+    """What ``INSERT`` answers: ``num_affected_rows`` and ``num_inserted_rows`` (Databricks SQL)."""
+    if not report:
+        return {}
+    names = ("num_affected_rows", "num_inserted_rows")
+    return {
+        "manifest": {
+            "format": "JSON_ARRAY",
+            "schema": {
+                "column_count": 2,
+                "columns": [
+                    {"name": name, "type_name": "LONG", "position": i}
+                    for i, name in enumerate(names)
+                ],
+            },
+            "total_row_count": 1,
+        },
+        "result": {"row_count": 1, "data_array": [[str(n), str(n)]]},
+    }
+
+
+def _data_statement(fake: "FakeDatabricks", sql: str) -> Optional[Tuple[bool, str, Dict[str, Any]]]:
+    """``(ok, error, result)`` for a statement that reads or writes rows, ``None`` for any other.
+
+    ``INSERT OVERWRITE <t> SELECT <cols> FROM read_files('<dir>', format => 'parquet')`` replaces
+    the rows of ``<t>`` with the Parquet files under ``<dir>`` (a path on a volume the Files API
+    holds), the columns taken by position as an INSERT without a column list takes them.
+    """
+    s = sql.strip().rstrip(";").strip()
+    m = re.match(
+        rf"INSERT\s+OVERWRITE\s+(?:TABLE\s+)?{_FULL}\s+SELECT\s+(.+?)\s+"
+        rf"FROM\s+read_files\s*\(\s*{_QUOTED}\s*,\s*format\s*=>\s*'parquet'\s*\)\s*$",
+        s,
+        re.S | re.I,
+    )
+    if m:
+        cat, sch, name, select, literal = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        table = fake.tables.get(full)
+        if table is None:
+            return (
+                False,
+                f"[TABLE_OR_VIEW_NOT_FOUND] The table or view `{cat}`.`{sch}`.`{name}` cannot "
+                "be found.",
+                {},
+            )
+        wanted = _names(select)
+        if len(wanted) != len(table["columns"]):
+            return (
+                False,
+                f"[INSERT_COLUMN_ARITY_MISMATCH.NOT_ENOUGH_DATA_COLUMNS] Cannot write to {full}: "
+                f"the table has {len(table['columns'])} columns, the query {len(wanted)}.",
+                {},
+            )
+        directory = fake._fs_path(re.sub(r"\\(.)", r"\1", literal))
+        files = (
+            sorted(str(p) for p in Path(directory).rglob("*.parquet"))
+            if directory is not None and os.path.isdir(directory)
+            else []
+        )
+        if not files:
+            return (
+                False,
+                f"[UNABLE_TO_INFER_SCHEMA] read_files found no Parquet file at {literal!r}.",
+                {},
+            )
+        import duckdb
+
+        con = duckdb.connect(":memory:")
+        try:
+            quoted = ", ".join('"' + c.replace('"', '""') + '"' for c in wanted)
+            fetched = con.execute(f"SELECT {quoted} FROM read_parquet(?)", [files]).fetchall()
+        except Exception as exc:  # noqa: BLE001 — what the file lacks is the statement's error
+            return False, f"[UNRESOLVED_COLUMN] {type(exc).__name__}: {exc}", {}
+        finally:
+            con.close()
+        names = [c["name"] for c in table["columns"]]
+        fake.table_rows[full] = [dict(zip(names, row, strict=True)) for row in fetched]
+        return True, "", _insert_doc(len(fetched), fake.insert_reports_count)
+    m = re.match(rf"SELECT\s+COUNT\(\s*(?:\*|1)\s*\)\s+FROM\s+{_FULL}\s*$", s, re.I)
+    if m:
+        full = ".".join(m.groups())
+        if full not in fake.tables:
+            return False, f"[TABLE_OR_VIEW_NOT_FOUND] The table or view {full} cannot be found.", {}
+        return True, "", _count_doc(len(fake.table_rows.get(full, [])))
+    return None
+
+
 # ---------------------------------------------------------------------- a client
 class _HttpError(Exception):
     """What the SDK raises for an error status; ``status_code`` is what forge-cli reads."""
@@ -570,15 +688,29 @@ class _ApiClient:
     def __init__(self, endpoint: str):
         self._endpoint = endpoint
 
-    def do(self, method: str, path: str, query: Any = None, body: Any = None, **_: Any) -> Any:
+    def do(
+        self,
+        method: str,
+        path: str,
+        query: Any = None,
+        body: Any = None,
+        headers: Any = None,
+        data: Any = None,
+        **_: Any,
+    ) -> Any:
         import urllib.error
         import urllib.parse
         import urllib.request
 
         url = self._endpoint + path + ("?" + urllib.parse.urlencode(query) if query else "")
-        data = json.dumps(body).encode() if body is not None else None
-        request = urllib.request.Request(url, data=data, method=method)
+        if data is not None:  # a stream or bytes, sent as the SDK sends a file upload
+            payload = data if isinstance(data, (bytes, bytearray)) else data.read()
+        else:
+            payload = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=payload, method=method)
         request.add_header("Content-Type", "application/json")
+        for name, value in (headers or {}).items():
+            request.add_header(name, value)
         try:
             with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
                 raw = response.read()
@@ -636,6 +768,16 @@ class FakeDatabricks:
         # (method, path substring, status, message): matching requests are answered with an error
         self.failing_routes: List[Tuple[str, str, int, str]] = []
         self.replaced: List[str] = []  # tables a CREATE OR REPLACE hit while they existed
+        # Unity Catalog volumes the Files API serves ("cat.schema.volume"), their bytes in a
+        # temporary directory, and every call against them in order: (method, path)
+        self.volumes: set = set()
+        self.files_root = tempfile.mkdtemp(prefix="fake-databricks-files-")
+        self.file_ops: List[Tuple[str, str]] = []
+        # full table name -> rows (dicts by column name, table order) the last INSERT OVERWRITE
+        # wrote; a table nothing was loaded into has none
+        self.table_rows: Dict[str, List[Dict[str, Any]]] = {}
+        # False: an INSERT answers with no row count, as a statement that returns none would
+        self.insert_reports_count = True
         self._marker = 0
         self._job_seq = 0
         self._object_ids: Dict[str, int] = {}  # workspace path -> object_id
@@ -659,14 +801,16 @@ class FakeDatabricks:
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n) if n else b""
                 ctype = self.headers.get("Content-Type") or ""
+                path = unquote(parsed.path)
                 try:
-                    if ctype.startswith("multipart/form-data"):
+                    if path.startswith("/api/2.0/fs/files"):
+                        body = {"_raw": raw}  # an octet stream, not JSON
+                    elif ctype.startswith("multipart/form-data"):
                         body = _multipart(ctype, raw)
                     else:
                         body = json.loads(raw) if raw else {}
                 except ValueError:
                     body = {}
-                path = unquote(parsed.path)
                 with fake._lock:
                     fake.requests.append((method, path))
                     fake.queries.append((method, path, parsed.query))
@@ -705,6 +849,7 @@ class FakeDatabricks:
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
+        shutil.rmtree(self.files_root, ignore_errors=True)
 
     @property
     def endpoint(self) -> str:
@@ -899,6 +1044,12 @@ class FakeDatabricks:
         a("POST", r"/api/2\.0/workspace/import", self._ws_import)
         a("GET", r"/api/2\.0/workspace/get-status", self._ws_status)
         a("POST", r"/api/2\.0/workspace/delete", self._ws_delete)
+        # ---- files (Unity Catalog volumes)
+        a("PUT", r"/api/2\.0/fs/directories(/.*)", self._fs_mkdir)
+        a("GET", r"/api/2\.0/fs/directories(/.*)", self._fs_list)
+        a("DELETE", r"/api/2\.0/fs/directories(/.*)", self._fs_rmdir)
+        a("PUT", r"/api/2\.0/fs/files(/.*)", self._fs_put)
+        a("DELETE", r"/api/2\.0/fs/files(/.*)", self._fs_delete)
         # ---- sql
         a("POST", r"/api/2\.0/sql/statements/?", self._exec_sql)
         a("GET", r"/api/2\.0/sql/statements/([^/]+)", self._get_stmt)
@@ -1148,6 +1299,7 @@ class FakeDatabricks:
         if full not in self.tables:
             return _err(404, "TABLE_DOES_NOT_EXIST", f"Table '{full}' does not exist.")
         del self.tables[full]
+        self.table_rows.pop(full, None)
         self.grants.pop(("table", full), None)
         self._drop_tags("tables", full)
         return 200, {}
@@ -1389,6 +1541,114 @@ class FakeDatabricks:
         self.workspace_dirs.discard(path)
         return 200, {}
 
+    # -- files on volumes (the Files API)
+    def add_volume(self, full_name: str) -> None:
+        """Make ``/Volumes/<catalog>/<schema>/<volume>`` exist; creates the catalog and schema."""
+        cat, sch, _volume = full_name.split(".")
+        with self._lock:
+            self._ensure_schema(cat, sch)
+            self.volumes.add(full_name)
+            os.makedirs(self._fs_path("/Volumes/" + full_name.replace(".", "/")), exist_ok=True)
+
+    def _fs_path(self, volume_path: str) -> Optional[str]:
+        """The temporary-directory path of a ``/Volumes/...`` path; ``None`` outside a volume
+        the fake holds, or on a path that climbs out of it."""
+        parts = volume_path.split("/")
+        if parts[:2] != ["", "Volumes"] or len(parts) < 5:
+            return None
+        if ".." in parts or "." in parts[2:]:
+            return None
+        if ".".join(parts[2:5]) not in self.volumes:
+            return None
+        return os.path.join(self.files_root, *[p for p in parts[1:] if p])
+
+    def volume_files(self, prefix: str = "/Volumes") -> List[str]:
+        """Every file the Files API holds under ``prefix``, as ``/Volumes/...`` paths."""
+        found: List[str] = []
+        for root, _dirs, names in os.walk(self.files_root):
+            for name in names:
+                path = "/" + os.path.relpath(os.path.join(root, name), self.files_root)
+                if path.startswith(prefix.rstrip("/") + "/") or path == prefix:
+                    found.append(path.replace(os.sep, "/"))
+        return sorted(found)
+
+    def file_bytes(self, volume_path: str) -> bytes:
+        path = self._fs_path(volume_path)
+        assert path is not None, volume_path
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    def rows(self, full_name: str) -> List[Dict[str, Any]]:
+        """The rows the last INSERT OVERWRITE left in the table."""
+        return list(self.table_rows.get(full_name, []))
+
+    def _fs_target(self, method: str, m: Any) -> Tuple[Optional[str], Optional[Tuple[int, Any]]]:
+        path = m.group(1)
+        self.file_ops.append((method, path))
+        real = self._fs_path(path)
+        if real is None:
+            return None, _err(404, NOT_FOUND, f"The path {path} is not in a volume that exists.")
+        return real, None
+
+    def _fs_mkdir(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        real, failed = self._fs_target("PUT-DIR", m)
+        if failed:
+            return failed
+        os.makedirs(real, exist_ok=True)
+        return 204, None
+
+    def _fs_put(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        real, failed = self._fs_target("PUT", m)
+        if failed:
+            return failed
+        overwrite = (q.get("overwrite") or ["true"])[0].lower() != "false"
+        if os.path.exists(real) and not overwrite:
+            return _err(409, "ALREADY_EXISTS", f"The file {m.group(1)} already exists.")
+        os.makedirs(os.path.dirname(real), exist_ok=True)
+        with open(real, "wb") as fh:
+            fh.write(b.get("_raw") or b"")
+        return 204, None
+
+    def _fs_delete(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        real, failed = self._fs_target("DELETE", m)
+        if failed:
+            return failed
+        if not os.path.isfile(real):
+            return _err(404, NOT_FOUND, f"The file {m.group(1)} does not exist.")
+        os.remove(real)
+        return 204, None
+
+    def _fs_rmdir(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        real, failed = self._fs_target("DELETE-DIR", m)
+        if failed:
+            return failed
+        if not os.path.isdir(real):
+            return _err(404, NOT_FOUND, f"The directory {m.group(1)} does not exist.")
+        if os.listdir(real):
+            return _err(400, "FAILED_PRECONDITION", f"The directory {m.group(1)} is not empty.")
+        os.rmdir(real)
+        return 204, None
+
+    def _fs_list(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        real, failed = self._fs_target("LIST", m)
+        if failed:
+            return failed
+        if not os.path.isdir(real):
+            return _err(404, NOT_FOUND, f"The directory {m.group(1)} does not exist.")
+        base = m.group(1).rstrip("/")
+        contents = []
+        for name in sorted(os.listdir(real)):
+            full = os.path.join(real, name)
+            entry: Dict[str, Any] = {
+                "name": name,
+                "path": f"{base}/{name}",
+                "is_directory": os.path.isdir(full),
+            }
+            if os.path.isfile(full):
+                entry["file_size"] = os.path.getsize(full)
+            contents.append(entry)
+        return 200, {"contents": contents}
+
     # -- warehouse / sql
     def _get_wh(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
         wid = m.group(1)
@@ -1409,7 +1669,14 @@ class FakeDatabricks:
         self.sql_log.append(sql)
         self.timeline.append(("sql", sql))
         injected = next((msg for sub, msg in self.failing if sub in sql), None)
-        ok, err = (False, injected) if injected is not None else _execute(self, sql)
+        data = None if injected is not None else _data_statement(self, sql)
+        if injected is not None:
+            ok, err, answer = False, injected, {}
+        elif data is not None:
+            ok, err, answer = data
+        else:
+            ok, err = _execute(self, sql)
+            answer = {}
         sid = f"stmt-{len(self.statements) + 1}"
         if ok:
             doc: Dict[str, Any] = {
@@ -1421,6 +1688,7 @@ class FakeDatabricks:
                     "total_row_count": 0,
                 },
                 "result": {"row_count": 0},
+                **answer,
             }
         else:
             doc = {
