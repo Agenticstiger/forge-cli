@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 # role tag (fluid_sdk.BasePlugin.role) -> entry-point group. Single source of truth.
@@ -124,10 +125,42 @@ def is_allowed(name: str) -> bool:
     block = _env_names(_BLOCKLIST_ENV)
     if name in block:
         return False
-    allow = _env_names(_ALLOWLIST_ENV)
+    allow = {n for n in _env_names(_ALLOWLIST_ENV) if _QUALIFIED_SEP not in n}
     if allow and name not in allow:
         return False
     return True
+
+
+_QUALIFIED_SEP = ":"
+
+
+def _norm_dist(name: str) -> str:
+    """PEP 503-normalised distribution name (``Acme_Fluid.AWS`` -> ``acme-fluid-aws``)."""
+    return re.sub(r"[-_.]+", "-", name.strip()).lower()
+
+
+def override_granted(ep: Any) -> bool:
+    """Whether the operator explicitly allowed ``ep`` to replace a built-in name.
+
+    Built-in provider and IaC platform names are reserved: a third-party entry
+    point that claims one is skipped before it loads, because an installed
+    plugin could otherwise take over a name silently. An operator who wants
+    the override grants it with a distribution-qualified entry in
+    ``FLUID_PLUGINS_ALLOWLIST``: ``<distribution>:<entry-point name>``, for
+    example ``acme-fluid-aws:aws``. A bare name cannot grant it, because the
+    built-in has the same name. Qualified entries only grant overrides; they do
+    not make the allowlist restrict other plugins.
+    """
+    dist = entry_point_distribution(ep)
+    if not dist:
+        return False
+    want = f"{_norm_dist(dist.split(' ', 1)[0])}{_QUALIFIED_SEP}{str(ep.name).strip().lower()}"
+    granted = set()
+    for entry in _env_names(_ALLOWLIST_ENV):
+        dist_name, sep, ep_name = entry.partition(_QUALIFIED_SEP)
+        if sep and dist_name and ep_name:
+            granted.add(f"{_norm_dist(dist_name)}{_QUALIFIED_SEP}{ep_name.strip().lower()}")
+    return want in granted
 
 
 def _entry_points(group: str) -> List[Any]:
@@ -214,12 +247,14 @@ def installed_plugins(role: Optional[str] = None) -> Dict[str, List[Dict[str, An
     can audit or uninstall.
 
     Name-reading here is not the same as the *process* being plugin-free: CLI
-    bootstrap builds the full argparse tree first, and the ``iac_provider``
-    and ``modeling_technique`` roles feed argparse ``choices=`` from their
-    registries, so those two roles are discovered — and their entry points
-    loaded — before any command runs, ``fluid --version`` included. Set
-    ``FLUID_PLUGINS_BLOCKLIST`` to inspect an untrusted plugin without
-    executing it; the policy is checked before every ``ep.load()``.
+    bootstrap builds the full argparse tree first, and the
+    ``modeling_technique`` role feeds argparse ``choices=`` from its registry,
+    so that role is discovered, and its entry points loaded, before any command
+    runs, ``fluid --version`` included. The ``iac_provider`` role is lazy: its
+    plugin is loaded by name when a contract's platform needs it
+    (``iac.registry.get_iac_plugin``). Set ``FLUID_PLUGINS_BLOCKLIST`` to
+    inspect an untrusted plugin without executing it; the policy is checked
+    before every ``ep.load()``.
     """
     groups = governed_groups()
     keys = [role] if role else list(groups)

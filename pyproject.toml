@@ -529,6 +529,21 @@ snowflake = "fluid_build.providers.snowflake:SnowflakeProvider"
 # Built-ins are seeded in code, so this group is declared by THIRD-PARTY
 # packages only (listing the built-ins here would self-shadow).
 
+# OpenTofu emitters for an additional platform are a discovered plugin group
+# (``iac/registry.py``). A third-party package ships one so that installing it
+# makes ``binding.platform: <name>`` compile through ``fluid generate iac`` and
+# apply through the OpenTofu engine, with no core edit:
+#
+#     [project.entry-points."fluid_build.iac_providers"]
+#     onprem = "my_pkg.iac:OnPremIacPlugin"   # an IacProviderPlugin class/instance
+#
+# Loaded lazily, by name, when a contract's platform needs it (never at import,
+# so ``fluid --help`` / ``fluid providers`` run no plugin code). Governed by
+# FLUID_PLUGINS_ALLOWLIST / FLUID_PLUGINS_BLOCKLIST and the ``requires_cli`` gate.
+# Built-in platform names (aws / gcp / snowflake / confluent / databricks, their
+# aliases, local) are reserved: an entry point claiming one is skipped before it
+# is imported. Declared by THIRD-PARTY packages only.
+
 [project.urls]
 Homepage = "https://agenticstiger.github.io/forge_docs/"
 Repository = "https://github.com/Agenticstiger/forge-cli"

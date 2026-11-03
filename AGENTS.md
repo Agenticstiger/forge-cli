@@ -677,6 +677,52 @@ The reference plugin for `extension_validators` + `commands` is the
 declarations in its `pyproject.toml` is the canonical "how to write a
 plugin" example.
 
+### Shipping an IaC plugin (an OpenTofu emitter for another platform)
+
+An outside package adds a platform to `fluid generate iac` and `fluid apply`
+with an entry point; no forge-cli edit.
+
+```toml
+[project.entry-points."fluid_build.iac_providers"]
+onprem = "my_pkg.iac:OnPremIacPlugin"
+```
+
+- **Interface.** The target is a class (instantiated with no args) or an
+  instance implementing `fluid_build.iac.base.IacProviderPlugin`: `name`,
+  `required_providers`, `credential_env_vars`, and `emit`, `emit_data`,
+  `credential_env`, `discover_imports`, `provider_block`. Optional
+  capabilities are listed on that Protocol's docstring. The entry-point name is
+  the platform: `binding.platform: onprem` selects it.
+- **Schema.** `binding.platform` is a closed enum in every shipped schema, so a
+  plugin serves a platform the schema admits and no built-in emitter serves
+  (`kubernetes`, `postgres`, `kafka`, ...). Opening the enum is a schema change.
+- **Loading is lazy and by name** (stevedore `DriverManager` style, via
+  `iac.registry.get_iac_plugin`). Nothing is imported at startup, so `fluid
+  --help` and `fluid providers` never run plugin code; the plugin is imported
+  the first time a contract's platform needs it. `cutover.default_engine` sends
+  a platform a plugin serves to the OpenTofu engine.
+- **Policy.** `FLUID_PLUGINS_ALLOWLIST` / `FLUID_PLUGINS_BLOCKLIST` are checked
+  before `ep.load()`. `get_plugin_info().requires_cli` (PEP 440) is checked with
+  the provider registry's gate: a WARNING `provider_version_warning`, and a
+  refusal when `FLUID_PLUGIN_STRICT_COMPAT=1`.
+- **Reserved names.** An entry point may not claim a built-in platform: `aws`,
+  `gcp`, `snowflake`, `confluent`, `databricks`, any alias in
+  `iac/provider_match.py::PROVIDER_ALIASES` (`s3`, `glue`, `athena`, `google`,
+  `gcs`, `bigquery`, `local`, `duckdb`, ...) or a retired provider name
+  (`redshift`, `datamesh_manager`). It is skipped before it is imported, with a
+  WARNING `iac_provider_name_reserved` naming the distribution. A plugin's own
+  `name` (the Terraform provider's local name) is not reserved.
+- **Operator opt-in to replace a built-in.** The operator grants it with a
+  distribution-qualified entry in `FLUID_PLUGINS_ALLOWLIST`:
+  `<distribution>:<entry-point name>`, e.g. `acme-fluid-aws:aws` (distribution
+  names compare PEP 503-normalised, the entry-point name case-insensitively).
+  The plugin then loads and replaces the built-in for that platform, with an
+  INFO `iac_provider_override_granted`. A bare `aws` cannot grant it (the
+  built-in has that name), and qualified entries never make the allowlist
+  restrictive: plain names keep their meaning.
+- **Tests.** `tests/iac/test_iac_entrypoint_lazy_plugin.py` builds a real
+  throwaway `.dist-info` and is the pattern to copy.
+
 ## Links
 
 - **Documentation**: [https://agenticstiger.github.io/forge_docs/](https://agenticstiger.github.io/forge_docs/)

@@ -32,6 +32,7 @@ from fluid_build.iac import (
     IAC_PLUGINS,
     assemble_tofu_document,
     get_iac_plugin,
+    known_iac_platforms,
     provider_config,
     provider_match,
     render_tofu_json,
@@ -39,12 +40,13 @@ from fluid_build.iac import (
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.module import write_dependency_lock
 from fluid_build.iac.packaging import resolve_packaging
+from fluid_build.iac.registry import IacProviderChoices, iac_plugin_unavailable_reason
 from fluid_build.iac.source import contract_source, source_contract_file
 
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
 from ._logging import info
 
-_PROVIDER_CHOICES = ["auto", *sorted(IAC_PLUGINS)]
+_PROVIDER_CHOICES = IacProviderChoices()
 
 #: The AWS account the native planner is given when ``fluid generate iac`` runs
 #: without ``AWS_ACCOUNT_ID`` (see :func:`native_actions`). Shaped to pass the
@@ -61,7 +63,8 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         description=(
             "Compile a FLUID contract into an OpenTofu `.tf.json` module.\n\n"
             "The module is emitted for review — apply it with `tofu`.\n"
-            "Supported clouds: " + ", ".join(sorted(IAC_PLUGINS)) + "."
+            "Supported clouds: " + ", ".join(sorted(IAC_PLUGINS)) + ", plus any installed "
+            "IaC plugin (entry-point group fluid_build.iac_providers)."
         ),
         epilog="""Examples:
   fluid generate iac contract.fluid.yaml
@@ -123,7 +126,7 @@ def run(args, logger: logging.Logger) -> int:
         packaging = resolve_packaging(contract)
         logger.debug("packaging resolved: legacy=%s pool=%s", packaging.is_legacy, packaging.pool)
         provider = _resolve_provider(contract, getattr(args, "provider", "auto"))
-        plugin = get_iac_plugin(provider)
+        plugin = _require_plugin(provider)
         with contract_source(source_contract_file(contract_path)):
             # A module written for review is applied with a plain `tofu apply`, which would
             # skip what the plugin binds outside OpenTofu (Unity Catalog masks and row filters).
@@ -324,7 +327,7 @@ def _resolve_provider(contract, requested: str) -> str:
         return requested
 
     found = _detect_clouds(contract)
-    supported = "/".join(sorted(IAC_PLUGINS))
+    supported = "/".join(known_iac_platforms())
 
     if not found:
         raise CLIError(
@@ -347,7 +350,7 @@ def _resolve_provider(contract, requested: str) -> str:
         )
 
     cloud = found[0]
-    if cloud not in IAC_PLUGINS:
+    if get_iac_plugin(cloud) is None:
         # ``local``/DuckDB is a real, detected target but runs in-process — it
         # has no OpenTofu module to emit. Say so explicitly instead of the
         # misleading "no supported cloud".
@@ -363,6 +366,19 @@ def _resolve_provider(contract, requested: str) -> str:
             },
         )
     return cloud
+
+
+def _require_plugin(provider: str):
+    """The IaC plugin for ``provider``, or a ``CLIError`` saying why there is none."""
+    plugin = get_iac_plugin(provider)
+    if plugin is not None:
+        return plugin
+    why = iac_plugin_unavailable_reason(provider) or "no IaC plugin serves it"
+    raise CLIError(
+        1,
+        "generate_iac_failed",
+        {"error": f"no OpenTofu plugin for provider {provider!r}: {why}"},
+    )
 
 
 def native_actions(contract, logger: logging.Logger, *, offline: bool = False) -> list:
