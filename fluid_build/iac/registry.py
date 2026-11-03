@@ -35,10 +35,12 @@ Design, borrowed rather than invented:
   scans or loads this group at import time, so ``fluid --help`` and
   ``fluid providers`` never run third-party code. :func:`get_iac_plugin` is the
   load point.
-* **Policy** is the unified plugin manager's: the allow/block lists are checked
-  before ``ep.load()``, and the plugin's ``get_plugin_info().requires_cli`` is
-  checked with the provider registry's own gate (``providers._check_sdk_compat``:
-  advisory warning by default, rejection under ``FLUID_PLUGIN_STRICT_COMPAT=1``).
+* **Policy** is the unified plugin manager's: the allow/block lists (names match
+  case-insensitively, ``-`` == ``_``) and the reserved names are checked before
+  ``ep.load()``; the plugin's ``get_plugin_info().requires_cli`` is read from the
+  loaded plugin, so it is checked right after the import, with the provider
+  registry's own gate (``providers._check_sdk_compat``: advisory warning by
+  default, rejection under ``FLUID_PLUGIN_STRICT_COMPAT=1``).
 * **Reserved names**, as ``providers._claims_retired_name`` does for retired
   provider names: an entry point that claims a built-in platform (``aws``,
   ``gcp``, ``snowflake``, ``confluent``, ``databricks``, any alias
@@ -46,7 +48,15 @@ Design, borrowed rather than invented:
   BEFORE ``ep.load()`` with a WARNING naming the distribution and the opt-in. A
   plugin can add a platform; it replaces one only when the operator grants it
   with a distribution-qualified ``FLUID_PLUGINS_ALLOWLIST`` entry,
-  ``<distribution>:<entry-point name>`` (``plugin_manager.override_granted``).
+  ``<distribution>:<entry-point name>`` (``plugin_manager.override_granted``,
+  which reads the distribution's real name, never its display string). A grant
+  needs the name to pass the bare allowlist too: a bare allowlist that omits it
+  cancels the grant, with a WARNING. A granted override replaces the emitter
+  plugin only, not the in-tree helpers that modules import directly.
+* **Duplicate names.** Several distributions shipping one reserved name: each
+  ungranted claim is warned about, and the one granted claim loads. Several
+  shipping one non-reserved name: all are refused (fail closed) with one WARNING
+  naming them; the operator uses ``FLUID_PLUGINS_BLOCKLIST`` or uninstalls.
 
 **What still requires a core edit**:
 
@@ -55,8 +65,10 @@ Design, borrowed rather than invented:
   the schema does not list is rejected at validation. A plugin therefore serves
   a platform the schema admits and no built-in emitter serves (``kubernetes``,
   ``postgres``, ``kafka`` ...). Opening the enum is a schema decision.
-* The global ``fluid --provider`` flag's ``choices=`` list is hardcoded in
-  ``cli/__init__.py``; ``fluid generate iac --provider`` does accept a plugin.
+* ``fluid --provider`` is validated against the apply-provider registry
+  (``cli/__init__.py::_validate_global_args``), so for now it accepts built-ins
+  only. A plugin platform is reached by auto-detection from the contract's
+  ``binding.platform``.
 """
 
 from __future__ import annotations
@@ -75,6 +87,12 @@ IAC_PLUGINS: Dict[str, IacProviderPlugin] = {}
 #: clouds that live OUTSIDE this repo. In-tree clouds are NOT recorded; the
 #: ``cutover.OPENTOFU_DEFAULT_PROVIDERS`` frozenset stays their cutover switch.
 IAC_ENTRYPOINT_PLUGINS: Set[str] = set()
+
+#: The in-tree registrations, snapshotted as they register (not while an entry
+#: point is loading), so ``reset_iac_plugin_cache`` can restore a built-in a
+#: granted override replaced.
+_INTREE: Dict[str, IacProviderPlugin] = {}
+_LOADING = False
 
 #: Entry-point names whose load was attempted and refused or failed, so a
 #: platform that needs the plugin repeatedly does not re-import, and re-warn
@@ -102,7 +120,11 @@ def register_iac_plugin(name: str, plugin: IacProviderPlugin) -> None:
     if not is_allowed(name):
         _log.debug("iac plugin %r skipped by allow/block policy", name)
         return
+    # Not a boundary: a loaded plugin runs at host trust and can call this (or
+    # write IAC_PLUGINS) directly. Reserved names are enforced BEFORE the import.
     IAC_PLUGINS[name] = plugin
+    if not _LOADING:
+        _INTREE[name] = plugin
 
 
 def reserved_iac_names() -> FrozenSet[str]:
@@ -140,7 +162,11 @@ def _claims_reserved_name(ep: Any) -> bool:
     key = _norm(ep.name)
     if key not in reserved_iac_names():
         return False
-    from fluid_build.plugin_manager import entry_point_distribution, override_granted
+    from fluid_build.plugin_manager import (
+        entry_point_distribution,
+        granted_distribution,
+        override_granted,
+    )
     from fluid_build.providers import RETIRED_PROVIDERS
 
     who = entry_point_distribution(ep) or "<unknown distribution>"
@@ -163,16 +189,19 @@ def _claims_reserved_name(ep: Any) -> bool:
             extra={"evt": "iac_provider_override_granted", "_name": key, "plugin": who},
         )
         return False
-    dist = who.split(" ", 1)[0]
+    dist = granted_distribution(ep)
+    hint = (
+        f"; to allow this override add {f'{dist}:{ep.name}'!r} to FLUID_PLUGINS_ALLOWLIST"
+        if dist is not None
+        else ""
+    )
     _log.warning(
         "iac_provider_name_reserved: plugin %r (entry point %r) tried to register the built-in "
-        "IaC platform %r; it was skipped without being imported; to allow this override add "
-        "'%s:%s' to FLUID_PLUGINS_ALLOWLIST",
+        "IaC platform %r; it was skipped without being imported%s",
         who,
         ep.name,
         key,
-        dist,
-        ep.name,
+        hint,
         extra={"evt": "iac_provider_name_reserved", "_name": key, "plugin": who},
     )
     return True
@@ -181,11 +210,14 @@ def _claims_reserved_name(ep: Any) -> bool:
 #: ``(scanner, index)``: one metadata scan per process (about 8 ms), reused by
 #: the per-exposure platform lookups. Keyed on the scanner so a test that swaps
 #: ``plugin_manager._entry_points`` gets a fresh read.
-_INDEX: Optional[Tuple[Any, Dict[str, Any]]] = None
+_INDEX: Optional[Tuple[Any, Dict[str, List[Any]]]] = None
 
 
-def _entrypoints_by_name() -> Dict[str, Any]:
-    """``{normalised name: entry point}`` for the group. Reads names; never loads."""
+def _entrypoints_by_name() -> Dict[str, List[Any]]:
+    """``{normalised name: [entry points]}`` for the group. Reads names; never loads.
+
+    A list per name: two distributions can ship the same one.
+    """
     global _INDEX  # noqa: PLW0603
     from fluid_build import plugin_manager
 
@@ -193,18 +225,74 @@ def _entrypoints_by_name() -> Dict[str, Any]:
     cached = _INDEX
     if cached is None or cached[0] is not scanner:
         group = plugin_manager.ROLE_GROUPS["iac_provider"]
-        cached = _INDEX = (scanner, {_norm(ep.name): ep for ep in scanner(group)})
+        index: Dict[str, List[Any]] = {}
+        for ep in scanner(group):
+            index.setdefault(_norm(ep.name), []).append(ep)
+        cached = _INDEX = (scanner, index)
     return cached[1]
 
 
-def _admit(ep: Any, logger: logging.Logger) -> bool:
-    """The pre-load gates: allow/block policy, then reserved names."""
-    from fluid_build.plugin_manager import is_allowed
+def _who(ep: Any) -> str:
+    from fluid_build.plugin_manager import entry_point_distribution
 
-    if not is_allowed(ep.name):
-        logger.debug("iac plugin %r skipped by allow/block policy", ep.name)
-        return False
-    return not _claims_reserved_name(ep)
+    return entry_point_distribution(ep) or "<unknown distribution>"
+
+
+def _cancelled_grant_reason(key: str) -> str:
+    """Why a grant for ``key`` is cancelled when policy refuses the name."""
+    from fluid_build.plugin_manager import _BLOCKLIST_ENV, _env_names, _policy_key
+
+    if key in {_policy_key(n) for n in _env_names(_BLOCKLIST_ENV)}:
+        return f"{key!r} is in FLUID_PLUGINS_BLOCKLIST"
+    return f"the bare names in FLUID_PLUGINS_ALLOWLIST do not include {key!r}"
+
+
+def _resolve(key: str, eps: List[Any], logger: logging.Logger) -> Optional[Any]:
+    """The pre-load gates for one name: policy, reserved names, duplicates.
+
+    Returns the one entry point that may load, else ``None`` (after a WARNING
+    where an operator needs to act). Nothing is imported here.
+    """
+    from fluid_build.plugin_manager import is_allowed, override_granted
+
+    if not is_allowed(key):
+        logger.debug("iac plugin %r skipped by allow/block policy", key)
+        for ep in eps:
+            if override_granted(ep):
+                logger.warning(
+                    "iac_provider_grant_cancelled: the grant for plugin %r (entry point %r) is "
+                    "cancelled because %s; the platform %r stays unserved by it",
+                    _who(ep),
+                    ep.name,
+                    _cancelled_grant_reason(key),
+                    key,
+                    extra={"evt": "iac_provider_grant_cancelled", "_name": key},
+                )
+        return None
+    if key in reserved_iac_names():
+        # Warns about every ungranted claim; the granted ones come back.
+        granted = [ep for ep in eps if not _claims_reserved_name(ep)]
+        if len(granted) > 1:
+            logger.warning(
+                "iac_provider_name_ambiguous: several plugins (%s) are granted the built-in "
+                "IaC platform %r; none was imported",
+                ", ".join(repr(_who(ep)) for ep in granted),
+                key,
+                extra={"evt": "iac_provider_name_ambiguous", "_name": key},
+            )
+            return None
+        return granted[0] if granted else None
+    if len(eps) > 1:
+        logger.warning(
+            "iac_provider_name_ambiguous: %d plugins (%s) ship the IaC platform %r; none was "
+            "imported; block the name with FLUID_PLUGINS_BLOCKLIST or uninstall the extras",
+            len(eps),
+            ", ".join(repr(_who(ep)) for ep in eps),
+            key,
+            extra={"evt": "iac_provider_name_ambiguous", "_name": key},
+        )
+        return None
+    return eps[0]
 
 
 def _instantiate(name: str, obj: Any, logger: logging.Logger) -> Optional[IacProviderPlugin]:
@@ -231,28 +319,35 @@ def _compatible(name: str, plugin: Any, logger: logging.Logger) -> bool:
     return False
 
 
-def _load_entrypoint(ep: Any, logger: logging.Logger) -> Optional[IacProviderPlugin]:
-    """Run the gates, load ``ep`` and register what it yields. ``None`` if refused."""
-    key = _norm(ep.name)
-    if not _admit(ep, logger):
-        return None
-    try:
-        obj = ep.load()
-    except Exception as e:  # noqa: BLE001 - isolate a bad plugin, log by type only
-        logger.warning("plugin %r failed to load: %s", ep.name, type(e).__name__)
-        return None
-    plugin = _instantiate(ep.name, obj, logger)
-    if plugin is None or not _compatible(ep.name, plugin, logger):
-        return None
-    # Keyed by the entry-point name, the one that was vetted: the plugin's own
-    # ``name`` is the Terraform provider's local name and may legitimately be
-    # ``aws`` (an on-prem S3 emitter driving the aws provider).
-    register_iac_plugin(key, plugin)
-    if key not in IAC_PLUGINS:
-        return None
-    IAC_ENTRYPOINT_PLUGINS.add(key)
-    logger.debug("registered external iac plugin %r", ep.name)
-    return plugin
+def _load_key(key: str, eps: List[Any], logger: logging.Logger) -> Optional[IacProviderPlugin]:
+    """Run the gates for ``key``, load the admitted entry point and register what it
+    yields. ``None`` if refused."""
+    global _LOADING  # noqa: PLW0603
+    with _LOCK:
+        ep = _resolve(key, eps, logger)
+        if ep is None:
+            return None
+        _LOADING = True
+        try:
+            try:
+                obj = ep.load()
+            except Exception as e:  # noqa: BLE001 - isolate a bad plugin, log by type only
+                logger.warning("plugin %r failed to load: %s", ep.name, type(e).__name__)
+                return None
+            plugin = _instantiate(ep.name, obj, logger)
+            if plugin is None or not _compatible(ep.name, plugin, logger):
+                return None
+            # Keyed by the entry-point name, the one that was vetted: the plugin's own
+            # ``name`` is the Terraform provider's local name and may legitimately be
+            # ``aws`` (an on-prem S3 emitter driving the aws provider).
+            register_iac_plugin(key, plugin)
+        finally:
+            _LOADING = False
+        if IAC_PLUGINS.get(key) is not plugin:
+            return None
+        IAC_ENTRYPOINT_PLUGINS.add(key)
+        logger.debug("registered external iac plugin %r", ep.name)
+        return plugin
 
 
 def get_iac_plugin(name: str) -> Optional[IacProviderPlugin]:
@@ -260,15 +355,15 @@ def get_iac_plugin(name: str) -> Optional[IacProviderPlugin]:
 
     The load point. A registered (in-tree or already loaded) plugin is returned
     as is. Otherwise the ``fluid_build.iac_providers`` group is consulted by
-    NAME, and only a matching, admitted entry point is imported
-    (``stevedore.driver.DriverManager`` semantics). ``None`` when nothing serves
-    ``name``; :func:`iac_plugin_unavailable_reason` says why an installed one
-    was refused.
+    NAME (normalised: case-insensitive, ``-`` == ``_``), and only a matching,
+    admitted entry point is imported (``stevedore.driver.DriverManager``
+    semantics). ``None`` when nothing serves ``name``;
+    :func:`iac_plugin_unavailable_reason` says why an installed one was refused.
     """
-    plugin = IAC_PLUGINS.get(name)
-    if not isinstance(name, str) or not name:
-        return plugin
+    if not isinstance(name, str) or not name.strip():
+        return IAC_PLUGINS.get(name)
     key = _norm(name)
+    plugin = IAC_PLUGINS.get(key)
     if key in _REFUSED or key in IAC_ENTRYPOINT_PLUGINS:
         return plugin
     if key in reserved_iac_names():
@@ -279,10 +374,13 @@ def get_iac_plugin(name: str) -> Optional[IacProviderPlugin]:
     elif plugin is not None:
         return plugin
     with _LOCK:
-        ep = _entrypoints_by_name().get(key)
-        if ep is None:
+        # Re-check inside the lock: another thread may have loaded or refused it.
+        if key in IAC_ENTRYPOINT_PLUGINS or key in _REFUSED:
             return IAC_PLUGINS.get(key)
-        if _load_entrypoint(ep, _log) is None:
+        eps = _entrypoints_by_name().get(key)
+        if not eps:
+            return IAC_PLUGINS.get(key)
+        if _load_key(key, eps, _log) is None:
             _REFUSED.add(key)
         return IAC_PLUGINS.get(key)
 
@@ -311,8 +409,7 @@ def is_iac_entrypoint_platform(name: str) -> bool:
         return False
     from fluid_build.plugin_manager import is_allowed
 
-    ep = _entrypoints_by_name().get(key)
-    return ep is not None and is_allowed(ep.name)
+    return bool(_entrypoints_by_name().get(key)) and is_allowed(key)
 
 
 def known_iac_platforms() -> List[str]:
@@ -324,26 +421,38 @@ def known_iac_platforms() -> List[str]:
 
     names = set(IAC_PLUGINS)
     reserved = reserved_iac_names()
-    for key, ep in _entrypoints_by_name().items():
-        if key not in reserved and is_allowed(ep.name):
+    for key in _entrypoints_by_name():
+        if key not in reserved and is_allowed(key):
             names.add(key)
     return sorted(names)
 
 
 def iac_plugin_unavailable_reason(name: str) -> Optional[str]:
     """Why an installed plugin for ``name`` is not serving it, else ``None``."""
-    from fluid_build.plugin_manager import entry_point_distribution, is_allowed
+    from fluid_build.plugin_manager import is_allowed, override_granted
 
     key = _norm(name)
+    eps = _entrypoints_by_name().get(key)
+    if not eps:
+        return None
     if key in reserved_iac_names():
+        if not is_allowed(key) and any(override_granted(ep) for ep in eps):
+            return (
+                f"the grant for the IaC plugin from {_who(eps[0])!r} is cancelled because "
+                f"{_cancelled_grant_reason(key)}"
+            )
         return None
-    ep = _entrypoints_by_name().get(key)
-    if ep is None:
-        return None
-    who = entry_point_distribution(ep) or ep.name
-    if not is_allowed(ep.name):
-        return f"the IaC plugin from {who} is blocked by FLUID_PLUGINS_ALLOWLIST/BLOCKLIST"
-    return f"the IaC plugin from {who} was refused or failed to load (see the log)"
+    if not is_allowed(key):
+        return (
+            f"the IaC plugin from {_who(eps[0])!r} is blocked by FLUID_PLUGINS_ALLOWLIST/BLOCKLIST"
+        )
+    if len(eps) > 1:
+        dists = ", ".join(repr(_who(ep)) for ep in eps)
+        return (
+            f"the IaC platform {key!r} is shipped by several distributions ({dists}) and none "
+            "was loaded; block the name with FLUID_PLUGINS_BLOCKLIST or uninstall the extras"
+        )
+    return f"the IaC plugin from {_who(eps[0])!r} was refused or failed to load (see the log)"
 
 
 class IacProviderChoices:
@@ -368,12 +477,19 @@ class IacProviderChoices:
 
 
 def reset_iac_plugin_cache() -> None:
-    """Forget external plugins and refusals (tests; an install into a live process)."""
+    """Forget external plugins and refusals (tests; an install into a live process).
+
+    A built-in an external plugin replaced (a granted override) is restored from
+    the snapshot taken when it registered.
+    """
     global _INDEX  # noqa: PLW0603
     with _LOCK:
         _INDEX = None
         for key in list(IAC_ENTRYPOINT_PLUGINS):
             IAC_PLUGINS.pop(key, None)
+            builtin = _INTREE.get(key)
+            if builtin is not None:
+                IAC_PLUGINS[key] = builtin
         IAC_ENTRYPOINT_PLUGINS.clear()
         _REFUSED.clear()
 
@@ -381,12 +497,14 @@ def reset_iac_plugin_cache() -> None:
 def discover_iac_entrypoints(logger: Optional[logging.Logger] = None) -> None:
     """Eagerly load EVERY allowed entry-point plugin. Nothing calls this at import.
 
-    Kept for callers that want the whole set (an inspection command, a test); the
-    CLI loads by name through :func:`get_iac_plugin`. Same gates, per-plugin
-    fail-isolation: a bad plugin is skipped and never drops the others.
+    For callers that need the whole set (the state-ownership guard before a
+    destructive apply, an inspection command, a test); the CLI otherwise loads by
+    name through :func:`get_iac_plugin`. Same gates, per-plugin fail-isolation: a
+    bad plugin is skipped and never drops the others.
     """
     log = logger or _log
-    for key, ep in _entrypoints_by_name().items():
-        if key in IAC_ENTRYPOINT_PLUGINS:
-            continue
-        _load_entrypoint(ep, log)
+    with _LOCK:
+        for key, eps in list(_entrypoints_by_name().items()):
+            if key in IAC_ENTRYPOINT_PLUGINS:
+                continue
+            _load_key(key, eps, log)

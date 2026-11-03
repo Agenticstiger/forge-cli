@@ -83,6 +83,15 @@ class KubePlugin:
 
 class NeedsNewerCli(KubePlugin):
     REQUIRES = ">=999.0"
+
+
+class SlowPlugin(KubePlugin):
+    def __init__(self):
+        import time
+
+        with open(os.environ["LW8_MARKER"] + ".inst", "a") as _f:
+            _f.write("inst\\n")
+        time.sleep(0.3)
 """
 
 
@@ -168,13 +177,14 @@ def test_help_and_providers_load_no_plugin(dist):
     root = next(p for p in sys.path if (Path(p) / "lw8_plugin.py").exists())
     env = {**os.environ, "LW8_MARKER": str(dist), "PYTHONPATH": root}
     for argv in (["--help"], ["providers"], ["generate", "iac", "--help"]):
-        subprocess.run(
+        done = subprocess.run(
             [sys.executable, "-m", "fluid_build.cli", *argv],
             env=env,
             capture_output=True,
             check=False,
             timeout=120,
         )
+        assert done.returncode == 0, f"`fluid {' '.join(argv)}` failed: {done.stderr[-400:]!r}"
         assert not _loaded(dist), f"`fluid {' '.join(argv)}` imported the IaC plugin"
 
 
@@ -187,10 +197,27 @@ def test_contract_for_the_plugin_platform_emits_the_plugins_resources(dist, tmp_
     assert _loaded(dist)
 
 
-def test_explicit_provider_flag_reaches_the_plugin(dist, tmp_path):
+def test_provider_choices_list_the_plugin_platform_but_not_junk(dist, tmp_path):
+    # The generate-iac subparser's own choices see the plugin (names only); the
+    # GLOBAL --provider flag is validated elsewhere and accepts built-ins only.
     assert "kubernetes" in generate_iac._PROVIDER_CHOICES
     assert "nonesuch" not in generate_iac._PROVIDER_CHOICES
     assert _generate(tmp_path, _contract(tmp_path), provider="kubernetes") == 0
+
+
+def test_the_real_cli_autodetects_a_plugin_platform(dist, tmp_path):
+    root = next(p for p in sys.path if (Path(p) / "lw8_plugin.py").exists())
+    env = {**os.environ, "LW8_MARKER": str(dist), "PYTHONPATH": root}
+    out = tmp_path / "cli-out"
+    done = subprocess.run(
+        [sys.executable, "-m", "fluid_build.cli", "generate", "iac",
+         str(_contract(tmp_path)), "--out", str(out)],
+        env=env, capture_output=True, text=True, check=False, timeout=180,
+    )  # fmt: skip
+    assert done.returncode == 0, done.stderr[-600:]
+    doc = json.loads((out / "main.tf.json").read_text())
+    assert doc["resource"]["kubernetes_namespace"]["ns"]["metadata"]["name"] == "dummy-ns"
+    assert _loaded(dist)
 
 
 def test_the_apply_engine_routes_the_plugin_platform_through_opentofu(dist):
@@ -403,3 +430,220 @@ def test_a_grant_never_lifts_a_retired_name(tmp_path, monkeypatch, caplog, retir
     assert "the retired platform" in caplog.text
     assert "iac_provider_override_granted" not in caplog.text
     assert "FLUID_PLUGINS_ALLOWLIST" not in caplog.text
+
+
+# ── hardening: grant identity, policy spelling, escaping, duplicates, locking ──
+
+
+def _extra_dist(tmp_path, monkeypatch, tag, lines, name):
+    root = tmp_path / f"extra-{tag}"
+    root.mkdir()
+    _make_dist(root, lines, name=name)
+    monkeypatch.syspath_prepend(str(root))
+    R.reset_iac_plugin_cache()
+
+
+def test_a_self_declared_name_with_a_suffix_cannot_satisfy_a_grant(
+    dist, tmp_path, monkeypatch, caplog
+):
+    # METADATA ``Name: acme-fluid-aws spoof`` used to pass for ``acme-fluid-aws``
+    # (the first word of the "<name> <version>" display string).
+    _squat(tmp_path, monkeypatch, dist_name="acme-fluid-aws spoof")
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "acme-fluid-aws:aws")
+    builtin = R.IAC_PLUGINS["aws"]
+    with caplog.at_level(logging.WARNING, logger=R._log.name):
+        assert R.get_iac_plugin("aws") is builtin
+    assert not _loaded(dist)
+    assert "iac_provider_name_reserved" in caplog.text
+    assert "to allow this override" not in caplog.text  # no grant can work for that name
+
+
+def test_a_mixed_case_entry_point_is_blocked_by_a_lowercase_blocklist(tmp_path, monkeypatch):
+    root = tmp_path / "mixed"
+    root.mkdir()
+    marker = tmp_path / "mixed-marker.txt"
+    _make_dist(root, "Kubernetes = lw8_plugin:KubePlugin", name="mixed-case")
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.setenv("LW8_MARKER", str(marker))
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "kubernetes")
+    monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
+    sys.modules.pop("lw8_plugin", None)
+    R.reset_iac_plugin_cache()
+    try:
+        assert R.get_iac_plugin("Kubernetes") is None
+        assert not _loaded(marker)
+        assert not R.is_iac_entrypoint_platform("kubernetes")
+        assert "kubernetes" not in R.known_iac_platforms()
+    finally:
+        R.reset_iac_plugin_cache()
+        sys.modules.pop("lw8_plugin", None)
+
+
+@pytest.fixture
+def onprem(tmp_path, monkeypatch):
+    root = tmp_path / "onprem"
+    root.mkdir()
+    marker = tmp_path / "onprem-loaded.txt"
+    _make_dist(root, "on-prem = lw8_plugin:KubePlugin", name="onprem-pkg")
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.setenv("LW8_MARKER", str(marker))
+    for var in ("FLUID_PLUGINS_ALLOWLIST", "FLUID_PLUGINS_BLOCKLIST", "FLUID_PLUGIN_STRICT_COMPAT"):
+        monkeypatch.delenv(var, raising=False)
+    sys.modules.pop("lw8_plugin", None)
+    R.reset_iac_plugin_cache()
+    yield marker
+    R.reset_iac_plugin_cache()
+    sys.modules.pop("lw8_plugin", None)
+
+
+def test_hyphenated_entry_point_is_blocked_by_the_underscore_spelling(onprem, monkeypatch):
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "on_prem")
+    assert R.get_iac_plugin("on-prem") is None
+    assert not _loaded(onprem)
+    assert "blocked" in R.iac_plugin_unavailable_reason("on_prem")
+
+
+def test_hyphenated_entry_point_loads_under_a_hyphenated_allowlist(onprem, monkeypatch):
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "on-prem")
+    assert R.get_iac_plugin("on_prem") is not None
+    assert _loaded(onprem)
+
+
+def test_lookup_spelling_does_not_change_the_answer(onprem):
+    first = R.get_iac_plugin("On-Prem")
+    second = R.get_iac_plugin("On-Prem")
+    assert first is not None and first is second
+    assert R.get_iac_plugin("on_prem") is first
+    assert cutover.default_engine("On-Prem") == cutover.default_engine("on_prem") == "opentofu"
+    assert R.is_iac_entrypoint_platform("ON-PREM")
+
+
+@pytest.mark.parametrize("claimed", ["AWS", "S3", "BigQuery"])
+def test_a_mixed_case_squatter_is_still_reserved(tmp_path, monkeypatch, claimed):
+    root = tmp_path / "squat"
+    root.mkdir()
+    marker = tmp_path / "m.txt"
+    _make_dist(root, f"{claimed} = lw8_plugin:KubePlugin", name="squatter")
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.setenv("LW8_MARKER", str(marker))
+    monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
+    monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST", raising=False)
+    sys.modules.pop("lw8_plugin", None)
+    R.reset_iac_plugin_cache()
+    R.discover_iac_entrypoints()
+    R.get_iac_plugin(claimed)
+    assert not _loaded(marker)
+    R.reset_iac_plugin_cache()
+
+
+def test_control_characters_in_a_distribution_name_never_reach_the_log(
+    dist, tmp_path, monkeypatch, caplog
+):
+    _squat(tmp_path, monkeypatch, dist_name="inj\x1b[31mRED\x1b[0m", platform="gcp")
+    with caplog.at_level(logging.INFO, logger=R._log.name):
+        R.discover_iac_entrypoints()
+    assert "iac_provider_name_reserved" in caplog.text
+    assert "\x1b" not in caplog.text
+    # and the user-facing reason for a refused non-reserved plugin
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "inj_platform")
+    root = tmp_path / "inj2"
+    root.mkdir()
+    _make_dist(root, "inj-platform = lw8_plugin:KubePlugin", name="x\x1b[2Jy")
+    monkeypatch.syspath_prepend(str(root))
+    R.reset_iac_plugin_cache()
+    reason = R.iac_plugin_unavailable_reason("inj-platform")
+    assert reason and "\x1b" not in reason
+
+
+def test_a_bare_allowlist_that_omits_the_name_cancels_the_grant_and_says_so(
+    dist, tmp_path, monkeypatch, caplog
+):
+    _squat(tmp_path, monkeypatch)
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "kubernetes,acme-fluid-aws:aws")
+    with caplog.at_level(logging.WARNING, logger=R._log.name):
+        R.get_iac_plugin("aws")
+    cancelled = [r for r in caplog.records if "iac_provider_grant_cancelled" in r.getMessage()]
+    assert len(cancelled) == 1
+    assert "do not include 'aws'" in cancelled[0].getMessage()
+    assert "cancelled" in R.iac_plugin_unavailable_reason("aws")
+    assert not _loaded(dist)
+
+
+def test_two_distributions_shipping_one_plugin_name_are_both_refused(
+    dist, tmp_path, monkeypatch, caplog
+):
+    _extra_dist(tmp_path, monkeypatch, "b", "kubernetes = lw8_plugin:KubePlugin", "other-kube")
+    with caplog.at_level(logging.WARNING, logger=R._log.name):
+        assert R.get_iac_plugin("kubernetes") is None
+    assert not _loaded(dist)
+    warned = [r.getMessage() for r in caplog.records if "name_ambiguous" in r.getMessage()]
+    assert len(warned) == 1
+    assert "fluid-testcloud" in warned[0] and "other-kube" in warned[0]
+    assert "several distributions" in R.iac_plugin_unavailable_reason("kubernetes")
+    assert cutover.default_engine("kubernetes") == "native"
+
+
+def test_with_two_distributions_on_a_reserved_name_the_granted_one_loads(
+    dist, tmp_path, monkeypatch, caplog
+):
+    _extra_dist(tmp_path, monkeypatch, "a", "aws = lw8_plugin:KubePlugin", "ungranted-aws")
+    _extra_dist(tmp_path, monkeypatch, "b", "aws = lw8_plugin:KubePlugin", "acme-fluid-aws")
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "acme-fluid-aws:aws")
+    builtin = R.IAC_PLUGINS["aws"]
+    with caplog.at_level(logging.WARNING, logger=R._log.name):
+        plugin = R.get_iac_plugin("aws")
+    assert plugin is not builtin and type(plugin).__name__ == "KubePlugin"
+    assert "ungranted-aws" in caplog.text and "iac_provider_name_reserved" in caplog.text
+    assert "acme-fluid-aws" not in caplog.text.replace("'acme-fluid-aws:aws'", "")
+
+
+def test_reset_restores_the_builtin_a_granted_override_replaced(dist, tmp_path, monkeypatch):
+    _squat(tmp_path, monkeypatch)
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "acme-fluid-aws:aws")
+    builtin = R.IAC_PLUGINS["aws"]
+    assert R.get_iac_plugin("aws") is not builtin
+    R.reset_iac_plugin_cache()
+    assert R.IAC_PLUGINS["aws"] is builtin
+
+
+def test_concurrent_first_requests_instantiate_the_plugin_once(tmp_path, monkeypatch):
+    import threading
+
+    root = tmp_path / "slow"
+    root.mkdir()
+    marker = tmp_path / "slow-marker.txt"
+    _make_dist(root, "slowcloud = lw8_plugin:SlowPlugin", name="slow-pkg")
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.setenv("LW8_MARKER", str(marker))
+    for var in ("FLUID_PLUGINS_ALLOWLIST", "FLUID_PLUGINS_BLOCKLIST"):
+        monkeypatch.delenv(var, raising=False)
+    sys.modules.pop("lw8_plugin", None)
+    R.reset_iac_plugin_cache()
+    results = []
+    gate = threading.Barrier(4)
+
+    def ask():
+        gate.wait()
+        results.append(R.get_iac_plugin("slowcloud"))
+
+    threads = [threading.Thread(target=ask) for _ in range(4)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    try:
+        assert len(results) == 4 and all(r is results[0] and r is not None for r in results)
+        assert Path(str(marker) + ".inst").read_text().count("inst") == 1
+    finally:
+        R.reset_iac_plugin_cache()
+        sys.modules.pop("lw8_plugin", None)
+
+
+def test_the_state_guard_sees_a_plugin_cloud_that_was_never_loaded(dist):
+    from fluid_build.iac import state_migration as sm
+
+    res = [{"provider": 'provider["registry.opentofu.org/hashicorp/kubernetes"]'}]
+    assert not _loaded(dist)  # lazy: nothing loaded yet
+    verdict, _why = sm.classify(res, "aws")
+    assert verdict == "other"
+    assert sm.other_clouds(res, "aws") == frozenset({"kubernetes"})
