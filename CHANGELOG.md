@@ -249,9 +249,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column, a type change that is not a widening, an added `required: true` column), so a pipeline
   that runs `fluid diff --baseline --fail-on-breaking` can start exiting 1. A finding for a 0.7.x
   column is reported at `exposes[N].contract.schema.<column>`, and a nullability one at its
-  `.required`. Still not compared in a 0.7.x contract: quality-rule severity and a column's
-  `sensitivity`. A 0.7.x primary key is not recognised either, so a key column that becomes
-  nullable is reported as non-breaking.
+  `.required`.
+
+- **`fluid diff --baseline` ignored a 0.7.x contract's quality rules, sensitivity and primary
+  key.** A 0.7.x contract keeps them under `exposes[].contract`, where the diff did not look. A
+  rule in `contract.dq.rules`, `contract.quality` or a column's `quality` whose severity becomes
+  failing is now `quality_severity_escalated` (breaking), as a pre-0.7 `quality.tests` entry was.
+  `critical` counts as failing, as it does for `fluid test`: warn -> critical is now an
+  escalation, and critical -> error no longer is. Rules that share an id are judged by the most
+  severe of them, so a failing rule cannot hide behind a `warn` one of the same id. A column
+  whose `sensitivity` becomes or stops being `pii` or `phi` is `column_pii_added` /
+  `column_pii_removed` (info), and any other change to it is the new
+  `column_sensitivity_changed` (info), each with the sensitivity values as before and after. A
+  pre-0.7 `pii: true` rewritten as `sensitivity: pii` is not a change. A column the dbt engine
+  builds as a key (a `primary-key` tag, a `semanticType` of `identifier` or `primary_key`, or a
+  `labels.constraint` of `primary_key` or `unique`) that stops being `required` is
+  `primary_key_nullable` (breaking) rather than a non-breaking loosening.
+
+- **`fluid diff --baseline --format json` could print JSON that does not parse.** Rich wrapped
+  each long line at the terminal width (80 columns in CI), putting a line break inside a JSON
+  string, and read `[...]` in a column name as markup. JSON and Markdown are now printed
+  verbatim, and text without markup or `:emoji:` codes, so a column named `[/]` no longer
+  crashes the text output. Credential-shaped values are redacted in each value before the
+  document is written, by both the logging redactor and the console's, so a name ending in
+  `token=x` no longer cuts its JSON string short. A value JSON cannot hold, such as a date that
+  YAML put in a column's quality rule, is written as text: `json.dump` raised on it after the
+  text report had printed, and left `--out` cut short. `--out` now holds the same redacted
+  envelope as stdout; it held the raw values.
+
+- **The `fluid forge --refine` preview read no columns from a `schema: {fields: [...]}`
+  expose.** The diff now unwraps it at `schema` and `contract.schema` alike, as `fluid verify`
+  does, and reports its columns at `...schema.fields.<column>`. No bundled schema accepts the
+  wrapper, so `fluid diff --baseline` refuses such a contract as invalid (see Security).
 
 - **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
   `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the
@@ -528,6 +557,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the line break is the only problem: `(it ends in a line break, which a YAML | or > block keeps
   and |- or >- drops)`. A `sink.catalogAuth` field gets no hint, since its value is never shown.
   The schemas themselves are unchanged.
+
+- **`fluid diff --baseline` compared contracts that no schema accepts.** Its rules read only the
+  shapes a schema allows, so a value of the wrong type hid a change: a column retyped from
+  `decimal(18,2)` to the number `18` passed `--fail-on-breaking` with exit 0. Both contracts are
+  now validated first, against the schema their `fluidVersion` names, offline, the gate
+  `fluid plan` runs. An invalid one exits 2 with `diff_contract_invalid`, which names each
+  invalid file and logs each error, and nothing is printed or written to `--out`. Exit 2 is
+  diff(1)'s "trouble", so it never reads as 0 (no changes) or 1 (breaking). A pre-0.7 contract is
+  refused with the upgrade that `fluid validate` asks for, so a pre-0.7 baseline can no longer be
+  diffed against its 0.7.x rewrite. In `fluid_build.api.changelog`, `compare_contracts` raises the
+  new `ContractValidationError`, and `validate=False` diffs without validating; the
+  `fluid forge --refine` preview uses it, because the contract being refined may be the invalid one.
+
+- **`fluid diff --baseline` printed contract names raw.** A column or expose name could drive the
+  terminal (an escape sequence, a hyperlink to another URL, a carriage return or line feed that
+  forges a line, a bidi control that reorders it), and in `--format markdown` it could add a link,
+  an image or an HTML comment that hides the rest of a PR comment, or mention someone. Text output
+  now spells each control, bidi and invisible character as `\x1b` or `\u202e` and doubles a
+  backslash. Markdown puts the path and the description each in one code span: a backslash escape
+  is not enough there, because GitHub still links `\@user`, `\#1` and `\:smile\:` after
+  rendering. The fence is one backtick longer than any run of backticks in the name, and the
+  document is redacted per value before it is written, so a redaction cannot take the closing
+  fence with it. A Markdown entry now reads
+  ``- **column_added** `exposes[0].contract.schema.email` — `column 'email' added to expose 'orders'` ``.
+  The `fluid forge --refine` preview prints the same text without markup.
 
 ## [0.26.0] — 2026-11-01
 

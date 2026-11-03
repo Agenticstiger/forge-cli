@@ -17,11 +17,15 @@ from __future__ import annotations
 import argparse
 import copy
 import logging
+import math
 import os
+import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set
 
+from .._console import _redact_str
+from ..observability.secret_redactor import redact_secret_text
 from ..observability.tracing import traced_span as _traced_span
 from ..observability.tracing import traced_stage as _traced_stage
 from ._common import (
@@ -33,11 +37,13 @@ from ._common import (
     resolve_provider_from_contract,
     write_json,
 )
-from ._logging import info, warn
+from ._logging import error, info, warn
 
 if TYPE_CHECKING:
     from fluid_build.iac.drift import StateDriftReport
 
+    from ..api.changelog import ContractValidationError
+    from ..api.changelog_types import ChangelogReport
     from ._diff_live import LiveDriftReport
 
 COMMAND = "diff"
@@ -162,7 +168,8 @@ def register(subparsers: argparse._SubParsersAction):
         help=(
             "Path to a baseline (old) contract.fluid.yaml. When set, switches "
             "from drift mode to contract-vs-contract version diff and emits a "
-            "breaking-change classification."
+            "breaking-change classification. Both contracts must be schema-valid: "
+            "an invalid one exits 2 (diff_contract_invalid) before any output."
         ),
     )
     p.add_argument(
@@ -739,11 +746,11 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
     Loads two contracts, runs the changelog engine, prints in the requested
     format, optionally writes a JSON envelope to ``--out``, and returns a
     non-zero exit code when ``--fail-on-breaking`` is set and any breaking
-    change was detected.
+    change was detected. A contract that is not schema-valid exits 2 (diff(1)'s
+    "trouble") before anything is printed or written, so it never reads as 0
+    (no changes) or 1 (breaking).
     """
-    from fluid_build.cli.console import cprint
-
-    from ..api.changelog import compare_contracts, render_markdown, render_text
+    from ..api.changelog import ContractValidationError, compare_contracts
 
     if getattr(args, "env", None):
         # Environment overlays are a drift-mode concept (they shape the
@@ -798,29 +805,25 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
             "fluid.diff.format": getattr(args, "format", "text") or "text",
         },
     ) as span:
-        report = compare_contracts(baseline, new)
+        try:
+            report = compare_contracts(baseline, new)
+        except ContractValidationError as exc:
+            raise _invalid_contracts_error(
+                exc, {"baseline": baseline_path, "new": new_path}, logger
+            ) from exc
         span.set_attribute("fluid.diff.breaking_count", len(report.breaking))
         span.set_attribute("fluid.diff.non_breaking_count", len(report.non_breaking))
         span.set_attribute("fluid.diff.info_count", len(report.info))
 
-    # Render to stdout in the requested format.
-    fmt = getattr(args, "format", "text") or "text"
-    if fmt == "json":
-        # The JSON envelope is also written to --out (below) for CI
-        # artifact collection. Print to stdout here for piping.
-        import json as _json
+    # Render to stdout in the requested format, then always write the same
+    # envelope to --out so CI runners that don't parse stdout still get a
+    # machine-readable artifact. Both get the redacted report.
+    safe = _safe_report(report)
+    _print_version_diff(safe, getattr(args, "format", "text") or "text")
 
-        cprint(_json.dumps(report.to_dict(), indent=2))
-    elif fmt == "markdown":
-        cprint(render_markdown(report))
-    else:
-        cprint(render_text(report))
-
-    # Always write the structured envelope to --out so CI runners that don't
-    # parse stdout still get a machine-readable artifact.
     from ._common import write_json
 
-    write_json(args.out, report.to_dict())
+    write_json(args.out, safe.to_dict())
 
     info(
         logger,
@@ -834,3 +837,112 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
     if getattr(args, "fail_on_breaking", False) and report.has_breaking:
         return 1
     return 0
+
+
+def _safe_report(report: ChangelogReport) -> ChangelogReport:
+    """``report`` with every value redacted and made JSON-safe, for stdout and ``--out``.
+
+    A string goes through both redactors, as the CLI's error renderer does
+    (``cli/__init__.py``): ``redact_secret_text`` (JWTs, provider keys,
+    credentialed URLs, ``key=value``) and the console's pattern, which alone
+    catches ``api key: x``. A value JSON cannot hold, such as a date, bytes or
+    a set that YAML put in a column's quality rule, becomes text, so the
+    envelope always serialises: ``json.dump`` raised on it after the text
+    report had printed, and left ``--out`` cut short.
+    """
+    import dataclasses
+
+    from fluid_build.observability.secret_redactor import redact_value
+
+    from ..api.changelog_types import ChangelogReport as _Report
+
+    safe = _Report()
+    for change in (*report.breaking, *report.non_breaking, *report.info):
+        safe.add(
+            dataclasses.replace(
+                change,
+                **{
+                    field: _jsonable(redact_value(getattr(change, field)))
+                    for field in ("path", "description", "before", "after")
+                },
+            )
+        )
+    return safe
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact_str(value)
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, Mapping):
+        # A key is contract text too: a free-form ``labels`` key can hold a credential.
+        return {
+            _jsonable(redact_secret_text(str(key))): _jsonable(item) for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_jsonable(item) for item in value), key=repr)
+    return _redact_str(str(value))
+
+
+def _print_version_diff(report: ChangelogReport, fmt: str) -> None:
+    """Print a version-diff ``report`` (already made safe) to stdout as ``fmt``.
+
+    JSON and Markdown are documents a program reads, so they are written
+    verbatim: a regex pass over the finished document cut through its
+    structure (a name ending in ``token=x`` lost the closing quote of its JSON
+    string, or the closing fence of its Markdown code span, which let the rest
+    of the line render as Markdown), and Rich would wrap a long line at the
+    terminal width and read ``[...]`` in a name as markup. Each value was
+    redacted before (:func:`_safe_report`). Text is printed literally, so a
+    name cannot style it, swap in an emoji or (``[/]``) crash it, and
+    soft-wrapped, as the drift report is, so each entry stays one greppable
+    line.
+    """
+    from fluid_build.cli.console import cprint_literal
+
+    from ..api.changelog import render_markdown, render_text
+
+    if fmt == "json":
+        import json as _json
+
+        sys.stdout.write(_json.dumps(report.to_dict(), indent=2) + "\n")
+    elif fmt == "markdown":
+        sys.stdout.write(render_markdown(report) + "\n")
+    else:
+        cprint_literal(render_text(report), soft_wrap=True, highlight=False)
+
+
+def _invalid_contracts_error(
+    exc: ContractValidationError, paths: Dict[str, str], logger: logging.Logger
+) -> CLIError:
+    """``diff_contract_invalid`` for the contracts ``compare_contracts`` refused.
+
+    Each error is logged as ``fluid plan`` logs its schema errors, and the
+    message names every invalid file with the command that reports on it.
+    """
+    for side, errors in exc.errors.items():
+        for err in errors:
+            error(logger, "diff_contract_schema_error", side=side, path=paths[side], detail=err)
+    invalid = list(exc.errors)
+    named = "; ".join(
+        f"the {side} contract {paths[side]} has {len(exc.errors[side])} error(s)"
+        for side in invalid
+    )
+    commands = " and ".join(f"``fluid validate {paths[side]}``" for side in invalid)
+    return CLIError(
+        2,
+        "diff_contract_invalid",
+        {
+            "invalid": invalid,
+            "errors": {side: exc.errors[side] for side in invalid},
+            "message": (
+                f"``fluid diff --baseline`` compares valid contracts only: {named}. "
+                f"Run {commands} for the full report."
+            ),
+        },
+    )
