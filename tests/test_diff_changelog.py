@@ -1210,7 +1210,9 @@ def _address(*fields):
 def test_a_nested_field_declared_twice_in_the_new_contract_is_breaking(
     old_columns, new_columns, non_breaking
 ):
-    report = compare_contracts(_contract_flat(old_columns), _contract_flat(new_columns))
+    report = compare_contracts(
+        _contract_flat(old_columns), _contract_flat(new_columns), validate=False
+    )
 
     assert [c.kind for c in report.non_breaking] == non_breaking
     assert [(c.kind, c.path) for c in report.breaking] == [
@@ -1297,11 +1299,14 @@ def test_an_expose_is_named_by_id_or_exposeid_and_an_unnamed_one_by_position():
 
 @pytest.mark.parametrize("schema", [5, True, 3.5, "text", {"x": 1}])
 def test_a_malformed_schema_in_an_expose_that_is_new_does_not_crash(schema):
-    """The duplicate walk reads exposes the comparison used to skip as merely added."""
+    """The duplicate walk reads exposes the comparison used to skip as merely added.
+
+    A schema-invalid contract only gets here with ``validate=False``.
+    """
     old = {"exposes": [{"id": "a", "schema": [{"name": "x", "type": "INT"}]}]}
     new = {"exposes": [old["exposes"][0], {"id": "b", "schema": schema}]}
 
-    report = compare_contracts(old, new)
+    report = compare_contracts(old, new, validate=False)
 
     assert [c.kind for c in report.non_breaking] == ["expose_added"]
     assert report.total == 1
