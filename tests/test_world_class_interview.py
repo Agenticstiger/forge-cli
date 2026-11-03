@@ -44,6 +44,10 @@ from fluid_build.cli._world_class_interview import (
     run_world_class_bootstrap,
 )
 
+# collect_signals reads the welcome scan's threaded probes; a slow runner would
+# drop one and leave the signal at its "nothing detected" default.
+pytestmark = pytest.mark.usefixtures("deterministic_welcome_scan")
+
 # ---------------------------------------------------------------------------
 # Stubs
 # ---------------------------------------------------------------------------
