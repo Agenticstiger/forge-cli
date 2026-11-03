@@ -17,6 +17,7 @@
 AWS resource name normalization utilities.
 """
 
+import hashlib
 import re
 from typing import Optional
 
@@ -155,3 +156,59 @@ def normalize_lambda_name(name: str) -> str:
 
     # Truncate to 64 characters
     return normalized[:64]
+
+
+#: Per-service naming rules for names the planner derives from a contract id.
+#: Each is ``(characters NOT allowed, maximum length)``; pinned from the AWS API
+#: references so the planner's output is valid before ``validate_actions`` sees
+#: it:
+#:
+#: * Lambda function name, ``CreateFunction`` ``FunctionName``: letters, digits,
+#:   ``-`` and ``_``; 64 characters when only the name is given (the API's longer
+#:   limit applies to a full ARN).
+#:   https://docs.aws.amazon.com/lambda/latest/api/API_CreateFunction.html
+#: * Lambda permission statement id, ``AddPermission`` ``StatementId``: letters,
+#:   digits, ``-`` and ``_``; 1-100 characters.
+#:   https://docs.aws.amazon.com/lambda/latest/api/API_AddPermission.html
+#: * EventBridge Scheduler schedule name, ``CreateSchedule`` ``Name``: letters,
+#:   digits, ``-``, ``_`` and ``.``; 1-64 characters.
+#:   https://docs.aws.amazon.com/scheduler/latest/APIReference/API_CreateSchedule.html
+#: * EventBridge rule name, ``PutRule`` ``Name``: letters, digits, ``-``, ``_``
+#:   and ``.``; 1-64 characters.
+#:   https://docs.aws.amazon.com/eventbridge/latest/APIReference/API_PutRule.html
+#: * MWAA environment name, ``CreateEnvironment`` ``Name``: starts with a letter,
+#:   then letters, digits, ``-`` and ``_``; 1-80 characters (every name built
+#:   here starts with the literal ``mwaa-``).
+#:   https://docs.aws.amazon.com/mwaa/latest/API/API_CreateEnvironment.html
+#: * Step Functions state machine name, ``CreateStateMachine`` ``name``: 1-80
+#:   characters, no whitespace, brackets, wildcards or ``" # % \ ^ | ~ ` $ & , ; : /``.
+#:   https://docs.aws.amazon.com/step-functions/latest/apireference/API_CreateStateMachine.html
+LAMBDA_FUNCTION_NAME = (re.compile(r"[^a-zA-Z0-9\-_]"), 64)
+LAMBDA_STATEMENT_ID = (re.compile(r"[^a-zA-Z0-9\-_]"), 100)
+SCHEDULER_SCHEDULE_NAME = (re.compile(r"[^a-zA-Z0-9\-_.]"), 64)
+EVENTBRIDGE_RULE_NAME = (re.compile(r"[^a-zA-Z0-9\-_.]"), 64)
+MWAA_ENVIRONMENT_NAME = (re.compile(r"[^a-zA-Z0-9\-_]"), 80)
+STATE_MACHINE_NAME = (re.compile(r"[\s<>{}\[\]?*\"#%\\^|~`$&,;:/\x00-\x1f\x7f-\x9f]"), 80)
+
+#: Hex digits of the digest appended to a name that had to be shortened.
+_NAME_HASH_LEN = 8
+
+
+def bounded_aws_name(raw: str, rule: "tuple[re.Pattern[str], int]") -> str:
+    """``raw`` as a name ``rule`` accepts, deterministic and collision-safe.
+
+    Characters outside the rule's allowed set become ``-``. A name that had to
+    change at all (a replacement, or a cut to the service limit) ends in
+    ``-<hash>``, the hash taken from the *whole raw* name: ``a.b`` and ``a-b``
+    would otherwise both be ``fluid-workflow-a-b``, two products in one account
+    fighting over one Lambda, and two long ids sharing a prefix would collide
+    after the cut. A name the rule already accepts is returned as written, so
+    nothing already deployed under it is renamed.
+    """
+    pattern, limit = rule
+    name = pattern.sub("-", raw)
+    if name == raw and len(name) <= limit:
+        return name
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:_NAME_HASH_LEN]
+    keep = limit - _NAME_HASH_LEN - 1
+    return f"{name[:keep]}-{digest}"
