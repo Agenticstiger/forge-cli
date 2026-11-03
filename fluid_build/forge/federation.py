@@ -236,6 +236,7 @@ _POLICY_WARNED: Set[Tuple[str, Tuple[str, ...]]] = set()
 # (``~/.cache/fluid/federation-git/<id>`` and the digest-cache file).
 # Constrain it to a conservative slug so a tampered manifest row can't
 # smuggle ``../`` traversal or absolute-path segments into those sinks.
+# Matched with ``fullmatch``: ``$`` also matches before a trailing newline.
 _WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 

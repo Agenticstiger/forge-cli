@@ -70,6 +70,19 @@ def test_bigquery_catalog_identifiers_refuse_a_trailing_newline(kind, value):
         _quote_ident(f"{value}\n", kind=kind)
 
 
+@pytest.mark.parametrize(
+    ("kind", "value"), [("project", "acme-proj"), ("dataset", "sales"), ("table", "orders")]
+)
+def test_bigquery_catalog_name_check_refuses_a_trailing_newline(kind, value):
+    # The unquoted check behind `table_name IN ('...')` and FQN parsing.
+    from fluid_build.copilot.catalog.base import CatalogConfigError
+    from fluid_build.copilot.catalog.bigquery import _validate_ident
+
+    assert _validate_ident(value, kind=kind) == value
+    with pytest.raises(CatalogConfigError):
+        _validate_ident(f"{value}\n", kind=kind)
+
+
 def test_jdbc_schema_filter_refuses_a_trailing_newline(monkeypatch, tmp_path):
     pytest.importorskip("duckdb")
     from fluid_build.cli.discover import _jdbc_introspect
@@ -239,6 +252,21 @@ def test_dbt_importer_slugifies_an_identifier_ending_in_a_newline():
 
     assert _safe_identifier("orders") == "orders"
     assert _safe_identifier("orders\n") == "orders"
+
+
+def test_odcs_import_slugifies_an_id_ending_in_a_newline():
+    # The bundled schema's identifier pattern ends in `$`; it is matched whole.
+    from fluid_build.providers.odcs.mappers.normalize import _root_identifier
+
+    assert _root_identifier("orders", "0.7.5") == ("orders", None)
+    assert _root_identifier("orders\n", "0.7.5")[0] == "orders"
+
+
+def test_odps_import_semver_check_refuses_a_trailing_newline():
+    from fluid_build.providers.odps_standard.provider import _is_semver
+
+    assert _is_semver("1.2.3", "0.7.5") is True
+    assert _is_semver("1.2.3\n", "0.7.5") is False
 
 
 def test_mission_predicate_path_refuses_a_trailing_newline():

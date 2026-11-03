@@ -99,7 +99,8 @@ _log = logging.getLogger(__name__)
 
 # Conservative default identifier shape — covers Snowflake / BigQuery /
 # Unity / Glue without quoting weirdness. Catalogs with looser rules
-# (e.g., DataHub URN strings) override the regex per-adapter.
+# (e.g., DataHub URN strings) override the regex per-adapter. Matched
+# with ``fullmatch``: ``$`` also matches before a trailing newline.
 _DEFAULT_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
