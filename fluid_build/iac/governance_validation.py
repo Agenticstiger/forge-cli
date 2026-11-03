@@ -118,9 +118,15 @@ def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[st
     """
     from .providers import gcp as _gcp
     from .providers import gcp_governance as _gov
+    from .providers.aws import validate_aws_column_types
 
     errors: List[str] = []
     warnings: List[str] = []
+    # Column types a Glue table cannot hold: refused by the emitter, written as
+    # ``string`` with a warning here, or exact.
+    type_errors, type_warnings = validate_aws_column_types(contract)
+    errors.extend(type_errors)
+    warnings.extend(type_warnings)
     grants = normalize_access_grants(contract)
     unenforced: List[str] = []
     # AWS Iceberg tables in another catalog: Lake Formation cannot reach them,

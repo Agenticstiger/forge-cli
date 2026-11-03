@@ -180,6 +180,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tofu force-unlock <ID>` in the workdir (the ID is in tofu's error) clears it. A run that
   hits `FLUID_TOFU_TIMEOUT_SECONDS` is now interrupted (SIGINT) so tofu releases the lock, and
   killed only if it ignores that for 30 seconds.
+- **A column type AWS Glue or BigQuery could not hold was written anyway, and `fluid validate
+  --strict` passed.** The Glue emitter mapped 22 type names and turned every other one into
+  `string`: 47 of the 79 types the schema admits, among them `smallint`, `tinyint`, `int2`,
+  `int4`, `int8`, `real`, `money`, `bit`, `year`, `datetime2`, `timestamptz` and the other
+  timestamp spellings, `varbinary` and `blob`, and every array, struct, map, object, record and
+  row. The BigQuery emitter wrote `ARRAY` for an array, which is not a BigQuery column type (an
+  array is a REPEATED column of an element type), and a `STRUCT` with no fields, which BigQuery
+  rejects at apply, after the dataset was created; the element type of `array(string)` was
+  dropped on both clouds. Every type is now classified for each cloud. Each scalar with a Hive or
+  Athena type gets it (`smallint`, `int`, `bigint`, `float`, `double`, `timestamp`, `binary`,
+  `money` as `decimal(19,4)`, `bit` as `boolean`, `year` as `smallint`; the zone-aware
+  timestamps are `timestamp`, which keeps the UTC instant and not the offset; a bare `number` is
+  `decimal(38,9)`, as a bare `decimal` always was). A type Glue has no form for but that keeps
+  its value as text (`json`, `jsonb`, `variant`, `super`, `time`, `interval`, `bignumeric`) is
+  still written as `string`, and `fluid validate` now warns for it, so `--strict` fails; BigQuery
+  warns for `geometry` and `geom`, which are planar and become the spherical `GEOGRAPHY`, and
+  for a `decimal(p,s)` wider than a BigQuery NUMERIC holds (29 integer and 9 fractional digits;
+  declare `bignumeric`). A
+  type with no faithful form at all is refused with kind `column-type`: an array, struct, map,
+  object, record or row (also `array(string)`), a `bit(n)` wider than one bit and a type no
+  table maps, on both clouds, and on Glue also `geography`, `geometry`, `geom`, `point` and
+  `hll`, and a decimal Hive would reject (precision over 38 or 0, a scale over the precision
+  or below 0). The
+  refusal names the expose, each column, its declared type and why, and the fix (declare `json`
+  or `string` for now; typed nested columns are planned). `fluid validate`, `fluid generate iac`
+  and `fluid apply` raise the same refusal from the same function, so a contract that passes
+  validate cannot fail generate on a type. A BigQuery view carries no schema and is not checked.
+  `fluid verify` and `fluid diff` compare the live table with the new mapping, so a Glue table
+  applied by an earlier version reports type mismatches (verify: CRITICAL; diff: drift) on those
+  columns until `fluid apply` runs; verify's "require table recreation" wording is wrong for
+  these columns, a re-apply updates them in place. Changing a Glue column's type in place is
+  held by the data-loss gate: `fluid apply` (and its dry run) refuses, naming each table and
+  `column: old -> new`, until `--allow-data-loss`, because Parquet written under the old type
+  (Athena INSERT or CTAS, dbt) may stop reading until it is rewritten, and reverting the type
+  restores reads; a difference in spacing alone (`decimal(10, 2)`) is no change. The 0.16.2
+  note that only a bare `array` has no BigQuery form is superseded: an array of any element type and every
+  struct-like type are refused until the contract schema can declare element and field types.
+  BigQuery decimal precision and scale are still not emitted.
+
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
   never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
   sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP
@@ -251,6 +290,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into `main.tf.json`. The module's allowlists now end in `\Z`, so such a name is refused with
   `Invalid SQL identifier: 'spectrum_events\n'`. That includes a name that reaches it with a
   trailing newline from an environment variable or a file; strip the value where it is set.
+### Upgrade notes
+
+- A contract with a column typed `array`, `struct`, `map`, `object`, `record` or `row` (or
+  `array(...)`) on an `aws` Glue table or a `gcp` BigQuery table now fails `fluid validate`,
+  `fluid generate iac` and `fluid apply` with `column-type`, where it validated and wrote a
+  `string` column (Glue) or an invalid one (BigQuery). Declare the column `json` (BigQuery's
+  JSON type; Glue stores it as `string` and validate warns) or `string` until typed nested
+  columns are supported.
+- Other new refusals (kind `column-type`): on Glue, `geography`, `geometry`, `geom`, `point` and
+  `hll` (previously a silent `string`; declare `string` or `binary`) and a decimal Hive rejects
+  (precision over 38 or 0, scale over the precision or below 0); on both clouds, `bit(n)` with
+  n over 1 and any type no table maps.
+- New validate warnings, so `--strict` fails: on Glue, `json`, `jsonb`, `variant`, `super`,
+  `time`, `interval` and `bignumeric` (written as `string`, as before; declare `string` to say
+  so); on BigQuery, `geometry` and `geom` (planar, written as the spherical `GEOGRAPHY`) and a
+  `decimal(p,s)` wider than a NUMERIC holds (29 integer or 9 fractional digits; declare
+  `bignumeric`).
+- A Glue table's `smallint`, `tinyint`, `real`, `money`, `timestamptz` and the other types that
+  used to become `string` now get their Hive type, which is a column type change on a table an
+  earlier version applied. `fluid apply` refuses it, and so does its dry run, until
+  `--allow-data-loss`: the refusal names each table and `column: old -> new`. Parquet files
+  written under the old `string` schema (by Athena INSERT or CTAS, or dbt) hold strings, so
+  after `string` -> `smallint` Athena fails every read of them until they are rewritten (files
+  forge's own DuckDB build wrote are fixed by the change). Reverting the column type in the
+  contract restores reads, and `--allow-data-loss` proceeds (measured against moto with real
+  `tofu`: refused without the flag, `~1` applied with it). A difference in spacing alone, such as
+  `decimal(10, 2)` and `decimal(10,2)`, never trips the gate, and neither does an added or
+  removed column, which the gate did not cover before. Consumers that compare these columns as
+  strings (`small = '5'`) may need changes. Until the apply, `fluid verify` and `fluid diff`
+  report the mismatch. With the plan's change list unreadable, an AWS apply that updates
+  anything in place now also needs the flag, as a Databricks apply already did.
+- `decimal(10, 2)` is now written `decimal(10,2)`. Against moto, that alone applies without the
+  flag; real Glue was not measured.
 
 - **Other validators let a value with a trailing newline through, too.** The same `$` ended other
   whole-string patterns, so a value written as a YAML `|` block, read from a `.env` file or decoded
