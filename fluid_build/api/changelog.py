@@ -136,10 +136,12 @@ def _require_valid(contracts: Mapping[str, Mapping[str, Any]]) -> None:
 
     The rules read only the shapes a schema allows, so an invalid contract can
     hide a change from them: a column whose ``type`` is a number is never
-    compared. This is the gate ``fluid plan`` runs before it writes a plan: the JSON Schema of
-    the contract's own ``fluidVersion``, offline, from the bundled schemas. A
-    pre-0.7 version has no schema left, and is refused with the upgrade that
-    ``fluid validate`` asks for instead of "schema not available".
+    compared. This is the gate ``fluid plan`` runs before it writes a plan: the
+    JSON Schema of the contract's own ``fluidVersion``, offline, from the
+    bundled schemas. A pre-0.7 version has no schema left, and is refused with
+    the upgrade that ``fluid validate`` asks for instead of "schema not
+    available". A side the validator cannot even read (a ``fluidVersion`` that
+    is not a version, such as ``7``) is refused too, never let through.
     """
     # jsonschema stays off the import path of every caller that does not validate.
     from fluid_build.schema_manager import FluidSchemaManager
@@ -147,19 +149,26 @@ def _require_valid(contracts: Mapping[str, Mapping[str, Any]]) -> None:
     manager = FluidSchemaManager()
     errors: Dict[str, List[str]] = {}
     for side, contract in contracts.items():
-        version = manager.detect_version(dict(contract))
-        if version is not None and (version.major, version.minor) < (0, 7):
-            errors[side] = [
-                f"fluidVersion {str(contract.get('fluidVersion'))!r} is no longer supported: "
-                "pre-0.7 schemas have been removed; upgrade the contract to fluidVersion 0.7.x "
-                "or later"
-            ]
-            continue
-        result = manager.validate_contract(dict(contract), offline_only=True)
-        if not result.is_valid:
-            errors[side] = list(result.errors)
+        try:
+            found = _schema_errors(manager, contract)
+        except Exception as exc:  # noqa: BLE001 — a contract nothing can validate is refused
+            found = [f"the contract cannot be validated: {exc}"]
+        if found:
+            errors[side] = found
     if errors:
         raise ContractValidationError(errors)
+
+
+def _schema_errors(manager: Any, contract: Mapping[str, Any]) -> List[str]:
+    version = manager.detect_version(dict(contract))
+    if version is not None and (version.major, version.minor) < (0, 7):
+        return [
+            f"fluidVersion {str(contract.get('fluidVersion'))!r} is no longer supported: "
+            "pre-0.7 schemas have been removed; upgrade the contract to fluidVersion 0.7.x "
+            "or later"
+        ]
+    result = manager.validate_contract(dict(contract), offline_only=True)
+    return [] if result.is_valid else list(result.errors)
 
 
 # Characters ``str.isprintable`` passes that still draw nothing: the Unicode

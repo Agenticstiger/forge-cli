@@ -147,6 +147,22 @@ def test_a_contract_without_a_fluid_version_is_refused():
     assert set(excinfo.value.errors) == {"new"}
 
 
+@pytest.mark.parametrize("version", ["garbage", 7])
+def test_a_fluid_version_that_is_not_a_version_is_refused_not_raised(tmp_path, version):
+    """The validator raised on it, and the CLI exited 1 (``diff_failed``), which reads as breaking."""
+    from fluid_build.cli._common import CLIError
+
+    new = _contract([_ID])
+    new["fluidVersion"] = version
+
+    with pytest.raises(ContractValidationError) as excinfo:
+        compare_contracts(_contract([_ID]), new)
+    assert set(excinfo.value.errors) == {"new"}
+    with pytest.raises(CLIError) as cli_error:
+        _run_cli(tmp_path, _contract([_ID]), new, fail_on_breaking=True)
+    assert (cli_error.value.exit_code, cli_error.value.event) == (2, "diff_contract_invalid")
+
+
 def test_validate_false_diffs_what_it_is_given():
     """The refine preview's opt-out: an advisory diff of a contract still being repaired."""
     old = {"exposes": [{"id": "x", "schema": [{"name": "a", "type": "STRING"}]}]}
