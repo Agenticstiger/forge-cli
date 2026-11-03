@@ -101,6 +101,9 @@ def test_jdbc_schema_filter_refuses_a_trailing_newline(monkeypatch, tmp_path):
 
 
 def test_bigquery_project_quoting_refuses_a_trailing_newline():
+    # bigquery_validation imports google.cloud.bigquery at module load, and the
+    # GCP SDK is a provider extra the minimal unit lanes do not install.
+    pytest.importorskip("google.cloud.bigquery")
     from fluid_build.providers.bigquery_validation import _quote_bq_project
 
     assert _quote_bq_project("acme-analytics") == "`acme-analytics`"
