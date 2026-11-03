@@ -16,7 +16,9 @@
 
 import time
 
+import httpx
 import pytest
+import respx
 
 from fluid_build.errors import NetworkError
 from fluid_build.util.network import (
@@ -28,6 +30,8 @@ from fluid_build.util.network import (
     CircuitBreaker,
     CircuitState,
     RateLimiter,
+    create_session_with_retries,
+    safe_request,
 )
 
 
@@ -131,3 +135,52 @@ class TestDefaults:
         assert DEFAULT_MAX_RETRIES == 3
         assert DEFAULT_BACKOFF_FACTOR == 2
         assert DEFAULT_RATE_LIMIT == 50
+
+
+class TestSafeRequest:
+    """``safe_request`` over httpx: success, HTTP status, timeout and connection errors."""
+
+    URL = "https://api.example.test/thing"
+
+    def test_success_returns_response(self):
+        with respx.mock() as router:
+            router.get(self.URL).respond(200, json={"ok": True})
+            with httpx.Client() as session:
+                response = safe_request("GET", self.URL, session=session)
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+
+    def test_http_error_status_raises_network_error_with_status(self):
+        with respx.mock() as router:
+            router.get(self.URL).respond(404)
+            with httpx.Client() as session:
+                with pytest.raises(NetworkError, match="HTTP 404") as raised:
+                    safe_request("GET", self.URL, session=session)
+        assert raised.value.context["status_code"] == 404
+
+    def test_timeout_raises_network_error(self):
+        with respx.mock() as router:
+            router.get(self.URL).mock(side_effect=httpx.ReadTimeout("slow"))
+            with httpx.Client() as session:
+                with pytest.raises(NetworkError, match="timed out"):
+                    safe_request("GET", self.URL, session=session)
+
+    def test_connection_error_raises_network_error(self):
+        with respx.mock() as router:
+            router.get(self.URL).mock(side_effect=httpx.ConnectError("refused"))
+            with httpx.Client() as session:
+                with pytest.raises(NetworkError, match="Connection failed"):
+                    safe_request("GET", self.URL, session=session)
+
+    def test_retrying_session_retries_a_transient_status(self):
+        with respx.mock() as router:
+            route = router.get(self.URL).mock(
+                side_effect=[httpx.Response(503), httpx.Response(200, json={"ok": True})]
+            )
+            session = create_session_with_retries(max_retries=2, backoff_factor=0)
+            try:
+                response = safe_request("GET", self.URL, session=session)
+            finally:
+                session.close()
+        assert response.status_code == 200
+        assert route.call_count == 2

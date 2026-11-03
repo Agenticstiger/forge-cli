@@ -931,7 +931,7 @@ def s3_endpoint(monkeypatch) -> Iterator[str]:
     import sys
     import time
 
-    import requests
+    import httpx
 
     port = _free_port()
     endpoint = f"http://127.0.0.1:{port}"
@@ -944,9 +944,9 @@ def s3_endpoint(monkeypatch) -> Iterator[str]:
         deadline = time.monotonic() + 30
         while True:
             try:
-                requests.get(f"{endpoint}/moto-api/", timeout=1)
+                httpx.get(f"{endpoint}/moto-api/", timeout=1)
                 break
-            except requests.RequestException:
+            except httpx.RequestError:
                 if proc.poll() is not None or time.monotonic() > deadline:
                     pytest.skip("moto server did not start")
                 time.sleep(0.2)

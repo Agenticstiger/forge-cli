@@ -32,8 +32,8 @@ from types import SimpleNamespace
 from typing import Any, Iterator, List, Tuple
 from unittest.mock import patch
 
+import httpx
 import pytest
-import requests
 
 from fluid_build.cli._command_center import CommandCenterClient
 
@@ -347,7 +347,7 @@ def test_a_blueprint_get_does_not_follow_a_redirect_to_another_origin(
     cc, other = cc_redirecting_its_data
     api_url = _marketplace_url()
 
-    with pytest.raises(requests.exceptions.RequestException) as raised:
+    with pytest.raises(httpx.HTTPError) as raised:
         marketplace._marketplace_get(f"{api_url}{path}", logging.getLogger("t"))
 
     assert ("GET", f"{_MARKETPLACE}{path}") in cc.recorded
@@ -389,7 +389,7 @@ def test_the_instantiate_post_does_not_resend_the_parameters_to_another_origin(
     cc, other = cc_redirecting_its_data
     api_url = _marketplace_url()
 
-    with pytest.raises(requests.exceptions.RequestException):
+    with pytest.raises(httpx.HTTPError):
         marketplace._marketplace_post(
             f"{api_url}/customer-360/instantiate",
             logging.getLogger("t"),
@@ -441,7 +441,7 @@ def test_the_market_catalog_connector_does_not_follow_a_redirect_to_another_orig
         try:
             return await connector._get_catalog_stats_impl()
         finally:
-            await connector.session.close()
+            await connector.session.aclose()
 
     stats = asyncio.run(_run())
 
@@ -460,10 +460,10 @@ def test_every_request_on_the_connector_session_refuses_the_foreign_redirect(
     async def _run():
         connector = await _connected_catalog_connector()
         try:
-            async with connector.session.get(f"{connector.base_url}/search") as response:
-                return response.status
+            response = await connector.session.get(f"{connector.base_url}/search")
+            return response.status_code
         finally:
-            await connector.session.close()
+            await connector.session.aclose()
 
     with pytest.raises(CredentialRedirectRefused, match="another origin"):
         asyncio.run(_run())
@@ -488,7 +488,7 @@ def test_a_catalog_redirect_within_the_origin_is_still_followed(clean_env, monke
         try:
             return await connector._get_catalog_stats_impl()
         finally:
-            await connector.session.close()
+            await connector.session.aclose()
 
     try:
         assert asyncio.run(_run()) == {"total_products": 7}
@@ -499,8 +499,8 @@ def test_a_catalog_redirect_within_the_origin_is_still_followed(clean_env, monke
 # ── a refused hop is never sent: no request, not even a connection ───────
 #
 # The refusal is raised from the hook each library runs on a redirect response
-# before it follows it: aiohttp's ``on_request_redirect`` trace signal for the
-# catalog connector's session, requests' response hook for the marketplace.
+# before it follows it: the ``response`` event hook (``refuse_foreign_redirect``)
+# of the catalog connector's httpx AsyncClient and of the marketplace's client.
 # The second origin must see nothing at all, also for a 307 / 308, which
 # resends the method and the body (the operator's parameters).
 
@@ -554,12 +554,12 @@ def test_the_connector_session_sends_nothing_to_the_redirect_target(
         connector = await _connected_catalog_connector()
         try:
             kwargs = {} if method == "GET" else {"json": {"parameters": _PARAMETERS}}
-            async with connector.session.request(
+            response = await connector.session.request(
                 method, f"{connector.base_url}/instantiate", **kwargs
-            ) as response:
-                return response.status
+            )
+            return response.status_code
         finally:
-            await connector.session.close()
+            await connector.session.aclose()
 
     with pytest.raises(CredentialRedirectRefused, match="another origin"):
         asyncio.run(_run())
@@ -579,10 +579,8 @@ def test_a_marketplace_request_sends_nothing_to_the_redirect_target(
     url = f"{_marketplace_url()}/customer-360/instantiate"
     kwargs = {} if method == "get" else {"json": {"parameters": _PARAMETERS}}
 
-    with pytest.raises(requests.exceptions.RequestException, match="another origin"):
-        marketplace._marketplace_request(
-            getattr(requests, method), url, logging.getLogger("t"), **kwargs
-        )
+    with pytest.raises(httpx.HTTPError, match="another origin"):
+        marketplace._marketplace_request(method.upper(), url, logging.getLogger("t"), **kwargs)
 
     assert (method.upper(), f"{_MARKETPLACE}/customer-360/instantiate") in cc.recorded
     assert other.recorded == [] and other.bodies == []
@@ -593,7 +591,7 @@ def test_the_second_origin_is_reachable_so_the_zero_above_is_real(cc_redirecting
     # The counting listener does see a connection and a request sent to it.
     _cc, other, accepted, _status = cc_redirecting_every_hop
 
-    assert requests.post(f"{other.url}/collect", json={"x": 1}, timeout=5).status_code == 200
+    assert httpx.post(f"{other.url}/collect", json={"x": 1}, timeout=5).status_code == 200
     assert other.recorded == [("POST", "/collect")]
     assert len(accepted) == 1
 
@@ -758,7 +756,7 @@ def test_a_named_registry_request_with_a_header_of_its_own_refuses_another_origi
 
     old, new = moved_registry
 
-    with pytest.raises(requests.exceptions.RequestException, match="another origin"):
+    with pytest.raises(httpx.HTTPError, match="another origin"):
         marketplace._marketplace_get(
             f"{old.url}{_MARKETPLACE}/x",
             logging.getLogger("t"),
@@ -775,9 +773,9 @@ def test_a_named_registry_request_with_a_body_refuses_another_origin(moved_regis
 
     old, new = moved_registry
 
-    with pytest.raises(requests.exceptions.RequestException, match="another origin"):
+    with pytest.raises(httpx.HTTPError, match="another origin"):
         marketplace._marketplace_request(
-            getattr(requests, method),
+            method.upper(),
             f"{old.url}{_MARKETPLACE}/x/instantiate",
             logging.getLogger("t"),
             named_registry=True,
@@ -890,7 +888,7 @@ def test_a_named_registry_request_of_the_operators_still_stops_after_a_same_orig
 
     old, new = sticky_moved_registry
 
-    with pytest.raises(requests.exceptions.RequestException, match="another origin"):
+    with pytest.raises(httpx.HTTPError, match="another origin"):
         marketplace._marketplace_get(
             f"{old.url}{_MARKETPLACE}/x", logging.getLogger("t"), named_registry=True, **kwargs
         )
@@ -952,7 +950,7 @@ def test_a_named_registry_through_an_authenticated_proxy_follows_its_move(authen
 def test_a_named_registry_request_with_a_key_through_the_proxy_still_stops(authenticated_proxy):
     from fluid_build.cli import marketplace
 
-    with pytest.raises(requests.exceptions.RequestException, match="another origin"):
+    with pytest.raises(httpx.HTTPError, match="another origin"):
         marketplace._marketplace_get(
             f"{_PROXIED_OLD}{_MARKETPLACE}/x",
             logging.getLogger("t"),
