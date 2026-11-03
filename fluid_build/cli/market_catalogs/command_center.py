@@ -68,15 +68,26 @@ class CommandCenterConnector(BaseCatalogConnector):
             self.base_url = cc.get_catalog_url()
             self.cc_client = cc
 
-            # Initialize aiohttp session. Every request on it follows a
+            # Initialize the HTTP session. Every request on it follows a
             # redirect only within the Command Center's origin: the client's
             # probes passed the host gate for that origin, not for wherever
             # the Command Center redirects (the reporter's redirect rule).
-            import aiohttp
+            import httpx
 
-            from fluid_build.observability.reporter import foreign_redirect_trace_config
+            from fluid_build.observability.reporter import refuse_foreign_redirect
+            from fluid_build.util.http_client import new_async_client
 
-            self.session = aiohttp.ClientSession(trace_configs=[foreign_redirect_trace_config()])
+            # aiohttp's defaults, kept: 10 redirects, 300s total / 30s connect,
+            # and no proxy-environment lookup.
+            self.session = new_async_client(
+                timeout=httpx.Timeout(300.0, connect=30.0),
+                response_hooks=[refuse_foreign_redirect],
+                max_redirects=10,
+                trust_env=False,
+                # aiohttp's default context: the system CA store, so a corporate
+                # CA installed only there is still trusted.
+                system_trust=True,
+            )
 
             self.logger.info(f"Connected to Command Center catalog: {self.base_url}")
             return True
@@ -94,18 +105,18 @@ class CommandCenterConnector(BaseCatalogConnector):
             # Build query parameters
             params = {}
 
-            if filters.query:
-                params["query"] = filters.query
-            if filters.domains:
-                params["domains"] = ",".join(filters.domains)
-            if filters.owners:
-                params["owners"] = ",".join(filters.owners)
+            if filters.text_query:
+                params["query"] = filters.text_query
+            if filters.domain:
+                params["domains"] = filters.domain
+            if filters.owner:
+                params["owners"] = filters.owner
             if filters.tags:
                 params["tags"] = ",".join(filters.tags)
-            if filters.layers:
-                params["layers"] = ",".join([layer.value for layer in filters.layers])
-            if filters.statuses:
-                params["statuses"] = ",".join([status.value for status in filters.statuses])
+            if filters.layer:
+                params["layers"] = filters.layer.value
+            if filters.status:
+                params["statuses"] = filters.status.value
             if filters.min_quality_score:
                 params["min_quality"] = filters.min_quality_score
             if filters.limit:
@@ -114,69 +125,80 @@ class CommandCenterConnector(BaseCatalogConnector):
                 params["offset"] = filters.offset
 
             # Make request
-            async with self.session.get(self.base_url, params=params) as response:
-                if response.status != 200:
-                    self.logger.warning(f"Command Center search failed: {response.status}")
-                    return []
+            from fluid_build.util.http_client import merge_query
 
-                data = await response.json()
-                products = []
+            response = await self.session.get(merge_query(self.base_url, params))
+            if response.status_code != 200:
+                self.logger.warning(f"Command Center search failed: {response.status_code}")
+                return []
 
-                # Map Command Center schema to DataProductMetadata
-                for item in data.get("items", []):
-                    try:
-                        # Parse layer
-                        layer = None
-                        if "layer" in item:
-                            try:
-                                layer = DataProductLayer(item["layer"])
-                            except ValueError:
-                                pass
+            data = response.json()
+            products = []
 
-                        # Parse status
-                        status = DataProductStatus.ACTIVE  # Default
-                        if "status" in item:
-                            try:
-                                status = DataProductStatus(item["status"])
-                            except ValueError:
-                                pass
+            # Map Command Center schema to DataProductMetadata
+            for item in data.get("items", []):
+                try:
+                    # Parse layer
+                    layer = None
+                    if "layer" in item:
+                        try:
+                            layer = DataProductLayer(item["layer"])
+                        except ValueError:
+                            self.logger.debug(
+                                "Command Center product %r has an unknown layer %r; left unset",
+                                item.get("id"),
+                                item["layer"],
+                            )
 
-                        # Create metadata
-                        product = DataProductMetadata(
-                            id=item["id"],
-                            name=item["name"],
-                            description=item.get("description", ""),
-                            domain=item.get("domain", "unknown"),
-                            owner=(
-                                item.get("owner", {}).get("name", "unknown")
-                                if isinstance(item.get("owner"), dict)
-                                else item.get("owner", "unknown")
-                            ),
-                            layer=layer,
-                            status=status,
-                            tags=item.get("tags", []),
-                            quality_score=item.get("quality_score", 0.0),
-                            created_at=item.get("created_at"),
-                            updated_at=item.get("updated_at"),
-                            data_location=item.get("data_location", ""),
-                            schema_definition=item.get("schema", {}),
-                            sla=item.get("sla", {}),
-                            documentation_url=item.get("documentation_url"),
-                            metadata={
-                                "source": "command_center",
-                                "cc_url": f"{self.base_url}/{item['id']}",
-                                "version": item.get("version", "unknown"),
-                                **item.get("metadata", {}),
-                            },
-                        )
+                    # Parse status
+                    status = DataProductStatus.ACTIVE  # Default
+                    if "status" in item:
+                        try:
+                            status = DataProductStatus(item["status"])
+                        except ValueError:
+                            self.logger.debug(
+                                "Command Center product %r has an unknown status %r; kept %s",
+                                item.get("id"),
+                                item["status"],
+                                status.value,
+                            )
 
-                        products.append(product)
+                    # Create metadata
+                    product = DataProductMetadata(
+                        id=item["id"],
+                        name=item["name"],
+                        description=item.get("description", ""),
+                        domain=item.get("domain", "unknown"),
+                        owner=(
+                            item.get("owner", {}).get("name", "unknown")
+                            if isinstance(item.get("owner"), dict)
+                            else item.get("owner", "unknown")
+                        ),
+                        layer=layer,
+                        status=status,
+                        tags=item.get("tags", []),
+                        quality_score=item.get("quality_score", 0.0),
+                        created_at=item.get("created_at"),
+                        updated_at=item.get("updated_at"),
+                        data_location=item.get("data_location", ""),
+                        schema_definition=item.get("schema", {}),
+                        sla=item.get("sla", {}),
+                        documentation_url=item.get("documentation_url"),
+                        metadata={
+                            "source": "command_center",
+                            "cc_url": f"{self.base_url}/{item['id']}",
+                            "version": item.get("version", "unknown"),
+                            **item.get("metadata", {}),
+                        },
+                    )
 
-                    except Exception as e:
-                        self.logger.warning(f"Failed to parse product {item.get('id')}: {e}")
-                        continue
+                    products.append(product)
 
-                return products
+                except Exception as e:
+                    self.logger.warning(f"Failed to parse product {item.get('id')}: {e}")
+                    continue
+
+            return products
 
         except Exception as e:
             self.logger.error(f"Command Center search failed: {e}")
@@ -187,11 +209,11 @@ class CommandCenterConnector(BaseCatalogConnector):
         try:
             stats_url = f"{self.base_url}/stats"
 
-            async with self.session.get(stats_url) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    return {"total_products": 0, "total_domains": 0, "avg_quality_score": 0.0}
+            response = await self.session.get(stats_url)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {"total_products": 0, "total_domains": 0, "avg_quality_score": 0.0}
 
         except Exception as e:
             self.logger.warning(f"Failed to get Command Center stats: {e}")

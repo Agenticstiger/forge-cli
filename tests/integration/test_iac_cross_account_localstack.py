@@ -140,15 +140,15 @@ def _gate() -> tuple[bool, str]:
         return False, f"fluid_build.iac unavailable: {exc}"
     if runner.tofu_path() is None:
         return False, "the `tofu` (OpenTofu) binary is not on PATH"
-    for mod in ("boto3", "requests"):
+    for mod in ("boto3", "httpx"):
         try:
             __import__(mod)
         except ImportError:
             return False, f"the `{mod}` package is not installed"
-    import requests
+    import httpx
 
     try:
-        resp = requests.get(f"{ENDPOINT}/_localstack/health", timeout=5)
+        resp = httpx.get(f"{ENDPOINT}/_localstack/health", timeout=5)
     except Exception as exc:  # noqa: BLE001
         return False, f"LocalStack not reachable at {ENDPOINT}: {exc}"
     if resp.status_code != 200:
@@ -188,10 +188,10 @@ def _client(service: str, key: str = KEY_A):
 
 def _reset() -> None:
     """Wipe every emulator backend so each test starts from empty."""
-    import requests
+    import httpx
 
     try:
-        requests.post(f"{ENDPOINT}/_localstack/state/reset", timeout=20)
+        httpx.post(f"{ENDPOINT}/_localstack/state/reset", timeout=20)
     except Exception:  # noqa: BLE001 - best-effort isolation
         pass
 

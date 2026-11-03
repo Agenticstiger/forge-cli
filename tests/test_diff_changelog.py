@@ -58,7 +58,12 @@ NBSP = chr(0xA0)
 
 @pytest.fixture
 def v1_v2():
-    """The on-disk fixture pair loaded as parsed contracts."""
+    """The on-disk fixture pair loaded as parsed contracts.
+
+    They declare 0.7.3 but keep the pre-0.7 shapes the legacy rules read (a
+    flat ``schema``, ``quality.tests``, a root ``agentPolicy``), which no
+    bundled schema accepts, so they are diffed with ``validate=False``.
+    """
     import yaml
 
     v1 = yaml.safe_load((FIXTURES / "v1.fluid.yaml").read_text())
@@ -73,14 +78,14 @@ def v1_v2():
 
 def test_same_contract_produces_empty_diff(v1_v2):
     v1, _ = v1_v2
-    report = compare_contracts(v1, v1)
+    report = compare_contracts(v1, v1, validate=False)
     assert report.total == 0
     assert not report.has_breaking
 
 
 def test_report_total_matches_section_sums(v1_v2):
     v1, v2 = v1_v2
-    report = compare_contracts(v1, v2)
+    report = compare_contracts(v1, v2, validate=False)
     assert report.total == (len(report.breaking) + len(report.non_breaking) + len(report.info))
 
 
@@ -267,7 +272,7 @@ def test_quality_severity_unchanged_no_change():
 def test_fixture_v1_to_v2_classification(v1_v2):
     """Full pipeline against the on-disk fixture pair."""
     v1, v2 = v1_v2
-    report = compare_contracts(v1, v2)
+    report = compare_contracts(v1, v2, validate=False)
 
     # v2 vs v1 should detect:
     #  - email column removed (breaking)
@@ -309,7 +314,7 @@ def test_fixture_v1_to_v2_classification(v1_v2):
 
 def test_render_text_contains_summary_line(v1_v2):
     v1, v2 = v1_v2
-    report = compare_contracts(v1, v2)
+    report = compare_contracts(v1, v2, validate=False)
     out = render_text(report)
     assert "Summary:" in out
     assert "breaking" in out.lower()
@@ -322,7 +327,7 @@ def test_render_text_empty_report_says_no_changes():
 
 def test_render_markdown_includes_section_headings(v1_v2):
     v1, v2 = v1_v2
-    report = compare_contracts(v1, v2)
+    report = compare_contracts(v1, v2, validate=False)
     md = render_markdown(report)
     assert "# Contract changelog" in md
     if report.breaking:
@@ -333,7 +338,7 @@ def test_render_markdown_includes_section_headings(v1_v2):
 
 def test_report_to_dict_round_trips_through_json(v1_v2):
     v1, v2 = v1_v2
-    report = compare_contracts(v1, v2)
+    report = compare_contracts(v1, v2, validate=False)
     data = report.to_dict()
     # Must be JSON-serialisable
     s = json.dumps(data)
@@ -347,14 +352,26 @@ def test_report_to_dict_round_trips_through_json(v1_v2):
 # ---------------------------------------------------------------------------
 
 
+def _cli_contracts(tmp_path):
+    """A valid 0.7.6 pair for the CLI, which validates both: ``new`` drops a column."""
+    import yaml
+
+    old = tmp_path / "old.fluid.yaml"
+    new = tmp_path / "new.fluid.yaml"
+    old.write_text(yaml.safe_dump(_contract_076([_ID_COLUMN, {"name": "note", "type": "string"}])))
+    new.write_text(yaml.safe_dump(_contract_076([_ID_COLUMN])))
+    return str(old), str(new)
+
+
 def test_cli_diff_baseline_mode_smoke(tmp_path, monkeypatch):
     """End-to-end: ``fluid diff <new> --baseline <old>`` produces JSON and exits 0 by default."""
     from fluid_build.cli import diff as diff_mod
 
+    old, new = _cli_contracts(tmp_path)
     out_path = tmp_path / "diff.json"
     args = argparse.Namespace(
-        contract=str(FIXTURES / "v2.fluid.yaml"),
-        baseline=str(FIXTURES / "v1.fluid.yaml"),
+        contract=new,
+        baseline=old,
         env=None,
         state=None,
         out=str(out_path),
@@ -378,9 +395,10 @@ def test_cli_diff_baseline_fail_on_breaking(tmp_path):
     """``--fail-on-breaking`` returns 1 when breaking changes exist."""
     from fluid_build.cli import diff as diff_mod
 
+    old, new = _cli_contracts(tmp_path)
     args = argparse.Namespace(
-        contract=str(FIXTURES / "v2.fluid.yaml"),
-        baseline=str(FIXTURES / "v1.fluid.yaml"),
+        contract=new,
+        baseline=old,
         env=None,
         state=None,
         out=str(tmp_path / "diff.json"),
@@ -397,9 +415,10 @@ def test_cli_diff_baseline_idempotent(tmp_path):
     """``--fail-on-breaking`` returns 0 when comparing a contract to itself."""
     from fluid_build.cli import diff as diff_mod
 
+    old, _ = _cli_contracts(tmp_path)
     args = argparse.Namespace(
-        contract=str(FIXTURES / "v1.fluid.yaml"),
-        baseline=str(FIXTURES / "v1.fluid.yaml"),
+        contract=old,
+        baseline=old,
         env=None,
         state=None,
         out=str(tmp_path / "diff.json"),
@@ -885,14 +904,14 @@ def test_moving_columns_from_schema_to_contract_schema_is_not_a_change():
     old = _contract_flat([{"name": "id", "type": "STRING", "nullable": False}])
     new = _contract_076([{"name": "id", "type": "string", "required": True}])
 
-    assert compare_contracts(old, new).total == 0
+    assert compare_contracts(old, new, validate=False).total == 0
 
 
 def test_a_column_dropped_while_moving_to_contract_schema_is_still_found():
     old = _contract_flat([{"name": "id", "type": "STRING"}, {"name": "note", "type": "STRING"}])
     new = _contract_076([{"name": "id", "type": "string"}])
 
-    report = compare_contracts(old, new)
+    report = compare_contracts(old, new, validate=False)
 
     assert report.total == 1
     assert [(c.kind, c.path) for c in report.breaking] == [
@@ -1326,9 +1345,10 @@ def test_cli_diff_baseline_sets_otel_attributes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(diff_mod, "_traced_span", _fake_traced_span)
 
+    old, new = _cli_contracts(tmp_path)
     args = argparse.Namespace(
-        contract=str(FIXTURES / "v2.fluid.yaml"),
-        baseline=str(FIXTURES / "v1.fluid.yaml"),
+        contract=new,
+        baseline=old,
         env=None,
         state=None,
         out=str(tmp_path / "diff.json"),

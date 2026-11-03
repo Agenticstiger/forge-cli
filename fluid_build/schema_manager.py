@@ -21,13 +21,14 @@ against the official FLUID schema repository.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Union
+from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Union
 
 import yaml
 
@@ -110,6 +111,7 @@ def _locate_error(error: Any, locate: Callable[..., Optional[str]]) -> Optional[
         known = schema.get("properties") or {}
         patterns = list((schema.get("patternProperties") or {}).keys())
         for key in error.instance:
+            # re.search, as jsonschema's additionalProperties reads these keys.
             if key not in known and not any(re.search(p, str(key)) for p in patterns):
                 return locate([*path, key])
     if error.validator == "required":
@@ -130,6 +132,72 @@ def _error_path(error: Any, locate: Optional[Callable[..., Optional[str]]] = Non
     path = path or "root"
     where = _locate_error(error, locate) if locate is not None else None
     return f"{where} ({path})" if where else path
+
+
+def _end_anchored(pattern: str) -> str:
+    r"""``pattern`` with each ``$`` anchor written ``\Z``, the end of the value.
+
+    JSON Schema writes ``pattern`` in ECMA-262, where ``$`` matches only at the
+    end of the value. Python's ``$`` also matches before a final ``\n``, so
+    jsonschema's ``re.search`` let ``"orders\n"`` through ``^[a-z_]+$``.
+    fastjsonschema and js-regex make the same rewrite with a ``(?<!\\)\$``
+    finder, which turns ``[$]`` into ``[\Z]`` (that does not compile) and
+    misses the ``$`` after an escaped backslash (``\\$``). This scan skips
+    escapes and ``[...]`` sets instead.
+    """
+    out: List[str] = []
+    i, in_set = 0, False
+    while i < len(pattern):
+        token = pattern[i]
+        if token == "\\":
+            token = pattern[i : i + 2]
+        elif in_set:
+            in_set = token != "]"
+        elif token == "[":
+            in_set = True
+            # A "]" first in a set, after an optional "^", is a literal.
+            first = i + 1 + (pattern[i + 1 : i + 2] == "^")
+            if pattern[first : first + 1] == "]":
+                token = pattern[i : first + 1]
+        i += len(token)
+        out.append(r"\Z" if token == "$" and not in_set else token)
+    return "".join(out)
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled_pattern(pattern: str) -> re.Pattern[str]:
+    return re.compile(_end_anchored(pattern))
+
+
+def _pattern_keyword(validator: Any, pattern: str, instance: Any, schema: Any) -> Iterator[Any]:
+    """jsonschema's ``pattern`` keyword, with ``$`` read as ECMA-262 reads it."""
+    if not validator.is_type(instance, "string") or _compiled_pattern(pattern).search(instance):
+        return
+    message = f"{instance!r} does not match {pattern!r}"
+    if re.search(pattern, instance):  # only the final line break fails
+        message += " (it ends in a line break, which a YAML | or > block keeps and |- or >- drops)"
+    yield jsonschema.ValidationError(message)
+
+
+@functools.lru_cache(maxsize=None)
+def _end_anchored_validator(validator_class: Any) -> Any:
+    return jsonschema.validators.extend(validator_class, {"pattern": _pattern_keyword})
+
+
+def schema_validator(schema: Dict[str, Any]) -> Any:
+    """A jsonschema validator for ``schema``, in the dialect it declares, whose
+    ``pattern`` ends at the end of the value (:func:`_end_anchored`). Validate
+    against a FLUID schema through this, never ``validator_for`` directly.
+
+    The keyword is replaced the way check-jsonschema replaces it, with
+    ``jsonschema.validators.extend``. Two places keep jsonschema's own
+    ``re.search``: ``patternProperties`` keys, as its ``additionalProperties``
+    and :func:`_locate_error` read them, and a subschema that declares its own
+    ``$schema`` (or a ``$ref`` to the root, which does), for which jsonschema
+    picks that dialect's own class. No FLUID schema has either; a test fails if
+    one does.
+    """
+    return _end_anchored_validator(jsonschema.validators.validator_for(schema))(schema)
 
 
 def _schema_version_sort_key(version: str) -> tuple[int, int, int]:
@@ -736,7 +804,7 @@ class FluidSchemaManager:
             # 2020-12; validating them with Draft 7 worked only because none
             # has yet used a 2020-12-only keyword. The first one to do so
             # would have been accepted without error.
-            validator = jsonschema.validators.validator_for(schema)(schema)
+            validator = schema_validator(schema)
 
             # Validate and collect errors
             errors = sorted(validator.iter_errors(contract), key=lambda e: e.path)

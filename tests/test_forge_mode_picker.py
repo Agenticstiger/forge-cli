@@ -181,7 +181,7 @@ def test_pick_mode_default_picks_from_product_when_workspace_has_products(tmp_pa
 
 
 def test_pick_mode_default_survives_a_slow_workspace_probe(tmp_path, silent_console, monkeypatch):
-    """A workspace probe slower than the scan's default 0.4s budget keeps its result.
+    """A workspace probe slower than the scan's default 1.0s budget keeps its result.
 
     Deterministic stand-in for a loaded CI runner, where the probe overran and the
     default fell back to ``ai`` (``assert 'ai' == 'from_product'``). Holds only while
@@ -194,7 +194,7 @@ def test_pick_mode_default_survives_a_slow_workspace_probe(tmp_path, silent_cons
     real_probe = _welcome_scan._probe_workspace
 
     def _slow_probe(start):
-        time.sleep(0.6)  # past the default 0.4s _PROBE_TIMEOUT_S
+        time.sleep(1.2)  # past the default 1.0s _TOTAL_TIMEOUT_S
         return real_probe(start)
 
     monkeypatch.setattr(_welcome_scan, "_probe_workspace", _slow_probe)
