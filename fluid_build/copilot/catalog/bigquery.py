@@ -86,6 +86,8 @@ from fluid_build.copilot.catalog.models import (
 #
 # The pattern table here keeps both rules visible — adding a new
 # identifier kind (e.g., a connection name) just adds one entry.
+# Match these with ``fullmatch``: their ``$`` also matches before a
+# trailing newline, so ``.match`` lets ``"orders\n"`` through.
 _BQ_IDENT_PATTERNS = {
     # Allow hyphens for project IDs.
     "project": re.compile(r"^[A-Za-z][A-Za-z0-9-]*$"),
@@ -113,7 +115,7 @@ def _quote_ident(value: str, *, kind: str) -> str:
 def _validate_ident(value: str, *, kind: str) -> str:
     """Return a BigQuery identifier after strict kind-specific validation."""
     pattern = _BQ_IDENT_PATTERNS.get(kind)
-    if pattern is None or not pattern.match(value or ""):
+    if pattern is None or not pattern.fullmatch(value or ""):
         raise CatalogConfigError(
             message=f"Invalid BigQuery {kind} identifier: {value!r}",
             suggestions=[

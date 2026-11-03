@@ -36,7 +36,7 @@ from fluid_build.util.contract import slugify_identifier
 
 # Canonical FLUID contract-id pattern (lowercased form — ``product_id`` is
 # lowercased before the check). Mirrors the JSON-schema id constraint.
-_FLUID_ID_RE = re.compile(r"^[a-z0-9_][a-z0-9_.-]*[a-z0-9_]$|^[a-z0-9_]$")
+_FLUID_ID_RE = re.compile(r"^[a-z0-9_][a-z0-9_.-]*[a-z0-9_]\Z|^[a-z0-9_]\Z")
 
 
 def _run_from_jdbc_source(

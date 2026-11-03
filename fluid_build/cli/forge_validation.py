@@ -46,7 +46,7 @@ def validate_project_name(name: str) -> Tuple[bool, Optional[str]]:
     if len(name) > 63:
         return False, "Project name must be 63 characters or less"
 
-    if not re.match(r"^[a-z][a-z0-9-]*[a-z0-9]$", name):
+    if not re.match(r"^[a-z][a-z0-9-]*[a-z0-9]\Z", name):
         return (
             False,
             "Project name must start with a letter, end with letter/number, and contain only lowercase letters, numbers, and hyphens",
@@ -147,7 +147,7 @@ def validate_template_name(template: str) -> Tuple[bool, Optional[str]]:
     if len(template) < 2:
         return False, "Template name must be at least 2 characters"
 
-    if not re.match(r"^[a-z][a-z0-9-]*$", template):
+    if not re.match(r"^[a-z][a-z0-9-]*\Z", template):
         return (
             False,
             "Template name must start with a letter and contain only lowercase letters, numbers, and hyphens",

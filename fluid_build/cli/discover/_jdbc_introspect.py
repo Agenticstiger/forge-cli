@@ -541,7 +541,7 @@ def _attach_string_sqlite(args: Dict[str, str], alias: str) -> str:
     return f"ATTACH {quote_ansi_string_literal(path)} AS {alias} (TYPE sqlite)"
 
 
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 def _validate_alias(alias: str) -> str:

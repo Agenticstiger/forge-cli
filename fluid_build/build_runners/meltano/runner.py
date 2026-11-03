@@ -112,8 +112,8 @@ def collect_singer_output(
 # ── Tap invocation ──────────────────────────────────────────────────────
 
 
-_TAP_NAME_RE = re.compile(r"^tap-[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
-_TARGET_NAME_RE = re.compile(r"^target-[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
+_TAP_NAME_RE = re.compile(r"^tap-[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?\Z")
+_TARGET_NAME_RE = re.compile(r"^target-[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?\Z")
 
 
 def _resolve_tap_binary(tap_name: str, *, project_dir: Optional[Path] = None) -> Optional[str]:
