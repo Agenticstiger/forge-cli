@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid doctor --strict` turns the "Action needed" summary into exit 1.** `fluid doctor` printed
+  "Action needed" for a copilot that is not ready and still exited 0, so a CI gate could not tell.
+  With `--strict` it exits 1 whenever the summary says "Action needed", in the text report and with
+  `--json`, whose payload now carries `action_needed` and `copilot_ready`. The default exit code is
+  unchanged, and `--strict` has no effect with `--features-only`, which prints no summary.
+
 - **`fluid publish` tells the Command Center which workspace holds a Databricks table.** The
   product's `metadata.workspace_host` is now `https://<host>[:port]` taken from `DATABRICKS_HOST`,
   normalised and checked as the provider checks it (https, or plain http only to a loopback
