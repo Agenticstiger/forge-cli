@@ -70,6 +70,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes when the region matches the declaration, fails with the fix when it does not, and is
   skipped when the contract declares none.
 
+### Removed
+
+- **`redshift` and `datamesh-manager` are no longer providers.** Neither deployed anything as a
+  provider: `redshift` only forwarded to `aws` (its real job, the Redshift rollback DDL, is
+  reached through the snapshot's provider name, not the registry), and Data Mesh Manager is a
+  catalog. `fluid providers` now lists `aws`, `databricks`, `gcp`, `local` and `snowflake`, plus any
+  third-party plugin. Redshift support is unchanged (it is part of `aws`), and Data Mesh Manager
+  publishing is unchanged (`fluid publish --target datamesh-manager`, `fluid datamesh-manager`).
+  **Breaking (CLI surface):** `--provider redshift` and `--provider datamesh-manager` (and
+  `FLUID_PROVIDER`) are no longer accepted; they exit 2 with the replacement
+  (`--provider aws`, or `fluid publish --target datamesh-manager`) instead of a bare "unknown
+  provider".
+
 ## [0.26.0] — 2026-11-01
 
 ### Added

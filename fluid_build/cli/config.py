@@ -457,7 +457,7 @@ security, performance, and operational considerations.
 ### Required Environment Variables
 ```bash
 # Infrastructure (Required)
-export FLUID_PROVIDER="gcp"              # or aws, azure, snowflake
+export FLUID_PROVIDER="gcp"              # or aws, databricks, snowflake
 export FLUID_PROJECT="your-project-id"   # Cloud project identifier
 export FLUID_REGION="us-central1"        # Cloud region
 

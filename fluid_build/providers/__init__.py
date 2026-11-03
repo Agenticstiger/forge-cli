@@ -105,6 +105,28 @@ def _normalize_name(name: str) -> str:
     return name.strip().lower().replace("-", "_")
 
 
+#: Names that are no longer providers -> what to do instead. Not
+#: registry entries: a user who typed one gets this line (exit 2) rather than a
+#: bare "unknown provider". Keys are :func:`_normalize_name` spellings.
+RETIRED_PROVIDERS: Dict[str, str] = {
+    "redshift": "Redshift is part of the aws provider; use --provider aws",
+    "datamesh_manager": (
+        "Data Mesh Manager is a catalog, not a provider; use "
+        "`fluid publish --target datamesh-manager` (or `fluid datamesh-manager`)"
+    ),
+}
+
+
+def retired_provider_hint(name: Optional[str]) -> Optional[str]:
+    """One-line ``--provider``/``FLUID_PROVIDER`` error for a retired name, else ``None``."""
+    if not name:
+        return None
+    use = RETIRED_PROVIDERS.get(_normalize_name(name))
+    if use is None:
+        return None
+    return f"Provider '{name}' was retired: {use}"
+
+
 def _add_discovery_error(source: str, modname: str, exc: BaseException) -> None:
     # DISCOVERY_ERRORS is surfaced to users via registry_dump() / `fluid providers
     # --debug`, so it must NOT carry raw exception text or a full traceback — either
@@ -466,7 +488,7 @@ def discover_providers(logger: Optional[logging.Logger] = None, *, force: bool =
             return
 
         # What the policy now allows is no longer blocked. A name it still
-        # blocks stays recorded: one registered at import time (redshift, by
+        # blocks stays recorded: one registered at import time (aws, by
         # the aws package) is not offered again when its module is cached.
         from fluid_build.plugin_manager import is_allowed
 

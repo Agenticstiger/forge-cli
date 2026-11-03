@@ -151,9 +151,10 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
         # Deliberately NO argparse ``choices``. The provider set is a registry
         # (built-ins + ``fluid_build.providers`` entry-point plugins), and the
         # hardcoded enum disagreed with it in both directions: it rejected
-        # ``redshift`` and ``datamesh_manager``, which ``fluid providers``
-        # lists, and accepted ``azure``, which is not registered at all — and a
-        # pip-installed provider plugin could never be passed. Enumerating the
+        # ``redshift`` and ``datamesh_manager`` (then registered; since retired,
+        # see ``RETIRED_PROVIDERS``), and accepted ``azure``, which is not
+        # registered at all — and a pip-installed provider plugin could never be
+        # passed. Enumerating the
         # registry here is not an option: discovery imports every provider
         # module, and ``build_parser()`` is the ``fluid --help`` cold path.
         # The value is validated against the live registry in
@@ -740,8 +741,11 @@ def _validate_global_args(
         # lists, plugins included.
         known = _known_provider_names() if known_providers is None else known_providers
         if known and args.provider not in known and args.provider != _PROVIDER_AUTO:
+            from fluid_build.providers import retired_provider_hint
+
             issues.append(
-                f"Unknown provider '{args.provider}' — installed providers: "
+                retired_provider_hint(args.provider)
+                or f"Unknown provider '{args.provider}' — installed providers: "
                 f"{', '.join(known)} (see `fluid providers`)"
             )
 

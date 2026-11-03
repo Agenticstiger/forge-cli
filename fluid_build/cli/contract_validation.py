@@ -111,7 +111,7 @@ _NO_LIVE_VALIDATION = {
     ),
     "azure": (
         "Provider 'azure' validation not yet implemented",
-        "Supported providers: gcp, snowflake, aws, local. Others coming soon.",
+        "Supported providers: aws, databricks, gcp, local, snowflake. Others coming soon.",
     ),
 }
 

@@ -251,7 +251,11 @@ def build_provider(
         # blocked provider as "unknown" sends the operator hunting for a
         # typo or a missing extra.
         from fluid_build.plugin_manager import is_allowed
+        from fluid_build.providers import retired_provider_hint
 
+        hint = retired_provider_hint(name)
+        if hint:
+            raise CLIError(2, "provider_retired", {"error": hint})
         if not is_allowed(name):
             raise CLIError(2, "provider_blocked_by_policy", {"requested": name})
         raise CLIError(

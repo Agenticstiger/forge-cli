@@ -1234,7 +1234,7 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
 
     A ``binding.platform`` says where an expose lands and a build's
     ``execution.runtime.platform`` where it runs; neither is a provider name,
-    though ``local``, ``gcp``, ``aws``, ``snowflake`` and ``redshift`` are also
+    though ``local``, ``gcp``, ``aws`` and ``snowflake`` are also
     providers. Read as one, a Kafka binding or a Flink build's
     ``runtime.platform: kubernetes`` ended the run as ``provider_unknown``.
 
