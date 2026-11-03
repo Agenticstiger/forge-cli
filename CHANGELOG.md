@@ -28,6 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   qualified entry does not restrict other plugins. The retired names `redshift` and
   `datamesh-manager` cannot be granted.
 
+- **Extras for AI, MCP and lineage, ahead of their removal from the base install.**
+  `pip install 'data-product-forge[standard]'` installs litellm and the MCP SDK; `[litellm]`
+  (alias `[ai]`), `[mcp]` and `[lineage]` install one each. This release still puts all three in
+  the base install, so existing installs change nothing; 0.28.0 removes them from the base install,
+  and `fluid doctor` says so. Install `[standard]` now if you use AI authoring, `fluid ai setup` or
+  `fluid mcp serve`, and `[lineage]` if you set `OPENLINEAGE_URL`. The Docker images install
+  `[standard,lineage]`. `[mcp]` also declares `pyjwt[crypto]>=2.15.0`, which the MCP output-port
+  auth imports directly, and `[litellm]` keeps the Python 3.10 pin split from #555.
+
 - **`fluid doctor --strict` turns the "Action needed" summary into exit 1.** `fluid doctor` printed
   "Action needed" for a copilot that is not ready and still exited 0, so a CI gate could not tell.
   With `--strict` it exits 1 whenever the summary says "Action needed", in the text report and with
@@ -256,6 +265,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engines, and refuses with `ERR_APPLY_BUILD_IDENTIFIER_INVALID`, which names the id, says nothing
   was applied and suggests a rename. A mode without a build phase, and a contract without builds,
   are not checked, as before.
+
+- **A missing optional dependency names the extra to install, and silent fallbacks warn.**
+  litellm, the MCP SDK, openlineage, boto3 and duckdb are imported through one gate: when one is
+  missing, the command prints `<feature> needs <package>, which is not installed.` and
+  `pip install 'data-product-forge[<extra>]'`, with no traceback, and exits 1, where some paths
+  failed deep inside with a traceback. A package that is installed but fails to import (litellm >= 1.98 on Python 3.10) is reported as
+  that. Fallbacks that used to be silent now warn once: the ODCS typed model, the Glue catalog id,
+  and credentials without pydantic-settings. `fluid doctor` reads these packages' versions from
+  their metadata instead of importing them (about 1,000 modules loaded instead of 3,300). On AWS,
+  `fluid plan` without a resolvable account id says so, where it failed on the invalid bucket
+  name `None-fluid-...`.
 
 - **`fluid diff --baseline` reported nothing for column changes in a 0.7.x contract.** It read
   columns from `exposes[].schema`, but a 0.7.x contract keeps them in `exposes[].contract.schema`
