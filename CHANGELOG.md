@@ -207,6 +207,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Invalid SQL identifier: 'spectrum_events\n'`. That includes a name that reaches it with a
   trailing newline from an environment variable or a file; strip the value where it is set.
 
+- **Schema validation let a value with a trailing newline through a `pattern`.** JSON Schema
+  writes `pattern` in ECMA-262, where `$` matches only at the end of the value, but the
+  jsonschema library runs it with Python's `re.search`, whose `$` also matches before a final
+  newline. So `fluid validate` accepted `id: "orders\n"`, which an `id: |` block scalar produces,
+  under every bundled schema version (0.7.1 to 0.7.7). Contract, fragment and bundle validation
+  now read `$` as the end of the value. Such a value is refused at its path, with a hint when
+  the line break is the only problem: `(it ends in a line break, which a YAML | or > block keeps
+  and |- or >- drops)`. The schemas themselves are unchanged.
+
 ## [0.26.0] — 2026-11-01
 
 ### Added

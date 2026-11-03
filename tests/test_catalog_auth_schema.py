@@ -164,6 +164,8 @@ def test_ga_075_refuses_the_key():
         ({**_OAUTH2, "credentialEnv": "LK_CRED\n"}, "credentialEnv: does not match"),
         ({"type": "bearer", "tokenEnv": "UC_TOKEN\n"}, "tokenEnv: does not match"),
         ({"type": "bearer", "tokenEnv": _PAT}, "tokenEnv: must not match"),
+        # The token check's "$" no longer matches before the "\n"; the name pattern refuses it.
+        ({"type": "bearer", "tokenEnv": _PAT + "\n"}, "tokenEnv: does not match"),
         (
             {**_OAUTH2, "credentialEnv": "AKIAIOSFODNN7EXAMPLE"},  # pragma: allowlist secret
             "credentialEnv: must not match",
@@ -193,9 +195,10 @@ def test_076_refuses_a_malformed_catalog_auth(catalog_auth, expected):
         ({"type": "bearer", "tokenEnv": "T", "credentialEnv": _SECRET}, _SECRET),
         ({"type": _SECRET}, _SECRET),
         ({"type": "bearer", "tokenEnv": _PAT}, _PAT),
+        ({"type": "bearer", "tokenEnv": _PAT + "\n"}, _PAT),
         ({**_OAUTH2, "oauth2ServerUri": _USERINFO_URI}, "2OR3eRvYfSZ"),
     ],
-    ids=["credentialEnv", "tokenEnv", "wrong-type-field", "type", "pat", "userinfo"],
+    ids=["credentialEnv", "tokenEnv", "wrong-type-field", "type", "pat", "pat-lf", "userinfo"],
 )
 def test_a_schema_error_never_quotes_the_value(catalog_auth, secret):
     errors = _errors("0.7.6", catalog_auth)
@@ -224,6 +227,7 @@ def test_schema_and_parser_share_the_variable_name_rule():
         {**_OAUTH2, "credentialEnv": "LK_CRED\n"},
         {"type": "bearer", "tokenEnv": "UC_TOKEN\n"},
         {"type": "bearer", "tokenEnv": _PAT},
+        {"type": "bearer", "tokenEnv": _PAT + "\n"},
         {"type": "bearer", "tokenEnv": "S3_CREDENTIAL_V2"},
         {"type": "bearer", "tokenEnv": "LAKEKEEPERCATALOGCREDENTIALPROD"},
         {**_OAUTH2, "oauth2ServerUri": _USERINFO_URI},

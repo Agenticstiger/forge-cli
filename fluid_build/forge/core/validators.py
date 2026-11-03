@@ -390,9 +390,7 @@ def validate_json_schema(
                 )
             ]
         schema = schema_manager.get_schema(version)
-        try:
-            import jsonschema  # type: ignore
-        except ImportError:  # pragma: no cover — jsonschema is a hard dep upstream
+        if importlib.util.find_spec("jsonschema") is None:  # pragma: no cover — a hard dep upstream
             return [
                 ValidationIssue(
                     file=path,
@@ -405,9 +403,9 @@ def validate_json_schema(
 
         # Honour the schema's declared $schema; Draft 7 silently ignores
         # newer keywords, which drops the constraints they express.
-        from fluid_build.schema_manager import format_schema_error
+        from fluid_build.schema_manager import format_schema_error, schema_validator
 
-        validator = jsonschema.validators.validator_for(schema)(schema)
+        validator = schema_validator(schema)
         errors = sorted(validator.iter_errors(doc), key=lambda e: list(e.absolute_path))
         for err in errors:
             loc = "/".join(str(p) for p in err.absolute_path) or "<root>"
