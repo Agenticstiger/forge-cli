@@ -180,22 +180,22 @@ def test_search_lists_bundled_with_no_registry():
     )
     with (
         patch.object(marketplace_module, "console", MagicMock()),
-        patch.object(marketplace_module, "requests") as mock_requests,
+        patch("fluid_build.util.http_client.new_client") as mock_new_client,
     ):
         result = marketplace_module.search_blueprints(args, _logger(), None)
     assert result == 0
-    mock_requests.get.assert_not_called()  # api_url=None → registry skipped
+    mock_new_client.assert_not_called()  # api_url=None → registry skipped
 
 
 def test_info_serves_bundled_offline():
     args = SimpleNamespace(blueprint_id="fluid.starter")
     with (
         patch.object(marketplace_module, "console", MagicMock()),
-        patch.object(marketplace_module, "requests") as mock_requests,
+        patch("fluid_build.util.http_client.new_client") as mock_new_client,
     ):
         result = marketplace_module.show_blueprint_info(args, _logger(), None)
     assert result == 0
-    mock_requests.get.assert_not_called()
+    mock_new_client.assert_not_called()
 
 
 def test_instantiate_bundled_offline_writes_valid_contract(tmp_path):
@@ -209,12 +209,11 @@ def test_instantiate_bundled_offline_writes_valid_contract(tmp_path):
     )
     with (
         patch.object(marketplace_module, "console", MagicMock()),
-        patch.object(marketplace_module, "requests") as mock_requests,
+        patch("fluid_build.util.http_client.new_client") as mock_new_client,
     ):
         result = marketplace_module.instantiate_blueprint(args, _logger(), None)
     assert result == 0
-    mock_requests.get.assert_not_called()
-    mock_requests.post.assert_not_called()
+    mock_new_client.assert_not_called()
     written = json.loads(out.read_text())
     assert written["id"] == "ops.offline-product"
     _assert_valid_074(written)

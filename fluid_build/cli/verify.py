@@ -1194,6 +1194,7 @@ _FINDINGS_DIMENSIONS = (
     ("residency", "\n   🔍 Residency (workspace region)"),
     ("governance_tags", "\n   🔍 Governance tags (Unity Catalog)"),
     ("row_filter_masks", "\n   🔍 Row filter and column masks (Unity Catalog)"),
+    ("retention", "\n   🔍 Retention (Delta history)"),
     ("jobs", "\n   🔍 Jobs"),
 )
 
@@ -1211,6 +1212,11 @@ def _render_findings_dimensions(dimensions: Dict[str, Any]) -> None:
         if dimension.get("status") == "skip":
             cprint(f"      ⚪ SKIPPED - {dimension.get('message', '')}", markup=False)
             continue
+        if dimension.get("status") == "warn":
+            cprint(f"      ⚠️  WARN - {dimension.get('message', '')}", markup=False)
+            for warning in dimension.get("warnings") or []:
+                cprint(f"         Fix: {warning}", markup=False)
+            continue
         cprint(f"      ❌ FAIL - {dimension.get('message', '')}", markup=False)
         if dimension.get("fix"):
             cprint(f"         Fix: {dimension['fix']}", markup=False)
@@ -1221,6 +1227,8 @@ def _render_findings_dimensions(dimensions: Dict[str, Any]) -> None:
                     f"            Fix (run by an admin of the catalog): {finding['fix']}",
                     markup=False,
                 )
+        for warning in dimension.get("warnings") or []:
+            cprint(f"         ⚠️  {warning}", markup=False)
 
 
 #: What ``fluid apply`` provisions for a GCP-bound expose, as far as stage 9
