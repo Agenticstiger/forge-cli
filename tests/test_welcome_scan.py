@@ -28,6 +28,10 @@ from fluid_build.cli._welcome_scan import (
     run_welcome_scan,
 )
 
+# The scan drops any probe result that misses its budget; these tests assert on
+# what the probes report, so they must not race the clock on a loaded runner.
+pytestmark = pytest.mark.usefixtures("deterministic_welcome_scan")
+
 
 @pytest.fixture(autouse=True)
 def isolate_home(tmp_path, monkeypatch):

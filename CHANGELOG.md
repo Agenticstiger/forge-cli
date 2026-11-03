@@ -147,6 +147,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls its "v1" headings an internal milestone. A test fails if it announces a 1.x release while
   the package is below 1.0. The package description named GCP, Snowflake and Local and now names
   AWS and Databricks too.
+- **Install hints named `fluid-build` instead of `data-product-forge`.** Doctor, the copilot,
+  the MCP, ODCS and DuckDB errors, the generated Jenkinsfile and the docs told people to
+  `pip install fluid-build[...]`; they now name `data-product-forge` with the right extra, and a
+  ratchet test keeps the wrong name out. `data-product-forge[mcp]` resolves as an empty alias.
+  `fluid-build` on PyPI is now only an alias that installs `data-product-forge`.
 - **An AWS contract's schedule was dropped without a word, and the one it got was not labelled.**
   The workflow Lambda was named `fluid-workflow-<id>` raw, so a dotted id (the schema's own
   example is `gold.hr.employee_360_v1`, and 27 of 28 examples use dots) or one over about 49
@@ -243,6 +248,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dimension that reads the workspace's metastore summary for every table the module manages: it
   passes when the region matches the declaration, fails with the fix when it does not, and is
   skipped when the contract declares none.
+
+### Security
+
+- **`validate_ident` let a name with a trailing newline through.** Python's `$` also matches just
+  before a trailing newline, so the identifier allowlist in `providers/_sql_safety.py`, which the
+  DDL and OpenTofu emitters route names through, accepted `orders\n` and passed it on with the
+  newline: `fluid generate iac` wrote `CREATE EXTERNAL SCHEMA IF NOT EXISTS spectrum_events\n ...`
+  into `main.tf.json`. The module's allowlists now end in `\Z`, so such a name is refused with
+  `Invalid SQL identifier: 'spectrum_events\n'`. That includes a name that reaches it with a
+  trailing newline from an environment variable or a file; strip the value where it is set.
 
 ## [0.26.0] — 2026-11-01
 

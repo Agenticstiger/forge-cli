@@ -477,8 +477,9 @@ def test_missing_litellm_raises_typed_error(monkeypatch):
     assert excinfo.value.event == "copilot_litellm_unavailable"
     suggestions = excinfo.value.suggestions
     assert any("pip install" in s for s in suggestions)
-    # The hint points at re-installing fluid-build (litellm is hard dep).
-    assert any("fluid-build" in s or "litellm" in s for s in suggestions)
+    # The hint names the real PyPI distribution, never the `fluid-build` alias.
+    assert any("data-product-forge[litellm]" in s for s in suggestions)
+    assert not any("fluid-build" in s for s in suggestions)
 
 
 # ---------------------------------------------------------------------------
