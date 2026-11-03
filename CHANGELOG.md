@@ -143,9 +143,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column, a type change that is not a widening, an added `required: true` column), so a pipeline
   that runs `fluid diff --baseline --fail-on-breaking` can start exiting 1. A finding for a 0.7.x
   column is reported at `exposes[N].contract.schema.<column>`, and a nullability one at its
-  `.required`. Still not compared in a 0.7.x contract: quality-rule severity and a column's
-  `sensitivity`. A 0.7.x primary key is not recognised either, so a key column that becomes
-  nullable is reported as non-breaking.
+  `.required`.
+
+- **`fluid diff --baseline` ignored a 0.7.x contract's quality rules, sensitivity and primary
+  key.** A 0.7.x contract keeps them under `exposes[].contract`, where the diff did not look. A
+  rule in `contract.dq.rules`, `contract.quality` or a column's `quality` whose severity becomes
+  failing is now `quality_severity_escalated` (breaking), as a pre-0.7 `quality.tests` entry was.
+  `critical` counts as failing, as it does for `fluid test`: warn -> critical is now an
+  escalation, and critical -> error no longer is. A column whose `sensitivity` becomes or stops
+  being `pii` or `phi` is `column_pii_added` / `column_pii_removed` (info), and any other change
+  to it is the new `column_sensitivity_changed` (info). A column tagged `primary-key` is in the
+  primary key, so one that stops being `required` is `primary_key_nullable` (breaking) rather
+  than a non-breaking loosening.
 
 - **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
   `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the

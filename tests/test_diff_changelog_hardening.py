@@ -31,6 +31,7 @@ import pytest
 import yaml
 
 from fluid_build.api.changelog import ContractValidationError, compare_contracts
+from fluid_build.api.changelog_rules import diff_quality_severity
 from tests.test_diff_changelog import _ID_COLUMN as _ID
 from tests.test_diff_changelog import _contract_076
 
@@ -169,3 +170,137 @@ def test_the_cli_exits_2_on_an_invalid_contract_whatever_fail_on_breaking_says(
     assert str(tmp_path / "new.fluid.yaml") in context["message"]
     assert "fluid validate" in context["message"]
     assert not (tmp_path / "diff.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# 0.7.x keeps quality, sensitivity and the primary key under exposes[].contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "old_severity, new_severity, escalated",
+    [
+        ("warn", "error", True),
+        ("warn", "critical", True),
+        ("info", "error", True),
+        ("critical", "error", False),
+        ("error", "critical", False),
+        ("error", "warn", False),
+    ],
+)
+def test_a_dq_rule_escalated_to_a_failing_severity_is_breaking(
+    old_severity, new_severity, escalated
+):
+    def rules(severity):
+        return {"rules": [{"id": "orders_complete", "type": "completeness", "severity": severity}]}
+
+    report = compare_contracts(
+        _contract([_ID], dq=rules(old_severity)), _contract([_ID], dq=rules(new_severity))
+    )
+
+    if not escalated:
+        assert report.total == 0
+        return
+    (change,) = report.breaking
+    assert change.kind == "quality_severity_escalated"
+    assert change.path == "exposes[0].contract.dq.rules.orders_complete.severity"
+    assert (change.before, change.after) == (old_severity, new_severity)
+    assert f"severity={new_severity}" in change.description
+
+
+def test_a_contract_quality_rule_escalated_to_error_is_breaking():
+    def quality(severity):
+        return [{"rule": "positive_amount", "expression": "amount > 0", "severity": severity}]
+
+    report = compare_contracts(
+        _contract([_ID], quality=quality("warning")), _contract([_ID], quality=quality("error"))
+    )
+
+    (change,) = report.breaking
+    assert change.kind == "quality_severity_escalated"
+    assert change.path == "exposes[0].contract.quality.positive_amount.severity"
+
+
+def test_a_column_quality_rule_escalated_to_error_is_breaking():
+    def email(severity):
+        rule = {"id": "email-valid", "type": "text", "severity": severity}
+        return {"name": "email", "type": "string", "quality": [rule]}
+
+    report = compare_contracts(_contract([email("warning")]), _contract([email("error")]))
+
+    (change,) = report.breaking
+    assert change.kind == "quality_severity_escalated"
+    assert change.path == "exposes[0].contract.schema.email.quality.email-valid.severity"
+    assert "column 'email'" in change.description
+
+
+@pytest.mark.parametrize(
+    "old_severity, new_severity, escalated",
+    [("warn", "critical", True), ("critical", "error", False)],
+)
+def test_a_pre_07_quality_test_is_judged_by_the_same_severity_scale(
+    old_severity, new_severity, escalated
+):
+    """``critical`` fails a run as ``error`` does (``fluid_build.severity``)."""
+
+    def expose(severity):
+        return {"id": "x", "quality": {"tests": [{"name": "t1", "severity": severity}]}}
+
+    changes = diff_quality_severity(expose(old_severity), expose(new_severity), "x", 0)
+
+    assert [c.kind for c in changes] == (["quality_severity_escalated"] if escalated else [])
+
+
+@pytest.mark.parametrize(
+    "old, new, kind, before, after",
+    [
+        ("none", "pii", "column_pii_added", False, True),
+        (None, "phi", "column_pii_added", False, True),
+        ("pii", "anonymized", "column_pii_removed", True, False),
+        ("internal", "restricted", "column_sensitivity_changed", "internal", "restricted"),
+        ("pii", "phi", "column_sensitivity_changed", "pii", "phi"),
+        (None, "confidential", "column_sensitivity_changed", None, "confidential"),
+    ],
+)
+def test_a_sensitivity_change_is_an_info_signal(old, new, kind, before, after):
+    def email(sensitivity):
+        column = {"name": "email", "type": "string"}
+        return {**column, "sensitivity": sensitivity} if sensitivity else column
+
+    report = compare_contracts(_contract([email(old)]), _contract([email(new)]))
+
+    (change,) = report.info
+    assert report.total == 1
+    assert (change.kind, change.path) == (kind, "exposes[0].contract.schema.email.sensitivity")
+    assert (change.before, change.after) == (before, after)
+
+
+@pytest.mark.parametrize(
+    "tag, validate",
+    [
+        ("primary-key", True),
+        # The ODCS exporter's other spelling: ``$defs.tags`` is lower-kebab-case,
+        # so only an unvalidated diff meets it.
+        ("primaryKey", False),
+    ],
+)
+def test_a_tagged_primary_key_column_made_nullable_is_breaking(tag, validate):
+    def key(required):
+        return {"name": "id", "type": "string", "required": required, "tags": [tag]}
+
+    report = compare_contracts(_contract([key(True)]), _contract([key(False)]), validate=validate)
+
+    (change,) = report.breaking
+    assert report.total == 1
+    assert change.kind == "primary_key_nullable"
+    assert change.path == "exposes[0].contract.schema.id.required"
+
+
+def test_the_cli_gate_fails_on_a_primary_key_made_nullable(tmp_path):
+    key = {"name": "id", "type": "string", "required": True, "tags": ["primary-key"]}
+
+    rc = _run_cli(
+        tmp_path, _contract([key]), _contract([{**key, "required": False}]), fail_on_breaking=True
+    )
+
+    assert rc == 1
