@@ -195,21 +195,20 @@ _NAME_HASH_LEN = 8
 
 
 def bounded_aws_name(raw: str, rule: "tuple[re.Pattern[str], int]") -> str:
-    """``raw`` as a name ``rule`` accepts, deterministic and collision-safe when long.
+    """``raw`` as a name ``rule`` accepts, deterministic and collision-safe.
 
-    Characters outside the rule's allowed set become ``-``. A name over the
-    service limit is cut and ends in ``-<hash>``, the hash taken from the *whole
-    raw* name, so two long contract ids that share a prefix stay distinct. A
-    name that fits is returned as the replacement left it: no hash, so the
-    common (short, dotted) id reads as written.
-
-    The replacement is lossy by design (``a.b`` and ``a-b`` map to one name); a
-    contract does not normally carry both, and a hash on every dotted id would
-    make every name unreadable.
+    Characters outside the rule's allowed set become ``-``. A name that had to
+    change at all (a replacement, or a cut to the service limit) ends in
+    ``-<hash>``, the hash taken from the *whole raw* name: ``a.b`` and ``a-b``
+    would otherwise both be ``fluid-workflow-a-b``, two products in one account
+    fighting over one Lambda, and two long ids sharing a prefix would collide
+    after the cut. A name the rule already accepts is returned as written, so
+    nothing already deployed under it is renamed.
     """
     pattern, limit = rule
     name = pattern.sub("-", raw)
-    if len(name) <= limit:
+    if name == raw and len(name) <= limit:
         return name
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:_NAME_HASH_LEN]
-    return f"{name[: limit - _NAME_HASH_LEN - 1]}-{digest}"
+    keep = limit - _NAME_HASH_LEN - 1
+    return f"{name[:keep]}-{digest}"

@@ -560,6 +560,10 @@ class SchedulePlanner:
                 if t.get("type") == "provider_action"
             ]
         )
+        # Contract values reach this source only as ``repr()`` literals (``!r``):
+        # spliced inside quotes, a task param or an id carrying a quote closed the
+        # literal and ran as code on every tick (or left a SyntaxError behind).
+        default_id = str(contract.get("id"))
         return {
             "ZipFile": f"""
 import json
@@ -569,10 +573,10 @@ import logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-TASKS = json.loads('''{task_entries}''')
+TASKS = json.loads({task_entries!r})
 
 def handler(event, context):
-    contract_id = event.get('contract_id', '{contract.get("id")}')
+    contract_id = event.get('contract_id', {default_id!r})
     logger.info(f"Executing FLUID workflow for contract: {{contract_id}}")
 
     completed = set()
@@ -622,10 +626,10 @@ def handler(event, context):
         key = record['s3']['object']['key']
         logger.info(f"S3 trigger: s3://{{bucket}}/{{key}}")
         lam.invoke(
-            FunctionName='{workflow_fn}',
+            FunctionName={workflow_fn!r},
             InvocationType='Event',
             Payload=json.dumps({{
-                'contract_id': '{contract_id}',
+                'contract_id': {contract_id!r},
                 'trigger': 's3',
                 'bucket': bucket,
                 'key': key,
@@ -656,10 +660,10 @@ def handler(event, context):
         event_name = record.get('eventName')
         logger.info(f"DynamoDB trigger: {{event_name}}")
         lam.invoke(
-            FunctionName='{workflow_fn}',
+            FunctionName={workflow_fn!r},
             InvocationType='Event',
             Payload=json.dumps({{
-                'contract_id': '{contract_id}',
+                'contract_id': {contract_id!r},
                 'trigger': 'dynamodb',
                 'event_name': event_name,
                 'keys': record.get('dynamodb', {{}}).get('Keys', {{}}),
@@ -688,10 +692,10 @@ def handler(event, context):
     logger.info(f"EventBridge trigger: {{json.dumps(event)}}")
     lam = boto3.client('lambda')
     lam.invoke(
-        FunctionName='{workflow_fn}',
+        FunctionName={workflow_fn!r},
         InvocationType='Event',
         Payload=json.dumps({{
-            'contract_id': '{contract_id}',
+            'contract_id': {contract_id!r},
             'trigger': 'eventbridge',
             'detail_type': event.get('detail-type', ''),
             'detail': event.get('detail', {{}}),
@@ -722,10 +726,10 @@ def handler(event, context):
         body = json.loads(record['body'])
         logger.info(f"SQS trigger: {{body}}")
         lam.invoke(
-            FunctionName='{workflow_fn}',
+            FunctionName={workflow_fn!r},
             InvocationType='Event',
             Payload=json.dumps({{
-                'contract_id': '{contract_id}',
+                'contract_id': {contract_id!r},
                 'trigger': 'sqs',
                 'body': body,
             }}),

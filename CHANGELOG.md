@@ -155,16 +155,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   S3 resources and no `aws_lambda_function`, `aws_lambda_permission` or `aws_scheduler_schedule`,
   exit 0. Every name the schedule planner derives from an id (Lambda functions, permission
   statement ids, the schedule, event rules, the state machine, the MWAA environment) now goes
-  through one helper that replaces what the service refuses with `-` and, past the service limit,
-  cuts and ends in a hash of the whole id so two long ids stay apart. A plan its own validator
-  rejects is a typed `PlanValidationError`, matched by type through the cause chain like a
-  sovereignty refusal: `generate iac` exits non-zero and `apply` raises, where a planner that
-  could not run (no SDK, no credentials) stays best-effort. The scheduled Lambda only logs each
+  through one helper that replaces what the service refuses with `-` and, when it had to change
+  the name at all (a replacement, or a cut to the service limit), ends it in a hash of the whole
+  id, so `a.b` and `a-b` cannot share one Lambda and two long ids stay apart; a name the service
+  already accepts is left as written, so nothing deployed is renamed. A plan its own validator
+  rejects, an orchestration task the planner rejects and a schedule-planner failure are a typed
+  `PlanValidationError`, matched by type through the cause chain like a sovereignty refusal:
+  `generate iac` exits non-zero and `apply` raises, where a planner that could not run (no SDK,
+  no credentials) stays best-effort. This holds for every AWS plan-validator refusal, so a
+  contract with no schedule that the validator refuses (a bad Glue name, say) now fails
+  `generate iac` and `apply` too, where it used to emit the module without a word (`fluid plan`
+  already refused it). The scheduled Lambda only logs each
   task and runs no build, and both roles it names (`fluid-workflow-execution`,
   `EventBridgeSchedulerRole`) are never created, so every plan that emits it now warns
   `schedule_placeholder_lambda`. An AWS account that cannot be resolved (no `AWS_ACCOUNT_ID`, no
   credentials for `sts:GetCallerIdentity`) is refused by name, before any name is derived from it,
-  rather than as a Glue or S3 name `None-fluid-staging` the validator would reject.
+  rather than as a Glue or S3 name `None-fluid-staging` the validator would reject, and says so
+  when the cause is a missing boto3 (`pip install 'data-product-forge[aws]'`) rather than
+  credentials.
+- **The AWS plan validator refused dotted S3 bucket names.** S3 allows lowercase letters, digits,
+  dots and hyphens (3-63 characters, a letter or digit at each end, no `..`, `.-` or `-.`, not
+  shaped like an IP address); the validator allowed no dot, which was harmless while its refusals
+  were swallowed and is not now that they stop `generate iac` and `apply`.
+- **A contract value could run as code in the AWS workflow Lambda.** The schedule planner spliced
+  task params and the contract id into the Lambda's Python source inside quote marks, so a task
+  param such as `'''+__import__('os').system('id')+'''` (the schema accepts any task params)
+  closed the literal and ran on every schedule tick under `fluid-workflow-execution`, and an id
+  with a trailing newline left a Lambda that was a SyntaxError. Every value now reaches the
+  source as a `repr()` literal.
 - **The same AWS contract could emit a different module from one run to the next.** The AWS
   planner ordered its actions through a `set`, so the order changed with Python's hash seed, and
   with it the emitted module: a Lambda permission, schedule target, event-source mapping or S3

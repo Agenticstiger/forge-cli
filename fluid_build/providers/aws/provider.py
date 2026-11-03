@@ -38,7 +38,7 @@ from .plan.planner import plan_actions
 from .plan.schedule import SCHEDULER_INVOKE_ROLE, WORKFLOW_EXECUTION_ROLE
 from .util.auth import get_auth_report
 from .util.circuit_breaker import CircuitBreakerOpenError, get_circuit_breaker
-from .util.config import AwsAccountUnresolvedError
+from .util.config import AwsAccountUnresolvedError, account_unresolved_message
 from .util.dependencies import order_actions_by_dependencies
 from .util.logging import redact_dict
 from .util.validation import ResourceValidator, validate_actions_strict
@@ -181,11 +181,7 @@ class AwsProvider(BaseProvider):
             # builds ``None-fluid-staging`` and the validator refuses the plan
             # with a message about a bucket, hiding the cause. ``generate iac``
             # passes a placeholder account, so it never reaches this.
-            raise AwsAccountUnresolvedError(
-                "The AWS account id could not be resolved. Set AWS_ACCOUNT_ID, or "
-                "configure AWS credentials (environment, profile or role) so that "
-                "sts:GetCallerIdentity succeeds."
-            )
+            raise AwsAccountUnresolvedError(account_unresolved_message())
 
         try:
             # Validate sovereignty constraints (FLUID 0.7.1)
@@ -357,7 +353,7 @@ class AwsProvider(BaseProvider):
 
         except OrchestrationError as e:
             self.err_kv(event="orchestration_planning_failed", error=str(e))
-            raise ProviderError(f"Orchestration planning failed: {e}") from e
+            raise PlanValidationError(f"Orchestration planning failed: {e}") from e
 
     def _plan_schedule(self, contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
         """
@@ -409,7 +405,7 @@ class AwsProvider(BaseProvider):
 
         except Exception as e:
             self.err_kv(event="schedule_planning_failed", error=str(e))
-            raise ProviderError(f"Schedule planning failed: {e}") from e
+            raise PlanValidationError(f"Schedule planning failed: {e}") from e
 
     def _utc_timestamp(self) -> str:
         """Generate UTC timestamp string."""
