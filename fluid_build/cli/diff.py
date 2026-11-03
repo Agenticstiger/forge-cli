@@ -17,12 +17,14 @@ from __future__ import annotations
 import argparse
 import copy
 import logging
+import math
 import os
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set
 
+from .._console import _redact_str
 from ..observability.tracing import traced_span as _traced_span
 from ..observability.tracing import traced_stage as _traced_stage
 from ._common import (
@@ -812,14 +814,15 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
         span.set_attribute("fluid.diff.non_breaking_count", len(report.non_breaking))
         span.set_attribute("fluid.diff.info_count", len(report.info))
 
-    # Render to stdout in the requested format.
-    _print_version_diff(report, getattr(args, "format", "text") or "text")
+    # Render to stdout in the requested format, then always write the same
+    # envelope to --out so CI runners that don't parse stdout still get a
+    # machine-readable artifact. Both get the redacted report.
+    safe = _safe_report(report)
+    _print_version_diff(safe, getattr(args, "format", "text") or "text")
 
-    # Always write the structured envelope to --out so CI runners that don't
-    # parse stdout still get a machine-readable artifact.
     from ._common import write_json
 
-    write_json(args.out, report.to_dict())
+    write_json(args.out, safe.to_dict())
 
     info(
         logger,
@@ -835,27 +838,21 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
     return 0
 
 
-def _print_version_diff(report: ChangelogReport, fmt: str) -> None:
-    """Print a version-diff ``report`` to stdout as ``fmt`` (text, json or markdown).
+def _safe_report(report: ChangelogReport) -> ChangelogReport:
+    """``report`` with every value redacted and made JSON-safe, for stdout and ``--out``.
 
-    Every value is redacted first, by the redactor logging uses
-    (``redact_value``), so a credential-shaped name or description never
-    reaches stdout. JSON and Markdown are documents a program reads, so they
-    are then written verbatim. A regex pass over the finished document cut
-    through its structure: a name ending in ``token=x`` lost the closing quote
-    of its JSON string, or the closing fence of its Markdown code span, which
-    let the rest of the line render as Markdown. Rich would also wrap a long
-    line at the terminal width and read ``[...]`` in a name as markup. Text is
-    printed literally, so a name cannot style it, swap in an emoji or (``[/]``)
-    crash it, and soft-wrapped, as the drift report is, so each entry stays one
-    greppable line. The JSON envelope is also written to ``--out``.
+    A string goes through both redactors, as the CLI's error renderer does
+    (``cli/__init__.py``): ``redact_secret_text`` (JWTs, provider keys,
+    credentialed URLs, ``key=value``) and the console's pattern, which alone
+    catches ``api key: x``. A value JSON cannot hold, such as a date, bytes or
+    a set that YAML put in a column's quality rule, becomes text, so the
+    envelope always serialises: ``json.dump`` raised on it after the text
+    report had printed, and left ``--out`` cut short.
     """
     import dataclasses
 
-    from fluid_build.cli.console import cprint_literal
     from fluid_build.observability.secret_redactor import redact_value
 
-    from ..api.changelog import render_markdown, render_text
     from ..api.changelog_types import ChangelogReport as _Report
 
     safe = _Report()
@@ -863,21 +860,57 @@ def _print_version_diff(report: ChangelogReport, fmt: str) -> None:
         safe.add(
             dataclasses.replace(
                 change,
-                path=redact_value(change.path),
-                description=redact_value(change.description),
-                before=redact_value(change.before),
-                after=redact_value(change.after),
+                **{
+                    field: _jsonable(redact_value(getattr(change, field)))
+                    for field in ("path", "description", "before", "after")
+                },
             )
         )
+    return safe
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact_str(value)
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_jsonable(item) for item in value), key=repr)
+    return _redact_str(str(value))
+
+
+def _print_version_diff(report: ChangelogReport, fmt: str) -> None:
+    """Print a version-diff ``report`` (already made safe) to stdout as ``fmt``.
+
+    JSON and Markdown are documents a program reads, so they are written
+    verbatim: a regex pass over the finished document cut through its
+    structure (a name ending in ``token=x`` lost the closing quote of its JSON
+    string, or the closing fence of its Markdown code span, which let the rest
+    of the line render as Markdown), and Rich would wrap a long line at the
+    terminal width and read ``[...]`` in a name as markup. Each value was
+    redacted before (:func:`_safe_report`). Text is printed literally, so a
+    name cannot style it, swap in an emoji or (``[/]``) crash it, and
+    soft-wrapped, as the drift report is, so each entry stays one greppable
+    line.
+    """
+    from fluid_build.cli.console import cprint_literal
+
+    from ..api.changelog import render_markdown, render_text
 
     if fmt == "json":
         import json as _json
 
-        sys.stdout.write(_json.dumps(safe.to_dict(), indent=2) + "\n")
+        sys.stdout.write(_json.dumps(report.to_dict(), indent=2) + "\n")
     elif fmt == "markdown":
-        sys.stdout.write(render_markdown(safe) + "\n")
+        sys.stdout.write(render_markdown(report) + "\n")
     else:
-        cprint_literal(render_text(safe), soft_wrap=True, highlight=False)
+        cprint_literal(render_text(report), soft_wrap=True, highlight=False)
 
 
 def _invalid_contracts_error(

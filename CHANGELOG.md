@@ -165,8 +165,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string, and read `[...]` in a column name as markup. JSON and Markdown are now printed
   verbatim, and text without markup or `:emoji:` codes, so a column named `[/]` no longer
   crashes the text output. Credential-shaped values are redacted in each value before the
-  document is written, by the redactor logging uses, so a name ending in `token=x` no
-  longer cuts its JSON string short. The `--out` file was never affected.
+  document is written, by both the logging redactor and the console's, so a name ending in
+  `token=x` no longer cuts its JSON string short. A value JSON cannot hold, such as a date that
+  YAML put in a column's quality rule, is written as text: `json.dump` raised on it after the
+  text report had printed, and left `--out` cut short. `--out` now holds the same redacted
+  envelope as stdout; it held the raw values.
 
 - **The `fluid forge --refine` preview read no columns from a `schema: {fields: [...]}`
   expose.** The diff now unwraps it at `schema` and `contract.schema` alike, as `fluid verify`

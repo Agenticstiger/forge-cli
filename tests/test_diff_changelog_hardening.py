@@ -410,8 +410,52 @@ def test_credentials_are_redacted_value_by_value_and_the_json_still_parses(tmp_p
 
     out = capsys.readouterr().out
     (added,) = json.loads(out)["non_breaking"]
-    assert "abc123" not in out and "hunter2" not in out
-    assert added["after"]["description"].startswith("password=") and "REDACTED" in out
+    assert added["after"]["description"].startswith("password=")
+    artifact = (tmp_path / "diff.json").read_text(encoding="utf-8")
+    for document in (out, artifact):
+        assert "abc123" not in document and "hunter2" not in document
+        assert "redacted" in document.lower()
+    assert json.loads(artifact) == json.loads(out)
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        pytest.param("api key: ZZtop99", id="api-key-with-a-space"),
+        pytest.param("password" + " " * 9 + "= ZZtop99", id="wide-separator"),
+        pytest.param("password=ZZtop99" + "A" * 5000, id="long-value"),
+    ],
+)
+@pytest.mark.parametrize("fmt", ["json", "markdown"])
+def test_every_secret_shape_the_console_masked_is_still_masked(tmp_path, capsys, secret, fmt):
+    """The logging redactor alone missed these, which the console pattern caught on main."""
+    new = _contract([_ID, {"name": f"x {secret}", "type": "string"}])
+
+    assert _run_cli(tmp_path, _contract([_ID]), new, fmt=fmt) == 0
+
+    assert "ZZtop99" not in capsys.readouterr().out
+    assert "ZZtop99" not in (tmp_path / "diff.json").read_text(encoding="utf-8")
+
+
+def test_a_value_json_cannot_hold_does_not_break_the_envelope(tmp_path, capsys):
+    """YAML gives a column's quality rule a date; json.dump raised on it and cut --out short."""
+    import datetime
+
+    rule = {
+        "id": "fresh",
+        "type": "custom",
+        "mustBe": datetime.date(2020, 1, 1),
+        "ratio": float("nan"),
+    }
+    new = _contract([_ID, {"name": "note", "type": "string", "quality": [rule]}])
+
+    assert _run_cli(tmp_path, _contract([_ID]), new, fmt="json") == 0
+
+    out = capsys.readouterr().out
+    strict = {"parse_constant": lambda token: pytest.fail(f"bare {token} in the JSON")}
+    (added,) = json.loads(out, **strict)["non_breaking"]
+    assert added["after"]["quality"][0]["mustBe"] == "2020-01-01"
+    json.loads((tmp_path / "diff.json").read_text(encoding="utf-8"), **strict)
 
 
 def test_the_gate_runs_without_a_writable_home(tmp_path, monkeypatch, capsys):
