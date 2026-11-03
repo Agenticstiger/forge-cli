@@ -244,6 +244,7 @@ def _report(*names):
         pytest.param("e\u200bmail", "e\\u200bmail", id="zero-width-space"),
         pytest.param("e\ufe0fmail", "e\\ufe0fmail", id="variation-selector"),
         pytest.param("\u3164", "\\u3164", id="hangul-filler"),
+        pytest.param("\u2800", "\\u2800", id="braille-blank"),
         pytest.param("x\U000e0041", "x\\U000e0041", id="tag-character"),
         pytest.param("a\\x1b", "a\\\\x1b", id="literal-backslash-stays-distinct"),
         pytest.param("straße_日本", "straße_日本", id="printable-unicode-is-kept"),
@@ -413,6 +414,22 @@ def test_credentials_are_redacted_value_by_value_and_the_json_still_parses(tmp_p
     assert added["after"]["description"].startswith("password=") and "REDACTED" in out
 
 
+def test_the_gate_runs_without_a_writable_home(tmp_path, monkeypatch, capsys):
+    """The schema manager created ~/.fluid/schema_cache when it was built; a read-only
+    HOME made every run exit 1, as for a breaking change."""
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(blocker / "home"))
+    key = {"name": "id", "type": "string", "required": True, "tags": ["primary-key"]}
+
+    rc = _run_cli(
+        tmp_path, _contract([key]), _contract([{**key, "required": False}]), fail_on_breaking=True
+    )
+
+    assert rc == 1
+    assert "primary_key_nullable" in capsys.readouterr().out
+
+
 def test_the_refine_preview_prints_names_literally():
     from rich.console import Console
 
@@ -568,9 +585,9 @@ def test_a_pre_07_quality_test_is_judged_by_the_same_severity_scale(
 @pytest.mark.parametrize(
     "old, new, kind, before, after",
     [
-        ("none", "pii", "column_pii_added", False, True),
-        (None, "phi", "column_pii_added", False, True),
-        ("pii", "anonymized", "column_pii_removed", True, False),
+        ("none", "pii", "column_pii_added", "none", "pii"),
+        (None, "phi", "column_pii_added", None, "phi"),
+        ("pii", "anonymized", "column_pii_removed", "pii", "anonymized"),
         ("internal", "restricted", "column_sensitivity_changed", "internal", "restricted"),
         ("pii", "phi", "column_sensitivity_changed", "pii", "phi"),
         (None, "confidential", "column_sensitivity_changed", None, "confidential"),
@@ -587,6 +604,23 @@ def test_a_sensitivity_change_is_an_info_signal(old, new, kind, before, after):
     assert report.total == 1
     assert (change.kind, change.path) == (kind, "exposes[0].contract.schema.email.sensitivity")
     assert (change.before, change.after) == (before, after)
+
+
+def test_rewriting_a_pii_flag_as_a_sensitivity_is_not_a_change():
+    old = {"id": "x", "schema": [{"name": "email", "type": "STRING", "pii": True}]}
+    new = {"id": "x", "schema": [{"name": "email", "type": "STRING", "sensitivity": "pii"}]}
+
+    assert diff_columns(old, new, "x", 0) == []
+
+
+def test_a_pre_07_pii_flag_is_reported_at_pii():
+    old = {"id": "x", "schema": [{"name": "email", "type": "STRING"}]}
+    new = {"id": "x", "schema": [{"name": "email", "type": "STRING", "pii": True}]}
+
+    (change,) = diff_columns(old, new, "x", 0)
+
+    assert (change.kind, change.path) == ("column_pii_added", "exposes[0].schema.email.pii")
+    assert (change.before, change.after) == (False, True)
 
 
 @pytest.mark.parametrize(
@@ -608,6 +642,52 @@ def test_a_tagged_primary_key_column_made_nullable_is_breaking(tag, validate):
     assert report.total == 1
     assert change.kind == "primary_key_nullable"
     assert change.path == "exposes[0].contract.schema.id.required"
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        pytest.param({"semanticType": "identifier"}, id="semantic-identifier"),
+        pytest.param({"semanticType": "primary_key"}, id="semantic-primary-key"),
+        pytest.param({"labels": {"constraint": "primary_key"}}, id="label-constraint"),
+        pytest.param({"labels": {"unique": "true"}}, id="label-unique"),
+    ],
+)
+def test_a_column_the_dbt_engine_builds_as_a_key_made_nullable_is_breaking(marker):
+    """The dbt engine gives these a primary_key constraint; the diff read only the tag."""
+
+    def key(required):
+        return {"name": "id", "type": "string", "required": required, **marker}
+
+    report = compare_contracts(_contract([key(True)]), _contract([key(False)]))
+
+    (change,) = report.breaking
+    assert change.kind == "primary_key_nullable"
+
+
+def test_the_primary_key_matches_the_columns_the_dbt_engine_builds_as_keys():
+    from fluid_build.api.changelog_rules import _in_primary_key
+    from fluid_build.engines.dbt._test_mapping import column_is_key
+
+    columns = [
+        {},
+        {"unique": True},
+        {"unique": "yes"},
+        {"pk": "1"},
+        {"primary": False},
+        {"isPrimary": "true"},
+        {"semanticType": " Identifier "},
+        {"semanticType": "email"},
+        {"labels": {"constraint": "UNIQUE"}},
+        {"labels": {"constraint": "check"}},
+        {"labels": {"unique": "no"}},
+        {"labels": "not-a-mapping"},
+    ]
+    for column in columns:
+        assert _in_primary_key(column) == column_is_key(column), column
+    assert _in_primary_key({"tags": ["primary-key"]}) and not column_is_key(
+        {"tags": ["primary-key"]}
+    )
 
 
 def test_a_pre_07_primary_key_flag_is_still_read():

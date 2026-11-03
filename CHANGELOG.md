@@ -154,9 +154,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   severe of them, so a failing rule cannot hide behind a `warn` one of the same id. A column
   whose `sensitivity` becomes or stops being `pii` or `phi` is `column_pii_added` /
   `column_pii_removed` (info), and any other change to it is the new
-  `column_sensitivity_changed` (info). A column tagged `primary-key` is in the
-  primary key, so one that stops being `required` is `primary_key_nullable` (breaking) rather
-  than a non-breaking loosening.
+  `column_sensitivity_changed` (info), each with the sensitivity values as before and after. A
+  pre-0.7 `pii: true` rewritten as `sensitivity: pii` is not a change. A column the dbt engine
+  builds as a key (a `primary-key` tag, a `semanticType` of `identifier` or `primary_key`, or a
+  `labels.constraint` of `primary_key` or `unique`) that stops being `required` is
+  `primary_key_nullable` (breaking) rather than a non-breaking loosening.
 
 - **`fluid diff --baseline --format json` could print JSON that does not parse.** Rich wrapped
   each long line at the terminal width (80 columns in CI), putting a line break inside a JSON

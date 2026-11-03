@@ -248,16 +248,44 @@ def _primary_key_set(expose: Mapping[str, Any]) -> frozenset[str]:
     return frozenset(pk)
 
 
-def _in_primary_key(column: Mapping[str, Any]) -> bool:
-    """Whether *column* says it is part of its expose's primary key.
+#: Column keys whose truthy value marks a key, as the dbt engine reads them.
+_KEY_FLAGS = ("unique", "primary", "primaryKey", "primary_key", "pk", "isPrimary")
 
-    A 0.7.x column has no ``primaryKey`` key: it is in the key when its
-    ``tags`` hold ``primary-key`` or ``primaryKey``, the tag the ODCS exporter
-    turns into ``primaryKey: true`` (``providers/odcs/mappers``).
+
+def _in_primary_key(column: Mapping[str, Any]) -> bool:
+    """Whether *column* is a key of its expose, the way forge builds it.
+
+    The columns the dbt engine gives a ``primary_key`` constraint
+    (``engines/dbt/_test_mapping.py::column_is_key``, mirrored here because
+    importing the engine loads every engine): a truthy key flag, a
+    ``semanticType`` of ``identifier`` or ``primary_key``, or a ``labels``
+    ``constraint`` of ``primary_key`` or ``unique`` or a truthy
+    ``labels.unique``. Plus the ``primary-key`` (or ``primaryKey``) tag that
+    the ODCS exporter turns into ``primaryKey: true`` (``providers/odcs/mappers``).
+    tests/test_diff_changelog_hardening.py pins the two against each other.
     """
     tags = column.get("tags")
-    tagged = isinstance(tags, (list, tuple)) and ("primary-key" in tags or "primaryKey" in tags)
-    return column.get("primaryKey") is True or tagged
+    if isinstance(tags, (list, tuple)) and ("primary-key" in tags or "primaryKey" in tags):
+        return True
+    if any(_truthy(column.get(flag)) for flag in _KEY_FLAGS):
+        return True
+    if str(column.get("semanticType") or "").strip().lower() in ("identifier", "primary_key"):
+        return True
+    labels = column.get("labels")
+    if isinstance(labels, Mapping):
+        if _truthy(labels.get("unique")):
+            return True
+        return str(labels.get("constraint") or "").strip().lower() in ("primary_key", "unique")
+    return False
+
+
+def _truthy(value: Any) -> bool:
+    """``is_truthy`` of the dbt engine: a YAML boolean, or ``"true"`` / ``"1"`` / ``"yes"``."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
 
 
 #: Column sensitivities that mark personal data, as ``cli/docs_build.py`` and
@@ -277,6 +305,17 @@ def _is_pii(column: Mapping[str, Any]) -> bool:
     )
 
 
+def _sensitivity(column: Mapping[str, Any]) -> Any:
+    """A column's ``sensitivity``; a pre-0.7 ``pii: true`` with none reads as ``pii``.
+
+    So rewriting ``pii: true`` as ``sensitivity: pii`` is not a change.
+    """
+    sensitivity = column.get("sensitivity")
+    if sensitivity is None and column.get("pii"):
+        return "pii"
+    return sensitivity
+
+
 def _sensitivity_changes(
     old: Mapping[str, Any], new: Mapping[str, Any], col_name: str, path_prefix: str
 ) -> List[Change]:
@@ -289,9 +328,12 @@ def _sensitivity_changes(
     and the change is reported at the key that carried it.
     """
     old_pii, new_pii = _is_pii(old), _is_pii(new)
-    old_sensitivity, new_sensitivity = old.get("sensitivity"), new.get("sensitivity")
+    old_sensitivity, new_sensitivity = _sensitivity(old), _sensitivity(new)
     if old_pii != new_pii:
-        key = "sensitivity" if old_sensitivity != new_sensitivity else "pii"
+        if old.get("sensitivity") != new.get("sensitivity"):
+            key, before, after = "sensitivity", old_sensitivity, new_sensitivity
+        else:
+            key, before, after = "pii", old_pii, new_pii
         return [
             Change(
                 path=f"{path_prefix}.{col_name}.{key}",
@@ -302,8 +344,8 @@ def _sensitivity_changes(
                     if new_pii
                     else f"column '{col_name}' PII annotation removed"
                 ),
-                before=old_pii,
-                after=new_pii,
+                before=before,
+                after=after,
             )
         ]
     if old_sensitivity != new_sensitivity:

@@ -29,8 +29,11 @@ contract supplies as data: spelled out for a terminal, inert in Markdown.
 
 from __future__ import annotations
 
+import contextlib
 import re
-from typing import Any, Dict, List, Mapping
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Mapping
 
 from .changelog_rules import (
     diff_agent_policy,
@@ -143,20 +146,41 @@ def _require_valid(contracts: Mapping[str, Mapping[str, Any]]) -> None:
     available". A side the validator cannot even read (a ``fluidVersion`` that
     is not a version, such as ``7``) is refused too, never let through.
     """
+    errors: Dict[str, List[str]] = {}
+    with _schema_manager() as manager:
+        for side, contract in contracts.items():
+            try:
+                found = _schema_errors(manager, contract)
+            except Exception as exc:  # noqa: BLE001 — a contract nothing can validate is refused
+                found = [f"the contract cannot be validated: {exc}"]
+            if found:
+                errors[side] = found
+    if errors:
+        raise ContractValidationError(errors)
+
+
+@contextlib.contextmanager
+def _schema_manager() -> Iterator[Any]:
+    """The schema manager, with its cache in a temporary directory when HOME is not writable.
+
+    The manager creates ``~/.fluid/schema_cache`` when it is built, which
+    raised on a read-only or missing HOME (a locked-down CI container) and
+    made the gate exit 1, as for a breaking change. The diff validates
+    offline against the bundled schemas, so a temporary cache loses nothing
+    a bundled version needs.
+    """
     # jsonschema stays off the import path of every caller that does not validate.
     from fluid_build.schema_manager import FluidSchemaManager
 
-    manager = FluidSchemaManager()
-    errors: Dict[str, List[str]] = {}
-    for side, contract in contracts.items():
-        try:
-            found = _schema_errors(manager, contract)
-        except Exception as exc:  # noqa: BLE001 — a contract nothing can validate is refused
-            found = [f"the contract cannot be validated: {exc}"]
-        if found:
-            errors[side] = found
-    if errors:
-        raise ContractValidationError(errors)
+    try:
+        manager = FluidSchemaManager()
+    except OSError:
+        manager = None
+    if manager is not None:
+        yield manager
+        return
+    with tempfile.TemporaryDirectory(prefix="fluid-schema-cache-") as cache:
+        yield FluidSchemaManager(cache_dir=Path(cache))
 
 
 def _schema_errors(manager: Any, contract: Mapping[str, Any]) -> List[str]:
@@ -174,10 +198,11 @@ def _schema_errors(manager: Any, contract: Mapping[str, Any]) -> List[str]:
 # Characters ``str.isprintable`` passes that still draw nothing: the Unicode
 # Default_Ignorable_Code_Point letters and marks (the combining grapheme joiner,
 # the Hangul fillers, the Khmer inherent vowels, the Mongolian free variation
-# selectors and the variation selectors). The other default-ignorables are
+# selectors and the variation selectors), and the blank Braille pattern,
+# which is a symbol but draws as a space. The other default-ignorables are
 # format characters, which ``isprintable`` already refuses.
 _DRAWS_NOTHING = re.compile(
-    "[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u3164\ufe00-\ufe0f\uffa0"
+    "[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u2800\u3164\ufe00-\ufe0f\uffa0"
     "\U000e0100-\U000e01ef]"
 )
 
