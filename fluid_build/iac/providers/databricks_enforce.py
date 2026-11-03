@@ -761,6 +761,10 @@ class FailSafe:
     checked: bool = False
     #: Whether the table's grants could be listed (else only the restricted identities were revoked).
     listed: bool = True
+    #: Whether any effective-permission entry said where a privilege comes from
+    #: (``inherited_from_*``); if none did, "nothing inherited is open" cannot be told from
+    #: "the listing does not say".
+    inheritance_visible: bool = False
     #: The table's owner could not be read, so the lock could not skip it (only this run's own
     #: identity was skipped).
     owner_unknown: bool = False
@@ -982,6 +986,12 @@ def _open_paths(session: Session, table: str, owner: str, result: FailSafe) -> N
         result.checked = False
         return
     result.checked = True
+    result.inheritance_visible = any(
+        str(k).startswith("inherited_from")
+        for entry in entries
+        for detail in _privileges(entry).values()
+        for k in detail
+    )
     for entry in entries:
         principal = str(entry.get("principal") or "")
         if not principal or (owner and principal.lower() == owner.lower()):
@@ -1030,8 +1040,13 @@ def _describe(target: Target, fs: FailSafe) -> str:
         )
     if fs.still_open:
         done += "Still open: " + " | ".join(fs.still_open) + ". "
-    elif fs.checked:
+    elif fs.checked and fs.inheritance_visible:
         done += "No grant inherited from the schema or the catalog was found open. "
+    elif fs.checked:
+        done += (
+            "The permission listing did not say where any privilege comes from, so it could not "
+            "determine whether a schema or catalog grant is open: check them. "
+        )
     else:
         done += "Grants inherited from the schema or the catalog could not be checked: check them. "
     return done.rstrip()

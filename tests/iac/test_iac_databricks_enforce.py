@@ -1113,6 +1113,7 @@ def test_when_the_deny_all_filter_fails_select_is_revoked_from_every_grantee_but
     fake.grant("table", TABLE, "power-group", "ALL_PRIVILEGES")
     fake.grant("table", TABLE, "fake-user@example.test", "SELECT")  # the table's owner
     fake.grant("table", TABLE, "modifier", "MODIFY")
+    fake.grant("schema", "main.cp360", "browsers", "USE_SCHEMA")  # inherited, but not a read
     fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
     run = Run(fake)
     with pytest.raises(UnsupportedBindingError) as exc:
@@ -1166,6 +1167,17 @@ def test_an_owner_the_contract_restricts_is_named_as_a_path_the_lock_cannot_clos
     assert "Still open:" in message
     assert f"{ANALYSTS_GROUP} owns {TABLE}" in message
     assert "ALTER TABLE `main`.`cp360`.`profile` OWNER TO" in message
+    assert "No grant inherited" not in message
+
+
+def test_effective_permissions_with_no_inherited_field_do_not_claim_nothing_is_open(fake):
+    seed(fake)
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        run.post(contract())
+    message = str(exc.value)
+    assert "could not determine whether a schema or catalog grant is open" in message
     assert "No grant inherited" not in message
 
 
