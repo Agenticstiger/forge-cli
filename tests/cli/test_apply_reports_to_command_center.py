@@ -602,3 +602,86 @@ def test_a_build_id_that_is_not_in_the_contract_is_the_reason(
     assert patch["body"]["result"]["error_event"] == "build_not_found:no_such_build"
     assert patch["body"]["current_phase"] == "build"
     assert build["calls"] == 0
+
+
+def test_a_failed_apply_reads_the_json_diagnostic_and_says_how_to_continue(
+    product, tofu, monkeypatch
+):
+    stream = [
+        {"@level": "info", "@message": "google_bigquery_dataset.d: Creation complete"},
+        {
+            "@level": "error",
+            "type": "diagnostic",
+            "diagnostic": {
+                "severity": "error",
+                "summary": "googleapi: Error 403: Access Denied",
+                "detail": "Permission bigquery.tables.create denied on dataset d",
+                "address": "google_bigquery_table.orders",
+            },
+        },
+    ]
+    stdout = "\n".join(json.dumps(e) for e in stream)
+    monkeypatch.setattr(
+        runner, "tofu_apply", lambda *a, **k: runner.TofuResult("apply", 1, stdout, "", stream)
+    )
+
+    with pytest.raises(CLIError) as exc:
+        _apply(product)
+
+    assert exc.value.event == "opentofu_apply_failed"
+    assert exc.value.context["error"] == (
+        "googleapi: Error 403: Access Denied (google_bigquery_table.orders)"
+    )
+    assert exc.value.context["resource"] == "google_bigquery_table.orders"
+    assert "bigquery.tables.create denied" in exc.value.context["detail"]
+    assert "@level" not in json.dumps(exc.value.context)
+    suggestions = "\n".join(exc.value.suggestions)
+    assert "re-run 'fluid apply'" in suggestions
+    assert "tofu state list" in suggestions
+
+
+@pytest.mark.parametrize(
+    "result, expected",
+    [
+        (runner.TofuResult("apply", 7, "", "", []), "tofu apply exited 7"),
+        (
+            runner.TofuResult("apply", 1, '{"@level":"warn"}', "", [{"@level": "warn"}]),
+            "tofu apply exited 1",
+        ),
+        (
+            runner.TofuResult("apply", 1, "", "Error: state lock held", []),
+            "Error: state lock held",
+        ),
+    ],
+)
+def test_a_failed_apply_without_a_diagnostic_never_prints_raw_json(result, expected):
+    err = engine._apply_failure(result, "/work/my dir")
+
+    assert err.context["error"] == expected
+    assert "'tofu state list' in '/work/my dir'" in "\n".join(err.suggestions)
+    assert ("force-unlock" in "\n".join(err.suggestions)) == ("lock" in expected)
+
+
+@pytest.mark.parametrize(
+    "summary, locked",
+    [
+        ("Error acquiring the state lock", True),
+        ("Error locking state: ConditionalCheckFailed", True),
+        ("Unsupported block type", False),
+        ("Missing required argument in backend block", False),
+    ],
+)
+def test_only_a_state_lock_error_suggests_force_unlock(summary, locked):
+    events = [{"diagnostic": {"severity": "error", "summary": summary, "detail": ""}}]
+
+    err = engine._apply_failure(runner.TofuResult("apply", 1, "", "", events), "/w")
+
+    assert ("force-unlock" in "\n".join(err.suggestions)) is locked
+
+
+def test_a_non_string_diagnostic_field_does_not_raise():
+    events = [{"diagnostic": {"severity": "error", "summary": 403, "detail": None, "address": 7}}]
+
+    err = engine._apply_failure(runner.TofuResult("apply", 1, "", "", events), "/w")
+
+    assert err.context["error"] == "403 (7)"

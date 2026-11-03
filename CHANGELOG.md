@@ -132,6 +132,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
+  `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the
+  diagnostic (the summary, the resource address and the provider's detail) and says that OpenTofu
+  records state as it goes, so fixing the cause and re-running `fluid apply` normally continues;
+  `tofu state list` in the working directory shows what exists, and a state-lock error also
+  points at `tofu force-unlock`. The raw output tail is logged under `--debug`. Every value a
+  `CLIError` prints is now redacted and has its control characters spelled out, as the other
+  error handlers already did, so a provider message carrying a credential is masked.
 - **`fluid roadmap` claimed a 1.0 release and the package description left providers out.** The
   roadmap said "forge-cli v1.0 shipped"; the package is 0.x Beta, and the roadmap now says so and
   calls its "v1" headings an internal milestone. A test fails if it announces a 1.x release while
