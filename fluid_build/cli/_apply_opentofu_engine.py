@@ -291,9 +291,15 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
         _enforce_data_loss_gate(args, logger, provider, changes, data_changes, lost_in_place)
 
         if dry_run:
+            _enforce_access(plugin, "pre_apply", contract, dry_run=True)
             cprint("\ndry-run: plan only — not applying.")
             info(logger, "opentofu_apply_dry_run", provider=provider, **changes)
             return 0
+        # Access enforcement the cloud keeps outside OpenTofu (Unity Catalog column masks
+        # and row filters) goes onto the tables that already exist BEFORE the apply, so a
+        # grant the apply adds lands on a protected table. A failure stops the run here:
+        # nothing has been applied.
+        _enforce_access(plugin, "pre_apply", contract)
         imported.keep()
 
     # ``fluid apply`` is the headline state-changing command, so a receiver
@@ -305,6 +311,9 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
     with _apply_lineage(contract, provider=provider, planned=changes) as record:
         apply_result = runner.tofu_apply(str(workdir), env=env)
         if not apply_result.ok:
+            # A table the failed apply created, its grants and the job that fills it can all
+            # exist with no mask or filter: bind what exists (never drop) before failing.
+            _enforce_after_failed_apply(plugin, contract)
             raise CLIError(
                 1,
                 "opentofu_apply_failed",
@@ -319,8 +328,64 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
             planned=changes, applied=applied, resources=_module_addresses(module), dry_run=False
         )
 
+    # The tables this apply created exist now, empty, and get their masks and row filter here.
+    # A dbt job that writes one was created paused in this same apply (the plugin's ``emit``
+    # reads the live bindings), and the next apply starts it once they are in place, so no
+    # build fills a table first. A table that cannot be bound is closed to the principals it
+    # restricts (a deny-all row filter, else revoked), and the run fails.
+    _enforce_access(plugin, "post_apply", contract)
+
     info(logger, "opentofu_apply_ok", provider=provider, **applied)
     return 0
+
+
+def _enforce_access(
+    plugin: Any, hook: str, contract: Mapping[str, Any], *, dry_run: bool = False
+) -> None:
+    """Run a plugin's ``pre_apply`` / ``post_apply`` access-enforcement hook, if it has one.
+
+    Optional plugin capability, discovered like ``plan_notices``: the Databricks plugin
+    binds Unity Catalog column masks and row filters, which the provider cannot manage
+    (``iac/providers/databricks_enforce.py``). Unlike the advisory hooks this one gates: a
+    refusal or failure is a typed error and the run exits non-zero. With ``dry_run`` the
+    plugin prints the statements and runs none.
+    """
+    run = getattr(plugin, hook, None)
+    if not callable(run):
+        return
+    try:
+        if dry_run:
+            run(contract, say=cprint, dry_run=True)
+        else:
+            run(contract, say=cprint)
+    except UnsupportedBindingError as exc:
+        raise CLIError(
+            1,
+            "opentofu_access_enforcement_failed",
+            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+        ) from exc
+
+
+def _enforce_after_failed_apply(plugin: Any, contract: Mapping[str, Any]) -> None:
+    """Best effort, bind-only ``post_apply`` for a ``tofu apply`` that failed part way.
+
+    A failure here is printed, never raised: the error the run exits with is the apply's own
+    (``opentofu_apply_failed``). The plugin binds what exists, revokes ``SELECT`` where it
+    cannot, skips tables that do not exist and drops nothing (``after_failed_apply``).
+    """
+    run = getattr(plugin, "post_apply", None)
+    if not callable(run):
+        return
+    cprint(
+        "\n  tofu apply failed part way: binding the masks and row filter on the tables that "
+        "exist before the run stops (no mask or filter is dropped)."
+    )
+    try:
+        run(contract, say=cprint, after_failed_apply=True)
+    except UnsupportedBindingError as exc:
+        cprint(f"  access enforcement after the failed apply: {exc} {' '.join(exc.remediation)}")
+    except Exception as exc:  # noqa: BLE001 — the apply's own error is what the run raises
+        cprint(f"  access enforcement after the failed apply could not run: {type(exc).__name__}")
 
 
 def _applied_env(args) -> Optional[str]:
