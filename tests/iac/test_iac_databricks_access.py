@@ -23,9 +23,8 @@ follow the definition, and every shape the mapping cannot express is a refusal.
 
 from __future__ import annotations
 
-import copy
 import hashlib
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import pytest
 
@@ -42,8 +41,6 @@ pytestmark = [pytest.mark.unit, pytest.mark.databricks]
 from ._databricks_governed import (  # noqa: E402
     ANALYSTS,
     ANALYSTS_GROUP,
-    COLUMNS,
-    CONSENT,
     DENIED,
     DENY,
     FILTER,

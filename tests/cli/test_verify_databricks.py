@@ -765,7 +765,7 @@ def restricted_contract(**overrides: Any) -> Dict[str, Any]:
 def expected_enforcement(contract: Dict[str, Any]):
     from fluid_build.iac.providers.databricks import managed_objects
 
-    (table,), _jobs = managed_objects(contract, {})
+    (table,), _ = managed_objects(contract, {})
     return table
 
 

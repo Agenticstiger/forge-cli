@@ -70,10 +70,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from urllib.parse import parse_qs, unquote, urlparse
 
 NOT_FOUND = "NOT_FOUND"
-_USER = "fake-user@example.test"
-_ORG_ID = "1234567890123456"
 #: The identity a run authenticates as (``GET .../scim/v2/Me``), and so a function's owner.
-DEPLOY_USER = _USER
+DEPLOY_USER = "fake-user@example.test"
+_USER = DEPLOY_USER
+_ORG_ID = "1234567890123456"
 
 _IDENT = r"`?([^`.\s]+)`?"
 _FULL = rf"{_IDENT}\.{_IDENT}\.{_IDENT}"
