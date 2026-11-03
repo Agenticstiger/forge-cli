@@ -73,9 +73,9 @@ _INTOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 # SLSA Provenance predicate type. Stable for SLSA v1.0; bumping SLSA
 # version would change this URI and the internal structure.
 _SLSA_PROVENANCE_PREDICATE_TYPE = "https://slsa.dev/provenance/v1"
-# Our build-type URI — identifies the builder (fluid-build bundle)
+# Our build-type URI — identifies the builder (`fluid bundle`)
 # and its version. The version suffix lets verifiers pin to a
-# specific fluid-build release's provenance schema.
+# specific data-product-forge release's provenance schema.
 _FLUID_BUILD_TYPE_V1 = "https://fluid-build.io/bundle-provenance/v1"
 
 

@@ -686,7 +686,7 @@ def _call_llm_with_tools(
             raise CopilotGenerationError(
                 "copilot_agent_loop_litellm_missing",
                 "The agent loop needs litellm for tool use but it is not installed.",
-                suggestions=["pip install 'fluid-build[litellm]'"],
+                suggestions=["pip install 'data-product-forge[litellm]'"],
             ) from exc
         except Exception as exc:  # noqa: BLE001 — translate to the loop's error type
             raise CopilotGenerationError(
