@@ -1228,7 +1228,7 @@ class FakeDatabricks:
         cat = (q.get("catalog_name") or [""])[0]
         sch = (q.get("schema_name") or [""])[0]
         names = sorted(n for n in self.functions if n.rsplit(".", 1)[0] == f"{cat}.{sch}")
-        return 200, self._page(names, q, "functions", lambda n: self._function_summary(n))
+        return 200, self._page(names, q, "functions", self._function_summary)
 
     def _function_summary(self, full: str) -> Dict[str, Any]:
         cat, sch, name = full.split(".")

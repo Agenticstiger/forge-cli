@@ -1056,8 +1056,6 @@ class TestExplainPlanFailure:
     )
 
     def _residency_json(self, padding=2000):
-        import json
-
         diagnostic = {
             "severity": "error",
             "summary": "Resource precondition failed",
@@ -1093,8 +1091,6 @@ class TestExplainPlanFailure:
         assert "eu-central-1" in text and "us-west-2" in text and "\n" not in text
 
     def test_the_live_region_comes_from_the_diagnostic_values_when_the_text_lacks_it(self):
-        import json
-
         diagnostic = {
             "detail": "The contract declares binding.location.region eu-central-1, but the "
             "workspace DATABRICKS_HOST names is in (unknown).",

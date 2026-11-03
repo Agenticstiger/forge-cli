@@ -147,7 +147,7 @@ def default_client() -> Any:
     return WorkspaceClient(**config)
 
 
-def _scrub(text: Any) -> str:
+def scrub(text: Any) -> str:
     """One short line with every credential value in the environment removed."""
     from ...observability.secret_redactor import redact_secret_text
     from .databricks_auth import credential_values
@@ -158,7 +158,7 @@ def _scrub(text: Any) -> str:
     return line if len(line) <= _MAX_MESSAGE else line[: _MAX_MESSAGE - 3] + "..."
 
 
-def _is_not_found(exc: BaseException) -> bool:
+def is_not_found(exc: BaseException) -> bool:
     for attr in ("status_code", "status", "http_status"):
         if getattr(exc, attr, None) == 404:
             return True
@@ -173,11 +173,6 @@ def _is_not_found(exc: BaseException) -> bool:
     }
 
 
-#: The redaction and not-found test other Databricks code (the build runner's landing) shares.
-scrub = _scrub
-is_not_found = _is_not_found
-
-
 def read_table(client: Any, full_name: str) -> Optional[Dict[str, Any]]:
     """The live table, or ``None`` when it does not exist."""
     try:
@@ -185,7 +180,7 @@ def read_table(client: Any, full_name: str) -> Optional[Dict[str, Any]]:
             "GET", f"/api/2.1/unity-catalog/tables/{quote(full_name, safe='.')}"
         )
     except Exception as exc:  # noqa: BLE001 — a 404 is an answer, anything else is raised on
-        if _is_not_found(exc):
+        if is_not_found(exc):
             return None
         raise
     return out if isinstance(out, dict) else {}
@@ -198,7 +193,7 @@ def read_function(client: Any, full_name: str) -> Optional[Dict[str, Any]]:
             "GET", f"/api/2.1/unity-catalog/functions/{quote(full_name, safe='.')}"
         )
     except Exception as exc:  # noqa: BLE001 — a 404 is an answer, anything else is raised on
-        if _is_not_found(exc):
+        if is_not_found(exc):
             return None
         raise
     return out if isinstance(out, dict) else {}
@@ -322,7 +317,7 @@ class SqlRunner:
         except StatementFailed:
             raise
         except Exception as exc:  # noqa: BLE001 — every transport failure is the statement's
-            raise StatementFailed(f"{type(exc).__name__}: {_scrub(exc)}") from exc
+            raise StatementFailed(f"{type(exc).__name__}: {scrub(exc)}") from exc
         except BaseException:
             # Ctrl-C or SystemExit while the statement runs: it would go on running on the
             # warehouse after this process has gone.
@@ -333,7 +328,7 @@ class SqlRunner:
         if state != "SUCCEEDED":
             error = (doc.get("status") or {}).get("error") or {}
             raise StatementFailed(
-                f"{state}: {_scrub(error.get('message') or 'no message from the server')}"
+                f"{state}: {scrub(error.get('message') or 'no message from the server')}"
             )
         return doc
 
@@ -530,7 +525,7 @@ class Session:
             raise
         except Exception as exc:  # noqa: BLE001
             raise FunctionMismatch(
-                f"could not read {step.function.full_name}: {type(exc).__name__}: {_scrub(exc)}"
+                f"could not read {step.function.full_name}: {type(exc).__name__}: {scrub(exc)}"
             ) from exc
         if problem is not None:
             raise FunctionMismatch(
@@ -585,7 +580,7 @@ def _client_for(
         if required:
             raise EnforcementError(
                 f"could not create the Databricks client for the masks and row filters: "
-                f"{type(exc).__name__}: {_scrub(exc)}"
+                f"{type(exc).__name__}: {scrub(exc)}"
             ) from exc
     say(
         "  note: masks and row filters an earlier apply bound were not checked for removal "
@@ -600,7 +595,7 @@ def _read(client: Any, target: Target) -> Optional[Dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001
         raise EnforcementError(
             f"could not read {target.full_name} from Unity Catalog to see which masks and row "
-            f"filters it has: {type(exc).__name__}: {_scrub(exc)}",
+            f"filters it has: {type(exc).__name__}: {scrub(exc)}",
             ("Check DATABRICKS_HOST and the credential, then re-run fluid apply.",),
         ) from exc
 
@@ -857,7 +852,7 @@ def drop_orphan_functions(session: Session, targets: Sequence[Target], say: Say)
         except Exception as exc:  # noqa: BLE001 — unknown binding: drop nothing
             say(
                 f"  note: orphan functions in {where} not dropped: its tables or functions could "
-                f"not be read ({type(exc).__name__}: {_scrub(exc)})."
+                f"not be read ({type(exc).__name__}: {scrub(exc)})."
             )
             continue
         names = [
