@@ -589,7 +589,7 @@ class FederatedWorkspace:
         # anything outside a conservative slug so a tampered manifest
         # row cannot smuggle ``../`` traversal or absolute segments into
         # those path sinks.
-        if not _WORKSPACE_ID_RE.match(ws_id):
+        if not _WORKSPACE_ID_RE.fullmatch(ws_id):
             raise ValueError(
                 f"federation workspace id {ws_id!r} is invalid: must match "
                 f"{_WORKSPACE_ID_RE.pattern} (alphanumerics, dot, dash, "

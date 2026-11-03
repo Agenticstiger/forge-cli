@@ -43,7 +43,7 @@ from typing import Any, List, Mapping, Tuple
 from .base import UnsupportedBindingError
 from .column_access import policy_where
 
-_NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+_NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}\Z")
 
 
 @dataclass(frozen=True)

@@ -103,7 +103,7 @@ LOG = logging.getLogger(__name__)
 # binding carries (a jurisdiction such as "EU", a Google region, an unresolved
 # "{{ env.AWS_REGION }}") must not become the provider's region; it used to be
 # ignored, and still is.
-_AWS_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+$")
+_AWS_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+\Z")
 
 
 def recorded_regions(resources: Iterable[Mapping[str, Any]]) -> set:

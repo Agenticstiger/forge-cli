@@ -324,7 +324,7 @@ def validate_name(name: str, resource_type: str) -> bool:
     try:
         if resource_type in ["dataset", "table"]:
             # BigQuery naming rules
-            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name):
+            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*\Z", name):
                 return False
             return len(name) <= 1024
 
@@ -332,7 +332,7 @@ def validate_name(name: str, resource_type: str) -> bool:
             # Cloud Storage naming rules
             if len(name) < 3 or len(name) > 63:
                 return False
-            if not re.match(r"^[a-z0-9][a-z0-9\-]*[a-z0-9]$", name):
+            if not re.match(r"^[a-z0-9][a-z0-9\-]*[a-z0-9]\Z", name):
                 return False
             if re.match(r"^\d+\.\d+\.\d+\.\d+$", name):
                 return False
@@ -344,7 +344,7 @@ def validate_name(name: str, resource_type: str) -> bool:
                 return False
             if not name[0].isalpha():
                 return False
-            return re.match(r"^[a-zA-Z][a-zA-Z0-9\-\._~%+]*$", name) is not None
+            return re.match(r"^[a-zA-Z][a-zA-Z0-9\-\._~%+]*\Z", name) is not None
 
         elif resource_type == "job":
             # Job naming rules
@@ -354,7 +354,7 @@ def validate_name(name: str, resource_type: str) -> bool:
                 return False
             if name[-1] == "-":
                 return False
-            return re.match(r"^[a-z][a-z0-9\-]*[a-z0-9]$", name) is not None
+            return re.match(r"^[a-z][a-z0-9\-]*[a-z0-9]\Z", name) is not None
 
         else:
             # Unknown resource type

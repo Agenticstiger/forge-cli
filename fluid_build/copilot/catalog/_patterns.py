@@ -143,7 +143,7 @@ def validate_and_quote_identifier(
         non-SQL-shaped identifiers.
     """
     rule = pattern or _DEFAULT_IDENTIFIER
-    if not rule.match(value or ""):
+    if not rule.fullmatch(value or ""):
         raise CatalogConfigError(
             message=f"Invalid {kind} identifier: {value!r}",
             suggestions=[

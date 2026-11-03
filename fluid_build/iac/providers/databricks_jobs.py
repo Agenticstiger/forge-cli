@@ -123,9 +123,9 @@ _GIT_PROVIDERS = {
     "dev.azure.com": "azureDevOpsServices",
 }
 _GIT_REFS = ("branch", "tag", "commit")
-_GIT_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
-_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
-_REPO_PATH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+_GIT_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
+_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}\Z")
+_REPO_PATH_RE = re.compile(r"^[A-Za-z0-9._/-]+\Z")
 
 #: ``1h``, ``30m``, ``45s``, ``2d``, a bare number of seconds, or ISO 8601 ``PT1H30M``.
 _DURATION_RE = re.compile(r"^(\d+)\s*([smhd]?)$")

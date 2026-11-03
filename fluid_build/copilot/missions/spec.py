@@ -70,7 +70,7 @@ _CRITERION_KEYS = frozenset({"check", "advisory", "require", "path", "op", "valu
 _BUDGET_KEYS = frozenset({"max_usd", "max_iterations", "max_wall_seconds"})
 
 #: One dotted-path segment: a key, optionally fanned out over an array.
-_SEGMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)(\[\*\])?$")
+_SEGMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)(\[\*\])?\Z")
 
 _MISSION_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 

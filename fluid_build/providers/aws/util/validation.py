@@ -37,10 +37,10 @@ class ResourceValidator:
     """Validates AWS resource configurations before execution."""
 
     # AWS naming rules
-    S3_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$")
-    GLUE_DATABASE_PATTERN = re.compile(r"^[a-z0-9_]+$")
-    GLUE_TABLE_PATTERN = re.compile(r"^[a-z0-9_]+$")
-    LAMBDA_FUNCTION_PATTERN = re.compile(r"^[a-zA-Z0-9\-_]+$")
+    S3_BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]\Z")
+    GLUE_DATABASE_PATTERN = re.compile(r"^[a-z0-9_]+\Z")
+    GLUE_TABLE_PATTERN = re.compile(r"^[a-z0-9_]+\Z")
+    LAMBDA_FUNCTION_PATTERN = re.compile(r"^[a-zA-Z0-9\-_]+\Z")
 
     # AWS service quotas (defaults - can be increased)
     DEFAULT_QUOTAS = {
