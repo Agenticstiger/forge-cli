@@ -21,11 +21,14 @@ formatting lives in ``cli/diff.py`` (text / json / markdown emitters).
 The classifier is fluid-schema-native — it understands acquisition engines,
 ``agentPolicy``, ``sovereignty``, and the SDP/ADP/CDP × Bronze/Silver/Gold
 cross-check directly, rather than treating contracts as generic schema docs.
+
+Both contracts are schema-validated before they are compared (see
+:class:`ContractValidationError`).
 """
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Dict, List, Mapping
 
 from .changelog_rules import (
     diff_agent_policy,
@@ -39,11 +42,35 @@ from .changelog_rules import (
 from .changelog_types import Change, ChangelogReport
 
 
-def compare_contracts(baseline: Mapping[str, Any], new: Mapping[str, Any]) -> ChangelogReport:
+class ContractValidationError(ValueError):
+    """A contract handed to :func:`compare_contracts` is not a valid FLUID contract.
+
+    ``errors`` maps each invalid side, ``"baseline"`` or ``"new"``, to its
+    errors, worded as ``fluid validate`` words them. A side that validated is
+    absent.
+    """
+
+    def __init__(self, errors: Mapping[str, List[str]]) -> None:
+        self.errors: Dict[str, List[str]] = {side: list(found) for side, found in errors.items()}
+        super().__init__(
+            "; ".join(
+                f"the {side} contract is not a valid FLUID contract ({len(found)} error(s))"
+                for side, found in self.errors.items()
+            )
+        )
+
+
+def compare_contracts(
+    baseline: Mapping[str, Any], new: Mapping[str, Any], *, validate: bool = True
+) -> ChangelogReport:
     """Return a structured changelog comparing two parsed contracts.
 
     ``baseline`` is treated as "old"; ``new`` as the candidate. Idempotent —
     passing the same dict twice produces an empty report.
+
+    Both are first validated (:func:`_require_valid`), and an invalid one
+    raises :class:`ContractValidationError`. ``validate=False`` diffs whatever
+    it is given, for an advisory diff of a contract still being repaired.
     """
     report = ChangelogReport()
 
@@ -52,6 +79,9 @@ def compare_contracts(baseline: Mapping[str, Any], new: Mapping[str, Any]) -> Ch
             "compare_contracts: both arguments must be Mapping; "
             f"got {type(baseline).__name__} / {type(new).__name__}"
         )
+
+    if validate:
+        _require_valid({"baseline": baseline, "new": new})
 
     # Top-level metadata churn — info-level signals.
     report.extend(diff_metadata(baseline, new))
@@ -97,6 +127,37 @@ def compare_contracts(baseline: Mapping[str, Any], new: Mapping[str, Any]) -> Ch
         report.extend(diff_quality_severity(base_expose, new_expose, expose_id, idx))
 
     return report
+
+
+def _require_valid(contracts: Mapping[str, Mapping[str, Any]]) -> None:
+    """Raise :class:`ContractValidationError` naming every side that is not valid.
+
+    The rules read only the shapes a schema allows, so an invalid contract can
+    hide a change from them: a column whose ``type`` is a number is never
+    compared. This is the gate ``fluid plan`` runs before it writes a plan: the JSON Schema of
+    the contract's own ``fluidVersion``, offline, from the bundled schemas. A
+    pre-0.7 version has no schema left, and is refused with the upgrade that
+    ``fluid validate`` asks for instead of "schema not available".
+    """
+    # jsonschema stays off the import path of every caller that does not validate.
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    manager = FluidSchemaManager()
+    errors: Dict[str, List[str]] = {}
+    for side, contract in contracts.items():
+        version = manager.detect_version(dict(contract))
+        if version is not None and (version.major, version.minor) < (0, 7):
+            errors[side] = [
+                f"fluidVersion {str(contract.get('fluidVersion'))!r} is no longer supported: "
+                "pre-0.7 schemas have been removed; upgrade the contract to fluidVersion 0.7.x "
+                "or later"
+            ]
+            continue
+        result = manager.validate_contract(dict(contract), offline_only=True)
+        if not result.is_valid:
+            errors[side] = list(result.errors)
+    if errors:
+        raise ContractValidationError(errors)
 
 
 def render_text(report: ChangelogReport) -> str:

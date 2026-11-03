@@ -239,6 +239,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Invalid SQL identifier: 'spectrum_events\n'`. That includes a name that reaches it with a
   trailing newline from an environment variable or a file; strip the value where it is set.
 
+- **`fluid diff --baseline` compared contracts that no schema accepts.** Its rules read only the
+  shapes a schema allows, so a value of the wrong type hid a change: a column retyped from
+  `decimal(18,2)` to the number `18` passed `--fail-on-breaking` with exit 0. Both contracts are
+  now validated first, against the schema their `fluidVersion` names, offline, the gate
+  `fluid plan` runs. An invalid one exits 2 with `diff_contract_invalid`, which names each
+  invalid file and logs each error, and nothing is printed or written to `--out`. Exit 2 is
+  diff(1)'s "trouble", so it never reads as 0 (no changes) or 1 (breaking). A pre-0.7 contract is
+  refused with the upgrade that `fluid validate` asks for, so a pre-0.7 baseline can no longer be
+  diffed against its 0.7.x rewrite. In `fluid_build.api.changelog`, `compare_contracts` raises the
+  new `ContractValidationError`, and `validate=False` diffs without validating; the
+  `fluid forge --refine` preview uses it, because the contract being refined may be the invalid one.
+
 ## [0.26.0] — 2026-11-01
 
 ### Added

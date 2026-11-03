@@ -33,11 +33,12 @@ from ._common import (
     resolve_provider_from_contract,
     write_json,
 )
-from ._logging import info, warn
+from ._logging import error, info, warn
 
 if TYPE_CHECKING:
     from fluid_build.iac.drift import StateDriftReport
 
+    from ..api.changelog import ContractValidationError
     from ._diff_live import LiveDriftReport
 
 COMMAND = "diff"
@@ -739,11 +740,18 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
     Loads two contracts, runs the changelog engine, prints in the requested
     format, optionally writes a JSON envelope to ``--out``, and returns a
     non-zero exit code when ``--fail-on-breaking`` is set and any breaking
-    change was detected.
+    change was detected. A contract that is not schema-valid exits 2 (diff(1)'s
+    "trouble") before anything is printed or written, so it never reads as 0
+    (no changes) or 1 (breaking).
     """
     from fluid_build.cli.console import cprint
 
-    from ..api.changelog import compare_contracts, render_markdown, render_text
+    from ..api.changelog import (
+        ContractValidationError,
+        compare_contracts,
+        render_markdown,
+        render_text,
+    )
 
     if getattr(args, "env", None):
         # Environment overlays are a drift-mode concept (they shape the
@@ -798,7 +806,12 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
             "fluid.diff.format": getattr(args, "format", "text") or "text",
         },
     ) as span:
-        report = compare_contracts(baseline, new)
+        try:
+            report = compare_contracts(baseline, new)
+        except ContractValidationError as exc:
+            raise _invalid_contracts_error(
+                exc, {"baseline": baseline_path, "new": new_path}, logger
+            ) from exc
         span.set_attribute("fluid.diff.breaking_count", len(report.breaking))
         span.set_attribute("fluid.diff.non_breaking_count", len(report.non_breaking))
         span.set_attribute("fluid.diff.info_count", len(report.info))
@@ -834,3 +847,34 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
     if getattr(args, "fail_on_breaking", False) and report.has_breaking:
         return 1
     return 0
+
+
+def _invalid_contracts_error(
+    exc: ContractValidationError, paths: Dict[str, str], logger: logging.Logger
+) -> CLIError:
+    """``diff_contract_invalid`` for the contracts ``compare_contracts`` refused.
+
+    Each error is logged as ``fluid plan`` logs its schema errors, and the
+    message names every invalid file with the command that reports on it.
+    """
+    for side, errors in exc.errors.items():
+        for err in errors:
+            error(logger, "diff_contract_schema_error", side=side, path=paths[side], detail=err)
+    invalid = list(exc.errors)
+    named = "; ".join(
+        f"the {side} contract {paths[side]} has {len(exc.errors[side])} error(s)"
+        for side in invalid
+    )
+    commands = " and ".join(f"``fluid validate {paths[side]}``" for side in invalid)
+    return CLIError(
+        2,
+        "diff_contract_invalid",
+        {
+            "invalid": invalid,
+            "errors": {side: exc.errors[side] for side in invalid},
+            "message": (
+                f"``fluid diff --baseline`` compares valid contracts only: {named}. "
+                f"Run {commands} for the full report."
+            ),
+        },
+    )

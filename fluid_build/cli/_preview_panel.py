@@ -714,7 +714,10 @@ def render_refine_diff(
     try:
         from fluid_build.api.changelog import compare_contracts, render_text
 
-        report = compare_contracts(old_contract, new_contract)
+        # Not validated: the existing contract is often invalid (that can be why
+        # it is being refined), and the new one passed the runtime's schema
+        # gate already. ``fluid diff --baseline`` validates both.
+        report = compare_contracts(old_contract, new_contract, validate=False)
     except Exception:  # noqa: BLE001 — diff is advisory; never block the write
         LOG.debug("render_refine_diff: changelog engine unavailable", exc_info=True)
         return False
