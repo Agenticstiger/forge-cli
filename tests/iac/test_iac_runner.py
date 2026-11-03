@@ -193,3 +193,97 @@ class TestStateList:
             runner, "_run", lambda *a, **k: runner.TofuResult("state-list", 1, "", "no state")
         )
         assert runner.tofu_state_list("/wd") == []
+
+
+class TestS3Lockfile:
+    """S3 state locks via ``-backend-config=use_lockfile=true`` at init (tofu >= 1.10)."""
+
+    FLAG = "-backend-config=use_lockfile=true"
+
+    def _init_args(self, monkeypatch, tmp_path, backend, version):
+        import json as _json
+
+        doc = {"terraform": {"backend": backend} if backend else {}}
+        (tmp_path / "main.tf.json").write_text(_json.dumps(doc))
+        seen = {}
+        monkeypatch.setattr(runner, "tofu_version", lambda: version)
+        monkeypatch.setattr(runner, "_run", lambda args, **kw: seen.setdefault("args", args))
+        runner.tofu_init(str(tmp_path))
+        return seen["args"]
+
+    S3 = {"s3": {"bucket": "b", "key": "k"}}
+
+    def test_added_on_new_tofu(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("FLUID_TOFU_S3_LOCKFILE", raising=False)
+        assert self.FLAG in self._init_args(monkeypatch, tmp_path, self.S3, (1, 10, 0))
+
+    def test_absent_and_warns_on_old_tofu(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.delenv("FLUID_TOFU_S3_LOCKFILE", raising=False)
+        with caplog.at_level("WARNING"):
+            args = self._init_args(monkeypatch, tmp_path, self.S3, (1, 9, 9))
+        assert self.FLAG not in args
+        assert "s3_state_unlocked" in caplog.text and "1.10" in caplog.text
+
+    def test_opt_out(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("FLUID_TOFU_S3_LOCKFILE", "0")
+        assert self.FLAG not in self._init_args(monkeypatch, tmp_path, self.S3, (1, 12, 1))
+
+    def test_gcs_and_local_untouched(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("FLUID_TOFU_S3_LOCKFILE", raising=False)
+        assert self.FLAG not in self._init_args(
+            monkeypatch, tmp_path, {"gcs": {"bucket": "b"}}, (1, 12, 1)
+        )
+        assert self.FLAG not in self._init_args(monkeypatch, tmp_path, None, (1, 12, 1))
+
+    def test_emitted_module_has_no_lockfile(self):
+        from fluid_build.iac.backend import parse_backend
+
+        assert parse_backend("s3://b/k") == {"s3": {"bucket": "b", "key": "k"}}
+
+    def test_unreadable_version_skips_flag_and_warns(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.delenv("FLUID_TOFU_S3_LOCKFILE", raising=False)
+        with caplog.at_level("WARNING"):
+            args = self._init_args(monkeypatch, tmp_path, self.S3, None)
+        assert self.FLAG not in args
+        assert "s3_state_unlocked" in caplog.text and "could not be read" in caplog.text
+
+
+class TestLockfileReconfigure:
+    """``-reconfigure`` joins the lockfile flag only for a kept workdir on this same state."""
+
+    def _args(self, monkeypatch, tmp_path, recorded, module=None):
+        import json as _json
+
+        monkeypatch.delenv("FLUID_TOFU_S3_LOCKFILE", raising=False)
+        s3 = module or {"bucket": "b", "key": "k", "region": "eu-west-1"}
+        (tmp_path / "main.tf.json").write_text(_json.dumps({"terraform": {"backend": {"s3": s3}}}))
+        if recorded is not None:
+            (tmp_path / ".terraform").mkdir()
+            (tmp_path / ".terraform" / "terraform.tfstate").write_text(
+                _json.dumps({"backend": {"type": "s3", "config": recorded}})
+            )
+        seen = {}
+        monkeypatch.setattr(runner, "tofu_version", lambda: (1, 12, 1))
+        monkeypatch.setattr(runner, "_run", lambda args, **kw: seen.setdefault("args", args))
+        runner.tofu_init(str(tmp_path))
+        return seen["args"]
+
+    def test_same_backend_without_lockfile_reconfigures(self, monkeypatch, tmp_path):
+        rec = {"bucket": "b", "key": "k", "region": "eu-west-1", "use_lockfile": None}
+        args = self._args(monkeypatch, tmp_path, rec)
+        assert "-reconfigure" in args and "-backend-config=use_lockfile=true" in args
+
+    def test_different_key_does_not(self, monkeypatch, tmp_path):
+        rec = {"bucket": "b", "key": "other", "region": "eu-west-1", "use_lockfile": None}
+        assert "-reconfigure" not in self._args(monkeypatch, tmp_path, rec)
+
+    def test_different_region_does_not(self, monkeypatch, tmp_path):
+        rec = {"bucket": "b", "key": "k", "region": "us-east-1", "use_lockfile": None}
+        assert "-reconfigure" not in self._args(monkeypatch, tmp_path, rec)
+
+    def test_already_locking_does_not(self, monkeypatch, tmp_path):
+        rec = {"bucket": "b", "key": "k", "region": "eu-west-1", "use_lockfile": True}
+        assert "-reconfigure" not in self._args(monkeypatch, tmp_path, rec)
+
+    def test_nothing_recorded_does_not(self, monkeypatch, tmp_path):
+        assert "-reconfigure" not in self._args(monkeypatch, tmp_path, None)

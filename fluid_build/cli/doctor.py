@@ -174,6 +174,12 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "Per-`tofu` invocation wall-clock cap",
     ),
     (
+        "FLUID_TOFU_S3_LOCKFILE",
+        "on (OpenTofu 1.10+)",
+        "Set =0 to skip S3-native state locking when the deploying role cannot "
+        "write the `<key>.tflock` object",
+    ),
+    (
         "FLUID_FEDERATION_TIMEOUT_SECONDS",
         "30s default",
         "Per-git-operation cap when `fluid apply` fetches a federated "

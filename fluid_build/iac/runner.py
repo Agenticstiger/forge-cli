@@ -26,11 +26,13 @@ embeds them in argv or in the ``.tf.json``.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 # Per-command wall-clock cap. A hung ``tofu`` (e.g., an unauthenticated
@@ -43,6 +45,10 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 # can take many minutes for the eventual consistency to settle).
 _DEFAULT_TOFU_TIMEOUT_SECONDS = 1800
 _MIN_REQUIRED_VERSION = (1, 6, 0)
+# S3-native state locking (``use_lockfile``) arrived in OpenTofu 1.10.
+_S3_LOCKFILE_MIN_VERSION = (1, 10, 0)
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_timeout() -> int:
@@ -199,6 +205,74 @@ def _run(
     )
 
 
+def _needs_reconfigure_for_lockfile(workdir: str, config: Mapping[str, Any]) -> bool:
+    """True when ``workdir`` was initialised on this same S3 state, without the lockfile.
+
+    Adding ``use_lockfile`` to a kept workdir changes its backend config, which
+    ``tofu init`` refuses without ``-reconfigure``. That is safe only when the
+    recorded backend is this one: the same bucket, key and region (compared when
+    the module names one), ``use_lockfile`` not already true. A recorded backend
+    that differs in any of them is left to tofu's own error, never repointed.
+    """
+    from .state_migration import recorded_backend
+
+    recorded = recorded_backend(Path(workdir))
+    if not recorded or set(recorded) != {"s3"}:
+        return False
+    have = recorded["s3"] or {}
+    if have.get("use_lockfile") is True:
+        return False
+    fields = ("bucket", "key") + (("region",) if config.get("region") else ())
+    return all(have.get(k) == config.get(k) for k in fields)
+
+
+def _s3_lockfile_args(workdir: str) -> List[str]:
+    """``-backend-config=use_lockfile=true`` when the module's backend is S3.
+
+    The flag is passed at init, not emitted into the module, so the module's
+    bytes (an adopter may keep them as golden files) do not change. Gated on
+    the installed tofu (>= 1.10) and switched off by ``FLUID_TOFU_S3_LOCKFILE=0``
+    for a role that cannot write the ``<key>.tflock`` object. ``-reconfigure``
+    rides along when a kept workdir recorded this state without the lockfile.
+    """
+    try:
+        with open(os.path.join(workdir, "main.tf.json"), encoding="utf-8") as fh:
+            backend = json.load(fh).get("terraform", {}).get("backend", {})
+    except (OSError, ValueError, AttributeError):
+        return []
+    if not isinstance(backend, dict) or not isinstance(backend.get("s3"), dict):
+        return []
+    if os.environ.get("FLUID_TOFU_S3_LOCKFILE", "").strip().lower() in ("0", "false", "no", "off"):
+        return []
+    version = tofu_version()
+    if version is None or version < _S3_LOCKFILE_MIN_VERSION:
+        if version is None:
+            reason = (
+                "the OpenTofu version could not be read, so the lock flag was skipped "
+                "rather than risk an unrecognised build failing init"
+            )
+        else:
+            reason = (
+                f"OpenTofu {'.'.join(str(p) for p in version)} predates 1.10, so two applies "
+                "on the same product can race. Upgrade OpenTofu to 1.10 or newer, "
+                "or run with --ensure-opentofu (pins a version that locks)"
+            )
+        logger.warning(
+            json.dumps(
+                {
+                    "event": "s3_state_unlocked",
+                    "tofu_version": ".".join(str(p) for p in version) if version else None,
+                    "message": f"S3 state is not locked: {reason}.",
+                }
+            )
+        )
+        return []
+    args = ["-backend-config=use_lockfile=true"]
+    if _needs_reconfigure_for_lockfile(workdir, backend["s3"]):
+        args.append("-reconfigure")
+    return args
+
+
 def tofu_init(
     workdir: str,
     *,
@@ -223,7 +297,9 @@ def tofu_init(
     args = ["init", "-input=false", "-no-color"]
     if not backend:
         args.append("-backend=false")
-    if reconfigure:
+    else:
+        args.extend(a for a in _s3_lockfile_args(workdir) if a not in args)
+    if reconfigure and "-reconfigure" not in args:
         args.append("-reconfigure")
     if force_copy:
         args.append("-force-copy")
