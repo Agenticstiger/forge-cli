@@ -100,10 +100,7 @@ def _record_run_elsewhere(build_id: str, report: Any) -> None:
 
 
 def _report_externally_run_build(
-    build: Dict[str, Any],
-    build_id: str,
-    report: Any,
-    contract: Optional[Dict[str, Any]] = None,
+    build: Dict[str, Any], build_id: str, report: Any, contract: Dict[str, Any]
 ) -> None:
     """Say that a build runs on its own platform; it is not run here.
 
@@ -112,14 +109,13 @@ def _report_externally_run_build(
     DuckDB's or a warehouse's. The summary counts it on its own line, apart
     from skips; the run report, whose statuses are succeeded, failed and
     skipped, records it as skipped with ``reason: runs_outside_forge``.
+
+    A build that opts in with ``parameters.flink``, in a ``contract`` whose
+    schema has the managed lane, is reported as deployed by ``fluid apply``.
     """
     from fluid_build.streaming.compiler import managed_config, managed_lane_enabled
 
-    if (
-        contract is not None
-        and managed_lane_enabled(contract)
-        and managed_config(build) is not None
-    ):
+    if managed_lane_enabled(contract) and managed_config(build) is not None:
         cprint(
             f"\nBuild '{build_id}' is managed by fluid apply on the Flink Operator; "
             "no local or batch execution is performed."

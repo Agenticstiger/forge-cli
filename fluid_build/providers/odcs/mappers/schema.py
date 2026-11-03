@@ -444,11 +444,11 @@ def _field_to_property(
     elif fld.get("tags") and any(t in ("primary-key", "primaryKey") for t in fld["tags"]):
         prop["primaryKey"] = True
 
-    _add_recursive_type(prop, fld, provider, include_quality)
+    _add_canonical_type(prop, fld, provider, include_quality)
     return prop
 
 
-def _add_recursive_type(
+def _add_canonical_type(
     prop: Dict[str, Any], fld: Mapping[str, Any], provider: Optional[str], include_quality: bool
 ) -> None:
     """Add the native ODCS tree and the canonical FLUID type of a nested column.

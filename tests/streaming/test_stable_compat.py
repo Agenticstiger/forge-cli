@@ -21,6 +21,8 @@ scalar timestamps outside the streaming type model must also keep working.
 
 import copy
 
+import pytest
+
 from fluid_build.build_runners import base
 from fluid_build.providers.odcs.mappers.schema import _field_to_property
 from fluid_build.schema_manager import FluidSchemaManager
@@ -53,7 +55,7 @@ def test_stable_contract_asking_for_the_managed_lane_is_warned_not_refused(tmp_p
     contract = _stable({"flink": {"management": "operator"}})
     result = FluidSchemaManager(cache_dir=tmp_path).validate_contract(contract, offline_only=True)
     assert result.is_valid, result.errors
-    assert any("needs schema 0.7.7 or later" in w for w in result.warnings), result.warnings
+    assert any("needs fluidVersion 0.7.7 or later" in w for w in result.warnings), result.warnings
 
 
 def test_runner_reports_a_stable_flink_build_as_run_elsewhere(monkeypatch):
@@ -72,7 +74,16 @@ def test_preview_contract_is_managed_and_an_older_one_is_not(contract):
     assert managed_builds(older) == []
     assert compile_contract(older) == ()
     (warning,) = validation_warnings(older)
-    assert "needs schema 0.7.7 or later" in warning
+    assert "needs fluidVersion 0.7.7 or later" in warning
+
+
+@pytest.mark.parametrize("version", ["0.7.8", "0.8", "1.0.0", "0.7.7-rc1", "0.7.7 ", 0.8, None])
+def test_only_a_bundled_schema_with_the_lane_enables_it(contract, version):
+    # None of these was validated against a schema that has the lane, and
+    # `fluid verify` has no schema gate of its own: it would reach the cluster.
+    contract["fluidVersion"] = version
+    assert managed_builds(contract) == []
+    assert compile_contract(contract) == ()
 
 
 def test_scalar_timestamps_outside_the_streaming_model_export_as_before():

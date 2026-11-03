@@ -37,7 +37,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     from fluid_build.cli.console import cprint
     from fluid_build.cli.plan import _gate_contract_for_plan_or_apply
     from fluid_build.cli.security import validate_cli_path
-    from fluid_build.streaming.compiler import compile_contract
+    from fluid_build.streaming.compiler import compile_contract, validation_warnings
 
     source = validate_cli_path(args.contract, mode="read", file_type="contract")
     output = validate_cli_path(args.out, mode="write", must_exist=False, file_type="output")
@@ -45,11 +45,18 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     _gate_contract_for_plan_or_apply(contract, logger, command="plan")
     artifacts = compile_contract(contract)
     if not artifacts:
+        # An older contract that already set parameters.flink.management is told
+        # why its schema keeps the job external, not to opt in again.
+        reasons = validation_warnings(contract)
         raise CLIError(
             1,
             "generate_flink_external",
             {
-                "error": "No managed Flink build; opt in with properties.parameters.flink",
+                "error": (
+                    reasons[0]
+                    if reasons
+                    else "No managed Flink build; opt in with properties.parameters.flink"
+                ),
             },
         )
     output = Path(output)

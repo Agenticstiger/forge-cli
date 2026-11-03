@@ -29,21 +29,19 @@ from urllib.parse import urlsplit
 
 import jsonschema
 
-from fluid_build.errors import ValidationError
 from fluid_build.providers._iceberg_catalog import (
     catalog_kind_info,
     resolve_iceberg_catalog,
 )
 from fluid_build.providers._iceberg_catalog_auth import parse_catalog_auth
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
-from fluid_build.schema_manager import SchemaVersion
 from fluid_build.streaming.types import LogicalType, columns_sql, parse_fields
 from fluid_build.util.contract import is_externally_run_build
 
 #: The schema the managed lane arrived in. On an older contract
 #: ``parameters.flink`` stays what it was: free-form settings of a job that
 #: runs elsewhere, which forge-cli does not read.
-_MANAGED_SINCE = SchemaVersion.parse("0.7.7")
+_MANAGED_SINCE = "0.7.7"
 _NAME = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
 _TEXT = {"type": "string", "minLength": 1}
 _POSITIVE = {"type": "integer", "minimum": 1}
@@ -172,11 +170,20 @@ def managed_config(build: Mapping[str, Any]) -> Mapping[str, Any] | None:
 
 
 def managed_lane_enabled(contract: Mapping[str, Any]) -> bool:
-    """Whether the contract's schema has the managed lane (``_MANAGED_SINCE`` or later)."""
-    try:
-        return _MANAGED_SINCE <= SchemaVersion.parse(str(contract.get("fluidVersion")))
-    except ValidationError:
+    """Whether the contract declares a bundled schema that has the managed lane.
+
+    Only an exact bundled version counts. An unknown, prerelease or padded
+    ``fluidVersion`` was never checked against a schema that has the lane,
+    and ``fluid verify`` would otherwise reach the cluster for it.
+    """
+    # Local import: schema_manager imports this module lazily, so a module-level
+    # import here would make the cycle real the day either side stops deferring.
+    from fluid_build.schema_manager import FluidSchemaManager, SchemaVersion
+
+    version = contract.get("fluidVersion")
+    if not isinstance(version, str) or version not in FluidSchemaManager.BUNDLED_VERSIONS:
         return False
+    return SchemaVersion.parse(_MANAGED_SINCE) <= SchemaVersion.parse(version)
 
 
 def managed_builds(contract: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -564,8 +571,8 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
         flink = parameters.get("flink") if isinstance(parameters, Mapping) else None
         if isinstance(flink, Mapping) and "management" in flink:
             warnings.append(
-                f"Build {build.get('id')}: parameters.flink.management needs schema "
-                f"{_MANAGED_SINCE} or later; on {contract.get('fluidVersion')} the job "
-                "still runs outside forge-cli"
+                f"Build {build.get('id')}: parameters.flink.management needs fluidVersion "
+                f"{_MANAGED_SINCE} or later; on {contract.get('fluidVersion')} the job still "
+                "runs outside forge-cli and fluid apply does not deploy it"
             )
     return warnings
