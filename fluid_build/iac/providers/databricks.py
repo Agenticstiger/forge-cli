@@ -494,8 +494,8 @@ def _refuse_unapplied_masking(
             "governance-unmapped",
             f"{where} declares policy.privacy.masking, which only forge-cli's DuckDB "
             "acquisition runner applies, at landing, before the rows leave the machine. "
-            f"{unapplied} Applied anyway, the table would hold the values the contract "
-            "promises to mask.",
+            f"{unapplied[:1].upper()}{unapplied[1:]} Applied anyway, the table would hold the "
+            "values the contract promises to mask.",
             "Write this expose with a DuckDB acquisition build (pattern: acquisition, "
             "engine: duckdb), which masks the columns before it loads the table. Or remove "
             "policy.privacy.masking and enforce access with policy.authz.columnRestrictions, "

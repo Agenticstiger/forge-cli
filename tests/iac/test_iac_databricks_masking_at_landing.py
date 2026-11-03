@@ -163,7 +163,7 @@ def test_the_table_is_emitted_exactly_as_without_masking():
 
 def test_a_contract_with_no_build_that_writes_the_expose_is_refused():
     text = _both(_contract())
-    assert "no build" in text and "DuckDB acquisition" in text
+    assert "machine. No build writes it" in text and "DuckDB acquisition" in text
 
 
 def test_a_dbt_build_writing_the_expose_is_refused_naming_it():
