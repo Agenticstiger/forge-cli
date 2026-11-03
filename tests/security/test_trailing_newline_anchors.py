@@ -203,6 +203,23 @@ def test_prompt_profile_name_refuses_a_trailing_newline():
         _resolve_profile_dir("eu-gdpr-strict\n")
 
 
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        ("fluid_build.cli.forge_domain_enrichment", "_SAFE_DOMAIN_RE"),
+        ("fluid_build.cli._ai_setup_storage", "_DOMAIN_SLUG_RE"),
+    ],
+)
+def test_domain_slug_patterns_refuse_a_trailing_newline(module, name):
+    # Fed a stripped or on-disk value, so pinned on the pattern: their comments
+    # say they mirror the profile-name guard, and they now do.
+    import importlib
+
+    pattern = getattr(importlib.import_module(module), name)
+    assert pattern.match("finance")
+    assert pattern.match("finance\n") is None
+
+
 def test_prompt_overlay_name_refuses_a_trailing_newline():
     from fluid_build.cli.forge_prompt_overlays import PromptOverlayError, _resolve_overlay_path
 
