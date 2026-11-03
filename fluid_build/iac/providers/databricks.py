@@ -72,6 +72,10 @@ resources, with no new schema field (fluid-schema 0.7.6):
   databricks``) becomes a serverless ``databricks_job`` with a ``dbt_task``, and
   a local project its ``databricks_workspace_file`` uploads
   (``databricks_jobs.py``).
+* ``lifecycle.expire`` is accepted on a table that is rebuilt in full on every run (a dbt
+  ``table`` model, or forge-cli's DuckDB acquisition) when ``lifecycle.retention`` covers the
+  table's Delta history, so ``VACUUM`` removes older copies; anything else is refused
+  (``databricks_retention.py``). ``fluid verify`` reads the live properties.
 * A table a dbt build writes, locally or as a job, is rebuilt by dbt's ``table``
   materialization with CREATE OR REPLACE, so the module creates it and then
   leaves its definition to dbt: ``lifecycle.ignore_changes`` on what that
@@ -156,6 +160,7 @@ from .databricks_jobs import (
     dbt_written_exposes,
     run_as_allowlist,
 )
+from .databricks_retention import Retention, check_expire
 
 _LOG = logging.getLogger(__name__)
 
@@ -260,6 +265,8 @@ class _Table:
     region: str = ""
     #: The column masks and row filter Unity Catalog enforces on it, if the expose has any.
     enforcement: Optional[TableEnforcement] = None
+    #: The ``lifecycle.expire`` it promises and this module accepted (``databricks_retention.py``).
+    retention: Optional[Retention] = None
 
     @property
     def full_name(self) -> str:
@@ -476,17 +483,6 @@ def _refuse_governance(
                 "Remove binding.encryption; configure customer-managed keys on the workspace.",
             )
         )
-    lifecycle = exposure.get("lifecycle") or {}
-    if isinstance(lifecycle, Mapping) and lifecycle.get("expire"):
-        refusals.append(
-            _refusal(
-                "retention-unmapped",
-                f"{where} sets lifecycle.expire, and nothing on Databricks would expire the "
-                "data.",
-                "Remove lifecycle.expire from the databricks binding, or schedule the delete "
-                "in a build.",
-            )
-        )
 
 
 def _refuse_shape(
@@ -672,6 +668,7 @@ def _resolve_table(
     exposure: Mapping[str, Any],
     refusals: List[UnsupportedBindingError],
     *,
+    contract: Mapping[str, Any],
     validating: bool,
 ) -> Optional[_Table]:
     """One Databricks expose → :class:`_Table`, or ``None`` with its refusals."""
@@ -687,6 +684,10 @@ def _resolve_table(
     partitions = _partitions(where, loc, columns, refusals, validating=validating)
     region = _region(where, loc, refusals)
     _refuse_governance(where, binding, exposure, refusals)
+    retention, retention_refusals = check_expire(
+        where, exposure, names.get("table") or "", contract, validating=validating
+    )
+    refusals.extend(retention_refusals)
     enforcement: Optional[TableEnforcement] = None
     if len(refusals) == before:
         try:
@@ -716,6 +717,7 @@ def _resolve_table(
         exposure=exposure,
         region=region,
         enforcement=enforcement,
+        retention=retention,
     )
 
 
@@ -1033,7 +1035,7 @@ def _compile(
     if _set(contract.get("packaging")):
         refusals.append(_packaging_refusal("the contract"))
 
-    targets = _resolve_tables(compiled, exposures, validating=validating)
+    targets = _resolve_tables(compiled, exposures, contract, validating=validating)
     warehouse = _warehouse(env, refusals)
     _refuse_duplicate_tables(compiled.tables, refusals)
     _refuse_region_conflict(compiled.tables, refusals)
@@ -1072,12 +1074,18 @@ def _compile(
 
 
 def _resolve_tables(
-    compiled: _Compiled, exposures: Sequence[Tuple[int, Mapping[str, Any]]], *, validating: bool
+    compiled: _Compiled,
+    exposures: Sequence[Tuple[int, Mapping[str, Any]]],
+    contract: Mapping[str, Any],
+    *,
+    validating: bool,
 ) -> List[_GrantTarget]:
     """Resolve each Databricks expose into ``compiled.tables``; a grant target for every one."""
     targets: List[_GrantTarget] = []
     for index, exposure in exposures:
-        table = _resolve_table(index, exposure, compiled.refusals, validating=validating)
+        table = _resolve_table(
+            index, exposure, compiled.refusals, contract=contract, validating=validating
+        )
         if table is not None:
             compiled.tables.append(table)
         targets.append(
@@ -2084,6 +2092,10 @@ class ManagedTable:
     #: The whole expectation, with each function's definition: what ``fluid verify`` checks
     #: a bound function's owner, body, parameters and return type against.
     enforcement: Optional[TableEnforcement] = None
+    #: The accepted ``lifecycle.expire``: its retention as written and in seconds, which the
+    #: table's Delta history must not exceed. ``None`` when the expose sets no expire.
+    retention_period: Optional[str] = None
+    retention_seconds: Optional[int] = None
 
 
 def managed_objects(
@@ -2129,6 +2141,8 @@ def managed_objects(
                 for mask in (table.enforcement.masks if table.enforcement else ())
             ),
             enforcement=table.enforcement,
+            retention_period=table.retention.period if table.retention else None,
+            retention_seconds=table.retention.seconds if table.retention else None,
         )
         for table in compiled.tables
     ]
