@@ -364,6 +364,46 @@ class TestDbtTable:
         _refused(_compile(_contract(), tmp_path), "not-selected")
 
 
+class TestEnvironmentPlaceholders:
+    """``fluid validate`` reads the contract before ``{{ env.X }}`` is substituted; the emitter
+    after. A placeholder is left to the emitter, never refused for its own text."""
+
+    def _check(self, contract, table="orders"):
+        return ret.check_expire(
+            "exposes[0]", contract["exposes"][0], table, contract, validating=True
+        )
+
+    def test_a_placeholder_table_name_is_left_to_the_emitter(self, tmp_path):
+        _project(tmp_path, "{{ config(materialized='table') }}\nselect 1 as id\n")
+        with contract_source(tmp_path / "contract.fluid.yaml"):
+            retention, refusals = self._check(_contract(), table="{{ env.tbl }}")
+        assert refusals == [] and retention is not None
+
+    def test_a_placeholder_retention_is_left_to_the_emitter_and_promises_nothing(self):
+        contract = _contract(
+            builds=[_acquisition()],
+            exposes__0__lifecycle={"retention": "{{ env.RETENTION }}", "expire": True},
+        )
+        assert self._check(contract) == (None, [])
+
+    def test_a_placeholder_source_mode_is_left_to_the_emitter(self):
+        assert self._check(_contract(builds=[_acquisition("{{ env.MODE }}")]))[1] == []
+
+    def test_the_emitter_still_refuses_the_value_once_substituted(self):
+        contract = _contract(builds=[_acquisition("incremental_append")])
+        _refused(_compile(contract), "incremental")
+
+    def test_a_retention_of_hours_names_a_whole_day_count_that_covers_it(self, tmp_path):
+        _project(
+            tmp_path,
+            "{{ config(materialized='table', tblproperties="
+            "{'delta.logRetentionDuration': 'interval 721 hours'}) }}\nselect 1 as id\n",
+        )
+        contract = _contract(exposes__0__lifecycle={"retention": "P30D", "expire": True})
+        refusal = _refused(_compile(contract, tmp_path), "too-short")
+        assert "at least P31D" in " ".join(refusal.remediation)
+
+
 class TestJinjaScan:
     """``sql_config`` reads a model's tags in linear time: a model file is the dbt author's,
     but CI runs ``fluid validate`` on a pull request's."""
@@ -542,6 +582,9 @@ class TestSelection:
             {"select": "shop.marts.orders"},
             {"select": "shop.marts"},
             {"select": "shop.*"},
+            {"select": "shop"},  # the project's name selects its every node
+            {"select": "marts"},  # dbt matches the fqn without the project's name too
+            {"select": "marts.orders"},
             {"select": "ord*"},
             {"select": "*"},
             {"select": "path:models/marts"},

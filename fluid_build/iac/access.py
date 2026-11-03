@@ -203,7 +203,9 @@ def _from_access_policy(contract: Mapping[str, Any]) -> Tuple[AccessGrant, ...]:
         if not split:
             continue
         principal, principal_type = split
-        resources = tuple(str(r) for r in (entry.get("resources") or ()) if str(r).strip())
+        # A blank entry is kept: dropped, it would leave an empty list, which means every
+        # expose; kept, ``parse_grant_scope`` reports it as unevaluable.
+        resources = tuple(str(r) for r in (entry.get("resources") or ()))
         grants.append(
             AccessGrant(
                 principal=principal,

@@ -1329,3 +1329,13 @@ def test_the_native_simple_apply_never_takes_the_platform():
         _simple_apply_provider(contract, _LOG)
     assert exc.value.event == "apply_platform_unsupported"
     assert "exposes[0].binding.platform: databricks" in exc.value.context["error"]
+
+
+@pytest.mark.parametrize(
+    "value", [{1: "a", "b": "c"}, {__import__("datetime").date(2024, 1, 1): "x"}]
+)
+def test_a_contract_json_cannot_key_reuses_no_pause_decision(value):
+    contract = _contract()
+    contract["metadata"] = {"free_form": value}
+    assert dbx._contract_key(contract) is None
+    IAC_PLUGINS["databricks"].emit(contract)  # no TypeError from the key

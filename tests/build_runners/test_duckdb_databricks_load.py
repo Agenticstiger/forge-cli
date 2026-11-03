@@ -359,6 +359,17 @@ def test_a_load_that_reports_no_count_is_counted_in_the_table(fake, tmp_path):
     assert any("COUNT" in s.upper() for s in fake.sql_log)
 
 
+def test_a_count_that_fails_after_the_load_says_the_load_ran(fake, tmp_path):
+    fake.insert_reports_count = False
+    fake.fail_on("COUNT(", "[INTERNAL_ERROR] no count")
+    with pytest.raises(load.DatabricksLoadError) as exc:
+        _load(_landing(fake), _parquet(tmp_path))
+    text = str(exc.value)
+    assert f"loaded {TABLE}, but counting its rows afterwards failed" in text
+    assert "loading" not in text.split("but")[0]
+    assert fake.volume_files() == []
+
+
 def test_a_staged_file_that_cannot_be_deleted_fails_the_run_naming_it(fake, tmp_path):
     fake.fail_route("DELETE", r"/fs/files/", 403, "no permission to delete")
     with pytest.raises(load.DatabricksLoadError) as exc:
@@ -401,6 +412,8 @@ def _volume_file(
 
 
 _OLD = load.STALE_STAGING_SECONDS + 60
+#: A run id as the acquisition runner makes one (``generate_run_id``).
+EARLIER_RUN = "01" + "0" * 15 + "Z"
 
 
 def test_the_load_reads_the_uploaded_file_not_the_run_directory(fake, tmp_path):
@@ -458,8 +471,8 @@ def test_an_interrupted_statement_is_cancelled_on_the_warehouse():
 
 
 def test_staged_files_an_earlier_killed_run_left_are_deleted_first(fake, tmp_path):
-    stale = f"{VOLUME}/bronze_subs/ingest/run-0"
-    other_build = f"{VOLUME}/bronze_subs/other/run-0"
+    stale = f"{VOLUME}/bronze_subs/ingest/{EARLIER_RUN}"
+    other_build = f"{VOLUME}/bronze_subs/other/{EARLIER_RUN}"
     _volume_file(fake, f"{stale}/subs.parquet", b"left by a run that was killed", age_seconds=_OLD)
     _volume_file(fake, f"{other_build}/subs.parquet", b"another build's run", age_seconds=_OLD)
 
@@ -472,7 +485,7 @@ def test_staged_files_an_earlier_killed_run_left_are_deleted_first(fake, tmp_pat
 
 def test_a_recent_run_of_the_same_build_keeps_its_staged_files(fake, tmp_path):
     # another run of this build, uploaded a minute ago, may still be loading
-    running = f"{VOLUME}/bronze_subs/ingest/run-0"
+    running = f"{VOLUME}/bronze_subs/ingest/{EARLIER_RUN}"
     _volume_file(fake, f"{running}/subs.parquet", b"in flight", age_seconds=60)
 
     facts = _load(_landing(fake), _parquet(tmp_path), run_id="run-1")
@@ -481,10 +494,30 @@ def test_a_recent_run_of_the_same_build_keeps_its_staged_files(fake, tmp_path):
     assert fake.volume_files() == [f"{running}/subs.parquet"]
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "{volume}/bronze_subs/ingest/2024/part-0.parquet",  # not a run directory's name
+        "{volume}/bronze_subs/ingest/{run}/notes.txt",  # not what a load stages
+        "{volume}/bronze_subs/ingest/{run}/nested/part-0.parquet",  # a subdirectory
+    ],
+)
+def test_the_sweep_leaves_what_a_load_did_not_stage(fake, tmp_path, path):
+    planted = path.format(volume=VOLUME, run=EARLIER_RUN)
+    _volume_file(fake, planted, b"someone else's data", age_seconds=_OLD)
+
+    facts = _load(_landing(fake), _parquet(tmp_path), run_id="run-1")
+
+    assert facts["earlier_runs_staging_deleted"] == []
+    assert fake.volume_files() == [planted]
+
+
 def test_a_stale_run_that_cannot_be_deleted_does_not_stop_the_load(fake, tmp_path):
-    stale = f"{VOLUME}/bronze_subs/ingest/run-0"
+    stale = f"{VOLUME}/bronze_subs/ingest/{EARLIER_RUN}"
     _volume_file(fake, f"{stale}/subs.parquet", b"left behind", age_seconds=_OLD)
-    fake.fail_route("DELETE", r"/fs/files/Volumes/.*/ingest/run-0/", 403, "PERMISSION_DENIED")
+    fake.fail_route(
+        "DELETE", rf"/fs/files/Volumes/.*/ingest/{EARLIER_RUN}/", 403, "PERMISSION_DENIED"
+    )
     facts = _load(_landing(fake), _parquet(tmp_path), run_id="run-1")
     assert facts["earlier_runs_staging_deleted"] == []
     assert fake.volume_files() == [f"{stale}/subs.parquet"]

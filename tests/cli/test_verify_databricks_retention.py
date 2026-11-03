@@ -250,3 +250,14 @@ def test_a_table_served_without_properties_is_a_warning_that_says_the_defaults_w
     assert dim["status"] == "warn", dim
     assert "no table properties" in dim["warnings"][0]
     assert "SHOW TBLPROPERTIES" in dim["fix"]
+
+
+def test_verify_reads_the_contract_as_apply_does_with_its_placeholders_substituted(
+    workspace, monkeypatch
+):
+    monkeypatch.setenv("FLUID_TEST_RETENTION", "P365D")
+    contract = _contract("{{ env.FLUID_TEST_RETENTION }}")
+    workspace.extras = {"effective_predictive_optimization_flag": {"value": "ENABLE"}}
+    dim = _dimension(_verify(workspace, contract))
+    assert dim["status"] == "pass", dim
+    assert dim["retention"] == "P365D"

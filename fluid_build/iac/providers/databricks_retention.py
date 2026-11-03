@@ -62,6 +62,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+from ...util.binding_paths import ENV_PLACEHOLDER_RE
 from ...util.contract import builds_writing_expose, is_duckdb_acquisition_build
 from ..base import UnsupportedBindingError
 from ..source import current_contract_source
@@ -534,13 +535,14 @@ def _part_selects(part: str, model: DbtModel) -> Optional[bool]:
             fnmatch.fnmatchcase(h, w) for h, w in zip(have.parts, wanted.parts, strict=False)
         )
     else:
+        # dbt's fqn method: the model's own name, or a prefix of its fully qualified name,
+        # with or without the project's name in front (``shop``, ``marts``, ``marts.orders``)
         wanted_parts = value.split(".")
-        if len(wanted_parts) == 1:
-            hit = fnmatch.fnmatchcase(model.name, value)
-        else:
-            hit = len(wanted_parts) <= len(model.fqn) and all(
-                fnmatch.fnmatchcase(h, w) for h, w in zip(model.fqn, wanted_parts, strict=False)
-            )
+        hit = (len(wanted_parts) == 1 and fnmatch.fnmatchcase(model.name, value)) or any(
+            len(wanted_parts) <= len(fqn)
+            and all(fnmatch.fnmatchcase(h, w) for h, w in zip(fqn, wanted_parts, strict=False))
+            for fqn in (model.fqn, model.fqn[1:])
+        )
     if hit:
         return True
     return None if operators else False
@@ -586,11 +588,20 @@ def _fix_materialized() -> str:
     return "Declare materialized='table' on the model ({{ config(materialized='table') }})."
 
 
+def _templated(value: Any) -> bool:
+    """Whether ``value`` still holds an ``{{ env.X }}`` placeholder: ``fluid validate`` reads
+    the contract before the environment is substituted, the emitter after."""
+    return isinstance(value, str) and ENV_PLACEHOLDER_RE.search(value) is not None
+
+
 def _dbt_model(
     build: Mapping[str, Any], table: str, where: str, validating: bool
 ) -> Tuple[Optional[DbtModel], Optional[UnsupportedBindingError]]:
     """The dbt model of ``build`` for ``table``; ``(None, None)`` when ``validating`` with
-    no contract file to find the project from, as the job emitter does."""
+    no contract file to find the project from, as the job emitter does, or with a table
+    name that is still an environment placeholder (the emitter resolves it)."""
+    if validating and _templated(table):
+        return None, None
     label = f"{where}: build {build.get('id')!r}"
     repository = str(build.get("repository") or "").strip()
     if "://" in repository or repository.startswith("git@"):
@@ -661,17 +672,18 @@ def _selection_refusal(
 
 
 def _acquisition_mode_refusal(
-    build: Mapping[str, Any], label: str
+    build: Mapping[str, Any], label: str, validating: bool = False
 ) -> Optional[UnsupportedBindingError]:
     """A refusal unless the DuckDB acquisition's ``properties.source.mode`` is one the
-    Databricks landing runs as a full overwrite of the table."""
+    Databricks landing runs as a full overwrite of the table (an environment placeholder
+    is left to the emitter, which reads it substituted)."""
     from ...build_runners._databricks_load import LOAD_MODES
 
     properties = build.get("properties")
     source = properties.get("source") if isinstance(properties, Mapping) else None
     mode = source.get("mode") if isinstance(source, Mapping) else None
     mode = getattr(mode, "value", mode)
-    if mode in LOAD_MODES:
+    if mode in LOAD_MODES or (validating and _templated(mode)):
         return None
     fix = (
         f"Set properties.source.mode to {LOAD_MODES[0]!r} (the landing overwrites the whole "
@@ -712,7 +724,9 @@ def check_expire(
     refusals: List[UnsupportedBindingError] = []
     period = lifecycle.get("retention")
     seconds: Optional[int] = None
-    if not period:
+    if validating and _templated(period):
+        pass  # the emitter checks it once the environment is substituted
+    elif not period:
         refusals.append(
             _refusal(
                 "period",
@@ -754,7 +768,7 @@ def check_expire(
             # whole table, and only in the modes the landing accepts (it refuses any other
             # before the build runs); acceptance rests on both. If the landing ever appends,
             # this must refuse.
-            refusal = _acquisition_mode_refusal(build, label)
+            refusal = _acquisition_mode_refusal(build, label, validating)
             if refusal is not None:
                 refusals.append(refusal)
             continue
@@ -827,13 +841,17 @@ def check_expire(
                 f"{_shown(DELETED_FILE_RETENTION, DEFAULT_DELETED_FILE_SECONDS)}). VACUUM keeps "
                 "old data files that long, so a copy older than the retention would remain. "
                 "forge-cli does not shorten the history yet.",
-                f"Set lifecycle.retention to at least P{effective // DAY}D, or remove "
+                f"Set lifecycle.retention to at least P{-(-effective // DAY)}D, or remove "
                 "lifecycle.expire.",
             )
         )
     if refusals:
         return None, refusals
-    return Retention(period=str(period), seconds=int(seconds or 0)), []
+    if seconds is None:
+        # validating with a placeholder retention: nothing to promise yet; the emitter
+        # reads it substituted
+        return None, []
+    return Retention(period=str(period), seconds=seconds), []
 
 
 __all__ = [

@@ -1119,8 +1119,8 @@ def _lock(
                 result.revoked.append(statement)
                 say(f"      revoked: {statement}")
     restricted = {p.lower() for p in enforcement.restricted}
-    for held_by in (owner, me):
-        if held_by and held_by.lower() in restricted:
+    for held_by in dict.fromkeys(h for h in (owner, me) if h):  # once when the run owns it
+        if held_by.lower() in restricted:
             what = "owns" if held_by == owner else "is the identity of this run, and has"
             result.still_open.append(
                 f"{held_by} {what} {table} and the contract restricts it; an owner reads its "

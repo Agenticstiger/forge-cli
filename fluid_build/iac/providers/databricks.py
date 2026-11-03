@@ -138,6 +138,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ...providers._sql_safety import validate_ident, validate_sql_type_param_payload
+from ...util.binding_paths import ENV_PLACEHOLDER_RE
 from ...util.contract import (
     builds_writing_expose,
     is_databricks_job_build,
@@ -507,6 +508,62 @@ def _refuse_unapplied_masking(
     )
 
 
+def _refuse_unlandable(
+    where: str,
+    exposure: Mapping[str, Any],
+    builds: Sequence[Mapping[str, Any]],
+    refusals: List[UnsupportedBindingError],
+) -> None:
+    """What the DuckDB acquisition runner would refuse at run time for this expose, refused
+    here: by then ``fluid apply`` has created the table. Its source mode and sink format
+    (``build_runners/_databricks_load.unsupported_reason``) and, when it masks at landing,
+    each masking rule (``build_runners/_masking.masking_rules``). A value that is still an
+    ``{{ env.X }}`` placeholder (``fluid validate`` reads the contract unsubstituted) is
+    left to the emitter, which reads it substituted."""
+    from ...build_runners._databricks_load import unsupported_reason
+    from ...build_runners._masking import MaskingPolicyError, masking_rules
+
+    writers = [
+        b
+        for b in builds_writing_expose(exposure.get("exposeId"), builds)
+        if is_duckdb_acquisition_build(b)
+    ]
+    for build in writers:
+        properties = build.get("properties")
+        properties = properties if isinstance(properties, Mapping) else {}
+        source = properties.get("source")
+        sink = properties.get("sink")
+        mode = source.get("mode") if isinstance(source, Mapping) else None
+        sink_format = (sink.get("format") if isinstance(sink, Mapping) else None) or "parquet"
+        if any(isinstance(v, str) and ENV_PLACEHOLDER_RE.search(v) for v in (mode, sink_format)):
+            continue
+        reason = unsupported_reason(str(mode or ""), str(sink_format).lower(), 1)
+        if reason:
+            refusals.append(
+                _refusal(
+                    "landing-unsupported",
+                    f"{where}: build {build.get('id')!r} lands this expose with forge-cli's "
+                    f"DuckDB acquisition runner, and {reason}. The build would be refused at "
+                    "run time, after fluid apply had created the table.",
+                    "Set properties.source.mode: full_refresh and properties.sink.format: "
+                    "parquet on the build (one stream), or write the expose another way.",
+                )
+            )
+    if writers and not masking_unapplied_reason(exposure, builds):
+        try:
+            masking_rules(exposure)
+        except MaskingPolicyError as exc:
+            refusals.append(
+                _refusal(
+                    "masking-invalid",
+                    f"{where} policy.privacy.masking: {exc} The DuckDB acquisition runner "
+                    "would refuse to land anything.",
+                    "Correct the rule as the message says, or remove it from "
+                    "policy.privacy.masking.",
+                )
+            )
+
+
 def _refuse_governance(
     where: str,
     binding: Mapping[str, Any],
@@ -519,6 +576,7 @@ def _refuse_governance(
     authz = (policy.get("authz") or {}) if isinstance(policy, Mapping) else {}
     privacy = (policy.get("privacy") or {}) if isinstance(policy, Mapping) else {}
     _refuse_unapplied_masking(where, exposure, builds, refusals)
+    _refuse_unlandable(where, exposure, builds, refusals)
     unmapped = [
         name
         for name, value in (
@@ -1867,7 +1925,7 @@ class DatabricksIacPlugin:
         notices = _use_catalog_notices(compiled)
         decided = getattr(self, "_pause_decision", None)
         self._pause_decision = None  # used once: the next run decides again
-        if decided is not None and decided[0] == _contract_key(contract):
+        if decided is not None and decided[0] is not None and decided[0] == _contract_key(contract):
             paused = list(decided[1])
         else:
             paused = [(j.name, t) for j, t in _jobs_to_pause(compiled, contract)]
@@ -1993,9 +2051,14 @@ class DatabricksIacPlugin:
         return out
 
 
-def _contract_key(contract: Mapping[str, Any]) -> str:
-    """A stable text of the contract, to tie a decision to the contract it was made for."""
-    return json.dumps(contract, sort_keys=True, default=str)
+def _contract_key(contract: Mapping[str, Any]) -> Optional[str]:
+    """A stable text of the contract, to tie a decision to the contract it was made for;
+    ``None`` for one JSON cannot write (mixed-type or date keys, a cycle), and then no
+    decision is ever reused for it: :meth:`plan_notices` works it out again."""
+    try:
+        return json.dumps(contract, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return None
 
 
 def _jobs_to_pause(

@@ -54,7 +54,14 @@ def _build(
     pattern: Optional[str] = "acquisition",
     outputs: Optional[List[str]] = ("orders",),
 ) -> Dict[str, Any]:
-    build: Dict[str, Any] = {"id": build_id, "engine": engine}
+    build: Dict[str, Any] = {
+        "id": build_id,
+        "engine": engine,
+        "properties": {
+            "source": {"kind": "filesystem", "mode": "full_refresh"},
+            "sink": {"format": "parquet"},
+        },
+    }
     if pattern:
         build["pattern"] = pattern
     if outputs is not None:
@@ -236,3 +243,41 @@ def test_row_level_policy_beside_accepted_masking_is_still_refused_alone():
 @pytest.mark.parametrize("masking", [None, [], {}])
 def test_an_empty_masking_block_is_not_masking(masking):
     assert _both(_contract(masking=masking)) is None
+
+
+@pytest.mark.parametrize(
+    "source, sink, fragment",
+    [
+        ({"mode": "incremental_append"}, {"format": "parquet"}, "full_refresh"),
+        ({"mode": "full_refresh"}, {"format": "csv"}, "sink format"),
+        ({}, {"format": "parquet"}, "modes"),
+    ],
+)
+def test_a_landing_the_runner_would_refuse_is_refused_before_the_table_exists(
+    source, sink, fragment
+):
+    build = _build()
+    build["properties"] = {"source": {"kind": "filesystem", **source}, "sink": sink}
+    refusal = _emit(_contract(build))
+    assert refusal is not None and refusal.kind == "databricks-landing-unsupported"
+    assert fragment in str(refusal) and "'ingest'" in str(refusal)
+
+
+def test_a_placeholder_mode_is_left_to_the_emitter():
+    build = _build()
+    build["properties"]["source"]["mode"] = "{{ env.MODE }}"
+    errors, _ = dbx.validate_databricks_binding(_contract(build))
+    assert not [e for e in errors if "landing" in e]
+
+
+@pytest.mark.parametrize(
+    "masking",
+    [
+        [{"column": "msisdn", "strategy": "k_anonymity"}],
+        [{"column": "msisdn", "strategy": "no-such-strategy"}],
+        {"column": "msisdn", "strategy": "hash"},
+    ],
+)
+def test_a_masking_rule_the_runner_cannot_apply_is_refused(masking):
+    refusal = _emit(_contract(_build(), masking=masking))
+    assert refusal is not None and refusal.kind == "databricks-masking-invalid"

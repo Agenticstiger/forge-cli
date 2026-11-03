@@ -43,7 +43,9 @@ The table is the IaC's: a missing table is an error that names ``fluid apply``, 
 creates or alters one. The volume is named by ``DATABRICKS_STAGING_VOLUME``
 (``/Volumes/<catalog>/<schema>/<volume>``), from the environment only, like
 ``DATABRICKS_WAREHOUSE_ID``: a contract that named a path could aim the upload anywhere the
-credential reaches. The client and the statement runner are the ones that enforce masks and row
+credential reaches. Give the staging a volume of its own: the sweep of earlier runs deletes only
+directories named like a run id that hold nothing but old Parquet files, but it runs under the
+deploy credential. The client and the statement runner are the ones that enforce masks and row
 filters (``iac/providers/databricks_enforce.py``), on the same pinned credential; no message carries
 a credential.
 
@@ -224,16 +226,27 @@ def insert_overwrite_statement(target: LoadTarget, source: str) -> str:
     )
 
 
+#: A run directory's name: the acquisition runner's run id (``01`` + 16 Crockford base32
+#: characters, ``_acquisition_common.generate_run_id``). The sweep touches nothing else.
+_RUN_DIR_RE = re.compile(r"01[0-9A-HJKMNP-TV-Z]{16}")
+
+
 def _stale_files(listed: Any, run_dir: str, cutoff_ms: float) -> Optional[List[str]]:
-    """The files of an earlier run's directory listing, when every one was last modified
-    before ``cutoff_ms`` (epoch milliseconds, as the Files API reports ``last_modified``);
-    ``None`` when any is newer or carries no date."""
+    """The files of an earlier run's directory listing, when it looks like what a load stages
+    (Parquet files only, no subdirectory) and every file was last modified before
+    ``cutoff_ms`` (epoch milliseconds, as the Files API reports ``last_modified``); ``None``
+    otherwise: a file that is newer, undated or not Parquet, a subdirectory, or an empty
+    directory (a run that has made it and is still uploading)."""
     files: List[str] = []
+    if not listed:
+        return None
     for entry in listed:
         entry = _mapping(entry)
         path = str(entry.get("path") or "")
         if entry.get("is_directory") or not path.startswith(run_dir + "/"):
-            continue
+            return None
+        if not path.endswith(".parquet"):
+            return None
         try:
             modified = float(entry.get("last_modified"))
         except (TypeError, ValueError):
@@ -319,14 +332,18 @@ class Landing:
         full = self.target.full_name
         try:
             doc = self._sql.execute(insert_overwrite_statement(self.target, remote))
-            reported = _rows_reported(doc)
-            if reported is None:
-                # A full refresh leaves exactly the file's rows, so the table's count is the load's.
-                return self._count(full), "count_after_load"
         except StatementFailed as exc:
             raise DatabricksLoadError(f"loading {full} failed: {exc}") from exc
-        loaded, rows_from = reported
-        return loaded, rows_from
+        reported = _rows_reported(doc)
+        if reported is not None:
+            return reported
+        # A full refresh leaves exactly the file's rows, so the table's count is the load's.
+        try:
+            return self._count(full), "count_after_load"
+        except StatementFailed as exc:
+            raise DatabricksLoadError(
+                f"loaded {full}, but counting its rows afterwards failed: {exc}"
+            ) from exc
 
     def _delete(self, prefix: str, remote: str) -> List[str]:
         """Delete the staged file and its directory; what could not be deleted, named."""
@@ -382,8 +399,9 @@ class Landing:
             run_dir = str(_mapping(run).get("path") or "").rstrip("/")
             if not _mapping(run).get("is_directory") or run_dir == current:
                 continue
-            if not run_dir.startswith(build_dir + "/") or "/" in run_dir[len(build_dir) + 1 :]:
-                continue  # only a direct child of this build's directory
+            name = run_dir[len(build_dir) + 1 :]
+            if not run_dir.startswith(build_dir + "/") or not _RUN_DIR_RE.fullmatch(name):
+                continue  # only a run directory, directly in this build's directory
             try:
                 listed = self._list_dir(run_dir)
                 files = _stale_files(listed, run_dir, cutoff_ms)

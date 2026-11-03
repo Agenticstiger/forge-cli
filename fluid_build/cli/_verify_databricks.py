@@ -74,6 +74,7 @@ Every failure is a result, never a traceback, and no message carries a token.
 
 from __future__ import annotations
 
+import copy
 import os
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import quote
@@ -903,11 +904,15 @@ def verify_databricks_expose(
     gives one (an external pipeline owns its creation).
     ``client_factory()`` defaults to ``WorkspaceClient(**sdk_config(os.environ))``.
     """
+    from fluid_build.cli._common import resolve_env_templates_in_contract
     from fluid_build.iac.base import UnsupportedBindingError
     from fluid_build.iac.providers.databricks import managed_objects
 
     try:
-        tables, jobs = managed_objects(contract, os.environ)
+        # What fluid apply provisions, from the contract as apply reads it: with its
+        # ``{{ env.X }}`` placeholders substituted.
+        resolved = resolve_env_templates_in_contract(copy.deepcopy(dict(contract or {})))
+        tables, jobs = managed_objects(resolved, os.environ)
     except UnsupportedBindingError as exc:
         return _error(f"{exc} ({exc.kind})", remediation=tuple(exc.remediation))
     except Exception as exc:  # noqa: BLE001 — the emitter's refusal is the result

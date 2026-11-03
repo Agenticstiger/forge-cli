@@ -142,6 +142,8 @@ def test_an_expose_id_the_contract_does_not_have_is_refused():
         "$.exposes[?(@.exposeId=='orders' || @.exposeId=='refunds')]",
         "$.exposes[?(@.exposeId=='orders')].contract",
         "orders",
+        "",
+        "   ",
     ],
 )
 def test_a_jsonpath_the_emitter_cannot_evaluate_is_refused(resource):
