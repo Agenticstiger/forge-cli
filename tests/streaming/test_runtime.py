@@ -280,7 +280,12 @@ def test_catalog_auth_is_resolved_locally_and_sent_only_as_headers(
             "resource": "warehouse",
         }
         monkeypatch.setenv("CATALOG_CREDENTIAL", "synthetic-client:synthetic-secret")
-        monkeypatch.setenv(SECRET_REF_ALLOWLIST_ENV, "CATALOG_CREDENTIAL@identity.example")
+        # The credential goes to the identity provider and the token minted from it
+        # to the catalog, so the operator pairs the variable with both hosts.
+        monkeypatch.setenv(
+            SECRET_REF_ALLOWLIST_ENV,
+            "CATALOG_CREDENTIAL@identity.example,CATALOG_CREDENTIAL@catalog.example",
+        )
     (artifact,) = compile_contract(contract)
     calls = []
 

@@ -48,16 +48,28 @@ in the shell or CI that runs fluid; a project `.env` is ignored for them:
 ```bash
 export FLUID_FLINK_KUBE_CONTEXT_ALLOWLIST=development
 export FLUID_FLINK_NAMESPACE_ALLOWLIST=data-products
-export FLUID_FLINK_IMAGE_ALLOWLIST=registry.example.com/forge-flink   # or a prefix ending in /
+export FLUID_FLINK_IMAGE_ALLOWLIST=forge-flink   # the image without :tag and @sha256:
 export FLUID_FLINK_SERVICE_ACCOUNT_ALLOWLIST=data-products/flink
 export FLUID_FLINK_SECRET_ALLOWLIST=data-products/flink-storage
 ```
 
-`fluid verify` also calls the catalog. A public catalog host needs an entry in
+Once the image is in your registry, list its repository instead, such as
+`registry.example.com/forge-flink`, or `registry.example.com/` for everything
+under it. A prefix must end in `/`.
+
+`fluid apply` and `fluid verify` also check where the catalog credential goes:
+the catalog, an OAuth2 token endpoint and any `s3.endpoint` in
+`catalogProperties`. A public host needs an entry in
 `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST`, and a link-local host is always
-refused. A `catalogAuth` token variable needs `NAME@host` in
-`FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, for example
-`LAKEKEEPER_TOKEN@catalog.example.com`, before fluid reads it.
+refused. A `catalogAuth` variable needs `NAME@host` in
+`FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` for each host that receives it, before
+fluid reads it: `LAKEKEEPER_TOKEN@catalog.example.com` for a bearer token. An
+OAuth2 credential needs two entries, one for the token endpoint and one for the
+catalog, which receives the token minted from it. A private or loopback host
+needs no host entry, and a loopback host needs no `NAME@host` entry either.
+
+Checkpoint, savepoint, HA and warehouse locations are not on these lists. Scope
+them with the permissions of the credentials in the allowed Secrets.
 
 This fixture proves task recovery and nested-value fidelity. It does not certify
 Kubernetes deployment, savepoint upgrades, job-manager failover or production HA.

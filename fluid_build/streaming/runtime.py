@@ -29,12 +29,10 @@ from urllib.parse import quote
 import httpx
 
 from fluid_build.providers._iceberg_catalog import resolve_iceberg_catalog
-from fluid_build.providers._iceberg_catalog_auth import parse_catalog_auth
 from fluid_build.streaming.compiler import FlinkArtifacts, compile_contract, managed_config
 from fluid_build.streaming.policy import (
     catalog_request_guard,
-    refuse_unless_catalog_host_allowed,
-    refuse_unless_catalog_secret_allowed,
+    refuse_unless_catalog_targets_allowed,
     refuse_unless_deployment_allowed,
 )
 from fluid_build.streaming.types import LogicalType
@@ -197,6 +195,13 @@ def reconcile(
         client = _client(build)
         desired = artifact.resources[1]
         name = desired["metadata"]["name"]
+        # The deployed job's CREATE CATALOG sends its token from the pod, so its
+        # destinations clear the same policy as verify's before anything deploys.
+        refuse_unless_catalog_targets_allowed(
+            managed_config(build) or {},
+            _catalog_uri(contract, artifact),
+            s3_endpoint=desired["spec"]["flinkConfiguration"].get("s3.endpoint"),
+        )
         if dry_run:
             pending.append((artifact, client, None))
             continue
@@ -358,24 +363,28 @@ def _oauth2_access_token(auth: Any, credential: str) -> str:
 def _catalog_headers(cfg: Mapping[str, Any], catalog_uri: str) -> dict[str, str]:
     """The catalog request's auth header, once the operator's policy allows each step.
 
-    The contract names the token endpoint and the variable, so both clear the
-    policy before the variable is read.
+    The contract names the catalog, the token endpoint and the variable, so all
+    of them clear the policy before the variable is read.
     """
-    auth, errors = parse_catalog_auth(cfg.get("catalogAuth"))
-    if errors:
-        raise StreamingError("; ".join(errors))
+    try:
+        auth = refuse_unless_catalog_targets_allowed(cfg, catalog_uri)
+    except ValueError as exc:  # a malformed catalogAuth, as parse_catalog_auth words it
+        raise StreamingError(str(exc)) from exc
     if not auth:
         return {}
-    oauth2 = auth.type == "oauth2"
-    if oauth2:
-        refuse_unless_catalog_host_allowed(auth.oauth2_server_uri, role="OAuth2 token endpoint")
-    refuse_unless_catalog_secret_allowed(
-        auth.env_var, auth.oauth2_server_uri if oauth2 else catalog_uri
-    )
     token = os.environ.get(auth.env_var)
     if not token:
         raise StreamingError("Catalog token variable must be set for CLI verification")
+    oauth2 = auth.type == "oauth2"
     return {"Authorization": f"Bearer {_oauth2_access_token(auth, token) if oauth2 else token}"}
+
+
+def _catalog_uri(contract: Mapping[str, Any], artifact: FlinkArtifacts) -> str:
+    target = next(e for e in contract["exposes"] if e["exposeId"] == artifact.expose_id)
+    resolved = resolve_iceberg_catalog(target["binding"])
+    if not resolved.uri:
+        raise StreamingError("REST catalog URI is required")
+    return str(resolved.uri)
 
 
 def catalog_evidence(
@@ -390,8 +399,6 @@ def catalog_evidence(
     resolved = resolve_iceberg_catalog(target["binding"])
     if not resolved.uri:
         raise StreamingError("REST catalog URI is required")
-    # The contract names the catalog too: it clears the policy before any request.
-    refuse_unless_catalog_host_allowed(resolved.uri, role="catalog")
     headers = _catalog_headers(cfg, resolved.uri)
     with safe_httpx_client(
         base_url=resolved.uri.rstrip("/") + "/",
@@ -399,7 +406,7 @@ def catalog_evidence(
         allow_private=True,
         require_https=bool(headers),
         timeout=30,
-        event_hooks={"request": [catalog_request_guard(resolved.uri, role="catalog")]},
+        event_hooks={"request": [catalog_request_guard(resolved.uri, role="Iceberg catalog")]},
     ) as client:
         config = client.get("v1/config", params={"warehouse": resolved.warehouse})
         config.raise_for_status()

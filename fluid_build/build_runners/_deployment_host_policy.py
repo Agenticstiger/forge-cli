@@ -77,7 +77,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, List, Mapping, Optional
+from typing import Any, Callable, List, Literal, Mapping, Optional
 from urllib.parse import urlsplit
 
 from fluid_build._errors import FluidUserError, doc_url
@@ -127,18 +127,22 @@ def _on_allowlist(host: str, suffixes: List[str]) -> bool:
     return False
 
 
+VerdictCode = Literal["missing", "scheme", "no-host", "link-local", "mixed", "public"]
+
+
 @dataclass(frozen=True)
 class HostVerdict:
     """Why the policy refuses a URL, without wording.
 
-    ``code`` is ``missing``, ``scheme``, ``no-host``, ``link-local``, ``mixed``
-    or ``public``. Each caller phrases it for its own case, so the decision has
-    one home and only the message differs.
+    Each caller phrases ``code`` for its own case, so the decision has one home
+    and only the message differs. ``pinned`` is the address a request was
+    pinned to, when that address and not the name decided.
     """
 
-    code: str
+    code: VerdictCode
     host: Optional[str] = None
     scheme: str = ""
+    pinned: Optional[str] = None
 
 
 def host_verdict(
@@ -154,14 +158,14 @@ def host_verdict(
     """
     if not url or not str(url).strip():
         return HostVerdict("missing")
-    parts = urlsplit(str(url).strip())
+    try:
+        parts = urlsplit(str(url).strip())
+        host = parts.hostname
+    except ValueError:  # an unbalanced "[" in the netloc: no host can be read from it
+        return HostVerdict("no-host")
     scheme = (parts.scheme or "").lower()
     if scheme not in _ALLOWED_SCHEMES:
         return HostVerdict("scheme", scheme=scheme)
-    try:
-        host = parts.hostname
-    except ValueError:
-        host = None
     if not host:
         return HostVerdict("no-host", scheme=scheme)
     # First, and not overridable: this is where instance metadata lives, and no
@@ -187,6 +191,39 @@ def host_verdict(
         # request_guard closes.
         return None
     return HostVerdict("public", host, scheme)
+
+
+def pinned_verdict(
+    url: Optional[str],
+    pinned: Optional[str],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    operator_supplied: bool = False,
+) -> Optional[HostVerdict]:
+    """The decision for the address a request is actually pinned to.
+
+    A request hook added to ``safe_httpx_client`` runs after its pinning hook,
+    which has replaced the hostname with the IP the connection will use.
+    Judging that IP closes two gaps that resolving the name again leaves open:
+    DNS rebinding between the two lookups, and a parser differential, where
+    ``socket.getaddrinfo`` encodes ``faß.de`` as IDNA2003 ``fass.de`` while
+    httpx resolves IDNA2008 ``xn--fa-hia.de``. The name ``url`` carries still
+    decides the allowlist; the pinned address decides the scope. A refusal
+    names both, because the name is what an allowlist entry would list.
+    """
+    if not pinned:
+        return HostVerdict("no-host")
+    try:
+        host = urlsplit(str(url or "").strip()).hostname
+    except ValueError:
+        host = None
+    if _hostname_is_link_local(pinned):
+        return HostVerdict("link-local", host or pinned, pinned=pinned)
+    if operator_supplied or (host and _on_allowlist(host, allowlist(environ))):
+        return None
+    if hostname_scope(pinned) == "non_public":
+        return None
+    return HostVerdict("public", host or pinned, pinned=pinned)
 
 
 def host_refusal(
