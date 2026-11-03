@@ -612,7 +612,6 @@ jobs:
       # The wheel above is installed with no extras. Gate its cold-import cost
       # (a module-count ceiling on build_parser()) and prove the offline
       # pipeline stages run on that bare install, from a neutral directory.
-      # Same script as release.yml's post-build smoke.
       - name: Bare-install smoke (module ceiling + offline pipeline)
         run: bash scripts/ci/bare_install_smoke.sh /tmp/smoke examples/aws-s3-glue-athena/contract.fluid.yaml
 

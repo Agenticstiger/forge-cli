@@ -302,11 +302,6 @@ jobs:
           test -f release-smoke/contract.fluid.yaml || { echo "::error::scaffold failed"; exit 1; }
           echo "Release smoke test passed"
 
-          # Bare wheel (no extras): module-count ceiling + offline pipeline
-          # stages. Same script as ci.yml's build-check.
-          cd "$GITHUB_WORKSPACE"
-          bash scripts/ci/bare_install_smoke.sh /tmp/test-install examples/aws-s3-glue-athena/contract.fluid.yaml
-
       - name: Generate CycloneDX SBOM
         # SBOM of exactly what the released wheel installs (the isolated
         # venv built above). Shipped as a release artifact for supply-chain

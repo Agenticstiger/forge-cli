@@ -15,8 +15,8 @@
 
 # Smoke a BARE wheel install (no extras): the cold import cost of
 # build_parser(), then the offline pipeline stages on an example contract.
-# Shared by ci.yml (build-check) and release.yml (post-build smoke) so the two
-# cannot drift.
+# Called from ci.yml (build-check). Not from release.yml: its build job holds
+# id-token and attestations write, and a tag's commit has already passed this.
 #
 #   scripts/ci/bare_install_smoke.sh <venv-dir> <contract.fluid.yaml>
 #
