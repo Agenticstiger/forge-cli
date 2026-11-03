@@ -254,9 +254,10 @@ for row in rows:
         row["attributes"] = dict(row["attributes"])
 assert sorted(rows, key=lambda x: x["event_id"]) == sorted(expected, key=lambda x: x["event_id"])
 print("PASS: 200 unique records; five nested structs, nulls, empty containers, exact decimals; task recovery")
-""".replace(
-            "EXPECTED_EVENTS", repr(json.dumps(events + more))
-        )
+"""
+        # A separate statement: black 24 (ci.yml) and black 26 (the dev extra)
+        # disagree on how to wrap a call made on a triple-quoted string.
+        readback = readback.replace("EXPECTED_EVENTS", repr(json.dumps(events + more)))
         network = project + "_default"
         result = subprocess.run(
             [
