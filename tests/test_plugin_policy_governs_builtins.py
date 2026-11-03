@@ -128,17 +128,17 @@ class TestBlocklistGovernsBuiltInProviders:
         assert not registry.POLICY_BLOCKED
 
     def test_a_provider_registered_at_import_stays_blocked_through_rediscovery(self, monkeypatch):
-        """redshift registers when the aws package is imported, and a cached
-        module is not imported again: forgetting every record at the start of a
-        rediscovery reported a blocked redshift as no provider at all."""
-        monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "redshift")
-        registry.register_provider("redshift", object, logger=LOG)  # as at import
-        assert "redshift" in registry.POLICY_BLOCKED
+        """aws registers when its package is imported, and a cached module is
+        not imported again: forgetting every record at the start of a
+        rediscovery reported a blocked aws as no provider at all."""
+        monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "aws")
+        registry.register_provider("aws", object, logger=LOG)  # as at import
+        assert "aws" in registry.POLICY_BLOCKED
         _rediscover()
-        assert "redshift" in registry.POLICY_BLOCKED
+        assert "aws" in registry.POLICY_BLOCKED
         monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST")
         _rediscover()
-        assert "redshift" not in registry.POLICY_BLOCKED  # allowed again, forgotten
+        assert "aws" not in registry.POLICY_BLOCKED  # allowed again, forgotten
 
     def test_allowlist_excludes_unlisted_builtins(self, monkeypatch):
         """An allowlist means "only these load" — the built-ins were silently

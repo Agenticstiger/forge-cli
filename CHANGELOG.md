@@ -132,6 +132,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid diff --baseline` reported nothing for column changes in a 0.7.x contract.** It read
+  columns from `exposes[].schema`, but a 0.7.x contract keeps them in `exposes[].contract.schema`
+  (as does every `fluid init` template), so a removed column, a type change or a new NOT NULL
+  column was missed, `--fail-on-breaking` exited 0, and the `fluid forge --refine` preview said
+  "No changes vs the existing contract." It now reads `contract.schema` when `schema` is absent,
+  and a column is NOT NULL when `required` is true or `nullable` is `false`, for an added column
+  and for a change in nullability (a flat `schema` column that says only `required: true` was
+  nullable before). Contracts that used to diff clean can now report breaking changes (a removed
+  column, a type change that is not a widening, an added `required: true` column), so a pipeline
+  that runs `fluid diff --baseline --fail-on-breaking` can start exiting 1. A finding for a 0.7.x
+  column is reported at `exposes[N].contract.schema.<column>`, and a nullability one at its
+  `.required`. Still not compared in a 0.7.x contract: quality-rule severity and a column's
+  `sensitivity`. A 0.7.x primary key is not recognised either, so a key column that becomes
+  nullable is reported as non-breaking.
+
 - **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
   `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the
   diagnostic (the summary, the resource address and the provider's detail) and says that OpenTofu
@@ -152,53 +167,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pip install fluid-build[...]`; they now name `data-product-forge` with the right extra, and a
   ratchet test keeps the wrong name out. `data-product-forge[mcp]` resolves as an empty alias.
   `fluid-build` on PyPI is now only an alias that installs `data-product-forge`.
-- **An AWS contract's schedule was dropped without a word, and the one it got was not labelled.**
-  The workflow Lambda was named `fluid-workflow-<id>` raw, so a dotted id (the schema's own
-  example is `gold.hr.employee_360_v1`, and 27 of 28 examples use dots) or one over about 49
-  characters failed the plan validator, and `native_actions` swallowed the refusal at DEBUG:
-  `fluid generate iac` and `fluid apply` logged "Planned EventBridge schedule", wrote the Glue and
-  S3 resources and no `aws_lambda_function`, `aws_lambda_permission` or `aws_scheduler_schedule`,
-  exit 0. Every name the schedule planner derives from an id (Lambda functions, permission
-  statement ids, the schedule, event rules, the state machine, the MWAA environment) now goes
-  through one helper that replaces what the service refuses with `-` and, when it had to change
-  the name at all (a replacement, or a cut to the service limit), ends it in a hash of the whole
-  id, so `a.b` and `a-b` cannot share one Lambda and two long ids stay apart; a name the service
-  already accepts is left as written, so nothing deployed is renamed. A plan its own validator
-  rejects, an orchestration task the planner rejects and a schedule-planner failure are a typed
-  `PlanValidationError`, matched by type through the cause chain like a sovereignty refusal:
-  `generate iac` exits non-zero and `apply` raises, where a planner that could not run (no SDK,
-  no credentials) stays best-effort. This holds for every AWS plan-validator refusal, so a
-  contract with no schedule that the validator refuses (a bad Glue name, say) now fails
-  `generate iac` and `apply` too, where it used to emit the module without a word (`fluid plan`
-  already refused it). The scheduled Lambda only logs each
-  task and runs no build, and both roles it names (`fluid-workflow-execution`,
-  `EventBridgeSchedulerRole`) are never created, so every plan that emits it now warns
-  `schedule_placeholder_lambda`. When no AWS account can be resolved (no `AWS_ACCOUNT_ID`, no
-  credentials for `sts:GetCallerIdentity`), a contract that declares orchestration (a schedule,
-  triggers or tasks) is refused by name, before any name is derived from it, rather than as a Glue
-  or S3 name `None-fluid-staging` the validator would reject, and the message says so when the
-  cause is a missing boto3 (`pip install 'data-product-forge[aws]'`) rather than credentials. A
-  contract without orchestration needs no native plan and applies its exposes as before; the
-  sovereignty check still runs first either way.
-- **The AWS plan validator refused dotted S3 bucket names.** S3 allows lowercase letters, digits,
-  dots and hyphens (3-63 characters, a letter or digit at each end, no `..`, `.-` or `-.`, not
-  shaped like an IP address); the validator allowed no dot, which was harmless while its refusals
-  were swallowed and is not now that they stop `generate iac` and `apply`.
-- **A contract value could run as code in the AWS workflow Lambda.** The schedule planner spliced
-  task params and the contract id into the Lambda's Python source inside quote marks, so a task
-  param such as `'''+__import__('os').system('id')+'''` (the schema accepts any task params)
-  closed the literal and ran on every schedule tick under `fluid-workflow-execution`, and an id
-  with a trailing newline left a Lambda that was a SyntaxError. Every value now reaches the
-  source as a `repr()` literal.
-- **The same AWS contract could emit a different module from one run to the next.** The AWS
-  planner ordered its actions through a `set`, so the order changed with Python's hash seed, and
-  with it the emitted module: a Lambda permission, schedule target, event-source mapping or S3
-  notification named the function by literal ARN in one run and by
-  `${aws_lambda_function.<name>.arn}` in the next (the reference only when the function happened
-  to be planned first), so tofu sometimes had no ordering edge to the function. Actions now keep
-  the order they were planned in. Measured on 21 AWS contracts: modules without a Lambda are
-  byte-identical to before; scheduled ones now always emit the reference.
-
+- **Two applies on the same S3 state could race.** The S3 backend was emitted without locking, so a
+  scheduled apply and a manual one (or an apply and a teardown) wrote the same state unguarded.
+  `tofu init` now gets `-backend-config=use_lockfile=true` for an S3 backend on OpenTofu 1.10 or
+  newer; the emitted module is unchanged. On an older OpenTofu a WARNING says the state is
+  unlocked. Upgrade note: `tofu plan` takes the lock too, so every role that runs plan,
+  `fluid apply --dry-run`, `fluid diff` or `fluid verify --state-drift` against S3 state needs
+  `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `<key>.tflock`, or sets
+  `FLUID_TOFU_S3_LOCKFILE=0`. A workdir kept from before the upgrade is re-initialised with
+  `-reconfigure` once, only when it recorded this same bucket, key and region. The opt-out also takes effect on a
+  workdir that already had locking on. A run killed hard can leave `<key>.tflock` behind;
+  `tofu force-unlock <ID>` in the workdir (the ID is in tofu's error) clears it. A run that
+  hits `FLUID_TOFU_TIMEOUT_SECONDS` is now interrupted (SIGINT) so tofu releases the lock, and
+  killed only if it ignores that for 30 seconds.
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
   never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
   sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP
@@ -248,6 +229,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dimension that reads the workspace's metastore summary for every table the module manages: it
   passes when the region matches the declaration, fails with the fix when it does not, and is
   skipped when the contract declares none.
+- **An AWS contract's schedule was dropped without a word, and the one it got was not labelled.**
+  The workflow Lambda was named `fluid-workflow-<id>` raw, so a dotted id (the schema's own
+  example is `gold.hr.employee_360_v1`, and 27 of 28 examples use dots) or one over about 49
+  characters failed the plan validator, and `native_actions` swallowed the refusal at DEBUG:
+  `fluid generate iac` and `fluid apply` logged "Planned EventBridge schedule", wrote the Glue and
+  S3 resources and no `aws_lambda_function`, `aws_lambda_permission` or `aws_scheduler_schedule`,
+  exit 0. Every name the schedule planner derives from an id (Lambda functions, permission
+  statement ids, the schedule, event rules, the state machine, the MWAA environment) now goes
+  through one helper that replaces what the service refuses with `-` and, when it had to change
+  the name at all (a replacement, or a cut to the service limit), ends it in a hash of the whole
+  id, so `a.b` and `a-b` cannot share one Lambda and two long ids stay apart; a name the service
+  already accepts is left as written, so nothing deployed is renamed. A plan its own validator
+  rejects, an orchestration task the planner rejects and a schedule-planner failure are a typed
+  `PlanValidationError`, matched by type through the cause chain like a sovereignty refusal:
+  `generate iac` exits non-zero and `apply` raises, where a planner that could not run (no SDK,
+  no credentials) stays best-effort. This holds for every AWS plan-validator refusal, so a
+  contract with no schedule that the validator refuses (a bad Glue name, say) now fails
+  `generate iac` and `apply` too, where it used to emit the module without a word (`fluid plan`
+  already refused it). The scheduled Lambda only logs each
+  task and runs no build, and both roles it names (`fluid-workflow-execution`,
+  `EventBridgeSchedulerRole`) are never created, so every plan that emits it now warns
+  `schedule_placeholder_lambda`. When no AWS account can be resolved (no `AWS_ACCOUNT_ID`, no
+  credentials for `sts:GetCallerIdentity`), a contract that declares orchestration (a schedule,
+  triggers or tasks) is refused by name, before any name is derived from it, rather than as a Glue
+  or S3 name `None-fluid-staging` the validator would reject, and the message says so when the
+  cause is a missing boto3 (`pip install 'data-product-forge[aws]'`) rather than credentials. A
+  contract without orchestration needs no native plan and applies its exposes as before; the
+  sovereignty check still runs first either way.
+- **The AWS plan validator refused dotted S3 bucket names.** S3 allows lowercase letters, digits,
+  dots and hyphens (3-63 characters, a letter or digit at each end, no `..`, `.-` or `-.`, not
+  shaped like an IP address); the validator allowed no dot, which was harmless while its refusals
+  were swallowed and is not now that they stop `generate iac` and `apply`.
+- **A contract value could run as code in the AWS workflow Lambda.** The schedule planner spliced
+  task params and the contract id into the Lambda's Python source inside quote marks, so a task
+  param such as `'''+__import__('os').system('id')+'''` (the schema accepts any task params)
+  closed the literal and ran on every schedule tick under `fluid-workflow-execution`, and an id
+  with a trailing newline left a Lambda that was a SyntaxError. Every value now reaches the
+  source as a `repr()` literal.
+- **The same AWS contract could emit a different module from one run to the next.** The AWS
+  planner ordered its actions through a `set`, so the order changed with Python's hash seed, and
+  with it the emitted module: a Lambda permission, schedule target, event-source mapping or S3
+  notification named the function by literal ARN in one run and by
+  `${aws_lambda_function.<name>.arn}` in the next (the reference only when the function happened
+  to be planned first), so tofu sometimes had no ordering edge to the function. Actions now keep
+  the order they were planned in. Measured on 21 AWS contracts: modules without a Lambda are
+  byte-identical to before; scheduled ones now always emit the reference.
+
+### Removed
+
+- **`redshift` and `datamesh-manager` are no longer providers.** Neither deployed anything as a
+  provider: `redshift` only forwarded to `aws`, and Data Mesh Manager is a catalog. `fluid providers` now lists `aws`, `databricks`, `gcp`, `local` and `snowflake`, plus any
+  third-party plugin. Redshift objects apply through the `aws` provider, and Data Mesh Manager
+  publishing is unchanged (`fluid publish --target datamesh-manager`, `fluid datamesh-manager`).
+  **Breaking (CLI surface):** `--provider redshift` and `--provider datamesh-manager` (and
+  `FLUID_PROVIDER`) are no longer accepted; they exit 2 with the replacement
+  (`--provider aws`, or `fluid publish --target datamesh-manager`) instead of a bare "unknown
+  provider". A contract's `redshift` build runtime or expose platform is served by `aws`, and plugins
+  cannot claim either retired name.
 
 ### Security
 
