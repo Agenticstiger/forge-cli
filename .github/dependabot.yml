@@ -19,3 +19,11 @@ updates:
       prefix: "chore(ci)"
     labels:
       - ci
+    groups:
+      # Dependabot treats codeql-action's init, analyze and upload-sarif as
+      # separate dependencies and bumps each in its own PR. CodeQL fails any
+      # run whose steps are on different versions ("Loaded a configuration
+      # file for version X, but running version Y"), so they move together.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"

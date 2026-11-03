@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -56,6 +57,7 @@ from fluid_build.iac.state_migration import (
     records_backend,
 )
 from fluid_build.iac.state_migration import reconcile_state_key as _reconcile_state
+from fluid_build.observability.secret_redactor import redact_secret_text
 
 from ._apply_cc_report import current_report
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
@@ -291,9 +293,15 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
         _enforce_data_loss_gate(args, logger, provider, changes, data_changes, lost_in_place)
 
         if dry_run:
+            _enforce_access(plugin, "pre_apply", contract, dry_run=True)
             cprint("\ndry-run: plan only — not applying.")
             info(logger, "opentofu_apply_dry_run", provider=provider, **changes)
             return 0
+        # Access enforcement the cloud keeps outside OpenTofu (Unity Catalog column masks
+        # and row filters) goes onto the tables that already exist BEFORE the apply, so a
+        # grant the apply adds lands on a protected table. A failure stops the run here:
+        # nothing has been applied.
+        _enforce_access(plugin, "pre_apply", contract)
         imported.keep()
 
     # ``fluid apply`` is the headline state-changing command, so a receiver
@@ -305,11 +313,14 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
     with _apply_lineage(contract, provider=provider, planned=changes) as record:
         apply_result = runner.tofu_apply(str(workdir), env=env)
         if not apply_result.ok:
-            raise CLIError(
-                1,
-                "opentofu_apply_failed",
-                {"error": _tail(apply_result.stderr or apply_result.stdout)},
+            # A table the failed apply created, its grants and the job that fills it can all
+            # exist with no mask or filter: bind what exists (never drop) before failing.
+            _enforce_after_failed_apply(plugin, contract)
+            logger.debug(
+                "opentofu apply raw output tail: %s",
+                _tail(apply_result.stderr or apply_result.stdout),
             )
+            raise _apply_failure(apply_result, str(workdir))
         applied = runner.change_summary(apply_result)
         record(applied)
 
@@ -319,8 +330,64 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
             planned=changes, applied=applied, resources=_module_addresses(module), dry_run=False
         )
 
+    # The tables this apply created exist now, empty, and get their masks and row filter here.
+    # A dbt job that writes one was created paused in this same apply (the plugin's ``emit``
+    # reads the live bindings), and the next apply starts it once they are in place, so no
+    # build fills a table first. A table that cannot be bound is closed to the principals it
+    # restricts (a deny-all row filter, else revoked), and the run fails.
+    _enforce_access(plugin, "post_apply", contract)
+
     info(logger, "opentofu_apply_ok", provider=provider, **applied)
     return 0
+
+
+def _enforce_access(
+    plugin: Any, hook: str, contract: Mapping[str, Any], *, dry_run: bool = False
+) -> None:
+    """Run a plugin's ``pre_apply`` / ``post_apply`` access-enforcement hook, if it has one.
+
+    Optional plugin capability, discovered like ``plan_notices``: the Databricks plugin
+    binds Unity Catalog column masks and row filters, which the provider cannot manage
+    (``iac/providers/databricks_enforce.py``). Unlike the advisory hooks this one gates: a
+    refusal or failure is a typed error and the run exits non-zero. With ``dry_run`` the
+    plugin prints the statements and runs none.
+    """
+    run = getattr(plugin, hook, None)
+    if not callable(run):
+        return
+    try:
+        if dry_run:
+            run(contract, say=cprint, dry_run=True)
+        else:
+            run(contract, say=cprint)
+    except UnsupportedBindingError as exc:
+        raise CLIError(
+            1,
+            "opentofu_access_enforcement_failed",
+            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+        ) from exc
+
+
+def _enforce_after_failed_apply(plugin: Any, contract: Mapping[str, Any]) -> None:
+    """Best effort, bind-only ``post_apply`` for a ``tofu apply`` that failed part way.
+
+    A failure here is printed, never raised: the error the run exits with is the apply's own
+    (``opentofu_apply_failed``). The plugin binds what exists, revokes ``SELECT`` where it
+    cannot, skips tables that do not exist and drops nothing (``after_failed_apply``).
+    """
+    run = getattr(plugin, "post_apply", None)
+    if not callable(run):
+        return
+    cprint(
+        "\n  tofu apply failed part way: binding the masks and row filter on the tables that "
+        "exist before the run stops (no mask or filter is dropped)."
+    )
+    try:
+        run(contract, say=cprint, after_failed_apply=True)
+    except UnsupportedBindingError as exc:
+        cprint(f"  access enforcement after the failed apply: {exc} {' '.join(exc.remediation)}")
+    except Exception as exc:  # noqa: BLE001 — the apply's own error is what the run raises
+        cprint(f"  access enforcement after the failed apply could not run: {type(exc).__name__}")
 
 
 def _applied_env(args) -> Optional[str]:
@@ -1072,7 +1139,17 @@ def _plan_failure(
     explained = _explained_failure(plugin, contract, output, workdir, env)
     if explained is not None:
         return explained
-    return CLIError(1, "opentofu_plan_failed", {"error": _tail(plan.stderr or plan.stdout)})
+    err = CLIError(
+        1,
+        "opentofu_plan_failed",
+        {"error": _tail(redact_secret_text(plan.stderr or plan.stdout or ""))},
+    )
+    if _mentions_state_lock(output):
+        err.suggestions = list(err.suggestions) + [
+            "The state is locked: wait for the other run, or clear a stale lock with "
+            f"'tofu force-unlock <id>' in {shlex.quote(workdir)}"
+        ]
+    return err
 
 
 def _guard_region_move(
@@ -1465,6 +1542,70 @@ def _data_loss_blocked(changes: Mapping[str, int], allow_data_loss: bool) -> boo
 
 def _tail(text: str, limit: int = 800) -> str:
     return (text or "")[-limit:]
+
+
+def _diagnostics(events: Any) -> List[Mapping[str, Any]]:
+    """The error diagnostics in a ``tofu -json`` stream, in the order printed."""
+    found: List[Mapping[str, Any]] = []
+    for event in events or []:
+        diag = event.get("diagnostic") if isinstance(event, Mapping) else None
+        if isinstance(diag, Mapping) and diag.get("severity", "error") == "error":
+            found.append(diag)
+    return found
+
+
+def _mentions_state_lock(text: str) -> bool:
+    """True when tofu says the state lock is the problem.
+
+    Matched on the phrases tofu prints ("Error acquiring the state lock",
+    "Error locking state"), never on a bare "lock", which "block" contains.
+    """
+    low = text.lower()
+    return "state lock" in low or "locking state" in low
+
+
+def _apply_failure(result: Any, workdir: str) -> CLIError:
+    """The error for a failed ``tofu apply``: what failed, on which resource, and the way on.
+
+    ``-json`` puts every diagnostic on stdout as one JSON line, so the raw tail
+    was a run of ``{"@level":...}`` objects. The diagnostics are read back into
+    a summary, the resource address and the provider's detail; output that holds
+    none (a crash, a timeout) falls back to the first ``Error:``, else the exit
+    code. Tofu records state as it goes, so what was created before the failure
+    is normally tracked and a re-run converges: the suggestions say so.
+    """
+    diagnostics = _diagnostics(getattr(result, "events", None))
+    context: Dict[str, Any] = {}
+    locked = False
+    if diagnostics:
+        first = diagnostics[0]
+        # Redacted before it is cut: a credential split at the limit (a URL that lost
+        # its ``@``) matches no pattern.
+        address = redact_secret_text(str(first.get("address") or "").strip())
+        detail = redact_secret_text(str(first.get("detail") or "").strip())
+        summary = redact_secret_text(str(first.get("summary") or "").strip()) or "tofu apply failed"
+        context["error"] = summary + (f" ({address})" if address else "")
+        if address:
+            context["resource"] = address
+        if detail:
+            context["detail"] = detail[:800]
+        if len(diagnostics) > 1:
+            context["more_errors"] = len(diagnostics) - 1
+        locked = _mentions_state_lock(summary + " " + detail)
+    else:
+        output = result.stderr or result.stdout or ""
+        context["error"] = (
+            _first_error(redact_secret_text(output), 800)
+            if "Error:" in output
+            else f"tofu apply exited {getattr(result, 'returncode', 1)}"
+        )
+        locked = _mentions_state_lock(output)
+    err = CLIError(1, "opentofu_apply_failed", context)
+    hints = [f"To see what exists, run 'tofu state list' in {shlex.quote(workdir)}"]
+    if locked:
+        hints.append("The state is locked: wait for the other run, or 'tofu force-unlock <id>'")
+    err.suggestions = list(err.suggestions) + hints
+    return err
 
 
 def _first_error(text: str, limit: int = 400) -> str:

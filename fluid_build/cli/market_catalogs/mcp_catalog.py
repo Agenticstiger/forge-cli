@@ -505,7 +505,7 @@ class McpCatalogConnector(BaseCatalogConnector):
             from mcp import ClientSessionGroup
         except ImportError as exc:  # pragma: no cover - mcp is a core dep
             raise RuntimeError(
-                "MCP discovery requires the 'mcp' SDK (pip install 'fluid-build')."
+                "MCP discovery requires the 'mcp' SDK (pip install 'data-product-forge[mcp]')."
             ) from exc
 
         params = self._build_server_params()

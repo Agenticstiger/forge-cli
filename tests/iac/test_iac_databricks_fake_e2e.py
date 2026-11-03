@@ -34,8 +34,17 @@ schema and the table: apply creates them, a second plan is empty, removing a lab
 only its assignment without ``--allow-data-loss``, and an assignment already in the workspace
 (state lost, or set by hand) is adopted, not a failed create.
 
+A contract's column restrictions and row filters become Unity Catalog SQL functions bound on
+the table, run on the warehouse outside OpenTofu (``databricks_enforce.py``): apply binds the
+filter and masks, a second apply executes no statement, a table that already exists is bound
+before ``tofu apply`` can grant on it, a changed predicate binds a new function, a removed
+restriction is dropped, a binding that fails revokes SELECT from the restricted principals and
+fails the run (and the next apply binds first and grants again), and a failure before the apply
+stops it with nothing applied.
+
 Not proven here: what real Databricks accepts (SQL dialect, warehouse state,
-privilege names, Unity Catalog storage); that is the manual live tier.
+privilege names, Unity Catalog storage, that CREATE FUNCTION IF NOT EXISTS and SET MASK / SET
+ROW FILTER behave as the stand-in models them); that is the manual live tier.
 
 Skipped unless ``tofu`` is on PATH; ``tofu init`` needs the registry, a
 provider cache or a filesystem mirror for ``databricks/databricks``.
@@ -43,6 +52,7 @@ provider cache or a filesystem mirror for ``databricks/databricks``.
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 from typing import Iterator, List
 
@@ -526,3 +536,437 @@ def test_diff_initialises_with_the_committed_lock(workspace, fake, capfd):
     rc, out = run_fluid(capfd, "diff", path)
     assert rc == 0, out
     assert lock.read_text() == dependency_lock(IAC_PLUGINS["databricks"])
+
+
+# ── column masks and row filters ────────────────────────────────────────────
+def _sdk_missing() -> bool:
+    try:
+        return importlib.util.find_spec("databricks.sdk") is None
+    except ModuleNotFoundError:
+        return True
+
+
+requires_sdk = pytest.mark.skipif(
+    _sdk_missing(), reason="databricks-sdk (the [databricks] extra) is not installed"
+)
+
+EU = "region = 'eu'"
+
+
+def _restricted(
+    *,
+    where: str = EU,
+    deny: bool = True,
+    mask: bool = True,
+    row_filter: bool = True,
+    readers=("group:analysts", "group:bi"),
+    columns=None,
+) -> dict:
+    """``orders`` with ``amount`` denied and ``region`` masked to the analysts, who also read
+    only some rows. ``bi`` is not restricted."""
+    contract = make_contract(readers=readers, **({"columns": columns} if columns else {}))
+    authz = contract["exposes"][0]["policy"]["authz"]
+    restrictions = []
+    if deny:
+        restrictions.append(
+            {"principal": "group:analysts", "columns": ["amount"], "access": "deny"}
+        )
+    if mask:
+        restrictions.append(
+            {
+                "principal": "group:analysts",
+                "columns": ["region"],
+                "access": "mask",
+                "mask": "last_four",
+            }
+        )
+    if restrictions:
+        authz["columnRestrictions"] = restrictions
+    if row_filter:
+        authz["rowFilters"] = [{"principal": "group:analysts", "where": where}]
+    return contract
+
+
+def _live(fake: FakeDatabricks) -> dict:
+    return fake.tables[TABLE]
+
+
+def _masks(fake: FakeDatabricks) -> dict:
+    return {c["name"]: c["mask"]["function_name"] for c in _live(fake)["columns"] if c.get("mask")}
+
+
+def _brownfield(fake: FakeDatabricks) -> None:
+    fake.create_table(TABLE, LIVE_COLUMNS, properties={"delta.columnMapping.mode": "name"})
+
+
+@requires_sdk
+def test_apply_binds_the_filter_and_masks_and_a_second_apply_executes_no_statement(
+    workspace, fake, capfd
+):
+    path = write_contract(workspace, _restricted())
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    row_filter = _live(fake)["row_filter"]
+    assert row_filter["function_name"].startswith("main.sales.fluid_rf_orders_")
+    assert row_filter["input_column_names"] == ["region"]
+    assert sorted(_masks(fake)) == ["amount", "region"]
+    assert all(f in fake.functions for f in [row_filter["function_name"], *_masks(fake).values()])
+    # The table was created by this apply, so everything was bound after it, empty.
+    assert fake.grants[("table", TABLE)] == {"analysts": ["SELECT"], "bi": ["SELECT"]}
+    assert "masks and row filter" in out and fake.unknown == []
+
+    statements = len(fake.sql_log)
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert "tofu plan: +0 ~0 -0" in out
+    assert len(fake.sql_log) == statements, "a second apply executes no statement"
+    assert fake.unknown == []
+
+
+@requires_sdk
+def test_a_table_that_exists_is_bound_before_the_apply_can_grant_on_it(workspace, fake, capfd):
+    _brownfield(fake)
+    rc, out = apply_contract(capfd, write_contract(workspace, _restricted()))
+    assert rc == 0, out
+    assert "row_filter" in _live(fake) and len(_masks(fake)) == 2
+    assert fake.replaced == []
+
+    timeline = fake.timeline
+    last_bind = max(
+        i for i, (kind, what) in enumerate(timeline) if kind == "sql" and "SET " in what
+    )
+    first_grant = min(
+        i for i, (kind, what) in enumerate(timeline) if kind == "perm" and what.endswith("orders")
+    )
+    assert last_bind < first_grant, "every binding was made before the first grant on the table"
+
+
+@requires_sdk
+def test_a_dry_run_prints_the_statements_and_executes_none(workspace, fake, capfd):
+    _brownfield(fake)
+    rc, out = apply_contract(capfd, write_contract(workspace, _restricted()), "--mode", "dry-run")
+    assert rc == 0, out
+    assert "before apply: bind row filter" in out and "SET ROW FILTER" in out
+    assert "dry-run: none of these statements ran." in out and "dry-run: plan only" in out
+    assert fake.sql_log == [] and fake.functions == {} and "row_filter" not in _live(fake)
+
+
+@requires_sdk
+def test_a_changed_predicate_binds_a_new_function_and_keeps_the_old_one(workspace, fake, capfd):
+    assert apply_contract(capfd, write_contract(workspace, _restricted()))[0] == 0
+    old = _live(fake)["row_filter"]["function_name"]
+    masks = _masks(fake)
+
+    rc, out = apply_contract(capfd, write_contract(workspace, _restricted(where="region = 'uk'")))
+    assert rc == 0, out
+    new = _live(fake)["row_filter"]["function_name"]
+    assert new != old and old in fake.functions and new in fake.functions
+    assert _masks(fake) == masks
+    assert not any(s.startswith("DROP") for s in fake.sql_log)
+    assert not any("REPLACE FUNCTION" in s for s in fake.sql_log)
+
+
+@requires_sdk
+def test_a_removed_restriction_is_dropped_and_said_to_widen_access(workspace, fake, capfd):
+    assert apply_contract(capfd, write_contract(workspace, _restricted()))[0] == 0
+
+    rc, out = apply_contract(
+        capfd, write_contract(workspace, _restricted(mask=False, row_filter=False))
+    )
+    assert rc == 0, out
+    assert "access widened (no data lost, not gated): drop row filter" in out
+    assert "access widened (no data lost, not gated): drop mask" in out
+    assert "row_filter" not in _live(fake)
+    assert sorted(_masks(fake)) == ["amount"]
+
+    rc, out = apply_contract(
+        capfd, write_contract(workspace, _restricted(deny=False, mask=False, row_filter=False))
+    )
+    assert rc == 0, out
+    assert _masks(fake) == {} and "row_filter" not in _live(fake)
+    statements = len(fake.sql_log)
+    assert apply_contract(capfd, write_contract(workspace, make_contract()))[0] == 0
+    assert len(fake.sql_log) == statements
+
+
+@requires_sdk
+def test_a_failed_binding_with_no_deny_all_locks_the_table_and_the_next_apply_fixes_it(
+    workspace, fake, capfd
+):
+    path = write_contract(workspace, _restricted())
+    # Neither the real filter nor the deny-all filter can be bound.
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] warehouse stopped")
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 1, out
+    assert "opentofu_access_enforcement_failed" in out
+    assert "warehouse stopped" in out and "every grantee but its owner" in out
+    assert "revoked: REVOKE SELECT ON TABLE `main`.`sales`.`orders` FROM `analysts`" in out
+    assert fake.grants[("table", TABLE)]["analysts"] == []
+    assert fake.grants[("table", TABLE)]["bi"] == [], "revoked from every grantee but the owner"
+    assert "row_filter" not in _live(fake)
+
+    fake.failing.clear()
+    mark = len(fake.timeline)
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert "row_filter" in _live(fake) and len(_masks(fake)) == 2
+    assert fake.grants[("table", TABLE)] == {"analysts": ["SELECT"], "bi": ["SELECT"]}
+    again = fake.timeline[mark:]
+    bound = next(i for i, (k, w) in enumerate(again) if k == "sql" and "SET ROW FILTER" in w)
+    granted = next(i for i, (k, w) in enumerate(again) if k == "perm" and w.endswith("orders"))
+    assert bound < granted, "the table is bound before the grant is put back"
+
+
+@requires_sdk
+def test_a_failed_mask_leaves_a_deny_all_filter_and_every_grant_in_place_until_the_next_apply(
+    workspace, fake, capfd
+):
+    path = write_contract(workspace, _restricted())
+    fake.fail_on("SET MASK", "[INTERNAL_ERROR] warehouse stopped")
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 1, out
+    assert "A deny-all row filter (main.sales.fluid_rf_orders_deny_all_" in out
+    assert "SELECT was not revoked from anyone" in out
+    deny_all = _live(fake)["row_filter"]
+    assert deny_all["function_name"].startswith("main.sales.fluid_rf_orders_deny_all_")
+    assert deny_all["input_column_names"] == []
+    assert fake.grants[("table", TABLE)] == {"analysts": ["SELECT"], "bi": ["SELECT"]}
+    assert not any(s.startswith("REVOKE") for s in fake.sql_log)
+
+    fake.failing.clear()
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert _live(fake)["row_filter"]["function_name"].startswith("main.sales.fluid_rf_orders_")
+    assert "deny_all" not in _live(fake)["row_filter"]["function_name"]
+    assert len(_masks(fake)) == 2
+
+
+@requires_sdk
+def test_a_failure_before_the_apply_stops_it_with_nothing_applied(workspace, fake, capfd):
+    _brownfield(fake)
+    assert apply_contract(capfd, write_contract(workspace, _restricted()))[0] == 0
+    # A new reader, and a changed predicate whose function cannot be made.
+    fake.fail_on("CREATE FUNCTION", "[INSUFFICIENT_PERMISSIONS] cannot create a function")
+    contract = _restricted(
+        where="region = 'uk'", readers=("group:analysts", "group:bi", "group:new")
+    )
+
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 1, out
+    assert "opentofu_access_enforcement_failed" in out and "the apply did not run" in out
+    assert "new" not in fake.grants[("table", TABLE)], "tofu apply never ran"
+    assert not any(s.startswith("REVOKE") for s in fake.sql_log)
+    assert fake.grants[("table", TABLE)]["analysts"] == ["SELECT"]
+
+
+@requires_sdk
+def test_a_contract_with_an_invalid_predicate_is_refused_before_anything_runs(
+    workspace, fake, capfd
+):
+    contract = _restricted(where="region = 'eu'; DROP TABLE main.sales.orders")
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 1 and "databricks-row-filter-invalid" in out
+    assert fake.sql_log == [] and fake.tables == {}
+
+
+@requires_sdk
+def test_an_apply_that_fails_after_creating_the_table_still_binds_it_and_fails_with_the_apply_error(
+    workspace, fake, capfd
+):
+    # The table is created, then the grant on it fails: a later run of a job that fills the
+    # table would read it with no mask or filter if the failed apply stopped there.
+    fake.fail_route("PATCH", "/permissions/table/", message="grant refused")
+    rc, out = apply_contract(capfd, write_contract(workspace, _restricted()))
+
+    assert rc == 1, out
+    assert "opentofu_apply_failed" in out, "the run fails with the apply's own error"
+    assert "opentofu_access_enforcement_failed" not in out
+    assert TABLE in fake.tables, "the failed apply did create the table"
+    assert "row_filter" in _live(fake) and sorted(_masks(fake)) == ["amount", "region"]
+    assert "binding the masks and row filter on the tables that exist" in out
+    assert not any(s.startswith(("DROP", "REVOKE")) for s in fake.sql_log)
+
+
+@requires_sdk
+def test_an_apply_that_fails_before_creating_the_table_binds_nothing_and_says_nothing_alarming(
+    workspace, fake, capfd
+):
+    fake.fail_route("POST", "/unity-catalog/schemas", message="no schema for you")
+    rc, out = apply_contract(capfd, write_contract(workspace, _restricted()))
+
+    assert rc == 1 and "opentofu_apply_failed" in out, out
+    assert TABLE not in fake.tables and fake.sql_log == []
+    assert "not created by the failed apply" in out
+    assert "NOT REVOKED" not in out
+
+
+@requires_sdk
+def test_a_failed_apply_never_drops_a_binding_the_contract_no_longer_asks_for(
+    workspace, fake, capfd
+):
+    assert apply_contract(capfd, write_contract(workspace, _restricted()))[0] == 0
+    before = _live(fake)["row_filter"]["function_name"]
+    mark = len(fake.sql_log)
+
+    # No restriction now, and a new reader whose grant fails: dropping the filter would widen
+    # access, and waits for an apply that succeeds.
+    fake.fail_route("PATCH", "/permissions/table/", message="grant refused")
+    contract = _restricted(
+        mask=False,
+        deny=False,
+        row_filter=False,
+        readers=("group:analysts", "group:bi", "group:new"),
+    )
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 1 and "opentofu_apply_failed" in out, out
+    assert _live(fake)["row_filter"]["function_name"] == before
+    assert sorted(_masks(fake)) == ["amount", "region"]
+    assert not any(s.startswith("DROP") for s in fake.sql_log[mark:])
+    assert "access widened" not in out
+
+    fake.failing_routes.clear()
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 0, out
+    assert "row_filter" not in _live(fake) and _masks(fake) == {}, "dropped once it succeeded"
+
+
+@requires_sdk
+def test_a_function_pre_created_under_the_hashed_name_stops_the_apply_before_anything_is_applied(
+    workspace, fake, capfd
+):
+    from fluid_build.iac.providers import databricks as dbx
+
+    _brownfield(fake)
+    contract = _restricted()
+    path = write_contract(workspace, contract)
+    enforcement = (
+        dbx._compile(contract, {dbx.WAREHOUSE_ENV: fake.warehouse_id}).tables[0].enforcement
+    )
+    mask = enforcement.masks[0]
+    # Someone with CREATE FUNCTION took the name, with a body that returns the value as it is.
+    fake.add_function(
+        mask.function.full_name,
+        [("val", mask.function.params[0][1])],
+        mask.function.returns,
+        "`val`",
+    )
+
+    rc, out = apply_contract(capfd, path)
+
+    assert rc == 1, out
+    assert "opentofu_access_enforcement_failed" in out and "It was not bound" in out
+    assert "attacker@example.test" in out
+    assert mask.column not in _masks(fake), "the hostile function was never bound"
+    assert ("table", TABLE) not in fake.grants, "tofu apply never ran: nothing was granted"
+
+
+@requires_sdk
+def test_a_row_filter_set_by_hand_stops_the_apply_and_is_left_in_place(workspace, fake, capfd):
+    _brownfield(fake)
+    from fluid_build.iac.providers.databricks_enforce import SqlRunner
+
+    sql = SqlRunner(fake.client(), fake.warehouse_id)
+    theirs = "main.sales.admin_rows"
+    sql.run(
+        "CREATE FUNCTION `main`.`sales`.`admin_rows`(`region` STRING) RETURNS BOOLEAN RETURN true"
+    )
+    sql.run(
+        "ALTER TABLE `main`.`sales`.`orders` SET ROW FILTER `main`.`sales`.`admin_rows` "
+        "ON (`region`)"
+    )
+    rc, out = apply_contract(capfd, write_contract(workspace, _restricted()))
+    assert rc == 1, out
+    assert "opentofu_access_enforcement_failed" in out and "did not create" in out
+    assert theirs in out and "Nothing was changed" in out
+    assert _live(fake)["row_filter"]["function_name"] == theirs
+    assert ("table", TABLE) not in fake.grants, "tofu apply never ran"
+
+
+@requires_sdk
+def test_a_filter_needing_a_column_the_apply_adds_is_held_by_a_deny_all_filter_before_it(
+    workspace, fake, capfd
+):
+    _brownfield(fake)  # the table holds rows and has no ``channel`` column yet
+    contract = _restricted(
+        where="channel = 'web'", columns=COLUMNS + [("channel", "string", False)]
+    )
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 0, out
+    row_filter = _live(fake)["row_filter"]
+    assert row_filter["input_column_names"] == ["channel"]
+    assert "deny_all" not in row_filter["function_name"], "the real filter replaced the interim one"
+
+    timeline = fake.timeline
+    interim = next(
+        i
+        for i, (k, w) in enumerate(timeline)
+        if k == "sql" and "SET ROW FILTER" in w and "deny_all" in w
+    )
+    first_grant = min(
+        i for i, (k, w) in enumerate(timeline) if k == "perm" and w.endswith("orders")
+    )
+    add_column = next(i for i, (k, w) in enumerate(timeline) if k == "sql" and "ADD COLUMN" in w)
+    real = max(i for i, (k, w) in enumerate(timeline) if k == "sql" and "SET ROW FILTER" in w)
+    assert interim < add_column < real, "deny-all, then the new column, then the real filter"
+    assert interim < first_grant
+
+
+def test_generate_iac_refuses_a_module_a_plain_tofu_apply_would_leave_unmasked(
+    workspace, fake, capfd
+):
+    path = write_contract(workspace, _restricted())
+
+    rc, out = run_fluid(capfd, "generate", "iac", path, "--out", "iac")
+    assert rc == 1, out
+    assert "databricks-enforcement-outside-module" in out
+    assert "plain tofu apply" in out and "fluid apply" in out
+    assert not (workspace / "iac" / "main.tf.json").exists(), "no module was written"
+
+    # validate, plan and a dry-run apply are unaffected, and so is a contract without any.
+    assert run_fluid(capfd, "validate", path)[0] == 0
+    assert run_fluid(capfd, "plan", path, "--out", "plan.json")[0] == 0
+    plain = write_contract(workspace, make_contract())
+    rc, out = run_fluid(capfd, "generate", "iac", plain, "--out", "iac")
+    assert rc == 0, out
+    assert (workspace / "iac" / "main.tf.json").is_file()
+
+
+@requires_sdk
+def test_a_dbt_job_created_with_its_restricted_table_is_paused_until_the_next_apply(
+    workspace, fake, capfd
+):
+    contract = _restricted()
+    contract["builds"] = [
+        {
+            "id": "transform",
+            "engine": "dbt",
+            "pattern": "hybrid-reference",
+            "repository": "https://github.com/o/r?tag=v1",
+            "outputs": ["orders"],
+            "properties": {"model": "orders", "select": "orders+"},
+            "execution": {
+                "trigger": {"type": "schedule", "cron": "*/5 * * * *"},
+                "runtime": {"platform": "databricks"},
+            },
+        }
+    ]
+    path = write_contract(workspace, contract)
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    (job,) = fake.jobs.values()
+    assert job["settings"]["schedule"]["pause_status"] == "PAUSED"
+    assert "is created paused" in out and "run-now" in out
+    assert "row_filter" in _live(fake), "the table was bound in the same apply"
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert "tofu plan: +0 ~1 -0" in out, "only the job changes: it is unpaused"
+    (job,) = fake.jobs.values()
+    assert job["settings"]["schedule"]["pause_status"] == "UNPAUSED"
+    assert "is created paused" not in out
+
+    assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]

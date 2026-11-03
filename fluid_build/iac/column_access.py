@@ -104,8 +104,14 @@ def _where(exposure: Mapping[str, Any], index: int) -> str:
     return policy_where(exposure, index, "columnRestrictions")
 
 
-def restrictions_for(exposure: Mapping[str, Any], index: int = 0) -> Tuple[Restriction, ...]:
+def restrictions_for(
+    exposure: Mapping[str, Any], index: int = 0, *, rule_per_principal: bool = False
+) -> Tuple[Restriction, ...]:
     """The expose's column restrictions, or ``()``; a malformed one is refused.
+
+    A column has one masking rule on GCP (its policy tag's data policy) and AWS (its view),
+    so two rules for one column are refused. ``rule_per_principal`` lifts that for a platform
+    whose mask is a function that tests each principal itself (Databricks).
 
     Every column must be one the expose's schema declares: a restriction on a column
     the table does not have protects nothing, and on GCP it cannot be attached.
@@ -182,7 +188,8 @@ def restrictions_for(exposure: Mapping[str, Any], index: int = 0) -> Tuple[Restr
                 mask=mask,
             )
         )
-    _refuse_two_rules_for_a_column(out, where)
+    if not rule_per_principal:
+        _refuse_two_rules_for_a_column(out, where)
     return tuple(out)
 
 

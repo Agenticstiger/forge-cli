@@ -1121,8 +1121,7 @@ def test_g12_the_checks_look_for_the_prod_file(
 def test_g12_a_contract_tests_baseline_is_the_flat_twins_and_sees_a_column_removed_in_a_fragment(
     fx: Path, flat: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``contract-tests`` reads ``exposes[].contract.schema``: the check that does see 0.7.x
-    columns (``diff`` does not: G-13)."""
+    """``contract-tests`` reads ``exposes[].contract.schema``, as ``diff`` does (G-13)."""
     baselines = {}
     for name, contract in (("fx", fx), ("flat", flat)):
         argv = ["contract-tests", "contract.fluid.yaml", "--env", "prod"]
@@ -1172,12 +1171,6 @@ def test_g13_an_expose_the_baseline_has_and_the_ref_contract_lost_is_a_breaking_
     assert "expose 'out' removed" not in text and "added" not in text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG G13-diff-columns: fluid diff --baseline reads exposes[].schema, but a 0.7.x "
-    "contract keeps its columns in exposes[].contract.schema, so a removed column is "
-    "'No changes detected' (a flat contract too)",
-)
 def test_g13_a_column_removed_inside_the_schema_fragment_is_detected(
     fx: Path, flat: Path, capsys: pytest.CaptureFixture
 ) -> None:
@@ -1187,19 +1180,13 @@ def test_g13_a_column_removed_inside_the_schema_fragment_is_detected(
     rc, text = cli(["diff", fx, "--baseline", flat, "--fail-on-breaking"], capsys)
 
     assert rc == 1, text
-    assert "column 'label' removed" in text
+    assert _squash("column 'label' removed") in _squash(text)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG G13-diff-columns: fluid diff --baseline reads exposes[].schema, but a 0.7.x "
-    "contract keeps its columns in exposes[].contract.schema, so a removed column is "
-    "'No changes detected' (flat contract too)",
-)
 def test_g13_a_column_removed_from_a_flat_contract_is_detected_too(
     tmp_path: Path, flat: Path, capsys: pytest.CaptureFixture
 ) -> None:
-    """The same removal in the flat twin: the gap is in ``diff``, not in the refs."""
+    """The same removal in the flat twin: ``diff`` finds it whether or not the schema is a ref."""
     document = _read(flat)
     document["exposes"][0]["contract"]["schema"] = document["exposes"][0]["contract"]["schema"][:1]
     changed = _write(tmp_path / "changed" / "contract.fluid.yaml", _dump(document))
@@ -1207,7 +1194,7 @@ def test_g13_a_column_removed_from_a_flat_contract_is_detected_too(
     rc, text = cli(["diff", changed, "--baseline", flat, "--fail-on-breaking"], capsys)
 
     assert rc == 1, text
-    assert "column 'label' removed" in text
+    assert _squash("column 'label' removed") in _squash(text)
 
 
 # ── G-14 · the exports ─────────────────────────────────────────────────────
