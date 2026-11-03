@@ -1619,6 +1619,34 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                 ctx, streams_to_run, started_at, t_start, f"bigquery load: {reason}"
             )
 
+    # A Databricks binding lands the file locally, uploads it to a Unity Catalog volume and
+    # loads the table fluid apply created (see ``_databricks_load``). Everything it needs is
+    # checked before any work runs: it must never land somewhere else and succeed.
+    dbx_landing = None
+    if _is_databricks_binding(ctx):
+        from .._databricks_load import (
+            DatabricksLoadError,
+            databricks_load_target,
+            open_landing,
+        )
+        from .._databricks_load import (
+            unsupported_reason as databricks_unsupported_reason,
+        )
+
+        try:
+            expose = _build_expose(ctx) or {}
+            dbx_target = databricks_load_target(expose.get("binding") or {}, expose)
+            reason = databricks_unsupported_reason(
+                _mode_name(ctx), sink_format, len(streams_to_run)
+            )
+            if reason:
+                raise DatabricksLoadError(reason)
+            if dbx_target is None:  # unreachable: _is_databricks_binding said it is
+                raise DatabricksLoadError("the binding does not name a Databricks table")
+            dbx_landing = open_landing(dbx_target)
+        except DatabricksLoadError as exc:
+            return _refused_run(ctx, streams_to_run, started_at, t_start, f"databricks load: {exc}")
+
     stream_results: List[StreamResult] = []
     failures = 0
     records_total = 0
@@ -1870,6 +1898,34 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                     error=f"bigquery load: {type(exc).__name__}: {exc}",
                 )
 
+    # Databricks: the file is on local disk now; upload it and load the table. After the
+    # late-arrival split, so the rows loaded are the rows that stayed. A failed or short load
+    # fails the stream, and so the run and the apply. The staged files are deleted either way.
+    databricks_load: Dict[str, Any] = {}
+    if dbx_landing is not None and failures == 0 and stream_results:
+        from ...iac.providers.databricks_enforce import scrub as _scrub_dbx
+
+        for i, sr in enumerate(stream_results):
+            if sr.state is not RunState.SUCCEEDED:
+                continue
+            staged = _resolve_destination_path(ctx, sr.name, sink_format, out_dir)
+            try:
+                databricks_load = dbx_landing.load(
+                    staged,
+                    product_id=ctx.product_id,
+                    build_id=ctx.build_id,
+                    run_id=ctx.run_id,
+                    expected_rows=_count_file_rows(staged, sink_format),
+                    logger=LOG,
+                )
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                stream_results[i] = dataclasses.replace(
+                    sr,
+                    state=RunState.FAILED,
+                    error=f"databricks load: {type(exc).__name__}: {_scrub_dbx(exc)}",
+                )
+
     # ``onError: fail`` mode — when ANY bad rows landed in the DLQ,
     # promote the run to FAILED so the run record reflects the issue.
     # The DLQ records are still on disk (audit trail intact); the
@@ -1907,6 +1963,8 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
         facets["pii_findings"] = pii_findings
     if bigquery_load:
         facets["bigquery_load"] = bigquery_load
+    if databricks_load:
+        facets["databricks_load"] = databricks_load
     rows_from = "write" if counted_at_write else "source_count"
     if any(split.get("late") for split in late_arrival_split_results.values()):
         # The split moved rows out of the file the COPY wrote.
@@ -1951,11 +2009,15 @@ def _resolve_destination_path(
     ``_object_store_uri``. For local paths, behavior is unchanged:
     relative paths are rooted under ``ctx.workdir`` and parent
     directories are created. A BigQuery binding is not a file destination:
-    the file is staged locally for the load job, see ``_bigquery_target``.
+    the file is staged locally for the load job, see ``_bigquery_target``. A
+    Databricks binding is not one either: its file is staged locally, uploaded to
+    a volume and loaded into the table, see ``_databricks_staging_path``.
     """
     bq = _bigquery_target(ctx)
     if bq is not None:
         return str(_bigquery_staging_path(ctx, bq, sink_format))
+    if _is_databricks_binding(ctx):
+        return str(_databricks_staging_path(ctx, stream, sink_format))
     expose = _build_expose(ctx)
     if expose is not None:
         binding = expose.get("binding", {}) or {}
@@ -2166,9 +2228,10 @@ def _binding_destination_uri(ctx: RunContext) -> Optional[str]:
     no secret, so the COPY reached S3 unauthenticated and came back 403.
 
     None for a BigQuery binding too: its file is staged locally and loaded by a
-    job, so the ``gs://`` path it may carry is never written to.
+    job, so the ``gs://`` path it may carry is never written to; and for a
+    Databricks binding, whose file is staged locally and uploaded to a volume.
     """
-    if _bigquery_target(ctx) is not None:
+    if _bigquery_target(ctx) is not None or _is_databricks_binding(ctx):
         return None
     expose = _build_expose(ctx)
     if expose is None:
@@ -2217,6 +2280,33 @@ def _bigquery_staging_path(ctx: RunContext, target: Dict[str, Any], sink_format:
     ext = _FILE_FORMAT_EXT.get((sink_format or "parquet").lower(), sink_format)
     build = _path_part(getattr(ctx, "build_id", None) or "build")
     path = Path(ctx.workdir) / ".fluid" / "staging" / build / f"{_path_part(target['table'])}.{ext}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _is_databricks_binding(ctx: RunContext) -> bool:
+    """True when the expose this build writes is bound to Databricks.
+
+    Its ``location.path`` (and ``out/``) are never written: the rows land in the table.
+    """
+    from ...iac.provider_match import is_cloud
+
+    expose = _build_expose(ctx)
+    return expose is not None and is_cloud(expose.get("binding") or {}, "databricks")
+
+
+def _databricks_staging_path(ctx: RunContext, stream: str, sink_format: str) -> Path:
+    """Where a Databricks-bound build lands its file before the upload.
+
+    Beside the BigQuery staging, under ``.fluid/staging``, and not ``out/``, which is the
+    local target's own output. Named after the table, as the catalogue names it.
+    """
+    ext = _FILE_FORMAT_EXT.get((sink_format or "parquet").lower(), sink_format)
+    expose = _build_expose(ctx) or {}
+    loc = (expose.get("binding") or {}).get("location") or {}
+    build = _path_part(getattr(ctx, "build_id", None) or "build")
+    name = _path_part(loc.get("table") or stream)
+    path = Path(ctx.workdir) / ".fluid" / "staging" / build / f"{name}.{ext}"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 

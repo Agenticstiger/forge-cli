@@ -119,8 +119,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against the live `row_filter` and each column's `mask` from the GetTable it already reads, and
   each bound function read back for its owner (this verify's identity or the table's owner),
   body, parameters and return type; a missing or different binding is CRITICAL with `fluid
-  apply` as the fix, and a contract that restricts nothing skips it. `policy.privacy.masking`
-  (landing-time masking), `rowLevelPolicy` and `binding.governance` are still refused. Proven
+  apply` as the fix, and a contract that restricts nothing skips it. `rowLevelPolicy` and
+  `binding.governance` are still refused, and `policy.privacy.masking` (landing-time masking) is
+  refused unless a DuckDB acquisition writes the expose (see the bronze landing entry). Proven
   against the in-process stand-in with a real `tofu` apply, and the function bodies evaluated
   in DuckDB; not run against a live workspace: that `CREATE FUNCTION IF NOT EXISTS`, `SET ROW
   FILTER` (with `ON ()` as well) and `SET MASK` behave as the stand-in models them, that `SET`
@@ -129,6 +130,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves a window with no filter), that FunctionInfo's `routine_definition` is the body as
   written, that `current_user()` is a service principal's application ID, and what a warehouse
   of each type enforces are unproven.
+
+- **`lifecycle.expire` on a Databricks table is accepted when the table is rebuilt in full and
+  its Delta history is limited.** It used to be refused (`databricks-retention-unmapped`):
+  nothing on Databricks deletes rows by age. A table rewritten whole on every run holds no row
+  copy older than a run except in its Delta history, which `VACUUM` (run by predictive
+  optimization on Unity Catalog managed tables) empties after `delta.logRetentionDuration`
+  (30 days by default) and `delta.deletedFileRetentionDuration` (7 days). So the emitter and
+  `fluid validate` now accept `expire: true` when every build writing the expose is a dbt build
+  whose model for the table resolves to `materialized: table`, or forge-cli's DuckDB acquisition
+  with `properties.source.mode: full_refresh` (its Databricks landing overwrites the whole table,
+  and runs no other mode; another mode is `databricks-retention-incremental`, none `-unmapped`),
+  and `lifecycle.retention` is at least the larger of the two history properties (the model's
+  `tblproperties` when it sets them). The model is the one whose `alias`, else file name, is the
+  expose's table, with `materialized` resolved as dbt does: `config()` in the SQL, then the
+  model's YAML `config:`, then `dbt_project.yml` by the most specific path; the default is `view`.
+  The build must also run that model: its `--select` (`properties.model` / `select`, as
+  `build_selectors` makes it) must include the model by name, fully qualified name (dbt-core
+  1.11's fqn method: an exact prefix, with or without the project's name, a wildcard globbing the
+  whole rest of the name) or path, else
+  `databricks-retention-not-selected` (graph operators on another node, tags, configs and state
+  cannot be evaluated here and are refused too). A table name, retention or source mode that is
+  still an `{{ env.X }}` placeholder is left by `fluid validate` to the emitter, which checks it
+  substituted, and `fluid verify` reads the contract with its placeholders substituted, as `fluid
+  apply` does.
+  Refused, with the fix: `databricks-retention-incremental` (`incremental`, `snapshot`),
+  `-not-table` (`view` and the rest), `-dbt-unresolved` (a Git repository, or a value that is not
+  a plain literal: `var()`, a conditional `config()`, a custom `schema`), `-too-short`
+  (a retention under the history, so under 30 days by default), `-period` (missing or not ISO 8601)
+  and `-unmapped` (any other writer, or none). ISO 8601 years and months are counted at their
+  shortest (P1Y = 365 days, P1M = 28 days), so the check never passes a retention that is too
+  short. `fluid verify` gains a `retention` dimension: the live table's Delta history
+  (`properties` and `delta_runtime_properties_kvpairs`) must not exceed the contract's retention
+  (CRITICAL, with the `ALTER TABLE ... SET TBLPROPERTIES`), and predictive optimization off for
+  the table is a warning with the fix (enable it, or schedule `VACUUM`), as is a table GetTable
+  serves without any properties (Delta's defaults were assumed; check `SHOW TBLPROPERTIES`);
+  skipped without `expire`. Not run against a live workspace: which property names Unity Catalog's GetTable
+  serves for a table's Delta retention, and what predictive optimization reports, are modelled
+  on databricks-sdk-go v0.190.0, not observed.
+
+- **A Databricks `accessPolicy` grant scoped by `resources` lands on the tables it names.** It used
+  to be refused (`databricks-grant-scope-unmapped`) whatever it named, which blocked every product
+  whose grants carry `resources: ["$.exposes[?(@.exposeId=='<id>')]"]`. The emitter now evaluates
+  that shape (single or double quotes, spaces allowed) and `$.exposes[*]` / `$.exposes` (every
+  expose), and grants only on the matching tables; several resources add up. A grant without
+  `resources` still covers every table. Any other JSONPath (`$.exposes[0]`, a filter on another
+  field, `||`, a path below the expose), alone or beside a good one, and an exposeId this contract
+  does not have, stay `databricks-grant-scope-unmapped`, with a message that names the resource and
+  says the grant is refused rather than placed on more tables than it names; a blank resource
+  (`""`) is one of those, not "every expose". `fluid validate` and
+  the emitter read the one `_compile` verdict, and `fluid verify`'s catalog-access check reads the
+  per-table grants, so a scoped reader is checked only where it is granted. The scope is parsed
+  once, in `iac/access.py` (`AccessGrant.scope`); what the AWS and GCP emitters produce is
+  unchanged. Known gap, not fixed here: the GCP emitter applies every `accessPolicy` grant to every
+  expose and never reads `resources`, and the AWS emitter does not read `accessPolicy.grants`, so a
+  scoped grant is not scoped there.
+
+- **The DuckDB acquisition runner lands a Databricks expose in its table, and `policy.privacy.masking`
+  is accepted on one it writes.** For `platform: databricks` the runner used to write a LOCAL file
+  (`location.path`, else `out/`) and report success with nothing in Databricks. It now hashes (or
+  tokenizes, encrypts, masks) at landing as before, writes Parquet under `.fluid/staging`, uploads it
+  through the Files API to `DATABRICKS_STAGING_VOLUME` (`/Volumes/<catalog>/<schema>/<volume>`, from
+  the environment only, like `DATABRICKS_WAREHOUSE_ID`) as `<product>/<build>/<run id>/<file>.parquet`,
+  and runs one statement on the warehouse, `INSERT OVERWRITE <catalog>.<schema>.<table>
+  (<the contract's columns>) SELECT <the same columns> FROM read_files('<the staged file>', format =>
+  'parquet')`: a full refresh, each value into the column of its name, that rewrites the rows and keeps the table's definition, grants, tags, row filter and column masks.
+  It reads only the file the run uploaded, never the directory, so a file someone else puts there is
+  not loaded. The staged files are deleted afterwards whether or not the load worked, and on Ctrl-C
+  too (an INSERT the warehouse has answered for is cancelled first); a file that cannot be deleted
+  fails the run and is named first in the error. A run killed outright cannot clean up, so each
+  load first deletes what earlier runs of the same build left under `<volume>/<product>/<build>/`:
+  only a directory named like a run id that holds nothing but Parquet files, all over an hour old
+  (a run still in progress keeps its upload, and a directory forge-cli did not stage is left).
+  Give the staging a volume of its own. The run record gains
+  `facets.databricks_load` (table, rows loaded, where it staged, that it deleted, and
+  `earlier_runs_staging_deleted`). The table must exist: a missing one fails naming
+  `fluid apply`, and the runner never creates or alters a table. An unset volume or warehouse, a
+  mode other than `full_refresh`, a sink other than Parquet and more than one stream are refused
+  before anything runs, and the emitter refuses the mode and the sink format already
+  (`databricks-landing-unsupported`), with any masking rule the runner cannot apply
+  (`databricks-masking-invalid`), so `fluid validate` says so before `fluid apply` creates the
+  table. Every other platform's landing is unchanged. The Databricks emitter now
+  accepts `policy.privacy.masking` on an expose when every build that writes it is a DuckDB
+  acquisition build (the runner applies the mask before the data leaves the machine, as on AWS), and
+  keeps refusing it, with the reason, for a dbt-written expose, another engine, or no build at all;
+  `fluid validate` and `fluid apply` read the one `_compile` verdict. `rowLevelPolicy` and
+  `binding.governance` are still refused. Proven against the in-process stand-in (Files API,
+  `INSERT OVERWRITE ... read_files` over the uploaded Parquet in DuckDB) with a real `tofu` apply
+  followed by the build; not run against a live workspace: what `read_files` and `INSERT OVERWRITE`
+  do on a managed table that carries a mask and a row filter, that `INSERT OVERWRITE` keeps them,
+  the Files API's limits, and whether a type the Parquet carries is accepted by the table's are
+  unproven. The run-time schema gate still compares a declared `string` with DuckDB's `VARCHAR` as a
+  type change; declare `varchar` for a column the source reads as text.
 
 ### Fixed
 
@@ -339,6 +432,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`--provider aws`, or `fluid publish --target datamesh-manager`) instead of a bare "unknown
   provider". A contract's `redshift` build runtime or expose platform is served by `aws`, and plugins
   cannot claim either retired name.
+
+- **A failed fail-safe no longer locks the run out, and says what it could not close.** When a
+  mask or row filter cannot be bound, the lock that revokes SELECT from every grantee but the
+  owner now also skips the identity the run is (it has to repair the table), and when the
+  table's owner could not be read it says the owner could not be skipped. An owner the contract
+  itself restricts reads its table whatever is revoked: the message now names that path as still
+  open, with the `ALTER TABLE ... OWNER TO` to run. When the permission listing shows no
+  `inherited_from_*` field at all, it says it could not determine whether a schema or catalog
+  grant is open, where it claimed none was.
+
+- **A job paused for an unprotected table is announced and found.** The apply decides once, in
+  `emit`, which dbt jobs to create paused, and its notice reads that decision, so a transient
+  read error can no longer pause a job without saying so. `fluid verify` now fails the jobs
+  dimension for a job that is paused while its table's masks or row filter are not in place,
+  with the apply that binds them and starts the job as the fix.
+
+- **A changed contract no longer leaves its old masks and row filter functions behind.** After
+  a successful apply (never in a dry run, never after a failed apply or a failed bind), the
+  functions in the product schema that carry the table's `fluid_rf_<table>_`,
+  `fluid_mask_<table>_<column>_` or deny-all name and are neither expected now nor bound to any
+  table in the schema (every table is read first; if one cannot be, nothing is dropped) are
+  dropped, each printed, and only when the run's own identity owns the function: one with
+  another owner, or an owner that cannot be read, is left and named. A function without the
+  `fluid_` prefix is never touched.
+
+- **A plan that fails the residency check prints one line.** The apply showed the last 800
+  characters of the tofu JSON, which cut off the sentence naming the live region. It now says
+  the declared region, the live region (read from the diagnostic's message, or its `values`)
+  and the fix.
 
 ### Security
 

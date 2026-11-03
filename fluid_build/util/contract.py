@@ -202,6 +202,21 @@ def is_databricks_job_build(build: Mapping[str, Any]) -> bool:
     return isinstance(platform, str) and platform.strip().lower() == "databricks"
 
 
+def is_duckdb_acquisition_build(build: Mapping[str, Any]) -> bool:
+    """True when forge-cli's DuckDB acquisition runner runs the build: ``pattern:
+    acquisition`` and ``engine: duckdb``. That runner applies ``policy.privacy.masking`` to
+    the rows it lands, before they leave the machine (``build_runners/_masking.py``) and
+    lands a Databricks expose in its table (``build_runners/_databricks_load.py``)."""
+    pattern = build.get("pattern")
+    engine = get_build_engine(build)
+    return (
+        isinstance(pattern, str)
+        and pattern.strip().lower() == "acquisition"
+        and isinstance(engine, str)
+        and engine.strip().lower() == "duckdb"
+    )
+
+
 def is_unscheduled_build(build: Mapping[str, Any]) -> bool:
     """True when no scheduler starts the build's runs: its job runs outside
     forge-cli (:func:`is_externally_run_build`), continuously

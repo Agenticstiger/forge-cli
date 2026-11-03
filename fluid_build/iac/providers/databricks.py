@@ -31,7 +31,10 @@ resources, with no new schema field (fluid-schema 0.7.6):
   set: Delta drops and renames columns only under column mapping.
 * ``accessPolicy.grants[]`` and ``policy.authz.readers`` / ``writers`` become
   one ``databricks_grant`` per (table, principal), plus ``USE_SCHEMA`` on the
-  schema. ``databricks_grant`` is authoritative for its principal on its
+  schema. A grant's ``resources`` places it on the tables of the exposes it names
+  (``$.exposes[?(@.exposeId=='<id>')]``, or ``$.exposes[*]`` / ``$.exposes`` for
+  all; ``iac/access.py::parse_grant_scope``); any other JSONPath, or an exposeId
+  the contract does not have, is refused, never widened. ``databricks_grant`` is authoritative for its principal on its
   securable, so a principal named twice is merged into one resource rather
   than two that undo each other. It also means the product takes over each
   named principal's privileges on its schema: on a schema that existed before
@@ -72,6 +75,10 @@ resources, with no new schema field (fluid-schema 0.7.6):
   databricks``) becomes a serverless ``databricks_job`` with a ``dbt_task``, and
   a local project its ``databricks_workspace_file`` uploads
   (``databricks_jobs.py``).
+* ``lifecycle.expire`` is accepted on a table that is rebuilt in full on every run (a dbt
+  ``table`` model, or forge-cli's DuckDB acquisition) when ``lifecycle.retention`` covers the
+  table's Delta history, so ``VACUUM`` removes older copies; anything else is refused
+  (``databricks_retention.py``). ``fluid verify`` reads the live properties.
 * A table a dbt build writes, locally or as a job, is rebuilt by dbt's ``table``
   materialization with CREATE OR REPLACE, so the module creates it and then
   leaves its definition to dbt: ``lifecycle.ignore_changes`` on what that
@@ -123,6 +130,7 @@ so an existing table must be imported before the first apply.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -130,7 +138,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ...providers._sql_safety import validate_ident, validate_sql_type_param_payload
-from ...util.contract import is_databricks_job_build
+from ...util.binding_paths import ENV_PLACEHOLDER_RE
+from ...util.contract import (
+    builds_writing_expose,
+    is_databricks_job_build,
+    is_duckdb_acquisition_build,
+)
 from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
 from ..governance_labels import governance_labels
@@ -155,6 +168,7 @@ from .databricks_jobs import (
     dbt_written_exposes,
     run_as_allowlist,
 )
+from .databricks_retention import Retention, check_expire
 
 _LOG = logging.getLogger(__name__)
 
@@ -259,6 +273,8 @@ class _Table:
     region: str = ""
     #: The column masks and row filter Unity Catalog enforces on it, if the expose has any.
     enforcement: Optional[TableEnforcement] = None
+    #: The ``lifecycle.expire`` it promises and this module accepted (``databricks_retention.py``).
+    retention: Optional[Retention] = None
 
     @property
     def full_name(self) -> str:
@@ -434,20 +450,141 @@ def _packaging_refusal(where: str) -> UnsupportedBindingError:
     )
 
 
+def _describe_writer(build: Mapping[str, Any]) -> str:
+    engine = build.get("engine")
+    parts = [f"engine {engine!r}" if engine else "no engine"]
+    if build.get("pattern"):
+        parts.append(f"pattern {build.get('pattern')!r}")
+    return f"build {build.get('id')!r} ({', '.join(parts)})"
+
+
+def masking_unapplied_reason(exposure: Mapping[str, Any], builds: Any) -> Optional[str]:
+    """Why no mask would be applied to this expose's rows, or ``None`` when one is.
+
+    ``policy.privacy.masking`` is applied by the DuckDB acquisition runner at landing, before
+    the rows leave the machine (``build_runners/_masking.py``), so it holds on a Databricks
+    table only when every build that writes the table is such a build
+    (``is_duckdb_acquisition_build``). A dbt model, another engine, or no build at all writes
+    rows nothing masked.
+    """
+    writers = builds_writing_expose(exposure.get("exposeId"), builds)
+    if not writers:
+        return "no build writes it, so nothing would apply the mask."
+    unmasked = [build for build in writers if not is_duckdb_acquisition_build(build)]
+    if not unmasked:
+        return None
+    return (
+        f"{', '.join(_describe_writer(build) for build in unmasked)} "
+        f"{'writes' if len(unmasked) == 1 else 'write'} it and applies no mask."
+    )
+
+
+def _refuse_unapplied_masking(
+    where: str,
+    exposure: Mapping[str, Any],
+    builds: Sequence[Mapping[str, Any]],
+    refusals: List[UnsupportedBindingError],
+) -> None:
+    """``policy.privacy.masking`` on an expose no DuckDB acquisition build alone writes."""
+    policy = exposure.get("policy")
+    privacy = policy.get("privacy") if isinstance(policy, Mapping) else None
+    if not isinstance(privacy, Mapping) or not _set(privacy.get("masking")):
+        return
+    unapplied = masking_unapplied_reason(exposure, builds)
+    if unapplied is None:
+        return
+    refusals.append(
+        _refusal(
+            "governance-unmapped",
+            f"{where} declares policy.privacy.masking, which only forge-cli's DuckDB "
+            "acquisition runner applies, at landing, before the rows leave the machine. "
+            f"{unapplied[:1].upper()}{unapplied[1:]} Applied anyway, the table would hold the "
+            "values the contract promises to mask.",
+            "Write this expose with a DuckDB acquisition build (pattern: acquisition, "
+            "engine: duckdb), which masks the columns before it loads the table. Or remove "
+            "policy.privacy.masking and enforce access with policy.authz.columnRestrictions, "
+            "which become Unity Catalog column masks.",
+        )
+    )
+
+
+def _refuse_unlandable(
+    where: str,
+    exposure: Mapping[str, Any],
+    builds: Sequence[Mapping[str, Any]],
+    refusals: List[UnsupportedBindingError],
+    *,
+    validating: bool = False,
+) -> None:
+    """What the DuckDB acquisition runner would refuse at run time for this expose, refused
+    here: by then ``fluid apply`` has created the table. Its source mode and sink format
+    (``build_runners/_databricks_load.unsupported_reason``) and, when it masks at landing,
+    each masking rule (``build_runners/_masking.masking_rules``). A value that is still an
+    ``{{ env.X }}`` placeholder is left alone only while validating (``fluid validate`` reads
+    the contract unsubstituted); the emitter reads it substituted, and one still unresolved
+    there (its variable unset) is refused."""
+    from ...build_runners._databricks_load import unsupported_reason
+    from ...build_runners._masking import MaskingPolicyError, masking_rules
+
+    writers = [
+        b
+        for b in builds_writing_expose(exposure.get("exposeId"), builds)
+        if is_duckdb_acquisition_build(b)
+    ]
+    for build in writers:
+        properties = build.get("properties")
+        properties = properties if isinstance(properties, Mapping) else {}
+        source = properties.get("source")
+        sink = properties.get("sink")
+        mode = source.get("mode") if isinstance(source, Mapping) else None
+        sink_format = (sink.get("format") if isinstance(sink, Mapping) else None) or "parquet"
+        placeholder = any(
+            isinstance(v, str) and ENV_PLACEHOLDER_RE.search(v) for v in (mode, sink_format)
+        )
+        if validating and placeholder:
+            continue
+        reason = unsupported_reason(str(mode or ""), str(sink_format).lower(), 1)
+        if reason:
+            refusals.append(
+                _refusal(
+                    "landing-unsupported",
+                    f"{where}: build {build.get('id')!r} lands this expose with forge-cli's "
+                    f"DuckDB acquisition runner, and {reason}. The build would be refused at "
+                    "run time, after fluid apply had created the table.",
+                    "Set properties.source.mode: full_refresh and properties.sink.format: "
+                    "parquet on the build (one stream), or write the expose another way.",
+                )
+            )
+    if writers and not masking_unapplied_reason(exposure, builds):
+        try:
+            masking_rules(exposure)
+        except MaskingPolicyError as exc:
+            refusals.append(
+                _refusal(
+                    "masking-invalid",
+                    f"{where} policy.privacy.masking: {exc} The DuckDB acquisition runner "
+                    "would refuse to land anything.",
+                    "Correct the rule as the message says, or remove it from "
+                    "policy.privacy.masking.",
+                )
+            )
+
+
 def _refuse_governance(
     where: str,
     binding: Mapping[str, Any],
     exposure: Mapping[str, Any],
     refusals: List[UnsupportedBindingError],
+    builds: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     """Governance the module would apply with exit 0 but never enforce."""
     policy = exposure.get("policy") or {}
     authz = (policy.get("authz") or {}) if isinstance(policy, Mapping) else {}
     privacy = (policy.get("privacy") or {}) if isinstance(policy, Mapping) else {}
+    _refuse_unapplied_masking(where, exposure, builds, refusals)
     unmapped = [
         name
         for name, value in (
-            ("policy.privacy.masking", privacy.get("masking")),
             ("policy.privacy.rowLevelPolicy", privacy.get("rowLevelPolicy")),
             ("binding.governance", binding.get("governance")),
         )
@@ -460,8 +597,8 @@ def _refuse_governance(
                 f"{where} declares {', '.join(unmapped)}, which the Databricks emitter does not "
                 "map yet. Applied anyway, the table would be readable without the mask, filter "
                 "or restriction the contract promises.",
-                "Remove them from this expose until they are mapped (landing-time masking and "
-                "ABAC policies are not), and enforce access with grants. policy.authz."
+                "Remove them from this expose until they are mapped (ABAC policies are not), "
+                "and enforce access with grants. policy.authz."
                 "columnRestrictions and policy.authz.rowFilters are mapped: they become Unity "
                 "Catalog column masks and a row filter.",
             )
@@ -473,17 +610,6 @@ def _refuse_governance(
                 f"{where} declares binding.encryption. Unity Catalog managed tables use the "
                 "workspace's storage keys; a per-table key cannot be set from here.",
                 "Remove binding.encryption; configure customer-managed keys on the workspace.",
-            )
-        )
-    lifecycle = exposure.get("lifecycle") or {}
-    if isinstance(lifecycle, Mapping) and lifecycle.get("expire"):
-        refusals.append(
-            _refusal(
-                "retention-unmapped",
-                f"{where} sets lifecycle.expire, and nothing on Databricks would expire the "
-                "data.",
-                "Remove lifecycle.expire from the databricks binding, or schedule the delete "
-                "in a build.",
             )
         )
 
@@ -671,7 +797,9 @@ def _resolve_table(
     exposure: Mapping[str, Any],
     refusals: List[UnsupportedBindingError],
     *,
+    contract: Mapping[str, Any],
     validating: bool,
+    builds: Sequence[Mapping[str, Any]] = (),
 ) -> Optional[_Table]:
     """One Databricks expose → :class:`_Table`, or ``None`` with its refusals."""
     binding = exposure.get("binding") or {}
@@ -685,7 +813,12 @@ def _resolve_table(
     columns = _columns(where, exposure, refusals, validating=validating)
     partitions = _partitions(where, loc, columns, refusals, validating=validating)
     region = _region(where, loc, refusals)
-    _refuse_governance(where, binding, exposure, refusals)
+    _refuse_governance(where, binding, exposure, refusals, builds)
+    _refuse_unlandable(where, exposure, builds, refusals, validating=validating)
+    retention, retention_refusals = check_expire(
+        where, exposure, names.get("table") or "", contract, validating=validating
+    )
+    refusals.extend(retention_refusals)
     enforcement: Optional[TableEnforcement] = None
     if len(refusals) == before:
         try:
@@ -715,6 +848,7 @@ def _resolve_table(
         exposure=exposure,
         region=region,
         enforcement=enforcement,
+        retention=retention,
     )
 
 
@@ -860,17 +994,38 @@ def _principal_identities(
 def _refuse_grant_shapes(
     contract: Mapping[str, Any], grants: Sequence[Any], refusals: List[UnsupportedBindingError]
 ) -> None:
-    """Grants a Unity Catalog grant cannot express: scoped by resources, or conditional."""
+    """Grants a Unity Catalog grant cannot express: scoped by resources it cannot evaluate or
+    by an expose the contract does not have, or conditional."""
+    expose_ids = {
+        str(e.get("exposeId")) for e in contract.get("exposes") or () if isinstance(e, Mapping)
+    }
+    fix = (
+        "Scope the grant with $.exposes[?(@.exposeId=='<id>')] for one expose (repeat it for "
+        "several) or $.exposes[*] for every expose, or drop resources (every table of the "
+        "product)."
+    )
     for grant in grants:
-        if grant.resources:
+        scope = grant.scope
+        if scope.unevaluable:
             refusals.append(
                 _refusal(
                     "grant-scope-unmapped",
-                    f"accessPolicy grant to {grant_key(grant)!r} is scoped by resources, which "
-                    "the Databricks emitter does not evaluate: the grant would reach no "
-                    "Databricks table.",
-                    "Drop resources (the grant then covers every table of the product), or "
-                    "use the expose's policy.authz.readers / writers.",
+                    f"accessPolicy grant to {grant_key(grant)!r} is scoped by "
+                    f"{', '.join(repr(r) for r in scope.unevaluable)}, which the Databricks "
+                    "emitter cannot evaluate, so it cannot tell which tables the grant is for. "
+                    "It is refused rather than placed on more tables than it names.",
+                    fix,
+                )
+            )
+        unknown = sorted(scope.expose_ids - expose_ids)
+        if unknown:
+            refusals.append(
+                _refusal(
+                    "grant-scope-unmapped",
+                    f"accessPolicy grant to {grant_key(grant)!r} is scoped to exposeId "
+                    f"{', '.join(repr(i) for i in unknown)}, which no expose of this contract "
+                    "has.",
+                    "Correct the exposeId in resources, or remove that resource. " + fix,
                 )
             )
     for entry in (contract.get("accessPolicy") or {}).get("grants") or ():
@@ -891,7 +1046,7 @@ def _target_privileges(
     """``{principal: privileges}`` on one expose's table, from accessPolicy and its authz."""
     named: List[Tuple[Tuple[str, ...], set]] = []
     for grant in grants:
-        if grant.resources:
+        if not grant.scope.covers(target.exposure.get("exposeId")):
             continue
         identities = _principal_identities(
             grant_key(grant), target, refusals, fallback=grant.principal
@@ -1032,7 +1187,8 @@ def _compile(
     if _set(contract.get("packaging")):
         refusals.append(_packaging_refusal("the contract"))
 
-    targets = _resolve_tables(compiled, exposures, validating=validating)
+    builds = [b for b in contract.get("builds") or [] if isinstance(b, Mapping)]
+    targets = _resolve_tables(compiled, exposures, contract, validating=validating, builds=builds)
     warehouse = _warehouse(env, refusals)
     _refuse_duplicate_tables(compiled.tables, refusals)
     _refuse_region_conflict(compiled.tables, refusals)
@@ -1071,12 +1227,24 @@ def _compile(
 
 
 def _resolve_tables(
-    compiled: _Compiled, exposures: Sequence[Tuple[int, Mapping[str, Any]]], *, validating: bool
+    compiled: _Compiled,
+    exposures: Sequence[Tuple[int, Mapping[str, Any]]],
+    contract: Mapping[str, Any],
+    *,
+    validating: bool,
+    builds: Sequence[Mapping[str, Any]] = (),
 ) -> List[_GrantTarget]:
     """Resolve each Databricks expose into ``compiled.tables``; a grant target for every one."""
     targets: List[_GrantTarget] = []
     for index, exposure in exposures:
-        table = _resolve_table(index, exposure, compiled.refusals, validating=validating)
+        table = _resolve_table(
+            index,
+            exposure,
+            compiled.refusals,
+            contract=contract,
+            validating=validating,
+            builds=builds,
+        )
         if table is not None:
             compiled.tables.append(table)
         targets.append(
@@ -1180,6 +1348,40 @@ def _emit_table(
     # table with CREATE OR REPLACE, so a table that exists but is not in
     # state would otherwise be replaced, and the plan would only show +1.
     compiled.imports.append(ImportBlock(f"databricks_sql_table.{table_key}", table.full_name))
+
+
+#: The residency precondition's own message (``_region_precondition``), and the diagnostic
+#: ``values`` entry that carries the live region (``statement: is "us-west-2"``). In ``tofu
+#: -json`` output the text is one JSON string; in human output it is wrapped, hence ``\s+``.
+_RESIDENCY_RE = re.compile(
+    r"The\s+contract\s+declares\s+binding\.location\.region\s+([a-z0-9-]+),\s+but\s+the\s+"
+    r"workspace\s+DATABRICKS_HOST\s+names\s+is\s+in\s+(\S+?)\.?\s+Residency"
+)
+_RESIDENCY_START_RE = re.compile(
+    r"The\s+contract\s+declares\s+binding\.location\.region\s+([a-z0-9-]+),"
+)
+_LIVE_VALUE_RE = re.compile(r'is\s+\\?"([a-z0-9-]+)\\?"')
+
+
+def _residency_failure(output: str) -> Optional[UnsupportedBindingError]:
+    """One clean line for a plan that fails the residency precondition: the declared region,
+    the live one and the fix. ``None`` when the output is not that failure."""
+    start = _RESIDENCY_START_RE.search(output)
+    if start is None:
+        return None
+    declared = start.group(1)
+    full = _RESIDENCY_RE.search(output)
+    live = full.group(2) if full else ""
+    if not re.fullmatch(r"[a-z0-9-]+", live):  # "(unknown)", a value not yet known, or cut off
+        value = _LIVE_VALUE_RE.search(output)
+        live = value.group(1) if value else ""
+    seen = f"in {live}" if live else "in a region the plan output does not show"
+    return _refusal(
+        "residency-region",
+        f"the contract declares binding.location.region {declared}, but the workspace "
+        f"DATABRICKS_HOST names is {seen}. Point DATABRICKS_HOST at a workspace in {declared}, "
+        "or correct binding.location.region.",
+    )
 
 
 def _region_precondition(compiled: _Compiled, cid: str, region: str) -> Dict[str, Any]:
@@ -1562,7 +1764,11 @@ class DatabricksIacPlugin:
         if compiled.refusals:
             raise compiled.refusals[0]
         _enforce_sovereignty(contract, compiled.tables)
-        for job, _tables in _jobs_to_pause(compiled, contract):
+        # Decided once, here: ``plan_notices`` of the same run says what this paused, so a
+        # transient read error cannot pause a job without the notice (or the reverse).
+        to_pause = _jobs_to_pause(compiled, contract)
+        self._pause_decision = (_contract_key(contract), [(j.name, t) for j, t in to_pause])
+        for job, _tables in to_pause:
             _pause(compiled, job)
         return compiled.resources
 
@@ -1723,9 +1929,15 @@ class DatabricksIacPlugin:
         it creates paused until the tables they write are protected."""
         compiled = _compile(contract, os.environ)
         notices = _use_catalog_notices(compiled)
-        for job, tables in _jobs_to_pause(compiled, contract):
+        decided = getattr(self, "_pause_decision", None)
+        self._pause_decision = None  # used once: the next run decides again
+        if decided is not None and decided[0] is not None and decided[0] == _contract_key(contract):
+            paused = list(decided[1])
+        else:
+            paused = [(j.name, t) for j, t in _jobs_to_pause(compiled, contract)]
+        for name, tables in paused:
             notices.append(
-                f"job {job.name!r} is created paused (pause_status PAUSED): it writes "
+                f"job {name!r} is created paused (pause_status PAUSED): it writes "
                 f"{', '.join(sorted(tables))}, whose masks and row filter are not bound yet, and "
                 "a run before that would fill an unprotected table. The next fluid apply, once "
                 "they are bound, starts its schedule; an explicit run-now works meanwhile."
@@ -1752,6 +1964,9 @@ class DatabricksIacPlugin:
                 "DATABRICKS_HOST with DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET (a "
                 "service principal's OAuth secret), then re-run 'fluid apply'.",
             )
+        residency = _residency_failure(output or "")
+        if residency is not None:
+            return residency
         if _UNREACHABLE_RE.search(output or ""):
             return _refusal(
                 "workspace-unreachable",
@@ -1840,6 +2055,16 @@ class DatabricksIacPlugin:
             if full in live:
                 out.extend(f"{full}.{line}" for line in _changed_columns(live[full], declared))
         return out
+
+
+def _contract_key(contract: Mapping[str, Any]) -> Optional[str]:
+    """A stable text of the contract, to tie a decision to the contract it was made for;
+    ``None`` for one JSON cannot write (mixed-type or date keys, a cycle), and then no
+    decision is ever reused for it: :meth:`plan_notices` works it out again."""
+    try:
+        return json.dumps(contract, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return None
 
 
 def _jobs_to_pause(
@@ -2031,6 +2256,10 @@ class ManagedTable:
     #: The whole expectation, with each function's definition: what ``fluid verify`` checks
     #: a bound function's owner, body, parameters and return type against.
     enforcement: Optional[TableEnforcement] = None
+    #: The accepted ``lifecycle.expire``: its retention as written and in seconds, which the
+    #: table's Delta history must not exceed. ``None`` when the expose sets no expire.
+    retention_period: Optional[str] = None
+    retention_seconds: Optional[int] = None
 
 
 def managed_objects(
@@ -2076,6 +2305,8 @@ def managed_objects(
                 for mask in (table.enforcement.masks if table.enforcement else ())
             ),
             enforcement=table.enforcement,
+            retention_period=table.retention.period if table.retention else None,
+            retention_seconds=table.retention.seconds if table.retention else None,
         )
         for table in compiled.tables
     ]
