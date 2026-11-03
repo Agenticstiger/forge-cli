@@ -254,3 +254,15 @@ def test_policy_apply_bindings_resolve_a_retired_platform():
     from fluid_build.cli.policy_apply import _resolve_from_bindings
 
     assert _resolve_from_bindings({"bindings": [{"provider": "redshift"}]})[0] == "aws"
+
+
+def test_a_non_string_platform_passes_through_unchanged():
+    # LLM-drafted contracts can carry a non-string platform; the successor
+    # lookup must hand it on as before, not raise AttributeError.
+    from fluid_build.cli._common import resolve_provider_from_contract
+    from fluid_build.providers import _claims_retired_name, resolve_retired_platform
+
+    assert resolve_retired_platform(123) == 123
+    assert resolve_retired_platform(None) is None
+    assert _claims_retired_name(123, "plugin", None) is False
+    assert resolve_provider_from_contract({"exposes": [{"binding": {"platform": 123}}]})[0] == 123

@@ -125,6 +125,8 @@ RETIRED_SUCCESSORS: Dict[str, str] = {"redshift": "aws"}
 
 def resolve_retired_platform(name: str) -> str:
     """The successor provider for a retired platform name; any other name unchanged."""
+    if not isinstance(name, str):
+        return name
     return RETIRED_SUCCESSORS.get(_normalize_name(name), name)
 
 
@@ -136,7 +138,7 @@ def _claims_retired_name(name: str, who: str, logger: Optional[logging.Logger]) 
     lookup for contracts. Only discovery calls this; an explicit
     ``register_provider(...)`` call in code stays allowed.
     """
-    if _normalize_name(name) not in RETIRED_PROVIDERS:
+    if not isinstance(name, str) or _normalize_name(name) not in RETIRED_PROVIDERS:
         return False
     _safe_log(
         logger,
