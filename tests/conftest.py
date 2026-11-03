@@ -204,6 +204,32 @@ def _disable_copilot_self_eval(monkeypatch):
     monkeypatch.setenv("FLUID_COPILOT_SELF_EVAL", "0")
 
 
+@pytest.fixture
+def deterministic_welcome_scan(monkeypatch):
+    """Make ``run_welcome_scan`` return every probe's result, however slow the runner.
+
+    The scan runs its probes in threads and discards any result that misses a
+    0.4s per-probe / 1.0s total budget: right for a CLI prompt, wrong for a test
+    that asserts on what a probe reports (workspace products, sample data, ...).
+    On a loaded runner (coverage, ``-n auto``) the probe overruns, its field
+    keeps the "nothing detected" default, and the mode picker falls back to
+    ``ai`` where the test expects ``from_product`` or ``refine``.
+
+    The budget only decides which results are kept, never how long the scan runs
+    (it still joins every probe thread), so wall-clock assertions are unaffected.
+    The dbt probe sizes its ``dbt --version`` subprocess from the same budget, so
+    it is pointed at "no dbt installed" instead of waiting out a slow dbt-core;
+    tests of the dbt probe patch ``_resolve_dbt_executable`` themselves.
+
+    Opt in with ``pytestmark = pytest.mark.usefixtures("deterministic_welcome_scan")``.
+    """
+    monkeypatch.setattr("fluid_build.cli._welcome_scan._PROBE_TIMEOUT_S", 30.0)
+    monkeypatch.setattr("fluid_build.cli._welcome_scan._TOTAL_TIMEOUT_S", 60.0)
+    monkeypatch.setattr(
+        "fluid_build.build_runners.dbt.runner._resolve_dbt_executable", lambda: None
+    )
+
+
 @pytest.fixture(autouse=True)
 def _stop_leaked_monitoring_threads():
     """Drain every MonitoringSystem's background worker threads after each

@@ -1,0 +1,48 @@
+# Heavy third-party SDKs must not be reachable from the light-CLI modules,
+# directly or through any chain, unless the edge is a function-local import.
+# Run with:  lint-imports --config .importlinter-external
+#
+# Separate from [tool.importlinter] in pyproject.toml, whose contracts keep
+# include_external_packages = false. Here external packages are in the graph,
+# and grimp counts function-local imports as edges: every lazy route that
+# exists today is listed in ignore_imports with the reason it is lazy. A new
+# route fails the check; a stale ignore also fails (unmatched ignores error).
+# Forbidden modules must be root-level names (import-linter rule).
+# Borrowed: seddonym/import-linter (BSD-2), already a dev dependency.
+
+[importlinter]
+root_package = fluid_build
+include_external_packages = True
+
+[importlinter:contract:light-cli-external]
+name = validate/plan/bundle/apply cold path imports no heavy SDK at module scope
+type = forbidden
+source_modules =
+    fluid_build.schema_manager
+    fluid_build.forge.core.plan_digest
+    fluid_build.iac
+    fluid_build.cli.validate
+    fluid_build.cli.plan
+    fluid_build.cli.bundle
+    fluid_build.cli.apply
+forbidden_modules =
+    litellm
+    mcp
+    openlineage
+    boto3
+ignore_imports =
+    # boto3: each of these imports sits inside a function, guarded by
+    # try/except ImportError, and runs only once an AWS code path is taken.
+    fluid_build.secrets -> boto3
+    fluid_build.iac.providers.aws -> boto3
+    fluid_build.credentials.adapters -> boto3
+    # providers/aws: the three modules below import boto3 inside functions
+    # (try/except ImportError); listed one by one so a new eager import
+    # elsewhere in the tree is still caught.
+    fluid_build.providers.aws.provider -> boto3
+    fluid_build.providers.aws.util.auth -> boto3
+    fluid_build.providers.aws.util.config -> boto3
+    fluid_build.cli._auth_provider_impls -> boto3
+    # openlineage: imported inside the emit helpers, so it loads only when a
+    # build runner actually emits a lineage event.
+    fluid_build.build_runners._lineage -> openlineage
