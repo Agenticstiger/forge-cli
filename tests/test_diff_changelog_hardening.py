@@ -430,6 +430,39 @@ def test_a_dq_rule_escalated_to_a_failing_severity_is_breaking(
     assert f"severity={new_severity}" in change.description
 
 
+@pytest.mark.parametrize(
+    "new_severities",
+    [
+        pytest.param(["error", "warn"], id="failing-first"),
+        pytest.param(["warn", "error"], id="failing-last"),
+    ],
+)
+def test_a_duplicate_rule_id_cannot_hide_an_escalation(new_severities):
+    """Rule ids need not be unique, and the last rule of a name stood for all of them."""
+
+    def rules(*severities):
+        return {"rules": [{"id": "d1", "type": "completeness", "severity": s} for s in severities]}
+
+    report = compare_contracts(
+        _contract([_ID], dq=rules("warn")), _contract([_ID], dq=rules(*new_severities))
+    )
+
+    (change,) = report.breaking
+    assert change.kind == "quality_severity_escalated"
+    assert (change.before, change.after) == ("warn", "error")
+
+
+def test_a_rule_already_failing_under_a_duplicate_id_is_not_escalated():
+    def rules(*severities):
+        return {"rules": [{"id": "d1", "type": "completeness", "severity": s} for s in severities]}
+
+    report = compare_contracts(
+        _contract([_ID], dq=rules("error", "warn")), _contract([_ID], dq=rules("error", "error"))
+    )
+
+    assert report.total == 0
+
+
 def test_a_contract_quality_rule_escalated_to_error_is_breaking():
     def quality(severity):
         return [{"rule": "positive_amount", "expression": "amount > 0", "severity": severity}]

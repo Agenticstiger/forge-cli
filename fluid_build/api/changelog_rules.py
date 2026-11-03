@@ -699,20 +699,26 @@ def diff_quality_severity(
 
 
 def _severity_escalations(
-    old_rules: Mapping[str, Mapping[str, Any]],
-    new_rules: Mapping[str, Mapping[str, Any]],
+    old_rules: Mapping[str, Sequence[Mapping[str, Any]]],
+    new_rules: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
     path_prefix: str,
     owner: str,
     noun: str,
 ) -> List[Change]:
+    """A named rule escalated: failing in the new contract, and not in the old one.
+
+    A name can be on several rules (nothing makes an id unique), and each
+    version is judged by its most severe rule of that name, so a failing rule
+    cannot hide behind a ``warn`` one of the same id.
+    """
     changes: List[Change] = []
-    for name, new_rule in new_rules.items():
-        old_rule = old_rules.get(name)
-        if old_rule is None:
+    for name, new_group in new_rules.items():
+        old_group = old_rules.get(name)
+        if not old_group:
             continue
-        old_sev = str(old_rule.get("severity", "warn")).lower()
-        new_sev = str(new_rule.get("severity", "warn")).lower()
+        old_sev = _most_severe(old_group)
+        new_sev = _most_severe(new_group)
         if not is_error(old_sev) and is_error(new_sev):
             changes.append(
                 Change(
@@ -739,15 +745,20 @@ def _dig(node: Any, keys: Sequence[str]) -> Any:
     return node
 
 
-def _rules_by_name(rules: Any, keys: Sequence[str]) -> dict[str, Mapping[str, Any]]:
-    out: dict[str, Mapping[str, Any]] = {}
+def _most_severe(rules: Sequence[Mapping[str, Any]]) -> str:
+    severities = [str(rule.get("severity", "warn")).lower() for rule in rules]
+    return next((sev for sev in severities if is_error(sev)), severities[0])
+
+
+def _rules_by_name(rules: Any, keys: Sequence[str]) -> dict[str, List[Mapping[str, Any]]]:
+    out: dict[str, List[Mapping[str, Any]]] = {}
     if not isinstance(rules, (list, tuple)):
         return out
     for rule in rules:
         if isinstance(rule, Mapping):
             name = next((rule.get(k) for k in keys if rule.get(k)), None)
             if isinstance(name, str):
-                out[name] = rule
+                out.setdefault(name, []).append(rule)
     return out
 
 

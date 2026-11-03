@@ -150,9 +150,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule in `contract.dq.rules`, `contract.quality` or a column's `quality` whose severity becomes
   failing is now `quality_severity_escalated` (breaking), as a pre-0.7 `quality.tests` entry was.
   `critical` counts as failing, as it does for `fluid test`: warn -> critical is now an
-  escalation, and critical -> error no longer is. A column whose `sensitivity` becomes or stops
-  being `pii` or `phi` is `column_pii_added` / `column_pii_removed` (info), and any other change
-  to it is the new `column_sensitivity_changed` (info). A column tagged `primary-key` is in the
+  escalation, and critical -> error no longer is. Rules that share an id are judged by the most
+  severe of them, so a failing rule cannot hide behind a `warn` one of the same id. A column
+  whose `sensitivity` becomes or stops being `pii` or `phi` is `column_pii_added` /
+  `column_pii_removed` (info), and any other change to it is the new
+  `column_sensitivity_changed` (info). A column tagged `primary-key` is in the
   primary key, so one that stops being `required` is `primary_key_nullable` (breaking) rather
   than a non-breaking loosening.
 
