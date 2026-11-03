@@ -21,7 +21,15 @@ Execution API), ``databricks_grant`` and ``databricks_entity_tag_assignment`` (c
 update, delete and the paginated list ``fluid verify`` reads; ``tags``, ``tag_page_size``). A
 small SQL interpreter understands exactly the statements ``databricks_sql_table`` sends (CREATE
 [OR REPLACE] TABLE, ALTER TABLE ADD / DROP / RENAME / ALTER COLUMN, SET / UNSET TBLPROPERTIES,
-CLUSTER BY, COMMENT ON TABLE, DROP TABLE).
+CLUSTER BY, COMMENT ON TABLE, DROP TABLE), and the statements forge-cli sends for a contract's
+column restrictions and row filters: CREATE FUNCTION IF NOT EXISTS (a SQL function is kept as
+sent in ``functions``; CREATE OR REPLACE of one a filter or mask uses is refused, as Unity Catalog
+refuses it), ALTER TABLE SET / DROP ROW FILTER, ALTER COLUMN SET / DROP MASK, and REVOKE SELECT.
+The bindings are served on the table (``row_filter``, ``columns[].mask``) as Unity Catalog serves
+them, and a CREATE OR REPLACE TABLE keeps them (Databricks docs: REPLACE preserves row filters
+and column masks). ``fail_on(substring, message)`` makes every statement containing it FAIL,
+for the fail-safe tests; ``fail_route(method, path_part)`` answers matching requests with an
+error, to fail a ``tofu apply`` part way; ``timeline`` orders statements against permission changes.
 Any other statement FAILS (state ``FAILED``) and stays visible in ``sql_log``, so a new
 statement shape shows up as an error, never as a silent no-op. Every other endpoint answers a
 Databricks-shaped 404 and is recorded in ``unknown``.
@@ -62,7 +70,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from urllib.parse import parse_qs, unquote, urlparse
 
 NOT_FOUND = "NOT_FOUND"
-_USER = "fake-user@example.test"
+#: The identity a run authenticates as (``GET .../scim/v2/Me``), and so a function's owner.
+DEPLOY_USER = "fake-user@example.test"
+_USER = DEPLOY_USER
 _ORG_ID = "1234567890123456"
 
 _IDENT = r"`?([^`.\s]+)`?"
@@ -248,6 +258,13 @@ def _new_table(cols: List[Dict[str, Any]], tail: Dict[str, Any], marker: int) ->
     }
 
 
+def _coldef_param(txt: str) -> Dict[str, str]:
+    m = re.match(r"\s*`?([^`\s]+)`?\s+(.+?)\s*$", txt, re.S)
+    if not m:
+        raise ValueError(f"cannot parse function parameter: {txt!r}")
+    return {"name": m.group(1), "type": m.group(2).strip().lower()}
+
+
 def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
     """Run one statement against ``fake``; return (ok, error message)."""
     s = sql.strip().rstrip(";").strip()
@@ -270,9 +287,70 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
             tail = _parse_create_tail(s[close + 1 :])
         except ValueError as exc:
             return False, f"fake_databricks: {exc}"
-        if full in fake.tables and replace:
+        old = fake.tables.get(full)
+        if old is not None and replace:
             fake.replaced.append(full)  # evidence: CREATE OR REPLACE hit an existing table
-        fake.tables[full] = _new_table(cols, tail, fake._next_marker())
+        new = _new_table(cols, tail, fake._next_marker())
+        if old is not None and replace:
+            # REPLACE preserves row filters and column masks (Databricks docs).
+            if old.get("row_filter"):
+                new["row_filter"] = old["row_filter"]
+            kept = {c["name"]: c["mask"] for c in old["columns"] if c.get("mask")}
+            for col in new["columns"]:
+                if col["name"] in kept:
+                    col["mask"] = kept[col["name"]]
+        fake.tables[full] = new
+        return True, ""
+
+    m = re.match(
+        rf"CREATE\s+(OR\s+REPLACE\s+)?FUNCTION\s+(IF\s+NOT\s+EXISTS\s+)?{_FULL}\s*\(",
+        s,
+        re.S | re.I,
+    )
+    if m:
+        replace, ine, cat, sch, name = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        if f"{cat}.{sch}" not in fake.schemas:
+            return False, f"[SCHEMA_NOT_FOUND] The schema `{cat}`.`{sch}` cannot be found."
+        close = _balanced(s, m.end() - 1)
+        returns = re.match(r"\s*RETURNS\s+(.+?)\s+RETURN\s+(.+)$", s[close + 1 :], re.S | re.I)
+        if close < 0 or not returns:
+            return False, "[PARSE_SYNTAX_ERROR] CREATE FUNCTION needs RETURNS ... RETURN ..."
+        if full in fake.functions:
+            if replace:
+                if fake.function_in_use(full):
+                    return (
+                        False,
+                        f"[FUNCTION_IN_USE] {full} is used by a row filter or a column mask",
+                    )
+            elif ine:
+                return True, ""
+            else:
+                return False, f"[ROUTINE_ALREADY_EXISTS] {full}"
+        params = [_coldef_param(p) for p in _split_top(s[m.end() : close])]
+        fake.functions[full] = {
+            "params": params,
+            "returns": returns.group(1).strip(),
+            "body": returns.group(2).strip(),
+            "sql": s,
+            "owner": _USER,  # the identity the run authenticates as (GET .../scim/v2/Me)
+        }
+        return True, ""
+
+    m = re.match(
+        rf"REVOKE\s+(ALL\s+PRIVILEGES|\w+)\s+ON\s+TABLE\s+{_FULL}\s+FROM\s+`((?:[^`]|``)+)`\s*$",
+        s,
+        re.I,
+    )
+    if m:
+        priv, cat, sch, name, who = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        if full not in fake.tables:
+            return False, f"[TABLE_OR_VIEW_NOT_FOUND] {full}"
+        held = fake.grants.setdefault(("table", full), {})
+        who = who.replace("``", "`")
+        gone = "ALL_PRIVILEGES" if priv.upper().startswith("ALL") else priv.upper()
+        held[who] = [p for p in held.get(who, []) if p != gone]
         return True, ""
 
     m = re.match(rf"DROP\s+TABLE\s+(IF\s+EXISTS\s+)?{_FULL}\s*$", s, re.I)
@@ -306,6 +384,64 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
 
     def find(col: str) -> int:
         return next((i for i, c in enumerate(cols) if c["name"] == col), -1)
+
+    fn = rf"{_IDENT}\.{_IDENT}\.{_IDENT}"
+    m = re.match(rf"SET\s+ROW\s+FILTER\s+{fn}\s+ON\s*\((.*)\)\s*$", action, re.S | re.I)
+    if m:
+        fcat, fsch, fname, inner = m.groups()
+        func = fake.functions.get(f"{fcat}.{fsch}.{fname}")
+        if func is None:
+            return False, f"[ROUTINE_NOT_FOUND] {fcat}.{fsch}.{fname}"
+        names = _names(inner) if inner.strip() else []
+        missing = [c for c in names if find(c) < 0]
+        if missing:
+            return False, f"[UNRESOLVED_COLUMN] {missing[0]}"
+        if len(names) != len(func["params"]) or func["returns"].lower() != "boolean":
+            return (
+                False,
+                "[INVALID_ROW_FILTER] the function must return BOOLEAN and take one argument per column",
+            )
+        for col, param in zip(names, func["params"], strict=True):
+            if cols[find(col)]["type"].lower() != param["type"]:
+                return False, f"[INVALID_ROW_FILTER] {col} is not of type {param['type']}"
+        t["row_filter"] = {
+            "function_name": f"{fcat}.{fsch}.{fname}",
+            "input_column_names": names,
+        }
+        return True, ""
+
+    if re.match(r"DROP\s+ROW\s+FILTER\s*$", action, re.I):
+        if not t.get("row_filter"):
+            return False, "[ROW_FILTER_NOT_FOUND] the table has no row filter"
+        t.pop("row_filter")
+        return True, ""
+
+    m = re.match(rf"ALTER\s+COLUMN\s+`?([^`\s]+)`?\s+SET\s+MASK\s+{fn}\s*$", action, re.I)
+    if m:
+        col, fcat, fsch, fname = m.groups()
+        idx = find(col)
+        if idx < 0:
+            return False, f"[UNRESOLVED_COLUMN] {col}"
+        func = fake.functions.get(f"{fcat}.{fsch}.{fname}")
+        if func is None:
+            return False, f"[ROUTINE_NOT_FOUND] {fcat}.{fsch}.{fname}"
+        ctype = cols[idx]["type"].lower()
+        if len(func["params"]) != 1 or func["params"][0]["type"] != ctype:
+            return False, f"[INVALID_COLUMN_MASK] the function must take one {ctype} argument"
+        if func["returns"].lower() != ctype:
+            return False, f"[INVALID_COLUMN_MASK] the function must return {ctype}"
+        cols[idx]["mask"] = {"function_name": f"{fcat}.{fsch}.{fname}"}
+        return True, ""
+
+    m = re.match(r"ALTER\s+COLUMN\s+`?([^`\s]+)`?\s+DROP\s+MASK\s*$", action, re.I)
+    if m:
+        idx = find(m.group(1))
+        if idx < 0:
+            return False, f"[UNRESOLVED_COLUMN] {m.group(1)}"
+        if not cols[idx].get("mask"):
+            return False, f"[COLUMN_MASK_NOT_FOUND] {m.group(1)} has no mask"
+        cols[idx].pop("mask")
+        return True, ""
 
     m = re.match(r"ADD\s+COLUMN\s+(.*)$", action, re.S | re.I)
     if m:
@@ -407,6 +543,48 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
     return False, f"fake_databricks: unsupported statement: {s[:200]}"
 
 
+# ---------------------------------------------------------------------- a client
+class _HttpError(Exception):
+    """What the SDK raises for an error status; ``status_code`` is what forge-cli reads."""
+
+    def __init__(self, status_code: int, doc: Dict[str, Any]):
+        super().__init__(doc.get("message") or str(status_code))
+        self.status_code = status_code
+        self.error_code = doc.get("error_code")
+
+
+class _ApiClient:
+    """``WorkspaceClient.api_client`` over plain HTTP: ``do(method, path, query=, body=)``."""
+
+    def __init__(self, endpoint: str):
+        self._endpoint = endpoint
+
+    def do(self, method: str, path: str, query: Any = None, body: Any = None, **_: Any) -> Any:
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        url = self._endpoint + path + ("?" + urllib.parse.urlencode(query) if query else "")
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method)
+        request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                doc = json.loads(exc.read() or b"{}")
+            except ValueError:
+                doc = {}
+            raise _HttpError(exc.code, doc) from exc
+        return json.loads(raw) if raw else {}
+
+
+class _Client:
+    def __init__(self, endpoint: str):
+        self.api_client = _ApiClient(endpoint)
+
+
 # ---------------------------------------------------------------------- the server
 class FakeDatabricks:
     def __init__(
@@ -439,6 +617,13 @@ class FakeDatabricks:
         self.queries: List[Tuple[str, str, str]] = []  # (method, path, raw query)
         self.unknown: List[Tuple[str, str]] = []  # 404'd because not implemented
         self.sql_log: List[str] = []  # every SQL statement received
+        # full name -> {params, returns, body, sql} of each SQL function CREATE FUNCTION made
+        self.functions: Dict[str, Dict[str, Any]] = {}
+        # ("sql", statement) and ("perm", full_name) in the order they arrived
+        self.timeline: List[Tuple[str, str]] = []
+        self.failing: List[Tuple[str, str]] = []  # (substring, message): matching statements FAIL
+        # (method, path substring, status, message): matching requests are answered with an error
+        self.failing_routes: List[Tuple[str, str, int, str]] = []
         self.replaced: List[str] = []  # tables a CREATE OR REPLACE hit while they existed
         self._marker = 0
         self._job_seq = 0
@@ -559,6 +744,30 @@ class FakeDatabricks:
             self._ensure_schema(cat, sch)
             self.tables[full_name] = _new_table(cols, tail, self._next_marker())
 
+    def client(self) -> Any:
+        """A stand-in for ``databricks.sdk.WorkspaceClient``: only ``api_client.do``, over HTTP."""
+        return _Client(self.endpoint)
+
+    def fail_on(self, substring: str, message: str = "[INTERNAL_ERROR] injected failure") -> None:
+        """Make every later statement containing ``substring`` FAIL with ``message``."""
+        self.failing.append((substring, message))
+
+    def fail_route(
+        self, method: str, path_part: str, status: int = 400, message: str = "injected failure"
+    ) -> None:
+        """Answer every later ``method`` request whose path matches the regex ``path_part`` with
+        an error (a 4xx, which the provider does not retry), to make a ``tofu apply`` fail part
+        way, or (a 429 or 503) to make one read fail."""
+        self.failing_routes.append((method, path_part, status, message))
+
+    def function_in_use(self, full_name: str) -> bool:
+        for t in self.tables.values():
+            used = [(t.get("row_filter") or {}).get("function_name")]
+            used += [(c.get("mask") or {}).get("function_name") for c in t["columns"]]
+            if full_name in used:
+                return True
+        return False
+
     def add_job(self, settings: Dict[str, Any]) -> int:
         """Seed a job (brownfield) from its settings; returns the new job id."""
         with self._lock:
@@ -609,6 +818,9 @@ class FakeDatabricks:
     def _route(
         self, method: str, path: str, query: Dict[str, List[str]], body: Dict[str, Any]
     ) -> Tuple[int, Any]:
+        for fail_method, fail_path, status, message in self.failing_routes:
+            if method == fail_method and re.search(fail_path, path):
+                return _err(status, "INVALID_PARAMETER_VALUE", message)
         for m, rx, fn in self.routes:
             if m == method:
                 mt = rx.match(path)
@@ -636,6 +848,7 @@ class FakeDatabricks:
         a("GET", r"/api/2\.1/unity-catalog/schemas/([^/]+)", self._get_schema)
         a("PATCH", r"/api/2\.1/unity-catalog/schemas/([^/]+)", self._patch_schema)
         a("DELETE", r"/api/2\.1/unity-catalog/schemas/([^/]+)", self._delete_schema)
+        a("GET", r"/api/2\.1/unity-catalog/functions/([^/]+)", self._get_function)
         a("GET", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._get_table)
         a("DELETE", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._delete_table)
         a("GET", r"/api/2\.1/unity-catalog/permissions/([a-z_]+)/([^/]+)", self._get_perms)
@@ -773,6 +986,61 @@ class FakeDatabricks:
         self._drop_tags("schemas", full)
         return 200, {}
 
+    # -- functions
+    def add_function(
+        self,
+        full_name: str,
+        params: Sequence[Tuple[str, str]],
+        returns: str,
+        body: str,
+        owner: str = "attacker@example.test",
+    ) -> None:
+        """Seed a SQL function as someone else made it, without a SQL statement (the stand-in's
+        ``sql_log`` stays as it was): ``params`` is ``[(name, type)]``."""
+        with self._lock:
+            self.functions[full_name] = {
+                "params": [{"name": n, "type": t.lower()} for n, t in params],
+                "returns": returns,
+                "body": body,
+                "sql": "",
+                "owner": owner,
+            }
+
+    def _get_function(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        """FunctionInfo, with the fields databricks-sdk-go v0.190.0 names: ``owner``,
+        ``routine_definition``, ``input_params.parameters[]`` and ``full_data_type``."""
+        full = m.group(1)
+        fn = self.functions.get(full)
+        if fn is None:
+            return _err(404, "FUNCTION_DOES_NOT_EXIST", f"Function '{full}' does not exist.")
+        cat, sch, name = full.split(".")
+        returns = fn["returns"].lower()
+        return 200, {
+            "name": name,
+            "catalog_name": cat,
+            "schema_name": sch,
+            "full_name": full,
+            "function_id": f"fid-{full}",
+            "owner": fn.get("owner"),
+            "created_by": fn.get("owner"),
+            "routine_body": "SQL",
+            "routine_definition": fn["body"],
+            "parameter_style": "S",
+            "data_type": re.split(r"[(<]", returns)[0].upper(),
+            "full_data_type": returns,
+            "input_params": {
+                "parameters": [
+                    {
+                        "name": p["name"],
+                        "position": i,
+                        "type_text": p["type"],
+                        "type_name": re.split(r"[(<]", p["type"])[0].upper(),
+                    }
+                    for i, p in enumerate(fn["params"])
+                ]
+            },
+        }
+
     # -- tables
     def _get_table(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
         full = m.group(1)
@@ -802,11 +1070,15 @@ class FakeDatabricks:
             }
             if c.get("comment") is not None:
                 col["comment"] = c["comment"]
+            if c.get("mask"):
+                col["mask"] = dict(c["mask"])
             # partition columns are flagged on the columns themselves in the UC REST API
             if c["name"] in t["partitions"]:
                 col["partition_index"] = t["partitions"].index(c["name"])
             cols.append(col)
+        extra = {"row_filter": t["row_filter"]} if t.get("row_filter") else {}
         return {
+            **extra,
             "name": name,
             "catalog_name": cat,
             "schema_name": sch,
@@ -922,6 +1194,7 @@ class FakeDatabricks:
         return 200, self._assignments(self.grants.get((m.group(1), m.group(2)), {}))
 
     def _patch_perms(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        self.timeline.append(("perm", m.group(2)))
         g = self.grants.setdefault((m.group(1), m.group(2)), {})
         for ch in b.get("changes") or []:
             cur = set(g.get(ch["principal"], []))
@@ -1086,7 +1359,9 @@ class FakeDatabricks:
     def _exec_sql(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
         sql = b.get("statement", "")
         self.sql_log.append(sql)
-        ok, err = _execute(self, sql)
+        self.timeline.append(("sql", sql))
+        injected = next((msg for sub, msg in self.failing if sub in sql), None)
+        ok, err = (False, injected) if injected is not None else _execute(self, sql)
         sid = f"stmt-{len(self.statements) + 1}"
         if ok:
             doc: Dict[str, Any] = {

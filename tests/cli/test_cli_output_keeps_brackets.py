@@ -393,6 +393,44 @@ def test_cli_error_message_context_and_suggestions_print_verbatim(monkeypatch, c
     assert "[dim]" not in out and "[red]" not in out
 
 
+def test_cli_error_context_is_redacted_and_control_characters_are_spelled_out(monkeypatch, capsys):
+    """A provider's text reaches the context (a tofu diagnostic's detail): no secret, no escape."""
+    err = CLIError(1, "opentofu_apply_failed", {"detail": "login failed password=hunter2\x1b[31m"})
+    _raise_from_command(monkeypatch, err)
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "hunter2" not in out
+    assert "\x1b" not in out
+    assert "detail:" in out
+
+
+def test_cli_error_prints_no_credential_shape_the_full_redactor_knows(monkeypatch, capsys):
+    leaky = (
+        "AKIAIOSFODNN7EXAMPLE Authorization: Bearer abcdef0123456789token "  # pragma: allowlist secret
+        "postgres://admin:s3cretpw@db.example.com/orders"  # pragma: allowlist secret
+    )
+    err = CLIError(1, "opentofu_apply_failed", {"detail": leaky})
+    err.suggestions = [leaky]
+    _raise_from_command(monkeypatch, err)
+
+    rc = cli_mod.main(["validate", "unused.fluid.yaml"])
+
+    out = _unwrapped(capsys.readouterr().out)
+    assert rc == 1
+    assert not [
+        s
+        for s in (
+            "AKIAIOSFODNN7EXAMPLE",  # pragma: allowlist secret
+            "abcdef0123456789token",
+            "s3cretpw",
+        )
+        if s in out
+    ]
+
+
 def test_fluid_cli_error_format_for_user_prints_brackets_literally():
     """``FluidCLIError.format_for_user`` (the top-level handler's renderer) had
     the same flaw: ``exposes[orders]`` and ``pkg[gcp]`` lost their brackets."""

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "data-product-forge"
 dynamic = ["version"]
-description = "FLUID Build System: plan/apply/visualize data products across providers (GCP, Snowflake, Local) with policy & contract tests."
+description = "FLUID Build System: plan/apply/visualize data products across providers (AWS, GCP, Snowflake, Databricks, Local) with policy & contract tests."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

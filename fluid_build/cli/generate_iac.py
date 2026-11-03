@@ -125,6 +125,12 @@ def run(args, logger: logging.Logger) -> int:
         provider = _resolve_provider(contract, getattr(args, "provider", "auto"))
         plugin = get_iac_plugin(provider)
         with contract_source(source_contract_file(contract_path)):
+            # A module written for review is applied with a plain `tofu apply`, which would
+            # skip what the plugin binds outside OpenTofu (Unity Catalog masks and row filters).
+            refuse = getattr(plugin, "standalone_module_refusal", None)
+            refusal = refuse(contract) if callable(refuse) else None
+            if refusal is not None:
+                raise refusal
             actions = native_actions(contract, logger, offline=True)
             resources = plugin.emit(contract, actions)
             data = plugin.emit_data(contract, actions)

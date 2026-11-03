@@ -35,6 +35,10 @@ from fluid_build.cli._forge_mode_picker import (
     should_show_picker,
 )
 
+# pick_mode derives its default from the welcome scan's threaded probes; without
+# this a slow runner drops the workspace probe and every default falls back to "ai".
+pytestmark = pytest.mark.usefixtures("deterministic_welcome_scan")
+
 # ---------------------------------------------------------------------------
 # should_show_picker — trigger conditions
 # ---------------------------------------------------------------------------
@@ -174,6 +178,30 @@ def test_pick_mode_default_picks_from_product_when_workspace_has_products(tmp_pa
     args = _bare_args()
     chosen = pick_mode(args, console=silent_console, input_fn=lambda _: "", target_dir=tmp_path)
     assert chosen == "from_product"
+
+
+def test_pick_mode_default_survives_a_slow_workspace_probe(tmp_path, silent_console, monkeypatch):
+    """A workspace probe slower than the scan's default 0.4s budget keeps its result.
+
+    Deterministic stand-in for a loaded CI runner, where the probe overran and the
+    default fell back to ``ai`` (``assert 'ai' == 'from_product'``). Holds only while
+    ``deterministic_welcome_scan`` is applied to this module.
+    """
+    import time
+
+    from fluid_build.cli import _welcome_scan
+
+    real_probe = _welcome_scan._probe_workspace
+
+    def _slow_probe(start):
+        time.sleep(0.6)  # past the default 0.4s _PROBE_TIMEOUT_S
+        return real_probe(start)
+
+    monkeypatch.setattr(_welcome_scan, "_probe_workspace", _slow_probe)
+    (tmp_path / "contract.fluid.yaml").write_text("fluidVersion: '0.7.3'\n")
+    args = _bare_args()
+    chosen = pick_mode(args, console=silent_console, input_fn=lambda _: "", target_dir=tmp_path)
+    assert chosen == "refine"
 
 
 @pytest.mark.parametrize(

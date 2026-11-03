@@ -35,6 +35,7 @@ from fluid_build.cli.forge_banner import compact_next_line
 # transitive deps back into this package.
 from fluid_build.observability.secret_redactor import (
     install_secret_redacting_filter,
+    redact_secret_text,
     register_secrets_from_environ,
 )
 
@@ -475,20 +476,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             # ``tofu state rm <address>`` line runs it without its address.
             from rich.text import Text
 
+            from fluid_build._console import _redact_str, literal_text
+
             message = Text(f"❌ {e.message}", style="red")
             if slug:
                 message.append(f"  [{slug}]", style="dim")
             context.console.print(message)
             if e.context:
                 for key, value in e.context.items():
+                    # Provider text (a tofu diagnostic's detail) lands here: redacted
+                    # and with control characters spelled out, as the handlers below.
                     context.console.print(
-                        Text.assemble("  ", (f"{key}:", "dim"), f" {value}"), soft_wrap=True
+                        Text.assemble(
+                            "  ",
+                            (f"{key}:", "dim"),
+                            literal_text(_redact_str(redact_secret_text(f" {value}"))),
+                        ),
+                        soft_wrap=True,
                     )
             suggestions = getattr(e, "suggestions", None) or []
             if suggestions:
                 context.console.print("\n[yellow]💡 Suggestions:[/yellow]")
                 for suggestion in suggestions:
-                    context.console.print(Text(f"  • {suggestion}"))
+                    context.console.print(
+                        literal_text(_redact_str(redact_secret_text(f"  • {suggestion}")))
+                    )
             docs_url = getattr(e, "docs_url", None)
             if docs_url:
                 # soft_wrap: a docs link is a URL, and Rich word-wraps at the terminal
