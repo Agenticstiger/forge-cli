@@ -433,6 +433,11 @@ dev = [
   # ``cli/__init__.py`` at import time) and that the tier-0
   # ``fluid_build._net`` leaf module stays free of fluid_build upstreams.
   "import-linter>=2.0",
+  # Dependency hygiene (deptry, MIT): declared-but-unused (DEP002), imported-
+  # but-undeclared (DEP001/DEP003), dev-only imports in runtime code (DEP004).
+  # Config in ``[tool.deptry]`` below; advisory in CI for 0.27.0 and 0.28.0,
+  # blocking from 0.29.0.
+  "deptry==0.25.1",
   # The BigQuery read/load tests for embedded-SQL builds (tests/build_runners/
   # test_embedded_sql_bigquery.py) stream Arrow batches through a fake client;
   # the unit lanes install ``.[dev,local]``, which has no pyarrow, so without
@@ -622,7 +627,15 @@ target-version = "py310"
 # fallbacks when Rich is unavailable) are allowed via per-file-ignores
 # or a ``# noqa: T201`` comment that explains the exemption.
 # See CODE_REVIEW C-011.
-select = ["E", "F", "I", "B", "T201"]
+#
+# TID253 (flake8-tidy-imports banned-module-level-imports) keeps the heavy SDKs
+# off the import-time path: they must be imported inside the function that uses
+# them, so ``fluid --help`` / validate / plan stay light. Borrowed from ruff
+# rather than a custom check. Gap, measured: TID253 does NOT flag an import
+# inside a module-level ``try:`` block (the guarded-optional-import idiom), so a
+# green run proves less than it looks. The runtime guards in
+# tests/perf/test_startup_budget.py and ``.importlinter-external`` cover that.
+select = ["E", "F", "I", "B", "T201", "TID253"]
 ignore = [
   "E203",   # whitespace before ':' — Black-compatible
   "E501",   # line-too-long — handled by Black where possible
@@ -644,9 +657,20 @@ ignore = [
   "F811",   # redefined-while-unused — overload patterns
 ]
 
+[tool.ruff.lint.flake8-tidy-imports]
+banned-module-level-imports = [
+  "litellm",
+  "mcp",
+  "openlineage",
+  "boto3",
+  "botocore",
+  "google.cloud",
+  "snowflake.connector",
+  "databricks.sdk",
+]
+
 [tool.ruff.lint.per-file-ignores]
 # Tests, doctor scripts, and one-shot tools are allowed bare print().
-"tests/**" = ["T201"]
 "scripts/**" = ["T201"]
 # The console renderer owns print() fallbacks by design. The canonical
 # home is the tier-0 leaf ``fluid_build/_console.py``; ``cli/console.py``
@@ -658,6 +682,27 @@ ignore = [
 # The error printer is the last-resort path when the Rich panel render
 # itself fails — it MUST use bare print(..., file=sys.stderr).
 "fluid_build/cli/errors.py" = ["T201"]
+# TID253: tests may import the SDKs they exercise at module scope.
+"tests/**" = ["T201", "TID253"]
+# TID253: the MCP output port is a server that needs the SDK to exist; it is
+# only imported once a user runs ``fluid mcp serve`` (lazy at the CLI).
+"fluid_build/output_ports/mcp/server.py" = ["TID253"]
+"fluid_build/output_ports/mcp/_transport.py" = ["TID253"]
+# TID253: BigQuery validator needs google.cloud at import; loaded only by the
+# GCP provider paths.
+"fluid_build/providers/bigquery_validation.py" = ["TID253"]
+
+[tool.deptry]
+known_first_party = ["fluid_build"]
+# Extras that hold dev tooling, not runtime dependencies: their imports are
+# expected in tests only.
+optional_dependencies_dev_groups = ["dev", "docs", "test-emulators", "test-emulators-heavy"]
+# Keeps deptry's defaults (they already exclude tests and .venv).
+extend_exclude = ["scripts", "examples"]
+
+[tool.deptry.per_rule_ignores]
+# h11 is a security floor for a transitive dependency; nothing imports it.
+DEP002 = ["h11"]
 
 [tool.bandit]
 # B608: SQL query construction is expected — this is a pipeline/SQL code generator

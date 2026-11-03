@@ -202,6 +202,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes when the region matches the declaration, fails with the fix when it does not, and is
   skipped when the contract declares none.
 
+### Security
+
+- **`validate_ident` let a name with a trailing newline through.** Python's `$` also matches just
+  before a trailing newline, so the identifier allowlist in `providers/_sql_safety.py`, which the
+  DDL and OpenTofu emitters route names through, accepted `orders\n` and passed it on with the
+  newline: `fluid generate iac` wrote `CREATE EXTERNAL SCHEMA IF NOT EXISTS spectrum_events\n ...`
+  into `main.tf.json`. The module's allowlists now end in `\Z`, so such a name is refused with
+  `Invalid SQL identifier: 'spectrum_events\n'`. That includes a name that reaches it with a
+  trailing newline from an environment variable or a file; strip the value where it is set.
+
 ## [0.26.0] — 2026-11-01
 
 ### Added
