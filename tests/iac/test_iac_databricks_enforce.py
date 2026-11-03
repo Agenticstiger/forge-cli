@@ -175,7 +175,7 @@ def test_a_second_run_executes_nothing(fake):
     assert again.said == []
 
 
-def test_a_changed_predicate_binds_a_new_function_and_keeps_the_old_one(fake):
+def test_a_changed_predicate_binds_a_new_function_and_drops_the_old_one_after_the_apply(fake):
     seed(fake)
     Run(fake).pre(contract())
     old = live(fake)["row_filter"]["function_name"]
@@ -184,14 +184,17 @@ def test_a_changed_predicate_binds_a_new_function_and_keeps_the_old_one(fake):
     changed = contract(filters=[{**FILTER, "where": "consent_data_analytics = false"}])
     run = Run(fake)
     run.pre(changed)
+    assert old in fake.functions, "pre_apply drops nothing"
     run.post(changed)
 
     new = live(fake)["row_filter"]
     assert new["function_name"] != old
     assert new["input_column_names"] == ["consent_data_analytics"]
-    assert old in fake.functions, "a superseded function is not dropped"
+    assert old not in fake.functions, "the superseded function is dropped once the apply is done"
     assert live_masks(fake) == masks
-    assert not any(s.startswith("DROP") for s in run.statements())
+    assert [s for s in run.statements() if s.startswith("DROP")] == [
+        f"DROP FUNCTION IF EXISTS `main`.`cp360`.`{old.rsplit('.', 1)[1]}`"
+    ]
     assert len([s for s in run.statements() if s.startswith("CREATE FUNCTION")]) == 1
 
 
@@ -1046,6 +1049,108 @@ def test_a_read_failure_before_the_apply_still_stops_the_run(fake):
     fake.fail_route("GET", r"/tables/main\.cp360\.profile$", 503, "temporarily unavailable")
     with pytest.raises(UnsupportedBindingError, match="could not read main.cp360.profile"):
         Run(fake).pre(contract())
+
+
+# ── orphan functions: what a changed contract leaves behind ─────────────────
+OTHER_FILTER = {"principal": ANALYSTS, "where": "is_suppressed = false"}
+
+
+def _fluid_functions(fake: FakeDatabricks) -> set:
+    return {n for n in fake.functions if n.rsplit(".", 1)[1].startswith("fluid_")}
+
+
+def _changed_contract_applied(fake: FakeDatabricks):
+    """Apply a contract, then one whose row filter differs: the first filter is superseded."""
+    seed(fake)
+    Run(fake).pre(contract())
+    first = live(fake)["row_filter"]["function_name"]
+    changed = contract(filters=[OTHER_FILTER])
+    return first, changed
+
+
+def test_a_superseded_function_is_dropped_after_a_successful_apply_and_said(fake):
+    first, changed = _changed_contract_applied(fake)
+    run = Run(fake)
+    run.pre(changed)
+    assert first in fake.functions, "pre_apply keeps it until the apply has succeeded"
+    run.post(changed)
+    assert first not in fake.functions
+    now = live(fake)["row_filter"]["function_name"]
+    assert now in fake.functions and now != first
+    assert f"DROP FUNCTION IF EXISTS `main`.`cp360`.`{first.rsplit('.', 1)[1]}`" in run.statements()
+    assert f"dropped superseded function {first}" in run.text
+    assert all(f in fake.functions for f in live_masks(fake).values())
+
+
+def test_a_function_bound_to_any_table_in_the_schema_is_never_dropped(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.create_table("main.cp360.other", [("a", "string", True)])
+    fake.tables["main.cp360.other"]["row_filter"] = {
+        "function_name": first,
+        "input_column_names": [],
+    }
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert first in fake.functions
+    assert "DROP FUNCTION" not in "\n".join(run.statements())
+
+
+def test_only_this_tables_fluid_functions_are_dropped(fake):
+    first, changed = _changed_contract_applied(fake)
+    keep = [
+        "main.cp360.my_helper",  # no fluid_ prefix
+        "main.cp360.fluid_rf_profile_x_deadbeef",  # another table's name
+        "main.cp360.fluid_rf_profile_deadbeef_extra",  # not this module's naming
+        "main.cp360.fluid_mask_profile_nosuchcolumn_deadbeef",  # no such column on the table
+    ]
+    for name in keep:
+        fake.add_function(name, [("val", "STRING")], "STRING", "`val`")
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert first not in fake.functions
+    assert all(name in fake.functions for name in keep)
+
+
+def test_nothing_is_dropped_after_a_failed_apply(fake):
+    first, changed = _changed_contract_applied(fake)
+    run = Run(fake)
+    PLUGIN.post_apply(
+        changed, say=run.said.append, client_factory=fake.client, after_failed_apply=True
+    )
+    assert first in fake.functions
+    assert "DROP FUNCTION" not in "\n".join(run.statements())
+
+
+def test_nothing_is_dropped_when_a_bind_fails(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError):
+        run.post(changed)
+    assert first in fake.functions
+    assert "DROP FUNCTION" not in "\n".join(run.statements())
+
+
+def test_a_schema_whose_tables_cannot_all_be_read_drops_nothing_and_says_so(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.create_table("main.cp360.other", [("a", "string", True)])
+    Run(fake).pre(changed)
+    fake.fail_route("GET", r"/tables/main\.cp360\.other$", 503, "unavailable")
+    run = Run(fake)
+    run.post(changed)
+    assert first in fake.functions
+    assert "orphan" in run.text and "not dropped" in run.text
+
+
+def test_the_orphan_drop_follows_pages_of_functions(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.list_page_size = 1
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert first not in fake.functions
 
 
 # ── the fail-safe: a deny-all filter, then a lock ───────────────────────────

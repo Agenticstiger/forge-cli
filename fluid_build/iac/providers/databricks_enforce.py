@@ -47,6 +47,7 @@ lazily: it is the ``[databricks]`` extra. No message carries a credential.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -741,6 +742,116 @@ def post_apply(
                 "first (replacing a deny-all filter) and grants again afterwards.",
             ),
         )
+    if not after_failed_apply:
+        drop_orphan_functions(runner, targets, say)
+
+
+def _list_named(client: Any, path: str, query: Mapping[str, str], key: str) -> List[Dict[str, Any]]:
+    """Every entry of a paged Unity Catalog list (``key`` holds the page's rows)."""
+    out: List[Dict[str, Any]] = []
+    token: Optional[str] = None
+    for _ in range(100):
+        page = client.api_client.do(
+            "GET", path, query={**query, **({"page_token": token} if token else {})}
+        )
+        out += [r for r in (page.get(key) or []) if isinstance(r, Mapping)]
+        token = page.get("next_page_token") or None
+        if not token:
+            return out
+    raise StatementFailed("the list never ended")
+
+
+def _bare(name: Any) -> str:
+    return str(name or "").replace("`", "").lower()
+
+
+def _orphans(
+    names: Sequence[str], table: str, columns: Collection[str], keep: Collection[str]
+) -> List[str]:
+    """The functions among ``names`` (bare, lower case) that carry this table's fluid_ name
+    pattern and are not in ``keep``: ``fluid_rf_<table>_<8 hex>``, the deny-all
+    ``fluid_rf_<table>_deny_all_<8 hex>`` and ``fluid_mask_<table>_<column>_<8 hex>`` for a column
+    the table has."""
+    t = re.escape(table.lower())
+    shapes = [
+        f"{ROW_FILTER_PREFIX}{t}_[0-9a-f]{{8}}",
+        f"{ROW_FILTER_PREFIX}{t}_deny_all_[0-9a-f]{{8}}",
+    ]
+    shapes += [f"{MASK_PREFIX}{t}_{re.escape(c.lower())}_[0-9a-f]{{8}}" for c in columns]
+    rx = re.compile("|".join(f"(?:{x})" for x in shapes))
+    return [n for n in names if n.startswith("fluid_") and rx.fullmatch(n) and n not in keep]
+
+
+def drop_orphan_functions(session: Session, targets: Sequence[Target], say: Say) -> None:
+    """Drop this module's functions that a changed contract left behind, after a successful apply.
+
+    A function is dropped only when its name is this table's fluid_ pattern
+    (:func:`_orphans`), it is not one the contract expects now, and no table in its schema has it
+    as a row filter or column mask (every table of the schema is read first). If the schema
+    cannot be read completely, nothing is dropped in it. Each drop is printed.
+    """
+    schemas: Dict[Tuple[str, str], List[Target]] = {}
+    for target in targets:
+        parts = target.full_name.split(".")
+        if len(parts) == 3:
+            schemas.setdefault((parts[0], parts[1]), []).append(target)
+    expected = set()
+    for target in targets:
+        e = target.enforcement
+        if e is None:
+            continue
+        expected |= {_bare(m.function.full_name) for m in e.masks}
+        if e.row_filter is not None:
+            expected.add(_bare(e.row_filter.function.full_name))
+        if e.deny_all is not None:
+            expected.add(_bare(e.deny_all.function.full_name))
+    client = session.client
+    for (catalog, schema), members in sorted(schemas.items()):
+        where = f"{catalog}.{schema}"
+        try:
+            query = {"catalog_name": catalog, "schema_name": schema}
+            bound: set = set()
+            columns: Dict[str, List[str]] = {}
+            for row in _list_named(client, "/api/2.1/unity-catalog/tables", query, "tables"):
+                full = str(row.get("full_name") or f"{where}.{row.get('name')}")
+                live = read_table(client, full)
+                if live is None:
+                    continue
+                bound.add(_bare((live.get("row_filter") or {}).get("function_name")))
+                live_cols = _live_columns(live)
+                bound |= {
+                    _bare((c.get("mask") or {}).get("function_name")) for c in live_cols.values()
+                }
+                columns[full.rsplit(".", 1)[-1].lower()] = [
+                    str(c["name"]) for c in live_cols.values()
+                ]
+            listed = _list_named(client, "/api/2.1/unity-catalog/functions", query, "functions")
+        except Exception as exc:  # noqa: BLE001 — unknown binding: drop nothing
+            say(
+                f"  note: orphan functions in {where} not dropped: its tables or functions could "
+                f"not be read ({type(exc).__name__}: {_scrub(exc)})."
+            )
+            continue
+        names = [
+            str(r.get("name") or str(r.get("full_name") or "").rsplit(".", 1)[-1]).lower()
+            for r in listed
+        ]
+        mine = f"{where}.".lower()
+        keep = {n[len(mine) :] for n in expected | bound if n.startswith(mine)}
+        dropped: List[str] = []
+        for target in members:
+            table = target.full_name.split(".")[2]
+            for name in _orphans(names, table, columns.get(table.lower(), ()), keep):
+                if name in dropped:
+                    continue
+                full = f"{where}.{name}"
+                try:
+                    session.runner.run(f"DROP FUNCTION IF EXISTS {quote_table(full)}")
+                except StatementFailed as exc:
+                    say(f"  note: superseded function {full} was not dropped: {exc}")
+                    continue
+                dropped.append(name)
+                say(f"  dropped superseded function {full}")
 
 
 @dataclass
