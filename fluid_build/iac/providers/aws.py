@@ -255,7 +255,8 @@ _HIVE_REFUSED = {
 }
 
 _DECIMAL_FAMILY = frozenset({"decimal", "numeric", "dec", "number"})
-_DECIMAL_ARGS_RE = re.compile(r"^\((\d+)(?:,(\d+))?\)$")
+# ASCII digits only: ``\d`` alone also matches Arabic-Indic and other Unicode digits.
+_DECIMAL_ARGS_RE = re.compile(r"^\((\d+)(?:,(\d+))?\)$", re.ASCII)
 _HIVE_DECIMAL_DEFAULT = "decimal(38,9)"
 _HIVE_TYPE_FIX = (
     "Declare a FLUID column type such as string, integer, bigint, decimal(12,2), double, "
@@ -287,6 +288,10 @@ def _hive_outcome(raw: Any) -> column_types.TypeOutcome:
             "cannot declare them yet",
             column_types.NESTED_FIX,
         )
+    if not rest.isascii():
+        return column_types.refused(
+            f"whose parameters ({rest}) are not ASCII", "Declare the type with ASCII digits."
+        )
     if base in _DECIMAL_FAMILY:
         return _hive_decimal(rest)
     if base == "bit" and rest not in ("", "(1)"):
@@ -307,7 +312,7 @@ def _hive_outcome(raw: Any) -> column_types.TypeOutcome:
     if base == "float" and rest:
         # ``float(53)`` is double precision, as in PostgreSQL and SQL Server.
         digits = rest.strip("()")
-        if digits.isdigit() and int(digits) > 24:
+        if digits.isascii() and digits.isdigit() and int(digits) > 24:
             return column_types.exact("double")
     return column_types.exact(hit)
 
@@ -328,7 +333,9 @@ def _glue_column_type_findings(
 def _glue_table_declared(binding: Mapping[str, Any]) -> bool:
     """Does :func:`_emit_glue` write a table for ``binding``? Its three gates, for the
     validate-time check to apply the column types where the emitter does."""
-    loc = binding.get("location") or {}
+    loc = binding.get("location")
+    if not isinstance(loc, Mapping):
+        return False
     fmt = binding.get("format") or "parquet"
     return bool(loc.get("database") and loc.get("table") and _glue_cataloged(binding, fmt))
 
@@ -339,13 +346,13 @@ def validate_aws_column_types(contract: Mapping[str, Any]) -> Tuple[List[str], L
     fallback. ``fluid validate`` runs this so ``generate iac`` finds nothing new."""
     errors: List[str] = []
     warnings: List[str] = []
-    for index, exposure in enumerate(contract.get("exposes") or []):
+    for index, exposure in enumerate(column_types.exposes_of(contract)):
         binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
         if not isinstance(binding, Mapping) or not is_cloud(binding, "aws"):
             continue
         if not _glue_table_declared(binding):
             continue
-        schema = (exposure.get("contract") or {}).get("schema") or []
+        schema = column_types.schema_of(exposure)
         refusal, lossy = _glue_column_type_findings(_expose_id(exposure) or str(index), schema)
         if refusal is not None:
             errors.append(f"{refusal} {' '.join(refusal.remediation)}".strip())
@@ -370,39 +377,48 @@ def _plan_glue_columns(state: Any) -> Dict[str, str]:
     }
 
 
-def glue_column_type_notices(plan: Mapping[str, Any]) -> List[str]:
-    """One notice per Glue table the plan updates in place with other column types.
+def glue_column_type_changes(plan: Mapping[str, Any]) -> List[str]:
+    """One line per Glue table the plan updates in place with other column types.
 
-    A column type change is a schema change its readers see (a query that compares
-    ``small = '5'`` breaks when ``small`` becomes ``smallint``), and it plans as a
-    plain ``~``: the data files are untouched, so the data-loss gate has nothing to
-    say. This says it instead. Created and removed tables, and updates that keep
-    every column's type, give none.
+    A column type change plans as a plain ``~`` and leaves the data files alone, but
+    Parquet written under the old type (Athena INSERT or CTAS, dbt: ``string``) holds
+    values the new type cannot read, and Athena then fails every read of those files.
+    So each line is data the apply puts at risk, and the engine's data-loss gate
+    (``plan_data_changes``) holds the apply until ``--allow-data-loss``. A difference
+    in spacing alone (``decimal(10, 2)`` against ``decimal(10,2)``) is no change.
+    Created and removed tables, and updates that keep every column's type, give none.
     """
-    notices: List[str] = []
+    lines: List[str] = []
     for change in plan.get("resource_changes") or []:
         if not isinstance(change, Mapping) or change.get("type") != "aws_glue_catalog_table":
             continue
-        detail = change.get("change") or {}
-        if list(detail.get("actions") or []) != ["update"]:
+        detail = change.get("change")
+        if not isinstance(detail, Mapping) or list(detail.get("actions") or []) != ["update"]:
             continue
-        before = detail.get("before") or {}
-        after = detail.get("after") or {}
+        before, after = detail.get("before"), detail.get("after")
         old, new = _plan_glue_columns(before), _plan_glue_columns(after)
         changed = [
             f"{name}: {old[name]} -> {new[name]}"
             for name in old
-            if name in new and old[name] != new[name]
+            if name in new and _unspaced(old[name]) != _unspaced(new[name])
         ]
         if not changed:
             continue
-        table = ".".join(str(before.get(key) or "") for key in ("database_name", "name"))
-        notices.append(
-            f"Glue table {table}: column types change in place ({'; '.join(changed)}). The "
-            "data files are untouched and readers see the new types, so a query that compares "
-            "one of these columns as the old type may need changes."
+        table = ".".join(
+            str(before.get(key) or "")
+            for key in ("database_name", "name")
+            if isinstance(before, Mapping)
         )
-    return notices
+        lines.append(
+            f"Glue table {table}: column types change in place ({'; '.join(changed)}); files "
+            "written under the old type may stop reading until they are rewritten, and "
+            "reverting the column type restores reads"
+        )
+    return lines
+
+
+def _unspaced(glue_type: str) -> str:
+    return "".join(glue_type.split())
 
 
 def _columns(schema: List[Mapping[str, Any]]) -> List[Dict[str, str]]:
@@ -899,10 +915,10 @@ class AwsIacPlugin:
         """The regions existing state places resources in; see :func:`recorded_regions`."""
         return recorded_regions(resources)
 
-    def plan_update_notices(self, plan: Mapping[str, Any]) -> List[str]:
-        """One line per Glue table the saved plan updates in place with other column
-        types. See :func:`glue_column_type_notices`."""
-        return glue_column_type_notices(plan)
+    def plan_data_changes(self, plan: Mapping[str, Any]) -> List[str]:
+        """The Glue tables the saved plan gives other column types in place; each needs
+        ``--allow-data-loss``. See :func:`glue_column_type_changes`."""
+        return glue_column_type_changes(plan)
 
     def provider_block_for(self, contract: Mapping[str, Any]) -> Dict[str, Any]:
         """``provider_block``, plus the region the contract's AWS bindings name.

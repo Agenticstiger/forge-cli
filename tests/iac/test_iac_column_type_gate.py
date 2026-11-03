@@ -22,6 +22,7 @@ and ``validate`` agrees with the emitter on which contracts pass.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import re
@@ -36,7 +37,11 @@ from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.column_types import EXACT, LOSSY, REFUSED
 from fluid_build.iac.governance_validation import validate_governance
 from fluid_build.iac.providers.aws import _hive_outcome, _hive_type, validate_aws_column_types
-from fluid_build.iac.providers.gcp import _bq_outcome, validate_gcp_binding
+from fluid_build.iac.providers.gcp import (
+    _bq_outcome,
+    validate_bigquery_column_types,
+    validate_gcp_binding,
+)
 
 pytestmark = [pytest.mark.unit, pytest.mark.provider]
 
@@ -366,10 +371,10 @@ def test_validate_strict_exits_1_on_the_glue_json_warning_and_0_without_it(tmp_p
     capsys.readouterr()
 
 
-# ── The plan notice for a column type that changes in place ──────────────────
+# ── An in-place Glue column type change is held by the data-loss gate ────────
 
 
-def _glue_change(actions, before_types, after_types):
+def _glue_change(actions, before_types, after_types, before_raw=None):
     def table(types):
         if types is None:
             return None
@@ -383,52 +388,74 @@ def _glue_change(actions, before_types, after_types):
     return {
         "type": "aws_glue_catalog_table",
         "address": "aws_glue_catalog_table.t",
-        "change": {"actions": actions, "before": table(before_types), "after": table(after_types)},
+        "change": {
+            "actions": actions,
+            "before": before_raw if before_raw is not None else table(before_types),
+            "after": table(after_types),
+        },
     }
 
 
-def test_a_glue_update_that_changes_a_column_type_is_announced_once_per_table():
-    plan = {
-        "resource_changes": [
-            _glue_change(
-                ["update"],
-                [("id", "string"), ("small", "string"), ("tz", "string")],
-                [("id", "string"), ("small", "smallint"), ("tz", "timestamp")],
-            )
-        ]
-    }
-    notices = get_iac_plugin("aws").plan_update_notices(plan)
-    assert len(notices) == 1
-    assert notices[0].startswith("Glue table demo.orders: column types change in place")
-    assert "small: string -> smallint; tz: string -> timestamp" in notices[0]
-    assert "id:" not in notices[0]
-    assert "data files are untouched" in notices[0]
+def _hold(*changes):
+    return get_iac_plugin("aws").plan_data_changes({"resource_changes": list(changes)})
 
 
-def test_no_notice_without_a_type_change_or_for_a_create_or_another_resource():
-    plugin = get_iac_plugin("aws")
-    same = [("id", "string"), ("small", "smallint")]
-    assert (
-        plugin.plan_update_notices({"resource_changes": [_glue_change(["update"], same, same)]})
-        == []
+def test_a_glue_update_that_changes_a_column_type_is_held_with_the_whole_story():
+    lines = _hold(
+        _glue_change(
+            ["update"],
+            [("id", "string"), ("small", "string"), ("tz", "string")],
+            [("id", "string"), ("small", "smallint"), ("tz", "timestamp")],
+        )
     )
-    added = same + [("new", "int")]
-    assert (
-        plugin.plan_update_notices({"resource_changes": [_glue_change(["update"], same, added)]})
-        == []
-    )
-    assert (
-        plugin.plan_update_notices({"resource_changes": [_glue_change(["create"], None, same)]})
-        == []
-    )
+    assert len(lines) == 1
+    line = lines[0]
+    assert line.startswith("Glue table demo.orders: column types change in place")
+    assert "small: string -> smallint; tz: string -> timestamp" in line
+    assert "id:" not in line
+    assert "may stop reading until they are rewritten" in line
+    assert "reverting the column type restores reads" in line
+
+
+def test_a_spacing_only_difference_a_new_column_or_a_create_is_not_held():
+    same = [("id", "string"), ("d", "decimal(10, 2)")]
+    assert _hold(_glue_change(["update"], same, [("id", "string"), ("d", "decimal(10,2)")])) == []
+    assert _hold(_glue_change(["update"], same, same + [("new", "int")])) == []
+    assert _hold(_glue_change(["update"], same, same[:1])) == []
+    assert _hold(_glue_change(["create"], None, same)) == []
     other = _glue_change(["update"], [("a", "string")], [("a", "int")])
     other["type"] = "aws_s3_bucket"
-    assert plugin.plan_update_notices({"resource_changes": [other]}) == []
-    assert plugin.plan_update_notices({}) == []
+    assert _hold(other) == []
+    assert get_iac_plugin("aws").plan_data_changes({}) == []
+    # A type change next to a spacing change is still held, for the type only.
+    held = _hold(
+        _glue_change(
+            ["update"],
+            [("a", "string"), ("d", "decimal(10, 2)")],
+            [("a", "int"), ("d", "decimal(10,2)")],
+        )
+    )
+    assert len(held) == 1 and "a: string -> int" in held[0] and "d:" not in held[0]
 
 
-def test_the_engine_prints_the_notice_on_a_dry_run_and_never_fails_on_it(monkeypatch, capsys):
+def test_a_malformed_plan_is_read_without_raising():
+    assert _hold(_glue_change(["update"], None, [("a", "int")], before_raw="x")) == []
+    assert _hold({"type": "aws_glue_catalog_table", "change": "x"}) == []
+
+
+def _enforce(lines, allow):
     from fluid_build.cli import _apply_opentofu_engine as engine
+
+    args = argparse.Namespace(allow_data_loss=allow)
+    changes = {"add": 0, "change": 1, "remove": 0}
+    engine._enforce_data_loss_gate(
+        args, logging.getLogger("test"), "aws", changes, {"remove": 0}, lines
+    )
+
+
+def test_the_apply_is_refused_without_the_flag_and_proceeds_with_it(monkeypatch, capsys):
+    from fluid_build.cli import _apply_opentofu_engine as engine
+    from fluid_build.cli._common import CLIError
 
     plan = {
         "resource_changes": [
@@ -436,19 +463,78 @@ def test_the_engine_prints_the_notice_on_a_dry_run_and_never_fails_on_it(monkeyp
         ]
     }
     monkeypatch.setattr(engine.runner, "tofu_show_plan", lambda *a, **k: plan)
-    log = logging.getLogger("test")
-    plugin = get_iac_plugin("aws")
-    engine._report_plan_update_notices(plugin, {"change": 1}, "wd", {}, log)
-    assert "note: Glue table demo.orders" in capsys.readouterr().out
-    engine._report_plan_update_notices(plugin, {"change": 0}, "wd", {}, log)
-    assert capsys.readouterr().out == ""
-    monkeypatch.setattr(engine.runner, "tofu_show_plan", lambda *a, **k: None)
-    engine._report_plan_update_notices(plugin, {"change": 1}, "wd", {}, log)
-    assert capsys.readouterr().out == ""
+    lines = engine._in_place_changes(get_iac_plugin("aws"), {"change": 1}, "wd", {})
+    assert len(lines) == 1
+    with pytest.raises(CLIError) as caught:
+        _enforce(lines, allow=False)
+    message = str(caught.value.context if hasattr(caught.value, "context") else caught.value)
+    assert "small: string -> smallint" in message and "--allow-data-loss" in message
+    _enforce(lines, allow=True)
+    assert "small: string -> smallint" in capsys.readouterr().out
 
-    def boom(*a, **k):
-        raise RuntimeError("x")
 
-    monkeypatch.setattr(engine.runner, "tofu_show_plan", boom)
-    engine._report_plan_update_notices(plugin, {"change": 1}, "wd", {}, log)
-    assert capsys.readouterr().out == ""
+def test_live_values_in_the_gate_list_and_the_notices_print_literally(monkeypatch, capsys):
+    """A live column type is data: ``string[/]`` must not be read as markup, and a
+    link tag must not become a hyperlink."""
+    from fluid_build.cli import _apply_opentofu_engine as engine
+
+    evil = "string[/] [link=https://evil.example]x[/link]"
+    lines = _hold(_glue_change(["update"], [("a", evil)], [("a", "int")]))
+    _enforce(lines, allow=True)
+    out = capsys.readouterr().out
+    assert "string[/] [link=https://evil.example]x[/link]" in out
+
+    class Plugin:
+        def plan_notices(self, contract):
+            return [evil]
+
+    engine._report_plan_notices(Plugin(), {}, logging.getLogger("test"))
+    assert evil in capsys.readouterr().out
+
+
+# ── Hardening: non-ASCII parameters, the NUMERIC range, malformed bindings ───
+
+
+@pytest.mark.parametrize("fluid_type", ["decimal(١٠,٢)", "float(٥٣)", "number(１０)"])
+def test_non_ascii_digits_in_a_type_are_refused_on_both_clouds(fluid_type):
+    assert _hive_outcome(fluid_type).status == REFUSED
+    assert _bq_outcome(fluid_type).status == REFUSED
+
+
+@pytest.mark.parametrize(
+    "fluid_type", ["decimal(38,0)", "decimal(40,10)", "numeric(38,10)", "number(30)"]
+)
+def test_a_decimal_wider_than_numeric_is_warned_on_bigquery(fluid_type):
+    outcome = _bq_outcome(fluid_type)
+    assert (outcome.target, outcome.status) == ("NUMERIC", LOSSY)
+    assert "bignumeric" in outcome.fix.lower()
+    errors, warnings = validate_gcp_binding(_contract("gcp", [("amt", fluid_type)]))
+    assert errors == [] and len(warnings) == 1 and "bignumeric" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "fluid_type", ["decimal", "decimal(38,9)", "decimal(29,0)", "numeric(10,2)", "number(18)"]
+)
+def test_a_decimal_within_numeric_is_exact_on_bigquery(fluid_type):
+    assert _bq_outcome(fluid_type).status == EXACT
+
+
+@pytest.mark.parametrize("platform", ["aws", "gcp"])
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda e: e["binding"].update(location="s3://x"),
+        lambda e: e.update(contract="x"),
+        lambda e: e["contract"].update(schema="x"),
+        lambda e: e.update(binding="x"),
+        lambda e: e["contract"].update(schema=[1, None, "x"]),
+    ],
+)
+def test_a_schema_invalid_binding_is_skipped_not_fatal(platform, mutate):
+    contract = _contract(platform, _GOOD)
+    mutate(contract["exposes"][0])
+    assert validate_aws_column_types(contract) == ([], [])
+    assert validate_bigquery_column_types(contract) == ([], [])
+    for exposes in ("x", 5, {"a": 1}):
+        assert validate_aws_column_types({"exposes": exposes}) == ([], [])
+        assert validate_bigquery_column_types({"exposes": exposes}) == ([], [])

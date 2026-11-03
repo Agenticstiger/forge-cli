@@ -162,7 +162,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decimal(38,9)`, as a bare `decimal` always was). A type Glue has no form for but that keeps
   its value as text (`json`, `jsonb`, `variant`, `super`, `time`, `interval`, `bignumeric`) is
   still written as `string`, and `fluid validate` now warns for it, so `--strict` fails; BigQuery
-  warns for `geometry` and `geom`, which are planar and become the spherical `GEOGRAPHY`. A
+  warns for `geometry` and `geom`, which are planar and become the spherical `GEOGRAPHY`, and
+  for a `decimal(p,s)` wider than a BigQuery NUMERIC holds (29 integer and 9 fractional digits;
+  declare `bignumeric`). A
   type with no faithful form at all is refused with kind `column-type`: an array, struct, map,
   object, record or row (also `array(string)`), a `bit(n)` wider than one bit and a type no
   table maps, on both clouds, and on Glue also `geography`, `geometry`, `geom`, `point` and
@@ -175,10 +177,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fluid verify` and `fluid diff` compare the live table with the new mapping, so a Glue table
   applied by an earlier version reports type mismatches (verify: CRITICAL; diff: drift) on those
   columns until `fluid apply` runs; verify's "require table recreation" wording is wrong for
-  these columns, a re-apply updates them in place. `fluid apply` (and its dry run) announces
-  such a change before it is made, one note per Glue table listing each `column: old -> new`.
-  The 0.16.2 note that only
-  a bare `array` has no BigQuery form is superseded: an array of any element type and every
+  these columns, a re-apply updates them in place. Changing a Glue column's type in place is
+  held by the data-loss gate: `fluid apply` (and its dry run) refuses, naming each table and
+  `column: old -> new`, until `--allow-data-loss`, because Parquet written under the old type
+  (Athena INSERT or CTAS, dbt) may stop reading until it is rewritten, and reverting the type
+  restores reads; a difference in spacing alone (`decimal(10, 2)`) is no change. The 0.16.2
+  note that only a bare `array` has no BigQuery form is superseded: an array of any element type and every
   struct-like type are refused until the contract schema can declare element and field types.
   BigQuery decimal precision and scale are still not emitted.
 
@@ -246,16 +250,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   n over 1 and any type no table maps.
 - New validate warnings, so `--strict` fails: on Glue, `json`, `jsonb`, `variant`, `super`,
   `time`, `interval` and `bignumeric` (written as `string`, as before; declare `string` to say
-  so); on BigQuery, `geometry` and `geom` (planar, written as the spherical `GEOGRAPHY`).
+  so); on BigQuery, `geometry` and `geom` (planar, written as the spherical `GEOGRAPHY`) and a
+  `decimal(p,s)` wider than a NUMERIC holds (29 integer or 9 fractional digits; declare
+  `bignumeric`).
 - A Glue table's `smallint`, `tinyint`, `real`, `money`, `timestamptz` and the other types that
-  used to become `string` now get their Hive type. The next `fluid apply` updates those column
-  types in place (measured against moto with real `tofu`: `~1`, data files untouched). It is
-  not stopped by `--allow-data-loss`, which gates only removals and data-losing updates; the
-  plan notice announces it instead. Consumers that compare those columns as strings (`small =
-  '5'`) may need changes. Until the apply, `fluid verify` and `fluid diff` report the mismatch.
-- `decimal(10, 2)` is now written `decimal(10,2)`. Measured against moto, a table applied with
-  the spaced form plans an in-place change (`d: decimal(10, 2) -> decimal(10,2)`) on the next
-  apply, harmless but visible in the notice; real Glue was not measured.
+  used to become `string` now get their Hive type, which is a column type change on a table an
+  earlier version applied. `fluid apply` refuses it, and so does its dry run, until
+  `--allow-data-loss`: the refusal names each table and `column: old -> new`. Parquet files
+  written under the old `string` schema (by Athena INSERT or CTAS, or dbt) hold strings, so
+  after `string` -> `smallint` Athena fails every read of them until they are rewritten (files
+  forge's own DuckDB build wrote are fixed by the change). Reverting the column type in the
+  contract restores reads, and `--allow-data-loss` proceeds (measured against moto with real
+  `tofu`: refused without the flag, `~1` applied with it). A difference in spacing alone, such as
+  `decimal(10, 2)` and `decimal(10,2)`, never trips the gate, and neither does an added or
+  removed column, which the gate did not cover before. Consumers that compare these columns as
+  strings (`small = '5'`) may need changes. Until the apply, `fluid verify` and `fluid diff`
+  report the mismatch. With the plan's change list unreadable, an AWS apply that updates
+  anything in place now also needs the flag, as a Databricks apply already did.
+- `decimal(10, 2)` is now written `decimal(10,2)`. Against moto, that alone applies without the
+  flag; real Glue was not measured.
 
 ## [0.26.0] — 2026-11-01
 

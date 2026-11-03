@@ -34,7 +34,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.iac import build_module, get_iac_plugin, runner
 from fluid_build.iac.backend import (
     STATE_BACKEND_ENV,
@@ -279,7 +279,6 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
                 "lost; not gated; a job's run history goes with it): " + ", ".join(retired)
             )
         _report_plan_notices(plugin, contract, logger)
-        _report_plan_update_notices(plugin, changes, str(workdir), env, logger)
         # In-place updates that delete data — a dropped column — which the destroy
         # count above never sees (``~`` in the summary, not ``-``).
         lost_in_place = _in_place_changes(plugin, changes, str(workdir), env)
@@ -1075,9 +1074,11 @@ def _enforce_data_loss_gate(
             changes["remove"],
         )
     if lost_in_place:
-        cprint(
+        # The lines quote live objects (a table's column types): data, not markup.
+        cprint_literal(
             "\n  ⚠️  --allow-data-loss: existing data is changed in place with no snapshot: "
-            + "; ".join(lost_in_place)
+            + "; ".join(lost_in_place),
+            soft_wrap=True,
         )
         logger.warning(
             "--allow-data-loss: bypassing the data-loss gate for in-place data changes "
@@ -1471,35 +1472,11 @@ def _report_plan_notices(plugin: Any, contract: Mapping[str, Any], logger: loggi
     if not callable(notices):
         return
     try:
-        lines = list(notices(contract))
+        for line in notices(contract):
+            # A notice can quote live objects, so it is data, not markup.
+            cprint_literal(f"  note: {line}")
     except Exception as exc:  # noqa: BLE001 — advisory only, never fails an apply
         logger.debug("plan notices unavailable: %s", type(exc).__name__)
-        return
-    for line in lines:
-        cprint(f"  note: {line}")
-
-
-def _report_plan_update_notices(
-    plugin: Any,
-    changes: Mapping[str, int],
-    workdir: str,
-    env: Mapping[str, str],
-    logger: logging.Logger,
-) -> None:
-    """Print the plugin's notices about the saved plan's in-place updates
-    (``plan_update_notices(plan)``), such as Glue columns that change type. Advisory
-    only: it never gates and a plan it cannot read prints nothing."""
-    notices = getattr(plugin, "plan_update_notices", None)
-    if not callable(notices) or not int(changes.get("change", 0)):
-        return
-    try:
-        shown = runner.tofu_show_plan(workdir, plan_file="tfplan", env=env)
-        lines = list(notices(shown)) if shown is not None else []
-    except Exception as exc:  # noqa: BLE001 — advisory only, never fails an apply
-        logger.debug("plan update notices unavailable: %s", type(exc).__name__)
-        return
-    for line in lines:
-        cprint(f"  note: {line}")
 
 
 def _reconcile_with_state(

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -69,9 +70,9 @@ from . import gcp_governance as _gov
 
 # FLUID column type → BigQuery type, keyed on the lower-cased base name
 # (``varchar(255)`` is ``varchar``). Every entry is a type a BigQuery table schema
-# takes; ``_bq_outcome`` classifies the rest. A bare ``number`` or ``decimal`` is
-# NUMERIC whatever precision it declares: BigQuery precision and scale are not
-# emitted yet.
+# takes; ``_bq_outcome`` classifies the rest. A ``number`` or ``decimal`` is NUMERIC
+# whatever precision it declares (precision and scale are not emitted yet), and
+# ``_bq_outcome`` warns when the declared range is wider than a NUMERIC holds.
 _BQ_TYPES = column_types.expand(
     {
         "STRING": "string, str, text, varchar, varchar2, nvarchar, char, nchar, character, clob, "
@@ -92,6 +93,13 @@ _BQ_TYPES = column_types.expand(
         "GEOGRAPHY": "geography, geometry, geom, point",
     }
 )
+
+#: What a BigQuery NUMERIC holds, and the types that take a precision and scale: the
+#: scale is not emitted, so a declared range beyond it overflows at load.
+_BQ_NUMERIC_INTEGER_DIGITS = 29
+_BQ_NUMERIC_SCALE = 9
+_BQ_DECIMAL_FAMILY = frozenset({"decimal", "numeric", "dec", "number"})
+_BQ_DECIMAL_ARGS_RE = re.compile(r"^\((\d+)(?:,(\d+))?\)$", re.ASCII)
 
 #: Types whose BigQuery type holds a different thing. ``GEOMETRY`` is planar and
 #: ``GEOGRAPHY`` is a sphere, so the same coordinates mean other shapes and distances.
@@ -156,6 +164,10 @@ def _bq_outcome(raw: Any) -> column_types.TypeOutcome:
             "with fields, and the contract schema cannot declare them yet",
             column_types.NESTED_FIX,
         )
+    if not rest.isascii():
+        return column_types.refused(
+            f"whose parameters ({rest}) are not ASCII", "Declare the type with ASCII digits."
+        )
     if base == "bit" and rest not in ("", "(1)"):
         return column_types.refused(
             "which is a bit string, and BigQuery has none",
@@ -168,6 +180,17 @@ def _bq_outcome(raw: Any) -> column_types.TypeOutcome:
             "Declare a FLUID column type such as string, integer, bigint, numeric, double, "
             "boolean, date, timestamp or json.",
         )
+    if base in _BQ_DECIMAL_FAMILY and rest:
+        match = _BQ_DECIMAL_ARGS_RE.match(rest)
+        if match is not None:
+            precision, scale = int(match.group(1)), int(match.group(2) or 0)
+            if scale > _BQ_NUMERIC_SCALE or precision - scale > _BQ_NUMERIC_INTEGER_DIGITS:
+                return column_types.lossy(
+                    hit,
+                    f"whose range a BigQuery NUMERIC ({_BQ_NUMERIC_INTEGER_DIGITS} integer and "
+                    f"{_BQ_NUMERIC_SCALE} fractional digits) cannot hold",
+                    "Declare bignumeric if the values need that range.",
+                )
     if base in _BQ_LOSSY:
         return column_types.lossy(
             hit, _BQ_LOSSY[base], "Declare geography if the coordinates are on the sphere."
@@ -206,13 +229,13 @@ def validate_bigquery_column_types(contract: Mapping[str, Any]) -> Tuple[List[st
     ``generate iac`` finds nothing new."""
     errors: List[str] = []
     warnings: List[str] = []
-    for exposure in contract.get("exposes") or []:
+    for exposure in column_types.exposes_of(contract):
         binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
         if not isinstance(binding, Mapping) or not _gov.gcp_owned(binding):
             continue
         if resolve_gcp_target(binding) != BIGQUERY_TABLE:
             continue
-        schema = (exposure.get("contract") or {}).get("schema") or []
+        schema = column_types.schema_of(exposure)
         refusal, lossy = _bq_column_type_findings(_expose_id(exposure) or "?", schema)
         if refusal is not None:
             errors.append(f"{refusal} {' '.join(refusal.remediation)}".strip())

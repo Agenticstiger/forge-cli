@@ -96,6 +96,20 @@ def split_type(raw: Any) -> Tuple[str, str]:
     return text[:cut].strip(), text[cut:].replace(" ", "")
 
 
+def exposes_of(contract: Any) -> List[Any]:
+    """The contract's ``exposes`` when it is a list, else none: a schema-invalid contract
+    is the schema check's to report, and the type gate skips what it cannot read."""
+    exposes = contract.get("exposes") if isinstance(contract, Mapping) else None
+    return exposes if isinstance(exposes, list) else []
+
+
+def schema_of(exposure: Mapping[str, Any]) -> List[Any]:
+    """The expose's ``contract.schema`` columns when they are a list, else none."""
+    section = exposure.get("contract")
+    schema = section.get("schema") if isinstance(section, Mapping) else None
+    return schema if isinstance(schema, list) else []
+
+
 def column_type_findings(
     expose: str,
     schema: Iterable[Any],

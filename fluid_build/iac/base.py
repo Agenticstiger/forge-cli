@@ -72,10 +72,6 @@ class IacProviderPlugin(Protocol):
       ``--allow-data-loss``, as a destroy does. It raises
       :class:`UnsupportedBindingError` for an update the provider cannot apply,
       which stops the apply whatever the flags.
-    * ``plan_update_notices(plan)``: advisory lines about the saved plan's
-      in-place updates (``tofu show -json``) that a consumer of the table will
-      see but that need no ``--allow-data-loss``, printed before the apply and
-      on a dry run. Never gates.
     * ``explain_plan_failure(output, contract, state)``: an
       :class:`UnsupportedBindingError` naming the fix for a failed ``tofu``
       run, or ``None``.
