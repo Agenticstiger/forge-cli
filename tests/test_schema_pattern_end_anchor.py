@@ -25,8 +25,8 @@ JavaScript refused it.
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
+from re import sub
 from typing import Any, Dict, Iterator, List
 
 import pytest
@@ -147,10 +147,9 @@ def test_bundle_validation_refuses_an_id_that_ends_in_a_newline() -> None:
 def test_bundle_validation_without_jsonschema_is_an_error(monkeypatch: Any) -> None:
     """The check reads the flag ``schema_validator`` needs: a jsonschema that is found but
     fails to import is the library-missing error, not a skipped check."""
-    import fluid_build.schema_manager as schema_manager
     from fluid_build.forge.core.validators import validate_json_schema
 
-    monkeypatch.setattr(schema_manager, "JSONSCHEMA_AVAILABLE", False)
+    monkeypatch.setattr("fluid_build.schema_manager.JSONSCHEMA_AVAILABLE", False)
     issues = validate_json_schema(
         "contract.resolved.yaml", _contract("0.7.6"), schema_manager=FluidSchemaManager()
     )
@@ -204,7 +203,7 @@ def _tree(pattern: str) -> str:
 def _only_end_anchors_changed(pattern: str) -> bool:
     """Python's parser reads the rewrite as ``pattern`` with each ``$`` (``AT_END``)
     made ``\\Z`` (``AT_END_STRING``), and nothing else changed."""
-    expected = re.sub(r"\bAT_END\b", "AT_END_STRING", _tree(pattern))
+    expected = sub(r"\bAT_END\b", "AT_END_STRING", _tree(pattern))
     return _tree(_end_anchored(pattern)) == expected
 
 
