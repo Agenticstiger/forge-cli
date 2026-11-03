@@ -432,14 +432,16 @@ def _spawn_probe(
     deadline.
 
     Probes must not write to stdout/stderr: a daemon thread caught mid-write
-    when the interpreter exits can abort the process.
+    when the interpreter exits can abort the process. Only ``Exception`` is
+    recorded; a probe that ends its thread with ``SystemExit`` or
+    ``KeyboardInterrupt`` is simply dropped at the deadline.
     """
     future: Future[Dict[str, Any]] = Future()
 
     def _run() -> None:
         try:
             future.set_result(fn(*args))
-        except BaseException as exc:  # noqa: BLE001 — recorded on the Future, never raised here
+        except Exception as exc:  # noqa: BLE001 — recorded on the Future, never raised here
             future.set_exception(exc)
 
     threading.Thread(target=_run, name=f"welcome-scan-{name}", daemon=True).start()
