@@ -20,6 +20,19 @@ AWS configuration resolution utilities.
 import os
 from typing import Optional, Tuple
 
+from fluid_build.providers._plan_validation import PlanValidationError
+
+
+class AwsAccountUnresolvedError(PlanValidationError):
+    """No AWS account id could be resolved, so no resource name can be planned.
+
+    A :class:`PlanValidationError` so ``native_actions`` re-raises it (matched by
+    type) rather than treating the planner as one that could not run: the
+    account feeds names (``{account}-fluid-data``) and every role ARN, and a
+    plan built on ``None`` is refused by the validator with a message about a
+    bucket name, not the cause.
+    """
+
 
 def resolve_account_and_region(
     account_id: Optional[str] = None, region: Optional[str] = None

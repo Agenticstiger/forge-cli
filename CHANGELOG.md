@@ -147,6 +147,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls its "v1" headings an internal milestone. A test fails if it announces a 1.x release while
   the package is below 1.0. The package description named GCP, Snowflake and Local and now names
   AWS and Databricks too.
+- **An AWS contract's schedule was dropped without a word, and the one it got was not labelled.**
+  The workflow Lambda was named `fluid-workflow-<id>` raw, so a dotted id (the schema's own
+  example is `gold.hr.employee_360_v1`, and 27 of 28 examples use dots) or one over about 49
+  characters failed the plan validator, and `native_actions` swallowed the refusal at DEBUG:
+  `fluid generate iac` and `fluid apply` logged "Planned EventBridge schedule", wrote the Glue and
+  S3 resources and no `aws_lambda_function`, `aws_lambda_permission` or `aws_scheduler_schedule`,
+  exit 0. Every name the schedule planner derives from an id (Lambda functions, permission
+  statement ids, the schedule, event rules, the state machine, the MWAA environment) now goes
+  through one helper that replaces what the service refuses with `-` and, past the service limit,
+  cuts and ends in a hash of the whole id so two long ids stay apart. A plan its own validator
+  rejects is a typed `PlanValidationError`, matched by type through the cause chain like a
+  sovereignty refusal: `generate iac` exits non-zero and `apply` raises, where a planner that
+  could not run (no SDK, no credentials) stays best-effort. The scheduled Lambda only logs each
+  task and runs no build, and both roles it names (`fluid-workflow-execution`,
+  `EventBridgeSchedulerRole`) are never created, so every plan that emits it now warns
+  `schedule_placeholder_lambda`. An AWS account that cannot be resolved (no `AWS_ACCOUNT_ID`, no
+  credentials for `sts:GetCallerIdentity`) is refused by name, before any name is derived from it,
+  rather than as a Glue or S3 name `None-fluid-staging` the validator would reject.
 - **The same AWS contract could emit a different module from one run to the next.** The AWS
   planner ordered its actions through a `set`, so the order changed with Python's hash seed, and
   with it the emitted module: a Lambda permission, schedule target, event-source mapping or S3

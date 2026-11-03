@@ -43,6 +43,7 @@ import yaml
 
 from fluid_build.cli import generate_iac, main
 from fluid_build.cli._common import CLIError
+from fluid_build.providers.aws.util.config import AwsAccountUnresolvedError
 
 pytestmark = [pytest.mark.unit, pytest.mark.provider]
 
@@ -202,7 +203,10 @@ class TestApplyStillResolvesTheAccount:
     (``cli/_apply_opentofu_engine.py``); only ``generate iac`` passes ``offline``."""
 
     def test_the_apply_call_asks_sts_for_a_missing_account(self, clients):
-        generate_iac.native_actions(_scheduled(), logging.getLogger("t"))
+        # The ``clients`` guard makes the lookup fail, so no account resolves:
+        # refused by name, before any resource name is derived from ``None``.
+        with pytest.raises(AwsAccountUnresolvedError, match="AWS_ACCOUNT_ID"):
+            generate_iac.native_actions(_scheduled(), logging.getLogger("t"))
         assert clients == ["sts"]
 
     def test_the_offline_call_plans_without_asking(self, clients):

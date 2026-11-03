@@ -28,7 +28,22 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
+from ..util.names import (
+    EVENTBRIDGE_RULE_NAME,
+    LAMBDA_FUNCTION_NAME,
+    LAMBDA_STATEMENT_ID,
+    MWAA_ENVIRONMENT_NAME,
+    SCHEDULER_SCHEDULE_NAME,
+    STATE_MACHINE_NAME,
+    bounded_aws_name,
+)
+
 logger = logging.getLogger(__name__)
+
+#: The IAM roles the planned Lambdas and schedules reference by literal ARN. The
+#: planner emits no ``aws_iam_role``: both must already exist in the account.
+WORKFLOW_EXECUTION_ROLE = "fluid-workflow-execution"
+SCHEDULER_INVOKE_ROLE = "EventBridgeSchedulerRole"
 
 
 class SchedulePlanner:
@@ -51,6 +66,17 @@ class SchedulePlanner:
         self.account_id = account_id
         self.region = region
         self.logger = logger or logging.getLogger(__name__)
+
+    @staticmethod
+    def workflow_function_name(contract_id: Any) -> str:
+        """The workflow Lambda's name: the one every trigger Lambda invokes.
+
+        Every AWS name derived from a contract id goes through
+        :func:`bounded_aws_name`. A dotted id (``gold.hr.employee_360_v1``, the
+        schema's own example) or a long one used to reach the plan validator raw,
+        which refused the whole plan, so the schedule went missing from the module.
+        """
+        return bounded_aws_name(f"fluid-workflow-{contract_id}", LAMBDA_FUNCTION_NAME)
 
     def plan_schedule_actions(self, contract: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
@@ -124,7 +150,7 @@ class SchedulePlanner:
         actions = []
 
         contract_id = contract.get("id", "unknown")
-        environment_name = f"mwaa-{contract_id}"
+        environment_name = bounded_aws_name(f"mwaa-{contract_id}", MWAA_ENVIRONMENT_NAME)
 
         # Check if MWAA environment already specified
         mwaa_config = orchestration.get("mwaa", {})
@@ -174,7 +200,7 @@ class SchedulePlanner:
         timezone = orchestration.get("timezone", "UTC")
 
         # 1. Create Lambda function for workflow execution
-        function_name = f"fluid-workflow-{contract_id}"
+        function_name = self.workflow_function_name(contract_id)
 
         actions.append(
             {
@@ -183,7 +209,7 @@ class SchedulePlanner:
                 "function_name": function_name,
                 "runtime": "python3.11",
                 "handler": "index.handler",
-                "role": f"arn:aws:iam::{self.account_id}:role/fluid-workflow-execution",
+                "role": f"arn:aws:iam::{self.account_id}:role/{WORKFLOW_EXECUTION_ROLE}",
                 "code": self._generate_workflow_lambda_code(contract, orchestration),
                 "timeout": orchestration.get("timeout", 300),
                 "memory_size": orchestration.get("memory", 256),
@@ -197,7 +223,7 @@ class SchedulePlanner:
         )
 
         # 2. Create EventBridge Scheduler rule
-        schedule_name = f"fluid-schedule-{contract_id}"
+        schedule_name = bounded_aws_name(f"fluid-schedule-{contract_id}", SCHEDULER_SCHEDULE_NAME)
 
         actions.append(
             {
@@ -208,7 +234,7 @@ class SchedulePlanner:
                 "timezone": timezone,
                 "target": {
                     "arn": f"arn:aws:lambda:{self.region}:{self.account_id}:function:{function_name}",
-                    "role_arn": f"arn:aws:iam::{self.account_id}:role/EventBridgeSchedulerRole",
+                    "role_arn": f"arn:aws:iam::{self.account_id}:role/{SCHEDULER_INVOKE_ROLE}",
                     "input": json.dumps(
                         {"contract_id": contract_id, "execution_type": "scheduled"}
                     ),
@@ -226,7 +252,9 @@ class SchedulePlanner:
                 "id": f"lambda_permission_{contract_id}",
                 "op": "lambda.add_permission",
                 "function_name": function_name,
-                "statement_id": f"AllowEventBridgeInvoke-{contract_id}",
+                "statement_id": bounded_aws_name(
+                    f"AllowEventBridgeInvoke-{contract_id}", LAMBDA_STATEMENT_ID
+                ),
                 "action": "lambda:InvokeFunction",
                 "principal": "scheduler.amazonaws.com",
                 "source_arn": f"arn:aws:scheduler:{self.region}:{self.account_id}:schedule/default/{schedule_name}",
@@ -277,7 +305,9 @@ class SchedulePlanner:
         actions = []
 
         contract_id = contract.get("id", "unknown")
-        function_name = f"fluid-s3-trigger-{contract_id}-{trigger_id}"
+        function_name = bounded_aws_name(
+            f"fluid-s3-trigger-{contract_id}-{trigger_id}", LAMBDA_FUNCTION_NAME
+        )
 
         # 1. Create Lambda function
         actions.append(
@@ -287,7 +317,7 @@ class SchedulePlanner:
                 "function_name": function_name,
                 "runtime": "python3.11",
                 "handler": "index.handler",
-                "role": f"arn:aws:iam::{self.account_id}:role/fluid-workflow-execution",
+                "role": f"arn:aws:iam::{self.account_id}:role/{WORKFLOW_EXECUTION_ROLE}",
                 "code": self._generate_s3_trigger_lambda_code(contract, trigger),
                 "timeout": 300,
                 "tags": self._get_schedule_tags(contract),
@@ -318,7 +348,9 @@ class SchedulePlanner:
                 "id": f"lambda_permission_s3_{trigger_id}",
                 "op": "lambda.add_permission",
                 "function_name": function_name,
-                "statement_id": f"AllowS3Invoke-{trigger_id}",
+                "statement_id": bounded_aws_name(
+                    f"AllowS3Invoke-{trigger_id}", LAMBDA_STATEMENT_ID
+                ),
                 "action": "lambda:InvokeFunction",
                 "principal": "s3.amazonaws.com",
                 "source_arn": f"arn:aws:s3:::{bucket}",
@@ -334,7 +366,9 @@ class SchedulePlanner:
         actions = []
 
         contract_id = contract.get("id", "unknown")
-        function_name = f"fluid-dynamodb-trigger-{contract_id}-{trigger_id}"
+        function_name = bounded_aws_name(
+            f"fluid-dynamodb-trigger-{contract_id}-{trigger_id}", LAMBDA_FUNCTION_NAME
+        )
 
         # 1. Create Lambda function
         actions.append(
@@ -344,7 +378,7 @@ class SchedulePlanner:
                 "function_name": function_name,
                 "runtime": "python3.11",
                 "handler": "index.handler",
-                "role": f"arn:aws:iam::{self.account_id}:role/fluid-workflow-execution",
+                "role": f"arn:aws:iam::{self.account_id}:role/{WORKFLOW_EXECUTION_ROLE}",
                 "code": self._generate_dynamodb_trigger_lambda_code(contract, trigger),
                 "timeout": 300,
                 "tags": self._get_schedule_tags(contract),
@@ -376,8 +410,12 @@ class SchedulePlanner:
         actions = []
 
         contract_id = contract.get("id", "unknown")
-        rule_name = f"fluid-event-{contract_id}-{trigger_id}"
-        function_name = f"fluid-event-trigger-{contract_id}-{trigger_id}"
+        rule_name = bounded_aws_name(
+            f"fluid-event-{contract_id}-{trigger_id}", EVENTBRIDGE_RULE_NAME
+        )
+        function_name = bounded_aws_name(
+            f"fluid-event-trigger-{contract_id}-{trigger_id}", LAMBDA_FUNCTION_NAME
+        )
 
         # 1. Create Lambda function
         actions.append(
@@ -387,7 +425,7 @@ class SchedulePlanner:
                 "function_name": function_name,
                 "runtime": "python3.11",
                 "handler": "index.handler",
-                "role": f"arn:aws:iam::{self.account_id}:role/fluid-workflow-execution",
+                "role": f"arn:aws:iam::{self.account_id}:role/{WORKFLOW_EXECUTION_ROLE}",
                 "code": self._generate_event_trigger_lambda_code(contract, trigger),
                 "timeout": 300,
                 "tags": self._get_schedule_tags(contract),
@@ -420,7 +458,9 @@ class SchedulePlanner:
                 "id": f"lambda_permission_eventbridge_{trigger_id}",
                 "op": "lambda.add_permission",
                 "function_name": function_name,
-                "statement_id": f"AllowEventBridgeInvoke-{trigger_id}",
+                "statement_id": bounded_aws_name(
+                    f"AllowEventBridgeInvoke-{trigger_id}", LAMBDA_STATEMENT_ID
+                ),
                 "action": "lambda:InvokeFunction",
                 "principal": "events.amazonaws.com",
                 "source_arn": f"arn:aws:events:{self.region}:{self.account_id}:rule/{rule_name}",
@@ -436,7 +476,9 @@ class SchedulePlanner:
         actions = []
 
         contract_id = contract.get("id", "unknown")
-        function_name = f"fluid-sqs-trigger-{contract_id}-{trigger_id}"
+        function_name = bounded_aws_name(
+            f"fluid-sqs-trigger-{contract_id}-{trigger_id}", LAMBDA_FUNCTION_NAME
+        )
 
         # 1. Create Lambda function
         actions.append(
@@ -446,7 +488,7 @@ class SchedulePlanner:
                 "function_name": function_name,
                 "runtime": "python3.11",
                 "handler": "index.handler",
-                "role": f"arn:aws:iam::{self.account_id}:role/fluid-workflow-execution",
+                "role": f"arn:aws:iam::{self.account_id}:role/{WORKFLOW_EXECUTION_ROLE}",
                 "code": self._generate_sqs_trigger_lambda_code(contract, trigger),
                 "timeout": 300,
                 "tags": self._get_schedule_tags(contract),
@@ -480,7 +522,7 @@ class SchedulePlanner:
         actions = []
 
         contract_id = contract.get("id", "unknown")
-        state_machine_name = f"fluid-workflow-{contract_id}"
+        state_machine_name = bounded_aws_name(f"fluid-workflow-{contract_id}", STATE_MACHINE_NAME)
 
         # Generate state machine definition from tasks
         state_machine_def = self._generate_state_machine_definition(contract, orchestration)
@@ -563,7 +605,7 @@ def handler(event, context):
     ) -> Dict[str, Any]:
         """Generate Lambda code for S3 trigger."""
         contract_id = contract.get("id", "unknown")
-        workflow_fn = f"fluid-workflow-{contract_id}"
+        workflow_fn = self.workflow_function_name(contract_id)
         return {
             "ZipFile": f"""
 import json
@@ -598,7 +640,7 @@ def handler(event, context):
     ) -> Dict[str, Any]:
         """Generate Lambda code for DynamoDB trigger."""
         contract_id = contract.get("id", "unknown")
-        workflow_fn = f"fluid-workflow-{contract_id}"
+        workflow_fn = self.workflow_function_name(contract_id)
         return {
             "ZipFile": f"""
 import json
@@ -632,7 +674,7 @@ def handler(event, context):
     ) -> Dict[str, Any]:
         """Generate Lambda code for EventBridge trigger."""
         contract_id = contract.get("id", "unknown")
-        workflow_fn = f"fluid-workflow-{contract_id}"
+        workflow_fn = self.workflow_function_name(contract_id)
         return {
             "ZipFile": f"""
 import json
@@ -664,7 +706,7 @@ def handler(event, context):
     ) -> Dict[str, Any]:
         """Generate Lambda code for SQS trigger."""
         contract_id = contract.get("id", "unknown")
-        workflow_fn = f"fluid-workflow-{contract_id}"
+        workflow_fn = self.workflow_function_name(contract_id)
         return {
             "ZipFile": f"""
 import json

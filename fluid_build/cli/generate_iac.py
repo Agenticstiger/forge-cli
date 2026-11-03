@@ -410,10 +410,35 @@ def native_actions(contract, logger: logging.Logger, *, offline: bool = False) -
         # outside its declared jurisdiction logged the violation and then
         # emitted the module anyway, exit 0. Absence of a check and a failed
         # check are different things; only the first is best-effort.
-        if _is_sovereignty_refusal(exc):
+        # The same holds for a plan its own provider's validator rejected
+        # (``PlanValidationError``): a dotted contract id made the AWS planner
+        # refuse, and swallowing that left a module with no schedule, exit 0.
+        if _is_sovereignty_refusal(exc) or _is_plan_validation_refusal(exc):
             raise
         logger.debug("shadow: native planner unavailable: %s", exc)
     return []
+
+
+def _is_plan_validation_refusal(exc: BaseException) -> bool:
+    """True when ``exc`` (or anything it was raised *from*) is a plan-validation refusal.
+
+    Matched on type through the ``__cause__``/``__context__`` chain, never on
+    message text, as :func:`_is_sovereignty_refusal` is.
+    """
+    from fluid_build.providers._plan_validation import PlanValidationError
+
+    return _in_cause_chain(exc, (PlanValidationError,))
+
+
+def _in_cause_chain(exc: BaseException, types: tuple) -> bool:
+    seen: set = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, types):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 def _is_sovereignty_refusal(exc: BaseException) -> bool:
@@ -432,15 +457,7 @@ def _is_sovereignty_refusal(exc: BaseException) -> bool:
     from fluid_build._errors import ResidencyViolationError
     from fluid_build.cli._errors import SovereigntyViolationError
 
-    vetoes = (SovereigntyViolationError, ResidencyViolationError)
-    seen: set = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, vetoes):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__ or cur.__context__
-    return False
+    return _in_cause_chain(exc, (SovereigntyViolationError, ResidencyViolationError))
 
 
 def _drop_referenced_container_actions(contract, actions: list, logger: logging.Logger) -> list:

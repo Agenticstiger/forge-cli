@@ -300,9 +300,9 @@ def _cyclic_tasks() -> Dict[str, Any]:
 class TestThePlannerFailing:
     """The planner failing on another field does not let the environment drop.
 
-    ``native_actions`` returns ``[]`` when the native planner raises (it logs
-    that at DEBUG), so the emitter saw no ``mwaa.ensure_environment`` and wrote
-    the data plane alone, exit 0.
+    ``native_actions`` returns ``[]`` when the native planner raises something
+    that is not a refusal (it logs that at DEBUG), so the emitter saw no
+    ``mwaa.ensure_environment`` and wrote the data plane alone, exit 0.
     """
 
     @pytest.mark.parametrize("make", [_upper_case_table, _cyclic_tasks], ids=["glue-name", "cycle"])
@@ -322,7 +322,12 @@ class TestThePlannerFailing:
             generate_iac.run(
                 _args(_write(tmp_path, _upper_case_table()), out), logging.getLogger("t")
             )
-        assert excinfo.value.context["kind"] == "mwaa-environment-not-emitted"
+        # The planner ran and refused its own plan, so ``native_actions`` raises
+        # it (``PlanValidationError``) before the emitter's backstop is reached;
+        # the cycle case, a planner failure that is not a refusal of the plan,
+        # still gets that backstop (above).
+        assert excinfo.value.event == "generate_iac_failed"
+        assert "Plan validation failed" in excinfo.value.context["error"]
         assert not out.exists()
 
     @pytest.mark.parametrize(

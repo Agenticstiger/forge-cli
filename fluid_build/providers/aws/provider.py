@@ -27,6 +27,7 @@ import time
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
+from fluid_build.providers._plan_validation import PlanValidationError
 from fluid_build.providers.base import (
     ApplyResult,
     BaseProvider,
@@ -34,8 +35,10 @@ from fluid_build.providers.base import (
 )
 
 from .plan.planner import plan_actions
+from .plan.schedule import SCHEDULER_INVOKE_ROLE, WORKFLOW_EXECUTION_ROLE
 from .util.auth import get_auth_report
 from .util.circuit_breaker import CircuitBreakerOpenError, get_circuit_breaker
+from .util.config import AwsAccountUnresolvedError
 from .util.dependencies import order_actions_by_dependencies
 from .util.logging import redact_dict
 from .util.validation import ResourceValidator, validate_actions_strict
@@ -173,6 +176,17 @@ class AwsProvider(BaseProvider):
             mode=mode,
         )
 
+        if not self.account_id:
+            # Before any name is derived from it: with ``None`` the planner
+            # builds ``None-fluid-staging`` and the validator refuses the plan
+            # with a message about a bucket, hiding the cause. ``generate iac``
+            # passes a placeholder account, so it never reaches this.
+            raise AwsAccountUnresolvedError(
+                "The AWS account id could not be resolved. Set AWS_ACCOUNT_ID, or "
+                "configure AWS credentials (environment, profile or role) so that "
+                "sts:GetCallerIdentity succeeds."
+            )
+
         try:
             # Validate sovereignty constraints (FLUID 0.7.1)
             self._validate_sovereignty(contract)
@@ -202,7 +216,7 @@ class AwsProvider(BaseProvider):
 
             if not validation_result["valid"]:
                 error_msg = "Plan validation failed:\n" + "\n".join(validation_result["errors"])
-                raise ProviderError(error_msg)
+                raise PlanValidationError(error_msg)
 
             # Log warnings if any
             for warning in validation_result.get("warnings", []):
@@ -365,6 +379,24 @@ class AwsProvider(BaseProvider):
         try:
             actions = plan_schedule_actions(contract, self.account_id, self.region, self.logger)
 
+            if any(a.get("op") == "eventbridge.ensure_schedule" for a in actions):
+                # The schedule fires a Lambda whose body only logs each task and
+                # records it ok; it runs no build. Its two roles are named by
+                # literal ARN and nothing here creates them. Say so on every
+                # plan that emits it, rather than let a green apply imply a
+                # working pipeline.
+                self.warn_kv(
+                    event="schedule_placeholder_lambda",
+                    message=(
+                        "The scheduled Lambda is a placeholder: it logs each task and does "
+                        "not run this product's builds. The IAM roles "
+                        f"arn:aws:iam::{self.account_id}:role/{WORKFLOW_EXECUTION_ROLE} "
+                        f"(Lambda) and arn:aws:iam::{self.account_id}:role/"
+                        f"{SCHEDULER_INVOKE_ROLE} (EventBridge Scheduler) are referenced by "
+                        "name and not created: they must already exist in the account."
+                    ),
+                    contract_id=contract.get("id"),
+                )
             if actions:
                 self.info_kv(
                     event="schedule_planned",
