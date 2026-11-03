@@ -207,6 +207,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Invalid SQL identifier: 'spectrum_events\n'`. That includes a name that reaches it with a
   trailing newline from an environment variable or a file; strip the value where it is set.
 
+- **36 more validators let a value with a trailing newline through.** The same `$` ended other
+  whole-string patterns, so a value written as a YAML `|` block, read from a `.env` file or decoded
+  from `%0A` in a URL kept its newline: `fluid generate iac` put `region = "eu-west-1\n"` on the
+  AWS provider, and a Databricks job got `branch = "main\n"` from `?branch=main%0A`. They now end
+  in `\Z` (two call sites use `fullmatch`), so such a value is refused with the validator's usual
+  message, or takes the path the code already has for a value that is not a plain name: an AWS
+  binding region is left to the environment, and a product id forged from a JDBC source or
+  imported from dbt is slugified. Covered: quality-check selectors, catalog and JDBC identifiers,
+  BigQuery and GCP project ids, contract, build, federation-workspace and overlay-env ids,
+  row-filter names, Singer tap and target names, prompt profile and overlay names, mission
+  predicate paths, AWS and GCP resource names, Snowflake account segments and Databricks git refs.
+
 ## [0.26.0] — 2026-11-01
 
 ### Added
