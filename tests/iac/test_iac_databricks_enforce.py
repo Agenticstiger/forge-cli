@@ -1291,6 +1291,26 @@ def test_a_job_is_unpaused_once_the_live_bindings_match(workspace_client):
     assert not any("is created paused" in n for n in PLUGIN.plan_notices(_job_contract()))
 
 
+def test_the_pause_decision_is_made_once_and_the_notice_reuses_it(workspace_client):
+    fake = workspace_client
+    seed(fake)
+    Run(fake).pre(contract())  # bound: a fresh read would say "protected"
+    fake.fail_route("GET", r"/tables/main\.cp360\.profile$", 503, "unavailable")
+    assert _emitted_job(_job_contract())["schedule"]["pause_status"] == "PAUSED"
+    fake.failing_routes.clear()  # the read error was transient
+    notices = "\n".join(PLUGIN.plan_notices(_job_contract()))
+    assert "is created paused" in notices and "main.cp360.profile" in notices
+
+
+def test_the_notice_is_not_reused_by_a_later_run(workspace_client):
+    fake = workspace_client
+    seed(fake)
+    assert _emitted_job(_job_contract())["schedule"]["pause_status"] == "PAUSED"
+    assert "is created paused" in "\n".join(PLUGIN.plan_notices(_job_contract()))
+    Run(fake).pre(contract())  # a later run, with no emit before its notices
+    assert not any("is created paused" in n for n in PLUGIN.plan_notices(_job_contract()))
+
+
 def test_a_job_stays_paused_while_a_binding_is_missing_or_differs(workspace_client):
     fake = workspace_client
     seed(fake)
