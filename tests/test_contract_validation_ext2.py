@@ -350,12 +350,14 @@ class TestDetectAndValidateProviderExt(unittest.TestCase):
         warnings = v.report.get_warnings()
         assert any("databricks" in w.message.lower() for w in warnings)
 
-    def test_azure_adds_warning(self):
+    def test_azure_is_an_unknown_provider(self):
+        # azure is not a registered provider: it is reported as unknown, not as
+        # "coming soon", and the valid names come from the registry.
         v = _make_validator_new(provider_name="azure")
         v.contract = {"exposes": [{"binding": {"platform": "azure"}}]}
         v._detect_and_validate_provider()
-        warnings = v.report.get_warnings()
-        assert any("azure" in w.message.lower() for w in warnings)
+        errors = v.report.get_errors()
+        assert any("unknown provider 'azure'" in e.message.lower() for e in errors)
 
     def test_gcp_unavailable_adds_error(self):
         v = _make_validator_new(provider_name="gcp")

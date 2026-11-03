@@ -36,7 +36,10 @@ class StreamingTemplate(ProjectTemplate):
             name="Streaming Data Product",
             description="Real-time data processing and streaming analytics with event-driven architecture",
             complexity=ComplexityLevel.ADVANCED,
-            provider_support=["gcp", "aws", "azure", "kafka", "confluent"],
+            # Scaffolding metadata, filtered against the registered forge providers
+            # where it is used. azure was dropped (not a registered provider);
+            # kafka / confluent are platform names, kept as metadata.
+            provider_support=["gcp", "aws", "kafka", "confluent"],
             use_cases=[
                 "Real-time analytics and dashboards",
                 "Event-driven microservices",

@@ -279,10 +279,12 @@ def register(subparsers: argparse._SubParsersAction):
     # Provider selection
     p.add_argument(
         "--provider",
-        choices=["local", "gcp", "snowflake", "aws", "azure"],
+        # No argparse ``choices``: checked against the live provider registry after
+        # the parse (cli/__init__.py), so a retired name gets its hint.
         default="local",
         help=(
-            "Infrastructure provider (default: local = DuckDB, no cloud needed). "
+            "Infrastructure provider (default: local = DuckDB, no cloud needed; "
+            "see `fluid providers`). "
             "With --quickstart, gcp|snowflake select a provider starter contract."
         ),
     )

@@ -231,7 +231,11 @@ def test_a_blocking_allowlist_does_not_hide_the_hint(monkeypatch, caplog, capsys
     monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "zzz")
     rc, text = _main_output(["--provider", "redshift", "providers"], caplog, capsys)
     assert rc == 2
-    assert _REDSHIFT_HINT in text
+    # Still the retirement hint, but it no longer sends the operator to a provider
+    # their own policy blocks: it says so.
+    assert "Provider 'redshift' was retired" in text
+    assert "use --provider aws" not in text
+    assert "plugin allow/block policy blocks here" in text
 
 
 def test_a_contract_naming_redshift_gets_the_aws_native_plan(monkeypatch):

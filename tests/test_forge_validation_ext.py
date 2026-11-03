@@ -109,9 +109,15 @@ class TestSanitizeProjectName:
 
 class TestValidateProvider:
     def test_valid_providers(self):
-        for p in ["local", "gcp", "aws", "azure", "snowflake", "databricks"]:
+        for p in ["local", "gcp", "aws", "snowflake", "databricks"]:
             ok, err = validate_provider(p)
             assert ok is True, f"Failed for {p}"
+
+    def test_azure_and_retired_names_are_not_providers(self):
+        # Registry-driven: azure is not registered; redshift is retired (into aws).
+        for p in ["azure", "redshift"]:
+            ok, err = validate_provider(p)
+            assert ok is False, p
 
     def test_empty(self):
         ok, err = validate_provider("")

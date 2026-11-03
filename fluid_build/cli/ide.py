@@ -181,18 +181,18 @@ class FluidLanguageServer:
                     insert_text="aws",
                 ),
                 CompletionItem(
-                    label="azure",
-                    kind=CompletionType.PROVIDER,
-                    detail="Microsoft Azure",
-                    documentation="Microsoft Azure provider",
-                    insert_text="azure",
-                ),
-                CompletionItem(
                     label="snowflake",
                     kind=CompletionType.PROVIDER,
                     detail="Snowflake Data Platform",
                     documentation="Snowflake Data Platform provider",
                     insert_text="snowflake",
+                ),
+                CompletionItem(
+                    label="databricks",
+                    kind=CompletionType.PROVIDER,
+                    detail="Databricks Lakehouse",
+                    documentation="Databricks provider (plan and OpenTofu apply)",
+                    insert_text="databricks",
                 ),
             ],
             "contract_fields": [

@@ -124,12 +124,26 @@ def validate_provider(provider: str) -> Tuple[bool, Optional[str]]:
     Returns:
         (is_valid, error_message)
     """
-    valid_providers = ["local", "gcp", "aws", "azure", "snowflake", "databricks"]
+    from fluid_build.providers import (
+        BUILTIN_PROVIDERS,
+        registered_provider_names,
+        retired_provider_hint,
+    )
 
     if not provider:
         return False, "Provider cannot be empty"
 
-    if provider.lower() not in valid_providers:
+    # Registry-driven: the names `fluid providers` lists, plugins included. The
+    # static list this replaced named `azure` (not registered).
+    try:
+        valid_providers = registered_provider_names()
+    except Exception:  # noqa: BLE001 - discovery trouble must not reject every provider
+        valid_providers = sorted(BUILTIN_PROVIDERS)
+
+    if provider.lower().replace("-", "_") not in valid_providers:
+        retired = retired_provider_hint(provider)
+        if retired:
+            return False, retired
         return False, f"Invalid provider. Must be one of: {', '.join(valid_providers)}"
 
     return True, None

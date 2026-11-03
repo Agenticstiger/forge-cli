@@ -866,6 +866,10 @@ def _inspect_bigquery(
         return base
     try:
         from fluid_build.providers import bigquery_validation
+
+        # The module imports the SDK on first use, not at import: touch it here so
+        # a missing 'gcp' extra fails with the install hint, not mid-comparison.
+        bigquery_validation.bigquery  # noqa: B018
     except ImportError:
         base.status = ERROR
         base.detail = "google-cloud-bigquery is not installed; install the 'gcp' extra"

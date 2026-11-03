@@ -76,9 +76,11 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
     p.add_argument("contract", nargs="?", help="contract.fluid.yaml")
     p.add_argument(
         "--provider",
-        choices=_PROVIDER_CHOICES,
+        # No argparse ``choices``: a retired name gets its hint (checked against the
+        # provider registry after the parse, cli/__init__.py) and `run` names the
+        # IaC clouds when the provider has no IaC plugin.
         default="auto",
-        help="Target cloud (default: auto-detect from the contract)",
+        help=f"Target cloud, one of {', '.join(sorted(IAC_PLUGINS))} (default: auto-detect)",
     )
     p.add_argument("--out", "-o", default="runtime/iac", help="Output directory")
     p.add_argument("--env", help="Environment overlay")

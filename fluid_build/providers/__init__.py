@@ -18,7 +18,12 @@ Provider registry & discovery for FLUID Build (production-ready).
 
 Key features
 ------------
-- Single source of truth: PROVIDERS dict (name -> class or factory).
+- Single source of truth: PROVIDERS dict (name -> class or factory). Names come
+  from ``fluid_build.providers`` entry-point *metadata* and are listed without
+  importing anything; a provider class is imported (and cached) only when it is
+  looked up by name -- the pattern of stevedore's ``entry_point_names()`` plus a
+  load-one-by-name ``DriverManager`` (https://docs.openstack.org/stevedore/),
+  done here with the stdlib ``importlib.metadata`` so no dependency is added.
 - Safe, idempotent discovery (re-entrant, thread-safe, 'force' refresh).
 - Multiple auto-registration strategies per submodule:
     1) Explicit self-registration (preferred):
@@ -54,8 +59,177 @@ from dataclasses import dataclass
 from inspect import isclass
 from typing import Any, Dict, List, Optional, Set, Tuple, Type
 
+#: The built-in providers and where their class lives. This table mirrors the
+#: ``[project.entry-points."fluid_build.providers"]`` block of pyproject (a test
+#: pins the two together). It is the fallback for a checkout whose installed
+#: metadata predates an entry point (a stale editable install without
+#: ``databricks``), and it is the set of names a THIRD-PARTY plugin may never
+#: claim (see :func:`_claims_reserved_name`).
+BUILTIN_PROVIDERS: Dict[str, str] = {
+    "aws": "fluid_build.providers.aws:AwsProvider",
+    "databricks": "fluid_build.providers.databricks:DatabricksProvider",
+    "gcp": "fluid_build.providers.gcp:GcpProvider",
+    "local": "fluid_build.providers.local:LocalProvider",
+    "snowflake": "fluid_build.providers.snowflake:SnowflakeProvider",
+}
+
+#: The distribution that ships the built-ins. An entry point from any other
+#: distribution is a third-party plugin.
+_FIRST_PARTY_DIST = "data-product-forge"
+
+
+@dataclass(frozen=True)
+class _Pending:
+    """A provider known by name and entry-point string, not yet imported."""
+
+    name: str
+    value: str  # "module:attr"
+    source: str  # "entrypoint" (declared metadata) | "builtin" (static fallback table)
+    ep: Any = None  # the importlib.metadata.EntryPoint, when there is one
+    distribution: Optional[str] = None
+
+    def load(self) -> Any:
+        if self.ep is not None:
+            return self.ep.load()
+        modname, _, attr = self.value.partition(":")
+        return getattr(importlib.import_module(modname), attr)
+
+
+class _ProviderMap(dict):
+    """``PROVIDERS``: a dict whose unloaded entries are entry points, not classes.
+
+    Membership, ``len``, iteration and ``keys()`` cover loaded *and* pending
+    names and import nothing. Reading a value (``[name]``, ``get``, ``values``,
+    ``items``) imports the pending provider once and caches the class. Writes
+    behave as on a plain dict and supersede a pending entry of the same name.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pending: Dict[str, _Pending] = {}
+
+    # -- names (never import) ------------------------------------------------
+    def __contains__(self, name: object) -> bool:
+        return dict.__contains__(self, name) or name in self._pending
+
+    def _names(self) -> List[str]:
+        return list(dict.keys(self)) + [n for n in self._pending if not dict.__contains__(self, n)]
+
+    def keys(self):  # type: ignore[override]
+        return self._names()
+
+    def __iter__(self):
+        return iter(self._names())
+
+    def __len__(self) -> int:
+        return len(self._names())
+
+    def __bool__(self) -> bool:
+        return bool(dict.__len__(self) or self._pending)
+
+    # -- values (import on demand) ------------------------------------------
+    def _resolve(self, name: str) -> None:
+        with _LOCK:
+            pend = self._pending.get(name)
+            if pend is None:
+                return
+            _RESOLVING.add(name)
+            try:
+                obj = pend.load()
+                # Importing the provider package may already have registered it
+                # (the built-ins self-register); otherwise register what the
+                # entry point resolved to. Same gates as any registration.
+                register_provider(name, obj, source="entrypoint")
+                meta = _REGISTRY_META.get(name)
+                if meta is not None:
+                    meta["source"] = "entrypoint"
+            except Exception as exc:
+                # Type-only, as in discovery: never interpolate exception text.
+                _safe_log(
+                    None,
+                    logging.WARNING,
+                    "provider_entrypoint_failed",
+                    name=name,
+                    error=type(exc).__name__,
+                )
+                _add_discovery_error("entrypoint", name, exc)
+            finally:
+                _RESOLVING.discard(name)
+                self._pending.pop(name, None)
+
+    def __getitem__(self, name):
+        if not dict.__contains__(self, name):
+            self._resolve(name)
+        return dict.__getitem__(self, name)
+
+    def get(self, name, default=None):
+        if not dict.__contains__(self, name):
+            self._resolve(name)
+        return dict.get(self, name, default)
+
+    def _resolve_all(self) -> None:
+        for n in list(self._pending):
+            self._resolve(n)
+
+    def values(self):  # type: ignore[override]
+        self._resolve_all()
+        return dict.values(self)
+
+    def items(self):  # type: ignore[override]
+        self._resolve_all()
+        return dict.items(self)
+
+    # -- writes ---------------------------------------------------------------
+    def __setitem__(self, name, value) -> None:
+        self._pending.pop(name, None)
+        dict.__setitem__(self, name, value)
+
+    def __delitem__(self, name) -> None:
+        if name in self._pending:
+            del self._pending[name]
+            if not dict.__contains__(self, name):
+                return
+        dict.__delitem__(self, name)
+
+    def pop(self, name, *default):
+        self._pending.pop(name, None)
+        return dict.pop(self, name, *default)
+
+    def clear(self) -> None:
+        self._pending.clear()
+        dict.clear(self)
+
+    def update(self, *args, **kwargs) -> None:  # type: ignore[override]
+        for other in args:
+            if isinstance(other, _ProviderMap):
+                for n, pend in other._pending.items():
+                    if not dict.__contains__(self, n):
+                        self._pending[n] = pend
+                other = dict(dict.items(other))
+            for k, v in dict(other).items():
+                self[k] = v
+        for k, v in kwargs.items():
+            self[k] = v
+
+    def copy(self) -> "_ProviderMap":  # type: ignore[override]
+        dup = _ProviderMap()
+        dup.update(self)
+        return dup
+
+    # -- introspection that must not import ------------------------------------
+    def pending(self, name: str) -> Optional[_Pending]:
+        return self._pending.get(name)
+
+    def is_loaded(self, name: str) -> bool:
+        return dict.__contains__(self, name)
+
+
 # Public, process-wide registry (name -> provider class or factory)
-PROVIDERS: Dict[str, Any] = {}
+PROVIDERS: Dict[str, Any] = _ProviderMap()
+
+# Names currently being imported by ``_ProviderMap._resolve``: only that import
+# may fill its own pending slot (the built-in packages self-register on import).
+_RESOLVING: Set[str] = set()
 
 # Collect discovery errors for diagnostics/UIs
 DISCOVERY_ERRORS: List[Dict[str, str]] = []
@@ -130,40 +304,106 @@ def resolve_retired_platform(name: str) -> str:
     return RETIRED_SUCCESSORS.get(_normalize_name(name), name)
 
 
-def _claims_retired_name(name: str, who: str, logger: Optional[logging.Logger]) -> bool:
-    """True (after a WARNING) when a plugin tries to register a retired provider name.
+def _claims_reserved_name(
+    name: str,
+    who: str,
+    logger: Optional[logging.Logger],
+    *,
+    third_party: bool = False,
+    ep: Any = None,
+    ambiguous_grant: bool = False,
+) -> bool:
+    """True (after a WARNING) when a plugin tries to register a reserved provider name.
 
-    A retired name stays reserved: an entry point able to claim ``redshift`` would
-    replace the retirement hint for ``--provider redshift`` and win the platform
-    lookup for contracts. Only discovery calls this; an explicit
-    ``register_provider(...)`` call in code stays allowed.
+    Two kinds of name are reserved against discovery:
+
+    * a **retired** name (``RETIRED_PROVIDERS``): an entry point able to claim
+      ``redshift`` would replace the retirement hint for ``--provider redshift``
+      and win the platform lookup for contracts;
+    * a **built-in** name (``BUILTIN_PROVIDERS``), when ``third_party`` is true:
+      a plugin from any distribution other than ``data-product-forge`` (unless
+      the operator grants it via ``plugin_manager.override_granted``) that
+      claims ``gcp`` / ``snowflake`` / ... would otherwise capture the provider
+      that emits that cloud's DDL and IaC (and its credentials).
+
+    The check runs BEFORE the entry point is loaded, so a hostile or broken
+    plugin module is never imported. Only discovery calls this; an explicit
+    ``register_provider(..., override=True)`` call in code stays allowed.
     """
-    if not isinstance(name, str) or _normalize_name(name) not in RETIRED_PROVIDERS:
+    if not isinstance(name, str):
+        return False
+    from fluid_build.plugin_manager import granted_distribution, override_granted
+
+    cname = _normalize_name(name)
+    hint = ""
+    if cname in RETIRED_PROVIDERS:
+        # No built-in to replace, so no operator grant can lift this one.
+        event, what = "provider_retired_name_reserved", "the retired provider"
+    elif third_party and cname in BUILTIN_PROVIDERS:
+        if ep is not None and override_granted(ep) and not ambiguous_grant:
+            (logger or _log).info(
+                "provider_builtin_override_granted: %r overrides the built-in provider %r "
+                "(FLUID_PLUGINS_ALLOWLIST)",
+                who,
+                cname,
+                extra={"evt": "provider_builtin_override_granted", "_name": cname, "plugin": who},
+            )
+            return False
+        event, what = "provider_builtin_name_reserved", "the built-in provider"
+        if ambiguous_grant:
+            hint = "; several distributions are granted this name, so none was loaded"
+        else:
+            dist = granted_distribution(ep) if ep is not None else None
+            if dist:
+                # %r-formatted by the caller below: a distribution name is
+                # plugin-controlled text and must not print raw into a log line.
+                hint = f"; to allow it, add {f'{dist}:{cname}'!r} to FLUID_PLUGINS_ALLOWLIST"
+    else:
         return False
     # The plugin goes into the message itself, repr'd so control characters are
     # escaped: the CLI's formatters print the message only, and this line is how
     # an operator learns which package to uninstall.
     (logger or _log).warning(
-        "provider_retired_name_reserved: %r tried to register the retired provider %r; "
-        "it was skipped",
+        "%s: %r tried to register %s %r; it was skipped%s",
+        event,
         who,
-        _normalize_name(name),
-        extra={
-            "evt": "provider_retired_name_reserved",
-            "_name": _normalize_name(name),
-            "plugin": who,
-        },
+        what,
+        cname,
+        hint,
+        extra={"evt": event, "_name": cname, "plugin": who},
     )
     return True
+
+
+def _claims_retired_name(name: str, who: str, logger: Optional[logging.Logger]) -> bool:
+    """Retired-name half of :func:`_claims_reserved_name` (in-tree auto-register paths)."""
+    return _claims_reserved_name(name, who, logger)
 
 
 def retired_provider_hint(name: Optional[str]) -> Optional[str]:
     """One-line ``--provider``/``FLUID_PROVIDER`` error for a retired name, else ``None``."""
     if not name:
         return None
-    use = RETIRED_PROVIDERS.get(_normalize_name(name))
+    cname = _normalize_name(name)
+    use = RETIRED_PROVIDERS.get(cname)
     if use is None:
         return None
+    successor = RETIRED_SUCCESSORS.get(cname)
+    if successor is not None:
+        try:
+            from fluid_build.plugin_manager import is_allowed
+
+            blocked = not is_allowed(successor)
+        except Exception:  # noqa: BLE001 - a hint never fails on a policy lookup
+            blocked = False
+        if blocked:
+            # Naming `--provider aws` when the operator's policy removed aws would
+            # send them to a second error.
+            return (
+                f"Provider '{name}' was retired: it is now part of the '{successor}' provider, "
+                f"which the plugin allow/block policy blocks here "
+                "(FLUID_PLUGINS_ALLOWLIST / FLUID_PLUGINS_BLOCKLIST), so nothing serves it"
+            )
     return f"Provider '{name}' was retired: {use}"
 
 
@@ -395,7 +635,10 @@ def register_provider(
     # every registration source.
     from fluid_build.plugin_manager import is_allowed
 
-    if not is_allowed(cname):
+    # A name being resolved from its entry point already passed this gate when
+    # discovery declared it; re-asking at first use would let a policy that
+    # changed since discovery silently turn a declared provider into a missing one.
+    if cname not in _RESOLVING and not is_allowed(cname):
         _safe_log(
             logger,
             logging.DEBUG,
@@ -422,14 +665,21 @@ def register_provider(
         return
 
     with _LOCK:
-        exists = cname in PROVIDERS
+        # A name an entry point already claims is taken even before its class is
+        # imported: only that entry point's own import (``_RESOLVING``) may fill
+        # the slot, so a plugin that self-registers at import time cannot slip in
+        # ahead of a built-in that has not been loaded yet.
+        exists = PROVIDERS.is_loaded(cname) or (  # type: ignore[attr-defined]
+            PROVIDERS.pending(cname) is not None  # type: ignore[attr-defined]
+            and cname not in _RESOLVING
+        )
         if exists and not override:
             _safe_log(
                 logger, logging.DEBUG, "provider_duplicate_ignored", name=cname, source=source
             )
             return
 
-        PROVIDERS[cname] = provider
+        PROVIDERS[cname] = provider  # also supersedes a pending entry of that name
         # capture meta
         mod = getattr(provider, "__module__", "<unknown>")
         qual = getattr(provider, "__qualname__", repr(provider))
@@ -442,6 +692,31 @@ def register_provider(
             provider=f"{mod}:{qual}",
             source=source,
         )
+
+
+def provider_origin(name: str) -> Dict[str, Any]:
+    """Where ``name`` comes from, without importing it.
+
+    ``loaded`` is False for a provider declared by entry point and not yet used;
+    then ``module`` is the entry point's ``module:attr`` string.
+    """
+    cname = _normalize_name(name)
+    with _LOCK:
+        pend = PROVIDERS.pending(cname)  # type: ignore[attr-defined]
+        if pend is not None and not PROVIDERS.is_loaded(cname):  # type: ignore[attr-defined]
+            return {
+                "loaded": False,
+                "source": "entrypoint",
+                "module": pend.value,
+                "distribution": pend.distribution,
+            }
+        meta = _REGISTRY_META.get(cname, {})
+        return {
+            "loaded": PROVIDERS.is_loaded(cname),  # type: ignore[attr-defined]
+            "source": meta.get("source", "unknown"),
+            "module": meta.get("module", "unknown"),
+            "distribution": None,
+        }
 
 
 def registry_dump() -> Dict[str, Any]:
@@ -468,9 +743,10 @@ def get_provider(name: str) -> Any:
     """
     cname = _normalize_name(name)
     with _LOCK:
-        if cname not in PROVIDERS:
+        found = PROVIDERS.get(cname)  # imports the provider if it is only declared
+        if found is None:
             raise KeyError(f"Unknown provider '{name}'. Available: {sorted(PROVIDERS.keys())}")
-        return PROVIDERS[cname]
+        return found
 
 
 def clear_providers() -> None:
@@ -504,10 +780,14 @@ def discover_providers(logger: Optional[logging.Logger] = None, *, force: bool =
     Import provider subpackages and auto-register implementations.
 
     Discovery order:
-      0) ``fluid_build.providers`` entry-points (pip-installed plugins).
-      1) Curated / default built-in modules.
-      2) pkgutil scan of ``fluid_build.providers.*`` subpackages.
-      3) Fallback best-effort (if registry still empty).
+      0) ``fluid_build.providers`` entry-points: the five built-ins and any
+         pip-installed plugin. Recorded BY NAME from entry-point metadata;
+         nothing is imported. A provider class is imported, once, when it is
+         first looked up (``PROVIDERS[name]`` / ``.get(name)``).
+      1) ``FLUID_PROVIDERS`` modules, when the operator names them (imported).
+      2) pkgutil scan of the remaining ``fluid_build.providers.*`` PACKAGES
+         (never the ``*_validation`` / ``quality_engine`` / ``_*`` helpers).
+      3) Fallback best-effort (if the registry is still empty).
 
     Idempotent. If force=True, re-attempts even if discovery was previously marked done.
     Honors FLUID_PROVIDERS="mod1,mod2" to constrain imports.
@@ -537,14 +817,15 @@ def discover_providers(logger: Optional[logging.Logger] = None, *, force: bool =
         # 0) entry-point plugins (third-party packages)
         _discover_entrypoints(logger)
 
-        # 1) preload curated/default modules (soft-fail)
+        # 1) modules the operator named via FLUID_PROVIDERS (soft-fail)
         _preload_curated(logger)
 
         # 2) iterate all submodules in this package (soft-fail)
         _discover_subpackages(logger)
 
-        # 3) If still empty, fallback (best-effort)
-        if not PROVIDERS:
+        # 3) If still empty, fallback (best-effort). Skipped when the operator's
+        # policy blocked a name: an empty registry is then the policy working.
+        if not PROVIDERS and not POLICY_BLOCKED:
             _fallback_registers(logger)
 
         _DISCOVERY_DONE = True
@@ -557,8 +838,49 @@ def discover_providers(logger: Optional[logging.Logger] = None, *, force: bool =
         )
 
 
+def _dist_name(ep: Any) -> Optional[str]:
+    """Normalised distribution name behind an entry point, or ``None`` if unattributable."""
+    dist = getattr(ep, "dist", None)
+    name = getattr(dist, "name", None) if dist is not None else None
+    if not name:
+        get = getattr(getattr(dist, "metadata", None), "get", None)
+        name = get("Name") if callable(get) else None
+    return re.sub(r"[-_.]+", "-", str(name)).lower() if name else None
+
+
+def _is_first_party(ep: Any) -> bool:
+    """True only for an entry point shipped by ``data-product-forge`` itself.
+
+    An entry point whose distribution cannot be determined is NOT trusted: the
+    reservation of built-in names fails closed.
+    """
+    return _dist_name(ep) == _FIRST_PARTY_DIST
+
+
+def _entry_points_for_group(group: str) -> List[Any]:
+    # Python >=3.12 returns SelectableGroups; 3.10-3.11 returns dict
+    all_eps = importlib.metadata.entry_points()
+    if isinstance(all_eps, dict):
+        return list(all_eps.get(group, []))
+    # SelectableGroups (3.12+) or importlib_metadata backport
+    return list(
+        all_eps.select(group=group) if hasattr(all_eps, "select") else all_eps.get(group, [])
+    )
+
+
+def registered_provider_names() -> List[str]:
+    """Sorted provider names, from metadata, with NO provider import.
+
+    Runs name discovery (idempotent) and returns every name that is registered or
+    declared by an entry point -- what ``fluid providers`` lists and what
+    ``--provider`` is validated against.
+    """
+    discover_providers()
+    return sorted(PROVIDERS.keys())
+
+
 def _discover_entrypoints(logger: Optional[logging.Logger]) -> None:
-    """Discover third-party providers via ``fluid_build.providers`` entry-points.
+    """Record ``fluid_build.providers`` entry points by name -- without importing them.
 
     Uses :func:`importlib.metadata.entry_points` so any pip-installed package
     that declares::
@@ -566,31 +888,42 @@ def _discover_entrypoints(logger: Optional[logging.Logger]) -> None:
         [project.entry-points."fluid_build.providers"]
         mycloud = "my_package.provider:MyCloudProvider"
 
-    will be picked up automatically at discovery time.
+    is listed at discovery time. ``EntryPoint.name`` / ``.value`` / ``.dist`` need
+    no ``.load()``; the class is imported only when the provider is first used
+    (see :class:`_ProviderMap`), which is also when the plugin<->CLI compat gate
+    runs. The built-ins are entry points of ``data-product-forge`` itself, with
+    :data:`BUILTIN_PROVIDERS` as the fallback for stale installed metadata.
     """
     EP_GROUP = "fluid_build.providers"
     try:
-        # Python >=3.12 returns SelectableGroups; 3.10-3.11 returns dict
-        all_eps = importlib.metadata.entry_points()
-        if isinstance(all_eps, dict):
-            eps = all_eps.get(EP_GROUP, [])
-        else:
-            # SelectableGroups (3.12+) or importlib_metadata backport
-            eps = (
-                all_eps.select(group=EP_GROUP)
-                if hasattr(all_eps, "select")
-                else all_eps.get(EP_GROUP, [])
-            )
+        eps = _entry_points_for_group(EP_GROUP)
     except Exception as exc:
         _safe_log(logger, logging.DEBUG, "entrypoint_discovery_unavailable", error=str(exc))
-        return
+        eps = []
 
     # Gate provider entry-points through the unified operator allow/block policy
     # (FLUID_PLUGINS_ALLOWLIST / FLUID_PLUGINS_BLOCKLIST), so the SAME control that
     # governs validators / catalog / iac plugins also governs providers — the
     # highest-stakes role (it emits cloud DDL / IaC). Imported lazily to avoid any
     # import-time coupling during early provider bootstrap.
-    from fluid_build.plugin_manager import is_allowed
+    from fluid_build.plugin_manager import (
+        entry_point_distribution,
+        is_allowed,
+        override_granted,
+    )
+
+    # A built-in name more than one distribution is granted: ambiguous, load none
+    # (last-one-wins must not decide which plugin takes over a built-in).
+    grants: Dict[str, int] = {}
+    for ep in eps:
+        n = _normalize_name(ep.name)
+        if (
+            n in BUILTIN_PROVIDERS
+            and not _is_first_party(ep)
+            and is_allowed(ep.name)
+            and override_granted(ep)
+        ):
+            grants[n] = grants.get(n, 0) + 1
 
     for ep in eps:
         if not is_allowed(ep.name):
@@ -603,40 +936,89 @@ def _discover_entrypoints(logger: Optional[logging.Logger]) -> None:
             )
             POLICY_BLOCKED.add(_normalize_name(ep.name))
             continue
-        from fluid_build.plugin_manager import entry_point_distribution
-
-        if _claims_retired_name(
-            ep.name, entry_point_distribution(ep) or str(getattr(ep, "value", ep)), logger
+        who = entry_point_distribution(ep) or str(getattr(ep, "value", ep))
+        # Before anything is imported: a plugin must not take a retired name, nor
+        # (unless it ships with data-product-forge) a built-in one.
+        third_party = not _is_first_party(ep)
+        if _claims_reserved_name(
+            ep.name,
+            who,
+            logger,
+            third_party=third_party,
+            ep=ep,
+            ambiguous_grant=grants.get(_normalize_name(ep.name), 0) > 1,
         ):
             continue
-        try:
-            provider_cls = ep.load()
-            register_provider(
-                ep.name, provider_cls, override=False, logger=logger, source="entrypoint"
-            )
-            _safe_log(
-                logger,
-                logging.DEBUG,
-                "provider_entrypoint_loaded",
-                name=ep.name,
-                entrypoint=str(ep),
-            )
-        except Exception as exc:
-            # Type-only — never interpolate the raw exception text (matches the
-            # unified manager's posture and the DISCOVERY_ERRORS redaction above).
-            _safe_log(
-                logger,
-                logging.WARNING,
-                "provider_entrypoint_failed",
-                name=ep.name,
-                error=type(exc).__name__,
-            )
-            _add_discovery_error("entrypoint", ep.name, exc)
+        _declare_pending(
+            ep.name,
+            _Pending(
+                name=_normalize_name(ep.name),
+                value=str(getattr(ep, "value", "")),
+                source="entrypoint",
+                ep=ep,
+                distribution=who,
+            ),
+            logger,
+            # An operator-granted override replaces the built-in's slot.
+            replace=third_party
+            and _normalize_name(ep.name) in BUILTIN_PROVIDERS
+            and override_granted(ep),
+        )
+
+    # Built-ins the installed metadata did not list (stale editable install).
+    for name, value in BUILTIN_PROVIDERS.items():
+        if name in PROVIDERS:
+            continue
+        if not is_allowed(name):
+            POLICY_BLOCKED.add(name)
+            continue
+        _declare_pending(
+            name,
+            _Pending(
+                name=name,
+                value=value,
+                source="builtin",
+                distribution=_FIRST_PARTY_DIST,
+            ),
+            logger,
+        )
+
+
+def _declare_pending(
+    name: str, pend: _Pending, logger: Optional[logging.Logger], *, replace: bool = False
+) -> None:
+    """Record ``name`` as declared-but-unloaded; the first declaration wins."""
+    cname = _normalize_name(name)
+    if not _is_valid_name(cname) or cname in _BANNED_NAMES:
+        _safe_log(
+            logger, logging.DEBUG, "provider_name_rejected", name=cname, reason="invalid_name"
+        )
+        return
+    with _LOCK:
+        if replace:
+            PROVIDERS.pop(cname, None)
+            _REGISTRY_META.pop(cname, None)
+        elif cname in PROVIDERS:
+            _safe_log(logger, logging.DEBUG, "provider_duplicate_ignored", name=cname)
+            return
+        PROVIDERS._pending[cname] = pend  # type: ignore[attr-defined]
+    _safe_log(
+        logger,
+        logging.DEBUG,
+        "provider_entrypoint_declared",
+        name=cname,
+        entrypoint=pend.value,
+    )
 
 
 def _preload_curated(logger: Optional[logging.Logger]) -> None:
+    """Import the modules the operator named in ``FLUID_PROVIDERS`` (and only those).
+
+    Without the variable nothing is imported here: the built-ins are declared by
+    entry point and load on first use.
+    """
     env = (os.getenv("FLUID_PROVIDERS") or "").strip()
-    candidates = [m.strip() for m in env.split(",") if m.strip()] if env else list(_DEFAULT_MODULES)
+    candidates = [m.strip() for m in env.split(",") if m.strip()] if env else []
     for modname in candidates:
         try:
             importlib.import_module(modname)
@@ -652,8 +1034,25 @@ def _preload_curated(logger: Optional[logging.Logger]) -> None:
             _add_discovery_error("default", modname, exc)
 
 
+#: In-tree packages under ``fluid_build/providers/`` that are NOT providers: spec
+#: exporters, catalog backends, shared code, and the retired ``datamesh_manager``.
+#: Importing them registers nothing (``tests/providers/test_no_exporter_providers.py``)
+#: but pulls ``requests`` and the AWS util chain, so the scan leaves them alone.
+#: A NEW package that is in neither this set nor :data:`BUILTIN_PROVIDERS` is still
+#: imported and auto-registered; a test makes the author classify it.
+_NON_PROVIDER_PACKAGES = frozenset(
+    {"catalogs", "common", "datamesh_manager", "odcs", "odps_standard", "opds"}
+)
+
+
 def _discover_subpackages(logger: Optional[logging.Logger]) -> None:
-    """Import all subpackages under fluid_build.providers.* and try auto-registration."""
+    """Import the in-tree provider PACKAGES under fluid_build.providers.* and auto-register.
+
+    Only packages: helper modules (``aws_validation``, ``bigquery_validation``,
+    ``quality_engine``, ``validation_*``, ``_*``) are not providers and some load
+    a cloud SDK at import. The built-in providers are declared by entry point and
+    are not imported here either.
+    """
     try:
         pkg = importlib.import_module("fluid_build.providers")
     except Exception as exc:
@@ -664,8 +1063,12 @@ def _discover_subpackages(logger: Optional[logging.Logger]) -> None:
     for modinfo in pkgutil.iter_modules(getattr(pkg, "__path__", []), pkg.__name__ + "."):
         modname = modinfo.name
         short = modname.rsplit(".", 1)[-1]
-        if short in {"__init__", "base"}:
-            continue  # skip non-providers
+        if not modinfo.ispkg or short.startswith("_") or short == "base":
+            continue  # helpers and non-packages are not providers
+        if short in BUILTIN_PROVIDERS:
+            continue  # declared by entry point; imported on first use
+        if short in _NON_PROVIDER_PACKAGES:
+            continue  # exporters / catalogs / shared code: nothing to register, and costly
 
         try:
             mod = importlib.import_module(modname)

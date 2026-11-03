@@ -91,8 +91,13 @@ Examples:
     # Provider override
     p.add_argument(
         "--provider",
-        choices=["aws", "gcp", "azure", "snowflake"],
-        help="Override provider (default: auto-detect from contract.provider)",
+        # No argparse ``choices``: the value is checked against the live provider
+        # registry after the parse (cli/__init__.py), so a retired name gets its
+        # hint and a plugin provider is accepted.
+        help=(
+            "Override provider (default: auto-detect from contract.provider; "
+            "see `fluid providers`)"
+        ),
     )
 
     # Environment and customization

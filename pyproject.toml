@@ -527,10 +527,14 @@ fluid = "fluid_build.cli:main"
 
 # Optional future plugin discovery (safe metadata; your code can adopt entrypoints later)
 [project.entry-points."fluid_build.providers"]
+# These five are the built-ins. They are also listed in
+# ``fluid_build.providers.BUILTIN_PROVIDERS`` (pinned equal by a test), and a
+# plugin from any other distribution may not claim these names.
 local = "fluid_build.providers.local:LocalProvider"
 aws = "fluid_build.providers.aws:AwsProvider"
 gcp = "fluid_build.providers.gcp:GcpProvider"
 snowflake = "fluid_build.providers.snowflake:SnowflakeProvider"
+databricks = "fluid_build.providers.databricks:DatabricksProvider"
 # NB: odps is intentionally NOT a provider entry-point. ODPS is the Open Data
 # Product Standard (a spec / export format), not a cloud provider; its exporter
 # is constructed directly by `fluid odps` (see providers/opds/__init__.py).
@@ -737,9 +741,6 @@ banned-module-level-imports = [
 # only imported once a user runs ``fluid mcp serve`` (lazy at the CLI).
 "fluid_build/output_ports/mcp/server.py" = ["TID253"]
 "fluid_build/output_ports/mcp/_transport.py" = ["TID253"]
-# TID253: BigQuery validator needs google.cloud at import; loaded only by the
-# GCP provider paths.
-"fluid_build/providers/bigquery_validation.py" = ["TID253"]
 
 [tool.deptry]
 known_first_party = ["fluid_build"]

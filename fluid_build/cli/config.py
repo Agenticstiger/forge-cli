@@ -89,6 +89,16 @@ class ValidationRule:
             self.environments = list(EnvironmentType)
 
 
+def _registered_provider_names() -> List[str]:
+    """Provider names `fluid providers` lists (metadata only, no provider import)."""
+    from fluid_build.providers import BUILTIN_PROVIDERS, registered_provider_names
+
+    try:
+        return registered_provider_names()
+    except Exception:  # noqa: BLE001 - a discovery problem must not reject every config
+        return sorted(BUILTIN_PROVIDERS)
+
+
 class ConfigurationManager:
     """Production-ready configuration management with validation"""
 
@@ -168,23 +178,25 @@ class ConfigurationManager:
         """Register default validation rules"""
         self.validation_rules = [
             # Provider validation
+            # Registry-driven, like the global `--provider` check: the accepted
+            # names are what `fluid providers` lists (plugins included). The
+            # static list this replaced named `azure`, which is not registered,
+            # and omitted `databricks`.
             ValidationRule(
                 "provider_valid",
-                lambda cfg: (
-                    cfg.get("provider", {}).value in ["local", "gcp", "aws", "azure", "snowflake"]
-                ),
-                "Provider must be one of: local, gcp, aws, azure, snowflake",
+                lambda cfg: cfg.get("provider", {}).value in _registered_provider_names(),
+                "Provider must be a registered provider (see `fluid providers`)",
             ),
             # Cloud provider project requirement
             ValidationRule(
                 "cloud_provider_project",
                 lambda cfg: (
                     not (
-                        cfg.get("provider", {}).value in ["gcp", "aws", "azure"]
+                        cfg.get("provider", {}).value in ["gcp", "aws"]
                         and not cfg.get("project", {}).value
                     )
                 ),
-                "Cloud providers (gcp, aws, azure) require a project to be specified",
+                "Cloud providers (gcp, aws) require a project to be specified",
                 environments=[EnvironmentType.STAGING, EnvironmentType.PRODUCTION],
             ),
             # Production security requirements
