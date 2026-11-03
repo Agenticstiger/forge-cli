@@ -99,7 +99,12 @@ def _record_run_elsewhere(build_id: str, report: Any) -> None:
         report.record_build(build_id=build_id, status="skipped", reason="runs_outside_forge")
 
 
-def _report_externally_run_build(build: Dict[str, Any], build_id: str, report: Any) -> None:
+def _report_externally_run_build(
+    build: Dict[str, Any],
+    build_id: str,
+    report: Any,
+    contract: Optional[Dict[str, Any]] = None,
+) -> None:
     """Say that a build runs on its own platform; it is not run here.
 
     A Flink job runs on the Flink Kubernetes Operator or AWS Managed Service
@@ -108,9 +113,13 @@ def _report_externally_run_build(build: Dict[str, Any], build_id: str, report: A
     from skips; the run report, whose statuses are succeeded, failed and
     skipped, records it as skipped with ``reason: runs_outside_forge``.
     """
-    from fluid_build.streaming.compiler import managed_config
+    from fluid_build.streaming.compiler import managed_config, managed_lane_enabled
 
-    if managed_config(build) is not None:
+    if (
+        contract is not None
+        and managed_lane_enabled(contract)
+        and managed_config(build) is not None
+    ):
         cprint(
             f"\nBuild '{build_id}' is managed by fluid apply on the Flink Operator; "
             "no local or batch execution is performed."
@@ -1455,7 +1464,7 @@ def run_builds_from_args(
         runs_before = _run_ids(contract_path.parent, product_id, build_id) if report else None
 
         if is_externally_run_build(build):
-            _report_externally_run_build(build, build_id, report)
+            _report_externally_run_build(build, build_id, report, contract)
             total_external += 1
             continue
 

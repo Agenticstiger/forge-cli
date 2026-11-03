@@ -1,3 +1,17 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Pure compiler for the opt-in Flink Operator / Iceberg lane.
 
 The runtime remains external. Compilation never contacts Kubernetes, a catalog,
@@ -15,15 +29,21 @@ from urllib.parse import urlsplit
 
 import jsonschema
 
+from fluid_build.errors import ValidationError
 from fluid_build.providers._iceberg_catalog import (
     catalog_kind_info,
     resolve_iceberg_catalog,
 )
 from fluid_build.providers._iceberg_catalog_auth import parse_catalog_auth
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
+from fluid_build.schema_manager import SchemaVersion
 from fluid_build.streaming.types import LogicalType, columns_sql, parse_fields
 from fluid_build.util.contract import is_externally_run_build
 
+#: The schema the managed lane arrived in. On an older contract
+#: ``parameters.flink`` stays what it was: free-form settings of a job that
+#: runs elsewhere, which forge-cli does not read.
+_MANAGED_SINCE = SchemaVersion.parse("0.7.7")
 _NAME = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
 _TEXT = {"type": "string", "minLength": 1}
 _POSITIVE = {"type": "integer", "minimum": 1}
@@ -151,7 +171,17 @@ def managed_config(build: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return cfg
 
 
+def managed_lane_enabled(contract: Mapping[str, Any]) -> bool:
+    """Whether the contract's schema has the managed lane (``_MANAGED_SINCE`` or later)."""
+    try:
+        return _MANAGED_SINCE <= SchemaVersion.parse(str(contract.get("fluidVersion")))
+    except ValidationError:
+        return False
+
+
 def managed_builds(contract: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    if not managed_lane_enabled(contract):
+        return []
     return [
         build
         for build in contract.get("builds") or []
@@ -196,8 +226,8 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
         raise ValueError(
             f"parameters.flink.{'.'.join(map(str, problem.path))}: invalid configuration ({problem.validator})"
         )
-    if contract.get("fluidVersion") != "0.7.7":
-        raise ValueError("Managed Flink is opt-in under fluidVersion: 0.7.7")
+    if not managed_lane_enabled(contract):
+        raise ValueError(f"Managed Flink needs schema {_MANAGED_SINCE} or later")
     if contract.get("accessPolicy") or contract.get("governance"):
         raise ValueError("Managed Flink cannot yet enforce root accessPolicy/governance")
     bid = build.get("id")
@@ -518,3 +548,24 @@ def validation_errors(contract: Mapping[str, Any]) -> list[str]:
     except (ValueError, KeyError, TypeError) as exc:
         return [f"Managed Flink: {exc}"]
     return []
+
+
+def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
+    """An older contract that asks for the managed lane still validates, as before.
+
+    Its build stays run outside forge-cli, so say why nothing will deploy it.
+    """
+    if managed_lane_enabled(contract):
+        return []
+    warnings = []
+    for build in contract.get("builds") or []:
+        props = build.get("properties") if isinstance(build, Mapping) else None
+        parameters = props.get("parameters") if isinstance(props, Mapping) else None
+        flink = parameters.get("flink") if isinstance(parameters, Mapping) else None
+        if isinstance(flink, Mapping) and "management" in flink:
+            warnings.append(
+                f"Build {build.get('id')}: parameters.flink.management needs schema "
+                f"{_MANAGED_SINCE} or later; on {contract.get('fluidVersion')} the job "
+                "still runs outside forge-cli"
+            )
+    return warnings

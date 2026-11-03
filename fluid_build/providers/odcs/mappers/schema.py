@@ -444,38 +444,54 @@ def _field_to_property(
     elif fld.get("tags") and any(t in ("primary-key", "primaryKey") for t in fld["tags"]):
         prop["primaryKey"] = True
 
-    raw_type = str(fld.get("type", "")).strip().lower()
-    if {"fields", "element", "key", "value"} & fld.keys() or raw_type.startswith(
-        ("timestamp_ltz", "timestamptz", "timestamp(")
-    ):
-        from fluid_build.streaming.types import parse_type
-
-        dtype = parse_type(fld, path=str(fld.get("name")))
-        if dtype.kind == "struct":
-            prop["properties"] = [
-                _field_to_property(child, provider, include_quality) for child in fld["fields"]
-            ]
-        elif dtype.kind == "array":
-            prop["items"] = _field_to_property(
-                {"name": "element", **fld["element"]}, provider, include_quality
-            )
-        # ODCS has native object/array trees, but no typed-map/key nullability
-        # model. Preserve the canonical FLUID type alongside that native view.
-        extension = {
-            "property": "fluid.recursiveType",
-            "value": copy.deepcopy(
-                {
-                    key: value
-                    for key, value in fld.items()
-                    if key in {"type", "fields", "element", "key", "value"}
-                }
-            ),
-        }
-        custom = [
-            item
-            for item in prop.get("customProperties") or []
-            if item.get("property") != "fluid.recursiveType"
-        ]
-        prop["customProperties"] = [*custom, extension]
-
+    _add_recursive_type(prop, fld, provider, include_quality)
     return prop
+
+
+def _add_recursive_type(
+    prop: Dict[str, Any], fld: Mapping[str, Any], provider: Optional[str], include_quality: bool
+) -> None:
+    """Add the native ODCS tree and the canonical FLUID type of a nested column.
+
+    Also for a timestamp whose zone or precision ODCS cannot hold.
+    """
+    raw_type = str(fld.get("type", "")).strip().lower()
+    nested = bool({"fields", "element", "key", "value"} & fld.keys())
+    if not nested and not raw_type.startswith(("timestamp_ltz", "timestamptz", "timestamp(")):
+        return
+    from fluid_build.streaming.types import parse_type
+
+    try:
+        dtype = parse_type(fld, path=str(fld.get("name")))
+    except ValueError:
+        if nested:
+            raise
+        # A scalar timestamp outside the streaming type model, such as a
+        # Snowflake TIMESTAMP_LTZ(9), exports exactly as it did before.
+        return
+    if dtype.kind == "struct":
+        prop["properties"] = [
+            _field_to_property(child, provider, include_quality) for child in fld["fields"]
+        ]
+    elif dtype.kind == "array":
+        prop["items"] = _field_to_property(
+            {"name": "element", **fld["element"]}, provider, include_quality
+        )
+    # ODCS has native object/array trees, but no typed-map/key nullability
+    # model. Preserve the canonical FLUID type alongside that native view.
+    extension = {
+        "property": "fluid.recursiveType",
+        "value": copy.deepcopy(
+            {
+                key: value
+                for key, value in fld.items()
+                if key in {"type", "fields", "element", "key", "value"}
+            }
+        ),
+    }
+    custom = [
+        item
+        for item in prop.get("customProperties") or []
+        if item.get("property") != "fluid.recursiveType"
+    ]
+    prop["customProperties"] = [*custom, extension]

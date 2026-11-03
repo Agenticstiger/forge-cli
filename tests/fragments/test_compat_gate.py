@@ -396,6 +396,16 @@ def _corpus(source_root: Path) -> List[Path]:
     return found
 
 
+def _bundled_by(release_tree: Path, contract: Path) -> bool:
+    """Whether the release bundles the contract's schema.
+
+    A contract on a schema opened after the release (the 0.7.7 preview, say)
+    has nothing there to match: v0.24.0 only answers "Schema not available".
+    """
+    version = yaml.safe_load(contract.read_text(encoding="utf-8"))["fluidVersion"]
+    return (release_tree / "fluid_build" / "schemas" / f"fluid-schema-{version}.json").is_file()
+
+
 class Side:
     """One tree's run: its jobs' results and the files they wrote."""
 
@@ -615,7 +625,7 @@ def differential(release_tree: Path, tmp_path_factory: pytest.TempPathFactory) -
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text, encoding="utf-8")
         custom[name] = corpus_root / "custom" / name / next(iter(files))
-    corpus = _corpus(corpus_root)
+    corpus = [path for path in _corpus(corpus_root) if _bundled_by(release_tree, path)]
     assert len(corpus) >= 30, f"the corpus shrank to {len(corpus)} contracts"
     before = _tree_state(corpus_root)
 
