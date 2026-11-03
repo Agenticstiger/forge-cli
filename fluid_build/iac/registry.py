@@ -228,7 +228,8 @@ def _entrypoints_by_name() -> Dict[str, List[Any]]:
         index: Dict[str, List[Any]] = {}
         for ep in scanner(group):
             index.setdefault(_norm(ep.name), []).append(ep)
-        cached = _INDEX = (scanner, index)
+        cached = (scanner, index)
+        _INDEX = cached  # read back above on the next call
     return cached[1]
 
 
