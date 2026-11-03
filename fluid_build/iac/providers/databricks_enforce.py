@@ -281,6 +281,10 @@ class SqlRunner:
 
     def run(self, statement: str) -> None:
         """Run one statement to ``SUCCEEDED``; :class:`StatementFailed` otherwise."""
+        self.execute(statement)
+
+    def execute(self, statement: str) -> Mapping[str, Any]:
+        """:meth:`run`, and the finished statement's document (its ``result`` and ``manifest``)."""
         do = self._client.api_client.do
         try:
             doc = do(
@@ -310,6 +314,7 @@ class SqlRunner:
             raise StatementFailed(
                 f"{state}: {_scrub(error.get('message') or 'no message from the server')}"
             )
+        return doc
 
     @staticmethod
     def _state(doc: Any) -> str:

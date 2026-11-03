@@ -130,7 +130,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ...providers._sql_safety import validate_ident, validate_sql_type_param_payload
-from ...util.contract import is_databricks_job_build
+from ...util.contract import (
+    builds_writing_expose,
+    is_databricks_job_build,
+    is_duckdb_acquisition_build,
+)
 from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
 from ..governance_labels import governance_labels
@@ -434,20 +438,79 @@ def _packaging_refusal(where: str) -> UnsupportedBindingError:
     )
 
 
+def _describe_writer(build: Mapping[str, Any]) -> str:
+    engine = build.get("engine")
+    parts = [f"engine {engine!r}" if engine else "no engine"]
+    if build.get("pattern"):
+        parts.append(f"pattern {build.get('pattern')!r}")
+    return f"build {build.get('id')!r} ({', '.join(parts)})"
+
+
+def masking_unapplied_reason(exposure: Mapping[str, Any], builds: Any) -> Optional[str]:
+    """Why no mask would be applied to this expose's rows, or ``None`` when one is.
+
+    ``policy.privacy.masking`` is applied by the DuckDB acquisition runner at landing, before
+    the rows leave the machine (``build_runners/_masking.py``), so it holds on a Databricks
+    table only when every build that writes the table is such a build
+    (``is_duckdb_acquisition_build``). A dbt model, another engine, or no build at all writes
+    rows nothing masked.
+    """
+    writers = builds_writing_expose(exposure.get("exposeId"), builds)
+    if not writers:
+        return "no build writes it, so nothing would apply the mask."
+    unmasked = [build for build in writers if not is_duckdb_acquisition_build(build)]
+    if not unmasked:
+        return None
+    return (
+        f"{', '.join(_describe_writer(build) for build in unmasked)} "
+        f"{'writes' if len(unmasked) == 1 else 'write'} it and applies no mask."
+    )
+
+
+def _refuse_unapplied_masking(
+    where: str,
+    exposure: Mapping[str, Any],
+    builds: Sequence[Mapping[str, Any]],
+    refusals: List[UnsupportedBindingError],
+) -> None:
+    """``policy.privacy.masking`` on an expose no DuckDB acquisition build alone writes."""
+    policy = exposure.get("policy")
+    privacy = policy.get("privacy") if isinstance(policy, Mapping) else None
+    if not isinstance(privacy, Mapping) or not _set(privacy.get("masking")):
+        return
+    unapplied = masking_unapplied_reason(exposure, builds)
+    if unapplied is None:
+        return
+    refusals.append(
+        _refusal(
+            "governance-unmapped",
+            f"{where} declares policy.privacy.masking, which only forge-cli's DuckDB "
+            "acquisition runner applies, at landing, before the rows leave the machine. "
+            f"{unapplied} Applied anyway, the table would hold the values the contract "
+            "promises to mask.",
+            "Write this expose with a DuckDB acquisition build (pattern: acquisition, "
+            "engine: duckdb), which masks the columns before it loads the table. Or remove "
+            "policy.privacy.masking and enforce access with policy.authz.columnRestrictions, "
+            "which become Unity Catalog column masks.",
+        )
+    )
+
+
 def _refuse_governance(
     where: str,
     binding: Mapping[str, Any],
     exposure: Mapping[str, Any],
     refusals: List[UnsupportedBindingError],
+    builds: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     """Governance the module would apply with exit 0 but never enforce."""
     policy = exposure.get("policy") or {}
     authz = (policy.get("authz") or {}) if isinstance(policy, Mapping) else {}
     privacy = (policy.get("privacy") or {}) if isinstance(policy, Mapping) else {}
+    _refuse_unapplied_masking(where, exposure, builds, refusals)
     unmapped = [
         name
         for name, value in (
-            ("policy.privacy.masking", privacy.get("masking")),
             ("policy.privacy.rowLevelPolicy", privacy.get("rowLevelPolicy")),
             ("binding.governance", binding.get("governance")),
         )
@@ -672,6 +735,7 @@ def _resolve_table(
     refusals: List[UnsupportedBindingError],
     *,
     validating: bool,
+    builds: Sequence[Mapping[str, Any]] = (),
 ) -> Optional[_Table]:
     """One Databricks expose → :class:`_Table`, or ``None`` with its refusals."""
     binding = exposure.get("binding") or {}
@@ -685,7 +749,7 @@ def _resolve_table(
     columns = _columns(where, exposure, refusals, validating=validating)
     partitions = _partitions(where, loc, columns, refusals, validating=validating)
     region = _region(where, loc, refusals)
-    _refuse_governance(where, binding, exposure, refusals)
+    _refuse_governance(where, binding, exposure, refusals, builds)
     enforcement: Optional[TableEnforcement] = None
     if len(refusals) == before:
         try:
@@ -1032,7 +1096,8 @@ def _compile(
     if _set(contract.get("packaging")):
         refusals.append(_packaging_refusal("the contract"))
 
-    targets = _resolve_tables(compiled, exposures, validating=validating)
+    builds = [b for b in contract.get("builds") or [] if isinstance(b, Mapping)]
+    targets = _resolve_tables(compiled, exposures, validating=validating, builds=builds)
     warehouse = _warehouse(env, refusals)
     _refuse_duplicate_tables(compiled.tables, refusals)
     _refuse_region_conflict(compiled.tables, refusals)
@@ -1071,12 +1136,18 @@ def _compile(
 
 
 def _resolve_tables(
-    compiled: _Compiled, exposures: Sequence[Tuple[int, Mapping[str, Any]]], *, validating: bool
+    compiled: _Compiled,
+    exposures: Sequence[Tuple[int, Mapping[str, Any]]],
+    *,
+    validating: bool,
+    builds: Sequence[Mapping[str, Any]] = (),
 ) -> List[_GrantTarget]:
     """Resolve each Databricks expose into ``compiled.tables``; a grant target for every one."""
     targets: List[_GrantTarget] = []
     for index, exposure in exposures:
-        table = _resolve_table(index, exposure, compiled.refusals, validating=validating)
+        table = _resolve_table(
+            index, exposure, compiled.refusals, validating=validating, builds=builds
+        )
         if table is not None:
             compiled.tables.append(table)
         targets.append(

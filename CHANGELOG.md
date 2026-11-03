@@ -124,6 +124,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written, that `current_user()` is a service principal's application ID, and what a warehouse
   of each type enforces are unproven.
 
+- **The DuckDB acquisition runner lands a Databricks expose in its table, and `policy.privacy.masking`
+  is accepted on one it writes.** For `platform: databricks` the runner used to write a LOCAL file
+  (`location.path`, else `out/`) and report success with nothing in Databricks. It now hashes (or
+  tokenizes, encrypts, masks) at landing as before, writes Parquet under `.fluid/staging`, uploads it
+  through the Files API to `DATABRICKS_STAGING_VOLUME` (`/Volumes/<catalog>/<schema>/<volume>`, from
+  the environment only, like `DATABRICKS_WAREHOUSE_ID`) as `<product>/<build>/<run id>/<file>.parquet`,
+  and runs one statement on the warehouse, `INSERT OVERWRITE <catalog>.<schema>.<table> SELECT
+  <the contract's columns> FROM read_files('<run dir>', format => 'parquet')`: a full refresh that
+  rewrites the rows and keeps the table's definition, grants, tags, row filter and column masks.
+  The staged files are deleted afterwards whether or not the load worked (a file that cannot be
+  deleted fails the run and is named), and the run record gains `facets.databricks_load` (table, rows
+  loaded, where it staged, that it deleted). The table must exist: a missing one fails naming
+  `fluid apply`, and the runner never creates or alters a table. An unset volume or warehouse, a
+  mode other than `full_refresh`, a sink other than Parquet and more than one stream are refused
+  before anything runs. Every other platform's landing is unchanged. The Databricks emitter now
+  accepts `policy.privacy.masking` on an expose when every build that writes it is a DuckDB
+  acquisition build (the runner applies the mask before the data leaves the machine, as on AWS), and
+  keeps refusing it, with the reason, for a dbt-written expose, another engine, or no build at all;
+  `fluid validate` and `fluid apply` read the one `_compile` verdict. `rowLevelPolicy` and
+  `binding.governance` are still refused. Proven against the in-process stand-in (Files API,
+  `INSERT OVERWRITE ... read_files` over the uploaded Parquet in DuckDB) with a real `tofu` apply
+  followed by the build; not run against a live workspace: what `read_files` and `INSERT OVERWRITE`
+  do on a managed table that carries a mask and a row filter, that `INSERT OVERWRITE` keeps them,
+  the Files API's limits, and whether a type the Parquet carries is accepted by the table's are
+  unproven. The run-time schema gate still compares a declared `string` with DuckDB's `VARCHAR` as a
+  type change; declare `varchar` for a column the source reads as text.
+
 ### Fixed
 
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
