@@ -1156,6 +1156,19 @@ def test_the_lock_skips_the_deploy_identity_when_it_is_not_the_owner(fake):
     assert "could not be skipped" not in str(exc.value)
 
 
+def test_an_owner_the_contract_restricts_is_named_as_a_path_the_lock_cannot_close(fake):
+    seed(fake)
+    fake.tables[TABLE]["owner"] = ANALYSTS_GROUP  # the owner is a restricted group
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    with pytest.raises(UnsupportedBindingError) as exc:
+        Run(fake).post(contract())
+    message = str(exc.value)
+    assert "Still open:" in message
+    assert f"{ANALYSTS_GROUP} owns {TABLE}" in message
+    assert "ALTER TABLE `main`.`cp360`.`profile` OWNER TO" in message
+    assert "No grant inherited" not in message
+
+
 def test_a_grant_inherited_from_the_schema_or_catalog_is_named_with_what_to_run(fake):
     seed(fake)
     fake.grant("schema", "main.cp360", "schema-readers", "SELECT")

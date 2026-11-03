@@ -958,6 +958,16 @@ def _lock(
             else:
                 result.revoked.append(statement)
                 say(f"      revoked: {statement}")
+    restricted = {p.lower() for p in enforcement.restricted}
+    for held_by in (owner, me):
+        if held_by and held_by.lower() in restricted:
+            what = "owns" if held_by == owner else "is the identity of this run, and has"
+            result.still_open.append(
+                f"{held_by} {what} {table} and the contract restricts it; an owner reads its "
+                "table whatever is revoked, so this lock cannot close that path. Run: ALTER TABLE "
+                f"{'.'.join(quote_ident(p) for p in table.split('.'))} OWNER TO "
+                "`<an identity the contract does not restrict>`"
+            )
     _open_paths(session, table, owner, result)
 
 
