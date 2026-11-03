@@ -363,10 +363,12 @@ litellm = [
 # ``fluid mcp output-port serve``). mcp is still in the base install today;
 # this extra is redundant for now and carries the install after 0.28.0.
 # pyjwt is declared explicitly because fluid_build/output_ports/mcp/auth.py
-# imports ``jwt`` directly; its floor is mcp 1.22's own requirement.
+# imports ``jwt`` directly. Floor 2.15.0: every release up to 2.14.0 has
+# advisories on the PyJWKClient/decode path auth.py uses (e.g.
+# GHSA-ffc3-869f-jxw9); [crypto] for the RS256/ES256/EdDSA verifiers.
 mcp = [
   "mcp>=1.22,<3.0",
-  "pyjwt>=2.10.1",
+  "pyjwt[crypto]>=2.15.0",
 ]
 
 # OpenLineage run-event emission. openlineage-python is still in the base
