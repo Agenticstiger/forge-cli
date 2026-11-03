@@ -132,6 +132,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid apply --mode amend-and-build` provisioned a product, then refused its id.** The build
+  phase keeps run records, cursors and watermarks under `.fluid/runs/<contract.id>/<build.id>/`,
+  so its ids must start with a letter or underscore, use only letters, digits, `_`, `.` and `-`,
+  and be at most 128 characters. The contract schema allows more (`1orders`, or a longer id), so
+  `fluid validate` and `fluid plan` passed such an id. Only the build runner checked it, and on the
+  OpenTofu engine (AWS, GCP, Snowflake, Confluent, Databricks and IaC plugin clouds) the runner
+  starts after `tofu apply`: the infrastructure was created, and the run then stopped with
+  "Unexpected error". A build mode (`amend-and-build`, `replace-and-build`) now checks
+  `contract.id` and every `builds[].id` before the apply hooks, `tofu` and the runner, on both
+  engines, and refuses with `ERR_APPLY_BUILD_IDENTIFIER_INVALID`, which names the id, says nothing
+  was applied and suggests a rename. A mode without a build phase, and a contract without builds,
+  are not checked, as before.
+
 - **`fluid diff --baseline` reported nothing for column changes in a 0.7.x contract.** It read
   columns from `exposes[].schema`, but a 0.7.x contract keeps them in `exposes[].contract.schema`
   (as does every `fluid init` template), so a removed column, a type change or a new NOT NULL
