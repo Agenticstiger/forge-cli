@@ -23,11 +23,13 @@ The classifier is fluid-schema-native — it understands acquisition engines,
 cross-check directly, rather than treating contracts as generic schema docs.
 
 Both contracts are schema-validated before they are compared (see
-:class:`ContractValidationError`).
+:class:`ContractValidationError`), and the renderers print every name a
+contract supplies as data: spelled out for a terminal, inert in Markdown.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Mapping
 
 from .changelog_rules import (
@@ -160,11 +162,77 @@ def _require_valid(contracts: Mapping[str, Mapping[str, Any]]) -> None:
         raise ContractValidationError(errors)
 
 
+# Characters ``str.isprintable`` passes that still draw nothing: the Unicode
+# Default_Ignorable_Code_Point letters and marks (the combining grapheme joiner,
+# the Hangul fillers, the Khmer inherent vowels, the Mongolian free variation
+# selectors and the variation selectors). The other default-ignorables are
+# format characters, which ``isprintable`` already refuses.
+_DRAWS_NOTHING = re.compile(
+    "[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u180f\u3164\ufe00-\ufe0f\uffa0"
+    "\U000e0100-\U000e01ef]"
+)
+
+
+def _spell(ch: str) -> str:
+    if ch == "\\":
+        return "\\\\"
+    if ch.isprintable() and not _DRAWS_NOTHING.match(ch):
+        return ch
+    code = ord(ch)
+    if code < 0x100:
+        return f"\\x{code:02x}"
+    if code < 0x10000:
+        return f"\\u{code:04x}"
+    return f"\\U{code:08x}"
+
+
+def _text(value: Any) -> str:
+    """``value`` as one line of text that shows every character it holds.
+
+    A path or a description quotes names from the contract, and printed raw a
+    name could drive the terminal: ESC opens an escape sequence (a colour, a
+    retitled window, a link to another URL), a line feed or a carriage return
+    forges or overwrites a line, and a bidi control reorders what the reader
+    sees (Trojan Source, CVE-2021-42574). Every character that is not
+    printable, or prints as nothing, is spelled as ``repr`` spells it
+    (``\\x1b``, ``\\u202e``), and a backslash is doubled, so a name holding the
+    four characters ``\\x1b`` still reads differently from one holding ESC.
+    """
+    return "".join(_spell(ch) for ch in str(value))
+
+
+def _code(value: Any) -> str:
+    """``value`` as one Markdown code span, the one inline construct nothing is read out of.
+
+    Outside a code span a backslash escape stops CommonMark markup but not
+    what a host adds after rendering: on GitHub ``\\@name`` still notifies,
+    ``\\#1`` links an issue, ``\\:smile\\:`` is an emoji and
+    ``foo\\@example\\.com`` a mail link, and GitLab also reads ``!1``,
+    ``~label`` and ``%milestone``. Inside a code span every character is
+    literal on every host. The fence is one backtick longer than the longest
+    run of backticks in the text, and the text is padded with a space when it
+    holds a backtick or starts and ends with one, as mdformat's ``code_inline``
+    writes it (MIT, github.com/hukkin/mdformat). The text is spelled by
+    :func:`_text` first, so it holds no line break, which would let the next
+    line start a heading before the span is ever parsed.
+    """
+    text = _text(value)
+    longest = max((len(run) for run in re.findall("`+", text)), default=0)
+    if longest:
+        fence = "`" * (longest + 1)
+        return f"{fence} {text} {fence}"
+    if text.startswith(" ") and text.endswith(" ") and text.strip():
+        return f"` {text} `"
+    return f"`{text or ' '}`"
+
+
 def render_text(report: ChangelogReport) -> str:
     """Plain-text render: grouped by severity with one-line entries.
 
     Used by ``fluid diff --baseline ...`` default output. Kept simple so the
-    output is grep-friendly in CI logs.
+    output is grep-friendly in CI logs. Each field is spelled by
+    :func:`_text`, so a name in it cannot drive the terminal or forge a line;
+    print the result without Rich markup (``cprint_literal``).
     """
     lines: list[str] = []
 
@@ -174,7 +242,7 @@ def render_text(report: ChangelogReport) -> str:
         lines.append(title)
         lines.append("-" * len(title))
         for c in changes:
-            lines.append(f"  {c.kind:32s} {c.path}: {c.description}")
+            lines.append(f"  {_text(c.kind):32s} {_text(c.path)}: {_text(c.description)}")
         lines.append("")
 
     _section(f"BREAKING ({len(report.breaking)})", report.breaking)
@@ -192,7 +260,14 @@ def render_text(report: ChangelogReport) -> str:
 
 
 def render_markdown(report: ChangelogReport) -> str:
-    """Markdown render — for PR-comment bots that paste this into a discussion."""
+    """Markdown render — for PR-comment bots that paste this into a discussion.
+
+    The path and the description quote names from the contract, so each is
+    one code span (:func:`_code`): a name can add no link, image, comment,
+    heading or list item, and mentions no one. ``kind`` is this module's own
+    vocabulary (``[a-z_]``). Print the result verbatim (``cprint_json``):
+    Rich would read ``[...]`` in it as markup and wrap its long lines.
+    """
     parts: list[str] = ["# Contract changelog", ""]
 
     def _section(title: str, changes: list[Change], emoji: str) -> None:
@@ -201,7 +276,7 @@ def render_markdown(report: ChangelogReport) -> str:
         parts.append(f"## {emoji} {title} ({len(changes)})")
         parts.append("")
         for c in changes:
-            parts.append(f"- **{c.kind}** `{c.path}` — {c.description}")
+            parts.append(f"- **{c.kind}** {_code(c.path)} — {_code(c.description)}")
         parts.append("")
 
     _section("Breaking", report.breaking, "")

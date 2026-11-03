@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from fluid_build.iac.drift import StateDriftReport
 
     from ..api.changelog import ContractValidationError
+    from ..api.changelog_types import ChangelogReport
     from ._diff_live import LiveDriftReport
 
 COMMAND = "diff"
@@ -744,14 +745,7 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
     "trouble") before anything is printed or written, so it never reads as 0
     (no changes) or 1 (breaking).
     """
-    from fluid_build.cli.console import cprint
-
-    from ..api.changelog import (
-        ContractValidationError,
-        compare_contracts,
-        render_markdown,
-        render_text,
-    )
+    from ..api.changelog import ContractValidationError, compare_contracts
 
     if getattr(args, "env", None):
         # Environment overlays are a drift-mode concept (they shape the
@@ -817,17 +811,7 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
         span.set_attribute("fluid.diff.info_count", len(report.info))
 
     # Render to stdout in the requested format.
-    fmt = getattr(args, "format", "text") or "text"
-    if fmt == "json":
-        # The JSON envelope is also written to --out (below) for CI
-        # artifact collection. Print to stdout here for piping.
-        import json as _json
-
-        cprint(_json.dumps(report.to_dict(), indent=2))
-    elif fmt == "markdown":
-        cprint(render_markdown(report))
-    else:
-        cprint(render_text(report))
+    _print_version_diff(report, getattr(args, "format", "text") or "text")
 
     # Always write the structured envelope to --out so CI runners that don't
     # parse stdout still get a machine-readable artifact.
@@ -847,6 +831,30 @@ def _run_version_diff(args, logger: logging.Logger) -> int:
     if getattr(args, "fail_on_breaking", False) and report.has_breaking:
         return 1
     return 0
+
+
+def _print_version_diff(report: ChangelogReport, fmt: str) -> None:
+    """Print a version-diff ``report`` to stdout as ``fmt`` (text, json or markdown).
+
+    JSON and Markdown are documents a program reads, written verbatim: Rich
+    would wrap a long line at the terminal width (inside a JSON string, or a
+    Markdown code span) and read ``[...]`` in a name as markup. Text is printed
+    literally, so a name cannot style it, swap in an emoji or (``[/]``) crash
+    it, and soft-wrapped, as the drift report is, so each entry stays one
+    greppable line. The JSON envelope is also written to ``--out``.
+    """
+    from fluid_build.cli.console import cprint_json, cprint_literal
+
+    from ..api.changelog import render_markdown, render_text
+
+    if fmt == "json":
+        import json as _json
+
+        cprint_json(_json.dumps(report.to_dict(), indent=2))
+    elif fmt == "markdown":
+        cprint_json(render_markdown(report))
+    else:
+        cprint_literal(render_text(report), soft_wrap=True, highlight=False)
 
 
 def _invalid_contracts_error(

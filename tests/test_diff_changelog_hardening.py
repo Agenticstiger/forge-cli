@@ -25,13 +25,20 @@ keeps under ``exposes[].contract``. And it read no columns from a
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 
 import pytest
 import yaml
 
-from fluid_build.api.changelog import ContractValidationError, compare_contracts
+from fluid_build.api.changelog import (
+    ContractValidationError,
+    compare_contracts,
+    render_markdown,
+    render_text,
+)
 from fluid_build.api.changelog_rules import diff_columns, diff_quality_severity
+from fluid_build.api.changelog_types import Change, ChangelogReport
 from tests.test_diff_changelog import _ID_COLUMN as _ID
 from tests.test_diff_changelog import _contract_076
 
@@ -170,6 +177,165 @@ def test_the_cli_exits_2_on_an_invalid_contract_whatever_fail_on_breaking_says(
     assert str(tmp_path / "new.fluid.yaml") in context["message"]
     assert "fluid validate" in context["message"]
     assert not (tmp_path / "diff.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Names are printed as data: escaped for a terminal and inert in Markdown
+# ---------------------------------------------------------------------------
+
+
+def _report(*names):
+    """A report naming each of ``names`` as an added column, as ``diff_columns`` words it."""
+    report = ChangelogReport()
+    for name in names:
+        report.add(
+            Change(
+                path=f"exposes[0].contract.schema.{name}",
+                kind="column_added",
+                severity="non_breaking",
+                description=f"column '{name}' added to expose 'orders'",
+            )
+        )
+    return report
+
+
+@pytest.mark.parametrize(
+    "name, spelled",
+    [
+        pytest.param(
+            "x\x1b]8;;https://evil.example\x07click\x1b]8;;\x07",
+            "x\\x1b]8;;https://evil.example\\x07click\\x1b]8;;\\x07",
+            id="osc8-hyperlink",
+        ),
+        pytest.param("x\x1b[2J", "x\\x1b[2J", id="clear-screen"),
+        pytest.param("x\x9b31m", "x\\x9b31m", id="c1-csi"),
+        pytest.param("a\rb", "a\\x0db", id="carriage-return"),
+        pytest.param("a\tb", "a\\x09b", id="tab"),
+        pytest.param("admin\u202egnp.exe", "admin\\u202egnp.exe", id="bidi-override"),
+        pytest.param("e\u200bmail", "e\\u200bmail", id="zero-width-space"),
+        pytest.param("e\ufe0fmail", "e\\ufe0fmail", id="variation-selector"),
+        pytest.param("\u3164", "\\u3164", id="hangul-filler"),
+        pytest.param("x\U000e0041", "x\\U000e0041", id="tag-character"),
+        pytest.param("a\\x1b", "a\\\\x1b", id="literal-backslash-stays-distinct"),
+        pytest.param("straße_日本", "straße_日本", id="printable-unicode-is-kept"),
+    ],
+)
+def test_render_text_spells_out_what_a_terminal_would_act_on(name, spelled):
+    out = render_text(_report(name))
+
+    assert f"column '{spelled}' added" in out
+    assert f"exposes[0].contract.schema.{spelled}:" in out
+    assert all(ch == "\n" or ch.isprintable() for ch in out)
+
+
+def test_a_newline_in_a_name_cannot_forge_a_line():
+    out = render_text(_report("a\nSummary: 0 breaking, 0 non-breaking, 0 info"))
+
+    assert [line for line in out.splitlines() if line.startswith("Summary:")] == [
+        "Summary: 0 breaking, 1 non-breaking, 0 info"
+    ]
+    assert "a\\x0aSummary: 0 breaking" in out
+
+
+def _html(markdown):
+    from markdown_it import MarkdownIt
+
+    return MarkdownIt("commonmark").enable(["table", "strikethrough"]).render(markdown)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("<!-- everything below is hidden", id="html-comment"),
+        pytest.param("<img src=https://tracker.example/p.gif>", id="html-image"),
+        pytest.param("[click](https://evil.example)", id="link"),
+        pytest.param("![x](https://tracker.example/p.gif)", id="image"),
+        pytest.param("**bold** _em_ ~~gone~~", id="emphasis"),
+        pytest.param("a\n# Summary: 0 breaking", id="newline-heading"),
+        pytest.param("a\n- forged entry", id="newline-list-item"),
+        pytest.param("a`b", id="one-backtick"),
+        pytest.param("a``b```c", id="backtick-runs"),
+        pytest.param("`edge`", id="backtick-at-both-ends"),
+        pytest.param(" spaced ", id="space-at-both-ends"),
+        pytest.param("@octocat #1 :smile: GH-1 foo@example.com", id="host-references"),
+        pytest.param("a\\", id="trailing-backslash"),
+    ],
+)
+def test_render_markdown_keeps_every_name_inside_a_code_span(name):
+    """A code span is the one inline construct nothing is read out of.
+
+    Outside one, a backslash escape stops CommonMark markup but not what GitHub
+    adds after rendering: ``\\@user`` still notifies and ``\\#1`` still links.
+    """
+    report = _report(name)
+    html = _html(render_markdown(report))
+
+    assert html.count("<li>") == 1
+    assert html.count("<h1>") == 1  # the "Contract changelog" title
+    for tag in ("<a ", "<img", "<!--", "<em>", "<strong>bold", "<s>", "<h2>Summary"):
+        assert tag not in html, (tag, html)
+    # Both data fields arrive intact as code: the path and the description.
+    from html import escape
+
+    for code in (report.non_breaking[0].path, report.non_breaking[0].description):
+        spelled = code.replace("\\", "\\\\").replace("\n", "\\x0a")
+        assert f"<code>{escape(spelled, quote=False)}</code>" in html, html
+
+
+def test_render_markdown_reads_as_before_for_an_ordinary_name():
+    md = render_markdown(_report("email"))
+
+    assert (
+        "- **column_added** `exposes[0].contract.schema.email` — "
+        "`column 'email' added to expose 'orders'`"
+    ) in md
+
+
+def test_the_cli_prints_text_without_reading_it_as_rich_markup(tmp_path, capsys):
+    """Rich read ``[bold]`` as a style, swapped ``:smile:`` for an emoji and raised on ``[/]``."""
+    names = ["[bold]x[/bold]", "[/]", ":smile:"]
+    old = _contract([_ID])
+    new = _contract([_ID] + [{"name": n, "type": "string"} for n in names])
+
+    assert _run_cli(tmp_path, old, new, fmt="text") == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    for name in names:
+        # One line per entry, as render_text wrote it: Rich does not wrap it either.
+        (line,) = [line for line in lines if f".schema.{name}:" in line]
+        assert line.endswith(f"column '{name}' added to expose 'orders'")
+
+
+@pytest.mark.parametrize("fmt", ["markdown", "json"])
+def test_the_cli_prints_markdown_and_json_verbatim(tmp_path, capsys, fmt):
+    """Rich wrapped a long line at 80 columns, which put a line break inside a JSON string
+    and could start a Markdown heading inside a code span."""
+    long_name = "customer_lifetime_value_estimate_in_reporting_currency_v2 # [bold]x[/bold] :smile:"
+    old = _contract([_ID])
+    new = _contract([_ID, {"name": long_name, "type": "string"}])
+
+    assert _run_cli(tmp_path, old, new, fmt=fmt) == 0
+
+    out = capsys.readouterr().out
+    report = compare_contracts(old, new)
+    if fmt == "json":
+        assert json.loads(out) == report.to_dict()
+    else:
+        assert out == render_markdown(report) + "\n"
+
+
+def test_the_refine_preview_prints_names_literally():
+    from rich.console import Console
+
+    from fluid_build.cli._preview_panel import render_refine_diff
+
+    console = Console(record=True, width=200)
+    old = _contract([_ID])
+    new = _contract([_ID, {"name": "[bold]x[/bold]", "type": "string"}])
+
+    assert render_refine_diff(old, new, console=console) is True
+
+    assert "column '[bold]x[/bold]' added" in console.export_text()
 
 
 # ---------------------------------------------------------------------------

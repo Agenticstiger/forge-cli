@@ -156,6 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primary key, so one that stops being `required` is `primary_key_nullable` (breaking) rather
   than a non-breaking loosening.
 
+- **`fluid diff --baseline --format json` could print JSON that does not parse.** Rich wrapped
+  each long line at the terminal width (80 columns in CI), putting a line break inside a JSON
+  string, and read `[...]` in a column name as markup. JSON and Markdown are now printed
+  verbatim, and text without markup or `:emoji:` codes, so a column named `[/]` no longer
+  crashes the text output. The `--out` file was never affected.
+
 - **The `fluid forge --refine` preview read no columns from a `schema: {fields: [...]}`
   expose.** The diff now unwraps it at `schema` and `contract.schema` alike, as `fluid verify`
   does, and reports its columns at `...schema.fields.<column>`. No bundled schema accepts the
@@ -264,6 +270,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diffed against its 0.7.x rewrite. In `fluid_build.api.changelog`, `compare_contracts` raises the
   new `ContractValidationError`, and `validate=False` diffs without validating; the
   `fluid forge --refine` preview uses it, because the contract being refined may be the invalid one.
+
+- **`fluid diff --baseline` printed contract names raw.** A column or expose name could drive the
+  terminal (an escape sequence, a hyperlink to another URL, a carriage return or line feed that
+  forges a line, a bidi control that reorders it), and in `--format markdown` it could add a link,
+  an image or an HTML comment that hides the rest of a PR comment, or mention someone. Text output
+  now spells each control, bidi and invisible character as `\x1b` or `\u202e` and doubles a
+  backslash. Markdown puts the path and the description each in one code span: a backslash escape
+  is not enough there, because GitHub still links `\@user`, `\#1` and `\:smile\:` after
+  rendering. The fence is one backtick longer than any run of backticks in the name. A Markdown
+  entry now reads ``- **column_added** `exposes[0].contract.schema.email` — `column 'email' added
+  to expose 'orders'` ``. The `fluid forge --refine` preview prints the same text without markup.
 
 ## [0.26.0] — 2026-11-01
 

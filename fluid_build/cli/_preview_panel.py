@@ -746,13 +746,18 @@ def render_refine_diff(
         try:
             from rich.panel import Panel as _RichPanel
 
+            from fluid_build._console import literal_text
+
+            # The body quotes column names: a ``str`` would be read as markup.
             border = "red" if report.has_breaking else "yellow"
-            console.print(_RichPanel(body, title=f"[bold]{title}[/bold]", border_style=border))
+            console.print(
+                _RichPanel(literal_text(body), title=f"[bold]{title}[/bold]", border_style=border)
+            )
             return True
         except Exception:  # noqa: BLE001 — fall through to plain text
             try:
                 console.print(f"\n=== {title} ===")
-                console.print(body)
+                console.print(body, markup=False, emoji=False)
                 return True
             except Exception:  # noqa: BLE001
                 pass
