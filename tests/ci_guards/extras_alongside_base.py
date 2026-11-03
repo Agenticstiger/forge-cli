@@ -14,10 +14,9 @@
 
 """Read pyproject's extras the way pip does, for the extras-alongside-base guard.
 
-litellm, mcp and openlineage-python sit in ``[project] dependencies`` today
-and leave the base install in 0.28.0. Until then the extras that will carry
-them are declared next to base (a duplicate requirement is harmless to pip
-and uv), so every consumer can switch to explicit extras first.
+litellm, mcp and openlineage-python left ``[project] dependencies`` in 0.28.0
+and live only in the ``[litellm]``, ``[mcp]`` and ``[lineage]`` extras (0.27.0
+declared them next to base so consumers could switch first).
 
 This module only parses; ``tests/test_ci_extras_alongside_base.py`` asserts.
 """

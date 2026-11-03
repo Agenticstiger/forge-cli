@@ -66,16 +66,18 @@ class MissingOptionalDependency(ImportError):
 
     exit_code = 1
 
-    def __init__(self, module: str, extra: str, feature: str) -> None:
+    def __init__(self, module: str, extra: str, feature: str, alternatives: str = "") -> None:
         self.module = module
         self.extra = extra
         self.feature = feature
+        self.alternatives = alternatives
         top = module.split(".", 1)[0]
         self.package = _DISTRIBUTION.get(top, top)
         self.event = _EVENTS.get(top, _GENERIC_EVENT)
         super().__init__(
             f"{feature} needs {self.package}, which is not installed.\n\n"
-            f"    pip install 'data-product-forge[{extra}]'",
+            f"    pip install 'data-product-forge[{extra}]'"
+            + (f"\n\n{alternatives}" if alternatives else ""),
             name=module,
         )
 

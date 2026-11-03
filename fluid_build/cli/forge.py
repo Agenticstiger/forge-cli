@@ -1902,7 +1902,13 @@ def _run_main(args, logger: logging.Logger) -> int:
         # trace. Stack trace is logged at DEBUG for triage, but the
         # operator-facing output is just the message + actionable
         # next steps.
+        from fluid_build._optional import MissingOptionalDependency
         from fluid_build.errors import FluidError
+
+        if isinstance(exc, MissingOptionalDependency):
+            # "Install the extra" is the whole remedy: let the CLI entry point
+            # print the install line and exit 1, with no traceback.
+            raise
 
         logger.debug("Forge command failed", exc_info=True)
         suggestions = getattr(exc, "suggestions", None) or []

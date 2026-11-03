@@ -1107,6 +1107,12 @@ def run_ai_copilot_mode(
     fallback_mode_choices: Sequence[Mapping[str, str]] = (),
 ) -> int:
     """Run Forge with AI copilot assistance."""
+    # Before the error boundary and before any context or memory is read: a
+    # litellm-backed provider on an install without litellm raises
+    # MissingOptionalDependency, which the CLI prints (install line, exit 1).
+    from fluid_build.llm.providers import preflight_llm_provider
+
+    preflight_llm_provider(args)
     console = console_factory() if console_factory else None
 
     def _render_ai_copilot_error(console: Any, exc: BaseException) -> None:

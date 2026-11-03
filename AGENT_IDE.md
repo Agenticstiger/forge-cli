@@ -8,7 +8,7 @@
 ## TL;DR
 
 ```bash
-pip install data-product-forge
+pip install "data-product-forge[standard]"   # AI authoring + the MCP server
 cd your-data-product-repo
 fluid scaffold-ide --target kiro      # or cursor / claude-code / cline / generic
 fluid forge                           # AI authoring (mode picker)

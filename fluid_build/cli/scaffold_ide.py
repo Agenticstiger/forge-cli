@@ -750,6 +750,14 @@ def run(args, logger: logging.Logger | None = None) -> int:
             "python_must_be_an_absolute_path",
             {"python": python_bin},
         )
+    # Every entry written below launches ``fluid mcp serve``; without the mcp
+    # SDK that server cannot start, so write nothing rather than a dead config.
+    from fluid_build._optional import MissingOptionalDependency, is_available
+
+    if not is_available("mcp"):
+        raise MissingOptionalDependency(
+            "mcp", "mcp", "fluid scaffold-ide (the IDE entry it writes launches `fluid mcp serve`)"
+        )
     if not out_root.exists():
         out_root.mkdir(parents=True, exist_ok=True)
 

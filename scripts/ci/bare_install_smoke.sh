@@ -55,4 +55,54 @@ FLUID="$VENV/bin/fluid"
 "$FLUID" bundle "$CONTRACT" --format tgz --out bundle.tgz
 "$FLUID" generate iac "$CONTRACT" --out iac
 "$FLUID" doctor
+
+# litellm, mcp and openlineage are extras since 0.28.0. On a bare install each
+# feature that needs one must fail (or warn) with the exact install line, exit
+# the documented way and print no traceback. $out is the combined output.
+expect() { # expect <label> <wanted-rc> <needle> <command...>
+  local label=$1 want=$2 needle=$3 out rc
+  shift 3
+  set +e
+  out=$("$@" 2>&1 </dev/null)
+  rc=$?
+  set -e
+  # Rich wraps long lines; compare on whitespace-collapsed text.
+  local flat
+  flat=$(printf '%s' "$out" | tr -s '[:space:]' ' ')
+  if [ "$rc" -ne "$want" ] || [[ "$flat" != *"$needle"* ]] || [[ "$out" == *Traceback* ]]; then
+    echo "::error::bare-install smoke '$label': rc=$rc (want $want), needle '$needle'"
+    printf '%s\n' "$out"
+    exit 1
+  fi
+  echo "ok: $label"
+}
+
+expect "mcp serve" 1 "pip install 'data-product-forge[mcp]'" "$FLUID" mcp serve
+expect "scaffold-ide" 1 "pip install 'data-product-forge[mcp]'" \
+  "$FLUID" scaffold-ide --target claude-code --out ide
+[ ! -e ide ] || { echo "::error::scaffold-ide wrote files without the mcp SDK"; exit 1; }
+expect "ai forge" 1 "pip install 'data-product-forge[litellm]'" \
+  env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u GEMINI_API_KEY -u GOOGLE_API_KEY \
+  "$FLUID" forge --llm-provider openai --non-interactive
+expect "ai forge alternatives" 1 "--llm-provider claude-code" \
+  "$FLUID" forge --llm-provider openai --non-interactive
+# The hint sits in a bordered panel that wraps, so match the extra spelling alone.
+expect "doctor readiness" 0 "data-product-forge[litellm]" \
+  env GEMINI_API_KEY=smoke-not-a-key "$FLUID" doctor
+expect "template forge" 0 "contract.fluid.yaml" \
+  "$FLUID" forge --template starter --non-interactive --yes
+
+# OPENLINEAGE_URL without the client: the emitter warns once with the extra and
+# does not raise. `fluid apply` reaches it only through a real OpenTofu apply
+# (needs the tofu binary), so drive the same emit path directly.
+expect "lineage warns" 0 "pip install 'data-product-forge[lineage]'" \
+  env OPENLINEAGE_URL=http://127.0.0.1:9 "$VENV/bin/python" -I -c "
+from fluid_build.api.lineage import RunEventType
+from fluid_build.build_runners._lineage import emit_apply_event, resolve_lineage_emitter
+emitter = resolve_lineage_emitter()
+for kind in (RunEventType.START, RunEventType.COMPLETE):
+    emit_apply_event(emitter, {'id': 'p', 'exposes': []}, event_type=kind,
+                     event_time='2026-11-03T00:00:00Z', run_id='01SMOKE',
+                     run_started_at='2026-11-03T00:00:00Z', provider='aws')
+"
 echo "Bare-install smoke passed"

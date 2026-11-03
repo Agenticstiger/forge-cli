@@ -732,14 +732,20 @@ def _print_doctor_summary(
     cprint()
 
 
-#: Shown once per ``fluid doctor`` run. litellm and mcp leave the base
-#: install in 0.28.0 (``[standard]`` restores both); keep the text in step
-#: with the release note for that change.
-EXTRAS_MOVE_NOTICE = "AI/MCP move to extras in 0.28.0: pip install 'data-product-forge[standard]'"
+#: Shown once per ``fluid doctor`` run, and only when litellm or mcp is missing.
+#: Since 0.28.0 both live in extras (``[standard]`` installs both); keep the
+#: text in step with the CHANGELOG entry for that change.
+EXTRAS_MOVE_NOTICE = (
+    "AI and MCP are extras since 0.28.0: pip install 'data-product-forge[standard]'"
+)
 
 
 def _print_extras_move_notice() -> None:
-    """Print the one-line AI/MCP extras notice (a single call per run)."""
+    """Print the one-line AI/MCP extras notice when either package is missing."""
+    from fluid_build._optional import is_available
+
+    if is_available("litellm") and is_available("mcp"):
+        return
     # Literal: rich would read "[standard]" as a markup tag and drop it.
     cprint_literal(EXTRAS_MOVE_NOTICE)
     cprint()
@@ -768,10 +774,13 @@ def _print_doctor_next_steps(
         return
 
     if RICH_AVAILABLE:
+        from rich.text import Text
+
         console = Console()
         console.print(
             Panel(
-                "\n".join(f"• {item}" for item in suggestions),
+                # Literal: an install line such as ``...[litellm]`` is not markup.
+                Text("\n".join(f"• {item}" for item in suggestions)),
                 title="Next steps",
                 border_style="yellow",
             )

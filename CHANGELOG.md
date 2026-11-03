@@ -745,6 +745,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider". A contract's `redshift` build runtime or expose platform is served by `aws`, and plugins
   cannot claim either retired name.
 
+
+- **Breaking (install): litellm, mcp and openlineage-python are no longer in the base install.**
+  *Before:* `pip install data-product-forge` pulled in litellm, mcp and openlineage-python, and with
+  them boto3 (through litellm), aiohttp, openai, tokenizers and about fifty more packages.
+  *Now:* the base install is the core pipeline (`validate`, `plan`, `apply`, `verify`, `publish`,
+  `generate iac`, `bundle`, `diff`, `doctor`, and template or blank `forge`). Each feature that
+  needs one of the three prints the exact install line and exits 1, with no traceback, before it
+  does any work:
+  - AI forge with an API-key provider (`fluid forge --llm-provider openai|anthropic|gemini|...`),
+    `forge data-model`, `ai setup`, the agent loop and the staged copilot agents need
+    `pip install 'data-product-forge[litellm]'` (alias `[ai]`) or `[standard]`. The error is raised
+    before the interview reads any context or memory, and it names the ways to author without it:
+    `--llm-provider claude-code` (uses your Claude Code login; `codex`, `cursor`, `kiro` and
+    `mcp-sampling` are keyless too) and `--template starter`. Template and blank forge are
+    unchanged. `fluid doctor` no longer reports a configured provider as ready when litellm is
+    missing.
+  - `fluid mcp serve`, `fluid mcp output-port serve`, the MCP delegates and keyless
+    `mcp-sampling` need `[mcp]` or `[standard]`. `fluid scaffold-ide` needs it too, and writes
+    nothing without it, because every entry it writes launches `fluid mcp serve`.
+  - Sending lineage to `OPENLINEAGE_URL` needs `[lineage]`. Without it, `fluid apply` logs one
+    warning naming the extra and carries on; the SDK conformance suite fails with the same hint.
+  - AWS users need `[aws]`: boto3 used to arrive silently through litellm. Without it `fluid diff`
+    and the AWS provider fail with the `[aws]` hint instead of a misleading bucket-name error.
+  - `packaging` is now a declared base dependency (it used to arrive through litellm).
+
+  `pip install 'data-product-forge[standard]'` restores the previous AI and MCP behaviour, and
+  `[dev]` and `[all]` include all three. The Docker image profiles already install `[standard]` and
+  `[lineage]`. 0.27.0 added the extras next to the base install so you could switch first.
+  *Why:* the base install resolved to 88 packages (Linux, Python 3.12) for a command line whose
+  core commands need none of these three; litellm alone was 30 of them.
+  *Numbers* (`uv pip compile`, base install, no extras, packages before to after): Linux Python 3.12
+  88 to 41, Linux Python 3.10 86 to 45, Windows Python 3.12 89 to 41. A bare install is about
+  56 MB of site-packages, and `build_parser()` imports 840 modules on it.
+
 ### Security
 
 - **A contract chose both the variable and the hosts an Iceberg sink's catalog credential went
