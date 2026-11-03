@@ -830,7 +830,10 @@ def drop_orphan_functions(session: Session, targets: Sequence[Target], say: Say)
             query = {"catalog_name": catalog, "schema_name": schema}
             bound: set = set()
             columns: Dict[str, List[str]] = {}
-            for row in _list_named(client, "/api/2.1/unity-catalog/tables", query, "tables"):
+            # include_browse: a table the run may only browse is listed too, and reading it
+            # fails, so nothing is dropped rather than a binding being missed
+            tables_query = {**query, "include_browse": "true"}
+            for row in _list_named(client, "/api/2.1/unity-catalog/tables", tables_query, "tables"):
                 full = str(row.get("full_name") or f"{where}.{row.get('name')}")
                 live = read_table(client, full)
                 if live is None:

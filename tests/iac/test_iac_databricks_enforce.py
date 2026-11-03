@@ -1176,6 +1176,22 @@ def test_the_orphan_drop_follows_pages_of_functions(fake):
     assert first not in fake.functions
 
 
+def test_the_orphan_drop_lists_the_tables_it_may_only_browse_too(fake):
+    first, changed = _changed_contract_applied(fake)
+    seen: List[Any] = []
+    real = fake._list_tables
+
+    def spy(m, q, b):
+        seen.append(q)
+        return real(m, q, b)
+
+    fake.routes = [(mth, rx, spy if fn == real else fn) for mth, rx, fn in fake.routes]
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert any((q.get("include_browse") or [""])[0] == "true" for q in seen), seen
+
+
 # ── the fail-safe: a deny-all filter, then a lock ───────────────────────────
 def _holders(fake: FakeDatabricks) -> Dict[str, List[str]]:
     return {p: v for p, v in fake.grants[("table", TABLE)].items() if v}

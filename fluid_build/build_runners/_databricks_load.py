@@ -412,14 +412,22 @@ class Landing:
                 )
             raise
         left = self._delete(prefix, remote)
-        if failure is not None:
-            tail = (
-                f"; and could not delete the staged files, which hold the landed data: "
-                f"{'; '.join(left)}"
-                if left
-                else f" (the staged files in {prefix} were deleted)"
+        if left:
+            # the paths lead the message: a caller that shortens it must not cut them off
+            logger.error(
+                "databricks.load could not delete the staged files, which hold the landed data; "
+                "delete them: %s",
+                "; ".join(left),
             )
-            raise DatabricksLoadError(f"{failure}{tail}") from None
+        if failure is not None:
+            if left:
+                raise DatabricksLoadError(
+                    f"could not delete the staged files, which hold the landed data; delete them: "
+                    f"{'; '.join(left)}. The load had failed: {failure}"
+                ) from None
+            raise DatabricksLoadError(
+                f"{failure} (the staged files in {prefix} were deleted)"
+            ) from None
         if left:
             raise DatabricksLoadError(
                 f"loaded {loaded} rows into {full}, but could not delete the staged files, which "

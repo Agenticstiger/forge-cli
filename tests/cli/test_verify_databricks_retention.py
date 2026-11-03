@@ -46,10 +46,14 @@ class RetentionWorkspace(StubWorkspace):
     def __init__(self) -> None:
         super().__init__()
         self.extras: Dict[str, Any] = {}
+        #: GetTable serves a managed Delta table's properties (``delta.*``) with it.
+        self.serves_properties = True
 
     def answer(self, method: str, path: str, query: Dict[str, Any]) -> Dict[str, Any]:
         out = super().answer(method, path, query)
         if path == f"/api/2.1/unity-catalog/tables/{TABLE}":
+            served = {"properties": {"delta.minReaderVersion": "3"}}
+            out = {**(served if self.serves_properties else {}), **out}
             out = {**out, **copy.deepcopy(self.extras)}
         return out
 
@@ -235,3 +239,14 @@ def test_the_stand_in_workspace_serves_the_properties_verify_reads(tmp_path):
     assert _dimension(failing)["status"] == "fail"
     assert _dimension(passing)["status"] == "pass"
     assert _dimension(passing)["predictive_optimization"] == "ENABLE"
+
+
+def test_a_table_served_without_properties_is_a_warning_that_says_the_defaults_were_assumed(
+    workspace,
+):
+    workspace.serves_properties = False
+    workspace.extras = {"effective_predictive_optimization_flag": {"value": "ENABLE"}}
+    dim = _dimension(_verify(workspace, _contract()))
+    assert dim["status"] == "warn", dim
+    assert "no table properties" in dim["warnings"][0]
+    assert "SHOW TBLPROPERTIES" in dim["fix"]

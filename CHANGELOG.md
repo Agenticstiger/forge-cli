@@ -156,8 +156,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   short. `fluid verify` gains a `retention` dimension: the live table's Delta history
   (`properties` and `delta_runtime_properties_kvpairs`) must not exceed the contract's retention
   (CRITICAL, with the `ALTER TABLE ... SET TBLPROPERTIES`), and predictive optimization off for
-  the table is a warning with the fix (enable it, or schedule `VACUUM`); skipped without
-  `expire`. Not run against a live workspace: which property names Unity Catalog's GetTable
+  the table is a warning with the fix (enable it, or schedule `VACUUM`), as is a table GetTable
+  serves without any properties (Delta's defaults were assumed; check `SHOW TBLPROPERTIES`);
+  skipped without `expire`. Not run against a live workspace: which property names Unity Catalog's GetTable
   serves for a table's Delta retention, and what predictive optimization reports, are modelled
   on databricks-sdk-go v0.190.0, not observed.
 
@@ -168,11 +169,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through the Files API to `DATABRICKS_STAGING_VOLUME` (`/Volumes/<catalog>/<schema>/<volume>`, from
   the environment only, like `DATABRICKS_WAREHOUSE_ID`) as `<product>/<build>/<run id>/<file>.parquet`,
   and runs one statement on the warehouse, `INSERT OVERWRITE <catalog>.<schema>.<table> SELECT
-  <the contract's columns> FROM read_files('<run dir>', format => 'parquet')`: a full refresh that
-  rewrites the rows and keeps the table's definition, grants, tags, row filter and column masks.
-  The staged files are deleted afterwards whether or not the load worked (a file that cannot be
-  deleted fails the run and is named), and the run record gains `facets.databricks_load` (table, rows
-  loaded, where it staged, that it deleted). The table must exist: a missing one fails naming
+  <the contract's columns> FROM read_files('<the staged file>', format => 'parquet')`: a full refresh
+  that rewrites the rows and keeps the table's definition, grants, tags, row filter and column masks.
+  It reads only the file the run uploaded, never the directory, so a file someone else puts there is
+  not loaded. The staged files are deleted afterwards whether or not the load worked, and on Ctrl-C
+  too (the INSERT is cancelled on the warehouse first); a file that cannot be deleted fails the run
+  and is named first in the error. A run killed outright cannot clean up, so each load first deletes
+  what earlier runs of the same build left under `<volume>/<product>/<build>/`. The run record gains
+  `facets.databricks_load` (table, rows loaded, where it staged, that it deleted, and
+  `earlier_runs_staging_deleted`). The table must exist: a missing one fails naming
   `fluid apply`, and the runner never creates or alters a table. An unset volume or warehouse, a
   mode other than `full_refresh`, a sink other than Parquet and more than one stream are refused
   before anything runs. Every other platform's landing is unchanged. The Databricks emitter now

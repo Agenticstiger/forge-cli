@@ -473,6 +473,11 @@ def _retention_dimension(table: Any, live_table: Mapping[str, Any]) -> Dict[str,
             ),
         }
     result["history_seconds"] = effective
+    if "properties" not in live_table and "delta_runtime_properties_kvpairs" not in live_table:
+        warnings.append(
+            f"Unity Catalog returned no table properties for {table.full_name}, so Delta's "
+            f"defaults were assumed. Check them with SHOW TBLPROPERTIES {quoted}"
+        )
     if effective > promised:
         days = max(promised // 86400, 1)
         fix = (

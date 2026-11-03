@@ -339,6 +339,8 @@ def _walk_models(
         base = project / rel
         if base.is_symlink() or not base.is_dir():
             continue
+        if not base.resolve().is_relative_to(project.resolve()):
+            continue  # a folder on the way is a link out of the project
         for here, dirs, names in os.walk(base, followlinks=False):
             dirs[:] = sorted(
                 d for d in dirs if not d.startswith(".") and not (Path(here) / d).is_symlink()

@@ -465,6 +465,19 @@ class TestDbtRefused:
         (tmp_path / "dbt" / "models" / "orders.sql").symlink_to(outside)
         _refused(_compile(_contract(), tmp_path), "dbt-unresolved")
 
+    def test_a_model_path_through_a_linked_folder_is_not_followed(self, tmp_path):
+        _project(tmp_path, name="other")
+        outside = tmp_path / "outside" / "sub"
+        outside.mkdir(parents=True)
+        (outside / "orders.sql").write_text(
+            "{{ config(materialized='table') }}\nselect 1", encoding="utf-8"
+        )
+        (tmp_path / "dbt" / "linked").symlink_to(tmp_path / "outside")
+        (tmp_path / "dbt" / "dbt_project.yml").write_text(
+            "name: shop\nmodel-paths: ['linked/sub']\n", encoding="utf-8"
+        )
+        _refused(_compile(_contract(), tmp_path), "dbt-unresolved")
+
     def test_validate_without_a_contract_file_reads_nothing(self):
         # As for the job emitter: nothing to read yet, so nothing refused for the project.
         _accepted(_compile(_contract(), None, validating=True))
