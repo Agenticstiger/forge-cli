@@ -196,7 +196,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   functions in the product schema that carry the table's `fluid_rf_<table>_`,
   `fluid_mask_<table>_<column>_` or deny-all name and are neither expected now nor bound to any
   table in the schema (every table is read first; if one cannot be, nothing is dropped) are
-  dropped, each printed. A function without the `fluid_` prefix is never touched.
+  dropped, each printed, and only when the run's own identity owns the function: one with
+  another owner, or an owner that cannot be read, is left and named. A function without the
+  `fluid_` prefix is never touched.
 
 - **A plan that fails the residency check prints one line.** The apply showed the last 800
   characters of the tofu JSON, which cut off the sentence naming the live region. It now says

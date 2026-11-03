@@ -219,6 +219,12 @@ def _type(text: Any) -> str:
     return "".join(str(text or "").split()).lower()
 
 
+def owner_matches(owner: Any, owners: Collection[str]) -> bool:
+    """Whether a function's ``owner`` is one of ``owners`` (case-insensitive): the one comparison
+    the read-back of a function and the orphan drop share."""
+    return str(owner or "").lower() in {o.lower() for o in owners}
+
+
 def function_problem(
     info: Optional[Mapping[str, Any]], expected: Function, owners: Collection[str]
 ) -> Optional[str]:
@@ -234,7 +240,7 @@ def function_problem(
         return f"{expected.full_name} does not exist"
     problems: List[str] = []
     owner = str(info.get("owner") or "")
-    if owner.lower() not in {o.lower() for o in owners}:
+    if not owner_matches(owner, owners):
         problems.append(f"its owner is {owner or 'unknown'}, not {' or '.join(sorted(owners))}")
     body_language = str(info.get("routine_body") or "SQL").upper()
     if body_language != "SQL":
@@ -845,6 +851,20 @@ def drop_orphan_functions(session: Session, targets: Sequence[Target], say: Say)
                 if name in dropped:
                     continue
                 full = f"{where}.{name}"
+                try:
+                    owner = str((read_function(client, full) or {}).get("owner") or "")
+                    me = session.identity
+                except Exception:  # noqa: BLE001 — unknown owner: leave it
+                    owner, me = "", ""
+                if not me or not owner_matches(owner, {me}):
+                    why = (
+                        f"owned by {owner}, not by the deploy identity"
+                        if owner
+                        else "owner unknown"
+                    )
+                    say(f"  left function {full}: {why}")
+                    dropped.append(name)  # said once; not tried again for another table
+                    continue
                 try:
                     session.runner.run(f"DROP FUNCTION IF EXISTS {quote_table(full)}")
                 except StatementFailed as exc:

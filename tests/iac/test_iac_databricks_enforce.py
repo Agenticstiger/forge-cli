@@ -1113,6 +1113,29 @@ def test_only_this_tables_fluid_functions_are_dropped(fake):
     assert all(name in fake.functions for name in keep)
 
 
+def test_an_orphan_not_owned_by_the_deploy_identity_is_left_and_named(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.functions[first]["owner"] = "someone-else@example.test"
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert first in fake.functions
+    assert "DROP FUNCTION" not in "\n".join(run.statements())
+    assert f"left function {first}: owned by someone-else@example.test, not by the deploy " in (
+        run.text
+    )
+
+
+def test_an_orphan_whose_owner_cannot_be_read_is_left_and_named(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.fail_route("GET", rf"/functions/{first}$", 503, "unavailable")
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert first in fake.functions
+    assert f"left function {first}: owner unknown" in run.text
+
+
 def test_nothing_is_dropped_after_a_failed_apply(fake):
     first, changed = _changed_contract_applied(fake)
     run = Run(fake)
