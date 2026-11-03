@@ -29,28 +29,51 @@ The user sees a panel **populated with what was found**, asking only the
 un-inferred bits. Recurring users (≥5 forges) skip the welcome entirely
 and land straight in the interview.
 
-50ms scan budget — every probe is best-effort, never blocking.
+Every probe is best-effort and never raises. Budget: once the one-time
+module imports are done, the probes share ``_TOTAL_TIMEOUT_S`` of wall-clock
+and the scan returns by then, dropping any probe still running. The dbt probe
+sets the floor: with Python dbt-core on PATH it usually waits out
+``_DBT_VERSION_TIMEOUT_S`` and reports nothing. ``scan_duration_ms`` is the
+measured wall-clock of the whole call, imports included.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
 import shutil
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, wait
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 LOG = logging.getLogger(__name__)
 
 
-# Probe budgets — every individual probe must finish under this.
-_PROBE_TIMEOUT_S = 0.4
-# Aggregate scan budget — shut down probes that overrun.
+# Wall-clock budget for the whole scan, counted once the cold imports are done
+# (see ``_warm_probe_imports``). A probe still running at the deadline is dropped.
 _TOTAL_TIMEOUT_S = 1.0
+# ``dbt --version`` cap. Fusion answers in milliseconds, Python dbt-core in
+# seconds, so a slow binary simply reports nothing. Independent of the scan
+# budget (it sizes one subprocess, not the scan) but it must stay below it: the
+# subprocess is then killed by its own timeout before the scan can abandon it.
+_DBT_VERSION_TIMEOUT_S = 0.32
+# Modules the probes import lazily, paid up front by ``_warm_probe_imports``.
+# They stay function-local in the probes, not imported here, so this module is
+# cheap to import. ``tests/test_welcome_scan_budget.py`` fails if a probe starts
+# importing something that is not listed here.
+_WARM_MODULES = (
+    "fluid_build.cli.workspace_config",  # _probe_workspace
+    "fluid_build.cli.ai_setup",  # _probe_ai_credentials
+    # ``_load_ai_config`` imports it lazily; it pulls in pydantic and is most of
+    # the AI probe's cold cost (~0.1s CPU, several times that on a loaded host).
+    "fluid_build.copilot.unified_config",
+    "fluid_build.build_runners.dbt.runner",  # _probe_dbt_engine
+)
 # Repeat-user threshold — at this many forges we stop showing the panel.
 _REPEAT_USER_THRESHOLD = 5
 # File extensions we recognise as candidate sample data.
@@ -244,11 +267,11 @@ def _probe_dbt_engine() -> Dict[str, Any]:
     """Detect the dbt engine flavor (Python dbt-core v1 vs Fusion / v2).
 
     Fusion (Rust) answers ``dbt --version`` in milliseconds; Python
-    dbt-core takes seconds, so the subprocess gets a sub-budget timeout
-    and a slow binary simply reports nothing — the CLIs row then shows a
-    plain ``dbt`` exactly as before. The detection cache is keyed on the
-    timeout too, so this short-budget miss never poisons the build
-    runner's full-budget probe.
+    dbt-core takes seconds, so the subprocess gets its own short timeout
+    (``_DBT_VERSION_TIMEOUT_S``) and a slow binary simply reports nothing —
+    the CLIs row then shows a plain ``dbt`` exactly as before. The detection
+    cache is keyed on the timeout too, so this short-timeout miss never
+    poisons the build runner's full-timeout probe.
     """
     try:
         from fluid_build.build_runners.dbt.runner import (
@@ -259,7 +282,7 @@ def _probe_dbt_engine() -> Dict[str, Any]:
         dbt_bin = _resolve_dbt_executable()
         if not dbt_bin:
             return {}
-        flavor, version = _detect_dbt_engine(dbt_bin, timeout=_PROBE_TIMEOUT_S * 0.8)
+        flavor, version = _detect_dbt_engine(dbt_bin, timeout=_DBT_VERSION_TIMEOUT_S)
         if flavor == "unknown":
             return {}
         return {"dbt_engine": f"{flavor} {version}".strip()}
@@ -381,18 +404,66 @@ def _probe_specialization_suggestion(start: Path) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _warm_probe_imports() -> None:
+    """Import every module in ``_WARM_MODULES`` (best-effort, idempotent).
+
+    A cold import is CPU work, not the I/O wait the scan budget exists for, and
+    a loaded machine stretches it several times over. Paying it here, before
+    the budget clock starts, keeps the first scan of a process from dropping
+    results that a warm scan returns.
+    """
+    for name in _WARM_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception as exc:  # noqa: BLE001 — best-effort; the probe reports its own failure
+            LOG.debug("welcome_scan_warm_failed: %s — %s", name, exc)
+
+
+def _spawn_probe(
+    name: str, fn: Callable[..., Dict[str, Any]], args: Tuple[Any, ...]
+) -> Future[Dict[str, Any]]:
+    """Run ``fn(*args)`` on a daemon thread and return a Future for its result.
+
+    Not a ``ThreadPoolExecutor``: its workers are non-daemon and joined at
+    interpreter exit (documented in ``concurrent.futures``), so a probe the scan
+    gave up on would keep the CLI alive until it finished. Same idiom as the
+    non-SIGALRM path of ``ProcessManager.run_with_timeout`` (``cli/security.py``),
+    with a Future per probe so the caller can wait on all of them against one
+    deadline.
+
+    Probes must not write to stdout/stderr: a daemon thread caught mid-write
+    when the interpreter exits can abort the process.
+    """
+    future: Future[Dict[str, Any]] = Future()
+
+    def _run() -> None:
+        try:
+            future.set_result(fn(*args))
+        except BaseException as exc:  # noqa: BLE001 — recorded on the Future, never raised here
+            future.set_exception(exc)
+
+    threading.Thread(target=_run, name=f"welcome-scan-{name}", daemon=True).start()
+    return future
+
+
 def run_welcome_scan(*, start: Optional[Path] = None) -> WelcomeFindings:
     """Run every probe in parallel and return a :class:`WelcomeFindings`.
 
-    Total wall-clock <= ``_TOTAL_TIMEOUT_S``. Each individual probe runs
-    under ``_PROBE_TIMEOUT_S``. A probe that times out is silently
-    dropped — its fields stay at their defaults.
+    The probes start together on daemon threads. The cold imports they trigger
+    finish first (``_warm_probe_imports``, overlapping the probes' own work,
+    the dbt subprocess included); the probes then get ``_TOTAL_TIMEOUT_S`` of
+    wall-clock. A probe still running at the deadline is dropped — its fields
+    stay at their defaults — and abandoned, so a hung probe delays neither the
+    prompt nor the process exit.
+
+    Wall-clock is the cold imports plus at most ``_TOTAL_TIMEOUT_S``;
+    ``scan_duration_ms`` reports all of it.
     """
     target = (start or Path.cwd()).resolve()
     findings = WelcomeFindings()
-    started = time.time()
+    started = time.monotonic()
 
-    probes = {
+    probes: Dict[str, Tuple[Callable[..., Dict[str, Any]], Tuple[Any, ...]]] = {
         "workspace": (_probe_workspace, (target,)),
         "ai": (_probe_ai_credentials, ()),
         "clis": (_probe_clis, ()),
@@ -404,21 +475,22 @@ def run_welcome_scan(*, start: Optional[Path] = None) -> WelcomeFindings:
         "specialization": (_probe_specialization_suggestion, (target,)),
     }
 
-    with ThreadPoolExecutor(max_workers=len(probes)) as pool:
-        futures = {name: pool.submit(fn, *args) for name, (fn, args) in probes.items()}
-        deadline = started + _TOTAL_TIMEOUT_S
-        for name, fut in futures.items():
-            remaining = max(0.0, deadline - time.time())
-            try:
-                result = fut.result(timeout=min(_PROBE_TIMEOUT_S, remaining))
-            except Exception as exc:  # noqa: BLE001 — concurrent.futures.TimeoutError + others
-                LOG.debug("welcome_scan_probe_failed: %s — %s", name, exc)
-                continue
-            for key, value in (result or {}).items():
-                if hasattr(findings, key):
-                    setattr(findings, key, value)
+    futures = {name: _spawn_probe(name, fn, args) for name, (fn, args) in probes.items()}
+    _warm_probe_imports()
+    done, _ = wait(futures.values(), timeout=_TOTAL_TIMEOUT_S)
+    for name, future in futures.items():
+        if future not in done:
+            LOG.debug("welcome_scan_probe_timeout: %s", name)
+            continue
+        exc = future.exception()
+        if exc is not None:
+            LOG.debug("welcome_scan_probe_failed: %s — %s", name, exc)
+            continue
+        for key, value in (future.result() or {}).items():
+            if hasattr(findings, key):
+                setattr(findings, key, value)
 
-    findings.scan_duration_ms = int((time.time() - started) * 1000)
+    findings.scan_duration_ms = int((time.monotonic() - started) * 1000)
     return findings
 
 
