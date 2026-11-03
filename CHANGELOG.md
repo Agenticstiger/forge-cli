@@ -273,9 +273,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed deep inside with a traceback. A package that is installed but fails to import (litellm >= 1.98 on Python 3.10) is reported as
   that. Fallbacks that used to be silent now warn once: the ODCS typed model, the Glue catalog id,
   and credentials without pydantic-settings. `fluid doctor` reads these packages' versions from
-  their metadata instead of importing them (about 1,000 modules loaded instead of 3,300). On AWS,
-  `fluid plan` without a resolvable account id says so, where it failed on the invalid bucket
-  name `None-fluid-...`.
+  their metadata instead of importing them (about 1,000 modules loaded instead of 3,300).
 
 - **`fluid diff --baseline` reported nothing for column changes in a 0.7.x contract.** It read
   columns from `exposes[].schema`, but a 0.7.x contract keeps them in `exposes[].contract.schema`

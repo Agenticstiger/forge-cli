@@ -41,6 +41,7 @@ from pathlib import Path
 import pytest
 
 from fluid_build._optional import MissingOptionalDependency, is_available, require
+from fluid_build.providers.base import ProviderError
 
 REPO = Path(__file__).resolve().parent.parent
 SCRATCH_CONTRACT = REPO / "examples" / "aws-s3-glue-athena" / "contract.fluid.yaml"
@@ -287,10 +288,19 @@ def test_doctor_imports_neither_litellm_mcp_nor_openlineage_and_reports_versions
 # ── mcp ──────────────────────────────────────────────────────────────────────
 
 
-def test_mcp_serve_without_the_sdk_prints_the_install_line_and_exits_1(block, cli):
+def test_mcp_serve_without_the_sdk_prints_the_install_line_and_exits_1(block, cli, monkeypatch):
+    from fluid_build.cli.mcp import policy as mcp_policy
+    from fluid_build.cli.mcp import server as mcp_server
+
+    # An app built by an earlier test in this process is cached; without
+    # clearing it, serve skips the SDK import and runs a stdio server.
+    monkeypatch.setattr(mcp_server, "_mcp_app", None)
+    monkeypatch.setattr(mcp_policy, "_current_policy", None)
     block("mcp")
     rc, out = cli("mcp", "serve")
     assert rc == 1
+    # A serve that never started leaves no policy behind for later tools.
+    assert mcp_policy._current_policy is None
     assert _hint("The MCP server", "mcp", "mcp") in out
     assert "ERR_MCP_SDK_UNAVAILABLE" in out
     assert "No module named" not in out and "Unexpected error" not in out
@@ -420,9 +430,10 @@ def test_aws_plan_without_boto3_fails_with_the_extra_not_a_bucket_name(block, mo
 
     provider = AwsProvider()
     assert provider.account_id is None
-    with pytest.raises(MissingOptionalDependency) as info:
+    with pytest.raises(ProviderError) as info:
         provider.plan({"id": "p", "exposes": []})
-    assert str(info.value) == _hint("Resolving the AWS account id", "boto3", "aws")
+    assert "boto3 is not installed" in str(info.value)
+    assert "pip install 'data-product-forge[aws]'" in str(info.value)
 
 
 def test_aws_plan_without_credentials_fails_clearly_not_with_a_none_bucket(monkeypatch):
@@ -434,12 +445,11 @@ def test_aws_plan_without_credentials_fails_clearly_not_with_a_none_bucket(monke
 
     monkeypatch.setattr(boto3, "client", no_credentials)
     from fluid_build.providers.aws.provider import AwsProvider
-    from fluid_build.providers.base import ProviderError
 
     provider = AwsProvider()
     with pytest.raises(ProviderError) as info:
         provider.plan({"id": "p", "exposes": []})
-    assert "Could not resolve the AWS account id" in str(info.value)
+    assert "The AWS account id could not be resolved" in str(info.value)
     assert "None-fluid-staging" not in str(info.value)
 
 
@@ -456,7 +466,7 @@ def test_diff_without_boto3_fails_with_the_aws_extra(block, cli, monkeypatch):
     rc, out = cli("diff", str(SCRATCH_CONTRACT), "--no-live")
     assert rc == 1
     flat = _flat(out)
-    assert "Resolving the AWS account id needs boto3, which is not installed." in flat
+    assert "boto3 is not installed" in flat
     assert "pip install 'data-product-forge[aws]'" in flat
     assert "None-fluid-staging" not in out
 
@@ -471,7 +481,7 @@ def test_diff_without_credentials_fails_clearly_not_with_a_none_bucket(cli, monk
     monkeypatch.setattr(boto3, "client", no_credentials)
     rc, out = cli("diff", str(SCRATCH_CONTRACT), "--no-live")
     assert rc == 1
-    assert "Could not resolve the AWS account id" in _flat(out)
+    assert "The AWS account id could not be resolved" in _flat(out)
     assert "None-fluid-staging" not in out
 
 

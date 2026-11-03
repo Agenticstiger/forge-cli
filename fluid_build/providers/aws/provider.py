@@ -98,26 +98,6 @@ class AwsProvider(BaseProvider):
             region=self.region,
         )
 
-    def _require_account_id(self) -> None:
-        """Fail clearly when no AWS account id was resolved.
-
-        Planning derives bucket names from the account id; with ``None`` it used
-        to emit ``None-fluid-staging`` and fail later with "Bucket name
-        'None-fluid-staging' is invalid". The id comes from ``AWS_ACCOUNT_ID`` or
-        ``sts:GetCallerIdentity`` (which needs boto3, the ``[aws]`` extra).
-        """
-        if self.account_id:
-            return
-        from fluid_build._optional import MissingOptionalDependency, is_available
-
-        if not is_available("boto3"):
-            raise MissingOptionalDependency("boto3", "aws", "Resolving the AWS account id")
-        raise ProviderError(
-            "Could not resolve the AWS account id through STS GetCallerIdentity. "
-            "Check your credentials with 'aws sts get-caller-identity', "
-            "or set AWS_ACCOUNT_ID."
-        )
-
     def capabilities(self) -> Mapping[str, bool]:
         """Advertise comprehensive AWS provider capabilities."""
         return {
@@ -196,10 +176,6 @@ class AwsProvider(BaseProvider):
             contract_name=contract.get("name"),
             mode=mode,
         )
-
-        # Before the ``try`` below: it wraps every other exception as "Failed to
-        # plan AWS deployment", which would bury the install line.
-        self._require_account_id()
 
         try:
             # Validate sovereignty constraints (FLUID 0.7.1). First, and with no
