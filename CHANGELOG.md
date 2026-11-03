@@ -156,6 +156,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primary key, so one that stops being `required` is `primary_key_nullable` (breaking) rather
   than a non-breaking loosening.
 
+- **The `fluid forge --refine` preview read no columns from a `schema: {fields: [...]}`
+  expose.** The diff now unwraps it at `schema` and `contract.schema` alike, as `fluid verify`
+  does, and reports its columns at `...schema.fields.<column>`. No bundled schema accepts the
+  wrapper, so `fluid diff --baseline` refuses such a contract as invalid (see Security).
+
 - **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
   `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the
   diagnostic (the summary, the resource address and the provider's detail) and says that OpenTofu

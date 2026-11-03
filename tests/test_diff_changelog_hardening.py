@@ -31,7 +31,7 @@ import pytest
 import yaml
 
 from fluid_build.api.changelog import ContractValidationError, compare_contracts
-from fluid_build.api.changelog_rules import diff_quality_severity
+from fluid_build.api.changelog_rules import diff_columns, diff_quality_severity
 from tests.test_diff_changelog import _ID_COLUMN as _ID
 from tests.test_diff_changelog import _contract_076
 
@@ -304,3 +304,51 @@ def test_the_cli_gate_fails_on_a_primary_key_made_nullable(tmp_path):
     )
 
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# A schema may wrap its column list as {"fields": [...]}
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "layout, at",
+    [
+        pytest.param(lambda cols: {"schema": {"fields": cols}}, "schema.fields", id="flat"),
+        pytest.param(
+            lambda cols: {"contract": {"schema": {"fields": cols}}},
+            "contract.schema.fields",
+            id="contract",
+        ),
+    ],
+)
+def test_a_wrapped_schema_is_read(layout, at):
+    email = {"name": "email", "type": "STRING"}
+    old = {"id": "x", **layout([_ID, email])}
+    new = {"id": "x", **layout([_ID])}
+
+    changes = diff_columns(old, new, "x", 0)
+
+    assert [(c.kind, c.path) for c in changes] == [("column_removed", f"exposes[0].{at}.email")]
+
+
+def test_wrapping_a_schema_is_not_a_change_to_its_columns():
+    columns = [_ID, {"name": "email", "type": "STRING"}]
+
+    assert diff_columns({"schema": columns}, {"schema": {"fields": columns}}, "x", 0) == []
+
+
+def test_a_wrapped_schema_is_read_when_validation_is_off_and_refused_when_it_is_on():
+    """No bundled schema accepts the wrapper, so only an unvalidated diff ever meets it."""
+    email = {"name": "email", "type": "string"}
+    old, new = _contract([_ID, email]), _contract([_ID])
+    for contract in (old, new):
+        expose = contract["exposes"][0]
+        expose["contract"]["schema"] = {"fields": expose["contract"]["schema"]}
+
+    report = compare_contracts(old, new, validate=False)
+    assert [(c.kind, c.path) for c in report.breaking] == [
+        ("column_removed", "exposes[0].contract.schema.fields.email")
+    ]
+    with pytest.raises(ContractValidationError):
+        compare_contracts(old, new)

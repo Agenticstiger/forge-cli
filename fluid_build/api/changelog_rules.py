@@ -182,17 +182,22 @@ def _expose_schema(expose: Mapping[str, Any]) -> Tuple[Sequence[Any], Optional[s
     Pre-0.7 contracts keep their columns at ``schema``; 0.7.x contracts keep
     them at ``contract.schema``. The flat ``schema`` is read when it is
     present and ``contract.schema`` only when it is absent, so a contract
-    that carries both is read as it was before 0.7.x. The location is
-    ``None`` when the expose carries no schema at all.
+    that carries both is read as it was before 0.7.x. Either one may wrap
+    its list as ``{"fields": [...]}``, as ``_verify_reconcile`` and
+    ``forge_copilot_drift_guard`` accept, and the columns are then found at
+    ``schema.fields``. The location is ``None`` when the expose carries no
+    schema at all.
     """
-    columns = expose.get("schema")
-    if columns is not None:
-        return columns or [], "schema"
-    contract = expose.get("contract")
-    columns = contract.get("schema") if isinstance(contract, Mapping) else None
-    if columns is not None:
-        return columns or [], "contract.schema"
-    return [], None
+    columns, location = expose.get("schema"), "schema"
+    if columns is None:
+        contract = expose.get("contract")
+        columns = contract.get("schema") if isinstance(contract, Mapping) else None
+        location = "contract.schema"
+    if columns is None:
+        return [], None
+    if isinstance(columns, Mapping):
+        columns, location = columns.get("fields"), f"{location}.fields"
+    return (columns if isinstance(columns, (list, tuple)) else []), location
 
 
 def _is_nullable(column: Mapping[str, Any]) -> bool:
