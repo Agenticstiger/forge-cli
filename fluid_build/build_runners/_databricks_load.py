@@ -255,6 +255,10 @@ class Landing:
     # ── the three steps ────────────────────────────────────────────────
 
     def _upload(self, path: str, prefix: str, remote: str) -> None:
+        # One PUT to the Files API's own endpoint (the one databricks-sdk's FilesAPI.upload
+        # calls), not WorkspaceClient.files.upload: from databricks-sdk 0.4x its FilesExt can
+        # switch to multipart uploads through presigned cloud-storage URLs, a second host the
+        # data would go to. The cost is the single PUT's 5 GiB limit per file.
         do = self._client.api_client.do
         try:
             do("PUT", _fs("directories", prefix))
