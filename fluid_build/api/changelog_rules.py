@@ -175,6 +175,38 @@ def _columns_by_name(columns: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[
     return out
 
 
+def _expose_schema(expose: Mapping[str, Any]) -> Tuple[Sequence[Any], Optional[str]]:
+    """Return an expose's columns and where, below the expose, they were found.
+
+    Pre-0.7 contracts keep their columns at ``schema``; 0.7.x contracts keep
+    them at ``contract.schema``. The flat ``schema`` is read when it is
+    present and ``contract.schema`` only when it is absent, so a contract
+    that carries both is read as it was before 0.7.x. The location is
+    ``None`` when the expose carries no schema at all.
+    """
+    columns = expose.get("schema")
+    if columns is not None:
+        return columns or [], "schema"
+    contract = expose.get("contract")
+    columns = contract.get("schema") if isinstance(contract, Mapping) else None
+    if columns is not None:
+        return columns or [], "contract.schema"
+    return [], None
+
+
+def _is_nullable(column: Mapping[str, Any]) -> bool:
+    """Whether *column* admits NULL.
+
+    Pre-0.7 columns spell NOT NULL ``nullable: false``. A 0.7.x column has no
+    ``nullable`` key and spells it ``required: true``. ``required`` only
+    decides where ``nullable`` is absent: an explicit ``nullable`` wins.
+    """
+    nullable = column.get("nullable")
+    if nullable is not None:
+        return nullable is not False
+    return column.get("required") is not True
+
+
 def _primary_key_set(expose: Mapping[str, Any]) -> frozenset[str]:
     """Extract the set of primary-key column names from an expose dict.
 
@@ -187,7 +219,7 @@ def _primary_key_set(expose: Mapping[str, Any]) -> frozenset[str]:
         for n in expose_pk:
             if isinstance(n, str):
                 pk.add(n)
-    for col in expose.get("schema", []) or []:
+    for col in _expose_schema(expose)[0]:
         if isinstance(col, Mapping) and col.get("primaryKey") is True:
             name = col.get("name")
             if isinstance(name, str):
@@ -201,13 +233,19 @@ def diff_columns(
     expose_id: str,
     expose_idx: int,
 ) -> List[Change]:
-    """Classify per-column changes between two versions of the same expose."""
-    base_cols = baseline_expose.get("schema", []) or []
-    new_cols = new_expose.get("schema", []) or []
+    """Classify per-column changes between two versions of the same expose.
+
+    Columns are read from ``schema`` or, in a 0.7.x contract, from
+    ``contract.schema`` (see :func:`_expose_schema`).
+    """
+    base_cols, base_at = _expose_schema(baseline_expose)
+    new_cols, new_at = _expose_schema(new_expose)
     base_by_name = _columns_by_name(base_cols)
     new_by_name = _columns_by_name(new_cols)
     pk = _primary_key_set(new_expose) | _primary_key_set(baseline_expose)
-    path_prefix = f"exposes[{expose_idx}].schema"
+    # Paths follow the layout the new contract uses (the baseline's, when the
+    # new one gave the expose no schema), so each leads to a key that exists.
+    path_prefix = f"exposes[{expose_idx}].{new_at or base_at or 'schema'}"
 
     changes: List[Change] = []
 
@@ -228,7 +266,7 @@ def diff_columns(
     # (downstream pipelines may insert rows that fail the NOT NULL check).
     for col_name in new_by_name.keys() - base_by_name.keys():
         col = new_by_name[col_name]
-        is_nullable = col.get("nullable", True) is not False
+        is_nullable = _is_nullable(col)
         severity = "non_breaking" if is_nullable else "breaking"
         description = (
             f"column '{col_name}' added to expose '{expose_id}'"
@@ -326,8 +364,8 @@ def diff_columns(
             )
 
         # Nullability changes.
-        old_null = old.get("nullable", True) is not False
-        new_null = new.get("nullable", True) is not False
+        old_null = _is_nullable(old)
+        new_null = _is_nullable(new)
         if old_null != new_null:
             if new_null and col_name in pk:
                 # PK column became nullable — breaking.
@@ -688,7 +726,7 @@ def _diff_nested_fields(
 
     for fname in new_by_name.keys() - base_by_name.keys():
         field = new_by_name[fname]
-        is_nullable = field.get("nullable", True) is not False
+        is_nullable = _is_nullable(field)
         severity = "non_breaking" if is_nullable else "breaking"
         changes.append(
             Change(

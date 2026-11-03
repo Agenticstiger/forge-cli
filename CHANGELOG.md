@@ -20,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid diff --baseline` reported nothing for column changes in a 0.7.x contract.** It read
+  columns from `exposes[].schema`, but a 0.7.x contract keeps them in `exposes[].contract.schema`
+  (as does every `fluid init` template), so a removed column, a type change or a new NOT NULL
+  column was missed, `--fail-on-breaking` exited 0, and the `fluid forge --refine` preview said
+  "No changes vs the existing contract." It now reads `contract.schema` when `schema` is absent,
+  and where a column has no `nullable` it takes `required: true` as NOT NULL, for an added column
+  and for a change in nullability. Contracts that used to diff clean can now report breaking
+  changes (a removed column, a type change that is not a widening, an added `required: true`
+  column), so a pipeline that runs `fluid diff --baseline --fail-on-breaking` can start exiting 1.
+  Such findings are reported at `exposes[N].contract.schema.<column>`. Quality-rule severity and
+  column `sensitivity` in a 0.7.x contract are still not compared.
+
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
   never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
   sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP
