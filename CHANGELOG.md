@@ -132,6 +132,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid diff --baseline` reported nothing for column changes in a 0.7.x contract.** It read
+  columns from `exposes[].schema`, but a 0.7.x contract keeps them in `exposes[].contract.schema`
+  (as does every `fluid init` template), so a removed column, a type change or a new NOT NULL
+  column was missed, `--fail-on-breaking` exited 0, and the `fluid forge --refine` preview said
+  "No changes vs the existing contract." It now reads `contract.schema` when `schema` is absent,
+  and a column is NOT NULL when `required` is true or `nullable` is `false`, for an added column
+  and for a change in nullability (a flat `schema` column that says only `required: true` was
+  nullable before). Contracts that used to diff clean can now report breaking changes (a removed
+  column, a type change that is not a widening, an added `required: true` column), so a pipeline
+  that runs `fluid diff --baseline --fail-on-breaking` can start exiting 1. A finding for a 0.7.x
+  column is reported at `exposes[N].contract.schema.<column>`, and a nullability one at its
+  `.required`. Still not compared in a 0.7.x contract: quality-rule severity and a column's
+  `sensitivity`. A 0.7.x primary key is not recognised either, so a key column that becomes
+  nullable is reported as non-breaking.
+
 - **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
   `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the
   diagnostic (the summary, the resource address and the provider's detail) and says that OpenTofu
