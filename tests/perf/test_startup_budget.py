@@ -80,7 +80,16 @@ pytestmark = pytest.mark.skipif(
 # ``copilot.schemas.stage_outputs`` / ``modeling_techniques``). Deferring that
 # one is a follow-up outside this change's blast radius, which is why
 # ``pydantic`` is deliberately NOT added to ``FORBIDDEN_ON_HELP`` here.
-MAX_MODULES = 1100
+#
+# Ratchet: measured 852 on 3.12 / 866 on 3.14 / 840 on 3.10 (2026-11-03, a
+# ``.[dev,local]`` install, the same one every ``Perf budgets`` lane uses);
+# the ceiling is the 3.12 count + 5%, rounded up. Lower it whenever a slimming
+# PR drops the count; the test prints the measured number so CI logs show it.
+MAX_MODULES = 895
+# ``fluid_build.providers.discover_providers()`` imports every built-in
+# provider module. Measured 872 on 3.12 / 885 on 3.14 / 696 on 3.10 in a
+# fresh process (2026-11-03); ceiling is the 3.12 count + 5%, rounded up.
+MAX_DISCOVERY_MODULES = 916
 MAX_HELP_WALL_SECONDS = 2.0
 
 # Heavy SDKs that must NOT load on the --help / parser-build path. ``mcp`` is
@@ -160,12 +169,43 @@ def _probe():
     return count, loaded
 
 
-def test_help_module_count_under_budget():
+_DISCOVER_PROBE = (
+    "import sys;"
+    "from fluid_build.providers import discover_providers; discover_providers();"
+    "print(len(sys.modules))"
+)
+
+
+def test_help_module_count_under_budget(capsys):
     count, _ = _probe()
+    with capsys.disabled():
+        print(f"\n[startup-budget] build_parser(): {count} modules (budget {MAX_MODULES})")
     assert count < MAX_MODULES, (
         f"`fluid --help` imports {count} modules (budget {MAX_MODULES}). "
         "A new top-level import crept onto the parser-build path — defer it "
         "behind a function-local import (see A++ Light CLI Cards 1/3)."
+    )
+
+
+def test_provider_discovery_module_count_under_budget(capsys):
+    """``discover_providers()`` in a cold process. No banned-module assertion yet."""
+    count = int(
+        subprocess.run(
+            [sys.executable, "-c", _DISCOVER_PROBE],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=_clean_env(),
+        ).stdout.splitlines()[-1]
+    )
+    with capsys.disabled():
+        print(
+            f"\n[startup-budget] discover_providers(): {count} modules "
+            f"(budget {MAX_DISCOVERY_MODULES})"
+        )
+    assert count < MAX_DISCOVERY_MODULES, (
+        f"`discover_providers()` imports {count} modules (budget {MAX_DISCOVERY_MODULES}). "
+        "A provider module (or something it imports at module scope) got heavier."
     )
 
 
