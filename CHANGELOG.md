@@ -132,6 +132,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid roadmap` claimed a 1.0 release and the package description left providers out.** The
+  roadmap said "forge-cli v1.0 shipped"; the package is 0.x Beta, and the roadmap now says so and
+  calls its "v1" headings an internal milestone. A test fails if it announces a 1.x release while
+  the package is below 1.0. The package description named GCP, Snowflake and Local and now names
+  AWS and Databricks too.
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
   never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
   sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP
