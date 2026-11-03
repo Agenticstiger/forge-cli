@@ -134,7 +134,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fluid apply --dry-run`, `fluid diff` or `fluid verify --state-drift` against S3 state needs
   `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `<key>.tflock`, or sets
   `FLUID_TOFU_S3_LOCKFILE=0`. A workdir kept from before the upgrade is re-initialised with
-  `-reconfigure` once, only when it recorded this same bucket, key and region.
+  `-reconfigure` once, only when it recorded this same bucket, key and region. The opt-out also takes effect on a
+  workdir that already had locking on. A run killed hard can leave `<key>.tflock` behind;
+  `tofu force-unlock <ID>` in the workdir (the ID is in tofu's error) clears it. A run that
+  hits `FLUID_TOFU_TIMEOUT_SECONDS` is now interrupted (SIGINT) so tofu releases the lock, and
+  killed only if it ignores that for 30 seconds.
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
   never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
   sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP
