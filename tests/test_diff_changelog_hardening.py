@@ -163,6 +163,19 @@ def test_a_fluid_version_that_is_not_a_version_is_refused_not_raised(tmp_path, v
     assert (cli_error.value.exit_code, cli_error.value.event) == (2, "diff_contract_invalid")
 
 
+def test_the_cli_names_the_baseline_when_only_the_baseline_is_invalid(tmp_path):
+    from fluid_build.cli._common import CLIError
+
+    old = _contract([_ID, {"name": "amount", "type": 18}])
+
+    with pytest.raises(CLIError) as excinfo:
+        _run_cli(tmp_path, old, _contract([_ID]))
+
+    assert excinfo.value.exit_code == 2
+    assert excinfo.value.context["invalid"] == ["baseline"]
+    assert str(tmp_path / "old.fluid.yaml") in excinfo.value.context["message"]
+
+
 def test_validate_false_diffs_what_it_is_given():
     """The refine preview's opt-out: an advisory diff of a contract still being repaired."""
     old = {"exposes": [{"id": "x", "schema": [{"name": "a", "type": "STRING"}]}]}
@@ -296,6 +309,26 @@ def test_render_markdown_keeps_every_name_inside_a_code_span(name):
     for code in (report.non_breaking[0].path, report.non_breaking[0].description):
         spelled = code.replace("\\", "\\\\").replace("\n", "\\x0a")
         assert f"<code>{escape(spelled, quote=False)}</code>" in html, html
+
+
+@pytest.mark.parametrize(
+    "raw, content",
+    [
+        pytest.param(" x ", " x ", id="space-at-both-ends"),
+        pytest.param("`edge`", "`edge`", id="backtick-at-both-ends"),
+        pytest.param("a``b", "a``b", id="backtick-run"),
+        pytest.param(" lead", " lead", id="space-at-one-end"),
+        pytest.param("   ", "   ", id="only-spaces"),
+        pytest.param("", " ", id="empty-becomes-one-space"),
+    ],
+)
+def test_code_span_keeps_its_text_exactly(raw, content):
+    """A code span strips one space from each end, and a backtick at an end needs padding."""
+    from html import escape
+
+    from fluid_build.api.changelog import _code
+
+    assert _html(_code(raw)) == f"<p><code>{escape(content, quote=False)}</code></p>\n"
 
 
 def test_render_markdown_reads_as_before_for_an_ordinary_name():
@@ -463,6 +496,32 @@ def test_a_rule_already_failing_under_a_duplicate_id_is_not_escalated():
     assert report.total == 0
 
 
+def test_a_quality_test_with_no_severity_is_warn_so_error_is_an_escalation():
+    old = {"id": "x", "quality": {"tests": [{"name": "t1"}]}}
+    new = {"id": "x", "quality": {"tests": [{"name": "t1", "severity": "error"}]}}
+
+    (change,) = diff_quality_severity(old, new, "x", 0)
+
+    assert (change.kind, change.before, change.after) == (
+        "quality_severity_escalated",
+        "warn",
+        "error",
+    )
+
+
+def test_a_column_quality_rule_named_by_name_is_matched_too():
+    """ODCS names a rule by ``id`` or ``name``; one with a name and no id is still compared."""
+
+    def email(severity):
+        rule = {"name": "email_valid", "type": "text", "severity": severity}
+        return {"name": "email", "type": "string", "quality": [rule]}
+
+    report = compare_contracts(_contract([email("warning")]), _contract([email("error")]))
+
+    (change,) = report.breaking
+    assert change.path == "exposes[0].contract.schema.email.quality.email_valid.severity"
+
+
 def test_a_contract_quality_rule_escalated_to_error_is_breaking():
     def quality(severity):
         return [{"rule": "positive_amount", "expression": "amount > 0", "severity": severity}]
@@ -549,6 +608,21 @@ def test_a_tagged_primary_key_column_made_nullable_is_breaking(tag, validate):
     assert report.total == 1
     assert change.kind == "primary_key_nullable"
     assert change.path == "exposes[0].contract.schema.id.required"
+
+
+def test_a_pre_07_primary_key_flag_is_still_read():
+    old = {
+        "id": "x",
+        "schema": [{"name": "id", "type": "STRING", "primaryKey": True, "nullable": False}],
+    }
+    new = {
+        "id": "x",
+        "schema": [{"name": "id", "type": "STRING", "primaryKey": True, "nullable": True}],
+    }
+
+    (change,) = diff_columns(old, new, "x", 0)
+
+    assert change.kind == "primary_key_nullable"
 
 
 def test_the_cli_gate_fails_on_a_primary_key_made_nullable(tmp_path):
