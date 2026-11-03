@@ -198,13 +198,25 @@ def _is_nullable(column: Mapping[str, Any]) -> bool:
     """Whether *column* admits NULL.
 
     Pre-0.7 columns spell NOT NULL ``nullable: false``. A 0.7.x column has no
-    ``nullable`` key and spells it ``required: true``. ``required`` only
-    decides where ``nullable`` is absent: an explicit ``nullable`` wins.
+    ``nullable`` key and spells it ``required: true``. A column is NOT NULL
+    when either says so: the emitters read ``required`` alone, so a column
+    that declares both and contradicts itself must not be read as nullable.
     """
-    nullable = column.get("nullable")
-    if nullable is not None:
-        return nullable is not False
-    return column.get("required") is not True
+    return column.get("nullable") is not False and not column.get("required")
+
+
+def _nullability_key(old: Mapping[str, Any], new: Mapping[str, Any]) -> str:
+    """The key a nullability change is reported at: the one the contract uses.
+
+    A 0.7.x column says ``required``, a pre-0.7 one ``nullable``. The new
+    column decides; the old one does when the new says neither.
+    """
+    for column in (new, old):
+        if "nullable" in column:
+            return "nullable"
+        if "required" in column:
+            return "required"
+    return "nullable"
 
 
 def _primary_key_set(expose: Mapping[str, Any]) -> frozenset[str]:
@@ -367,11 +379,12 @@ def diff_columns(
         old_null = _is_nullable(old)
         new_null = _is_nullable(new)
         if old_null != new_null:
+            key = _nullability_key(old, new)
             if new_null and col_name in pk:
                 # PK column became nullable — breaking.
                 changes.append(
                     Change(
-                        path=f"{path_prefix}.{col_name}.nullable",
+                        path=f"{path_prefix}.{col_name}.{key}",
                         kind="primary_key_nullable",
                         severity="breaking",
                         description=(
@@ -386,7 +399,7 @@ def diff_columns(
                 # NOT NULL added to a previously-nullable column — breaking.
                 changes.append(
                     Change(
-                        path=f"{path_prefix}.{col_name}.nullable",
+                        path=f"{path_prefix}.{col_name}.{key}",
                         kind="column_nullable_tightened",
                         severity="breaking",
                         description=(
@@ -401,7 +414,7 @@ def diff_columns(
                 # Loosening to nullable on a non-PK — non-breaking.
                 changes.append(
                     Change(
-                        path=f"{path_prefix}.{col_name}.nullable",
+                        path=f"{path_prefix}.{col_name}.{key}",
                         kind="column_nullable_loosened",
                         severity="non_breaking",
                         description=f"column '{col_name}' is now nullable",

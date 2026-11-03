@@ -765,26 +765,59 @@ def test_076_required_flip_is_a_nullability_change(old_required, new_required, s
     assert report.total == 1
     (change,) = getattr(report, severity)
     assert change.kind == kind
-    assert change.path == "exposes[0].contract.schema.id.nullable"
+    assert change.path == "exposes[0].contract.schema.id.required"
     assert (change.before, change.after) == (not old_required, not new_required)
 
 
 @pytest.mark.parametrize(
     "column, severity",
     [
-        pytest.param({"required": True}, "breaking", id="required-alone"),
-        pytest.param({"required": True, "nullable": True}, "non_breaking", id="nullable-wins"),
-        pytest.param({"required": False, "nullable": False}, "breaking", id="nullable-false-wins"),
+        pytest.param({}, "non_breaking", id="neither"),
+        pytest.param({"nullable": True}, "non_breaking", id="nullable-true"),
+        pytest.param({"nullable": False}, "breaking", id="nullable-false"),
+        pytest.param({"required": False}, "non_breaking", id="required-false"),
+        pytest.param({"required": True}, "breaking", id="required-true"),
+        pytest.param({"required": 1}, "breaking", id="required-truthy"),
+        pytest.param(
+            {"required": True, "nullable": True}, "breaking", id="required-beats-nullable"
+        ),
+        pytest.param(
+            {"required": False, "nullable": False}, "breaking", id="nullable-false-stands"
+        ),
     ],
 )
-def test_required_stands_in_for_nullable_only_where_nullable_is_absent(column, severity):
-    """A flat (pre-0.7) schema may spell NOT NULL either way; an explicit ``nullable`` decides."""
+def test_a_column_is_not_null_when_required_or_nullable_false_says_so(column, severity):
+    """The emitters read ``required`` alone, so a column that declares both and contradicts
+    itself is read as the stricter of the two, never as nullable."""
     old = {"id": "x", "schema": []}
     new = {"id": "x", "schema": [{"name": "n", "type": "INT", **column}]}
 
     changes = diff_columns(old, new, "x", 0)
 
     assert [(c.kind, c.severity) for c in changes] == [("column_added", severity)]
+
+
+@pytest.mark.parametrize(
+    "old_column, new_column, primary_key, kind, key",
+    [
+        ({"nullable": True}, {"nullable": False}, False, "column_nullable_tightened", "nullable"),
+        ({"nullable": False}, {"nullable": True}, False, "column_nullable_loosened", "nullable"),
+        ({}, {"required": True}, False, "column_nullable_tightened", "required"),
+        ({"required": True}, {}, False, "column_nullable_loosened", "required"),
+        ({"nullable": False}, {"nullable": True}, True, "primary_key_nullable", "nullable"),
+        ({"required": True}, {"required": False}, True, "primary_key_nullable", "required"),
+    ],
+)
+def test_a_nullability_change_is_reported_at_the_key_the_contract_uses(
+    old_column, new_column, primary_key, kind, key
+):
+    def expose(column):
+        columns = [{"name": "n", "type": "INT", **column}]
+        return {"id": "x", "schema": columns, **({"primaryKey": ["n"]} if primary_key else {})}
+
+    changes = diff_columns(expose(old_column), expose(new_column), "x", 0)
+
+    assert [(c.kind, c.path) for c in changes] == [(kind, f"exposes[0].schema.n.{key}")]
 
 
 def test_nested_field_added_required_is_breaking():
