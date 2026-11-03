@@ -268,6 +268,9 @@ def test_a_placeholder_mode_is_left_to_the_emitter():
     build["properties"]["source"]["mode"] = "{{ env.MODE }}"
     errors, _ = dbx.validate_databricks_binding(_contract(build))
     assert not [e for e in errors if "landing" in e]
+    # at apply the contract is substituted; a variable still unset is refused there
+    refusal = _emit(_contract(build))
+    assert refusal is not None and refusal.kind == "databricks-landing-unsupported"
 
 
 @pytest.mark.parametrize(

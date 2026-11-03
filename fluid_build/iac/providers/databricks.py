@@ -513,13 +513,16 @@ def _refuse_unlandable(
     exposure: Mapping[str, Any],
     builds: Sequence[Mapping[str, Any]],
     refusals: List[UnsupportedBindingError],
+    *,
+    validating: bool = False,
 ) -> None:
     """What the DuckDB acquisition runner would refuse at run time for this expose, refused
     here: by then ``fluid apply`` has created the table. Its source mode and sink format
     (``build_runners/_databricks_load.unsupported_reason``) and, when it masks at landing,
     each masking rule (``build_runners/_masking.masking_rules``). A value that is still an
-    ``{{ env.X }}`` placeholder (``fluid validate`` reads the contract unsubstituted) is
-    left to the emitter, which reads it substituted."""
+    ``{{ env.X }}`` placeholder is left alone only while validating (``fluid validate`` reads
+    the contract unsubstituted); the emitter reads it substituted, and one still unresolved
+    there (its variable unset) is refused."""
     from ...build_runners._databricks_load import unsupported_reason
     from ...build_runners._masking import MaskingPolicyError, masking_rules
 
@@ -535,7 +538,10 @@ def _refuse_unlandable(
         sink = properties.get("sink")
         mode = source.get("mode") if isinstance(source, Mapping) else None
         sink_format = (sink.get("format") if isinstance(sink, Mapping) else None) or "parquet"
-        if any(isinstance(v, str) and ENV_PLACEHOLDER_RE.search(v) for v in (mode, sink_format)):
+        placeholder = any(
+            isinstance(v, str) and ENV_PLACEHOLDER_RE.search(v) for v in (mode, sink_format)
+        )
+        if validating and placeholder:
             continue
         reason = unsupported_reason(str(mode or ""), str(sink_format).lower(), 1)
         if reason:
@@ -576,7 +582,6 @@ def _refuse_governance(
     authz = (policy.get("authz") or {}) if isinstance(policy, Mapping) else {}
     privacy = (policy.get("privacy") or {}) if isinstance(policy, Mapping) else {}
     _refuse_unapplied_masking(where, exposure, builds, refusals)
-    _refuse_unlandable(where, exposure, builds, refusals)
     unmapped = [
         name
         for name, value in (
@@ -809,6 +814,7 @@ def _resolve_table(
     partitions = _partitions(where, loc, columns, refusals, validating=validating)
     region = _region(where, loc, refusals)
     _refuse_governance(where, binding, exposure, refusals, builds)
+    _refuse_unlandable(where, exposure, builds, refusals, validating=validating)
     retention, retention_refusals = check_expire(
         where, exposure, names.get("table") or "", contract, validating=validating
     )

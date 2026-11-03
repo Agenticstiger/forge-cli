@@ -505,6 +505,27 @@ _METHOD_RE = re.compile(r"^([A-Za-z_.]+):")
 _GRAPH_RE = re.compile(r"^(@)?(\d*\+)?(.*?)(\+\d*)?$")
 
 
+def _fqn_selects(fqn: List[str], selector: str) -> bool:
+    """dbt's fqn method for one node, as dbt-core 1.11 has it (``dbt/graph/selector_methods.py``
+    ``is_selected_node``, called with the fqn and with the fqn less its project by
+    ``QualifiedNameSelectorMethod.node_is_match``; Apache-2.0): the model's own name exactly,
+    else the selector's dot-separated parts as an exact prefix of the fqn up to the first part
+    with a wildcard, and from there one ``fnmatch`` of the rest. Case-sensitive, the stricter
+    reading. A versioned model is refused before this is asked."""
+    if fqn[-1] == selector:
+        return True
+    flat = [item for segment in fqn for item in segment.split(".")]
+    parts = selector.split(".")
+    if len(flat) < len(parts):
+        return False
+    for i, part in enumerate(parts):
+        if any(w in part for w in ("*", "?", "[", "]")):
+            return fnmatch.fnmatchcase(".".join(flat[i:]), ".".join(parts[i:]))
+        if flat[i] != part:
+            return False
+    return True
+
+
 def _part_selects(part: str, model: DbtModel) -> Optional[bool]:
     """Whether one selector (no space, no comma) includes ``model``: ``True``, ``False``, or
     ``None`` when it cannot be told without dbt's graph or run state (a graph operator on
@@ -535,14 +556,7 @@ def _part_selects(part: str, model: DbtModel) -> Optional[bool]:
             fnmatch.fnmatchcase(h, w) for h, w in zip(have.parts, wanted.parts, strict=False)
         )
     else:
-        # dbt's fqn method: the model's own name, or a prefix of its fully qualified name,
-        # with or without the project's name in front (``shop``, ``marts``, ``marts.orders``)
-        wanted_parts = value.split(".")
-        hit = (len(wanted_parts) == 1 and fnmatch.fnmatchcase(model.name, value)) or any(
-            len(wanted_parts) <= len(fqn)
-            and all(fnmatch.fnmatchcase(h, w) for h, w in zip(fqn, wanted_parts, strict=False))
-            for fqn in (model.fqn, model.fqn[1:])
-        )
+        hit = any(_fqn_selects(list(fqn), value) for fqn in (model.fqn, model.fqn[1:]) if fqn)
     if hit:
         return True
     return None if operators else False

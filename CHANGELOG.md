@@ -146,8 +146,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expose's table, with `materialized` resolved as dbt does: `config()` in the SQL, then the
   model's YAML `config:`, then `dbt_project.yml` by the most specific path; the default is `view`.
   The build must also run that model: its `--select` (`properties.model` / `select`, as
-  `build_selectors` makes it) must include the model by name, fully qualified name (or a prefix
-  of it, with or without the project's name, as dbt matches) or path, else
+  `build_selectors` makes it) must include the model by name, fully qualified name (dbt-core
+  1.11's fqn method: an exact prefix, with or without the project's name, a wildcard globbing the
+  whole rest of the name) or path, else
   `databricks-retention-not-selected` (graph operators on another node, tags, configs and state
   cannot be evaluated here and are refused too). A table name, retention or source mode that is
   still an `{{ env.X }}` placeholder is left by `fluid validate` to the emitter, which checks it

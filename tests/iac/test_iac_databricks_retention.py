@@ -585,7 +585,8 @@ class TestSelection:
             {"select": "shop"},  # the project's name selects its every node
             {"select": "marts"},  # dbt matches the fqn without the project's name too
             {"select": "marts.orders"},
-            {"select": "ord*"},
+            {"select": "marts.*"},
+            {"select": "shop.m*.orders"},
             {"select": "*"},
             {"select": "path:models/marts"},
             {"select": "path:models/marts/"},
@@ -615,6 +616,10 @@ class TestSelection:
             {"select": "other"},
             {"select": "customers"},
             {"select": "shop.orders"},  # dbt's fqn is a prefix: marts is skipped
+            {"select": "ord*"},  # dbt globs the whole rest of the fqn: shop.marts.orders
+            {"select": "ma*ts"},
+            {"select": "*.core"},
+            {"select": "Orders"},  # case-sensitive
             {"select": "models"},  # no slash: a name, not the path
             {"select": ["other", "customers"]},
             {"select": "shop.other"},
