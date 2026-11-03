@@ -409,8 +409,8 @@ def test_cli_error_context_is_redacted_and_control_characters_are_spelled_out(mo
 
 def test_cli_error_prints_no_credential_shape_the_full_redactor_knows(monkeypatch, capsys):
     leaky = (
-        "AKIAIOSFODNN7EXAMPLE Authorization: Bearer abcdef0123456789token "
-        "postgres://admin:s3cretpw@db.example.com/orders"
+        "AKIAIOSFODNN7EXAMPLE Authorization: Bearer abcdef0123456789token "  # pragma: allowlist secret
+        "postgres://admin:s3cretpw@db.example.com/orders"  # pragma: allowlist secret
     )
     err = CLIError(1, "opentofu_apply_failed", {"detail": leaky})
     err.suggestions = [leaky]
@@ -421,7 +421,13 @@ def test_cli_error_prints_no_credential_shape_the_full_redactor_knows(monkeypatc
     out = _unwrapped(capsys.readouterr().out)
     assert rc == 1
     assert not [
-        s for s in ("AKIAIOSFODNN7EXAMPLE", "abcdef0123456789token", "s3cretpw") if s in out
+        s
+        for s in (
+            "AKIAIOSFODNN7EXAMPLE",  # pragma: allowlist secret
+            "abcdef0123456789token",
+            "s3cretpw",
+        )
+        if s in out
     ]
 
 

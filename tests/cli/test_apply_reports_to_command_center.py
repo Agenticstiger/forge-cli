@@ -687,18 +687,22 @@ def test_a_non_string_diagnostic_field_does_not_raise():
     assert err.context["error"] == "403 (7)"
 
 
-_LEAKS = ("AKIAIOSFODNN7EXAMPLE", "abcdef0123456789token", "s3cretpw")
+_LEAKS = ("AKIAIOSFODNN7EXAMPLE", "abcdef0123456789token", "s3cretpw")  # pragma: allowlist secret
 
 
 def _leaky() -> str:
     return (
-        "access key AKIAIOSFODNN7EXAMPLE, Authorization: Bearer abcdef0123456789token, "
-        "dsn postgres://admin:s3cretpw@db.example.com/orders"
+        "access key AKIAIOSFODNN7EXAMPLE, Authorization: Bearer abcdef0123456789token, "  # pragma: allowlist secret
+        "dsn postgres://admin:s3cretpw@db.example.com/orders"  # pragma: allowlist secret
     )
 
 
 def test_a_failed_apply_diagnostic_is_redacted_before_it_is_cut():
-    detail = "x" * 780 + " postgres://admin:s3cretpw@db.example.com/orders " + _leaky()
+    detail = (
+        "x" * 780
+        + " postgres://admin:s3cretpw@db.example.com/orders "  # pragma: allowlist secret
+        + _leaky()
+    )
     events = [{"diagnostic": {"severity": "error", "summary": _leaky(), "detail": detail}}]
 
     err = engine._apply_failure(runner.TofuResult("apply", 1, "", "", events), "/w")
