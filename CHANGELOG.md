@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid validate` and `fluid plan` warn about an id the build phase refuses.** The build
+  phase puts `contract.id` and each `builds[].id` in directory names and generated code, so they
+  must start with a letter or underscore, use only letters, digits, `_`, `.` and `-`, and be at
+  most 128 characters. The contract schema allows more (`1orders`, or a longer id), and
+  `fluid apply` in a build mode refuses such an id before it applies anything, but validate and
+  plan said nothing. For a contract with builds, both now warn and name the id: plain
+  `fluid validate` passes and `--strict` fails, and `fluid plan` still writes the plan, whatever
+  its `--mode`. A contract without builds is not checked, as in `fluid apply`.
+
 - **`fluid doctor --strict` turns the "Action needed" summary into exit 1.** `fluid doctor` printed
   "Action needed" for a copilot that is not ready and still exited 0, so a CI gate could not tell.
   With `--strict` it exits 1 whenever the summary says "Action needed", in the text report and with
@@ -351,6 +360,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trailing newline from an environment variable or a file; strip the value where it is set.
 ### Upgrade notes
 
+- New validate warning, so `--strict` fails: a contract with builds whose `contract.id` or a
+  `builds[].id` the build phase refuses (`1orders`, or more than 128 characters). `fluid apply`
+  in a build mode already refuses it; rename the id to fit.
 - A contract with a column typed `array`, `struct`, `map`, `object`, `record` or `row` (or
   `array(...)`) on an `aws` Glue table or a `gcp` BigQuery table now fails `fluid validate`,
   `fluid generate iac` and `fluid apply` with `column-type`, where it validated and wrote a
