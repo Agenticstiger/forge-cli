@@ -147,6 +147,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls its "v1" headings an internal milestone. A test fails if it announces a 1.x release while
   the package is below 1.0. The package description named GCP, Snowflake and Local and now names
   AWS and Databricks too.
+- **A column type AWS Glue or BigQuery could not hold was written anyway, and `fluid validate
+  --strict` passed.** The Glue emitter mapped 22 type names and turned every other one into
+  `string`: 47 of the 79 types the schema admits, among them `smallint`, `tinyint`, `int2`,
+  `int4`, `int8`, `real`, `money`, `bit`, `year`, `datetime2`, `timestamptz` and the other
+  timestamp spellings, `varbinary` and `blob`, and every array, struct, map, object, record and
+  row. The BigQuery emitter wrote `ARRAY` for an array, which is not a BigQuery column type (an
+  array is a REPEATED column of an element type), and a `STRUCT` with no fields, which BigQuery
+  rejects at apply, after the dataset was created; the element type of `array(string)` was
+  dropped on both clouds. Every type is now classified for each cloud. Each scalar with a Hive or
+  Athena type gets it (`smallint`, `int`, `bigint`, `float`, `double`, `timestamp`, `binary`,
+  `money` as `decimal(19,4)`, `bit` as `boolean`, `year` as `smallint`; the zone-aware
+  timestamps are `timestamp`, which keeps the UTC instant and not the offset; a bare `number` is
+  `decimal(38,9)`, as a bare `decimal` always was). A type Glue has no form for but that keeps
+  its value as text (`json`, `jsonb`, `variant`, `super`, `time`, `interval`, `bignumeric`) is
+  still written as `string`, and `fluid validate` now warns for it, so `--strict` fails; BigQuery
+  warns for `geometry` and `geom`, which are planar and become the spherical `GEOGRAPHY`. A
+  type with no faithful form at all is refused with kind `column-type`: an array, struct, map,
+  object, record or row (also `array(string)`), a `bit(n)` wider than one bit and a type no
+  table maps, on both clouds, and on Glue also `geography`, `geometry`, `geom`, `point` and
+  `hll`, and a decimal Hive would reject (precision over 38 or 0, a scale over the precision
+  or below 0). The
+  refusal names the expose, each column, its declared type and why, and the fix (declare `json`
+  or `string` for now; typed nested columns are planned). `fluid validate`, `fluid generate iac`
+  and `fluid apply` raise the same refusal from the same function, so a contract that passes
+  validate cannot fail generate on a type. A BigQuery view carries no schema and is not checked.
+  `fluid verify` and `fluid diff` compare the live table with the new mapping, so a Glue table
+  applied by an earlier version reports type mismatches (verify: CRITICAL; diff: drift) on those
+  columns until `fluid apply` runs; verify's "require table recreation" wording is wrong for
+  these columns, a re-apply updates them in place. `fluid apply` (and its dry run) announces
+  such a change before it is made, one note per Glue table listing each `column: old -> new`.
+  The 0.16.2 note that only
+  a bare `array` has no BigQuery form is superseded: an array of any element type and every
+  struct-like type are refused until the contract schema can declare element and field types.
+  BigQuery decimal precision and scale are still not emitted.
+
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
   never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
   sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP
@@ -196,6 +231,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dimension that reads the workspace's metastore summary for every table the module manages: it
   passes when the region matches the declaration, fails with the fix when it does not, and is
   skipped when the contract declares none.
+
+### Upgrade notes
+
+- A contract with a column typed `array`, `struct`, `map`, `object`, `record` or `row` (or
+  `array(...)`) on an `aws` Glue table or a `gcp` BigQuery table now fails `fluid validate`,
+  `fluid generate iac` and `fluid apply` with `column-type`, where it validated and wrote a
+  `string` column (Glue) or an invalid one (BigQuery). Declare the column `json` (BigQuery's
+  JSON type; Glue stores it as `string` and validate warns) or `string` until typed nested
+  columns are supported.
+- Other new refusals (kind `column-type`): on Glue, `geography`, `geometry`, `geom`, `point` and
+  `hll` (previously a silent `string`; declare `string` or `binary`) and a decimal Hive rejects
+  (precision over 38 or 0, scale over the precision or below 0); on both clouds, `bit(n)` with
+  n over 1 and any type no table maps.
+- New validate warnings, so `--strict` fails: on Glue, `json`, `jsonb`, `variant`, `super`,
+  `time`, `interval` and `bignumeric` (written as `string`, as before; declare `string` to say
+  so); on BigQuery, `geometry` and `geom` (planar, written as the spherical `GEOGRAPHY`).
+- A Glue table's `smallint`, `tinyint`, `real`, `money`, `timestamptz` and the other types that
+  used to become `string` now get their Hive type. The next `fluid apply` updates those column
+  types in place (measured against moto with real `tofu`: `~1`, data files untouched). It is
+  not stopped by `--allow-data-loss`, which gates only removals and data-losing updates; the
+  plan notice announces it instead. Consumers that compare those columns as strings (`small =
+  '5'`) may need changes. Until the apply, `fluid verify` and `fluid diff` report the mismatch.
+- `decimal(10, 2)` is now written `decimal(10,2)`. Measured against moto, a table applied with
+  the spaced form plans an in-place change (`d: decimal(10, 2) -> decimal(10,2)`) on the next
+  apply, harmless but visible in the notice; real Glue was not measured.
 
 ## [0.26.0] — 2026-11-01
 

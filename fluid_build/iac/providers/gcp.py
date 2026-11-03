@@ -45,6 +45,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from .. import column_types
 from ..access import (
     GROUP,
     AccessGrant,
@@ -52,6 +53,7 @@ from ..access import (
     normalize_access_grants,
     role_grants,
 )
+from ..base import UnsupportedBindingError
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref
 from ..packaging import (
@@ -65,28 +67,37 @@ from ..provider_match import is_cloud
 from ..versions import required_providers
 from . import gcp_governance as _gov
 
-# FLUID column type → BigQuery type (best-effort; unknown types upper-cased).
-_BQ_TYPES = {
-    "string": "STRING",
-    "str": "STRING",
-    "text": "STRING",
-    "integer": "INT64",
-    "int": "INT64",
-    "int64": "INT64",
-    "bigint": "INT64",
-    "float": "FLOAT64",
-    "float64": "FLOAT64",
-    "double": "FLOAT64",
-    "numeric": "NUMERIC",
-    "decimal": "NUMERIC",
-    "boolean": "BOOL",
-    "bool": "BOOL",
-    "timestamp": "TIMESTAMP",
-    "datetime": "DATETIME",
-    "date": "DATE",
-    "time": "TIME",
-    "bytes": "BYTES",
-    "json": "JSON",
+# FLUID column type → BigQuery type, keyed on the lower-cased base name
+# (``varchar(255)`` is ``varchar``). Every entry is a type a BigQuery table schema
+# takes; ``_bq_outcome`` classifies the rest. A bare ``number`` or ``decimal`` is
+# NUMERIC whatever precision it declares: BigQuery precision and scale are not
+# emitted yet.
+_BQ_TYPES = column_types.expand(
+    {
+        "STRING": "string, str, text, varchar, varchar2, nvarchar, char, nchar, character, clob, "
+        "uuid, uniqueidentifier, guid, enum",
+        "INT64": "integer, int, int2, int4, int8, int16, int32, int64, tinyint, smallint, "
+        "mediumint, bigint, long, longint, serial, bigserial, year",
+        "FLOAT64": "float, float4, float8, float32, float64, double, real",
+        "NUMERIC": "numeric, decimal, dec, number, money",
+        "BIGNUMERIC": "bignumeric",
+        "BOOL": "boolean, bool, bit",
+        "TIMESTAMP": "timestamp, timestamptz, timestamp_tz, timestamp_ltz",
+        "DATETIME": "datetime, datetime2, smalldatetime, timestamp_ntz, timestampntz",
+        "DATE": "date",
+        "TIME": "time",
+        "INTERVAL": "interval",
+        "BYTES": "bytes, binary, varbinary, blob, bytea, raw, hll",
+        "JSON": "json, jsonb, variant, super",
+        "GEOGRAPHY": "geography, geometry, geom, point",
+    }
+)
+
+#: Types whose BigQuery type holds a different thing. ``GEOMETRY`` is planar and
+#: ``GEOGRAPHY`` is a sphere, so the same coordinates mean other shapes and distances.
+_BQ_LOSSY = {
+    "geometry": "which is planar, and BigQuery has only the spherical GEOGRAPHY",
+    "geom": "which is planar, and BigQuery has only the spherical GEOGRAPHY",
 }
 
 # FLUID permission → BigQuery dataset access role. BigQuery dataset
@@ -136,22 +147,77 @@ _BQ_MULTIWORD_TYPES = {
 }
 
 
-def _bq_type(raw: Any) -> str:
-    base = " ".join(str(raw or "STRING").strip().lower().split("(", 1)[0].split())
+def _bq_outcome(raw: Any) -> column_types.TypeOutcome:
+    """What ``raw`` becomes in a BigQuery table schema: exact, lossy or refused."""
+    base, rest = column_types.split_type(raw)
+    if base in column_types.STRUCTURED:
+        return column_types.refused(
+            "which BigQuery holds only as a REPEATED column of an element type or a RECORD "
+            "with fields, and the contract schema cannot declare them yet",
+            column_types.NESTED_FIX,
+        )
+    if base == "bit" and rest not in ("", "(1)"):
+        return column_types.refused(
+            "which is a bit string, and BigQuery has none",
+            "Declare bytes or an integer type.",
+        )
     hit = _BQ_TYPES.get(base) or _BQ_MULTIWORD_TYPES.get(base)
-    if hit is not None:
-        return hit
-    # A source-native spelling (VARCHAR, SMALLINT, UUID, TIMESTAMPTZ ...) used to
-    # be upper-cased verbatim, which BigQuery rejects: a contract read from
-    # Postgres emitted ``"type": "VARCHAR"``. The ODCS physical-type table covers
-    # the FLUID column-type enum and agrees with every entry above, so this only
-    # changes the types that were invalid before.
-    from ...providers.odcs.mappers.types import fluid_to_physical
+    if hit is None:
+        return column_types.refused(
+            "which the BigQuery emitter does not map",
+            "Declare a FLUID column type such as string, integer, bigint, numeric, double, "
+            "boolean, date, timestamp or json.",
+        )
+    if base in _BQ_LOSSY:
+        return column_types.lossy(
+            hit, _BQ_LOSSY[base], "Declare geography if the coordinates are on the sphere."
+        )
+    return column_types.exact(hit)
 
-    physical = fluid_to_physical(base, "gcp")
-    if physical:
-        return physical
+
+def _bq_type(raw: Any) -> str:
+    """The BigQuery type ``raw`` is written as. Total, for ``fluid verify``, ``fluid diff``
+    and the Dataform engine: a refused type reads as its upper-cased name here, and is
+    refused where the module is emitted (:func:`_refuse_bq_column_types`)."""
+    outcome = _bq_outcome(raw)
+    if outcome.target is not None:
+        return outcome.target
     return str(raw).upper() if raw else "STRING"
+
+
+def _bq_column_type_findings(
+    expose: str, schema: Iterable[Any]
+) -> Tuple[Optional[UnsupportedBindingError], List[str]]:
+    return column_types.column_type_findings(expose, schema, _bq_outcome, "BigQuery")
+
+
+def _refuse_bq_column_types(expose: str, schema: Iterable[Any]) -> None:
+    """Raise for a column BigQuery cannot hold, which it would reject at apply, after
+    the dataset was created, or (an array) take without its element type."""
+    refusal, _lossy = _bq_column_type_findings(expose, schema)
+    if refusal is not None:
+        raise refusal
+
+
+def validate_bigquery_column_types(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
+    """``(errors, warnings)`` for the column types of the contract's BigQuery tables:
+    the refusal :func:`_emit_bigquery` raises, and a warning for each type it writes as
+    a different one. A view carries no schema. ``fluid validate`` runs this, so
+    ``generate iac`` finds nothing new."""
+    errors: List[str] = []
+    warnings: List[str] = []
+    for exposure in contract.get("exposes") or []:
+        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
+        if not isinstance(binding, Mapping) or not _gov.gcp_owned(binding):
+            continue
+        if resolve_gcp_target(binding) != BIGQUERY_TABLE:
+            continue
+        schema = (exposure.get("contract") or {}).get("schema") or []
+        refusal, lossy = _bq_column_type_findings(_expose_id(exposure) or "?", schema)
+        if refusal is not None:
+            errors.append(f"{refusal} {' '.join(refusal.remediation)}".strip())
+        warnings.extend(lossy)
+    return errors, warnings
 
 
 def _bq_fields(schema: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -1167,6 +1233,10 @@ def _emit_bigquery(
     placement: _Placement = _LEGACY_PLACEMENT,
     governance: Optional[_BqGovernance] = None,
 ) -> None:
+    if not is_view:
+        # Refused before anything is written: the same findings ``fluid validate``
+        # reports (:func:`validate_bigquery_column_types`).
+        _refuse_bq_column_types(_expose_id(exposure) or "?", schema)
     gov = governance or _NO_GOVERNANCE
     dataset = loc.get("dataset") or "default"
     table = _bq_table_name(exposure, loc)
@@ -1455,7 +1525,8 @@ def validate_gcp_binding(contract: Mapping[str, Any]) -> Tuple[List[str], List[s
     binding (no platform) is a different contract error, and the JSON-schema
     check already names it. Iceberg exposes are left to
     ``iac.iceberg_validation``, which owns a more specific message for the
-    same input. Returns ``(errors, warnings)``.
+    same input. It also reports the column types of each BigQuery table
+    (:func:`validate_bigquery_column_types`). Returns ``(errors, warnings)``.
     """
     errors: List[str] = []
     warnings: List[str] = []
@@ -1496,7 +1567,10 @@ def validate_gcp_binding(contract: Mapping[str, Any]) -> Tuple[List[str], List[s
             errors.append(message)
         else:
             warnings.append(message)
-    return errors, warnings
+    # The column types of each BigQuery table: what the emitter refuses, or writes
+    # as another type.
+    type_errors, type_warnings = validate_bigquery_column_types(contract)
+    return errors + type_errors, warnings + type_warnings
 
 
 def _bq_table_name(exposure: Mapping[str, Any], loc: Mapping[str, Any]) -> str:
