@@ -369,7 +369,7 @@ def register(subparsers) -> None:
         help="Validate ODCS contract file",
         description=(
             "Validate an ODCS YAML/JSON file. Default: jsonschema first-pass + "
-            "vowl second-pass (when installed via `pip install fluid-build[odcs-strict]`). "
+            "vowl second-pass (when installed via `pip install data-product-forge[odcs-strict]`). "
             "All violations are collected — exit code is 1 if any check fails."
         ),
     )
@@ -583,7 +583,7 @@ def _run_odcs_validate(args):
         else:
             if diag is None:
                 report["passes"]["vowl"] = {"ok": True, "skipped": "vowl not installed"}
-                cprint("○ vowl: not installed (pip install 'fluid-build[odcs-strict]')")
+                cprint("○ vowl: not installed (pip install 'data-product-forge[odcs-strict]')")
             else:
                 report["passes"]["vowl"] = {"ok": True, "diagnostics": diag}
                 cprint(

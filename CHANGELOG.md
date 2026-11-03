@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Install hints named `fluid-build` instead of `data-product-forge`.** Doctor, the copilot,
+  the MCP, ODCS and DuckDB errors, the generated Jenkinsfile and the docs told people to
+  `pip install fluid-build[...]`; they now name `data-product-forge` with the right extra, and a
+  ratchet test keeps the wrong name out. `data-product-forge[mcp]` resolves as an empty alias.
+  `fluid-build` on PyPI is now only an alias that installs `data-product-forge`.
+
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
   never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
   sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP

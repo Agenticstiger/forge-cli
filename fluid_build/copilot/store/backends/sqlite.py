@@ -100,7 +100,7 @@ class SqliteBackend(Store):
             _log.warning(
                 "Sqlite store at %s reports schema version %d but this "
                 "CLI only knows about version %d. Proceeding read-only "
-                "is recommended; upgrade fluid-build before writing.",
+                "is recommended; upgrade data-product-forge before writing.",
                 self.path,
                 current,
                 _SCHEMA_VERSION,

@@ -334,7 +334,7 @@ class HostedMcpClient:
             from mcp import ClientSessionGroup, StdioServerParameters
         except ImportError as exc:  # pragma: no cover - mcp is a base dep
             raise RuntimeError(
-                "Hosted-MCP delegation requires the 'mcp' SDK (ships with fluid-build)."
+                "Hosted-MCP delegation requires the 'mcp' SDK (pip install 'data-product-forge[mcp]')."
             ) from exc
 
         params = StdioServerParameters(
