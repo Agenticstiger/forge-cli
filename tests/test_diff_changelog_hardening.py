@@ -437,6 +437,17 @@ def test_every_secret_shape_the_console_masked_is_still_masked(tmp_path, capsys,
     assert "ZZtop99" not in (tmp_path / "diff.json").read_text(encoding="utf-8")
 
 
+def test_a_credential_in_a_mapping_key_is_masked_too(tmp_path, capsys):
+    """A removed column's labels reach before/after; a key that holds a credential leaked."""
+    labels = {"api_key=ghpZZtop99": "a", "password: ZZtop99": "b"}
+    old = _contract([_ID, {"name": "note", "type": "string", "labels": labels}])
+
+    assert _run_cli(tmp_path, old, _contract([_ID]), fmt="json") == 0
+
+    assert "ZZtop99" not in capsys.readouterr().out
+    assert "ZZtop99" not in (tmp_path / "diff.json").read_text(encoding="utf-8")
+
+
 def test_a_value_json_cannot_hold_does_not_break_the_envelope(tmp_path, capsys):
     """YAML gives a column's quality rule a date; json.dump raised on it and cut --out short."""
     import datetime

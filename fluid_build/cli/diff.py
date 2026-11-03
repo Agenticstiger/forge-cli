@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set
 
 from .._console import _redact_str
+from ..observability.secret_redactor import redact_secret_text
 from ..observability.tracing import traced_span as _traced_span
 from ..observability.tracing import traced_stage as _traced_stage
 from ._common import (
@@ -877,7 +878,10 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else str(value)
     if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
+        # A key is contract text too: a free-form ``labels`` key can hold a credential.
+        return {
+            _jsonable(redact_secret_text(str(key))): _jsonable(item) for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
     if isinstance(value, (set, frozenset)):
