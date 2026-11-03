@@ -1141,7 +1141,7 @@ def _schema_defs(version: str) -> Mapping[str, Any]:
 
 def _is_semver(value: Any, version: str) -> bool:
     pattern = _semver_pattern(version)
-    return pattern is None or bool(pattern.match(str(value)))
+    return pattern is None or bool(pattern.fullmatch(str(value)))
 
 
 def _rehydrate_document(fluid: Mapping[str, Any]) -> Mapping[str, Any]:

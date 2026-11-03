@@ -492,7 +492,7 @@ def bundle_overlay_warnings(source: Optional[Mapping[str, Any]]) -> List[str]:
 #: path. It selects the overlay file whose ``id`` the recorded source
 #: contract is checked with, so a value like ``../../x`` must not be able to
 #: pick an arbitrary file for that check.
-_ENV_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 
 
 def bundle_source_contract(

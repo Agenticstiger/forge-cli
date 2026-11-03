@@ -47,7 +47,7 @@ _KEYWORDS_PATH = Path(__file__).with_name("agent_specs") / "domain_keywords.yaml
 # override — defence in depth against a ``../``-style traversal reaching a
 # fragment block in an out-of-tree YAML. Matches the profile-name guard in
 # ``forge_copilot_prompts._PROFILE_NAME_RE``.
-_SAFE_DOMAIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SAFE_DOMAIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
 @lru_cache(maxsize=1)
