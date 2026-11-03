@@ -31,7 +31,10 @@ resources, with no new schema field (fluid-schema 0.7.6):
   set: Delta drops and renames columns only under column mapping.
 * ``accessPolicy.grants[]`` and ``policy.authz.readers`` / ``writers`` become
   one ``databricks_grant`` per (table, principal), plus ``USE_SCHEMA`` on the
-  schema. ``databricks_grant`` is authoritative for its principal on its
+  schema. A grant's ``resources`` places it on the tables of the exposes it names
+  (``$.exposes[?(@.exposeId=='<id>')]``, or ``$.exposes[*]`` / ``$.exposes`` for
+  all; ``iac/access.py::parse_grant_scope``); any other JSONPath, or an exposeId
+  the contract does not have, is refused, never widened. ``databricks_grant`` is authoritative for its principal on its
   securable, so a principal named twice is merged into one resource rather
   than two that undo each other. It also means the product takes over each
   named principal's privileges on its schema: on a schema that existed before
@@ -927,17 +930,38 @@ def _principal_identities(
 def _refuse_grant_shapes(
     contract: Mapping[str, Any], grants: Sequence[Any], refusals: List[UnsupportedBindingError]
 ) -> None:
-    """Grants a Unity Catalog grant cannot express: scoped by resources, or conditional."""
+    """Grants a Unity Catalog grant cannot express: scoped by resources it cannot evaluate or
+    by an expose the contract does not have, or conditional."""
+    expose_ids = {
+        str(e.get("exposeId")) for e in contract.get("exposes") or () if isinstance(e, Mapping)
+    }
+    fix = (
+        "Scope the grant with $.exposes[?(@.exposeId=='<id>')] for one expose (repeat it for "
+        "several) or $.exposes[*] for every expose, or drop resources (every table of the "
+        "product)."
+    )
     for grant in grants:
-        if grant.resources:
+        scope = grant.scope
+        if scope.unevaluable:
             refusals.append(
                 _refusal(
                     "grant-scope-unmapped",
-                    f"accessPolicy grant to {grant_key(grant)!r} is scoped by resources, which "
-                    "the Databricks emitter does not evaluate: the grant would reach no "
-                    "Databricks table.",
-                    "Drop resources (the grant then covers every table of the product), or "
-                    "use the expose's policy.authz.readers / writers.",
+                    f"accessPolicy grant to {grant_key(grant)!r} is scoped by "
+                    f"{', '.join(repr(r) for r in scope.unevaluable)}, which the Databricks "
+                    "emitter cannot evaluate, so it cannot tell which tables the grant is for. "
+                    "It is refused rather than placed on more tables than it names.",
+                    fix,
+                )
+            )
+        unknown = sorted(scope.expose_ids - expose_ids)
+        if unknown:
+            refusals.append(
+                _refusal(
+                    "grant-scope-unmapped",
+                    f"accessPolicy grant to {grant_key(grant)!r} is scoped to exposeId "
+                    f"{', '.join(repr(i) for i in unknown)}, which no expose of this contract "
+                    "has.",
+                    "Correct the exposeId in resources, or remove that resource. " + fix,
                 )
             )
     for entry in (contract.get("accessPolicy") or {}).get("grants") or ():
@@ -958,7 +982,7 @@ def _target_privileges(
     """``{principal: privileges}`` on one expose's table, from accessPolicy and its authz."""
     named: List[Tuple[Tuple[str, ...], set]] = []
     for grant in grants:
-        if grant.resources:
+        if not grant.scope.covers(target.exposure.get("exposeId")):
             continue
         identities = _principal_identities(
             grant_key(grant), target, refusals, fallback=grant.principal

@@ -52,8 +52,9 @@ needs its own schema decision; it is tracked, not silently papered over.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional, Tuple
+from typing import Any, FrozenSet, Iterable, Mapping, Optional, Tuple
 
 #: Principal type prefixes the ``accessPolicy`` schema documents.
 USER = "user"
@@ -73,6 +74,54 @@ _KNOWN_PREFIXES = {
 _SERVICE_ACCOUNT_SUFFIX = ".gserviceaccount.com"
 
 
+# The JSONPath scopes a grant's ``resources`` may carry that an emitter can evaluate: one
+# expose by id (``$.exposes[?(@.exposeId=='orders')]``, either quote, spaces allowed), or
+# every expose (``$.exposes[*]``, ``$.exposes``). Anything else is kept as written and
+# reported as unevaluable, never read as "every expose".
+_ONE_EXPOSE_RE = re.compile(
+    r"""\$\.exposes\s*\[\s*\?\s*\(\s*@\.exposeId\s*==\s*(['"])([^'"]+)\1\s*\)\s*\]"""
+)
+_EVERY_EXPOSE_RE = re.compile(r"\$\.exposes(?:\s*\[\s*\*\s*\])?")
+
+
+@dataclass(frozen=True)
+class GrantScope:
+    """Which exposes a grant's ``resources`` name.
+
+    A grant without ``resources`` covers every expose (``all_exposes``). ``unevaluable``
+    holds each resource that is not one of the shapes above, as written: a grant with any
+    is one an emitter cannot place, and :meth:`covers` is then false for every expose.
+    """
+
+    all_exposes: bool = True
+    expose_ids: FrozenSet[str] = frozenset()
+    unevaluable: Tuple[str, ...] = ()
+
+    def covers(self, expose_id: Any) -> bool:
+        if self.unevaluable:
+            return False
+        return self.all_exposes or str(expose_id) in self.expose_ids
+
+
+def parse_grant_scope(resources: Iterable[str]) -> GrantScope:
+    """The :class:`GrantScope` of a grant's ``resources``."""
+    resources = tuple(resources)
+    if not resources:
+        return GrantScope()
+    every = False
+    ids: set[str] = set()
+    unevaluable: list[str] = []
+    for resource in resources:
+        text = resource.strip()
+        if _EVERY_EXPOSE_RE.fullmatch(text):
+            every = True
+        elif one := _ONE_EXPOSE_RE.fullmatch(text):
+            ids.add(one.group(2))
+        else:
+            unevaluable.append(resource)
+    return GrantScope(all_exposes=every, expose_ids=frozenset(ids), unevaluable=tuple(unevaluable))
+
+
 @dataclass(frozen=True)
 class AccessGrant:
     """One normalized access grant, provider-agnostic.
@@ -88,6 +137,11 @@ class AccessGrant:
     principal_type: str
     permissions: Tuple[str, ...]
     resources: Tuple[str, ...] = ()
+
+    @property
+    def scope(self) -> GrantScope:
+        """The exposes ``resources`` names (every expose when it is empty)."""
+        return parse_grant_scope(self.resources)
 
     @property
     def is_service_account(self) -> bool:
@@ -257,9 +311,11 @@ __all__ = [
     "AccessGrant",
     "DOMAIN",
     "GROUP",
+    "GrantScope",
     "SERVICE_ACCOUNT",
     "USER",
     "normalize_access_grants",
+    "parse_grant_scope",
     "role_grants",
     "uses_legacy_policy_surface",
 ]

@@ -694,7 +694,7 @@ def test_unset_warehouse_is_refused(monkeypatch):
             {"principal": "group:x", "permissions": ["read"], "conditions": {"ip": "1"}},
             "conditions",
         ),
-        ({"principal": "group:x", "permissions": ["read"], "resources": ["$.exposes"]}, "scope"),
+        ({"principal": "group:x", "permissions": ["read"], "resources": ["$.exposes[0]"]}, "scope"),
         ({"principal": "user:bob@corp.example", "permissions": ["read"]}, "principal-placeholder"),
         ({"principal": "serviceAccount:sa@p.iam", "permissions": ["read"]}, "principal-unmapped"),
     ],

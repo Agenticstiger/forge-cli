@@ -164,6 +164,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serves for a table's Delta retention, and what predictive optimization reports, are modelled
   on databricks-sdk-go v0.190.0, not observed.
 
+- **A Databricks `accessPolicy` grant scoped by `resources` lands on the tables it names.** It used
+  to be refused (`databricks-grant-scope-unmapped`) whatever it named, which blocked every product
+  whose grants carry `resources: ["$.exposes[?(@.exposeId=='<id>')]"]`. The emitter now evaluates
+  that shape (single or double quotes, spaces allowed) and `$.exposes[*]` / `$.exposes` (every
+  expose), and grants only on the matching tables; several resources add up. A grant without
+  `resources` still covers every table. Any other JSONPath (`$.exposes[0]`, a filter on another
+  field, `||`, a path below the expose), alone or beside a good one, and an exposeId this contract
+  does not have, stay `databricks-grant-scope-unmapped`, with a message that names the resource and
+  says the grant is refused rather than placed on more tables than it names. `fluid validate` and
+  the emitter read the one `_compile` verdict, and `fluid verify`'s catalog-access check reads the
+  per-table grants, so a scoped reader is checked only where it is granted. The scope is parsed
+  once, in `iac/access.py` (`AccessGrant.scope`); what the AWS and GCP emitters produce is
+  unchanged. Known gap, not fixed here: the GCP emitter applies every `accessPolicy` grant to every
+  expose and never reads `resources`, and the AWS emitter does not read `accessPolicy.grants`, so a
+  scoped grant is not scoped there.
+
 - **The DuckDB acquisition runner lands a Databricks expose in its table, and `policy.privacy.masking`
   is accepted on one it writes.** For `platform: databricks` the runner used to write a LOCAL file
   (`location.path`, else `out/`) and report success with nothing in Databricks. It now hashes (or
