@@ -608,19 +608,21 @@ def _insert_doc(n: int, report: bool) -> Dict[str, Any]:
 def _data_statement(fake: "FakeDatabricks", sql: str) -> Optional[Tuple[bool, str, Dict[str, Any]]]:
     """``(ok, error, result)`` for a statement that reads or writes rows, ``None`` for any other.
 
-    ``INSERT OVERWRITE <t> SELECT <cols> FROM read_files('<path>', format => 'parquet')`` replaces
-    the rows of ``<t>`` with the Parquet file at ``<path>``, or every one under it when it is a
-    directory (a path on a volume the Files API holds), the columns taken by position as an INSERT without a column list takes them.
+    ``INSERT OVERWRITE <t> [(<targets>)] SELECT <cols> FROM read_files('<path>', format =>
+    'parquet')`` replaces the rows of ``<t>`` with the Parquet file at ``<path>``, or every one
+    under it when it is a directory (a path on a volume the Files API holds). With a column list
+    each selected column goes to the target column it names (a table column it leaves out is
+    NULL); without one, by position in table order, as Databricks does.
     """
     s = sql.strip().rstrip(";").strip()
     m = re.match(
-        rf"INSERT\s+OVERWRITE\s+(?:TABLE\s+)?{_FULL}\s+SELECT\s+(.+?)\s+"
+        rf"INSERT\s+OVERWRITE\s+(?:TABLE\s+)?{_FULL}\s+(?:\(([^)]*)\)\s+)?SELECT\s+(.+?)\s+"
         rf"FROM\s+read_files\s*\(\s*{_QUOTED}\s*,\s*format\s*=>\s*'parquet'\s*\)\s*$",
         s,
         re.S | re.I,
     )
     if m:
-        cat, sch, name, select, literal = m.groups()
+        cat, sch, name, targets, select, literal = m.groups()
         full = f"{cat}.{sch}.{name}"
         table = fake.tables.get(full)
         if table is None:
@@ -631,11 +633,20 @@ def _data_statement(fake: "FakeDatabricks", sql: str) -> Optional[Tuple[bool, st
                 {},
             )
         wanted = _names(select)
-        if len(wanted) != len(table["columns"]):
+        names = [c["name"] for c in table["columns"]]
+        into = _names(targets) if targets is not None else names
+        unknown = [c for c in into if c.lower() not in {n.lower() for n in names}]
+        if unknown:
+            return (
+                False,
+                f"[UNRESOLVED_COLUMN] Cannot write to {full}: no column {unknown[0]!r}.",
+                {},
+            )
+        if len(wanted) != len(into):
             return (
                 False,
                 f"[INSERT_COLUMN_ARITY_MISMATCH.NOT_ENOUGH_DATA_COLUMNS] Cannot write to {full}: "
-                f"the table has {len(table['columns'])} columns, the query {len(wanted)}.",
+                f"the insert names {len(into)} columns, the query {len(wanted)}.",
                 {},
             )
         source = fake._fs_path(re.sub(r"\\(.)", r"\1", literal))
@@ -661,8 +672,14 @@ def _data_statement(fake: "FakeDatabricks", sql: str) -> Optional[Tuple[bool, st
             return False, f"[UNRESOLVED_COLUMN] {type(exc).__name__}: {exc}", {}
         finally:
             con.close()
-        names = [c["name"] for c in table["columns"]]
-        fake.table_rows[full] = [dict(zip(names, row, strict=True)) for row in fetched]
+        by_lower = {n.lower(): n for n in names}
+        fake.table_rows[full] = [
+            {
+                **{n: None for n in names},
+                **{by_lower[t.lower()]: v for t, v in zip(into, row, strict=True)},
+            }
+            for row in fetched
+        ]
         return True, "", _insert_doc(len(fetched), fake.insert_reports_count)
     m = re.match(rf"SELECT\s+COUNT\(\s*(?:\*|1)\s*\)\s+FROM\s+{_FULL}\s*$", s, re.I)
     if m:
@@ -1647,6 +1664,7 @@ class FakeDatabricks:
             }
             if os.path.isfile(full):
                 entry["file_size"] = os.path.getsize(full)
+                entry["last_modified"] = int(os.path.getmtime(full) * 1000)
             contents.append(entry)
         return 200, {"contents": contents}
 

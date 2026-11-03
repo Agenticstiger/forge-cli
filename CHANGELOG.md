@@ -119,8 +119,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against the live `row_filter` and each column's `mask` from the GetTable it already reads, and
   each bound function read back for its owner (this verify's identity or the table's owner),
   body, parameters and return type; a missing or different binding is CRITICAL with `fluid
-  apply` as the fix, and a contract that restricts nothing skips it. `policy.privacy.masking`
-  (landing-time masking), `rowLevelPolicy` and `binding.governance` are still refused. Proven
+  apply` as the fix, and a contract that restricts nothing skips it. `rowLevelPolicy` and
+  `binding.governance` are still refused, and `policy.privacy.masking` (landing-time masking) is
+  refused unless a DuckDB acquisition writes the expose (see the bronze landing entry). Proven
   against the in-process stand-in with a real `tofu` apply, and the function bodies evaluated
   in DuckDB; not run against a live workspace: that `CREATE FUNCTION IF NOT EXISTS`, `SET ROW
   FILTER` (with `ON ()` as well) and `SET MASK` behave as the stand-in models them, that `SET`
@@ -138,8 +139,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (30 days by default) and `delta.deletedFileRetentionDuration` (7 days). So the emitter and
   `fluid validate` now accept `expire: true` when every build writing the expose is a dbt build
   whose model for the table resolves to `materialized: table`, or forge-cli's DuckDB acquisition
-  (which relies on its Databricks landing being an overwrite of the whole table), and
-  `lifecycle.retention` is at least the larger of the two history properties (the model's
+  with `properties.source.mode: full_refresh` (its Databricks landing overwrites the whole table,
+  and runs no other mode; another mode is `databricks-retention-incremental`, none `-unmapped`),
+  and `lifecycle.retention` is at least the larger of the two history properties (the model's
   `tblproperties` when it sets them). The model is the one whose `alias`, else file name, is the
   expose's table, with `materialized` resolved as dbt does: `config()` in the SQL, then the
   model's YAML `config:`, then `dbt_project.yml` by the most specific path; the default is `view`.
@@ -168,14 +170,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokenizes, encrypts, masks) at landing as before, writes Parquet under `.fluid/staging`, uploads it
   through the Files API to `DATABRICKS_STAGING_VOLUME` (`/Volumes/<catalog>/<schema>/<volume>`, from
   the environment only, like `DATABRICKS_WAREHOUSE_ID`) as `<product>/<build>/<run id>/<file>.parquet`,
-  and runs one statement on the warehouse, `INSERT OVERWRITE <catalog>.<schema>.<table> SELECT
-  <the contract's columns> FROM read_files('<the staged file>', format => 'parquet')`: a full refresh
-  that rewrites the rows and keeps the table's definition, grants, tags, row filter and column masks.
+  and runs one statement on the warehouse, `INSERT OVERWRITE <catalog>.<schema>.<table>
+  (<the contract's columns>) SELECT <the same columns> FROM read_files('<the staged file>', format =>
+  'parquet')`: a full refresh, each value into the column of its name, that rewrites the rows and keeps the table's definition, grants, tags, row filter and column masks.
   It reads only the file the run uploaded, never the directory, so a file someone else puts there is
   not loaded. The staged files are deleted afterwards whether or not the load worked, and on Ctrl-C
-  too (the INSERT is cancelled on the warehouse first); a file that cannot be deleted fails the run
+  too (an INSERT the warehouse has answered for is cancelled first); a file that cannot be deleted fails the run
   and is named first in the error. A run killed outright cannot clean up, so each load first deletes
-  what earlier runs of the same build left under `<volume>/<product>/<build>/`. The run record gains
+  what earlier runs of the same build left under `<volume>/<product>/<build>/`, once all of it is
+  over an hour old (a run still in progress keeps its upload). The run record gains
   `facets.databricks_load` (table, rows loaded, where it staged, that it deleted, and
   `earlier_runs_staging_deleted`). The table must exist: a missing one fails naming
   `fluid apply`, and the runner never creates or alters a table. An unset volume or warehouse, a

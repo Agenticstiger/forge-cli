@@ -62,7 +62,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
-from ...util.contract import builds_writing_expose
+from ...util.contract import builds_writing_expose, is_duckdb_acquisition_build
 from ..base import UnsupportedBindingError
 from ..source import current_contract_source
 
@@ -239,9 +239,54 @@ def _literal(node: ast.AST) -> Any:
     return UNKNOWN
 
 
-_COMMENT_RE = re.compile(r"\{#.*?#\}", re.DOTALL)
-_RAW_RE = re.compile(r"\{%-?\s*raw\s*-?%\}.*?\{%-?\s*endraw\s*-?%\}", re.DOTALL)
-_TAG_RE = re.compile(r"\{\{(.*?)\}\}|\{%(.*?)%\}", re.DOTALL)
+_RAW_OPEN_RE = re.compile(r"\{%-?\s*raw\s*-?%\}")
+_RAW_CLOSE_RE = re.compile(r"\{%-?\s*endraw\s*-?%\}")
+
+
+# The scans below match what the lazy regexes ``\{#.*?#\}``, ``{% raw %}.*?{% endraw %}`` and
+# ``\{\{(.*?)\}\}|\{%(.*?)%\}`` would, in linear time: an opener with no closer after it means no
+# later opener of that kind has one either, so the scan stops looking for that kind instead of
+# re-reading the rest of the file from every opener (quadratic on a file of unclosed ``{{``).
+def _without_comments_and_raw(text: str) -> str:
+    out: List[str] = []
+    pos = 0
+    while (start := text.find("{#", pos)) >= 0 and (end := text.find("#}", start + 2)) >= 0:
+        out.append(text[pos:start])
+        pos = end + 2
+    text = "".join(out) + text[pos:]
+    out, pos = [], 0
+    while (opened := _RAW_OPEN_RE.search(text, pos)) and (
+        closed := _RAW_CLOSE_RE.search(text, opened.end())
+    ):
+        out.append(text[pos : opened.start()])
+        pos = closed.end()
+    return "".join(out) + text[pos:]
+
+
+def _tags(text: str) -> Iterator[Tuple[Optional[str], Optional[str]]]:
+    """``(expression, None)`` for each ``{{ ... }}`` and ``(None, statement)`` for each
+    ``{% ... %}``, in order."""
+    closer = {"{{": "}}", "{%": "%}"}
+    nxt: Dict[str, int] = {}
+    pos = 0
+    while True:
+        for opener in list(closer):
+            if nxt.get(opener, -1) < pos:
+                nxt[opener] = text.find(opener, pos)
+                if nxt[opener] < 0:
+                    del closer[opener]
+        if not closer:
+            return
+        start, opener = min((nxt[o], o) for o in closer)
+        end = text.find(closer[opener], start + 2)
+        if end < 0:
+            del closer[opener]  # no closer after this opener, so none after a later one
+            continue
+        inner = text[start + 2 : end]
+        yield (inner, None) if opener == "{{" else (None, inner)
+        pos = end + 2
+
+
 _BLOCKS = frozenset({"if", "for", "macro", "call", "filter", "with", "block"})
 _ENDS = frozenset({"endif", "endfor", "endmacro", "endcall", "endfilter", "endwith", "endblock"})
 
@@ -254,11 +299,10 @@ def sql_config(text: str) -> Dict[str, Any]:
     inside a block, or one with a ``**`` expansion or positional argument. A keyword whose
     value is not a literal is :data:`UNKNOWN`.
     """
-    text = _RAW_RE.sub("", _COMMENT_RE.sub("", text))
+    text = _without_comments_and_raw(text)
     found: Dict[str, Any] = {}
     depth = 0
-    for match in _TAG_RE.finditer(text):
-        expression, statement = match.group(1), match.group(2)
+    for expression, statement in _tags(text):
         if statement is not None:
             words = statement.strip(" \t\r\n-+").split(None, 1)
             word = words[0] if words else ""
@@ -538,13 +582,6 @@ def _is_dbt(build: Mapping[str, Any]) -> bool:
     return engine == "dbt" or engine.startswith("dbt-")
 
 
-def _is_duckdb_acquisition(build: Mapping[str, Any]) -> bool:
-    return (
-        str(build.get("pattern") or "").strip().lower() == "acquisition"
-        and str(build.get("engine") or "").strip().lower() == "duckdb"
-    )
-
-
 def _fix_materialized() -> str:
     return "Declare materialized='table' on the model ({{ config(materialized='table') }})."
 
@@ -623,6 +660,39 @@ def _selection_refusal(
     )
 
 
+def _acquisition_mode_refusal(
+    build: Mapping[str, Any], label: str
+) -> Optional[UnsupportedBindingError]:
+    """A refusal unless the DuckDB acquisition's ``properties.source.mode`` is one the
+    Databricks landing runs as a full overwrite of the table."""
+    from ...build_runners._databricks_load import LOAD_MODES
+
+    properties = build.get("properties")
+    source = properties.get("source") if isinstance(properties, Mapping) else None
+    mode = source.get("mode") if isinstance(source, Mapping) else None
+    mode = getattr(mode, "value", mode)
+    if mode in LOAD_MODES:
+        return None
+    fix = (
+        f"Set properties.source.mode to {LOAD_MODES[0]!r} (the landing overwrites the whole "
+        "table), or remove lifecycle.expire."
+    )
+    if not mode:
+        return _refusal(
+            "unmapped",
+            f"{label} sets no properties.source.mode, so nothing says it rewrites the whole "
+            "table, and rows older than the retention could stay.",
+            fix,
+        )
+    return _refusal(
+        "incremental",
+        f"{label}: the acquisition's source mode is {mode!r}, and only "
+        f"{', '.join(repr(m) for m in LOAD_MODES)} rewrites the whole table on Databricks, so "
+        "rows older than the retention could stay.",
+        fix,
+    )
+
+
 def check_expire(
     where: str,
     exposure: Mapping[str, Any],
@@ -679,10 +749,14 @@ def check_expire(
         )
     for build in writers:
         label = f"{where}: build {build.get('id')!r}"
-        if _is_duckdb_acquisition(build):
+        if is_duckdb_acquisition_build(build):
             # forge-cli's acquisition lands into Databricks as an INSERT OVERWRITE of the
-            # whole table; acceptance rests on that. If the landing ever appends, this must
-            # refuse.
+            # whole table, and only in the modes the landing accepts (it refuses any other
+            # before the build runs); acceptance rests on both. If the landing ever appends,
+            # this must refuse.
+            refusal = _acquisition_mode_refusal(build, label)
+            if refusal is not None:
+                refusals.append(refusal)
             continue
         if not _is_dbt(build):
             refusals.append(
@@ -739,16 +813,20 @@ def check_expire(
             )
         )
     if seconds is not None and seconds < effective:
-        declared = "its declared properties" if tblproperties else "Delta's defaults"
+
+        def _shown(key: str, default: int) -> str:
+            value = tblproperties.get(key)
+            return f"{value!s} (declared)" if value else f"{days_text(default)} (Delta's default)"
+
         refusals.append(
             _refusal(
                 "too-short",
                 f"{where} lifecycle.retention is {period} ({days_text(seconds)}), shorter than "
-                f"the table's Delta history of {days_text(effective)} ({declared}: "
-                f"{LOG_RETENTION} {days_text(DEFAULT_LOG_SECONDS)}, {DELETED_FILE_RETENTION} "
-                f"{days_text(DEFAULT_DELETED_FILE_SECONDS)}). VACUUM keeps old data files "
-                "that long, so a copy older than the retention would remain. forge-cli does "
-                "not shorten the history yet.",
+                f"the table's Delta history of {days_text(effective)} ({LOG_RETENTION} "
+                f"{_shown(LOG_RETENTION, DEFAULT_LOG_SECONDS)}, {DELETED_FILE_RETENTION} "
+                f"{_shown(DELETED_FILE_RETENTION, DEFAULT_DELETED_FILE_SECONDS)}). VACUUM keeps "
+                "old data files that long, so a copy older than the retention would remain. "
+                "forge-cli does not shorten the history yet.",
                 f"Set lifecycle.retention to at least P{effective // DAY}D, or remove "
                 "lifecycle.expire.",
             )

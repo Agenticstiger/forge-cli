@@ -1903,7 +1903,7 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
     # fails the stream, and so the run and the apply. The staged files are deleted either way.
     databricks_load: Dict[str, Any] = {}
     if dbx_landing is not None and failures == 0 and stream_results:
-        from ...iac.providers.databricks_enforce import _scrub as _scrub_dbx
+        from ...iac.providers.databricks_enforce import scrub as _scrub_dbx
 
         for i, sr in enumerate(stream_results):
             if sr.state is not RunState.SUCCEEDED:

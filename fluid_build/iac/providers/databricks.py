@@ -531,8 +531,8 @@ def _refuse_governance(
                 f"{where} declares {', '.join(unmapped)}, which the Databricks emitter does not "
                 "map yet. Applied anyway, the table would be readable without the mask, filter "
                 "or restriction the contract promises.",
-                "Remove them from this expose until they are mapped (landing-time masking and "
-                "ABAC policies are not), and enforce access with grants. policy.authz."
+                "Remove them from this expose until they are mapped (ABAC policies are not), "
+                "and enforce access with grants. policy.authz."
                 "columnRestrictions and policy.authz.rowFilters are mapped: they become Unity "
                 "Catalog column masks and a row filter.",
             )

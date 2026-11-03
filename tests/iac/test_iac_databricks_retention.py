@@ -171,14 +171,17 @@ def _contract(**overrides: Any) -> Dict[str, Any]:
     return contract
 
 
-def _acquisition(**build: Any) -> Dict[str, Any]:
-    return {
+def _acquisition(mode: Any = "full_refresh", **build: Any) -> Dict[str, Any]:
+    source = {"kind": "filesystem", **({"mode": mode} if mode is not None else {})}
+    out = {
         "id": "land",
         "engine": "duckdb",
         "pattern": "acquisition",
         "outputs": ["orders"],
         **build,
     }
+    out["properties"] = {"source": source, **(build.get("properties") or {})}
+    return out
 
 
 def _project(
@@ -359,6 +362,27 @@ class TestDbtTable:
         # The relation is found without case; dbt's selection is case-sensitive.
         _accepted(_compile(_contract(builds__0__properties={"model": "Orders"}), tmp_path))
         _refused(_compile(_contract(), tmp_path), "not-selected")
+
+
+class TestJinjaScan:
+    """``sql_config`` reads a model's tags in linear time: a model file is the dbt author's,
+    but CI runs ``fluid validate`` on a pull request's."""
+
+    @pytest.mark.parametrize("opener", ["{{", "{%", "{#", "{% raw %}"])
+    def test_a_file_of_unclosed_openers_is_read_quickly(self, opener):
+        import time
+
+        started = time.monotonic()
+        assert ret.sql_config(opener * 200_000) == {}
+        assert time.monotonic() - started < 2.0
+
+    def test_tags_comments_and_raw_blocks_are_read_as_the_regexes_did(self):
+        text = (
+            "{# {{ config(materialized='view') }} #}"
+            "{% raw %}{{ config(materialized='view') }}{% endraw %}"
+            "{{ config(materialized='table') }} {{ unclosed"
+        )
+        assert ret.sql_config(text) == {"materialized": "table"}
 
 
 class TestDbtRefused:
@@ -613,7 +637,8 @@ class TestDeltaProperties:
     def test_a_longer_history_than_the_contract_is_refused(self, tmp_path):
         compiled = self._table(tmp_path, "{'delta.logRetentionDuration': 'interval 400 days'}")
         refusal = _refused(compiled, "too-short")
-        assert "400 days" in str(refusal) and "declared properties" in str(refusal)
+        assert "interval 400 days (declared)" in str(refusal)
+        assert "7 days (Delta's default)" in str(refusal)
 
     def test_a_history_inside_the_contract_is_accepted(self, tmp_path):
         compiled = self._table(
@@ -679,6 +704,23 @@ class TestWriters:
         build = _acquisition()
         del build["outputs"]
         _accepted(_compile(_contract(builds=[build])))
+
+    @pytest.mark.parametrize(
+        "mode", ["incremental_append", "incremental_merge", "incremental_dedup", "cdc", "streaming"]
+    )
+    def test_an_acquisition_that_does_not_rewrite_the_table_is_refused(self, mode):
+        refusal = _refused(_compile(_contract(builds=[_acquisition(mode)])), "incremental")
+        assert repr(mode) in str(refusal) and "full_refresh" in str(refusal)
+
+    def test_an_acquisition_without_a_source_mode_is_refused(self):
+        _refused(_compile(_contract(builds=[_acquisition(None)])), "unmapped")
+
+    def test_the_mode_accepted_is_the_one_the_landing_runs(self):
+        from fluid_build.build_runners import _databricks_load as load
+
+        for mode in load.LOAD_MODES:
+            assert load.unsupported_reason(mode, "parquet", 1) is None
+            _accepted(_compile(_contract(builds=[_acquisition(mode)])))
 
     def test_an_acquisition_with_a_short_retention_is_still_refused(self):
         contract = _contract(

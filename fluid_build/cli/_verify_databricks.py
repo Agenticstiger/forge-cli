@@ -59,7 +59,9 @@ What is checked is what the emitter's own pass says it provisions
    until a ``VACUUM`` runs. ``skip`` when the contract sets no expire.
 6. **The jobs.** Each dbt build that writes the expose has exactly one job of
    its name. None means ``fluid apply`` did not run (or the job was deleted);
-   several mean an apply without its state created a duplicate.
+   several mean an apply without its state created a duplicate. A job that is paused while
+   its table's masks or row filter are not in place fails too, with the apply that binds them
+   and starts the job as the fix.
 
 The client is ``databricks.sdk.WorkspaceClient`` built from ``sdk_config`` (the
 credential policy the provider and the doctor share), used only through its

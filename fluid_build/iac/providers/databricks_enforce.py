@@ -26,7 +26,9 @@ OpenTofu, in two hooks ``fluid apply`` calls around ``tofu apply``:
 * :func:`post_apply` binds whatever is still missing (the tables the apply just created, empty
   at that moment), and drops what the contract no longer asks for: a mask or filter whose
   function carries this module's name prefix. A filter an admin set by hand is left alone.
-  Dropping widens access, so it waits for the apply to succeed and is printed as such.
+  Dropping widens access, so it waits for the apply to succeed and is printed as such. After an
+  apply that succeeded it also drops this module's superseded functions that no table in the
+  schema uses and this run's identity owns (:func:`drop_orphan_functions`).
 
 Both read the live bindings first (``GET /api/2.1/unity-catalog/tables/{name}``:
 ``row_filter.function_name`` / ``input_column_names`` and ``columns[].mask.function_name``,
@@ -169,6 +171,11 @@ def _is_not_found(exc: BaseException) -> bool:
         "RESOURCE_DOES_NOT_EXIST",
         "NOT_FOUND",
     }
+
+
+#: The redaction and not-found test other Databricks code (the build runner's landing) shares.
+scrub = _scrub
+is_not_found = _is_not_found
 
 
 def read_table(client: Any, full_name: str) -> Optional[Dict[str, Any]]:

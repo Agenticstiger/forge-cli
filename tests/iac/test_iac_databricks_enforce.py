@@ -1176,6 +1176,17 @@ def test_the_orphan_drop_follows_pages_of_functions(fake):
     assert first not in fake.functions
 
 
+def test_an_orphan_whose_drop_fails_is_kept_named_and_the_apply_still_succeeds(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.fail_on("DROP FUNCTION", "[PERMISSION_DENIED] cannot drop")
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert first in fake.functions
+    assert f"note: superseded function {first} was not dropped" in run.text
+    assert "PERMISSION_DENIED" in run.text
+
+
 def test_the_orphan_drop_lists_the_tables_it_may_only_browse_too(fake):
     first, changed = _changed_contract_applied(fake)
     seen: List[Any] = []

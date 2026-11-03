@@ -31,6 +31,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -180,7 +182,7 @@ def test_the_insert_overwrite_statement_is_exact():
     expose = _expose()
     target = load.databricks_load_target(expose["binding"], expose)
     assert load.insert_overwrite_statement(target, f"{VOLUME}/bronze_subs/ingest/run-1") == (
-        "INSERT OVERWRITE `main`.`bronze`.`subs` SELECT `id`, `msisdn`, `zip` "
+        "INSERT OVERWRITE `main`.`bronze`.`subs` (`id`, `msisdn`, `zip`) SELECT `id`, `msisdn`, `zip` "
         f"FROM read_files('{VOLUME}/bronze_subs/ingest/run-1', format => 'parquet')"
     )
 
@@ -376,11 +378,29 @@ def test_a_failed_upload_is_cleaned_up_and_nothing_loads(fake, tmp_path):
     assert fake.volume_files() == []
 
 
-def _volume_file(fake: FakeDatabricks, volume_path: str, data: bytes) -> None:
+def test_the_load_puts_each_column_in_the_column_of_its_name(fake, tmp_path):
+    # fluid apply appended `id` to a live table that keeps the other two first: by position,
+    # the msisdn values would land in `id`
+    cols = fake.tables[TABLE]["columns"]
+    fake.tables[TABLE]["columns"] = cols[1:] + cols[:1]
+    _load(_landing(fake), _parquet(tmp_path))
+    assert [r["id"] for r in fake.rows(TABLE)] == ["1", "2", "3"]
+    assert fake.rows(TABLE)[0]["msisdn"] == ROWS[0][1]
+
+
+def _volume_file(
+    fake: FakeDatabricks, volume_path: str, data: bytes, *, age_seconds: float = 0
+) -> None:
     real = fake._fs_path(volume_path)
     assert real is not None, volume_path
     Path(real).parent.mkdir(parents=True, exist_ok=True)
     Path(real).write_bytes(data)
+    if age_seconds:
+        when = time.time() - age_seconds
+        os.utime(real, (when, when))
+
+
+_OLD = load.STALE_STAGING_SECONDS + 60
 
 
 def test_the_load_reads_the_uploaded_file_not_the_run_directory(fake, tmp_path):
@@ -440,8 +460,8 @@ def test_an_interrupted_statement_is_cancelled_on_the_warehouse():
 def test_staged_files_an_earlier_killed_run_left_are_deleted_first(fake, tmp_path):
     stale = f"{VOLUME}/bronze_subs/ingest/run-0"
     other_build = f"{VOLUME}/bronze_subs/other/run-0"
-    _volume_file(fake, f"{stale}/subs.parquet", b"left by a run that was killed")
-    _volume_file(fake, f"{other_build}/subs.parquet", b"another build's run")
+    _volume_file(fake, f"{stale}/subs.parquet", b"left by a run that was killed", age_seconds=_OLD)
+    _volume_file(fake, f"{other_build}/subs.parquet", b"another build's run", age_seconds=_OLD)
 
     facts = _load(_landing(fake), _parquet(tmp_path), run_id="run-1")
 
@@ -450,9 +470,20 @@ def test_staged_files_an_earlier_killed_run_left_are_deleted_first(fake, tmp_pat
     assert [r["id"] for r in fake.rows(TABLE)] == ["1", "2", "3"]
 
 
+def test_a_recent_run_of_the_same_build_keeps_its_staged_files(fake, tmp_path):
+    # another run of this build, uploaded a minute ago, may still be loading
+    running = f"{VOLUME}/bronze_subs/ingest/run-0"
+    _volume_file(fake, f"{running}/subs.parquet", b"in flight", age_seconds=60)
+
+    facts = _load(_landing(fake), _parquet(tmp_path), run_id="run-1")
+
+    assert facts["earlier_runs_staging_deleted"] == []
+    assert fake.volume_files() == [f"{running}/subs.parquet"]
+
+
 def test_a_stale_run_that_cannot_be_deleted_does_not_stop_the_load(fake, tmp_path):
     stale = f"{VOLUME}/bronze_subs/ingest/run-0"
-    _volume_file(fake, f"{stale}/subs.parquet", b"left behind")
+    _volume_file(fake, f"{stale}/subs.parquet", b"left behind", age_seconds=_OLD)
     fake.fail_route("DELETE", r"/fs/files/Volumes/.*/ingest/run-0/", 403, "PERMISSION_DENIED")
     facts = _load(_landing(fake), _parquet(tmp_path), run_id="run-1")
     assert facts["earlier_runs_staging_deleted"] == []

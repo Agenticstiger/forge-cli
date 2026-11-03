@@ -24,7 +24,7 @@ module moves it into the table in three steps:
    ``<volume>/<product>/<build>/<run id>/<file>.parquet``;
 2. run ONE statement on ``DATABRICKS_WAREHOUSE_ID`` through the SQL Statement Execution API::
 
-       INSERT OVERWRITE `c`.`s`.`t` SELECT `col`, ... FROM read_files('<staged file>', format => 'parquet')
+       INSERT OVERWRITE `c`.`s`.`t` (`col`, ...) SELECT `col`, ... FROM read_files('<staged file>', format => 'parquet')
 
    reading the one file this run uploaded, never the directory (a file someone else put there is not
    loaded), a full refresh that rewrites the table's rows and nothing else: the table's definition, grants,
@@ -33,9 +33,11 @@ module moves it into the table in three steps:
 3. delete the staged files and their directory, whether the load worked or not. The volume must never
    keep landed data (masked, but still the product's data). A file that cannot be deleted fails the
    run and is named, so that someone deletes it. Ctrl-C (or any other interrupt) during the upload or
-   the INSERT cancels the statement and still deletes the files before it propagates. A run killed
-   outright (SIGKILL, a CI runner torn down) cannot clean up, so each load first deletes what an
-   earlier run of the same build left under ``<volume>/<product>/<build>/``.
+   the INSERT still deletes the files before it propagates. An INSERT the warehouse has already
+   answered for is cancelled first; one still inside its first 30-second wait runs on, and Delta
+   commits it whole or not at all. A run killed outright (SIGKILL, a CI runner torn down) cannot clean up, so each
+   load first deletes what an earlier run of the same build left under
+   ``<volume>/<product>/<build>/``, once all of it is over an hour old.
 
 The table is the IaC's: a missing table is an error that names ``fluid apply``, and this module never
 creates or alters one. The volume is named by ``DATABRICKS_STAGING_VOLUME``
@@ -55,6 +57,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import quote
@@ -67,10 +70,10 @@ from ..iac.providers.databricks_enforce import (
     WAREHOUSE_ENV,
     SqlRunner,
     StatementFailed,
-    _is_not_found,
-    _scrub,
     default_client,
+    is_not_found,
     read_table,
+    scrub,
 )
 from ..providers._sql_safety import validate_ident
 from ..util.binding_paths import ENV_PLACEHOLDER_RE
@@ -80,8 +83,12 @@ STAGING_VOLUME_ENV = "DATABRICKS_STAGING_VOLUME"
 
 _VOLUME_FORM = "/Volumes/<catalog>/<schema>/<volume>"
 _VOLUME_RE = re.compile(r"^/Volumes/([^/]+)/([^/]+)/([^/]+)/?$")
+#: How old every file of an earlier run's staging directory must be before a load deletes it:
+#: well past a load's own span (the INSERT is cancelled after 600 s), so a run of the same build
+#: still in progress keeps its upload.
+STALE_STAGING_SECONDS = 3600
 #: The only mode a load supports: ``INSERT OVERWRITE`` replaces the table's rows.
-_MODES = ("full_refresh",)
+LOAD_MODES = ("full_refresh",)
 _SINK_FORMATS = ("parquet",)
 
 
@@ -194,9 +201,9 @@ def unsupported_reason(mode: str, sink_format: str, stream_count: int) -> Option
         return f"a Databricks binding loads exactly one stream; this build has {stream_count}"
     if sink_format not in _SINK_FORMATS:
         return f"a Databricks load takes {list(_SINK_FORMATS)}; the sink format is {sink_format!r}"
-    if mode not in _MODES:
+    if mode not in LOAD_MODES:
         return (
-            f"a Databricks load is an INSERT OVERWRITE, so it supports modes {list(_MODES)}; "
+            f"a Databricks load is an INSERT OVERWRITE, so it supports modes {list(LOAD_MODES)}; "
             f"this build is {mode!r}"
         )
     return None
@@ -204,12 +211,37 @@ def unsupported_reason(mode: str, sink_format: str, stream_count: int) -> Option
 
 def insert_overwrite_statement(target: LoadTarget, source: str) -> str:
     """The one statement that loads the run's file: every name an identifier the emitter
-    accepted, quoted; the path a Spark string literal (backslash escapes)."""
+    accepted, quoted; the path a Spark string literal (backslash escapes).
+
+    The target columns are listed, so each value goes to the column of its name whatever order
+    the live table keeps them in (a column added later by ``fluid apply`` sits at the end, not
+    where the contract declares it); without the list Databricks inserts by position.
+    """
     columns = ", ".join(quote_ident(column) for column in target.columns)
     return (
-        f"INSERT OVERWRITE {quote_table(target.full_name)} SELECT {columns} "
+        f"INSERT OVERWRITE {quote_table(target.full_name)} ({columns}) SELECT {columns} "
         f"FROM read_files({string_literal(source)}, format => 'parquet')"
     )
+
+
+def _stale_files(listed: Any, run_dir: str, cutoff_ms: float) -> Optional[List[str]]:
+    """The files of an earlier run's directory listing, when every one was last modified
+    before ``cutoff_ms`` (epoch milliseconds, as the Files API reports ``last_modified``);
+    ``None`` when any is newer or carries no date."""
+    files: List[str] = []
+    for entry in listed:
+        entry = _mapping(entry)
+        path = str(entry.get("path") or "")
+        if entry.get("is_directory") or not path.startswith(run_dir + "/"):
+            continue
+        try:
+            modified = float(entry.get("last_modified"))
+        except (TypeError, ValueError):
+            return None
+        if modified >= cutoff_ms:
+            return None
+        files.append(path)
+    return files
 
 
 def _fs(kind: str, path: str) -> str:
@@ -217,7 +249,7 @@ def _fs(kind: str, path: str) -> str:
 
 
 def _failure(exc: BaseException) -> str:
-    return f"{type(exc).__name__}: {_scrub(exc)}"
+    return f"{type(exc).__name__}: {scrub(exc)}"
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -302,25 +334,44 @@ class Landing:
         try:
             do("DELETE", _fs("files", remote))
         except Exception as exc:  # noqa: BLE001
-            if not _is_not_found(exc):
+            if not is_not_found(exc):
                 return [f"{remote} ({_failure(exc)})"]
         try:
             do("DELETE", _fs("directories", prefix))
         except Exception as exc:  # noqa: BLE001
-            if not _is_not_found(exc):
+            if not is_not_found(exc):
                 return [f"{prefix} ({_failure(exc)})"]
         return []
 
+    def _list_dir(self, path: str) -> List[Any]:
+        """Every entry of a volume directory, following ``next_page_token``."""
+        entries: List[Any] = []
+        token: Optional[str] = None
+        for _ in range(100):
+            page = _mapping(
+                self._client.api_client.do(
+                    "GET", _fs("directories", path), query={"page_token": token} if token else None
+                )
+            )
+            entries += list(page.get("contents") or [])
+            token = page.get("next_page_token") or None
+            if not token:
+                return entries
+        raise DatabricksLoadError(f"the listing of {path} never ended")
+
     def _sweep_stale(self, build_dir: str, current: str, logger: logging.Logger) -> List[str]:
         """Delete what earlier runs of this build left in ``build_dir`` (a run killed before its
-        own delete); the run directories deleted. Best effort: a failure is logged, not raised,
-        because this run's own files are deleted by this run whatever happens here."""
+        own delete); the run directories deleted. Only a run directory whose every file is older
+        than :data:`STALE_STAGING_SECONDS` is deleted: a run of the same build still in progress
+        keeps its upload. Best effort: a failure is logged, not raised, because this run's own
+        files are deleted by this run whatever happens here."""
         do = self._client.api_client.do
         swept: List[str] = []
+        cutoff_ms = (time.time() - STALE_STAGING_SECONDS) * 1000
         try:
-            runs = _mapping(do("GET", _fs("directories", build_dir))).get("contents") or []
+            runs = self._list_dir(build_dir)
         except Exception as exc:  # noqa: BLE001
-            if not _is_not_found(exc):
+            if not is_not_found(exc):
                 logger.warning(
                     "databricks.load could not list %s for earlier runs' staged files: %s",
                     build_dir,
@@ -334,11 +385,11 @@ class Landing:
             if not run_dir.startswith(build_dir + "/") or "/" in run_dir[len(build_dir) + 1 :]:
                 continue  # only a direct child of this build's directory
             try:
-                listed = _mapping(do("GET", _fs("directories", run_dir))).get("contents") or []
-                for entry in listed:
-                    path = str(_mapping(entry).get("path") or "")
-                    if _mapping(entry).get("is_directory") or not path.startswith(run_dir + "/"):
-                        continue
+                listed = self._list_dir(run_dir)
+                files = _stale_files(listed, run_dir, cutoff_ms)
+                if files is None:
+                    continue  # a file there is recent, or undated: perhaps a run in progress
+                for path in files:
                     do("DELETE", _fs("files", path))
                 do("DELETE", _fs("directories", run_dir))
             except Exception as exc:  # noqa: BLE001
