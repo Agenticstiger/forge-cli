@@ -1188,30 +1188,45 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
     # check is non-critical (ok=True) so a missing install doesn't fail
     # the suite. Surfaces both install state and the env-var status so
     # users can confirm at a glance whether routing is live.
-    try:
-        import litellm  # type: ignore[import-untyped]
+    # Detection is metadata-only: ``import litellm`` costs ~2,300 modules and
+    # makes litellm fetch its model-cost map over the network, which a health
+    # check must never do.
+    from importlib import metadata as _metadata
 
-        litellm_version = getattr(litellm, "__version__", "(unknown)")
-        details = f"litellm {litellm_version} · routing every provider"
-        checks.append(
-            {
-                "check": "LiteLLM backend",
-                "category": "ai",
-                "status": "✅ Installed",
-                "ok": True,
-                "details": details,
-            }
-        )
-    except ImportError:
-        checks.append(
-            {
-                "check": "LiteLLM backend",
-                "category": "ai",
-                "status": "⚠️  Not installed (optional)",
-                "ok": True,
-                "details": "Install with: pip install 'data-product-forge[litellm]'",
-            }
-        )
+    from fluid_build._optional import is_available
+
+    # Same metadata-only probe for the other optional runtimes the install hints
+    # point at, so ``fluid doctor`` shows the extra to install. Never imported:
+    # ``mcp`` and ``openlineage`` are large trees and have no business in a health check.
+    for label, module, dist, extra, note in (
+        ("LiteLLM backend", "litellm", "litellm", "litellm", "routing every provider"),
+        ("MCP SDK", "mcp", "mcp", "mcp", "fluid mcp serve / MCP delegates"),
+        ("OpenLineage client", "openlineage", "openlineage-python", "lineage", "lineage emission"),
+    ):
+        if is_available(module):
+            try:
+                version = _metadata.version(dist)
+            except _metadata.PackageNotFoundError:
+                version = "(unknown)"
+            checks.append(
+                {
+                    "check": label,
+                    "category": "ai",
+                    "status": "✅ Installed",
+                    "ok": True,
+                    "details": f"{dist} {version} · {note}",
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "check": label,
+                    "category": "ai",
+                    "status": "⚠️  Not installed (optional)",
+                    "ok": True,
+                    "details": f"Install with: pip install 'data-product-forge[{extra}]'",
+                }
+            )
 
     # Third-party LLM provider plugins (entry-point group fluid_build.llm_providers).
     # Reads entry-point NAMES only (never loads/executes plugin code) so a health

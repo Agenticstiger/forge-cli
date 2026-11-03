@@ -330,12 +330,10 @@ class HostedMcpClient:
 
     @asynccontextmanager
     async def _open_real_session(self) -> AsyncIterator[Any]:
-        try:
-            from mcp import ClientSessionGroup, StdioServerParameters
-        except ImportError as exc:  # pragma: no cover - mcp is a base dep
-            raise RuntimeError(
-                "Hosted-MCP delegation requires the 'mcp' SDK (pip install 'data-product-forge[mcp]')."
-            ) from exc
+        from fluid_build._optional import require
+
+        require("mcp", "mcp", "Hosted-MCP delegation")
+        from mcp import ClientSessionGroup, StdioServerParameters
 
         params = StdioServerParameters(
             command=self.command,

@@ -184,12 +184,10 @@ class DbtMcpClient:
 
     @asynccontextmanager
     async def _open_real_session(self) -> AsyncIterator[Any]:
-        try:
-            from mcp import ClientSessionGroup, StdioServerParameters
-        except ImportError as exc:  # pragma: no cover - mcp is a base dep
-            raise RuntimeError(
-                "The dbt MCP delegate requires the 'mcp' SDK (pip install 'data-product-forge[mcp]')."
-            ) from exc
+        from fluid_build._optional import require
+
+        require("mcp", "mcp", "The dbt MCP delegate")
+        from mcp import ClientSessionGroup, StdioServerParameters
 
         params = StdioServerParameters(
             command=self.command,

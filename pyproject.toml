@@ -159,11 +159,12 @@ dependencies = [
   # thread per instance, which leaked unboundedly with a per-session
   # SessionState. Reintroduce a backend here only if a multi-replica
   # deployment needs shared limits.)
-  # Borrowed SQL parser (MIT) used by fluid_build.providers._sql_safety to
-  # AST-classify statement bodies for the Snowflake action surfaces, so a
-  # contract cannot smuggle account-level / multi-statement SQL through the
-  # custom-SQL / task-body / view-body surfaces. Borrowed-not-built per
-  # /borrow-before-build: https://github.com/tobymao/sqlglot
+  # Borrowed SQL parser (MIT). Real consumers: fluid_build/iac/row_access.py
+  # (parses and validates a row-filter predicate before it is written into a
+  # platform policy; it FAILS OPEN if sqlglot is missing, so keep this in the
+  # base install), iac/providers/databricks_access.py, forge/core/validators.py
+  # and the from_ddl parser. (providers/_sql_safety.py does not use it.)
+  # Borrowed-not-built per /borrow-before-build: https://github.com/tobymao/sqlglot
   "sqlglot>=25.0",
   # Bitol-vendor-listed Python library for ODCS v3.1.0. Provides typed
   # Pydantic v2 models + ``from_file()`` / ``to_yaml()`` for lossless
@@ -356,6 +357,11 @@ litellm = []
 # ``pip install 'data-product-forge[mcp]'`` resolve now; it gets filled
 # when mcp leaves the base install.
 mcp = []
+
+# OpenLineage emission needs openlineage-python, which is in the base install
+# today. This empty alias lets ``pip install 'data-product-forge[lineage]'``
+# resolve now; step 6 of the dependency diet fills it.
+lineage = []
 
 # V1.5 metadata-source catalog adapters.
 #
