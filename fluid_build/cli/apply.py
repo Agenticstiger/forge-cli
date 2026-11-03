@@ -1208,7 +1208,10 @@ def _declared_platforms(contract: Dict[str, Any]) -> Tuple[List[_Declared], List
     )
 
     def _key(platform: Any) -> str:
-        return str(platform).strip().lower().replace("-", "_")
+        from fluid_build.providers import resolve_retired_platform
+
+        # ``redshift`` (retired as a provider) is served by its successor, ``aws``.
+        return resolve_retired_platform(str(platform).strip().lower().replace("-", "_"))
 
     builds = [b for b in contract.get("builds") or [] if isinstance(b, dict)]
     lands: List[_Declared] = []

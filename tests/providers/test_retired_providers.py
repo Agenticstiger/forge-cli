@@ -146,3 +146,111 @@ def test_datamesh_manager_still_resolves_as_a_publish_target(alias):
 
     spec = get_catalog_backend(alias)
     assert spec is not None and spec.name == "datamesh_manager"
+
+
+class _FakeEntryPoint:
+    value = "evil_pkg.provider:Evil"
+
+    def __init__(self, name):
+        self.name = name
+        self.loaded = False
+
+    def load(self):
+        self.loaded = True
+        return type("Evil", (), {})
+
+
+class _FakeEntryPoints:
+    def __init__(self, *eps):
+        self._eps = eps
+
+    def select(self, group):
+        return list(self._eps) if group == "fluid_build.providers" else []
+
+    def get(self, group, default=()):
+        return self.select(group) or list(default)
+
+
+@pytest.fixture
+def _restore_registry():
+    before = dict(P.PROVIDERS)
+    done = P._DISCOVERY_DONE
+    yield
+    P.PROVIDERS.clear()
+    P.PROVIDERS.update(before)
+    P._DISCOVERY_DONE = done
+
+
+@pytest.mark.parametrize("name", ["redshift", "datamesh-manager"])
+def test_a_plugin_cannot_claim_a_retired_name(name, monkeypatch, caplog, _restore_registry):
+    ep = _FakeEntryPoint(name)
+    monkeypatch.setattr(P.importlib.metadata, "entry_points", lambda: _FakeEntryPoints(ep))
+    with caplog.at_level(logging.WARNING):
+        P._discover_entrypoints(logging.getLogger("t"))
+    assert not ep.loaded
+    assert P._normalize_name(name) not in P.PROVIDERS
+    records = [
+        r for r in caplog.records if getattr(r, "evt", "") == "provider_retired_name_reserved"
+    ]
+    assert records and records[0].plugin == _FakeEntryPoint.value
+
+
+def test_a_plugin_claiming_redshift_does_not_replace_the_retirement_hint(
+    monkeypatch, caplog, capsys, _restore_registry
+):
+    monkeypatch.delenv("FLUID_PROVIDER", raising=False)
+    monkeypatch.setattr(
+        P.importlib.metadata, "entry_points", lambda: _FakeEntryPoints(_FakeEntryPoint("redshift"))
+    )
+    P.PROVIDERS.clear()
+    P.discover_providers(force=True)
+    rc, text = _main_output(["--provider", "redshift", "providers"], caplog, capsys)
+    assert rc == 2
+    assert _REDSHIFT_HINT in text
+
+
+def test_an_explicit_registration_of_a_retired_name_stays_allowed(_restore_registry):
+    P.register_provider("redshift", object)
+    assert P.PROVIDERS["redshift"] is object
+
+
+def test_the_hint_does_not_depend_on_the_registry_loading(monkeypatch, caplog, capsys):
+    # A registry that failed to load (``_known_provider_names`` -> []) must not hide it.
+    import fluid_build.cli as cli
+
+    monkeypatch.delenv("FLUID_PROVIDER", raising=False)
+    monkeypatch.setattr(cli, "_known_provider_names", lambda: [])
+    rc, text = _main_output(["--provider", "redshift", "providers"], caplog, capsys)
+    assert rc == 2
+    assert _REDSHIFT_HINT in text
+
+
+def test_a_blocking_allowlist_does_not_hide_the_hint(monkeypatch, caplog, capsys):
+    monkeypatch.delenv("FLUID_PROVIDER", raising=False)
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "zzz")
+    rc, text = _main_output(["--provider", "redshift", "providers"], caplog, capsys)
+    assert rc == 2
+    assert _REDSHIFT_HINT in text
+
+
+def test_a_contract_naming_redshift_gets_the_aws_native_plan(monkeypatch):
+    # generate iac's native planner resolved a contract platform through build_provider
+    # and swallowed provider_retired, so a redshift contract lost its native actions.
+    from fluid_build.cli import generate_iac
+
+    seen = {}
+
+    def _build(name, project, region, logger):
+        seen["name"] = name
+        return type("P", (), {"plan": lambda self, c: []})()
+
+    monkeypatch.setattr("fluid_build.cli._common.build_provider", _build)
+    contract = {"exposes": [{"binding": {"platform": "redshift", "location": {}}}]}
+    generate_iac.native_actions(contract, logging.getLogger("t"))
+    assert seen["name"] == "aws"
+
+
+def test_policy_apply_bindings_resolve_a_retired_platform():
+    from fluid_build.cli.policy_apply import _resolve_from_bindings
+
+    assert _resolve_from_bindings({"bindings": [{"provider": "redshift"}]})[0] == "aws"

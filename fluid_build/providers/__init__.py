@@ -117,6 +117,37 @@ RETIRED_PROVIDERS: Dict[str, str] = {
 }
 
 
+#: The provider that now serves a retired name used as a *platform* in a contract
+#: (``builds[].execution.runtime.platform: redshift`` still validates). Data Mesh
+#: Manager is a catalog, not a platform, so it has none.
+RETIRED_SUCCESSORS: Dict[str, str] = {"redshift": "aws"}
+
+
+def resolve_retired_platform(name: str) -> str:
+    """The successor provider for a retired platform name; any other name unchanged."""
+    return RETIRED_SUCCESSORS.get(_normalize_name(name), name)
+
+
+def _claims_retired_name(name: str, who: str, logger: Optional[logging.Logger]) -> bool:
+    """True (after a WARNING) when a plugin tries to register a retired provider name.
+
+    A retired name stays reserved: an entry point able to claim ``redshift`` would
+    replace the retirement hint for ``--provider redshift`` and win the platform
+    lookup for contracts. Only discovery calls this; an explicit
+    ``register_provider(...)`` call in code stays allowed.
+    """
+    if _normalize_name(name) not in RETIRED_PROVIDERS:
+        return False
+    _safe_log(
+        logger,
+        logging.WARNING,
+        "provider_retired_name_reserved",
+        name=_normalize_name(name),
+        plugin=who,
+    )
+    return True
+
+
 def retired_provider_hint(name: Optional[str]) -> Optional[str]:
     """One-line ``--provider``/``FLUID_PROVIDER`` error for a retired name, else ``None``."""
     if not name:
@@ -563,6 +594,12 @@ def _discover_entrypoints(logger: Optional[logging.Logger]) -> None:
             )
             POLICY_BLOCKED.add(_normalize_name(ep.name))
             continue
+        from fluid_build.plugin_manager import entry_point_distribution
+
+        if _claims_retired_name(
+            ep.name, entry_point_distribution(ep) or str(getattr(ep, "value", ep)), logger
+        ):
+            continue
         try:
             provider_cls = ep.load()
             register_provider(
@@ -656,6 +693,8 @@ def _auto_register_from_module(mod, logger: Optional[logging.Logger]) -> None:
     providers_map = getattr(mod, "PROVIDERS", None)
     if isinstance(providers_map, dict) and providers_map:
         for name, prov in list(providers_map.items()):
+            if _claims_retired_name(name, getattr(mod, "__name__", "<unknown>"), logger):
+                continue
             try:
                 register_provider(name, prov, override=False, logger=logger)
             except Exception as exc:
@@ -673,6 +712,8 @@ def _auto_register_from_module(mod, logger: Optional[logging.Logger]) -> None:
     name = getattr(mod, "NAME", None)
     prov = getattr(mod, "Provider", None)
     if isinstance(name, str) and prov is not None:
+        if _claims_retired_name(name, getattr(mod, "__name__", "<unknown>"), logger):
+            return
         try:
             register_provider(name, prov, override=False, logger=logger)
             _safe_log(
@@ -708,6 +749,8 @@ def _auto_register_from_module(mod, logger: Optional[logging.Logger]) -> None:
             inferred = _normalize_name(getattr(cls, "name", cls.__name__).replace("Provider", ""))
             if not _is_valid_name(inferred):
                 inferred = _normalize_name(getattr(mod, "__name__", "provider").rsplit(".", 1)[-1])
+            if _claims_retired_name(inferred, getattr(mod, "__name__", "<unknown>"), logger):
+                return
             register_provider(inferred, cls, override=False, logger=logger)
             _safe_log(
                 logger,

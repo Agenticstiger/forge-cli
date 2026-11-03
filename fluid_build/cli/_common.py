@@ -211,23 +211,28 @@ def resolve_provider_from_contract(contract: Dict[str, Any]) -> tuple[str, Dict[
     falls back to top-level binding.platform (Snowflake-style), then
     builds[].execution.runtime.platform.
 
+    A retired provider name used as a platform (``redshift``) resolves to its
+    successor provider (``aws``).
+
     Returns:
         (provider_name, location_dict) where location may contain
         project, region, dataset, bucket, etc.
     """
+    from fluid_build.providers import resolve_retired_platform
+
     for exp in contract.get("exposes", []):
         binding = exp.get("binding", {})
         platform = binding.get("platform", "")
         if platform:
-            return platform, binding.get("location", {})
+            return resolve_retired_platform(platform), binding.get("location", {})
     # Top-level binding (Snowflake-style contracts)
     top_binding = contract.get("binding", {})
     if isinstance(top_binding, dict) and top_binding.get("platform"):
-        return top_binding["platform"], top_binding.get("location", {})
+        return resolve_retired_platform(top_binding["platform"]), top_binding.get("location", {})
     for build in contract.get("builds", []):
         platform = (build.get("execution") or {}).get("runtime", {}).get("platform", "")
         if platform:
-            return platform, {}
+            return resolve_retired_platform(platform), {}
     return "", {}
 
 

@@ -70,7 +70,10 @@ def _resolve_from_bindings(data: dict) -> tuple[str, str]:
             project = b.get("project", "")
         if provider and project:
             break
-    return provider, project
+    from fluid_build.providers import resolve_retired_platform
+
+    # A platform the contract named, so a retired one resolves to its successor.
+    return resolve_retired_platform(provider) if provider else provider, project
 
 
 @_traced_stage("policy_apply")
