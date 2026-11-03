@@ -43,7 +43,6 @@ import fluid_build.cli as cli_mod
 from fluid_build.build_runners import _ids
 from fluid_build.build_runners import base as runner_base
 from fluid_build.build_runners._ids import IdentifierViolation
-from fluid_build.cli import build_parser
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.apply import _gate_contract_for_apply
 from fluid_build.cli.apply import run as apply_run
@@ -129,7 +128,7 @@ def _source(form: str, contract: Dict[str, Any], *, mode: str) -> str:
 
 def _apply(src: str, *flags: str) -> int:
     """``fluid apply <src> <flags> --yes`` through the real top-level parser."""
-    return apply_run(build_parser().parse_args(["apply", src, *flags, "--yes"]), LOG)
+    return apply_run(cli_mod.build_parser().parse_args(["apply", src, *flags, "--yes"]), LOG)
 
 
 @pytest.fixture
