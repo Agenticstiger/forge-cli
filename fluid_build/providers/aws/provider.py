@@ -27,7 +27,6 @@ import time
 from collections.abc import Mapping
 from typing import Any, Dict, List, NoReturn, Optional
 
-from fluid_build.providers._plan_validation import PlanValidationError
 from fluid_build.providers.base import (
     ApplyResult,
     BaseProvider,
@@ -35,10 +34,8 @@ from fluid_build.providers.base import (
 )
 
 from .plan.planner import plan_actions
-from .plan.schedule import SCHEDULER_INVOKE_ROLE, WORKFLOW_EXECUTION_ROLE
 from .util.auth import get_auth_report
 from .util.circuit_breaker import CircuitBreakerOpenError, get_circuit_breaker
-from .util.config import AwsAccountUnresolvedError, account_unresolved_message
 from .util.dependencies import order_actions_by_dependencies
 from .util.logging import redact_dict
 from .util.validation import ResourceValidator, validate_actions_strict
@@ -169,6 +166,10 @@ class AwsProvider(BaseProvider):
         Athena queries / workgroups, Redshift schemas, Lambda functions,
         EventBridge rules / schedules, IAM roles / policies.
         """
+        # Imported here, not at module scope: this module is loaded by
+        # ``fluid --help``, whose module count is budgeted.
+        from fluid_build.providers._plan_validation import PlanValidationError
+
         self.debug_kv(
             event="plan_started",
             contract_id=contract.get("id"),
@@ -336,6 +337,8 @@ class AwsProvider(BaseProvider):
         ``native_actions`` treats that as best-effort, as before. ``generate
         iac`` passes a placeholder account, so it never reaches this.
         """
+        from .util.config import AwsAccountUnresolvedError, account_unresolved_message
+
         orchestration = contract.get("orchestration")
         if isinstance(orchestration, Mapping) and any(
             orchestration.get(key) for key in ("schedule", "triggers", "tasks")
@@ -353,6 +356,8 @@ class AwsProvider(BaseProvider):
         orchestration = contract.get("orchestration")
         if not orchestration:
             return []
+
+        from fluid_build.providers._plan_validation import PlanValidationError
 
         from .plan.orchestration import OrchestrationError, plan_orchestration_tasks
 
@@ -387,7 +392,13 @@ class AwsProvider(BaseProvider):
         if not orchestration.get("schedule") and not orchestration.get("triggers"):
             return []
 
-        from .plan.schedule import plan_schedule_actions
+        from fluid_build.providers._plan_validation import PlanValidationError
+
+        from .plan.schedule import (
+            SCHEDULER_INVOKE_ROLE,
+            WORKFLOW_EXECUTION_ROLE,
+            plan_schedule_actions,
+        )
 
         try:
             actions = plan_schedule_actions(contract, self.account_id, self.region, self.logger)
