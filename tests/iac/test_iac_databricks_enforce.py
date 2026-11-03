@@ -722,7 +722,7 @@ def test_the_engine_prints_an_enforcement_failure_after_a_failed_apply_and_never
 def test_the_engine_binds_before_it_raises_the_apply_failure():
     source = __import__("inspect").getsource(engine._apply_via_opentofu)
     bind = source.index("_enforce_after_failed_apply(plugin, contract)")
-    failed = source.index('"opentofu_apply_failed"')
+    failed = source.index("raise _apply_failure(")
     assert source.index("runner.tofu_apply(") < bind < failed
 
 

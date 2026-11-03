@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -56,6 +57,7 @@ from fluid_build.iac.state_migration import (
     records_backend,
 )
 from fluid_build.iac.state_migration import reconcile_state_key as _reconcile_state
+from fluid_build.observability.secret_redactor import redact_secret_text
 
 from ._apply_cc_report import current_report
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
@@ -314,11 +316,11 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
             # A table the failed apply created, its grants and the job that fills it can all
             # exist with no mask or filter: bind what exists (never drop) before failing.
             _enforce_after_failed_apply(plugin, contract)
-            raise CLIError(
-                1,
-                "opentofu_apply_failed",
-                {"error": _tail(apply_result.stderr or apply_result.stdout)},
+            logger.debug(
+                "opentofu apply raw output tail: %s",
+                _tail(apply_result.stderr or apply_result.stdout),
             )
+            raise _apply_failure(apply_result, str(workdir))
         applied = runner.change_summary(apply_result)
         record(applied)
 
@@ -1137,7 +1139,17 @@ def _plan_failure(
     explained = _explained_failure(plugin, contract, output, workdir, env)
     if explained is not None:
         return explained
-    return CLIError(1, "opentofu_plan_failed", {"error": _tail(plan.stderr or plan.stdout)})
+    err = CLIError(
+        1,
+        "opentofu_plan_failed",
+        {"error": _tail(redact_secret_text(plan.stderr or plan.stdout or ""))},
+    )
+    if _mentions_state_lock(output):
+        err.suggestions = list(err.suggestions) + [
+            "The state is locked: wait for the other run, or clear a stale lock with "
+            f"'tofu force-unlock <id>' in {shlex.quote(workdir)}"
+        ]
+    return err
 
 
 def _guard_region_move(
@@ -1530,6 +1542,70 @@ def _data_loss_blocked(changes: Mapping[str, int], allow_data_loss: bool) -> boo
 
 def _tail(text: str, limit: int = 800) -> str:
     return (text or "")[-limit:]
+
+
+def _diagnostics(events: Any) -> List[Mapping[str, Any]]:
+    """The error diagnostics in a ``tofu -json`` stream, in the order printed."""
+    found: List[Mapping[str, Any]] = []
+    for event in events or []:
+        diag = event.get("diagnostic") if isinstance(event, Mapping) else None
+        if isinstance(diag, Mapping) and diag.get("severity", "error") == "error":
+            found.append(diag)
+    return found
+
+
+def _mentions_state_lock(text: str) -> bool:
+    """True when tofu says the state lock is the problem.
+
+    Matched on the phrases tofu prints ("Error acquiring the state lock",
+    "Error locking state"), never on a bare "lock", which "block" contains.
+    """
+    low = text.lower()
+    return "state lock" in low or "locking state" in low
+
+
+def _apply_failure(result: Any, workdir: str) -> CLIError:
+    """The error for a failed ``tofu apply``: what failed, on which resource, and the way on.
+
+    ``-json`` puts every diagnostic on stdout as one JSON line, so the raw tail
+    was a run of ``{"@level":...}`` objects. The diagnostics are read back into
+    a summary, the resource address and the provider's detail; output that holds
+    none (a crash, a timeout) falls back to the first ``Error:``, else the exit
+    code. Tofu records state as it goes, so what was created before the failure
+    is normally tracked and a re-run converges: the suggestions say so.
+    """
+    diagnostics = _diagnostics(getattr(result, "events", None))
+    context: Dict[str, Any] = {}
+    locked = False
+    if diagnostics:
+        first = diagnostics[0]
+        # Redacted before it is cut: a credential split at the limit (a URL that lost
+        # its ``@``) matches no pattern.
+        address = redact_secret_text(str(first.get("address") or "").strip())
+        detail = redact_secret_text(str(first.get("detail") or "").strip())
+        summary = redact_secret_text(str(first.get("summary") or "").strip()) or "tofu apply failed"
+        context["error"] = summary + (f" ({address})" if address else "")
+        if address:
+            context["resource"] = address
+        if detail:
+            context["detail"] = detail[:800]
+        if len(diagnostics) > 1:
+            context["more_errors"] = len(diagnostics) - 1
+        locked = _mentions_state_lock(summary + " " + detail)
+    else:
+        output = result.stderr or result.stdout or ""
+        context["error"] = (
+            _first_error(redact_secret_text(output), 800)
+            if "Error:" in output
+            else f"tofu apply exited {getattr(result, 'returncode', 1)}"
+        )
+        locked = _mentions_state_lock(output)
+    err = CLIError(1, "opentofu_apply_failed", context)
+    hints = [f"To see what exists, run 'tofu state list' in {shlex.quote(workdir)}"]
+    if locked:
+        hints.append("The state is locked: wait for the other run, or 'tofu force-unlock <id>'")
+    err.suggestions = list(err.suggestions) + hints
+    return err
 
 
 def _first_error(text: str, limit: int = 400) -> str:

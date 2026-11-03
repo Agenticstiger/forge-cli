@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid doctor --strict` turns the "Action needed" summary into exit 1.** `fluid doctor` printed
+  "Action needed" for a copilot that is not ready and still exited 0, so a CI gate could not tell.
+  With `--strict` it exits 1 whenever the summary says "Action needed", in the text report and with
+  `--json`, whose payload now carries `action_needed` and `copilot_ready`. The default exit code is
+  unchanged, and `--strict` has no effect with `--features-only`, which prints no summary.
+
 - **`fluid publish` tells the Command Center which workspace holds a Databricks table.** The
   product's `metadata.workspace_host` is now `https://<host>[:port]` taken from `DATABRICKS_HOST`,
   normalised and checked as the provider checks it (https, or plain http only to a loopback
@@ -126,6 +132,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
+  `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the
+  diagnostic (the summary, the resource address and the provider's detail) and says that OpenTofu
+  records state as it goes, so fixing the cause and re-running `fluid apply` normally continues;
+  `tofu state list` in the working directory shows what exists, and a state-lock error also
+  points at `tofu force-unlock`, as does a plan that fails on a held state lock. The raw output
+  tail is logged under `--debug`. Every value a `CLIError` prints (context and suggestions) now
+  goes through the full secret redactor, so a provider message carrying an access key id, a
+  bearer token or a URL password is masked, and has its control characters spelled out, as the
+  other error handlers already did.
+- **`fluid roadmap` claimed a 1.0 release and the package description left providers out.** The
+  roadmap said "forge-cli v1.0 shipped"; the package is 0.x Beta, and the roadmap now says so and
+  calls its "v1" headings an internal milestone. A test fails if it announces a 1.x release while
+  the package is below 1.0. The package description named GCP, Snowflake and Local and now names
+  AWS and Databricks too.
 - **Two applies on the same S3 state could race.** The S3 backend was emitted without locking, so a
   scheduled apply and a manual one (or an apply and a teardown) wrote the same state unguarded.
   `tofu init` now gets `-backend-config=use_lockfile=true` for an S3 backend on OpenTofu 1.10 or
