@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 """``accessPolicy.grants[].resources`` scopes a grant to exposes on Databricks.
 
 The emitter evaluates the expose filters a data product writes,
