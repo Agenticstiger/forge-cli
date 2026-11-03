@@ -167,6 +167,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pip install fluid-build[...]`; they now name `data-product-forge` with the right extra, and a
   ratchet test keeps the wrong name out. `data-product-forge[mcp]` resolves as an empty alias.
   `fluid-build` on PyPI is now only an alias that installs `data-product-forge`.
+- **Two applies on the same S3 state could race.** The S3 backend was emitted without locking, so a
+  scheduled apply and a manual one (or an apply and a teardown) wrote the same state unguarded.
+  `tofu init` now gets `-backend-config=use_lockfile=true` for an S3 backend on OpenTofu 1.10 or
+  newer; the emitted module is unchanged. On an older OpenTofu a WARNING says the state is
+  unlocked. Upgrade note: `tofu plan` takes the lock too, so every role that runs plan,
+  `fluid apply --dry-run`, `fluid diff` or `fluid verify --state-drift` against S3 state needs
+  `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `<key>.tflock`, or sets
+  `FLUID_TOFU_S3_LOCKFILE=0`. A workdir kept from before the upgrade is re-initialised with
+  `-reconfigure` once, only when it recorded this same bucket, key and region. The opt-out also takes effect on a
+  workdir that already had locking on. A run killed hard can leave `<key>.tflock` behind;
+  `tofu force-unlock <ID>` in the workdir (the ID is in tofu's error) clears it. A run that
+  hits `FLUID_TOFU_TIMEOUT_SECONDS` is now interrupted (SIGINT) so tofu releases the lock, and
+  killed only if it ignores that for 30 seconds.
 - **A contract's governance labels were dropped silently on Databricks.** The Databricks emitter
   never read `labels`, so `data-classification: confidential`, the `gdpr-article`, and the
   sovereignty jurisdiction, regulation and residency reached AWS (tags, Glue parameters) and GCP
