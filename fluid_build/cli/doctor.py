@@ -33,7 +33,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 
 from ._common import CLIError
 from ._logging import info
@@ -573,6 +573,7 @@ def run(args, logger: logging.Logger) -> int:
         feature_checks_ok=feature_checks_ok,
         copilot_readiness=copilot_readiness,
     )
+    _print_extras_move_notice()
 
     if not extended_requested:
         return 0 if feature_checks_ok and not needs_action else 1
@@ -728,6 +729,19 @@ def _print_doctor_summary(
     cprint("=" * 60)
     cprint(f"Status:  {summary.status}")
     cprint(f"Message: {summary.message}")
+    cprint()
+
+
+#: Shown once per ``fluid doctor`` run. litellm and mcp leave the base
+#: install in 0.28.0 (``[standard]`` restores both); keep the text in step
+#: with the release note for that change.
+EXTRAS_MOVE_NOTICE = "AI/MCP move to extras in 0.28.0: pip install 'data-product-forge[standard]'"
+
+
+def _print_extras_move_notice() -> None:
+    """Print the one-line AI/MCP extras notice (a single call per run)."""
+    # Literal: rich would read "[standard]" as a markup tag and drop it.
+    cprint_literal(EXTRAS_MOVE_NOTICE)
     cprint()
 
 

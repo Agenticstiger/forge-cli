@@ -347,16 +347,45 @@ postgres = [
   "psycopg[binary]>=3.1",
 ]
 
-# LiteLLM is now a core dependency (above), not an extra. The
-# ``[litellm]`` alias is kept empty for back-compat with anyone who
-# scripted ``pip install data-product-forge[litellm]`` during the opt-in
-# preview window.
-litellm = []
+# AI authoring (litellm). litellm is still in the base install today, so this
+# extra is redundant for now; it exists so that pip/uv installs of
+# ``data-product-forge[litellm]`` keep working after litellm leaves the base
+# install in 0.28.0. The two lines are copied verbatim from ``dependencies``:
+# the Python-version marker split (PR #555) must never be collapsed, because
+# litellm >= 1.98 cannot be imported on Python 3.10.
+# tests/ci_guards/extras_alongside_base.py pins both lines.
+litellm = [
+  "litellm>=1.83.14,<2; python_version >= '3.11'",
+  "litellm>=1.83.14,<1.98; python_version < '3.11'",
+]
 
-# mcp is in the base install today. This empty alias lets
-# ``pip install 'data-product-forge[mcp]'`` resolve now; it gets filled
-# when mcp leaves the base install.
-mcp = []
+# MCP server and output-port gateway (``fluid mcp serve``,
+# ``fluid mcp output-port serve``). mcp is still in the base install today;
+# this extra is redundant for now and carries the install after 0.28.0.
+# pyjwt is declared explicitly because fluid_build/output_ports/mcp/auth.py
+# imports ``jwt`` directly; its floor is mcp 1.22's own requirement.
+mcp = [
+  "mcp>=1.22,<3.0",
+  "pyjwt>=2.10.1",
+]
+
+# OpenLineage run-event emission. openlineage-python is still in the base
+# install today; this extra is redundant for now and carries the install
+# after it leaves base.
+lineage = [
+  "openlineage-python>=1.52",
+]
+
+# AI + MCP together: restores today's base behaviour once litellm and mcp
+# leave the base install in 0.28.0 (the ``fastapi[standard]`` precedent).
+standard = [
+  "data-product-forge[litellm,mcp]",
+]
+
+# Alias of ``[litellm]`` for readers who look for an ``ai`` extra.
+ai = [
+  "data-product-forge[litellm]",
+]
 
 # OpenLineage emission needs openlineage-python, which is in the base install
 # today. This empty alias lets ``pip install 'data-product-forge[lineage]'``
@@ -448,6 +477,9 @@ dev = [
   # the unit lanes install ``.[dev,local]``, which has no pyarrow, so without
   # it those tests would skip in CI instead of running.
   "pyarrow>=14",
+  # litellm, mcp and openlineage leave the base install in 0.28.0; the tests
+  # import all three at module level, so dev names them explicitly.
+  "data-product-forge[litellm,mcp,lineage]",
 ]
 
 # Light (in-process) integration-test emulators — Stage 1. moto mocks the
@@ -489,7 +521,7 @@ test-emulators-heavy = [
 
 # One-shot install for contributors
 all = [
-  "data-product-forge[local,aws,gcp,snowflake,viz,odps,tui,copilot,vector,postgres,docs,dev]"
+  "data-product-forge[local,aws,gcp,snowflake,viz,odps,tui,copilot,vector,postgres,docs,litellm,mcp,lineage,dev]"
 ]
 
 [project.scripts]

@@ -55,16 +55,18 @@ COPY fluid_build/ fluid_build/
 # Install the package (non-editable)
 RUN pip install --prefix=/install .
 
-# Install provider dependencies based on profile
+# Install provider dependencies based on profile. Every profile names
+# [standard] (litellm + mcp) so the image keeps AI and `fluid mcp serve`
+# once they leave the base install in 0.28.0.
 RUN if [ "${PROFILE}" = "experimental" ] || [ "${PROFILE}" = "alpha" ]; then \
       pip install --prefix=/install \
-        ".[local,gcp,snowflake,viz]"; \
+        ".[local,gcp,snowflake,viz,standard]"; \
     elif [ "${PROFILE}" = "beta" ]; then \
       pip install --prefix=/install \
-        ".[local,gcp,viz]"; \
+        ".[local,gcp,viz,standard]"; \
     else \
       pip install --prefix=/install \
-        ".[local]"; \
+        ".[local,standard]"; \
     fi
 
 # ============================================
