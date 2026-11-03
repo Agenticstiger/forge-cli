@@ -146,9 +146,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expose's table, with `materialized` resolved as dbt does: `config()` in the SQL, then the
   model's YAML `config:`, then `dbt_project.yml` by the most specific path; the default is `view`.
   The build must also run that model: its `--select` (`properties.model` / `select`, as
-  `build_selectors` makes it) must include the model by name, fully qualified name or path, else
+  `build_selectors` makes it) must include the model by name, fully qualified name (or a prefix
+  of it, with or without the project's name, as dbt matches) or path, else
   `databricks-retention-not-selected` (graph operators on another node, tags, configs and state
-  cannot be evaluated here and are refused too).
+  cannot be evaluated here and are refused too). A table name, retention or source mode that is
+  still an `{{ env.X }}` placeholder is left by `fluid validate` to the emitter, which checks it
+  substituted, and `fluid verify` reads the contract with its placeholders substituted, as `fluid
+  apply` does.
   Refused, with the fix: `databricks-retention-incremental` (`incremental`, `snapshot`),
   `-not-table` (`view` and the rest), `-dbt-unresolved` (a Git repository, or a value that is not
   a plain literal: `var()`, a conditional `config()`, a custom `schema`), `-too-short`
@@ -172,7 +176,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `resources` still covers every table. Any other JSONPath (`$.exposes[0]`, a filter on another
   field, `||`, a path below the expose), alone or beside a good one, and an exposeId this contract
   does not have, stay `databricks-grant-scope-unmapped`, with a message that names the resource and
-  says the grant is refused rather than placed on more tables than it names. `fluid validate` and
+  says the grant is refused rather than placed on more tables than it names; a blank resource
+  (`""`) is one of those, not "every expose". `fluid validate` and
   the emitter read the one `_compile` verdict, and `fluid verify`'s catalog-access check reads the
   per-table grants, so a scoped reader is checked only where it is granted. The scope is parsed
   once, in `iac/access.py` (`AccessGrant.scope`); what the AWS and GCP emitters produce is
@@ -191,15 +196,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   'parquet')`: a full refresh, each value into the column of its name, that rewrites the rows and keeps the table's definition, grants, tags, row filter and column masks.
   It reads only the file the run uploaded, never the directory, so a file someone else puts there is
   not loaded. The staged files are deleted afterwards whether or not the load worked, and on Ctrl-C
-  too (an INSERT the warehouse has answered for is cancelled first); a file that cannot be deleted fails the run
-  and is named first in the error. A run killed outright cannot clean up, so each load first deletes
-  what earlier runs of the same build left under `<volume>/<product>/<build>/`, once all of it is
-  over an hour old (a run still in progress keeps its upload). The run record gains
+  too (an INSERT the warehouse has answered for is cancelled first); a file that cannot be deleted
+  fails the run and is named first in the error. A run killed outright cannot clean up, so each
+  load first deletes what earlier runs of the same build left under `<volume>/<product>/<build>/`:
+  only a directory named like a run id that holds nothing but Parquet files, all over an hour old
+  (a run still in progress keeps its upload, and a directory forge-cli did not stage is left).
+  Give the staging a volume of its own. The run record gains
   `facets.databricks_load` (table, rows loaded, where it staged, that it deleted, and
   `earlier_runs_staging_deleted`). The table must exist: a missing one fails naming
   `fluid apply`, and the runner never creates or alters a table. An unset volume or warehouse, a
   mode other than `full_refresh`, a sink other than Parquet and more than one stream are refused
-  before anything runs. Every other platform's landing is unchanged. The Databricks emitter now
+  before anything runs, and the emitter refuses the mode and the sink format already
+  (`databricks-landing-unsupported`), with any masking rule the runner cannot apply
+  (`databricks-masking-invalid`), so `fluid validate` says so before `fluid apply` creates the
+  table. Every other platform's landing is unchanged. The Databricks emitter now
   accepts `policy.privacy.masking` on an expose when every build that writes it is a DuckDB
   acquisition build (the runner applies the mask before the data leaves the machine, as on AWS), and
   keeps refusing it, with the reason, for a dbt-written expose, another engine, or no build at all;
