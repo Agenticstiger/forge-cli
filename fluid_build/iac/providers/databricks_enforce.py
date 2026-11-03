@@ -47,6 +47,7 @@ lazily: it is the ``[databricks]`` extra. No message carries a credential.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -218,6 +219,12 @@ def _type(text: Any) -> str:
     return "".join(str(text or "").split()).lower()
 
 
+def owner_matches(owner: Any, owners: Collection[str]) -> bool:
+    """Whether a function's ``owner`` is one of ``owners`` (case-insensitive): the one comparison
+    the read-back of a function and the orphan drop share."""
+    return str(owner or "").lower() in {o.lower() for o in owners}
+
+
 def function_problem(
     info: Optional[Mapping[str, Any]], expected: Function, owners: Collection[str]
 ) -> Optional[str]:
@@ -233,7 +240,7 @@ def function_problem(
         return f"{expected.full_name} does not exist"
     problems: List[str] = []
     owner = str(info.get("owner") or "")
-    if owner.lower() not in {o.lower() for o in owners}:
+    if not owner_matches(owner, owners):
         problems.append(f"its owner is {owner or 'unknown'}, not {' or '.join(sorted(owners))}")
     body_language = str(info.get("routine_body") or "SQL").upper()
     if body_language != "SQL":
@@ -741,6 +748,130 @@ def post_apply(
                 "first (replacing a deny-all filter) and grants again afterwards.",
             ),
         )
+    if not after_failed_apply:
+        drop_orphan_functions(runner, targets, say)
+
+
+def _list_named(client: Any, path: str, query: Mapping[str, str], key: str) -> List[Dict[str, Any]]:
+    """Every entry of a paged Unity Catalog list (``key`` holds the page's rows)."""
+    out: List[Dict[str, Any]] = []
+    token: Optional[str] = None
+    for _ in range(100):
+        page = client.api_client.do(
+            "GET", path, query={**query, **({"page_token": token} if token else {})}
+        )
+        out += [r for r in (page.get(key) or []) if isinstance(r, Mapping)]
+        token = page.get("next_page_token") or None
+        if not token:
+            return out
+    raise StatementFailed("the list never ended")
+
+
+def _bare(name: Any) -> str:
+    return str(name or "").replace("`", "").lower()
+
+
+def _orphans(
+    names: Sequence[str], table: str, columns: Collection[str], keep: Collection[str]
+) -> List[str]:
+    """The functions among ``names`` (bare, lower case) that carry this table's fluid_ name
+    pattern and are not in ``keep``: ``fluid_rf_<table>_<8 hex>``, the deny-all
+    ``fluid_rf_<table>_deny_all_<8 hex>`` and ``fluid_mask_<table>_<column>_<8 hex>`` for a column
+    the table has."""
+    t = re.escape(table.lower())
+    shapes = [
+        f"{ROW_FILTER_PREFIX}{t}_[0-9a-f]{{8}}",
+        f"{ROW_FILTER_PREFIX}{t}_deny_all_[0-9a-f]{{8}}",
+    ]
+    shapes += [f"{MASK_PREFIX}{t}_{re.escape(c.lower())}_[0-9a-f]{{8}}" for c in columns]
+    rx = re.compile("|".join(f"(?:{x})" for x in shapes))
+    return [n for n in names if n.startswith("fluid_") and rx.fullmatch(n) and n not in keep]
+
+
+def drop_orphan_functions(session: Session, targets: Sequence[Target], say: Say) -> None:
+    """Drop this module's functions that a changed contract left behind, after a successful apply.
+
+    A function is dropped only when its name is this table's fluid_ pattern
+    (:func:`_orphans`), it is not one the contract expects now, and no table in its schema has it
+    as a row filter or column mask (every table of the schema is read first). If the schema
+    cannot be read completely, nothing is dropped in it. Each drop is printed.
+    """
+    schemas: Dict[Tuple[str, str], List[Target]] = {}
+    for target in targets:
+        parts = target.full_name.split(".")
+        if len(parts) == 3:
+            schemas.setdefault((parts[0], parts[1]), []).append(target)
+    expected = set()
+    for target in targets:
+        e = target.enforcement
+        if e is None:
+            continue
+        expected |= {_bare(m.function.full_name) for m in e.masks}
+        if e.row_filter is not None:
+            expected.add(_bare(e.row_filter.function.full_name))
+        if e.deny_all is not None:
+            expected.add(_bare(e.deny_all.function.full_name))
+    client = session.client
+    for (catalog, schema), members in sorted(schemas.items()):
+        where = f"{catalog}.{schema}"
+        try:
+            query = {"catalog_name": catalog, "schema_name": schema}
+            bound: set = set()
+            columns: Dict[str, List[str]] = {}
+            for row in _list_named(client, "/api/2.1/unity-catalog/tables", query, "tables"):
+                full = str(row.get("full_name") or f"{where}.{row.get('name')}")
+                live = read_table(client, full)
+                if live is None:
+                    continue
+                bound.add(_bare((live.get("row_filter") or {}).get("function_name")))
+                live_cols = _live_columns(live)
+                bound |= {
+                    _bare((c.get("mask") or {}).get("function_name")) for c in live_cols.values()
+                }
+                columns[full.rsplit(".", 1)[-1].lower()] = [
+                    str(c["name"]) for c in live_cols.values()
+                ]
+            listed = _list_named(client, "/api/2.1/unity-catalog/functions", query, "functions")
+        except Exception as exc:  # noqa: BLE001 — unknown binding: drop nothing
+            say(
+                f"  note: orphan functions in {where} not dropped: its tables or functions could "
+                f"not be read ({type(exc).__name__}: {_scrub(exc)})."
+            )
+            continue
+        names = [
+            str(r.get("name") or str(r.get("full_name") or "").rsplit(".", 1)[-1]).lower()
+            for r in listed
+        ]
+        mine = f"{where}.".lower()
+        keep = {n[len(mine) :] for n in expected | bound if n.startswith(mine)}
+        dropped: List[str] = []
+        for target in members:
+            table = target.full_name.split(".")[2]
+            for name in _orphans(names, table, columns.get(table.lower(), ()), keep):
+                if name in dropped:
+                    continue
+                full = f"{where}.{name}"
+                try:
+                    owner = str((read_function(client, full) or {}).get("owner") or "")
+                    me = session.identity
+                except Exception:  # noqa: BLE001 — unknown owner: leave it
+                    owner, me = "", ""
+                if not me or not owner_matches(owner, {me}):
+                    why = (
+                        f"owned by {owner}, not by the deploy identity"
+                        if owner
+                        else "owner unknown"
+                    )
+                    say(f"  left function {full}: {why}")
+                    dropped.append(name)  # said once; not tried again for another table
+                    continue
+                try:
+                    session.runner.run(f"DROP FUNCTION IF EXISTS {quote_table(full)}")
+                except StatementFailed as exc:
+                    say(f"  note: superseded function {full} was not dropped: {exc}")
+                    continue
+                dropped.append(name)
+                say(f"  dropped superseded function {full}")
 
 
 @dataclass
@@ -761,6 +892,13 @@ class FailSafe:
     checked: bool = False
     #: Whether the table's grants could be listed (else only the restricted identities were revoked).
     listed: bool = True
+    #: Whether any effective-permission entry said where a privilege comes from
+    #: (``inherited_from_*``); if none did, "nothing inherited is open" cannot be told from
+    #: "the listing does not say".
+    inheritance_visible: bool = False
+    #: The table's owner could not be read, so the lock could not skip it (only this run's own
+    #: identity was skipped).
+    owner_unknown: bool = False
 
 
 _READ = frozenset({"SELECT", "ALL_PRIVILEGES"})
@@ -913,8 +1051,16 @@ def _lock(
     result: FailSafe,
     say: Say,
 ) -> None:
-    """Revoke SELECT (and ALL PRIVILEGES) on the table from every grantee but its owner."""
+    """Revoke SELECT (and ALL PRIVILEGES) on the table from every grantee but its owner and the
+    identity this run is: revoking from the deploy identity would lock the run out of the table
+    it has to repair."""
     owner = str((live or {}).get("owner") or "")
+    result.owner_unknown = not owner
+    try:
+        me = session.identity
+    except Exception:  # noqa: BLE001 — unreadable: nothing to skip but the owner
+        me = ""
+    skip = {p.lower() for p in (owner, me) if p}
     grantees: Dict[str, set] = {}
     try:
         for entry in _list_pages(
@@ -931,7 +1077,7 @@ def _lock(
         )
         grantees = {p: {"SELECT"} for p in enforcement.restricted}
     for principal, held in sorted(grantees.items()):
-        if owner and principal.lower() == owner.lower():
+        if principal.lower() in skip:
             continue
         statements = []
         if "SELECT" in held:
@@ -947,6 +1093,16 @@ def _lock(
             else:
                 result.revoked.append(statement)
                 say(f"      revoked: {statement}")
+    restricted = {p.lower() for p in enforcement.restricted}
+    for held_by in (owner, me):
+        if held_by and held_by.lower() in restricted:
+            what = "owns" if held_by == owner else "is the identity of this run, and has"
+            result.still_open.append(
+                f"{held_by} {what} {table} and the contract restricts it; an owner reads its "
+                "table whatever is revoked, so this lock cannot close that path. Run: ALTER TABLE "
+                f"{'.'.join(quote_ident(p) for p in table.split('.'))} OWNER TO "
+                "`<an identity the contract does not restrict>`"
+            )
     _open_paths(session, table, owner, result)
 
 
@@ -961,6 +1117,12 @@ def _open_paths(session: Session, table: str, owner: str, result: FailSafe) -> N
         result.checked = False
         return
     result.checked = True
+    result.inheritance_visible = any(
+        str(k).startswith("inherited_from")
+        for entry in entries
+        for detail in _privileges(entry).values()
+        for k in detail
+    )
     for entry in entries:
         principal = str(entry.get("principal") or "")
         if not principal or (owner and principal.lower() == owner.lower()):
@@ -992,10 +1154,15 @@ def _describe(target: Target, fs: FailSafe) -> str:
     done = f"The deny-all row filter could not be bound ({fs.deny_all_problem}). " + (
         "SELECT (and ALL PRIVILEGES where held) was revoked on the table from "
         + ", ".join(sorted({s.rsplit(" FROM ", 1)[1] for s in fs.revoked}))
-        + " (every grantee but its owner). "
+        + " (every grantee but its owner and this run's own identity). "
         if fs.revoked
         else "Nothing was revoked. "
     )
+    if fs.owner_unknown:
+        done += (
+            "The table's owner could not be read, so it could not be skipped: if the owner held "
+            "SELECT through a grant, it was revoked too. "
+        )
     if not fs.listed:
         done += "Its grants could not be listed, so only the restricted identities were revoked. "
     if fs.unrevoked:
@@ -1004,8 +1171,13 @@ def _describe(target: Target, fs: FailSafe) -> str:
         )
     if fs.still_open:
         done += "Still open: " + " | ".join(fs.still_open) + ". "
-    elif fs.checked:
+    elif fs.checked and fs.inheritance_visible:
         done += "No grant inherited from the schema or the catalog was found open. "
+    elif fs.checked:
+        done += (
+            "The permission listing did not say where any privilege comes from, so it could not "
+            "determine whether a schema or catalog grant is open: check them. "
+        )
     else:
         done += "Grants inherited from the schema or the catalog could not be checked: check them. "
     return done.rstrip()

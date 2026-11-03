@@ -197,6 +197,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes when the region matches the declaration, fails with the fix when it does not, and is
   skipped when the contract declares none.
 
+- **A failed fail-safe no longer locks the run out, and says what it could not close.** When a
+  mask or row filter cannot be bound, the lock that revokes SELECT from every grantee but the
+  owner now also skips the identity the run is (it has to repair the table), and when the
+  table's owner could not be read it says the owner could not be skipped. An owner the contract
+  itself restricts reads its table whatever is revoked: the message now names that path as still
+  open, with the `ALTER TABLE ... OWNER TO` to run. When the permission listing shows no
+  `inherited_from_*` field at all, it says it could not determine whether a schema or catalog
+  grant is open, where it claimed none was.
+
+- **A job paused for an unprotected table is announced and found.** The apply decides once, in
+  `emit`, which dbt jobs to create paused, and its notice reads that decision, so a transient
+  read error can no longer pause a job without saying so. `fluid verify` now fails the jobs
+  dimension for a job that is paused while its table's masks or row filter are not in place,
+  with the apply that binds them and starts the job as the fix.
+
+- **A changed contract no longer leaves its old masks and row filter functions behind.** After
+  a successful apply (never in a dry run, never after a failed apply or a failed bind), the
+  functions in the product schema that carry the table's `fluid_rf_<table>_`,
+  `fluid_mask_<table>_<column>_` or deny-all name and are neither expected now nor bound to any
+  table in the schema (every table is read first; if one cannot be, nothing is dropped) are
+  dropped, each printed, and only when the run's own identity owns the function: one with
+  another owner, or an owner that cannot be read, is left and named. A function without the
+  `fluid_` prefix is never touched.
+
+- **A plan that fails the residency check prints one line.** The apply showed the last 800
+  characters of the tofu JSON, which cut off the sentence naming the live region. It now says
+  the declared region, the live region (read from the diagnostic's message, or its `values`)
+  and the fix.
+
 ### Security
 
 - **`validate_ident` let a name with a trailing newline through.** Python's `$` also matches just

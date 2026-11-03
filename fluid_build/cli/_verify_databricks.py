@@ -609,8 +609,31 @@ def _function_findings(
     return out
 
 
-def _jobs_dimension(client: Any, expose_id: str, contract: Mapping[str, Any], jobs: Any) -> Any:
-    """The dimension for the dbt jobs that write ``expose_id``; ``None`` when there are none."""
+def _paused(job: Mapping[str, Any]) -> bool:
+    """Whether the job's schedule or continuous block is ``PAUSED``."""
+    settings = job.get("settings")
+    if not isinstance(settings, Mapping):
+        return False
+    return any(
+        isinstance(settings.get(block), Mapping) and settings[block].get("pause_status") == "PAUSED"
+        for block in ("schedule", "continuous")
+    )
+
+
+def _jobs_dimension(
+    client: Any,
+    expose_id: str,
+    contract: Mapping[str, Any],
+    jobs: Any,
+    enforcement: Optional[Mapping[str, Any]] = None,
+    table_name: str = "",
+) -> Any:
+    """The dimension for the dbt jobs that write ``expose_id``; ``None`` when there are none.
+
+    A job that is paused while the table's masks or row filter are not in place is the one
+    ``fluid apply`` creates paused for that reason (``DatabricksIacPlugin.emit``): it is a finding
+    whose fix is the apply that binds them and starts it.
+    """
     from fluid_build.util.contract import builds_writing_expose
 
     writers = {
@@ -631,6 +654,17 @@ def _jobs_dimension(client: Any, expose_id: str, contract: Mapping[str, Any], jo
                     "build": job.build_id,
                     "message": f"no job named {job.name!r} for build {job.build_id}: "
                     "run fluid apply",
+                }
+            )
+        elif len(hits) == 1 and _paused(hits[0]) and (enforcement or {}).get("status") == "fail":
+            findings.append(
+                {
+                    "build": job.build_id,
+                    "message": (
+                        f"job {job.name!r} is paused because {table_name or 'its table'} is not "
+                        "protected (the row_filter_masks dimension fails): run fluid apply, which "
+                        "binds the masks and row filter, then starts the job"
+                    ),
                 }
             )
         elif len(hits) > 1:
@@ -801,7 +835,7 @@ def verify_databricks_expose(
         residency = _residency_dimension(client, table)
         tags = _tags_dimension(client, table)
         enforcement = _enforcement_dimension(table, live_table, client)
-        job_dim = _jobs_dimension(client, expose_id, contract, jobs)
+        job_dim = _jobs_dimension(client, expose_id, contract, jobs, enforcement, target)
     except Exception as exc:  # noqa: BLE001 — a check that could not run is an error
         return _error(
             f"Databricks check for {target} could not run: {_failure(exc)}",

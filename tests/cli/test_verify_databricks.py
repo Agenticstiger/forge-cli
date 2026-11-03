@@ -137,10 +137,10 @@ class StubWorkspace:
         self.api_client = StubApiClient(self)
         self.calls: List[Any] = []
 
-    def add_jobs(self, name: str, count: int) -> None:
+    def add_jobs(self, name: str, count: int, **settings: Any) -> None:
         for _ in range(count):
             job_id = len(self.jobs) + 1
-            self.jobs.append({"job_id": job_id, "settings": {"name": name}})
+            self.jobs.append({"job_id": job_id, "settings": {"name": name, **settings}})
 
     def answer(self, method: str, path: str, query: Dict[str, Any]) -> Dict[str, Any]:
         assert method == "GET"
@@ -1058,3 +1058,50 @@ def test_the_real_sdk_reads_the_stand_in_workspace(tmp_path, monkeypatch):
     assert result["status"] == "mismatch", result
     assert [f["field"] for f in result["dimensions"]["structure"]["missing_fields"]] == ["region"]
     assert [f["principal"] for f in result["dimensions"]["catalog_access"]["findings"]] == ["bi"]
+
+
+# ── A job this module paused because its table is not protected ─────────
+
+
+def restricted_contract_with_job() -> Dict[str, Any]:
+    document = restricted_contract()
+    document["builds"] = contract_with_job()["builds"]
+    return document
+
+
+def test_a_job_paused_while_its_table_is_not_protected_is_a_finding(workspace):
+    contract = restricted_contract_with_job()
+    workspace.add_jobs(
+        job_name(), 1, schedule={"quartz_cron_expression": "0 0 2 * * ?", "pause_status": "PAUSED"}
+    )
+
+    result = verify(workspace, contract)
+
+    dimension = result["dimensions"]["jobs"]
+    assert dimension["status"] == "fail"
+    [finding] = dimension["findings"]
+    assert finding["build"] == "dbt_daily"
+    assert "is paused" in finding["message"] and "not protected" in finding["message"]
+    assert "run fluid apply" in finding["message"]
+    assert result["severity"]["level"] == "CRITICAL"
+
+
+def test_a_paused_job_on_a_protected_table_is_not_a_finding(workspace):
+    contract = restricted_contract_with_job()
+    bind_all(workspace, contract)
+    workspace.add_jobs(
+        job_name(), 1, schedule={"quartz_cron_expression": "0 0 2 * * ?", "pause_status": "PAUSED"}
+    )
+
+    assert verify(workspace, contract)["dimensions"]["jobs"]["status"] == "pass"
+
+
+def test_an_unpaused_job_on_an_unprotected_table_has_no_paused_finding(workspace):
+    contract = restricted_contract_with_job()
+    workspace.add_jobs(
+        job_name(),
+        1,
+        schedule={"quartz_cron_expression": "0 0 2 * * ?", "pause_status": "UNPAUSED"},
+    )
+
+    assert verify(workspace, contract)["dimensions"]["jobs"]["status"] == "pass"

@@ -353,6 +353,17 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
         held[who] = [p for p in held.get(who, []) if p != gone]
         return True, ""
 
+    m = re.match(rf"DROP\s+FUNCTION\s+(IF\s+EXISTS\s+)?{_FULL}\s*$", s, re.I)
+    if m:
+        ie, cat, sch, name = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        if full not in fake.functions:
+            return (True, "") if ie else (False, f"[ROUTINE_NOT_FOUND] {full}")
+        if fake.function_in_use(full):
+            return False, f"[FUNCTION_IN_USE] {full} is used by a row filter or a column mask"
+        del fake.functions[full]
+        return True, ""
+
     m = re.match(rf"DROP\s+TABLE\s+(IF\s+EXISTS\s+)?{_FULL}\s*$", s, re.I)
     if m:
         ie, cat, sch, name = m.groups()
@@ -849,6 +860,8 @@ class FakeDatabricks:
         a("PATCH", r"/api/2\.1/unity-catalog/schemas/([^/]+)", self._patch_schema)
         a("DELETE", r"/api/2\.1/unity-catalog/schemas/([^/]+)", self._delete_schema)
         a("GET", r"/api/2\.1/unity-catalog/functions/([^/]+)", self._get_function)
+        a("GET", r"/api/2\.1/unity-catalog/functions", self._list_functions)
+        a("GET", r"/api/2\.1/unity-catalog/tables", self._list_tables)
         a("GET", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._get_table)
         a("DELETE", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._delete_table)
         a("GET", r"/api/2\.1/unity-catalog/permissions/([a-z_]+)/([^/]+)", self._get_perms)
@@ -1041,6 +1054,41 @@ class FakeDatabricks:
             },
         }
 
+    def _list_functions(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        """The functions of one schema, a page at a time (``list_page_size``)."""
+        cat = (q.get("catalog_name") or [""])[0]
+        sch = (q.get("schema_name") or [""])[0]
+        names = sorted(n for n in self.functions if n.rsplit(".", 1)[0] == f"{cat}.{sch}")
+        return 200, self._page(names, q, "functions", lambda n: self._function_summary(n))
+
+    def _function_summary(self, full: str) -> Dict[str, Any]:
+        cat, sch, name = full.split(".")
+        return {
+            "name": name,
+            "catalog_name": cat,
+            "schema_name": sch,
+            "full_name": full,
+            "owner": self.functions[full].get("owner"),
+        }
+
+    def _list_tables(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        cat = (q.get("catalog_name") or [""])[0]
+        sch = (q.get("schema_name") or [""])[0]
+        names = sorted(n for n in self.tables if n.rsplit(".", 1)[0] == f"{cat}.{sch}")
+        return 200, self._page(
+            names, q, "tables", lambda n: {"name": n.rsplit(".", 1)[1], "full_name": n}
+        )
+
+    def _page(
+        self, names: List[str], q: Any, key: str, row: Callable[[str], Any]
+    ) -> Dict[str, Any]:
+        size = int(getattr(self, "list_page_size", 100))
+        start = int((q.get("page_token") or ["0"])[0])
+        out: Dict[str, Any] = {key: [row(n) for n in names[start : start + size]]}
+        if start + size < len(names):
+            out["next_page_token"] = str(start + size)
+        return out
+
     # -- tables
     def _get_table(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
         full = m.group(1)
@@ -1087,7 +1135,7 @@ class FakeDatabricks:
             "data_source_format": "DELTA",
             "table_id": f"tid-{full}",
             "metastore_id": "ms-fake",
-            "owner": _USER,
+            "owner": t.get("owner", _USER),
             "columns": cols,
             "properties": t["properties"],
             "comment": t.get("comment"),

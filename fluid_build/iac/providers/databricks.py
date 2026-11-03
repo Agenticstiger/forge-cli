@@ -123,6 +123,7 @@ so an existing table must be imported before the first apply.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -1182,6 +1183,40 @@ def _emit_table(
     compiled.imports.append(ImportBlock(f"databricks_sql_table.{table_key}", table.full_name))
 
 
+#: The residency precondition's own message (``_region_precondition``), and the diagnostic
+#: ``values`` entry that carries the live region (``statement: is "us-west-2"``). In ``tofu
+#: -json`` output the text is one JSON string; in human output it is wrapped, hence ``\s+``.
+_RESIDENCY_RE = re.compile(
+    r"The\s+contract\s+declares\s+binding\.location\.region\s+([a-z0-9-]+),\s+but\s+the\s+"
+    r"workspace\s+DATABRICKS_HOST\s+names\s+is\s+in\s+(\S+?)\.?\s+Residency"
+)
+_RESIDENCY_START_RE = re.compile(
+    r"The\s+contract\s+declares\s+binding\.location\.region\s+([a-z0-9-]+),"
+)
+_LIVE_VALUE_RE = re.compile(r'is\s+\\?"([a-z0-9-]+)\\?"')
+
+
+def _residency_failure(output: str) -> Optional[UnsupportedBindingError]:
+    """One clean line for a plan that fails the residency precondition: the declared region,
+    the live one and the fix. ``None`` when the output is not that failure."""
+    start = _RESIDENCY_START_RE.search(output)
+    if start is None:
+        return None
+    declared = start.group(1)
+    full = _RESIDENCY_RE.search(output)
+    live = full.group(2) if full else ""
+    if not re.fullmatch(r"[a-z0-9-]+", live):  # "(unknown)", a value not yet known, or cut off
+        value = _LIVE_VALUE_RE.search(output)
+        live = value.group(1) if value else ""
+    seen = f"in {live}" if live else "in a region the plan output does not show"
+    return _refusal(
+        "residency-region",
+        f"the contract declares binding.location.region {declared}, but the workspace "
+        f"DATABRICKS_HOST names is {seen}. Point DATABRICKS_HOST at a workspace in {declared}, "
+        "or correct binding.location.region.",
+    )
+
+
 def _region_precondition(compiled: _Compiled, cid: str, region: str) -> Dict[str, Any]:
     """The plan-time check that the workspace is in the declared ``region``.
 
@@ -1562,7 +1597,11 @@ class DatabricksIacPlugin:
         if compiled.refusals:
             raise compiled.refusals[0]
         _enforce_sovereignty(contract, compiled.tables)
-        for job, _tables in _jobs_to_pause(compiled, contract):
+        # Decided once, here: ``plan_notices`` of the same run says what this paused, so a
+        # transient read error cannot pause a job without the notice (or the reverse).
+        to_pause = _jobs_to_pause(compiled, contract)
+        self._pause_decision = (_contract_key(contract), [(j.name, t) for j, t in to_pause])
+        for job, _tables in to_pause:
             _pause(compiled, job)
         return compiled.resources
 
@@ -1723,9 +1762,15 @@ class DatabricksIacPlugin:
         it creates paused until the tables they write are protected."""
         compiled = _compile(contract, os.environ)
         notices = _use_catalog_notices(compiled)
-        for job, tables in _jobs_to_pause(compiled, contract):
+        decided = getattr(self, "_pause_decision", None)
+        self._pause_decision = None  # used once: the next run decides again
+        if decided is not None and decided[0] == _contract_key(contract):
+            paused = list(decided[1])
+        else:
+            paused = [(j.name, t) for j, t in _jobs_to_pause(compiled, contract)]
+        for name, tables in paused:
             notices.append(
-                f"job {job.name!r} is created paused (pause_status PAUSED): it writes "
+                f"job {name!r} is created paused (pause_status PAUSED): it writes "
                 f"{', '.join(sorted(tables))}, whose masks and row filter are not bound yet, and "
                 "a run before that would fill an unprotected table. The next fluid apply, once "
                 "they are bound, starts its schedule; an explicit run-now works meanwhile."
@@ -1752,6 +1797,9 @@ class DatabricksIacPlugin:
                 "DATABRICKS_HOST with DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET (a "
                 "service principal's OAuth secret), then re-run 'fluid apply'.",
             )
+        residency = _residency_failure(output or "")
+        if residency is not None:
+            return residency
         if _UNREACHABLE_RE.search(output or ""):
             return _refusal(
                 "workspace-unreachable",
@@ -1840,6 +1888,11 @@ class DatabricksIacPlugin:
             if full in live:
                 out.extend(f"{full}.{line}" for line in _changed_columns(live[full], declared))
         return out
+
+
+def _contract_key(contract: Mapping[str, Any]) -> str:
+    """A stable text of the contract, to tie a decision to the contract it was made for."""
+    return json.dumps(contract, sort_keys=True, default=str)
 
 
 def _jobs_to_pause(
