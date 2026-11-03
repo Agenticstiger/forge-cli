@@ -289,14 +289,20 @@ def _aws_contract(region):
     return {"id": "bronze.orders", "exposes": [expose]}
 
 
-def test_aws_binding_region_ending_in_a_newline_is_not_the_provider_region(monkeypatch):
+def test_aws_binding_region_ending_in_a_newline_is_refused(monkeypatch):
+    # Neither dropped (the provider would take the environment's region) nor
+    # stripped (sovereignty checks the value as written, so a stripped pin
+    # could apply a region its deniedRegions names).
     from fluid_build.iac import get_iac_plugin, provider_config
+    from fluid_build.iac.base import UnsupportedBindingError
 
-    monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
+    for name in [k for k in os.environ if k.startswith("AWS_ENDPOINT_URL")]:
+        monkeypatch.delenv(name)
     plugin = get_iac_plugin("aws")
 
-    assert provider_config(plugin, _aws_contract("eu-west-1")) == {"region": "eu-west-1"}
-    assert provider_config(plugin, _aws_contract("eu-west-1\n")) == {}
+    assert provider_config(plugin, _aws_contract("eu-west-1"))["region"] == "eu-west-1"
+    with pytest.raises(UnsupportedBindingError, match="whitespace around it"):
+        provider_config(plugin, _aws_contract("eu-west-1\n"))
 
 
 def test_aws_recorded_region_ending_in_a_newline_is_not_a_region():

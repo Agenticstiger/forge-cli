@@ -212,12 +212,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from `%0A` in a URL kept its newline: `fluid generate iac` put `region = "eu-west-1\n"` on the
   AWS provider, and a Databricks job got `branch = "main\n"` from `?branch=main%0A`. They now end
   in `\Z` (two call sites use `fullmatch`), so such a value is refused with the validator's usual
-  message, or takes the path the code already has for a value that is not a plain name: an AWS
-  binding region is left to the environment, and a product id forged from a JDBC source or
-  imported from dbt is slugified. Covered: quality-check selectors, catalog and JDBC identifiers,
-  BigQuery and GCP project ids, contract, build, federation-workspace and overlay-env ids,
-  row-filter names, Singer tap and target names, prompt profile and overlay names, mission
-  predicate paths, AWS and GCP resource names, Snowflake account segments and Databricks git refs.
+  message, or takes the path the code already has for a value that is not a plain name: a product
+  id forged from a JDBC source or imported from dbt is slugified. An AWS binding region is read
+  without the newline, as `fluid verify` already reads it, so it is still the provider's region
+  rather than being dropped in favour of the environment's. Covered: quality-check selectors,
+  catalog and JDBC identifiers, BigQuery and GCP project ids, contract, build,
+  federation-workspace and overlay-env ids, row-filter names, Singer tap and target names, prompt
+  profile and overlay names, mission predicate paths, AWS and GCP resource names, Snowflake
+  account segments and Databricks git refs.
 
 ## [0.26.0] — 2026-11-01
 
