@@ -193,6 +193,8 @@ def test_a_plugin_cannot_claim_a_retired_name(name, monkeypatch, caplog, _restor
         r for r in caplog.records if getattr(r, "evt", "") == "provider_retired_name_reserved"
     ]
     assert records and records[0].plugin == _FakeEntryPoint.value
+    # The CLI prints the message only, so the plugin must be named in it.
+    assert repr(_FakeEntryPoint.value) in records[0].getMessage()
 
 
 def test_a_plugin_claiming_redshift_does_not_replace_the_retirement_hint(

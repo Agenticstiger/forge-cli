@@ -140,12 +140,19 @@ def _claims_retired_name(name: str, who: str, logger: Optional[logging.Logger]) 
     """
     if not isinstance(name, str) or _normalize_name(name) not in RETIRED_PROVIDERS:
         return False
-    _safe_log(
-        logger,
-        logging.WARNING,
-        "provider_retired_name_reserved",
-        name=_normalize_name(name),
-        plugin=who,
+    # The plugin goes into the message itself, repr'd so control characters are
+    # escaped: the CLI's formatters print the message only, and this line is how
+    # an operator learns which package to uninstall.
+    (logger or _log).warning(
+        "provider_retired_name_reserved: %r tried to register the retired provider %r; "
+        "it was skipped",
+        who,
+        _normalize_name(name),
+        extra={
+            "evt": "provider_retired_name_reserved",
+            "_name": _normalize_name(name),
+            "plugin": who,
+        },
     )
     return True
 
