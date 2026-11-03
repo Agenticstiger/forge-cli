@@ -614,3 +614,29 @@ class TestTheUnresolvedAccountMessage:
         message = str(excinfo.value)
         assert "sts:GetCallerIdentity" in message
         assert "boto3" not in message
+
+    def test_a_contract_without_orchestration_still_applies_its_exposes(self, monkeypatch):
+        """Nothing in it needs the native plan, and tofu resolves the account itself,
+        so the planner only reports that it could not run, as on main."""
+        provider = self._provider_without_account(monkeypatch)
+        contract = _contract()
+        del contract["orchestration"]
+        with pytest.raises(ProviderError) as excinfo:
+            provider.plan(contract)
+        assert not isinstance(excinfo.value, AwsAccountUnresolvedError)
+        monkeypatch.setattr("fluid_build.cli._common.build_provider", lambda *a, **k: provider)
+        assert generate_iac.native_actions(contract, logging.getLogger("t")) == []
+
+    def test_sovereignty_is_checked_before_the_account(self, monkeypatch):
+        provider = self._provider_without_account(monkeypatch)
+        contract = _contract()
+        del contract["orchestration"]
+        contract["sovereignty"] = {
+            "jurisdiction": "EU",
+            "allowedRegions": ["eu-central-1"],
+            "enforcementMode": "strict",
+        }
+        monkeypatch.setattr("fluid_build.cli._common.build_provider", lambda *a, **k: provider)
+        with pytest.raises(Exception) as excinfo:
+            generate_iac.native_actions(contract, logging.getLogger("t"))
+        assert generate_iac._is_sovereignty_refusal(excinfo.value)

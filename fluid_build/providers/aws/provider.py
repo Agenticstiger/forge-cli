@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NoReturn, Optional
 
 from fluid_build.providers._plan_validation import PlanValidationError
 from fluid_build.providers.base import (
@@ -176,16 +176,13 @@ class AwsProvider(BaseProvider):
             mode=mode,
         )
 
-        if not self.account_id:
-            # Before any name is derived from it: with ``None`` the planner
-            # builds ``None-fluid-staging`` and the validator refuses the plan
-            # with a message about a bucket, hiding the cause. ``generate iac``
-            # passes a placeholder account, so it never reaches this.
-            raise AwsAccountUnresolvedError(account_unresolved_message())
-
         try:
-            # Validate sovereignty constraints (FLUID 0.7.1)
+            # Validate sovereignty constraints (FLUID 0.7.1). First, and with no
+            # account needed: this is the only place AWS enforces jurisdiction.
             self._validate_sovereignty(contract)
+
+            if not self.account_id:
+                self._no_plan_without_account(contract)
 
             # ``plan_actions`` constructs an :class:`AwsPlanner` and
             # calls :meth:`BasePlanner.plan` which already runs the
@@ -325,6 +322,26 @@ class AwsProvider(BaseProvider):
             # operator most needs in the log was the one missing from it.
             self.err_kv(event="sovereignty_violation", error=str(e))
             raise ProviderError(str(e)) from e
+
+    def _no_plan_without_account(self, contract: Mapping[str, Any]) -> NoReturn:
+        """No account resolved, so no name can be derived: stop before one is.
+
+        With ``None`` the planner builds ``None-fluid-staging`` and the validator
+        refuses the plan with a message about a bucket, hiding the cause. A
+        contract that declares orchestration (a schedule, triggers or tasks)
+        needs this plan, since its Lambda, permission and schedule come from
+        nowhere else, so the gap is refused by name. Any other contract's
+        resources come from its exposes, which tofu applies with its own
+        credentials: the planner reports that it could not run, and
+        ``native_actions`` treats that as best-effort, as before. ``generate
+        iac`` passes a placeholder account, so it never reaches this.
+        """
+        orchestration = contract.get("orchestration")
+        if isinstance(orchestration, Mapping) and any(
+            orchestration.get(key) for key in ("schedule", "triggers", "tasks")
+        ):
+            raise AwsAccountUnresolvedError(account_unresolved_message())
+        raise ProviderError(f"native AWS plan skipped: {account_unresolved_message()}")
 
     def _plan_orchestration(self, contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
         """

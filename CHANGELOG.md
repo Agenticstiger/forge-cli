@@ -168,11 +168,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already refused it). The scheduled Lambda only logs each
   task and runs no build, and both roles it names (`fluid-workflow-execution`,
   `EventBridgeSchedulerRole`) are never created, so every plan that emits it now warns
-  `schedule_placeholder_lambda`. An AWS account that cannot be resolved (no `AWS_ACCOUNT_ID`, no
-  credentials for `sts:GetCallerIdentity`) is refused by name, before any name is derived from it,
-  rather than as a Glue or S3 name `None-fluid-staging` the validator would reject, and says so
-  when the cause is a missing boto3 (`pip install 'data-product-forge[aws]'`) rather than
-  credentials.
+  `schedule_placeholder_lambda`. When no AWS account can be resolved (no `AWS_ACCOUNT_ID`, no
+  credentials for `sts:GetCallerIdentity`), a contract that declares orchestration (a schedule,
+  triggers or tasks) is refused by name, before any name is derived from it, rather than as a Glue
+  or S3 name `None-fluid-staging` the validator would reject, and the message says so when the
+  cause is a missing boto3 (`pip install 'data-product-forge[aws]'`) rather than credentials. A
+  contract without orchestration needs no native plan and applies its exposes as before; the
+  sovereignty check still runs first either way.
 - **The AWS plan validator refused dotted S3 bucket names.** S3 allows lowercase letters, digits,
   dots and hyphens (3-63 characters, a letter or digit at each end, no `..`, `.-` or `-.`, not
   shaped like an IP address); the validator allowed no dot, which was harmless while its refusals
