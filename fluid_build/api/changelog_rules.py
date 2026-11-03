@@ -820,9 +820,11 @@ def _diff_container_children(
         before, after = old.get(key), new.get(key)
         if isinstance(before, Mapping) or isinstance(after, Mapping):
             changes.extend(
+                # The slot name wins over any `name` the child carries, so the
+                # child is never dropped or reported at the wrong path.
                 _diff_nested_fields(
-                    [{"name": key, **before}] if isinstance(before, Mapping) else [],
-                    [{"name": key, **after}] if isinstance(after, Mapping) else [],
+                    [{**before, "name": key}] if isinstance(before, Mapping) else [],
+                    [{**after, "name": key}] if isinstance(after, Mapping) else [],
                     expose_id=expose_id,
                     path_prefix=path_prefix,
                 )
