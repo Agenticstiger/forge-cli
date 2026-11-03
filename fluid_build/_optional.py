@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 """Optional-dependency gate: one call, one install line, no traceback.
 
 ``require("litellm", "litellm", "fluid ai setup")`` returns the imported module

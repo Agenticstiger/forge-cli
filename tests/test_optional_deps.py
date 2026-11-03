@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 """Optional-dependency failures say exactly what to install (diet plan, step 5).
 
 Every test here makes a package *look* uninstalled, with the same two moves a
