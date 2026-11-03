@@ -1183,6 +1183,40 @@ def _emit_table(
     compiled.imports.append(ImportBlock(f"databricks_sql_table.{table_key}", table.full_name))
 
 
+#: The residency precondition's own message (``_region_precondition``), and the diagnostic
+#: ``values`` entry that carries the live region (``statement: is "us-west-2"``). In ``tofu
+#: -json`` output the text is one JSON string; in human output it is wrapped, hence ``\s+``.
+_RESIDENCY_RE = re.compile(
+    r"The\s+contract\s+declares\s+binding\.location\.region\s+([a-z0-9-]+),\s+but\s+the\s+"
+    r"workspace\s+DATABRICKS_HOST\s+names\s+is\s+in\s+(\S+?)\.?\s+Residency"
+)
+_RESIDENCY_START_RE = re.compile(
+    r"The\s+contract\s+declares\s+binding\.location\.region\s+([a-z0-9-]+),"
+)
+_LIVE_VALUE_RE = re.compile(r'is\s+\\?"([a-z0-9-]+)\\?"')
+
+
+def _residency_failure(output: str) -> Optional[UnsupportedBindingError]:
+    """One clean line for a plan that fails the residency precondition: the declared region,
+    the live one and the fix. ``None`` when the output is not that failure."""
+    start = _RESIDENCY_START_RE.search(output)
+    if start is None:
+        return None
+    declared = start.group(1)
+    full = _RESIDENCY_RE.search(output)
+    live = full.group(2) if full else ""
+    if not re.fullmatch(r"[a-z0-9-]+", live):  # "(unknown)", a value not yet known, or cut off
+        value = _LIVE_VALUE_RE.search(output)
+        live = value.group(1) if value else ""
+    seen = f"in {live}" if live else "in a region the plan output does not show"
+    return _refusal(
+        "residency-region",
+        f"the contract declares binding.location.region {declared}, but the workspace "
+        f"DATABRICKS_HOST names is {seen}. Point DATABRICKS_HOST at a workspace in {declared}, "
+        "or correct binding.location.region.",
+    )
+
+
 def _region_precondition(compiled: _Compiled, cid: str, region: str) -> Dict[str, Any]:
     """The plan-time check that the workspace is in the declared ``region``.
 
@@ -1763,6 +1797,9 @@ class DatabricksIacPlugin:
                 "DATABRICKS_HOST with DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET (a "
                 "service principal's OAuth secret), then re-run 'fluid apply'.",
             )
+        residency = _residency_failure(output or "")
+        if residency is not None:
+            return residency
         if _UNREACHABLE_RE.search(output or ""):
             return _refusal(
                 "workspace-unreachable",
