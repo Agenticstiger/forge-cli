@@ -95,7 +95,7 @@ def _get_litellm() -> Any:
             "copilot_litellm_unavailable",
             "litellm is not installed (this is a hard dependency).",
             suggestions=[
-                "pip install --upgrade fluid-build",
+                "pip install 'data-product-forge[litellm]'",
                 "Or install litellm directly: pip install litellm",
             ],
         ) from exc

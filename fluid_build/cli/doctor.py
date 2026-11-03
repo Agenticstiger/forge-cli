@@ -1203,7 +1203,7 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
                 "category": "ai",
                 "status": "⚠️  Not installed (optional)",
                 "ok": True,
-                "details": "Install with: pip install 'fluid-build[litellm]'",
+                "details": "Install with: pip install 'data-product-forge[litellm]'",
             }
         )
 
