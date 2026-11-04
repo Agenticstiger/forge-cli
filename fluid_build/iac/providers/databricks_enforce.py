@@ -622,17 +622,19 @@ def preview(
         steps += [("after apply", s) for s in plan.drop]
         if steps:
             lines.append((plan, steps))
-    if not lines:
-        return
-    say("\n  Unity Catalog masks and row filters (run on the SQL warehouse, not by OpenTofu):")
-    for plan, steps in lines:
-        say(f"  {plan.full_name}" + ("" if plan.exists else " (not created yet)"))
-        for when, step in steps:
-            note = " [widens access]" if step.widens else ""
-            say(f"    {when}{note}: {step.what}")
-            if step.statement:
-                say(f"      {step.statement}")
-    say("    dry-run: none of these statements ran.")
+    if lines:
+        say("\n  Unity Catalog masks and row filters (run on the SQL warehouse, not by OpenTofu):")
+        for plan, steps in lines:
+            say(f"  {plan.full_name}" + ("" if plan.exists else " (not created yet)"))
+            for when, step in steps:
+                note = " [widens access]" if step.widens else ""
+                say(f"    {when}{note}: {step.what}")
+                if step.statement:
+                    say(f"      {step.statement}")
+    # What a successful apply's post_apply then drops, worked out as it does it.
+    drop_orphan_functions(pair, targets, say, dry_run=True)
+    if lines:
+        say("    dry-run: none of these statements ran.")
 
 
 def pre_apply(
@@ -802,13 +804,20 @@ def _orphans(
     return [n for n in names if n.startswith("fluid_") and rx.fullmatch(n) and n not in keep]
 
 
-def drop_orphan_functions(session: Session, targets: Sequence[Target], say: Say) -> None:
+def drop_orphan_functions(
+    session: Session, targets: Sequence[Target], say: Say, *, dry_run: bool = False
+) -> None:
     """Drop this module's functions that a changed contract left behind, after a successful apply.
 
     A function is dropped only when its name is this table's fluid_ pattern
     (:func:`_orphans`), it is not one the contract expects now, and no table in its schema has it
     as a row filter or column mask (every table of the schema is read first). If the schema
     cannot be read completely, nothing is dropped in it. Each drop is printed.
+
+    ``dry_run`` (``fluid apply --mode dry-run``) prints what the apply would drop and runs no
+    statement. It works on the bindings the apply leaves: a table the contract manages carries
+    the functions it expects (post_apply binds them before it drops anything), so the functions
+    bound there now count only for the tables the contract does not manage.
     """
     schemas: Dict[Tuple[str, str], List[Target]] = {}
     for target in targets:
@@ -826,6 +835,7 @@ def drop_orphan_functions(session: Session, targets: Sequence[Target], say: Say)
         if e.deny_all is not None:
             expected.add(_bare(e.deny_all.function.full_name))
     client = session.client
+    managed = {target.full_name.lower() for target in targets}
     for (catalog, schema), members in sorted(schemas.items()):
         where = f"{catalog}.{schema}"
         try:
@@ -840,18 +850,21 @@ def drop_orphan_functions(session: Session, targets: Sequence[Target], say: Say)
                 live = read_table(client, full)
                 if live is None:
                     continue
-                bound.add(_bare((live.get("row_filter") or {}).get("function_name")))
                 live_cols = _live_columns(live)
-                bound |= {
-                    _bare((c.get("mask") or {}).get("function_name")) for c in live_cols.values()
-                }
+                if not (dry_run and full.lower() in managed):
+                    bound.add(_bare((live.get("row_filter") or {}).get("function_name")))
+                    bound |= {
+                        _bare((c.get("mask") or {}).get("function_name"))
+                        for c in live_cols.values()
+                    }
                 columns[full.rsplit(".", 1)[-1].lower()] = [
                     str(c["name"]) for c in live_cols.values()
                 ]
             listed = _list_named(client, "/api/2.1/unity-catalog/functions", query, "functions")
         except Exception as exc:  # noqa: BLE001 — unknown binding: drop nothing
+            what = "not listed" if dry_run else "not dropped"
             say(
-                f"  note: orphan functions in {where} not dropped: its tables or functions could "
+                f"  note: orphan functions in {where} {what}: its tables or functions could "
                 f"not be read ({type(exc).__name__}: {scrub(exc)})."
             )
             continue
@@ -865,16 +878,18 @@ def drop_orphan_functions(session: Session, targets: Sequence[Target], say: Say)
         for target in members:
             table = target.full_name.split(".")[2]
             for name in _orphans(names, table, columns.get(table.lower(), ()), keep):
-                if name not in settled and _drop_if_owned(session, f"{where}.{name}", say):
+                if name not in settled and _drop_if_owned(
+                    session, f"{where}.{name}", say, dry_run=dry_run
+                ):
                     settled.append(name)
 
 
-def _drop_if_owned(session: Session, full: str, say: Say) -> bool:
+def _drop_if_owned(session: Session, full: str, say: Say, *, dry_run: bool = False) -> bool:
     """Drop one orphan function when the deploy identity owns it, printing what happened.
 
     ``True`` when it is settled: dropped, or left (and named) because another identity owns it
     or the owner cannot be read, so it is not tried again for another table. ``False`` when the
-    ``DROP`` itself failed.
+    ``DROP`` itself failed. ``dry_run`` says what it would do and runs nothing.
     """
     try:
         owner = str((read_function(session.client, full) or {}).get("owner") or "")
@@ -883,7 +898,10 @@ def _drop_if_owned(session: Session, full: str, say: Say) -> bool:
         owner, me = "", ""
     if not me or not owner_matches(owner, {me}):
         why = f"owned by {owner}, not by the deploy identity" if owner else "owner unknown"
-        say(f"  left function {full}: {why}")
+        say(f"  {'would leave' if dry_run else 'left'} function {full}: {why}")
+        return True
+    if dry_run:
+        say(f"  would drop superseded function {full} (after the apply, if it succeeds)")
         return True
     try:
         session.runner.run(f"DROP FUNCTION IF EXISTS {quote_table(full)}")

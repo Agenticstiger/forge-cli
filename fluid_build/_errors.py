@@ -98,6 +98,11 @@ def doc_url(topic: Optional[str] = None) -> str:
     return f"{_DOC_BASE}/{_DOC_ROUTES.get(topic or '', _DOC_FALLBACK)}"
 
 
+#: The longest panel title :meth:`FluidUserError.render` keeps on the border: the panel is
+#: 100 columns wide, less its corners and padding.
+_TITLE_MAX = 90
+
+
 @dataclass
 class FluidUserError(Exception):
     """Base class for typed user-facing errors. Emit via ``render`` / ``as_json``."""
@@ -146,6 +151,12 @@ class FluidUserError(Exception):
         buf = StringIO()
         console = Console(file=buf, force_terminal=color, no_color=not color, width=100)
         body = Text()
+        title = f"✗ {self.what}"
+        if len(title) > _TITLE_MAX or "\n" in self.what:
+            # A panel title is cut at the border, not wrapped: a long ``what`` (a refusal that
+            # lists every finding) goes in the body, whole, and the title names the error.
+            body.append(f"{self.what}\n", style="bold")
+            title = f"✗ {self.code}"
         if self.where:
             body.append("in   ", style="dim")
             body.append(f"{self.where}\n")
@@ -155,7 +166,7 @@ class FluidUserError(Exception):
         body.append(f"{self.fix}\n")
         body.append("doc  ", style="dim")
         body.append(f"{self.doc}")
-        console.print(Panel(body, title=f"✗ {self.what}", border_style="red"))
+        console.print(Panel(body, title=title, border_style="red"))
         return buf.getvalue()
 
     def _render_plain(self) -> str:
