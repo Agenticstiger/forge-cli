@@ -350,6 +350,12 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
     # authoritative semantic validation; Forge must not mistake DDL for a transform.
     if not re.match(r"(?is)^\s*SELECT\b", sql) or ";" in sql:
         raise ValueError("Managed Flink properties.sql must be a single SELECT without semicolons")
+    # A /*+ OPTIONS(...) */ hint overrides the source's connector options at query
+    # time (dynamic table options are on by default), so contract SQL could point
+    # the Kafka source at another broker or wire a config provider that reads the
+    # pod's secrets. Flink reads a hint only from the literal "/*+" token.
+    if "/*+" in sql:
+        raise ValueError("Managed Flink properties.sql must not contain SQL hints (/*+ ... */)")
     iceberg = binding.get("icebergConfig") or {}
     if iceberg.get("writeVersion", 2) != 2:
         raise ValueError("Managed Flink requires Iceberg format version 2")

