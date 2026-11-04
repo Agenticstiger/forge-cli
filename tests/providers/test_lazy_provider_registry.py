@@ -533,6 +533,8 @@ def test_a_spoofed_first_party_distribution_is_still_reserved(
         P.discover_providers(force=True)
     assert not spoof.loaded
     assert "provider_builtin_name_reserved" in caplog.text
+    # It must not be told how to grant itself.
+    assert "data-product-forge:local" not in caplog.text
     assert P.PROVIDERS.pending("local").source == "builtin"
 
 
@@ -692,3 +694,30 @@ def test_keys_is_a_set_like_view(_restore_registry):
     assert keys & {"gcp", "nope"} == {"gcp"}
     assert {"aws", "gcp"} <= keys
     assert sorted(keys) == sorted(_BUILTINS)
+
+
+def test_a_provider_blocked_after_discovery_is_never_imported(monkeypatch, _restore_registry):
+    ep = _EP("kube", dist="acme-fluid-kube", value="acme.kube:Kube")
+    ep.load = lambda: (setattr(ep, "loaded", True), _Replacement)[1]
+    _discover_with(monkeypatch, ep)
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "kube")
+    assert P.PROVIDERS.get("kube") is None
+    assert not ep.loaded
+    assert "kube" in P.POLICY_BLOCKED
+
+
+@pytest.mark.parametrize(
+    "module, qualname",
+    [
+        ("fluid_build.providers.gcp.nonexistent", "GcpProvider"),
+        ("fluid_build.providers.gcp.provider", "NoSuchClass"),
+    ],
+)
+def test_a_class_naming_no_real_in_tree_class_is_refused(module, qualname, _restore_registry):
+    import fluid_build.providers.gcp.provider  # noqa: F401  (loaded, so only the name decides)
+
+    P.PROVIDERS.clear()
+    fake = _evil_class(module)
+    fake.__qualname__ = qualname
+    P.register_provider("gcp", fake)
+    assert not P.PROVIDERS.is_loaded("gcp")

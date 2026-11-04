@@ -134,6 +134,15 @@ class _ProviderMap(dict):
             pend = self._pending.get(name)
             if pend is None:
                 return
+            from fluid_build.plugin_manager import is_allowed
+
+            if not is_allowed(name):
+                # Checked again before the import: a blocklist loaded after
+                # discovery (FLUID_SECRETS_FILE at apply time) must not run the
+                # plugin's code, not merely leave it unserved.
+                self._pending.pop(name, None)
+                POLICY_BLOCKED.add(name)
+                return
             _RESOLVING.add(name)
             try:
                 obj = pend.load()
@@ -395,7 +404,8 @@ def _claims_reserved_name(
             hint = "; several distributions are granted this name, so none was loaded"
         else:
             dist = granted_distribution(ep) if ep is not None else None
-            if dist:
+            # A spoofed ``Name: data-product-forge`` must not be told how to grant itself.
+            if dist and re.sub(r"[-_.]+", "-", dist).lower() != _FIRST_PARTY_DIST:
                 # %r-formatted by the caller below: a distribution name is
                 # plugin-controlled text and must not print raw into a log line.
                 hint = f"; to allow it, add {f'{dist}:{cname}'!r} to FLUID_PLUGINS_ALLOWLIST"
@@ -786,12 +796,13 @@ def _builtin_registration_refused(cname: str, provider: Any) -> bool:
     module = sys.modules.get(mod)
     qual = getattr(provider, "__qualname__", None)
     if module is None or not isinstance(qual, str) or "<locals>" in qual:
-        return False
+        # A module that is not loaded, or a class it cannot name: not provably in-tree.
+        return True
     obj: Any = module
     for part in qual.split("."):
         obj = getattr(obj, part, None)
-    # In-tree module that does hold a class by that name, but a different one: a spoof.
-    return obj is not None and obj is not provider
+    # Only the class the in-tree module really defines under that name passes.
+    return obj is not provider
 
 
 def provider_origin(name: str) -> Dict[str, Any]:
