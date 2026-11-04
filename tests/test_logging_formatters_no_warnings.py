@@ -39,7 +39,6 @@ import warnings
 
 import pytest
 
-from fluid_build.logging_utils import JsonFormatter
 from fluid_build.structured_logging import StructuredFormatter, configure_structured_logging
 
 
@@ -69,16 +68,6 @@ def test_structured_formatter_emits_no_warnings():
     payload = json.loads(out)
     assert payload["message"] == "probe message"
     assert payload["timestamp"].endswith("Z")
-
-
-def test_json_formatter_emits_no_warnings():
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        out = _format_one(JsonFormatter())
-    payload = json.loads(out)
-    assert payload["message"] == "probe message"
-    # naive-UTC seconds-precision shape, e.g. 2026-07-17T21:22:12
-    assert "T" in payload["time"] and "+" not in payload["time"]
 
 
 # ── Pin 2: the full leaked-formatter + in-memory MCP scenario terminates ───

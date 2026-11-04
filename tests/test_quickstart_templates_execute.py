@@ -23,7 +23,7 @@ engine emitted no DDL, so nothing created a relation under any name), on
 template's own CSV did not contain.
 
 This drives the real CLI as a subprocess and the real DuckDB -- `platform:
-local` is DuckDB throughout (`providers/local/{local,ducksql,mocks}.py`) --
+local` is DuckDB throughout (`providers/local/local.py`) --
 rather than asserting on emitter output, because the whole failure class was
 invisible to string assertions.
 

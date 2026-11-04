@@ -908,25 +908,6 @@ def _overrides_warehouse(runtime: IcebergSinkPlan) -> bool:
     return _overrides_catalog_property(runtime, "warehouse")
 
 
-def _reaching_catalog_type(info: Any, runtime: IcebergSinkPlan) -> Optional[str]:
-    """The catalog ``type`` the worker actually receives, or ``None``.
-
-    The derived value when the runner derives (``None`` for a catalog reached by
-    ``catalog-impl``), then every override map in merge order, the last one
-    winning, as the runner merges them. A hand-written config therefore decides
-    for itself: its ``type`` is what reaches the worker, not the expose's kind.
-    """
-    reaching: Optional[str] = None
-    if runtime.derives and not info.catalog_impl:
-        reaching = info.runtime_type
-    for _label, mapping in runtime.overrides:
-        if runtime.impl_key in mapping:
-            reaching = None
-        if runtime.type_key in mapping:
-            reaching = str(mapping[runtime.type_key] or "").strip().lower() or None
-    return reaching
-
-
 def _wire_catalog(info: CatalogKind) -> str:
     """The catalog the worker builds from ``info``'s derived selector.
 
