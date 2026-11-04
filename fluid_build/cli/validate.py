@@ -1186,6 +1186,9 @@ def _run_contract_rules(
                 "the contract was NOT checked for a continuous trigger on a batch build"
             )
 
+        # --- An id the build phase refuses (WARNING) -----------------------
+        _build_id_check(validation_result, contract)
+
         # --- Packaging checks (RFC-packaging-modes.md file 9) ---------------
         # ``fluid validate`` had NO packaging awareness: a `shared` block with
         # no `pool` validated clean and then failed at `fluid plan` with an
@@ -1304,6 +1307,32 @@ def _databricks_binding_check(validation_result, contract: Mapping[str, Any]) ->
         validation_result.is_valid = False
     for msg in warnings:
         validation_result.add_warning(msg)
+
+
+def _build_id_check(validation_result, contract: Mapping[str, Any]) -> None:
+    """A ``contract.id`` or ``builds[].id`` the build phase refuses, as a warning.
+
+    The schema's ``$defs.identifier`` admits ids the build phase refuses
+    (``1orders``, or more than 128 characters), and the two grammars stay
+    different by decision. ``fluid apply`` in a build mode refuses such an id
+    before it applies anything, with the same rule
+    (``build_runners._ids.validate_build_ids``). A warning, not an error: plain
+    validate passes and ``--strict`` fails. A crash in the check is reported,
+    never swallowed.
+    """
+    try:
+        from fluid_build.build_runners._ids import build_id_warning
+
+        message = build_id_warning(contract)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_warning(
+            f"Build-id check could not run ({type(exc).__name__}: {exc}); "
+            "contract.id and builds[].id were NOT checked against the ids the build "
+            "phase accepts"
+        )
+        return
+    if message is not None:
+        validation_result.add_warning(message)
 
 
 def _duplicate_contract_id_errors(contract: Mapping[str, Any]) -> List[str]:

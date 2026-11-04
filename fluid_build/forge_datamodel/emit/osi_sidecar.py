@@ -93,14 +93,14 @@ def validate_osi_document(document: Dict[str, Any]) -> List[str]:
     Returns a sorted list of human-readable issue strings (empty when
     conformant). ``jsonschema`` is imported lazily — this module sits on
     the forge pipeline path, not the CLI cold path, but there is no
-    reason to tax importers that never validate.
+    reason to tax importers that never validate. A ``pattern``'s ``$`` is
+    the end of the value, as ECMA-262 reads it.
     """
-    import jsonschema
+    from fluid_build.schema_manager import schema_validator
 
     schema = _load_ossie_schema()
-    validator_cls = jsonschema.validators.validator_for(schema)
     errors = sorted(
-        validator_cls(schema).iter_errors(document),
+        schema_validator(schema).iter_errors(document),
         key=lambda e: ([str(p) for p in e.absolute_path], e.message),
     )
     return [f"{'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors]

@@ -46,11 +46,26 @@ def requires_respx(reason: str = "respx not installed") -> Any:
     return pytest.mark.skipif(respx is None, reason=reason)
 
 
+def _list_orchestrator(monkeypatch: pytest.MonkeyPatch, host: str) -> None:
+    """Name a mock orchestrator in the operator allowlist, as its owner would.
+
+    The unit suite replaces safe_http's pin hook with a no-op (tests/conftest.py),
+    so the deployment-host request guard sees this name where production sees
+    the IP the request was pinned to. A name that does not resolve is no address
+    the guard can allow, so it is refused unless listed. Listing it keeps the
+    link-local refusal in force.
+    """
+    from fluid_build.build_runners._deployment_host_policy import ALLOWLIST_ENV
+
+    monkeypatch.setenv(ALLOWLIST_ENV, host)
+
+
 @pytest.fixture
-def airbyte_mock() -> Iterator["AirbyteMockServer"]:
+def airbyte_mock(monkeypatch: pytest.MonkeyPatch) -> Iterator["AirbyteMockServer"]:
     """In-memory Airbyte API. Tests mutate state via ``airbyte_mock.create_source(...)``;
     runner code under test sees realistic CRUD responses.
     """
+    _list_orchestrator(monkeypatch, "airbyte.test")
     server = AirbyteMockServer()
     with respx.mock(base_url="https://airbyte.test", assert_all_called=False) as router:
         server.attach(router)
@@ -58,7 +73,8 @@ def airbyte_mock() -> Iterator["AirbyteMockServer"]:
 
 
 @pytest.fixture
-def kafka_connect_mock() -> Iterator["KafkaConnectMockServer"]:
+def kafka_connect_mock(monkeypatch: pytest.MonkeyPatch) -> Iterator["KafkaConnectMockServer"]:
+    _list_orchestrator(monkeypatch, "kafka-connect.test")
     server = KafkaConnectMockServer()
     with respx.mock(base_url="http://kafka-connect.test:8083", assert_all_called=False) as router:
         server.attach(router)
