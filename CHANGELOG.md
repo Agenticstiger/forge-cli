@@ -546,6 +546,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into `main.tf.json`. The module's allowlists now end in `\Z`, so such a name is refused with
   `Invalid SQL identifier: 'spectrum_events\n'`. That includes a name that reaches it with a
   trailing newline from an environment variable or a file; strip the value where it is set.
+
+- **The acquisition orchestrator check judged a second DNS answer, not the address the config
+  went to.** For kafka_connect, debezium and airbyte, the per-request guard that keeps a
+  contract-named `deployment.server_url` from receiving the connector config, resolved source
+  password included, unless its host is private, loopback or listed in
+  `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST`, resolved the hostname again instead of looking at
+  the IP `safe_httpx_client` had pinned the connection to. A name that answered the two lookups
+  differently (DNS rebinding), or a non-ASCII name that Python's resolver spells as IDNA2003 and
+  httpx as IDNA2008 (`faß.de` is `fass.de` to one and `xn--fa-hia.de` to the other), passed as
+  private while the config went to an unlisted public address, and a listed name could be sent
+  to instance metadata the same way. The guard now judges the pinned address. The name still
+  decides the allowlist, the address decides public or private, a link-local address is refused
+  even for a listed name, and the refusal names both: `host 'connect.example.com', connecting to
+  '93.184.216.34', is public`. A URL that cannot be parsed, such as `http://[::1`, is refused with
+  "it has no host" where it raised `ValueError`.
+
 ### Upgrade notes
 
 - A contract with a column typed `array`, `struct`, `map`, `object`, `record` or `row` (or
