@@ -621,6 +621,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project dotenv file cannot point them elsewhere while `FLUID_LLM_API_KEY` or a stored key is in
   play, as for every other provider endpoint.
 
+- **Cloud metadata endpoints outside link-local passed as internal.** The checks that allow an
+  internal endpoint but never instance metadata (the acquisition orchestrator guard for
+  kafka_connect, debezium and airbyte, and the OpenLineage emitter) refused only link-local and
+  unspecified addresses. AWS's IPv6 instance metadata `fd00:ec2::254`, the EKS Pod Identity
+  agent's `fd00:ec2::23`, GCP's IPv6 `fd20:ce::254`, Oracle Cloud's IPv6 `fd00:c1::a9fe:a9fe` and
+  Alibaba Cloud's `100.100.100.200` sit in ULA or CGNAT space and were allowed like any private
+  host, even with no allowlist entry. These addresses, and any IPv4-mapped (`::ffff:...`) or
+  NAT64 (`64:ff9b::/96`) address that carries a link-local or metadata address, are now refused
+  even when listed. Their ranges stay allowed: a Tailscale tailnet (CGNAT, `100.100.100.100`
+  included) or an IPv6 cluster on ULA addresses needs no change.
+
 ### Upgrade notes
 
 - New validate warning, so `--strict` fails: a contract with builds whose `contract.id` or a
