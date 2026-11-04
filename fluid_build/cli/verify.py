@@ -1436,12 +1436,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     # so its parent is NOT the project root.
     _hydrate_dotenv_into_environ(Path.cwd(), getattr(args, "env", None))
 
-    from fluid_build.streaming.compiler import compile_contract
+    from fluid_build.cli.plan import compile_managed_streaming
 
-    try:
-        streaming = compile_contract(contract)
-    except ValueError as exc:
-        raise CLIError(1, "verify_streaming_invalid", {"error": str(exc)}) from exc
+    streaming = compile_managed_streaming(contract, logger, command="verify")
     if streaming:
         from fluid_build.streaming.runtime import verify as verify_streaming
 

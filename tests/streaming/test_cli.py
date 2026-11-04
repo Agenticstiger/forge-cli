@@ -224,3 +224,40 @@ def test_generated_filenames_do_not_collide_between_namespaces(contract, tmp_pat
     for record in records:
         resources = list(yaml.safe_load_all((out / record["resources"]).read_text()))
         assert resources[1]["metadata"]["annotations"]["fluid.build/build"] == record["build"]
+
+
+def _set_trigger_null(contract):
+    contract["builds"][0]["execution"]["trigger"] = None
+
+
+def _set_execution_string(contract):
+    contract["builds"][0]["execution"] = "x"
+
+
+def _set_builds_int(contract):
+    contract["builds"] = 3
+
+
+def _set_uri_int(contract):
+    contract["exposes"][0]["binding"]["location"]["uri"] = 8181
+
+
+@pytest.mark.parametrize(
+    "mutate", [_set_trigger_null, _set_execution_string, _set_builds_int, _set_uri_int]
+)
+@pytest.mark.parametrize("command", ["apply", "verify"])
+def test_a_schema_invalid_managed_contract_is_a_typed_refusal(contract, tmp_path, mutate, command):
+    """compile_contract runs before the gate; a malformed shape must not crash it."""
+    mutate(contract)
+    source = tmp_path / "contract.fluid.yaml"
+    source.write_text(yaml.safe_dump(contract))
+    argv = [command, str(source)] + (["--yes"] if command == "apply" else [])
+    args = build_parser().parse_args(argv)
+    run = {"apply": apply, "verify": verify}[command]
+    with (
+        patch.object(Kubectl, "command", side_effect=AssertionError("kubectl ran")),
+        pytest.raises(CLIError) as refused,
+    ):
+        run(args, logging.getLogger("test"))
+    assert refused.value.event in (f"{command}_contract_invalid", "apply_contract_invalid")
+    assert refused.value.context["error_count"] >= 1
