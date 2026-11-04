@@ -66,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *Why:* the base install resolved to 88 packages (Linux, Python 3.12) for a command line whose
   core commands need none of these three; litellm alone was 30 of them.
   *Numbers* (`uv pip compile`, base install, no extras, packages before to after): Linux Python 3.12
-  88 to 41, Linux Python 3.10 86 to 45, Windows Python 3.12 89 to 41. A bare install is about
+  88 to 41, Linux Python 3.10 86 to 45, Windows Python 3.12 89 to 40. A bare install is about
   68 MB of site-packages, and `build_parser()` imports 842 modules on it.
 
 - **Every Databricks table now gets tag assignments.** A contract without labels used to make

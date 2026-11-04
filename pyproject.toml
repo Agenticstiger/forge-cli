@@ -359,9 +359,15 @@ litellm = [
 # imports ``jwt`` directly. Floor 2.15.0: every release up to 2.14.0 has
 # advisories on the PyJWKClient/decode path auth.py uses (e.g.
 # GHSA-ffc3-869f-jxw9); [crypto] for the RS256/ES256/EdDSA verifiers.
+#
+# starlette and uvicorn are declared because the output-port transport
+# (fluid_build/output_ports/mcp/_transport.py) imports them directly; mcp
+# requires both, so they add nothing to the install. Floors as mcp states them.
 mcp = [
   "mcp>=1.30,!=2.0.*,!=2.1.*,<3.0",
   "pyjwt[crypto]>=2.15.0",
+  "starlette>=0.27",
+  "uvicorn>=0.31.1",
 ]
 
 # OpenLineage run-event emission (``OPENLINEAGE_URL``, the SDK conformance
@@ -386,8 +392,13 @@ mcp = [
 #   PyPI:   https://pypi.org/project/openlineage-python/
 #   GitHub: https://github.com/OpenLineage/OpenLineage/tree/main/client/python
 #   Spec:   https://openlineage.io/spec/2-0-2/OpenLineage.json
+#
+# python-dateutil is declared because the event-time check in
+# build_runners/_lineage.py imports it directly; openlineage-python requires it
+# (same floor), so it adds nothing to the install.
 lineage = [
   "openlineage-python>=1.52",
+  "python-dateutil>=2.8.2",
 ]
 
 # AI + MCP together: restores the pre-0.28.0 base behaviour (the
@@ -805,14 +816,10 @@ DEP001 = [
   "sklearn",
   "openapi_spec_validator",
 ]
-# Soft imports that degrade when the package is absent, so no extra declares them:
+# A soft import that degrades when the package is absent, so no extra declares it:
 #   opentelemetry (observability/tracing.py, cli/_ux_telemetry.py: tracing is a
-#   no-op without it), python-dateutil (the lineage event-time check falls back
-#   to now), packaging (plugin-version checks fall back to the legacy bounds).
-#   starlette / uvicorn are the MCP output-port transport, pinned by mcp itself.
-# TODO(PR D): once mcp / openlineage-python live in their extras, declare
-# starlette, uvicorn in ``[mcp]`` and python-dateutil in ``[lineage]``.
-DEP003 = ["opentelemetry", "dateutil", "packaging", "starlette", "uvicorn"]
+#   no-op without it).
+DEP003 = ["opentelemetry"]
 # Used only on a dev path, never a hard requirement of the installed CLI:
 #   pytest: api/conformance/runner.py runs inside a pytest session and calls
 #   pytest.skip; tomli: fluid_build/__init__.py version fallback for a source

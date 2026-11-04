@@ -4,7 +4,6 @@ attrs
 certifi
 cffi
 click
-colorama
 cryptography
 h11
 httpcore

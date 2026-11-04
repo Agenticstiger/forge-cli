@@ -50,7 +50,7 @@ BASELINES = Path(__file__).resolve().parent / "dep_budget_baselines"
 TARGETS: dict[str, tuple[str, str, int]] = {
     "linux-py312": ("linux", "3.12", 41),
     "linux-py310": ("linux", "3.10", 45),
-    "windows-py312": ("windows", "3.12", 41),
+    "windows-py312": ("windows", "3.12", 40),
 }
 
 # ``name==version`` or ``name @ url``: uv writes one or the other per package.
