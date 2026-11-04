@@ -33,7 +33,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from fluid_build.cli.console import cprint, cprint_literal, literal_text
+from fluid_build.cli.console import cprint, cprint_literal, literal_error_text, literal_text
 
 from ._common import CLIError
 from ._logging import info
@@ -58,6 +58,7 @@ try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
+    from rich.text import Text as RichText
 
     RICH_AVAILABLE = True
 except ImportError:
@@ -716,8 +717,11 @@ def _print_doctor_summary(
         console = Console()
         console.print(
             Panel(
-                f"[{summary.text_style}]{summary.status}[/{summary.text_style}]\n"
-                f"[dim]{summary.message}[/dim]",
+                RichText.assemble(
+                    (summary.status, summary.text_style),
+                    "\n",
+                    literal_error_text(summary.message, "dim"),
+                ),
                 title="🩺 Doctor Summary",
                 border_style=summary.border_style,
             )
@@ -777,7 +781,7 @@ def _print_doctor_next_steps(
         console = Console()
         console.print(
             Panel(
-                literal_text("\n").join(literal_text(f"• {item}") for item in suggestions),
+                literal_text("\n").join(literal_error_text(f"• {item}") for item in suggestions),
                 title="Next steps",
                 border_style="yellow",
             )
@@ -1188,9 +1192,15 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
                 {
                     "check": "Forge AI Copilot",
                     "category": "ai",
-                    "status": "⚠️  Not configured",
+                    "status": "⚠️  Not ready" if readiness.error else "⚠️  Not configured",
                     "ok": True,  # Non-critical
-                    "details": "Run 'fluid ai setup' to configure",
+                    # A configured provider that cannot run (litellm missing) says
+                    # why, with the install line, instead of blaming setup.
+                    "details": (
+                        str(getattr(readiness.error, "message", readiness.error))
+                        if readiness.error
+                        else "Run 'fluid ai setup' to configure"
+                    ),
                 }
             )
     except Exception:
@@ -1431,14 +1441,14 @@ def _print_copilot_readiness(readiness: LlmReadinessCheck, verbose: bool = False
             message_text = getattr(error, "message", None)
             if message_text is None:
                 message_text = error if isinstance(error, str) else str(error)
-            table.add_row("Message", literal_text(message_text))
+            table.add_row("Message", literal_error_text(message_text))
         console.print(table)
         error_suggestions = getattr(readiness.error, "suggestions", None)
         if verbose and readiness.error is not None and error_suggestions:
             console.print(
                 Panel(
                     literal_text("\n").join(
-                        literal_text(f"• {item}") for item in error_suggestions
+                        literal_error_text(f"• {item}") for item in error_suggestions
                     ),
                     title="Copilot Suggestions",
                     border_style="yellow",

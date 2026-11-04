@@ -42,7 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - AI forge with an API-key provider (`fluid forge --llm-provider openai|anthropic|gemini|...`),
     `forge data-model`, `ai setup`, the agent loop and the staged copilot agents need
     `pip install 'data-product-forge[litellm]'` (alias `[ai]`) or `[standard]`. The error is raised
-    before the interview reads any context or memory, and it names the ways to author without it:
+    before the interview reads any context or memory and before the interactive setup reads the OS
+    keyring or asks for a key (`fluid forge --llm-provider openai` and `fluid ai setup` stop at
+    once), and it names the ways to author without it:
     `--llm-provider claude-code` (uses your Claude Code login; `codex`, `cursor`, `kiro` and
     `mcp-sampling` are keyless too) and `--template starter`. Template and blank forge are
     unchanged. `fluid doctor` no longer reports a configured provider as ready when litellm is
@@ -98,6 +100,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The `[mcp]` extra now needs `mcp>=1.30,!=2.0.*,!=2.1.*,<3.0`, and the `[litellm]` extra
+  excludes litellm 1.107.0.** *Before:* the floor was `mcp>=1.22`, which allowed releases with
+  published advisories. They were fixed in mcp 1.23.0, 1.27.2 (GHSA-jpw9: an SSE session was not
+  bound to the principal that opened it, and `fluid mcp output-port serve` uses
+  `SseServerTransport`), 1.28.1 and 1.30.0, and in 2.2.0 for the 2.x line. *Now:* the floor is
+  1.30 and 2.0.* and 2.1.* are excluded. The CI "MCP SDK Drift" lower-bound leg tests 1.30
+  (it was 1.22). litellm 1.107.0 is MAL-2026-2144, a malicious release since removed from PyPI;
+  both `litellm` requirement lines now carry `!=1.107.0`.
+- **Error and hint text that now prints as written is redacted first.** The CLI renderers that
+  print an exception, message, suggestion or hint literally (so `pip install
+  'data-product-forge[litellm]'` keeps its brackets) no longer let a secret through. Rich markup
+  used to swallow a bracketed `[ghp_...]` or `[sk-ant-...]` in an exception message; printed
+  literally it showed. Those paths (`fluid forge` and its modes, `doctor`, `auth`, `apply`,
+  `import`, `ai setup|status|test`, `demo`, the template, copilot and CI-scaffold agents,
+  `market`, `policy-check`, `validate-artifacts`, `ops`, and the exception-printing sites of
+  `status`, `plan` and `verify`) now mask GitHub, Anthropic and OpenAI keys,
+  JWTs and `password=...` pairs, the same as the top-level error handler. A test scans every
+  module under `fluid_build/cli` for a message printed as markup, so a new one fails CI.
+
 - **An Iceberg sink's catalog credential could be pointed at a cloud metadata address.** The
   `sink.catalogAuth` host check of the Kafka Connect and embedded Debezium sinks refused only
   link-local and unspecified addresses. So a catalog or OAuth2 token endpoint at AWS's IPv6
@@ -124,6 +145,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the AI copilot and template-mode error renderers, `core`, `doctor`, `market`, `auth`) now prints
   it as written, with control characters spelled out. `tests/test_hints_print_literally.py` scans
   those modules and fails on a new site that prints such text as markup.
+- **The `[litellm]` install line was lost, printed twice, or blamed setup.** `fluid ai status`
+  put it in a markup panel, so it read `pip install 'data-product-forge'`. `fluid forge
+  data-model ... --llm-provider` printed it twice (a log line, then the error). `fluid doctor`
+  said "Not configured: run 'fluid ai setup'" for a provider that was configured but could not
+  run; it now shows the install line. In `forge --agent-loop` the hint no longer recommends
+  `--llm-provider claude-code`, which has no tool use and crashed there. A provider picked by
+  Ollama detection, not by flag, is named `provider ollama`, not `--llm-provider ollama`.
+  Interactive `fluid forge` without litellm no longer offers or saves Ollama, reads the keyring
+  or asks for a key: it offers the keyless agents and `--template starter`.
+- **The OpenLineage "needs openlineage-python" warning printed twice** in a real run: once as
+  a console line and once through the logging last-resort handler. It is the console line only.
 
 ## [0.27.0] — 2026-11-04
 

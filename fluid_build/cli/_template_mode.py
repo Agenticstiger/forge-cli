@@ -43,7 +43,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
-from fluid_build._console import literal_text
+from fluid_build._console import literal_error_text
 
 # ── Project ──
 # ``_fm`` indirection: ``forge_modes`` re-imports the symbols defined
@@ -164,7 +164,7 @@ def run_template_mode(
     except Exception as exc:  # noqa: BLE001
         logger.exception("Template mode failed")
         if console:
-            console.print(literal_text(f"❌ Template mode failed: {exc}", "red"))
+            console.print(literal_error_text(f"❌ Template mode failed: {exc}", "red"))
         else:
             console_error(f"Template mode failed: {exc}")
         return 1
@@ -287,9 +287,9 @@ def _create_project_agent_loop(
         logger.exception("Agent loop failed")
         if console:
             try:
-                console.print(literal_text(exc.message, "red"))
+                console.print(literal_error_text(exc.message, "red"))
                 for sug in getattr(exc, "suggestions", []) or []:
-                    console.print(literal_text(sug, "dim"))
+                    console.print(literal_error_text(sug, "dim"))
             except Exception:  # noqa: BLE001
                 pass
         return False
@@ -297,7 +297,7 @@ def _create_project_agent_loop(
         logger.exception("Agent loop crashed")
         if console:
             try:
-                console.print(literal_text(f"Agent loop failed: {exc}", "red"))
+                console.print(literal_error_text(f"Agent loop failed: {exc}", "red"))
             except Exception:  # noqa: BLE001
                 pass
         return False
@@ -1043,9 +1043,9 @@ def _create_project_minimal(
         _emit_incomplete_forge_span(logger)
         if console:
             try:
-                console.print(literal_text(f"❌ {exc.message}", "red"))
+                console.print(literal_error_text(f"❌ {exc.message}", "red"))
                 for suggestion in getattr(exc, "suggestions", []) or []:
-                    console.print(literal_text(f"• {suggestion}", "dim"))
+                    console.print(literal_error_text(f"• {suggestion}", "dim"))
             except Exception:  # noqa: BLE001
                 pass
         else:
@@ -1056,7 +1056,7 @@ def _create_project_minimal(
         _emit_incomplete_forge_span(logger)
         if console:
             try:
-                console.print(literal_text(f"❌ Failed to create project: {exc}", "red"))
+                console.print(literal_error_text(f"❌ Failed to create project: {exc}", "red"))
             except Exception:  # noqa: BLE001
                 pass
         else:
@@ -1443,7 +1443,7 @@ def _scaffold_data_folder(target_dir: Path, context: dict, console: Any) -> None
             )
     except OSError as exc:
         if console and RICH_AVAILABLE:
-            console.print(literal_text(f"Could not create scaffolding: {exc}", "yellow"))
+            console.print(literal_error_text(f"Could not create scaffolding: {exc}", "yellow"))
 
 
 def _show_existing_products(console: Any, existing_contracts: list) -> None:

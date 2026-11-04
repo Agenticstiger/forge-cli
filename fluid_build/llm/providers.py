@@ -795,6 +795,13 @@ def _provider_name_from(args: Any, env: Mapping[str, str]) -> str:
     )
 
 
+_AGENT_LOOP_ALTERNATIVES = (
+    "Or author without it: --template starter. The agent loop needs a provider that "
+    "supports tool use, which the keyless providers (claude-code, codex, cursor, kiro, "
+    "mcp-sampling) do not."
+)
+
+
 def preflight_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = None) -> None:
     """Fail fast when the selected provider cannot be used on this install.
 
@@ -803,10 +810,27 @@ def preflight_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = Non
     :class:`~fluid_build._optional.MissingOptionalDependency` when a
     litellm-backed provider is chosen and litellm is absent. Call it before
     anything that reads workspace context or memory.
+
+    The error is tailored to the run: ``(--llm-provider X)`` only when the flag
+    was passed, and in ``--agent-loop`` only the alternative that works there.
     """
+    from fluid_build._optional import MissingOptionalDependency
+
     name = _provider_name_from(args, dict(environ or os.environ))
-    if isinstance(name, str):
+    if not isinstance(name, str):
+        return
+    try:
         get_llm_provider(name)
+    except MissingOptionalDependency as exc:
+        flagged = bool(getattr(args, "llm_provider", None))
+        agent_loop = bool(getattr(args, "agent_loop", False))
+        how = f"--llm-provider {name}" if flagged else f"provider {name}"
+        raise MissingOptionalDependency(
+            exc.module,
+            exc.extra,
+            f"AI-assisted authoring ({how})",
+            alternatives=_AGENT_LOOP_ALTERNATIVES if agent_loop else _LITELLM_ALTERNATIVES,
+        ) from None
 
 
 def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -> LlmConfig:

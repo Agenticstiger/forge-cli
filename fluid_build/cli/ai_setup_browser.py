@@ -32,6 +32,7 @@ import logging
 import webbrowser
 from typing import Any, Optional
 
+from fluid_build._console import literal_error_text
 from fluid_build.cli.forge_copilot_llm_providers import LlmConfig
 
 LOG = logging.getLogger(__name__)
@@ -205,7 +206,9 @@ def _try_localhost_callback_oauth(
 
     if captured.get("error") or not captured.get("code"):
         console.print(
-            f"[yellow]OAuth callback returned no code (error={captured.get('error')}).[/yellow]"
+            literal_error_text(
+                f"OAuth callback returned no code (error={captured.get('error')}).", "yellow"
+            )
         )
         return None
 

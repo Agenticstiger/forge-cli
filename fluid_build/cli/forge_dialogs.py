@@ -38,6 +38,8 @@ from difflib import SequenceMatcher
 from getpass import getpass
 from typing import Any, Dict, List, Mapping, Optional
 
+from fluid_build._console import literal_error_text
+
 # Import ``normalize_provider_name`` from its LIGHT defining module rather than
 # the heavy ``forge_copilot_runtime`` re-export. ``forge_copilot_runtime`` pulls
 # the LLM/discovery stack (httpx) and the schema_manager chain (jsonschema),
@@ -580,7 +582,7 @@ def print_dialog_status(
     icon = icon_map.get(status, "[cyan]ℹ[/cyan]")
     console.print(f"{icon} {message}")
     if detail:
-        console.print(f"[dim]{detail}[/dim]")
+        console.print(literal_error_text(f"{detail}", "dim"))
     console.print()
 
 

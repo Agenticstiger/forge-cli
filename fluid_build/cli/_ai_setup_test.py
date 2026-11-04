@@ -607,12 +607,12 @@ def run_ai_test(console: Any, args: Any) -> tuple[int, dict]:
         if as_json:
             sys.stdout.write(json.dumps(report, indent=2) + "\n")
         elif console and RICH_AVAILABLE:
-            from fluid_build.cli.console import literal_text
+            from fluid_build.cli.console import literal_error_text, literal_text
 
             suggestions = "\n".join(f"- {s}" for s in exc.suggestions)
-            body = literal_text(exc.message, "red")
+            body = literal_error_text(exc.message, "red")
             if suggestions:
-                body = literal_text("\n\n").join([body, literal_text(suggestions, "dim")])
+                body = literal_text("\n\n").join([body, literal_error_text(suggestions, "dim")])
             console.print(Panel(body, title="AI Provider Test Failed", border_style="red"))
         else:
             from fluid_build.cli.console import cprint_literal

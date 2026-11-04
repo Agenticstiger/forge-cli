@@ -542,13 +542,14 @@ def test_lineage_without_openlineage_warns_once_naming_the_extra_and_does_not_ra
                 run_started_at="2026-05-15T00:00:00Z",
                 provider="aws",
             )
-    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1, warnings
-    assert "OpenLineage emission needs openlineage-python, which is not installed" in warnings[0]
-    assert "pip install 'data-product-forge[lineage]'" in warnings[0]
-    # The console copy too: Rich markup used to swallow ``[lineage]`` there.
+    # The console carries the warning, once. A WARNING record as well made the root
+    # logger's last-resort handler print the same line a second time.
     shown = capsys.readouterr()
-    assert "pip install 'data-product-forge[lineage]'" in shown.out + shown.err
+    text = " ".join((shown.out + shown.err).split())
+    hint = "pip install 'data-product-forge[lineage]'"
+    assert text.count(hint) == 1, text
+    assert "OpenLineage emission needs openlineage-python, which is not installed" in text
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 # ── duckdb / vowl ────────────────────────────────────────────────────────────

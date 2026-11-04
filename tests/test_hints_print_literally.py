@@ -43,30 +43,24 @@ from fluid_build.llm.providers import CopilotGenerationError, LlmReadinessCheck
 HINT = "pip install 'data-product-forge[litellm]'"
 CLI = Path(__file__).resolve().parents[1] / "fluid_build" / "cli"
 
-#: The modules whose error and hint output the founder named, plus the others that
-#: print an exception, a message or a suggestion from the same flows.
-SCANNED = (
-    "forge",
-    "forge_modes",
-    "forge_copilot_agent",
-    "forge_copilot_scaffold_mixin",
-    "forge_data_model",
-    "forge_domain_agent_base",
-    "core",
-    "doctor",
-    "market",
-    "_template_mode",
-    "_ai_setup_test",
-    "auth",
+#: Every module under ``fluid_build/cli``: the first version scanned twelve and
+#: missed ``ai status``, whose hint went through a ``Panel``.
+SCANNED = tuple(
+    sorted(
+        str(path.relative_to(CLI).with_suffix("")).replace("\\", "/") for path in CLI.rglob("*.py")
+    )
 )
 #: A scan that quietly stops finding files would pass forever.
-MIN_SCANNED = 12
+MIN_SCANNED = 150
 
 _TEXTY = re.compile(
     r"exc|exception|suggest|\.message|\bsug\b|hint|\bmsg\b|\berr\b|error_msg|\berror\b"
-    r"|\.detail|\.fix_hint"
+    r"|\.detail|\.fix_hint|\bdetail\b"
 )
-_PRINTERS = {"print", "cprint"}
+#: Calls that parse their ``str`` argument as Rich markup: ``console.print`` (also
+#: wrapping a ``Panel``), ``cprint``, ``Panel``, a table row, ``Text.from_markup``.
+_PRINTER_ATTRS = {"print", "from_markup", "add_row"}
+_PRINTER_NAMES = {"cprint", "Panel"}
 
 #: (module, printed call) -> why markup is safe there. Keep each reason specific.
 ALLOWED = {
@@ -91,6 +85,42 @@ ALLOWED = {
         "core",
         "console.print(f'  • {suggestion}')",
     ): "the no-Rich fallback console, which has no markup to parse",
+    (
+        "_apply_opentofu_engine",
+        "cprint(f'  access enforcement after the failed apply could not run: {type(exc).__name__}')",
+    ): "prints the exception class name only, never its text",
+    (
+        "_interview_slash_commands",
+        "console.print(f'[yellow]Unknown command: :{name}. Did you mean [bold]:{suggestion}[/bold]? (:help lists all)[/yellow]')",
+    ): "a command name from the fixed slash-command table, not an exception",
+    (
+        "_subcommand_guide",
+        "cprint(f'[yellow]Recommended:[/yellow] {hint.rationale}')",
+    ): "a rationale string from the internal subcommand catalog",
+    (
+        "_welcome_scan",
+        "table.add_row('Keyless:', f'[green]✓ {agents}[/green] — no API key needed, e.g. [bold]--llm-provider {suggested}[/bold]')",
+    ): "agent names the scan itself detected, not exception text",
+    (
+        "_welcome_scan",
+        "table.add_row('Suggested:', f'--data-product-type {findings.suggested_data_product_type} (based on your recent forge history)')",
+    ): "a product type from the fixed catalog",
+    (
+        "ai_setup",
+        "console.print(f'\\n[bold]{label}[/bold] selected.{url_hint}')",
+    ): "a provider label and a URL hint from the internal provider table",
+    (
+        "next_steps",
+        "cprint(f'  {step.command}    # {step.hint}')",
+    ): "a step table the CLI builds itself",
+    (
+        "validate",
+        "cprint(f\"   issues: {s['total']} total ({s.get('error', 0)} error, {s.get('warning', 0)} warning, {s.get('info', 0)} info)\")",
+    ): "integer counts",
+    (
+        "validate_artifacts",
+        "cprint(f\"   issues: {s['total']} total ({s.get('error', 0)} error, {s.get('warning', 0)} warning, {s.get('info', 0)} info)\")",
+    ): "integer counts",
 }
 
 
@@ -101,9 +131,16 @@ def _printed_calls(module: str) -> list[tuple[int, str]]:
         if not isinstance(node, ast.Call):
             continue
         fn = node.func
-        name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
-        if name not in _PRINTERS:
+        if isinstance(fn, ast.Attribute):
+            if fn.attr not in _PRINTER_ATTRS:
+                continue
+        elif getattr(fn, "id", None) not in _PRINTER_NAMES:
             continue
+        if any(
+            kw.arg == "markup" and isinstance(kw.value, ast.Constant) and kw.value.value is False
+            for kw in node.keywords
+        ):
+            continue  # printed without markup: literal already
         for arg in node.args:
             if isinstance(arg, ast.JoinedStr) and any(
                 isinstance(v, ast.FormattedValue) and _TEXTY.search(ast.unparse(v.value))
@@ -225,3 +262,165 @@ def test_doctor_next_steps_plain_text_fallback(
     readiness = LlmReadinessCheck(ready=False, provider="gemini", error=_error())  # type: ignore[arg-type]
     doctor._print_doctor_next_steps(feature_checks_ok=True, copilot_readiness=readiness)
     assert HINT in " ".join(capsys.readouterr().out.split())
+
+
+# --- secrets on the literal paths ------------------------------------------
+
+#: Each shape the two repo redactors know: a bracketed GitHub token (markup used to
+#: swallow it), a bare Anthropic key, a JWT, and a ``key=value`` pair.
+_SECRETS = {
+    "ghp": "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
+    "anthropic": "sk-ant-api03-AAAAbbbbCCCCdddd1234567890",
+    "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+    "kv": "hunter2",
+}
+_SECRET_LINE = (
+    f"[{_SECRETS['ghp']}] {_SECRETS['anthropic']} {_SECRETS['jwt']} password={_SECRETS['kv']}"
+)
+
+
+def _assert_masked(text: str) -> None:
+    leaked = [name for name, value in _SECRETS.items() if value in text]
+    assert not leaked, f"secret shapes printed in the clear: {leaked}"
+
+
+def _leaky_error() -> CopilotGenerationError:
+    return CopilotGenerationError(
+        "copilot_x", f"failed: {_SECRET_LINE}; {HINT}", [f"{_SECRET_LINE} {HINT}"]
+    )
+
+
+def test_literal_error_text_masks_secrets_and_keeps_the_hint() -> None:
+    from fluid_build._console import literal_error_text, literal_text
+
+    plain = literal_error_text(f"{_SECRET_LINE} {HINT}").plain
+    _assert_masked(plain)
+    assert HINT in plain
+    # literal_text itself stays non-redacting: it prints contract values.
+    assert _SECRETS["kv"] in literal_text(_SECRET_LINE).plain
+
+
+def test_cprint_literal_masks_bare_token_shapes(capsys: pytest.CaptureFixture[str]) -> None:
+    from fluid_build._console import cprint_literal
+
+    cprint_literal(f"{_SECRET_LINE} {HINT}")
+    out = capsys.readouterr().out
+    _assert_masked(out)
+    assert HINT in " ".join(out.split())
+
+
+def test_forge_modes_renderer_masks_secrets() -> None:
+    from fluid_build.cli import forge_modes
+
+    console, buf = _console()
+    forge_modes._render_ai_copilot_error(console, _leaky_error())
+    forge_modes._render_ai_copilot_error(console, RuntimeError(_SECRET_LINE))
+    _assert_masked(buf.getvalue())
+    assert HINT in buf.getvalue()
+
+
+def test_template_mode_renderer_masks_secrets() -> None:
+    import importlib
+
+    importlib.import_module("fluid_build.cli.forge_modes")
+    _template_mode = importlib.import_module("fluid_build.cli._template_mode")
+
+    def boom(context, options):
+        raise _leaky_error()
+
+    copilot = SimpleNamespace(
+        generate_project_artifacts=boom, _attempt_generation_recovery=lambda **kw: None
+    )
+    console, buf = _console()
+    _template_mode._create_project_minimal(
+        copilot=copilot,
+        target_dir=Path("."),
+        context={},
+        copilot_options={},
+        dry_run=False,
+        logger=logging.getLogger("t"),
+        console=console,
+    )
+    _assert_masked(buf.getvalue())
+    assert HINT in buf.getvalue()
+
+
+def test_copilot_agent_renderer_masks_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fluid_build.cli import forge_copilot_agent as fca
+
+    agent = object.__new__(fca.CopilotAgentBase)
+    console, buf = _console()
+    agent.console = console
+    monkeypatch.setattr(fca, "normalize_copilot_context", lambda c: c)
+
+    def boom(context, options):
+        raise _leaky_error()
+
+    monkeypatch.setattr(agent, "generate_project_artifacts", boom, raising=False)
+    monkeypatch.setattr(agent, "_attempt_generation_recovery", lambda **kw: None, raising=False)
+    agent.create_project(Path("."), {}, {}, dry_run=True)
+    _assert_masked(buf.getvalue())
+    assert HINT in buf.getvalue()
+
+
+def test_doctor_renderers_mask_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fluid_build.cli import doctor
+
+    console, buf = _console()
+    monkeypatch.setattr(doctor, "Console", lambda *a, **k: console)
+    readiness = LlmReadinessCheck(ready=False, provider="gemini", error=_leaky_error())  # type: ignore[arg-type]
+    doctor._print_doctor_next_steps(feature_checks_ok=True, copilot_readiness=readiness)
+    doctor._print_copilot_readiness(readiness, verbose=True)
+    _assert_masked(buf.getvalue())
+    assert HINT in buf.getvalue()
+
+
+def test_core_handle_error_masks_secrets() -> None:
+    from fluid_build.cli.core import CLIContext
+
+    ctx = object.__new__(CLIContext)
+    console, buf = _console()
+    ctx.console = console
+    ctx.logger = logging.getLogger("t")
+    ctx.metrics = None
+    ctx.handle_error(RuntimeError(_SECRET_LINE))
+    _assert_masked(buf.getvalue())
+
+
+def test_ai_status_keeps_the_install_hint_and_masks_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``fluid ai status`` put the error in a markup ``Panel``: ``[litellm]`` vanished."""
+    from fluid_build.cli import ai_setup
+
+    error = f"openai needs litellm, which is not installed: {HINT} {_SECRET_LINE}"
+    readiness = LlmReadinessCheck(ready=False, provider="openai", error=error)  # type: ignore[arg-type]
+    monkeypatch.setattr(ai_setup, "check_llm_readiness", lambda *a, **k: readiness, raising=False)
+    import fluid_build.llm.providers as providers
+
+    monkeypatch.setattr(providers, "check_llm_readiness", lambda *a, **k: readiness)
+    console, buf = _console()
+    ai_setup.show_ai_status(console)
+    text = " ".join(buf.getvalue().split())
+    assert HINT in text
+    _assert_masked(text)
+
+
+def test_doctor_summary_panel_prints_literally(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fluid_build.cli import doctor
+
+    console, buf = _console()
+    monkeypatch.setattr(doctor, "Console", lambda *a, **k: console)
+    readiness = LlmReadinessCheck(
+        ready=False,
+        provider="openai",
+        error=f"openai needs litellm: {HINT} {_SECRET_LINE}",  # type: ignore[arg-type]
+    )
+    doctor._print_doctor_summary(
+        feature_checks_ok=True,
+        copilot_readiness=readiness,
+        extended_available=False,
+        extended_requested=False,
+    )
+    text = " ".join(buf.getvalue().split())
+    _assert_masked(text)

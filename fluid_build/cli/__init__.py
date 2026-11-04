@@ -22,7 +22,7 @@ import sys
 import time
 from typing import Any, List, Optional
 
-from fluid_build.cli.console import cprint, info, warning
+from fluid_build.cli.console import cprint, cprint_literal, info, warning
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_banner import compact_next_line
 
@@ -683,7 +683,7 @@ def _handle_health_check(self) -> int:
     for check_name, check_result in results["checks"].items():
         status = check_result["status"].upper()
         error = f" ({check_result.get('error', '')})" if check_result.get("error") else ""
-        cprint(f"{check_name}: {status}{error}")
+        cprint_literal(f"{check_name}: {status}{error}")
 
     overall = "HEALTHY" if results["overall_healthy"] else "UNHEALTHY"
     cprint(f"\nOverall Status: {overall}")

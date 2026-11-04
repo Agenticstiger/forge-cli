@@ -1074,7 +1074,14 @@ def _resolve_optional_llm_config(args: Any, logger: logging.Logger):
     try:
         config = resolve_llm_config(args)
     except Exception as exc:  # noqa: BLE001
-        logger.error("could_not_resolve_llm_config: %s", exc)
+        from fluid_build._optional import MissingOptionalDependency
+
+        if isinstance(exc, MissingOptionalDependency):
+            # The CLI prints this hint once on its way out; logging it here as
+            # well showed the user the same install line twice.
+            logger.debug("could_not_resolve_llm_config: %s", exc)
+        else:
+            logger.error("could_not_resolve_llm_config: %s", exc)
         raise
     # Surface known capability gaps for the resolved (provider, model)
     # combination *before* the run starts. ``staged_pipeline`` is the

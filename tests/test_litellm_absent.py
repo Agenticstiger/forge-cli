@@ -113,6 +113,147 @@ class TestCliSurface:
         assert "Traceback" not in out
         assert loaded == []
 
+    def test_interactive_forge_fails_before_touching_the_keyring(
+        self, block, cli, monkeypatch
+    ):  # noqa: F811
+        block("litellm")
+        monkeypatch.delenv("FLUID_NONINTERACTIVE", raising=False)
+        monkeypatch.setenv("FLUID_FORGE_NO_PICKER", "1")
+        monkeypatch.setenv("FLUID_FORGE_NO_WELCOME", "1")
+        calls: list[str] = []
+        import fluid_build.cli.ai_setup as ai_setup
+
+        monkeypatch.setattr(
+            ai_setup, "run_ai_setup_inline", lambda *a, **k: calls.append("inline-setup")
+        )
+        for name in ("_load_key_from_keyring", "_save_key_to_keyring"):
+            monkeypatch.setattr(ai_setup, name, lambda *a, _n=name, **k: calls.append(_n))
+        try:
+            import keyring
+        except ImportError:
+            pass
+        else:
+            for name in ("get_password", "set_password", "get_credential"):
+                monkeypatch.setattr(
+                    keyring, name, lambda *a, _n=name, **k: calls.append(f"keyring.{_n}")
+                )
+        rc, out = cli("forge", "--llm-provider", "openai")
+        assert rc == 1, out
+        assert "pip install 'data-product-forge[litellm]'" in " ".join(out.split())
+        assert calls == []
+
+    def test_ai_setup_fails_before_asking_for_a_key(self, block, cli, monkeypatch):  # noqa: F811
+        block("litellm")
+        import fluid_build.cli.ai_setup as ai_setup
+
+        asked: list[str] = []
+        monkeypatch.setattr(
+            ai_setup, "run_ai_setup_interactive", lambda *a, **k: asked.append("wizard")
+        )
+        for extra in ((), ("--provider", "openai")):
+            rc, out = cli("ai", "setup", *extra)
+            flat = " ".join(out.split())
+            assert rc == 1, out
+            assert "pip install 'data-product-forge[litellm]'" in flat
+            for keyless in ("claude-code", "codex", "cursor", "kiro", "mcp-sampling", "--template"):
+                assert keyless in flat
+            assert "Traceback" not in out
+        assert asked == []
+
+    @pytest.mark.parametrize("sub", ["from-intent", "from-ddl"])
+    def test_data_model_with_a_provider_prints_the_hint_once(
+        self, block, cli, tmp_path, sub
+    ):  # noqa: F811
+        block("litellm")
+        src = tmp_path / ("intent.yaml" if sub == "from-intent" else "a.sql")
+        src.write_text(
+            "name: sales\ngrain: order\n" if sub == "from-intent" else "CREATE TABLE t (id int);"
+        )
+        out_file = str(tmp_path / "out.yaml")
+        args = ([sub, str(src)] if sub == "from-intent" else [sub, "--ddl", str(src)]) + [
+            "--output",
+            out_file,
+            "--llm-provider",
+            "openai",
+        ]
+        rc, out = cli("forge", "data-model", *args)
+        flat = " ".join(out.split())
+        assert rc == 1, out
+        assert flat.count("pip install 'data-product-forge[litellm]'") == 1, out
+
+    def test_agent_loop_offers_only_what_works_there(self, block, cli):  # noqa: F811
+        block("litellm")
+        rc, out = cli("forge", "--agent-loop", "--llm-provider", "openai", "--non-interactive")
+        flat = " ".join(out.split())
+        assert rc == 1, out
+        assert "--template starter" in flat
+        assert "--llm-provider claude-code" not in flat
+        assert "Traceback" not in out
+
+    def test_a_provider_not_chosen_by_flag_is_not_called_a_flag(self, block):  # noqa: F811
+        block("litellm")
+        from types import SimpleNamespace
+
+        from fluid_build.llm.providers import preflight_llm_provider
+
+        args = SimpleNamespace(llm_provider=None, agent_loop=False)
+        with pytest.raises(MissingOptionalDependency) as info:
+            preflight_llm_provider(args, {"FLUID_LLM_PROVIDER": "ollama"})
+        assert "(provider ollama)" in str(info.value)
+        assert "--llm-provider ollama" not in str(info.value).split("\n")[0]
+
+    def test_interactive_setup_offers_and_saves_no_litellm_provider(
+        self, block, cli, monkeypatch  # noqa: F811
+    ):
+        block("litellm")
+        import shutil
+
+        import fluid_build.cli.ai_setup as ai_setup
+
+        saved: list[tuple] = []
+        offered: list[str] = []
+        monkeypatch.setattr(ai_setup, "_save_ai_config", lambda *a, **k: saved.append(a))
+        monkeypatch.setattr(ai_setup, "detect_ollama_available", lambda *a, **k: True)
+        monkeypatch.setattr(
+            ai_setup, "ask_confirmation", lambda *a, **k: offered.append("ask") or True
+        )
+        monkeypatch.setattr(
+            ai_setup, "_prompt_for_api_key", lambda *a, **k: offered.append("key-prompt")
+        )
+        monkeypatch.setattr(shutil, "which", lambda *a, **k: None)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+        for var in ("OLLAMA_HOST", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(ai_setup, "_load_ai_config", lambda *a, **k: None)
+        monkeypatch.setattr(ai_setup, "_ai_setup_skipped", False)  # session state
+        import io
+
+        from rich.console import Console
+
+        buf = io.StringIO()
+        result = ai_setup.run_ai_setup_inline(Console(file=buf, width=250))
+        assert result is None
+        assert saved == [] and offered == []
+        assert "pip install 'data-product-forge[litellm]'" in " ".join(buf.getvalue().split())
+
+    def test_doctor_row_names_litellm_not_setup(self, block, monkeypatch):  # noqa: F811
+        block("litellm")
+        monkeypatch.setenv("FLUID_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-real-0000000000000000")
+        from fluid_build.cli.doctor import _check_fluid_features
+
+        _ok, checks = _check_fluid_features()
+        row = next(c for c in checks if c["check"] == "Forge AI Copilot")
+        assert "pip install 'data-product-forge[litellm]'" in row["details"]
+        assert "fluid ai setup" not in row["details"]
+
+    def test_ai_status_keeps_the_hint(self, block, cli, monkeypatch):  # noqa: F811
+        block("litellm")
+        monkeypatch.setenv("FLUID_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-real-0000000000000000")
+        rc, out = cli("ai", "status")
+        assert "pip install 'data-product-forge[litellm]'" in " ".join(out.split()), out
+
     def test_template_forge_works_without_litellm(self, block, cli, tmp_path):  # noqa: F811
         block("litellm")
         rc, out = cli(

@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
-from fluid_build._console import literal_text
+from fluid_build._console import literal_error_text
 from fluid_build.cli._forge_mode_errors import forge_mode_error_boundary
 from fluid_build.cli.console import cprint, cprint_literal, success
 from fluid_build.cli.console import error as console_error
@@ -1094,9 +1094,9 @@ def _render_ai_copilot_error(console: Any, exc: BaseException) -> None:
     """Render an AI-copilot failure; messages and suggestions print as written."""
     if isinstance(exc, CopilotGenerationError):
         if console:
-            console.print(literal_text(f"❌ AI Copilot failed: {exc.message}", "red"))
+            console.print(literal_error_text(f"❌ AI Copilot failed: {exc.message}", "red"))
             for suggestion in exc.suggestions:
-                console.print(literal_text(f"• {suggestion}", "dim"))
+                console.print(literal_error_text(f"• {suggestion}", "dim"))
         else:
             console_error(f"AI Copilot failed: {exc.message}")
             for suggestion in exc.suggestions:
@@ -1104,7 +1104,7 @@ def _render_ai_copilot_error(console: Any, exc: BaseException) -> None:
     else:
         is_key_error = "api_key" in str(exc).lower() or "missing_llm" in str(exc).lower()
         if console:
-            console.print(literal_text(f"AI Copilot failed: {exc}", "red"))
+            console.print(literal_error_text(f"AI Copilot failed: {exc}", "red"))
             if is_key_error:
                 console.print(
                     "[yellow]Tip: Run 'fluid ai setup' to configure your LLM provider,[/yellow]\n"
@@ -1595,7 +1595,7 @@ def run_domain_agent_mode(
 
     def _render_domain_agent_error(console: Any, exc: BaseException) -> None:
         if console:
-            console.print(literal_text(f"❌ Domain agent failed: {exc}", "red"))
+            console.print(literal_error_text(f"❌ Domain agent failed: {exc}", "red"))
 
     with forge_mode_error_boundary(
         logger,
@@ -1791,7 +1791,7 @@ def run_guided_mode(
 
     def _render_guided_error(console: Any, exc: BaseException) -> None:
         if console:
-            console.print(literal_text(f"Guided mode failed: {exc}", "red"))
+            console.print(literal_error_text(f"Guided mode failed: {exc}", "red"))
 
     with forge_mode_error_boundary(
         logger,

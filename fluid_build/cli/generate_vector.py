@@ -30,7 +30,7 @@ import json
 import logging
 import os
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
 from ._logging import info
@@ -80,10 +80,10 @@ def run(args, logger: logging.Logger) -> int:
 
         errors, warnings = validate_vector_binding(contract)
         for msg in warnings:
-            cprint(f"  warning: {msg}")
+            cprint_literal(f"  warning: {msg}")
         if errors:
             for msg in errors:
-                cprint(f"  error: {msg}")
+                cprint_literal(f"  error: {msg}")
             raise CLIError(1, "generate_vector_invalid_binding", {"errors": errors})
 
         artifacts = compile_vector_port(contract)

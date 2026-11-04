@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from fluid_build._console import literal_text
+from fluid_build._console import literal_error_text
 from fluid_build.cli._common import CLIError
 from fluid_build.cli.console import cprint, cprint_literal
 
@@ -288,7 +288,7 @@ class AuthProvider:
             cprint("  Checking available auth methods...")
             for label, available, detail in methods:
                 icon = "✓" if available else "✗"
-                cprint(f"    {icon} {label:<30} {detail}")
+                cprint_literal(f"    {icon} {label:<30} {detail}")
             return
 
         lines = []
@@ -672,7 +672,9 @@ async def handle_login(provider: str, auth_manager: AuthManager, logger: logging
         else:
             error_msg = result.error_message or "Authentication failed"
             if console:
-                console.print(literal_text(f"\n❌ Authentication failed: {error_msg}", "bold red"))
+                console.print(
+                    literal_error_text(f"\n❌ Authentication failed: {error_msg}", "bold red")
+                )
 
                 if "not installed" in error_msg.lower():
                     console.print(

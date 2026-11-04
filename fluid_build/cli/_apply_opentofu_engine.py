@@ -391,7 +391,9 @@ def _enforce_after_failed_apply(plugin: Any, contract: Mapping[str, Any]) -> Non
     try:
         run(contract, say=cprint, after_failed_apply=True)
     except UnsupportedBindingError as exc:
-        cprint(f"  access enforcement after the failed apply: {exc} {' '.join(exc.remediation)}")
+        cprint_literal(
+            f"  access enforcement after the failed apply: {exc} {' '.join(exc.remediation)}"
+        )
     except Exception as exc:  # noqa: BLE001 — the apply's own error is what the run raises
         cprint(f"  access enforcement after the failed apply could not run: {type(exc).__name__}")
 

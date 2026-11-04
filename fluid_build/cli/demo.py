@@ -44,7 +44,7 @@ from fluid_build.cli.artifact_envelope import dump_json_with_envelope
 from fluid_build.cli.artifact_paths import workspace_init_receipt_path
 from fluid_build.cli.artifact_receipts import ReceiptBuilder
 from fluid_build.cli.artifact_scan import diff_snapshots, snapshot_workspace
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, literal_error_text
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.next_steps import print_next_steps
 
@@ -52,6 +52,7 @@ try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
+    from rich.text import Text
 
     RICH_AVAILABLE = True
     _console = Console()
@@ -228,15 +229,23 @@ def _print_failure_panel(name: str, exc: Exception) -> None:
     _console.print()
     _console.print(
         Panel(
-            f"[bold red]Demo didn't finish successfully.[/bold red]\n\n"
-            f"[dim]Error:[/dim] {exc}\n\n"
-            "Try these to get unstuck:\n"
-            "  [bright_cyan]fluid doctor[/bright_cyan]   "
-            "[dim]← check Python version, dependencies, local providers[/dim]\n"
-            f"  [bright_cyan]rm -rf {name}[/bright_cyan]   "
-            "[dim]← remove the half-built project and try again[/dim]\n\n"
-            "[dim]If it keeps failing, please open an issue with the error above\n"
-            "at https://github.com/Agenticstiger/forge-cli/issues[/dim]",
+            Text.assemble(
+                Text.from_markup("[bold red]Demo didn't finish successfully.[/bold red]\n\n"),
+                Text.from_markup("[dim]Error:[/dim] "),
+                literal_error_text(exc),
+                Text.from_markup(
+                    "\n\nTry these to get unstuck:\n"
+                    "  [bright_cyan]fluid doctor[/bright_cyan]   "
+                    "[dim]← check Python version, dependencies, local providers[/dim]\n"
+                ),
+                Text("  "),
+                Text(f"rm -rf {name}", style="bright_cyan"),
+                Text.from_markup(
+                    "   [dim]← remove the half-built project and try again[/dim]\n\n"
+                    "[dim]If it keeps failing, please open an issue with the error above\n"
+                    "at https://github.com/Agenticstiger/forge-cli/issues[/dim]"
+                ),
+            ),
             title="[bold bright_white]Something went wrong[/bold bright_white]",
             border_style="red",
             padding=(1, 2),

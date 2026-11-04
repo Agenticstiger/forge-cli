@@ -43,6 +43,8 @@ import shlex
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List
 
+from fluid_build._console import literal_error_text, literal_text
+
 LOG = logging.getLogger(__name__)
 
 
@@ -68,7 +70,7 @@ def _cmd_ai_setup(console: Any, **_kwargs: Any) -> None:
     except Exception as exc:  # noqa: BLE001
         LOG.debug("ai_setup_slash_failed: %s", exc)
         if console:
-            console.print(f"[red]:ai-setup failed: {exc}[/red]")
+            console.print(literal_error_text(f":ai-setup failed: {exc}", "red"))
 
 
 def _cmd_show_work(console: Any, *, state: Any = None, **_kwargs: Any) -> None:
@@ -107,8 +109,8 @@ def _cmd_doctor(console: Any, **_kwargs: Any) -> None:
         LOG.debug("doctor_slash_failed: %s", exc)
         if console:
             console.print(
-                f"[yellow]Couldn't run doctor inline ({exc}); try "
-                "[bold]fluid doctor[/bold] in another terminal.[/yellow]"
+                literal_error_text(f"Couldn't run doctor inline ({exc}); ", "yellow")
+                + literal_text("try fluid doctor in another terminal.", "yellow")
             )
 
 
