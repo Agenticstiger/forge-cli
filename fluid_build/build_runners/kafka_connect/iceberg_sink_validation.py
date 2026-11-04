@@ -65,11 +65,12 @@ Snowflake-managed table for the same expose. Per sink build:
   see); and an override map that inlines a ``credential`` or ``token`` value
   is a warning;
 * every host a ``sink.catalogAuth`` credential reaches (the catalog, and an
-  OAuth2 token endpoint) must be https, and the operator must allow it: the
-  variable paired with the host (``NAME@host``), and a hostname listed, because
-  the worker or the server resolves it itself. The lists are the operator's,
-  so this is a warning here and an error in the run's preflight, which checks
-  it before the variable is read;
+  OAuth2 token endpoint) must be https and must not be link-local, an error
+  here and in the run's preflight; and the operator must allow it: the variable
+  paired with the host (``NAME@host``), and a hostname listed, because the
+  worker or the server resolves it itself. Those lists are the operator's, so
+  a missing entry is a warning here and an error in the preflight, which
+  checks it before the variable is read;
 * the ``binding.location`` text a derived sink config carries must not start
   with ``env:`` or hold ``${`` or a control character, and ``client.region``
   must be one host label.
@@ -1383,7 +1384,7 @@ def _destination_host(url: str, source: str, role: str, receives: str) -> Tuple[
     """``(host, "")`` for a destination the operator may allow, else ``("", why not)``.
 
     "Why not" is a refusal no operator entry changes: the URL is not https (a
-    loopback one included, as on the managed Flink lane), names no host, or
+    loopback one included), names no host, or
     names a link-local or unspecified address, where cloud instance metadata
     lives (the deployment host policy's rule).
     """
@@ -1396,8 +1397,8 @@ def _destination_host(url: str, source: str, role: str, receives: str) -> Tuple[
     if parts.scheme != "https":
         return "", (
             f"{source} must be an https:// URL: the {role} receives {receives} on every "
-            "request, and http would carry it in clear text (on a loopback host too, as on "
-            "the managed Flink lane)"
+            "request, and http would carry it in clear text, so a loopback host needs "
+            "https too"
         )
     if not host:
         return "", no_host
@@ -1413,8 +1414,8 @@ def _destination_host(url: str, source: str, role: str, receives: str) -> Tuple[
 def _unlisted_host(host: str) -> Optional[str]:
     """Why ``host`` needs a host-list entry the operator has not given, or ``None``.
 
-    The rule the founder chose for these sinks on 2026-11-04, the one the
-    managed Flink lane applies. The Kafka Connect worker or the Debezium Server
+    The rule the founder chose for these sinks on 2026-11-04. The Kafka Connect
+    worker or the Debezium Server
     resolves a hostname itself, after this check, so no DNS answer seen here
     shows where it will connect: a name passes only when the operator lists it
     in ``FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST``, or when it is
@@ -1569,8 +1570,8 @@ def _check_inlined_secrets(
 # ---------------------------------------------------------------------------
 
 #: One DNS label (RFC 1123): letters, digits and inner hyphens, at most 63.
-#: Any case, because the released sinks pass the region for every catalog
-#: kind and a label ignores case; the managed Flink lane takes lowercase only.
+#: Any case, because the sinks pass the region for every catalog kind and a
+#: label ignores case.
 _HOST_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 
 #: The binding setting each catalog-specific property is derived from.
@@ -1582,14 +1583,14 @@ _EXTRA_PROPERTY_SOURCES: Mapping[str, str] = {
 #: Who resolves a reference in the derived config, for the location messages.
 _REFERENCES_RESOLVED_BY: Mapping[str, str] = {
     "kafka-connect": (
-        "the Kafka Connect worker, where Iceberg replaces a value that starts with env: by "
-        "that variable from the worker's environment and Kafka Connect resolves a "
-        "${provider:key} expression with the worker's config providers"
+        "the Kafka Connect worker, where Iceberg's REST catalog replaces a value that starts "
+        "with env: by that variable from the worker's environment and Kafka Connect resolves "
+        "a ${provider:key} expression with the worker's config providers"
     ),
     "debezium": (
-        "the embedded Debezium Server, where Iceberg replaces a value that starts with env: "
-        "by that variable and SmallRye Config expands a ${...} expression, both from the "
-        "server's environment, which is this runner's"
+        "the embedded Debezium Server, where Iceberg's REST catalog replaces a value that "
+        "starts with env: by that variable and SmallRye Config expands a ${...} expression, "
+        "both from the server's environment, which is this runner's"
     ),
 }
 
@@ -1639,17 +1640,19 @@ def _check_location_text(
 ) -> None:
     """The ``binding.location`` text a derived sink config carries. HARD.
 
-    Iceberg replaces a catalog property that starts with ``env:`` by that
-    variable, in the process that builds the catalog (EnvironmentUtil.resolveAll,
-    from RESTSessionCatalog.initialize: apache-iceberg-1.10.0
-    RESTSessionCatalog.java:195). A warehouse is then sent to the catalog and a
-    region becomes part of the S3 and Glue endpoint hosts, so location text that
-    references a variable could send any variable the worker or the server holds
-    to a host the contract chose; ``${`` is the Kafka Connect and SmallRye form
-    of the same reference. Only ``sink.catalogAuth`` names a variable, and the
-    operator pairs it with its hosts (:func:`_check_catalog_auth_destinations`).
-    A value is never quoted: it names a variable. ``client.region`` must also be
-    one host label, as on the managed Flink lane.
+    Iceberg's REST catalog replaces a catalog property that starts with ``env:``
+    by that variable, in the process that builds the catalog
+    (EnvironmentUtil.resolveAll, from RESTSessionCatalog.initialize:
+    apache-iceberg-1.10.0 RESTSessionCatalog.java:195). A warehouse is then sent
+    to the catalog and a region becomes part of the S3 and Glue endpoint hosts,
+    so location text that references a variable could send any variable the
+    worker or the server holds to a host the contract chose; ``${`` is the Kafka
+    Connect and SmallRye form of the same reference, read for every catalog
+    kind. The ``env:`` rule is applied to every kind too, as hardening: no real
+    value starts with it, and a kind that later resolves it needs no new check.
+    Only ``sink.catalogAuth`` names a variable, and the operator pairs it with
+    its hosts (:func:`_check_catalog_auth_destinations`). A value is never
+    quoted: it names a variable. ``client.region`` must also be one host label.
     """
     resolved = resolve_iceberg_catalog(binding, sink=sink, account_ref="")
     referenced: set[str] = set()

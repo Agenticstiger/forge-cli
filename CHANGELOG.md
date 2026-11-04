@@ -550,13 +550,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, and a hostname listed in
   `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST`, because the worker resolves the name itself,
   later. An IP address keeps that list's rules (link-local never, a private one with no entry, a
-  public one only when listed), and a loopback host needs neither entry. The run refuses before
-  any Connect REST call, `application.properties` write or read of the variable; `fluid validate`
-  warns with the `export` lines the run needs. `binding.location` text that reaches the derived
-  sink config may no longer start with `env:` or hold `${` or a control character, and its
-  `region` must be one host label. **Upgrade:** a sink whose `catalogAuth` reaches a non-loopback
-  host fails its run until the operator adds both entries, and one on an `http://` catalog or
-  token endpoint fails `fluid validate`.
+  public one only when listed), and a loopback host needs neither entry. A bare `NAME` entry
+  allows every host and a listed hostname also covers its subdomains, so prefer `NAME@host` and
+  the exact host. The run refuses before any Connect REST call, `application.properties` write or
+  read of the variable; `fluid validate` warns with the `export` line the run needs, and refuses
+  an `http://` or link-local host outright. `binding.location` text that reaches the derived sink
+  config may no longer start with `env:` or hold `${` or a control character, and its `region`
+  must be one host label. **Upgrade:** a sink whose `catalogAuth` reaches a non-loopback host
+  fails its run until the operator adds both entries, and one on an `http://` catalog or token
+  endpoint fails `fluid validate`. A derived sink whose `binding.location` holds such text, or a
+  region that is not one label, now fails `fluid validate` and the run, `catalogAuth` or not;
+  write the value itself.
 
 - **`validate_ident` let a name with a trailing newline through.** Python's `$` also matches just
   before a trailing newline, so the identifier allowlist in `providers/_sql_safety.py`, which the
