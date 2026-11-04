@@ -41,7 +41,7 @@ _LOG = logging.getLogger(__name__)
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.emulated,
+    pytest.mark.emulated_heavy,
     pytest.mark.skipif(
         os.environ.get("FLUID_TEST_FLINK_ICEBERG") != "1",
         reason="set FLUID_TEST_FLINK_ICEBERG=1 and build examples/flink-iceberg/runtime",
