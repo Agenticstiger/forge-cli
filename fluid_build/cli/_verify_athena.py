@@ -385,7 +385,7 @@ def _quotable_columns(glue_table: Mapping[str, Any]) -> List[str]:
 def _compare_schema(
     glue_table: Mapping[str, Any], declared: List[Mapping[str, Any]]
 ) -> Dict[str, Any]:
-    from fluid_build.iac.providers.aws import _hive_type
+    from fluid_build.iac.providers.aws import _hive_column_type
 
     storage = glue_table.get("StorageDescriptor") or {}
     actual: Dict[str, Dict[str, str]] = {}
@@ -399,7 +399,7 @@ def _compare_schema(
         name = str(field["name"])
         expected[name.lower()] = {
             "name": name,
-            "type": _canonical_glue_type(_hive_type(field.get("type"))),
+            "type": _canonical_glue_type(_hive_column_type(field)),
         }
 
     matching: List[str] = []

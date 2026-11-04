@@ -115,11 +115,15 @@ def column_type_findings(
     schema: Iterable[Any],
     outcome_for: Callable[[Any], TypeOutcome],
     target: str,
+    column_outcome: Optional[Callable[[Mapping[str, Any]], Optional[TypeOutcome]]] = None,
 ) -> Tuple[Optional[UnsupportedBindingError], List[str]]:
     """``(refusal, warnings)`` for one expose's columns on ``target`` (a table kind).
 
     One refusal covers every column the target cannot hold, so the author fixes
-    them in one pass; each lossy column is its own warning.
+    them in one pass; each lossy column is its own warning. ``column_outcome``
+    judges a whole column first (one that declares its ``fields``, ``element``,
+    ``key`` or ``value``); ``None`` leaves it to ``outcome_for``, which sees the
+    type name alone.
     """
     parts: List[str] = []
     fixes: Dict[str, List[str]] = {}
@@ -129,7 +133,9 @@ def column_type_findings(
             continue
         name = column.get("name")
         declared = str(column.get("type") if column.get("type") is not None else "string")
-        outcome = outcome_for(column.get("type"))
+        outcome = (column_outcome(column) if column_outcome else None) or outcome_for(
+            column.get("type")
+        )
         if outcome.status == REFUSED:
             parts.append(f"{name!r} is declared {declared!r}, {outcome.why}")
             fixes.setdefault(outcome.fix, []).append(repr(name))
