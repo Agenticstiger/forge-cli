@@ -2334,6 +2334,8 @@ def _delete_local_staging(path: str) -> Optional[str]:
     try:
         staged.parent.rmdir()  # only when empty: the BigQuery staging shares the directory
     except OSError:
+        # Not empty (another file of the build is staged there) or already gone: an empty
+        # directory holds no data, so leaving it is harmless.
         pass
     return None
 

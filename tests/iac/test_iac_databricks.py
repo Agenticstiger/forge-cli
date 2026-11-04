@@ -33,7 +33,7 @@ import pytest
 
 from fluid_build.cli import _apply_opentofu_engine as engine
 from fluid_build.cli._common import CLIError
-from fluid_build.iac import IAC_PLUGINS, build_module, cutover, provider_match
+from fluid_build.iac import IAC_PLUGINS, build_module, cutover, provider_match, runner
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.module import LOCK_FILE_NAME, dependency_lock, write_dependency_lock
 from fluid_build.iac.providers import databricks as dbx
@@ -799,7 +799,17 @@ def test_fluid_validate_reports_the_refusals(monkeypatch, tmp_path: Path, capfd)
     assert rc != 0 and "sets binding.location.host" in out
 
 
-@pytest.mark.parametrize("command", [("generate", "iac"), ("apply",)])
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("generate", "iac"),
+        # apply checks for the tofu binary before it emits, so without one it never refuses
+        pytest.param(
+            ("apply",),
+            marks=pytest.mark.skipif(runner.tofu_path() is None, reason="tofu not installed"),
+        ),
+    ],
+)
 def test_a_sovereignty_refusal_prints_its_reason_and_fix(
     monkeypatch, tmp_path: Path, capfd, command
 ):
