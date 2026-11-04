@@ -571,8 +571,24 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
 
 
 def compile_contract(contract: Mapping[str, Any]) -> tuple[FlinkArtifacts, ...]:
+    return tuple(artifact for _, artifact in compile_builds(contract))
+
+
+def compile_builds(
+    contract: Mapping[str, Any],
+) -> tuple[tuple[Mapping[str, Any], FlinkArtifacts], ...]:
+    """Each managed build with the artifacts compiled from it, paired by position.
+
+    Whatever acts on an artifact checks the build it came from, never one found by
+    id: two builds may share an id, and an operator's allowlists would then be
+    judged on the wrong one.
+    """
     builds = managed_builds(contract)
     artifacts = tuple(compile_build(contract, build) for build in builds)
+    ids = [a.build_id for a in artifacts]
+    repeated = sorted({i for i in ids if ids.count(i) > 1})
+    if repeated:
+        raise ValueError(f"Managed Flink build ids must be unique; {repeated[0]!r} is used twice")
     if builds and (
         len(builds) != len(contract.get("builds") or [])
         or {e.get("exposeId") for e in contract.get("exposes") or []}
@@ -603,7 +619,7 @@ def compile_contract(contract: Mapping[str, Any]) -> tuple[FlinkArtifacts, ...]:
         for b in prefixes[i + 1 :]
     ):
         raise ValueError("State storage prefixes must not overlap between managed builds")
-    return artifacts
+    return tuple(zip(builds, artifacts, strict=True))
 
 
 def validation_errors(contract: Mapping[str, Any]) -> list[str]:

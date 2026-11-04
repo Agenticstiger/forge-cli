@@ -21,9 +21,11 @@ any table that identity can, so apply refuses it unless the operator lists the p
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 
-from fluid_build.streaming.compiler import validation_warnings
+from fluid_build.streaming.compiler import validation_errors, validation_warnings
 from fluid_build.streaming.policy import (
     CONTRACT_SQL_ALLOWLIST_ENV,
     FlinkPolicyError,
@@ -63,3 +65,29 @@ def test_a_mapped_build_needs_no_listing(contract, monkeypatch):
     monkeypatch.delenv(CONTRACT_SQL_ALLOWLIST_ENV, raising=False)
     refuse_unless_contract_sql_allowed(contract["id"], contract["builds"][0])
     assert validation_warnings(contract) == []
+
+
+def test_a_second_build_with_the_same_id_cannot_vouch_for_the_first(contract, monkeypatch):
+    # The SQL build comes first; a clean build reuses its id. Builds were looked up
+    # by id at apply, so every check ran on the clean one and passed the other.
+    monkeypatch.delenv(CONTRACT_SQL_ALLOWLIST_ENV, raising=False)
+    first = contract["builds"][0]
+    second = copy.deepcopy(first)
+    first["properties"]["sql"] = "SELECT * FROM lake.secret_ns.payroll"
+    deployment = second["properties"]["parameters"]["flink"]["deployment"]
+    deployment["name"] = "commerce-orders-2"
+    for key in ("checkpointUri", "savepointUri", "haUri"):
+        deployment[key] = deployment[key].replace("/orders/", "/orders-2/")
+    second["outputs"] = ["orders2"]
+    expose = copy.deepcopy(contract["exposes"][0])
+    expose["exposeId"] = "orders2"
+    expose["binding"]["location"]["table"] = "orders2"
+    contract["builds"].append(second)
+    contract["exposes"].append(expose)
+    with pytest.raises(ValueError, match="'ingest-orders' is used twice"):
+        reconcile(contract, dry_run=True)
+    assert any("used twice" in e for e in validation_errors(contract))
+    # With distinct ids, the SQL build is judged as itself.
+    second["id"] = "ingest-orders-2"
+    with pytest.raises(FlinkPolicyError, match="'ingest-orders' runs SQL written in the contract"):
+        reconcile(contract, dry_run=True)
