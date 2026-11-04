@@ -298,9 +298,9 @@ def _hive_outcome(raw: Any) -> column_types.TypeOutcome:
     base, rest = column_types.split_type(raw)
     if base in column_types.STRUCTURED:
         return column_types.refused(
-            "which Glue holds only with its element or field types, and the contract schema "
-            "cannot declare them yet",
-            column_types.NESTED_FIX,
+            "which Glue holds only with its element or field types, and none is declared "
+            "(fields, element, or key and value need contract 0.7.7 or later)",
+            column_types.NESTED_FIX_DECLARE,
         )
     if not rest.isascii():
         return column_types.refused(

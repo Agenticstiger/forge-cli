@@ -56,13 +56,21 @@ class TypeOutcome(NamedTuple):
     fix: str = ""
 
 
-#: Types that carry element or field types, which the contract schema cannot
-#: declare yet: ``$defs.column`` is closed, and ``array(string)`` is only a type
-#: pattern. No cloud table takes them without that detail.
+#: Types that carry element or field types. No cloud table takes them without that
+#: detail, which a column declares as ``fields``, ``element``, or ``key`` and ``value``
+#: from contract 0.7.7 (``$defs.column`` was closed before, and ``array(string)`` is
+#: only a type pattern).
 STRUCTURED = frozenset({"array", "struct", "map", "object", "record", "row"})
 
-#: The fix for a refused structured column, whichever cloud refused it.
-NESTED_FIX = "Declare json or string for now; typed nested columns are planned."
+#: The fix for a refused structured column: BigQuery for every one, and Glue for a
+#: declared one it cannot hold.
+NESTED_FIX = "Declare json or string instead."
+
+#: The fix for a bare structured column on Glue, which holds it once it is declared.
+NESTED_FIX_DECLARE = (
+    "Declare the type's fields, element, or key and value (contract 0.7.7 or later), "
+    "or declare json or string."
+)
 
 
 def expand(groups: Mapping[str, str]) -> Dict[str, str]:

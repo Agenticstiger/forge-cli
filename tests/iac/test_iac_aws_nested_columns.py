@@ -123,7 +123,8 @@ def test_a_bare_nested_type_is_still_refused_with_the_existing_wording():
         contract = _contract([{"name": "x", "type": bare}])
         errors, _ = validate_aws_column_types(contract)
         assert len(errors) == 1 and f"'x' is declared {bare!r}" in errors[0], errors
-        assert "cannot declare them yet" in errors[0]
+        assert "cannot declare them yet" not in errors[0]
+        assert "contract 0.7.7 or later" in errors[0]
         with pytest.raises(UnsupportedBindingError) as caught:
             get_iac_plugin("aws").emit(contract)
         assert caught.value.kind == "column-type"
