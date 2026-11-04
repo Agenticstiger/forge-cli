@@ -33,7 +33,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from fluid_build.cli.console import cprint, cprint_literal
+from fluid_build.cli.console import cprint, cprint_literal, literal_text
 
 from ._common import CLIError
 from ._logging import info
@@ -399,7 +399,7 @@ def _run_scoped(args, logger: logging.Logger, scope_arg: str) -> int:
         icon = {Severity.OK: "✓", Severity.WARN: "!", Severity.ERROR: "✗"}
         cprint(f"fluid doctor — scope={report.scope.value}")
         for r in report.results:
-            cprint(f"  {icon[r.severity]} {r.name}: {r.detail}")
+            cprint_literal(f"  {icon[r.severity]} {r.name}: {r.detail}")
             if r.severity is not Severity.OK and r.fix:
                 cprint(f"      fix: {r.fix}")
         summary = (
@@ -728,7 +728,7 @@ def _print_doctor_summary(
     cprint("Doctor Summary")
     cprint("=" * 60)
     cprint(f"Status:  {summary.status}")
-    cprint(f"Message: {summary.message}")
+    cprint_literal(f"Message: {summary.message}")
     cprint()
 
 
@@ -774,13 +774,10 @@ def _print_doctor_next_steps(
         return
 
     if RICH_AVAILABLE:
-        from rich.text import Text
-
         console = Console()
         console.print(
             Panel(
-                # Literal: an install line such as ``...[litellm]`` is not markup.
-                Text("\n".join(f"• {item}" for item in suggestions)),
+                literal_text("\n").join(literal_text(f"• {item}") for item in suggestions),
                 title="Next steps",
                 border_style="yellow",
             )
@@ -789,7 +786,7 @@ def _print_doctor_next_steps(
 
     cprint("Next steps:")
     for suggestion in suggestions:
-        cprint(f"  • {suggestion}")
+        cprint_literal(f"  • {suggestion}")
     cprint()
 
 
@@ -1434,13 +1431,15 @@ def _print_copilot_readiness(readiness: LlmReadinessCheck, verbose: bool = False
             message_text = getattr(error, "message", None)
             if message_text is None:
                 message_text = error if isinstance(error, str) else str(error)
-            table.add_row("Message", message_text)
+            table.add_row("Message", literal_text(message_text))
         console.print(table)
         error_suggestions = getattr(readiness.error, "suggestions", None)
         if verbose and readiness.error is not None and error_suggestions:
             console.print(
                 Panel(
-                    "\n".join(f"• {item}" for item in error_suggestions),
+                    literal_text("\n").join(
+                        literal_text(f"• {item}") for item in error_suggestions
+                    ),
                     title="Copilot Suggestions",
                     border_style="yellow",
                 )
@@ -1460,9 +1459,9 @@ def _print_copilot_readiness(readiness: LlmReadinessCheck, verbose: bool = False
         message_text = getattr(error, "message", None)
         if message_text is None:
             message_text = error if isinstance(error, str) else str(error)
-        cprint(f"Message:  {message_text}")
+        cprint_literal(f"Message:  {message_text}")
         for suggestion in getattr(error, "suggestions", None) or []:
-            cprint(f"  • {suggestion}")
+            cprint_literal(f"  • {suggestion}")
     cprint()
 
 

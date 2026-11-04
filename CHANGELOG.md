@@ -32,6 +32,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking (install): litellm, mcp and openlineage-python are no longer in the base install.**
+  *Before:* `pip install data-product-forge` pulled in litellm, mcp and openlineage-python, and with
+  them boto3 (through litellm), aiohttp, openai, tokenizers and about fifty more packages.
+  *Now:* the base install is the core pipeline (`validate`, `plan`, `apply`, `verify`, `publish`,
+  `generate iac`, `bundle`, `diff`, `doctor`, and template or blank `forge`). Each feature that
+  needs one of the three prints the exact install line and exits 1, with no traceback, before it
+  does any work:
+  - AI forge with an API-key provider (`fluid forge --llm-provider openai|anthropic|gemini|...`),
+    `forge data-model`, `ai setup`, the agent loop and the staged copilot agents need
+    `pip install 'data-product-forge[litellm]'` (alias `[ai]`) or `[standard]`. The error is raised
+    before the interview reads any context or memory, and it names the ways to author without it:
+    `--llm-provider claude-code` (uses your Claude Code login; `codex`, `cursor`, `kiro` and
+    `mcp-sampling` are keyless too) and `--template starter`. Template and blank forge are
+    unchanged. `fluid doctor` no longer reports a configured provider as ready when litellm is
+    missing.
+  - `fluid mcp serve`, `fluid mcp output-port serve`, the MCP delegates and keyless
+    `mcp-sampling` need `[mcp]` or `[standard]`. `fluid scaffold-ide` needs it too, and writes
+    nothing without it, because every entry it writes launches `fluid mcp serve`.
+  - Sending lineage to `OPENLINEAGE_URL` needs `[lineage]`. Without it, `fluid apply` logs one
+    warning naming the extra and carries on; the SDK conformance suite fails with the same hint.
+  - AWS users need `[aws]`: boto3 used to arrive silently through litellm. Without it, an AWS
+    command that needs the account id fails with "The AWS account id could not be resolved: boto3
+    is not installed, so sts:GetCallerIdentity cannot be called. Install it with pip install
+    'data-product-forge[aws]', or set AWS_ACCOUNT_ID." instead of a misleading bucket-name error.
+  - `packaging` is now a declared base dependency (it used to arrive through litellm).
+
+  `pip install 'data-product-forge[standard]'` restores the previous AI and MCP behaviour, and
+  `[dev]` and `[all]` include all three. The Docker image profiles already install `[standard]` and
+  `[lineage]`. 0.27.0 added the extras next to the base install so you could switch first.
+  *Why:* the base install resolved to 88 packages (Linux, Python 3.12) for a command line whose
+  core commands need none of these three; litellm alone was 30 of them.
+  *Numbers* (`uv pip compile`, base install, no extras, packages before to after): Linux Python 3.12
+  88 to 41, Linux Python 3.10 86 to 45, Windows Python 3.12 89 to 41. A bare install is about
+  68 MB of site-packages, and `build_parser()` imports 842 modules on it.
+
 - **Every Databricks table now gets tag assignments.** A contract without labels used to make
   none; its table now carries the product's identity tags, which count toward Unity Catalog's 50
   per securable together with the governance labels. Refused rather than applied part way: a
@@ -81,6 +116,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fluid odcs validate --roundtrip` failed on an installed CLI** because `deepdiff` was
   declared only for development. It now belongs to the `[odcs-strict]` extra, and a missing
   `deepdiff` says which extra to install.
+
+- **Install hints keep their `[extra]` when the CLI prints them.** Rich read the `[litellm]` in
+  `pip install 'data-product-forge[litellm]'` as a style tag and dropped it, so the line a user
+  most needs after the 0.28.0 install change read `pip install 'data-product-forge'`. Every CLI
+  site that prints an exception's message, suggestions or hint (`forge`, `forge data-model`,
+  the AI copilot and template-mode error renderers, `core`, `doctor`, `market`, `auth`) now prints
+  it as written, with control characters spelled out. `tests/test_hints_print_literally.py` scans
+  those modules and fails on a new site that prints such text as markup.
 
 ## [0.27.0] — 2026-11-04
 
@@ -744,40 +787,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`--provider aws`, or `fluid publish --target datamesh-manager`) instead of a bare "unknown
   provider". A contract's `redshift` build runtime or expose platform is served by `aws`, and plugins
   cannot claim either retired name.
-
-
-- **Breaking (install): litellm, mcp and openlineage-python are no longer in the base install.**
-  *Before:* `pip install data-product-forge` pulled in litellm, mcp and openlineage-python, and with
-  them boto3 (through litellm), aiohttp, openai, tokenizers and about fifty more packages.
-  *Now:* the base install is the core pipeline (`validate`, `plan`, `apply`, `verify`, `publish`,
-  `generate iac`, `bundle`, `diff`, `doctor`, and template or blank `forge`). Each feature that
-  needs one of the three prints the exact install line and exits 1, with no traceback, before it
-  does any work:
-  - AI forge with an API-key provider (`fluid forge --llm-provider openai|anthropic|gemini|...`),
-    `forge data-model`, `ai setup`, the agent loop and the staged copilot agents need
-    `pip install 'data-product-forge[litellm]'` (alias `[ai]`) or `[standard]`. The error is raised
-    before the interview reads any context or memory, and it names the ways to author without it:
-    `--llm-provider claude-code` (uses your Claude Code login; `codex`, `cursor`, `kiro` and
-    `mcp-sampling` are keyless too) and `--template starter`. Template and blank forge are
-    unchanged. `fluid doctor` no longer reports a configured provider as ready when litellm is
-    missing.
-  - `fluid mcp serve`, `fluid mcp output-port serve`, the MCP delegates and keyless
-    `mcp-sampling` need `[mcp]` or `[standard]`. `fluid scaffold-ide` needs it too, and writes
-    nothing without it, because every entry it writes launches `fluid mcp serve`.
-  - Sending lineage to `OPENLINEAGE_URL` needs `[lineage]`. Without it, `fluid apply` logs one
-    warning naming the extra and carries on; the SDK conformance suite fails with the same hint.
-  - AWS users need `[aws]`: boto3 used to arrive silently through litellm. Without it `fluid diff`
-    and the AWS provider fail with the `[aws]` hint instead of a misleading bucket-name error.
-  - `packaging` is now a declared base dependency (it used to arrive through litellm).
-
-  `pip install 'data-product-forge[standard]'` restores the previous AI and MCP behaviour, and
-  `[dev]` and `[all]` include all three. The Docker image profiles already install `[standard]` and
-  `[lineage]`. 0.27.0 added the extras next to the base install so you could switch first.
-  *Why:* the base install resolved to 88 packages (Linux, Python 3.12) for a command line whose
-  core commands need none of these three; litellm alone was 30 of them.
-  *Numbers* (`uv pip compile`, base install, no extras, packages before to after): Linux Python 3.12
-  88 to 41, Linux Python 3.10 86 to 45, Windows Python 3.12 89 to 41. A bare install is about
-  56 MB of site-packages, and `build_parser()` imports 840 modules on it.
 
 ### Security
 
@@ -1776,7 +1785,6 @@ consumers.
 - Resolved `secretRef` values are registered with the exact-value redactor (#884), so a literal a
   client library echoes in its own error is masked by value rather than by pattern.
 
-
 - A contract repository could hand the whole host to its own SQL through DuckDB's spill
   directory. `secure_duckdb_connect` never set `temp_directory`, and DuckDB resolves its
   temp directory into `allowed_directories` like any other grant; the default is relative
@@ -1859,7 +1867,6 @@ into consumers.
   writes moved from
   `metadata.odps_passthrough` to the root `extensions.odps`, because `metadata` is
   `additionalProperties: false` and the old address could never validate.
-
 
 ### Fixed
 
@@ -2053,7 +2060,6 @@ into consumers.
   has nothing to decide.
 - `{{ env.NAME }}` interpolation in a connection field reads the environment without going through
   `secretRef` at all, so it is not covered by this policy.
-
 
 - On DuckDB 1.5.x, `lock_configuration` does not hold for logging reached as a table
   function: `SET enable_logging = true` is refused, but `SELECT * FROM enable_logging(...)`
@@ -2961,7 +2967,6 @@ This release fixes six security advisories. Each entry below has its own upgrade
   `RuntimeError` stand-in as `__cause__`, whose message starts with the driver's exception
   type name. Its `__context__` is `None`. Code that inspected the driver's exception on
   the chain must read the type name from that message instead.
-
 
 ### Upgrade notes
 
@@ -4502,8 +4507,6 @@ whole reason this release exists.
   identically. Sections that a reader could not reproduce — a Docker pull that
   returns `unauthorized`, a provider `fluid providers` does not list — are gone
   rather than softened. (#608)
-
-
 
 ## [0.15.0] — 2026-09-14
 

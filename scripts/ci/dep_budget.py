@@ -46,7 +46,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BASELINES = Path(__file__).resolve().parent / "dep_budget_baselines"
 
 # name -> (uv --python-platform, --python-version, ceiling). Measured with
-# uv 0.11.23 on 2026-11-03.
+# uv 0.11.23 on 2026-11-04.
 TARGETS: dict[str, tuple[str, str, int]] = {
     "linux-py312": ("linux", "3.12", 41),
     "linux-py310": ("linux", "3.10", 45),

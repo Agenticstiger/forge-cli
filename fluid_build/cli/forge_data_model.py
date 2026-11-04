@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import yaml
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.copilot.schemas.stage_outputs import LogicalDraft
 from fluid_build.copilot.store.audit_trail import write_audit_event
 from fluid_build.copilot.store.factory import resolve_store
@@ -359,7 +359,7 @@ def run_learn_command(args: Any, logger: logging.Logger) -> int:
         before = yaml.safe_load(original_path.read_text(encoding="utf-8"))
         after = yaml.safe_load(edited_path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
-        cprint(f"[red]learn failed:[/red] could not parse YAML: {exc}")
+        _print_failure("learn failed:", f"could not parse YAML: {exc}")
         return 1
 
     edits = compute_edits(before=before or {}, after=after or {})
@@ -431,10 +431,10 @@ def run_from_ddl_command(args: Any, logger: logging.Logger) -> int:
             engine=args.engine,
         )
     except ValueError as exc:
-        cprint(f"[red]from-ddl failed:[/red] {exc}")
+        _print_failure("from-ddl failed:", f"{exc}")
         return 1
     except AgentExecutionError as exc:
-        cprint(f"[red]from-ddl failed:[/red] {exc}")
+        _print_failure("from-ddl failed:", f"{exc}")
         return 1
     # H22 — always write a per-run cost.json so deterministic runs are
     # visible to ``fluid stats``.
@@ -488,7 +488,7 @@ def run_from_intent_command(args: Any, logger: logging.Logger) -> int:
         try:
             sys.stdout.write(render_intent_example(str(args.example)))
         except IntentValidationError as exc:
-            cprint(f"[red]from-intent failed:[/red] {exc}")
+            _print_failure("from-intent failed:", f"{exc}")
             return 1
         return 0
 
@@ -500,7 +500,7 @@ def run_from_intent_command(args: Any, logger: logging.Logger) -> int:
         try:
             load_business_intent(args.validate_intent)
         except IntentValidationError as exc:
-            cprint(f"[red]intent validation failed:[/red] {exc}")
+            _print_failure("intent validation failed:", f"{exc}")
             return 1
         cprint(f"[green]Intent file is valid[/green] {args.validate_intent}")
         return 0
@@ -525,7 +525,7 @@ def run_from_intent_command(args: Any, logger: logging.Logger) -> int:
     try:
         intent = load_business_intent(intent_file)
     except IntentValidationError as exc:
-        cprint(f"[red]from-intent failed:[/red] {exc}")
+        _print_failure("from-intent failed:", f"{exc}")
         return 1
 
     technique = _normalize_technique(
@@ -547,7 +547,7 @@ def run_from_intent_command(args: Any, logger: logging.Logger) -> int:
             engine=args.engine,
         )
     except AgentExecutionError as exc:
-        cprint(f"[red]from-intent failed:[/red] {exc}")
+        _print_failure("from-intent failed:", f"{exc}")
         return 1
     # H22 — always write a per-run cost.json so deterministic runs are
     # visible to ``fluid stats``.
@@ -581,10 +581,17 @@ def run_from_intent_command(args: Any, logger: logging.Logger) -> int:
     )
 
 
+def _print_failure(label: str, text: Any) -> None:
+    """``label`` in red, then ``text`` (an exception or message) printed as written."""
+    cprint(f"[red]{label}[/red]", end=" ")
+    cprint_literal(text)
+
+
 def _print_copilot_generation_error(exc: CopilotGenerationError) -> None:
-    cprint(f"[red]{exc.event}:[/red] {exc.message}")
+    cprint(f"[red]{exc.event}:[/red]", end=" ")
+    cprint_literal(exc.message)
     for suggestion in exc.suggestions:
-        cprint(f"  - {suggestion}")
+        cprint_literal(f"  - {suggestion}")
 
 
 def run_from_source_command(args: Any, logger: logging.Logger) -> int:
@@ -743,11 +750,12 @@ def run_from_source_command(args: Any, logger: logging.Logger) -> int:
         # ``suggestions`` attribute; surface them so the operator
         # has a clear next-action.
         suggestions = getattr(exc, "suggestions", None)
-        cprint(f"[red]from-source failed:[/red] {exc}")
+        cprint("[red]from-source failed:[/red]", end=" ")
+        cprint_literal(exc)
         if suggestions:
             cprint("Suggestions:")
             for s in suggestions:
-                cprint(f"  • {s}")
+                cprint_literal(f"  • {s}")
         return 1
 
     # H22 — persist cost.json under .fluid/agents/<run-id>/ even for
@@ -870,7 +878,7 @@ def run_validate_command(args: Any, logger: logging.Logger) -> int:
         # ``FileNotFoundError`` straight to the user via the generic
         # ``forge run`` fallback, which is terrible UX for a CLI that
         # advertises "fluid forge data-model validate <path>".
-        cprint(f"[red]validate failed:[/red] {target} does not exist")
+        _print_failure("validate failed:", f"{target} does not exist")
         return 1
 
     logical = None
@@ -887,7 +895,7 @@ def run_validate_command(args: Any, logger: logging.Logger) -> int:
             if model_path.exists():
                 logical = LogicalDraft.model_validate_json(model_path.read_text(encoding="utf-8"))
     except (yaml.YAMLError, ValueError) as exc:
-        cprint(f"[red]validate failed:[/red] {target} is not a valid contract/sidecar ({exc})")
+        _print_failure("validate failed:", f"{target} is not a valid contract/sidecar ({exc})")
         return 1
 
     report = validator.validate(logical=logical, contract=contract)
@@ -931,11 +939,11 @@ def run_dump_ddl_command(args: Any, logger: logging.Logger) -> int:
             warehouse=args.warehouse,
         )
     except RuntimeError as exc:
-        cprint(f"[red]dump-ddl failed:[/red] {exc}")
+        _print_failure("dump-ddl failed:", f"{exc}")
         return 1
     except Exception as exc:  # noqa: BLE001
         logger.error("dump_ddl_failed: %s", exc)
-        cprint(f"[red]dump-ddl failed:[/red] {exc}")
+        _print_failure("dump-ddl failed:", f"{exc}")
         return 1
 
     cprint(
@@ -1142,7 +1150,7 @@ def _maybe_run_custom_technique(args: Any, logger: logging.Logger) -> Optional[i
     try:
         logical = LogicalDraft.model_validate_json(path.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001 — surface the validation error cleanly
-        cprint(f"[red]--logical-model is not a valid logical model:[/red] {exc}")
+        _print_failure("--logical-model is not a valid logical model:", f"{exc}")
         return 1
     engine = getattr(args, "engine", None) or "dbt"
     output_path = Path(args.output)
@@ -1492,9 +1500,9 @@ def _print_validation_report(report: Any) -> None:
     for issue in report.issues:
         prefix = f"{issue.severity.upper()}:"
         if issue.field:
-            cprint(f"  {prefix} [{issue.field}] {issue.message}")
+            cprint_literal(f"  {prefix} [{issue.field}] {issue.message}")
         else:
-            cprint(f"  {prefix} {issue.message}")
+            cprint_literal(f"  {prefix} {issue.message}")
 
 
 def _print_canonical_coverage(logical: LogicalDraft, industry_pack: Any) -> None:

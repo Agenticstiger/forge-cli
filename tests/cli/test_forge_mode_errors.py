@@ -47,14 +47,14 @@ from fluid_build.cli.forge_modes import (
 )
 
 # Golden console strings — verbatim from the pre-refactor except blocks.
-GOLDEN_AI_GENERIC = "[red]AI Copilot failed: boom[/red]"
-GOLDEN_AI_COPILOT_ERR = "[red]❌ AI Copilot failed: friendly message[/red]"
+GOLDEN_AI_GENERIC = "AI Copilot failed: boom"
+GOLDEN_AI_COPILOT_ERR = "❌ AI Copilot failed: friendly message"
 GOLDEN_AI_TIP = (
     "[yellow]Tip: Run 'fluid ai setup' to configure your LLM provider,[/yellow]\n"
     "[yellow]or use 'fluid forge --blank' / guided mode without AI.[/yellow]"
 )
-GOLDEN_DOMAIN_GENERIC = "[red]❌ Domain agent failed: boom[/red]"
-GOLDEN_GUIDED_GENERIC = "[red]Guided mode failed: boom[/red]"
+GOLDEN_DOMAIN_GENERIC = "❌ Domain agent failed: boom"
+GOLDEN_GUIDED_GENERIC = "Guided mode failed: boom"
 
 
 def _printed(console: MagicMock) -> str:
@@ -313,7 +313,7 @@ class TestAiCopilotModeErrorParity:
         assert result == 1
         printed = _printed(console)
         assert GOLDEN_AI_COPILOT_ERR in printed
-        assert "[dim]• try this[/dim]" in printed
+        assert "• try this" in printed
         # The internal error code must never surface to the user.
         assert "internal_error_code" not in printed
 
@@ -328,7 +328,7 @@ class TestAiCopilotModeErrorParity:
         )
         with (
             patch("fluid_build.cli.forge_modes.console_error") as mock_err,
-            patch("fluid_build.cli.forge_modes.cprint") as mock_cprint,
+            patch("fluid_build.cli.forge_modes.cprint_literal") as mock_cprint,
         ):
             result = run_ai_copilot_mode(
                 self._args(),

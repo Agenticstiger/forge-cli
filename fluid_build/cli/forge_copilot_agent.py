@@ -30,7 +30,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
-from fluid_build.cli.console import cprint
+from fluid_build._console import literal_text
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_copilot_interview import run_post_generation_clarification
 from fluid_build.cli.forge_copilot_memory import CopilotMemoryStore
@@ -464,20 +465,18 @@ class CopilotAgentBase(CopilotProjectMemoryMixin, CopilotLegacyScaffoldMixin, AI
             return False
         except CopilotGenerationError as exc:
             if self.console:
-                self.console.print(f"[red]❌ {exc.message}[/red]")
+                self.console.print(literal_text(f"❌ {exc.message}", "red"))
                 for suggestion in exc.suggestions:
-                    from rich.markup import escape as _rich_escape
-
-                    self.console.print(f"[dim]• {_rich_escape(str(suggestion))}[/dim]")
+                    self.console.print(literal_text(f"• {suggestion}", "dim"))
             else:
                 console_error(exc.message)
                 for suggestion in exc.suggestions:
-                    cprint(f"  • {suggestion}")
+                    cprint_literal(f"  • {suggestion}")
             return False
         except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
             LOG.exception("Project creation failed")
             if self.console:
-                self.console.print(f"[red]❌ Failed to create project: {exc}[/red]")
+                self.console.print(literal_text(f"❌ Failed to create project: {exc}", "red"))
             else:
                 console_error(f"Failed to create project: {exc}")
             return False

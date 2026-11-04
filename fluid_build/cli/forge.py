@@ -35,11 +35,12 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from fluid_build._console import literal_text
 from fluid_build.cli.artifact_envelope import dump_json_with_envelope
 from fluid_build.cli.artifact_paths import product_forge_receipt_path
 from fluid_build.cli.artifact_receipts import ReceiptBuilder
 from fluid_build.cli.artifact_scan import diff_snapshots, snapshot_workspace
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_banner import print_v2_banner
 from fluid_build.cli.forge_copilot_memory import (
@@ -1569,7 +1570,9 @@ def _run_main(args, logger: logging.Logger) -> int:
             set_prompt_profile(_profile_name)
         except PromptProfileError as exc:
             if console:
-                console.print(f"[red]Invalid --prompt-profile:[/red] {exc}")
+                console.print(
+                    literal_text("Invalid --prompt-profile:", "red") + literal_text(f" {exc}")
+                )
             else:
                 console_error(f"Invalid --prompt-profile: {exc}")
             return 2
@@ -1596,7 +1599,9 @@ def _run_main(args, logger: logging.Logger) -> int:
             _active_overlays = activate_prompt_overlays(_overlay_spec)
         except PromptOverlayError as exc:
             if console:
-                console.print(f"[red]Invalid --prompt-overlay:[/red] {exc}")
+                console.print(
+                    literal_text("Invalid --prompt-overlay:", "red") + literal_text(f" {exc}")
+                )
             else:
                 console_error(f"Invalid --prompt-overlay: {exc}")
             return 2
@@ -1663,7 +1668,7 @@ def _run_main(args, logger: logging.Logger) -> int:
             _resolve_resume_args(args, workspace_root=scan_root, console=console)
         except _ResumeFlagError as exc:
             if console:
-                console.print(f"[red]{exc}[/red]")
+                console.print(literal_text(f"{exc}", "red"))
             else:
                 console_error(str(exc))
             return exc.exit_code
@@ -1916,25 +1921,23 @@ def _run_main(args, logger: logging.Logger) -> int:
         if isinstance(exc, FluidError):
             # Typed Fluid error — clean message + suggestions.
             if console:
-                console.print(f"[red]Forge failed:[/red] {message}")
+                console.print(literal_text("Forge failed:", "red") + literal_text(f" {message}"))
                 if suggestions:
                     console.print("[bold]Next actions:[/bold]")
                     for s in suggestions:
-                        console.print(f"  • {s}")
+                        console.print(literal_text(f"  • {s}"))
             else:
                 console_error(f"Forge failed: {message}")
                 if suggestions:
                     cprint("Next actions:")
                     for s in suggestions:
-                        cprint(f"  - {s}")
+                        cprint_literal(f"  - {s}")
         else:
             # Unexpected — full message; suggest doctor.
             logger.exception("Forge command failed")
             if console:
-                console.print(
-                    f"[red]Forge failed: {exc}[/red]\n"
-                    f"[dim]Run 'fluid doctor' to diagnose, or see {_DOCS_URL}[/dim]"
-                )
+                console.print(literal_text(f"Forge failed: {exc}", "red"))
+                console.print(f"[dim]Run 'fluid doctor' to diagnose, or see {_DOCS_URL}[/dim]")
             else:
                 console_error(f"Forge failed: {exc}")
                 cprint(f"Run 'fluid doctor' to diagnose, or see {_DOCS_URL}")
