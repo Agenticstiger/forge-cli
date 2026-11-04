@@ -128,11 +128,19 @@ def canonical_cloud(token: object) -> str:
     """Map a raw contract platform/provider token to a canonical cloud name.
 
     Returns the canonical name (``aws``/``gcp``/``snowflake``/``confluent``/
-    ``databricks``/``local``) or ``""`` when the token is empty or unrecognised.
+    ``databricks``/``local``), the name of an installed IaC plugin platform
+    (an entry point in ``fluid_build.iac_providers``; names only, nothing is
+    imported), or ``""`` when the token is empty or unrecognised.
     """
     if not isinstance(token, str):
         return ""
-    return PROVIDER_ALIASES.get(token.strip().lower().replace("-", "_"), "")
+    key = token.strip().lower().replace("-", "_")
+    cloud = PROVIDER_ALIASES.get(key, "")
+    if cloud or not key:
+        return cloud
+    from .registry import is_iac_entrypoint_platform
+
+    return key if is_iac_entrypoint_platform(key) else ""
 
 
 def is_cloud(binding: object, cloud: str) -> bool:

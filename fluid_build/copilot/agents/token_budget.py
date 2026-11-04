@@ -288,7 +288,7 @@ def count_tokens(text: str, *, provider: str = "", model: str = "") -> int:
         return estimate_tokens(text)
     if provider and model:
         try:
-            import litellm  # core dep
+            import litellm  # optional ([litellm]); the except below falls back to the heuristic
 
             from fluid_build.llm.litellm_backend import (
                 _LITELLM_PREFIX_BY_PROVIDER,

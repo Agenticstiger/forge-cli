@@ -29,6 +29,8 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from ..severity import is_error
+from ..util.contract import column_is_key
 from .changelog_types import Change
 
 # Type widening table — keys are the "from" type, values are the set of
@@ -181,17 +183,22 @@ def _expose_schema(expose: Mapping[str, Any]) -> Tuple[Sequence[Any], Optional[s
     Pre-0.7 contracts keep their columns at ``schema``; 0.7.x contracts keep
     them at ``contract.schema``. The flat ``schema`` is read when it is
     present and ``contract.schema`` only when it is absent, so a contract
-    that carries both is read as it was before 0.7.x. The location is
-    ``None`` when the expose carries no schema at all.
+    that carries both is read as it was before 0.7.x. Either one may wrap
+    its list as ``{"fields": [...]}``, as ``_verify_reconcile`` and
+    ``forge_copilot_drift_guard`` accept, and the columns are then found at
+    ``schema.fields``. The location is ``None`` when the expose carries no
+    schema at all.
     """
-    columns = expose.get("schema")
-    if columns is not None:
-        return columns or [], "schema"
-    contract = expose.get("contract")
-    columns = contract.get("schema") if isinstance(contract, Mapping) else None
-    if columns is not None:
-        return columns or [], "contract.schema"
-    return [], None
+    columns, location = expose.get("schema"), "schema"
+    if columns is None:
+        contract = expose.get("contract")
+        columns = contract.get("schema") if isinstance(contract, Mapping) else None
+        location = "contract.schema"
+    if columns is None:
+        return [], None
+    if isinstance(columns, Mapping):
+        columns, location = columns.get("fields"), f"{location}.fields"
+    return (columns if isinstance(columns, (list, tuple)) else []), location
 
 
 def _is_nullable(column: Mapping[str, Any]) -> bool:
@@ -225,7 +232,8 @@ def _primary_key_set(expose: Mapping[str, Any]) -> frozenset[str]:
     """Extract the set of primary-key column names from an expose dict.
 
     Supports both ``primaryKey: [col1, col2]`` at the expose root and the
-    per-column ``primaryKey: true`` flag — both occur in real contracts.
+    per-column ``primaryKey: true`` flag — both occur in real contracts —
+    and a 0.7.x column's primary-key tag (see :func:`_in_primary_key`).
     """
     pk: set[str] = set()
     expose_pk = expose.get("primaryKey")
@@ -234,11 +242,104 @@ def _primary_key_set(expose: Mapping[str, Any]) -> frozenset[str]:
             if isinstance(n, str):
                 pk.add(n)
     for col in _expose_schema(expose)[0]:
-        if isinstance(col, Mapping) and col.get("primaryKey") is True:
+        if isinstance(col, Mapping) and _in_primary_key(col):
             name = col.get("name")
             if isinstance(name, str):
                 pk.add(name)
     return frozenset(pk)
+
+
+def _in_primary_key(column: Mapping[str, Any]) -> bool:
+    """Whether *column* is a key of its expose, the way forge builds it.
+
+    The columns the dbt engine gives a ``primary_key`` constraint
+    (``util.contract.column_is_key``: a truthy key flag, a ``semanticType`` of
+    ``identifier`` or ``primary_key``, a ``labels`` ``constraint`` of
+    ``primary_key`` or ``unique``, a truthy ``labels.unique``), plus the
+    ``primary-key`` (or ``primaryKey``) tag the ODCS exporter turns into
+    ``primaryKey: true`` (``providers/odcs/mappers``).
+    """
+    tags = column.get("tags")
+    if isinstance(tags, (list, tuple)) and ("primary-key" in tags or "primaryKey" in tags):
+        return True
+    return column_is_key(column)
+
+
+#: Column sensitivities that mark personal data, as ``cli/docs_build.py`` and
+#: the MCP output port's PII redaction read them.
+_PERSONAL_DATA = frozenset({"pii", "phi"})
+
+
+def _is_pii(column: Mapping[str, Any]) -> bool:
+    """Whether *column* holds personal data.
+
+    Pre-0.7 columns say ``pii: true``. A 0.7.x column has no ``pii`` key and
+    says ``sensitivity: pii`` (or ``phi``).
+    """
+    sensitivity = column.get("sensitivity")
+    return bool(column.get("pii")) or (
+        isinstance(sensitivity, str) and sensitivity in _PERSONAL_DATA
+    )
+
+
+def _sensitivity(column: Mapping[str, Any]) -> Any:
+    """A column's ``sensitivity``; a pre-0.7 ``pii: true`` with none reads as ``pii``.
+
+    So rewriting ``pii: true`` as ``sensitivity: pii`` is not a change.
+    """
+    sensitivity = column.get("sensitivity")
+    if sensitivity is None and column.get("pii"):
+        return "pii"
+    return sensitivity
+
+
+def _sensitivity_changes(
+    old: Mapping[str, Any], new: Mapping[str, Any], col_name: str, path_prefix: str
+) -> List[Change]:
+    """PII annotation drift, and any other change to a 0.7.x column's ``sensitivity``.
+
+    A column gaining ``pii: true`` is a governance signal — downstream
+    consumers may have access controls that key off this flag. Surface as
+    INFO-level so it shows up in PR-review feedback without breaking the
+    build. A 0.7.x column says it with ``sensitivity`` (see :func:`_is_pii`),
+    and the change is reported at the key that carried it.
+    """
+    old_pii, new_pii = _is_pii(old), _is_pii(new)
+    old_sensitivity, new_sensitivity = _sensitivity(old), _sensitivity(new)
+    if old_pii != new_pii:
+        if old.get("sensitivity") != new.get("sensitivity"):
+            key, before, after = "sensitivity", old_sensitivity, new_sensitivity
+        else:
+            key, before, after = "pii", old_pii, new_pii
+        return [
+            Change(
+                path=f"{path_prefix}.{col_name}.{key}",
+                kind="column_pii_added" if new_pii else "column_pii_removed",
+                severity="info",
+                description=(
+                    f"column '{col_name}' is now PII"
+                    if new_pii
+                    else f"column '{col_name}' PII annotation removed"
+                ),
+                before=before,
+                after=after,
+            )
+        ]
+    if old_sensitivity != new_sensitivity:
+        return [
+            Change(
+                path=f"{path_prefix}.{col_name}.sensitivity",
+                kind="column_sensitivity_changed",
+                severity="info",
+                description=(
+                    f"column '{col_name}' sensitivity changed "
+                    f"{old_sensitivity or 'unset'} -> {new_sensitivity or 'unset'}"
+                ),
+                before=old_sensitivity,
+                after=new_sensitivity,
+            )
+        ]
+    return []
 
 
 def diff_columns(
@@ -355,27 +456,7 @@ def diff_columns(
                 )
             )
 
-        # PII annotation drift. A column gaining ``pii: true`` is a
-        # governance signal — downstream consumers may have access
-        # controls that key off this flag. Surface as INFO-level so it
-        # shows up in PR-review feedback without breaking the build.
-        old_pii = bool(old.get("pii"))
-        new_pii = bool(new.get("pii"))
-        if old_pii != new_pii:
-            changes.append(
-                Change(
-                    path=f"{path_prefix}.{col_name}.pii",
-                    kind="column_pii_added" if new_pii else "column_pii_removed",
-                    severity="info",
-                    description=(
-                        f"column '{col_name}' is now PII"
-                        if new_pii
-                        else f"column '{col_name}' PII annotation removed"
-                    ),
-                    before=old_pii,
-                    after=new_pii,
-                )
-            )
+        changes.extend(_sensitivity_changes(old, new, col_name, path_prefix))
 
         # Nullability changes.
         old_null = _is_nullable(old)
@@ -582,33 +663,90 @@ def diff_sovereignty(baseline: Mapping[str, Any], new: Mapping[str, Any]) -> Lis
     return changes
 
 
+#: Where an expose keeps its quality rules, and the keys that name one there:
+#: pre-0.7 ``quality.tests``; in 0.7.x ``contract.dq.rules`` (``$defs.dqRule``)
+#: and the inline ``contract.quality``.
+_QUALITY_RULES: Tuple[Tuple[Tuple[str, ...], Tuple[str, ...], str], ...] = (
+    (("quality", "tests"), ("name", "id"), "quality test"),
+    (("contract", "dq", "rules"), ("id",), "quality rule"),
+    (("contract", "quality"), ("rule",), "quality rule"),
+)
+
+
 def diff_quality_severity(
     baseline_expose: Mapping[str, Any],
     new_expose: Mapping[str, Any],
     expose_id: str,
     expose_idx: int,
 ) -> List[Change]:
-    """A quality rule whose severity escalates warn -> error breaks downstream gating."""
-    old_tests = _quality_tests_by_name(baseline_expose)
-    new_tests = _quality_tests_by_name(new_expose)
+    """A quality rule whose severity escalates to a failing one breaks downstream gating.
 
+    Reads the rules of every location in ``_QUALITY_RULES`` and, from 0.7.6,
+    each column's own ``quality`` rules (named by ``id``, ODCS's shape).
+    ``critical`` fails a run as ``error`` does (``fluid_build.severity``), so
+    either one is an escalation from ``warn``, and one to the other is not. A
+    rule is matched across versions by name; one without a name is skipped.
+    """
     changes: List[Change] = []
-    path_prefix = f"exposes[{expose_idx}].quality.tests"
-    for name, new_test in new_tests.items():
-        old_test = old_tests.get(name)
-        if old_test is None:
+    for location, keys, noun in _QUALITY_RULES:
+        changes.extend(
+            _severity_escalations(
+                _rules_by_name(_dig(baseline_expose, location), keys),
+                _rules_by_name(_dig(new_expose, location), keys),
+                path_prefix=f"exposes[{expose_idx}].{'.'.join(location)}",
+                owner=f"expose '{expose_id}'",
+                noun=noun,
+            )
+        )
+
+    base_columns = _columns_by_name(_expose_schema(baseline_expose)[0])
+    new_cols, new_at = _expose_schema(new_expose)
+    for col_name, new_col in _columns_by_name(new_cols).items():
+        old_col = base_columns.get(col_name)
+        if old_col is None:
             continue
-        old_sev = str(old_test.get("severity", "warn")).lower()
-        new_sev = str(new_test.get("severity", "warn")).lower()
-        if old_sev != "error" and new_sev == "error":
+        changes.extend(
+            _severity_escalations(
+                _rules_by_name(old_col.get("quality"), ("id", "name")),
+                _rules_by_name(new_col.get("quality"), ("id", "name")),
+                path_prefix=f"exposes[{expose_idx}].{new_at}.{col_name}.quality",
+                owner=f"column '{col_name}' of expose '{expose_id}'",
+                noun="quality rule",
+            )
+        )
+    return changes
+
+
+def _severity_escalations(
+    old_rules: Mapping[str, Sequence[Mapping[str, Any]]],
+    new_rules: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    path_prefix: str,
+    owner: str,
+    noun: str,
+) -> List[Change]:
+    """A named rule escalated: failing in the new contract, and not in the old one.
+
+    A name can be on several rules (nothing makes an id unique), and each
+    version is judged by its most severe rule of that name, so a failing rule
+    cannot hide behind a ``warn`` one of the same id.
+    """
+    changes: List[Change] = []
+    for name, new_group in new_rules.items():
+        old_group = old_rules.get(name)
+        if not old_group:
+            continue
+        old_sev = _most_severe(old_group)
+        new_sev = _most_severe(new_group)
+        if not is_error(old_sev) and is_error(new_sev):
             changes.append(
                 Change(
                     path=f"{path_prefix}.{name}.severity",
                     kind="quality_severity_escalated",
                     severity="breaking",
                     description=(
-                        f"quality test '{name}' on expose '{expose_id}' "
-                        f"escalated to severity=error (previously {old_sev}); "
+                        f"{noun} '{name}' on {owner} "
+                        f"escalated to severity={new_sev} (previously {old_sev}); "
                         f"downstream gating will now hard-fail"
                     ),
                     before=old_sev,
@@ -618,17 +756,28 @@ def diff_quality_severity(
     return changes
 
 
-def _quality_tests_by_name(expose: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
-    out: dict[str, Mapping[str, Any]] = {}
-    quality = expose.get("quality") or {}
-    if not isinstance(quality, Mapping):
+def _dig(node: Any, keys: Sequence[str]) -> Any:
+    for key in keys:
+        if not isinstance(node, Mapping):
+            return None
+        node = node.get(key)
+    return node
+
+
+def _most_severe(rules: Sequence[Mapping[str, Any]]) -> str:
+    severities = [str(rule.get("severity", "warn")).lower() for rule in rules]
+    return next((sev for sev in severities if is_error(sev)), severities[0])
+
+
+def _rules_by_name(rules: Any, keys: Sequence[str]) -> dict[str, List[Mapping[str, Any]]]:
+    out: dict[str, List[Mapping[str, Any]]] = {}
+    if not isinstance(rules, (list, tuple)):
         return out
-    tests = quality.get("tests") or []
-    for t in tests:
-        if isinstance(t, Mapping):
-            name = t.get("name") or t.get("id")
+    for rule in rules:
+        if isinstance(rule, Mapping):
+            name = next((rule.get(k) for k in keys if rule.get(k)), None)
             if isinstance(name, str):
-                out[name] = t
+                out.setdefault(name, []).append(rule)
     return out
 
 

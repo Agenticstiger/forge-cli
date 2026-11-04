@@ -34,7 +34,10 @@ Borrowed model (adapted, **not** depended on — zero new dependencies):
 industry-standard property (dbt / pluggy / Backstage don't sandbox third-party
 plugins either; see ``SECURITY``). The operator pins exactly which plugins load
 via ``FLUID_PLUGINS_ALLOWLIST`` / ``FLUID_PLUGINS_BLOCKLIST`` (comma-separated
-entry-point names; allowlist wins — if set, only listed names load). Every load
+entry-point names, matched case-insensitively with ``-`` == ``_``). The
+blocklist always wins; an allowlist holding a bare name restricts loading to the
+listed names, while ``<distribution>:<name>`` entries only grant built-in
+overrides and restrict nothing. Every load
 and invocation is fail-isolated and logged **by exception type only**, so a
 plugin bug or a secret-bearing exception message can neither crash the CLI nor
 leak into logs.
@@ -44,6 +47,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 # role tag (fluid_sdk.BasePlugin.role) -> entry-point group. Single source of truth.
@@ -116,18 +120,78 @@ def _env_names(var: str) -> set:
     return {x.strip() for x in os.environ.get(var, "").split(",") if x.strip()}
 
 
+def _policy_key(name: str) -> str:
+    """How allow/block entries and plugin names compare: case-insensitive, ``-`` == ``_``."""
+    return str(name).strip().lower().replace("-", "_")
+
+
 def is_allowed(name: str) -> bool:
     """Return whether entry-point ``name`` may load under the allow/block policy.
 
-    Blocklist always wins; if an allowlist is set, only listed names load.
+    Names match case-insensitively, with ``-`` and ``_`` equal, so ``Kube-Rnetes``
+    cannot slip past ``FLUID_PLUGINS_BLOCKLIST=kube_rnetes``. The blocklist always
+    wins. If the allowlist holds a bare name, only listed names load. A
+    ``<distribution>:<name>`` entry only grants an override (:func:`override_granted`)
+    and restricts nothing.
     """
-    block = _env_names(_BLOCKLIST_ENV)
-    if name in block:
+    key = _policy_key(name)
+    if key in {_policy_key(n) for n in _env_names(_BLOCKLIST_ENV)}:
         return False
-    allow = _env_names(_ALLOWLIST_ENV)
-    if allow and name not in allow:
+    allow = {_policy_key(n) for n in _env_names(_ALLOWLIST_ENV) if _QUALIFIED_SEP not in n}
+    if allow and key not in allow:
         return False
     return True
+
+
+_QUALIFIED_SEP = ":"
+
+#: PEP 508 project-name grammar (https://peps.python.org/pep-0508/#names), used
+#: with ``fullmatch`` so a trailing newline cannot pass.
+_DIST_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+
+
+def _norm_dist(name: str) -> str:
+    """PEP 503-normalised distribution name (``Acme_Fluid.AWS`` -> ``acme-fluid-aws``)."""
+    return re.sub(r"[-_.]+", "-", name.strip()).lower()
+
+
+def granted_distribution(ep: Any) -> Optional[str]:
+    """The name of the distribution that ships ``ep``, when it is a valid project name.
+
+    Read from the distribution itself (``ep.dist.name``), never from the
+    ``"<name> <version>"`` display string of :func:`entry_point_distribution`,
+    so a self-declared ``Name: acme-fluid-aws spoof`` cannot satisfy the grant
+    ``acme-fluid-aws:aws``. ``None``, so no grant is possible, for anything else.
+    """
+    dist = getattr(ep, "dist", None)
+    name = getattr(dist, "name", None) if dist is not None else None
+    if isinstance(name, str) and _DIST_NAME.fullmatch(name):
+        return name
+    return None
+
+
+def override_granted(ep: Any) -> bool:
+    """Whether the operator explicitly allowed ``ep`` to replace a built-in name.
+
+    Built-in provider and IaC platform names are reserved: a third-party entry
+    point that claims one is skipped before it loads, because an installed
+    plugin could otherwise take over a name silently. An operator who wants
+    the override grants it with a distribution-qualified entry in
+    ``FLUID_PLUGINS_ALLOWLIST``: ``<distribution>:<entry-point name>``, for
+    example ``acme-fluid-aws:aws``. A bare name cannot grant it, because the
+    built-in has the same name. Qualified entries only grant overrides; they do
+    not make the allowlist restrict other plugins.
+    """
+    dist = granted_distribution(ep)
+    if dist is None:
+        return False
+    want = f"{_norm_dist(dist)}{_QUALIFIED_SEP}{_policy_key(ep.name)}"
+    granted = set()
+    for entry in _env_names(_ALLOWLIST_ENV):
+        dist_name, sep, ep_name = entry.partition(_QUALIFIED_SEP)
+        if sep and dist_name.strip() and ep_name.strip():
+            granted.add(f"{_norm_dist(dist_name)}{_QUALIFIED_SEP}{_policy_key(ep_name)}")
+    return want in granted
 
 
 def _entry_points(group: str) -> List[Any]:
@@ -214,12 +278,14 @@ def installed_plugins(role: Optional[str] = None) -> Dict[str, List[Dict[str, An
     can audit or uninstall.
 
     Name-reading here is not the same as the *process* being plugin-free: CLI
-    bootstrap builds the full argparse tree first, and the ``iac_provider``
-    and ``modeling_technique`` roles feed argparse ``choices=`` from their
-    registries, so those two roles are discovered — and their entry points
-    loaded — before any command runs, ``fluid --version`` included. Set
-    ``FLUID_PLUGINS_BLOCKLIST`` to inspect an untrusted plugin without
-    executing it; the policy is checked before every ``ep.load()``.
+    bootstrap builds the full argparse tree first, and the
+    ``modeling_technique`` role feeds argparse ``choices=`` from its registry,
+    so that role is discovered, and its entry points loaded, before any command
+    runs, ``fluid --version`` included. The ``iac_provider`` role is lazy: its
+    plugin is loaded by name when a contract's platform needs it
+    (``iac.registry.get_iac_plugin``). Set ``FLUID_PLUGINS_BLOCKLIST`` to
+    inspect an untrusted plugin without executing it; the policy is checked
+    before every ``ep.load()``.
     """
     groups = governed_groups()
     keys = [role] if role else list(groups)

@@ -33,7 +33,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 
 from ._common import CLIError
 from ._logging import info
@@ -573,6 +573,7 @@ def run(args, logger: logging.Logger) -> int:
         feature_checks_ok=feature_checks_ok,
         copilot_readiness=copilot_readiness,
     )
+    _print_extras_move_notice()
 
     if not extended_requested:
         return 0 if feature_checks_ok and not needs_action else 1
@@ -728,6 +729,19 @@ def _print_doctor_summary(
     cprint("=" * 60)
     cprint(f"Status:  {summary.status}")
     cprint(f"Message: {summary.message}")
+    cprint()
+
+
+#: Shown once per ``fluid doctor`` run. litellm and mcp leave the base
+#: install in 0.28.0 (``[standard]`` restores both); keep the text in step
+#: with the release note for that change.
+EXTRAS_MOVE_NOTICE = "AI/MCP move to extras in 0.28.0: pip install 'data-product-forge[standard]'"
+
+
+def _print_extras_move_notice() -> None:
+    """Print the one-line AI/MCP extras notice (a single call per run)."""
+    # Literal: rich would read "[standard]" as a markup tag and drop it.
+    cprint_literal(EXTRAS_MOVE_NOTICE)
     cprint()
 
 
@@ -1188,30 +1202,51 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
     # check is non-critical (ok=True) so a missing install doesn't fail
     # the suite. Surfaces both install state and the env-var status so
     # users can confirm at a glance whether routing is live.
-    try:
-        import litellm  # type: ignore[import-untyped]
+    # Detection is metadata-only: ``import litellm`` costs ~2,300 modules and
+    # makes litellm fetch its model-cost map over the network, which a health
+    # check must never do.
+    from importlib import metadata as _metadata
 
-        litellm_version = getattr(litellm, "__version__", "(unknown)")
-        details = f"litellm {litellm_version} · routing every provider"
-        checks.append(
-            {
-                "check": "LiteLLM backend",
-                "category": "ai",
-                "status": "✅ Installed",
-                "ok": True,
-                "details": details,
-            }
-        )
-    except ImportError:
-        checks.append(
-            {
-                "check": "LiteLLM backend",
-                "category": "ai",
-                "status": "⚠️  Not installed (optional)",
-                "ok": True,
-                "details": "Install with: pip install 'data-product-forge[litellm]'",
-            }
-        )
+    from fluid_build._optional import is_available
+
+    # Same metadata-only probe for the other optional runtimes the install hints
+    # point at, so ``fluid doctor`` shows the extra to install. Never imported:
+    # ``mcp`` and ``openlineage`` are large trees and have no business in a health check.
+    for label, module, dist, extra, note in (
+        ("LiteLLM backend", "litellm", "litellm", "litellm", "routing every provider"),
+        ("MCP SDK", "mcp", "mcp", "mcp", "fluid mcp serve / MCP delegates"),
+        (
+            "OpenLineage client",
+            "openlineage.client",
+            "openlineage-python",
+            "lineage",
+            "lineage emission",
+        ),
+    ):
+        if is_available(module):
+            try:
+                version = _metadata.version(dist)
+            except _metadata.PackageNotFoundError:
+                version = "(unknown)"
+            checks.append(
+                {
+                    "check": label,
+                    "category": "ai",
+                    "status": "✅ Installed",
+                    "ok": True,
+                    "details": f"{dist} {version} · {note}",
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "check": label,
+                    "category": "ai",
+                    "status": "⚠️  Not installed (optional)",
+                    "ok": True,
+                    "details": f"Install with: pip install 'data-product-forge[{extra}]'",
+                }
+            )
 
     # Third-party LLM provider plugins (entry-point group fluid_build.llm_providers).
     # Reads entry-point NAMES only (never loads/executes plugin code) so a health

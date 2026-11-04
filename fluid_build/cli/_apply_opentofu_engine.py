@@ -106,10 +106,16 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
 
     plugin = get_iac_plugin(provider)
     if plugin is None:
+        from fluid_build.iac.registry import iac_plugin_unavailable_reason
+
+        why = iac_plugin_unavailable_reason(provider)
         raise CLIError(
             1,
             "opentofu_engine_unsupported_provider",
-            {"error": f"no OpenTofu plugin for provider {provider!r}"},
+            {
+                "error": f"no OpenTofu plugin for provider {provider!r}"
+                + (f": {why}" if why else "")
+            },
         )
     if runner.tofu_path() is None:
         # `tofu` isn't on PATH. When the operator opted in (--ensure-opentofu,
