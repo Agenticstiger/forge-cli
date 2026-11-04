@@ -1188,17 +1188,18 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
                 }
             )
         else:
+            configured = bool(readiness.provider)
             checks.append(
                 {
                     "check": "Forge AI Copilot",
                     "category": "ai",
-                    "status": "⚠️  Not ready" if readiness.error else "⚠️  Not configured",
+                    "status": "⚠️  Not ready" if configured else "⚠️  Not configured",
                     "ok": True,  # Non-critical
                     # A configured provider that cannot run (litellm missing) says
                     # why, with the install line, instead of blaming setup.
                     "details": (
                         str(getattr(readiness.error, "message", readiness.error))
-                        if readiness.error
+                        if configured and readiness.error
                         else "Run 'fluid ai setup' to configure"
                     ),
                 }

@@ -110,7 +110,7 @@ fluid scaffold-ide --target <ide> --force
 ```
 
 The canonical pack ships inside the `data-product-forge` package, so a
-`pip install -U data-product-forge && fluid scaffold-ide --target <ide> --force`
+`pip install -U 'data-product-forge[mcp]' && fluid scaffold-ide --target <ide> --force`
 pulls in any pipeline-stage or steering updates.
 
 ---

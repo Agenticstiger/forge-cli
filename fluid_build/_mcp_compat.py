@@ -68,10 +68,9 @@ def require_sdk(feature: str = "The MCP server") -> None:
     missing install reads as one install line and not ``No module named 'mcp'``.
     Probes with ``find_spec``; nothing is imported.
     """
-    from fluid_build._optional import MissingOptionalDependency, is_available
+    from fluid_build._optional import ensure_installed
 
-    if not is_available("mcp"):
-        raise MissingOptionalDependency("mcp", "mcp", feature)
+    ensure_installed("mcp", "mcp", feature)
 
 
 @functools.lru_cache(maxsize=1)

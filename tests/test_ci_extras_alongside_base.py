@@ -82,7 +82,7 @@ class TestFilledExtras:
         assert "pyjwt" in _names("mcp")
 
     def test_lineage_carries_openlineage(self):
-        assert EXTRAS["lineage"] == ["openlineage-python>=1.52"]
+        assert EXTRAS["lineage"] == ["openlineage-python>=1.52", "python-dateutil>=2.8.2"]
 
     def test_standard_covers_litellm_and_mcp(self):
         assert g.closure("litellm", EXTRAS) <= g.closure("standard", EXTRAS)

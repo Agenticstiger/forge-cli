@@ -819,6 +819,11 @@ def run_ai_setup_interactive(
         )
         return None
 
+    # Every provider the picker offers is validated through litellm. Without it
+    # the wizard would read the keyring and collect a key it can only reject, so
+    # stop before touching either (the CLI prints the hint and exits 1).
+    _require_litellm_for_setup()
+
     # Show current status first. When a specific provider was requested
     # we skip the "already configured / reconfigure?" gate — the operator
     # explicitly asked to (re)configure that one provider.
@@ -1503,16 +1508,7 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
         # Nothing keyless is available and the API-key providers cannot run here:
         # say so once, offer no key prompt, save nothing.
         if console and RICH_AVAILABLE:
-            from fluid_build._console import literal_text
-
-            console.print(
-                literal_text(
-                    "AI authoring with an API-key provider or Ollama needs litellm: "
-                    "pip install 'data-product-forge[litellm]'",
-                    "yellow",
-                )
-            )
-            console.print(literal_text(_SETUP_KEYLESS_ALTERNATIVES, "dim"))
+            print_litellm_missing(console)
         LOG.info("Inline AI setup: litellm missing, no keyless agent found")
         return None
     imported = _offer_import_from_other_clis(console)
@@ -1809,17 +1805,27 @@ _SETUP_KEYLESS_ALTERNATIVES = (
 )
 
 
+def print_litellm_missing(console: Any) -> None:
+    """Print the litellm install line and the keyless alternatives, literally."""
+    from fluid_build._console import literal_text
+
+    console.print(
+        literal_text(
+            "AI authoring with an API-key provider or Ollama needs litellm: "
+            "pip install 'data-product-forge[litellm]'",
+            "yellow",
+        )
+    )
+    console.print(literal_text(_SETUP_KEYLESS_ALTERNATIVES, "dim"))
+
+
 def _require_litellm_for_setup() -> None:
     """Raise the install hint when litellm is absent, before any key is asked for."""
-    from fluid_build._optional import MissingOptionalDependency, is_available
+    from fluid_build._optional import ensure_installed
 
-    if not is_available("litellm"):
-        raise MissingOptionalDependency(
-            "litellm",
-            "litellm",
-            "Validating an AI provider key",
-            alternatives=_SETUP_KEYLESS_ALTERNATIVES,
-        )
+    ensure_installed(
+        "litellm", "litellm", "Validating an AI provider key", _SETUP_KEYLESS_ALTERNATIVES
+    )
 
 
 def _run_ai_command(args, logger: logging.Logger) -> int:
@@ -1885,9 +1891,7 @@ def _run_ai_command(args, logger: logging.Logger) -> int:
                 print_v2_banner("ai_setup", quiet=getattr(args, "quiet", False))
             return rc
 
-        # Every provider the picker offers is validated through litellm. Without
-        # it the wizard would collect an API key and only then fail, so stop
-        # before the first prompt (the CLI prints the hint and exits 1).
+        # Also checked inside the wizard, for its other callers.
         _require_litellm_for_setup()
 
         result = run_ai_setup_interactive(console, preselected_provider=preselected)

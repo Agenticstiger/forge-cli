@@ -341,3 +341,131 @@ def test_readiness_is_not_ready_when_a_key_is_set_but_litellm_is_absent(block): 
     assert result.ready is False
     assert result.auth_available is True
     assert "pip install 'data-product-forge[litellm]'" in (result.error or "")
+
+
+class TestNoKeyringBeforeTheHint:
+    """Without litellm, nothing reads a credential store or probes a port first."""
+
+    @staticmethod
+    def _spy(monkeypatch) -> list[str]:
+        calls: list[str] = []
+        import fluid_build.cli.ai_setup as ai_setup
+
+        for name in ("_load_key_from_keyring", "_save_key_to_keyring", "detect_ollama_available"):
+            monkeypatch.setattr(ai_setup, name, lambda *a, _n=name, **k: calls.append(_n))
+        try:
+            import keyring
+        except ImportError:
+            pass
+        else:
+            for name in ("get_password", "set_password", "get_credential"):
+                monkeypatch.setattr(
+                    keyring, name, lambda *a, _n=name, **k: calls.append(f"keyring.{_n}")
+                )
+        import fluid_build.llm.providers as providers
+
+        monkeypatch.setattr(
+            providers,
+            "_infer_provider_from_env",
+            lambda *a, **k: calls.append("infer") or None,
+        )
+        return calls
+
+    def test_preflight_with_no_selector_fails_before_inference(
+        self, block, monkeypatch
+    ):  # noqa: F811
+        block("litellm")
+        calls = self._spy(monkeypatch)
+        from types import SimpleNamespace
+
+        from fluid_build.llm.providers import preflight_llm_provider
+
+        args = SimpleNamespace(llm_provider=None, agent_loop=False)
+        with pytest.raises(MissingOptionalDependency) as info:
+            preflight_llm_provider(args, {})
+        assert "pip install 'data-product-forge[litellm]'" in str(info.value)
+        assert _ALTERNATIVES in str(info.value)
+        assert calls == []
+
+    def test_preflight_with_a_keyless_selector_still_passes(self, block, monkeypatch):  # noqa: F811
+        block("litellm")
+        from types import SimpleNamespace
+
+        from fluid_build.llm.providers import preflight_llm_provider
+
+        preflight_llm_provider(SimpleNamespace(llm_provider="claude-code"), {})
+        preflight_llm_provider(SimpleNamespace(llm_provider=None), {"FLUID_FORGE_AGENT": "codex"})
+
+    def test_init_handoff_prints_the_hint_and_touches_no_credential_store(
+        self, block, monkeypatch, tmp_path, capsys  # noqa: F811
+    ):
+        block("litellm")
+        calls = self._spy(monkeypatch)
+        import logging
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import fluid_build.cli.ai_setup as ai_setup
+        from fluid_build.cli.init import _offer_first_forge
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(ai_setup, "_load_ai_config", lambda *a, **k: None)
+        monkeypatch.setattr(
+            ai_setup, "_offer_import_from_other_clis", lambda *a, **k: calls.append("import")
+        )
+        monkeypatch.setattr(
+            ai_setup, "_prompt_for_api_key", lambda *a, **k: calls.append("key-prompt")
+        )
+        for var in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "OLLAMA_HOST"):
+            monkeypatch.delenv(var, raising=False)
+        args = SimpleNamespace(target_dir=str(tmp_path), name=None, provider=None)
+        with (
+            patch("fluid_build.cli.init._is_ai_configured", return_value=False),
+            patch("fluid_build.cli.init.RICH_AVAILABLE", True),
+            patch("rich.prompt.Confirm.ask", return_value=True),
+            patch("fluid_build.cli.forge.run") as forge_run,
+        ):
+            _offer_first_forge(args, logging.getLogger("test"))
+        out = " ".join((lambda c: c.out + c.err)(capsys.readouterr()).split())
+        assert "pip install 'data-product-forge[litellm]'" in out
+        assert "--llm-provider claude-code" in out
+        assert calls == []
+        forge_run.assert_not_called()
+
+
+class TestDoctorStatus:
+    def _row(self, monkeypatch):
+        from fluid_build.cli.doctor import _check_fluid_features
+
+        _ok, checks = _check_fluid_features()
+        return next(c for c in checks if c["check"] == "Forge AI Copilot")
+
+    def test_nothing_configured_says_not_configured(self, block, monkeypatch):  # noqa: F811
+        block("litellm")
+        for var in (
+            "FLUID_LLM_PROVIDER",
+            "FLUID_FORGE_AGENT",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OLLAMA_HOST",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        import fluid_build._ai_config_shared as shared
+        import fluid_build.llm.providers as providers
+
+        monkeypatch.setattr(shared, "load_ai_config", lambda *a, **k: None)
+        monkeypatch.setattr(providers, "_infer_provider_from_keyring", lambda *a, **k: None)
+        monkeypatch.setattr(providers, "_infer_provider_from_ambient", lambda *a, **k: None)
+        row = self._row(monkeypatch)
+        assert "Not configured" in row["status"]
+        assert "fluid ai setup" in row["details"]
+
+    def test_configured_but_unable_to_run_says_not_ready(self, block, monkeypatch):  # noqa: F811
+        block("litellm")
+        monkeypatch.setenv("FLUID_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-real-0000000000000000")
+        row = self._row(monkeypatch)
+        assert "Not ready" in row["status"]
+        assert "pip install 'data-product-forge[litellm]'" in row["details"]

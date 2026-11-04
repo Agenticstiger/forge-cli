@@ -100,6 +100,8 @@ expect_once() { # expect_once <label> <wanted-rc> <needle> <command...>
 expect "mcp serve" 1 "pip install 'data-product-forge[mcp]'" "$FLUID" mcp serve
 expect "scaffold-ide" 1 "pip install 'data-product-forge[mcp]'" \
   "$FLUID" scaffold-ide --target claude-code --out ide
+expect "output-port serve" 1 "pip install 'data-product-forge[mcp]'" \
+  "$FLUID" mcp output-port serve "$CONTRACT"
 [ ! -e ide ] || { echo "::error::scaffold-ide wrote files without the mcp SDK"; exit 1; }
 expect "ai forge" 1 "pip install 'data-product-forge[litellm]'" \
   env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u GEMINI_API_KEY -u GOOGLE_API_KEY \
@@ -128,6 +130,8 @@ expect_once "lineage warns once" 0 "pip install 'data-product-forge[lineage]'" \
   env OPENLINEAGE_URL=http://127.0.0.1:9 "$VENV/bin/python" -I -c "
 from fluid_build.api.lineage import RunEventType
 from fluid_build.build_runners._lineage import emit_apply_event, resolve_lineage_emitter
+from fluid_build.cli import _setup_enhanced_logging
+_setup_enhanced_logging('WARNING', None)  # the CLI's handlers, as in a real apply
 emitter = resolve_lineage_emitter()
 for kind in (RunEventType.START, RunEventType.COMPLETE):
     emit_apply_event(emitter, {'id': 'p', 'exposes': []}, event_type=kind,

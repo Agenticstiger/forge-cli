@@ -488,15 +488,14 @@ def _require_litellm(provider_name: str) -> None:
     :class:`~fluid_build._optional.MissingOptionalDependency`, which the CLI
     prints as the install line and exits 1 on, with no traceback.
     """
-    from fluid_build._optional import MissingOptionalDependency, is_available
+    from fluid_build._optional import ensure_installed
 
-    if not is_available("litellm"):
-        raise MissingOptionalDependency(
-            "litellm",
-            "litellm",
-            f"AI-assisted authoring (--llm-provider {provider_name})",
-            alternatives=_LITELLM_ALTERNATIVES,
-        )
+    ensure_installed(
+        "litellm",
+        "litellm",
+        f"AI-assisted authoring (--llm-provider {provider_name})",
+        _LITELLM_ALTERNATIVES,
+    )
 
 
 def get_llm_provider(name: str) -> LlmProvider:
@@ -814,16 +813,30 @@ def preflight_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = Non
     The error is tailored to the run: ``(--llm-provider X)`` only when the flag
     was passed, and in ``--agent-loop`` only the alternative that works there.
     """
-    from fluid_build._optional import MissingOptionalDependency
+    from fluid_build._optional import MissingOptionalDependency, ensure_installed
 
-    name = _provider_name_from(args, dict(environ or os.environ))
+    env = dict(environ or os.environ)
+    agent_loop = bool(getattr(args, "agent_loop", False))
+    if not (
+        getattr(args, "llm_provider", None)
+        or env.get("FLUID_LLM_PROVIDER")
+        or env.get("FLUID_FORGE_AGENT")
+    ):
+        # Nothing chosen: inference reads the keyring and probes Ollama, and every
+        # provider it can pick (or the gemini default) needs litellm. Fail first.
+        ensure_installed(
+            "litellm",
+            "litellm",
+            "AI-assisted authoring",
+            _AGENT_LOOP_ALTERNATIVES if agent_loop else _LITELLM_ALTERNATIVES,
+        )
+    name = _provider_name_from(args, env)
     if not isinstance(name, str):
         return
     try:
         get_llm_provider(name)
     except MissingOptionalDependency as exc:
         flagged = bool(getattr(args, "llm_provider", None))
-        agent_loop = bool(getattr(args, "agent_loop", False))
         how = f"--llm-provider {name}" if flagged else f"provider {name}"
         raise MissingOptionalDependency(
             exc.module,

@@ -45,7 +45,7 @@ import importlib.util
 import sys
 from types import ModuleType
 
-__all__ = ["MissingOptionalDependency", "is_available", "require"]
+__all__ = ["MissingOptionalDependency", "ensure_installed", "is_available", "require"]
 
 # import name -> distribution name, where they differ (pandas' ``INSTALL_MAPPING``).
 _DISTRIBUTION = {
@@ -107,6 +107,16 @@ def is_available(module: str) -> bool:
     semantics); probe the top-level name when that cost matters.
     """
     return _present(module)
+
+
+def ensure_installed(module: str, extra: str, feature: str, alternatives: str = "") -> None:
+    """Raise :class:`MissingOptionalDependency` when *module* is absent; import nothing.
+
+    The probe-only twin of :func:`require`, for guards that run before the
+    package is needed (a preflight, a wizard's first prompt).
+    """
+    if not _present(module):
+        raise MissingOptionalDependency(module, extra, feature, alternatives)
 
 
 def require(module: str, extra: str, feature: str) -> ModuleType:
