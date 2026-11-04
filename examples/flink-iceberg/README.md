@@ -51,22 +51,26 @@ export FLUID_FLINK_NAMESPACE_ALLOWLIST=data-products
 export FLUID_FLINK_IMAGE_ALLOWLIST=forge-flink   # the image without :tag and @sha256:
 export FLUID_FLINK_SERVICE_ACCOUNT_ALLOWLIST=data-products/flink
 export FLUID_FLINK_SECRET_ALLOWLIST=data-products/flink-storage
+export FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST=iceberg-rest   # the catalog the job uses
 ```
 
 Once the image is in your registry, list its repository instead, such as
 `registry.example.com/forge-flink`, or `registry.example.com/` for everything
 under it. A prefix must end in `/`.
 
-`fluid apply` and `fluid verify` also check where the catalog credential goes:
-the catalog, an OAuth2 token endpoint and any `s3.endpoint` in
-`catalogProperties`. A public host needs an entry in
-`FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST`, and a link-local host is always
-refused. A `catalogAuth` variable needs `NAME@host` in
+`fluid apply` and `fluid verify` also check where the job connects: the catalog,
+an OAuth2 token endpoint and any `s3.endpoint` in `catalogProperties`. A
+hostname needs an entry in `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST`
+whatever it resolves to, because the job resolves it itself, after fluid has
+checked it; list a parent domain such as `svc.cluster.local` to cover a
+cluster's services. An IP address needs an entry only when it is public, and a
+link-local one is always refused. A `catalogAuth` variable needs `NAME@host` in
 `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` for each host that receives it, before
 fluid reads it: `LAKEKEEPER_TOKEN@catalog.example.com` for a bearer token. An
-OAuth2 credential needs two entries, one for the token endpoint and one for the
-catalog, which receives the token minted from it. A private or loopback host
-needs no host entry, and a loopback host needs no `NAME@host` entry either.
+OAuth2 credential needs two entries, one for the token endpoint (which must be
+`https://`) and one for the catalog, which receives the token minted from it.
+`localhost` needs neither entry. No other catalog property may start with
+`env:`, since Iceberg would resolve it from the job's environment.
 
 Checkpoint, savepoint, HA and warehouse locations are not on these lists. Scope
 them with the permissions of the credentials in the allowed Secrets.

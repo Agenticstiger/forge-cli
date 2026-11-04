@@ -40,6 +40,8 @@ endpoint and the S3 endpoint. Both checks reuse two existing policies:
 - Hosts go through the deployment host policy (``build_runners/
   _deployment_host_policy.py``): link-local never, a public host only when
   listed. On every request it judges the address the connection is pinned to.
+  A hostname needs an entry whatever it resolves to here: the deployed job
+  resolves it itself, after this check, where no DNS answer seen here applies.
 - The token's variable goes through the secret-ref policy (``build_runners/
   _secret_policy.py``, ``NAME@host``). It is paired with every host that
   receives the credential or a token minted from it, before the variable is read.
@@ -50,6 +52,7 @@ ignores a value that one of the project's own dotenv files tries to set.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -62,12 +65,13 @@ from fluid_build.build_runners._deployment_host_policy import (
 from fluid_build.build_runners._deployment_host_policy import (
     HostVerdict,
     host_verdict,
+    is_listed,
     pinned_verdict,
 )
 from fluid_build.build_runners._deployment_host_policy import allowlist as host_allowlist
 from fluid_build.build_runners._secret_policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
 from fluid_build.build_runners._secret_policy import allowlist as secret_ref_allowlist
-from fluid_build.build_runners._secret_policy import variable_allowed
+from fluid_build.build_runners._secret_policy import is_loopback, variable_allowed
 from fluid_build.providers._iceberg_catalog_auth import CatalogAuth, parse_catalog_auth
 
 CONTEXT_ALLOWLIST_ENV = "FLUID_FLINK_KUBE_CONTEXT_ALLOWLIST"
@@ -194,14 +198,18 @@ def _catalog_reason(verdict: HostVerdict) -> str:
     return f"{named} is public and not in {HOST_ALLOWLIST_ENV}"
 
 
+def _host_fix(role: str, host: str, environ: Optional[Mapping[str, str]]) -> str:
+    listed = ",".join([*host_allowlist(environ), host])
+    return (
+        f"If this {role} is yours, name its host {_OPERATOR_ONLY}: "
+        f'export {HOST_ALLOWLIST_ENV}="{listed}", or list a parent domain such as '
+        "svc.cluster.local to cover its subdomains. Leave the port off."
+    )
+
+
 def _refuse(verdict: HostVerdict, role: str, environ: Optional[Mapping[str, str]] = None) -> None:
     if verdict.code in ("public", "mixed"):
-        listed = ",".join([*host_allowlist(environ), str(verdict.host)])
-        fix = (
-            f"If this {role} is yours, name its host {_OPERATOR_ONLY}: "
-            f'export {HOST_ALLOWLIST_ENV}="{listed}", or list a parent domain to cover '
-            "its subdomains. Leave the port off. A private or loopback host needs no entry."
-        )
+        fix = _host_fix(role, str(verdict.host), environ)
     else:
         fix = f"Point the contract at the {role} itself, as an http:// or https:// URL."
     raise FlinkPolicyError(
@@ -212,13 +220,40 @@ def _refuse(verdict: HostVerdict, role: str, environ: Optional[Mapping[str, str]
     )
 
 
+def _is_ip_address(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    return True
+
+
 def refuse_unless_catalog_host_allowed(
     url: Optional[str], *, role: str, environ: Optional[Mapping[str, str]] = None
 ) -> None:
-    """Raise unless the lane may use ``url``: the catalog, its token endpoint or S3."""
+    """Raise unless the lane may use ``url``: the catalog, its token endpoint or S3.
+
+    The deployed job resolves a hostname itself, after this check, so no DNS
+    answer seen here shows where it will connect: a name passes only when the
+    operator lists it. An IP address keeps the deployment host policy, and
+    ``localhost`` never leaves the machine or the job's own pod.
+    """
     verdict = host_verdict(url, environ=environ)
     if verdict is not None:
         _refuse(verdict, role, environ)
+    host = urlsplit(str(url).strip()).hostname or ""
+    if _is_ip_address(host) or is_loopback(host) or is_listed(host, environ):
+        return
+    raise FlinkPolicyError(
+        what=f"the managed Flink lane may not use the {role}",
+        why=(
+            f"Refused because host {host!r} is a name the operator has not listed. The "
+            "deployed job resolves it itself, after this check, so no DNS answer here "
+            "shows where it will connect. An IP address needs an entry only when public."
+        ),
+        fix=_host_fix(role, host, environ),
+        doc=doc_url(),
+    )
 
 
 def catalog_request_guard(url: str, *, role: str) -> Callable[[Any], None]:

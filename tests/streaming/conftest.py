@@ -19,6 +19,7 @@ import yaml
 
 from fluid_build.streaming.policy import (
     CONTEXT_ALLOWLIST_ENV,
+    HOST_ALLOWLIST_ENV,
     IMAGE_ALLOWLIST_ENV,
     NAMESPACE_ALLOWLIST_ENV,
     SECRET_ALLOWLIST_ENV,
@@ -43,6 +44,7 @@ def contract():
 
 @pytest.fixture(autouse=True)
 def operator_allows_the_example(monkeypatch):
-    """The example's deployment targets, listed as its operator would list them."""
+    """The example's deployment targets and catalog, listed as its operator would."""
     for name, value in EXAMPLE_ALLOWLISTS.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest")  # a name the job resolves

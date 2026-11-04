@@ -45,6 +45,8 @@ from fluid_build.streaming.policy import (
 )
 from fluid_build.streaming.runtime import (
     Kubectl,
+    StreamingError,
+    _oauth2_access_token,
     catalog_evidence,
     inspect_drift,
     reconcile,
@@ -150,6 +152,11 @@ def test_a_project_dotenv_cannot_grant_these(name):
         ("https://8.8.8.8/", "8.8.8.8", False),
         ("http://127.0.0.1:8181", "", False),  # loopback and private need no entry
         ("http://10.0.0.5:8181", "", False),
+        # The job resolves a name itself, later: a name needs an entry, whatever DNS says here.
+        ("http://iceberg-rest:8181", "", True),
+        ("http://iceberg-rest:8181", "iceberg-rest", False),
+        ("http://minio.lake.svc.cluster.local:9000", "svc.cluster.local", False),
+        ("http://localhost:8181", "", False),
     ],
 )
 def test_the_catalog_host_follows_the_deployment_host_policy(monkeypatch, url, allowlist, refused):
@@ -223,11 +230,10 @@ def _pinned(ip):
 @pytest.mark.parametrize(
     "url,pinned,allowlist,refused",
     [
-        # The name passes (unresolved here, private for an IDNA2003 lookup of faß.de),
-        # yet the connection is pinned to a public address: refused.
+        # An unlisted name is refused, whatever a lookup here or the pin says.
         ("https://catalog.internal/", "93.184.216.34", "", True),
         ("https://faß.de/", "93.184.216.34", "", True),
-        ("https://catalog.internal/", "10.0.0.5", "", False),
+        ("https://catalog.internal/", "10.0.0.5", "catalog.internal", False),
         # A listed name may connect to its public address, never to metadata.
         ("https://catalog.example.com/", "93.184.216.34", "catalog.example.com", False),
         ("https://catalog.example.com/", "169.254.169.254", "catalog.example.com", True),
@@ -315,17 +321,34 @@ def test_both_catalog_clients_carry_the_pinned_address_guard(contract, monkeypat
         assert role in refused.value.what
 
 
-def test_a_pinned_refusal_names_the_host_to_list_and_the_address_it_reached(monkeypatch):
-    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "corp.example")
-    guard = catalog_request_guard("https://catalog.internal/", role="Iceberg catalog")
-    with patch(
-        "fluid_build.build_runners._deployment_host_policy.hostname_scope",
-        side_effect=lambda host: "unresolved" if host == "catalog.internal" else "public",
+def test_a_pinned_refusal_names_the_host_and_the_address_it_reached(monkeypatch):
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "catalog.example.com")
+    guard = catalog_request_guard("https://catalog.example.com/", role="Iceberg catalog")
+    with pytest.raises(FlinkPolicyError) as refused:
+        guard(_pinned("169.254.169.254"))
+    assert "'catalog.example.com', connecting to '169.254.169.254'," in refused.value.why
+
+
+@pytest.mark.parametrize("scope", ["unresolved", "non_public"])
+def test_a_name_the_job_resolves_needs_an_entry_whatever_it_resolves_to_here(
+    contract, monkeypatch, scope
+):
+    # DNS here at apply proves nothing about where the pod connects later.
+    cfg = contract["builds"][0]["properties"]["parameters"]["flink"]
+    cfg["catalogProperties"] = {"s3.endpoint": "https://s3.attacker.example"}
+    with (
+        patch(
+            "fluid_build.build_runners._deployment_host_policy.hostname_scope",
+            return_value=scope,
+        ),
+        patch.object(Kubectl, "command", side_effect=AssertionError("kubectl ran")),
     ):
         with pytest.raises(FlinkPolicyError) as refused:
-            guard(_pinned("93.184.216.34"))
-    assert "'catalog.internal', connecting to '93.184.216.34'," in refused.value.why
-    assert f'export {HOST_ALLOWLIST_ENV}="corp.example,catalog.internal"' in refused.value.fix
+            reconcile(contract, dry_run=True)
+    assert "S3 endpoint" in refused.value.what
+    assert "resolves it itself" in refused.value.why
+    listed = "iceberg-rest,s3.attacker.example"  # the operator's entry is kept
+    assert f'export {HOST_ALLOWLIST_ENV}="{listed}"' in refused.value.fix
 
 
 def test_a_malformed_catalog_url_is_refused_not_raised():
@@ -339,6 +362,48 @@ def test_a_loopback_catalog_needs_no_entry_for_its_host_or_its_token(uri):
     cfg = {"catalogAuth": {"type": "bearer", "tokenEnv": "CI_SECRET"}}
     auth = refuse_unless_catalog_targets_allowed(cfg, uri, environ={})
     assert auth is not None and auth.env_var == "CI_SECRET"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("catalogProperties", "env:AWS_SECRET_ACCESS_KEY"),
+        ("catalogProperties", "${AWS_SECRET_ACCESS_KEY}"),
+        ("location", "env:AWS_SECRET_ACCESS_KEY"),
+        ("catalogProperties", "EU-WEST-1"),
+    ],
+)
+def test_contract_text_cannot_make_the_pod_send_one_of_its_variables(contract, field, value):
+    # Iceberg resolves env:<NAME> in any catalog property inside the pod, and the
+    # region is signed into every S3 request: only catalogAuth may name a variable.
+    if field == "location":
+        contract["exposes"][0]["binding"]["location"]["region"] = value
+    else:
+        managed = contract["builds"][0]["properties"]["parameters"]["flink"]
+        managed["catalogProperties"] = {"client.region": value}
+    with pytest.raises(ValueError, match="client.region"):
+        compile_contract(contract)
+
+
+def test_a_region_name_still_reaches_the_catalog(contract):
+    contract["exposes"][0]["binding"]["location"]["region"] = "eu-central-1"
+    (artifact,) = compile_contract(contract)
+    assert "'client.region' = 'eu-central-1'" in artifact.statements[0]
+
+
+def test_an_oauth2_token_endpoint_must_use_https(contract):
+    _sink(contract, "https://10.0.0.9", _oauth2("http://10.0.0.8/token"))
+    with pytest.raises(ValueError, match="OAuth2 token endpoint requires HTTPS"):
+        compile_contract(contract)
+    auth = SimpleNamespace(
+        oauth2_server_uri="http://10.0.0.8/token", scope="catalog", audience=None, resource=None
+    )
+    with patch(
+        "fluid_build.streaming.runtime.safe_httpx_client",
+        side_effect=AssertionError("a client was built"),
+    ):
+        with pytest.raises(StreamingError, match="must use https"):
+            _oauth2_access_token(auth, "id:secret")
 
 
 def test_the_token_fix_keeps_valid_entries_and_drops_ignored_ones(monkeypatch):

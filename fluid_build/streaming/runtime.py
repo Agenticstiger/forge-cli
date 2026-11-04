@@ -24,7 +24,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -332,6 +332,9 @@ def _iceberg_fields(expected: Any, actual: Any, path: str = "$") -> None:
 
 def _oauth2_access_token(auth: Any, credential: str) -> str:
     """Exchange ``client_id:client_secret`` for an access token at the token endpoint."""
+    # The client's require_https covers only a base_url; this posts to a full URL.
+    if urlsplit(str(auth.oauth2_server_uri)).scheme != "https":
+        raise StreamingError("The OAuth2 token endpoint must use https: it receives the secret")
     client_id, separator, client_secret = credential.partition(":")
     if not separator or not client_id or not client_secret:
         raise StreamingError("Catalog credential variable must contain client_id:client_secret")
