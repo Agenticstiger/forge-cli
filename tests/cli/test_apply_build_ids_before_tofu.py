@@ -22,6 +22,10 @@ checked these ids, and on the OpenTofu engine it runs after ``tofu apply``. So
 ``--mode amend-and-build`` provisioned the product and then failed with
 "Unexpected error", because ``IdentifierViolation`` had no typed mapping.
 
+A ``--build-id`` that names no build failed late the same way: the runner keeps the
+builds whose id equals it and, with none left, logs ``Build not found`` and returns 1,
+after ``tofu apply`` on the OpenTofu engine.
+
 These tests drive ``run()`` through the real argparse surface. ``tofu`` and the
 apply hooks are recorders; the build runner is the real one, behind a spy, so
 "refused first" is asserted as "``tofu``, the hooks and the runner never ran".
@@ -33,7 +37,7 @@ import copy
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Optional
 from unittest import mock
 
 import pytest
@@ -355,3 +359,172 @@ class TestOneRuleForBothCallers:
     )
     def test_what_it_does_not_check(self, contract: Dict[str, Any]) -> None:
         _ids.validate_build_ids(contract)
+
+
+# ``--build-id`` values that name no build of ``_CONTRACT``. The runner compares ids
+# exactly, so a near miss is as unknown as a typo.
+_UNKNOWN_BUILD_IDS = [
+    pytest.param("make_row", id="typo"),
+    pytest.param("Make_Rows", id="case"),
+    pytest.param("make_rows ", id="trailing-space"),
+    pytest.param("make", id="prefix"),
+]
+
+
+def _with_build_ids(*build_ids: Optional[str]) -> Dict[str, Any]:
+    """``_CONTRACT`` with one build per id; ``None`` is a build that declares no id."""
+    contract = copy.deepcopy(_CONTRACT)
+    template = contract["builds"][0]
+    contract["builds"] = []
+    for build_id in build_ids:
+        build = copy.deepcopy(template)
+        if build_id is None:
+            del build["id"]
+        else:
+            build["id"] = build_id
+        contract["builds"].append(build)
+    return contract
+
+
+@pytest.mark.usefixtures("workspace")
+class TestAnUnknownBuildIdIsRefusedFirst:
+    """``--build-id`` names no build of the contract.
+
+    The runner keeps the builds whose id equals ``--build-id`` and, with none left,
+    logs ``Build not found`` and returns 1. On the OpenTofu engine that came after
+    ``tofu apply``: a mistyped id provisioned the product, then the run failed.
+    """
+
+    @pytest.mark.parametrize("form", ["yaml", "plan"])
+    @pytest.mark.parametrize("build_id", _UNKNOWN_BUILD_IDS)
+    @pytest.mark.parametrize("mode,extra", _BUILD_MODES)
+    def test_refused_before_tofu(
+        self,
+        tofu: mock.Mock,
+        hooks: mock.Mock,
+        runner: mock.Mock,
+        form: str,
+        build_id: str,
+        mode: str,
+        extra: Any,
+    ) -> None:
+        src = _source(form, _CONTRACT, mode=mode)
+        with pytest.raises(CLIError) as exc:
+            _apply(src, "--mode", mode, *extra, "--build-id", build_id)
+        tofu.assert_not_called()
+        hooks.assert_not_called()
+        runner.assert_not_called()
+        assert exc.value.event == "apply_build_id_not_found"
+        assert exc.value.context["build_id"] == repr(build_id)
+        assert exc.value.context["available"] == ["make_rows"]
+
+    @pytest.mark.usefixtures("native")
+    def test_native_engine_refuses_with_the_same_typed_error(self, runner: mock.Mock) -> None:
+        """The native engine applies nothing before its builds, but its refusal was a
+        log line and exit 1."""
+        src = _source("yaml", _CONTRACT, mode="amend-and-build")
+        with pytest.raises(CLIError) as exc:
+            _apply(src, "--mode", "amend-and-build", "--build-id", "make_row")
+        runner.assert_not_called()
+        assert exc.value.event == "apply_build_id_not_found"
+
+    def test_it_lists_the_build_ids_in_contract_order(self, tofu: mock.Mock) -> None:
+        src = _source("yaml", _with_build_ids("make_rows", "load_orders"), mode="amend-and-build")
+        with pytest.raises(CLIError) as exc:
+            _apply(src, "--mode", "amend-and-build", "--build-id", "load_order")
+        assert exc.value.context["available"] == ["make_rows", "load_orders"]
+
+    def test_builds_that_declare_no_id_match_no_build_id(
+        self, tofu: mock.Mock, runner: mock.Mock
+    ) -> None:
+        """``builds[].id`` is optional, and the runner matches no ``--build-id`` to a
+        build without one."""
+        src = _source("yaml", _with_build_ids(None), mode="amend-and-build")
+        with pytest.raises(CLIError) as exc:
+            _apply(src, "--mode", "amend-and-build", "--build-id", "make_rows")
+        tofu.assert_not_called()
+        runner.assert_not_called()
+        assert exc.value.context["available"] == []
+        assert "none of the contract's builds declares an id" in exc.value.context["hint"]
+
+    def test_an_unusable_id_is_refused_first(self, tofu: mock.Mock) -> None:
+        """The runner checks the ids before it filters, and apply keeps that order."""
+        src = _source("yaml", _with("contract.id", "1orders"), mode="amend-and-build")
+        with pytest.raises(CLIError) as exc:
+            _apply(src, "--mode", "amend-and-build", "--build-id", "make_row")
+        assert exc.value.event == "apply_build_identifier_invalid"
+
+    def test_the_refusal_says_what_to_change(self, tofu: mock.Mock) -> None:
+        src = _source("yaml", _CONTRACT, mode="amend-and-build")
+        with pytest.raises(CLIError) as exc:
+            _apply(src, "--mode", "amend-and-build", "--build-id", "make_row")
+        hint = exc.value.context["hint"]
+        assert "Nothing was applied" in hint
+        assert "drop --build-id" in hint
+        assert exc.value.suggestions, "the catalog gives the event its suggestions"
+
+    def test_the_cli_renders_it_as_a_typed_error(
+        self, tofu: mock.Mock, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Through ``main()``: the slug, the id asked for and the ids there are."""
+        src = _source("yaml", _CONTRACT, mode="amend-and-build")
+        argv = ["apply", src, "--mode", "amend-and-build", "--build-id", "make_row", "--yes"]
+        assert cli_mod.main(argv) == 1
+        out = capsys.readouterr().out
+        assert "ERR_APPLY_BUILD_ID_NOT_FOUND" in out
+        assert "'make_row'" in out
+        assert "['make_rows']" in out
+        tofu.assert_not_called()
+
+    @pytest.mark.parametrize("build_id", _UNKNOWN_BUILD_IDS)
+    def test_the_runner_still_refuses_on_its_own(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, build_id: str
+    ) -> None:
+        """Kept as the backstop for a caller that skips ``fluid apply``. It refuses the
+        same near misses: both compare ids exactly."""
+        import argparse
+
+        path = tmp_path / "contract.fluid.yaml"
+        path.write_text("{}", encoding="utf-8")
+        args = argparse.Namespace(contract=str(path), env=None, build_id=build_id)
+        with caplog.at_level(logging.ERROR, logger=LOG.name):
+            rc = runner_base.run_builds_from_args(args, LOG, contract=copy.deepcopy(_CONTRACT))
+        assert rc == 1
+        assert f"Build not found: {build_id}" in caplog.text
+
+
+@pytest.mark.usefixtures("workspace")
+class TestAKnownBuildIdStillRuns:
+    """The check refuses exactly the ``--build-id`` values the runner would refuse."""
+
+    @pytest.mark.parametrize("form", ["yaml", "plan"])
+    @pytest.mark.parametrize("build_id", ["make_rows", "load_orders"])
+    def test_it_reaches_tofu_then_the_runner(
+        self, tofu: mock.Mock, form: str, build_id: str
+    ) -> None:
+        src = _source(form, _with_build_ids("make_rows", "load_orders"), mode="amend-and-build")
+        with mock.patch("fluid_build.build_runners.run_builds_from_args", return_value=0) as run:
+            assert _apply(src, "--mode", "amend-and-build", "--build-id", build_id) == 0
+        tofu.assert_called_once()
+        run.assert_called_once()
+        assert run.call_args.args[0].build_id == build_id
+
+    def test_an_empty_build_id_filters_nothing(self, tofu: mock.Mock) -> None:
+        """The runner runs every build for ``--build-id ''``, so it is not refused."""
+        src = _source("yaml", _CONTRACT, mode="amend-and-build")
+        with mock.patch("fluid_build.build_runners.run_builds_from_args", return_value=0) as run:
+            assert _apply(src, "--mode", "amend-and-build", "--build-id", "") == 0
+        tofu.assert_called_once()
+        run.assert_called_once()
+
+    def test_a_contract_without_builds_is_not_checked(
+        self, tofu: mock.Mock, runner: mock.Mock
+    ) -> None:
+        """With no builds the runner returns 0 before it filters, so a ``--build-id`` is
+        not refused there either."""
+        contract = copy.deepcopy(_CONTRACT)
+        del contract["builds"]
+        src = _source("yaml", contract, mode="amend-and-build")
+        assert _apply(src, "--mode", "amend-and-build", "--build-id", "make_rows") == 0
+        tofu.assert_called_once()
+        runner.assert_called_once()

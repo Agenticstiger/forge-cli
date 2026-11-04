@@ -276,6 +276,14 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         None,
     ),
+    "apply_build_id_not_found": (
+        [
+            "Pass one of the available build ids as --build-id: ids match exactly, case included",
+            "Run 'fluid apply <contract> --mode amend-and-build' without --build-id to run "
+            + "every build",
+        ],
+        None,
+    ),
     "output_write_failed": (
         ["Check that the --out path is writable and the parent directory exists"],
         None,
@@ -332,6 +340,21 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             "--llm-provider claude-code",
         ],
         "secrets",
+    ),
+    # Optional-dependency gate (fluid_build/_optional.py). The message already
+    # carries the exact `pip install` line; these only give the stable slug a
+    # curated follow-up and a docs anchor.
+    "copilot_litellm_unavailable": (
+        ["Run 'fluid doctor' to see which optional packages are installed"],
+        None,
+    ),
+    "mcp_sdk_unavailable": (
+        ["Run 'fluid doctor' to see which optional packages are installed"],
+        None,
+    ),
+    "optional_dependency_missing": (
+        ["Run 'fluid doctor' to see which optional packages are installed"],
+        None,
     ),
     "copilot_missing_llm_model": (
         [

@@ -341,13 +341,12 @@ def _fetch_sample_rows(arguments: Dict[str, Any], env: Mapping[str, str]) -> Dic
     ref = f'"{alias}"."{schema}"."{table}"' if schema else f'"{alias}"."{table}"'
     sql = f"SELECT * FROM {ref} LIMIT {applied_limit}"
 
+    from fluid_build._optional import MissingOptionalDependency, require
+
     try:
-        import duckdb  # noqa: F401 - the install hint below
-    except ImportError:
-        return {
-            "error": "DuckDbNotInstalled",
-            "message": "fetch_sample_rows requires duckdb (pip install 'data-product-forge[local]').",
-        }
+        require("duckdb", "local", "fetch_sample_rows")
+    except MissingOptionalDependency as exc:
+        return {"error": "DuckDbNotInstalled", "message": str(exc)}
     from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
 
     con = None

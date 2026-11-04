@@ -495,8 +495,9 @@ def get_llm_provider(name: str) -> LlmProvider:
     remaining name falls through to litellm's native provider routing. Plugin
     discovery is lazy (first call here) so ``fluid --help`` never scans it.
 
-    ``litellm`` is a hard dependency of fluid (declared in
-    ``pyproject.toml``); the import never fails in a working install.
+    ``litellm`` is an optional dependency (the ``[litellm]`` extra, still
+    installed by default today). Reaching for it without the package raises a
+    ``copilot_litellm_unavailable`` error carrying the install line.
     """
     normalized = (name or "").strip().lower()
     if normalized in ("mcp-sampling", "mcp_sampling"):
@@ -605,9 +606,6 @@ class MCPSamplingProvider(LlmProvider):
         # Lazy imports avoid an import cycle: ``mcp.py`` imports the
         # provider catalog from this module (via LiteLLM), so importing
         # ``mcp`` at module-load time here would deadlock.
-        import anyio.from_thread
-        from mcp.types import SamplingMessage, TextContent
-
         from fluid_build._mcp_sampling_context import get_sampling_context
 
         ctx, anyio_token = get_sampling_context()
@@ -624,6 +622,17 @@ class MCPSamplingProvider(LlmProvider):
                     "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY).",
                 ],
             )
+
+        # Imported only once a sampling context exists: that context is installed
+        # by the MCP server, so the SDK is present whenever this line is reached,
+        # and a terminal run without ``mcp`` gets the no-context error above, not
+        # an ImportError.
+        import anyio.from_thread
+
+        from fluid_build._optional import require
+
+        mcp_types = require("mcp.types", "mcp", "MCP sampling")
+        SamplingMessage, TextContent = mcp_types.SamplingMessage, mcp_types.TextContent
 
         max_tokens = int(getattr(config, "max_tokens", 4096) or 4096)
         temperature = getattr(config, "temperature", None)
