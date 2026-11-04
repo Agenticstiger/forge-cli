@@ -76,6 +76,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared only for development. It now belongs to the `[odcs-strict]` extra, and a missing
   `deepdiff` says which extra to install.
 
+### Changed
+
+- **`fluid --help` and each command start faster.** The core commands load lazily: `fluid --help`,
+  an unknown command and `fluid <cmd>` import only the module of the command being run, instead of
+  all of them. On a bare install, `fluid --help` imports 299 modules (was 857) and builds the parser
+  in about 85 ms (was about 1,100 ms, median of 7 cold runs on Python 3.12); `fluid validate` goes
+  to 327 modules and `fluid forge` to 464. `pydantic`, the copilot schemas and the IaC plugins are
+  no longer loaded by `--help`. The command list and every help line are unchanged, and
+  `build_parser()` with no argument still returns the full tree.
+
 ## [0.27.0] — 2026-11-04
 
 ### Added
