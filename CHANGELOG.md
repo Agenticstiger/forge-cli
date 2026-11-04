@@ -67,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   core commands need none of these three; litellm alone was 30 of them.
   *Numbers* (`uv pip compile`, base install, no extras, packages before to after): Linux Python 3.12
   88 to 41, Linux Python 3.10 86 to 45, Windows Python 3.12 89 to 40. A bare install is about
-  68 MB of site-packages, and `build_parser()` imports 842 modules on it.
+  68 MB of site-packages.
 
 - **Every Databricks table now gets tag assignments.** A contract without labels used to make
   none; its table now carries the product's identity tags, which count toward Unity Catalog's 50
@@ -97,6 +97,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to 327 modules and `fluid forge` to 464. `pydantic`, the copilot schemas and the IaC plugins are
   no longer loaded by `--help`. The command list and every help line are unchanged, and
   `build_parser()` with no argument still returns the full tree.
+
+### Removed
+
+- **Nine modules that nothing imported are gone** (#832): `fluid_build.logging_utils`,
+  `fluid_build.cli.init_samples`, `fluid_build.copilot.schemas.table_metadata`,
+  `fluid_build.providers.local.ducksql`, `.mocks` and `.samples`, and
+  `fluid_build.runtimes.dataform_gcp`, `.dbt_bigquery` and `.dbt_duckdb`, with unused functions
+  elsewhere (3,638 lines in all). No command or contract behaves differently; code that imported
+  one of these modules directly must drop the import.
 
 ### Security
 
