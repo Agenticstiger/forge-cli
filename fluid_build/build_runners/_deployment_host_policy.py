@@ -340,7 +340,7 @@ def _pinned_refusal(verdict: HostVerdict) -> str:
     a host that really is public.
     """
     if verdict.code == "no-host":
-        return "it has no host"
+        return "the request has no address to check"
     named = f"host {verdict.host!r}"
     if verdict.pinned and verdict.pinned != verdict.host:
         named += f", connecting to {verdict.pinned!r},"
