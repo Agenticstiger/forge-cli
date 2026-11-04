@@ -354,6 +354,73 @@ def test_a_type_is_widened_only_losslessly_and_said_so(contract):
             {"columns": [{"name": "x", "from": "customer", "cast": "struct"}]},
             r"only a scalar type",
         ),
+        # Inside containers: an element field, a nullable element, a map value.
+        (
+            [
+                EVENT_ID,
+                col(
+                    "items",
+                    "array",
+                    element={
+                        "type": "struct",
+                        "fields": [col("sku", "string"), col("price", "string")],
+                    },
+                ),
+            ],
+            None,
+            r"decimal\(18,2\) at \[\]\.price is not string",
+        ),
+        (
+            [
+                EVENT_ID,
+                col(
+                    "items",
+                    "array",
+                    element={
+                        "type": "struct",
+                        "required": True,
+                        "fields": [col("sku", "string"), col("price", "decimal(18,2)")],
+                    },
+                ),
+            ],
+            None,
+            r"a value at \[\] can be null",
+        ),
+        (
+            [
+                EVENT_ID,
+                col(
+                    "attributes",
+                    "map",
+                    key={"type": "string", "required": True},
+                    value={"type": "int"},
+                ),
+            ],
+            None,
+            r"string at \{value\} is not int",
+        ),
+        # Nullability survives a widening, a conversion and an exploded element.
+        (
+            [EVENT_ID, col("n", "long", required=True)],
+            {
+                "columns": [
+                    {
+                        "name": "n",
+                        "from": "customer.address.geo.location.coordinates.latitude",
+                        "cast": "double",
+                    }
+                ]
+            },
+            r"can be null, but the output requires it",
+        ),
+        (
+            [EVENT_ID, col("sku", "string", required=True)],
+            {
+                "explode": {"path": "items", "as": "item"},
+                "columns": [{"name": "sku", "from": "item.sku"}],
+            },
+            r"can be null, but the output requires it",
+        ),
         ([EVENT_ID], {"typo": True}, r"unsupported field\(s\) \['typo'\]"),
         ([EVENT_ID], {"columns": []}, r"columns: expected a non-empty list"),
     ],
@@ -366,26 +433,25 @@ def test_an_output_the_stream_cannot_fill_fails_before_deploy(contract, columns,
 
 
 @pytest.mark.parametrize(
-    "path",
+    "path,match",
     [
-        "event_id; DROP TABLE x",
-        "`event_id`",
-        "attributes['it''s']",
-        "attributes['a\\b']",
-        "event_id\n",
-        "customer..id",
-        "1st",
-        "attributes[channel]",
-        "attributes['" + "k" * 257 + "']",
-        ".".join(["a"] * 65),
+        ("event_id; DROP TABLE x", "expected a path"),
+        ("`event_id`", "expected a path"),
+        ("attributes['it''s']", "expected a path"),
+        ("attributes['a\\b']", "expected a path"),
+        ("event_id\n", "expected a path"),
+        ("customer..id", "expected a path"),
+        ("1st", "expected a path"),
+        ("attributes[channel]", "expected a path"),
+        ("attributes['" + "k" * 257 + "']", "expected a path"),
+        (".".join(["a"] * 65), "at most 64 steps"),
     ],
 )
-def test_a_path_is_never_sql_and_a_bad_one_is_not_echoed(contract, path):
+def test_a_path_is_never_sql_and_a_bad_one_is_not_echoed(contract, path, match):
     _output(contract, [EVENT_ID, col("x", "string")], {"columns": [{"name": "x", "from": path}]})
-    with pytest.raises(ValueError) as caught:
+    with pytest.raises(ValueError, match=match) as caught:
         compile_contract(contract)
-    if len(path) < 200:
-        assert path not in str(caught.value)
+    assert path not in str(caught.value)
 
 
 def test_paths_round_trip():
@@ -648,6 +714,32 @@ def test_the_stream_and_mapping_work_from_fragments(contract, tmp_path, capsys):
         == 1
     )
     capsys.readouterr()
+
+
+def test_a_widened_column_keeps_its_nullability(contract):
+    _stream(contract)["schema"].append(col("quantity", "int"))
+    _output(contract, [EVENT_ID, col("quantity", "long", required=True)])
+    with pytest.raises(ValueError, match="can be null, but the output requires it"):
+        compile_contract(contract)
+    _stream(contract)["schema"][-1]["required"] = True
+    assert "CAST(`src`.`quantity` AS BIGINT) AS `quantity`" in _insert(contract)
+
+
+def test_a_required_exploded_field_needs_a_required_element(contract):
+    items = _stream(contract)["schema"][2]
+    items["element"]["fields"][0]["required"] = True
+    _output(
+        contract,
+        [EVENT_ID, col("sku", "string", required=True)],
+        {
+            "explode": {"path": "items", "as": "item"},
+            "columns": [{"name": "sku", "from": "item.sku"}],
+        },
+    )
+    with pytest.raises(ValueError, match="can be null"):
+        compile_contract(contract)
+    items["element"]["required"] = True
+    assert "`elem`.`sku` AS `sku`" in _insert(contract)
 
 
 def test_a_required_field_of_an_optional_struct_is_required_where_the_struct_is_present(

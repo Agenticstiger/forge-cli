@@ -112,3 +112,34 @@ def test_a_second_build_with_the_same_id_cannot_vouch_for_the_first(contract, mo
     second["id"] = "ingest-orders-2"
     with pytest.raises(FlinkPolicyError, match="'ingest-orders' runs SQL written in the contract"):
         reconcile(contract, dry_run=True)
+
+
+def test_nothing_is_applied_before_the_gate_and_a_listed_build_proceeds(contract, monkeypatch):
+    from unittest.mock import patch
+
+    from fluid_build.streaming.compiler import compile_contract
+    from fluid_build.streaming.runtime import Kubectl
+
+    _props(contract)["sql"] = "SELECT * FROM source_events"
+    monkeypatch.delenv(CONTRACT_SQL_ALLOWLIST_ENV, raising=False)
+    with patch.object(Kubectl, "get") as get, patch.object(Kubectl, "apply") as apply:
+        with pytest.raises(FlinkPolicyError):
+            reconcile(contract)
+    assert get.call_count == 0 and apply.call_count == 0
+    (artifact,) = compile_contract(contract)
+    running = copy.deepcopy(artifact.resources[1])
+    running["metadata"]["generation"] = 2
+    running["status"] = {
+        "observedGeneration": 2,
+        "jobManagerDeploymentStatus": "READY",
+        "reconciliationStatus": {"state": "DEPLOYED"},
+        "jobStatus": {"state": "RUNNING", "jobId": "a" * 32},
+    }
+    entry = contract_sql_entry(contract["id"], contract["builds"][0])
+    monkeypatch.setenv(CONTRACT_SQL_ALLOWLIST_ENV, entry)
+    with (
+        patch.object(Kubectl, "get", side_effect=[None, None, running]),
+        patch.object(Kubectl, "apply") as apply,
+    ):
+        assert reconcile(contract)[0]["status"] == "running"
+    assert [c.args[0]["kind"] for c in apply.call_args_list] == ["ConfigMap", "FlinkDeployment"]
