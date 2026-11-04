@@ -74,9 +74,11 @@ def _hosts(auth: str) -> List[str]:
 
 @pytest.fixture(autouse=True)
 def _operator_environment(monkeypatch):
-    """No ``NAME@host`` entry unless a test adds one. The variable is set, so
-    the embedded Debezium preflight's own "set?" check passes."""
+    """No operator entry unless a test adds one, whatever the shell exports. The
+    variable is set, so the embedded Debezium preflight's own "set?" check
+    passes. Autouse runs first, so a mock fixture's own host entry survives."""
     monkeypatch.delenv(SECRET_REF_ALLOWLIST, raising=False)
+    monkeypatch.delenv(HOST_ALLOWLIST, raising=False)
     monkeypatch.setenv(_SECRET, _SECRET_VALUE)
 
 
@@ -348,6 +350,7 @@ def test_the_suggestion_keeps_the_operators_entries(monkeypatch):
     error = iceberg_sink_preflight(_kc_contract(dict(_AUTHS["bearer"])), "ingest")
     assert error is not None
     assert f'{SECRET_REF_ALLOWLIST}="OTHER@db.example.com,{_SECRET}@{_CATALOG_HOST}"' in error
+    assert f'{HOST_ALLOWLIST}="db.example.com,{_CATALOG_HOST}"' in error
 
 
 def test_a_refused_variable_is_never_read(monkeypatch, fake_server, tmp_path):
@@ -681,3 +684,46 @@ def test_a_derived_warehouse_names_where_it_came_from():
     contract["exposes"][0]["binding"]["platform"] = "aws"
     errors, _warnings = validate_iceberg_sink(contract)
     assert any("the warehouse derived from binding.location" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "uri", ["https:///catalog", "https://[::1/catalog"], ids=["empty", "bracket"]
+)
+def test_a_destination_with_no_readable_host_is_refused(uri):
+    contract = _kc_contract(dict(_AUTHS["bearer"]), location=_location(uri))
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any("names no host" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "token_endpoint, refused",
+    [
+        (_IDP, "a remote IdP beside a loopback catalog"),
+        ("https://169.254.169.254/token", "a link-local IdP"),
+        ("https://[::]/token", "an unspecified IdP"),
+    ],
+)
+def test_the_token_endpoint_is_judged_on_its_own(token_endpoint, refused):
+    raw = {**_AUTHS["oauth2"], "oauth2ServerUri": token_endpoint}
+    contract = _kc_contract(raw, location=_location("https://localhost:8443/catalog"))
+    error = iceberg_sink_preflight(contract, "ingest")
+    assert error is not None and "OAuth2 token endpoint" in error, refused
+
+
+@pytest.mark.parametrize("engine_name", ["kafka-connect", "debezium"])
+def test_validate_warns_for_both_engines_and_both_types(engine_name):
+    build = _kc_contract if engine_name == "kafka-connect" else _dbz_contract
+    for auth in sorted(_AUTHS):
+        errors, warnings = validate_iceberg_sink(build(dict(_AUTHS[auth])))
+        assert errors == [], (auth, errors)
+        assert any(f"{_SECRET}@{_CATALOG_HOST}" in w for w in warnings), (auth, warnings)
+
+
+@pytest.mark.parametrize("region, refused", [("eu-west-1", False), ("eu-west-1.evil", True)])
+def test_a_glue_region_is_a_host_label(region, refused):
+    """Glue is where client.region builds the AWS endpoint hosts."""
+    location = {"database": "bronze", "table": "orders", "bucket": "lake", "region": region}
+    contract = _kc_contract(None, location=location)
+    contract["exposes"][0]["binding"]["platform"] = "aws"
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any("binding.location.region" in e for e in errors) is refused, errors
