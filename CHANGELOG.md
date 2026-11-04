@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks delivery from the catalog and the operator, not the rows: it says so.
 
 - **0.7.7 declares nested columns, and the Kafka record the job reads.** A column of type `struct`,
-  `array` or `map` declares its `fields`, `element`, or `key` and `value`,, nested up to 32 levels, with
+  `array` or `map` declares its `fields`, `element`, or `key` and `value`, nested up to 32 levels, with
   `decimal(p,s)` and `timestamp(n)` / `timestamp_ltz(n)`. `properties.stream` describes the topic's
   records (`kind`, `topic`, `format`, `schema`, an optional key and Kafka metadata), and
   `properties.mapping` selects, casts and explodes them into the output's columns, or

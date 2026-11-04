@@ -77,7 +77,8 @@ The test uses a unique Compose project and loopback-only random host ports,
 produces events, restarts the task manager, produces another batch, independently
 compares every nested value and then checks schema-drift refusal. A second test
 runs both shapes from the same keyed records with a header, and compares their
-rows with what was produced. Containers, networks and volumes are removed in
+rows with what was produced, and a third checks that the generated queries plan
+in Flink. Containers, networks and volumes are removed in
 `finally`. Fixture credentials are local test values only. Docker images and
 build cache are retained.
 
