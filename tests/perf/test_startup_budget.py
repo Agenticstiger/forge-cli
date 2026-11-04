@@ -74,18 +74,27 @@ pytestmark = pytest.mark.skipif(
 # cold path in ``opentelemetry``-installed envs). In the CI perf env
 # (``.[dev,local]``, no ``opentelemetry``) a cold ``build_parser()`` sits at
 # ~786 modules — comfortably under the budget. NB ``pydantic`` +
-# ``modeling_techniques`` still load in richer envs via a *separate* eager
-# importer: the ``fluid forge data-model`` registration
+# ``modeling_techniques`` loaded via the ``fluid forge data-model`` registration
 # (``_forge_data_model_register`` → ``forge_data_model`` →
-# ``copilot.schemas.stage_outputs`` / ``modeling_techniques``). Deferring that
-# one is a follow-up outside this change's blast radius, which is why
-# ``pydantic`` is deliberately NOT added to ``FORBIDDEN_ON_HELP`` here.
+# ``copilot.schemas.stage_outputs`` / ``modeling_techniques``); the lazy core
+# commands (below) stopped importing that registration unless ``forge`` is the
+# command being run, so ``pydantic`` is now in ``FORBIDDEN_ON_HELP``.
 #
 # Ratchet: measured 852 on 3.12 / 866 on 3.14 / 840 on 3.10 (2026-11-03, a
 # ``.[dev,local]`` install, the same one every ``Perf budgets`` lane uses);
 # the ceiling is the 3.12 count + 5%, rounded up. Lower it whenever a slimming
 # PR drops the count; the test prints the measured number so CI logs show it.
-MAX_MODULES = 895
+#
+# Lazy core commands (2026-11-04): ``build_parser(argv)`` imports only the
+# invoked command's module (Click ``LazyGroup`` recipe, see ``cli/bootstrap.py``).
+# Measured 299 on 3.12 in a bare install AND in ``.[dev,local]`` (was 857 with
+# every command module imported); ceiling = measured + 5%, rounded up. The
+# probe below passes ``sys.argv[1:]`` -- ``build_parser()`` with no argument is
+# the full eager tree, which tests/scripts enumerate and which is NOT this path.
+MAX_MODULES = 314
+# ``fluid providers`` end to end: measured 311 on 3.12 (command module + provider
+# discovery on top of the 299 above); ceiling = measured + 5%, rounded up.
+MAX_PROVIDERS_CMD_MODULES = 327
 # ``fluid_build.providers.discover_providers()`` reads provider NAMES from
 # entry-point metadata and imports no provider module (a class loads on first
 # use). It imported every provider package and helper before: 872 on 3.12, 2,243
@@ -123,11 +132,14 @@ FORBIDDEN_ON_HELP = (
     "litellm",
     "requests",
     "google.protobuf",
+    # Gone with the lazy core commands: the forge data-model registration and
+    # the copilot schemas were what pulled it onto the --help path.
+    "pydantic",
 )
 
 _BUILD_PARSER_PROBE = (
     "import sys; sys.argv=['fluid','--help'];"
-    "from fluid_build.cli import build_parser; build_parser();"
+    "from fluid_build.cli import build_parser; build_parser(sys.argv[1:]);"
     "print(len(sys.modules));"
     f"print(','.join(m for m in {FORBIDDEN_ON_HELP!r} if m in sys.modules))"
 )
@@ -259,9 +271,14 @@ def test_fluid_providers_command_stays_light(capsys):
     """``fluid providers`` loads no cloud SDK and stays inside the --help module budget."""
     count, loaded = _probe_discovery(_PROVIDERS_CMD_PROBE)
     with capsys.disabled():
-        print(f"\n[startup-budget] fluid providers: {count} modules (budget {MAX_MODULES})")
+        print(
+            f"\n[startup-budget] fluid providers: {count} modules "
+            f"(budget {MAX_PROVIDERS_CMD_MODULES})"
+        )
     assert not loaded, f"`fluid providers` loaded {sorted(loaded)}"
-    assert count < MAX_MODULES, f"`fluid providers` imports {count} modules (budget {MAX_MODULES})."
+    assert (
+        count < MAX_PROVIDERS_CMD_MODULES
+    ), f"`fluid providers` imports {count} modules (budget {MAX_PROVIDERS_CMD_MODULES})."
 
 
 def test_heavy_sdks_not_loaded_on_help():

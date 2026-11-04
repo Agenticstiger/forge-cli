@@ -163,6 +163,11 @@ def _refs_in_file(root: Path, path: Path, package: str) -> Iterator[ImportRef]:
                 cli_module = _constant_str(node.args[1])
                 if cli_module is not None:
                     yield ImportRef(rel, node.lineno, f"{package}.cli.{cli_module}", None)
+            elif fn == "CoreCommand" and node.args:
+                # bootstrap.CORE_COMMANDS: the module a core command is imported from.
+                cli_module = _constant_str(node.args[0])
+                if cli_module is not None:
+                    yield ImportRef(rel, node.lineno, f"{package}.cli.{cli_module}", None)
 
 
 def collect_refs(root: Path, package: str) -> List[ImportRef]:
@@ -344,7 +349,7 @@ def test_the_scan_reaches_lazy_and_string_imports() -> None:
     ]
     assert lazy, "the function-level, try-wrapped provider import in version_cmd.py was missed"
     registered = {r.module for r in refs if r.path == "fluid_build/cli/bootstrap.py"}
-    assert "fluid_build.cli.contract_tests" in registered, "_try_register sites were missed"
+    assert "fluid_build.cli.contract_tests" in registered, "CORE_COMMANDS entries were missed"
     assert "fluid_build.schema_manager" in registered, "_imp(...) string imports were missed"
 
 

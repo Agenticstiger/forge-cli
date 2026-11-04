@@ -419,6 +419,7 @@ def _literal_connection(contract: str = DEMO_CONTRACT) -> str:
 #: Variables the ``fluid apply`` code path reads that a scheduled run does not
 #: need, so the worker environment does not pass them.
 NOT_PASSED = {
+    "_ARGCOMPLETE": "set by the shell's tab completion, which a scheduled DAG task never is",
     "GIT_CONFIG_PARAMETERS": (
         "federation reads it only to append its own git config entries after any the "
         "caller already set; with none set its entries are the whole value"

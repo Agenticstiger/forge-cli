@@ -89,8 +89,35 @@ class ProductionCLI:
         set_security_context(security_context)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Enhanced CLI parser with production features and comprehensive help"""
+class _LazyVersionAction(argparse._VersionAction):
+    """``--version`` whose text is built when the flag is used.
+
+    The text carries the roadmap's "next:" line, read from the bundled
+    ``copilot/roadmap.md``; computing it in ``build_parser`` put the copilot
+    package and a file read on every ``fluid`` start.
+    """
+
+    def __call__(self, parser: Any, namespace: Any, values: Any, option_string: Any = None) -> None:
+        from fluid_build import __version__ as _ver
+
+        version_text = f"FLUID Forge CLI v{_ver}"
+        next_line = compact_next_line()
+        if next_line:
+            version_text = f"{version_text}\n{next_line}"
+        self.version = version_text
+        super().__call__(parser, namespace, values, option_string)
+
+
+def build_parser(argv: Optional[List[str]] = None) -> argparse.ArgumentParser:
+    """Enhanced CLI parser with production features and comprehensive help.
+
+    ``argv=None`` (the default) builds the FULL tree: every command's real
+    subparser. That is what tests, ``fluid describe``, ``scripts/`` and the docs
+    drift gate enumerate. Passing the argv about to be parsed (``main`` does)
+    builds the LAZY tree instead: every command is listed (name + help) but only
+    the invoked one is imported and registered for real -- see
+    ``cli/bootstrap.py::register_core_commands``.
+    """
     p = argparse.ArgumentParser(
         prog="fluid",
         description="""
@@ -175,13 +202,7 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
     )
     p.add_argument("--config-dir", help="Custom configuration directory (default: ~/.fluid)")
     p.add_argument("--no-color", action="store_true", help="Disable colored output")
-    from fluid_build import __version__ as _ver
-
-    version_text = f"FLUID Forge CLI v{_ver}"
-    next_line = compact_next_line()
-    if next_line:
-        version_text = f"{version_text}\n{next_line}"
-    p.add_argument("--version", action="version", version=version_text)
+    p.add_argument("--version", action=_LazyVersionAction, version="")
 
     # Production and monitoring options
     prod_group = p.add_argument_group("Production & Monitoring")
@@ -207,7 +228,7 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
         description="Use 'fluid <command> --help' for command-specific help",
         metavar="COMMAND",
     )
-    register_core_commands(sp)  # pulls in validate/plan/apply/... from commands/*
+    register_core_commands(sp, argv)  # lazy when argv is given, else every command
 
     # UX hardening — wire shell tab completion via argcomplete when
     # available. Soft-import: a missing argcomplete dep silently
@@ -215,14 +236,29 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
     # opt in by running ``eval "$(register-python-argcomplete fluid)"``
     # in their shell rc per the README. Zero overhead when not in
     # completion mode.
-    try:
-        import argcomplete
+    # ``autocomplete`` is a no-op unless the shell set ``_ARGCOMPLETE``, so the
+    # import is skipped outside completion.
+    if "_ARGCOMPLETE" in os.environ:
+        try:
+            import argcomplete
 
-        argcomplete.autocomplete(p)
-    except ImportError:
-        pass
+            argcomplete.autocomplete(p)
+        except ImportError:
+            # argcomplete is optional: without it, tab completion stays off.
+            pass
 
     return p
+
+
+def _ensure_fluid_home() -> None:
+    """Create ``~/.fluid`` (best effort), as every run did before commands were lazy."""
+    from pathlib import Path as _Path
+
+    try:
+        (_Path.home() / ".fluid").mkdir(exist_ok=True)
+    except (OSError, RuntimeError):
+        # No writable or resolvable HOME: the first-run checks see it missing, as before.
+        pass
 
 
 def _force_utf8_streams() -> None:
@@ -302,11 +338,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Setup production environment first
         cli.setup_production_environment()
 
-        parser = build_parser()
-
-        # Intercept help requests for beautiful Rich-formatted output
         if argv is None:
             argv = sys.argv[1:]
+        # Lazy tree: only the invoked command's module is imported. Shell
+        # completion needs every command's options, so it gets the full tree.
+        parser = build_parser(None if "_ARGCOMPLETE" in os.environ else argv)
+        # ~/.fluid used to be created on every run by the forge registries the
+        # eager tree imported. The first-run check below and `fluid init` read
+        # its existence, so it is created here, keeping their behaviour.
+        _ensure_fluid_home()
+
+        # Intercept help requests for beautiful Rich-formatted output
 
         if not argv or argv[0] in ("-h", "--help", "help"):
             if HELP_RICH_AVAILABLE:
@@ -342,6 +384,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
 
         args = parser.parse_args(argv)
+        if getattr(args, "_lazy_stub", False):
+            # Safety net: the argv peek missed the command, so its parser was a
+            # stub. Parse again with that command's real parser.
+            args = build_parser([args.cmd]).parse_args(argv)
 
         # Handle special production commands first
         if getattr(args, "health_check", False):

@@ -64,7 +64,7 @@ class SimpleRegistry(Generic[T]):
             raise TypeError(f"Component must inherit from {self.component_type.__name__}")
 
         self._components[name] = Component(name, component_class)
-        logger.info(f"Registered {self.component_type.__name__.lower()}: {name}")
+        logger.debug(f"Registered {self.component_type.__name__.lower()}: {name}")
 
     def get(self, name: str) -> Optional[T]:
         """Get component instance"""

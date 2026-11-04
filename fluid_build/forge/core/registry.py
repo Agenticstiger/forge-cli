@@ -125,7 +125,7 @@ class ComponentRegistry(Generic[T], ABC):
             logger.warning(f"Could not instantiate component {name}: {e}")
 
         self._components[name] = component_info
-        logger.info(f"Registered {self.component_type.__name__.lower()} '{name}' from {source}")
+        logger.debug(f"Registered {self.component_type.__name__.lower()} '{name}' from {source}")
 
     def unregister(self, name: str) -> bool:
         """Unregister a component"""
