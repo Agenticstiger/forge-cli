@@ -197,7 +197,7 @@ class TestModule:
         ]
         # Each grant by the provider's own id, best-effort: on a new table it fails,
         # and the grant's create sets the same privileges.
-        grants = {b.id for b in imports if b.best_effort}
+        grants = {b.id for b in imports if b.best_effort and b.to.startswith("databricks_grant.")}
         assert grants == {
             "table/main.sales.orders/analysts",
             "table/main.sales.orders/bi",
@@ -206,7 +206,12 @@ class TestModule:
             "schema/main.sales/bi",
             "schema/main.sales/alice@corp.com",
         }
-        assert all(b.to.startswith("databricks_grant.") for b in imports if b.best_effort)
+        # The rest are the product's own tags on the table (test_iac_databricks_metadata.py).
+        assert all(
+            b.to.startswith(("databricks_grant.", "databricks_entity_tag_assignment."))
+            for b in imports
+            if b.best_effort
+        )
 
     def test_other_clouds_are_untouched(self):
         contract = _contract(**{"exposes.0.binding.platform": "snowflake"})
@@ -498,7 +503,14 @@ SCHEMA_TAGS = {
     "fluid_residency": "true",
     "gdpr_article": "art6-1b-contractual",
 }
-TABLE_TAGS = {**SCHEMA_TAGS, "retention": "7y", "sensitivity": "high"}
+#: The product's own tags on the table, from ``_contract()``'s id, name and fluidVersion
+#: (the rest of them: test_iac_databricks_metadata.py).
+PRODUCT_TAGS = {
+    "fluid_product_id": "sales.orders",
+    "fluid_product_name": "Orders",
+    "fluid_version": "0.7.6",
+}
+TABLE_TAGS = {**SCHEMA_TAGS, **PRODUCT_TAGS, "retention": "7y", "sensitivity": "high"}
 TAG = "databricks_entity_tag_assignment"
 
 
@@ -555,18 +567,21 @@ class TestGovernanceTags:
         ] == ("art6-1b-contractual")
         assert not any("-" in body["tag_key"] for body in doc["resource"][TAG].values())
 
-    def test_a_contract_without_labels_gets_the_module_it_always_did(self):
+    def test_a_contract_without_labels_tags_only_the_table_with_the_product(self):
         doc = _module(_contract())
-        assert TAG not in doc["resource"]
-        assert IAC_PLUGINS["databricks"].discover_imports(_contract()) == [
-            block
+        assert _tags_on(doc, "schemas") == {}
+        assert _tags_on(doc, "tables") == PRODUCT_TAGS
+        tag_imports = [
+            block.id
             for block in IAC_PLUGINS["databricks"].discover_imports(_contract())
-            if "tag_assignment" not in block.to
+            if "tag_assignment" in block.to
         ]
-        assert dbx.planned_objects(_contract()) == [
-            a for a in dbx.planned_objects(_contract()) if a["resource_type"] != TAG
-        ]
-        assert dbx.managed_objects(_contract())[0][0].tags == ()
+        assert sorted(tag_imports) == sorted(f"tables,main.sales.orders,{k}" for k in PRODUCT_TAGS)
+        assert {
+            a["resource_id"] for a in dbx.planned_objects(_contract()) if a["resource_type"] == TAG
+        } == set(tag_imports)
+        (table,), _ = dbx.managed_objects(_contract())
+        assert dict(table.tags) == PRODUCT_TAGS and table.schema_tags == ()
 
     def test_two_exposes_in_one_schema_claim_one_body_per_schema_tag(self):
         contract = _governed()
@@ -643,9 +658,9 @@ class TestGovernanceTags:
 
     def test_exactly_fifty_tags_fit(self):
         contract = _contract()
-        contract["labels"] = {f"k{i:03d}": "v" for i in range(50)}
+        contract["labels"] = {f"k{i:03d}": "v" for i in range(50 - len(PRODUCT_TAGS))}
         doc = _module(contract)
-        assert len(_tags_on(doc, "schemas")) == 50 and len(_tags_on(doc, "tables")) == 50
+        assert len(_tags_on(doc, "schemas")) == 47 and len(_tags_on(doc, "tables")) == 50
 
     def test_the_table_alone_over_the_cap_is_refused_once(self):
         contract = _contract()
