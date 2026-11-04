@@ -65,8 +65,8 @@ class TestLitellmMarkerSplit:
     def test_extra_keeps_both_marker_lines_verbatim(self):
         assert sorted(EXTRAS["litellm"]) == sorted(
             [
-                "litellm>=1.83.14,<2; python_version >= '3.11'",
-                "litellm>=1.83.14,<1.98; python_version < '3.11'",
+                "litellm>=1.83.14,!=1.107.0,<2; python_version >= '3.11'",
+                "litellm>=1.83.14,!=1.107.0,<1.98; python_version < '3.11'",
             ]
         )
 
@@ -78,7 +78,7 @@ class TestLitellmMarkerSplit:
 
 class TestFilledExtras:
     def test_mcp_pins_the_sdk_and_declares_pyjwt(self):
-        assert "mcp>=1.22,<3.0" in EXTRAS["mcp"]
+        assert "mcp>=1.30,!=2.0.*,!=2.1.*,<3.0" in EXTRAS["mcp"]
         assert "pyjwt" in _names("mcp")
 
     def test_lineage_carries_openlineage(self):

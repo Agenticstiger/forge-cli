@@ -35,7 +35,7 @@ the migration guide, which oversells several removals:
   ``open_inmemory_session``).
 
 This module is the ONLY place allowed to branch on the SDK generation.
-The install pin (pyproject.toml) is ``mcp>=1.22,<3.0``, so both
+The install pin (pyproject.toml) is ``mcp>=1.30,!=2.0.*,!=2.1.*,<3.0``, so both
 generations install — the dual support here is what keeps both drift legs
 green.
 

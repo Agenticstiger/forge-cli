@@ -280,9 +280,10 @@ postgres = [
 #
 # The two requirement lines below are the Python-version marker split (PR #555);
 # never collapse them. tests/ci_guards/extras_alongside_base.py pins both.
+# !=1.107.0: MAL-2026-2144, a malicious release since removed from PyPI.
 litellm = [
-  "litellm>=1.83.14,<2; python_version >= '3.11'",
-  "litellm>=1.83.14,<1.98; python_version < '3.11'",
+  "litellm>=1.83.14,!=1.107.0,<2; python_version >= '3.11'",
+  "litellm>=1.83.14,!=1.107.0,<1.98; python_version < '3.11'",
 ]
 
 # MCP server and output-port gateway (``fluid mcp serve``,
@@ -350,12 +351,16 @@ litellm = [
 #   docs:  https://modelcontextprotocol.github.io/python-sdk/
 #   repo:  https://github.com/modelcontextprotocol/python-sdk
 #
+# mcp floor 1.30: advisories fixed in 1.23.0, 1.27.2 (GHSA-jpw9, an SSE session
+# not bound to its principal; the gateway uses ``SseServerTransport``), 1.28.1
+# and 1.30.0; 2.0.* and 2.1.* carry them too and were fixed in 2.2.0.
+#
 # pyjwt is declared explicitly because fluid_build/output_ports/mcp/auth.py
 # imports ``jwt`` directly. Floor 2.15.0: every release up to 2.14.0 has
 # advisories on the PyJWKClient/decode path auth.py uses (e.g.
 # GHSA-ffc3-869f-jxw9); [crypto] for the RS256/ES256/EdDSA verifiers.
 mcp = [
-  "mcp>=1.22,<3.0",
+  "mcp>=1.30,!=2.0.*,!=2.1.*,<3.0",
   "pyjwt[crypto]>=2.15.0",
 ]
 
