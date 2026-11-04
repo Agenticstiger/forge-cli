@@ -7,7 +7,8 @@ What it proves: what the real ``databricks/databricks`` provider (1.140.0) and `
 apply and import for a live object. It serves ``data.databricks_catalog``,
 ``databricks_schema``, ``databricks_sql_table`` (whose DDL goes through the SQL Statement
 Execution API), ``databricks_grant`` and ``databricks_entity_tag_assignment`` (create, get,
-update, delete and the paginated list ``fluid verify`` reads; ``tags``, ``tag_page_size``). A
+update, delete and the paginated list ``fluid verify`` reads, on a catalog, schema, table or
+column; ``tags``, ``tag_page_size``). A
 small SQL interpreter understands exactly the statements ``databricks_sql_table`` sends (CREATE
 [OR REPLACE] TABLE, ALTER TABLE ADD / DROP / RENAME / ALTER COLUMN, SET / UNSET TBLPROPERTIES,
 CLUSTER BY, COMMENT ON TABLE, DROP TABLE), and the statements forge-cli sends for a contract's
@@ -1332,6 +1333,12 @@ class FakeDatabricks:
     def _entity_exists(self, entity_type: str, name: str) -> bool:
         if entity_type == "tables":
             return name in self.tables
+        if entity_type == "columns":
+            # ``catalog.schema.table.column``, as the provider's docs name a column entity
+            table, _, column = name.rpartition(".")
+            return table in self.tables and any(
+                c["name"] == column for c in self.tables[table]["columns"]
+            )
         if entity_type == "schemas":
             return name in self.schemas
         return entity_type == "catalogs" and name in self.catalogs

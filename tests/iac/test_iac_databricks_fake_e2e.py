@@ -52,6 +52,7 @@ from fluid_build.iac.module import LOCK_FILE_NAME, dependency_lock
 
 from ._databricks_cli import (  # noqa: F401 — plugin_cache is a fixture
     COLUMNS,
+    PRODUCT_TAGS,
     apply_contract,
     isolate_workspace,
     make_contract,
@@ -168,7 +169,7 @@ def test_a_grant_revoke_is_not_gated(workspace, fake, capfd):
 
 LABELS = {"data-classification": "confidential", "cost-center": "cx-001"}
 SCHEMA_TAGS = {"data_classification": "confidential", "cost_center": "cx-001"}
-TABLE_TAGS = {**SCHEMA_TAGS, "sensitivity": "high"}
+TABLE_TAGS = {**SCHEMA_TAGS, **PRODUCT_TAGS, "sensitivity": "high"}
 
 
 def _governed(**labels: str) -> dict:
@@ -192,10 +193,10 @@ def test_apply_writes_the_governance_labels_as_tags_and_a_second_plan_is_empty(
     assert fake.unknown == []
 
 
-def test_a_contract_without_labels_makes_no_tag_assignment(workspace, fake, capfd):
+def test_a_contract_without_labels_tags_only_the_table_with_the_product(workspace, fake, capfd):
     assert apply_contract(capfd, write_contract(workspace, make_contract()))[0] == 0
-    assert fake.tags == {}
-    assert not any("entity-tag-assignments" in path for _method, path in fake.requests)
+    assert fake.tags_on("schemas", "main.sales") == {}
+    assert fake.tags_on("tables", TABLE) == PRODUCT_TAGS
 
 
 def test_a_changed_label_value_updates_the_tag_in_place(workspace, fake, capfd):
@@ -226,6 +227,7 @@ def test_removing_a_label_destroys_only_its_assignment_without_allow_data_loss(
     assert fake.tags_on("schemas", "main.sales") == {"data_classification": "confidential"}
     assert fake.tags_on("tables", TABLE) == {
         "data_classification": "confidential",
+        **PRODUCT_TAGS,
         "sensitivity": "high",
     }
     assert fake.tables[TABLE]["marker"] == marker and fake.replaced == []
@@ -351,13 +353,15 @@ def _brownfield_with_grants(fake: FakeDatabricks, *table_privileges: str) -> Non
 def test_existing_grants_are_adopted_with_their_table(workspace, fake, capfd):
     # Each grant is imported by the provider's own id, so the contract's grants
     # plan no change. The table's one update writes back what the provider does
-    # not import (its properties and warehouse id): the values it already has.
+    # not import (its properties and warehouse id): the values it already has,
+    # plus the contract's description as its comment. The +5 are the product's
+    # own tags, which a table made before them does not carry.
     _brownfield_with_grants(fake, "SELECT")
     path = write_contract(workspace, make_contract())
     rc, out = apply_contract(capfd, path, "--mode", "dry-run")
     assert rc == 0, out
     assert "brownfield: adopted 6 pre-existing resource(s)" in out
-    assert "tofu plan: +0 ~1 -0" in out
+    assert f"tofu plan: +{len(PRODUCT_TAGS)} ~1 -0" in out
     assert apply_contract(capfd, path)[0] == 0
     assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]
     assert fake.grants[("table", TABLE)] == {"analysts": ["SELECT"], "bi": ["SELECT"]}
@@ -369,7 +373,7 @@ def test_an_adopted_grant_shows_what_the_contract_takes_away(workspace, fake, ca
     _brownfield_with_grants(fake, "MODIFY", "SELECT")
     path = write_contract(workspace, make_contract())
     rc, out = apply_contract(capfd, path, "--mode", "dry-run")
-    assert rc == 0 and "tofu plan: +0 ~3 -0" in out, out
+    assert rc == 0 and f"tofu plan: +{len(PRODUCT_TAGS)} ~3 -0" in out, out
     assert apply_contract(capfd, path)[0] == 0
     assert fake.grants[("table", TABLE)] == {"analysts": ["SELECT"], "bi": ["SELECT"]}
 
