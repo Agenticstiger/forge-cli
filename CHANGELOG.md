@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **IaC plugins load when a contract needs their platform, and cannot take a built-in's name
+  unless the operator says so.** A package that ships an OpenTofu emitter through the
+  `fluid_build.iac_providers` entry-point group used to be imported whenever `fluid_build.iac`
+  was; now only its name is read, and it is imported the first time a contract's
+  `binding.platform` (or `fluid generate iac --provider`) asks for it, so `fluid --help` and
+  `fluid providers` run no plugin code. The allow/block lists and the reserved names are
+  checked before the import, and the plugin's `requires_cli` right after it (it is read from the
+  loaded plugin); allow/block names now match case-insensitively with `-` equal to `_`. A
+  contract's `binding.platform` selects a plugin platform by auto-detection; the global
+  `--provider` flag still accepts built-in providers only. Two distributions shipping the same
+  non-reserved name are both refused with a WARNING. Before a destructive apply attributes a
+  state to a cloud, every admitted installed plugin is loaded. An entry point claiming a built-in platform (`aws`, `gcp`,
+  `snowflake`, `confluent`, `databricks`, an alias such as `glue` or `bigquery`, or `local`) is
+  skipped without being imported, with a WARNING naming its distribution. **Breaking (plugins):**
+  a plugin that replaced a built-in emitter now needs the operator's grant, a
+  distribution-qualified `FLUID_PLUGINS_ALLOWLIST` entry such as `acme-fluid-aws:aws`; a
+  qualified entry does not restrict other plugins. The retired names `redshift` and
+  `datamesh-manager` cannot be granted.
+
 - **`fluid doctor --strict` turns the "Action needed" summary into exit 1.** `fluid doctor` printed
   "Action needed" for a copilot that is not ready and still exited 0, so a CI gate could not tell.
   With `--strict` it exits 1 whenever the summary says "Action needed", in the text report and with

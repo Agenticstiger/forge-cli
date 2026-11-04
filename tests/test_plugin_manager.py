@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from fluid_build import plugin_manager as PM
 
 
@@ -176,3 +178,61 @@ def test_run_role_validators_folds_into_validation_result(monkeypatch):
     assert any("E1" in e and "(at a.b)" in e for e in result.errors)
     assert any("W1" in w for w in result.warnings)
     assert not any("I1" in m for m in result.errors + result.warnings)
+
+
+# ── allow/block spelling + distribution-qualified grants ──────────────────────
+
+
+def test_is_allowed_matches_case_insensitively_with_dash_equal_underscore(monkeypatch):
+    monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "on_prem,Kubernetes")
+    assert PM.is_allowed("on-prem") is False
+    assert PM.is_allowed("ON_PREM") is False
+    assert PM.is_allowed("kubernetes") is False
+    assert PM.is_allowed("KUBERNETES") is False
+    assert PM.is_allowed("other") is True
+    monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST")
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "On-Prem")
+    assert PM.is_allowed("on_prem") is True
+    assert PM.is_allowed("other") is False
+
+
+class _Dist:
+    def __init__(self, name, version="1.0"):
+        self.name = name
+        self.version = version
+
+
+class _EP:
+    def __init__(self, name, dist):
+        self.name = name
+        self.dist = dist
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("acme-fluid-aws", "acme-fluid-aws"),
+        ("Acme_Fluid.AWS", "Acme_Fluid.AWS"),
+        ("acme-fluid-aws spoof", None),
+        ("acme\x1b[31m", None),
+        ("acme\n", None),
+        ("", None),
+        ("-lead", None),
+        (None, None),
+    ],
+)
+def test_granted_distribution_reads_the_real_name_and_validates_it(name, expected):
+    assert PM.granted_distribution(_EP("aws", _Dist(name))) == expected
+    assert PM.granted_distribution(_EP("aws", None)) is None
+
+
+def test_override_granted_uses_the_distribution_name_not_the_display_string(monkeypatch):
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "acme-fluid-aws:aws")
+    assert PM.override_granted(_EP("aws", _Dist("acme-fluid-aws"))) is True
+    assert PM.override_granted(_EP("AWS", _Dist("Acme_Fluid.AWS"))) is True
+    assert PM.override_granted(_EP("aws", _Dist("acme-fluid-aws spoof"))) is False
+    assert PM.override_granted(_EP("aws", _Dist("other"))) is False
+    assert PM.override_granted(_EP("aws", None)) is False
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "aws")
+    assert PM.override_granted(_EP("aws", _Dist("acme-fluid-aws"))) is False

@@ -26,9 +26,11 @@ from fluid_build.iac import registry as R
 @pytest.fixture(autouse=True)
 def _isolate_iac_registry():
     saved = dict(R.IAC_PLUGINS)
+    R.reset_iac_plugin_cache()
     try:
         yield
     finally:
+        R.reset_iac_plugin_cache()
         R.IAC_PLUGINS.clear()
         R.IAC_PLUGINS.update(saved)
 
@@ -73,7 +75,7 @@ def test_external_iac_plugin_registered_from_entrypoint(monkeypatch):
     monkeypatch.delenv("FLUID_PLUGINS_ALLOWLIST", raising=False)
     monkeypatch.delenv("FLUID_PLUGINS_BLOCKLIST", raising=False)
 
-    assert R.get_iac_plugin("mycloud") is None  # not registered yet
+    assert "mycloud" not in R.IAC_PLUGINS  # not registered until something asks
     R.discover_iac_entrypoints()
     plugin = R.get_iac_plugin("mycloud")
     assert plugin is not None
