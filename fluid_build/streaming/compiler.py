@@ -331,13 +331,13 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
             f"Flink build {bid}: managed Flink reads the records properties.stream declares "
             "(kind, topic, format, schema)"
         )
-    spec = props["stream"]
-    if isinstance(spec, Mapping):
-        reject_uncompiled_rules(spec.get("schema"))
-        key = spec.get("key")
+    stream_spec = props["stream"]
+    if isinstance(stream_spec, Mapping):
+        reject_uncompiled_rules(stream_spec.get("schema"))
+        key = stream_spec.get("key")
         if isinstance(key, Mapping):
             reject_uncompiled_rules(key.get("schema"))
-    stream = parse_stream(spec, f"Flink build {bid}: properties.stream")
+    stream = parse_stream(stream_spec, f"Flink build {bid}: properties.stream")
     source = cfg["source"]
     registry = source.get("schemaRegistryUrl")
     if stream.uses_registry:
