@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A sovereignty refusal says why on every command.** `fluid generate iac` turned a typed
+  refusal (a placement outside `sovereignty.allowedRegions`, say) into `generate_iac_failed` and
+  printed only the finding; it now prints the error's reason (`... allows me-central-1,
+  me-south-1`), fix and doc, as `fluid apply` does. A typed error whose message is too long for
+  the panel's title (one that lists every finding) is now printed whole in the panel instead of
+  cut at the border.
 - **A Databricks landing leaves nothing behind.** After the load, the bronze landing now also
   removes the build's and the product's directories in the staging volume
   (`<volume>/<product>/<build>/`) once each is listed empty, never one another run or build still

@@ -25,6 +25,7 @@ import argparse
 import copy
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -796,6 +797,33 @@ def test_fluid_validate_reports_the_refusals(monkeypatch, tmp_path: Path, capfd)
     contract["exposes"][0]["binding"]["location"]["host"] = "evil.example.com"
     rc, out = run_fluid(capfd, "validate", write_contract(tmp_path, contract))
     assert rc != 0 and "sets binding.location.host" in out
+
+
+@pytest.mark.parametrize("command", [("generate", "iac"), ("apply",)])
+def test_a_sovereignty_refusal_prints_its_reason_and_fix(
+    monkeypatch, tmp_path: Path, capfd, command
+):
+    isolate_workspace(
+        monkeypatch,
+        tmp_path,
+        host="https://adb-1.azuredatabricks.net",
+        warehouse_id=WAREHOUSE,
+        plugin_cache=str(tmp_path),
+    )
+    contract = make_contract(region="europe-west3")
+    contract["sovereignty"] = {
+        "allowedRegions": ["me-central-1", "me-south-1"],
+        "enforcementMode": "strict",
+    }
+    path = write_contract(tmp_path, contract)
+    extra = ("--out", str(tmp_path / "iac")) if command[0] == "generate" else ("--yes",)
+    rc, out = run_fluid(capfd, *command, path, *extra)
+    # the typed-error panel: colours and its border cut the wrapped text
+    out = " ".join(re.sub(r"\x1b\[[0-9;]*m|[│╭╮╰╯─]", " ", out).split())
+    assert rc != 0
+    assert "Region 'europe-west3' not in allowed regions list" in out
+    assert "allows me-central-1, me-south-1" in out
+    assert "Set binding.location.region on every databricks expose" in out
 
 
 def test_a_databricks_build_beside_non_cloud_exposes_still_meets_the_host_guard(
