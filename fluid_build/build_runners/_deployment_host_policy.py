@@ -33,7 +33,9 @@ The policy, chosen by the founder on 2026-10-27 after the options were laid out:
   working install on upgrade for no gain.
 * **Link-local and unspecified are refused outright**, allowlist or not. That is
   where cloud instance metadata lives (169.254.169.254), and it is never a
-  legitimate orchestrator.
+  legitimate orchestrator. So are the metadata endpoints outside link-local,
+  such as AWS's IPv6 ``fd00:ec2::254`` and Alibaba's ``100.100.100.200``
+  (``_net.CLOUD_METADATA_ADDRESSES``).
 * A host that does **not resolve** passes the construction-time check and is
   judged again on every request. Refusing it outright was the first version and
   it was wrong: ``kafka-connect.internal`` does not resolve on a laptop, so a
@@ -263,8 +265,8 @@ def host_refusal(
     host = verdict.host
     if verdict.code == "link-local":
         return (
-            f"host {host!r} is link-local or unspecified, where cloud instance metadata "
-            "lives; no orchestrator is there, and this is refused even with an allowlist "
+            f"host {host!r} is link-local, unspecified or a known cloud metadata endpoint; "
+            "no orchestrator is ever there, and this is refused even with an allowlist "
             "entry"
         )
     if verdict.code == "mixed":
@@ -307,8 +309,8 @@ def _host_error(refusal: str, *, engine: str, operator_supplied: bool) -> Deploy
             what=f"the {engine} endpoint given on the command line cannot be used",
             why=f"Refused because {refusal}.",
             fix=(
-                f"Point it at the {engine} API itself. A link-local address is instance "
-                "metadata, never a service endpoint, and is refused however it is "
+                f"Point it at the {engine} API itself. A link-local or cloud metadata "
+                "address is never a service endpoint, and is refused however it is "
                 "configured."
             ),
             doc=doc_url(),
@@ -346,8 +348,8 @@ def _pinned_refusal(verdict: HostVerdict) -> str:
         named += f", connecting to {verdict.pinned!r},"
     if verdict.code == "link-local":
         return (
-            f"{named} is link-local or unspecified, where cloud instance metadata lives; "
-            "no orchestrator is there, and this is refused even with an allowlist entry"
+            f"{named} is link-local, unspecified or a known cloud metadata endpoint; "
+            "no orchestrator is ever there, and this is refused even with an allowlist entry"
         )
     return (
         f"{named} is public, and the config posted to it carries the source credential "

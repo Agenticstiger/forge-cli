@@ -65,7 +65,12 @@ from typing import Any, Dict, Iterator, List, Tuple
 
 import pytest
 
-from fluid_build._net import _hostname_is_private, hostname_scope, is_public_address
+from fluid_build._net import (
+    _hostname_is_link_local,
+    _hostname_is_private,
+    hostname_scope,
+    is_public_address,
+)
 from fluid_build.build_runners._deployment_host_policy import (
     ALLOWLIST_ENV,
     DeploymentHostError,
@@ -91,6 +96,8 @@ FAKE_DNS: Dict[str, List[str]] = {
     # What socket.getaddrinfo answers for faß.de: it asks about IDNA2003
     # fass.de, while httpx connects to IDNA2008 xn--fa-hia.de.
     "faß.de": ["10.1.2.3"],
+    # Alibaba Cloud's metadata service, which sits inside CGNAT.
+    "orchestrator.alibaba.test": ["100.100.100.200"],
 }
 
 
@@ -186,6 +193,38 @@ def test_the_broad_gate_keeps_its_fail_closed_direction(host: str, private: bool
     assert _hostname_is_private(host) is private
 
 
+@pytest.mark.parametrize(
+    "address, refused",
+    [
+        ("169.254.169.254", True),
+        ("0.0.0.0", True),
+        ("::", True),
+        # Metadata and credential endpoints that are not link-local.
+        ("fd00:ec2::254", True),  # AWS EC2 IMDS over IPv6
+        ("fd00:ec2::23", True),  # AWS EKS Pod Identity agent, IPv6
+        ("fd20:ce::254", True),  # GCP metadata server, IPv6-only VMs
+        ("fd00:c1::a9fe:a9fe", True),  # Oracle Cloud IMDS, IPv6
+        ("100.100.100.200", True),  # Alibaba Cloud metadata, inside CGNAT
+        # The same addresses wrapped in IPv6.
+        ("::ffff:169.254.169.254", True),
+        ("::ffff:100.100.100.200", True),
+        ("64:ff9b::a9fe:a9fe", True),  # NAT64 of 169.254.169.254
+        ("64:ff9b::6464:64c8", True),  # NAT64 of 100.100.100.200
+        # Their neighbours are ordinary internal networks and stay allowed.
+        ("100.100.100.100", False),  # Tailscale MagicDNS
+        ("100.64.1.2", False),  # a Tailscale node
+        ("fd00::1", False),
+        ("fd00:ec2::253", False),
+        ("10.1.2.3", False),
+        ("64:ff9b::5db8:d822", False),  # NAT64 of a public address
+        ("93.184.216.34", False),
+    ],
+)
+def test_the_narrow_gate_refuses_metadata_wherever_it_lives(address: str, refused: bool) -> None:
+    """Link-local was the whole list, so metadata in ULA or CGNAT space passed as internal."""
+    assert _hostname_is_link_local(address) is refused
+
+
 def test_the_address_predicate_is_shared_not_copied() -> None:
     """``safe_http`` re-exports the tier-0 definitions rather than owning them.
 
@@ -233,6 +272,8 @@ def test_the_address_predicate_is_shared_not_copied() -> None:
         ("http://orchestrator.metadata.test", "", False, "instance metadata"),
         ("http://orchestrator.metadata.test", "metadata.test", False, "metadata, even named"),
         ("http://169.254.169.254", "169.254.169.254", False, "by address, even named"),
+        ("http://[fd00:ec2::254]", "fd00:ec2::254", False, "AWS IPv6 metadata, even named"),
+        ("http://orchestrator.alibaba.test", "alibaba.test", False, "Alibaba metadata, named"),
         ("http://0.0.0.0", "", False, "unspecified routes to loopback on many stacks"),
         ("file:///etc/passwd", "", False, "not an http(s) orchestrator"),
         ("", "", False, "nothing configured"),
@@ -254,6 +295,15 @@ def test_a_mixed_answer_is_refused_for_what_it_is() -> None:
     refusal = host_refusal("https://orchestrator.mixed.test", engine="airbyte", environ={})
     assert refusal is not None
     assert "both public and non-public" in refusal, refusal
+
+
+def test_a_metadata_refusal_says_metadata() -> None:
+    """``fd00:ec2::254`` is not link-local, so the refusal must not only say it is."""
+    refusal = host_refusal(
+        "http://[fd00:ec2::254]", engine="airbyte", environ={ALLOWLIST_ENV: "fd00:ec2::254"}
+    )
+    assert refusal is not None
+    assert "cloud metadata" in refusal, refusal
 
 
 def test_an_unresolvable_host_is_not_this_gate_s_refusal() -> None:
@@ -426,6 +476,7 @@ def _pinned(address: str) -> Any:
         ("https://orchestrator.public.test", "93.184.216.34", "orchestrator.public.test", False),
         ("https://orchestrator.public.test", "169.254.169.254", "orchestrator.public.test", True),
         ("https://orchestrator.public.test", "0.0.0.0", "orchestrator.public.test", True),
+        ("https://orchestrator.public.test", "fd00:ec2::254", "orchestrator.public.test", True),
         # No address to judge is not a pass.
         ("https://orchestrator.public.test", "", "orchestrator.public.test", True),
     ],
