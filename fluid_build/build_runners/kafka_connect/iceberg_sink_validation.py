@@ -131,7 +131,6 @@ from ...providers._iceberg_catalog import (
     canonical_catalog_kind,
     catalog_kind_info,
     iceberg_catalog_kind,
-    iceberg_namespace,
     iceberg_sink_exposes,
     is_object_store_uri,
     known_catalog_kinds,
@@ -1165,10 +1164,8 @@ def _check_catalog_auth(
     errors: List[str],
     warnings: List[str],
 ) -> None:
-    """``sink.catalogAuth``: shape, catalog, derivation, overrides, the hosts
-    its credential reaches, and the embedded Debezium variable at run time.
-    HARD, except a destination the operator has yet to allow, which ``fluid
-    validate`` only warns about (:func:`_check_catalog_auth_destinations`)."""
+    """``sink.catalogAuth``: shape, catalog, derivation, overrides, the hosts it
+    reaches, and the embedded Debezium variable at run time. HARD."""
     raw = raw_catalog_auth(sink)
     if raw is None:
         return
@@ -1244,14 +1241,7 @@ def _check_catalog_auth(
                 f"keys from {label}, or remove sink.{CATALOG_AUTH_FIELD}"
             )
 
-    # Before the variable is read: a refused destination never touches it.
-    if (
-        auth is not None
-        and not refused
-        and _check_catalog_auth_destinations(head, auth, runtime, targets, errors, warnings)
-    ):
-        return
-    _check_catalog_auth_env_at_run(head, auth, runtime, errors)
+    _check_catalog_auth_reach(head, auth, refused, runtime, targets, errors, warnings)
 
 
 def _check_catalog_auth_env_at_run(
@@ -1339,8 +1329,89 @@ def _ip_literal(host: str) -> Optional[Union[ipaddress.IPv4Address, ipaddress.IP
     return address
 
 
-def _destination_refusal(host: str) -> Optional[Tuple[bool, str]]:
-    """Why a credential may not go to ``host``: ``(never, reason)``, or ``None``.
+def _check_catalog_auth_reach(
+    head: str,
+    auth: Optional[CatalogAuth],
+    refused: Sequence[str],
+    runtime: IcebergSinkPlan,
+    targets: Sequence[Mapping[str, Any]],
+    errors: List[str],
+    warnings: List[str],
+) -> None:
+    """The hosts the credential reaches, then the embedded Debezium variable.
+
+    In that order, so a refused destination never reads the variable.
+    ``refused`` names the catalog kinds not reached over REST: that is already
+    an error, and nothing there reads the credential.
+    """
+    if auth is not None and not refused:
+        if _check_catalog_auth_destinations(head, auth, runtime, targets, errors, warnings):
+            return
+    _check_catalog_auth_env_at_run(head, auth, runtime, errors)
+
+
+def _credential_destinations(
+    auth: CatalogAuth, runtime: IcebergSinkPlan, targets: Sequence[Mapping[str, Any]]
+) -> List[Tuple[str, str, str]]:
+    """``(role, setting, url)`` for each host the credential reaches.
+
+    The catalog the sink calls (:func:`_catalog_uri_reaching`), once per uri,
+    and for ``oauth2`` the token endpoint, which receives the credential itself
+    while the catalog receives a token minted from it.
+    """
+    destinations: List[Tuple[str, str, str]] = []
+    for target in targets:
+        uri, source = _catalog_uri_reaching(target.get("binding") or {}, runtime)
+        if uri.strip() and all(uri != url for _role, _source, url in destinations):
+            destinations.append(("Iceberg catalog", source, uri))
+    if auth.type == "oauth2":
+        source = f"sink.{CATALOG_AUTH_FIELD}.oauth2ServerUri"
+        destinations.append(("OAuth2 token endpoint", source, auth.oauth2_server_uri))
+    return destinations
+
+
+def _received(auth: CatalogAuth, role: str) -> str:
+    """What the ``role`` host receives of the credential, for the messages."""
+    if role == "OAuth2 token endpoint":
+        return f"the credential in {auth.env_var} (the client id and secret)"
+    if auth.type == "oauth2":
+        return f"a token minted from the credential in {auth.env_var}"
+    return f"the token in {auth.env_var}"
+
+
+def _destination_host(url: str, source: str, role: str, receives: str) -> Tuple[str, str]:
+    """``(host, "")`` for a destination the operator may allow, else ``("", why not)``.
+
+    "Why not" is a refusal no operator entry changes: the URL is not https (a
+    loopback one included, as on the managed Flink lane), names no host, or
+    names a link-local or unspecified address, where cloud instance metadata
+    lives (the deployment host policy's rule).
+    """
+    no_host = f"{source} names no host, so where the {role} sends {receives} cannot be checked"
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+    except ValueError:  # an unbalanced "[" in the netloc: no host can be read
+        return "", no_host
+    if parts.scheme != "https":
+        return "", (
+            f"{source} must be an https:// URL: the {role} receives {receives} on every "
+            "request, and http would carry it in clear text (on a loopback host too, as on "
+            "the managed Flink lane)"
+        )
+    if not host:
+        return "", no_host
+    address = _ip_literal(host)
+    if address is not None and (address.is_link_local or address.is_unspecified):
+        return "", (
+            f"the {role} host {host!r} ({source}) is link-local or unspecified, where cloud "
+            "instance metadata lives; this is refused even with an allowlist entry"
+        )
+    return host, ""
+
+
+def _unlisted_host(host: str) -> Optional[str]:
+    """Why ``host`` needs a host-list entry the operator has not given, or ``None``.
 
     The rule the founder chose for these sinks on 2026-11-04, the one the
     managed Flink lane applies. The Kafka Connect worker or the Debezium Server
@@ -1348,25 +1419,18 @@ def _destination_refusal(host: str) -> Optional[Tuple[bool, str]]:
     shows where it will connect: a name passes only when the operator lists it
     in ``FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST``, or when it is
     ``localhost``. An IP literal keeps the deployment host policy's rules
-    (``_deployment_host_policy.py``): link-local and unspecified never
-    (``never`` is ``True``), a private or loopback address with no entry, a
-    public one only when listed. Nothing is resolved. A listed host is matched
-    by that policy's own suffix rule, so the two lists cannot read differently.
+    (``_deployment_host_policy.py``): a private or loopback address needs no
+    entry, a public one is listed (link-local is refused before this, by
+    :func:`_destination_host`). Nothing is resolved. A listed host is matched by
+    that policy's own suffix rule, so the two lists cannot read differently.
     """
-    listed = _on_allowlist(host, host_allowlist())
-    address = _ip_literal(host)
-    if address is not None:
-        if address.is_link_local or address.is_unspecified:
-            return True, (
-                "is link-local or unspecified, where cloud instance metadata lives; this is "
-                "refused even with an allowlist entry"
-            )
-        if listed or not is_public_address(host):
-            return None
-        return False, f"is a public address not in {HOST_ALLOWLIST_ENV}"
-    if listed or is_loopback(host):
+    if _on_allowlist(host, host_allowlist()):
         return None
-    return False, f"is a name not in {HOST_ALLOWLIST_ENV}"
+    if _ip_literal(host) is not None:
+        return (
+            f"is a public address not in {HOST_ALLOWLIST_ENV}" if is_public_address(host) else None
+        )
+    return None if is_loopback(host) else f"is a name not in {HOST_ALLOWLIST_ENV}"
 
 
 def _check_catalog_auth_destinations(
@@ -1380,76 +1444,38 @@ def _check_catalog_auth_destinations(
     """Every host the credential reaches must be https and allowed by the operator.
 
     The contract names the variable (``tokenEnv`` / ``credentialEnv``) and the
-    hosts: the catalog uri, and for ``oauth2`` the token endpoint, which
-    receives the credential itself while the catalog receives a token minted
-    from it. Iceberg resolves ``env:<NAME>`` where the sink runs (on embedded
-    Debezium, from this runner's whole environment) and sends the value there,
-    so without an operator boundary any variable there could go to a host the
-    contract chose. Each host needs:
+    hosts (:func:`_credential_destinations`). Iceberg resolves ``env:<NAME>``
+    where the sink runs (on embedded Debezium, from this runner's whole
+    environment) and sends the value there, so without an operator boundary any
+    variable there could go to a host the contract chose. Each host needs:
 
-    * https, a loopback one included, as on the managed Flink lane. HARD, as is
-      a host no entry can allow (:func:`_destination_refusal`);
+    * https, and an address no entry has to rule out (:func:`_destination_host`).
+      HARD;
     * the variable paired with it in ``FLUID_ACQUISITION_SECRET_REF_ALLOWLIST``
       (``NAME@host``), unless it is loopback (``_secret_policy.variable_allowed``);
-    * a hostname listed in ``FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST``.
+    * a hostname listed in ``FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST``
+      (:func:`_unlisted_host`).
 
     Both lists are operator-only (``credentials/protected_env.py`` ignores a
     project dotenv file's value) and are read where the sink config is
     derived: the run's preflight refuses, and ``fluid validate``, which may run
     without them, warns with the entries the run needs. Returns ``True`` when
-    the run must stop, so the embedded Debezium preflight never reads the
-    variable of a refused sink.
+    the run must stop.
     """
-    destinations: List[Tuple[str, str, str]] = []
-    for target in targets:
-        uri, source = _catalog_uri_reaching(target.get("binding") or {}, runtime)
-        if uri.strip() and all(uri != url for _role, _source, url in destinations):
-            destinations.append(("Iceberg catalog", source, uri))
-    if auth.type == "oauth2":
-        destinations.append(
-            (
-                "OAuth2 token endpoint",
-                f"sink.{CATALOG_AUTH_FIELD}.oauth2ServerUri",
-                auth.oauth2_server_uri,
-            )
-        )
     hard: List[str] = []
     reasons: List[str] = []
     pairs: List[str] = []
     hosts: List[str] = []
-    for role, source, url in destinations:
+    for role, source, url in _credential_destinations(auth, runtime, targets):
         if _rendered_at_run(url):
             continue
-        if role == "OAuth2 token endpoint":
-            receives = f"the credential in {auth.env_var} (the client id and secret)"
-        elif auth.type == "oauth2":
-            receives = f"a token minted from the credential in {auth.env_var}"
-        else:
-            receives = f"the token in {auth.env_var}"
-        try:
-            parts = urlsplit(url)
-            host = parts.hostname
-        except ValueError:  # an unbalanced "[" in the netloc: no host can be read
-            parts, host = None, None
-        if parts is None or parts.scheme != "https":
-            hard.append(
-                f"{head}: {source} must be an https:// URL: the {role} receives {receives} "
-                "on every request, and http would carry it in clear text (on a loopback host "
-                "too, as on the managed Flink lane)"
-            )
+        host, problem = _destination_host(url, source, role, _received(auth, role))
+        if problem:
+            hard.append(f"{head}: {problem}")
             continue
-        if not host:
-            hard.append(
-                f"{head}: {source} names no host, so where the {role} sends {receives} "
-                "cannot be checked"
-            )
-            continue
-        refusal = _destination_refusal(host)
-        if refusal is not None and refusal[0]:
-            hard.append(f"{head}: the {role} host {host!r} ({source}) {refusal[1]}")
-            continue
-        if refusal is not None:
-            reasons.append(f"the {role} host {host!r} {refusal[1]}")
+        unlisted = _unlisted_host(host)
+        if unlisted is not None:
+            reasons.append(f"the {role} host {host!r} {unlisted}")
             hosts.append(host)
         if not variable_allowed(auth.env_var, host):
             reasons.append(
@@ -1458,8 +1484,26 @@ def _check_catalog_auth_destinations(
             )
             pairs.append(f"{auth.env_var}@{host}")
     errors.extend(hard)
-    if not reasons:
-        return bool(hard)
+    if reasons:
+        issue = _unallowed_destinations(head, auth, runtime, reasons, pairs, hosts)
+        run_only = _AT_RUN.get()
+        if run_only is None:
+            warnings.append(issue)
+        else:
+            errors.append(issue)
+            run_only.append(issue)
+    return bool(hard or reasons)
+
+
+def _unallowed_destinations(
+    head: str,
+    auth: CatalogAuth,
+    runtime: IcebergSinkPlan,
+    reasons: Sequence[str],
+    pairs: Sequence[str],
+    hosts: Sequence[str],
+) -> str:
+    """The refusal of the destinations the operator has yet to allow, with one export."""
     settings: List[str] = []
     if pairs:
         # Rebuilt from the parsed list, so an entry the parser ignores is not echoed back.
@@ -1467,10 +1511,9 @@ def _check_catalog_auth_destinations(
         entries = ",".join(dict.fromkeys([*current, *pairs]))
         settings.append(f'{SECRET_REF_ALLOWLIST_ENV}="{entries}"')
     if hosts:
-        settings.append(
-            f'{HOST_ALLOWLIST_ENV}="{",".join(dict.fromkeys([*host_allowlist(), *hosts]))}"'
-        )
-    issue = (
+        entries = ",".join(dict.fromkeys([*host_allowlist(), *hosts]))
+        settings.append(f'{HOST_ALLOWLIST_ENV}="{entries}"')
+    return (
         f"{head}: sink.{CATALOG_AUTH_FIELD}.{auth.env_field} names {auth.env_var}. Iceberg "
         f"resolves it from {_RESOLVED_FROM[runtime.engine]} and sends it to hosts this "
         "contract names, and the run refuses until the operator allows each: "
@@ -1482,13 +1525,6 @@ def _check_catalog_auth_destinations(
         "with a port never matches. A loopback host needs no entry, and a private IP address "
         "needs only the pairing"
     )
-    run_only = _AT_RUN.get()
-    if run_only is None:
-        warnings.append(issue)
-    else:
-        errors.append(issue)
-        run_only.append(issue)
-    return True
 
 
 def _check_inlined_secrets(
@@ -1578,17 +1614,18 @@ def _derived_location_text(
         text.append(("binding.location.region", str(resolved.region)))
     for prop, value in resolved.extra_catalog_props.items():
         text.append((_EXTRA_PROPERTY_SOURCES.get(prop, f"binding.location ({prop})"), str(value)))
-    namespace = iceberg_namespace(binding)
-    if namespace:
-        if loc.get("database"):
-            text.append(("binding.location.database", namespace))
-        elif binding.get("database"):
-            text.append(("binding.database", namespace))
-        else:
-            text.append(("binding.location.dataset", namespace))
-    table = loc.get("table") or binding.get("table")
-    if table and runtime.engine == "kafka-connect":
-        text.append(("binding.location.table" if loc.get("table") else "binding.table", str(table)))
+    # The namespace and table fields as written: whichever one the sink reads.
+    names = [
+        ("binding.location.database", loc.get("database")),
+        ("binding.database", binding.get("database")),
+        ("binding.location.dataset", loc.get("dataset")),
+    ]
+    if runtime.engine == "kafka-connect":  # Debezium Server composes the table itself
+        names += [
+            ("binding.location.table", loc.get("table")),
+            ("binding.table", binding.get("table")),
+        ]
+    text.extend((source, str(value)) for source, value in names if value)
     text.extend(("binding.location.partitionBy", str(item)) for item in resolved.partition_by)
     return text
 
