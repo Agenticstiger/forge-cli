@@ -149,8 +149,8 @@ pytestmark = [
 #: policy (CHANGELOG Unreleased, Security), a ``sink.catalogAuth`` credential
 #: reaches only https hosts, a loopback one included, and this stack serves
 #: Lakekeeper and Keycloak over http. The founder chose (2026-11-04) to skip them
-#: until the stack runs TLS, a follow-up on the forge-cli board: "Iceberg sink
-#: live OAuth2 stack over TLS". The fourth test talks to Lakekeeper directly.
+#: until the stack runs TLS (Trello XgF5xhrM, "Live Lakekeeper OAuth2 test: run
+#: the stack over TLS"). The fourth test talks to Lakekeeper directly.
 _NEEDS_TLS_STACK = pytest.mark.skip(
     reason=(
         "catalogAuth hosts must be https; this stack serves Lakekeeper and Keycloak over "
