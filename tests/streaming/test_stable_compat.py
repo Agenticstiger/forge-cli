@@ -20,6 +20,7 @@ scalar timestamps outside the streaming type model must also keep working.
 """
 
 import copy
+import json
 
 import pytest
 
@@ -90,15 +91,24 @@ def test_only_a_bundled_schema_with_the_lane_enables_it(contract, version):
     assert compile_contract(contract) == ()
 
 
-def test_scalar_timestamps_outside_the_streaming_model_export_as_before():
-    for raw in ("TIMESTAMP_LTZ(9)", "timestamptz(3)", "TIMESTAMP(9)"):
-        prop = _field_to_property({"name": "ts", "type": raw}, None, include_quality=False)
-        assert prop["name"] == "ts"
-        assert not any(
-            item.get("property") == "fluid.recursiveType"
-            for item in prop.get("customProperties") or []
-        ), raw
-    kept = _field_to_property(
-        {"name": "ts", "type": "timestamp_ltz(3)"}, None, include_quality=False
+@pytest.mark.parametrize(
+    "raw",
+    ["TIMESTAMP_LTZ(9)", "timestamptz(3)", "TIMESTAMP(9)", "timestamp_ltz", "timestamp_ltz(3)"],
+)
+def test_a_scalar_timestamp_exports_as_it_did_before_the_managed_lane(raw):
+    prop = _field_to_property({"name": "ts", "type": raw}, None, include_quality=False)
+    assert prop["name"] == "ts"
+    assert prop.get("customProperties") is None, raw
+
+
+def test_a_stable_contract_exports_to_odcs_with_no_recursive_type_property():
+    from fluid_build.providers.odcs import OdcsProvider
+
+    contract = flink_contract("0.7.5")
+    contract["exposes"][0]["contract"]["schema"].append(
+        {"name": "seen_at", "type": "timestamp_ltz"}
     )
-    assert kept["customProperties"][-1]["property"] == "fluid.recursiveType"
+    ((_, odcs),) = OdcsProvider().render_all_ports(contract)
+    assert "fluid.recursiveType" not in json.dumps(odcs)
+    props = {p["name"]: p for p in odcs["schema"][0]["properties"]}
+    assert props["seen_at"].get("customProperties") is None

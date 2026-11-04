@@ -35,6 +35,11 @@ def test_recursive_odcs_native_shape_and_lossless_extension(contract):
                 "$defs": schema["$defs"],
             }
         ).validate(prop)
+        if not {"fields", "element", "key", "value"} & field.keys():
+            # A scalar exports as it always has: no extension, so a zone or a
+            # precision ODCS cannot hold is not carried back.
+            assert prop.get("customProperties") is None
+            continue
         recovered = _property_to_field(prop)
         for key in ("type", "fields", "element", "key", "value"):
             if key in field:
