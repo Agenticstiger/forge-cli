@@ -25,12 +25,15 @@ run whose variable is unset or empty.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pytest
 
+from fluid_build.build_runners._deployment_host_policy import ALLOWLIST_ENV as HOST_ALLOWLIST
+from fluid_build.build_runners._secret_policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST
 from fluid_build.build_runners.debezium.iceberg_sink import emit_debezium_iceberg_sink_config
 from fluid_build.build_runners.kafka_connect.iceberg_sink import emit_iceberg_sink_config
 from fluid_build.providers._iceberg_catalog import ResolvedIcebergCatalog
@@ -38,7 +41,22 @@ from fluid_build.providers._iceberg_catalog_auth import parse_catalog_auth
 
 pytestmark = [pytest.mark.unit]
 
-_KEYCLOAK = "http://keycloak:8080/realms/iceberg/protocol/openid-connect/token"
+
+@pytest.fixture(autouse=True)
+def _operator_allows_the_fixture_hosts(request, monkeypatch):
+    """The operator pairs each fixture variable with each fixture host. Where a
+    credential may go is pinned in test_iceberg_sink_catalog_destinations.py."""
+    if "kafka_connect_mock" in request.fixturenames:
+        # The mock may set the host list for its own server: extend it after.
+        request.getfixturevalue("kafka_connect_mock")
+    hosts = ("lakekeeper", "keycloak")
+    names = ("LAKEKEEPER_CREDENTIAL", "UC_TOKEN")
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, ",".join(f"{n}@{h}" for n in names for h in hosts))
+    current = [h for h in os.environ.get(HOST_ALLOWLIST, "").split(",") if h.strip()]
+    monkeypatch.setenv(HOST_ALLOWLIST, ",".join([*current, *hosts]))
+
+
+_KEYCLOAK = "https://keycloak:8443/realms/iceberg/protocol/openid-connect/token"
 _SECRET_VALUE = "spark:2OR3eRvYfSZzzZ16MlPd95jhLnOaLM52"  # pragma: allowlist secret
 _OAUTH2 = {
     "type": "oauth2",
@@ -52,7 +70,7 @@ _LAKEKEEPER = ResolvedIcebergCatalog(
     catalog_type="rest",
     warehouse="demo",
     fq_table="bronze.orders",
-    uri="http://lakekeeper:8181/catalog",
+    uri="https://lakekeeper:8443/catalog",
     kind="lakekeeper",
 )
 
@@ -118,7 +136,12 @@ def test_emitters_are_deterministic_with_auth():
 # ── Kafka Connect runner ────────────────────────────────────────────────────
 
 
-def _kc_contract(catalog_auth: Dict[str, Any], **kc: Any) -> Dict[str, Any]:
+def _kc_contract(
+    catalog_auth: Optional[Dict[str, Any]], *, location: Optional[Dict[str, Any]] = None, **kc: Any
+) -> Dict[str, Any]:
+    sink: Dict[str, Any] = {"format": "iceberg"}
+    if catalog_auth is not None:
+        sink["catalogAuth"] = catalog_auth
     return {
         "fluidVersion": "0.7.6",
         "kind": "DataProduct",
@@ -137,7 +160,7 @@ def _kc_contract(catalog_auth: Dict[str, Any], **kc: Any) -> Dict[str, Any]:
                         "mode": "incremental_append",
                         "streams": ["public.orders"],
                     },
-                    "sink": {"format": "iceberg", "catalogAuth": catalog_auth},
+                    "sink": sink,
                     "kafka-connect": {
                         "deployment": {"server_url": "http://kafka-connect.test:8083"},
                         "connector_name": "src",
@@ -154,13 +177,17 @@ def _kc_contract(catalog_auth: Dict[str, Any], **kc: Any) -> Dict[str, Any]:
                 "binding": {
                     "platform": "local",
                     "format": "iceberg",
-                    "location": {
-                        "catalog": "lakekeeper",
-                        "uri": "http://lakekeeper:8181/catalog",
-                        "warehouse": "demo",
-                        "database": "bronze",
-                        "table": "orders",
-                    },
+                    "location": (
+                        dict(location)
+                        if location is not None
+                        else {
+                            "catalog": "lakekeeper",
+                            "uri": "https://lakekeeper:8443/catalog",
+                            "warehouse": "demo",
+                            "database": "bronze",
+                            "table": "orders",
+                        }
+                    ),
                 },
                 "contract": {"schema": []},
             }
@@ -216,8 +243,13 @@ def test_kafka_connect_runner_refuses_an_override_that_sets_auth(
 # ── embedded Debezium Server runner ─────────────────────────────────────────
 
 
-def _dbz_contract(catalog_auth: Dict[str, Any], server_sink: Any = None) -> Dict[str, Any]:
-    contract = _kc_contract(catalog_auth)
+def _dbz_contract(
+    catalog_auth: Optional[Dict[str, Any]],
+    server_sink: Any = None,
+    *,
+    location: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    contract = _kc_contract(catalog_auth, location=location)
     contract["id"] = "bronze.dbz_auth"
     build = contract["builds"][0]
     build["engine"] = "debezium"
@@ -251,14 +283,19 @@ class _RecordingRun:
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
 
-@pytest.fixture
-def fake_server(monkeypatch):
+def _install_fake_server(monkeypatch) -> _RecordingRun:
+    """Fake the Debezium Server binary and its start; returns the recorder."""
     from fluid_build.build_runners.debezium import runner as dbz_runner
 
     recorder = _RecordingRun()
     monkeypatch.setattr(dbz_runner, "resolve_server_binary", lambda _v: "/opt/dbz/run.sh")
     monkeypatch.setattr(dbz_runner.subprocess, "run", recorder)
     return recorder
+
+
+@pytest.fixture
+def fake_server(monkeypatch):
+    return _install_fake_server(monkeypatch)
 
 
 def test_embedded_writes_env_references_and_the_server_inherits_the_environment(

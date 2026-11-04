@@ -197,8 +197,9 @@ def variable_allowed(
 ) -> bool:
     """Whether ``variable`` may be sent to ``host``: the decision, without wording.
 
-    For a caller that phrases its own refusal (the managed Flink lane's catalog
-    token, ``streaming/policy.py``). A loopback host needs no entry.
+    For a caller that phrases its own refusal: the managed Flink lane's catalog
+    token (``streaming/policy.py``) and the Iceberg sinks' catalog token
+    (``kafka_connect/iceberg_sink_validation.py``). A loopback host needs no entry.
     """
     return is_loopback(host) or _allows(variable, host, allowlist(environ))
 
