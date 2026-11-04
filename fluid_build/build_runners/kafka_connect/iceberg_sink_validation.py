@@ -1682,7 +1682,10 @@ def _derived_location_text(
         used.append(next(((s, v) for s, v in tables if v), None))
     text.extend((source, str(value)) for source, value in filter(None, used))
     raw_partition = sink.get("partitionBy")
-    partition = list(raw_partition) if isinstance(raw_partition, (list, tuple, str)) else []
+    try:  # as SinkSpec.from_dict reads it: a mapping gives its keys, a string its letters
+        partition = list(raw_partition) if raw_partition else []
+    except TypeError:  # SinkSpec refuses it too, so the run stops before any config
+        partition = []
     if partition:
         text.extend(("sink.partitionBy", str(item)) for item in partition)
     else:

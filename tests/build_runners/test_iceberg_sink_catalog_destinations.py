@@ -665,3 +665,11 @@ def test_a_glue_region_is_a_host_label(region, refused):
     contract["exposes"][0]["binding"]["platform"] = "aws"
     errors, _warnings = validate_iceberg_sink(contract)
     assert any("binding.location.region" in e for e in errors) is refused, errors
+
+
+def test_sink_partition_by_is_read_as_sinkspec_reads_it():
+    """A mapping reaches the config as its keys (SinkSpec.from_dict lists it)."""
+    contract = _kc_contract(None, location=_location(partitionBy=["day"]))
+    contract["builds"][0]["properties"]["sink"]["partitionBy"] = {f"${{env:{_SECRET}}}": 1}
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any("sink.partitionBy" in e for e in errors), errors
