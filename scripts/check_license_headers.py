@@ -14,11 +14,12 @@ name the holder and the license.
 The year is one fixed value, so the header never needs a yearly bump. The
 holder is spelled as in LICENSE, NOTICE and pyproject.toml, and the check pins
 holder AND year rather than any "Copyright" line, so a misspelt entity cannot
-creep back in (the license files once carried "Pty Ltd"). The legacy 14-line
-boilerplate (with the old "2024-2026 ... Ltd" notice) fails the check;
-running ``add_license_headers.py`` migrates it. The writer and this checker
-share one definition of a valid header; tests/test_license_headers.py pins
-that.
+creep back in (the license files once carried "Pty Ltd"). Both lines are
+matched as whole comment lines, so "Apache-2.0 OR MIT" or the same text inside
+a docstring does not pass. The legacy 14-line boilerplate (with the old
+"2024-2026 ... Ltd" notice) fails the check; running
+``add_license_headers.py`` migrates it. The writer and this checker share one
+definition of a valid header; tests/test_license_headers.py pins that.
 """
 
 from __future__ import annotations
@@ -40,11 +41,12 @@ EXCLUDED_PREFIXES = (
     "tools/product_guardrail/",
 )
 
-# Every further line the header must carry. Matched whitespace-insensitively
-# against the file preamble so a reflowed comment or an extra leading blank line
-# doesn't fail the gate. Keep in sync with the ``apache2`` template in
-# scripts/add_license_headers.py; tests/test_license_headers.py pins that the
-# writer's output satisfies this checker.
+# Every further line the header must carry. Like the token, each is matched as
+# a whole ``#`` comment line with whitespace collapsed: re-spacing a comment
+# doesn't fail the gate, but an extra license term ("Apache-2.0 OR MIT") or the
+# text sitting in a docstring does. Keep in sync with the ``apache2`` template
+# in scripts/add_license_headers.py; tests/test_license_headers.py pins that
+# the writer's output satisfies this checker.
 REQUIRED_HEADER_LINES = ("SPDX-License-Identifier: Apache-2.0",)
 
 # The header is two lines; allow room for a shebang, an encoding declaration,
@@ -76,21 +78,20 @@ def files_requiring_headers(paths: Iterable[Path], repo_root: Path) -> list[Path
 
 
 def missing_header_parts(text: str) -> list[str]:
-    """Return the required header pieces absent from ``text``'s preamble.
+    """Return the required header lines absent from ``text``'s preamble.
 
-    Empty list means the file carries the complete two-line header. Comparison
-    collapses whitespace so comment reflowing doesn't matter, but a missing
-    line, wrong holder or wrong year does.
+    Empty list means the file carries the complete two-line header. Each
+    required line must be a whole ``#`` comment line; whitespace is collapsed
+    so re-spacing doesn't matter, but a missing line, a wrong holder or year,
+    an extra license term or the text inside a docstring does. A leading
+    byte-order mark is ignored.
     """
-    preamble = "\n".join(text.splitlines()[:HEADER_PREAMBLE_LINES])
-    normalized = " ".join(preamble.split())
-    missing = []
-    if REQUIRED_HEADER_TOKEN not in normalized:
-        missing.append(REQUIRED_HEADER_TOKEN)
-    missing.extend(
-        line for line in REQUIRED_HEADER_LINES if " ".join(line.split()) not in normalized
-    )
-    return missing
+    preamble = text.lstrip("﻿").splitlines()[:HEADER_PREAMBLE_LINES]
+    comments = {
+        " ".join(line.strip()[1:].split()) for line in preamble if line.strip().startswith("#")
+    }
+    required = (REQUIRED_HEADER_TOKEN, *REQUIRED_HEADER_LINES)
+    return [part for part in required if part not in comments]
 
 
 def has_required_header(path: Path) -> bool:

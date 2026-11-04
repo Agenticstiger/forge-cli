@@ -111,9 +111,35 @@ def test_legacy_boilerplate_is_rejected():
     assert checker.REQUIRED_HEADER_TOKEN in missing
 
 
+@pytest.mark.parametrize(
+    "spdx_line",
+    [
+        "# SPDX-License-Identifier: Apache-2.0 OR MIT\n",
+        "# SPDX-License-Identifier: Apache-2.0-or-later\n",
+    ],
+)
+def test_extra_license_term_is_rejected(spdx_line):
+    """The SPDX line is matched whole, not as a prefix of a longer expression."""
+    missing = checker.missing_header_parts(COPYRIGHT_LINE + spdx_line + '\n"""M."""\n')
+    assert missing == ["SPDX-License-Identifier: Apache-2.0"]
+
+
+def test_header_text_inside_a_docstring_is_rejected():
+    """Only comment lines count: the same words in a docstring are no header."""
+    text = (
+        '"""Copyright 2025 Agentics Transformation Limited\n'
+        'SPDX-License-Identifier: Apache-2.0\n"""\n'
+    )
+    assert len(checker.missing_header_parts(text)) == 2
+
+
 def test_shebang_and_encoding_do_not_break_detection():
     text = "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n" + FULL_HEADER + '\n"""M."""\n'
     assert checker.missing_header_parts(text) == []
+
+
+def test_byte_order_mark_does_not_break_detection():
+    assert checker.missing_header_parts("﻿" + FULL_HEADER + '\n"""M."""\n') == []
 
 
 def test_reflowed_whitespace_is_tolerated():
@@ -157,6 +183,18 @@ def test_writer_adds_the_header_to_a_bare_file(tmp_path):
 
     assert writer.process_file(target, FULL_HEADER) == "added"
     assert target.read_text(encoding="utf-8") == FULL_HEADER + "\nVALUE = 1\n"
+
+
+@pytest.mark.parametrize("half", [COPYRIGHT_LINE, SPDX_LINE], ids=["copyright-only", "spdx-only"])
+def test_writer_completes_a_half_header_in_one_pass(tmp_path, half):
+    """Either line alone is taken as the header and replaced, not left under a
+    second, stacked header that only a later run would fold away."""
+    target = tmp_path / "half.py"
+    target.write_text(half + "\nVALUE = 1\n", encoding="utf-8")
+
+    assert writer.process_file(target, FULL_HEADER) == "replaced"
+    assert target.read_text(encoding="utf-8") == FULL_HEADER + "\nVALUE = 1\n"
+    assert writer.process_file(target, FULL_HEADER) == "skipped"
 
 
 def test_writer_is_idempotent_on_a_compliant_file(tmp_path):

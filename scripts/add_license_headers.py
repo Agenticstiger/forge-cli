@@ -131,19 +131,29 @@ def build_header(
     return header.replace("{HOLDER}", holder).replace("{YEARS}", years)
 
 
-def has_license_header(content: str) -> bool:
-    """Check whether the file already contains a license header."""
+def has_license_header(content: str, own_lines: frozenset[str] = frozenset()) -> bool:
+    """Check whether the file already contains a license header.
+
+    ``own_lines`` are the lines of the header about to be written. Either one
+    on its own counts, so a file carrying only half of the two-line header is
+    replaced in one pass instead of getting a full header stacked on top.
+    """
     # Look in the first 30 lines for a copyright notice
-    head = "\n".join(content.splitlines()[:30])
+    head_lines = content.splitlines()[:30]
+    if any(line.rstrip() in own_lines for line in head_lines):
+        return True
+    head = "\n".join(head_lines)
     return "Copyright" in head and ("License" in head or "Permission" in head)
 
 
-def remove_header(content: str) -> str:
+def remove_header(content: str, own_lines: frozenset[str] = frozenset()) -> str:
     """Remove an existing license header from file content.
 
     Handles single headers (Apache or MIT) and corrupted dual-headers
     (MIT body + orphaned Apache fragment) by stripping all leading comment
-    lines that are part of a license block.
+    lines that are part of a license block. A line of ``own_lines`` (the
+    header about to be written) marks a header like a copyright line does, so
+    a lone SPDX line is stripped too.
     """
     lines = content.splitlines(True)
 
@@ -169,7 +179,7 @@ def remove_header(content: str) -> str:
         line = lines[i].rstrip()
 
         if line.startswith("#"):
-            if "Copyright" in line:
+            if "Copyright" in line or line in own_lines:
                 found_copyright = True
             if any(
                 kw in line
@@ -265,19 +275,20 @@ def process_file(
     if not content.strip():
         return "skipped"
 
-    already_has = has_license_header(content)
+    own_lines = frozenset(line for line in header.splitlines() if line.strip())
+    already_has = has_license_header(content, own_lines)
 
     if remove_only:
         if not already_has:
             return "skipped"
-        new_content = remove_header(content)
+        new_content = remove_header(content, own_lines)
         if not dry_run:
             path.write_text(new_content, encoding="utf-8")
         return "removed"
 
     if already_has:
         # Replace existing header
-        stripped = remove_header(content)
+        stripped = remove_header(content, own_lines)
         new_content = add_header(stripped, header)
         action = "replaced"
     else:
