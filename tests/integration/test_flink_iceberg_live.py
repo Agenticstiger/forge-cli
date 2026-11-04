@@ -284,7 +284,11 @@ print("PASS: 200 unique records; five nested structs, nulls, empty containers, e
         # Existing tables must be checked before INSERT planning/submission,
         # including changes the planner could otherwise coerce implicitly.
         drifted = copy.deepcopy(contract)
+        # The contract agrees with itself (stream and output both int), so it compiles;
+        # only the table the first run created disagrees, and the runner must refuse it.
         drifted["exposes"][0]["contract"]["schema"][1]["fields"][1]["fields"][0]["type"] = "int"
+        stream = drifted["builds"][0]["properties"]["stream"]
+        stream["schema"][1]["fields"][1]["fields"][0]["type"] = "int"
         (mismatch,) = compile_contract(drifted)
         (tmp_path / "job.properties").write_text(mismatch.resources[0]["data"]["job.properties"])
         rejected = subprocess.run(
