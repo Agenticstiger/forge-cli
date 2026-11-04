@@ -22,7 +22,7 @@ and optionally Redshift.
 
 from __future__ import annotations
 
-import importlib.util
+import functools
 import logging
 import sys
 from typing import Any, Dict, List, Optional
@@ -47,25 +47,35 @@ LOG = logging.getLogger("fluid.providers.aws_validation")
 _self = sys.modules[__name__]
 
 
-def _sdk_present() -> bool:
+@functools.lru_cache(maxsize=1)
+def _boto3_importable() -> bool:
+    """Whether ``import boto3`` works, tried once on first access and cached.
+
+    ``find_spec`` alone says "installed" for a broken install (a missing
+    dependency, a bad build), which would skip the install hint downstream.
+    """
     try:
-        return importlib.util.find_spec("boto3") is not None
-    except (ImportError, ValueError):
+        import boto3  # noqa: F401
+    except Exception:  # noqa: BLE001 - any failure to import means unavailable
         return False
+    return True
 
 
 def __getattr__(name: str) -> Any:
     if name == "BOTO3_AVAILABLE":
-        return _sdk_present()
+        return _boto3_importable()
     if name == "boto3":
-        if not _sdk_present():
+        if not _boto3_importable():
             return None
         import boto3
 
         return boto3
     if name == "ClientError":
-        from botocore.exceptions import ClientError
-
+        try:
+            from botocore.exceptions import ClientError
+        except ImportError as exc:
+            # PEP 562: a missing attribute is an AttributeError (``hasattr`` works).
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
         return ClientError
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -74,7 +84,7 @@ def _client_error() -> type:
     """``botocore``'s ``ClientError``, or a never-raised stand-in without botocore."""
     try:
         return _self.ClientError  # type: ignore[no-any-return,attr-defined]
-    except ImportError:
+    except (ImportError, AttributeError):
 
         class _NoClientError(Exception):
             pass

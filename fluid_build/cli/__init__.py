@@ -378,6 +378,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             if requested_provider and requested_provider != _PROVIDER_AUTO and not retired
             else []
         )
+        if known_providers and getattr(args, "generate_sub", None) == "iac":
+            # `generate iac --provider` names an IaC cloud, not only a provider
+            # (confluent has an IaC plugin and no provider): accept both sets.
+            from fluid_build.iac.registry import IAC_PLUGINS
+
+            known_providers = sorted({*known_providers, *IAC_PLUGINS})
         _validate_global_args(args, cli.logger, known_providers=known_providers)
         if retired:
             return 2

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 """The provider registry lists providers without importing them, and reserves the built-ins.
 
 * ``fluid providers`` / ``--provider`` read NAMES from entry-point metadata; a
@@ -25,6 +24,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -41,13 +41,26 @@ _BUILTINS = {"aws", "databricks", "gcp", "local", "snowflake"}
 
 
 def _run(code: str) -> str:
+    """Run ``code`` in this interpreter against THIS checkout, never another copy.
+
+    ``-I`` would ignore ``PYTHONPATH`` and fall back to whichever ``fluid_build`` is
+    installed in the environment, so the child imports from ``sys.path[0]`` that is
+    pinned explicitly and asserts where ``fluid_build`` came from.
+    """
+    root = str(_ROOT)
+    guard = (
+        f"import sys; sys.path.insert(0, {root!r});"
+        "import fluid_build, os;"
+        f"assert os.path.realpath(fluid_build.__file__).startswith({os.path.realpath(root)!r}), "
+        "fluid_build.__file__;"
+    )
     out = subprocess.run(
-        [sys.executable, "-I", "-c", code],
+        [sys.executable, "-s", "-c", guard + code],
         capture_output=True,
         text=True,
         check=True,
         cwd=str(_ROOT / "tests"),
-        env={"PATH": "", "PYTHONPATH": str(_ROOT), "HOME": "/nonexistent"},
+        env={"PATH": "", "PYTHONPATH": root, "HOME": "/nonexistent"},
     )
     return out.stdout.strip()
 
@@ -409,3 +422,273 @@ def test_two_distributions_with_a_built_in_name(monkeypatch, caplog, _restore_re
         P.discover_providers(force=True)
     assert P.PROVIDERS.pending("gcp").source == "builtin"
     assert caplog.text.count("several distributions are granted") == 2
+
+
+# --- security review fixes: code-level capture, granted override, listing, spoofing, policy ---
+
+
+def _evil_class(module="evilmod"):
+    cls = type("Evil", (), {})
+    cls.__module__ = module
+    return cls
+
+
+@pytest.mark.parametrize("name", sorted(_BUILTINS))
+def test_code_cannot_take_a_builtin_name_before_discovery(name, caplog, _restore_registry):
+    # What the iac_providers plugins do while the argparse tree is built.
+    P.PROVIDERS.clear()
+    evil = _evil_class()
+    with caplog.at_level(logging.WARNING):
+        P.register_provider(name, evil)
+    assert not P.PROVIDERS.is_loaded(name)
+    assert "provider_builtin_name_reserved" in caplog.text
+    assert repr("evilmod:Evil") in caplog.text
+    P.discover_providers(force=True)
+    assert P.PROVIDERS.get(name) is not evil
+    assert P.PROVIDERS.get(name).__module__.startswith(f"fluid_build.providers.{name}")
+
+
+def test_a_class_that_only_claims_an_in_tree_module_is_refused(_restore_registry):
+    P.PROVIDERS.clear()
+    fake = _evil_class("fluid_build.providers.gcp")
+    fake.__qualname__ = "GcpProvider"
+    import fluid_build.providers.gcp  # noqa: F401  (the real class is now a module attribute)
+
+    P.register_provider("gcp", fake)
+    assert not P.PROVIDERS.is_loaded("gcp")
+
+
+def test_a_failed_granted_override_does_not_leave_the_name_open(
+    monkeypatch, caplog, _restore_registry
+):
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "acme-fluid-gcp:gcp")
+    ep = _granting_ep()
+    ep.load = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    _discover_with(monkeypatch, ep)
+    assert P.PROVIDERS.get("gcp") is None  # the granted plugin failed; slot is now empty
+    evil = _evil_class("some_plugin")
+    with caplog.at_level(logging.WARNING):
+        P.register_provider("gcp", evil)
+    assert not P.PROVIDERS.is_loaded("gcp")
+    assert "provider_builtin_name_reserved" in caplog.text
+
+
+def test_the_granted_entry_point_is_what_is_served(monkeypatch, _restore_registry):
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "acme-fluid-gcp:gcp")
+    ep = _granting_ep()
+
+    def _load():
+        # Importing a subclass imports the built-in, which self-registers GcpProvider.
+        from fluid_build.providers.gcp import GcpProvider
+
+        P.register_provider("gcp", GcpProvider)  # what the import's self-registration does
+
+        class AcmeGcp(GcpProvider):
+            pass
+
+        AcmeGcp.__module__ = "acmegcp"
+        ep.cls = AcmeGcp
+        return AcmeGcp
+
+    ep.load = _load
+    _discover_with(monkeypatch, ep)
+    served = P.PROVIDERS["gcp"]
+    assert served is ep.cls
+    assert P.provider_origin("gcp")["module"] == "acmegcp"
+
+
+def test_detailed_listing_does_not_import_a_reserved_provider(monkeypatch, tmp_path):
+    from fluid_build import plugin_manager as pm
+
+    marker = tmp_path / "imported"
+    reserved = _EP("aws")
+    reserved.load = lambda: marker.write_text("x")
+    granted = _EP("gcp", dist="acme-fluid-gcp")
+    granted.load = lambda: marker.with_name("granted").write_text("x")
+    own = _EP("mycloud")
+    own.load = lambda: marker.with_name("own").write_text("x")
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "acme-fluid-gcp:gcp")
+    monkeypatch.setattr(pm, "_entry_points", lambda group: [reserved, granted, own])
+    monkeypatch.setattr(pm, "governed_groups", lambda: {"provider": "fluid_build.providers"})
+
+    entries = {e["name"]: e for e in pm.detailed_plugins("provider")["provider"]}
+
+    assert not marker.exists()
+    assert entries["aws"]["reserved"] is True and entries["aws"]["allowed"] is False
+    # A granted override and an unreserved name are still loaded for their metadata.
+    assert (tmp_path / "granted").exists() and (tmp_path / "own").exists()
+    assert not entries["gcp"].get("reserved") and not entries["mycloud"].get("reserved")
+
+
+def test_a_spoofed_first_party_distribution_is_still_reserved(
+    monkeypatch, caplog, _restore_registry
+):
+    spoof = _EP("local", dist="data-product-forge", value="evilmod:P")
+    assert P._is_first_party(spoof) is False
+    real = _EP("local", dist="data-product-forge", value=P.BUILTIN_PROVIDERS["local"])
+    assert P._is_first_party(real) is True
+    monkeypatch.setattr(P.importlib.metadata, "entry_points", lambda: _EPs(spoof))
+    P.PROVIDERS.clear()
+    with caplog.at_level(logging.WARNING):
+        P.discover_providers(force=True)
+    assert not spoof.loaded
+    assert "provider_builtin_name_reserved" in caplog.text
+    assert P.PROVIDERS.pending("local").source == "builtin"
+
+
+def test_a_blocklist_set_after_discovery_blocks_first_use(monkeypatch, _restore_registry):
+    P.PROVIDERS.clear()
+    P.discover_providers(force=True)
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "local")
+    assert P.PROVIDERS.get("local") is None
+    assert "local" in P.POLICY_BLOCKED
+    assert not P.PROVIDERS.is_loaded("local")
+
+
+def test_a_forced_rediscovery_drops_a_pending_entry_that_is_now_blocked(
+    monkeypatch, _restore_registry
+):
+    monkeypatch.setattr(P.importlib.metadata, "entry_points", lambda: _EPs())
+    P.PROVIDERS.clear()
+    P.discover_providers(force=True)
+    assert P.PROVIDERS.pending("snowflake") is not None
+    monkeypatch.setenv("FLUID_PLUGINS_BLOCKLIST", "snowflake")
+    P._DISCOVERY_DONE = False  # keep the cached short-circuit out of the way
+    P.discover_providers(force=True)
+    assert "snowflake" not in P.PROVIDERS
+    assert "snowflake" in P.POLICY_BLOCKED
+
+
+def test_an_installed_but_broken_snowflake_connector_gives_the_install_hint(monkeypatch):
+    from fluid_build.providers.snowflake import connection as C
+
+    monkeypatch.setattr(C, "SNOWFLAKE_AVAILABLE", True, raising=False)
+    monkeypatch.setattr(C, "snowflake", None, raising=False)
+    conn = C.SnowflakeConnection.__new__(C.SnowflakeConnection)
+    with pytest.raises(RuntimeError, match="pip install snowflake-connector-python"):
+        conn._connect()
+
+
+# --- defect-hunt fixes ---------------------------------------------------------------------
+
+
+def test_generate_iac_accepts_an_iac_cloud_that_is_not_a_provider(capsys, caplog, tmp_path):
+    # `confluent` has an IaC plugin and no provider; the post-parse provider check
+    # used to reject it ("Unknown provider 'confluent'") before generate_iac ran.
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_text("fluidVersion: 0.7.5\nkind: DataProduct\nid: x\n", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG):
+        main(["generate", "iac", str(contract), "--provider", "confluent", "--out", str(tmp_path)])
+    out = capsys.readouterr()
+    assert "Unknown provider" not in caplog.text + out.err + out.out
+
+
+def test_generate_iac_still_rejects_a_name_that_is_neither(capsys, caplog, tmp_path):
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_text("fluidVersion: 0.7.5\nkind: DataProduct\nid: x\n", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG):
+        rc = main(["generate", "iac", str(contract), "--provider", "nosuchcloud"])
+    out = capsys.readouterr()
+    assert rc == 2 and "Unknown provider" in caplog.text + out.err + out.out
+
+
+def _failing_ep(name="mycloud", dist="mycloud-plugin"):
+    ep = _EP(name, dist=dist, value="mycloud.mod:P")
+    return ep
+
+
+def test_a_provider_that_fails_to_import_is_named_and_remembered(
+    monkeypatch, caplog, _restore_registry
+):
+    ep = _failing_ep()
+    _discover_with(monkeypatch, ep)
+    with caplog.at_level(logging.WARNING):
+        assert P.PROVIDERS.get("mycloud") is None
+    msg = " ".join(r.getMessage() for r in caplog.records if "mycloud" in r.getMessage())
+    assert "mycloud" in msg and "RuntimeError" in msg and "mycloud-plugin" in msg
+    for _ in range(2):  # the second lookup says the same, not "unknown"
+        with pytest.raises(P.ProviderLoadError) as e:
+            P.get_provider("mycloud")
+        assert "failed to load" in str(e.value) and "RuntimeError" in str(e.value)
+        assert "mycloud-plugin" in str(e.value)
+
+
+def test_build_provider_reports_a_load_failure_not_unknown(monkeypatch, _restore_registry):
+    from fluid_build.cli._common import CLIError, build_provider
+
+    _discover_with(monkeypatch, _failing_ep())
+    for _ in range(2):
+        with pytest.raises(CLIError) as e:
+            build_provider("mycloud", None, None, logging.getLogger("t"))
+        assert e.value.event == "provider_load_failed"
+
+
+_HIDE_SDKS = (
+    "import sys\n"
+    "class _B:\n"
+    "    def find_spec(self, name, path=None, target=None):\n"
+    "        if name.startswith(('google.cloud.bigquery','google.api_core','botocore')):\n"
+    "            raise ImportError(name)\n"
+    "sys.meta_path.insert(0, _B())\n"
+)
+
+
+def test_an_absent_sdk_is_a_missing_attribute_not_an_import_error():
+    code = _HIDE_SDKS + (
+        "from fluid_build.providers import bigquery_validation as b, aws_validation as a;"
+        "print(hasattr(b,'bigquery'), hasattr(b,'google_exceptions'), hasattr(a,'ClientError'))"
+    )
+    assert _run(code) == "False False False"
+
+
+def test_an_installed_but_broken_boto3_is_not_available(tmp_path):
+    (tmp_path / "boto3.py").write_text("raise ImportError('broken install')\n")
+    code = (
+        f"import sys; sys.path.insert(0, {str(tmp_path)!r});"
+        "import importlib.util;"
+        "assert importlib.util.find_spec('boto3') is not None;"
+        "from fluid_build.providers import aws_validation as a;"
+        "print(a.BOTO3_AVAILABLE, a.boto3)"
+    )
+    assert _run(code) == "False None"
+
+
+def test_an_installed_but_broken_snowflake_connector_is_not_available(tmp_path):
+    pkg = tmp_path / "snowflake"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "connector.py").write_text("raise ImportError('broken install')\n")
+    code = (
+        f"import sys; sys.path.insert(0, {str(tmp_path)!r});"
+        "from fluid_build.providers.snowflake import connection as c;"
+        "print(c.SNOWFLAKE_AVAILABLE)"
+    )
+    assert _run(code) == "False"
+
+
+def test_pop_of_a_pending_name_returns_the_provider_and_removes_it(_restore_registry):
+    P.PROVIDERS.clear()
+    P.discover_providers(force=True)
+    popped = P.PROVIDERS.pop("gcp", None)
+    assert popped is not None and popped.__name__ == "GcpProvider"
+    assert "gcp" not in P.PROVIDERS and P.PROVIDERS.pending("gcp") is None
+    with pytest.raises(KeyError):
+        P.PROVIDERS.pop("gcp")
+    assert P.PROVIDERS.pop("gcp", "dflt") == "dflt"
+
+
+def test_pop_of_a_pending_name_that_fails_to_import_gives_the_default(
+    monkeypatch, _restore_registry
+):
+    _discover_with(monkeypatch, _failing_ep())
+    assert P.PROVIDERS.pop("mycloud", "dflt") == "dflt"
+    assert "mycloud" not in P.PROVIDERS
+
+
+def test_keys_is_a_set_like_view(_restore_registry):
+    P.PROVIDERS.clear()
+    P.discover_providers(force=True)
+    keys = P.PROVIDERS.keys()
+    assert keys & {"gcp", "nope"} == {"gcp"}
+    assert {"aws", "gcp"} <= keys
+    assert sorted(keys) == sorted(_BUILTINS)

@@ -50,14 +50,18 @@ _self = sys.modules[__name__]
 
 
 def __getattr__(name: str) -> Any:
-    if name == "bigquery":
-        from google.cloud import bigquery
+    try:
+        if name == "bigquery":
+            from google.cloud import bigquery
 
-        return bigquery
-    if name == "google_exceptions":
-        from google.api_core import exceptions
+            return bigquery
+        if name == "google_exceptions":
+            from google.api_core import exceptions
 
-        return exceptions
+            return exceptions
+    except ImportError as exc:
+        # PEP 562: an absent SDK is a missing attribute, so ``hasattr`` is False.
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

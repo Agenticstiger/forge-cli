@@ -115,6 +115,8 @@ def run(args, logger: logging.Logger) -> int:
         cprint(f"  {r}  ({len(entries)}){suffix}")
         for e in entries:
             status = "allowed" if e["allowed"] else "BLOCKED (allow/block policy)"
+            if e.get("reserved"):
+                status = "RESERVED (claims a built-in or retired name; not loaded)"
             # `compatible is False` means the CLI will refuse to register it
             # under FLUID_PLUGIN_STRICT_COMPAT — "allowed" alone contradicts
             # what actually happens.
@@ -136,7 +138,7 @@ def run(args, logger: logging.Logger) -> int:
             if detail_bits:
                 cprint(f"      {'  '.join(detail_bits)}")
         cprint("")
-    blocked = sum(1 for v in data.values() for e in v if not e["allowed"])
+    blocked = sum(1 for v in data.values() for e in v if not e["allowed"] and not e.get("reserved"))
     if blocked:
         cprint(f"{blocked} plugin(s) blocked by FLUID_PLUGINS_ALLOWLIST / FLUID_PLUGINS_BLOCKLIST.")
     undispatched = sorted(

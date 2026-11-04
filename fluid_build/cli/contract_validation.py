@@ -109,6 +109,12 @@ _NO_LIVE_VALIDATION = {
         "Run 'fluid validate' for the offline binding checks and "
         "'fluid apply --mode dry-run' to plan against the workspace.",
     ),
+    # `fluid validate` accepts `azure` (the schema enum lists it) although there is
+    # no azure provider: say so as a warning, so the two commands agree.
+    "azure": (
+        "Platform 'azure' has no provider, so it was not validated",
+        "Supported providers: aws, databricks, gcp, local, snowflake (see `fluid providers`).",
+    ),
 }
 
 LOG = logging.getLogger("fluid.cli.contract_validation")
