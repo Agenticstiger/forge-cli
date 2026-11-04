@@ -35,6 +35,7 @@ from fluid_build.streaming.policy import (
     refuse_unless_catalog_targets_allowed,
     refuse_unless_contract_sql_allowed,
     refuse_unless_deployment_allowed,
+    refuse_unless_source_hosts_allowed,
 )
 from fluid_build.streaming.types import LogicalType
 from fluid_build.util.safe_http import safe_httpx_client
@@ -189,19 +190,27 @@ def reconcile(
     dry_run = dry_run or mode == "dry-run"
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise StreamingError("Readiness timeout must be positive")
-    pending: list[tuple[FlinkArtifacts, Kubectl, dict[str, Any] | None]] = []
+    # Every build clears the operator's policy before any kubectl call, so a refusal
+    # of the last build is not preceded by a read of the first.
+    clients: list[Kubectl] = []
     for build, artifact in compiled:
         refuse_unless_contract_sql_allowed(contract.get("id"), build)
-        client = _client(build)
-        desired = artifact.resources[1]
-        name = desired["metadata"]["name"]
+        clients.append(_client(build))
         # The deployed job's CREATE CATALOG sends its token from the pod, so its
-        # destinations clear the same policy as verify's before anything deploys.
+        # destinations clear the same policy as verify's before anything deploys,
+        # except that loopback is the pod itself there, not this machine.
         refuse_unless_catalog_targets_allowed(
             managed_config(build) or {},
             _catalog_uri(contract, artifact),
-            s3_endpoint=desired["spec"]["flinkConfiguration"].get("s3.endpoint"),
+            s3_endpoint=artifact.resources[1]["spec"]["flinkConfiguration"].get("s3.endpoint"),
+            pod_side=True,
         )
+        # The brokers and the Schema Registry the job connects to, by the same rule.
+        refuse_unless_source_hosts_allowed(managed_config(build) or {})
+    pending: list[tuple[FlinkArtifacts, Kubectl, dict[str, Any] | None]] = []
+    for (_, artifact), client in zip(compiled, clients, strict=True):
+        desired = artifact.resources[1]
+        name = desired["metadata"]["name"]
         if dry_run:
             pending.append((artifact, client, None))
             continue

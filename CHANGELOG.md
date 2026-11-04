@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Managed Flink to Iceberg, as a preview in FLUID 0.7.7.** A build with `engine: flink` (or
+  `properties.language: flink_sql`) and `parameters.flink.management: operator` is deployed by
+  forge-cli to a Kubernetes cluster that runs the Flink Kubernetes Operator, and writes an Iceberg
+  REST catalog table. Contracts on 0.7.6 and earlier keep `parameters.flink` as free-form settings
+  of a job that runs elsewhere. `fluid generate flink <contract> --out <dir>` writes the Flink SQL,
+  the ConfigMap and the `FlinkDeployment` for review; `fluid plan`, `fluid apply` (`--dry-run`
+  included), `fluid diff` and `fluid verify` handle the build, and `fluid verify
+  --streaming-timeout <seconds>` (default 120) bounds the wait for a snapshot and a checkpoint.
+  The ConfigMap is named by a digest of everything its `deployment.json` renders. `fluid verify`
+  checks delivery from the catalog and the operator, not the rows: it says so.
+
+- **0.7.7 declares nested columns, and the Kafka record the job reads.** A column of type `struct`,
+  `array` or `map` declares its `fields`, `element`, or `key` and `value`, nested up to 32 levels, with
+  `decimal(p,s)` and `timestamp(n)` / `timestamp_ltz(n)`. `properties.stream` describes the topic's
+  records (`kind`, `topic`, `format`, `schema`, an optional key and Kafka metadata), and
+  `properties.mapping` selects, casts and explodes them into the output's columns, or
+  `properties.sql` brings a `SELECT` of the contract's own. AWS Glue holds a nested column the
+  contract declares, as `struct<a:string,b:int>`, `array<string>` and `map<string,string>`; a bare
+  `struct`, `array` or `map` is still refused there and on BigQuery. A scalar timestamp exports to
+  ODCS exactly as before.
+
+- **The operator, not the contract, allows what a managed Flink contract names.** A contract names
+  its kube context, namespace, image, service account and mounted Secrets, so `fluid apply`
+  (`--dry-run` included), `fluid diff` and `fluid verify` refuse any of them the operator has not
+  listed, before a kubectl call, and an unset list allows nothing: `FLUID_FLINK_KUBE_CONTEXT_ALLOWLIST`,
+  `FLUID_FLINK_NAMESPACE_ALLOWLIST`, `FLUID_FLINK_IMAGE_ALLOWLIST` (a repository, without `:tag` and
+  `@sha256:`, or a prefix ending in `/`), `FLUID_FLINK_SERVICE_ACCOUNT_ALLOWLIST` and
+  `FLUID_FLINK_SECRET_ALLOWLIST` (`name` or `namespace/name`). A build that brings its own
+  `properties.sql` also needs its product in `FLUID_FLINK_CONTRACT_SQL_ALLOWLIST`. All of them are
+  ignored when a project `.env` sets them.
+
+- **Where a managed Flink job connects follows one host rule, and a token needs `NAME@host`.** The
+  Iceberg catalog, an OAuth2 token endpoint and an `s3.endpoint` are checked by `fluid apply` and
+  `fluid verify`, and `fluid apply` checks the Kafka brokers in `source.bootstrapServers` and the
+  `source.schemaRegistryUrl` as well, all before a kubectl call. A hostname needs an entry in
+  `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST`, because the job resolves it itself after the check;
+  an IP address needs one only when it is public, a link-local one is never allowed, and `localhost`
+  needs none. There is no topic allowlist: within an allowed broker the contract picks the topic,
+  and the broker's ACLs bound that. A `catalogAuth` variable is sent only to a host the operator
+  paired with it, `NAME@host` in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, before it is read, and an
+  OAuth2 credential needs one for the token endpoint and one for the catalog. At `fluid apply` the
+  token is sent from the pod, where `localhost` is the pod itself or a sidecar, so there it needs
+  its entry too; `fluid verify` sends from your machine and still needs none for `localhost`.
+
 - **`fluid validate` and `fluid plan` warn about an id the build phase refuses.** The build
   phase puts `contract.id` and each `builds[].id` in directory names and generated code, so they
   must start with a letter or underscore, use only letters, digits, `_`, `.` and `-`, and be at

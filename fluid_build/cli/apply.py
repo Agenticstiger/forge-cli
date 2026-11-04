@@ -1982,12 +1982,9 @@ def run(args, logger: logging.Logger) -> int:
         _log_apply_failure(logger, start_time, Exception("User interrupted"))
         logger.warning("⚠️ Execution interrupted by user")
         return 130
-    from fluid_build.streaming.compiler import compile_contract
+    from fluid_build.cli.plan import compile_managed_streaming
 
-    try:
-        streaming = compile_contract(source_contract)
-    except ValueError as exc:
-        raise CLIError(1, "apply_streaming_invalid", {"error": str(exc)}) from exc
+    streaming = compile_managed_streaming(source_contract, logger, command="apply")
     if streaming:
         from fluid_build.streaming.runtime import reconcile
 

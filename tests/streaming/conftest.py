@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ipaddress
+import socket
 from pathlib import Path
 
 import pytest
@@ -47,4 +49,28 @@ def operator_allows_the_example(monkeypatch):
     """The example's deployment targets and catalog, listed as its operator would."""
     for name, value in EXAMPLE_ALLOWLISTS.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest")  # a name the job resolves
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest,kafka")  # names the job resolves
+
+
+@pytest.fixture(autouse=True)
+def offline_dns(monkeypatch):
+    """No unit test resolves real DNS: a name fails at once, an IP literal is itself.
+
+    A lookup of a cluster-internal name (``minio.lake.svc.cluster.local``) takes
+    seconds against a real resolver, and its answer would depend on the machine.
+    Returns the names that were looked up.
+    """
+    looked_up: list[str] = []
+    real = socket.getaddrinfo
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        text = host.decode() if isinstance(host, bytes) else str(host)
+        try:
+            address = ipaddress.ip_address(text.split("%", 1)[0])
+        except ValueError:
+            looked_up.append(text)
+            raise socket.gaierror(socket.EAI_NONAME, "name resolution is stubbed in unit tests")
+        return real(str(address), port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    return looked_up

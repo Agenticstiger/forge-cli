@@ -32,11 +32,12 @@ def test_nested_type_compiles_losslessly(contract):
     assert parsed["attributes"].sql() == "MAP<STRING NOT NULL, STRING>"
     physical = {c["name"]: c["type"] for c in _columns(fields)}
     assert physical["customer"] == (
-        "struct<id:string, address:struct<country:string, "
-        "geo:struct<location:struct<coordinates:struct<latitude:double, longitude:double>>>>>"
+        "struct<id:string,address:struct<country:string,"
+        "geo:struct<location:struct<coordinates:struct<latitude:double,longitude:double>>>>>"
     )
-    assert physical["items"] == "array<struct<sku:string, price:DECIMAL(18,2)>>"
-    assert physical["attributes"] == "map<string, string>"
+    # As Glue reports a type back: lowercase, no space after a comma.
+    assert physical["items"] == "array<struct<sku:string,price:decimal(18,2)>>"
+    assert physical["attributes"] == "map<string,string>"
 
 
 @pytest.mark.parametrize(

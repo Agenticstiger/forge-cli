@@ -53,13 +53,15 @@ Cloud targets are separate extras: `[gcp]`, `[aws]`, `[snowflake]`, or `[all]`. 
 global install, [pipx](https://pipx.pypa.io/) works too:
 `pipx install "data-product-forge[all]"`.
 
-## What makes it different
+## Preview: managed Flink to Iceberg
 
-**Preview:** [Managed Flink -> Iceberg streaming](https://agenticstiger.github.io/forge_docs/advanced/managed-flink-iceberg.html) adds
+[Managed Flink -> Iceberg streaming](https://agenticstiger.github.io/forge_docs/advanced/managed-flink-iceberg.html) adds
 recursive schemas, generated operator resources, plan/apply/drift integration,
 and checkpoint/catalog verification. The [runnable example](examples/flink-iceberg/)
 includes an opt-in Kafka-to-Iceberg recovery and nested-value fidelity test.
 This lane is opt-in under schema 0.7.7; existing external Flink behavior is unchanged.
+
+## What makes it different
 
 Four properties, each with the command that demonstrates it. Everything below was run against
 `data-product-forge` 0.15.0 installed from PyPI, offline, with no cloud credentials configured.

@@ -549,22 +549,14 @@ def _add_canonical_type(
 ) -> None:
     """Add the native ODCS tree and the canonical FLUID type of a nested column.
 
-    Also for a timestamp whose zone or precision ODCS cannot hold.
+    A scalar column exports as it always has, whatever its type: ``fluid.recursiveType``
+    is for nested types, which ODCS cannot hold as FLUID declares them.
     """
-    raw_type = str(fld.get("type", "")).strip().lower()
-    nested = bool({"fields", "element", "key", "value"} & fld.keys())
-    if not nested and not raw_type.startswith(("timestamp_ltz", "timestamptz", "timestamp(")):
+    if not {"fields", "element", "key", "value"} & fld.keys():
         return
     from fluid_build.streaming.types import parse_type
 
-    try:
-        dtype = parse_type(fld, path=str(fld.get("name")))
-    except ValueError:
-        if nested:
-            raise
-        # A scalar timestamp outside the streaming type model, such as a
-        # Snowflake TIMESTAMP_LTZ(9), exports exactly as it did before.
-        return
+    dtype = parse_type(fld, path=str(fld.get("name")))
     if dtype.kind == "struct":
         prop["properties"] = [
             _field_to_property(child, provider, include_quality) for child in fld["fields"]

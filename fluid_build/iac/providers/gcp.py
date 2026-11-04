@@ -161,7 +161,7 @@ def _bq_outcome(raw: Any) -> column_types.TypeOutcome:
     if base in column_types.STRUCTURED:
         return column_types.refused(
             "which BigQuery holds only as a REPEATED column of an element type or a RECORD "
-            "with fields, and the contract schema cannot declare them yet",
+            "with fields, and this emitter does not write either yet",
             column_types.NESTED_FIX,
         )
     if not rest.isascii():

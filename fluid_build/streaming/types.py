@@ -78,7 +78,7 @@ class LogicalType:
         if dialect not in {"flink", "hive"}:
             raise ValueError(f"Unsupported nested-type dialect: {dialect}")
         if self.kind == "struct":
-            body = ", ".join(
+            body = (", " if dialect == "flink" else ",").join(
                 (
                     f"`{name}` {child.sql(dialect)}"
                     if dialect == "flink"
@@ -90,12 +90,15 @@ class LogicalType:
         elif self.kind == "array" and self.element is not None:
             result = f"{'ARRAY' if dialect == 'flink' else 'array'}<{self.element.sql(dialect)}>"
         elif self.kind == "map" and self.key is not None and self.value is not None:
+            separator = ", " if dialect == "flink" else ","
             result = (
                 f"{'MAP' if dialect == 'flink' else 'map'}"
-                f"<{self.key.sql(dialect)}, {self.value.sql(dialect)}>"
+                f"<{self.key.sql(dialect)}{separator}{self.value.sql(dialect)}>"
             )
         elif self.kind == "decimal":
-            result = f"DECIMAL({self.precision},{self.scale})"
+            result = (
+                f"{'DECIMAL' if dialect == 'flink' else 'decimal'}({self.precision},{self.scale})"
+            )
         elif self.kind in {"timestamp", "timestamp_ltz"} and self.precision is not None:
             result = f"{self.kind.upper()}({self.precision})" if dialect == "flink" else "timestamp"
         else:

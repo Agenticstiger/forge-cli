@@ -302,3 +302,78 @@ def test_event_time_needs_millisecond_precision(contract):
     managed_config(contract["builds"][0])["source"]["eventTime"]["column"] = "kafka_ts"
     (artifact,) = compile_contract(contract)
     assert "WATERMARK FOR `kafka_ts`" in artifact.sql
+
+
+def test_a_nested_type_error_names_the_expose_and_column(contract):
+    extra = copy.deepcopy(contract["exposes"][0])
+    extra["exposeId"] = "unrelated"
+    contract["exposes"].insert(0, extra)  # the build's output is no longer exposes[0]
+    contract["exposes"][1]["contract"]["schema"][3]["key"]["required"] = False
+    with pytest.raises(ValueError) as refused:
+        compile_contract(contract)
+    assert str(refused.value) == (
+        "exposes[1].contract.schema.attributes.key: supported map keys are required strings"
+    )
+
+
+def test_a_nested_type_error_is_reported_once_by_validate(contract):
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    contract["exposes"][0]["contract"]["schema"][3]["key"]["required"] = False
+    result = FluidSchemaManager().validate_contract(contract, offline_only=True)
+    assert not result.is_valid
+    assert [e for e in result.errors if "supported map keys" in e] == [
+        "exposes[0].contract.schema.attributes.key: supported map keys are required strings"
+    ]
+
+
+def test_a_bad_partition_source_column_is_labelled(contract):
+    contract["exposes"][0]["binding"]["icebergConfig"]["partitionSpec"] = [
+        {"sourceColumn": "event_id", "transform": "identity"},
+        {"sourceColumn": "bad col", "transform": "identity"},
+    ]
+    with pytest.raises(ValueError) as refused:
+        compile_contract(contract)
+    message = str(refused.value)
+    assert message.startswith("icebergConfig.partitionSpec[1].sourceColumn: ")
+    assert "bad col" in message
+
+
+@pytest.mark.parametrize(
+    "constant,value",
+    [
+        ("_FLINK_VERSION", "v1_21"),
+        ("_JAR_URI", "local:///opt/flink/usrlib/other.jar"),
+        ("_ENTRY_CLASS", "io.fluid.forge.Other"),
+        ("_DEFAULT_TASK_SLOTS", 4),
+        ("_DEFAULT_IDLE_TIMEOUT_MS", 5000),
+        ("_DEFAULT_JOB_MANAGER_MEMORY", "2048m"),
+        ("_DEFAULT_TASK_MANAGER_MEMORY", "4096m"),
+        ("_DEFAULT_PARALLELISM", 2),
+        ("_DEFAULT_CHECKPOINT_INTERVAL_MS", 20000),
+        ("_DEFAULT_CHECKPOINT_TIMEOUT_MS", 240000),
+    ],
+)
+def test_a_constant_or_default_the_contract_does_not_set_changes_the_configmap_name(
+    contract, monkeypatch, constant, value
+):
+    """The ConfigMap is immutable and named by the digest, and its deployment.json
+    carries what the compiler fixes or defaults; changing one must not reuse the name."""
+    import fluid_build.streaming.compiler as compiler
+
+    (original,) = compile_contract(contract)
+    monkeypatch.setattr(compiler, constant, value)
+    (changed,) = compile_contract(contract)
+    assert changed.digest != original.digest
+    assert changed.resources[0]["metadata"]["name"] != original.resources[0]["metadata"]["name"]
+    assert changed.resources[0]["data"]["deployment.json"] != (
+        original.resources[0]["data"]["deployment.json"]
+    )
+
+
+def test_the_configmap_name_the_deployment_mounts_is_the_one_it_is_named_by(contract):
+    (artifact,) = compile_contract(contract)
+    config_map, deployment = artifact.resources
+    (volume,) = deployment["spec"]["podTemplate"]["spec"]["volumes"]
+    assert volume["configMap"]["name"] == config_map["metadata"]["name"]
+    assert json.loads(config_map["data"]["deployment.json"]) == deployment["spec"]
