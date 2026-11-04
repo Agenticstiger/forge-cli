@@ -198,10 +198,11 @@ def test_contract_for_the_plugin_platform_emits_the_plugins_resources(dist, tmp_
 
 
 def test_provider_choices_list_the_plugin_platform_but_not_junk(dist, tmp_path):
-    # The generate-iac subparser's own choices see the plugin (names only); the
+    # The IaC platform names see the plugin (names only, nothing imported); the
     # GLOBAL --provider flag is validated elsewhere and accepts built-ins only.
-    assert "kubernetes" in generate_iac._PROVIDER_CHOICES
-    assert "nonesuch" not in generate_iac._PROVIDER_CHOICES
+    choices = R.IacProviderChoices()
+    assert "kubernetes" in choices
+    assert "nonesuch" not in choices
     assert _generate(tmp_path, _contract(tmp_path), provider="kubernetes") == 0
 
 
