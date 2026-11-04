@@ -57,6 +57,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Flink host check already refused these addresses; its message now names a metadata endpoint
   instead of calling it link-local.
 
+### Changed
+
+- **The declared dependencies now match what the code imports.** `deptry` reports no findings.
+  `typing-extensions` and the Windows-only `colorama` leave the base install: nothing imports
+  either, and `pydantic` and `click` still bring them where they are needed. `anyio`, which the
+  MCP code imports directly, is named in the base install (it already arrived through `httpx`).
+  The `[viz]`, `[tui]` and `[odps]` extras are now empty aliases, because nothing imports
+  `graphviz`, `textual` or `ruamel.yaml`; `pip install data-product-forge[viz]` still works.
+  `[gcp]` drops `google-auth-oauthlib` and `google-cloud-iam` (unused). The GCP project-access
+  probe, the one user of `google-api-python-client`, now reports "not checked" when that large
+  package is absent, where it reported "no access"; `[gcp]` still leaves it out.
+  `[aws]` names `botocore`.
+
+### Fixed
+
+- **`fluid odcs validate --roundtrip` failed on an installed CLI** because `deepdiff` was
+  declared only for development. It now belongs to the `[odcs-strict]` extra, and a missing
+  `deepdiff` says which extra to install.
+
 ## [0.27.0] — 2026-11-04
 
 ### Added

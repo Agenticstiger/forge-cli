@@ -12,7 +12,6 @@ charset-normalizer
 click
 colorama
 cryptography
-distro
 fastuuid
 filelock
 frozenlist
