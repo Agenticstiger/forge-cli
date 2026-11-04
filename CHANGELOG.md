@@ -641,6 +641,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   region that is not one label, now fails `fluid validate` and the run, `catalogAuth` or not;
   write the value itself.
 
+- **forge-cli's own HTTP calls never carry a credential to another origin, and the base install has
+  one HTTP client.** The Command Center, marketplace, observability reporter and Data Mesh Manager
+  clients run on httpx; forge code no longer imports `requests`, `aiohttp` or `urllib3`, and
+  `requests` is no longer a declared dependency (it still installs through openlineage-python and
+  tiktoken until 0.28.0). The Data Mesh Manager client used to forward its `x-api-key` header to
+  whatever origin a redirect named; it now refuses the redirect with an error that names the new
+  origin and says to update `DMM_API_URL`. Every client with the redirect guard judges the URL httpx
+  will actually follow, so a `Location` with a scheme but no host (`https:/x`) is refused instead of
+  reaching the same host's default port. A server's `Retry-After` is honoured up to 120 seconds, and
+  a value too large to parse no longer crashes the command. A `REQUESTS_CA_BUNDLE` or
+  `CURL_CA_BUNDLE` that points at a missing file disables Command Center reporting with a warning
+  naming the variable; TLS verification is never relaxed. The Command Center catalog connector's
+  search, which raised on the real search filters, works (#804).
+
 - **A plugin can no longer take over a built-in provider by registering its name.** Provider
   entry points were loaded first, so an installed package that declared `gcp`, `aws`, `snowflake`,
   `databricks` or `local` replaced the provider that emits that cloud's DDL and IaC and receives
