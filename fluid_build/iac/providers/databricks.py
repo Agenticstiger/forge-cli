@@ -71,8 +71,15 @@ resources, with no new schema field (fluid-schema 0.7.6):
   and the fail-safe lock depend on (``databricks_enforce.py``). A comment holding a
   backslash is ``databricks-comment-unsafe``: the provider escapes only quotes when it
   writes ``COMMENT '...'`` (``parseComment``), so a trailing backslash would escape the
-  closing quote. On a table a dbt build writes, the comments are dbt's (its ``CREATE OR
-  REPLACE`` sets them from the model, with ``persist_docs``), so the module sets none.
+  closing quote; one holding ``${`` is refused too, since Spark may substitute it. On a
+  table a dbt build writes, the comments are dbt's (its ``CREATE OR REPLACE`` sets them
+  from the model, with ``persist_docs``), so the module sets none.
+* Unity Catalog's certification (the system governed tag ``system.certification_status``)
+  is ``deprecated`` when the expose's ``lifecycle.state`` (else the product's) is
+  ``deprecated``, else ``certified`` when the label ``certification: certified`` (the
+  expose's, else the product's) says so; that label is then no plain tag, and any other
+  value of it is ``databricks-certification-invalid``. The deploy identity needs ASSIGN on
+  the governed tag, which the plan says (:meth:`DatabricksIacPlugin.plan_notices`).
 * ``policy.authz.columnRestrictions`` and ``policy.authz.rowFilters`` are enforced by Unity
   Catalog: SQL functions bound on the table, with the semantics GCP and AWS give them
   (``databricks_access.py``). ``deny`` is a mask that returns NULL (Unity Catalog has no
@@ -353,6 +360,9 @@ _PRODUCT_TAGS = (
 )
 #: The column tag a column's ``sensitivity`` becomes.
 SENSITIVITY_TAG = "fluid_sensitivity"
+#: The contract label that certifies a product (founder decision, 2026-11-04: a label, so no
+#: schema field); its one accepted value. ``lifecycle.state: deprecated`` gives the other.
+CERTIFICATION_LABEL = "certification"
 #: Unity Catalog's system governed tag for a certified or deprecated asset ("Flag data as
 #: certified or deprecated", Databricks docs): values ``certified`` and ``deprecated``. Setting
 #: it needs ASSIGN on that governed tag, besides APPLY TAG on the table (the Entity Tag
@@ -833,6 +843,19 @@ def _comment(raw: Any, where: str, refusals: List[UnsupportedBindingError]) -> O
                 "escaping only quotes, so Databricks would read the backslash as an escape and "
                 "the text after it as SQL.",
                 "Remove the backslash from the description (write a / or spell it out).",
+            )
+        )
+        return None
+    if "${" in text:
+        # Spark substitutes ``${var}``, ``${env:X}`` and ``${system:x}`` in a statement's
+        # whole text, string literals included, while ``spark.sql.variable.substitute`` is on
+        # (its default): a comment would publish what the warehouse holds under that name.
+        refusals.append(
+            _refusal(
+                "comment-unsafe",
+                f"{where} holds '${{', which Spark may substitute with a variable, setting or "
+                "environment value before the COMMENT is stored.",
+                "Write it without '${' (for example '$ {').",
             )
         )
         return None
@@ -1587,6 +1610,8 @@ def _uc_tags(
     with another, or drop some without a word.
     """
     labels = governance_labels(contract, exposure, limit=None)
+    # The certification label is Unity Catalog's certification tag, not a tag of its own.
+    labels.pop(CERTIFICATION_LABEL, None)
     tags: Dict[str, str] = dict(own or {})
     source: Dict[str, str] = {}
     for label, value in labels.items():
@@ -1633,12 +1658,36 @@ def _lookup(document: Mapping[str, Any], path: str) -> Any:
     return value
 
 
-def _certification(contract: Mapping[str, Any], table: _Table) -> Optional[str]:
-    """``deprecated`` when the expose's ``lifecycle.state`` (else the product's) says so."""
+def _certification(
+    contract: Mapping[str, Any], table: _Table, refusals: List[UnsupportedBindingError]
+) -> Optional[str]:
+    """Unity Catalog's certification of ``table``: ``deprecated`` when the expose's
+    ``lifecycle.state`` (else the product's) says so, else ``certified`` when the label
+    :data:`CERTIFICATION_LABEL` (the expose's, else the product's) says so.
+
+    A deprecated product is never shown as certified, whatever its label. Any other label
+    value is refused: Unity Catalog's tag takes only those two values.
+    """
     state = _text(_lookup(table.exposure, "lifecycle.state")) or _text(
         _lookup(contract, "lifecycle.state")
     )
-    return "deprecated" if state.lower() == "deprecated" else None
+    if state.lower() == "deprecated":
+        return "deprecated"
+    label = governance_labels(contract, table.exposure, limit=None).get(CERTIFICATION_LABEL)
+    if label is None:
+        return None
+    if label != "certified":
+        refusals.append(
+            _refusal(
+                "certification-invalid",
+                f"{table.where}: the label {CERTIFICATION_LABEL} is {label!r}, and Unity "
+                f"Catalog's {CERTIFICATION_TAG} takes 'certified' or 'deprecated'.",
+                f"Set labels.{CERTIFICATION_LABEL}: certified, or remove it; a deprecated "
+                "product says so with lifecycle.state: deprecated.",
+            )
+        )
+        return None
+    return "certified"
 
 
 def _product_tags(
@@ -1670,7 +1719,7 @@ def _product_tags(
             )
             continue
         tags[key] = value
-    certification = _certification(contract, table)
+    certification = _certification(contract, table, refusals)
     if certification is not None:
         tags[CERTIFICATION_TAG] = certification
     return tags

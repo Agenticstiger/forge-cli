@@ -21,9 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the masks, the row filter and the fail-safe lock depend on, and the owner team is a tag. On a
   table a dbt build writes, the comments stay dbt's (its `CREATE OR REPLACE` sets them, from the
   model with `persist_docs`): forge-cli sets none there and `fluid validate` says so; its tags
-  are still set. A product whose `lifecycle.state` is `deprecated` (the expose's, else the
-  product's) gets Unity Catalog's system tag `system.certification_status = deprecated`; the
-  deploy identity needs ASSIGN on that governed tag, which the plan says. `fluid verify`'s
+  are still set. Unity Catalog's certification, the system governed tag
+  `system.certification_status`, is `deprecated` when `lifecycle.state` (the expose's, else the
+  product's) is `deprecated`, else `certified` when the label `certification: certified` (the
+  expose's, else the product's) says so; that label is then not also a plain tag, and any other
+  value of it is refused (`databricks-certification-invalid`). The deploy identity needs the
+  ASSIGN permission on that governed tag (not verified on a live workspace), which the plan
+  says. `fluid verify`'s
   governance-tags dimension now also checks the product's tags, the column tags and the comments,
   reading each tag list to its last page.
 
@@ -36,7 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   characters (`databricks-tag-value-too-long`), more than 1,000 column tags on a table
   (`databricks-tags-too-many`), and a description holding a backslash
   (`databricks-comment-unsafe`: the provider escapes only quotes when it writes
-  `COMMENT '...'`, so a trailing backslash would end the string early).
+  `COMMENT '...'`, so a trailing backslash would end the string early), and one holding `${`
+  (also `databricks-comment-unsafe`: Spark may substitute a variable there).
 
 ## [0.27.0] — 2026-11-04
 

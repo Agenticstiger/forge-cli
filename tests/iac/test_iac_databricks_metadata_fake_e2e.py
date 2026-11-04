@@ -183,18 +183,25 @@ def test_a_table_created_without_comments_is_adopted_and_gains_them_in_place(
     assert fake.tables[TABLE]["marker"] == marker and fake.replaced == []
 
 
-def test_a_deprecated_product_gets_the_certification_system_tag(workspace, fake, capfd):
+def test_certified_then_deprecated_sets_the_certification_system_tag(workspace, fake, capfd):
     contract = _described()
-    contract["lifecycle"] = {"state": "deprecated"}
+    contract["labels"] = {"certification": "certified"}
     path = write_contract(workspace, contract)
 
     rc, out = apply_contract(capfd, path)
     assert rc == 0, out
-    assert "system.certification_status is set on main.sales.orders (deprecated)" in out
-    assert fake.tags_on("tables", TABLE)["system.certification_status"] == "deprecated"
+    assert "system.certification_status is set on main.sales.orders (certified)" in out
+    assert "needs the ASSIGN permission" in out
+    tags = fake.tags_on("tables", TABLE)
+    assert tags["system.certification_status"] == "certified" and "certification" not in tags
     assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]
 
-    del contract["lifecycle"]
+    contract["lifecycle"] = {"state": "deprecated"}
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 0, out
+    assert fake.tags_on("tables", TABLE)["system.certification_status"] == "deprecated"
+
+    del contract["lifecycle"], contract["labels"]
     rc, out = apply_contract(capfd, write_contract(workspace, contract))
     assert rc == 0, out
     assert "system.certification_status" not in fake.tags_on("tables", TABLE)

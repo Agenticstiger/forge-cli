@@ -173,9 +173,10 @@ class TestComments:
         assert table["comment"] == "padded"
         assert "comment" not in table["column"][0]
 
-    def test_an_interpolation_in_a_description_stays_a_literal(self):
+    def test_an_interpolation_in_a_tag_value_stays_a_literal(self):
+        # a comment holding one is refused (below); a tag value goes as JSON, not SQL
         contract = _contract()
-        contract["exposes"][0]["description"] = 'see ${file("/etc/passwd")}'
+        contract["name"] = 'see ${file("/etc/passwd")}'
         rendered = build_module(IAC_PLUGINS["databricks"], contract)
         assert '$${file(\\"/etc/passwd\\")}' in rendered
         assert '"see ${file' not in rendered
@@ -202,6 +203,18 @@ class TestComments:
         errors, _ = dbx.validate_databricks_binding(contract)
         assert len(errors) == 1 and "databricks-comment-unsafe" not in errors[0]
         assert "backslash" in errors[0]
+
+    @pytest.mark.parametrize("text", ["${env:HOME}", "x ${spark.sql.warehouse.dir} y"])
+    def test_a_spark_variable_is_refused_because_it_would_be_substituted(self, text):
+        contract = _contract()
+        contract["exposes"][0]["contract"]["schema"][0]["description"] = text
+        refusal = _refused(contract)
+        assert refusal.kind == "databricks-comment-unsafe" and "${" in str(refusal)
+
+    def test_a_dollar_alone_is_a_comment(self):
+        contract = _contract()
+        contract["exposes"][0]["description"] = "Costs in $ and {braces}; $5 {each}"
+        assert _table(_module(contract))["comment"] == "Costs in $ and {braces}; $5 {each}"
 
     def test_a_dbt_written_table_leaves_its_comments_to_dbt(self):
         contract = _contract()
@@ -401,3 +414,33 @@ class TestCertification:
         contract["labels"] = {f"k{i:03d}": "v" for i in range(50 - len(IDENTITY))}
         errors, _ = dbx.validate_databricks_binding(contract)
         assert len(errors) == 1 and "51" in errors[0]
+
+    def test_a_certification_label_certifies_the_table_and_is_no_plain_tag(self):
+        contract = _contract()
+        contract["labels"] = {"certification": "Certified", "cost-center": "cx-1"}
+        doc = _module(contract)
+        (tags,) = _tags(doc, "tables").values()
+        assert tags[CERTIFICATION] == "certified" and "certification" not in tags
+        (schema,) = _tags(doc, "schemas").values()
+        assert schema == {"cost_center": "cx-1"}
+
+    def test_an_expose_label_certifies_its_own_table(self):
+        contract = _contract()
+        contract["exposes"][0]["labels"] = {"certification": "certified"}
+        assert self._table_tags(contract)[CERTIFICATION] == "certified"
+
+    def test_deprecated_wins_over_a_certification_label(self):
+        contract = _contract()
+        contract["labels"] = {"certification": "certified"}
+        contract["exposes"][0]["lifecycle"] = {"state": "deprecated"}
+        assert self._table_tags(contract)[CERTIFICATION] == "deprecated"
+
+    @pytest.mark.parametrize("value", ["gold", "deprecated", "pending"])
+    def test_any_other_certification_label_is_refused(self, value):
+        contract = _contract()
+        contract["labels"] = {"certification": value}
+        refusal = _refused(contract)
+        assert refusal.kind == "databricks-certification-invalid"
+        assert repr(value) in str(refusal) and "lifecycle.state" in " ".join(refusal.remediation)
+        errors, _ = dbx.validate_databricks_binding(contract)
+        assert len(errors) == 1
