@@ -187,7 +187,21 @@ def _resolve_catalog_id() -> str:
 
         identity = boto3.client("sts").get_caller_identity()
         value = str(identity.get("Account") or "")
-    except Exception:  # noqa: BLE001 — best-effort; emit no import on failure
+    except ImportError:
+        # Loud, not silent: dropping the import block means a Glue database or
+        # table that already exists is planned as a create and then conflicts.
+        LOG.warning(
+            "boto3 is not installed, so the AWS account id could not be looked up and the "
+            "Glue catalog import blocks are omitted. Install it, or set AWS_ACCOUNT_ID:\n\n"
+            "    pip install 'data-product-forge[aws]'"
+        )
+        value = ""
+    except Exception as exc:  # noqa: BLE001 — best-effort; emit no import on failure
+        LOG.warning(
+            "Could not resolve the AWS account id (%s), so the Glue catalog import blocks "
+            "are omitted. Set AWS_ACCOUNT_ID or configure AWS credentials.",
+            type(exc).__name__,
+        )
         value = ""
     _CATALOG_ID_CACHE["value"] = value
     return value

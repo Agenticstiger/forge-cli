@@ -35,18 +35,6 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 if TYPE_CHECKING:
     pass
 
-try:
-    import requests as requests_module
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-
-    HAS_REQUESTS = True
-except ImportError:
-    HAS_REQUESTS = False
-    requests_module = None  # type: ignore
-    HTTPAdapter = None  # type: ignore
-    Retry = None  # type: ignore
-
 from ..errors import NetworkError, wrap_error
 
 logger = logging.getLogger(__name__)
@@ -194,35 +182,41 @@ def create_session_with_retries(
     max_retries: int = DEFAULT_MAX_RETRIES,
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
     status_forcelist: tuple = (500, 502, 503, 504, 429),
-) -> Any:  # returns requests.Session
+) -> Any:  # returns httpx.Client
     """
-    Create requests session with automatic retry configuration.
+    Create an httpx client with automatic retry configuration.
+
+    Redirects are followed and the proxy environment is honoured, as the
+    ``requests`` session this replaces did. Retries follow
+    ``urllib3.util.retry.Retry`` semantics (see ``util.http_client``).
 
     Args:
         max_retries: Maximum number of retries
-        backoff_factor: Backoff multiplier (delay = backoff_factor * (2 ** retry_count))
+        backoff_factor: Backoff multiplier (delay = backoff_factor * (2 ** (retry_count - 1)),
+            no delay before the first retry)
         status_forcelist: HTTP status codes that trigger retry
 
     Returns:
-        Configured requests.Session
+        Configured httpx.Client
     """
-    if not HAS_REQUESTS:
-        raise ImportError("requests library not installed")
+    from .http_client import new_client
 
-    session = requests_module.Session()
-
-    retry_strategy = Retry(
-        total=max_retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=status_forcelist,
-        allowed_methods=["HEAD", "GET", "PUT", "POST", "DELETE", "OPTIONS", "TRACE"],
+    return new_client(
+        retry={
+            "total": max_retries,
+            "backoff_factor": backoff_factor,
+            "status_forcelist": status_forcelist,
+            "allowed_methods": ["HEAD", "GET", "PUT", "POST", "DELETE", "OPTIONS", "TRACE"],
+        }
     )
 
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
 
-    return session
+_REQUESTS_ONLY_KWARGS = {
+    "verify": "pass the CA bundle through the client (REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE "
+    "or util.http_client.new_client) -- verify= is a client option in httpx",
+    "cert": "client certificates are a client option in httpx (new_client(cert=...))",
+    "stream": "use session.stream(...) for a streamed response in httpx",
+}
 
 
 def safe_request(
@@ -234,7 +228,7 @@ def safe_request(
     session: Optional[Any] = None,
     circuit_breaker: Optional[CircuitBreaker] = None,
     **kwargs,
-) -> Any:  # returns requests.Response
+) -> Any:  # returns httpx.Response
     """
     Make HTTP request with safety features.
 
@@ -243,9 +237,9 @@ def safe_request(
         url: Request URL
         timeout: Read timeout in seconds
         connect_timeout: Connection timeout in seconds
-        session: Optional requests session (creates one with retries if not provided)
+        session: Optional httpx client (creates one with retries if not provided)
         circuit_breaker: Optional circuit breaker
-        **kwargs: Additional arguments passed to requests
+        **kwargs: Additional arguments passed to httpx
 
     Returns:
         Response object
@@ -253,8 +247,7 @@ def safe_request(
     Raises:
         NetworkError: If request fails after retries
     """
-    if not HAS_REQUESTS:
-        raise ImportError("requests library not installed")
+    import httpx
 
     # Set timeouts
     if timeout is None:
@@ -262,15 +255,23 @@ def safe_request(
     if connect_timeout is None:
         connect_timeout = DEFAULT_CONNECT_TIMEOUT
 
-    # Use tuple (connect_timeout, read_timeout)
-    timeout_tuple = (connect_timeout, timeout)
+    # connect_timeout bounds the connection, timeout the read (and write/pool)
+    request_timeout = httpx.Timeout(timeout, connect=connect_timeout)
 
     # Create session if not provided
     if session is None:
         session = create_session_with_retries()
 
+    # ``requests`` keyword names that ``httpx`` spells differently: translate the
+    # one that maps one-to-one, refuse the rest rather than ignore them silently.
+    if "allow_redirects" in kwargs:
+        kwargs["follow_redirects"] = kwargs.pop("allow_redirects")
+    for name, instead in _REQUESTS_ONLY_KWARGS.items():
+        if name in kwargs:
+            raise TypeError(f"safe_request() no longer takes {name!r}: {instead}")
+
     # Add timeout to kwargs
-    kwargs["timeout"] = timeout_tuple
+    kwargs["timeout"] = request_timeout
 
     # Execute request
     try:
@@ -279,12 +280,15 @@ def safe_request(
         else:
             response = session.request(method, url, **kwargs)
 
-        # Raise for HTTP errors
-        response.raise_for_status()
+        # Raise for 4xx/5xx only, as ``requests`` did: ``httpx``'s
+        # ``raise_for_status()`` also raises on a 1xx/3xx (a 304, a 301 with no
+        # ``Location``).
+        if response.is_error:
+            response.raise_for_status()
 
         return response
 
-    except requests_module.exceptions.Timeout as e:
+    except httpx.TimeoutException as e:
         raise NetworkError(
             f"Request timed out after {timeout}s: {url}",
             context={"url": url, "method": method, "timeout": timeout},
@@ -296,7 +300,7 @@ def safe_request(
             original_error=e,
         )
 
-    except requests_module.exceptions.ConnectionError as e:
+    except (httpx.NetworkError, httpx.RemoteProtocolError, httpx.ProxyError) as e:
         raise NetworkError(
             f"Connection failed: {url}",
             context={"url": url, "method": method},
@@ -308,8 +312,8 @@ def safe_request(
             original_error=e,
         )
 
-    except requests_module.exceptions.HTTPError as e:
-        status_code = e.response.status_code if e.response else None
+    except httpx.HTTPStatusError as e:
+        status_code = e.response.status_code
         raise NetworkError(
             f"HTTP {status_code} error: {url}",
             context={"url": url, "method": method, "status_code": status_code},
@@ -331,38 +335,38 @@ def safe_request(
 # Convenience functions
 
 
-def safe_get(url: str, **kwargs) -> Any:  # returns requests.Response
+def safe_get(url: str, **kwargs) -> Any:  # returns httpx.Response
     """Safe GET request with timeouts and retries"""
     return safe_request("GET", url, **kwargs)
 
 
-def safe_post(url: str, **kwargs) -> Any:  # returns requests.Response
+def safe_post(url: str, **kwargs) -> Any:  # returns httpx.Response
     """Safe POST request with timeouts and retries"""
     return safe_request("POST", url, **kwargs)
 
 
-def safe_put(url: str, **kwargs) -> Any:  # returns requests.Response
+def safe_put(url: str, **kwargs) -> Any:  # returns httpx.Response
     """Safe PUT request with timeouts and retries"""
     return safe_request("PUT", url, **kwargs)
 
 
-def safe_patch(url: str, **kwargs) -> Any:  # returns requests.Response
+def safe_patch(url: str, **kwargs) -> Any:  # returns httpx.Response
     """Safe PATCH request with timeouts and retries"""
     return safe_request("PATCH", url, **kwargs)
 
 
-def safe_delete(url: str, **kwargs) -> Any:  # returns requests.Response
+def safe_delete(url: str, **kwargs) -> Any:  # returns httpx.Response
     """Safe DELETE request with timeouts and retries"""
     return safe_request("DELETE", url, **kwargs)
 
 
 # Global instances for common use
-_default_session: Optional[Any] = None  # requests.Session
+_default_session: Optional[Any] = None  # httpx.Client
 _default_rate_limiter: Optional[RateLimiter] = None
 _default_circuit_breaker: Optional[CircuitBreaker] = None
 
 
-def get_default_session() -> Any:  # returns requests.Session
+def get_default_session() -> Any:  # returns httpx.Client
     """Get or create default session"""
     global _default_session
     if _default_session is None:

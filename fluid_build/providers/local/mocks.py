@@ -163,13 +163,15 @@ class FakeGCSMock:
 
     def create_bucket(self, bucket_name: str) -> Dict[str, Any]:
         """Create GCS bucket in fake server."""
-        import requests
+        import httpx
 
         url = f"{self.endpoint_url}/storage/v1/b"
         data = {"name": bucket_name}
 
         try:
-            response = requests.post(url, json=data)
+            # requests.post followed redirects and set no timeout; keep the
+            # redirects and bound the wait.
+            response = httpx.post(url, json=data, follow_redirects=True, timeout=30)
             return {"success": response.status_code in [200, 201], "bucket": bucket_name}
         except Exception as e:
             self.logger.error(f"Failed to create bucket: {e}")

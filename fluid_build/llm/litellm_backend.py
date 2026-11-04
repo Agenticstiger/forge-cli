@@ -83,20 +83,31 @@ _thread_local = threading.local()
 def _get_litellm() -> Any:
     """Lazy-import litellm; raise a typed error with the install hint.
 
-    ``litellm`` is a hard dependency in ``pyproject.toml`` so this
-    branch only fires in pathological environments (a partial
-    installation, an interpreter mismatch). The suggestion points at
-    the canonical re-install command.
+    ``litellm`` is an optional dependency (the ``[litellm]`` extra; it is
+    still installed by default today). The gate is
+    :func:`fluid_build._optional.require`, which probes before importing, so a
+    present-but-broken litellm is reported as such rather than as missing.
     """
+    from fluid_build._optional import MissingOptionalDependency, require
+
     try:
-        import litellm  # type: ignore[import-untyped]
-    except ImportError as exc:
+        litellm = require("litellm", "litellm", "AI-assisted authoring")
+    except MissingOptionalDependency as exc:
         raise CopilotGenerationError(
             "copilot_litellm_unavailable",
-            "litellm is not installed (this is a hard dependency).",
+            f"{exc.feature} needs {exc.package}, which is not installed.",
+            suggestions=[f"pip install 'data-product-forge[{exc.extra}]'"],
+        ) from exc
+    except ImportError as exc:
+        # Present but broken (e.g. litellm >= 1.98 on Python 3.10): same typed
+        # error as "missing", so every existing caller degrades the same way.
+        # ``require`` already wrote "... installed but failed to import: <why>".
+        raise CopilotGenerationError(
+            "copilot_litellm_unavailable",
+            str(exc),
             suggestions=[
-                "pip install 'data-product-forge[litellm]'",
-                "Or install litellm directly: pip install litellm",
+                "pip install 'data-product-forge[litellm]' "
+                "(installs the litellm version this Python supports)"
             ],
         ) from exc
     return litellm

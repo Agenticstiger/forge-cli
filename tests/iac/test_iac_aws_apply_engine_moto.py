@@ -82,7 +82,7 @@ def moto_endpoint(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     the backends. The ``/moto-api/reset`` admin endpoint clears all state,
     giving each test the clean account it expects.
     """
-    import requests
+    import httpx
     from moto.server import ThreadedMotoServer
 
     server = ThreadedMotoServer(port=0, verbose=False)
@@ -94,7 +94,7 @@ def moto_endpoint(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         # Reset before yielding — also covers state leaked in by a previous
         # test running in the same process.
         with contextlib.suppress(Exception):
-            requests.post(f"{endpoint}/moto-api/reset", timeout=5)
+            httpx.post(f"{endpoint}/moto-api/reset", timeout=5)
         yield endpoint
     finally:
         server.stop()

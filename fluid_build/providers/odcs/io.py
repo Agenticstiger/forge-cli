@@ -40,6 +40,38 @@ from typing import Any, Dict, Union
 
 LOG = logging.getLogger(__name__)
 
+#: Fallback kinds already reported in this process (one WARNING per kind).
+_FALLBACK_WARNED: set = set()
+
+
+def _warn_fallback_once(kind: str, path: Any, exc: BaseException) -> None:
+    """One WARNING per process when the typed ODCS library path is abandoned.
+
+    ``open-data-contract-standard`` is a base dependency, not an extra, so an
+    ``ImportError`` here means a broken install and the hint is a reinstall.
+    Any other failure is the library rejecting this file: the raw YAML is used
+    and the typed validation it would have done is skipped.
+    """
+    if kind in _FALLBACK_WARNED:
+        return
+    _FALLBACK_WARNED.add(kind)
+    if isinstance(exc, ImportError):
+        LOG.warning(
+            "open-data-contract-standard could not be imported, so ODCS files are %s as plain "
+            "YAML with no typed validation. Reinstall it with: "
+            "pip install --force-reinstall 'open-data-contract-standard>=3.1.2'",
+            "read" if kind == "read" else "written",
+        )
+        return
+    LOG.warning(
+        "open-data-contract-standard rejected %s (%s: %s); falling back to plain YAML %s "
+        "without typed validation. Shown once per process.",
+        path,
+        type(exc).__name__,
+        str(exc).splitlines()[0][:200] if str(exc) else "",
+        "parsing" if kind == "read" else "output",
+    )
+
 
 def read_input(path: Union[str, Path]) -> Dict[str, Any]:
     """Load an ODCS YAML/JSON file.
@@ -69,11 +101,7 @@ def read_input(path: Union[str, Path]) -> Dict[str, Any]:
             # author never set.
             return dc.model_dump(by_alias=True, exclude_none=True)
         except Exception as exc:  # noqa: BLE001 — soft-fail to raw parse
-            LOG.debug(
-                "OpenDataContractStandard.from_file failed on %s; falling back to raw YAML: %s",
-                input_path,
-                exc,
-            )
+            _warn_fallback_once("read", input_path, exc)
 
     return raw
 
@@ -99,11 +127,7 @@ def write_output(data: Dict[str, Any], path: Union[Path, str], fmt: str) -> None
             output_path.write_text(dc.to_yaml(), encoding="utf-8")
             return
         except Exception as exc:  # noqa: BLE001 — soft-fail to raw dump
-            LOG.debug(
-                "OpenDataContractStandard.to_yaml failed for %s; falling back to raw YAML dump: %s",
-                output_path,
-                exc,
-            )
+            _warn_fallback_once("write", output_path, exc)
 
     with open(output_path, "w", encoding="utf-8") as f:
         if fmt == "yaml":

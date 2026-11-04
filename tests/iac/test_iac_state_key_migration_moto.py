@@ -95,7 +95,7 @@ def plugin_cache(tmp_path_factory: pytest.TempPathFactory) -> str:
 @pytest.fixture
 def moto(monkeypatch, tmp_path: Path, plugin_cache: str) -> Iterator[str]:
     """A fresh moto server holding the state bucket; tofu and boto3 aim at it."""
-    import requests
+    import httpx
     from moto.server import ThreadedMotoServer
 
     server = ThreadedMotoServer(port=0, verbose=False)
@@ -104,7 +104,7 @@ def moto(monkeypatch, tmp_path: Path, plugin_cache: str) -> Iterator[str]:
         _, port = server.get_host_and_port()
         endpoint = f"http://127.0.0.1:{port}"
         with contextlib.suppress(Exception):
-            requests.post(f"{endpoint}/moto-api/reset", timeout=5)
+            httpx.post(f"{endpoint}/moto-api/reset", timeout=5)
         for var in ("AWS_PROFILE", "AWS_SESSION_TOKEN", "FLUID_STATE_BACKEND", "FLUID_PROVIDER"):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("AWS_ENDPOINT_URL", endpoint)

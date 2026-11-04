@@ -41,8 +41,10 @@ green.
 
 Tier-0 leaf rules: no module-scope ``mcp`` import (the startup budget in
 ``tests/perf/test_startup_budget.py`` forbids ``mcp`` on ``fluid --help``);
-every SDK import below is function-local, and the version probe uses
-``find_spec`` (metadata only, imports nothing).
+every SDK import below is function-local. The generation probe uses
+``find_spec``, which is not free: for a dotted name it imports the
+parent packages (``mcp`` and ``mcp.server``, about 430 modules). It therefore
+runs only from :func:`is_v2`, never on a cold path.
 """
 
 from __future__ import annotations
@@ -58,16 +60,35 @@ if TYPE_CHECKING:  # pragma: no cover - annotation-only
 _MISSING = object()
 
 
+def require_sdk(feature: str = "The MCP server") -> None:
+    """Raise ``MissingOptionalDependency`` (``[mcp]``) when the SDK is absent.
+
+    Called at the entry of every function that is the first to touch the SDK on
+    a real path (``fluid mcp serve``, the output-port server, tool errors), so a
+    missing install reads as one install line and not ``No module named 'mcp'``.
+    Probes with ``find_spec``; nothing is imported.
+    """
+    from fluid_build._optional import MissingOptionalDependency, is_available
+
+    if not is_available("mcp"):
+        raise MissingOptionalDependency("mcp", "mcp", feature)
+
+
 @functools.lru_cache(maxsize=1)
 def is_v2() -> bool:
     """True when the installed SDK is the 2.x generation.
 
     Feature-probe (``mcp.server.mcpserver`` exists only in 2.x) — never
-    parse ``mcp.__version__``.  ``find_spec`` reads packaging metadata
-    without importing ``mcp``, so the cold-path budget is unaffected.
-    Memoised with ``lru_cache`` per house style (lock-guarded, and
+    parse ``mcp.__version__``.  ``find_spec`` on a dotted name imports its
+    parent packages (``mcp``, ``mcp.server``: about 430 modules), so this is
+    not free and must stay off the cold ``--help`` path.  It raises
+    ``ModuleNotFoundError`` when ``mcp`` itself is absent (CPython bpo-30436),
+    so the top-level package is probed first; with no SDK installed this is
+    ``False``.  Memoised with ``lru_cache`` per house style (lock-guarded, and
     ``is_v2.cache_clear()`` is the test reset hook).
     """
+    if importlib.util.find_spec("mcp") is None:
+        return False
     return importlib.util.find_spec("mcp.server.mcpserver") is not None
 
 
@@ -103,6 +124,7 @@ def get_tool_error() -> type:
     The class also moved: ``mcp.server.fastmcp.exceptions`` on v1,
     ``mcp.server.mcpserver.exceptions`` on v2.
     """
+    require_sdk()
     if is_v2():
         from mcp.server.mcpserver.exceptions import ToolError
 
@@ -120,6 +142,7 @@ def get_server_api() -> tuple[type, type]:
     ``.tool(**kwargs)(fn)``, and both inject ``ctx`` as a handler parameter,
     so callers need no further branching.
     """
+    require_sdk()
     if is_v2():
         from mcp.server.mcpserver import Context, MCPServer
 
@@ -157,6 +180,7 @@ def build_lowlevel_server(
     ``on_*`` constructor kwargs and wraps returns in the typed ``*Result``
     models the 2.x lowlevel server requires.
     """
+    require_sdk()
     from mcp.server.lowlevel import Server  # local: keep ``fluid --help`` light
 
     # Forward ``version`` / ``lifespan`` only when set: an explicit None

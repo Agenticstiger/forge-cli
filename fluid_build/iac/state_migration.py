@@ -251,8 +251,12 @@ def other_clouds(resources: Iterable[Mapping[str, Any]], provider: str) -> Froze
 
 
 def _sources_by_plugin(provider: str) -> Dict[str, FrozenSet[str]]:
-    from .registry import IAC_PLUGINS
+    from .registry import IAC_PLUGINS, discover_iac_entrypoints
 
+    # Attribute a state against EVERY admitted plugin, not only the ones loaded so
+    # far: this is the guard that stops a destructive apply from deleting another
+    # cloud's resources. Laziness matters for ``--help``/``providers``, not here.
+    discover_iac_entrypoints()
     by_plugin = {name: plugin_sources(name) for name in IAC_PLUGINS}
     by_plugin.setdefault(provider, plugin_sources(provider))
     return by_plugin

@@ -44,9 +44,8 @@ dependencies = [
   "pydantic>=2.7",
   "typing-extensions>=4.8",
   "jinja2>=3.1.6",  # security: >=3.1.6 closes CVE-2025-27516 (sandbox escape via |attr)
-  "httpx>=0.27",  # For FluidCommandCenter catalog provider
+  "httpx>=0.27",  # The one HTTP client: Command Center, Data Mesh Manager, marketplace, reporter
   "h11>=0.16",  # security: pin transitive h11 >=0.16 to close CVE-2025-43859 (chunked request smuggling)
-  "requests>=2.32.5",  # For Data Mesh Manager catalog publishing and shared HTTP helpers
   # LiteLLM is the canonical LLM backend (was an opt-in extra). It
   # replaces ~1,300 lines of per-provider wire-format code with one
   # unified API across openai / anthropic / gemini / bedrock / azure /
@@ -160,11 +159,12 @@ dependencies = [
   # thread per instance, which leaked unboundedly with a per-session
   # SessionState. Reintroduce a backend here only if a multi-replica
   # deployment needs shared limits.)
-  # Borrowed SQL parser (MIT) used by fluid_build.providers._sql_safety to
-  # AST-classify statement bodies for the Snowflake action surfaces, so a
-  # contract cannot smuggle account-level / multi-statement SQL through the
-  # custom-SQL / task-body / view-body surfaces. Borrowed-not-built per
-  # /borrow-before-build: https://github.com/tobymao/sqlglot
+  # Borrowed SQL parser (MIT). Real consumers: fluid_build/iac/row_access.py
+  # (parses and validates a row-filter predicate before it is written into a
+  # platform policy; it FAILS OPEN if sqlglot is missing, so keep this in the
+  # base install), iac/providers/databricks_access.py, forge/core/validators.py
+  # and the from_ddl parser. (providers/_sql_safety.py does not use it.)
+  # Borrowed-not-built per /borrow-before-build: https://github.com/tobymao/sqlglot
   "sqlglot>=25.0",
   # Bitol-vendor-listed Python library for ODCS v3.1.0. Provides typed
   # Pydantic v2 models + ``from_file()`` / ``to_yaml()`` for lossless
@@ -347,16 +347,47 @@ postgres = [
   "psycopg[binary]>=3.1",
 ]
 
-# LiteLLM is now a core dependency (above), not an extra. The
-# ``[litellm]`` alias is kept empty for back-compat with anyone who
-# scripted ``pip install data-product-forge[litellm]`` during the opt-in
-# preview window.
-litellm = []
+# AI authoring (litellm). litellm is still in the base install today, so this
+# extra is redundant for now; it exists so that pip/uv installs of
+# ``data-product-forge[litellm]`` keep working after litellm leaves the base
+# install in 0.28.0. The two lines are copied verbatim from ``dependencies``:
+# the Python-version marker split (PR #555) must never be collapsed, because
+# litellm >= 1.98 cannot be imported on Python 3.10.
+# tests/ci_guards/extras_alongside_base.py pins both lines.
+litellm = [
+  "litellm>=1.83.14,<2; python_version >= '3.11'",
+  "litellm>=1.83.14,<1.98; python_version < '3.11'",
+]
 
-# mcp is in the base install today. This empty alias lets
-# ``pip install 'data-product-forge[mcp]'`` resolve now; it gets filled
-# when mcp leaves the base install.
-mcp = []
+# MCP server and output-port gateway (``fluid mcp serve``,
+# ``fluid mcp output-port serve``). mcp is still in the base install today;
+# this extra is redundant for now and carries the install after 0.28.0.
+# pyjwt is declared explicitly because fluid_build/output_ports/mcp/auth.py
+# imports ``jwt`` directly. Floor 2.15.0: every release up to 2.14.0 has
+# advisories on the PyJWKClient/decode path auth.py uses (e.g.
+# GHSA-ffc3-869f-jxw9); [crypto] for the RS256/ES256/EdDSA verifiers.
+mcp = [
+  "mcp>=1.22,<3.0",
+  "pyjwt[crypto]>=2.15.0",
+]
+
+# OpenLineage run-event emission. openlineage-python is still in the base
+# install today; this extra is redundant for now and carries the install
+# after it leaves base.
+lineage = [
+  "openlineage-python>=1.52",
+]
+
+# AI + MCP together: restores today's base behaviour once litellm and mcp
+# leave the base install in 0.28.0 (the ``fastapi[standard]`` precedent).
+standard = [
+  "data-product-forge[litellm,mcp]",
+]
+
+# Alias of ``[litellm]`` for readers who look for an ``ai`` extra.
+ai = [
+  "data-product-forge[litellm]",
+]
 
 # V1.5 metadata-source catalog adapters.
 #
@@ -443,6 +474,9 @@ dev = [
   # the unit lanes install ``.[dev,local]``, which has no pyarrow, so without
   # it those tests would skip in CI instead of running.
   "pyarrow>=14",
+  # litellm, mcp and openlineage leave the base install in 0.28.0; the tests
+  # import all three at module level, so dev names them explicitly.
+  "data-product-forge[litellm,mcp,lineage]",
 ]
 
 # Light (in-process) integration-test emulators — Stage 1. moto mocks the
@@ -484,7 +518,7 @@ test-emulators-heavy = [
 
 # One-shot install for contributors
 all = [
-  "data-product-forge[local,aws,gcp,snowflake,viz,odps,tui,copilot,vector,postgres,docs,dev]"
+  "data-product-forge[local,aws,gcp,snowflake,viz,odps,tui,copilot,vector,postgres,docs,litellm,mcp,lineage,dev]"
 ]
 
 [project.scripts]
@@ -528,6 +562,21 @@ snowflake = "fluid_build.providers.snowflake:SnowflakeProvider"
 # coding agents) always win — a plugin can never silently shadow a built-in.
 # Built-ins are seeded in code, so this group is declared by THIRD-PARTY
 # packages only (listing the built-ins here would self-shadow).
+
+# OpenTofu emitters for an additional platform are a discovered plugin group
+# (``iac/registry.py``). A third-party package ships one so that installing it
+# makes ``binding.platform: <name>`` compile through ``fluid generate iac`` and
+# apply through the OpenTofu engine, with no core edit:
+#
+#     [project.entry-points."fluid_build.iac_providers"]
+#     onprem = "my_pkg.iac:OnPremIacPlugin"   # an IacProviderPlugin class/instance
+#
+# Loaded lazily, by name, when a contract's platform needs it (never at import,
+# so ``fluid --help`` / ``fluid providers`` run no plugin code). Governed by
+# FLUID_PLUGINS_ALLOWLIST / FLUID_PLUGINS_BLOCKLIST and the ``requires_cli`` gate.
+# Built-in platform names (aws / gcp / snowflake / confluent / databricks, their
+# aliases, local) are reserved: an entry point claiming one is skipped before it
+# is imported. Declared by THIRD-PARTY packages only.
 
 [project.urls]
 Homepage = "https://agenticstiger.github.io/forge_docs/"
