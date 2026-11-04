@@ -214,3 +214,16 @@ def test_validate_help_imports_validate_but_not_forge_or_copilot() -> None:
     out = _run(_PROBE.format(argv=["validate", "--help"], watch=watch))
     loaded = set(filter(None, out[1].split(",")))
     assert loaded == {"fluid_build.cli.validate"}, loaded
+
+
+def test_the_global_option_tables_match_the_parser():
+    # _requested_command steps past global options by these two tables; one the
+    # parser gains but the tables miss would be read as the command name.
+    value_opts, flag_opts = set(), set()
+    for action in build_parser()._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            continue
+        longs = {o for o in action.option_strings if o.startswith("--") and o != "--help"}
+        (flag_opts if action.nargs == 0 else value_opts).update(longs)
+    assert value_opts == set(bootstrap._GLOBAL_VALUE_OPTS)
+    assert flag_opts == set(bootstrap._GLOBAL_FLAG_OPTS)
