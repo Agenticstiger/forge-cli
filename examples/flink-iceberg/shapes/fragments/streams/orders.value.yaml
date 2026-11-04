@@ -1,0 +1,45 @@
+# The value of each record on the orders topic, as the producers write it.
+- name: event_id
+  type: string
+  required: true
+- name: customer
+  type: struct
+  fields:
+    - name: id
+      type: string
+    - name: address
+      type: struct
+      fields:
+        - name: country
+          type: string
+        - name: geo
+          type: struct
+          fields:
+            - name: location
+              type: struct
+              fields:
+                - name: coordinates
+                  type: struct
+                  fields:
+                    - name: latitude
+                      type: double
+                    - name: longitude
+                      type: double
+- name: items
+  type: array
+  element:
+    type: struct
+    fields:
+      - name: sku
+        type: string
+      - name: price
+        type: decimal(18,2)
+- name: attributes
+  type: map
+  key:
+    type: string
+    required: true
+  value:
+    type: string
+- name: event_time
+  type: timestamp_ltz(3)

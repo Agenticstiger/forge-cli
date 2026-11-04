@@ -1,0 +1,3 @@
+# Both contracts below read the one stream fragment in fragments/, so the
+# workspace lets their $refs reach this directory.
+ref_root: .

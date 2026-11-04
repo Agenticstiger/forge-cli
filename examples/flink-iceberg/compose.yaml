@@ -57,6 +57,7 @@ services:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
         parallelism.default: 1
+        taskmanager.numberOfTaskSlots: 2
         execution.checkpointing.interval: 2s
         execution.checkpointing.mode: EXACTLY_ONCE
         state.checkpoints.dir: file:///tmp/forge-checkpoints
