@@ -32,7 +32,6 @@ write or read of the variable.
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -44,6 +43,8 @@ from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
     iceberg_sink_preflight,
     validate_iceberg_sink,
 )
+from tests.build_runners import test_catalog_auth_sink as _sink_tests
+from tests.build_runners.test_catalog_auth_sink import _RecordingRun
 
 pytestmark = [pytest.mark.unit]
 
@@ -116,50 +117,10 @@ def _kc_contract(
     location: Optional[Dict[str, Any]] = None,
     **kc: Any,
 ) -> Dict[str, Any]:
-    sink: Dict[str, Any] = {"format": "iceberg"}
-    if catalog_auth is not None:
-        sink["catalogAuth"] = catalog_auth
-    return {
-        "fluidVersion": "0.7.6",
-        "kind": "DataProduct",
-        "id": "bronze.sink_destinations",
-        "name": "X",
-        "metadata": {"layer": "Bronze", "owner": {"team": "dp", "email": "x@y.z"}},
-        "builds": [
-            {
-                "id": "ingest",
-                "pattern": "acquisition",
-                "engine": "kafka-connect",
-                "properties": {
-                    "source": {
-                        "kind": "postgres",
-                        "connection": {"host": "db", "database": "x", "user": "u"},
-                        "mode": "incremental_append",
-                        "streams": ["public.orders"],
-                    },
-                    "sink": sink,
-                    "kafka-connect": {
-                        "deployment": {"server_url": "http://kafka-connect.test:8083"},
-                        "connector_name": "src",
-                        **kc,
-                    },
-                },
-                "outputs": ["data"],
-            }
-        ],
-        "exposes": [
-            {
-                "exposeId": "data",
-                "kind": "table",
-                "binding": {
-                    "platform": "local",
-                    "format": "iceberg",
-                    "location": dict(location if location is not None else _location()),
-                },
-                "contract": {"schema": []},
-            }
-        ],
-    }
+    """The catalogAuth sink tests' Kafka Connect contract, aimed at a remote catalog."""
+    return _sink_tests._kc_contract(
+        catalog_auth, location=location if location is not None else _location(), **kc
+    )
 
 
 def _dbz_contract(
@@ -168,43 +129,15 @@ def _dbz_contract(
     location: Optional[Dict[str, Any]] = None,
     server_sink: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    contract = _kc_contract(catalog_auth, location=location)
-    build = contract["builds"][0]
-    build["engine"] = "debezium"
-    props = build["properties"]
-    del props["kafka-connect"]
-    props["source"] = {
-        "kind": "postgres",
-        "connection": {"host": "db", "port": 5432, "database": "x", "user": "u"},
-        "mode": "cdc",
-        "streams": ["public.orders"],
-    }
-    props["debezium"] = {
-        "deployment": {"mode": "embedded"},
-        "server": {"sink": server_sink or {"type": "iceberg"}},
-    }
-    return contract
-
-
-class _RecordingRun:
-    """Stands in for ``subprocess.run`` of the Debezium Server binary."""
-
-    def __init__(self) -> None:
-        self.calls: List[Dict[str, Any]] = []
-
-    def __call__(self, argv: List[str], **kwargs: Any) -> subprocess.CompletedProcess:
-        self.calls.append({"argv": argv, **kwargs})
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    """The catalogAuth sink tests' embedded Debezium contract, aimed at a remote catalog."""
+    return _sink_tests._dbz_contract(
+        catalog_auth, server_sink, location=location if location is not None else _location()
+    )
 
 
 @pytest.fixture
-def fake_server(monkeypatch):
-    from fluid_build.build_runners.debezium import runner as dbz_runner
-
-    recorder = _RecordingRun()
-    monkeypatch.setattr(dbz_runner, "resolve_server_binary", lambda _v: "/opt/dbz/run.sh")
-    monkeypatch.setattr(dbz_runner.subprocess, "run", recorder)
-    return recorder
+def fake_server(monkeypatch) -> _RecordingRun:
+    return _sink_tests._install_fake_server(monkeypatch)
 
 
 class _Engine:
