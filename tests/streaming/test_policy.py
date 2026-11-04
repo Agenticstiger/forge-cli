@@ -43,6 +43,7 @@ from fluid_build.streaming.policy import (
     refuse_unless_catalog_secret_allowed,
     refuse_unless_catalog_targets_allowed,
     refuse_unless_deployment_allowed,
+    refuse_unless_source_hosts_allowed,
 )
 from fluid_build.streaming.runtime import (
     Kubectl,
@@ -613,3 +614,41 @@ def test_verify_keeps_the_loopback_exemption_and_apply_does_not(monkeypatch):
             cfg, "https://localhost:8181", environ={}, pod_side=True
         )
     assert refuse_unless_catalog_targets_allowed(cfg, "https://localhost:8181", environ={})
+
+
+@pytest.mark.parametrize(
+    "servers",
+    [
+        "ok/evil.example:9092",
+        "ok?x@evil.example:9092",
+        "ok#x@evil.example:9092",
+        "ok/path:9092",
+        "user@ok:9092",
+        "ok\\evil.example:9092",
+    ],
+)
+def test_a_broker_entry_the_client_could_read_as_another_host_is_refused(servers):
+    # Kafka's client takes the host after any '/', '?', '#' or '@': judging the
+    # text before it would approve 'ok' while the job dials evil.example.
+    cfg = {"source": {"bootstrapServers": servers}}
+    with pytest.raises(FlinkPolicyError) as refused:
+        refuse_unless_source_hosts_allowed(cfg, environ={HOST_ALLOWLIST_ENV: "ok"})
+    assert "characters a host name cannot have" in refused.value.why
+
+
+def test_a_registry_url_with_a_backslash_is_refused():
+    cfg = {
+        "source": {"bootstrapServers": "ok:9092", "schemaRegistryUrl": "http://evil.example\\.ok"}
+    }
+    with pytest.raises(FlinkPolicyError) as refused:
+        refuse_unless_source_hosts_allowed(cfg, environ={HOST_ALLOWLIST_ENV: "ok"})
+    assert "characters a host name cannot have" in refused.value.why
+
+
+@pytest.mark.parametrize(
+    "servers",
+    ["ok:9092", "OK:9092", "kafka-0.ok:9092,kafka_1.ok:9093", "[::1]:9092", "10.0.0.5:9092"],
+)
+def test_a_well_formed_broker_list_still_passes(servers):
+    cfg = {"source": {"bootstrapServers": servers}}
+    refuse_unless_source_hosts_allowed(cfg, environ={HOST_ALLOWLIST_ENV: "ok"})

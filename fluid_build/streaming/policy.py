@@ -55,8 +55,9 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import os
+import re
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Tuple
 from urllib.parse import urlsplit
 
 from fluid_build._errors import FluidUserError, doc_url
@@ -222,6 +223,25 @@ def _refuse(verdict: HostVerdict, role: str, environ: Optional[Mapping[str, str]
     )
 
 
+#: What a host name may be: letters, digits, '.', '-' and '_'. Kafka's client takes the
+#: host after any '/', '?', '#' or '@' in an entry, and Java and Python split a URL with
+#: a backslash differently, so a name with any other character is one the policy and
+#: the deployed job could read as two different hosts.
+_HOST_NAME = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _refuse_unreadable_host(host: str, role: str) -> NoReturn:
+    raise FlinkPolicyError(
+        what=f"the managed Flink lane may not use the {role}",
+        why=(
+            f"Refused because {host!r} has characters a host name cannot have, so the "
+            "deployed job's client could read it as a different host than this check does."
+        ),
+        fix="Name the host with letters, digits, '.', '-' and '_' only, or give an IP address.",
+        doc=doc_url(),
+    )
+
+
 def _is_ip_address(host: str) -> bool:
     try:
         ipaddress.ip_address(host.split("%", 1)[0])
@@ -240,10 +260,14 @@ def refuse_unless_catalog_host_allowed(
     operator lists it. An IP address keeps the deployment host policy, and
     ``localhost`` never leaves the machine or the job's own pod.
     """
+    if "\\" in str(url):
+        _refuse_unreadable_host(str(url), role)
     verdict = host_verdict(url, environ=environ)
     if verdict is not None:
         _refuse(verdict, role, environ)
     host = urlsplit(str(url).strip()).hostname or ""
+    if not _is_ip_address(host) and not _HOST_NAME.fullmatch(host):
+        _refuse_unreadable_host(host, role)
     if _is_ip_address(host) or is_loopback(host) or is_listed(host, environ):
         return
     raise FlinkPolicyError(
@@ -402,6 +426,10 @@ def _kafka_entry_host(entry: str, position: int) -> str:
             raise malformed("has no port")
         if ":" in host:
             raise malformed("is an IPv6 address without brackets")
+        if host and not _HOST_NAME.fullmatch(host):
+            # Kafka's client reads the host after any '/', '?', '#' or '@', so
+            # 'ok/evil.example:9092' would reach evil.example while this read 'ok'.
+            raise malformed("has characters a host name cannot have")
         rest = f":{port}"
     if not host:
         raise malformed("has no host")

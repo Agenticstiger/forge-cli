@@ -216,6 +216,8 @@ def managed_builds(contract: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 
 def _url(value: str, label: str, schemes: tuple[str, ...] = ("http", "https")) -> None:
+    if "\\" in value:  # Python and Java split such a URL into different hosts
+        raise ValueError(f"{label}: a backslash is not allowed in a URL")
     parsed = urlsplit(value)
     if parsed.scheme not in schemes or not parsed.netloc or parsed.username or parsed.password:
         raise ValueError(f"{label}: expected a {schemes} URI without inline credentials")
