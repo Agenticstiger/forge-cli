@@ -1425,7 +1425,11 @@ def run_builds_from_args(
     report = current_apply_run()
     product_id = str(contract.get("id") or "")
 
-    # Filter builds if specific ID requested
+    # Filter builds if specific ID requested. ``fluid apply`` refuses an id no
+    # build has before it applies anything
+    # (``cli/apply.py::_gate_selected_build_for_apply``), so on the OpenTofu
+    # engine it is not refused here after ``tofu apply``; this one stays as the
+    # backstop for any caller that skips it.
     if args.build_id:
         builds = [b for b in builds if b.get("id") == args.build_id]
         if not builds:

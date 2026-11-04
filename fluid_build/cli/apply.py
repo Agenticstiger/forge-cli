@@ -346,6 +346,47 @@ def _gate_build_ids_for_apply(contract: Dict[str, Any]) -> None:
         ) from exc
 
 
+def _gate_selected_build_for_apply(contract: Dict[str, Any], build_id: Optional[str]) -> None:
+    """Refuse, before anything is applied, a ``--build-id`` that names no build.
+
+    The build runner keeps the builds whose id equals ``--build-id`` and, with
+    none left, logs "Build not found" and returns 1. On the OpenTofu engine it
+    runs after ``tofu apply``, so a mistyped id provisioned the product and
+    then failed. This is the runner's own match
+    (``build_runners.base.run_builds_from_args``), run ahead of the hooks,
+    ``tofu`` and the runner on both engines. Like the runner, it checks nothing
+    for an empty ``--build-id``, which filters nothing, or for a contract with
+    no builds, where the runner returns before it filters.
+
+    Raises:
+        CLIError: ``apply_build_id_not_found``.
+    """
+    builds = contract.get("builds") or []
+    if not (isinstance(build_id, str) and build_id) or not builds:
+        return
+    # The runner's filter: an exact match, case and spaces included.
+    if any(isinstance(build, dict) and build.get("id") == build_id for build in builds):
+        return
+    available = [build["id"] for build in builds if isinstance(build, dict) and build.get("id")]
+    if available:
+        why, fix = "no build of the contract has that id", "Pass one of the available ids"
+    else:
+        why, fix = "none of the contract's builds declares an id", "Give the build you mean an id"
+    raise CLIError(
+        1,
+        "apply_build_id_not_found",
+        {
+            "build_id": repr(build_id),
+            "available": available,
+            "hint": (
+                "--build-id selects the build whose id equals it exactly, case and spaces "
+                f"included, and {why}. {fix}, or drop --build-id to run every build. "
+                "Nothing was applied."
+            ),
+        },
+    )
+
+
 def _log_apply_failure(logger: logging.Logger, start_time: float, error: Exception) -> None:
     """Record a pre-dispatch ``apply_contract`` failure for the structured log."""
     log_operation_failure(logger, "apply_contract", error=error, duration=time.time() - start_time)
@@ -2003,12 +2044,14 @@ def run(args, logger: logging.Logger) -> int:
     # skip it, so a schema-invalid contract reached ``tofu`` or the build
     # runner and could exit 0. One call per run, on the one loaded copy.
     # A build mode also checks the ids the build phase turns into paths, which
-    # the schema admits more of: on the OpenTofu engine the runner would only
-    # refuse one after ``tofu apply``.
+    # the schema admits more of, and then that ``--build-id`` names a build, in
+    # the runner's order: on the OpenTofu engine the runner would only refuse
+    # either after ``tofu apply``.
     try:
         _gate_contract_for_apply(source_contract, logger)
         if needs_build(resolved_mode):
             _gate_build_ids_for_apply(source_contract)
+            _gate_selected_build_for_apply(source_contract, resolved_build_id)
     except CLIError as exc:
         _log_apply_failure(logger, start_time, exc)
         raise

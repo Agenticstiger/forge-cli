@@ -276,6 +276,14 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         None,
     ),
+    "apply_build_id_not_found": (
+        [
+            "Pass one of the available build ids as --build-id: ids match exactly, case included",
+            "Run 'fluid apply <contract> --mode amend-and-build' without --build-id to run "
+            + "every build",
+        ],
+        None,
+    ),
     "output_write_failed": (
         ["Check that the --out path is writable and the parent directory exists"],
         None,

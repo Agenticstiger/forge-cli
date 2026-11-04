@@ -265,6 +265,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engines, and refuses with `ERR_APPLY_BUILD_IDENTIFIER_INVALID`, which names the id, says nothing
   was applied and suggests a rename. A mode without a build phase, and a contract without builds,
   are not checked, as before.
+- **A mistyped `--build-id` provisioned the product, then found no build.** The build runner keeps
+  the builds whose id equals `--build-id` and, with none left, logged `Build not found` and exited
+  1, but on the OpenTofu engine it starts after `tofu apply`, so the infrastructure was created
+  first. A build mode now checks `--build-id` against the contract's builds before the apply
+  hooks, `tofu` and the runner, on both engines, and refuses with `ERR_APPLY_BUILD_ID_NOT_FOUND`,
+  which names the id, lists the ids the contract has and says nothing was applied. Ids match
+  exactly, as in the runner. An empty `--build-id` and a contract without builds are not checked,
+  as before. The Command Center run now reports `apply_build_id_not_found`, where it reported
+  `build_not_found:<id>`.
 
 - **A missing optional dependency names the extra to install, and silent fallbacks warn.**
   litellm, the MCP SDK, openlineage, boto3 and duckdb are imported through one gate: when one is
