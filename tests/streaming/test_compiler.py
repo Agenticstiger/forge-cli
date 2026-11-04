@@ -338,3 +338,42 @@ def test_a_bad_partition_source_column_is_labelled(contract):
     assert message.startswith("icebergConfig.partitionSpec[1].sourceColumn: ")
     assert "bad col" in message
 
+
+@pytest.mark.parametrize(
+    "constant,value",
+    [
+        ("_FLINK_VERSION", "v1_21"),
+        ("_JAR_URI", "local:///opt/flink/usrlib/other.jar"),
+        ("_ENTRY_CLASS", "io.fluid.forge.Other"),
+        ("_DEFAULT_TASK_SLOTS", 4),
+        ("_DEFAULT_IDLE_TIMEOUT_MS", 5000),
+        ("_DEFAULT_JOB_MANAGER_MEMORY", "2048m"),
+        ("_DEFAULT_TASK_MANAGER_MEMORY", "4096m"),
+        ("_DEFAULT_PARALLELISM", 2),
+        ("_DEFAULT_CHECKPOINT_INTERVAL_MS", 20000),
+        ("_DEFAULT_CHECKPOINT_TIMEOUT_MS", 240000),
+    ],
+)
+def test_a_constant_or_default_the_contract_does_not_set_changes_the_configmap_name(
+    contract, monkeypatch, constant, value
+):
+    """The ConfigMap is immutable and named by the digest, and its deployment.json
+    carries what the compiler fixes or defaults; changing one must not reuse the name."""
+    import fluid_build.streaming.compiler as compiler
+
+    (original,) = compile_contract(contract)
+    monkeypatch.setattr(compiler, constant, value)
+    (changed,) = compile_contract(contract)
+    assert changed.digest != original.digest
+    assert changed.resources[0]["metadata"]["name"] != original.resources[0]["metadata"]["name"]
+    assert changed.resources[0]["data"]["deployment.json"] != (
+        original.resources[0]["data"]["deployment.json"]
+    )
+
+
+def test_the_configmap_name_the_deployment_mounts_is_the_one_it_is_named_by(contract):
+    (artifact,) = compile_contract(contract)
+    config_map, deployment = artifact.resources
+    (volume,) = deployment["spec"]["podTemplate"]["spec"]["volumes"]
+    assert volume["configMap"]["name"] == config_map["metadata"]["name"]
+    assert json.loads(config_map["data"]["deployment.json"]) == deployment["spec"]

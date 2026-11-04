@@ -44,6 +44,21 @@ from fluid_build.util.contract import is_externally_run_build
 #: ``parameters.flink`` stays what it was: free-form settings of a job that
 #: runs elsewhere, which forge-cli does not read.
 _MANAGED_SINCE = "0.7.7"
+#: What the rendered FlinkDeployment fixes or defaults, whatever the contract says.
+#: The digest covers the rendered spec, so changing one names a new ConfigMap.
+_FLINK_VERSION = "v1_20"
+_JAR_URI = "local:///opt/flink/usrlib/forge-sql-runner.jar"
+_ENTRY_CLASS = "io.fluid.forge.ForgeSqlRunner"
+_DEFAULT_PARALLELISM = 1
+_DEFAULT_TASK_SLOTS = 2
+_DEFAULT_IDLE_TIMEOUT_MS = 60000
+_DEFAULT_CHECKPOINT_INTERVAL_MS = 10000
+_DEFAULT_CHECKPOINT_TIMEOUT_MS = 120000
+_DEFAULT_JOB_MANAGER_MEMORY = "1024m"
+_DEFAULT_TASK_MANAGER_MEMORY = "2048m"
+#: Stands for the ConfigMap's name inside the spec the digest is taken of: the name
+#: is made from the digest, so it cannot be in what the digest covers.
+_CONFIGMAP_PLACEHOLDER = "<configmap>"
 #: Products whose own properties.sql the operator lets apply deploy
 #: (streaming.policy.refuse_unless_contract_sql_allowed). Defined here, not in
 #: streaming.policy, because validate reaches this module and must not import
@@ -352,8 +367,8 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
         for b in uris[i + 1 :]
     ):
         raise ValueError("Checkpoint, savepoint and HA storage prefixes must not overlap")
-    checkpoint_ms = deployment.get("checkpointIntervalMs", 10000)
-    if deployment.get("checkpointTimeoutMs", 120000) <= checkpoint_ms:
+    checkpoint_ms = deployment.get("checkpointIntervalMs", _DEFAULT_CHECKPOINT_INTERVAL_MS)
+    if deployment.get("checkpointTimeoutMs", _DEFAULT_CHECKPOINT_TIMEOUT_MS) <= checkpoint_ms:
         raise ValueError("checkpointTimeoutMs must exceed checkpointIntervalMs")
     event_time = source.get("eventTime")
     watermark = ""
@@ -484,12 +499,79 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
         f" WITH (\n  {_options(source_options)}\n)",
         f"INSERT INTO {target_name}\n{query}",
     )
+    config = {
+        "execution.checkpointing.interval": f"{checkpoint_ms} ms",
+        "execution.checkpointing.timeout": f"{deployment.get('checkpointTimeoutMs', _DEFAULT_CHECKPOINT_TIMEOUT_MS)} ms",
+        "execution.checkpointing.mode": "EXACTLY_ONCE",
+        "execution.checkpointing.externalized-checkpoint-retention": "RETAIN_ON_CANCELLATION",
+        "state.checkpoints.dir": deployment["checkpointUri"],
+        "state.savepoints.dir": deployment["savepointUri"],
+        "high-availability.type": "kubernetes",
+        "high-availability.storageDir": deployment["haUri"],
+        "taskmanager.numberOfTaskSlots": str(deployment.get("taskSlots", _DEFAULT_TASK_SLOTS)),
+        "table.exec.source.idle-timeout": f"{deployment.get('idleTimeoutMs', _DEFAULT_IDLE_TIMEOUT_MS)} ms",
+        "kubernetes.operator.job.upgrade.last-state-fallback.enabled": "false",
+    }
+    storage_options = catalog_options
+    if storage_options.get("s3.endpoint"):
+        config["s3.endpoint"] = storage_options["s3.endpoint"]
+    if storage_options.get("s3.path-style-access"):
+        config["s3.path.style.access"] = storage_options["s3.path-style-access"]
+    if storage_options.get("client.region"):
+        config["s3.endpoint.region"] = storage_options["client.region"]
+    spec: dict[str, Any] = {
+        "image": deployment["image"],
+        "flinkVersion": _FLINK_VERSION,
+        "serviceAccount": deployment["serviceAccount"],
+        "flinkConfiguration": config,
+        "jobManager": {
+            "resource": {
+                "memory": deployment.get("jobManagerMemory", _DEFAULT_JOB_MANAGER_MEMORY),
+                "cpu": 1,
+            }
+        },
+        "taskManager": {
+            "resource": {
+                "memory": deployment.get("taskManagerMemory", _DEFAULT_TASK_MANAGER_MEMORY),
+                "cpu": 1,
+            }
+        },
+        "podTemplate": {
+            "spec": {
+                "containers": [
+                    {
+                        "name": "flink-main-container",
+                        "envFrom": [
+                            {"secretRef": {"name": s}} for s in deployment.get("secretRefs", [])
+                        ],
+                        "volumeMounts": [
+                            {"name": "forge-sql", "mountPath": "/etc/forge", "readOnly": True}
+                        ],
+                    }
+                ],
+                "volumes": [{"name": "forge-sql", "configMap": {"name": _CONFIGMAP_PLACEHOLDER}}],
+            }
+        },
+        "job": {
+            "jarURI": _JAR_URI,
+            "entryClass": _ENTRY_CLASS,
+            "args": ["/etc/forge/job.properties"],
+            "parallelism": deployment.get("parallelism", _DEFAULT_PARALLELISM),
+            "upgradeMode": "savepoint",
+            "allowNonRestoredState": False,
+            "state": deployment.get("state", "running"),
+        },
+    }
     payload = {
-        "artifactVersion": "flink-iceberg-v1",
+        "artifactVersion": "flink-iceberg-v2",
         "product": contract.get("id"),
         "build": bid,
         "statements": statements,
         "deployment": deployment,
+        # Everything the deployment renders, so a constant or a default that the
+        # contract does not set still changes the digest and with it the ConfigMap's
+        # name: the ConfigMap is immutable, and its deployment.json carries them.
+        "spec": spec,
         "targetSchema": (target.get("contract") or {}).get("schema"),
     }
     digest = hashlib.sha256(
@@ -508,26 +590,7 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
             "fluid.build/build": bid,
         },
     }
-    config = {
-        "execution.checkpointing.interval": f"{checkpoint_ms} ms",
-        "execution.checkpointing.timeout": f"{deployment.get('checkpointTimeoutMs', 120000)} ms",
-        "execution.checkpointing.mode": "EXACTLY_ONCE",
-        "execution.checkpointing.externalized-checkpoint-retention": "RETAIN_ON_CANCELLATION",
-        "state.checkpoints.dir": deployment["checkpointUri"],
-        "state.savepoints.dir": deployment["savepointUri"],
-        "high-availability.type": "kubernetes",
-        "high-availability.storageDir": deployment["haUri"],
-        "taskmanager.numberOfTaskSlots": str(deployment.get("taskSlots", 2)),
-        "table.exec.source.idle-timeout": f"{deployment.get('idleTimeoutMs', 60000)} ms",
-        "kubernetes.operator.job.upgrade.last-state-fallback.enabled": "false",
-    }
-    storage_options = catalog_options
-    if storage_options.get("s3.endpoint"):
-        config["s3.endpoint"] = storage_options["s3.endpoint"]
-    if storage_options.get("s3.path-style-access"):
-        config["s3.path.style.access"] = storage_options["s3.path-style-access"]
-    if storage_options.get("client.region"):
-        config["s3.endpoint.region"] = storage_options["client.region"]
+    spec["podTemplate"]["spec"]["volumes"][0]["configMap"]["name"] = cm_name
     config_map: dict[str, Any] = {
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -545,43 +608,7 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
         "apiVersion": "flink.apache.org/v1beta1",
         "kind": "FlinkDeployment",
         "metadata": metadata,
-        "spec": {
-            "image": deployment["image"],
-            "flinkVersion": "v1_20",
-            "serviceAccount": deployment["serviceAccount"],
-            "flinkConfiguration": config,
-            "jobManager": {
-                "resource": {"memory": deployment.get("jobManagerMemory", "1024m"), "cpu": 1}
-            },
-            "taskManager": {
-                "resource": {"memory": deployment.get("taskManagerMemory", "2048m"), "cpu": 1}
-            },
-            "podTemplate": {
-                "spec": {
-                    "containers": [
-                        {
-                            "name": "flink-main-container",
-                            "envFrom": [
-                                {"secretRef": {"name": s}} for s in deployment.get("secretRefs", [])
-                            ],
-                            "volumeMounts": [
-                                {"name": "forge-sql", "mountPath": "/etc/forge", "readOnly": True}
-                            ],
-                        }
-                    ],
-                    "volumes": [{"name": "forge-sql", "configMap": {"name": cm_name}}],
-                }
-            },
-            "job": {
-                "jarURI": "local:///opt/flink/usrlib/forge-sql-runner.jar",
-                "entryClass": "io.fluid.forge.ForgeSqlRunner",
-                "args": ["/etc/forge/job.properties"],
-                "parallelism": deployment.get("parallelism", 1),
-                "upgradeMode": "savepoint",
-                "allowNonRestoredState": False,
-                "state": deployment.get("state", "running"),
-            },
-        },
+        "spec": spec,
     }
     config_map["data"]["deployment.json"] = json.dumps(manifest["spec"], sort_keys=True)
     if sum(len(value.encode("utf-8")) for value in config_map["data"].values()) > 1024 * 1024:
