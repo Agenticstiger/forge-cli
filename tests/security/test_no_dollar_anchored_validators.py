@@ -93,9 +93,9 @@ from typing import (
 import pytest
 
 try:  # Python 3.11+: the parser ``re`` itself uses
-    from re import _constants as _sre
-    from re import _parser as _sre_parse
-except ImportError:  # Python 3.10
+    _sre = re._constants
+    _sre_parse = re._parser
+except AttributeError:  # Python 3.10, where ``re`` is one module
     import sre_constants as _sre  # type: ignore[no-redef]
     import sre_parse as _sre_parse  # type: ignore[no-redef]
 
