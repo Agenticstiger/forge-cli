@@ -791,13 +791,13 @@ def _localstack_ready() -> tuple[bool, str]:
     if os.environ.get("FLUID_IAC_LIVE_LOCALSTACK", "").strip().lower() not in _TRUE:
         return False, "live LocalStack tests are opt-in — set FLUID_IAC_LIVE_LOCALSTACK=1"
     try:
-        import requests  # noqa: F401 — verify present
+        import httpx  # noqa: F401 — verify present
     except ImportError:
-        return False, "the `requests` package is not installed"
+        return False, "the `httpx` package is not installed"
     try:
-        import requests
+        import httpx
 
-        resp = requests.get(f"{LOCALSTACK_ENDPOINT}/_localstack/health", timeout=5)
+        resp = httpx.get(f"{LOCALSTACK_ENDPOINT}/_localstack/health", timeout=5)
         if resp.status_code != 200:
             return False, f"LocalStack health at {LOCALSTACK_ENDPOINT} returned {resp.status_code}"
     except Exception as exc:  # noqa: BLE001
@@ -873,11 +873,11 @@ def _localstack_reset(endpoint: str = LOCALSTACK_ENDPOINT) -> None:
     (S3 buckets, Glue databases, Lambdas, …) so the next test sees an
     empty account. The default account ID stays ``000000000000``.
     """
-    import requests
+    import httpx
 
     with contextlib.suppress(Exception):
         # POST is the documented method; GET works on some Pro versions.
-        requests.post(f"{endpoint}/_localstack/state/reset", timeout=15)
+        httpx.post(f"{endpoint}/_localstack/state/reset", timeout=15)
 
 
 class LocalStackProject:

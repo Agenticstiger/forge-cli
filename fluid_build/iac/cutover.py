@@ -47,23 +47,27 @@ def default_engine(provider: str) -> str:
     — it is the strangler-fig cutover switch, and a cloud with an emitter but
     no entry in the set is deliberately still on its native path.
 
-    An **out-of-tree** cloud, registered through the ``fluid_build.iac_providers``
-    entry-point group, cannot appear in that frozenset without a core edit —
-    which is precisely the "zero edits to forge-cli core" promise
-    ``registry.py`` makes. Such a plugin exists only to emit an OpenTofu
-    module, so it routes to the OpenTofu engine automatically. Before this,
-    ``default_engine("<plugin-cloud>")`` returned ``native`` and the IaC path
-    the plugin was written for was never selected.
+    An **out-of-tree** cloud, served by an entry point in the
+    ``fluid_build.iac_providers`` group, cannot appear in that frozenset without
+    a core edit. Such a plugin exists only to emit an OpenTofu module, so a
+    platform it serves routes to the OpenTofu engine. This is the point where
+    the plugin is loaded (``get_iac_plugin``): only a platform that is not
+    in-tree and not ``local`` triggers an entry-point lookup, and a plugin the
+    allow/block policy or the version gate refused routes ``native``, so it
+    is reported as unsupported rather than half-run.
     """
     if provider in OPENTOFU_DEFAULT_PROVIDERS:
         return "opentofu"
     # Local import: ``iac/__init__`` pulls every provider plugin, and this
     # module is imported on the apply cold path.
     try:
-        from .registry import IAC_ENTRYPOINT_PLUGINS
+        from .registry import IAC_ENTRYPOINT_PLUGINS, get_iac_plugin
 
-        if provider in IAC_ENTRYPOINT_PLUGINS:
-            return "opentofu"
+        # Only a plugin LOADED from the entry-point group counts: an in-tree
+        # cloud missing from the frozenset is deliberately still native.
+        if provider and get_iac_plugin(provider) is not None:
+            if provider.strip().lower().replace("-", "_") in IAC_ENTRYPOINT_PLUGINS:
+                return "opentofu"
     except Exception:  # noqa: BLE001 — registry unavailable → the safe default
         pass
     return "native"

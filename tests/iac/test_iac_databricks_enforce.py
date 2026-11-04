@@ -175,7 +175,7 @@ def test_a_second_run_executes_nothing(fake):
     assert again.said == []
 
 
-def test_a_changed_predicate_binds_a_new_function_and_keeps_the_old_one(fake):
+def test_a_changed_predicate_binds_a_new_function_and_drops_the_old_one_after_the_apply(fake):
     seed(fake)
     Run(fake).pre(contract())
     old = live(fake)["row_filter"]["function_name"]
@@ -184,14 +184,17 @@ def test_a_changed_predicate_binds_a_new_function_and_keeps_the_old_one(fake):
     changed = contract(filters=[{**FILTER, "where": "consent_data_analytics = false"}])
     run = Run(fake)
     run.pre(changed)
+    assert old in fake.functions, "pre_apply drops nothing"
     run.post(changed)
 
     new = live(fake)["row_filter"]
     assert new["function_name"] != old
     assert new["input_column_names"] == ["consent_data_analytics"]
-    assert old in fake.functions, "a superseded function is not dropped"
+    assert old not in fake.functions, "the superseded function is dropped once the apply is done"
     assert live_masks(fake) == masks
-    assert not any(s.startswith("DROP") for s in run.statements())
+    assert [s for s in run.statements() if s.startswith("DROP")] == [
+        f"DROP FUNCTION IF EXISTS `main`.`cp360`.`{old.rsplit('.', 1)[1]}`"
+    ]
     assert len([s for s in run.statements() if s.startswith("CREATE FUNCTION")]) == 1
 
 
@@ -1048,6 +1051,158 @@ def test_a_read_failure_before_the_apply_still_stops_the_run(fake):
         Run(fake).pre(contract())
 
 
+# ── orphan functions: what a changed contract leaves behind ─────────────────
+OTHER_FILTER = {"principal": ANALYSTS, "where": "is_suppressed = false"}
+
+
+def _fluid_functions(fake: FakeDatabricks) -> set:
+    return {n for n in fake.functions if n.rsplit(".", 1)[1].startswith("fluid_")}
+
+
+def _changed_contract_applied(fake: FakeDatabricks):
+    """Apply a contract, then one whose row filter differs: the first filter is superseded."""
+    seed(fake)
+    Run(fake).pre(contract())
+    first = live(fake)["row_filter"]["function_name"]
+    changed = contract(filters=[OTHER_FILTER])
+    return first, changed
+
+
+def test_a_superseded_function_is_dropped_after_a_successful_apply_and_said(fake):
+    first, changed = _changed_contract_applied(fake)
+    run = Run(fake)
+    run.pre(changed)
+    assert first in fake.functions, "pre_apply keeps it until the apply has succeeded"
+    run.post(changed)
+    assert first not in fake.functions
+    now = live(fake)["row_filter"]["function_name"]
+    assert now in fake.functions and now != first
+    assert f"DROP FUNCTION IF EXISTS `main`.`cp360`.`{first.rsplit('.', 1)[1]}`" in run.statements()
+    assert f"dropped superseded function {first}" in run.text
+    assert all(f in fake.functions for f in live_masks(fake).values())
+
+
+def test_a_function_bound_to_any_table_in_the_schema_is_never_dropped(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.create_table("main.cp360.other", [("a", "string", True)])
+    fake.tables["main.cp360.other"]["row_filter"] = {
+        "function_name": first,
+        "input_column_names": [],
+    }
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert first in fake.functions
+    assert "DROP FUNCTION" not in "\n".join(run.statements())
+
+
+def test_only_this_tables_fluid_functions_are_dropped(fake):
+    first, changed = _changed_contract_applied(fake)
+    keep = [
+        "main.cp360.my_helper",  # no fluid_ prefix
+        "main.cp360.fluid_rf_profile_x_deadbeef",  # another table's name
+        "main.cp360.fluid_rf_profile_deadbeef_extra",  # not this module's naming
+        "main.cp360.fluid_mask_profile_nosuchcolumn_deadbeef",  # no such column on the table
+    ]
+    for name in keep:
+        fake.add_function(name, [("val", "STRING")], "STRING", "`val`")
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert first not in fake.functions
+    assert all(name in fake.functions for name in keep)
+
+
+def test_an_orphan_not_owned_by_the_deploy_identity_is_left_and_named(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.functions[first]["owner"] = "someone-else@example.test"
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert first in fake.functions
+    assert "DROP FUNCTION" not in "\n".join(run.statements())
+    assert f"left function {first}: owned by someone-else@example.test, not by the deploy " in (
+        run.text
+    )
+
+
+def test_an_orphan_whose_owner_cannot_be_read_is_left_and_named(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.fail_route("GET", rf"/functions/{first}$", 503, "unavailable")
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert first in fake.functions
+    assert f"left function {first}: owner unknown" in run.text
+
+
+def test_nothing_is_dropped_after_a_failed_apply(fake):
+    first, changed = _changed_contract_applied(fake)
+    run = Run(fake)
+    PLUGIN.post_apply(
+        changed, say=run.said.append, client_factory=fake.client, after_failed_apply=True
+    )
+    assert first in fake.functions
+    assert "DROP FUNCTION" not in "\n".join(run.statements())
+
+
+def test_nothing_is_dropped_when_a_bind_fails(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError):
+        run.post(changed)
+    assert first in fake.functions
+    assert "DROP FUNCTION" not in "\n".join(run.statements())
+
+
+def test_a_schema_whose_tables_cannot_all_be_read_drops_nothing_and_says_so(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.create_table("main.cp360.other", [("a", "string", True)])
+    Run(fake).pre(changed)
+    fake.fail_route("GET", r"/tables/main\.cp360\.other$", 503, "unavailable")
+    run = Run(fake)
+    run.post(changed)
+    assert first in fake.functions
+    assert "orphan" in run.text and "not dropped" in run.text
+
+
+def test_the_orphan_drop_follows_pages_of_functions(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.list_page_size = 1
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert first not in fake.functions
+
+
+def test_an_orphan_whose_drop_fails_is_kept_named_and_the_apply_still_succeeds(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.fail_on("DROP FUNCTION", "[PERMISSION_DENIED] cannot drop")
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert first in fake.functions
+    assert f"note: superseded function {first} was not dropped" in run.text
+    assert "PERMISSION_DENIED" in run.text
+
+
+def test_the_orphan_drop_lists_the_tables_it_may_only_browse_too(fake):
+    first, changed = _changed_contract_applied(fake)
+    seen: List[Any] = []
+    real = fake._list_tables
+
+    def spy(m, q, b):
+        seen.append(q)
+        return real(m, q, b)
+
+    fake.routes = [(mth, rx, spy if fn == real else fn) for mth, rx, fn in fake.routes]
+    run = Run(fake)
+    run.pre(changed)
+    run.post(changed)
+    assert any((q.get("include_browse") or [""])[0] == "true" for q in seen), seen
+
+
 # ── the fail-safe: a deny-all filter, then a lock ───────────────────────────
 def _holders(fake: FakeDatabricks) -> Dict[str, List[str]]:
     return {p: v for p, v in fake.grants[("table", TABLE)].items() if v}
@@ -1113,6 +1268,7 @@ def test_when_the_deny_all_filter_fails_select_is_revoked_from_every_grantee_but
     fake.grant("table", TABLE, "power-group", "ALL_PRIVILEGES")
     fake.grant("table", TABLE, "fake-user@example.test", "SELECT")  # the table's owner
     fake.grant("table", TABLE, "modifier", "MODIFY")
+    fake.grant("schema", "main.cp360", "browsers", "USE_SCHEMA")  # inherited, but not a read
     fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
     run = Run(fake)
     with pytest.raises(UnsupportedBindingError) as exc:
@@ -1127,6 +1283,57 @@ def test_when_the_deny_all_filter_fails_select_is_revoked_from_every_grantee_but
     assert "every grantee but its owner" in message
     assert "other-group" in message and "power-group" in message
     assert "No grant inherited from the schema or the catalog was found open" in message
+
+
+def test_the_lock_never_revokes_from_the_deploy_identity_when_the_owner_is_unreadable(fake):
+    seed(fake)
+    fake.grant("table", TABLE, DEPLOY_USER, "SELECT")  # this run's own identity
+    fake.grant("table", TABLE, "other-group", "SELECT")
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    fake.fail_route("GET", r"/tables/main\.cp360\.profile$", 503, "unavailable")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        run.post(contract())
+    revokes = [s for s in fake.sql_log if s.startswith("REVOKE")]
+    assert not any(DEPLOY_USER in s for s in revokes), "the run must not lock itself out"
+    assert any("other-group" in s for s in revokes)
+    assert fake.grants[("table", TABLE)][DEPLOY_USER] == ["SELECT"]
+    assert "owner could not be read, so it could not be skipped" in str(exc.value)
+
+
+def test_the_lock_skips_the_deploy_identity_when_it_is_not_the_owner(fake):
+    seed(fake)
+    fake.tables[TABLE]["owner"] = "someone-else@example.test"
+    fake.grant("table", TABLE, DEPLOY_USER, "SELECT")
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    with pytest.raises(UnsupportedBindingError) as exc:
+        Run(fake).post(contract())
+    assert fake.grants[("table", TABLE)][DEPLOY_USER] == ["SELECT"]
+    assert "could not be skipped" not in str(exc.value)
+
+
+def test_an_owner_the_contract_restricts_is_named_as_a_path_the_lock_cannot_close(fake):
+    seed(fake)
+    fake.tables[TABLE]["owner"] = ANALYSTS_GROUP  # the owner is a restricted group
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    with pytest.raises(UnsupportedBindingError) as exc:
+        Run(fake).post(contract())
+    message = str(exc.value)
+    assert "Still open:" in message
+    assert f"{ANALYSTS_GROUP} owns {TABLE}" in message
+    assert "ALTER TABLE `main`.`cp360`.`profile` OWNER TO" in message
+    assert "No grant inherited" not in message
+
+
+def test_effective_permissions_with_no_inherited_field_do_not_claim_nothing_is_open(fake):
+    seed(fake)
+    fake.fail_on("SET ROW FILTER", "[INTERNAL_ERROR] x")
+    run = Run(fake)
+    with pytest.raises(UnsupportedBindingError) as exc:
+        run.post(contract())
+    message = str(exc.value)
+    assert "could not determine whether a schema or catalog grant is open" in message
+    assert "No grant inherited" not in message
 
 
 def test_a_grant_inherited_from_the_schema_or_catalog_is_named_with_what_to_run(fake):
@@ -1236,6 +1443,26 @@ def test_a_job_is_unpaused_once_the_live_bindings_match(workspace_client):
     Run(fake).pre(contract())
     job = _emitted_job(_job_contract())
     assert job["schedule"]["pause_status"] == "UNPAUSED"
+    assert not any("is created paused" in n for n in PLUGIN.plan_notices(_job_contract()))
+
+
+def test_the_pause_decision_is_made_once_and_the_notice_reuses_it(workspace_client):
+    fake = workspace_client
+    seed(fake)
+    Run(fake).pre(contract())  # bound: a fresh read would say "protected"
+    fake.fail_route("GET", r"/tables/main\.cp360\.profile$", 503, "unavailable")
+    assert _emitted_job(_job_contract())["schedule"]["pause_status"] == "PAUSED"
+    fake.failing_routes.clear()  # the read error was transient
+    notices = "\n".join(PLUGIN.plan_notices(_job_contract()))
+    assert "is created paused" in notices and "main.cp360.profile" in notices
+
+
+def test_the_notice_is_not_reused_by_a_later_run(workspace_client):
+    fake = workspace_client
+    seed(fake)
+    assert _emitted_job(_job_contract())["schedule"]["pause_status"] == "PAUSED"
+    assert "is created paused" in "\n".join(PLUGIN.plan_notices(_job_contract()))
+    Run(fake).pre(contract())  # a later run, with no emit before its notices
     assert not any("is created paused" in n for n in PLUGIN.plan_notices(_job_contract()))
 
 

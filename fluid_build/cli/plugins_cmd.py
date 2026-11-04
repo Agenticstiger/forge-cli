@@ -23,12 +23,13 @@ load. The listing itself reads entry-point *names* only (see
 ALLOWED plugins to read their declared metadata.
 
 **This command does not give you a plugin-free process.** CLI bootstrap builds
-the whole argparse tree before dispatch, and two roles feed argparse
-``choices=`` from their registries — ``iac_provider`` (via
-``cli/generate_iac.py``) and ``modeling_technique`` (via
-``cli/forge_data_model.py``). Their entry points are therefore ``ep.load()``-ed
-on **every** invocation, ``fluid --version`` and ``fluid plugins`` included.
-The ``command`` role is genuinely lazy and is not imported until dispatched.
+the whole argparse tree before dispatch, and the ``modeling_technique`` role
+feeds argparse ``choices=`` from its registry (via ``cli/forge_data_model.py``),
+so its entry points are ``ep.load()``-ed on **every** invocation, ``fluid
+--version`` and ``fluid plugins`` included. The ``iac_provider`` role is lazy:
+only its entry-point *names* are read, and a plugin is imported the first time a
+contract's platform needs it (or before a destructive apply attributes a state).
+The ``command`` role is also not imported until dispatched.
 
 To inspect an untrusted plugin set without executing it, block it first::
 

@@ -44,9 +44,8 @@ dependencies = [
   "pydantic>=2.7",
   "typing-extensions>=4.8",
   "jinja2>=3.1.6",  # security: >=3.1.6 closes CVE-2025-27516 (sandbox escape via |attr)
-  "httpx>=0.27",  # For FluidCommandCenter catalog provider
+  "httpx>=0.27",  # The one HTTP client: Command Center, Data Mesh Manager, marketplace, reporter
   "h11>=0.16",  # security: pin transitive h11 >=0.16 to close CVE-2025-43859 (chunked request smuggling)
-  "requests>=2.32.5",  # For Data Mesh Manager catalog publishing and shared HTTP helpers
   # LiteLLM is the canonical LLM backend (was an opt-in extra). It
   # replaces ~1,300 lines of per-provider wire-format code with one
   # unified API across openai / anthropic / gemini / bedrock / azure /
@@ -528,6 +527,21 @@ snowflake = "fluid_build.providers.snowflake:SnowflakeProvider"
 # coding agents) always win — a plugin can never silently shadow a built-in.
 # Built-ins are seeded in code, so this group is declared by THIRD-PARTY
 # packages only (listing the built-ins here would self-shadow).
+
+# OpenTofu emitters for an additional platform are a discovered plugin group
+# (``iac/registry.py``). A third-party package ships one so that installing it
+# makes ``binding.platform: <name>`` compile through ``fluid generate iac`` and
+# apply through the OpenTofu engine, with no core edit:
+#
+#     [project.entry-points."fluid_build.iac_providers"]
+#     onprem = "my_pkg.iac:OnPremIacPlugin"   # an IacProviderPlugin class/instance
+#
+# Loaded lazily, by name, when a contract's platform needs it (never at import,
+# so ``fluid --help`` / ``fluid providers`` run no plugin code). Governed by
+# FLUID_PLUGINS_ALLOWLIST / FLUID_PLUGINS_BLOCKLIST and the ``requires_cli`` gate.
+# Built-in platform names (aws / gcp / snowflake / confluent / databricks, their
+# aliases, local) are reserved: an entry point claiming one is skipped before it
+# is imported. Declared by THIRD-PARTY packages only.
 
 [project.urls]
 Homepage = "https://agenticstiger.github.io/forge_docs/"

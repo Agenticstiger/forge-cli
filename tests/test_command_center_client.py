@@ -16,7 +16,9 @@
 
 from unittest.mock import MagicMock, mock_open, patch
 
+import httpx
 import pytest
+import respx
 
 from fluid_build.cli._command_center import (
     CommandCenterClient,
@@ -97,40 +99,27 @@ class TestCommandCenterClient:
 
     @patch.object(CommandCenterClient, "_detect_url", return_value="http://localhost:8000")
     def test_check_availability_success(self, _mock_detect):
-        mock_health_response = MagicMock()
-        mock_health_response.status_code = 200
-
-        mock_head_response = MagicMock()
-        mock_head_response.status_code = 200
-
-        mock_version_response = MagicMock()
-        mock_version_response.status_code = 200
-        mock_version_response.json.return_value = {"version": "2.0.0"}
-
-        with (
-            patch(
-                "fluid_build.cli._command_center.requests.get",
-                side_effect=[mock_health_response, mock_version_response],
-            ),
-            patch(
-                "fluid_build.cli._command_center.requests.head",
-                return_value=mock_head_response,
-            ),
-        ):
+        with respx.mock(assert_all_called=False) as router:
+            router.get("http://localhost:8000/health").respond(200)
+            router.head(url__regex=r"http://localhost:8000/api/.*").respond(200)
+            router.get("http://localhost:8000/api/v1/version").respond(
+                200, json={"version": "2.0.0"}
+            )
             client = CommandCenterClient()
             assert client.available is True
 
     @patch.object(CommandCenterClient, "_detect_url", return_value="http://localhost:8000")
     def test_check_availability_failure(self, _mock_detect):
-        with patch(
-            "fluid_build.cli._command_center.requests.get",
-            side_effect=Exception("connection refused"),
-        ):
+        with respx.mock() as router:
+            router.get("http://localhost:8000/health").mock(
+                side_effect=httpx.ConnectError("connection refused")
+            )
             client = CommandCenterClient()
             assert client.available is False
 
     @patch.object(CommandCenterClient, "_detect_url", return_value="http://localhost:8000")
-    def test_check_availability_requests_not_available(self, _mock_detect):
-        with patch("fluid_build.cli._command_center.REQUESTS_AVAILABLE", False):
+    def test_check_availability_health_not_ok(self, _mock_detect):
+        with respx.mock() as router:
+            router.get("http://localhost:8000/health").respond(503)
             client = CommandCenterClient()
             assert client.available is False

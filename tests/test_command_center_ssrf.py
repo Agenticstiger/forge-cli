@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import respx
+
 from fluid_build.cli._command_center import (
     CommandCenterClient,
 )
@@ -152,31 +154,35 @@ class TestReporterSsrfGate:
 
 class TestClientCheckAvailabilityGate:
     def test_check_availability_refuses_metadata_url(self, monkeypatch):
-        """``_check_availability`` must bail before any ``requests``
-        call when the configured URL is the metadata service."""
+        """``_check_availability`` must bail before any HTTP request
+        when the configured URL is the metadata service."""
         monkeypatch.setenv("FLUID_COMMAND_CENTER_URL", "http://169.254.169.254")
-        with patch("fluid_build.cli._command_center.requests") as mock_requests:
+        with respx.mock(assert_all_called=False) as router:
+            # A catch-all that answers 200: any attempted request is recorded
+            # (an unmocked request would be an error the client swallows, so
+            # ``router.calls`` would stay empty and prove nothing).
+            router.route().respond(200)
             client = CommandCenterClient()
         assert client.available is False
         # No HTTP probe should have been issued.
-        assert not mock_requests.get.called
-        assert not mock_requests.head.called
+        assert not router.calls
 
     def test_check_availability_refuses_rfc1918_url(self, monkeypatch):
         monkeypatch.setenv("FLUID_COMMAND_CENTER_URL", "http://10.0.0.9:8000")
-        with patch("fluid_build.cli._command_center.requests") as mock_requests:
+        with respx.mock(assert_all_called=False) as router:
+            router.route().respond(200)  # records any attempted request
             client = CommandCenterClient()
         assert client.available is False
-        assert not mock_requests.get.called
+        assert not router.calls
 
     def test_check_availability_probes_localhost_default(self, monkeypatch):
         """Localhost (the default) is allowed — the probe IS issued."""
         monkeypatch.delenv("FLUID_COMMAND_CENTER_URL", raising=False)
         monkeypatch.setenv("FLUID_DISABLE_CC_DETECTION", "false")
-        with patch("fluid_build.cli._command_center.requests") as mock_requests:
-            mock_requests.get.return_value = MagicMock(status_code=500)
-            mock_requests.exceptions = __import__("requests").exceptions  # real exception classes
+        with respx.mock(assert_all_called=False) as router:
+            health = router.get(url__regex=r"http://[^/]+/health").respond(500)
             client = CommandCenterClient()
         # Localhost default must reach the probe (status 500 → unavailable,
         # but the request WAS attempted, proving the gate let it through).
-        assert mock_requests.get.called
+        assert health.called
+        assert client.available is False

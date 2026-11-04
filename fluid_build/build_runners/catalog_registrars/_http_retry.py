@@ -45,12 +45,10 @@ Borrow-before-build receipts:
 
 from __future__ import annotations
 
-import email.utils
 import logging
 import random
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Callable, FrozenSet, Optional, TypeVar
 
 # Retryable HTTP status codes — mirrors DataHub's
@@ -115,28 +113,9 @@ def retry_after_seconds(exc: BaseException) -> Optional[float]:
 
     if not isinstance(exc, httpx.HTTPStatusError):
         return None
-    raw = exc.response.headers.get("Retry-After")
-    if not raw:
-        return None
-    raw = raw.strip()
-    try:
-        secs = float(int(raw))
-        return secs if secs >= 0 else None
-    except ValueError:
-        pass
-    # HTTP-date form → seconds from now. ``parsedate_to_datetime``
-    # returns ``None`` on some Pythons and raises ``ValueError`` /
-    # ``TypeError`` on others for a malformed value — handle both.
-    try:
-        parsed = email.utils.parsedate_to_datetime(raw)
-    except (ValueError, TypeError):
-        return None
-    if parsed is None:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    delta = (parsed - datetime.now(timezone.utc)).total_seconds()
-    return max(0.0, delta)
+    from fluid_build.util.http_client import parse_retry_after
+
+    return parse_retry_after(exc.response.headers.get("Retry-After"))
 
 
 def compute_delay(attempt: int, policy: RetryPolicy, retry_after: Optional[float] = None) -> float:
