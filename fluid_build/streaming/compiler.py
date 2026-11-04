@@ -315,7 +315,9 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
     spec = props["stream"]
     if isinstance(spec, Mapping):
         reject_uncompiled_rules(spec.get("schema"))
-        reject_uncompiled_rules((spec.get("key") or {}).get("schema"))
+        key = spec.get("key")
+        if isinstance(key, Mapping):
+            reject_uncompiled_rules(key.get("schema"))
     stream = parse_stream(spec, f"Flink build {bid}: properties.stream")
     source = cfg["source"]
     registry = source.get("schemaRegistryUrl")
@@ -356,6 +358,12 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
         dtype = stream.columns.get(name)
         if dtype is None or dtype.kind not in {"timestamp", "timestamp_ltz"}:
             raise ValueError("eventTime.column must identify a top-level timestamp")
+        # Flink accepts a rowtime of precision 0 to 3 only, and the stream's default is 6.
+        if (6 if dtype.precision is None else dtype.precision) > 3:
+            raise ValueError(
+                "eventTime.column must be a timestamp of precision 3 or less, such as "
+                "timestamp_ltz(3): Flink's event time is milliseconds"
+            )
         watermark = (
             f",\n  WATERMARK FOR `{name}` AS `{name}`"
             f" - INTERVAL '{event_time['delaySeconds']}' SECOND"
@@ -640,7 +648,7 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
     if managed_lane_enabled(contract):
         try:
             builds = managed_builds(contract)
-        except ValueError:
+        except (ValueError, KeyError, TypeError):
             return []  # validation_errors reports it
         return [
             f"Build {build.get('id')}: properties.sql is run only if the operator lists "

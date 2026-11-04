@@ -1199,8 +1199,8 @@
         },
         "topic": {
           "type": "string",
-          "pattern": "^[A-Za-z0-9._-]{1,249}(?![\\s\\S])",
-          "description": "One Kafka topic, by name: Kafka's legal characters, no pattern and no list."
+          "pattern": "^(?!\\.\\.?(?![\\s\\S]))[A-Za-z0-9._-]{1,249}(?![\\s\\S])",
+          "description": "One Kafka topic, by name: Kafka's legal characters (not . or ..), no pattern and no list."
         },
         "format": {
           "enum": ["json", "avro-confluent"],

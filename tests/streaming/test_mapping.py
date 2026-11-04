@@ -648,3 +648,30 @@ def test_the_stream_and_mapping_work_from_fragments(contract, tmp_path, capsys):
         == 1
     )
     capsys.readouterr()
+
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        (lambda s: s.update(topic="."), "one Kafka topic"),
+        (lambda s: s.update(topic=".."), "one Kafka topic"),
+        (lambda s: s.update(key="raw"), "key: expected an object"),
+        (lambda s: s.update(key=[1]), "key: expected an object"),
+        (
+            lambda s: s.update(key={"format": "raw", "schema": [col("k", "string")], "prefix": ""}),
+            "key.prefix",
+        ),
+        (lambda s: s.update(metadata=[{"name": "m", "from": ["offset"]}]), "from: expected one of"),
+    ],
+)
+def test_malformed_streams_fail_with_a_message_not_a_crash(contract, mutate, match):
+    mutate(_stream(contract))
+    with pytest.raises(ValueError, match=match):
+        compile_contract(contract)
+    assert validation_errors(contract)
+
+
+def test_warnings_never_crash(contract):
+    from fluid_build.streaming.compiler import validation_warnings
+
+    assert validation_warnings({**contract, "builds": 5}) == []

@@ -284,3 +284,16 @@ def test_duplicate_writers_and_cross_build_state_prefixes_are_rejected(contract)
     contract["exposes"].append(target)
     with pytest.raises(ValueError, match="overlap between"):
         compile_contract(contract)
+
+
+def test_event_time_needs_millisecond_precision(contract):
+    # Flink's rowtime takes precision 0 to 3; a stream timestamp defaults to 6.
+    stream = contract["builds"][0]["properties"]["stream"]
+    stream["schema"][-1]["type"] = "timestamp_ltz"
+    contract["exposes"][0]["contract"]["schema"][-1]["type"] = "timestamp_ltz"
+    with pytest.raises(ValueError, match="precision 3 or less"):
+        compile_contract(contract)
+    stream["metadata"] = [{"name": "kafka_ts", "from": "timestamp"}]
+    managed_config(contract["builds"][0])["source"]["eventTime"]["column"] = "kafka_ts"
+    (artifact,) = compile_contract(contract)
+    assert "WATERMARK FOR `kafka_ts`" in artifact.sql

@@ -150,7 +150,7 @@ def parse_stream(spec: Any, where: str = "properties.stream") -> Stream:
     if stream.get("kind") != "kafka":
         raise ValueError(f"{where}.kind: only kafka streams are supported")
     topic = stream.get("topic")
-    if not isinstance(topic, str) or not _TOPIC.fullmatch(topic):
+    if not isinstance(topic, str) or not _TOPIC.fullmatch(topic) or topic in {".", ".."}:
         raise ValueError(f"{where}.topic: expected one Kafka topic name")
     fmt = stream.get("format")
     if fmt not in VALUE_FORMATS:
@@ -165,7 +165,9 @@ def parse_stream(spec: Any, where: str = "properties.stream") -> Stream:
         if key_format not in KEY_FORMATS:
             raise ValueError(f"{where}.key.format: expected one of {list(KEY_FORMATS)}")
         prefix = spec_key.get("prefix", "")
-        if not isinstance(prefix, str) or (prefix and not re.fullmatch(_IDENT, prefix)):
+        if "prefix" in spec_key and (
+            not isinstance(prefix, str) or not re.fullmatch(_IDENT, prefix)
+        ):
             raise ValueError(f"{where}.key.prefix: expected an identifier")
         fields = parse_fields(spec_key.get("schema"), path=f"{where}.key.schema")
         if key_format == "raw" and (
@@ -182,7 +184,7 @@ def parse_stream(spec: Any, where: str = "properties.stream") -> Stream:
         name, source = item.get("name"), item.get("from")
         if not isinstance(name, str):
             raise ValueError(f"{where}.metadata[{i}].name: a column name is required")
-        if source not in _METADATA:
+        if not isinstance(source, str) or source not in _METADATA:
             raise ValueError(f"{where}.metadata[{i}].from: expected one of {sorted(_METADATA)}")
         metadata.append((validate_ident(name), source))
     seen: set[str] = set()
