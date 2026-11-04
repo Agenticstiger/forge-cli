@@ -261,3 +261,86 @@ def test_a_schema_invalid_managed_contract_is_a_typed_refusal(contract, tmp_path
         run(args, logging.getLogger("test"))
     assert refused.value.event in (f"{command}_contract_invalid", "apply_contract_invalid")
     assert refused.value.context["error_count"] >= 1
+
+
+def _write(contract, tmp_path):
+    source = tmp_path / "contract.fluid.yaml"
+    source.write_text(yaml.safe_dump(contract))
+    return source
+
+
+def test_apply_dry_run_without_a_mode_never_reaches_the_cluster(contract, tmp_path):
+    """--dry-run alone must plan: a kubectl read, apply or readiness poll is a failure."""
+    args = build_parser().parse_args(
+        ["apply", str(_write(contract, tmp_path)), "--dry-run", "--yes"]
+    )
+    assert args.mode is None
+    with (
+        patch.object(Kubectl, "command", side_effect=AssertionError("kubectl command")),
+        patch.object(Kubectl, "get", side_effect=AssertionError("kubectl get")),
+        patch.object(Kubectl, "apply", side_effect=AssertionError("kubectl apply")),
+    ):
+        assert apply(args, logging.getLogger("test")) == 0
+
+
+def test_the_schema_gate_runs_on_a_managed_apply_that_compiles(contract, tmp_path):
+    contract["unknownRootField"] = True  # compiles; only the schema refuses it
+    assert compile_contract(contract)
+    args = build_parser().parse_args(["apply", str(_write(contract, tmp_path)), "--yes"])
+    with patch("fluid_build.streaming.runtime.reconcile") as reconcile:
+        with pytest.raises(CLIError) as refused:
+            apply(args, logging.getLogger("test"))
+    assert refused.value.event == "apply_contract_invalid"
+    reconcile.assert_not_called()
+
+
+def test_apply_refuses_a_partial_build_selection(contract, tmp_path):
+    args = build_parser().parse_args(
+        [
+            "apply",
+            str(_write(contract, tmp_path)),
+            "--yes",
+            "--mode",
+            "amend-and-build",
+            "--build-id",
+            "ingest-orders",
+        ]
+    )
+    with patch("fluid_build.streaming.runtime.reconcile") as reconcile:
+        with pytest.raises(CLIError) as refused:
+            apply(args, logging.getLogger("test"))
+    assert refused.value.event == "apply_streaming_build_selection"
+    reconcile.assert_not_called()
+
+
+@pytest.mark.parametrize("flag", [["--no-live"], ["--state", "state.json"]])
+def test_diff_refuses_to_read_a_managed_stream_from_anything_but_the_cluster(
+    contract, tmp_path, flag
+):
+    from fluid_build.cli.diff import run as diff
+
+    args = build_parser().parse_args(["diff", str(_write(contract, tmp_path)), *flag])
+    with patch("fluid_build.streaming.runtime.inspect_drift") as drift:
+        with pytest.raises(CLIError) as refused:
+            diff(args, logging.getLogger("test"))
+    assert refused.value.event == "flink_diff_requires_live"
+    drift.assert_not_called()
+
+
+def test_verify_refuses_a_partial_expose_selection(contract, tmp_path):
+    args = build_parser().parse_args(
+        ["verify", str(_write(contract, tmp_path)), "--expose", "orders"]
+    )
+    with patch("fluid_build.streaming.runtime.verify") as check:
+        with pytest.raises(CLIError) as refused:
+            verify(args, logging.getLogger("test"))
+    assert refused.value.event == "verify_streaming_selection"
+    check.assert_not_called()
+
+
+@pytest.mark.parametrize("flags,expected", [([], 120), (["--streaming-timeout", "7"], 7)])
+def test_verify_passes_the_streaming_timeout_through(contract, tmp_path, flags, expected):
+    args = build_parser().parse_args(["verify", str(_write(contract, tmp_path)), *flags])
+    with patch("fluid_build.streaming.runtime.verify", return_value=[]) as check:
+        assert verify(args, logging.getLogger("test")) == 0
+    assert check.call_args.kwargs["timeout_seconds"] == expected
