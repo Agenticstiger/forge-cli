@@ -113,6 +113,23 @@ def test_fluid_odcs_validate_keeps_the_hint_whole(tmp_path: Path, capsys: Any) -
     assert f"'customer_orders_v1\\n' does not match '^[A-Za-z0-9_-]+$'{_LINE_BREAK_HINT}" in text
 
 
+def test_fluid_odcs_validate_prints_a_value_with_brackets_literally(
+    tmp_path: Path, capsys: Any
+) -> None:
+    """The message quotes the value, and Rich read ``[/]`` in it as a closing tag: the
+    command ended in ``Unexpected error: closing tag '[/]' ... has nothing to close``."""
+    from fluid_build.cli import main
+
+    path = tmp_path / "orders.odcs.yaml"
+    path.write_text(yaml.safe_dump(_odcs("t[/]1")), encoding="utf-8")
+
+    rc = main(["odcs", "validate", str(path), "--no-vowl"])
+
+    text = " ".join(capsys.readouterr().out.split())
+    assert rc == 1, text
+    assert "schema.0.id: 't[/]1' does not match" in text, text
+
+
 def test_validate_artifacts_refuses_a_block_scalar_table_id() -> None:
     """``validate_odcs`` is what ``fluid validate-artifacts`` runs on ``odcs/*.odcs.yaml``."""
     assert validate_odcs("odcs/orders.odcs.yaml", _odcs_yaml("|-").encode()) == []
@@ -228,6 +245,18 @@ def test_an_extension_schema_is_read_in_the_dialect_it_declares(monkeypatch: Any
     assert _assemble(monkeypatch, schema, {"libraries": [], "librarys": []}) == {}
 
 
+def test_an_extension_schema_that_cannot_be_applied_drops_only_its_block(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """A malformed plugin schema neither stops the run nor lets its block through."""
+    schemas = {"bad": {"$schema": 7, "type": "string"}, "x": _SCAFFOLD_SCHEMA}
+    monkeypatch.setattr(extension_schemas, "iter_extension_schemas", lambda *a, **k: schemas)
+    kept = {"patterns": [{"use": "ci:basic"}]}
+
+    assert extension_schemas.assemble_proposed_extensions({"bad": "a", "x": kept}) == {"x": kept}
+    assert "extension schema 'bad' unusable" in caplog.text
+
+
 def test_an_extension_schema_that_declares_no_dialect_is_draft_07(monkeypatch: Any) -> None:
     """The plugin contract says draft-07. 2020-12, jsonschema's default, has no
     ``dependencies`` keyword and would keep this block."""
@@ -241,17 +270,39 @@ def test_an_extension_schema_that_declares_no_dialect_is_draft_07(monkeypatch: A
 
 
 def _validator_builds(path: Path) -> Iterator[str]:
-    """Calls in ``path`` that build a jsonschema validator themselves."""
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    """Spellings in ``path`` that build a jsonschema validator without ``schema_validator``.
+    It goes by names, so a class first bound to another name (``V = Draft7Validator``)
+    gets past it."""
+    text = path.read_text(encoding="utf-8")
+    if not any(word in text for word in ("jsonschema", "Validator", "validator_for")):
+        return
+    tree = ast.parse(text)
+    modules = {"jsonschema"}  # names that hold jsonschema or jsonschema.validators
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules |= {a.asname for a in node.names if a.name == "jsonschema" and a.asname}
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("jsonschema"):
+            modules |= {a.asname or a.name for a in node.names if a.name == "validators"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("jsonschema"):
+            for a in node.names:
+                builder = a.name == "validator_for" or re.fullmatch(r"Draft\d+Validator", a.name)
+                if a.name == "validate" or (a.asname and builder):
+                    yield f"{path.name}:{node.lineno}: from {node.module} import {a.name}"
         if not isinstance(node, ast.Call):
             continue
         func = node.func
         name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
         if name == "validator_for" or re.fullmatch(r"Draft\d+Validator", name):
             yield f"{path.name}:{node.lineno}: {name}()"
-        elif name == "validate" and ast.unparse(func) == "jsonschema.validate":
-            if all(k.arg != "cls" for k in node.keywords):
-                yield f"{path.name}:{node.lineno}: jsonschema.validate()"
+        elif name in ("validate", "extend", "create") and isinstance(func, ast.Attribute):
+            root = func.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            cls = next((k.value for k in node.keywords if k.arg == "cls"), None)
+            routed = cls is not None and "schema_validator" in ast.unparse(cls)
+            if isinstance(root, ast.Name) and root.id in modules and not routed:
+                yield f"{path.name}:{node.lineno}: {ast.unparse(func)}()"
 
 
 def test_every_validator_is_built_by_schema_validator() -> None:

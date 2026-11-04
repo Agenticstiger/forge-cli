@@ -257,6 +257,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was applied and suggests a rename. A mode without a build phase, and a contract without builds,
   are not checked, as before.
 
+- **`fluid odcs validate` stopped with `Unexpected error: closing tag '[/]' ... has nothing to
+  close`** when a value that fails a schema check contained `[/]` or another Rich markup tag. The
+  error line quotes the value, and it was printed as markup. It is printed as plain text now, so
+  the command reports the error and exits 1.
+
 - **`fluid diff --baseline` reported nothing for column changes in a 0.7.x contract.** It read
   columns from `exposes[].schema`, but a 0.7.x contract keeps them in `exposes[].contract.schema`
   (as does every `fluid init` template), so a removed column, a type change or a new NOT NULL

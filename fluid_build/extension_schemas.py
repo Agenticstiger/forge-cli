@@ -212,8 +212,16 @@ def assemble_proposed_extensions(
             # The dialect the plugin's schema declares, draft-07 when it declares
             # none; Draft 7 ignores a newer keyword rather than enforcing it. A
             # pattern's "$" is the end of the value, as ECMA-262 reads it.
-            validator = schema_validator(schema, default=Draft7Validator)
-            if next(iter(validator.iter_errors(block)), None) is not None:
+            try:
+                validator = schema_validator(schema, default=Draft7Validator)
+                invalid = next(iter(validator.iter_errors(block)), None) is not None
+            except Exception as e:  # a schema that cannot be applied, e.g. a non-string $schema
+                from fluid_build.observability.secret_redactor import redact_secret_text
+
+                log = logger or logging.getLogger(__name__)
+                log.warning("%s", redact_secret_text(f"extension schema {key!r} unusable: {e}"))
+                continue  # unchecked — don't emit it
+            if invalid:
                 continue  # invalid — let the repair loop surface it; don't emit junk
         out[key] = block
     return out

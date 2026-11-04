@@ -87,7 +87,6 @@ def validate(odps: Mapping[str, Any], schema: Mapping[str, Any]) -> None:
     try:
         # cls: the declared dialect, with a pattern's "$" read as the end of the
         # value, as ECMA-262 does. jsonschema.validate still checks the schema first.
-        cls = type(schema_validator(schema))
-        jsonschema.validate(instance=odps, schema=schema, cls=cls)
+        jsonschema.validate(instance=odps, schema=schema, cls=type(schema_validator(schema)))
     except jsonschema.ValidationError as exc:
         raise ProviderError(f"ODPS validation failed: {exc.message}") from exc

@@ -568,7 +568,8 @@ def _run_odcs_validate(args):
             report["ok"] = False
             cprint(f"✗ jsonschema: {len(errors)} error(s)")
             for e in errors[:10]:
-                cprint(f"   {e['path'] or '<root>'}: {_brief(e['message'])}")
+                # markup=False: the message quotes the value, and "[/]" in it is a Rich tag.
+                cprint(f"   {e['path'] or '<root>'}: {_brief(e['message'])}", markup=False)
             if len(errors) > 10:
                 cprint(f"   ... +{len(errors) - 10} more")
         else:
