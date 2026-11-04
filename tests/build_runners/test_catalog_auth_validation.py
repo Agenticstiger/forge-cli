@@ -23,10 +23,13 @@ property. A warning: an override or hand-written map that inlines a literal
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Optional
 
 import pytest
 
+from fluid_build.build_runners._deployment_host_policy import ALLOWLIST_ENV as HOST_ALLOWLIST
+from fluid_build.build_runners._secret_policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST
 from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
     iceberg_sink_preflight,
     validate_iceberg_sink,
@@ -35,7 +38,19 @@ from fluid_build.providers._iceberg_catalog import catalog_kind_info, known_cata
 
 pytestmark = [pytest.mark.unit]
 
-_KEYCLOAK = "http://keycloak:8080/realms/iceberg/protocol/openid-connect/token"
+
+@pytest.fixture(autouse=True)
+def _operator_allows_the_fixture_hosts(monkeypatch):
+    """The operator pairs each fixture variable with each fixture host. Where a
+    credential may go is pinned in test_iceberg_sink_catalog_destinations.py."""
+    hosts = ("lakekeeper", "keycloak", "catalog", "c")
+    names = ("LAKEKEEPER_CREDENTIAL", "UC_TOKEN", "LK_CRED")
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, ",".join(f"{n}@{h}" for n in names for h in hosts))
+    current = [h for h in os.environ.get(HOST_ALLOWLIST, "").split(",") if h.strip()]
+    monkeypatch.setenv(HOST_ALLOWLIST, ",".join([*current, *hosts]))
+
+
+_KEYCLOAK = "https://keycloak:8443/realms/iceberg/protocol/openid-connect/token"
 _OAUTH2 = {
     "type": "oauth2",
     "credentialEnv": "LAKEKEEPER_CREDENTIAL",
@@ -44,7 +59,7 @@ _OAUTH2 = {
 }
 _LAKEKEEPER_LOCATION = {
     "catalog": "lakekeeper",
-    "uri": "http://lakekeeper:8181/catalog",
+    "uri": "https://lakekeeper:8443/catalog",
     "warehouse": "demo",
     "database": "bronze",
     "table": "orders",
@@ -114,7 +129,7 @@ def _dbz(catalog_auth: Optional[Dict[str, Any]], *, server_sink=None, mode="embe
 def test_every_rest_kind_accepts_catalog_auth(catalog):
     location = {**_LAKEKEEPER_LOCATION, "catalog": catalog}
     if catalog != "lakekeeper":
-        location["uri"] = "http://catalog:8181/api/catalog"
+        location["uri"] = "https://catalog:8443/api/catalog"
     errors, _warnings = validate_iceberg_sink(_kc(dict(_OAUTH2), location=location))
     assert errors == []
 
@@ -194,7 +209,7 @@ def test_a_handwritten_sink_config_is_refused(contract, where):
     assert f"{prefix}rest.auth.type to oauth2" in hit[0]
     # A contract value is named by its field, not echoed (it could hold a secret).
     assert f"{prefix}oauth2-server-uri to <oauth2ServerUri>" in hit[0]
-    assert "keycloak:8080" not in hit[0]
+    assert "keycloak:8443" not in hit[0]
 
 
 def test_a_handwritten_config_with_a_userinfo_uri_is_refused_without_echoing_it():
@@ -265,7 +280,7 @@ def test_debezium_override_of_an_auth_property_is_refused(key):
 def test_an_unrelated_override_key_is_not_a_conflict():
     kc = {
         "iceberg_catalog_overrides": {
-            "iceberg.catalog.uri": "http://c:8181/catalog",
+            "iceberg.catalog.uri": "https://c:8443/catalog",
             "s3.region": "y",
         }
     }

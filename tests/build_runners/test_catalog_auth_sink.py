@@ -25,12 +25,15 @@ run whose variable is unset or empty.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
 
+from fluid_build.build_runners._deployment_host_policy import ALLOWLIST_ENV as HOST_ALLOWLIST
+from fluid_build.build_runners._secret_policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST
 from fluid_build.build_runners.debezium.iceberg_sink import emit_debezium_iceberg_sink_config
 from fluid_build.build_runners.kafka_connect.iceberg_sink import emit_iceberg_sink_config
 from fluid_build.providers._iceberg_catalog import ResolvedIcebergCatalog
@@ -38,7 +41,19 @@ from fluid_build.providers._iceberg_catalog_auth import parse_catalog_auth
 
 pytestmark = [pytest.mark.unit]
 
-_KEYCLOAK = "http://keycloak:8080/realms/iceberg/protocol/openid-connect/token"
+
+@pytest.fixture(autouse=True)
+def _operator_allows_the_fixture_hosts(monkeypatch):
+    """The operator pairs each fixture variable with each fixture host. Where a
+    credential may go is pinned in test_iceberg_sink_catalog_destinations.py."""
+    hosts = ("lakekeeper", "keycloak")
+    names = ("LAKEKEEPER_CREDENTIAL", "UC_TOKEN")
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST, ",".join(f"{n}@{h}" for n in names for h in hosts))
+    current = [h for h in os.environ.get(HOST_ALLOWLIST, "").split(",") if h.strip()]
+    monkeypatch.setenv(HOST_ALLOWLIST, ",".join([*current, *hosts]))
+
+
+_KEYCLOAK = "https://keycloak:8443/realms/iceberg/protocol/openid-connect/token"
 _SECRET_VALUE = "spark:2OR3eRvYfSZzzZ16MlPd95jhLnOaLM52"  # pragma: allowlist secret
 _OAUTH2 = {
     "type": "oauth2",
@@ -52,7 +67,7 @@ _LAKEKEEPER = ResolvedIcebergCatalog(
     catalog_type="rest",
     warehouse="demo",
     fq_table="bronze.orders",
-    uri="http://lakekeeper:8181/catalog",
+    uri="https://lakekeeper:8443/catalog",
     kind="lakekeeper",
 )
 
@@ -156,7 +171,7 @@ def _kc_contract(catalog_auth: Dict[str, Any], **kc: Any) -> Dict[str, Any]:
                     "format": "iceberg",
                     "location": {
                         "catalog": "lakekeeper",
-                        "uri": "http://lakekeeper:8181/catalog",
+                        "uri": "https://lakekeeper:8443/catalog",
                         "warehouse": "demo",
                         "database": "bronze",
                         "table": "orders",
