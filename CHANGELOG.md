@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-11-04
+
 ### Added
 
 - **Managed Flink to Iceberg, as a preview in FLUID 0.7.7.** A build with `engine: flink` (or
@@ -447,6 +449,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that gates on it can start exiting 1, and the `fluid forge --refine` preview lists it as a
   breaking change.
 
+- **`fluid diff --baseline` compared contracts that no schema accepts.** Its rules read only the
+  shapes a schema allows, so a value of the wrong type hid a change: a column retyped from
+  `decimal(18,2)` to the number `18` passed `--fail-on-breaking` with exit 0. Both contracts are
+  now validated first, against the schema their `fluidVersion` names, offline, the gate
+  `fluid plan` runs. An invalid one exits 2 with `diff_contract_invalid`, which names each
+  invalid file and logs each error, and nothing is printed or written to `--out`. Exit 2 is
+  diff(1)'s "trouble", so it never reads as 0 (no changes) or 1 (breaking). A pre-0.7 contract is
+  refused with the upgrade that `fluid validate` asks for, so a pre-0.7 baseline can no longer be
+  diffed against its 0.7.x rewrite. In `fluid_build.api.changelog`, `compare_contracts` raises the
+  new `ContractValidationError`, and `validate=False` diffs without validating; the
+  `fluid forge --refine` preview uses it, because the contract being refined may be the invalid one.
+
 - **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
   `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the
   diagnostic (the summary, the resource address and the provider's detail) and says that OpenTofu
@@ -568,6 +582,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dimension that reads the workspace's metastore summary for every table the module manages: it
   passes when the region matches the declaration, fails with the fix when it does not, and is
   skipped when the contract declares none.
+- **A failed fail-safe no longer locks the run out, and says what it could not close.** When a
+  mask or row filter cannot be bound, the lock that revokes SELECT from every grantee but the
+  owner now also skips the identity the run is (it has to repair the table), and when the
+  table's owner could not be read it says the owner could not be skipped. An owner the contract
+  itself restricts reads its table whatever is revoked: the message now names that path as still
+  open, with the `ALTER TABLE ... OWNER TO` to run. When the permission listing shows no
+  `inherited_from_*` field at all, it says it could not determine whether a schema or catalog
+  grant is open, where it claimed none was.
+- **A job paused for an unprotected table is announced and found.** The apply decides once, in
+  `emit`, which dbt jobs to create paused, and its notice reads that decision, so a transient
+  read error can no longer pause a job without saying so. `fluid verify` now fails the jobs
+  dimension for a job that is paused while its table's masks or row filter are not in place,
+  with the apply that binds them and starts the job as the fix.
+- **A changed contract no longer leaves its old masks and row filter functions behind.** After
+  a successful apply (never in a dry run, never after a failed apply or a failed bind), the
+  functions in the product schema that carry the table's `fluid_rf_<table>_`,
+  `fluid_mask_<table>_<column>_` or deny-all name and are neither expected now nor bound to any
+  table in the schema (every table is read first; if one cannot be, nothing is dropped) are
+  dropped, each printed, and only when the run's own identity owns the function: one with
+  another owner, or an owner that cannot be read, is left and named. A function without the
+  `fluid_` prefix is never touched.
+- **A plan that fails the residency check prints one line.** The apply showed the last 800
+  characters of the tofu JSON, which cut off the sentence naming the live region. It now says
+  the declared region, the live region (read from the diagnostic's message, or its `values`)
+  and the fix.
 - **An AWS contract's schedule was dropped without a word, and the one it got was not labelled.**
   The workflow Lambda was named `fluid-workflow-<id>` raw, so a dotted id (the schema's own
   example is `gold.hr.employee_360_v1`, and 27 of 28 examples use dots) or one over about 49
@@ -631,35 +670,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider". A contract's `redshift` build runtime or expose platform is served by `aws`, and plugins
   cannot claim either retired name.
 
-- **A failed fail-safe no longer locks the run out, and says what it could not close.** When a
-  mask or row filter cannot be bound, the lock that revokes SELECT from every grantee but the
-  owner now also skips the identity the run is (it has to repair the table), and when the
-  table's owner could not be read it says the owner could not be skipped. An owner the contract
-  itself restricts reads its table whatever is revoked: the message now names that path as still
-  open, with the `ALTER TABLE ... OWNER TO` to run. When the permission listing shows no
-  `inherited_from_*` field at all, it says it could not determine whether a schema or catalog
-  grant is open, where it claimed none was.
-
-- **A job paused for an unprotected table is announced and found.** The apply decides once, in
-  `emit`, which dbt jobs to create paused, and its notice reads that decision, so a transient
-  read error can no longer pause a job without saying so. `fluid verify` now fails the jobs
-  dimension for a job that is paused while its table's masks or row filter are not in place,
-  with the apply that binds them and starts the job as the fix.
-
-- **A changed contract no longer leaves its old masks and row filter functions behind.** After
-  a successful apply (never in a dry run, never after a failed apply or a failed bind), the
-  functions in the product schema that carry the table's `fluid_rf_<table>_`,
-  `fluid_mask_<table>_<column>_` or deny-all name and are neither expected now nor bound to any
-  table in the schema (every table is read first; if one cannot be, nothing is dropped) are
-  dropped, each printed, and only when the run's own identity owns the function: one with
-  another owner, or an owner that cannot be read, is left and named. A function without the
-  `fluid_` prefix is never touched.
-
-- **A plan that fails the residency check prints one line.** The apply showed the last 800
-  characters of the tofu JSON, which cut off the sentence naming the live region. It now says
-  the declared region, the live region (read from the diagnostic's message, or its `values`)
-  and the fix.
-
 ### Security
 
 - **A contract chose both the variable and the hosts an Iceberg sink's catalog credential went
@@ -714,6 +724,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Invalid SQL identifier: 'spectrum_events\n'`. That includes a name that reaches it with a
   trailing newline from an environment variable or a file; strip the value where it is set.
 
+- **Other validators let a value with a trailing newline through, too.** The same `$` ended other
+  whole-string patterns, so a value written as a YAML `|` block, read from a `.env` file or decoded
+  from `%0A` in a URL kept its newline: `fluid generate iac` put `region = "eu-west-1\n"` on the
+  AWS provider, and a Databricks job got `branch = "main\n"` from `?branch=main%0A`. They now end
+  in `\Z` or are matched with `fullmatch`, so such a value is refused with the validator's usual
+  message, or takes the path the code already has for a value that is not a plain name: a product
+  id forged from a JDBC source or imported from dbt or ODCS is slugified. An AWS binding region
+  with whitespace around it is refused (`aws-region-whitespace`), because the sovereignty policy
+  checks the region as written. Covered: quality-check selectors, catalog and JDBC identifiers,
+  BigQuery and GCP project ids, contract, build, federation-workspace and overlay-env ids,
+  row-filter names, Singer tap and target names, prompt profile and overlay names, mission
+  predicate paths, AWS and GCP resource names, Snowflake account segments, Databricks git refs,
+  and the identifier and version checks of ODCS and ODPS imports.
+
+- **Schema validation let a value with a trailing newline through a `pattern`.** JSON Schema
+  writes `pattern` in ECMA-262, where `$` matches only at the end of the value, but the
+  jsonschema library runs it with Python's `re.search`, whose `$` also matches before a final
+  newline. So `fluid validate` accepted `id: "orders\n"`, which an `id: |` block scalar produces,
+  under every bundled schema version (0.7.1 to 0.7.7). Contract, fragment and bundle validation
+  now read `$` as the end of the value. Such a value is refused at its path, with a hint when
+  the line break is the only problem: `(it ends in a line break, which a YAML | or > block keeps
+  and |- or >- drops)`. A `sink.catalogAuth` field gets no hint, since its value is never shown.
+  The schemas themselves are unchanged.
+
+- **The ODCS and plugin-extension checks let a value with a trailing newline through a `pattern`,
+  too.** The fix above covered the FLUID schemas only. `fluid odcs validate` and
+  `fluid validate-artifacts` accepted an ODCS `schema[].id: "t1\n"` while refusing `"t 1"`, and
+  the forge copilot kept an LLM-proposed extension block whose value ended in a line break, such
+  as `use: "ci:basic\n"` for `customScaffold`. Every JSON Schema check now reads `$` as the end of
+  the value, including the ODPS, OPDS and Ossie checks, whose vendored schemas have no such
+  pattern yet. Their errors carry the same hint; an extension block that fails is dropped, as
+  before. An extension schema is read in the dialect its `$schema` declares, and as draft-07 when
+  it declares none, so a 2020-12 `unevaluatedProperties: false` is no longer ignored.
+  `patternProperties` keys are still matched as before, so OPDS's language-code key `^[a-z]{2}$`
+  accepts `"en\n"`.
+
 - **The acquisition orchestrator check judged a second DNS answer, not the address the config
   went to.** For kafka_connect, debezium and airbyte, the per-request guard that keeps a
   contract-named `deployment.server_url` from receiving the connector config, resolved source
@@ -756,8 +802,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   even when listed. Their ranges stay allowed: a Tailscale tailnet (CGNAT, `100.100.100.100`
   included) or an IPv6 cluster on ULA addresses needs no change.
 
+- **`fluid diff --baseline` printed contract names raw.** A column or expose name could drive the
+  terminal (an escape sequence, a hyperlink to another URL, a carriage return or line feed that
+  forges a line, a bidi control that reorders it), and in `--format markdown` it could add a link,
+  an image or an HTML comment that hides the rest of a PR comment, or mention someone. Text output
+  now spells each control, bidi and invisible character as `\x1b` or `\u202e` and doubles a
+  backslash. Markdown puts the path and the description each in one code span: a backslash escape
+  is not enough there, because GitHub still links `\@user`, `\#1` and `\:smile\:` after
+  rendering. The fence is one backtick longer than any run of backticks in the name, and the
+  document is redacted per value before it is written, so a redaction cannot take the closing
+  fence with it. A Markdown entry now reads
+  ``- **column_added** `exposes[0].contract.schema.email` — `column 'email' added to expose 'orders'` ``.
+  The `fluid forge --refine` preview prints the same text without markup.
+
 ### Upgrade notes
 
+- `--provider redshift` and `--provider datamesh-manager` (and `FLUID_PROVIDER`) exit 2 and name
+  the replacement: `--provider aws`, or `fluid publish --target datamesh-manager`. `azure` is an
+  unknown provider (see Removed).
+- A plugin that replaced a built-in provider or IaC emitter is skipped with a WARNING until the
+  operator grants it a distribution-qualified `FLUID_PLUGINS_ALLOWLIST` entry, such as
+  `acme-fluid-aws:aws` (see Added and Security).
+- A Kafka Connect or embedded Debezium Iceberg sink whose `catalogAuth` reaches a non-loopback
+  host fails its run until the operator pairs the variable with the host as `NAME@host` in
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` and, for a hostname, lists it in
+  `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST`; an `http://` catalog or token endpoint fails
+  `fluid validate` (see Security).
+- On OpenTofu 1.10 or newer, S3 state is locked and `tofu plan` takes the lock too: every role
+  that runs plan, `fluid apply --dry-run`, `fluid diff` or `fluid verify --state-drift` against S3
+  state needs `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `<key>.tflock`, or sets
+  `FLUID_TOFU_S3_LOCKFILE=0` (see Fixed).
+- `fluid diff --baseline --fail-on-breaking` can start exiting 1: it now sees column changes in a
+  0.7.x contract, compares column types more strictly and reports a name declared twice. It exits
+  2 with `diff_contract_invalid` when either contract fails its schema, and refuses a pre-0.7
+  contract with the upgrade `fluid validate` asks for (see Fixed).
 - New validate warning, so `--strict` fails: a contract with builds whose `contract.id` or a
   `builds[].id` the build phase refuses (`1orders`, or more than 128 characters). `fluid apply`
   in a build mode already refuses it; rename the id to fit.
@@ -792,67 +870,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anything in place now also needs the flag, as a Databricks apply already did.
 - `decimal(10, 2)` is now written `decimal(10,2)`. Against moto, that alone applies without the
   flag; real Glue was not measured.
-
-- **Other validators let a value with a trailing newline through, too.** The same `$` ended other
-  whole-string patterns, so a value written as a YAML `|` block, read from a `.env` file or decoded
-  from `%0A` in a URL kept its newline: `fluid generate iac` put `region = "eu-west-1\n"` on the
-  AWS provider, and a Databricks job got `branch = "main\n"` from `?branch=main%0A`. They now end
-  in `\Z` or are matched with `fullmatch`, so such a value is refused with the validator's usual
-  message, or takes the path the code already has for a value that is not a plain name: a product
-  id forged from a JDBC source or imported from dbt or ODCS is slugified. An AWS binding region
-  with whitespace around it is refused (`aws-region-whitespace`), because the sovereignty policy
-  checks the region as written. Covered: quality-check selectors, catalog and JDBC identifiers,
-  BigQuery and GCP project ids, contract, build, federation-workspace and overlay-env ids,
-  row-filter names, Singer tap and target names, prompt profile and overlay names, mission
-  predicate paths, AWS and GCP resource names, Snowflake account segments, Databricks git refs,
-  and the identifier and version checks of ODCS and ODPS imports.
-
-- **Schema validation let a value with a trailing newline through a `pattern`.** JSON Schema
-  writes `pattern` in ECMA-262, where `$` matches only at the end of the value, but the
-  jsonschema library runs it with Python's `re.search`, whose `$` also matches before a final
-  newline. So `fluid validate` accepted `id: "orders\n"`, which an `id: |` block scalar produces,
-  under every bundled schema version (0.7.1 to 0.7.7). Contract, fragment and bundle validation
-  now read `$` as the end of the value. Such a value is refused at its path, with a hint when
-  the line break is the only problem: `(it ends in a line break, which a YAML | or > block keeps
-  and |- or >- drops)`. A `sink.catalogAuth` field gets no hint, since its value is never shown.
-  The schemas themselves are unchanged.
-
-- **The ODCS and plugin-extension checks let a value with a trailing newline through a `pattern`,
-  too.** The fix above covered the FLUID schemas only. `fluid odcs validate` and
-  `fluid validate-artifacts` accepted an ODCS `schema[].id: "t1\n"` while refusing `"t 1"`, and
-  the forge copilot kept an LLM-proposed extension block whose value ended in a line break, such
-  as `use: "ci:basic\n"` for `customScaffold`. Every JSON Schema check now reads `$` as the end of
-  the value, including the ODPS, OPDS and Ossie checks, whose vendored schemas have no such
-  pattern yet. Their errors carry the same hint; an extension block that fails is dropped, as
-  before. An extension schema is read in the dialect its `$schema` declares, and as draft-07 when
-  it declares none, so a 2020-12 `unevaluatedProperties: false` is no longer ignored.
-  `patternProperties` keys are still matched as before, so OPDS's language-code key `^[a-z]{2}$`
-  accepts `"en\n"`.
-
-- **`fluid diff --baseline` compared contracts that no schema accepts.** Its rules read only the
-  shapes a schema allows, so a value of the wrong type hid a change: a column retyped from
-  `decimal(18,2)` to the number `18` passed `--fail-on-breaking` with exit 0. Both contracts are
-  now validated first, against the schema their `fluidVersion` names, offline, the gate
-  `fluid plan` runs. An invalid one exits 2 with `diff_contract_invalid`, which names each
-  invalid file and logs each error, and nothing is printed or written to `--out`. Exit 2 is
-  diff(1)'s "trouble", so it never reads as 0 (no changes) or 1 (breaking). A pre-0.7 contract is
-  refused with the upgrade that `fluid validate` asks for, so a pre-0.7 baseline can no longer be
-  diffed against its 0.7.x rewrite. In `fluid_build.api.changelog`, `compare_contracts` raises the
-  new `ContractValidationError`, and `validate=False` diffs without validating; the
-  `fluid forge --refine` preview uses it, because the contract being refined may be the invalid one.
-
-- **`fluid diff --baseline` printed contract names raw.** A column or expose name could drive the
-  terminal (an escape sequence, a hyperlink to another URL, a carriage return or line feed that
-  forges a line, a bidi control that reorders it), and in `--format markdown` it could add a link,
-  an image or an HTML comment that hides the rest of a PR comment, or mention someone. Text output
-  now spells each control, bidi and invisible character as `\x1b` or `\u202e` and doubles a
-  backslash. Markdown puts the path and the description each in one code span: a backslash escape
-  is not enough there, because GitHub still links `\@user`, `\#1` and `\:smile\:` after
-  rendering. The fence is one backtick longer than any run of backticks in the name, and the
-  document is redacted per value before it is written, so a redaction cannot take the closing
-  fence with it. A Markdown entry now reads
-  ``- **column_added** `exposes[0].contract.schema.email` — `column 'email' added to expose 'orders'` ``.
-  The `fluid forge --refine` preview prints the same text without markup.
+- 0.28.0 removes litellm, the MCP SDK and openlineage-python from the base install. Install
+  `[standard]` now if you use AI authoring, `fluid ai setup` or `fluid mcp serve`, and
+  `[lineage]` if you set `OPENLINEAGE_URL` (see Added).
 
 ## [0.26.0] — 2026-11-01
 
@@ -7262,7 +7282,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.23.0...v0.24.0
