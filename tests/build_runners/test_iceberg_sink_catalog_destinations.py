@@ -49,6 +49,8 @@ pytestmark = [pytest.mark.unit]
 
 _SECRET = "OPERATOR_SYNTH_SECRET"  # pragma: allowlist secret - a variable NAME
 _SECRET_VALUE = "operator-synth-value-7Hq2"  # pragma: allowlist secret
+#: AWS's documented example secret access key: the shape a rendered secret takes.
+_AWS_DOC_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # pragma: allowlist secret
 _CATALOG_HOST = "catalog.attacker.example"
 _IDP_HOST = "idp.attacker.example"
 _CATALOG = f"https://{_CATALOG_HOST}/catalog"
@@ -588,7 +590,10 @@ def test_a_host_that_is_not_plain_is_refused_and_never_echoed(uri, monkeypatch):
 
 @pytest.mark.parametrize(
     "uri",
-    ["https://evil.example\\@127.0.0.1/catalog", "https://u:p4ss@catalog.attacker.example/c"],
+    [
+        "https://evil.example\\@127.0.0.1/catalog",
+        "https://u:p4ss@catalog.attacker.example/c",  # pragma: allowlist secret
+    ],
     ids=["backslash", "userinfo"],
 )
 def test_a_user_password_part_is_refused(uri):
@@ -611,10 +616,10 @@ def test_an_engine_that_derives_no_sink_config_skips_the_location_text():
 def test_a_rendered_region_is_not_echoed(monkeypatch):
     """At run a region may hold whatever a {{ env.* }} template rendered."""
     contract = _kc_contract(None, location=_location(region="{{ env.LAKE_REGION }}"))
-    monkeypatch.setenv("LAKE_REGION", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+    monkeypatch.setenv("LAKE_REGION", _AWS_DOC_KEY)
     error = iceberg_sink_preflight(_rendered(contract), "ingest")
     assert error is not None and "binding.location.region" in error
-    assert "wJalrXUtnFEMI" not in error
+    assert _AWS_DOC_KEY[:13] not in error
 
 
 def test_validate_defers_a_template_only_where_it_decides_the_host():
