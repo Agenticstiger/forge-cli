@@ -52,6 +52,7 @@ ignores a value that one of the project's own dotenv files tries to set.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import os
 from dataclasses import dataclass
@@ -73,6 +74,7 @@ from fluid_build.build_runners._secret_policy import ALLOWLIST_ENV as SECRET_REF
 from fluid_build.build_runners._secret_policy import allowlist as secret_ref_allowlist
 from fluid_build.build_runners._secret_policy import is_loopback, variable_allowed
 from fluid_build.providers._iceberg_catalog_auth import CatalogAuth, parse_catalog_auth
+from fluid_build.streaming.compiler import CONTRACT_SQL_ALLOWLIST_ENV
 
 CONTEXT_ALLOWLIST_ENV = "FLUID_FLINK_KUBE_CONTEXT_ALLOWLIST"
 NAMESPACE_ALLOWLIST_ENV = "FLUID_FLINK_NAMESPACE_ALLOWLIST"
@@ -338,3 +340,60 @@ def refuse_unless_catalog_targets_allowed(
         refuse_unless_catalog_secret_allowed(auth.env_var, str(token_endpoint), environ=environ)
     refuse_unless_catalog_secret_allowed(auth.env_var, catalog_uri, environ=environ)
     return auth
+
+
+def contract_sql_entry(product_id: Any, build: Mapping[str, Any]) -> str:
+    """The allowlist entry that approves exactly this build's SQL: ``product/build@sha256:..``."""
+    sql = (build.get("properties") or {}).get("sql")
+    digest = hashlib.sha256(str(sql).strip().encode("utf-8")).hexdigest()
+    return f"{product_id}/{build.get('id')}@sha256:{digest}"
+
+
+def refuse_unless_contract_sql_allowed(
+    product_id: Any, build: Mapping[str, Any], environ: Optional[Mapping[str, str]] = None
+) -> None:
+    """Raise unless the operator lists a build whose own SQL the job would run.
+
+    forge-cli writes the query from ``properties.mapping``, and that query reads only
+    the stream. A contract's ``properties.sql`` runs inside the job with its catalog
+    identity, so it can read any table that identity can (``lake.<namespace>.<table>``)
+    and write it into the product's own table.
+
+    An entry is one of:
+    - ``<product id>/<build id>@sha256:<digest of the stripped SQL>``, which approves
+      the reviewed SQL only, so an edit needs a new review (recommended);
+    - ``<product id>/<build id>``, which approves the build's SQL as it changes;
+    - ``<product id>``, which approves every build of the product.
+    """
+    props = build.get("properties")
+    if not isinstance(props, Mapping) or props.get("sql") is None:
+        return
+    build_id = build.get("id")
+    pinned = contract_sql_entry(product_id, build)
+    entries = _entries(CONTRACT_SQL_ALLOWLIST_ENV, environ)
+    if {str(product_id), f"{product_id}/{build_id}", pinned} & set(entries):
+        return
+    stale = any(e.startswith(f"{product_id}/{build_id}@") for e in entries)
+    listed = ",".join(
+        [*(e for e in entries if not e.startswith(f"{product_id}/{build_id}@")), pinned]
+    )
+    raise FlinkPolicyError(
+        what=f"managed Flink build {build_id!r} runs SQL written in the contract",
+        why=(
+            (
+                f"{CONTRACT_SQL_ALLOWLIST_ENV} approves other SQL for {product_id}/{build_id}: "
+                "the build's SQL changed after it was listed. "
+                if stale
+                else f"{product_id}/{build_id} is not in {CONTRACT_SQL_ALLOWLIST_ENV}. "
+            )
+            + "A contract's own SELECT runs inside the job with its catalog identity: it can "
+            "read any table that identity can read, not only the stream, and copy it into "
+            "this product's table. An unset list allows nothing."
+        ),
+        fix=(
+            "Declare the output in properties.mapping, which forge-cli compiles into a query "
+            "that reads only the stream; or, once this SQL is reviewed, list it "
+            f'{_OPERATOR_ONLY}, pinned to what was reviewed: export {CONTRACT_SQL_ALLOWLIST_ENV}="{listed}".'
+        ),
+        doc=doc_url(),
+    )
