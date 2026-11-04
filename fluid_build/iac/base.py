@@ -50,8 +50,10 @@ class IacProviderPlugin(Protocol):
     * In-tree: add a module under ``iac/providers/`` and ``register_iac_plugin``
       it in ``iac/__init__.py``.
     * Out-of-tree (pip-installed): ship an entry-point under
-      ``fluid_build.iac_providers``; ``registry.discover_iac_entrypoints`` (run
-      on import, via the unified plugin manager) registers it automatically.
+      ``fluid_build.iac_providers``. ``registry.get_iac_plugin`` loads it by
+      name the first time a contract's platform needs it (never at import),
+      through the unified plugin manager's allow/block policy, the
+      ``requires_cli`` gate and the reserved built-in names.
 
     This mirrors dbt's per-platform adapter pattern (``dbt-bigquery``,
     ``dbt-snowflake``), which scales that way to 40+ adapters.

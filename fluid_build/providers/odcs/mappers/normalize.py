@@ -462,7 +462,7 @@ def _root_identifier(raw: Any, version: str) -> tuple[str, Optional[str]]:
         return _IMPORTED_ID_FALLBACK, None
     text = str(raw)
     pattern = _identifier_pattern(version)
-    if pattern is None or pattern.match(text):
+    if pattern is None or pattern.fullmatch(text):
         return text, None
     slug = _slugged_root_id(text)
     # %r: the id is document text and may carry control characters.

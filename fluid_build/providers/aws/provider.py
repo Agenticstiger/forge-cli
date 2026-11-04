@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NoReturn, Optional
 
 from fluid_build.providers.base import (
     ApplyResult,
@@ -166,6 +166,10 @@ class AwsProvider(BaseProvider):
         Athena queries / workgroups, Redshift schemas, Lambda functions,
         EventBridge rules / schedules, IAM roles / policies.
         """
+        # Imported here, not at module scope: this module is loaded by
+        # ``fluid --help``, whose module count is budgeted.
+        from fluid_build.providers._plan_validation import PlanValidationError
+
         self.debug_kv(
             event="plan_started",
             contract_id=contract.get("id"),
@@ -174,8 +178,12 @@ class AwsProvider(BaseProvider):
         )
 
         try:
-            # Validate sovereignty constraints (FLUID 0.7.1)
+            # Validate sovereignty constraints (FLUID 0.7.1). First, and with no
+            # account needed: this is the only place AWS enforces jurisdiction.
             self._validate_sovereignty(contract)
+
+            if not self.account_id:
+                self._no_plan_without_account(contract)
 
             # ``plan_actions`` constructs an :class:`AwsPlanner` and
             # calls :meth:`BasePlanner.plan` which already runs the
@@ -202,7 +210,7 @@ class AwsProvider(BaseProvider):
 
             if not validation_result["valid"]:
                 error_msg = "Plan validation failed:\n" + "\n".join(validation_result["errors"])
-                raise ProviderError(error_msg)
+                raise PlanValidationError(error_msg)
 
             # Log warnings if any
             for warning in validation_result.get("warnings", []):
@@ -316,6 +324,28 @@ class AwsProvider(BaseProvider):
             self.err_kv(event="sovereignty_violation", error=str(e))
             raise ProviderError(str(e)) from e
 
+    def _no_plan_without_account(self, contract: Mapping[str, Any]) -> NoReturn:
+        """No account resolved, so no name can be derived: stop before one is.
+
+        With ``None`` the planner builds ``None-fluid-staging`` and the validator
+        refuses the plan with a message about a bucket, hiding the cause. A
+        contract that declares orchestration (a schedule, triggers or tasks)
+        needs this plan, since its Lambda, permission and schedule come from
+        nowhere else, so the gap is refused by name. Any other contract's
+        resources come from its exposes, which tofu applies with its own
+        credentials: the planner reports that it could not run, and
+        ``native_actions`` treats that as best-effort, as before. ``generate
+        iac`` passes a placeholder account, so it never reaches this.
+        """
+        from .util.config import AwsAccountUnresolvedError, account_unresolved_message
+
+        orchestration = contract.get("orchestration")
+        if isinstance(orchestration, Mapping) and any(
+            orchestration.get(key) for key in ("schedule", "triggers", "tasks")
+        ):
+            raise AwsAccountUnresolvedError(account_unresolved_message())
+        raise ProviderError(f"native AWS plan skipped: {account_unresolved_message()}")
+
     def _plan_orchestration(self, contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
         """
         Plan orchestration tasks from contract (FLUID 0.7.1).
@@ -326,6 +356,8 @@ class AwsProvider(BaseProvider):
         orchestration = contract.get("orchestration")
         if not orchestration:
             return []
+
+        from fluid_build.providers._plan_validation import PlanValidationError
 
         from .plan.orchestration import OrchestrationError, plan_orchestration_tasks
 
@@ -343,7 +375,7 @@ class AwsProvider(BaseProvider):
 
         except OrchestrationError as e:
             self.err_kv(event="orchestration_planning_failed", error=str(e))
-            raise ProviderError(f"Orchestration planning failed: {e}") from e
+            raise PlanValidationError(f"Orchestration planning failed: {e}") from e
 
     def _plan_schedule(self, contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
         """
@@ -360,11 +392,35 @@ class AwsProvider(BaseProvider):
         if not orchestration.get("schedule") and not orchestration.get("triggers"):
             return []
 
-        from .plan.schedule import plan_schedule_actions
+        from fluid_build.providers._plan_validation import PlanValidationError
+
+        from .plan.schedule import (
+            SCHEDULER_INVOKE_ROLE,
+            WORKFLOW_EXECUTION_ROLE,
+            plan_schedule_actions,
+        )
 
         try:
             actions = plan_schedule_actions(contract, self.account_id, self.region, self.logger)
 
+            if any(a.get("op") == "eventbridge.ensure_schedule" for a in actions):
+                # The schedule fires a Lambda whose body only logs each task and
+                # records it ok; it runs no build. Its two roles are named by
+                # literal ARN and nothing here creates them. Say so on every
+                # plan that emits it, rather than let a green apply imply a
+                # working pipeline.
+                self.warn_kv(
+                    event="schedule_placeholder_lambda",
+                    message=(
+                        "The scheduled Lambda is a placeholder: it logs each task and does "
+                        "not run this product's builds. The IAM roles "
+                        f"arn:aws:iam::{self.account_id}:role/{WORKFLOW_EXECUTION_ROLE} "
+                        f"(Lambda) and arn:aws:iam::{self.account_id}:role/"
+                        f"{SCHEDULER_INVOKE_ROLE} (EventBridge Scheduler) are referenced by "
+                        "name and not created: they must already exist in the account."
+                    ),
+                    contract_id=contract.get("id"),
+                )
             if actions:
                 self.info_kv(
                     event="schedule_planned",
@@ -377,7 +433,7 @@ class AwsProvider(BaseProvider):
 
         except Exception as e:
             self.err_kv(event="schedule_planning_failed", error=str(e))
-            raise ProviderError(f"Schedule planning failed: {e}") from e
+            raise PlanValidationError(f"Schedule planning failed: {e}") from e
 
     def _utc_timestamp(self) -> str:
         """Generate UTC timestamp string."""

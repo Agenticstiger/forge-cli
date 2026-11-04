@@ -132,7 +132,9 @@ def run(args, logger: logging.Logger) -> int:
         provider_name = args.provider
         if not provider_name:
             # Auto-detect from contract
-            provider_name = contract.get("provider", "aws")
+            from fluid_build.providers import resolve_retired_platform
+
+            provider_name = resolve_retired_platform(contract.get("provider", "aws"))
             if args.verbose:
                 info(logger, f"Auto-detected provider: {provider_name}")
 

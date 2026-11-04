@@ -15,12 +15,15 @@
 """Tests for fluid_build.cli.marketplace."""
 
 import argparse
+import contextlib
 import json
 import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
+import respx
 
 import fluid_build.cli.marketplace as marketplace_module
 from fluid_build.cli._common import CLIError
@@ -29,6 +32,7 @@ from fluid_build.cli.marketplace import (
     interactive_parameter_wizard,
     show_blueprint_info,
 )
+from fluid_build.util import http_client
 
 # ── helpers ────────────────────────────────────────────────────────────
 
@@ -93,124 +97,115 @@ def _make_blueprint_json(**kwargs):
 # ── show_blueprint_info ───────────────────────────────────────────────
 
 
+API = "http://localhost:8000/api/v1/blueprints"
+
+
+@contextlib.contextmanager
+def _spy_client():
+    """Record the keyword arguments each marketplace request opens its client with."""
+    with patch("fluid_build.util.http_client.new_client", wraps=http_client.new_client) as spy:
+        yield spy
+
+
 class TestShowBlueprintInfo:
     def test_success_returns_zero(self):
         args = _args(blueprint_id="test-bp", version=None, show_template=False)
-        mock_response = MagicMock()
-        mock_response.json.return_value = _make_blueprint_json()
 
         with (
             patch.object(marketplace_module, "console", MagicMock()),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
+            _spy_client() as spy,
         ):
-            mock_requests.get.return_value = mock_response
-            mock_requests.exceptions.RequestException = Exception
-            result = show_blueprint_info(args, _logger(), "http://localhost:8000/api/v1/blueprints")
+            route = router.get(f"{API}/test-bp").mock(
+                return_value=httpx.Response(200, json=_make_blueprint_json())
+            )
+            result = show_blueprint_info(args, _logger(), API)
 
         assert result == 0
+        assert route.call_count == 1
         assert (
-            mock_requests.get.call_args.kwargs["timeout"]
-            == marketplace_module.MARKETPLACE_HTTP_TIMEOUT_SECONDS
+            spy.call_args.kwargs["timeout"] == marketplace_module.MARKETPLACE_HTTP_TIMEOUT_SECONDS
         )
 
     def test_request_exception_returns_one(self):
         args = _args(blueprint_id="test-bp", version=None, show_template=False)
 
-        class FakeRequestError(Exception):
-            pass
-
         with (
             patch.object(marketplace_module, "console", MagicMock()),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
         ):
-            mock_requests.get.side_effect = FakeRequestError("connection refused")
-            mock_requests.exceptions.RequestException = FakeRequestError
-            result = show_blueprint_info(args, _logger(), "http://localhost:8000/api/v1/blueprints")
+            router.get(f"{API}/test-bp").mock(side_effect=httpx.HTTPError("connection refused"))
+            result = show_blueprint_info(args, _logger(), API)
 
         assert result == 1
 
     def test_version_passed_in_params(self):
         args = _args(blueprint_id="test-bp", version="2.0.0", show_template=False)
-        mock_response = MagicMock()
-        mock_response.json.return_value = _make_blueprint_json()
-        captured_params = {}
 
         with (
             patch.object(marketplace_module, "console", MagicMock()),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
         ):
-            mock_requests.get.side_effect = lambda url, params=None, **kwargs: (
-                captured_params.update(params or {}),
-                mock_response,
-            )[-1]
-            mock_requests.exceptions.RequestException = Exception
-            show_blueprint_info(args, _logger(), "http://localhost:8000/api/v1/blueprints")
+            route = router.get(f"{API}/test-bp").mock(
+                return_value=httpx.Response(200, json=_make_blueprint_json())
+            )
+            show_blueprint_info(args, _logger(), API)
 
-        assert captured_params.get("version") == "2.0.0"
+        assert route.calls.last.request.url.params.get("version") == "2.0.0"
 
     def test_connection_error_returns_concise_message(self):
-        import requests as real_requests
-
         args = _args(blueprint_id="test-bp", version=None, show_template=False)
         mock_console = MagicMock()
 
         with (
             patch.object(marketplace_module, "console", mock_console),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
         ):
-            mock_requests.get.side_effect = real_requests.exceptions.ConnectionError(
-                "connection refused"
+            route = router.get(f"{API}/test-bp").mock(
+                side_effect=httpx.ConnectError("connection refused")
             )
-            mock_requests.exceptions = real_requests.exceptions
-            result = show_blueprint_info(args, _logger(), "http://localhost:8000/api/v1/blueprints")
+            result = show_blueprint_info(args, _logger(), API)
 
         assert result == 1
-        assert mock_requests.get.call_count == marketplace_module.MARKETPLACE_HTTP_RETRIES + 1
+        assert route.call_count == marketplace_module.MARKETPLACE_HTTP_RETRIES + 1
         assert "Could not connect to the marketplace API" in str(mock_console.print.call_args_list)
 
     def test_success_rate_greater_than_one_shown_as_percentage(self):
         args = _args(blueprint_id="test-bp", version=None, show_template=False)
         bp_data = _make_blueprint_json(success_rate=97.5)
-        mock_response = MagicMock()
-        mock_response.json.return_value = bp_data
-        printed_calls = []
 
         mock_console = MagicMock()
 
         with (
             patch.object(marketplace_module, "console", mock_console),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
+            _spy_client() as spy,
         ):
-            mock_requests.get.return_value = mock_response
-            mock_requests.exceptions.RequestException = Exception
-            result = show_blueprint_info(args, _logger(), "http://localhost:8000/api/v1/blueprints")
+            router.get(f"{API}/test-bp").mock(return_value=httpx.Response(200, json=bp_data))
+            result = show_blueprint_info(args, _logger(), API)
 
         assert result == 0
         assert (
-            mock_requests.get.call_args.kwargs["timeout"]
-            == marketplace_module.MARKETPLACE_HTTP_TIMEOUT_SECONDS
+            spy.call_args.kwargs["timeout"] == marketplace_module.MARKETPLACE_HTTP_TIMEOUT_SECONDS
         )
 
     def test_show_template_prints_syntax(self):
         args = _args(blueprint_id="test-bp", version=None, show_template=True)
         bp_data = _make_blueprint_json()
         bp_data["contract_template"] = "{{ project_id }}"
-        mock_response = MagicMock()
-        mock_response.json.return_value = bp_data
 
         with (
             patch.object(marketplace_module, "console", MagicMock()),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
+            _spy_client() as spy,
             patch("fluid_build.cli.marketplace.Syntax", MagicMock()),
         ):
-            mock_requests.get.return_value = mock_response
-            mock_requests.exceptions.RequestException = Exception
-            result = show_blueprint_info(args, _logger(), "http://localhost:8000/api/v1/blueprints")
+            router.get(f"{API}/test-bp").mock(return_value=httpx.Response(200, json=bp_data))
+            result = show_blueprint_info(args, _logger(), API)
 
         assert result == 0
         assert (
-            mock_requests.get.call_args.kwargs["timeout"]
-            == marketplace_module.MARKETPLACE_HTTP_TIMEOUT_SECONDS
+            spy.call_args.kwargs["timeout"] == marketplace_module.MARKETPLACE_HTTP_TIMEOUT_SECONDS
         )
 
 
@@ -218,25 +213,17 @@ class TestShowBlueprintInfo:
 
 
 class TestInstantiateBlueprint:
-    def _mock_requests(self, mock_requests, bp_data, instantiate_result=None):
-        mock_requests.exceptions.RequestException = Exception
-        bp_response = MagicMock()
-        bp_response.json.return_value = bp_data
-
-        inst_response = MagicMock()
-        inst_response.json.return_value = instantiate_result or {
-            "contract": {"builds": []},
-            "cost_estimate": "$0.10",
-        }
-
-        def fake_get(url, **kwargs):
-            return bp_response
-
-        def fake_post(url, **kwargs):
-            return inst_response
-
-        mock_requests.get.side_effect = fake_get
-        mock_requests.post.side_effect = fake_post
+    def _mock_routes(self, router, bp_data, instantiate_result=None):
+        get_route = router.get(f"{API}/test-bp").mock(
+            return_value=httpx.Response(200, json=bp_data)
+        )
+        post_route = router.post(f"{API}/test-bp/instantiate").mock(
+            return_value=httpx.Response(
+                200,
+                json=instantiate_result or {"contract": {"builds": []}, "cost_estimate": "$0.10"},
+            )
+        )
+        return get_route, post_route
 
     def test_no_params_no_interactive_returns_one(self):
         args = _args(blueprint_id="test-bp", params=None, interactive=False)
@@ -244,12 +231,10 @@ class TestInstantiateBlueprint:
 
         with (
             patch.object(marketplace_module, "console", MagicMock()),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
         ):
-            self._mock_requests(mock_requests, bp_data)
-            result = instantiate_blueprint(
-                args, _logger(), "http://localhost:8000/api/v1/blueprints"
-            )
+            self._mock_routes(router, bp_data)
+            result = instantiate_blueprint(args, _logger(), API)
 
         assert result == 1
 
@@ -265,23 +250,18 @@ class TestInstantiateBlueprint:
 
         with (
             patch.object(marketplace_module, "console", MagicMock()),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
+            _spy_client() as spy,
             patch("fluid_build.cli.marketplace.Syntax", MagicMock()),
         ):
-            self._mock_requests(mock_requests, bp_data)
-            result = instantiate_blueprint(
-                args, _logger(), "http://localhost:8000/api/v1/blueprints"
-            )
+            get_route, post_route = self._mock_routes(router, bp_data)
+            result = instantiate_blueprint(args, _logger(), API)
 
         assert result == 0
-        assert (
-            mock_requests.get.call_args.kwargs["timeout"]
-            == marketplace_module.MARKETPLACE_HTTP_TIMEOUT_SECONDS
-        )
-        assert (
-            mock_requests.post.call_args.kwargs["timeout"]
-            == marketplace_module.MARKETPLACE_HTTP_TIMEOUT_SECONDS
-        )
+        assert get_route.call_count == 1
+        assert post_route.call_count == 1
+        timeouts = [call.kwargs["timeout"] for call in spy.call_args_list]
+        assert timeouts == [marketplace_module.MARKETPLACE_HTTP_TIMEOUT_SECONDS] * 2
 
     def test_params_from_file(self, tmp_path):
         params_file = tmp_path / "params.json"
@@ -297,52 +277,41 @@ class TestInstantiateBlueprint:
 
         with (
             patch.object(marketplace_module, "console", MagicMock()),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
             patch("fluid_build.cli.marketplace.Syntax", MagicMock()),
         ):
-            self._mock_requests(mock_requests, bp_data)
-            result = instantiate_blueprint(
-                args, _logger(), "http://localhost:8000/api/v1/blueprints"
-            )
+            self._mock_routes(router, bp_data)
+            result = instantiate_blueprint(args, _logger(), API)
 
         assert result == 0
 
     def test_fetch_failure_returns_one(self):
         args = _args(blueprint_id="test-bp", params='{"x": 1}', interactive=False)
 
-        class FakeError(Exception):
-            pass
-
         with (
             patch.object(marketplace_module, "console", MagicMock()),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
         ):
-            mock_requests.get.side_effect = FakeError("conn error")
-            mock_requests.exceptions.RequestException = FakeError
-            result = instantiate_blueprint(
-                args, _logger(), "http://localhost:8000/api/v1/blueprints"
-            )
+            router.get(f"{API}/test-bp").mock(side_effect=httpx.HTTPError("conn error"))
+            result = instantiate_blueprint(args, _logger(), API)
 
         assert result == 1
 
     def test_fetch_timeout_retries_and_returns_one(self):
-        import requests as real_requests
-
         args = _args(blueprint_id="test-bp", params='{"x": 1}', interactive=False)
         mock_console = MagicMock()
 
         with (
             patch.object(marketplace_module, "console", mock_console),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
         ):
-            mock_requests.get.side_effect = real_requests.exceptions.Timeout("read timed out")
-            mock_requests.exceptions = real_requests.exceptions
-            result = instantiate_blueprint(
-                args, _logger(), "http://localhost:8000/api/v1/blueprints"
+            route = router.get(f"{API}/test-bp").mock(
+                side_effect=httpx.ReadTimeout("read timed out")
             )
+            result = instantiate_blueprint(args, _logger(), API)
 
         assert result == 1
-        assert mock_requests.get.call_count == marketplace_module.MARKETPLACE_HTTP_RETRIES + 1
+        assert route.call_count == marketplace_module.MARKETPLACE_HTTP_RETRIES + 1
         assert "timed out after" in str(mock_console.print.call_args_list)
 
     def test_output_file_saved(self, tmp_path):
@@ -358,13 +327,11 @@ class TestInstantiateBlueprint:
 
         with (
             patch.object(marketplace_module, "console", MagicMock()),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
             patch("fluid_build.cli.marketplace.Syntax", MagicMock()),
         ):
-            self._mock_requests(mock_requests, bp_data)
-            result = instantiate_blueprint(
-                args, _logger(), "http://localhost:8000/api/v1/blueprints"
-            )
+            self._mock_routes(router, bp_data)
+            result = instantiate_blueprint(args, _logger(), API)
 
         assert result == 0
         assert output_file.exists()
@@ -381,21 +348,15 @@ class TestInstantiateBlueprint:
         )
         bp_data = _make_blueprint_json()
 
-        class FakeReqError(Exception):
-            response = None
-
         with (
             patch.object(marketplace_module, "console", MagicMock()),
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
         ):
-            mock_requests.exceptions.RequestException = FakeReqError
-            bp_response = MagicMock()
-            bp_response.json.return_value = bp_data
-            mock_requests.get.return_value = bp_response
-            mock_requests.post.side_effect = FakeReqError("instantiate failed")
-            result = instantiate_blueprint(
-                args, _logger(), "http://localhost:8000/api/v1/blueprints"
+            router.get(f"{API}/test-bp").mock(return_value=httpx.Response(200, json=bp_data))
+            router.post(f"{API}/test-bp/instantiate").mock(
+                side_effect=httpx.HTTPError("instantiate failed")
             )
+            result = instantiate_blueprint(args, _logger(), API)
 
         assert result == 1
 

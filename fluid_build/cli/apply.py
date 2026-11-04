@@ -308,6 +308,85 @@ def _gate_contract_for_apply(contract: Dict[str, Any], logger: logging.Logger) -
     _gate_contract_for_plan_or_apply(contract, logger, command="apply")
 
 
+def _gate_build_ids_for_apply(contract: Dict[str, Any]) -> None:
+    """Refuse, before anything is applied, an id the build phase would refuse.
+
+    The build phase turns ``contract.id`` and ``builds[].id`` into directory
+    names, so it takes a narrower grammar than the schema: ``1orders``, or an
+    id of 129 characters, passes ``fluid validate`` and ``fluid plan``. The
+    build runner checks the ids itself, but on the OpenTofu engine it runs
+    after ``tofu apply``, so such an id was refused once the product was
+    provisioned, as an "Unexpected error". This is the runner's own check
+    (``build_runners._ids.validate_build_ids``), run ahead of the hooks,
+    ``tofu`` and the runner on both engines.
+
+    Raises:
+        CLIError: ``apply_build_identifier_invalid``.
+    """
+    from fluid_build.build_runners._ids import IdentifierViolation, validate_build_ids
+
+    try:
+        validate_build_ids(contract)
+    except IdentifierViolation as exc:
+        raise CLIError(
+            1,
+            "apply_build_identifier_invalid",
+            {
+                "field": exc.kind,
+                "value": repr(exc.value),
+                "hint": (
+                    "The build phase keeps each build's run records, cursors and "
+                    "watermarks under .fluid/runs/<contract.id>/<build.id>/, so both ids "
+                    "must start with a letter or underscore, use only letters, digits, "
+                    "'_', '.' and '-', and be at most 128 characters. The contract schema "
+                    "allows more, so fluid validate and fluid plan accept it. Nothing was "
+                    "applied."
+                ),
+            },
+        ) from exc
+
+
+def _gate_selected_build_for_apply(contract: Dict[str, Any], build_id: Optional[str]) -> None:
+    """Refuse, before anything is applied, a ``--build-id`` that names no build.
+
+    The build runner keeps the builds whose id equals ``--build-id`` and, with
+    none left, logs "Build not found" and returns 1. On the OpenTofu engine it
+    runs after ``tofu apply``, so a mistyped id provisioned the product and
+    then failed. This is the runner's own match
+    (``build_runners.base.run_builds_from_args``), run ahead of the hooks,
+    ``tofu`` and the runner on both engines. Like the runner, it checks nothing
+    for an empty ``--build-id``, which filters nothing, or for a contract with
+    no builds, where the runner returns before it filters.
+
+    Raises:
+        CLIError: ``apply_build_id_not_found``.
+    """
+    builds = contract.get("builds") or []
+    if not (isinstance(build_id, str) and build_id) or not builds:
+        return
+    # The runner's filter: an exact match, case and spaces included.
+    if any(isinstance(build, dict) and build.get("id") == build_id for build in builds):
+        return
+    available = [build["id"] for build in builds if isinstance(build, dict) and build.get("id")]
+    if available:
+        why, fix = "no build of the contract has that id", "Pass one of the available ids"
+    else:
+        why, fix = "none of the contract's builds declares an id", "Give the build you mean an id"
+    raise CLIError(
+        1,
+        "apply_build_id_not_found",
+        {
+            "build_id": repr(build_id),
+            "available": available,
+            "hint": (
+                "--build-id selects the build whose id equals it exactly, case and spaces "
+                f"included, and {why}. {fix}, or drop --build-id to run every build. "
+                "Nothing was applied."
+            ),
+        },
+    )
+
+
 def _log_apply_failure(logger: logging.Logger, start_time: float, error: Exception) -> None:
     """Record a pre-dispatch ``apply_contract`` failure for the structured log."""
     log_operation_failure(logger, "apply_contract", error=error, duration=time.time() - start_time)
@@ -1208,7 +1287,10 @@ def _declared_platforms(contract: Dict[str, Any]) -> Tuple[List[_Declared], List
     )
 
     def _key(platform: Any) -> str:
-        return str(platform).strip().lower().replace("-", "_")
+        from fluid_build.providers import resolve_retired_platform
+
+        # ``redshift`` (retired as a provider) is served by its successor, ``aws``.
+        return resolve_retired_platform(str(platform).strip().lower().replace("-", "_"))
 
     builds = [b for b in contract.get("builds") or [] if isinstance(b, dict)]
     lands: List[_Declared] = []
@@ -1234,7 +1316,7 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
 
     A ``binding.platform`` says where an expose lands and a build's
     ``execution.runtime.platform`` where it runs; neither is a provider name,
-    though ``local``, ``gcp``, ``aws``, ``snowflake`` and ``redshift`` are also
+    though ``local``, ``gcp``, ``aws`` and ``snowflake`` are also
     providers. Read as one, a Kafka binding or a Flink build's
     ``runtime.platform: kubernetes`` ended the run as ``provider_unknown``.
 
@@ -1961,8 +2043,15 @@ def run(args, logger: logging.Logger) -> int:
     # IaC plugin clouds) and both engines' ``needs_build`` returns used to
     # skip it, so a schema-invalid contract reached ``tofu`` or the build
     # runner and could exit 0. One call per run, on the one loaded copy.
+    # A build mode also checks the ids the build phase turns into paths, which
+    # the schema admits more of, and then that ``--build-id`` names a build, in
+    # the runner's order: on the OpenTofu engine the runner would only refuse
+    # either after ``tofu apply``.
     try:
         _gate_contract_for_apply(source_contract, logger)
+        if needs_build(resolved_mode):
+            _gate_build_ids_for_apply(source_contract)
+            _gate_selected_build_for_apply(source_contract, resolved_build_id)
     except CLIError as exc:
         _log_apply_failure(logger, start_time, exc)
         raise

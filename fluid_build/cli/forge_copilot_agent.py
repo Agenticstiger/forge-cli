@@ -466,7 +466,9 @@ class CopilotAgentBase(CopilotProjectMemoryMixin, CopilotLegacyScaffoldMixin, AI
             if self.console:
                 self.console.print(f"[red]❌ {exc.message}[/red]")
                 for suggestion in exc.suggestions:
-                    self.console.print(f"[dim]• {suggestion}[/dim]")
+                    from rich.markup import escape as _rich_escape
+
+                    self.console.print(f"[dim]• {_rich_escape(str(suggestion))}[/dim]")
             else:
                 console_error(exc.message)
                 for suggestion in exc.suggestions:

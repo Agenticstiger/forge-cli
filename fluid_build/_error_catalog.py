@@ -74,7 +74,7 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     # ── providers ──────────────────────────────────────────────────────────
     "provider_not_specified": (
         [
-            "Pass a provider: --provider local|gcp|snowflake|aws|azure",
+            "Pass a provider: --provider aws|databricks|gcp|local|snowflake",
             "Or set the FLUID_PROVIDER environment variable",
             "Run 'fluid providers' to list the available providers",
         ],
@@ -91,7 +91,14 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     "provider_unknown": (
         [
             "Run 'fluid providers' to see the available providers",
-            "Valid built-ins: local, gcp, snowflake, aws, azure",
+            "Valid built-ins: aws, databricks, gcp, local, snowflake",
+        ],
+        "providers",
+    ),
+    "provider_retired": (
+        [
+            "Run 'fluid providers' to see the available providers",
+            "CHANGELOG.md lists it under Removed, with its replacement",
         ],
         "providers",
     ),
@@ -258,6 +265,25 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Run 'fluid validate <contract>' first to rule out a contract problem"],
         None,
     ),
+    "apply_build_identifier_invalid": (
+        [
+            "Rename the id to fit, for example orders_v1 instead of 1orders, and apply again",
+            (
+                "A renamed id starts over: its builds get new cursors and watermarks under "
+                ".fluid/runs/, and a renamed contract.id gets a new OpenTofu workdir under "
+                ".fluid/iac/<provider>/"
+            ),
+        ],
+        None,
+    ),
+    "apply_build_id_not_found": (
+        [
+            "Pass one of the available build ids as --build-id: ids match exactly, case included",
+            "Run 'fluid apply <contract> --mode amend-and-build' without --build-id to run "
+            + "every build",
+        ],
+        None,
+    ),
     "output_write_failed": (
         ["Check that the --out path is writable and the parent directory exists"],
         None,
@@ -314,6 +340,21 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             "--llm-provider claude-code",
         ],
         "secrets",
+    ),
+    # Optional-dependency gate (fluid_build/_optional.py). The message already
+    # carries the exact `pip install` line; these only give the stable slug a
+    # curated follow-up and a docs anchor.
+    "copilot_litellm_unavailable": (
+        ["Run 'fluid doctor' to see which optional packages are installed"],
+        None,
+    ),
+    "mcp_sdk_unavailable": (
+        ["Run 'fluid doctor' to see which optional packages are installed"],
+        None,
+    ),
+    "optional_dependency_missing": (
+        ["Run 'fluid doctor' to see which optional packages are installed"],
+        None,
     ),
     "copilot_missing_llm_model": (
         [

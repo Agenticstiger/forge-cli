@@ -36,8 +36,8 @@ _ENV_TEMPLATE_RE = re.compile(r"\{\{\s*env\.(\S+?)\s*\}\}")
 # share the canonical pattern without redefining or importing a private name.
 ENV_TEMPLATE_RE = _ENV_TEMPLATE_RE
 _ACCOUNT_HOST_RE = re.compile(r"\.snowflakecomputing\.com$", re.IGNORECASE)
-_ACCOUNT_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-_ACCOUNT_REGION_SEGMENT_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+$")
+_ACCOUNT_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+\Z")
+_ACCOUNT_REGION_SEGMENT_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\Z")
 _ACCOUNT_CLOUD_SUFFIXES = frozenset({"aws", "azure", "gcp"})
 
 # Keys that carry secret material. These MUST never appear in the `_sources`

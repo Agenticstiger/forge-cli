@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Standalone Redshift provider for rollback / DDL emission.
+"""Standalone Redshift helper for rollback / DDL emission.
 
 The full AWS provider (``fluid_build.providers.aws.AwsProvider``) handles
 Redshift planning. Redshift's rollback semantics are
 SQL-DDL-based (``DROP`` + ``CREATE TABLE AS SELECT`` inside a transaction)
 while the rest of AWS (S3 / Glue / Athena) uses prefix-copy semantics.
 
-Splitting Redshift out as its own provider class keeps the rollback
+Splitting Redshift out as its own class keeps the rollback
 surface modular: ``cli/_rollback_writer.py::_delegate_to_provider``
 asks each provider for its restore DDL by name, and Redshift owns its
 SQL while ``AwsProvider`` returns ``[]`` (S3 prefix-copy is non-DDL).
@@ -32,9 +32,10 @@ require a snapshot-source switch inside the AWS provider, which couples
 two unrelated rollback semantics. One class per restore-semantics is
 cleaner than one class with two switches.
 
-Registered as ``"redshift"`` in the provider registry so
-``_delegate_to_provider("redshift", "restore_ddl", snapshot)`` succeeds
-without falling through to the legacy lookup.
+Not in the provider registry (``redshift`` is no longer a ``--provider``;
+Redshift is part of ``aws``).
+``_delegate_to_provider("redshift", "restore_ddl", snapshot)`` imports this
+class directly, keyed by the snapshot's provider name.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ from ..base import ApplyResult, BaseProvider
 
 
 class RedshiftProvider(BaseProvider):
-    """Thin Redshift provider — owns rollback semantics only.
+    """Thin Redshift helper — owns rollback semantics only.
 
     ``plan`` delegates to the full ``AwsProvider``; this class exists
     primarily so ``restore_ddl`` and ``cleanup_backups`` participate in

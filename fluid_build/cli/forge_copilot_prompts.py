@@ -253,7 +253,7 @@ _PROFILES_DIR: Path = Path(__file__).with_name("agent_specs") / "prompt_profiles
 # leading dot/underscore. This is the first line of defence against
 # ``--prompt-profile ../../etc``; ``_resolve_profile_dir`` adds a resolved-path
 # containment check as the second.
-_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
 class PromptProfileError(ValueError):

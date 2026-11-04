@@ -487,11 +487,11 @@ def validate_contract_path(raw: Any) -> str:
 
 
 def validate_id(raw: Any, *, kind: str) -> str:
-    """:func:`validate_identifier`, refusing a trailing newline as well.
+    """:func:`validate_identifier` as a :class:`ScheduleRenderError`, with its own newline check.
 
-    The shared grammar ends in ``$``, which also matches before a final
-    ``\\n``; an id or env that carries one names nothing fluid can find
-    (``--env 'aws\\n'`` silently applies no overlay).
+    An id or env that ends in a newline names nothing fluid can find (``--env
+    'aws\\n'`` silently applies no overlay). The shared grammar ends in
+    ``\\Z`` and refuses one already; the check below still holds if it changes.
     """
     try:
         value = validate_identifier(raw, kind=kind)

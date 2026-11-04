@@ -251,7 +251,9 @@ def _build_router(model_list: List[Dict[str, Any]]) -> Any:
     * ``set_verbose=False`` — keep litellm's debug logging off; we own
       observability via the structured-events bus.
     """
-    import litellm  # type: ignore[import-untyped]
+    from fluid_build._optional import require
+
+    litellm = require("litellm", "litellm", "LLM fallback routing")
 
     # ``fallbacks`` is a list-of-dict-of-list: each dict maps the
     # primary model_name to a list of fallback model_names. With all

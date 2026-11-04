@@ -34,7 +34,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.iac import build_module, get_iac_plugin, runner
 from fluid_build.iac.backend import (
     STATE_BACKEND_ENV,
@@ -106,10 +106,16 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
 
     plugin = get_iac_plugin(provider)
     if plugin is None:
+        from fluid_build.iac.registry import iac_plugin_unavailable_reason
+
+        why = iac_plugin_unavailable_reason(provider)
         raise CLIError(
             1,
             "opentofu_engine_unsupported_provider",
-            {"error": f"no OpenTofu plugin for provider {provider!r}"},
+            {
+                "error": f"no OpenTofu plugin for provider {provider!r}"
+                + (f": {why}" if why else "")
+            },
         )
     if runner.tofu_path() is None:
         # `tofu` isn't on PATH. When the operator opted in (--ensure-opentofu,
@@ -1074,9 +1080,11 @@ def _enforce_data_loss_gate(
             changes["remove"],
         )
     if lost_in_place:
-        cprint(
+        # The lines quote live objects (a table's column types): data, not markup.
+        cprint_literal(
             "\n  ⚠️  --allow-data-loss: existing data is changed in place with no snapshot: "
-            + "; ".join(lost_in_place)
+            + "; ".join(lost_in_place),
+            soft_wrap=True,
         )
         logger.warning(
             "--allow-data-loss: bypassing the data-loss gate for in-place data changes "
@@ -1470,12 +1478,11 @@ def _report_plan_notices(plugin: Any, contract: Mapping[str, Any], logger: loggi
     if not callable(notices):
         return
     try:
-        lines = list(notices(contract))
+        for line in notices(contract):
+            # A notice can quote live objects, so it is data, not markup.
+            cprint_literal(f"  note: {line}")
     except Exception as exc:  # noqa: BLE001 — advisory only, never fails an apply
         logger.debug("plan notices unavailable: %s", type(exc).__name__)
-        return
-    for line in lines:
-        cprint(f"  note: {line}")
 
 
 def _reconcile_with_state(

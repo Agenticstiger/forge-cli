@@ -76,6 +76,10 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping, Sequence
 
+# Key recognition lives in ``util.contract`` so ``fluid diff`` judges a key the way this
+# engine builds one without importing every engine; re-exported for ``_tm.*`` callers.
+from ...util.contract import column_is_key, is_truthy  # noqa: F401
+
 # ── Package prefixes / canonical test names ───────────────────────────────
 # The single numeric range/between dialect (see module docstring).
 RANGE_TEST_NAME = "dbt_expectations.expect_column_values_to_be_between"
@@ -275,7 +279,6 @@ def sentinel_test(kind: str, column: str | None = None) -> str:
 # ``maximum`` / FK spellings below are accepted best-effort because contracts
 # express quality intent inline in practice.
 
-_PK_KEYS = ("primary", "primaryKey", "primary_key", "pk", "isPrimary")
 _ENUM_KEYS = ("enum", "acceptedValues", "accepted_values")
 _FK_KEYS = ("foreign_key", "foreignKey", "references", "relationship_to")
 
@@ -296,32 +299,6 @@ _BETWEEN_RE = re.compile(
     r"^\s*between\s+(-?\d+(?:\.\d+)?)\s+and\s+(-?\d+(?:\.\d+)?)\s*$", re.IGNORECASE
 )
 _REFERENCES_RE = re.compile(r"^\s*references\s+(\S+?)\.(\w+)\s*$", re.IGNORECASE)
-
-
-def is_truthy(value: Any) -> bool:
-    """Loose truthiness for YAML/JSON booleans-as-strings (``"true"``/``True``)."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in ("true", "1", "yes")
-    return bool(value)
-
-
-def column_is_key(col: Mapping[str, Any]) -> bool:
-    """True when the column is declared a uniqueness key / primary key."""
-    if is_truthy(col.get("unique")):
-        return True
-    if any(is_truthy(col.get(k)) for k in _PK_KEYS):
-        return True
-    if str(col.get("semanticType") or "").strip().lower() in ("identifier", "primary_key"):
-        return True
-    labels = col.get("labels")
-    if isinstance(labels, Mapping):
-        if is_truthy(labels.get("unique")):
-            return True
-        if str(labels.get("constraint") or "").strip().lower() in ("primary_key", "unique"):
-            return True
-    return False
 
 
 def validation_rules(col: Mapping[str, Any]) -> list[Mapping[str, Any]]:

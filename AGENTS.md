@@ -199,7 +199,7 @@ new extra installed). `uv` is dev-time only — not a runtime dep.
 - **Changing what `fluid plan` emits**: `plan.json` must carry both `planDigest` and `bundleDigest` (re-run `inject_digests` after any mutation to the dict). Actions must carry BOTH `op` and `action_type` fields — apply.py's provider dispatcher reads `op`, display/viz reads `action_type`. Dropping either silently breaks the pipeline.
 - **Generating a new CI system template**: extend `fluid_build/forge/core/pipeline_templates.py`. The 11-stage sequence + the `--install-mode {pypi,dev-source}` semantics must be preserved across systems. Jenkins is the reference implementation; GitHub Actions / GitLab / Azure / Bitbucket / CircleCI / Tekton port from it.
 - **Adding a new Path-B scheduler**: extend `fluid_build/providers/<provider>/plan/schedule.py` with a `SchedulePlanner`-compatible interface. Stage 6 `fluid plan` invokes it; stage 7 apply executes the resulting actions alongside DDL.
-- **Adding a new publish target / catalog backend**: drop a new module under `fluid_build/build_runners/catalog_registrars/<name>.py` that defines a `CatalogRegistrar` (the sync HTTP-level shape — see `datahub.py` as the reference) and ends with a `register_catalog_backend(CatalogBackendSpec(...))` call. The spec declares the canonical name, optional aliases, the registrar factory, and a flat `env_vars` mapping (config key → tuple of accepted env vars). That single file makes the backend visible on both publish surfaces — `fluid publish --target <name>` and contract `properties.catalog.register: [<name>]` — and applies the env-var overrides via `config_manager._apply_catalog_env_overrides`. No edits to `providers/catalogs/__init__.py`, `_catalog.py`, or `publish.py` are required. The two legacy native async providers (`fluid-command-center`, `datamesh-manager`) keep custom config shapes and live as hand-wired `BaseCatalogProvider` subclasses under `providers/catalogs/`; new backends should prefer the registrar shape unless they truly need the async-native surface.
+- **Adding a new publish target / catalog backend**: drop a new module under `fluid_build/build_runners/catalog_registrars/<name>.py` that defines a `CatalogRegistrar` (the sync HTTP-level shape — see `datahub.py` as the reference) and ends with a `register_catalog_backend(CatalogBackendSpec(...))` call. The spec declares the canonical name, optional aliases, the registrar factory, and a flat `env_vars` mapping (config key → tuple of accepted env vars). That single file makes the backend visible on both publish surfaces — `fluid publish --target <name>` and contract `properties.catalog.register: [<name>]` — and applies the env-var overrides via `config_manager._apply_catalog_env_overrides`. No edits to `providers/catalogs/__init__.py`, `_catalog.py`, or `publish.py` are required. Command Center (`fluid-command-center`) keeps a custom config shape as a hand-wired `BaseCatalogProvider` subclass under `providers/catalogs/`; Data Mesh Manager is a catalog backend (`build_runners/catalog_registrars/datamesh_manager.py`) reached with `fluid publish --target datamesh-manager`, plus the `fluid datamesh-manager` command, and is not a provider; new backends should prefer the registrar shape unless they truly need the async-native surface.
 - **Adding a copilot tool that takes a path**: accept `workspace_root: Optional[Path]` as a kwarg from `dispatch_tool_call`; confine the LLM-supplied path with `resolved.relative_to(workspace_root)` and apply a suffix allow-list + size cap. Reference implementation: `cli/forge_copilot_tools.py::_dispatch_read_sample_schema`.
 - **Emitting new SQL DDL**: identifiers must go through `fluid_build/providers/_sql_safety.py::validate_ident`; string literals through `quote_string_literal`. Inline `.replace("'", "''")` is considered a regression — it diverges from the central helper.
 - **Adding a secret pattern to logs**: extend `fluid_build/providers/snowflake/util/logging.py::SENSITIVE_PATTERNS`/`SENSITIVE_KEYS` AND mirror the addition into `fluid_build/observability/secret_redactor.py` to keep the two redactor layers symmetric.
@@ -676,6 +676,72 @@ The reference plugin for `extension_validators` + `commands` is the
 `data-product-forge-custom-scaffold` package; reading its entry-point
 declarations in its `pyproject.toml` is the canonical "how to write a
 plugin" example.
+
+### Shipping an IaC plugin (an OpenTofu emitter for another platform)
+
+An outside package adds a platform to `fluid generate iac` and `fluid apply`
+with an entry point; no forge-cli edit.
+
+```toml
+[project.entry-points."fluid_build.iac_providers"]
+onprem = "my_pkg.iac:OnPremIacPlugin"
+```
+
+- **Interface.** The target is a class (instantiated with no args) or an
+  instance implementing `fluid_build.iac.base.IacProviderPlugin`: `name`,
+  `required_providers`, `credential_env_vars`, and `emit`, `emit_data`,
+  `credential_env`, `discover_imports`, `provider_block`. Optional
+  capabilities are listed on that Protocol's docstring. The entry-point name is
+  the platform: `binding.platform: onprem` selects it.
+- **Schema.** `binding.platform` is a closed enum in every shipped schema, so a
+  plugin serves a platform the schema admits and no built-in emitter serves
+  (`kubernetes`, `postgres`, `kafka`, ...). Opening the enum is a schema change.
+- **Loading is lazy and by name** (stevedore `DriverManager` style, via
+  `iac.registry.get_iac_plugin`). Nothing is imported at startup, so `fluid
+  --help` and `fluid providers` never run plugin code; the plugin is imported
+  the first time a contract's platform needs it. `cutover.default_engine` sends
+  a platform a plugin serves to the OpenTofu engine.
+- **Selecting a plugin platform.** A contract's `binding.platform` is
+  auto-detected. The global `fluid --provider` flag is validated against the
+  apply-provider registry and accepts built-ins only for now.
+- **Policy.** `FLUID_PLUGINS_ALLOWLIST` / `FLUID_PLUGINS_BLOCKLIST` (names match
+  case-insensitively, `-` == `_`; the blocklist wins; qualified entries restrict
+  nothing) and the reserved names are checked before `ep.load()`.
+  `get_plugin_info().requires_cli` (PEP 440) is read from the loaded plugin, so
+  it is checked right after the import, with the provider registry's gate: a
+  WARNING `provider_version_warning`, and a refusal when
+  `FLUID_PLUGIN_STRICT_COMPAT=1`.
+- **Reserved names.** An entry point may not claim a built-in platform: `aws`,
+  `gcp`, `snowflake`, `confluent`, `databricks`, any alias in
+  `iac/provider_match.py::PROVIDER_ALIASES` (`s3`, `glue`, `athena`, `google`,
+  `gcs`, `bigquery`, `local`, `duckdb`, ...) or a retired provider name
+  (`redshift`, `datamesh_manager`). It is skipped before it is imported, with a
+  WARNING `iac_provider_name_reserved` naming the distribution. A plugin's own
+  `name` (the Terraform provider's local name) is not reserved.
+- **Operator opt-in to replace a built-in.** The operator grants it with a
+  distribution-qualified entry in `FLUID_PLUGINS_ALLOWLIST`:
+  `<distribution>:<entry-point name>`, e.g. `acme-fluid-aws:aws` (distribution
+  names compare PEP 503-normalised, the entry-point name case-insensitively).
+  The plugin then loads and replaces the built-in for that platform, with an
+  INFO `iac_provider_override_granted`. A bare `aws` cannot grant it (the
+  built-in has that name), and qualified entries never make the allowlist
+  restrictive: plain names keep their meaning. The distribution is read from the
+  installed distribution's real name (`ep.dist.name`, a valid PEP 508 name), not
+  its display string. A bare allowlist that omits the name cancels the grant
+  (WARNING `iac_provider_grant_cancelled`). A granted override replaces the
+  emitter plugin only, not the in-tree validation helpers
+  (`iac.providers.gcp._bq_type`, `validate_gcp_binding`, ...) that modules import
+  directly.
+- **Duplicate names.** Several distributions shipping one reserved name: each
+  ungranted claim is warned about and the one granted claim loads. Several
+  shipping one non-reserved name: all are refused with one WARNING
+  (`iac_provider_name_ambiguous`); block the name with `FLUID_PLUGINS_BLOCKLIST`
+  or uninstall the extras.
+- **State guard.** Before a destructive apply attributes a state to a cloud,
+  every admitted installed plugin is loaded (`state_migration`), so another
+  plugin cloud's resources are never mistaken for ambiguous ones.
+- **Tests.** `tests/iac/test_iac_entrypoint_lazy_plugin.py` builds a real
+  throwaway `.dist-info` and is the pattern to copy.
 
 ## Links
 

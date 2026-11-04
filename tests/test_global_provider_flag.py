@@ -15,7 +15,8 @@
 """The global ``--provider`` flag must agree with the provider registry.
 
 `fluid providers` (help text: "List all discoverable infrastructure providers")
-returned aws / datamesh_manager / gcp / local / redshift / snowflake, while the
+returned aws / databricks / datamesh_manager / gcp / local / redshift / snowflake (then;
+``redshift`` and ``datamesh_manager`` have since been retired as providers), while the
 global flag carried a hardcoded ``choices=["local","gcp","snowflake","aws",
 "azure"]``. The two disagreed in BOTH directions:
 
@@ -57,12 +58,9 @@ class TestChoicesComeFromTheRegistry:
             assert args.provider == name
 
     def test_a_registry_provider_the_old_enum_rejected_now_parses(self, parser):
-        # 'redshift' and 'datamesh_manager' ship in the registry and were
-        # rejected by the enum.
-        known = _known_provider_names()
-        for name in ("redshift", "datamesh_manager"):
-            if name in known:
-                assert parser.parse_args(["--provider", name, "providers"]).provider == name
+        # 'databricks' ships in the registry and was rejected by the enum.
+        assert "databricks" in _known_provider_names()
+        assert parser.parse_args(["--provider", "databricks", "providers"]).provider == "databricks"
 
     def test_an_unregistered_provider_is_reported_as_unknown(self):
         from fluid_build.cli import _validate_global_args

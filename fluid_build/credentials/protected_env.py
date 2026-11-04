@@ -197,6 +197,8 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "FLUID_DIAG_OUT_DIR",
         "FLUID_PRICES_JSON",
         "FLUID_STATE_BACKEND",
+        # =0 turns S3 state locking off: the operator's call, never a checkout's
+        "FLUID_TOFU_S3_LOCKFILE",
         "FLUID_STORE_BACKEND",
         "FLUID_STORE_DSN",
         "FLUID_STORE_PATH",

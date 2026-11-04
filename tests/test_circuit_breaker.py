@@ -149,10 +149,9 @@ class TestCommandCenterReporter:
 
     def test_send_logs_noop_when_empty_logs(self):
         config = self._make_config(configured=True)
-        with patch("fluid_build.observability.reporter.requests", MagicMock()):
-            reporter = CommandCenterReporter(config)
-            reporter.send_logs("123", [])
-            assert reporter.queue.empty()
+        reporter = CommandCenterReporter(config)
+        reporter.send_logs("123", [])
+        assert reporter.queue.empty()
 
     def test_send_metrics_noop_when_disabled(self):
         config = self._make_config(configured=False)
@@ -160,8 +159,7 @@ class TestCommandCenterReporter:
         reporter.send_metrics("123", [{"name": "duration", "value": 1.0}])
         assert reporter.queue.empty()
 
-    @patch("fluid_build.observability.reporter.requests")
-    def test_enqueue_adds_to_queue(self, _mock_requests):
+    def test_enqueue_adds_to_queue(self):
         config = self._make_config(configured=True)
         reporter = CommandCenterReporter(config)
         reporter._enqueue("POST", "/api/v1/test", {"key": "val"})
@@ -170,8 +168,7 @@ class TestCommandCenterReporter:
         assert event["method"] == "POST"
         assert event["endpoint"] == "/api/v1/test"
 
-    @patch("fluid_build.observability.reporter.requests")
-    def test_enqueue_drops_when_full(self, _mock_requests):
+    def test_enqueue_drops_when_full(self):
         config = self._make_config(configured=True)
         reporter = CommandCenterReporter(config)
         reporter.queue = queue.Queue(maxsize=1)
@@ -179,8 +176,7 @@ class TestCommandCenterReporter:
         reporter._enqueue("POST", "/test2", {})  # should be dropped
         assert reporter.queue.qsize() == 1
 
-    @patch("fluid_build.observability.reporter.requests")
-    def test_register_execution_with_git_info(self, _mock_requests):
+    def test_register_execution_with_git_info(self):
         config = self._make_config(configured=True)
         reporter = CommandCenterReporter(config)
         reporter.register_execution(
@@ -193,8 +189,7 @@ class TestCommandCenterReporter:
         assert event["payload"]["git_repo"] == "test"
         assert event["payload"]["git_commit"] == "abc123"
 
-    @patch("fluid_build.observability.reporter.requests")
-    def test_update_execution_payload(self, _mock_requests):
+    def test_update_execution_payload(self):
         config = self._make_config(configured=True)
         reporter = CommandCenterReporter(config)
         reporter.update_execution(
@@ -207,15 +202,13 @@ class TestCommandCenterReporter:
         assert event["payload"]["status"] == "success"
         assert event["payload"]["progress"] == 100.0
 
-    @patch("fluid_build.observability.reporter.requests")
-    def test_update_execution_empty_payload_not_enqueued(self, _mock_requests):
+    def test_update_execution_empty_payload_not_enqueued(self):
         config = self._make_config(configured=True)
         reporter = CommandCenterReporter(config)
         reporter.update_execution(execution_id="abc")
         assert reporter.queue.empty()
 
-    @patch("fluid_build.observability.reporter.requests")
-    def test_send_event_post(self, _mock_requests):
+    def test_send_event_post(self):
         config = self._make_config(configured=True)
         reporter = CommandCenterReporter(config)
         mock_response = MagicMock()
@@ -227,8 +220,7 @@ class TestCommandCenterReporter:
         reporter._send_event(event)
         reporter.session.post.assert_called_once()
 
-    @patch("fluid_build.observability.reporter.requests")
-    def test_send_event_patch(self, _mock_requests):
+    def test_send_event_patch(self):
         config = self._make_config(configured=True)
         reporter = CommandCenterReporter(config)
         mock_response = MagicMock()
@@ -239,8 +231,7 @@ class TestCommandCenterReporter:
         reporter._send_event(event)
         reporter.session.patch.assert_called_once()
 
-    @patch("fluid_build.observability.reporter.requests")
-    def test_send_event_unsupported_method_raises(self, _mock_requests):
+    def test_send_event_unsupported_method_raises(self):
         config = self._make_config(configured=True)
         reporter = CommandCenterReporter(config)
         reporter.session = MagicMock()

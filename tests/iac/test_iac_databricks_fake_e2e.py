@@ -653,7 +653,7 @@ def test_a_dry_run_prints_the_statements_and_executes_none(workspace, fake, capf
 
 
 @requires_sdk
-def test_a_changed_predicate_binds_a_new_function_and_keeps_the_old_one(workspace, fake, capfd):
+def test_a_changed_predicate_binds_a_new_function_and_drops_the_old_one(workspace, fake, capfd):
     assert apply_contract(capfd, write_contract(workspace, _restricted()))[0] == 0
     old = _live(fake)["row_filter"]["function_name"]
     masks = _masks(fake)
@@ -661,9 +661,12 @@ def test_a_changed_predicate_binds_a_new_function_and_keeps_the_old_one(workspac
     rc, out = apply_contract(capfd, write_contract(workspace, _restricted(where="region = 'uk'")))
     assert rc == 0, out
     new = _live(fake)["row_filter"]["function_name"]
-    assert new != old and old in fake.functions and new in fake.functions
+    assert new != old and old not in fake.functions and new in fake.functions
     assert _masks(fake) == masks
-    assert not any(s.startswith("DROP") for s in fake.sql_log)
+    assert f"dropped superseded function {old}" in out
+    assert [s for s in fake.sql_log if s.startswith("DROP")] == [
+        f"DROP FUNCTION IF EXISTS `main`.`sales`.`{old.rsplit('.', 1)[1]}`"
+    ]
     assert not any("REPLACE FUNCTION" in s for s in fake.sql_log)
 
 

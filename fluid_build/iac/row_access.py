@@ -43,7 +43,7 @@ from typing import Any, List, Mapping, Tuple
 from .base import UnsupportedBindingError
 from .column_access import policy_where
 
-_NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+_NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}\Z")
 
 
 @dataclass(frozen=True)
@@ -84,7 +84,11 @@ def _predicate_columns(where: str, at: str) -> Tuple[str, ...]:
     try:
         import sqlglot
         from sqlglot import expressions as exp
-    except ImportError:  # pragma: no cover - sqlglot is a core dependency
+    except ImportError:  # pragma: no cover - sqlglot is a base dependency
+        # Fails OPEN on the structural checks: without sqlglot the separator and
+        # comment check above still runs, but subqueries, UNION/GROUP/ORDER/LIMIT
+        # and undeclared columns go unchecked. This is sqlglot's real consumer in
+        # the base install, so keep it in `dependencies`.
         return ()
     try:
         tree = sqlglot.parse_one(f"SELECT 1 FROM t WHERE {where}")

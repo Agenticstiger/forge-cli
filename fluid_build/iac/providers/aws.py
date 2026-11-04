@@ -79,7 +79,7 @@ from ...providers._iceberg_catalog import (
 )
 from ...providers._sql_safety import quote_string_literal, validate_ident
 from ...providers.aws.util import warehouse as _warehouse
-from .. import column_access
+from .. import column_access, column_types
 from ..base import UnsupportedBindingError
 from ..governance_labels import governance_labels
 from ..importer import ImportBlock
@@ -103,7 +103,7 @@ LOG = logging.getLogger(__name__)
 # binding carries (a jurisdiction such as "EU", a Google region, an unresolved
 # "{{ env.AWS_REGION }}") must not become the provider's region; it used to be
 # ignored, and still is.
-_AWS_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+$")
+_AWS_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d+\Z")
 
 
 def recorded_regions(resources: Iterable[Mapping[str, Any]]) -> set:
@@ -187,7 +187,21 @@ def _resolve_catalog_id() -> str:
 
         identity = boto3.client("sts").get_caller_identity()
         value = str(identity.get("Account") or "")
-    except Exception:  # noqa: BLE001 — best-effort; emit no import on failure
+    except ImportError:
+        # Loud, not silent: dropping the import block means a Glue database or
+        # table that already exists is planned as a create and then conflicts.
+        LOG.warning(
+            "boto3 is not installed, so the AWS account id could not be looked up and the "
+            "Glue catalog import blocks are omitted. Install it, or set AWS_ACCOUNT_ID:\n\n"
+            "    pip install 'data-product-forge[aws]'"
+        )
+        value = ""
+    except Exception as exc:  # noqa: BLE001 — best-effort; emit no import on failure
+        LOG.warning(
+            "Could not resolve the AWS account id (%s), so the Glue catalog import blocks "
+            "are omitted. Set AWS_ACCOUNT_ID or configure AWS credentials.",
+            type(exc).__name__,
+        )
         value = ""
     _CATALOG_ID_CACHE["value"] = value
     return value
@@ -195,37 +209,230 @@ def _resolve_catalog_id() -> str:
 
 _CATALOG_ID_CACHE: Dict[str, str] = {}
 
-# FLUID column type → Hive/Glue column type.
-_HIVE_TYPES = {
-    "string": "string",
-    "str": "string",
-    "text": "string",
-    "integer": "int",
-    "int": "int",
-    "int32": "int",
-    "bigint": "bigint",
-    "int64": "bigint",
-    "long": "bigint",
-    "float": "float",
-    "float32": "float",
-    "double": "double",
-    "float64": "double",
-    "boolean": "boolean",
-    "bool": "boolean",
-    "date": "date",
-    "timestamp": "timestamp",
-    "datetime": "timestamp",
-    "binary": "binary",
-    "bytes": "binary",
+# FLUID column type → Hive/Glue column type, keyed on the lower-cased base name
+# (``varchar(255)`` is ``varchar``). Only a type Hive holds without loss is here;
+# ``_hive_outcome`` classifies every other one.
+#
+# Where the choice is not obvious: Hive has no zone-aware timestamp, so the
+# ``timestamptz`` family is ``timestamp``, which stores the UTC instant (the
+# offset is not kept); ``money`` is SQL Server's ``decimal(19,4)``; ``year`` is
+# MySQL's, a four-digit number, so ``smallint``; ``bit`` is the SQL Server
+# 0/1 flag. Text, UUIDs and enums are ``string``: Hive has no better form, and
+# every engine reading the table treats them as text.
+_HIVE_TYPES = column_types.expand(
+    {
+        "string": "string, str, text, varchar, varchar2, nvarchar, char, nchar, character, clob, "
+        "uuid, uniqueidentifier, guid, enum",
+        "tinyint": "tinyint",
+        "smallint": "smallint, int2, int16, year",
+        "int": "int, integer, int4, int32, mediumint, serial",
+        "bigint": "bigint, int8, int64, long, longint, bigserial",
+        "float": "float, float4, float32, real",
+        "double": "double, double precision, float8, float64",
+        "boolean": "boolean, bool, bit",
+        "date": "date",
+        "timestamp": "timestamp, datetime, datetime2, smalldatetime, timestamptz, timestamp_tz, "
+        "timestamp_ltz, timestamp_ntz, timestampntz, timestamp with time zone, "
+        "timestamp without time zone",
+        "binary": "binary, bytes, varbinary, blob, bytea, raw",
+        "decimal(19,4)": "money",
+    }
+)
+
+#: Types Hive has no form for but that keep their value as text. Written as
+#: ``string``, and ``fluid validate`` warns.
+_HIVE_AS_STRING = {
+    "json": "which Hive has no json type for",
+    "jsonb": "which Hive has no jsonb type for",
+    "variant": "which Hive has no variant type for",
+    "super": "which Hive has no super type for",
+    "time": "which Hive has no time-of-day type for",
+    "interval": "which Hive has no interval column type for",
+    "bignumeric": "whose digits beyond 38 no Hive decimal holds",
 }
+
+#: Types with no Hive form and no fallback worth writing: which encoding a spatial
+#: value or a sketch takes is the writer's, and a guess would be wrong half the time.
+_HIVE_REFUSED = {
+    **{
+        t: (
+            "which has no Hive column type (a spatial value is stored as WKT text or WKB bytes, "
+            "and only the writer knows which)",
+            "Declare string (WKT) or binary (WKB), whichever the data holds.",
+        )
+        for t in ("geography", "geometry", "geom", "point")
+    },
+    "hll": (
+        "which is an engine-specific sketch with no Hive column type",
+        "Declare binary to store the sketch's bytes.",
+    ),
+}
+
+_DECIMAL_FAMILY = frozenset({"decimal", "numeric", "dec", "number"})
+# ASCII digits only: ``\d`` alone also matches Arabic-Indic and other Unicode digits.
+_DECIMAL_ARGS_RE = re.compile(r"^\((\d+)(?:,(\d+))?\)$", re.ASCII)
+_HIVE_DECIMAL_DEFAULT = "decimal(38,9)"
+_HIVE_TYPE_FIX = (
+    "Declare a FLUID column type such as string, integer, bigint, decimal(12,2), double, "
+    "boolean, date or timestamp."
+)
+
+
+def _hive_decimal(rest: str) -> column_types.TypeOutcome:
+    """``decimal(p,s)`` passes through as written; a bare one widens to a safe default."""
+    if not rest:
+        return column_types.exact(_HIVE_DECIMAL_DEFAULT)
+    match = _DECIMAL_ARGS_RE.match(rest)
+    if match is not None:
+        precision, scale = int(match.group(1)), int(match.group(2) or 0)
+        if 1 <= precision <= 38 and scale <= precision:
+            return column_types.exact(f"decimal{rest}")
+    return column_types.refused(
+        f"whose precision and scale are not a Hive decimal's ({rest})",
+        "Declare decimal(p,s) with p from 1 to 38 and s no larger than p, or string.",
+    )
+
+
+def _hive_outcome(raw: Any) -> column_types.TypeOutcome:
+    """What ``raw`` becomes in a Glue table: its Hive type, exact, lossy or refused."""
+    base, rest = column_types.split_type(raw)
+    if base in column_types.STRUCTURED:
+        return column_types.refused(
+            "which Glue holds only with its element or field types, and the contract schema "
+            "cannot declare them yet",
+            column_types.NESTED_FIX,
+        )
+    if not rest.isascii():
+        return column_types.refused(
+            f"whose parameters ({rest}) are not ASCII", "Declare the type with ASCII digits."
+        )
+    if base in _DECIMAL_FAMILY:
+        return _hive_decimal(rest)
+    if base == "bit" and rest not in ("", "(1)"):
+        return column_types.refused(
+            "which is a bit string, and Hive has none", "Declare binary or an integer type."
+        )
+    if base in _HIVE_REFUSED:
+        return column_types.refused(*_HIVE_REFUSED[base])
+    if base in _HIVE_AS_STRING:
+        return column_types.lossy(
+            "string",
+            _HIVE_AS_STRING[base],
+            "Declare string to store the text on purpose; this warning then goes away.",
+        )
+    hit = _HIVE_TYPES.get(base)
+    if hit is None:
+        return column_types.refused("which the Glue emitter does not map", _HIVE_TYPE_FIX)
+    if base == "float" and rest:
+        # ``float(53)`` is double precision, as in PostgreSQL and SQL Server.
+        digits = rest.strip("()")
+        if digits.isascii() and digits.isdigit() and int(digits) > 24:
+            return column_types.exact("double")
+    return column_types.exact(hit)
 
 
 def _hive_type(raw: Any) -> str:
-    t = str(raw or "string").strip().lower()
-    if t.startswith(("decimal", "numeric")):
-        # decimal(10,2) passes through; a bare type widens to a safe default.
-        return t.replace("numeric", "decimal") if "(" in t else "decimal(38,9)"
-    return _HIVE_TYPES.get(t, "string")
+    """The Hive type ``raw`` is written as. Total, for ``fluid verify`` and ``fluid diff``
+    to compare a live table with: a refused type reads as ``string`` here, and is
+    refused where the module is emitted (:func:`_refuse_glue_column_types`)."""
+    return _hive_outcome(raw).target or "string"
+
+
+def _glue_column_type_findings(
+    expose: str, schema: Iterable[Any]
+) -> Tuple[Optional[UnsupportedBindingError], List[str]]:
+    return column_types.column_type_findings(expose, schema, _hive_outcome, "AWS Glue")
+
+
+def _glue_table_declared(binding: Mapping[str, Any]) -> bool:
+    """Does :func:`_emit_glue` write a table for ``binding``? Its three gates, for the
+    validate-time check to apply the column types where the emitter does."""
+    loc = binding.get("location")
+    if not isinstance(loc, Mapping):
+        return False
+    fmt = binding.get("format") or "parquet"
+    return bool(loc.get("database") and loc.get("table") and _glue_cataloged(binding, fmt))
+
+
+def validate_aws_column_types(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
+    """``(errors, warnings)`` for the column types of the contract's Glue tables: the
+    refusal :func:`_emit_glue` raises, and a warning for each type it writes as a
+    fallback. ``fluid validate`` runs this so ``generate iac`` finds nothing new."""
+    errors: List[str] = []
+    warnings: List[str] = []
+    for index, exposure in enumerate(column_types.exposes_of(contract)):
+        binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
+        if not isinstance(binding, Mapping) or not is_cloud(binding, "aws"):
+            continue
+        if not _glue_table_declared(binding):
+            continue
+        schema = column_types.schema_of(exposure)
+        refusal, lossy = _glue_column_type_findings(_expose_id(exposure) or str(index), schema)
+        if refusal is not None:
+            errors.append(f"{refusal} {' '.join(refusal.remediation)}".strip())
+        warnings.extend(lossy)
+    return errors, warnings
+
+
+def _plan_glue_columns(state: Any) -> Dict[str, str]:
+    """``{column: type}`` of a planned ``aws_glue_catalog_table`` (``tofu show -json``
+    renders its one ``storage_descriptor`` block as a one-item list)."""
+    if not isinstance(state, Mapping):
+        return {}
+    descriptor = state.get("storage_descriptor")
+    if isinstance(descriptor, list):
+        descriptor = descriptor[0] if descriptor else None
+    if not isinstance(descriptor, Mapping):
+        return {}
+    return {
+        str(c.get("name")): str(c.get("type"))
+        for c in descriptor.get("columns") or []
+        if isinstance(c, Mapping)
+    }
+
+
+def glue_column_type_changes(plan: Mapping[str, Any]) -> List[str]:
+    """One line per Glue table the plan updates in place with other column types.
+
+    A column type change plans as a plain ``~`` and leaves the data files alone, but
+    Parquet written under the old type (Athena INSERT or CTAS, dbt: ``string``) holds
+    values the new type cannot read, and Athena then fails every read of those files.
+    So each line is data the apply puts at risk, and the engine's data-loss gate
+    (``plan_data_changes``) holds the apply until ``--allow-data-loss``. A difference
+    in spacing alone (``decimal(10, 2)`` against ``decimal(10,2)``) is no change.
+    Created and removed tables, and updates that keep every column's type, give none.
+    """
+    lines: List[str] = []
+    for change in plan.get("resource_changes") or []:
+        if not isinstance(change, Mapping) or change.get("type") != "aws_glue_catalog_table":
+            continue
+        detail = change.get("change")
+        if not isinstance(detail, Mapping) or list(detail.get("actions") or []) != ["update"]:
+            continue
+        before, after = detail.get("before"), detail.get("after")
+        old, new = _plan_glue_columns(before), _plan_glue_columns(after)
+        changed = [
+            f"{name}: {old[name]} -> {new[name]}"
+            for name in old
+            if name in new and _unspaced(old[name]) != _unspaced(new[name])
+        ]
+        if not changed:
+            continue
+        table = ".".join(
+            str(before.get(key) or "")
+            for key in ("database_name", "name")
+            if isinstance(before, Mapping)
+        )
+        lines.append(
+            f"Glue table {table}: column types change in place ({'; '.join(changed)}); files "
+            "written under the old type may stop reading until they are rewritten, and "
+            "reverting the column type restores reads"
+        )
+    return lines
+
+
+def _unspaced(glue_type: str) -> str:
+    return "".join(glue_type.split())
 
 
 def _columns(schema: List[Mapping[str, Any]]) -> List[Dict[str, str]]:
@@ -463,6 +670,7 @@ class AwsIacPlugin:
                 contract=contract,
                 placement=placement,
                 labels=gov_labels,
+                expose=_expose_id(exposure) or str(index),
             )
             _emit_s3(resources, loc, cid, tags, placement=placement)
             _emit_kinesis(resources, loc, cid, tags)
@@ -727,6 +935,11 @@ class AwsIacPlugin:
         """The regions existing state places resources in; see :func:`recorded_regions`."""
         return recorded_regions(resources)
 
+    def plan_data_changes(self, plan: Mapping[str, Any]) -> List[str]:
+        """The Glue tables the saved plan gives other column types in place; each needs
+        ``--allow-data-loss``. See :func:`glue_column_type_changes`."""
+        return glue_column_type_changes(plan)
+
     def provider_block_for(self, contract: Mapping[str, Any]) -> Dict[str, Any]:
         """``provider_block``, plus the region the contract's AWS bindings name.
 
@@ -741,6 +954,29 @@ class AwsIacPlugin:
         provider v6).
         """
         cfg = dict(self.provider_block())
+        for index, expose in enumerate(contract.get("exposes") or []):
+            binding = expose.get("binding") or {}
+            raw = (binding.get("location") or {}).get("region")
+            # A region code with whitespace around it (a YAML ``|`` block ends in a
+            # newline) is refused. Dropping it leaves the provider on the
+            # environment's region; pinning it stripped applies a region the
+            # sovereignty policy, which reads the value as written, never checked.
+            if (
+                is_cloud(binding, "aws")
+                and isinstance(raw, str)
+                and raw != raw.strip()
+                and _AWS_REGION_RE.match(raw.strip())
+            ):
+                raise UnsupportedBindingError(
+                    "aws-region-whitespace",
+                    f"exposes[{expose.get('exposeId') or index}] binding.location.region is "
+                    f"{raw!r}: a region code with whitespace around it. The sovereignty policy "
+                    "checks the region as written, so it is refused rather than pinned stripped.",
+                    (
+                        f"Write the region alone: region: {raw.strip()} (a YAML '|' block ends "
+                        "the value in a newline).",
+                    ),
+                )
         named = {
             str(((e.get("binding") or {}).get("location") or {}).get("region"))
             for e in contract.get("exposes") or []
@@ -926,6 +1162,7 @@ def _emit_glue(
     contract: Optional[Mapping[str, Any]] = None,
     placement: _Placement = _LEGACY_PLACEMENT,
     labels: Optional[Mapping[str, str]] = None,
+    expose: str = "?",
 ) -> None:
     database = loc.get("database")
     if not database:
@@ -961,6 +1198,11 @@ def _emit_glue(
     # had write-once-on-create semantics and never reconciled the
     # parameters again. Mirrors how the Glue Terraform Registry
     # examples model catalog metadata + descriptions in one resource.
+    # A column Glue cannot hold is refused, not written as ``string``: the same
+    # findings ``fluid validate`` reports (:func:`validate_aws_column_types`).
+    refusal, _lossy = _glue_column_type_findings(expose, schema)
+    if refusal is not None:
+        raise refusal
     storage: Dict[str, Any] = {"columns": _columns(schema)}
     # Athena reads a Glue table through the Hive input format and SerDe the
     # table declares. Without them every query failed with HIVE_UNSUPPORTED_FORMAT

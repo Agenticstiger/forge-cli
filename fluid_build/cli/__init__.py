@@ -20,7 +20,7 @@ import logging
 import os
 import sys
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fluid_build.cli.console import cprint, info, warning
 from fluid_build.cli.console import error as console_error
@@ -152,9 +152,10 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
         # Deliberately NO argparse ``choices``. The provider set is a registry
         # (built-ins + ``fluid_build.providers`` entry-point plugins), and the
         # hardcoded enum disagreed with it in both directions: it rejected
-        # ``redshift`` and ``datamesh_manager``, which ``fluid providers``
-        # lists, and accepted ``azure``, which is not registered at all — and a
-        # pip-installed provider plugin could never be passed. Enumerating the
+        # ``redshift`` and ``datamesh_manager`` (then registered; since retired,
+        # see ``RETIRED_PROVIDERS``), and accepted ``azure``, which is not
+        # registered at all — and a pip-installed provider plugin could never be
+        # passed. Enumerating the
         # registry here is not an option: discovery imports every provider
         # module, and ``build_parser()`` is the ``fluid --help`` cold path.
         # The value is validated against the live registry in
@@ -257,6 +258,29 @@ def _force_utf8_streams() -> None:
             pass
 
 
+def _render_missing_optional(e: Any, args: argparse.Namespace, context: Any, cli: Any) -> int:
+    """Print an optional-dependency hint (message + stable slug) and return exit 1."""
+    from fluid_build._console import _redact_str, literal_text
+    from fluid_build._error_catalog import slug_for
+
+    slug = slug_for(e.event)
+    cli.logger.log_safe(
+        "error",
+        "CLI optional dependency missing",
+        extra={
+            "cmd": getattr(args, "cmd", None),
+            "event": e.event,
+            "error_slug": slug,
+            "module": e.module,
+            "extra": e.extra,
+            "exit_code": e.exit_code,
+        },
+    )
+    context.console.print(literal_text(_redact_str(f"❌ {e}"), "red"))
+    context.console.print(literal_text(f"[{slug}]", "dim"))
+    return int(e.exit_code)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """Enhanced main entry point with production features and comprehensive error handling"""
     # Must run before ANY output: the banner below is Unicode-heavy and would
@@ -344,12 +368,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         # `--provider` / `FLUID_PROVIDER` keeps its current startup cost
         # (tests/perf/test_startup_budget.py).
         requested_provider = getattr(args, "provider", None)
+        # A retired name needs no discovery: the answer is the same whatever the
+        # registry holds, and a registry that failed to load must not hide it.
+        from fluid_build.providers import retired_provider_hint
+
+        retired = bool(requested_provider) and retired_provider_hint(requested_provider) is not None
         known_providers = (
             _known_provider_names()
-            if requested_provider and requested_provider != _PROVIDER_AUTO
+            if requested_provider and requested_provider != _PROVIDER_AUTO and not retired
             else []
         )
         _validate_global_args(args, cli.logger, known_providers=known_providers)
+        if retired:
+            return 2
         if requested_provider and known_providers and requested_provider not in known_providers:
             return 2
 
@@ -523,6 +554,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise
 
         except Exception as e:  # noqa: BLE001
+            # An optional package is absent (``fluid_build._optional``). Checked
+            # here rather than as its own ``except`` clause so the module is only
+            # imported on the failure path: ``fluid --help`` stays at its budget.
+            # ``str(e)`` is the whole remedy (``<feature> needs <pkg> ... pip
+            # install the extra``): print it and exit 1, no traceback.
+            from fluid_build._optional import MissingOptionalDependency
+
+            if isinstance(e, MissingOptionalDependency):
+                return _render_missing_optional(e, args, context, cli)
+
             # The exception text is data, not markup, as in the CLIError branch
             # above. Parsed as markup, an error quoting ``[/]`` raised
             # ``MarkupError`` from this handler, and the outer fallback then
@@ -750,8 +791,17 @@ def _validate_global_args(
         # would drag provider discovery onto the `--help` path. Checking it
         # here means the accepted values are exactly what `fluid providers`
         # lists, plugins included.
-        known = _known_provider_names() if known_providers is None else known_providers
-        if known and args.provider not in known and args.provider != _PROVIDER_AUTO:
+        from fluid_build.providers import retired_provider_hint
+
+        retired_hint = retired_provider_hint(args.provider)
+        known = (
+            []
+            if retired_hint
+            else (_known_provider_names() if known_providers is None else known_providers)
+        )
+        if retired_hint:
+            issues.append(retired_hint)
+        elif known and args.provider not in known and args.provider != _PROVIDER_AUTO:
             issues.append(
                 f"Unknown provider '{args.provider}' — installed providers: "
                 f"{', '.join(known)} (see `fluid providers`)"

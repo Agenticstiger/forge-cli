@@ -701,6 +701,9 @@ def _gate_provider_flag(requested: Optional[str], logger: logging.Logger) -> Non
     registry.discover_providers(logger)
     name = requested.strip().lower().replace("-", "_")
     if name not in registry.PROVIDERS:
+        hint = registry.retired_provider_hint(name)
+        if hint:
+            raise CLIError(2, "provider_retired", {"error": hint})
         raise CLIError(
             2, "provider_unknown", {"requested": name, "available": sorted(registry.PROVIDERS)}
         )
