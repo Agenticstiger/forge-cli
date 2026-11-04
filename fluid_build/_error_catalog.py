@@ -95,6 +95,14 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "providers",
     ),
+    "provider_load_failed": (
+        [
+            "The provider is declared but importing it failed (see the WARNING above)",
+            "Reinstall the distribution named in the error, or its extra",
+            "Run 'fluid providers --debug' for the discovery errors",
+        ],
+        "providers",
+    ),
     "provider_retired": (
         [
             "Run 'fluid providers' to see the available providers",

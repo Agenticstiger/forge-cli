@@ -19,11 +19,11 @@ Implements the ValidationProvider interface for validating FLUID contracts
 against actual BigQuery resources.
 """
 
-import re
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
 
-from google.api_core import exceptions as google_exceptions
-from google.cloud import bigquery
+import re
+import sys
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from fluid_build.providers._sql_safety import validate_ident
 from fluid_build.providers.quality_engine import (
@@ -38,6 +38,32 @@ from fluid_build.providers.validation_provider import (
     ValidationProvider,
     ValidationResult,
 )
+
+if TYPE_CHECKING:
+    from google.cloud import bigquery
+
+# ``google.cloud.bigquery`` / ``google.api_core`` are imported on first USE, never
+# at import: importing this module must not load a cloud SDK. They stay readable
+# as ``bigquery`` / ``google_exceptions`` module attributes (PEP 562); a ``setattr``
+# on the module (tests) shadows them, and code reaches them through ``_self``.
+_self = sys.modules[__name__]
+
+
+def __getattr__(name: str) -> Any:
+    try:
+        if name == "bigquery":
+            from google.cloud import bigquery
+
+            return bigquery
+        if name == "google_exceptions":
+            from google.api_core import exceptions
+
+            return exceptions
+    except ImportError as exc:
+        # PEP 562: an absent SDK is a missing attribute, so ``hasattr`` is False.
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # GCP project ids allow hyphens (which ``validate_ident`` rejects), so they
 # need a dedicated allowlist: 6–30 chars, lowercase-or-mixed letter start,
@@ -122,7 +148,7 @@ class BigQueryValidationProvider(ValidationProvider):
     def client(self) -> bigquery.Client:
         """Lazy-load BigQuery client"""
         if self._client is None:
-            self._client = bigquery.Client(project=self.project_id)
+            self._client = _self.bigquery.Client(project=self.project_id)
         return self._client
 
     def validate_connection(self) -> bool:
@@ -183,7 +209,7 @@ class BigQueryValidationProvider(ValidationProvider):
                 },
             )
 
-        except google_exceptions.NotFound:
+        except _self.google_exceptions.NotFound:
             return None
         except Exception as e:
             # Re-raise with more context

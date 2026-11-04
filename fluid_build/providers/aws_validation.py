@@ -22,7 +22,9 @@ and optionally Redshift.
 
 from __future__ import annotations
 
+import functools
 import logging
+import sys
 from typing import Any, Dict, List, Optional
 
 from fluid_build.providers.validation_provider import (
@@ -34,16 +36,60 @@ from fluid_build.providers.validation_provider import (
     ValidationResult,
 )
 
-try:
-    import boto3
-    from botocore.exceptions import ClientError
-
-    BOTO3_AVAILABLE = True
-except ImportError:
-    BOTO3_AVAILABLE = False
-    boto3 = None  # type: ignore[assignment]
-
 LOG = logging.getLogger("fluid.providers.aws_validation")
+
+
+# boto3 / botocore are imported on first USE, never at import: importing this
+# module (the provider registry once did, via a package scan) must not load an
+# SDK. The names below stay readable as module attributes through PEP 562
+# ``__getattr__``; ``setattr`` on the module (tests) shadows them, and the code
+# reaches them through ``_self`` so a patch is honoured.
+_self = sys.modules[__name__]
+
+
+@functools.lru_cache(maxsize=1)
+def _boto3_importable() -> bool:
+    """Whether ``import boto3`` works, tried once on first access and cached.
+
+    ``find_spec`` alone says "installed" for a broken install (a missing
+    dependency, a bad build), which would skip the install hint downstream.
+    """
+    try:
+        import boto3  # noqa: F401
+    except Exception:  # noqa: BLE001 - any failure to import means unavailable
+        return False
+    return True
+
+
+def __getattr__(name: str) -> Any:
+    if name == "BOTO3_AVAILABLE":
+        return _boto3_importable()
+    if name == "boto3":
+        if not _boto3_importable():
+            return None
+        import boto3
+
+        return boto3
+    if name == "ClientError":
+        try:
+            from botocore.exceptions import ClientError
+        except ImportError as exc:
+            # PEP 562: a missing attribute is an AttributeError (``hasattr`` works).
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+        return ClientError
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _client_error() -> type:
+    """``botocore``'s ``ClientError``, or a never-raised stand-in without botocore."""
+    try:
+        return _self.ClientError  # type: ignore[no-any-return,attr-defined]
+    except (ImportError, AttributeError):
+
+        class _NoClientError(Exception):
+            pass
+
+        return _NoClientError
 
 
 class AWSValidationProvider(ValidationProvider):
@@ -80,7 +126,7 @@ class AWSValidationProvider(ValidationProvider):
             session_kwargs: Dict[str, Any] = {"region_name": self.region}
             if self.profile:
                 session_kwargs["profile_name"] = self.profile
-            session = boto3.Session(**session_kwargs)
+            session = _self.boto3.Session(**session_kwargs)
             self._glue_client = session.client("glue")
         return self._glue_client
 
@@ -149,7 +195,7 @@ class AWSValidationProvider(ValidationProvider):
                 },
             )
 
-        except ClientError as e:
+        except _client_error() as e:
             code = e.response.get("Error", {}).get("Code", "")
             if code == "EntityNotFoundException":
                 return None

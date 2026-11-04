@@ -36,7 +36,8 @@ class ETLPipelineTemplate(ProjectTemplate):
             name="ETL Pipeline Data Product",
             description="Extract, transform, load data workflows with robust error handling",
             complexity=ComplexityLevel.INTERMEDIATE,
-            provider_support=["local", "gcp", "snowflake", "aws", "azure"],
+            # azure is not a registered provider; see streaming.py.
+            provider_support=["local", "gcp", "snowflake", "aws"],
             use_cases=[
                 "Data warehouse loading and updates",
                 "Cross-system data synchronization",

@@ -360,6 +360,19 @@ def _requires_cli_satisfied(metadata: Optional[Dict[str, Any]]) -> Optional[bool
         return None
 
 
+_PROVIDER_GROUP = "fluid_build.providers"
+
+
+def _provider_reserved(ep: Any) -> bool:
+    """Whether ``ep`` claims a reserved provider name (checked without importing it)."""
+    try:
+        from fluid_build.providers import entry_point_reserved
+
+        return entry_point_reserved(ep)
+    except Exception:  # noqa: BLE001 - fail closed: never import what cannot be checked
+        return True
+
+
 def detailed_plugins(
     role: Optional[str] = None, logger: Optional[logging.Logger] = None
 ) -> Dict[str, List[Dict[str, Any]]]:
@@ -391,6 +404,12 @@ def detailed_plugins(
                 "metadata": None,
                 "compatible": None,
             }
+            if allowed and group == _PROVIDER_GROUP and _provider_reserved(ep):
+                # A provider discovery would skip (a retired name, or a built-in
+                # name nobody granted) is listed, never imported.
+                entry["allowed"] = False
+                entry["reserved"] = True
+                allowed = False
             if allowed:  # only ALLOWED plugins are ever loaded
                 try:
                     obj = ep.load()

@@ -86,10 +86,13 @@ pytestmark = pytest.mark.skipif(
 # the ceiling is the 3.12 count + 5%, rounded up. Lower it whenever a slimming
 # PR drops the count; the test prints the measured number so CI logs show it.
 MAX_MODULES = 895
-# ``fluid_build.providers.discover_providers()`` imports every built-in
-# provider module. Measured 872 on 3.12 / 885 on 3.14 / 696 on 3.10 in a
-# fresh process (2026-11-03); ceiling is the 3.12 count + 5%, rounded up.
-MAX_DISCOVERY_MODULES = 916
+# ``fluid_build.providers.discover_providers()`` reads provider NAMES from
+# entry-point metadata and imports no provider module (a class loads on first
+# use). It imported every provider package and helper before: 872 on 3.12, 2,243
+# with the cloud extras installed. Measured 188 on 3.12 in a fresh ``.[dev,local]``
+# process, 191 with ``[aws,gcp,snowflake]`` installed (2026-11-03); ceiling is the
+# 3.12 count + 5%, rounded up.
+MAX_DISCOVERY_MODULES = 198
 MAX_HELP_WALL_SECONDS = 2.0
 
 # Heavy SDKs that must NOT load on the --help / parser-build path. ``mcp`` is
@@ -169,11 +172,53 @@ def _probe():
     return count, loaded
 
 
+# Cloud SDKs that listing providers must never load. ``google.cloud`` can already
+# be in ``sys.modules`` at interpreter start (a google-cloud-* ``*-nspkg.pth``
+# namespace shim), so the probes report only what the code under test newly loads.
+FORBIDDEN_ON_DISCOVERY = (
+    "boto3",
+    "botocore",
+    "google.cloud",
+    "snowflake.connector",
+    "requests",
+)
+
 _DISCOVER_PROBE = (
     "import sys;"
+    f"pre = {{m for m in {FORBIDDEN_ON_DISCOVERY!r} if m in sys.modules}};"
     "from fluid_build.providers import discover_providers; discover_providers();"
-    "print(len(sys.modules))"
+    "print(len(sys.modules));"
+    f"print(','.join(m for m in {FORBIDDEN_ON_DISCOVERY!r} if m in sys.modules and m not in pre))"
 )
+
+# ``fluid providers`` end to end (argparse, logging, the command), output discarded.
+_PROVIDERS_CMD_PROBE = (
+    "import sys, io, contextlib;"
+    f"pre = {{m for m in {FORBIDDEN_ON_DISCOVERY!r} if m in sys.modules}};"
+    "from fluid_build.cli import main;"
+    "buf = io.StringIO();"
+    "ctx = contextlib.redirect_stdout(buf);"
+    "ctx.__enter__();"
+    "rc = main(['providers']);"
+    "ctx.__exit__(None, None, None);"
+    "assert rc == 0, rc;"
+    "assert 'gcp' in buf.getvalue(), buf.getvalue();"
+    "print(len(sys.modules));"
+    f"print(','.join(m for m in {FORBIDDEN_ON_DISCOVERY!r} if m in sys.modules and m not in pre))"
+)
+
+
+def _probe_discovery(code):
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=_clean_env(),
+    ).stdout.splitlines()
+    count = int(out[0])
+    loaded = set(filter(None, (out[1] if len(out) > 1 else "").split(",")))
+    return count, loaded
 
 
 def test_help_module_count_under_budget(capsys):
@@ -188,16 +233,8 @@ def test_help_module_count_under_budget(capsys):
 
 
 def test_provider_discovery_module_count_under_budget(capsys):
-    """``discover_providers()`` in a cold process. No banned-module assertion yet."""
-    count = int(
-        subprocess.run(
-            [sys.executable, "-c", _DISCOVER_PROBE],
-            capture_output=True,
-            text=True,
-            check=True,
-            env=_clean_env(),
-        ).stdout.splitlines()[-1]
-    )
+    """``discover_providers()`` in a cold process: names only, no provider import."""
+    count, _ = _probe_discovery(_DISCOVER_PROBE)
     with capsys.disabled():
         print(
             f"\n[startup-budget] discover_providers(): {count} modules "
@@ -205,8 +242,26 @@ def test_provider_discovery_module_count_under_budget(capsys):
         )
     assert count < MAX_DISCOVERY_MODULES, (
         f"`discover_providers()` imports {count} modules (budget {MAX_DISCOVERY_MODULES}). "
-        "A provider module (or something it imports at module scope) got heavier."
+        "Discovery must list providers from entry-point metadata and import none; "
+        "something imported a provider package or a helper module."
     )
+
+
+def test_provider_discovery_loads_no_cloud_sdk():
+    _, loaded = _probe_discovery(_DISCOVER_PROBE)
+    assert not loaded, (
+        f"discover_providers() loaded {sorted(loaded)}. Listing providers must not import "
+        "a provider or a *_validation / quality_engine helper; keep SDK imports lazy."
+    )
+
+
+def test_fluid_providers_command_stays_light(capsys):
+    """``fluid providers`` loads no cloud SDK and stays inside the --help module budget."""
+    count, loaded = _probe_discovery(_PROVIDERS_CMD_PROBE)
+    with capsys.disabled():
+        print(f"\n[startup-budget] fluid providers: {count} modules (budget {MAX_MODULES})")
+    assert not loaded, f"`fluid providers` loaded {sorted(loaded)}"
+    assert count < MAX_MODULES, f"`fluid providers` imports {count} modules (budget {MAX_MODULES})."
 
 
 def test_heavy_sdks_not_loaded_on_help():

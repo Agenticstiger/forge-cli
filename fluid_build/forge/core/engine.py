@@ -61,6 +61,10 @@ from .registry import (
 )
 
 logger = logging.getLogger(__name__)
+# The FORGE SCAFFOLDING providers (fluid_build/forge/providers/{aws,gcp,local,snowflake}.py),
+# not the runtime provider registry: there is no databricks scaffold, and
+# azure / redshift / datamesh-manager are not providers. Correct as it stands;
+# tests/providers/test_registry_reservation.py pins it to that directory.
 COPILOT_WARNING_ONLY_PROVIDERS = {"local", "gcp", "aws", "snowflake"}
 
 

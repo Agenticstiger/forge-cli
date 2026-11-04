@@ -40,13 +40,11 @@ from fluid_build.iac import (
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.module import write_dependency_lock
 from fluid_build.iac.packaging import resolve_packaging
-from fluid_build.iac.registry import IacProviderChoices, iac_plugin_unavailable_reason
+from fluid_build.iac.registry import iac_plugin_unavailable_reason
 from fluid_build.iac.source import contract_source, source_contract_file
 
 from ._common import CLIError, load_contract_with_overlay, resolve_env_templates_in_contract
 from ._logging import info
-
-_PROVIDER_CHOICES = IacProviderChoices()
 
 #: The AWS account the native planner is given when ``fluid generate iac`` runs
 #: without ``AWS_ACCOUNT_ID`` (see :func:`native_actions`). Shaped to pass the
@@ -76,9 +74,11 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
     p.add_argument("contract", nargs="?", help="contract.fluid.yaml")
     p.add_argument(
         "--provider",
-        choices=_PROVIDER_CHOICES,
+        # No argparse ``choices``: a retired name gets its hint (checked against the
+        # provider registry after the parse, cli/__init__.py) and `run` names the
+        # IaC clouds when the provider has no IaC plugin.
         default="auto",
-        help="Target cloud (default: auto-detect from the contract)",
+        help=f"Target cloud, one of {', '.join(sorted(IAC_PLUGINS))} (default: auto-detect)",
     )
     p.add_argument("--out", "-o", default="runtime/iac", help="Output directory")
     p.add_argument("--env", help="Environment overlay")

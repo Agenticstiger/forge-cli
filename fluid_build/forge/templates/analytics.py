@@ -57,7 +57,8 @@ class AnalyticsTemplate(ProjectTemplate):
             name="Analytics Data Product",
             description="Business intelligence and reporting data products with SQL transforms",
             complexity=ComplexityLevel.INTERMEDIATE,
-            provider_support=["local", "gcp", "snowflake", "bigquery", "redshift"],
+            # redshift was retired as a provider (it is part of aws); bigquery is a gcp service.
+            provider_support=["local", "gcp", "snowflake", "bigquery"],
             use_cases=[
                 "Business dashboards and KPI tracking",
                 "Customer analytics and segmentation",

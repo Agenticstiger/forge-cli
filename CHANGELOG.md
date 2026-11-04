@@ -312,6 +312,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and credentials without pydantic-settings. `fluid doctor` reads these packages' versions from
   their metadata instead of importing them (about 1,000 modules loaded instead of 3,300).
 
+- **`fluid providers` and provider lookup no longer import every provider.** Names come from
+  entry-point metadata, and a provider is imported the first time it is used: `fluid providers`
+  loads 854 modules instead of 1,206 (864 instead of 2,146 with the cloud extras), and provider
+  discovery 188 instead of 874. `fluid providers --debug` still imports each one to report it, and
+  a provider plugin that fails to load reports on first use. `fluid export`, `init`, `import` and
+  `generate iac` check `--provider` against the registry: a retired name gets its hint and an
+  unknown one exits 2 with the installed list, where argparse printed "invalid choice", and
+  `generate iac --provider local` exits 2 with the supported list instead of an `AttributeError`.
+
 - **`fluid diff --baseline` reported nothing for column changes in a 0.7.x contract.** It read
   columns from `exposes[].schema`, but a 0.7.x contract keeps them in `exposes[].contract.schema`
   (as does every `fluid init` template), so a removed column, a type change or a new NOT NULL
@@ -564,6 +573,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`azure` is no longer accepted as a provider name.** There is no azure provider; validation
+  called it "coming soon" and three templates listed it, with `redshift`, as supported. It is now
+  an unknown provider like any other.
+
 - **`redshift` and `datamesh-manager` are no longer providers.** Neither deployed anything as a
   provider: `redshift` only forwarded to `aws`, and Data Mesh Manager is a catalog. `fluid providers` now lists `aws`, `databricks`, `gcp`, `local` and `snowflake`, plus any
   third-party plugin. Redshift objects apply through the `aws` provider, and Data Mesh Manager
@@ -627,6 +640,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endpoint fails `fluid validate`. A derived sink whose `binding.location` holds such text, or a
   region that is not one label, now fails `fluid validate` and the run, `catalogAuth` or not;
   write the value itself.
+
+- **forge-cli's own HTTP calls never carry a credential to another origin, and the base install has
+  one HTTP client.** The Command Center, marketplace, observability reporter and Data Mesh Manager
+  clients run on httpx; forge code no longer imports `requests`, `aiohttp` or `urllib3`, and
+  `requests` is no longer a declared dependency (it still installs through openlineage-python and
+  tiktoken until 0.28.0). The Data Mesh Manager client used to forward its `x-api-key` header to
+  whatever origin a redirect named; it now refuses the redirect with an error that names the new
+  origin and says to update `DMM_API_URL`. Every client with the redirect guard judges the URL httpx
+  will actually follow, so a `Location` with a scheme but no host (`https:/x`) is refused instead of
+  reaching the same host's default port. A server's `Retry-After` is honoured up to 120 seconds, and
+  a value too large to parse no longer crashes the command. A `REQUESTS_CA_BUNDLE` or
+  `CURL_CA_BUNDLE` that points at a missing file disables Command Center reporting with a warning
+  naming the variable; TLS verification is never relaxed. The Command Center catalog connector's
+  search, which raised on the real search filters, works (#804).
+
+- **A plugin can no longer take over a built-in provider by registering its name.** Provider
+  entry points were loaded first, so an installed package that declared `gcp`, `aws`, `snowflake`,
+  `databricks` or `local` replaced the provider that emits that cloud's DDL and IaC and receives
+  its credentials. Such an entry point is now skipped before it is imported, with a WARNING naming
+  its distribution. An operator who wants the override grants it with a distribution-qualified
+  `FLUID_PLUGINS_ALLOWLIST` entry, `<distribution>:<name>`; the retired names cannot be granted.
 
 - **`validate_ident` let a name with a trailing newline through.** Python's `$` also matches just
   before a trailing newline, so the identifier allowlist in `providers/_sql_safety.py`, which the

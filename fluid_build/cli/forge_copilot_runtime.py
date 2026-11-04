@@ -122,6 +122,9 @@ from fluid_build.schema_manager import FluidSchemaManager
 from fluid_build.util.contract import get_builds
 
 LOG = logging.getLogger("fluid.cli.forge_copilot")
+# The built-in FORGE SCAFFOLDING providers (fluid_build/forge/providers/), the
+# fallback when the forge registry cannot be read -- not the runtime provider
+# registry (there is no databricks scaffold). See COPILOT_WARNING_ONLY_PROVIDERS.
 COPILOT_BUILTIN_PROVIDERS = ("local", "gcp", "aws", "snowflake")
 
 

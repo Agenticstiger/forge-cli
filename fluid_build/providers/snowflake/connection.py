@@ -15,17 +15,41 @@
 # fluid_build/provider/snowflake/connection.py
 from __future__ import annotations
 
+import functools
 import logging
+import sys
 from collections.abc import Iterable
 from typing import Any, Dict, Optional
 
-try:
-    import snowflake.connector
+# snowflake.connector is imported on first USE, never at import. ``snowflake`` and
+# ``SNOWFLAKE_AVAILABLE`` stay readable as module attributes (PEP 562); a
+# ``setattr`` on the module (tests) shadows them, and ``_connect`` reaches them
+# through ``_self`` so a patch is honoured.
+_self = sys.modules[__name__]
 
-    SNOWFLAKE_AVAILABLE = True
-except ImportError:
-    SNOWFLAKE_AVAILABLE = False
-    snowflake = None
+
+def _sdk() -> Any:
+    """The ``snowflake`` top-level package with ``.connector`` imported, or ``None``."""
+    try:
+        import snowflake.connector  # noqa: F401
+    except Exception:  # noqa: BLE001 - an installed-but-broken connector is unavailable
+        return None
+    return sys.modules["snowflake"]
+
+
+@functools.lru_cache(maxsize=1)
+def _connector_importable() -> bool:
+    """Whether ``snowflake.connector`` imports, tried once on first access and cached."""
+    return _sdk() is not None
+
+
+def __getattr__(name: str) -> Any:
+    if name == "snowflake":
+        return _sdk()
+    if name == "SNOWFLAKE_AVAILABLE":
+        return _connector_importable()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 from fluid_build.providers._sql_safety import validate_ident
 
@@ -78,9 +102,11 @@ class SnowflakeConnection:
             self._conn = None
 
     def _connect(self):
-        if not SNOWFLAKE_AVAILABLE:
+        if not _self.SNOWFLAKE_AVAILABLE or _self.snowflake is None:
+            # ``snowflake`` is None when the connector is installed but its import
+            # failed (a broken install); the hint covers both cases.
             raise RuntimeError(
-                "snowflake-connector-python not installed. "
+                "snowflake-connector-python not installed (or it could not be imported). "
                 "Install with: pip install snowflake-connector-python"
             )
 
@@ -126,7 +152,7 @@ class SnowflakeConnection:
             kwargs.get("database"),
             kwargs.get("schema"),
         )
-        conn = snowflake.connector.connect(**kwargs)
+        conn = _self.snowflake.connector.connect(**kwargs)
         self._initialize_session(conn, self.opts)
         return conn
 

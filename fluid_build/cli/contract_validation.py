@@ -109,9 +109,11 @@ _NO_LIVE_VALIDATION = {
         "Run 'fluid validate' for the offline binding checks and "
         "'fluid apply --mode dry-run' to plan against the workspace.",
     ),
+    # `fluid validate` accepts `azure` (the schema enum lists it) although there is
+    # no azure provider: say so as a warning, so the two commands agree.
     "azure": (
-        "Provider 'azure' validation not yet implemented",
-        "Supported providers: aws, databricks, gcp, local, snowflake. Others coming soon.",
+        "Platform 'azure' has no provider, so it was not validated",
+        "Supported providers: aws, databricks, gcp, local, snowflake (see `fluid providers`).",
     ),
 }
 
@@ -589,7 +591,12 @@ class ContractValidator:
             )
             return
         else:
-            supported = ["gcp", "snowflake", "aws", "local", "databricks", "azure"]
+            from fluid_build.providers import BUILTIN_PROVIDERS, registered_provider_names
+
+            try:
+                supported = registered_provider_names()
+            except Exception:  # noqa: BLE001 - the message must still render
+                supported = sorted(BUILTIN_PROVIDERS)
             self.report.add_issue(
                 "error",
                 "binding",
@@ -1489,7 +1496,8 @@ Examples:
     p.add_argument("--env", help="Environment overlay (dev/test/prod)")
 
     p.add_argument(
-        "--provider", help="Override provider platform (gcp, snowflake, databricks, aws, azure)"
+        "--provider",
+        help="Override provider platform (aws, databricks, gcp, local, snowflake; see `fluid providers`)",
     )
 
     p.add_argument("--project", help="Override project/account ID")

@@ -263,6 +263,17 @@ def build_provider(
             raise CLIError(2, "provider_retired", {"error": hint})
         if not is_allowed(name):
             raise CLIError(2, "provider_blocked_by_policy", {"requested": name})
+        failure = registry.provider_load_failure(name)
+        if failure is not None:
+            raise CLIError(
+                2,
+                "provider_load_failed",
+                {
+                    "requested": name,
+                    "error": failure["error"],
+                    "distribution": failure["distribution"],
+                },
+            )
         raise CLIError(
             2, "provider_unknown", {"requested": name, "available": sorted(registry.PROVIDERS)}
         )

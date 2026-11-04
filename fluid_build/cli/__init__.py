@@ -378,6 +378,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             if requested_provider and requested_provider != _PROVIDER_AUTO and not retired
             else []
         )
+        if known_providers and getattr(args, "generate_sub", None) == "iac":
+            # `generate iac --provider` names an IaC cloud, not only a provider
+            # (confluent has an IaC plugin and no provider): accept both sets.
+            from fluid_build.iac.registry import IAC_PLUGINS
+
+            known_providers = sorted({*known_providers, *IAC_PLUGINS})
         _validate_global_args(args, cli.logger, known_providers=known_providers)
         if retired:
             return 2
@@ -768,8 +774,7 @@ def _known_provider_names() -> List[str]:
     try:
         from fluid_build import providers as registry
 
-        registry.discover_providers()
-        return sorted(registry.PROVIDERS.keys())
+        return registry.registered_provider_names()
     except Exception:  # noqa: BLE001 - advisory check; never crash the CLI
         return []
 
@@ -807,8 +812,8 @@ def _validate_global_args(
                 f"{', '.join(known)} (see `fluid providers`)"
             )
 
-        # Only GCP and Azure require an explicit --project; AWS resolves account from STS/env
-        if args.provider in ["gcp", "azure"] and not getattr(args, "project", None):
+        # Only GCP requires an explicit --project; AWS resolves account from STS/env
+        if args.provider == "gcp" and not getattr(args, "project", None):
             issues.append(f"Provider '{args.provider}' requires --project to be specified")
 
         # Security check for local provider in production (only show in debug mode)
