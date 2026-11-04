@@ -30,7 +30,8 @@ the newest), as the union of:
 
 * ``<PROVIDER>_API_BASE`` for every ``litellm.provider_list`` entry (``-``
   read as ``_``);
-* every ``*_API_BASE`` name its provider code reads;
+* every ``*_API_BASE`` name its provider code reads, with a kind after it
+  too (``DASHSCOPE_API_BASE_VIDEO``, ``QWENCLOUD_API_BASE_RERANK``);
 * every name its provider code reads through ``get_secret``,
   ``get_secret_str``, ``get_secret_bool``, ``os.getenv`` or ``os.environ``
   that ends in ``_URL``, ``_ENDPOINT``, ``_HOST``, ``_BASE``, ``_ACCOUNT_ID``
@@ -110,6 +111,9 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "CUSTOM_OPENAI_API_BASE",
         "DARKBLOOM_API_BASE",
         "DASHSCOPE_API_BASE",
+        "DASHSCOPE_API_BASE_IMAGE",
+        "DASHSCOPE_API_BASE_RERANK",
+        "DASHSCOPE_API_BASE_VIDEO",
         "DATABRICKS_AGENT_API_BASE",
         "DATABRICKS_API_BASE",
         "DATAFORSEO_API_BASE",
@@ -220,7 +224,13 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "PRISM_API_BASE",
         "PUBLICAI_API_BASE",
         "QWENCLOUD_API_BASE",
+        "QWENCLOUD_API_BASE_IMAGE",
+        "QWENCLOUD_API_BASE_RERANK",
+        "QWENCLOUD_API_BASE_VIDEO",
         "QWEN_AI_PLATFORM_API_BASE",
+        "QWEN_AI_PLATFORM_API_BASE_IMAGE",
+        "QWEN_AI_PLATFORM_API_BASE_RERANK",
+        "QWEN_AI_PLATFORM_API_BASE_VIDEO",
         "RAGFLOW_API_BASE",
         "RECRAFT_API_BASE",
         "REDUCTO_API_BASE",
