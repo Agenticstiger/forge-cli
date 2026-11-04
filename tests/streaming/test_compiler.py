@@ -135,11 +135,11 @@ def test_event_time_and_partition(contract):
     cfg = managed_config(contract["builds"][0])
     cfg["source"]["eventTime"] = {"column": "event_time", "delaySeconds": 5}
     contract["exposes"][0]["binding"]["icebergConfig"]["partitionSpec"] = [
-        {"sourceColumn": "event_time", "transform": "day"},
+        {"sourceColumn": "event_id", "transform": "identity"},
     ]
     (artifact,) = compile_contract(contract)
     assert "WATERMARK FOR `event_time` AS `event_time` - INTERVAL '5' SECOND" in artifact.sql
-    assert "PARTITIONED BY (days(`event_time`))" in artifact.sql
+    assert "PARTITIONED BY (`event_id`)" in artifact.sql
 
 
 @pytest.mark.parametrize("surface", ["root", "column", "source", "dq"])
@@ -243,32 +243,28 @@ def test_avro_source_emits_registry_format_without_json_options(contract):
     assert "json." not in artifact.sql
 
 
-@pytest.mark.parametrize(
-    "partition,sql",
-    [
-        ({"sourceColumn": "event_id", "transform": "identity"}, "`event_id`"),
-        (
-            {"sourceColumn": "event_id", "transform": "bucket", "numBuckets": 8},
-            "bucket(8, `event_id`)",
-        ),
-        (
-            {"sourceColumn": "event_id", "transform": "truncate", "width": 4},
-            "truncate(4, `event_id`)",
-        ),
-    ],
-)
-def test_partition_transforms_use_native_iceberg_ddl(contract, partition, sql):
-    contract["exposes"][0]["binding"]["icebergConfig"]["partitionSpec"] = [partition]
+def test_an_identity_partition_uses_native_iceberg_ddl(contract):
+    contract["exposes"][0]["binding"]["icebergConfig"]["partitionSpec"] = [
+        {"sourceColumn": "event_id", "transform": "identity"}
+    ]
     (artifact,) = compile_contract(contract)
-    assert f"PARTITIONED BY ({sql})" in artifact.sql
+    assert "PARTITIONED BY (`event_id`)" in artifact.sql
 
 
 @pytest.mark.parametrize(
     "partition,match",
     [
         ({"sourceColumn": "missing", "transform": "identity"}, "not a target"),
-        ({"sourceColumn": "event_id", "transform": "bucket", "numBuckets": 0}, "positive"),
         ({"sourceColumn": "event_id", "transform": "unknown"}, "Unsupported partition"),
+        # Hidden partitioning: Flink's Iceberg DDL cannot declare it, so the job would
+        # fail after deploy with "Encountered "(" at line 16".
+        ({"sourceColumn": "event_time", "transform": "day"}, "only by a column"),
+        ({"sourceColumn": "event_time", "transform": "hour"}, "only by a column"),
+        (
+            {"sourceColumn": "event_id", "transform": "bucket", "numBuckets": 8},
+            "only by a column",
+        ),
+        ({"sourceColumn": "event_id", "transform": "truncate", "width": 4}, "only by a column"),
     ],
 )
 def test_invalid_partition_transforms_fail(contract, partition, match):

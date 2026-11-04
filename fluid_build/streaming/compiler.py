@@ -417,13 +417,15 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
         transform = item["transform"]
         if transform == "identity":
             partition.append(f"`{name}`")
-        elif transform in {"year", "month", "day", "hour"}:
-            partition.append(f"{transform}s(`{name}`)")
-        elif transform in {"bucket", "truncate"}:
-            parameter = item.get("numBuckets" if transform == "bucket" else "width")
-            if not isinstance(parameter, int) or isinstance(parameter, bool) or parameter < 1:
-                raise ValueError(f"{transform} requires a positive size")
-            partition.append(f"{transform}({parameter}, `{name}`)")
+        elif transform in {"year", "month", "day", "hour", "bucket", "truncate"}:
+            # Iceberg's transforms are hidden partitioning, which Flink SQL cannot declare:
+            # Iceberg's Flink DDL partitions by plain columns only, and PARTITIONED BY
+            # (days(col)) does not parse, so the job would fail after it deploys.
+            raise ValueError(
+                f"Partition transform {transform!r} on {name!r}: Flink's Iceberg DDL can "
+                "partition only by a column (transform identity). Create the table with "
+                "this partition spec before the job runs, and leave it out here"
+            )
         else:
             raise ValueError(f"Unsupported partition transform {transform!r}")
     auth, auth_errors = parse_catalog_auth(cfg.get("catalogAuth"))
