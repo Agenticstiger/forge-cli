@@ -614,6 +614,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   '93.184.216.34', is public`. A URL that cannot be parsed, such as `http://[::1`, is refused with
   "it has no host" where it raised `ValueError`.
 
+- **litellm 1.108.0 reads seven provider endpoints the dotenv guard did not know.**
+  `BESPOKE_API_BASE`, `CORALBRICKS_API_BASE`, `DATABRICKS_AGENT_API_BASE`, `INFERENCEAPIS_API_BASE`,
+  `LAYA_API_BASE`, `MICROSOFT_365_COPILOT_API_BASE` and `SCALEDOWN_API_BASE` choose the host
+  litellm sends the provider key to. They are now in `credentials/litellm_endpoints.py`, so a
+  project dotenv file cannot point them elsewhere while `FLUID_LLM_API_KEY` or a stored key is in
+  play, as for every other provider endpoint.
+
 ### Upgrade notes
 
 - New validate warning, so `--strict` fails: a contract with builds whose `contract.id` or a

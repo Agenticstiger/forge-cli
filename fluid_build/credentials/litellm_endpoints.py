@@ -24,9 +24,9 @@ Copilot ones) is protected outright. Any other ``<NAME>_API_BASE`` is the
 project's own setting and follows the name-shape rule.
 
 Vendored because importing litellm takes seconds and dotenv hydration runs on
-every command. Generated from the litellm 1.83.14, 1.97.0, 1.105.0 and
-1.106.0 wheels (FLUID's floor, the last release Python 3.10 can import, and the
-two newest), as the union of:
+every command. Generated from the litellm 1.83.14, 1.97.0, 1.105.0, 1.106.0
+and 1.108.0 wheels (FLUID's floor, the last release Python 3.10 can import, and
+the newest), as the union of:
 
 * ``<PROVIDER>_API_BASE`` for every ``litellm.provider_list`` entry (``-``
   read as ``_``);
@@ -83,6 +83,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "BASETEN_API_BASE",
         "BEDROCK_API_BASE",
         "BEDROCK_MANTLE_API_BASE",
+        "BESPOKE_API_BASE",
         "BFL_API_BASE",
         "BLACK_FOREST_LABS_API_BASE",
         "BRAVE_API_BASE",
@@ -100,6 +101,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "COMETAPI_API_BASE",
         "COMETAPI_BASE_URL",
         "COMPACTIFAI_API_BASE",
+        "CORALBRICKS_API_BASE",
         "CORTECS_API_BASE",
         "CRUSOE_API_BASE",
         "CRW_API_BASE",
@@ -108,6 +110,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "CUSTOM_OPENAI_API_BASE",
         "DARKBLOOM_API_BASE",
         "DASHSCOPE_API_BASE",
+        "DATABRICKS_AGENT_API_BASE",
         "DATABRICKS_API_BASE",
         "DATAFORSEO_API_BASE",
         "DATAROBOT_API_BASE",
@@ -156,6 +159,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "HUMANLOOP_API_BASE",
         "HYPERBOLIC_API_BASE",
         "INCEPTION_API_BASE",
+        "INFERENCEAPIS_API_BASE",
         "INFINITY_API_BASE",
         "JINA_AI_API_BASE",
         "LAMBDA_AI_API_BASE",
@@ -163,6 +167,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "LANGFLOW_API_BASE",
         "LANGFUSE_API_BASE",
         "LANGGRAPH_API_BASE",
+        "LAYA_API_BASE",
         "LEMONADE_API_BASE",
         "LIBERTAI_API_BASE",
         "LINKUP_API_BASE",
@@ -175,6 +180,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "MARITALK_API_BASE",
         "META_API_BASE",
         "META_LLAMA_API_BASE",
+        "MICROSOFT_365_COPILOT_API_BASE",
         "MILVUS_API_BASE",
         "MINIMAX_API_BASE",
         "MISTRAL_API_BASE",
@@ -228,6 +234,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "SAIL_API_BASE",
         "SAMBANOVA_API_BASE",
         "SAP_API_BASE",
+        "SCALEDOWN_API_BASE",
         "SCALEWAY_API_BASE",
         "SCX_AI_API_BASE",
         "SCX_API_BASE",
