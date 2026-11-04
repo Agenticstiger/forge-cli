@@ -138,6 +138,10 @@ def roundtrip_check(odcs: Mapping[str, Any], reconstructed: Mapping[str, Any]) -
     :mod:`deepdiff` so list-of-objects ordering, nested-dict comparison, and
     type coercion are handled consistently.
     """
+    from fluid_build._optional import MissingOptionalDependency, is_available
+
+    if not is_available("deepdiff"):
+        raise MissingOptionalDependency("deepdiff", "odcs-strict", "the ODCS round-trip check")
     from deepdiff import DeepDiff
 
     diff = DeepDiff(

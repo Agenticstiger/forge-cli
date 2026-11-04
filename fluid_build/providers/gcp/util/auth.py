@@ -270,11 +270,18 @@ def validate_credentials(project: str) -> Dict[str, Any]:
     return result
 
 
-def _test_project_access(project: str, credentials) -> bool:
-    """Test basic project access."""
+def _test_project_access(project: str, credentials) -> Optional[bool]:
+    """Test basic project access; ``None`` when it cannot be checked.
+
+    The probe needs google-api-python-client, which the ``gcp`` extra leaves out
+    (it is large and only this probe uses it), so without it the answer is
+    "not checked", never "no access".
+    """
     try:
         from googleapiclient.discovery import build
-
+    except ImportError:
+        return None
+    try:
         service = build("cloudresourcemanager", "v1", credentials=credentials)
         service.projects().get(projectId=project).execute()
         return True

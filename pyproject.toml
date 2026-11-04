@@ -42,7 +42,6 @@ dependencies = [
   "rfc8785",
   "rich>=13.7",
   "pydantic>=2.7",
-  "typing-extensions>=4.8",
   "jinja2>=3.1.6",  # security: >=3.1.6 closes CVE-2025-27516 (sandbox escape via |attr)
   "httpx>=0.27",  # The one HTTP client: Command Center, Data Mesh Manager, marketplace, reporter
   "h11>=0.16",  # security: pin transitive h11 >=0.16 to close CVE-2025-43859 (chunked request smuggling)
@@ -201,8 +200,6 @@ dependencies = [
   #   GitHub: https://github.com/OpenLineage/OpenLineage/tree/main/client/python
   #   Spec:   https://openlineage.io/spec/2-0-2/OpenLineage.json
   "openlineage-python>=1.52",
-  # Optional UX nicety on Windows; no-op elsewhere
-  "colorama>=0.4.6; platform_system == 'Windows'",
   # Cross-platform single-keypress reader powering arrow-key menu
   # navigation in ``forge_ui.ask_numbered_choice`` (the interactive
   # forge / ai-setup menus). Owns the finicky, edge-case-ridden part —
@@ -220,6 +217,11 @@ dependencies = [
   #    which fights the startup-budget gate; simple-term-menu rejected:
   #    Linux/macOS-only, would drop the Windows path #263/#269 hardened.)
   "readchar>=4.0",
+  # Imported directly by the MCP server, the sampling bridge and the LLM MCP
+  # client (anyio.from_thread, anyio.lowlevel). It already arrives through
+  # httpx, so naming it adds nothing to the install; it stops a change to
+  # httpx from silently removing a module forge imports.
+  "anyio>=4",
 ]
 
 [project.optional-dependencies]
@@ -249,6 +251,10 @@ sdk = [
 #   Listed:  https://github.com/bitol-io/open-data-contract-standard/blob/main/vendors.md
 odcs-strict = [
   "vowl>=0.0.2",
+  # ``fluid odcs validate --roundtrip`` and the copilot ODCS round-trip check
+  # diff the rendered contract with deepdiff (providers/odcs/validation.py).
+  # It used to be named only in ``dev``, so an installed CLI had no deepdiff.
+  "deepdiff>=7.0",
 ]
 
 # Local provider (DuckDB)
@@ -269,7 +275,6 @@ local = [
 # GCP provider (install only when needed)
 gcp = [
   "google-auth>=2.29",
-  "google-auth-oauthlib>=1.2",
   "google-cloud-bigquery>=3.20",
   # An embedded-SQL build on DuckDB reads an upstream BigQuery table through
   # python-bigquery's Arrow pages (``RowIterator.to_arrow_iterable``) into
@@ -282,8 +287,6 @@ gcp = [
   # Dataplex SDK. Pulled in by default because most BigQuery
   # adopters also use Dataplex tagging.
   "google-cloud-dataplex>=1.0",
-  # optional; gated for 3.10+ environments where wheel support exists
-  "google-cloud-iam>=2.15 ; python_version >= '3.10'",
   # optional runtime helpers (dbt) — also 3.10+ where ecosystem is healthiest
   "dbt-bigquery>=1.7,<2 ; python_version >= '3.10'",
 ]
@@ -299,19 +302,21 @@ snowflake = [
 # pulls the SDK — the integration workflows install `.[dev,aws]`.
 aws = [
   "boto3>=1.34",
+  # Imported directly (ClientError, the bundled endpoint data); boto3 pulls it.
+  "botocore>=1.34",
 ]
 
 # Visualizations (plan graph, HTML)
-viz = [
-  "graphviz>=0.20",
-]
+# Empty alias: the plan graph shells out to the ``dot`` binary and never imports
+# the Python ``graphviz`` package. Kept so ``pip install ...[viz]`` still resolves.
+viz = []
 
 # ODPS / OPDS export (spec conversion). Two distinct standards both
 # abbreviated ODPS: Bitol Open Data Product Standard v1.0.0 and the LF/ODPI
 # Open Data Product Specification v4.1. Both are covered by this extra.
-odps = [
-  "ruamel.yaml>=0.18",
-]
+# Empty alias: nothing in fluid_build imports ruamel.yaml. Kept so
+# ``pip install ...[odps]`` (and the ``[opds]`` alias) still resolves.
+odps = []
 
 # Back-compat alias — earlier docs / install scripts used ``[opds]`` for the
 # letter-swap of ODPS. Kept as an empty alias that depends on ``[odps]`` so
@@ -322,9 +327,9 @@ opds = [
 ]
 
 # Optional TUI extras
-tui = [
-  "textual>=0.58",
-]
+# Empty alias: nothing in fluid_build imports textual. Kept so
+# ``pip install ...[tui]`` still resolves.
+tui = []
 
 # Optional copilot discovery helpers for Parquet / Avro metadata inspection
 copilot = [
@@ -750,9 +755,62 @@ optional_dependencies_dev_groups = ["dev", "docs", "test-emulators", "test-emula
 # Keeps deptry's defaults (they already exclude tests and .venv).
 extend_exclude = ["scripts", "examples"]
 
+# Distribution name -> import name, for every package whose import name is not
+# its distribution name. Without it the result depends on which extras happen to
+# be installed where deptry runs (an uninstalled package is guessed as
+# ``google_cloud_bigquery``), so CI and a laptop would disagree.
+[tool.deptry.package_module_name_map]
+google-auth = "google"
+google-cloud-bigquery = "google"
+google-cloud-storage = "google"
+google-cloud-dataplex = "google"
+snowflake-connector-python = "snowflake"
+databricks-sdk = "databricks"
+acryl-datahub = "datahub"
+sqlite-vec = "sqlite_vec"
+data-product-forge-sdk = ["fluid_sdk", "fluid_provider_sdk"]
+
 [tool.deptry.per_rule_ignores]
 # h11 is a security floor for a transitive dependency; nothing imports it.
-DEP002 = ["h11"]
+# dbt-bigquery / dbt-snowflake are dbt adapters: fluid runs dbt as a subprocess
+# and dbt-core loads the adapter by name, so no forge module imports them.
+DEP002 = ["h11", "dbt-bigquery", "dbt-snowflake"]
+# Optional integrations the user installs themselves. Each import is guarded
+# (try/except ImportError, MissingExtraError, or a feature probe) and no extra
+# owns the package, so declaring them would put them on every install:
+#   git (GitPython: workspace.py), psutil (performance.py), argcomplete (cli
+#   completion), hvac / azure (secrets.py, auth), airbyte / dlt / sqlalchemy
+#   (the airbyte and dlt runners), avro (fallback after fastavro), sklearn (an
+#   environment probe), openapi_spec_validator (bundle validation, off by default),
+#   googleapiclient (the GCP project-access probe reports "not checked" without it;
+#   kept out of [gcp] on purpose: it is large and only this probe uses it).
+DEP001 = [
+  "googleapiclient",
+  "git",
+  "psutil",
+  "argcomplete",
+  "hvac",
+  "azure",
+  "airbyte",
+  "dlt",
+  "sqlalchemy",
+  "avro",
+  "sklearn",
+  "openapi_spec_validator",
+]
+# Soft imports that degrade when the package is absent, so no extra declares them:
+#   opentelemetry (observability/tracing.py, cli/_ux_telemetry.py: tracing is a
+#   no-op without it), python-dateutil (the lineage event-time check falls back
+#   to now), packaging (plugin-version checks fall back to the legacy bounds).
+#   starlette / uvicorn are the MCP output-port transport, pinned by mcp itself.
+# TODO(PR D): once mcp / openlineage-python live in their extras, declare
+# starlette, uvicorn in ``[mcp]`` and python-dateutil in ``[lineage]``.
+DEP003 = ["opentelemetry", "dateutil", "packaging", "starlette", "uvicorn"]
+# Used only on a dev path, never a hard requirement of the installed CLI:
+#   pytest: api/conformance/runner.py runs inside a pytest session and calls
+#   pytest.skip; tomli: fluid_build/__init__.py version fallback for a source
+#   checkout on Python 3.10 (guarded, degrades to the pinned fallback version).
+DEP004 = ["pytest", "tomli"]
 
 [tool.bandit]
 # B608: SQL query construction is expected — this is a pipeline/SQL code generator
