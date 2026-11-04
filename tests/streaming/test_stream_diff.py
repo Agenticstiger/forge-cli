@@ -144,3 +144,17 @@ def test_builds_without_a_stream_are_left_alone(baseline):
     other = copy.deepcopy(baseline)
     other["builds"][0]["id"] = "renamed"
     assert diff_streams(baseline, other) == []
+
+
+def test_a_build_that_runs_its_own_sql_is_reported(baseline):
+    def sql(contract, text):
+        new = copy.deepcopy(contract)
+        new["builds"][0]["properties"]["sql"] = text
+        return new
+
+    reading = sql(baseline, "SELECT * FROM source_events")
+    widened = sql(baseline, "SELECT * FROM source_events UNION ALL SELECT * FROM lake.hr.pay")
+    assert _kinds(baseline, reading) == {("stream_contract_sql_added", "breaking")}
+    assert _kinds(reading, widened) == {("stream_contract_sql_changed", "breaking")}
+    assert _kinds(widened, baseline) == {("stream_contract_sql_removed", "non_breaking")}
+    assert _kinds(reading, sql(baseline, "  SELECT * FROM source_events\n")) == set()

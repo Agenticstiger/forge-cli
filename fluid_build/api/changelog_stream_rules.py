@@ -22,7 +22,9 @@ without it stops the job: Confluent Schema Registry's FORWARD compatibility, see
 from the consumer. What the outputs then contain is diffed with the exposes.
 
 A different topic or encoding is breaking. So is an explode added, removed or moved,
-because it changes how many rows each record becomes. An output read from another
+because it changes how many rows each record becomes, and so is a build that starts
+running, or changes, SQL written in the contract, which can read any table the job's
+catalog identity can. An output read from another
 path keeps its type but may change meaning; that is reported for review, as dbt
 reports a changed model, not as breaking.
 """
@@ -95,6 +97,11 @@ def _sources(props: Mapping[str, Any]) -> Dict[str, str]:
         for entry in columns or []
         if isinstance(entry, Mapping)
     }
+
+
+def _sql(props: Mapping[str, Any]) -> Optional[str]:
+    sql = props.get("sql")
+    return sql.strip() if isinstance(sql, str) else None
 
 
 def _explode(props: Mapping[str, Any]) -> Optional[str]:
@@ -195,6 +202,30 @@ def diff_streams(baseline: Mapping[str, Any], new: Mapping[str, Any]) -> List[Ch
                 _explode(base_props),
                 _explode(new_props),
             )
+        old_sql, new_sql = _sql(base_props), _sql(new_props)
+        if old_sql != new_sql:
+            if old_sql is None:
+                kind, severity, text = (
+                    "stream_contract_sql_added",
+                    "breaking",
+                    f"build '{build_id}' runs SQL written in the contract instead of its "
+                    "mapping: it can read any table the job's catalog identity can",
+                )
+            elif new_sql is None:
+                kind, severity, text = (
+                    "stream_contract_sql_removed",
+                    "non_breaking",
+                    f"build '{build_id}' reads the stream through its mapping instead of its "
+                    "own SQL",
+                )
+            else:
+                kind, severity, text = (
+                    "stream_contract_sql_changed",
+                    "breaking",
+                    f"build '{build_id}' runs different SQL written in the contract: review "
+                    "what it now reads",
+                )
+            changed("sql", kind, severity, text, old_sql, new_sql)
         old_sources, new_sources = _sources(base_props), _sources(new_props)
         for name in sorted(old_sources.keys() | new_sources.keys()):
             before = old_sources.get(name, name)
