@@ -47,4 +47,4 @@ def operator_allows_the_example(monkeypatch):
     """The example's deployment targets and catalog, listed as its operator would."""
     for name, value in EXAMPLE_ALLOWLISTS.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest")  # a name the job resolves
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest,kafka")  # names the job resolves

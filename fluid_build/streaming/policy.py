@@ -279,26 +279,39 @@ def catalog_request_guard(url: str, *, role: str) -> Callable[[Any], None]:
 
 
 def refuse_unless_catalog_secret_allowed(
-    variable: str, url: str, *, environ: Optional[Mapping[str, str]] = None
+    variable: str,
+    url: str,
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    pod_side: bool = False,
 ) -> None:
     """Raise unless the operator lets ``variable`` be sent to ``url``'s host.
 
     Checked before the variable is read, so a refusal never touches the secret.
+    ``fluid verify`` sends from this machine, where a loopback host is this
+    machine and needs no entry. ``pod_side`` is apply: the deployed job sends
+    from its pod, where loopback is the pod itself or a sidecar injected into it,
+    so the entry is required whatever the host.
     """
     host = urlsplit(url).hostname
-    if variable_allowed(variable, host, environ=environ):
+    if variable_allowed(variable, host, environ=environ, loopback_exempt=not pod_side):
         return
     # Rebuilt from the parsed list, so an entry the parser ignores is not echoed back.
     current = [f"{n}@{h}" if h else n for n, h in secret_ref_allowlist(environ)]
     suggestion = ",".join([*current, f"{variable}@{host}" if host else variable])
+    loopback_note = (
+        "A loopback host is the pod itself or a sidecar injected into it, so it needs "
+        "an entry too."
+        if pod_side
+        else "A loopback host needs no entry."
+    )
     raise FlinkPolicyError(
         what=f"the managed Flink lane would send variable {variable!r} to host {host!r}",
         why=(
             "catalogAuth names the variable and the contract names the host. fluid verify "
             "sends it from this environment, and the deployed job from its pod, whose "
             "mounted Secrets hold more than the catalog token. Without an operator "
-            "allowlist, any variable there could go to a host the contract chose. A "
-            "loopback host needs no entry."
+            f"allowlist, any variable there could go to a host the contract chose. {loopback_note}"
         ),
         fix=(
             f"If this is intended, set it {_OPERATOR_ONLY}: "
@@ -315,6 +328,7 @@ def refuse_unless_catalog_targets_allowed(
     *,
     s3_endpoint: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
+    pod_side: bool = False,
 ) -> Optional[CatalogAuth]:
     """Check every destination a credential goes to, at apply as at verify.
 
@@ -323,6 +337,11 @@ def refuse_unless_catalog_targets_allowed(
     this environment. Both run this before anything is read or deployed. An
     OAuth2 credential is paired with BOTH hosts: the token endpoint receives the
     credential, and the catalog receives the token minted from it.
+
+    ``pod_side`` is apply's: the variable is sent from the pod, so a loopback
+    host is not exempt from its ``NAME@host`` entry (see
+    :func:`refuse_unless_catalog_secret_allowed`). The host check itself is the
+    same on both sides.
     """
     refuse_unless_catalog_host_allowed(catalog_uri, role="Iceberg catalog", environ=environ)
     if s3_endpoint:
@@ -337,9 +356,92 @@ def refuse_unless_catalog_targets_allowed(
         refuse_unless_catalog_host_allowed(
             token_endpoint, role="OAuth2 token endpoint", environ=environ
         )
-        refuse_unless_catalog_secret_allowed(auth.env_var, str(token_endpoint), environ=environ)
-    refuse_unless_catalog_secret_allowed(auth.env_var, catalog_uri, environ=environ)
+        refuse_unless_catalog_secret_allowed(
+            auth.env_var, str(token_endpoint), environ=environ, pod_side=pod_side
+        )
+    refuse_unless_catalog_secret_allowed(
+        auth.env_var, catalog_uri, environ=environ, pod_side=pod_side
+    )
     return auth
+
+
+def _kafka_entry_host(entry: str, position: int) -> str:
+    """The host of one ``bootstrapServers`` entry, ``host:port`` or ``[ipv6]:port``.
+
+    Raises:
+        FlinkPolicyError: the entry is empty, has an unbalanced bracket, a bare
+            IPv6 address, or no numeric port.
+    """
+
+    def malformed(reason: str) -> FlinkPolicyError:
+        return FlinkPolicyError(
+            what="the managed Flink lane may not use the Kafka bootstrap server",
+            why=f"Refused because bootstrapServers entry {position} {reason}.",
+            fix=(
+                "Write source.bootstrapServers as a comma-separated host:port list, such "
+                "as kafka-0:9092,kafka-1:9092, with an IPv6 address in brackets: [::1]:9092."
+            ),
+            doc=doc_url(),
+        )
+
+    text = entry.strip()
+    if not text:
+        raise malformed("is empty")
+    if text.startswith("["):
+        close = text.find("]")
+        if close < 0:
+            raise malformed("has an unbalanced bracket")
+        host, rest = text[1:close], text[close + 1 :]
+        if not _is_ip_address(host) or ":" not in host:
+            raise malformed("has brackets around something other than an IPv6 address")
+    elif "]" in text:
+        raise malformed("has an unbalanced bracket")
+    else:
+        host, separator, port = text.rpartition(":")
+        if not separator:
+            raise malformed("has no port")
+        if ":" in host:
+            raise malformed("is an IPv6 address without brackets")
+        rest = f":{port}"
+    if not host:
+        raise malformed("has no host")
+    if not (rest.startswith(":") and rest[1:].isascii() and rest[1:].isdigit()):
+        raise malformed("has no numeric port")
+    if not 0 < int(rest[1:]) < 65536:
+        raise malformed("has a port outside 1-65535")
+    return host
+
+
+def refuse_unless_source_hosts_allowed(
+    cfg: Mapping[str, Any], *, environ: Optional[Mapping[str, str]] = None
+) -> None:
+    """Raise unless the Kafka brokers and the Schema Registry are hosts the lane may use.
+
+    The same rule as the catalog's: the deployed job resolves each name itself,
+    so a hostname needs an operator entry, an IP address needs one only when
+    public, link-local is never allowed, and ``localhost`` is free. Without it a
+    contract could point the job, with its mounted Secrets and whatever the
+    pod's network reaches, at a broker it chose. There is no topic allowlist:
+    within an allowed broker the contract picks the topic, and the broker's ACLs
+    bound that.
+
+    Raises:
+        FlinkPolicyError: a host is not allowed, or ``bootstrapServers`` is malformed.
+    """
+    source = cfg.get("source")
+    if not isinstance(source, Mapping):
+        return
+    servers = source.get("bootstrapServers")
+    if isinstance(servers, str):
+        for position, entry in enumerate(servers.split(","), 1):
+            host = _kafka_entry_host(entry, position)
+            literal = f"[{host}]" if ":" in host else host
+            refuse_unless_catalog_host_allowed(
+                f"http://{literal}", role="Kafka bootstrap server", environ=environ
+            )
+    registry = source.get("schemaRegistryUrl")
+    if registry:
+        refuse_unless_catalog_host_allowed(registry, role="Schema Registry", environ=environ)
 
 
 def contract_sql_entry(product_id: Any, build: Mapping[str, Any]) -> str:

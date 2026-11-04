@@ -20,6 +20,7 @@ of that may reach a cluster, a network or the environment unless the operator
 listed it. These tests pin each refusal and that it comes first.
 """
 
+import copy
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -347,7 +348,7 @@ def test_a_name_the_job_resolves_needs_an_entry_whatever_it_resolves_to_here(
             reconcile(contract, dry_run=True)
     assert "S3 endpoint" in refused.value.what
     assert "resolves it itself" in refused.value.why
-    listed = "iceberg-rest,s3.attacker.example"  # the operator's entry is kept
+    listed = "iceberg-rest,kafka,s3.attacker.example"  # the operator's entry is kept
     assert f'export {HOST_ALLOWLIST_ENV}="{listed}"' in refused.value.fix
 
 
@@ -423,3 +424,192 @@ def test_the_token_fix_keeps_valid_entries_and_drops_ignored_ones(monkeypatch):
         refuse_unless_catalog_secret_allowed("CI_SECRET", "https://catalog.example/")
     expected = "OTHER@corp.example,CI_SECRET@catalog.example"
     assert f'export {SECRET_REF_ALLOWLIST_ENV}="{expected}"' in refused.value.fix
+
+
+# ── The Kafka brokers and the Schema Registry, by the catalog's rule ─────────
+
+
+def _source(contract):
+    return contract["builds"][0]["properties"]["parameters"]["flink"]["source"]
+
+
+def _brokers(contract, servers):
+    _source(contract)["bootstrapServers"] = servers
+    return contract
+
+
+def _refused_before_kubectl(contract, **kwargs):
+    with patch.object(Kubectl, "command", side_effect=AssertionError("kubectl ran")):
+        with pytest.raises(FlinkPolicyError) as refused:
+            reconcile(contract, **kwargs)
+    return refused.value
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_an_unlisted_broker_name_is_refused_before_any_kubectl_call(contract, monkeypatch, dry_run):
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest")
+    refused = _refused_before_kubectl(contract, dry_run=dry_run)
+    assert "Kafka bootstrap server" in refused.what
+    assert "host 'kafka' is a name the operator has not listed" in refused.why
+    assert f'export {HOST_ALLOWLIST_ENV}="iceberg-rest,kafka"' in refused.fix
+
+
+def test_a_second_broker_that_is_not_listed_is_refused_too(contract, monkeypatch):
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest,kafka")
+    _brokers(contract, "kafka:9092, other.example:9092")
+    assert "'other.example'" in _refused_before_kubectl(contract, dry_run=True).why
+
+
+def test_a_broker_the_operator_lists_passes(contract):
+    _brokers(contract, "kafka:9092,kafka:9093")
+    with patch.object(Kubectl, "command", side_effect=AssertionError("kubectl ran")):
+        (result,) = reconcile(contract, dry_run=True)
+    assert result["status"] == "planned"
+
+
+def test_every_build_clears_the_policy_before_any_build_is_read(contract, monkeypatch):
+    """The second build's refusal must not follow a kubectl read of the first."""
+    second = copy.deepcopy(contract["builds"][0])
+    second["id"] = "other"
+    second["outputs"] = ["other-output"]
+    flink = second["properties"]["parameters"]["flink"]
+    flink["source"]["bootstrapServers"] = "unlisted.example:9092"
+    flink["deployment"].update(
+        name="other",
+        checkpointUri="s3://flink-state/other/checkpoints",
+        savepointUri="s3://flink-state/other/savepoints",
+        haUri="s3://flink-state/other/ha",
+    )
+    contract["builds"].append(second)
+    target = copy.deepcopy(contract["exposes"][0])
+    target["exposeId"] = "other-output"
+    target["binding"]["location"]["table"] = "other_table"
+    contract["exposes"].append(target)
+    assert "'unlisted.example'" in _refused_before_kubectl(contract).why
+
+
+@pytest.mark.parametrize("servers", ["10.0.0.5:9092", "127.0.0.1:9092", "localhost:9092"])
+def test_a_private_or_loopback_broker_needs_no_entry(contract, monkeypatch, servers):
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest")
+    reconcile(_brokers(contract, servers), dry_run=True)
+
+
+def test_a_public_ip_broker_needs_an_entry_and_a_link_local_one_is_never_allowed(
+    contract, monkeypatch
+):
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest")
+    refused = _refused_before_kubectl(_brokers(contract, "8.8.8.8:9092"), dry_run=True)
+    assert "public and not in" in refused.why
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest,8.8.8.8,169.254.169.254")
+    reconcile(_brokers(contract, "8.8.8.8:9092"), dry_run=True)
+    refused = _refused_before_kubectl(_brokers(contract, "169.254.169.254:9092"), dry_run=True)
+    assert "link-local" in refused.why and "Kafka bootstrap server" in refused.what
+
+
+@pytest.mark.parametrize(
+    "servers,verdict",
+    [
+        ("[::1]:9092", "passes"),
+        ("[fe80::1]:9092", "link-local"),
+        ("[2001:4860:4860::8888]:9092", "public"),
+        ("kafka:9092,[::1]:9092", "passes"),
+    ],
+)
+def test_a_bracketed_ipv6_broker_is_parsed_and_judged(contract, monkeypatch, servers, verdict):
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest,kafka")
+    _brokers(contract, servers)
+    if verdict == "passes":
+        reconcile(contract, dry_run=True)
+    else:
+        assert verdict in _refused_before_kubectl(contract, dry_run=True).why
+
+
+@pytest.mark.parametrize(
+    "servers,reason",
+    [
+        ("kafka:9092,,kafka:9093", "entry 2 is empty"),
+        ("kafka:9092,", "entry 2 is empty"),
+        ("[::1:9092", "unbalanced bracket"),
+        ("::1]:9092", "unbalanced bracket"),
+        ("::1:9092", "IPv6 address without brackets"),
+        ("kafka", "has no port"),
+        ("kafka:", "no numeric port"),
+        ("kafka:abc", "no numeric port"),
+        ("kafka:70000", "outside 1-65535"),
+        ("[kafka]:9092", "something other than an IPv6 address"),
+        (":9092", "has no host"),
+    ],
+)
+def test_a_malformed_broker_list_is_a_typed_refusal(contract, servers, reason):
+    refused = _refused_before_kubectl(_brokers(contract, servers), dry_run=True)
+    assert "Kafka bootstrap server" in refused.what
+    assert reason in refused.why
+    assert "host:port" in refused.fix
+
+
+def _registry(contract, url):
+    stream = contract["builds"][0]["properties"]["stream"]
+    stream["format"] = "avro-confluent"
+    _source(contract)["schemaRegistryUrl"] = url
+    return contract
+
+
+def test_an_unlisted_schema_registry_name_is_refused(contract, monkeypatch):
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest,kafka")
+    refused = _refused_before_kubectl(_registry(contract, "http://registry:8081"), dry_run=True)
+    assert "Schema Registry" in refused.what
+    assert "host 'registry' is a name the operator has not listed" in refused.why
+
+
+def test_a_listed_schema_registry_and_a_private_ip_one_pass(contract, monkeypatch):
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest,kafka,registry")
+    reconcile(_registry(contract, "http://registry:8081"), dry_run=True)
+    reconcile(_registry(contract, "http://10.0.0.7:8081"), dry_run=True)
+    refused = _refused_before_kubectl(
+        _registry(contract, "http://169.254.169.254:8081"), dry_run=True
+    )
+    assert "link-local" in refused.why and "Schema Registry" in refused.what
+
+
+# ── A token sent from the pod: loopback is not the machine fluid runs on ─────
+
+
+def _loopback_catalog(contract):
+    return _sink(contract, "https://localhost:8181", {"type": "bearer", "tokenEnv": "CI_SECRET"})
+
+
+def test_apply_refuses_a_loopback_token_destination_without_an_entry(contract, monkeypatch):
+    monkeypatch.delenv(SECRET_REF_ALLOWLIST_ENV, raising=False)
+    monkeypatch.setenv("CI_SECRET", "sentinel-value-must-not-leak")
+    refused = _refused_before_kubectl(_loopback_catalog(contract), dry_run=True)
+    assert "'CI_SECRET'" in refused.what and "'localhost'" in refused.what
+    assert "pod itself or a sidecar" in refused.why
+    assert f'{SECRET_REF_ALLOWLIST_ENV}="CI_SECRET@localhost"' in refused.fix
+    assert "sentinel-value-must-not-leak" not in str(refused.as_json())
+
+
+def test_apply_accepts_a_loopback_token_destination_the_operator_paired(contract, monkeypatch):
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST_ENV, "CI_SECRET@localhost")
+    reconcile(_loopback_catalog(contract), dry_run=True)
+
+
+def test_apply_refuses_a_loopback_oauth2_endpoint_without_an_entry(contract, monkeypatch):
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST_ENV, "CI_SECRET@catalog.example")
+    _sink(contract, "https://catalog.example", _oauth2("https://localhost/token"))
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "iceberg-rest,kafka,catalog.example")
+    refused = _refused_before_kubectl(contract, dry_run=True)
+    assert "'localhost'" in refused.what
+
+
+def test_verify_keeps_the_loopback_exemption_and_apply_does_not(monkeypatch):
+    from fluid_build.streaming.runtime import _catalog_headers
+
+    cfg = {"catalogAuth": {"type": "bearer", "tokenEnv": "CI_SECRET"}}
+    monkeypatch.delenv(SECRET_REF_ALLOWLIST_ENV, raising=False)
+    monkeypatch.setenv("CI_SECRET", "tok")
+    assert _catalog_headers(cfg, "https://localhost:8181") == {"Authorization": "Bearer tok"}
+    with pytest.raises(FlinkPolicyError):
+        refuse_unless_catalog_targets_allowed(
+            cfg, "https://localhost:8181", environ={}, pod_side=True
+        )
+    assert refuse_unless_catalog_targets_allowed(cfg, "https://localhost:8181", environ={})
