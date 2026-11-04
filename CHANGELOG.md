@@ -262,6 +262,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `fluid forge` welcome scan kept walking the whole directory tree after it had returned.**
+  Its type-suggestion probe listed contracts with `sorted(cwd.rglob("contract.fluid.yaml"))[:8]`,
+  which reads every file under the current directory (279 s under a folder holding many repos) and
+  goes into `.venv`, `.git` and `node_modules`. The scan returns at its 1.0 s budget, but Python
+  cannot kill a thread, so the walker went on at about half a core, and the mode picker, the
+  interview and the welcome panel each start a scan: up to three overlapped. The walk is now
+  bounded and ends with its scan. It skips the directories `util/upstream_discovery` already skips
+  (`.git`, `.venv`, `site-packages`, `node_modules`, `dist`, `build`, ...), lists at most 6 levels
+  below the current directory, reads at most 10,000 directory entries, and stops at its next
+  directory once the scan has returned; one walk runs at a time per process. It tallies the same
+  first 8 contracts as before wherever those limits do not cut the walk. A symlink named
+  `contract.fluid.yaml`, or one that is not a regular file (a FIFO, a device), is no longer
+  opened.
+
 - **`fluid apply --mode amend-and-build` provisioned a product, then refused its id.** The build
   phase keeps run records, cursors and watermarks under `.fluid/runs/<contract.id>/<build.id>/`,
   so its ids must start with a letter or underscore, use only letters, digits, `_`, `.` and `-`,
@@ -591,6 +605,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A contract chose both the variable and the hosts an Iceberg sink's catalog credential went
+  to.** On the Kafka Connect and embedded Debezium Iceberg sinks, `sink.catalogAuth` names an
+  environment variable (`tokenEnv` / `credentialEnv`), and the same contract names the catalog
+  (`binding.location.uri`) and the OAuth2 token endpoint (`oauth2ServerUri`). The config forge-cli
+  pushes or writes carries `env:<NAME>`, which Iceberg resolves on the Connect worker, or on
+  embedded Debezium from the runner's whole environment, so any variable there could be sent to a
+  host the contract picked. Every host the credential reaches must now be https (a loopback one
+  included) and allowed by the operator: the variable paired with it as `NAME@host` in
+  `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, and a hostname listed in
+  `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST`, because the worker resolves the name itself,
+  later. An IP address keeps that list's rules (link-local never, a private one with no entry, a
+  public one only when listed), and a loopback host needs neither entry. A bare `NAME` entry
+  allows every host and a listed hostname also covers its subdomains, so prefer `NAME@host` and
+  the exact host. The run refuses before any Connect REST call, `application.properties` write or
+  read of the variable; `fluid validate` warns with the `export` line the run needs, and refuses
+  an `http://` or link-local host outright. `binding.location` text that reaches the derived sink
+  config may no longer start with `env:` or hold `${` or a control character, and its `region`
+  must be one host label. **Upgrade:** a sink whose `catalogAuth` reaches a non-loopback host
+  fails its run until the operator adds both entries, and one on an `http://` catalog or token
+  endpoint fails `fluid validate`. A derived sink whose `binding.location` holds such text, or a
+  region that is not one label, now fails `fluid validate` and the run, `catalogAuth` or not;
+  write the value itself.
+
 - **`validate_ident` let a name with a trailing newline through.** Python's `$` also matches just
   before a trailing newline, so the identifier allowlist in `providers/_sql_safety.py`, which the
   DDL and OpenTofu emitters route names through, accepted `orders\n` and passed it on with the
@@ -620,6 +657,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   litellm sends the provider key to. They are now in `credentials/litellm_endpoints.py`, so a
   project dotenv file cannot point them elsewhere while `FLUID_LLM_API_KEY` or a stored key is in
   play, as for every other provider endpoint.
+
+- **The litellm endpoint check could not see a provider's per-kind route.** It looked for names
+  ending in `_API_BASE`, so the nine `DASHSCOPE_`, `QWENCLOUD_` and `QWEN_AI_PLATFORM_API_BASE_IMAGE`,
+  `_RERANK` and `_VIDEO` names litellm reads (three of them new in 1.108.0) were never listed, and
+  a project dotenv file could set them unpaired. They are listed now and the check reads a kind
+  after `_API_BASE`. FLUID calls only `litellm.completion`, which none of them routes, so nothing
+  reached them. The Databricks model-serving group also names `DATABRICKS_CLIENT_SECRET`, which
+  litellm's OAuth M2M path posts to the workspace `DATABRICKS_API_BASE` names; the name-shape rule
+  already refused that pairing, and the group now says why.
 
 ### Upgrade notes
 

@@ -1256,9 +1256,18 @@ ENDPOINT_CREDENTIAL_GROUPS: Tuple[EndpointGroup, ...] = (
     EndpointGroup(
         service="Databricks model serving",
         endpoints=("DATABRICKS_API_BASE",),
-        credentials=("DATABRICKS_API_KEY", "DATABRICKS_TOKEN", _LLM_KEY),
+        credentials=(
+            "DATABRICKS_API_KEY",
+            "DATABRICKS_TOKEN",
+            # litellm's OAuth M2M path posts it to the workspace this base names
+            "DATABRICKS_CLIENT_SECRET",
+            _LLM_KEY,
+        ),
         ambient=True,
-        read_by=f"litellm's databricks/ route (DATABRICKS_API_BASE); {_LLM_KEYRING}",
+        read_by=(
+            "litellm's databricks/ route (DATABRICKS_API_BASE, and its OAuth M2M "
+            f"token request with DATABRICKS_CLIENT_SECRET); {_LLM_KEYRING}"
+        ),
         paired_by=((_LLM_KEY,),),
     ),
     EndpointGroup(
