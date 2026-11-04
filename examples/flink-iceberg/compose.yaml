@@ -1,0 +1,64 @@
+services:
+  kafka:
+    image: redpandadata/redpanda:v24.3.9
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - 512M
+      - --reserve-memory
+      - 0M
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - 0.0.0.0:9092
+      - --advertise-kafka-addr
+      - kafka:9092
+  s3:
+    # MinIO no longer publishes its images (Docker Hub and Quay both refuse the pinned
+    # tags), so the fixture's object store is Adobe's S3Mock (Apache-2.0). It creates the
+    # warehouse bucket at startup, accepts any credentials and serves path-style
+    # requests only, which is how every client here is configured.
+    image: adobe/s3mock:5.2.3
+    environment:
+      COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: warehouse
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    depends_on: [s3]
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin # pragma: allowlist secret - disposable local fixture
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://s3:9090
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports: ["127.0.0.1:0:8181"]
+  jobmanager:
+    image: ${FLUID_FLINK_TEST_IMAGE:-forge-flink:test}
+    command: jobmanager
+    environment: &flink-env
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin # pragma: allowlist secret - disposable local fixture
+      AWS_REGION: us-east-1
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        parallelism.default: 1
+        taskmanager.numberOfTaskSlots: 2
+        execution.checkpointing.interval: 2s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        state.checkpoints.dir: file:///tmp/forge-checkpoints
+        restart-strategy.type: fixed-delay
+        restart-strategy.fixed-delay.attempts: 10
+        restart-strategy.fixed-delay.delay: 1s
+    volumes: ["./job.properties:/etc/forge/job.properties:ro"]
+    ports: ["127.0.0.1:0:8081"]
+  taskmanager:
+    image: ${FLUID_FLINK_TEST_IMAGE:-forge-flink:test}
+    command: taskmanager
+    depends_on: [jobmanager]
+    environment: *flink-env

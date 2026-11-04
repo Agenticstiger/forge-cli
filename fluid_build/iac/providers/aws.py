@@ -298,9 +298,9 @@ def _hive_outcome(raw: Any) -> column_types.TypeOutcome:
     base, rest = column_types.split_type(raw)
     if base in column_types.STRUCTURED:
         return column_types.refused(
-            "which Glue holds only with its element or field types, and the contract schema "
-            "cannot declare them yet",
-            column_types.NESTED_FIX,
+            "which Glue holds only with its element or field types, and none is declared "
+            "(fields, element, or key and value need contract 0.7.7 or later)",
+            column_types.NESTED_FIX_DECLARE,
         )
     if not rest.isascii():
         return column_types.refused(
@@ -338,10 +338,50 @@ def _hive_type(raw: Any) -> str:
     return _hive_outcome(raw).target or "string"
 
 
+def _nested_hive_type(column: Mapping[str, Any]) -> Optional[str]:
+    """The Hive type of a column that declares its nested types, else ``None``.
+
+    A struct, array or map declares ``fields``, ``element`` or ``key`` and
+    ``value`` from contract 0.7.7. A bare one (0.7.5 and 0.7.6 could declare
+    nothing more) is not handled here: :func:`_hive_outcome` refuses it.
+
+    Raises:
+        ValueError: the declared nested type is one Glue cannot hold.
+    """
+    if column_types.split_type(column.get("type"))[0] not in column_types.STRUCTURED:
+        return None
+    if not {"fields", "element", "key", "value"} & column.keys():
+        return None
+    from fluid_build.streaming.types import parse_type
+
+    return parse_type(column, path=str(column.get("name"))).sql("hive")
+
+
+def _hive_column_outcome(column: Mapping[str, Any]) -> Optional[column_types.TypeOutcome]:
+    try:
+        nested = _nested_hive_type(column)
+    except ValueError as exc:
+        return column_types.refused(
+            f"whose nested types Glue cannot hold ({exc})", column_types.NESTED_FIX
+        )
+    return None if nested is None else column_types.exact(nested)
+
+
+def _hive_column_type(column: Mapping[str, Any]) -> str:
+    """The Hive type a column is written as: its declared nested type, else :func:`_hive_type`."""
+    try:
+        nested = _nested_hive_type(column)
+    except ValueError:
+        nested = None  # refused where the module is emitted
+    return nested if nested is not None else _hive_type(column.get("type"))
+
+
 def _glue_column_type_findings(
     expose: str, schema: Iterable[Any]
 ) -> Tuple[Optional[UnsupportedBindingError], List[str]]:
-    return column_types.column_type_findings(expose, schema, _hive_outcome, "AWS Glue")
+    return column_types.column_type_findings(
+        expose, schema, _hive_outcome, "AWS Glue", column_outcome=_hive_column_outcome
+    )
 
 
 def _glue_table_declared(binding: Mapping[str, Any]) -> bool:
@@ -438,7 +478,8 @@ def _unspaced(glue_type: str) -> str:
 def _columns(schema: List[Mapping[str, Any]]) -> List[Dict[str, str]]:
     columns: List[Dict[str, str]] = []
     for col in schema or []:
-        entry: Dict[str, str] = {"name": col.get("name"), "type": _hive_type(col.get("type"))}
+        physical_type = _hive_column_type(col)
+        entry: Dict[str, str] = {"name": col.get("name"), "type": physical_type}
         if col.get("description"):
             entry["comment"] = col["description"]
         columns.append(entry)

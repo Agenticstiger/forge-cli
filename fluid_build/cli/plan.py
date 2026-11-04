@@ -326,7 +326,26 @@ def run(args, logger: logging.Logger) -> int:
         )
 
         # Version-aware routing
-        if _should_use_provider_actions(contract, logger):
+        from fluid_build.streaming.compiler import compile_contract
+
+        streaming = compile_contract(contract)
+        if streaming:
+            plan = {
+                "format_version": fluid_version,
+                "generated_at": time.time(),
+                "mode": getattr(args, "mode", None),
+                "contract": contract,
+                "contract_metadata": {
+                    "id": contract.get("id"),
+                    "version": fluid_version,
+                    "source_path": str(Path(args.contract).resolve()),
+                },
+                "actions": [
+                    artifact.plan_action(step) for step, artifact in enumerate(streaming, 1)
+                ],
+                "total_actions": len(streaming),
+            }
+        elif _should_use_provider_actions(contract, logger):
             plan = _plan_with_provider_actions(contract, args, logger)
         else:
             plan = _plan_legacy(contract, args, logger)
@@ -691,6 +710,34 @@ def _gate_provider_flag(requested: Optional[str], logger: logging.Logger) -> Non
         )
 
 
+def compile_managed_streaming(
+    contract: Dict[str, Any], logger: logging.Logger, *, command: str
+) -> Any:
+    """Compile the contract's managed Flink builds, refusing a malformed one typed.
+
+    ``compile_contract`` runs before ``apply`` and ``verify`` have gated the
+    contract, so a schema-invalid shape (a ``null`` trigger, a string
+    ``execution``, an integer ``builds``) reaches code that expects the schema's
+    shapes and raises ``AttributeError``/``TypeError``/``KeyError``. When it
+    does, the schema gate runs and reports the contract's errors as the
+    ``<command>_contract_invalid`` panel; if the contract is valid the crash is
+    a real defect and propagates.
+
+    Raises:
+        CLIError: ``<command>_streaming_invalid`` for a build the compiler
+            refuses, ``<command>_contract_invalid`` for a schema-invalid one.
+    """
+    from fluid_build.streaming.compiler import compile_contract
+
+    try:
+        return compile_contract(contract)
+    except ValueError as exc:
+        raise CLIError(1, f"{command}_streaming_invalid", {"error": str(exc)}) from exc
+    except (TypeError, AttributeError, KeyError):
+        _gate_contract_for_plan_or_apply(contract, logger, command=command)
+        raise
+
+
 def _gate_contract_for_plan_or_apply(
     contract: Dict[str, Any], logger: logging.Logger, *, command: str
 ) -> None:
@@ -745,7 +792,9 @@ def _gate_contract_for_plan_or_apply(
         errors = list(result.errors)
         for err in errors:
             error(logger, "contract_schema_error", command=command, detail=err)
-        event = "local_plan_validation_failed" if command == "plan" else "apply_contract_invalid"
+        event = (
+            "local_plan_validation_failed" if command == "plan" else f"{command}_contract_invalid"
+        )
         raise CLIError(
             1,
             event,

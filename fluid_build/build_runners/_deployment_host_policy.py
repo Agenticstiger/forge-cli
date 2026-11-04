@@ -129,6 +129,11 @@ def _on_allowlist(host: str, suffixes: List[str]) -> bool:
     return False
 
 
+def is_listed(host: Optional[str], environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether the operator names ``host``, exactly or by a parent domain."""
+    return bool(host) and _on_allowlist(str(host), allowlist(environ))
+
+
 VerdictCode = Literal["missing", "scheme", "no-host", "link-local", "mixed", "public"]
 
 

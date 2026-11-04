@@ -787,6 +787,8 @@ class FluidSchemaManager:
             if JSONSCHEMA_AVAILABLE and "$schema" in schema:
                 # Use JSON Schema validation
                 is_valid = self._validate_with_jsonschema(contract, schema, result, locate)
+                if is_valid:
+                    is_valid = self._validate_managed_streaming(contract, result)
             else:
                 # Fallback to a minimal required-field check only when the
                 # jsonschema library is unavailable (jsonschema is a hard
@@ -805,6 +807,38 @@ class FluidSchemaManager:
 
         result.validation_time = time.time() - start_time
         return result
+
+    def _validate_managed_streaming(
+        self, contract: Dict[str, Any], result: ValidationResult
+    ) -> bool:
+        """Typed nested columns and the managed Flink lane: checks of a whole contract.
+
+        Not part of :meth:`_validate_with_jsonschema`, which ``fluid validate
+        --fragment`` also runs on a fragment, and a fragment can be a list or a
+        string.
+        """
+        from fluid_build.streaming.compiler import validation_errors, validation_warnings
+        from fluid_build.streaming.types import parse_type
+
+        before = len(result.errors)
+        for position, expose in enumerate(contract.get("exposes") or []):
+            for column in (expose.get("contract") or {}).get("schema") or []:
+                if {"fields", "element", "key", "value"} & column.keys():
+                    try:
+                        # The path the compiler labels the same column with, so the
+                        # one error is reported once, below.
+                        parse_type(
+                            column, path=f"exposes[{position}].contract.schema.{column['name']}"
+                        )
+                    except ValueError as exc:
+                        result.add_error(str(exc))
+        for message in validation_errors(contract):
+            # A column the loop above reported is the compiler's first error too.
+            if message.removeprefix("Managed Flink: ") not in result.errors:
+                result.add_error(message)
+        for message in validation_warnings(contract):
+            result.add_warning(message)
+        return len(result.errors) == before
 
     def _validate_with_jsonschema(
         self,

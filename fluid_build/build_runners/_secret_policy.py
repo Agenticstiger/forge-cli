@@ -193,14 +193,24 @@ def allowlist(environ: Optional[Mapping[str, str]] = None) -> List[Tuple[str, Op
 
 
 def variable_allowed(
-    variable: str, host: Optional[str], *, environ: Optional[Mapping[str, str]] = None
+    variable: str,
+    host: Optional[str],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    loopback_exempt: bool = True,
 ) -> bool:
     """Whether ``variable`` may be sent to ``host``: the decision, without wording.
 
-    For a caller that phrases its own refusal (the Iceberg sinks' catalog token,
-    ``kafka_connect/iceberg_sink_validation.py``). A loopback host needs no entry.
+    For a caller that phrases its own refusal: the managed Flink lane's catalog
+    token (``streaming/policy.py``) and the Iceberg sinks' catalog token
+    (``kafka_connect/iceberg_sink_validation.py``). A loopback host needs no entry,
+    unless ``loopback_exempt`` is false: a send made from somewhere other than this
+    process, where loopback is not this machine (a pod's own network namespace,
+    or a sidecar injected into it), is judged by the allowlist alone.
     """
-    return is_loopback(host) or _allows(variable, host, allowlist(environ))
+    if loopback_exempt and is_loopback(host):
+        return True
+    return _allows(variable, host, allowlist(environ))
 
 
 def _allows(variable: str, host: Optional[str], entries: List[Tuple[str, Optional[str]]]) -> bool:

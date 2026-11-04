@@ -250,7 +250,7 @@ def test_a_structured_column_is_refused_at_validate_and_at_generate(platform):
     assert "expose 'orders'" in message
     assert "'tags' is declared 'array'" in message
     assert "'addr' is declared 'struct'" in message
-    assert "json or string" in message and "planned" in message
+    assert "json or string" in message and "cannot declare them yet" not in message
     with pytest.raises(UnsupportedBindingError) as caught:
         get_iac_plugin(platform).emit(contract)
     assert caught.value.kind == "column-type"

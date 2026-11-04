@@ -175,6 +175,8 @@ dmypy.json
 /*-fluid.yaml
 /*.fluid.yaml
 fluid.workspace.yaml
+# An example that shares fragments across contracts needs its workspace file.
+!/examples/flink-iceberg/shapes/fluid.workspace.yaml
 
 # --- fluid-cli: engineer-personal state (never commit) -------------------
 # Receipts, logs, and per-engineer learning history live under .fluid/
@@ -193,3 +195,6 @@ runtime/
 #   .fluid/ci-state.json    — records inputs that produced committed CI files
 # --- end fluid-cli -------------------------------------------------------
 .verify-logs/
+
+# Versioned Flink runtime sources; its Maven target/ stays locally ignored.
+!examples/flink-iceberg/runtime/

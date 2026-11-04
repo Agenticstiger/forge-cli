@@ -54,6 +54,7 @@ def register(subparsers: argparse._SubParsersAction):
           iac                    Compile a contract to an OpenTofu .tf.json module
           vector                 Compile a contract to a pgvector embeddings target
                                  (DDL + RAG manifest for the ai-embeddable columns)
+          flink                  Compile preview managed Flink SQL and operator resources
           artifacts              Stage-3 fanout: bundle → ODCS, Bitol ODPS,
                                  LF/ODPI ODPS v4.1, schedule, policies
 
@@ -91,6 +92,7 @@ Examples:
         generate_artifacts,
         generate_ci,
         generate_dbt_tests,
+        generate_flink,
         generate_iac,
         generate_schedule,
         generate_speed_transformation,
@@ -106,6 +108,7 @@ Examples:
     generate_dbt_tests.register_subcommand(sub)
     generate_iac.register_subcommand(sub)
     generate_vector.register_subcommand(sub)
+    generate_flink.register_subcommand(sub)
 
     # Default handler (backward compat: no subcommand → transformation)
     p.set_defaults(cmd=COMMAND, func=run)

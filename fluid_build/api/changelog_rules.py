@@ -597,6 +597,11 @@ def diff_columns(
                     path_prefix=f"{path_prefix}.{col_name}.fields",
                 )
             )
+        changes.extend(
+            _diff_container_children(
+                old, new, expose_id=expose_id, path_prefix=f"{path_prefix}.{col_name}"
+            )
+        )
 
         changes.extend(_sensitivity_changes(old, new, col_name, path_prefix))
 
@@ -1066,6 +1071,19 @@ def _diff_nested_fields(
                     after=new_type,
                 )
             )
+        old_null = _is_nullable(old)
+        new_null = _is_nullable(new)
+        if old_null != new_null:
+            changes.append(
+                Change(
+                    path=f"{path_prefix}.{fname}.{_nullability_key(old, new)}",
+                    kind="nested_nullable_loosened" if new_null else "nested_nullable_tightened",
+                    severity="non_breaking" if new_null else "breaking",
+                    description=f"nested field '{fname}' nullability changed",
+                    before=old_null,
+                    after=new_null,
+                )
+            )
         # Deeper nesting (struct of struct).
         if isinstance(old.get("fields"), Sequence) or isinstance(new.get("fields"), Sequence):
             changes.extend(
@@ -1076,7 +1094,32 @@ def _diff_nested_fields(
                     path_prefix=f"{path_prefix}.{fname}.fields",
                 )
             )
+        changes.extend(
+            _diff_container_children(
+                old, new, expose_id=expose_id, path_prefix=f"{path_prefix}.{fname}"
+            )
+        )
 
+    return changes
+
+
+def _diff_container_children(
+    old: Mapping[str, Any], new: Mapping[str, Any], *, expose_id: str, path_prefix: str
+) -> List[Change]:
+    changes: List[Change] = []
+    for key in ("element", "key", "value"):
+        before, after = old.get(key), new.get(key)
+        if isinstance(before, Mapping) or isinstance(after, Mapping):
+            changes.extend(
+                # The slot name wins over any `name` the child carries, so the
+                # child is never dropped or reported at the wrong path.
+                _diff_nested_fields(
+                    [{**before, "name": key}] if isinstance(before, Mapping) else [],
+                    [{**after, "name": key}] if isinstance(after, Mapping) else [],
+                    expose_id=expose_id,
+                    path_prefix=path_prefix,
+                )
+            )
     return changes
 
 

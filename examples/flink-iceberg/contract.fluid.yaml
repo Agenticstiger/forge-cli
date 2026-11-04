@@ -1,0 +1,152 @@
+fluidVersion: "0.7.7"
+kind: DataProduct
+id: commerce.nested-events
+name: Nested commerce events
+metadata:
+  owner:
+    team: data-platform
+builds:
+  - id: ingest-orders
+    engine: flink
+    pattern: embedded-logic
+    outputs: [orders]
+    execution:
+      trigger:
+        type: continuous
+      runtime:
+        platform: kubernetes
+    properties:
+      language: flink_sql
+      # The records, as the topic carries them. With no mapping, each output
+      # column is read from the stream column of the same name, nested as it is.
+      stream:
+        kind: kafka
+        topic: orders
+        format: json
+        schema:
+          - name: event_id
+            type: string
+            required: true
+          - name: customer
+            type: struct
+            fields:
+              - name: id
+                type: string
+              - name: address
+                type: struct
+                fields:
+                  - name: country
+                    type: string
+                  - name: geo
+                    type: struct
+                    fields:
+                      - name: location
+                        type: struct
+                        fields:
+                          - name: coordinates
+                            type: struct
+                            fields:
+                              - name: latitude
+                                type: double
+                              - name: longitude
+                                type: double
+          - name: items
+            type: array
+            element:
+              type: struct
+              fields:
+                - name: sku
+                  type: string
+                - name: price
+                  type: decimal(18,2)
+          - name: attributes
+            type: map
+            key:
+              type: string
+              required: true
+            value:
+              type: string
+          - name: event_time
+            type: timestamp_ltz(3)
+      parameters:
+        flink:
+          management: operator
+          source:
+            bootstrapServers: kafka:9092
+            groupId: forge-commerce-orders-v1
+            eventTime:
+              column: event_time
+              delaySeconds: 5
+          deployment:
+            name: commerce-orders
+            namespace: data-products
+            context: development
+            serviceAccount: flink
+            # Replace with the digest of the image built from runtime/Dockerfile.
+            image: forge-flink@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            checkpointUri: s3://flink-state/orders/checkpoints
+            savepointUri: s3://flink-state/orders/savepoints
+            haUri: s3://flink-state/orders/ha
+            secretRefs: [flink-storage]
+          maxSnapshotAgeSeconds: 300
+exposes:
+  - exposeId: orders
+    kind: table
+    binding:
+      platform: aws
+      format: iceberg
+      location:
+        catalog: rest
+        uri: http://iceberg-rest:8181
+        warehouse: s3://warehouse/
+        database: commerce
+        table: orders
+      icebergConfig:
+        writeVersion: 2
+        fileFormat: parquet
+    contract:
+      schema:
+        - name: event_id
+          type: string
+          required: true
+        - name: customer
+          type: struct
+          fields:
+            - name: id
+              type: string
+            - name: address
+              type: struct
+              fields:
+                - name: country
+                  type: string
+                - name: geo
+                  type: struct
+                  fields:
+                    - name: location
+                      type: struct
+                      fields:
+                        - name: coordinates
+                          type: struct
+                          fields:
+                            - name: latitude
+                              type: double
+                            - name: longitude
+                              type: double
+        - name: items
+          type: array
+          element:
+            type: struct
+            fields:
+              - name: sku
+                type: string
+              - name: price
+                type: decimal(18,2)
+        - name: attributes
+          type: map
+          key:
+            type: string
+            required: true
+          value:
+            type: string
+        - name: event_time
+          type: timestamp_ltz(3)

@@ -1,0 +1,21 @@
+# The orders topic, shared by every product that reads it: the record value,
+# the key and the Kafka metadata each product may read as columns.
+kind: kafka
+topic: orders
+format: json
+schema:
+  $ref: ./orders.value.yaml
+key:
+  format: raw
+  schema:
+    - name: order_key
+      type: string
+metadata:
+  - name: kafka_partition
+    from: partition
+  - name: kafka_offset
+    from: offset
+  - name: kafka_timestamp
+    from: timestamp
+  - name: kafka_headers
+    from: headers

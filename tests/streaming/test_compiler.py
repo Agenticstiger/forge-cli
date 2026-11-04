@@ -1,0 +1,377 @@
+# Copyright 2024-2026 Agentics Transformation Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import copy
+import json
+
+import pytest
+
+from fluid_build.streaming.compiler import compile_contract, managed_config, validation_errors
+
+
+def _stream(contract):
+    return contract["builds"][0]["properties"]["stream"]
+
+
+def test_deterministic_artifacts_and_native_table_creation(contract):
+    (first,) = compile_contract(contract)
+    (second,) = compile_contract(copy.deepcopy(contract))
+    assert first == second
+    assert len(first.digest) == 64
+    assert "CREATE CATALOG `lake`" in first.sql
+    assert "CREATE DATABASE IF NOT EXISTS `lake`.`commerce`" in first.sql
+    assert "CREATE TABLE IF NOT EXISTS `lake`.`commerce`.`orders`" in first.sql
+    assert "MAP<STRING NOT NULL, STRING>" in first.sql
+    assert first.statements[-1].startswith("INSERT INTO `lake`.`commerce`.`orders`")
+    cm, deployment = first.resources
+    assert cm["immutable"]
+    assert "statement.4=INSERT INTO" in cm["data"]["job.properties"]
+    assert deployment["spec"]["job"]["upgradeMode"] == "savepoint"
+    assert (
+        deployment["spec"]["flinkConfiguration"]["execution.checkpointing.mode"] == "EXACTLY_ONCE"
+    )
+    assert deployment["spec"]["podTemplate"]["spec"]["containers"][0]["envFrom"] == [
+        {"secretRef": {"name": "flink-storage"}},
+    ]
+
+
+def test_sql_and_runtime_changes_change_digest(contract):
+    (original,) = compile_contract(contract)
+    contract["builds"][0]["properties"]["mapping"] = {
+        "columns": [{"name": "event_time", "from": "event_time", "cast": "timestamp_ltz(6)"}]
+    }
+    contract["exposes"][0]["contract"]["schema"][-1]["type"] = "timestamp_ltz(6)"
+    (changed,) = compile_contract(contract)
+    assert original.digest != changed.digest
+    cfg = managed_config(contract["builds"][0])
+    cfg["deployment"]["parallelism"] = 2
+    (parallel,) = compile_contract(contract)
+    assert changed.digest != parallel.digest
+
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        (lambda c, f: f["deployment"].update(image="flink:latest"), "invalid configuration"),
+        # A pattern ends at the end of the value: a trailing newline is refused.
+        (
+            lambda c, f: f["deployment"].update(name=f["deployment"]["name"] + "\n"),
+            "invalid configuration",
+        ),
+        (
+            lambda c, f: f["deployment"].update(image=f["deployment"]["image"] + "\n"),
+            "invalid configuration",
+        ),
+        (lambda c, f: f["deployment"].pop("context"), "invalid configuration"),
+        (lambda c, f: f.update(typo=True), "invalid configuration"),
+        (lambda c, f: _stream(c).update(format="protobuf"), "format: expected one of"),
+        (lambda c, f: _stream(c).update(format="avro-confluent"), "schemaRegistryUrl"),
+        (lambda c, f: f["source"].update(topic="orders"), "declared in properties.stream"),
+        (
+            lambda c, f: f["deployment"].update(savepointUri=f["deployment"]["checkpointUri"]),
+            "overlap",
+        ),
+        (lambda c, f: f["deployment"].update(haUri="s3://state/"), "dedicated prefix"),
+        (lambda c, f: f["deployment"].update(checkpointTimeoutMs=1000), "exceed"),
+        (
+            lambda c, f: c["builds"][0]["properties"].update(sql="SELECT 1; DROP TABLE x"),
+            "single SELECT",
+        ),
+        (
+            lambda c, f: c["builds"][0]["properties"].update(sql="DELETE FROM source_events"),
+            "single SELECT",
+        ),
+        (lambda c, f: c["builds"][0].update(outputs=[]), "exactly one"),
+        (lambda c, f: c["builds"][0]["execution"]["trigger"].update(type="manual"), "continuous"),
+        (lambda c, f: c["exposes"][0]["binding"]["location"].update(catalog="glue"), "REST"),
+        (
+            lambda c, f: c["exposes"][0]["binding"]["icebergConfig"].update(
+                properties={"write.upsert.enabled": "true"}
+            ),
+            "append-only",
+        ),
+        (lambda c, f: c["exposes"][0].update(policy={"privacy": {}}), "policy/quality"),
+    ],
+)
+def test_fail_closed(contract, mutate, match):
+    mutate(contract, managed_config(contract["builds"][0]))
+    with pytest.raises(ValueError, match=match):
+        compile_contract(contract)
+    assert validation_errors(contract)
+
+
+def test_external_flink_unchanged(contract):
+    contract["builds"][0]["properties"]["parameters"].pop("flink")
+    assert compile_contract(contract) == ()
+
+
+def test_mixed_contract_refused(contract):
+    contract["builds"].append({"id": "batch", "engine": "sql"})
+    with pytest.raises(ValueError, match="only managed"):
+        compile_contract(contract)
+
+
+def test_catalog_auth_is_reference_only(contract):
+    cfg = managed_config(contract["builds"][0])
+    cfg["catalogAuth"] = {"type": "bearer", "tokenEnv": "CATALOG_TOKEN"}
+    contract["exposes"][0]["binding"]["location"]["uri"] = "https://catalog.example"
+    (artifact,) = compile_contract(contract)
+    assert "'token' = 'env:CATALOG_TOKEN'" in artifact.sql
+    assert "CATALOG_TOKEN" in json.dumps(artifact.resources)
+
+
+def test_event_time_and_partition(contract):
+    cfg = managed_config(contract["builds"][0])
+    cfg["source"]["eventTime"] = {"column": "event_time", "delaySeconds": 5}
+    contract["exposes"][0]["binding"]["icebergConfig"]["partitionSpec"] = [
+        {"sourceColumn": "event_id", "transform": "identity"},
+    ]
+    (artifact,) = compile_contract(contract)
+    assert "WATERMARK FOR `event_time` AS `event_time` - INTERVAL '5' SECOND" in artifact.sql
+    assert "PARTITIONED BY (`event_id`)" in artifact.sql
+
+
+@pytest.mark.parametrize("surface", ["root", "column", "source", "dq"])
+def test_uncompiled_governance_is_rejected(contract, surface):
+    target = contract["exposes"][0]["contract"]
+    if surface == "root":
+        contract["accessPolicy"] = {"allow": ["reader"]}
+    elif surface == "column":
+        target["schema"][1]["fields"][0]["validationRules"] = {"unique": True}
+    elif surface == "source":
+        _stream(contract)["schema"][0]["quality"] = ["check"]
+    else:
+        target["dq"] = {"tests": ["check"]}
+    with pytest.raises(ValueError, match="enforce|policy/quality"):
+        compile_contract(contract)
+
+
+def test_s3_compatible_state_configuration_matches_fileio(contract):
+    cfg = managed_config(contract["builds"][0])
+    cfg["catalogProperties"] = {
+        "s3.endpoint": "http://minio:9000",
+        "s3.path-style-access": "true",
+        "client.region": "us-east-1",
+    }
+    (artifact,) = compile_contract(contract)
+    config = artifact.resources[1]["spec"]["flinkConfiguration"]
+    assert config["s3.endpoint"] == "http://minio:9000"
+    assert config["s3.path.style.access"] == "true"
+    assert config["s3.endpoint.region"] == "us-east-1"
+    assert (
+        json.loads(artifact.resources[0]["data"]["deployment.json"])
+        == artifact.resources[1]["spec"]
+    )
+
+
+def test_authenticated_catalog_requires_https(contract):
+    managed_config(contract["builds"][0])["catalogAuth"] = {
+        "type": "bearer",
+        "tokenEnv": "CATALOG_TOKEN",
+    }
+    with pytest.raises(ValueError, match="require HTTPS"):
+        compile_contract(contract)
+
+
+def test_configmap_size_limit_is_enforced(contract):
+    contract["builds"][0]["properties"]["sql"] = "SELECT '" + "x" * (1024 * 1024) + "'"
+    with pytest.raises(ValueError, match="1 MiB limit"):
+        compile_contract(contract)
+
+
+def test_null_management_config_is_not_silently_external(contract):
+    contract["builds"][0]["properties"]["parameters"]["flink"] = None
+    with pytest.raises(ValueError, match="must be an object"):
+        compile_contract(contract)
+
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        (lambda c, f: c["builds"][0].pop("id"), "build id"),
+        (
+            lambda c, f: c["builds"][0].update(
+                engine="sql",
+                properties={"parameters": {"flink": f}},
+            ),
+            "requires engine",
+        ),
+        (lambda c, f: c["exposes"][0]["binding"].update(format="parquet"), "format"),
+        (lambda c, f: c["exposes"][0]["binding"]["location"].pop("uri"), "uri and warehouse"),
+        (
+            lambda c, f: c["exposes"][0]["binding"]["location"].update(warehouse="gs://bucket/"),
+            "warehouse",
+        ),
+        (lambda c, f: c["exposes"][0]["binding"]["location"].pop("table"), "namespace/database"),
+        (lambda c, f: f["source"].update(schemaRegistryUrl="http://registry:8081"), "only to avro"),
+        (lambda c, f: f["source"]["eventTime"].update(column="event_id"), "timestamp"),
+        (lambda c, f: c["builds"][0]["properties"].pop("stream"), "properties.stream"),
+        (lambda c, f: c["builds"][0]["properties"].update(sql=" "), "SELECT"),
+        (
+            lambda c, f: c["exposes"][0]["binding"]["icebergConfig"].update(writeVersion=1),
+            "version 2",
+        ),
+        (
+            lambda c, f: c["exposes"][0]["binding"]["icebergConfig"].update(sortOrder=["event_id"]),
+            "sortOrder",
+        ),
+    ],
+)
+def test_invalid_semantic_combinations_fail_before_emission(contract, mutate, match):
+    mutate(contract, managed_config(contract["builds"][0]))
+    with pytest.raises(ValueError, match=match):
+        compile_contract(contract)
+
+
+def test_avro_source_emits_registry_format_without_json_options(contract):
+    cfg = managed_config(contract["builds"][0])
+    _stream(contract)["format"] = "avro-confluent"
+    cfg["source"]["schemaRegistryUrl"] = "https://registry.example"
+    (artifact,) = compile_contract(contract)
+    assert "'avro-confluent.url' = 'https://registry.example'" in artifact.sql
+    assert "json." not in artifact.sql
+
+
+def test_an_identity_partition_uses_native_iceberg_ddl(contract):
+    contract["exposes"][0]["binding"]["icebergConfig"]["partitionSpec"] = [
+        {"sourceColumn": "event_id", "transform": "identity"}
+    ]
+    (artifact,) = compile_contract(contract)
+    assert "PARTITIONED BY (`event_id`)" in artifact.sql
+
+
+@pytest.mark.parametrize(
+    "partition,match",
+    [
+        ({"sourceColumn": "missing", "transform": "identity"}, "not a target"),
+        ({"sourceColumn": "event_id", "transform": "unknown"}, "Unsupported partition"),
+        # Hidden partitioning: Flink's Iceberg DDL cannot declare it, so the job would
+        # fail after deploy with "Encountered "(" at line 16".
+        ({"sourceColumn": "event_time", "transform": "day"}, "only by a column"),
+        ({"sourceColumn": "event_time", "transform": "hour"}, "only by a column"),
+        (
+            {"sourceColumn": "event_id", "transform": "bucket", "numBuckets": 8},
+            "only by a column",
+        ),
+        ({"sourceColumn": "event_id", "transform": "truncate", "width": 4}, "only by a column"),
+    ],
+)
+def test_invalid_partition_transforms_fail(contract, partition, match):
+    contract["exposes"][0]["binding"]["icebergConfig"]["partitionSpec"] = [partition]
+    with pytest.raises(ValueError, match=match):
+        compile_contract(contract)
+
+
+def test_duplicate_writers_and_cross_build_state_prefixes_are_rejected(contract):
+    build = copy.deepcopy(contract["builds"][0])
+    build["id"] = "other"
+    contract["builds"].append(build)
+    with pytest.raises(ValueError, match="unique namespace/name"):
+        compile_contract(contract)
+    managed_config(build)["deployment"]["name"] = "other"
+    with pytest.raises(ValueError, match="one managed Flink writer"):
+        compile_contract(contract)
+    build["outputs"] = ["other-output"]
+    target = copy.deepcopy(contract["exposes"][0])
+    target["exposeId"] = "other-output"
+    target["binding"]["location"]["table"] = "other_table"
+    contract["exposes"].append(target)
+    with pytest.raises(ValueError, match="overlap between"):
+        compile_contract(contract)
+
+
+def test_event_time_needs_millisecond_precision(contract):
+    # Flink's rowtime takes precision 0 to 3; a stream timestamp defaults to 6.
+    stream = contract["builds"][0]["properties"]["stream"]
+    stream["schema"][-1]["type"] = "timestamp_ltz"
+    contract["exposes"][0]["contract"]["schema"][-1]["type"] = "timestamp_ltz"
+    with pytest.raises(ValueError, match="precision 3 or less"):
+        compile_contract(contract)
+    stream["metadata"] = [{"name": "kafka_ts", "from": "timestamp"}]
+    managed_config(contract["builds"][0])["source"]["eventTime"]["column"] = "kafka_ts"
+    (artifact,) = compile_contract(contract)
+    assert "WATERMARK FOR `kafka_ts`" in artifact.sql
+
+
+def test_a_nested_type_error_names_the_expose_and_column(contract):
+    extra = copy.deepcopy(contract["exposes"][0])
+    extra["exposeId"] = "unrelated"
+    contract["exposes"].insert(0, extra)  # the build's output is no longer exposes[0]
+    contract["exposes"][1]["contract"]["schema"][3]["key"]["required"] = False
+    with pytest.raises(ValueError) as refused:
+        compile_contract(contract)
+    assert str(refused.value) == (
+        "exposes[1].contract.schema.attributes.key: supported map keys are required strings"
+    )
+
+
+def test_a_nested_type_error_is_reported_once_by_validate(contract):
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    contract["exposes"][0]["contract"]["schema"][3]["key"]["required"] = False
+    result = FluidSchemaManager().validate_contract(contract, offline_only=True)
+    assert not result.is_valid
+    assert [e for e in result.errors if "supported map keys" in e] == [
+        "exposes[0].contract.schema.attributes.key: supported map keys are required strings"
+    ]
+
+
+def test_a_bad_partition_source_column_is_labelled(contract):
+    contract["exposes"][0]["binding"]["icebergConfig"]["partitionSpec"] = [
+        {"sourceColumn": "event_id", "transform": "identity"},
+        {"sourceColumn": "bad col", "transform": "identity"},
+    ]
+    with pytest.raises(ValueError) as refused:
+        compile_contract(contract)
+    message = str(refused.value)
+    assert message.startswith("icebergConfig.partitionSpec[1].sourceColumn: ")
+    assert "bad col" in message
+
+
+@pytest.mark.parametrize(
+    "constant,value",
+    [
+        ("_FLINK_VERSION", "v1_21"),
+        ("_JAR_URI", "local:///opt/flink/usrlib/other.jar"),
+        ("_ENTRY_CLASS", "io.fluid.forge.Other"),
+        ("_DEFAULT_TASK_SLOTS", 4),
+        ("_DEFAULT_IDLE_TIMEOUT_MS", 5000),
+        ("_DEFAULT_JOB_MANAGER_MEMORY", "2048m"),
+        ("_DEFAULT_TASK_MANAGER_MEMORY", "4096m"),
+        ("_DEFAULT_PARALLELISM", 2),
+        ("_DEFAULT_CHECKPOINT_INTERVAL_MS", 20000),
+        ("_DEFAULT_CHECKPOINT_TIMEOUT_MS", 240000),
+    ],
+)
+def test_a_constant_or_default_the_contract_does_not_set_changes_the_configmap_name(
+    contract, monkeypatch, constant, value
+):
+    """The ConfigMap is immutable and named by the digest, and its deployment.json
+    carries what the compiler fixes or defaults; changing one must not reuse the name."""
+    (original,) = compile_contract(contract)
+    monkeypatch.setattr(f"fluid_build.streaming.compiler.{constant}", value)
+    (changed,) = compile_contract(contract)
+    assert changed.digest != original.digest
+    assert changed.resources[0]["metadata"]["name"] != original.resources[0]["metadata"]["name"]
+    assert changed.resources[0]["data"]["deployment.json"] != (
+        original.resources[0]["data"]["deployment.json"]
+    )
+
+
+def test_the_configmap_name_the_deployment_mounts_is_the_one_it_is_named_by(contract):
+    (artifact,) = compile_contract(contract)
+    config_map, deployment = artifact.resources
+    (volume,) = deployment["spec"]["podTemplate"]["spec"]["volumes"]
+    assert volume["configMap"]["name"] == config_map["metadata"]["name"]
+    assert json.loads(config_map["data"]["deployment.json"]) == deployment["spec"]

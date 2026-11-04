@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set
 
 from .._console import _redact_str
+from .._errors import FluidUserError
 from ..observability.secret_redactor import redact_secret_text
 from ..observability.tracing import traced_span as _traced_span
 from ..observability.tracing import traced_stage as _traced_stage
@@ -38,6 +39,7 @@ from ._common import (
     write_json,
 )
 from ._logging import error, info, warn
+from .console import cprint
 
 if TYPE_CHECKING:
     from fluid_build.iac.drift import StateDriftReport
@@ -243,6 +245,41 @@ def run(args, logger: logging.Logger) -> int:
         # into ``CREATE OR REPLACE TABLE <project>...``: every silver and gold.
         contract = resolve_env_templates_in_contract(copy.deepcopy(dict(contract)))
 
+        from fluid_build.streaming.compiler import managed_builds
+
+        if managed_builds(contract):
+            from fluid_build.cli.plan import _gate_contract_for_plan_or_apply
+            from fluid_build.streaming.runtime import StreamingError, inspect_drift
+
+            _gate_contract_for_plan_or_apply(contract, logger, command="plan")
+            if getattr(args, "state", None) or not getattr(args, "live", True):
+                raise CLIError(
+                    1,
+                    "flink_diff_requires_live",
+                    {
+                        "error": "Managed Flink drift requires live Kubernetes reads; omit --state/--no-live",
+                    },
+                )
+            try:
+                results = inspect_drift(contract)
+            except StreamingError as exc:
+                raise CLIError(
+                    EXIT_INSPECTION_FAILED, "flink_diff_inspection_failed", {"error": str(exc)}
+                ) from exc
+            has_drift = any(result["has_drift"] for result in results)
+            write_json(
+                args.out,
+                {
+                    "contract": args.contract,
+                    "drift_source": "flink-operator",
+                    "summary": {"has_drift": has_drift},
+                    "builds": results,
+                    "scope": "operator specification; use verify for Iceberg schema and commit health",
+                },
+            )
+            cprint(f"Managed Flink: {'drift detected' if has_drift else 'no deployment drift'}")
+            return EXIT_DRIFT if has_drift and args.exit_on_drift else 0
+
         # Bug 5a: infer the provider from ``binding.platform`` when the
         # operator didn't pass ``--provider`` and ``FLUID_PROVIDER`` env
         # isn't set. Every other FLUID command auto-detects this way
@@ -410,7 +447,10 @@ def run(args, logger: logging.Logger) -> int:
 
         return 0
 
-    except CLIError:
+    except (CLIError, FluidUserError):
+        # A typed error already says what happened and how to fix it (the
+        # managed Flink policy names the variables to set); flattening it into
+        # diff_failed would keep only its first line.
         raise
     except Exception as e:
         raise CLIError(1, "diff_failed", {"error": str(e)})

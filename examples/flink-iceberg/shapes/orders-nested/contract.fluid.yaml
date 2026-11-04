@@ -1,0 +1,136 @@
+fluidVersion: "0.7.7"
+kind: DataProduct
+id: commerce.orders-nested
+name: Orders, nested
+description: >-
+  Each order event written as a nested Iceberg row in a shape of its own:
+  structs built from fields that are flat or elsewhere in the record, a
+  subset of the customer that stays null where the customer is, the
+  coordinates struct moved up, the items kept as they are, and the Kafka
+  position grouped in one struct.
+metadata:
+  owner:
+    team: data-platform
+builds:
+  - id: ingest-orders-nested
+    engine: flink
+    pattern: embedded-logic
+    outputs: [orders_nested]
+    execution:
+      trigger:
+        type: continuous
+      runtime:
+        platform: kubernetes
+    properties:
+      language: flink_sql
+      stream:
+        $ref: ../fragments/streams/orders.yaml
+      mapping:
+        # A dotted name maps one field of a struct output; the struct is built
+        # from its fields. Fields it does not list come from the same path.
+        columns:
+          - name: order.key
+            from: order_key
+          - name: order.channel
+            from: attributes['channel']
+          - name: order.placed_at
+            from: event_time
+          - name: customer.country
+            from: customer.address.country
+          - name: location
+            from: customer.address.geo.location.coordinates
+          - name: kafka.partition
+            from: kafka_partition
+          - name: kafka.offset
+            from: kafka_offset
+          - name: kafka.timestamp
+            from: kafka_timestamp
+      parameters:
+        flink:
+          management: operator
+          source:
+            bootstrapServers: kafka:9092
+            groupId: forge-commerce-orders-nested-v1
+            eventTime:
+              column: event_time
+              delaySeconds: 5
+          deployment:
+            name: commerce-orders-nested
+            namespace: data-products
+            context: development
+            serviceAccount: flink
+            # Replace with the digest of the image built from ../../runtime/Dockerfile.
+            image: forge-flink@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            checkpointUri: s3://flink-state/orders-nested/checkpoints
+            savepointUri: s3://flink-state/orders-nested/savepoints
+            haUri: s3://flink-state/orders-nested/ha
+            secretRefs: [flink-storage]
+          maxSnapshotAgeSeconds: 300
+exposes:
+  - exposeId: orders_nested
+    kind: table
+    binding:
+      platform: aws
+      format: iceberg
+      location:
+        catalog: rest
+        uri: http://iceberg-rest:8181
+        warehouse: s3://warehouse/
+        database: commerce
+        table: orders_nested
+      icebergConfig:
+        writeVersion: 2
+        fileFormat: parquet
+    contract:
+      schema:
+        - name: event_id
+          type: string
+          required: true
+        - name: order
+          type: struct
+          required: true
+          fields:
+            - name: key
+              type: string
+            - name: channel
+              type: string
+            - name: placed_at
+              type: timestamp_ltz(3)
+        - name: customer
+          type: struct
+          fields:
+            - name: id
+              type: string
+            - name: country
+              type: string
+        - name: location
+          type: struct
+          fields:
+            - name: latitude
+              type: double
+            - name: longitude
+              type: double
+        - name: items
+          type: array
+          element:
+            type: struct
+            fields:
+              - name: sku
+                type: string
+              - name: price
+                type: decimal(18,2)
+        - name: kafka
+          type: struct
+          required: true
+          fields:
+            - name: partition
+              type: int
+              required: true
+            - name: offset
+              type: long
+              required: true
+            - name: timestamp
+              type: timestamp_ltz(3)
+              required: true
+        - name: event_time
+          type: timestamp_ltz(3)

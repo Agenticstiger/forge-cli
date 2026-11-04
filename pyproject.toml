@@ -815,6 +815,7 @@ module = [
     # misspelt verdict code fail here instead of falling through.
     "fluid_build.build_runners._deployment_host_policy",
     "fluid_build.build_runners._secret_policy",
+    "fluid_build.streaming.policy",
 ]
 strict = true
 

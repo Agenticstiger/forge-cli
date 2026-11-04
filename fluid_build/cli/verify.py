@@ -173,6 +173,12 @@ Use Cases:
         dest="expose_id",
         help="Verify specific expose by ID (default: all exposes)",
     )
+    p.add_argument(
+        "--streaming-timeout",
+        type=float,
+        default=120,
+        help="Seconds to wait for fresh managed Flink checkpoint/commit evidence (default: 120)",
+    )
 
     p.add_argument(
         "--strict",
@@ -1429,6 +1435,36 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     # contract file itself lives deeper in the tree (e.g. fluid/contracts/*)
     # so its parent is NOT the project root.
     _hydrate_dotenv_into_environ(Path.cwd(), getattr(args, "env", None))
+
+    from fluid_build.cli.plan import compile_managed_streaming
+
+    streaming = compile_managed_streaming(contract, logger, command="verify")
+    if streaming:
+        from fluid_build.streaming.runtime import verify as verify_streaming
+
+        if getattr(args, "expose_id", None):
+            raise CLIError(
+                1,
+                "verify_streaming_selection",
+                {
+                    "error": "Verify the whole managed streaming contract; partial expose selection is not supported",
+                },
+            )
+        try:
+            evidence = verify_streaming(
+                contract, timeout_seconds=getattr(args, "streaming_timeout", 120)
+            )
+        except (ValueError, OSError) as exc:
+            raise CLIError(1, "verify_streaming_failed", {"error": str(exc)}) from exc
+        if getattr(args, "out", None):
+            Path(args.out).write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+        for item in evidence:
+            cprint(
+                f"Flink {item['build']}: {item['status']}; snapshot {item['snapshotId']}; "
+                f"checkpoint {item['checkpointId']}; row-level read-back not checked",
+                markup=False,
+            )
+        return 0
 
     # Get exposes to verify
     exposes = contract.get("exposes", [])

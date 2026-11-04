@@ -1,0 +1,117 @@
+fluidVersion: "0.7.7"
+kind: DataProduct
+id: commerce.order-items
+name: Order items
+description: >-
+  One row per item of each order event: nested fields lifted to columns, the
+  items array exploded, a map entry and a header looked up, and the record
+  key and Kafka position kept for lineage.
+metadata:
+  owner:
+    team: data-platform
+builds:
+  - id: ingest-order-items
+    engine: flink
+    pattern: embedded-logic
+    outputs: [order_items]
+    execution:
+      trigger:
+        type: continuous
+      runtime:
+        platform: kubernetes
+    properties:
+      language: flink_sql
+      stream:
+        $ref: ../fragments/streams/orders.yaml
+      mapping:
+        # One output row per element of items; an order with no items writes none.
+        explode:
+          path: items
+          as: item
+        # Only the columns read from another path are listed: event_id,
+        # order_key, kafka_partition, kafka_offset and event_time come by name.
+        columns:
+          - name: customer_id
+            from: customer.id
+          - name: country
+            from: customer.address.country
+          - name: latitude
+            from: customer.address.geo.location.coordinates.latitude
+          - name: longitude
+            from: customer.address.geo.location.coordinates.longitude
+          - name: channel
+            from: attributes['channel']
+          - name: sku
+            from: item.sku
+          - name: price
+            from: item.price
+          - name: trace_id
+            from: kafka_headers['trace-id']
+            cast: string
+      parameters:
+        flink:
+          management: operator
+          source:
+            bootstrapServers: kafka:9092
+            groupId: forge-commerce-order-items-v1
+            eventTime:
+              column: event_time
+              delaySeconds: 5
+          deployment:
+            name: commerce-order-items
+            namespace: data-products
+            context: development
+            serviceAccount: flink
+            # Replace with the digest of the image built from ../../runtime/Dockerfile.
+            image: forge-flink@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            checkpointUri: s3://flink-state/order-items/checkpoints
+            savepointUri: s3://flink-state/order-items/savepoints
+            haUri: s3://flink-state/order-items/ha
+            secretRefs: [flink-storage]
+          maxSnapshotAgeSeconds: 300
+exposes:
+  - exposeId: order_items
+    kind: table
+    binding:
+      platform: aws
+      format: iceberg
+      location:
+        catalog: rest
+        uri: http://iceberg-rest:8181
+        warehouse: s3://warehouse/
+        database: commerce
+        table: order_items
+      icebergConfig:
+        writeVersion: 2
+        fileFormat: parquet
+    contract:
+      schema:
+        - name: event_id
+          type: string
+          required: true
+        - name: order_key
+          type: string
+        - name: customer_id
+          type: string
+        - name: country
+          type: string
+        - name: latitude
+          type: double
+        - name: longitude
+          type: double
+        - name: channel
+          type: string
+        - name: sku
+          type: string
+        - name: price
+          type: decimal(18,2)
+        - name: trace_id
+          type: string
+        - name: kafka_partition
+          type: int
+          required: true
+        - name: kafka_offset
+          type: long
+          required: true
+        - name: event_time
+          type: timestamp_ltz(3)
