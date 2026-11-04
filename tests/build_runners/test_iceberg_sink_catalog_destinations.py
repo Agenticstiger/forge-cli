@@ -634,3 +634,50 @@ def test_a_catalog_not_reached_over_rest_never_reads_the_variable(monkeypatch):
     error = iceberg_sink_preflight(contract, "ingest")
     assert error is not None and "not reached over REST" in error
     assert registered == []
+
+
+@pytest.mark.parametrize("engine_name", ["kafka-connect", "debezium"])
+def test_sink_partition_by_is_the_text_checked_when_set(engine_name):
+    """The runner's SinkSpec reads sink.partitionBy over the binding's."""
+    build = _kc_contract if engine_name == "kafka-connect" else _dbz_contract
+    contract = build(None, location=_location(partitionBy=["day"]))
+    contract["builds"][0]["properties"]["sink"]["partitionBy"] = [f"${{env:{_SECRET}}}"]
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any("sink.partitionBy" in e for e in errors), errors
+    contract = build(None, location=_location(partitionBy=[f"env:{_SECRET}"]))
+    contract["builds"][0]["properties"]["sink"]["partitionBy"] = ["day"]
+    assert not any("partitionBy" in e for e in validate_iceberg_sink(contract)[0])
+
+
+def test_only_the_namespace_field_the_sink_reads_is_checked():
+    """iceberg_namespace reads the first one set; the others reach nothing."""
+    contract = _kc_contract(None, location=_location(dataset=f"${{{_SECRET}}}"))
+    assert not any("dataset" in e for e in validate_iceberg_sink(contract)[0])
+    location = _location()
+    del location["database"]
+    contract = _kc_contract(None, location={**location, "dataset": f"${{{_SECRET}}}"})
+    assert any("binding.location.dataset" in e for e in validate_iceberg_sink(contract)[0])
+
+
+def test_a_written_out_scheme_is_checked_while_the_host_waits_on_a_template():
+    contract = _kc_contract(dict(_AUTHS["bearer"]), location=_location("http://{{ env.H }}/c"))
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any("must be an https:// URL" in e for e in errors), errors
+
+
+def test_a_percent_suffix_does_not_make_a_name_an_address(monkeypatch):
+    """10.0.0.1%25.attacker.example is a name, and not a plain one."""
+    _operator_allows(monkeypatch, pairs=[_SECRET])
+    contract = _kc_contract(
+        dict(_AUTHS["bearer"]), location=_location("https://10.0.0.1%25.attacker.example/c")
+    )
+    error = iceberg_sink_preflight(contract, "ingest")
+    assert error is not None and "not a plain DNS name or IP address" in error
+
+
+def test_a_derived_warehouse_names_where_it_came_from():
+    location = {"database": "bronze", "table": "orders", "bucket": "lake", "path": "p/${X}/"}
+    contract = _kc_contract(None, location=location)
+    contract["exposes"][0]["binding"]["platform"] = "aws"
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any("the warehouse derived from binding.location" in e for e in errors), errors

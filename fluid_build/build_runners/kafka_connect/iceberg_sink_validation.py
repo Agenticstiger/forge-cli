@@ -1329,9 +1329,12 @@ def _catalog_uri_reaching(binding: Mapping[str, Any], runtime: IcebergSinkPlan) 
 
 
 def _ip_literal(host: str) -> Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
-    """``host`` as an address, an IPv4-mapped IPv6 one as its IPv4; ``None`` for a name."""
+    """``host`` as an address, an IPv4-mapped IPv6 one as its IPv4; ``None`` for a name.
+
+    Parsed as written: ``10.0.0.1%25.example`` is a name, not 10.0.0.1.
+    """
     try:
-        address = ipaddress.ip_address(host.split("%", 1)[0])
+        address = ipaddress.ip_address(host)
     except ValueError:
         return None
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
@@ -1398,6 +1401,13 @@ def _received(auth: CatalogAuth, role: str) -> str:
 _PLAIN_HOST_RE = re.compile(r"[a-z0-9._-]+|[0-9a-f:.]+")
 
 
+def _not_https(source: str, role: str, receives: str) -> str:
+    return (
+        f"{source} must be an https:// URL: the {role} receives {receives} on every "
+        "request, and http would carry it in clear text, so a loopback host needs https too"
+    )
+
+
 def _destination_host(url: str, source: str, role: str, receives: str) -> Tuple[str, str]:
     """``(host, "")`` for a destination the operator may allow, else ``("", why not)``.
 
@@ -1415,11 +1425,7 @@ def _destination_host(url: str, source: str, role: str, receives: str) -> Tuple[
     except ValueError:  # an unbalanced "[" in the netloc: no host can be read
         return "", no_host
     if parts.scheme != "https":
-        return "", (
-            f"{source} must be an https:// URL: the {role} receives {receives} on every "
-            "request, and http would carry it in clear text, so a loopback host needs "
-            "https too"
-        )
+        return "", _not_https(source, role, receives)
     if "@" in parts.netloc:
         return "", (
             f"{source} carries a user:password@ part (not shown). Remove it: the {role} "
@@ -1500,6 +1506,12 @@ def _check_catalog_auth_destinations(
     hosts: List[str] = []
     for role, source, url in _credential_destinations(auth, runtime, targets):
         if _rendered_at_run(url):
+            # A template decides the host, which the run checks once rendered;
+            # a scheme written out is decided now.
+            scheme, written, _rest = url.partition("://")
+            if written and not ENV_PLACEHOLDER_RE.search(scheme):
+                if scheme.strip().lower() != "https":
+                    hard.append(f"{head}: {_not_https(source, role, _received(auth, role))}")
             continue
         host, problem = _destination_host(url, source, role, _received(auth, role))
         if problem:
@@ -1553,7 +1565,8 @@ def _unallowed_destinations(
         "hosts, so without the operator's lists any variable there could go to a host the "
         "contract chose; a hostname needs an entry because the sink resolves it itself, "
         "later, where no lookup made here applies. If this is intended, add the entries "
-        f"{_OPERATOR_ONLY}: export {' '.join(settings)}. Leave the port off: a host written "
+        f"{_OPERATOR_ONLY}; this keeps the ones set here: export {' '.join(settings)}. Leave "
+        "the port off: a host written "
         "with a port never matches. A loopback host needs no entry, and a private IP address "
         "needs only the pairing"
     )
@@ -1627,38 +1640,53 @@ _REFERENCES_RESOLVED_BY: Mapping[str, str] = {
 
 
 def _derived_location_text(
-    binding: Mapping[str, Any], resolved: ResolvedIcebergCatalog, runtime: IcebergSinkPlan
+    binding: Mapping[str, Any],
+    sink: Mapping[str, Any],
+    resolved: ResolvedIcebergCatalog,
+    runtime: IcebergSinkPlan,
 ) -> List[Tuple[str, str]]:
-    """``(setting, value)`` for each ``binding.location`` value the derived config carries.
+    """``(setting, value)`` for each contract value the derived config carries.
 
     Read off the resolved catalog both emitters build from, so a value is
-    checked as it reaches the sink, a warehouse derived from a bucket included.
-    Kafka Connect also names the table; Debezium Server composes it.
+    checked as it reaches the sink, a warehouse derived from a bucket included,
+    and only the field the sink reads where several could name it: the first
+    namespace field set, as ``iceberg_namespace`` reads them, and
+    ``sink.partitionBy`` over ``binding.location.partitionBy``, as the runner's
+    ``SinkSpec`` does. Kafka Connect also names the table; Debezium Server
+    composes it.
     """
     loc = binding.get("location") or {}
     text: List[Tuple[str, str]] = []
     if resolved.uri:
         text.append(("binding.location.uri", str(resolved.uri)))
     if resolved.warehouse:
-        source = "binding.location.warehouse" if loc.get("warehouse") else "binding.location.bucket"
+        written = str(loc.get("warehouse") or "").strip()
+        source = (
+            "binding.location.warehouse"
+            if written and resolved.warehouse == written
+            else "the warehouse derived from binding.location (bucket, path, database, table)"
+        )
         text.append((source, resolved.warehouse))
     if resolved.region:
         text.append(("binding.location.region", str(resolved.region)))
     for prop, value in resolved.extra_catalog_props.items():
         text.append((_EXTRA_PROPERTY_SOURCES.get(prop, f"binding.location ({prop})"), str(value)))
-    # The namespace and table fields as written: whichever one the sink reads.
-    names = [
+    namespaces = (
         ("binding.location.database", loc.get("database")),
         ("binding.database", binding.get("database")),
         ("binding.location.dataset", loc.get("dataset")),
-    ]
+    )
+    tables = (("binding.location.table", loc.get("table")), ("binding.table", binding.get("table")))
+    used = [next(((s, v) for s, v in namespaces if v), None)]
     if runtime.engine == "kafka-connect":  # Debezium Server composes the table itself
-        names += [
-            ("binding.location.table", loc.get("table")),
-            ("binding.table", binding.get("table")),
-        ]
-    text.extend((source, str(value)) for source, value in names if value)
-    text.extend(("binding.location.partitionBy", str(item)) for item in resolved.partition_by)
+        used.append(next(((s, v) for s, v in tables if v), None))
+    text.extend((source, str(value)) for source, value in filter(None, used))
+    raw_partition = sink.get("partitionBy")
+    partition = list(raw_partition) if isinstance(raw_partition, (list, tuple, str)) else []
+    if partition:
+        text.extend(("sink.partitionBy", str(item)) for item in partition)
+    else:
+        text.extend(("binding.location.partitionBy", str(item)) for item in resolved.partition_by)
     return text
 
 
@@ -1687,7 +1715,7 @@ def _check_location_text(
     """
     resolved = resolve_iceberg_catalog(binding, sink=sink, account_ref="")
     referenced: set[str] = set()
-    for source, value in _derived_location_text(binding, resolved, runtime):
+    for source, value in _derived_location_text(binding, sink, resolved, runtime):
         if not re.search(FORBIDDEN_TEXT_PATTERN, value) or source in referenced:
             continue
         referenced.add(source)

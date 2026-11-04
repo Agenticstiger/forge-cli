@@ -43,9 +43,12 @@ pytestmark = [pytest.mark.unit]
 
 
 @pytest.fixture(autouse=True)
-def _operator_allows_the_fixture_hosts(monkeypatch):
+def _operator_allows_the_fixture_hosts(request, monkeypatch):
     """The operator pairs each fixture variable with each fixture host. Where a
     credential may go is pinned in test_iceberg_sink_catalog_destinations.py."""
+    if "kafka_connect_mock" in request.fixturenames:
+        # The mock may set the host list for its own server: extend it after.
+        request.getfixturevalue("kafka_connect_mock")
     hosts = ("lakekeeper", "keycloak")
     names = ("LAKEKEEPER_CREDENTIAL", "UC_TOKEN")
     monkeypatch.setenv(SECRET_REF_ALLOWLIST, ",".join(f"{n}@{h}" for n in names for h in hosts))
