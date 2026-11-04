@@ -22,6 +22,7 @@ import httpx
 import pytest
 
 from fluid_build.streaming.compiler import compile_contract
+from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV, SECRET_REF_ALLOWLIST_ENV
 from fluid_build.streaming.runtime import (
     Kubectl,
     StreamingError,
@@ -264,10 +265,12 @@ def test_catalog_auth_is_resolved_locally_and_sent_only_as_headers(
 ):
     contract["exposes"][0]["contract"]["schema"] = [{"name": "id", "type": "long"}]
     contract["exposes"][0]["binding"]["location"]["uri"] = "https://catalog.example"
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "catalog.example,identity.example")
     cfg = contract["builds"][0]["properties"]["parameters"]["flink"]
     if auth_type == "bearer":
         cfg["catalogAuth"] = {"type": "bearer", "tokenEnv": "CATALOG_TOKEN"}
         monkeypatch.setenv("CATALOG_TOKEN", "synthetic-token")
+        monkeypatch.setenv(SECRET_REF_ALLOWLIST_ENV, "CATALOG_TOKEN@catalog.example")
     else:
         cfg["catalogAuth"] = {
             "type": "oauth2",
@@ -278,6 +281,12 @@ def test_catalog_auth_is_resolved_locally_and_sent_only_as_headers(
             "resource": "warehouse",
         }
         monkeypatch.setenv("CATALOG_CREDENTIAL", "synthetic-client:synthetic-secret")
+        # The credential goes to the identity provider and the token minted from it
+        # to the catalog, so the operator pairs the variable with both hosts.
+        monkeypatch.setenv(
+            SECRET_REF_ALLOWLIST_ENV,
+            "CATALOG_CREDENTIAL@identity.example,CATALOG_CREDENTIAL@catalog.example",
+        )
     (artifact,) = compile_contract(contract)
     calls = []
 

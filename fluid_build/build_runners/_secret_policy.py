@@ -192,6 +192,17 @@ def allowlist(environ: Optional[Mapping[str, str]] = None) -> List[Tuple[str, Op
     return _entries(env.get(ALLOWLIST_ENV, "") or "")
 
 
+def variable_allowed(
+    variable: str, host: Optional[str], *, environ: Optional[Mapping[str, str]] = None
+) -> bool:
+    """Whether ``variable`` may be sent to ``host``: the decision, without wording.
+
+    For a caller that phrases its own refusal (the managed Flink lane's catalog
+    token, ``streaming/policy.py``). A loopback host needs no entry.
+    """
+    return is_loopback(host) or _allows(variable, host, allowlist(environ))
+
+
 def _allows(variable: str, host: Optional[str], entries: List[Tuple[str, Optional[str]]]) -> bool:
     target = (host or "").strip().lower().rstrip(".")
     for name, allowed_host in entries:

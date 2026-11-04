@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set
 
 from .._console import _redact_str
+from .._errors import FluidUserError
 from ..observability.secret_redactor import redact_secret_text
 from ..observability.tracing import traced_span as _traced_span
 from ..observability.tracing import traced_stage as _traced_stage
@@ -446,7 +447,10 @@ def run(args, logger: logging.Logger) -> int:
 
         return 0
 
-    except CLIError:
+    except (CLIError, FluidUserError):
+        # A typed error already says what happened and how to fix it (the
+        # managed Flink policy names the variables to set); flattening it into
+        # diff_failed would keep only its first line.
         raise
     except Exception as e:
         raise CLIError(1, "diff_failed", {"error": str(e)})
