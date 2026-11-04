@@ -34,6 +34,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import httpx
+import pytest
 import respx
 
 from fluid_build.api.lineage import RunEvent, RunEventType
@@ -56,11 +57,19 @@ def _event() -> RunEvent:
     )
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://169.254.169.254/ingest",
+        "http://[fd00:ec2::254]/ingest",  # AWS IMDS over IPv6: not link-local
+        "http://100.100.100.200/ingest",  # Alibaba Cloud metadata: inside CGNAT
+    ],
+)
 @respx.mock
-def test_emit_blocks_metadata_endpoint():
+def test_emit_blocks_metadata_endpoint(endpoint: str):
     """A lineage endpoint pointed at the cloud-metadata service must
     NOT receive the POST (which would carry the Bearer token)."""
-    emitter = HttpLineageEmitter(endpoint="http://169.254.169.254/ingest", api_key="secret-token")
+    emitter = HttpLineageEmitter(endpoint=endpoint, api_key="secret-token")
     route = respx.post(url__regex=r".*").mock(return_value=httpx.Response(200))
     emitter.emit(_event())
     assert not route.called, "POST to metadata endpoint must be refused"

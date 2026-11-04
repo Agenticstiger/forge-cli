@@ -57,6 +57,25 @@ EXTRA_BLOCKED_NETWORKS = tuple(
     )
 )
 
+# Cloud metadata and credential endpoints that are NOT link-local, so the narrow
+# gate below passed them as internal. They sit in ranges that are ordinary
+# internal networks -- ULA for an IPv6 cluster, CGNAT for a Tailscale tailnet --
+# so the ranges stay allowed and only these addresses are named, checked before
+# any allowlist as rmcp-server-kit's ssrf.rs does.
+CLOUD_METADATA_ADDRESSES = frozenset(
+    ipaddress.ip_address(addr)
+    for addr in (
+        "fd00:ec2::254",  # AWS EC2 instance metadata over IPv6 (Nitro, opt-in)
+        "fd00:ec2::23",  # AWS EKS Pod Identity agent, IPv6
+        "fd20:ce::254",  # GCP metadata server, IPv6-only VMs
+        "fd00:c1::a9fe:a9fe",  # Oracle Cloud instance metadata, IPv6 (cloud-init)
+        "100.100.100.200",  # Alibaba Cloud metadata, inside CGNAT
+    )
+)
+
+# RFC 6052: a well-known NAT64 address carries its IPv4 address in the low 32 bits.
+_NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+
 
 def is_public_address(addr: str) -> bool:
     """True iff ``addr`` is a routable public IP (v4 or v6).
@@ -192,8 +211,25 @@ def _hostname_is_private(hostname: str) -> bool:
     return hostname_scope(hostname) != "public"
 
 
+def _is_metadata_address(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Link-local, unspecified or a named metadata endpoint, seen through IPv6 wrappers.
+
+    An IPv4-mapped address (``::ffff:169.254.169.254``) reaches the IPv4
+    address from a dual-stack socket, and a NAT64 one (``64:ff9b::a9fe:a9fe``)
+    reaches it through the gateway, so both are judged by the address they
+    carry. ``is_link_local`` unwraps the mapped form only on interpreters with
+    the CPython backport, so it is not relied on.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        elif ip in _NAT64_WELL_KNOWN:
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return ip.is_link_local or ip.is_unspecified or ip in CLOUD_METADATA_ADDRESSES
+
+
 def _hostname_is_link_local(hostname: str) -> bool:
-    """Return True when ``hostname`` resolves to a link-local address.
+    """Return True when ``hostname`` resolves to a link-local or metadata address.
 
     The narrow companion to :func:`_hostname_is_private`, for the callers
     that *deliberately* accept an operator-configured internal endpoint —
@@ -202,7 +238,9 @@ def _hostname_is_link_local(hostname: str) -> bool:
     credential-bearing-POST-to-``169.254.169.254`` shape. Link-local
     (169.254.0.0/16, fe80::/10) is where AWS/GCP/Azure instance metadata
     lives and is never a legitimate service endpoint, so it stays blocked
-    even when private ranges are allowed. Unspecified (0.0.0.0, ::) is
+    even when private ranges are allowed. So do the metadata endpoints that
+    are not link-local (:data:`CLOUD_METADATA_ADDRESSES`) and either kind
+    wrapped in an IPv4-mapped or NAT64 address. Unspecified (0.0.0.0, ::) is
     refused for the same reason it is in the broad gate: on many stacks it
     routes to loopback.
 
@@ -220,9 +258,10 @@ def _hostname_is_link_local(hostname: str) -> bool:
     for entry in addresses:
         ip_str = entry[4][0]
         try:
-            ip = ipaddress.ip_address(ip_str)
+            # Without the zone, so fd00:ec2::254%eth0 is still the metadata address.
+            ip = ipaddress.ip_address(str(ip_str).split("%", 1)[0])
         except ValueError:
             return True
-        if ip.is_link_local or ip.is_unspecified:
+        if _is_metadata_address(ip):
             return True
     return False
