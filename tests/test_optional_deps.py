@@ -58,6 +58,11 @@ def _hint(feature: str, pkg: str, extra: str) -> str:
 @pytest.fixture
 def block(monkeypatch):
     """``block("litellm", "mcp")`` makes those top-level packages look uninstalled."""
+    from fluid_build import _mcp_compat
+
+    # ``is_v2`` is memoised: evaluated while mcp is blocked it caches False, and
+    # every later test in the process would drive a 2.x SDK with the 1.x API.
+    _mcp_compat.is_v2.cache_clear()
 
     def _block(*tops: str) -> None:
         blocked = set(tops)
@@ -85,7 +90,8 @@ def block(monkeypatch):
 
         monkeypatch.setattr(importlib.util, "find_spec", find_spec)
 
-    return _block
+    yield _block
+    _mcp_compat.is_v2.cache_clear()
 
 
 @pytest.fixture
@@ -335,26 +341,32 @@ def test_mcp_generation_probe_survives_a_missing_sdk(block):
         _mcp_compat.is_v2.cache_clear()
 
 
-@pytest.fixture
-def _restore_output_port_modules():
-    """Put ``sys.modules`` back exactly: keep what existed, drop what was added."""
-    prefix = "fluid_build.output_ports.mcp"
-    before = {k: v for k, v in sys.modules.items() if k.startswith(prefix)}
-    yield
-    for key in [k for k in sys.modules if k.startswith(prefix)]:
-        del sys.modules[key]
-    sys.modules.update(before)
-
-
-def test_output_port_server_without_the_sdk_names_the_extra(block, _restore_output_port_modules):
-    block("mcp")
-    for key in [k for k in sys.modules if k.startswith("fluid_build.output_ports.mcp")]:
-        del sys.modules[key]
-    pkg = importlib.import_module("fluid_build.output_ports.mcp")
-    with pytest.raises(MissingOptionalDependency) as info:
-        pkg.OutputPortMcpServer()
-    assert str(info.value) == _hint("The MCP output-port server", "mcp", "mcp")
-    assert "mcp>=1.0,<2.0" not in str(info.value)
+def test_output_port_server_without_the_sdk_names_the_extra(tmp_path):
+    # In a subprocess: importing the package with mcp blocked leaves a stub bound
+    # on ``fluid_build.output_ports`` that later in-process tests would patch.
+    code = textwrap.dedent(
+        """
+        import sys
+        sys.modules["mcp"] = None  # an uninstalled SDK, as the import system sees it
+        from fluid_build._optional import MissingOptionalDependency
+        import fluid_build.output_ports.mcp as pkg
+        try:
+            pkg.OutputPortMcpServer()
+        except MissingOptionalDependency as exc:
+            print("MSG=" + repr(str(exc)))
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(REPO), "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    expected = _hint("The MCP output-port server", "mcp", "mcp")
+    assert f"MSG={expected!r}" in proc.stdout, proc.stdout + proc.stderr
+    assert "mcp>=1.0,<2.0" not in proc.stdout
 
 
 def test_mcp_delegates_name_the_extra(block):
