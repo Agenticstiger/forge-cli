@@ -213,6 +213,15 @@ def test_a_link_local_token_endpoint_is_refused(contract, monkeypatch):
     assert "link-local" in _refused_before_any_client(contract).why
 
 
+@pytest.mark.parametrize("ip", ["100.100.100.200", "[fd00:ec2::254]"])
+def test_a_metadata_token_endpoint_is_refused_by_name(contract, monkeypatch, ip):
+    """A metadata endpoint outside link-local is refused, and the reason says what it is."""
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST_ENV, "CI_SECRET")
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, ip.strip("[]"))
+    _sink(contract, "https://10.0.0.5", _oauth2(f"https://{ip}/token"))
+    assert "known cloud metadata endpoint" in _refused_before_any_client(contract).why
+
+
 def _pinned(ip):
     """A request as the guard sees it: safe_httpx_client's pin hook has put the IP in."""
     return SimpleNamespace(url=SimpleNamespace(host=ip))

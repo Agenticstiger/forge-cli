@@ -17,6 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `python scripts/add_license_headers.py`, which also migrates a file that still has the old block,
   and the License Headers check enforces the new form.
 
+### Security
+
+- **An Iceberg sink's catalog credential could be pointed at a cloud metadata address.** The
+  `sink.catalogAuth` host check of the Kafka Connect and embedded Debezium sinks refused only
+  link-local and unspecified addresses. So a catalog or OAuth2 token endpoint at AWS's IPv6
+  instance metadata `fd00:ec2::254`, the EKS Pod Identity agent's `fd00:ec2::23`, GCP's IPv6
+  `fd20:ce::254`, Oracle Cloud's IPv6 `fd00:c1::a9fe:a9fe` or Alibaba Cloud's `100.100.100.200`
+  passed once the operator paired the variable with that host or set a bare `NAME` entry. So did
+  `100.100.100.200` inside an IPv4-mapped or NAT64 (`64:ff9b::/96`) address, and a link-local
+  address inside a NAT64 one. `fluid validate` and the run's preflight now refuse all of them even
+  when listed, with the check the orchestrator guard and the OpenLineage emitter use (#823). A
+  Tailscale tailnet (CGNAT) or an IPv6 cluster on ULA addresses needs no change. The managed
+  Flink host check already refused these addresses; its message now names a metadata endpoint
+  instead of calling it link-local.
+
 ## [0.27.0] — 2026-11-04
 
 ### Added

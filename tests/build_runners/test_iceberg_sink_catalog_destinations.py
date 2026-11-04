@@ -353,6 +353,50 @@ def test_a_link_local_catalog_is_refused_even_when_listed(host, monkeypatch):
     assert any("link-local" in e for e in errors), errors
 
 
+#: Metadata endpoints outside link-local (``_net.CLOUD_METADATA_ADDRESSES``), and
+#: wrapped forms that reach one: the other internal-endpoint checks refuse them
+#: even when listed, so a catalog credential may not go there either.
+_METADATA_HOSTS = [
+    "100.100.100.200",  # Alibaba Cloud metadata, inside CGNAT
+    "[fd00:ec2::254]",  # AWS EC2 instance metadata over IPv6
+    "[fd00:ec2::23]",  # AWS EKS Pod Identity agent, IPv6
+    "[fd20:ce::254]",  # GCP metadata server, IPv6-only VMs
+    "[fd00:c1::a9fe:a9fe]",  # Oracle Cloud instance metadata, IPv6
+    "[64:ff9b::a9fe:a9fe]",  # NAT64 of 169.254.169.254
+    "[64:ff9b::6464:64c8]",  # NAT64 of 100.100.100.200
+    "[::ffff:100.100.100.200]",  # IPv4-mapped 100.100.100.200
+]
+
+
+@pytest.mark.parametrize("host", _METADATA_HOSTS)
+def test_a_cloud_metadata_catalog_is_refused_even_when_listed(host, monkeypatch):
+    bare = host.strip("[]")
+    _operator_allows(monkeypatch, pairs=[_SECRET, f"{_SECRET}@{bare}"], hosts=[bare])
+    contract = _kc_contract(dict(_AUTHS["bearer"]), location=_location(f"https://{host}/catalog"))
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any("metadata endpoint" in e for e in errors), errors
+    assert iceberg_sink_preflight(contract, "ingest") is not None
+
+
+@pytest.mark.parametrize("host", ["100.100.100.200", "[fd00:ec2::254]", "[64:ff9b::a9fe:a9fe]"])
+def test_a_cloud_metadata_token_endpoint_is_refused_even_when_listed(host, monkeypatch):
+    bare = host.strip("[]")
+    _operator_allows(monkeypatch, pairs=[_SECRET, f"{_SECRET}@{bare}"], hosts=[bare])
+    raw = {**_AUTHS["oauth2"], "oauth2ServerUri": f"https://{host}/token"}
+    contract = _kc_contract(raw, location=_location("https://localhost:8443/catalog"))
+    error = iceberg_sink_preflight(contract, "ingest")
+    assert error is not None and "metadata endpoint" in error, error
+
+
+@pytest.mark.parametrize("host", ["100.100.100.100", "[fd00:ec2::1]"])
+def test_the_ranges_around_metadata_stay_internal(host, monkeypatch):
+    """A Tailscale tailnet (CGNAT) and an IPv6 cluster (ULA) need only the pairing."""
+    bare = host.strip("[]")
+    contract = _kc_contract(dict(_AUTHS["bearer"]), location=_location(f"https://{host}/catalog"))
+    _operator_allows(monkeypatch, pairs=[f"{_SECRET}@{bare}"])
+    assert iceberg_sink_preflight(contract, "ingest") is None
+
+
 def test_a_public_ip_needs_a_host_entry(monkeypatch):
     contract = _kc_contract(
         dict(_AUTHS["bearer"]), location=_location("https://93.184.216.34/catalog")

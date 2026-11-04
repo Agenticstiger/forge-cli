@@ -179,8 +179,8 @@ def _catalog_reason(verdict: HostVerdict) -> str:
         return "it has no host"
     if verdict.code == "link-local":
         return (
-            f"{named} is link-local or unspecified, where cloud instance metadata "
-            "lives; this is refused even with an allowlist entry"
+            f"{named} is link-local, unspecified or a known cloud metadata endpoint; "
+            "this is refused even with an allowlist entry"
         )
     if verdict.code == "mixed":
         return (

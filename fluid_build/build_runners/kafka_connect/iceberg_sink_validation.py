@@ -54,7 +54,8 @@ Snowflake-managed table for the same expose. Per sink build:
   see); and an override map that inlines a ``credential`` or ``token`` value
   is a warning;
 * every host a ``sink.catalogAuth`` credential reaches (the catalog, and an
-  OAuth2 token endpoint) must be https and must not be link-local, an error
+  OAuth2 token endpoint) must be https and must not be link-local or a cloud
+  metadata endpoint, an error
   here and in the run's preflight; and the operator must allow it: the variable
   paired with the host (``NAME@host``), and a hostname listed, because the
   worker or the server resolves it itself. Those lists are the operator's, so
@@ -105,7 +106,7 @@ from typing import (
 )
 from urllib.parse import urlsplit
 
-from ..._net import is_public_address
+from ..._net import _is_metadata_address, is_public_address
 from ...providers._iceberg_catalog import (
     BIGQUERY_LOCATION,
     BIGQUERY_PROJECT_ID,
@@ -1402,10 +1403,12 @@ def _destination_host(url: str, source: str, role: str, receives: str) -> Tuple[
 
     "Why not" is a refusal no operator entry changes: the URL is not https (a
     loopback one included), carries a ``user:password@`` part, names no plain
-    host (:data:`_PLAIN_HOST_RE`), or names a link-local or unspecified
-    address, where cloud instance metadata lives (the deployment host policy's
-    rule). Python and the JVM split a URL's authority alike only when it holds
-    no such part, so the host checked here is the one the sink connects to.
+    host (:data:`_PLAIN_HOST_RE`), or names a link-local, unspecified or cloud
+    metadata address (:data:`fluid_build._net.CLOUD_METADATA_ADDRESSES`), also
+    inside an IPv4-mapped or NAT64 address: the deployment host policy's rule,
+    through the same :func:`fluid_build._net._is_metadata_address`. Python and
+    the JVM split a URL's authority alike only when it holds no such part, so
+    the host checked here is the one the sink connects to.
     """
     no_host = f"{source} names no host, so where the {role} sends {receives} cannot be checked"
     try:
@@ -1429,10 +1432,11 @@ def _destination_host(url: str, source: str, role: str, receives: str) -> Tuple[
             f"is not shown, and the {role} would receive {receives}"
         )
     address = _ip_literal(host)
-    if address is not None and (address.is_link_local or address.is_unspecified):
+    if address is not None and _is_metadata_address(address):
         return "", (
-            f"the {role} host {host!r} ({source}) is link-local or unspecified, where cloud "
-            "instance metadata lives; this is refused even with an allowlist entry"
+            f"the {role} host {host!r} ({source}) is link-local, unspecified or a known cloud "
+            f"metadata endpoint; no {role} is ever there, and this is refused even with an "
+            "allowlist entry"
         )
     return host, ""
 
@@ -1447,9 +1451,10 @@ def _unlisted_host(host: str) -> Optional[str]:
     in ``FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST``, or when it is
     ``localhost``. An IP literal keeps the deployment host policy's rules
     (``_deployment_host_policy.py``): a private or loopback address needs no
-    entry, a public one is listed (link-local is refused before this, by
-    :func:`_destination_host`). Nothing is resolved. A listed host is matched by
-    that policy's own suffix rule, so the two lists cannot read differently.
+    entry, a public one is listed (link-local and metadata addresses are
+    refused before this, by :func:`_destination_host`). Nothing is resolved.
+    A listed host is matched by that policy's own suffix rule, so the two
+    lists cannot read differently.
     """
     if _on_allowlist(host, host_allowlist()):
         return None
