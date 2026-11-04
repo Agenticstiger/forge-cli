@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid validate` and `fluid plan` warn about an id the build phase refuses.** The build
+  phase puts `contract.id` and each `builds[].id` in directory names and generated code, so they
+  must start with a letter or underscore, use only letters, digits, `_`, `.` and `-`, and be at
+  most 128 characters. The contract schema allows more (`1orders`, or a longer id), and
+  `fluid apply` in a build mode refuses such an id before it applies anything, but validate and
+  plan said nothing. For a contract with builds, both now warn and name the id: plain
+  `fluid validate` passes and `--strict` fails, and `fluid plan` still writes the plan, whatever
+  its `--mode`. A contract without builds is not checked, as in `fluid apply`.
+
 - **IaC plugins load when a contract needs their platform, and cannot take a built-in's name
   unless the operator says so.** A package that ships an OpenTofu emitter through the
   `fluid_build.iac_providers` entry-point group used to be imported whenever `fluid_build.iac`
@@ -275,6 +284,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as before. The Command Center run now reports `apply_build_id_not_found`, where it reported
   `build_not_found:<id>`.
 
+- **`fluid odcs validate` stopped with `Unexpected error: closing tag '[/]' ... has nothing to
+  close`** when a value that fails a schema check contained `[/]` or another Rich markup tag. The
+  error line quotes the value, and it was printed as markup. It is printed as plain text now, so
+  the command reports the error and exits 1.
+
 - **A missing optional dependency names the extra to install, and silent fallbacks warn.**
   litellm, the MCP SDK, openlineage, boto3 and duckdb are imported through one gate: when one is
   missing, the command prints `<feature> needs <package>, which is not installed.` and
@@ -327,6 +341,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expose.** The diff now unwraps it at `schema` and `contract.schema` alike, as `fluid verify`
   does, and reports its columns at `...schema.fields.<column>`. No bundled schema accepts the
   wrapper, so `fluid diff --baseline` refuses such a contract as invalid (see Security).
+
+- **`fluid diff --baseline` compares column types more strictly, so `--fail-on-breaking` stops
+  passing type changes that break consumers.** Contracts that used to diff clean can now report
+  breaking type changes (a pipeline that runs `fluid diff --baseline --fail-on-breaking` can start
+  exiting 1), and some findings that were `info` or `non_breaking` are now `breaking`. Rule by rule:
+  - A type name that is not plain ASCII is compared as written, not case-folded, so apart from
+    surrounding whitespace it matches nothing but itself, and the finding says so. Type text the
+    comparison cannot order (non-ASCII text, or parameters that are not plain integers, such as
+    `enum('a','b')` or `varchar(max)`) is a different type when the text differs after ASCII case
+    folding; it used to read as "no parameters" or as a whitespace difference. Case inside a quoted
+    parameter is still folded, so `enum('a')` and `enum('A')` still compare equal.
+  - A parameter change that is neither a pure widening nor a pure narrowing is now `breaking`, not
+    `info`: `varchar` to `varchar(10)` or back, `decimal(10,2)` to `decimal(12,1)` or to a bare
+    `decimal`. The kind stays `column_type_param_changed`; its text now reads "(not a pure
+    widening)".
+  - A bigger parameter is a widening only for types whose parameter measures capacity: lengths
+    (`varchar`, `char`, `string`, `text`, `varbinary` and their variants), precisions (`float`,
+    `time`, `timestamp`, `datetime` and their variants) and the decimal family. A parameter that
+    names something is not one: `geometry(4326)` to `geometry(32633)`, `binary(16)` to
+    `binary(32)` and `vector(3)` to `vector(1536)` are now `breaking`.
+  - A `decimal`, `dec`, `numeric`, `number` or `bignumeric` with a precision and a scale widens only
+    when the scale and the integer digits (precision minus scale) both hold. `decimal(10,2)` to
+    `decimal(12,4)` is still a widening; `decimal(10,2)` to `decimal(11,4)`, which holds one
+    integer digit fewer, is now `breaking`.
+  - A change to a different base type widens only when the new type declares no parameters of its
+    own: `int` to `decimal(5,0)` is now `breaking`, `int` to a bare `decimal` still widens.
+  - `time` to `timestamp` or `datetime`, `float` to `decimal` or `numeric`, and `int`, `integer`
+    or `int32` to `float` are no longer widenings. `float` to `double` and `int` to `double` are.
+
+- **`fluid diff --baseline` reports a name the new contract declares twice.** The comparison matched
+  exposes, columns and nested fields by name and kept the last of a repeated name, so an earlier
+  declaration was never compared. An expose id (`exposeId`, or `id`), a column name or a nested
+  field name that the new contract declares more than once is now `breaking`
+  (`expose_duplicate_id`, `column_duplicate_name`, `nested_field_duplicate_name`), in an expose both
+  contracts have and in one that is new, and whatever the baseline holds: a contract that already
+  declares a name twice is reported against itself until one declaration is removed, so a pipeline
+  that gates on it can start exiting 1, and the `fluid forge --refine` preview lists it as a
+  breaking change.
 
 - **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
   `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the
@@ -546,8 +598,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into `main.tf.json`. The module's allowlists now end in `\Z`, so such a name is refused with
   `Invalid SQL identifier: 'spectrum_events\n'`. That includes a name that reaches it with a
   trailing newline from an environment variable or a file; strip the value where it is set.
+
+- **The acquisition orchestrator check judged a second DNS answer, not the address the config
+  went to.** For kafka_connect, debezium and airbyte, the per-request guard that keeps a
+  contract-named `deployment.server_url` from receiving the connector config, resolved source
+  password included, unless its host is private, loopback or listed in
+  `FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST`, resolved the hostname again instead of looking at
+  the IP `safe_httpx_client` had pinned the connection to. A name that answered the two lookups
+  differently (DNS rebinding), or a non-ASCII name that Python's resolver spells as IDNA2003 and
+  httpx as IDNA2008 (`faß.de` is `fass.de` to one and `xn--fa-hia.de` to the other), passed as
+  private while the config went to an unlisted public address, and a listed name could be sent
+  to instance metadata the same way. The guard now judges the pinned address. The name still
+  decides the allowlist, the address decides public or private, a link-local address is refused
+  even for a listed name, and the refusal names both: `host 'connect.example.com', connecting to
+  '93.184.216.34', is public`. A URL that cannot be parsed, such as `http://[::1`, is refused with
+  "it has no host" where it raised `ValueError`.
+
+- **litellm 1.108.0 reads seven provider endpoints the dotenv guard did not know.**
+  `BESPOKE_API_BASE`, `CORALBRICKS_API_BASE`, `DATABRICKS_AGENT_API_BASE`, `INFERENCEAPIS_API_BASE`,
+  `LAYA_API_BASE`, `MICROSOFT_365_COPILOT_API_BASE` and `SCALEDOWN_API_BASE` choose the host
+  litellm sends the provider key to. They are now in `credentials/litellm_endpoints.py`, so a
+  project dotenv file cannot point them elsewhere while `FLUID_LLM_API_KEY` or a stored key is in
+  play, as for every other provider endpoint.
+
 ### Upgrade notes
 
+- New validate warning, so `--strict` fails: a contract with builds whose `contract.id` or a
+  `builds[].id` the build phase refuses (`1orders`, or more than 128 characters). `fluid apply`
+  in a build mode already refuses it; rename the id to fit.
 - A contract with a column typed `array`, `struct`, `map`, `object`, `record` or `row` (or
   `array(...)`) on an `aws` Glue table or a `gcp` BigQuery table now fails `fluid validate`,
   `fluid generate iac` and `fluid apply` with `column-type`, where it validated and wrote a
@@ -603,6 +681,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the line break is the only problem: `(it ends in a line break, which a YAML | or > block keeps
   and |- or >- drops)`. A `sink.catalogAuth` field gets no hint, since its value is never shown.
   The schemas themselves are unchanged.
+
+- **The ODCS and plugin-extension checks let a value with a trailing newline through a `pattern`,
+  too.** The fix above covered the FLUID schemas only. `fluid odcs validate` and
+  `fluid validate-artifacts` accepted an ODCS `schema[].id: "t1\n"` while refusing `"t 1"`, and
+  the forge copilot kept an LLM-proposed extension block whose value ended in a line break, such
+  as `use: "ci:basic\n"` for `customScaffold`. Every JSON Schema check now reads `$` as the end of
+  the value, including the ODPS, OPDS and Ossie checks, whose vendored schemas have no such
+  pattern yet. Their errors carry the same hint; an extension block that fails is dropped, as
+  before. An extension schema is read in the dialect its `$schema` declares, and as draft-07 when
+  it declares none, so a 2020-12 `unevaluatedProperties: false` is no longer ignored.
+  `patternProperties` keys are still matched as before, so OPDS's language-code key `^[a-z]{2}$`
+  accepts `"en\n"`.
 
 - **`fluid diff --baseline` compared contracts that no schema accepts.** Its rules read only the
   shapes a schema allows, so a value of the wrong type hid a change: a column retyped from

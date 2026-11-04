@@ -35,6 +35,7 @@ from fluid_build.providers._iceberg_catalog import (
 )
 from fluid_build.providers._iceberg_catalog_auth import FORBIDDEN_TEXT_PATTERN, parse_catalog_auth
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
+from fluid_build.schema_manager import schema_validator
 from fluid_build.streaming.mapping import SOURCE_TABLE, bind_by_name, compile_select, parse_stream
 from fluid_build.streaming.types import LogicalType, columns_sql, parse_fields
 from fluid_build.util.contract import is_externally_run_build
@@ -236,9 +237,10 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
             f"parameters.flink.source.{moved[0]}: the topic, format and schema of the records "
             "are declared in properties.stream; parameters.flink.source keeps the connection"
         )
-    errors = sorted(
-        jsonschema.Draft202012Validator(_CONFIG).iter_errors(cfg), key=lambda e: str(e.path)
-    )
+    # schema_validator, so that a pattern ends at the end of the value, not
+    # before a trailing newline as jsonschema's own re.search lets it.
+    validator = schema_validator(_CONFIG, default=jsonschema.Draft202012Validator)
+    errors = sorted(validator.iter_errors(cfg), key=lambda e: str(e.path))
     if errors:
         # Do not echo instance values: an invalid value might be a pasted credential.
         problem = errors[0]

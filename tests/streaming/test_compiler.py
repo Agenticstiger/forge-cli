@@ -64,6 +64,15 @@ def test_sql_and_runtime_changes_change_digest(contract):
     "mutate,match",
     [
         (lambda c, f: f["deployment"].update(image="flink:latest"), "invalid configuration"),
+        # A pattern ends at the end of the value: a trailing newline is refused.
+        (
+            lambda c, f: f["deployment"].update(name=f["deployment"]["name"] + "\n"),
+            "invalid configuration",
+        ),
+        (
+            lambda c, f: f["deployment"].update(image=f["deployment"]["image"] + "\n"),
+            "invalid configuration",
+        ),
         (lambda c, f: f["deployment"].pop("context"), "invalid configuration"),
         (lambda c, f: f.update(typo=True), "invalid configuration"),
         (lambda c, f: _stream(c).update(format="protobuf"), "format: expected one of"),
