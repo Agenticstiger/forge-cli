@@ -29,6 +29,7 @@ from fluid_build.streaming.compiler import validation_errors, validation_warning
 from fluid_build.streaming.policy import (
     CONTRACT_SQL_ALLOWLIST_ENV,
     FlinkPolicyError,
+    contract_sql_entry,
     refuse_unless_contract_sql_allowed,
 )
 from fluid_build.streaming.runtime import reconcile
@@ -58,7 +59,27 @@ def test_apply_refuses_contract_sql_the_operator_did_not_list(contract, monkeypa
         refuse_unless_contract_sql_allowed(
             contract["id"], build, {CONTRACT_SQL_ALLOWLIST_ENV: "other.product"}
         )
-    assert "other.product,commerce.nested-events/ingest-orders" in caught.value.fix
+    pinned = contract_sql_entry(contract["id"], build)
+    assert f"other.product,{pinned}" in caught.value.fix
+
+
+def test_a_pinned_listing_approves_the_reviewed_sql_only(contract):
+    build = contract["builds"][0]
+    _props(contract)["sql"] = "SELECT * FROM source_events"
+    pinned = contract_sql_entry(contract["id"], build)
+    assert pinned.startswith("commerce.nested-events/ingest-orders@sha256:")
+    refuse_unless_contract_sql_allowed(contract["id"], build, {CONTRACT_SQL_ALLOWLIST_ENV: pinned})
+    # Whitespace around the SQL is not a change; anything else is.
+    _props(contract)["sql"] = "\n  SELECT * FROM source_events  \n"
+    refuse_unless_contract_sql_allowed(contract["id"], build, {CONTRACT_SQL_ALLOWLIST_ENV: pinned})
+    _props(contract)["sql"] = "SELECT * FROM source_events UNION ALL SELECT * FROM lake.hr.pay"
+    with pytest.raises(FlinkPolicyError) as caught:
+        refuse_unless_contract_sql_allowed(
+            contract["id"], build, {CONTRACT_SQL_ALLOWLIST_ENV: pinned}
+        )
+    assert "changed after it was listed" in caught.value.why
+    assert pinned not in caught.value.fix
+    assert contract_sql_entry(contract["id"], build) in caught.value.fix
 
 
 def test_a_mapped_build_needs_no_listing(contract, monkeypatch):

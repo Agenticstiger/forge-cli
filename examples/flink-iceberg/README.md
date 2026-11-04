@@ -46,9 +46,14 @@ fluid validate --schema-version 0.7.7 --fragment streamSource shapes/fragments/s
 `--fragment recordMapping` checks a mapping, and `--fragment schema` a column list.
 
 A build may run its own `properties.sql` instead, read by output column name.
-`fluid apply` refuses it unless the operator lists the product in
-`FLUID_FLINK_CONTRACT_SQL_ALLOWLIST`. That SQL runs with the job's catalog
-identity, so it can read any table that identity can read, not only the stream.
+That SQL runs with the job's catalog identity, so it can read any table that
+identity can read, not only the stream. `fluid apply` therefore refuses it unless
+the operator lists it in `FLUID_FLINK_CONTRACT_SQL_ALLOWLIST`.
+
+List it as `<product>/<build>@sha256:<digest>`, which the refusal prints. That
+entry approves the SQL that was reviewed and nothing it is later edited into.
+`<product>/<build>` and `<product>` approve whatever SQL the build or product
+runs.
 
 ## Run the data-plane proof locally
 
