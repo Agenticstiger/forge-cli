@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid validate` and `fluid plan` warn about an id the build phase refuses.** The build
+  phase puts `contract.id` and each `builds[].id` in directory names and generated code, so they
+  must start with a letter or underscore, use only letters, digits, `_`, `.` and `-`, and be at
+  most 128 characters. The contract schema allows more (`1orders`, or a longer id), and
+  `fluid apply` in a build mode refuses such an id before it applies anything, but validate and
+  plan said nothing. For a contract with builds, both now warn and name the id: plain
+  `fluid validate` passes and `--strict` fails, and `fluid plan` still writes the plan, whatever
+  its `--mode`. A contract without builds is not checked, as in `fluid apply`.
+
 - **IaC plugins load when a contract needs their platform, and cannot take a built-in's name
   unless the operator says so.** A package that ships an OpenTofu emitter through the
   `fluid_build.iac_providers` entry-point group used to be imported whenever `fluid_build.iac`
@@ -569,6 +578,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- New validate warning, so `--strict` fails: a contract with builds whose `contract.id` or a
+  `builds[].id` the build phase refuses (`1orders`, or more than 128 characters). `fluid apply`
+  in a build mode already refuses it; rename the id to fit.
 - A contract with a column typed `array`, `struct`, `map`, `object`, `record` or `row` (or
   `array(...)`) on an `aws` Glue table or a `gcp` BigQuery table now fails `fluid validate`,
   `fluid generate iac` and `fluid apply` with `column-type`, where it validated and wrote a

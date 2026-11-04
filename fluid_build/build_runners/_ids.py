@@ -47,6 +47,12 @@ from typing import Any, Mapping, Optional
 # can never traverse out of the directory it is joined into.
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]{0,127}\Z")
 
+# :data:`_IDENT_RE` in words, for a message that tells an author what to change.
+IDENT_RULE = (
+    "start with a letter or underscore, use only letters, digits, '_', '.' and '-', "
+    "and be at most 128 characters"
+)
+
 
 class IdentifierViolation(ValueError):
     """Raised when a contract identifier fails validation.
@@ -103,3 +109,27 @@ def validate_build_ids(contract: Mapping[str, Any]) -> None:
     for build in builds:
         if isinstance(build, Mapping) and build.get("id"):
             validate_identifier(build["id"], kind="build.id")
+
+
+def build_id_warning(contract: Mapping[str, Any]) -> Optional[str]:
+    """The warning ``fluid validate`` and ``fluid plan`` give for an id the build phase refuses.
+
+    The schema's ``$defs.identifier`` admits more than :data:`_IDENT_RE` (a
+    leading digit, any length), and the two stay different by decision. So
+    validate and plan accept such an id and warn, and ``fluid apply`` in a
+    build mode refuses it. The check is :func:`validate_build_ids`, so the
+    warning names the id apply would name. Returns ``None`` when it passes.
+
+    The text does not say the schema accepted the id: validate also runs this
+    on a contract the schema refused, such as one whose ``id`` is ``123``.
+    """
+    try:
+        validate_build_ids(contract)
+    except IdentifierViolation as exc:
+        return (
+            f"{exc.kind} {exc.value!r} cannot be used by the build phase, which puts it in "
+            f"directory names and generated code, so it must {IDENT_RULE}. fluid apply in a "
+            "build mode (amend-and-build, replace-and-build) refuses this id before it "
+            "applies anything. Rename it to fit."
+        )
+    return None

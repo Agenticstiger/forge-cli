@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fluid_build.cli.console import cprint, warning
+from fluid_build.cli.console import cprint, cprint_literal, warning
 
 # 11-stage pipeline: stage-6 → stage-7 cryptographic plan-binding. ``plan.json``
 # carries ``bundleDigest`` (pins input bundle) + ``planDigest`` (catches
@@ -305,6 +305,7 @@ def run(args, logger: logging.Logger) -> int:
         # plan generation or write. A failure raises ``CLIError`` →
         # non-zero exit, no plan.json written.
         _gate_contract_for_plan_or_apply(contract, logger, command="plan")
+        _warn_unusable_build_ids(contract)
 
         # --- --provider gate -------------------------------------------------
         # ``--provider`` reaches ``build_provider`` only on the legacy planner
@@ -759,6 +760,27 @@ def _gate_contract_for_plan_or_apply(
                 ),
             },
         )
+
+
+def _warn_unusable_build_ids(contract: Dict[str, Any]) -> None:
+    """Warn when the build phase will refuse ``contract.id`` or a ``builds[].id``.
+
+    The schema admits ids the build phase refuses (``1orders``, or one of 129
+    characters), and ``fluid apply`` in a build mode refuses such an id before
+    it applies anything. Plan only warns, whatever ``--mode`` it plans for, and
+    writes the plan. Not part of :func:`_gate_contract_for_plan_or_apply`:
+    apply shares that gate and refuses the id with a typed error of its own
+    (``cli/apply.py::_gate_build_ids_for_apply``). Printed, not logged: a
+    ``warn()`` event would print the same text again as a JSON line.
+    """
+    from fluid_build.build_runners._ids import build_id_warning
+
+    message = build_id_warning(contract)
+    if message is not None:
+        # As validate prints its warnings (validate._cprint_literal): literal,
+        # because the id is contract data, not markup; the terminal wraps the
+        # line, so Rich never breaks one inside the id; and no highlighter.
+        cprint_literal(f"\n⚠️  {message}", highlight=False, soft_wrap=True)
 
 
 def _validate_plan_actions(plan: Dict[str, Any], logger: logging.Logger) -> None:
