@@ -342,6 +342,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does, and reports its columns at `...schema.fields.<column>`. No bundled schema accepts the
   wrapper, so `fluid diff --baseline` refuses such a contract as invalid (see Security).
 
+- **`fluid diff --baseline` compares column types more strictly, so `--fail-on-breaking` stops
+  passing type changes that break consumers.** Contracts that used to diff clean can now report
+  breaking type changes (a pipeline that runs `fluid diff --baseline --fail-on-breaking` can start
+  exiting 1), and some findings that were `info` or `non_breaking` are now `breaking`. Rule by rule:
+  - A type name that is not plain ASCII is compared as written, not case-folded, so apart from
+    surrounding whitespace it matches nothing but itself, and the finding says so. Type text the
+    comparison cannot order (non-ASCII text, or parameters that are not plain integers, such as
+    `enum('a','b')` or `varchar(max)`) is a different type when the text differs after ASCII case
+    folding; it used to read as "no parameters" or as a whitespace difference. Case inside a quoted
+    parameter is still folded, so `enum('a')` and `enum('A')` still compare equal.
+  - A parameter change that is neither a pure widening nor a pure narrowing is now `breaking`, not
+    `info`: `varchar` to `varchar(10)` or back, `decimal(10,2)` to `decimal(12,1)` or to a bare
+    `decimal`. The kind stays `column_type_param_changed`; its text now reads "(not a pure
+    widening)".
+  - A bigger parameter is a widening only for types whose parameter measures capacity: lengths
+    (`varchar`, `char`, `string`, `text`, `varbinary` and their variants), precisions (`float`,
+    `time`, `timestamp`, `datetime` and their variants) and the decimal family. A parameter that
+    names something is not one: `geometry(4326)` to `geometry(32633)`, `binary(16)` to
+    `binary(32)` and `vector(3)` to `vector(1536)` are now `breaking`.
+  - A `decimal`, `dec`, `numeric`, `number` or `bignumeric` with a precision and a scale widens only
+    when the scale and the integer digits (precision minus scale) both hold. `decimal(10,2)` to
+    `decimal(12,4)` is still a widening; `decimal(10,2)` to `decimal(11,4)`, which holds one
+    integer digit fewer, is now `breaking`.
+  - A change to a different base type widens only when the new type declares no parameters of its
+    own: `int` to `decimal(5,0)` is now `breaking`, `int` to a bare `decimal` still widens.
+  - `time` to `timestamp` or `datetime`, `float` to `decimal` or `numeric`, and `int`, `integer`
+    or `int32` to `float` are no longer widenings. `float` to `double` and `int` to `double` are.
+
+- **`fluid diff --baseline` reports a name the new contract declares twice.** The comparison matched
+  exposes, columns and nested fields by name and kept the last of a repeated name, so an earlier
+  declaration was never compared. An expose id (`exposeId`, or `id`), a column name or a nested
+  field name that the new contract declares more than once is now `breaking`
+  (`expose_duplicate_id`, `column_duplicate_name`, `nested_field_duplicate_name`), in an expose both
+  contracts have and in one that is new, and whatever the baseline holds: a contract that already
+  declares a name twice is reported against itself until one declaration is removed, so a pipeline
+  that gates on it can start exiting 1, and the `fluid forge --refine` preview lists it as a
+  breaking change.
+
 - **A failed `fluid apply` on OpenTofu printed raw JSON and no way forward.** The runner uses
   `-json`, so the error was the last 800 characters of diagnostic lines. It now reads the
   diagnostic (the summary, the resource address and the provider's detail) and says that OpenTofu
