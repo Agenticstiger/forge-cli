@@ -501,12 +501,10 @@ class McpCatalogConnector(BaseCatalogConnector):
         # streamable-HTTP), runs the ``initialize`` handshake, and tears the
         # connection down on context exit. We don't re-implement any of that —
         # we only translate config into the right params object below.
-        try:
-            from mcp import ClientSessionGroup
-        except ImportError as exc:  # pragma: no cover - mcp is a core dep
-            raise RuntimeError(
-                "MCP discovery requires the 'mcp' SDK (pip install 'data-product-forge[mcp]')."
-            ) from exc
+        from fluid_build._optional import require
+
+        require("mcp", "mcp", "MCP discovery")
+        from mcp import ClientSessionGroup
 
         params = self._build_server_params()
         async with ClientSessionGroup() as group:

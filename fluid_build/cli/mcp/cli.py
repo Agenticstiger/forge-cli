@@ -143,8 +143,10 @@ def run(args, logger: logging.Logger) -> int:
         return _render_mcp_guide()
     if action == "serve":
         policy = _build_policy_from_args(args)
-        _set_policy(policy)
+        # Build first: when the SDK is missing this raises, and the process must
+        # not be left with a policy installed for a server that never started.
         app = _build_fastmcp_app(policy)
+        _set_policy(policy)
         try:
             asyncio.run(app.run_stdio_async())
         except KeyboardInterrupt:

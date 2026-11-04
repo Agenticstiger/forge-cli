@@ -53,6 +53,7 @@ The forge-cli-owned surface is small and stable:
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Dict, FrozenSet, Optional, Tuple, Type
 
 try:
@@ -274,6 +275,15 @@ if _HAS_PYDANTIC_SETTINGS:
     }
 else:
     _CREDENTIAL_CLASSES = {}
+    # An empty registry makes every platform fall through to "whatever the
+    # binding supplied", i.e. no env-var credential resolution at all. That is a
+    # silent behaviour change, so say so. (pydantic-settings is a base
+    # dependency, so this means a broken install, not a missing extra.)
+    logging.getLogger(__name__).warning(
+        "pydantic-settings could not be imported, so platform credentials are NOT "
+        "resolved from the environment (SNOWFLAKE_*, AWS_*, ...). Reinstall it with: "
+        "pip install --force-reinstall 'pydantic-settings>=2'"
+    )
 
 
 def get_credentials_for(platform: str, binding: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

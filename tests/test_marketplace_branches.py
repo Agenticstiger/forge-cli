@@ -20,7 +20,9 @@ import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
+import respx
 
 import fluid_build.cli.marketplace as marketplace_module
 from fluid_build.cli._common import CLIError
@@ -31,6 +33,7 @@ from fluid_build.cli.marketplace import (
     register,
     run,
 )
+from fluid_build.util import http_client
 
 
 @pytest.fixture
@@ -200,15 +203,26 @@ class TestGetApiUrl:
 # ── search_blueprints ───────────────────────────────────────────────
 
 
+def _search_args(**overrides):
+    values = dict(
+        query="test",
+        category=None,
+        tags=None,
+        maturity=None,
+        state="published",
+        sort="downloads",
+        limit=20,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 class TestSearchBlueprints:
     @patch("fluid_build.cli.marketplace.console", MagicMock())
     def test_search_success(self, logger):
-        import requests as real_requests
-
         from fluid_build.cli.marketplace import search_blueprints
 
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {
+        body = {
             "items": [
                 {
                     "id": "bp1",
@@ -222,153 +236,83 @@ class TestSearchBlueprints:
             ],
             "total": 1,
         }
-        mock_resp.raise_for_status = MagicMock()
-        with patch("fluid_build.cli.marketplace.requests") as mock_requests:
-            mock_requests.get.return_value = mock_resp
-            mock_requests.exceptions = real_requests.exceptions
-            args = SimpleNamespace(
-                query="test",
-                category=None,
-                tags=None,
-                maturity=None,
-                state="published",
-                sort="downloads",
-                limit=20,
-            )
-            result = search_blueprints(args, logger, "http://api")
+        with respx.mock(assert_all_called=False) as router:
+            route = router.get("http://api").mock(return_value=httpx.Response(200, json=body))
+            with patch(
+                "fluid_build.util.http_client.new_client", wraps=http_client.new_client
+            ) as spy:
+                result = search_blueprints(_search_args(query="test"), logger, "http://api")
         assert result == 0
+        assert route.call_count == 1
         assert (
-            mock_requests.get.call_args.kwargs["timeout"]
-            == marketplace_module.MARKETPLACE_HTTP_TIMEOUT_SECONDS
+            spy.call_args.kwargs["timeout"] == marketplace_module.MARKETPLACE_HTTP_TIMEOUT_SECONDS
         )
 
     @patch("fluid_build.cli.marketplace.console", MagicMock())
     def test_search_empty_results(self, logger):
-        import requests as real_requests
-
         from fluid_build.cli.marketplace import search_blueprints
 
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"items": [], "total": 0}
-        mock_resp.raise_for_status = MagicMock()
-        with patch("fluid_build.cli.marketplace.requests") as mock_requests:
-            mock_requests.get.return_value = mock_resp
-            mock_requests.exceptions = real_requests.exceptions
-            args = SimpleNamespace(
-                query="xyz",
-                category=None,
-                tags=None,
-                maturity=None,
-                state="published",
-                sort="downloads",
-                limit=20,
+        with respx.mock(assert_all_called=False) as router:
+            router.get("http://api").mock(
+                return_value=httpx.Response(200, json={"items": [], "total": 0})
             )
-            result = search_blueprints(args, logger, "http://api")
+            result = search_blueprints(_search_args(query="xyz"), logger, "http://api")
         assert result == 0
 
     @patch("fluid_build.cli.marketplace.console", MagicMock())
     def test_search_with_all_filters(self, logger):
-        import requests as real_requests
-
         from fluid_build.cli.marketplace import search_blueprints
 
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"items": [], "total": 0}
-        mock_resp.raise_for_status = MagicMock()
-        with patch("fluid_build.cli.marketplace.requests") as mock_requests:
-            mock_requests.get.return_value = mock_resp
-            mock_requests.exceptions = real_requests.exceptions
-            args = SimpleNamespace(
-                query="q",
-                category="analytics",
-                tags="tag1,tag2",
-                maturity="stable",
-                state="published",
-                sort="name",
-                limit=10,
+        args = _search_args(
+            query="q",
+            category="analytics",
+            tags="tag1,tag2",
+            maturity="stable",
+            sort="name",
+            limit=10,
+        )
+        with respx.mock(assert_all_called=False) as router:
+            route = router.get("http://api").mock(
+                return_value=httpx.Response(200, json={"items": [], "total": 0})
             )
             result = search_blueprints(args, logger, "http://api")
         assert result == 0
+        assert route.call_count == 1
 
     @patch("fluid_build.cli.marketplace.console", MagicMock())
     def test_search_request_error(self, logger):
-        import requests as real_requests
-
         from fluid_build.cli.marketplace import search_blueprints
 
-        with patch("fluid_build.cli.marketplace.requests") as mock_requests:
-            mock_requests.get.side_effect = real_requests.exceptions.RequestException(
-                "Network error"
-            )
-            mock_requests.exceptions = real_requests.exceptions
-            args = SimpleNamespace(
-                query="test",
-                category=None,
-                tags=None,
-                maturity=None,
-                state="published",
-                sort="downloads",
-                limit=20,
-            )
-            result = search_blueprints(args, logger, "http://api")
+        with respx.mock(assert_all_called=False) as router:
+            router.get("http://api").mock(side_effect=httpx.HTTPError("Network error"))
+            result = search_blueprints(_search_args(), logger, "http://api")
         assert result == 1
 
     def test_search_timeout_retries_and_returns_one(self, logger):
-        import requests as real_requests
-
         from fluid_build.cli.marketplace import search_blueprints
 
-        args = SimpleNamespace(
-            query="test",
-            category=None,
-            tags=None,
-            maturity=None,
-            state="published",
-            sort="downloads",
-            limit=20,
-        )
         with (
             patch("fluid_build.cli.marketplace.console") as mock_console,
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
         ):
-            mock_requests.get.side_effect = real_requests.exceptions.Timeout("read timed out")
-            mock_requests.exceptions = real_requests.exceptions
-            result = search_blueprints(args, logger, "http://api")
+            route = router.get("http://api").mock(side_effect=httpx.ReadTimeout("read timed out"))
+            result = search_blueprints(_search_args(), logger, "http://api")
 
         assert result == 1
-        assert mock_requests.get.call_count == marketplace_module.MARKETPLACE_HTTP_RETRIES + 1
+        assert route.call_count == marketplace_module.MARKETPLACE_HTTP_RETRIES + 1
         assert "timed out after" in str(mock_console.print.call_args_list)
 
     def test_search_http_error_reports_status(self, logger):
-        import requests as real_requests
-
         from fluid_build.cli.marketplace import search_blueprints
-
-        args = SimpleNamespace(
-            query="test",
-            category=None,
-            tags=None,
-            maturity=None,
-            state="published",
-            sort="downloads",
-            limit=20,
-        )
-        response = MagicMock()
-        response.status_code = 503
-        response.text = "service unavailable"
-        error = real_requests.exceptions.HTTPError("server error")
-        error.response = response
-
-        mock_response = MagicMock()
-        mock_response.raise_for_status.side_effect = error
 
         with (
             patch("fluid_build.cli.marketplace.console") as mock_console,
-            patch("fluid_build.cli.marketplace.requests") as mock_requests,
+            respx.mock(assert_all_called=False) as router,
         ):
-            mock_requests.get.return_value = mock_response
-            mock_requests.exceptions = real_requests.exceptions
-            result = search_blueprints(args, logger, "http://api")
+            router.get("http://api").mock(
+                return_value=httpx.Response(503, text="service unavailable")
+            )
+            result = search_blueprints(_search_args(), logger, "http://api")
 
         assert result == 1
         assert "HTTP 503" in str(mock_console.print.call_args_list)

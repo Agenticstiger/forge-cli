@@ -592,15 +592,21 @@ def test_a_failed_build_is_reported_with_its_build_id(product, tofu, build, cc, 
 def test_a_build_id_that_is_not_in_the_contract_is_the_reason(
     product, tofu, build, cc, monkeypatch
 ):
+    """Refused before ``tofu`` runs: the run reports the refusal and no infrastructure."""
     url, recorder = cc
     _configure(monkeypatch, url)
     _with_build(product)
 
-    assert _apply(product, "--mode", "amend-and-build", "--build-id", "no_such_build") == 1
+    with pytest.raises(CLIError) as exc:
+        _apply(product, "--mode", "amend-and-build", "--build-id", "no_such_build")
+    assert exc.value.event == "apply_build_id_not_found"
 
+    (post,) = _by(recorder, "POST")
     (patch,) = _by(recorder, "PATCH")
-    assert patch["body"]["result"]["error_event"] == "build_not_found:no_such_build"
-    assert patch["body"]["current_phase"] == "build"
+    assert post["body"]["metadata"]["product_id"] == "bronze.customer_subscriptions"
+    result = patch["body"]["result"]
+    assert result["error_event"] == "apply_build_id_not_found"
+    assert "planned_changes" not in result
     assert build["calls"] == 0
 
 
