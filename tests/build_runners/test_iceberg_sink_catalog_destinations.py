@@ -553,3 +553,53 @@ def test_a_handwritten_sink_config_reads_no_location_text():
         sink_connector_config={"connector.class": "x"},
     )
     assert not any("binding.location.region" in e for e in validate_iceberg_sink(contract)[0])
+
+
+# ── a host the refusal can repeat safely ───────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        'https://x"$(id)".attacker.example/catalog',
+        "https://x,OTHER_VAR.attacker.example/catalog",
+        "https://faß.example/catalog",
+        "https://[fd00::1%25eth0]/catalog",
+    ],
+    ids=["shell", "comma", "non-ascii", "zone-id"],
+)
+def test_a_host_that_is_not_plain_is_refused_and_never_echoed(uri, monkeypatch):
+    """The refusal's export line repeats the host, so it must be safe to paste."""
+    _operator_allows(monkeypatch, pairs=[_SECRET], hosts=["attacker.example", "example"])
+    contract = _kc_contract(dict(_AUTHS["bearer"]), location=_location(uri))
+    errors, _warnings = validate_iceberg_sink(contract)
+    mine = [e for e in errors if "not a plain DNS name or IP address" in e]
+    assert mine, errors
+    error = iceberg_sink_preflight(contract, "ingest")
+    assert error is not None
+    for text in (*mine, error):
+        assert "export" not in text
+        assert "$(id)" not in text and "other_var" not in text.lower()
+        assert "faß" not in text and "eth0" not in text
+
+
+@pytest.mark.parametrize(
+    "uri",
+    ["https://evil.example\\@127.0.0.1/catalog", "https://u:p4ss@catalog.attacker.example/c"],
+    ids=["backslash", "userinfo"],
+)
+def test_a_user_password_part_is_refused(uri):
+    """Python and the JVM read such an authority differently; it never reaches a check."""
+    contract = _kc_contract(dict(_AUTHS["bearer"]), location=_location(uri))
+    errors, _warnings = validate_iceberg_sink(contract)
+    mine = [e for e in errors if "user:password@ part" in e]
+    assert mine, errors
+    assert not any("p4ss" in e for e in mine)
+
+
+def test_an_engine_that_derives_no_sink_config_skips_the_location_text():
+    """Only the Kafka Connect and Debezium runners derive the config from the binding."""
+    contract = _kc_contract(None, location=_location(warehouse=f"env:{_SECRET}"))
+    contract["builds"][0]["engine"] = "airbyte"
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert not any("binding.location.warehouse" in e for e in errors), errors

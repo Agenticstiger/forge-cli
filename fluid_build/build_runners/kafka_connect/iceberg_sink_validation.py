@@ -531,7 +531,7 @@ def _check_catalog(
             f"use one of: {', '.join(known_catalog_kinds())}"
         )
         return
-    if runtime.derives:
+    if runtime.derives and runtime.engine in _CATALOG_AUTH_ENGINES:
         _check_location_text(bid, binding, sink, runtime, errors)
 
     # The sink must write through the catalog dbt and the IaC read. Both read
@@ -1380,13 +1380,23 @@ def _received(auth: CatalogAuth, role: str) -> str:
     return f"the token in {auth.env_var}"
 
 
+#: A host the operator can list: a DNS name (``urlsplit`` has lowercased it) or
+#: an IP address, in plain characters. The refusal's ``export`` line repeats
+#: the host, so a quote, ``$(`` or comma there would turn the operator's paste
+#: into a command, or into a bare entry that lets some other variable go to any
+#: host. A ``%`` zone id names an interface, never a remote catalog.
+_PLAIN_HOST_RE = re.compile(r"[a-z0-9._-]+|[0-9a-f:.]+")
+
+
 def _destination_host(url: str, source: str, role: str, receives: str) -> Tuple[str, str]:
     """``(host, "")`` for a destination the operator may allow, else ``("", why not)``.
 
     "Why not" is a refusal no operator entry changes: the URL is not https (a
-    loopback one included), names no host, or
-    names a link-local or unspecified address, where cloud instance metadata
-    lives (the deployment host policy's rule).
+    loopback one included), carries a ``user:password@`` part, names no plain
+    host (:data:`_PLAIN_HOST_RE`), or names a link-local or unspecified
+    address, where cloud instance metadata lives (the deployment host policy's
+    rule). Python and the JVM split a URL's authority alike only when it holds
+    no such part, so the host checked here is the one the sink connects to.
     """
     no_host = f"{source} names no host, so where the {role} sends {receives} cannot be checked"
     try:
@@ -1400,8 +1410,19 @@ def _destination_host(url: str, source: str, role: str, receives: str) -> Tuple[
             "request, and http would carry it in clear text, so a loopback host needs "
             "https too"
         )
+    if "@" in parts.netloc:
+        return "", (
+            f"{source} carries a user:password@ part (not shown). Remove it: the {role} "
+            f"receives {receives}, and a credential belongs in that variable, not in the URL"
+        )
     if not host:
         return "", no_host
+    if not _PLAIN_HOST_RE.fullmatch(host):
+        return "", (
+            f"{source} names a host that is not a plain DNS name or IP address (letters, "
+            "digits, '.', '-' and '_'; a non-ASCII name in its xn-- form; no zone id). It "
+            f"is not shown, and the {role} would receive {receives}"
+        )
     address = _ip_literal(host)
     if address is not None and (address.is_link_local or address.is_unspecified):
         return "", (
