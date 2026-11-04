@@ -130,6 +130,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A project `.env` could configure the embedded Debezium Server.** `fluid apply` loads the
+  project's `.env`, `.env.<environment>` and `.env.local` into its environment, which the
+  embedded Debezium Server inherits. The server's SmallRye Config reads a variable over its
+  `application.properties`, and its JVM reads `-D` system properties, which outrank both, from
+  `JDK_JAVA_OPTIONS` or the launcher's `JAVA_OPTS`. So a project file could send a
+  `sink.catalogAuth` credential to a catalog the operator never paired with it, change the
+  source database, load another config file, or start another `java`. The dotenv files
+  forge-cli loads can no longer set these, and each is ignored with the usual warning:
+  `DEBEZIUM_*`, `QUARKUS_*`, `SMALLRYE_*` and `MP_CONFIG_*` variables in the forms SmallRye
+  Config matches, profile forms included (`debezium.sink.iceberg.uri`, `_PROD_DEBEZIUM_…`,
+  `%prod.…`); `JDK_JAVA_OPTIONS`, `JAVA_OPTS` and `JAVA_HOME`; and the Debezium Server launcher's
+  `EXTRA_CONNECTOR`, `JMX_HOST`, `JMX_PORT`, `JMX_EXPORTER_PORT`, `JMX_EXPORTER_CONFIG` and
+  `OTEL_JAVAAGENT_*`. Set such a variable in the shell or CI instead.
+
 - **The `[mcp]` extra now needs `mcp>=1.30,!=2.0.*,!=2.1.*,<3.0`, and the `[litellm]` extra
   excludes litellm 1.107.0.** *Before:* the floor was `mcp>=1.22`, which allowed releases with
   published advisories. They were fixed in mcp 1.23.0, 1.27.2 (GHSA-jpw9: an SSE session was not

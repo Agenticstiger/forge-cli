@@ -56,7 +56,11 @@ credentials, which is what they are for. They may not carry a setting that:
   ``OPENLINEAGE_URL``, ``OTEL_EXPORTER_OTLP_*ENDPOINT``, ``AWS_ENDPOINT_URL*``,
   ``VAULT_ADDR``, ``OLLAMA_HOST``, every endpoint variable a catalog backend
   reads (``DATAHUB_GMS_URL``, ``OPENMETADATA_SERVER_URL`` ...), and
-  ``SNOWFLAKE_OAUTH_TOKEN_REQUEST_URL``, ``BIGQUERY_EMULATOR_HOST`` ...);
+  ``SNOWFLAKE_OAUTH_TOKEN_REQUEST_URL``, ``BIGQUERY_EMULATOR_HOST`` ...), and
+  every setting of the embedded Debezium Server, which inherits this
+  environment and reads it over its ``application.properties``
+  (``DEBEZIUM_*``, ``QUARKUS_*``, ``SMALLRYE_*``, ``MP_CONFIG_*``, in the forms
+  SmallRye Config matches, :func:`_is_server_config_name`);
 * chooses what program or library runs in this process or its subprocesses
   (``FLUID_DBT_MCP_COMMAND``/``_ARGS``/``_ENV``, ``FLUID_OPENTOFU_VERSION``,
   ``DBT_EXECUTABLE``, ``PATH``, ``ComSpec``, ``SystemRoot``, ``PYTHONPATH``,
@@ -147,6 +151,7 @@ their own constants, and the classification test pins that the names agree.
 from __future__ import annotations
 
 import os
+import re
 import stat
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -536,6 +541,16 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     "_RLD",
 )
 
+#: The configuration namespaces of the embedded Debezium Server: Debezium's own
+#: properties, Quarkus, SmallRye Config and MicroProfile Config (a profile, or
+#: other config files to load). The server inherits this process's environment
+#: (``build_runners/debezium/runner.py``), and SmallRye Config reads a property
+#: from a variable (ordinal 300) over ``application.properties``, so a project
+#: file could move the sink's catalog past the ``sink.catalogAuth`` pairing, or
+#: the source database, after every check forge-cli runs.
+_SERVER_CONFIG_NAMESPACES: Tuple[str, ...] = ("DEBEZIUM_", "QUARKUS_", "SMALLRYE_", "MP_CONFIG_")
+_PROFILE_ENV_FORM = re.compile(r"_[A-Z0-9]+_(.+)")
+
 # Name-shape rule for FLUID_* names: fails closed for a knob nobody listed yet.
 _FLUID_PROTECTED_SUFFIXES: Tuple[str, ...] = (
     "_URL",
@@ -755,11 +770,29 @@ def is_protected_env_key(key: str) -> bool:
         return False
     if name in PROTECTED_ENV_KEYS or name.startswith(PROTECTED_ENV_PREFIXES):
         return True
+    if _is_server_config_name(name):
+        return True
     if name.startswith("FLUID_"):
         return name.endswith(_FLUID_PROTECTED_SUFFIXES) or any(
             fragment in name for fragment in _FLUID_PROTECTED_FRAGMENTS
         )
     return False
+
+
+def _is_server_config_name(name: str) -> bool:
+    """Does SmallRye Config read the upper-cased variable ``name`` as a server property?
+
+    It matches a property by its own name (``debezium.sink.iceberg.uri``), with
+    every non-alphanumeric character as ``_``, upper-cased
+    (``DEBEZIUM_SINK_ICEBERG_URI``), and for one profile as
+    ``%prod.debezium.sink.iceberg.uri`` or ``_PROD_DEBEZIUM_SINK_ICEBERG_URI``.
+    """
+    if name.startswith("%"):
+        name = name.partition(".")[2]
+    normalized = re.sub(r"[^A-Z0-9]", "_", name)
+    profile = _PROFILE_ENV_FORM.fullmatch(normalized)
+    candidates = (normalized, profile.group(1)) if profile else (normalized,)
+    return any(candidate.startswith(_SERVER_CONFIG_NAMESPACES) for candidate in candidates)
 
 
 # ── third-party endpoints: the pairing rule ─────────────────────────────────
