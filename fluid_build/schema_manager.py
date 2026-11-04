@@ -821,15 +821,21 @@ class FluidSchemaManager:
         from fluid_build.streaming.types import parse_type
 
         before = len(result.errors)
-        for expose in contract.get("exposes") or []:
+        for position, expose in enumerate(contract.get("exposes") or []):
             for column in (expose.get("contract") or {}).get("schema") or []:
                 if {"fields", "element", "key", "value"} & column.keys():
                     try:
-                        parse_type(column, path=column["name"])
+                        # The path the compiler labels the same column with, so the
+                        # one error is reported once, below.
+                        parse_type(
+                            column, path=f"exposes[{position}].contract.schema.{column['name']}"
+                        )
                     except ValueError as exc:
                         result.add_error(str(exc))
         for message in validation_errors(contract):
-            result.add_error(message)
+            # A column the loop above reported is the compiler's first error too.
+            if message.removeprefix("Managed Flink: ") not in result.errors:
+                result.add_error(message)
         for message in validation_warnings(contract):
             result.add_warning(message)
         return len(result.errors) == before

@@ -302,3 +302,39 @@ def test_event_time_needs_millisecond_precision(contract):
     managed_config(contract["builds"][0])["source"]["eventTime"]["column"] = "kafka_ts"
     (artifact,) = compile_contract(contract)
     assert "WATERMARK FOR `kafka_ts`" in artifact.sql
+
+
+def test_a_nested_type_error_names_the_expose_and_column(contract):
+    extra = copy.deepcopy(contract["exposes"][0])
+    extra["exposeId"] = "unrelated"
+    contract["exposes"].insert(0, extra)  # the build's output is no longer exposes[0]
+    contract["exposes"][1]["contract"]["schema"][3]["key"]["required"] = False
+    with pytest.raises(ValueError) as refused:
+        compile_contract(contract)
+    assert str(refused.value) == (
+        "exposes[1].contract.schema.attributes.key: supported map keys are required strings"
+    )
+
+
+def test_a_nested_type_error_is_reported_once_by_validate(contract):
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    contract["exposes"][0]["contract"]["schema"][3]["key"]["required"] = False
+    result = FluidSchemaManager().validate_contract(contract, offline_only=True)
+    assert not result.is_valid
+    assert [e for e in result.errors if "supported map keys" in e] == [
+        "exposes[0].contract.schema.attributes.key: supported map keys are required strings"
+    ]
+
+
+def test_a_bad_partition_source_column_is_labelled(contract):
+    contract["exposes"][0]["binding"]["icebergConfig"]["partitionSpec"] = [
+        {"sourceColumn": "event_id", "transform": "identity"},
+        {"sourceColumn": "bad col", "transform": "identity"},
+    ]
+    with pytest.raises(ValueError) as refused:
+        compile_contract(contract)
+    message = str(refused.value)
+    assert message.startswith("icebergConfig.partitionSpec[1].sourceColumn: ")
+    assert "bad col" in message
+

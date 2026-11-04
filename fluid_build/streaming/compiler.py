@@ -307,7 +307,9 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
     if len(table_parts) != 2 or "None" in table_parts:
         raise ValueError("Iceberg target requires one namespace/database and table")
     namespace, table = (validate_ident(x) for x in table_parts)
-    fields = parse_fields((target.get("contract") or {}).get("schema"))
+    fields = parse_fields(
+        (target.get("contract") or {}).get("schema"), path=f"exposes[{index}].contract.schema"
+    )
     props = build.get("properties") or {}
     if "stream" not in props:
         raise ValueError(
@@ -410,8 +412,13 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
     if set(table_properties) - allowed_table_properties:
         raise ValueError("Unsupported Iceberg table properties; this lane is append-only")
     partition = []
-    for item in iceberg.get("partitionSpec") or []:
-        name = validate_ident(item["sourceColumn"])
+    for position, item in enumerate(iceberg.get("partitionSpec") or []):
+        try:
+            name = validate_ident(item["sourceColumn"])
+        except ValueError as exc:
+            raise ValueError(
+                f"icebergConfig.partitionSpec[{position}].sourceColumn: {exc}"
+            ) from exc
         if name not in dict(fields):
             raise ValueError(f"Partition source {name!r} is not a target column")
         transform = item["transform"]
