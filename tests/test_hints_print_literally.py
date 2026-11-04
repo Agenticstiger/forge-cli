@@ -469,7 +469,7 @@ def test_doctor_summary_panel_prints_literally(monkeypatch: pytest.MonkeyPatch) 
 
 # --- bracketed secrets in exception text ------------------------------------
 
-TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"  # runtime-built, not a literal secret
+TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"  # pragma: allowlist secret
 
 
 def test_console_error_masks_a_bracketed_token(capsys) -> None:
