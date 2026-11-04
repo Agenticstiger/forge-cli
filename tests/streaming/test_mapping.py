@@ -702,7 +702,21 @@ def test_malformed_streams_fail_with_a_message_not_a_crash(contract, mutate, mat
     assert validation_errors(contract)
 
 
-def test_warnings_never_crash(contract):
+def test_warnings_never_crash_and_name_a_mapping_nothing_compiles(contract):
     from fluid_build.streaming.compiler import validation_warnings
 
     assert validation_warnings({**contract, "builds": 5}) == []
+    unmanaged = copy.deepcopy(contract)
+    _props(unmanaged)["parameters"].pop("flink")
+    _props(unmanaged)["sql"] = "SELECT 1"
+    _props(unmanaged)["mapping"] = {"columns": [{"name": "event_id", "from": "event_id"}]}
+    (warning,) = validation_warnings(unmanaged)
+    assert "properties.mapping is compiled only by the managed Flink lane" in warning
+
+
+def test_an_unmanaged_build_with_a_stream_still_needs_its_sql(contract, tmp_path):
+    _props(contract)["parameters"].pop("flink")
+    result = _validate(contract, tmp_path)
+    assert any("'sql' is a required property" in str(e) for e in result.errors), result.errors
+    _props(contract)["sql"] = "SELECT * FROM orders"
+    assert _validate(contract, tmp_path).is_valid

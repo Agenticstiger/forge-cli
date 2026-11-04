@@ -3482,7 +3482,7 @@
         },
         "stream": {
           "$ref": "#/$defs/streamSource",
-          "description": "NEW in v0.7.7 (preview): The stream the build reads. With a stream, sql is optional: the managed Flink lane writes the query from the mapping instead."
+          "description": "NEW in v0.7.7 (preview): The stream the build reads. On a managed Flink build (parameters.flink.management) sql is optional: the lane writes the query from the mapping instead. Elsewhere the stream describes what the build's own sql reads."
         },
         "mapping": {
           "$ref": "#/$defs/recordMapping",
@@ -3498,8 +3498,23 @@
       "if": {
         "not": {
           "required": [
-            "stream"
-          ]
+            "stream",
+            "parameters"
+          ],
+          "properties": {
+            "parameters": {
+              "required": [
+                "flink"
+              ],
+              "properties": {
+                "flink": {
+                  "required": [
+                    "management"
+                  ]
+                }
+              }
+            }
+          }
         }
       },
       "then": {
