@@ -1,30 +1,20 @@
-# Copyright 2024-2026 Agentics Transformation Ltd
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
 
 """Pins for the license-header checker + writer staying in agreement.
 
-The two scripts previously disagreed about what "has a header" means:
-``check_license_headers.py`` only grepped the copyright line, so 346 files
-whose Apache boilerplate had been truncated mid-block (323 cut after the
-LICENSE-2.0 URL, 23 cut right after "you may not use this file…") passed
-the gate — while ``add_license_headers.py``, which writes the complete
-block, rewrote every one of them on any run. Following the checker's own
-"Run: python scripts/add_license_headers.py" remediation therefore turned
-a one-file fix into a 361-file diff.
+The two scripts must share one definition of a valid header: the two-line
+form (``Copyright 2025 Agentics Transformation Limited`` plus
+``SPDX-License-Identifier: Apache-2.0``). When an earlier checker only
+grepped the copyright line while the writer wrote the full Apache
+boilerplate, following the checker's "Run: python
+scripts/add_license_headers.py" remediation turned a one-file fix into a
+hundreds-of-files diff.
 
-These tests pin both halves of the fix: the checker validates the whole
-boilerplate, and the writer is a no-op on an already-compliant tree.
+These tests pin both halves: the checker rejects anything but the exact
+two-line header (a missing line, wrong holder, wrong year, the legacy
+boilerplate), the writer migrates the legacy block, and the writer is a no-op
+on an already-compliant tree.
 """
 
 from __future__ import annotations
@@ -56,7 +46,9 @@ writer = _load(WRITER, "_license_writer")
 
 FULL_HEADER = writer.build_header("apache2", writer.DEFAULT_HOLDER, writer.DEFAULT_YEARS)
 
-TRUNCATED_AT_URL = (
+# The legacy 14-line block, kept literal: it models what ~2,100 files carried
+# before the two-line header, and the writer must migrate it.
+LEGACY_HEADER = (
     "# Copyright 2024-2026 Agentics Transformation Ltd\n"
     "#\n"
     '# Licensed under the Apache License, Version 2.0 (the "License");\n'
@@ -64,37 +56,59 @@ TRUNCATED_AT_URL = (
     "# You may obtain a copy of the License at\n"
     "#\n"
     "#     http://www.apache.org/licenses/LICENSE-2.0\n"
-)
-
-TRUNCATED_EARLY = (
-    "# Copyright 2024-2026 Agentics Transformation Ltd\n"
     "#\n"
-    '# Licensed under the Apache License, Version 2.0 (the "License");\n'
-    "# you may not use this file except in compliance with the License.\n"
+    "# Unless required by applicable law or agreed to in writing, software\n"
+    '# distributed under the License is distributed on an "AS IS" BASIS,\n'
+    "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n"
+    "# See the License for the specific language governing permissions and\n"
+    "# limitations under the License.\n"
 )
 
+COPYRIGHT_LINE = "# Copyright 2025 Agentics Transformation Limited\n"
+SPDX_LINE = "# SPDX-License-Identifier: Apache-2.0\n"
 
-# ── The checker validates the WHOLE boilerplate ────────────────────────────
+
+# ── The checker requires the exact two-line header ─────────────────────────
+
+
+def test_writer_template_is_the_two_line_header():
+    assert FULL_HEADER == COPYRIGHT_LINE + SPDX_LINE
 
 
 def test_complete_header_passes():
     assert checker.missing_header_parts(FULL_HEADER + '\n"""Module."""\n') == []
 
 
-@pytest.mark.parametrize(
-    "header,label",
-    [(TRUNCATED_AT_URL, "cut after the LICENSE-2.0 URL"), (TRUNCATED_EARLY, "cut mid-grant")],
-)
-def test_truncated_header_is_rejected(header, label):
-    """Both real-world truncation shapes must fail — they passed the old
-    copyright-token-only check, which is how 346 files drifted."""
-    missing = checker.missing_header_parts(header + '\n"""Module."""\n')
-    assert missing, f"truncated header ({label}) slipped through the gate"
-    assert "limitations under the License." in missing
+def test_missing_copyright_line_is_rejected():
+    missing = checker.missing_header_parts(SPDX_LINE + '\n"""Module."""\n')
+    assert checker.REQUIRED_HEADER_TOKEN in missing
 
 
-def test_missing_copyright_is_rejected():
+def test_missing_spdx_line_is_rejected():
+    missing = checker.missing_header_parts(COPYRIGHT_LINE + '\n"""Module."""\n')
+    assert missing == ["SPDX-License-Identifier: Apache-2.0"]
+
+
+def test_no_header_is_rejected():
     assert checker.REQUIRED_HEADER_TOKEN in checker.missing_header_parts('"""No header."""\n')
+
+
+@pytest.mark.parametrize(
+    "bad_copyright",
+    [
+        "# Copyright 2025 Agentics Transformation Ltd\n",  # wrong holder spelling
+        "# Copyright 2024-2026 Agentics Transformation Limited\n",  # wrong year
+    ],
+)
+def test_wrong_holder_or_year_is_rejected(bad_copyright):
+    missing = checker.missing_header_parts(bad_copyright + SPDX_LINE + '\n"""M."""\n')
+    assert checker.REQUIRED_HEADER_TOKEN in missing
+
+
+def test_legacy_boilerplate_is_rejected():
+    """The old 14-line block (2024-2026, Ltd) no longer satisfies the gate."""
+    missing = checker.missing_header_parts(LEGACY_HEADER + '\n"""Module."""\n')
+    assert checker.REQUIRED_HEADER_TOKEN in missing
 
 
 def test_shebang_and_encoding_do_not_break_detection():
@@ -103,9 +117,9 @@ def test_shebang_and_encoding_do_not_break_detection():
 
 
 def test_reflowed_whitespace_is_tolerated():
-    """Comparison collapses whitespace, so re-indenting the block is fine —
-    only genuinely absent clauses fail."""
-    text = FULL_HEADER.replace("#     http://", "#   http://")
+    """Comparison collapses whitespace, so re-spacing the header is fine —
+    only genuinely absent lines fail."""
+    text = FULL_HEADER.replace("# SPDX-License-Identifier:", "#   SPDX-License-Identifier:")
     assert checker.missing_header_parts(text) == []
 
 
@@ -118,11 +132,31 @@ def test_writer_output_satisfies_the_checker():
     assert checker.missing_header_parts(FULL_HEADER + '\n"""M."""\n') == []
 
 
-def test_writer_completes_a_truncated_header():
-    content = TRUNCATED_AT_URL + '\n"""Module."""\n'
-    fixed = writer.add_header(writer.remove_header(content), FULL_HEADER)
-    assert checker.missing_header_parts(fixed) == []
-    assert '"""Module."""' in fixed
+def test_writer_migrates_the_legacy_header(tmp_path):
+    """The old 14-line block is replaced by exactly the two-line header, with
+    the shebang, encoding line and code untouched; a second pass is a no-op."""
+    target = tmp_path / "legacy.py"
+    body = '"""Module."""\n\nCODE = 42\n'
+    prefix = "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n"
+    target.write_text(prefix + LEGACY_HEADER + "\n" + body, encoding="utf-8")
+
+    assert checker.missing_header_parts(target.read_text(encoding="utf-8"))
+    assert writer.process_file(target, FULL_HEADER) == "replaced"
+    migrated = target.read_text(encoding="utf-8")
+
+    assert migrated == prefix + FULL_HEADER + "\n" + body
+    assert checker.missing_header_parts(migrated) == []
+
+    assert writer.process_file(target, FULL_HEADER) == "skipped"
+    assert target.read_text(encoding="utf-8") == migrated
+
+
+def test_writer_adds_the_header_to_a_bare_file(tmp_path):
+    target = tmp_path / "bare.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+
+    assert writer.process_file(target, FULL_HEADER) == "added"
+    assert target.read_text(encoding="utf-8") == FULL_HEADER + "\nVALUE = 1\n"
 
 
 def test_writer_is_idempotent_on_a_compliant_file(tmp_path):
@@ -142,7 +176,7 @@ def test_writer_is_idempotent_on_a_compliant_file(tmp_path):
 
 def test_writer_preserves_shebang_and_code(tmp_path):
     target = tmp_path / "script.py"
-    target.write_text("#!/usr/bin/env python3\n" + TRUNCATED_AT_URL + "\nCODE = 42\n", "utf-8")
+    target.write_text("#!/usr/bin/env python3\n" + LEGACY_HEADER + "\nCODE = 42\n", "utf-8")
 
     writer.process_file(target, FULL_HEADER)
     result = target.read_text(encoding="utf-8")

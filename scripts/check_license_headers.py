@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
-# Copyright 2024-2026 Agentics Transformation Ltd
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
 
 """Check license headers on tracked Python files.
 
-Validates the WHOLE Apache-2.0 boilerplate, not just the copyright line.
-Checking only the copyright token let 346 files drift to a header truncated
-mid-boilerplate — 323 cut after the LICENSE-2.0 URL and 23 cut right after
-"you may not use this file…" — dropping the warranty and liability
-disclaimer that Apache-2.0's appendix asks to be attached. Every one of
-them passed the old check, and `add_license_headers.py` (which writes the
-complete block) rewrote all 346 on any run, so the two scripts disagreed
-about what "has a header" means. They now share one definition.
+The header is the two-line REUSE-style form: a copyright notice plus an
+``SPDX-License-Identifier: Apache-2.0`` line (REUSE spec 3.3; the ASF also
+accepts an SPDX header form in place of the long boilerplate). The Apache-2.0
+terms, warranty disclaimer included (sections 7-8), bind through the LICENSE
+file regardless of what the header says, so the per-file block only has to
+name the holder and the license.
+
+The year is one fixed value, so the header never needs a yearly bump. The
+holder is spelled as in LICENSE, NOTICE and pyproject.toml, and the check pins
+holder AND year rather than any "Copyright" line, so a misspelt entity cannot
+creep back in (the license files once carried "Pty Ltd"). The legacy 14-line
+boilerplate (with the old "2024-2026 ... Ltd" notice) fails the check;
+running ``add_license_headers.py`` migrates it. The writer and this checker
+share one definition of a valid header; tests/test_license_headers.py pins
+that.
 """
 
 from __future__ import annotations
@@ -31,7 +27,7 @@ import subprocess
 from pathlib import Path
 from typing import Iterable
 
-REQUIRED_HEADER_TOKEN = "Copyright 2024-2026"
+REQUIRED_HEADER_TOKEN = "Copyright 2025 Agentics Transformation Limited"
 EXCLUDED_PREFIXES = (
     "examples/",
     # Vendored, generated upstream, and byte-identical across every repo that
@@ -44,27 +40,16 @@ EXCLUDED_PREFIXES = (
     "tools/product_guardrail/",
 )
 
-# Every substantive line of the Apache-2.0 boilerplate. Matched
-# whitespace-insensitively against the file preamble so a reflowed comment
-# or an extra leading blank line doesn't fail the gate, while a genuinely
-# truncated block does. Keep in sync with the ``apache2`` template in
-# scripts/add_license_headers.py — tests/test_license_headers.py pins that
-# the writer's output satisfies this checker.
-REQUIRED_HEADER_LINES = (
-    'Licensed under the Apache License, Version 2.0 (the "License");',
-    "you may not use this file except in compliance with the License.",
-    "You may obtain a copy of the License at",
-    "http://www.apache.org/licenses/LICENSE-2.0",
-    "Unless required by applicable law or agreed to in writing, software",
-    'distributed under the License is distributed on an "AS IS" BASIS,',
-    "WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.",
-    "See the License for the specific language governing permissions and",
-    "limitations under the License.",
-)
+# Every further line the header must carry. Matched whitespace-insensitively
+# against the file preamble so a reflowed comment or an extra leading blank line
+# doesn't fail the gate. Keep in sync with the ``apache2`` template in
+# scripts/add_license_headers.py; tests/test_license_headers.py pins that the
+# writer's output satisfies this checker.
+REQUIRED_HEADER_LINES = ("SPDX-License-Identifier: Apache-2.0",)
 
-# The boilerplate is 14 lines; allow room for a shebang, an encoding
-# declaration, and blank lines before giving up.
-HEADER_PREAMBLE_LINES = 25
+# The header is two lines; allow room for a shebang, an encoding declaration,
+# and blank lines before giving up.
+HEADER_PREAMBLE_LINES = 10
 
 
 def tracked_python_files(repo_root: Path) -> list[Path]:
@@ -93,9 +78,9 @@ def files_requiring_headers(paths: Iterable[Path], repo_root: Path) -> list[Path
 def missing_header_parts(text: str) -> list[str]:
     """Return the required header pieces absent from ``text``'s preamble.
 
-    Empty list means the file carries the complete boilerplate. Comparison
+    Empty list means the file carries the complete two-line header. Comparison
     collapses whitespace so comment reflowing doesn't matter, but a missing
-    clause does.
+    line, wrong holder or wrong year does.
     """
     preamble = "\n".join(text.splitlines()[:HEADER_PREAMBLE_LINES])
     normalized = " ".join(preamble.split())
@@ -109,7 +94,7 @@ def missing_header_parts(text: str) -> list[str]:
 
 
 def has_required_header(path: Path) -> bool:
-    """Check the file preamble for the complete Apache-2.0 boilerplate."""
+    """Check the file preamble for the copyright line and the SPDX identifier."""
     return not missing_header_parts(path.read_text(encoding="utf-8", errors="ignore"))
 
 
