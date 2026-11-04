@@ -77,7 +77,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, List, Mapping, Optional
+from typing import Any, Callable, List, Literal, Mapping, Optional
 from urllib.parse import urlsplit
 
 from fluid_build._errors import FluidUserError, doc_url
@@ -127,6 +127,105 @@ def _on_allowlist(host: str, suffixes: List[str]) -> bool:
     return False
 
 
+VerdictCode = Literal["missing", "scheme", "no-host", "link-local", "mixed", "public"]
+
+
+@dataclass(frozen=True)
+class HostVerdict:
+    """Why the policy refuses a URL, without wording.
+
+    Each caller phrases ``code`` for its own case, so the decision has one home
+    and only the message differs. ``pinned`` is the address a request was
+    pinned to, when that address and not the name decided.
+    """
+
+    code: VerdictCode
+    host: Optional[str] = None
+    scheme: str = ""
+    pinned: Optional[str] = None
+
+
+def host_verdict(
+    url: Optional[str],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    operator_supplied: bool = False,
+) -> Optional[HostVerdict]:
+    """The policy's decision for ``url``: ``None`` when it may be used.
+
+    :func:`host_refusal` words it for an acquisition orchestrator; the managed
+    Flink lane words it for an Iceberg catalog (``streaming/policy.py``).
+    """
+    if not url or not str(url).strip():
+        return HostVerdict("missing")
+    try:
+        parts = urlsplit(str(url).strip())
+        host = parts.hostname
+    except ValueError:  # an unbalanced "[" in the netloc: no host can be read from it
+        return HostVerdict("no-host")
+    scheme = (parts.scheme or "").lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        return HostVerdict("scheme", scheme=scheme)
+    if not host:
+        return HostVerdict("no-host", scheme=scheme)
+    # First, and not overridable: this is where instance metadata lives, and no
+    # orchestrator is ever legitimately there.
+    if _hostname_is_link_local(host):
+        return HostVerdict("link-local", host, scheme)
+    if operator_supplied or _on_allowlist(host, allowlist(environ)):
+        return None
+    scope = hostname_scope(host)
+    if scope == "non_public":
+        return None
+    if scope == "mixed":
+        return HostVerdict("mixed", host, scheme)
+    if scope == "unresolved":
+        # Not this gate's refusal to make. A name that does not resolve cannot
+        # receive anything, and refusing it here turns "that host is not
+        # running" into a security error. Note what this does NOT buy: both
+        # clients pass the URL to safe_httpx_client, whose resolve_and_validate
+        # raises UnsafeURLError("cannot resolve hostname") at construction, so
+        # an unresolvable host is still refused -- by the transport layer, with
+        # an accurate message. This branch matters for a caller that reaches the
+        # policy without that layer, and for the resolve-later race that
+        # request_guard closes.
+        return None
+    return HostVerdict("public", host, scheme)
+
+
+def pinned_verdict(
+    url: Optional[str],
+    pinned: Optional[str],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    operator_supplied: bool = False,
+) -> Optional[HostVerdict]:
+    """The decision for the address a request is actually pinned to.
+
+    A request hook added to ``safe_httpx_client`` runs after its pinning hook,
+    which has replaced the hostname with the IP the connection will use.
+    Judging that IP closes two gaps that resolving the name again leaves open:
+    DNS rebinding between the two lookups, and a parser differential, where
+    ``socket.getaddrinfo`` encodes ``faß.de`` as IDNA2003 ``fass.de`` while
+    httpx resolves IDNA2008 ``xn--fa-hia.de``. The name ``url`` carries still
+    decides the allowlist; the pinned address decides the scope. A refusal
+    names both, because the name is what an allowlist entry would list.
+    """
+    if not pinned:
+        return HostVerdict("no-host")
+    try:
+        host = urlsplit(str(url or "").strip()).hostname
+    except ValueError:
+        host = None
+    if _hostname_is_link_local(pinned):
+        return HostVerdict("link-local", host or pinned, pinned=pinned)
+    if operator_supplied or (host and _on_allowlist(host, allowlist(environ))):
+        return None
+    if hostname_scope(pinned) == "non_public":
+        return None
+    return HostVerdict("public", host or pinned, pinned=pinned)
+
+
 def host_refusal(
     url: Optional[str],
     *,
@@ -149,52 +248,32 @@ def host_refusal(
     ``fluid import airbyte --server-url https://...`` did when this check was
     first written. The scheme and metadata-address rules still apply, because
     neither is ever what an operator meant."""
-    if not url or not str(url).strip():
+    verdict = host_verdict(url, environ=environ, operator_supplied=operator_supplied)
+    if verdict is None:
+        return None
+    if verdict.code == "missing":
         return "no deployment.server_url is configured"
-    parts = urlsplit(str(url).strip())
-    scheme = (parts.scheme or "").lower()
-    if scheme not in _ALLOWED_SCHEMES:
+    if verdict.code == "scheme":
         return (
-            f"its scheme is {scheme or 'missing'}; the {engine} orchestrator must be an "
+            f"its scheme is {verdict.scheme or 'missing'}; the {engine} orchestrator must be an "
             "http:// or https:// URL"
         )
-    try:
-        host = parts.hostname
-    except ValueError:
-        host = None
-    if not host:
+    if verdict.code == "no-host":
         return "it has no host"
-    # First, and not overridable: this is where instance metadata lives, and no
-    # orchestrator is ever legitimately there.
-    if _hostname_is_link_local(host):
+    host = verdict.host
+    if verdict.code == "link-local":
         return (
             f"host {host!r} is link-local or unspecified, where cloud instance metadata "
             "lives; no orchestrator is there, and this is refused even with an allowlist "
             "entry"
         )
-    if operator_supplied or _on_allowlist(host, allowlist(environ)):
-        return None
-    scope = hostname_scope(host)
-    if scope == "non_public":
-        return None
-    if scope == "mixed":
+    if verdict.code == "mixed":
         return (
             f"host {host!r} resolves to both public and non-public addresses, and the "
             "connection is pinned to a public one. One private record beside a public "
             "one is how an unnamed host is made to look internal, so a mixed answer "
             "needs an allowlist entry like any other public host"
         )
-    if scope == "unresolved":
-        # Not this gate's refusal to make. A name that does not resolve cannot
-        # receive anything, and refusing it here turns "that host is not
-        # running" into a security error. Note what this does NOT buy: both
-        # clients pass the URL to safe_httpx_client, whose resolve_and_validate
-        # raises UnsafeURLError("cannot resolve hostname") at construction, so
-        # an unresolvable host is still refused -- by the transport layer, with
-        # an accurate message. This branch matters for a caller that reaches the
-        # policy without that layer, and for the resolve-later race that
-        # request_guard closes.
-        return None
     return (
         f"host {host!r} is public, and the config posted to it carries the source "
         "credential in clear text"
@@ -218,8 +297,13 @@ def refuse_unless_host_allowed(
     refusal = host_refusal(url, engine=engine, environ=environ, operator_supplied=operator_supplied)
     if refusal is None:
         return str(url).strip()
+    raise _host_error(refusal, engine=engine, operator_supplied=operator_supplied)
+
+
+def _host_error(refusal: str, *, engine: str, operator_supplied: bool) -> DeploymentHostError:
+    """The :class:`DeploymentHostError` for ``refusal``, worded for whoever chose the URL."""
     if operator_supplied:
-        raise DeploymentHostError(
+        return DeploymentHostError(
             what=f"the {engine} endpoint given on the command line cannot be used",
             why=f"Refused because {refusal}.",
             fix=(
@@ -229,7 +313,7 @@ def refuse_unless_host_allowed(
             ),
             doc=doc_url(),
         )
-    raise DeploymentHostError(
+    return DeploymentHostError(
         what=f"the {engine} orchestrator may not receive this product's credential",
         why=(
             f"forge-cli hands the whole connector config -- the resolved source password "
@@ -248,24 +332,58 @@ def refuse_unless_host_allowed(
     )
 
 
+def _pinned_refusal(verdict: HostVerdict) -> str:
+    """:func:`host_refusal`'s words for a :func:`pinned_verdict`, naming both.
+
+    The host is what an allowlist entry would list. The address is where the
+    connection was going, and the only part that tells a rebinding answer from
+    a host that really is public.
+    """
+    if verdict.code == "no-host":
+        return "it has no host"
+    named = f"host {verdict.host!r}"
+    if verdict.pinned and verdict.pinned != verdict.host:
+        named += f", connecting to {verdict.pinned!r},"
+    if verdict.code == "link-local":
+        return (
+            f"{named} is link-local or unspecified, where cloud instance metadata lives; "
+            "no orchestrator is there, and this is refused even with an allowlist entry"
+        )
+    return (
+        f"{named} is public, and the config posted to it carries the source credential "
+        "in clear text"
+    )
+
+
 def request_guard(
     url: Optional[str], *, engine: str, operator_supplied: bool = False
 ) -> Callable[[Any], None]:
-    """An httpx request hook that re-applies the policy to ``url``'s host.
+    """An httpx request hook that judges the address the request is pinned to.
 
     The authoritative check. :func:`host_refusal` runs once at construction to
     fail fast, but its verdict on a host that did not resolve yet is "allow",
     so the policy has to be asked again when the request actually goes out --
     by then the name resolves or the request fails on its own.
 
-    It closes over the URL given at construction rather than reading
-    ``request.url``, because ``safe_httpx_client`` inserts its DNS-pinning hook
-    ahead of this one and that hook rewrites the URL to the pinned IP. The
-    hostname is what an allowlist entry names, so the original is what must be
-    judged.
+    ``safe_httpx_client`` inserts its DNS-pinning hook ahead of this one, and
+    that hook rewrites ``request.url`` to the IP the connection will use. This
+    judges that IP rather than resolving the name again: a second lookup can
+    disagree with the first (DNS rebinding) or encode a non-ASCII name
+    differently (Python's IDNA2003 against httpx's IDNA2008). The name in
+    ``url``, closed over at construction, is still checked as it was there and
+    still decides the allowlist, because the hostname is what an entry names.
     """
 
-    def _guard(request: Any) -> None:  # pragma: no cover - exercised via the clients
+    def _guard(request: Any) -> None:
         refuse_unless_host_allowed(url, engine=engine, operator_supplied=operator_supplied)
+        verdict = pinned_verdict(
+            url,
+            getattr(getattr(request, "url", None), "host", None),
+            operator_supplied=operator_supplied,
+        )
+        if verdict is not None:
+            raise _host_error(
+                _pinned_refusal(verdict), engine=engine, operator_supplied=operator_supplied
+            )
 
     return _guard
