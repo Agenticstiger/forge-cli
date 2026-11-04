@@ -146,10 +146,11 @@ class _ProviderMap(dict):
             if not is_allowed(name):
                 # Checked again before the import: a blocklist loaded after
                 # discovery (FLUID_SECRETS_FILE at apply time) must not run the
-                # plugin's code, not merely leave it unserved.
-                self._pending.pop(name, None)
+                # plugin's code, not merely leave it unserved. The entry stays
+                # declared, so the policy of the moment decides each lookup.
                 POLICY_BLOCKED.add(name)
                 return
+            POLICY_BLOCKED.discard(name)
             _RESOLVING.add(name)
             try:
                 obj = pend.load()

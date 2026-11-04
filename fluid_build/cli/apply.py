@@ -1361,6 +1361,17 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
         name = named[0] if named else name
     if name == "local":
         unsupported += [f"{w}: {n}" for w, n, outside in runs if not outside and not _served(n)]
+    # A platform the plugin policy removed is left to build_provider only when it
+    # is the provider chosen; handed to another one it would land as that
+    # provider's placeholder file.
+    unsupported += [
+        f"{w}: {n} (blocked by FLUID_PLUGINS_ALLOWLIST/BLOCKLIST)"
+        for w, n, outside in lands
+        if not outside
+        and n != name
+        and n in registry.POLICY_BLOCKED
+        and registry.PROVIDERS.get(n) is None
+    ]
     if unsupported:
         shown = ", ".join(unsupported[:_PLATFORMS_SHOWN])
         if len(unsupported) > _PLATFORMS_SHOWN:

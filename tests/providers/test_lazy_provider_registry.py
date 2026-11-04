@@ -32,7 +32,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib  # type: ignore[no-redef]
 
 from fluid_build import providers as P
 from fluid_build.cli import main
@@ -130,20 +134,27 @@ class _EPs:
         return self.select(group) or list(default)
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def _restore_registry():
+    # Every test here rewrites the process-wide registry; put all of it back, or
+    # later tests (here and in tests/cli) see this one's blocks and failures.
     before = P.PROVIDERS.copy()
     blocked = set(P.POLICY_BLOCKED)
-    done = P._DISCOVERY_DONE
+    failures = dict(P.LOAD_FAILURES)
+    errors = list(P.DISCOVERY_ERRORS)
+    done, attempts = P._DISCOVERY_DONE, P._DISCOVERY_ATTEMPTS
     meta = dict(P._REGISTRY_META)
     yield
     P.PROVIDERS.clear()
     P.PROVIDERS.update(before)
     P.POLICY_BLOCKED.clear()
     P.POLICY_BLOCKED.update(blocked)
+    P.LOAD_FAILURES.clear()
+    P.LOAD_FAILURES.update(failures)
+    P.DISCOVERY_ERRORS[:] = errors
     P._REGISTRY_META.clear()
     P._REGISTRY_META.update(meta)
-    P._DISCOVERY_DONE = done
+    P._DISCOVERY_DONE, P._DISCOVERY_ATTEMPTS = done, attempts
 
 
 @pytest.mark.parametrize("name", sorted(_BUILTINS))
@@ -450,10 +461,11 @@ def test_code_cannot_take_a_builtin_name_before_discovery(name, caplog, _restore
 
 
 def test_a_class_that_only_claims_an_in_tree_module_is_refused(_restore_registry):
+    # Imported first: its own import registers the real class, which is not the point here.
+    importlib.import_module("fluid_build.providers.gcp")
     P.PROVIDERS.clear()
     fake = _evil_class("fluid_build.providers.gcp")
     fake.__qualname__ = "GcpProvider"
-    importlib.import_module("fluid_build.providers.gcp")  # the real class is now a module attribute
 
     P.register_provider("gcp", fake)
     assert not P.PROVIDERS.is_loaded("gcp")
