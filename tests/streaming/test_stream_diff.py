@@ -40,12 +40,9 @@ def _stream(contract):
     return contract["builds"][0]["properties"]["stream"]
 
 
-_NEW: list = []
-
-
-def _registry(stream, url):
-    """The contract being mutated also names the registry its new format needs."""
-    _NEW[-1]["builds"][0]["properties"]["parameters"]["flink"]["source"]["schemaRegistryUrl"] = url
+def _registry(contract, url):
+    """The registry the avro-confluent format needs."""
+    contract["builds"][0]["properties"]["parameters"]["flink"]["source"]["schemaRegistryUrl"] = url
 
 
 def _kinds(baseline, new):
@@ -62,44 +59,49 @@ def test_an_unchanged_stream_reports_nothing(baseline):
 @pytest.mark.parametrize(
     "mutate,expected",
     [
-        (lambda s: s.update(topic="orders-v2"), ("stream_topic_changed", "breaking")),
+        (lambda s, c: s.update(topic="orders-v2"), ("stream_topic_changed", "breaking")),
         (
-            lambda s: s.update(format="avro-confluent") or _registry(s, "https://registry.example"),
+            lambda s, c: s.update(format="avro-confluent")
+            or _registry(c, "https://registry.example"),
             ("stream_format_changed", "breaking"),
         ),
         # The job stops reading a field: an output still reading it would fail validate.
-        (lambda s: s["schema"].pop(), ("stream_field_removed", "non_breaking")),
+        (lambda s, c: s["schema"].pop(), ("stream_field_removed", "non_breaking")),
         (
-            lambda s: s["schema"].append({"name": "channel", "type": "string"}),
+            lambda s, c: s["schema"].append({"name": "channel", "type": "string"}),
             ("stream_field_added", "non_breaking"),
         ),
         (
-            lambda s: s["schema"].append({"name": "channel", "type": "string", "required": True}),
+            lambda s, c: s["schema"].append(
+                {"name": "channel", "type": "string", "required": True}
+            ),
             ("stream_field_added", "breaking"),
         ),
         (
-            lambda s: s["schema"][-1].update(type="long"),
+            lambda s, c: s["schema"][-1].update(type="long"),
             ("stream_column_type_widened", "non_breaking"),
         ),
-        (lambda s: s["schema"][-2].update(type="int"), ("stream_column_type_changed", "breaking")),
         (
-            lambda s: s["schema"][-2].update(required=True),
+            lambda s, c: s["schema"][-2].update(type="int"),
+            ("stream_column_type_changed", "breaking"),
+        ),
+        (
+            lambda s, c: s["schema"][-2].update(required=True),
             ("stream_nullable_tightened", "breaking"),
         ),
         (
-            lambda s: s["schema"][1]["fields"].append({"name": "tier", "type": "string"}),
+            lambda s, c: s["schema"][1]["fields"].append({"name": "tier", "type": "string"}),
             ("stream_field_added", "non_breaking"),
         ),
         (
-            lambda s: s.update(metadata=[{"name": "kafka_offset", "from": "offset"}]),
+            lambda s, c: s.update(metadata=[{"name": "kafka_offset", "from": "offset"}]),
             None,
         ),
     ],
 )
 def test_reader_schema_rules(baseline, mutate, expected):
     new = copy.deepcopy(baseline)
-    _NEW.append(new)
-    mutate(_stream(new))
+    mutate(_stream(new), new)
     kinds = _kinds(baseline, new)
     assert kinds == ({expected} if expected else set()), kinds
 
@@ -109,7 +111,7 @@ def test_a_nested_change_names_its_path(baseline):
     _stream(new)["schema"][1]["fields"].append({"name": "tier", "type": "string"})
     (change,) = diff_streams(baseline, new)
     assert change.path == "builds[0].properties.stream.schema.customer.fields.tier"
-    assert "the job now reads 'customer.fields.tier'" in change.description
+    assert "the job now reads 'customer.tier'" in change.description
 
 
 def test_key_metadata_explode_and_sources(baseline):
@@ -140,21 +142,81 @@ def test_key_metadata_explode_and_sources(baseline):
     assert _kinds(rows, moved) == {("stream_column_source_changed", "non_breaking")}
 
 
-def test_builds_without_a_stream_are_left_alone(baseline):
+def test_a_renamed_build_is_a_new_build(baseline):
     other = copy.deepcopy(baseline)
     other["builds"][0]["id"] = "renamed"
     assert diff_streams(baseline, other) == []
+    # Renaming it is no way to slip its own SQL past review.
+    other["builds"][0]["properties"]["sql"] = "SELECT * FROM lake.hr.pay"
+    (change,) = diff_streams(baseline, other)
+    assert (change.kind, change.severity) == ("stream_contract_sql_added", "breaking")
+    assert "new build 'renamed'" in change.description
 
 
-def test_a_build_that_runs_its_own_sql_is_reported(baseline):
-    def sql(contract, text):
-        new = copy.deepcopy(contract)
-        new["builds"][0]["properties"]["sql"] = text
-        return new
+def test_a_build_without_a_stream_on_either_side_is_left_alone(baseline):
+    other = copy.deepcopy(baseline)
+    for contract in (baseline, other):
+        contract["builds"][0]["properties"].pop("stream")
+    other["builds"][0]["properties"]["sql"] = "SELECT 2"
+    assert diff_streams(baseline, other) == []
 
-    reading = sql(baseline, "SELECT * FROM source_events")
-    widened = sql(baseline, "SELECT * FROM source_events UNION ALL SELECT * FROM lake.hr.pay")
-    assert _kinds(baseline, reading) == {("stream_contract_sql_added", "breaking")}
-    assert _kinds(reading, widened) == {("stream_contract_sql_changed", "breaking")}
-    assert _kinds(widened, baseline) == {("stream_contract_sql_removed", "non_breaking")}
-    assert _kinds(reading, sql(baseline, "  SELECT * FROM source_events\n")) == set()
+
+def test_a_stream_declared_or_dropped_is_reported(baseline):
+    without = copy.deepcopy(baseline)
+    without["builds"][0]["properties"].pop("stream")
+    (dropped,) = diff_streams(baseline, without)
+    assert (dropped.kind, dropped.severity) == ("stream_dropped", "info")
+    (declared,) = diff_streams(without, baseline)
+    assert (declared.kind, declared.severity) == ("stream_declared", "info")
+
+
+def test_key_schema_explode_removal_and_casts_are_reported(baseline):
+    _stream(baseline)["key"] = {"format": "raw", "schema": [{"name": "k", "type": "string"}]}
+    keyed = copy.deepcopy(baseline)
+    _stream(keyed)["key"]["schema"][0]["type"] = "binary"
+    assert _kinds(baseline, keyed) == {("stream_column_type_changed", "breaking")}
+
+    rows = copy.deepcopy(baseline)
+    rows["builds"][0]["properties"]["mapping"] = {
+        "explode": {"path": "items", "as": "item"},
+        "columns": [{"name": "sku", "from": "item.sku"}],
+    }
+    rows["exposes"][0]["contract"]["schema"] = [
+        {"name": "event_id", "type": "string", "required": True},
+        {"name": "sku", "type": "string"},
+    ]
+    flat = copy.deepcopy(rows)
+    flat["builds"][0]["properties"].pop("mapping")
+    flat["exposes"][0]["contract"]["schema"] = [
+        {"name": "event_id", "type": "string", "required": True}
+    ]
+    assert ("stream_explode_changed", "breaking") in _kinds(rows, flat)
+
+    cast = copy.deepcopy(baseline)
+    _stream(cast)["metadata"] = [{"name": "kafka_headers", "from": "headers"}]
+    cast["builds"][0]["properties"]["mapping"] = {
+        "columns": [{"name": "trace", "from": "kafka_headers['trace']"}]
+    }
+    cast["exposes"][0]["contract"]["schema"].append({"name": "trace", "type": "binary"})
+    converted = copy.deepcopy(cast)
+    converted["builds"][0]["properties"]["mapping"]["columns"][0]["cast"] = "string"
+    converted["exposes"][0]["contract"]["schema"][-1]["type"] = "string"
+    (source,) = [
+        c for c in diff_streams(cast, converted) if c.kind.startswith("stream_column_source")
+    ]
+    assert source.after == "kafka_headers['trace'] as string"
+
+
+def test_a_build_that_gains_its_stream_and_new_sql_in_one_edit_is_reported(baseline):
+    # The base branch's managed shape had no stream; migrating to it is one edit,
+    # and so is switching to SQL that reads other tables in the same edit.
+    old = copy.deepcopy(baseline)
+    old["builds"][0]["properties"].pop("stream")
+    old["builds"][0]["properties"]["sql"] = "SELECT * FROM source_events"
+    new = copy.deepcopy(baseline)
+    new["builds"][0]["properties"]["sql"] = "SELECT * FROM lake.hr.salaries"
+    kinds = {(c.kind, c.severity) for c in diff_streams(old, new)}
+    assert kinds == {("stream_contract_sql_changed", "breaking"), ("stream_declared", "info")}
+    old["builds"][0]["properties"].pop("sql")
+    kinds = {(c.kind, c.severity) for c in diff_streams(old, new)}
+    assert kinds == {("stream_contract_sql_added", "breaking"), ("stream_declared", "info")}

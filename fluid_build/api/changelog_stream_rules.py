@@ -37,14 +37,28 @@ from .changelog_rules import _diff_nested_fields
 from .changelog_types import Change
 
 
-def _streams(contract: Mapping[str, Any]) -> Dict[str, Tuple[int, Mapping[str, Any]]]:
-    """``{build id: (index, properties)}`` for every build that declares a stream."""
+def _builds(contract: Mapping[str, Any]) -> Dict[str, Tuple[int, Mapping[str, Any]]]:
+    """``{build id: (index, properties)}`` for every build with properties."""
     found: Dict[str, Tuple[int, Mapping[str, Any]]] = {}
     for i, build in enumerate(contract.get("builds") or []):
         props = build.get("properties") if isinstance(build, Mapping) else None
-        if isinstance(props, Mapping) and isinstance(props.get("stream"), Mapping):
+        if isinstance(props, Mapping):
             found[str(build.get("id"))] = (i, props)
     return found
+
+
+def _has_stream(props: Mapping[str, Any]) -> bool:
+    return isinstance(props.get("stream"), Mapping)
+
+
+def _label(relative: str) -> str:
+    """A schema path as a reader names it: ``customer.id``, ``items[].price``."""
+    for suffix in (".type", ".required", ".nullable"):
+        if relative.endswith(suffix):
+            relative = relative[: -len(suffix)]
+    for raw, shown in ((".element", "[]"), (".key", "{key}"), (".value", "{value}")):
+        relative = relative.replace(raw, shown)
+    return relative.replace(".fields.", ".")
 
 
 def _fields(stream: Mapping[str, Any], *keys: str) -> List[Mapping[str, Any]]:
@@ -58,7 +72,7 @@ def _reader_changes(changes: List[Change], prefix: str) -> List[Change]:
     """The column rules' findings, restated for a schema the job reads."""
     out: List[Change] = []
     for change in changes:
-        field = change.path[len(prefix) + 1 :]
+        field = _label(change.path[len(prefix) + 1 :])
         kind = "stream_" + change.kind.removeprefix("nested_")
         severity = change.severity
         if change.kind == "nested_field_removed":
@@ -90,10 +104,12 @@ def _reader_changes(changes: List[Change], prefix: str) -> List[Change]:
 
 
 def _sources(props: Mapping[str, Any]) -> Dict[str, str]:
+    """``{output: source}``, a conversion included: ``kafka_headers['trace-id'] as string``."""
     mapping = props.get("mapping")
     columns = mapping.get("columns") if isinstance(mapping, Mapping) else None
     return {
         str(entry.get("name")): str(entry.get("from"))
+        + (f" as {entry['cast']}" if entry.get("cast") is not None else "")
         for entry in columns or []
         if isinstance(entry, Mapping)
     }
@@ -110,14 +126,95 @@ def _explode(props: Mapping[str, Any]) -> Optional[str]:
     return str(explode.get("path")) if isinstance(explode, Mapping) else None
 
 
+def _sql_change(
+    build_id: str, index: int, base_props: Mapping[str, Any], new_props: Mapping[str, Any]
+) -> Optional[Change]:
+    """A build's own SQL added, changed or removed: what it reads is the reviewer's call."""
+    old_sql, new_sql = _sql(base_props), _sql(new_props)
+    if old_sql == new_sql:
+        return None
+    if old_sql is None:
+        kind, severity, text = (
+            "stream_contract_sql_added",
+            "breaking",
+            f"build '{build_id}' runs SQL written in the contract: it can read any table the "
+            "job's catalog identity can",
+        )
+    elif new_sql is None:
+        kind, severity, text = (
+            "stream_contract_sql_removed",
+            "non_breaking",
+            f"build '{build_id}' reads the stream through its mapping instead of its own SQL",
+        )
+    else:
+        kind, severity, text = (
+            "stream_contract_sql_changed",
+            "breaking",
+            f"build '{build_id}' runs different SQL written in the contract: review what it "
+            "now reads",
+        )
+    return Change(
+        path=f"builds[{index}].properties.sql",
+        kind=kind,
+        severity=severity,
+        description=text,
+        before=old_sql,
+        after=new_sql,
+    )
+
+
 def diff_streams(baseline: Mapping[str, Any], new: Mapping[str, Any]) -> List[Change]:
     """Classify changes to the stream every build present in both contracts reads."""
-    base_streams = _streams(baseline)
-    new_streams = _streams(new)
+    base_builds = _builds(baseline)
+    new_builds = _builds(new)
     changes: List[Change] = []
-    for build_id in sorted(base_streams.keys() & new_streams.keys()):
-        _, base_props = base_streams[build_id]
-        index, new_props = new_streams[build_id]
+    # A build the baseline does not have (or had under another id) that runs its own
+    # SQL over a stream: what it reads is the reviewer's to check.
+    for build_id in sorted(new_builds.keys() - base_builds.keys()):
+        index, props = new_builds[build_id]
+        if _has_stream(props) and _sql(props) is not None:
+            changes.append(
+                Change(
+                    path=f"builds[{index}].properties.sql",
+                    kind="stream_contract_sql_added",
+                    severity="breaking",
+                    description=(
+                        f"new build '{build_id}' runs SQL written in the contract: it can read "
+                        "any table the job's catalog identity can"
+                    ),
+                    before=None,
+                    after=_sql(props),
+                )
+            )
+    for build_id in sorted(base_builds.keys() & new_builds.keys()):
+        _, base_props = base_builds[build_id]
+        index, new_props = new_builds[build_id]
+        if not (_has_stream(base_props) or _has_stream(new_props)):
+            continue
+        # Before anything else: a build may gain its stream and new SQL in one edit.
+        sql_change = _sql_change(build_id, index, base_props, new_props)
+        if sql_change is not None:
+            changes.append(sql_change)
+        if _has_stream(base_props) != _has_stream(new_props):
+            declared = _has_stream(new_props)
+            changes.append(
+                Change(
+                    path=f"builds[{index}].properties.stream",
+                    kind="stream_declared" if declared else "stream_dropped",
+                    severity="info",
+                    description=(
+                        f"build '{build_id}' "
+                        + (
+                            "now declares the stream it reads"
+                            if declared
+                            else "no longer declares its stream"
+                        )
+                    ),
+                    before=None if declared else dict(base_props["stream"]),
+                    after=dict(new_props["stream"]) if declared else None,
+                )
+            )
+            continue
         old, cur = base_props["stream"], new_props["stream"]
         at = f"builds[{index}].properties"
 
@@ -202,30 +299,6 @@ def diff_streams(baseline: Mapping[str, Any], new: Mapping[str, Any]) -> List[Ch
                 _explode(base_props),
                 _explode(new_props),
             )
-        old_sql, new_sql = _sql(base_props), _sql(new_props)
-        if old_sql != new_sql:
-            if old_sql is None:
-                kind, severity, text = (
-                    "stream_contract_sql_added",
-                    "breaking",
-                    f"build '{build_id}' runs SQL written in the contract instead of its "
-                    "mapping: it can read any table the job's catalog identity can",
-                )
-            elif new_sql is None:
-                kind, severity, text = (
-                    "stream_contract_sql_removed",
-                    "non_breaking",
-                    f"build '{build_id}' reads the stream through its mapping instead of its "
-                    "own SQL",
-                )
-            else:
-                kind, severity, text = (
-                    "stream_contract_sql_changed",
-                    "breaking",
-                    f"build '{build_id}' runs different SQL written in the contract: review "
-                    "what it now reads",
-                )
-            changed("sql", kind, severity, text, old_sql, new_sql)
         old_sources, new_sources = _sources(base_props), _sources(new_props)
         for name in sorted(old_sources.keys() | new_sources.keys()):
             before = old_sources.get(name, name)
