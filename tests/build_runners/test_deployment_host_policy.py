@@ -98,6 +98,8 @@ FAKE_DNS: Dict[str, List[str]] = {
     "faß.de": ["10.1.2.3"],
     # Alibaba Cloud's metadata service, which sits inside CGNAT.
     "orchestrator.alibaba.test": ["100.100.100.200"],
+    # An answer that keeps its zone, as some resolvers return it.
+    "orchestrator.zoned.test": ["fd00:ec2::254%eth0"],
 }
 
 
@@ -210,6 +212,7 @@ def test_the_broad_gate_keeps_its_fail_closed_direction(host: str, private: bool
         ("::ffff:100.100.100.200", True),
         ("64:ff9b::a9fe:a9fe", True),  # NAT64 of 169.254.169.254
         ("64:ff9b::6464:64c8", True),  # NAT64 of 100.100.100.200
+        ("orchestrator.zoned.test", True),  # fd00:ec2::254%eth0: the zone is not a disguise
         # Their neighbours are ordinary internal networks and stay allowed.
         ("100.100.100.100", False),  # Tailscale MagicDNS
         ("100.64.1.2", False),  # a Tailscale node
