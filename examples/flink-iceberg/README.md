@@ -1,6 +1,6 @@
 # Nested Flink -> Iceberg example
 
-See [the preview guide](../../docs/flink-iceberg.md) for the contract format,
+See [the preview guide](https://agenticstiger.github.io/forge_docs/advanced/managed-flink-iceberg.html) for the contract format,
 operator prerequisites, workflow, limits and certification status.
 
 The [contract](contract.fluid.yaml) preserves five nested structs, arrays of
