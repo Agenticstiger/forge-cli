@@ -553,7 +553,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             from fluid_build._console import _redact_error_str, _redact_str, literal_text
 
-            message = Text(f"❌ {e.message}", style="red")
+            message = literal_text(_redact_error_str(f"❌ {e.message}"), "red")
             if slug:
                 message.append(f"  [{slug}]", style="dim")
             context.console.print(message)

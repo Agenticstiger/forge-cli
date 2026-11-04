@@ -306,7 +306,12 @@ def _warn_once(key: str, message: str) -> None:
     except Exception:  # pragma: no cover — console is best-effort
         LOG.warning("%s", message)
     else:
-        LOG.warning("%s", message, extra={"fluid_console_shown": True})
+        if LOG.hasHandlers():
+            LOG.warning("%s", message, extra={"fluid_console_shown": True})
+        else:
+            # Outside the CLI (library use) nothing handles the record, and
+            # logging's last-resort handler would print the line a second time.
+            LOG.debug("%s", message)
 
 
 #: Process-level dedup set for :func:`_warn_once`.

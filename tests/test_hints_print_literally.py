@@ -481,6 +481,22 @@ def test_console_error_masks_a_bracketed_token(capsys) -> None:
     assert "upstream said" in out.err
 
 
+def test_a_cli_error_message_is_masked_and_printed_as_written(tmp_path, capsys, monkeypatch):
+    import fluid_build.cli.validate as validate_cmd
+    from fluid_build._contract_loader import CLIError
+    from fluid_build.cli import main
+
+    def refuse(args, logger):
+        raise CLIError(1, f"upstream said [{TOKEN}] about exposes[orders]")
+
+    monkeypatch.setattr(validate_cmd, "run", refuse)
+    rc = main(["validate", str(tmp_path / "c.yaml")])
+    shown = capsys.readouterr()
+    assert rc == 1
+    assert TOKEN not in shown.out + shown.err
+    assert "exposes[orders]" in shown.out + shown.err
+
+
 def test_odps_validate_masks_a_bracketed_token(tmp_path, capsys, monkeypatch) -> None:
     from fluid_build.cli.odps_standard import _run_odps_validate
     from fluid_build.providers import odps_standard
