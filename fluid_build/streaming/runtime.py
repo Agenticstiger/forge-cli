@@ -24,13 +24,17 @@ import subprocess
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
 from fluid_build.providers._iceberg_catalog import resolve_iceberg_catalog
-from fluid_build.providers._iceberg_catalog_auth import parse_catalog_auth
 from fluid_build.streaming.compiler import FlinkArtifacts, compile_contract, managed_config
+from fluid_build.streaming.policy import (
+    catalog_request_guard,
+    refuse_unless_catalog_targets_allowed,
+    refuse_unless_deployment_allowed,
+)
 from fluid_build.streaming.types import LogicalType
 from fluid_build.util.safe_http import safe_httpx_client
 
@@ -95,6 +99,9 @@ def _client(build: Mapping[str, Any]) -> Kubectl:
     if cfg is None:
         raise StreamingError("Expected a managed Flink build")
     deployment = cfg["deployment"]
+    # Every kubectl client is made here, so this is where the operator's
+    # boundary holds for apply (dry runs included), diff and verify.
+    refuse_unless_deployment_allowed(build.get("id"), deployment)
     return Kubectl(deployment["namespace"], deployment["context"])
 
 
@@ -188,6 +195,13 @@ def reconcile(
         client = _client(build)
         desired = artifact.resources[1]
         name = desired["metadata"]["name"]
+        # The deployed job's CREATE CATALOG sends its token from the pod, so its
+        # destinations clear the same policy as verify's before anything deploys.
+        refuse_unless_catalog_targets_allowed(
+            managed_config(build) or {},
+            _catalog_uri(contract, artifact),
+            s3_endpoint=desired["spec"]["flinkConfiguration"].get("s3.endpoint"),
+        )
         if dry_run:
             pending.append((artifact, client, None))
             continue
@@ -316,6 +330,66 @@ def _iceberg_fields(expected: Any, actual: Any, path: str = "$") -> None:
         _iceberg_type(dtype, fields[name]["type"], f"{path}.{name}")
 
 
+def _oauth2_access_token(auth: Any, credential: str) -> str:
+    """Exchange ``client_id:client_secret`` for an access token at the token endpoint."""
+    # The client's require_https covers only a base_url; this posts to a full URL.
+    if urlsplit(str(auth.oauth2_server_uri)).scheme != "https":
+        raise StreamingError("The OAuth2 token endpoint must use https: it receives the secret")
+    client_id, separator, client_secret = credential.partition(":")
+    if not separator or not client_id or not client_secret:
+        raise StreamingError("Catalog credential variable must contain client_id:client_secret")
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": auth.scope,
+    }
+    if auth.audience:
+        data["audience"] = auth.audience
+    if auth.resource:
+        data["resource"] = auth.resource
+    role = "OAuth2 token endpoint"
+    with safe_httpx_client(
+        allow_private=True,
+        require_https=True,
+        timeout=30,
+        event_hooks={"request": [catalog_request_guard(auth.oauth2_server_uri, role=role)]},
+    ) as oauth:
+        response = oauth.post(auth.oauth2_server_uri, data=data)
+        response.raise_for_status()
+        token = response.json().get("access_token")
+    if not isinstance(token, str) or not token:
+        raise StreamingError("Catalog OAuth2 response contains no access token")
+    return token
+
+
+def _catalog_headers(cfg: Mapping[str, Any], catalog_uri: str) -> dict[str, str]:
+    """The catalog request's auth header, once the operator's policy allows each step.
+
+    The contract names the catalog, the token endpoint and the variable, so all
+    of them clear the policy before the variable is read.
+    """
+    try:
+        auth = refuse_unless_catalog_targets_allowed(cfg, catalog_uri)
+    except ValueError as exc:  # a malformed catalogAuth, as parse_catalog_auth words it
+        raise StreamingError(str(exc)) from exc
+    if not auth:
+        return {}
+    token = os.environ.get(auth.env_var)
+    if not token:
+        raise StreamingError("Catalog token variable must be set for CLI verification")
+    oauth2 = auth.type == "oauth2"
+    return {"Authorization": f"Bearer {_oauth2_access_token(auth, token) if oauth2 else token}"}
+
+
+def _catalog_uri(contract: Mapping[str, Any], artifact: FlinkArtifacts) -> str:
+    target = next(e for e in contract["exposes"] if e["exposeId"] == artifact.expose_id)
+    resolved = resolve_iceberg_catalog(target["binding"])
+    if not resolved.uri:
+        raise StreamingError("REST catalog URI is required")
+    return str(resolved.uri)
+
+
 def catalog_evidence(
     contract: Mapping[str, Any],
     build: Mapping[str, Any],
@@ -328,43 +402,14 @@ def catalog_evidence(
     resolved = resolve_iceberg_catalog(target["binding"])
     if not resolved.uri:
         raise StreamingError("REST catalog URI is required")
-    auth, errors = parse_catalog_auth(cfg.get("catalogAuth"))
-    if errors:
-        raise StreamingError("; ".join(errors))
-    headers = {}
-    if auth:
-        token = os.environ.get(auth.env_var)
-        if not token:
-            raise StreamingError("Catalog token variable must be set for CLI verification")
-        if auth.type == "oauth2":
-            client_id, separator, client_secret = token.partition(":")
-            if not separator or not client_id or not client_secret:
-                raise StreamingError(
-                    "Catalog credential variable must contain client_id:client_secret"
-                )
-            data = {
-                "grant_type": "client_credentials",
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "scope": auth.scope,
-            }
-            if auth.audience:
-                data["audience"] = auth.audience
-            if auth.resource:
-                data["resource"] = auth.resource
-            with safe_httpx_client(allow_private=True, require_https=True, timeout=30) as oauth:
-                response = oauth.post(auth.oauth2_server_uri, data=data)
-                response.raise_for_status()
-                token = response.json().get("access_token")
-                if not isinstance(token, str) or not token:
-                    raise StreamingError("Catalog OAuth2 response contains no access token")
-        headers["Authorization"] = f"Bearer {token}"
+    headers = _catalog_headers(cfg, resolved.uri)
     with safe_httpx_client(
         base_url=resolved.uri.rstrip("/") + "/",
         headers=headers,
         allow_private=True,
         require_https=bool(headers),
         timeout=30,
+        event_hooks={"request": [catalog_request_guard(resolved.uri, role="Iceberg catalog")]},
     ) as client:
         config = client.get("v1/config", params={"warehouse": resolved.warehouse})
         config.raise_for_status()

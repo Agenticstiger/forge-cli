@@ -33,7 +33,7 @@ from fluid_build.providers._iceberg_catalog import (
     catalog_kind_info,
     resolve_iceberg_catalog,
 )
-from fluid_build.providers._iceberg_catalog_auth import parse_catalog_auth
+from fluid_build.providers._iceberg_catalog_auth import FORBIDDEN_TEXT_PATTERN, parse_catalog_auth
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.streaming.types import LogicalType, columns_sql, parse_fields
 from fluid_build.util.contract import is_externally_run_build
@@ -350,6 +350,12 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
     # authoritative semantic validation; Forge must not mistake DDL for a transform.
     if not re.match(r"(?is)^\s*SELECT\b", sql) or ";" in sql:
         raise ValueError("Managed Flink properties.sql must be a single SELECT without semicolons")
+    # A /*+ OPTIONS(...) */ hint overrides the source's connector options at query
+    # time (dynamic table options are on by default), so contract SQL could point
+    # the Kafka source at another broker or wire a config provider that reads the
+    # pod's secrets. Flink reads a hint only from the literal "/*+" token.
+    if "/*+" in sql:
+        raise ValueError("Managed Flink properties.sql must not contain SQL hints (/*+ ... */)")
     iceberg = binding.get("icebergConfig") or {}
     if iceberg.get("writeVersion", 2) != 2:
         raise ValueError("Managed Flink requires Iceberg format version 2")
@@ -391,9 +397,26 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
         catalog_options["io-impl"] = resolved.io_impl
     if resolved.region:
         catalog_options.setdefault("client.region", resolved.region)
+    # Iceberg's REST client replaces any catalog property that starts with env: by
+    # that variable from the pod (RESTSessionCatalog.initialize ->
+    # EnvironmentUtil.resolveAll), so contract text here could have the pod send any
+    # of its variables: a region is signed into every S3 request. Only catalogAuth's
+    # own reference, merged below and paired with its hosts by the operator, may.
+    for key, value in catalog_options.items():
+        if re.search(FORBIDDEN_TEXT_PATTERN, str(value)):
+            raise ValueError(
+                f"catalog property {key} must not start with env: or contain ${{ or a "
+                "control character; only catalogAuth may reference a variable"
+            )
+    if "client.region" in catalog_options and not re.fullmatch(
+        _NAME, str(catalog_options["client.region"])
+    ):
+        raise ValueError("client.region must be a region name such as eu-central-1")
     if auth:
         if urlsplit(resolved.uri).scheme != "https":
             raise ValueError("Authenticated Iceberg catalogs require HTTPS")
+        if auth.type == "oauth2" and urlsplit(str(auth.oauth2_server_uri)).scheme != "https":
+            raise ValueError("An OAuth2 token endpoint requires HTTPS: it receives the secret")
         catalog_options.update(auth.catalog_properties())
     if "s3.endpoint" in catalog_options:
         _url(catalog_options["s3.endpoint"], "s3.endpoint")
