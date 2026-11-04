@@ -264,6 +264,7 @@ def test_catalog_auth_is_resolved_locally_and_sent_only_as_headers(
     contract, monkeypatch, auth_type
 ):
     contract["exposes"][0]["contract"]["schema"] = [{"name": "id", "type": "long"}]
+    contract["builds"][0]["properties"]["stream"]["schema"].append({"name": "id", "type": "long"})
     contract["exposes"][0]["binding"]["location"]["uri"] = "https://catalog.example"
     monkeypatch.setenv(HOST_ALLOWLIST_ENV, "catalog.example,identity.example")
     cfg = contract["builds"][0]["properties"]["parameters"]["flink"]
@@ -511,6 +512,7 @@ def test_successful_checkpoint_and_catalog_evidence(contract):
 def test_missing_or_stale_commit_refused(contract, snapshots, current):
     # Keep one scalar to isolate snapshot evidence from recursive schema checks.
     contract["exposes"][0]["contract"]["schema"] = [{"name": "id", "type": "long"}]
+    contract["builds"][0]["properties"]["stream"]["schema"].append({"name": "id", "type": "long"})
     (artifact,) = compile_contract(contract)
     metadata = {
         "current-schema-id": 0,

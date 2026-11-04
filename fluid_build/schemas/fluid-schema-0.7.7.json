@@ -1187,6 +1187,136 @@
         "value": {"$ref": "#/$defs/nestedType"}
       }
     },
+    "streamSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.7 (preview): The Kafka records a streaming build reads, described apart from the engine that reads them: one topic, how its values are encoded, the value's fields, an optional key, and Kafka record metadata read as columns. The value and key schemas are lists of columns, the same shape as an expose's contract.schema, so one fragment can describe a topic and a table that lands it. Brokers, consumer groups and registries are the engine's parameters, not part of the stream.",
+      "required": ["kind", "topic", "format", "schema"],
+      "properties": {
+        "kind": {
+          "const": "kafka",
+          "description": "The streaming system. Only kafka in this preview."
+        },
+        "topic": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]{1,249}(?![\\s\\S])",
+          "description": "One Kafka topic, by name: Kafka's legal characters, no pattern and no list."
+        },
+        "format": {
+          "enum": ["json", "avro-confluent"],
+          "description": "How record values are encoded. json: one JSON object per record; a field the schema does not declare is ignored, and a declared field that is missing reads as null. avro-confluent: Avro in the Confluent Schema Registry wire format. The declared schema is the reader schema, so the producers' subject must stay readable by it: FORWARD or FULL compatibility, transitive."
+        },
+        "schema": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/column"},
+          "description": "The record value's fields, as columns. Nested data uses fields (struct), element (array) and key/value (map)."
+        },
+        "key": {"$ref": "#/$defs/streamKey"},
+        "metadata": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/streamMetadataColumn"},
+          "description": "Kafka record metadata, each read as a column."
+        }
+      }
+    },
+    "streamKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.7 (preview): The record key, read as columns next to the value's. A record without a key reads its key columns as null.",
+      "required": ["format", "schema"],
+      "properties": {
+        "format": {
+          "enum": ["raw", "json", "avro-confluent"],
+          "description": "raw: the key's bytes as one column, of type string (UTF-8) or binary. json and avro-confluent: a key record whose fields are the schema's columns."
+        },
+        "schema": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/column"},
+          "description": "The key's fields, as columns: exactly one for raw."
+        },
+        "prefix": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?![\\s\\S])",
+          "description": "Put in front of every key column's name, so a key field can share its name with a value field (a Debezium key repeats the value's id). A mapping names the prefixed column."
+        }
+      }
+    },
+    "streamMetadataColumn": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.7 (preview): One piece of Kafka record metadata, read as a column. Its type is fixed by what it reads: topic string, partition int, offset long, timestamp timestamp_ltz(3), timestamp-type string, headers map<string, binary> and leader-epoch int. leader-epoch is null when the broker does not report it; the others are never null.",
+      "required": ["name", "from"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The column's name, unique among the stream's value, key and metadata columns."
+        },
+        "from": {
+          "enum": ["topic", "partition", "offset", "timestamp", "timestamp-type", "headers", "leader-epoch"],
+          "description": "The metadata the column reads."
+        },
+        "description": {"type": "string"}
+      }
+    },
+    "recordMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.7 (preview): How the stream's records become the output's rows. An output column the mapping does not list, nested fields included, is read from the stream column or field at the same path, and keeps its type: so a stream landed as it is, flat or nested, needs no mapping. forge-cli writes the query from the mapping and checks every output column's type and nullability against it before anything deploys; no contract text reaches the job's SQL.",
+      "properties": {
+        "explode": {"$ref": "#/$defs/recordExplode"},
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/recordMappingColumn"},
+          "description": "Output columns, or nested fields of them, that are read from another path, renamed or converted."
+        }
+      }
+    },
+    "recordExplode": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.7 (preview): One output row per element of an array. A record whose array is null or empty produces no row.",
+      "required": ["path", "as"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*|\\['[^'\\\\\\u0000-\\u001f\\u007f]{1,256}'\\])*(?![\\s\\S])",
+          "description": "The array: a stream column or a nested field, such as items or order.lines."
+        },
+        "as": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?![\\s\\S])",
+          "description": "The element's name in mapping paths: item.sku for a field of a struct element, item for a scalar element."
+        }
+      }
+    },
+    "recordMappingColumn": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "NEW in v0.7.7 (preview): Where one output column, or one nested field of one, is read from.",
+      "required": ["name", "from"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?![\\s\\S])",
+          "description": "The output column, or a field of a struct output column as a dotted path (customer.id). Mapping a nested field builds that struct from the paths given, so a nested output can be written from fields that are flat or elsewhere in the record."
+        },
+        "from": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*|\\['[^'\\\\\\u0000-\\u001f\\u007f]{1,256}'\\])*(?![\\s\\S])",
+          "description": "The source: a stream column (value, key or metadata), a nested field (customer.address.country), a map entry (attributes['channel'], null when the key is absent) or the exploded element (item.sku)."
+        },
+        "cast": {
+          "$ref": "#/$defs/column/properties/type",
+          "description": "Convert the source to this type: binary to string (UTF-8), or a widening (int to long, float to double, a decimal to a wider precision at the same scale, a timestamp to a finer precision)."
+        },
+        "description": {"type": "string"}
+      }
+    },
     "dqSpec": {
       "type": "object",
       "additionalProperties": false,
@@ -3350,6 +3480,14 @@
           "type": "object",
           "additionalProperties": true
         },
+        "stream": {
+          "$ref": "#/$defs/streamSource",
+          "description": "NEW in v0.7.7 (preview): The stream the build reads. With a stream, sql is optional: the managed Flink lane writes the query from the mapping instead."
+        },
+        "mapping": {
+          "$ref": "#/$defs/recordMapping",
+          "description": "NEW in v0.7.7 (preview): How the stream's records become the output's rows. Requires stream, and replaces sql."
+        },
         "tags": {
           "$ref": "#/$defs/tags"
         },
@@ -3357,9 +3495,23 @@
           "$ref": "#/$defs/labels"
         }
       },
-      "required": [
-        "sql"
-      ]
+      "if": {
+        "not": {
+          "required": [
+            "stream"
+          ]
+        }
+      },
+      "then": {
+        "required": [
+          "sql"
+        ]
+      },
+      "dependentRequired": {
+        "mapping": [
+          "stream"
+        ]
+      }
     },
     "multiStagePattern": {
       "type": "object",

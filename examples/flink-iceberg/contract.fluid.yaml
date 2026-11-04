@@ -17,64 +17,66 @@ builds:
         platform: kubernetes
     properties:
       language: flink_sql
-      sql: >-
-        SELECT event_id, customer, items, attributes, event_time FROM source_events
+      # The records, as the topic carries them. With no mapping, each output
+      # column is read from the stream column of the same name, nested as it is.
+      stream:
+        kind: kafka
+        topic: orders
+        format: json
+        schema:
+          - name: event_id
+            type: string
+            required: true
+          - name: customer
+            type: struct
+            fields:
+              - name: id
+                type: string
+              - name: address
+                type: struct
+                fields:
+                  - name: country
+                    type: string
+                  - name: geo
+                    type: struct
+                    fields:
+                      - name: location
+                        type: struct
+                        fields:
+                          - name: coordinates
+                            type: struct
+                            fields:
+                              - name: latitude
+                                type: double
+                              - name: longitude
+                                type: double
+          - name: items
+            type: array
+            element:
+              type: struct
+              fields:
+                - name: sku
+                  type: string
+                - name: price
+                  type: decimal(18,2)
+          - name: attributes
+            type: map
+            key:
+              type: string
+              required: true
+            value:
+              type: string
+          - name: event_time
+            type: timestamp_ltz(3)
       parameters:
         flink:
           management: operator
           source:
             bootstrapServers: kafka:9092
-            topic: orders
             groupId: forge-commerce-orders-v1
-            format: json
             eventTime:
               column: event_time
               delaySeconds: 5
-            schema:
-              - name: event_id
-                type: string
-                required: true
-              - name: customer
-                type: struct
-                fields:
-                  - name: id
-                    type: string
-                  - name: address
-                    type: struct
-                    fields:
-                      - name: country
-                        type: string
-                      - name: geo
-                        type: struct
-                        fields:
-                          - name: location
-                            type: struct
-                            fields:
-                              - name: coordinates
-                                type: struct
-                                fields:
-                                  - name: latitude
-                                    type: double
-                                  - name: longitude
-                                    type: double
-              - name: items
-                type: array
-                element:
-                  type: struct
-                  fields:
-                    - name: sku
-                      type: string
-                    - name: price
-                      type: decimal(18,2)
-              - name: attributes
-                type: map
-                key:
-                  type: string
-                  required: true
-                value:
-                  type: string
-              - name: event_time
-                type: timestamp_ltz(3)
           deployment:
             name: commerce-orders
             namespace: data-products
