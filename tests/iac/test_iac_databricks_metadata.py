@@ -347,3 +347,57 @@ class TestColumnTags:
             ("engineer_email", "fluid_sensitivity", "pii"),
             ("tower_id", "fluid_sensitivity", "internal"),
         )
+
+
+# ── certification ───────────────────────────────────────────────────────────
+CERTIFICATION = "system.certification_status"
+
+
+class TestCertification:
+    def _table_tags(self, contract: Dict[str, Any]) -> Dict[str, str]:
+        (tags,) = _tags(_module(contract), "tables").values()
+        return tags
+
+    def test_a_deprecated_product_is_deprecated_in_unity_catalog(self):
+        contract = _contract()
+        contract["lifecycle"] = {"state": "deprecated"}
+        assert self._table_tags(contract)[CERTIFICATION] == "deprecated"
+
+    def test_the_exposes_own_state_wins(self):
+        contract = _contract()
+        contract["lifecycle"] = {"state": "deprecated"}
+        contract["exposes"][0]["lifecycle"] = {"state": "active"}
+        assert CERTIFICATION not in self._table_tags(contract)
+        contract["lifecycle"] = {"state": "active"}
+        contract["exposes"][0]["lifecycle"] = {"state": "deprecated"}
+        assert self._table_tags(contract)[CERTIFICATION] == "deprecated"
+
+    @pytest.mark.parametrize("state", ["preview", "active", "retired"])
+    def test_no_other_state_sets_it(self, state):
+        contract = _contract()
+        contract["lifecycle"] = {"state": state}
+        assert CERTIFICATION not in self._table_tags(contract)
+
+    def test_imported_by_the_providers_id_and_named_by_a_plan_notice(self):
+        contract = _contract()
+        contract["lifecycle"] = {"state": "deprecated"}
+        imports = {
+            block.id
+            for block in IAC_PLUGINS["databricks"].discover_imports(contract)
+            if block.to.startswith(TAG)
+        }
+        assert f"tables,main.ops.tickets,{CERTIFICATION}" in imports
+        notices = IAC_PLUGINS["databricks"].plan_notices(contract)
+        assert any(CERTIFICATION in n and "ASSIGN" in n for n in notices)
+        assert not any(
+            CERTIFICATION in n for n in IAC_PLUGINS["databricks"].plan_notices(_contract())
+        )
+
+    def test_it_counts_toward_the_fifty_and_verify_checks_it(self):
+        contract = _contract()
+        contract["lifecycle"] = {"state": "deprecated"}
+        (table,), _ = dbx.managed_objects(contract)
+        assert dict(table.tags)[CERTIFICATION] == "deprecated"
+        contract["labels"] = {f"k{i:03d}": "v" for i in range(50 - len(IDENTITY))}
+        errors, _ = dbx.validate_databricks_binding(contract)
+        assert len(errors) == 1 and "51" in errors[0]

@@ -353,6 +353,11 @@ _PRODUCT_TAGS = (
 )
 #: The column tag a column's ``sensitivity`` becomes.
 SENSITIVITY_TAG = "fluid_sensitivity"
+#: Unity Catalog's system governed tag for a certified or deprecated asset ("Flag data as
+#: certified or deprecated", Databricks docs): values ``certified`` and ``deprecated``. Setting
+#: it needs ASSIGN on that governed tag, besides APPLY TAG on the table (the Entity Tag
+#: Assignments API, databricks-sdk 0.158.0 ``EntityTagAssignmentsAPI.create``).
+CERTIFICATION_TAG = "system.certification_status"
 
 
 def _refusal(kind: str, message: str, *remediation: str) -> UnsupportedBindingError:
@@ -1628,6 +1633,14 @@ def _lookup(document: Mapping[str, Any], path: str) -> Any:
     return value
 
 
+def _certification(contract: Mapping[str, Any], table: _Table) -> Optional[str]:
+    """``deprecated`` when the expose's ``lifecycle.state`` (else the product's) says so."""
+    state = _text(_lookup(table.exposure, "lifecycle.state")) or _text(
+        _lookup(contract, "lifecycle.state")
+    )
+    return "deprecated" if state.lower() == "deprecated" else None
+
+
 def _product_tags(
     contract: Mapping[str, Any], table: _Table, refusals: List[UnsupportedBindingError]
 ) -> Dict[str, str]:
@@ -1657,6 +1670,9 @@ def _product_tags(
             )
             continue
         tags[key] = value
+    certification = _certification(contract, table)
+    if certification is not None:
+        tags[CERTIFICATION_TAG] = certification
     return tags
 
 
@@ -2156,6 +2172,19 @@ class DatabricksIacPlugin:
         it creates paused until the tables they write are protected."""
         compiled = _compile(contract, os.environ)
         notices = _use_catalog_notices(compiled)
+        certified = sorted(
+            {
+                f"{full_name} ({value})"
+                for _k, full_name, key, value in compiled.tags
+                if key == CERTIFICATION_TAG
+            }
+        )
+        if certified:
+            notices.append(
+                f"{CERTIFICATION_TAG} is set on {', '.join(certified)}: a system governed tag, "
+                "so this identity needs the ASSIGN permission on it, which an account or "
+                "workspace admin grants, or the tag assignment fails."
+            )
         decided = getattr(self, "_pause_decision", None)
         self._pause_decision = None  # used once: the next run decides again
         if decided is not None and decided[0] is not None and decided[0] == _contract_key(contract):

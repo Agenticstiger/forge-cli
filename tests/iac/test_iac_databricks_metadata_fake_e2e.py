@@ -181,3 +181,20 @@ def test_a_table_created_without_comments_is_adopted_and_gains_them_in_place(
     assert fake.tables[TABLE]["comment"] == "One row per order, as the shop's sees it."
     assert fake.tables[TABLE]["columns"][0]["comment"] == "The order's id."
     assert fake.tables[TABLE]["marker"] == marker and fake.replaced == []
+
+
+def test_a_deprecated_product_gets_the_certification_system_tag(workspace, fake, capfd):
+    contract = _described()
+    contract["lifecycle"] = {"state": "deprecated"}
+    path = write_contract(workspace, contract)
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert "system.certification_status is set on main.sales.orders (deprecated)" in out
+    assert fake.tags_on("tables", TABLE)["system.certification_status"] == "deprecated"
+    assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]
+
+    del contract["lifecycle"]
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 0, out
+    assert "system.certification_status" not in fake.tags_on("tables", TABLE)

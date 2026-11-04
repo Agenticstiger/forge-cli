@@ -21,8 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the masks, the row filter and the fail-safe lock depend on, and the owner team is a tag. On a
   table a dbt build writes, the comments stay dbt's (its `CREATE OR REPLACE` sets them, from the
   model with `persist_docs`): forge-cli sets none there and `fluid validate` says so; its tags
-  are still set. `fluid verify`'s governance-tags dimension now also checks the product's tags,
-  the column tags and the comments, reading each tag list to its last page.
+  are still set. A product whose `lifecycle.state` is `deprecated` (the expose's, else the
+  product's) gets Unity Catalog's system tag `system.certification_status = deprecated`; the
+  deploy identity needs ASSIGN on that governed tag, which the plan says. `fluid verify`'s
+  governance-tags dimension now also checks the product's tags, the column tags and the comments,
+  reading each tag list to its last page.
 
 ### Changed
 
