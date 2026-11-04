@@ -165,6 +165,7 @@ def run_id_to_uuid(run_id: str, event_time: str) -> str:
     timestamp produced a *different* ``runId`` for START and COMPLETE of the
     same run — which makes the pair uncorrelatable in Marquez/DataHub.
     """
+    _require_openlineage()
     from openlineage.client.uuid import generate_static_uuid
 
     return str(generate_static_uuid(_parse_event_time(event_time), run_id.encode("utf-8")))
@@ -186,6 +187,14 @@ def _as_run_facet(payload: Dict[str, Any], *, schema_path: str) -> Dict[str, Any
     }
 
 
+def _require_openlineage() -> None:
+    """Raise :class:`~fluid_build._optional.MissingOptionalDependency` when the
+    OpenLineage client is not installed (``pip install 'data-product-forge[lineage]'``)."""
+    from fluid_build._optional import require
+
+    require("openlineage.client", "lineage", "OpenLineage emission")
+
+
 def to_openlineage(event: RunEvent) -> Any:
     """Translate a FLUID ``RunEvent`` into a spec-conformant OpenLineage event.
 
@@ -193,6 +202,7 @@ def to_openlineage(event: RunEvent) -> Any:
     supplies ``producer`` and ``schemaURL`` defaults, but we set ``producer``
     explicitly so it identifies FLUID rather than the client library.
     """
+    _require_openlineage()
     from openlineage.client.event_v2 import (
         InputDataset,
         Job,
@@ -244,6 +254,7 @@ def to_openlineage(event: RunEvent) -> Any:
 
 def encode_event(event: RunEvent) -> dict:
     """Serialise a FLUID ``RunEvent`` as conformant OpenLineage JSON-ready dict."""
+    _require_openlineage()
     from openlineage.client.serde import Serde
 
     return Serde.to_dict(to_openlineage(event))
@@ -284,9 +295,11 @@ def _warn_once(key: str, message: str) -> None:
     _WARNED.add(key)
     LOG.warning("%s", message)
     try:
-        from fluid_build._console import warning as console_warning
+        from fluid_build._console import cprint, literal_text
 
-        console_warning(message)
+        # Literal: the message names an install extra such as ``[lineage]``,
+        # which Rich markup would read as a tag and drop.
+        cprint(literal_text(f"⚠️  {message}", style="yellow"))
     except Exception:  # pragma: no cover — console is best-effort
         pass
 
@@ -392,6 +405,13 @@ class HttpLineageEmitter(LineageEmitter):
                 resp = client.post(self.endpoint, json=self._encode(event), headers=headers)
                 resp.raise_for_status()
         except Exception as exc:  # noqa: BLE001
+            from fluid_build._optional import MissingOptionalDependency
+
+            if isinstance(exc, MissingOptionalDependency):
+                # Not a transport failure: the receiver is configured and the
+                # client library that builds the event is absent. Name the extra.
+                _warn_once("missing-openlineage", f"Lineage is not being emitted.\n{exc}")
+                return
             # Class-only, because httpx error messages can echo the endpoint URL.
             # Surfaced on the CLI too: "lineage configured but nothing shipped"
             # is precisely the state an operator must not have to guess at.

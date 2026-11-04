@@ -84,7 +84,11 @@ def _predicate_columns(where: str, at: str) -> Tuple[str, ...]:
     try:
         import sqlglot
         from sqlglot import expressions as exp
-    except ImportError:  # pragma: no cover - sqlglot is a core dependency
+    except ImportError:  # pragma: no cover - sqlglot is a base dependency
+        # Fails OPEN on the structural checks: without sqlglot the separator and
+        # comment check above still runs, but subqueries, UNION/GROUP/ORDER/LIMIT
+        # and undeclared columns go unchecked. This is sqlglot's real consumer in
+        # the base install, so keep it in `dependencies`.
         return ()
     try:
         tree = sqlglot.parse_one(f"SELECT 1 FROM t WHERE {where}")

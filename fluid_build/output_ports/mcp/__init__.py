@@ -85,15 +85,19 @@ try:
         OutputPortMcpServer,
         run_stdio,
     )
-except ImportError:  # pragma: no cover - exercised only when mcp SDK absent
+except ImportError as _import_error:  # pragma: no cover - exercised only when mcp SDK absent
     SERVER_NAME = "forge-cli-output-port-mcp"
     SERVER_VERSION = "0.1.0"
+    _server_import_error = _import_error
 
     def _missing_sdk(*_args, **_kwargs):  # type: ignore[unused-ignore]
-        raise ImportError(
-            "The 'mcp' package is required for the Fluid MCP output-port "
-            "server. Install with: pip install 'mcp>=1.0,<2.0'"
-        )
+        from fluid_build._optional import MissingOptionalDependency, is_available
+
+        if is_available("mcp"):
+            # The SDK is installed but ``.server`` failed to import: say so
+            # rather than telling the user to install what they already have.
+            raise _server_import_error
+        raise MissingOptionalDependency("mcp", "mcp", "The MCP output-port server")
 
     OutputPortMcpServer = _missing_sdk  # type: ignore[assignment]
     run_stdio = _missing_sdk  # type: ignore[assignment]

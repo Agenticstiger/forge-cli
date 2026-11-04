@@ -333,6 +333,21 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "secrets",
     ),
+    # Optional-dependency gate (fluid_build/_optional.py). The message already
+    # carries the exact `pip install` line; these only give the stable slug a
+    # curated follow-up and a docs anchor.
+    "copilot_litellm_unavailable": (
+        ["Run 'fluid doctor' to see which optional packages are installed"],
+        None,
+    ),
+    "mcp_sdk_unavailable": (
+        ["Run 'fluid doctor' to see which optional packages are installed"],
+        None,
+    ),
+    "optional_dependency_missing": (
+        ["Run 'fluid doctor' to see which optional packages are installed"],
+        None,
+    ),
     "copilot_missing_llm_model": (
         [
             "Set FLUID_LLM_MODEL or pass --llm-model",

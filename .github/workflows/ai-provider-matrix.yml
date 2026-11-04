@@ -76,7 +76,7 @@ jobs:
           # whose emitter differences are not what it is testing. Needed
           # explicitly because dbt-duckdb declares `dbt-core>=1.8.0` with no
           # upper bound (verified on PyPI 2026-09-20).
-          python -m pip install -e ".[dev,local]" "dbt-core<2" dbt-duckdb
+          python -m pip install -e ".[dev,local,litellm]" "dbt-core<2" dbt-duckdb
 
       - name: Run strict hosted-provider E2E
         if: steps.gate.outputs.enabled == 'true'
