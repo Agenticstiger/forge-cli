@@ -31,9 +31,8 @@ declared path per output column, never an expression.
 
 from __future__ import annotations
 
-import dataclasses
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
@@ -218,7 +217,7 @@ def show(steps: Sequence[Step]) -> str:
 
 
 def _nullable(dtype: LogicalType, nullable: bool) -> LogicalType:
-    return dataclasses.replace(dtype, required=not nullable)
+    return replace(dtype, required=not nullable)
 
 
 def _sql_type(dtype: LogicalType) -> str:
@@ -399,7 +398,7 @@ class _Compiler:
 
     def _settle(self, ref: _Ref) -> _Ref:
         if ref.origin is not None and ref.origin in self.present:
-            return dataclasses.replace(ref, dtype=_nullable(ref.dtype, False))
+            return replace(ref, dtype=_nullable(ref.dtype, False))
         return ref
 
     def _step(self, ref: _Ref, step: Step, where: str, label: str) -> _Ref:

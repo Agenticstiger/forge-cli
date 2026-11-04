@@ -359,10 +359,8 @@ def test_a_constant_or_default_the_contract_does_not_set_changes_the_configmap_n
 ):
     """The ConfigMap is immutable and named by the digest, and its deployment.json
     carries what the compiler fixes or defaults; changing one must not reuse the name."""
-    import fluid_build.streaming.compiler as compiler
-
     (original,) = compile_contract(contract)
-    monkeypatch.setattr(compiler, constant, value)
+    monkeypatch.setattr(f"fluid_build.streaming.compiler.{constant}", value)
     (changed,) = compile_contract(contract)
     assert changed.digest != original.digest
     assert changed.resources[0]["metadata"]["name"] != original.resources[0]["metadata"]["name"]
