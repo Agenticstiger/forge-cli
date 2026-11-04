@@ -60,7 +60,10 @@ credentials, which is what they are for. They may not carry a setting that:
   every setting of the embedded Debezium Server, which inherits this
   environment and reads it over its ``application.properties``
   (``DEBEZIUM_*``, ``QUARKUS_*``, ``SMALLRYE_*``, ``MP_CONFIG_*``, in the forms
-  SmallRye Config matches, :func:`_is_server_config_name`);
+  SmallRye Config matches, :func:`_is_server_config_name`), its JVM's options
+  and binary (``JDK_JAVA_OPTIONS``, ``JAVA_OPTS``, ``JAVA_HOME``), and its
+  ``run.sh`` launcher's (``EXTRA_CONNECTOR``, ``JMX_*`` ports and hosts,
+  ``OTEL_JAVAAGENT_*``);
 * chooses what program or library runs in this process or its subprocesses
   (``FLUID_DBT_MCP_COMMAND``/``_ARGS``/``_ENV``, ``FLUID_OPENTOFU_VERSION``,
   ``DBT_EXECUTABLE``, ``PATH``, ``ComSpec``, ``SystemRoot``, ``PYTHONPATH``,
@@ -483,6 +486,20 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "NODE_PATH",
         "JAVA_TOOL_OPTIONS",
         "_JAVA_OPTIONS",
+        # read by every JDK 9+ ``java`` launcher, and by Debezium Server's
+        # run.sh: a ``-D`` system property (ordinal 400) outranks the
+        # environment and application.properties, and ``-javaagent:`` loads code
+        "JDK_JAVA_OPTIONS",
+        "JAVA_OPTS",
+        # run.sh starts ``$JAVA_HOME/bin/java``
+        "JAVA_HOME",
+        # run.sh sources connectors/debezium-connector-<value>/*.sh, and opens
+        # remote JMX or an exporter port with these
+        "EXTRA_CONNECTOR",
+        "JMX_HOST",
+        "JMX_PORT",
+        "JMX_EXPORTER_PORT",
+        "JMX_EXPORTER_CONFIG",
         "CLASSPATH",
         "GCONV_PATH",
         "GIT_SSH",
@@ -539,6 +556,9 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     "LD_",
     "DYLD_",
     "_RLD",
+    # the OpenTelemetry Java agent Debezium Server's run.sh can start: its
+    # extensions load a jar, and its configuration file sets the exporter
+    "OTEL_JAVAAGENT_",
 )
 
 #: The configuration namespaces of the embedded Debezium Server: Debezium's own
@@ -549,7 +569,10 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
 #: file could move the sink's catalog past the ``sink.catalogAuth`` pairing, or
 #: the source database, after every check forge-cli runs.
 _SERVER_CONFIG_NAMESPACES: Tuple[str, ...] = ("DEBEZIUM_", "QUARKUS_", "SMALLRYE_", "MP_CONFIG_")
-_PROFILE_ENV_FORM = re.compile(r"_[A-Z0-9]+_(.+)")
+#: A leading profile segment as SmallRye's ``EnvConfigSource`` matches it: ``%``
+#: or ``_``, the profile names (``dev,prod``), then any one separator, since a
+#: property's ``.`` matches ``.``, ``-``, ``_`` or ``/`` in a variable name.
+_PROFILE_SEGMENT = re.compile(r"[%_][A-Z0-9,]*[^A-Z0-9,]")
 
 # Name-shape rule for FLUID_* names: fails closed for a knob nobody listed yet.
 _FLUID_PROTECTED_SUFFIXES: Tuple[str, ...] = (
@@ -784,15 +807,17 @@ def _is_server_config_name(name: str) -> bool:
 
     It matches a property by its own name (``debezium.sink.iceberg.uri``), with
     every non-alphanumeric character as ``_``, upper-cased
-    (``DEBEZIUM_SINK_ICEBERG_URI``), and for one profile as
-    ``%prod.debezium.sink.iceberg.uri`` or ``_PROD_DEBEZIUM_SINK_ICEBERG_URI``.
+    (``DEBEZIUM_SINK_ICEBERG_URI``), and for a profile as
+    ``%prod.debezium.sink.iceberg.uri``, ``%PROD_DEBEZIUM_SINK_ICEBERG_URI``,
+    ``_PROD_DEBEZIUM_SINK_ICEBERG_URI`` or ``%dev,prod.debezium...``: the name
+    is judged with and without its :data:`_PROFILE_SEGMENT`.
     """
-    if name.startswith("%"):
-        name = name.partition(".")[2]
-    normalized = re.sub(r"[^A-Z0-9]", "_", name)
-    profile = _PROFILE_ENV_FORM.fullmatch(normalized)
-    candidates = (normalized, profile.group(1)) if profile else (normalized,)
-    return any(candidate.startswith(_SERVER_CONFIG_NAMESPACES) for candidate in candidates)
+    profile = _PROFILE_SEGMENT.match(name)
+    candidates = (name, name[profile.end() :]) if profile else (name,)
+    return any(
+        re.sub(r"[^A-Z0-9]", "_", candidate).startswith(_SERVER_CONFIG_NAMESPACES)
+        for candidate in candidates
+    )
 
 
 # ── third-party endpoints: the pairing rule ─────────────────────────────────

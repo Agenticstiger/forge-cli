@@ -728,6 +728,12 @@ _SERVER_SETTINGS = (
     "DEBEZIUM_SOURCE_DATABASE_HOSTNAME",
     "_PROD_DEBEZIUM_SINK_ICEBERG_URI",
     "%prod.debezium.sink.iceberg.uri",
+    # SmallRye matches a property's "." to ".", "-", "_" or "/" in a variable
+    # name, the profile's separator included
+    "%PROD_DEBEZIUM_SINK_ICEBERG_URI",
+    "%prod-debezium.sink.iceberg.uri",
+    "%prod_debezium.sink.iceberg.uri",
+    "%dev,prod.debezium.sink.iceberg.uri",
     "QUARKUS_CONFIG_LOCATIONS",
     "quarkus.config.locations",
     "QUARKUS_PROFILE",
@@ -735,8 +741,23 @@ _SERVER_SETTINGS = (
     "MP_CONFIG_PROFILE",
 )
 
+#: What the server's JVM and its run.sh launcher read: a ``-D`` system
+#: property (ordinal 400) outranks the environment and the properties file.
+_SERVER_LAUNCH_SETTINGS = (
+    "JDK_JAVA_OPTIONS",
+    "JAVA_OPTS",
+    "JAVA_HOME",
+    "EXTRA_CONNECTOR",
+    "JMX_HOST",
+    "JMX_PORT",
+    "JMX_EXPORTER_PORT",
+    "JMX_EXPORTER_CONFIG",
+    "OTEL_JAVAAGENT_EXTENSIONS",
+    "OTEL_JAVAAGENT_CONFIGURATION_FILE",
+)
 
-@pytest.mark.parametrize("name", _SERVER_SETTINGS)
+
+@pytest.mark.parametrize("name", _SERVER_SETTINGS + _SERVER_LAUNCH_SETTINGS)
 def test_the_debezium_servers_configuration_is_operator_only(name: str) -> None:
     from fluid_build.credentials.protected_env import is_protected_env_key
 
