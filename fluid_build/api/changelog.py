@@ -44,6 +44,7 @@ from .changelog_rules import (
     diff_sovereignty,
     iter_expose_pairs,
 )
+from .changelog_stream_rules import diff_streams
 from .changelog_types import Change, ChangelogReport
 
 
@@ -97,6 +98,9 @@ def compare_contracts(
     # Agent policy + sovereignty.
     report.extend(diff_agent_policy(baseline, new))
     report.extend(diff_sovereignty(baseline, new))
+
+    # What streaming builds read (builds[].properties.stream).
+    report.extend(diff_streams(baseline, new))
 
     # Per-expose schema and quality.
     for expose_id, idx, base_expose, new_expose in iter_expose_pairs(baseline, new):
