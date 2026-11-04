@@ -249,6 +249,17 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
     return p
 
 
+def _ensure_fluid_home() -> None:
+    """Create ``~/.fluid`` (best effort), as every run did before commands were lazy."""
+    from pathlib import Path as _Path
+
+    try:
+        (_Path.home() / ".fluid").mkdir(exist_ok=True)
+    except (OSError, RuntimeError):
+        # No writable or resolvable HOME: the first-run checks see it missing, as before.
+        pass
+
+
 def _force_utf8_streams() -> None:
     """Ensure stdout/stderr can encode the CLI's Unicode output.
 
@@ -331,6 +342,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Lazy tree: only the invoked command's module is imported. Shell
         # completion needs every command's options, so it gets the full tree.
         parser = build_parser(None if "_ARGCOMPLETE" in os.environ else argv)
+        # ~/.fluid used to be created on every run by the forge registries the
+        # eager tree imported. The first-run check below and `fluid init` read
+        # its existence, so it is created here, keeping their behaviour.
+        _ensure_fluid_home()
 
         # Intercept help requests for beautiful Rich-formatted output
 

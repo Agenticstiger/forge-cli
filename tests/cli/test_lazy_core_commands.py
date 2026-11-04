@@ -227,3 +227,25 @@ def test_the_global_option_tables_match_the_parser():
         (flag_opts if action.nargs == 0 else value_opts).update(longs)
     assert value_opts == set(bootstrap._GLOBAL_VALUE_OPTS)
     assert flag_opts == set(bootstrap._GLOBAL_FLAG_OPTS)
+
+
+def test_help_on_a_fresh_home_lists_the_commands_and_creates_fluid_home(tmp_path):
+    # The eager tree created ~/.fluid on every run, so the first-run panel never
+    # replaced `fluid --help`; lazy commands must keep that.
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {**os.environ, "HOME": str(home), "USERPROFILE": str(home), "COLUMNS": "120"}
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        env.pop(var, None)
+    for _ in range(2):
+        done = subprocess.run(
+            [sys.executable, "-m", "fluid_build.cli", "--help"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert done.returncode == 0, done.stderr
+        assert "First Time" not in done.stdout
+        assert "validate" in done.stdout
+    assert (home / ".fluid").is_dir()
