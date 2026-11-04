@@ -77,7 +77,7 @@ def test_generated_flink_job_preserves_nested_values_after_task_restart(tmp_path
     cfg = contract["builds"][0]["properties"]["parameters"]["flink"]
     cfg["source"]["startupMode"] = "earliest-offset"
     cfg["catalogProperties"] = {
-        "s3.endpoint": "http://minio:9000",
+        "s3.endpoint": "http://s3:9090",
         "s3.path-style-access": "true",
         "client.region": "us-east-1",
     }
@@ -235,7 +235,7 @@ from decimal import Decimal
 from datetime import datetime
 from pyiceberg.catalog.rest import RestCatalog
 cat = RestCatalog("test", uri="http://iceberg-rest:8181",
-                  **{"s3.endpoint":"http://minio:9000", "s3.access-key-id":"minioadmin",
+                  **{"s3.endpoint":"http://s3:9090", "s3.access-key-id":"minioadmin",
                      "s3.secret-access-key":"minioadmin", "s3.region":"us-east-1"})
 rows = []
 for _ in range(90):
@@ -391,7 +391,7 @@ def test_generated_flink_jobs_flatten_and_reshape_keyed_events(tmp_path):
         cfg = contract["builds"][0]["properties"]["parameters"]["flink"]
         cfg["source"]["startupMode"] = "earliest-offset"
         cfg["catalogProperties"] = {
-            "s3.endpoint": "http://minio:9000",
+            "s3.endpoint": "http://s3:9090",
             "s3.path-style-access": "true",
             "client.region": "us-east-1",
         }
@@ -475,7 +475,7 @@ from decimal import Decimal
 from datetime import datetime
 from pyiceberg.catalog.rest import RestCatalog
 cat = RestCatalog("test", uri="http://iceberg-rest:8181",
-                  **{"s3.endpoint":"http://minio:9000", "s3.access-key-id":"minioadmin",
+                  **{"s3.endpoint":"http://s3:9090", "s3.access-key-id":"minioadmin",
                      "s3.secret-access-key":"minioadmin", "s3.region":"us-east-1"})
 events = json.loads(EVENTS)
 when = datetime.fromisoformat("2026-01-01T00:00:01.123+00:00")
