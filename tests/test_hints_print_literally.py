@@ -269,9 +269,9 @@ def test_doctor_next_steps_plain_text_fallback(
 #: Each shape the two repo redactors know: a bracketed GitHub token (markup used to
 #: swallow it), a bare Anthropic key, a JWT, and a ``key=value`` pair.
 _SECRETS = {
-    "ghp": "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
+    "ghp": "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",  # pragma: allowlist secret
     "anthropic": "sk-ant-api03-AAAAbbbbCCCCdddd1234567890",
-    "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+    "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",  # pragma: allowlist secret
     "kv": "hunter2",
 }
 _SECRET_LINE = (
