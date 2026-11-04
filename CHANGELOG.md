@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Databricks landing leaves nothing behind.** After the load, the bronze landing now also
+  removes the build's and the product's directories in the staging volume
+  (`<volume>/<product>/<build>/`) once each is listed empty, never one another run or build still
+  uses. It deletes the local masked Parquet copy under `.fluid/staging/<build>/` after the load
+  attempt, success or failure, and says so in `facets.databricks_load.local_staging_deleted`; one
+  that cannot be deleted fails the run, naming it.
+- **`fluid apply --mode dry-run` lists the superseded functions the apply would drop.** The
+  Databricks dry run now prints `would drop superseded function <name>` (or `would leave function
+  <name>: <why>`) for each `fluid_` mask or row-filter function a successful apply's clean-up would
+  drop, worked out the same way against the bindings the apply leaves, and runs nothing.
+
 ### Added
 
 - **A Databricks data product looks like a native one in Unity Catalog.** `fluid apply` now
@@ -25,7 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `system.certification_status`, is `deprecated` when `lifecycle.state` (the expose's, else the
   product's) is `deprecated`, else `certified` when the label `certification: certified` (the
   expose's, else the product's) says so; that label is then not also a plain tag, and any other
-  value of it is refused (`databricks-certification-invalid`). The deploy identity needs the
+  value of it is refused (`databricks-certification-invalid`). A product-level
+  `labels.certification` certifies every Databricks table of the product, as intended; an
+  expose-level one certifies only that expose's table. The deploy identity needs the
   ASSIGN permission on that governed tag (not verified on a live workspace), which the plan
   says. `fluid verify`'s governance-tags dimension now also checks the product's tags, the column
   tags and the comments, reading each tag list to its last page.
