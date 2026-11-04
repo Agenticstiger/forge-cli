@@ -33,6 +33,7 @@ from fluid_build.streaming.compiler import FlinkArtifacts, compile_contract, man
 from fluid_build.streaming.policy import (
     catalog_request_guard,
     refuse_unless_catalog_targets_allowed,
+    refuse_unless_contract_sql_allowed,
     refuse_unless_deployment_allowed,
 )
 from fluid_build.streaming.types import LogicalType
@@ -192,6 +193,7 @@ def reconcile(
     pending: list[tuple[FlinkArtifacts, Kubectl, dict[str, Any] | None]] = []
     for artifact in artifacts:
         build = builds[artifact.build_id]
+        refuse_unless_contract_sql_allowed(contract.get("id"), build)
         client = _client(build)
         desired = artifact.resources[1]
         name = desired["metadata"]["name"]

@@ -43,6 +43,11 @@ from fluid_build.util.contract import is_externally_run_build
 #: ``parameters.flink`` stays what it was: free-form settings of a job that
 #: runs elsewhere, which forge-cli does not read.
 _MANAGED_SINCE = "0.7.7"
+#: Products whose own properties.sql the operator lets apply deploy
+#: (streaming.policy.refuse_unless_contract_sql_allowed). Defined here, not in
+#: streaming.policy, because validate reaches this module and must not import
+#: build_runners.
+CONTRACT_SQL_ALLOWLIST_ENV = "FLUID_FLINK_CONTRACT_SQL_ALLOWLIST"
 _NAME = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
 _TEXT = {"type": "string", "minLength": 1}
 _POSITIVE = {"type": "integer", "minimum": 1}
@@ -612,10 +617,22 @@ def validation_errors(contract: Mapping[str, Any]) -> list[str]:
 def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
     """An older contract that asks for the managed lane still validates, as before.
 
-    Its build stays run outside forge-cli, so say why nothing will deploy it.
+    Its build stays run outside forge-cli, so say why nothing will deploy it. On the
+    preview, a managed build that brings its own SQL is told that apply needs the
+    operator to allow it.
     """
     if managed_lane_enabled(contract):
-        return []
+        try:
+            builds = managed_builds(contract)
+        except ValueError:
+            return []  # validation_errors reports it
+        return [
+            f"Build {build.get('id')}: properties.sql is run only if the operator lists "
+            f"{contract.get('id')} in {CONTRACT_SQL_ALLOWLIST_ENV}; properties.mapping is "
+            "checked against the output before deploy and reads nothing but the stream"
+            for build in builds
+            if (build.get("properties") or {}).get("sql") is not None
+        ]
     warnings = []
     for build in contract.get("builds") or []:
         props = build.get("properties") if isinstance(build, Mapping) else None
