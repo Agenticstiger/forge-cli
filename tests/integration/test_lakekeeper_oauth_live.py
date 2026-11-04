@@ -145,6 +145,19 @@ pytestmark = [
     ),
 ]
 
+#: The three tests that derive a sink config. Since the Iceberg sink destination
+#: policy (CHANGELOG Unreleased, Security), a ``sink.catalogAuth`` credential
+#: reaches only https hosts, a loopback one included, and this stack serves
+#: Lakekeeper and Keycloak over http. The founder chose (2026-11-04) to skip them
+#: until the stack runs TLS (Trello XgF5xhrM, "Live Lakekeeper OAuth2 test: run
+#: the stack over TLS"). The fourth test talks to Lakekeeper directly.
+_NEEDS_TLS_STACK = pytest.mark.skip(
+    reason=(
+        "catalogAuth hosts must be https; this stack serves Lakekeeper and Keycloak over "
+        "http until the TLS follow-up lands"
+    )
+)
+
 _REALM = "fluid"
 _CLIENT_ID = "fluid-sink"
 #: The client scope whose Audience mapper adds :data:`_AUDIENCE` to ``aud``.
@@ -593,6 +606,7 @@ def _wait_failed(stack: _AuthStack, name: str, *, deadline_s: float = 180) -> Di
 # ---------------------------------------------------------------------------
 
 
+@_NEEDS_TLS_STACK
 def test_catalog_auth_oauth2_streams_into_an_auth_required_lakekeeper(
     request: pytest.FixtureRequest,
 ):
@@ -647,6 +661,7 @@ def test_catalog_auth_oauth2_streams_into_an_auth_required_lakekeeper(
             _delete_connector(stack, connector)
 
 
+@_NEEDS_TLS_STACK
 def test_stored_connector_config_holds_the_reference_not_the_secret(
     auth_stack: _AuthStack, request: pytest.FixtureRequest
 ):
@@ -697,6 +712,7 @@ def test_stored_connector_config_holds_the_reference_not_the_secret(
             _delete_connector(stack, connector)
 
 
+@_NEEDS_TLS_STACK
 def test_unset_credential_variable_fails_the_task_and_writes_nothing(
     auth_stack: _AuthStack, request: pytest.FixtureRequest
 ):
