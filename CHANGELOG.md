@@ -162,6 +162,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Flink host check already refused these addresses; its message now names a metadata endpoint
   instead of calling it link-local.
 
+- **An Iceberg sink override could change the catalog host after the `catalogAuth` check, or
+  carry another variable to it.** On the Kafka Connect and embedded Debezium sinks, a
+  `sink.catalogAuth` credential goes only to hosts the operator paired it with. The check read
+  override text before the sink expands it: Debezium Server's SmallRye Config expands a `${...}`
+  expression when the server starts, Kafka Connect resolves a `${provider:path:key}` reference
+  with the worker's config providers, and Iceberg replaces a value that starts with `env:` by
+  that variable. So a `${...}` in an override `uri` could make the server call a host other than
+  the one checked. On a build with `sink.catalogAuth`, a catalog URL that holds `${`, starts
+  with `env:` or holds a control character is now refused wherever it is set, at `fluid validate`
+  and in the run's preflight, as the OAuth2 token endpoint already was. So is such a value
+  anywhere else Iceberg reads it: `iceberg_catalog_overrides`, the `iceberg.*` keys of
+  `sink_connector_config` except `iceberg.kafka.*`, and every key of an embedded Debezium
+  `server.sink.config`. A storage credential comes from the worker's or the server's own
+  credential chain, not from the contract. Kafka-side keys such as `consumer.override.*` and
+  `iceberg.kafka.*` keep their config providers, and a build without `catalogAuth` is unchanged.
+
 ### Fixed
 
 - **`fluid odcs validate --roundtrip` failed on an installed CLI** because `deepdiff` was
