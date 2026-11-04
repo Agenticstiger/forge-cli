@@ -603,3 +603,34 @@ def test_an_engine_that_derives_no_sink_config_skips_the_location_text():
     contract["builds"][0]["engine"] = "airbyte"
     errors, _warnings = validate_iceberg_sink(contract)
     assert not any("binding.location.warehouse" in e for e in errors), errors
+
+
+def test_a_rendered_region_is_not_echoed(monkeypatch):
+    """At run a region may hold whatever a {{ env.* }} template rendered."""
+    contract = _kc_contract(None, location=_location(region="{{ env.LAKE_REGION }}"))
+    monkeypatch.setenv("LAKE_REGION", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+    error = iceberg_sink_preflight(_rendered(contract), "ingest")
+    assert error is not None and "binding.location.region" in error
+    assert "wJalrXUtnFEMI" not in error
+
+
+def test_validate_defers_a_template_only_where_it_decides_the_host():
+    """A template in the path leaves the scheme and host to check now."""
+    raw = dict(_AUTHS["bearer"])
+    contract = _kc_contract(raw, location=_location("http://169.254.169.254/{{ env.X }}"))
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any("must be an https:// URL" in e for e in errors), errors
+
+
+def test_a_catalog_not_reached_over_rest_never_reads_the_variable(monkeypatch):
+    """catalogAuth on Glue is already refused; the embedded preflight reads nothing."""
+    registered: List[Any] = []
+    monkeypatch.setattr(
+        "fluid_build.observability.secret_redactor.register_secret", registered.append
+    )
+    location = {"database": "bronze", "table": "orders", "bucket": "lake", "region": "us-east-1"}
+    contract = _dbz_contract(dict(_AUTHS["bearer"]), location=location)
+    contract["exposes"][0]["binding"]["platform"] = "aws"
+    error = iceberg_sink_preflight(contract, "ingest")
+    assert error is not None and "not reached over REST" in error
+    assert registered == []

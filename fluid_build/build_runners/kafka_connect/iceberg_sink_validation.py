@@ -1292,15 +1292,24 @@ _OPERATOR_ONLY = (
 )
 
 
+#: A URL's scheme and authority: what decides where a request goes.
+_URL_HEAD_RE = re.compile(r"[^/]*(?://[^/?#]*)?")
+
+
 def _rendered_at_run(value: str) -> bool:
     """Under ``fluid validate``, does ``value`` wait on a ``{{ env.* }}`` template?
 
     The acquisition dispatcher renders every such template before a runner
     and its preflight see the contract (``build_runners/base.py``), so the
     preflight checks the value the sink receives. ``fluid validate`` sees the
-    template itself, and leaves the check to the run.
+    template itself and leaves the check to the run, but only when the
+    template is where it changes the answer: in a URL's scheme or authority,
+    not in its path.
     """
-    return _AT_RUN.get() is None and bool(ENV_PLACEHOLDER_RE.search(value))
+    if _AT_RUN.get() is not None:
+        return False
+    head = _URL_HEAD_RE.match(value)
+    return bool(ENV_PLACEHOLDER_RE.search(head.group(0) if head else value))
 
 
 def _catalog_uri_reaching(binding: Mapping[str, Any], runtime: IcebergSinkPlan) -> Tuple[str, str]:
@@ -1343,12 +1352,13 @@ def _check_catalog_auth_reach(
 
     In that order, so a refused destination never reads the variable.
     ``refused`` names the catalog kinds not reached over REST: that is already
-    an error, and nothing there reads the credential.
+    an error, and nothing there reads the credential, so nothing reads the
+    variable either.
     """
-    if auth is not None and not refused:
-        if _check_catalog_auth_destinations(head, auth, runtime, targets, errors, warnings):
-            return
-    _check_catalog_auth_env_at_run(head, auth, runtime, errors)
+    if auth is None or refused:
+        return
+    if not _check_catalog_auth_destinations(head, auth, runtime, targets, errors, warnings):
+        _check_catalog_auth_env_at_run(head, auth, runtime, errors)
 
 
 def _credential_destinations(
@@ -1692,8 +1702,9 @@ def _check_location_text(
     if region and "binding.location.region" not in referenced and not _rendered_at_run(region):
         if not _HOST_LABEL_RE.fullmatch(region):
             errors.append(
-                f"iceberg sink (build {bid!r}): binding.location.region {region!r} is not a "
-                "region name such as eu-central-1. The derived sink config passes it to "
+                f"iceberg sink (build {bid!r}): binding.location.region is not a region name "
+                "such as eu-central-1 (the value is not shown: at run it may have come from a "
+                "{{ env.* }} template). The derived sink config passes it to "
                 "Iceberg's AWS client as client.region, which builds the S3 and Glue endpoint "
                 "hosts from it, so it must be one host label: letters, digits and inner "
                 "hyphens, at most 63 characters"
