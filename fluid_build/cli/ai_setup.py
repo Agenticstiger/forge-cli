@@ -241,12 +241,16 @@ def _validate_api_key(provider: Any, api_key: str) -> Optional[str]:
     """Lightweight API call to verify the key works.
 
     One litellm completion validates every provider — there's no
-    per-provider httpx logic anymore. litellm is a core dep so the
-    import always resolves.
+    per-provider httpx logic anymore. litellm is an optional dependency
+    (``[litellm]``): when it is absent this raises
+    :class:`~fluid_build._optional.MissingOptionalDependency`, which the CLI
+    renders as a one-line install hint.
 
     Returns ``None`` on success or a short human-readable error message.
     """
-    import litellm  # core dep
+    from fluid_build._optional import require
+
+    litellm = require("litellm", "litellm", "Validating an AI provider key")
 
     from fluid_build.cli.forge_copilot_llm_litellm import (
         _LITELLM_PREFIX_BY_PROVIDER,
@@ -338,17 +342,13 @@ def _pick_provider(console: Any) -> Optional[str]:
 
     Returns the canonical provider key, or ``None`` if the user skipped.
     """
-    from fluid_build.cli.forge_ui import ask_numbered_choice
-
     # Detect litellm availability once so we can offer the broader
     # list when present, and fall back to the native four when it
     # isn't installed.
-    try:
-        import litellm  # noqa: F401
+    from fluid_build._optional import is_available
+    from fluid_build.cli.forge_ui import ask_numbered_choice
 
-        litellm_available = True
-    except ImportError:
-        litellm_available = False
+    litellm_available = is_available("litellm")
 
     base_choices: List[Tuple[str, str]] = [
         ("gemini", "Google Gemini  (free tier available)"),

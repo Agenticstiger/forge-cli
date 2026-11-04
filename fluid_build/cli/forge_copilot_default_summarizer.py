@@ -128,7 +128,7 @@ def build_default_summarizer(
             # for every provider. Replaces ~30 lines of per-provider
             # request building, header formatting, and httpx posting
             # that the legacy path used to do.
-            import litellm  # core dep
+            import litellm  # optional ([litellm]); an ImportError is handled below
 
             from fluid_build.cli.forge_copilot_llm_litellm import (
                 _LITELLM_PREFIX_BY_PROVIDER,

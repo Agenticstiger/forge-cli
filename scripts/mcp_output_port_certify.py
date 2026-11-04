@@ -178,10 +178,20 @@ def _check_direct_jsonrpc(
     """
     import asyncio
 
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
+    try:
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
 
-    from fluid_build._mcp_compat import attr, self_attesting_client_kwargs
+        from fluid_build._mcp_compat import attr, self_attesting_client_kwargs
+    except ImportError as exc:
+        return CertificationCheck(
+            name="direct_jsonrpc",
+            status="fail",
+            detail=(
+                f"MCP SDK not importable ({exc}). Install it with: "
+                "pip install 'data-product-forge[mcp]'"
+            ),
+        )
 
     cmd = _server_command(contract_path, expose_id=expose_id)
     server_params = StdioServerParameters(

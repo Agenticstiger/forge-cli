@@ -411,7 +411,7 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         run: |
           pip install --upgrade pip
-          pip install -e ".[dev,local]" psycopg
+          pip install -e ".[dev,local,litellm,mcp]" psycopg
 
       - name: Apply seed.sql to dockerized Postgres
         if: steps.gate.outputs.enabled == 'true'
@@ -512,7 +512,7 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         run: |
           pip install --upgrade pip
-          pip install -e ".[dev,snowflake]"
+          pip install -e ".[dev,snowflake,litellm,mcp]"
 
       - name: Run Snowflake e2e
         if: steps.gate.outputs.enabled == 'true'
@@ -585,7 +585,7 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         run: |
           pip install --upgrade pip
-          pip install -e ".[dev,local]"
+          pip install -e ".[dev,local,litellm,mcp]"
 
       - name: Run live LLM gateway tests
         if: steps.gate.outputs.enabled == 'true'
@@ -688,7 +688,7 @@ jobs:
           # binds `platform: postgres`, and without psycopg the gateway
           # answers every tools/call with UnsupportedBindingError. `[dev,local]`
           # alone made this job unpassable from the day it was added.
-          pip install -e ".[dev,local,postgres]"
+          pip install -e ".[dev,local,postgres,litellm,mcp]"
           # Fail HERE if the seed fails. This used to end in
           # `2>/dev/null || true`, which discarded both the error text and the
           # exit code, so a seed that never ran surfaced three steps later as

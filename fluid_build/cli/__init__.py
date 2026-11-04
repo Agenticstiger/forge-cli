@@ -20,7 +20,7 @@ import logging
 import os
 import sys
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fluid_build.cli.console import cprint, info, warning
 from fluid_build.cli.console import error as console_error
@@ -256,6 +256,29 @@ def _force_utf8_streams() -> None:
         except (ValueError, OSError):
             # Detached buffer / non-reconfigurable stream — not worth crashing over.
             pass
+
+
+def _render_missing_optional(e: Any, args: argparse.Namespace, context: Any, cli: Any) -> int:
+    """Print an optional-dependency hint (message + stable slug) and return exit 1."""
+    from fluid_build._console import _redact_str, literal_text
+    from fluid_build._error_catalog import slug_for
+
+    slug = slug_for(e.event)
+    cli.logger.log_safe(
+        "error",
+        "CLI optional dependency missing",
+        extra={
+            "cmd": getattr(args, "cmd", None),
+            "event": e.event,
+            "error_slug": slug,
+            "module": e.module,
+            "extra": e.extra,
+            "exit_code": e.exit_code,
+        },
+    )
+    context.console.print(literal_text(_redact_str(f"❌ {e}"), "red"))
+    context.console.print(literal_text(f"[{slug}]", "dim"))
+    return int(e.exit_code)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -531,6 +554,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise
 
         except Exception as e:  # noqa: BLE001
+            # An optional package is absent (``fluid_build._optional``). Checked
+            # here rather than as its own ``except`` clause so the module is only
+            # imported on the failure path: ``fluid --help`` stays at its budget.
+            # ``str(e)`` is the whole remedy (``<feature> needs <pkg> ... pip
+            # install the extra``): print it and exit 1, no traceback.
+            from fluid_build._optional import MissingOptionalDependency
+
+            if isinstance(e, MissingOptionalDependency):
+                return _render_missing_optional(e, args, context, cli)
+
             # The exception text is data, not markup, as in the CLIError branch
             # above. Parsed as markup, an error quoting ``[/]`` raised
             # ``MarkupError`` from this handler, and the outer fallback then
