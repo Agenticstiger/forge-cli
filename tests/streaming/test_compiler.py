@@ -20,6 +20,10 @@ import pytest
 from fluid_build.streaming.compiler import compile_contract, managed_config, validation_errors
 
 
+def _stream(contract):
+    return contract["builds"][0]["properties"]["stream"]
+
+
 def test_deterministic_artifacts_and_native_table_creation(contract):
     (first,) = compile_contract(contract)
     (second,) = compile_contract(copy.deepcopy(contract))
@@ -44,7 +48,10 @@ def test_deterministic_artifacts_and_native_table_creation(contract):
 
 def test_sql_and_runtime_changes_change_digest(contract):
     (original,) = compile_contract(contract)
-    contract["builds"][0]["properties"]["sql"] += " WHERE event_id <> ''"
+    contract["builds"][0]["properties"]["mapping"] = {
+        "columns": [{"name": "event_time", "from": "event_time", "cast": "timestamp_ltz(6)"}]
+    }
+    contract["exposes"][0]["contract"]["schema"][-1]["type"] = "timestamp_ltz(6)"
     (changed,) = compile_contract(contract)
     assert original.digest != changed.digest
     cfg = managed_config(contract["builds"][0])
@@ -68,8 +75,9 @@ def test_sql_and_runtime_changes_change_digest(contract):
         ),
         (lambda c, f: f["deployment"].pop("context"), "invalid configuration"),
         (lambda c, f: f.update(typo=True), "invalid configuration"),
-        (lambda c, f: f["source"].update(format="protobuf"), "invalid configuration"),
-        (lambda c, f: f["source"].update(format="avro-confluent"), "schemaRegistryUrl"),
+        (lambda c, f: _stream(c).update(format="protobuf"), "format: expected one of"),
+        (lambda c, f: _stream(c).update(format="avro-confluent"), "schemaRegistryUrl"),
+        (lambda c, f: f["source"].update(topic="orders"), "declared in properties.stream"),
         (
             lambda c, f: f["deployment"].update(savepointUri=f["deployment"]["checkpointUri"]),
             "overlap",
@@ -126,9 +134,6 @@ def test_catalog_auth_is_reference_only(contract):
 def test_event_time_and_partition(contract):
     cfg = managed_config(contract["builds"][0])
     cfg["source"]["eventTime"] = {"column": "event_time", "delaySeconds": 5}
-    contract["builds"][0]["properties"][
-        "sql"
-    ] = "SELECT event_id, customer, items, attributes, event_time FROM source_events"
     contract["exposes"][0]["binding"]["icebergConfig"]["partitionSpec"] = [
         {"sourceColumn": "event_time", "transform": "day"},
     ]
@@ -145,7 +150,7 @@ def test_uncompiled_governance_is_rejected(contract, surface):
     elif surface == "column":
         target["schema"][1]["fields"][0]["validationRules"] = {"unique": True}
     elif surface == "source":
-        managed_config(contract["builds"][0])["source"]["schema"][0]["quality"] = ["check"]
+        _stream(contract)["schema"][0]["quality"] = ["check"]
     else:
         target["dq"] = {"tests": ["check"]}
     with pytest.raises(ValueError, match="enforce|policy/quality"):
@@ -211,7 +216,8 @@ def test_null_management_config_is_not_silently_external(contract):
         (lambda c, f: c["exposes"][0]["binding"]["location"].pop("table"), "namespace/database"),
         (lambda c, f: f["source"].update(schemaRegistryUrl="http://registry:8081"), "only to avro"),
         (lambda c, f: f["source"]["eventTime"].update(column="event_id"), "timestamp"),
-        (lambda c, f: c["builds"][0]["properties"].pop("sql"), "SELECT"),
+        (lambda c, f: c["builds"][0]["properties"].pop("stream"), "properties.stream"),
+        (lambda c, f: c["builds"][0]["properties"].update(sql=" "), "SELECT"),
         (
             lambda c, f: c["exposes"][0]["binding"]["icebergConfig"].update(writeVersion=1),
             "version 2",
@@ -230,7 +236,8 @@ def test_invalid_semantic_combinations_fail_before_emission(contract, mutate, ma
 
 def test_avro_source_emits_registry_format_without_json_options(contract):
     cfg = managed_config(contract["builds"][0])
-    cfg["source"].update(format="avro-confluent", schemaRegistryUrl="https://registry.example")
+    _stream(contract)["format"] = "avro-confluent"
+    cfg["source"]["schemaRegistryUrl"] = "https://registry.example"
     (artifact,) = compile_contract(contract)
     assert "'avro-confluent.url' = 'https://registry.example'" in artifact.sql
     assert "json." not in artifact.sql
@@ -286,3 +293,16 @@ def test_duplicate_writers_and_cross_build_state_prefixes_are_rejected(contract)
     contract["exposes"].append(target)
     with pytest.raises(ValueError, match="overlap between"):
         compile_contract(contract)
+
+
+def test_event_time_needs_millisecond_precision(contract):
+    # Flink's rowtime takes precision 0 to 3; a stream timestamp defaults to 6.
+    stream = contract["builds"][0]["properties"]["stream"]
+    stream["schema"][-1]["type"] = "timestamp_ltz"
+    contract["exposes"][0]["contract"]["schema"][-1]["type"] = "timestamp_ltz"
+    with pytest.raises(ValueError, match="precision 3 or less"):
+        compile_contract(contract)
+    stream["metadata"] = [{"name": "kafka_ts", "from": "timestamp"}]
+    managed_config(contract["builds"][0])["source"]["eventTime"]["column"] = "kafka_ts"
+    (artifact,) = compile_contract(contract)
+    assert "WATERMARK FOR `kafka_ts`" in artifact.sql

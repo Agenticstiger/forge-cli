@@ -48,10 +48,18 @@ def test_recursive_odcs_native_shape_and_lossless_extension(contract):
             assert prop["customProperties"][0]["property"] == "fluid.recursiveType"
 
 
+def _schemas(contract):
+    """The output and the stream it is read from: a changed field stays readable."""
+    return (
+        contract["exposes"][0]["contract"]["schema"],
+        contract["builds"][0]["properties"]["stream"]["schema"],
+    )
+
+
 def test_recursive_field_diff_in_canonical_contract(contract):
     new = copy.deepcopy(contract)
-    items = new["exposes"][0]["contract"]["schema"][2]["element"]
-    items["fields"][1]["type"] = "string"
+    for schema in _schemas(new):
+        schema[2]["element"]["fields"][1]["type"] = "string"
     report = compare_contracts(contract, new)
     assert report.has_breaking
     assert any("items.element.fields.price.type" in change.path for change in report.breaking)
@@ -59,20 +67,22 @@ def test_recursive_field_diff_in_canonical_contract(contract):
 
 def test_nested_required_field_addition_is_breaking(contract):
     new = copy.deepcopy(contract)
-    new["exposes"][0]["contract"]["schema"][1]["fields"].append(
-        {
-            "name": "new_required",
-            "type": "string",
-            "required": True,
-        }
-    )
+    for schema in _schemas(new):
+        schema[1]["fields"].append(
+            {
+                "name": "new_required",
+                "type": "string",
+                "required": True,
+            }
+        )
     report = compare_contracts(contract, new)
     assert report.has_breaking
 
 
 def test_array_element_nullability_tightening_is_breaking(contract):
     new = copy.deepcopy(contract)
-    new["exposes"][0]["contract"]["schema"][2]["element"]["required"] = True
+    for schema in _schemas(new):
+        schema[2]["element"]["required"] = True
     report = compare_contracts(contract, new)
     assert report.has_breaking
 

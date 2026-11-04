@@ -36,6 +36,7 @@ from fluid_build.providers._iceberg_catalog import (
 from fluid_build.providers._iceberg_catalog_auth import FORBIDDEN_TEXT_PATTERN, parse_catalog_auth
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.schema_manager import schema_validator
+from fluid_build.streaming.mapping import SOURCE_TABLE, bind_by_name, compile_select, parse_stream
 from fluid_build.streaming.types import LogicalType, columns_sql, parse_fields
 from fluid_build.util.contract import is_externally_run_build
 
@@ -43,6 +44,11 @@ from fluid_build.util.contract import is_externally_run_build
 #: ``parameters.flink`` stays what it was: free-form settings of a job that
 #: runs elsewhere, which forge-cli does not read.
 _MANAGED_SINCE = "0.7.7"
+#: Products whose own properties.sql the operator lets apply deploy
+#: (streaming.policy.refuse_unless_contract_sql_allowed). Defined here, not in
+#: streaming.policy, because validate reaches this module and must not import
+#: build_runners.
+CONTRACT_SQL_ALLOWLIST_ENV = "FLUID_FLINK_CONTRACT_SQL_ALLOWLIST"
 _NAME = r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
 _TEXT = {"type": "string", "minLength": 1}
 _POSITIVE = {"type": "integer", "minimum": 1}
@@ -55,13 +61,10 @@ _CONFIG = {
         "source": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["bootstrapServers", "topic", "groupId", "schema", "format"],
+            "required": ["bootstrapServers", "groupId"],
             "properties": {
                 "bootstrapServers": _TEXT,
-                "topic": _TEXT,
                 "groupId": _TEXT,
-                "format": {"enum": ["json", "avro-confluent"]},
-                "schema": {"type": "array", "minItems": 1, "items": {"type": "object"}},
                 "schemaRegistryUrl": _TEXT,
                 "startupMode": {"enum": ["earliest-offset", "group-offsets"]},
                 "eventTime": {
@@ -225,6 +228,15 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
     cfg = managed_config(build)
     if cfg is None:
         raise ValueError("This Flink build is externally managed; opt in with parameters.flink")
+    source = cfg.get("source")
+    moved = (
+        sorted({"topic", "format", "schema"} & set(source)) if isinstance(source, Mapping) else []
+    )
+    if moved:
+        raise ValueError(
+            f"parameters.flink.source.{moved[0]}: the topic, format and schema of the records "
+            "are declared in properties.stream; parameters.flink.source keeps the connection"
+        )
     # schema_validator, so that a pattern ends at the end of the value, not
     # before a trailing newline as jsonschema's own re.search lets it.
     validator = schema_validator(_CONFIG, default=jsonschema.Draft202012Validator)
@@ -247,10 +259,14 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
     outputs = build.get("outputs")
     if not isinstance(outputs, list) or len(outputs) != 1:
         raise ValueError(f"Flink build {bid}: declare exactly one Iceberg output")
-    targets = [e for e in contract.get("exposes") or [] if e.get("exposeId") == outputs[0]]
+    targets = [
+        (i, e)
+        for i, e in enumerate(contract.get("exposes") or [])
+        if e.get("exposeId") == outputs[0]
+    ]
     if len(targets) != 1:
         raise ValueError(f"Flink build {bid}: output must identify one expose")
-    target = targets[0]
+    index, target = targets[0]
     if (
         target.get("policy")
         or target.get("quality")
@@ -292,33 +308,36 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
         raise ValueError("Iceberg target requires one namespace/database and table")
     namespace, table = (validate_ident(x) for x in table_parts)
     fields = parse_fields((target.get("contract") or {}).get("schema"))
+    props = build.get("properties") or {}
+    if "stream" not in props:
+        raise ValueError(
+            f"Flink build {bid}: managed Flink reads the records properties.stream declares "
+            "(kind, topic, format, schema)"
+        )
+    spec = props["stream"]
+    if isinstance(spec, Mapping):
+        reject_uncompiled_rules(spec.get("schema"))
+        key = spec.get("key")
+        if isinstance(key, Mapping):
+            reject_uncompiled_rules(key.get("schema"))
+    stream = parse_stream(spec, f"Flink build {bid}: properties.stream")
     source = cfg["source"]
-    reject_uncompiled_rules(source["schema"])
-    source_fields = parse_fields(source["schema"])
+    registry = source.get("schemaRegistryUrl")
+    if stream.uses_registry:
+        if not registry:
+            raise ValueError("An avro-confluent value or key requires source.schemaRegistryUrl")
+        _url(registry, "source.schemaRegistryUrl")
+    elif registry:
+        raise ValueError("schemaRegistryUrl applies only to avro-confluent")
     source_options = {
         "connector": "kafka",
-        "topic": source["topic"],
+        "topic": stream.topic,
         "properties.bootstrap.servers": source["bootstrapServers"],
         "properties.group.id": source["groupId"],
         "scan.startup.mode": source.get("startupMode", "group-offsets"),
         "properties.auto.offset.reset": "earliest",
-        "format": source["format"],
+        **stream.format_options(registry),
     }
-    if source["format"] == "avro-confluent":
-        if not source.get("schemaRegistryUrl"):
-            raise ValueError("Avro source requires schemaRegistryUrl")
-        _url(source["schemaRegistryUrl"], "source.schemaRegistryUrl")
-        source_options["avro-confluent.url"] = source["schemaRegistryUrl"]
-    elif source.get("schemaRegistryUrl"):
-        raise ValueError("schemaRegistryUrl applies only to avro-confluent")
-    else:
-        source_options.update(
-            {
-                "json.fail-on-missing-field": "false",
-                "json.ignore-parse-errors": "false",
-                "json.timestamp-format.standard": "ISO-8601",
-            }
-        )
     deployment = cfg["deployment"]
     uris = [deployment[k].rstrip("/") for k in ("checkpointUri", "savepointUri", "haUri")]
     for uri in uris:
@@ -338,26 +357,49 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
     watermark = ""
     if event_time:
         name = validate_ident(event_time["column"])
-        dtype = dict(source_fields).get(name)
+        dtype = stream.columns.get(name)
         if dtype is None or dtype.kind not in {"timestamp", "timestamp_ltz"}:
             raise ValueError("eventTime.column must identify a top-level timestamp")
+        # Flink accepts a rowtime of precision 0 to 3 only, and the stream's default is 6.
+        if (6 if dtype.precision is None else dtype.precision) > 3:
+            raise ValueError(
+                "eventTime.column must be a timestamp of precision 3 or less, such as "
+                "timestamp_ltz(3): Flink's event time is milliseconds"
+            )
         watermark = (
             f",\n  WATERMARK FOR `{name}` AS `{name}`"
             f" - INTERVAL '{event_time['delaySeconds']}' SECOND"
         )
-    sql = (build.get("properties") or {}).get("sql")
-    if not isinstance(sql, str) or not sql.strip():
-        raise ValueError("Flink build requires a SELECT query in properties.sql")
-    # This gate is intentionally conservative. Flink's matching planner performs
-    # authoritative semantic validation; Forge must not mistake DDL for a transform.
-    if not re.match(r"(?is)^\s*SELECT\b", sql) or ";" in sql:
-        raise ValueError("Managed Flink properties.sql must be a single SELECT without semicolons")
-    # A /*+ OPTIONS(...) */ hint overrides the source's connector options at query
-    # time (dynamic table options are on by default), so contract SQL could point
-    # the Kafka source at another broker or wire a config provider that reads the
-    # pod's secrets. Flink reads a hint only from the literal "/*+" token.
-    if "/*+" in sql:
-        raise ValueError("Managed Flink properties.sql must not contain SQL hints (/*+ ... */)")
+    sql = props.get("sql")
+    if sql is not None and props.get("mapping") is not None:
+        raise ValueError(
+            f"Flink build {bid}: declare properties.mapping or properties.sql, not both"
+        )
+    if sql is None:
+        query = compile_select(
+            stream,
+            props.get("mapping"),
+            fields,
+            where=f"Flink build {bid}: properties.mapping",
+            target_where=f"exposes[{index}].contract.schema",
+        )
+    else:
+        # A contract's own SELECT, bound by name to the output columns.
+        if not isinstance(sql, str) or not sql.strip():
+            raise ValueError("Flink build properties.sql must be a SELECT query")
+        # This gate is intentionally conservative. Flink's matching planner performs
+        # authoritative semantic validation; Forge must not mistake DDL for a transform.
+        if not re.match(r"(?is)^\s*SELECT\b", sql) or ";" in sql:
+            raise ValueError(
+                "Managed Flink properties.sql must be a single SELECT without semicolons"
+            )
+        # A /*+ OPTIONS(...) */ hint overrides the source's connector options at query
+        # time (dynamic table options are on by default), so contract SQL could point
+        # the Kafka source at another broker or wire a config provider that reads the
+        # pod's secrets. Flink reads a hint only from the literal "/*+" token.
+        if "/*+" in sql:
+            raise ValueError("Managed Flink properties.sql must not contain SQL hints (/*+ ... */)")
+        query = bind_by_name(sql, fields)
     iceberg = binding.get("icebergConfig") or {}
     if iceberg.get("writeVersion", 2) != 2:
         raise ValueError("Managed Flink requires Iceberg format version 2")
@@ -429,9 +471,9 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
         f"CREATE DATABASE IF NOT EXISTS `lake`.`{namespace}`",
         f"CREATE TABLE IF NOT EXISTS {target_name} (\n  {columns_sql(fields)}\n)"
         f"{partition_sql}\nWITH (\n  {_options({'format-version': '2', 'write.format.default': iceberg.get('fileFormat', 'parquet'), **table_properties})}\n)",
-        f"CREATE TEMPORARY TABLE `source_events` (\n  {columns_sql(source_fields)}{watermark}\n)"
+        f"CREATE TEMPORARY TABLE `{SOURCE_TABLE}` (\n  {stream.ddl()}{watermark}\n)"
         f" WITH (\n  {_options(source_options)}\n)",
-        f"INSERT INTO {target_name}\n{sql.strip()}",
+        f"INSERT INTO {target_name}\n{query}",
     )
     payload = {
         "artifactVersion": "flink-iceberg-v1",
@@ -539,8 +581,24 @@ def compile_build(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Flin
 
 
 def compile_contract(contract: Mapping[str, Any]) -> tuple[FlinkArtifacts, ...]:
+    return tuple(artifact for _, artifact in compile_builds(contract))
+
+
+def compile_builds(
+    contract: Mapping[str, Any],
+) -> tuple[tuple[Mapping[str, Any], FlinkArtifacts], ...]:
+    """Each managed build with the artifacts compiled from it, paired by position.
+
+    Whatever acts on an artifact checks the build it came from, never one found by
+    id: two builds may share an id, and an operator's allowlists would then be
+    judged on the wrong one.
+    """
     builds = managed_builds(contract)
     artifacts = tuple(compile_build(contract, build) for build in builds)
+    ids = [a.build_id for a in artifacts]
+    repeated = sorted({i for i in ids if ids.count(i) > 1})
+    if repeated:
+        raise ValueError(f"Managed Flink build ids must be unique; {repeated[0]!r} is used twice")
     if builds and (
         len(builds) != len(contract.get("builds") or [])
         or {e.get("exposeId") for e in contract.get("exposes") or []}
@@ -571,7 +629,7 @@ def compile_contract(contract: Mapping[str, Any]) -> tuple[FlinkArtifacts, ...]:
         for b in prefixes[i + 1 :]
     ):
         raise ValueError("State storage prefixes must not overlap between managed builds")
-    return artifacts
+    return tuple(zip(builds, artifacts, strict=True))
 
 
 def validation_errors(contract: Mapping[str, Any]) -> list[str]:
@@ -585,10 +643,30 @@ def validation_errors(contract: Mapping[str, Any]) -> list[str]:
 def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
     """An older contract that asks for the managed lane still validates, as before.
 
-    Its build stays run outside forge-cli, so say why nothing will deploy it.
+    Its build stays run outside forge-cli, so say why nothing will deploy it. On the
+    preview, a managed build that brings its own SQL is told that apply needs the
+    operator to allow it.
     """
     if managed_lane_enabled(contract):
-        return []
+        try:
+            builds = managed_builds(contract)
+        except (ValueError, KeyError, TypeError):
+            return []  # validation_errors reports it
+        warnings = [
+            f"Build {build.get('id')}: properties.sql is run only if the operator lists "
+            f"{contract.get('id')} in {CONTRACT_SQL_ALLOWLIST_ENV}; properties.mapping is "
+            "checked against the output before deploy and reads nothing but the stream"
+            for build in builds
+            if (build.get("properties") or {}).get("sql") is not None
+        ]
+        for build in contract.get("builds") or []:
+            props = build.get("properties") if isinstance(build, Mapping) else None
+            if isinstance(props, Mapping) and "mapping" in props and build not in builds:
+                warnings.append(
+                    f"Build {build.get('id')}: properties.mapping is compiled only by the "
+                    "managed Flink lane (parameters.flink.management); nothing reads it here"
+                )
+        return warnings
     warnings = []
     for build in contract.get("builds") or []:
         props = build.get("properties") if isinstance(build, Mapping) else None

@@ -17,7 +17,7 @@ on:
       - "fluid_build/providers/_iceberg*.py"
       - "fluid_build/iac/providers/aws.py"
       - "fluid_build/build_runners/base.py"
-      - "fluid_build/api/changelog_rules.py"
+      - "fluid_build/api/changelog*.py"
       - "examples/flink-iceberg/**"
       - "tests/streaming/**"
       - "tests/integration/test_flink_iceberg_live.py"

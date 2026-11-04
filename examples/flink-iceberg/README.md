@@ -6,6 +6,55 @@ operator prerequisites, workflow, limits and certification status.
 The [contract](contract.fluid.yaml) preserves five nested structs, arrays of
 structs, exact decimal prices, maps and event-time timestamps.
 
+## Record shapes
+
+A build declares the records it reads in `properties.stream`:
+- the topic;
+- the value's format (`json` or `avro-confluent`) and its fields, as columns;
+- optionally the record key (`raw`, `json` or `avro-confluent`);
+- optionally Kafka metadata (`topic`, `partition`, `offset`, `timestamp`,
+  `timestamp-type`, `headers`, `leader-epoch`), each read as a column.
+
+`properties.mapping` says how the records become the output's rows. forge-cli
+writes the query from the two, and checks every output column's type and
+nullability against the path it is read from before anything deploys. An output
+column the mapping does not list is read from the stream column at the same
+path. So a stream landed as it is, flat or nested, needs no mapping, like the
+contract above.
+
+The [shapes](shapes) directory reads one stream, kept in a
+[fragment](shapes/fragments/streams/orders.yaml), into two products:
+- [order-items](shapes/order-items/contract.fluid.yaml) flattens each event to
+  one row per item. It lifts nested fields to columns, explodes `items`, looks
+  up a map entry and a header, and keeps the record key and the Kafka position.
+- [orders-nested](shapes/orders-nested/contract.fluid.yaml) writes each event as
+  a nested row in a shape of its own:
+  - structs built from fields that are flat or elsewhere in the record (a
+    dotted name such as `order.key` maps one field);
+  - a subset of `customer` that stays null where the customer is;
+  - the coordinates struct moved up;
+  - the Kafka position grouped in one struct.
+
+Their `$ref`s reach the shared fragment through the
+[workspace](shapes/fluid.workspace.yaml). Check a fragment on its own, naming
+the schema version because the workspace has no root contract:
+
+```bash
+fluid validate --schema-version 0.7.7 --fragment streamSource shapes/fragments/streams/orders.yaml
+```
+
+`--fragment recordMapping` checks a mapping, and `--fragment schema` a column list.
+
+A build may run its own `properties.sql` instead, read by output column name.
+That SQL runs with the job's catalog identity, so it can read any table that
+identity can read, not only the stream. `fluid apply` therefore refuses it unless
+the operator lists it in `FLUID_FLINK_CONTRACT_SQL_ALLOWLIST`.
+
+List it as `<product>/<build>@sha256:<digest>`, which the refusal prints. That
+entry approves the SQL that was reviewed and nothing it is later edited into.
+`<product>/<build>` and `<product>` approve whatever SQL the build or product
+runs.
+
 ## Run the data-plane proof locally
 
 Requirements: a working Docker daemon with Compose, Forge's test environment,
@@ -26,9 +75,11 @@ normal `/tmp` or hidden home directories.
 
 The test uses a unique Compose project and loopback-only random host ports,
 produces events, restarts the task manager, produces another batch, independently
-compares every nested value and then checks schema-drift refusal. Containers,
-networks and volumes are removed in `finally`. Fixture credentials are local test
-values only. Docker images and build cache are retained.
+compares every nested value and then checks schema-drift refusal. A second test
+runs both shapes from the same keyed records with a header, and compares their
+rows with what was produced. Containers, networks and volumes are removed in
+`finally`. Fixture credentials are local test values only. Docker images and
+build cache are retained.
 
 Do not run `compose up` directly without generating/mounting `job.properties`;
 the test does that from the actual compiler output.

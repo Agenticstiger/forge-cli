@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .base import (
     ExportCtx,
@@ -217,6 +217,11 @@ def _property_to_field(prop: Mapping[str, Any]) -> Dict[str, Any]:
         ("criticalDataElement", "critical_data_element"),
         ("authoritativeDefinitions", "authoritative_definitions"),
         ("customProperties", "custom_properties"),
+        # Property lineage: FLUID derives it from a build's stream mapping on export,
+        # and an imported contract carries no build, so it is kept as written.
+        ("transformSourceObjects", "transform_source_objects"),
+        ("transformLogic", "transform_logic"),
+        ("transformDescription", "transform_description"),
     ):
         if src in prop:
             pt[dst] = prop[src]
@@ -267,6 +272,7 @@ def _extract_schema(fluid: Mapping[str, Any], include_quality: bool = True) -> L
             continue
 
         expose_id = expose.get("exposeId") or expose.get("id") or "dataset"
+        grain = _add_stream_lineage(fluid, expose_id, contract_schema, properties)
         pt = get_expose_passthrough(expose)
 
         physical_type = pt.get("physical_type") or _platform_to_physical_type(provider)
@@ -285,6 +291,8 @@ def _extract_schema(fluid: Mapping[str, Any], include_quality: bool = True) -> L
             schema_object["physicalName"] = physical_name
         if expose.get("description"):
             schema_object["description"] = expose["description"]
+        if grain:
+            schema_object["dataGranularityDescription"] = grain
 
         # Pass-through extras
         for src, dst in (
@@ -301,6 +309,91 @@ def _extract_schema(fluid: Mapping[str, Any], include_quality: bool = True) -> L
 
         odcs_schema.append(schema_object)
     return odcs_schema
+
+
+def _add_stream_lineage(
+    fluid: Mapping[str, Any],
+    expose_id: Any,
+    columns: List[Mapping[str, Any]],
+    properties: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Mark each property read from a build's ``properties.stream`` with its source.
+
+    ODCS v3's property lineage: the topic as ``transformSourceObjects`` and the path the
+    column (or a nested field mapped on its own) is read from as ``transformLogic``.
+    Returns the row grain an explode sets, for ``dataGranularityDescription``.
+    """
+    builds = [
+        build
+        for build in fluid.get("builds") or []
+        if isinstance(build, Mapping)
+        and expose_id in (build.get("outputs") or [])
+        and isinstance(build.get("properties"), Mapping)
+    ]
+    if len(builds) != 1:
+        return None
+    lineage = _stream_lineage(builds[0]["properties"], columns)
+    if lineage is None:
+        return None
+    topic, paths, grain = lineage
+
+    def mark(prefix: str, props: List[Dict[str, Any]]) -> None:
+        for prop in props:
+            name = f"{prefix}{prop.get('name')}"
+            if name in paths:
+                prop["transformSourceObjects"] = [topic]
+                prop["transformLogic"] = paths[name]
+            elif isinstance(prop.get("properties"), list):
+                mark(name + ".", prop["properties"])
+
+    mark("", properties)
+    return grain
+
+
+def _stream_lineage(
+    properties: Mapping[str, Any], target: Sequence[Any]
+) -> tuple[str, dict[str, str], str | None] | None:
+    """Where each output column, and each nested field mapped on its own, is read from.
+
+    For catalogs (ODCS ``transformSourceObjects``/``transformLogic``): the stream's topic,
+    ``{output path: source path}`` and the row grain an explode sets. It describes the
+    contract and does not compile it, so `fluid validate` still reports a mapping that
+    cannot be compiled; a build that runs its own SQL has no lineage to report.
+    """
+    stream = properties.get("stream")
+    mapping = properties.get("mapping") or {}
+    if properties.get("sql") is not None or not isinstance(stream, Mapping):
+        return None
+    topic = stream.get("topic")
+    if not isinstance(topic, str) or not isinstance(mapping, Mapping):
+        return None
+    overrides = {
+        entry["name"]: entry["from"]
+        for entry in mapping.get("columns") or []
+        if isinstance(entry, Mapping)
+        and isinstance(entry.get("name"), str)
+        and isinstance(entry.get("from"), str)
+    }
+    paths: dict[str, str] = {}
+
+    def walk(prefix: str, fields: Any) -> None:
+        for field in fields if isinstance(fields, list) else []:
+            if not isinstance(field, Mapping) or not isinstance(field.get("name"), str):
+                continue
+            name = prefix + field["name"]
+            if name in overrides:
+                paths[name] = overrides[name]
+            elif any(key.startswith(name + ".") for key in overrides):
+                walk(name + ".", field.get("fields"))
+            else:
+                paths[name] = name
+
+    walk("", target)
+    explode = mapping.get("explode")
+    grain = None
+    if isinstance(explode, Mapping) and isinstance(explode.get("path"), str):
+        grain = f"One row per element of {explode['path']} in each record of topic {topic}"
+    return topic, paths, grain
 
 
 def _expose_provider(expose: Mapping[str, Any]) -> Optional[str]:
@@ -434,6 +527,9 @@ def _field_to_property(
         ("critical_data_element", "criticalDataElement"),
         ("authoritative_definitions", "authoritativeDefinitions"),
         ("custom_properties", "customProperties"),
+        ("transform_source_objects", "transformSourceObjects"),
+        ("transform_logic", "transformLogic"),
+        ("transform_description", "transformDescription"),
     ):
         if src in pt:
             prop[dst] = pt[src]

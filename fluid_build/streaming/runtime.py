@@ -29,10 +29,11 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from fluid_build.providers._iceberg_catalog import resolve_iceberg_catalog
-from fluid_build.streaming.compiler import FlinkArtifacts, compile_contract, managed_config
+from fluid_build.streaming.compiler import FlinkArtifacts, compile_builds, managed_config
 from fluid_build.streaming.policy import (
     catalog_request_guard,
     refuse_unless_catalog_targets_allowed,
+    refuse_unless_contract_sql_allowed,
     refuse_unless_deployment_allowed,
 )
 from fluid_build.streaming.types import LogicalType
@@ -178,7 +179,7 @@ def reconcile(
     dry_run: bool = False,
     timeout_seconds: float = 300,
 ) -> list[dict[str, Any]]:
-    artifacts = compile_contract(contract)
+    compiled = compile_builds(contract)
     if mode.startswith("replace"):
         raise StreamingError(
             "replace/reset is not supported for managed streams; restore state explicitly"
@@ -188,10 +189,9 @@ def reconcile(
     dry_run = dry_run or mode == "dry-run"
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise StreamingError("Readiness timeout must be positive")
-    builds = {b["id"]: b for b in contract.get("builds") or []}
     pending: list[tuple[FlinkArtifacts, Kubectl, dict[str, Any] | None]] = []
-    for artifact in artifacts:
-        build = builds[artifact.build_id]
+    for build, artifact in compiled:
+        refuse_unless_contract_sql_allowed(contract.get("id"), build)
         client = _client(build)
         desired = artifact.resources[1]
         name = desired["metadata"]["name"]
@@ -453,10 +453,9 @@ def catalog_evidence(
 
 def inspect_drift(contract: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Compare live resources to their immutable last-applied spec, not the next plan."""
-    builds = {b["id"]: b for b in contract.get("builds") or []}
     results = []
-    for artifact in compile_contract(contract):
-        client = _client(builds[artifact.build_id])
+    for build, artifact in compile_builds(contract):
+        client = _client(build)
         name = artifact.resources[1]["metadata"]["name"]
         current = client.get("flinkdeployment", name)
         if current is None:
@@ -500,9 +499,7 @@ def inspect_drift(contract: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 def _verify_once(contract: Mapping[str, Any]) -> list[dict[str, Any]]:
     results = []
-    builds = {b["id"]: b for b in contract.get("builds") or []}
-    for artifact in compile_contract(contract):
-        build = builds[artifact.build_id]
+    for build, artifact in compile_builds(contract):
         cfg = managed_config(build)
         if cfg is None:
             raise StreamingError("Expected managed configuration")
