@@ -440,6 +440,8 @@ def _execute(ctx: RunContext, runner: KafkaConnectRunner) -> RunResult:
                 # ``env:<NAME>`` references only; the variable lives on the
                 # Connect worker, out of this process's sight, so there is no
                 # run check for it here (the embedded Debezium runner has one).
+                # The preflight above refused it unless the operator pairs it
+                # with every host it reaches.
                 catalog_auth=catalog_auth_of(props.get("sink")),
             )
             # A bucket whose variable is unset or empty here resolved to one the

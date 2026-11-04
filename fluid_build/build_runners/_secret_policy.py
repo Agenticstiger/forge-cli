@@ -201,9 +201,10 @@ def variable_allowed(
 ) -> bool:
     """Whether ``variable`` may be sent to ``host``: the decision, without wording.
 
-    For a caller that phrases its own refusal (the managed Flink lane's catalog
-    token, ``streaming/policy.py``). A loopback host needs no entry, unless
-    ``loopback_exempt`` is false: a send made from somewhere other than this
+    For a caller that phrases its own refusal: the managed Flink lane's catalog
+    token (``streaming/policy.py``) and the Iceberg sinks' catalog token
+    (``kafka_connect/iceberg_sink_validation.py``). A loopback host needs no entry,
+    unless ``loopback_exempt`` is false: a send made from somewhere other than this
     process, where loopback is not this machine (a pod's own network namespace,
     or a sidecar injected into it), is judged by the allowlist alone.
     """

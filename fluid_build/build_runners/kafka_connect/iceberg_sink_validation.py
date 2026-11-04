@@ -63,7 +63,17 @@ Snowflake-managed table for the same expose. Per sink build:
   properties it emits; an embedded Debezium run also needs its variable set
   (the Kafka Connect variable lives on the worker, which forge-cli cannot
   see); and an override map that inlines a ``credential`` or ``token`` value
-  is a warning.
+  is a warning;
+* every host a ``sink.catalogAuth`` credential reaches (the catalog, and an
+  OAuth2 token endpoint) must be https and must not be link-local, an error
+  here and in the run's preflight; and the operator must allow it: the variable
+  paired with the host (``NAME@host``), and a hostname listed, because the
+  worker or the server resolves it itself. Those lists are the operator's, so
+  a missing entry is a warning here and an error in the preflight, which
+  checks it before the variable is read;
+* the ``binding.location`` text a derived sink config carries must not start
+  with ``env:`` or hold ``${`` or a control character, and ``client.region``
+  must be one host label.
 
 Debezium builds in ``bring-your-own`` / ``managed`` mode create only the SOURCE
 connector (no sink is derived), so none of this applies to them; an embedded
@@ -86,8 +96,10 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import ipaddress
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import (
     AbstractSet,
@@ -100,9 +112,13 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Union,
 )
+from urllib.parse import urlsplit
 
+from ..._net import is_public_address
 from ...providers._iceberg_catalog import (
+    BIGQUERY_LOCATION,
     BIGQUERY_PROJECT_ID,
     BUCKET_WAREHOUSE_KINDS,
     DYNAMODB_CATALOG_IMPL,
@@ -111,6 +127,7 @@ from ...providers._iceberg_catalog import (
     FAMILY_UNKNOWN,
     GLUE_CATALOG_IMPL,
     CatalogKind,
+    ResolvedIcebergCatalog,
     binding_catalog_kind,
     canonical_catalog_kind,
     catalog_kind_info,
@@ -125,12 +142,20 @@ from ...providers._iceberg_catalog_auth import (
     AUTH_OWNED_PROPERTIES,
     AUTHORIZATION_HEADER_PROPERTY,
     CATALOG_AUTH_FIELD,
+    FORBIDDEN_TEXT_PATTERN,
     INLINE_CHECKED_KEYS,
     CatalogAuth,
     is_literal_secret,
     parse_catalog_auth,
     raw_catalog_auth,
 )
+from ...util.binding_paths import ENV_PLACEHOLDER_RE
+from .._deployment_host_policy import ALLOWLIST_ENV as HOST_ALLOWLIST_ENV
+from .._deployment_host_policy import _on_allowlist
+from .._deployment_host_policy import allowlist as host_allowlist
+from .._secret_policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
+from .._secret_policy import allowlist as secret_ref_allowlist
+from .._secret_policy import is_loopback, variable_allowed
 
 LOG = logging.getLogger("fluid.acquire.iceberg_sink")
 
@@ -436,7 +461,7 @@ def _check_build(
             "streamingSink.routeField"
         )
 
-    _check_catalog_auth(bid, sink, runtime, targets, errors)
+    _check_catalog_auth(bid, sink, runtime, targets, errors, warnings)
     _check_inlined_secrets(bid, sink, runtime, warnings)
 
     # The catalog checks read each expose the sink writes. A Debezium Server
@@ -506,6 +531,8 @@ def _check_catalog(
             f"use one of: {', '.join(known_catalog_kinds())}"
         )
         return
+    if runtime.derives and runtime.engine in _CATALOG_AUTH_ENGINES:
+        _check_location_text(bid, binding, sink, runtime, errors)
 
     # The sink must write through the catalog dbt and the IaC read. Both read
     # only the expose, so a ``sink.catalog``, an override or a hand-written
@@ -1136,9 +1163,10 @@ def _check_catalog_auth(
     runtime: IcebergSinkPlan,
     targets: Sequence[Mapping[str, Any]],
     errors: List[str],
+    warnings: List[str],
 ) -> None:
-    """``sink.catalogAuth``: shape, catalog, derivation, overrides, and the
-    embedded Debezium variable at run time. HARD."""
+    """``sink.catalogAuth``: shape, catalog, derivation, overrides, the hosts it
+    reaches, and the embedded Debezium variable at run time. HARD."""
     raw = raw_catalog_auth(sink)
     if raw is None:
         return
@@ -1214,7 +1242,7 @@ def _check_catalog_auth(
                 f"keys from {label}, or remove sink.{CATALOG_AUTH_FIELD}"
             )
 
-    _check_catalog_auth_env_at_run(head, auth, runtime, errors)
+    _check_catalog_auth_reach(head, auth, refused, runtime, targets, errors, warnings)
 
 
 def _check_catalog_auth_env_at_run(
@@ -1252,6 +1280,298 @@ def _check_catalog_auth_env_at_run(
     run_only.append(issue)
 
 
+#: The environment each engine resolves ``sink.catalogAuth``'s ``env:<NAME>`` from.
+_RESOLVED_FROM: Mapping[str, str] = {
+    "kafka-connect": "the Kafka Connect worker's environment",
+    "debezium": "this runner's environment, which the embedded Debezium Server inherits,",
+}
+
+_OPERATOR_ONLY = (
+    "in the OPERATOR environment (a shell or CI variable, not a project .env, which is "
+    "ignored for these settings)"
+)
+
+
+#: A URL's scheme and authority: what decides where a request goes.
+_URL_HEAD_RE = re.compile(r"[^/]*(?://[^/?#]*)?")
+
+
+def _rendered_at_run(value: str) -> bool:
+    """Under ``fluid validate``, does ``value`` wait on a ``{{ env.* }}`` template?
+
+    The acquisition dispatcher renders every such template before a runner
+    and its preflight see the contract (``build_runners/base.py``), so the
+    preflight checks the value the sink receives. ``fluid validate`` sees the
+    template itself and leaves the check to the run, but only when the
+    template is where it changes the answer: in a URL's scheme or authority,
+    not in its path.
+    """
+    if _AT_RUN.get() is not None:
+        return False
+    head = _URL_HEAD_RE.match(value)
+    return bool(ENV_PLACEHOLDER_RE.search(head.group(0) if head else value))
+
+
+def _catalog_uri_reaching(binding: Mapping[str, Any], runtime: IcebergSinkPlan) -> Tuple[str, str]:
+    """The catalog uri the sink's REST client calls, and the setting that names it.
+
+    ``binding.location.uri``, unless an override map merged over the derived
+    config sets the uri property: the last one wins, as the runner merges them.
+    The credential goes wherever this points.
+    """
+    key = f"{_property_prefix(runtime)}uri"
+    uri = str((binding.get("location") or {}).get("uri") or "")
+    source = "binding.location.uri"
+    for label, mapping in runtime.overrides:
+        if key in mapping:
+            uri, source = str(mapping[key] or ""), f"{label} {key}"
+    return uri, source
+
+
+def _ip_literal(host: str) -> Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
+    """``host`` as an address, an IPv4-mapped IPv6 one as its IPv4; ``None`` for a name.
+
+    Parsed as written: ``10.0.0.1%25.example`` is a name, not 10.0.0.1.
+    """
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
+
+
+def _check_catalog_auth_reach(
+    head: str,
+    auth: Optional[CatalogAuth],
+    refused: Sequence[str],
+    runtime: IcebergSinkPlan,
+    targets: Sequence[Mapping[str, Any]],
+    errors: List[str],
+    warnings: List[str],
+) -> None:
+    """The hosts the credential reaches, then the embedded Debezium variable.
+
+    In that order, so a refused destination never reads the variable.
+    ``refused`` names the catalog kinds not reached over REST: that is already
+    an error, and nothing there reads the credential, so nothing reads the
+    variable either.
+    """
+    if auth is None or refused:
+        return
+    if not _check_catalog_auth_destinations(head, auth, runtime, targets, errors, warnings):
+        _check_catalog_auth_env_at_run(head, auth, runtime, errors)
+
+
+def _credential_destinations(
+    auth: CatalogAuth, runtime: IcebergSinkPlan, targets: Sequence[Mapping[str, Any]]
+) -> List[Tuple[str, str, str]]:
+    """``(role, setting, url)`` for each host the credential reaches.
+
+    The catalog the sink calls (:func:`_catalog_uri_reaching`), once per uri,
+    and for ``oauth2`` the token endpoint, which receives the credential itself
+    while the catalog receives a token minted from it.
+    """
+    destinations: List[Tuple[str, str, str]] = []
+    for target in targets:
+        uri, source = _catalog_uri_reaching(target.get("binding") or {}, runtime)
+        if uri.strip() and all(uri != url for _role, _source, url in destinations):
+            destinations.append(("Iceberg catalog", source, uri))
+    if auth.type == "oauth2":
+        source = f"sink.{CATALOG_AUTH_FIELD}.oauth2ServerUri"
+        destinations.append(("OAuth2 token endpoint", source, auth.oauth2_server_uri))
+    return destinations
+
+
+def _received(auth: CatalogAuth, role: str) -> str:
+    """What the ``role`` host receives of the credential, for the messages."""
+    if role == "OAuth2 token endpoint":
+        return f"the credential in {auth.env_var} (the client id and secret)"
+    if auth.type == "oauth2":
+        return f"a token minted from the credential in {auth.env_var}"
+    return f"the token in {auth.env_var}"
+
+
+#: A host the operator can list: a DNS name (``urlsplit`` has lowercased it) or
+#: an IP address, in plain characters. The refusal's ``export`` line repeats
+#: the host, so a quote, ``$(`` or comma there would turn the operator's paste
+#: into a command, or into a bare entry that lets some other variable go to any
+#: host. A ``%`` zone id names an interface, never a remote catalog.
+_PLAIN_HOST_RE = re.compile(r"[a-z0-9._-]+|[0-9a-f:.]+")
+
+
+def _not_https(source: str, role: str, receives: str) -> str:
+    return (
+        f"{source} must be an https:// URL: the {role} receives {receives} on every "
+        "request, and http would carry it in clear text, so a loopback host needs https too"
+    )
+
+
+def _destination_host(url: str, source: str, role: str, receives: str) -> Tuple[str, str]:
+    """``(host, "")`` for a destination the operator may allow, else ``("", why not)``.
+
+    "Why not" is a refusal no operator entry changes: the URL is not https (a
+    loopback one included), carries a ``user:password@`` part, names no plain
+    host (:data:`_PLAIN_HOST_RE`), or names a link-local or unspecified
+    address, where cloud instance metadata lives (the deployment host policy's
+    rule). Python and the JVM split a URL's authority alike only when it holds
+    no such part, so the host checked here is the one the sink connects to.
+    """
+    no_host = f"{source} names no host, so where the {role} sends {receives} cannot be checked"
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+    except ValueError:  # an unbalanced "[" in the netloc: no host can be read
+        return "", no_host
+    if parts.scheme != "https":
+        return "", _not_https(source, role, receives)
+    if "@" in parts.netloc:
+        return "", (
+            f"{source} carries a user:password@ part (not shown). Remove it: the {role} "
+            f"receives {receives}, and a credential belongs in that variable, not in the URL"
+        )
+    if not host:
+        return "", no_host
+    if not _PLAIN_HOST_RE.fullmatch(host):
+        return "", (
+            f"{source} names a host that is not a plain DNS name or IP address (letters, "
+            "digits, '.', '-' and '_'; a non-ASCII name in its xn-- form; no zone id). It "
+            f"is not shown, and the {role} would receive {receives}"
+        )
+    address = _ip_literal(host)
+    if address is not None and (address.is_link_local or address.is_unspecified):
+        return "", (
+            f"the {role} host {host!r} ({source}) is link-local or unspecified, where cloud "
+            "instance metadata lives; this is refused even with an allowlist entry"
+        )
+    return host, ""
+
+
+def _unlisted_host(host: str) -> Optional[str]:
+    """Why ``host`` needs a host-list entry the operator has not given, or ``None``.
+
+    The rule the founder chose for these sinks on 2026-11-04. The Kafka Connect
+    worker or the Debezium Server
+    resolves a hostname itself, after this check, so no DNS answer seen here
+    shows where it will connect: a name passes only when the operator lists it
+    in ``FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST``, or when it is
+    ``localhost``. An IP literal keeps the deployment host policy's rules
+    (``_deployment_host_policy.py``): a private or loopback address needs no
+    entry, a public one is listed (link-local is refused before this, by
+    :func:`_destination_host`). Nothing is resolved. A listed host is matched by
+    that policy's own suffix rule, so the two lists cannot read differently.
+    """
+    if _on_allowlist(host, host_allowlist()):
+        return None
+    if _ip_literal(host) is not None:
+        return (
+            f"is a public address not in {HOST_ALLOWLIST_ENV}" if is_public_address(host) else None
+        )
+    return None if is_loopback(host) else f"is a name not in {HOST_ALLOWLIST_ENV}"
+
+
+def _check_catalog_auth_destinations(
+    head: str,
+    auth: CatalogAuth,
+    runtime: IcebergSinkPlan,
+    targets: Sequence[Mapping[str, Any]],
+    errors: List[str],
+    warnings: List[str],
+) -> bool:
+    """Every host the credential reaches must be https and allowed by the operator.
+
+    The contract names the variable (``tokenEnv`` / ``credentialEnv``) and the
+    hosts (:func:`_credential_destinations`). Iceberg resolves ``env:<NAME>``
+    where the sink runs (on embedded Debezium, from this runner's whole
+    environment) and sends the value there, so without an operator boundary any
+    variable there could go to a host the contract chose. Each host needs:
+
+    * https, and an address no entry has to rule out (:func:`_destination_host`).
+      HARD;
+    * the variable paired with it in ``FLUID_ACQUISITION_SECRET_REF_ALLOWLIST``
+      (``NAME@host``), unless it is loopback (``_secret_policy.variable_allowed``);
+    * a hostname listed in ``FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST``
+      (:func:`_unlisted_host`).
+
+    Both lists are operator-only (``credentials/protected_env.py`` ignores a
+    project dotenv file's value) and are read where the sink config is
+    derived: the run's preflight refuses, and ``fluid validate``, which may run
+    without them, warns with the entries the run needs. Returns ``True`` when
+    the run must stop.
+    """
+    hard: List[str] = []
+    reasons: List[str] = []
+    pairs: List[str] = []
+    hosts: List[str] = []
+    for role, source, url in _credential_destinations(auth, runtime, targets):
+        if _rendered_at_run(url):
+            # A template decides the host, which the run checks once rendered;
+            # a scheme written out is decided now.
+            scheme, written, _rest = url.partition("://")
+            if written and not ENV_PLACEHOLDER_RE.search(scheme):
+                if scheme.strip().lower() != "https":
+                    hard.append(f"{head}: {_not_https(source, role, _received(auth, role))}")
+            continue
+        host, problem = _destination_host(url, source, role, _received(auth, role))
+        if problem:
+            hard.append(f"{head}: {problem}")
+            continue
+        unlisted = _unlisted_host(host)
+        if unlisted is not None:
+            reasons.append(f"the {role} host {host!r} {unlisted}")
+            hosts.append(host)
+        if not variable_allowed(auth.env_var, host):
+            reasons.append(
+                f"{auth.env_var} is not paired with the {role} host {host!r} in "
+                f"{SECRET_REF_ALLOWLIST_ENV}"
+            )
+            pairs.append(f"{auth.env_var}@{host}")
+    errors.extend(hard)
+    if reasons:
+        issue = _unallowed_destinations(head, auth, runtime, reasons, pairs, hosts)
+        run_only = _AT_RUN.get()
+        if run_only is None:
+            warnings.append(issue)
+        else:
+            errors.append(issue)
+            run_only.append(issue)
+    return bool(hard or reasons)
+
+
+def _unallowed_destinations(
+    head: str,
+    auth: CatalogAuth,
+    runtime: IcebergSinkPlan,
+    reasons: Sequence[str],
+    pairs: Sequence[str],
+    hosts: Sequence[str],
+) -> str:
+    """The refusal of the destinations the operator has yet to allow, with one export."""
+    settings: List[str] = []
+    if pairs:
+        # Rebuilt from the parsed list, so an entry the parser ignores is not echoed back.
+        current = [f"{n}@{h}" if h else n for n, h in secret_ref_allowlist()]
+        entries = ",".join(dict.fromkeys([*current, *pairs]))
+        settings.append(f'{SECRET_REF_ALLOWLIST_ENV}="{entries}"')
+    if hosts:
+        entries = ",".join(dict.fromkeys([*host_allowlist(), *hosts]))
+        settings.append(f'{HOST_ALLOWLIST_ENV}="{entries}"')
+    return (
+        f"{head}: sink.{CATALOG_AUTH_FIELD}.{auth.env_field} names {auth.env_var}. Iceberg "
+        f"resolves it from {_RESOLVED_FROM[runtime.engine]} and sends it to hosts this "
+        "contract names, and the run refuses until the operator allows each: "
+        f"{'; '.join(dict.fromkeys(reasons))}. A contract names both the variable and the "
+        "hosts, so without the operator's lists any variable there could go to a host the "
+        "contract chose; a hostname needs an entry because the sink resolves it itself, "
+        "later, where no lookup made here applies. If this is intended, add the entries "
+        f"{_OPERATOR_ONLY}; this keeps the ones set here: export {' '.join(settings)}. Leave "
+        "the port off: a host written "
+        "with a port never matches. A loopback host needs no entry, and a private IP address "
+        "needs only the pairing"
+    )
+
+
 def _check_inlined_secrets(
     bid: Any,
     sink: Mapping[str, Any],
@@ -1286,4 +1606,137 @@ def _check_inlined_secrets(
                 f"shown), so the secret is inlined into the sink config forge-cli {where}. "
                 f"Use sink.{CATALOG_AUTH_FIELD}, or set {key} to env:<VARIABLE>, which Iceberg "
                 "resolves from the environment of the process that runs the sink"
+            )
+
+
+# ---------------------------------------------------------------------------
+# binding.location text in the derived sink config
+# ---------------------------------------------------------------------------
+
+#: One DNS label (RFC 1123): letters, digits and inner hyphens, at most 63.
+#: Any case, because the sinks pass the region for every catalog kind and a
+#: label ignores case.
+_HOST_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+
+#: The binding setting each catalog-specific property is derived from.
+_EXTRA_PROPERTY_SOURCES: Mapping[str, str] = {
+    BIGQUERY_PROJECT_ID: "binding.location.project",
+    BIGQUERY_LOCATION: "binding.location.region",
+}
+
+#: Who resolves a reference in the derived config, for the location messages.
+_REFERENCES_RESOLVED_BY: Mapping[str, str] = {
+    "kafka-connect": (
+        "the Kafka Connect worker, where Iceberg's REST catalog replaces a value that starts "
+        "with env: by that variable from the worker's environment and Kafka Connect resolves "
+        "a ${provider:key} expression with the worker's config providers"
+    ),
+    "debezium": (
+        "the embedded Debezium Server, where Iceberg's REST catalog replaces a value that "
+        "starts with env: by that variable and SmallRye Config expands a ${...} expression, "
+        "both from the server's environment, which is this runner's"
+    ),
+}
+
+
+def _derived_location_text(
+    binding: Mapping[str, Any],
+    sink: Mapping[str, Any],
+    resolved: ResolvedIcebergCatalog,
+    runtime: IcebergSinkPlan,
+) -> List[Tuple[str, str]]:
+    """``(setting, value)`` for each contract value the derived config carries.
+
+    Read off the resolved catalog both emitters build from, so a value is
+    checked as it reaches the sink, a warehouse derived from a bucket included,
+    and only the field the sink reads where several could name it: the first
+    namespace field set, as ``iceberg_namespace`` reads them, and
+    ``sink.partitionBy`` over ``binding.location.partitionBy``, as the runner's
+    ``SinkSpec`` does. Kafka Connect also names the table; Debezium Server
+    composes it.
+    """
+    loc = binding.get("location") or {}
+    text: List[Tuple[str, str]] = []
+    if resolved.uri:
+        text.append(("binding.location.uri", str(resolved.uri)))
+    if resolved.warehouse:
+        written = str(loc.get("warehouse") or "").strip()
+        source = (
+            "binding.location.warehouse"
+            if written and resolved.warehouse == written
+            else "the warehouse derived from binding.location (bucket, path, database, table)"
+        )
+        text.append((source, resolved.warehouse))
+    if resolved.region:
+        text.append(("binding.location.region", str(resolved.region)))
+    for prop, value in resolved.extra_catalog_props.items():
+        text.append((_EXTRA_PROPERTY_SOURCES.get(prop, f"binding.location ({prop})"), str(value)))
+    namespaces = (
+        ("binding.location.database", loc.get("database")),
+        ("binding.database", binding.get("database")),
+        ("binding.location.dataset", loc.get("dataset")),
+    )
+    tables = (("binding.location.table", loc.get("table")), ("binding.table", binding.get("table")))
+    used = [next(((s, v) for s, v in namespaces if v), None)]
+    if runtime.engine == "kafka-connect":  # Debezium Server composes the table itself
+        used.append(next(((s, v) for s, v in tables if v), None))
+    text.extend((source, str(value)) for source, value in filter(None, used))
+    raw_partition = sink.get("partitionBy")
+    try:  # as SinkSpec.from_dict reads it: a mapping gives its keys, a string its letters
+        partition = list(raw_partition) if raw_partition else []
+    except TypeError:  # SinkSpec refuses it too, so the run stops before any config
+        partition = []
+    if partition:
+        text.extend(("sink.partitionBy", str(item)) for item in partition)
+    else:
+        text.extend(("binding.location.partitionBy", str(item)) for item in resolved.partition_by)
+    return text
+
+
+def _check_location_text(
+    bid: Any,
+    binding: Mapping[str, Any],
+    sink: Mapping[str, Any],
+    runtime: IcebergSinkPlan,
+    errors: List[str],
+) -> None:
+    """The ``binding.location`` text a derived sink config carries. HARD.
+
+    Iceberg's REST catalog replaces a catalog property that starts with ``env:``
+    by that variable, in the process that builds the catalog
+    (EnvironmentUtil.resolveAll, from RESTSessionCatalog.initialize:
+    apache-iceberg-1.10.0 RESTSessionCatalog.java:195). A warehouse is then sent
+    to the catalog and a region becomes part of the S3 and Glue endpoint hosts,
+    so location text that references a variable could send any variable the
+    worker or the server holds to a host the contract chose; ``${`` is the Kafka
+    Connect and SmallRye form of the same reference, read for every catalog
+    kind. The ``env:`` rule is applied to every kind too, as hardening: no real
+    value starts with it, and a kind that later resolves it needs no new check.
+    Only ``sink.catalogAuth`` names a variable, and the operator pairs it with
+    its hosts (:func:`_check_catalog_auth_destinations`). A value is never
+    quoted: it names a variable. ``client.region`` must also be one host label.
+    """
+    resolved = resolve_iceberg_catalog(binding, sink=sink, account_ref="")
+    referenced: set[str] = set()
+    for source, value in _derived_location_text(binding, sink, resolved, runtime):
+        if not re.search(FORBIDDEN_TEXT_PATTERN, value) or source in referenced:
+            continue
+        referenced.add(source)
+        errors.append(
+            f"iceberg sink (build {bid!r}): {source} starts with env:, or holds ${{ or a "
+            "control character (the value is not shown). The derived sink config hands it to "
+            f"{_REFERENCES_RESOLVED_BY[runtime.engine]}, so it could send any variable there to "
+            f"a host the contract chose. Write the value itself; only sink.{CATALOG_AUTH_FIELD} "
+            "may name a variable, and the operator pairs it with the hosts it reaches"
+        )
+    region = str(resolved.region or "")
+    if region and "binding.location.region" not in referenced and not _rendered_at_run(region):
+        if not _HOST_LABEL_RE.fullmatch(region):
+            errors.append(
+                f"iceberg sink (build {bid!r}): binding.location.region is not a region name "
+                "such as eu-central-1 (the value is not shown: at run it may have come from a "
+                "{{ env.* }} template). The derived sink config passes it to "
+                "Iceberg's AWS client as client.region, which builds the S3 and Glue endpoint "
+                "hosts from it, so it must be one host label: letters, digits and inner "
+                "hyphens, at most 63 characters"
             )

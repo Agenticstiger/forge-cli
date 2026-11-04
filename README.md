@@ -55,7 +55,7 @@ global install, [pipx](https://pipx.pypa.io/) works too:
 
 ## What makes it different
 
-**Preview:** [Managed Flink -> Iceberg streaming](docs/flink-iceberg.md) adds
+**Preview:** [Managed Flink -> Iceberg streaming](https://agenticstiger.github.io/forge_docs/advanced/managed-flink-iceberg.html) adds
 recursive schemas, generated operator resources, plan/apply/drift integration,
 and checkpoint/catalog verification. The [runnable example](examples/flink-iceberg/)
 includes an opt-in Kafka-to-Iceberg recovery and nested-value fidelity test.
