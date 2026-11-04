@@ -362,11 +362,8 @@ class TestNoKeyringBeforeTheHint:
                 monkeypatch.setattr(
                     keyring, name, lambda *a, _n=name, **k: calls.append(f"keyring.{_n}")
                 )
-        import fluid_build.llm.providers as providers
-
         monkeypatch.setattr(
-            providers,
-            "_infer_provider_from_env",
+            "fluid_build.llm.providers._infer_provider_from_env",
             lambda *a, **k: calls.append("infer") or None,
         )
         return calls
@@ -452,12 +449,9 @@ class TestDoctorStatus:
             "OLLAMA_HOST",
         ):
             monkeypatch.delenv(var, raising=False)
-        import fluid_build._ai_config_shared as shared
-        import fluid_build.llm.providers as providers
-
-        monkeypatch.setattr(shared, "load_ai_config", lambda *a, **k: None)
-        monkeypatch.setattr(providers, "_infer_provider_from_keyring", lambda *a, **k: None)
-        monkeypatch.setattr(providers, "_infer_provider_from_ambient", lambda *a, **k: None)
+        monkeypatch.setattr("fluid_build._ai_config_shared.load_ai_config", lambda *a, **k: None)
+        for name in ("_infer_provider_from_keyring", "_infer_provider_from_ambient"):
+            monkeypatch.setattr(f"fluid_build.llm.providers.{name}", lambda *a, **k: None)
         row = self._row(monkeypatch)
         assert "Not configured" in row["status"]
         assert "fluid ai setup" in row["details"]

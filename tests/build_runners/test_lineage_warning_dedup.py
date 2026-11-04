@@ -55,8 +55,6 @@ def test_console_handler_skips_the_record_a_file_handler_keeps(tmp_path, monkeyp
 def test_without_logging_handlers_the_warning_is_logged_at_debug(monkeypatch, caplog):
     # Library use: with no handler, logging's last-resort handler would print a
     # WARNING record under the console line, so the user saw it twice.
-    import logging
-
     from fluid_build.build_runners import _lineage
 
     monkeypatch.setattr(_lineage, "_WARNED", set())

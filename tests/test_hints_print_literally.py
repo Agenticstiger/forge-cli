@@ -32,6 +32,7 @@ import ast
 import io
 import logging
 import re
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -437,9 +438,7 @@ def test_ai_status_keeps_the_install_hint_and_masks_secrets(
     error = f"openai needs litellm, which is not installed: {HINT} {_SECRET_LINE}"
     readiness = LlmReadinessCheck(ready=False, provider="openai", error=error)  # type: ignore[arg-type]
     monkeypatch.setattr(ai_setup, "check_llm_readiness", lambda *a, **k: readiness, raising=False)
-    import fluid_build.llm.providers as providers
-
-    monkeypatch.setattr(providers, "check_llm_readiness", lambda *a, **k: readiness)
+    monkeypatch.setattr("fluid_build.llm.providers.check_llm_readiness", lambda *a, **k: readiness)
     console, buf = _console()
     ai_setup.show_ai_status(console)
     text = " ".join(buf.getvalue().split())
@@ -524,7 +523,7 @@ def test_scan_flags_a_markup_false_print_of_exception_text_and_a_plus_concat(tmp
     )
     module = tmp_path / "probe.py"
     module.write_text(src)
-    import tests.test_hints_print_literally as me
+    me = sys.modules[__name__]
 
     original = me.CLI
     me.CLI = tmp_path
