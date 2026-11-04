@@ -275,6 +275,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as before. The Command Center run now reports `apply_build_id_not_found`, where it reported
   `build_not_found:<id>`.
 
+- **`fluid odcs validate` stopped with `Unexpected error: closing tag '[/]' ... has nothing to
+  close`** when a value that fails a schema check contained `[/]` or another Rich markup tag. The
+  error line quotes the value, and it was printed as markup. It is printed as plain text now, so
+  the command reports the error and exits 1.
+
 - **A missing optional dependency names the extra to install, and silent fallbacks warn.**
   litellm, the MCP SDK, openlineage, boto3 and duckdb are imported through one gate: when one is
   missing, the command prints `<feature> needs <package>, which is not installed.` and
@@ -619,6 +624,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the line break is the only problem: `(it ends in a line break, which a YAML | or > block keeps
   and |- or >- drops)`. A `sink.catalogAuth` field gets no hint, since its value is never shown.
   The schemas themselves are unchanged.
+
+- **The ODCS and plugin-extension checks let a value with a trailing newline through a `pattern`,
+  too.** The fix above covered the FLUID schemas only. `fluid odcs validate` and
+  `fluid validate-artifacts` accepted an ODCS `schema[].id: "t1\n"` while refusing `"t 1"`, and
+  the forge copilot kept an LLM-proposed extension block whose value ended in a line break, such
+  as `use: "ci:basic\n"` for `customScaffold`. Every JSON Schema check now reads `$` as the end of
+  the value, including the ODPS, OPDS and Ossie checks, whose vendored schemas have no such
+  pattern yet. Their errors carry the same hint; an extension block that fails is dropped, as
+  before. An extension schema is read in the dialect its `$schema` declares, and as draft-07 when
+  it declares none, so a 2020-12 `unevaluatedProperties: false` is no longer ignored.
+  `patternProperties` keys are still matched as before, so OPDS's language-code key `^[a-z]{2}$`
+  accepts `"en\n"`.
 
 - **`fluid diff --baseline` compared contracts that no schema accepts.** Its rules read only the
   shapes a schema allows, so a value of the wrong type hid a change: a column retyped from

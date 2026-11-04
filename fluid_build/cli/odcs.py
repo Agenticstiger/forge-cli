@@ -504,6 +504,15 @@ def _validate_imported_contract(contract: dict) -> list:
     return [] if result.is_valid else list(result.errors)
 
 
+def _brief(message: str, limit: int = 120) -> str:
+    """``message`` cut to ``limit`` characters, keeping a line-break hint whole: cut,
+    ``... block keeps and |`` reads as advice to use ``|``."""
+    from fluid_build.schema_manager import LINE_BREAK_HINT
+
+    head = message.removesuffix(LINE_BREAK_HINT)
+    return head[:limit] + message[len(head) :]
+
+
 def _run_odcs_validate(args):
     """Run ODCS validate command — multi-pass with structured report.
 
@@ -559,7 +568,8 @@ def _run_odcs_validate(args):
             report["ok"] = False
             cprint(f"✗ jsonschema: {len(errors)} error(s)")
             for e in errors[:10]:
-                cprint(f"   {e['path'] or '<root>'}: {e['message'][:120]}")
+                # markup=False: the message quotes the value, and "[/]" in it is a Rich tag.
+                cprint(f"   {e['path'] or '<root>'}: {_brief(e['message'])}", markup=False)
             if len(errors) > 10:
                 cprint(f"   ... +{len(errors) - 10} more")
         else:

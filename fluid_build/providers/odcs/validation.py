@@ -74,15 +74,17 @@ def collect_errors(odcs: Mapping[str, Any], schema: Mapping[str, Any]) -> List[D
     Empty list = valid. No-op (empty list) when :mod:`jsonschema` is not
     installed. Used by ``validate()`` (which raises on non-empty) and by
     ``fluid odcs validate --report`` (which serializes to JSON for CI).
+
+    A ``pattern``'s ``$`` is the end of the value, as ECMA-262 reads it, so
+    ``schema[].id: "t1\\n"`` fails ``^[A-Za-z0-9_-]+$`` like ``"t 1"`` does.
     """
-    try:
-        import jsonschema
-    except ImportError:
+    from fluid_build.schema_manager import JSONSCHEMA_AVAILABLE, schema_validator
+
+    if not JSONSCHEMA_AVAILABLE:
         LOG.warning("jsonschema not installed, skipping ODCS validation")
         return []
 
-    validator_cls = jsonschema.validators.validator_for(schema)
-    validator = validator_cls(schema)
+    validator = schema_validator(schema)
     out: List[Dict[str, Any]] = []
     for err in validator.iter_errors(odcs):
         out.append(

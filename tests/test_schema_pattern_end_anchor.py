@@ -239,12 +239,33 @@ def _nodes(node: Any) -> Iterator[Dict[str, Any]]:
             yield from _nodes(value)
 
 
+#: Every schema fluid validates against: the FLUID and Ossie ones, and the vendored
+#: standards (tests/test_standard_schema_pattern_end_anchor.py tests their checks).
+_SHIPPED = sorted(_SCHEMA_DIR.glob("*.json")) + [
+    _SCHEMA_DIR.parent / "providers" / "odcs" / "odcs-schema-v3.1.0.json",
+    _SCHEMA_DIR.parent / "providers" / "odps_standard" / "schemas" / "odps-product-v1.0.0.json",
+    _SCHEMA_DIR.parent / "providers" / "odps_standard" / "schemas" / "odps-product-v1.1.0.json",
+    _SCHEMA_DIR.parent / "providers" / "opds" / "opds-schema-v4.1.0.json",
+]
+
+#: ``patternProperties`` keys, by schema. They keep jsonschema's own ``re.search``:
+#: jsonschema matches them in ``patternProperties``, ``additionalProperties`` and
+#: ``unevaluatedProperties``, and overriding ``patternProperties`` alone, as
+#: check-jsonschema does, lets a key that one matches and another does not through
+#: ``additionalProperties: false`` unchecked. So OPDS's ISO 639-1 language codes,
+#: ``^[a-z]{2}$``, also match ``"en\n"``. Under ``product.details`` and ``declarative``,
+#: which take any key, the value is then checked as a language entry.
+#: ``$defs/Languages`` takes no other key, so a hand-written OPDS file can carry
+#: ``{"en\n": ...}`` there; fluid's emitter writes ``en``.
+_KEY_PATTERNS = {"opds-schema-v4.1.0.json": [("^[a-z]{2}$",)] * 3}
+
+
 def test_every_bundled_schema_pattern_is_rewritten_anchor_for_anchor() -> None:
     """The scan reads escapes and sets as Python does, checked against Python's own
-    parser for every ``pattern`` the bundled schemas hold."""
+    parser for every ``pattern`` the shipped schemas hold."""
     patterns = {
         node["pattern"]
-        for path in _SCHEMA_DIR.glob("fluid-*schema-*.json")
+        for path in _SHIPPED
         for node in _nodes(json.loads(path.read_text(encoding="utf-8")))
         if isinstance(node.get("pattern"), str)
     }
@@ -252,16 +273,17 @@ def test_every_bundled_schema_pattern_is_rewritten_anchor_for_anchor() -> None:
     assert [p for p in patterns if not _only_end_anchors_changed(p)] == []
 
 
-@pytest.mark.parametrize(
-    "path", sorted(_SCHEMA_DIR.glob("fluid-schema-*.json")), ids=lambda path: path.name
-)
+@pytest.mark.parametrize("path", _SHIPPED, ids=lambda path: path.name)
 def test_every_pattern_of_the_schema_is_checked_with_the_rewrite(path: Path) -> None:
     """jsonschema picks the validator class again for each subschema it enters, by
-    that subschema's ``$schema``. One that declares it, or a ``$ref`` to the root,
-    which does, would be checked with jsonschema's own ``pattern`` again.
-    ``patternProperties`` keys are not rewritten (``schema_validator`` says why), so
-    a schema that starts to use the keyword has to come back here."""
-    below_root = list(_nodes(json.loads(path.read_text(encoding="utf-8"))))[1:]
-    assert [n for n in below_root if isinstance(n.get("$schema"), str)] == []
-    assert [n for n in below_root if n.get("$ref") == "#"] == []
-    assert [n for n in below_root if "patternProperties" in n] == []
+    that subschema's ``$schema``. One that declares it, or a ``$ref``,
+    ``$recursiveRef`` or ``$dynamicRef`` to the root, which does, would be checked
+    with jsonschema's own ``pattern`` again. ``patternProperties`` keys are not
+    rewritten, so a schema that starts to use the keyword has to come back to
+    :data:`_KEY_PATTERNS`."""
+    nodes = list(_nodes(json.loads(path.read_text(encoding="utf-8"))))
+    assert [n for n in nodes[1:] if isinstance(n.get("$schema"), str)] == []
+    assert [n for n in nodes if n.get("$ref") == "#"] == []
+    assert [n for n in nodes if "$recursiveRef" in n or "$dynamicRef" in n] == []
+    keys = [tuple(n["patternProperties"]) for n in nodes if "patternProperties" in n]
+    assert keys == _KEY_PATTERNS.get(path.name, [])
