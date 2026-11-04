@@ -395,7 +395,7 @@ class TestPasswordEqualToAnotherPartOfTheUri:
             args, logging.getLogger("fluid.test.jdbc"), operator_supplied=True
         )
         assert rc == 2
-        assert printed == [f"[red]JDBC introspection failed:[/red] {expected}"]
+        assert printed == [f"JDBC introspection failed: {expected}"]
 
     @pytest.mark.parametrize("kind,uri,expected", STOCK_LOGINS, ids=STOCK_IDS)
     def test_fetch_sample_rows(self, kind, uri, expected, no_connect):
@@ -419,7 +419,7 @@ class TestPasswordEqualToAnotherPartOfTheUri:
         monkeypatch.setattr(introspect, "introspect_jdbc", quote_it)
         args = argparse.Namespace(source="postgres", uri=uri, output=str(tmp_path / "c.yaml"))
         assert _run_from_jdbc_source(args, logging.getLogger("fluid.test.jdbc")) == 1
-        assert printed == ["[red]JDBC introspection failed:[/red] server said: *** rejected"]
+        assert printed == ["JDBC introspection failed: server said: *** rejected"]
 
 
 class TestQueryStringSecrets:

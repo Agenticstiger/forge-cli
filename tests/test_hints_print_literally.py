@@ -86,6 +86,14 @@ ALLOWED = {
         "console.print(f'  • {suggestion}')",
     ): "the no-Rich fallback console, which has no markup to parse",
     (
+        "auth",
+        "self.console.print(f'[green]{msg}[/green]' if ok else f'[yellow]{msg}[/yellow]')",
+    ): "msg is one of two fixed status strings chosen two lines above",
+    (
+        "core",
+        "console.print(f'❌ {self.message}' + (f'  [{slug}]' if slug else ''))",
+    ): "the no-Rich fallback console, which has no markup to parse",
+    (
         "_apply_opentofu_engine",
         "cprint(f'  access enforcement after the failed apply could not run: {type(exc).__name__}')",
     ): "prints the exception class name only, never its text",
@@ -124,6 +132,36 @@ ALLOWED = {
 }
 
 
+#: Exception text in a ``markup=False`` print: ``cprint`` masks only ``key=value`` there.
+_EXC_TEXT = re.compile(r"\bexc\b|\bexc_|exception|\.args\b|\bstr\((?:exc|err|e)\b")
+#: The helpers that redact every credential shape (``fluid_build/_console.py``).
+_REDACTING_HELPERS = {"cprint_literal", "literal_error_text"}
+
+
+def _exprs(node: ast.AST) -> list[str]:
+    """The source of every interpolated or concatenated part of a printed argument.
+
+    An f-string yields its ``{...}`` values; ``a + b`` yields the parts of both
+    sides (a ``+`` is an f-string by other means); a conditional yields both arms.
+    """
+    if isinstance(node, ast.JoinedStr):
+        return [ast.unparse(v.value) for v in node.values if isinstance(v, ast.FormattedValue)]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _exprs(node.left) + _exprs(node.right)
+    if isinstance(node, ast.IfExp):
+        return _exprs(node.body) + _exprs(node.orelse)
+    if isinstance(node, ast.Constant):
+        return []
+    return [ast.unparse(node)] if isinstance(node, ast.BinOp) else []
+
+
+def _uses_redacting_helper(node: ast.AST) -> bool:
+    return any(
+        isinstance(n, ast.Call) and getattr(n.func, "id", None) in _REDACTING_HELPERS
+        for n in ast.walk(node)
+    )
+
+
 def _printed_calls(module: str) -> list[tuple[int, str]]:
     tree = ast.parse((CLI / f"{module}.py").read_text(encoding="utf-8"))
     found = []
@@ -136,16 +174,19 @@ def _printed_calls(module: str) -> list[tuple[int, str]]:
                 continue
         elif getattr(fn, "id", None) not in _PRINTER_NAMES:
             continue
-        if any(
+        literal = any(
             kw.arg == "markup" and isinstance(kw.value, ast.Constant) and kw.value.value is False
             for kw in node.keywords
-        ):
-            continue  # printed without markup: literal already
+        )
         for arg in node.args:
-            if isinstance(arg, ast.JoinedStr) and any(
-                isinstance(v, ast.FormattedValue) and _TEXTY.search(ast.unparse(v.value))
-                for v in arg.values
-            ):
+            parts = _exprs(arg)
+            if literal:
+                # Markup is off, but a bracketed token is still printed as written
+                # unless the text went through the full redaction.
+                bad = any(_EXC_TEXT.search(p) for p in parts) and not _uses_redacting_helper(arg)
+            else:
+                bad = any(_TEXTY.search(p) for p in parts)
+            if bad:
                 found.append((node.lineno, ast.unparse(node)))
                 break
     return found
@@ -424,3 +465,55 @@ def test_doctor_summary_panel_prints_literally(monkeypatch: pytest.MonkeyPatch) 
     )
     text = " ".join(buf.getvalue().split())
     _assert_masked(text)
+
+
+# --- bracketed secrets in exception text ------------------------------------
+
+TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"  # runtime-built, not a literal secret
+
+
+def test_console_error_masks_a_bracketed_token(capsys) -> None:
+    from fluid_build._console import error
+
+    error(f"upstream said [{TOKEN}] and more")
+    out = capsys.readouterr()
+    assert TOKEN not in out.out + out.err
+    assert "upstream said" in out.err
+
+
+def test_odps_validate_masks_a_bracketed_token(tmp_path, capsys, monkeypatch) -> None:
+    from fluid_build.cli.odps_standard import _run_odps_validate
+    from fluid_build.providers import odps_standard
+    from fluid_build.providers.base import ProviderError
+
+    def refuse(self, data):
+        raise ProviderError(f"bad value [{TOKEN}]")
+
+    monkeypatch.setattr(odps_standard.BitolOdpsProvider, "validate_product", refuse)
+    doc = tmp_path / "p.yaml"
+    doc.write_text("apiVersion: v1.0.0\nstatus: draft\n")
+    rc = _run_odps_validate(SimpleNamespace(odps_file=str(doc)))
+    shown = capsys.readouterr()
+    assert rc == 1
+    assert TOKEN not in shown.out + shown.err
+    assert "bad value" in shown.out + shown.err
+
+
+def test_scan_flags_a_markup_false_print_of_exception_text_and_a_plus_concat(tmp_path) -> None:
+    src = (
+        "def f(exc, r):\n"
+        "    cprint(f'x {exc}', markup=False)\n"
+        "    cprint(literal_error_text(f'x {exc}'), markup=False)\n"
+        "    cprint('a' + (f'[{r.error}]' if r.error else ''))\n"
+    )
+    module = tmp_path / "probe.py"
+    module.write_text(src)
+    import tests.test_hints_print_literally as me
+
+    original = me.CLI
+    me.CLI = tmp_path
+    try:
+        lines = [line for line, _call in me._printed_calls("probe")]
+    finally:
+        me.CLI = original
+    assert lines == [2, 4]

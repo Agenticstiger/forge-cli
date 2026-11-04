@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from fluid_build._env_names import ENV_NAME_RULE, is_env_name
-from fluid_build.cli.console import cprint, cprint_json
+from fluid_build.cli.console import cprint, cprint_json, cprint_literal
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
 try:
@@ -990,7 +990,7 @@ async def run_async(args, logger: logging.Logger) -> int:
             acq_results = publish_acquisition(contract, Path.cwd())
             for r in acq_results:
                 icon = "✅" if r.succeeded else "⚠️"
-                cprint(
+                cprint_literal(
                     f"  {icon} acquisition publish "
                     f"{r.product_id}/{r.expose_id} → {r.target}"
                     + (f"  [{r.error}]" if r.error else "")

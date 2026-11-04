@@ -296,7 +296,7 @@ def _force_utf8_streams() -> None:
 
 def _render_missing_optional(e: Any, args: argparse.Namespace, context: Any, cli: Any) -> int:
     """Print an optional-dependency hint (message + stable slug) and return exit 1."""
-    from fluid_build._console import _redact_str, literal_text
+    from fluid_build._console import _redact_error_str, _redact_str, literal_text
     from fluid_build._error_catalog import slug_for
 
     slug = slug_for(e.event)
@@ -312,7 +312,7 @@ def _render_missing_optional(e: Any, args: argparse.Namespace, context: Any, cli
             "exit_code": e.exit_code,
         },
     )
-    context.console.print(literal_text(_redact_str(f"❌ {e}"), "red"))
+    context.console.print(literal_text(_redact_error_str(f"❌ {e}"), "red"))
     context.console.print(literal_text(f"[{slug}]", "dim"))
     return int(e.exit_code)
 
@@ -551,7 +551,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             # ``tofu state rm <address>`` line runs it without its address.
             from rich.text import Text
 
-            from fluid_build._console import _redact_str, literal_text
+            from fluid_build._console import _redact_error_str, _redact_str, literal_text
 
             message = Text(f"❌ {e.message}", style="red")
             if slug:
@@ -621,11 +621,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             # ``MarkupError`` from this handler, and the outer fallback then
             # died on the same text with a traceback. It is redacted too: that
             # crash used to keep a secret beside a ``[/]`` off the screen.
-            from fluid_build._console import _redact_str, literal_text
+            from fluid_build._console import _redact_error_str, _redact_str, literal_text
 
             # Structured catch for provider errors (before generic Exception)
             if ProviderError is not None and isinstance(e, ProviderError):
-                context.console.print(literal_text(_redact_str(f"❌ Provider error: {e}"), "red"))
+                context.console.print(
+                    literal_text(_redact_error_str(f"❌ Provider error: {e}"), "red")
+                )
                 cli.logger.log_safe(
                     "error",
                     "Provider error",
@@ -644,7 +646,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 1
 
             # Handle unexpected errors with enhanced context
-            context.console.print(literal_text(_redact_str(f"❌ Unexpected error: {e}"), "red"))
+            context.console.print(
+                literal_text(_redact_error_str(f"❌ Unexpected error: {e}"), "red")
+            )
             cli.logger.log_safe(
                 "error",
                 "CLI unhandled exception",
@@ -660,7 +664,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 import traceback
 
                 context.console.print("\n[red]Debug traceback:[/red]")
-                context.console.print(literal_text(_redact_str(traceback.format_exc())))
+                context.console.print(literal_text(_redact_error_str(traceback.format_exc())))
 
             # Provide helpful guidance
             context.console.print("\n[yellow]💡 This appears to be an unexpected error.[/yellow]")
@@ -763,6 +767,9 @@ def _setup_enhanced_logging(
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(numeric)
     console_handler.setFormatter(formatter)
+    # A warning already printed to the console (``fluid_console_shown``) stays in
+    # the log file but is not echoed here a second time.
+    console_handler.addFilter(lambda record: not getattr(record, "fluid_console_shown", False))
     root_logger.addHandler(console_handler)
 
     # File handler if specified

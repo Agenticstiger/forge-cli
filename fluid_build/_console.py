@@ -98,7 +98,7 @@ def _redact_error_str(value: Any) -> str:
     """
     from fluid_build.observability.secret_redactor import redact_secret_text
 
-    return redact_secret_text(_redact_str(str(value)))
+    return redact_secret_text(_redact_str(str(value)), keep_dotted_names=True)
 
 
 def literal_error_text(text: Any, style: str = "") -> RichText:
@@ -253,7 +253,7 @@ def error(msg: str) -> None:
     # Redact the raw text first (see ``_show_controls``), and funnel through the
     # typed ``_redact_str`` sanitiser last so CodeQL recognises the sink path is
     # sanitised on every branch.
-    safe_msg = _redact_str(_show_controls(_redact_str(str(msg))))
+    safe_msg = _redact_str(_show_controls(_redact_error_str(msg)))
     if RICH_AVAILABLE:
         _err_console = RichConsole(stderr=True)
         _err_console.print(RichText(f"❌ {safe_msg}", style="red"))

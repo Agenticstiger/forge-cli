@@ -282,13 +282,17 @@ class BufferedLineageEmitter(LineageEmitter):
 
 
 def _warn_once(key: str, message: str) -> None:
-    """Surface a warning on the CLI (logged only if that fails), at most once per process.
+    """Surface a warning on the CLI and log it, at most once per process.
 
     A lineage refusal that only reaches ``LOG.warning`` is invisible during
     a normal ``fluid apply`` (the ``fluid.acquire.lineage`` logger is not
     printed at default verbosity), so an operator who configured
     ``OPENLINEAGE_URL`` had no way to learn that nothing shipped. Deduped by
     ``key`` because emission is per-event and a run emits at least two.
+
+    The WARNING record is always emitted, so ``--log-file`` and log pipelines
+    keep it. After a successful console print it carries ``fluid_console_shown``,
+    which the CLI's console handler drops so the line is not shown twice.
     """
     if key in _WARNED:
         return
@@ -302,10 +306,7 @@ def _warn_once(key: str, message: str) -> None:
     except Exception:  # pragma: no cover — console is best-effort
         LOG.warning("%s", message)
     else:
-        # Not a warning as well: with no handler on this logger the root's
-        # last-resort handler prints WARNING to stderr, and the user then saw
-        # the same line twice.
-        LOG.debug("%s", message)
+        LOG.warning("%s", message, extra={"fluid_console_shown": True})
 
 
 #: Process-level dedup set for :func:`_warn_once`.

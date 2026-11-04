@@ -27,7 +27,7 @@ from typing import Optional
 import click
 
 from fluid_build.cli._export_env import resolve_for_export
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.cli.console import error as console_error
 from fluid_build.loader import load_contract
 from fluid_build.providers.odcs import OdcsProvider
@@ -550,7 +550,7 @@ def _run_odcs_validate(args):
     try:
         odcs_data = load_yaml_json(file_path)
     except (UnsafeYamlError, yaml.YAMLError) as exc:
-        cprint(f"✗ Validation failed: {exc}", markup=False)
+        cprint_literal(f"✗ Validation failed: {exc}")
         report["passes"]["parse"] = {"ok": False, "error": str(exc)[:300]}
         report["ok"] = False
         _write_validate_report(args, report)
@@ -589,7 +589,7 @@ def _run_odcs_validate(args):
         except Exception as exc:  # noqa: BLE001 — vowl bundles its own errors
             report["passes"]["vowl"] = {"ok": False, "error": str(exc)[:300]}
             report["ok"] = False
-            cprint(f"✗ vowl: {type(exc).__name__}: {str(exc)[:200]}", markup=False)
+            cprint_literal(f"✗ vowl: {type(exc).__name__}: {str(exc)[:200]}")
         else:
             if diag is None:
                 report["passes"]["vowl"] = {"ok": True, "skipped": "vowl not installed"}
@@ -613,7 +613,7 @@ def _run_odcs_validate(args):
         except Exception as exc:  # noqa: BLE001
             report["passes"]["roundtrip"] = {"ok": False, "error": str(exc)[:300]}
             report["ok"] = False
-            cprint(f"✗ roundtrip: {type(exc).__name__}: {str(exc)[:200]}", markup=False)
+            cprint_literal(f"✗ roundtrip: {type(exc).__name__}: {str(exc)[:200]}")
         else:
             report["passes"]["roundtrip"] = rt
             if rt["equal"]:
