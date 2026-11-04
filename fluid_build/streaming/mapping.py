@@ -326,6 +326,13 @@ class _Compiler:
                     raise ValueError(f"{at}.cast: only a scalar type can be a conversion target")
                 cast = parse_type({"type": item["cast"]}, path=f"{at}.cast")
             self.overrides[name] = _Override(at, parse_path(item.get("from"), f"{at}.from"), cast)
+        # Each struct output path with a mapped field under it, and the first such field,
+        # found once instead of scanning every override for every output path.
+        self.inside: dict[str, str] = {}
+        for name in self.overrides:
+            parts = name.split(".")
+            for end in range(1, len(parts)):
+                self.inside.setdefault(".".join(parts[:end]), name)
         self.used: set[str] = set()
 
     def _explode(self, spec: Mapping[str, Any]) -> None:
@@ -349,6 +356,7 @@ class _Compiler:
     def resolve(self, steps: tuple[Step, ...], where: str) -> _Ref:
         root = steps[0][1]
         rest = steps[1:]
+        done = 1
         if self.alias is not None and self.element is not None and root == self.alias:
             self.alias_used = True
             element, nullable = self.element, not self.element.required
@@ -365,6 +373,7 @@ class _Compiler:
                     None,
                 )
                 rest = rest[1:]
+                done = 2
             else:
                 # UNNEST spreads a struct element over columns, so the whole element is
                 # rebuilt from them. A rebuilt row is never null; its fields carry the nulls.
@@ -380,24 +389,25 @@ class _Compiler:
         else:
             raise ValueError(f"{where}: {root} is not a column of properties.stream")
         for step in rest:
-            ref = self._step(ref, step, where)
+            ref = self._step(ref, step, where, show(steps[:done]))
+            done += 1
         return ref
 
-    def _step(self, ref: _Ref, step: Step, where: str) -> _Ref:
+    def _step(self, ref: _Ref, step: Step, where: str, label: str) -> _Ref:
         kind, name = step
         dtype = ref.dtype
         origin = None if ref.origin is None else (*ref.origin, step)
         if kind == "field":
             if dtype.kind != "struct":
-                raise ValueError(f"{where}: {_describe(dtype)} has no field {name}")
+                raise ValueError(f"{where}: {label} is {_describe(dtype)}, not a struct")
             fields = dict(dtype.fields)
             if name not in fields:
-                raise ValueError(f"{where}: the struct has no field {name}")
+                raise ValueError(f"{where}: {label} has no field {name}")
             child = fields[name]
             nullable = not dtype.required or not child.required
             return _Ref(f"{ref.sql}.`{name}`", _nullable(child, nullable), origin)
         if dtype.kind != "map" or dtype.value is None:
-            raise ValueError(f"{where}: ['{name}'] needs a map, not {_describe(dtype)}")
+            raise ValueError(f"{where}: {label} is {_describe(dtype)}, not a map")
         # A key the record does not carry reads as null.
         literal = quote_ansi_string_literal(name)
         return _Ref(f"{ref.sql}[{literal}]", _nullable(dtype.value, True), origin)
@@ -431,10 +441,10 @@ class _Compiler:
     def target(self, path: tuple[str, ...], dtype: LogicalType) -> _Out:
         name = ".".join(path)
         override = self.overrides.get(name)
-        nested = [key for key in self.overrides if key.startswith(name + ".")]
+        nested = self.inside.get(name)
         if override is not None:
             if nested:
-                raise ValueError(f"{override.where}: {nested[0]} is inside {name}, mapped whole")
+                raise ValueError(f"{override.where}: {nested} is inside {name}, mapped whole")
             self.used.add(name)
             ref = self.resolve(override.source, f"{override.where}.from")
             sql = self._assign(ref, dtype, override, name)

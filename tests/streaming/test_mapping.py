@@ -290,17 +290,17 @@ def test_a_type_is_widened_only_losslessly_and_said_so(contract):
         (
             [EVENT_ID, col("x", "string")],
             {"columns": [{"name": "x", "from": "customer.nope"}]},
-            r"the struct has no field nope",
+            r"customer has no field nope",
         ),
         (
             [EVENT_ID, col("x", "string")],
             {"columns": [{"name": "x", "from": "event_id['k']"}]},
-            r"\['k'\] needs a map, not string",
+            r"event_id is string, not a map",
         ),
         (
             [EVENT_ID, col("x", "string")],
             {"columns": [{"name": "x", "from": "event_id.k"}]},
-            r"string has no field k",
+            r"event_id is string, not a struct",
         ),
         (
             [EVENT_ID],
