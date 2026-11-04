@@ -288,7 +288,6 @@ class _Ref:
 class _Out:
     sql: str
     nullable: bool
-    origins: tuple[tuple[Step, ...] | None, ...]
 
 
 @dataclass(frozen=True)
@@ -307,6 +306,9 @@ class _Compiler:
         self.element: LogicalType | None = None
         self.alias_used = False
         self.join = ""
+        # Source structs a row being built is known to read with a value: it is null
+        # where they are, so their own nullability does not reach its fields.
+        self.present: list[tuple[Step, ...]] = []
         mapping = _object({} if spec is None else spec, where, {"explode", "columns"})
         if "explode" in mapping:
             self._explode(_object(mapping["explode"], f"{where}.explode", {"path", "as"}))
@@ -387,12 +389,17 @@ class _Compiler:
                 cells = ", ".join(f"`{_ELEM}`.`{name}`" for name, _ in fields)
                 ref = _Ref(f"CAST(ROW({cells}) AS {_sql_type(rebuilt)})", rebuilt, None)
         elif root in self.columns:
-            ref = _Ref(f"`{_SRC}`.`{root}`", self.columns[root], (steps[0],))
+            ref = self._settle(_Ref(f"`{_SRC}`.`{root}`", self.columns[root], (steps[0],)))
         else:
             raise ValueError(f"{where}: {root} is not a column of properties.stream")
         for step in rest:
-            ref = self._step(ref, step, where, show(steps[:done]))
+            ref = self._settle(self._step(ref, step, where, show(steps[:done])))
             done += 1
+        return ref
+
+    def _settle(self, ref: _Ref) -> _Ref:
+        if ref.origin is not None and ref.origin in self.present:
+            return dataclasses.replace(ref, dtype=_nullable(ref.dtype, False))
         return ref
 
     def _step(self, ref: _Ref, step: Step, where: str, label: str) -> _Ref:
@@ -450,7 +457,7 @@ class _Compiler:
             self.used.add(name)
             ref = self.resolve(override.source, f"{override.where}.from")
             sql = self._assign(ref, dtype, override, name)
-            return _Out(sql, not ref.dtype.required, (ref.origin,))
+            return _Out(sql, not ref.dtype.required)
         if dtype.kind == "struct" and nested:
             return self._row(path, dtype)
         steps = tuple(("field", part) for part in path)
@@ -464,24 +471,48 @@ class _Compiler:
             and _difference(ref.dtype, dtype, "") is not None
         ):
             return self._row(path, dtype)
-        return _Out(self._assign(ref, dtype, None, name), not ref.dtype.required, (ref.origin,))
+        return _Out(self._assign(ref, dtype, None, name), not ref.dtype.required)
 
     def _row(self, path: tuple[str, ...], dtype: LogicalType) -> _Out:
         """A struct output built field by field, from the paths its fields are read from."""
-        children = [self.target((*path, name), child) for name, child in dtype.fields]
-        origins = tuple(origin for child in children for origin in child.origins)
-        sql = f"CAST(ROW({', '.join(child.sql for child in children)}) AS {_sql_type(dtype)})"
-        parent = self._shared_struct(origins)
-        if parent is None:
-            return _Out(sql, False, origins)
-        if dtype.required:
+        planned = tuple(
+            origin for name, child in dtype.fields for origin in self._plan((*path, name), child)
+        )
+        parent = self._shared_struct(planned)
+        if parent is not None and dtype.required:
             raise ValueError(
                 f"{self.target_where}.{'.'.join(path)}: required, but its fields are read "
                 f"from {show(parent.origin or ())}, which can be null"
             )
+        if parent is not None and parent.origin is not None:
+            self.present.append(parent.origin)
+        try:
+            children = [self.target((*path, name), child) for name, child in dtype.fields]
+        finally:
+            if parent is not None and parent.origin is not None:
+                self.present.pop()
+        row = f"ROW({', '.join(child.sql for child in children)})"
+        if parent is None:
+            return _Out(f"CAST({row} AS {_sql_type(dtype)})", False)
         # Fields read from one nullable struct: the output is null where that struct is.
-        sql = f"CASE WHEN {parent.sql} IS NULL THEN CAST(NULL AS {_sql_type(dtype)}) ELSE {sql} END"
-        return _Out(sql, True, origins)
+        # Flink 1.20's validator refuses a CAST(ROW(...)) as a CASE branch, so the bare
+        # ROW is the branch and the CASE is cast to the output's type.
+        case = f"CASE WHEN {parent.sql} IS NULL THEN NULL ELSE {row} END"
+        return _Out(f"CAST({case} AS {_sql_type(dtype)})", True)
+
+    def _plan(
+        self, path: tuple[str, ...], dtype: LogicalType
+    ) -> tuple[tuple[Step, ...] | None, ...]:
+        """Where each field of a row to be built is read from, before any of it is checked."""
+        name = ".".join(path)
+        override = self.overrides.get(name)
+        if override is not None:
+            steps = override.source
+        elif dtype.kind == "struct" and name in self.inside:
+            return tuple(o for child, t in dtype.fields for o in self._plan((*path, child), t))
+        else:
+            steps = tuple(("field", part) for part in path)
+        return (steps if steps[0][1] in self.columns and steps[0][1] != self.alias else None,)
 
     def _shared_struct(self, origins: tuple[tuple[Step, ...] | None, ...]) -> _Ref | None:
         """The nullable source struct every field of a built row is read from, if one is."""
@@ -496,7 +527,10 @@ class _Compiler:
             prefix = prefix[:common]
         while prefix:
             if all(len(path) > len(prefix) for path in paths):
-                ref = self.resolve(tuple(prefix), self.where)
+                try:
+                    ref = self.resolve(tuple(prefix), self.where)
+                except ValueError:
+                    return None  # the fields' own paths report it
                 if ref.dtype.kind == "struct":
                     return None if ref.dtype.required else ref
             prefix.pop()

@@ -204,8 +204,8 @@ def test_a_nested_subset_stays_null_where_its_source_struct_is_null(contract):
     _output(contract, [EVENT_ID, col("customer", "struct", fields=[col("id", "string")])])
     assert _insert(contract) == _select(
         "`src`.`event_id` AS `event_id`",
-        "CASE WHEN `src`.`customer` IS NULL THEN CAST(NULL AS ROW<`id` STRING>) "
-        "ELSE CAST(ROW(`src`.`customer`.`id`) AS ROW<`id` STRING>) END AS `customer`",
+        "CAST(CASE WHEN `src`.`customer` IS NULL THEN NULL "
+        "ELSE ROW(`src`.`customer`.`id`) END AS ROW<`id` STRING>) AS `customer`",
     )
 
 
@@ -214,7 +214,7 @@ def test_nested_fields_are_reordered_by_name_never_by_position(contract):
     swapped = col("customer", "struct", fields=list(reversed(original["fields"])))
     _output(contract, [EVENT_ID, swapped])
     insert = _insert(contract)
-    assert "CAST(ROW(`src`.`customer`.`address`, `src`.`customer`.`id`)" in insert
+    assert "ELSE ROW(`src`.`customer`.`address`, `src`.`customer`.`id`) END" in insert
     assert insert.count("CASE WHEN `src`.`customer` IS NULL") == 1
 
 
@@ -648,6 +648,37 @@ def test_the_stream_and_mapping_work_from_fragments(contract, tmp_path, capsys):
         == 1
     )
     capsys.readouterr()
+
+
+def test_a_required_field_of_an_optional_struct_is_required_where_the_struct_is_present(
+    contract,
+):
+    # The rebuilt struct is null where the customer is; where the customer is there,
+    # its required id is too. A subset, a reorder and a widening all keep it required.
+    customer = _stream(contract)["schema"][1]
+    customer["fields"][0]["required"] = True
+    customer["fields"].append(col("visits", "int", required=True))
+    _output(
+        contract,
+        [
+            EVENT_ID,
+            col(
+                "customer",
+                "struct",
+                fields=[col("visits", "long", required=True), col("id", "string", required=True)],
+            ),
+        ],
+    )
+    insert = _insert(contract)
+    assert (
+        "CAST(CASE WHEN `src`.`customer` IS NULL THEN NULL ELSE "
+        "ROW(CAST(`src`.`customer`.`visits` AS BIGINT), `src`.`customer`.`id`) END "
+        "AS ROW<`visits` BIGINT NOT NULL, `id` STRING NOT NULL>) AS `customer`" in insert
+    )
+    # The struct itself still can be null, so it cannot be declared required.
+    contract["exposes"][0]["contract"]["schema"][1]["required"] = True
+    with pytest.raises(ValueError, match="required, but its fields are read from customer"):
+        compile_contract(contract)
 
 
 @pytest.mark.parametrize(

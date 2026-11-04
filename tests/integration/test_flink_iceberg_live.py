@@ -35,6 +35,7 @@ import pytest
 import yaml
 
 from fluid_build.streaming.compiler import compile_contract
+from fluid_build.streaming.types import columns_sql
 
 _LOG = logging.getLogger(__name__)
 
@@ -574,3 +575,141 @@ print(f"PASS: {len(items)} item rows, {len(nested)} nested rows; key, header, me
         assert result.returncode == 0, result.stdout + result.stderr
     finally:
         compose("down", "-v", "--remove-orphans", check=False)
+
+
+def _column(name, type_, **kw):
+    return {"name": name, "type": type_, **kw}
+
+
+def _planner_cases():
+    """Every example, plus the mappings whose SQL is hardest on Flink's validator."""
+    from fluid_build._contract_loader import load_contract_with_overlay
+
+    example = Path(__file__).resolve().parents[2] / "examples/flink-iceberg"
+    base = yaml.safe_load((example / "contract.fluid.yaml").read_text())
+    cases = {"example": base}
+    for shape in _SHAPES:
+        cases[shape] = load_contract_with_overlay(
+            str(example / "shapes" / shape / "contract.fluid.yaml"), None, _LOG
+        )
+
+    def variant(name, columns, mapping=None, stream=None):
+        contract = copy.deepcopy(base)
+        props = contract["builds"][0]["properties"]
+        if stream is not None:
+            stream(props["stream"])
+        contract["exposes"][0]["contract"]["schema"] = columns
+        if mapping is not None:
+            props["mapping"] = mapping
+        cases[name] = contract
+
+    def required_fields(stream):
+        customer = stream["schema"][1]
+        customer["fields"][0]["required"] = True
+        customer["fields"].append(_column("visits", "int", required=True))
+
+    event_id = _column("event_id", "string", required=True)
+    variant(
+        "required fields of an optional struct, widened",
+        [
+            event_id,
+            _column(
+                "customer",
+                "struct",
+                fields=[
+                    _column("visits", "long", required=True),
+                    _column("id", "string", required=True),
+                ],
+            ),
+        ],
+        stream=required_fields,
+    )
+    variant(
+        "a null-propagated struct inside another",
+        [
+            event_id,
+            _column(
+                "customer",
+                "struct",
+                fields=[
+                    _column("id", "string"),
+                    _column("address", "struct", fields=[_column("country", "string")]),
+                ],
+            ),
+        ],
+    )
+    variant(
+        "the headers map whole",
+        [
+            event_id,
+            _column(
+                "hdrs",
+                "map",
+                key={"type": "string", "required": True},
+                value={"type": "binary"},
+            ),
+        ],
+        stream=lambda s: s.update(metadata=[{"name": "hdrs", "from": "headers"}]),
+    )
+    variant(
+        "an exploded element kept nested",
+        [
+            event_id,
+            _column(
+                "item",
+                "struct",
+                fields=[_column("sku", "string"), _column("price", "decimal(18,2)")],
+            ),
+        ],
+        mapping={"explode": {"path": "items", "as": "item"}},
+    )
+    sql = copy.deepcopy(base)
+    sql["builds"][0]["properties"]["sql"] = "SELECT * FROM source_events"
+    cases["contract SQL, bound by name"] = sql
+    return cases
+
+
+def test_generated_queries_plan_in_flink(tmp_path):
+    """The runtime image's own planner accepts every query forge-cli writes.
+
+    The job's statements need a Kafka broker and an Iceberg catalog to run, but not
+    to plan: the source table is the generated Kafka DDL, and the output is a
+    blackhole table with the expose's columns, so EXPLAIN validates the generated
+    query exactly as the job would submit it.
+    """
+    if shutil.which("docker") is None:
+        pytest.skip("Docker is required")
+    image = os.environ.get("FLUID_FLINK_TEST_IMAGE", "forge-flink:test")
+    if subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode:
+        pytest.skip("Build the example Flink runtime image first")
+    refused = []
+    for name, contract in _planner_cases().items():
+        (artifact,) = compile_contract(contract)
+        source, insert = artifact.statements[3], artifact.statements[4]
+        sink = (
+            f"CREATE TEMPORARY TABLE `sink` (\n  {columns_sql(artifact.target_fields)}\n)"
+            " WITH ('connector' = 'blackhole')"
+        )
+        query = "EXPLAIN INSERT INTO `sink`\n" + insert.split("\n", 1)[1]
+        (tmp_path / "plan.sql").write_text(";\n".join([source, sink, query]) + ";\n")
+        run = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{tmp_path / 'plan.sql'}:/plan.sql:ro",
+                image,
+                "/opt/flink/bin/sql-client.sh",
+                "-f",
+                "/plan.sql",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        out = run.stdout + run.stderr
+        if run.returncode or "[ERROR]" in out or "== Optimized Physical Plan ==" not in out:
+            reason = next((line for line in out.splitlines() if "Exception" in line), out[-400:])
+            refused.append(f"{name}: {reason.strip()[:400]}")
+    assert not refused, "\n".join(refused)
