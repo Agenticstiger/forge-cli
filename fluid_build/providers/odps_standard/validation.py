@@ -75,13 +75,18 @@ def schema_for_document(odps: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def validate(odps: Mapping[str, Any], schema: Mapping[str, Any]) -> None:
-    """Validate an ODPS product against the vendored v1.0.0 JSON Schema."""
+    """Validate an ODPS product against ``schema``, the vendored one for its
+    ``apiVersion`` (:func:`schema_for_document`)."""
     try:
         import jsonschema
     except ImportError:
         LOG.warning("jsonschema not installed, skipping ODPS validation")
         return
+    from fluid_build.schema_manager import schema_validator
+
     try:
-        jsonschema.validate(instance=odps, schema=schema)
+        # cls: the declared dialect, with a pattern's "$" read as the end of the
+        # value, as ECMA-262 does. jsonschema.validate still checks the schema first.
+        jsonschema.validate(instance=odps, schema=schema, cls=type(schema_validator(schema)))
     except jsonschema.ValidationError as exc:
         raise ProviderError(f"ODPS validation failed: {exc.message}") from exc

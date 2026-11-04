@@ -359,6 +359,7 @@ def _disable_ssrf_guard_for_unit_tests(request):
     _real_guard_files = (
         "tests/util/test_safe_http.py",
         "tests/test_forge_web_tools.py",
+        "tests/build_runners/test_deployment_host_policy_real_pin_hook.py",
     )
     if any(marker in fspath for marker in _real_guard_files):
         yield

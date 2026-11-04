@@ -36,7 +36,6 @@ dashboard, one mental model across stages 2 and 4.
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import logging
 import shutil
@@ -111,10 +110,6 @@ def _load_schema(path: Path) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Soft-import helpers
 # ---------------------------------------------------------------------------
-
-
-def _jsonschema_available() -> bool:
-    return importlib.util.find_spec("jsonschema") is not None
 
 
 def _conftest_available() -> bool:
@@ -306,7 +301,10 @@ def _validate_against_schema(
             )
         ]
 
-    if not _jsonschema_available():
+    from fluid_build.schema_manager import JSONSCHEMA_AVAILABLE, schema_validator
+
+    # The flag schema_validator needs: a package that is found can still fail to import.
+    if not JSONSCHEMA_AVAILABLE:
         return [
             ValidationIssue(
                 file=artifact_path,
@@ -319,8 +317,6 @@ def _validate_against_schema(
                 code=f"{code_prefix}-LIB-MISSING",
             )
         ]
-
-    import jsonschema  # type: ignore
 
     issues: List[ValidationIssue] = []
     # Validate with the dialect the schema DECLARES, not a hardcoded one.
@@ -335,7 +331,10 @@ def _validate_against_schema(
     # and guards nine objects with `unevaluatedProperties: false`. A server entry
     # carrying an unexpected key validated with ZERO errors, reachable from
     # `fluid validate-artifacts`. See tests/test_jsonschema_dialect.py.
-    validator = jsonschema.validators.validator_for(schema)(schema)
+    #
+    # schema_validator also reads a pattern's `$` as the end of the value, as
+    # ECMA-262 does: ODCS refused `schema[].id: "t 1"` but took `"t1\n"`.
+    validator = schema_validator(schema)
 
     errors = sorted(validator.iter_errors(doc), key=lambda e: list(e.absolute_path))
     for err in errors:
@@ -397,7 +396,9 @@ def validate_opds(path: str, content: bytes) -> List[ValidationIssue]:
             )
         ]
 
-    if not _jsonschema_available():
+    from fluid_build.schema_manager import JSONSCHEMA_AVAILABLE
+
+    if not JSONSCHEMA_AVAILABLE:
         return [
             ValidationIssue(
                 file=path,

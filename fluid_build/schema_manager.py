@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Union
+from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Mapping, Optional, Union
 
 import yaml
 
@@ -43,6 +43,7 @@ from .errors import ValidationError as FluidValidationError
 # anywhere in this module — and RefResolver is deprecated, so the day a
 # jsonschema release drops it this ImportError would have silently disabled
 # schema validation across the CLI. Never name more in a probe than you use.
+_JSONSCHEMA_IMPORT_ERROR: Optional[ImportError] = None
 try:
     import jsonschema
 
@@ -65,6 +66,9 @@ _UNQUOTED_VALUE_PATHS = frozenset({"catalogAuth"})
 
 #: Validators whose jsonschema message names only keys, never a value.
 _KEY_ONLY_VALIDATORS = frozenset({"required", "additionalProperties"})
+
+#: Ends a ``pattern`` error when the value's final line break is all that fails it.
+LINE_BREAK_HINT = " (it ends in a line break, which a YAML | or > block keeps and |- or >- drops)"
 
 
 def format_schema_error(error: Any) -> str:
@@ -175,7 +179,7 @@ def _pattern_keyword(validator: Any, pattern: str, instance: Any, schema: Any) -
         return
     message = f"{instance!r} does not match {pattern!r}"
     if re.search(pattern, instance):  # only the final line break fails
-        message += " (it ends in a line break, which a YAML | or > block keeps and |- or >- drops)"
+        message += LINE_BREAK_HINT
     yield jsonschema.ValidationError(message)
 
 
@@ -184,20 +188,32 @@ def _end_anchored_validator(validator_class: Any) -> Any:
     return jsonschema.validators.extend(validator_class, {"pattern": _pattern_keyword})
 
 
-def schema_validator(schema: Dict[str, Any]) -> Any:
+def schema_validator(schema: Mapping[str, Any], default: Any = None) -> Any:
     """A jsonschema validator for ``schema``, in the dialect it declares, whose
     ``pattern`` ends at the end of the value (:func:`_end_anchored`). Validate
-    against a FLUID schema through this, never ``validator_for`` directly.
+    against a FLUID schema, or a vendored or plugin one, through this, never
+    ``validator_for`` directly. ``default`` is the dialect of a schema that
+    declares none, jsonschema's newest when not given. Raises ``ImportError``
+    when jsonschema could not be imported; check :data:`JSONSCHEMA_AVAILABLE`
+    first to skip instead.
 
     The keyword is replaced the way check-jsonschema replaces it, with
     ``jsonschema.validators.extend``. Two places keep jsonschema's own
     ``re.search``: ``patternProperties`` keys, as its ``additionalProperties``
     and :func:`_locate_error` read them, and a subschema that declares its own
-    ``$schema`` (or a ``$ref`` to the root, which does), for which jsonschema
-    picks that dialect's own class. No FLUID schema has either; a test fails if
-    one does.
+    ``$schema`` (or a ``$ref``, ``$recursiveRef`` or ``$dynamicRef`` to the
+    root, which does), for which jsonschema picks that dialect's own class. No
+    FLUID schema has either. Of the vendored ones, only OPDS keys
+    ``patternProperties``, with ``^[a-z]{2}$`` language codes. A test fails if
+    either changes (``_KEY_PATTERNS`` in tests/test_schema_pattern_end_anchor.py).
     """
-    return _end_anchored_validator(jsonschema.validators.validator_for(schema))(schema)
+    if not JSONSCHEMA_AVAILABLE:
+        raise ImportError("jsonschema is not available") from _JSONSCHEMA_IMPORT_ERROR
+    if default is None:
+        validator_class = jsonschema.validators.validator_for(schema)
+    else:
+        validator_class = jsonschema.validators.validator_for(schema, default=default)
+    return _end_anchored_validator(validator_class)(schema)
 
 
 def _schema_version_sort_key(version: str) -> tuple[int, int, int]:

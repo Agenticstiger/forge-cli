@@ -47,6 +47,10 @@ written and is mutation-checked:
    patched where the runner looks the name up.
 3. **The per-request guard really fires.** Asserting ``len(event_hooks) >= 2``
    passed for a no-op guard; this fires a request and asserts nothing is sent.
+4. **The guard judges the address the request is pinned to.** It resolved the
+   name a second time, so DNS rebinding, or ``faß.de`` looked up as IDNA2003
+   ``fass.de`` while httpx connects to IDNA2008 ``xn--fa-hia.de``, could pass
+   a name whose connection went to an unlisted public address or to metadata.
 """
 
 from __future__ import annotations
@@ -56,6 +60,7 @@ import pathlib
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
 from typing import Any, Dict, Iterator, List, Tuple
 
 import pytest
@@ -81,6 +86,11 @@ FAKE_DNS: Dict[str, List[str]] = {
     "orchestrator.mixed.test": ["fd00::1", "93.184.216.34"],
     "orchestrator.v6public.test": ["2606:2800:220:1:248:1893:25c8:1946"],
     "orchestrator.mappedprivate.test": ["::ffff:10.1.2.3"],
+    # Private when asked a second time, whatever the pinning lookup got.
+    "orchestrator.rebind.test": ["10.1.2.3"],
+    # What socket.getaddrinfo answers for faß.de: it asks about IDNA2003
+    # fass.de, while httpx connects to IDNA2008 xn--fa-hia.de.
+    "faß.de": ["10.1.2.3"],
 }
 
 
@@ -227,6 +237,7 @@ def test_the_address_predicate_is_shared_not_copied() -> None:
         ("file:///etc/passwd", "", False, "not an http(s) orchestrator"),
         ("", "", False, "nothing configured"),
         ("https://", "", False, "no host"),
+        ("http://[::1", "", False, "an unbalanced bracket has no host"),
     ],
 )
 def test_the_policy_matrix(url: str, listed: str, allowed: bool, because: str) -> None:
@@ -397,21 +408,77 @@ def test_the_guard_refuses_a_host_that_only_resolves_later(
         thread.join(timeout=5)
 
 
-def test_the_guard_judges_the_original_host_not_the_pinned_ip() -> None:
-    """The SSRF hook rewrites the URL to an IP before this one runs."""
+def _pinned(address: str) -> Any:
+    """A request as the guard sees it: safe_httpx_client's pin hook has put the IP in."""
+    return SimpleNamespace(url=SimpleNamespace(host=address))
 
-    class _Explodes:
-        @property
-        def url(self) -> str:
-            raise AssertionError("the guard must not read the rewritten request URL")
 
-    import os
+@pytest.mark.parametrize(
+    "url, pinned, listed, refused",
+    [
+        # The guard's own lookup of the name says private (rebinding, or the
+        # IDNA2003 spelling of faß.de), yet the connection is pinned to a
+        # public address: refused.
+        ("https://orchestrator.rebind.test", "93.184.216.34", "", True),
+        ("https://faß.de", "93.184.216.34", "", True),
+        ("http://orchestrator.rebind.test:8083", "10.1.2.3", "", False),
+        # A listed name may connect to its public address, never to metadata.
+        ("https://orchestrator.public.test", "93.184.216.34", "orchestrator.public.test", False),
+        ("https://orchestrator.public.test", "169.254.169.254", "orchestrator.public.test", True),
+        ("https://orchestrator.public.test", "0.0.0.0", "orchestrator.public.test", True),
+        # No address to judge is not a pass.
+        ("https://orchestrator.public.test", "", "orchestrator.public.test", True),
+    ],
+)
+def test_the_guard_judges_the_pinned_address_not_a_second_lookup(
+    monkeypatch: pytest.MonkeyPatch, url: str, pinned: str, listed: str, refused: bool
+) -> None:
+    """The pin hook runs first and puts the IP the connection will use in the URL.
 
-    os.environ[ALLOWLIST_ENV] = "orchestrator.public.test"
-    try:
-        request_guard("https://orchestrator.public.test", engine="airbyte")(_Explodes())
-    finally:
-        del os.environ[ALLOWLIST_ENV]
+    Resolving the name again can answer differently: DNS rebinding between the
+    two lookups, or Python's IDNA2003 against httpx's IDNA2008. The name still
+    decides the allowlist; the pinned address decides the scope.
+    """
+    monkeypatch.setenv(ALLOWLIST_ENV, listed)
+    guard = request_guard(url, engine="kafka-connect")
+    if refused:
+        with pytest.raises(DeploymentHostError):
+            guard(_pinned(pinned))
+    else:
+        guard(_pinned(pinned))
+
+
+def test_a_pinned_refusal_names_the_host_to_list_and_the_address_it_reached() -> None:
+    with pytest.raises(DeploymentHostError) as excinfo:
+        request_guard("https://orchestrator.rebind.test", engine="debezium")(
+            _pinned("93.184.216.34")
+        )
+    error = excinfo.value
+    assert "'orchestrator.rebind.test', connecting to '93.184.216.34'," in (error.why or "")
+    assert "debezium" in (error.why or "")
+    assert f'{ALLOWLIST_ENV}="connect.example.com"' in (error.fix or "")
+
+
+def test_an_operator_chosen_url_still_never_connects_to_metadata() -> None:
+    guard = request_guard(
+        "https://orchestrator.public.test", engine="airbyte", operator_supplied=True
+    )
+    guard(_pinned("93.184.216.34"))
+    with pytest.raises(DeploymentHostError) as excinfo:
+        guard(_pinned("169.254.169.254"))
+    error = excinfo.value
+    rendered = " ".join([str(error), error.why or "", error.fix or ""])
+    assert "connecting to '169.254.169.254'" in rendered
+    assert "contract" not in rendered, rendered
+
+
+def test_a_malformed_url_is_refused_not_raised() -> None:
+    """``http://[::1`` made ``urlsplit`` raise ValueError through the policy."""
+    with pytest.raises(DeploymentHostError) as excinfo:
+        refuse_unless_host_allowed("http://[::1", engine="kafka-connect")
+    assert "no host" in (excinfo.value.why or "")
+    with pytest.raises(DeploymentHostError):
+        request_guard("http://[::1", engine="kafka-connect")(_pinned("127.0.0.1"))
 
 
 @pytest.mark.parametrize(
