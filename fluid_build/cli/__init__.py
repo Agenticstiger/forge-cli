@@ -244,6 +244,7 @@ For more information, visit: https://github.com/Agenticstiger/forge-cli
 
             argcomplete.autocomplete(p)
         except ImportError:
+            # argcomplete is optional: without it, tab completion stays off.
             pass
 
     return p
