@@ -104,6 +104,13 @@ class _ProviderMap(dict):
     behave as on a plain dict and supersede a pending entry of the same name.
     """
 
+    def __eq__(self, other: object) -> bool:
+        # The loaded entries compare as a dict's would; comparing must not
+        # import every pending provider.
+        return dict.__eq__(self, other)
+
+    __hash__ = None  # type: ignore[assignment]  # mutable, as a dict
+
     def __init__(self) -> None:
         super().__init__()
         self._pending: Dict[str, _Pending] = {}

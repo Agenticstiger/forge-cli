@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import subprocess
@@ -452,7 +453,7 @@ def test_a_class_that_only_claims_an_in_tree_module_is_refused(_restore_registry
     P.PROVIDERS.clear()
     fake = _evil_class("fluid_build.providers.gcp")
     fake.__qualname__ = "GcpProvider"
-    import fluid_build.providers.gcp  # noqa: F401  (the real class is now a module attribute)
+    importlib.import_module("fluid_build.providers.gcp")  # the real class is now a module attribute
 
     P.register_provider("gcp", fake)
     assert not P.PROVIDERS.is_loaded("gcp")
@@ -550,7 +551,7 @@ def test_a_blocklist_set_after_discovery_blocks_first_use(monkeypatch, _restore_
 def test_a_forced_rediscovery_drops_a_pending_entry_that_is_now_blocked(
     monkeypatch, _restore_registry
 ):
-    monkeypatch.setattr(P.importlib.metadata, "entry_points", lambda: _EPs())
+    monkeypatch.setattr(P.importlib.metadata, "entry_points", _EPs)
     P.PROVIDERS.clear()
     P.discover_providers(force=True)
     assert P.PROVIDERS.pending("snowflake") is not None
@@ -676,14 +677,16 @@ def test_pop_of_a_pending_name_returns_the_provider_and_removes_it(_restore_regi
     assert "gcp" not in P.PROVIDERS and P.PROVIDERS.pending("gcp") is None
     with pytest.raises(KeyError):
         P.PROVIDERS.pop("gcp")
-    assert P.PROVIDERS.pop("gcp", "dflt") == "dflt"
+    popped = P.PROVIDERS.pop("gcp", "dflt")
+    assert popped == "dflt"
 
 
 def test_pop_of_a_pending_name_that_fails_to_import_gives_the_default(
     monkeypatch, _restore_registry
 ):
     _discover_with(monkeypatch, _failing_ep())
-    assert P.PROVIDERS.pop("mycloud", "dflt") == "dflt"
+    popped = P.PROVIDERS.pop("mycloud", "dflt")
+    assert popped == "dflt"
     assert "mycloud" not in P.PROVIDERS
 
 
@@ -714,7 +717,7 @@ def test_a_provider_blocked_after_discovery_is_never_imported(monkeypatch, _rest
     ],
 )
 def test_a_class_naming_no_real_in_tree_class_is_refused(module, qualname, _restore_registry):
-    import fluid_build.providers.gcp.provider  # noqa: F401  (loaded, so only the name decides)
+    importlib.import_module("fluid_build.providers.gcp.provider")  # loaded: only the name decides
 
     P.PROVIDERS.clear()
     fake = _evil_class(module)
