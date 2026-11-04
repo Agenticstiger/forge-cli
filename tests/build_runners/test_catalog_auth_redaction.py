@@ -80,7 +80,12 @@ def test_an_override_warehouse_password_is_masked():
 
 def test_the_embedded_preflight_registers_the_variable_value(monkeypatch):
     monkeypatch.setenv("FW_LK_CREDENTIAL", f"spark:{_PASSWORD}")
-    binding = _binding("lakekeeper", uri="http://c:8181/catalog", warehouse="analytics")
+    # The operator pairs the variable with both hosts it reaches.
+    monkeypatch.setenv(
+        "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST", "FW_LK_CREDENTIAL@c,FW_LK_CREDENTIAL@kc.example"
+    )
+    monkeypatch.setenv("FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST", "c,kc.example")
+    binding = _binding("lakekeeper", uri="https://c:8443/catalog", warehouse="analytics")
     contract = _contract(
         binding, debezium={"deployment": {"mode": "embedded"}, "server": {"sink": {}}}
     )

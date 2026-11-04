@@ -31,8 +31,10 @@ and land straight in the interview.
 
 Every probe is best-effort and never raises. Budget: once the one-time
 module imports are done, the probes share ``_TOTAL_TIMEOUT_S`` of wall-clock
-and the scan returns by then, dropping any probe still running. The dbt probe
-sets the floor: with Python dbt-core on PATH it usually waits out
+and the scan returns by then, dropping any probe still running. A dropped probe
+is abandoned, not killed (Python cannot kill a thread); the one that walks the
+directory tree bounds itself and ends when the scan returns (``_find_contracts``).
+The dbt probe sets the floor: with Python dbt-core on PATH it usually waits out
 ``_DBT_VERSION_TIMEOUT_S`` and reports nothing. ``scan_duration_ms`` is the
 measured wall-clock of the whole call, imports included.
 """
@@ -48,6 +50,7 @@ import threading
 import time
 from concurrent.futures import Future, wait
 from dataclasses import asdict, dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -73,11 +76,30 @@ _WARM_MODULES = (
     # the AI probe's cold cost (~0.1s CPU, several times that on a loaded host).
     "fluid_build.copilot.unified_config",
     "fluid_build.build_runners.dbt.runner",  # _probe_dbt_engine
+    # ``_walk_contracts`` takes the contract filename from ``cli.artifact_paths``, which
+    # ``workspace_config`` above already imports.
+    "fluid_build.util.upstream_discovery",  # _walk_contracts (directories to skip)
 )
 # Repeat-user threshold — at this many forges we stop showing the panel.
 _REPEAT_USER_THRESHOLD = 5
 # File extensions we recognise as candidate sample data.
 _SAMPLE_EXTENSIONS = (".csv", ".parquet", ".json", ".jsonl", ".tsv", ".duckdb")
+# The specialization probe tallies the productType of the first contracts under the
+# start directory. Its tree walk (``_find_contracts``) is bounded three ways: contracts
+# taken, directory levels below the start, and directory entries read. At the caps an
+# ordinary tree costs ~0.1s (a pathological one, 10,000 one-entry directories, ~0.6s of
+# CPU), and the scan's stop flag ends the walk early either way.
+_SPECIALIZATION_SAMPLE = 8
+_SPECIALIZATION_MAX_DEPTH = 6
+_SPECIALIZATION_MAX_ENTRIES = 10_000
+# One specialization walk at a time in the process. A walk the scan gave up on ends at
+# its next directory once the scan's stop flag is set, but one stuck in a filesystem
+# call (a hung network mount) never does, and each later scan would add another. Behind
+# this lock the later walks wait and leave when their own scan returns (a caller with no
+# scan gives up after one scan budget), so a process holds at most one stuck walker.
+_WALK_GATE = threading.Lock()
+# How often a walk waiting for the gate looks at its scan's stop flag.
+_WALK_GATE_POLL_S = 0.05
 # CLI binaries we report on.
 _CLI_BINARIES = (
     "dbt",
@@ -361,24 +383,99 @@ def _probe_return_user() -> Dict[str, Any]:
         return {"return_user": False, "forge_count": 0}
 
 
-def _probe_specialization_suggestion(start: Path) -> Dict[str, Any]:
-    """Suggest a productType based on recent forge history.
+def _walk_contracts(start: Path, stop: Optional[threading.Event]) -> List[Path]:
+    """The bounded walk behind :func:`_find_contracts`: depth-first, entries in name order."""
+    from fluid_build.cli.artifact_paths import CONTRACT_FILENAME
+    from fluid_build.util.upstream_discovery import BUILD_OUTPUT_DIRS, IGNORED_DIRS
 
-    Reads the last 5 ``.fluid/forge-receipt.json`` entries under the
-    workspace and proposes the dominant type. Only fires when ≥4/5
-    are the same type.
+    skip = IGNORED_DIRS | BUILD_OUTPUT_DIRS
+    found: List[Path] = []
+    unread = _SPECIALIZATION_MAX_ENTRIES
+
+    def visit(directory: str, depth: int) -> bool:
+        """Read ``directory``, then its subdirectories; True once the whole walk is over."""
+        nonlocal unread
+        if unread <= 0 or (stop is not None and stop.is_set()):
+            return True
+        try:
+            with os.scandir(directory) as listing:
+                entries = list(islice(listing, unread))
+        except OSError:
+            return False
+        unread -= len(entries)
+        # Names compare as path components do, so a contract file falls among the
+        # subdirectories exactly where ``sorted(rglob(...))`` would put it.
+        for entry in sorted(entries, key=lambda e: e.name):
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if depth < _SPECIALIZATION_MAX_DEPTH and entry.name not in skip:
+                        if visit(entry.path, depth + 1):
+                            return True
+                elif entry.name == CONTRACT_FILENAME and entry.is_file(follow_symlinks=False):
+                    found.append(Path(entry.path))
+                    if len(found) >= _SPECIALIZATION_SAMPLE:
+                        return True
+            except OSError:
+                continue
+        return False
+
+    visit(str(start), 0)
+    return found
+
+
+def _find_contracts(start: Path, stop: Optional[threading.Event] = None) -> List[Path]:
+    """The first ``_SPECIALIZATION_SAMPLE`` contracts under ``start``, in ``rglob`` order.
+
+    Depth-first with each directory's entries in name order, which lists the contracts
+    exactly as ``sorted(start.rglob("contract.fluid.yaml"))`` does, so the walk can end
+    at the last one it needs instead of reading the whole tree first. It also ends on
+    its own bounds, and only the contracts it reached are returned:
+
+    * directories on the repo's VCS / dependency / build-output list
+      (``upstream_discovery.IGNORED_DIRS`` and ``BUILD_OUTPUT_DIRS``: ``.git``,
+      ``.venv``, ``site-packages``, ``node_modules``, ``dist``, ...) are not entered;
+    * nothing deeper than ``_SPECIALIZATION_MAX_DEPTH`` levels below ``start`` is
+      listed, and at most ``_SPECIALIZATION_MAX_ENTRIES`` entries are read in all (a
+      directory larger than what is left of that is read in part);
+    * symlinks are neither followed nor tallied, and only a regular file counts as a
+      contract: ``rglob`` opens a symlink to ``/dev/zero`` or a FIFO named like one;
+    * ``stop`` is looked at before every directory. Python cannot kill a thread, so
+      this is how a scan ends the walk it abandoned.
+
+    One walk runs at a time per process (``_WALK_GATE``); a walk that is made to wait
+    leaves with ``[]`` as soon as its ``stop`` is set, or after one scan budget if it
+    has none.
+    """
+    deadline = time.monotonic() + _TOTAL_TIMEOUT_S
+    while not _WALK_GATE.acquire(timeout=_WALK_GATE_POLL_S):
+        if (stop is not None and stop.is_set()) or time.monotonic() >= deadline:
+            return []
+    try:
+        return _walk_contracts(start, stop)
+    finally:
+        _WALK_GATE.release()
+
+
+def _probe_specialization_suggestion(
+    start: Path, stop: Optional[threading.Event] = None
+) -> Dict[str, Any]:
+    """Suggest a productType from the ``contract.fluid.yaml`` files under ``start``.
+
+    Tallies ``metadata.productType`` over the first ``_SPECIALIZATION_SAMPLE``
+    contracts ``_find_contracts`` returns and proposes the dominant type when at
+    least 4 of at least 5 typed contracts agree. ``stop`` is the scan's flag for a
+    probe it has given up on: the walk and the parse loop both end on it.
     """
     try:
-        # Cheapest possible: glob for nearby contracts and tally their
-        # productType. Limited to a small radius so the scan stays
-        # under budget.
-        contracts = sorted(start.rglob("contract.fluid.yaml"))[:8]
+        contracts = _find_contracts(start, stop)
         if not contracts:
             return {}
         import yaml as _yaml
 
         types: List[str] = []
         for c in contracts:
+            if stop is not None and stop.is_set():
+                return {}
             try:
                 doc = _yaml.safe_load(c.read_text(encoding="utf-8")) or {}
                 pt = (doc.get("metadata") or {}).get("productType")
@@ -456,7 +553,9 @@ def run_welcome_scan(*, start: Optional[Path] = None) -> WelcomeFindings:
     the dbt subprocess included); the probes then get ``_TOTAL_TIMEOUT_S`` of
     wall-clock. A probe still running at the deadline is dropped — its fields
     stay at their defaults — and abandoned, so a hung probe delays neither the
-    prompt nor the process exit.
+    prompt nor the process exit. The probe that walks the directory tree is told
+    to stop when the scan returns and ends at its next directory; the others run
+    on to their own end.
 
     Wall-clock is the cold imports plus at most ``_TOTAL_TIMEOUT_S``;
     ``scan_duration_ms`` reports all of it.
@@ -464,6 +563,7 @@ def run_welcome_scan(*, start: Optional[Path] = None) -> WelcomeFindings:
     target = (start or Path.cwd()).resolve()
     findings = WelcomeFindings()
     started = time.monotonic()
+    stop = threading.Event()  # set when the scan returns, see ``_find_contracts``
 
     probes: Dict[str, Tuple[Callable[..., Dict[str, Any]], Tuple[Any, ...]]] = {
         "workspace": (_probe_workspace, (target,)),
@@ -474,12 +574,15 @@ def run_welcome_scan(*, start: Optional[Path] = None) -> WelcomeFindings:
         "samples": (_probe_sample_data, (target,)),
         "cloud": (_probe_cloud_creds, ()),
         "return_user": (_probe_return_user, ()),
-        "specialization": (_probe_specialization_suggestion, (target,)),
+        "specialization": (_probe_specialization_suggestion, (target, stop)),
     }
 
-    futures = {name: _spawn_probe(name, fn, args) for name, (fn, args) in probes.items()}
-    _warm_probe_imports()
-    done, _ = wait(futures.values(), timeout=_TOTAL_TIMEOUT_S)
+    try:
+        futures = {name: _spawn_probe(name, fn, args) for name, (fn, args) in probes.items()}
+        _warm_probe_imports()
+        done, _ = wait(futures.values(), timeout=_TOTAL_TIMEOUT_S)
+    finally:
+        stop.set()
     for name, future in futures.items():
         if future not in done:
             LOG.debug("welcome_scan_probe_timeout: %s", name)

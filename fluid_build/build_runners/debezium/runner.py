@@ -706,7 +706,8 @@ def _execute_debezium_server(
 
     # The server inherits this process's environment, which is where Iceberg
     # resolves the ``env:<NAME>`` catalog properties ``sink.catalogAuth``
-    # emits, and where the preflight checked the variable is set. The
+    # emits, and where the preflight checked the variable is set, once the
+    # operator had paired it with every host it reaches. The
     # ``FLUID_DBZ_*`` credentials the file refers to are added to it. No
     # secret is written to application.properties.
     try:
