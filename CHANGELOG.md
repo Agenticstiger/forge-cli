@@ -621,6 +621,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project dotenv file cannot point them elsewhere while `FLUID_LLM_API_KEY` or a stored key is in
   play, as for every other provider endpoint.
 
+- **The litellm endpoint check could not see a provider's per-kind route.** It looked for names
+  ending in `_API_BASE`, so the nine `DASHSCOPE_`, `QWENCLOUD_` and `QWEN_AI_PLATFORM_API_BASE_IMAGE`,
+  `_RERANK` and `_VIDEO` names litellm reads (three of them new in 1.108.0) were never listed, and
+  a project dotenv file could set them unpaired. They are listed now and the check reads a kind
+  after `_API_BASE`. FLUID calls only `litellm.completion`, which none of them routes, so nothing
+  reached them. The Databricks model-serving group also names `DATABRICKS_CLIENT_SECRET`, which
+  litellm's OAuth M2M path posts to the workspace `DATABRICKS_API_BASE` names; the name-shape rule
+  already refused that pairing, and the group now says why.
+
 ### Upgrade notes
 
 - New validate warning, so `--strict` fails: a contract with builds whose `contract.id` or a

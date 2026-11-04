@@ -80,6 +80,18 @@ def test_a_project_s_own_api_base_loads_with_its_own_key(tmp_path: Path) -> None
     assert os.environ["MYAPP_API_KEY"] == PROJECT_KEY
 
 
+def test_databricks_api_base_is_refused_while_the_operator_holds_the_m2m_secret() -> None:
+    # litellm's Databricks OAuth M2M path takes the workspace from
+    # DATABRICKS_API_BASE and posts DATABRICKS_CLIENT_SECRET there
+    # (litellm 1.108.0 llms/databricks/common_utils.py), whatever key pairs it.
+    refused = unpaired_endpoints(
+        {"DATABRICKS_API_BASE": "https://evil.test", "FLUID_LLM_API_KEY": PROJECT_KEY},
+        {"DATABRICKS_CLIENT_SECRET": OPERATOR_KEY},
+    )
+
+    assert "DATABRICKS_CLIENT_SECRET" in refused["DATABRICKS_API_BASE"].operator_credentials
+
+
 def test_a_project_api_base_still_follows_the_name_shape_rule() -> None:
     # The operator's own MYAPP_API_KEY would go to the project's host.
     refused = unpaired_endpoints(
@@ -102,10 +114,13 @@ def test_a_project_api_base_still_follows_the_name_shape_rule() -> None:
         "TENSORMESH_SERVERLESS_BASE_URL",
         "ANTHROPIC_AWS_BASE_URL",
         "COMETAPI_BASE_URL",
+        # a provider's route for one kind of call
+        "DASHSCOPE_API_BASE_VIDEO",
+        "QWENCLOUD_API_BASE_RERANK",
     ],
 )
 def test_a_litellm_provider_endpoint_pairs_only_with_fluid_llm_api_key(endpoint: str) -> None:
-    prefix = re.sub(r"_(API_BASE|BASE_URL)$", "", endpoint)
+    prefix = re.sub(r"_(API_BASE(?:_[A-Z0-9]+)*|BASE_URL)$", "", endpoint)
     decoy = {endpoint: "https://llm.project.test", f"{prefix}_API_KEY": PROJECT_KEY}
     paired = {endpoint: "https://llm.project.test", "FLUID_LLM_API_KEY": PROJECT_KEY}
 
@@ -237,7 +252,9 @@ _NOT_PROVIDER_CODE = (
     "rust_bridge/",
     "router_strategy/",
 )
-_READ = re.compile(r"""["']([A-Z][A-Z0-9_]*_API_BASE)["']""")
+# ``<NAME>_API_BASE``, and the same with a kind after it (``DASHSCOPE_API_BASE_VIDEO``,
+# ``QWENCLOUD_API_BASE_RERANK``): one provider's route for one kind of call.
+_READ = re.compile(r"""["']([A-Z][A-Z0-9_]*_API_BASE(?:_[A-Z0-9]+)*)["']""")
 # A get_secret* / os.getenv / os.environ read of a name ending like a host, a
 # URL, an endpoint or an account id (the host Snowflake's is part of).
 _ENV_READ = re.compile(
