@@ -37,28 +37,82 @@ from .changelog_types import Change
 # types that strictly widen them. Anything not in this table is treated as
 # a breaking type change. Names normalized to upper-case AND stripped of
 # precision/scale annotations (those are compared separately below).
+#
+# Only conversions that keep every existing value are listed, and only into a
+# target that declares no parameters of its own (see ``_classify_type_diff``).
+# Apache Iceberg ("Schema Evolution" in the table spec) and Delta Lake ("Type
+# widening") draw the same line: int -> long, float -> double and
+# date -> timestamp (Iceberg v3, Delta timestampNTZ) widen; int -> float,
+# float -> decimal and anything out of TIME are on neither list.
 _WIDENING: Mapping[str, frozenset[str]] = {
-    "INT": frozenset({"BIGINT", "INTEGER", "LONG", "DECIMAL", "NUMERIC", "FLOAT", "DOUBLE"}),
-    "INT32": frozenset({"INT64", "BIGINT", "LONG", "DECIMAL", "FLOAT", "DOUBLE"}),
-    "INTEGER": frozenset({"BIGINT", "LONG", "DECIMAL", "FLOAT", "DOUBLE"}),
+    "INT": frozenset({"BIGINT", "INTEGER", "LONG", "DECIMAL", "NUMERIC", "DOUBLE"}),
+    "INT32": frozenset({"INT64", "BIGINT", "LONG", "DECIMAL", "DOUBLE"}),
+    "INTEGER": frozenset({"BIGINT", "LONG", "DECIMAL", "DOUBLE"}),
     "SMALLINT": frozenset({"INT", "INT32", "INT64", "BIGINT", "INTEGER", "LONG"}),
-    "FLOAT": frozenset({"DOUBLE", "DECIMAL", "NUMERIC"}),
+    "FLOAT": frozenset({"DOUBLE"}),
     "VARCHAR": frozenset({"TEXT", "STRING"}),
     "STRING": frozenset({"TEXT"}),
     "DATE": frozenset({"DATETIME", "TIMESTAMP"}),
-    "TIME": frozenset({"DATETIME", "TIMESTAMP"}),
 }
 
-# Type-name + parameter regex. Captures e.g. ``DECIMAL(10,2)`` as ("DECIMAL",
-# "10,2") and ``VARCHAR(255)`` as ("VARCHAR", "255"). Suffix-attribute-less
-# types ("BIGINT") fall through with empty params.
-_TYPE_PARAM_RE = re.compile(r"^([A-Z0-9_]+)\s*(?:\(([^)]+)\))?\s*$")
+# Fixed-point types: two parameters, (precision, scale).
+_FIXED_POINT = frozenset({"DECIMAL", "DEC", "NUMERIC", "NUMBER", "BIGNUMERIC"})
+
+# Types whose parameter measures capacity (a length or a precision), so a bigger
+# one holds every value the smaller one did. The parameters of any other type
+# name something instead (``GEOMETRY(4326)`` is a spatial reference id,
+# ``VECTOR(1536)`` a dimension, ``BINARY(16)`` an exact width): changing them is
+# not a widening, whichever way the number moves.
+_MEASURED = _FIXED_POINT | frozenset(
+    {
+        "VARCHAR",
+        "VARCHAR2",
+        "NVARCHAR",
+        "NVARCHAR2",
+        "CHAR",
+        "NCHAR",
+        "CHARACTER",
+        "STRING",
+        "TEXT",
+        "VARBINARY",
+        "FLOAT",
+        "TIME",
+        "TIMESTAMP",
+        "TIMESTAMP_NTZ",
+        "TIMESTAMP_LTZ",
+        "TIMESTAMP_TZ",
+        "DATETIME",
+        "DATETIME2",
+    }
+)
+
+# Type-name + parameter grammar. ASCII only, matched whole with ``fullmatch``
+# (``$`` would let a trailing newline through), and linear in the input: the one
+# ``\s*`` sits inside the optional group, so a name followed by a long run of
+# spaces can't backtrack quadratically (the input is stripped before it is
+# matched). Captures e.g. ``DECIMAL(10,2)`` as ("DECIMAL", "10,2") and
+# ``VARCHAR(255)`` as ("VARCHAR", "255"). Suffix-attribute-less types ("BIGINT")
+# fall through with empty params.
+_TYPE_PARAM_RE = re.compile(r"([A-Z0-9_]+)(?:\s*\(([^)]+)\))?", re.ASCII)
+
+# The parameters the classifier can order: plain ASCII integers.
+_TYPE_INT_PARAMS_RE = re.compile(r"[0-9]+(?:\s*,\s*[0-9]+)*", re.ASCII)
+
+# The whitespace that may surround a parameter: ``str.strip()`` with no argument
+# also removes non-ASCII spaces, which would let them pass for ASCII ones.
+_ASCII_WS = " \t\n\r\f\v"
 
 
 def _norm_type(t: Any) -> str:
     if not isinstance(t, str):
         return ""
-    return t.strip().upper()
+    t = t.strip()
+    # Fold case for ASCII names only. ``str.upper()`` maps some non-ASCII
+    # letters onto ASCII ones (U+0131 dotless i -> "I", U+017F long s -> "S"),
+    # which would make an unknown type compare equal to a real one although the
+    # IaC emitters do not fold them. A non-ASCII name stays as written and
+    # matches nothing but itself.
+    return t.upper() if t.isascii() else t
 
 
 def _parse_type(t: str) -> Tuple[str, Optional[Tuple[int, ...]]]:
@@ -70,21 +124,29 @@ def _parse_type(t: str) -> Tuple[str, Optional[Tuple[int, ...]]]:
         ``"BIGINT"`` → ``("BIGINT", None)``
         ``"DECIMAL"`` → ``("DECIMAL", None)``  (no precision specified)
 
-    Returns ``("", None)`` when the input doesn't parse cleanly — caller
-    decides whether to treat that as a generic mismatch.
+    Returns ``("", None)`` for an empty input. A type that doesn't parse
+    cleanly (non-ASCII text, or parameters that aren't plain integers, such as
+    ``ENUM('A','B')`` or ``VARCHAR(MAX)``) comes back as ``(whole_string,
+    None)``: it equals itself and no other type, so a change in it is a
+    mismatch and never a normalization.
     """
     if not t:
         return ("", None)
-    m = _TYPE_PARAM_RE.match(t.strip())
+    t = t.strip()
+    m = _TYPE_PARAM_RE.fullmatch(t)
     if not m:
-        return (t.strip(), None)
+        return (t, None)
     base, params = m.group(1), m.group(2)
     if not params:
         return (base, None)
+    params = params.strip(_ASCII_WS)
+    if not _TYPE_INT_PARAMS_RE.fullmatch(params):
+        return (t, None)
     try:
-        nums = tuple(int(p.strip()) for p in params.split(","))
+        nums = tuple(int(p) for p in params.split(","))
     except ValueError:
-        return (base, None)
+        # Past the interpreter's integer-string limit.
+        return (t, None)
     return (base, nums)
 
 
@@ -95,10 +157,15 @@ def _classify_param_change(
 ) -> Optional[str]:
     """Classify a same-base type parameter change as 'widening' / 'narrowing'.
 
-    Returns ``"widening"`` if every parameter grew (or stayed equal),
-    ``"narrowing"`` if any parameter shrank, ``"changed"`` for ambiguous /
-    not-comparable cases, or ``None`` when both sides have no params (so
-    there's no diff to classify).
+    Returns ``"widening"`` if no parameter shrank and the type's parameters
+    measure capacity (see ``_MEASURED``), ``"narrowing"`` if none grew,
+    ``"changed"`` for everything else (one side has no parameters, a different
+    number of them, parameters that moved in different directions, or ones that
+    name something rather than measure it), or ``None`` when both sides carry
+    the same parameters, or none (so there's no diff to classify).
+
+    A fixed-point type's ``(precision, scale)`` is compared as (integer digits,
+    scale), not as the two numbers it is written with.
     """
     if old_params is None and new_params is None:
         return None
@@ -112,9 +179,19 @@ def _classify_param_change(
     if len(old_params) != len(new_params):
         # DECIMAL(10) vs DECIMAL(10,2) — semantically different shapes.
         return "changed"
-    pairs = list(zip(old_params, new_params, strict=True))
+    if base in _FIXED_POINT and len(old_params) == 2:
+        # (precision, scale) holds ``precision - scale`` integer digits and
+        # ``scale`` fractional ones, so a bigger precision with a bigger scale
+        # can still shrink the integer part: (10,2) holds 99999999.99 and
+        # (11,4) holds 9999999.9999. Compare the two capacities. Delta Lake
+        # widens decimal(p,s) to (p+k1,s+k2) only when k1 >= k2 >= 0, the same
+        # condition; Iceberg widens precision at a fixed scale.
+        (o_prec, o_scale), (n_prec, n_scale) = old_params, new_params
+        pairs = [(o_prec - o_scale, n_prec - n_scale), (o_scale, n_scale)]
+    else:
+        pairs = list(zip(old_params, new_params, strict=True))
     if all(n >= o for o, n in pairs):
-        return "widening"
+        return "widening" if base in _MEASURED else "changed"
     if all(n <= o for o, n in pairs):
         return "narrowing"
     # Mixed: e.g. precision grew but scale shrank — neither pure widening
@@ -134,16 +211,26 @@ def _is_widening(old_type: str, new_type: str) -> bool:
     return new_type in widens_to
 
 
+def _why_not_widening(old_type: str, new_type: str) -> str:
+    """The reason, for a finding's text, a type change is not a widening."""
+    if old_type.isascii() and new_type.isascii():
+        return "not a widening cast"
+    return "a type name with non-ASCII characters matches no other type"
+
+
 def _classify_type_diff(old_full: str, new_full: str) -> Tuple[str, str]:
     """Classify a (possibly parameterized) type change.
 
     Returns ``(severity, kind)``:
-      * ``("non_breaking", "column_type_widened")`` — base widened or
-        parameters strictly grew
+      * ``("non_breaking", "column_type_widened")`` — base widened to a type
+        that declares no parameters, or parameters strictly grew
       * ``("breaking", "column_type_changed")`` — base narrowed, parameters
         shrank, or unrelated type swap
-      * ``("info", "column_type_param_changed")`` — same base, parameters
-        changed in a way that's neither pure widening nor pure narrowing
+      * ``("breaking", "column_type_param_changed")`` — same base, parameters
+        changed in a way that's neither pure widening nor pure narrowing, or
+        only one side declares parameters
+      * ``("info", "column_type_normalized")`` — same base and parameters,
+        written with different formatting (whitespace, leading zeros)
     """
     old_base, old_params = _parse_type(old_full)
     new_base, new_params = _parse_type(new_full)
@@ -153,28 +240,83 @@ def _classify_type_diff(old_full: str, new_full: str) -> Tuple[str, str]:
         change = _classify_param_change(old_params, new_params, old_base)
         if change is None:
             # Same base, no param difference but full strings differ —
-            # whitespace or capitalization. Treat as info-level.
+            # whitespace or leading zeros (case is folded before this point).
             return ("info", "column_type_normalized")
         if change == "widening":
             return ("non_breaking", "column_type_widened")
         if change == "narrowing":
             return ("breaking", "column_type_changed")
-        return ("info", "column_type_param_changed")
+        return ("breaking", "column_type_param_changed")
 
-    # Different base type — fall back to the base-name widening table.
-    if _is_widening(old_base, new_base):
+    # Different base type — fall back to the base-name widening table. The
+    # table knows base names only: a target that declares parameters
+    # (``INT`` -> ``DECIMAL(5,0)``) may hold less than the source did.
+    if new_params is None and _is_widening(old_base, new_base):
         return ("non_breaking", "column_type_widened")
     return ("breaking", "column_type_changed")
 
 
+def _column_name(col: Any) -> Optional[str]:
+    """The name a column is matched by: ``name``, else ``id``."""
+    if isinstance(col, Mapping):
+        name = col.get("name") or col.get("id")
+        if isinstance(name, str):
+            return name
+    return None
+
+
 def _columns_by_name(columns: Sequence[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    """Index columns by name; the last of a repeated name wins.
+
+    :func:`diff_duplicates` reports the names this would collapse.
+    """
     out: dict[str, Mapping[str, Any]] = {}
     for col in columns or []:
-        if isinstance(col, Mapping):
-            name = col.get("name") or col.get("id")
-            if isinstance(name, str):
-                out[name] = col
+        name = _column_name(col)
+        if name is not None:
+            out[name] = col
     return out
+
+
+def _duplicate_columns(columns: Sequence[Mapping[str, Any]]) -> dict[str, list[Mapping[str, Any]]]:
+    """Every name declared more than once, with all of its declarations."""
+    seen: dict[str, list[Mapping[str, Any]]] = {}
+    if not isinstance(columns, Sequence):
+        return {}
+    for col in columns:
+        name = _column_name(col)
+        if name is not None:
+            seen.setdefault(name, []).append(col)
+    return {name: cols for name, cols in seen.items() if len(cols) > 1}
+
+
+def _duplicate_changes(
+    declarations: Sequence[Mapping[str, Any]],
+    *,
+    kind: str,
+    noun: str,
+    expose_id: str,
+    path_prefix: str,
+) -> List[Change]:
+    """A breaking ``Change`` for every name the new contract declares more than once.
+
+    :func:`_columns_by_name` keeps the last declaration of a name, so without this
+    the earlier one would never be compared against the baseline.
+    """
+    return [
+        Change(
+            path=f"{path_prefix}.{name}",
+            kind=kind,
+            severity="breaking",
+            description=(
+                f"{noun} '{name}' is declared {len(declared)} times in expose "
+                f"'{expose_id}'; keep one (a later declaration hides an earlier one)"
+            ),
+            before=None,
+            after=[dict(d) for d in declared],
+        )
+        for name, declared in _duplicate_columns(declarations).items()
+    ]
 
 
 def _expose_schema(expose: Mapping[str, Any]) -> Tuple[Sequence[Any], Optional[str]]:
@@ -417,17 +559,17 @@ def diff_columns(
             elif kind == "column_type_param_changed":
                 desc = (
                     f"column '{col_name}' type parameters changed "
-                    f"{old_type} -> {new_type} (review: not pure widening or narrowing)"
+                    f"{old_type} -> {new_type} (not a pure widening)"
                 )
             elif kind == "column_type_normalized":
                 desc = (
                     f"column '{col_name}' type normalized "
-                    f"{old_type} -> {new_type} (whitespace/casing only)"
+                    f"{old_type} -> {new_type} (formatting only)"
                 )
             else:
                 desc = (
                     f"column '{col_name}' type changed "
-                    f"{old_type} -> {new_type} (not a widening cast)"
+                    f"{old_type} -> {new_type} ({_why_not_widening(old_type, new_type)})"
                 )
             changes.append(
                 Change(
@@ -948,14 +1090,10 @@ def iter_expose_pairs(
     base_exposes = list(baseline.get("exposes") or [])
     new_exposes = list(new.get("exposes") or [])
     base_by_id = {
-        (e.get("id") or e.get("exposeId") or f"_pos_{i}"): (i, e)
-        for i, e in enumerate(base_exposes)
-        if isinstance(e, Mapping)
+        _expose_key(i, e): (i, e) for i, e in enumerate(base_exposes) if isinstance(e, Mapping)
     }
     new_by_id = {
-        (e.get("id") or e.get("exposeId") or f"_pos_{i}"): (i, e)
-        for i, e in enumerate(new_exposes)
-        if isinstance(e, Mapping)
+        _expose_key(i, e): (i, e) for i, e in enumerate(new_exposes) if isinstance(e, Mapping)
     }
     all_ids = set(base_by_id) | set(new_by_id)
     for eid in all_ids:
@@ -963,3 +1101,89 @@ def iter_expose_pairs(
         n = new_by_id.get(eid)
         idx_in_new = n[0] if n else (b[0] if b else 0)
         yield eid, idx_in_new, (b[1] if b else None), (n[1] if n else None)
+
+
+def _expose_key(index: int, expose: Mapping[str, Any]) -> Any:
+    """The id exposes are matched by; one without an id is matched by position."""
+    return expose.get("id") or expose.get("exposeId") or f"_pos_{index}"
+
+
+def _nested_duplicates(columns: Sequence[Any], *, expose_id: str, path_prefix: str) -> List[Change]:
+    """Every ``fields`` name declared twice below *columns*, at any depth."""
+    changes: List[Change] = []
+    if not isinstance(columns, Sequence):
+        return changes
+    for col in columns:
+        name = _column_name(col)
+        fields = col.get("fields") if name is not None else None
+        if isinstance(fields, Sequence):
+            prefix = f"{path_prefix}.{name}.fields"
+            changes.extend(
+                _duplicate_changes(
+                    fields,
+                    kind="nested_field_duplicate_name",
+                    noun="nested field",
+                    expose_id=expose_id,
+                    path_prefix=prefix,
+                )
+            )
+            changes.extend(_nested_duplicates(fields, expose_id=expose_id, path_prefix=prefix))
+    return changes
+
+
+def _duplicate_exposes(exposes: Sequence[Any]) -> List[Change]:
+    """Every expose id declared twice. An expose without an id is matched by position."""
+    declared_at: dict[Any, list[int]] = {}
+    for i, expose in enumerate(exposes):
+        if isinstance(expose, Mapping):
+            expose_id = expose.get("id") or expose.get("exposeId")
+            if expose_id:
+                declared_at.setdefault(expose_id, []).append(i)
+    return [
+        Change(
+            path=f"exposes[{at[-1]}]",
+            kind="expose_duplicate_id",
+            severity="breaking",
+            description=(
+                f"expose '{expose_id}' is declared {len(at)} times "
+                f"(at {', '.join(f'exposes[{i}]' for i in at)}); "
+                f"keep one (a later declaration hides an earlier one)"
+            ),
+            before=None,
+            after={"id": expose_id, "indexes": at},
+        )
+        for expose_id, at in declared_at.items()
+        if len(at) > 1
+    ]
+
+
+def diff_duplicates(new: Mapping[str, Any]) -> List[Change]:
+    """Flag every expose id, column name and nested field name *new* declares twice.
+
+    Breaking, and reported whatever the baseline holds. The comparison indexes
+    exposes, columns and fields by name and keeps the last of a repeated name,
+    so an earlier declaration would never be compared against the baseline,
+    and an emitter is free to read either one. It follows that a contract that
+    already declares a name twice is reported against itself, until one
+    declaration is removed.
+    """
+    exposes = list(new.get("exposes") or [])
+    changes = _duplicate_exposes(exposes)
+    for i, expose in enumerate(exposes):
+        if not isinstance(expose, Mapping):
+            continue
+        columns, where_found = _expose_schema(expose)
+        if where_found is None:
+            continue
+        key, prefix = _expose_key(i, expose), f"exposes[{i}].{where_found}"
+        changes.extend(
+            _duplicate_changes(
+                columns,
+                kind="column_duplicate_name",
+                noun="column",
+                expose_id=key,
+                path_prefix=prefix,
+            )
+        )
+        changes.extend(_nested_duplicates(columns, expose_id=key, path_prefix=prefix))
+    return changes

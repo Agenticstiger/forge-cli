@@ -313,7 +313,8 @@ def _gate_build_ids_for_apply(contract: Dict[str, Any]) -> None:
 
     The build phase turns ``contract.id`` and ``builds[].id`` into directory
     names, so it takes a narrower grammar than the schema: ``1orders``, or an
-    id of 129 characters, passes ``fluid validate`` and ``fluid plan``. The
+    id of 129 characters, passes ``fluid validate`` and ``fluid plan``, which
+    only warn (``build_runners._ids.build_id_warning``). The
     build runner checks the ids itself, but on the OpenTofu engine it runs
     after ``tofu apply``, so such an id was refused once the product was
     provisioned, as an "Unexpected error". This is the runner's own check
@@ -323,7 +324,11 @@ def _gate_build_ids_for_apply(contract: Dict[str, Any]) -> None:
     Raises:
         CLIError: ``apply_build_identifier_invalid``.
     """
-    from fluid_build.build_runners._ids import IdentifierViolation, validate_build_ids
+    from fluid_build.build_runners._ids import (
+        IDENT_RULE,
+        IdentifierViolation,
+        validate_build_ids,
+    )
 
     try:
         validate_build_ids(contract)
@@ -337,10 +342,8 @@ def _gate_build_ids_for_apply(contract: Dict[str, Any]) -> None:
                 "hint": (
                     "The build phase keeps each build's run records, cursors and "
                     "watermarks under .fluid/runs/<contract.id>/<build.id>/, so both ids "
-                    "must start with a letter or underscore, use only letters, digits, "
-                    "'_', '.' and '-', and be at most 128 characters. The contract schema "
-                    "allows more, so fluid validate and fluid plan accept it. Nothing was "
-                    "applied."
+                    f"must {IDENT_RULE}. The contract schema allows more, so fluid "
+                    "validate and fluid plan only warn about it. Nothing was applied."
                 ),
             },
         ) from exc

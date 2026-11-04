@@ -21,8 +21,11 @@ Covers the diff engine (``api/changelog.py``), rule classifications
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -30,10 +33,12 @@ import pytest
 from fluid_build.api.changelog import compare_contracts, render_markdown, render_text
 from fluid_build.api.changelog_rules import (
     _classify_type_diff,
+    _norm_type,
     _parse_type,
     diff_agent_policy,
     diff_columns,
     diff_consumes,
+    diff_duplicates,
     diff_quality_severity,
     diff_sovereignty,
 )
@@ -41,6 +46,14 @@ from fluid_build.api.changelog_types import Change, ChangelogReport
 from tests.test_schema_076_preview_additions import _base_contract
 
 FIXTURES = Path(__file__).parent / "fixtures" / "changelog"
+
+# Characters the type tests need that look like ASCII, built with chr() so the source
+# stays plain ASCII and greppable.
+DOTLESS_I = chr(0x131)  # str.upper() maps it to "I"
+LONG_S = chr(0x17F)  # str.upper() maps it to "S"
+DOTTED_CAPITAL_I = chr(0x130)
+FULLWIDTH_ONE = chr(0xFF11)
+NBSP = chr(0xA0)
 
 
 @pytest.fixture
@@ -475,6 +488,14 @@ def test_cli_diff_baseline_rejects_state(tmp_path):
         ("BIGINT", "BIGINT", None),
         ("DECIMAL(38, 18)", "DECIMAL", (38, 18)),
         ("", "", None),
+        # Off-grammar text is its own type: it equals itself and nothing else, so a
+        # change in it can never be read as "no parameters" or as whitespace.
+        ("ENUM('A','B')", "ENUM('A','B')", None),
+        ("VARCHAR(MAX)", "VARCHAR(MAX)", None),
+        ("DECIMAL(1_0,2)", "DECIMAL(1_0,2)", None),
+        ("DECIMAL(+10,2)", "DECIMAL(+10,2)", None),
+        (f"DECIMAL({FULLWIDTH_ONE}0,2)", f"DECIMAL({FULLWIDTH_ONE}0,2)", None),
+        (f"DECIMAL({NBSP}10,2)", f"DECIMAL({NBSP}10,2)", None),
     ],
 )
 def test_parse_type_extracts_base_and_params(raw, expected_base, expected_params):
@@ -495,10 +516,14 @@ def test_decimal_precision_narrowing_is_breaking():
     assert kind == "column_type_changed"
 
 
-def test_decimal_mixed_param_change_is_info():
-    """Precision grew but scale shrank — neither pure widening nor narrowing."""
+def test_decimal_mixed_param_change_is_breaking():
+    """Precision grew but scale shrank — neither pure widening nor narrowing.
+
+    It used to be ``info``, which ``--fail-on-breaking`` lets through; a column that
+    holds fewer fractional digits than before loses data for its consumers.
+    """
     sev, kind = _classify_type_diff("DECIMAL(20,4)", "DECIMAL(30,2)")
-    assert sev == "info"
+    assert sev == "breaking"
     assert kind == "column_type_param_changed"
 
 
@@ -894,24 +919,18 @@ def test_a_column_dropped_while_moving_to_contract_schema_is_still_found():
     ]
 
 
-@pytest.mark.parametrize("fail_on_breaking, expected_rc", [(True, 1), (False, 0)])
-def test_cli_diff_baseline_sees_a_required_column_added_to_a_076_contract(
-    tmp_path, fail_on_breaking, expected_rc
-):
-    """``--fail-on-breaking`` is the exit code CI gates on; it must see 0.7.x columns."""
+def _cli_diff_baseline(tmp_path, old, new, fail_on_breaking):
+    """Run ``fluid diff <new> --baseline <old>`` on two contract dicts; return (rc, JSON report)."""
     import yaml
 
     from fluid_build.cli import diff as diff_mod
 
-    old = tmp_path / "old.fluid.yaml"
-    new = tmp_path / "new.fluid.yaml"
-    old.write_text(yaml.safe_dump(_contract_076([_ID_COLUMN])))
-    added = {"name": "region", "type": "string", "required": True}
-    new.write_text(yaml.safe_dump(_contract_076([_ID_COLUMN, added])))
+    (tmp_path / "old.fluid.yaml").write_text(yaml.safe_dump(old))
+    (tmp_path / "new.fluid.yaml").write_text(yaml.safe_dump(new))
     out = tmp_path / "diff.json"
     args = argparse.Namespace(
-        contract=str(new),
-        baseline=str(old),
+        contract=str(tmp_path / "new.fluid.yaml"),
+        baseline=str(tmp_path / "old.fluid.yaml"),
         env=None,
         state=None,
         out=str(out),
@@ -920,11 +939,386 @@ def test_cli_diff_baseline_sees_a_required_column_added_to_a_076_contract(
         format="json",
         cmd="diff",
     )
-
     rc = diff_mod.run(args, logging.getLogger("test.diff"))
+    return rc, json.loads(out.read_text())
+
+
+@pytest.mark.parametrize("fail_on_breaking, expected_rc", [(True, 1), (False, 0)])
+def test_cli_diff_baseline_sees_a_required_column_added_to_a_076_contract(
+    tmp_path, fail_on_breaking, expected_rc
+):
+    """``--fail-on-breaking`` is the exit code CI gates on; it must see 0.7.x columns."""
+    added = {"name": "region", "type": "string", "required": True}
+
+    rc, report = _cli_diff_baseline(
+        tmp_path, _contract_076([_ID_COLUMN]), _contract_076([_ID_COLUMN, added]), fail_on_breaking
+    )
 
     assert rc == expected_rc
-    assert [c["kind"] for c in json.loads(out.read_text())["breaking"]] == ["column_added"]
+    assert [c["kind"] for c in report["breaking"]] == ["column_added"]
+
+
+# ---------------------------------------------------------------------------
+# Type comparison: type changes that used to pass ``--fail-on-breaking``
+# ---------------------------------------------------------------------------
+
+
+def _assert_schema_valid(*contracts):
+    """Every contract below is one the bundled 0.7.6 schema accepts, so the engine must handle it."""
+    from fluid_build.schema_manager import FluidSchemaManager
+
+    for contract in contracts:
+        result = FluidSchemaManager().validate_contract(
+            contract, schema_version="0.7.6", offline_only=True
+        )
+        assert result.is_valid, result.errors
+
+
+def _type_change_report(old_type, new_type):
+    old = _contract_076([{"name": "c", "type": old_type}])
+    new = _contract_076([{"name": "c", "type": new_type}])
+    _assert_schema_valid(old, new)
+    return compare_contracts(old, new)
+
+
+@pytest.mark.parametrize(
+    "old_type, new_type, severity, kind",
+    [
+        # A name that only looks like a real type once str.upper() has folded it.
+        pytest.param("int", f"{DOTLESS_I}nt", "breaking", "column_type_changed", id="dotless-i"),
+        pytest.param(
+            "timestamp", f"time{LONG_S}tamp", "breaking", "column_type_changed", id="long-s"
+        ),
+        # Parameters used to be ignored when the base type changed.
+        ("int", "decimal(5,0)", "breaking", "column_type_changed"),
+        # Parameters present on one side only, or moving in different directions.
+        ("varchar", "varchar(10)", "breaking", "column_type_param_changed"),
+        ("varchar(255)", "varchar", "breaking", "column_type_param_changed"),
+        ("decimal(10,2)", "decimal(12,1)", "breaking", "column_type_param_changed"),
+        ("decimal(10,2)", "decimal", "breaking", "column_type_param_changed"),
+        # Precision and scale both grow, the integer digits shrink (8 -> 7).
+        ("decimal(10,2)", "decimal(11,4)", "breaking", "column_type_param_changed"),
+        # Parameters that name something (a spatial reference id, an exact width) don't widen.
+        ("geometry(4326)", "geometry(32633)", "breaking", "column_type_param_changed"),
+        ("binary(16)", "binary(32)", "breaking", "column_type_param_changed"),
+        # Entries that left the widening table.
+        ("time", "timestamp", "breaking", "column_type_changed"),
+        ("time", "datetime", "breaking", "column_type_changed"),
+        ("int", "float", "breaking", "column_type_changed"),
+        ("integer", "float", "breaking", "column_type_changed"),
+        ("int32", "float", "breaking", "column_type_changed"),
+        ("float", "decimal", "breaking", "column_type_changed"),
+        ("float", "numeric", "breaking", "column_type_changed"),
+        # Parameters the classifier can't order used to read as "no parameters".
+        ("enum('a','b')", "enum('a')", "breaking", "column_type_changed"),
+        ("varchar", "varchar(max)", "breaking", "column_type_changed"),
+        ("decimal(10,2)", "decimal(1_0,2)", "breaking", "column_type_changed"),
+        ("decimal(10,2)", f"decimal({NBSP}10,2)", "breaking", "column_type_changed"),
+        # Controls, which pass on the code before this change too: what still widens, and
+        # what is only whitespace.
+        ("int", "bigint", "non_breaking", "column_type_widened"),
+        ("int", "double", "non_breaking", "column_type_widened"),
+        ("int", "decimal", "non_breaking", "column_type_widened"),
+        ("varchar", "text", "non_breaking", "column_type_widened"),
+        ("varchar(50)", "varchar(255)", "non_breaking", "column_type_widened"),
+        ("date", "timestamp", "non_breaking", "column_type_widened"),
+        ("float", "double", "non_breaking", "column_type_widened"),
+        ("decimal(10,2)", "decimal(12,4)", "non_breaking", "column_type_widened"),
+        ("char(10)", "char(20)", "non_breaking", "column_type_widened"),
+        ("float(24)", "float(53)", "non_breaking", "column_type_widened"),
+        ("decimal(10,2)", "decimal(10, 2)", "info", "column_type_normalized"),
+        ("varchar(255)", "varchar(0255)", "info", "column_type_normalized"),
+    ],
+)
+def test_076_type_comparison(old_type, new_type, severity, kind):
+    report = _type_change_report(old_type, new_type)
+
+    assert report.total == 1
+    (change,) = getattr(report, severity)
+    assert change.kind == kind
+    assert change.path == "exposes[0].contract.schema.c.type"
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (" int ", "INT"),
+        ("DeCiMaL(10,2)", "DECIMAL(10,2)"),
+        (f"{DOTLESS_I}nt", f"{DOTLESS_I}nt"),
+        (f"time{LONG_S}tamp", f"time{LONG_S}tamp"),
+        (f"{DOTTED_CAPITAL_I}nt", f"{DOTTED_CAPITAL_I}nt"),
+        (None, ""),
+        (5, ""),
+    ],
+)
+def test_norm_type_folds_case_for_ascii_names_only(raw, expected):
+    assert _norm_type(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "old, new, expected",
+    [
+        # Same integer digits, bigger scale: still holds every old value.
+        ("DECIMAL(10,2)", "DECIMAL(12,4)", ("non_breaking", "column_type_widened")),
+        ("DECIMAL(10,2)", "DECIMAL(11,4)", ("breaking", "column_type_param_changed")),
+        ("NUMBER(10,2)", "NUMBER(11,4)", ("breaking", "column_type_param_changed")),
+        ("NUMERIC(10,2)", "NUMERIC(12,1)", ("breaking", "column_type_param_changed")),
+        ("DECIMAL(10)", "DECIMAL(10,2)", ("breaking", "column_type_param_changed")),
+        ("DECIMAL(10)", "DECIMAL(12)", ("non_breaking", "column_type_widened")),
+        # Types that are not fixed-point compare their parameters one by one.
+        ("TIMESTAMP(3)", "TIMESTAMP(6)", ("non_breaking", "column_type_widened")),
+    ],
+)
+def test_fixed_point_widens_only_when_scale_and_integer_digits_both_hold(old, new, expected):
+    assert _classify_type_diff(old, new) == expected
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("GEOMETRY(4326)", "GEOMETRY(32633)"),
+        ("GEOMETRY(32633)", "GEOMETRY(4326)"),
+        ("VECTOR(3)", "VECTOR(1536)"),
+        ("BINARY(16)", "BINARY(32)"),
+        ("BIT(8)", "BIT(16)"),
+    ],
+)
+def test_parameters_that_name_something_are_never_a_widening(old, new):
+    """A spatial reference id, a dimension or an exact width does not measure capacity."""
+    assert _classify_type_diff(old, new)[0] == "breaking"
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("VARCHAR(10)", "VARCHAR(20)"),
+        ("CHAR(1)", "CHAR(8)"),
+        ("FLOAT(24)", "FLOAT(53)"),
+        ("TIME(0)", "TIME(6)"),
+        ("DATETIME2(3)", "DATETIME2(7)"),
+    ],
+)
+def test_a_bigger_length_or_precision_is_a_widening(old, new):
+    assert _classify_type_diff(old, new) == ("non_breaking", "column_type_widened")
+
+
+def test_parsing_a_long_run_of_spaces_or_an_unclosed_list_stays_linear():
+    """A type is untrusted text: the parser must not backtrack quadratically on it."""
+    started = time.perf_counter()
+    _parse_type("A" + " " * 50_000 + "x")
+    _parse_type("A(" + "1" * 50_000)
+    assert time.perf_counter() - started < 2.0
+
+
+def test_an_oversized_integer_parameter_is_unparseable_text():
+    if not hasattr(sys, "set_int_max_str_digits"):
+        pytest.skip("this interpreter has no integer-string length limit")
+    previous = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(640)
+    try:
+        raw = "VARCHAR(" + "9" * 700 + ")"
+        assert _parse_type(raw) == (raw, None)
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+def test_a_non_ascii_type_name_says_why_it_is_not_the_same_type():
+    report = _type_change_report("int", f"{DOTLESS_I}nt")
+
+    (change,) = report.breaking
+    assert "non-ASCII" in change.description
+
+
+@pytest.mark.parametrize("fail_on_breaking, expected_rc", [(True, 1), (False, 0)])
+def test_cli_diff_baseline_fails_on_a_type_change_that_used_to_pass(
+    tmp_path, fail_on_breaking, expected_rc
+):
+    """``int`` -> ``decimal(5,0)`` was reported as a widening, so the CI gate stayed green."""
+    old = _contract_076([{"name": "id", "type": "int"}])
+    new = _contract_076([{"name": "id", "type": "decimal(5,0)"}])
+    _assert_schema_valid(old, new)
+
+    rc, report = _cli_diff_baseline(tmp_path, old, new, fail_on_breaking)
+
+    assert rc == expected_rc
+    assert [c["kind"] for c in report["breaking"]] == ["column_type_changed"]
+
+
+def _contract_with_exposes(*exposes):
+    """A 0.7.6 contract with one expose per ``(expose_id, columns)`` pair."""
+    contract = _contract_076([])
+    template = contract["exposes"][0]
+    contract["exposes"] = []
+    for expose_id, columns in exposes:
+        expose = copy.deepcopy(template)
+        expose["exposeId"] = expose_id
+        expose["contract"]["schema"] = columns
+        contract["exposes"].append(expose)
+    return contract
+
+
+@pytest.mark.parametrize(
+    "declared, kinds",
+    [
+        pytest.param(["int", "string"], {"column_duplicate_name"}, id="last-matches-baseline"),
+        pytest.param(
+            ["string", "int"], {"column_duplicate_name", "column_type_changed"}, id="last-differs"
+        ),
+        pytest.param(["string", "string"], {"column_duplicate_name"}, id="identical"),
+        pytest.param(["string"] * 3, {"column_duplicate_name"}, id="three-times"),
+    ],
+)
+def test_076_a_column_declared_twice_in_the_new_contract_is_breaking(declared, kinds):
+    """The index keeps the last declaration of a name, so the diff never saw the other one."""
+    old = _contract_076([_ID_COLUMN, {"name": "note", "type": "string"}])
+    new = _contract_076([_ID_COLUMN] + [{"name": "note", "type": t} for t in declared])
+    _assert_schema_valid(old, new)
+
+    report = compare_contracts(old, new)
+
+    assert {c.kind for c in report.breaking} == kinds
+    assert report.total == len(kinds)
+    (duplicate,) = [c for c in report.breaking if c.kind == "column_duplicate_name"]
+    assert duplicate.path == "exposes[0].contract.schema.note"
+    assert [c["type"] for c in duplicate.after] == declared
+
+
+_ZIP = {"name": "zip", "type": "STRING"}
+
+
+def _address(*fields):
+    return {"name": "addr", "type": "STRUCT", "fields": list(fields)}
+
+
+@pytest.mark.parametrize(
+    "old_columns, new_columns, non_breaking",
+    [
+        pytest.param(
+            [_address(_ZIP)],
+            [_address({"name": "zip", "type": "INT"}, _ZIP)],
+            [],
+            id="column-in-both-contracts",
+        ),
+        pytest.param(
+            [{"name": "id", "type": "STRING"}],
+            [{"name": "id", "type": "STRING"}, _address(_ZIP, _ZIP)],
+            ["column_added"],
+            id="column-is-new",
+        ),
+    ],
+)
+def test_a_nested_field_declared_twice_in_the_new_contract_is_breaking(
+    old_columns, new_columns, non_breaking
+):
+    report = compare_contracts(
+        _contract_flat(old_columns), _contract_flat(new_columns), validate=False
+    )
+
+    assert [c.kind for c in report.non_breaking] == non_breaking
+    assert [(c.kind, c.path) for c in report.breaking] == [
+        ("nested_field_duplicate_name", "exposes[0].schema.addr.fields.zip")
+    ]
+
+
+def test_076_an_expose_id_declared_twice_in_the_new_contract_is_breaking():
+    as_string = [{"name": "a", "type": "string"}]
+    as_int = [{"name": "a", "type": "int"}]
+    old = _contract_with_exposes(("orders", as_string))
+    new = _contract_with_exposes(("orders", as_int), ("orders", as_string))
+    _assert_schema_valid(old, new)
+
+    report = compare_contracts(old, new)
+
+    assert report.total == 1
+    (change,) = report.breaking
+    assert (change.kind, change.path) == ("expose_duplicate_id", "exposes[1]")
+    assert change.after == {"id": "orders", "indexes": [0, 1]}
+
+
+def test_076_distinct_names_and_ids_are_not_duplicates():
+    columns = [_ID_COLUMN, {"name": "note", "type": "string"}]
+    contract = _contract_with_exposes(("orders", columns), ("customers", columns))
+    _assert_schema_valid(contract)
+
+    assert compare_contracts(contract, copy.deepcopy(contract)).total == 0
+
+
+def test_a_duplicate_in_an_expose_that_is_new_to_the_contract_is_breaking():
+    """A new expose has no baseline to hide a change from, but it is just as ambiguous."""
+    customers = ("customers", [_ID_COLUMN])
+    note = {"name": "note", "type": "string"}
+    old = _contract_with_exposes(customers)
+    new = _contract_with_exposes(customers, ("orders", [_ID_COLUMN, note, note]))
+    _assert_schema_valid(old, new)
+
+    report = compare_contracts(old, new)
+
+    assert [c.kind for c in report.non_breaking] == ["expose_added"]
+    assert [(c.kind, c.path) for c in report.breaking] == [
+        ("column_duplicate_name", "exposes[1].contract.schema.note")
+    ]
+
+
+def test_a_nested_field_declared_twice_below_the_first_level_is_breaking():
+    lat = {"name": "lat", "type": "DOUBLE"}
+    geo = {"name": "geo", "type": "STRUCT", "fields": [lat, lat]}
+    contract = _contract_flat([{"name": "addr", "type": "STRUCT", "fields": [geo]}])
+
+    assert [(c.kind, c.path) for c in diff_duplicates(contract)] == [
+        ("nested_field_duplicate_name", "exposes[0].schema.addr.fields.geo.fields.lat")
+    ]
+
+
+def test_076_a_duplicate_both_contracts_declare_is_still_reported():
+    """The documented exception to idempotence: the earlier declaration is hidden in both."""
+    note = {"name": "note", "type": "string"}
+    contract = _contract_076([_ID_COLUMN, note, note])
+    _assert_schema_valid(contract)
+
+    report = compare_contracts(contract, copy.deepcopy(contract))
+
+    assert [c.kind for c in report.breaking] == ["column_duplicate_name"]
+    assert report.total == 1
+
+
+def test_076_a_duplicate_only_the_baseline_declares_is_not_reported():
+    note = {"name": "note", "type": "string"}
+    old = _contract_076([_ID_COLUMN, note, note])
+    new = _contract_076([_ID_COLUMN, note])
+
+    assert compare_contracts(old, new).total == 0
+
+
+def test_an_expose_is_named_by_id_or_exposeid_and_an_unnamed_one_by_position():
+    exposes = [{"id": "a"}, {"exposeId": "a"}, {"id": "b"}, {"schema": []}, {"id": "_pos_3"}]
+
+    found = diff_duplicates({"exposes": exposes})
+
+    assert [(c.kind, c.path) for c in found] == [("expose_duplicate_id", "exposes[1]")]
+
+
+@pytest.mark.parametrize("schema", [5, True, 3.5, "text", {"x": 1}])
+def test_a_malformed_schema_in_an_expose_that_is_new_does_not_crash(schema):
+    """The duplicate walk reads exposes the comparison used to skip as merely added.
+
+    A schema-invalid contract only gets here with ``validate=False``.
+    """
+    old = {"exposes": [{"id": "a", "schema": [{"name": "x", "type": "INT"}]}]}
+    new = {"exposes": [old["exposes"][0], {"id": "b", "schema": schema}]}
+
+    report = compare_contracts(old, new, validate=False)
+
+    assert [c.kind for c in report.non_breaking] == ["expose_added"]
+    assert report.total == 1
+
+
+def test_the_duplicate_findings_render():
+    note = {"name": "note", "type": "string"}
+    report = compare_contracts(_contract_076([_ID_COLUMN]), _contract_076([_ID_COLUMN, note, note]))
+
+    assert "column_duplicate_name" in render_text(report)
+    assert "column_duplicate_name" in render_markdown(report)
+    assert json.loads(json.dumps(report.to_dict()))["breaking"][0]["after"] == [note, note]
 
 
 # ---------------------------------------------------------------------------
