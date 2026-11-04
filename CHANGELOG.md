@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A Databricks data product looks like a native one in Unity Catalog.** `fluid apply` now
+  writes, from the contract, the table's comment (the expose's `description`, else the product's,
+  its `purpose` when structured) and each column's (`contract.schema[].description`). The table
+  carries the product's identity as tags: `fluid_product_id`, `fluid_product_name`,
+  `fluid_domain`, `fluid_layer`, `fluid_product_type`, `fluid_product_version` (the expose's
+  `version`), `fluid_version` (`fluidVersion`) and `fluid_owner_team` (`metadata.owner.team`),
+  the keys AWS Glue and Snowflake already use; a field the contract does not state makes no tag.
+  A column the contract classifies (`sensitivity`) carries it as the column tag
+  `fluid_sensitivity`. The table's owner is unchanged: the deploy identity keeps owning it, which
+  the masks, the row filter and the fail-safe lock depend on, and the owner team is a tag. On a
+  table a dbt build writes, the comments stay dbt's (its `CREATE OR REPLACE` sets them, from the
+  model with `persist_docs`): forge-cli sets none there and `fluid validate` says so; its tags
+  are still set. Unity Catalog's certification, the system governed tag
+  `system.certification_status`, is `deprecated` when `lifecycle.state` (the expose's, else the
+  product's) is `deprecated`, else `certified` when the label `certification: certified` (the
+  expose's, else the product's) says so; that label is then not also a plain tag, and any other
+  value of it is refused (`databricks-certification-invalid`). The deploy identity needs the
+  ASSIGN permission on that governed tag (not verified on a live workspace), which the plan
+  says. `fluid verify`'s governance-tags dimension now also checks the product's tags, the column
+  tags and the comments, reading each tag list to its last page.
+
+### Changed
+
+- **Every Databricks table now gets tag assignments.** A contract without labels used to make
+  none; its table now carries the product's identity tags, which count toward Unity Catalog's 50
+  per securable together with the governance labels. Refused rather than applied part way: a
+  label that becomes one of those keys (`databricks-tag-collision`), a tag value over 256
+  characters (`databricks-tag-value-too-long`), more than 1,000 column tags on a table
+  (`databricks-tags-too-many`), and a description holding a backslash
+  (`databricks-comment-unsafe`: the provider escapes only quotes when it writes
+  `COMMENT '...'`, so a trailing backslash would end the string early), and one holding `${`
+  (also `databricks-comment-unsafe`: Spark may substitute a variable there).
+
 ### Security
 
 - **An Iceberg sink's catalog credential could be pointed at a cloud metadata address.** The

@@ -67,6 +67,16 @@ CONTRACT: Dict[str, Any] = {
     ],
 }
 TABLE = "main.sales.orders"
+#: What ``fluid apply`` sets on ``CONTRACT``'s table besides its columns: the product's own
+#: tags and its description as the comment (test_iac_databricks_metadata.py).
+PRODUCT_TAGS = {
+    "fluid_product_id": "dbx.fake.orders",
+    "fluid_product_name": "Databricks test orders",
+    "fluid_layer": "Gold",
+    "fluid_version": "0.7.6",
+    "fluid_owner_team": "data-platform",
+}
+TABLE_COMMENT = "Databricks verify test contract"
 LIVE_COLUMNS = [
     {"name": "id", "type_text": "bigint", "nullable": False},
     {"name": "amount", "type_text": "double", "nullable": True},
@@ -122,8 +132,11 @@ class StubWorkspace:
         self.region = "eu-central-1"
         self.fail_on: Optional[str] = None
         self.page_size = 100
-        # (entity type, full name) -> {tag key: value}, served paginated by ``tag_page_size``
-        self.tags: Dict[Any, Dict[str, str]] = {}
+        # (entity type, full name) -> {tag key: value}, served paginated by ``tag_page_size``;
+        # by default what an apply of ``CONTRACT`` leaves
+        self.tags: Dict[Any, Dict[str, str]] = {("tables", TABLE): dict(PRODUCT_TAGS)}
+        # full name -> the table's ``comment``
+        self.comments: Dict[str, str] = {TABLE: TABLE_COMMENT}
         self.tag_page_size = 100
         # full name -> the table's ``row_filter`` as GetTable serves it
         self.row_filters: Dict[str, Dict[str, Any]] = {}
@@ -155,6 +168,8 @@ class StubWorkspace:
                 "columns": self.tables[full],
                 "owner": self.table_owner,
             }
+            if full in self.comments:
+                table["comment"] = self.comments[full]
             if full in self.row_filters:
                 table["row_filter"] = self.row_filters[full]
             return table
@@ -636,7 +651,7 @@ def governed_contract() -> Dict[str, Any]:
 def seed_tags(workspace: StubWorkspace, **extra: str) -> None:
     schema = {"data_classification": "confidential", "cost_center": "cx-001"}
     workspace.tags[("schemas", "main.sales")] = dict(schema, **extra)
-    workspace.tags[("tables", TABLE)] = dict(schema, sensitivity="high", **extra)
+    workspace.tags[("tables", TABLE)] = dict(schema, sensitivity="high", **PRODUCT_TAGS, **extra)
 
 
 def test_every_expected_tag_on_the_table_and_its_schema_passes(workspace):
@@ -646,7 +661,7 @@ def test_every_expected_tag_on_the_table_and_its_schema_passes(workspace):
 
     assert result["status"] == "match" and result["severity"]["level"] == "SUCCESS"
     tags = result["dimensions"]["governance_tags"]
-    assert tags["status"] == "pass" and "5 governance tag(s)" in tags["message"]
+    assert tags["status"] == "pass" and "10 tag(s) and 1 comment(s)" in tags["message"]
     asked = [path for _m, path, _q in workspace.calls if "entity-tag-assignments" in path]
     assert asked == [
         "/api/2.1/unity-catalog/entity-tag-assignments/schemas/main.sales/tags",
@@ -697,7 +712,8 @@ def test_the_tag_list_is_read_across_every_page_an_empty_one_with_a_token_includ
         for _m, path, q in workspace.calls
         if path.endswith(f"/tables/{TABLE}/tags")
     ]
-    assert tokens == [None, "1", "2", "3"]
+    # an empty first page, then one page per tag: the 3 governance and 5 product tags
+    assert tokens == [None, *(str(page) for page in range(1, 9))]
 
 
 def test_a_tag_list_that_never_ends_is_an_error_not_a_pass(workspace):
@@ -709,10 +725,26 @@ def test_a_tag_list_that_never_ends_is_an_error_not_a_pass(workspace):
     assert result["status"] == "error" and "never ended" in result["error"]
 
 
-def test_a_contract_without_governance_labels_skips_the_tags_and_asks_nothing(workspace):
+def test_a_contract_without_governance_labels_checks_the_products_own_tags_on_the_table(
+    workspace,
+):
     result = verify(workspace)
 
     assert result["status"] == "match"
+    assert result["dimensions"]["governance_tags"]["status"] == "pass"
+    asked = [path for _m, path, _q in workspace.calls if "entity-tag-assignments" in path]
+    assert asked == [f"/api/2.1/unity-catalog/entity-tag-assignments/tables/{TABLE}/tags"]
+
+
+def test_nothing_to_tag_or_comment_skips_and_asks_nothing(workspace, monkeypatch):
+    from fluid_build.iac.providers import databricks as dbx
+
+    monkeypatch.setattr(dbx, "_PRODUCT_TAGS", ())
+    contract = copy.deepcopy(CONTRACT)
+    del contract["description"]
+
+    result = verify(workspace, contract)
+
     assert result["dimensions"]["governance_tags"]["status"] == "skip"
     assert not any("entity-tag-assignments" in path for _m, path, _q in workspace.calls)
 
@@ -731,12 +763,113 @@ def test_fluid_verify_prints_the_tag_fix_and_strict_fails(tmp_path, monkeypatch,
     assert code != 0
 
 
-def test_fluid_verify_shows_the_tags_skipped_without_labels(
+def test_fluid_verify_passes_the_products_own_tags_without_labels(
     tmp_path, monkeypatch, capfd, workspace
 ):
     code, out = _run_verify(tmp_path, monkeypatch, capfd, workspace, "--strict")
 
-    assert "Governance tags (Unity Catalog) ⚪ SKIPPED" in out and code == 0
+    assert "all 5 tag(s) and 1 comment(s) are on the table" in out and code == 0
+
+
+# ── Comments and column tags ────────────────────────────────────────────
+
+
+def described_contract() -> Dict[str, Any]:
+    """``orders`` with its own description, a described column and two classified ones."""
+    document = copy.deepcopy(CONTRACT)
+    expose = document["exposes"][0]
+    expose["description"] = "One row per order, as the shop's system records it."
+    schema = expose["contract"]["schema"]
+    schema[0]["description"] = "The order's id."
+    schema[1]["sensitivity"] = "confidential"
+    schema[2]["sensitivity"] = "internal"
+    return document
+
+
+def seed_described(workspace: StubWorkspace) -> None:
+    workspace.comments[TABLE] = "One row per order, as the shop's system records it."
+    workspace.tables[TABLE][0]["comment"] = "The order's id."
+    workspace.tags[("columns", f"{TABLE}.amount")] = {"fluid_sensitivity": "confidential"}
+    workspace.tags[("columns", f"{TABLE}.region")] = {"fluid_sensitivity": "internal"}
+
+
+def test_the_comments_and_column_tags_the_contract_sets_pass(workspace):
+    seed_described(workspace)
+
+    result = verify(workspace, described_contract())
+
+    tags = result["dimensions"]["governance_tags"]
+    assert result["status"] == "match", tags
+    assert tags["message"] == (
+        "all 7 tag(s) and 2 comment(s) are on the table, its schema and its columns"
+    )
+    asked = [path for _m, path, _q in workspace.calls if "entity-tag-assignments" in path]
+    assert asked == [
+        f"/api/2.1/unity-catalog/entity-tag-assignments/tables/{TABLE}/tags",
+        f"/api/2.1/unity-catalog/entity-tag-assignments/columns/{TABLE}.amount/tags",
+        f"/api/2.1/unity-catalog/entity-tag-assignments/columns/{TABLE}.region/tags",
+    ]
+
+
+def test_a_missing_column_tag_fails_naming_the_column(workspace):
+    seed_described(workspace)
+    del workspace.tags[("columns", f"{TABLE}.amount")]
+
+    result = verify(workspace, described_contract())
+
+    assert result["severity"]["level"] == "CRITICAL"
+    (finding,) = result["dimensions"]["governance_tags"]["findings"]
+    assert finding["entity"] == f"column {TABLE}.amount"
+    assert finding["tag"] == "fluid_sensitivity" and finding["expected"] == "confidential"
+
+
+def test_the_column_tag_list_is_read_across_every_page(workspace):
+    seed_described(workspace)
+    workspace.tags[("columns", f"{TABLE}.amount")]["set_by_someone_else"] = "x"
+    workspace.tag_page_size = 1
+
+    result = verify(workspace, described_contract())
+
+    assert result["dimensions"]["governance_tags"]["status"] == "pass"
+    tokens = [
+        q.get("page_token") for _m, path, q in workspace.calls if path.endswith(".amount/tags")
+    ]
+    assert tokens == [None, "1"]
+
+
+def test_a_changed_or_missing_comment_fails_with_the_apply_fix(workspace):
+    seed_described(workspace)
+    workspace.comments[TABLE] = "edited by hand"
+    del workspace.tables[TABLE][0]["comment"]
+
+    result = verify(workspace, described_contract())
+
+    tags = result["dimensions"]["governance_tags"]
+    assert tags["status"] == "fail" and "fluid apply" in tags["fix"]
+    table, column = tags["findings"]
+    assert (table["entity"], table["actual"]) == (f"table {TABLE}", "edited by hand")
+    assert (column["entity"], column["actual"]) == (f"column {TABLE}.id", None)
+    assert "description" in result["severity"]["reason"]
+
+
+def test_a_comment_or_tag_someone_else_added_is_not_a_finding(workspace):
+    seed_described(workspace)
+    workspace.tables[TABLE][2]["comment"] = "region code"
+    workspace.tags[("tables", TABLE)]["steward"] = "someone"
+
+    assert verify(workspace, described_contract())["status"] == "match"
+
+
+def test_a_dbt_written_table_is_not_checked_for_comments(workspace):
+    contract = contract_with_job()
+    contract["exposes"][0]["description"] = "never set by fluid apply on a dbt table"
+    workspace.comments.pop(TABLE)
+    workspace.add_jobs(job_name(), 1)
+
+    result = verify(workspace, contract)
+
+    tags = result["dimensions"]["governance_tags"]
+    assert tags["status"] == "pass" and "0 comment(s)" in tags["message"]
 
 
 # ── Row filter and column masks ─────────────────────────────────────────

@@ -60,6 +60,18 @@ def isolate_workspace(
     monkeypatch.chdir(root)
 
 
+#: The product's own tags ``fluid apply`` puts on the table of every :func:`make_contract`
+#: product: its id, name, layer, ``fluidVersion`` and owner team
+#: (``test_iac_databricks_metadata.py``).
+PRODUCT_TAGS = {
+    "fluid_product_id": "dbx.fake.orders",
+    "fluid_product_name": "Databricks test orders",
+    "fluid_layer": "Gold",
+    "fluid_version": "0.7.6",
+    "fluid_owner_team": "data-platform",
+}
+
+
 def make_contract(
     *,
     columns: List[Tuple[str, str, bool]] = COLUMNS,

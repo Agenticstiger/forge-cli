@@ -55,6 +55,31 @@ resources, with no new schema field (fluid-schema 0.7.6):
   existing assignment is imported best-effort before the first apply, and removing a
   label destroys only its assignment, which holds no data. Whether a tag survives a
   dbt ``CREATE OR REPLACE`` is undocumented, so ``fluid verify`` is the gate.
+* The product is described in Unity Catalog the way a native one is. The table's
+  ``comment`` is the expose's ``description`` (else the product's, its ``purpose`` when
+  structured) and each column's is its ``contract.schema[].description``. The table also
+  carries the product's identity as tags (:data:`_PRODUCT_TAGS`: ``fluid_product_id``,
+  ``fluid_product_name``, ``fluid_domain``, ``fluid_layer``, ``fluid_product_type``,
+  ``fluid_product_version`` from the expose's ``version``, ``fluid_version`` from
+  ``fluidVersion``, and ``fluid_owner_team`` from ``metadata.owner.team``), counted with the
+  governance labels toward the 50; a label that meets one of those keys is
+  ``databricks-tag-collision`` and a value longer than the 256 characters a tag value holds
+  is ``databricks-tag-value-too-long``. A column the contract classifies
+  (``contract.schema[].sensitivity``) carries it as the column tag ``fluid_sensitivity``
+  (entity type ``columns``), at most 1,000 on a table. The owner is recorded as a tag,
+  never set: the table's owner stays the deploy identity, which the masks, the row filter
+  and the fail-safe lock depend on (``databricks_enforce.py``). A comment holding a
+  backslash is ``databricks-comment-unsafe``: the provider escapes only quotes when it
+  writes ``COMMENT '...'`` (``parseComment``), so a trailing backslash would escape the
+  closing quote; one holding ``${`` is refused too, since Spark may substitute it. On a
+  table a dbt build writes, the comments are dbt's (its ``CREATE OR REPLACE`` sets them
+  from the model, with ``persist_docs``), so the module sets none.
+* Unity Catalog's certification (the system governed tag ``system.certification_status``)
+  is ``deprecated`` when the expose's ``lifecycle.state`` (else the product's) is
+  ``deprecated``, else ``certified`` when the label ``certification: certified`` (the
+  expose's, else the product's) says so; that label is then no plain tag, and any other
+  value of it is ``databricks-certification-invalid``. The deploy identity needs ASSIGN on
+  the governed tag, which the plan says (:meth:`DatabricksIacPlugin.plan_notices`).
 * ``policy.authz.columnRestrictions`` and ``policy.authz.rowFilters`` are enforced by Unity
   Catalog: SQL functions bound on the table, with the semantics GCP and AWS give them
   (``databricks_access.py``). ``deny`` is a mask that returns NULL (Unity Catalog has no
@@ -275,6 +300,11 @@ class _Table:
     enforcement: Optional[TableEnforcement] = None
     #: The ``lifecycle.expire`` it promises and this module accepted (``databricks_retention.py``).
     retention: Optional[Retention] = None
+    #: Its ``comment``, and ``(column, comment)`` per described column; see :func:`_comments`.
+    comment: Optional[str] = None
+    column_comments: Tuple[Tuple[str, str], ...] = ()
+    #: ``(column, sensitivity)`` per column the contract classifies.
+    classified: Tuple[Tuple[str, str], ...] = ()
 
     @property
     def full_name(self) -> str:
@@ -310,6 +340,34 @@ class _Compiled:
 #: Unity Catalog allows 50 tags on a securable ("Apply tags to Unity Catalog securable
 #: objects", Databricks docs). Its keys may not contain ``. , - = / :``.
 _MAX_TAGS = 50
+#: The same page: a tag value holds at most 256 characters, and a table at most 1,000
+#: column tags across its columns.
+_MAX_TAG_VALUE = 256
+_MAX_COLUMN_TAGS = 1000
+
+#: The product's identity on its table: tag key → where the contract states it
+#: (:func:`_product_tags`). The keys are the ones the AWS Glue parameters and the
+#: Snowflake comment use for the same facts.
+_PRODUCT_TAGS = (
+    ("fluid_product_id", "id"),
+    ("fluid_product_name", "name"),
+    ("fluid_domain", "domain"),
+    ("fluid_layer", "metadata.layer"),
+    ("fluid_product_type", "metadata.productType"),
+    ("fluid_product_version", "exposes[].version"),
+    ("fluid_version", "fluidVersion"),
+    ("fluid_owner_team", "metadata.owner.team"),
+)
+#: The column tag a column's ``sensitivity`` becomes.
+SENSITIVITY_TAG = "fluid_sensitivity"
+#: The contract label that certifies a product (founder decision, 2026-11-04: a label, so no
+#: schema field); its one accepted value. ``lifecycle.state: deprecated`` gives the other.
+CERTIFICATION_LABEL = "certification"
+#: Unity Catalog's system governed tag for a certified or deprecated asset ("Flag data as
+#: certified or deprecated", Databricks docs): values ``certified`` and ``deprecated``. Setting
+#: it needs ASSIGN on that governed tag, besides APPLY TAG on the table (the Entity Tag
+#: Assignments API, databricks-sdk 0.158.0 ``EntityTagAssignmentsAPI.create``).
+CERTIFICATION_TAG = "system.certification_status"
 
 
 def _refusal(kind: str, message: str, *remediation: str) -> UnsupportedBindingError:
@@ -757,6 +815,90 @@ def _columns(
     return columns
 
 
+def _text(raw: Any) -> str:
+    """A contract string as Unity Catalog would keep it: ``""`` for none, stripped."""
+    if isinstance(raw, Mapping):
+        # a structured product description (``$defs.descriptionObject``): its purpose
+        raw = raw.get("purpose")
+    return "" if raw is None or isinstance(raw, (Mapping, list)) else str(raw).strip()
+
+
+def _comment(raw: Any, where: str, refusals: List[UnsupportedBindingError]) -> Optional[str]:
+    """``raw`` as a table or column comment; ``None`` for none, or refused.
+
+    The provider writes a comment into SQL as ``COMMENT '...'`` and escapes only the quote
+    (``parseComment`` in ``resource_sql_table.go`` at v1.140.0: ``\\'`` → ``'``, then ``'``
+    → ``\\'``). Databricks reads a backslash in a string literal as an escape, so a trailing
+    one, or one before a quote, ends the literal early and the rest of the text is read as
+    SQL. Without a backslash the provider's escaping is complete.
+    """
+    text = _text(raw)
+    if not text:
+        return None
+    if "\\" in text:
+        refusals.append(
+            _refusal(
+                "comment-unsafe",
+                f"{where} holds a backslash. The provider writes it into COMMENT '...' "
+                "escaping only quotes, so Databricks would read the backslash as an escape and "
+                "the text after it as SQL.",
+                "Remove the backslash from the description (write a / or spell it out).",
+            )
+        )
+        return None
+    if "${" in text:
+        # Spark substitutes ``${var}``, ``${env:X}`` and ``${system:x}`` in a statement's
+        # whole text, string literals included, while ``spark.sql.variable.substitute`` is on
+        # (its default): a comment would publish what the warehouse holds under that name.
+        refusals.append(
+            _refusal(
+                "comment-unsafe",
+                f"{where} holds '${{', which Spark may substitute with a variable, setting or "
+                "environment value before the COMMENT is stored.",
+                "Write it without '${' (for example '$ {').",
+            )
+        )
+        return None
+    return text
+
+
+def _comments(
+    where: str,
+    exposure: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    columns: Sequence[Mapping[str, Any]],
+    refusals: List[UnsupportedBindingError],
+) -> Tuple[Optional[str], List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """``(table comment, [(column, comment)], [(column, sensitivity)])`` for one expose.
+
+    The table's comment is the expose's ``description``, else the product's; a column's is
+    its ``description``, and its classification its ``sensitivity``. Only the columns
+    :func:`_columns` kept are read, by the name Unity Catalog stores.
+    """
+    if _text(exposure.get("description")):
+        comment = _comment(exposure.get("description"), f"{where} description", refusals)
+    else:
+        comment = _comment(contract.get("description"), "the contract's description", refusals)
+    kept = {column["name"] for column in columns}
+    described: List[Tuple[str, str]] = []
+    classified: List[Tuple[str, str]] = []
+    schema_cols = (exposure.get("contract") or {}).get("schema") or []
+    for position, column in enumerate(schema_cols):
+        if not isinstance(column, Mapping):
+            continue
+        name = str(column.get("name") or "").strip().lower()
+        if name not in kept:
+            continue
+        col_where = f"{where} contract.schema[{position}]"
+        text = _comment(column.get("description"), f"{col_where}.description", refusals)
+        if text is not None:
+            described.append((name, text))
+        sensitivity = _text(column.get("sensitivity"))
+        if sensitivity:
+            classified.append((name, sensitivity))
+    return comment, described, classified
+
+
 def _partitions(
     where: str,
     loc: Mapping[str, Any],
@@ -819,6 +961,7 @@ def _resolve_table(
         where, exposure, names.get("table") or "", contract, validating=validating
     )
     refusals.extend(retention_refusals)
+    comment, column_comments, classified = _comments(where, exposure, contract, columns, refusals)
     enforcement: Optional[TableEnforcement] = None
     if len(refusals) == before:
         try:
@@ -849,6 +992,9 @@ def _resolve_table(
         region=region,
         enforcement=enforcement,
         retention=retention,
+        comment=comment,
+        column_comments=tuple(column_comments),
+        classified=tuple(classified),
     )
 
 
@@ -1204,6 +1350,12 @@ def _compile(
         _emit_table(
             compiled, table, cid, warehouse, region, dbt_owned=table.expose_id in dbt_written
         )
+        if table.expose_id in dbt_written and (table.comment or table.column_comments):
+            compiled.warnings.append(
+                f"{table.where} is written by dbt, whose CREATE OR REPLACE sets the table and "
+                "column comments: Unity Catalog shows the dbt model's descriptions (with "
+                "persist_docs), not the contract's, so fluid apply sets none."
+            )
         _emit_grants(compiled, table, cid, privileges.get(table.full_name, {}))
         _emit_tags(compiled, table, cid, contract)
     _merge_jobs(
@@ -1337,10 +1489,19 @@ def _emit_table(
         # dbt's table materialization rebuilds it with CREATE OR REPLACE: the
         # module creates it (its grants need it to exist) and leaves the rest to
         # dbt, as the Snowflake emitter does (iac/providers/snowflake.py).
+        # Comments included: the CREATE OR REPLACE writes the model's own (dbt's
+        # ``persist_docs``) or none, so a comment set here would last only until
+        # the first dbt run, and ``fluid verify`` would then fail on it every time.
         body["lifecycle"] = {"ignore_changes": list(_DBT_OWNED)}
         compiled.dbt_written.append(table.full_name)
     else:
         body["properties"] = {COLUMN_MAPPING: "name"}
+        if table.comment is not None:
+            body["comment"] = table.comment
+        described = dict(table.column_comments)
+        for column in body["column"]:
+            if column["name"] in described:
+                column["comment"] = described[column["name"]]
     if table.partitions:
         body["partitions"] = list(table.partitions)
     _claim(compiled, "databricks_sql_table", table_key, f"table {table.full_name}", body)
@@ -1437,27 +1598,37 @@ def _uc_tags(
     contract: Mapping[str, Any],
     exposure: Mapping[str, Any],
     refusals: List[UnsupportedBindingError],
+    own: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, str]:
-    """The governance labels of ``where`` as Unity Catalog tags, or ``{}`` and a refusal.
+    """The governance labels of ``where`` as Unity Catalog tags, with the module's ``own``
+    tags (the product's identity, :func:`_product_tags`), or ``{}`` and a refusal.
 
     ``governance_labels`` keys are ``[a-z0-9_-]``, and a tag key may not contain
     ``-``, so each ``-`` becomes ``_``; the values go as they are. Two labels that
-    meet at one key, or more tags than a securable holds, are refused: the module
-    would otherwise overwrite one tag with another, or drop some without a word.
+    meet at one key, a label that meets one of the module's own keys, or more tags
+    than a securable holds, are refused: the module would otherwise overwrite one tag
+    with another, or drop some without a word.
     """
     labels = governance_labels(contract, exposure, limit=None)
-    tags: Dict[str, str] = {}
+    # The certification label is Unity Catalog's certification tag, not a tag of its own.
+    labels.pop(CERTIFICATION_LABEL, None)
+    tags: Dict[str, str] = dict(own or {})
     source: Dict[str, str] = {}
     for label, value in labels.items():
         key = label.replace("-", "_")
         if key in tags:
+            first = (
+                f"the labels {source[key]!r} and {label!r} are"
+                if key in source
+                else f"the label {label!r} and the product's own tag are"
+            )
             refusals.append(
                 _refusal(
                     "tag-collision",
-                    f"{where}: the labels {source[key]!r} and {label!r} are both the Unity "
-                    f"Catalog tag key {key!r} (a tag key may not contain '-', so each '-' "
-                    "becomes '_'), and one would silently replace the other.",
-                    "Rename one of the labels so they differ once '-' is read as '_'.",
+                    f"{where}: {first} both the Unity Catalog tag key {key!r} (a tag key may not "
+                    "contain '-', so each '-' becomes '_'), and one would silently replace the "
+                    "other.",
+                    "Rename the label so it differs from the other key once '-' is read as '_'.",
                 )
             )
             return {}
@@ -1467,14 +1638,90 @@ def _uc_tags(
         refusals.append(
             _refusal(
                 "tags-too-many",
-                f"{where} would carry {len(tags)} governance tags, and Unity Catalog allows "
-                f"{_MAX_TAGS} on a securable, so the rest would be dropped without a word.",
+                f"{where} would carry {len(tags)} tags ({len(labels)} from governance labels), "
+                f"and Unity Catalog allows {_MAX_TAGS} on a securable, so the rest would be "
+                "dropped without a word.",
                 f"Remove labels from the contract (or the expose) until {_MAX_TAGS} or fewer "
                 "remain; the classification, jurisdiction, regulation and residency each count "
-                "as one.",
+                "as one, and so does each of the product's own tags on a table (fluid_product_id "
+                "and the others the contract states).",
             )
         )
         return {}
+    return tags
+
+
+def _lookup(document: Mapping[str, Any], path: str) -> Any:
+    value: Any = document
+    for part in path.split("."):
+        value = value.get(part) if isinstance(value, Mapping) else None
+    return value
+
+
+def _certification(
+    contract: Mapping[str, Any], table: _Table, refusals: List[UnsupportedBindingError]
+) -> Optional[str]:
+    """Unity Catalog's certification of ``table``: ``deprecated`` when the expose's
+    ``lifecycle.state`` (else the product's) says so, else ``certified`` when the label
+    :data:`CERTIFICATION_LABEL` (the expose's, else the product's) says so.
+
+    A deprecated product is never shown as certified, whatever its label. Any other label
+    value is refused: Unity Catalog's tag takes only those two values.
+    """
+    state = _text(_lookup(table.exposure, "lifecycle.state")) or _text(
+        _lookup(contract, "lifecycle.state")
+    )
+    if state.lower() == "deprecated":
+        return "deprecated"
+    label = governance_labels(contract, table.exposure, limit=None).get(CERTIFICATION_LABEL)
+    if label is None:
+        return None
+    if label != "certified":
+        refusals.append(
+            _refusal(
+                "certification-invalid",
+                f"{table.where}: the label {CERTIFICATION_LABEL} is {label!r}, and Unity "
+                f"Catalog's {CERTIFICATION_TAG} takes 'certified' or 'deprecated'.",
+                f"Set labels.{CERTIFICATION_LABEL}: certified, or remove it; a deprecated "
+                "product says so with lifecycle.state: deprecated.",
+            )
+        )
+        return None
+    return "certified"
+
+
+def _product_tags(
+    contract: Mapping[str, Any], table: _Table, refusals: List[UnsupportedBindingError]
+) -> Dict[str, str]:
+    """The product's identity and owner team as tags on ``table`` (:data:`_PRODUCT_TAGS`).
+
+    A field the contract does not state makes no tag. A value is kept as written, less
+    surrounding whitespace (Unity Catalog refuses that); one longer than a tag value
+    holds is refused rather than cut, since a cut id or name names another product.
+    """
+    tags: Dict[str, str] = {}
+    for key, path in _PRODUCT_TAGS:
+        if path == "exposes[].version":
+            where, raw = f"{table.where} version", table.exposure.get("version")
+        else:
+            where, raw = f"the contract's {path}", _lookup(contract, path)
+        value = _text(raw)
+        if not value:
+            continue
+        if len(value) > _MAX_TAG_VALUE:
+            refusals.append(
+                _refusal(
+                    "tag-value-too-long",
+                    f"{where} is {len(value)} characters, and a Unity Catalog tag value holds "
+                    f"at most {_MAX_TAG_VALUE}, so tag {key} would be cut.",
+                    f"Shorten it to {_MAX_TAG_VALUE} characters or fewer.",
+                )
+            )
+            continue
+        tags[key] = value
+    certification = _certification(contract, table, refusals)
+    if certification is not None:
+        tags[CERTIFICATION_TAG] = certification
     return tags
 
 
@@ -1533,13 +1780,58 @@ def _emit_tags(compiled: _Compiled, table: _Table, cid: str, contract: Mapping[s
         ("schemas", schema_name, tofu_ref(f"databricks_schema.{schema_key}.id")),
         on_schema,
     )
-    on_table = _uc_tags(table.where, contract, table.exposure, compiled.refusals)
+    own = _product_tags(contract, table, compiled.refusals)
+    on_table = _uc_tags(table.where, contract, table.exposure, compiled.refusals, own)
     _claim_tags(
         compiled,
         f"{table_key}_table_tag",
         ("tables", table.full_name, tofu_ref(f"databricks_sql_table.{table_key}.id")),
         on_table,
     )
+    _emit_column_tags(compiled, table, table_key)
+
+
+def _emit_column_tags(compiled: _Compiled, table: _Table, table_key: str) -> None:
+    """Each classified column's ``sensitivity`` as the column tag :data:`SENSITIVITY_TAG`.
+
+    A column is entity type ``columns``, named ``catalog.schema.table.column`` (the
+    provider's ``entity_tag_assignment`` docs at v1.140.0). The name is built on the
+    table's ``id`` so the assignment is ordered after the table; the column is an
+    identifier ``_ident`` accepted, so it is safe inside the expression.
+    """
+    if len(table.classified) > _MAX_COLUMN_TAGS:
+        compiled.refusals.append(
+            _refusal(
+                "tags-too-many",
+                f"{table.where} would carry {len(table.classified)} column tags, and Unity "
+                f"Catalog allows {_MAX_COLUMN_TAGS} across a table's columns, so the rest would "
+                "be dropped without a word.",
+                f"Classify {_MAX_COLUMN_TAGS} or fewer of its columns (contract.schema[]."
+                "sensitivity).",
+            )
+        )
+        return
+    for column, sensitivity in table.classified:
+        if len(sensitivity) > _MAX_TAG_VALUE:
+            compiled.refusals.append(
+                _refusal(
+                    "tag-value-too-long",
+                    f"{table.where} column {column} has a sensitivity of {len(sensitivity)} "
+                    f"characters, and a Unity Catalog tag value holds at most {_MAX_TAG_VALUE}.",
+                    "Use one of the schema's sensitivity levels.",
+                )
+            )
+            continue
+        _claim_tags(
+            compiled,
+            f"{table_key}_col_{column}_tag",
+            (
+                "columns",
+                f"{table.full_name}.{column}",
+                TofuExpr("${" + f"databricks_sql_table.{table_key}.id" + "}." + column),
+            ),
+            {SENSITIVITY_TAG: sensitivity},
+        )
 
 
 def _merge_jobs(compiled: _Compiled, jobs: CompiledJobs) -> None:
@@ -1929,6 +2221,19 @@ class DatabricksIacPlugin:
         it creates paused until the tables they write are protected."""
         compiled = _compile(contract, os.environ)
         notices = _use_catalog_notices(compiled)
+        certified = sorted(
+            {
+                f"{full_name} ({value})"
+                for _k, full_name, key, value in compiled.tags
+                if key == CERTIFICATION_TAG
+            }
+        )
+        if certified:
+            notices.append(
+                f"{CERTIFICATION_TAG} is set on {', '.join(certified)}: a system governed tag, "
+                "so this identity needs the ASSIGN permission on it, which an account or "
+                "workspace admin grants, or the tag assignment fails."
+            )
         decided = getattr(self, "_pause_decision", None)
         self._pause_decision = None  # used once: the next run decides again
         if decided is not None and decided[0] is not None and decided[0] == _contract_key(contract):
@@ -2001,8 +2306,8 @@ class DatabricksIacPlugin:
             if _MIXED_CHANGE in output:
                 return _refusal(
                     "column-change-mixed",
-                    "Databricks cannot add or remove columns and change existing ones in the "
-                    f"same apply. {listed}",
+                    "Databricks cannot add or remove columns and change existing ones (their "
+                    f"nullability or description included) in the same apply. {listed}",
                     "Apply the change in two steps: first only add or remove columns, then "
                     "change the existing ones (or the other way round).",
                 )
@@ -2260,6 +2565,12 @@ class ManagedTable:
     #: table's Delta history must not exceed. ``None`` when the expose sets no expire.
     retention_period: Optional[str] = None
     retention_seconds: Optional[int] = None
+    #: The ``comment`` the module sets on it, and ``(column, comment)`` per described column;
+    #: none on a table a dbt build writes (dbt sets its comments).
+    comment: Optional[str] = None
+    column_comments: Tuple[Tuple[str, str], ...] = ()
+    #: ``(column, key, value)`` per column tag it is meant to carry, sorted.
+    column_tags: Tuple[Tuple[str, str, str], ...] = ()
 
 
 def managed_objects(
@@ -2307,6 +2618,17 @@ def managed_objects(
             enforcement=table.enforcement,
             retention_period=table.retention.period if table.retention else None,
             retention_seconds=table.retention.seconds if table.retention else None,
+            comment=None if table.full_name in compiled.dbt_written else table.comment,
+            column_comments=(
+                () if table.full_name in compiled.dbt_written else table.column_comments
+            ),
+            column_tags=tuple(
+                sorted(
+                    (full_name[len(table.full_name) + 1 :], tag_key, tag_value)
+                    for kind, full_name, tag_key, tag_value in compiled.tags
+                    if kind == "columns" and full_name.rsplit(".", 1)[0] == table.full_name
+                )
+            ),
         )
         for table in compiled.tables
     ]

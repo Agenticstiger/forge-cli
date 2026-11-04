@@ -31,12 +31,16 @@ What is checked is what the emitter's own pass says it provisions
    reach the table. Read from the catalog's effective permissions. forge-cli
    never grants it (the catalog is not the product's), so the finding carries
    the statement an admin runs.
-3. **Governance tags.** The contract's governance labels are Unity Catalog tags
-   (``databricks_entity_tag_assignment``) on the table and its schema. Each
-   expected tag must be there with its value; a tag someone else set is ignored.
-   Read from ``GET .../entity-tag-assignments/{type}/{name}/tags``, which pages.
-   A dbt ``CREATE OR REPLACE`` may drop a table's tags (Databricks does not
-   say), so this is the gate: the fix is ``fluid apply``.
+3. **Governance tags and comments.** The contract's governance labels are Unity Catalog
+   tags (``databricks_entity_tag_assignment``) on the table and its schema, the product's
+   identity and owner team are tags on the table, and each classified column carries its
+   ``fluid_sensitivity`` column tag. Each expected tag must be there with its value; a tag
+   someone else set is ignored. Read from ``GET .../entity-tag-assignments/{type}/{name}/tags``
+   (``columns`` named ``catalog.schema.table.column``), which pages. The table's ``comment``
+   and each described column's, from the GetTable already read, must be the contract's; on a
+   table a dbt build writes the module sets none, so none is checked. A dbt
+   ``CREATE OR REPLACE`` may drop a table's tags (Databricks does not say), so this is the
+   gate: the fix is ``fluid apply``.
 4. **Row filter and column masks.** The contract's ``columnRestrictions`` and ``rowFilters``
    are Unity Catalog SQL functions bound on the table (``databricks_access.py``), named by a
    hash of their definition. The table's ``row_filter.function_name`` / ``input_column_names``
@@ -508,23 +512,78 @@ def _retention_dimension(table: Any, live_table: Mapping[str, Any]) -> Dict[str,
     return {**result, "status": "pass", "message": message}
 
 
-def _tags_dimension(client: Any, table: Any) -> Dict[str, Any]:
-    """The governance tags the module sets on the table and its schema, against the live ones.
+def _comment_findings(table: Any, live_table: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """The table and column comments the module sets, against the live ones."""
+    findings: List[Dict[str, Any]] = []
+    label = f"table {table.full_name}"
+    expected = getattr(table, "comment", None)
+    if expected is not None and (live_table.get("comment") or None) != expected:
+        findings.append(
+            {
+                "entity": label,
+                "comment": "table",
+                "expected": expected,
+                "actual": live_table.get("comment"),
+                "message": f"{label} does not have the contract's description as its comment",
+            }
+        )
+    live_columns = {
+        str(col.get("name") or "").lower(): col
+        for col in live_table.get("columns") or []
+        if isinstance(col, Mapping)
+    }
+    for column, comment in getattr(table, "column_comments", ()):
+        live = live_columns.get(column)
+        if live is None:
+            continue  # a missing column is the structure dimension's finding
+        if (live.get("comment") or None) != comment:
+            findings.append(
+                {
+                    "entity": f"column {table.full_name}.{column}",
+                    "comment": column,
+                    "expected": comment,
+                    "actual": live.get("comment"),
+                    "message": (
+                        f"column {table.full_name}.{column} does not have the contract's "
+                        "description as its comment"
+                    ),
+                }
+            )
+    return findings
 
-    ``skip`` when the contract has no governance labels: nothing was promised. A
-    tag set by someone else is ignored; a missing one, or one with another value,
-    fails.
+
+def _tags_dimension(client: Any, table: Any, live_table: Mapping[str, Any]) -> Dict[str, Any]:
+    """The tags and comments the module sets on the table, its schema and its columns,
+    against the live ones.
+
+    ``skip`` when the module sets none: nothing was promised. A tag set by someone
+    else is ignored; a missing one, or one with another value, fails, and so does a
+    comment that is not the contract's.
     """
     schema = table.full_name.rsplit(".", 1)[0]
+    by_column: Dict[str, List[Any]] = {}
+    for column, key, value in getattr(table, "column_tags", ()):
+        by_column.setdefault(column, []).append((key, value))
     wanted = (
         ("schemas", schema, f"schema {schema}", tuple(getattr(table, "schema_tags", ()))),
         ("tables", table.full_name, f"table {table.full_name}", tuple(getattr(table, "tags", ()))),
+    ) + tuple(
+        (
+            "columns",
+            f"{table.full_name}.{column}",
+            f"column {table.full_name}.{column}",
+            tuple(tags),
+        )
+        for column, tags in sorted(by_column.items())
+    )
+    comments = (1 if getattr(table, "comment", None) is not None else 0) + len(
+        getattr(table, "column_comments", ())
     )
     total = sum(len(expected) for *_rest, expected in wanted)
-    if not total:
+    if not total and not comments:
         return {
             "status": "skip",
-            "message": "the contract has no governance labels to check as tags",
+            "message": "the contract sets no tags or comments to check",
             "findings": [],
         }
     findings: List[Dict[str, Any]] = []
@@ -555,15 +614,17 @@ def _tags_dimension(client: Any, table: Any) -> Dict[str, Any]:
                         ),
                     }
                 )
+    findings.extend(_comment_findings(table, live_table))
+    checked = f"{total} tag(s) and {comments} comment(s)"
     if not findings:
         return {
             "status": "pass",
-            "message": f"all {total} governance tag(s) are on the table and its schema",
+            "message": f"all {checked} are on the table, its schema and its columns",
             "findings": [],
         }
     return {
         "status": "fail",
-        "message": f"{len(findings)} of {total} governance tag(s) missing or changed",
+        "message": f"{len(findings)} of {checked} missing or changed",
         "findings": findings,
         "fix": (
             "Run fluid apply to set them again; a dbt CREATE OR REPLACE may have dropped "
@@ -965,7 +1026,7 @@ def verify_databricks_expose(
     try:
         access = _access_dimension(client, table)
         residency = _residency_dimension(client, table)
-        tags = _tags_dimension(client, table)
+        tags = _tags_dimension(client, table, live_table)
         enforcement = _enforcement_dimension(table, live_table, client)
         retention = _retention_dimension(table, live_table)
         job_dim = _jobs_dimension(client, expose_id, contract, jobs, enforcement, target)
