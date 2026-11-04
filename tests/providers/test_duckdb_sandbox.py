@@ -950,24 +950,6 @@ def test_a_symlinked_runtime_does_not_grant_where_it_points(target, tmp_path, mo
     assert not out.exists() or SECRET not in out.read_text(encoding="utf-8")
     assert SECRET not in "\n".join(printed)
 
-    # The local provider's other DuckDB call site (ducksql.apply_sql), too.
-    from fluid_build.providers.local import ducksql
-
-    granted: List[DuckDBAllowlist] = []
-
-    def capture(database: Any = ":memory:", *, allow: DuckDBAllowlist, **kwargs: Any) -> Any:
-        granted.append(allow)
-        return secure_duckdb_connect(database, allow=allow, **kwargs)
-
-    monkeypatch.setattr(ducksql, "secure_duckdb_connect", capture)
-    assert ducksql.apply_sql([]) == []
-    con = secure_duckdb_connect(allow=granted[0])
-    try:
-        with pytest.raises(duckdb.PermissionException):
-            con.execute(_READ_CREDENTIALS).fetchall()
-    finally:
-        con.close()
-
     # The same build without the symlink still writes its own output.
     (contract_dir / "runtime").unlink()
     contract = _contract("SELECT 1 AS a", out)

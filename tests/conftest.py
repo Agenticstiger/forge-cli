@@ -48,7 +48,7 @@ def _self_heal_personal_memory():
 # ── Root-logger isolation: no test may leak global logging state ──────
 #
 # Several production entry points (structured_logging.configure_structured_logging,
-# logging_utils.setup_logger, the CLI's main()) replace the ROOT logger's
+# structured_logging.configure_structured_logging, the CLI's main()) replace the ROOT logger's
 # handlers wholesale.  A test that exercises them used to leak that
 # configuration into every later test on the same worker — including a
 # StreamHandler bound to the (soon closed) captured stderr.  Combined with

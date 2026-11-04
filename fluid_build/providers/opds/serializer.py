@@ -192,16 +192,3 @@ def json_dumps_min(obj: Any) -> str:
 def hashlib_sha256(obj: Any) -> str:
     payload = json_dumps_min(obj).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
-
-
-def build_interface_signatures(odps_doc: Dict[str, Any]) -> Dict[str, Any]:
-    out = {}
-    outputs = (odps_doc.get("interfaces") or {}).get("outputs") or []
-    for o in outputs:
-        rid = o.get("id", "output")
-        sig = _schema_signature(o.get("schema") or [])
-        out[rid] = {
-            "schema": sig,
-            "schemaHash": hashlib_sha256(sig),
-        }
-    return out

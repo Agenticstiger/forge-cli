@@ -23,7 +23,7 @@ Ensures actions are executed in the correct order based on dependencies:
 """
 
 from collections import defaultdict, deque
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Set
 
 
 class DependencyGraph:
@@ -238,21 +238,3 @@ def order_actions_by_dependencies(actions: List[Dict[str, Any]]) -> List[Dict[st
 
     graph = analyze_dependencies(actions)
     return graph.get_ordered_actions()
-
-
-def validate_no_cycles(actions: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
-    """
-    Check for circular dependencies.
-
-    Args:
-        actions: Actions to check
-
-    Returns:
-        Tuple of (is_valid, error_messages)
-    """
-    try:
-        graph = analyze_dependencies(actions)
-        graph.topological_sort()
-        return True, []
-    except ValueError as e:
-        return False, [str(e)]

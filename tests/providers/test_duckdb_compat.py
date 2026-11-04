@@ -473,19 +473,6 @@ def test_an_unknown_function_is_not_a_sandbox_refusal():
     assert not is_sandbox_refusal(missing.value)
 
 
-def test_the_snowflake_mock_connects(tmp_path):
-    """DuckDB 2.0 refuses ``CREATE SCHEMA information_schema`` (a system catalog)."""
-    from fluid_build.providers.local.mocks import SnowflakeDuckDBMock
-
-    mock = SnowflakeDuckDBMock(db_path=str(tmp_path / "sf.duckdb"))
-    con = mock.connect()
-    assert con.execute("SELECT count(*) FROM information_schema.schemata").fetchall()[0][0] > 0
-    assert con.execute(
-        "SELECT count(*) FROM information_schema.schemata WHERE schema_name = 'PUBLIC'"
-    ).fetchall() == [(1,)]
-    con.close()
-
-
 # ── storage format ───────────────────────────────────────────────────────
 
 

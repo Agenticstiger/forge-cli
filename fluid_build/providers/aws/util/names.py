@@ -134,30 +134,6 @@ def normalize_bucket_name(name: str, account_id: Optional[str] = None) -> str:
     return normalized
 
 
-def normalize_lambda_name(name: str) -> str:
-    """
-    Normalize Lambda function name to AWS requirements.
-
-    Lambda function names must:
-    - Be 1-64 characters
-    - Contain only letters, numbers, hyphens, and underscores
-
-    Args:
-        name: Input function name
-
-    Returns:
-        Normalized function name
-    """
-    # Replace invalid characters with underscores
-    normalized = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
-
-    # Remove consecutive underscores
-    normalized = re.sub(r"_+", "_", normalized)
-
-    # Truncate to 64 characters
-    return normalized[:64]
-
-
 #: Per-service naming rules for names the planner derives from a contract id.
 #: Each is ``(characters NOT allowed, maximum length)``; pinned from the AWS API
 #: references so the planner's output is valid before ``validate_actions`` sees
