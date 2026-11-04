@@ -1289,10 +1289,10 @@ def _check_catalog_auth_env_at_run(
     run_only.append(issue)
 
 
-#: Where each engine resolves the ``env:<NAME>`` that ``sink.catalogAuth`` emits.
-_RESOLVED_IN: Mapping[str, str] = {
-    "kafka-connect": "on the Kafka Connect worker, from the worker's environment",
-    "debezium": "in the embedded Debezium Server, which inherits this runner's environment",
+#: The environment each engine resolves ``sink.catalogAuth``'s ``env:<NAME>`` from.
+_RESOLVED_FROM: Mapping[str, str] = {
+    "kafka-connect": "the Kafka Connect worker's environment",
+    "debezium": "this runner's environment, which the embedded Debezium Server inherits,",
 }
 
 _OPERATOR_ONLY = (
@@ -1460,27 +1460,27 @@ def _check_catalog_auth_destinations(
     errors.extend(hard)
     if not reasons:
         return bool(hard)
-    exports: List[str] = []
+    settings: List[str] = []
     if pairs:
         # Rebuilt from the parsed list, so an entry the parser ignores is not echoed back.
         current = [f"{n}@{h}" if h else n for n, h in secret_ref_allowlist()]
         entries = ",".join(dict.fromkeys([*current, *pairs]))
-        exports.append(f'export {SECRET_REF_ALLOWLIST_ENV}="{entries}"')
+        settings.append(f'{SECRET_REF_ALLOWLIST_ENV}="{entries}"')
     if hosts:
-        exports.append(
-            f'export {HOST_ALLOWLIST_ENV}="{",".join(dict.fromkeys([*host_allowlist(), *hosts]))}"'
+        settings.append(
+            f'{HOST_ALLOWLIST_ENV}="{",".join(dict.fromkeys([*host_allowlist(), *hosts]))}"'
         )
     issue = (
-        f"{head}: sink.{CATALOG_AUTH_FIELD}.{auth.env_field} names {auth.env_var}, which "
-        f"Iceberg resolves {_RESOLVED_IN[runtime.engine]} and sends to hosts this contract "
-        f"names, and the run refuses until the operator allows each: "
-        f"{'; '.join(dict.fromkeys(reasons))}. A "
-        "contract names both the variable and the hosts, so without the operator's lists any "
-        "variable there could go to a host the contract chose; a hostname needs an entry "
-        "because the sink resolves it itself, later, where no lookup made here applies. If "
-        f"this is intended, set {_OPERATOR_ONLY}: {' '.join(exports)}. Leave the port off: a "
-        "host written with a port never matches. A loopback host needs no entry, and a "
-        "private IP address needs only the pairing"
+        f"{head}: sink.{CATALOG_AUTH_FIELD}.{auth.env_field} names {auth.env_var}. Iceberg "
+        f"resolves it from {_RESOLVED_FROM[runtime.engine]} and sends it to hosts this "
+        "contract names, and the run refuses until the operator allows each: "
+        f"{'; '.join(dict.fromkeys(reasons))}. A contract names both the variable and the "
+        "hosts, so without the operator's lists any variable there could go to a host the "
+        "contract chose; a hostname needs an entry because the sink resolves it itself, "
+        "later, where no lookup made here applies. If this is intended, add the entries "
+        f"{_OPERATOR_ONLY}: export {' '.join(settings)}. Leave the port off: a host written "
+        "with a port never matches. A loopback host needs no entry, and a private IP address "
+        "needs only the pairing"
     )
     run_only = _AT_RUN.get()
     if run_only is None:

@@ -336,8 +336,10 @@ def test_validate_warns_where_the_run_refuses():
     error = iceberg_sink_preflight(contract, "ingest")
     assert error is not None
     assert error.startswith("iceberg sink preflight failed: ")  # run-only, no "see validate"
-    assert f'export {SECRET_REF_ALLOWLIST}="{_SECRET}@{_CATALOG_HOST}"' in error
-    assert f'export {HOST_ALLOWLIST}="' in error
+    # One export line sets both, ready to paste.
+    assert (
+        f'export {SECRET_REF_ALLOWLIST}="{_SECRET}@{_CATALOG_HOST}" ' f'{HOST_ALLOWLIST}="' in error
+    )
     assert _SECRET_VALUE not in error
 
 
