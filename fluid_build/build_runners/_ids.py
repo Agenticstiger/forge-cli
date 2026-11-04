@@ -119,14 +119,17 @@ def build_id_warning(contract: Mapping[str, Any]) -> Optional[str]:
     validate and plan accept such an id and warn, and ``fluid apply`` in a
     build mode refuses it. The check is :func:`validate_build_ids`, so the
     warning names the id apply would name. Returns ``None`` when it passes.
+
+    The text does not say the schema accepted the id: validate also runs this
+    on a contract the schema refused, such as one whose ``id`` is ``123``.
     """
     try:
         validate_build_ids(contract)
     except IdentifierViolation as exc:
         return (
             f"{exc.kind} {exc.value!r} cannot be used by the build phase, which puts it in "
-            f"directory names and generated code, so it must {IDENT_RULE}. The contract "
-            "schema allows more, but fluid apply in a build mode (amend-and-build, "
-            "replace-and-build) refuses this id before it applies anything. Rename it to fit."
+            f"directory names and generated code, so it must {IDENT_RULE}. fluid apply in a "
+            "build mode (amend-and-build, replace-and-build) refuses this id before it "
+            "applies anything. Rename it to fit."
         )
     return None

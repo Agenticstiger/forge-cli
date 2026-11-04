@@ -777,8 +777,10 @@ def _warn_unusable_build_ids(contract: Dict[str, Any]) -> None:
 
     message = build_id_warning(contract)
     if message is not None:
-        # Literal: the message quotes the id, which is contract data, not markup.
-        cprint_literal(f"\n⚠️  {message}")
+        # As validate prints its warnings (validate._cprint_literal): literal,
+        # because the id is contract data, not markup; the terminal wraps the
+        # line, so Rich never breaks one inside the id; and no highlighter.
+        cprint_literal(f"\n⚠️  {message}", highlight=False, soft_wrap=True)
 
 
 def _validate_plan_actions(plan: Dict[str, Any], logger: logging.Logger) -> None:

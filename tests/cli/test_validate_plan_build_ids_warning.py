@@ -151,6 +151,16 @@ class TestValidate:
     def test_a_contract_without_builds_is_not_warned(self) -> None:
         assert _validate(_without_builds(_with("contract.id", "1orders")), "--strict") == 0
 
+    def test_a_schema_refused_id_is_not_called_schema_valid(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Contract rules also run on a contract the schema refused, so the warning
+        must not claim the schema accepted the id."""
+        assert _validate(_with("contract.id", 123)) == 1
+        out = capsys.readouterr().out
+        assert _squash("contract.id 123 cannot be used by the build phase") in _squash(out)
+        assert "schema allows" not in " ".join(out.split())
+
     def test_a_crash_in_the_check_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def boom(contract: Any) -> None:
             raise RuntimeError("boom")
