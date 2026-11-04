@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 """A 0.7.7 contract that declares its nested columns reaches Glue as typed columns.
 
 0.7.7 lets a column declare ``fields``, ``element``, ``key`` and ``value``. Glue
