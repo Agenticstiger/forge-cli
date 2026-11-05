@@ -1,30 +1,21 @@
 #!/usr/bin/env python3
-# Copyright 2024-2026 Agentics Transformation Ltd
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
 
 """
 Add or replace license headers in all Python source files.
 
 Usage:
-    # Add Apache 2.0 headers (default):
+    # Add the two-line Apache-2.0 header (default):
+    # "Copyright 2025 Agentics Transformation Limited" + SPDX-License-Identifier.
+    # An old 14-line boilerplate block is replaced (migrated) in the same pass.
     python scripts/add_license_headers.py
 
     # Use a custom license template file:
     python scripts/add_license_headers.py --template my_license.txt
 
     # Change copyright holder and years:
-    python scripts/add_license_headers.py --holder "Acme Corp" --years "2025-2026"
+    python scripts/add_license_headers.py --holder "Acme Corp" --years "2025"
 
     # Dry run — show what would change without modifying files:
     python scripts/add_license_headers.py --dry-run
@@ -48,21 +39,7 @@ from pathlib import Path
 # The placeholder {HOLDER} and {YEARS} are substituted at runtime.
 # ---------------------------------------------------------------------------
 LICENSES = {
-    "apache2": (
-        "# Copyright {YEARS} {HOLDER}\n"
-        "#\n"
-        '# Licensed under the Apache License, Version 2.0 (the "License");\n'
-        "# you may not use this file except in compliance with the License.\n"
-        "# You may obtain a copy of the License at\n"
-        "#\n"
-        "#     http://www.apache.org/licenses/LICENSE-2.0\n"
-        "#\n"
-        "# Unless required by applicable law or agreed to in writing, software\n"
-        '# distributed under the License is distributed on an "AS IS" BASIS,\n'
-        "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n"
-        "# See the License for the specific language governing permissions and\n"
-        "# limitations under the License.\n"
-    ),
+    "apache2": "# Copyright {YEARS} {HOLDER}\n# SPDX-License-Identifier: Apache-2.0\n",
     "mit": (
         "# Copyright (c) {YEARS} {HOLDER}\n"
         "#\n"
@@ -114,8 +91,8 @@ LICENSES = {
     ),
 }
 
-DEFAULT_HOLDER = "Agentics Transformation Ltd"
-DEFAULT_YEARS = "2024-2026"
+DEFAULT_HOLDER = "Agentics Transformation Limited"
+DEFAULT_YEARS = "2025"
 DEFAULT_LICENSE = "apache2"
 DEFAULT_DIRS = ["fluid_build", "tests", "scripts", "tools"]
 
@@ -154,19 +131,29 @@ def build_header(
     return header.replace("{HOLDER}", holder).replace("{YEARS}", years)
 
 
-def has_license_header(content: str) -> bool:
-    """Check whether the file already contains a license header."""
+def has_license_header(content: str, own_lines: frozenset[str] = frozenset()) -> bool:
+    """Check whether the file already contains a license header.
+
+    ``own_lines`` are the lines of the header about to be written. Either one
+    on its own counts, so a file carrying only half of the two-line header is
+    replaced in one pass instead of getting a full header stacked on top.
+    """
     # Look in the first 30 lines for a copyright notice
-    head = "\n".join(content.splitlines()[:30])
+    head_lines = content.splitlines()[:30]
+    if any(line.rstrip() in own_lines for line in head_lines):
+        return True
+    head = "\n".join(head_lines)
     return "Copyright" in head and ("License" in head or "Permission" in head)
 
 
-def remove_header(content: str) -> str:
+def remove_header(content: str, own_lines: frozenset[str] = frozenset()) -> str:
     """Remove an existing license header from file content.
 
     Handles single headers (Apache or MIT) and corrupted dual-headers
     (MIT body + orphaned Apache fragment) by stripping all leading comment
-    lines that are part of a license block.
+    lines that are part of a license block. A line of ``own_lines`` (the
+    header about to be written) marks a header like a copyright line does, so
+    a lone SPDX line is stripped too.
     """
     lines = content.splitlines(True)
 
@@ -192,7 +179,7 @@ def remove_header(content: str) -> str:
         line = lines[i].rstrip()
 
         if line.startswith("#"):
-            if "Copyright" in line:
+            if "Copyright" in line or line in own_lines:
                 found_copyright = True
             if any(
                 kw in line
@@ -288,19 +275,20 @@ def process_file(
     if not content.strip():
         return "skipped"
 
-    already_has = has_license_header(content)
+    own_lines = frozenset(line for line in header.splitlines() if line.strip())
+    already_has = has_license_header(content, own_lines)
 
     if remove_only:
         if not already_has:
             return "skipped"
-        new_content = remove_header(content)
+        new_content = remove_header(content, own_lines)
         if not dry_run:
             path.write_text(new_content, encoding="utf-8")
         return "removed"
 
     if already_has:
         # Replace existing header
-        stripped = remove_header(content)
+        stripped = remove_header(content, own_lines)
         new_content = add_header(stripped, header)
         action = "replaced"
     else:

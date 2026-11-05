@@ -146,6 +146,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer loaded by `--help`. The command list and every help line are unchanged, and
   `build_parser()` with no argument still returns the full tree.
 
+- **Every maintained Python file now carries a two-line license header instead of the 14-line
+  Apache boilerplate.** The header is `# Copyright 2025 Agentics Transformation Limited` followed by
+  `# SPDX-License-Identifier: Apache-2.0`. The holder is now spelled as in `LICENSE`, `NOTICE` and
+  `pyproject.toml`, and the single fixed year means the header never needs a yearly bump. The
+  license terms are unchanged and still come from `LICENSE`. Contributors keep running
+  `python scripts/add_license_headers.py`, which also migrates a file that still has the old block,
+  and the License Headers check enforces the new form.
+
 ### Removed
 
 - **Nine modules that nothing imported are gone** (#832): `fluid_build.logging_utils`,

@@ -52,7 +52,7 @@ All PRs to `main` must pass these checks before merge:
 | **Coverage Gates** | Core 80%, local providers 50%, cloud providers 20% (Python 3.12) |
 | **Security Scan** | `bandit` with medium severity threshold |
 | **Build Smoke Test** | Wheel build + install verification |
-| **License Headers** | All maintained `.py` files except `examples/**` must have Apache 2.0 header |
+| **License Headers** | All maintained `.py` files except `examples/**` must carry the two-line header, `# Copyright 2025 Agentics Transformation Limited` and `# SPDX-License-Identifier: Apache-2.0` |
 | **actionlint** | Validates `.github/workflows/*.yml` and refuses any change that would let fork PRs read cloud secrets |
 | **Docs Reminder** | Soft check — adds `needs-docs` label if no docs reference |
 
