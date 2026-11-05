@@ -960,11 +960,21 @@ class TestLocalLocation:
     def _landed(contract: Path, relative: str) -> Dict[str, str]:
         return {"path": str(contract.resolve().parent / relative)}
 
-    def test_the_location_is_the_file_the_build_writes(self, cc, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        "run_from",
+        [
+            # fluid publish contracts/customer_subscriptions/contract.fluid.yaml
+            "workspace",
+            # cd contracts/customer_subscriptions && fluid publish contract.fluid.yaml,
+            # as every stage of a generated product pipeline runs it.
+            "product",
+        ],
+    )
+    def test_the_location_is_the_file_the_build_writes(self, cc, tmp_path, monkeypatch, run_from):
         contract = _write_product(tmp_path, overlay=False)
+        work = tmp_path if run_from == "workspace" else contract.parent
 
-        # Named relative to the workspace root, as a pipeline does.
-        body = self._sent(cc, monkeypatch, tmp_path, contract.relative_to(tmp_path))
+        body = self._sent(cc, monkeypatch, work, contract.relative_to(work))
 
         landed = self._landed(contract, "out/customer_subscriptions.parquet")
         assert body["metadata"]["location"] == landed
@@ -1004,6 +1014,8 @@ class TestLocalLocation:
             # build, and gives a parquet path without the suffix ``.parquet``.
             ("out/orders", EMBEDDED_SQL, "out/orders.parquet"),
             ("out/orders.pq", EMBEDDED_SQL, "out/orders.pq"),
+            # An absolute path is not anchored; the writer's file name still applies.
+            ("/srv/lake/orders", EMBEDDED_SQL, "/srv/lake/orders.parquet"),
             # An acquisition build writes the path as declared.
             ("out/orders", None, "out/orders"),
         ],
@@ -1019,12 +1031,55 @@ class TestLocalLocation:
         assert body["metadata"]["location"] == self._landed(contract, landed)
 
     @pytest.mark.parametrize(
+        ("binding_format", "expose_format", "landed"),
+        [
+            # Anything but parquet is written as CSV at the path as declared.
+            ("csv", None, "out/orders"),
+            # The writer also reads a format declared on the expose itself.
+            (None, "parquet", "out/orders.parquet"),
+        ],
+    )
+    def test_the_file_name_follows_the_format_the_writer_reads(
+        self, cc, tmp_path, monkeypatch, binding_format, expose_format, landed
+    ):
+        document = yaml.safe_load(_with_location({"path": "out/orders"}, EMBEDDED_SQL))
+        expose = document["exposes"][0]
+        expose["binding"]["format"] = binding_format
+        if expose_format:
+            expose["format"] = expose_format
+        text = yaml.safe_dump(document, sort_keys=False)
+        contract = _write_product(tmp_path, text, overlay=False)
+
+        body = self._sent(cc, monkeypatch, tmp_path, contract)
+
+        assert body["metadata"]["location"] == self._landed(contract, landed)
+
+    @pytest.mark.parametrize(
+        ("location", "builds", "landed"),
+        [
+            # ``fluid validate`` refuses both contracts; the report must not
+            # fail the publish, so the file keeps its declared name.
+            ({"path": "out/orders"}, [{"id": "transform", "engine": 5}], "out/orders"),
+            ({"path": "/"}, EMBEDDED_SQL, "/"),
+        ],
+    )
+    def test_a_contract_the_schema_refuses_still_publishes(
+        self, cc, tmp_path, monkeypatch, location, builds, landed
+    ):
+        contract = _write_product(tmp_path, _with_location(location, builds), overlay=False)
+
+        body = self._sent(cc, monkeypatch, tmp_path, contract)
+
+        assert body["metadata"]["location"] == self._landed(contract, landed)
+
+    @pytest.mark.parametrize(
         ("location", "builds"),
         [
             ({"path": "/srv/lake/orders.parquet"}, None),
             ({"path": "s3://lake/orders/"}, None),
             # Not ``s3:/lake/orders.parquet``: the file-name rule is for local files.
             ({"path": "s3://lake/orders"}, EMBEDDED_SQL),
+            ({"path": 5}, None),
             ({}, None),
         ],
     )

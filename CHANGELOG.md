@@ -14,12 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named no file: the engine anchors that path at the contract's directory, not the reader's. The
   Command Center now gets the path the engine writes, anchored there, under the local provider's
   file name when it writes the expose (`out/orders` with `format: parquet` is
-  `out/orders.parquet`); `--dry-run` shows it. The contract, and the `contract_yaml` sent with it,
-  keep the path as written. The path is the publishing machine's, which the Command Center shows
-  only to members of the product's organization. An absolute path, a remote URI, another
-  platform's location, a path still holding a `{{ env.* }}` placeholder (one publish leaves
-  literal is never filled in) and a publish to an endpoint the checkout's project config named
-  are reported as before.
+  `out/orders.parquet`, an absolute path too); `--dry-run` shows it. The contract, and the
+  `contract_yaml` sent with it, keep the path as written. The path is the publishing machine's,
+  which the Command Center shows only to the owners, admins and members of the product's
+  organization, not to its viewers. Reported as before: a remote URI, another platform's
+  location, a publish to an endpoint the checkout's project config named, and a path whose
+  `{{ env.* }}` placeholder publish leaves unfilled (a credential-shaped name, or one that is not
+  set): this step never fills it in. A placeholder publish does fill is anchored with the rest of
+  the path.
 - **A sovereignty refusal says why on every command.** `fluid generate iac` turned a typed
   refusal (a placement outside `sovereignty.allowedRegions`, say) into `generate_iac_failed` and
   printed only the finding; it now prints the error's reason (`... allows me-central-1,

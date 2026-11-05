@@ -560,8 +560,16 @@ def _reported_location(
         return location
     landed = resolve_binding_path(path, source_contract_dir(contract_path, logger))
     expose = contract["exposes"][0]
-    if not is_remote_uri(landed) and _landed_by_local_provider(contract, expose):
-        landed, _ = local_provider_landing(landed, expose["binding"].get("format"))
+    try:
+        if not is_remote_uri(landed) and _landed_by_local_provider(contract, expose):
+            # The format as the writer reads it (``LocalProvider._derive_actions_from_contract``).
+            fmt = expose["binding"].get("format") or expose.get("format")
+            landed, _ = local_provider_landing(landed, fmt)
+    except (AttributeError, TypeError, ValueError) as exc:
+        # Only a contract the schema refuses gets here (``builds[].engine: 5``,
+        # ``location.path: /``), and ``fluid validate`` names it. Reporting the
+        # file must not fail the publish: its name stays as declared.
+        logger.debug("reported location keeps the declared file name: %s", type(exc).__name__)
     return {**location, "path": landed}
 
 
