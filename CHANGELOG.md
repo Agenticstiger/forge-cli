@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`_DATA_VAULT_2_ALIASES`, `detect_ollama_available`). Each function read, as a bare name, a
   value that only its module's `__getattr__` could supply, and Python never consults that hook
   for a bare name. Both now read the value through the module that defines it. A test checks every
-  module with a module-level `__getattr__` for the same mistake. The interview bug dates from
-  0.10.0 and is in 0.27.0.
+  module with a module-level `__getattr__` for the same mistake. Both bugs date from 0.8.2a1 and
+  are in 0.27.0.
 
 - **A sovereignty refusal says why on every command.** `fluid generate iac` turned a typed
   refusal (a placement outside `sovereignty.allowedRegions`, say) into `generate_iac_failed` and
