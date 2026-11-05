@@ -71,8 +71,13 @@ class RunnerConformance:
         in spec 2-0-2) rather than a network fetch of the schema, so the
         suite stays offline and deterministic.
         """
+        from fluid_build._optional import require
         from fluid_build.api.lineage import RunEventType
         from fluid_build.build_runners._lineage import BufferedLineageEmitter, encode_event
+
+        # Encoding needs the official client; name the extra up front rather
+        # than failing on the first event.
+        require("openlineage.client", "lineage", "the SDK conformance suite")
 
         buffered = BufferedLineageEmitter()
         object.__setattr__(conformance_ctx, "lineage", buffered)

@@ -34,7 +34,7 @@ import importlib.util
 import sys
 from types import ModuleType
 
-__all__ = ["MissingOptionalDependency", "is_available", "require"]
+__all__ = ["MissingOptionalDependency", "ensure_installed", "is_available", "require"]
 
 # import name -> distribution name, where they differ (pandas' ``INSTALL_MAPPING``).
 _DISTRIBUTION = {
@@ -55,16 +55,18 @@ class MissingOptionalDependency(ImportError):
 
     exit_code = 1
 
-    def __init__(self, module: str, extra: str, feature: str) -> None:
+    def __init__(self, module: str, extra: str, feature: str, alternatives: str = "") -> None:
         self.module = module
         self.extra = extra
         self.feature = feature
+        self.alternatives = alternatives
         top = module.split(".", 1)[0]
         self.package = _DISTRIBUTION.get(top, top)
         self.event = _EVENTS.get(top, _GENERIC_EVENT)
         super().__init__(
             f"{feature} needs {self.package}, which is not installed.\n\n"
-            f"    pip install 'data-product-forge[{extra}]'",
+            f"    pip install 'data-product-forge[{extra}]'"
+            + (f"\n\n{alternatives}" if alternatives else ""),
             name=module,
         )
 
@@ -94,6 +96,16 @@ def is_available(module: str) -> bool:
     semantics); probe the top-level name when that cost matters.
     """
     return _present(module)
+
+
+def ensure_installed(module: str, extra: str, feature: str, alternatives: str = "") -> None:
+    """Raise :class:`MissingOptionalDependency` when *module* is absent; import nothing.
+
+    The probe-only twin of :func:`require`, for guards that run before the
+    package is needed (a preflight, a wizard's first prompt).
+    """
+    if not _present(module):
+        raise MissingOptionalDependency(module, extra, feature, alternatives)
 
 
 def require(module: str, extra: str, feature: str) -> ModuleType:

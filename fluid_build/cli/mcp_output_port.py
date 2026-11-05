@@ -339,8 +339,11 @@ def _resolve_contract_path(args) -> Path:
 
 
 def _run_serve(args, logger: logging.Logger) -> int:
+    from fluid_build._mcp_compat import require_sdk
     from fluid_build.output_ports.mcp import find_expose, run_stdio
 
+    # Before anything is printed or logged: without the SDK the server cannot start.
+    require_sdk("The MCP output-port server")
     contract_path = _resolve_contract_path(args)
     transport = getattr(args, "transport", "stdio")
     # HTTP reads FLUID_MCP_AUTH_* / FLUID_MCP_TRUSTED_PROXIES; a bad value

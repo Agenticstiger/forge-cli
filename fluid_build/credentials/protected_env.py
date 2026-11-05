@@ -45,7 +45,14 @@ credentials, which is what they are for. They may not carry a setting that:
   ``OPENLINEAGE_URL``, ``OTEL_EXPORTER_OTLP_*ENDPOINT``, ``AWS_ENDPOINT_URL*``,
   ``VAULT_ADDR``, ``OLLAMA_HOST``, every endpoint variable a catalog backend
   reads (``DATAHUB_GMS_URL``, ``OPENMETADATA_SERVER_URL`` ...), and
-  ``SNOWFLAKE_OAUTH_TOKEN_REQUEST_URL``, ``BIGQUERY_EMULATOR_HOST`` ...);
+  ``SNOWFLAKE_OAUTH_TOKEN_REQUEST_URL``, ``BIGQUERY_EMULATOR_HOST`` ...), and
+  every setting of the embedded Debezium Server, which inherits this
+  environment and reads it over its ``application.properties``
+  (``DEBEZIUM_*``, ``QUARKUS_*``, ``SMALLRYE_*``, ``MP_CONFIG_*``, in the forms
+  SmallRye Config matches, :func:`_is_server_config_name`), its JVM's options
+  and binary (``JDK_JAVA_OPTIONS``, ``JAVA_OPTS``, ``JAVA_HOME``), and its
+  ``run.sh`` launcher's (``EXTRA_CONNECTOR``, ``JMX_*`` ports and hosts,
+  ``OTEL_JAVAAGENT_*``);
 * chooses what program or library runs in this process or its subprocesses
   (``FLUID_DBT_MCP_COMMAND``/``_ARGS``/``_ENV``, ``FLUID_OPENTOFU_VERSION``,
   ``DBT_EXECUTABLE``, ``PATH``, ``ComSpec``, ``SystemRoot``, ``PYTHONPATH``,
@@ -136,6 +143,7 @@ their own constants, and the classification test pins that the names agree.
 from __future__ import annotations
 
 import os
+import re
 import stat
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
@@ -467,6 +475,20 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "NODE_PATH",
         "JAVA_TOOL_OPTIONS",
         "_JAVA_OPTIONS",
+        # read by every JDK 9+ ``java`` launcher, and by Debezium Server's
+        # run.sh: a ``-D`` system property (ordinal 400) outranks the
+        # environment and application.properties, and ``-javaagent:`` loads code
+        "JDK_JAVA_OPTIONS",
+        "JAVA_OPTS",
+        # run.sh starts ``$JAVA_HOME/bin/java``
+        "JAVA_HOME",
+        # run.sh sources connectors/debezium-connector-<value>/*.sh, and opens
+        # remote JMX or an exporter port with these
+        "EXTRA_CONNECTOR",
+        "JMX_HOST",
+        "JMX_PORT",
+        "JMX_EXPORTER_PORT",
+        "JMX_EXPORTER_CONFIG",
         "CLASSPATH",
         "GCONV_PATH",
         "GIT_SSH",
@@ -523,7 +545,23 @@ PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     "LD_",
     "DYLD_",
     "_RLD",
+    # the OpenTelemetry Java agent Debezium Server's run.sh can start: its
+    # extensions load a jar, and its configuration file sets the exporter
+    "OTEL_JAVAAGENT_",
 )
+
+#: The configuration namespaces of the embedded Debezium Server: Debezium's own
+#: properties, Quarkus, SmallRye Config and MicroProfile Config (a profile, or
+#: other config files to load). The server inherits this process's environment
+#: (``build_runners/debezium/runner.py``), and SmallRye Config reads a property
+#: from a variable (ordinal 300) over ``application.properties``, so a project
+#: file could move the sink's catalog past the ``sink.catalogAuth`` pairing, or
+#: the source database, after every check forge-cli runs.
+_SERVER_CONFIG_NAMESPACES: Tuple[str, ...] = ("DEBEZIUM_", "QUARKUS_", "SMALLRYE_", "MP_CONFIG_")
+#: A leading profile segment as SmallRye's ``EnvConfigSource`` matches it: ``%``
+#: or ``_``, the profile names (``dev,prod``), then any one separator, since a
+#: property's ``.`` matches ``.``, ``-``, ``_`` or ``/`` in a variable name.
+_PROFILE_SEGMENT = re.compile(r"[%_][A-Z0-9,]*[^A-Z0-9,]")
 
 # Name-shape rule for FLUID_* names: fails closed for a knob nobody listed yet.
 _FLUID_PROTECTED_SUFFIXES: Tuple[str, ...] = (
@@ -744,11 +782,31 @@ def is_protected_env_key(key: str) -> bool:
         return False
     if name in PROTECTED_ENV_KEYS or name.startswith(PROTECTED_ENV_PREFIXES):
         return True
+    if _is_server_config_name(name):
+        return True
     if name.startswith("FLUID_"):
         return name.endswith(_FLUID_PROTECTED_SUFFIXES) or any(
             fragment in name for fragment in _FLUID_PROTECTED_FRAGMENTS
         )
     return False
+
+
+def _is_server_config_name(name: str) -> bool:
+    """Does SmallRye Config read the upper-cased variable ``name`` as a server property?
+
+    It matches a property by its own name (``debezium.sink.iceberg.uri``), with
+    every non-alphanumeric character as ``_``, upper-cased
+    (``DEBEZIUM_SINK_ICEBERG_URI``), and for a profile as
+    ``%prod.debezium.sink.iceberg.uri``, ``%PROD_DEBEZIUM_SINK_ICEBERG_URI``,
+    ``_PROD_DEBEZIUM_SINK_ICEBERG_URI`` or ``%dev,prod.debezium...``: the name
+    is judged with and without its :data:`_PROFILE_SEGMENT`.
+    """
+    profile = _PROFILE_SEGMENT.match(name)
+    candidates = (name, name[profile.end() :]) if profile else (name,)
+    return any(
+        re.sub(r"[^A-Z0-9]", "_", candidate).startswith(_SERVER_CONFIG_NAMESPACES)
+        for candidate in candidates
+    )
 
 
 # ── third-party endpoints: the pairing rule ─────────────────────────────────

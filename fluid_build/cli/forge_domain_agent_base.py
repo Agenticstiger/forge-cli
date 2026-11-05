@@ -9,7 +9,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, literal_error_text
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_agent_specs import (
     AgentSpec,
@@ -103,7 +103,7 @@ class AIAgentBase:
             return False
         except Exception as exc:
             if self.console:
-                self.console.print(f"[red]❌ Failed to create project: {exc}[/red]")
+                self.console.print(literal_error_text(f"❌ Failed to create project: {exc}", "red"))
             else:
                 console_error(f"Failed to create project: {exc}")
             return False
@@ -155,7 +155,9 @@ class AIAgentBase:
             return engine.run_with_config(project_config, dry_run=False)
         except Exception as exc:
             if self.console:
-                self.console.print(f"[red]❌ ForgeEngine integration failed: {exc}[/red]")
+                self.console.print(
+                    literal_error_text(f"❌ ForgeEngine integration failed: {exc}", "red")
+                )
             return False
 
     def _show_ai_analysis(self, context: Dict[str, Any], suggestions: Dict[str, Any]) -> None:

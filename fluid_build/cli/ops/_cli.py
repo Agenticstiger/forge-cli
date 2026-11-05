@@ -23,7 +23,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 
 # ── Common helpers ─────────────────────────────────────────────────────
 
@@ -211,7 +211,7 @@ def _run_runs_logs(args: argparse.Namespace, logger: logging.Logger) -> int:
     for line in lines:
         ts = line.timestamp or "-"
         lvl = line.level or "-"
-        cprint(f"{ts}  {lvl:5s}  {line.message}")
+        cprint_literal(f"{ts}  {lvl:5s}  {line.message}")
     return 0
 
 

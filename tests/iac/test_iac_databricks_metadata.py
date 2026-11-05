@@ -433,3 +433,26 @@ class TestCertification:
         assert repr(value) in str(refusal) and "lifecycle.state" in " ".join(refusal.remediation)
         errors, _ = dbx.validate_databricks_binding(contract)
         assert len(errors) == 1
+
+    def _two_tables(self) -> Dict[str, Any]:
+        contract = _contract()
+        second = json.loads(json.dumps(contract["exposes"][0]))
+        second["exposeId"] = "closures"
+        second["binding"]["location"]["table"] = "closures"
+        contract["exposes"].append(second)
+        return contract
+
+    def _certified(self, contract: Dict[str, Any]) -> Dict[str, str]:
+        return {
+            body["entity_name"].split(".")[1].split("_")[-1]: body["tag_value"]
+            for body in _module(contract)["resource"][TAG].values()
+            if body["tag_key"] == CERTIFICATION
+        }
+
+    def test_a_product_label_certifies_every_expose_an_expose_label_only_its_own(self):
+        contract = self._two_tables()
+        contract["labels"] = {"certification": "certified"}
+        assert self._certified(contract) == {"tickets": "certified", "closures": "certified"}
+        del contract["labels"]
+        contract["exposes"][1]["labels"] = {"certification": "certified"}
+        assert self._certified(contract) == {"closures": "certified"}

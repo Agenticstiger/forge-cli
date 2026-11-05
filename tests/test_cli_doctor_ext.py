@@ -138,10 +138,13 @@ class TestPrintCopilotReadinessPlainText(unittest.TestCase):
         with (
             patch("fluid_build.cli.doctor.RICH_AVAILABLE", False),
             patch("fluid_build.cli.doctor.cprint") as mock_cprint,
+            patch("fluid_build.cli.doctor.cprint_literal") as mock_literal,
         ):
             _print_copilot_readiness(readiness, verbose=True)
 
-        all_calls = " ".join(str(c) for c in mock_cprint.call_args_list)
+        all_calls = " ".join(
+            str(c) for c in [*mock_cprint.call_args_list, *mock_literal.call_args_list]
+        )
         assert "Forge Copilot Readiness" in all_calls
         assert "api_key=***" in all_calls
         assert "No API key was configured for the openai copilot adapter." in all_calls

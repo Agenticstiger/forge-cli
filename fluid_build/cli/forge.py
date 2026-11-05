@@ -24,11 +24,12 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from fluid_build._console import literal_error_text, literal_text
 from fluid_build.cli.artifact_envelope import dump_json_with_envelope
 from fluid_build.cli.artifact_paths import product_forge_receipt_path
 from fluid_build.cli.artifact_receipts import ReceiptBuilder
 from fluid_build.cli.artifact_scan import diff_snapshots, snapshot_workspace
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_banner import print_v2_banner
 from fluid_build.cli.forge_copilot_memory import (
@@ -1558,7 +1559,9 @@ def _run_main(args, logger: logging.Logger) -> int:
             set_prompt_profile(_profile_name)
         except PromptProfileError as exc:
             if console:
-                console.print(f"[red]Invalid --prompt-profile:[/red] {exc}")
+                console.print(
+                    literal_text("Invalid --prompt-profile:", "red") + literal_error_text(f" {exc}")
+                )
             else:
                 console_error(f"Invalid --prompt-profile: {exc}")
             return 2
@@ -1585,7 +1588,9 @@ def _run_main(args, logger: logging.Logger) -> int:
             _active_overlays = activate_prompt_overlays(_overlay_spec)
         except PromptOverlayError as exc:
             if console:
-                console.print(f"[red]Invalid --prompt-overlay:[/red] {exc}")
+                console.print(
+                    literal_text("Invalid --prompt-overlay:", "red") + literal_error_text(f" {exc}")
+                )
             else:
                 console_error(f"Invalid --prompt-overlay: {exc}")
             return 2
@@ -1652,7 +1657,7 @@ def _run_main(args, logger: logging.Logger) -> int:
             _resolve_resume_args(args, workspace_root=scan_root, console=console)
         except _ResumeFlagError as exc:
             if console:
-                console.print(f"[red]{exc}[/red]")
+                console.print(literal_error_text(f"{exc}", "red"))
             else:
                 console_error(str(exc))
             return exc.exit_code
@@ -1823,6 +1828,14 @@ def _run_main(args, logger: logging.Logger) -> int:
         if not get_cli_arg(args, "non_interactive", False):
             from fluid_build.cli.ai_setup import run_ai_setup_inline
 
+            # An explicit litellm-backed --llm-provider on an install without
+            # litellm fails here, before the setup flow reads the OS keyring or
+            # offers to import or prompt for a key it could not use.
+            if get_cli_arg(args, "llm_provider", None):
+                from fluid_build.llm.providers import preflight_llm_provider
+
+                preflight_llm_provider(args)
+
             # Always go through inline setup — it handles all cases:
             # 1. Config file exists with key → loads it, sets env vars, returns config
             # 2. Keyring has key → loads it, sets env vars, returns config
@@ -1891,7 +1904,13 @@ def _run_main(args, logger: logging.Logger) -> int:
         # trace. Stack trace is logged at DEBUG for triage, but the
         # operator-facing output is just the message + actionable
         # next steps.
+        from fluid_build._optional import MissingOptionalDependency
         from fluid_build.errors import FluidError
+
+        if isinstance(exc, MissingOptionalDependency):
+            # "Install the extra" is the whole remedy: let the CLI entry point
+            # print the install line and exit 1, with no traceback.
+            raise
 
         logger.debug("Forge command failed", exc_info=True)
         suggestions = getattr(exc, "suggestions", None) or []
@@ -1899,25 +1918,25 @@ def _run_main(args, logger: logging.Logger) -> int:
         if isinstance(exc, FluidError):
             # Typed Fluid error — clean message + suggestions.
             if console:
-                console.print(f"[red]Forge failed:[/red] {message}")
+                console.print(
+                    literal_text("Forge failed:", "red") + literal_error_text(f" {message}")
+                )
                 if suggestions:
                     console.print("[bold]Next actions:[/bold]")
                     for s in suggestions:
-                        console.print(f"  • {s}")
+                        console.print(literal_error_text(f"  • {s}"))
             else:
                 console_error(f"Forge failed: {message}")
                 if suggestions:
                     cprint("Next actions:")
                     for s in suggestions:
-                        cprint(f"  - {s}")
+                        cprint_literal(f"  - {s}")
         else:
             # Unexpected — full message; suggest doctor.
             logger.exception("Forge command failed")
             if console:
-                console.print(
-                    f"[red]Forge failed: {exc}[/red]\n"
-                    f"[dim]Run 'fluid doctor' to diagnose, or see {_DOCS_URL}[/dim]"
-                )
+                console.print(literal_error_text(f"Forge failed: {exc}", "red"))
+                console.print(f"[dim]Run 'fluid doctor' to diagnose, or see {_DOCS_URL}[/dim]")
             else:
                 console_error(f"Forge failed: {exc}")
                 cprint(f"Run 'fluid doctor' to diagnose, or see {_DOCS_URL}")

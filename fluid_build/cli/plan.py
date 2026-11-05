@@ -853,7 +853,7 @@ def _validate_plan_actions(plan: Dict[str, Any], logger: logging.Logger) -> None
     if errors:
         cprint(f"\n⚠  Action validation found {len(errors)} issue(s):")
         for err in errors:
-            cprint(f"   • {err}")
+            cprint_literal(f"   • {err}")
     else:
         cprint(f"\n✓  All {len(typed)} actions pass schema validation")
 

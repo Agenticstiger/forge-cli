@@ -612,6 +612,8 @@ def _offer_first_forge(args, logger: logging.Logger) -> None:
         # provider/model up front and forge skips its inline fallback.
         if not ai_ready and RICH_AVAILABLE:
             try:
+                from fluid_build._optional import MissingOptionalDependency
+
                 from .ai_setup import run_ai_setup_interactive
 
                 setup_result = run_ai_setup_interactive(console)
@@ -622,6 +624,13 @@ def _offer_first_forge(args, logger: logging.Logger) -> None:
                         "\nAI setup was skipped — continuing with forge in "
                         "non-AI mode. Run 'fluid ai setup' anytime to enable AI."
                     )
+            except MissingOptionalDependency:
+                # No litellm: print the install line and the keyless options,
+                # then end init normally without launching forge.
+                from .ai_setup import print_litellm_missing
+
+                print_litellm_missing(console)
+                return
             except Exception as setup_exc:  # pragma: no cover — defensive
                 logger.debug("Inline AI setup failed: %s", setup_exc)
                 cprint(

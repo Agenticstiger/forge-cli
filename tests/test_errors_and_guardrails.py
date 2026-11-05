@@ -134,3 +134,16 @@ class TestValidateNoOvergrant:
     def test_payload_not_dict(self):
         actions = [SimpleNamespace(resource_id="x", payload="string")]
         assert validate_no_overgrant(actions) is True
+
+
+def test_a_long_what_is_rendered_whole_not_cut_at_the_panel_title():
+    from fluid_build._errors import SovereigntyViolationError
+
+    what = "placement refused: " + "; ".join(
+        f"expose_{i}: Region 'europe-west3' denied" for i in range(4)
+    )
+    err = SovereigntyViolationError(
+        what=what, why="the policy allows me-central-1", fix="f", doc="d"
+    )
+    rendered = " ".join(err.render(color=False).split())
+    assert " ".join(what.split()) in rendered.replace("│ ", "").replace(" │", "")

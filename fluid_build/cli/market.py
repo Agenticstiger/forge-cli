@@ -35,7 +35,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fluid_build.cli.console import cprint, cprint_json, hint, success
+from fluid_build.cli.console import cprint, cprint_json, cprint_literal, hint, success
 
 # Rich imports for enhanced output
 try:
@@ -1089,7 +1089,7 @@ async def handle_search_suggestions(
         cprint("=" * 40)
 
         for i, suggestion in enumerate(suggestions, 1):
-            cprint(f"  {i}. {suggestion}")
+            cprint_literal(f"  {i}. {suggestion}")
 
         return 0
 

@@ -54,6 +54,7 @@ from typing import Any, Callable, Dict, Optional
 
 from fluid_build.observability.secret_redactor import redact_secret_text
 
+
 # Soft-import OTEL. When absent, the decorator returns wrapped
 # callables unchanged — zero runtime overhead for opted-out setups.
 #
@@ -65,7 +66,22 @@ from fluid_build.observability.secret_redactor import redact_secret_text
 # any env that has ``opentelemetry`` installed. The exporter is imported lazily
 # inside :func:`_get_tracer` (first traced span, endpoint configured) instead.
 # Pinned by tests/perf/test_startup_budget.py.
+# Probe the SDK before importing anything: with the API present but no SDK
+# (the bare install, where mcp used to bring opentelemetry-api), the import
+# below would load ~15 api modules on every command only to fail on the SDK.
+# ``find_spec`` locates ``opentelemetry.sdk`` without importing it.
+def _sdk_installed() -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("opentelemetry.sdk") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 try:
+    if not _sdk_installed():
+        raise ImportError("opentelemetry-sdk is not installed")
     from opentelemetry import trace as _otel_trace
     from opentelemetry.sdk.resources import Resource as _OtelResource
     from opentelemetry.sdk.trace import TracerProvider as _OtelTracerProvider

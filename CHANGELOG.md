@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The interactive AI interview stopped at the data-modeling question, and `fluid ai test`
+  with no provider configured crashed.** Both printed a `NameError`
+  (`_DATA_VAULT_2_ALIASES`, `detect_ollama_available`). Each function read, as a bare name, a
+  value that only its module's `__getattr__` could supply, and Python never consults that hook
+  for a bare name. Both now read the value through the module that defines it. A test checks every
+  module with a module-level `__getattr__` for the same mistake. Both bugs date from 0.8.2a1 and
+  are in 0.27.0.
+
+- **`fluid publish` tells the Command Center where a local product's file is.** A relative
+  `location.path` (`./out/party.parquet`) was reported as written, so the deployment's location
+  named no file: the engine anchors that path at the contract's directory, not the reader's. The
+  Command Center now gets the path the engine writes, anchored there with any `..` folded, under
+  the local provider's file name when it writes the expose (`out/orders` with `format: parquet`
+  is `out/orders.parquet`, an absolute path too); `--dry-run` shows it. The contract, and the
+  `contract_yaml` sent with it, keep the path as written. The path is the publishing machine's,
+  which the Command Center shows only to the owners, admins and members of the product's
+  organization, not to its viewers. Reported as before: a remote URI, another platform's
+  location, a publish to an endpoint the checkout's project config named, and a path whose
+  `{{ env.* }}` placeholder publish leaves unfilled (a credential-shaped name, or one that is not
+  set): this step never fills it in. A placeholder publish does fill is anchored with the rest of
+  the path.
+- **A sovereignty refusal says why on every command.** `fluid generate iac` turned a typed
+  refusal (a placement outside `sovereignty.allowedRegions`, say) into `generate_iac_failed` and
+  printed only the finding; it now prints the error's reason (`... allows me-central-1,
+  me-south-1`), fix and doc, as `fluid apply` does. A typed error whose message is too long for
+  the panel's title (one that lists every finding) is now printed whole in the panel instead of
+  cut at the border.
+- **A Databricks landing leaves nothing behind.** After the load, the bronze landing now also
+  removes the build's and the product's directories in the staging volume
+  (`<volume>/<product>/<build>/`) once each is listed empty, never one another run or build still
+  uses. It deletes the local masked Parquet copy under `.fluid/staging/<build>/` after the load
+  attempt, success or failure, and says so in `facets.databricks_load.local_staging_deleted`; one
+  that cannot be deleted fails the run, naming it.
+- **`fluid apply --mode dry-run` lists the superseded functions the apply would drop.** The
+  Databricks dry run now prints `would drop superseded function <name>` (or `would leave function
+  <name>: <why>`) for each `fluid_` mask or row-filter function a successful apply's clean-up would
+  drop, worked out the same way against the bindings the apply leaves, and runs nothing.
+
 ### Added
 
 - **A Databricks data product looks like a native one in Unity Catalog.** `fluid apply` now
@@ -25,12 +65,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `system.certification_status`, is `deprecated` when `lifecycle.state` (the expose's, else the
   product's) is `deprecated`, else `certified` when the label `certification: certified` (the
   expose's, else the product's) says so; that label is then not also a plain tag, and any other
-  value of it is refused (`databricks-certification-invalid`). The deploy identity needs the
+  value of it is refused (`databricks-certification-invalid`). A product-level
+  `labels.certification` certifies every Databricks table of the product, as intended; an
+  expose-level one certifies only that expose's table. The deploy identity needs the
   ASSIGN permission on that governed tag (not verified on a live workspace), which the plan
   says. `fluid verify`'s governance-tags dimension now also checks the product's tags, the column
   tags and the comments, reading each tag list to its last page.
 
 ### Changed
+
+- **Breaking (install): litellm, mcp and openlineage-python are no longer in the base install.**
+  *Before:* `pip install data-product-forge` pulled in litellm, mcp and openlineage-python, and with
+  them boto3 (through litellm), aiohttp, openai, tokenizers and about fifty more packages.
+  *Now:* the base install is the core pipeline (`validate`, `plan`, `apply`, `verify`, `publish`,
+  `generate iac`, `bundle`, `diff`, `doctor`, and template or blank `forge`). A command that cannot
+  run without one of the three prints the exact install line and exits 1, with no traceback, before
+  it does any work:
+  - An API-key provider (`--llm-provider openai|anthropic|gemini|ollama`, or `--llm-model` alone,
+    which resolves to Ollama) needs `pip install 'data-product-forge[litellm]'` (alias `[ai]`) or
+    `[standard]`, in `fluid forge`, `fluid forge --agent-loop`, `fluid forge data-model` and the
+    staged copilot agents; so does `fluid ai setup`. The error is raised before the interview reads
+    any context or memory and before the interactive setup reads the OS keyring or asks for a key.
+    `fluid forge` names the ways to author without it, `--llm-provider claude-code` (uses your
+    Claude Code login) and `--template starter`; in `--agent-loop` only `--template starter`, since
+    the keyless agents have no tool use. `fluid ai setup` also names `codex`, `cursor`, `kiro`
+    (each uses its own CLI login) and `mcp-sampling`. `fluid forge data-model` with no `--llm-*`
+    flag runs offline and needs no extra. `fluid init`'s hand-off into AI setup, and an
+    interactive `fluid forge` with no provider chosen, use Claude Code when it is installed;
+    otherwise they print the install line and the alternatives, then fall back to template or
+    guided mode instead of exiting. Template and blank forge are
+    unchanged. `fluid doctor` no longer reports a configured provider as ready when litellm is
+    missing.
+  - `fluid mcp serve`, `fluid mcp output-port serve` and the MCP delegates need `[mcp]` or
+    `[standard]` (`mcp-sampling` works only inside `fluid mcp serve`). `fluid scaffold-ide` needs it
+    too, and writes nothing without it, because every entry it writes launches `fluid mcp serve`.
+  - Sending lineage to `OPENLINEAGE_URL` needs `[lineage]`. Without it, `fluid apply` through
+    OpenTofu and acquisition builds, the paths that emit lineage, print one warning naming the extra
+    and carry on; the SDK conformance suite fails with the same hint.
+  - AWS users need `[aws]`: boto3 used to arrive silently through litellm. Without it, an AWS
+    command that needs the account id fails with "The AWS account id could not be resolved: boto3
+    is not installed, so sts:GetCallerIdentity cannot be called. Install it with pip install
+    'data-product-forge[aws]', or set AWS_ACCOUNT_ID." instead of a misleading bucket-name error.
+  - `packaging` is now a declared base dependency (it used to arrive through litellm).
+
+  `pip install 'data-product-forge[standard]'` restores the previous AI and MCP behaviour, and
+  `[dev]` and `[all]` include all three. The Docker image profiles already install `[standard]` and
+  `[lineage]`. 0.27.0 added the extras next to the base install so you could switch first.
+  *Why:* the base install resolved to 88 packages (Linux, Python 3.12) for a command line whose
+  core commands need none of these three; litellm alone was 30 of them.
+  *Numbers* (`uv pip compile`, base install, no extras, packages before to after): Linux Python 3.12
+  88 to 41, Linux Python 3.10 86 to 45, Windows Python 3.12 89 to 40. A bare install is about
+  68 MB of site-packages.
 
 - **Every Databricks table now gets tag assignments.** A contract without labels used to make
   none; its table now carries the product's identity tags, which count toward Unity Catalog's 50
@@ -42,6 +127,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COMMENT '...'`, so a trailing backslash would end the string early), and one holding `${`
   (also `databricks-comment-unsafe`: Spark may substitute a variable there).
 
+- **The declared dependencies now match what the code imports.** `deptry` reports no findings.
+  `typing-extensions` and the Windows-only `colorama` leave the base install: nothing imports
+  either, and `pydantic` and `click` still bring them where they are needed. `anyio`, which the
+  MCP code imports directly, is named in the base install (it already arrived through `httpx`).
+  The `[viz]`, `[tui]` and `[odps]` extras are now empty aliases, because nothing imports
+  `graphviz`, `textual` or `ruamel.yaml`; `pip install data-product-forge[viz]` still works.
+  `[gcp]` drops `google-auth-oauthlib` and `google-cloud-iam` (unused). The GCP project-access
+  probe, the one user of `google-api-python-client`, now reports "not checked" when that large
+  package is absent, where it reported "no access"; `[gcp]` still leaves it out.
+  `[aws]` names `botocore`.
+
+- **`fluid --help` and each command start faster.** The core commands load lazily: `fluid --help`,
+  an unknown command and `fluid <cmd>` import only the module of the command being run, instead of
+  all of them. On a bare install, `fluid --help` imports 299 modules (was 857) and builds the parser
+  in about 85 ms (was about 1,100 ms, median of 7 cold runs on Python 3.12); `fluid validate` goes
+  to 327 modules and `fluid forge` to 464. `pydantic`, the copilot schemas and the IaC plugins are
+  no longer loaded by `--help`. The command list and every help line are unchanged, and
+  `build_parser()` with no argument still returns the full tree.
+
 - **Every maintained Python file now carries a two-line license header instead of the 14-line
   Apache boilerplate.** The header is `# Copyright 2025 Agentics Transformation Limited` followed by
   `# SPDX-License-Identifier: Apache-2.0`. The holder is now spelled as in `LICENSE`, `NOTICE` and
@@ -50,7 +154,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `python scripts/add_license_headers.py`, which also migrates a file that still has the old block,
   and the License Headers check enforces the new form.
 
+### Removed
+
+- **Nine modules that nothing imported are gone** (#832): `fluid_build.logging_utils`,
+  `fluid_build.cli.init_samples`, `fluid_build.copilot.schemas.table_metadata`,
+  `fluid_build.providers.local.ducksql`, `.mocks` and `.samples`, and
+  `fluid_build.runtimes.dataform_gcp`, `.dbt_bigquery` and `.dbt_duckdb`, with unused functions
+  elsewhere (3,638 lines in all). No command or contract behaves differently; code that imported
+  one of these modules directly must drop the import.
+
 ### Security
+
+- **A project `.env` could configure the embedded Debezium Server.** `fluid apply` loads the
+  project's `.env`, `.env.<environment>` and `.env.local` into its environment, which the
+  embedded Debezium Server inherits. The server's SmallRye Config reads a variable over its
+  `application.properties`, and its JVM reads `-D` system properties, which outrank both, from
+  `JDK_JAVA_OPTIONS` or the launcher's `JAVA_OPTS`. So a project file could send a
+  `sink.catalogAuth` credential to a catalog the operator never paired with it, change the
+  source database, load another config file, or start another `java`. The dotenv files
+  forge-cli loads can no longer set these, and each is ignored with the usual warning:
+  `DEBEZIUM_*`, `QUARKUS_*`, `SMALLRYE_*` and `MP_CONFIG_*` variables in the forms SmallRye
+  Config matches, profile forms included (`debezium.sink.iceberg.uri`, `_PROD_DEBEZIUM_…`,
+  `%prod.…`); `JDK_JAVA_OPTIONS`, `JAVA_OPTS` and `JAVA_HOME`; and the Debezium Server launcher's
+  `EXTRA_CONNECTOR`, `JMX_HOST`, `JMX_PORT`, `JMX_EXPORTER_PORT`, `JMX_EXPORTER_CONFIG` and
+  `OTEL_JAVAAGENT_*`. Set such a variable in the shell or CI instead.
+
+- **The `[mcp]` extra now needs `mcp>=1.30,!=2.0.*,!=2.1.*,<3.0`, and the `[litellm]` extra
+  excludes litellm 1.107.0.** *Before:* the floor was `mcp>=1.22`, which allowed releases with
+  published advisories. They were fixed in mcp 1.23.0, 1.27.2 (GHSA-jpw9: an SSE session was not
+  bound to the principal that opened it, and `fluid mcp output-port serve` uses
+  `SseServerTransport`), 1.28.1 and 1.30.0, and in 2.2.0 for the 2.x line. *Now:* the floor is
+  1.30 and 2.0.* and 2.1.* are excluded. The CI "MCP SDK Drift" lower-bound leg tests 1.30
+  (it was 1.22). litellm 1.107.0 is MAL-2026-2144, a malicious release since removed from PyPI;
+  both `litellm` requirement lines now carry `!=1.107.0`.
+- **Error and hint text that now prints as written is redacted first.** The CLI renderers that
+  print an exception, message, suggestion or hint literally (so `pip install
+  'data-product-forge[litellm]'` keeps its brackets) no longer let a secret through. Rich markup
+  used to swallow a bracketed `[ghp_...]` or `[sk-ant-...]` in an exception message; printed
+  literally it showed. Those paths (`fluid forge` and its modes, `doctor`, `auth`, `apply`,
+  `import`, `ai setup|status|test`, `demo`, the template, copilot and CI-scaffold agents,
+  `market`, `policy-check`, `validate-artifacts`, `ops`, and the exception-printing sites of
+  `status`, `plan` and `verify`) now mask GitHub, Anthropic and OpenAI keys,
+  JWTs and `password=...` pairs, the same as the top-level error handler. A test scans every
+  module under `fluid_build/cli` for a message printed as markup, so a new one fails CI.
 
 - **An Iceberg sink's catalog credential could be pointed at a cloud metadata address.** The
   `sink.catalogAuth` host check of the Kafka Connect and embedded Debezium sinks refused only
@@ -65,24 +211,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Flink host check already refused these addresses; its message now names a metadata endpoint
   instead of calling it link-local.
 
-### Changed
-
-- **The declared dependencies now match what the code imports.** `deptry` reports no findings.
-  `typing-extensions` and the Windows-only `colorama` leave the base install: nothing imports
-  either, and `pydantic` and `click` still bring them where they are needed. `anyio`, which the
-  MCP code imports directly, is named in the base install (it already arrived through `httpx`).
-  The `[viz]`, `[tui]` and `[odps]` extras are now empty aliases, because nothing imports
-  `graphviz`, `textual` or `ruamel.yaml`; `pip install data-product-forge[viz]` still works.
-  `[gcp]` drops `google-auth-oauthlib` and `google-cloud-iam` (unused). The GCP project-access
-  probe, the one user of `google-api-python-client`, now reports "not checked" when that large
-  package is absent, where it reported "no access"; `[gcp]` still leaves it out.
-  `[aws]` names `botocore`.
+- **An Iceberg sink override could change the catalog host after the `catalogAuth` check, or
+  carry another variable to it.** On the Kafka Connect and embedded Debezium sinks, a
+  `sink.catalogAuth` credential goes only to hosts the operator paired it with. The check read
+  override text before the sink expands it: Debezium Server's SmallRye Config expands a `${...}`
+  expression when the server starts, Kafka Connect resolves a `${provider:path:key}` reference
+  with the worker's config providers, and Iceberg replaces a value that starts with `env:` by
+  that variable. So a `${...}` in an override `uri` could make the server call a host other than
+  the one checked. On a build with `sink.catalogAuth`, a catalog URL that holds `${`, starts
+  with `env:` or holds a control character is now refused wherever it is set, at `fluid validate`
+  and in the run's preflight, as the OAuth2 token endpoint already was. So is such a value
+  anywhere else Iceberg reads it: `iceberg_catalog_overrides`, the `iceberg.*` keys of
+  `sink_connector_config` except `iceberg.kafka.*`, and every key of an embedded Debezium
+  `server.sink.config`. A storage credential comes from the worker's or the server's own
+  credential chain, not from the contract. Kafka-side keys such as `consumer.override.*` and
+  `iceberg.kafka.*` keep their config providers, and a build without `catalogAuth` is unchanged.
 
 ### Fixed
 
 - **`fluid odcs validate --roundtrip` failed on an installed CLI** because `deepdiff` was
   declared only for development. It now belongs to the `[odcs-strict]` extra, and a missing
   `deepdiff` says which extra to install.
+
+- **Install hints keep their `[extra]` when the CLI prints them.** Rich read the `[litellm]` in
+  `pip install 'data-product-forge[litellm]'` as a style tag and dropped it, so the line a user
+  most needs after the 0.28.0 install change read `pip install 'data-product-forge'`. Every CLI
+  site that prints an exception's message, suggestions or hint (`forge`, `forge data-model`,
+  the AI copilot and template-mode error renderers, `core`, `doctor`, `market`, `auth`) now prints
+  it as written, with control characters spelled out. `tests/test_hints_print_literally.py` scans
+  those modules and fails on a new site that prints such text as markup.
+- **The `[litellm]` install line was lost, printed twice, or blamed setup.** `fluid ai status`
+  put it in a markup panel, so it read `pip install 'data-product-forge'`. `fluid forge
+  data-model ... --llm-provider` printed it twice (a log line, then the error). `fluid doctor`
+  said "Not configured: run 'fluid ai setup'" for a provider that was configured but could not
+  run; it now shows the install line. In `forge --agent-loop` the hint no longer recommends
+  `--llm-provider claude-code`, which has no tool use and crashed there. A provider picked by
+  Ollama detection, not by flag, is named `provider ollama`, not `--llm-provider ollama`.
+  Interactive `fluid forge` without litellm no longer offers or saves Ollama, reads the keyring
+  or asks for a key: it offers the keyless agents and `--template starter`.
+- **The OpenLineage "needs openlineage-python" warning printed twice** in a real run: once as
+  a console line and once through the logging last-resort handler. It is the console line only.
 
 ## [0.27.0] — 2026-11-04
 
@@ -1744,7 +1912,6 @@ consumers.
 - Resolved `secretRef` values are registered with the exact-value redactor (#884), so a literal a
   client library echoes in its own error is masked by value rather than by pattern.
 
-
 - A contract repository could hand the whole host to its own SQL through DuckDB's spill
   directory. `secure_duckdb_connect` never set `temp_directory`, and DuckDB resolves its
   temp directory into `allowed_directories` like any other grant; the default is relative
@@ -1827,7 +1994,6 @@ into consumers.
   writes moved from
   `metadata.odps_passthrough` to the root `extensions.odps`, because `metadata` is
   `additionalProperties: false` and the old address could never validate.
-
 
 ### Fixed
 
@@ -2021,7 +2187,6 @@ into consumers.
   has nothing to decide.
 - `{{ env.NAME }}` interpolation in a connection field reads the environment without going through
   `secretRef` at all, so it is not covered by this policy.
-
 
 - On DuckDB 1.5.x, `lock_configuration` does not hold for logging reached as a table
   function: `SET enable_logging = true` is refused, but `SELECT * FROM enable_logging(...)`
@@ -2929,7 +3094,6 @@ This release fixes six security advisories. Each entry below has its own upgrade
   `RuntimeError` stand-in as `__cause__`, whose message starts with the driver's exception
   type name. Its `__context__` is `None`. Code that inspected the driver's exception on
   the chain must read the type name from that message instead.
-
 
 ### Upgrade notes
 
@@ -4470,8 +4634,6 @@ whole reason this release exists.
   identically. Sections that a reader could not reproduce — a Docker pull that
   returns `unauthorized`, a provider `fluid providers` does not list — are gone
   rather than softened. (#608)
-
-
 
 ## [0.15.0] — 2026-09-14
 

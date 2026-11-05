@@ -811,20 +811,6 @@ def _dlt_credentials_names(
     return frozenset(names), tuple(sorted(prefixes))
 
 
-def _dlt_endpoint_fields(kind: str) -> FrozenSet[str]:
-    """The top-level fields of ``kind``'s dlt credentials that pin it: all of
-    them (nested configurations included) but :data:`_DLT_IN_ACCOUNT_FIELDS`.
-    The empty set when dlt cannot introspect ``kind``; the names under its
-    credentials sections then pin whole (:func:`_dlt_credentials_names`)."""
-    try:
-        fields, configurations, _ = _dlt_credentials_spec(kind)
-    except Exception:  # noqa: BLE001 — dlt missing, or a spec it cannot build
-        return frozenset()
-    return frozenset(
-        {path[0] for path, allowed in fields if not allowed} | {path[0] for path in configurations}
-    )
-
-
 def _project_endpoint_field_names(
     section: str, pipeline_name: str, kind: str, names: Sequence[str]
 ) -> List[str]:

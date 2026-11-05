@@ -1586,6 +1586,18 @@ class FakeDatabricks:
                     found.append(path.replace(os.sep, "/"))
         return sorted(found)
 
+    def volume_dirs(self, prefix: str = "/Volumes") -> List[str]:
+        """Every directory the Files API holds under ``prefix`` below a volume's root, as
+        ``/Volumes/...`` paths (the volume roots themselves are not listed)."""
+        found: List[str] = []
+        for root, dirs, _names in os.walk(self.files_root):
+            for name in dirs:
+                path = "/" + os.path.relpath(os.path.join(root, name), self.files_root)
+                path = path.replace(os.sep, "/")
+                if len(path.split("/")) > 5 and path.startswith(prefix.rstrip("/") + "/"):
+                    found.append(path)
+        return sorted(found)
+
     def file_bytes(self, volume_path: str) -> bytes:
         path = self._fs_path(volume_path)
         assert path is not None, volume_path

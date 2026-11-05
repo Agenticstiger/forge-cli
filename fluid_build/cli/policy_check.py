@@ -16,7 +16,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fluid_build.cli.console import cprint, cprint_json, success
+from fluid_build.cli.console import cprint, cprint_json, cprint_literal, success
 from fluid_build.cli.console import error as console_error
 
 try:
@@ -533,7 +533,7 @@ def output_text(
                     location.append(f"field: {v.field}")
 
                 loc_str = f" [{', '.join(location)}]" if location else ""
-                cprint(f"  {v.severity.value.upper()}: {v.message}{loc_str}")
+                cprint_literal(f"  {v.severity.value.upper()}: {v.message}{loc_str}")
 
                 if v.remediation:
                     cprint(f"    💡 {v.remediation}")

@@ -25,7 +25,7 @@ import logging
 from pathlib import Path
 
 from fluid_build.cli._common import CLIError
-from fluid_build.cli.console import cprint, cprint_json
+from fluid_build.cli.console import cprint, cprint_json, cprint_literal
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
 COMMAND = "validate-artifacts"
@@ -177,7 +177,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                     if issue.column is not None:
                         loc += f":C{issue.column}"
                     loc += ")"
-                cprint(
+                cprint_literal(
                     f"   [{issue.severity}] {issue.validator}: {issue.file}{loc}: {issue.message}"
                 )
 

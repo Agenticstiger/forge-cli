@@ -14,6 +14,7 @@ import argparse
 import copy
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -21,7 +22,7 @@ import pytest
 
 from fluid_build.cli import _apply_opentofu_engine as engine
 from fluid_build.cli._common import CLIError
-from fluid_build.iac import IAC_PLUGINS, build_module, cutover, provider_match
+from fluid_build.iac import IAC_PLUGINS, build_module, cutover, provider_match, runner
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.module import LOCK_FILE_NAME, dependency_lock, write_dependency_lock
 from fluid_build.iac.providers import databricks as dbx
@@ -785,6 +786,43 @@ def test_fluid_validate_reports_the_refusals(monkeypatch, tmp_path: Path, capfd)
     contract["exposes"][0]["binding"]["location"]["host"] = "evil.example.com"
     rc, out = run_fluid(capfd, "validate", write_contract(tmp_path, contract))
     assert rc != 0 and "sets binding.location.host" in out
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("generate", "iac"),
+        # apply checks for the tofu binary before it emits, so without one it never refuses
+        pytest.param(
+            ("apply",),
+            marks=pytest.mark.skipif(runner.tofu_path() is None, reason="tofu not installed"),
+        ),
+    ],
+)
+def test_a_sovereignty_refusal_prints_its_reason_and_fix(
+    monkeypatch, tmp_path: Path, capfd, command
+):
+    isolate_workspace(
+        monkeypatch,
+        tmp_path,
+        host="https://adb-1.azuredatabricks.net",
+        warehouse_id=WAREHOUSE,
+        plugin_cache=str(tmp_path),
+    )
+    contract = make_contract(region="europe-west3")
+    contract["sovereignty"] = {
+        "allowedRegions": ["me-central-1", "me-south-1"],
+        "enforcementMode": "strict",
+    }
+    path = write_contract(tmp_path, contract)
+    extra = ("--out", str(tmp_path / "iac")) if command[0] == "generate" else ("--yes",)
+    rc, out = run_fluid(capfd, *command, path, *extra)
+    # the typed-error panel: colours and its border cut the wrapped text
+    out = " ".join(re.sub(r"\x1b\[[0-9;]*m|[│╭╮╰╯─]", " ", out).split())
+    assert rc != 0
+    assert "Region 'europe-west3' not in allowed regions list" in out
+    assert "allows me-central-1, me-south-1" in out
+    assert "Set binding.location.region on every databricks expose" in out
 
 
 def test_a_databricks_build_beside_non_cloud_exposes_still_meets_the_host_guard(

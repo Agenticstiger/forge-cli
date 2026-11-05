@@ -94,30 +94,3 @@ def get_auth_headers(
         headers["Authorization"] = f"Basic {credentials}"
 
     return headers
-
-
-def validate_auth_config(auth_config: Dict[str, str]) -> bool:
-    """Validate authentication configuration
-
-    Args:
-        auth_config: Authentication configuration dictionary
-
-    Returns:
-        True if valid, False otherwise
-    """
-    if not auth_config:
-        # Check if environment variables are set
-        return bool(os.getenv("FLUID_API_KEY") or os.getenv("FLUID_BEARER_TOKEN"))
-
-    auth_type = auth_config.get("type", "api_key")
-
-    if auth_type == "api_key":
-        return "api_key" in auth_config or bool(os.getenv("FLUID_API_KEY"))
-
-    elif auth_type == "bearer":
-        return "token" in auth_config or bool(os.getenv("FLUID_BEARER_TOKEN"))
-
-    elif auth_type == "basic":
-        return "username" in auth_config and "password" in auth_config
-
-    return False

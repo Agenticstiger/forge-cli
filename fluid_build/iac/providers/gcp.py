@@ -310,19 +310,6 @@ def _gcs_member(grant: AccessGrant) -> str:
     return f"{grant.principal_type}:{grant.principal}"
 
 
-def _legacy_gcs_member(principal: str) -> str:
-    """Deprecated shim: format a bare principal string as an IAM member.
-
-    Retained only for out-of-tree callers that pass a raw string; new code
-    passes an :class:`AccessGrant` to :func:`_gcs_member`.
-    """
-    if "@" not in principal:
-        return f"group:{principal}"
-    if principal.lower().endswith(".gserviceaccount.com"):
-        return f"serviceAccount:{principal}"
-    return f"user:{principal}"
-
-
 @dataclass(frozen=True)
 class _Placement:
     """One exposure's resolved container ownership (see the module docstring)."""

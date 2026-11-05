@@ -26,7 +26,10 @@ module moves it into the table in three steps:
    answered for is cancelled first; one still inside its first 30-second wait runs on, and Delta
    commits it whole or not at all. A run killed outright (SIGKILL, a CI runner torn down) cannot clean up, so each
    load first deletes what an earlier run of the same build left under
-   ``<volume>/<product>/<build>/``, once all of it is over an hour old.
+   ``<volume>/<product>/<build>/``, once all of it is over an hour old. Once its own run
+   directory is gone, the load also removes ``<volume>/<product>/<build>/`` and then
+   ``<volume>/<product>/`` when each is listed empty, so no empty directories pile up; the
+   Files API deletes only an empty directory, so another run's files are never touched.
 
 The table is the IaC's: a missing table is an error that names ``fluid apply``, and this module never
 creates or alters one. The volume is named by ``DATABRICKS_STAGING_VOLUME``
@@ -349,6 +352,30 @@ class Landing:
                 return [f"{prefix} ({_failure(exc)})"]
         return []
 
+    def _prune_parents(self, prefix: str, logger: logging.Logger) -> None:
+        """Remove the build's and then the product's directory above the run directory
+        ``prefix`` (already deleted), each only when it is listed empty, and stop at the first
+        that is not. Never the volume itself. Best effort: an empty directory holds no data, so
+        a failure is logged, never raised. The Files API refuses to delete a directory that is
+        not empty, so a run that stages there between the listing and the delete keeps its
+        files."""
+        build_dir = prefix.rsplit("/", 1)[0]
+        for directory in (build_dir, build_dir.rsplit("/", 1)[0]):
+            if not directory.startswith(self.volume.path + "/"):
+                return
+            try:
+                if self._list_dir(directory):
+                    return  # another run, or another build, still uses it
+                self._client.api_client.do("DELETE", _fs("directories", directory))
+            except Exception as exc:  # noqa: BLE001
+                if not is_not_found(exc):
+                    logger.info(
+                        "databricks.load left the empty staging directory %s: %s",
+                        directory,
+                        _failure(exc),
+                    )
+                return
+
     def _list_dir(self, path: str) -> List[Any]:
         """Every entry of a volume directory, following ``next_page_token``."""
         entries: List[Any] = []
@@ -471,6 +498,8 @@ class Landing:
                 )
             raise
         left = self._delete(prefix, remote)
+        if not left:
+            self._prune_parents(prefix, logger)
         if left:
             # the paths lead the message: a caller that shortens it must not cut them off
             logger.error(

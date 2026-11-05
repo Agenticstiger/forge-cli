@@ -46,7 +46,7 @@ from fluid_build.cli.artifact_paths import (
     product_memory_path,
     workspace_init_receipt_path,
 )
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.cli.workspace_config import find_workspace_root, load_workspace_config
 
 try:
@@ -461,5 +461,5 @@ def run(args: Any, logger: logging.Logger) -> int:
         return 0
     except Exception as exc:  # noqa: BLE001 — best-effort
         logger.debug("status_command_failed: %s", exc)
-        cprint(f"fluid status: couldn't gather state: {exc}")
+        cprint_literal(f"fluid status: couldn't gather state: {exc}")
         return 0

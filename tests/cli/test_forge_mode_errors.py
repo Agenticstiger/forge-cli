@@ -36,19 +36,31 @@ from fluid_build.cli.forge_modes import (
 )
 
 # Golden console strings — verbatim from the pre-refactor except blocks.
-GOLDEN_AI_GENERIC = "[red]AI Copilot failed: boom[/red]"
-GOLDEN_AI_COPILOT_ERR = "[red]❌ AI Copilot failed: friendly message[/red]"
+GOLDEN_AI_GENERIC = "AI Copilot failed: boom"
+GOLDEN_AI_COPILOT_ERR = "❌ AI Copilot failed: friendly message"
 GOLDEN_AI_TIP = (
     "[yellow]Tip: Run 'fluid ai setup' to configure your LLM provider,[/yellow]\n"
     "[yellow]or use 'fluid forge --blank' / guided mode without AI.[/yellow]"
 )
-GOLDEN_DOMAIN_GENERIC = "[red]❌ Domain agent failed: boom[/red]"
-GOLDEN_GUIDED_GENERIC = "[red]Guided mode failed: boom[/red]"
+GOLDEN_DOMAIN_GENERIC = "❌ Domain agent failed: boom"
+GOLDEN_GUIDED_GENERIC = "Guided mode failed: boom"
 
 
 def _printed(console: MagicMock) -> str:
     """Concatenate every positional arg passed to ``console.print``."""
     return "\n".join(str(call.args[0]) for call in console.print.call_args_list if call.args)
+
+
+def _style_of(console: MagicMock, needle: str) -> str:
+    """The Rich style of the printed ``Text`` containing ``needle``.
+
+    The messages print as ``Text`` (not markup), so the colour is a ``Text`` style,
+    not a ``[red]`` tag in the string the golden strings above compare.
+    """
+    for call in console.print.call_args_list:
+        if call.args and needle in str(call.args[0]):
+            return str(getattr(call.args[0], "style", ""))
+    raise AssertionError(f"nothing printed containing {needle!r}")
 
 
 # ── unit: the boundary in isolation ───────────────────────────────────
@@ -277,6 +289,7 @@ class TestAiCopilotModeErrorParity:
         logger.exception.assert_any_call("AI Copilot mode failed")
         printed = _printed(console)
         assert GOLDEN_AI_GENERIC in printed
+        assert _style_of(console, GOLDEN_AI_GENERIC) == "red"
         # No api-key hint for a non-key error.
         assert "fluid ai setup" not in printed
 
@@ -302,7 +315,9 @@ class TestAiCopilotModeErrorParity:
         assert result == 1
         printed = _printed(console)
         assert GOLDEN_AI_COPILOT_ERR in printed
-        assert "[dim]• try this[/dim]" in printed
+        assert _style_of(console, GOLDEN_AI_COPILOT_ERR) == "red"
+        assert _style_of(console, "• try this") == "dim"
+        assert "• try this" in printed
         # The internal error code must never surface to the user.
         assert "internal_error_code" not in printed
 
@@ -317,7 +332,7 @@ class TestAiCopilotModeErrorParity:
         )
         with (
             patch("fluid_build.cli.forge_modes.console_error") as mock_err,
-            patch("fluid_build.cli.forge_modes.cprint") as mock_cprint,
+            patch("fluid_build.cli.forge_modes.cprint_literal") as mock_cprint,
         ):
             result = run_ai_copilot_mode(
                 self._args(),

@@ -693,7 +693,7 @@ class TestBootstrapCommands:
 
         # register_core_commands delegates to the lazy loader.
         rcc = inspect.getsource(bootstrap.register_core_commands)
-        assert "_register_command_plugins(sp)" in rcc
+        assert "_register_command_plugins(sp, argv)" in rcc
 
 
 # ---------------------------------------------------------------------------

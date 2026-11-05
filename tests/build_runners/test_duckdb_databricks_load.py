@@ -267,8 +267,20 @@ def test_the_file_is_uploaded_loaded_and_the_staged_copy_deleted(fake, tmp_path)
     puts = [p for m, p in fake.file_ops if m == "PUT"]
     assert puts == [f"{run_dir}/subs.parquet"]
     # in order: earlier runs looked for, the directory, the file, then (after the load) the file
-    # and the directory go
-    assert [m for m, _ in fake.file_ops] == ["LIST", "PUT-DIR", "PUT", "DELETE", "DELETE-DIR"]
+    # and the directory go, and then the build's and the product's directories, each once it is
+    # listed empty
+    assert [m for m, _ in fake.file_ops] == [
+        "LIST",
+        "PUT-DIR",
+        "PUT",
+        "DELETE",
+        "DELETE-DIR",
+        "LIST",
+        "DELETE-DIR",
+        "LIST",
+        "DELETE-DIR",
+    ]
+    assert fake.volume_dirs() == [], "no empty directory is left either"
     assert fake.sql_log[-1].startswith("INSERT OVERWRITE `main`.`bronze`.`subs`")
     assert fake.unknown == []
 
@@ -459,6 +471,47 @@ def test_an_interrupted_statement_is_cancelled_on_the_warehouse():
     assert ("POST", "/api/2.0/sql/statements/s-1/cancel") in calls
 
 
+def test_a_failed_load_also_leaves_no_empty_directory(fake, tmp_path):
+    fake.fail_on("INSERT OVERWRITE")
+    with pytest.raises(load.DatabricksLoadError):
+        _load(_landing(fake), _parquet(tmp_path))
+    assert fake.volume_files() == [] and fake.volume_dirs() == []
+
+
+def test_a_parent_another_run_still_uses_is_kept(fake, tmp_path):
+    running = f"{VOLUME}/bronze_subs/ingest/{EARLIER_RUN}"
+    other_build = f"{VOLUME}/bronze_subs/other/{EARLIER_RUN}"
+    _volume_file(fake, f"{running}/subs.parquet", b"in flight", age_seconds=60)
+    _volume_file(fake, f"{other_build}/subs.parquet", b"another build's run", age_seconds=60)
+
+    _load(_landing(fake), _parquet(tmp_path), run_id="run-1")
+
+    assert fake.volume_files() == [f"{running}/subs.parquet", f"{other_build}/subs.parquet"]
+    assert f"{VOLUME}/bronze_subs/ingest/run-1" not in fake.volume_dirs()
+    assert f"{VOLUME}/bronze_subs/ingest" in fake.volume_dirs()
+
+
+def test_only_the_build_directory_goes_when_the_product_holds_another_build(fake, tmp_path):
+    other_build = f"{VOLUME}/bronze_subs/other/{EARLIER_RUN}"
+    _volume_file(fake, f"{other_build}/subs.parquet", b"another build's run", age_seconds=60)
+
+    _load(_landing(fake), _parquet(tmp_path), run_id="run-1")
+
+    assert f"{VOLUME}/bronze_subs/ingest" not in fake.volume_dirs()
+    assert fake.volume_dirs() == [
+        f"{VOLUME}/bronze_subs",
+        f"{VOLUME}/bronze_subs/other",
+        other_build,
+    ]
+
+
+def test_a_parent_that_cannot_be_removed_does_not_fail_the_load(fake, tmp_path):
+    fake.fail_route("DELETE", r"/fs/directories/Volumes/.*/bronze_subs/ingest$", 403, "DENIED")
+    facts = _load(_landing(fake), _parquet(tmp_path), run_id="run-1")
+    assert facts["staged_files_deleted"] is True and fake.volume_files() == []
+    assert f"{VOLUME}/bronze_subs/ingest" in fake.volume_dirs()
+
+
 def test_staged_files_an_earlier_killed_run_left_are_deleted_first(fake, tmp_path):
     stale = f"{VOLUME}/bronze_subs/ingest/{EARLIER_RUN}"
     other_build = f"{VOLUME}/bronze_subs/other/{EARLIER_RUN}"
@@ -617,6 +670,7 @@ def test_the_run_record_says_what_was_loaded(fake, tmp_path):
     facts = facets["databricks_load"]
     assert facts["table"] == TABLE and facts["rows"] == 3
     assert facts["staged_files_deleted"] is True
+    assert facts["local_staging_deleted"] is True
     assert facts["staged_to"].startswith(f"{VOLUME}/bronze_subs/ingest/")
     assert facets["masking"]["columns"]["msisdn"]["strategy"] == "hash"
     assert VOLUME not in json.dumps(facets["landed"]), "the landed facet names no volume path"
@@ -636,6 +690,36 @@ def test_a_databricks_binding_never_writes_the_local_fallback(fake, tmp_path, lo
     written = {p.name for p in tmp_path.rglob("*.parquet")}
     assert written <= {"subs.parquet"}
     assert all(".fluid/staging" in str(p) for p in tmp_path.rglob("*.parquet"))
+
+
+def test_the_local_staged_copy_is_deleted_after_the_load(fake, tmp_path):
+    assert _run(_contract(tmp_path, masking_rules=HASH), tmp_path) == 0
+    assert list((tmp_path / ".fluid" / "staging").rglob("*.parquet")) == []
+
+
+def test_the_local_staged_copy_is_deleted_after_a_failed_load_too(fake, tmp_path, caplog):
+    fake.fail_on("INSERT OVERWRITE", "[PERMISSION_DENIED] no MODIFY")
+    assert _run(_contract(tmp_path, masking_rules=HASH), tmp_path) != 0
+    assert list((tmp_path / ".fluid" / "staging").rglob("*.parquet")) == []
+    assert "local staged copy" in caplog.text and "deleted" in caplog.text
+
+
+def test_a_local_staged_copy_that_cannot_be_deleted_fails_the_run_naming_it(
+    fake, tmp_path, monkeypatch, caplog
+):
+    from fluid_build.build_runners.duckdb import runner as duckdb_runner
+
+    real_unlink = Path.unlink
+
+    def refuse(self, *args, **kwargs):
+        if self.suffix == ".parquet" and ".fluid/staging" in str(self):
+            raise PermissionError("read-only")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(duckdb_runner.Path, "unlink", refuse)
+    assert _run(_contract(tmp_path), tmp_path) != 0
+    assert "could not delete the local staged copy" in caplog.text
+    assert "subs.parquet" in caplog.text
 
 
 def test_a_second_run_overwrites_the_table(fake, tmp_path):

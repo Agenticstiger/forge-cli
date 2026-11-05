@@ -92,24 +92,3 @@ def resolve_account_and_region(
         resolved_region = "us-east-1"
 
     return resolved_account, resolved_region
-
-
-def get_boto_session(region: Optional[str] = None):
-    """
-    Get a boto3 session with proper configuration.
-
-    Args:
-        region: AWS region
-
-    Returns:
-        Configured boto3 Session
-    """
-    try:
-        import boto3
-    except ImportError:
-        raise RuntimeError("boto3 not installed. Install with: pip install boto3")
-
-    if region:
-        return boto3.Session(region_name=region)
-    else:
-        return boto3.Session()

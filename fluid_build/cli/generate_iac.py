@@ -16,6 +16,7 @@ import argparse
 import logging
 import os
 
+from fluid_build._errors import FluidUserError
 from fluid_build.cli.console import cprint
 from fluid_build.iac import (
     IAC_PLUGINS,
@@ -156,6 +157,10 @@ def run(args, logger: logging.Logger) -> int:
             "unsupported_binding",
             {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
         )
+    except FluidUserError:
+        # A typed refusal (a sovereignty or residency veto, say) carries its why, fix and doc;
+        # the CLI renders all of them. Collapsed into generate_iac_failed it kept only ``what``.
+        raise
     except Exception as e:
         raise CLIError(1, "generate_iac_failed", {"error": str(e)})
 

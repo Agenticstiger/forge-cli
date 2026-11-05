@@ -531,13 +531,15 @@ def test_lineage_without_openlineage_warns_once_naming_the_extra_and_does_not_ra
                 run_started_at="2026-05-15T00:00:00Z",
                 provider="aws",
             )
-    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1, warnings
-    assert "OpenLineage emission needs openlineage-python, which is not installed" in warnings[0]
-    assert "pip install 'data-product-forge[lineage]'" in warnings[0]
-    # The console copy too: Rich markup used to swallow ``[lineage]`` there.
+    # The console carries the warning, once. The WARNING record is kept for log
+    # files and marked so the CLI's console handler does not echo it again.
     shown = capsys.readouterr()
-    assert "pip install 'data-product-forge[lineage]'" in shown.out + shown.err
+    text = " ".join((shown.out + shown.err).split())
+    hint = "pip install 'data-product-forge[lineage]'"
+    assert text.count(hint) == 1, text
+    assert "OpenLineage emission needs openlineage-python, which is not installed" in text
+    warned = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warned) == 1 and warned[0].fluid_console_shown is True
 
 
 # ── duckdb / vowl ────────────────────────────────────────────────────────────
@@ -685,3 +687,19 @@ def test_doctor_probes_the_openlineage_client_not_the_namespace(monkeypatch):
     row = next(c for c in checks if c["check"] == "OpenLineage client")
     assert "Not installed" in row["status"]
     assert "data-product-forge[lineage]" in row["details"]
+
+
+@pytest.mark.parametrize("transport", ["stdio", "http"])
+def test_output_port_serve_prints_only_the_hint_without_the_sdk(
+    block, cli, tmp_path, transport  # noqa: F811
+):
+    block("mcp")
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_text("fluidVersion: 0.7.5\nkind: DataProduct\nid: x\nname: x\nexposes: []\n")
+    rc, out = cli("mcp", "output-port", "serve", str(contract), "--transport", transport)
+    flat = " ".join(out.split())
+    assert rc == 1, out
+    assert "pip install 'data-product-forge[mcp]'" in flat
+    for noise in ("serving expose", "auto-selected", "NO built-in auth", "output_port_serve_start"):
+        assert noise not in out
+    assert "Traceback" not in out

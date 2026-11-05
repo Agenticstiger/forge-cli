@@ -141,25 +141,6 @@ timed = performance_monitor.timed
 cached = performance_monitor.cached
 
 
-def log_performance_summary():
-    """Log performance summary"""
-    metrics = performance_monitor.get_metrics()
-    cache_stats = performance_monitor.get_cache_stats()
-
-    logger.info("=== Performance Summary ===")
-    for name, metric in metrics.items():
-        success_rate = metric["success_count"] / metric["count"] * 100 if metric["count"] > 0 else 0
-        logger.info(
-            f"{name}: {metric['count']} calls, "
-            f"avg: {metric['avg_time']:.3f}s, "
-            f"success: {success_rate:.1f}%"
-        )
-
-    logger.info(
-        f"Cache: {cache_stats['cache_size']} entries, {cache_stats['total_memory_mb']:.1f}MB"
-    )
-
-
 def optimize_registry_performance():
     """Apply performance optimizations to registry system"""
 

@@ -21,8 +21,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+from fluid_build._console import literal_error_text
 from fluid_build.cli._forge_mode_errors import forge_mode_error_boundary
-from fluid_build.cli.console import cprint, success
+from fluid_build.cli.console import cprint, cprint_literal, success
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_copilot_interview import (
     InterviewQuestion,
@@ -1078,6 +1079,28 @@ def _forge_project_creation_core(
     return None
 
 
+def _render_ai_copilot_error(console: Any, exc: BaseException) -> None:
+    """Render an AI-copilot failure; messages and suggestions print as written."""
+    if isinstance(exc, CopilotGenerationError):
+        if console:
+            console.print(literal_error_text(f"❌ AI Copilot failed: {exc.message}", "red"))
+            for suggestion in exc.suggestions:
+                console.print(literal_error_text(f"• {suggestion}", "dim"))
+        else:
+            console_error(f"AI Copilot failed: {exc.message}")
+            for suggestion in exc.suggestions:
+                cprint_literal(f"  • {suggestion}")
+    else:
+        is_key_error = "api_key" in str(exc).lower() or "missing_llm" in str(exc).lower()
+        if console:
+            console.print(literal_error_text(f"AI Copilot failed: {exc}", "red"))
+            if is_key_error:
+                console.print(
+                    "[yellow]Tip: Run 'fluid ai setup' to configure your LLM provider,[/yellow]\n"
+                    "[yellow]or use 'fluid forge --blank' / guided mode without AI.[/yellow]"
+                )
+
+
 def run_ai_copilot_mode(
     args: Any,
     logger: logging.Logger,
@@ -1096,27 +1119,13 @@ def run_ai_copilot_mode(
     fallback_mode_choices: Sequence[Mapping[str, str]] = (),
 ) -> int:
     """Run Forge with AI copilot assistance."""
-    console = console_factory() if console_factory else None
+    # Before the error boundary and before any context or memory is read: a
+    # litellm-backed provider on an install without litellm raises
+    # MissingOptionalDependency, which the CLI prints (install line, exit 1).
+    from fluid_build.llm.providers import preflight_llm_provider
 
-    def _render_ai_copilot_error(console: Any, exc: BaseException) -> None:
-        if isinstance(exc, CopilotGenerationError):
-            if console:
-                console.print(f"[red]❌ AI Copilot failed: {exc.message}[/red]")
-                for suggestion in exc.suggestions:
-                    console.print(f"[dim]• {suggestion}[/dim]")
-            else:
-                console_error(f"AI Copilot failed: {exc.message}")
-                for suggestion in exc.suggestions:
-                    cprint(f"  • {suggestion}")
-        else:
-            is_key_error = "api_key" in str(exc).lower() or "missing_llm" in str(exc).lower()
-            if console:
-                console.print(f"[red]AI Copilot failed: {exc}[/red]")
-                if is_key_error:
-                    console.print(
-                        "[yellow]Tip: Run 'fluid ai setup' to configure your LLM provider,[/yellow]\n"
-                        "[yellow]or use 'fluid forge --blank' / guided mode without AI.[/yellow]"
-                    )
+    preflight_llm_provider(args)
+    console = console_factory() if console_factory else None
 
     with forge_mode_error_boundary(
         logger,
@@ -1575,7 +1584,7 @@ def run_domain_agent_mode(
 
     def _render_domain_agent_error(console: Any, exc: BaseException) -> None:
         if console:
-            console.print(f"[red]❌ Domain agent failed: {exc}[/red]")
+            console.print(literal_error_text(f"❌ Domain agent failed: {exc}", "red"))
 
     with forge_mode_error_boundary(
         logger,
@@ -1771,7 +1780,7 @@ def run_guided_mode(
 
     def _render_guided_error(console: Any, exc: BaseException) -> None:
         if console:
-            console.print(f"[red]Guided mode failed: {exc}[/red]")
+            console.print(literal_error_text(f"Guided mode failed: {exc}", "red"))
 
     with forge_mode_error_boundary(
         logger,

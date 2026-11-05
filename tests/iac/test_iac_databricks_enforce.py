@@ -1071,6 +1071,50 @@ def test_a_superseded_function_is_dropped_after_a_successful_apply_and_said(fake
     assert all(f in fake.functions for f in live_masks(fake).values())
 
 
+def test_a_dry_run_lists_the_superseded_function_the_apply_would_drop_and_drops_nothing(fake):
+    first, changed = _changed_contract_applied(fake)
+    before = dict(fake.functions)
+    start = len(fake.sql_log)
+    run = Run(fake)
+    run.pre(changed, dry_run=True)
+    assert f"would drop superseded function {first}" in run.text
+    assert fake.sql_log[start:] == [] and fake.functions == before
+    # the same function the real apply then drops
+    real = Run(fake)
+    real.pre(changed)
+    real.post(changed)
+    assert f"dropped superseded function {first}" in real.text
+
+
+def test_a_dry_run_lists_no_drop_when_nothing_is_superseded(fake):
+    seed(fake)
+    Run(fake).pre(contract())
+    run = Run(fake)
+    run.pre(contract(), dry_run=True)
+    assert "superseded" not in run.text and "would drop" not in run.text
+
+
+def test_a_dry_run_keeps_a_function_another_table_still_uses(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.create_table("main.cp360.other", [("a", "string", True)])
+    fake.tables["main.cp360.other"]["row_filter"] = {
+        "function_name": first,
+        "input_column_names": [],
+    }
+    run = Run(fake)
+    run.pre(changed, dry_run=True)
+    assert "would drop" not in run.text
+
+
+def test_a_dry_run_names_an_orphan_it_would_leave(fake):
+    first, changed = _changed_contract_applied(fake)
+    fake.functions[first]["owner"] = "someone-else@example.test"
+    run = Run(fake)
+    run.pre(changed, dry_run=True)
+    assert f"would leave function {first}: owned by someone-else@example.test" in run.text
+    assert "would drop" not in run.text
+
+
 def test_a_function_bound_to_any_table_in_the_schema_is_never_dropped(fake):
     first, changed = _changed_contract_applied(fake)
     fake.create_table("main.cp360.other", [("a", "string", True)])

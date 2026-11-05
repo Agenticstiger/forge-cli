@@ -132,6 +132,7 @@ from ...providers._iceberg_catalog_auth import (
     AUTH_OWNED_PROPERTIES,
     AUTHORIZATION_HEADER_PROPERTY,
     CATALOG_AUTH_FIELD,
+    CONTROL_RE,
     FORBIDDEN_TEXT_PATTERN,
     INLINE_CHECKED_KEYS,
     CatalogAuth,
@@ -897,25 +898,6 @@ def _overrides_warehouse(runtime: IcebergSinkPlan) -> bool:
     return _overrides_catalog_property(runtime, "warehouse")
 
 
-def _reaching_catalog_type(info: Any, runtime: IcebergSinkPlan) -> Optional[str]:
-    """The catalog ``type`` the worker actually receives, or ``None``.
-
-    The derived value when the runner derives (``None`` for a catalog reached by
-    ``catalog-impl``), then every override map in merge order, the last one
-    winning, as the runner merges them. A hand-written config therefore decides
-    for itself: its ``type`` is what reaches the worker, not the expose's kind.
-    """
-    reaching: Optional[str] = None
-    if runtime.derives and not info.catalog_impl:
-        reaching = info.runtime_type
-    for _label, mapping in runtime.overrides:
-        if runtime.impl_key in mapping:
-            reaching = None
-        if runtime.type_key in mapping:
-            reaching = str(mapping[runtime.type_key] or "").strip().lower() or None
-    return reaching
-
-
 def _wire_catalog(info: CatalogKind) -> str:
     """The catalog the worker builds from ``info``'s derived selector.
 
@@ -1231,8 +1213,83 @@ def _check_catalog_auth(
                 "(Iceberg uses a token over a credential when it gets both). Remove those "
                 f"keys from {label}, or remove sink.{CATALOG_AUTH_FIELD}"
             )
+        _check_override_references(head, auth, runtime, label, mapping, clashing, errors)
 
     _check_catalog_auth_reach(head, auth, refused, runtime, targets, errors, warnings)
+
+
+def _read_by_iceberg(runtime: IcebergSinkPlan, key: Any) -> bool:
+    """Does the sink hand ``key`` of an override map to Iceberg?
+
+    Every Debezium Server sink key is an Iceberg consumer or catalog property.
+    On Kafka Connect those are the ``iceberg.*`` keys except ``iceberg.kafka.*``,
+    which configure the control topic's Kafka clients; the rest (such as
+    ``consumer.override.*``) configure the connector's Kafka side too.
+    """
+    if runtime.engine == "debezium":
+        return True
+    text = str(key)
+    return text.startswith("iceberg.") and not text.startswith("iceberg.kafka.")
+
+
+#: Where a storage credential comes from when the contract may not name it.
+_CREDENTIAL_CHAIN: Mapping[str, str] = {
+    "kafka-connect": "the Kafka Connect worker's",
+    "debezium": "the embedded Debezium Server's",
+}
+
+
+def _check_override_references(
+    head: str,
+    auth: Optional[CatalogAuth],
+    runtime: IcebergSinkPlan,
+    label: str,
+    mapping: Mapping[str, Any],
+    clashing: Sequence[str],
+    errors: List[str],
+) -> None:
+    """With ``sink.catalogAuth``, no other value Iceberg reads may name a variable. HARD.
+
+    The operator pairs the one variable ``catalogAuth`` names with the hosts it
+    reaches (:func:`_check_catalog_auth_destinations`). An override value that
+    references another (``env:``, or a ``${...}`` the worker's config providers
+    or SmallRye Config resolve) would carry that variable to the same hosts, in
+    a header, a property or a path, resolved where the sink runs, after these
+    checks. ``binding.location`` text is held to the same rule
+    (:func:`_check_location_text`), and so is a control character, which could
+    end the value early and start another header or property. A key that
+    already clashes with ``catalogAuth`` has its own error, and so does the
+    catalog uri, a destination :func:`_destination_host` refuses with its own
+    reason.
+    """
+    from fluid_build.observability.secret_redactor import is_sensitive_key_name
+
+    variable = auth.env_var if auth is not None else f"the sink.{CATALOG_AUTH_FIELD} variable"
+    uri_key = f"{_property_prefix(runtime)}uri"
+    for key, value in mapping.items():
+        if key in clashing or key == uri_key or value is None or not _read_by_iceberg(runtime, key):
+            continue
+        text = str(value)
+        if CONTROL_RE.search(text):
+            errors.append(
+                f"{head}: {label} {key} holds a control character (the value is not shown), "
+                "which could end it early and start another header or property. Remove it"
+            )
+        elif re.search(FORBIDDEN_TEXT_PATTERN, text):
+            advice = (
+                f"A credential reaches the catalog only through sink.{CATALOG_AUTH_FIELD}, and "
+                f"a storage credential comes from {_CREDENTIAL_CHAIN[runtime.engine]} own "
+                "credential chain (for S3, its AWS environment or instance profile). Remove the "
+                f"key, or remove sink.{CATALOG_AUTH_FIELD}"
+                if is_sensitive_key_name(str(key))
+                else f"Write the value itself, or remove sink.{CATALOG_AUTH_FIELD}"
+            )
+            errors.append(
+                f"{head}: {label} {key} starts with env:, or holds ${{ (the value is not "
+                f"shown). The sink config hands it to {_REFERENCES_RESOLVED_BY[runtime.engine]}, "
+                "after these checks, so it could carry another variable to the hosts the "
+                f"operator paired with {variable}. {advice}"
+            )
 
 
 def _check_catalog_auth_env_at_run(
@@ -1401,15 +1458,27 @@ def _not_https(source: str, role: str, receives: str) -> str:
 def _destination_host(url: str, source: str, role: str, receives: str) -> Tuple[str, str]:
     """``(host, "")`` for a destination the operator may allow, else ``("", why not)``.
 
-    "Why not" is a refusal no operator entry changes: the URL is not https (a
-    loopback one included), carries a ``user:password@`` part, names no plain
-    host (:data:`_PLAIN_HOST_RE`), or names a link-local, unspecified or cloud
-    metadata address (:data:`fluid_build._net.CLOUD_METADATA_ADDRESSES`), also
-    inside an IPv4-mapped or NAT64 address: the deployment host policy's rule,
-    through the same :func:`fluid_build._net._is_metadata_address`. Python and
-    the JVM split a URL's authority alike only when it holds no such part, so
-    the host checked here is the one the sink connects to.
+    "Why not" is a refusal no operator entry changes: the URL holds text the
+    sink expands after this check (``FORBIDDEN_TEXT_PATTERN``: a ``${...}``
+    config-provider or SmallRye expression, a leading ``env:``, a control
+    character), so the host it ends up calling is not the one read here; the
+    URL is not https (a loopback one included), carries a ``user:password@``
+    part, names no plain host (:data:`_PLAIN_HOST_RE`), or names a link-local,
+    unspecified or cloud metadata address
+    (:data:`fluid_build._net.CLOUD_METADATA_ADDRESSES`), also inside an
+    IPv4-mapped or NAT64 address: the deployment host policy's rule, through
+    the same :func:`fluid_build._net._is_metadata_address`. Python and the JVM
+    split a URL's authority alike only when it holds no such part, so the host
+    checked here is the one the sink connects to.
     """
+    if re.search(FORBIDDEN_TEXT_PATTERN, url):
+        # SmallRye expands ``https://10.0.0.5:${p}/x`` with ``p=443@evil.example``
+        # to a URL whose host is evil.example: the host is decided after this check.
+        return "", (
+            f"{source} starts with env:, or holds ${{ or a control character (the value is "
+            "not shown): the sink expands or reads such text after this check, so the "
+            f"{role} host that receives {receives} cannot be checked. Write the URL itself"
+        )
     no_host = f"{source} names no host, so where the {role} sends {receives} cannot be checked"
     try:
         parts = urlsplit(url)

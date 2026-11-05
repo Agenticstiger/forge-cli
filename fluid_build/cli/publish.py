@@ -27,11 +27,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from fluid_build._env_names import ENV_NAME_RULE, is_env_name
-from fluid_build.cli.console import cprint, cprint_json
+from fluid_build.cli.console import cprint, cprint_json, cprint_literal
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
 try:
@@ -443,6 +444,7 @@ async def publish_contract(
             from ._publish_provenance import contract_provenance
 
             asset.provenance = contract_provenance(contract_path)
+            asset.location = _reported_location(asset, contract, contract_path, project_file)
     except Exception as e:
         return PublishResult(
             success=False,
@@ -502,6 +504,69 @@ async def publish_contract(
 
     result = await provider.publish(asset)
     return result
+
+
+def _reported_location(
+    asset: Any, contract: Dict[str, Any], contract_path: Path, project_file: Optional[str]
+) -> Any:
+    """The ``metadata.location`` a Command Center publish reports for ``asset``.
+
+    The Command Center shows a local deployment's location as it is sent, and a
+    relative ``location.path`` names a file only together with the directory
+    the engine anchors it at: the source contract's
+    (``fluid_build.util.binding_paths``). So a local path is anchored there and
+    cleaned to one spelling (``x/../shared`` is ``shared``), under the local
+    provider's file name when that provider writes the expose
+    (``local_provider_landing``, the rule the ``consumes[]`` reader applies),
+    the way ``docker compose config`` resolves a relative path against the
+    Compose file's directory. Only this report changes: the contract, and the
+    ``contract_yaml`` sent with it, keep the path as written, and a changed
+    location is a new dict.
+
+    ``asset.location`` is returned as it is for any other platform; for an
+    endpoint the checkout named (``project_file``), which is not sent the
+    runner's own layout, as it is not sent its ``{{ env.* }}`` values; for a
+    remote URI; and for a path that still holds a ``{{ env.NAME }}``:
+    ``resolve_binding_path`` would fill it from the environment, including the
+    credential-shaped names :func:`resolve_contract_env_templates` leaves literal.
+    """
+    from fluid_build._contract_loader import source_contract_dir
+    from fluid_build.build_runners._embedded_sql_io import _landed_by_local_provider
+    from fluid_build.util.binding_paths import (
+        ENV_PLACEHOLDER_RE,
+        is_remote_uri,
+        local_provider_landing,
+        resolve_binding_path,
+    )
+
+    location = asset.location
+    path = location.get("path") if isinstance(location, dict) else None
+    if (
+        asset.platform != "local"
+        or project_file
+        or not path
+        or not isinstance(path, str)
+        or ENV_PLACEHOLDER_RE.search(path)
+        or is_remote_uri(path)
+    ):
+        return location
+    anchored = resolve_binding_path(path, source_contract_dir(contract_path, logger))
+    landed = os.path.normpath(anchored)
+    expose = contract["exposes"][0]
+    try:
+        if _landed_by_local_provider(contract, expose):
+            # The format as the writer reads it (``LocalProvider._derive_actions_from_contract``).
+            fmt = expose["binding"].get("format") or expose.get("format")
+            landed, _ = local_provider_landing(landed, fmt)
+    except (AttributeError, TypeError, ValueError) as exc:
+        # Only a contract nothing can build gets here: one the schema refuses
+        # (``builds[].engine: 5``) or a path the writer cannot name a file at
+        # (``/``). Reporting the file must not fail the publish: its name stays
+        # as declared.
+        logger.debug(
+            "reported location keeps the declared file name: %s: %s", type(exc).__name__, exc
+        )
+    return {**location, "path": landed}
 
 
 def _publish_catalog_config(
@@ -979,7 +1044,7 @@ async def run_async(args, logger: logging.Logger) -> int:
             acq_results = publish_acquisition(contract, Path.cwd())
             for r in acq_results:
                 icon = "✅" if r.succeeded else "⚠️"
-                cprint(
+                cprint_literal(
                     f"  {icon} acquisition publish "
                     f"{r.product_id}/{r.expose_id} → {r.target}"
                     + (f"  [{r.error}]" if r.error else "")

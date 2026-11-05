@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fluid_build.cli.console import cprint, success, warning
+from fluid_build.cli.console import cprint, cprint_literal, success, warning
 from fluid_build.cli.console import error as console_error
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
@@ -1772,7 +1772,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         cprint(f"   Target: {target}")
 
         if result["status"] == "unsupported":
-            cprint(f"   ⏭️  Skipped: {result.get('error', 'no verifier for this format')}")
+            cprint_literal(f"   ⏭️  Skipped: {result.get('error', 'no verifier for this format')}")
             unsupported_count += 1
             continue
 
@@ -1785,7 +1785,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             # they indicate real problems regardless of materialization
             # source.
             if reference_only and result.get("exists") is False:
-                cprint(
+                cprint_literal(
                     f"   🔵 INFO: {result.get('error', 'Table not materialized yet')} "
                     "(reference-only — external pipeline owns creation)"
                 )
@@ -1795,7 +1795,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 continue
             # Not markup: a message such as "pip install 'data-product-forge[aws]'"
             # lost its ``[aws]`` to Rich, which read it as a style tag.
-            cprint(f"   ❌ Error: {result.get('error', 'Unknown error')}", markup=False)
+            cprint_literal(f"   ❌ Error: {result.get('error', 'Unknown error')}", markup=False)
             error_count += 1
             continue
 
@@ -1922,7 +1922,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 cprint(f"\n   Build: {r.product_id}/{r.build_id}")
                 for c in r.checks:
                     icon = "✅" if c.passed else "❌"
-                    cprint(f"      {icon} {c.name}: {c.detail}")
+                    cprint_literal(f"      {icon} {c.name}: {c.detail}")
                     if not c.passed:
                         mismatch_count += 1
     except Exception as exc:  # noqa: BLE001 — verify must not crash the CLI
@@ -1951,7 +1951,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 cprint(f"\n   Build: {r.product_id}/{r.build_id}")
                 for c in r.checks:
                     icon = "✅" if c.passed else "❌"
-                    cprint(f"      {icon} {c.name}: {c.detail}")
+                    cprint_literal(f"      {icon} {c.name}: {c.detail}")
                     if not c.passed:
                         mismatch_count += 1
                         if c.name in CRITICAL_TRANSFORMATION_CHECK_NAMES:

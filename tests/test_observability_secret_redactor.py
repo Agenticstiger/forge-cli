@@ -12,7 +12,7 @@ from io import StringIO
 import pytest
 
 from fluid_build.cli import _setup_enhanced_logging
-from fluid_build.observability.secret_redactor import SecretRedactingFilter
+from fluid_build.observability.secret_redactor import SecretRedactingFilter, redact_secret_text
 
 
 @pytest.fixture
@@ -687,3 +687,43 @@ class TestDatabricksCredentials:
         assert "v4lue-xyz" not in redact_secret_text(f"{name}=v4lue-xyz")
         assert "v4lue-xyz" not in redact_secret_text(f"{name}: v4lue-xyz")
         assert "v4lue-xyz" not in redact_secret_text('{"%s": "v4lue-xyz"}' % name)
+
+
+class TestJwtAnchoring:
+    """Error text a person reads keeps a dotted table name; logs keep the #389 rule."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "my-gcp-project.customer_analytics.daily_revenue_summary",
+            "ANALYTICS_DB.PUBLIC_SCHEMA.CUSTOMER_ORDERS",
+        ],
+    )
+    def test_fully_qualified_table_names_survive_in_error_text(self, name):
+        from fluid_build._console import literal_error_text
+
+        text = f"Table {name} not found"
+        assert redact_secret_text(text, keep_dotted_names=True) == text
+        assert literal_error_text(text).plain == text
+        # Log redaction keeps the prefix-agnostic three-segment rule.
+        assert name not in redact_secret_text(text)
+
+    @pytest.mark.parametrize("keep_dotted_names", [False, True])
+    def test_three_and_two_segment_jwts_are_still_masked(self, keep_dotted_names):
+        header = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        three = f"{header}.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"
+        two = f"{header}.eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        for token in (three, two):
+            out = redact_secret_text(f"token {token} end", keep_dotted_names=keep_dotted_names)
+            assert "eyJ" not in out
+
+
+class TestUrlUserinfoKeepsAMaskedPassword:
+    def test_an_already_masked_password_is_left_alone(self):
+        assert redact_secret_text("could not use postgres://u:***@db/x") == (
+            "could not use postgres://u:***@db/x"
+        )
+
+    def test_a_raw_password_is_still_masked(self):
+        out = redact_secret_text("could not use postgres://u:hunter2pass@db/x")
+        assert "hunter2pass" not in out

@@ -10,7 +10,7 @@ import importlib
 import logging
 import os
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from fluid_build.cli.console import error as console_error
 
@@ -223,6 +223,27 @@ _GLOBAL_VALUE_OPTS = frozenset(
 )
 
 
+# The global options that take no value; with ``_GLOBAL_VALUE_OPTS`` this is every
+# long option ``build_parser`` declares, which lets an abbreviation be resolved.
+_GLOBAL_FLAG_OPTS = frozenset(
+    {"--no-color", "--version", "--profile", "--health-check", "--stats", "--safe-mode", "--debug"}
+)
+
+
+def _takes_separate_value(tok: str) -> bool:
+    """True when global option *tok* is followed by its value as the next token.
+
+    argparse accepts an unambiguous abbreviation (``--prov gcp``), so one is
+    resolved here too; reading it as a flag would take ``gcp`` for the command.
+    """
+    if "=" in tok or not tok.startswith("--"):
+        return False
+    if tok in _GLOBAL_VALUE_OPTS:
+        return True
+    matches = [o for o in _GLOBAL_VALUE_OPTS | _GLOBAL_FLAG_OPTS if o.startswith(tok)]
+    return len(matches) == 1 and matches[0] in _GLOBAL_VALUE_OPTS
+
+
 def _requested_command(argv: List[str]) -> Optional[str]:
     """Return the invoked subcommand name from *argv*, or ``None``.
 
@@ -237,7 +258,7 @@ def _requested_command(argv: List[str]) -> Optional[str]:
             return None
         if tok.startswith("-"):
             # Value-taking global option with a separate value → skip both.
-            i += 2 if (tok in _GLOBAL_VALUE_OPTS and "=" not in tok) else 1
+            i += 2 if _takes_separate_value(tok) else 1
             continue
         return tok
     return None
@@ -311,7 +332,9 @@ def _wrap_plugin_parser_funcs(parser: argparse.ArgumentParser) -> None:
                 _wrap_plugin_parser_funcs(sub)
 
 
-def _register_command_plugins(sp: argparse._SubParsersAction) -> None:
+def _register_command_plugins(
+    sp: argparse._SubParsersAction, argv: Optional[List[str]] = None
+) -> None:
     """Register external ``fluid_build.commands`` plugins LAZILY.
 
     A plugin's module + ``register()`` is imported only when its command is
@@ -331,7 +354,7 @@ def _register_command_plugins(sp: argparse._SubParsersAction) -> None:
         return
 
     core_names = set(sp.choices)
-    requested = _requested_command(sys.argv[1:])
+    requested = _requested_command(sys.argv[1:] if argv is None else argv)
     # Import the real subparsers ONLY when a non-core command is being invoked
     # (i.e. plausibly a plugin command). ``--help`` / a core command / no
     # command all keep the cold path free of plugin imports.
@@ -351,156 +374,414 @@ def _register_command_plugins(sp: argparse._SubParsersAction) -> None:
             _wrap_plugin_parser_funcs(sp.choices[name])
 
 
-def register_core_commands(sp: argparse._SubParsersAction) -> None:
-    # --- Core commands (with inline fallbacks for backwards compat) ---
+# ────────────────────────────────────────────────────────────────────
+# Lazy CORE commands
+# ────────────────────────────────────────────────────────────────────
+# ``fluid --help`` and every ``fluid <cmd>`` used to import EVERY command
+# module (~800 modules, pydantic, rich, yaml, the IaC plugins, ...) just to
+# build a parser whose subcommand it then mostly ignored. The core commands
+# now follow the same recipe as the plugin commands above -- Click's
+# ``LazyGroup`` ("Complex Applications" docs): the command NAMES and their
+# one-line help come from a static table, and a command's module is imported
+# only when it is the one invoked.
+#
+# argparse has no lazy ``get_command`` hook, so ``register_core_commands`` takes
+# the argv being parsed: every command gets a cheap stub subparser (name +
+# aliases + help, which is all ``fluid --help`` and the "invalid choice" error
+# print), and only the command ``_requested_command`` finds in argv gets its
+# real ``register()``. With ``argv=None`` the FULL eager tree is built
+# (``describe``, the docs drift gate and the tests enumerate it).
+#
+# Click's docs warn that lazy loading hides import bugs: a command whose module
+# fails to import is invisible until someone runs it. Two guards answer that:
+# ``tests/cli/test_lazy_core_commands.py`` runs ``<cmd> --help`` for every
+# command, and compares this table with the tree the eager path builds, so it
+# cannot drift from the real registrations.
 
-    # 🚀 FLUID Init - Universal Onboarding
-    _try_register(sp, "init", "init")
 
-    # 🚀 FLUID Demo - zero-setup working example (customer-360)
-    _try_register(sp, "demo", "demo")
+class CoreCommand(NamedTuple):
+    """One ``cli/<module>.py`` and the subcommands its ``register()`` adds."""
 
-    # 📋 FLUID Status - one-page summary of the current product (slice UX-A)
-    _try_register(sp, "status", "status")
+    module: str
+    profile: str  # build-profile gate name (see ``is_command_enabled``)
+    commands: Tuple[Tuple[str, Any, Tuple[str, ...]], ...]  # (name, help, aliases)
+    method: str = "register"
+    # Set when a failed import is answered with a stand-in instead of silence:
+    # "validate" = the minimal validator; any other text = ``_register_unavailable``.
+    fallback: Optional[str] = None
 
-    # 📥 FLUID Import - migrate dbt/Terraform/SQL projects to FLUID
-    _try_register(sp, "import_cmd", "import")
 
-    # 🎯 Industry Skills
-    _try_register(sp, "skills_cmd", "skills")
+def _cmd(name: str, help_text: Any, *aliases: str) -> Tuple[str, Any, Tuple[str, ...]]:
+    return (name, help_text, tuple(aliases))
 
-    # 🔌 Plugins — inspect installed plugins by role + allow/block status
-    _try_register(sp, "plugins_cmd", "plugins")
 
-    # 📤 Exporters — list the spec exporters (odps/odcs) — the discoverable home
-    # for spec-export classes that are intentionally NOT in the provider registry
-    _try_register(sp, "exporters_cmd", "exporters")
+# Order is the order ``fluid --help`` lists the commands in.
+CORE_COMMANDS: Tuple[CoreCommand, ...] = (
+    CoreCommand("init", "init", (_cmd("init", "🚀 Create new FLUID project (smart setup)"),)),
+    CoreCommand(
+        "demo",
+        "demo",
+        (_cmd("demo", "🚀 Try FLUID in ~30s — zero setup, no API key, local DuckDB"),),
+    ),
+    CoreCommand(
+        "status", "status", (_cmd("status", "📋 One-page summary of the current FLUID product"),)
+    ),
+    CoreCommand(
+        "import_cmd",
+        "import",
+        (
+            _cmd(
+                "import",
+                "📥 Import an existing project into FLUID (dbt/Terraform/SQL or Meltano/Airbyte/dlt/Singer)",
+            ),
+        ),
+    ),
+    CoreCommand(
+        "skills_cmd",
+        "skills",
+        (_cmd("skills", "Manage industry skills for agentic project knowledge"),),
+    ),
+    CoreCommand(
+        "plugins_cmd",
+        "plugins",
+        (_cmd("plugins", "List installed FLUID plugins by role and their allow/block status"),),
+    ),
+    CoreCommand(
+        "exporters_cmd",
+        "exporters",
+        (_cmd("exporters", "List spec exporters (contract → ODPS / ODCS standards)"),),
+    ),
+    CoreCommand(
+        "validate",
+        "validate",
+        (_cmd("validate", "Validate a FLUID contract against official schemas"),),
+        fallback="validate",
+    ),
+    CoreCommand(
+        "plan",
+        "plan",
+        (_cmd("plan", "Generate execution plan from FLUID contract"),),
+        fallback="Create an execution plan for a contract",
+    ),
+    CoreCommand(
+        "ship",
+        "ship",
+        (_cmd("ship", "Run validate → bundle → plan → apply in sequence (the happy path)"),),
+    ),
+    CoreCommand(
+        "apply",
+        "apply",
+        (_cmd("apply", "Apply a plan or contract against providers with full orchestration"),),
+        fallback="Apply a contract",
+    ),
+    CoreCommand(
+        "viz_graph",
+        "graph",
+        (
+            _cmd(
+                "viz-graph", "Generate beautiful, interactive data product lineage and build graphs"
+            ),
+        ),
+        fallback="Render the contract as a graph",
+    ),
+    CoreCommand(
+        "verify", "verify", (_cmd("verify", "Verify deployed resources match contract schema"),)
+    ),
+    CoreCommand("viz_plan", "viz-plan", (_cmd("viz-plan", argparse.SUPPRESS),)),
+    CoreCommand(
+        "contract_tests",
+        "contract-tests",
+        (_cmd("contract-tests", "Check a contract's exposed schemas against a saved baseline"),),
+    ),
+    CoreCommand(
+        "contract_validation",
+        "contract-validation",
+        (
+            _cmd(
+                "contract-validation", "Validate contract compliance with actual deployed resources"
+            ),
+        ),
+    ),
+    CoreCommand(
+        "test",
+        "test",
+        (_cmd("test", "Test a FLUID contract against live data (schema, quality, SLAs)"),),
+    ),
+    CoreCommand(
+        "scaffold_ci", "scaffold-ci", (_cmd("scaffold-ci", "Generate CI pipeline (GitLab/GitHub)"),)
+    ),
+    CoreCommand(
+        "scaffold_ide",
+        "scaffold-ide",
+        (
+            _cmd(
+                "scaffold-ide",
+                "Generate agentic-IDE config (.kiro/, .cursor/rules/, .claude/, .clinerules/, or generic AGENTS.md + mcp.json) so any agentic IDE can drive forge-cli.",
+            ),
+        ),
+    ),
+    CoreCommand(
+        "scaffold_composer",
+        "scaffold-composer",
+        (_cmd("scaffold-composer", "Generate Cloud Composer DAG from contract"),),
+    ),
+    CoreCommand(
+        "generate_airflow",
+        "generate-airflow",
+        (_cmd("generate-airflow", "Generate Airflow DAG from FLUID contract (0.7.0+)"),),
+    ),
+    CoreCommand(
+        "generate", "generate", (_cmd("generate", "Generate artifacts from FLUID contract"),)
+    ),
+    CoreCommand(
+        "export",
+        "export",
+        (_cmd("export", "Export FLUID contract as orchestration code (DAG/pipeline/flow)"),),
+    ),
+    CoreCommand(
+        "docs_build",
+        "docs",
+        (_cmd("docs", "Generate a static catalog of contracts (index + per-contract pages)"),),
+    ),
+    CoreCommand(
+        "doctor",
+        "doctor",
+        (_cmd("doctor", "Run built-in health checks and optional extended diagnostics"),),
+    ),
+    CoreCommand("provider_cmds", "providers", (_cmd("providers", "List discoverable providers"),)),
+    CoreCommand(
+        "provider_init",
+        "provider-init",
+        (_cmd("provider-init", "Scaffold a new FLUID provider package"),),
+    ),
+    CoreCommand(
+        "version_cmd", "version", (_cmd("version", "Show version and system information"),)
+    ),
+    CoreCommand("roadmap_cmd", "roadmap", (_cmd("roadmap", "Show the staged forge roadmap"),)),
+    CoreCommand(
+        "memory_cmd", "memory", (_cmd("memory", "Inspect and manage staged memory/cache state"),)
+    ),
+    CoreCommand("mcp", "mcp", (_cmd("mcp", "Serve staged forge tools over MCP stdio"),)),
+    CoreCommand(
+        "export_opds",
+        "export-opds",
+        (
+            _cmd(
+                "export-opds",
+                "[deprecated alias] Export FLUID → LF/ODPI ODPS v4.1 JSON. Prefer `fluid generate standard --format odps-v4.1`.",
+            ),
+        ),
+    ),
+    CoreCommand(
+        "opds",
+        "opds",
+        (
+            _cmd(
+                "odps",
+                "Bitol ODPS v1.0.0 (default) or ODPS v4.1 (LF/ODPI) — export, import, validate",
+                "opds",
+            ),
+        ),
+    ),
+    CoreCommand(
+        "odps_standard",
+        "odps-standard",
+        (_cmd("odps-bitol", "ODPS-Bitol (Bitol.io Data Product Standard for Entropy Data)"),),
+    ),
+    CoreCommand(
+        "odcs", "odcs", (_cmd("odcs", "ODCS (Open Data Contract Standard - Bitol.io) commands"),)
+    ),
+    CoreCommand(
+        "datamesh_manager",
+        "datamesh-manager",
+        (_cmd("datamesh-manager", "Publish to Entropy Data / Data Mesh Manager", "dmm"),),
+        method="add_parser",
+    ),
+    CoreCommand("ai_setup", "ai", (_cmd("ai", "Configure AI / LLM settings for Forge Copilot"),)),
+    CoreCommand("forge", "forge", (_cmd("forge", "🔨 Create a new data product with AI Copilot"),)),
+    CoreCommand("contract", "contract", (_cmd("contract", "Inspect / mutate FLUID contracts"),)),
+    CoreCommand(
+        "runs", "runs", (_cmd("runs", "Inspect acquisition run history (status / logs / diff)"),)
+    ),
+    CoreCommand(
+        "retention", "retention", (_cmd("retention", "Retention sweep over the state directory"),)
+    ),
+    CoreCommand(
+        "secrets",
+        "secrets",
+        (_cmd("secrets", "🔐 Manage acquisition-pipeline secrets (login / verify / rotate)"),),
+    ),
+    CoreCommand(
+        "market",
+        "market",
+        (_cmd("market", "Discover data products from enterprise catalogs and marketplaces"),),
+    ),
+    CoreCommand(
+        "policy",
+        "policy",
+        (
+            _cmd(
+                "policy",
+                "Policy operations: check · compile · apply  (pipeline stage 8 + static lint)",
+            ),
+        ),
+    ),
+    CoreCommand(
+        "policy_check",
+        "policy-check",
+        (_cmd("policy-check", "Validate contract against schema-driven policies"),),
+    ),
+    CoreCommand(
+        "policy_compile",
+        "policy-compile",
+        (_cmd("policy-compile", "Compile accessPolicy → provider IAM bindings"),),
+    ),
+    CoreCommand(
+        "policy_apply", "policy-apply", (_cmd("policy-apply", "Apply compiled IAM bindings"),)
+    ),
+    CoreCommand(
+        "product_new", "product-new", (_cmd("product-new", "Bootstrap a new product skeleton"),)
+    ),
+    CoreCommand("auth", "auth", (_cmd("auth", "Provider authentication management"),)),
+    CoreCommand("marketplace", "marketplace", (_cmd("marketplace", argparse.SUPPRESS),)),
+    CoreCommand(
+        "publish", "publish", (_cmd("publish", "Publish data products to enterprise catalogs"),)
+    ),
+    CoreCommand(
+        "bundle",
+        "bundle",
+        (_cmd("bundle", "Resolve $ref pointers and emit a single bundled contract"),),
+    ),
+    CoreCommand(
+        "validate_artifacts",
+        "validate-artifacts",
+        (
+            _cmd(
+                "validate-artifacts", "Re-verify MANIFEST + per-format validators on stage-3 output"
+            ),
+        ),
+    ),
+    CoreCommand(
+        "schedule_sync",
+        "schedule-sync",
+        (_cmd("schedule-sync", "Push DAG files to a scheduler (pipeline stage 11, Path A)"),),
+    ),
+    CoreCommand(
+        "verify_signature",
+        "verify-signature",
+        (_cmd("verify-signature", "Verify a Sigstore-cosign-signed tgz bundle"),),
+    ),
+    CoreCommand(
+        "rollback",
+        "rollback",
+        (_cmd("rollback", "Restore a data product from a prior apply --mode replace snapshot"),),
+    ),
+    CoreCommand(
+        "split",
+        "split",
+        (_cmd("split", "Split a flat contract into composable fragments with $ref pointers"),),
+    ),
+    CoreCommand(
+        "diff",
+        "diff",
+        (_cmd("diff", "Compare contract-vs-live (drift) or contract-vs-contract (version)"),),
+    ),
+    CoreCommand("context", "config", (_cmd("config", "Get/Set default provider/project/region"),)),
+    CoreCommand(
+        "product_add",
+        "product-add",
+        (_cmd("product-add", "Add a source/exposure/dq rule to an existing contract"),),
+    ),
+    CoreCommand(
+        "pipeline_generator",
+        "generate-pipeline",
+        (_cmd("generate-pipeline", "🚀 Generate CI/CD pipeline templates for FLUID projects"),),
+    ),
+    CoreCommand(
+        "ide", "ide", (_cmd("ide", "💻 IDE integration and developer experience features"),)
+    ),
+    CoreCommand(
+        "workspace",
+        "workspace",
+        (_cmd("workspace", "🤝 Team workspace and collaboration features"),),
+    ),
+    CoreCommand(
+        "stats", "stats", (_cmd("stats", "Aggregate cost / token usage across forge runs"),)
+    ),
+    CoreCommand(
+        "agents_cmd", "agents", (_cmd("agents", "Manage forge agent runs (list / show / prune)"),)
+    ),
+    CoreCommand(
+        "mission",
+        "mission",
+        (_cmd("mission", "Mission specs: trust pinning + zero-LLM success-criteria scorecards"),),
+    ),
+    CoreCommand(
+        "describe_cmd", "describe", (_cmd("describe", "Describe this forge-cli installation"),)
+    ),
+)
 
-    # validate (enhanced → fallback)
-    if is_command_enabled("validate"):
-        try:
-            from . import validate
 
-            validate.register(sp)
-        except ImportError as e:
+def _core_command_names(entry: CoreCommand) -> List[str]:
+    return [n for name, _h, aliases in entry.commands for n in (name, *aliases)]
+
+
+def _register_stubs(sp: argparse._SubParsersAction, entry: CoreCommand) -> None:
+    """Register name + aliases + help only, with no import of ``entry.module``.
+
+    A stub is never meant to run: ``_requested_command`` hands the invoked
+    command its real parser. Should one be reached anyway (a global-option
+    spelling the argv peek cannot read), it accepts any arguments, marks the
+    namespace ``_lazy_stub`` and ``cli.main`` re-parses with the real parser.
+    """
+    for name, help_text, aliases in entry.commands:
+        p = sp.add_parser(
+            name,
+            help=help_text,
+            aliases=list(aliases),
+            add_help=False,
+            prefix_chars="\x01",
+        )
+        p.add_argument("argv", nargs="*")
+        p.set_defaults(_lazy_stub=True)
+
+
+def _register_entry(sp: argparse._SubParsersAction, entry: CoreCommand) -> None:
+    """Import ``entry.module`` and run its ``register()`` (the eager path)."""
+    if not is_command_enabled(entry.profile):
+        return
+    if entry.fallback is None:
+        _try_register(sp, entry.module, entry.profile, method=entry.method)
+        return
+    try:
+        mod = importlib.import_module(f".{entry.module}", __package__)
+        getattr(mod, entry.method)(sp)
+    except ImportError as e:
+        if entry.fallback == "validate":
             LOG.debug("enhanced_validate_unavailable_using_fallback: %s", e)
             v = sp.add_parser("validate", help="Validate a FLUID contract")
             v.add_argument("contract")
             v.add_argument("--env")
             v.set_defaults(func=cmd_validate_run)
+        else:
+            LOG.warning("%s_module_unavailable: %s", entry.module, e)
+            _register_unavailable(sp, entry.commands[0][0], entry.fallback, entry.module, e)
 
-    # plan (a stub that reports the import error when the module is broken)
-    if is_command_enabled("plan"):
-        try:
-            from . import plan
 
-            plan.register(sp)
-        except ImportError as e:
-            LOG.warning("plan_module_unavailable: %s", e)
-            _register_unavailable(sp, "plan", "Create an execution plan for a contract", "plan", e)
+def register_core_commands(
+    sp: argparse._SubParsersAction, argv: Optional[List[str]] = None
+) -> None:
+    """Register the core commands, then the (lazy) command plugins.
 
-    # ship (UX hardening — validate → bundle → plan → apply macro)
-    _try_register(sp, "ship", "ship")
-
-    # apply (a stub that reports the import error when the module is broken)
-    if is_command_enabled("apply"):
-        try:
-            from . import apply
-
-            apply.register(sp)
-        except ImportError as e:
-            LOG.warning("apply_module_unavailable: %s", e)
-            _register_unavailable(sp, "apply", "Apply a contract", "apply", e)
-
-    # viz-graph (a stub that reports the import error when the module is broken)
-    if is_command_enabled("graph"):
-        try:
-            from . import viz_graph
-
-            viz_graph.register(sp)
-        except ImportError as e:
-            LOG.warning("viz_graph_module_unavailable: %s", e)
-            _register_unavailable(sp, "viz-graph", "Render the contract as a graph", "viz_graph", e)
-
-    # --- Simple registrations (profile-gated via _try_register) ---
-    # ``fluid execute`` was deleted when build_runners landed. Its engine code
-    # moved to ``fluid_build.build_runners``; ``fluid apply --build <id>`` is
-    # the canonical entry point.
-    _try_register(sp, "verify", "verify")
-    _try_register(sp, "viz_plan", "viz-plan")
-    _try_register(sp, "contract_tests", "contract-tests")
-    _try_register(sp, "contract_validation", "contract-validation")
-    _try_register(sp, "test", "test")
-    _try_register(sp, "scaffold_ci", "scaffold-ci")
-    _try_register(sp, "scaffold_ide", "scaffold-ide")
-    _try_register(sp, "scaffold_composer", "scaffold-composer")
-    _try_register(sp, "generate_airflow", "generate-airflow")
-    _try_register(sp, "generate", "generate")
-    _try_register(sp, "export", "export")
-    _try_register(sp, "docs_build", "docs")
-    _try_register(sp, "doctor", "doctor")
-    _try_register(sp, "provider_cmds", "providers")
-    _try_register(sp, "provider_init", "provider-init")
-    _try_register(sp, "version_cmd", "version")
-    _try_register(sp, "roadmap_cmd", "roadmap")
-    _try_register(sp, "memory_cmd", "memory")
-    _try_register(sp, "mcp", "mcp")
-    _try_register(sp, "export_opds", "export-opds")
-    _try_register(sp, "opds", "opds")
-    _try_register(sp, "odps_standard", "odps-standard")
-    _try_register(sp, "odcs", "odcs")
-    _try_register(sp, "datamesh_manager", "datamesh-manager", method="add_parser")
-    _try_register(sp, "ai_setup", "ai")
-    _try_register(sp, "forge", "forge")
-    _try_register(sp, "contract", "contract")
-    # Day-2 ops surface for source-aligned acquisition contracts.
-    # `fluid runs {status,logs,diff}` for run-record introspection;
-    # `fluid retention sweep` for state-root cleanup. Kept under their own
-    # umbrellas so the existing top-level `status` / `doctor` / `auth`
-    # commands aren't shadowed.
-    _try_register(sp, "runs", "runs")
-    _try_register(sp, "retention", "retention")
-    _try_register(sp, "secrets", "secrets")
-    _try_register(sp, "market", "market")
-    # ``fluid policy {check,compile,apply}`` — unified umbrella that
-    # groups the three policy verbs under one subcommand. The legacy
-    # hyphenated top-level forms below remain registered for
-    # backward-compat (one-release deprecation window); both surfaces
-    # share the same ``_add_arguments`` helpers in the underlying
-    # policy_* modules, so options stay in sync automatically.
-    _try_register(sp, "policy", "policy")
-    _try_register(sp, "policy_check", "policy-check")
-    _try_register(sp, "policy_compile", "policy-compile")
-    _try_register(sp, "policy_apply", "policy-apply")
-    _try_register(sp, "product_new", "product-new")
-    _try_register(sp, "auth", "auth")
-    _try_register(sp, "marketplace", "marketplace")  # deprecated — use market --blueprints
-    _try_register(sp, "publish", "publish")
-    _try_register(sp, "bundle", "bundle")
-    _try_register(sp, "validate_artifacts", "validate-artifacts")
-    _try_register(sp, "schedule_sync", "schedule-sync")
-    _try_register(sp, "verify_signature", "verify-signature")
-    _try_register(sp, "rollback", "rollback")
-    # The hidden ``fluid compile`` alias was removed when the 11-stage
-    # pipeline landed. Users running ``fluid compile`` now get the standard
-    # argparse "invalid choice" error, which is the desired signal.
-    _try_register(sp, "split", "split")
-    _try_register(sp, "diff", "diff")
-    _try_register(sp, "context", "config")  # canonical: ``fluid config``
-    _try_register(sp, "product_add", "product-add")
-    _try_register(sp, "pipeline_generator", "generate-pipeline")
-    # copilot removed — AI is built into forge
-    _try_register(sp, "ide", "ide")
-    _try_register(sp, "workspace", "workspace")
-    _try_register(sp, "stats", "stats")
-    # ``fluid agents`` — manage forge agent runs (list / show / prune).
-    # New in the resumability landing; mirrors ``stats`` registration.
-    _try_register(sp, "agents_cmd", "agents")
-    # ``fluid mission`` — mission specs: trust pinning + zero-LLM
-    # success-criteria scorecards (deep-agents PR 1; the autonomous
-    # runner lands in PR 2). See RFC-deep-agents.md.
-    _try_register(sp, "mission", "mission")
-    _try_register(sp, "describe_cmd", "describe")
+    ``argv=None`` registers every command for real. With an argv, only the
+    invoked command is real and the rest are stubs (see the block comment above).
+    """
+    requested = _requested_command(argv) if argv is not None else None
+    for entry in CORE_COMMANDS:
+        if argv is None or requested in _core_command_names(entry):
+            _register_entry(sp, entry)
+        elif is_command_enabled(entry.profile):
+            _register_stubs(sp, entry)
 
     # ────────────────────────────────────────────────────────────────────
     # External CLI plugins — discovered via Python entry-points, loaded LAZILY.
@@ -519,4 +800,4 @@ def register_core_commands(sp: argparse._SubParsersAction) -> None:
     # ``_register_command_plugins``. Governance, fail-isolation, and type-only
     # logging are preserved there.
     # ────────────────────────────────────────────────────────────────────
-    _register_command_plugins(sp)
+    _register_command_plugins(sp, argv)

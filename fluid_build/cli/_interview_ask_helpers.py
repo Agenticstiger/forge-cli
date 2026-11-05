@@ -87,8 +87,10 @@ def __getattr__(name: str) -> Any:
 
     RETEST-1 surfaced `NameError: _DATA_VAULT_2_ALIASES` at line 971;
     same family as the earlier `normalize_interview_value` miss. This
-    shim catches every host-defined constant in one pass so future
-    extracted references don't surface as a third NameError later.
+    shim serves ``_interview_ask_helpers.<NAME>`` attribute access only
+    (PEP 562); a function in this module that reads one of these names
+    must go through the host module, as ``_ask_data_modeling_technique``
+    does. ``tests/cli/test_module_getattr_globals.py`` enforces that.
     """
     if name.startswith("_") and name.endswith("_ALIASES"):
         from fluid_build.cli import forge_copilot_interview as _host_module
@@ -976,6 +978,11 @@ def _ask_data_modeling_technique(
     if not console:
         return
 
+    # The alias tables live in the host module. Read them through it: the
+    # module-level ``__getattr__`` below serves ``module.NAME`` only, never a bare
+    # name inside a function, which raised NameError here.
+    from fluid_build.cli import forge_copilot_interview as _host_module
+
     default_value = _suggest_modeling_default(state)
     default_label = "reporting" if default_value == "dimensional" else "history"
 
@@ -983,12 +990,12 @@ def _ask_data_modeling_technique(
         {
             "label": "History / audit model",
             "value": "data_vault_2",
-            "aliases": list(_DATA_VAULT_2_ALIASES),
+            "aliases": list(_host_module._DATA_VAULT_2_ALIASES),
         },
         {
             "label": "Reporting / star model",
             "value": "dimensional",
-            "aliases": list(_DIMENSIONAL_ALIASES),
+            "aliases": list(_host_module._DIMENSIONAL_ALIASES),
         },
     ]
     match = ask_flexible_choice(

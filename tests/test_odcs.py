@@ -602,7 +602,7 @@ def test_odcs_validate_reports_an_unreadable_file_as_a_failure(
     args = argparse.Namespace(
         odcs_file=str(contract), report=str(report), roundtrip=False, vowl=False
     )
-    with patch("fluid_build.cli.odcs.cprint") as printed:
+    with patch("fluid_build.cli.odcs.cprint_literal") as printed:
         assert _run_odcs_validate(args) == 1
     assert any(reason in c.args[0] for c in printed.call_args_list)
     # A CI gate reading --report gets the failure too, not a missing file.

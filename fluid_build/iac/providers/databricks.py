@@ -67,7 +67,9 @@ resources, with no new schema field (fluid-schema 0.7.6):
   is ``deprecated`` when the expose's ``lifecycle.state`` (else the product's) is
   ``deprecated``, else ``certified`` when the label ``certification: certified`` (the
   expose's, else the product's) says so; that label is then no plain tag, and any other
-  value of it is ``databricks-certification-invalid``. The deploy identity needs ASSIGN on
+  value of it is ``databricks-certification-invalid``. A product-level label certifies every
+  table of the product (intended); an expose-level one only that expose's table. The deploy
+  identity needs ASSIGN on
   the governed tag, which the plan says (:meth:`DatabricksIacPlugin.plan_notices`).
 * ``policy.authz.columnRestrictions`` and ``policy.authz.rowFilters`` are enforced by Unity
   Catalog: SQL functions bound on the table, with the semantics GCP and AWS give them
@@ -1654,8 +1656,9 @@ def _certification(
     ``lifecycle.state`` (else the product's) says so, else ``certified`` when the label
     :data:`CERTIFICATION_LABEL` (the expose's, else the product's) says so.
 
-    A deprecated product is never shown as certified, whatever its label. Any other label
-    value is refused: Unity Catalog's tag takes only those two values.
+    A product-level label certifies every expose's table, as intended; an expose-level one
+    only its own. A deprecated product is never shown as certified, whatever its label. Any
+    other label value is refused: Unity Catalog's tag takes only those two values.
     """
     state = _text(_lookup(table.exposure, "lifecycle.state")) or _text(
         _lookup(contract, "lifecycle.state")

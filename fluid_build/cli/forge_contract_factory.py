@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional
 
 import yaml
 
+from fluid_build._console import literal_error_text
 from fluid_build.cli.artifact_paths import CONTRACT_FILENAME
 from fluid_build.schema_manager import FluidSchemaManager
 
@@ -263,7 +264,9 @@ def create_and_validate_contract(
         except Exception:  # noqa: BLE001 — defensive; never let errors printer crash
             if console:
                 try:
-                    console.print(f"[red]Generated contract is invalid: {error}[/red]")
+                    console.print(
+                        literal_error_text(f"Generated contract is invalid: {error}", "red")
+                    )
                 except Exception:  # noqa: BLE001
                     pass
         return None

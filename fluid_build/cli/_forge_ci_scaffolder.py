@@ -23,6 +23,8 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from fluid_build._console import literal_error_text
+
 # Choices + alias map. These are the source of truth — the host
 # module re-exports them under the same names so existing imports
 # keep resolving.
@@ -277,7 +279,9 @@ def scaffold_ci_pipeline(
     except ImportError as exc:
         if console:
             try:
-                console.print(f"[yellow]Could not load pipeline generator: {exc}[/yellow]")
+                console.print(
+                    literal_error_text(f"Could not load pipeline generator: {exc}", "yellow")
+                )
             except Exception:  # noqa: BLE001
                 pass
         return (None, None)
@@ -288,7 +292,7 @@ def scaffold_ci_pipeline(
     except Exception as exc:  # noqa: BLE001
         if console:
             try:
-                console.print(f"[yellow]CI generation failed: {exc}[/yellow]")
+                console.print(literal_error_text(f"CI generation failed: {exc}", "yellow"))
             except Exception:  # noqa: BLE001
                 pass
         return (None, None)
@@ -307,7 +311,7 @@ def scaffold_ci_pipeline(
         drift = None
         if console:
             try:
-                console.print(f"[dim]ci-state drift check skipped: {exc}[/dim]")
+                console.print(literal_error_text(f"ci-state drift check skipped: {exc}", "dim"))
             except Exception:  # noqa: BLE001
                 pass
 
@@ -373,7 +377,7 @@ def scaffold_ci_pipeline(
     except OSError as exc:
         if console:
             try:
-                console.print(f"[yellow]Could not write CI files: {exc}[/yellow]")
+                console.print(literal_error_text(f"Could not write CI files: {exc}", "yellow"))
             except Exception:  # noqa: BLE001
                 pass
         return (None, None)
@@ -410,7 +414,7 @@ def scaffold_ci_pipeline(
         except Exception as exc:  # noqa: BLE001 — ci-state write is best-effort
             if console:
                 try:
-                    console.print(f"[dim]ci-state not written: {exc}[/dim]")
+                    console.print(literal_error_text(f"ci-state not written: {exc}", "dim"))
                 except Exception:  # noqa: BLE001
                     pass
 

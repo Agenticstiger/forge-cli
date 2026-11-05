@@ -22,7 +22,7 @@ import json
 import logging
 import sys
 
-from fluid_build.cli.console import cprint, cprint_json, success
+from fluid_build.cli.console import cprint, cprint_json, cprint_literal, success
 from fluid_build.cli.console import error as console_error
 
 try:
@@ -492,7 +492,7 @@ def _print_publish_result(result):
             if odcs.get("validation_error"):
                 cprint(f"   Validation: {odcs['validation_error']}")
             if not odcs.get("success") and odcs.get("error"):
-                cprint(f"   Error: {odcs['error']}")
+                cprint_literal(f"   Error: {odcs['error']}")
 
 
 def _cmd_list(args, logger=None):

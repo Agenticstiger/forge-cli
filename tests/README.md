@@ -23,8 +23,6 @@ tests/
 │   ├── test_forge.py          # Code generation
 │   ├── test_doctor.py         # System diagnostics
 │   └── ... (20+ more)
-├── runtimes/                   # Runtime integration tests
-│   └── test_dataform_gcp.py   # Dataform runtime ⭐ NEW
 └── individual/                 # Individual test modules
     └── ... (legacy tests)
 ```
@@ -107,20 +105,6 @@ test creates and drops a temporary schema inside that database.
 - `test_add_exposure_to_contract()` - Exposure addition
 - `test_deduplication_on_add()` - Duplicate handling
 - `test_get_section_key()` - Section mapping
-
-### ✅ Dataform Runtime Tests (`tests/runtimes/test_dataform_gcp.py`)
-- Google Cloud Dataform API integration
-- Compilation with git references
-- Polling for completion
-- Error handling
-- Stub implementation
-- Timeout handling
-
-**Key Tests:**
-- `test_stub_implementation_without_library()` - Graceful degradation
-- `test_dataform_with_mock_api()` - API mocking
-- `test_dataform_compilation_errors()` - Error reporting
-- `test_wait_for_compilation()` - Polling logic
 
 ### ✅ Error Framework Tests (`tests/test_error_framework.py`)
 - Error codes (E001-E999)

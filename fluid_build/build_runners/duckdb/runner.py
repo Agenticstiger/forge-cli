@@ -1889,7 +1889,8 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
 
     # Databricks: the file is on local disk now; upload it and load the table. After the
     # late-arrival split, so the rows loaded are the rows that stayed. A failed or short load
-    # fails the stream, and so the run and the apply. The staged files are deleted either way.
+    # fails the stream, and so the run and the apply. The staged files are deleted either way:
+    # the volume's by the landing, the local copy here (masked, but still the product's data).
     databricks_load: Dict[str, Any] = {}
     if dbx_landing is not None and failures == 0 and stream_results:
         from ...iac.providers.databricks_enforce import scrub as _scrub_dbx
@@ -1898,6 +1899,7 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
             if sr.state is not RunState.SUCCEEDED:
                 continue
             staged = _resolve_destination_path(ctx, sr.name, sink_format, out_dir)
+            error: Optional[str] = None
             try:
                 databricks_load = dbx_landing.load(
                     staged,
@@ -1908,12 +1910,19 @@ def _execute(ctx: RunContext, runner: DuckdbRunner) -> RunResult:
                     logger=LOG,
                 )
             except Exception as exc:  # noqa: BLE001
+                error = f"databricks load: {type(exc).__name__}: {_scrub_dbx(exc)}"
+            finally:
+                # Ctrl-C included: the local copy goes before the interrupt propagates.
+                left = _delete_local_staging(staged)
+            if databricks_load:
+                databricks_load["local_staging_deleted"] = left is None
+            if left is not None:
+                error = (f"{error}; " if error else "databricks load: ") + left
+            elif error is not None:
+                error += " (the local staged copy was deleted)"
+            if error is not None:
                 failures += 1
-                stream_results[i] = dataclasses.replace(
-                    sr,
-                    state=RunState.FAILED,
-                    error=f"databricks load: {type(exc).__name__}: {_scrub_dbx(exc)}",
-                )
+                stream_results[i] = dataclasses.replace(sr, state=RunState.FAILED, error=error)
 
     # ``onError: fail`` mode — when ANY bad rows landed in the DLQ,
     # promote the run to FAILED so the run record reflects the issue.
@@ -2298,6 +2307,26 @@ def _databricks_staging_path(ctx: RunContext, stream: str, sink_format: str) -> 
     path = Path(ctx.workdir) / ".fluid" / "staging" / build / f"{name}.{ext}"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _delete_local_staging(path: str) -> Optional[str]:
+    """Delete a Databricks load's local staged file, and its build directory once empty;
+    ``None`` when the file is gone, else why it is not (naming the path first)."""
+    staged = Path(path)
+    try:
+        staged.unlink(missing_ok=True)
+    except OSError as exc:
+        return (
+            f"could not delete the local staged copy, which holds the landed data; delete it: "
+            f"{staged} ({type(exc).__name__}: {exc})"
+        )
+    try:
+        staged.parent.rmdir()  # only when empty: the BigQuery staging shares the directory
+    except OSError:
+        # Not empty (another file of the build is staged there) or already gone: an empty
+        # directory holds no data, so leaving it is harmless.
+        pass
+    return None
 
 
 def _path_part(value: Any) -> str:
