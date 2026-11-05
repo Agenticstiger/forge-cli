@@ -717,3 +717,171 @@ def test_sink_partition_by_is_read_as_sinkspec_reads_it():
     contract["builds"][0]["properties"]["sink"]["partitionBy"] = {f"${{env:{_SECRET}}}": 1}
     errors, _warnings = validate_iceberg_sink(contract)
     assert any("sink.partitionBy" in e for e in errors), errors
+
+
+# ── text the sink expands after the check ──────────────────────────────────
+#
+# Kafka Connect resolves a ``${provider:path:key}`` reference with the worker's
+# config providers and Debezium Server's SmallRye Config expands a ``${...}``
+# expression when the sink starts, and Iceberg's REST catalog replaces a value
+# that starts with ``env:`` by that variable. All of that happens after these
+# checks, so a destination built from such text cannot be checked, and with
+# ``sink.catalogAuth`` no other variable may ride to the paired catalog.
+
+_EXPANDING_URI = "https://10.0.0.5:${p}/catalog"
+
+
+def test_a_self_referencing_override_uri_cannot_move_the_catalog_host(monkeypatch):
+    """SmallRye expands ``${debezium.sink.iceberg.p}`` to ``443@evil.example``, so the
+    server calls ``https://10.0.0.5:443@evil.example/catalog``: userinfo
+    ``10.0.0.5:443`` and host ``evil.example``, which the operator never paired."""
+    _operator_allows(monkeypatch, pairs=[f"{_SECRET}@10.0.0.5"])
+    contract = _dbz_contract(
+        dict(_AUTHS["bearer"]),
+        location=_location("https://10.0.0.5/catalog"),
+        server_sink={
+            "type": "iceberg",
+            "iceberg_sink_enabled": True,
+            "config": {
+                "uri": "https://10.0.0.5:${debezium.sink.iceberg.p}/catalog",
+                "p": "443@evil.example",
+            },
+        },
+    )
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any(
+        "debezium.server.sink.config uri" in e and "after this check" in e for e in errors
+    ), errors
+    assert iceberg_sink_preflight(contract, "ingest") is not None
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://10.0.0.5:${file:/etc/catalog.properties:port}/catalog",
+        "https://10.0.0.5/${env:CATALOG_PATH}",
+        "env:CATALOG_URI",
+    ],
+)
+def test_an_override_uri_the_sink_expands_is_refused(uri, monkeypatch):
+    _operator_allows(monkeypatch, pairs=[f"{_SECRET}@10.0.0.5"])
+    contract = _kc_contract(
+        dict(_AUTHS["bearer"]),
+        location=_location("https://10.0.0.5/catalog"),
+        iceberg_catalog_overrides={"iceberg.catalog.uri": uri},
+    )
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any(
+        "iceberg_catalog_overrides iceberg.catalog.uri" in e and "after this check" in e
+        for e in errors
+    ), errors
+    assert all(uri not in e for e in errors), errors
+    assert iceberg_sink_preflight(contract, "ingest") is not None
+
+
+def test_an_expanding_uri_is_refused_before_anything_is_sent(engine, monkeypatch):
+    _operator_allows(monkeypatch, pairs=[f"{_SECRET}@10.0.0.5"])
+    location = _location("https://10.0.0.5/catalog")
+    if engine.name == "kafka-connect":
+        contract = engine.contract(
+            dict(_AUTHS["bearer"]),
+            location=location,
+            iceberg_catalog_overrides={"iceberg.catalog.uri": _EXPANDING_URI},
+        )
+    else:
+        server_sink = {"type": "iceberg", "iceberg_sink_enabled": True}
+        server_sink["config"] = {"uri": _EXPANDING_URI}
+        contract = engine.contract(
+            dict(_AUTHS["bearer"]), location=location, server_sink=server_sink
+        )
+    assert engine.run(contract) == 1
+    assert not engine.touched(contract)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["${env:AWS_SECRET_ACCESS_KEY}", "env:AWS_SECRET_ACCESS_KEY", "${file:/run/secrets/aws:key}"],
+)
+def test_a_catalog_override_may_not_reference_another_variable(value, monkeypatch):
+    _allow_everything(monkeypatch, "bearer")
+    contract = _kc_contract(
+        dict(_AUTHS["bearer"]),
+        iceberg_catalog_overrides={"iceberg.catalog.header.X-Leak": value},
+    )
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any(
+        "iceberg_catalog_overrides iceberg.catalog.header.X-Leak" in e for e in errors
+    ), errors
+    assert all(value not in e for e in errors), errors
+    assert iceberg_sink_preflight(contract, "ingest") is not None
+
+
+def test_a_debezium_sink_override_may_not_expand_a_variable(monkeypatch):
+    _allow_everything(monkeypatch, "bearer")
+    contract = _dbz_contract(
+        dict(_AUTHS["bearer"]),
+        server_sink={
+            "type": "iceberg",
+            "iceberg_sink_enabled": True,
+            "config": {"header.X-Leak": "${AWS_SECRET_ACCESS_KEY}"},
+        },
+    )
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert any("debezium.server.sink.config header.X-Leak" in e for e in errors), errors
+
+
+def test_a_kafka_level_override_keeps_its_config_provider(monkeypatch):
+    """Only what Iceberg reads is held to the rule: a consumer setting goes to Kafka."""
+    _allow_everything(monkeypatch, "bearer")
+    contract = _kc_contract(
+        dict(_AUTHS["bearer"]),
+        iceberg_sink_enabled=True,
+        sink_connector_config={"consumer.override.sasl.jaas.config": "${file:/run/kafka:jaas}"},
+    )
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert not any("consumer.override" in e for e in errors), errors
+
+
+def test_without_catalog_auth_an_override_is_unchanged():
+    contract = _kc_contract(
+        None, iceberg_catalog_overrides={"iceberg.catalog.header.X": "${file:/run/h:x}"}
+    )
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert not any("header.X" in e for e in errors), errors
+
+
+def test_the_control_topic_kafka_clients_keep_their_config_providers(monkeypatch):
+    """``iceberg.kafka.*`` configures the control topic's Kafka clients, not Iceberg."""
+    _allow_everything(monkeypatch, "bearer")
+    contract = _kc_contract(
+        dict(_AUTHS["bearer"]),
+        iceberg_sink_enabled=True,
+        sink_connector_config={"iceberg.kafka.sasl.jaas.config": "${file:/run/kafka:jaas}"},
+    )
+    errors, _warnings = validate_iceberg_sink(contract)
+    assert not any("iceberg.kafka" in e for e in errors), errors
+
+
+def test_a_storage_secret_reference_is_refused_without_asking_to_inline_it(monkeypatch):
+    _allow_everything(monkeypatch, "bearer")
+    contract = _kc_contract(
+        dict(_AUTHS["bearer"]),
+        iceberg_catalog_overrides={"iceberg.catalog.s3.secret-access-key": "${file:/run/s3:key}"},
+    )
+    errors, _warnings = validate_iceberg_sink(contract)
+    refused = [e for e in errors if "iceberg.catalog.s3.secret-access-key" in e]
+    assert refused and "credential chain" in refused[0], errors
+    assert "Write the value itself" not in refused[0]
+
+
+def test_a_control_character_in_an_override_value_is_refused_for_what_it_is(monkeypatch):
+    _allow_everything(monkeypatch, "bearer")
+    contract = _kc_contract(
+        dict(_AUTHS["bearer"]),
+        iceberg_catalog_overrides={"iceberg.catalog.header.X-Trace": "a\r\nX-Injected: 1"},
+    )
+    errors, _warnings = validate_iceberg_sink(contract)
+    refused = [e for e in errors if "iceberg.catalog.header.X-Trace" in e]
+    assert refused and "control character" in refused[0], errors
+    assert "another variable" not in refused[0]
+    assert "X-Injected" not in refused[0]
