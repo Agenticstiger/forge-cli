@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The interactive AI interview stopped at the data-modeling question, and `fluid ai test`
+  with no provider configured crashed.** Both printed a `NameError`
+  (`_DATA_VAULT_2_ALIASES`, `detect_ollama_available`). Each function read, as a bare name, a
+  value that only its module's `__getattr__` could supply, and Python never consults that hook
+  for a bare name. Both now read the value through the module that defines it. A test checks every
+  module with a module-level `__getattr__` for the same mistake. Both bugs date from 0.8.2a1 and
+  are in 0.27.0.
+
 - **`fluid publish` tells the Command Center where a local product's file is.** A relative
   `location.path` (`./out/party.parquet`) was reported as written, so the deployment's location
   named no file: the engine anchors that path at the contract's directory, not the reader's. The

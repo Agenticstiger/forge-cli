@@ -68,6 +68,17 @@ def _load_key_from_keyring(*args, **kwargs):
     return _host()._load_key_from_keyring(*args, **kwargs)
 
 
+# ``_resolve_ai_test_config`` reads these two as bare names; the module-level
+# ``__getattr__`` below cannot supply a bare name, so `fluid ai test` with no
+# provider configured failed with NameError.
+def detect_ollama_available(*args, **kwargs):
+    return _host().detect_ollama_available(*args, **kwargs)
+
+
+def _sanitize_ollama_host(*args, **kwargs):
+    return _host()._sanitize_ollama_host(*args, **kwargs)
+
+
 def _resolve_cloud_api_key(*args, **kwargs):
     return _host()._resolve_cloud_api_key(*args, **kwargs)
 
