@@ -13,9 +13,9 @@
 # limitations under the License.
 
 """``fluid publish`` to the Command Center: visibility, ``--env``, the contract
-version record, and ``--dry-run``.
+version record, ``--dry-run``, and a local deployment's location.
 
-Four things were wrong, measured against a Postgres-sourced subscriptions
+Five things were wrong, measured against a Postgres-sourced subscriptions
 product classified ``confidential``:
 
 1. every product was sent ``is_public: true``, because visibility was read from
@@ -26,7 +26,9 @@ product classified ``confidential``:
 3. no contract version was recorded: ``POST /api/v1/contracts/sync`` (which
    stores the version and its git provenance) was never called;
 4. ``--dry-run`` printed ``{"dry_run": true, "valid": true}`` and nothing about
-   what would be sent.
+   what would be sent;
+5. its ``./out/customer_subscriptions.parquet`` was reported as the deployment's
+   location, a path that names no file without the contract's directory.
 
 The tests run the real provider and CLI against a loopback server that keeps
 state the way the Command Center does (``fluid_cc_backend/app/api/v1/assets.py``
@@ -919,6 +921,253 @@ class TestWorkspaceHost:
         monkeypatch.delenv("DATABRICKS_HOST")
         metadata = self._metadata(cc, "databricks", {"table": "t", "host": "https://evil.example"})
         assert "workspace_host" not in metadata
+
+
+# ---------------------------------------------------------------------------
+# 5. A local deployment's location is the file the engine writes
+# ---------------------------------------------------------------------------
+
+
+EMBEDDED_SQL = [{"id": "transform", "engine": "sql", "properties": {"sql": "SELECT 1 AS id"}}]
+
+
+def _with_location(location: Dict[str, Any], builds: Optional[List[Dict[str, Any]]] = None) -> str:
+    """SUBSCRIPTIONS with ``exposes[0].binding.location`` (and ``builds``) replaced."""
+    contract = yaml.safe_load(SUBSCRIPTIONS)
+    contract["exposes"][0]["binding"]["location"] = location
+    if builds is not None:
+        contract["builds"] = builds
+    return yaml.safe_dump(contract, sort_keys=False)
+
+
+class TestLocalLocation:
+    """A local ``location.path`` is reported where the engine writes the file.
+
+    The engine anchors a relative path at the source contract's directory
+    (``fluid_build.util.binding_paths``), not at the reader's, so the
+    ``./out/x.parquet`` the Command Center used to show named no file.
+    """
+
+    @staticmethod
+    def _sent(cc, monkeypatch, work: Path, contract: Path, *argv: str) -> Dict[str, Any]:
+        """The ``POST /api/v1/assets`` body ``fluid publish`` sends."""
+        monkeypatch.setenv("FLUID_CC_ORG_ID", ORG_A["id"])
+        assert _publish(cc, monkeypatch, work, contract, *argv) == 0
+        (create,) = cc.calls("POST", "/api/v1/assets")
+        return create["body"]
+
+    @staticmethod
+    def _landed(contract: Path, relative: str) -> Dict[str, str]:
+        return {"path": str(contract.resolve().parent / relative)}
+
+    @pytest.mark.parametrize(
+        "run_from",
+        [
+            # fluid publish contracts/customer_subscriptions/contract.fluid.yaml
+            "workspace",
+            # cd contracts/customer_subscriptions && fluid publish contract.fluid.yaml,
+            # as every stage of a generated product pipeline runs it.
+            "product",
+        ],
+    )
+    def test_the_location_is_the_file_the_build_writes(self, cc, tmp_path, monkeypatch, run_from):
+        contract = _write_product(tmp_path, overlay=False)
+        work = tmp_path if run_from == "workspace" else contract.parent
+
+        body = self._sent(cc, monkeypatch, work, contract.relative_to(work))
+
+        landed = self._landed(contract, "out/customer_subscriptions.parquet")
+        assert body["metadata"]["location"] == landed
+
+    def test_the_contract_keeps_the_path_as_written(self, cc, tmp_path, monkeypatch):
+        from fluid_build.cli._common import (
+            load_contract_with_overlay,
+            resolve_contract_env_templates,
+        )
+
+        contract = _write_product(tmp_path, overlay=False)
+
+        body = self._sent(cc, monkeypatch, tmp_path, contract)
+
+        loaded = load_contract_with_overlay(str(contract), None, logging.getLogger("test"))
+        as_before = yaml.safe_dump(resolve_contract_env_templates(loaded), sort_keys=False)
+        (sync,) = cc.calls("POST", SYNC_PATH)
+        assert body["contract_yaml"] == as_before
+        assert sync["body"]["contract_yaml"] == as_before
+        assert "path: ./out/customer_subscriptions.parquet" in as_before
+
+    def test_dry_run_shows_the_location_a_publish_sends(self, cc, tmp_path, monkeypatch, capsys):
+        contract = _write_product(tmp_path, overlay=False)
+        monkeypatch.setenv("FLUID_CC_ORG_ID", ORG_A["id"])
+
+        assert _publish(cc, monkeypatch, tmp_path, contract, "--dry-run") == 0
+
+        assert cc.requests == []
+        (result,) = _document(capsys)
+        location = result["details"]["asset_write"]["body"]["metadata"]["location"]
+        assert location == self._landed(contract, "out/customer_subscriptions.parquet")
+
+    @pytest.mark.parametrize(
+        ("declared", "builds", "landed"),
+        [
+            # The local provider writes the first expose of an embedded-SQL
+            # build, and gives a parquet path without the suffix ``.parquet``.
+            ("out/orders", EMBEDDED_SQL, "out/orders.parquet"),
+            ("out/orders.pq", EMBEDDED_SQL, "out/orders.pq"),
+            # An absolute path is not anchored; the writer's file name still applies.
+            ("/srv/lake/orders", EMBEDDED_SQL, "/srv/lake/orders.parquet"),
+            # An acquisition build writes the path as declared.
+            ("out/orders", None, "out/orders"),
+        ],
+    )
+    def test_the_file_name_is_the_one_its_writer_uses(
+        self, cc, tmp_path, monkeypatch, declared, builds, landed
+    ):
+        text = _with_location({"path": declared}, builds)
+        contract = _write_product(tmp_path, text, overlay=False)
+
+        body = self._sent(cc, monkeypatch, tmp_path, contract)
+
+        assert body["metadata"]["location"] == self._landed(contract, landed)
+
+    def test_a_path_climbing_out_has_one_spelling(self, cc, tmp_path, monkeypatch):
+        text = _with_location({"path": "../shared/out/orders.parquet"})
+        contract = _write_product(tmp_path, text, overlay=False)
+
+        body = self._sent(cc, monkeypatch, tmp_path, contract)
+
+        shared = contract.resolve().parent.parent / "shared" / "out" / "orders.parquet"
+        assert body["metadata"]["location"] == {"path": str(shared)}
+
+    @pytest.mark.parametrize(
+        ("binding_format", "expose_format", "landed"),
+        [
+            # Anything but parquet is written as CSV at the path as declared.
+            ("csv", None, "out/orders"),
+            # The writer also reads a format declared on the expose itself.
+            (None, "parquet", "out/orders.parquet"),
+        ],
+    )
+    def test_the_file_name_follows_the_format_the_writer_reads(
+        self, cc, tmp_path, monkeypatch, binding_format, expose_format, landed
+    ):
+        document = yaml.safe_load(_with_location({"path": "out/orders"}, EMBEDDED_SQL))
+        expose = document["exposes"][0]
+        expose["binding"]["format"] = binding_format
+        if expose_format:
+            expose["format"] = expose_format
+        text = yaml.safe_dump(document, sort_keys=False)
+        contract = _write_product(tmp_path, text, overlay=False)
+
+        body = self._sent(cc, monkeypatch, tmp_path, contract)
+
+        assert body["metadata"]["location"] == self._landed(contract, landed)
+
+    @pytest.mark.parametrize(
+        ("location", "builds", "landed"),
+        [
+            # Nothing can build these (the schema refuses the first two, and
+            # ``/`` names no file); the report must not fail the publish, so
+            # the file keeps its declared name.
+            ({"path": "out/orders"}, [{"id": "transform", "engine": 5}], "out/orders"),
+            ({"path": "out/orders"}, 5, "out/orders"),
+            ({"path": "/"}, EMBEDDED_SQL, "/"),
+        ],
+    )
+    def test_a_contract_the_schema_refuses_still_publishes(
+        self, cc, tmp_path, monkeypatch, location, builds, landed
+    ):
+        contract = _write_product(tmp_path, _with_location(location, builds), overlay=False)
+
+        body = self._sent(cc, monkeypatch, tmp_path, contract)
+
+        assert body["metadata"]["location"] == self._landed(contract, landed)
+
+    @pytest.mark.parametrize(
+        ("location", "builds"),
+        [
+            ({"path": "/srv/lake/orders.parquet"}, None),
+            ({"path": "s3://lake/orders/"}, None),
+            # Not ``s3:/lake/orders.parquet``: the file-name rule is for local files.
+            ({"path": "s3://lake/orders"}, EMBEDDED_SQL),
+            ({"path": 5}, None),
+            ({}, None),
+        ],
+    )
+    def test_a_location_naming_no_relative_file_is_sent_as_written(
+        self, cc, tmp_path, monkeypatch, location, builds
+    ):
+        contract = _write_product(tmp_path, _with_location(location, builds), overlay=False)
+
+        body = self._sent(cc, monkeypatch, tmp_path, contract)
+
+        assert body["metadata"]["location"] == location
+
+    def test_an_aws_overlay_keeps_its_bucket_relative_path(self, cc, tmp_path, monkeypatch):
+        contract = _write_product(tmp_path)
+
+        body = self._sent(cc, monkeypatch, tmp_path, contract, "--env", "aws")
+
+        aws = yaml.safe_load(AWS_OVERLAY)["exposes"][0]["binding"]["location"]
+        assert body["metadata"]["location"] == aws
+
+    @pytest.mark.parametrize(
+        "declared",
+        [
+            # Left literal by publish (a credential-shaped name): filling it
+            # while anchoring would send the value.
+            "{{ env.LAKE_TOKEN }}/orders.parquet",
+            # Not set: still literal, not anchored as ``/orders.parquet``.
+            "{{ env.LAKE_UNSET_DIR }}/orders.parquet",
+        ],
+    )
+    def test_a_path_still_holding_an_env_placeholder_is_sent_as_written(
+        self, cc, tmp_path, monkeypatch, declared
+    ):
+        monkeypatch.setenv("LAKE_TOKEN", "lake-token-not-a-secret")
+        monkeypatch.delenv("LAKE_UNSET_DIR", raising=False)
+        contract = _write_product(tmp_path, _with_location({"path": declared}), overlay=False)
+
+        body = self._sent(cc, monkeypatch, tmp_path, contract)
+
+        assert body["metadata"]["location"] == {"path": declared}
+        assert "lake-token-not-a-secret" not in json.dumps(cc.requests)
+
+    def test_a_filled_env_placeholder_is_anchored_as_the_build_runner_does(
+        self, cc, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("LAKE_DIR", "lake")
+        text = _with_location({"path": "{{ env.LAKE_DIR }}/orders.parquet"})
+        contract = _write_product(tmp_path, text, overlay=False)
+
+        body = self._sent(cc, monkeypatch, tmp_path, contract)
+
+        assert body["metadata"]["location"] == self._landed(contract, "lake/orders.parquet")
+
+    def test_an_endpoint_the_checkout_named_gets_the_path_as_written(
+        self, cc, tmp_path, monkeypatch
+    ):
+        # The runner's own layout is not the checkout's to send (cli/publish.py),
+        # as its {{ env.* }} values and DATABRICKS_HOST are not.
+        from fluid_build.cli.publish import publish_contract
+        from fluid_build.config_manager import FluidConfig
+
+        contract = _write_product(tmp_path, overlay=False)
+        block = {"endpoint": cc.url, "organization_id": ORG_A["id"]}
+        block["auth"] = {"type": "api_key", "api_key": API_KEY}
+        config = {"catalogs": {"fluid-command-center": block}}
+        (tmp_path / "fluid.config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        result = asyncio.run(
+            publish_contract(contract, "command-center", FluidConfig(), skip_health_check=True)
+        )
+
+        assert result.success, result.error
+        (create,) = cc.calls("POST", "/api/v1/assets")
+        assert create["body"]["metadata"]["location"] == {
+            "path": "./out/customer_subscriptions.parquet"
+        }
 
 
 class TestDerivedLineageEdges:

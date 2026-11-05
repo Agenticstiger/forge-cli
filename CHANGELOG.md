@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   module with a module-level `__getattr__` for the same mistake. Both bugs date from 0.8.2a1 and
   are in 0.27.0.
 
+- **`fluid publish` tells the Command Center where a local product's file is.** A relative
+  `location.path` (`./out/party.parquet`) was reported as written, so the deployment's location
+  named no file: the engine anchors that path at the contract's directory, not the reader's. The
+  Command Center now gets the path the engine writes, anchored there with any `..` folded, under
+  the local provider's file name when it writes the expose (`out/orders` with `format: parquet`
+  is `out/orders.parquet`, an absolute path too); `--dry-run` shows it. The contract, and the
+  `contract_yaml` sent with it, keep the path as written. The path is the publishing machine's,
+  which the Command Center shows only to the owners, admins and members of the product's
+  organization, not to its viewers. Reported as before: a remote URI, another platform's
+  location, a publish to an endpoint the checkout's project config named, and a path whose
+  `{{ env.* }}` placeholder publish leaves unfilled (a credential-shaped name, or one that is not
+  set): this step never fills it in. A placeholder publish does fill is anchored with the rest of
+  the path.
 - **A sovereignty refusal says why on every command.** `fluid generate iac` turned a typed
   refusal (a placement outside `sovereignty.allowedRegions`, say) into `generate_iac_failed` and
   printed only the finding; it now prints the error's reason (`... allows me-central-1,
