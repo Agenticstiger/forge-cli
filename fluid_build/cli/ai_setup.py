@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple
 from urllib.parse import urlsplit
 
+from fluid_build._console import literal_error_text
 from fluid_build.cli.forge_banner import print_v2_banner
 
 if TYPE_CHECKING:  # resolve annotation names for ruff/type-checkers only
@@ -137,6 +138,7 @@ try:
     from rich.panel import Panel
     from rich.prompt import Confirm, Prompt
     from rich.table import Table
+    from rich.text import Text as RichText
 
     RICH_AVAILABLE = True
 except ImportError:  # pragma: no cover
@@ -655,8 +657,8 @@ def _collect_and_validate_api_key(
             last_error = error
             remaining = max_attempts - attempt
             if remaining > 0:
+                console.print(literal_error_text(f"Key validation failed: {error}", "red"))
                 console.print(
-                    f"[red]Key validation failed: {error}[/red]\n"
                     f"[dim]{remaining} attempt(s) left. "
                     "[bold]Tip:[/bold] run [bold cyan]fluid doctor[/bold cyan] "
                     "if you suspect an environment issue.[/dim]"
@@ -664,7 +666,7 @@ def _collect_and_validate_api_key(
                 continue
 
             # Phase 0.5 #11 — 3-attempt rescue.
-            console.print(f"[red]Last error: {error}[/red]")
+            console.print(literal_error_text(f"Last error: {error}", "red"))
             rescue = _rescue_after_attempts(console)
             if rescue == "switch":
                 # Re-enter the picker — but skip browser to avoid loop.
@@ -816,6 +818,11 @@ def run_ai_setup_interactive(
             "Or set API keys directly: export OPENAI_API_KEY=sk-..."
         )
         return None
+
+    # Every provider the picker offers is validated through litellm. Without it
+    # the wizard would read the keyring and collect a key it can only reject, so
+    # stop before touching either (the CLI prints the hint and exits 1).
+    _require_litellm_for_setup()
 
     # Show current status first. When a specific provider was requested
     # we skip the "already configured / reconfigure?" gate — the operator
@@ -1265,7 +1272,7 @@ def _import_and_persist(console: Any, candidate: _ImportedKey) -> Optional[LlmCo
     # (CodeQL py/clear-text-logging-sensitive-data — ``candidate.key`` in scope).
     error = _validate_api_key(provider_obj, candidate.key)
     if error:
-        console.print(f"[yellow]That key didn't validate: {error}. Skipping.[/yellow]")
+        console.print(literal_error_text(f"That key didn't validate: {error}. Skipping.", "yellow"))
         LOG.info("Import-from-CLIs: discovered key failed validation (provider offered)")
         return None
     return _persist_and_return(
@@ -1370,14 +1377,21 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
         return None
 
     # 1. Check saved provider/model config and OS-keyring secret.
+    # Without litellm no provider that goes through it can run (every API-key
+    # provider and Ollama), so none is loaded, offered or saved below: only the
+    # keyless coding agents remain. Nothing here reads the keyring or writes config.
+    from fluid_build._optional import is_available as _is_available
+
+    has_litellm = _is_available("litellm")
+
     saved = _load_ai_config()
     if saved and saved.get("provider"):
         pname = saved["provider"]
         model = saved.get("model")
         provider = BUILTIN_LLM_PROVIDERS.get(pname)
-        if provider:
-            from fluid_build.cli.forge_copilot_coding_agent import is_coding_agent
+        from fluid_build.cli.forge_copilot_coding_agent import is_coding_agent
 
+        if provider and (has_litellm or is_coding_agent(pname)):
             if is_coding_agent(pname):
                 config = _make_coding_agent_config(pname, model=model)
                 if console and RICH_AVAILABLE:
@@ -1411,7 +1425,7 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
 
     # 2. Check cloud-provider env vars (e.g. CI environments that
     #    inject ANTHROPIC_API_KEY / OPENAI_API_KEY directly).
-    for pname, env_var in PROVIDER_ENV_VARS.items():
+    for pname, env_var in PROVIDER_ENV_VARS.items() if has_litellm else ():
         env_key = os.environ.get(env_var)
         if env_key:
             if console and RICH_AVAILABLE:
@@ -1426,14 +1440,14 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
             return _make_cloud_config(pname, env_key)
 
     # 3. Explicit OLLAMA_HOST env var.
-    if os.environ.get("OLLAMA_HOST"):
+    if has_litellm and os.environ.get("OLLAMA_HOST"):
         if console and RICH_AVAILABLE:
             console.print("[dim]Using local Ollama.[/dim]")
         LOG.info("Inline AI setup: using ollama from OLLAMA_HOST env var")
         return _make_ollama_config()
 
     # 4. Auto-detect local Ollama — ask the user before selecting it.
-    if detect_ollama_available(os.environ):
+    if has_litellm and detect_ollama_available(os.environ):
         if sys.stdin.isatty() and console and RICH_AVAILABLE:
             use_ollama = ask_confirmation(
                 console,
@@ -1490,6 +1504,13 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
     # 4.6. Opt-in: import a key already stored by another tool (gh hosts.yml,
     #      ~/.codex/auth.json, ~/.openai/credentials, ...). TTY-only and behind
     #      an explicit confirm — the helper self-guards non-interactive runs.
+    if not has_litellm:
+        # Nothing keyless is available and the API-key providers cannot run here:
+        # say so once, offer no key prompt, save nothing.
+        if console and RICH_AVAILABLE:
+            print_litellm_missing(console)
+        LOG.info("Inline AI setup: litellm missing, no keyless agent found")
+        return None
     imported = _offer_import_from_other_clis(console)
     if imported is not None:
         return imported
@@ -1514,14 +1535,14 @@ def show_ai_status(console: Any) -> None:
     readiness = check_llm_readiness()
 
     if not console or not RICH_AVAILABLE:
-        from fluid_build.cli.console import cprint
+        from fluid_build.cli.console import cprint, cprint_literal
 
         status = "ready" if readiness.ready else "not configured"
         cprint(f"AI Copilot: {status}")
         if readiness.provider:
             cprint(f"  Provider: {readiness.provider}  Model: {readiness.model}")
         if readiness.error:
-            cprint(f"  {readiness.error}")
+            cprint_literal(f"  {readiness.error}")
         return
 
     if readiness.ready:
@@ -1544,9 +1565,14 @@ def show_ai_status(console: Any) -> None:
     else:
         console.print(
             Panel(
-                f"[yellow]{readiness.error or 'AI not configured.'}[/yellow]\n\n"
-                "Run [bold cyan]fluid ai setup[/bold cyan] to configure, "
-                "or just run [bold cyan]fluid forge[/bold cyan] and you'll be guided through it.",
+                RichText.assemble(
+                    literal_error_text(readiness.error or "AI not configured.", "yellow"),
+                    "\n\n",
+                    RichText.from_markup(
+                        "Run [bold cyan]fluid ai setup[/bold cyan] to configure, "
+                        "or just run [bold cyan]fluid forge[/bold cyan] and you'll be guided through it."
+                    ),
+                ),
                 title="AI Copilot Status",
                 border_style="yellow",
             )
@@ -1772,6 +1798,36 @@ def register(subparsers) -> None:
     parser.set_defaults(func=_run_ai_command)
 
 
+_SETUP_KEYLESS_ALTERNATIVES = (
+    "Or author with no API key at all. Run fluid forge --llm-provider claude-code | codex | cursor | kiro "
+    "(uses that agent's own login), --llm-provider mcp-sampling (from your IDE), "
+    "or fluid forge --template starter (no AI)."
+)
+
+
+def print_litellm_missing(console: Any) -> None:
+    """Print the litellm install line and the keyless alternatives, literally."""
+    from fluid_build._console import literal_text
+
+    console.print(
+        literal_text(
+            "AI authoring with an API-key provider or Ollama needs litellm: "
+            "pip install 'data-product-forge[litellm]'",
+            "yellow",
+        )
+    )
+    console.print(literal_text(_SETUP_KEYLESS_ALTERNATIVES, "dim"))
+
+
+def _require_litellm_for_setup() -> None:
+    """Raise the install hint when litellm is absent, before any key is asked for."""
+    from fluid_build._optional import ensure_installed
+
+    ensure_installed(
+        "litellm", "litellm", "Validating an AI provider key", _SETUP_KEYLESS_ALTERNATIVES
+    )
+
+
 def _run_ai_command(args, logger: logging.Logger) -> int:
     """Entry point for ``fluid ai setup|status``."""
     # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
@@ -1834,6 +1890,9 @@ def _run_ai_command(args, logger: logging.Logger) -> int:
             if rc == 0:
                 print_v2_banner("ai_setup", quiet=getattr(args, "quiet", False))
             return rc
+
+        # Also checked inside the wizard, for its other callers.
+        _require_litellm_for_setup()
 
         result = run_ai_setup_interactive(console, preselected_provider=preselected)
         if result is not None:

@@ -43,6 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from fluid_build._console import literal_error_text
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.observability.tracing import traced_stage as _traced_stage
 
@@ -1140,7 +1141,7 @@ def _render_apply_result(
             )
         else:
             error_msg = result.get("error", "Unknown error")
-            console.print(f"\n[red]❌ Deployment failed: {error_msg}[/red]")
+            console.print(literal_error_text(f"\n❌ Deployment failed: {error_msg}", "red"))
 
             # Show individual action errors
             if "results" in result:
@@ -1148,7 +1149,13 @@ def _render_apply_result(
                 for i, r in enumerate(result["results"]):
                     if r.get("status") == "error":
                         console.print(
-                            f"  {i + 1}. [red]✗[/red] {r.get('op', 'unknown')}: {r.get('error', 'no details')}"
+                            Text.assemble(
+                                f"  {i + 1}. ",
+                                ("✗", "red"),
+                                literal_error_text(
+                                    f" {r.get('op', 'unknown')}: {r.get('error', 'no details')}"
+                                ),
+                            )
                         )
     else:
         if success and not no_outputs:

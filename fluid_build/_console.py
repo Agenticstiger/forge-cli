@@ -89,6 +89,28 @@ def literal_text(text: Any, style: str = "") -> RichText:
     return RichText(_show_controls(str(text)), style=style)
 
 
+def _redact_error_str(value: Any) -> str:
+    """``value`` with the credential shapes of both redactors masked.
+
+    ``_redact_str`` only knows ``key=value``; ``redact_secret_text`` adds the bare
+    ``sk-``/``ghp_``/JWT/bearer shapes, which a bracketed ``[ghp_...]`` in an error
+    message would otherwise print as written once markup stops swallowing it.
+    """
+    from fluid_build.observability.secret_redactor import redact_secret_text
+
+    return redact_secret_text(_redact_str(str(value)), keep_dotted_names=True)
+
+
+def literal_error_text(text: Any, style: str = "") -> RichText:
+    """:func:`literal_text` for an exception message, suggestion or hint.
+
+    Redacts first (see :func:`_redact_error_str`), then prints as written. Use it
+    wherever the text can carry a secret; :func:`literal_text` stays non-redacting
+    for contract values.
+    """
+    return literal_text(_redact_error_str(text), style)
+
+
 def _redact_str(value: str) -> str:
     """Pure ``str -> str`` sanitiser for credential-shaped substrings.
 
@@ -200,7 +222,7 @@ def cprint_literal(text: Any, **kwargs: Any) -> None:
     are always off, whatever ``kwargs`` says.
     """
     kwargs.update(markup=False, emoji=False)
-    cprint(_show_controls(_redact_str(str(text))), **kwargs)
+    cprint(_show_controls(_redact_error_str(text)), **kwargs)
 
 
 def info(msg: str) -> None:
@@ -231,7 +253,7 @@ def error(msg: str) -> None:
     # Redact the raw text first (see ``_show_controls``), and funnel through the
     # typed ``_redact_str`` sanitiser last so CodeQL recognises the sink path is
     # sanitised on every branch.
-    safe_msg = _redact_str(_show_controls(_redact_str(str(msg))))
+    safe_msg = _redact_str(_show_controls(_redact_error_str(msg)))
     if RICH_AVAILABLE:
         _err_console = RichConsole(stderr=True)
         _err_console.print(RichText(f"❌ {safe_msg}", style="red"))

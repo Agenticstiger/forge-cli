@@ -26,6 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
+from fluid_build._console import literal_error_text
 from fluid_build.cli.console import cprint, success, warning
 from fluid_build.cli.forge_copilot_memory import (
     build_copilot_project_memory,
@@ -243,7 +244,9 @@ class CopilotProjectMemoryMixin:
             memory_path = self._relative_memory_path()
             if self.console:
                 self.console.print(
-                    f"[yellow]⚠ Could not save copilot memory to {memory_path}: {exc}[/yellow]"
+                    literal_error_text(
+                        f"⚠ Could not save copilot memory to {memory_path}: {exc}", "yellow"
+                    )
                 )
             else:
                 warning(f"Could not save copilot memory: {exc}")

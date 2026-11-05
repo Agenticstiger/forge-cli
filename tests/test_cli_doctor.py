@@ -327,7 +327,7 @@ class TestPrintDoctorNextStepsDualShape:
         )
 
     @patch("fluid_build.cli.doctor.RICH_AVAILABLE", False)
-    @patch("fluid_build.cli.doctor.cprint")
+    @patch("fluid_build.cli.doctor.cprint_literal")
     def test_string_error_appended_verbatim(self, mock_cprint):
         """A plain-string error must end up as a bullet in the suggestions."""
         from fluid_build.cli.doctor import _print_doctor_next_steps
@@ -341,7 +341,7 @@ class TestPrintDoctorNextStepsDualShape:
         assert "Set OPENAI_API_KEY" in printed
 
     @patch("fluid_build.cli.doctor.RICH_AVAILABLE", False)
-    @patch("fluid_build.cli.doctor.cprint")
+    @patch("fluid_build.cli.doctor.cprint_literal")
     def test_structured_error_with_suggestions_is_expanded(self, mock_cprint):
         """A structured error (``.suggestions`` list) must expand to multiple bullets."""
         from fluid_build.cli.doctor import _print_doctor_next_steps

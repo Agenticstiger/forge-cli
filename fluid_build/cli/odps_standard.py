@@ -34,7 +34,7 @@ from typing import Optional
 
 import click
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.loader import load_contract
 from fluid_build.providers.odps_standard import OdpsStandardProvider
 
@@ -342,19 +342,19 @@ def _run_odps_validate(args):
             else:
                 odps_data = json.load(f)
     except OSError as exc:
-        cprint(
+        cprint_literal(
             f"✗ Validation failed: cannot read {file_path}: {exc.strerror or exc}. "
             "Check that the path exists, is a file, and is readable."
         )
         return 1
     except UnicodeDecodeError as exc:
-        cprint(
+        cprint_literal(
             f"✗ Validation failed: {file_path} is not valid UTF-8 text: {exc}. "
             "Re-save the file as UTF-8."
         )
         return 1
     except (UnsafeYamlError, yaml.YAMLError, json.JSONDecodeError) as exc:
-        cprint(f"✗ Validation failed: {file_path}: {exc}")
+        cprint_literal(f"✗ Validation failed: {file_path}: {exc}")
         return 1
     except RecursionError:
         # ``json.load`` has no depth cap of its own; a document nested past the
@@ -377,7 +377,7 @@ def _run_odps_validate(args):
     try:
         BitolOdpsProvider().validate_product(odps_data)
     except ProviderError as exc:
-        cprint(f"✗ {exc}")
+        cprint_literal(f"✗ {exc}")
         return 1
 
     declared_version = str(odps_data.get("apiVersion") or "v1.0.0")

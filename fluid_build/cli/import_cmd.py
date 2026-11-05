@@ -34,7 +34,8 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-from fluid_build.cli.console import cprint
+from fluid_build._console import literal_error_text
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.util.contract import slugify_identifier
 
 from ._logging import error, info
@@ -661,9 +662,9 @@ def _run_directory_scan_import(args: Any, logger: logging.Logger) -> int:
             contracts = generate_contracts_from_scan(scan_results, args.provider, logger)
         except ValueError as exc:
             if RICH_AVAILABLE:
-                console.print(f"[red]❌ {exc}[/red]")
+                console.print(literal_error_text(f"❌ {exc}", "red"))
             else:
-                cprint(f"\n❌ {exc}")
+                cprint_literal(f"\n❌ {exc}")
             return 1
 
         # Apply governance if PII detected

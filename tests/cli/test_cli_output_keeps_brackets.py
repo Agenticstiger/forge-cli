@@ -501,7 +501,7 @@ def test_unexpected_error_and_its_traceback_are_redacted(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 2
     assert "hunter2" not in out
-    assert "❌ Unexpected error: [/] connect failed password=<redacted>" in _unwrapped(out)
+    assert "❌ Unexpected error: [/] connect failed password=***REDACTED***" in _unwrapped(out)
 
 
 def test_provider_error_prints_its_message_verbatim(monkeypatch, capsys):
@@ -521,7 +521,7 @@ def test_provider_error_is_redacted(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "abc123" not in out
-    assert "❌ Provider error: [/] auth failed token=<redacted>" in _unwrapped(out)
+    assert "❌ Provider error: [/] auth failed token=***REDACTED***" in _unwrapped(out)
 
 
 def test_last_resort_handler_prints_its_message_verbatim(monkeypatch, capsys):

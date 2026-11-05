@@ -45,32 +45,10 @@ dependencies = [
   "jinja2>=3.1.6",  # security: >=3.1.6 closes CVE-2025-27516 (sandbox escape via |attr)
   "httpx>=0.27",  # The one HTTP client: Command Center, Data Mesh Manager, marketplace, reporter
   "h11>=0.16",  # security: pin transitive h11 >=0.16 to close CVE-2025-43859 (chunked request smuggling)
-  # LiteLLM is the canonical LLM backend (was an opt-in extra). It
-  # replaces ~1,300 lines of per-provider wire-format code with one
-  # unified API across openai / anthropic / gemini / bedrock / azure /
-  # vertex / groq / mistral / cohere / ollama / etc., plus built-in
-  # cost tracking, retries, streaming, and tool-use normalisation.
-  # security: >=1.83.7 closes CVE-2026-42208 (CVSS 9.3 SQLi); skips compromised
-  # 1.82.7/1.82.8 PyPI artifacts.
-  #
-  # The 3.10 cap is an upstream defect, not a compatibility choice of ours.
-  # litellm's own metadata declares requires_python ">=3.10,<3.15", but from
-  # 1.98.0 onward the module
-  # litellm/llms/anthropic/experimental_pass_through/context_management/editors/compact.py
-  # imports NotRequired straight from typing. NotRequired landed in typing at
-  # 3.11 (PEP 655), so merely importing litellm raises
-  # ImportError on 3.10. Verified against a real CPython 3.10.20: 1.97.0
-  # imports clean (that module included), 1.98.0 and 1.99.0 do not.
-  #
-  # We advertise 3.10 (requires-python + the 3.10 classifier) and litellm is
-  # a core dependency, so this broke installs, not just CI. Cap 3.10 below
-  # the regression and leave 3.11+ on current litellm; drop the second line
-  # once upstream guards that import with typing_extensions.
-  #
-  # >=1.83.14 for the python-dotenv floor below: 1.83.7 to 1.83.13 pin
-  # python-dotenv==1.0.1, which ignores PYTHON_DOTENV_DISABLED.
-  "litellm>=1.83.14,<2; python_version >= '3.11'",
-  "litellm>=1.83.14,<1.98; python_version < '3.11'",
+  # PEP 440 version parsing in providers/__init__.py (plugin compatibility
+  # windows) and cli/generate_ci.py. It used to arrive via litellm and
+  # openlineage-python; declared now that neither is in the base install.
+  "packaging>=23.0",
   # .env file credential loading in fluid_build.credentials.dotenv_store.
   # 1.2.0 is the first release that honours PYTHON_DOTENV_DISABLED, which
   # stops dbt and litellm re-reading the project's .env around the
@@ -91,67 +69,6 @@ dependencies = [
   # Borrowed-not-built per /borrow-before-build (skill receipts in commit msg):
   #   docs:  https://docs.pydantic.dev/latest/concepts/pydantic_settings/
   "pydantic-settings>=2.0",
-  # Official Anthropic-maintained Model Context Protocol Python SDK.
-  # Two consumers in this codebase:
-  #   1. ``fluid mcp serve`` — FastMCP + ServerSession.create_message
-  #      (canonical server-side sampling). Replaced ~450 LOC of
-  #      hand-rolled MCP plumbing in the Phase 3 migration.
-  #   2. ``fluid mcp output-port serve`` — the consumer-side gateway
-  #      that turns a FLUID expose into an agent-consumable MCP
-  #      endpoint and enforces ``policy.agentPolicy``
-  #      (allowedModels/allowedUseCases) at every read.
-  #
-  # Floor pinned at 1.20:
-  #   - 1.7's tools/base.py does ``issubclass(param.annotation, Context)``
-  #     which raises TypeError under ``from __future__ import annotations``
-  #     + ``ctx: Context = None``. Later 1.x releases use
-  #     ``typing.get_type_hints()`` and handle the deferred-annotation +
-  #     Optional shape correctly.
-  #   - 1.15's ``ClientSession.__init__`` doesn't yet accept
-  #     ``sampling_capabilities``; that landed in a later 1.x. Our live
-  #     sampling integration test (test_mcp_live_llm_sampling.py) advertises
-  #     the sampling capability via that kwarg so the floor must include it.
-  #   - The gateway depends on the lifespan API + ``mcp.shared.memory``
-  #     test fixtures introduced in 1.20.
-  #   - 1.20 and 1.21 import ``eval_type_backport`` from
-  #     ``pydantic._internal._typing_extra``, which pydantic 2.14 removed,
-  #     so ``mcp.server.fastmcp`` fails to import with current pydantic.
-  #     1.22 is the first 1.x that imports with pydantic 2.14.
-  #   1.22+ has all of the above. Pinned by the mcp-sdk-drift CI job.
-  # Ceiling ``<3.0`` since Phase 2 (2026-09-14). The codebase is
-  # DUAL-SUPPORT (1.x and 2.x) via the fluid_build/_mcp_compat.py seam, and
-  # widening the ceiling is what makes 2.x BLOCKING: the drift job's
-  # ``range-max`` leg now resolves inside ``>=1.20,<3.0``, so it runs
-  # without the warn-wrapper. The ``latest`` leg stays warn-only and
-  # becomes the early warning for 3.x, which is the same reasoning that
-  # made it warn-only for 2.x.
-  #
-  # What was audited before widening, against the official rename table at
-  # https://py.sdk.modelcontextprotocol.io/migration (11 fields moved from
-  # camelCase to snake_case ON ATTRIBUTE ACCESS, a read that fails
-  # SILENTLY because getattr returns the default):
-  #   - attribute reads using a renamed spelling, across the 16 modules
-  #     that import mcp:                                              0
-  #   - ``model_dump()`` on an SDK model without ``by_alias=True``
-  #     (2.x emits snake_case keys peers do not recognise, no error):  0
-  #   - dict-key reads of a renamed name:  2, both on forge's OWN
-  #     hand-built tool-advertisement dict (cli/mcp/policy.py writes it,
-  #     output_ports/mcp/server.py reads it), consistent on both sides
-  #   - camelCase CONSTRUCTOR kwargs:  6, and the guide confirms 2.x still
-  #     accepts those; only attribute access moved.
-  # tests/test_mcp_sdk_rename_guard.py pins all of that so it cannot drift
-  # back silently.
-  #
-  # Known 2.x behavior gap, unchanged: v2 drops clientInfo extra fields at
-  # wire-parse (v1 was extra="allow"), so self-attested output-port
-  # identity moved to the capabilities channel — see
-  # _mcp_compat.self_attesting_client_kwargs.
-  #
-  # Borrowed-not-built per /borrow-before-build (skill receipts in
-  # AGENT_IDE.md "Related work" section + the gateway commit msg):
-  #   docs:  https://modelcontextprotocol.github.io/python-sdk/
-  #   repo:  https://github.com/modelcontextprotocol/python-sdk
-  "mcp>=1.22,<3.0",
   # (The MCP output-port rate limiter is an in-process monotonic-clock
   # deque sliding window in SessionState.check_rate_limit — no dependency.
   # PyrateLimiter was dropped: its Limiter spins a background "leaker"
@@ -180,26 +97,6 @@ dependencies = [
   # buckets that preserve unmodeled fields keep their round-trip
   # fidelity contract.
   "open-data-contract-standard>=3.1.2",
-  # Official OpenLineage Python client (LF AI & Data graduate project).
-  # Owns the lineage wire format so FLUID does not hand-roll it: the
-  # ``event_v2`` model supplies the nested run/job objects plus the
-  # required ``producer`` / ``schemaURL`` fields, ``Serde`` does the
-  # serialisation, and ``uuid.generate_static_uuid`` maps FLUID's sortable
-  # base32 run ids onto the ``format: uuid`` the spec mandates while
-  # keeping them monotonic. The previous hand-rolled encoder emitted a
-  # payload every OpenLineage consumer rejects.
-  #
-  # Adds exactly one distribution to the install: its own requirements
-  # (attrs, python-dateutil, packaging, requests, httpx, pyyaml) are
-  # already present transitively (attrs arrives via core ``jsonschema``).
-  # Imported lazily inside the emitter only, never at module import, so
-  # the ``fluid --help`` startup budget is untouched.
-  #
-  # Borrowed-not-built per /borrow-before-build:
-  #   PyPI:   https://pypi.org/project/openlineage-python/
-  #   GitHub: https://github.com/OpenLineage/OpenLineage/tree/main/client/python
-  #   Spec:   https://openlineage.io/spec/2-0-2/OpenLineage.json
-  "openlineage-python>=1.52",
   # Cross-platform single-keypress reader powering arrow-key menu
   # navigation in ``forge_ui.ask_numbered_choice`` (the interactive
   # forge / ai-setup menus). Owns the finicky, edge-case-ridden part —
@@ -352,39 +249,160 @@ postgres = [
   "psycopg[binary]>=3.1",
 ]
 
-# AI authoring (litellm). litellm is still in the base install today, so this
-# extra is redundant for now; it exists so that pip/uv installs of
-# ``data-product-forge[litellm]`` keep working after litellm leaves the base
-# install in 0.28.0. The two lines are copied verbatim from ``dependencies``:
-# the Python-version marker split (PR #555) must never be collapsed, because
-# litellm >= 1.98 cannot be imported on Python 3.10.
-# tests/ci_guards/extras_alongside_base.py pins both lines.
+# AI authoring (litellm; ``fluid forge``, ``forge data-model``, ``ai setup``, the
+# agent loop and the staged copilot agents). litellm left the base install in
+# 0.28.0; ``[standard]`` and ``[ai]`` also install it.
+#
+# LiteLLM is the canonical LLM backend (was an opt-in extra). It
+# replaces ~1,300 lines of per-provider wire-format code with one
+# unified API across openai / anthropic / gemini / bedrock / azure /
+# vertex / groq / mistral / cohere / ollama / etc., plus built-in
+# cost tracking, retries, streaming, and tool-use normalisation.
+# security: >=1.83.7 closes CVE-2026-42208 (CVSS 9.3 SQLi); skips compromised
+# 1.82.7/1.82.8 PyPI artifacts.
+#
+# The 3.10 cap is an upstream defect, not a compatibility choice of ours.
+# litellm's own metadata declares requires_python ">=3.10,<3.15", but from
+# 1.98.0 onward the module
+# litellm/llms/anthropic/experimental_pass_through/context_management/editors/compact.py
+# imports NotRequired straight from typing. NotRequired landed in typing at
+# 3.11 (PEP 655), so merely importing litellm raises
+# ImportError on 3.10. Verified against a real CPython 3.10.20: 1.97.0
+# imports clean (that module included), 1.98.0 and 1.99.0 do not.
+#
+# We advertise 3.10 (requires-python + the 3.10 classifier) and litellm is
+# a core dependency, so this broke installs, not just CI. Cap 3.10 below
+# the regression and leave 3.11+ on current litellm; drop the second line
+# once upstream guards that import with typing_extensions.
+#
+# >=1.83.14 for the python-dotenv floor below: 1.83.7 to 1.83.13 pin
+# python-dotenv==1.0.1, which ignores PYTHON_DOTENV_DISABLED.
+#
+# The two requirement lines below are the Python-version marker split (PR #555);
+# never collapse them. tests/ci_guards/extras_alongside_base.py pins both.
+# !=1.107.0: MAL-2026-2144, a malicious release since removed from PyPI.
 litellm = [
-  "litellm>=1.83.14,<2; python_version >= '3.11'",
-  "litellm>=1.83.14,<1.98; python_version < '3.11'",
+  "litellm>=1.83.14,!=1.107.0,<2; python_version >= '3.11'",
+  "litellm>=1.83.14,!=1.107.0,<1.98; python_version < '3.11'",
 ]
 
 # MCP server and output-port gateway (``fluid mcp serve``,
-# ``fluid mcp output-port serve``). mcp is still in the base install today;
-# this extra is redundant for now and carries the install after 0.28.0.
+# ``fluid mcp output-port serve``, keyless ``mcp-sampling``). mcp left the base
+# install in 0.28.0; ``[standard]`` also installs it.
+#
+# Official Anthropic-maintained Model Context Protocol Python SDK.
+# Two consumers in this codebase:
+#   1. ``fluid mcp serve`` — FastMCP + ServerSession.create_message
+#      (canonical server-side sampling). Replaced ~450 LOC of
+#      hand-rolled MCP plumbing in the Phase 3 migration.
+#   2. ``fluid mcp output-port serve`` — the consumer-side gateway
+#      that turns a FLUID expose into an agent-consumable MCP
+#      endpoint and enforces ``policy.agentPolicy``
+#      (allowedModels/allowedUseCases) at every read.
+#
+# Floor pinned at 1.20:
+#   - 1.7's tools/base.py does ``issubclass(param.annotation, Context)``
+#     which raises TypeError under ``from __future__ import annotations``
+#     + ``ctx: Context = None``. Later 1.x releases use
+#     ``typing.get_type_hints()`` and handle the deferred-annotation +
+#     Optional shape correctly.
+#   - 1.15's ``ClientSession.__init__`` doesn't yet accept
+#     ``sampling_capabilities``; that landed in a later 1.x. Our live
+#     sampling integration test (test_mcp_live_llm_sampling.py) advertises
+#     the sampling capability via that kwarg so the floor must include it.
+#   - The gateway depends on the lifespan API + ``mcp.shared.memory``
+#     test fixtures introduced in 1.20.
+#   - 1.20 and 1.21 import ``eval_type_backport`` from
+#     ``pydantic._internal._typing_extra``, which pydantic 2.14 removed,
+#     so ``mcp.server.fastmcp`` fails to import with current pydantic.
+#     1.22 is the first 1.x that imports with pydantic 2.14.
+#   1.22+ has all of the above. Pinned by the mcp-sdk-drift CI job.
+# Ceiling ``<3.0`` since Phase 2 (2026-09-14). The codebase is
+# DUAL-SUPPORT (1.x and 2.x) via the fluid_build/_mcp_compat.py seam, and
+# widening the ceiling is what makes 2.x BLOCKING: the drift job's
+# ``range-max`` leg now resolves inside ``>=1.20,<3.0``, so it runs
+# without the warn-wrapper. The ``latest`` leg stays warn-only and
+# becomes the early warning for 3.x, which is the same reasoning that
+# made it warn-only for 2.x.
+#
+# What was audited before widening, against the official rename table at
+# https://py.sdk.modelcontextprotocol.io/migration (11 fields moved from
+# camelCase to snake_case ON ATTRIBUTE ACCESS, a read that fails
+# SILENTLY because getattr returns the default):
+#   - attribute reads using a renamed spelling, across the 16 modules
+#     that import mcp:                                              0
+#   - ``model_dump()`` on an SDK model without ``by_alias=True``
+#     (2.x emits snake_case keys peers do not recognise, no error):  0
+#   - dict-key reads of a renamed name:  2, both on forge's OWN
+#     hand-built tool-advertisement dict (cli/mcp/policy.py writes it,
+#     output_ports/mcp/server.py reads it), consistent on both sides
+#   - camelCase CONSTRUCTOR kwargs:  6, and the guide confirms 2.x still
+#     accepts those; only attribute access moved.
+# tests/test_mcp_sdk_rename_guard.py pins all of that so it cannot drift
+# back silently.
+#
+# Known 2.x behavior gap, unchanged: v2 drops clientInfo extra fields at
+# wire-parse (v1 was extra="allow"), so self-attested output-port
+# identity moved to the capabilities channel — see
+# _mcp_compat.self_attesting_client_kwargs.
+#
+# Borrowed-not-built per /borrow-before-build (skill receipts in
+# AGENT_IDE.md "Related work" section + the gateway commit msg):
+#   docs:  https://modelcontextprotocol.github.io/python-sdk/
+#   repo:  https://github.com/modelcontextprotocol/python-sdk
+#
+# mcp floor 1.30: advisories fixed in 1.23.0, 1.27.2 (GHSA-jpw9, an SSE session
+# not bound to its principal; the gateway uses ``SseServerTransport``), 1.28.1
+# and 1.30.0; 2.0.* and 2.1.* carry them too and were fixed in 2.2.0.
+#
 # pyjwt is declared explicitly because fluid_build/output_ports/mcp/auth.py
 # imports ``jwt`` directly. Floor 2.15.0: every release up to 2.14.0 has
 # advisories on the PyJWKClient/decode path auth.py uses (e.g.
 # GHSA-ffc3-869f-jxw9); [crypto] for the RS256/ES256/EdDSA verifiers.
+#
+# starlette and uvicorn are declared because the output-port transport
+# (fluid_build/output_ports/mcp/_transport.py) imports them directly; mcp
+# requires both, so they add nothing to the install. Floors as mcp states them.
 mcp = [
-  "mcp>=1.22,<3.0",
+  "mcp>=1.30,!=2.0.*,!=2.1.*,<3.0",
   "pyjwt[crypto]>=2.15.0",
+  "starlette>=0.27",
+  "uvicorn>=0.31.1",
 ]
 
-# OpenLineage run-event emission. openlineage-python is still in the base
-# install today; this extra is redundant for now and carries the install
-# after it leaves base.
+# OpenLineage run-event emission (``OPENLINEAGE_URL``, the SDK conformance
+# suite). openlineage-python left the base install in 0.28.0.
+#
+# Official OpenLineage Python client (LF AI & Data graduate project).
+# Owns the lineage wire format so FLUID does not hand-roll it: the
+# ``event_v2`` model supplies the nested run/job objects plus the
+# required ``producer`` / ``schemaURL`` fields, ``Serde`` does the
+# serialisation, and ``uuid.generate_static_uuid`` maps FLUID's sortable
+# base32 run ids onto the ``format: uuid`` the spec mandates while
+# keeping them monotonic. The previous hand-rolled encoder emitted a
+# payload every OpenLineage consumer rejects.
+#
+# Adds exactly one distribution to the install: its own requirements
+# (attrs, python-dateutil, packaging, requests, httpx, pyyaml) are
+# already present transitively (attrs arrives via core ``jsonschema``).
+# Imported lazily inside the emitter only, never at module import, so
+# the ``fluid --help`` startup budget is untouched.
+#
+# Borrowed-not-built per /borrow-before-build:
+#   PyPI:   https://pypi.org/project/openlineage-python/
+#   GitHub: https://github.com/OpenLineage/OpenLineage/tree/main/client/python
+#   Spec:   https://openlineage.io/spec/2-0-2/OpenLineage.json
+#
+# python-dateutil is declared because the event-time check in
+# build_runners/_lineage.py imports it directly; openlineage-python requires it
+# (same floor), so it adds nothing to the install.
 lineage = [
   "openlineage-python>=1.52",
+  "python-dateutil>=2.8.2",
 ]
 
-# AI + MCP together: restores today's base behaviour once litellm and mcp
-# leave the base install in 0.28.0 (the ``fastapi[standard]`` precedent).
+# AI + MCP together: restores the pre-0.28.0 base behaviour (the
+# ``fastapi[standard]`` precedent).
 standard = [
   "data-product-forge[litellm,mcp]",
 ]
@@ -479,7 +497,7 @@ dev = [
   # the unit lanes install ``.[dev,local]``, which has no pyarrow, so without
   # it those tests would skip in CI instead of running.
   "pyarrow>=14",
-  # litellm, mcp and openlineage leave the base install in 0.28.0; the tests
+  # litellm, mcp and openlineage left the base install in 0.28.0; the tests
   # import all three at module level, so dev names them explicitly.
   "data-product-forge[litellm,mcp,lineage]",
 ]
@@ -798,14 +816,10 @@ DEP001 = [
   "sklearn",
   "openapi_spec_validator",
 ]
-# Soft imports that degrade when the package is absent, so no extra declares them:
+# A soft import that degrades when the package is absent, so no extra declares it:
 #   opentelemetry (observability/tracing.py, cli/_ux_telemetry.py: tracing is a
-#   no-op without it), python-dateutil (the lineage event-time check falls back
-#   to now), packaging (plugin-version checks fall back to the legacy bounds).
-#   starlette / uvicorn are the MCP output-port transport, pinned by mcp itself.
-# TODO(PR D): once mcp / openlineage-python live in their extras, declare
-# starlette, uvicorn in ``[mcp]`` and python-dateutil in ``[lineage]``.
-DEP003 = ["opentelemetry", "dateutil", "packaging", "starlette", "uvicorn"]
+#   no-op without it).
+DEP003 = ["opentelemetry"]
 # Used only on a dev path, never a hard requirement of the installed CLI:
 #   pytest: api/conformance/runner.py runs inside a pytest session and calls
 #   pytest.skip; tomli: fluid_build/__init__.py version fallback for a source

@@ -33,7 +33,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from fluid_build.cli.console import cprint, cprint_literal
+from fluid_build.cli.console import cprint, cprint_literal, literal_error_text, literal_text
 
 from ._common import CLIError
 from ._logging import info
@@ -58,6 +58,7 @@ try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
+    from rich.text import Text as RichText
 
     RICH_AVAILABLE = True
 except ImportError:
@@ -399,7 +400,7 @@ def _run_scoped(args, logger: logging.Logger, scope_arg: str) -> int:
         icon = {Severity.OK: "✓", Severity.WARN: "!", Severity.ERROR: "✗"}
         cprint(f"fluid doctor — scope={report.scope.value}")
         for r in report.results:
-            cprint(f"  {icon[r.severity]} {r.name}: {r.detail}")
+            cprint_literal(f"  {icon[r.severity]} {r.name}: {r.detail}")
             if r.severity is not Severity.OK and r.fix:
                 cprint(f"      fix: {r.fix}")
         summary = (
@@ -716,8 +717,11 @@ def _print_doctor_summary(
         console = Console()
         console.print(
             Panel(
-                f"[{summary.text_style}]{summary.status}[/{summary.text_style}]\n"
-                f"[dim]{summary.message}[/dim]",
+                RichText.assemble(
+                    (summary.status, summary.text_style),
+                    "\n",
+                    literal_error_text(summary.message, "dim"),
+                ),
                 title="🩺 Doctor Summary",
                 border_style=summary.border_style,
             )
@@ -728,18 +732,24 @@ def _print_doctor_summary(
     cprint("Doctor Summary")
     cprint("=" * 60)
     cprint(f"Status:  {summary.status}")
-    cprint(f"Message: {summary.message}")
+    cprint_literal(f"Message: {summary.message}")
     cprint()
 
 
-#: Shown once per ``fluid doctor`` run. litellm and mcp leave the base
-#: install in 0.28.0 (``[standard]`` restores both); keep the text in step
-#: with the release note for that change.
-EXTRAS_MOVE_NOTICE = "AI/MCP move to extras in 0.28.0: pip install 'data-product-forge[standard]'"
+#: Shown once per ``fluid doctor`` run, and only when litellm or mcp is missing.
+#: Since 0.28.0 both live in extras (``[standard]`` installs both); keep the
+#: text in step with the CHANGELOG entry for that change.
+EXTRAS_MOVE_NOTICE = (
+    "AI and MCP are extras since 0.28.0: pip install 'data-product-forge[standard]'"
+)
 
 
 def _print_extras_move_notice() -> None:
-    """Print the one-line AI/MCP extras notice (a single call per run)."""
+    """Print the one-line AI/MCP extras notice when either package is missing."""
+    from fluid_build._optional import is_available
+
+    if is_available("litellm") and is_available("mcp"):
+        return
     # Literal: rich would read "[standard]" as a markup tag and drop it.
     cprint_literal(EXTRAS_MOVE_NOTICE)
     cprint()
@@ -771,7 +781,7 @@ def _print_doctor_next_steps(
         console = Console()
         console.print(
             Panel(
-                "\n".join(f"• {item}" for item in suggestions),
+                literal_text("\n").join(literal_error_text(f"• {item}") for item in suggestions),
                 title="Next steps",
                 border_style="yellow",
             )
@@ -780,7 +790,7 @@ def _print_doctor_next_steps(
 
     cprint("Next steps:")
     for suggestion in suggestions:
-        cprint(f"  • {suggestion}")
+        cprint_literal(f"  • {suggestion}")
     cprint()
 
 
@@ -1178,13 +1188,20 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
                 }
             )
         else:
+            configured = bool(readiness.provider)
             checks.append(
                 {
                     "check": "Forge AI Copilot",
                     "category": "ai",
-                    "status": "⚠️  Not configured",
+                    "status": "⚠️  Not ready" if configured else "⚠️  Not configured",
                     "ok": True,  # Non-critical
-                    "details": "Run 'fluid ai setup' to configure",
+                    # A configured provider that cannot run (litellm missing) says
+                    # why, with the install line, instead of blaming setup.
+                    "details": (
+                        str(getattr(readiness.error, "message", readiness.error))
+                        if configured and readiness.error
+                        else "Run 'fluid ai setup' to configure"
+                    ),
                 }
             )
     except Exception:
@@ -1425,13 +1442,15 @@ def _print_copilot_readiness(readiness: LlmReadinessCheck, verbose: bool = False
             message_text = getattr(error, "message", None)
             if message_text is None:
                 message_text = error if isinstance(error, str) else str(error)
-            table.add_row("Message", message_text)
+            table.add_row("Message", literal_error_text(message_text))
         console.print(table)
         error_suggestions = getattr(readiness.error, "suggestions", None)
         if verbose and readiness.error is not None and error_suggestions:
             console.print(
                 Panel(
-                    "\n".join(f"• {item}" for item in error_suggestions),
+                    literal_text("\n").join(
+                        literal_error_text(f"• {item}") for item in error_suggestions
+                    ),
                     title="Copilot Suggestions",
                     border_style="yellow",
                 )
@@ -1451,9 +1470,9 @@ def _print_copilot_readiness(readiness: LlmReadinessCheck, verbose: bool = False
         message_text = getattr(error, "message", None)
         if message_text is None:
             message_text = error if isinstance(error, str) else str(error)
-        cprint(f"Message:  {message_text}")
+        cprint_literal(f"Message:  {message_text}")
         for suggestion in getattr(error, "suggestions", None) or []:
-            cprint(f"  • {suggestion}")
+            cprint_literal(f"  • {suggestion}")
     cprint()
 
 

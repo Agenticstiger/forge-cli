@@ -98,6 +98,13 @@ _SENSITIVE_KEY_PARTS = (
     "token",
 )
 _JWT_RE = re.compile(r"\b[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b")
+# Three-segment JWT anchored on the ``eyJ`` base64url prefix of the JSON ``{"``
+# header (gitleaks' ``jwt`` rule and detect-secrets' ``JwtTokenDetector`` anchor
+# the same way). Used instead of the prefix-agnostic ``_JWT_RE`` for text a person
+# reads (``redact_secret_text(..., keep_dotted_names=True)``), where ``_JWT_RE``
+# would hide a fully qualified name such as
+# ``my-gcp-project.customer_analytics.daily_revenue_summary``. Logs keep ``_JWT_RE``.
+_JWT_ANCHORED_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 # Two-segment JWT (header.payload, no signature). Anchored on the ``eyJ``
 # base64url prefix of the JSON ``{"`` header so we don't redact arbitrary
 # dotted identifiers. Complements ``_JWT_RE`` which requires three segments.
@@ -161,8 +168,10 @@ _FERNET_TOKEN_RE = re.compile(r"\bgAAAAA[A-Za-z0-9_-]{20,}")
 # (providers/snowflake/util/logging.py imports this exact object) so the two
 # redaction layers cannot drift — the CLAUDE.md "extend both" invariant, enforced
 # by a single source of truth.
+# A password that is already the ``***`` mask is left alone: masking it again
+# turned ``postgres://u:***@db/x`` into ``postgres://u:***REDACTED***@db/x``.
 _URL_USERINFO_RE = re.compile(
-    r"([A-Za-z][A-Za-z0-9+.\-]{0,40}://[^/?#@:\s]{0,256}:)[^/?#@\s]{1,4096}(@)"
+    r"([A-Za-z][A-Za-z0-9+.\-]{0,40}://[^/?#@:\s]{0,256}:)(?!\*{3}@)[^/?#@\s]{1,4096}(@)"
 )
 # PEM private-key block (RSA / EC / OPENSSH / DSA / bare PKCS#8 ...).
 # ``[^-]*`` (zero-or-more) so the algorithm word is optional and the bare
@@ -580,13 +589,19 @@ def _mask_assignment(match: "re.Match[str]") -> str:
     return f"{match.group('key')}{match.group('sep')}{quote}{_REDACTED}{quote}"
 
 
-def redact_secret_text(text: str, *, extra_secrets: Iterable[str] = ()) -> str:
+def redact_secret_text(
+    text: str, *, extra_secrets: Iterable[str] = (), keep_dotted_names: bool = False
+) -> str:
     """Redact secret-like substrings in plain text.
 
     ``extra_secrets`` are literals to mask for THIS call only — for callers
     that hold a credential but must not register it process-wide (e.g. the
     Snowflake IaC table COMMENT, which carries whatever one contract spelled
     inline and should not affect redaction of anything else).
+
+    ``keep_dotted_names`` masks a three-segment JWT only when it has the ``eyJ``
+    header, so a fully qualified table name in an error a person reads survives.
+    Log redaction leaves it off and keeps the prefix-agnostic rule.
     """
     if not isinstance(text, str) or not text:
         return text
@@ -598,7 +613,7 @@ def redact_secret_text(text: str, *, extra_secrets: Iterable[str] = ()) -> str:
     # PEM blocks first: a multiline key block can itself contain ``.``/``=``
     # runs that would otherwise be partially mangled by the token regexes.
     redacted = _PEM_PRIVATE_KEY_RE.sub(_REDACTED, redacted)
-    redacted = _JWT_RE.sub(_REDACTED, redacted)
+    redacted = (_JWT_ANCHORED_RE if keep_dotted_names else _JWT_RE).sub(_REDACTED, redacted)
     redacted = _JWT_TWO_SEGMENT_RE.sub(_REDACTED, redacted)
     # S-010: provider-token shapes run before the assignment regex so
     # ``api_key=sk_live_...`` hits the Stripe pattern in addition to the

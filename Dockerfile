@@ -57,8 +57,8 @@ RUN pip install --prefix=/install .
 
 # Install provider dependencies based on profile. Every profile names
 # [standard] (litellm + mcp) and [lineage], so the image keeps AI,
-# `fluid mcp serve` and OpenLineage emission once they leave the base install
-# in 0.28.0.
+# `fluid mcp serve` and OpenLineage emission now that they are out of the base
+# install (0.28.0).
 RUN if [ "${PROFILE}" = "experimental" ] || [ "${PROFILE}" = "alpha" ]; then \
       pip install --prefix=/install \
         ".[local,gcp,snowflake,viz,standard,lineage]"; \

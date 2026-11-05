@@ -282,18 +282,21 @@ class BufferedLineageEmitter(LineageEmitter):
 
 
 def _warn_once(key: str, message: str) -> None:
-    """Log a warning AND surface it on the CLI, at most once per process.
+    """Surface a warning on the CLI and log it, at most once per process.
 
     A lineage refusal that only reaches ``LOG.warning`` is invisible during
     a normal ``fluid apply`` (the ``fluid.acquire.lineage`` logger is not
     printed at default verbosity), so an operator who configured
     ``OPENLINEAGE_URL`` had no way to learn that nothing shipped. Deduped by
     ``key`` because emission is per-event and a run emits at least two.
+
+    The WARNING record is always emitted, so ``--log-file`` and log pipelines
+    keep it. After a successful console print it carries ``fluid_console_shown``,
+    which the CLI's console handler drops so the line is not shown twice.
     """
     if key in _WARNED:
         return
     _WARNED.add(key)
-    LOG.warning("%s", message)
     try:
         from fluid_build._console import cprint, literal_text
 
@@ -301,7 +304,14 @@ def _warn_once(key: str, message: str) -> None:
         # which Rich markup would read as a tag and drop.
         cprint(literal_text(f"⚠️  {message}", style="yellow"))
     except Exception:  # pragma: no cover — console is best-effort
-        pass
+        LOG.warning("%s", message)
+    else:
+        if LOG.hasHandlers():
+            LOG.warning("%s", message, extra={"fluid_console_shown": True})
+        else:
+            # Outside the CLI (library use) nothing handles the record, and
+            # logging's last-resort handler would print the line a second time.
+            LOG.debug("%s", message)
 
 
 #: Process-level dedup set for :func:`_warn_once`.

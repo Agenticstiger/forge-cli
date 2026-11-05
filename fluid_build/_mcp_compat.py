@@ -35,7 +35,7 @@ the migration guide, which oversells several removals:
   ``open_inmemory_session``).
 
 This module is the ONLY place allowed to branch on the SDK generation.
-The install pin (pyproject.toml) is ``mcp>=1.22,<3.0``, so both
+The install pin (pyproject.toml) is ``mcp>=1.30,!=2.0.*,!=2.1.*,<3.0``, so both
 generations install — the dual support here is what keeps both drift legs
 green.
 
@@ -68,10 +68,9 @@ def require_sdk(feature: str = "The MCP server") -> None:
     missing install reads as one install line and not ``No module named 'mcp'``.
     Probes with ``find_spec``; nothing is imported.
     """
-    from fluid_build._optional import MissingOptionalDependency, is_available
+    from fluid_build._optional import ensure_installed
 
-    if not is_available("mcp"):
-        raise MissingOptionalDependency("mcp", "mcp", feature)
+    ensure_installed("mcp", "mcp", feature)
 
 
 @functools.lru_cache(maxsize=1)

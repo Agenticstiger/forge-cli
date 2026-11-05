@@ -117,7 +117,7 @@ class TestHelpers:
         error("PATH=/usr/bin\x00PASSWORD=hunter2\x00HOME=/root; token\x1f=abc123")
         err = capsys.readouterr().err
         assert "hunter2" not in err and "abc123" not in err
-        assert "\\x00PASSWORD=<redacted>" in err
+        assert "\\x00PASSWORD=***REDACTED***" in err
 
     def test_heading(self, capsys):
         heading("My Section")

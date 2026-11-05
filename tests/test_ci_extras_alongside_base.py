@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The extras that will carry litellm, mcp and openlineage once base drops them.
+"""The extras that carry litellm, mcp and openlineage now that base dropped them.
 
-Slice 2 of the dependency diet adds ``[litellm]``, ``[mcp]``, ``[lineage]``,
-``[standard]`` and ``[ai]`` while base still lists all three packages. These
-tests keep that layout from drifting before the removal release.
+0.27.0 added ``[litellm]``, ``[mcp]``, ``[lineage]``, ``[standard]`` and
+``[ai]`` next to base; 0.28.0 removed the three packages from base. These
+tests keep the extras layout from drifting and keep the packages out of base.
 """
 
 from __future__ import annotations
@@ -55,14 +55,20 @@ def _names(extra: str) -> set[str]:
     return {g.requirement_name(r) for r in g.closure(extra, EXTRAS)}
 
 
-class TestLitellmMarkerSplit:
-    def test_base_still_has_the_split(self):
-        # If this fails the split moved or was collapsed in base; fix the
-        # guard and the extra together, never one alone.
-        assert len(_base_lines("litellm")) == 2
+class TestBaseIsLean:
+    @pytest.mark.parametrize("package", ["litellm", "mcp", "openlineage-python"])
+    def test_base_does_not_list_it(self, package):
+        assert _base_lines(package) == []
 
-    def test_extra_copies_both_marker_lines_verbatim(self):
-        assert sorted(EXTRAS["litellm"]) == sorted(_base_lines("litellm"))
+
+class TestLitellmMarkerSplit:
+    def test_extra_keeps_both_marker_lines_verbatim(self):
+        assert sorted(EXTRAS["litellm"]) == sorted(
+            [
+                "litellm>=1.83.14,!=1.107.0,<2; python_version >= '3.11'",
+                "litellm>=1.83.14,!=1.107.0,<1.98; python_version < '3.11'",
+            ]
+        )
 
     def test_python_310_keeps_the_cap(self):
         capped = [r for r in EXTRAS["litellm"] if "python_version < '3.11'" in r]
@@ -71,12 +77,12 @@ class TestLitellmMarkerSplit:
 
 
 class TestFilledExtras:
-    def test_mcp_matches_base_and_declares_pyjwt(self):
-        assert [r for r in _base_lines("mcp")][0] in EXTRAS["mcp"]
+    def test_mcp_pins_the_sdk_and_declares_pyjwt(self):
+        assert "mcp>=1.30,!=2.0.*,!=2.1.*,<3.0" in EXTRAS["mcp"]
         assert "pyjwt" in _names("mcp")
 
-    def test_lineage_matches_base(self):
-        assert EXTRAS["lineage"] == _base_lines("openlineage-python")
+    def test_lineage_carries_openlineage(self):
+        assert EXTRAS["lineage"] == ["openlineage-python>=1.52", "python-dateutil>=2.8.2"]
 
     def test_standard_covers_litellm_and_mcp(self):
         assert g.closure("litellm", EXTRAS) <= g.closure("standard", EXTRAS)

@@ -28,8 +28,9 @@ import json
 import logging
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -40,6 +41,17 @@ from fluid_build.cli import odps_standard as bitol_cli
 from fluid_build.cli.odps import cmd_opds_validate
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "fluid" / "contract-multi-expose.fluid.yaml"
+
+
+@contextmanager
+def _printed() -> Iterator[MagicMock]:
+    """Everything ``odps-bitol validate`` prints, through ``cprint`` or ``cprint_literal``."""
+    mock = MagicMock()
+    with (
+        patch("fluid_build.cli.odps_standard.cprint", mock),
+        patch("fluid_build.cli.odps_standard.cprint_literal", mock),
+    ):
+        yield mock
 
 
 def _bitol_validate(path: Path) -> int:
@@ -109,7 +121,7 @@ def test_bitol_validate_and_odps_validate_agree(tmp_path: Path, case: str) -> No
 
 def test_bitol_validate_names_the_schema_violation(tmp_path: Path) -> None:
     path = _case_file(tmp_path, "unknown-top-level-key")
-    with patch("fluid_build.cli.odps_standard.cprint") as printed:
+    with _printed() as printed:
         assert bitol_cli._run_odps_validate(argparse.Namespace(odps_file=str(path))) == 1
     message = printed.call_args.args[0]
     assert "Additional properties are not allowed" in message
@@ -120,7 +132,7 @@ def test_bitol_validate_reports_the_declared_api_version(tmp_path: Path) -> None
     """The success line says which schema the file was checked against."""
     for case, version in (("forge-exported", "v1.0.0"), ("v1.1.0-type-field", "v1.1.0")):
         path = _case_file(tmp_path, case)
-        with patch("fluid_build.cli.odps_standard.cprint") as printed:
+        with _printed() as printed:
             assert bitol_cli._run_odps_validate(argparse.Namespace(odps_file=str(path))) == 0
         assert version in printed.call_args.args[0]
 
@@ -139,7 +151,7 @@ def test_bitol_validate_rejects_a_file_that_is_not_a_mapping(tmp_path: Path) -> 
     """A top-level list reached ``.get`` on the schema path and raised."""
     path = tmp_path / "list.odps.yaml"
     path.write_text("- apiVersion: v1.0.0\n", encoding="utf-8")
-    with patch("fluid_build.cli.odps_standard.cprint") as printed:
+    with _printed() as printed:
         assert bitol_cli._run_odps_validate(argparse.Namespace(odps_file=str(path))) == 1
     assert "mapping" in printed.call_args.args[0]
 
@@ -156,7 +168,7 @@ def test_bitol_validate_rejects_a_file_that_is_not_a_mapping(tmp_path: Path) -> 
 
 def _validate_message(path: Path) -> tuple[int, str]:
     """Exit code, and the single line ``odps-bitol validate`` printed for the file."""
-    with patch("fluid_build.cli.odps_standard.cprint") as printed:
+    with _printed() as printed:
         code = bitol_cli._run_odps_validate(argparse.Namespace(odps_file=str(path)))
     assert printed.call_count == 1
     return code, printed.call_args.args[0]

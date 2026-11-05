@@ -46,11 +46,11 @@ ROOT = Path(__file__).resolve().parents[2]
 BASELINES = Path(__file__).resolve().parent / "dep_budget_baselines"
 
 # name -> (uv --python-platform, --python-version, ceiling). Measured with
-# uv 0.11.23 on 2026-11-03.
+# uv 0.11.23 on 2026-11-04.
 TARGETS: dict[str, tuple[str, str, int]] = {
-    "linux-py312": ("linux", "3.12", 87),
-    "linux-py310": ("linux", "3.10", 86),
-    "windows-py312": ("windows", "3.12", 88),
+    "linux-py312": ("linux", "3.12", 41),
+    "linux-py310": ("linux", "3.10", 45),
+    "windows-py312": ("windows", "3.12", 40),
 }
 
 # ``name==version`` or ``name @ url``: uv writes one or the other per package.

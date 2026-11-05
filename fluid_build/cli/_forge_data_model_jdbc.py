@@ -31,7 +31,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, literal_error_text, literal_text
 from fluid_build.util.contract import slugify_identifier
 
 # Canonical FLUID contract-id pattern (lowercased form — ``product_id`` is
@@ -83,7 +83,10 @@ def _run_from_jdbc_source(
     except (ImportError, ValueError) as exc:
         # Over MCP this console is the server's, and its log: whatever the
         # message quotes, the URI's password is masked.
-        cprint(f"[red]JDBC introspection failed:[/red] {_error_text(exc, args.uri)}")
+        cprint(
+            literal_text("JDBC introspection failed:", "red")
+            + literal_error_text(f" {_error_text(exc, args.uri)}")
+        )
         return 2
     except Exception as exc:  # noqa: BLE001 — surface clean
         # Connect / SQL errors carry detail the operator needs to see
@@ -91,7 +94,10 @@ def _run_from_jdbc_source(
         # authentication failed", etc.), with the URI's password masked.
         # Structured logs (which may flow to log aggregators) get only the
         # exception class.
-        cprint(f"[red]JDBC introspection failed:[/red] {_error_text(exc, args.uri)}")
+        cprint(
+            literal_text("JDBC introspection failed:", "red")
+            + literal_error_text(f" {_error_text(exc, args.uri)}")
+        )
         logger.debug("jdbc_introspect_failed: %s", type(exc).__name__)
         return 1
 

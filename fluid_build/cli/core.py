@@ -99,6 +99,8 @@ except ImportError:
 
 # Import CLIError as the base exception so FluidCLIError can inherit from it.
 # This unifies the error hierarchy: CLIError (lightweight) ← FluidCLIError (enhanced).
+from fluid_build._console import literal_error_text
+
 from ._common import CLIError as _BaseCLIError
 
 
@@ -354,7 +356,7 @@ class CLIContext:
             return 1
         else:
             # Unexpected error
-            self.console.print(f"[red]❌ Unexpected error: {error}[/red]")
+            self.console.print(literal_error_text(f"❌ Unexpected error: {error}", "red"))
             self.logger.exception("unexpected_error", extra={"error": str(error)})
             self.finish_command(success=False)
             return 2

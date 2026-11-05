@@ -26,7 +26,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, literal_error_text
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_copilot_runtime import normalize_provider_name, normalize_template_name
 from fluid_build.cli.forge_copilot_taxonomy import (
@@ -78,7 +78,9 @@ class CopilotLegacyScaffoldMixin:
             return success
         except Exception as exc:
             if self.console:
-                self.console.print(f"[red]❌ ForgeEngine integration failed: {exc}[/red]")
+                self.console.print(
+                    literal_error_text(f"❌ ForgeEngine integration failed: {exc}", "red")
+                )
             else:
                 console_error(f"ForgeEngine integration failed: {exc}")
             return False

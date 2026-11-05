@@ -368,7 +368,9 @@ The interview is **mode-aware**: compose runs ~3 questions seeded from upstream 
 
 Cost is visible before it's spent: every run renders `.fluid/agents/<run-id>/{cost.json,reasoning.md,transcript.json}` and `.fluid/forge-receipt.json`. Aggregate across runs via `fluid stats --by provider|type|engine`.
 
-Opt into the **LiteLLM unified backend** for one API across OpenAI / Anthropic / Gemini / Bedrock / Azure / Vertex / Groq / Cohere / Mistral / Ollama:
+AI authoring through an API-key provider runs on the **LiteLLM unified backend** (one API across OpenAI / Anthropic / Gemini / Bedrock / Azure / Vertex / Groq / Cohere / Mistral / Ollama). litellm is an extra since 0.28.0, not part of the base install: `[litellm]` (alias `[ai]`), or `[standard]` for AI + MCP. Without it, a litellm-backed `--llm-provider` fails up front with the install line; the keyless coding-agent providers (`claude-code`, `codex`, `cursor`, `kiro`), `mcp-sampling` and `--template`/`--blank` forge need no extra. MCP (`fluid mcp serve`, `fluid mcp output-port serve`, `scaffold-ide`) needs `[mcp]` and OpenLineage emission needs `[lineage]`; all three gate through `fluid_build/_optional.py`.
+
+When you add code that uses one of them: route it through `require()` / `is_available()`, never a module-scope import. `.[dev]` installs all three, so only `scripts/ci/bare_install_smoke.sh` (the bare wheel, asserting the hints) and `scripts/ci/dep_budget.py` (the base package count per target) see a regression. boto3 no longer arrives through litellm, so AWS paths need `[aws]`.
 
 ```bash
 pip install "data-product-forge[litellm]"

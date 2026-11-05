@@ -152,13 +152,13 @@ echo ""
 # Determine version if not specified
 if [ -z "$VERSION" ]; then
     print_warning "No version specified, will install latest from $PROFILE profile"
-    VERSION_SPEC="data-product-forge"
+    VERSION_SPEC="data-product-forge[standard,lineage]"
     if [ "$TAG" = "" ]; then
         TAG="$PROFILE-latest"
     fi
 else
     print_success "Building with version: $VERSION"
-    VERSION_SPEC="data-product-forge==$VERSION"
+    VERSION_SPEC="data-product-forge[standard,lineage]==$VERSION"
     if [ "$TAG" = "" ]; then
         TAG="$VERSION"
     fi
@@ -214,9 +214,9 @@ ARG PROFILE
 RUN if [ -n "${PYPI_USER}" ] && [ -n "${PYPI_PASS}" ]; then \
       PYPI_HOST=$(echo ${PYPI_URL} | sed 's|http://||;s|/.*||'); \
       AUTH_PYPI_URL="http://${PYPI_USER}:${PYPI_PASS}@${PYPI_HOST}/simple"; \
-      pip install --index-url "${AUTH_PYPI_URL}" --trusted-host ${PYPI_HOST} ${VERSION_SPEC}; \
+      pip install --index-url "${AUTH_PYPI_URL}" --trusted-host ${PYPI_HOST} "${VERSION_SPEC}"; \
     else \
-      pip install --index-url ${PYPI_URL} --trusted-host $(echo ${PYPI_URL} | sed 's|http://||;s|/.*||') ${VERSION_SPEC}; \
+      pip install --index-url ${PYPI_URL} --trusted-host $(echo ${PYPI_URL} | sed 's|http://||;s|/.*||') "${VERSION_SPEC}"; \
     fi
 
 # Install provider dependencies based on profile

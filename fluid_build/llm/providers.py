@@ -41,6 +41,7 @@ __all__ = [
     "normalize_llm_provider_name",
     "query_ollama_models",
     "reset_llm_caches",
+    "preflight_llm_provider",
     "resolve_llm_config",
     "resolve_model_name",
     "resolve_ollama_model",
@@ -473,6 +474,30 @@ def normalize_llm_provider_name(value: Any) -> str:
     return normalized
 
 
+_LITELLM_ALTERNATIVES = (
+    "Or author without it: --llm-provider claude-code (uses your Claude Code login) "
+    "or --template starter."
+)
+
+
+def _require_litellm(provider_name: str) -> None:
+    """Fail now, before any context or memory is loaded, when litellm is absent.
+
+    Only the litellm-backed providers reach this; keyless coding agents and
+    ``mcp-sampling`` return earlier. The error is a
+    :class:`~fluid_build._optional.MissingOptionalDependency`, which the CLI
+    prints as the install line and exits 1 on, with no traceback.
+    """
+    from fluid_build._optional import ensure_installed
+
+    ensure_installed(
+        "litellm",
+        "litellm",
+        f"AI-assisted authoring (--llm-provider {provider_name})",
+        _LITELLM_ALTERNATIVES,
+    )
+
+
 def get_llm_provider(name: str) -> LlmProvider:
     """Resolve a provider adapter by name.
 
@@ -495,9 +520,10 @@ def get_llm_provider(name: str) -> LlmProvider:
     remaining name falls through to litellm's native provider routing. Plugin
     discovery is lazy (first call here) so ``fluid --help`` never scans it.
 
-    ``litellm`` is an optional dependency (the ``[litellm]`` extra, still
-    installed by default today). Reaching for it without the package raises a
-    ``copilot_litellm_unavailable`` error carrying the install line.
+    ``litellm`` is an optional dependency (the ``[litellm]`` / ``[standard]``
+    extra; not in the base install since 0.28.0). Choosing a litellm-backed
+    provider without the package raises ``MissingOptionalDependency`` here, up
+    front, carrying the install line and the keyless alternatives.
     """
     normalized = (name or "").strip().lower()
     if normalized in ("mcp-sampling", "mcp_sampling"):
@@ -520,6 +546,7 @@ def get_llm_provider(name: str) -> LlmProvider:
     from fluid_build.llm.litellm_backend import get_litellm_provider
 
     if canonical in BUILTIN_LLM_PROVIDERS:
+        _require_litellm(canonical)
         return get_litellm_provider(canonical)
 
     # Third-party provider plugins (fluid_build.llm_providers entry points).
@@ -533,6 +560,7 @@ def get_llm_provider(name: str) -> LlmProvider:
 
     # Fallback: litellm's catch-all for any other provider it natively supports
     # (e.g. github/azure/bedrock/vertex_ai) — unchanged behaviour.
+    _require_litellm(canonical)
     return get_litellm_provider(canonical)
 
 
@@ -755,16 +783,73 @@ _KEYLESS_PROVIDERS: frozenset = frozenset(
 )
 
 
-def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -> LlmConfig:
-    """Resolve provider, model, endpoint, and API key from flags and env vars."""
-    env = dict(environ or os.environ)
-    provider_name = (
+def _provider_name_from(args: Any, env: Mapping[str, str]) -> str:
+    """The provider name the flags and environment select (flag, env, key sniff, default)."""
+    return (
         getattr(args, "llm_provider", None)
         or env.get("FLUID_LLM_PROVIDER")
         or env.get("FLUID_FORGE_AGENT")
         or _infer_provider_from_env(env)
         or "gemini"
     )
+
+
+_AGENT_LOOP_ALTERNATIVES = (
+    "Or author without it: --template starter. The agent loop needs a provider that "
+    "supports tool use, which the keyless providers (claude-code, codex, cursor, kiro, "
+    "mcp-sampling) do not."
+)
+
+
+def preflight_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = None) -> None:
+    """Fail fast when the selected provider cannot be used on this install.
+
+    Cheap and side-effect free (no key lookup, no network, no litellm import):
+    it only resolves the provider adapter, which raises
+    :class:`~fluid_build._optional.MissingOptionalDependency` when a
+    litellm-backed provider is chosen and litellm is absent. Call it before
+    anything that reads workspace context or memory.
+
+    The error is tailored to the run: ``(--llm-provider X)`` only when the flag
+    was passed, and in ``--agent-loop`` only the alternative that works there.
+    """
+    from fluid_build._optional import MissingOptionalDependency, ensure_installed
+
+    env = dict(environ or os.environ)
+    agent_loop = bool(getattr(args, "agent_loop", False))
+    if not (
+        getattr(args, "llm_provider", None)
+        or env.get("FLUID_LLM_PROVIDER")
+        or env.get("FLUID_FORGE_AGENT")
+    ):
+        # Nothing chosen: inference reads the keyring and probes Ollama, and every
+        # provider it can pick (or the gemini default) needs litellm. Fail first.
+        ensure_installed(
+            "litellm",
+            "litellm",
+            "AI-assisted authoring",
+            _AGENT_LOOP_ALTERNATIVES if agent_loop else _LITELLM_ALTERNATIVES,
+        )
+    name = _provider_name_from(args, env)
+    if not isinstance(name, str):
+        return
+    try:
+        get_llm_provider(name)
+    except MissingOptionalDependency as exc:
+        flagged = bool(getattr(args, "llm_provider", None))
+        how = f"--llm-provider {name}" if flagged else f"provider {name}"
+        raise MissingOptionalDependency(
+            exc.module,
+            exc.extra,
+            f"AI-assisted authoring ({how})",
+            alternatives=_AGENT_LOOP_ALTERNATIVES if agent_loop else _LITELLM_ALTERNATIVES,
+        ) from None
+
+
+def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -> LlmConfig:
+    """Resolve provider, model, endpoint, and API key from flags and env vars."""
+    env = dict(environ or os.environ)
+    provider_name = _provider_name_from(args, env)
     provider = get_llm_provider(provider_name)
 
     # Resolve model: explicit flag → env var → catalog default → class default.
@@ -1513,6 +1598,23 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
 
     model = env.get("FLUID_LLM_MODEL") or saved_model or provider.default_model
     endpoint = env.get("FLUID_LLM_ENDPOINT") or provider.default_endpoint(model, env)
+
+    # Every built-in provider runs through litellm, which is an extra since 0.28.0.
+    # A configured key is not "ready" without it.
+    from fluid_build._optional import is_available
+
+    if not is_available("litellm"):
+        return LlmReadinessCheck(
+            ready=False,
+            provider=provider.name,
+            model=model,
+            endpoint=endpoint,
+            auth_available=True,
+            error=(
+                f"{provider.name} needs litellm, which is not installed: "
+                "pip install 'data-product-forge[litellm]'"
+            ),
+        )
 
     LOG.debug("LLM readiness: provider=%s model=%s ready=True", provider.name, model)
     return LlmReadinessCheck(
