@@ -708,3 +708,89 @@ def test_dotenv_cannot_widen_the_host_or_secret_ref_allowlists(
         "FLUID_COMMAND_CENTER_HOST_ALLOWLIST",
     ):
         assert name not in os.environ, name
+
+
+# ── the embedded Debezium Server's own configuration ─────────────────────────
+#
+# The embedded Debezium Server inherits this process's environment, and its
+# SmallRye Config reads a property from a variable (ordinal 300) over
+# application.properties: by the property's own name, with every other
+# character as "_", upper-cased, and per profile as "%prod.<name>" or
+# "_PROD_<NAME>". A project file that set one could move the sink's catalog
+# past the sink.catalogAuth pairing, or the source database, or load another
+# config file.
+
+_SERVER_SETTINGS = (
+    "DEBEZIUM_SINK_ICEBERG_URI",
+    "debezium.sink.iceberg.uri",
+    "debezium_sink_iceberg_uri",
+    "DEBEZIUM_SINK_ICEBERG_HEADER_X_LEAK",
+    "DEBEZIUM_SOURCE_DATABASE_HOSTNAME",
+    "_PROD_DEBEZIUM_SINK_ICEBERG_URI",
+    "%prod.debezium.sink.iceberg.uri",
+    # SmallRye matches a property's "." to ".", "-", "_" or "/" in a variable
+    # name, the profile's separator included
+    "%PROD_DEBEZIUM_SINK_ICEBERG_URI",
+    "%prod-debezium.sink.iceberg.uri",
+    "%prod_debezium.sink.iceberg.uri",
+    "%dev,prod.debezium.sink.iceberg.uri",
+    "QUARKUS_CONFIG_LOCATIONS",
+    "quarkus.config.locations",
+    "QUARKUS_PROFILE",
+    "SMALLRYE_CONFIG_LOCATIONS",
+    "MP_CONFIG_PROFILE",
+)
+
+#: What the server's JVM and its run.sh launcher read: a ``-D`` system
+#: property (ordinal 400) outranks the environment and the properties file.
+_SERVER_LAUNCH_SETTINGS = (
+    "JDK_JAVA_OPTIONS",
+    "JAVA_OPTS",
+    "JAVA_HOME",
+    "EXTRA_CONNECTOR",
+    "JMX_HOST",
+    "JMX_PORT",
+    "JMX_EXPORTER_PORT",
+    "JMX_EXPORTER_CONFIG",
+    "OTEL_JAVAAGENT_EXTENSIONS",
+    "OTEL_JAVAAGENT_CONFIGURATION_FILE",
+)
+
+
+@pytest.mark.parametrize("name", _SERVER_SETTINGS + _SERVER_LAUNCH_SETTINGS)
+def test_the_debezium_servers_configuration_is_operator_only(name: str) -> None:
+    from fluid_build.credentials.protected_env import is_protected_env_key
+
+    assert is_protected_env_key(name)
+
+
+@pytest.mark.parametrize("name", ["MY_DEBEZIUM_URI", "DEBEZIUMX_HOST", "QUARKUSX", "MP_CONFIGX"])
+def test_a_look_alike_of_the_servers_namespaces_is_not_caught(name: str) -> None:
+    from fluid_build.credentials.protected_env import is_protected_env_key
+
+    assert not is_protected_env_key(name)
+
+
+def test_a_project_dotenv_cannot_configure_the_debezium_server(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / ".env").write_text(
+        "DEBEZIUM_SINK_ICEBERG_URI=https://evil.example/catalog\n"
+        "_PROD_DEBEZIUM_SINK_ICEBERG_URI=https://evil.example/catalog\n"
+        "QUARKUS_CONFIG_LOCATIONS=/tmp/evil.properties\n"
+        "SMALLRYE_CONFIG_LOCATIONS=/tmp/evil.properties\n"
+        f"PROTECTED_ENV_TEST_API_KEY={_TEST_API_KEY}\n"
+    )
+
+    with caplog.at_level(logging.WARNING):
+        hydrate_dotenv(tmp_path, environment="dev")
+
+    for name in (
+        "DEBEZIUM_SINK_ICEBERG_URI",
+        "_PROD_DEBEZIUM_SINK_ICEBERG_URI",
+        "QUARKUS_CONFIG_LOCATIONS",
+        "SMALLRYE_CONFIG_LOCATIONS",
+    ):
+        assert name not in os.environ, name
+    assert os.environ.get("PROTECTED_ENV_TEST_API_KEY") == _TEST_API_KEY
+    assert any("DEBEZIUM_SINK_ICEBERG_URI" in r.getMessage() for r in _warnings(caplog))
