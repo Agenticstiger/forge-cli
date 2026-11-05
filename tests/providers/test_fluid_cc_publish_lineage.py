@@ -1030,6 +1030,15 @@ class TestLocalLocation:
 
         assert body["metadata"]["location"] == self._landed(contract, landed)
 
+    def test_a_path_climbing_out_has_one_spelling(self, cc, tmp_path, monkeypatch):
+        text = _with_location({"path": "../shared/out/orders.parquet"})
+        contract = _write_product(tmp_path, text, overlay=False)
+
+        body = self._sent(cc, monkeypatch, tmp_path, contract)
+
+        shared = contract.resolve().parent.parent / "shared" / "out" / "orders.parquet"
+        assert body["metadata"]["location"] == {"path": str(shared)}
+
     @pytest.mark.parametrize(
         ("binding_format", "expose_format", "landed"),
         [
@@ -1057,9 +1066,11 @@ class TestLocalLocation:
     @pytest.mark.parametrize(
         ("location", "builds", "landed"),
         [
-            # ``fluid validate`` refuses both contracts; the report must not
-            # fail the publish, so the file keeps its declared name.
+            # Nothing can build these (the schema refuses the first two, and
+            # ``/`` names no file); the report must not fail the publish, so
+            # the file keeps its declared name.
             ({"path": "out/orders"}, [{"id": "transform", "engine": 5}], "out/orders"),
+            ({"path": "out/orders"}, 5, "out/orders"),
             ({"path": "/"}, EMBEDDED_SQL, "/"),
         ],
     )

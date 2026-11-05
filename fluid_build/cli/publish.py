@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -524,8 +525,9 @@ def _reported_location(
     The Command Center shows a local deployment's location as it is sent, and a
     relative ``location.path`` names a file only together with the directory
     the engine anchors it at: the source contract's
-    (``fluid_build.util.binding_paths``). So a local path is anchored there,
-    under the local provider's file name when that provider writes the expose
+    (``fluid_build.util.binding_paths``). So a local path is anchored there and
+    cleaned to one spelling (``x/../shared`` is ``shared``), under the local
+    provider's file name when that provider writes the expose
     (``local_provider_landing``, the rule the ``consumes[]`` reader applies),
     the way ``docker compose config`` resolves a relative path against the
     Compose file's directory. Only this report changes: the contract, and the
@@ -534,10 +536,10 @@ def _reported_location(
 
     ``asset.location`` is returned as it is for any other platform; for an
     endpoint the checkout named (``project_file``), which is not sent the
-    runner's own layout, as it is not sent its ``{{ env.* }}`` values; and for
-    a path that still holds a ``{{ env.NAME }}``: ``resolve_binding_path`` would
-    fill it from the environment, including the credential-shaped names
-    :func:`resolve_contract_env_templates` leaves literal.
+    runner's own layout, as it is not sent its ``{{ env.* }}`` values; for a
+    remote URI; and for a path that still holds a ``{{ env.NAME }}``:
+    ``resolve_binding_path`` would fill it from the environment, including the
+    credential-shaped names :func:`resolve_contract_env_templates` leaves literal.
     """
     from fluid_build._contract_loader import source_contract_dir
     from fluid_build.build_runners._embedded_sql_io import _landed_by_local_provider
@@ -556,20 +558,25 @@ def _reported_location(
         or not path
         or not isinstance(path, str)
         or ENV_PLACEHOLDER_RE.search(path)
+        or is_remote_uri(path)
     ):
         return location
-    landed = resolve_binding_path(path, source_contract_dir(contract_path, logger))
+    anchored = resolve_binding_path(path, source_contract_dir(contract_path, logger))
+    landed = os.path.normpath(anchored)
     expose = contract["exposes"][0]
     try:
-        if not is_remote_uri(landed) and _landed_by_local_provider(contract, expose):
+        if _landed_by_local_provider(contract, expose):
             # The format as the writer reads it (``LocalProvider._derive_actions_from_contract``).
             fmt = expose["binding"].get("format") or expose.get("format")
             landed, _ = local_provider_landing(landed, fmt)
     except (AttributeError, TypeError, ValueError) as exc:
-        # Only a contract the schema refuses gets here (``builds[].engine: 5``,
-        # ``location.path: /``), and ``fluid validate`` names it. Reporting the
-        # file must not fail the publish: its name stays as declared.
-        logger.debug("reported location keeps the declared file name: %s", type(exc).__name__)
+        # Only a contract nothing can build gets here: one the schema refuses
+        # (``builds[].engine: 5``) or a path the writer cannot name a file at
+        # (``/``). Reporting the file must not fail the publish: its name stays
+        # as declared.
+        logger.debug(
+            "reported location keeps the declared file name: %s: %s", type(exc).__name__, exc
+        )
     return {**location, "path": landed}
 
 
