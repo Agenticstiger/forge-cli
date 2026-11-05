@@ -454,6 +454,7 @@ async def publish_contract(
             from ._publish_provenance import contract_provenance
 
             asset.provenance = contract_provenance(contract_path)
+            asset.location = _reported_location(asset, contract, contract_path, project_file)
     except Exception as e:
         return PublishResult(
             success=False,
@@ -513,6 +514,55 @@ async def publish_contract(
 
     result = await provider.publish(asset)
     return result
+
+
+def _reported_location(
+    asset: Any, contract: Dict[str, Any], contract_path: Path, project_file: Optional[str]
+) -> Any:
+    """The ``metadata.location`` a Command Center publish reports for ``asset``.
+
+    The Command Center shows a local deployment's location as it is sent, and a
+    relative ``location.path`` names a file only together with the directory
+    the engine anchors it at: the source contract's
+    (``fluid_build.util.binding_paths``). So a local path is anchored there,
+    under the local provider's file name when that provider writes the expose
+    (``local_provider_landing``, the rule the ``consumes[]`` reader applies),
+    the way ``docker compose config`` resolves a relative path against the
+    Compose file's directory. Only this report changes: the contract, and the
+    ``contract_yaml`` sent with it, keep the path as written, and a changed
+    location is a new dict.
+
+    ``asset.location`` is returned as it is for any other platform; for an
+    endpoint the checkout named (``project_file``), which is not sent the
+    runner's own layout, as it is not sent its ``{{ env.* }}`` values; and for
+    a path that still holds a ``{{ env.NAME }}``: ``resolve_binding_path`` would
+    fill it from the environment, including the credential-shaped names
+    :func:`resolve_contract_env_templates` leaves literal.
+    """
+    from fluid_build._contract_loader import source_contract_dir
+    from fluid_build.build_runners._embedded_sql_io import _landed_by_local_provider
+    from fluid_build.util.binding_paths import (
+        ENV_PLACEHOLDER_RE,
+        is_remote_uri,
+        local_provider_landing,
+        resolve_binding_path,
+    )
+
+    location = asset.location
+    path = location.get("path") if isinstance(location, dict) else None
+    if (
+        asset.platform != "local"
+        or project_file
+        or not path
+        or not isinstance(path, str)
+        or ENV_PLACEHOLDER_RE.search(path)
+    ):
+        return location
+    landed = resolve_binding_path(path, source_contract_dir(contract_path, logger))
+    expose = contract["exposes"][0]
+    if not is_remote_uri(landed) and _landed_by_local_provider(contract, expose):
+        landed, _ = local_provider_landing(landed, expose["binding"].get("format"))
+    return {**location, "path": landed}
 
 
 def _publish_catalog_config(
