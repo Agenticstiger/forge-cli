@@ -57,24 +57,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *Before:* `pip install data-product-forge` pulled in litellm, mcp and openlineage-python, and with
   them boto3 (through litellm), aiohttp, openai, tokenizers and about fifty more packages.
   *Now:* the base install is the core pipeline (`validate`, `plan`, `apply`, `verify`, `publish`,
-  `generate iac`, `bundle`, `diff`, `doctor`, and template or blank `forge`). Each feature that
-  needs one of the three prints the exact install line and exits 1, with no traceback, before it
-  does any work:
-  - AI forge with an API-key provider (`fluid forge --llm-provider openai|anthropic|gemini|...`),
-    `forge data-model`, `ai setup`, the agent loop and the staged copilot agents need
-    `pip install 'data-product-forge[litellm]'` (alias `[ai]`) or `[standard]`. The error is raised
-    before the interview reads any context or memory and before the interactive setup reads the OS
-    keyring or asks for a key (`fluid forge --llm-provider openai` and `fluid ai setup` stop at
-    once), and it names the ways to author without it:
-    `--llm-provider claude-code` (uses your Claude Code login; `codex`, `cursor`, `kiro` and
-    `mcp-sampling` are keyless too) and `--template starter`. Template and blank forge are
+  `generate iac`, `bundle`, `diff`, `doctor`, and template or blank `forge`). A command that cannot
+  run without one of the three prints the exact install line and exits 1, with no traceback, before
+  it does any work:
+  - An API-key provider (`--llm-provider openai|anthropic|gemini|ollama`, or `--llm-model` alone,
+    which resolves to Ollama) needs `pip install 'data-product-forge[litellm]'` (alias `[ai]`) or
+    `[standard]`, in `fluid forge`, `fluid forge --agent-loop`, `fluid forge data-model` and the
+    staged copilot agents; so does `fluid ai setup`. The error is raised before the interview reads
+    any context or memory and before the interactive setup reads the OS keyring or asks for a key.
+    `fluid forge` names the ways to author without it, `--llm-provider claude-code` (uses your
+    Claude Code login) and `--template starter`; in `--agent-loop` only `--template starter`, since
+    the keyless agents have no tool use. `fluid ai setup` also names `codex`, `cursor`, `kiro`
+    (each uses its own CLI login) and `mcp-sampling`. `fluid forge data-model` with no `--llm-*`
+    flag runs offline and needs no extra. `fluid init`'s hand-off into AI setup, and an
+    interactive `fluid forge` with no provider chosen, use Claude Code when it is installed;
+    otherwise they print the install line and the alternatives, then fall back to template or
+    guided mode instead of exiting. Template and blank forge are
     unchanged. `fluid doctor` no longer reports a configured provider as ready when litellm is
     missing.
-  - `fluid mcp serve`, `fluid mcp output-port serve`, the MCP delegates and keyless
-    `mcp-sampling` need `[mcp]` or `[standard]`. `fluid scaffold-ide` needs it too, and writes
-    nothing without it, because every entry it writes launches `fluid mcp serve`.
-  - Sending lineage to `OPENLINEAGE_URL` needs `[lineage]`. Without it, `fluid apply` logs one
-    warning naming the extra and carries on; the SDK conformance suite fails with the same hint.
+  - `fluid mcp serve`, `fluid mcp output-port serve` and the MCP delegates need `[mcp]` or
+    `[standard]` (`mcp-sampling` works only inside `fluid mcp serve`). `fluid scaffold-ide` needs it
+    too, and writes nothing without it, because every entry it writes launches `fluid mcp serve`.
+  - Sending lineage to `OPENLINEAGE_URL` needs `[lineage]`. Without it, `fluid apply` through
+    OpenTofu and acquisition builds, the paths that emit lineage, print one warning naming the extra
+    and carry on; the SDK conformance suite fails with the same hint.
   - AWS users need `[aws]`: boto3 used to arrive silently through litellm. Without it, an AWS
     command that needs the account id fails with "The AWS account id could not be resolved: boto3
     is not installed, so sts:GetCallerIdentity cannot be called. Install it with pip install
