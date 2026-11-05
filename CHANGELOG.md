@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The interactive AI interview stopped at the data-modeling question, and `fluid ai test`
+  with no provider configured crashed.** Both printed a `NameError`
+  (`_DATA_VAULT_2_ALIASES`, `detect_ollama_available`). Each function read, as a bare name, a
+  value that only its module's `__getattr__` could supply, and Python never consults that hook
+  for a bare name. Both now read the value through the module that defines it. A test checks every
+  module with a module-level `__getattr__` for the same mistake. The interview bug dates from
+  0.10.0 and is in 0.27.0.
+
 - **A sovereignty refusal says why on every command.** `fluid generate iac` turned a typed
   refusal (a placement outside `sovereignty.allowedRegions`, say) into `generate_iac_failed` and
   printed only the finding; it now prints the error's reason (`... allows me-central-1,
