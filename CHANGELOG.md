@@ -7,45 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **The interactive AI interview stopped at the data-modeling question, and `fluid ai test`
-  with no provider configured crashed.** Both printed a `NameError`
-  (`_DATA_VAULT_2_ALIASES`, `detect_ollama_available`). Each function read, as a bare name, a
-  value that only its module's `__getattr__` could supply, and Python never consults that hook
-  for a bare name. Both now read the value through the module that defines it. A test checks every
-  module with a module-level `__getattr__` for the same mistake. Both bugs date from 0.8.2a1 and
-  are in 0.27.0.
-
-- **`fluid publish` tells the Command Center where a local product's file is.** A relative
-  `location.path` (`./out/party.parquet`) was reported as written, so the deployment's location
-  named no file: the engine anchors that path at the contract's directory, not the reader's. The
-  Command Center now gets the path the engine writes, anchored there with any `..` folded, under
-  the local provider's file name when it writes the expose (`out/orders` with `format: parquet`
-  is `out/orders.parquet`, an absolute path too); `--dry-run` shows it. The contract, and the
-  `contract_yaml` sent with it, keep the path as written. The path is the publishing machine's,
-  which the Command Center shows only to the owners, admins and members of the product's
-  organization, not to its viewers. Reported as before: a remote URI, another platform's
-  location, a publish to an endpoint the checkout's project config named, and a path whose
-  `{{ env.* }}` placeholder publish leaves unfilled (a credential-shaped name, or one that is not
-  set): this step never fills it in. A placeholder publish does fill is anchored with the rest of
-  the path.
-- **A sovereignty refusal says why on every command.** `fluid generate iac` turned a typed
-  refusal (a placement outside `sovereignty.allowedRegions`, say) into `generate_iac_failed` and
-  printed only the finding; it now prints the error's reason (`... allows me-central-1,
-  me-south-1`), fix and doc, as `fluid apply` does. A typed error whose message is too long for
-  the panel's title (one that lists every finding) is now printed whole in the panel instead of
-  cut at the border.
-- **A Databricks landing leaves nothing behind.** After the load, the bronze landing now also
-  removes the build's and the product's directories in the staging volume
-  (`<volume>/<product>/<build>/`) once each is listed empty, never one another run or build still
-  uses. It deletes the local masked Parquet copy under `.fluid/staging/<build>/` after the load
-  attempt, success or failure, and says so in `facets.databricks_load.local_staging_deleted`; one
-  that cannot be deleted fails the run, naming it.
-- **`fluid apply --mode dry-run` lists the superseded functions the apply would drop.** The
-  Databricks dry run now prints `would drop superseded function <name>` (or `would leave function
-  <name>: <why>`) for each `fluid_` mask or row-filter function a successful apply's clean-up would
-  drop, worked out the same way against the bindings the apply leaves, and runs nothing.
+## [0.28.0] — 2026-11-06
 
 ### Added
 
@@ -154,6 +116,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `python scripts/add_license_headers.py`, which also migrates a file that still has the old block,
   and the License Headers check enforces the new form.
 
+### Fixed
+
+- **The interactive AI interview stopped at the data-modeling question, and `fluid ai test`
+  with no provider configured crashed.** Both printed a `NameError`
+  (`_DATA_VAULT_2_ALIASES`, `detect_ollama_available`). Each function read, as a bare name, a
+  value that only its module's `__getattr__` could supply, and Python never consults that hook
+  for a bare name. Both now read the value through the module that defines it. A test checks every
+  module with a module-level `__getattr__` for the same mistake. Both bugs date from 0.8.2a1 and
+  are in 0.27.0.
+
+- **`fluid publish` tells the Command Center where a local product's file is.** A relative
+  `location.path` (`./out/party.parquet`) was reported as written, so the deployment's location
+  named no file: the engine anchors that path at the contract's directory, not the reader's. The
+  Command Center now gets the path the engine writes, anchored there with any `..` folded, under
+  the local provider's file name when it writes the expose (`out/orders` with `format: parquet`
+  is `out/orders.parquet`, an absolute path too); `--dry-run` shows it. The contract, and the
+  `contract_yaml` sent with it, keep the path as written. The path is the publishing machine's,
+  which the Command Center shows only to the owners, admins and members of the product's
+  organization, not to its viewers. Reported as before: a remote URI, another platform's
+  location, a publish to an endpoint the checkout's project config named, and a path whose
+  `{{ env.* }}` placeholder publish leaves unfilled (a credential-shaped name, or one that is not
+  set): this step never fills it in. A placeholder publish does fill is anchored with the rest of
+  the path.
+- **A sovereignty refusal says why on every command.** `fluid generate iac` turned a typed
+  refusal (a placement outside `sovereignty.allowedRegions`, say) into `generate_iac_failed` and
+  printed only the finding; it now prints the error's reason (`... allows me-central-1,
+  me-south-1`), fix and doc, as `fluid apply` does. A typed error whose message is too long for
+  the panel's title (one that lists every finding) is now printed whole in the panel instead of
+  cut at the border.
+- **A Databricks landing leaves nothing behind.** After the load, the bronze landing now also
+  removes the build's and the product's directories in the staging volume
+  (`<volume>/<product>/<build>/`) once each is listed empty, never one another run or build still
+  uses. It deletes the local masked Parquet copy under `.fluid/staging/<build>/` after the load
+  attempt, success or failure, and says so in `facets.databricks_load.local_staging_deleted`; one
+  that cannot be deleted fails the run, naming it.
+- **`fluid apply --mode dry-run` lists the superseded functions the apply would drop.** The
+  Databricks dry run now prints `would drop superseded function <name>` (or `would leave function
+  <name>: <why>`) for each `fluid_` mask or row-filter function a successful apply's clean-up would
+  drop, worked out the same way against the bindings the apply leaves, and runs nothing.
+
+- **`fluid odcs validate --roundtrip` failed on an installed CLI** because `deepdiff` was
+  declared only for development. It now belongs to the `[odcs-strict]` extra, and a missing
+  `deepdiff` says which extra to install.
+
+- **Install hints keep their `[extra]` when the CLI prints them.** Rich read the `[litellm]` in
+  `pip install 'data-product-forge[litellm]'` as a style tag and dropped it, so the line a user
+  most needs after the 0.28.0 install change read `pip install 'data-product-forge'`. Every CLI
+  site that prints an exception's message, suggestions or hint (`forge`, `forge data-model`,
+  the AI copilot and template-mode error renderers, `core`, `doctor`, `market`, `auth`) now prints
+  it as written, with control characters spelled out. `tests/test_hints_print_literally.py` scans
+  those modules and fails on a new site that prints such text as markup.
+- **The `[litellm]` install line was lost, printed twice, or blamed setup.** `fluid ai status`
+  put it in a markup panel, so it read `pip install 'data-product-forge'`. `fluid forge
+  data-model ... --llm-provider` printed it twice (a log line, then the error). `fluid doctor`
+  said "Not configured: run 'fluid ai setup'" for a provider that was configured but could not
+  run; it now shows the install line. In `forge --agent-loop` the hint no longer recommends
+  `--llm-provider claude-code`, which has no tool use and crashed there. A provider picked by
+  Ollama detection, not by flag, is named `provider ollama`, not `--llm-provider ollama`.
+  Interactive `fluid forge` without litellm no longer offers or saves Ollama, reads the keyring
+  or asks for a key: it offers the keyless agents and `--template starter`.
+- **The OpenLineage "needs openlineage-python" warning printed twice** in a real run: once as
+  a console line and once through the logging last-resort handler. It is the console line only.
+
 ### Removed
 
 - **Nine modules that nothing imported are gone** (#832): `fluid_build.logging_utils`,
@@ -226,31 +251,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `server.sink.config`. A storage credential comes from the worker's or the server's own
   credential chain, not from the contract. Kafka-side keys such as `consumer.override.*` and
   `iceberg.kafka.*` keep their config providers, and a build without `catalogAuth` is unchanged.
-
-### Fixed
-
-- **`fluid odcs validate --roundtrip` failed on an installed CLI** because `deepdiff` was
-  declared only for development. It now belongs to the `[odcs-strict]` extra, and a missing
-  `deepdiff` says which extra to install.
-
-- **Install hints keep their `[extra]` when the CLI prints them.** Rich read the `[litellm]` in
-  `pip install 'data-product-forge[litellm]'` as a style tag and dropped it, so the line a user
-  most needs after the 0.28.0 install change read `pip install 'data-product-forge'`. Every CLI
-  site that prints an exception's message, suggestions or hint (`forge`, `forge data-model`,
-  the AI copilot and template-mode error renderers, `core`, `doctor`, `market`, `auth`) now prints
-  it as written, with control characters spelled out. `tests/test_hints_print_literally.py` scans
-  those modules and fails on a new site that prints such text as markup.
-- **The `[litellm]` install line was lost, printed twice, or blamed setup.** `fluid ai status`
-  put it in a markup panel, so it read `pip install 'data-product-forge'`. `fluid forge
-  data-model ... --llm-provider` printed it twice (a log line, then the error). `fluid doctor`
-  said "Not configured: run 'fluid ai setup'" for a provider that was configured but could not
-  run; it now shows the install line. In `forge --agent-loop` the hint no longer recommends
-  `--llm-provider claude-code`, which has no tool use and crashed there. A provider picked by
-  Ollama detection, not by flag, is named `provider ollama`, not `--llm-provider ollama`.
-  Interactive `fluid forge` without litellm no longer offers or saves Ollama, reads the keyring
-  or asks for a key: it offers the keyless agents and `--template starter`.
-- **The OpenLineage "needs openlineage-python" warning printed twice** in a real run: once as
-  a console line and once through the logging last-resort handler. It is the console line only.
 
 ## [0.27.0] — 2026-11-04
 
@@ -7521,7 +7521,8 @@ via the Trusted-Publishing release pipeline.
 - Contract schema v0.5.7
 - Basic Airflow DAG export
 
-[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/Agenticstiger/forge-cli/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/Agenticstiger/forge-cli/compare/v0.24.0...v0.25.0
