@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its `purpose` when structured) and each column's (`contract.schema[].description`). The table
   carries the product's identity as tags: `fluid_product_id`, `fluid_product_name`,
   `fluid_domain`, `fluid_layer`, `fluid_product_type`, `fluid_product_version` (the expose's
-  `version`), `fluid_version` (`fluidVersion`) and `fluid_owner_team` (`metadata.owner.team`),
-  the keys AWS Glue and Snowflake already use; a field the contract does not state makes no tag.
+  `version`), `fluid_version` (`fluidVersion`) and `fluid_owner_team` (`metadata.owner.team`).
+  `fluid_domain`, `fluid_layer`, `fluid_product_type` and `fluid_version` are the keys AWS Glue
+  and Snowflake already use; the other four are new. A field the contract does not state makes no
+  tag.
   A column the contract classifies (`sensitivity`) carries it as the column tag
   `fluid_sensitivity`. The table's owner is unchanged: the deploy identity keeps owning it, which
   the masks, the row filter and the fail-safe lock depend on, and the owner team is a tag. On a
