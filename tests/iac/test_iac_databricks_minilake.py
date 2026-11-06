@@ -71,9 +71,9 @@ _NO_TABLE_PROPERTIES = pytest.mark.xfail(
     raises=MinilakeGap,
     strict=True,
     reason=(
-        "minilake keeps no Delta table properties: it drops the TBLPROPERTIES and COMMENT of a "
-        "CREATE TABLE, so every plan after the first updates the table, and that update fails "
-        "on the ALTER TABLE ... SET TBLPROPERTIES the provider sends (DuckDB cannot parse it)"
+        "minilake keeps no Delta table properties: it drops the TBLPROPERTIES of a CREATE TABLE, "
+        "so every plan after the first updates the table, and that update fails on the "
+        "ALTER TABLE ... SET TBLPROPERTIES the provider sends (DuckDB cannot parse it)"
     ),
 )
 
@@ -131,7 +131,7 @@ def untagged(monkeypatch) -> None:
     tier applies them (``test_iac_databricks_fake_e2e.py``,
     ``test_iac_databricks_metadata_fake_e2e.py``).
     """
-    monkeypatch.setattr(databricks, "_emit_tags", lambda *_args: None)
+    monkeypatch.setattr(databricks, "_emit_tags", lambda *_args, **_kwargs: None)
 
 
 @_NO_TABLE_PROPERTIES
