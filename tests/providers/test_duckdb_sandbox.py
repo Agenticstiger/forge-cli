@@ -612,6 +612,9 @@ def test_only_a_local_output_gets_its_copy_sibling(layout, monkeypatch):
     assert allow.remote_prefixes == ("s3://landing/out/",)
     # The operator's directory itself as the output: its sibling would be outside it.
     assert provider._allowlist([], outputs=[{"path": str(shared)}]).dirs[-1] == str(shared)
+    # A 252-byte name: tmp_ makes 256, past NAME_MAX; the output alone is granted.
+    longest = str(shared / ("x" * 248 + ".csv"))
+    assert provider._allowlist([], outputs=[{"path": longest}]).paths[-1] == longest
 
     (shared / "tmp_rates.csv").symlink_to(layout["outside"] / "secret.csv")
     assert str(shared / "tmp_rates.csv") not in provider._allowlist(rates).paths
@@ -665,6 +668,8 @@ def test_contract_tests_action_grants_its_outputs_copy_sibling_only(layout, monk
     assert not allow.dirs
     # A directory output, the operator's directory itself, is written in place.
     assert _action_allowlist({}, {"path": str(shared), "format": "csv"}).dirs == (str(shared),)
+    longest = str(shared / ("x" * 248 + ".csv"))  # tmp_ would pass NAME_MAX
+    assert _action_allowlist({}, {"path": longest, "format": "csv"}).paths == (longest,)
 
     (shared / "tmp_result.parquet").symlink_to(layout["outside"] / "secret.csv")
     action = {"op": "add", "resource_type": "sql", "id": "orders", "sql": "SELECT * FROM orders"}
@@ -1549,6 +1554,19 @@ def test_copy_tmp_path_names_the_file_duckdb_writes_before_it_replaces_one(tmp_p
     finally:
         con.close()
     assert [p.name for p in tmp_path.iterdir()] == ["orders.parquet"]
+
+
+def test_copy_tmp_paths_grants_no_sibling_duckdb_cannot_write(tmp_path):
+    """A rewrite of a local file needs its ``tmp_`` sibling. A URL and a
+    directory are written in place, and a ``tmp_`` name past NAME_MAX could not
+    be created (granting one raised ``ENAMETOOLONG`` from the grant's checks)."""
+    target = tmp_path / "orders.parquet"
+    assert sandbox.copy_tmp_paths(target) == (sandbox.copy_tmp_path(target),)
+    assert sandbox.copy_tmp_paths("s3://landing/out/orders.parquet") == ()
+    assert sandbox.copy_tmp_paths(tmp_path) == ()
+    longest = tmp_path / ("x" * 247 + ".csv")  # tmp_ + 251 = 255 bytes
+    assert sandbox.copy_tmp_paths(longest) == (sandbox.copy_tmp_path(longest),)
+    assert sandbox.copy_tmp_paths(tmp_path / ("x" * 248 + ".csv")) == ()
 
 
 @pytest.mark.parametrize("version", ["1.4.4", "1.4.3", "1.2.2", "0.10.0", "garbage", None])

@@ -39,7 +39,7 @@ from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
     WorkspaceGrant,
     broad_root_reason,
-    copy_tmp_path,
+    copy_tmp_paths,
     is_sandbox_refusal,
     refuse_broad_root,
     sandbox_refusal_hint,
@@ -181,17 +181,6 @@ def _declared_location(spec: Any) -> Optional[str]:
     # Only s3:// is remote here (``_register_mapping_input``): any other string
     # is a local path, as ``Path`` reads it.
     return raw if _is_s3_uri(raw) else str(Path(raw))
-
-
-def _copy_sibling(location: str) -> Tuple[str, ...]:
-    """The ``tmp_`` file a ``COPY ... TO`` over the output ``location`` writes first, if any.
-
-    None for an ``s3://`` URL or a directory, which DuckDB writes in place: a
-    directory output that is itself a granted root would put one outside them.
-    """
-    if _is_s3_uri(location) or Path(location).is_dir():
-        return ()
-    return (copy_tmp_path(location),)
 
 
 def _declared_io(action: Dict[str, Any]) -> Tuple[List[Any], List[Any]]:
@@ -355,7 +344,7 @@ class LocalProvider(BaseProvider):
         file writes first (:func:`copy_tmp_path`), confined the same way:
         without it, an output outside the directories granted whole was written
         once and refused on every run after. Inputs get none, nor do ``s3://``
-        and directory outputs (written in place, :func:`_copy_sibling`); the
+        and directory outputs (written in place, :func:`copy_tmp_paths`); the
         directory an output file is in is not granted for it.
         """
         from fluid_build.util.upstream_discovery import collect_search_roots
@@ -393,7 +382,7 @@ class LocalProvider(BaseProvider):
                 allow = allow.with_declared(location, within=within)
         for spec in outputs:
             if (location := _declared_location(spec)) is not None:
-                allow = allow.with_declared(location, *_copy_sibling(location), within=within)
+                allow = allow.with_declared(location, *copy_tmp_paths(location), within=within)
         return allow
 
     def _connect(
