@@ -205,7 +205,7 @@ An owner who wants the summary that lineage backends already show for most table
 }
 ```
 
-`rowCount`, `count`, `nullCount` and `distinctCount` are filled under the same suppression as the state. `min` and `max` are never filled: each is one record's value. `sum` and `quantiles` stay in the state, behind the port's access policy. Because the backend's audience is unknown, the summary never names a column the source restricts for anyone, and it is refused for `mode: snapshot` and for profiles with `noise`: exact counts published on every refresh could be subtracted, and they would spend nothing from the privacy budget.
+`rowCount`, `count`, `nullCount` and `distinctCount` are filled under the same suppression as the state. `min` and `max` are never filled: each is one record's value. `sum` and `quantiles` stay in the state, behind the port's access policy. Because the backend's audience is unknown, the summary never names a column the source restricts for anyone, and it is refused for `mode: snapshot`, for profiles with `noise`, and for profiles with `differencing: accepted`: exact counts published again for the same rows could be subtracted by readers the owner never accepted that for, and they would spend nothing from the privacy budget.
 
 ### The output facet: `fluid_profileCommitment`
 
@@ -245,9 +245,15 @@ Restrictions on the source carry over. Every column the profile reads (`columns`
 
 A sum has a second risk: one large contributor. A sum, a sum of squares or a sum of products is also suppressed when its two largest contributors (entities, or rows without `entity`, by absolute value) make up more than `disclosure.maxDominance` of it, default 0.8. This is the dominance rule statistical agencies apply to magnitude tables. Counting the top two matters because the second-largest contributor can subtract its own value, and what is left must not be mostly the largest one.
 
-Suppression alone can be undone by subtraction, because bucket counts add up to `n` and groups add up to their total. So suppression is applied in two passes, the usual practice in statistical disclosure control (tau-ARGUS and sdcTable both call this primary and secondary suppression). The first pass suppresses small and dominated cells. The second runs on the full table, before rare labels are pooled, over every sum the state publishes: the buckets or categories of one cell, and each bucket or label across the cells of a group and the total. Wherever a sum has at least one suppressed part and its suppressed parts together count fewer than `minCellSize`, it suppresses the smallest published part that is not zero (ties broken by label order), and it repeats until no sum is left like that. A zero is never chosen, since suppressing it hides nothing.
+Suppression alone can be undone by subtraction, because a state is full of sums. So suppression is applied in two passes, the usual practice in statistical disclosure control (tau-ARGUS and sdcTable both call this primary and secondary suppression). The first pass suppresses small and dominated cells. The second runs on the full table, before rare labels are pooled, over every sum the state's own structure implies:
 
-The second pass stops recovery by one subtraction: whatever a reader can subtract out of a sum covers at least `minCellSize` contributors. It does not stop every linear recovery in a two-way table with published margins. Optimal secondary suppression is a hard problem, and that is what the dedicated tools solve. This is why `groupBy` is capped at two columns in this version, and why the stronger guarantee is noise.
+- within a cell, the buckets or categories of a column, with `belowMinimum` and the nulls, add up to `n`;
+- across cells, every count and every moments sum of a group's cells adds up to the total, and in a two-way grouping each row and each column adds up to its margin;
+- for event data, the transitions out of an activity plus the sequences that end there add up to that activity's count, the transitions into it plus the sequences that start there add up to the same count, and the dwell buckets of a pair add up to its transition count.
+
+Wherever a sum has a suppressed part, its suppressed parts together must pass the rules a single cell must pass: at least `minCellSize` contributors, and no dominance. Until they do, the pass suppresses the smallest published part that is not zero (ties broken by label order) and checks again, and it repeats until no sum is left like that. A zero is never chosen, since suppressing it hides nothing.
+
+The second pass stops recovery by one subtraction: whatever a reader can subtract out of a sum covers at least `minCellSize` contributors, and no one or two of them dominate it. It does not stop every linear recovery in a two-way table with published margins. Optimal secondary suppression is a hard problem, and that is what the dedicated tools solve. This is why `groupBy` is capped at two columns in this version, and why the stronger guarantee is noise.
 
 ### Differencing across states
 
@@ -255,7 +261,7 @@ Two states that count overlapping rows can be subtracted. If a snapshot profile 
 
 `mode: tumbling` publishes each window once, when it closes, so each row is in at most one state and there is nothing to subtract. `mode: snapshot` re-counts the same rows on every refresh, so `fluid validate` refuses it unless the profile declares `noise`, or the owner writes `disclosure.differencing: accepted`. The second form exists for profiles whose consumers already hold the rows (an internal drift check, say) and puts the decision in the contract diff where a reviewer sees it.
 
-A producer that has to correct a published tumbling window (late rows, a fixed bug) publishes a restatement. A restatement counts the same rows again, so it is allowed only for a profile that would pass as a snapshot: one with `noise` or `differencing: accepted`. Otherwise a published window is final.
+A producer that has to correct a published tumbling window (late rows, a fixed bug) publishes a restatement. A restatement counts the same rows again, so it is allowed only for a profile that would pass as a snapshot: one with `noise` or `differencing: accepted`. Otherwise a published window is final. A restatement never carries the summary facet.
 
 ### Optional differential privacy
 
@@ -301,7 +307,7 @@ Cross-mesh consumers pin `upstreamDigest` as today. Because refreshes do not mov
 11. `noise` with a non-positive `epsilon`, or `gaussian` without `delta`.
 12. A `contract` block on a `data_profile` expose: the state format is fixed by the spec.
 13. `mode: tumbling` with a `qos.freshnessSLO` shorter than `window.length`.
-14. `announce: summary` together with `mode: snapshot` or `noise`.
+14. `announce: summary` together with `mode: snapshot`, `noise` or `differencing: accepted`.
 
 It also warns when one contract declares two profiles of the same source, because their published sums can combine like the margins of one larger table (see Limits).
 
