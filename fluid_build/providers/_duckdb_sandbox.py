@@ -541,6 +541,27 @@ def copy_tmp_path(path: PathLike) -> str:
     return os.path.join(head, "tmp_" + name)
 
 
+#: The longest file name the usual file systems hold, in bytes (POSIX ``NAME_MAX``).
+_NAME_MAX = 255
+
+
+def copy_tmp_paths(path: PathLike) -> Tuple[str, ...]:
+    """What to grant beside an output ``path`` for its rewrite: :func:`copy_tmp_path`, or nothing.
+
+    Nothing for a URL or an existing directory, which DuckDB writes in place (a
+    directory output that is itself a granted root would put one outside every
+    root), nor for a ``tmp_`` name longer than ``NAME_MAX``, which DuckDB could
+    not create either and which a grant's own checks cannot ``stat``.
+    """
+    raw = os.fspath(path)
+    if is_remote_location(raw) or os.path.isdir(os.path.expanduser(raw)):
+        return ()
+    sibling = copy_tmp_path(raw)
+    if len(os.fsencode(os.path.basename(sibling))) > _NAME_MAX:
+        return ()
+    return (sibling,)
+
+
 def unaliased_dir(path: PathLike, *, within: Iterable[Optional[PathLike]] = ()) -> Optional[str]:
     """``path`` as an absolute directory to grant, or ``None`` if it is an alias.
 
@@ -1489,6 +1510,7 @@ __all__ = [
     "broad_root_reason",
     "confine_declared",
     "copy_tmp_path",
+    "copy_tmp_paths",
     "duckdb_version",
     "is_remote_location",
     "is_sandbox_refusal",

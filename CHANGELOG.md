@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An embedded-SQL build whose output is outside the contract's directory replaces it on every
+  run, not only the first.** The local provider grants such an output (in a directory the
+  operator lists in `FLUID_DUCKDB_ALLOWED_DIRS`, for one) as its file. DuckDB's `COPY ... TO`
+  over a file that exists writes `tmp_<name>` beside it and renames that into place, so the first
+  run wrote the file and every later one failed with "Permission Error: Cannot access file
+  .../tmp_<name>". The local provider's materialize of such an expose (`fluid apply`) was refused
+  the same way, fell back, and then skipped as a no-op because the file existed: the run passed
+  with the previous run's rows still in the file. Each output is now granted with its `tmp_`
+  sibling, confined as the output is, so a planted `tmp_` symlink that leads out is refused. An
+  input gets no sibling, nor do an `s3://` output and a directory (both written in place), nor a
+  `tmp_` name longer than the file system holds; the directory an output file is in is never
+  granted. The contract-tests local action grants its outputs the same way. The DuckDB
+  acquisition runner's landing got this fix in 0.19.0 (#699). Found on the demo lab on 0.18.2,
+  still in 0.28.0.
+
 ## [0.28.0] — 2026-11-06
 
 ### Added
