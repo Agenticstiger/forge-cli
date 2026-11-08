@@ -300,7 +300,7 @@ disclosure:
     maxRowsPerEntity: 50        # required when entity is set
 ```
 
-The declared edges double as the clipping bounds, so the sensitivity of every sum is known. When `entity` is set, the privacy unit is the entity and `maxRowsPerEntity` bounds each entity's contribution (rows past it are left out of the noised state, and the state says how many); otherwise it is the row. A producer refuses to publish a state that would exceed the budget within its period, and the commitment facet records what each state spent. Noise makes a state impossible to recompute from the source, so `sourceSnapshot` audits only noise-free profiles. The reference implementation would use OpenDP, as an optional extra so the base install stays light.
+The declared edges double as the clipping bounds, so the sensitivity of every sum is known. When `entity` is set, the privacy unit is the entity and `maxRowsPerEntity` bounds each entity's contribution (rows past it are left out of the noised state; the producer may log how many, and the state never publishes the count); otherwise it is the row. A producer refuses to publish a state that would exceed the budget within its period, and the commitment facet records what each state spent. Noise makes a state impossible to recompute from the source, so `sourceSnapshot` audits only noise-free profiles. The reference implementation would use OpenDP, as an optional extra so the base install stays light.
 
 ## Composition and lineage
 
