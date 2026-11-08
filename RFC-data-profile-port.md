@@ -15,7 +15,7 @@ The contract holds only the declaration: which expose is profiled, which columns
 
 ## Motivation
 
-Some consumers need the shape of a dataset and must not see its rows. A simulation fitted against observed behaviour is the sharpest case: the FLUX spec's Playback kind names the data a simulation is calibrated against, and today that is a bare URI to raw telemetry. Drift monitors, synthetic data generators and a marketplace preview of a product are others. In each case the data owner wants to share counts and distributions with a wider audience than the one allowed to read the records.
+Some consumers need the shape of a dataset and must not see its rows. A simulation fitted against observed behavior is the sharpest case: the FLUX spec's Playback kind names the data a simulation is calibrated against, and today that is a bare URI to raw telemetry. Drift monitors, synthetic data generators and a marketplace preview of a product are others. In each case the data owner wants to share counts and distributions with a wider audience than the one allowed to read the records.
 
 FLUID has no way to say this. `exposes[].kind` has no profile concept. The fields that look close are declarations of checks, not carriers of values: `contract.dq` and `contract.quality` say what to test, `observability.metrics` says what to watch. A team that wants to share a profile today has two options and both are bad.
 
@@ -31,7 +31,7 @@ Goals:
 - Values flow through the port. The contract digest moves only when the declaration changes.
 - Aggregate-only by construction, with minimum cell suppression and optional differential privacy declared in the contract where a reviewer can see them.
 - A fixed, versioned state document so producers and consumers written by different people agree byte for byte.
-- Announcement over OpenLineage using the existing `DataQualityMetricsInputDatasetFacet`, plus one custom facet that commits to the state.
+- Announcement over OpenLineage: one custom facet that commits to each state, plus the existing `DataQualityMetricsInputDatasetFacet` when the owner opts in to summary counts.
 - Ordinary composition: other products consume a profile with an ordinary `consumes[]` entry.
 
 Non-goals:
@@ -69,12 +69,13 @@ exposes:
       format: json
       location: { bucket: billing-profiles, path: payments/ }
     qos:
-      freshnessSLO: P1D
+      freshnessSLO: P8D
     policy:
       authz:
         readers: [pricing_analysts]
     profile:
       source: payments
+      entity: customer_id
       window: { column: event_ts, length: P7D, mode: tumbling }
       columns:
         - name: amount
@@ -85,17 +86,17 @@ exposes:
           domain: category
         - name: segment
           domain: category
+        - name: event_type
+          domain: category
       families: [histogram, moments, quantiles, distinct, transitions, dwell]
       quantiles: ["0.5", "0.9"]
       groupBy: [segment]
       sequence:
-        entity: customer_id
         activity: event_type
         time: event_ts
         dwellEdges: [PT1H, P1D, P7D, P30D]
       disclosure:
         minCellSize: 10
-      announce: summary
 ```
 
 `profile.source` names an expose of the same contract. A profile can only describe data its own product owns, because only the owner can read the rows inside its boundary. A product that wants a profile of someone else's data consumes that data, builds its own expose, and profiles that.
@@ -109,6 +110,8 @@ Every profiled column must exist in the source's `contract.schema`. Each column 
 
 A value outside its declared range refuses the whole state: no state is written, and the run reports the column and the row position, never the value. The fix is to widen the edges, which is a declaration change and is reviewed as one. Silent clamping was considered and rejected: it would hide exactly the drift a profile exists to show.
 
+`entity` names the column that identifies the person or thing a row is about. It is optional, never published, and only ever counted. When it is set it is the privacy unit: the minimum cell size counts distinct entities, the dominance rule and noise bound each entity's contribution, and the sequence families order events per entity. Declare it whenever a row is not already one person or thing. Without it the minimum counts rows, and on event data ten rows can be one customer.
+
 ### Statistic families
 
 `families` lists what a state carries. Each family is computed per cell (see grouping below).
@@ -116,17 +119,17 @@ A value outside its declared range refuses the whole state: no state is written,
 - `histogram`: the count per bucket of a range column, or per category of a category column. For a category column the histogram's keys are its support.
 - `moments`: for a range column, the sum and the sum of squares of its rounded values. `pairs` (optional, a list of two-column lists) adds the sum of products for each declared pair. These are the sufficient statistics for means, variances, correlations, ratio metrics and regression adjustment, which is what experiment analysis needs (gbstats takes exactly `n`, `sum`, `sum_squares` and a sum of products).
 - `quantiles`: for each requested probability in `profile.quantiles`, the index of the bucket that holds that quantile. It says "the median lies in [50, 100)", never the median value.
-- `distinct`: the number of distinct values of a column in the cell. On `sequence.entity` it is the number of entities.
+- `distinct`: the number of distinct values of a column in the cell. On `entity` it is the number of entities.
 - `transitions`: for event data, the count of each directly-follows pair (activity a, then activity b, for the same entity, ordered by time), plus how many sequences start and end at each activity. This is the object-centric directly-follows graph that process mining uses (OCEL 2.0), reduced to its counts.
 - `dwell`: for each directly-follows pair, a histogram of the time between the two events on `sequence.dwellEdges` (ISO 8601 durations).
 
-`transitions` and `dwell` need a `sequence` block: the entity column, the activity column and the time column. The entity column is used to order and group events and is never published. Sequences are cut at window boundaries: the first event of an entity inside a window starts a sequence.
+`transitions` and `dwell` need `entity` and a `sequence` block: the activity column and the time column. The activity column must also be declared in `columns` as a category column, so every label rule applies to it: a rare activity is pooled, and a transition that involves a pooled activity is counted under `belowMinimum`, never keyed by its label. Sequences are cut at window boundaries: the first event of an entity inside a window starts a sequence.
 
 ### Grouping and windows
 
 `groupBy` lists up to two category columns from `columns`. Every family is computed for each cell of the cross product of their categories, and for the ungrouped total. An experiment's outcome per variant and segment is a grouped `moments` profile: `groupBy: [variant, segment]` with `moments` on the outcome column.
 
-`window` says which rows a state covers. `mode: tumbling` cuts the time column into consecutive windows of `length`, so each row lands in at most one state. `mode: snapshot` profiles the whole source at each refresh. The two behave very differently under differencing; see Disclosure.
+`window` says which rows a state covers. `mode: tumbling` cuts the time column into consecutive windows of `length`. A window is published once, when it closes, so each row lands in at most one state; rows that arrive after their window closed are not counted in any state. That is why a `qos.freshnessSLO` shorter than `window.length` is refused: meeting it would mean publishing windows that are still open. `mode: snapshot` profiles the whole source at each refresh. The two behave very differently under differencing; see Disclosure.
 
 ### Profile states
 
@@ -162,7 +165,7 @@ A state is one JSON document, written to the binding as an immutable object name
 }
 ```
 
-A suppressed value is written as `null` and listed in its cell's `suppressed` array, so a reader cannot mistake it for zero. In the sketch, one plan had fewer than ten payments, so its label is gone and its count went into `belowMinimum`, which is itself below ten and so suppressed. The count for `basic` was then suppressed too, so the pooled count cannot be recovered from `n` by subtraction (see Disclosure). Sums are strings because they can pass 2^53. A sum is in units of `resolution`, a sum of squares in units of `resolution` squared, and a sum of products in units of the two resolutions multiplied. The `stateDigest` is the SHA-256 of the document in the same canonical JSON that `compute_contract_digest` uses (NFC strings, sorted keys, compact separators, UTF-8). The document holds only strings, integers, booleans and nulls, so there is no float formatting to disagree about.
+A suppressed value is written as `null` and listed in its cell's `suppressed` array, so a reader cannot mistake it for zero. In the sketch, one plan had fewer than ten customers, so its label is gone and its count went into `belowMinimum`, which is itself below ten and so suppressed. The count for `basic` was then suppressed too, so the pooled count cannot be recovered from `n` by subtraction (see Disclosure). Sums are strings because they can pass 2^53. A sum is in units of `resolution`, a sum of squares in units of `resolution` squared, and a sum of products in units of the two resolutions multiplied. The `stateDigest` is the SHA-256 of the document in the same canonical JSON that `compute_contract_digest` uses (NFC strings, sorted keys, compact separators, UTF-8). The document holds only strings, integers, booleans and nulls, so there is no float formatting to disagree about.
 
 `previousStateDigest` chains each state to the one before it. A consumer that holds state 41 can tell whether state 42 replaced, skipped or rewrote history. `declarationDigest` is the digest of the canonical `profile` block alone. A consumer that pins it accepts unrelated contract edits (a new description, another expose) and still notices any change to what is computed.
 
@@ -184,9 +187,9 @@ Each state is announced with one OpenLineage `RunEvent` (`COMPLETE`) from the jo
 
 ### The input facet: `DataQualityMetricsInputDatasetFacet`
 
-The source dataset carries the standard `dataQualityMetrics` input facet (OpenLineage 1.55.0, facet schema 1-0-3). It is an input facet on purpose: the metrics describe the rows this run read when it read them, which is what the input facet means. The generic `DataQualityMetricsDatasetFacet` would read as a claim about the dataset at large.
+By default (`announce: commitment`) the event carries the commitment facet below and no metrics. A lineage backend's readers are not the profile's readers, and exact counts there would sit beside states that may be noised or suppressed differently.
 
-The announcement carries the summary that lineage backends already show for most tables, and nothing else:
+An owner who wants the summary that lineage backends already show for most tables sets `announce: summary`. The source dataset then carries the standard `dataQualityMetrics` input facet (OpenLineage 1.55.0, facet schema 1-0-3). It is an input facet on purpose: the metrics describe the rows this run read when it read them, which is what the input facet means. The generic `DataQualityMetricsDatasetFacet` would read as a claim about the dataset at large. The summary carries this and nothing else:
 
 ```json
 "inputFacets": {
@@ -202,7 +205,7 @@ The announcement carries the summary that lineage backends already show for most
 }
 ```
 
-`rowCount`, `count`, `nullCount` and `distinctCount` are filled under the same suppression as the state. `min` and `max` are never filled: each is one record's value. `sum` and `quantiles` stay in the state, behind the port's access policy, because a lineage backend's readers are not the profile's readers. A producer that wants the announcement to carry nothing but the commitment sets `announce: commitment`.
+`rowCount`, `count`, `nullCount` and `distinctCount` are filled under the same suppression as the state. `min` and `max` are never filled: each is one record's value. `sum` and `quantiles` stay in the state, behind the port's access policy. Because the backend's audience is unknown, the summary never names a column the source restricts for anyone, and it is refused for `mode: snapshot` and for profiles with `noise`: exact counts published on every refresh could be subtracted, and they would spend nothing from the privacy budget.
 
 ### The output facet: `fluid_profileCommitment`
 
@@ -232,23 +235,27 @@ A consumer reads the state from the port, recomputes its digest, and checks it a
 
 ### Aggregate-only
 
-A state may contain counts, sums of rounded values, sums of squares and products, bucket indices, and category labels that cleared the minimum cell size. It may not contain a row, an identifier, a single record's value, a minimum or maximum, or a sample. `fluid validate` refuses a `category` domain on a source column marked `sensitivity: pii` or `phi`, since its labels would be identifiers; such a column can still be bucketed as a `range` or used as `sequence.entity`, which is never published.
+A state may contain counts, sums of rounded values, sums of squares and products, bucket indices, and category labels that cleared the minimum cell size. It may not contain a row, an identifier, a single record's value, a minimum or maximum, or a sample. `fluid validate` refuses a `category` domain on a source column marked `sensitivity: pii` or `phi`, since its labels would be identifiers; such a column can still be bucketed as a `range` or used as `entity`, which is never published.
 
-Restrictions on the source carry over. A profile column that the source restricts with `policy.authz.columnRestrictions` for any of the profile's readers is refused. A profile may have a wider audience than its source, which is the point of it, but never by accident: no grant on the source reaches the profile, and no grant on the profile reaches the source.
+Restrictions on the source carry over. Every column the profile reads (`columns`, `groupBy`, `pairs`, `window.column`, `sequence.activity`, `sequence.time`) is refused if the source restricts it with `policy.authz.columnRestrictions` for any of the profile's readers. The one exception is `entity`: it is never published, only counted, and refusing a restricted identifier there would only push owners to profile without a privacy unit. A profile may have a wider audience than its source, which is the point of it, but never by accident: no grant on the source reaches the profile, and no grant on the profile reaches the source.
 
 ### Minimum cell size
 
-`disclosure.minCellSize` is required and must be at least 5. Any cell, bucket, category, transition or group with a count from 1 up to `minCellSize - 1` is suppressed, and so is everything computed from it. Zero is published, since it describes no one.
+`disclosure.minCellSize` is required and must be at least 5. It counts distinct entities when `entity` is set, and rows otherwise. Any cell, bucket, category, transition, dwell bucket or group whose count is from 1 up to `minCellSize - 1` is suppressed, and so is everything computed from it. Zero is published, since it describes no one.
 
-Suppression alone can be undone by subtraction, because bucket counts add up to `n` and groups add up to their total. So suppression is applied in two passes, the usual practice in statistical disclosure control (tau-ARGUS and sdcTable both call this primary and secondary suppression). The first pass suppresses small cells. The second looks at every published sum: wherever exactly one of its parts is suppressed, it also suppresses the smallest published part (ties broken by label order), and repeats until no sum has exactly one suppressed part.
+A sum has a second risk: one large contributor. A sum, a sum of squares or a sum of products is also suppressed when its two largest contributors (entities, or rows without `entity`, by absolute value) make up more than `disclosure.maxDominance` of it, default 0.8. This is the dominance rule statistical agencies apply to magnitude tables. Counting the top two matters because the second-largest contributor can subtract its own value, and what is left must not be mostly the largest one.
 
-The second pass stops recovery by one subtraction. It does not stop every recovery in a two-way table with published margins; optimal secondary suppression is a hard problem, and that is what the dedicated tools solve. This is why `groupBy` is capped at two columns in this version, and why the stronger guarantee is noise.
+Suppression alone can be undone by subtraction, because bucket counts add up to `n` and groups add up to their total. So suppression is applied in two passes, the usual practice in statistical disclosure control (tau-ARGUS and sdcTable both call this primary and secondary suppression). The first pass suppresses small and dominated cells. The second runs on the full table, before rare labels are pooled, over every sum the state publishes: the buckets or categories of one cell, and each bucket or label across the cells of a group and the total. Wherever a sum has at least one suppressed part and its suppressed parts together count fewer than `minCellSize`, it suppresses the smallest published part that is not zero (ties broken by label order), and it repeats until no sum is left like that. A zero is never chosen, since suppressing it hides nothing.
+
+The second pass stops recovery by one subtraction: whatever a reader can subtract out of a sum covers at least `minCellSize` contributors. It does not stop every linear recovery in a two-way table with published margins. Optimal secondary suppression is a hard problem, and that is what the dedicated tools solve. This is why `groupBy` is capped at two columns in this version, and why the stronger guarantee is noise.
 
 ### Differencing across states
 
 Two states that count overlapping rows can be subtracted. If a snapshot profile shows `n = 1840` today and `1841` tomorrow, the difference in every sum is one new record. Minimum cell size does nothing against this.
 
-`mode: tumbling` puts each row in at most one state, so there is nothing to subtract. `mode: snapshot` re-counts the same rows on every refresh, so `fluid validate` refuses it unless the profile declares `noise`, or the owner writes `disclosure.differencing: accepted`. The second form exists for profiles whose consumers already hold the rows (an internal drift check, say) and puts the decision in the contract diff where a reviewer sees it.
+`mode: tumbling` publishes each window once, when it closes, so each row is in at most one state and there is nothing to subtract. `mode: snapshot` re-counts the same rows on every refresh, so `fluid validate` refuses it unless the profile declares `noise`, or the owner writes `disclosure.differencing: accepted`. The second form exists for profiles whose consumers already hold the rows (an internal drift check, say) and puts the decision in the contract diff where a reviewer sees it.
+
+A producer that has to correct a published tumbling window (late rows, a fixed bug) publishes a restatement. A restatement counts the same rows again, so it is allowed only for a profile that would pass as a snapshot: one with `noise` or `differencing: accepted`. Otherwise a published window is final.
 
 ### Optional differential privacy
 
@@ -263,7 +270,7 @@ disclosure:
     budget: { epsilon: "4", period: P30D }
 ```
 
-The declared edges double as the clipping bounds, so the sensitivity of every sum is known. When `sequence.entity` is set, the privacy unit is the entity and `maxRowsPerEntity` bounds each entity's contribution; otherwise it is the row. A producer refuses to publish a state that would exceed the budget within its period, and the commitment facet records what each state spent. Noise makes a state impossible to recompute from the source, so `sourceSnapshot` audits only noise-free profiles. The reference implementation would use OpenDP, as an optional extra so the base install stays light.
+The declared edges double as the clipping bounds, so the sensitivity of every sum is known. When `entity` is set, the privacy unit is the entity and `maxRowsPerEntity` bounds each entity's contribution; otherwise it is the row. A producer refuses to publish a state that would exceed the budget within its period, and the commitment facet records what each state spent. Noise makes a state impossible to recompute from the source, so `sourceSnapshot` audits only noise-free profiles. The reference implementation would use OpenDP, as an optional extra so the base install stays light.
 
 ## Composition and lineage
 
@@ -286,13 +293,17 @@ Cross-mesh consumers pin `upstreamDigest` as today. Because refreshes do not mov
 3. A profiled column missing from the source schema.
 4. A `range` column without at least two strictly increasing decimal-string `edges`, or `moments` on a column without `resolution`.
 5. `moments` or `quantiles` on a `category` column, or `quantiles` without `profile.quantiles`.
-6. `transitions` or `dwell` without `sequence`, or `dwell` without `dwellEdges`.
+6. `transitions` or `dwell` without `entity` and `sequence`, `dwell` without `dwellEdges`, or a `sequence.activity` that is not a `category` column in `columns`.
 7. A `groupBy` column that is not a `category` column of the profile, or more than two of them.
-8. `minCellSize` missing or below 5.
-9. A `category` domain on a `pii` or `phi` source column, or a column the source restricts for any profile reader.
+8. `minCellSize` missing or below 5, or `maxDominance` outside (0, 1).
+9. A `category` domain on a `pii` or `phi` source column, or any column the profile reads, other than `entity`, that the source restricts for a profile reader.
 10. `mode: snapshot` with neither `noise` nor `differencing: accepted`.
 11. `noise` with a non-positive `epsilon`, or `gaussian` without `delta`.
 12. A `contract` block on a `data_profile` expose: the state format is fixed by the spec.
+13. `mode: tumbling` with a `qos.freshnessSLO` shorter than `window.length`.
+14. `announce: summary` together with `mode: snapshot` or `noise`.
+
+It also warns when one contract declares two profiles of the same source, because their published sums can combine like the margins of one larger table (see Limits).
 
 ## Compatibility and rollback
 
@@ -306,9 +317,9 @@ A forge-cli release older than the one that ships the schema change rejects `kin
 
 ## Delivery plan
 
-1. Schema and validator: the kind, the block, the twelve rules, the kind lists and the exporters, with a fixture contract per rule and a golden check that every existing fixture validates unchanged.
+1. Schema and validator: the kind, the block, the rules above, the kind lists and the exporters, with a fixture contract per rule and a golden check that every existing fixture validates unchanged.
 2. The state: the state JSON Schema, a canonical writer, the digests, the commitment facet schema, and the announcement builder in `build_runners/_lineage.py`. Tests include a round trip and a check that a facet with `min` or `max` set is refused.
-3. A reference profiler that computes states on the local DuckDB path with both suppression passes, and optional noise through OpenDP as an extra. The exact command surface is left to that PR.
+3. A reference profiler that computes states on the local DuckDB path with both suppression passes and the dominance rule, and optional noise through OpenDP as an extra. The exact command surface is left to that PR.
 4. `fluid verify` checks the newest state: freshness against `qos.freshnessSLO`, the digest chain, and the contract and declaration digests.
 
 User docs land in forge_docs alongside step 1.
@@ -331,7 +342,7 @@ OpenLineage as the only carrier: lineage backends have their own readership, the
 
 From the receipts recorded 2026-11-08, not re-run here:
 
-- OpenLineage 1.55.0 ships `DataQualityMetricsInputDatasetFacet`, already reachable through forge-cli's `lineage` extra. Used for the announcement.
+- OpenLineage 1.55.0 ships `DataQualityMetricsInputDatasetFacet`, already reachable through forge-cli's `lineage` extra. Used for the opt-in summary announcement.
 - whylogs: rejected as a dependency (dormant since early 2025); drift pattern adapted.
 - OpenDP 0.16.0 (MIT): the optional noise mechanism.
 - Apache DataSketches 5.2.0 (Apache-2.0): only if mergeable sketches are ever needed. Not in this version.
@@ -350,8 +361,8 @@ Inside forge-cli: `compute_contract_digest` and its canonical JSON are reused fo
 
 ## Open questions
 
-1. Should `announce` default to `commitment` rather than `summary`? `summary` matches what catalogs already show; `commitment` shares nothing beyond the digests.
-2. Is 5 the right floor for `minCellSize`? Agencies set this per release; the floor only stops a declaration from being meaningless.
+1. Should `announce` default to `summary` for tumbling profiles without noise, where each row is counted once and the counts cannot be subtracted across states? This RFC defaults to `commitment` everywhere, because the lineage backend's audience is still not the profile's.
+2. Are 5 for the `minCellSize` floor and 0.8 for the `maxDominance` default right? Agencies set both per release; the floor only stops a declaration from being meaningless.
 3. Should a profile be allowed on a `stream` or `topic` source in this version, or only on tables until the reference profiler covers streams?
 
 ## Limits
@@ -359,6 +370,10 @@ Inside forge-cli: `compute_contract_digest` and its canonical JSON are reused fo
 Minimum cell suppression is not a formal privacy guarantee. Differencing, linkage with outside data, and margins in two-way tables remain risks; noise is the formal option, and it costs accuracy.
 
 The second suppression pass blocks recovery by one subtraction, not every linear recovery.
+
+Two profiles of the same source are not checked against each other. Their sums can combine like the margins of one larger table, which is why the validator warns about them.
+
+Without `entity`, the minimum counts rows. On event data that protects far less than it appears to, and the validator cannot tell event data from one row per person, so the docs have to say it.
 
 Quantiles have bucket resolution only, by design.
 
