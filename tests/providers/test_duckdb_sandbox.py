@@ -537,6 +537,8 @@ def test_an_embedded_sql_output_outside_the_contract_directory_is_replaced_on_ev
     assert _count(out) == 2
     with (layout["contract_dir"] / "data" / "orders.csv").open("a", encoding="utf-8") as more:
         more.write("3,30\n")
+    # A run interrupted mid-write leaves its tmp_ file behind: the next one writes over it.
+    (landing / f"tmp_result.{fmt}").write_text("half a file", encoding="utf-8")
     # The second run writes over the file the first one wrote.
     assert _execute_embedded_sql_build(build, contract, layout["contract_dir"]) == 0, printed
     assert _count(out) == 3
@@ -589,8 +591,9 @@ def test_a_materialized_expose_outside_the_contract_directory_is_rewritten_on_ev
 def test_only_a_local_output_gets_its_copy_sibling(layout, monkeypatch):
     """The sibling is one more single file, confined as the output is: a planted
     ``tmp_`` symlink that leads out of the operator's directory is refused, not
-    granted. An input gets none (it is never written), nor does an object-store
-    output (DuckDB writes a URL in place), and no directory is granted."""
+    granted. An input gets none (it is never written), nor do an object-store
+    output and a directory output (DuckDB writes both in place), and no
+    directory is granted for a file."""
     from fluid_build.providers.local.local import LocalProvider
 
     shared = layout["tmp"] / "shared"
@@ -607,9 +610,11 @@ def test_only_a_local_output_gets_its_copy_sibling(layout, monkeypatch):
     ]
     assert not any(Path(d).is_relative_to(shared) for d in allow.dirs)
     assert allow.remote_prefixes == ("s3://landing/out/",)
+    # The operator's directory itself as the output: its sibling would be outside it.
+    assert provider._allowlist([], outputs=[{"path": str(shared)}]).dirs[-1] == str(shared)
 
     (shared / "tmp_rates.csv").symlink_to(layout["outside"] / "secret.csv")
-    provider._allowlist(rates)
+    assert str(shared / "tmp_rates.csv") not in provider._allowlist(rates).paths
     (shared / "tmp_result.csv").symlink_to(layout["outside"] / "secret.csv")
     with pytest.raises(DuckDBSandboxError, match="FLUID_DUCKDB_ALLOWED_DIRS"):
         provider._allowlist(rates, outputs=result)
@@ -630,6 +635,7 @@ def test_a_planted_copy_sibling_cannot_redirect_a_rewrite(layout, printed, monke
     secret = layout["outside"] / "secret.csv"
     (shared / "tmp_result.csv").symlink_to(secret)
 
+    build["properties"]["sql"] = "SELECT 2 AS a"
     assert _execute_embedded_sql_build(build, contract, layout["contract_dir"]) == 1
     assert "FLUID_DUCKDB_ALLOWED_DIRS" in "\n".join(printed), printed
     assert secret.read_text(encoding="utf-8") == f"token\n{SECRET}\n"
@@ -657,6 +663,8 @@ def test_contract_tests_action_grants_its_outputs_copy_sibling_only(layout, monk
         for name in ("orders.csv", "result.parquet", "tmp_result.parquet")
     ]
     assert not allow.dirs
+    # A directory output, the operator's directory itself, is written in place.
+    assert _action_allowlist({}, {"path": str(shared), "format": "csv"}).dirs == (str(shared),)
 
     (shared / "tmp_result.parquet").symlink_to(layout["outside"] / "secret.csv")
     action = {"op": "add", "resource_type": "sql", "id": "orders", "sql": "SELECT * FROM orders"}

@@ -132,7 +132,7 @@ def _action_allowlist(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> DuckDB
     An output also gets the ``tmp_`` sibling that a ``COPY ... TO`` over an
     existing file writes first (:func:`copy_tmp_path`), beside the resolved
     path :func:`_write_output` copies to, and confined the same way. An input
-    gets none.
+    gets none, nor does a directory output (written in place).
     """
     within = [Path.cwd()]
     allow = DuckDBAllowlist.none()
@@ -143,9 +143,8 @@ def _action_allowlist(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> DuckDB
     for spec in _output_specs(outputs):
         if spec.get("path"):
             out = Path(str(spec["path"]))
-            allow = allow.with_declared(
-                str(out.absolute()), copy_tmp_path(out.resolve()), within=within
-            )
+            sibling = () if out.is_dir() else (copy_tmp_path(out.resolve()),)
+            allow = allow.with_declared(str(out.absolute()), *sibling, within=within)
     return allow
 
 

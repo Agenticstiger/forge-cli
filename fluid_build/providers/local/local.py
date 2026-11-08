@@ -183,6 +183,17 @@ def _declared_location(spec: Any) -> Optional[str]:
     return raw if _is_s3_uri(raw) else str(Path(raw))
 
 
+def _copy_sibling(location: str) -> Tuple[str, ...]:
+    """The ``tmp_`` file a ``COPY ... TO`` over the output ``location`` writes first, if any.
+
+    None for an ``s3://`` URL or a directory, which DuckDB writes in place: a
+    directory output that is itself a granted root would put one outside them.
+    """
+    if _is_s3_uri(location) or Path(location).is_dir():
+        return ()
+    return (copy_tmp_path(location),)
+
+
 def _declared_io(action: Dict[str, Any]) -> Tuple[List[Any], List[Any]]:
     """``(inputs, outputs)``: what ``action`` declares it reads and writes through DuckDB."""
     op = (action.get("op") or action.get("type") or "").lower().strip()
@@ -316,7 +327,7 @@ class LocalProvider(BaseProvider):
             outputs.extend(writes)
         self._run_io = (inputs, outputs)
 
-    def _allowlist(self, specs: Iterable[Any], *, outputs: Iterable[Any] = ()) -> DuckDBAllowlist:
+    def _allowlist(self, inputs: Iterable[Any], *, outputs: Iterable[Any] = ()) -> DuckDBAllowlist:
         """What this provider's SQL may touch, and nothing else.
 
         The source contract's directory (``anchor_dir``) and the FLUID
@@ -339,12 +350,13 @@ class LocalProvider(BaseProvider):
         resolved where DuckDB opens it, the working directory, and is confined
         all the same.
 
-        ``specs`` are what the SQL reads, ``outputs`` what it writes. Each local
+        ``inputs`` are what the SQL reads, ``outputs`` what it writes. Each local
         output also gets the ``tmp_`` sibling a ``COPY ... TO`` over an existing
         file writes first (:func:`copy_tmp_path`), confined the same way:
         without it, an output outside the directories granted whole was written
-        once and refused on every run after. Inputs and ``s3://`` outputs
-        (written in place) get none, and the output's directory is never granted.
+        once and refused on every run after. Inputs get none, nor do ``s3://``
+        and directory outputs (written in place, :func:`_copy_sibling`); the
+        directory an output file is in is not granted for it.
         """
         from fluid_build.util.upstream_discovery import collect_search_roots
 
@@ -376,14 +388,12 @@ class LocalProvider(BaseProvider):
         allow = DuckDBAllowlist.none().with_dirs(self.anchor_dir, workspace, runtime, scratch)
         within = [anchor, runtime, scratch, *collect_search_roots(workspace)]
         _log_sandbox_roots(self, grant, anchor, runtime, scratch)
-        for spec in specs:
+        for spec in inputs:
             if (location := _declared_location(spec)) is not None:
                 allow = allow.with_declared(location, within=within)
         for spec in outputs:
-            if (location := _declared_location(spec)) is None:
-                continue
-            sibling = () if _is_s3_uri(location) else (copy_tmp_path(location),)
-            allow = allow.with_declared(location, *sibling, within=within)
+            if (location := _declared_location(spec)) is not None:
+                allow = allow.with_declared(location, *_copy_sibling(location), within=within)
         return allow
 
     def _connect(
