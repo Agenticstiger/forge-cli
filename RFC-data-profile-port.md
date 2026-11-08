@@ -127,7 +127,7 @@ A value outside its declared range refuses the whole state: no state is written,
 
 ### Grouping and windows
 
-`groupBy` lists up to two category columns from `columns`. Every family is computed for each cell of the cross product of their categories, and for the ungrouped total. An experiment's outcome per variant and segment is a grouped `moments` profile: `groupBy: [variant, segment]` with `moments` on the outcome column.
+`groupBy` lists up to two category columns from `columns`. Every family is computed for each cell of the cross product of their categories, and for the ungrouped total. Rows with a null grouping value form one more cell, under every rule. An experiment's outcome per variant and segment is a grouped `moments` profile: `groupBy: [variant, segment]` with `moments` on the outcome column.
 
 `window` says which rows a state covers. `mode: tumbling` cuts the time column into consecutive windows of `length`. A window is published once, when it closes, so each row lands in at most one state; rows that arrive after their window closed are not counted in any state. That is why a `qos.freshnessSLO` shorter than `window.length` is refused: meeting it would mean publishing windows that are still open. `mode: snapshot` profiles the whole source at each refresh. The two behave very differently under differencing; see Disclosure.
 
@@ -243,17 +243,21 @@ Restrictions on the source carry over. Every column the profile reads (`columns`
 
 `disclosure.minCellSize` is required and must be at least 5. It counts distinct entities when `entity` is set, and rows otherwise. Any cell, bucket, category, transition, dwell bucket or group whose count is from 1 up to `minCellSize - 1` is suppressed, and so is everything computed from it. Zero is published, since it describes no one.
 
+The count rule applies to sums too. A sum, a sum of squares or a sum of products is published only when at least `minCellSize` of its contributors are not at the column's lowest edge and at least `minCellSize` are not at its highest edge. Without that, the sum of a 0/1 column would publish exactly the count of ones that its histogram suppresses, and a sum where all but two contributors sit at the top edge would give away those two.
+
 A sum has a second risk: one large contributor. A sum, a sum of squares or a sum of products is also suppressed when its two largest contributors (entities, or rows without `entity`, by absolute value) make up more than `disclosure.maxDominance` of it, default 0.8. This is the dominance rule statistical agencies apply to magnitude tables. Counting the top two matters because the second-largest contributor can subtract its own value, and what is left must not be mostly the largest one.
 
-Suppression alone can be undone by subtraction, because a state is full of sums. So suppression is applied in two passes, the usual practice in statistical disclosure control (tau-ARGUS and sdcTable both call this primary and secondary suppression). The first pass suppresses small and dominated cells. The second runs on the full table, before rare labels are pooled, over every sum the state's own structure implies:
+Suppression alone can be undone by subtraction, because a state is full of sums. So suppression is applied in two passes, the usual practice in statistical disclosure control (tau-ARGUS and sdcTable both call this primary and secondary suppression). The first pass suppresses small and dominated cells and sums. The second runs on the full table, before rare labels are pooled, over every sum the state's own structure implies:
 
 - within a cell, the buckets or categories of a column, with `belowMinimum` and the nulls, add up to `n`;
-- across cells, every count and every moments sum of a group's cells adds up to the total, and in a two-way grouping each row and each column adds up to its margin;
-- for event data, the transitions out of an activity plus the sequences that end there add up to that activity's count, the transitions into it plus the sequences that start there add up to the same count, and the dwell buckets of a pair add up to its transition count.
+- across cells, every count and every moments sum of the cells adds up to the total (rows with a null grouping value are a cell of their own, so the cells always cover the total, and no other margin is published);
+- for event data, the transitions out of an activity plus the sequences that end there add up to that activity's count, the transitions into it plus the sequences that start there add up to the same count, the starts of all activities and the ends of all activities each add up to the number of sequences (which is the cell's entity count), and the dwell buckets of a pair add up to its transition count.
 
-Wherever a sum has a suppressed part, its suppressed parts together must pass the rules a single cell must pass: at least `minCellSize` contributors, and no dominance. Until they do, the pass suppresses the smallest published part that is not zero (ties broken by label order) and checks again, and it repeats until no sum is left like that. A zero is never chosen, since suppressing it hides nothing.
+Wherever a sum has a suppressed part, its suppressed parts together must pass the rules a single cell must pass: at least `minCellSize` contributors, and no dominance. Until they do, the pass suppresses the smallest published part that is not zero (ties broken by label order) and checks again, and it repeats until no sum is left like that. A zero is never chosen, since suppressing it hides nothing. This list is the set of identities this version of the state format creates; a family added later adds its identities here and to the audit below.
 
-The second pass stops recovery by one subtraction: whatever a reader can subtract out of a sum covers at least `minCellSize` contributors, and no one or two of them dominate it. It does not stop every linear recovery in a two-way table with published margins. Optimal secondary suppression is a hard problem, and that is what the dedicated tools solve. This is why `groupBy` is capped at two columns in this version, and why the stronger guarantee is noise.
+The second pass stops recovery by one subtraction. A reader can still combine several published values, or use bounds (a value in a bucket lies between its edges), so the producer then audits the result, the step tau-ARGUS calls auditing. For every suppressed value it computes the narrowest range the published values allow: a small linear program over the identities above and the bounds the state implies (counts are never negative, every value in a bucket lies between its edges, quantile positions bound cumulative counts, and the summary facet's numbers count as published when `announce: summary` is set). A suppressed count whose range is narrower than `minCellSize`, or a suppressed sum whose range is narrower than its largest contributor, gets more suppression, and the audit runs again until none is left. The reference profiler would solve these with HiGHS through `highspy` (MIT).
+
+Together, the two passes and the audit mean that no combination of the values in one state pins down a suppressed value. They say nothing about values outside the state: another profile of the same source, another state, or what a reader already knows (see Limits). That, and the cost of auditing large tables, is why `groupBy` is capped at two columns in this version, and why the stronger guarantee is noise.
 
 ### Differencing across states
 
@@ -325,7 +329,7 @@ A forge-cli release older than the one that ships the schema change rejects `kin
 
 1. Schema and validator: the kind, the block, the rules above, the kind lists and the exporters, with a fixture contract per rule and a golden check that every existing fixture validates unchanged.
 2. The state: the state JSON Schema, a canonical writer, the digests, the commitment facet schema, and the announcement builder in `build_runners/_lineage.py`. Tests include a round trip and a check that a facet with `min` or `max` set is refused.
-3. A reference profiler that computes states on the local DuckDB path with both suppression passes and the dominance rule, and optional noise through OpenDP as an extra. The exact command surface is left to that PR.
+3. A reference profiler that computes states on the local DuckDB path with both suppression passes, the dominance rule and the audit, and optional noise through OpenDP. HiGHS and OpenDP sit in one optional extra, so the base install stays light. The exact command surface is left to that PR.
 4. `fluid verify` checks the newest state: freshness against `qos.freshnessSLO`, the digest chain, and the contract and declaration digests.
 
 User docs land in forge_docs alongside step 1.
@@ -360,7 +364,8 @@ Checked for this RFC (2026-11-08):
 - OpenLineage spec: custom facets need `_producer` and `_schemaURL`, a project prefix, and an immutable schema URL.
 - DataHub `DatasetFieldProfile.pdl` and OpenMetadata `table.json` `columnProfile`: field lists as quoted above.
 - gbstats `models/statistics.py`: `SampleMeanStatistic(n, sum, sum_squares)`, `RatioStatistic` adds `m_d_sum_of_products`, `RegressionAdjustedStatistic` adds `post_pre_sum_of_products`.
-- sdcTable 0.34.0 (GPL) and tau-ARGUS 4.2.5.2 (EUPL-1.2): primary and secondary cell suppression. Copyleft, so the pattern is adapted and nothing is vendored.
+- sdcTable 0.34.0 (GPL) and tau-ARGUS 4.2.5.2 (EUPL-1.2): primary and secondary cell suppression, and the audit. Copyleft, so the pattern is adapted and nothing is vendored.
+- HiGHS 1.15.1 (MIT, active; `highspy` 1.15.1 on PyPI, MIT): the linear programming solver for the audit.
 - Open Data Contract Standard 3.2.0: no profile or statistics concept to align with.
 
 Inside forge-cli: `compute_contract_digest` and its canonical JSON are reused for state digests, and the `fluid_*` facet keys, job naming and producer URI follow `build_runners/_lineage.py`.
@@ -373,9 +378,9 @@ Inside forge-cli: `compute_contract_digest` and its canonical JSON are reused fo
 
 ## Limits
 
-Minimum cell suppression is not a formal privacy guarantee. Differencing, linkage with outside data, and margins in two-way tables remain risks; noise is the formal option, and it costs accuracy.
+Minimum cell suppression, even audited, is not a formal privacy guarantee. Linkage with outside data remains a risk; noise is the formal option, and it costs accuracy.
 
-The second suppression pass blocks recovery by one subtraction, not every linear recovery.
+The audit covers the values of one state. States are kept apart by tumbling windows, or by noise, not by the audit.
 
 Two profiles of the same source are not checked against each other. Their sums can combine like the margins of one larger table, which is why the validator warns about them.
 
