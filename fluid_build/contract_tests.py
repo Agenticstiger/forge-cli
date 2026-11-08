@@ -47,6 +47,7 @@ from fluid_build.providers._duckdb_compat import NO_ROWS_TO_WRITE, one_row, quer
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
     DuckDBSandboxError,
+    copy_tmp_path,
     is_sandbox_refusal,
     sandbox_refusal_hint,
     secure_duckdb_connect,
@@ -127,6 +128,11 @@ def _action_allowlist(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> DuckDB
     relative paths resolve) or a directory the operator lists in
     ``FLUID_DUCKDB_ALLOWED_DIRS``: a declared file is granted to the action's
     SQL, so declaring ``~/.aws/credentials`` must not make it readable.
+
+    An output also gets the ``tmp_`` sibling that a ``COPY ... TO`` over an
+    existing file writes first (:func:`copy_tmp_path`), beside the resolved
+    path :func:`_write_output` copies to, and confined the same way. An input
+    gets none.
     """
     within = [Path.cwd()]
     allow = DuckDBAllowlist.none()
@@ -136,7 +142,10 @@ def _action_allowlist(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> DuckDB
             allow = allow.with_declared(*(str(Path(f).absolute()) for f in files), within=within)
     for spec in _output_specs(outputs):
         if spec.get("path"):
-            allow = allow.with_declared(str(Path(str(spec["path"])).absolute()), within=within)
+            out = Path(str(spec["path"]))
+            allow = allow.with_declared(
+                str(out.absolute()), copy_tmp_path(out.resolve()), within=within
+            )
     return allow
 
 

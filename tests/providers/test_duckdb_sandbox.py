@@ -510,6 +510,163 @@ def test_the_copy_sibling_is_one_more_file_confined_like_the_landing(layout, mon
         _run_allowlist(ctx, _run_streams(ctx), "parquet")
 
 
+# ── the local provider's outputs ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize("fmt", ["csv", "parquet"])
+def test_an_embedded_sql_output_outside_the_contract_directory_is_replaced_on_every_run(
+    fmt, layout, printed, monkeypatch
+):
+    """The local provider grants a declared output outside the contract's
+    directory as its file, and a ``COPY ... TO`` over an existing file writes
+    DuckDB's ``tmp_`` sibling first (``copy_tmp_path``). With the file alone
+    granted, the first run wrote it and every run after it failed with
+    "Cannot access file .../tmp_result.<fmt>"."""
+    from fluid_build.build_runners.base import _execute_embedded_sql_build
+
+    shared = layout["tmp"] / "shared"
+    landing = shared / "result"
+    landing.mkdir(parents=True)
+    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(shared))
+    out = landing / f"result.{fmt}"
+    contract = _contract("SELECT id, amount FROM read_csv('data/orders.csv')", out)
+    contract["exposes"][0]["binding"]["format"] = fmt
+    build = contract["builds"][0]
+
+    assert _execute_embedded_sql_build(build, contract, layout["contract_dir"]) == 0, printed
+    assert _count(out) == 2
+    with (layout["contract_dir"] / "data" / "orders.csv").open("a", encoding="utf-8") as more:
+        more.write("3,30\n")
+    # The second run writes over the file the first one wrote.
+    assert _execute_embedded_sql_build(build, contract, layout["contract_dir"]) == 0, printed
+    assert _count(out) == 3
+    # Written beside the file and renamed into place: nothing is left behind.
+    assert [p.name for p in landing.iterdir()] == [out.name]
+
+
+def test_a_materialized_expose_outside_the_contract_directory_is_rewritten_on_every_run(
+    layout, monkeypatch
+):
+    """``plan`` + ``apply`` land an expose with a materialize action. Refused on
+    the ``tmp_`` sibling, its write fell back, the existing file then made it a
+    skipped no-op, and the run passed with the previous run's rows left in it."""
+    from fluid_build.providers.local.local import LocalProvider
+
+    shared = layout["tmp"] / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(shared))
+    out = shared / "orders.parquet"
+    source = layout["contract_dir"] / "data" / "orders.csv"
+    build = {
+        "id": "summarize",
+        "engine": "sql",
+        "pattern": "embedded-logic",
+        "properties": {
+            "sql": "SELECT id, amount FROM orders",
+            "parameters": {"inputs": [{"name": "orders", "path": str(source)}]},
+        },
+    }
+    binding = {"platform": "local", "format": "parquet", "location": {"path": str(out)}}
+    contract = {
+        "fluidVersion": "0.7.3",
+        "id": "silver.materialized",
+        "builds": [build],
+        "exposes": [{"exposeId": "orders_out", "binding": binding}],
+    }
+
+    provider = LocalProvider(project="local", region="local", anchor_dir=layout["contract_dir"])
+    first = provider.apply(actions=provider.plan(contract))
+    assert (first["failed"], first["results"][-1]["op"]) == (0, "materialize"), first["results"]
+    assert _count(out) == 2
+    with source.open("a", encoding="utf-8") as more:
+        more.write("3,30\n")
+    second = provider.apply(actions=provider.plan(contract))
+    assert (second["failed"], second["results"][-1]["op"]) == (0, "materialize"), second["results"]
+    assert _count(out) == 3
+    assert [p.name for p in shared.iterdir()] == ["orders.parquet"]
+
+
+def test_only_a_local_output_gets_its_copy_sibling(layout, monkeypatch):
+    """The sibling is one more single file, confined as the output is: a planted
+    ``tmp_`` symlink that leads out of the operator's directory is refused, not
+    granted. An input gets none (it is never written), nor does an object-store
+    output (DuckDB writes a URL in place), and no directory is granted."""
+    from fluid_build.providers.local.local import LocalProvider
+
+    shared = layout["tmp"] / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(shared))
+    (shared / "rates.csv").write_text("id,rate\n1,3\n", encoding="utf-8")
+    rates = [{"path": str(shared / "rates.csv")}]
+    result = [{"path": str(shared / "result.csv")}]
+    provider = LocalProvider(project="local", region="local", anchor_dir=layout["contract_dir"])
+
+    allow = provider._allowlist(rates, outputs=[*result, {"path": "s3://landing/out/r.parquet"}])
+    assert sorted(p for p in allow.paths if Path(p).parent == shared) == [
+        str(shared / name) for name in ("rates.csv", "result.csv", "tmp_result.csv")
+    ]
+    assert not any(Path(d).is_relative_to(shared) for d in allow.dirs)
+    assert allow.remote_prefixes == ("s3://landing/out/",)
+
+    (shared / "tmp_rates.csv").symlink_to(layout["outside"] / "secret.csv")
+    provider._allowlist(rates)
+    (shared / "tmp_result.csv").symlink_to(layout["outside"] / "secret.csv")
+    with pytest.raises(DuckDBSandboxError, match="FLUID_DUCKDB_ALLOWED_DIRS"):
+        provider._allowlist(rates, outputs=result)
+
+
+def test_a_planted_copy_sibling_cannot_redirect_a_rewrite(layout, printed, monkeypatch):
+    """Granted, a ``tmp_`` symlink beside an output that exists would make the
+    rewrite write wherever it points (DuckDB realpaths a grant): here, over the
+    secret. The build is refused before its SQL runs, and the secret is intact."""
+    from fluid_build.build_runners.base import _execute_embedded_sql_build
+
+    shared = layout["tmp"] / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(shared))
+    contract = _contract("SELECT 1 AS a", shared / "result.csv")
+    build = contract["builds"][0]
+    assert _execute_embedded_sql_build(build, contract, layout["contract_dir"]) == 0, printed
+    secret = layout["outside"] / "secret.csv"
+    (shared / "tmp_result.csv").symlink_to(secret)
+
+    assert _execute_embedded_sql_build(build, contract, layout["contract_dir"]) == 1
+    assert "FLUID_DUCKDB_ALLOWED_DIRS" in "\n".join(printed), printed
+    assert secret.read_text(encoding="utf-8") == f"token\n{SECRET}\n"
+    assert (shared / "result.csv").read_text(encoding="utf-8").splitlines() == ["a", "1"]
+
+
+def test_contract_tests_action_grants_its_outputs_copy_sibling_only(layout, monkeypatch):
+    """The contract-tests action writes a parquet output with ``COPY ... TO`` the
+    resolved path (falling back to pandas), so that path's ``tmp_`` sibling is
+    granted with it, confined the same way; an input's is not."""
+    from types import SimpleNamespace
+
+    from fluid_build.contract_tests import LocalProviderError, _action_allowlist, apply_action
+
+    shared = layout["tmp"] / "shared"
+    shared.mkdir()
+    monkeypatch.setenv("FLUID_DUCKDB_ALLOWED_DIRS", str(shared))
+    source = shutil.copy(layout["contract_dir"] / "data" / "orders.csv", shared)
+    inputs = {"orders": {"path": str(source)}}
+    outputs = {"path": str(shared / "result.parquet"), "format": "parquet"}
+
+    allow = _action_allowlist(inputs, outputs)
+    assert sorted(os.path.realpath(p) for p in allow.paths) == [
+        os.path.realpath(shared / name)
+        for name in ("orders.csv", "result.parquet", "tmp_result.parquet")
+    ]
+    assert not allow.dirs
+
+    (shared / "tmp_result.parquet").symlink_to(layout["outside"] / "secret.csv")
+    action = {"op": "add", "resource_type": "sql", "id": "orders", "sql": "SELECT * FROM orders"}
+    with pytest.raises(LocalProviderError, match="FLUID_DUCKDB_ALLOWED_DIRS"):
+        apply_action(
+            {**action, "inputs": inputs, "outputs": outputs}, SimpleNamespace(dry_run=False)
+        )
+    assert not (shared / "result.parquet").exists()
+
+
 def test_a_sqlite_source_outside_the_allowed_directories_is_refused(layout, monkeypatch):
     """The engine attaches a SQLite source before the sandbox's lock, when no
     allowlist applies yet (and through DuckDB 1.5 the sqlite scanner did not

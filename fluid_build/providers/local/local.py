@@ -39,6 +39,7 @@ from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
     WorkspaceGrant,
     broad_root_reason,
+    copy_tmp_path,
     is_sandbox_refusal,
     refuse_broad_root,
     sandbox_refusal_hint,
@@ -171,6 +172,34 @@ def _is_s3_uri(path: str) -> bool:
     return path[:5].lower() == "s3://"
 
 
+def _declared_location(spec: Any) -> Optional[str]:
+    """The location an input or output spec declares, as the allowlist grants it."""
+    raw = spec.get("path") if isinstance(spec, dict) else spec
+    if not raw:
+        return None
+    raw = str(raw)
+    # Only s3:// is remote here (``_register_mapping_input``): any other string
+    # is a local path, as ``Path`` reads it.
+    return raw if _is_s3_uri(raw) else str(Path(raw))
+
+
+def _declared_io(action: Dict[str, Any]) -> Tuple[List[Any], List[Any]]:
+    """``(inputs, outputs)``: what ``action`` declares it reads and writes through DuckDB."""
+    op = (action.get("op") or action.get("type") or "").lower().strip()
+    inputs: List[Any] = []
+    outputs: List[Any] = []
+    if op in {"sql", "query", "execute_sql"}:
+        for key in ("inputs", "tables", "outputs", "out"):
+            value = action.get(key) or []
+            found = outputs if key in {"outputs", "out"} else inputs
+            found.extend(value if isinstance(value, list) else [value])
+    elif op == "load_data":
+        inputs.append(action.get("path"))
+    elif op in {"copy", "materialize"}:
+        outputs.append(action.get("dst") or action.get("out") or action.get("path"))
+    return [spec for spec in inputs if spec], [spec for spec in outputs if spec]
+
+
 def _s3_bucket_regions(specs: Iterable[Any]) -> Dict[str, Optional[str]]:
     """``{bucket: region}`` for every ``s3://`` input or output spec.
 
@@ -267,21 +296,6 @@ class LocalProvider(BaseProvider):
 
     # ------------------------- Sandboxed DuckDB ------------------------- #
 
-    @staticmethod
-    def _declared_io(action: Dict[str, Any]) -> List[Any]:
-        """Every location ``action`` declares it reads or writes through DuckDB."""
-        op = (action.get("op") or action.get("type") or "").lower().strip()
-        found: List[Any] = []
-        if op in {"sql", "query", "execute_sql"}:
-            for key in ("inputs", "tables", "outputs", "out"):
-                value = action.get(key) or []
-                found.extend(value if isinstance(value, list) else [value])
-        elif op == "load_data":
-            found.append(action.get("path"))
-        elif op in {"copy", "materialize"}:
-            found.append(action.get("dst") or action.get("out") or action.get("path"))
-        return [spec for spec in found if spec]
-
     def _declare_run_io(self, actions: Iterable[Dict[str, Any]]) -> None:
         """Record what every action of this run declares, before any SQL runs.
 
@@ -289,17 +303,20 @@ class LocalProvider(BaseProvider):
         over a file is read again by a later action's SQL: every connection of
         the run gets the run's whole declared allowlist, not just its own.
         """
-        specs: List[Any] = []
+        inputs: List[Any] = []
+        outputs: List[Any] = []
         for action in actions:
             flat = dict(action)
             payload = flat.pop("payload", None)
             if isinstance(payload, dict):
                 for key, value in payload.items():
                     flat.setdefault(key, value)
-            specs.extend(self._declared_io(flat))
-        self._run_io = specs
+            reads, writes = _declared_io(flat)
+            inputs.extend(reads)
+            outputs.extend(writes)
+        self._run_io = (inputs, outputs)
 
-    def _allowlist(self, specs: Iterable[Any]) -> DuckDBAllowlist:
+    def _allowlist(self, specs: Iterable[Any], *, outputs: Iterable[Any] = ()) -> DuckDBAllowlist:
         """What this provider's SQL may touch, and nothing else.
 
         The source contract's directory (``anchor_dir``) and the FLUID
@@ -321,6 +338,13 @@ class LocalProvider(BaseProvider):
         (``DuckDBAllowlist.with_declared``). A relative declared path is
         resolved where DuckDB opens it, the working directory, and is confined
         all the same.
+
+        ``specs`` are what the SQL reads, ``outputs`` what it writes. Each local
+        output also gets the ``tmp_`` sibling a ``COPY ... TO`` over an existing
+        file writes first (:func:`copy_tmp_path`), confined the same way:
+        without it, an output outside the directories granted whole was written
+        once and refused on every run after. Inputs and ``s3://`` outputs
+        (written in place) get none, and the output's directory is never granted.
         """
         from fluid_build.util.upstream_discovery import collect_search_roots
 
@@ -353,31 +377,39 @@ class LocalProvider(BaseProvider):
         within = [anchor, runtime, scratch, *collect_search_roots(workspace)]
         _log_sandbox_roots(self, grant, anchor, runtime, scratch)
         for spec in specs:
-            raw = spec.get("path") if isinstance(spec, dict) else spec
-            if not raw:
+            if (location := _declared_location(spec)) is not None:
+                allow = allow.with_declared(location, within=within)
+        for spec in outputs:
+            if (location := _declared_location(spec)) is None:
                 continue
-            raw = str(raw)
-            # Only s3:// is remote here (``_register_mapping_input``): any other
-            # string is a local path, as ``Path`` reads it.
-            allow = allow.with_declared(raw if _is_s3_uri(raw) else str(Path(raw)), within=within)
+            sibling = () if _is_s3_uri(location) else (copy_tmp_path(location),)
+            allow = allow.with_declared(location, *sibling, within=within)
         return allow
 
-    def _connect(self, specs: Iterable[Any] = (), *, config: Optional[Dict[str, Any]] = None):
+    def _connect(
+        self,
+        inputs: Iterable[Any] = (),
+        outputs: Iterable[Any] = (),
+        *,
+        config: Optional[Dict[str, Any]] = None,
+    ):
         """The provider's one way to DuckDB: sandboxed to :meth:`_allowlist`.
 
-        ``specs`` are the calling action's own declared locations, added to the
-        run's (:meth:`_declare_run_io`). The S3 buckets among them get their
-        extensions and credential secret before the configuration is locked.
+        ``inputs`` and ``outputs`` are the calling action's own declared locations,
+        added to the run's (:meth:`_declare_run_io`). The S3 buckets among them get
+        their extensions and credential secret before the configuration is locked.
         """
         _Duck.get()
-        all_specs = [*getattr(self, "_run_io", []), *specs]
-        allow = self._allowlist(all_specs)
+        run_inputs, run_outputs = getattr(self, "_run_io", ((), ()))
+        all_inputs = [*run_inputs, *inputs]
+        all_outputs = [*run_outputs, *outputs]
+        allow = self._allowlist(all_inputs, outputs=all_outputs)
         self._last_allow = allow
         return secure_duckdb_connect(
             self._get_db_path(),
             allow=allow,
             config=config,
-            before_lock=lambda con: self._attach_object_stores(con, all_specs),
+            before_lock=lambda con: self._attach_object_stores(con, [*all_inputs, *all_outputs]),
         )
 
     def _get_db_path(self) -> str:
@@ -893,7 +925,7 @@ class LocalProvider(BaseProvider):
             outputs = [outputs]
         # Threads set at connect: the sandbox locks the configuration, so a
         # ``PRAGMA threads`` afterwards is refused.
-        con = self._connect([*inputs, *outputs], config={"threads": 4})
+        con = self._connect(inputs, outputs, config={"threads": 4})
         # Closed on every path, a failure included (see _run_load_data_action):
         # otherwise one failing SQL action fails every later action of the run.
         try:
@@ -1155,7 +1187,7 @@ class LocalProvider(BaseProvider):
         fmt = (action.get("format") or _ext(dst) or "csv").lower()
         if source_table:
             try:
-                con = self._connect([dst])
+                con = self._connect(outputs=[dst])
                 try:
                     rel = con.sql(f"SELECT * FROM {validate_ident(source_table)}")
                     self._write_relation(rel, dst, fmt)
