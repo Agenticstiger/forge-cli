@@ -94,18 +94,37 @@ exposes:
       sequence:
         activity: event_type
         time: event_ts
-        dwellEdges: [PT1H, P1D, P7D, P30D]
+        dwellEdges: [PT0S, PT1H, PT6H, P1D, P7D]
       disclosure:
         minCellSize: 10
 ```
 
 `profile.source` names an expose of the same contract. A profile can only describe data its own product owns, because only the owner can read the rows inside its boundary. A product that wants a profile of someone else's data consumes that data, builds its own expose, and profiles that.
 
+The whole block:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `source` | yes | The exposeId of the profiled expose, in the same contract. |
+| `entity` | no | The column that identifies the person or thing a row is about. The privacy unit. Never published. |
+| `window` | yes | `mode: tumbling` with `column` and `length`, or `mode: snapshot`. |
+| `columns[]` | yes | `name` and `domain` (`range` or `category`); a `range` column also has `edges` and `resolution`. |
+| `families` | yes | Any of `histogram`, `moments`, `quantiles`, `distinct`, `transitions`, `dwell`. |
+| `quantiles` | with `quantiles` | Probabilities, as decimal strings. |
+| `pairs` | no | Two-column lists of `range` columns, for sums of products. |
+| `groupBy` | no | Up to two `category` columns. |
+| `sequence` | with `transitions` or `dwell` | `activity`, `time` and `dwellEdges`. |
+| `disclosure.minCellSize` | yes | At least 5. |
+| `disclosure.maxDominance` | no | Between 0 and 1, default 0.8. |
+| `disclosure.differencing` | no | `accepted`, the explicit acceptance described under Disclosure. |
+| `disclosure.noise` | no | `mechanism`, `epsilon`, `delta` (gaussian), `budget`, and `maxRowsPerEntity` when `entity` is set. |
+| `announce` | no | `commitment` (the default) or `summary`. |
+
 ### Columns
 
 Every profiled column must exist in the source's `contract.schema`. Each column has a `domain`:
 
-- `range`: a numeric column. `edges` are the bucket boundaries, written as decimal strings so no binary float enters a hashed document. The first and last edge are the declared range. Buckets are half-open, `[e_i, e_i+1)`, except the last, which is closed so a value equal to the top edge is counted. `resolution` is the step values are rounded to (half-even) before any sum, so sums are exact integers in units of `resolution`.
+- `range`: a numeric column. `edges` are the bucket boundaries, written as decimal strings so no binary float enters a hashed document. The first and last edge are the declared range. Buckets are half-open, `[e_i, e_i+1)`, except the last, which is closed so a value equal to the top edge is counted. The range check and the bucketing use the exact value. `resolution` is the step values are rounded to (half-even) for sums only, so sums are exact integers in units of `resolution`; every edge must be a multiple of it.
 - `category`: a string column. Its categories are counted as they occur. A category below the minimum cell size is dropped from the histogram and its count pooled into `belowMinimum`, so a rare label never appears. The pooled count is itself suppressed when it is below the minimum.
 
 A value outside its declared range refuses the whole state: no state is written, and the run reports the column and the row position, never the value. The fix is to widen the edges, which is a declaration change and is reviewed as one. Silent clamping was considered and rejected: it would hide exactly the drift a profile exists to show.
@@ -114,14 +133,14 @@ A value outside its declared range refuses the whole state: no state is written,
 
 ### Statistic families
 
-`families` lists what a state carries. Each family is computed per cell (see grouping below).
+`families` lists what a state carries. A family applies to every column it fits: `histogram` and `distinct` to every column (and `distinct` also to `entity`), `moments` and `quantiles` to every `range` column, `transitions` and `dwell` to the sequence. Each family is computed per cell (see grouping below).
 
 - `histogram`: the count per bucket of a range column, or per category of a category column. For a category column the histogram's keys are its support.
 - `moments`: for a range column, the sum and the sum of squares of its rounded values. `pairs` (optional, a list of two-column lists) adds the sum of products for each declared pair. These are the sufficient statistics for means, variances, correlations, ratio metrics and regression adjustment, which is what experiment analysis needs (gbstats takes exactly `n`, `sum`, `sum_squares` and a sum of products).
 - `quantiles`: for each requested probability in `profile.quantiles`, the index of the bucket that holds that quantile. It says "the median lies in [50, 100)", never the median value.
 - `distinct`: the number of distinct values of a column in the cell. On `entity` it is the number of entities.
 - `transitions`: for event data, the count of each directly-follows pair (activity a, then activity b, for the same entity, ordered by time), plus how many sequences start and end at each activity. This is the object-centric directly-follows graph that process mining uses (OCEL 2.0), reduced to its counts.
-- `dwell`: for each directly-follows pair, a histogram of the time between the two events on `sequence.dwellEdges` (ISO 8601 durations).
+- `dwell`: for each directly-follows pair, a histogram of the time between the two events on `sequence.dwellEdges` (ISO 8601 durations). The range rule applies: the first edge is the shortest dwell counted (`PT0S` counts every one), and a dwell past the last edge refuses the state. With tumbling windows no dwell is longer than `window.length`, so a last edge equal to `window.length` is never passed.
 
 `transitions` and `dwell` need `entity` and a `sequence` block: the activity column and the time column. The activity column must also be declared in `columns` as a category column, so every label rule applies to it: a rare activity is pooled, and a transition that involves a pooled activity is counted under `belowMinimum`, never keyed by its label. Sequences are cut at window boundaries: the first event of an entity inside a window starts a sequence.
 
@@ -129,7 +148,7 @@ A value outside its declared range refuses the whole state: no state is written,
 
 `groupBy` lists up to two category columns from `columns`. Every family is computed for each cell of the cross product of their categories, and for the ungrouped total. Rows with a null grouping value form one more cell, under every rule. An experiment's outcome per variant and segment is a grouped `moments` profile: `groupBy: [variant, segment]` with `moments` on the outcome column.
 
-`window` says which rows a state covers. `mode: tumbling` cuts the time column into consecutive windows of `length`. A window is published once, when it closes, so each row lands in at most one state; rows that arrive after their window closed are not counted in any state. That is why a `qos.freshnessSLO` shorter than `window.length` is refused: meeting it would mean publishing windows that are still open. `mode: snapshot` profiles the whole source at each refresh. The two behave very differently under differencing; see Disclosure.
+`window` says which rows a state covers. `mode: tumbling` cuts the time column into consecutive windows of `length`. A window is published once, when it closes, so each row lands in at most one state. Rows that arrive after their window closed are not counted, unless the profile allows restatements (see Disclosure), in which case a restatement counts them. A state's age is measured from the end of its window, so the newest state is at least `window.length` old just before the next one lands. That is why a `qos.freshnessSLO` that is not longer than `window.length` is refused: it could never be met without publishing windows that are still open. `mode: snapshot` profiles the whole source at each refresh. The two behave very differently under differencing; see Disclosure.
 
 ### Profile states
 
@@ -155,7 +174,7 @@ A state is one JSON document, written to the binding as an immutable object name
       "columns": {
         "amount": {
           "histogram": [12, 140, 410, 600, 513, 151],
-          "moments": { "sum": "10423315", "sumSquares": "981244877101" },
+          "moments": { "sum": "20811037", "sumSquares": "478634712081" },
           "quantiles": { "0.5": 3, "0.9": 4 }
         },
         "plan": { "histogram": { "basic": null, "plus": 928 }, "belowMinimum": null }
@@ -245,7 +264,7 @@ Restrictions on the source carry over. Every column the profile reads (`columns`
 
 The count rule applies to sums too. A sum, a sum of squares or a sum of products is published only when at least `minCellSize` of its contributors are not at the column's lowest edge and at least `minCellSize` are not at its highest edge. Without that, the sum of a 0/1 column would publish exactly the count of ones that its histogram suppresses, and a sum where all but two contributors sit at the top edge would give away those two.
 
-A sum has a second risk: one large contributor. A sum, a sum of squares or a sum of products is also suppressed when its two largest contributors (entities, or rows without `entity`, by absolute value) make up more than `disclosure.maxDominance` of it, default 0.8. This is the dominance rule statistical agencies apply to magnitude tables. Counting the top two matters because the second-largest contributor can subtract its own value, and what is left must not be mostly the largest one.
+A sum has a second risk: one large contributor. A sum, a sum of squares or a sum of products is also suppressed when its two largest contributions make up more than `disclosure.maxDominance` of the sum of all contributions taken as absolute values, default 0.8. A contribution is one entity's total (or one row's value without `entity`) of the summed term: the value, its square, or the product. This is the dominance rule statistical agencies apply to magnitude tables. Counting the top two matters because the second-largest contributor can subtract its own value, and what is left must not be mostly the largest one.
 
 Suppression alone can be undone by subtraction, because a state is full of sums. So suppression is applied in two passes, the usual practice in statistical disclosure control (tau-ARGUS and sdcTable both call this primary and secondary suppression). The first pass suppresses small and dominated cells and sums. The second runs on the full table, before rare labels are pooled, over every sum the state's own structure implies:
 
@@ -278,9 +297,10 @@ disclosure:
     mechanism: laplace          # or gaussian, which also needs delta
     epsilon: "0.5"              # spent per state
     budget: { epsilon: "4", period: P30D }
+    maxRowsPerEntity: 50        # required when entity is set
 ```
 
-The declared edges double as the clipping bounds, so the sensitivity of every sum is known. When `entity` is set, the privacy unit is the entity and `maxRowsPerEntity` bounds each entity's contribution; otherwise it is the row. A producer refuses to publish a state that would exceed the budget within its period, and the commitment facet records what each state spent. Noise makes a state impossible to recompute from the source, so `sourceSnapshot` audits only noise-free profiles. The reference implementation would use OpenDP, as an optional extra so the base install stays light.
+The declared edges double as the clipping bounds, so the sensitivity of every sum is known. When `entity` is set, the privacy unit is the entity and `maxRowsPerEntity` bounds each entity's contribution (rows past it are left out of the noised state, and the state says how many); otherwise it is the row. A producer refuses to publish a state that would exceed the budget within its period, and the commitment facet records what each state spent. Noise makes a state impossible to recompute from the source, so `sourceSnapshot` audits only noise-free profiles. The reference implementation would use OpenDP, as an optional extra so the base install stays light.
 
 ## Composition and lineage
 
@@ -288,7 +308,7 @@ A profile is an output port of the product that owns its source. It does not cha
 
 Other products consume it like any expose, with an ordinary `consumeRef`: `productId`, `exposeId`, `versionConstraint`, `requiredPolicies`, and `qosExpectations.freshnessMax` if they need a recent state. The composition rules are unchanged; a profile counts as an upstream like any other. The composition pipeline must not try to infer columns from a profile upstream, since a profile has no `contract.schema` to infer them from.
 
-Versioning follows the declaration. Adding a column or a family is a minor version. Removing one, or changing edges, resolution or the minimum cell size, is a major version, because states before and after are no longer comparable bucket for bucket. A consumer such as a simulation pins `^1.0` and keeps working across refreshes and additive changes.
+Versioning follows the declaration, and a profile expose must carry `version`. Adding a column or a family is a minor version. Any other change to the `profile` block (edges, resolution, the window, the entity, the grouping, the sequence, the quantiles or anything under `disclosure`) is a major version, because states before and after are no longer comparable cell for cell. A consumer such as a simulation pins `^1.0` and keeps working across refreshes and additive changes.
 
 Lineage records what was actually read. Inside the product, the source to profile edge is an aggregation (`transformation.type: aggregation` in field-level lineage). A consumer's `lineage.upstream` names the profile, not the source, so impact analysis on the source still reaches every profile consumer, through the profile. A schema change that drops a profiled column on the source fails `fluid validate` on the profile, in the same contract, before it can ship.
 
@@ -298,19 +318,19 @@ Cross-mesh consumers pin `upstreamDigest` as today. Because refreshes do not mov
 
 `fluid validate` refuses, naming the field path, the rule and the fix, and never printing a data value:
 
-1. `kind: data_profile` without a `profile` block, or a `profile` block on any other kind.
+1. `kind: data_profile` without a `profile` block, a `version` or a `profile.window`, or a `profile` block on any other kind.
 2. `profile.source` that is not an exposeId of this contract, names another `data_profile`, or has no `contract.schema`.
 3. A profiled column missing from the source schema.
-4. A `range` column without at least two strictly increasing decimal-string `edges`, or `moments` on a column without `resolution`.
-5. `moments` or `quantiles` on a `category` column, or `quantiles` without `profile.quantiles`.
+4. A `range` column without at least two strictly increasing decimal-string `edges`, edges that are not multiples of its `resolution`, or no `resolution` while `moments` is declared.
+5. `moments` or `quantiles` declared with no `range` column, `quantiles` without `profile.quantiles`, or a `pairs` entry that is not two `range` columns.
 6. `transitions` or `dwell` without `entity` and `sequence`, `dwell` without `dwellEdges`, or a `sequence.activity` that is not a `category` column in `columns`.
 7. A `groupBy` column that is not a `category` column of the profile, or more than two of them.
 8. `minCellSize` missing or below 5, or `maxDominance` outside (0, 1).
 9. A `category` domain on a `pii` or `phi` source column, or any column the profile reads, other than `entity`, that the source restricts for a profile reader.
 10. `mode: snapshot` with neither `noise` nor `differencing: accepted`.
-11. `noise` with a non-positive `epsilon`, or `gaussian` without `delta`.
+11. `noise` with a non-positive `epsilon`, `gaussian` without `delta`, a `budget.epsilon` below `epsilon`, or `entity` set without `maxRowsPerEntity`.
 12. A `contract` block on a `data_profile` expose: the state format is fixed by the spec.
-13. `mode: tumbling` with a `qos.freshnessSLO` shorter than `window.length`.
+13. `mode: tumbling` without `window.column` or `window.length`, or with a `qos.freshnessSLO` that is not longer than `window.length`.
 14. `announce: summary` together with `mode: snapshot`, `noise` or `differencing: accepted`.
 
 It also warns when one contract declares two profiles of the same source, because their published sums can combine like the margins of one larger table (see Limits).
@@ -320,6 +340,8 @@ It also warns when one contract declares two profiles of the same source, becaus
 The change is additive and lands only in the 0.7.7 preview: one enum value, one optional block, and an if/then that ties them together. Two existing constraints become conditional on the kind. `contract` is required on every expose today, and `$defs.exposeContract` requires `schema` or `openapiRef` through an `anyOf`. Both move into an if/then on the expose that applies to every kind except `data_profile`, so each existing kind accepts exactly what it accepts today, and a golden test over every fixture contract pins that. Stable 0.7.6 is unchanged, untagged contracts never default to a preview version, and so no existing contract's digest, bundle or plan moves.
 
 Code that lists expose kinds as a closed set gains one entry: `cli/product_add.py::_EXPOSE_KINDS`, the ODCS physical type map in `providers/odcs/mappers/types.py`, and the ODPS output port writer in `providers/opds/opds.py`, which writes `type: data_profile` and no schema. The ODCS export for a profile expose points at the state schema and carries no columns. Neither export ever carries a state.
+
+Two code paths assume every expose has a schema. `fluid validate`'s semantic pass (`cli/contract_validation.py::_validate_single_expose`) reports a missing `schema` as an error today; it learns that a `data_profile` has none and checks the `profile` block instead. `fluid plan` and `fluid apply` would treat a profile's binding like a `file` expose's: they provision the location and the grants, and create no table.
 
 Rollback is deleting the expose. Inside the contract only `accessPolicy` grants that point at it by JSONPath refer to it. Outside, its consumers fail validation the way they would for any removed expose, which is the right signal. If review withdraws the kind before 0.7.7 goes stable, only contracts that opted into the preview and used it are affected.
 
