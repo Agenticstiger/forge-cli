@@ -18,9 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same way, fell back, and then skipped as a no-op because the file existed: the run passed
   with the previous run's rows still in the file. Each output is now granted with its `tmp_`
   sibling, confined as the output is, so a planted `tmp_` symlink that leads out is refused. An
-  input gets no sibling, an `s3://` output none, and the output's directory is never granted. The
-  contract-tests local action grants its outputs the same way. The DuckDB acquisition runner's
-  landing got this fix in 0.19.0 (#699). Found on the demo lab on 0.18.2, still in 0.28.0.
+  input gets no sibling, nor do an `s3://` output and a directory (both written in place), nor a
+  `tmp_` name longer than the file system holds; the directory an output file is in is never
+  granted. The contract-tests local action grants its outputs the same way. The DuckDB
+  acquisition runner's landing got this fix in 0.19.0 (#699). Found on the demo lab on 0.18.2,
+  still in 0.28.0.
 
 ## [0.28.0] — 2026-11-06
 
