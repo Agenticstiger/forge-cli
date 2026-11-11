@@ -466,7 +466,7 @@ class TestLeanKeylessAutoPick:
         from fluid_build.llm.providers import preflight_llm_provider
 
         env = self._lean(block, monkeypatch, tmp_path)
-        env["GEMINI_API_KEY"] = "AIza-test"
+        env["GEMINI_API_KEY"] = "AIza-test"  # pragma: allowlist secret
         with pytest.raises(MissingOptionalDependency):
             preflight_llm_provider(self._args(), env)
 
