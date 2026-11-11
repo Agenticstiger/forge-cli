@@ -1055,6 +1055,12 @@ class TestGeminiIsDefaultProvider:
                 "fluid_build.cli.forge_copilot_llm_providers.detect_ollama_available",
                 return_value=False,
             ),
+            # A coding agent on this machine's PATH would be auto-picked
+            # (non-interactive); "unconfigured" means none is installed.
+            patch(
+                "fluid_build.llm.provider_resolve._first_coding_agent_on_path",
+                return_value=None,
+            ),
             patch(
                 "fluid_build.cli.forge_copilot_llm_providers._resolve_api_key",
                 return_value=None,

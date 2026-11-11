@@ -31,6 +31,7 @@ from fluid_build.cli.forge_copilot_llm_providers import (
     clear_api_key_from_keyring,
     detect_provider_from_api_key,
     get_catalog_default,
+    get_llm_provider,
     has_llm_api_key,
     live_provider_models,
     resolve_llm_config,
@@ -221,10 +222,11 @@ class TestResolveLlmConfig:
 
         assert config.provider == "ollama"
         assert config.api_key is None
-        # litellm owns auth/endpoint resolution; we emit a sentinel
-        # ``litellm://ollama/<model>`` so telemetry can identify the
-        # routed call without leaking the daemon URL into the config.
-        assert config.endpoint.startswith("litellm://ollama/")
+        # OLLAMA_HOST is a real daemon address, so it is the endpoint; litellm
+        # owns everything else and no placeholder URL is ever recorded.
+        assert config.endpoint == "http://localhost:11434"
+        _, payload = get_llm_provider("ollama").build_request(config, "s", "u")
+        assert payload["api_base"] == "http://localhost:11434"
 
     def test_llm_timeout_seconds_can_be_configured_from_env(self):
         args = SimpleNamespace(llm_provider="ollama", llm_model=None, llm_endpoint=None)
@@ -381,7 +383,7 @@ class TestResolveLlmConfig:
 
         assert config.provider == "ollama"
         assert config.model == "gemma4:latest"
-        assert config.endpoint.startswith("litellm://ollama/")
+        assert config.endpoint == "http://localhost:11434"
 
     def test_required_llm_preflight_rejects_unavailable_ollama_model(self):
         args = SimpleNamespace(
@@ -422,8 +424,8 @@ class TestCheckLlmReadiness:
         assert readiness.ready is True
         assert readiness.provider == "ollama"
         assert readiness.auth_available is True
-        # litellm-routed sentinel — see test_ollama_uses_default_endpoint_without_api_key.
-        assert readiness.endpoint.startswith("litellm://ollama/")
+        # See test_ollama_uses_default_endpoint_without_api_key.
+        assert readiness.endpoint == "http://localhost:11434"
 
     def test_redacts_endpoint_in_readiness_output(self):
         readiness = check_llm_readiness(

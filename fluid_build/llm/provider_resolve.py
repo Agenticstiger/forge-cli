@@ -28,6 +28,8 @@ keep resolving.
 from __future__ import annotations
 
 import logging
+import shutil
+import sys
 from typing import Mapping, Optional
 
 LOG = logging.getLogger("fluid.cli.llm_providers.resolve")
@@ -91,8 +93,121 @@ def _infer_provider_from_explicit_keys(env: Mapping[str, str]) -> Optional[str]:
     return None
 
 
-def _infer_provider_from_ambient(env: Mapping[str, str]) -> Optional[str]:
-    """Last-resort detection: Ollama already running on localhost.
+def _is_non_interactive(non_interactive: bool = False) -> bool:
+    """True when the run cannot answer a prompt: ``--non-interactive`` or no TTY on stdin."""
+    if non_interactive:
+        return True
+    try:
+        return not sys.stdin.isatty()
+    except (AttributeError, ValueError):  # no stdin, or a closed one
+        return True
+
+
+# Variables that mean the operator configured an LLM: an API key, or a stated
+# endpoint, model or Ollama host. A coding agent is never auto-picked over any of them, so a
+# run never sends its prompt somewhere other than the destination it was given.
+_CONFIG_ENV_VARS = (
+    "FLUID_LLM_API_KEY",
+    "FLUID_LLM_ENDPOINT",
+    "FLUID_LLM_MODEL",
+    "FLUID_LLM_ROUTING_ENDPOINT",
+    "FLUID_LLM_ROUTING_MODEL",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OLLAMA_HOST",
+)
+
+
+def _configured_by_env(env: Mapping[str, str]) -> bool:
+    """Whether the environment configures an LLM (see :data:`_CONFIG_ENV_VARS`).
+
+    Every provider's key in the host's ``PROVIDER_ENV_VARS`` counts too.
+    """
+    provider_keys = tuple(getattr(_host(), "PROVIDER_ENV_VARS", {}).values())
+    return any(env.get(var) for var in _CONFIG_ENV_VARS + provider_keys)
+
+
+def _operator_configured_a_provider(env: Mapping[str, str]) -> bool:
+    """Whether anything but ambient discovery already names a provider.
+
+    An API-key, endpoint or model env var (even several keys, which
+    :func:`_infer_provider_from_explicit_keys` refuses to choose between), a
+    keyring key, or a saved ``~/.fluid`` provider. A coding agent is never
+    auto-picked over any of these.
+    """
+    if _configured_by_env(env):
+        return True
+    keyring_fn = getattr(_host(), "_get_api_key_from_keyring", _get_api_key_from_keyring)
+    if any(keyring_fn(name) for name in ("openai", "anthropic", "gemini")):
+        return True
+    try:
+        from fluid_build._ai_config_shared import load_ai_config
+
+        saved = load_ai_config()
+    except Exception:  # noqa: BLE001 — detection must never hard-fail
+        return False
+    return bool(saved and saved.get("provider"))
+
+
+def _first_coding_agent_on_path(env: Mapping[str, str]) -> Optional[str]:
+    """The first installed coding-agent CLI, in ``CODING_AGENT_NAMES`` order."""
+    from fluid_build.llm.coding_agent import _AGENT_SPECS, CODING_AGENT_NAMES
+
+    # Search the PATH of the environment we were given, never the process's:
+    # an environment without PATH finds nothing, as it would for a child process.
+    path = env.get("PATH", "")
+    for name in CODING_AGENT_NAMES:
+        if shutil.which(_AGENT_SPECS[name].binary, path=path):
+            return name
+    return None
+
+
+def _lean_keyless_autopick(
+    env: Mapping[str, str], *, non_interactive: bool = False, allow_agents: bool = True
+) -> Optional[str]:
+    """The coding agent a run without litellm auto-picks, else ``None``.
+
+    The ambient rung of the ladder without its keyring read, so the litellm
+    preflight stays cheap: a non-interactive run, no configuring variable, no
+    saved provider, an agent CLI on PATH, and no local Ollama (it needs litellm,
+    and a running one is never silently swapped for a cloud agent).
+    ``allow_agents=False`` (the agent loop, or a stated endpoint or model)
+    disables it.
+    """
+    if not allow_agents or not _is_non_interactive(non_interactive):
+        return None
+    if _configured_by_env(env):
+        return None
+    agent = _first_coding_agent_on_path(env)
+    if agent is None:
+        return None
+    try:
+        from fluid_build._ai_config_shared import load_ai_config
+
+        saved = load_ai_config()
+    except Exception:  # noqa: BLE001 — detection must never hard-fail
+        saved = None
+    if saved and saved.get("provider"):
+        return None
+    detect_fn = getattr(_host(), "detect_ollama_available", None)
+    if detect_fn is not None and detect_fn(env):
+        return None
+    return agent
+
+
+def _infer_provider_from_ambient(
+    env: Mapping[str, str], *, non_interactive: bool = False, allow_agents: bool = True
+) -> Optional[str]:
+    """Last-resort detection, shared by the readiness ladder and the real selection.
+
+    1. Ollama already running on localhost: data stays local.
+    2. Non-interactive runs only, and only when nothing is configured: the first
+       coding-agent CLI on PATH. Interactive runs keep "offer, don't force"
+       (the ``fluid ai setup`` inline offer). ``allow_agents=False`` skips this
+       rung: for the agent loop, which needs tool use, and when the operator
+       stated an endpoint or model.
 
     Only call this AFTER the saved config and the keyring have been
     consulted — ambient services must not override an explicit
@@ -107,6 +222,12 @@ def _infer_provider_from_ambient(env: Mapping[str, str]) -> Optional[str]:
     detect_fn = getattr(_host(), "detect_ollama_available", None)
     if detect_fn is not None and detect_fn(env):
         return "ollama"
+    if (
+        allow_agents
+        and _is_non_interactive(non_interactive)
+        and not _operator_configured_a_provider(env)
+    ):
+        return _first_coding_agent_on_path(env)
     return None
 
 
@@ -114,14 +235,18 @@ def _infer_provider_from_ambient(env: Mapping[str, str]) -> Optional[str]:
 # imported ``_infer_provider_from_env``.  The new code paths inside
 # :func:`check_llm_readiness` use the split functions above so the
 # saved config gets a chance to win over ambient Ollama.
-def _infer_provider_from_env(env: Mapping[str, str]) -> Optional[str]:
+def _infer_provider_from_env(
+    env: Mapping[str, str], *, non_interactive: bool = False, allow_agents: bool = True
+) -> Optional[str]:
     explicit = _infer_provider_from_explicit_keys(env)
     if explicit:
         return explicit
     keyring_match = _infer_provider_from_keyring()
     if keyring_match:
         return keyring_match
-    return _infer_provider_from_ambient(env)
+    return _infer_provider_from_ambient(
+        env, non_interactive=non_interactive, allow_agents=allow_agents
+    )
 
 
 def _infer_provider_from_keyring() -> Optional[str]:

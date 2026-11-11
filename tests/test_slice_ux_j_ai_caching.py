@@ -72,13 +72,9 @@ class TestModelRouting:
             routing_model="claude-3-5-haiku-latest",
         )
         routed = cfg.for_routing()
-        # litellm path: routed endpoint is the ``litellm://anthropic/<model>``
-        # sentinel (litellm owns auth + transport, no real URL needed).
-        # Legacy path: ``https://api.anthropic.com/...`` — accept either.
-        assert "anthropic" in routed.endpoint
-        assert (
-            routed.endpoint.startswith("litellm://anthropic/") or "anthropic.com" in routed.endpoint
-        )
+        # litellm owns auth + transport, so the re-derived endpoint is empty:
+        # never a placeholder URL for something to dial.
+        assert routed.endpoint == ""
 
     def test_for_routing_uses_explicit_routing_endpoint(self):
         cfg = LlmConfig(

@@ -419,6 +419,119 @@ class TestNoKeyringBeforeTheHint:
         forge_run.assert_not_called()
 
 
+class TestLeanKeylessAutoPick:
+    """Without litellm, a non-interactive run may still author with an installed agent."""
+
+    @staticmethod
+    def _lean(block, monkeypatch, tmp_path, *, tty=False, ollama=False, saved=None):  # noqa: F811
+        import stat
+        import sys
+        from types import SimpleNamespace
+
+        from fluid_build.llm import providers
+
+        block("litellm")
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        exe = bindir / "claude"
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+        monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: tty))
+        monkeypatch.setattr(providers, "detect_ollama_available", lambda env: ollama)
+        monkeypatch.setattr(providers, "_get_api_key_from_keyring", lambda name: None)
+        monkeypatch.setattr("fluid_build._ai_config_shared.load_ai_config", lambda *a, **k: saved)
+        return {"PATH": str(bindir)}
+
+    @staticmethod
+    def _args(**kw):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(**{"llm_provider": None, "agent_loop": False, **kw})
+
+    def test_agent_on_path_passes_the_preflight(self, block, monkeypatch, tmp_path):  # noqa: F811
+        from fluid_build.llm.providers import _provider_name_from, preflight_llm_provider
+
+        env = self._lean(block, monkeypatch, tmp_path)
+        preflight_llm_provider(self._args(), env)
+        assert _provider_name_from(self._args(), env) == "claude-code"
+
+    def test_running_ollama_still_fails_fast(self, block, monkeypatch, tmp_path):  # noqa: F811
+        from fluid_build.llm.providers import preflight_llm_provider
+
+        env = self._lean(block, monkeypatch, tmp_path, ollama=True)
+        with pytest.raises(MissingOptionalDependency):
+            preflight_llm_provider(self._args(), env)
+
+    def test_an_api_key_still_fails_fast(self, block, monkeypatch, tmp_path):  # noqa: F811
+        from fluid_build.llm.providers import preflight_llm_provider
+
+        env = self._lean(block, monkeypatch, tmp_path)
+        env["GEMINI_API_KEY"] = "AIza-test"
+        with pytest.raises(MissingOptionalDependency):
+            preflight_llm_provider(self._args(), env)
+
+    def test_a_stated_ollama_host_still_fails_fast(
+        self, block, monkeypatch, tmp_path
+    ):  # noqa: F811
+        from fluid_build.llm.providers import preflight_llm_provider
+
+        env = self._lean(block, monkeypatch, tmp_path)
+        env["OLLAMA_HOST"] = "http://127.0.0.1:11500"
+        with pytest.raises(MissingOptionalDependency):
+            preflight_llm_provider(self._args(), env)
+
+    def test_a_saved_provider_still_fails_fast(self, block, monkeypatch, tmp_path):  # noqa: F811
+        from fluid_build.llm.providers import preflight_llm_provider
+
+        env = self._lean(block, monkeypatch, tmp_path, saved={"provider": "openai"})
+        with pytest.raises(MissingOptionalDependency):
+            preflight_llm_provider(self._args(), env)
+
+    def test_a_tty_still_fails_fast(self, block, monkeypatch, tmp_path):  # noqa: F811
+        from fluid_build.llm.providers import preflight_llm_provider
+
+        env = self._lean(block, monkeypatch, tmp_path, tty=True)
+        with pytest.raises(MissingOptionalDependency):
+            preflight_llm_provider(self._args(), env)
+
+    def test_the_agent_loop_never_auto_picks_an_agent(
+        self, block, monkeypatch, tmp_path
+    ):  # noqa: F811
+        from fluid_build.llm.providers import _provider_name_from, preflight_llm_provider
+
+        env = self._lean(block, monkeypatch, tmp_path)
+        with pytest.raises(MissingOptionalDependency) as info:
+            preflight_llm_provider(self._args(agent_loop=True), env)
+        assert "--template starter" in str(info.value)
+        assert _provider_name_from(self._args(agent_loop=True), env) != "claude-code"
+
+    def test_the_agent_loop_env_route_never_auto_picks_an_agent(
+        self, block, monkeypatch, tmp_path
+    ):  # noqa: F811
+        from fluid_build.llm.providers import preflight_llm_provider
+
+        env = {**self._lean(block, monkeypatch, tmp_path), "FLUID_COPILOT_AGENT_LOOP": "1"}
+        with pytest.raises(MissingOptionalDependency) as info:
+            preflight_llm_provider(self._args(), env)
+        assert "--template starter" in str(info.value)
+
+
+def test_agent_search_uses_only_the_given_environment(monkeypatch, tmp_path):
+    """An environment without PATH finds no agent, even if the process PATH has one."""
+    import stat
+
+    from fluid_build.llm.provider_resolve import _first_coding_agent_on_path
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    exe = bindir / "claude"
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", str(bindir))
+    assert _first_coding_agent_on_path({}) is None
+    assert _first_coding_agent_on_path({"PATH": str(bindir)}) == "claude-code"
+
+
 class TestDoctorStatus:
     def _row(self, monkeypatch):
         from fluid_build.cli.doctor import _check_fluid_features
