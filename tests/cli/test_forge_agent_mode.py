@@ -18,7 +18,9 @@ agent's shell wrapper in the IDE is contract-compatible.
 
 from __future__ import annotations
 
+import io
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -243,9 +245,11 @@ def test_emit_plan_emits_forge_plan_event(tmp_path: Path):
     consumes_step = next(s for s in plan["next_steps"] if "consumes" in s["step"].lower())
     assert "list_source_lineage" in consumes_step["mcp_tools"]
 
-    # The architectural note must remind the agent NOT to shell-run fluid forge --ai.
-    assert "do NOT" in plan["note"] or "do not" in plan["note"].lower()
-    assert "API key" in plan["note"] or "api key" in plan["note"].lower()
+    # The note must describe the real split: the agent fills the fields itself,
+    # while --agent plus an AI flag runs forge's own AI with a second LLM.
+    assert "--ai" not in plan["note"]
+    assert "--llm-provider" in plan["note"]
+    assert "second LLM" in plan["note"]
 
     # Order: plan event must come BEFORE forge.done so consumers parsing
     # the stream see "what to do next" before the terminal signal.
@@ -330,3 +334,123 @@ def test_agent_flag_registered_in_argparse():
     args = parser.parse_args(["forge", "--agent", "--blank"])
     assert getattr(args, "agent", False) is True
     assert getattr(args, "blank", False) is True
+
+
+# ---------------------------------------------------------------------------
+# 6. Explicit AI flags under --agent select AI mode (never a silent blank)
+# ---------------------------------------------------------------------------
+
+
+def _agent_args(argv: list[str], tmp_path: Path):
+    import argparse
+
+    from fluid_build.cli import forge as forge_mod
+
+    parser = argparse.ArgumentParser()
+    sp = parser.add_subparsers()
+    forge_mod.register(sp)
+    return parser.parse_args(["forge", "--agent", *argv, "-d", str(tmp_path / "product")])
+
+
+def _run_agent(args, capsys, monkeypatch, *, ai_result=0):
+    """Run forge.run under --agent with the AI generation seam mocked.
+
+    Returns (events, ai_mock). stdin is a non-TTY and ``input`` must never be
+    called: an agent's shell cannot answer a prompt.
+    """
+    from unittest.mock import MagicMock
+
+    from fluid_build.cli import forge as forge_mod
+
+    ai = MagicMock(side_effect=ai_result if isinstance(ai_result, Exception) else None)
+    if not isinstance(ai_result, Exception):
+        ai.return_value = ai_result
+    monkeypatch.setattr(forge_mod, "run_ai_copilot_mode", ai)
+    monkeypatch.setattr(
+        "builtins.input", lambda *a, **k: pytest.fail("input() called under --agent")
+    )
+    monkeypatch.setattr(forge_mod, "_write_forge_receipt", lambda **k: None)
+    forge_mod.run(args, logging.getLogger("test"))
+    return _parse_jsonl_events(capsys.readouterr().out), ai
+
+
+def test_agent_alone_is_blank_in_process(tmp_path, capsys, monkeypatch):
+    args = _agent_args(["--data-product-type", "SDP"], tmp_path)
+    events, ai = _run_agent(args, capsys, monkeypatch)
+    assert next(e for e in events if e["event"] == "forge.start")["mode"] == "blank"
+    assert args.blank is True
+    ai.assert_not_called()
+
+
+def test_agent_with_llm_provider_selects_ai_mode(tmp_path, capsys, monkeypatch):
+    args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
+    events, ai = _run_agent(args, capsys, monkeypatch)
+    assert next(e for e in events if e["event"] == "forge.start")["mode"] == "ai"
+    assert not args.blank
+    ai.assert_called_once()
+    assert next(e for e in events if e["event"] == "forge.done")["exit_code"] == 0
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--context", '{"project_goal": "daily revenue"}'],
+        ["--llm-model", "some-model"],
+        ["--llm-endpoint", "http://localhost:1234"],
+    ],
+)
+def test_agent_with_other_ai_flags_selects_ai_mode(flags, tmp_path, capsys, monkeypatch):
+    args = _agent_args(flags, tmp_path)
+    events, ai = _run_agent(args, capsys, monkeypatch)
+    assert next(e for e in events if e["event"] == "forge.start")["mode"] == "ai"
+    assert not args.blank
+    ai.assert_called_once()
+
+
+def test_agent_ai_mode_is_non_interactive(tmp_path, capsys, monkeypatch):
+    """AI mode under --agent must never reach the inline-setup prompt flow."""
+    from fluid_build.cli import ai_setup
+
+    monkeypatch.setattr(
+        ai_setup,
+        "run_ai_setup_inline",
+        lambda *a, **k: pytest.fail("interactive AI setup reached under --agent"),
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
+    events, ai = _run_agent(args, capsys, monkeypatch)
+    assert args.non_interactive is True
+    ai.assert_called_once()
+
+
+@pytest.mark.parametrize("failure", [1, RuntimeError("provider down")])
+def test_agent_ai_failure_is_not_success(failure, tmp_path, capsys, monkeypatch):
+    args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
+    events, _ = _run_agent(args, capsys, monkeypatch, ai_result=failure)
+    done = next(e for e in events if e["event"] == "forge.done")
+    assert done["exit_code"] != 0
+
+
+def test_agent_ai_mode_emits_contract_written(tmp_path, capsys, monkeypatch):
+    """The receipt path's "create" rows reach the stream as forge.contract_written."""
+    from fluid_build.cli import forge as forge_mod
+
+    product = tmp_path / "product"
+
+    def _fake_ai(args, logger):
+        product.mkdir(parents=True, exist_ok=True)
+        (product / "contract.fluid.yaml").write_text("fluidVersion: 0.7.6\n")
+        return 0
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(forge_mod, "run_ai_copilot_mode", _fake_ai)
+    monkeypatch.setattr(
+        "builtins.input", lambda *a, **k: pytest.fail("input() called under --agent")
+    )
+    args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
+    forge_mod.run(args, logging.getLogger("test"))
+    events = _parse_jsonl_events(capsys.readouterr().out)
+    written = [e for e in events if e["event"] == "forge.contract_written"]
+    assert written, [e["event"] for e in events]
+    assert written[0]["action"] == "created"
+    assert written[0]["path"].endswith("contract.fluid.yaml")
