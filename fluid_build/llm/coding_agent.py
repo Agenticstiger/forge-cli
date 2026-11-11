@@ -47,6 +47,7 @@ import subprocess
 import tempfile
 import threading
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from fluid_build.llm.providers import (
@@ -120,7 +121,7 @@ class AgentSpec:
     model_flag: str  # "--model" | "-m" | "" (passthrough only when explicit)
     output_mode: str  # "claude-json" | "result-json" | "raw"
     cost_field: Optional[str]  # top-level JSON cost field, e.g. "total_cost_usd"
-    auth_markers: Tuple[str, ...]  # stderr substrings -> not_authenticated
+    auth_markers: Tuple[str, ...]  # stderr / reported-error substrings -> not_authenticated
     login_hint: str  # actionable suggestion for missing-key / not-authenticated
     # Endpoint variables the agent reads, and the key variables it sends there
     # instead of its own stored login. A project dotenv file's endpoint reaches
@@ -128,6 +129,16 @@ class AgentSpec:
     # ``_agent_environment``.
     endpoint_env: Tuple[str, ...] = ()
     endpoint_key_env: Tuple[str, ...] = ()
+    # Isolation from the user's own agent config (hooks, plugins, MCP servers,
+    # CLAUDE.md) and from the agent's default system prompt. Each entry is the
+    # argv tokens of one flag, passed only when the installed CLI's ``--help``
+    # lists the flag (``_cli_help``), so older versions keep working.
+    isolation_args: Tuple[Tuple[str, ...], ...] = ()
+    # Flag that REPLACES the default system prompt; ``system_prompt_flag`` (which
+    # only appends) is the fallback when the CLI does not list it.
+    system_prompt_replace_flag: str = ""
+    # Variables removed from the child environment.
+    drop_env: Tuple[str, ...] = ()
 
 
 _AGENT_SPECS: Dict[str, AgentSpec] = {
@@ -150,6 +161,9 @@ _AGENT_SPECS: Dict[str, AgentSpec] = {
         auth_markers=(
             "not logged in",
             "please run /login",
+            "/login",
+            "failed to authenticate",
+            "oauth session expired",
             "oauth",
             "unauthorized",
             "invalid api key",
@@ -158,6 +172,21 @@ _AGENT_SPECS: Dict[str, AgentSpec] = {
         login_hint="Run `claude` once and sign in (subscription), or set ANTHROPIC_API_KEY.",
         endpoint_env=("ANTHROPIC_BASE_URL",),
         endpoint_key_env=("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"),
+        # Borrowed from claude-agent-sdk-python (MIT) @ 3cf3446b0f,
+        # src/claude_agent_sdk/_internal/transport/subprocess_cli.py
+        # ``_build_command``: replace the system prompt, no tools, strict MCP,
+        # no filesystem settings. An EMPTY setting-sources list must be the
+        # single token ``--setting-sources=``: a separate "" argument misparses
+        # the flags after it (SDK #778). The SDK also drops CLAUDECODE from the
+        # child env (SDK #732).
+        isolation_args=(
+            ("--tools", ""),
+            ("--strict-mcp-config",),
+            ("--setting-sources=",),
+            ("--no-session-persistence",),
+        ),
+        system_prompt_replace_flag="--system-prompt",
+        drop_env=("CLAUDECODE",),
     ),
     "codex": AgentSpec(
         name="codex",
@@ -295,6 +324,44 @@ def _run_agent(
     return proc.returncode, proc.stdout, proc.stderr
 
 
+_HELP_TIMEOUT_SECONDS = 10
+
+
+def _run_help(binary: str) -> str:
+    """``<binary> --help`` text, or ``""`` when it cannot be read.
+
+    The second subprocess seam (tests monkeypatch it, like ``_run_agent``).
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 — list argv, no shell, fixed binary set
+            [binary, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=_HELP_TIMEOUT_SECONDS,
+            cwd=tempfile.gettempdir(),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return f"{proc.stdout or ''}\n{proc.stderr or ''}"
+
+
+@lru_cache(maxsize=None)
+def _cli_help(binary: str) -> str:
+    """Help text of ``binary``, probed once per process."""
+    return _run_help(binary)
+
+
+def _lists_flag(help_text: str, flag: str) -> bool:
+    """True when ``flag`` appears in ``help_text`` as a whole flag name.
+
+    ``--tools`` must not match ``--allowedTools``, nor ``--system-prompt`` match
+    ``--append-system-prompt``.
+    """
+    name = flag.split("=", 1)[0]
+    return re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", help_text) is not None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -351,6 +418,8 @@ def _agent_environment(spec: AgentSpec) -> Dict[str, str]:
     CODEX_API_KEY in place of its login.
     """
     env = dict(os.environ)
+    for key in spec.drop_env:
+        env.pop(key, None)
     if not spec.endpoint_env:
         return env
     from fluid_build.credentials.dotenv_store import project_supplied
@@ -415,6 +484,27 @@ def _extract_envelope(spec: AgentSpec, stdout: str) -> str:
             return data["result"]
         return text
     return text  # "raw" — stdout is the final message verbatim
+
+
+def _reported_error(spec: AgentSpec, stdout: str) -> Optional[str]:
+    """The agent's own failure report from its JSON stdout, else ``None``.
+
+    ``claude -p --output-format json`` reports a failure as a result object with
+    ``is_error: true`` on STDOUT (its ``subtype`` can still say ``success`` and
+    stderr stays empty). Returns the ``result`` text (``""`` when absent) so the
+    caller treats it as a failure even at exit code 0, before the envelope parser
+    sees it.
+    """
+    if spec.output_mode not in ("claude-json", "result-json"):
+        return None
+    try:
+        data = json.loads(_ANSI_RE.sub("", stdout or ""))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict) or data.get("is_error") is not True:
+        return None
+    result = data.get("result")
+    return result.strip() if isinstance(result, str) else ""
 
 
 def _record_agent_usage_and_cost(spec: AgentSpec, stdout: str) -> None:
@@ -528,9 +618,19 @@ class CodingAgentProvider(LlmProvider):
         if spec.model_flag and config.model and config.model != spec.name:
             argv += [spec.model_flag, str(config.model)]
 
+        help_text = _cli_help(binary) if spec.isolation_args else ""
+        for tokens in spec.isolation_args:
+            if _lists_flag(help_text, tokens[0]):
+                argv += tokens
+
         combined_prompt = user_prompt
         if spec.system_prompt_mode == "flag":
-            argv += [spec.system_prompt_flag, system_prompt]
+            system_flag = spec.system_prompt_flag
+            if spec.system_prompt_replace_flag and _lists_flag(
+                help_text, spec.system_prompt_replace_flag
+            ):
+                system_flag = spec.system_prompt_replace_flag
+            argv += [system_flag, system_prompt]
         else:
             combined_prompt = f"{system_prompt}{_PROMPT_DELIM}{user_prompt}"
 
@@ -581,17 +681,20 @@ class CodingAgentProvider(LlmProvider):
                 except OSError:  # pragma: no cover — best-effort cleanup
                     pass
 
-        if rc != 0:
-            lowered = (stderr or "").lower()
+        reported = _reported_error(spec, stdout)
+        if rc != 0 or reported is not None:
+            reason = "\n".join(part for part in (reported, (stderr or "").strip()) if part)
+            lowered = reason.lower()
             if any(marker in lowered for marker in spec.auth_markers):
                 raise CopilotGenerationError(
                     "coding_agent_not_authenticated",
                     f"{spec.name} is installed but not authenticated.",
                     suggestions=[spec.login_hint],
                 )
+            outcome = f"exited with code {rc}" if rc != 0 else "reported an error"
             raise CopilotGenerationError(
                 "coding_agent_failed",
-                f"{spec.name} exited with code {rc}: {_redact(stderr)[:500]}",
+                f"{spec.name} {outcome}: {_redact(reason)[:500]}",
                 suggestions=[
                     f"Run `{spec.binary}` manually to confirm it works.",
                     "Or fall back to an API key / Ollama.",
