@@ -52,7 +52,7 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional
 
 import httpx
 
@@ -894,8 +894,19 @@ def remember_named_llm_provider(args: Any, environ: Optional[Mapping[str, str]] 
     setattr(args, _NAMED_PROVIDER_ATTR, _explicit_provider_name(args, env))
 
 
-def _unused_generic_key_note(args: Any, provider_name: str) -> str:
-    """Why ``FLUID_LLM_API_KEY`` is not the key of *provider_name*, which nothing named."""
+def _unnamed_provider_note(
+    args: Any, env: Mapping[str, str], provider_name: str, named: bool
+) -> Optional[str]:
+    """Why ``FLUID_LLM_API_KEY`` is not used for *provider_name*, else ``None``.
+
+    ``FLUID_LLM_API_KEY`` does not say which vendor it is for, so a provider
+    forge picked itself never gets it (``provider_resolve._resolve_api_key``).
+    The note is logged, so it is built from provider names alone and never from
+    anything that holds or resolves a key (CodeQL
+    py/clear-text-logging-sensitive-data).
+    """
+    if named or not env.get("FLUID_LLM_API_KEY"):
+        return None
     recorded = _recorded_named_provider(args)
     if isinstance(recorded, str) and recorded:  # interactive setup replaced the choice
         return (
@@ -907,22 +918,6 @@ def _unused_generic_key_note(args: Any, provider_name: str) -> str:
         f"--llm-provider or FLUID_LLM_PROVIDER, and forge picked {provider_name} itself. "
         f"Pass --llm-provider {provider_name} to use the key with it."
     )
-
-
-def _api_key_for_run(
-    args: Any, env: Mapping[str, str], provider_name: str
-) -> Tuple[Optional[str], Optional[str]]:
-    """The key this run sends to *provider_name*, and a note when FLUID_LLM_API_KEY is unused.
-
-    ``FLUID_LLM_API_KEY`` does not say which vendor it is for, so a provider
-    forge picked itself never gets it (``provider_resolve._resolve_api_key``),
-    and the note says so.
-    """
-    named = _provider_is_named(args, env, provider_name)
-    note = None
-    if env.get("FLUID_LLM_API_KEY") and not named:
-        note = _unused_generic_key_note(args, provider_name)
-    return _resolve_api_key(provider_name, env, named=named), note
 
 
 def _same_llm_provider(first: str, second: str) -> bool:
@@ -1042,7 +1037,9 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
             ],
         )
 
-    api_key, unused_generic_key = _api_key_for_run(args, env, provider.name)
+    named = _provider_is_named(args, env, provider.name)
+    api_key = _resolve_api_key(provider.name, env, named=named)
+    unnamed_note = _unnamed_provider_note(args, env, provider.name, named)
     # A third-party provider plugin may declare ``keyless = True`` (class attr)
     # when it authenticates by some other means (e.g. an ambient cloud identity
     # or its own env var validated at call time) — same escape the built-in
@@ -1055,7 +1052,7 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
             "copilot_missing_llm_api_key",
             f"No API key was configured for the {provider.name} copilot adapter.",
             suggestions=[
-                *([unused_generic_key] if unused_generic_key else []),
+                *([unnamed_note] if unnamed_note else []),
                 "Run 'fluid ai setup' to configure a provider interactively",
                 "Set the provider-specific API key environment variable, or FLUID_LLM_API_KEY "
                 "with --llm-provider",
@@ -1067,9 +1064,9 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
         )
 
     model_notes: List[str] = []
-    if unused_generic_key:
-        model_notes.append(unused_generic_key)
-        LOG.warning(unused_generic_key)
+    if unnamed_note:
+        model_notes.append(unnamed_note)
+        LOG.warning(unnamed_note)
     if not _explicit_provider_name(args, env) and provider.name in _NON_LITELLM_PROVIDERS:
         # Nothing named a provider and it is not a key-based one, so the keyless
         # auto-pick chose it: say which, and how to override.

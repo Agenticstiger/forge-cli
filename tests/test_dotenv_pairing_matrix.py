@@ -740,7 +740,11 @@ def test_interactive_setup_never_sends_the_saved_key_to_a_project_endpoint(
 
     assert listener.saw(OPERATOR_KEY) == []
     assert listener.saw(PROJECT_KEY) != []
-    assert any(f"Your {provider} key is not used" in r.getMessage() for r in caplog.records)
+    # The warning names the endpoint, never the provider string setup worked
+    # with: that can come from classifying a typed key (CodeQL
+    # py/clear-text-logging-sensitive-data).
+    warned = [r.getMessage() for r in caplog.records if "Your key is not used" in r.getMessage()]
+    assert warned and all(endpoint in message for message in warned)
 
 
 @pytest.mark.parametrize(

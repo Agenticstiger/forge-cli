@@ -290,6 +290,20 @@ _PROVIDER_ENDPOINT_SERVICES = {
 }
 
 
+def _endpoint_service(provider: str) -> Optional[str]:
+    """The ``credentials.protected_env`` group of *provider*, or ``None``.
+
+    Picked by comparison, so the result is the table's own constant. A provider
+    name can come from classifying a typed key (``_classify_key_shape``), and
+    what setup logs must not be derived from a key (CodeQL
+    py/clear-text-logging-sensitive-data).
+    """
+    return next(
+        (service for name, service in _PROVIDER_ENDPOINT_SERVICES.items() if name == provider),
+        None,
+    )
+
+
 def _project_llm_endpoints(provider: str) -> List[str]:
     """The endpoint variables in effect that project dotenv files point *provider* at.
 
@@ -302,7 +316,7 @@ def _project_llm_endpoints(provider: str) -> List[str]:
     """
     from fluid_build.credentials import dotenv_store
 
-    service = _PROVIDER_ENDPOINT_SERVICES.get(provider)
+    service = _endpoint_service(provider)
     if service is not None:
         return dotenv_store.project_endpoints_in_effect(service)
     from fluid_build.credentials.protected_env import (
@@ -323,14 +337,16 @@ def _project_llm_endpoints(provider: str) -> List[str]:
 def _project_host_notice(provider: str) -> Optional[str]:
     """Why setup sends no key of the operator's for *provider*, or ``None``.
 
-    Kept apart from every frame that holds a key, so no key can reach the text
-    (CodeQL py/clear-text-logging-sensitive-data).
+    Built from the endpoint group's name and the endpoint variables' names, never
+    from *provider* itself or a key, because it is logged (CodeQL
+    py/clear-text-logging-sensitive-data).
     """
     names = _project_llm_endpoints(provider)
     if not names:
         return None
+    who = _endpoint_service(provider) or "this LLM provider"
     return (
-        f"a project dotenv file points {provider} at its own host ({', '.join(names)}), "
+        f"a project dotenv file points {who} at its own host ({', '.join(names)}), "
         "so your key is not sent there; run 'fluid ai setup' outside this project"
     )
 
@@ -339,7 +355,7 @@ def _warn_key_not_used(provider: str) -> None:
     """Log that the operator's key for *provider* is not used for this run."""
     notice = _project_host_notice(provider)
     if notice:
-        LOG.warning("Your %s key is not used: %s.", provider, notice)
+        LOG.warning("Your key is not used: %s.", notice)
 
 
 def set_session_env(provider: str, api_key: str) -> None:
