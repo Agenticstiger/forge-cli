@@ -20,11 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limitation). The principals with `SELECT` get `CAN RUN` on it. A space never widens access:
   Genie answers as the person asking, under their Unity Catalog grants. Prompt matching, which
   samples values with the author's permissions, is never turned on. A product whose
-  `agentPolicy` rules out question answering (`qa`) is refused at `fluid validate`. A re-apply
+  `agentPolicy` denies `qa`, or allows neither `qa` nor `analysis`, is refused at `fluid validate`. A re-apply
   finds the space by a `[fluid-genie:<product id>]` marker at the end of its description, in the
   deploying identity's own folder only (a space carrying the marker anywhere else is left alone,
   with a note), and updates it with its `etag`. A second apply changes nothing, and removing the
-  block trashes the space.
+  block trashes the space. Deploy a product from one identity (CI, say): a space another
+  identity made is left alone, and that identity makes its own.
   `fluid apply --mode dry-run` prints what would change. The space is made through the Genie
   REST API (the `[databricks]` extra), since the databricks/databricks provider has no Genie
   space resource. One space per product; a space over several products is a follow-up.

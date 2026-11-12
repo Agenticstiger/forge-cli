@@ -72,6 +72,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from difflib import get_close_matches
 from typing import (
     Any,
     Callable,
@@ -111,8 +112,9 @@ READER_LEVEL = "CAN_RUN"
 _KEPT_LEVELS = frozenset({"CAN_EDIT", "CAN_MANAGE"})
 _LEVEL_RANK = {"CAN_READ": 1, "CAN_RUN": 2, "CAN_EDIT": 3, "CAN_MANAGE": 4}
 _PAGE_SIZE = 100
-#: The use case a Genie space is: answering questions about the data.
-_GENIE_USE_CASE = "qa"
+#: The use cases a Genie space is: answering questions about the data, by analysing it. One of
+#: them allowed is enough; ``qa`` denied refuses the space.
+_GENIE_USE_CASES = ("qa", "analysis")
 _NOT_SENSITIVE = frozenset({"", "none", "public", "internal"})
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 #: What the service appends to a title another space in the folder already has (it keeps titles
@@ -241,19 +243,21 @@ def _block_title(contract: Mapping[str, Any], out: Compiled) -> str:
         out.refusals.append(
             _refusal(
                 "invalid",
-                f"{_WHERE} is {type(block).__name__}, and it is a mapping: {{}} for a space with "
-                "the product's name, or {title: ...}.",
+                f"{_WHERE} is {block!r}, not a mapping: write {{}} for a space with the "
+                "product's name, or {title: ...}.",
                 f"Write {_WHERE}: {{}} to create the space, or remove {_WHERE} for none.",
             )
         )
         return ""
     unknown = sorted(str(key) for key in block if key not in _BLOCK_KEYS)
     if unknown:
+        near = sorted({m for k in unknown for m in get_close_matches(k, _BLOCK_KEYS, n=1)})
         out.refusals.append(
             _refusal(
                 "invalid",
                 f"{_WHERE} has {', '.join(repr(k) for k in unknown)}, which it does not read "
-                f"(it reads: {', '.join(sorted(_BLOCK_KEYS))}).",
+                f"(it reads: {', '.join(sorted(_BLOCK_KEYS))})"
+                + (f"; did you mean {', '.join(repr(m) for m in near)}?" if near else "."),
                 f"Remove {', '.join(unknown)} from {_WHERE}.",
             )
         )
@@ -340,14 +344,15 @@ def _policy_refusals(table: Any) -> List[UnsupportedBindingError]:
                 f"Remove extensions.{EXTENSION_KEY}, or allow AI access in agentPolicy.",
             )
         )
-    if _GENIE_USE_CASE in denied or (allowed and _GENIE_USE_CASE not in allowed):
+    if "qa" in denied or (allowed and not set(_GENIE_USE_CASES) & set(allowed)):
         out.append(
             _refusal(
                 "policy",
-                f"{where} does not allow the use case {_GENIE_USE_CASE!r} (question answering), "
-                "which is what a Genie space is.",
-                f"Remove extensions.{EXTENSION_KEY}, or allow {_GENIE_USE_CASE!r} in "
-                "agentPolicy.allowedUseCases.",
+                f"{where} "
+                + ("denies 'qa'" if "qa" in denied else "allows neither 'qa' nor 'analysis'")
+                + " (question answering over the data), which is what a Genie space is.",
+                f"Remove extensions.{EXTENSION_KEY}, or allow 'qa' in agentPolicy.allowedUseCases "
+                "(and take it out of deniedUseCases).",
             )
         )
     return out
@@ -845,7 +850,31 @@ def _create_new(client: Any, space: Space, serialized: Mapping[str, Any], say: S
     say(f"    created {space.title!r}: {_summary(serialized, space.tables)} ({_url(space_id)})")
     _title_kept(created.get("title"), space.title, say)
     _wait_listed(client, space, space_id, say)
+    _found_again(client, space_id)
     return space_id
+
+
+def _found_again(client: Any, space_id: str) -> None:
+    """Stop, and trash the new space, when it is not where the next apply looks for it: a
+    space every apply could not find would be made again on each one."""
+    home = _call(client, "read which identity this run is", lambda: _home(client))
+    parent = _call(client, "read the new Genie space", lambda: _parent(client, space_id))
+    if _in_folder(parent, home):
+        return
+    _call(
+        client,
+        "trash the new Genie space",
+        lambda: client.api_client.do("DELETE", f"{SPACES_PATH}/{quote(space_id)}"),
+    )
+    raise GenieError(
+        f"the Genie API put the new space in {parent or 'a folder this identity cannot read'}, "
+        f"not in this identity's own folder ({home}), where the next apply looks for it, so it "
+        "was trashed rather than made again on every apply.",
+        (
+            "Deploy with an identity whose home folder is /Users/<its userName>, or report this "
+            "to forge-cli with the folder named above.",
+        ),
+    )
 
 
 def _wait_listed(client: Any, space: Space, space_id: str, say: Say) -> None:
@@ -956,28 +985,25 @@ def _find(client: Any, token: str) -> List[Dict[str, Any]]:
 def _owned(client: Any, found: List[Dict[str, Any]], say: Say) -> List[Dict[str, Any]]:
     """The spaces in ``found`` that this identity made: the ones in its own folder,
     ``/Users/<userName>``, where the Genie API puts a space it creates (measured
-    2026-11-12; the list leaves ``parent_path`` out, a plain GET has it).
+    2026-11-12; the list leaves ``parent_path`` out, a plain GET has it). A service
+    principal's folder is ``/Users/<application id>``, its userName, the folder Databricks Asset
+    Bundles' default ``root_path`` builds from ``workspace.current_user.userName``.
 
     A space anyone else made carrying the marker is left alone, with a note: adopting it would
     fill it with the product, share it to the readers and keep its maker's ``CAN_MANAGE``
     (inherited from their folder, which a share cannot remove), and that level can read the
-    readers' conversations. Only this identity and an admin can make a space in its folder.
+    readers' conversations. Only this identity and an admin can make a space in its folder. A
+    failure to read a space's folder other than 403 or 404 is raised, not taken for "someone
+    else's": that would make a second space for the product.
     """
     if not found:
         return []
-    home = f"/users/{_enforce.deploy_identity(client).lower()}"
+    home = _home(client)
     mine = []
     for space in found:
         space_id = str(space.get("space_id"))
-        try:
-            parent = str(
-                client.api_client.do("GET", f"{SPACES_PATH}/{quote(space_id)}").get("parent_path")
-                or ""
-            )
-        except Exception:  # noqa: BLE001 — a space it cannot read is not one it made
-            parent = ""
-        folder = parent.rstrip("/").lower()
-        if folder == home or folder.startswith(home + "/"):
+        parent = _parent(client, space_id)
+        if _in_folder(parent, home):
             mine.append(space)
             continue
         say(
@@ -987,6 +1013,27 @@ def _owned(client: Any, found: List[Dict[str, Any]], say: Say) -> List[Dict[str,
             "take the marker out of its description."
         )
     return mine
+
+
+def _home(client: Any) -> str:
+    """This identity's own folder, lower-cased: ``/users/<userName>``."""
+    return f"/users/{_enforce.deploy_identity(client).lower()}"
+
+
+def _parent(client: Any, space_id: str) -> str:
+    """The folder a space is in, ``""`` when this identity cannot read it (403, 404)."""
+    try:
+        doc = client.api_client.do("GET", f"{SPACES_PATH}/{quote(space_id)}") or {}
+    except Exception as exc:  # noqa: BLE001 — only "cannot read it" means "not its own"
+        if _status(exc) in (403, 404):
+            return ""
+        raise
+    return str(doc.get("parent_path") or "")
+
+
+def _in_folder(parent: str, home: str) -> bool:
+    folder = parent.rstrip("/").lower()
+    return folder == home or folder.startswith(home + "/")
 
 
 def _marker_of(space: Mapping[str, Any]) -> str:

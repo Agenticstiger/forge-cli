@@ -384,11 +384,16 @@ def test_the_measure_sql_is_what_the_governed_mcp_query_path_renders(agg, extra)
 @pytest.mark.parametrize(
     "change, kind, words",
     [
-        (lambda d: d["extensions"].update({genie.EXTENSION_KEY: True}), "invalid", "is bool"),
+        (lambda d: d["extensions"].update({genie.EXTENSION_KEY: True}), "invalid", "is True"),
         (
             lambda d: d["extensions"][genie.EXTENSION_KEY].update({"warehouse": "x"}),
             "invalid",
             "'warehouse'",
+        ),
+        (
+            lambda d: d["extensions"][genie.EXTENSION_KEY].update({"titel": "x"}),
+            "invalid",
+            "did you mean 'title'?",
         ),
         (
             lambda d: d["extensions"][genie.EXTENSION_KEY].update({"title": " "}),
@@ -399,14 +404,14 @@ def test_the_measure_sql_is_what_the_governed_mcp_query_path_renders(agg, extra)
         (
             lambda d: d["exposes"][0]["policy"]["agentPolicy"].update({"deniedUseCases": ["qa"]}),
             "policy",
-            "'qa'",
+            "denies 'qa'",
         ),
         (
             lambda d: d["exposes"][0]["policy"]["agentPolicy"].update(
                 {"allowedUseCases": ["training"]}
             ),
             "policy",
-            "'qa'",
+            "allows neither 'qa' nor 'analysis'",
         ),
         (
             lambda d: d["exposes"][0]["policy"]["agentPolicy"].update({"allowedModels": []}),
@@ -1004,3 +1009,32 @@ def test_renaming_the_space_to_a_title_another_space_has_says_so(fake):
     assert "already called 'Tower Passport'" in str(exc.value)
     assert "title of its own" in exc.value.remediation[0]
     assert "changed while this apply" not in str(exc.value)
+
+
+def test_a_policy_that_allows_analysis_but_names_no_qa_still_gets_its_space():
+    doc = site_contract()
+    doc["exposes"][0]["policy"]["agentPolicy"]["allowedUseCases"] = ["analysis"]
+    assert compiled(doc).refusals == []
+
+
+def test_a_transient_failure_to_read_a_spaces_folder_fails_not_duplicates(fake):
+    """Taken for "someone else's", a 503 would make a second space for the product."""
+    Run(fake)(site_contract())
+    fake.fail_route("GET", r"/api/2\.0/genie/spaces/", 503, "TEMPORARILY_UNAVAILABLE")
+    with pytest.raises(genie.GenieError) as exc:
+        Run(fake)(site_contract())
+    assert "could not check whose Genie spaces those are" in str(exc.value)
+    assert len(fake.genie_spaces) == 1
+    # Removing the block under the same failure trashes nothing and says it could not check.
+    retire = Run(fake)(without_block(site_contract()))
+    assert len(fake.genie_spaces) == 1 and "not checked for a Genie space" in retire.text
+
+
+def test_a_new_space_the_next_apply_could_not_find_is_trashed_and_said(fake):
+    """If the identity's folder were not /Users/<userName> (a service principal's, say), every
+    apply would make another space; the create checks it and stops instead."""
+    fake.me_user_name = "8d5f1c3e-2b6a-4f0e-9c1d-7a3b5e9f0c21"  # the folder stays the user's
+    with pytest.raises(genie.GenieError) as exc:
+        Run(fake)(site_contract())
+    assert "where the next apply looks for it, so it was trashed" in str(exc.value)
+    assert fake.genie_spaces == {}

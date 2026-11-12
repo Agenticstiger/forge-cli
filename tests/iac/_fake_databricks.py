@@ -1129,11 +1129,12 @@ class FakeDatabricks:
 
     # ------------------------------------------------------------------ handlers
     def _me(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        name = getattr(self, "me_user_name", _USER)
         return 200, {
             "id": "1",
-            "userName": _USER,
+            "userName": name,
             "active": True,
-            "emails": [{"value": _USER, "primary": True}],
+            "emails": [{"value": name, "primary": True}],
         }
 
     def _nf_setting(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
