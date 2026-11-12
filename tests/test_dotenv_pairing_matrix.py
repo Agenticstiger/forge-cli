@@ -690,6 +690,120 @@ def test_an_exported_fluid_llm_api_key_refuses_a_project_openai_endpoint(
     assert "OPENAI_BASE_URL" not in os.environ
 
 
+# ── interactive setup puts no stored key where a project endpoint reads ─────
+
+
+@pytest.mark.parametrize(
+    "provider,endpoint,credential",
+    [
+        ("openai", "OPENAI_BASE_URL", "OPENAI_API_KEY"),
+        ("anthropic", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"),
+        # setup writes GOOGLE_API_KEY, which forge reads before GEMINI_API_KEY
+        ("gemini", "GEMINI_API_BASE", "GEMINI_API_KEY"),
+    ],
+)
+def test_interactive_setup_never_sends_the_saved_key_to_a_project_endpoint(
+    project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    listener: Listener,
+    caplog: pytest.LogCaptureFixture,
+    provider: str,
+    endpoint: str,
+    credential: str,
+) -> None:
+    # The project pairs its own endpoint with its own key; ``fluid ai setup``
+    # saved this provider with a keyring key. Interactive forge's setup copied
+    # the saved key into the provider's variable (set_session_env), over the
+    # project's, so the saved key went to the project's host.
+    import fluid_build.cli.ai_setup as ai_setup
+    from fluid_build.llm.providers import remember_named_llm_provider
+
+    (project / ".env").write_text(f"{endpoint}={listener.url}\n{credential}={PROJECT_KEY}\n")
+    hydrate_dotenv(project)
+    assert os.environ[endpoint] == listener.url  # the pairing holds
+    _keyring_holds(monkeypatch, provider)
+    monkeypatch.setattr(ai_setup, "_ai_setup_skipped", False)
+    monkeypatch.setattr(ai_setup, "_load_ai_config", lambda: {"provider": provider, "model": "m"})
+    monkeypatch.setattr(
+        ai_setup, "_load_key_from_keyring", lambda name: OPERATOR_KEY if name == provider else None
+    )
+
+    # What interactive ``fluid forge`` does (cli/forge.py): setup, then its key.
+    with caplog.at_level(logging.WARNING):
+        config = ai_setup.run_ai_setup_inline(None)
+        args = types.SimpleNamespace(llm_provider=None, llm_model=None, llm_endpoint=None)
+        remember_named_llm_provider(args, os.environ)
+        args.llm_provider = config.provider
+        if config.api_key:
+            ai_setup.set_session_env(config.provider, config.api_key)
+    _llm_call(provider, endpoint)
+
+    assert listener.saw(OPERATOR_KEY) == []
+    assert listener.saw(PROJECT_KEY) != []
+    assert any(f"Your {provider} key is not used" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "provider,endpoint,credential",
+    [
+        ("openai", "OPENAI_BASE_URL", "OPENAI_API_KEY"),
+        # no group is mapped to groq, so every LLM endpoint the project set counts
+        ("groq", "GROQ_API_BASE", "FLUID_LLM_API_KEY"),
+    ],
+)
+def test_setup_checks_no_key_against_a_project_endpoint(
+    project: Path, listener: Listener, provider: str, endpoint: str, credential: str
+) -> None:
+    # ``fluid ai setup`` checks a typed or imported key with one litellm call,
+    # and litellm reads the endpoint from the environment.
+    import fluid_build.cli.ai_setup as ai_setup
+    from fluid_build.cli.forge_copilot_llm_litellm import get_litellm_provider
+
+    _skip_where_litellm_cannot_reply()
+    (project / ".env").write_text(f"{endpoint}={listener.url}\n{credential}={PROJECT_KEY}\n")
+    hydrate_dotenv(project)
+    assert os.environ[endpoint] == listener.url  # the pairing holds
+
+    error = ai_setup._validate_api_key(get_litellm_provider(provider), OPERATOR_KEY)
+
+    assert listener.saw(OPERATOR_KEY) == []
+    assert error is not None and error.startswith("not checked:") and endpoint in error
+
+
+def test_setup_asks_for_no_key_it_could_not_check(
+    project: Path, monkeypatch: pytest.MonkeyPatch, listener: Listener
+) -> None:
+    # Asking three times for a key that can be neither checked nor used, with
+    # "2 attempt(s) left", helps nobody: setup says why once and stops.
+    import fluid_build.cli.ai_setup as ai_setup
+
+    (project / ".env").write_text(f"OPENAI_BASE_URL={listener.url}\nOPENAI_API_KEY={PROJECT_KEY}\n")
+    hydrate_dotenv(project)
+    asked: List[Any] = []
+    monkeypatch.setattr(ai_setup.Prompt, "ask", lambda *a, **k: asked.append(a) or OPERATOR_KEY)
+    printed: List[str] = []
+    console = types.SimpleNamespace(print=lambda *a, **k: printed.append(str(a[0]) if a else ""))
+
+    result = ai_setup._collect_and_validate_api_key(
+        console, provider_choice="openai", tier="balanced"
+    )
+
+    assert result is None
+    assert asked == []
+    assert listener.requests == []
+    assert any("Not asking for a" in line and "OPENAI_BASE_URL" in line for line in printed)
+
+
+def test_setup_still_sets_the_key_where_no_project_endpoint_reads(project: Path) -> None:
+    import fluid_build.cli.ai_setup as ai_setup
+
+    (project / ".env").write_text(f"OPENAI_API_KEY={PROJECT_KEY}\n")  # a key, no endpoint
+    hydrate_dotenv(project)
+    ai_setup.set_session_env("openai", OPERATOR_KEY)
+
+    assert os.environ["OPENAI_API_KEY"] == OPERATOR_KEY
+
+
 _FAKE_CODEX = """#!{python}
 # codex exec, as far as credentials go: OPENAI_BASE_URL is where it sends,
 # CODEX_API_KEY is the key (blank counts as unset), else the login stored in

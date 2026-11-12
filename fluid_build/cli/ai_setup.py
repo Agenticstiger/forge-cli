@@ -232,7 +232,15 @@ def _validate_api_key(provider: Any, api_key: str) -> Optional[str]:
     renders as a one-line install hint.
 
     Returns ``None`` on success or a short human-readable error message.
+
+    Nothing is sent while a project dotenv file points the provider at its own
+    host: litellm reads that endpoint from the environment, so the check would
+    hand the operator's key (typed, or imported from another tool) to it.
     """
+    notice = _project_host_notice(provider.name.lower())
+    if notice:
+        return f"not checked: {notice}"
+
     from fluid_build._optional import require
 
     litellm = require("litellm", "litellm", "Validating an AI provider key")
@@ -272,21 +280,92 @@ def _validate_api_key(provider: Any, api_key: str) -> Optional[str]:
         return f"validation failed: {exc}"
 
 
+# The ``credentials.protected_env`` endpoint group of each provider whose
+# PROVIDER_ENV_VARS name ``set_session_env`` writes.
+_PROVIDER_ENDPOINT_SERVICES = {
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "gemini": "Google Gemini",
+    "github": "GitHub Models",
+}
+
+
+def _project_llm_endpoints(provider: str) -> List[str]:
+    """The endpoint variables in effect that project dotenv files point *provider* at.
+
+    ``credentials.protected_env`` loaded such an endpoint only because the
+    project files supply a key for it, the one its readers send there. For a
+    provider whose key ``set_session_env`` writes, the endpoints of its own
+    group. For any other provider, every LLM endpoint the project set (the
+    groups that list FLUID_LLM_API_KEY, which every LLM group does, and the
+    litellm names no group lists): litellm's routes are not mapped one by one.
+    """
+    from fluid_build.credentials import dotenv_store
+
+    service = _PROVIDER_ENDPOINT_SERVICES.get(provider)
+    if service is not None:
+        return dotenv_store.project_endpoints_in_effect(service)
+    from fluid_build.credentials.protected_env import (
+        ENDPOINT_CREDENTIAL_GROUPS,
+        UNLISTED_LLM_ENDPOINTS,
+        is_endpoint_of,
+    )
+
+    groups = [g for g in ENDPOINT_CREDENTIAL_GROUPS if "FLUID_LLM_API_KEY" in g.credentials]
+    groups.append(UNLISTED_LLM_ENDPOINTS)
+    return sorted(
+        name
+        for name in dotenv_store.project_values_in_effect()
+        if any(is_endpoint_of(group, name) for group in groups)
+    )
+
+
+def _project_host_notice(provider: str) -> Optional[str]:
+    """Why setup sends no key of the operator's for *provider*, or ``None``.
+
+    Kept apart from every frame that holds a key, so no key can reach the text
+    (CodeQL py/clear-text-logging-sensitive-data).
+    """
+    names = _project_llm_endpoints(provider)
+    if not names:
+        return None
+    return (
+        f"a project dotenv file points {provider} at its own host ({', '.join(names)}), "
+        "so your key is not sent there; run 'fluid ai setup' outside this project"
+    )
+
+
+def _warn_key_not_used(provider: str) -> None:
+    """Log that the operator's key for *provider* is not used for this run."""
+    notice = _project_host_notice(provider)
+    if notice:
+        LOG.warning("Your %s key is not used: %s.", provider, notice)
+
+
 def set_session_env(provider: str, api_key: str) -> None:
     """Set the provider-specific env var for the current process only.
 
     This is necessary so that ``resolve_llm_config()`` can find the key
     during this session.  The key is **not** written to disk or exported
     to child processes beyond the current process tree.
+
+    Not while a project dotenv file points the provider at its own host: the
+    key is the operator's (keyring, ``ai_config.json``, a prompt, another
+    tool's login), and the readers would send it there in place of the key
+    the project paired that host with.
     """
     from fluid_build.cli.ai_setup import PROVIDER_ENV_VARS
 
     env_var = PROVIDER_ENV_VARS.get(provider)
-    if env_var:
-        os.environ[env_var] = api_key
-        # Don't interpolate env_var/provider — ``api_key`` is in scope
-        # at this LOG site (CodeQL py/clear-text-logging-sensitive-data).
-        LOG.debug("Set session env var (provider configured)")
+    if not env_var:
+        return
+    if _project_llm_endpoints(provider):
+        _warn_key_not_used(provider)
+        return
+    os.environ[env_var] = api_key
+    # Don't interpolate env_var/provider — ``api_key`` is in scope
+    # at this LOG site (CodeQL py/clear-text-logging-sensitive-data).
+    LOG.debug("Set session env var (provider configured)")
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +658,12 @@ def _collect_and_validate_api_key(
     label = PROVIDER_DISPLAY_NAMES.get(provider_choice, provider_choice)
     signup_url = _SIGNUP_URLS.get(provider_choice, "")
     last_error: Optional[str] = None
+    # A key typed here could be neither checked nor used (_validate_api_key,
+    # set_session_env), so ask for none.
+    notice = _project_host_notice(provider_choice)
+    if notice:
+        console.print(literal_error_text(f"Not asking for a {label} key: {notice}.", "yellow"))
+        return None
 
     for attempt in range(1, max_attempts + 1):
         url_hint = (
@@ -1249,6 +1334,10 @@ def _import_and_persist(console: Any, candidate: _ImportedKey) -> Optional[LlmCo
     provider_obj = _resolve_import_provider_obj(candidate.provider)
     if provider_obj is None:
         console.print(f"[yellow]Could not initialise {label}; skipping.[/yellow]")
+        return None
+    notice = _project_host_notice(provider_obj.name.lower())
+    if notice:  # the key could be neither checked nor used (_validate_api_key)
+        console.print(literal_error_text(f"Skipping the {label} key: {notice}.", "yellow"))
         return None
     console.print("[dim]Verifying the imported key...[/dim]")
     # Don't interpolate the key at any LOG site in this frame

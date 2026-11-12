@@ -117,6 +117,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   need the provider's own key variable beside them (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
   `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `GITHUB_API_KEY`). Endpoints of providers forge reaches
   only by name (`GROQ_API_BASE`, `DEEPSEEK_API_BASE` ...) still pair with it.
+- **Interactive setup no longer sends your saved key to a host a project's `.env` names.** A
+  project file may point a provider at its own host (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`,
+  `GEMINI_API_BASE`, `GITHUB_API_BASE`) next to a key of its own. Interactive `fluid forge` and
+  `fluid init` then loaded the provider `fluid ai setup` saved and copied its keyring key into the
+  provider's key variable, over the project's key (for Gemini into `GOOGLE_API_KEY`, which forge
+  reads first), so your key went to the project's host. While a project endpoint of that provider
+  is in effect, setup now leaves the variable alone, the project's own key goes there, and a
+  warning says your key was not used. `fluid ai setup` no longer checks a typed or imported key
+  against such a host either: the check is one litellm call, which reads the endpoint from the
+  environment. It now asks for no key there, skips a key it would import, and says to run
+  `fluid ai setup` outside the project. For a provider other than OpenAI, Anthropic, Gemini and
+  GitHub, any LLM endpoint a project file set counts.
 
 ## [0.28.0] — 2026-11-06
 
