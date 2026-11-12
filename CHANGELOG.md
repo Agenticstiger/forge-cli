@@ -52,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory, two levels deep, so a target outside it, or deeper, got neither: the run wrote the
   contract and the stream never said so. The stated target is scanned too, and a file outside the
   current directory is reported by its absolute path.
+- **Forge asks the Ollama it calls.** With `--llm-endpoint` or `FLUID_LLM_ENDPOINT` set, forge
+  picked its default Ollama model from `OLLAMA_HOST` or localhost, and so did its model preflight
+  and `fluid ai test --endpoint`, which failed with "model ... was not returned by the provider"
+  for a model the endpoint has. All three now ask the stated endpoint. A `--tiered` stage now
+  calls a stated endpoint too, as the routing model already did; it called the provider's
+  default address instead.
 
 ### Changed
 
@@ -71,6 +77,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `claude --help` lists it. Claude Code authentication that lives in a setting (an
   `apiKeyHelper`, or Bedrock or Vertex variables in `settings.json`) must come from the shell
   environment instead.
+- **`OLLAMA_HOST` may name any machine, as in Ollama's own client.** The chat call already dialled
+  it, but detection, forge's default-model pick and `fluid ai setup` ignored a non-local host with
+  a warning and asked localhost, so the model came from one daemon and the call went to another.
+  Every Ollama read now goes through one helper, `fluid_build/llm/ollama_host.py`. A project
+  `.env` still cannot set `OLLAMA_HOST`. `fluid ai test --endpoint` accepts any Ollama host, over
+  http or https. A stated endpoint is read the same way (`--llm-endpoint gpu-box` means
+  `http://gpu-box:11434`) and keeps a `user:password@`, sent as basic auth. `fluid doctor` and
+  `fluid ai setup` show it masked, and `~/.fluid/ai_config.json` stores a saved address without
+  it unless `FLUID_ALLOW_PLAINTEXT_AI_SECRETS` is set, as for API keys.
+- **`LlmProvider.list_available_models` takes an `endpoint` keyword**, the address the call will
+  go to, passed only when the operator states one. A provider plugin that overrides the method
+  with the two-argument signature keeps working until an endpoint is stated.
 
 ## [0.28.0] — 2026-11-06
 

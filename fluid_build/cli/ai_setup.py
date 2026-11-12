@@ -137,22 +137,16 @@ except ImportError:  # pragma: no cover
 
 LOG = logging.getLogger("fluid.cli.ai_setup")
 
-# SSRF guard: restrict Ollama host to localhost addresses only.
-_LOCALHOST_PREFIXES = (
-    "http://localhost",
-    "http://127.0.0.1",
-    "http://[::1]",
-    "http://0.0.0.0",
-)
 
+def _normalize_ollama_host(host: str) -> str:
+    """*host* as a URL to dial, or the default local address when blank.
 
-def _sanitize_ollama_host(host: str) -> str:
-    """Return *host* if it points to localhost, otherwise fall back to the default."""
-    clean = (host or "http://localhost:11434").rstrip("/")
-    if not any(clean.lower().startswith(p) for p in _LOCALHOST_PREFIXES):
-        LOG.warning("OLLAMA_HOST points to a non-localhost address (%s), ignoring.", clean)
-        return "http://localhost:11434"
-    return clean
+    Any machine is allowed, the same as for every other Ollama read
+    (``fluid_build/llm/ollama_host.py``).
+    """
+    from fluid_build.llm.ollama_host import ollama_daemon_url
+
+    return ollama_daemon_url({}, host)
 
 
 # Keyring key prefix used when persisting API keys.
@@ -1388,10 +1382,12 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
                 LOG.info("Inline AI setup: loaded coding agent %s from saved config", pname)
                 return config
             if pname == "ollama":
-                ollama_host = _sanitize_ollama_host(
-                    saved.get("ollama_host", "http://localhost:11434")
-                )
-                os.environ["OLLAMA_HOST"] = ollama_host
+                # The environment wins over the saved address: it may hold the
+                # ``user:password@`` that ai_config.json leaves out.
+                if not os.environ.get("OLLAMA_HOST"):
+                    os.environ["OLLAMA_HOST"] = _normalize_ollama_host(
+                        saved.get("ollama_host") or ""
+                    )
                 config = _make_ollama_config(model=model)
                 if console and RICH_AVAILABLE:
                     console.print(f"[dim]Using Ollama ({config.model}).[/dim]")
