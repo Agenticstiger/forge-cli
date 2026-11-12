@@ -345,16 +345,17 @@ def _enforce_access(
     binds Unity Catalog column masks and row filters, which the provider cannot manage
     (``iac/providers/databricks_enforce.py``). Unlike the advisory hooks this one gates: a
     refusal or failure is a typed error and the run exits non-zero. With ``dry_run`` the
-    plugin prints the statements and runs none.
+    plugin prints the statements and runs none. What a hook prints is data (table names,
+    statements, a server's error text with its ``[ERROR_CLASS]``), so it goes out literally.
     """
     run = getattr(plugin, hook, None)
     if not callable(run):
         return
     try:
         if dry_run:
-            run(contract, say=cprint, dry_run=True)
+            run(contract, say=cprint_literal, dry_run=True)
         else:
-            run(contract, say=cprint)
+            run(contract, say=cprint_literal)
     except UnsupportedBindingError as exc:
         raise CLIError(
             1,
@@ -367,26 +368,30 @@ def build_after_apply(
     args, logger: logging.Logger, contract: Mapping[str, Any], build_kwargs: Mapping[str, Any]
 ) -> int:
     """The build phase of a build-augmented mode, after a ``tofu apply`` that succeeded, then
-    the plugin's ``post_build`` hook once every build succeeded (:func:`after_builds`)."""
+    the plugin's ``post_build`` hook (:func:`after_builds`), whatever the builds returned: one
+    that failed part way may already have rebuilt a table. A dry run changes nothing, so it
+    runs no hook (its plan already printed what the apply would declare)."""
     from fluid_build.build_runners import run_builds_from_args
 
     rc = run_builds_from_args(args, logger, force_run=True, **build_kwargs)
-    if rc == 0:
-        after_builds(args, contract)
+    if not getattr(args, "dry_run", False):
+        after_builds(args, logger, contract)
     return rc
 
 
-def after_builds(args, contract: Mapping[str, Any]) -> None:
-    """The plugin's ``post_build`` hook, if it has one, after a build phase that succeeded.
+def after_builds(args, logger: logging.Logger, contract: Mapping[str, Any]) -> None:
+    """The plugin's ``post_build`` hook, if it has one, after the build phase.
 
     Optional plugin capability, discovered like ``plan_notices``, and advisory: a dbt build run
     here may have rebuilt a table with CREATE OR REPLACE, which drops what the apply declared on
     it that dbt does not (the Databricks plugin's Unity Catalog keys), and the plugin declares
-    it again. It never changes the run's exit code.
+    it again. It gets the contract as the apply did, its ``{{ env.* }}`` templates resolved
+    (:func:`_load_contract`), and never changes the run's exit code.
     """
     try:
+        resolved = _load_contract(args, logger, contract)
         plugin = get_iac_plugin(
-            _resolve_provider(contract, getattr(args, "provider", None) or "auto")
+            _resolve_provider(resolved, getattr(args, "provider", None) or "auto")
         )
     except Exception:  # noqa: BLE001 — the apply resolved it already; nothing to add here
         return
@@ -395,9 +400,9 @@ def after_builds(args, contract: Mapping[str, Any]) -> None:
         return
     try:
         with contract_source(source_contract_file(getattr(args, "contract", None))):
-            run(contract, say=cprint)
+            run(resolved, say=cprint_literal)
     except Exception as exc:  # noqa: BLE001 — advisory: the build's own result stands
-        cprint(f"  after the build: {type(exc).__name__}: {redact_secret_text(str(exc))}")
+        cprint_literal(f"  after the build: {type(exc).__name__}: {exc}")
 
 
 def _enforce_after_failed_apply(plugin: Any, contract: Mapping[str, Any]) -> None:
@@ -415,7 +420,7 @@ def _enforce_after_failed_apply(plugin: Any, contract: Mapping[str, Any]) -> Non
         "exist before the run stops (no mask or filter is dropped)."
     )
     try:
-        run(contract, say=cprint, after_failed_apply=True)
+        run(contract, say=cprint_literal, after_failed_apply=True)
     except UnsupportedBindingError as exc:
         cprint_literal(
             f"  access enforcement after the failed apply: {exc} {' '.join(exc.remediation)}"

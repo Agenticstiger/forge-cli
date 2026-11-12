@@ -18,13 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forge table carries (`system.information_schema.table_tags`), wherever an overlay put it.
   `fluid apply` declares the keys on the SQL warehouse after `tofu apply` (the provider has no
   constraint argument), re-declares any that are missing, replaces or drops the ones it
-  declared (named `fluid_pk_<table>` / `fluid_fk_<table>_<columns>`) when the contract changes,
+  declared (named `fluid_pk_<table>` / `fluid_fk_<table>__<columns>`) when the contract changes,
   and leaves any other key in place. A key that cannot be declared yet (its parent not
   deployed, say) is skipped with the reason and the fix, never failing the run;
   `--mode dry-run` prints the statements. Because a dbt `table` build's `CREATE OR REPLACE`
   drops a table's keys and every foreign key that references it (measured on a warehouse),
   each Databricks dbt job that writes a keyed table gets a second task, `fluid_keys`, that
-  declares them again after dbt, in a script that never fails the run; a dbt build that
+  declares them again after dbt, with the contract's own foreign keys into those tables, in a
+  script that passes over a key it cannot add instead of failing the run. Such a key (a key
+  column the dbt model leaves nullable, say) is reported by the next `fluid apply`, and the
+  script needs a SQL warehouse that runs SQL scripting. A dbt build that
   `--mode amend-and-build` runs locally is followed by the same re-declaration.
 
 ### Fixed

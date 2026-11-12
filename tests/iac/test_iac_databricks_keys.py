@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -161,7 +163,7 @@ class TestResolve:
         cands = {SITES: [keys.Candidate("main.geo.sites", ("site_id",))]}
         (fk,) = keys.foreign_keys(_keys(self.REF), cands)
         assert fk == keys.ForeignKey(
-            "fluid_fk_tickets_site_id", ("site_id",), "main.geo.sites", ("site_id",)
+            "fluid_fk_tickets__site_id", ("site_id",), "main.geo.sites", ("site_id",)
         )
 
     def test_columns_that_cover_a_composite_key_form_one_in_its_order(self):
@@ -172,7 +174,7 @@ class TestResolve:
         cands = {"p.q_v1": [keys.Candidate("main.p.q", ("day", "site_id"))]}
         (fk,) = keys.foreign_keys(_keys(*refs), cands)
         assert fk.columns == ("d", "s") and fk.parent_columns == ("day", "site_id")
-        assert fk.name == "fluid_fk_tickets_d_s"
+        assert fk.name == "fluid_fk_tickets__d__s"
 
     def test_two_columns_to_one_key_are_two_foreign_keys(self):
         refs = (
@@ -233,7 +235,7 @@ class TestResolve:
 
 
 # ── the statements from a live table ───────────────────────────────────────
-FK = keys.ForeignKey("fluid_fk_tickets_site_id", ("site_id",), "main.geo.sites", ("site_id",))
+FK = keys.ForeignKey("fluid_fk_tickets__site_id", ("site_id",), "main.geo.sites", ("site_id",))
 
 
 def _live(*constraints: Dict[str, Any]) -> Dict[str, Any]:
@@ -263,7 +265,7 @@ class TestPlan:
         assert [s.statement for s in plan.steps] == [
             "ALTER TABLE `main`.`ops`.`tickets` ADD CONSTRAINT `fluid_pk_tickets` PRIMARY KEY "
             "(`ticket_id`)",
-            "ALTER TABLE `main`.`ops`.`tickets` ADD CONSTRAINT `fluid_fk_tickets_site_id` "
+            "ALTER TABLE `main`.`ops`.`tickets` ADD CONSTRAINT `fluid_fk_tickets__site_id` "
             "FOREIGN KEY (`site_id`) REFERENCES `main`.`geo`.`sites` (`site_id`)",
         ]
         assert plan.exists is False
@@ -276,7 +278,7 @@ class TestPlan:
     def test_a_changed_key_of_ours_is_dropped_and_added(self):
         live = _live(
             _pk("fluid_pk_tickets", "note"),
-            _fk("fluid_fk_tickets_site_id", "site_id", "main.old.sites"),
+            _fk("fluid_fk_tickets__site_id", "site_id", "main.old.sites"),
         )
         plan = keys.plan_table("main.ops.tickets", self.K, [FK], live)
         assert [s.what.split(" ")[0] for s in plan.steps] == ["drop", "drop", "primary", "foreign"]
@@ -293,18 +295,18 @@ class TestPlan:
     def test_keys_of_ours_the_contract_dropped_are_dropped_and_no_other(self):
         live = _live(
             _pk("fluid_pk_tickets", "ticket_id"),
-            _fk("fluid_fk_tickets_old", "note"),
+            _fk("fluid_fk_tickets__old", "note"),
             _fk("admin_fk", "x"),
         )
         plan = keys.plan_table("main.ops.tickets", None, [], live)
         assert [s.statement for s in plan.steps] == [
-            "ALTER TABLE `main`.`ops`.`tickets` DROP CONSTRAINT IF EXISTS `fluid_fk_tickets_old`",
+            "ALTER TABLE `main`.`ops`.`tickets` DROP CONSTRAINT IF EXISTS `fluid_fk_tickets__old`",
             "ALTER TABLE `main`.`ops`.`tickets` DROP CONSTRAINT IF EXISTS `fluid_pk_tickets`",
         ]
 
     def test_a_foreign_key_of_ours_whose_parent_is_unresolved_now_is_kept(self):
         live = _live(
-            _pk("fluid_pk_tickets", "ticket_id"), _fk("fluid_fk_tickets_site_id", "site_id")
+            _pk("fluid_pk_tickets", "ticket_id"), _fk("fluid_fk_tickets__site_id", "site_id")
         )
         plan = keys.plan_table("main.ops.tickets", self.K, [], live)
         assert plan.steps == []
@@ -315,7 +317,7 @@ class TestRebuildScript:
     def test_every_primary_key_then_every_foreign_key_inside_one_handler(self):
         child = _keys(TestResolve.REF)
         parent = keys.TableKeys("main.geo.sites", ("site_id",))
-        script = keys.rebuild_script([(child, [FK]), (parent, [])])
+        script = keys.rebuild_script([child, parent], [("main.ops.tickets", FK)])
         body = script.split("BEGIN\n", 1)[1]
         assert body.splitlines() == [
             "  DECLARE CONTINUE HANDLER FOR SQLEXCEPTION BEGIN END;",
@@ -328,7 +330,7 @@ class TestRebuildScript:
 
     def test_nothing_to_declare_is_still_a_valid_file(self):
         only_refs = keys.TableKeys("main.ops.tickets", (), (TestResolve.REF,))
-        script = keys.rebuild_script([(only_refs, [])])
+        script = keys.rebuild_script([only_refs], [])
         assert "BEGIN" not in script and script.rstrip().endswith("AS fluid_keys;")
 
 
@@ -358,7 +360,7 @@ def _emitted(tmp_path: Path, contract: Dict[str, Any], monkeypatch, found=None) 
     """``emit``'s resources, its live lookup answered by ``found`` (product → candidates)."""
     asked: List[List[str]] = []
 
-    def lookup(products):
+    def lookup(products, failures=None):
         asked.append(list(products))
         return found or {}
 
@@ -489,7 +491,7 @@ def deploy_tickets(fake: FakeDatabricks) -> None:
 
 PK_SITES = ("PRIMARY KEY", "fluid_pk_sites", "site_id")
 PK_TICKETS = ("PRIMARY KEY", "fluid_pk_tickets", "ticket_id")
-FK_TICKETS = ("FOREIGN KEY", "fluid_fk_tickets_site_id", "site_id", "main.geo.sites", "site_id")
+FK_TICKETS = ("FOREIGN KEY", "fluid_fk_tickets__site_id", "site_id", "main.geo.sites", "site_id")
 
 
 class TestHooks:
@@ -502,7 +504,7 @@ class TestHooks:
         run.post(tickets())
         assert fake.keys_on("main.ops.tickets") == [PK_TICKETS, FK_TICKETS]
         assert (
-            "done: foreign key fluid_fk_tickets_site_id (site_id) references main.geo.sites (site_id)"
+            "done: foreign key fluid_fk_tickets__site_id (site_id) references main.geo.sites (site_id)"
             in run.text
         )
         # One lookup, by tag, for the other product: the parent's location is never assumed.
@@ -522,7 +524,7 @@ class TestHooks:
         run.post(tickets())
         assert (
             "FOREIGN KEY",
-            "fluid_fk_tickets_site_id",
+            "fluid_fk_tickets__site_id",
             "site_id",
             "prod.geo.sites",
             "site_id",
@@ -581,7 +583,7 @@ class TestHooks:
             PK_TICKETS,
             ("FOREIGN KEY", "admin_fk", "note", "main.geo.sites", "site_id"),
         ]
-        assert "done: drop foreign key fluid_fk_tickets_site_id" in run.text
+        assert "done: drop foreign key fluid_fk_tickets__site_id" in run.text
 
     def test_a_dry_run_prints_the_statements_and_runs_none(self, fake):
         run = Hooks(fake)
@@ -642,7 +644,7 @@ class TestHooks:
         run.post(both)
         assert fake.keys_on("main.geo.visits") == [
             ("PRIMARY KEY", "fluid_pk_visits", "visit_id"),
-            ("FOREIGN KEY", "fluid_fk_visits_site_id", "site_id", "main.geo.sites", "site_id"),
+            ("FOREIGN KEY", "fluid_fk_visits__site_id", "site_id", "main.geo.sites", "site_id"),
         ]
         assert not [s for s in fake.sql_log if "information_schema" in s]
 
@@ -689,6 +691,233 @@ class TestAfterBuilds:
         monkeypatch.setattr(engine, "_resolve_provider", lambda contract, requested: "databricks")
         monkeypatch.setattr(engine, "get_iac_plugin", lambda provider: Plugin())
         args = type("Args", (), {"contract": None, "provider": None})()
-        engine.after_builds(args, {"id": "x"})
+        engine.after_builds(args, logging.getLogger("t"), {"id": "x"})
         assert Plugin.calls == [{"id": "x"}]
         assert "after the build: RuntimeError: boom" in capsys.readouterr().out
+
+
+# ── the review round: each finding pinned ──────────────────────────────────
+R = keys.Reference
+
+
+class TestCompositeAmongOthers:
+    CANDS = {
+        "p.q_v1": [
+            keys.Candidate("main.p.orders", ("order_id", "line_no")),
+            keys.Candidate("main.p.cust", ("cust_id",)),
+        ]
+    }
+
+    def test_a_composite_key_and_a_single_one_to_two_tables_of_one_product(self):
+        refs = (
+            R("o", "p.q_v1", "order_id"),
+            R("l", "p.q_v1", "line_no"),
+            R("c", "p.q_v1", "cust_id"),
+        )
+        out = keys.foreign_keys(_keys(*refs), self.CANDS)
+        assert {(fk.columns, fk.parent) for fk in out} == {
+            (("o", "l"), "main.p.orders"),
+            (("c",), "main.p.cust"),
+        }
+
+    def test_two_composite_keys_to_two_tables_of_one_product(self):
+        cands = {
+            "p.q_v1": [
+                keys.Candidate("main.p.a", ("x", "y")),
+                keys.Candidate("main.p.b", ("u", "v")),
+            ]
+        }
+        refs = (
+            R("cx", "p.q_v1", "x"),
+            R("cy", "p.q_v1", "y"),
+            R("cu", "p.q_v1", "u"),
+            R("cv", "p.q_v1", "v"),
+        )
+        out = keys.foreign_keys(_keys(*refs), cands)
+        assert sorted((fk.columns, fk.parent) for fk in out) == [
+            (("cu", "cv"), "main.p.b"),
+            (("cx", "cy"), "main.p.a"),
+        ]
+
+    def test_half_a_composite_key_is_said_as_such(self):
+        notes: List[str] = []
+        assert keys.foreign_keys(_keys(R("o", "p.q_v1", "order_id")), self.CANDS, notes) == []
+        assert "part of the composite PRIMARY KEY (order_id, line_no) of main.p.orders" in notes[0]
+
+
+class TestStaleForeignKeys:
+    K = keys.TableKeys(
+        "main.ops.tickets", ("ticket_id",), (R("a", "p.q_v1", "x"), R("b", "p.q_v1", "y"))
+    )
+    LIVE = _live(
+        _pk("fluid_pk_tickets", "ticket_id"),
+        {
+            "foreign_key_constraint": {
+                "name": "fluid_fk_tickets__a",
+                "child_columns": ["a"],
+                "parent_table": "main.c.old",
+                "parent_columns": ["x"],
+            }
+        },
+    )
+
+    def test_one_a_wanted_composite_key_covers_is_dropped(self):
+        want = keys.ForeignKey("fluid_fk_tickets__a__b", ("a", "b"), "main.c.new", ("x", "y"))
+        plan = keys.plan_table("main.ops.tickets", self.K, [want], self.LIVE, candidates={})
+        assert [s.statement.split(" CONSTRAINT ")[-1].split(" ")[-1] for s in plan.fk_drops] == [
+            "`fluid_fk_tickets__a`"
+        ]
+        assert [s.what.split(" (")[0] for s in plan.fk_adds] == [
+            "foreign key fluid_fk_tickets__a__b"
+        ]
+
+    def test_one_whose_product_now_resolves_elsewhere_or_nowhere_is_dropped(self):
+        plan = keys.plan_table("main.ops.tickets", self.K, [], self.LIVE, candidates={})
+        assert len(plan.fk_drops) == 1
+
+    def test_one_whose_product_cannot_be_looked_up_now_is_kept(self):
+        plan = keys.plan_table(
+            "main.ops.tickets", self.K, [], self.LIVE, candidates={}, unknown={"p.q_v1"}
+        )
+        assert plan.fk_drops == []
+
+
+def test_names_cannot_collide_in_a_schema():
+    a = keys.constraint_name(keys.FK_PREFIX, "a", "b", "c")
+    b = keys.constraint_name(keys.FK_PREFIX, "a_b", "c")
+    c = keys.constraint_name(keys.FK_PREFIX, "a", "b_c")
+    assert len({a, b, c}) == 3
+    assert a == "fluid_fk_a__b__c" and b == "fluid_fk_a_b__c"
+    ambiguous = keys.constraint_name(keys.FK_PREFIX, "a__b", "c")
+    assert re.fullmatch(r"fluid_fk_a__b__c_[0-9a-f]{8}", ambiguous)
+
+
+def test_lookup_skips_a_table_it_cannot_read_or_name_and_says_so():
+    class Runner:
+        def execute(self, statement: str) -> Dict[str, Any]:
+            rows = [
+                ["main", "geo", "sites", SITES],
+                ["main", "geo", "busy", SITES],
+                ["main", "geo", "bad-name", SITES],
+            ]
+            return {"result": {"data_array": rows}}
+
+    class Api:
+        def do(self, method: str, path: str, **_kw: Any) -> Dict[str, Any]:
+            if path.endswith("main.geo.busy"):
+                raise RuntimeError("429 too many")
+            pk = {"primary_key_constraint": {"name": "p", "child_columns": ["site_id"]}}
+            return {"owner": "me", "table_constraints": [pk]}
+
+    notes: List[str] = []
+    client = type("Client", (), {"api_client": Api()})()
+    found = keys.lookup(Runner(), client, [SITES], "me", notes)
+    assert found == {SITES: [keys.Candidate("main.geo.sites", ("site_id",), True)]}
+    assert any("main.geo.busy" in n and "429 too many" in n for n in notes)
+    assert any("main.geo.bad-name" in n and "no plain identifier" in n for n in notes)
+
+
+class TestJobScriptCoverage:
+    def test_a_rebuilt_parent_gets_its_same_contract_childs_foreign_key_back(
+        self, tmp_path, monkeypatch
+    ):
+        _project(tmp_path)
+        contract = product(
+            "sales.star_v1",
+            expose("dim", [col("id", pk=True)], "sales"),
+            expose(
+                "fact", [col("fact_id", pk=True), col("dim_id", ref="sales.star_v1.id")], "sales"
+            ),
+        )
+        contract = _dbt(contract)  # the job writes dim only; fact is no build's
+        script = _script(_emitted(tmp_path, contract, monkeypatch))
+        assert "ADD CONSTRAINT `fluid_pk_dim` PRIMARY KEY (`id`)" in script
+        assert (
+            "`fluid_fk_fact__dim_id` FOREIGN KEY (`dim_id`) REFERENCES `main`.`sales`.`dim` (`id`)"
+            in script
+        )
+        assert "fluid_pk_fact" not in script  # fact is not rebuilt
+
+    def test_validate_of_a_templated_location_does_not_raise(self, monkeypatch):
+        monkeypatch.setenv(dbx.WAREHOUSE_ENV, WAREHOUSE)
+        contract = _dbt(tickets(), repository="https://github.com/o/r?tag=v1.2.0")
+        contract["exposes"][0]["binding"]["location"]["database"] = "{{ env.CAT }}"
+        out = dbx._compile(contract, {dbx.WAREHOUSE_ENV: WAREHOUSE}, validating=True)
+        assert not out.refusals, [r.kind for r in out.refusals]
+
+
+class TestEmitLookup:
+    def test_a_lookup_that_fails_is_a_plan_notice(self, tmp_path, monkeypatch):
+        _project(tmp_path)
+        monkeypatch.setenv(dbx.WAREHOUSE_ENV, WAREHOUSE)
+
+        def failing(products, failures=None):
+            failures.append("RuntimeError: warehouse asleep")
+            return {}
+
+        monkeypatch.setattr(dbx, "_live_key_lookup", failing)
+        contract = _dbt(tickets())
+        with contract_source(tmp_path / "contract.fluid.yaml"):
+            PLUGIN.emit(contract)
+            notices = PLUGIN.plan_notices(contract)
+        assert any("could not look up now (RuntimeError: warehouse asleep)" in n for n in notices)
+
+    def test_a_refused_contract_never_reaches_the_warehouse(self, tmp_path, monkeypatch):
+        _project(tmp_path)
+        monkeypatch.setenv(dbx.WAREHOUSE_ENV, WAREHOUSE)
+        asked: List[Any] = []
+        monkeypatch.setattr(dbx, "_live_key_lookup", lambda *a, **k: asked.append(a) or {})
+        contract = _dbt(tickets())
+        contract["exposes"][0]["contract"]["schema"][2]["type"] = "not_a_type"
+        with contract_source(tmp_path / "contract.fluid.yaml"), pytest.raises(Exception):
+            PLUGIN.emit(contract)
+        assert asked == []
+
+
+class TestBuildPhaseHook:
+    def _engine(self, monkeypatch, plugin: Any):
+        from fluid_build.cli import _apply_opentofu_engine as engine
+
+        monkeypatch.setattr(engine, "_resolve_provider", lambda contract, requested: "databricks")
+        monkeypatch.setattr(engine, "get_iac_plugin", lambda provider: plugin)
+        return engine
+
+    def test_a_dry_run_declares_nothing(self, monkeypatch):
+        import fluid_build.build_runners as runners
+
+        engine = self._engine(monkeypatch, object())
+        monkeypatch.setattr(runners, "run_builds_from_args", lambda *a, **k: 0)
+        called: List[Any] = []
+        monkeypatch.setattr(engine, "after_builds", lambda *a: called.append(a))
+        args = type("Args", (), {"dry_run": True, "contract": None, "provider": None})()
+        assert engine.build_after_apply(args, logging.getLogger("t"), {"id": "x"}, {}) == 0
+        assert called == []
+        args.dry_run = False
+        assert engine.build_after_apply(args, logging.getLogger("t"), {"id": "x"}, {}) == 0
+        assert len(called) == 1
+
+    def test_a_build_that_failed_part_way_is_still_followed_by_the_hook(self, monkeypatch):
+        import fluid_build.build_runners as runners
+
+        engine = self._engine(monkeypatch, object())
+        monkeypatch.setattr(runners, "run_builds_from_args", lambda *a, **k: 1)
+        called: List[Any] = []
+        monkeypatch.setattr(engine, "after_builds", lambda *a: called.append(a))
+        args = type("Args", (), {"dry_run": False, "contract": None, "provider": None})()
+        assert engine.build_after_apply(args, logging.getLogger("t"), {"id": "x"}, {}) == 1
+        assert len(called) == 1
+
+    def test_the_hook_gets_the_contract_with_its_templates_resolved(self, monkeypatch):
+        seen: List[Dict[str, Any]] = []
+
+        class Plugin:
+            def post_build(self, contract, say):
+                seen.append(contract)
+
+        engine = self._engine(monkeypatch, Plugin())
+        monkeypatch.setenv("CAT", "main")
+        contract = tickets()
+        contract["exposes"][0]["binding"]["location"]["database"] = "{{ env.CAT }}"
+        args = type("Args", (), {"contract": None, "provider": None})()
+        engine.after_builds(args, logging.getLogger("t"), contract)
+        assert seen[0]["exposes"][0]["binding"]["location"]["database"] == "main"

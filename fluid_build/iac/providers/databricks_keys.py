@@ -30,10 +30,12 @@ overlay put them and whichever contract or repository applied them. A candidate 
 referenced columns as its live PRIMARY KEY; of several, one in the child's catalog wins, and
 more than one left is ambiguous, so that key is skipped and said.
 
-**Names.** ``fluid_pk_<table>`` and ``fluid_fk_<table>_<columns>`` (a key's name is unique in
-its schema; one longer than 255 characters is cut and given a digest). The ``fluid_`` prefix
-marks what this module owns: it replaces or drops only a key so named, and leaves any other in
-place, saying so. A key that already holds what the contract asks, whatever its name, is kept.
+**Names.** ``fluid_pk_<table>`` and ``fluid_fk_<table>__<column>[__<column>]``: a key's name
+must be unique in its schema, and a table's name is, so are a foreign key's columns on it
+(:func:`constraint_name`; a part that could read two ways adds a digest, and a name past 255
+characters is cut and given one). The ``fluid_`` prefix marks what this module owns: it
+replaces or drops only a key so named, and leaves any other in place, saying so. A key that
+already holds what the contract asks, whatever its name, is kept.
 
 **A key never fails the run**: it is metadata. One that cannot be declared yet (its parent
 not deployed, a parent without its primary key, a nullable column) is skipped with the reason
@@ -54,10 +56,16 @@ Measured on Databricks SQL (serverless warehouse, dbsql 2026.45, 2026-11-12):
 So a dbt ``table`` build, a ``CREATE OR REPLACE``, would leave its table with no keys after
 every run. Each Databricks dbt job that writes a keyed table therefore gets a second task,
 ``fluid_keys`` (``databricks_jobs.py``), which runs :func:`rebuild_script` on the same
-warehouse once dbt has succeeded: the keys the apply resolved, each added again, and each that
-fails (a key still in place, a parent whose own task has not run yet) passed over, so no run
-fails on one. A parent's rebuild also drops the foreign keys that reference it; each child's
-next build, or ``fluid apply``, declares them again.
+warehouse once dbt has succeeded: the keys of the tables it rebuilt and the contract's own
+foreign keys into them, each added again, and each that fails passed over, so no run fails
+on one. What it cannot add it passes over without a word: a key column the dbt model leaves
+nullable (declare ``not_null`` on it in the model, with the model contract enforced) is
+reported only by the next ``fluid apply``. The script is SQL scripting (a ``BEGIN ... END``
+block), which a current Databricks SQL warehouse runs; on one that cannot, the task, and the
+job's run, fail. A parent's rebuild also drops the foreign keys of other contracts' tables
+that reference it: such a child gets them back from its own job's task after its next build,
+or from its next ``fluid apply``. A dbt build that ``fluid apply --mode amend-and-build`` runs
+on this machine is followed by the same re-declaration (``post_build``).
 
 The pattern is dbt-databricks' own (``macros/relations/constraints.sql``: ``ALTER TABLE ... ADD
 CONSTRAINT`` after every create or replace), for keys the contract declares rather than a model.
@@ -65,9 +73,24 @@ CONSTRAINT`` after every create or replace), for keys the contract declares rath
 
 from __future__ import annotations
 
+import hashlib
 import os
+from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 from ...providers._sql_safety import reject_control_chars, validate_ident
 from ..naming import bounded_ident
@@ -179,8 +202,14 @@ class ForeignKey:
 
 
 def constraint_name(prefix: str, *parts: str) -> str:
-    """``prefix`` and ``parts`` joined by ``_``; cut, with a digest, past 255 characters."""
-    return bounded_ident(prefix + "_".join(parts), _MAX_NAME)
+    """``prefix`` and ``parts`` joined by ``__``, which no part a schema can mistake holds:
+    ``fluid_pk_<table>``, ``fluid_fk_<table>__<column>[__<column>]``. A part that holds ``__``
+    or starts or ends with ``_`` could read two ways, so a digest of the parts then follows.
+    Cut, with a digest, past 255 characters."""
+    name = prefix + "__".join(parts)
+    if any("__" in p or p.startswith("_") or p.endswith("_") for p in parts):
+        name += "_" + hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()[:8]
+    return bounded_ident(name, _MAX_NAME)
 
 
 def _tags(raw: Any) -> frozenset:
@@ -307,20 +336,8 @@ def foreign_keys(
                     "run fluid apply here again."
                 )
             continue
-        wanted = [r.parent_column for r in refs]
-        if len(refs) > 1 and len(set(wanted)) == len(wanted):
-            whole = [c for c in found if len(c.primary) > 1 and set(c.primary) == set(wanted)]
-            if whole:
-                pick, tied = _pick(whole, keys.catalog)
-                if pick is None:
-                    said.append(_ambiguous(children, product, wanted, tied))
-                    continue
-                child = {r.parent_column: r.column for r in refs}
-                columns = tuple(child[c] for c in pick.primary)
-                name = constraint_name(FK_PREFIX, keys.table, *columns)
-                out.append(ForeignKey(name, columns, pick.full_name, pick.primary))
-                continue
-        for ref in refs:
+        left = _composites(keys, product, refs, found, out, said)
+        for ref in left:
             single = [c for c in found if c.primary == (ref.parent_column,)]
             pick, tied = _pick(single, keys.catalog)
             if pick is not None:
@@ -329,14 +346,65 @@ def foreign_keys(
             elif tied:
                 said.append(_ambiguous(ref.column, product, [ref.parent_column], tied))
             else:
-                tables = ", ".join(sorted(c.full_name for c in found))
-                said.append(
-                    f"foreign key ({ref.column}) to {product}.{ref.parent_column}: {product} "
-                    f"has {tables}, and none has PRIMARY KEY ({ref.parent_column}). Tag "
-                    f"{ref.parent_column} primary-key in {product}'s contract and apply it, then "
-                    "run fluid apply here again."
-                )
+                said.append(_unmatched(ref, product, found))
     return out
+
+
+def _composites(
+    keys: TableKeys,
+    product: str,
+    refs: Sequence[Reference],
+    found: Sequence[Candidate],
+    out: List[ForeignKey],
+    said: List[str],
+) -> List[Reference]:
+    """The composite foreign keys among ``refs``, appended to ``out``; the references left.
+
+    For each composite primary key a table of ``product`` has, widest first: the references
+    that name each of its columns exactly once are one foreign key, in that key's order. What
+    is left is matched column by column, so one product can take a composite key to one of its
+    tables and a single-column key to another.
+    """
+    by_key: Dict[frozenset, List[Candidate]] = {}
+    for cand in found:
+        if len(cand.primary) > 1:
+            by_key.setdefault(frozenset(cand.primary), []).append(cand)
+    left = list(refs)
+    for columns in sorted(by_key, key=lambda k: (-len(k), sorted(k))):
+        named: Dict[str, List[Reference]] = {}
+        for ref in left:
+            if ref.parent_column in columns:
+                named.setdefault(ref.parent_column, []).append(ref)
+        if set(named) != columns or any(len(v) != 1 for v in named.values()):
+            continue
+        used = [v[0] for v in named.values()]
+        left = [r for r in left if r not in used]
+        pick, tied = _pick(by_key[columns], keys.catalog)
+        if pick is None:
+            children = ", ".join(r.column for r in used)
+            said.append(_ambiguous(children, product, sorted(columns), tied))
+            continue
+        child = tuple(named[c][0].column for c in pick.primary)
+        name = constraint_name(FK_PREFIX, keys.table, *child)
+        out.append(ForeignKey(name, child, pick.full_name, pick.primary))
+    return left
+
+
+def _unmatched(ref: Reference, product: str, found: Sequence[Candidate]) -> str:
+    """Why ``ref`` matches no table of ``product``, and what to do."""
+    part = next((c for c in found if ref.parent_column in c.primary and len(c.primary) > 1), None)
+    if part is not None:
+        return (
+            f"foreign key ({ref.column}) to {product}.{ref.parent_column}: that column is part "
+            f"of the composite PRIMARY KEY ({', '.join(part.primary)}) of {part.full_name}. "
+            "Reference each of its columns, once each, from this table's columns."
+        )
+    tables = ", ".join(sorted(c.full_name for c in found))
+    return (
+        f"foreign key ({ref.column}) to {product}.{ref.parent_column}: {product} has {tables}, "
+        f"and none has PRIMARY KEY ({ref.parent_column}). Tag {ref.parent_column} primary-key "
+        f"in {product}'s contract and apply it, then run fluid apply here again."
+    )
 
 
 def _ambiguous(
@@ -380,15 +448,21 @@ def live_keys(
 
 
 def lookup(
-    runner: SqlRunner, client: Any, products: Iterable[str], owner: str = ""
+    runner: SqlRunner,
+    client: Any,
+    products: Iterable[str],
+    owner: str = "",
+    notes: Optional[List[str]] = None,
 ) -> Dict[str, List[Candidate]]:
     """The tables tagged with each product id, with their live primary keys; one ``owner``
     owns (the deploying identity) is ``trusted``.
 
     One query on ``system.information_schema.table_tags``, which lists what this identity can
-    see, then one Tables API read per table found. A table whose name this module could not
-    quote is no candidate. Raises when the query or a read fails.
+    see, then one Tables API read per table found. A table that cannot be read, or whose name
+    is no plain identifier, is no candidate, and ``notes`` says which. Raises when the query
+    fails.
     """
+    said = notes if notes is not None else []
     wanted = sorted({p for p in products if p})
     if not wanted:
         return {}
@@ -408,9 +482,19 @@ def lookup(
         full_name = f"{catalog}.{schema}.{table}".lower()
         try:
             quote_table(full_name)
+            live = read_table(client, full_name)
         except ValueError:
+            said.append(
+                f"{full_name} is tagged {PRODUCT_TAG} = {product!r}, but its name is no plain "
+                "identifier, so no foreign key references it."
+            )
             continue
-        live = read_table(client, full_name)
+        except Exception as exc:  # noqa: BLE001 — one unreadable table is not every table
+            said.append(
+                f"{full_name}, tagged {PRODUCT_TAG} = {product!r}, could not be read "
+                f"({type(exc).__name__}: {scrub(exc)}), so no foreign key references it now."
+            )
+            continue
         if live is None:
             continue
         primary, _ = live_keys(live)
@@ -478,13 +562,17 @@ def plan_table(
     keys: Optional[TableKeys],
     fks: Sequence[ForeignKey],
     live: Optional[Mapping[str, Any]],
+    *,
+    candidates: Optional[Mapping[str, Sequence[Candidate]]] = None,
+    unknown: Collection[str] = frozenset(),
 ) -> TablePlan:
     """The steps from ``live`` (``None``: not created yet) to what the contract declares.
 
     A key already in place is kept whatever its name. One this module declared (its prefix)
     that the contract changed or dropped is dropped; any other is left, and a contract key it
-    is in the way of is noted. A foreign key of this module whose parent cannot be resolved now
-    is kept while the contract still references its columns.
+    is in the way of is noted. A foreign key of this module that no wanted key replaces is kept
+    while its columns still reference the one product whose tables could not be looked up, or
+    whose tables still include its parent (:func:`_still_meant`): a parent unresolved for now.
     """
     plan = TablePlan(full_name, exists=live is not None)
     live_pk, live_fks = live_keys(live or {})
@@ -511,7 +599,6 @@ def plan_table(
             )
         )
     wanted = {fk.columns: fk for fk in fks}
-    referenced = {r.column for r in keys.references} if keys is not None else set()
     for fk in live_fks:
         want = wanted.get(fk.columns)
         if want is not None and (fk.parent, fk.parent_columns) == (
@@ -530,13 +617,36 @@ def plan_table(
                 )
                 del wanted[fk.columns]
             continue
-        if want is None and set(fk.columns) <= referenced:
-            continue  # still referenced, its parent unresolved now: kept
+        if want is None and _still_meant(fk, keys, fks, candidates, unknown):
+            continue  # its parent unresolved for now: kept
         why = "its parent changed" if want is not None else "the contract no longer declares it"
         plan.fk_drops.append(_drop(full_name, fk.name, f"drop {fk.describe()}: {why}"))
     for fk in wanted.values():
         plan.fk_adds.append(Step(fk.describe(), foreign_key_statement(full_name, fk)))
     return plan
+
+
+def _still_meant(
+    fk: ForeignKey,
+    keys: Optional[TableKeys],
+    wanted: Sequence[ForeignKey],
+    candidates: Optional[Mapping[str, Sequence[Candidate]]],
+    unknown: Collection[str],
+) -> bool:
+    """Whether a foreign key this module declared, that the contract's resolved keys do not
+    include, still says what the contract does: no wanted key covers any of its columns, its
+    columns all reference one product, and that product's tables could not be looked up (or
+    were not, ``candidates`` ``None``) or still include its parent."""
+    if any(set(w.columns) & set(fk.columns) for w in wanted):
+        return False
+    refs = {r.column: r.product for r in keys.references} if keys is not None else {}
+    products = {refs.get(c) for c in fk.columns}
+    if len(products) != 1 or None in products:
+        return False
+    (product,) = products
+    if candidates is None or product in unknown:
+        return True
+    return any(c.full_name == fk.parent for c in candidates.get(str(product)) or ())
 
 
 def _hint(error: str) -> str:
@@ -583,21 +693,24 @@ def resolve(
     runner: SqlRunner,
     client: Any,
     notes: List[str],
-) -> Dict[str, List[Candidate]]:
-    """Every table the contract's references can resolve to: its own exposes' declared
-    primary keys, and the live tables of each other product it references."""
+) -> Tuple[Dict[str, List[Candidate]], FrozenSet[str]]:
+    """Every table the contract's references can resolve to (its own exposes' declared
+    primary keys, and the live tables of each other product it references), and the products
+    whose tables could not be looked up at all."""
     candidates: Dict[str, List[Candidate]] = dict(own_candidates(contract_id, keyed))
     others = sorted({r.product for k in keyed for r in k.references if r.product != contract_id})
     if not others:
-        return candidates
+        return candidates, frozenset()
     try:
-        candidates.update(lookup(runner, client, others, deploying_identity(client)))
+        owner = deploying_identity(client)
+        candidates.update(lookup(runner, client, others, owner, notes))
     except Exception as exc:  # noqa: BLE001 — a lookup that fails declares no such key
         notes.append(
             f"foreign keys to {', '.join(others)}: their tables could not be looked up "
             f"({type(exc).__name__}: {scrub(exc)})."
         )
-    return candidates
+        return candidates, frozenset(others)
+    return candidates, frozenset()
 
 
 def deploying_identity(client: Any) -> str:
@@ -656,14 +769,20 @@ def reconcile(
                 general.append(f"keys of {target.full_name}: the table does not exist.")
             continue
         reads.append(_Read(target, live))
-    keyed = [r.target.keys for r in reads if r.target.keys is not None]
-    candidates = resolve(keyed, contract_id, runner, client, general) if keyed else {}
+    # Own candidates come from what every expose declares, read or not: a parent this run could
+    # not read still declares its primary key.
+    keyed = [t.keys for t in targets if t.keys is not None]
+    candidates, unknown = (
+        resolve(keyed, contract_id, runner, client, general) if keyed else ({}, frozenset())
+    )
     plans: List[TablePlan] = []
     for read in reads:
         keys = read.target.keys
         notes: List[str] = []
         fks = foreign_keys(keys, candidates, notes, own_id=contract_id) if keys else []
-        plan = plan_table(read.target.full_name, keys, fks, read.live)
+        plan = plan_table(
+            read.target.full_name, keys, fks, read.live, candidates=candidates, unknown=unknown
+        )
         plan.notes[:0] = notes
         if plan.steps or plan.notes:
             plans.append(plan)
@@ -725,22 +844,32 @@ def _run(plans: Sequence[TablePlan], runner: SqlRunner, say: Say) -> None:
 # ── after a dbt build ──────────────────────────────────────────────────
 
 
-def rebuild_script(entries: Sequence[Tuple[TableKeys, Sequence[ForeignKey]]]) -> str:
+def rebuild_script(rebuilt: Sequence[TableKeys], foreign: Sequence[Tuple[str, ForeignKey]]) -> str:
     """The SQL file a dbt job's ``fluid_keys`` task runs once the build has succeeded.
 
-    Every primary key first, then every foreign key, each inside one script whose
-    ``CONTINUE`` handler passes over a statement that fails, so the task, and the run, never
-    fail on a key. A job whose tables resolve to no statement still gets a valid file.
+    The primary keys of the tables the build rebuilds, then ``foreign`` (``(child table, key)``),
+    each inside one script whose ``CONTINUE`` handler passes over a statement that fails, so
+    the task, and the run, never fail on a key: a key still in place, a parent whose own key is
+    not back yet, a key column the dbt model leaves nullable. A statement for a name that is no
+    plain identifier yet (``fluid validate`` compiles before ``{{ env.* }}`` templates are
+    resolved) is left out. A job whose tables resolve to no statement still gets a valid file.
     """
-    body = [primary_key_statement(keys) for keys, _ in entries if keys.primary]
-    body += [foreign_key_statement(keys.full_name, fk) for keys, fks in entries for fk in fks]
+    body: List[str] = []
+    for keys in rebuilt:
+        if keys.primary:
+            with suppress(ValueError):
+                body.append(primary_key_statement(keys))
+    for child, fk in foreign:
+        with suppress(ValueError):
+            body.append(foreign_key_statement(child, fk))
     header = [
         "-- Written by fluid apply (data-product-forge); the next apply rewrites it.",
         "-- A dbt table build replaces its table with CREATE OR REPLACE, which drops the table's",
         "-- Unity Catalog keys and the foreign keys that reference it. This task, run after a",
-        "-- build that succeeded, declares this job's keys again. A statement that fails (a key",
-        "-- still in place, a parent whose own key is not back yet) is passed over: no run fails",
-        "-- on a key.",
+        "-- build that succeeded, declares them again. A statement that fails (a key still in",
+        "-- place, a parent whose own key is not back yet, a key column the model leaves",
+        "-- nullable) is passed over: no run fails on a key, and fluid apply says why one is",
+        "-- missing.",
     ]
     if not body:
         return "\n".join([*header, "SELECT 'no key to declare' AS fluid_keys;", ""])

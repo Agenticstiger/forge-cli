@@ -1431,6 +1431,8 @@ def _rebuild_scripts(
     """The ``fluid_keys`` script of each Databricks dbt job, by its build; ``None`` for a job
     that writes no table with a key (``databricks_keys.rebuild_script``).
 
+    A job's script declares again what its build's ``CREATE OR REPLACE`` drops: the keys of the
+    tables it writes, and the foreign keys of this contract's other tables that reference them.
     Its foreign keys to other products need ``key_lookup``, which only ``emit`` passes; without
     it (``fluid validate``, the native planner) a script holds the primary keys and the foreign
     keys to this contract's own tables.
@@ -1461,12 +1463,16 @@ def _rebuild_scripts(
     )
     if others and key_lookup is not None:
         candidates.update(key_lookup(others))
-    scripts = {
-        build_id: rebuild_script(
-            [(keys, foreign_keys(keys, candidates, own_id=contract_id)) for keys in tables]
-        )
-        for build_id, tables in written.items()
-    }
+    resolved = [
+        (keys.full_name, fk)
+        for _t, keys in keyed
+        for fk in foreign_keys(keys, candidates, own_id=contract_id)
+    ]
+    scripts: Dict[int, str] = {}
+    for build_id, tables in written.items():
+        names = {keys.full_name for keys in tables}
+        drops = [(child, fk) for child, fk in resolved if child in names or fk.parent in names]
+        scripts[build_id] = rebuild_script(tables, drops)
     return lambda build: scripts.get(id(build))
 
 
@@ -1490,22 +1496,43 @@ def _declare_keys(
         say(f"\n  Unity Catalog keys: not declared ({type(exc).__name__}: {scrub(exc)}).")
 
 
-def _live_key_lookup(products: Sequence[str]) -> Mapping[str, Sequence[Candidate]]:
+#: How long ``emit`` waits for the live key lookup: a plan should not hang on a warehouse.
+_KEY_LOOKUP_TIMEOUT_SECONDS = 120
+
+
+def _live_key_lookup(
+    products: Sequence[str], failures: Optional[List[str]] = None
+) -> Mapping[str, Sequence[Candidate]]:
     """Other products' live tables, for the ``fluid_keys`` scripts ``emit`` writes.
 
-    Best effort, empty when the workspace cannot be read: a module still emits without a
-    credential (``fluid generate iac``), and ``fluid apply`` resolves, declares and reports the
-    keys itself after ``tofu apply`` (``databricks_keys.reconcile``).
+    Best effort, and what it could not read is added to ``failures``: a module still emits
+    without a credential (``fluid generate iac``), and ``fluid apply`` resolves, declares and
+    reports the keys itself after ``tofu apply`` (``databricks_keys.reconcile``).
     """
+    said: List[str] = []
     try:
         warehouse = str(os.environ.get(WAREHOUSE_ENV) or "").strip()
         if not warehouse:
+            said.append(f"{WAREHOUSE_ENV} is not set")
             return {}
         client = default_client()
-        runner = SqlRunner(client, warehouse)
-        return lookup_key_tables(runner, client, products, deploying_identity(client))
-    except Exception:  # noqa: BLE001 — no live answer is no foreign key in the script
+        runner = SqlRunner(client, warehouse, timeout=_KEY_LOOKUP_TIMEOUT_SECONDS)
+        return lookup_key_tables(runner, client, products, deploying_identity(client), said)
+    except Exception as exc:  # noqa: BLE001 — no live answer is no foreign key in the script
+        said.append(f"{type(exc).__name__}: {scrub(exc)}")
         return {}
+    finally:
+        if failures is not None:
+            failures.extend(said)
+
+
+def _references_another_product(compiled: _Compiled, contract: Mapping[str, Any]) -> bool:
+    """Whether a dbt job's script may need the live lookup: the contract has a job, and a
+    table that references a product other than its own."""
+    own = _text(contract.get("id"))
+    return bool(compiled.jobs) and any(
+        r.product != own for t in compiled.tables if t.keys for r in t.keys.references
+    )
 
 
 def _resolve_tables(
@@ -2184,10 +2211,21 @@ class DatabricksIacPlugin:
     def emit(
         self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()
     ) -> Dict[str, Any]:
-        compiled = _compile(contract, os.environ, key_lookup=_live_key_lookup)
+        compiled = _compile(contract, os.environ)
         if compiled.refusals:
             raise compiled.refusals[0]
         _enforce_sovereignty(contract, compiled.tables)
+        # Only now, with the contract compiled and its sovereignty upheld, may the dbt jobs'
+        # fluid_keys scripts look up other products' tables on the warehouse; ``plan_notices``
+        # says when it could not.
+        failures: List[str] = []
+        if _references_another_product(compiled, contract):
+            compiled = _compile(
+                contract,
+                os.environ,
+                key_lookup=lambda products: _live_key_lookup(products, failures),
+            )
+        self._key_lookup_failures = (_contract_key(contract), failures)
         # Decided once, here: ``plan_notices`` of the same run says what this paused, so a
         # transient read error cannot pause a job without the notice (or the reverse).
         to_pause = _jobs_to_pause(compiled, contract)
@@ -2388,6 +2426,16 @@ class DatabricksIacPlugin:
                 f"{CERTIFICATION_TAG} is set on {', '.join(certified)}: a system governed tag, "
                 "so this identity needs the ASSIGN permission on it, which an account or "
                 "workspace admin grants, or the tag assignment fails."
+            )
+        failed = getattr(self, "_key_lookup_failures", None)
+        self._key_lookup_failures = None  # used once, as the pause decision is
+        if failed is not None and failed[1] and failed[0] == _contract_key(contract):
+            notices.append(
+                "the fluid_keys task of this contract's dbt jobs declares no foreign key to "
+                "another product's table it could not look up now ("
+                + "; ".join(failed[1])
+                + "). fluid apply still declares them on the tables after the apply, and the "
+                "next apply that can look them up writes them into the task's script."
             )
         decided = getattr(self, "_pause_decision", None)
         self._pause_decision = None  # used once: the next run decides again

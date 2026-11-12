@@ -1002,7 +1002,7 @@ def test_apply_declares_the_keys_and_a_child_finds_its_parent_by_its_product_tag
     assert rc == 0, out
     assert fake.keys_on("main.sales.returns") == [
         ("PRIMARY KEY", "fluid_pk_returns", "id"),
-        ("FOREIGN KEY", "fluid_fk_returns_region", "region", TABLE, "id"),
+        ("FOREIGN KEY", "fluid_fk_returns__region", "region", TABLE, "id"),
     ]
 
     statements = len(fake.sql_log)
