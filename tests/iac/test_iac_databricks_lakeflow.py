@@ -720,3 +720,20 @@ def test_verify_knows_a_pipeline_table_gets_its_tags_from_an_update(tmp_path):
         tables, _jobs = dbx.managed_objects(_contract(), ENV)
     (table,) = tables
     assert table.pipeline_written is True and table.dbt_written is False
+
+
+def test_a_pipeline_table_with_keys_is_warned_and_left_out_of_key_reconciling(
+    tmp_path, monkeypatch
+):
+    """Unity Catalog keys go on a table with ALTER TABLE, which a pipeline's materialized view
+    refuses; until the definition carries them, they are said and not attempted."""
+    contract = _contract()
+    site = contract["exposes"][0]["contract"]["schema"][0]
+    site["tags"] = ["primary-key"]
+    compiled = _compile(contract, tmp_path)
+    assert any("primary and foreign keys are not declared" in w for w in compiled.warnings)
+    seen: List[Any] = []
+    monkeypatch.setattr(dbx, "reconcile", lambda targets, *a, **k: seen.append(targets))
+    with contract_source(tmp_path / "capacity" / "contract.fluid.yaml"):
+        dbx._declare_keys(contract, lambda line: None)
+    assert seen == [[]]

@@ -1574,7 +1574,13 @@ def _declare_keys(
         compiled = _compile(contract, os.environ)
         if compiled.refusals:
             return  # the hooks that gate have refused already
-        targets = [KeyTarget(t.full_name, t.keys) for t in compiled.tables]
+        # A pipeline's table takes keys only in its definition, which forge-cli does not
+        # write yet (``_emit_pipeline_table`` warns); an ALTER on it would fail every apply.
+        targets = [
+            KeyTarget(t.full_name, t.keys)
+            for t in compiled.tables
+            if t.full_name not in compiled.lakeflow_written
+        ]
         reconcile(targets, _text(contract.get("id")), say, client_factory, dry_run=dry_run)
     except Exception as exc:  # noqa: BLE001 — a key never fails the run
         say(f"\n  Unity Catalog keys: not declared ({type(exc).__name__}: {scrub(exc)}).")
@@ -1880,6 +1886,12 @@ def _emit_pipeline_table(
                     "precondition": [_schema_holds_only(compiled, table, schema_key, catalog_name)]
                 }
     _emit_schema_tags(compiled, table, cid, contract)
+    if table.keys is not None and (table.keys.primary or table.keys.references):
+        compiled.warnings.append(
+            f"{table.where} is written by a lakeflow build, and its primary and foreign keys "
+            "are not declared: a Lakeflow pipeline's table takes them only in its definition, "
+            "which forge-cli does not write yet."
+        )
     return tofu_ref(f"databricks_schema.{schema_key}.name")
 
 
