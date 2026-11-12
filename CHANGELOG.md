@@ -51,6 +51,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   script needs a SQL warehouse that runs SQL scripting. A dbt build that
   `--mode amend-and-build` runs locally is followed by the same re-declaration.
 
+- **Databricks: a Unity Catalog metric view from each expose's `semantics` block.** `fluid apply`
+  creates `<catalog>.<schema>.<semantics.name>` (`<table>_semantic_model` when the model has no
+  name) beside the table, in the product's own schema, as metric view YAML 1.1, so Genie, AI/BI
+  dashboards and SQL (`SELECT country_code, MEASURE(site_count) ... GROUP BY ALL`) read the
+  contract's semantic model natively. Entities and dimensions become dimensions (a time
+  dimension at its `timeGranularity`); a measure is its aggregate; a simple metric is that
+  aggregate with its filter as `FILTER (WHERE ...)`; a ratio is `MEASURE(numerator) /
+  NULLIF(MEASURE(denominator), 0)`; a `nonAdditiveDimension` is a window measure
+  (`semiadditive: last` for `max`, `first` for `min`). Descriptions become comments, a column's
+  `businessName` the dimension's `display_name` and its `labels.synonyms` its synonyms; the
+  model's `ai-synonyms` and `ai-instructions` labels go into the view's comment. `SELECT` on the
+  view goes to exactly the principals that may read the table. The provider has no metric view
+  resource (terraform-provider-databricks#4827), so the view is created on the SQL warehouse after
+  `tofu apply`, like the column masks: `CREATE VIEW` when it is missing, `ALTER VIEW ... AS` (which
+  keeps its grants) when its definition changed, nothing when it did not, and `DROP VIEW` once the
+  contract no longer declares it. `--mode dry-run` prints every statement. What metric view YAML
+  cannot express is refused at `fluid validate`, not approximated: derived metrics, a ratio with
+  a filter, a non-additive dimension that is no time dimension, `hour` or `minute` on a `DATE`,
+  colliding names. Verified live on Databricks Free Edition with the semantics block of an
+  industry-model gold product (`HONESTLY_TESTED.md`).
+
 ### Changed
 
 - **Keys for two or more providers stop the run, even with Ollama running.** With
@@ -62,6 +83,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path exits 1 where it used to write a template instead. A `fluid ai setup`
   choice and a single keyring key still come first, and `GEMINI_API_KEY` with `GOOGLE_API_KEY` is
   one provider. Pick one with `--llm-provider` or `FLUID_LLM_PROVIDER`.
+- **`fluid apply` on a Databricks contract with `exposes[].semantics` needs the `[databricks]`
+  extra** (databricks-sdk), which creates the metric view, and refuses before `tofu apply` when it
+  is missing, as it does for column masks. A semantics block the metric view cannot hold (a
+  derived metric, say) now fails `fluid validate` for a Databricks binding.
+- The MCP query compiler and the Databricks metric view render a measure's aggregate through one
+  helper (`forge_datamodel/semantics_builder.py::aggregate_call`); the compiler's SQL and errors
+  are unchanged.
 
 ### Fixed
 
