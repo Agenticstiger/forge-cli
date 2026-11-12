@@ -38,8 +38,8 @@ def _fluid_invocation() -> list[str]:
 def _parse_jsonl_events(stdout: str) -> list[dict]:
     """Filter stdout for lines that parse as JSON and look like our events.
 
-    Rich banners and other non-JSON noise on stdout are silently ignored —
-    matches what the agent's parser will do.
+    Lenient on purpose, as a defensive agent parser is; that stdout holds
+    nothing else is asserted by ``_json_lines_only`` (section 7).
     """
     events: list[dict] = []
     for line in stdout.splitlines():
@@ -535,3 +535,127 @@ def test_agent_ai_mode_expands_a_tilde_target_dir(tmp_path, capsys, monkeypatch)
 
     contract = (home / "prod" / "contract.fluid.yaml").resolve()
     assert [(e["path"], e["action"]) for e in written] == [(str(contract), "created")]
+
+
+# ---------------------------------------------------------------------------
+# 7. stdout carries the JSON-Lines events and nothing else (AGENT_IDE.md)
+# ---------------------------------------------------------------------------
+
+
+def _json_lines_only(stdout: str) -> list[dict]:
+    """Every stdout line is one JSON event object, or the test fails on that line."""
+    events: list[dict] = []
+    for line in stdout.splitlines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            pytest.fail(f"non-JSON line on --agent stdout: {line!r}\nstdout:\n{stdout}")
+        assert isinstance(obj, dict) and isinstance(obj.get("event"), str), line
+        events.append(obj)
+    assert events, "no events on stdout"
+    return events
+
+
+def _hermetic_env(tmp_path: Path) -> dict:
+    """The process env with no LLM keys, an empty home and no OS keyring."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.endswith("_API_KEY") and not k.startswith(("FLUID_LLM_", "FLUID_FORGE_"))
+    }
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    env.update(HOME=str(home), PYTHON_KEYRING_BACKEND="keyring.backends.null.Keyring")
+    return env
+
+
+def test_agent_blank_stdout_is_json_lines_only(tmp_path: Path):
+    """The real wire format: the human panels move to stderr, not off the run."""
+    out = tmp_path / "product"
+    proc = subprocess.run(
+        [*_fluid_invocation(), "--agent", "--blank", "--data-product-type", "SDP", "-d", str(out)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=_hermetic_env(tmp_path),
+    )
+    assert proc.returncode == 0, proc.stderr
+    names = [e["event"] for e in _json_lines_only(proc.stdout)]
+    assert names[0] == "forge.start" and names[-1] == "forge.done"
+    assert "forge.contract_written" in names
+    assert "Forge Complete" in proc.stderr
+
+
+def test_agent_ai_stdout_is_json_lines_only(tmp_path, capsys, monkeypatch):
+    """AI mode with the generation seam mocked: what it and forge print goes to stderr.
+
+    The fake prints the way the AI path does: a Rich ``Console()`` built in its
+    own module, a plain ``print`` (a provider SDK's banner), and forge's own
+    success output afterwards.
+    """
+    from rich.console import Console
+    from rich.panel import Panel
+
+    from fluid_build.cli import forge as forge_mod
+
+    product = tmp_path / "product"
+
+    def _fake_ai(args, logger):
+        Console().print(Panel("Contract drafted by the copilot", title="Forge Complete"))
+        print("Give Feedback / Get Help: provider SDK banner")
+        product.mkdir(parents=True, exist_ok=True)
+        (product / "contract.fluid.yaml").write_text("fluidVersion: 0.7.6\n")
+        return 0
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(forge_mod, "run_ai_copilot_mode", _fake_ai)
+    monkeypatch.setattr(
+        "builtins.input", lambda *a, **k: pytest.fail("input() called under --agent")
+    )
+    args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
+    assert forge_mod.run(args, logging.getLogger("test")) == 0
+
+    captured = capsys.readouterr()
+    events = _json_lines_only(captured.out)
+    names = [e["event"] for e in events]
+    assert names[0] == "forge.start" and names[-1] == "forge.done"
+    assert "forge.contract_written" in names
+    assert "Contract drafted by the copilot" in captured.err
+    assert "provider SDK banner" in captured.err
+
+
+def _raise_missing_litellm(args, logger):
+    from fluid_build._optional import MissingOptionalDependency
+
+    raise MissingOptionalDependency("litellm", "litellm", "AI-assisted authoring")
+
+
+def test_agent_missing_extra_still_propagates_in_process(tmp_path, capsys, monkeypatch):
+    """An in-process caller (the MCP ``forge_run``) gets the exception, after forge.done."""
+    from fluid_build._optional import MissingOptionalDependency
+    from fluid_build.cli import forge as forge_mod
+
+    monkeypatch.setattr(forge_mod, "run_ai_copilot_mode", _raise_missing_litellm)
+    args = _agent_args(["--llm-provider", "openai"], tmp_path)
+    with pytest.raises(MissingOptionalDependency):
+        forge_mod.run(args, logging.getLogger("test"))
+
+    events = _json_lines_only(capsys.readouterr().out)
+    assert events[-1]["event"] == "forge.done"
+    assert events[-1]["exit_code"] == 1
+
+
+def test_agent_missing_extra_remedy_goes_to_stderr(tmp_path, capsys, monkeypatch):
+    """Through the CLI entry point: the install line on stderr, stdout events only, exit 1."""
+    from fluid_build.cli import forge as forge_mod
+    from fluid_build.cli import main as cli_main
+
+    monkeypatch.setattr(forge_mod, "run_ai_copilot_mode", _raise_missing_litellm)
+    argv = ["forge", "--agent", "--llm-provider", "openai", "-d", str(tmp_path / "product")]
+    assert cli_main(argv) == 1
+
+    captured = capsys.readouterr()
+    events = _json_lines_only(captured.out)
+    assert events[-1]["event"] == "forge.done"
+    assert "pip install 'data-product-forge[litellm]'" in captured.err

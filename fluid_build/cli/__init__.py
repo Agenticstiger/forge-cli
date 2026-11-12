@@ -301,8 +301,14 @@ def _render_missing_optional(e: Any, args: argparse.Namespace, context: Any, cli
             "exit_code": e.exit_code,
         },
     )
-    context.console.print(literal_text(_redact_error_str(f"❌ {e}"), "red"))
-    context.console.print(literal_text(f"[{slug}]", "dim"))
+    import contextlib
+
+    # ``fluid forge --agent``: stdout carries the JSON-Lines events only, so the
+    # remedy goes to stderr with the rest of the run's human output.
+    agent = getattr(args, "agent", False)
+    with contextlib.redirect_stdout(sys.stderr) if agent else contextlib.nullcontext():
+        context.console.print(literal_text(_redact_error_str(f"❌ {e}"), "red"))
+        context.console.print(literal_text(f"[{slug}]", "dim"))
     return int(e.exit_code)
 
 

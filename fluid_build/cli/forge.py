@@ -14,6 +14,7 @@ First-time project setup lives in ``fluid init``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import json
 import logging
@@ -1251,23 +1252,31 @@ def _print_next_steps(console: Any, target_dir: Path, contract_path: Path) -> No
 # event stream over stdout lets the agent parse progress (start / done /
 # contract_written / cost) without scraping Rich console output.
 #
-# Design choice: events go to stdout AS WHOLE JSON OBJECTS PER LINE so the
-# agent's parser is ``for line in stdout: try: obj = json.loads(line);
-# except: pass``. Rich's banners on stdout don't parse as JSON, so they're
-# harmlessly ignored. No need to mute Rich (which would break user-facing
-# UX outside ``--agent``).
+# Design choice: stdout carries the events and nothing else, one whole JSON
+# object per line (NDJSON, as AGENT_IDE.md promises), so the agent's parser
+# is ``for line in stdout: json.loads(line)``. ``run`` keeps the real stdout
+# for the events and points ``sys.stdout`` at stderr for the rest of the run
+# (``contextlib.redirect_stdout``, as the MCP ``forge_run`` dispatch does), so
+# every human-facing writer moves without being touched: Rich consoles built
+# without ``file=`` (Rich looks ``sys.stdout`` up at each write), ``print``,
+# and a provider SDK's banner. Outside ``--agent`` nothing changes.
+
+#: Where ``--agent`` events go while ``run`` points ``sys.stdout`` at stderr:
+#: the stdout the run started with. ``None`` outside an ``--agent`` run.
+_AGENT_EVENTS: Optional[Any] = None
 
 
 def _emit_agent_jsonl(event: str, **kvs: Any) -> None:
-    """Emit one canonical JSON-Lines event to stdout for agent consumption.
+    """Emit one canonical JSON-Lines event on the run's real stdout for the agent.
 
     Only used when ``--agent`` is active; callers gate via ``args.agent``.
     Failures are swallowed so a stdout pipe-closed never poisons the run.
     """
     try:
+        stream = _AGENT_EVENTS or sys.stdout
         payload = {"event": event, "ts": time.time(), **kvs}
-        sys.stdout.write(json.dumps(payload, default=str) + "\n")
-        sys.stdout.flush()
+        stream.write(json.dumps(payload, default=str) + "\n")
+        stream.flush()
     except Exception:  # noqa: BLE001
         pass
 
@@ -1492,26 +1501,35 @@ def run(args, logger: logging.Logger) -> int:
             )
         )
     )
-    _emit_agent_jsonl(
-        "forge.start",
-        run_id=run_id,
-        mode=mode,
-        data_product_type=getattr(args, "data_product_type", None),
-        target_dir=str(getattr(args, "target_dir", None) or ""),
-        emit_plan=bool(getattr(args, "emit_plan", False)),
-    )
+    global _AGENT_EVENTS  # noqa: PLW0603 — one run at a time, reset below
+    _AGENT_EVENTS = sys.stdout
     rc = 1
     try:
-        rc = _run_main(args, logger)
-        # On success, optionally emit the structured plan checklist BEFORE
-        # forge.done so consumers parsing the stream see the plan in order.
-        if rc == 0 and getattr(args, "emit_plan", False):
-            target_dir = getattr(args, "target_dir", None)
-            contract_path = Path(target_dir) / "contract.fluid.yaml" if target_dir else None
-            _emit_forge_plan(args, contract_path)
-        return rc
+        # Everything a human reads goes to stderr; the events keep stdout.
+        with contextlib.redirect_stdout(sys.stderr):
+            _emit_agent_jsonl(
+                "forge.start",
+                run_id=run_id,
+                mode=mode,
+                data_product_type=getattr(args, "data_product_type", None),
+                target_dir=str(getattr(args, "target_dir", None) or ""),
+                emit_plan=bool(getattr(args, "emit_plan", False)),
+            )
+            # A missing extra still propagates, as it always has: the CLI entry
+            # point says the remedy on stderr under --agent
+            # (``cli._render_missing_optional``), and an in-process caller
+            # (the MCP ``forge_run``) gets the exception itself.
+            rc = _run_main(args, logger)
+            # On success, optionally emit the structured plan checklist BEFORE
+            # forge.done so consumers parsing the stream see the plan in order.
+            if rc == 0 and getattr(args, "emit_plan", False):
+                target_dir = getattr(args, "target_dir", None)
+                contract_path = Path(target_dir) / "contract.fluid.yaml" if target_dir else None
+                _emit_forge_plan(args, contract_path)
+            return rc
     finally:
         _emit_agent_jsonl("forge.done", run_id=run_id, exit_code=int(rc or 0))
+        _AGENT_EVENTS = None
 
 
 #: Per-process flag for the personal-memory sanitiser.  See
