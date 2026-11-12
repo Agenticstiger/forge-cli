@@ -35,8 +35,8 @@ from unittest import mock
 
 import pytest
 
+import fluid_build.cli.ai_setup as ai_setup
 import fluid_build.llm.providers as providers
-from fluid_build.llm.providers import CopilotGenerationError, LlmConfig
 
 pytestmark = pytest.mark.unit
 
@@ -89,7 +89,6 @@ class _World:
 @pytest.fixture
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[_World]:
     import fluid_build._ai_config_shared as ai_config
-    import fluid_build.cli.ai_setup as ai_setup
 
     for var in _VARS:
         monkeypatch.delenv(var, raising=False)
@@ -141,7 +140,7 @@ def test_two_keys_never_fall_through_to_a_running_ollama(world: _World) -> None:
     env = world.env(**_TWO_KEYS)
 
     assert providers._provider_name_from(_args(), env) is None
-    with pytest.raises(CopilotGenerationError) as info:
+    with pytest.raises(providers.CopilotGenerationError) as info:
         providers.resolve_llm_config(_args(), env)
     assert info.value.event == "copilot_no_llm_provider"
     assert "OPENAI_API_KEY, ANTHROPIC_API_KEY" in info.value.message
@@ -220,30 +219,24 @@ def test_a_named_provider_is_unaffected(world: _World) -> None:
 
 def test_setup_does_not_pick_github_from_its_key(world: _World) -> None:
     # It used to pick github here, then raise KeyError: 'github' building it.
-    from fluid_build.cli.ai_setup import run_ai_setup_inline
-
     world.monkeypatch.setenv("GITHUB_API_KEY", GITHUB_KEY)
 
-    assert run_ai_setup_inline(None) is None
+    assert ai_setup.run_ai_setup_inline(None) is None
 
 
 def test_setup_still_reads_one_provider_s_key(world: _World) -> None:
-    from fluid_build.cli.ai_setup import run_ai_setup_inline
-
     world.monkeypatch.setenv("GITHUB_API_KEY", GITHUB_KEY)
     world.monkeypatch.setenv("ANTHROPIC_API_KEY", ANTHROPIC_KEY)
 
-    config = run_ai_setup_inline(None)
+    config = ai_setup.run_ai_setup_inline(None)
 
     assert (config.provider, config.api_key) == ("anthropic", ANTHROPIC_KEY)
 
 
 def test_setup_reads_the_gemini_alias_like_the_resolver(world: _World) -> None:
-    from fluid_build.cli.ai_setup import run_ai_setup_inline
-
     world.monkeypatch.setenv("GEMINI_API_KEY", GEMINI_KEY)
 
-    config = run_ai_setup_inline(None)
+    config = ai_setup.run_ai_setup_inline(None)
 
     assert (config.provider, config.api_key) == ("gemini", GEMINI_KEY)
 
@@ -259,25 +252,21 @@ def test_init_does_not_count_github_s_key_as_ai_configured(world: _World) -> Non
 def test_interactive_setup_names_two_keys_and_picks_neither(world: _World) -> None:
     from rich.console import Console
 
-    from fluid_build.cli.ai_setup import run_ai_setup_inline
-
     for name, value in _TWO_KEYS.items():
         world.monkeypatch.setenv(name, value)
     out = io.StringIO()
 
-    assert run_ai_setup_inline(Console(file=out, width=250)) is None
+    assert ai_setup.run_ai_setup_inline(Console(file=out, width=250)) is None
     assert "OPENAI_API_KEY, ANTHROPIC_API_KEY are all set" in out.getvalue()
 
 
 def test_setup_lets_one_keyring_key_break_the_tie_as_the_ladder_does(world: _World) -> None:
     # Without a TTY the one keyring key selects gemini; setup must agree.
-    from fluid_build.cli.ai_setup import run_ai_setup_inline
-
     for name, value in _TWO_KEYS.items():
         world.monkeypatch.setenv(name, value)
     world.keyring["gemini"] = GEMINI_KEY
 
-    config = run_ai_setup_inline(None)
+    config = ai_setup.run_ai_setup_inline(None)
 
     assert (config.provider, config.api_key) == ("gemini", GEMINI_KEY)
     assert providers.check_llm_readiness(dict(os.environ)).provider == "gemini"
@@ -294,9 +283,7 @@ def test_init_s_check_agrees_with_setup_on_two_keys(world: _World) -> None:
     assert _is_ai_configured() is True  # setup would use gemini
 
 
-def _ai_test(**flags: object) -> Tuple[Optional[LlmConfig], Optional[str]]:
-    from fluid_build.cli.ai_setup import _resolve_ai_test_config
-
+def _ai_test(**flags: object) -> Tuple[Optional[providers.LlmConfig], Optional[str]]:
     values = {
         "llm_provider": None,
         "llm_model": None,
@@ -304,7 +291,7 @@ def _ai_test(**flags: object) -> Tuple[Optional[LlmConfig], Optional[str]]:
         "llm_timeout_seconds": None,
     }
     values.update(flags)
-    return _resolve_ai_test_config(Namespace(**values))
+    return ai_setup._resolve_ai_test_config(Namespace(**values))
 
 
 def test_ai_test_does_not_pick_github_from_its_key(world: _World) -> None:
@@ -351,13 +338,15 @@ def test_ai_test_lets_one_keyring_key_break_the_tie(world: _World) -> None:
 # ── 3. interactive forge and init: what the operator states wins ────────────
 
 
-def _openai_setup_pick() -> LlmConfig:
+def _openai_setup_pick() -> providers.LlmConfig:
     """What inline setup returns for a saved OpenAI choice with its keyring key."""
-    return LlmConfig(provider="openai", model="gpt-saved-test", endpoint="", api_key=OPENAI_KEY)
+    return providers.LlmConfig(
+        provider="openai", model="gpt-saved-test", endpoint="", api_key=OPENAI_KEY
+    )
 
 
-def _claude_code_setup_pick() -> LlmConfig:
-    return LlmConfig(
+def _claude_code_setup_pick() -> providers.LlmConfig:
+    return providers.LlmConfig(
         provider="claude-code",
         model="claude-code",
         endpoint="coding-agent://claude-code",
@@ -366,7 +355,7 @@ def _claude_code_setup_pick() -> LlmConfig:
 
 
 def _interactive_forge(
-    world: _World, tmp_path: Path, pick: LlmConfig, **flags: object
+    world: _World, tmp_path: Path, pick: providers.LlmConfig, **flags: object
 ) -> Tuple[Optional[Namespace], List[str], List[str]]:
     """Run interactive ``fluid forge`` in AI mode with setup returning *pick*.
 
@@ -386,7 +375,7 @@ def _interactive_forge(
         seen["args"] = args
         return 0
 
-    def _setup(_console: object) -> LlmConfig:
+    def _setup(_console: object) -> providers.LlmConfig:
         setup_calls.append("setup")
         return pick
 
@@ -487,7 +476,7 @@ def test_setup_keeps_the_model_and_endpoint_variables(world: _World, tmp_path: P
 
 
 def test_setup_fills_what_the_run_leaves_unstated(world: _World, tmp_path: Path) -> None:
-    pick = LlmConfig(
+    pick = providers.LlmConfig(
         provider="openai",
         model="gpt-saved-test",
         endpoint="https://saved.example.test/v1",
@@ -516,7 +505,7 @@ def test_setup_s_agent_never_takes_a_stated_endpoint(world: _World, tmp_path: Pa
     assert setup_calls == ["setup"]
     assert ran.llm_provider is None
     assert ran.llm_endpoint == ONPREM
-    with pytest.raises(CopilotGenerationError) as info:
+    with pytest.raises(providers.CopilotGenerationError) as info:
         providers.resolve_llm_config(ran, world.env())
     assert info.value.event == "copilot_no_llm_provider"
     assert "saved claude-code" in info.value.message
@@ -540,7 +529,7 @@ def test_named_llm_provider_reads_the_flag_then_the_variables(world: _World) -> 
 
 
 def _init_ai_mode(
-    world: _World, tmp_path: Path, pick: LlmConfig
+    world: _World, tmp_path: Path, pick: providers.LlmConfig
 ) -> Tuple[Optional[Namespace], List[str]]:
     """``fluid init``'s AI path with setup returning *pick*; the copilot is stubbed."""
     from fluid_build.cli import init as init_mod
@@ -553,7 +542,7 @@ def _init_ai_mode(
         seen["args"] = args
         return 1  # no success panel
 
-    def _setup(_console: object) -> LlmConfig:
+    def _setup(_console: object) -> providers.LlmConfig:
         setup_calls.append("setup")
         return pick
 
