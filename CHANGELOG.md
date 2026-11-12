@@ -188,12 +188,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     declared key and about a freshness or completeness SLO there.
   - `fluid apply --mode amend-and-build` starts an update and waits for it
     (`replace-and-build`: a full refresh), then prints each rule's counts from the pipeline's
-    event log. A failed update fails the apply with its error. `amend` and `create-only` only
-    provision. A continuous pipeline is not started, but its tags are set once its table
-    exists. A tag the contract no longer declares is removed when the deploying identity set
-    it, so a steward's tag stays. A triggered pipeline does not retry a failed update
-    (`pipelines.numUpdateRetryAttempts` is 0; Lakeflow's default is five), since the same rows
-    would fail the same rule.
+    event log. A failed update fails the apply with its error, less the row a failed
+    expectation quotes. `amend` and `create-only` only provision. A continuous pipeline is not
+    started, but its tags are set once its table exists. A tag the contract no longer declares
+    is removed when the deploying identity set it, so a steward's tag stays. A triggered
+    pipeline does not retry a failed update (`pipelines.numUpdateRetryAttempts` is 0;
+    Lakeflow's default is five), since the same rows would fail the same rule.
   - Removing a pipeline needs `--allow-data-loss`: deleting a pipeline can delete its tables.
 
 ### Changed

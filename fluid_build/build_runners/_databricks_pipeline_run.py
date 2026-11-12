@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import time
 from contextlib import contextmanager
@@ -91,6 +92,12 @@ _READ_ATTEMPTS = 5
 #: Event-log pages read for one update, newest first (250 events each).
 _EVENT_PAGES = 20
 _ERRORS_SHOWN = 3
+#: Where a failed expectation's error starts quoting the record that failed it. Databricks'
+#: EXPECTATION_VIOLATION text reads "... Violated expectations: '<rule>'. Input data: '{...}'.
+#: Output record: '{...}'. Missing input data: false": a row of the table, or of what its query
+#: read, which a terminal or a CI log must not carry (more people read those than the table,
+#: and a pipeline's table takes no column masks yet).
+_RECORD_RE = re.compile(r"\b(?:input data|output record|missing input data)\s*:", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -521,7 +528,8 @@ def _report_quality(events: Sequence[Mapping[str, Any]], compiled: Any, say: Say
 
 
 def _errors(events: Sequence[Mapping[str, Any]]) -> List[str]:
-    """The update's ERROR events, oldest first, cleaned for printing."""
+    """The update's ERROR events, oldest first, cleaned for printing, without the record a
+    failed expectation quotes (:data:`_RECORD_RE`)."""
     out = []
     for event in events:
         if str(event.get("level") or "") != "ERROR":
@@ -533,8 +541,18 @@ def _errors(events: Sequence[Mapping[str, Any]]) -> List[str]:
                 text += " - " + " ".join(clean(exception["message"]).split())
                 break
         if text:
-            out.append(text[:600])
+            out.append(_without_record(text)[:600])
     return out
+
+
+def _without_record(text: str) -> str:
+    found = _RECORD_RE.search(text)
+    if found is None:
+        return text
+    return (
+        f"{text[: found.start()].rstrip()} (the record is not printed here: the update's event "
+        "log on the pipeline's page shows it)"
+    )
 
 
 def _identity(api: Any) -> Optional[str]:

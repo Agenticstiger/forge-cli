@@ -532,6 +532,41 @@ def test_failed_update_says_the_error_and_sets_no_tags(compiled, capsys):
     assert api.paths("GET", "entity-tag-assignments") == []
 
 
+def test_a_failed_expectation_s_record_is_not_printed(compiled, capsys):
+    """Databricks' EXPECTATION_VIOLATION error quotes the row that failed it (the documented
+    shape below): the flow and the rule are printed, the row is not."""
+    row = '{"site_id":"S-0042","owner_email":"someone@example.com"}'
+    violation = (
+        "[EXPECTATION_VIOLATION.VERBOSITY_ALL] Flow 'capacity' failed to meet the expectation. "
+        f"Violated expectations: 'capacity_site_complete'. Input data: '{row}'. "
+        f"Output record: '{row}'. Missing input data: false"
+    )
+    events = [
+        {
+            "level": "ERROR",
+            "message": "Flow 'capacity' has FAILED fatally.",
+            "event_type": "flow_progress",
+            "origin": {"update_id": "u1"},
+            "error": {"exceptions": [{"message": violation}]},
+        },
+        {
+            "level": "ERROR",
+            "message": f"Update u1 is FAILED. output record: {row}",
+            "event_type": "update_progress",
+            "origin": {"update_id": "u1"},
+        },
+        {"event_type": "create_update", "origin": {"update_id": "u1"}},
+    ]
+    api = _Api(["RUNNING", "FAILED"], events=events)
+    rc, lines = _wait(api, compiled)
+    text = _text(lines, capsys)
+
+    assert rc == 1
+    assert "Violated expectations: 'capacity_site_complete'." in text
+    assert "someone@example.com" not in text and "S-0042" not in text
+    assert text.count("the record is not printed here") == 2
+
+
 # 6. tags after a completed update ---------------------------------------------
 def test_tags_are_set_changed_removed_and_left_alone(compiled):
     """Declared tags are set; an undeclared tag the deploying identity set is removed (a
