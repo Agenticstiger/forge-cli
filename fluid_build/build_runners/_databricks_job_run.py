@@ -406,9 +406,9 @@ def _queued_behind(api: Any, job_id: int, run_id: int) -> str:
         return ""
     runs = listed.get("runs") if isinstance(listed, Mapping) else None
     others = [
-        r.get("run_id")
-        for r in runs or []
-        if isinstance(r, Mapping) and r.get("run_id") not in (None, run_id)
+        other
+        for other in (_whole(r.get("run_id")) for r in runs or [] if isinstance(r, Mapping))
+        if other and other != run_id
     ]
     if others:  # newest first: the last one started first
         return f"behind run {others[-1]} of this job, which runs one at a time"

@@ -620,3 +620,13 @@ def test_the_task_error_is_one_line(capsys) -> None:
     assert (
         "task 'dbt': Command 'dbt build --select orders else exit 1 fi ' returned non-zero" in out
     )
+
+
+def test_a_run_id_from_the_list_is_printed_as_a_number_only(capsys) -> None:
+    api = _Api(
+        [_run("QUEUED"), _run("TERMINATED", code="SUCCESS")],
+        active=[{"run_id": "\x1b[2J12"}, {"run_id": 77}],
+    )
+    rc, out = _go(api, capsys)
+    assert rc == 0 and "\x1b" not in out
+    assert "waiting for the workspace's limit" in out  # nothing but a number counts as a run
