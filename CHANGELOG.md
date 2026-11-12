@@ -78,6 +78,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path exits 1 where it used to write a template instead. A `fluid ai setup`
   choice and a single keyring key still come first, and `GEMINI_API_KEY` with `GOOGLE_API_KEY` is
   one provider. Pick one with `--llm-provider` or `FLUID_LLM_PROVIDER`.
+- **Databricks: Unity Catalog tag values are written as the contract states them.** The
+  governance labels became tags with GCP's label slugs: lowercased, spaces and punctuation
+  turned into `-`, cut at 63 characters (`business_value =
+  'a-single-unrenewed-ground-lease-can-strand-a-multi-tenant-tower'`, `fluid_jurisdiction =
+  'us'`). A tag value takes up to 256 characters with case, spaces and punctuation, so the value
+  is now the contract's text less surrounding whitespace, and `fluid_regulation` joins the
+  frameworks with `, ` (`GDPR, CCPA`). A longer value is refused as
+  `databricks-tag-value-too-long` rather than cut. Tag keys are unchanged (each `-` still
+  becomes `_`), and GCP labels and AWS tags keep the label alphabet.
+  **On an existing deployment** the next `fluid apply` updates each changed
+  `databricks_entity_tag_assignment` in place (`~`; `tag_value` has no replace modifier in the
+  pinned provider, 1.140.0): no table, schema or data is replaced or destroyed, and no
+  `--allow-data-loss` is needed. Until that apply, `fluid verify` reports the old values as tag
+  drift. On Free Edition, a product carrying the old values planned `+0 ~17 -0`.
 
 ### Fixed
 

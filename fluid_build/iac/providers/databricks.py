@@ -38,9 +38,12 @@ resources, with no new schema field (fluid-schema 0.7.6):
   residency), are Unity Catalog tags: one ``databricks_entity_tag_assignment`` per
   tag on each owned schema (the contract's own) and each table (the expose's too).
   A tag key may not contain ``-``, so each ``-`` becomes ``_``
-  (``data-classification`` is ``data_classification``); two labels that meet at one
-  key are ``databricks-tag-collision`` and more than the 50 tags a securable holds is
-  ``databricks-tags-too-many``, refused rather than overwritten or dropped. An
+  (``data-classification`` is ``data_classification``). A value is written as the
+  contract states it, less surrounding whitespace: a tag value keeps case, spaces and
+  punctuation, so it is not the lowercase slug the GCP label alphabet makes of it. Two
+  labels that meet at one key are ``databricks-tag-collision``, a value longer than 256
+  characters is ``databricks-tag-value-too-long`` and more than the 50 tags a securable
+  holds is ``databricks-tags-too-many``, refused rather than overwritten, cut or dropped. An
   existing assignment is imported best-effort before the first apply, and removing a
   label destroys only its assignment, which holds no data. Whether a tag survives a
   dbt ``CREATE OR REPLACE`` is undocumented, so ``fluid verify`` is the gate.
@@ -1768,12 +1771,14 @@ def _uc_tags(
     tags (the product's identity, :func:`_product_tags`), or ``{}`` and a refusal.
 
     ``governance_labels`` keys are ``[a-z0-9_-]``, and a tag key may not contain
-    ``-``, so each ``-`` becomes ``_``; the values go as they are. Two labels that
-    meet at one key, a label that meets one of the module's own keys, or more tags
-    than a securable holds, are refused: the module would otherwise overwrite one tag
-    with another, or drop some without a word.
+    ``-``, so each ``-`` becomes ``_``. The values go as the contract writes them, less
+    surrounding whitespace (``verbatim_values``): a tag value keeps case, spaces and
+    punctuation, so it is not cut to GCP's label alphabet. Two labels that meet at one
+    key, a label that meets one of the module's own keys, a value longer than a tag
+    value holds, or more tags than a securable holds, are refused: the module would
+    otherwise overwrite one tag with another, cut one, or drop some without a word.
     """
-    labels = governance_labels(contract, exposure, limit=None)
+    labels = governance_labels(contract, exposure, limit=None, verbatim_values=True)
     # The certification label is Unity Catalog's certification tag, not a tag of its own.
     labels.pop(CERTIFICATION_LABEL, None)
     tags: Dict[str, str] = dict(own or {})
@@ -1796,6 +1801,9 @@ def _uc_tags(
                 )
             )
             return {}
+        if len(value) > _MAX_TAG_VALUE:
+            refusals.append(_too_long(f"{where}: the governance label {label!r}", value, key))
+            continue
         tags[key] = value
         source[key] = label
     if len(tags) > _MAX_TAGS:
@@ -1813,6 +1821,16 @@ def _uc_tags(
         )
         return {}
     return tags
+
+
+def _too_long(what: str, value: str, key: str) -> UnsupportedBindingError:
+    """``databricks-tag-value-too-long``: ``value`` (``what``) would be cut as tag ``key``."""
+    return _refusal(
+        "tag-value-too-long",
+        f"{what} is {len(value)} characters, and a Unity Catalog tag value holds at most "
+        f"{_MAX_TAG_VALUE}, so tag {key} would be cut.",
+        f"Shorten it to {_MAX_TAG_VALUE} characters or fewer.",
+    )
 
 
 def _lookup(document: Mapping[str, Any], path: str) -> Any:
@@ -1874,14 +1892,7 @@ def _product_tags(
         if not value:
             continue
         if len(value) > _MAX_TAG_VALUE:
-            refusals.append(
-                _refusal(
-                    "tag-value-too-long",
-                    f"{where} is {len(value)} characters, and a Unity Catalog tag value holds "
-                    f"at most {_MAX_TAG_VALUE}, so tag {key} would be cut.",
-                    f"Shorten it to {_MAX_TAG_VALUE} characters or fewer.",
-                )
-            )
+            refusals.append(_too_long(where, value, key))
             continue
         tags[key] = value
     certification = _certification(contract, table, refusals)
