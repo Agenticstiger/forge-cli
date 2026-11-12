@@ -228,8 +228,11 @@ class TestRefusals:
     def test_a_column_differing_only_in_case_is_the_schemas_column(self):
         assert _one(_rule("completeness", "SITE_ID")).column == "site_id"
 
-    def test_a_reference_to_a_product_not_consumed_is_refused(self):
-        assert "consumes[] does not list" in _refused(_rule("valid_values", "site_id"), consumes=[])
+    def test_a_reference_to_a_product_not_consumed_has_no_expose(self):
+        # A source-aligned product consumes nothing: the engine decides whether it can find
+        # the other product's table without an expose (the dbt job cannot, and refuses).
+        check = _one(_rule("valid_values", "site_id"), consumes=[])
+        assert check.reference == Reference("bronze.asset.site_master_v1", None, "site_id")
 
     def test_a_reference_consumed_by_two_exposes_is_refused(self):
         consumes = [

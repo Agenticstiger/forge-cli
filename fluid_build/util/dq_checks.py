@@ -20,8 +20,8 @@ How each rule type reads:
   ``validationRules`` (``enum`` ``"A | B"`` or ``"A,B"``; ``regex``; ``range`` ``">= 0"``,
   ``">= 0 and <= 100"`` or ``"between 0 and 100"``) or as its
   ``labels.references: <product id>.<column>``, the foreign-key convention the Unity Catalog
-  keys read too, naming a product this one lists in ``consumes[]``. Each declaration is a
-  check. A column with none falls back to values the rule itself lists (``"<column> valid
+  keys read too; ``consumes[]`` says which of that product's exposes holds the column. Each
+  declaration is a check. A column with none falls back to values the rule itself lists (``"<column> valid
   values: A, B."`` in its description, as ``fluid test`` reads it); with neither, the rule is
   refused.
 * ``accuracy``: every value of each selected column meets ``<operator> <threshold>``, the bound
@@ -82,11 +82,11 @@ _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 @dataclass(frozen=True)
 class Reference:
-    """Where a value must exist: ``column`` of the table ``expose_id`` of ``product_id``, a
-    product the contract consumes."""
+    """Where a value must exist: ``column`` of a table of ``product_id``. ``expose_id`` is the
+    expose ``consumes[]`` lists that product by, or ``None`` when it does not list it."""
 
     product_id: str
-    expose_id: str
+    expose_id: Optional[str]
     column: str
 
 
@@ -585,7 +585,7 @@ class _Rule:
             f"reads column {name!r}, which declares no allowed values, and the rule lists none",
             f"Declare them on column {name!r}: validationRules [{{type: enum, constraint: "
             "'A | B'}] (or regex, or range), or labels.references: <product id>.<column> for "
-            "a value that must exist in a product this one consumes.",
+            "a value that must exist in another product's column.",
         )
         return []
 
@@ -613,25 +613,18 @@ class _Rule:
                 if c.get("productId") == product_id and c.get("exposeId")
             }
         )
-        if len(exposes) != 1:
-            listed = any(c.get("productId") == product_id for c in self.consumes)
-            why = (
-                f"consumes[] lists {product_id} by {len(exposes)} exposes, so which table holds "
-                "the column is ambiguous"
-                if listed and exposes
-                else (
-                    f"consumes[] lists {product_id} with no exposeId"
-                    if listed
-                    else f"consumes[] does not list {product_id}, so its table is unknown"
-                )
-            )
+        if len(exposes) > 1:
             self.refuse(
-                f"reads column {name!r}, which references {text!r}; {why}",
+                f"reads column {name!r}, which references {text!r}, and consumes[] lists "
+                f"{product_id} by {len(exposes)} exposes ({', '.join(exposes)}), so which table "
+                "holds the column is ambiguous",
                 f"List {product_id} in consumes[] once, with the exposeId of the table that "
                 f"holds {column}.",
             )
             return None
-        return Reference(product_id, exposes[0], column)
+        # Not consumed (a source-aligned product consumes nothing): an engine that finds the
+        # product's table another way can still check it; one that cannot refuses.
+        return Reference(product_id, exposes[0] if exposes else None, column)
 
     def refuse(self, problem: str, fix: str) -> None:
         self.refusals.append(
