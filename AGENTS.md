@@ -354,7 +354,7 @@ example questions in natural language:
 
 ```yaml
 extensions:
-  databricksGenie: {}        # or {title: "Site 360"}
+  databricksGenie: {}        # or {title: "Site 360", parentPath: /genie/asset}
 ```
 
 `fluid apply` creates the space after the tables, masks and row filters, and keeps it in step:
@@ -366,7 +366,17 @@ under their Unity Catalog grants. Prompt matching is never turned on. Only the p
 `SELECT` get `CAN RUN`. An `agentPolicy` that denies `qa` or `analysis`, or allows neither, refuses the space. The space is
 found again by the marker `[fluid-genie:<product id>]` at the end of its description, only in the
 deploying identity's own folder (one anywhere else is left alone), and removing the block trashes
-it. Code: `fluid_build/iac/providers/databricks_genie.py`.
+it.
+
+A product deployed from more than one identity (a laptop and CI) sets `parentPath`: a workspace
+folder that a workspace admin creates, with `CAN_MANAGE` only for those identities. The space is
+made there and adopted only there, so the identities keep one space. One an earlier apply made
+in the identity's own folder is moved in, keeping its conversations. A space inherits its folder's
+permissions, so the folder is the trust boundary. `/Shared` is refused offline, because every
+workspace user holds `CAN_MANAGE` there. The apply also stops, before `tofu`, on a folder that
+does not exist or one where the `users` group can edit or manage. Removing the block leaves a
+space in `parentPath` with a note naming it.
+Code: `fluid_build/iac/providers/databricks_genie.py`.
 
 ---
 

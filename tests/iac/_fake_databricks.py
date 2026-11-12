@@ -115,6 +115,24 @@ def _err(status: int, code: str, msg: str) -> Tuple[int, Dict[str, Any]]:
     return status, {"error_code": code, "message": msg}
 
 
+#: A service principal's application id, the name of its /Users folder.
+_APP_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def _bare(path: str) -> str:
+    """A workspace path as the service reads it back: without the ``/Workspace`` prefix a
+    create accepts and without a trailing ``/`` (measured 2026-11-12)."""
+    if path == "/Workspace" or path.startswith("/Workspace/"):
+        path = path[len("/Workspace") :]
+    return path.rstrip("/") or "/"
+
+
+def _folder_chain(folder: str) -> List[str]:
+    """``folder`` and every folder above it, the root first."""
+    parts = [p for p in folder.split("/") if p]
+    return ["/"] + ["/" + "/".join(parts[: i + 1]) for i in range(len(parts))]
+
+
 # ---------------------------------------------------------------------- SQL interpreter
 def _skip_quoted(s: str, i: int) -> int:
     """Index just past the quoted run (' or `) that starts at ``s[i]``."""
@@ -1055,6 +1073,16 @@ class FakeDatabricks:
         # workspace), and the permissions set on each one directly: {(key, name): level}.
         self.genie_spaces: Dict[str, Dict[str, Any]] = {}
         self.genie_acl: Dict[str, Dict[Tuple[str, str], str]] = {}
+        # Workspace folders' own permissions, {folder: {(key, name): level}}, over the ones a
+        # live workspace starts with (measured 2026-11-12, ``_folder_own_acl``). A folder and a
+        # space inherit every permission of the folders above them.
+        self.folder_acl: Dict[str, Dict[Tuple[str, str], str]] = {}
+        # True: a create or move answers 200 and leaves the space where it was (a service that
+        # stopped reading parent_path, which is Public Preview)
+        self.genie_ignores_parent_path = False
+        # Where a create that names no parent_path puts the space: the deploy user's own folder,
+        # unless a test that switches identities (me_user_name) moves it to the new one's
+        self.genie_default_parent: Optional[str] = None
         # metric views by full name: {"source": table full name, "comment": ...}
         self.metric_views: Dict[str, Dict[str, Any]] = {}
         self._space_seq = 0
@@ -1361,6 +1389,7 @@ class FakeDatabricks:
         a("DELETE", r"/api/2\.0/genie/spaces/([^/]+)", self._genie_trash)
         a("GET", r"/api/2\.0/permissions/genie/([^/]+)", self._genie_get_acl)
         a("PUT", r"/api/2\.0/permissions/genie/([^/]+)", self._genie_put_acl)
+        a("GET", r"/api/2\.0/permissions/directories/([0-9]+)", self._folder_get_acl)
 
     # ------------------------------------------------------------------ handlers
     def _me(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
@@ -1644,10 +1673,14 @@ class FakeDatabricks:
         problem = self._genie_check(b.get("serialized_space"))
         if problem:
             return _err(400, "INVALID_PARAMETER_VALUE", problem)
+        refused = self._genie_parent_refused(b)
+        if refused:
+            return refused
         with self._lock:
             self._space_count += 1
             space_id = f"01f1{self._space_count:028x}"
-            parent = b.get("parent_path") or f"/Users/{_USER}"
+            asked = None if self.genie_ignores_parent_path else b.get("parent_path")
+            parent = _bare(asked or self.genie_default_parent or f"/Users/{_USER}")
             title = b.get("title") or ""
             if self._genie_title_taken(title, parent):
                 # The service keeps titles unique in a folder by suffixing the new one.
@@ -1683,6 +1716,9 @@ class FakeDatabricks:
                 return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Space {space_id} does not exist.")
             if b.get("etag") and b["etag"] != space["etag"]:
                 return _err(409, "ABORTED", "The space was modified; the etag does not match.")
+            refused, b = self._genie_moved(b)
+            if refused:
+                return refused
             if "serialized_space" in b:
                 problem = self._genie_check(b["serialized_space"])
                 if problem:
@@ -1710,39 +1746,111 @@ class FakeDatabricks:
         space_id = m.group(1)
         if space_id not in self.genie_spaces:
             return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Space {space_id} does not exist.")
-        # The creator's and the admins' CAN_MANAGE come from the folders, as on a live
-        # workspace; only what was set on the space itself is direct.
-        acl: List[Dict[str, Any]] = [
-            {
-                "user_name": _USER,
-                "all_permissions": [
-                    {
-                        "permission_level": "CAN_MANAGE",
-                        "inherited": True,
-                        "inherited_from_object": ["/directories/1"],
-                    }
-                ],
-            },
-            {
-                "group_name": "admins",
-                "all_permissions": [
-                    {
-                        "permission_level": "CAN_MANAGE",
-                        "inherited": True,
-                        "inherited_from_object": ["/directories/"],
-                    }
-                ],
-            },
-        ]
-        for (key, name), level in sorted(self.genie_acl[space_id].items()):
-            acl.append(
-                {key: name, "all_permissions": [{"permission_level": level, "inherited": False}]}
-            )
+        # Every level on the space's folder and the folders above it is inherited, as on a live
+        # workspace (the creator's CAN_MANAGE comes from their folder); only what was set on the
+        # space itself is direct.
+        folders = _folder_chain(self.genie_spaces[space_id]["parent_path"])
         return 200, {
             "object_id": f"/genie/{space_id}",
             "object_type": "genie",
-            "access_control_list": acl,
+            "access_control_list": self._acl_doc(folders, self.genie_acl[space_id]),
         }
+
+    # ---- workspace folders: what a Genie space's parent_path must be, and their permissions
+
+    def _folder_own_acl(self, folder: str) -> Dict[Tuple[str, str], str]:
+        """The levels set on ``folder`` itself: ``folder_acl``'s, else the ones a live workspace
+        starts with (measured 2026-11-12): the root grants admins CAN_MANAGE, /Shared grants
+        users CAN_MANAGE, a /Users/<name> folder grants <name> CAN_MANAGE."""
+        if folder in self.folder_acl:
+            return self.folder_acl[folder]
+        if folder == "/":
+            return {("group_name", "admins"): "CAN_MANAGE"}
+        if folder == "/Shared":
+            return {("group_name", "users"): "CAN_MANAGE"}
+        parts = folder.split("/")
+        if len(parts) == 3 and parts[1] == "Users" and parts[2]:
+            key = "service_principal_name" if _APP_ID.fullmatch(parts[2]) else "user_name"
+            return {(key, parts[2]): "CAN_MANAGE"}
+        return {}
+
+    def _is_folder(self, folder: str) -> bool:
+        parts = folder.split("/")
+        home = len(parts) == 3 and parts[1] == "Users" and bool(parts[2])
+        return folder in ("/", "/Shared", "/Users") or home or folder in self.workspace_dirs
+
+    def _folder_id(self, folder: str) -> int:
+        """A folder's object_id: the root's is 0, as on a live workspace."""
+        if folder == "/":
+            return 0
+        with self._lock:
+            return self._object_ids.setdefault(folder, len(self._object_ids) + 1)
+
+    def _acl_doc(
+        self, inherited_from: Sequence[str], direct: Dict[Tuple[str, str], str]
+    ) -> List[Dict[str, Any]]:
+        """``access_control_list`` as the Permissions API answers it: one entry per principal,
+        each level it holds from the folders ``inherited_from`` (the root renders as
+        ``/directories/``, as measured) and the ones set directly."""
+        held: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for folder in inherited_from:
+            source = f"/directories/{self._folder_id(folder) or ''}"
+            for key, level in sorted(self._folder_own_acl(folder).items()):
+                held.setdefault(key, []).append(
+                    {
+                        "permission_level": level,
+                        "inherited": True,
+                        "inherited_from_object": [source],
+                    }
+                )
+        for key, level in sorted(direct.items()):
+            held.setdefault(key, []).append({"permission_level": level, "inherited": False})
+        return [{kind: name, "all_permissions": levels} for (kind, name), levels in held.items()]
+
+    def _folder_get_acl(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        wanted = int(m.group(1))
+        folder = next(
+            (
+                path
+                for path in ("/", "/Shared", *sorted(self.workspace_dirs), *self._object_ids)
+                if self._is_folder(path) and self._folder_id(path) == wanted
+            ),
+            None,
+        )
+        if folder is None:
+            return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Directory {wanted} does not exist.")
+        return 200, {
+            "object_id": f"/directories/{wanted}",
+            "object_type": "directory",
+            "access_control_list": self._acl_doc(
+                _folder_chain(folder)[:-1], self._folder_own_acl(folder)
+            ),
+        }
+
+    def _genie_moved(
+        self, body: Dict[str, Any]
+    ) -> Tuple[Optional[Tuple[int, Any]], Dict[str, Any]]:
+        """A PATCH body with its ``parent_path`` as the service keeps it (no ``/Workspace``, no
+        trailing ``/``; left out by a service that ignores it), or the refusal of one."""
+        refused = self._genie_parent_refused(body)
+        if refused or "parent_path" not in body:
+            return refused, body
+        moved = {**body, "parent_path": _bare(body["parent_path"])}
+        if self.genie_ignores_parent_path:
+            moved.pop("parent_path")
+        return None, moved
+
+    def _genie_parent_refused(self, body: Dict[str, Any]) -> Optional[Tuple[int, Any]]:
+        """A ``parent_path`` the service refuses, as it refuses it (measured 2026-11-12): a
+        relative one with 400, a folder that does not exist (case and all) with 404."""
+        if "parent_path" not in body:
+            return None
+        raw = str(body["parent_path"] or "")
+        if not raw.startswith("/"):
+            return _err(400, "BAD_REQUEST", f"requirement failed: {raw} is not absolute.")
+        if not self._is_folder(_bare(raw)):
+            return _err(404, "NOT_FOUND", f"Tree node with path {_bare(raw)} does not exist")
+        return None
 
     def _genie_put_acl(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
         space_id = m.group(1)
@@ -2085,7 +2193,19 @@ class FakeDatabricks:
                 "size": len(self.workspace_files[path]),
             }
         if path in self.workspace_dirs:
-            return 200, {"path": path, "object_type": "DIRECTORY", "object_id": 1}
+            return 200, {
+                "path": path,
+                "object_type": "DIRECTORY",
+                "object_id": self._folder_id(path),
+            }
+        # The folders a live workspace has from the start, with or without /Workspace.
+        bare = _bare(path) if path.startswith("/") else path
+        if self._is_folder(bare):
+            return 200, {
+                "path": path,
+                "object_type": "DIRECTORY",
+                "object_id": self._folder_id(bare),
+            }
         return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Path ({path}) doesn't exist.")
 
     def _ws_delete(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:

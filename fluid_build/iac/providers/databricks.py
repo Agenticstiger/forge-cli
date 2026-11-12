@@ -110,7 +110,9 @@ resources, with no new schema field (fluid-schema 0.7.6):
   ``agentPolicy`` as instructions. The provider has no Genie space resource, so
   :meth:`DatabricksIacPlugin.converge_output_ports` creates, updates or trashes it through the
   Genie API after the masks and row filters are in place, and finds it again by a marker in its
-  description (``databricks_genie.py``).
+  description (``databricks_genie.py``): in the deploying identity's own folder, or in the
+  workspace folder ``extensions.databricksGenie.parentPath`` names, which a product deployed
+  from more than one identity shares.
 
 * ``binding.location.region`` is the region the workspace is in, declared so a
   contract's ``sovereignty`` policy can check it (``policy/sovereignty.py``

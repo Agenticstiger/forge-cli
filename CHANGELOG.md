@@ -24,11 +24,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finds the space by a `[fluid-genie:<product id>]` marker at the end of its description, in the
   deploying identity's own folder only (a space carrying the marker anywhere else is left alone,
   with a note), and updates it with its `etag`. A second apply changes nothing, and removing the
-  block trashes the space. Deploy a product from one identity (CI, say): a space another
-  identity made is left alone, and that identity makes its own.
+  block trashes the space. Deploy a product from one identity (CI, say), or name a shared folder
+  with `parentPath` (below): a space another identity made in its own folder is left alone.
   `fluid apply --mode dry-run` prints what would change. The space is made through the Genie
   REST API (the `[databricks]` extra), since the databricks/databricks provider has no Genie
   space resource. One space per product; a space over several products is a follow-up.
+
+- **One Genie space for a product deployed from more than one identity.**
+  `extensions.databricksGenie.parentPath` names a workspace folder, such as `/genie/<domain>`.
+  A workspace admin creates it and gives `CAN_MANAGE` only to the identities that deploy the
+  product. `fluid apply` creates the space there and adopts only a space directly in that
+  folder, so a laptop and CI keep one space instead of one each. A space an earlier apply made
+  in the identity's own folder is moved in and keeps its conversations. A copy left there
+  afterwards is trashed. A space inherits its folder's permissions, so the folder is the trust
+  boundary. `fluid validate` refuses anything under `/Shared`: every workspace user holds
+  `CAN_MANAGE` there (measured), so each could read every reader's conversations. `fluid apply`
+  stops before `tofu apply` when the folder is missing or not a folder, when its permissions
+  cannot be read, or when the `users` group holds `CAN_EDIT` or `CAN_MANAGE` on it. Removing the
+  whole block leaves a space in `parentPath` in place, with a note naming it: without the block,
+  the apply no longer knows which folder to trust.
 
 - **Databricks: Unity Catalog primary and foreign keys from the contract.** A column tagged
   `primary-key` (all of them, in schema order, for a composite key; each must be
