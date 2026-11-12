@@ -1210,7 +1210,8 @@ def _log_forge_errors(events: List[Dict[str, Any]], logger: logging.Logger) -> N
     """
     for event in events:
         if event["event"] == "forge.error":
-            logger.warning("forge_run failed: %s: %s", event.get("code"), event.get("message"))
+            # ``%r``: a newline in the message stays one log line, not a forged second.
+            logger.warning("forge_run failed: %s: %r", event.get("code"), event.get("message"))
 
 
 def _run_forge_inproc(

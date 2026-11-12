@@ -845,7 +845,7 @@ def test_mcp_forge_run_logs_the_failure_for_the_server(tmp_path, monkeypatch, ca
         if r.name == "fluid.mcp.forge_run" and r.levelno == logging.WARNING
     ]
     assert logged.getMessage() == (
-        "forge_run failed: mcp_sampling_failed: The IDE refused the request."
+        "forge_run failed: mcp_sampling_failed: 'The IDE refused the request.'"
     )
     assert not getattr(logged, "fluid_console_shown", False)
 
