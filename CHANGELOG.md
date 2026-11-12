@@ -69,6 +69,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     second run.
   - A missing `databricks-sdk` (the `[databricks]` extra) is refused before anything is
     applied.
+- **Keys for two or more providers stop the run, even with Ollama running.** With
+  `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` both set (or one provider's key and `OLLAMA_HOST`) and
+  nothing naming a provider, a run without a TTY skipped both keys and used a running local
+  Ollama, and interactive setup used the first key it found. Forge now stops with
+  `copilot_no_llm_provider` and names the keys, without asking Ollama; interactive setup,
+  `fluid ai test` and `fluid doctor` say the same and use none of them, and `fluid init`'s AI
+  path exits 1 where it used to write a template instead. A `fluid ai setup`
+  choice and a single keyring key still come first, and `GEMINI_API_KEY` with `GOOGLE_API_KEY` is
+  one provider. Pick one with `--llm-provider` or `FLUID_LLM_PROVIDER`.
 
 ### Fixed
 
@@ -114,6 +123,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `forge.contract_written` and the receipt sent another, so the stream named one file twice,
   first by its absolute path and then by its path from the current directory. Only the receipt's
   event is left, as in every other mode.
+- **Interactive `fluid forge` keeps the provider, model and endpoint you state.** Its inline
+  setup put the saved or first-found provider over `--llm-provider`, `--llm-model` and
+  `--llm-endpoint`, and over `FLUID_LLM_PROVIDER`, `FLUID_FORGE_AGENT`, `FLUID_LLM_MODEL` and
+  `FLUID_LLM_ENDPOINT`, so `fluid forge --llm-provider ollama` could call Anthropic. A run that
+  names its provider now skips inline setup and resolves as a run without a TTY does. Otherwise
+  setup fills only what the run leaves unstated, and an agent it finds is not used when the run
+  states an endpoint or a model, or runs the agent loop. The welcome panel and the interview's
+  "What I see" panel name the provider the run uses, not the saved one. `fluid init`'s AI path
+  does the same, and its handoff no longer offers AI setup for a provider named by a variable.
+- **Interactive setup no longer picks GitHub Models from `GITHUB_API_KEY`.** It took any variable
+  in `PROVIDER_ENV_VARS`, so `GITHUB_API_KEY` alone selected github, which setup then failed to
+  build (`KeyError: 'github'`). It now reads the key variables a run without a TTY reads:
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY` or `GEMINI_API_KEY` (it missed the
+  second). GitHub Models stays a provider you name with `--llm-provider github`. `fluid ai test`
+  and `fluid init`'s check for a configured AI follow the same rule.
+- **`fluid ai test` tests the provider `FLUID_LLM_PROVIDER` or `FLUID_FORGE_AGENT` names.** It
+  read only `--llm-provider`, so with `FLUID_LLM_PROVIDER=anthropic` it tested the saved
+  provider, which forge would not use. A provider named this way also gets `FLUID_LLM_API_KEY`,
+  as with the flag. A coding agent or `mcp-sampling` named either way is not tested, and the
+  command now says so, where `claude-code` failed as "Unsupported AI provider 'claude_code'".
 - **A contract that types its text columns `STRING` passes the DuckDB acquisition's schema
   gate.** DuckDB reports every text column as `VARCHAR`, and the gate read `STRING` and `VARCHAR`
   as two types, so a contract written for Spark or Databricks stopped every ingest with "source

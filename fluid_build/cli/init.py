@@ -528,33 +528,41 @@ def run(args, logger: logging.Logger) -> int:
 def _is_ai_configured() -> bool:
     """Return True if a saved AI config (or environment fallback) is usable.
 
-    Mirrors the resolution order in :func:`ai_setup.run_ai_setup_inline`:
-    saved config → cloud provider env vars (including the
-    ``GEMINI_API_KEY`` alias for ``GOOGLE_API_KEY``) → ``OLLAMA_HOST``.
+    Mirrors what forge does before :func:`ai_setup.run_ai_setup_inline`: a
+    provider named by ``FLUID_LLM_PROVIDER`` / ``FLUID_FORGE_AGENT`` (forge
+    then runs no setup) → saved config → the key variables of exactly one
+    provider (``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``, ``GEMINI_API_KEY`` /
+    ``GOOGLE_API_KEY``, or ``OLLAMA_HOST``), or of several when exactly one
+    provider has a keyring key, which setup then uses. ``GITHUB_API_KEY`` does
+    not count.
     Used to decide whether the post-init handoff should offer to set AI
     up before launching forge.
     """
     try:
-        from .ai_setup import PROVIDER_ENV_VARS, _load_ai_config
+        from .ai_setup import _load_ai_config
     except Exception:  # pragma: no cover — import guard for partial installs
         return False
+
+    # From ``providers``: importing ``provider_resolve`` first is a circular import,
+    # and a plain ``fluid init`` has loaded neither by now.
+    from fluid_build.llm.providers import (
+        _infer_provider_from_explicit_keys,
+        _infer_provider_from_keyring,
+        ambiguous_keys_message,
+        named_llm_provider,
+    )
+
+    if named_llm_provider(None):
+        return True
 
     saved = _load_ai_config()
     if saved and saved.get("provider"):
         return True
 
-    for env_var in PROVIDER_ENV_VARS.values():
-        if os.environ.get(env_var):
-            return True
-
-    # ``GEMINI_API_KEY`` is the user-facing alias for ``GOOGLE_API_KEY``
-    # accepted by the copilot provider resolver — keep the post-init
-    # handoff in sync so a user who pastes that env var doesn't get
-    # asked to "set up AI" again.
-    if os.environ.get("GEMINI_API_KEY"):
+    if _infer_provider_from_explicit_keys(os.environ):
         return True
-
-    return bool(os.environ.get("OLLAMA_HOST"))
+    # Keys for several providers: setup goes on with the one keyring key, if any.
+    return bool(ambiguous_keys_message(os.environ) and _infer_provider_from_keyring())
 
 
 def _offer_first_forge(args, logger: logging.Logger) -> None:
@@ -894,6 +902,36 @@ def _ensure_gitignore_template(workspace_root: Path) -> None:
         pass  # Best-effort — gitignore is a nice-to-have, not load-bearing.
 
 
+def _setup_ai_mode_llm(args) -> str:
+    """Pick the LLM for ``fluid init``'s AI path, as ``fluid forge``'s ``run()`` does.
+
+    A provider the operator named (``FLUID_LLM_PROVIDER``, ``FLUID_FORGE_AGENT``)
+    skips inline setup. Otherwise setup fills only what the run leaves unstated
+    (``FLUID_LLM_MODEL`` and ``FLUID_LLM_ENDPOINT`` win). Returns ``"ready"``,
+    ``"stop"`` when setup named the keys of two or more providers and chose
+    none, or ``"template"`` when no provider is available.
+    """
+    from fluid_build._optional import is_available
+    from fluid_build.llm.providers import (
+        ambiguous_keys_message,
+        fill_llm_args_from_setup,
+        named_llm_provider,
+    )
+
+    from .ai_setup import run_ai_setup_inline, set_session_env
+
+    if named_llm_provider(args):
+        return "ready"
+    llm_config = run_ai_setup_inline(console if RICH_AVAILABLE else None)
+    if llm_config:
+        if fill_llm_args_from_setup(args, llm_config) and llm_config.api_key:
+            set_session_env(llm_config.provider, llm_config.api_key)
+        return "ready"
+    if is_available("litellm") and ambiguous_keys_message(os.environ):
+        return "stop"
+    return "template"
+
+
 def _ai_mode(args, logger: logging.Logger) -> int:
     """Let AI design the data product — delegates to forge copilot inline."""
     if RICH_AVAILABLE:
@@ -908,23 +946,14 @@ def _ai_mode(args, logger: logging.Logger) -> int:
         )
 
     try:
-        from .ai_setup import run_ai_setup_inline, set_session_env
         from .forge import run_ai_copilot_mode
 
-        # Run inline LLM setup — same as forge.py:run() does.
-        _console = console if RICH_AVAILABLE else None
-        llm_config = run_ai_setup_inline(_console)
-        if llm_config:
-            from fluid_build.llm.providers import remember_named_llm_provider
-
-            # FLUID_LLM_API_KEY goes only to a provider the operator named.
-            remember_named_llm_provider(args)
-            args.llm_provider = llm_config.provider
-            args.llm_model = llm_config.model
-            args.llm_endpoint = llm_config.endpoint
-            if llm_config.api_key:
-                set_session_env(llm_config.provider, llm_config.api_key)
-        else:
+        choice = _setup_ai_mode_llm(args)
+        if choice == "stop":
+            # Setup named the keys of two or more providers and chose none:
+            # stop, as forge does without a TTY, rather than write a template.
+            return 1
+        if choice == "template":
             if RICH_AVAILABLE:
                 from .forge_dialogs import print_dialog_status
 
