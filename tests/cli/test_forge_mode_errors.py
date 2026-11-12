@@ -355,21 +355,26 @@ class TestAiCopilotModeErrorParity:
 # ── a failure is logged once, noted for --agent, described as data ────
 
 
-def _raised(exc: BaseException) -> BaseException:
+def _raised(exc: Exception) -> Exception:
     """*exc* with a traceback, as a handler meets it."""
     try:
         raise exc
-    except BaseException as caught:  # noqa: BLE001
+    except Exception as caught:  # noqa: BLE001
         return caught
 
 
-def _handled(logger: logging.Logger, label: str, exc: BaseException, **kwargs) -> None:
+def _fail(exc: Exception) -> None:
+    """Raise *exc*; called inside a ``with`` so the code after the block stays reachable."""
+    raise exc
+
+
+def _handled(logger: logging.Logger, label: str, exc: Exception, **kwargs) -> None:
     """Call ``log_forge_failure`` from the ``except`` block, as handlers do."""
     from fluid_build.cli._forge_mode_errors import log_forge_failure
 
     try:
         raise exc
-    except BaseException as caught:  # noqa: BLE001
+    except Exception as caught:  # noqa: BLE001
         log_forge_failure(logger, label, caught, **kwargs)
 
 
@@ -428,14 +433,12 @@ class TestLogForgeFailure:
         logger = MagicMock()
         exc = CopilotGenerationError("internal_error_code", "friendly message")
 
-        def handler() -> int:
-            with forge_mode_error_boundary(
-                logger, MagicMock(), fail_label="X failed", render_error=lambda c, e: None
-            ) as boundary:
-                raise exc
-            return boundary.exit_code
+        with forge_mode_error_boundary(
+            logger, MagicMock(), fail_label="X failed", render_error=lambda c, e: None
+        ) as boundary:
+            _fail(exc)
 
-        assert handler() == 1
+        assert boundary.exit_code == 1
         logger.exception.assert_not_called()
         logger.error.assert_called_once_with(
             "%s: %s", "X failed", "internal_error_code", extra={"fluid_console_shown": True}

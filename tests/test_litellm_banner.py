@@ -65,7 +65,7 @@ def test_ai_test_json_stdout_is_the_report_alone_when_the_call_fails(
     litellm, failing_completion, monkeypatch, capsys, tmp_path
 ):
     """``fluid ai test --json`` on a failed call: one JSON document, nothing before it."""
-    from fluid_build.cli.ai_setup import run_ai_test
+    import fluid_build.cli.ai_setup as ai_setup
 
     monkeypatch.chdir(tmp_path)
     for name in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "FLUID_LLM_API_KEY"):
@@ -85,7 +85,7 @@ def test_ai_test_json_stdout_is_the_report_alone_when_the_call_fails(
             return_value=("unavailable", None),
         ),
     ):
-        code, report = run_ai_test(None, args)
+        code, report = ai_setup.run_ai_test(None, args)
 
     assert code != 0
     assert report["error"]["code"] == "copilot_litellm_request_failed"
