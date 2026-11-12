@@ -768,6 +768,29 @@ onprem = "my_pkg.iac:OnPremIacPlugin"
 - **Tests.** `tests/iac/test_iac_entrypoint_lazy_plugin.py` builds a real
   throwaway `.dist-info` and is the pattern to copy.
 
+## `fluid test` on Databricks: results table and dashboard (2026-11-12)
+
+- **Live checks.** `providers/databricks_validation.py` reads columns from the Unity
+  Catalog tables API and runs the row count and the rules on `DATABRICKS_WAREHOUSE_ID`
+  through `providers/databricks/statements.py` (Statement Execution API, `:name`
+  parameters, credential-scrubbed errors). Contract types go through
+  `engines/dbt/_types.sql_type(..., "databricks")` before they are compared.
+- **One translation of the rules.** `providers/quality_engine.py` is the native engine;
+  the SodaCL exporter and the dbt test mapping mirror it. It quotes identifiers per
+  dialect (backticks on Databricks and BigQuery, where `"x"` is a string) and string
+  literals through `_sql_safety.quote_string_literal_for`. A `valid_values` rule's values
+  come from the rule, else from its column's `enum` / `regex` validationRule, else from
+  its `labels.references` (resolved by the provider's `resolve_reference`; Databricks finds
+  the table by its `fluid_product_id` tag). `schema` rules are decided in
+  `cli/contract_validation.py::_decide_schema_rules` from the live column comparison.
+- **Same cases everywhere.** `cli/_test_cases.py` lists the run's test cases (each rule, then
+  each structural category). `--output junit` and `--results-table`
+  (`cli/_test_results_databricks.py`) both read it, so Jenkins and the table agree.
+- **Ownership.** The results table is created if missing; the catalog and schema never are,
+  a product's own schema is refused, and a table without the result columns is never written.
+  The dashboard (`cli/_test_dashboard_databricks.py`) is found by its workspace path, created,
+  PATCHed only when its definition differs, and published without embedded credentials.
+
 ## Links
 
 - **Documentation**: [https://agenticstiger.github.io/forge_docs/](https://agenticstiger.github.io/forge_docs/)
