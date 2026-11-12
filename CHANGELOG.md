@@ -166,6 +166,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   results; the dashboard lookup follows databricks-solutions/ai-dev-kit. No code is taken from
   either.
 
+- **Databricks: a build with `engine: lakeflow` is a Lakeflow Declarative Pipeline, and the
+  contract's data-quality rules are its expectations** (FLUID 0.7.7 preview). The build is
+  `pattern: embedded-logic` with `properties.sql`, the SELECT of the dataset. forge-cli writes
+  the pipeline's source around it: a materialized view with the expose's columns, types and
+  comments and one expectation per rule. It provisions one serverless pipeline per build, in
+  the product's own catalog and schema. The pipeline graph's Data quality tab then shows each
+  rule's passed and failed records.
+  - Severity: `info` and `warn` keep a failing row and count it, `error` drops it (`ON
+    VIOLATION DROP ROW`), and `critical` fails the update (`ON VIOLATION FAIL UPDATE`).
+  - `uniqueness`, `freshness` and references need the whole table, so each is checked by a
+    private view in the same pipeline, never published. A reference is a `valid_values` rule
+    whose column carries `labels.references: <product id>.<column>`; the referenced table is
+    found through the workspace (`fluid.workspace.yaml`, `FLUID_UPSTREAM_CONTRACTS`). `schema`
+    is the declared column list itself.
+  - The pipeline owns its table: no table resource is created for it, readers get `SELECT` on
+    the product's schema, and the table's and its columns' tags are set after each update
+    `fluid apply` runs. Masks, row filters, write grants, partitions, `lifecycle.expire` and a
+    cron trigger are refused on a lakeflow build for now.
+  - `fluid apply --mode amend-and-build` starts an update and waits for it
+    (`replace-and-build`: a full refresh), then prints each rule's counts from the pipeline's
+    event log. A failed update fails the apply with its error. `amend` and `create-only` only
+    provision, and a continuous pipeline is not started. A triggered pipeline does not retry a
+    failed update (`pipelines.numUpdateRetryAttempts` is 0; Lakeflow's default is five), since
+    the same rows would fail the same rule.
+  - Removing a pipeline needs `--allow-data-loss`: deleting a pipeline can delete its tables.
+
 ### Changed
 
 - **`fluid apply --mode amend-and-build` runs a Databricks dbt build now.** A dbt build with
