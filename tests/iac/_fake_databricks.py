@@ -37,7 +37,9 @@ summary, whose region is ``FakeDatabricks(region=...)``), and answers the Unity 
 effective-permissions read.
 Jobs and workspace files are kept as sent (``jobs[id]["settings"]``, ``workspace_files[path]``),
 so a test asserts on exactly what the provider submitted; ``add_job`` / ``add_workspace_file``
-seed brownfield objects.
+seed brownfield objects. A job can be run (``run-now``, ``runs/get``, ``runs/get-output``,
+``runs/cancel``): each run plays ``run_states`` and ends as ``run_result`` says, and
+``job_runs`` keeps every run-now request as sent.
 
 It also serves the Files API on Unity Catalog volumes (``add_volume``): PUT / DELETE of a file,
 PUT / GET / DELETE of a directory, backed by a temporary directory so the bytes a client uploads
@@ -49,8 +51,8 @@ statement leaves them), reporting ``num_affected_rows`` / ``num_inserted_rows`` 
 unless ``insert_reports_count`` is False, and ``SELECT COUNT(*) FROM <table>``.
 
 Not proven here: what real Databricks accepts (SQL dialect, warehouse state, the privilege
-model, Unity Catalog storage, ``read_files`` itself), whether a job's settings are valid (the fake stores any), job
-runs, and any workspace-level setting.
+model, Unity Catalog storage, ``read_files`` itself), whether a job's settings are valid (the fake stores any), that
+a job run does anything (the fake runs nothing), and any workspace-level setting.
 
 The provider is pointed at it with ``host`` and a dummy ``token``. Standalone:
 ``python _fake_databricks.py --port 8765``.
@@ -786,6 +788,18 @@ class FakeDatabricks:
         self.table_rows: Dict[str, List[Dict[str, Any]]] = {}
         # False: an INSERT answers with no row count, as a statement that returns none would
         self.insert_reports_count = True
+        # run_id -> {job_id, body (the run-now request), polls, cancelled}. A run is served
+        # one state of ``run_states`` per runs/get, then ends as ``run_result`` says; its one
+        # task ("dbt", run id + 100000) serves ``run_result``'s error and logs as its output.
+        self.job_runs: Dict[int, Dict[str, Any]] = {}
+        self.run_states: List[str] = ["PENDING", "RUNNING"]
+        self.run_result: Dict[str, str] = {
+            "code": "SUCCESS",
+            "message": "",
+            "error": "",
+            "logs": "",
+        }
+        self._run_seq = 500
         self._marker = 0
         self._job_seq = 0
         self._object_ids: Dict[str, int] = {}  # workspace path -> object_id
@@ -1047,6 +1061,10 @@ class FakeDatabricks:
         a("GET", r"/api/2\.2/jobs/list", self._job_list)
         a("POST", r"/api/2\.2/jobs/reset", self._job_reset)
         a("POST", r"/api/2\.2/jobs/delete", self._job_delete)
+        a("POST", r"/api/2\.2/jobs/run-now", self._run_now)
+        a("GET", r"/api/2\.2/jobs/runs/get", self._run_get)
+        a("GET", r"/api/2\.2/jobs/runs/get-output", self._run_output)
+        a("POST", r"/api/2\.2/jobs/runs/cancel", self._run_cancel)
         # ---- workspace files
         a("POST", r"/api/2\.0/workspace/mkdirs", self._ws_mkdirs)
         a("POST", r"/api/2\.0/workspace/import", self._ws_import)
@@ -1489,6 +1507,70 @@ class FakeDatabricks:
     def _job_delete(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
         # the real API answers 200 for a job that is already gone
         self.jobs.pop(int(b.get("job_id", 0)), None)
+        return 200, {}
+
+    # -- job runs
+    def _run_now(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        jid = int(b.get("job_id", 0))
+        if jid not in self.jobs:
+            return _err(400, "INVALID_PARAMETER_VALUE", f"Job {jid} does not exist.")
+        token = b.get("idempotency_token")
+        for rid, run in self.job_runs.items():  # the same token is the same run
+            if token and run["body"].get("idempotency_token") == token:
+                return 200, {"run_id": rid, "number_in_job": rid}
+        self._run_seq += 1
+        self.job_runs[self._run_seq] = {
+            "job_id": jid,
+            "body": copy.deepcopy(b),
+            "polls": 0,
+            "cancelled": False,
+        }
+        return 200, {"run_id": self._run_seq, "number_in_job": self._run_seq}
+
+    def _run_get(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        rid = int((q.get("run_id") or ["0"])[0])
+        run = self.job_runs.get(rid)
+        if run is None:
+            return _err(400, "INVALID_PARAMETER_VALUE", f"Run {rid} does not exist.")
+        polls, run["polls"] = run["polls"], run["polls"] + 1
+        doc: Dict[str, Any] = {
+            "run_id": rid,
+            "job_id": run["job_id"],
+            "run_page_url": f"{self.endpoint}/#job/{run['job_id']}/run/{rid}",
+        }
+        if not run["cancelled"] and polls < len(self.run_states):
+            doc["status"] = {"state": self.run_states[polls]}
+            return 200, doc
+        code, message = (
+            ("CANCELED", "Run cancelled.")
+            if run["cancelled"]
+            else (self.run_result["code"], self.run_result["message"])
+        )
+        details = {"code": code, "message": message}
+        doc["status"] = {"state": "TERMINATED", "termination_details": details}
+        doc["tasks"] = [
+            {
+                "task_key": "dbt",
+                "run_id": rid + 100000,
+                "attempt_number": 0,
+                "status": {"state": "TERMINATED", "termination_details": {"code": code}},
+            }
+        ]
+        return 200, doc
+
+    def _run_output(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        rid = int((q.get("run_id") or ["0"])[0]) - 100000
+        if rid not in self.job_runs:
+            return _err(400, "INVALID_PARAMETER_VALUE", f"Run {rid + 100000} does not exist.")
+        return 200, {
+            "error": self.run_result.get("error") or None,
+            "logs": self.run_result.get("logs") or None,
+        }
+
+    def _run_cancel(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        rid = int(b.get("run_id", 0))
+        if rid in self.job_runs:
+            self.job_runs[rid]["cancelled"] = True
         return 200, {}
 
     # -- workspace files
