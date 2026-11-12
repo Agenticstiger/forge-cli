@@ -332,12 +332,27 @@ class TestDetectAndValidateProviderExt(unittest.TestCase):
         errors = v.report.get_errors()
         assert any("Unknown provider" in e.message for e in errors)
 
-    def test_databricks_adds_warning(self):
+    def test_databricks_without_the_sdk_is_an_error(self):
         v = _make_validator_new(provider_name="databricks")
         v.contract = {"exposes": [{"binding": {"platform": "databricks"}}]}
-        v._detect_and_validate_provider()
-        warnings = v.report.get_warnings()
-        assert any("databricks" in w.message.lower() for w in warnings)
+        with patch("fluid_build.cli.contract_validation.DATABRICKS_VALIDATION_AVAILABLE", False):
+            v._detect_and_validate_provider()
+        errors = v.report.get_errors()
+        assert any("databricks-sdk" in e.message for e in errors)
+        assert any("data-product-forge[databricks]" in (e.suggestion or "") for e in errors)
+
+    def test_databricks_builds_the_unity_catalog_provider(self):
+        from fluid_build.providers.databricks_validation import DatabricksValidationProvider
+
+        v = _make_validator_new(provider_name="databricks")
+        v.contract = {"exposes": [{"binding": {"platform": "databricks"}}]}
+        with (
+            patch("fluid_build.cli.contract_validation.DATABRICKS_VALIDATION_AVAILABLE", True),
+            patch.object(DatabricksValidationProvider, "validate_connection", return_value=True),
+        ):
+            v._detect_and_validate_provider()
+        assert isinstance(v.validation_provider, DatabricksValidationProvider)
+        assert not v.report.get_errors()
 
     def test_azure_warns_that_it_was_not_validated(self):
         # `fluid validate` accepts azure (schema enum) although no provider serves

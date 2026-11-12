@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterator, List, Optional
 from fluid_build.providers._sql_safety import validate_ident
 from fluid_build.providers.quality_engine import (
     execute_quality_checks,
+    expose_columns,
     quality_results_to_issues,
 )
 from fluid_build.providers.validation_provider import (
@@ -454,5 +455,6 @@ class SnowflakeValidationProvider(ValidationProvider):
                 table_ref=table_ref,
                 execute_fn=conn.execute,
                 dialect="snowflake",
+                columns=expose_columns(resource_spec),
             )
         return quality_results_to_issues(results)

@@ -20,6 +20,7 @@ from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb
 from fluid_build.providers._sql_safety import quote_ansi_string_literal, validate_ident
 from fluid_build.providers.quality_engine import (
     execute_quality_checks,
+    expose_columns,
     quality_results_to_issues,
 )
 from fluid_build.providers.validation_provider import (
@@ -432,6 +433,7 @@ class LocalValidationProvider(ValidationProvider):
                     table_ref=table_ref,
                     execute_fn=_exec,
                     dialect="ansi",
+                    columns=expose_columns(resource_spec),
                 )
                 return quality_results_to_issues(results)
             finally:
@@ -465,6 +467,7 @@ class LocalValidationProvider(ValidationProvider):
                 table_ref=table_ref,
                 execute_fn=_exec,
                 dialect="ansi",
+                columns=expose_columns(resource_spec),
             )
             return quality_results_to_issues(results)
         finally:

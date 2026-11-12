@@ -87,17 +87,10 @@ BIGQUERY_AVAILABLE = _dist_installed("google-cloud-bigquery")
 SNOWFLAKE_VALIDATION_AVAILABLE = _dist_installed("snowflake-connector-python")
 AWS_VALIDATION_AVAILABLE = _dist_installed("boto3")
 LOCAL_VALIDATION_AVAILABLE = _dist_installed("duckdb")
+DATABRICKS_VALIDATION_AVAILABLE = _dist_installed("databricks-sdk")
 
 #: Known platforms with no live validation provider: ``(warning, suggestion)``.
-#: Databricks has no Unity Catalog introspection on this path yet (no SDK); its
-#: offline checks are `fluid validate`'s, and `fluid apply --mode dry-run` is a
-#: real `tofu plan` against the workspace.
 _NO_LIVE_VALIDATION = {
-    "databricks": (
-        "Live validation against Unity Catalog is not available for provider 'databricks' yet",
-        "Run 'fluid validate' for the offline binding checks and "
-        "'fluid apply --mode dry-run' to plan against the workspace.",
-    ),
     # `fluid validate` accepts `azure` (the schema enum lists it) although there is
     # no azure provider: say so as a warning, so the two commands agree.
     "azure": (
@@ -108,6 +101,12 @@ _NO_LIVE_VALIDATION = {
 
 LOG = logging.getLogger("fluid.cli.contract_validation")
 COMMAND = "contract-validation"
+
+
+def _rule_kind(rule: Any) -> str:
+    """A ``dq.rules[]`` entry's ``type``, lower-cased ("" when it has none)."""
+    kind = rule.get("type") if isinstance(rule, dict) else None
+    return kind.strip().lower() if isinstance(kind, str) else ""
 
 
 @dataclass
@@ -157,6 +156,11 @@ class CheckOutcome:
     message: str = ""
     expected: Optional[Any] = None
     actual: Optional[Any] = None
+    #: The data-quality rule this outcome is for (``dq.rules[].id`` / ``.type``)
+    #: and the expose it ran against, so a results table can key on them.
+    rule_id: Optional[str] = None
+    rule_type: Optional[str] = None
+    expose_id: Optional[str] = None
 
 
 @dataclass
@@ -573,6 +577,22 @@ class ContractValidator:
             from ..providers.local_validation import LocalValidationProvider
 
             self.validation_provider = LocalValidationProvider({"base_dir": base_dir})
+        elif self.provider_name == "databricks":
+            if not DATABRICKS_VALIDATION_AVAILABLE:
+                self.report.add_issue(
+                    "error",
+                    "binding",
+                    "databricks-sdk package is required for Databricks validation",
+                    "binding.platform",
+                    suggestion="Install it with: pip install 'data-product-forge[databricks]'",
+                )
+                return
+            from ..providers.databricks_validation import DatabricksValidationProvider
+
+            # Host, credentials and the SQL warehouse come from the
+            # environment (DATABRICKS_HOST, DATABRICKS_WAREHOUSE_ID), as for
+            # `fluid apply`; the contract names neither.
+            self.validation_provider = DatabricksValidationProvider({})
         elif self.provider_name in _NO_LIVE_VALIDATION:
             message, suggestion = _NO_LIVE_VALIDATION[self.provider_name]
             self.report.add_issue(
@@ -734,12 +754,23 @@ class ContractValidator:
         # Also check nested contract.dq.rules pattern
         if not dq_rules:
             dq_rules = expose.get("contract", {}).get("dq", {}).get("rules", [])
+        # A ``schema`` rule ("the table conforms to the contract schema") is
+        # decided by the live column comparison below, not by a query.
+        schema_rules: List[Dict[str, Any]] = []
+        if isinstance(dq_rules, list):
+            schema_rules = [r for r in dq_rules if _rule_kind(r) == "schema"]
+            dq_rules = [r for r in dq_rules if _rule_kind(r) != "schema"]
         if dq_rules and self.validation_provider and self.check_data:
             self._run_expose_quality_checks(expose, dq_rules, path_prefix)
 
         # Validate against actual resource (if provider available)
         if self.check_data and self.provider_name:
-            self._validate_against_actual_resource(expose, path_prefix)
+            first = len(self.report.issues)
+            compared = self._validate_against_actual_resource(expose, path_prefix)
+            if schema_rules and self.validation_provider:
+                self._decide_schema_rules(
+                    expose_id, schema_rules, self.report.issues[first:], compared, path_prefix
+                )
 
     def _validate_binding(self, binding: Dict[str, Any], path: str, expose_id: str) -> None:
         """Validate binding configuration."""
@@ -799,8 +830,22 @@ class ContractValidator:
         """Execute data-quality rules against the live resource via the provider."""
         expose_id = expose.get("id", "unknown")
         LOG.debug("Running %d quality checks for %s", len(rules), expose_id)
+        # A provider that hands back every rule's result (passes included)
+        # lets each outcome carry what was measured, not only the failures.
+        # ``ValidationProvider.run_quality_results`` answers ``None`` for a
+        # provider that only reports failures.
+        run_results = getattr(self.validation_provider, "run_quality_results", None)
+        results = None
         try:
-            issues = self.validation_provider.run_quality_checks(expose, rules)
+            if callable(run_results):
+                results = run_results(expose, rules)
+            if isinstance(results, list):
+                from fluid_build.providers.quality_engine import quality_results_to_issues
+
+                issues = quality_results_to_issues(results)
+            else:
+                results = None
+                issues = self.validation_provider.run_quality_checks(expose, rules)
         except Exception as exc:
             LOG.warning("Quality check execution failed for %s: %s", expose_id, exc)
             self.report.add_issue(
@@ -830,13 +875,82 @@ class ContractValidator:
                 documentation_url=issue.documentation_url,
             )
 
-        self._record_quality_outcomes(expose_id, rules, issues)
+        self._record_quality_outcomes(expose_id, rules, issues, results)
+
+    def _decide_schema_rules(
+        self,
+        expose_id: str,
+        rules: List[Dict[str, Any]],
+        resource_issues: List[ValidationIssue],
+        compared: bool,
+        path_prefix: str,
+    ) -> None:
+        """Decide each ``schema`` rule from the live column comparison.
+
+        It passes when every contract column is in the table with its type
+        (the comparison's errors are a missing column or a changed type; an
+        extra column or a nullability difference does not break the rule). A
+        comparison that could not run is a failed rule, not a pass.
+        """
+        missing_table = any(i.category == "missing_resource" for i in resource_issues)
+        broken = [
+            i
+            for i in resource_issues
+            if i.category in ("missing_field", "type_mismatch") and _is_error_severity(i.severity)
+        ]
+        expected = "every contract column, with its type"
+        for rule in rules:
+            if not isinstance(rule, dict) or not rule.get("id"):
+                continue
+            rule_id = str(rule["id"])
+            severity = rule.get("severity", "error")
+            if missing_table:
+                passed, actual = False, "table does not exist"
+                message = f"Rule '{rule_id}': the table does not exist, so no column could conform"
+            elif not compared:
+                passed, actual = False, "not executed"
+                message = (
+                    f"Rule '{rule_id}' is a schema rule, but the live table's columns could "
+                    "not be read, so it was not checked"
+                )
+            elif broken:
+                gone = sum(1 for i in broken if i.category == "missing_field")
+                actual = f"{gone} column(s) missing, {len(broken) - gone} type change(s)"
+                passed = False
+                message = f"Rule '{rule_id}': the table does not conform to the contract ({actual})"
+            else:
+                passed, actual = True, "all contract columns match"
+                message = "Schema conforms to the contract"
+            if not passed:
+                self.report.add_issue(
+                    severity,
+                    "quality",
+                    message,
+                    f"{path_prefix}.contract.dq.rules.{rule_id}",
+                    expected=expected,
+                    actual=actual,
+                )
+            self.report.record_check(
+                CheckOutcome(
+                    name=f"{expose_id}.{rule_id}",
+                    category="quality",
+                    passed=passed,
+                    severity=severity,
+                    message=message,
+                    expected=expected,
+                    actual=actual,
+                    rule_id=rule_id,
+                    rule_type="schema",
+                    expose_id=expose_id,
+                )
+            )
 
     def _record_quality_outcomes(
         self,
         expose_id: str,
         rules: List[Dict[str, Any]],
         issues: List[Any],
+        results: Optional[List[Any]] = None,
     ) -> None:
         """Record one :class:`CheckOutcome` per DQ rule that actually ran.
 
@@ -853,6 +967,10 @@ class ContractValidator:
         """
         declared = [r.get("id") for r in rules if isinstance(r, dict) and r.get("id")]
         if not declared:
+            return
+
+        if results is not None:
+            self._record_result_outcomes(expose_id, rules, results)
             return
 
         by_rule: Dict[str, Any] = {}
@@ -881,6 +999,9 @@ class ContractValidator:
                         f"{rule.get('type', 'rule')} check passed for "
                         f"'{rule.get('selector', '')}'"
                     ),
+                    rule_id=str(rule_id),
+                    rule_type=_rule_kind(rule) or None,
+                    expose_id=expose_id,
                 )
             else:
                 outcome = CheckOutcome(
@@ -891,8 +1012,44 @@ class ContractValidator:
                     message=issue.message,
                     expected=issue.expected,
                     actual=issue.actual,
+                    rule_id=str(rule_id),
+                    rule_type=_rule_kind(rule) or None,
+                    expose_id=expose_id,
                 )
             self.report.record_check(outcome)
+
+    def _record_result_outcomes(
+        self, expose_id: str, rules: List[Dict[str, Any]], results: List[Any]
+    ) -> None:
+        """One :class:`CheckOutcome` per rule from the provider's full results, so a
+        passing rule carries what was measured too."""
+        # Results come back in rule order; a queue per id pairs the n-th rule
+        # with an id with the n-th result for it, so two rules sharing an id
+        # cannot hide one's failure behind the other's pass.
+        queues: Dict[Any, List[Any]] = {}
+        for result in results:
+            queues.setdefault(getattr(result, "rule_id", None), []).append(result)
+        for rule in rules:
+            if not isinstance(rule, dict) or not rule.get("id"):
+                continue
+            queue = queues.get(rule["id"])
+            if not queue:
+                continue
+            result = queue.pop(0)
+            self.report.record_check(
+                CheckOutcome(
+                    name=f"{expose_id}.{rule['id']}",
+                    category="quality",
+                    passed=bool(result.passed),
+                    severity=result.severity or rule.get("severity", "error"),
+                    message=result.message,
+                    expected=result.expected,
+                    actual=result.actual,
+                    rule_id=str(rule["id"]),
+                    rule_type=result.rule_type or _rule_kind(rule) or None,
+                    expose_id=expose_id,
+                )
+            )
 
     def _validate_schema_definition(
         self, schema: List[Dict[str, Any]], path: str, expose_id: str
@@ -952,8 +1109,12 @@ class ContractValidator:
                     f"{col_path}.type",
                 )
 
-    def _validate_against_actual_resource(self, expose: Dict[str, Any], path: str) -> None:
-        """Validate contract schema against actual deployed resource."""
+    def _validate_against_actual_resource(self, expose: Dict[str, Any], path: str) -> bool:
+        """Validate contract schema against actual deployed resource.
+
+        Returns whether the live columns were compared with the contract (a
+        ``schema`` data-quality rule is decided by that comparison).
+        """
         expose_id = expose.get("id") or expose.get("exposeId") or "unknown"
 
         LOG.debug("Validating actual resource for %s", expose_id)
@@ -963,18 +1124,22 @@ class ContractValidator:
             binding = expose.get("binding", {})
             location = binding.get("location", {})
             props = location.get("properties", {})
-            self._validate_bigquery_resource(expose, path, props)
+            return self._validate_bigquery_resource(expose, path, props)
         elif self.provider_name == "aws" and self._iceberg_outside_glue(expose, path):
-            return
-        elif self.provider_name in ("snowflake", "aws", "local"):
-            self._validate_generic_resource(expose, path)
+            return False
+        elif self.provider_name in ("snowflake", "aws", "local", "databricks"):
+            return self._validate_generic_resource(expose, path)
         else:
             LOG.debug("Provider '%s' resource validation not yet implemented", self.provider_name)
+        return False
 
     def _validate_bigquery_resource(
         self, expose: Dict[str, Any], path: str, props: Dict[str, Any]
-    ) -> None:
-        """Validate against actual BigQuery table using provider abstraction."""
+    ) -> bool:
+        """Validate against actual BigQuery table using provider abstraction.
+
+        Returns whether the live columns were compared with the contract.
+        """
         if not self.validation_provider:
             self.report.add_issue(
                 "warning",
@@ -982,7 +1147,7 @@ class ContractValidator:
                 "No validation provider initialized, skipping resource validation",
                 path,
             )
-            return
+            return False
 
         project = props.get("project", self.project)
         dataset = props.get("dataset")
@@ -1005,7 +1170,7 @@ class ContractValidator:
                 suggestion=f"Add the following properties to binding.location.properties: {', '.join(missing)}",
                 documentation_url="https://agenticstiger.github.io/forge_docs/providers/gcp.html",
             )
-            return
+            return False
 
         table_fqn = f"{project}.{dataset}.{table}"
 
@@ -1091,6 +1256,7 @@ class ContractValidator:
                 LOG.info(f"✅ Resource '{table_fqn}' validated successfully")
             else:
                 LOG.warning(f"⚠️  Resource '{table_fqn}' validation found issues")
+            return True
 
         except Exception as e:
             self.report.add_issue(
@@ -1101,6 +1267,7 @@ class ContractValidator:
                 suggestion="Check provider credentials and network connectivity",
                 documentation_url="https://agenticstiger.github.io/forge_docs/advanced/production-troubleshooting.html",
             )
+            return False
 
     def _iceberg_outside_glue(self, expose: Dict[str, Any], path: str) -> bool:
         """Report an Iceberg table cataloged outside Glue as not checked.
@@ -1128,8 +1295,9 @@ class ContractValidator:
         )
         return True
 
-    def _validate_generic_resource(self, expose: Dict[str, Any], path: str) -> None:
-        """Validate a resource using the active validation provider (Snowflake, AWS, local)."""
+    def _validate_generic_resource(self, expose: Dict[str, Any], path: str) -> bool:
+        """Validate a resource with the active validation provider (Snowflake, AWS,
+        local, Databricks). Returns whether the comparison ran."""
         if not self.validation_provider:
             self.report.add_issue(
                 "warning",
@@ -1137,24 +1305,27 @@ class ContractValidator:
                 "No validation provider initialized, skipping resource validation",
                 path,
             )
-            return
+            return False
 
         expose_id = expose.get("id") or expose.get("exposeId") or "unknown"
 
         try:
-            # Cache lookup
+            # Cache lookup. Databricks is always read live: its columns are a free
+            # metadata read, and a cached row count would report an hour-old table
+            # (and write it to a results table) after a build changed it.
+            cache = None if self.provider_name == "databricks" else self.cache
             actual_schema = None
             cache_key = self._resource_cache_key(expose, expose_id)
-            if self.cache:
-                actual_schema = self.cache.get_schema(cache_key, self.provider_name)
+            if cache:
+                actual_schema = cache.get_schema(cache_key, self.provider_name)
                 if actual_schema:
                     LOG.info("Using cached schema for %s", cache_key)
 
             # Fetch from provider
             if actual_schema is None:
                 actual_schema = self.validation_provider.get_resource_schema(expose)
-                if self.cache and actual_schema:
-                    self.cache.set_schema(cache_key, self.provider_name, actual_schema)
+                if cache and actual_schema:
+                    cache.set_schema(cache_key, self.provider_name, actual_schema)
 
             # Validate
             result = self.validation_provider.validate_resource(expose, actual_schema)
@@ -1206,6 +1377,7 @@ class ContractValidator:
                 LOG.info("Resource '%s' validated successfully", expose_id)
             else:
                 LOG.warning("Resource '%s' validation found issues", expose_id)
+            return True
 
         except Exception as e:
             self.report.add_issue(
@@ -1215,6 +1387,7 @@ class ContractValidator:
                 path,
                 suggestion="Check provider credentials and connectivity",
             )
+            return False
 
     def _resource_cache_key(self, expose: Dict[str, Any], expose_id: str) -> str:
         """Cache identity for an expose's bound resource.

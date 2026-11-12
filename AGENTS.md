@@ -779,6 +779,33 @@ onprem = "my_pkg.iac:OnPremIacPlugin"
 - **Tests.** `tests/iac/test_iac_entrypoint_lazy_plugin.py` builds a real
   throwaway `.dist-info` and is the pattern to copy.
 
+## `fluid test` on Databricks: results table and dashboard (2026-11-12)
+
+- **Live checks.** `providers/databricks_validation.py` reads columns from the Unity
+  Catalog tables API and runs the row count and the rules on `DATABRICKS_WAREHOUSE_ID`
+  through `providers/databricks/statements.py` (Statement Execution API, `:name`
+  parameters, credential-scrubbed errors). Contract types go through
+  `engines/dbt/_types.sql_type(..., "databricks")` before they are compared.
+- **One reading of the rules.** `providers/quality_engine.py` is the native engine, and
+  `quality_engine.value_domain` is what a `valid_values` rule allows: the rule's own list,
+  else every declaration its column makes (`enum`, `regex`, `range` validationRules, and
+  `labels.references`, resolved by the provider's `resolve_reference`; Databricks finds the
+  table by its `fluid_product_id` tag). The SodaCL exporter renders the same reading (a
+  reference or a strict bound stays unmapped); the dbt test mapping
+  (`engines/dbt/_test_mapping.py`) still has its own. Identifiers are quoted per dialect
+  (backticks on Databricks and BigQuery, where `"x"` is a string), string literals through
+  `_sql_safety.quote_string_literal_for`. `schema` rules are decided in
+  `cli/contract_validation.py::_decide_schema_rules` from the live column comparison.
+- **Same cases everywhere.** `cli/_test_cases.py` lists the run's test cases (each rule, then
+  each structural category). `--output junit` and `--results-table`
+  (`cli/_test_results_databricks.py`) both read it, so Jenkins and the table agree.
+- **Ownership.** The results table is created if missing; the catalog and schema never are,
+  a product's own schema is refused, and a table without the result columns is never written.
+  A run is appended in one statement (its rows bound as one JSON parameter), so it is never
+  half-written. Databricks schemas are never served from the validation cache.
+  The dashboard (`cli/_test_dashboard_databricks.py`) is found by its workspace path, created,
+  PATCHed only when its definition differs, and published without embedded credentials.
+
 ## Links
 
 - **Documentation**: [https://agenticstiger.github.io/forge_docs/](https://agenticstiger.github.io/forge_docs/)
