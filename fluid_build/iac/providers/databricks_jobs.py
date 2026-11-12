@@ -93,6 +93,9 @@ MAX_PROJECT_FILES = 1000
 PRODUCT_TAG = "fluid_product"
 BUILD_TAG = "fluid_build"
 
+#: The key of the job's dbt task: what a run's report finds the dbt output under.
+DBT_TASK_KEY = "dbt"
+
 #: The data source that names the deploying identity's home folder.
 CURRENT_USER = "databricks_current_user"
 _HOME = tofu_ref(f"data.{CURRENT_USER}.me.home")
@@ -1011,7 +1014,7 @@ def _emit_job(
         job["depends_on"] = depends
         compiled.data.setdefault(CURRENT_USER, {})["me"] = {}
     job["task"] = [
-        {"task_key": "dbt", "environment_key": "dbt", "dbt_task": dbt_task, **settings.task},
+        {"task_key": DBT_TASK_KEY, "environment_key": "dbt", "dbt_task": dbt_task, **settings.task},
         *([_keys_task(item)] if keys_file else []),
     ]
     compiled.resources.append(("databricks_job", item.key, f"{item.where} job", job))
@@ -1034,7 +1037,7 @@ def _keys_task(item: _Build) -> Dict[str, Any]:
     warehouse."""
     return {
         "task_key": REBUILD_TASK,
-        "depends_on": [{"task_key": "dbt"}],
+        "depends_on": [{"task_key": DBT_TASK_KEY}],
         "timeout_seconds": REBUILD_TIMEOUT_SECONDS,
         "sql_task": {
             "warehouse_id": item.warehouse,
@@ -1098,6 +1101,7 @@ def _emit_files(
 
 
 __all__ = [
+    "DBT_TASK_KEY",
     "CompiledJobs",
     "DbtJob",
     "compile_dbt_jobs",

@@ -309,6 +309,19 @@ def _source_for(
 ) -> Optional[Tuple[str, str]]:
     reference = check.reference
     assert reference is not None
+    if reference.expose_id is None:
+        refusals.append(
+            _refusal(
+                "reference",
+                f"{where} rule {check.rule_id!r} on expose {check.expose_id!r} checks that every "
+                f"{check.column} exists in {reference.product_id}.{reference.column}, and "
+                f"consumes[] does not list {reference.product_id}: a dbt test reads the other "
+                "product from the dbt source the project declares for the expose it consumes.",
+                f"List {reference.product_id} in consumes[] with the exposeId of its table, and "
+                "declare that table as a dbt source the model reads.",
+            )
+        )
+        return None
     candidates = sorted(set(sources.get(reference.expose_id.lower(), [])))
     if len(candidates) == 1:
         return candidates[0]
@@ -544,6 +557,12 @@ def report(logs: str, checks: Sequence[DqCheck], *, truncated: bool = False) -> 
     if not checks:
         return []
     found = results(logs)
+    if not any(check.name in found for check in checks):
+        kept = " (Databricks kept only its end)" if truncated else ""
+        return [
+            f"   contract rules as dbt tests: none of the {len(checks)} reported in the task's "
+            f"output{kept}; dbt stopped before running them, or the run page has the rest"
+        ]
     lines: List[str] = []
     tally: Dict[str, int] = {}
     marks = {"PASS": "✓", "WARN": "!", "FAIL": "✗", "ERROR": "✗", "SKIP": "-"}

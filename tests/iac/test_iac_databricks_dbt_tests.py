@@ -316,6 +316,13 @@ class TestRefusals:
         text = self._refused(tmp_path, _contract(), "reference")
         assert "named 'customers'" in text
 
+    def test_a_reference_to_a_product_not_consumed_is_refused(self, tmp_path):
+        _project(tmp_path)
+        contract = _contract()
+        contract["consumes"] = []
+        text = self._refused(tmp_path, contract, "reference")
+        assert "consumes[] does not list crm.customers_v1" in text
+
     def test_a_user_file_where_a_test_goes_is_refused(self, tmp_path):
         _project(tmp_path)
         clash = tmp_path / "dbt/tests/fluid_dq/orders/orders_schema.sql"
@@ -496,6 +503,11 @@ class TestReport:
 
     def test_no_rules_no_report(self):
         assert dq.report(LOG, []) == []
+
+    def test_a_run_that_reached_no_test_says_so_once(self):
+        checks = [_check("not_null", name="a"), _check("unique", name="b")]
+        (line,) = dq.report("12:00:01  Encountered an error:\nCompilation Error", checks)
+        assert "none of the 2 reported" in line
 
     def test_expected_tests_come_from_the_contract_alone(self):
         contract = _contract()
