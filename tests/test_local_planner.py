@@ -235,6 +235,15 @@ class TestValidatePlan:
         valid, errors = validate_plan(actions)
         assert valid is False
 
+    def test_materialize_a_build_lands_needs_no_source(self):
+        payload = {"path": "out.parquet", "landed_by": ["ingest"]}
+        actions = [{"op": "materialize", "resource_id": "e1", "payload": payload}]
+        assert validate_plan(actions) == (True, [])
+
+    def test_landed_by_still_needs_an_output_path(self):
+        actions = [{"op": "materialize", "resource_id": "e1", "payload": {"landed_by": ["ingest"]}}]
+        assert validate_plan(actions) == (False, ["e1: materialize missing output path"])
+
     def test_multiple_errors(self):
         actions = [
             {"op": "load_data", "resource_id": "t1", "payload": {}},

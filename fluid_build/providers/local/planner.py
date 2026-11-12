@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 # SDK contract helper (optional)
 try:
@@ -189,17 +189,8 @@ def plan_actions(
         # SDP apply. The legacy warn-and-skip was both confusing
         # (suggesting a bug in the contract) and misleading (the
         # build runner had already handled it upstream).
-        pattern = (build.get("pattern") or "").strip().lower()
         engine = (build.get("engine") or "").strip().lower()
-        _ACQUISITION_ENGINES = {
-            "duckdb",
-            "dlt",
-            "airbyte",
-            "meltano",
-            "kafka-connect",
-            "debezium",
-        }
-        if pattern == "acquisition" and engine in _ACQUISITION_ENGINES:
+        if _is_acquisition_build(build):
             log.debug(
                 "local planner: skipping acquisition build '%s' (engine=%s) "
                 "— handled by build_runners/<engine>/, not the SQL planner",
@@ -350,6 +341,7 @@ def plan_actions(
         source_table = _determine_source_table(
             _ei["_raw"] if isinstance(_ei.get("_raw"), dict) else {}, builds, loaded_tables, log
         )
+        landed_by = _landed_by_runner(expose_id, builds)
 
         # Infer format
         fmt = _infer_format(out_path, _ei["_format"])
@@ -365,6 +357,8 @@ def plan_actions(
                     "format": fmt,
                     "source_table": source_table,
                     "schema": _ei["_schema"],
+                    # The builds whose runners land it: validate_plan asks it for no table.
+                    **({"landed_by": landed_by} if landed_by else {}),
                 },
             }
         )
@@ -535,6 +529,41 @@ def _produced_outside_forge(expose_id: Any, builds: List[Dict[str, Any]], log: A
     return True
 
 
+#: The engines with an acquisition runner under ``build_runners/<engine>/``
+#: (``build_runners.base.ACQUISITION_ENGINES``, which this module does not
+#: import: that pulls in the dbt runner and the credential stores).
+_ACQUISITION_ENGINES = frozenset(
+    {"duckdb", "dlt", "airbyte", "meltano", "kafka-connect", "debezium"}
+)
+
+
+def _is_acquisition_build(build: Mapping[str, Any]) -> bool:
+    """``pattern: acquisition`` with an engine that has a runner: the runner
+    lands what the build writes, and this planner plans nothing for it."""
+    pattern = (build.get("pattern") or "").strip().lower()
+    engine = (build.get("engine") or "").strip().lower()
+    return pattern == "acquisition" and engine in _ACQUISITION_ENGINES
+
+
+def _landed_by_runner(expose_id: Any, builds: List[Dict[str, Any]]) -> List[str]:
+    """The ids of the builds that write ``expose_id`` when each is an
+    acquisition build (:func:`_is_acquisition_build`), else ``[]``.
+
+    The builds that write it are :func:`builds_writing_expose`'s, as for
+    :func:`_produced_outside_forge`. Their runners land the expose, so no
+    table of this plan backs it. When another build may write it, or none
+    does, the expose is planned as before.
+    """
+    producers = builds_writing_expose(expose_id, builds)
+    if not producers or not all(_is_acquisition_build(p) for p in producers):
+        return []
+    return [
+        str(b.get("id") or f"build_{i}")
+        for i, b in enumerate(builds)
+        if any(b is p for p in producers)
+    ]
+
+
 def _determine_source_table(
     expose: Dict[str, Any], builds: List[Dict[str, Any]], loaded_tables: Set[str], logger
 ) -> Optional[str]:
@@ -545,7 +574,8 @@ def _determine_source_table(
     1. expose.source_table (explicit)
     2. The output table of the last build that produced one
     3. Table matching expose ID
-    4. None (will fail at apply time)
+    4. None: an acquisition build's runner lands the expose (logged at
+       debug), or nothing backs it (warned, and validate_plan reports it)
     """
     # Check explicit source
     source = expose.get("source_table") or expose.get("source")
@@ -571,6 +601,14 @@ def _determine_source_table(
     if loaded_tables:
         return sorted(loaded_tables)[0]
 
+    landed_by = _landed_by_runner(expose_id, builds)
+    if landed_by:
+        logger.debug(
+            "local planner: expose '%s' is landed by build(s) %s; no local table to materialize",
+            expose_id,
+            ", ".join(repr(b) for b in landed_by),
+        )
+        return None
     logger.warning(f"Could not determine source table for expose {expose_id}")
     return None
 
@@ -656,7 +694,8 @@ def validate_plan(actions: List[Dict[str, Any]], logger=None) -> Tuple[bool, Lis
     Checks:
     - All load_data actions have valid paths
     - All execute_sql actions have SQL text
-    - All materialize actions have source tables
+    - All materialize actions have source tables, except one whose expose a
+      build runner lands (``payload.landed_by``)
     - No missing dependencies
 
     Returns:
@@ -685,7 +724,7 @@ def validate_plan(actions: List[Dict[str, Any]], logger=None) -> Tuple[bool, Lis
             source = payload.get("source_table")
             if not path:
                 errors.append(f"{res_id}: materialize missing output path")
-            if not source:
+            if not source and not payload.get("landed_by"):
                 errors.append(f"{res_id}: materialize missing source_table")
 
     is_valid = len(errors) == 0
