@@ -106,8 +106,9 @@ _JWT_ANCHORED_RE = re.compile(
 # dotted identifiers. Complements ``_JWT_ANCHORED_RE``, which needs three segments.
 # It starts where :data:`_JWT_ANCHORED_RE` does, for the same reason.
 _JWT_TWO_SEGMENT_RE = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
-# Two or three dotted runs (12 or more characters, then 10 or more, then 12 or more),
-# masked only when the first one holds a JOSE header (:func:`_mask_if_jose`): one
+# A run of 12 or more characters and up to four more dotted segments, empty ones
+# included (a JWE has five), masked only when the first holds a JOSE header
+# (:func:`_mask_if_jose`): one
 # written with a space or a newline (``{ "`` encodes to ``eyA``, ``{\n`` to ``ewo``;
 # trufflehog's JWT detector anchors on ``ewogIC`` for these), or one glued to a word
 # (``token_eyJ…``, ``x-eyJ…``), where the two ``eyJ`` rules do not start. It used to
@@ -116,9 +117,7 @@ _JWT_TWO_SEGMENT_RE = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Z
 # ``northwind_towers.bronze_smart_meters.smart_meters`` and the name of the next table,
 # whose last part had 11 characters. A run starts where no base64url character
 # precedes it, for the reason given above (``a-a-a-…``).
-_JWT_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{12,})?\b"
-)
+_JWT_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{12,}(?:\.[A-Za-z0-9_-]*){1,4}")
 # How many ``eyJ`` inside a run's first segment :func:`_mask_if_jose` tries as the start
 # of a header. Bounded, so a run of many cannot cost a decode each.
 _GLUED_HEADER_TRIES = 3

@@ -28,7 +28,16 @@ def _label(value: Any) -> str:
 
 
 def _verbatim(value: Any) -> str:
-    """A string as written, less the surrounding whitespace a Unity Catalog tag refuses."""
+    """A string as written, less the surrounding whitespace a Unity Catalog tag refuses.
+
+    The schema allows only strings; a YAML ``true`` or ``null`` that reaches an emitter
+    unvalidated (``fluid generate iac`` has no schema gate) is spelled as YAML spells it,
+    and ``null`` makes no tag, rather than Python's ``True`` and ``None``.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
     return str(value).strip()
 
 

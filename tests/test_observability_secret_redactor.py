@@ -719,6 +719,12 @@ _JOSE_TOKENS = {
     "glued after _": "token_" + _jose(b'{"alg":"HS256","typ":"JWT"}', _PAYLOAD, _SIGNATURE),
     "glued after -": "x-" + _jose(b'{"alg":"HS256","typ":"JWT"}', _PAYLOAD, _SIGNATURE),
     "two segments (no signature)": _jose(b'{"alg":"none"}', _PAYLOAD),
+    "JWE, direct encryption, header with spaces": _jose(
+        b'{ "alg": "dir", "enc": "A256GCM" }', b"", b"0123456789ab", b"ciphertext here", bytes(16)
+    ),
+    "JWE with a key, header with newlines": _jose(
+        b'{\n "alg": "RSA-OAEP", "enc": "A256GCM"\n}', bytes(64), b"0123456789ab", b"ct", bytes(16)
+    ),
     "two segments glued after -": "x-" + _jose(b'{"alg":"none"}', _PAYLOAD),
 }
 

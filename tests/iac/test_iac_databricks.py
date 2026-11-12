@@ -719,6 +719,15 @@ class TestTagValuesAsWritten:
             contract, "databricks-tag-value-too-long", "'grain' is 257 characters"
         )
 
+    def test_a_value_that_is_not_a_string_is_spelled_as_yaml_spells_it(self):
+        # The schema allows only strings, but ``fluid generate iac`` emits without it.
+        from fluid_build.iac.governance_labels import governance_labels
+
+        contract = _contract()
+        contract["labels"] = {"pii": True, "archived": False, "gone": None, "ratio": 1.5}
+        labels = governance_labels(contract, contract["exposes"][0], verbatim_values=True)
+        assert labels == {"pii": "true", "archived": "false", "ratio": "1.5"}
+
     def test_gcp_and_aws_labels_keep_the_label_alphabet(self):
         from fluid_build.iac.governance_labels import governance_labels
 

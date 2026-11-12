@@ -616,7 +616,7 @@ def _report_sovereignty(
                     f"  — source: {pname} provider hook"
                 )
                 for v in violations:
-                    cprint(f"  - {v}")
+                    cprint_literal(f"  - {v}")
                 warn(
                     logger,
                     "sovereignty violations reported by provider hook",
@@ -661,7 +661,7 @@ def _report_sovereignty(
     if messages:
         cprint(f"\nSovereignty check: {len(messages)} finding(s)  — {source}")
         for m in messages:
-            cprint(f"  - {m}")
+            cprint_literal(f"  - {m}")
     else:
         cprint(f"\nSovereignty check: PASS  — {source}")
 
@@ -729,9 +729,26 @@ def _gate_sovereignty(contract: Dict[str, Any], where: str, logger: logging.Logg
         f"engine, enforcementMode={mode}"
     )
     for m in messages:
-        cprint(f"  - {m}")
+        # Literal: a finding names its expose as ``[id]``, which Rich would take for markup.
+        cprint_literal(f"  - {m}")
     _report_blocked(mode, len(messages), logger)
-    raise CLIError(1, "sovereignty_violation", {"contract": where})
+    # ``errors`` and ``message``, as ``local_plan_validation_failed`` carries them: a caller
+    # of the engine API (Command Center's plan endpoint) shows a refusal that has them
+    # instead of falling back to a plan this gate never saw.
+    errors = [m.split("\n", 1)[0].split(" ", 1)[-1].strip() for m in messages if "❌" in m]
+    raise CLIError(
+        1,
+        "sovereignty_violation",
+        {
+            "command": "plan",
+            "contract": where,
+            "errors": errors or [m.split("\n", 1)[0] for m in messages],
+            "message": (
+                f"The contract's sovereignty policy (enforcementMode {mode}) blocks where it "
+                "puts data, so fluid plan wrote no plan."
+            ),
+        },
+    )
 
 
 def _hook_provider(

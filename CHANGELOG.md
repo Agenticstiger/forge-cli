@@ -82,11 +82,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the policy only with `--check-sovereignty`, so a contract `fluid validate` refuses
   (`enforcementMode: strict`, or a region in `deniedRegions`, which blocks in every mode) still
   got a plan. Now plan runs the same policy engine before it plans: a blocking verdict exits 1
-  (`ERR_SOVEREIGNTY_VIOLATION`) before any plan is written. The default check builds no cloud
-  provider. `--check-sovereignty` runs the same check, then asks the provider's own hook and
-  prints the verdict, also before the plan is written: a hook that reports nothing no longer
-  passes a contract `fluid validate` refuses. The new `--no-check-sovereignty` writes the plan
-  anyway, says so on the console and logs a WARNING (event `sovereignty_check_skipped`); it
+  (`ERR_SOVEREIGNTY_VIOLATION`) before any plan is written. The refusal names each expose and
+  carries the findings as the error's `errors`, the way `local_plan_validation_failed` does, so
+  an engine-API caller such as Command Center's plan endpoint shows it. The default check builds
+  no cloud provider. `--check-sovereignty` runs the same check, then asks the provider's own
+  hook and prints the verdict, also before the plan is written: a hook that reports nothing no
+  longer passes a contract `fluid validate` refuses. The new `--no-check-sovereignty` writes the
+  plan anyway, says so on the console and logs a WARNING (event `sovereignty_check_skipped`); it
   changes nothing in `fluid apply`, which keeps its own checks (on Databricks and GCP it refuses
   such a placement itself). The generated CI pipelines already pass `--check-sovereignty`; a
   failing plan stage now writes no plan file (one left at `--out` by an earlier run stays as it

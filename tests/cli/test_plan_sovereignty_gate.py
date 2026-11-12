@@ -364,6 +364,13 @@ class TestPlanChecksSovereigntyByDefault:
         assert not (tmp_path / "plan.json").exists()
         out = capsys.readouterr().out
         assert "us-east-1" in out and "Sovereignty check FAILED" in out
+        # The expose is named, printed literally (Rich would take "[id]" for markup).
+        assert "[customer_events]" in out
+        # The findings ride on the error, as local_plan_validation_failed's do, so an
+        # engine-API caller (Command Center's plan endpoint) can show the refusal.
+        context = excinfo.value.context
+        assert context["errors"] and all("[customer_events]" in e for e in context["errors"])
+        assert "us-east-1" in " ".join(context["errors"]) and context["message"]
 
     @pytest.mark.parametrize(
         "kwargs",
