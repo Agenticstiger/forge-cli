@@ -1269,13 +1269,15 @@ def run_ai_copilot_mode(
                     },
                 )
                 failed = f"--seed-from failed for {_seed_from!s}: {type(_seed_exc).__name__}"
-                console_error(f"{failed} (run with --verbose for details)")
+                # What load_seed accepts; there is no --verbose to point at.
+                accepts = (
+                    "--seed-from takes a *.odps.yaml or *.odcs.yaml file, or a directory of them"
+                )
+                console_error(f"{failed} ({accepts})")
                 # ``--agent``'s forge.error gets the same words, not the exception:
                 # a typed one (ProviderError) would carry its text into the event.
                 note_forge_failure(
-                    CopilotGenerationError(
-                        "forge_seed_failed", failed, suggestions=["Run with --verbose for details"]
-                    )
+                    CopilotGenerationError("forge_seed_failed", failed, suggestions=[accepts])
                 )
                 return 1
 

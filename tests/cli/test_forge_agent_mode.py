@@ -801,6 +801,10 @@ def test_agent_seed_failure_is_a_forge_error_without_the_exception_text(
     error = events[1]
     assert error["code"] == "forge_seed_failed"
     assert error["message"].startswith(f"--seed-from failed for {missing}: ")
+    # A next step that exists: forge has no --verbose flag.
+    assert error["suggestions"] == [
+        "--seed-from takes a *.odps.yaml or *.odcs.yaml file, or a directory of them"
+    ]
     assert "exception" not in error
 
 
