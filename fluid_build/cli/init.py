@@ -915,6 +915,10 @@ def _ai_mode(args, logger: logging.Logger) -> int:
         _console = console if RICH_AVAILABLE else None
         llm_config = run_ai_setup_inline(_console)
         if llm_config:
+            from fluid_build.llm.providers import remember_named_llm_provider
+
+            # FLUID_LLM_API_KEY goes only to a provider the operator named.
+            remember_named_llm_provider(args)
             args.llm_provider = llm_config.provider
             args.llm_model = llm_config.model
             args.llm_endpoint = llm_config.endpoint

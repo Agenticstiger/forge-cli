@@ -11,7 +11,8 @@ Lifted from ``cli/forge_copilot_llm_providers.py`` (host file was
   :func:`_infer_provider_from_env` /
   :func:`_infer_provider_from_keyring` — pick a provider hint from
   whatever signal we can find.
-* :func:`_resolve_api_key` — env var first, keyring fallback.
+* :func:`_resolve_api_key` — env var first, keyring fallback;
+  ``FLUID_LLM_API_KEY`` only for a provider the operator named.
 * :func:`save_api_key_to_keyring` / :func:`clear_api_key_from_keyring`
   / :func:`_get_api_key_from_keyring` / :func:`_keyring_key` —
   keyring round-trips for cloud-provider secrets.
@@ -310,8 +311,19 @@ def _infer_provider_from_keyring() -> Optional[str]:
     return None
 
 
-def _resolve_api_key(provider: str, env: Mapping[str, str]) -> Optional[str]:
-    if env.get("FLUID_LLM_API_KEY"):
+def _resolve_api_key(
+    provider: str, env: Mapping[str, str], *, named: bool = False
+) -> Optional[str]:
+    """The API key for *provider*: ``FLUID_LLM_API_KEY``, its own variable, the keyring.
+
+    ``FLUID_LLM_API_KEY`` does not say which provider the key is for, so it is
+    read only when *named* is true: the operator named *provider* for this run
+    (``--llm-provider``, ``FLUID_LLM_PROVIDER``). A provider that forge found
+    itself (a running Ollama, ``OLLAMA_HOST``, the one keyring key, the one
+    provider key variable, interactive setup's pick) gets its own key or none,
+    never a key that may belong to another vendor.
+    """
+    if named and env.get("FLUID_LLM_API_KEY"):
         return env["FLUID_LLM_API_KEY"]
     env_var = PROVIDER_ENV_VARS.get(provider)
     if env_var:

@@ -43,10 +43,7 @@ LIVE_SUBJECTS = [
 
 def _resolve_live_config_or_skip():
     """Resolve real LLM config; skip cleanly if no provider configured."""
-    from fluid_build.cli.forge_copilot_llm_providers import (
-        has_llm_api_key,
-        resolve_llm_config,
-    )
+    from fluid_build.cli.forge_copilot_llm_providers import resolve_llm_config
 
     class _Args:
         pass
@@ -62,7 +59,7 @@ def _resolve_live_config_or_skip():
 
         if not detect_ollama_available(None):
             pytest.skip("provider resolved as ollama but no local server detected")
-    elif not has_llm_api_key(config.provider):
+    elif not config.api_key:  # the key the judge sends (FLUID_LLM_API_KEY only if named)
         pytest.skip(
             f"no API key resolved for provider {config.provider!r}; "
             f"set FLUID_LLM_PROVIDER/FLUID_LLM_MODEL + the relevant API key env var to run"

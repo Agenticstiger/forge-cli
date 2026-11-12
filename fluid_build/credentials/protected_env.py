@@ -83,8 +83,8 @@ service that also finds the operator's credential outside the environment
 (keyring, a stored CLI login, an SDK config file, cloud default credentials),
 whenever the project files do not supply one that every reader sends in its
 place. A project credential a reader consults after the keyring (FLUID passes
-the key it resolved, FLUID_LLM_API_KEY else the keyring, as litellm's
-``api_key``, which beats ``GROQ_API_KEY``), or never (``CLAUDE_API_KEY`` for
+the key it resolved, FLUID_LLM_API_KEY for a named provider else the keyring,
+as litellm's ``api_key``, which beats ``GROQ_API_KEY``), or never (``CLAUDE_API_KEY`` for
 litellm), is a decoy and pairs nothing; :attr:`EndpointGroup.paired_by` lists,
 per code path, the credentials that do. :data:`ENDPOINT_CREDENTIAL_GROUPS`
 lists the services and where each variable is read; the names litellm reads
@@ -356,7 +356,8 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS",
         "OLLAMA_HOST",
         # litellm's ollama/ route reads this one, and sends it the key FLUID
-        # resolved (FLUID_LLM_API_KEY or the keyring) as a bearer token
+        # resolved (FLUID_LLM_API_KEY for a named ollama, or the keyring) as a
+        # bearer token
         "OLLAMA_API_BASE",
         "VAULT_ADDR",
         # litellm routes every model call to this proxy when the switch is
@@ -883,17 +884,22 @@ class EndpointGroup:
     connection_string_passwords: Tuple[str, ...] = ()
 
 
-# ``llm/provider_resolve._resolve_api_key`` prefers it for every provider and
-# passes the result to litellm as ``api_key``, which beats the provider's own
-# key variable.
+# ``llm/provider_resolve._resolve_api_key`` prefers it for a provider the
+# operator named (``--llm-provider``, ``FLUID_LLM_PROVIDER``) and passes the
+# result to litellm as ``api_key``, which beats the provider's own key
+# variable. A provider forge picks itself never gets it, and forge can pick
+# openai, anthropic and gemini (the one keyring key or key variable), github
+# (interactive setup reads PROVIDER_ENV_VARS) and ollama. A project
+# FLUID_LLM_API_KEY is a decoy for those (the operator's keyring key goes out),
+# so it pairs only the endpoints of providers forge reaches by being named.
 _LLM_KEY = "FLUID_LLM_API_KEY"
 # ``_resolve_api_key`` then reads the provider's PROVIDER_ENV_VARS name (only
 # openai, anthropic, gemini and github have one) and falls back to the key
 # ``fluid ai setup`` saved in the keyring, which also beats a provider key
 # variable that litellm would read.
 _LLM_KEYRING = (
-    "the key comes from FLUID_LLM_API_KEY, the provider's PROVIDER_ENV_VARS name, then the "
-    "keyring (llm/provider_resolve.py)"
+    "the key comes from FLUID_LLM_API_KEY when the provider is named, the provider's "
+    "PROVIDER_ENV_VARS name, then the keyring (llm/provider_resolve.py)"
 )
 _GOOGLE_CREDENTIALS: Tuple[str, ...] = (
     "GOOGLE_APPLICATION_CREDENTIALS",
@@ -929,7 +935,8 @@ ENDPOINT_CREDENTIAL_GROUPS: Tuple[EndpointGroup, ...] = (
             "project OPENAI_BASE_URL from the codex environment unless the project "
             "supplies CODEX_API_KEY too"
         ),
-        paired_by=(("OPENAI_API_KEY", _LLM_KEY),),
+        # not _LLM_KEY: forge can pick openai without it being named
+        paired_by=(("OPENAI_API_KEY",),),
     ),
     EndpointGroup(
         service="Anthropic",
@@ -949,7 +956,8 @@ ENDPOINT_CREDENTIAL_GROUPS: Tuple[EndpointGroup, ...] = (
             "stored subscription login to ANTHROPIC_BASE_URL; only ANTHROPIC_API_KEY "
             "comes before the ambient credential on both paths"
         ),
-        paired_by=(("ANTHROPIC_API_KEY", _LLM_KEY), ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")),
+        # not _LLM_KEY: forge can pick anthropic without it being named
+        paired_by=(("ANTHROPIC_API_KEY",), ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")),
     ),
     EndpointGroup(
         service="Azure OpenAI",
@@ -980,7 +988,8 @@ ENDPOINT_CREDENTIAL_GROUPS: Tuple[EndpointGroup, ...] = (
             "GEMINI_API_KEY); google-genai (GOOGLE_GEMINI_BASE_URL); "
             f"{_LLM_KEYRING}, and for gemini also GEMINI_API_KEY and GOOGLE_API_KEY"
         ),
-        paired_by=((_LLM_KEY, "GOOGLE_API_KEY", "GEMINI_API_KEY"),),
+        # not _LLM_KEY: forge can pick gemini without it being named
+        paired_by=(("GOOGLE_API_KEY", "GEMINI_API_KEY"),),
     ),
     EndpointGroup(
         service="Groq",
@@ -1018,7 +1027,8 @@ ENDPOINT_CREDENTIAL_GROUPS: Tuple[EndpointGroup, ...] = (
             "litellm's github/ route (GITHUB_API_BASE; the key is GITHUB_API_KEY, "
             f"llm/providers.py PROVIDER_ENV_VARS); {_LLM_KEYRING}"
         ),
-        paired_by=((_LLM_KEY, "GITHUB_API_KEY"),),
+        # not _LLM_KEY: interactive setup can pick github without it being named
+        paired_by=(("GITHUB_API_KEY",),),
     ),
     EndpointGroup(
         service="Amazon Bedrock",
@@ -1460,7 +1470,9 @@ ENDPOINT_CREDENTIAL_GROUPS: Tuple[EndpointGroup, ...] = (
 #: account ids its provider code chooses a host from (DATAROBOT_ENDPOINT,
 #: SNOWFLAKE_ACCOUNT_ID, GIGACHAT_AUTH_URL ...); FLUID routes any provider name
 #: litellm knows (``llm/providers.py`` falls back to litellm's catch-all),
-#: handing it the key ``_resolve_api_key`` found. Only the names litellm reads
+#: handing it the key ``_resolve_api_key`` found. Forge never picks one of these
+#: itself: it reaches them only by being named, so FLUID_LLM_API_KEY comes first
+#: and pairs them. Only the names litellm reads
 #: (``litellm_endpoints.py``): any other ``<NAME>_API_BASE`` is the project's own
 #: and follows the name-shape rule.
 UNLISTED_LLM_ENDPOINTS = EndpointGroup(

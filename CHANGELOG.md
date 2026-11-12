@@ -96,6 +96,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   go to, passed only when the operator states one. A provider plugin that overrides the method
   with the two-argument signature keeps working until an endpoint is stated.
 
+### Security
+
+- **`FLUID_LLM_API_KEY` goes only to a provider you name.** The key does not say which vendor it
+  is for, yet forge sent it to whatever provider it picked, including one it only inferred: a
+  running Ollama or the one `OLLAMA_HOST` names (as `Authorization: Bearer`, in cleartext when
+  the host is http), the provider of the one key saved in the keyring, or the provider of the one
+  key variable set. So an OpenAI key could reach a local or remote Ollama, or Anthropic. Forge
+  now uses it only when `--llm-provider` or `FLUID_LLM_PROVIDER` names the provider the run uses.
+  A provider forge picks itself gets its own key variable, then its keyring key, and a warning
+  says the generic key was not used. In interactive `fluid forge` and `fluid init`, the provider
+  that setup finds counts as picked, not named. `fluid ai test` reads the key only with
+  `--llm-provider`, and `fluid doctor` counts it only with `FLUID_LLM_PROVIDER`. A named Ollama
+  still gets the key (ollama.com, a token proxy). If you used the key with a provider forge
+  inferred, name that provider: `--llm-provider <name>` or `FLUID_LLM_PROVIDER=<name>`.
+- **A project `.env` can no longer pair an OpenAI, Anthropic, Gemini or GitHub endpoint with
+  `FLUID_LLM_API_KEY`.** Forge can pick these providers without a name, and then it sends the
+  operator's keyring key, not the project's `FLUID_LLM_API_KEY`, so `OPENAI_BASE_URL`,
+  `ANTHROPIC_BASE_URL`, `GEMINI_API_BASE`, `GITHUB_API_BASE` and the like in a project file now
+  need the provider's own key variable beside them (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+  `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `GITHUB_API_KEY`). Endpoints of providers forge reaches
+  only by name (`GROQ_API_BASE`, `DEEPSEEK_API_BASE` ...) still pair with it.
+
 ## [0.28.0] — 2026-11-06
 
 ### Added

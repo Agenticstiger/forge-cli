@@ -4,13 +4,14 @@
 """Where litellm reads an LLM provider's endpoint, vendored.
 
 ``credentials.protected_env`` pairs these with ``FLUID_LLM_API_KEY`` only:
-FLUID routes any provider litellm knows and passes it the key it resolved
-(``FLUID_LLM_API_KEY``, else the keyring), which beats a provider key in the
-project's files. A group in ``protected_env`` that lists one of the names
-(``IBM watsonx``, ``OpenAI`` ...) pairs it by its own rule instead, and a name
-litellm sends something else to (``LITELLM_PROXY_API_BASE``, the GitHub
-Copilot ones) is protected outright. Any other ``<NAME>_API_BASE`` is the
-project's own setting and follows the name-shape rule.
+FLUID routes any provider litellm knows, only when the operator names it, and
+passes it the key it resolved (``FLUID_LLM_API_KEY``, else the keyring), which
+beats a provider key in the project's files. A group in ``protected_env`` that
+lists one of the names (``IBM watsonx``, ``OpenAI`` ...) pairs it by its own
+rule instead, and a name litellm sends something else to
+(``LITELLM_PROXY_API_BASE``, the GitHub Copilot ones) is protected outright.
+Any other ``<NAME>_API_BASE`` is the project's own setting and follows the
+name-shape rule.
 
 Vendored because importing litellm takes seconds and dotenv hydration runs on
 every command. Generated from the litellm 1.83.14, 1.97.0, 1.105.0, 1.106.0,

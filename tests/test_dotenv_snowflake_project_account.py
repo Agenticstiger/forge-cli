@@ -337,11 +337,14 @@ def test_a_blank_operator_credential_pairs_only_an_account_behind_a_blank_variab
 
 def test_a_blank_operator_llm_key_still_unpairs_an_llm_endpoint() -> None:
     # FLUID reads a blank FLUID_LLM_API_KEY as unset and takes the keyring key.
-    project = {"OPENAI_API_BASE": "https://llm.project.test", "FLUID_LLM_API_KEY": PROJECT_KEY}
+    # (DEEPSEEK_API_BASE: forge reaches deepseek only by name, so FLUID_LLM_API_KEY
+    # pairs it at all.)
+    project = {"DEEPSEEK_API_BASE": "https://llm.project.test", "FLUID_LLM_API_KEY": PROJECT_KEY}
 
-    refused = unpaired_endpoints(project, {"OPENAI_API_BASE": "", "FLUID_LLM_API_KEY": ""})
+    refused = unpaired_endpoints(project, {"DEEPSEEK_API_BASE": "", "FLUID_LLM_API_KEY": ""})
 
-    assert "OPENAI_API_BASE" in refused
+    assert unpaired_endpoints(project, {}) == {}
+    assert "DEEPSEEK_API_BASE" in refused
 
 
 def test_a_dropped_account_is_reported_while_the_shell_s_variable_is_blank(

@@ -1177,8 +1177,14 @@ class TestHasLlmApiKey:
         assert has_llm_api_key("gemini", {"GEMINI_API_KEY": "AIza-test"}) is True
         assert has_llm_api_key("gemini", {"GOOGLE_API_KEY": "AIza-test"}) is True
 
-    def test_generic_fluid_key_counts_for_hosted_provider(self):
-        assert has_llm_api_key("openai", {"FLUID_LLM_API_KEY": "sk-test"}) is True
+    def test_generic_fluid_key_counts_only_for_a_named_provider(self, monkeypatch):
+        monkeypatch.setattr(
+            "fluid_build.cli.forge_copilot_llm_providers._get_api_key_from_keyring",
+            lambda provider: None,
+        )
+        assert has_llm_api_key("openai", {"FLUID_LLM_API_KEY": "sk-test"}, named=True) is True
+        # FLUID_LLM_API_KEY names no vendor, so it is no key for a provider forge picked.
+        assert has_llm_api_key("openai", {"FLUID_LLM_API_KEY": "sk-test"}) is False
 
     def test_missing_hosted_key_is_false(self, monkeypatch):
         monkeypatch.setattr(
@@ -1207,13 +1213,16 @@ class TestKeyringResolution:
             result = _resolve_api_key("openai", {"OPENAI_API_KEY": "env-secret"})
         assert result == "env-secret"
 
-    def test_fluid_llm_api_key_takes_priority_over_keyring(self):
+    def test_fluid_llm_api_key_takes_priority_over_keyring_for_a_named_provider(self):
         with patch(
             "fluid_build.cli.forge_copilot_llm_providers._get_api_key_from_keyring",
             return_value="keyring-secret",
         ):
-            result = _resolve_api_key("openai", {"FLUID_LLM_API_KEY": "generic-key"})
-        assert result == "generic-key"
+            named = _resolve_api_key("openai", {"FLUID_LLM_API_KEY": "generic-key"}, named=True)
+            picked = _resolve_api_key("openai", {"FLUID_LLM_API_KEY": "generic-key"})
+        assert named == "generic-key"
+        # A provider forge picked itself gets its own key, never the generic one.
+        assert picked == "keyring-secret"
 
     def test_keyring_returns_none_when_not_available(self):
         with patch(

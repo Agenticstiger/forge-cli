@@ -1861,6 +1861,11 @@ def _run_main(args, logger: logging.Logger) -> int:
             # 3. Nothing found → prompts user interactively
             llm_config = run_ai_setup_inline(console)
             if llm_config:
+                from fluid_build.llm.providers import remember_named_llm_provider
+
+                # First keep what the operator named: FLUID_LLM_API_KEY goes only to
+                # that provider, never to the one setup found.
+                remember_named_llm_provider(args)
                 # Inject into args so copilot's resolve_llm_config() finds them
                 args.llm_provider = llm_config.provider
                 args.llm_model = llm_config.model
