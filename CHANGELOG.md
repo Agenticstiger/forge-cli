@@ -96,6 +96,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls that would lend the view owner's rights to its readers. Verified live on Databricks Free
   Edition with the semantics block of an industry-model gold product (`HONESTLY_TESTED.md`).
 
+- **`fluid test` checks a Databricks product live, and can keep its results in Unity Catalog.**
+  `fluid test` used to answer "Live validation against Unity Catalog is not available" for
+  `platform: databricks`. It now reads the table's columns from the Unity Catalog tables API
+  (no compute), and runs the row count and every `dq.rules[]` entry as SQL on
+  `DATABRICKS_WAREHOUSE_ID`, signing in as `fluid apply` and `fluid verify` do (the
+  `[databricks]` extra). Bronze products count like dbt-built ones. Two new flags:
+  - `--results-table CATALOG.SCHEMA.TABLE` appends one row per check of the run (each rule, then
+    each structural check, the same cases `--output junit` reports, which still works beside
+    it): run id and time, product id, version and layer, expose and table, rule id, type and
+    severity, passed, observed value, threshold, message, forge version. The table is created if
+    missing in a schema the operator already has; forge never creates the catalog or the schema,
+    refuses the product's own schema (before any check runs), and writes nothing into an
+    existing table without these columns. A run is appended in one statement, so it is never
+    half-written, and every value is a bound parameter. It refuses `--no-data`, which runs no
+    live check to record; Databricks schemas are read live, never from the validation cache.
+  - `--results-dashboard WORKSPACE_PATH` keeps an AI/BI (Lakeview) dashboard over that table:
+    the pass rate of the latest runs, the pass rate per product (coloured by layer), the failing
+    checks and the daily trend. It is found by its workspace path (no state file, so ephemeral CI
+    agents never duplicate it), created on first use, updated only when its definition changed,
+    and published without embedded credentials.
+  The row shape follows Databricks Labs DQX's summary-metrics table and Elementary's test
+  results; the dashboard lookup follows databricks-solutions/ai-dev-kit. No code is taken from
+  either.
+
 ### Changed
 
 - **`fluid apply --mode amend-and-build` runs a Databricks dbt build now.** A dbt build with
@@ -133,8 +157,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The MCP query compiler and the Databricks metric view render a measure's aggregate through one
   helper (`forge_datamodel/semantics_builder.py::aggregate_call`); the compiler's SQL and errors
   are unchanged.
+- **The native quality engine runs the rules a contract already declares in full.** A
+  `valid_values` rule that names no values takes them from its column: its `enum`
+  validationRule (`"A | B"` or `"A,B"`), its `regex` validationRule, its `range`
+  validationRule (`">= 0"`, `">= 0 and <= 100"`, `"between 0 and 100"`), or its
+  `labels.references: <product id>.<column>` (on Databricks, the referenced product's table is
+  found by the `fluid_product_id` tag `fluid apply` puts on it, the tested table's catalog
+  first, and every non-null value must be in its column). A `completeness`, `accuracy` or
+  `valid_values` rule may list several comma-separated columns, each of which must hold (a
+  `valid_values` column against its own declaration); a `uniqueness` or `freshness` rule over
+  several columns is reported as not run, never guessed. A `schema` rule passes when the live
+  table has every contract column with its type, and fails, at the rule's severity, when it
+  does not or could not be read. An `accuracy` rule with no threshold is reported as not run
+  (it used to pass whenever the column held a value). Every rule's result, passed or not, now
+  carries what was measured (`--output json` adds `rule_id`, `rule_type` and `expose_id` to
+  each check). `--engine soda` renders the same column declarations (`valid values`,
+  `valid regex`, `valid min` / `valid max`, one check per listed column); a reference or a
+  strict bound stays unmapped there. On the tower-management industry pack `fluid test` ran
+  38 of its 168 rules before; it now runs every rule of every deployed product.
 
 ### Fixed
+
+- **Quality checks measured a constant on BigQuery (and would have on Databricks).** The
+  completeness, uniqueness, accuracy and valid_values checks quoted their column the ANSI way,
+  `"col"`, which BigQuery and Spark SQL read as a string literal, and cast ratios to
+  `DOUBLE PRECISION`, which neither has. Columns are now backtick-quoted and ratios cast to
+  `FLOAT64` / `DOUBLE` on those two dialects; ANSI, DuckDB and Snowflake SQL is unchanged.
+- **A valid value containing a quote never matched on BigQuery or Databricks.** String literals
+  doubled the quote (`'it''s'`), which Databricks reads as the adjacent literals `'it'` and `'s'`
+  (checked on a SQL warehouse: the value becomes `its`) and BigQuery rejects. The new
+  `_sql_safety.quote_string_literal_for(dialect, value)` escapes it as `\'` there, after
+  doubling every backslash, so no value can end the literal early.
 
 - **`fluid ai models --provider` works, and takes the names `fluid forge --llm-provider`
   takes.** The flag stored its value where the global infrastructure `--provider` keeps its
