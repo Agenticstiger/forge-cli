@@ -48,6 +48,14 @@ def digest_ident(value: str) -> str:
     return f"{safe_ident(value)}_{_digest(value, 32)}"
 
 
+def bounded_ident(text: str, limit: int, sep: str = "_") -> str:
+    """``text``, or, when it is longer than ``limit``, its first characters, ``sep`` and an
+    8-digit digest of the whole: a name a service caps, whose cut forms stay distinct."""
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 9]}{sep}{_digest(text, 8)}"
+
+
 def _digest(value: str, length: int) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
 

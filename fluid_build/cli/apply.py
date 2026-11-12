@@ -2157,10 +2157,10 @@ def run(args, logger: logging.Logger) -> int:
         # not silently dropped on the cloud-provider path.
         if rc == 0 and needs_build(resolved_mode):
             args.build_id = resolved_build_id
-            from fluid_build.build_runners import run_builds_from_args
+            from fluid_build.cli._apply_opentofu_engine import build_after_apply
 
             jobs = _jobs_from_state(engine_kwargs, source_contract)
-            return run_builds_from_args(args, logger, force_run=True, **build_kwargs, **jobs)
+            return build_after_apply(args, logger, source_contract, {**build_kwargs, **jobs})
         return rc
 
     try:

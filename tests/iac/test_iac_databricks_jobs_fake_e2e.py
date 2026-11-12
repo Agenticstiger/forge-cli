@@ -315,3 +315,29 @@ def test_a_failed_run_fails_amend_and_build_with_dbt_s_output(workspace, fake, c
     assert "task 'dbt': dbt command failed" in out
     assert "A column with name `nope` cannot be resolved." in out
     assert "Failed: 1" in out
+
+
+def test_a_job_that_writes_a_keyed_table_declares_its_keys_again_after_dbt(workspace, fake, capfd):
+    document = job_contract()
+    document["exposes"][0]["contract"]["schema"][0]["tags"] = ["primary-key"]
+    path = write_contract(workspace, document)
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    settings = _only_job(fake)["settings"]
+    dbt_task, keys_task = settings["tasks"]
+    assert dbt_task["task_key"] == "dbt"
+    assert keys_task["task_key"] == "fluid_keys"
+    assert keys_task["depends_on"] == [{"task_key": "dbt"}]
+    assert keys_task["sql_task"] == {
+        "warehouse_id": fake.warehouse_id,
+        "file": {"path": f"/Workspace{ROOT}/fluid_keys.sql", "source": "WORKSPACE"},
+    }
+    script = fake.file_content(f"{ROOT}/fluid_keys.sql").decode("utf-8")
+    assert "DECLARE CONTINUE HANDLER FOR SQLEXCEPTION" in script
+    assert (
+        "ALTER TABLE `main`.`sales`.`orders` ADD CONSTRAINT `fluid_pk_orders` PRIMARY KEY (`id`)"
+        in script
+    )
+    # The provider reads back the task and the file as it sent them.
+    assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]
