@@ -106,8 +106,8 @@ _JWT_ANCHORED_RE = re.compile(
 # dotted identifiers. Complements ``_JWT_ANCHORED_RE``, which needs three segments.
 # It starts where :data:`_JWT_ANCHORED_RE` does, for the same reason.
 _JWT_TWO_SEGMENT_RE = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
-# A run of 12 or more characters and up to four more dotted segments, empty ones
-# included (a JWE has five), masked only when the first holds a JOSE header
+# A run of 12 or more characters and every dotted segment after it, empty ones included
+# (a JWE has five), masked from the first segment that holds a JOSE header
 # (:func:`_mask_if_jose`): one
 # written with a space or a newline (``{ "`` encodes to ``eyA``, ``{\n`` to ``ewo``;
 # trufflehog's JWT detector anchors on ``ewogIC`` for these), or one glued to a word
@@ -117,10 +117,10 @@ _JWT_TWO_SEGMENT_RE = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Z
 # ``northwind_towers.bronze_smart_meters.smart_meters`` and the name of the next table,
 # whose last part had 11 characters. A run starts where no base64url character
 # precedes it, for the reason given above (``a-a-a-…``).
-_JWT_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{12,}(?:\.[A-Za-z0-9_-]*){1,4}")
-# How many ``eyJ`` inside a run's first segment :func:`_mask_if_jose` tries as the start
-# of a header. Bounded, so a run of many cannot cost a decode each.
-_GLUED_HEADER_TRIES = 3
+_JWT_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{12,}(?:\.[A-Za-z0-9_-]*)+")
+# How many places inside one segment :func:`_mask_if_jose` tries as the start of a glued
+# header. Bounded, so a segment of many cannot cost a decode each.
+_GLUED_HEADER_TRIES = 6
 _BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)([^\s,;]+)")
 # SECURITY_REVIEW S-010: provider-specific token shapes. These don't
 # need surrounding assignment syntax — the string itself is distinctive
@@ -602,38 +602,57 @@ def _mask_assignment(match: "re.Match[str]") -> str:
 
 
 def _is_jose_header(segment: str) -> bool:
-    """Whether ``segment`` is a JOSE protected header: base64url of a JSON object.
+    """Whether ``segment`` is a JOSE protected header: base64url of a JSON object with
+    the ``alg`` member that RFC 7515 and RFC 7516 (section 4.1.1 each) require.
 
     detect-secrets' ``JwtTokenDetector.is_formally_valid`` checks a JWT the same way,
-    by decoding its parts and parsing them as JSON. A dotted name's first part decodes
-    to bytes that are not JSON. The imports are deferred: ``base64`` stays off the
-    ``fluid --help`` path, which loads this module for its logging filter.
+    by decoding its parts and parsing them as JSON. A dotted name's part decodes to
+    bytes that are not JSON, and ``alg`` keeps a short one such as ``e30`` (``{}``) from
+    counting. The imports are deferred: ``base64`` stays off the ``fluid --help`` path,
+    which loads this module for its logging filter.
     """
     import base64
     import json
 
     try:
-        decoded = base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
-        return isinstance(json.loads(decoded), dict)
+        decoded = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+        return isinstance(decoded, dict) and "alg" in decoded
     except (ValueError, RecursionError):
         # binascii.Error, UnicodeDecodeError and JSONDecodeError are ValueErrors.
         return False
 
 
+def _holds_jose_header(segment: str) -> bool:
+    """Whether ``segment`` is a JOSE header, or ends in one glued to a word.
+
+    A header is base64url of ``{``, so it starts with ``e``: a glued one starts at an
+    ``e`` after ``-`` or ``_`` (``x-ewog…``, ``token_eyAi…``) or at an ``eyJ``
+    (``tokeneyJ…``). At most :data:`_GLUED_HEADER_TRIES` of those places are tried.
+    """
+    if _is_jose_header(segment):
+        return True
+    tries = 0
+    at = segment.find("e", 1)
+    while at > 0 and tries < _GLUED_HEADER_TRIES:
+        if segment[at - 1] in "-_" or segment.startswith("eyJ", at):
+            tries += 1
+            if _is_jose_header(segment[at:]):
+                return True
+        at = segment.find("e", at + 1)
+    return False
+
+
 def _mask_if_jose(match: "re.Match[str]", placeholder: str) -> str:
-    """``placeholder`` when the ``_JWT_RE`` run ``match`` is a JOSE token, else the run."""
-    run = match.group(0)
-    first = run.split(".", 1)[0]
-    if _is_jose_header(first):
-        return placeholder
-    at = first.find("eyJ", 1)
-    for _ in range(_GLUED_HEADER_TRIES):
-        if at < 0:
-            break
-        if _is_jose_header(first[at:]):
-            return placeholder
-        at = first.find("eyJ", at + 1)
-    return run
+    """The ``_JWT_RE`` run ``match`` with the JOSE token in it masked, else unchanged.
+
+    The token may start in any segment: one glued after a dotted name
+    (``northwind_towers.x-<header>.<payload>``) is masked, the name kept.
+    """
+    segments = match.group(0).split(".")
+    for index, segment in enumerate(segments):
+        if _holds_jose_header(segment):
+            return ".".join(segments[:index] + [placeholder])
+    return match.group(0)
 
 
 def redact_jose_tokens(text: str, *, placeholder: str = _REDACTED) -> str:

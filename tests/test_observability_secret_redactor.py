@@ -789,6 +789,31 @@ class TestJoseTokensAndDottedNames:
         runs = "aGVhZGVyMTIzNDU2.cGF5bG9hZDEyMzQ1Ng.c2lnbmF0dXJlMTIz"
         assert redact_secret_text(f"id {runs} end") == f"id {runs} end"
 
+    @pytest.mark.parametrize(
+        "glued",
+        [
+            "northwind_towers.x-" + _jose(b'{"alg":"none"}', _PAYLOAD),
+            "northwind_towers.bronze_smart_meters.smart_meters.reading.x-"
+            + _jose(b'{"alg":"none"}', _PAYLOAD),
+            "token_"
+            + _jose(b'{ "alg": "dir", "enc": "A256GCM" }', b"", b"0123456789ab", b"ct", b"tag"),
+            "x-" + _jose(b'{\n "alg": "HS256"\n}', _PAYLOAD, _SIGNATURE),
+        ],
+    )
+    def test_a_header_glued_anywhere_in_a_run_is_found(self, glued):
+        from fluid_build.providers.snowflake.util.logging import redact_string
+
+        for out in (redact_secret_text(f"got {glued} end"), redact_string(f"got {glued} end")):
+            assert _leaked(glued.split("x-")[-1].split("token_")[-1], out) == []
+        assert redact_secret_text(f"got {glued} end").startswith(
+            "got northwind_towers." if glued.startswith("northwind") else "got "
+        )
+
+    def test_a_short_json_part_of_a_name_is_no_header(self):
+        # e30 is base64url of {}: JSON, but no JOSE header has no alg.
+        name = "northwind_towers.e30.daily_revenue_summary"
+        assert redact_secret_text(f"loaded {name}") == f"loaded {name}"
+
     def test_the_words_after_a_token_are_kept(self):
         token = _JOSE_TOKENS["compact JWS"]
         assert redact_secret_text(f"got {token}.Next step") == "got ***REDACTED***.Next step"
