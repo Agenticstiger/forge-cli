@@ -127,13 +127,13 @@ def test_the_error_has_catalog_suggestions():
     assert suggestions_for("copilot_no_llm_provider")
 
 
-def test_a_saved_setup_choice_is_named_instead_of_asking_to_run_setup(monkeypatch):
-    # Commands that do not read the saved choice (non-interactive forge) say so.
+def test_a_saved_setup_choice_selects_its_provider(monkeypatch):
+    # A run without a TTY reads the saved choice too, so what is missing is
+    # that provider's key, not a provider.
     monkeypatch.setattr(
         "fluid_build._ai_config_shared.load_ai_config", lambda *a, **k: {"provider": "anthropic"}
     )
     with pytest.raises(CopilotGenerationError) as info:
         resolve_llm_config(_args(), _NOTHING)
-    assert info.value.event == "copilot_no_llm_provider"
-    assert "'fluid ai setup' saved anthropic" in info.value.message
-    assert "--llm-provider anthropic" in info.value.message
+    assert info.value.event == "copilot_missing_llm_api_key"
+    assert "anthropic" in info.value.message

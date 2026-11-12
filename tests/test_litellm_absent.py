@@ -487,6 +487,24 @@ class TestLeanKeylessAutoPick:
         with pytest.raises(MissingOptionalDependency):
             preflight_llm_provider(self._args(), env)
 
+    def test_a_saved_agent_passes_the_preflight(self, block, monkeypatch, tmp_path):  # noqa: F811
+        # ``fluid ai setup`` saved a coding agent, which needs no litellm: the run
+        # uses it, as the selection ladder does.
+        from fluid_build.llm.providers import _provider_name_from, preflight_llm_provider
+
+        env = self._lean(block, monkeypatch, tmp_path, saved={"provider": "claude-code"})
+        preflight_llm_provider(self._args(), env)
+        assert _provider_name_from(self._args(), env) == "claude-code"
+
+    def test_a_saved_agent_with_a_stated_endpoint_still_fails_fast(
+        self, block, monkeypatch, tmp_path
+    ):  # noqa: F811
+        from fluid_build.llm.providers import preflight_llm_provider
+
+        env = self._lean(block, monkeypatch, tmp_path, saved={"provider": "claude-code"})
+        with pytest.raises(MissingOptionalDependency):
+            preflight_llm_provider(self._args(llm_endpoint="http://onprem.internal/v1"), env)
+
     def test_a_tty_still_fails_fast(self, block, monkeypatch, tmp_path):  # noqa: F811
         from fluid_build.llm.providers import preflight_llm_provider
 
@@ -552,8 +570,13 @@ class TestDoctorStatus:
         ):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setattr("fluid_build._ai_config_shared.load_ai_config", lambda *a, **k: None)
-        for name in ("_infer_provider_from_keyring", "_infer_provider_from_ambient"):
-            monkeypatch.setattr(f"fluid_build.llm.providers.{name}", lambda *a, **k: None)
+        # Readiness walks the selection ladder: empty its keyring, Ollama and
+        # agent rungs at their inputs.
+        monkeypatch.setattr("fluid_build.llm.providers._get_api_key_from_keyring", lambda n: None)
+        monkeypatch.setattr("fluid_build.llm.providers.detect_ollama_available", lambda env: False)
+        monkeypatch.setattr(
+            "fluid_build.llm.provider_resolve._first_coding_agent_on_path", lambda env: None
+        )
         row = self._row(monkeypatch)
         assert "Not configured" in row["status"]
         assert "fluid ai setup" in row["details"]
