@@ -466,6 +466,9 @@ def _cancelled_if_interrupted(api: Any, run_id: int, say: Say) -> Iterator[None]
             try:
                 signal.signal(signum, handler)
             except (TypeError, ValueError, OSError):
+                # Best effort: a handler Python cannot set back (one installed from C reads
+                # as None) is left as it is; the wait is over, and failing here would hide
+                # the build's own result.
                 pass
 
 
