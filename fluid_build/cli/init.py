@@ -932,15 +932,20 @@ def _ai_mode(args, logger: logging.Logger) -> int:
             if fill_llm_args_from_setup(args, llm_config) and llm_config.api_key:
                 set_session_env(llm_config.provider, llm_config.api_key)
         elif not named:
+            from fluid_build._optional import is_available
+            from fluid_build.llm.providers import ambiguous_keys_message
+
+            if is_available("litellm") and ambiguous_keys_message(os.environ):
+                # Setup named the keys of two or more providers and chose none:
+                # stop, as forge does without a TTY, rather than write a template.
+                return 1
             if RICH_AVAILABLE:
                 from .forge_dialogs import print_dialog_status
 
                 print_dialog_status(
                     console,
                     status="info",
-                    # "selected": setup also returns nothing when keys for two
-                    # providers are set, after naming them.
-                    message="No AI provider selected — using template mode instead.",
+                    message="No AI provider configured — using template mode instead.",
                     detail="Run 'fluid ai setup' anytime to enable AI-assisted generation.",
                 )
             args.template = "customer-360"

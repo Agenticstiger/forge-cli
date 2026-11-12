@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing naming a provider, a run without a TTY skipped both keys and used a running local
   Ollama, and interactive setup used the first key it found. Forge now stops with
   `copilot_no_llm_provider` and names the keys, without asking Ollama; interactive setup,
-  `fluid ai test` and `fluid doctor` say the same and use none of them. A `fluid ai setup`
+  `fluid ai test` and `fluid doctor` say the same and use none of them, and `fluid init`'s AI
+  path exits 1 where it used to write a template instead. A `fluid ai setup`
   choice and a single keyring key still come first, and `GEMINI_API_KEY` with `GOOGLE_API_KEY` is
   one provider. Pick one with `--llm-provider` or `FLUID_LLM_PROVIDER`.
 

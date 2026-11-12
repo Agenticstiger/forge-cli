@@ -732,3 +732,45 @@ def test_ai_test_knows_an_agent_in_any_spelling(world: _World, spelling: str) ->
     assert config is None
     assert "does not test" in error
     assert spelling.lower().replace("_", "-") in error
+
+
+def _init_ai_mode_without_setup(world: _World, tmp_path: Path) -> Tuple[int, List[str]]:
+    """``fluid init``'s AI path where setup found nothing; returns (rc, templates written)."""
+    from fluid_build.cli import init as init_mod
+
+    world.monkeypatch.chdir(tmp_path)
+    templates: List[str] = []
+
+    def _template(args: Namespace, _logger: logging.Logger) -> int:
+        templates.append(args.template)
+        return 0
+
+    with (
+        mock.patch("fluid_build.cli.ai_setup.run_ai_setup_inline", lambda console: None),
+        mock.patch.object(init_mod, "template_mode", _template),
+    ):
+        rc = init_mod._ai_mode(Namespace(name="demo-product", yes=True), logging.getLogger("t"))
+    return rc, templates
+
+
+def test_init_stops_when_setup_named_two_keys(world: _World, tmp_path: Path) -> None:
+    # Setup printed the keys and chose none; init must not write a template instead.
+    for name, value in _TWO_KEYS.items():
+        world.monkeypatch.setenv(name, value)
+
+    assert _init_ai_mode_without_setup(world, tmp_path) == (1, [])
+
+
+def test_init_still_uses_a_template_when_nothing_is_configured(
+    world: _World, tmp_path: Path
+) -> None:
+    assert _init_ai_mode_without_setup(world, tmp_path) == (0, ["customer-360"])
+
+
+def test_ai_test_says_the_ide_answers_mcp_sampling(world: _World) -> None:
+    world.monkeypatch.setenv("FLUID_LLM_PROVIDER", "MCP-Sampling")
+
+    config, error = _ai_test()
+
+    assert config is None
+    assert "does not test mcp-sampling" in error and "IDE" in error and "doctor" not in error

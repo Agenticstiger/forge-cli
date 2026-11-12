@@ -253,9 +253,15 @@ def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[st
     # registry does not list ``mcp-sampling``, so lower-case it here.
     agent = (_canonical_provider_name(named) or "").lower()
     if agent in _NON_LITELLM_PROVIDERS:
+        agent = agent.replace("_", "-")
+        if agent == "mcp-sampling":
+            return None, (
+                "fluid ai test does not test mcp-sampling: the IDE that runs forge's MCP "
+                "server answers those calls with its own model."
+            )
         return None, (
-            f"fluid ai test does not test {agent.replace('_', '-')}: forge hands its calls "
-            "to that agent, which signs in by itself. 'fluid doctor' checks that it is installed."
+            f"fluid ai test does not test {agent}: forge hands its calls to that agent's "
+            "CLI, which signs in by itself. 'fluid doctor' checks that the CLI is installed."
         )
     provider_override = _normalize_ai_test_provider(named)
     model_override = getattr(args, "llm_model", None) or os.environ.get("FLUID_LLM_MODEL")
