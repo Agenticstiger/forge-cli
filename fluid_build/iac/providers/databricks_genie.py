@@ -1034,34 +1034,43 @@ def _broadest(acl: Any, folder: str) -> Tuple[str, str]:
     level this module does not know could hide a grant to every user."""
     entries = acl.get("access_control_list") if isinstance(acl, Mapping) else None
     if not isinstance(entries, list) or not entries:
-        raise GenieError(
-            f"the permissions on the folder {folder} came back without an access control list, "
-            "so whether every workspace user can edit or manage it is unknown.",
-            (_remediation(None, f"read the permissions on the folder {folder}"),),
-        )
+        raise _unreadable(folder, "came back without an access control list")
     best = (ALL_USERS, "")
     for entry in entries:
         group = entry.get("group_name") if isinstance(entry, Mapping) else None
         if group not in ALL_USERS_GROUPS:
             continue
-        held = entry.get("all_permissions")
-        levels = [
-            str(item.get("permission_level") or "").upper()
-            for item in (held if isinstance(held, list) else ())
-            if isinstance(item, Mapping)
-        ]
-        unknown = [level for level in levels if level not in _LEVEL_RANK]
-        if not levels or unknown:
-            raise GenieError(
-                f"the permissions on the folder {folder} do not say plainly what the {group} "
-                f"group holds ({unknown or held!r}), so whether every workspace user can edit "
-                "or manage it is unknown.",
-                (f"Check the permissions on {folder}, then re-run fluid apply.",),
-            )
-        for level in levels:
+        for level in _held_levels(entry, folder):
             if _LEVEL_RANK[level] > _LEVEL_RANK.get(best[1], 0):
                 best = (str(group), level)
     return best
+
+
+def _held_levels(entry: Mapping[str, Any], folder: str) -> List[str]:
+    """The levels a group of every user holds on ``folder``, upper-cased; an entry that does
+    not say them plainly stops the apply."""
+    held = entry.get("all_permissions")
+    levels = [
+        str(item.get("permission_level") or "").upper()
+        for item in (held if isinstance(held, list) else ())
+        if isinstance(item, Mapping)
+    ]
+    unknown = [level for level in levels if level not in _LEVEL_RANK]
+    if not levels or unknown:
+        raise _unreadable(
+            folder,
+            f"do not say plainly what the {entry.get('group_name')} group holds "
+            f"({unknown or held!r})",
+        )
+    return levels
+
+
+def _unreadable(folder: str, what: str) -> GenieError:
+    return GenieError(
+        f"the permissions on the folder {folder} {what}, so whether every workspace user can "
+        "edit or manage it is unknown.",
+        (f"Check the permissions on {folder}, then re-run fluid apply.",),
+    )
 
 
 def _folder_object_id(client: Any, folder: str) -> str:
