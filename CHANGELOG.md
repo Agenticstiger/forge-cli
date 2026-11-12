@@ -86,6 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `http://gpu-box:11434`) and keeps a `user:password@`, sent as basic auth. `fluid doctor` and
   `fluid ai setup` show it masked, and `~/.fluid/ai_config.json` stores a saved address without
   it unless `FLUID_ALLOW_PLAINTEXT_AI_SECRETS` is set, as for API keys.
+- **With no provider selected, forge stops instead of using gemini.** It used to send
+  `FLUID_LLM_API_KEY` to Google whatever key it was, and with two provider keys set it asked for
+  a gemini key. It now fails with `copilot_no_llm_provider` and says why (nothing configured,
+  several keys, a key that names no provider, or a `fluid ai setup` choice that the command does
+  not read), in the words `fluid doctor` shows. Pass `--llm-provider`, or set
+  `FLUID_LLM_PROVIDER` or the key of exactly one provider.
 - **`LlmProvider.list_available_models` takes an `endpoint` keyword**, the address the call will
   go to, passed only when the operator states one. A provider plugin that overrides the method
   with the two-argument signature keeps working until an endpoint is stated.

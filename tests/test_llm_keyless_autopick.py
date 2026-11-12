@@ -4,8 +4,9 @@
 """Keyless auto-pick: a non-interactive run with no provider configured.
 
 Order: a running local Ollama (data stays local), then the first coding-agent CLI
-on PATH in ``CODING_AGENT_NAMES`` order, then the hardcoded ``gemini`` last
-resort. Interactive runs keep "offer, don't force" (the ``fluid ai setup``
+on PATH in ``CODING_AGENT_NAMES`` order, and otherwise no provider at all:
+forge then stops with ``copilot_no_llm_provider``, the same "Not selected"
+``fluid doctor`` shows. Interactive runs keep "offer, don't force" (the ``fluid ai setup``
 inline offer). ``check_llm_readiness`` and the real selection share one helper,
 so ``fluid doctor`` never disagrees with what forge then does.
 
@@ -115,8 +116,8 @@ class TestPick:
         world.monkeypatch.setattr(providers, "detect_ollama_available", lambda env: True)
         assert _provider_name_from(_args(), dict(world.env)) == "ollama"
 
-    def test_nothing_detected_keeps_the_gemini_last_resort(self, world):
-        assert _provider_name_from(_args(), dict(world.env)) == "gemini"
+    def test_nothing_detected_selects_no_provider(self, world):
+        assert _provider_name_from(_args(), dict(world.env)) is None
 
     def test_non_interactive_flag_overrides_a_tty(self, world):
         world.install("claude-code")
@@ -134,7 +135,7 @@ class TestInteractiveKeepsOfferDontForce:
     def test_tty_does_not_auto_pick_an_agent(self, world):
         world.install("claude-code")
         _tty(world, True)
-        assert _provider_name_from(_args(), dict(world.env)) == "gemini"
+        assert _provider_name_from(_args(), dict(world.env)) is None
 
     def test_tty_still_picks_a_running_ollama(self, world):
         world.install("claude-code")
@@ -168,10 +169,10 @@ class TestConfiguredMeansNoAutoPick:
         assert _provider_name_from(_args(), {**world.env, var: "codex"}) == "codex"
 
     def test_two_explicit_keys_are_still_configured(self, world):
-        # Ambiguous keys fall through to the default, never to an agent.
+        # Ambiguous keys select no provider, and never an agent.
         world.install("claude-code")
         env = {**world.env, "OPENAI_API_KEY": "k", "ANTHROPIC_API_KEY": "k"}
-        assert _provider_name_from(_args(), env) == "gemini"
+        assert _provider_name_from(_args(), env) is None
 
     def test_stated_ollama_host_is_never_swapped_for_an_agent(self, world):
         # Selection treats OLLAMA_HOST as an explicit Ollama choice; the agent
@@ -183,7 +184,7 @@ class TestConfiguredMeansNoAutoPick:
 
     def test_generic_api_key_is_configured(self, world):
         world.install("claude-code")
-        assert _provider_name_from(_args(), {**world.env, "FLUID_LLM_API_KEY": "k"}) == "gemini"
+        assert _provider_name_from(_args(), {**world.env, "FLUID_LLM_API_KEY": "k"}) is None
 
     def test_keyring_key_wins(self, world):
         world.install("claude-code")
@@ -195,7 +196,7 @@ class TestConfiguredMeansNoAutoPick:
     def test_ambiguous_keyring_is_still_configured(self, world):
         world.install("claude-code")
         world.monkeypatch.setattr(providers, "_get_api_key_from_keyring", lambda n: "k")
-        assert _provider_name_from(_args(), dict(world.env)) == "gemini"
+        assert _provider_name_from(_args(), dict(world.env)) is None
 
     def test_saved_config_is_still_configured(self, world):
         world.install("claude-code")
@@ -203,7 +204,7 @@ class TestConfiguredMeansNoAutoPick:
             "fluid_build._ai_config_shared.load_ai_config",
             lambda *a, **k: {"provider": "openai", "model": "gpt-4.1-mini"},
         )
-        assert _provider_name_from(_args(), dict(world.env)) == "gemini"
+        assert _provider_name_from(_args(), dict(world.env)) is None
 
 
 class TestSaysWhichWasPicked:
@@ -278,12 +279,12 @@ class TestStatedDestinationBlocksAutoPick:
         assert _provider_name_from(_args(llm_model="gpt-4o"), dict(world.env)) != "claude-code"
 
     def test_resolve_keeps_the_stated_endpoint_off_the_agent(self, world):
-        # The security repro: the agent is not picked, so with no key for the
-        # default provider the run stops before any call leaves the machine.
+        # The security repro: the agent is not picked, so with no provider
+        # selected the run stops before any call leaves the machine.
         world.install("claude-code")
         with pytest.raises(providers.CopilotGenerationError) as info:
             resolve_llm_config(_args(llm_endpoint=self._ONPREM, llm_model="my-model"), {})
-        assert "copilot_missing_llm_api_key" in repr(vars(info.value)) + str(info.value)
+        assert info.value.event == "copilot_no_llm_provider"
 
     @pytest.mark.parametrize(
         "var, value",
@@ -331,18 +332,18 @@ class TestAgentLoopNeverAutoPicksAnAgent:
         world.monkeypatch.setenv("FLUID_COPILOT_AGENT_LOOP", value)
         assert self._options().agent_loop is True
 
-    def test_flag_route_ends_at_the_missing_key_error(self, world):
+    def test_flag_route_ends_at_the_no_provider_error(self, world):
         world.install("claude-code")
         with pytest.raises(providers.CopilotGenerationError) as info:
             resolve_llm_config(self._options(agent_loop=True), {})
-        assert info.value.event == "copilot_missing_llm_api_key"
+        assert info.value.event == "copilot_no_llm_provider"
 
-    def test_env_route_ends_at_the_missing_key_error(self, world):
+    def test_env_route_ends_at_the_no_provider_error(self, world):
         world.install("claude-code")
         world.monkeypatch.setenv("FLUID_COPILOT_AGENT_LOOP", "1")
         with pytest.raises(providers.CopilotGenerationError) as info:
             resolve_llm_config(self._options(), {})
-        assert info.value.event == "copilot_missing_llm_api_key"
+        assert info.value.event == "copilot_no_llm_provider"
 
     def test_env_route_blocks_the_pick_in_selection(self, world):
         world.install("claude-code")

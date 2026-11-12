@@ -796,16 +796,17 @@ _KEYLESS_PROVIDERS: frozenset = frozenset(
 _NON_LITELLM_PROVIDERS: frozenset = _KEYLESS_PROVIDERS - {"ollama"}
 
 
-def _provider_name_from(args: Any, env: Mapping[str, str]) -> str:
-    """The provider name the flags and environment select (flag, env, key sniff, default)."""
-    return (
-        _explicit_provider_name(args, env)
-        or _infer_provider_from_env(
-            env,
-            non_interactive=bool(getattr(args, "non_interactive", False)),
-            allow_agents=_agents_allowed(args, env),
-        )
-        or "gemini"
+def _provider_name_from(args: Any, env: Mapping[str, str]) -> Optional[str]:
+    """The provider the flags and environment select (flag, env, key sniff, ambient).
+
+    ``None`` when nothing selects one. There is no default provider: guessing
+    one would send ``FLUID_LLM_API_KEY`` to a vendor it may not belong to, and
+    ask for that vendor's key when other keys are set.
+    """
+    return _explicit_provider_name(args, env) or _infer_provider_from_env(
+        env,
+        non_interactive=bool(getattr(args, "non_interactive", False)),
+        allow_agents=_agents_allowed(args, env),
     )
 
 
@@ -875,8 +876,8 @@ def preflight_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = Non
     agent_loop = agent_loop_requested(getattr(args, "agent_loop", False), env)
     if not _explicit_provider_name(args, env):
         # Nothing chosen: inference reads the keyring and probes Ollama, and every
-        # provider it can pick (or the gemini default) needs litellm, except the
-        # coding agent a non-interactive run auto-picks. Without litellm, that
+        # provider it can pick needs litellm, except the coding agent a
+        # non-interactive run auto-picks. Without litellm, that
         # agent is the only provider that can run; otherwise fail first.
         from fluid_build._optional import is_available
 
@@ -912,6 +913,9 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
     """Resolve provider, model, endpoint, and API key from flags and env vars."""
     env = dict(environ or os.environ)
     provider_name = _provider_name_from(args, env)
+    if provider_name is None:
+        # The suggestions come from the error catalog (``_error_catalog``).
+        raise CopilotGenerationError("copilot_no_llm_provider", no_provider_message(env))
     provider = get_llm_provider(provider_name)
 
     # A stated endpoint is where the call goes, so the Ollama model pick and the
@@ -1500,6 +1504,7 @@ from fluid_build.llm.provider_resolve import (  # noqa: E402,F401
     _lean_keyless_autopick,
     _resolve_api_key,
     clear_api_key_from_keyring,
+    no_provider_message,
     save_api_key_to_keyring,
 )
 
@@ -1648,7 +1653,7 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
         LOG.debug("LLM readiness: no provider detected from env or config")
         return LlmReadinessCheck(
             ready=False,
-            error="No LLM provider configured. Run 'fluid ai setup' or set an API key env var.",
+            error=no_provider_message(env),
         )
 
     provider = BUILTIN_LLM_PROVIDERS.get(provider_name)

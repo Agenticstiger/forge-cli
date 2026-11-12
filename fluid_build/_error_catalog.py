@@ -338,6 +338,15 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "secrets",
     ),
+    "copilot_no_llm_provider": (
+        [
+            "Pass --llm-provider, for example anthropic, openai, gemini or ollama",
+            "Or set FLUID_LLM_PROVIDER, or the API key of exactly one provider",
+            "Or run 'fluid ai setup' to choose and save a provider",
+            "Run 'fluid doctor' to see what forge would select",
+        ],
+        None,
+    ),
     # Optional-dependency gate (fluid_build/_optional.py). The message already
     # carries the exact `pip install` line; these only give the stable slug a
     # curated follow-up and a docs anchor.
