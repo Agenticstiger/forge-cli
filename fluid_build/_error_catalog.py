@@ -550,11 +550,15 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             "Move the offending binding into an allowed region, or widen "
             "'sovereignty.allowedRegions' in the contract",
             "Run 'fluid validate <contract>' to see the same findings with full detail",
-            "Set 'sovereignty.enforcementMode: advisory' to report a region outside "
-            "'allowedRegions' without blocking; a region in 'deniedRegions' blocks in "
-            "every mode",
-            "Pass --no-check-sovereignty to write the plan anyway (logged at WARNING; "
-            "fluid apply keeps its own checks)",
+            (
+                "Set 'sovereignty.enforcementMode: advisory' to report a region outside "
+                + "'allowedRegions' without blocking; a region in 'deniedRegions' blocks in "
+                + "every mode"
+            ),
+            (
+                "Pass --no-check-sovereignty to write the plan anyway (logged at WARNING; "
+                + "fluid apply keeps its own checks)"
+            ),
         ],
         "sovereignty",
     ),

@@ -12,7 +12,11 @@ from io import StringIO
 import pytest
 
 from fluid_build.cli import _setup_enhanced_logging
-from fluid_build.observability.secret_redactor import SecretRedactingFilter, redact_secret_text
+from fluid_build.observability.secret_redactor import (
+    SecretRedactingFilter,
+    redact_jose_tokens,
+    redact_secret_text,
+)
 
 
 @pytest.fixture
@@ -819,10 +823,9 @@ class TestJoseTokensAndDottedNames:
         assert redact_secret_text(f"got {token}.Next step") == "got ***REDACTED***.Next step"
 
     def test_the_snowflake_twin_shares_the_rule(self):
-        import fluid_build.observability.secret_redactor as g
-        import fluid_build.providers.snowflake.util.logging as sf
+        from fluid_build.providers.snowflake.util.logging import redact_jose_tokens as twin
 
-        assert sf.redact_jose_tokens is g.redact_jose_tokens
+        assert twin is redact_jose_tokens
 
     @pytest.mark.parametrize(
         "evil",
@@ -836,8 +839,6 @@ class TestJoseTokensAndDottedNames:
     )
     def test_the_scan_stays_linear(self, evil):
         import time
-
-        from fluid_build.observability.secret_redactor import redact_jose_tokens
 
         start = time.perf_counter()
         redact_jose_tokens(evil)

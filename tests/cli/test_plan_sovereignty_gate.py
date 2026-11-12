@@ -322,8 +322,8 @@ class TestPlanExitCode:
     def test_a_clean_provider_hook_does_not_weaken_check_sovereignty(self, tmp_path, monkeypatch):
         """The explicit flag runs the default check first, so a hook that reports
         nothing cannot pass a contract ``fluid validate`` refuses."""
-        import fluid_build.cli.plan as plan_mod
         from fluid_build._contract_loader import CLIError
+        from fluid_build.cli import plan as plan_mod
 
         monkeypatch.setattr(
             plan_mod, "_hook_provider", lambda *_a, **_k: ("aws", _CleanHookProvider())
@@ -388,8 +388,8 @@ class TestPlanChecksSovereigntyByDefault:
 
     def test_the_default_check_builds_no_provider(self, tmp_path, monkeypatch):
         """A plain plan stays off the cloud SDKs (Command Center's plan relies on it)."""
-        import fluid_build.cli.plan as plan_mod
         from fluid_build._contract_loader import CLIError
+        from fluid_build.cli import plan as plan_mod
 
         def no_provider(*_args, **_kwargs):
             raise AssertionError("the default sovereignty check built a provider")
