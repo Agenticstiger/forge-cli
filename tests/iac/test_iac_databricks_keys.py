@@ -921,3 +921,37 @@ class TestBuildPhaseHook:
         args = type("Args", (), {"contract": None, "provider": None})()
         engine.after_builds(args, logging.getLogger("t"), contract)
         assert seen[0]["exposes"][0]["binding"]["location"]["database"] == "main"
+
+
+def test_a_parent_that_cannot_be_read_now_keeps_its_foreign_key():
+    # A transient read failure of the parent must not drop a correct key, nor call it undeclared.
+    class Runner:
+        def execute(self, statement: str) -> Dict[str, Any]:
+            return {"result": {"data_array": [["main", "geo", "sites", SITES]]}}
+
+    class Api:
+        def do(self, method: str, path: str, **_kw: Any) -> Dict[str, Any]:
+            if "scim" in path:
+                return {"userName": "me"}
+            raise RuntimeError("429 too many")
+
+    client = type("Client", (), {"api_client": Api()})()
+    k = _keys(TestResolve.REF)
+    notes: List[str] = []
+    cands, unknown = keys.resolve([k], TICKETS, Runner(), client, notes)
+    assert unknown == {SITES} and any("429 too many" in n for n in notes)
+    live = _live(_pk("fluid_pk_tickets", "ticket_id"), _fk("fluid_fk_tickets__site_id", "site_id"))
+    fks = keys.foreign_keys(k, cands)
+    plan = keys.plan_table("main.ops.tickets", k, fks, live, candidates=cands, unknown=unknown)
+    assert plan.fk_drops == [] and plan.fk_adds == []
+
+
+def test_a_dropped_key_says_what_changed():
+    live = _live(_pk("fluid_pk_tickets", "ticket_id"), _fk("fluid_fk_tickets__site_id", "site_id"))
+    moved = _keys(keys.Reference("site_id", "geo.other_v1", "site_id"))
+    plan = keys.plan_table("main.ops.tickets", moved, [], live, candidates={})
+    (drop,) = plan.fk_drops
+    assert (
+        "the contract now references geo.other_v1, and main.geo.sites is not one of its tables"
+        in drop.what
+    )

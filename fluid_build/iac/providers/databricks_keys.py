@@ -88,6 +88,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Union,
 )
@@ -453,14 +454,16 @@ def lookup(
     products: Iterable[str],
     owner: str = "",
     notes: Optional[List[str]] = None,
+    unreadable: Optional[Set[str]] = None,
 ) -> Dict[str, List[Candidate]]:
     """The tables tagged with each product id, with their live primary keys; one ``owner``
     owns (the deploying identity) is ``trusted``.
 
     One query on ``system.information_schema.table_tags``, which lists what this identity can
     see, then one Tables API read per table found. A table that cannot be read, or whose name
-    is no plain identifier, is no candidate, and ``notes`` says which. Raises when the query
-    fails.
+    is no plain identifier, is no candidate, and ``notes`` says which; the product of one that
+    could not be read goes in ``unreadable``, since its tables are then not all known. Raises
+    when the query fails.
     """
     said = notes if notes is not None else []
     wanted = sorted({p for p in products if p})
@@ -494,6 +497,8 @@ def lookup(
                 f"{full_name}, tagged {PRODUCT_TAG} = {product!r}, could not be read "
                 f"({type(exc).__name__}: {scrub(exc)}), so no foreign key references it now."
             )
+            if unreadable is not None:
+                unreadable.add(product)
             continue
         if live is None:
             continue
@@ -572,7 +577,7 @@ def plan_table(
     that the contract changed or dropped is dropped; any other is left, and a contract key it
     is in the way of is noted. A foreign key of this module that no wanted key replaces is kept
     while its columns still reference the one product whose tables could not be looked up, or
-    whose tables still include its parent (:func:`_still_meant`): a parent unresolved for now.
+    whose tables still include its parent (:func:`_stale`): a parent unresolved for now.
     """
     plan = TablePlan(full_name, exists=live is not None)
     live_pk, live_fks = live_keys(live or {})
@@ -617,36 +622,43 @@ def plan_table(
                 )
                 del wanted[fk.columns]
             continue
-        if want is None and _still_meant(fk, keys, fks, candidates, unknown):
+        why = (
+            "its parent changed" if want is not None else _stale(fk, keys, fks, candidates, unknown)
+        )
+        if why is None:
             continue  # its parent unresolved for now: kept
-        why = "its parent changed" if want is not None else "the contract no longer declares it"
         plan.fk_drops.append(_drop(full_name, fk.name, f"drop {fk.describe()}: {why}"))
     for fk in wanted.values():
         plan.fk_adds.append(Step(fk.describe(), foreign_key_statement(full_name, fk)))
     return plan
 
 
-def _still_meant(
+def _stale(
     fk: ForeignKey,
     keys: Optional[TableKeys],
     wanted: Sequence[ForeignKey],
     candidates: Optional[Mapping[str, Sequence[Candidate]]],
     unknown: Collection[str],
-) -> bool:
-    """Whether a foreign key this module declared, that the contract's resolved keys do not
-    include, still says what the contract does: no wanted key covers any of its columns, its
-    columns all reference one product, and that product's tables could not be looked up (or
-    were not, ``candidates`` ``None``) or still include its parent."""
-    if any(set(w.columns) & set(fk.columns) for w in wanted):
-        return False
+) -> Optional[str]:
+    """Why a foreign key this module declared, that the contract's resolved keys do not
+    include, no longer says what the contract does; ``None`` keeps it. It is kept while its
+    columns all reference one product whose tables could not all be looked up (or were not,
+    ``candidates`` ``None``), or that still include its parent: a parent unresolved for now."""
+    covering = next((w for w in wanted if set(w.columns) & set(fk.columns)), None)
+    if covering is not None:
+        return f"the contract's foreign key ({', '.join(covering.columns)}) replaces it"
     refs = {r.column: r.product for r in keys.references} if keys is not None else {}
     products = {refs.get(c) for c in fk.columns}
-    if len(products) != 1 or None in products:
-        return False
+    if None in products:
+        return "the contract no longer declares it"
+    if len(products) != 1:
+        return "its columns now reference more than one product"
     (product,) = products
     if candidates is None or product in unknown:
-        return True
-    return any(c.full_name == fk.parent for c in candidates.get(str(product)) or ())
+        return None
+    if any(c.full_name == fk.parent for c in candidates.get(str(product)) or ()):
+        return None
+    return f"the contract now references {product}, and {fk.parent} is not one of its tables"
 
 
 def _hint(error: str) -> str:
@@ -696,21 +708,22 @@ def resolve(
 ) -> Tuple[Dict[str, List[Candidate]], FrozenSet[str]]:
     """Every table the contract's references can resolve to (its own exposes' declared
     primary keys, and the live tables of each other product it references), and the products
-    whose tables could not be looked up at all."""
+    whose tables could not all be looked up."""
     candidates: Dict[str, List[Candidate]] = dict(own_candidates(contract_id, keyed))
     others = sorted({r.product for k in keyed for r in k.references if r.product != contract_id})
     if not others:
         return candidates, frozenset()
     try:
         owner = deploying_identity(client)
-        candidates.update(lookup(runner, client, others, owner, notes))
+        unreadable: Set[str] = set()
+        candidates.update(lookup(runner, client, others, owner, notes, unreadable))
     except Exception as exc:  # noqa: BLE001 — a lookup that fails declares no such key
         notes.append(
             f"foreign keys to {', '.join(others)}: their tables could not be looked up "
             f"({type(exc).__name__}: {scrub(exc)})."
         )
         return candidates, frozenset(others)
-    return candidates, frozenset()
+    return candidates, frozenset(unreadable)
 
 
 def deploying_identity(client: Any) -> str:
