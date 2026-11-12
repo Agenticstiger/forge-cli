@@ -1047,3 +1047,107 @@ def test_a_policy_that_denies_analysis_refuses_the_space():
     doc["exposes"][0]["policy"]["agentPolicy"]["allowedUseCases"] = ["qa"]
     (refusal,) = compiled(doc).refusals
     assert refusal.kind == "databricks-genie-policy" and "denies 'analysis'" in str(refusal)
+
+
+# ---------------------------------------------------------------------- the defect scan's finds
+
+
+def test_the_engine_prints_genie_lines_literally(capsys):
+    """Rich reads ``[...]`` as markup: the marker vanished and a ``[/x]`` title raised."""
+
+    class Plugin:
+        def converge_output_ports(self, contract, say=None, dry_run=False):
+            say("note: carries [fluid-genie:a.b] in '[/x] odd title'")
+
+    engine._converge_output_ports(Plugin(), {})
+    out = capsys.readouterr().out
+    assert "[fluid-genie:a.b]" in out and "'[/x] odd title'" in out
+
+
+def test_a_principal_that_manages_the_table_reads_it_and_gets_can_run():
+    doc = site_contract()
+    doc["exposes"][0]["policy"]["authz"]["readers"] = [ANALYSTS, NOC]
+    doc["accessPolicy"] = {
+        "grants": [{"principal": "group:stewards@towers.example", "permissions": ["manage"]}]
+    }
+    assert STEWARD_SP in space_of(doc).readers
+
+
+def test_metric_views_count_toward_the_cap(fake, monkeypatch):
+    monkeypatch.setattr(genie, "MAX_TABLES", 1)
+    fake.add_metric_view("main.asset.site_360_metrics", TABLE)
+    with pytest.raises(genie.GenieError) as exc:
+        Run(fake)(site_contract())
+    assert "1 tables and 1 metric views" in str(exc.value) and fake.genie_spaces == {}
+
+
+@pytest.mark.parametrize(
+    "status, words",
+    [(400, "Fix what the message names"), (503, "busy or unavailable"), (401, "credential")],
+)
+def test_a_failed_call_says_what_to_do_for_its_status(fake, status, words):
+    fake.fail_route("POST", "/api/2.0/genie/spaces", status, "nope")
+    with pytest.raises(genie.GenieError) as exc:
+        Run(fake)(site_contract())
+    assert words in exc.value.remediation[0]
+    assert "remove extensions" not in exc.value.remediation[0]
+
+
+def test_a_misplaced_new_space_that_cannot_be_trashed_is_named(fake):
+    fake.me_user_name = "8d5f1c3e-2b6a-4f0e-9c1d-7a3b5e9f0c21"
+    fake.fail_route("DELETE", r"/api/2\.0/genie/spaces/", 403, "denied")
+    with pytest.raises(genie.GenieError) as exc:
+        Run(fake)(site_contract())
+    (space_id,) = fake.genie_spaces
+    assert space_id in str(exc.value) and "/Users/fake-user@example.test" in str(exc.value)
+    assert exc.value.remediation == (
+        f"Trash space {space_id} by hand before the next apply, which would make another.",
+    )
+
+
+def test_a_missing_sdk_stops_a_genie_apply_before_tofu(monkeypatch):
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, "wh-1")
+
+    def missing():
+        raise ImportError("No module named 'databricks'")
+
+    with pytest.raises(genie.GenieError) as exc:
+        PLUGIN.pre_apply(site_contract(), say=print, client_factory=missing)
+    assert "databricks-sdk is not installed" in str(exc.value)
+    PLUGIN.pre_apply(without_block(site_contract()), say=print, client_factory=missing)
+
+    class Plugin:
+        def pre_apply(self, contract, say=None, dry_run=False):
+            raise genie.GenieError("it broke", ("fix it",))
+
+    with pytest.raises(CLIError) as err:
+        engine._enforce_access(Plugin(), "pre_apply", {})
+    assert err.value.event == "opentofu_output_port_failed"
+
+
+def test_a_foreign_metric_view_whose_yaml_does_not_parse_is_not_a_match():
+    assert genie._metric_view_source("source: a.b.c\nx: 2021-13-45\n") == ""
+
+
+def test_two_metrics_with_one_name_give_one_snippet():
+    doc = site_contract()
+    metrics = doc["exposes"][0]["semantics"]["metrics"]
+    metrics.append(dict(metrics[0], filter="site_status = 'SUSPENDED'"))
+    measures = space_of(doc).serialized["instructions"]["sql_snippets"]["measures"]
+    assert [m["alias"] for m in measures].count("avg_tenancy_ratio") == 1
+
+
+def test_the_native_plan_refuses_what_emit_refuses(monkeypatch):
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, "wh-1")
+    with pytest.raises(UnsupportedBindingError) as exc:
+        dbx.planned_objects(site_contract(title=" "))
+    assert exc.value.kind == "databricks-genie-invalid"
+
+
+def test_a_principal_the_service_keeps_in_another_case_is_not_shared_again(fake):
+    fake.genie_acl_folds_case = True
+    doc = site_contract()
+    doc["exposes"][0]["binding"]["principals"][NOC] = "Noc@Towers.io"
+    Run(fake)(doc)
+    assert ("user_name", "noc@towers.io") in fake.genie_acl[only_space(fake)["space_id"]]
+    assert Run(fake)(doc).writes() == []

@@ -115,6 +115,9 @@ _PAGE_SIZE = 100
 #: The use cases a Genie space is: answering questions about the data, by analysing it. One of
 #: them allowed is enough; either one denied refuses the space.
 _GENIE_USE_CASES = ("qa", "analysis")
+#: What reads a table: ``SELECT``, or ``ALL_PRIVILEGES`` (a contract's ``admin`` or ``manage``),
+#: as ``databricks_enforce`` reads access.
+_READ_PRIVILEGES = frozenset({"SELECT", "ALL_PRIVILEGES"})
 _NOT_SENSITIVE = frozenset({"", "none", "public", "internal"})
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 #: What the service appends to a title another space in the folder already has (it keeps titles
@@ -132,6 +135,9 @@ ClientFactory = Callable[[], Any]
 
 class GenieError(UnsupportedBindingError):
     """The Genie space could not be put in step with the contract (``databricks-genie-failed``)."""
+
+    #: The engine's event for it, from whichever hook it is raised in.
+    event = "opentofu_output_port_failed"
 
     def __init__(self, message: str, remediation: Sequence[str] = ()):
         super().__init__("databricks-genie-failed", message, tuple(remediation))
@@ -320,7 +326,7 @@ def _readers(
             {
                 principal
                 for kind, full_name, principal, privileges in grants
-                if kind == "table" and full_name in names and "SELECT" in privileges
+                if kind == "table" and full_name in names and _READ_PRIVILEGES & set(privileges)
             }
         )
     )
@@ -574,8 +580,13 @@ def _snapshot_lines(semantics: Mapping[str, Any]) -> List[str]:
 def _exposed_metrics(semantics: Mapping[str, Any]) -> List[Mapping[str, Any]]:
     """``metrics[]``, then each measure with ``createMetric: true`` (a simple metric of itself,
     as MetricFlow reads it)."""
-    metrics = [m for m in semantics.get("metrics") or () if isinstance(m, Mapping)]
-    named = {_text(m.get("name")) for m in metrics}
+    metrics: List[Mapping[str, Any]] = []
+    named: set = set()
+    for metric in semantics.get("metrics") or ():
+        name = _text(metric.get("name")) if isinstance(metric, Mapping) else ""
+        if name and name not in named:  # the first of two with one name: ids are per name
+            named.add(name)
+            metrics.append(metric)
     for measure in semantics.get("measures") or ():
         if (
             isinstance(measure, Mapping)
@@ -819,6 +830,12 @@ def _with_metric_views(client: Any, space: Space) -> Dict[str, Any]:
         tables = sorted(
             [*serialized["data_sources"]["tables"], *views], key=lambda t: t["identifier"]
         )
+        if len(tables) > MAX_TABLES:
+            raise GenieError(
+                f"the space would hold {len(space.tables)} tables and {len(views)} metric views "
+                f"over them, and Genie holds at most {MAX_TABLES} tables, views or metric views.",
+                ("Drop the metric views the space does not need, or split the product.",),
+            )
         serialized["data_sources"] = {**serialized["data_sources"], "tables": tables}
     return serialized
 
@@ -866,11 +883,19 @@ def _found_again(client: Any, space_id: str) -> None:
     parent = _call(client, "read the new Genie space", lambda: _parent(client, space_id))
     if _in_folder(parent, home):
         return
-    _call(
-        client,
-        "trash the new Genie space",
-        lambda: client.api_client.do("DELETE", f"{SPACES_PATH}/{quote(space_id)}"),
-    )
+    try:
+        _call(
+            client,
+            "trash the new Genie space",
+            lambda: client.api_client.do("DELETE", f"{SPACES_PATH}/{quote(space_id)}"),
+        )
+    except GenieError as exc:
+        raise GenieError(
+            f"the Genie API put the new space {space_id} in "
+            f"{parent or 'a folder this identity cannot read'}, not in this identity's own folder "
+            f"({home}), where the next apply looks for it, and trashing it failed: {exc}",
+            (f"Trash space {space_id} by hand before the next apply, which would make another.",),
+        ) from exc
     raise GenieError(
         f"the Genie API put the new space in {parent or 'a folder this identity cannot read'}, "
         f"not in this identity's own folder ({home}), where the next apply looks for it, so it "
@@ -922,6 +947,13 @@ def _same_title(live: Any, wanted: str) -> bool:
     return live == wanted or (
         live.startswith(wanted) and bool(_TITLE_SUFFIX.fullmatch(live[len(wanted) :]))
     )
+
+
+def preflight(compiled: Compiled, client_factory: Optional[ClientFactory] = None) -> None:
+    """Before ``tofu apply``: the client a space the contract asks for needs (the SDK extra and
+    the credential), so a missing one stops the run before anything is applied."""
+    if compiled.space is not None:
+        _client(client_factory)
 
 
 def _retire(product_id: str, say: Say, factory: Optional[ClientFactory], dry_run: bool) -> None:
@@ -1239,7 +1271,8 @@ def _metric_view_source(definition: Any) -> str:
 
     try:
         doc = yaml.safe_load(definition)
-    except yaml.YAMLError:
+    except Exception:  # noqa: BLE001 — YAMLError, or ValueError for an impossible date
+
         return ""
     source = doc.get("source") if isinstance(doc, Mapping) else None
     if not isinstance(source, str):
@@ -1257,8 +1290,10 @@ def _share(client: Any, space_id: str, readers: Sequence[str], say: Say, dry_run
         client, "read the Genie space's permissions", lambda: client.api_client.do("GET", path)
     )
     held = _direct_levels(doc)
+    spelled = {_folded_key(key): key for key in held}  # the service's own spelling
+    reader_keys = {_folded_key(acl_key(r)) for r in readers}
     wanted = {key: level for key, level in held.items() if level in _KEPT_LEVELS}
-    kept = sorted(key[1] for key in wanted if key[1] not in readers)
+    kept = sorted(key[1] for key in wanted if _folded_key(key) not in reader_keys)
     if kept:
         say(
             f"    note: {', '.join(kept)} also hold CAN_EDIT or CAN_MANAGE on the space, set on it "
@@ -1266,7 +1301,7 @@ def _share(client: Any, space_id: str, readers: Sequence[str], say: Say, dry_run
         )
     for principal in readers:
         key = acl_key(principal)
-        wanted.setdefault(key, READER_LEVEL)
+        wanted.setdefault(spelled.get(_folded_key(key), key), READER_LEVEL)
     if wanted == held:
         return
     granted = sorted(key[1] for key, level in wanted.items() if held.get(key) != level)
@@ -1298,6 +1333,13 @@ def acl_key(principal: str) -> Tuple[str, str]:
     if _UUID.fullmatch(principal):
         return ("service_principal_name", principal)
     return ("group_name", principal)
+
+
+def _folded_key(key: Tuple[str, str]) -> Tuple[str, str]:
+    """An ACL key compared as Databricks compares it: a user's email and a service principal's
+    application ID without case, a group's name as written."""
+    kind, name = key
+    return key if kind == "group_name" else (kind, name.casefold())
 
 
 def _direct_levels(doc: Any) -> Dict[Tuple[str, str], str]:
@@ -1364,16 +1406,24 @@ def _call(client: Any, what: str, fn: Callable[[], Any]) -> Any:
     except UnsupportedBindingError:
         raise
     except Exception as exc:  # noqa: BLE001 — every API failure is said, with what to do
-        status = _status(exc)
-        remediation = ["Check DATABRICKS_HOST and the credential, then re-run fluid apply."]
-        if status in (403, 404) and "Genie" in what:
-            remediation = [
-                "Check that Genie (AI/BI) is enabled in the workspace and that this identity "
-                "may create Genie spaces, or remove extensions.databricksGenie.",
-            ]
         raise GenieError(
-            f"could not {what}: {type(exc).__name__}: {_scrub(exc)}", remediation
+            f"could not {what}: {type(exc).__name__}: {_scrub(exc)}",
+            (_remediation(_status(exc), what),),
         ) from exc
+
+
+def _remediation(status: Optional[int], what: str) -> str:
+    """What to do about a failed call, by its HTTP status."""
+    if status in (403, 404):
+        return (
+            f"Check that Genie (AI/BI) is enabled in the workspace and that this identity may "
+            f"{what}, then re-run fluid apply."
+        )
+    if status == 400:
+        return "Fix what the message names, then re-run fluid apply."
+    if status == 429 or (status or 0) >= 500:
+        return "The workspace is busy or unavailable: re-run fluid apply in a minute."
+    return "Check DATABRICKS_HOST and the credential, then re-run fluid apply."
 
 
 #: The HTTP status each databricks-sdk error class stands for (``databricks/sdk/errors/

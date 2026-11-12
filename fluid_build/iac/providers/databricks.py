@@ -2198,6 +2198,9 @@ class DatabricksIacPlugin:
         if dry_run:
             preview(targets, say, client_factory)
         else:
+            from .databricks_genie import preflight
+
+            preflight(_genie(contract, _compile(contract, os.environ), os.environ), client_factory)
             pre_apply(targets, say, client_factory)
 
     def post_apply(
@@ -2491,6 +2494,9 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     compiled = _compile(contract, os.environ)
     if compiled.refusals:
         raise compiled.refusals[0]
+    genie = _genie(contract, compiled, os.environ)
+    if genie.refusals:
+        raise genie.refusals[0]
     actions: List[Dict[str, Any]] = []
     for body in compiled.data.get("databricks_catalog", {}).values():
         actions.append(

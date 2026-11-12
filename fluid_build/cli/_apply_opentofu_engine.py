@@ -356,7 +356,9 @@ def _converge_output_ports(
     if not callable(run):
         return
     try:
-        run(contract, say=cprint, dry_run=dry_run)
+        # Literally: its lines quote titles (anyone's, from the Genie list) and the
+        # ``[fluid-genie:...]`` marker, which Rich would read as markup.
+        run(contract, say=cprint_literal, dry_run=dry_run)
     except UnsupportedBindingError as exc:
         raise CLIError(
             1,
@@ -387,7 +389,7 @@ def _enforce_access(
     except UnsupportedBindingError as exc:
         raise CLIError(
             1,
-            "opentofu_access_enforcement_failed",
+            getattr(exc, "event", None) or "opentofu_access_enforcement_failed",
             {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
         ) from exc
 

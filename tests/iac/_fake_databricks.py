@@ -841,6 +841,9 @@ class FakeDatabricks:
         # A new space stays out of the list for this many list calls (the live list showed one
         # about 9 s after it was made, 2026-11-12); 0 lists it at once.
         self.genie_list_lag = 0
+        # True: the Permissions API keeps a user's or service principal's name lower-cased
+        # (whether it does is unmeasured; this exercises a service that does)
+        self.genie_acl_folds_case = False
         self._genie_hidden: Dict[str, int] = {}
         self._marker = 0
         self._job_seq = 0
@@ -1521,7 +1524,10 @@ class FakeDatabricks:
             keys = [k for k in ("user_name", "group_name", "service_principal_name") if k in entry]
             if len(keys) != 1:
                 return _err(400, "INVALID_PARAMETER_VALUE", "one principal per entry")
-            direct[(keys[0], entry[keys[0]])] = level
+            name = entry[keys[0]]
+            if self.genie_acl_folds_case and keys[0] != "group_name":
+                name = name.lower()
+            direct[(keys[0], name)] = level
         with self._lock:
             self.genie_acl[space_id] = direct
         return self._genie_get_acl(m, q, b)
