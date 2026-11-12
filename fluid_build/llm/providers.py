@@ -1054,8 +1054,7 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
             suggestions=[
                 *([unnamed_note] if unnamed_note else []),
                 "Run 'fluid ai setup' to configure a provider interactively",
-                "Set the provider-specific API key environment variable, or FLUID_LLM_API_KEY "
-                "with --llm-provider",
+                "Set the provider's own key variable, or FLUID_LLM_API_KEY with --llm-provider",
                 "Examples: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY",
                 "For local models, use --llm-provider ollama and optionally --llm-endpoint",
                 "For keyless authoring: run forge from your IDE (mcp-sampling), or use a "

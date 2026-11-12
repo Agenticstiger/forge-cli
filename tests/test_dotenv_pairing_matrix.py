@@ -716,7 +716,7 @@ def test_interactive_setup_never_sends_the_saved_key_to_a_project_endpoint(
     # the saved key into the provider's variable (set_session_env), over the
     # project's, so the saved key went to the project's host.
     import fluid_build.cli.ai_setup as ai_setup
-    from fluid_build.llm.providers import remember_named_llm_provider
+    import fluid_build.llm.providers as llm_providers
 
     (project / ".env").write_text(f"{endpoint}={listener.url}\n{credential}={PROJECT_KEY}\n")
     hydrate_dotenv(project)
@@ -732,7 +732,7 @@ def test_interactive_setup_never_sends_the_saved_key_to_a_project_endpoint(
     with caplog.at_level(logging.WARNING):
         config = ai_setup.run_ai_setup_inline(None)
         args = types.SimpleNamespace(llm_provider=None, llm_model=None, llm_endpoint=None)
-        remember_named_llm_provider(args, os.environ)
+        llm_providers.remember_named_llm_provider(args, os.environ)
         args.llm_provider = config.provider
         if config.api_key:
             ai_setup.set_session_env(config.provider, config.api_key)

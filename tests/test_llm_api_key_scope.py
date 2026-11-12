@@ -28,7 +28,6 @@ from unittest import mock
 import pytest
 
 import fluid_build.llm.providers as providers
-from fluid_build.llm.providers import check_llm_readiness, resolve_llm_config
 from tests._dotenv_pairing_support import Listener, refuse_outbound_dns, send_if_loopback
 
 GENERIC_KEY = "generic-llm-key-test-0001"  # pragma: allowlist secret
@@ -86,7 +85,7 @@ def _args(**values: object) -> SimpleNamespace:
 def test_a_running_ollama_never_gets_the_generic_key(world: _World) -> None:
     world.ollama_up = True
 
-    config = resolve_llm_config(_args(), world.env(FLUID_LLM_API_KEY=GENERIC_KEY))
+    config = providers.resolve_llm_config(_args(), world.env(FLUID_LLM_API_KEY=GENERIC_KEY))
 
     assert config.provider == "ollama"
     assert config.api_key is None
@@ -99,7 +98,7 @@ def test_the_host_ollama_host_names_never_gets_the_generic_key(world: _World) ->
     remote = "http://gpu-box.example.test:11434"
     env = world.env(FLUID_LLM_API_KEY=GENERIC_KEY, OLLAMA_HOST=remote)
 
-    config = resolve_llm_config(_args(), env)
+    config = providers.resolve_llm_config(_args(), env)
     with mock.patch.dict(os.environ, {"OLLAMA_HOST": remote}):
         _headers, payload = providers.get_llm_provider("ollama").build_request(config, "s", "u")
 
@@ -112,7 +111,7 @@ def test_the_host_ollama_host_names_never_gets_the_generic_key(world: _World) ->
 def test_the_one_keyring_key_s_provider_gets_that_key(world: _World) -> None:
     world.keyring["anthropic"] = ANTHROPIC_KEY
 
-    config = resolve_llm_config(_args(), world.env(FLUID_LLM_API_KEY=GENERIC_KEY))
+    config = providers.resolve_llm_config(_args(), world.env(FLUID_LLM_API_KEY=GENERIC_KEY))
 
     assert config.provider == "anthropic"
     assert config.api_key == ANTHROPIC_KEY
@@ -121,7 +120,7 @@ def test_the_one_keyring_key_s_provider_gets_that_key(world: _World) -> None:
 def test_the_one_key_variable_s_provider_gets_that_key(world: _World) -> None:
     env = world.env(FLUID_LLM_API_KEY=GENERIC_KEY, OPENAI_API_KEY=OPENAI_KEY)
 
-    config = resolve_llm_config(_args(), env)
+    config = providers.resolve_llm_config(_args(), env)
 
     assert config.provider == "openai"
     assert config.api_key == OPENAI_KEY
@@ -139,7 +138,7 @@ def test_the_key_never_reaches_an_ollama_on_the_wire(
     try:
         monkeypatch.setenv("OLLAMA_HOST", listener.url)
         env = world.env(FLUID_LLM_API_KEY=GENERIC_KEY, OLLAMA_HOST=listener.url)
-        config = resolve_llm_config(_args(), env)
+        config = providers.resolve_llm_config(_args(), env)
         _headers, payload = providers.get_llm_provider("ollama").build_request(config, "s", "u")
         send_if_loopback(
             payload.get("api_base"),
@@ -170,7 +169,7 @@ def test_a_named_provider_gets_the_generic_key_first(
     else:
         args = _args(llm_provider=provider)
 
-    config = resolve_llm_config(args, env)
+    config = providers.resolve_llm_config(args, env)
 
     assert config.provider == provider
     assert config.api_key == GENERIC_KEY
@@ -184,7 +183,7 @@ def test_a_provider_with_no_key_of_its_own_says_why_the_generic_one_was_not_used
     # pick to reach that error, whose first suggestion is the way out.
     with mock.patch.object(providers, "_provider_name_from", return_value="openai"):
         with pytest.raises(providers.CopilotGenerationError) as info:
-            resolve_llm_config(_args(), world.env(FLUID_LLM_API_KEY=GENERIC_KEY))
+            providers.resolve_llm_config(_args(), world.env(FLUID_LLM_API_KEY=GENERIC_KEY))
 
     assert info.value.event == "copilot_missing_llm_api_key"
     assert "Pass --llm-provider openai" in info.value.suggestions[0]
@@ -194,27 +193,25 @@ def test_a_provider_with_no_key_of_its_own_says_why_the_generic_one_was_not_used
 
 
 def test_interactive_setup_s_pick_does_not_count_as_named(world: _World) -> None:
-    from fluid_build.llm.providers import remember_named_llm_provider
 
     args = _args()
-    remember_named_llm_provider(args, {})
+    providers.remember_named_llm_provider(args, {})
     args.llm_provider = "openai"  # what forge does with run_ai_setup_inline's config
     env = world.env(FLUID_LLM_API_KEY=GENERIC_KEY, OPENAI_API_KEY=OPENAI_KEY)
 
-    config = resolve_llm_config(args, env)
+    config = providers.resolve_llm_config(args, env)
 
     assert config.api_key == OPENAI_KEY
 
 
 def test_setup_replacing_a_named_provider_does_not_carry_the_key_over(world: _World) -> None:
-    from fluid_build.llm.providers import remember_named_llm_provider
 
     args = _args(llm_provider="anthropic")
-    remember_named_llm_provider(args, {})
+    providers.remember_named_llm_provider(args, {})
     args.llm_provider = "openai"  # the saved provider, loaded over the flag
     env = world.env(FLUID_LLM_API_KEY=ANTHROPIC_KEY, OPENAI_API_KEY=OPENAI_KEY)
 
-    config = resolve_llm_config(args, env)
+    config = providers.resolve_llm_config(args, env)
 
     assert config.api_key == OPENAI_KEY
     notes = " ".join(config.model_resolution_notes)
@@ -226,24 +223,22 @@ def test_setup_replacing_a_named_provider_does_not_carry_the_key_over(world: _Wo
 def test_setup_keeping_the_named_provider_keeps_the_key(
     world: _World, named: str, picked: str
 ) -> None:
-    from fluid_build.llm.providers import remember_named_llm_provider
 
     args = _args(llm_provider=named)
-    remember_named_llm_provider(args, {})
+    providers.remember_named_llm_provider(args, {})
     args.llm_provider = picked
 
-    config = resolve_llm_config(args, world.env(FLUID_LLM_API_KEY=GENERIC_KEY))
+    config = providers.resolve_llm_config(args, world.env(FLUID_LLM_API_KEY=GENERIC_KEY))
 
     assert config.api_key == GENERIC_KEY
 
 
 def test_the_first_record_is_kept(world: _World) -> None:
-    from fluid_build.llm.providers import remember_named_llm_provider
 
     args = _args()
-    remember_named_llm_provider(args, {})
+    providers.remember_named_llm_provider(args, {})
     args.llm_provider = "openai"
-    remember_named_llm_provider(args, {})  # a second setup must not name its own pick
+    providers.remember_named_llm_provider(args, {})  # a second setup must not name its own pick
 
     assert args.llm_provider_named is None
 
@@ -258,7 +253,7 @@ def test_the_copilot_options_carry_the_record(world: _World) -> None:
     )
     env = world.env(FLUID_LLM_API_KEY=GENERIC_KEY, OPENAI_API_KEY=OPENAI_KEY)
 
-    config = resolve_llm_config(SimpleNamespace(**options), env)
+    config = providers.resolve_llm_config(SimpleNamespace(**options), env)
 
     assert options["llm_provider_named"] is None
     assert config.api_key == OPENAI_KEY
@@ -283,7 +278,6 @@ def test_interactive_forge_records_what_was_named_before_setup_s_pick(
     flag: Optional[str],
 ) -> None:
     from fluid_build.cli.forge import run as forge_run
-    from fluid_build.llm.providers import LlmConfig
 
     monkeypatch.setattr("fluid_build.cli._welcome_scan.Path.home", lambda: tmp_path / "home")
     monkeypatch.setenv("FLUID_FORGE_NO_PREVIEW", "1")
@@ -295,8 +289,10 @@ def test_interactive_forge_records_what_was_named_before_setup_s_pick(
         seen["args"] = args
         return 0
 
-    def _setup(_console: object) -> LlmConfig:
-        return LlmConfig(provider="openai", model="gpt-4o", endpoint="", api_key=OPENAI_KEY)
+    def _setup(_console: object) -> providers.LlmConfig:
+        return providers.LlmConfig(
+            provider="openai", model="gpt-4o", endpoint="", api_key=OPENAI_KEY
+        )
 
     args = Namespace(
         command="forge",
@@ -328,7 +324,7 @@ def test_interactive_forge_records_what_was_named_before_setup_s_pick(
     assert ran_with.llm_provider == "openai"
     assert ran_with.llm_provider_named == flag
     env = world.env(FLUID_LLM_API_KEY=GENERIC_KEY, OPENAI_API_KEY=OPENAI_KEY)
-    assert resolve_llm_config(ran_with, env).api_key == OPENAI_KEY
+    assert providers.resolve_llm_config(ran_with, env).api_key == OPENAI_KEY
 
 
 # ── fluid doctor and fluid ai test ─────────────────────────────────────────
@@ -340,8 +336,8 @@ def test_readiness_counts_the_key_only_for_a_named_provider(
     monkeypatch.setattr("fluid_build._optional.is_available", lambda name: True)
     world.saved = {"provider": "openai", "model": "gpt-4o"}
 
-    picked = check_llm_readiness(world.env(FLUID_LLM_API_KEY=GENERIC_KEY))
-    named = check_llm_readiness(
+    picked = providers.check_llm_readiness(world.env(FLUID_LLM_API_KEY=GENERIC_KEY))
+    named = providers.check_llm_readiness(
         world.env(FLUID_LLM_API_KEY=GENERIC_KEY, FLUID_LLM_PROVIDER="openai")
     )
 
