@@ -535,6 +535,63 @@ def test_a_databricks_data_quality_monitor_passes_tofu_validate(tmp_path, monkey
     assert validate.returncode == 0, validate.stderr or validate.stdout
 
 
+@pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
+def test_a_databricks_lakeflow_pipeline_passes_tofu_validate(tmp_path, monkeypatch):
+    """A lakeflow build: the pipeline, its generated source file and folder, and the readers'
+    SELECT on the schema, with no table resource (the pipeline creates the table)."""
+    monkeypatch.setenv("DATABRICKS_WAREHOUSE_ID", "wh-validate-only")
+    contract = json.loads(json.dumps(_SAMPLE_CONTRACTS["databricks"]))
+    contract["fluidVersion"] = "0.7.7"
+    expose = contract["exposes"][0]
+    expose.pop("policy", None)
+    expose["binding"]["location"].pop("partitionBy", None)
+    columns = expose["contract"]["schema"]
+    first = columns[0]["name"]
+    expose["contract"]["dq"] = {
+        "rules": [
+            {
+                "id": "orders_key_unique",
+                "type": "uniqueness",
+                "selector": first,
+                "severity": "critical",
+            },
+            {
+                "id": "orders_complete",
+                "type": "completeness",
+                "selector": first,
+                "severity": "error",
+            },
+        ]
+    }
+    contract["builds"] = [
+        {
+            "id": "orders_pipeline",
+            "engine": "lakeflow",
+            "pattern": "embedded-logic",
+            "outputs": [expose["exposeId"]],
+            "properties": {"sql": f"SELECT * FROM main.raw.{expose['exposeId']}"},
+            "execution": {"trigger": {"type": "manual"}, "runtime": {"platform": "databricks"}},
+        }
+    ]
+    plugin = IAC_PLUGINS["databricks"]
+    text = build_module(plugin, contract)
+    resources = json.loads(text)["resource"]
+    assert "databricks_sql_table" not in resources
+    assert len(resources["databricks_pipeline"]) == 1
+    assert len(resources["databricks_workspace_file"]) == 1
+
+    (tmp_path / "main.tf.json").write_text(text)
+    write_dependency_lock(plugin, tmp_path)
+    _tofu_init_or_skip(tmp_path)
+    validate = subprocess.run(
+        [_TOFU, "validate", "-no-color"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert validate.returncode == 0, validate.stderr or validate.stdout
+
+
 # Per-cloud cross-account / cross-project shapes. Stage 1 unit tests
 # pin the dict; this pins the *.tf.json against the real ``tofu``
 # binary — catches any provider-schema mismatch in the new

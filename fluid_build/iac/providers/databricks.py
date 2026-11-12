@@ -189,6 +189,7 @@ from ...util.contract import (
     builds_writing_expose,
     is_databricks_job_build,
     is_duckdb_acquisition_build,
+    is_lakeflow_build,
 )
 from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
@@ -236,6 +237,12 @@ from .databricks_keys import (
     reconcile,
 )
 from .databricks_keys import lookup as lookup_key_tables
+from .databricks_lakeflow import (
+    CompiledPipelines,
+    LakeflowPipeline,
+    compile_lakeflow_pipelines,
+    lakeflow_written_exposes,
+)
 from .databricks_quality import RESOURCE_TYPE as QUALITY_MONITOR
 from .databricks_quality import (
     SchemaMonitor,
@@ -392,6 +399,9 @@ class _Compiled:
     metric_views: _metric_views.MetricViews = field(default_factory=_metric_views.MetricViews)
     #: The data quality monitor emitted per schema (``databricks_quality.py``).
     monitors: List[SchemaMonitor] = field(default_factory=list)
+    #: The Lakeflow pipelines, and the full names of the tables a pipeline owns.
+    pipelines: List[LakeflowPipeline] = field(default_factory=list)
+    lakeflow_written: List[str] = field(default_factory=list)
 
 
 #: Unity Catalog allows 50 tags on a securable ("Apply tags to Unity Catalog securable
@@ -1391,7 +1401,7 @@ def _compile(
         if isinstance(exposure, Mapping) and is_cloud(exposure.get("binding") or {}, "databricks")
     ]
     job_builds = any(
-        isinstance(build, Mapping) and is_databricks_job_build(build)
+        isinstance(build, Mapping) and (is_databricks_job_build(build) or is_lakeflow_build(build))
         for build in contract.get("builds") or []
     )
     if not exposures and not job_builds:
@@ -1412,7 +1422,16 @@ def _compile(
     cid = safe_ident(contract.get("id") or contract.get("name") or "product")
     privileges = _table_privileges(contract, targets, refusals)
     dbt_written = dbt_written_exposes(contract, compiled.tables)
+    lakeflow_written = lakeflow_written_exposes(contract, compiled.tables)
+    pipeline_schemas: Dict[str, TofuExpr] = {}
+    pipeline_tags: Dict[str, Tuple[Dict[str, str], List[Tuple[str, str, str]]]] = {}
     for table in compiled.tables:
+        if table.expose_id in lakeflow_written:
+            pipeline_schemas[table.full_name] = _emit_pipeline_table(
+                compiled, table, cid, region, privileges.get(table.full_name, {}), contract
+            )
+            pipeline_tags[table.full_name] = _pipeline_tags(compiled, table, contract)
+            continue
         _emit_table(
             compiled, table, cid, warehouse, region, dbt_owned=table.expose_id in dbt_written
         )
@@ -1438,6 +1457,12 @@ def _compile(
             validating=validating,
             run_as_allowed=run_as_allowlist(env),
             rebuild_script=_rebuild_scripts(compiled, contract, builds, key_lookup),
+        ),
+    )
+    _merge_pipelines(
+        compiled,
+        compile_lakeflow_pipelines(
+            contract, compiled.tables, schemas=pipeline_schemas, tags=pipeline_tags
         ),
     )
 
@@ -1675,13 +1700,18 @@ def _emit_quality_monitors(compiled: _Compiled, cid: str) -> None:
     a table that scan misses may wait up to two weeks for its health indicator (Databricks
     docs, "intelligent scanning").
     """
-    compiled.warnings.extend(window_warnings(compiled.tables))
-    for monitor in plan_monitors(compiled.tables):
+    # A pipeline's table has no databricks_sql_table: the pipeline creates it at its first
+    # update, after tofu apply.
+    tables = [
+        table for table in compiled.tables if table.full_name not in compiled.lakeflow_written
+    ]
+    compiled.warnings.extend(window_warnings(tables))
+    for monitor in plan_monitors(tables):
         key = _schema_key(cid, monitor.catalog, monitor.schema)
         body = monitor.body(tofu_ref(f"databricks_schema.{key}.schema_id"))
         body["depends_on"] = [
             f"databricks_sql_table.{_keys(cid, table)[2]}"
-            for table in compiled.tables
+            for table in tables
             if (table.catalog, table.schema) == (monitor.catalog, monitor.schema)
         ]
         _claim(
@@ -1702,14 +1732,10 @@ def _emit_quality_monitors(compiled: _Compiled, cid: str) -> None:
         compiled.monitors.append(monitor)
 
 
-def _emit_table(
-    compiled: _Compiled, table: _Table, cid: str, warehouse: str, region: str, *, dbt_owned: bool
-) -> None:
-    """The catalog reference, the owned schema and the table, with their imports.
-
-    ``region`` is the workspace region the contract declares (``""`` if none).
-    """
-    catalog_key, schema_key, table_key = _keys(cid, table)
+def _emit_schema(compiled: _Compiled, table: _Table, cid: str, region: str) -> TofuExpr:
+    """The catalog reference and the owned schema of ``table``, with the schema's import;
+    the catalog's name, as a reference to its data source."""
+    catalog_key, schema_key, _table_key = _keys(cid, table)
     catalog_name = tofu_ref(f"data.databricks_catalog.{catalog_key}.name")
     compiled.data.setdefault("databricks_catalog", {})[catalog_key] = {"name": table.catalog}
     if f"databricks_schema.{schema_key}" not in compiled.owners:
@@ -1726,6 +1752,155 @@ def _emit_table(
         f"schema {table.catalog}.{table.schema}",
         schema_body,
     )
+    return catalog_name
+
+
+def _refuse_pipeline_table(
+    compiled: _Compiled, table: _Table, privileges: Mapping[str, set], contract: Mapping[str, Any]
+) -> None:
+    """What a table a Lakeflow pipeline owns cannot have yet (founder, 2026-11-12): masks and a
+    row filter (Lakeflow takes them only in the definition), write privileges (only the
+    pipeline writes it), partitions, a retention promise, another writer, or a schema shared
+    with another table (its readers' SELECT is granted on the schema)."""
+    if table.enforcement is not None:
+        compiled.refusals.append(
+            _refusal(
+                "lakeflow-enforcement",
+                f"{table.where} is written by a lakeflow build and declares column restrictions "
+                "or row filters; Lakeflow binds masks and row filters only in the pipeline's "
+                "definition, which forge-cli does not write yet.",
+                "Remove policy.authz.columnRestrictions and rowFilters from this expose, or "
+                "write it with a dbt build.",
+            )
+        )
+    if table.partitions:
+        compiled.refusals.append(
+            _refusal(
+                "lakeflow-partitions",
+                f"{table.where} is written by a lakeflow build and declares partitions, which "
+                "the pipeline's definition does not set yet.",
+                "Remove the partitions from the binding.",
+            )
+        )
+    if table.retention is not None:
+        compiled.refusals.append(
+            _refusal(
+                "lakeflow-expire",
+                f"{table.where} is written by a lakeflow build and sets lifecycle.expire; the "
+                "pipeline owns the table's history, and forge-cli does not set its retention.",
+                "Remove lifecycle.expire from this expose.",
+            )
+        )
+    for principal, granted in sorted(privileges.items()):
+        if granted - {"SELECT"}:
+            compiled.refusals.append(
+                _refusal(
+                    "lakeflow-write-grant",
+                    f"{table.where} is written by a lakeflow build, and principal {principal!r} "
+                    f"would get {', '.join(sorted(granted - {'SELECT'}))} on it: only its "
+                    "pipeline writes the table, so only read access can be granted.",
+                    "Grant this expose read, select or query only (accessPolicy.grants[] "
+                    "permissions, policy.authz.readers).",
+                )
+            )
+    writers = [
+        b
+        for b in builds_writing_expose(table.expose_id, contract.get("builds") or [])
+        if not is_lakeflow_build(b)
+    ]
+    if writers:
+        compiled.refusals.append(
+            _refusal(
+                "lakeflow-writers",
+                f"{table.where} is written by a lakeflow build and by "
+                f"{', '.join(_describe_writer(b) for b in writers)}; a pipeline owns its table, "
+                "so no other build can write it.",
+                "Write the expose with the lakeflow build only (builds[].outputs).",
+            )
+        )
+    shared = [
+        other.where
+        for other in compiled.tables
+        if other is not table and (other.catalog, other.schema) == (table.catalog, table.schema)
+    ]
+    if shared:
+        compiled.refusals.append(
+            _refusal(
+                "lakeflow-schema-shared",
+                f"{table.where} is written by a lakeflow build, and its schema "
+                f"{table.catalog}.{table.schema} also holds {', '.join(shared)}: its readers' "
+                "SELECT is granted on the schema, so they would read those tables too.",
+                "Bind the lakeflow-built expose to a schema of its own.",
+            )
+        )
+
+
+def _emit_pipeline_table(
+    compiled: _Compiled,
+    table: _Table,
+    cid: str,
+    region: str,
+    privileges: Mapping[str, set],
+    contract: Mapping[str, Any],
+) -> TofuExpr:
+    """A table a Lakeflow pipeline owns (``databricks_lakeflow.py``): its schema with the
+    contract's tags, and each reader's ``SELECT`` on that schema, which exists before the
+    pipeline's first update creates the table. The table's own tags are set after each update
+    ``fluid apply`` runs (:func:`_pipeline_tags`). The schema's name, as a reference."""
+    _emit_schema(compiled, table, cid, region)
+    _catalog_key, schema_key, _table_key = _keys(cid, table)
+    compiled.lakeflow_written.append(table.full_name)
+    _refuse_pipeline_table(compiled, table, privileges, contract)
+    schema_name = f"{table.catalog}.{table.schema}"
+    schema_id = tofu_ref(f"databricks_schema.{schema_key}.id")
+    for principal, granted in sorted(privileges.items()):
+        if granted == {"SELECT"}:
+            _claim_grant(
+                compiled,
+                f"{schema_key}_usage_{unique_ident(principal)}",
+                ("schema", schema_name, schema_id),
+                principal,
+                ["SELECT", "USE_SCHEMA"],
+            )
+    _emit_schema_tags(compiled, table, cid, contract)
+    return tofu_ref(f"databricks_schema.{schema_key}.name")
+
+
+def _pipeline_tags(
+    compiled: _Compiled, table: _Table, contract: Mapping[str, Any]
+) -> Tuple[Dict[str, str], List[Tuple[str, str, str]]]:
+    """``(table tags, (column, key, value) column tags)`` of a pipeline's table: what the
+    module would assign on a table of its own (:func:`_emit_tags`), refused the same way."""
+    own = _product_tags(contract, table, compiled.refusals)
+    on_table = _uc_tags(table.where, contract, table.exposure, compiled.refusals, own)
+    on_columns = [
+        (column, SENSITIVITY_TAG, sensitivity)
+        for column, sensitivity in _classified_tags(compiled, table)
+    ]
+    return on_table, on_columns
+
+
+def _merge_pipelines(compiled: _Compiled, pipelines: CompiledPipelines) -> None:
+    """The Lakeflow pipelines' resources, data sources, refusals and warnings, into
+    ``compiled``."""
+    compiled.refusals.extend(pipelines.refusals)
+    compiled.warnings.extend(pipelines.warnings)
+    compiled.pipelines = pipelines.pipelines
+    for rtype, key, owner, body in pipelines.resources:
+        _claim(compiled, rtype, key, owner, body)
+    for dtype, entries in pipelines.data.items():
+        compiled.data.setdefault(dtype, {}).update(entries)
+
+
+def _emit_table(
+    compiled: _Compiled, table: _Table, cid: str, warehouse: str, region: str, *, dbt_owned: bool
+) -> None:
+    """The catalog reference, the owned schema and the table, with their imports.
+
+    ``region`` is the workspace region the contract declares (``""`` if none).
+    """
+    catalog_key, schema_key, table_key = _keys(cid, table)
+    catalog_name = _emit_schema(compiled, table, cid, region)
     body: Dict[str, Any] = {
         "catalog_name": catalog_name,
         "schema_name": tofu_ref(f"databricks_schema.{schema_key}.name"),
@@ -2030,15 +2205,8 @@ def _emit_tags(compiled: _Compiled, table: _Table, cid: str, contract: Mapping[s
     The schema carries the contract's own (no expose's), so two exposes in one schema
     claim one and the same body at each address (:func:`_claim` keeps the last).
     """
-    _catalog_key, schema_key, table_key = _keys(cid, table)
-    schema_name = f"{table.catalog}.{table.schema}"
-    on_schema = _uc_tags(f"schema {schema_name}", contract, {}, compiled.refusals)
-    _claim_tags(
-        compiled,
-        f"{schema_key}_schema_tag",
-        ("schemas", schema_name, tofu_ref(f"databricks_schema.{schema_key}.id")),
-        on_schema,
-    )
+    _catalog_key, _schema_key, table_key = _keys(cid, table)
+    _emit_schema_tags(compiled, table, cid, contract)
     own = _product_tags(contract, table, compiled.refusals)
     on_table = _uc_tags(table.where, contract, table.exposure, compiled.refusals, own)
     _claim_tags(
@@ -2050,14 +2218,24 @@ def _emit_tags(compiled: _Compiled, table: _Table, cid: str, contract: Mapping[s
     _emit_column_tags(compiled, table, table_key)
 
 
-def _emit_column_tags(compiled: _Compiled, table: _Table, table_key: str) -> None:
-    """Each classified column's ``sensitivity`` as the column tag :data:`SENSITIVITY_TAG`.
+def _emit_schema_tags(
+    compiled: _Compiled, table: _Table, cid: str, contract: Mapping[str, Any]
+) -> None:
+    """The contract's own governance labels on the table's schema."""
+    _catalog_key, schema_key, _table_key = _keys(cid, table)
+    schema_name = f"{table.catalog}.{table.schema}"
+    on_schema = _uc_tags(f"schema {schema_name}", contract, {}, compiled.refusals)
+    _claim_tags(
+        compiled,
+        f"{schema_key}_schema_tag",
+        ("schemas", schema_name, tofu_ref(f"databricks_schema.{schema_key}.id")),
+        on_schema,
+    )
 
-    A column is entity type ``columns``, named ``catalog.schema.table.column`` (the
-    provider's ``entity_tag_assignment`` docs at v1.140.0). The name is built on the
-    table's ``id`` so the assignment is ordered after the table; the column is an
-    identifier ``_ident`` accepted, so it is safe inside the expression.
-    """
+
+def _classified_tags(compiled: _Compiled, table: _Table) -> List[Tuple[str, str]]:
+    """``(column, sensitivity)`` per classified column that can carry the tag
+    :data:`SENSITIVITY_TAG`; a refusal for the rest."""
     if len(table.classified) > _MAX_COLUMN_TAGS:
         compiled.refusals.append(
             _refusal(
@@ -2069,7 +2247,8 @@ def _emit_column_tags(compiled: _Compiled, table: _Table, table_key: str) -> Non
                 "sensitivity).",
             )
         )
-        return
+        return []
+    kept: List[Tuple[str, str]] = []
     for column, sensitivity in table.classified:
         if len(sensitivity) > _MAX_TAG_VALUE:
             compiled.refusals.append(
@@ -2081,6 +2260,19 @@ def _emit_column_tags(compiled: _Compiled, table: _Table, table_key: str) -> Non
                 )
             )
             continue
+        kept.append((column, sensitivity))
+    return kept
+
+
+def _emit_column_tags(compiled: _Compiled, table: _Table, table_key: str) -> None:
+    """Each classified column's ``sensitivity`` as the column tag :data:`SENSITIVITY_TAG`.
+
+    A column is entity type ``columns``, named ``catalog.schema.table.column`` (the
+    provider's ``entity_tag_assignment`` docs at v1.140.0). The name is built on the
+    table's ``id`` so the assignment is ordered after the table; the column is an
+    identifier ``_ident`` accepted, so it is safe inside the expression.
+    """
+    for column, sensitivity in _classified_tags(compiled, table):
         _claim_tags(
             compiled,
             f"{table_key}_col_{column}_tag",
@@ -2844,6 +3036,25 @@ def _monitor_actions(monitors: Sequence[SchemaMonitor]) -> List[Dict[str, Any]]:
     ]
 
 
+def _pipeline_actions(pipelines: Sequence[LakeflowPipeline]) -> List[Dict[str, Any]]:
+    """One plan action per Lakeflow pipeline, with the table it publishes and its rules."""
+    return [
+        {
+            "op": "databricks.pipeline.ensure",
+            "resource_type": "databricks_pipeline",
+            "resource_id": pipeline.name,
+            "build_id": pipeline.build_id,
+            "table": pipeline.table,
+            "trigger": "continuous" if pipeline.continuous else "manual",
+            "expectations": [
+                {"dataset": dataset, "rule": rule_id, "severity": severity}
+                for dataset, rule_id, severity in pipeline.expectations
+            ],
+        }
+        for pipeline in pipelines
+    ]
+
+
 def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """The objects the module manages, as plan actions, for the native planner.
 
@@ -2878,6 +3089,8 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "schema": table.schema,
             }
         )
+        if table.full_name in compiled.lakeflow_written:
+            continue  # its pipeline creates it (the pipeline action below)
         actions.append(
             {
                 "op": "databricks.table.ensure",
@@ -2913,6 +3126,7 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     actions.extend(compiled.metric_views.plan_actions())
     actions.extend(_monitor_actions(compiled.monitors))
     actions.extend(_job_actions(compiled.jobs))
+    actions.extend(_pipeline_actions(compiled.pipelines))
     if genie.space is not None:
         from .databricks_genie import space_plan_action
 
@@ -3034,6 +3248,23 @@ def managed_objects(
     for kind, full_name, principal, _privileges in compiled.grants:
         if kind == "table" and principal not in readers.setdefault(full_name, []):
             readers[full_name].append(principal)
+    # A pipeline's table is read through SELECT on its schema (``_emit_pipeline_table``),
+    # and carries the tags fluid apply sets after an update, not tag resources.
+    pipelines = {pipeline.table: pipeline for pipeline in compiled.pipelines}
+    for kind, full_name, principal, privileges in compiled.grants:
+        if kind != "schema" or "SELECT" not in privileges:
+            continue
+        for table in compiled.tables:
+            if table.full_name in compiled.lakeflow_written and (
+                f"{table.catalog}.{table.schema}" == full_name
+            ):
+                if principal not in readers.setdefault(table.full_name, []):
+                    readers[table.full_name].append(principal)
+    for table_name, pipeline in pipelines.items():
+        for tag_key, tag_value in pipeline.table_tags:
+            compiled.tags.append(("tables", table_name, tag_key, tag_value))
+        for column, tag_key, tag_value in pipeline.column_tags:
+            compiled.tags.append(("columns", f"{table_name}.{column}", tag_key, tag_value))
     # The module checks every schema against the one declared region, so verify
     # checks every table against it too, not only the expose that declared it.
     region = next((table.region for table in compiled.tables if table.region), "")
