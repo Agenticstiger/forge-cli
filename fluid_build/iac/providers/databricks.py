@@ -112,7 +112,8 @@ resources, with no new schema field (fluid-schema 0.7.6):
   Genie API after the masks and row filters are in place, and finds it again by a marker in its
   description (``databricks_genie.py``): in the deploying identity's own folder, or in the
   workspace folder ``extensions.databricksGenie.parentPath`` names, which a product deployed
-  from more than one identity shares.
+  from more than one identity shares. ``fluid plan`` lists the space as a
+  ``databricks_genie_space`` action, and ``fluid generate iac`` notes that its module holds none.
 
 * ``binding.location.region`` is the region the workspace is in, declared so a
   contract's ``sovereignty`` policy can check it (``policy/sovereignty.py``
@@ -2354,6 +2355,28 @@ class DatabricksIacPlugin:
             "Or remove the column restrictions and row filters from the contract.",
         )
 
+    def planned_output_ports(self, contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        """``fluid plan``'s actions for what :meth:`converge_output_ports` makes after ``tofu
+        apply``: the Genie space ``extensions.databricksGenie`` asks for
+        (``databricks_genie.space_plan_action``). A contract the emitter refuses lists none here;
+        ``fluid validate`` and ``fluid apply`` say why."""
+        from .databricks_genie import space_plan_action
+
+        compiled = _compile(contract, os.environ)
+        if compiled.refusals:
+            return []
+        space = _genie(contract, compiled, os.environ).space
+        return [space_plan_action(space)] if space is not None else []
+
+    def standalone_module_notices(self, contract: Mapping[str, Any]) -> List[str]:
+        """What a module ``fluid generate iac`` writes leaves out that ``fluid apply`` makes:
+        the Genie space ``extensions.databricksGenie`` asks for (Genie API, after ``tofu
+        apply``). Printed under the module's path; nothing is refused for it."""
+        from .databricks_genie import module_notice
+
+        notice = module_notice(contract)
+        return [notice] if notice else []
+
     @staticmethod
     def _enforcement_targets(contract: Mapping[str, Any]) -> List[Target]:
         compiled = _compile(contract, os.environ)
@@ -2761,6 +2784,11 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
             }
         )
     actions.extend(_job_actions(compiled.jobs))
+    if genie.space is not None:
+        from .databricks_genie import space_plan_action
+
+        # Not in the module: listed so the plan shows what the apply does after tofu apply.
+        actions.append(space_plan_action(genie.space))
     unique: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for action in actions:
         unique.setdefault((action["resource_type"], action["resource_id"]), action)

@@ -462,6 +462,50 @@ def _policy_refusals(table: Any) -> List[UnsupportedBindingError]:
     return out
 
 
+#: The plan op of a Genie space: its words name no kind the engines' shadow comparison counts
+#: (``iac/shadow.py`` matches table, view, schema, ...), since no module holds the space.
+PLAN_OP = "databricks.genie_space.converge"
+
+
+def space_plan_action(space: Space) -> Dict[str, Any]:
+    """The space as a plan action: ``fluid plan`` lists it (``plan.py``, through the plugin's
+    ``planned_output_ports``) and ``fluid diff`` counts it among the resources the contract asks
+    for (``databricks.py::planned_objects``).
+
+    No OpenTofu resource: ``fluid apply`` makes it through the Genie API after ``tofu apply``,
+    so no module or state holds it, and ``fluid diff``'s verdict does not read it (the live
+    check reads the tables, the state check the module's resources). Identified as the space
+    itself is, by the product's id, with no space id: none is known before an apply finds or
+    makes it. ``op`` and ``action_type`` both, as every plan action carries them.
+    """
+    return {
+        "action_id": f"genie_space_{space.product_id}",
+        "op": PLAN_OP,
+        "action_type": PLAN_OP,
+        "provider": "databricks",
+        "resource_type": "databricks_genie_space",
+        "resource_id": space.product_id,
+        "description": f"Genie space {space.title!r}{_in(space)}: fluid apply creates or "
+        "updates it through the Genie API, after tofu apply",
+        "title": space.title,
+        "parent_path": space.parent_path or None,
+        "tables": list(space.tables),
+        "readers": list(space.readers),
+    }
+
+
+def module_notice(contract: Mapping[str, Any]) -> Optional[str]:
+    """What ``fluid generate iac`` says about a contract that asks for a space: the module it
+    writes holds none, and a plain ``tofu apply`` of it makes none."""
+    if not requested(contract):
+        return None
+    return (
+        f"{_WHERE} asks for a Genie space, which this module does not hold: fluid apply "
+        "creates, updates or trashes it through the Genie API after tofu apply, so a plain "
+        "tofu apply of this module makes no space."
+    )
+
+
 def _description(contract: Mapping[str, Any], product_id: str) -> str:
     about = _text(contract.get("description"))
     footer = (

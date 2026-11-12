@@ -44,6 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole block leaves a space in `parentPath` in place, with a note naming it: without the block,
   the apply no longer knows which folder to trust.
 
+- **`fluid plan` lists the Genie space** as a `databricks_genie_space` action with its title,
+  folder, tables and readers. `fluid diff` counts it among the contract's resources and never
+  reports it as drift, since nothing compares it with an apply. **`fluid generate iac` adds a
+  note** that the module it writes holds no Genie space, so a plain `tofu apply` makes none.
+
 - **Databricks: Unity Catalog primary and foreign keys from the contract.** A column tagged
   `primary-key` (all of them, in schema order, for a composite key; each must be
   `required: true`) becomes the table's PRIMARY KEY, and one tagged `foreign-key` with

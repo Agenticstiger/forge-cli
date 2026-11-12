@@ -1415,3 +1415,92 @@ def test_dropping_the_block_leaves_a_space_in_the_parent_path_with_a_note(fake):
     run = Run(fake)(without_block(site_contract()))
     assert set(fake.genie_spaces) == {space_id} and run.writes() == []
     assert f"left alone: space {space_id}" in run.text and SALES in run.text
+
+
+# ---------------------------------------------------------------------- plan, diff, generate iac
+
+
+def test_the_plan_lists_the_space_as_an_action_outside_the_module(monkeypatch):
+    from fluid_build.iac.shadow import native_logical_resources
+
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, "wh-1")
+    doc = site_contract(parentPath=SALES)
+    (action,) = [
+        a for a in dbx.planned_objects(doc) if a["resource_type"] == "databricks_genie_space"
+    ]
+    assert action == {
+        "action_id": f"genie_space_{PRODUCT}",
+        "op": "databricks.genie_space.converge",
+        "action_type": "databricks.genie_space.converge",
+        "provider": "databricks",
+        "resource_type": "databricks_genie_space",
+        "resource_id": PRODUCT,
+        "description": "Genie space 'Site 360' in /genie/sales: fluid apply creates or updates "
+        "it through the Genie API, after tofu apply",
+        "title": "Site 360",
+        "parent_path": SALES,
+        "tables": [TABLE],
+        "readers": list(space_of(doc).readers),
+    }
+    # No logical resource for the engines' parity check, and the module is the same with it.
+    assert native_logical_resources([action]) == set()
+    assert PLUGIN.emit(doc, [action]) == PLUGIN.emit(doc)
+    assert not [
+        a
+        for a in dbx.planned_objects(without_block(doc))
+        if a["resource_type"] == "databricks_genie_space"
+    ]
+    # fluid plan's hook lists the same action, and none for a contract the emitter refuses.
+    assert PLUGIN.planned_output_ports(doc) == [action]
+    assert PLUGIN.planned_output_ports(site_contract(parentPath="/Shared/x")) == []
+    (own,) = [
+        a
+        for a in dbx.planned_objects(site_contract())
+        if a["resource_type"] == "databricks_genie_space"
+    ]
+    assert own["parent_path"] is None and " in " not in own["description"].split(":")[0]
+
+
+def test_generate_iac_notes_the_space_its_module_does_not_hold():
+    (notice,) = PLUGIN.standalone_module_notices(site_contract())
+    assert "extensions.databricksGenie asks for a Genie space" in notice
+    assert "a plain tofu apply of this module makes no space" in notice
+    assert PLUGIN.standalone_module_notices(without_block(site_contract())) == []
+
+
+def test_the_cli_plans_lists_diffs_and_notes_the_space(monkeypatch, tmp_path, capfd):
+    from ._databricks_cli import isolate_workspace, make_contract, run_fluid, write_contract
+
+    isolate_workspace(
+        monkeypatch,
+        tmp_path,
+        host="https://adb-1.azuredatabricks.net",
+        warehouse_id="wh-0123456789abcdef",
+        plugin_cache=str(tmp_path),
+    )
+    doc = make_contract()
+    doc["extensions"] = {genie.EXTENSION_KEY: {"parentPath": SALES}}
+    path = write_contract(tmp_path, doc)
+
+    rc, out = run_fluid(capfd, "generate", "iac", path, "--out", str(tmp_path / "iac"))
+    assert rc == 0, out
+    assert "Note: extensions.databricksGenie asks for a Genie space, which this module" in out
+    assert "databricks_genie" not in (tmp_path / "iac" / "main.tf.json").read_text()
+
+    rc, out = run_fluid(capfd, "plan", path, "--out", str(tmp_path / "plan.json"))
+    assert rc == 0, out
+    plan = json.loads((tmp_path / "plan.json").read_text())
+    (listed,) = [a for a in plan["actions"] if a.get("resource_type") == "databricks_genie_space"]
+    assert listed["resource_id"] == "dbx.fake.orders" and listed["parent_path"] == SALES
+    assert listed["step"] == plan["total_actions"] == len(plan["actions"])
+    assert listed["action_id"] in plan["dependency_graph"]["nodes"]
+    assert f"genie_space_dbx.fake.orders ({genie.PLAN_OP})" in out
+
+    # Listed among what the contract asks for, and no drift: nothing compares it with an apply.
+    rc, out = run_fluid(
+        capfd, "diff", path, "--exit-on-drift", "--out", str(tmp_path / "drift.json")
+    )
+    assert rc == 0, out
+    report = json.loads((tmp_path / "drift.json").read_text())
+    assert "databricks_genie_space:dbx.fake.orders" in report["changes"]["added"]
+    assert report["summary"]["has_drift"] is False

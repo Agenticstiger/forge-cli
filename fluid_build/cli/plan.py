@@ -352,6 +352,10 @@ def run(args, logger: logging.Logger) -> int:
             plan["actions"] = list(existing) + schedule_actions
             plan["total_actions"] = len(plan["actions"])
 
+        # What the apply makes outside OpenTofu (a Databricks Genie space), before the digests.
+        if not streaming:
+            _append_output_port_actions(plan, contract, logger)
+
         # --- Packaging truthfulness (RFC-packaging-modes.md file 8) ---------
         # plan.json is the digest-bound artifact the human reviews, and
         # untouched it would list container-*creation* actions for containers
@@ -856,6 +860,60 @@ def _validate_plan_actions(plan: Dict[str, Any], logger: logging.Logger) -> None
             cprint_literal(f"   • {err}")
     else:
         cprint(f"\n✓  All {len(typed)} actions pass schema validation")
+
+
+def _append_output_port_actions(
+    plan: Dict[str, Any], contract: Dict[str, Any], logger: logging.Logger
+) -> None:
+    """Add to ``plan`` the actions an IaC plugin names for what ``fluid apply`` makes after
+    ``tofu apply`` (its ``planned_output_ports`` hook, beside ``converge_output_ports``): the
+    Databricks plugin's Genie space. One per platform the contract's exposes bind to, from the
+    in-tree plugins only (``IAC_PLUGINS``: nothing is loaded from an entry point to plan). They
+    come last and depend on nothing in the graph, since they run after the whole tofu apply.
+    The OpenTofu engine applies from the contract, never from plan actions, so they change what
+    is reviewed, not what is applied; ``planDigest`` covers them. Never on a managed streaming
+    plan, whose apply runs no OpenTofu and checks its actions against its artifacts one for one.
+    A hook that fails leaves its actions out with a warning: ``fluid validate`` and ``fluid
+    apply`` refuse the contract with the reason, and the plan of the rest stays readable."""
+    from fluid_build.iac.provider_match import canonical_cloud
+
+    platforms = sorted(
+        {
+            canonical_cloud((expose.get("binding") or {}).get("platform"))
+            for expose in contract.get("exposes") or []
+            if isinstance(expose, dict) and isinstance(expose.get("binding"), dict)
+        }
+        - {""}
+    )
+    if not platforms:
+        return
+    # Function-local: ``iac`` pulls every provider plugin, off the ``fluid --help`` cold path.
+    from fluid_build.iac import IAC_PLUGINS
+
+    added: List[Dict[str, Any]] = []
+    for name in platforms:
+        hook = getattr(IAC_PLUGINS.get(name), "planned_output_ports", None)
+        if not callable(hook):
+            continue
+        try:
+            added.extend(dict(action) for action in hook(contract))
+        except Exception as exc:  # noqa: BLE001 - the plan of everything else still stands
+            warn(
+                logger,
+                "plan_output_ports_skipped",
+                provider=name,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+    if not added:
+        return
+    actions = list(plan.get("actions") or [])
+    for action in added:
+        actions.append({"step": len(actions) + 1, "depends_on": [], **action})
+    plan["actions"] = actions
+    plan["total_actions"] = len(actions)
+    graph = plan.get("dependency_graph")
+    if isinstance(graph, dict) and isinstance(graph.get("nodes"), list):
+        graph["nodes"] = graph["nodes"] + [a.get("action_id") for a in added]
 
 
 def _plan_schedule_actions(

@@ -375,7 +375,8 @@ in the identity's own folder is moved in, keeping its conversations. A space inh
 permissions, so the folder is the trust boundary. `/Shared` is refused offline, because every
 workspace user holds `CAN_MANAGE` there. The apply also stops, before `tofu`, on a folder that
 does not exist or one where the `users` group can edit or manage. Removing the block leaves a
-space in `parentPath` with a note naming it.
+space in `parentPath` with a note naming it. `fluid plan` lists the space as a
+`databricks_genie_space` action, and `fluid generate iac` notes that its module holds none.
 Code: `fluid_build/iac/providers/databricks_genie.py`.
 
 ---
