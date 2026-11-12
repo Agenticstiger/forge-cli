@@ -22,6 +22,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -336,6 +337,25 @@ def test_agent_flag_registered_in_argparse():
     assert getattr(args, "blank", False) is True
 
 
+def test_agent_flag_help_names_the_events_the_stream_sends():
+    """``--agent``'s help lists the stream's events: forge.error too, never a phantom one."""
+    import argparse
+
+    from fluid_build.cli import forge as forge_mod
+
+    parser = argparse.ArgumentParser()
+    sp = parser.add_subparsers()
+    forge_mod.register(sp)
+    forge_parser = sp.choices["forge"]
+    (agent,) = [a for a in forge_parser._actions if "--agent" in a.option_strings]
+
+    for event in ("forge.start", "forge.contract_written", "forge.file_written"):
+        assert event in agent.help
+    for event in ("forge.plan", "forge.error", "forge.done"):
+        assert event in agent.help
+    assert "forge.cost" not in agent.help  # listed once, never sent
+
+
 # ---------------------------------------------------------------------------
 # 6. Explicit AI flags under --agent select AI mode (never a silent blank)
 # ---------------------------------------------------------------------------
@@ -632,7 +652,10 @@ def _raise_missing_litellm(args, logger):
 
 
 def test_agent_missing_extra_still_propagates_in_process(tmp_path, capsys, monkeypatch):
-    """An in-process caller (the MCP ``forge_run``) gets the exception, after forge.done."""
+    """An in-process caller (the MCP ``forge_run``) gets the exception, after forge.done.
+
+    The stream says which extra is missing, in forge.error, before forge.done.
+    """
     from fluid_build._optional import MissingOptionalDependency
     from fluid_build.cli import forge as forge_mod
 
@@ -642,8 +665,10 @@ def test_agent_missing_extra_still_propagates_in_process(tmp_path, capsys, monke
         forge_mod.run(args, logging.getLogger("test"))
 
     events = _json_lines_only(capsys.readouterr().out)
-    assert events[-1]["event"] == "forge.done"
+    assert [e["event"] for e in events][-2:] == ["forge.error", "forge.done"]
     assert events[-1]["exit_code"] == 1
+    assert events[-2]["code"] == "copilot_litellm_unavailable"
+    assert events[-2]["suggestions"] == ["pip install 'data-product-forge[litellm]'"]
 
 
 def test_agent_missing_extra_remedy_goes_to_stderr(tmp_path, capsys, monkeypatch):
@@ -659,3 +684,240 @@ def test_agent_missing_extra_remedy_goes_to_stderr(tmp_path, capsys, monkeypatch
     events = _json_lines_only(captured.out)
     assert events[-1]["event"] == "forge.done"
     assert "pip install 'data-product-forge[litellm]'" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 8. A failure is one forge.error event; its traceback is a DEBUG detail
+# ---------------------------------------------------------------------------
+
+
+def _no_provider_env(tmp_path: Path) -> dict:
+    """The hermetic env with nothing an LLM provider could be found from.
+
+    No key or Ollama variable, no coding-agent CLI on PATH, and every proxy
+    variable on a dead port, so a local Ollama on :11434 goes unseen too.
+    """
+    from fluid_build.llm.coding_agent import _AGENT_SPECS
+
+    env = {
+        k: v
+        for k, v in _hermetic_env(tmp_path).items()
+        if not k.startswith("OLLAMA_")
+        and not k.endswith(("_BASE_URL", "_API_BASE", "_AUTH_TOKEN"))
+        and k not in ("FLUID_HOME", "FLUID_CONFIG")  # the saved choice lives under HOME
+    }
+    agent_clis = [spec.binary for spec in _AGENT_SPECS.values()]
+    env["PATH"] = os.pathsep.join(
+        entry
+        for entry in env.get("PATH", "").split(os.pathsep)
+        if entry and not any(shutil.which(cli, path=entry) for cli in agent_clis)
+    )
+    dead = "http://127.0.0.1:9"
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        env[name] = env[name.lower()] = dead
+    env["NO_PROXY"] = env["no_proxy"] = ""
+    env["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    return env
+
+
+@pytest.mark.parametrize("log_level", ["INFO", "DEBUG"])
+def test_agent_ai_error_is_a_forge_error_event_not_a_traceback(log_level, tmp_path: Path):
+    """No provider configured, through the CLI entry point: the stream says why.
+
+    Every stdout line is JSON at either log level, and stderr shows the
+    traceback only at DEBUG.
+    """
+    proc = subprocess.run(
+        [*_fluid_invocation(), "--agent", "--context", "x", "-d", str(tmp_path / "product")],
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**_no_provider_env(tmp_path), "FLUID_LOG_LEVEL": log_level},
+    )
+
+    assert proc.returncode == 1, proc.stderr
+    events = _json_lines_only(proc.stdout)
+    assert [e["event"] for e in events] == ["forge.start", "forge.error", "forge.done"]
+    start, error, done = events
+    assert error["run_id"] == start["run_id"] == done["run_id"]
+    assert error["code"] == "copilot_no_llm_provider"
+    assert error["message"].startswith("No LLM provider configured")
+    assert any("fluid ai setup" in s for s in error["suggestions"])
+    assert error["docs_url"].startswith("https://")
+    assert done["exit_code"] == 1
+    assert ("Traceback (most recent call last)" in proc.stderr) is (log_level == "DEBUG")
+    assert "No LLM provider configured" in proc.stderr  # the human still reads why
+
+
+@pytest.fixture
+def _agent_env(monkeypatch):
+    """The variables ``--agent`` sets, owned by monkeypatch so they do not leak."""
+    for var in (
+        "FLUID_FORGE_NO_PICKER",
+        "FLUID_FORGE_NO_PREVIEW",
+        "FLUID_FORGE_NO_WELCOME",
+        "FLUID_FORGE_NO_STREAMING_PREVIEW",
+    ):
+        monkeypatch.setenv(var, "1")
+
+
+def test_agent_crash_is_named_by_class_not_text(tmp_path, capsys, monkeypatch, _agent_env):
+    """An unexpected exception: its class and a pointer to stderr, never its text.
+
+    The MCP ``forge_run`` hands these events to the IDE's model, and an
+    exception's text can carry paths or provider detail.
+    """
+    args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
+    events, _ = _run_agent(args, capsys, monkeypatch, ai_result=RuntimeError("/secret/path"))
+
+    error = next(e for e in events if e["event"] == "forge.error")
+    assert error["code"] == "forge_unexpected_error"
+    assert error["exception"] == "RuntimeError"
+    assert "/secret/path" not in json.dumps(error)
+
+
+def test_agent_failure_without_an_exception_sends_no_forge_error(
+    tmp_path, capsys, monkeypatch, _agent_env
+):
+    """Exit 1 with nothing raised: forge.done says it failed; nothing is made up.
+
+    A failure noted before the run (an earlier in-process run, a handler outside
+    ``--agent``) is not this run's: the run starts by forgetting it.
+    """
+    from fluid_build.cli._forge_mode_errors import note_forge_failure
+
+    note_forge_failure(KeyError("an earlier run"))
+    args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
+    events, _ = _run_agent(args, capsys, monkeypatch, ai_result=1)
+
+    assert [e["event"] for e in events] == ["forge.start", "forge.done"]
+    assert events[-1]["exit_code"] == 1
+
+
+def test_agent_seed_failure_is_a_forge_error_without_the_exception_text(
+    tmp_path, capsys, monkeypatch, _agent_env
+):
+    """``--seed-from`` swallows its error; the event says what the console says.
+
+    The exception is a typed one whose text can carry a remote seed's body, so
+    the event gets the console's words (path and class), never that text.
+    """
+    from fluid_build.cli import forge as forge_mod
+
+    monkeypatch.chdir(tmp_path)
+    missing = tmp_path / "missing-seed.yaml"
+    args = _agent_args(
+        ["--llm-provider", "openai", "--context", '{"project_goal": "x"}', "--seed-from"]
+        + [str(missing)],
+        tmp_path,
+    )
+    assert forge_mod.run(args, logging.getLogger("test")) == 1
+
+    events = _json_lines_only(capsys.readouterr().out)
+    assert [e["event"] for e in events] == ["forge.start", "forge.error", "forge.done"]
+    error = events[1]
+    assert error["code"] == "forge_seed_failed"
+    assert error["message"].startswith(f"--seed-from failed for {missing}: ")
+    # A next step that exists: forge has no --verbose flag.
+    assert error["suggestions"] == [
+        "--seed-from takes an ODPS or ODCS file (*.odps.yaml, *.odcs.yaml, or one with "
+        "kind: DataProduct or DataContract), or a directory of them"
+    ]
+    assert "exception" not in error
+
+
+def test_mcp_forge_run_logs_the_failure_for_the_server(tmp_path, monkeypatch, caplog, _agent_env):
+    """MCP ``forge_run`` discards forge's console output, so it logs the failure itself.
+
+    Forge marks its own record of a typed failure as shown on the console, and
+    the server's console handler drops it: without this line the server log has
+    nothing on a failed run.
+    """
+    from fluid_build.cli import forge as forge_mod
+    from fluid_build.cli import mcp as mcp_mod
+    from fluid_build.cli.mcp import McpPolicy, _run_forge_inproc
+    from fluid_build.llm.providers import CopilotGenerationError
+
+    def _fail(args, logger):
+        raise CopilotGenerationError("mcp_sampling_failed", "The IDE refused the request.")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(forge_mod, "run_ai_copilot_mode", _fail)
+    monkeypatch.setattr(
+        mcp_mod,
+        "_policy",
+        lambda: McpPolicy(
+            readable_paths=(tmp_path,),
+            writable_paths=(tmp_path,),
+            writable_namespaces=("history", "audit"),
+        ),
+    )
+    with caplog.at_level(logging.INFO, logger="fluid.mcp.forge_run"):
+        result = _run_forge_inproc("ai", str(tmp_path / "product"), "SDP", None)
+
+    assert result["exit_code"] == 1
+    assert [e["event"] for e in result["events"]][-2:] == ["forge.error", "forge.done"]
+    (logged,) = [
+        r
+        for r in caplog.records
+        if r.name == "fluid.mcp.forge_run" and r.levelno == logging.WARNING
+    ]
+    assert logged.getMessage() == (
+        "forge_run failed: mcp_sampling_failed: 'The IDE refused the request.'"
+    )
+    assert not getattr(logged, "fluid_console_shown", False)
+
+
+def test_agent_error_text_is_redacted(tmp_path, capsys, monkeypatch, _agent_env):
+    """The events go to stdout directly, past the logging redactor: they redact too."""
+    from fluid_build.cli import forge as forge_mod
+    from fluid_build.llm.providers import CopilotGenerationError
+
+    leaked = "sk-proj-" + "A" * 40  # pragma: allowlist secret
+
+    def _fail(args, logger):
+        raise CopilotGenerationError(
+            "copilot_litellm_request_failed",
+            f"litellm request failed: Incorrect API key provided: {leaked}",
+            suggestions=[f"Rotate {leaked}"],
+        )
+
+    monkeypatch.setattr(forge_mod, "run_ai_copilot_mode", _fail)
+    args = _agent_args(["--llm-provider", "openai"], tmp_path)
+    forge_mod.run(args, logging.getLogger("test"))
+
+    out = capsys.readouterr().out
+    assert leaked not in out
+    event = next(e for e in _json_lines_only(out) if e["event"] == "forge.error")
+    assert event["code"] == "copilot_litellm_request_failed"
+
+
+# ---------------------------------------------------------------------------
+# 9. One contract written, one forge.contract_written event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("inside_cwd", [True, False], ids=["under-cwd", "outside-cwd"])
+def test_agent_blank_reports_its_contract_once(
+    inside_cwd, tmp_path, capsys, monkeypatch, _agent_env
+):
+    """Blank mode used to send its own event as well as the receipt's: two for one file."""
+    from fluid_build.cli import forge as forge_mod
+
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    product = (work if inside_cwd else tmp_path) / "product"
+    args = _agent_args(["--blank", "--data-product-type", "SDP"], tmp_path)
+    args.target_dir = str(product)
+
+    assert forge_mod.run(args, logging.getLogger("test")) == 0
+
+    events = _json_lines_only(capsys.readouterr().out)
+    written = [(e["path"], e["action"]) for e in events if e["event"] == "forge.contract_written"]
+    contract = product / "contract.fluid.yaml"
+    path = "product/contract.fluid.yaml" if inside_cwd else str(contract.resolve())
+    assert written == [(path, "created")]
+    assert "forge.error" not in [e["event"] for e in events]

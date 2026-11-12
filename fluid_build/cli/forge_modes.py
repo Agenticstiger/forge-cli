@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from fluid_build._console import literal_error_text
-from fluid_build.cli._forge_mode_errors import forge_mode_error_boundary
+from fluid_build.cli._forge_mode_errors import forge_mode_error_boundary, note_forge_failure
 from fluid_build.cli.console import cprint, cprint_literal, success
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_copilot_interview import (
@@ -1284,9 +1284,17 @@ def run_ai_copilot_mode(
                         "exc_type": type(_seed_exc).__name__,
                     },
                 )
-                console_error(
-                    f"--seed-from failed for {_seed_from!s}: "
-                    f"{type(_seed_exc).__name__} (run with --verbose for details)"
+                failed = f"--seed-from failed for {_seed_from!s}: {type(_seed_exc).__name__}"
+                # What load_seed accepts; there is no --verbose to point at.
+                accepts = (
+                    "--seed-from takes an ODPS or ODCS file (*.odps.yaml, *.odcs.yaml, or "
+                    "one with kind: DataProduct or DataContract), or a directory of them"
+                )
+                console_error(f"{failed} ({accepts})")
+                # ``--agent``'s forge.error gets the same words, not the exception:
+                # a typed one (ProviderError) would carry its text into the event.
+                note_forge_failure(
+                    CopilotGenerationError("forge_seed_failed", failed, suggestions=[accepts])
                 )
                 return 1
 
