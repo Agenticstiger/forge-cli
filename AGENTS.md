@@ -96,7 +96,7 @@ Generated pipelines therefore compute ONE effective mode for stages 6 and 7: `AP
 
 ## For AI Coding Agents (Copilot, Cursor, Cline, Kiro, Claude Code, etc.)
 
-> **Quick start for any agentic IDE.** Run `fluid scaffold-ide --target {kiro|cursor|claude-code|cline|generic}` in your data-product repo. It drops the right steering files, hooks, and MCP server config for your IDE so its agent can drive `fluid` natively. See [AGENT_IDE.md](AGENT_IDE.md) for the full walkthrough.
+> **Quick start for any agentic IDE.** Run `fluid scaffold-ide --target {kiro|cursor|claude-code|cline|generic}` in your data-product repo. It installs the FLUID Agent Skills (`fluid_build/agent_skills/skills/`), a short always-loaded index, hooks, and MCP server config for your IDE so its agent can drive `fluid` natively. The same skills install as a Claude Code plugin (`/plugin install fluid@forge-cli` after `/plugin marketplace add Agenticstiger/forge-cli`) or with `npx skills add Agenticstiger/forge-cli`. Their reference sheets are generated (`python scripts/gen_agent_skill_references.py`; `tests/agent_skills` fails on drift), and `tests/agent_evals/` measures them against no skills and `fluid forge` AI mode (opt-in, marker `agent_eval`). See [AGENT_IDE.md](AGENT_IDE.md) for the full walkthrough.
 
 ### Project Structure
 
