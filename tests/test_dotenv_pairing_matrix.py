@@ -845,10 +845,10 @@ def _install_fake_codex(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def _run_codex() -> None:
+    import fluid_build.llm.providers as llm_providers
     from fluid_build.llm.coding_agent import get_coding_agent_provider
-    from fluid_build.llm.providers import LlmConfig
 
-    config = LlmConfig(provider="codex", model="codex", endpoint="", api_key=None)
+    config = llm_providers.LlmConfig(provider="codex", model="codex", endpoint="", api_key=None)
     try:
         get_coding_agent_provider("codex").invoke_blocking(config, "system", "user")
     except Exception:  # noqa: BLE001 — the listener answers 401
