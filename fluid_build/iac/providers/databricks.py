@@ -2715,6 +2715,20 @@ def _job_actions(jobs: Sequence[DbtJob]) -> List[Dict[str, Any]]:
     return actions
 
 
+def _monitor_actions(monitors: Sequence[SchemaMonitor]) -> List[Dict[str, Any]]:
+    """One plan action per schema's data quality monitor, keyed by the schema it watches."""
+    return [
+        {
+            "op": "databricks.quality_monitor",
+            "resource_type": QUALITY_MONITOR,
+            "resource_id": monitor.full_name,
+            "monitored": list(monitor.monitored),
+            "excluded": list(monitor.excluded),
+        }
+        for monitor in monitors
+    ]
+
+
 def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """The objects the module manages, as plan actions, for the native planner.
 
@@ -2778,16 +2792,7 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "tag_value": tag_value,
             }
         )
-    for monitor in compiled.monitors:
-        actions.append(
-            {
-                "op": "databricks.quality_monitor",
-                "resource_type": QUALITY_MONITOR,
-                "resource_id": monitor.full_name,
-                "monitored": list(monitor.monitored),
-                "excluded": list(monitor.excluded),
-            }
-        )
+    actions.extend(_monitor_actions(compiled.monitors))
     actions.extend(_job_actions(compiled.jobs))
     unique: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for action in actions:
