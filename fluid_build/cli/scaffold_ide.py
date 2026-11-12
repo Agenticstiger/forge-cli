@@ -487,13 +487,16 @@ def _ignore_in_git(root: Path, rel: str) -> Optional[Path]:
     """Add ``rel`` to ``root/.gitignore`` unless a line already names it.
 
     Appends in binary mode, so the file's mode, line endings and every other byte stay
-    as they were. A ``.gitignore`` that cannot be appended to is not fatal: the entry
-    to add by hand is logged.
+    as they were. An append follows a symlink, so a ``.gitignore`` that links outside
+    ``root`` (a cloned repository can ship one) is never written. A ``.gitignore`` that
+    cannot be appended to is not fatal: the entry to add by hand is logged.
     """
     gitignore = root / ".gitignore"
     try:
         if gitignore.exists() and not gitignore.is_file():
             raise OSError(f"{gitignore} is not a regular file")
+        if gitignore.is_symlink() and not gitignore.resolve().is_relative_to(root.resolve()):
+            raise OSError(f"{gitignore} links outside {root}")
         existing = gitignore.read_bytes() if gitignore.exists() else b""
         lines = {
             line.strip().lstrip("/") for line in existing.decode("utf-8", "replace").splitlines()

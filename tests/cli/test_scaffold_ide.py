@@ -565,6 +565,29 @@ def test_a_gitignore_directory_warns_and_the_run_succeeds(tmp_path: Path, caplog
     assert (tmp_path / ".claude/settings.local.json").is_file()
 
 
+def test_a_gitignore_linking_outside_the_project_is_never_written(tmp_path: Path, caplog):
+    """An append follows the link: a cloned repository must not make it write elsewhere."""
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"precious\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".gitignore").symlink_to(outside)
+    with caplog.at_level(logging.WARNING):
+        assert _run(project, "claude-code") == 0
+    assert outside.read_bytes() == b"precious\n"
+    assert "links outside" in caplog.text
+
+
+def test_a_gitignore_linking_inside_the_project_is_appended_to(tmp_path: Path):
+    shared = tmp_path / "config" / "ignore"
+    shared.parent.mkdir()
+    shared.write_bytes(b"node_modules/\n")
+    (tmp_path / ".gitignore").symlink_to(shared)
+    assert _run(tmp_path, "claude-code") == 0
+    assert shared.read_bytes() == b"node_modules/\n.claude/settings.local.json\n"
+    assert (tmp_path / ".gitignore").is_symlink()
+
+
 @pytest.mark.parametrize("line", [".claude/settings.local.json", "/.claude/settings.local.json"])
 def test_gitignore_already_naming_the_entry_is_unchanged(tmp_path: Path, line: str):
     body = f"dist/\r\n{line}\r\n".encode()
