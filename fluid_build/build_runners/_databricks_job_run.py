@@ -62,6 +62,7 @@ from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
+    ContextManager,
     Dict,
     Iterable,
     Iterator,
@@ -70,6 +71,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    TypeVar,
 )
 
 from fluid_build._console import cprint
@@ -77,6 +79,9 @@ from fluid_build._console import error as console_error
 from fluid_build.util.contract import is_continuous_build, is_databricks_job_build
 
 LOG = logging.getLogger(__name__)
+
+#: What a state resource becomes (``JobRef``, ``PipelineRef``).
+_Ref = TypeVar("_Ref")
 
 #: The wait cap for one run, in seconds (:func:`wait_budget`).
 TIMEOUT_ENV = "FLUID_DATABRICKS_RUN_TIMEOUT_SECONDS"
@@ -113,48 +118,121 @@ class JobRef:
     url: str = ""
 
 
+def selected_builds(
+    contract: Mapping[str, Any],
+    build_id: Optional[str],
+    wanted: Callable[[Dict[str, Any]], bool],
+) -> List[Mapping[str, Any]]:
+    """The builds of ``contract`` that ``wanted`` keeps: every one when ``build_id`` is empty,
+    as the build runner's own filter does, or the one ``build_id`` names."""
+    return [
+        build
+        for build in contract.get("builds") or []
+        if isinstance(build, Mapping)
+        and wanted(dict(build))
+        and (not build_id or build.get("id") == build_id)
+    ]
+
+
 def started_builds(contract: Mapping[str, Any], build_id: Optional[str]) -> List[Mapping[str, Any]]:
     """The builds a ``-and-build`` apply of ``contract`` starts as Databricks job runs.
 
     An empty ``build_id`` selects every build, as the build runner's own filter does.
     """
-    return [
-        build
-        for build in contract.get("builds") or []
-        if isinstance(build, Mapping)
-        and is_databricks_job_build(dict(build))
-        and not is_continuous_build(dict(build))
-        and (not build_id or build.get("id") == build_id)
-    ]
+    return selected_builds(
+        contract,
+        build_id,
+        lambda build: is_databricks_job_build(build) and not is_continuous_build(build),
+    )
 
 
 def jobs_in_state(resources: Iterable[Any], product: str) -> Dict[str, List[JobRef]]:
     """Build id to the ``databricks_job`` resources ``product`` has in an OpenTofu state.
 
     ``resources`` are a state's resources as ``runner.tofu_state_resources`` returns them. A
-    list per build, so that a caller can refuse a build with more than one. The tags are the
-    emitter's own (``databricks_jobs.PRODUCT_TAG`` / ``BUILD_TAG``).
+    list per build, so that a caller can refuse a build with more than one
+    (:func:`tagged_in_state`).
     """
+    return tagged_in_state(resources, "databricks_job", product, _job_ref)
+
+
+def _job_ref(values: Mapping[str, Any]) -> Optional[JobRef]:
+    try:
+        return JobRef(int(str(values.get("id"))), str(values.get("url") or ""))
+    except ValueError:
+        return None
+
+
+def tagged_in_state(
+    resources: Iterable[Any],
+    resource_type: str,
+    product: str,
+    make_ref: Callable[[Mapping[str, Any]], Optional[_Ref]],
+) -> Dict[str, List[_Ref]]:
+    """Build id to ``make_ref`` of each managed ``resource_type`` resource ``product`` has in
+    an OpenTofu state (one it returns ``None`` for is left out), found by the emitter's own
+    tags (``databricks_jobs.PRODUCT_TAG`` / ``BUILD_TAG``), never by name."""
     from fluid_build.iac.providers.databricks_jobs import BUILD_TAG, PRODUCT_TAG
 
-    found: Dict[str, List[JobRef]] = {}
+    found: Dict[str, List[_Ref]] = {}
     for resource in resources:
-        if not isinstance(resource, Mapping) or resource.get("type") != "databricks_job":
+        if not isinstance(resource, Mapping) or resource.get("type") != resource_type:
             continue
         if resource.get("mode", "managed") != "managed":
             continue
         values = resource.get("values") if isinstance(resource.get("values"), Mapping) else {}
         tags = values.get("tags") if isinstance(values.get("tags"), Mapping) else {}
-        if tags.get(PRODUCT_TAG) != product or not tags.get(BUILD_TAG):
-            continue
-        try:
-            job_id = int(str(values.get("id")))
-        except ValueError:
-            continue
-        found.setdefault(str(tags[BUILD_TAG]), []).append(
-            JobRef(job_id, str(values.get("url") or ""))
-        )
+        ref = make_ref(values) if tags.get(PRODUCT_TAG) == product and tags.get(BUILD_TAG) else None
+        if ref is not None:
+            found.setdefault(str(tags[BUILD_TAG]), []).append(ref)
     return found
+
+
+def single_ref(
+    refs: Mapping[str, Sequence[Any]],
+    build_id: str,
+    *,
+    product: str,
+    one: str,
+    many: str,
+    started: str,
+) -> Optional[Any]:
+    """The one resource an apply's state holds for ``build_id`` (``one``, ``many``: what it
+    is called), or ``None`` after saying that no ``started`` was started and why."""
+    from fluid_build.iac.providers.databricks_jobs import BUILD_TAG, PRODUCT_TAG
+
+    found = list(refs.get(build_id) or [])
+    if len(found) == 1:
+        return found[0]
+    held = f"no {one}" if not found else f"{len(found)} {many}"
+    console_error(
+        f"Build '{build_id}' - this apply's OpenTofu state holds {held} tagged "
+        f"{PRODUCT_TAG}={product}, {BUILD_TAG}={build_id}, so no {started} was started. Either "
+        "the state could not be read back after the apply (said above), or the contract "
+        "was not applied to databricks; fix that, then re-run fluid apply."
+    )
+    return None
+
+
+def client_or_none(
+    factory: Callable[[], Any], *, build_id: str, started: str, target: str
+) -> Optional[Any]:
+    """The Databricks client ``factory`` makes, or ``None`` after saying why there is none:
+    ``started`` is what it would start ("the run of Databricks job 'x'"), ``target`` what it
+    would start it on ("job 'x'")."""
+    try:
+        return factory()
+    except ImportError:
+        console_error(
+            f"Build '{build_id}' - databricks-sdk is not installed, and {started} is started "
+            "through it. Install the extra: pip install 'data-product-forge[databricks]'"
+        )
+    except Exception as exc:  # noqa: BLE001 — a bad credential must not become a traceback
+        console_error(
+            f"Build '{build_id}' - could not create the Databricks client to start {target}: "
+            f"{_failure(exc)}"
+        )
+    return None
 
 
 def wait_budget(settings: Mapping[str, Any], env: Mapping[str, str]) -> int:
@@ -229,12 +307,7 @@ def run_job_build(
 
     ``jobs`` is :func:`jobs_in_state` of the apply that provisioned it.
     """
-    from fluid_build.iac.providers.databricks_jobs import (
-        BUILD_TAG,
-        PRODUCT_TAG,
-        job_build_id,
-        job_product,
-    )
+    from fluid_build.iac.providers.databricks_jobs import job_build_id, job_product
 
     build_id = job_build_id(contract, build)
     product = job_product(contract)
@@ -247,34 +320,22 @@ def run_job_build(
             f"'{name}'{with_refresh} and wait for it."
         )
         return 0
-    refs = list(jobs.get(build_id) or [])
-    if len(refs) != 1:
-        found = "no Databricks job" if not refs else f"{len(refs)} Databricks jobs"
-        console_error(
-            f"Build '{build_id}' - this apply's OpenTofu state holds {found} tagged "
-            f"{PRODUCT_TAG}={product}, {BUILD_TAG}={build_id}, so no run was started. Either "
-            "the state could not be read back after the apply (said above), or the contract "
-            "was not applied to databricks; fix that, then re-run fluid apply."
-        )
+    ref = single_ref(
+        jobs, build_id, product=product, one="Databricks job", many="Databricks jobs", started="run"
+    )
+    if ref is None:
         return 1
-    try:
-        client = (client_factory or _default_client)()
-    except ImportError:
-        console_error(
-            f"Build '{build_id}' - databricks-sdk is not installed, and the run of Databricks job "
-            f"'{name}' is started through it. Install the extra: "
-            "pip install 'data-product-forge[databricks]'"
-        )
-        return 1
-    except Exception as exc:  # noqa: BLE001 — a bad credential must not become a traceback
-        console_error(
-            f"Build '{build_id}' - could not create the Databricks client to start job "
-            f"'{name}': {_failure(exc)}"
-        )
+    client = client_or_none(
+        client_factory or _default_client,
+        build_id=build_id,
+        started=f"the run of Databricks job '{name}'",
+        target=f"job '{name}'",
+    )
+    if client is None:
         return 1
     return start_and_wait(
         client,
-        refs[0],
+        ref,
         build_id=build_id,
         name=name,
         full_refresh=full_refresh,
@@ -451,15 +512,21 @@ def _wait(
         sleep(delay)
 
 
-@contextmanager
-def _cancelled_if_interrupted(api: Any, run_id: int, say: Say) -> Iterator[None]:
+def _cancelled_if_interrupted(api: Any, run_id: int, say: Say) -> ContextManager[None]:
     """Ctrl-C, SIGTERM or SIGHUP (a CI job cancelled, a terminal closed) while the run is
     waited on cancels it, then interrupts as Ctrl-C always does."""
+    return interrupt_guard(lambda: _cancel(api, run_id, say))
+
+
+@contextmanager
+def interrupt_guard(on_interrupt: Callable[[], Any]) -> Iterator[None]:
+    """Ctrl-C, SIGTERM or SIGHUP inside the block calls ``on_interrupt`` (cancel the run, stop
+    the update), then interrupts as Ctrl-C always does; the handlers are put back after."""
     previous = _interrupt_on_terminate()
     try:
         yield
     except KeyboardInterrupt:
-        _cancel(api, run_id, say)
+        on_interrupt()
         raise
     finally:
         for signum, handler in previous.items():

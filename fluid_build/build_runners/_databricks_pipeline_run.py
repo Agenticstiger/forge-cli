@@ -44,16 +44,14 @@ from __future__ import annotations
 import logging
 import os
 import re
-import signal
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
+    ContextManager,
     Dict,
     Iterable,
-    Iterator,
     List,
     Mapping,
     Optional,
@@ -67,6 +65,7 @@ from fluid_build._console import error as console_error
 from fluid_build.util.contract import is_continuous_build, is_lakeflow_build
 
 from ._databricks_job_run import (
+    _REPLACE_MODES,
     DEFAULT_TIMEOUT_SECONDS,
     HEARTBEAT_SECONDS,
     TIMEOUT_ENV,
@@ -75,10 +74,14 @@ from ._databricks_job_run import (
     _default_client,
     _duration,
     _failure,
-    _interrupt_on_terminate,
     _say,
     _timeout_override,
     clean,
+    client_or_none,
+    interrupt_guard,
+    selected_builds,
+    single_ref,
+    tagged_in_state,
 )
 
 LOG = logging.getLogger(__name__)
@@ -86,7 +89,6 @@ LOG = logging.getLogger(__name__)
 _PIPELINES = "/api/2.0/pipelines"
 _TABLES = "/api/2.1/unity-catalog/tables"
 _TAGS = "/api/2.1/unity-catalog/entity-tag-assignments"
-_REPLACE_MODES = ("replace", "replace-and-build")
 #: Update states that end it (the Pipelines API's ``UpdateInfoState``).
 _ENDED = ("COMPLETED", "FAILED", "CANCELED")
 _READ_ATTEMPTS = 5
@@ -116,37 +118,19 @@ def started_pipeline_builds(
     """The lakeflow builds a ``-and-build`` apply of ``contract`` runs: every one
     (``build_id`` empty), or the one ``build_id`` names. A triggered one gets an update; a
     continuous one, which Databricks keeps running, only its tags."""
-    return [
-        build
-        for build in contract.get("builds") or []
-        if isinstance(build, Mapping)
-        and is_lakeflow_build(build)
-        and (not build_id or build.get("id") == build_id)
-    ]
+    return selected_builds(contract, build_id, is_lakeflow_build)
 
 
 def pipelines_in_state(resources: Iterable[Any], product: str) -> Dict[str, List[PipelineRef]]:
     """Build id to the ``databricks_pipeline`` resources ``product`` has in an OpenTofu state,
     by the emitter's ``fluid_product`` / ``fluid_build`` tags (a list per build, so a caller
     can refuse a build with more than one)."""
-    from fluid_build.iac.providers.databricks_jobs import BUILD_TAG, PRODUCT_TAG
+    return tagged_in_state(resources, "databricks_pipeline", product, _pipeline_ref)
 
-    found: Dict[str, List[PipelineRef]] = {}
-    for resource in resources:
-        if not isinstance(resource, Mapping) or resource.get("type") != "databricks_pipeline":
-            continue
-        if resource.get("mode", "managed") != "managed":
-            continue
-        values = resource.get("values") if isinstance(resource.get("values"), Mapping) else {}
-        tags = values.get("tags") if isinstance(values.get("tags"), Mapping) else {}
-        if tags.get(PRODUCT_TAG) != product or not tags.get(BUILD_TAG):
-            continue
-        pipeline_id = str(values.get("id") or "")
-        if pipeline_id:
-            found.setdefault(str(tags[BUILD_TAG]), []).append(
-                PipelineRef(pipeline_id, str(values.get("url") or ""))
-            )
-    return found
+
+def _pipeline_ref(values: Mapping[str, Any]) -> Optional[PipelineRef]:
+    pipeline_id = str(values.get("id") or "")
+    return PipelineRef(pipeline_id, str(values.get("url") or "")) if pipeline_id else None
 
 
 def _compiled_pipeline(
@@ -202,15 +186,15 @@ def run_pipeline_build(
             f"pipeline '{name}' and wait for it."
         )
         return 0
-    refs = list(pipelines.get(build_id) or [])
-    if len(refs) != 1:
-        found = "no Lakeflow pipeline" if not refs else f"{len(refs)} Lakeflow pipelines"
-        console_error(
-            f"Build '{build_id}' - this apply's OpenTofu state holds {found} tagged "
-            f"fluid_product={product}, fluid_build={build_id}, so no update was started. "
-            "Either the state could not be read back after the apply (said above), or the "
-            "contract was not applied to databricks; fix that, then re-run fluid apply."
-        )
+    ref = single_ref(
+        pipelines,
+        build_id,
+        product=product,
+        one="Lakeflow pipeline",
+        many="Lakeflow pipelines",
+        started="update",
+    )
+    if ref is None:
         return 1
     compiled, why = _compiled_pipeline(contract, build_id, contract_file)
     if compiled is None:
@@ -219,26 +203,19 @@ def run_pipeline_build(
             f"({clean(why)}), so no update was started. fluid validate says the same."
         )
         return 1
-    try:
-        client = (client_factory or _default_client)()
-    except ImportError:
-        console_error(
-            f"Build '{build_id}' - databricks-sdk is not installed, and the update of Lakeflow "
-            f"pipeline '{name}' is started through it. Install the extra: "
-            "pip install 'data-product-forge[databricks]'"
-        )
-        return 1
-    except Exception as exc:  # noqa: BLE001 - a bad credential must not become a traceback
-        console_error(
-            f"Build '{build_id}' - could not create the Databricks client to start pipeline "
-            f"'{name}': {_failure(exc)}"
-        )
+    client = client_or_none(
+        client_factory or _default_client,
+        build_id=build_id,
+        started=f"the update of Lakeflow pipeline '{name}'",
+        target=f"pipeline '{name}'",
+    )
+    if client is None:
         return 1
     if continuous:
         return tag_running_pipeline(client, compiled, build_id=build_id, name=name)
     return update_and_wait(
         client,
-        refs[0],
+        ref,
         compiled,
         build_id=build_id,
         name=name,
@@ -412,22 +389,10 @@ def _wait(
         sleep(delay)
 
 
-@contextmanager
-def _stopped_if_interrupted(api: Any, pipeline_id: str, say: Say) -> Iterator[None]:
+def _stopped_if_interrupted(api: Any, pipeline_id: str, say: Say) -> ContextManager[None]:
     """Ctrl-C, SIGTERM or SIGHUP while the update is waited on stops it, then interrupts as
-    Ctrl-C always does (``_databricks_job_run._cancelled_if_interrupted``, for a pipeline)."""
-    previous = _interrupt_on_terminate()
-    try:
-        yield
-    except KeyboardInterrupt:
-        _stop(api, pipeline_id, say)
-        raise
-    finally:
-        for signum, handler in previous.items():
-            try:
-                signal.signal(signum, handler)
-            except (TypeError, ValueError, OSError):
-                pass  # best effort, as the job runner restores its handlers
+    Ctrl-C always does (``_databricks_job_run.interrupt_guard``, as a job run is cancelled)."""
+    return interrupt_guard(lambda: _stop(api, pipeline_id, say))
 
 
 def _stop(api: Any, pipeline_id: str, say: Say) -> bool:
