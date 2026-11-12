@@ -1511,13 +1511,18 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             # A Unity Catalog table, its readers' catalog access and its dbt
             # jobs, read through databricks-sdk. See _verify_databricks.py.
             from fluid_build.cli._verify_databricks import verify_databricks_expose
+            from fluid_build.iac.source import contract_source, source_contract_file
 
-            results[expose_name] = verify_databricks_expose(
-                expose_name,
-                expose_config,
-                contract=contract,
-                reference_only=reference_only,
-            )
+            # Compiled from the contract file, as fluid apply compiles it
+            # (``iac/source.py``): a Lakeflow reference check resolves the
+            # referenced product from the workspace around that file.
+            with contract_source(source_contract_file(args.contract)):
+                results[expose_name] = verify_databricks_expose(
+                    expose_name,
+                    expose_config,
+                    contract=contract,
+                    reference_only=reference_only,
+                )
         elif format_type == "bigquery_table" or gcp_kind == _GCP_BIGQUERY:
             # Get properties from either 'properties' or 'binding.location'
             properties = expose_config.get("properties", {})
