@@ -622,7 +622,7 @@ def plan_table(
                 )
                 del wanted[fk.columns]
             continue
-        if want is not None and _product(fk, keys) in unknown:
+        if want is not None and want.parent != fk.parent and _product(fk, keys) in unknown:
             # Not every table of its product could be read, so ``want`` is a guess from part of
             # them: the key stays where it is rather than move to a sibling of its parent.
             del wanted[fk.columns]
@@ -631,9 +631,14 @@ def plan_table(
                 f"of {_product(fk, keys)} could be read, so it is not moved to {want.parent}."
             )
             continue
-        why = (
-            "its parent changed" if want is not None else _stale(fk, keys, fks, candidates, unknown)
-        )
+        if want is not None:
+            why: Optional[str] = (
+                "its parent changed"
+                if want.parent != fk.parent
+                else "its parent's key columns changed"
+            )
+        else:
+            why = _stale(fk, keys, fks, candidates, unknown)
         if why is None:
             continue  # its parent unresolved for now: kept
         plan.fk_drops.append(_drop(full_name, fk.name, f"drop {fk.describe()}: {why}"))

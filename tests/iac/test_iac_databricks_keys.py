@@ -970,3 +970,13 @@ def test_a_key_is_not_moved_to_a_sibling_on_a_partial_view_of_its_product():
     assert (
         "is kept on main.geo.sites: not every table of geo.sites_v1 could be read" in plan.notes[0]
     )
+
+
+def test_a_key_whose_parent_key_columns_changed_is_replaced_and_says_so():
+    live = _live(_pk("fluid_pk_tickets", "ticket_id"), _fk("fluid_fk_tickets__site_id", "site_id"))
+    want = keys.ForeignKey("fluid_fk_tickets__site_id", ("site_id",), "main.geo.sites", ("code",))
+    plan = keys.plan_table(
+        "main.ops.tickets", _keys(TestResolve.REF), [want], live, candidates={}, unknown={SITES}
+    )
+    assert [s.what.split(": ")[-1] for s in plan.fk_drops] == ["its parent's key columns changed"]
+    assert len(plan.fk_adds) == 1 and plan.notes == []
