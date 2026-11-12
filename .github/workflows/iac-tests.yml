@@ -213,11 +213,13 @@ jobs:
             tests: >-
               tests/iac/test_iac_databricks_fake_e2e.py
               tests/iac/test_iac_databricks_jobs_fake_e2e.py
+              tests/iac/test_iac_databricks_genie_fake_e2e.py
             pytest-args: "-p no:randomly"
             junit: databricks-fake.xml
             require: |
               Databricks fake tier=tests/iac/test_iac_databricks_fake_e2e.py
               Databricks jobs fake tier=tests/iac/test_iac_databricks_jobs_fake_e2e.py
+              Databricks Genie fake tier=tests/iac/test_iac_databricks_genie_fake_e2e.py
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
