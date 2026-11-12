@@ -341,10 +341,12 @@ def _gate_build_ids_for_apply(contract: Dict[str, Any]) -> None:
 
 def _databricks_job_runs(contract: Dict[str, Any], build_id: Optional[str]) -> bool:
     """True when a build phase of ``contract`` starts Databricks job runs
-    (``build_runners/_databricks_job_run.py``): it needs the apply's state, and the SDK."""
+    (``build_runners/_databricks_job_run.py``) or Lakeflow pipeline updates
+    (``build_runners/_databricks_pipeline_run.py``): it needs the apply's state, and the SDK."""
     from fluid_build.build_runners._databricks_job_run import started_builds
+    from fluid_build.build_runners._databricks_pipeline_run import started_pipeline_builds
 
-    return bool(started_builds(contract, build_id))
+    return bool(started_builds(contract, build_id) or started_pipeline_builds(contract, build_id))
 
 
 def _state_for_job_runs(
@@ -360,15 +362,21 @@ def _state_for_job_runs(
 
 
 def _jobs_from_state(engine_kwargs: Dict[str, Any], contract: Dict[str, Any]) -> Dict[str, Any]:
-    """``run_builds_from_args`` keyword arguments: the Databricks jobs the applied state
-    holds for ``contract``, by build id (``_databricks_job_run.jobs_in_state``)."""
+    """``run_builds_from_args`` keyword arguments: the Databricks jobs and the Lakeflow
+    pipelines the applied state holds for ``contract``, by build id
+    (``_databricks_job_run.jobs_in_state``, ``_databricks_pipeline_run.pipelines_in_state``)."""
     if "applied_state" not in engine_kwargs:
         return {}
     from fluid_build.build_runners._databricks_job_run import jobs_in_state
+    from fluid_build.build_runners._databricks_pipeline_run import pipelines_in_state
     from fluid_build.iac.providers.databricks_jobs import job_product
 
-    jobs = jobs_in_state(engine_kwargs["applied_state"], job_product(contract))
-    return {"databricks_jobs": jobs}
+    state = engine_kwargs["applied_state"]
+    product = job_product(contract)
+    return {
+        "databricks_jobs": jobs_in_state(state, product),
+        "databricks_pipelines": pipelines_in_state(state, product),
+    }
 
 
 def _gate_databricks_sdk_for_apply(
@@ -395,10 +403,10 @@ def _gate_databricks_sdk_for_apply(
             1,
             "apply_databricks_sdk_missing",
             {
-                "error": "a dbt build runs on Databricks, and the build phase starts its job "
+                "error": "a dbt or lakeflow build runs on Databricks, and the build phase starts it "
                 "through databricks-sdk, which is not installed; nothing was applied",
                 "hint": "pip install 'data-product-forge[databricks]', or apply with "
-                "--mode amend to provision the job without starting it",
+                "--mode amend to provision it without starting it",
             },
         )
 

@@ -302,6 +302,8 @@ class TestModule:
         assert pipeline["continuous"] is False
         assert pipeline["development"] is False
         assert pipeline["channel"] == "CURRENT"
+        # A failed triggered update is not retried by Lakeflow (it retries five times).
+        assert pipeline["configuration"] == {"pipelines.numUpdateRetryAttempts": "0"}
         assert pipeline["catalog"] == "fluid_iactest_ldp"
         assert str(pipeline["schema"]) == f"${{databricks_schema.{schema_key}.name}}"
         assert pipeline["tags"] == {
@@ -335,7 +337,10 @@ class TestModule:
         contract = _edit(
             t=lambda c: c["builds"][0]["execution"].update(trigger={"type": "continuous"})
         )
-        assert _only(_compile(contract, tmp_path), "databricks_pipeline")["continuous"] is True
+        pipeline = _only(_compile(contract, tmp_path), "databricks_pipeline")
+        assert pipeline["continuous"] is True
+        # A continuous pipeline keeps Lakeflow's own restarts.
+        assert "configuration" not in pipeline
 
     def test_without_a_trigger_the_pipeline_is_triggered(self, tmp_path):
         contract = _edit(t=lambda c: c["builds"][0]["execution"].pop("trigger"))

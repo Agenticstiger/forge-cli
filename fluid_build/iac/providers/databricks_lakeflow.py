@@ -42,7 +42,8 @@ schema (``binding.location.database`` / ``schema``); the founder's decisions of 
   in the definition, and only the pipeline writes its table.
 * ``execution.trigger``: ``manual`` (or none) is a triggered pipeline, which ``fluid apply
   --mode amend-and-build`` starts and waits for; ``continuous`` keeps running. A cron is
-  refused for now.
+  refused for now. A triggered pipeline does not retry a failed update
+  (:data:`RETRY_SETTING` is 0): the same rows would fail the same rule.
 
 Everything the pipeline would accept with exit 0 and not honour is refused, as for tables
 and jobs. Prior art: DQX (databrickslabs/dqx) for the rule-to-check mapping, Lakeflow's own
@@ -69,12 +70,26 @@ from ..naming import TofuExpr, digest_ident, safe_ident, tofu_ref, unique_ident
 from ..provider_match import canonical_cloud
 from ..source import current_contract_source
 from .databricks_access import quote, quote_table, string_literal
-from .databricks_jobs import CURRENT_USER, _under_home
+from .databricks_jobs import (
+    BUILD_TAG,
+    CURRENT_USER,
+    PRODUCT_TAG,
+    _under_home,
+    job_build_id,
+    job_product,
+)
 
 _LOG = logging.getLogger(__name__)
 
 #: The Lakeflow runtime channel: the current one, never the preview.
 CHANNEL = "CURRENT"
+
+#: Lakeflow retries a failed triggered update itself, five times by default
+#: (``pipelines.numUpdateRetryAttempts``, cause ``RETRY_ON_FAILURE``; seen live 2026-11-12: a
+#: FAIL UPDATE rule failed the update, and the retries kept running after ``fluid apply`` had
+#: said so). The same rows fail the same rule again, so a triggered pipeline retries nothing;
+#: a continuous one keeps Lakeflow's own restarts.
+RETRY_SETTING = "pipelines.numUpdateRetryAttempts"
 
 #: What a failing row does, by the rule's severity, on the table itself ...
 ON_VIOLATION = {
@@ -744,13 +759,13 @@ def compile_lakeflow_pipelines(
     """
     compiled = CompiledPipelines()
     resolve = resolve or workspace_reference_resolver(contract)
-    product = str(contract.get("id") or contract.get("name") or "product")
+    product = job_product(contract)
     by_expose = {table.expose_id: table for table in tables}
     published: Dict[str, str] = {}
     for index, build in enumerate(contract.get("builds") or []):
         if not isinstance(build, Mapping) or not is_lakeflow_build(build):
             continue
-        build_id = str(build.get("id") or index)
+        build_id = job_build_id(contract, build)
         where = f"builds[{index}] ({build_id})"
         before = len(compiled.refusals)
         _refuse_unhonoured(build, where, compiled.refusals)
@@ -846,12 +861,14 @@ def _emit(
         )
     )
     name = f"fluid {product} {build_id}"
+    settings: Dict[str, Any] = {} if continuous else {"configuration": {RETRY_SETTING: "0"}}
     compiled.resources.append(
         (
             "databricks_pipeline",
             key,
             f"{where} pipeline",
             {
+                **settings,
                 "name": name,
                 "catalog": table.catalog,
                 "schema": schema,
@@ -859,7 +876,7 @@ def _emit(
                 "continuous": continuous,
                 "development": False,
                 "channel": CHANNEL,
-                "tags": {"fluid_product": product, "fluid_build": build_id},
+                "tags": {PRODUCT_TAG: product, BUILD_TAG: build_id},
                 "library": [
                     {"file": [{"path": tofu_ref(f"databricks_workspace_file.{file_key}.path")}]}
                 ],
@@ -894,6 +911,7 @@ def _emit(
 __all__ = [
     "CHANNEL",
     "COLUMN_TAGS_PROPERTY",
+    "RETRY_SETTING",
     "CompiledPipelines",
     "LakeflowPipeline",
     "ON_TABLE_VIOLATION",
