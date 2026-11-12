@@ -695,7 +695,7 @@ def test_a_view_the_contract_no_longer_declares_is_dropped_before_the_apply(fake
     run, doc = Run(fake), site_contract()
     run.post(doc)
     fake.create_table("main.archive.kept", [("x", "string", True)])
-    ours_moved = "main.archive.site_360_old_semantic_model"  # its table moved to sales
+    ours_moved = "main.archive.site_360_old_semantic_model"  # its table moved away
     ours_renamed = "main.sales.site_360_v0_semantic_model"  # its table was renamed
     theirs = "main.sales.someone_elses_semantic_model"
     for full, product in (
@@ -708,10 +708,9 @@ def test_a_view_the_contract_no_longer_declares_is_dropped_before_the_apply(fake
     before = len(fake.sql_log)
     run.pre(doc)
     dropped = [s for s in run.statements(before) if s.startswith("DROP VIEW")]
-    assert dropped == [
-        "DROP VIEW IF EXISTS `main`.`archive`.`site_360_old_semantic_model`",
-        "DROP VIEW IF EXISTS `main`.`sales`.`site_360_v0_semantic_model`",
-    ]
+    assert dropped == ["DROP VIEW IF EXISTS `main`.`sales`.`site_360_v0_semantic_model`"]
+    # Only the product's own schemas are looked in: one it no longer uses is not (a known limit).
+    assert ours_moved in fake.tables
     assert theirs in fake.tables and VIEW in fake.tables
     del doc["exposes"][0]["semantics"]
     run.pre(doc)
@@ -903,3 +902,31 @@ def test_the_engine_prints_what_the_hooks_say_as_data(monkeypatch, capsys):
     monkeypatch.setattr(engine, "cprint_literal", said.append)
     engine._enforce_access(Plugin(), "pre_apply", {}, dry_run=True)
     assert said == ["comment: Share of rows [/total] and [bold]"]
+
+
+def test_another_environment_of_the_product_keeps_its_view(fake):
+    """An overlay that changes only the schema (prod main.sales, staging main.sales_stg), in one
+    catalog under one deploy identity: neither environment's apply drops the other's view."""
+    prod, staging = site_contract(), site_contract()
+    staging["exposes"][0]["binding"]["location"]["schema"] = "sales_stg"
+    fake.create_table("main.sales_stg.site_360", COLUMNS)
+    run = Run(fake)
+    for doc in (prod, staging, prod, staging):
+        run.pre(doc)
+        run.post(doc)
+    assert VIEW in fake.tables and "main.sales_stg.site_360_semantic_model" in fake.tables
+    assert not [s for s in fake.sql_log if s.startswith("DROP VIEW")]
+
+
+def test_a_dates_own_column_is_qualified_in_a_two_argument_date_add():
+    semantics = copy.deepcopy(SEMANTICS)
+    semantics["dimensions"] += [
+        {"name": "next_day", "type": "categorical", "expr": "date_add(snapshot_date, 1)"},
+        {"name": "age", "type": "categorical", "expr": "datediff(captured_at, snapshot_date)"},
+    ]
+    fields = {
+        d["name"]: d["expr"]
+        for d in yaml.safe_load(only_view(site_contract(semantics)).definition)["dimensions"]
+    }
+    assert fields["next_day"] == "date_add(source.snapshot_date, 1)"
+    assert fields["age"] == "datediff(source.captured_at, source.snapshot_date)"

@@ -67,7 +67,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resource (terraform-provider-databricks#4827), so the view is created on the SQL warehouse after
   `tofu apply`, like the column masks: `CREATE VIEW` when it is missing, `ALTER VIEW ... AS` (which
   keeps its grants) when its definition changed, nothing when it did not, and `DROP VIEW`, before
-  the apply, once the contract no longer declares it (in any schema of the product's catalogs).
+  the apply, once the contract no longer declares it (in the schemas its tables are in, so another
+  environment of the product keeps its own).
   `--mode dry-run` prints every statement. What metric view YAML
   cannot express is refused at `fluid validate`, not approximated: derived metrics, a ratio with
   a filter, a non-additive dimension that is no time dimension, `hour` or `minute` on a `DATE`,

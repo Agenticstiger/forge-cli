@@ -1941,16 +1941,21 @@ class FakeDatabricks:
         return space_id
 
     def _table_summaries(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
-        """ListTableSummaries: every table of a catalog, ``table_name_pattern`` a SQL LIKE."""
+        """ListTableSummaries: the tables of a catalog; the name patterns are SQL LIKEs."""
         cat = (q.get("catalog_name") or [""])[0]
-        like = (q.get("table_name_pattern") or ["%"])[0]
-        rx = re.compile(
-            "^"
-            + "".join(".*" if c == "%" else "." if c == "_" else re.escape(c) for c in like)
-            + "$"
-        )
+
+        def like(key: str) -> "re.Pattern[str]":
+            text = (q.get(key) or ["%"])[0]
+            body = "".join(".*" if c == "%" else "." if c == "_" else re.escape(c) for c in text)
+            return re.compile(f"^{body}$")
+
+        schemas, tables = like("schema_name_pattern"), like("table_name_pattern")
         names = sorted(
-            n for n in self.tables if n.split(".")[0] == cat and rx.match(n.split(".")[2])
+            n
+            for n in self.tables
+            if n.split(".")[0] == cat
+            and schemas.match(n.split(".")[1])
+            and tables.match(n.split(".")[2])
         )
         return 200, self._page(
             names,

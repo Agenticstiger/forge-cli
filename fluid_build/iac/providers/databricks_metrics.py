@@ -78,13 +78,16 @@ like the column masks (``databricks_enforce.py``), around ``tofu apply``:
   ``policy.authz.readers``): ``SELECT`` granted to them, ``SELECT`` and ``ALL PRIVILEGES`` revoked
   from anyone else, revokes first and each on its own. Readers also need ``USE SCHEMA`` (the
   module grants it) and ``USE CATALOG`` (named by the plan notice).
-* A view of this product that the contract no longer declares, in any schema of its tables'
-  catalogs (its table renamed or moved, its semantics or its expose removed), is dropped before
-  ``tofu apply``: dropping a view only narrows who reads, and a schema the apply removes must be
-  empty (``databricks_schema`` is never ``force_destroy``). It is found by name
-  (``*_semantic_model``, ``table-summaries``) and dropped only with this product's
-  ``fluid.product_id`` and the deploy identity as owner. A product moved to another catalog leaves
-  its old views there; drop them by hand.
+* A view of this product that the contract no longer declares, in a schema its tables are in
+  (its table renamed, its semantics or its expose removed), is dropped before ``tofu apply``:
+  dropping a view only narrows who reads. It is found by name (``*_semantic_model``,
+  ``table-summaries``) and dropped only with this product's ``fluid.product_id`` and the deploy
+  identity as owner. Only those schemas are looked in, so another environment of the product (an
+  overlay that changes the schema, in the same catalog, under the same identity) keeps its views.
+  The cost is the one the column masks' functions share: a view left in a schema the contract
+  stops using (its table moved, its last expose removed) is not found, and OpenTofu's destroy of
+  that schema (never ``force_destroy``) then fails while the schema holds it; drop it by hand
+  (``DROP VIEW <name>``) and re-run.
 * A metric view reads its table with its owner's rights, and Unity Catalog applies the table's
   row filter and column masks to whoever queries the view (a row filter measured live). When
   binding them fails, :func:`lock_restricted` revokes ``SELECT`` on the views over restricted
@@ -197,8 +200,41 @@ _AFTER_AS_RE = re.compile(r"(?i)\bAS$")
 #: What a word may follow and be a unit or a type, not a column: ``::``, ``EXTRACT(``, an
 #: ``INTERVAL`` amount, the unit argument of the date-arithmetic functions.
 _UNIT_CONTEXT_RE = re.compile(
-    r"(?is)(?:::|\bextract\s*\(|\binterval\s+[-+]?(?:\d+(?:\.\d+)?|'(?:''|[^'])*')|"
-    r"\b(?:dateadd|datediff|date_add|date_diff|timestampadd|timestampdiff)\s*\()\s*$"
+    r"(?is)(?:::|\bextract\s*\(|\binterval\s+[-+]?(?:\d+(?:\.\d+)?|'(?:''|[^'])*'))\s*$"
+)
+#: The date-arithmetic functions whose first argument is a unit in their 3-argument form
+#: (``DATEADD(MONTH, 1, d)``) and a date in their 2-argument one (``date_add(d, 1)``): there a
+#: word is a unit only when it is one of these.
+_UNIT_ARGUMENT_RE = re.compile(
+    r"(?is)\b(?:dateadd|datediff|date_add|date_diff|timestampadd|timestampdiff)\s*\(\s*$"
+)
+_TIME_UNITS = frozenset(
+    {
+        "year",
+        "years",
+        "quarter",
+        "quarters",
+        "month",
+        "months",
+        "week",
+        "weeks",
+        "day",
+        "days",
+        "dayofyear",
+        "dayofweek",
+        "dow",
+        "doy",
+        "hour",
+        "hours",
+        "minute",
+        "minutes",
+        "second",
+        "seconds",
+        "millisecond",
+        "milliseconds",
+        "microsecond",
+        "microseconds",
+    }
 )
 
 Say = Callable[[str], None]
@@ -886,7 +922,9 @@ def _qualify(text: str, columns: Mapping[str, Any], table: str = "") -> Tuple[st
         before = text[: match.start()].rstrip()
         after = text[match.end() :].lstrip()
         typed = after.startswith(("'", '"')) or _AFTER_AS_RE.search(before)  # DATE'..', AS DATE
-        unit = _UNIT_CONTEXT_RE.search(before)
+        unit = _UNIT_CONTEXT_RE.search(before) or (
+            _UNIT_ARGUMENT_RE.search(before) and token.lower() in _TIME_UNITS
+        )
         if before.endswith(".") or after.startswith("(") or typed or unit:
             continue
         name = token[1:-1].replace("``", "`") if token[0] == "`" else token
@@ -934,7 +972,7 @@ def compile_metric_views(
                     "collision",
                     f"{table.where} semantics would create the metric view {view.full_name}, a "
                     f"name {clash} already takes.",
-                    "Give the semantic model another name (semantics.name).",
+                    "Rename one of the two tables: the view is named after its table.",
                 )
             )
             continue
@@ -1334,30 +1372,42 @@ def _run_step(session: Session, view: MetricView, step: Step, say: Say) -> Optio
     return None
 
 
-def _catalog_views(session: Session, catalog: str, say: Say) -> List[Mapping[str, Any]]:
-    """Every metric view of one catalog named as this module names one (``*_semantic_model``,
+def _schema_views(session: Session, where: str, say: Say) -> List[Mapping[str, Any]]:
+    """The metric views of one schema named as this module names one (``*_semantic_model``,
     ``GET /api/2.1/unity-catalog/table-summaries``); none, with a note, when unlisted."""
-    query = {"catalog_name": catalog, "table_name_pattern": f"%{DEFAULT_SUFFIX}"}
+    catalog, schema = where.split(".", 1)
+    query = {
+        "catalog_name": catalog,
+        "schema_name_pattern": schema,
+        "table_name_pattern": f"%{DEFAULT_SUFFIX}",
+    }
     try:
         rows = _list_named(
             session.client, "/api/2.1/unity-catalog/table-summaries", query, "tables"
         )
     except Exception as exc:  # noqa: BLE001 — unknown contents: drop nothing
-        if not _enforce.is_not_found(exc):
+        if not _enforce.is_not_found(exc):  # a schema not created yet holds no view
             say(
-                f"  note: metric views in catalog {catalog} were not checked for removal: they "
-                f"could not be listed ({type(exc).__name__}: {scrub(exc)})."
+                f"  note: metric views in {where} were not checked for removal: they could not "
+                f"be listed ({type(exc).__name__}: {scrub(exc)})."
             )
         return []
-    return [row for row in rows if str(row.get("table_type") or "").upper() == METRIC_VIEW]
+    # The pattern is a SQL LIKE, so `_` matches any character: keep this schema's rows only.
+    return [
+        row
+        for row in rows
+        if str(row.get("table_type") or "").upper() == METRIC_VIEW
+        and str(row.get("full_name") or "").lower().rsplit(".", 1)[0] == where.lower()
+    ]
 
 
 def _stale_views(session: Session, plan: MetricViews, say: Say) -> Iterator[Mapping[str, Any]]:
-    """This product's metric views, in any schema of its tables' catalogs, that the contract no
-    longer declares: a schema the apply removes then holds none of them."""
+    """This product's metric views in the schemas its tables are in that the contract no longer
+    declares. Only those schemas: another environment of the product (an overlay that changes the
+    schema, the same catalog, the same deploy identity) keeps its views."""
     expected = {view.full_name.lower() for view in plan.views}
-    for catalog in sorted({where.split(".", 1)[0] for where in plan.schemas}):
-        for row in _catalog_views(session, catalog, say):
+    for where in plan.schemas:
+        for row in _schema_views(session, where, say):
             full = str(row.get("full_name") or "")
             if not full or full.lower() in expected:
                 continue
