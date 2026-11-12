@@ -21,7 +21,6 @@ import yaml
 
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.providers import databricks as dbx
-from fluid_build.iac.providers import databricks_lakeflow as lakeflow
 from fluid_build.iac.providers.databricks_lakeflow import compile_lakeflow_pipelines
 from fluid_build.iac.source import contract_source
 from fluid_build.util.contract import is_externally_run_build, is_lakeflow_build
