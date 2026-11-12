@@ -198,6 +198,7 @@ from .databricks_keys import (
     KeyTarget,
     TableKeys,
     compile_keys,
+    deploying_identity,
     foreign_keys,
     own_candidates,
     rebuild_script,
@@ -1501,7 +1502,8 @@ def _live_key_lookup(products: Sequence[str]) -> Mapping[str, Sequence[Candidate
         if not warehouse:
             return {}
         client = default_client()
-        return lookup_key_tables(SqlRunner(client, warehouse), client, products)
+        runner = SqlRunner(client, warehouse)
+        return lookup_key_tables(runner, client, products, deploying_identity(client))
     except Exception:  # noqa: BLE001 — no live answer is no foreign key in the script
         return {}
 

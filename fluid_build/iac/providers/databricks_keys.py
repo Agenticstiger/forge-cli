@@ -78,6 +78,8 @@ from .databricks_enforce import (
     SqlRunner,
     StatementFailed,
     default_client,
+    deploy_identity,
+    owner_matches,
     read_table,
     scrub,
 )
@@ -146,10 +148,16 @@ class KeyTarget:
 
 @dataclass(frozen=True)
 class Candidate:
-    """A table a referenced product has, and its primary key."""
+    """A table a referenced product has, and its primary key.
+
+    ``trusted``: it is one of the contract's own exposes, or the identity this run deploys as
+    owns it. Anyone who owns a table can tag it ``fluid_product_id``, so a table this pipeline
+    deployed wins a tie against one it did not.
+    """
 
     full_name: str
     primary: Tuple[str, ...]
+    trusted: bool = True
 
     @property
     def catalog(self) -> str:
@@ -257,10 +265,11 @@ def own_candidates(contract_id: str, keyed: Iterable[TableKeys]) -> Dict[str, Li
 
 
 def _pick(matches: List[Candidate], catalog: str) -> Tuple[Optional[Candidate], List[Candidate]]:
-    """The one match (one in ``catalog`` wins a tie), or ``None`` and every match left."""
-    if len(matches) > 1:
-        local = [m for m in matches if m.catalog == catalog]
-        matches = local or matches
+    """The one match, or ``None`` and every match left. A tie goes to the trusted ones, then
+    to the ones in ``catalog``."""
+    for prefer in (lambda m: m.trusted, lambda m: m.catalog == catalog):
+        if len(matches) > 1:
+            matches = [m for m in matches if prefer(m)] or matches
     return (matches[0], []) if len(matches) == 1 else (None, matches)
 
 
@@ -370,8 +379,11 @@ def live_keys(
     return primary, foreign
 
 
-def lookup(runner: SqlRunner, client: Any, products: Iterable[str]) -> Dict[str, List[Candidate]]:
-    """The tables tagged with each product id, with their live primary keys.
+def lookup(
+    runner: SqlRunner, client: Any, products: Iterable[str], owner: str = ""
+) -> Dict[str, List[Candidate]]:
+    """The tables tagged with each product id, with their live primary keys; one ``owner``
+    owns (the deploying identity) is ``trusted``.
 
     One query on ``system.information_schema.table_tags``, which lists what this identity can
     see, then one Tables API read per table found. A table whose name this module could not
@@ -402,7 +414,10 @@ def lookup(runner: SqlRunner, client: Any, products: Iterable[str]) -> Dict[str,
         if live is None:
             continue
         primary, _ = live_keys(live)
-        out.setdefault(product, []).append(Candidate(full_name, primary[1] if primary else ()))
+        trusted = bool(owner) and owner_matches(live.get("owner"), {owner})
+        out.setdefault(product, []).append(
+            Candidate(full_name, primary[1] if primary else (), trusted)
+        )
     return out
 
 
@@ -576,13 +591,22 @@ def resolve(
     if not others:
         return candidates
     try:
-        candidates.update(lookup(runner, client, others))
+        candidates.update(lookup(runner, client, others, deploying_identity(client)))
     except Exception as exc:  # noqa: BLE001 — a lookup that fails declares no such key
         notes.append(
             f"foreign keys to {', '.join(others)}: their tables could not be looked up "
             f"({type(exc).__name__}: {scrub(exc)})."
         )
     return candidates
+
+
+def deploying_identity(client: Any) -> str:
+    """Who this run deploys as, or ``""`` when that cannot be read (then no table is trusted
+    over another)."""
+    try:
+        return deploy_identity(client)
+    except Exception:  # noqa: BLE001 — a tie is then broken by catalog alone
+        return ""
 
 
 @dataclass(frozen=True)

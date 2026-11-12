@@ -193,6 +193,18 @@ class TestResolve:
         (fk,) = keys.foreign_keys(_keys(self.REF), cands)
         assert fk.parent == "main.geo.sites"
 
+    def test_a_table_this_pipeline_owns_beats_a_tagged_one_it_does_not(self):
+        # Anyone who owns a table can tag it fluid_product_id: a decoy in the child's own
+        # catalog must not outrank the parent the deploying identity created elsewhere.
+        cands = {
+            SITES: [
+                keys.Candidate("main.scratch.sites", ("site_id",), trusted=False),
+                keys.Candidate("prod.geo.sites", ("site_id",), trusted=True),
+            ]
+        }
+        (fk,) = keys.foreign_keys(_keys(self.REF), cands)
+        assert fk.parent == "prod.geo.sites"
+
     def test_a_tie_no_catalog_breaks_is_skipped_and_said(self):
         cands = {
             SITES: [
@@ -496,6 +508,25 @@ class TestHooks:
         # One lookup, by tag, for the other product: the parent's location is never assumed.
         lookups = [s for s in fake.sql_log if "information_schema.table_tags" in s]
         assert len(lookups) == 1 and f"'{SITES}'" in lookups[0]
+
+    def test_a_decoy_someone_else_owns_does_not_become_the_parent(self, fake):
+        run = Hooks(fake)
+        fake.create_table("prod.geo.sites", [("site_id", "string", False)])
+        fake.tag("tables", "prod.geo.sites", keys.PRODUCT_TAG, SITES)
+        run.sql("ALTER TABLE prod.geo.sites ADD CONSTRAINT fluid_pk_sites PRIMARY KEY (site_id)")
+        fake.create_table("main.scratch.sites", [("site_id", "string", False)])
+        fake.tables["main.scratch.sites"]["owner"] = "mallory@example.test"
+        fake.tag("tables", "main.scratch.sites", keys.PRODUCT_TAG, SITES)
+        run.sql("ALTER TABLE main.scratch.sites ADD CONSTRAINT decoy_pk PRIMARY KEY (site_id)")
+        deploy_tickets(fake)
+        run.post(tickets())
+        assert (
+            "FOREIGN KEY",
+            "fluid_fk_tickets_site_id",
+            "site_id",
+            "prod.geo.sites",
+            "site_id",
+        ) in fake.keys_on("main.ops.tickets")
 
     def test_a_second_apply_runs_no_key_statement(self, fake):
         run = Hooks(fake)
