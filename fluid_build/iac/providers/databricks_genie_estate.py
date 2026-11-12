@@ -124,6 +124,13 @@ class Estate(genie.Compiled):
     #: How many contracts the estate holds.
     products: int = 0
 
+    @property
+    def joins(self) -> int:
+        """How many joins its space holds (0 without a space)."""
+        if self.space is None:
+            return 0
+        return len(genie._dig(self.space.serialized, ("instructions", "join_specs")) or ())
+
 
 # ---------------------------------------------------------------------- compile (pure)
 

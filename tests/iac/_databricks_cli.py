@@ -110,8 +110,10 @@ def make_contract(
     return contract
 
 
-def write_contract(root: Path, document: Dict[str, Any]) -> str:
-    path = root / "contract.fluid.yaml"
+def write_contract(root: Path, document: Dict[str, Any], name: str = "contract.fluid.yaml") -> str:
+    """Write ``document`` to ``root / name`` (its folders made), returning the path."""
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     return str(path)
 

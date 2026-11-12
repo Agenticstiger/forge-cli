@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 import pytest
-import yaml
 
 from fluid_build.cli import genie as genie_cli
 from fluid_build.cli._common import CLIError
@@ -34,8 +33,8 @@ from fluid_build.iac.providers import databricks_enforce
 from fluid_build.iac.providers import databricks_genie as genie
 from fluid_build.iac.providers import databricks_genie_estate as estate_mod
 
-from ._databricks_cli import isolate_workspace, run_fluid
-from ._fake_databricks import FakeDatabricks
+from ._databricks_cli import isolate_workspace, run_fluid, write_contract
+from ._fake_databricks import FakeDatabricks, writes_since
 
 pytestmark = [pytest.mark.unit, pytest.mark.databricks]
 
@@ -496,11 +495,7 @@ class Run:
         return "\n".join(self.said)
 
     def writes(self) -> List[Any]:
-        return [
-            r
-            for r in self.fake.requests[self.start :]
-            if r[0] in ("POST", "PATCH", "PUT", "DELETE")
-        ]
+        return writes_since(self.fake, self.start)
 
 
 def only_space(fake: FakeDatabricks) -> Dict[str, Any]:
@@ -648,19 +643,12 @@ def test_the_stand_in_refuses_what_the_service_refuses(fake):
 # ---------------------------------------------------------------------- fluid genie
 
 
-def write(root: Path, name: str, doc: Dict[str, Any]) -> Path:
-    path = root / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
-    return path
-
-
 def test_contract_paths_reads_files_globs_and_folders_once_each(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    write(tmp_path, "pack/bronze/dp001_site_master.fluid.yaml", sites())
-    write(tmp_path, "pack/silver/dp005_active_tenancy.fluid.yaml", tenancy())
-    write(tmp_path, "pack/silver/notes.yaml", {"not": "a contract"})
-    write(tmp_path, "pack/node_modules/x.fluid.yaml", billing())
+    write_contract(tmp_path, sites(), "pack/bronze/dp001_site_master.fluid.yaml")
+    write_contract(tmp_path, tenancy(), "pack/silver/dp005_active_tenancy.fluid.yaml")
+    write_contract(tmp_path, {"not": "a contract"}, "pack/silver/notes.yaml")
+    write_contract(tmp_path, billing(), "pack/node_modules/x.fluid.yaml")
     (tmp_path / "pack/link.fluid.yaml").symlink_to(
         tmp_path / "pack/bronze/dp001_site_master.fluid.yaml"
     )
@@ -698,7 +686,7 @@ def workspace(monkeypatch, tmp_path: Path, fake: FakeDatabricks) -> Path:
         ("pack/silver/dp005.fluid.yaml", tenancy()),
         ("pack/silver/dp016.fluid.yaml", billing()),
     ):
-        write(tmp_path, name, doc)
+        write_contract(tmp_path, doc, name)
     return tmp_path
 
 

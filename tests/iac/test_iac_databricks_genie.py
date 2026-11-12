@@ -29,7 +29,7 @@ from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.providers import databricks as dbx
 from fluid_build.iac.providers import databricks_genie as genie
 
-from ._fake_databricks import FakeDatabricks
+from ._fake_databricks import FakeDatabricks, writes_since
 
 pytestmark = [pytest.mark.unit, pytest.mark.databricks]
 
@@ -507,11 +507,7 @@ class Run:
         return "\n".join(self.said)
 
     def writes(self) -> List[Any]:
-        return [
-            r
-            for r in self.fake.requests[self.start :]
-            if r[0] in ("POST", "PATCH", "PUT", "DELETE")
-        ]
+        return writes_since(self.fake, self.start)
 
 
 def only_space(fake: FakeDatabricks) -> Dict[str, Any]:

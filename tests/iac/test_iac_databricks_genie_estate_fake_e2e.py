@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterator
 
 import pytest
-import yaml
 
 from fluid_build.iac import runner
 from fluid_build.iac.providers import databricks_enforce
@@ -30,6 +29,7 @@ from ._databricks_cli import (  # noqa: F401 — plugin_cache is a fixture
     make_contract,
     plugin_cache,
     run_fluid,
+    write_contract,
 )
 from ._fake_databricks import FakeDatabricks
 
@@ -111,17 +111,12 @@ def tenancy() -> Dict[str, Any]:
     )
 
 
-def write(root: Path, name: str, doc: Dict[str, Any]) -> str:
-    path = root / "products" / name / "contract.fluid.yaml"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
-    return str(path)
-
-
 def test_apply_two_products_then_one_space_over_both(workspace, fake, capfd):
-    rc, out = apply_contract(capfd, write(workspace, "sites", sites()))
+    rc, out = apply_contract(
+        capfd, write_contract(workspace, sites(), "products/sites/contract.fluid.yaml")
+    )
     assert rc == 0, out
-    tenancy_path = write(workspace, "tenancy", tenancy())
+    tenancy_path = write_contract(workspace, tenancy(), "products/tenancy/contract.fluid.yaml")
 
     # The second product is not applied yet: the run says which, and writes nothing.
     rc, out = run_fluid(capfd, "genie", "apply", "products", "--estate", "towers")

@@ -1005,6 +1005,32 @@ def _genie_problem(node: Any, path: str, ids: List[str]) -> Optional[str]:
     return problem
 
 
+def _genie_limit_problem(doc: Dict[str, Any]) -> Optional[str]:
+    """The service's limits on a whole ``serialized_space``: one text instruction, a known
+    relationship tag on each join, 50 tables. The last two measured on a live workspace
+    (2026-11-12), with these messages; a join's tables and its unqualified columns are not
+    checked when a space is made."""
+    instructions = doc.get("instructions") or {}
+    if len(instructions.get("text_instructions") or []) > 1:
+        return "At most 1 text instruction is allowed"
+    for spec in instructions.get("join_specs") or []:
+        for part in spec.get("sql") or []:
+            tag = re.fullmatch(r"--rt=FROM_RELATIONSHIP_TYPE_([A-Za-z_]+)--", str(part))
+            if tag and tag.group(1) not in _GENIE_RELATIONSHIPS:
+                return (
+                    f"Failed to parse export proto: FROM_RELATIONSHIP_TYPE_{tag.group(1)} "
+                    "(of class java.lang.String)"
+                )
+    if len((doc.get("data_sources") or {}).get("tables") or []) > 50:
+        return "A space can have at most 50 tables."
+    return None
+
+
+def writes_since(fake: "FakeDatabricks", start: int) -> List[Tuple[str, str]]:
+    """The writes (POST, PATCH, PUT, DELETE) ``fake`` served after its ``start``-th request."""
+    return [r for r in fake.requests[start:] if r[0] in ("POST", "PATCH", "PUT", "DELETE")]
+
+
 # ---------------------------------------------------------------------- the server
 class FakeDatabricks:
     def __init__(
@@ -1703,21 +1729,9 @@ class FakeDatabricks:
             return problem
         if len(ids) != len(set(ids)):
             return "ids must be unique"
-        if len((doc.get("instructions") or {}).get("text_instructions") or []) > 1:
-            return "At most 1 text instruction is allowed"
-        # Both measured on a live workspace (2026-11-12): a relationship tag the service does
-        # not know, and a 51st table. A join's tables and its unqualified columns are not
-        # checked when a space is made.
-        for spec in (doc.get("instructions") or {}).get("join_specs") or []:
-            for part in spec.get("sql") or []:
-                tag = re.fullmatch(r"--rt=FROM_RELATIONSHIP_TYPE_([A-Za-z_]+)--", str(part))
-                if tag and tag.group(1) not in _GENIE_RELATIONSHIPS:
-                    return (
-                        f"Failed to parse export proto: FROM_RELATIONSHIP_TYPE_{tag.group(1)} "
-                        "(of class java.lang.String)"
-                    )
-        if len((doc.get("data_sources") or {}).get("tables") or []) > 50:
-            return "A space can have at most 50 tables."
+        problem = _genie_limit_problem(doc)
+        if problem:
+            return problem
         for source in (doc.get("data_sources") or {}).get("tables") or []:
             if source.get("identifier") not in {**self.tables, **self.metric_views}:
                 return f"Table {source.get('identifier')!r} does not exist"

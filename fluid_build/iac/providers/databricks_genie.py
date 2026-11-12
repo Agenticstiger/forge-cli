@@ -1219,10 +1219,7 @@ def _tables_of_space(
     each data source leaving the space that is still a table in Unity Catalog (a product, or an
     expose, left out). One that is a metric view, or is gone, is said as a metric view."""
     path = ("data_sources", "tables")
-    try:
-        held = json.loads(live.get("serialized_space") or "{}")
-    except (TypeError, ValueError):
-        held = {}
+    held = _held(live)
     wanted = {
         str(t.get("identifier")) for t in _dig(serialized, path) or () if isinstance(t, Mapping)
     }
@@ -1251,40 +1248,49 @@ def differences(
     """What differs between the live space and the one the contract asks for, by name. A title
     the service suffixed because another space has it counts as the same title. ``tables`` are
     the data sources to name as tables (any other as a metric view); by default the space's."""
-    changes = []
-    if not _same_title(live.get("title"), space.title):
-        changes.append("title")
-    if (live.get("description") or "") != space.description:
-        changes.append("description")
-    if live.get("warehouse_id") != space.warehouse_id:
-        changes.append("warehouse")
-    try:
-        held = json.loads(live.get("serialized_space") or "{}")
-    except (TypeError, ValueError):
-        held = {}
-    if held != serialized:
-        named = []
-        if _dig(held, ("config", "sample_questions")) != _dig(
-            serialized, ("config", "sample_questions")
-        ):
-            named.append("sample questions")
-        named += _source_changes(
-            held, serialized, set(space.tables) if tables is None else set(tables)
+    changes = [
+        name
+        for name, same in (
+            ("title", _same_title(live.get("title"), space.title)),
+            ("description", (live.get("description") or "") == space.description),
+            ("warehouse", live.get("warehouse_id") == space.warehouse_id),
         )
-        if _dig(held, ("instructions", "text_instructions")) != _dig(
-            serialized, ("instructions", "text_instructions")
-        ):
-            named.append("instructions")
-        if _dig(held, ("instructions", "join_specs")) != _dig(
-            serialized, ("instructions", "join_specs")
-        ):
-            named.append("joins")
-        if _dig(held, ("instructions", "sql_snippets")) != _dig(
-            serialized, ("instructions", "sql_snippets")
-        ):
-            named.append("SQL snippets")
+        if not same
+    ]
+    held = _held(live)
+    if held != serialized:
+        own = set(space.tables if tables is None else tables)
+        named = (
+            _changed_parts(held, serialized, _CONFIG_PARTS)
+            + _source_changes(held, serialized, own)
+            + _changed_parts(held, serialized, _INSTRUCTION_PARTS)
+        )
         changes += named or ["other settings"]
     return changes
+
+
+#: The parts of ``serialized_space`` an update names a change of, as :func:`differences`
+#: names them: the sample questions, then the data sources, then these instructions.
+_CONFIG_PARTS = ((("config", "sample_questions"), "sample questions"),)
+_INSTRUCTION_PARTS = (
+    (("instructions", "text_instructions"), "instructions"),
+    (("instructions", "join_specs"), "joins"),
+    (("instructions", "sql_snippets"), "SQL snippets"),
+)
+
+
+def _changed_parts(
+    held: Any, wanted: Any, parts: Sequence[Tuple[Tuple[str, ...], str]]
+) -> List[str]:
+    return [name for path, name in parts if _dig(held, path) != _dig(wanted, path)]
+
+
+def _held(live: Mapping[str, Any]) -> Any:
+    """The live space's ``serialized_space``, parsed; ``{}`` when it holds no JSON."""
+    try:
+        return json.loads(live.get("serialized_space") or "{}")
+    except (TypeError, ValueError):
+        return {}
 
 
 def _source_changes(held: Any, wanted: Any, own: set) -> List[str]:

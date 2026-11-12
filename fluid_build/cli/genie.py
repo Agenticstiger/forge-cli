@@ -116,7 +116,7 @@ def run_apply(args: argparse.Namespace, logger: logging.Logger) -> int:
     say = cprint_literal
     say(
         f"Genie estate {args.estate}: {len(contracts)} contract(s), "
-        f"{len(estate.owners)} table(s), {_joins(estate)} join(s)"
+        f"{len(estate.owners)} table(s), {estate.joins} join(s)"
     )
     for warning in estate.warnings:
         say(f"  note: {warning}")
@@ -132,7 +132,7 @@ def run_apply(args: argparse.Namespace, logger: logging.Logger) -> int:
         estate=args.estate,
         products=len(contracts),
         tables=len(estate.owners),
-        joins=_joins(estate),
+        joins=estate.joins,
     )
     return 0
 
@@ -251,13 +251,6 @@ def _contracts_in(folder: Path, skip: frozenset) -> List[Path]:
         elif entry.is_file() and entry.name.endswith(CONTRACT_SUFFIXES):
             out.append(entry)
     return out
-
-
-def _joins(estate: Any) -> int:
-    space = getattr(estate, "space", None)
-    if space is None:
-        return 0
-    return len((space.serialized.get("instructions") or {}).get("join_specs") or ())
 
 
 def _cli_error(exc: Any) -> Any:
