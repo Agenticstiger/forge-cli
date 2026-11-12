@@ -369,18 +369,24 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     ),
     "claude_settings_unexpected_shape": (
         [
-            "The named settings file must be a JSON object; if it has 'hooks', that must be an "
-            "object, and 'hooks.PostToolUse' a list of objects",
+            (
+                "The named settings file must be a JSON object; if it has 'hooks', that must be "
+                "an object, and 'hooks.PostToolUse' a list of objects"
+            ),
             "Fix the file, then re-run: fluid scaffold-ide --target claude-code",
         ],
         None,
     ),
     "claude_settings_links_outside_project": (
         [
-            "The named Claude Code settings file is a symlink to a file outside this "
-            "project; scaffold-ide would copy that file's content into the project",
-            "Replace the link with a regular file or delete it, then re-run: "
-            "fluid scaffold-ide --target claude-code",
+            (
+                "The named Claude Code settings file is a symlink to a file outside this "
+                "project; scaffold-ide would copy that file's content into the project"
+            ),
+            (
+                "Replace the link with a regular file or delete it, then re-run: "
+                "fluid scaffold-ide --target claude-code"
+            ),
         ],
         None,
     ),
@@ -393,10 +399,15 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     ),
     "scaffold_ide_block_markers_malformed": (
         [
-            "The named CLAUDE.md or AGENTS.md must hold either no scaffold-ide markers or exactly "
-            "one '<!-- BEGIN forge-cli scaffold-ide block -->' followed by one matching END marker",
-            "Delete the stray or duplicate marker lines (the file was left untouched), "
-            "then re-run: fluid scaffold-ide --target <target>",
+            (
+                "The named CLAUDE.md or AGENTS.md must hold either no scaffold-ide markers or "
+                "exactly one '<!-- BEGIN forge-cli scaffold-ide block -->' followed by one "
+                "matching END marker"
+            ),
+            (
+                "Delete the stray or duplicate marker lines (the file was left untouched), "
+                "then re-run: fluid scaffold-ide --target <target>"
+            ),
         ],
         None,
     ),
@@ -404,8 +415,7 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         [
             "Re-run with --force to replace the file: fluid scaffold-ide --target <target> --force",
             "--force keeps the text of CLAUDE.md and AGENTS.md outside the scaffold-ide block",
-            "Upgrading from an earlier scaffold-ide: --force also removes the steering files "
-            "it wrote",
+            "Upgrading? --force also removes the steering files an earlier scaffold-ide wrote",
         ],
         None,
     ),

@@ -1271,8 +1271,10 @@ def render_report(meta: Dict[str, Any], records: Sequence[Dict[str, Any]]) -> st
         "list-price estimate. Used a skill: error-free runs that called the Skill tool or read",
         "a skill's files.",
         "",
-        "| Arm | Runs | valid@1 | pass@1 | Fidelity | Errors | Median wall | Input tok "
-        "| Output tok | Cache-read tok | Cost | Turns | Used a skill |",
+        (
+            "| Arm | Runs | valid@1 | pass@1 | Fidelity | Errors | Median wall | Input tok "
+            "| Output tok | Cache-read tok | Cost | Turns | Used a skill |"
+        ),
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for arm in arms:

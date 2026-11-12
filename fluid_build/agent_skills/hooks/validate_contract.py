@@ -40,11 +40,13 @@ MAX_LINES = 40
 #: Terminal control sequences: OSC (title, clipboard, links), CSI, the other ESC pairs,
 #: then any C0 or C1 control character but tab and newline, and the Unicode bidi
 #: controls that reorder how text reads (Trojan Source, CVE-2021-42574).
+#: Raw strings, so every range is written as escapes (ECMA-48: CSI parameter bytes
+#: 0x30-0x3F, intermediate 0x20-0x2F, final 0x40-0x7E; Fe escapes 0x40-0x5F).
 _CONTROL = re.compile(
-    "\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)?"
-    "|\x1b\\[[0-?]*[ -/]*[@-~]"
-    "|\x1b[@-_]?"
-    "|[\x00-\x08\x0b-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]"
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+    r"|\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]"
+    r"|\x1b[\x40-\x5f]?"
+    r"|[\x00-\x08\x0b-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]"
 )
 
 

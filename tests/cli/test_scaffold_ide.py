@@ -28,6 +28,7 @@ Six shapes verified:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import logging
@@ -671,10 +672,9 @@ def test_the_exact_legacy_hook_is_removed(tmp_path: Path):
 
 def test_reruns_never_stack_hook_entries(tmp_path: Path):
     for force in (False, True, True):
-        try:
+        # The first run writes .mcp.json; a later run without --force may refuse it.
+        with contextlib.suppress(CLIError):
             _run(tmp_path, "claude-code", force=force)
-        except CLIError:
-            pass
     assert _local_commands(tmp_path) == [f"{sys.executable} {HOOK_SCRIPT}"]
 
 
