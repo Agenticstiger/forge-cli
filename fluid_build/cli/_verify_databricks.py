@@ -616,7 +616,11 @@ def _tags_dimension(client: Any, table: Any, live_table: Mapping[str, Any]) -> D
         "message": f"{len(findings)} of {checked} missing or changed",
         "findings": findings,
         "fix": (
-            "Run fluid apply to set them again; a dbt CREATE OR REPLACE may have dropped "
+            "Run fluid apply --mode amend-and-build: a Lakeflow pipeline's table gets its tags "
+            "after an update that fluid apply starts (an update run from Databricks, or of a "
+            "continuous pipeline, sets none)"
+            if getattr(table, "pipeline_written", False)
+            else "Run fluid apply to set them again; a dbt CREATE OR REPLACE may have dropped "
             "them (whether Databricks keeps tags across it is undocumented)"
         ),
     }

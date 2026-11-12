@@ -560,7 +560,8 @@ def _sync_tags(api: Any, compiled: Any, previous: Tuple[Set[str], Set[str]], say
     on_columns: Dict[str, Dict[str, str]] = {}
     for column, key, value in compiled.column_tags:
         on_columns.setdefault(column, {})[key] = value
-    for column in sorted(set(on_columns) | tagged_columns):
+    # A recorded column the table no longer has took its tags with it.
+    for column in sorted(set(on_columns) | (tagged_columns & set(compiled.columns))):
         problems += _set_tags(
             api,
             "columns",

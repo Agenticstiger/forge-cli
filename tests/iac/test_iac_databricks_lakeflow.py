@@ -173,7 +173,7 @@ def _edit(**changes: Any) -> Dict[str, Any]:
     return contract
 
 
-def _resolver(product_id: str, expose_id: str, column: str):
+def _resolver(product_id: str, expose_id: Optional[str], column: str):
     assert (product_id, expose_id, column) == ("bronze.test.sites_v1", "sites", "site_id")
     return SITES, None
 
@@ -463,6 +463,60 @@ class TestSql:
 
 
 # ── 5. refusals ─────────────────────────────────────────────────────────────
+class TestSecurityReview:
+    """The 2026-11-12 security review's two candidates, both fixed."""
+
+    @pytest.mark.parametrize(
+        "sql,left_open",
+        [
+            ("SELECT id FROM src /*", "a /* comment"),
+            ("SELECT id FROM src /* a /* b */", "a /* comment"),
+            ("SELECT 'x", "a ' string"),
+            ('SELECT "x', 'a " string'),
+            ("SELECT `x FROM t", "a ` identifier"),
+        ],
+    )
+    def test_a_query_left_open_is_refused(self, tmp_path, sql, left_open):
+        contract = _edit(q=lambda c: c["builds"][0]["properties"].update(sql=sql))
+        compiled = _refused(contract, "query", tmp_path)
+        assert any(left_open in str(r) for r in compiled.refusals), compiled.refusals
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 1 AS id /* a /* nested */ comment */",
+            "SELECT 'it\\'s', '/*', `a``b` FROM t -- trailing /*",
+        ],
+    )
+    def test_a_closed_query_is_kept(self, tmp_path, sql):
+        contract = _edit(q=lambda c: c["builds"][0]["properties"].update(sql=sql))
+        assert "databricks-lakeflow-query" not in _kinds(_compile(contract, tmp_path))
+
+    def test_the_query_is_the_last_text_in_the_file(self, tmp_path):
+        """A rule description written after the query could be swallowed by a comment the
+        query opens; the check views now come first and the query last."""
+        contract = _contract()
+        sql = _sql(_compile(contract, tmp_path))
+        table_at = sql.index("CREATE OR REFRESH MATERIALIZED VIEW `capacity`")
+        assert sql.rindex("CREATE OR REFRESH PRIVATE MATERIALIZED VIEW") < table_at
+        query = contract["builds"][0]["properties"]["sql"].strip().rstrip(";").rstrip()
+        assert sql.rstrip().endswith(query + "\n;")
+
+    def test_the_schema_select_requires_a_schema_holding_only_the_table(self, tmp_path):
+        compiled = _compile(_contract(), tmp_path)
+        (grant,) = compiled.resources["databricks_grant"].values()
+        assert grant["privileges"] == ["SELECT", "USE_SCHEMA"]
+        (precondition,) = grant["lifecycle"]["precondition"]
+        (key,) = compiled.data["databricks_tables"]
+        condition = str(precondition["condition"])
+        assert f"data.databricks_tables.{key}.ids" in condition
+        assert '"fluid_iactest_ldp.silver_capacity.capacity"' in condition
+        assert "length(setsubtract(" in condition and "== 0" in condition
+        tables = compiled.data["databricks_tables"][key]
+        assert str(tables["schema_name"]).startswith("${databricks_schema.")
+        assert "holds tables the contract does not declare" in str(precondition["error_message"])
+
+
 class TestRefusals:
     def test_another_pattern(self, tmp_path):
         contract = _edit(p=lambda c: c["builds"][0].update(pattern="hybrid-reference"))
@@ -611,3 +665,58 @@ def test_verify_sees_readers_tags_and_column_tags(tmp_path):
     assert "analysts" in table.readers
     assert ("fluid_product_id", "silver.test.capacity_v1") in table.tags
     assert ("site_id", "fluid_sensitivity", "internal") in table.column_tags
+
+
+# ── delivery review, 2026-11-12 ────────────────────────────────────────────
+def test_a_lakeflow_build_whose_expose_another_build_names_is_refused_not_a_crash(tmp_path):
+    """The lakeflow build declares no outputs and a dbt build names the expose: the
+    expose is the dbt build's (builds_writing_expose), so the pipeline would write a
+    table another build owns."""
+
+    def dbt_writes_it(contract):
+        del contract["builds"][0]["outputs"]
+        contract["builds"].append(
+            {
+                "id": "dbt-capacity",
+                "engine": "dbt-databricks",
+                "pattern": "hybrid-reference",
+                "outputs": ["capacity"],
+                "properties": {"model": "capacity"},
+                "execution": {"runtime": {"platform": "databricks"}},
+            }
+        )
+
+    compiled = _compile(_edit(d=dbt_writes_it), tmp_path)
+    assert "databricks-lakeflow-writers" in _kinds(compiled)
+
+
+def test_removing_a_pipeline_is_data_loss_its_file_and_folder_are_not():
+    """Deleting a pipeline can delete its tables, so the data-loss gate counts it; its
+    generated source file and folder are run definitions, removed ungated."""
+    from fluid_build.cli._apply_opentofu_engine import _data_bearing_changes
+
+    removals = [
+        ("databricks_pipeline.p", "databricks_pipeline"),
+        ("databricks_workspace_file.f", "databricks_workspace_file"),
+        ("databricks_directory.d", "databricks_directory"),
+    ]
+    counted, revoked = _data_bearing_changes({"add": 0, "change": 0, "remove": 3}, removals)
+    assert counted["remove"] == 1 and revoked == []
+
+
+def test_a_schema_holding_other_tables_fails_the_plan_with_one_clean_line():
+    output = (
+        "Error: Resource precondition failed\n  on main.tf.json line 42: Schema\n"
+        "fluid_iactest_ldp.silver_capacity holds tables the contract does not declare\n"
+        "(fluid_iactest_ldp.silver_capacity.someone_elses). A Lakeflow pipeline's readers ..."
+    )
+    refusal = dbx.DatabricksIacPlugin().explain_plan_failure(output, _contract(), [])
+    assert refusal is not None and refusal.kind == "databricks-lakeflow-schema-not-owned"
+    assert "(someone_elses)" in str(refusal)
+
+
+def test_verify_knows_a_pipeline_table_gets_its_tags_from_an_update(tmp_path):
+    with contract_source(_workspace(tmp_path, _contract())):
+        tables, _jobs = dbx.managed_objects(_contract(), ENV)
+    (table,) = tables
+    assert table.pipeline_written is True and table.dbt_written is False

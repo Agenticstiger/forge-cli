@@ -196,7 +196,7 @@ class _Api:
         self.states = list(states or ["WAITING_FOR_RESOURCES", "RUNNING", "COMPLETED"])
         self.events = _good_events() if events is None else events
         self.properties = (
-            {"fluid.tags": "old_key,fluid_layer", "fluid.column_tags": "old_col"}
+            {"fluid.tags": "old_key,fluid_layer", "fluid.column_tags": "method,dropped_col"}
             if properties is None
             else properties
         )
@@ -512,7 +512,9 @@ def test_failed_update_says_the_error_and_sets_no_tags(compiled, capsys):
 def test_tags_are_set_changed_removed_and_left_alone(compiled):
     table = ("tables", TABLE)
     column = ("columns", f"{TABLE}.site_id")
-    old_column = ("columns", f"{TABLE}.old_col")
+    # ``method`` is still a column but no longer classified; ``dropped_col`` is gone from the
+    # table (and took its tags with it), so it is not read or written at all.
+    old_column = ("columns", f"{TABLE}.method")
     api = _Api(
         tags={
             table: {
@@ -537,7 +539,9 @@ def test_tags_are_set_changed_removed_and_left_alone(compiled):
     assert writes.index(("DELETE", TABLE, "fluid_version")) < writes.index(
         ("POST", TABLE, "fluid_version")
     )
-    assert ("DELETE", f"{TABLE}.old_col", "fluid_sensitivity") in writes
+    assert ("DELETE", f"{TABLE}.method", "fluid_sensitivity") in writes
+    assert not [p for p in api.paths("GET", "entity-tag-assignments") if "dropped_col" in p]
+    assert not [w for w in writes if "dropped_col" in w[1]]
     assert api.tags[table] == {
         "fluid_layer": "Silver",
         "fluid_version": "0.7.7",

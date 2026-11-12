@@ -1859,7 +1859,7 @@ def _emit_pipeline_table(
     contract's tags, and each reader's ``SELECT`` on that schema, which exists before the
     pipeline's first update creates the table. The table's own tags are set after each update
     ``fluid apply`` runs (:func:`_pipeline_tags`). The schema's name, as a reference."""
-    _emit_schema(compiled, table, cid, region)
+    catalog_name = _emit_schema(compiled, table, cid, region)
     _catalog_key, schema_key, _table_key = _keys(cid, table)
     compiled.lakeflow_written.append(table.full_name)
     _refuse_pipeline_table(compiled, table, privileges, contract)
@@ -1867,15 +1867,46 @@ def _emit_pipeline_table(
     schema_id = tofu_ref(f"databricks_schema.{schema_key}.id")
     for principal, granted in sorted(privileges.items()):
         if granted == {"SELECT"}:
+            key = f"{schema_key}_usage_{unique_ident(principal)}"
             _claim_grant(
                 compiled,
-                f"{schema_key}_usage_{unique_ident(principal)}",
+                key,
                 ("schema", schema_name, schema_id),
                 principal,
                 ["SELECT", "USE_SCHEMA"],
             )
+            if key in compiled.resources.get("databricks_grant", {}):
+                compiled.resources["databricks_grant"][key]["lifecycle"] = {
+                    "precondition": [_schema_holds_only(compiled, table, schema_key, catalog_name)]
+                }
     _emit_schema_tags(compiled, table, cid, contract)
     return tofu_ref(f"databricks_schema.{schema_key}.name")
+
+
+def _schema_holds_only(
+    compiled: _Compiled, table: _Table, schema_key: str, catalog_name: TofuExpr
+) -> Dict[str, Any]:
+    """The check that a pipeline's schema holds no table but the pipeline's own, before its
+    readers get ``SELECT`` on the whole schema: a schema adopted from the workspace may hold
+    other teams' tables, and ``lakeflow-schema-shared`` sees only this contract's
+    (security review, 2026-11-12). ``data.databricks_tables`` lists the schema's tables by full
+    name at plan time (provider 1.140.0, ``catalog/data_tables.go``); a schema this apply
+    creates is read at apply, empty. The names interpolated passed ``_ident``."""
+    key = f"{schema_key}_tables"
+    compiled.data.setdefault("databricks_tables", {})[key] = {
+        "catalog_name": catalog_name,
+        "schema_name": tofu_ref(f"databricks_schema.{schema_key}.name"),
+    }
+    others = f'setsubtract(data.databricks_tables.{key}.ids, ["{table.full_name}"])'
+    return {
+        "condition": tofu_ref(f"length({others}) == 0"),
+        "error_message": TofuExpr(
+            f"Schema {table.catalog}.{table.schema} holds tables the contract does not declare "
+            '(${join(", ", ' + others + ")}). A Lakeflow pipeline's readers get SELECT on "
+            "its schema, which would cover those tables too: bind the expose to a schema of "
+            "its own."
+        ),
+    }
 
 
 def _pipeline_tags(
@@ -1967,6 +1998,31 @@ def _residency_failure(output: str) -> Optional[UnsupportedBindingError]:
         f"the contract declares binding.location.region {declared}, but the workspace "
         f"DATABRICKS_HOST names is {seen}. Point DATABRICKS_HOST at a workspace in {declared}, "
         "or correct binding.location.region.",
+    )
+
+
+_SCHEMA_NOT_OWNED_RE = re.compile(
+    r"Schema\s+([a-z0-9_]+\.[a-z0-9_]+)\s+holds\s+tables\s+the\s+contract\s+does\s+not\s+"
+    r"declare\s+\(([^)]*)\)"
+)
+
+
+def _schema_not_owned_failure(output: str) -> Optional[UnsupportedBindingError]:
+    """One clean refusal for a plan that fails :func:`_schema_holds_only`; ``None`` when the
+    output is not that failure (tofu wraps the message, hence ``\\s+``)."""
+    found = _SCHEMA_NOT_OWNED_RE.search(output or "")
+    if found is None:
+        return None
+    # Bare table names: the schema is named already, and the CLI's secret redactor reads a
+    # three-part ``catalog.schema.table`` as a JWT and masks it.
+    names = [n.strip().rsplit(".", 1)[-1] for n in " ".join(found.group(2).split()).split(",")]
+    others = ", ".join(n for n in names if n) or "tables the plan output does not show"
+    return _refusal(
+        "lakeflow-schema-not-owned",
+        f"schema {found.group(1)} holds tables this contract does not declare ({others}). A "
+        "Lakeflow pipeline's readers get SELECT on its schema, which would cover them, so "
+        "nothing was applied.",
+        "Bind the lakeflow-built expose to a schema of its own, or move those tables out of " "it.",
     )
 
 
@@ -2839,7 +2895,7 @@ class DatabricksIacPlugin:
                 "DATABRICKS_HOST with DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET (a "
                 "service principal's OAuth secret), then re-run 'fluid apply'.",
             )
-        residency = _residency_failure(output or "")
+        residency = _residency_failure(output or "") or _schema_not_owned_failure(output or "")
         if residency is not None:
             return residency
         if _UNREACHABLE_RE.search(output or ""):
@@ -3236,6 +3292,8 @@ class ManagedTable:
     column_comments: Tuple[Tuple[str, str], ...] = ()
     #: ``(column, key, value)`` per column tag it is meant to carry, sorted.
     column_tags: Tuple[Tuple[str, str, str], ...] = ()
+    #: Published by a Lakeflow pipeline: its tags come from the updates fluid apply starts.
+    pipeline_written: bool = False
 
 
 def _pipeline_readers_and_tags(compiled: _Compiled, readers: Dict[str, List[str]]) -> None:
@@ -3284,6 +3342,7 @@ def managed_objects(
             ),
             readers=tuple(readers.get(table.full_name, ())),
             dbt_written=table.full_name in compiled.dbt_written,
+            pipeline_written=table.full_name in compiled.lakeflow_written,
             region=region,
             tags=tuple(sorted(tagged.get(("tables", table.full_name), ()))),
             schema_tags=tuple(

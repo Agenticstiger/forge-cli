@@ -149,6 +149,8 @@ class LakeflowPipeline:
     #: ``(column, key, value)`` on its columns.
     table_tags: Tuple[Tuple[str, str], ...] = ()
     column_tags: Tuple[Tuple[str, str, str], ...] = ()
+    #: The table's columns, as the definition declares them.
+    columns: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -162,8 +164,8 @@ class CompiledPipelines:
     pipelines: List[LakeflowPipeline] = field(default_factory=list)
 
 
-#: ``(product id, expose id, column) -> (catalog.schema.table, None) | (None, why)``.
-ReferenceResolver = Callable[[str, str, str], Tuple[Optional[str], Optional[str]]]
+#: ``(product id, expose id or None, column) -> (catalog.schema.table, None) | (None, why)``.
+ReferenceResolver = Callable[[str, Optional[str], str], Tuple[Optional[str], Optional[str]]]
 
 
 def _refusal(kind: str, message: str, *remediation: str) -> UnsupportedBindingError:
@@ -256,6 +258,47 @@ def _continuous(
     return False
 
 
+def _left_open(sql: str) -> Optional[str]:
+    """What ``sql`` leaves open at its end, as Spark SQL lexes it, or ``None``: a ``'`` or
+    ``"`` string (backslash escapes), a backtick identifier (a doubled backtick is one
+    backtick) or a bracketed comment (Spark nests them). A ``--`` comment ends at its line.
+
+    The query is the last thing in the pipeline's source, so an open comment or string could
+    only run into the end of the file; refused here all the same, at validate time, since
+    an earlier version that wrote check views after it let an unclosed ``/*`` swallow
+    them up to a ``*/`` in a rule's description (security review, 2026-11-12)."""
+    i, n, depth = 0, len(sql), 0
+    while i < n:
+        two = sql[i : i + 2]
+        if depth:
+            depth += 1 if two == "/*" else -1 if two == "*/" else 0
+            i += 2 if two in ("/*", "*/") else 1
+            continue
+        char = sql[i]
+        if two == "/*":
+            depth, i = 1, i + 2
+        elif two == "--":
+            end = sql.find("\n", i)
+            i = n if end < 0 else end + 1
+        elif char in ("'", '"'):
+            i += 1
+            while i < n and sql[i] != char:
+                i += 2 if sql[i] == "\\" else 1
+            if i >= n:
+                return f"a {char} string"
+            i += 1
+        elif char == "`":
+            end = sql.find("`", i + 1)
+            while end >= 0 and sql[end + 1 : end + 2] == "`":
+                end = sql.find("`", end + 2)
+            if end < 0:
+                return "a ` identifier"
+            i = end + 1
+        else:
+            i += 1
+    return "a /* comment" if depth else None
+
+
 def _query(build: Mapping[str, Any], where: str, refusals: List[UnsupportedBindingError]) -> str:
     """``properties.sql``: one query, without its trailing ``;``; ``""`` and a refusal if not."""
     pattern = str(build.get("pattern") or "hybrid-reference").strip().lower()
@@ -283,6 +326,16 @@ def _query(build: Mapping[str, Any], where: str, refusals: List[UnsupportedBindi
         if stripped == body:
             break
         body = stripped
+    left_open = _left_open(text) if text else None
+    if left_open:
+        refusals.append(
+            _refusal(
+                "query",
+                f"{where} properties.sql leaves {left_open} open at its end.",
+                "Close it, so the query is one complete SELECT.",
+            )
+        )
+        return ""
     if not text or ";" in text or not _QUERY_START_RE.match(body):
         refusals.append(
             _refusal(
@@ -531,10 +584,11 @@ def _referenced_table(
         full_name, why_not = None, "that column is not a plain identifier"
     if full_name is not None:
         return full_name, None
+    target = f"{ref.product_id} {ref.expose_id}" if ref.expose_id else ref.product_id
     return None, (
         "reference-unresolved",
-        f"rule {check.rule_id!r} checks {check.column} against {ref.product_id} "
-        f"{ref.expose_id}.{ref.column}, and {why_not}.",
+        f"rule {check.rule_id!r} checks {check.column} against {target}.{ref.column}, and "
+        f"{why_not}.",
         "Keep the referenced product's contract in this workspace (the directory holding "
         "fluid.workspace.yaml, or a root in FLUID_UPSTREAM_CONTRACTS), bound to a Databricks "
         "table with that column; or remove the rule.",
@@ -611,8 +665,9 @@ def render_pipeline_sql(
     column_tags: Sequence[Tuple[str, str, str]] = (),
     refusals: Optional[List[UnsupportedBindingError]] = None,
 ) -> str:
-    """The pipeline's source: the table with one expectation per row-level rule, then one
-    check view per whole-table check. ``table`` is ``databricks.py::_Table``."""
+    """The pipeline's source: one check view per whole-table check, then the table with one
+    expectation per row-level rule and the contract's query, last. ``table`` is
+    ``databricks.py::_Table``."""
     refusals = refusals if refusals is not None else []
     where = table.where
     described = dict(table.column_comments)
@@ -660,20 +715,42 @@ def render_pipeline_sql(
         f"{_SAFE_TEXT_RE.sub('_', build_id)}. Do not edit: change the contract and run fluid "
         "apply.\n"
     )
+    # The check views first and the table last: the contract's query is the last text in
+    # the file, so nothing forge-cli writes can follow it (a dataset's place in the file does
+    # not order the pipeline; its references do).
     statements = [
+        _check_view(table, rule, check, referenced.get(check.name), where, refusals)
+        for rule in rules
+        for check in rule.checks
+        if check.kind in VIEW_KINDS
+    ]
+    statements.append(
         f"CREATE OR REFRESH MATERIALIZED VIEW {quote(table.name)} (\n  "
         + ",\n  ".join(lines)
         + "\n)\n"
         + "\n".join(clauses)
         + f"\nAS\n{query}\n;\n"
-    ]
-    for rule in rules:
-        for check in rule.checks:
-            if check.kind in VIEW_KINDS:
-                statements.append(
-                    _check_view(table, rule, check, referenced.get(check.name), where, refusals)
-                )
+    )
     return header + "\n" + "\n".join(statements)
+
+
+def _databricks_table_with(expose: Mapping[str, Any], column: str) -> Optional[str]:
+    """``catalog.schema.table`` of an expose bound to a Databricks table with ``column``."""
+    binding = expose.get("binding") or {}
+    if canonical_cloud(binding.get("platform")) != "databricks":
+        return None
+    schema = (expose.get("contract") or {}).get("schema") or []
+    if not any(
+        isinstance(c, Mapping) and str(c.get("name") or "").lower() == column.lower()
+        for c in schema
+    ):
+        return None
+    location = binding.get("location") or {}
+    parts = [str(location.get(k) or "").strip().lower() for k in ("database", "schema", "table")]
+    try:
+        return ".".join(validate_ident(part) for part in parts)
+    except ValueError:
+        return None
 
 
 def workspace_reference_resolver(contract: Mapping[str, Any]) -> ReferenceResolver:
@@ -726,38 +803,29 @@ def workspace_reference_resolver(contract: Mapping[str, Any]) -> ReferenceResolv
         return found
 
     def resolve(
-        product_id: str, expose_id: str, column: str
+        product_id: str, expose_id: Optional[str], column: str
     ) -> Tuple[Optional[str], Optional[str]]:
+        """The expose ``expose_id`` names (``consumes[]`` lists the product by it), or, with
+        none, the product's one Databricks expose that has ``column``."""
         upstream, why = load(product_id)
         if upstream is None:
             return None, why
-        expose = next(
-            (
-                e
-                for e in upstream.get("exposes") or []
-                if isinstance(e, Mapping) and str(e.get("exposeId")) == expose_id
-            ),
-            None,
-        )
-        if expose is None:
-            return None, f"{product_id} has no expose {expose_id}"
-        binding = expose.get("binding") or {}
-        if canonical_cloud(binding.get("platform")) != "databricks":
-            return None, f"{product_id} {expose_id} is not bound to a Databricks table"
-        schema = (expose.get("contract") or {}).get("schema") or []
-        if not any(
-            isinstance(c, Mapping) and str(c.get("name") or "").lower() == column.lower()
-            for c in schema
-        ):
-            return None, f"{product_id} {expose_id} has no column {column}"
-        location = binding.get("location") or {}
-        parts = [
-            str(location.get(k) or "").strip().lower() for k in ("database", "schema", "table")
-        ]
-        try:
-            return ".".join(validate_ident(part) for part in parts), None
-        except ValueError:
-            return None, f"{product_id} {expose_id} names no plain catalog.schema.table"
+        names: List[str] = []
+        for expose in upstream.get("exposes") or []:
+            if not isinstance(expose, Mapping):
+                continue
+            if expose_id is not None and str(expose.get("exposeId")) != expose_id:
+                continue
+            name = _databricks_table_with(expose, column)
+            if name:
+                names.append(name)
+        which = f"{product_id} {expose_id}" if expose_id is not None else product_id
+        if len(names) != 1:
+            return None, (
+                f"{which} has {len(names)} Databricks tables with a column {column} "
+                "(catalog.schema.table names forge-cli can read)"
+            )
+        return names[0], None
 
     return resolve
 
@@ -805,6 +873,18 @@ def compile_lakeflow_pipelines(
             )
             continue
         published[table.full_name] = where
+        schema = schemas.get(table.full_name)
+        if schema is None:
+            compiled.refusals.append(
+                _refusal(
+                    "writers",
+                    f"{where} would publish {table.full_name}, and another build names that "
+                    "expose in its builds[].outputs: a pipeline owns its table, so no other "
+                    "build can write it.",
+                    "Name the expose in this lakeflow build's outputs only.",
+                )
+            )
+            continue
         rules, referenced = _rules(table, contract, compiled.refusals, resolve)
         table_tags, on_columns = tags.get(table.full_name, ({}, ()))
         table_tag_pairs = tuple(sorted(table_tags.items()))
@@ -828,7 +908,7 @@ def compile_lakeflow_pipelines(
             build_id=build_id,
             where=where,
             table=table,
-            schema=schemas[table.full_name],
+            schema=schema,
             source=source,
             continuous=continuous,
             rules=rules,
@@ -924,6 +1004,7 @@ def _emit(
             path=path,
             table_tags=table_tags,
             column_tags=column_tags,
+            columns=tuple(column["name"] for column in table.columns),
         )
     )
 

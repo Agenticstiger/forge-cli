@@ -84,7 +84,7 @@ def format_schema_error(error: Any) -> str:
         # 'lakeflow' is not valid under any of its engines.
         return (
             "'lakeflow' (a Databricks Lakeflow Declarative Pipeline) is an engine of the 0.7.7 "
-            "preview schema: declare fluidVersion: 0.7.7 to use it"
+            "preview schema: set the contract's fluidVersion to 0.7.7 to use it"
         )
     if error.validator == "not" and isinstance(value, dict) and list(value) == ["required"]:
         why = error.schema.get("description") if isinstance(error.schema, dict) else None
