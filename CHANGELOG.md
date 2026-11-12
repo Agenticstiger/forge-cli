@@ -83,10 +83,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Keys for two or more providers stop the run, even with Ollama running.** With
   `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` both set (or one provider's key and `OLLAMA_HOST`) and
   nothing naming a provider, a run without a TTY skipped both keys and used a running local
-  Ollama. Forge now stops with `copilot_no_llm_provider` and names the keys, without asking
-  Ollama, and `fluid doctor` says the same. A `fluid ai setup` choice and a single keyring key
-  still come first, and `GEMINI_API_KEY` with `GOOGLE_API_KEY` is one provider. Pick one with
-  `--llm-provider` or `FLUID_LLM_PROVIDER`.
+  Ollama, and interactive setup used the first key it found. Forge now stops with
+  `copilot_no_llm_provider` and names the keys, without asking Ollama; interactive setup,
+  `fluid ai test` and `fluid doctor` say the same and use none of them. A `fluid ai setup`
+  choice and a single keyring key still come first, and `GEMINI_API_KEY` with `GOOGLE_API_KEY` is
+  one provider. Pick one with `--llm-provider` or `FLUID_LLM_PROVIDER`.
 - **`LlmProvider.list_available_models` takes an `endpoint` keyword**, the address the call will
   go to, passed only when the operator states one. A provider plugin that overrides the method
   with the two-argument signature keeps working until an endpoint is stated.
@@ -152,6 +153,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a model the endpoint has. All three now ask the stated endpoint. A `--tiered` stage now
   calls a stated endpoint too, as the routing model already did; it called the provider's
   default address instead.
+- **Interactive setup no longer picks GitHub Models from `GITHUB_API_KEY`.** It took any variable
+  in `PROVIDER_ENV_VARS`, so `GITHUB_API_KEY` alone selected github, which setup then failed to
+  build (`KeyError: 'github'`). It now reads the key variables a run without a TTY reads:
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY` or `GEMINI_API_KEY` (it missed the
+  second). GitHub Models stays a provider you name with `--llm-provider github`. `fluid ai test`
+  and `fluid init`'s check for a configured AI follow the same rule.
 
 ### Security
 

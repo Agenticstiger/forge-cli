@@ -889,7 +889,7 @@ class EndpointGroup:
 # result to litellm as ``api_key``, which beats the provider's own key
 # variable. A provider forge picks itself never gets it, and forge can pick
 # openai, anthropic and gemini (the one keyring key or key variable), github
-# (interactive setup reads PROVIDER_ENV_VARS) and ollama. A project
+# (interactive setup's key import offers a gh login) and ollama. A project
 # FLUID_LLM_API_KEY is a decoy for those (the operator's keyring key goes out),
 # so it pairs only the endpoints of providers forge reaches by being named.
 _LLM_KEY = "FLUID_LLM_API_KEY"
@@ -1028,6 +1028,7 @@ ENDPOINT_CREDENTIAL_GROUPS: Tuple[EndpointGroup, ...] = (
             f"llm/providers.py PROVIDER_ENV_VARS); {_LLM_KEYRING}"
         ),
         # not _LLM_KEY: interactive setup can pick github without it being named
+        # (it imports a gh login; GITHUB_API_KEY alone selects nothing)
         paired_by=(("GITHUB_API_KEY",),),
     ),
     EndpointGroup(

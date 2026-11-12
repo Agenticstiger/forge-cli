@@ -656,7 +656,10 @@ class TestIsAiConfigured:
     def test_returns_true_when_provider_env_var_set(self, monkeypatch):
         from fluid_build.cli.init import _is_ai_configured
 
-        # Make sure no saved config interferes.
+        # Make sure no saved config interferes, nor a second provider's key:
+        # two providers' keys select neither.
+        for key in ("ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OLLAMA_HOST"):
+            monkeypatch.delenv(key, raising=False)
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-fake")
         with patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None):
             assert _is_ai_configured() is True

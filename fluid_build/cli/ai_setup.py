@@ -1443,12 +1443,13 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
     Resolves an LLM config in this priority order:
 
         1. saved config file + OS keyring (``~/.fluid/ai_config.json``)
-        2. cloud provider env vars (``OPENAI_API_KEY`` etc.)
+        2. cloud provider env vars (``OPENAI_API_KEY`` etc.), never ``GITHUB_API_KEY``
         3. explicit ``OLLAMA_HOST`` env var
         4. auto-detected local Ollama (with user confirmation on TTY)
         5. interactive provider picker
 
-    Returns ``None`` if the user skips setup or stdin is not a TTY.
+    Returns ``None`` if the user skips setup, stdin is not a TTY, or key
+    variables name two or more providers (setup names them instead of choosing).
     """
     # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
     from fluid_build.cli.ai_setup import (
@@ -1514,10 +1515,42 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
             # Config exists but no key anywhere — fall through to prompt.
 
     # 2. Check cloud-provider env vars (e.g. CI environments that
-    #    inject ANTHROPIC_API_KEY / OPENAI_API_KEY directly).
-    for pname, env_var in PROVIDER_ENV_VARS.items() if has_litellm else ():
-        env_key = os.environ.get(env_var)
-        if env_key:
+    #    inject ANTHROPIC_API_KEY / OPENAI_API_KEY directly). The key variables
+    #    a run without a TTY reads: OPENAI_API_KEY, ANTHROPIC_API_KEY and
+    #    GEMINI_API_KEY / GOOGLE_API_KEY. Never GITHUB_API_KEY: github is used
+    #    only when named (PROVIDER_ENV_VARS). Variables for two or more providers
+    #    (OLLAMA_HOST names Ollama) select none: as without a TTY, exactly one
+    #    keyring key then decides, else setup names them and stops.
+    if has_litellm:
+        from fluid_build.llm.provider_resolve import (
+            _explicit_key_signals,
+            _infer_provider_from_keyring,
+            _resolve_api_key,
+            ambiguous_keys_message,
+        )
+
+        ambiguous = ambiguous_keys_message(os.environ)
+        if ambiguous:
+            kept = _infer_provider_from_keyring()
+            kept_key = _resolve_api_key(kept, os.environ) if kept else None
+            if kept and kept_key:
+                if console and RICH_AVAILABLE:
+                    label = PROVIDER_DISPLAY_NAMES.get(kept, kept)
+                    console.print(f"[dim]Using {label}, the one provider with a keyring key.[/dim]")
+                LOG.info("Inline AI setup: several key variables, one keyring key")
+                return _make_cloud_config(kept, kept_key)
+            if console and RICH_AVAILABLE:
+                console.print(literal_error_text(ambiguous, "yellow"))
+            LOG.info("Inline AI setup: key variables for several providers, none chosen")
+            return None
+        signals = _explicit_key_signals(os.environ)  # one provider at most here
+        pname = next(iter(signals), None)
+        if pname and pname != "ollama":  # OLLAMA_HOST is step 3
+            # GOOGLE_API_KEY before GEMINI_API_KEY, as the key resolver reads them.
+            env_var = PROVIDER_ENV_VARS.get(pname)
+            if not env_var or not os.environ.get(env_var):
+                env_var = signals[pname][0]
+            env_key = os.environ[env_var]
             if console and RICH_AVAILABLE:
                 label = PROVIDER_DISPLAY_NAMES.get(pname, pname)
                 console.print(f"[dim]Using {label} from environment.[/dim]")

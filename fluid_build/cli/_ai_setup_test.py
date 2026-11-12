@@ -235,6 +235,12 @@ def _resolve_cloud_api_key(
 
 
 def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[str]]:
+    from fluid_build.llm.provider_resolve import (
+        _explicit_key_signals,
+        _infer_provider_from_keyring,
+        ambiguous_keys_message,
+    )
+
     provider_override = _normalize_ai_test_provider(getattr(args, "llm_provider", None))
     model_override = getattr(args, "llm_model", None) or os.environ.get("FLUID_LLM_MODEL")
     endpoint_override = getattr(args, "llm_endpoint", None) or os.environ.get("FLUID_LLM_ENDPOINT")
@@ -299,8 +305,20 @@ def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[st
             return config, None
         LOG.debug("Saved AI config was not test-ready: %s", error)
 
-    for pname, env_var in PROVIDER_ENV_VARS.items():
-        if os.environ.get(env_var) or (pname == "gemini" and os.environ.get("GEMINI_API_KEY")):
+    # One provider's key variables, the ones forge reads: never GITHUB_API_KEY.
+    # Two or more providers' (OLLAMA_HOST names Ollama) select none: as in
+    # forge, exactly one keyring key then decides, else the test stops.
+    ambiguous = ambiguous_keys_message(os.environ)
+    if ambiguous:
+        kept = _infer_provider_from_keyring()
+        if not kept:
+            return None, ambiguous
+        config, error = _build_for_provider(kept, allow_saved=False)
+        if config:
+            config.timeout_seconds = timeout
+        return config, error
+    for pname in _explicit_key_signals(os.environ):
+        if pname != "ollama":
             config, error = _build_for_provider(pname, allow_saved=False)
             if config:
                 config.timeout_seconds = timeout

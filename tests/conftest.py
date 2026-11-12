@@ -344,6 +344,40 @@ def _hermetic_saved_ai_config(monkeypatch, _empty_fluid_home):
         monkeypatch.setenv("FLUID_CONFIG", str(home / "config.yaml"))
 
 
+# What interactive setup writes straight into ``os.environ``: ``set_session_env``
+# exports the provider key it found (``PROVIDER_ENV_VARS``), and a saved Ollama
+# choice sets ``OLLAMA_HOST``. Monkeypatch cannot undo a direct assignment.
+_SESSION_ENV_VARS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "GITHUB_API_KEY",
+    "OLLAMA_HOST",
+)
+
+
+@pytest.fixture(autouse=True)
+def _session_env_is_restored(monkeypatch):
+    """No test leaves a provider key or ``OLLAMA_HOST`` behind for the next one.
+
+    A key one test exports (the import tests' canary, for one) made a later
+    test in the same worker select that provider: interactive setup reads the
+    key variables from ``os.environ``. The values are put back as the test found
+    them. Requesting ``monkeypatch`` tears this down first, so what monkeypatch
+    set is then undone by monkeypatch itself.
+    """
+    import os
+
+    found = {name: os.environ.get(name) for name in _SESSION_ENV_VARS}
+    yield
+    for name, value in found.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 def _noop_assert_safe_url(url, *, allow_private=False):  # noqa: ARG001
     """Replacement for safe_http.assert_safe_url used in unit tests.
 

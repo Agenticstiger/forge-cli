@@ -529,32 +529,33 @@ def _is_ai_configured() -> bool:
     """Return True if a saved AI config (or environment fallback) is usable.
 
     Mirrors the resolution order in :func:`ai_setup.run_ai_setup_inline`:
-    saved config → cloud provider env vars (including the
-    ``GEMINI_API_KEY`` alias for ``GOOGLE_API_KEY``) → ``OLLAMA_HOST``.
+    saved config → the key variables of exactly one
+    provider (``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``, ``GEMINI_API_KEY`` /
+    ``GOOGLE_API_KEY``, or ``OLLAMA_HOST``), or of several when exactly one
+    provider has a keyring key, which setup then uses. ``GITHUB_API_KEY`` does
+    not count.
     Used to decide whether the post-init handoff should offer to set AI
     up before launching forge.
     """
     try:
-        from .ai_setup import PROVIDER_ENV_VARS, _load_ai_config
+        from .ai_setup import _load_ai_config
     except Exception:  # pragma: no cover — import guard for partial installs
         return False
+
+    from fluid_build.llm.provider_resolve import (
+        _infer_provider_from_explicit_keys,
+        _infer_provider_from_keyring,
+        ambiguous_keys_message,
+    )
 
     saved = _load_ai_config()
     if saved and saved.get("provider"):
         return True
 
-    for env_var in PROVIDER_ENV_VARS.values():
-        if os.environ.get(env_var):
-            return True
-
-    # ``GEMINI_API_KEY`` is the user-facing alias for ``GOOGLE_API_KEY``
-    # accepted by the copilot provider resolver — keep the post-init
-    # handoff in sync so a user who pastes that env var doesn't get
-    # asked to "set up AI" again.
-    if os.environ.get("GEMINI_API_KEY"):
+    if _infer_provider_from_explicit_keys(os.environ):
         return True
-
-    return bool(os.environ.get("OLLAMA_HOST"))
+    # Keys for several providers: setup goes on with the one keyring key, if any.
+    return bool(ambiguous_keys_message(os.environ) and _infer_provider_from_keyring())
 
 
 def _offer_first_forge(args, logger: logging.Logger) -> None:

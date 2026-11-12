@@ -1,11 +1,15 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""Provider selection: key variables for two or more providers stop the run.
+"""Provider selection: setup reads the ladder's key variables; ambiguous keys stop.
 
 1. Key variables for two or more providers fell through to a running Ollama,
    which then answered in their place. Founder decision (2026-11-12): stop and
    name the keys. The saved choice and one keyring key still come first.
+2. Inline setup inferred ``github`` from ``GITHUB_API_KEY``, and then failed to
+   build it, though ``PROVIDER_ENV_VARS`` says github is used only when named.
+   Setup and ``fluid ai test`` now read the key variables a run without a TTY
+   reads, and treat keys for two or more providers as that run does.
 
 Hermetic: the keyring, the Ollama probe, the saved ``fluid ai setup`` choice,
 HOME and PATH are patched, so nothing reads the real ``~/.fluid``, finds an
@@ -14,21 +18,25 @@ agent CLI, or dials a daemon.
 
 from __future__ import annotations
 
+import io
+import os
 import sys
+from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Iterator, Optional
+from typing import Dict, Iterator, Optional, Tuple
 
 import pytest
 
 import fluid_build.llm.providers as providers
-from fluid_build.llm.providers import CopilotGenerationError
+from fluid_build.llm.providers import CopilotGenerationError, LlmConfig
 
 pytestmark = pytest.mark.unit
 
 OPENAI_KEY = "openai-env-key-test-0001"  # pragma: allowlist secret
 ANTHROPIC_KEY = "anthropic-env-key-test-0002"  # pragma: allowlist secret
 GEMINI_KEY = "gemini-env-key-test-0003"  # pragma: allowlist secret
+GITHUB_KEY = "github-env-key-test-0004"  # pragma: allowlist secret
 
 
 _VARS = (
@@ -196,3 +204,136 @@ def test_a_named_provider_is_unaffected(world: _World) -> None:
     config = providers.resolve_llm_config(_args(llm_provider="anthropic"), world.env(**_TWO_KEYS))
 
     assert (config.provider, config.api_key) == ("anthropic", ANTHROPIC_KEY)
+
+
+# ── 2. inline setup and fluid ai test read the ladder's key variables ───────
+
+
+def test_setup_does_not_pick_github_from_its_key(world: _World) -> None:
+    # It used to pick github here, then raise KeyError: 'github' building it.
+    from fluid_build.cli.ai_setup import run_ai_setup_inline
+
+    world.monkeypatch.setenv("GITHUB_API_KEY", GITHUB_KEY)
+
+    assert run_ai_setup_inline(None) is None
+
+
+def test_setup_still_reads_one_provider_s_key(world: _World) -> None:
+    from fluid_build.cli.ai_setup import run_ai_setup_inline
+
+    world.monkeypatch.setenv("GITHUB_API_KEY", GITHUB_KEY)
+    world.monkeypatch.setenv("ANTHROPIC_API_KEY", ANTHROPIC_KEY)
+
+    config = run_ai_setup_inline(None)
+
+    assert (config.provider, config.api_key) == ("anthropic", ANTHROPIC_KEY)
+
+
+def test_setup_reads_the_gemini_alias_like_the_resolver(world: _World) -> None:
+    from fluid_build.cli.ai_setup import run_ai_setup_inline
+
+    world.monkeypatch.setenv("GEMINI_API_KEY", GEMINI_KEY)
+
+    config = run_ai_setup_inline(None)
+
+    assert (config.provider, config.api_key) == ("gemini", GEMINI_KEY)
+
+
+def test_init_does_not_count_github_s_key_as_ai_configured(world: _World) -> None:
+    from fluid_build.cli.init import _is_ai_configured
+
+    world.monkeypatch.setenv("GITHUB_API_KEY", GITHUB_KEY)
+
+    assert _is_ai_configured() is False
+
+
+def test_interactive_setup_names_two_keys_and_picks_neither(world: _World) -> None:
+    from rich.console import Console
+
+    from fluid_build.cli.ai_setup import run_ai_setup_inline
+
+    for name, value in _TWO_KEYS.items():
+        world.monkeypatch.setenv(name, value)
+    out = io.StringIO()
+
+    assert run_ai_setup_inline(Console(file=out, width=250)) is None
+    assert "OPENAI_API_KEY, ANTHROPIC_API_KEY are all set" in out.getvalue()
+
+
+def test_setup_lets_one_keyring_key_break_the_tie_as_the_ladder_does(world: _World) -> None:
+    # Without a TTY the one keyring key selects gemini; setup must agree.
+    from fluid_build.cli.ai_setup import run_ai_setup_inline
+
+    for name, value in _TWO_KEYS.items():
+        world.monkeypatch.setenv(name, value)
+    world.keyring["gemini"] = GEMINI_KEY
+
+    config = run_ai_setup_inline(None)
+
+    assert (config.provider, config.api_key) == ("gemini", GEMINI_KEY)
+    assert providers.check_llm_readiness(dict(os.environ)).provider == "gemini"
+
+
+def test_init_s_check_agrees_with_setup_on_two_keys(world: _World) -> None:
+    from fluid_build.cli.init import _is_ai_configured
+
+    for name, value in _TWO_KEYS.items():
+        world.monkeypatch.setenv(name, value)
+
+    assert _is_ai_configured() is False  # setup would stop
+    world.keyring["gemini"] = GEMINI_KEY
+    assert _is_ai_configured() is True  # setup would use gemini
+
+
+def _ai_test(**flags: object) -> Tuple[Optional[LlmConfig], Optional[str]]:
+    from fluid_build.cli.ai_setup import _resolve_ai_test_config
+
+    values = {
+        "llm_provider": None,
+        "llm_model": None,
+        "llm_endpoint": None,
+        "llm_timeout_seconds": None,
+    }
+    values.update(flags)
+    return _resolve_ai_test_config(Namespace(**values))
+
+
+def test_ai_test_does_not_pick_github_from_its_key(world: _World) -> None:
+    world.monkeypatch.setenv("GITHUB_API_KEY", GITHUB_KEY)
+
+    config, error = _ai_test()
+
+    assert config is None
+    assert "github" not in error.lower()
+
+
+def test_ai_test_names_two_keys_and_tests_neither(world: _World) -> None:
+    for name, value in _TWO_KEYS.items():
+        world.monkeypatch.setenv(name, value)
+
+    config, error = _ai_test()
+
+    assert config is None
+    assert "OPENAI_API_KEY, ANTHROPIC_API_KEY are all set" in error
+
+
+def test_ai_test_still_tests_the_saved_choice_over_two_keys(world: _World) -> None:
+    world.saved = {"provider": "anthropic", "model": "claude-saved-test"}
+    for name, value in _TWO_KEYS.items():
+        world.monkeypatch.setenv(name, value)
+
+    config, error = _ai_test()
+
+    assert error is None
+    assert config.provider == "anthropic"
+
+
+def test_ai_test_lets_one_keyring_key_break_the_tie(world: _World) -> None:
+    for name, value in _TWO_KEYS.items():
+        world.monkeypatch.setenv(name, value)
+    world.keyring["gemini"] = GEMINI_KEY
+
+    config, error = _ai_test()
+
+    assert error is None
+    assert (config.provider, config.api_key) == ("gemini", GEMINI_KEY)

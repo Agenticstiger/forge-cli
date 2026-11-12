@@ -340,7 +340,16 @@ class TestWiring:
         monkeypatch.setattr(ai_setup, "_ai_setup_skipped", False, raising=False)
         monkeypatch.setattr(ai_setup, "_load_ai_config", lambda: None)
         monkeypatch.setattr(ai_setup, "PROVIDER_ENV_VARS", {}, raising=False)
-        monkeypatch.delenv("OLLAMA_HOST", raising=False)
+        # Setup reads the key variables a run without a TTY reads, from the
+        # environment, so no key one may be set (nor a key an earlier test left).
+        for var in (
+            "OLLAMA_HOST",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ):
+            monkeypatch.delenv(var, raising=False)
         monkeypatch.setattr(ai_setup, "detect_ollama_available", lambda env: False)
         monkeypatch.setattr(ai_setup.shutil, "which", lambda b: None)
         monkeypatch.setattr(ai_setup.sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
