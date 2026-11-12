@@ -100,6 +100,29 @@ def _get_litellm() -> Any:
                 "(installs the litellm version this Python supports)"
             ],
         ) from exc
+    return quiet_litellm(litellm)
+
+
+def quiet_litellm(litellm: Any) -> Any:
+    """Turn off what litellm prints to stdout by itself, and return the module.
+
+    On a failed call litellm prints a "Give Feedback / Get Help" banner (and,
+    for a model it cannot route, a "Provider List" link) with ``print``, which
+    puts text ahead of ``fluid ai test --json``'s report and in ``fluid forge
+    --agent``'s event stream. ``suppress_debug_info`` is litellm's own switch for
+    it, the one its Router and proxy set for the same reason (BerriAI/litellm
+    issue 5942). No error detail is lost: the failure still arrives as the
+    exception, which forge reports, and the provider-list link is in its text.
+    What goes is litellm's request for bug reports and its debug-mode hint.
+
+    Every forge call into ``litellm.completion`` loads litellm here, in
+    ``ai_setup._validate_api_key``, in the agent loop's tool call or in the
+    agent loop's summarizer, and each calls this, so whichever runs first sets
+    it. The fallback router (``fluid_build.llm.router``) builds a
+    ``litellm.Router``, which sets it too. The cost and token-budget helpers
+    only read litellm's tables, after an AI call has loaded it here.
+    """
+    litellm.suppress_debug_info = True
     return litellm
 
 

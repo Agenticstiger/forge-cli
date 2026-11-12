@@ -1200,6 +1200,20 @@ def _scope_from_args(arguments: Dict[str, Any]) -> Any:
     return CatalogScope.model_validate(flat)
 
 
+def _log_forge_errors(events: List[Dict[str, Any]], logger: logging.Logger) -> None:
+    """Write each ``forge.error`` event of an in-process run to the server's log.
+
+    ``_run_forge_inproc`` discards forge's console output, and forge marks its own
+    record of a typed failure as shown on that console, so the server's console
+    handler drops it. Without this line a failed ``forge_run`` leaves the server
+    log empty, though the tool errors' "see server logs" points there.
+    """
+    for event in events:
+        if event["event"] == "forge.error":
+            # ``%r``: a newline in the message stays one log line, not a forged second.
+            logger.warning("forge_run failed: %s: %r", event.get("code"), event.get("message"))
+
+
 def _run_forge_inproc(
     mode: str,
     target_dir: str,
@@ -1283,6 +1297,8 @@ def _run_forge_inproc(
             continue
         if isinstance(obj, dict) and isinstance(obj.get("event"), str):
             events.append(obj)
+
+    _log_forge_errors(events, forge_logger)
 
     contract_path = Path(target_dir) / "contract.fluid.yaml"
     return {

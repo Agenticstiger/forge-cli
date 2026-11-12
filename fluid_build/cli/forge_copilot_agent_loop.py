@@ -643,6 +643,9 @@ def _call_litellm_with_tools(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     import litellm
 
+    from fluid_build.llm.litellm_backend import quiet_litellm
+
+    quiet_litellm(litellm)
     payload = dict(payload)
     payload["tools"] = _to_openai_tool_shape(list(payload.get("tools") or []))
     response = litellm.completion(_skip_mcp_handler=True, **payload)

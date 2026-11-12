@@ -350,3 +350,242 @@ class TestAiCopilotModeErrorParity:
         result = run_ai_copilot_mode(self._args(), logger, **self._kwargs(copilot_class, console))
         assert result == 130
         logger.info.assert_any_call("AI Copilot cancelled by user")
+
+
+# ── a failure is logged once, noted for --agent, described as data ────
+
+
+def _raised(exc: Exception) -> Exception:
+    """*exc* with a traceback, as a handler meets it."""
+    try:
+        raise exc
+    except Exception as caught:  # noqa: BLE001
+        return caught
+
+
+def _fail(exc: Exception) -> None:
+    """Raise *exc*; called inside a ``with`` so the code after the block stays reachable."""
+    raise exc
+
+
+def _handled(logger: logging.Logger, label: str, exc: Exception, **kwargs) -> None:
+    """Call ``log_forge_failure`` from the ``except`` block, as handlers do."""
+    from fluid_build.cli._forge_mode_errors import log_forge_failure
+
+    try:
+        raise exc
+    except Exception as caught:  # noqa: BLE001
+        log_forge_failure(logger, label, caught, **kwargs)
+
+
+class TestLogForgeFailure:
+    @pytest.fixture(autouse=True)
+    def _forget_the_note(self):
+        """Drop what a test noted, and the traceback frames it holds, after the test."""
+        from fluid_build.cli._forge_mode_errors import take_forge_failure
+
+        yield
+        take_forge_failure()
+
+    def test_a_fluid_error_has_no_traceback_above_debug(self, caplog):
+        logger = logging.getLogger("test.forge.failure")
+        exc = CopilotGenerationError("copilot_no_llm_provider", "No LLM provider configured.")
+        with caplog.at_level(logging.DEBUG, logger=logger.name):
+            _handled(logger, "AI Copilot minimal flow failed", exc)
+
+        error, debug = caplog.records
+        assert (error.levelno, error.getMessage()) == (
+            logging.ERROR,
+            "AI Copilot minimal flow failed: copilot_no_llm_provider",
+        )
+        assert error.exc_info is None
+        # The caller prints the message; the record is for --log-file only.
+        assert error.fluid_console_shown is True
+        assert debug.levelno == logging.DEBUG and debug.exc_info[1] is exc
+
+    def test_a_fluid_error_nobody_printed_stays_on_the_console(self, caplog):
+        logger = logging.getLogger("test.forge.failure")
+        exc = CopilotGenerationError("copilot_x", "x")
+        with caplog.at_level(logging.DEBUG, logger=logger.name):
+            _handled(logger, "Agent loop failed", exc, shown=False)
+        assert caplog.records[0].fluid_console_shown is False
+
+    def test_a_crash_keeps_its_traceback(self, caplog):
+        logger = logging.getLogger("test.forge.failure")
+        with caplog.at_level(logging.DEBUG, logger=logger.name):
+            _handled(logger, "AI Copilot minimal flow crashed", KeyError("boom"))
+
+        (record,) = caplog.records
+        assert record.levelno == logging.ERROR
+        assert isinstance(record.exc_info[1], KeyError)
+
+    def test_the_failure_is_noted_for_the_run(self):
+        from fluid_build.cli._forge_mode_errors import take_forge_failure
+
+        exc = ValueError("boom")
+        _handled(MagicMock(), "X failed", exc)
+        assert take_forge_failure() is exc
+        assert take_forge_failure() is None  # read once
+
+    def test_the_boundary_logs_a_fluid_error_without_a_traceback(self):
+        from fluid_build.cli._forge_mode_errors import take_forge_failure
+
+        logger = MagicMock()
+        exc = CopilotGenerationError("internal_error_code", "friendly message")
+
+        with forge_mode_error_boundary(
+            logger, MagicMock(), fail_label="X failed", render_error=lambda c, e: None
+        ) as boundary:
+            _fail(exc)
+
+        assert boundary.exit_code == 1
+        logger.exception.assert_not_called()
+        logger.error.assert_called_once_with(
+            "%s: %s", "X failed", "internal_error_code", extra={"fluid_console_shown": True}
+        )
+        assert take_forge_failure() is exc
+
+
+class TestDescribeForgeFailure:
+    def _describe(self, exc):
+        from fluid_build.cli._forge_mode_errors import describe_forge_failure
+
+        return describe_forge_failure(_raised(exc))
+
+    def test_a_copilot_error_carries_its_code_message_and_next_steps(self):
+        fields = self._describe(
+            CopilotGenerationError("copilot_no_llm_provider", "No provider.", suggestions=["a"])
+        )
+        assert fields["code"] == "copilot_no_llm_provider"
+        assert fields["message"] == "No provider."
+        assert fields["suggestions"] == ["a"]
+        assert fields["docs_url"].startswith("https://")
+        assert "exception" not in fields
+
+    def test_a_missing_extra_names_its_install_line(self):
+        from fluid_build._optional import MissingOptionalDependency
+
+        fields = self._describe(MissingOptionalDependency("mcp", "mcp", "fluid mcp serve"))
+        assert fields == {
+            "code": "mcp_sdk_unavailable",
+            "message": "fluid mcp serve needs mcp, which is not installed.",
+            "suggestions": ["pip install 'data-product-forge[mcp]'"],
+        }
+
+    def test_a_fluid_error_gets_a_snake_case_code(self):
+        from fluid_build.errors import ConfigurationError
+
+        fields = self._describe(ConfigurationError("bad config", suggestions=["fix it"]))
+        assert (fields["code"], fields["message"], fields["suggestions"]) == (
+            "configuration_error",
+            "bad config",
+            ["fix it"],
+        )
+
+    def test_a_typed_user_error_maps_what_fix_and_doc(self):
+        from fluid_build._errors import FluidUserError
+
+        fields = self._describe(
+            FluidUserError(what="w", why="y", fix="f", doc="https://d", code="ERR_X")
+        )
+        assert fields == {
+            "code": "ERR_X",
+            "message": "w",
+            "suggestions": ["f"],
+            "docs_url": "https://d",
+        }
+
+    def test_a_crash_is_named_by_its_class_never_its_text(self):
+        fields = self._describe(OSError("/home/alice/.ssh/id_rsa: permission denied"))
+        assert fields["code"] == "forge_unexpected_error"
+        assert fields["exception"] == "OSError"
+        assert "alice" not in repr(fields)
+
+    def test_secrets_in_the_text_are_redacted(self):
+        leaked = "ghp_" + "a" * 36  # pragma: allowlist secret
+        fields = self._describe(
+            CopilotGenerationError("c", f"token {leaked} refused", suggestions=[f"drop {leaked}"])
+        )
+        assert leaked not in repr(fields)
+
+
+# ── the handlers that swallow a failure note it ───────────────────────
+
+
+class TestHandlersNoteTheirFailure:
+    def test_the_agent_loop_notes_a_typed_failure_without_a_traceback(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        from fluid_build.cli._forge_mode_errors import take_forge_failure
+        from fluid_build.cli._template_mode import _create_project_agent_loop
+
+        error = CopilotGenerationError("copilot_no_llm_provider", "No LLM provider configured.")
+
+        def _resolve(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(
+            "fluid_build.cli.forge_copilot_llm_providers.resolve_llm_config", _resolve
+        )
+        logger = logging.getLogger("test.forge.agent_loop")
+        with caplog.at_level(logging.DEBUG, logger=logger.name):
+            ok = _create_project_agent_loop(
+                target_dir=tmp_path,
+                context={},
+                copilot_options={},
+                copilot=None,
+                dry_run=False,
+                logger=logger,
+                console=None,
+            )
+
+        assert ok is False
+        assert take_forge_failure() is error
+        assert not [r for r in caplog.records if r.exc_info and r.levelno > logging.DEBUG]
+        # Nothing printed it (no console), so its log line stays on the console.
+        assert caplog.records[0].fluid_console_shown is False
+
+    @pytest.mark.parametrize(
+        "exc",
+        [CopilotGenerationError("copilot_x", "typed"), OSError("disk full")],
+        ids=["typed", "crash"],
+    )
+    def test_template_mode_notes_its_failure(self, exc):
+        from fluid_build.cli._forge_mode_errors import take_forge_failure
+        from fluid_build.cli._template_mode import run_template_mode
+
+        def _target(args, default_name):
+            raise exc
+
+        args = argparse.Namespace(non_interactive=True, template="starter", provider=None)
+        rc = run_template_mode(
+            args, MagicMock(), get_target_directory_fn=_target, console_factory=None
+        )
+
+        assert rc == 1
+        assert take_forge_failure() is exc
+
+
+def test_forge_prints_a_typed_user_errors_fix(tmp_path, capsys, monkeypatch):
+    """``_run_main`` prints what the ``--agent`` event carries, a FluidUserError's fix too."""
+    from fluid_build._errors import FluidUserError
+    from fluid_build.cli import forge as forge_mod
+
+    def _fail(args, logger):
+        raise FluidUserError(what="The target is locked.", why="w", fix="Unlock it first.", doc="")
+
+    monkeypatch.chdir(tmp_path)
+    for var in ("FLUID_FORGE_NO_PICKER", "FLUID_FORGE_NO_WELCOME", "FLUID_FORGE_NO_PREVIEW"):
+        monkeypatch.setenv(var, "1")
+    monkeypatch.setattr(forge_mod, "run_ai_copilot_mode", _fail)
+    parser = argparse.ArgumentParser()
+    forge_mod.register(parser.add_subparsers())
+    args = parser.parse_args(
+        ["forge", "--non-interactive", "--llm-provider", "openai", "-d", str(tmp_path / "p")]
+    )
+
+    assert forge_mod.run(args, logging.getLogger("test")) == 1
+
+    printed = capsys.readouterr()
+    assert "Forge failed: The target is locked." in printed.out
+    assert "Unlock it first." in printed.out
