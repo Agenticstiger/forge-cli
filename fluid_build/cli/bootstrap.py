@@ -648,6 +648,11 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
         "publish", "publish", (_cmd("publish", "Publish data products to enterprise catalogs"),)
     ),
     CoreCommand(
+        "genie",
+        "genie",
+        (_cmd("genie", "Databricks Genie space over several data products (apply · remove)"),),
+    ),
+    CoreCommand(
         "bundle",
         "bundle",
         (_cmd("bundle", "Resolve $ref pointers and emit a single bundled contract"),),

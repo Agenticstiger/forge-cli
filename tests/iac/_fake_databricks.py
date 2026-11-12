@@ -965,6 +965,8 @@ class _Client:
 # ``create-genie-agent.md``: ids of 32 lowercase hex characters, id-keyed lists sorted by id,
 # tables by identifier, text fields arrays of strings).
 _GENIE_TEXT_FIELDS = ("question", "content", "description", "sql", "synonyms")
+#: The relationship types a join's ``--rt=FROM_RELATIONSHIP_TYPE_<type>--`` tag may name.
+_GENIE_RELATIONSHIPS = ("ONE_TO_ONE", "ONE_TO_MANY", "MANY_TO_ONE", "MANY_TO_MANY")
 
 
 def _genie_order_problem(items: List[Any], path: str) -> Optional[str]:
@@ -1703,6 +1705,19 @@ class FakeDatabricks:
             return "ids must be unique"
         if len((doc.get("instructions") or {}).get("text_instructions") or []) > 1:
             return "At most 1 text instruction is allowed"
+        # Both measured on a live workspace (2026-11-12): a relationship tag the service does
+        # not know, and a 51st table. A join's tables and its unqualified columns are not
+        # checked when a space is made.
+        for spec in (doc.get("instructions") or {}).get("join_specs") or []:
+            for part in spec.get("sql") or []:
+                tag = re.fullmatch(r"--rt=FROM_RELATIONSHIP_TYPE_([A-Za-z_]+)--", str(part))
+                if tag and tag.group(1) not in _GENIE_RELATIONSHIPS:
+                    return (
+                        f"Failed to parse export proto: FROM_RELATIONSHIP_TYPE_{tag.group(1)} "
+                        "(of class java.lang.String)"
+                    )
+        if len((doc.get("data_sources") or {}).get("tables") or []) > 50:
+            return "A space can have at most 50 tables."
         for source in (doc.get("data_sources") or {}).get("tables") or []:
             if source.get("identifier") not in {**self.tables, **self.metric_views}:
                 return f"Table {source.get('identifier')!r} does not exist"
