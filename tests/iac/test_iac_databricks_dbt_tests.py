@@ -368,6 +368,74 @@ class TestRefusals:
         assert not compiled.refusals, _kinds(compiled)
         assert compiled.jobs[0].tests
 
+    def test_a_sibling_output_without_rules_needs_no_model(self, tmp_path):
+        # Only the exposes with rules are tested, so only their models are looked for.
+        _project(tmp_path)
+        contract = _contract()
+        sibling = copy.deepcopy(contract["exposes"][0])
+        sibling.update(exposeId="extra")
+        sibling["binding"]["location"]["table"] = "extra"
+        sibling["contract"]["dq"] = {"rules": []}
+        contract["exposes"].append(sibling)
+        contract["builds"][0]["outputs"] = ["orders", "extra"]
+        compiled = _compile(contract, tmp_path)
+        assert not compiled.refusals, _kinds(compiled)
+        assert all(
+            p.startswith("tests/fluid_dq/orders/") for p in _uploaded(compiled) if "fluid_dq" in p
+        )
+
+    def test_each_table_of_a_build_without_outputs_is_tested_through_its_own_model(self, tmp_path):
+        files = {
+            "models/orders.sql": "select 1\n",
+            "models/extra.sql": "select 1\n",
+            "models/sources.yml": SOURCES,
+        }
+        _project(tmp_path, files=files)
+        contract = _contract(rules=[])
+        extra = copy.deepcopy(contract["exposes"][0])
+        extra.update(exposeId="extra")
+        extra["binding"]["location"]["table"] = "extra"
+        extra["contract"]["dq"] = {
+            "rules": [
+                {"id": "extra_id", "type": "uniqueness", "selector": "id", "severity": "error"}
+            ]
+        }
+        contract["exposes"].append(extra)
+        del contract["builds"][0]["outputs"]  # writes every expose
+        compiled = _compile(contract, tmp_path)
+        assert not compiled.refusals, _kinds(compiled)
+        assert "tests/fluid_dq/extra/extra_id.sql" in _uploaded(compiled)
+
+    def test_a_user_test_of_that_name_under_fluid_dq_is_refused_too(self, tmp_path):
+        _project(
+            tmp_path,
+            files={
+                "models/orders.sql": "select 1\n",
+                "models/sources.yml": SOURCES,
+                "tests/fluid_dq/legacy/orders_schema.sql": "select 1 where false\n",
+            },
+        )
+        self._refused(tmp_path, _contract(), "name")
+
+    def test_a_project_yaml_too_deep_to_read_is_passed_over(self, tmp_path):
+        files = {
+            "models/orders.sql": "select 1\n",
+            "models/sources.yml": SOURCES,
+            "models/deep.yml": "x: " + "[" * 5000 + "]" * 5000 + "\n",
+        }
+        _project(tmp_path, files=files)
+        compiled = _compile(_contract(), tmp_path)
+        assert not compiled.refusals, _kinds(compiled)
+
+    def test_validate_defers_a_model_named_by_an_env_placeholder(self, tmp_path):
+        # fluid validate reads the contract before {{ env.* }} is substituted.
+        _project(tmp_path)
+        contract = _contract()
+        contract["exposes"][0]["binding"]["location"]["table"] = "{{ env.ORDERS_TABLE }}"
+        del contract["builds"][0]["properties"]
+        compiled = _compile(contract, tmp_path, validating=True)
+        assert "databricks-job-dq-model" not in _kinds(compiled), _kinds(compiled)
+
     def test_an_empty_test_paths_is_refused(self, tmp_path):
         _project(tmp_path, config="test-paths: []\n")
         self._refused(tmp_path, _contract(), "test-path")
@@ -512,6 +580,19 @@ class TestRendering:
         sql, _, _ = _render(dq.render(check, "orders"), [_Column("id", "bigint")])
         assert "where 1 = 0" in sql
 
+    def test_a_decimal_without_scale_expects_the_scale_databricks_reports(self):
+        check = _check("schema", column=None, columns=(("amount", "decimal(12)"),))
+        sql, _, _ = _render(dq.render(check, "orders"), [_Column("amount", "decimal(12,0)")])
+        assert "where 1 = 0" in sql, sql
+
+    def test_a_character_outside_the_bmp_reaches_dbt_whole(self):
+        # ensure_ascii wrote it as a surrogate pair, which dbt could not encode.
+        text = dq.render(_check("accepted_values", rule_id="r😀", values=("NEW😀",)), "orders")
+        _, configs, calls = _render(text)
+        assert configs["meta"]["fluid_rule_id"] == "r😀"
+        assert calls[0][2][2] == ["'NEW😀'"]
+        text.encode("utf-8")
+
     def test_a_type_the_warehouse_reports_cannot_break_out_of_its_literal(self):
         check = _check("schema", column=None, columns=(("id", "bigint"),))
         sql, _, _ = _render(dq.render(check, "orders"), [_Column("id", "x' or '1'='1\\")])
@@ -612,3 +693,14 @@ def test_dbt_parses_the_upload_and_selects_every_rules_test(tmp_path):
     )
     assert listed.returncode == 0, listed.stdout + listed.stderr
     assert set(listed.stdout.split()) == set(compiled.jobs[0].tests)
+
+
+def test_the_keys_task_runs_once_dbt_has_ended_whatever_its_outcome():
+    # A failing error-severity rule fails dbt after CREATE OR REPLACE dropped the table's
+    # keys; the fluid_keys task (main's #860) must still declare them again.
+    from fluid_build.iac.providers import databricks_jobs as jobs
+
+    item = jobs._Build({"id": "transform"}, "transform", "builds[0]", "sales.orders", WAREHOUSE)
+    task = jobs._keys_task(item)
+    assert task["depends_on"] == [{"task_key": jobs.DBT_TASK_KEY}]
+    assert task["run_if"] == "ALL_DONE"

@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+from ...util.binding_paths import ENV_PLACEHOLDER_RE
 from ...util.contract import builds_writing_expose
 from ...util.dq_checks import DqCheck, describe, has_rules, read_rules
 from ..base import UnsupportedBindingError
@@ -138,9 +139,17 @@ def compile_tests(
     if git or files is None or out.refusals:
         return out
     project = _Project(files)
+    checked = {check.expose_id for check in rules.checks}
+    single = len(tables) == 1
     models = {
-        table.expose_id: _model(build, table, project, where, out.refusals) for table in tables
+        _expose_key(table): _model(build, table, project, where, out.refusals, single=single)
+        for table in tables
+        if _expose_key(table) in checked
     }
+    if any(model == _DEFERRED for model in models.values()):
+        # ``fluid validate`` reads the contract before ``{{ env.* }}`` is substituted: the
+        # model is named only then, and the apply, which substitutes first, writes the tests.
+        return out
     folder = _test_folder(project, where, out.refusals)
     if folder is None or out.refusals:
         return out
@@ -149,6 +158,15 @@ def compile_tests(
     if out.refusals:
         out.files, out.tests = [], []
     return out
+
+
+#: What :func:`_model` answers for a model name that is still an ``{{ env.* }}`` placeholder.
+_DEFERRED = "\0deferred"
+
+
+def _expose_key(table: Any) -> str:
+    """The key :func:`read_rules` gives a table's checks (``DqCheck.expose_id``)."""
+    return str(table.exposure.get("exposeId") or "")
 
 
 class _Project:
@@ -168,9 +186,7 @@ class _Project:
         return {
             PurePosixPath(rel).stem: rel
             for rel in sorted(self.present)
-            if rel.endswith(".sql")
-            and any(rel.startswith(f"{path}/") for path in self.test_paths)
-            and f"/{TEST_DIR}/" not in f"/{rel}"
+            if rel.endswith(".sql") and any(rel.startswith(f"{path}/") for path in self.test_paths)
         }
 
     @property
@@ -226,7 +242,7 @@ def _add_test(
         return
     path = str(folder / model / f"{check.name}.sql")
     taken = project.singular_tests().get(check.name)
-    if taken is not None:
+    if taken is not None and taken != path:
         out.refusals.append(
             _refusal(
                 "name",
@@ -281,7 +297,7 @@ def _project_paths(files: Sequence[Tuple[str, bytes]]) -> Dict[str, List[str]]:
         if rel == "dbt_project.yml":
             try:
                 config = yaml.safe_load(data.decode("utf-8")) or {}
-            except (UnicodeDecodeError, yaml.YAMLError):
+            except (UnicodeDecodeError, RecursionError, yaml.YAMLError):
                 config = {}
     config = config if isinstance(config, Mapping) else {}
     out: Dict[str, List[str]] = {"name": [str(config.get("name") or "")]}
@@ -298,6 +314,8 @@ def _model(
     project: _Project,
     where: str,
     refusals: List[UnsupportedBindingError],
+    *,
+    single: bool = True,
 ) -> Optional[str]:
     """The dbt model that writes ``table``: the build's ``properties.model`` when it writes one
     output (as ``build_selectors`` selects it), else the model named after the table. Refused
@@ -307,7 +325,11 @@ def _model(
     props = build.get("properties") if isinstance(build.get("properties"), Mapping) else {}
     outputs = build.get("outputs") if isinstance(build.get("outputs"), list) else []
     named = props.get("model")
-    model = str(named) if named and len(outputs) <= 1 else str(table.name)
+    # ``properties.model`` names the model of the one table a build writes; a build that
+    # writes several (no ``outputs`` writes every expose) writes each through its own model.
+    model = str(named) if named and len(outputs) <= 1 and single else str(table.name)
+    if ENV_PLACEHOLDER_RE.search(model):
+        return _DEFERRED
     files = sorted(
         rel
         for rel in project.present
@@ -369,7 +391,7 @@ def _properties_docs(files: Sequence[Tuple[str, bytes]]) -> Iterator[Mapping[str
             continue
         try:
             doc = yaml.safe_load(data.decode("utf-8"))
-        except (UnicodeDecodeError, yaml.YAMLError):
+        except (UnicodeDecodeError, RecursionError, yaml.YAMLError):
             continue
         if isinstance(doc, Mapping):
             yield doc
@@ -437,8 +459,10 @@ def _exposes(tables: Sequence[Any]) -> str:
 def _jinja_str(text: str) -> str:
     """``text`` as a Jinja string literal holding no ``{``, ``}``, ``%`` or ``#``: JSON, whose
     escapes Jinja's string literals decode, with those four escaped too, so no value can open
-    or close a Jinja block or comment."""
-    encoded = json.dumps(text, ensure_ascii=True)
+    or close a Jinja block or comment. Other characters stay as they are: ``ensure_ascii``
+    would write an emoji as a surrogate pair, which Jinja decodes into two lone surrogates
+    that dbt cannot encode (the whole project's parse fails on one in a rule id)."""
+    encoded = json.dumps(text, ensure_ascii=False)
     for char, escape in (("{", "\\u007b"), ("}", "\\u007d"), ("%", "\\u0025"), ("#", "\\u0023")):
         encoded = encoded.replace(char, escape)
     return encoded
@@ -456,10 +480,12 @@ def _number(value: float) -> str:
 def _databricks_type(fluid_type: str) -> str:
     """The type Databricks reports for a column the contract declares as ``fluid_type``,
     lower case, no spaces: the type table the table and the model share
-    (``engines/dbt/_types.py``), ``decimal`` at Databricks' default ``decimal(10,0)``."""
+    (``engines/dbt/_types.py``) in the table emitter's spelling (``decimal(12)`` is
+    ``decimal(12,0)``), ``decimal`` at Databricks' default ``decimal(10,0)``."""
     from ...engines.dbt._types import sql_type
+    from .databricks import _canonical_type
 
-    resolved = sql_type(fluid_type, "databricks").lower().replace(" ", "")
+    resolved = _canonical_type(sql_type(fluid_type, "databricks").lower().replace(" ", ""))
     return "decimal(10,0)" if resolved == "decimal" else resolved
 
 

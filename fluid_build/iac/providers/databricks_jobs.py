@@ -1029,11 +1029,15 @@ def _emit_job(
 
 
 def _keys_task(item: _Build) -> Dict[str, Any]:
-    """The ``fluid_keys`` task: once dbt has succeeded, the uploaded script on the same
-    warehouse."""
+    """The ``fluid_keys`` task: once dbt has ended, the uploaded script on the same warehouse.
+    ``run_if: ALL_DONE``, not the default ALL_SUCCESS: a contract rule's test of severity
+    error fails dbt after its model's CREATE OR REPLACE dropped the table's keys, and the
+    run that finds bad data must not also leave the table keyless (the script passes over a
+    key it cannot add, such as one on a table dbt did not rebuild)."""
     return {
         "task_key": REBUILD_TASK,
         "depends_on": [{"task_key": DBT_TASK_KEY}],
+        "run_if": "ALL_DONE",
         "timeout_seconds": REBUILD_TIMEOUT_SECONDS,
         "sql_task": {
             "warehouse_id": item.warehouse,
