@@ -51,9 +51,17 @@ types but not the `exposeId`, so open the upstream contract and check it yoursel
 
 ## Reading upstream data in a local build
 
-`consumes[]` is a logical reference. A local SQL build reads the upstream file through
-`builds[].properties.parameters.inputs`, which registers it as a table for the SQL.
-Always give the input a `format`; without one it is read as CSV.
+How a local SQL build reads an upstream output depends on the apply mode:
+
+- `--mode amend`, the mode the deploying-fluid-contracts-safely skill runs, never binds
+  `consumes[]`. The build reads the upstream file through
+  `builds[].properties.parameters.inputs`, which registers it as a table for the SQL. In
+  this mode an input without a `format` is read as CSV.
+- `--mode amend-and-build` registers each `consumes[]` entry that the SQL reads by its
+  `exposeId` as a view, finding the upstream contract through `fluid.workspace.yaml`. An
+  explicit input still wins.
+
+An input with a `format` works in both modes, so always write one:
 
 ```yaml
 # builds[]
