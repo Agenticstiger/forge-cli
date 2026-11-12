@@ -1415,10 +1415,8 @@ def _call(client: Any, what: str, fn: Callable[[], Any]) -> Any:
 def _remediation(status: Optional[int], what: str) -> str:
     """What to do about a failed call, by its HTTP status."""
     if status in (403, 404):
-        return (
-            f"Check that Genie (AI/BI) is enabled in the workspace and that this identity may "
-            f"{what}, then re-run fluid apply."
-        )
+        genie = "Genie (AI/BI) is enabled in the workspace and that " if "Genie" in what else ""
+        return f"Check that {genie}this identity may {what}, then re-run fluid apply."
     if status == 400:
         return "Fix what the message names, then re-run fluid apply."
     if status == 429 or (status or 0) >= 500:

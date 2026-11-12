@@ -1151,3 +1151,13 @@ def test_a_principal_the_service_keeps_in_another_case_is_not_shared_again(fake)
     Run(fake)(doc)
     assert ("user_name", "noc@towers.io") in fake.genie_acl[only_space(fake)["space_id"]]
     assert Run(fake)(doc).writes() == []
+
+
+def test_a_refused_metric_view_read_is_not_blamed_on_genie(fake):
+    fake.fail_route("GET", r"/api/2\.1/unity-catalog/tables", 403, "no USE SCHEMA")
+    with pytest.raises(genie.GenieError) as exc:
+        Run(fake)(site_contract())
+    assert exc.value.remediation == (
+        "Check that this identity may read the metric views in Unity Catalog, then re-run "
+        "fluid apply.",
+    )
