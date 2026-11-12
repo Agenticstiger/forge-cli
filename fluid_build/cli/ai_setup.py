@@ -247,7 +247,10 @@ def _validate_api_key(provider: Any, api_key: str) -> Optional[str]:
 
     from fluid_build.cli.forge_copilot_llm_litellm import (
         _LITELLM_PREFIX_BY_PROVIDER,
+        quiet_litellm,
     )
+
+    quiet_litellm(litellm)
 
     prefix = _LITELLM_PREFIX_BY_PROVIDER.get(provider.name.lower(), provider.name.lower())
     model = (

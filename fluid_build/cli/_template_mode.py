@@ -40,6 +40,7 @@ from fluid_build._console import literal_error_text
 # that this module references via ``_fm.<name>`` so test patches that
 # target ``fluid_build.cli.forge_modes.<name>`` resolve at call time.
 from fluid_build.cli import forge_modes as _fm  # noqa: E402
+from fluid_build.cli._forge_mode_errors import log_forge_failure
 from fluid_build.cli.console import cprint, success
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_copilot_llm_providers import (
@@ -151,7 +152,7 @@ def run_template_mode(
         logger.info("3. fluid validate contract.fluid.yaml")
         return 0
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Template mode failed")
+        log_forge_failure(logger, "Template mode failed", exc)
         if console:
             console.print(literal_error_text(f"❌ Template mode failed: {exc}", "red"))
         else:
@@ -273,7 +274,7 @@ def _create_project_agent_loop(
         return True
 
     except CopilotGenerationError as exc:
-        logger.exception("Agent loop failed")
+        log_forge_failure(logger, "Agent loop failed", exc, shown=console is not None)
         if console:
             try:
                 console.print(literal_error_text(exc.message, "red"))
@@ -283,27 +284,13 @@ def _create_project_agent_loop(
                 pass
         return False
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Agent loop crashed")
+        log_forge_failure(logger, "Agent loop crashed", exc, shown=console is not None)
         if console:
             try:
                 console.print(literal_error_text(f"Agent loop failed: {exc}", "red"))
             except Exception:  # noqa: BLE001
                 pass
         return False
-
-
-def _is_missing_optional(exc: BaseException) -> bool:
-    """True when *exc* is, or was caused by, a missing optional dependency."""
-    from fluid_build._optional import MissingOptionalDependency
-
-    cur: Optional[BaseException] = exc
-    for _ in range(8):
-        if cur is None:
-            return False
-        if isinstance(cur, MissingOptionalDependency):
-            return True
-        cur = cur.__cause__ or cur.__context__
-    return False
 
 
 def _emit_incomplete_forge_span(logger: logging.Logger) -> None:
@@ -1023,12 +1010,9 @@ def _create_project_minimal(
         return True
 
     except CopilotGenerationError as exc:
-        if _is_missing_optional(exc):
-            # An absent optional package is an install problem, not a crash:
-            # the message and hint are the whole story, so no traceback.
-            logger.error("AI Copilot minimal flow unavailable: %s", exc.message)
-        else:
-            logger.exception("AI Copilot minimal flow failed")
+        # The message and its suggestions, printed below, are the whole story
+        # (a missing extra's install line included): the traceback is DEBUG.
+        log_forge_failure(logger, "AI Copilot minimal flow failed", exc)
         _emit_incomplete_forge_span(logger)
         if console:
             try:
@@ -1041,7 +1025,7 @@ def _create_project_minimal(
             console_error(exc.message)
         return False
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
-        logger.exception("AI Copilot minimal flow crashed")
+        log_forge_failure(logger, "AI Copilot minimal flow crashed", exc)
         _emit_incomplete_forge_span(logger)
         if console:
             try:
