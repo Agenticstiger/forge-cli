@@ -63,13 +63,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounds it checks; `fluid apply` says so, and `fluid validate` warns about a `dq.monitoring.window`
   other than one day. A monitor turned on outside forge-cli is adopted, not created over. If
   Databricks refuses the monitor (no serverless compute, or no MANAGE on the schema), the apply
-  fails after the tables are created and names the opt-out first. Removing one (opting out, dropping
-  the SLOs, removing the expose) deletes its hidden scan job and what it has learned, never table
-  data, so it is not gated, and is printed. **Cost:** scans run on serverless compute billed as
-  `DATA_QUALITY_MONITORING`, once when monitoring is turned on and then as often as each table is
-  updated. Databricks Free Edition runs it (proven 2026-11-12), and its daily compute quota covers
-  these scans too: a workspace over the quota stops all compute for the rest of the day, so on Free
-  Edition opt out the products you do not need watched.
+  fails after the tables are created, and its suggestions say what the monitor needs and name the
+  opt-out. Removing one (opting out, dropping the SLOs, removing the expose) deletes its hidden scan
+  job and what it has learned, never table data, so it is not gated, and is printed. **Cost:** scans
+  run on serverless compute billed as `DATA_QUALITY_MONITORING`, once when monitoring is turned on
+  and then as often as each table is updated. Databricks Free Edition runs it (proven 2026-11-12).
+  Expect the scans to count against its daily compute quota (their cost was not measured): a
+  workspace over the quota stops all compute for the rest of the day, so on Free Edition opt out the
+  products you do not need watched.
 
 ### Changed
 
