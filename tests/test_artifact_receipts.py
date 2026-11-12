@@ -8,7 +8,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import textwrap
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +22,26 @@ from fluid_build.cli.artifact_receipts import (
     generate_run_id,
 )
 from fluid_build.cli.artifact_writer import ArtifactWriter
+
+#: Run by the fork test in a fresh interpreter: an id in the parent, one in a
+#: forked child, then the parent's next id, all in one millisecond.
+_FORK_SCRIPT = """
+import os, types
+from fluid_build.cli import artifact_receipts as ar
+ar.time = types.SimpleNamespace(time=lambda: 1_800_000_000.0005)
+seeds = iter([5, 9])
+ar.secrets = types.SimpleNamespace(randbits=lambda k: next(seeds))
+print(ar.generate_run_id(), flush=True)
+read_end, write_end = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.write(write_end, ar.generate_run_id().encode())
+    os._exit(0)
+os.close(write_end)
+os.waitpid(pid, 0)
+print(os.read(read_end, 64).decode())
+print(ar.generate_run_id())
+"""
 
 
 class TestGenerateRunId:
@@ -55,6 +74,10 @@ class TestGenerateRunId:
         assert len(set(ids)) == 1000
         assert ids == sorted(ids)
 
+
+class TestRunIdSequence:
+    """Order and uniqueness at the edges: the clock, a used-up suffix, a fork."""
+
     def test_ids_keep_increasing_when_the_clock_steps_back(self, monkeypatch):
         start = time.time()
         clock = iter([start, start - 1.0, start - 2.0])
@@ -84,30 +107,11 @@ class TestGenerateRunId:
         Without the at-fork reset, the child continues the parent's sequence
         and makes the same id as the parent's next one (``...-00000006``).
         """
-        script = textwrap.dedent(
-            """
-            import os, types
-            from fluid_build.cli import artifact_receipts as ar
-            ar.time = types.SimpleNamespace(time=lambda: 1_800_000_000.0005)
-            seeds = iter([5, 9])
-            ar.secrets = types.SimpleNamespace(randbits=lambda k: next(seeds))
-            print(ar.generate_run_id(), flush=True)
-            read_end, write_end = os.pipe()
-            pid = os.fork()
-            if pid == 0:
-                os.write(write_end, ar.generate_run_id().encode())
-                os._exit(0)
-            os.close(write_end)
-            os.waitpid(pid, 0)
-            print(os.read(read_end, 64).decode())
-            print(ar.generate_run_id())
-            """
-        )
         root = Path(artifact_receipts.__file__).resolve().parents[2]
         paths = [str(root), os.environ.get("PYTHONPATH", "")]
         env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in paths if p)}
         result = subprocess.run(
-            [sys.executable, "-c", script],
+            [sys.executable, "-c", _FORK_SCRIPT],
             capture_output=True,
             text=True,
             timeout=120,
