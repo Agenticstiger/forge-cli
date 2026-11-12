@@ -197,6 +197,7 @@ class TestWindowWarnings:
         expose = {**ASKS, "contract": _dq(monitoring={"window": "PT1H"})}
         (warning,) = dq.window_warnings([_T("main.iot.r", expose)])
         assert "contract.dq.monitoring.window PT1H is not applied" in warning
+        assert warning.endswith("Set it to P1D, or remove it.")
 
     @pytest.mark.parametrize(
         "expose",
@@ -297,6 +298,9 @@ class TestEmitter:
         assert "not from the contract's SLO values" in notice
         assert "DATA_QUALITY_MONITORING" in notice
         assert "system.data_quality_monitoring.table_results" in notice
+        # Catalog Explorer's own label, and the way out of the cost
+        assert "the table's Quality indicator in Catalog Explorer" in notice
+        assert notice.endswith("contract.dq.monitoring.enabled: false turns it off for an expose.")
 
     def test_validate_warns_about_a_window_it_cannot_apply(self):
         contract = _contract(
@@ -379,3 +383,39 @@ class TestEngine:
         )
         assert f"{MONITOR}.{KEY}" not in calls
         assert f"databricks_schema.{KEY}" in calls
+
+
+# ── a monitor Databricks refuses ────────────────────────────────────────────
+class TestApplyFailure:
+    @staticmethod
+    def _failed(address: str) -> TofuResult:
+        events = [
+            {
+                "diagnostic": {
+                    "severity": "error",
+                    "summary": "failed to create data_quality_monitor",
+                    "detail": "PERMISSION_DENIED: User does not have MANAGE on Schema",
+                    "address": address,
+                }
+            }
+        ]
+        return TofuResult("apply", 1, "", "", events)
+
+    def test_a_refused_monitor_names_the_opt_out_first(self):
+        err = engine._apply_failure(
+            self._failed(f"{MONITOR}.{KEY}"), "/w", IAC_PLUGINS["databricks"]
+        )
+        assert err.event == "opentofu_apply_failed"
+        assert err.context["resource"] == f"{MONITOR}.{KEY}"
+        first, second, last = err.suggestions[-3:]
+        assert first.startswith("Databricks did not turn on data quality monitoring")
+        assert "MANAGE on the schema" in first
+        assert "contract.dq.monitoring.enabled: false" in second
+        assert last.startswith("To see what exists")
+
+    @pytest.mark.parametrize("plugin", [None, IAC_PLUGINS["databricks"]])
+    def test_any_other_failure_is_reported_as_before(self, plugin):
+        address = f"databricks_sql_table.{KEY}_readings"
+        err = engine._apply_failure(self._failed(address), "/w", plugin)
+        assert not any("data quality" in hint for hint in err.suggestions)
+        assert dq.failure_hints(address) == []

@@ -316,7 +316,7 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
                 "opentofu apply raw output tail: %s",
                 _tail(apply_result.stderr or apply_result.stdout),
             )
-            raise _apply_failure(apply_result, str(workdir))
+            raise _apply_failure(apply_result, str(workdir), plugin)
         applied = runner.change_summary(apply_result)
         record(applied)
 
@@ -1630,7 +1630,7 @@ def _mentions_state_lock(text: str) -> bool:
     return "state lock" in low or "locking state" in low
 
 
-def _apply_failure(result: Any, workdir: str) -> CLIError:
+def _apply_failure(result: Any, workdir: str, plugin: Any = None) -> CLIError:
     """The error for a failed ``tofu apply``: what failed, on which resource, and the way on.
 
     ``-json`` puts every diagnostic on stdout as one JSON line, so the raw tail
@@ -1638,11 +1638,14 @@ def _apply_failure(result: Any, workdir: str) -> CLIError:
     a summary, the resource address and the provider's detail; output that holds
     none (a crash, a timeout) falls back to the first ``Error:``, else the exit
     code. Tofu records state as it goes, so what was created before the failure
-    is normally tracked and a re-run converges: the suggestions say so.
+    is normally tracked and a re-run converges: the suggestions say so. A plugin's
+    optional ``apply_failure_hints(address, detail)`` puts its own way on first, for the
+    resource that failed.
     """
     diagnostics = _diagnostics(getattr(result, "events", None))
     context: Dict[str, Any] = {}
     locked = False
+    address = detail = ""
     if diagnostics:
         first = diagnostics[0]
         # Redacted before it is cut: a credential split at the limit (a URL that lost
@@ -1668,6 +1671,9 @@ def _apply_failure(result: Any, workdir: str) -> CLIError:
         locked = _mentions_state_lock(output)
     err = CLIError(1, "opentofu_apply_failed", context)
     hints = [f"To see what exists, run 'tofu state list' in {shlex.quote(workdir)}"]
+    plugin_hints = getattr(plugin, "apply_failure_hints", None)
+    if address and callable(plugin_hints):
+        hints = list(plugin_hints(address, detail)) + hints
     if locked:
         hints.append("The state is locked: wait for the other run, or 'tofu force-unlock <id>'")
     err.suggestions = list(err.suggestions) + hints

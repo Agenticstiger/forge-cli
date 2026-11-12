@@ -7,9 +7,9 @@ Databricks data quality monitoring (formerly anomaly detection) is enabled per U
 Catalog schema. On serverless compute it scans the schema's tables for freshness (a
 commit unusually late for the table) and completeness (fewer rows in the last 24 hours
 than the table's history predicts), writes one row per table and scan to
-``system.data_quality_monitoring.table_results`` and shows the result as the health
-indicator on each table's Overview in Catalog Explorer
-(https://docs.databricks.com/aws/en/data-quality-monitoring/anomaly-detection/).
+``system.data_quality_monitoring.table_results`` and shows the result as the Quality
+indicator on each table's Overview in Catalog Explorer (the docs' "health indicator",
+https://docs.databricks.com/aws/en/data-quality-monitoring/anomaly-detection/).
 
 An expose asks for it with fields it already has, no new one: a freshness or completeness
 SLO (``qos.freshnessSLO``, ``qos.completenessTarget``, an ``observability.defaultSLIs``
@@ -157,7 +157,7 @@ def window_warnings(tables: Sequence[MonitoredTable]) -> List[str]:
         warnings.append(
             f"{table.where}: contract.dq.monitoring.window {window} is not applied. Databricks "
             "data quality monitoring counts a table's rows over the last 24 hours and judges "
-            "its freshness against the table's own commit history."
+            "its freshness against the table's own commit history. Set it to P1D, or remove it."
         )
     return warnings
 
@@ -171,19 +171,36 @@ def monitor_notices(monitors: Sequence[SchemaMonitor]) -> List[str]:
         notices.append(
             f"data quality monitoring is on for schema {monitor.full_name} (watched: "
             f"{', '.join(monitor.monitored)}{skipped}). Databricks learns each table's freshness "
-            "and completeness bounds from its history, not from the contract's SLO values, "
-            "scans on serverless compute billed as DATA_QUALITY_MONITORING, and shows the "
-            "result as the table's health indicator in Catalog Explorer. "
-            "system.data_quality_monitoring.table_results holds every scan; only account "
-            "admins can read it unless they grant SELECT."
+            "and completeness bounds from its history, not from the contract's SLO values; it "
+            "scans on serverless compute billed as DATA_QUALITY_MONITORING and shows the result "
+            "as the table's Quality indicator in Catalog Explorer. "
+            "system.data_quality_monitoring.table_results holds every scan (account admins "
+            "only, unless they grant SELECT). contract.dq.monitoring.enabled: false turns it "
+            "off for an expose."
         )
     return notices
+
+
+def failure_hints(address: str) -> List[str]:
+    """The way on when ``tofu apply`` failed creating or changing the monitor at
+    ``address``; ``[]`` for any other resource. The monitor is created after the schema's
+    tables (``depends_on``), so they exist by then."""
+    if not address.startswith(f"{RESOURCE_TYPE}."):
+        return []
+    return [
+        "Databricks did not turn on data quality monitoring for this schema (its tables were "
+        "created first). It needs a Unity Catalog workspace with serverless compute, and "
+        "MANAGE on the schema for this identity (the schema's owner has it).",
+        "Or turn it off for the expose: set contract.dq.monitoring.enabled: false, then "
+        "re-run fluid apply.",
+    ]
 
 
 __all__ = [
     "RESOURCE_TYPE",
     "MonitoredTable",
     "SchemaMonitor",
+    "failure_hints",
     "monitor_notices",
     "monitoring_request",
     "plan_monitors",

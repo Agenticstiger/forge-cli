@@ -1362,12 +1362,20 @@ class FakeDatabricks:
         key = (m.group(1), m.group(2))
         if key not in self.quality_monitors:
             return self._dqm_missing(m.group(2))
+        # update_mask semantics: each masked field is replaced by the body's value, and one
+        # the body leaves out is cleared; what the mask does not name is kept. Provider 1.140.0
+        # sends update_mask=anomaly_detection_config,data_profiling_config, the whole config.
         config = self.quality_monitors[key]["anomaly_detection_config"]
         sent = b.get("anomaly_detection_config") or {}
-        if "excluded_table_full_names" in sent:
-            config["excluded_table_full_names"] = list(sent["excluded_table_full_names"])
-        else:
-            config.pop("excluded_table_full_names", None)
+        for path in ",".join(q.get("update_mask") or []).split(","):
+            head, _, leaf = path.strip().partition(".")
+            if head != "anomaly_detection_config":
+                continue
+            for name in [leaf] if leaf else ["excluded_table_full_names"]:
+                if name in sent:
+                    config[name] = list(sent[name])
+                else:
+                    config.pop(name, None)
         return 200, self._dqm_doc(key)
 
     def _dqm_delete(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:

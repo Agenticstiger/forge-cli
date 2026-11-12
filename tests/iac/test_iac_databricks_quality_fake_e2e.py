@@ -8,8 +8,10 @@ Pinned (Stage 1: real ``tofu`` and ``databricks/databricks`` 1.140.0, the stand-
 ``_fake_databricks.py``, its data quality endpoints shaped as Free Edition answered them): an
 expose with a freshness SLO turns monitoring on for its schema, watching it by the schema's
 ``schema_id`` and excluding the product's other table there; a second plan is empty; a monitor
-someone turned on outside forge-cli is adopted, not created over; opting out deletes only the
-monitor, not gated; and OpenTofu deletes the monitor before its schema.
+someone turned on outside forge-cli is adopted, not created over; the last exclusion leaving
+clears the list and the plan converges; a monitor Databricks refuses fails the apply with the
+opt-out named, its tables kept; opting out deletes only the monitor, not gated; and OpenTofu
+deletes the monitor before its schema.
 
 Not proven here: what real Databricks scans and reports (the live Free Edition run,
 HONESTLY_TESTED.md).
@@ -18,6 +20,7 @@ HONESTLY_TESTED.md).
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterator
 
@@ -42,6 +45,7 @@ pytestmark = [
 ]
 
 CREATE = ("POST", "/api/data-quality/v1/monitors")
+_TRANSPORT = re.compile(r"broken pipe|connection reset by peer")
 
 
 @pytest.fixture
@@ -129,6 +133,34 @@ def test_a_monitor_turned_on_outside_forge_cli_is_adopted_not_created_over(works
     assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]
 
 
+def test_the_last_exclusion_leaving_clears_the_list_and_the_plan_converges(workspace, fake, capfd):
+    assert apply_contract(capfd, write_contract(workspace, _monitored()))[0] == 0
+    both = _monitored()
+    both["exposes"][1]["qos"] = {"freshnessSLO": "PT1H"}
+    path = write_contract(workspace, both)
+    fake.queries.clear()
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert "tofu plan: +0 ~1 -0" in out
+    # provider 1.140.0 replaces the whole config: the mask names it, the body has no list
+    (patch,) = [query for method, _path, query in fake.queries if method == "PATCH"]
+    assert "anomaly_detection_config" in patch
+    assert "excluded_table_full_names" not in _monitor(fake)["anomaly_detection_config"]
+    assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]
+
+
+def test_a_refused_monitor_fails_the_apply_with_the_way_out(workspace, fake, capfd):
+    fake.fail_route("POST", r"^/api/data-quality/v1/monitors$", 400, "feature not enabled")
+
+    rc, out = apply_contract(capfd, write_contract(workspace, _monitored()))
+    assert rc != 0
+    assert "Databricks did not turn on data quality monitoring for this schema" in out
+    assert "set contract.dq.monitoring.enabled: false, then re-run fluid apply" in out
+    # created first, and kept: a re-run converges
+    assert {"main.sales.orders", "main.sales.notes"} <= set(fake.tables)
+
+
 def test_opting_out_deletes_only_the_monitor_and_is_not_gated(workspace, fake, capfd):
     assert apply_contract(capfd, write_contract(workspace, _monitored()))[0] == 0
     marker = fake.tables["main.sales.orders"]["marker"]
@@ -148,6 +180,10 @@ def test_a_destroy_deletes_the_monitor_before_its_schema(workspace, fake, capfd)
     fake.requests.clear()
 
     result = runner.tofu_destroy(str(workdir))
+    if not result.ok and _TRANSPORT.search(result.stdout + result.stderr):
+        # The stand-in closes every connection (HTTP/1.0); under load the provider can
+        # write to one it closed. State keeps what went, so the order holds across runs.
+        result = runner.tofu_destroy(str(workdir))
     assert result.ok, result.stderr or result.stdout
     deletes = [path for method, path in fake.requests if method == "DELETE"]
     monitor = deletes.index(f"/api/data-quality/v1/monitors/schema/{sid}")

@@ -95,7 +95,7 @@ resources, with no new schema field (fluid-schema 0.7.6):
   excluded, ``contract.dq.monitoring.enabled: false`` to opt out
   (``databricks_quality.py``). Databricks learns each table's bounds itself: the SLO
   values pick the tables and are not thresholds the monitor checks. Its results are the
-  health indicator on the table in Catalog Explorer and
+  Quality indicator on the table in Catalog Explorer and
   ``system.data_quality_monitoring.table_results``; removing it is not gated.
 * A dbt build that runs on Databricks (``execution.runtime.platform:
   databricks``) becomes a serverless ``databricks_job`` with a ``dbt_task``, and
@@ -216,7 +216,13 @@ from .databricks_keys import (
 )
 from .databricks_keys import lookup as lookup_key_tables
 from .databricks_quality import RESOURCE_TYPE as QUALITY_MONITOR
-from .databricks_quality import SchemaMonitor, monitor_notices, plan_monitors, window_warnings
+from .databricks_quality import (
+    SchemaMonitor,
+    failure_hints,
+    monitor_notices,
+    plan_monitors,
+    window_warnings,
+)
 from .databricks_retention import Retention, check_expire
 
 _LOG = logging.getLogger(__name__)
@@ -2511,6 +2517,11 @@ class DatabricksIacPlugin:
                 "they are bound, starts its schedule; an explicit run-now works meanwhile."
             )
         return notices
+
+    def apply_failure_hints(self, address: str, detail: str = "") -> List[str]:
+        """The way on when ``tofu apply`` failed on ``address``: a data quality monitor
+        Databricks refused (``databricks_quality.failure_hints``); ``[]`` otherwise."""
+        return failure_hints(address)
 
     def explain_plan_failure(
         self,
