@@ -383,7 +383,9 @@ class TestStartAndWait:
         rc, out = _go(api, capsys)
         assert rc == 1
         assert "could not read run 77: ConnectionError: connection reset" in out
-        assert "It may still be going." in out and f"run page: {URL}" in out
+        # Cancelled, so nothing the apply started is left running.
+        assert api.writes() == ["run-now", "runs/cancel"] and "cancelled run 77" in out
+        assert f"run page: {URL}" in out
 
 
 # ── choosing what to run ────────────────────────────────────────────────────
@@ -630,3 +632,28 @@ def test_a_run_id_from_the_list_is_printed_as_a_number_only(capsys) -> None:
     rc, out = _go(api, capsys)
     assert rc == 0 and "\x1b" not in out
     assert "waiting for the workspace's limit" in out  # nothing but a number counts as a run
+
+
+def test_a_run_that_can_be_neither_read_nor_cancelled_is_said_to_go_on(capsys) -> None:
+    api = _Api(
+        [_run("RUNNING")],
+        fail={"runs/get": ConnectionError("down"), "runs/cancel": ConnectionError("down")},
+    )
+    rc, out = _go(api, capsys)
+    assert rc == 1
+    assert "could not cancel run 77" in out and "run 77 may still be going" in out
+
+
+@pytest.mark.parametrize("value", ["1h", "0", "-5", "soon"])
+def test_a_timeout_that_is_not_seconds_is_said(capsys, value) -> None:
+    api = _Api([_run("TERMINATED", code="SUCCESS")])
+    rc, out = _go(api, capsys, env={TIMEOUT_ENV: value})
+    assert rc == 0
+    assert f"{TIMEOUT_ENV}='{value}' is not a whole number of seconds above 0" in out
+    assert "waiting up to 1h00m00s" in out
+
+
+def test_a_timeout_in_seconds_is_taken_quietly(capsys) -> None:
+    api = _Api([_run("TERMINATED", code="SUCCESS")])
+    rc, out = _go(api, capsys, env={TIMEOUT_ENV: "120"})
+    assert rc == 0 and TIMEOUT_ENV not in out

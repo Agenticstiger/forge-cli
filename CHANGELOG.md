@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`fluid apply --mode amend-and-build` runs a Databricks dbt build now.** A dbt build with
+  `execution.runtime.platform: databricks` runs as the serverless job `fluid apply` provisions.
+  `amend-and-build` and `replace-and-build` now start a run of that job after provisioning
+  and wait for it. They print the run page and each state the run enters, with the reason
+  while it is queued. A failed run fails the apply with the task's error and the end of
+  dbt's output. `replace-and-build` adds `--full-refresh` for that run only. Before, the apply
+  only provisioned the job and said how to start it, so a manual job never ran.
+  - `amend` and `create-only` still only provision, and a continuous job is not started.
+  - The job's settings, schedule and pause state are never changed.
+  - `FLUID_DATABRICKS_RUN_TIMEOUT_SECONDS` caps the wait: an hour, or the job's own timeouts
+    and retries plus 15 minutes. The run is cancelled at the cap, on Ctrl-C, or when it can
+    no longer be read.
+  - A missing `databricks-sdk` (the `[databricks]` extra) is refused before anything is
+    applied.
+
 ### Fixed
 
 - **`fluid ai models --provider` works, and takes the names `fluid forge --llm-provider`

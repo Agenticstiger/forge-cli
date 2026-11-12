@@ -30,10 +30,12 @@ build here once ``tofu apply`` has succeeded and the masks and row filters are b
    (``GET /api/2.2/jobs/runs/get-output``). Every credential value in the environment is
    masked in what is printed, and terminal control sequences are removed.
 
-The wait is capped (:func:`wait_budget`). At the cap, or on Ctrl-C, the run is cancelled
-before the build fails, so ``fluid apply`` leaves nothing running that it started (an
-interrupted load cancels its INSERT the same way, ``_databricks_load.py``). A continuous job
-is never started here: Databricks keeps it running, and a run of it does not end.
+The wait is capped (:func:`wait_budget`). At the cap, on Ctrl-C, and when the run can no
+longer be read (the SDK has already retried), the run is cancelled before the build fails,
+so ``fluid apply`` leaves nothing running that it started (an interrupted load cancels its
+INSERT the same way, ``_databricks_load.py``); a cancel that fails too is said, with the run
+page. A continuous job is never started here: Databricks keeps it running, and a run of it
+does not end.
 
 Polling follows databricks-sdk-py's run waiter (``JobsAPI.wait_get_run_job_terminated_or_
 skipped``: a poll a second longer each time, at most 10 s; Apache-2.0), and the failed-task
@@ -290,6 +292,12 @@ def start_and_wait(
     LOG.debug("databricks_job_run_started job_id=%s run_id=%s", job.job_id, run_id)
     say(f"\n🚀 Build '{build_id}' - started run {run_id} of {label}")
     budget = wait_budget(settings, env)
+    raw = str(env.get(TIMEOUT_ENV) or "").strip()
+    if raw and not (raw.isdigit() and int(raw) > 0):
+        say(
+            f"   {TIMEOUT_ENV}={clean(raw)!r} is not a whole number of seconds above 0: "
+            f"waiting up to {_duration(budget)}"
+        )
     start = clock()
     try:
         return _wait(api, job.job_id, run_id, build_id, budget, start, say, sleep, clock)
@@ -318,10 +326,9 @@ def _wait(
         try:
             run = api.do("GET", f"{_JOBS}/runs/get", query={"run_id": run_id}) or {}
         except Exception as exc:  # noqa: BLE001
-            console_error(
-                f"Build '{build_id}' - could not read run {run_id}: {_failure(exc)}. "
-                "It may still be going."
-            )
+            console_error(f"Build '{build_id}' - could not read run {run_id}: {_failure(exc)}.")
+            if not _cancel(api, run_id, say):
+                say(f"   run {run_id} may still be going")
             if url:
                 say(f"   run page: {url}")
             return 1
@@ -561,8 +568,12 @@ def _clock(seconds: float) -> str:
 
 
 def _duration(seconds: float) -> str:
+    """``57s``, ``1m18s``, ``1h00m00s``."""
     whole = max(int(seconds), 0)
-    minutes, secs = divmod(whole, 60)
+    hours, rest = divmod(whole, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
     return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
 
 
