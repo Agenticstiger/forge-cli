@@ -88,11 +88,21 @@ resources, with no new schema field (fluid-schema 0.7.6):
   ``databricks-row-filter-invalid``; ``access: allow``, a principal with no SQL test and a text
   mask on a non-string column are refused too. ``fluid verify`` checks the bindings.
 * An expose's ``semantics`` block is a Unity Catalog metric view beside its table,
-  ``<catalog>.<schema>.<semantics.name>`` (``<table>_semantic_model`` without a name), created on
-  the SQL warehouse after ``tofu apply`` (the provider has no metric view resource,
-  terraform-provider-databricks#4827), readable by exactly the principals that read the table,
-  and dropped once the contract no longer declares it. What metric view YAML cannot express is
-  refused (``databricks_metrics.py``).
+  ``<catalog>.<schema>.<table>_semantic_model``, created on the SQL warehouse after
+  ``tofu apply`` (the provider has no metric view resource, terraform-provider-databricks#4827),
+  readable by exactly the principals that read the table, and dropped before the apply once the
+  contract no longer declares it, in the schemas its tables are in. What metric view YAML cannot
+  express is refused (``databricks_metrics.py``).
+* An expose that states a freshness or completeness SLO (``qos.freshnessSLO``,
+  ``qos.completenessTarget``, ``observability.defaultSLIs``, a ``contract.dq.rules``
+  entry of type ``freshness``, ``completeness`` or ``anomaly_detection``) turns on
+  Databricks data quality monitoring for its schema: one
+  ``databricks_data_quality_monitor`` per owned schema, the module's other tables there
+  excluded, ``contract.dq.monitoring.enabled: false`` to opt out
+  (``databricks_quality.py``). Databricks learns each table's bounds itself: the SLO
+  values pick the tables and are not thresholds the monitor checks. Its results are the
+  Quality indicator on the table in Catalog Explorer and
+  ``system.data_quality_monitoring.table_results``; removing it is not gated.
 * A dbt build that runs on Databricks (``execution.runtime.platform:
   databricks``) becomes a serverless ``databricks_job`` with a ``dbt_task``, and
   a local project its ``databricks_workspace_file`` uploads
@@ -218,6 +228,14 @@ from .databricks_keys import (
     reconcile,
 )
 from .databricks_keys import lookup as lookup_key_tables
+from .databricks_quality import RESOURCE_TYPE as QUALITY_MONITOR
+from .databricks_quality import (
+    SchemaMonitor,
+    failure_hints,
+    monitor_notices,
+    plan_monitors,
+    window_warnings,
+)
 from .databricks_retention import Retention, check_expire
 
 _LOG = logging.getLogger(__name__)
@@ -364,6 +382,8 @@ class _Compiled:
     tags: List[Tuple[str, str, str, str]] = field(default_factory=list)
     #: The metric views of the exposes that declare ``semantics`` (``databricks_metrics.py``).
     metric_views: _metric_views.MetricViews = field(default_factory=_metric_views.MetricViews)
+    #: The data quality monitor emitted per schema (``databricks_quality.py``).
+    monitors: List[SchemaMonitor] = field(default_factory=list)
 
 
 #: Unity Catalog allows 50 tags on a securable ("Apply tags to Unity Catalog securable
@@ -1400,6 +1420,7 @@ def _compile(
     compiled.metric_views = _metric_views.compile_metric_views(
         contract, compiled.tables, privileges, refusals, compiled.warnings
     )
+    _emit_quality_monitors(compiled, cid)
     _merge_jobs(
         compiled,
         compile_dbt_jobs(
@@ -1619,13 +1640,58 @@ def _refuse_duplicate_tables(
         bound.setdefault(table.full_name, table.where)
 
 
+def _schema_key(cid: str, catalog: str, schema: str) -> str:
+    """The resource key of an owned schema, and of its data quality monitor."""
+    return safe_ident(f"{cid}_{catalog}_{schema}")
+
+
 def _keys(cid: str, table: _Table) -> Tuple[str, str, str]:
     """``(catalog, schema, table)`` resource keys of one table."""
     return (
         safe_ident(f"{cid}_{table.catalog}"),
-        safe_ident(f"{cid}_{table.catalog}_{table.schema}"),
+        _schema_key(cid, table.catalog, table.schema),
         safe_ident(f"{cid}_{table.catalog}_{table.schema}_{table.name}"),
     )
+
+
+def _emit_quality_monitors(compiled: _Compiled, cid: str) -> None:
+    """Databricks data quality monitoring on each owned schema one of its tables asks it for
+    (``databricks_quality.py``), keyed like the schema it watches.
+
+    A monitor someone turned on outside forge-cli is adopted, not created over: a second
+    create fails (``RESOURCE_ALREADY_EXISTS``, measured on Free Edition 2026-11-12). Its
+    import id is ``schema,<schema_id>``, a UUID Databricks assigns, so the import takes it
+    from the schema's state after the schema's own import (``ImportBlock.id_from``).
+
+    It is created after the schema's tables (``depends_on``): enabling it starts a scan, and
+    a table that scan misses may wait up to two weeks for its health indicator (Databricks
+    docs, "intelligent scanning").
+    """
+    compiled.warnings.extend(window_warnings(compiled.tables))
+    for monitor in plan_monitors(compiled.tables):
+        key = _schema_key(cid, monitor.catalog, monitor.schema)
+        body = monitor.body(tofu_ref(f"databricks_schema.{key}.schema_id"))
+        body["depends_on"] = [
+            f"databricks_sql_table.{_keys(cid, table)[2]}"
+            for table in compiled.tables
+            if (table.catalog, table.schema) == (monitor.catalog, monitor.schema)
+        ]
+        _claim(
+            compiled,
+            QUALITY_MONITOR,
+            key,
+            f"data quality monitor on schema {monitor.full_name}",
+            body,
+        )
+        compiled.imports.append(
+            ImportBlock(
+                f"{QUALITY_MONITOR}.{key}",
+                "schema,{}",
+                best_effort=True,
+                id_from=(f"databricks_schema.{key}", "schema_id"),
+            )
+        )
+        compiled.monitors.append(monitor)
 
 
 def _emit_table(
@@ -2475,7 +2541,7 @@ class DatabricksIacPlugin:
         """What the apply cannot do itself and someone must: ``USE CATALOG``; and the dbt jobs
         it creates paused until the tables they write are protected."""
         compiled = _compile(contract, os.environ)
-        notices = _use_catalog_notices(compiled)
+        notices = _use_catalog_notices(compiled) + monitor_notices(compiled.monitors)
         certified = sorted(
             {
                 f"{full_name} ({value})"
@@ -2513,6 +2579,11 @@ class DatabricksIacPlugin:
                 "they are bound, starts its schedule; an explicit run-now works meanwhile."
             )
         return notices
+
+    def apply_failure_hints(self, address: str, detail: str = "") -> List[str]:
+        """The way on when ``tofu apply`` failed on ``address``: a data quality monitor
+        Databricks refused (``databricks_quality.failure_hints``); ``[]`` otherwise."""
+        return failure_hints(address)
 
     def explain_plan_failure(
         self,
@@ -2717,6 +2788,20 @@ def _job_actions(jobs: Sequence[DbtJob]) -> List[Dict[str, Any]]:
     return actions
 
 
+def _monitor_actions(monitors: Sequence[SchemaMonitor]) -> List[Dict[str, Any]]:
+    """One plan action per schema's data quality monitor, keyed by the schema it watches."""
+    return [
+        {
+            "op": "databricks.quality_monitor",
+            "resource_type": QUALITY_MONITOR,
+            "resource_id": monitor.full_name,
+            "monitored": list(monitor.monitored),
+            "excluded": list(monitor.excluded),
+        }
+        for monitor in monitors
+    ]
+
+
 def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """The objects the module manages, as plan actions, for the native planner.
 
@@ -2784,6 +2869,7 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
             }
         )
     actions.extend(compiled.metric_views.plan_actions())
+    actions.extend(_monitor_actions(compiled.monitors))
     actions.extend(_job_actions(compiled.jobs))
     unique: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for action in actions:

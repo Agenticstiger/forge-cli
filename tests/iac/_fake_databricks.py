@@ -6,9 +6,10 @@
 What it proves: what the real ``databricks/databricks`` provider (1.140.0) and ``tofu`` plan,
 apply and import for a live object. It serves ``data.databricks_catalog``,
 ``databricks_schema``, ``databricks_sql_table`` (whose DDL goes through the SQL Statement
-Execution API), ``databricks_grant`` and ``databricks_entity_tag_assignment`` (create, get,
+Execution API), ``databricks_grant``, ``databricks_entity_tag_assignment`` (create, get,
 update, delete and the paginated list ``fluid verify`` reads, on a catalog, schema, table or
-column; ``tags``, ``tag_page_size``). A
+column; ``tags``, ``tag_page_size``) and a schema's ``databricks_data_quality_monitor``
+(``quality_monitors``). A
 small SQL interpreter understands exactly the statements ``databricks_sql_table`` sends (CREATE
 [OR REPLACE] TABLE, ALTER TABLE ADD / DROP / RENAME / ALTER COLUMN, SET / UNSET TBLPROPERTIES,
 CLUSTER BY, COMMENT ON TABLE, DROP TABLE), and the statements forge-cli sends for a contract's
@@ -1170,6 +1171,9 @@ class FakeDatabricks:
         self.statements: Dict[str, Dict[str, Any]] = {}
         # job_id -> {job_id, created_time, creator_user_name, settings}; settings as the provider sent
         self.jobs: Dict[int, Dict[str, Any]] = {}
+        # (object_type, object_id) -> the data quality monitor as the API serves it
+        # (``/api/data-quality/v1/monitors``); object_id is a schema's schema_id
+        self.quality_monitors: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.workspace_files: Dict[str, bytes] = {}  # workspace path -> content
         self.workspace_dirs: set = set()  # directories a workspace import / mkdirs created
         self.missing_parent_uploads: List[str] = []  # imports that met no parent folder
@@ -1516,6 +1520,11 @@ class FakeDatabricks:
         a("POST", r"/api/2\.0/sql/statements/?", self._exec_sql)
         a("GET", r"/api/2\.0/sql/statements/([^/]+)", self._get_stmt)
         a("GET", r"/api/2\.0/sql/warehouses/([^/]+)", self._get_wh)
+        # -- data quality monitoring (anomaly detection on a schema)
+        a("POST", r"/api/data-quality/v1/monitors", self._dqm_create)
+        a("GET", r"/api/data-quality/v1/monitors/(schema|table)/([^/]+)", self._dqm_get)
+        a("PATCH", r"/api/data-quality/v1/monitors/(schema|table)/([^/]+)", self._dqm_update)
+        a("DELETE", r"/api/data-quality/v1/monitors/(schema|table)/([^/]+)", self._dqm_delete)
         # ---- Genie spaces and their permissions (databricks-sdk-py service/dashboards.py, iam.py)
         a("GET", r"/api/2\.0/genie/spaces", self._genie_list)
         a("POST", r"/api/2\.0/genie/spaces", self._genie_create)
@@ -1526,6 +1535,85 @@ class FakeDatabricks:
         a("PUT", r"/api/2\.0/permissions/genie/([^/]+)", self._genie_put_acl)
 
     # ------------------------------------------------------------------ handlers
+    # -- data quality monitoring. Shapes as Free Edition answered them on 2026-11-12: a second
+    # create is 400 RESOURCE_ALREADY_EXISTS, a missing monitor 404 RESOURCE_DOES_NOT_EXIST
+    # ("Cannot find Schema with ID"), a create starts a run (PENDING), and the response carries
+    # read-only fields (workflow id, job type, run id and status) the provider does not model.
+    def _dqm_missing(self, object_id: str) -> Tuple[int, Any]:
+        return _err(
+            404,
+            "RESOURCE_DOES_NOT_EXIST",
+            f"Cannot find Schema with ID: /metastores:ms-fake/schemas:{object_id}",
+        )
+
+    def _dqm_doc(self, key: Tuple[str, str]) -> Dict[str, Any]:
+        return copy.deepcopy(self.quality_monitors[key])
+
+    def _dqm_create(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        object_type, object_id = b.get("object_type"), b.get("object_id")
+        if object_type != "schema":
+            return _err(400, "INVALID_PARAMETER_VALUE", "fake: only schema monitors are served")
+        if not any(s["schema_id"] == object_id for s in self.schemas.values()):
+            return _err(404, "SCHEMA_DOES_NOT_EXIST", f"Schema {object_id} does not exist")
+        key = (object_type, object_id)
+        if key in self.quality_monitors:
+            return _err(
+                400,
+                "RESOURCE_ALREADY_EXISTS",
+                "Already exists AnomalyDetectionConfig with ID: "
+                f"/metastores:ms-fake/schemas:{object_id}/",
+            )
+        config = dict(b.get("anomaly_detection_config") or {})
+        with self._lock:
+            self._job_seq += 1
+            run = self._job_seq
+        config.update(
+            {
+                "anomaly_detection_workflow_id": 500000 + run,
+                "job_type": "ANOMALY_DETECTION_JOB_TYPE_INTERNAL_HIDDEN",
+                "last_run_id": str(900000 + run),
+                "latest_run_status": "ANOMALY_DETECTION_RUN_STATUS_PENDING",
+            }
+        )
+        self.quality_monitors[key] = {
+            "object_type": object_type,
+            "object_id": object_id,
+            "anomaly_detection_config": config,
+        }
+        return 200, self._dqm_doc(key)
+
+    def _dqm_get(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        key = (m.group(1), m.group(2))
+        if key not in self.quality_monitors:
+            return self._dqm_missing(m.group(2))
+        return 200, self._dqm_doc(key)
+
+    def _dqm_update(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        key = (m.group(1), m.group(2))
+        if key not in self.quality_monitors:
+            return self._dqm_missing(m.group(2))
+        # update_mask semantics: each masked field is replaced by the body's value, and one
+        # the body leaves out is cleared; what the mask does not name is kept. Provider 1.140.0
+        # sends update_mask=anomaly_detection_config,data_profiling_config, the whole config.
+        config = self.quality_monitors[key]["anomaly_detection_config"]
+        sent = b.get("anomaly_detection_config") or {}
+        for path in ",".join(q.get("update_mask") or []).split(","):
+            head, _, leaf = path.strip().partition(".")
+            if head != "anomaly_detection_config":
+                continue
+            for name in [leaf] if leaf else ["excluded_table_full_names"]:
+                if name in sent:
+                    config[name] = list(sent[name])
+                else:
+                    config.pop(name, None)
+        return 200, self._dqm_doc(key)
+
+    def _dqm_delete(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        key = (m.group(1), m.group(2))
+        if self.quality_monitors.pop(key, None) is None:
+            return self._dqm_missing(m.group(2))
+        return 200, {}
+
     def _me(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
         name = getattr(self, "me_user_name", _USER)
         return 200, {
