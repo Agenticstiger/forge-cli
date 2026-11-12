@@ -203,7 +203,10 @@ def test_removing_the_job_is_not_gated_and_is_said(workspace, fake, capfd):
     # The build now runs locally: its job and uploaded project go; its table stays.
     rc, out = apply_contract(capfd, write_contract(workspace, job_contract(platform=None)))
     assert rc == 0, out
-    assert "job(s), workspace file(s) or folder(s) removed (no table data lost; not gated" in out
+    assert (
+        "job(s), workspace file(s), folder(s) or data quality monitor(s) removed (no table data lost; not gated"
+        in out
+    )
     assert fake.jobs == {} and fake.workspace_files == {}
     assert not [folder for folder in fake.workspace_dirs if folder.startswith(ROOT)]
     assert TABLE in fake.tables

@@ -375,6 +375,7 @@ class TestDataLossGate:
             "databricks_job",
             "databricks_workspace_file",
             "databricks_directory",
+            "databricks_data_quality_monitor",
         }
 
     def test_removed_jobs_and_files_are_not_data_bearing(self):

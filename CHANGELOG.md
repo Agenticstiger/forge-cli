@@ -50,6 +50,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column the dbt model leaves nullable, say) is reported by the next `fluid apply`, and the
   script needs a SQL warehouse that runs SQL scripting. A dbt build that
   `--mode amend-and-build` runs locally is followed by the same re-declaration.
+- **Databricks data quality monitoring from a contract's freshness and completeness SLOs.** An
+  expose bound to Databricks that states a freshness or completeness SLO (`qos.freshnessSLO`,
+  `qos.completenessTarget`, an `observability.defaultSLIs` freshness or completeness block, or a
+  `contract.dq.rules` entry of type `freshness`, `completeness` or `anomaly_detection`) now turns on
+  Databricks data quality monitoring (formerly anomaly detection) for the schema the product owns:
+  one `databricks_data_quality_monitor` per schema, created after its tables, with the product's
+  other tables there excluded by name. Catalog Explorer then shows a Quality indicator on the table,
+  and every scan lands in `system.data_quality_monitoring.table_results`. No new contract field:
+  `contract.dq.monitoring.enabled: false` opts an expose out. Databricks learns each table's bounds
+  from its history and takes no threshold, so the SLO values choose the tables and are not the
+  bounds it checks; `fluid apply` says so, and `fluid validate` warns about a `dq.monitoring.window`
+  other than one day. A monitor turned on outside forge-cli is adopted, not created over. If
+  Databricks refuses the monitor (no serverless compute, or no MANAGE on the schema), the apply
+  fails after the tables are created and names the opt-out first. Removing one (opting out, dropping
+  the SLOs, removing the expose) deletes its hidden scan job and what it has learned, never table
+  data, so it is not gated, and is printed. **Cost:** scans run on serverless compute billed as
+  `DATA_QUALITY_MONITORING`, once when monitoring is turned on and then as often as each table is
+  updated. Databricks Free Edition runs it (proven 2026-11-12), and its daily compute quota covers
+  these scans too: a workspace over the quota stops all compute for the rest of the day, so on Free
+  Edition opt out the products you do not need watched.
 
 ### Changed
 
