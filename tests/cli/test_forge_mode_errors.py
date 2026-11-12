@@ -374,6 +374,14 @@ def _handled(logger: logging.Logger, label: str, exc: BaseException, **kwargs) -
 
 
 class TestLogForgeFailure:
+    @pytest.fixture(autouse=True)
+    def _forget_the_note(self):
+        """Drop what a test noted, and the traceback frames it holds, after the test."""
+        from fluid_build.cli._forge_mode_errors import take_forge_failure
+
+        yield
+        take_forge_failure()
+
     def test_a_fluid_error_has_no_traceback_above_debug(self, caplog):
         logger = logging.getLogger("test.forge.failure")
         exc = CopilotGenerationError("copilot_no_llm_provider", "No LLM provider configured.")

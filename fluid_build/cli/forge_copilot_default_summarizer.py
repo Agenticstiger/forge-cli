@@ -121,7 +121,10 @@ def build_default_summarizer(
 
             from fluid_build.cli.forge_copilot_llm_litellm import (
                 _LITELLM_PREFIX_BY_PROVIDER,
+                quiet_litellm,
             )
+
+            quiet_litellm(litellm)
 
             prefix = _LITELLM_PREFIX_BY_PROVIDER.get(
                 routing_config.provider.lower(), routing_config.provider.lower()
