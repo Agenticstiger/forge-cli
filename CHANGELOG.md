@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fluid doctor` reports an installed coding agent as ready.** With `FLUID_LLM_PROVIDER` set to
   `claude-code`, `codex`, `cursor` or `kiro`, readiness said "No API key found"; it now checks
   that the agent's CLI is on PATH, and says so when it is not. Each CLI keeps its own sign-in.
+- **`fluid forge --agent` reports a contract written to a `--target-dir` outside the current
+  directory.** The receipt and the `forge.contract_written` event came from a scan of the current
+  directory, two levels deep, so a target outside it, or deeper, got neither: the run wrote the
+  contract and the stream never said so. The stated target is scanned too, and a file outside the
+  current directory is reported by its absolute path.
 
 ### Changed
 

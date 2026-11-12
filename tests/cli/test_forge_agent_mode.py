@@ -454,3 +454,84 @@ def test_agent_ai_mode_emits_contract_written(tmp_path, capsys, monkeypatch):
     assert written, [e["event"] for e in events]
     assert written[0]["action"] == "created"
     assert written[0]["path"].endswith("contract.fluid.yaml")
+
+
+def _run_ai_writing_to(product: Path, args, capsys, monkeypatch, *, contract=None):
+    """Run forge.run under --agent with an AI mode that writes *product*'s contract."""
+    from fluid_build.cli import forge as forge_mod
+
+    def _fake_ai(args, logger):
+        product.mkdir(parents=True, exist_ok=True)
+        (product / "contract.fluid.yaml").write_text(contract or "fluidVersion: 0.7.6\n")
+        return 0
+
+    monkeypatch.setattr(forge_mod, "run_ai_copilot_mode", _fake_ai)
+    monkeypatch.setattr(
+        "builtins.input", lambda *a, **k: pytest.fail("input() called under --agent")
+    )
+    forge_mod.run(args, logging.getLogger("test"))
+    events = _parse_jsonl_events(capsys.readouterr().out)
+    return [e for e in events if e["event"] == "forge.contract_written"]
+
+
+def test_agent_ai_mode_sees_a_target_dir_outside_cwd(tmp_path, capsys, monkeypatch):
+    """A ``--target-dir`` outside cwd is scanned too: the event and receipt name it."""
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    product = tmp_path / "product"  # where _agent_args points -d: outside cwd
+    args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
+
+    written = _run_ai_writing_to(product, args, capsys, monkeypatch)
+
+    contract = (product / "contract.fluid.yaml").resolve()
+    assert [(e["path"], e["action"]) for e in written] == [(str(contract), "created")]
+    assert (product / ".fluid" / "forge-receipt.json").is_file()
+
+
+def test_agent_ai_mode_sees_a_target_dir_deeper_than_the_cwd_scan(tmp_path, capsys, monkeypatch):
+    """The cwd scan stops two levels down; a deeper --target-dir still reports."""
+    monkeypatch.chdir(tmp_path)
+    product = tmp_path / "domains" / "sales" / "orders"
+    args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
+    args.target_dir = str(product)
+
+    written = _run_ai_writing_to(product, args, capsys, monkeypatch)
+
+    assert [(e["path"], e["action"]) for e in written] == [
+        ("domains/sales/orders/contract.fluid.yaml", "created")
+    ]
+
+
+def test_agent_ai_mode_reports_an_existing_contract_rewritten_in_place(
+    tmp_path, capsys, monkeypatch
+):
+    """The target is scanned before the run as well, so a rewrite is "modified"."""
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    product = tmp_path / "product"
+    product.mkdir()
+    (product / "contract.fluid.yaml").write_text("fluidVersion: 0.7.5\n")
+    args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
+
+    written = _run_ai_writing_to(product, args, capsys, monkeypatch)
+
+    assert [e["action"] for e in written] == ["modified"]
+
+
+def test_agent_ai_mode_expands_a_tilde_target_dir(tmp_path, capsys, monkeypatch):
+    """A literal ``~`` (quoted, or from a program) is read as the writer reads it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
+    args.target_dir = "~/prod"
+
+    written = _run_ai_writing_to(home / "prod", args, capsys, monkeypatch)
+
+    contract = (home / "prod" / "contract.fluid.yaml").resolve()
+    assert [(e["path"], e["action"]) for e in written] == [(str(contract), "created")]
