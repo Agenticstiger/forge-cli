@@ -349,7 +349,8 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Run 'fluid doctor' to see which optional packages are installed"],
         None,
     ),
-    # ``fluid scaffold-ide`` refusals. Each one is raised before the command writes a file.
+    # ``fluid scaffold-ide`` refusals. All but the last are raised before the command writes
+    # a file; ``refusing_to_overwrite…`` is raised at the first existing file it would write.
     "claude_settings_not_valid_json": (
         [
             "Fix the JSON syntax in the named .claude/settings.json (or settings.local.json)",
@@ -362,6 +363,15 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             "The named settings file must be a JSON object; if it has 'hooks', that must be an "
             "object, and 'hooks.PostToolUse' a list of objects",
             "Fix the file, then re-run: fluid scaffold-ide --target claude-code",
+        ],
+        None,
+    ),
+    "claude_settings_links_outside_project": (
+        [
+            "The named Claude Code settings file is a symlink to a file outside this "
+            "project; scaffold-ide would copy that file's content into the project",
+            "Replace the link with a regular file or delete it, then re-run: "
+            "fluid scaffold-ide --target claude-code",
         ],
         None,
     ),
@@ -385,6 +395,8 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         [
             "Re-run with --force to replace the file: fluid scaffold-ide --target <target> --force",
             "--force keeps the text of CLAUDE.md and AGENTS.md outside the scaffold-ide block",
+            "Upgrading from an earlier scaffold-ide: --force also removes the steering files "
+            "it wrote",
         ],
         None,
     ),

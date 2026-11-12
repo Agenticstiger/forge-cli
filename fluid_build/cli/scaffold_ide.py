@@ -397,13 +397,20 @@ def _install_skills(root: Path, skills_dir: str, force: bool) -> list[Path]:
     return written
 
 
-def _read_settings(path: Path) -> Dict:
-    """A Claude Code settings file as a dict; a file of the wrong shape is refused."""
+def _read_settings(path: Path, root: Path) -> Dict:
+    """A Claude Code settings file as a dict; a file of the wrong shape is refused.
+
+    So is one that links outside ``root``: a cloned repository can ship the link, and
+    the file it points at (a credentials file, say) would be read and written back
+    into the project as a regular file.
+    """
+    if path.is_symlink() and not path.resolve().is_relative_to(root.resolve()):
+        raise CLIError(2, "claude_settings_links_outside_project", {"path": str(path)})
     if not path.exists():
         return {}
     try:
         settings = json.loads(path.read_text(encoding="utf-8"))
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:  # unreadable (a directory, say), not UTF-8, not JSON
         raise CLIError(
             2, "claude_settings_not_valid_json", {"path": str(path), "error": str(exc)}
         ) from exc
@@ -460,7 +467,7 @@ def _write_claude_settings(root: Path, python_bin: str) -> list[Path]:
     """
     written = []
     shared = root / ".claude" / "settings.json"
-    settings = _read_settings(shared)
+    settings = _read_settings(shared, root)
     post = (settings.get("hooks") or {}).get("PostToolUse", [])
     cleaned = _without_validate_hook(post)
     if cleaned != post:
@@ -469,7 +476,7 @@ def _write_claude_settings(root: Path, python_bin: str) -> list[Path]:
         written.append(shared)
 
     local = root / ".claude" / "settings.local.json"
-    settings = _read_settings(local)
+    settings = _read_settings(local, root)
     hooks = settings.setdefault("hooks", {})
     hooks["PostToolUse"] = _without_validate_hook(hooks.get("PostToolUse", [])) + [
         _validate_hook_entry(python_bin)
@@ -665,8 +672,8 @@ def _emit_generic(root: Path, python_bin: str, force: bool) -> list[Path]:
 def _preflight(root: Path, target: str) -> None:
     """Raise every error an existing file's content or type can cause, before any write."""
     if target == "claude-code":
-        _read_settings(root / ".claude" / "settings.json")
-        _read_settings(root / ".claude" / "settings.local.json")
+        _read_settings(root / ".claude" / "settings.json", root)
+        _read_settings(root / ".claude" / "settings.local.json", root)
         _check_instructions(root / "CLAUDE.md")
     elif target == "generic":
         _check_instructions(root / "AGENTS.md")

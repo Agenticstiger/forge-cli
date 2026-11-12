@@ -475,6 +475,38 @@ def test_a_bad_local_settings_file_is_found_before_anything_is_written(tmp_path:
     assert sorted(_snapshot(tmp_path)) == [".claude/settings.local.json"]
 
 
+def test_a_settings_path_that_is_a_directory_is_refused_cleanly(tmp_path: Path):
+    (tmp_path / ".claude" / "settings.json").mkdir(parents=True)
+    with pytest.raises(CLIError, match="claude_settings_not_valid_json"):
+        _run(tmp_path, "claude-code")
+    assert _snapshot(tmp_path) == {}
+
+
+@pytest.mark.parametrize("name", ["settings.json", "settings.local.json"])
+def test_a_settings_file_linking_outside_the_project_is_refused(tmp_path: Path, name: str):
+    """A cloned repository could link it to a credentials file outside the project."""
+    secret = tmp_path / "home" / "credentials.json"
+    secret.parent.mkdir()
+    secret.write_text('{"token": "x"}')
+    project = tmp_path / "project"
+    (project / ".claude").mkdir(parents=True)
+    (project / ".claude" / name).symlink_to(secret)
+    with pytest.raises(CLIError, match="claude_settings_links_outside_project"):
+        _run(project, "claude-code")
+    assert sorted(_snapshot(project)) == [f".claude/{name}"]
+    assert (project / ".claude" / name).is_symlink()
+    assert secret.read_text() == '{"token": "x"}'
+
+
+def test_a_settings_file_linking_inside_the_project_is_followed(tmp_path: Path):
+    shared = tmp_path / "config" / "claude.json"
+    shared.parent.mkdir()
+    shared.write_text("{}")
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").symlink_to(shared)
+    assert _run(tmp_path, "claude-code") == 0
+
+
 @pytest.mark.parametrize("target, name", [("generic", "AGENTS.md"), ("claude-code", "CLAUDE.md")])
 def test_instructions_that_are_not_utf8_are_refused_before_any_write(
     tmp_path: Path, target: str, name: str
@@ -519,6 +551,7 @@ def test_malformed_markers_are_refused_and_the_file_is_untouched(
     [
         "claude_settings_not_valid_json",
         "claude_settings_unexpected_shape",
+        "claude_settings_links_outside_project",
         "scaffold_ide_file_not_utf8",
         "scaffold_ide_block_markers_malformed",
         "refusing_to_overwrite_existing_file_pass_force_to_override",
