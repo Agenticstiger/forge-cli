@@ -14,8 +14,10 @@ import pytest
 from fluid_build.cli import _setup_enhanced_logging
 from fluid_build.observability.secret_redactor import (
     SecretRedactingFilter,
+    forget_known_secrets,
     redact_jose_tokens,
     redact_secret_text,
+    register_secrets,
 )
 
 
@@ -752,6 +754,17 @@ def _leaked(token: str, out: str) -> list:
 
 class TestJoseTokensAndDottedNames:
     """JOSE tokens are masked by their header; a dotted name is never a token."""
+
+    @pytest.fixture(autouse=True)
+    def _no_registered_secrets(self):
+        # The exact-match registry is process-wide: a literal another test in this
+        # worker registered (a base64 key of bytes(range(32)), say) would mask part
+        # of these tokens first. The expectations here are the JOSE rule's alone.
+        held = sys.modules[redact_secret_text.__module__]._known_secrets
+        forget_known_secrets()
+        yield
+        forget_known_secrets()
+        register_secrets(held)
 
     @pytest.mark.parametrize("name", _DOTTED_NAMES)
     def test_a_fully_qualified_name_survives_every_path(self, name):

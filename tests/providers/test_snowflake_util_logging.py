@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from fluid_build.providers.snowflake.util.logging import (
     SENSITIVE_PATTERNS,
     redact_dict,
@@ -112,6 +114,24 @@ def _spaced_header_jwt() -> str:
 class TestSnowflakeRedactionSymmetryGaps:
     """Gaps ``redact_string`` previously leaked while the global
     ``redact_secret_text`` twin caught them."""
+
+    @pytest.fixture(autouse=True)
+    def _no_registered_secrets(self):
+        # The exact-match registry both layers share is process-wide; a literal another
+        # test in this worker registered would mask part of a token here first.
+        import sys
+
+        from fluid_build.observability.secret_redactor import (
+            forget_known_secrets,
+            redact_secret_text,
+            register_secrets,
+        )
+
+        held = sys.modules[redact_secret_text.__module__]._known_secrets
+        forget_known_secrets()
+        yield
+        forget_known_secrets()
+        register_secrets(held)
 
     # -- Gap 5: generic non-``eyJ`` 3-segment JWT --------------------------
     def test_generic_non_eyj_three_segment_jwt_masked(self) -> None:
