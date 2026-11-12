@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
+from fluid_build.cli import artifact_receipts
 from fluid_build.cli.artifact_receipts import (
     ReceiptBuilder,
     ReceiptDocument,
@@ -28,6 +31,62 @@ class TestGenerateRunId:
         """Tight loop generation must not collide on random bits."""
         ids = {generate_run_id() for _ in range(1000)}
         assert len(ids) == 1000
+
+    def test_ids_in_one_millisecond_never_repeat(self, monkeypatch):
+        """The collision behind the flake above (``999 == 1000``), made certain.
+
+        With the clock stopped and the random source fixed, a random suffix
+        repeats at once. Uniqueness in one process must not rest on chance.
+        """
+        frozen = time.time()
+        monkeypatch.setattr(artifact_receipts, "time", SimpleNamespace(time=lambda: frozen))
+        monkeypatch.setattr(
+            artifact_receipts,
+            "secrets",
+            SimpleNamespace(token_hex=lambda n=32: "ab" * n, randbits=lambda k: 0x1234),
+        )
+        ids = [generate_run_id() for _ in range(1000)]
+        assert len(set(ids)) == 1000
+        assert ids == sorted(ids)
+
+    def test_ids_keep_increasing_when_the_clock_steps_back(self, monkeypatch):
+        start = time.time()
+        clock = iter([start, start - 1.0, start - 2.0])
+        monkeypatch.setattr(artifact_receipts, "time", SimpleNamespace(time=lambda: next(clock)))
+        ids = [generate_run_id() for _ in range(3)]
+        assert len(set(ids)) == 3
+        assert ids == sorted(ids)
+
+    def test_a_used_up_suffix_moves_to_the_next_millisecond(self, monkeypatch):
+        ms = int(time.time() * 1000)
+        monkeypatch.setattr(artifact_receipts, "_last_ms", -1)
+        monkeypatch.setattr(artifact_receipts, "_last_suffix", 0)
+        # +0.5 ms so the float round trip cannot land on the millisecond before.
+        monkeypatch.setattr(
+            artifact_receipts, "time", SimpleNamespace(time=lambda: (ms + 0.5) / 1000)
+        )
+        monkeypatch.setattr(
+            artifact_receipts, "secrets", SimpleNamespace(randbits=lambda k: 0xFFFFFFFF)
+        )
+        assert generate_run_id() == f"{ms:011x}-ffffffff"
+        assert generate_run_id() == f"{ms + 1:011x}-ffffffff"
+
+    def test_a_forked_child_starts_its_own_sequence(self, monkeypatch):
+        """``_reset_run_id_state`` runs in the child after ``os.fork()``."""
+        ms = int(time.time() * 1000)
+        monkeypatch.setattr(artifact_receipts, "_last_ms", -1)
+        monkeypatch.setattr(artifact_receipts, "_last_suffix", 0)
+        monkeypatch.setattr(
+            artifact_receipts, "time", SimpleNamespace(time=lambda: (ms + 0.5) / 1000)
+        )
+        seeds = iter([5, 9])
+        monkeypatch.setattr(
+            artifact_receipts, "secrets", SimpleNamespace(randbits=lambda k: next(seeds))
+        )
+        assert generate_run_id() == f"{ms:011x}-00000005"
+        artifact_receipts._reset_run_id_state()
+        # The parent's next id would be ...-00000006; the child seeds its own.
+        assert generate_run_id() == f"{ms:011x}-00000009"
 
 
 class TestReceiptEntryToDict:

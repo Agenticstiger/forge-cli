@@ -46,7 +46,9 @@ __all__ = [
     "generate_run_id",
 ]
 
+import os
 import secrets
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -107,22 +109,66 @@ class ReceiptDocument:
         }
 
 
-def generate_run_id() -> str:
-    """Return a compact, time-sortable, machine-unique run identifier.
+#: The largest suffix 8 hex digits hold.
+_SUFFIX_MAX = 0xFFFFFFFF
 
-    Format: ``<hex-timestamp>-<hex-random>`` — e.g.
-    ``018f7c1d3a42-9a2f1d03``.  Sortable lexicographically because the
-    timestamp comes first.  Uses 4 bytes (8 hex chars) of randomness so
-    rapid-fire generation (e.g. tests in a tight loop) does not produce
-    collisions even when the ms-resolution timestamp is identical.
+# What the last run id used: its millisecond and its suffix. One process keeps
+# one sequence; ``_reset_run_id_state`` starts a forked child on its own.
+_run_id_lock = threading.Lock()
+_last_ms = -1
+_last_suffix = 0
 
-    No dependencies on ``uuid`` / ``ulid`` so the module stays
-    stdlib-only.
+
+def _reset_run_id_state() -> None:
+    """Forget the last run id. Runs in a forked child.
+
+    A child that kept the parent's state would make the parent's next id in
+    the same millisecond. The new lock replaces one that another thread may
+    have held at the fork.
     """
-    # Milliseconds since epoch, hex-encoded (fits in 11 chars until ~year 2527)
-    ts_hex = f"{int(time.time() * 1000):011x}"
-    rand_hex = secrets.token_hex(4)  # 8 hex chars ~ 4B values
-    return f"{ts_hex}-{rand_hex}"
+    global _run_id_lock, _last_ms, _last_suffix
+    _run_id_lock = threading.Lock()
+    _last_ms = -1
+    _last_suffix = 0
+
+
+if hasattr(os, "register_at_fork"):  # POSIX only
+    os.register_at_fork(after_in_child=_reset_run_id_state)
+
+
+def generate_run_id() -> str:
+    """Return a compact, time-sortable run identifier, unique in this process.
+
+    Format: ``<ms since epoch, 11 hex digits>-<suffix, 8 hex digits>``, e.g.
+    ``1a1d06ce9d5-3f9c0a17``. The timestamp comes first, so ids sort by time.
+    11 hex digits last until about the year 2527.
+
+    The suffix is monotonic, as in a ULID or a UUIDv7 (RFC 9562, section
+    6.2): the first id in a millisecond starts it at a random 31-bit value,
+    and each later id in that millisecond adds one. So ids from one process
+    never repeat and always increase, also in a tight loop and when the
+    clock steps back: the last millisecond is kept until the clock passes
+    it. A random suffix alone repeated by the birthday bound (1000 ids in
+    one millisecond: about 1 in 10,000). Across processes the random start
+    makes a repeat unlikely.
+
+    Stdlib only: ``uuid.uuid7`` needs Python 3.14 and is 36 characters long.
+    """
+    global _last_ms, _last_suffix
+    now_ms = int(time.time() * 1000)
+    with _run_id_lock:
+        if now_ms > _last_ms:
+            # A new millisecond. The top bit starts clear, so at least 2**31
+            # ids fit in it.
+            _last_ms, _last_suffix = now_ms, secrets.randbits(31)
+        elif _last_suffix < _SUFFIX_MAX:
+            _last_suffix += 1
+        else:
+            # The suffix is used up. Move to the next millisecond, as RFC 9562
+            # allows, and start a new suffix.
+            _last_ms, _last_suffix = _last_ms + 1, secrets.randbits(31)
+        ms, suffix = _last_ms, _last_suffix
+    return f"{ms:011x}-{suffix:08x}"
 
 
 class ReceiptBuilder:
