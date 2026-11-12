@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fluid ai models --provider` works, and takes the names `fluid forge --llm-provider`
+  takes.** The flag stored its value where the global infrastructure `--provider` keeps its
+  own, so the global check read `gemini` as an infrastructure provider: every
+  `fluid ai models --provider <name>` exited 2 with "Unknown provider 'gemini' — installed
+  providers: aws, databricks, gcp, local, snowflake (see `fluid providers`)". The flag now has
+  its own slot, and its names come from the LLM provider registry: the built-ins, the keyless
+  `mcp-sampling` and coding agents (`claude-code`, `codex`, `cursor`, `kiro`), and installed
+  `fluid_build.llm_providers` plugins, each shown with the model plan forge would use. An
+  unknown name is refused with the built-in names, as `fluid forge --llm-provider` refuses it;
+  the flag used to list five hard-coded names. The docs noted the exit in 0.18.1; it was still
+  there in 0.28.0.
+
 ### Added
 
 - **Agent Skills for coding agents.** Four skills in the agentskills.io `SKILL.md` format ship
