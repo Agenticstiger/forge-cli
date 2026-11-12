@@ -382,6 +382,8 @@ def _enforce_access(
     run = getattr(plugin, hook, None)
     if not callable(run):
         return
+    # What the hooks print quotes the contract and the server (statements, descriptions, errors):
+    # data, not markup, so a "[word]" in it neither vanishes nor raises.
     try:
         if dry_run:
             run(contract, say=cprint_literal, dry_run=True)
