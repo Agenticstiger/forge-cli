@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import logging
 import os
 import re
 import subprocess
@@ -90,7 +91,7 @@ EXPECTED_FILES = {
         ".kiro/hooks/on-save-contract.md",
         ".kiro/hooks/pre-commit-bundle.md",
         ".kiro/specs/first-data-product.md",
-        *_skill_paths(".agents/skills"),
+        *_skill_paths(".kiro/skills"),
     ],
     "cursor": [
         ".cursor/mcp.json",
@@ -266,7 +267,7 @@ def test_rerun_with_force_overwrites(tmp_path: Path):
     """--force lets us refresh the canonical pack after a forge-cli upgrade."""
     _run(tmp_path, "kiro")
     target = tmp_path / ".kiro/steering/fluid.md"
-    skill = tmp_path / ".agents/skills/authoring-fluid-contracts/SKILL.md"
+    skill = tmp_path / ".kiro/skills/authoring-fluid-contracts/SKILL.md"
     target.write_text("# user-edited\n")
     skill.write_text("# user-edited\n")
     _run(tmp_path, "kiro", force=True)
@@ -443,6 +444,270 @@ def test_claude_code_settings_of_the_wrong_shape_are_refused(tmp_path: Path, bod
     with pytest.raises(CLIError, match=event):
         _run(tmp_path, "claude-code")
     assert settings.read_text() == body
+
+
+def _snapshot(root: Path) -> dict[str, bytes]:
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def test_kiro_skills_live_in_the_kiro_directory():
+    """Kiro's workspace skills are read from .kiro/skills/ (https://kiro.dev/docs/skills/)."""
+    assert scaffold_ide.SKILLS_DIRS["kiro"] == ".kiro/skills"
+
+
+def test_a_bad_settings_file_is_found_before_anything_is_written(tmp_path: Path):
+    """An invalid settings.json used to surface after .mcp.json and CLAUDE.md were written,
+    and the re-run then refused to overwrite .mcp.json."""
+    settings = tmp_path / ".claude/settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text("{ not json")
+    with pytest.raises(CLIError, match="claude_settings_not_valid_json"):
+        _run(tmp_path, "claude-code")
+    assert sorted(_snapshot(tmp_path)) == [".claude/settings.json"]
+
+
+def test_a_bad_local_settings_file_is_found_before_anything_is_written(tmp_path: Path):
+    local = tmp_path / ".claude/settings.local.json"
+    local.parent.mkdir(parents=True)
+    local.write_text("[]")
+    with pytest.raises(CLIError, match="claude_settings_unexpected_shape"):
+        _run(tmp_path, "claude-code")
+    assert sorted(_snapshot(tmp_path)) == [".claude/settings.local.json"]
+
+
+@pytest.mark.parametrize("target, name", [("generic", "AGENTS.md"), ("claude-code", "CLAUDE.md")])
+def test_instructions_that_are_not_utf8_are_refused_before_any_write(
+    tmp_path: Path, target: str, name: str
+):
+    (tmp_path / name).write_bytes(b"# rules \xff\xfe\n")
+    with pytest.raises(CLIError, match="scaffold_ide_file_not_utf8"):
+        _run(tmp_path, target)
+    assert list(_snapshot(tmp_path)) == [name]
+    assert (tmp_path / name).read_bytes() == b"# rules \xff\xfe\n"
+
+
+BEGIN = scaffold_ide._BLOCK_BEGIN
+END = scaffold_ide._BLOCK_END
+
+
+@pytest.mark.parametrize(
+    "text, counts",
+    [
+        (f"mine\n{BEGIN}\nmy notes\n", (1, 0)),
+        (f"mine\n{END}\nnotes\n{BEGIN}\n", (1, 1)),
+        (f"{BEGIN}\na\n{END}\nmid\n{BEGIN}\nb\n{END}\n", (2, 2)),
+        (f"notes\n{END}\n", (0, 1)),
+    ],
+    ids=["orphan-begin", "end-before-begin", "two-blocks", "orphan-end"],
+)
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("target, name", [("generic", "AGENTS.md"), ("claude-code", "CLAUDE.md")])
+def test_malformed_markers_are_refused_and_the_file_is_untouched(
+    tmp_path: Path, target: str, name: str, force: bool, text: str, counts: tuple
+):
+    (tmp_path / name).write_text(text)
+    with pytest.raises(CLIError, match="scaffold_ide_block_markers_malformed") as caught:
+        _run(tmp_path, target, force=force)
+    assert (caught.value.context["begin"], caught.value.context["end"]) == counts
+    assert caught.value.suggestions
+    assert (tmp_path / name).read_bytes() == text.encode()
+    assert list(_snapshot(tmp_path)) == [name]
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        "claude_settings_not_valid_json",
+        "claude_settings_unexpected_shape",
+        "scaffold_ide_file_not_utf8",
+        "scaffold_ide_block_markers_malformed",
+        "refusing_to_overwrite_existing_file_pass_force_to_override",
+    ],
+)
+def test_every_refusal_carries_catalog_guidance(event: str):
+    error = CLIError(2, event, {})
+    assert any("fluid scaffold-ide" in line for line in error.suggestions)
+    assert error.docs_url
+
+
+def _gitignore_run(tmp_path: Path) -> None:
+    _run(tmp_path, "claude-code")
+
+
+def test_gitignore_keeps_its_mode(tmp_path: Path):
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("dist/\n")
+    gitignore.chmod(0o644)
+    _gitignore_run(tmp_path)
+    assert gitignore.stat().st_mode & 0o777 == 0o644
+    assert gitignore.read_text() == "dist/\n.claude/settings.local.json\n"
+
+
+def test_gitignore_keeps_crlf_line_endings(tmp_path: Path):
+    (tmp_path / ".gitignore").write_bytes(b"dist/\r\nbuild/")
+    _gitignore_run(tmp_path)
+    assert (tmp_path / ".gitignore").read_bytes() == (
+        b"dist/\r\nbuild/\r\n.claude/settings.local.json\r\n"
+    )
+
+
+def test_gitignore_with_non_utf8_bytes_keeps_them(tmp_path: Path):
+    (tmp_path / ".gitignore").write_bytes(b"caf\xff\n")
+    assert _run(tmp_path, "claude-code") == 0
+    assert (tmp_path / ".gitignore").read_bytes() == b"caf\xff\n.claude/settings.local.json\n"
+
+
+def test_a_gitignore_directory_warns_and_the_run_succeeds(tmp_path: Path, caplog):
+    (tmp_path / ".gitignore").mkdir()
+    with caplog.at_level(logging.WARNING):
+        assert _run(tmp_path, "claude-code") == 0
+    assert ".claude/settings.local.json" in caplog.text
+    assert (tmp_path / ".claude/settings.local.json").is_file()
+
+
+@pytest.mark.parametrize("line", [".claude/settings.local.json", "/.claude/settings.local.json"])
+def test_gitignore_already_naming_the_entry_is_unchanged(tmp_path: Path, line: str):
+    body = f"dist/\r\n{line}\r\n".encode()
+    (tmp_path / ".gitignore").write_bytes(body)
+    _gitignore_run(tmp_path)
+    assert (tmp_path / ".gitignore").read_bytes() == body
+
+
+def _local_commands(root: Path) -> list[str]:
+    return [h["command"] for e in _post_tool_use(root) for h in e["hooks"]]
+
+
+def test_a_wrapper_around_the_validate_command_is_the_users_own(tmp_path: Path):
+    shared = tmp_path / ".claude/settings.json"
+    shared.parent.mkdir(parents=True)
+    own = {
+        "hooks": {
+            "PostToolUse": [
+                {
+                    "matcher": "Edit|Write",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "my-tool fluid validate ${tool_input.file_path} --strict",
+                        },
+                        {
+                            "type": "command",
+                            "command": f"my-tool {sys.executable} {HOOK_SCRIPT}",
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+    shared.write_text(json.dumps(own))
+    _run(tmp_path, "claude-code")
+    assert json.loads(shared.read_text()) == own
+
+
+def test_the_exact_legacy_hook_is_removed(tmp_path: Path):
+    shared = tmp_path / ".claude/settings.json"
+    shared.parent.mkdir(parents=True)
+    legacy = {"type": "command", "command": "  fluid validate ${tool_input.file_path}  "}
+    shared.write_text(json.dumps({"hooks": {"PostToolUse": [{"hooks": [legacy]}]}}))
+    _run(tmp_path, "claude-code")
+    assert json.loads(shared.read_text())["hooks"]["PostToolUse"] == []
+
+
+def test_reruns_never_stack_hook_entries(tmp_path: Path):
+    for force in (False, True, True):
+        try:
+            _run(tmp_path, "claude-code", force=force)
+        except CLIError:
+            pass
+    assert _local_commands(tmp_path) == [f"{sys.executable} {HOOK_SCRIPT}"]
+
+
+def test_a_moved_install_replaces_the_old_hook(tmp_path: Path):
+    local = tmp_path / ".claude/settings.local.json"
+    local.parent.mkdir(parents=True)
+    old = "'/old env/bin/python' /old/site-packages/fluid_build/agent_skills/hooks/validate_contract.py"
+    win = "'C:\\py\\python.exe' 'C:\\site\\fluid_build\\agent_skills\\hooks\\validate_contract.py'"
+    local.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PostToolUse": [
+                        {"matcher": "Edit|Write", "hooks": [{"type": "command", "command": old}]},
+                        {"matcher": "Edit|Write", "hooks": [{"type": "command", "command": win}]},
+                    ]
+                }
+            }
+        )
+    )
+    _run(tmp_path, "claude-code")
+    assert _local_commands(tmp_path) == [f"{sys.executable} {HOOK_SCRIPT}"]
+
+
+def test_the_hook_timeout_outlasts_the_script_s_own():
+    spec = importlib.util.spec_from_file_location("_validate_hook", HOOK_SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    entry = scaffold_ide._validate_hook_entry(sys.executable)
+    assert entry["hooks"][0]["timeout"] > module.TIMEOUT_S
+
+
+#: (target, directory, suffix) of the steering files earlier scaffold-ide versions wrote.
+LEGACY = {
+    "kiro": (".kiro/steering", ".md"),
+    "cursor": (".cursor/rules", ".mdc"),
+    "cline": (".clinerules", ".md"),
+    "generic": (".ai/steering", ".md"),
+}
+LEGACY_FILES = {
+    "01-forge-cli": "# forge-cli — agentic guide",
+    "02-contract-schema": "# contract.fluid.yaml — schema cheatsheet",
+    "03-pipeline-decisions": "# When to call which `fluid` command — decision tree",
+    "04-guardrails": "# Guardrails — what's free with `pip install data-product-forge`",
+}
+
+
+def _write_legacy(root: Path, target: str) -> list[Path]:
+    directory, suffix = LEGACY[target]
+    front = "---\ninclusion: always\n---\n" if target in {"kiro", "cursor"} else ""
+    paths = []
+    for stem, title in LEGACY_FILES.items():
+        path = root / directory / f"{stem}{suffix}"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{front}{title}\n\nfluid generate-artifacts, 13 tools\n")
+        paths.append(path)
+    return paths
+
+
+@pytest.mark.parametrize("target", sorted(LEGACY))
+def test_force_removes_the_legacy_steering_files(tmp_path: Path, target: str, capsys):
+    legacy = _write_legacy(tmp_path, target)
+    _run(tmp_path, target, force=True)
+    assert not any(p.exists() for p in legacy)
+    out = capsys.readouterr().out
+    assert "removed 4 legacy steering file(s)" in out
+    assert (tmp_path / INDEX_FILES[target]).is_file()
+
+
+@pytest.mark.parametrize("target", sorted(LEGACY))
+def test_without_force_legacy_steering_is_kept_with_a_warning(tmp_path: Path, target: str, caplog):
+    legacy = _write_legacy(tmp_path, target)
+    with caplog.at_level(logging.WARNING):
+        _run(tmp_path, target)
+    assert all(p.exists() for p in legacy)
+    assert "re-run with --force to remove them" in caplog.text.replace("Re-run", "re-run")
+    assert all(p.name in caplog.text for p in legacy)
+
+
+def test_a_users_own_steering_file_with_another_heading_survives(tmp_path: Path):
+    mine = tmp_path / ".kiro/steering/01-forge-cli.md"
+    mine.parent.mkdir(parents=True)
+    mine.write_text("---\ninclusion: always\n---\n# Our team's forge rules\n\nkeep\n")
+    other = tmp_path / ".kiro/steering/05-extra.md"
+    other.write_text("# forge-cli — agentic guide\n")
+    _run(tmp_path, "kiro", force=True)
+    assert "keep" in mine.read_text()
+    assert other.exists()
 
 
 # ---------------------------------------------------------------------------

@@ -349,6 +349,45 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Run 'fluid doctor' to see which optional packages are installed"],
         None,
     ),
+    # ``fluid scaffold-ide`` refusals. Each one is raised before the command writes a file.
+    "claude_settings_not_valid_json": (
+        [
+            "Fix the JSON syntax in the named .claude/settings.json (or settings.local.json)",
+            "Re-run: fluid scaffold-ide --target claude-code",
+        ],
+        None,
+    ),
+    "claude_settings_unexpected_shape": (
+        [
+            "The named settings file must be a JSON object; if it has 'hooks', that must be an "
+            "object, and 'hooks.PostToolUse' a list of objects",
+            "Fix the file, then re-run: fluid scaffold-ide --target claude-code",
+        ],
+        None,
+    ),
+    "scaffold_ide_file_not_utf8": (
+        [
+            "Re-save the named CLAUDE.md or AGENTS.md as UTF-8",
+            "Then re-run: fluid scaffold-ide --target <target>",
+        ],
+        None,
+    ),
+    "scaffold_ide_block_markers_malformed": (
+        [
+            "The named CLAUDE.md or AGENTS.md must hold either no scaffold-ide markers or exactly "
+            "one '<!-- BEGIN forge-cli scaffold-ide block -->' followed by one matching END marker",
+            "Delete the stray or duplicate marker lines (the file was left untouched), "
+            "then re-run: fluid scaffold-ide --target <target>",
+        ],
+        None,
+    ),
+    "refusing_to_overwrite_existing_file_pass_force_to_override": (
+        [
+            "Re-run with --force to replace the file: fluid scaffold-ide --target <target> --force",
+            "--force keeps the text of CLAUDE.md and AGENTS.md outside the scaffold-ide block",
+        ],
+        None,
+    ),
     "optional_dependency_missing": (
         ["Run 'fluid doctor' to see which optional packages are installed"],
         None,

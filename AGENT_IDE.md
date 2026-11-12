@@ -33,7 +33,7 @@ That's it. Your IDE now has:
 
 | Target | Files emitted | Skills | Hook substrate |
 |---|---|---|---|
-| `kiro` | `.kiro/{settings/mcp.json, steering/fluid.md, hooks/, specs/}` | `.agents/skills/` | yes (event-driven) |
+| `kiro` | `.kiro/{settings/mcp.json, steering/fluid.md, hooks/, specs/}` | `.kiro/skills/` | yes (event-driven) |
 | `cursor` | `.cursor/{mcp.json, rules/fluid.mdc, HOOKS.md}` | `.agents/skills/` | no (agent-driven) |
 | `claude-code` | `.mcp.json` + `CLAUDE.md` block + `.claude/settings.local.json` | `.claude/skills/` | yes (PostToolUse) |
 | `cline` | `.cline/mcp_settings.json` + `.clinerules/fluid.md` | `.agents/skills/` | no (agent-driven) |

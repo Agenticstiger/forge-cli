@@ -9,8 +9,8 @@ Design: one canonical pack, multiple per-IDE adapters that translate paths and
 frontmatter. Sibling to ``scaffold-ci``. The pack is:
 
 * the Agent Skills in ``fluid_build/agent_skills/skills/`` (agentskills.io
-  ``SKILL.md`` format), copied into ``.claude/skills/`` for Claude Code and into
-  ``.agents/skills/`` for every other target;
+  ``SKILL.md`` format), copied into ``.claude/skills/`` for Claude Code, into
+  ``.kiro/skills/`` for Kiro and into ``.agents/skills/`` for every other target;
 * a short always-loaded index that names each skill and the few rules an agent must
   never break. It replaced four always-loaded steering files (11.2k characters) that
   had drifted from the CLI: a compressed index the agent always sees beats a skill it
@@ -40,10 +40,11 @@ LOG = logging.getLogger(__name__)
 TARGETS = ("kiro", "cursor", "claude-code", "cline", "generic")
 
 #: Where each target's agent finds the skills. Claude Code reads only its own
-#: directory; ``.agents/skills/`` is the cross-agent one (Codex, Cursor, Antigravity
-#: and the ``npx skills`` installer use it).
+#: directory and so does Kiro (https://kiro.dev/docs/skills/: workspace skills live in
+#: ``.kiro/skills/``); ``.agents/skills/`` is the cross-agent one (Codex, Cursor,
+#: Antigravity and the ``npx skills`` installer use it).
 SKILLS_DIRS = {
-    "kiro": ".agents/skills",
+    "kiro": ".kiro/skills",
     "cursor": ".agents/skills",
     "claude-code": ".claude/skills",
     "cline": ".agents/skills",
@@ -250,6 +251,11 @@ def _mcp_server_block(python_bin: str) -> Dict:
     }
 
 
+#: Claude Code's timeout for the hook. It must exceed the script's own ``TIMEOUT_S``
+#: (60), or Claude Code kills the hook before the script can print its timeout message.
+_HOOK_TIMEOUT_S = 90
+
+
 def _hook_script() -> Path:
     """The validate hook's script inside this installation of forge."""
     from fluid_build.agent_skills import PACK_DIR
@@ -273,7 +279,7 @@ def _validate_hook_entry(python_bin: str) -> Dict:
             {
                 "type": "command",
                 "command": f"{shlex.quote(python_bin)} {shlex.quote(str(_hook_script()))}",
-                "timeout": 60,
+                "timeout": _HOOK_TIMEOUT_S,
             }
         ],
     }
@@ -312,28 +318,67 @@ def _write_mcp_config(root: Path, rel: str, python_bin: str, force: bool) -> Pat
     return _write(root, rel, json.dumps(config, indent=2) + "\n", force)
 
 
+def _read_instructions(path: Path) -> str:
+    """The text of a CLAUDE.md / AGENTS.md; a file that is not UTF-8 is refused.
+
+    Read with universal newlines, as before: ``atomic_write`` writes in text mode, so a
+    ``\\r\\n`` kept in the text would come back as ``\\r\\r\\n`` on Windows.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise CLIError(2, "scaffold_ide_file_not_utf8", {"path": str(path)}) from exc
+
+
+def _block_span(existing: str, path: Path) -> Optional[tuple[int, int]]:
+    """Where the scaffold-ide block sits in ``existing``, or ``None`` when it has none.
+
+    A file is valid with no markers or with exactly one BEGIN followed by exactly one
+    END. Anything else (an orphan marker, an END before the BEGIN, two blocks) is
+    refused: guessing which text lies between the markers could delete the user's.
+    """
+    begins = existing.count(_BLOCK_BEGIN)
+    ends = existing.count(_BLOCK_END)
+    if begins == 0 and ends == 0:
+        return None
+    start = existing.find(_BLOCK_BEGIN)
+    end = existing.find(_BLOCK_END)
+    if begins != 1 or ends != 1 or end < start:
+        raise CLIError(
+            2,
+            "scaffold_ide_block_markers_malformed",
+            {"path": str(path), "begin": begins, "end": ends},
+        )
+    return start, end + len(_BLOCK_END)
+
+
+def _check_instructions(path: Path) -> None:
+    """Raise what an existing CLAUDE.md / AGENTS.md would make ``_upsert_block`` raise."""
+    if path.exists():
+        _block_span(_read_instructions(path), path)
+
+
 def _upsert_block(path: Path, body: str, force: bool) -> Optional[Path]:
     """Put ``body`` between the scaffold-ide markers in ``path``, keeping the rest.
 
     An existing file keeps every line outside the markers. Without ``--force`` a
     file that already has the block is left alone; with it, only the block is
-    replaced.
+    replaced. A file with malformed markers is refused and left untouched.
     """
     block = f"{_BLOCK_BEGIN}\n\n{body.rstrip()}\n\n{_BLOCK_END}"
     if not path.exists():
         atomic_write(str(path), block + "\n")
         return path
-    existing = path.read_text(encoding="utf-8")
-    start = existing.find(_BLOCK_BEGIN)
-    end = existing.find(_BLOCK_END, start + 1) if start >= 0 else -1
-    if start >= 0 and end > start:
+    existing = _read_instructions(path)
+    span = _block_span(existing, path)
+    if span is not None:
         if not force:
             LOG.info(
                 "%s already has a scaffold-ide block — skipping. Pass --force to replace.",
                 path.name,
             )
             return None
-        updated = existing[:start] + block + existing[end + len(_BLOCK_END) :]
+        updated = existing[: span[0]] + block + existing[span[1] :]
     else:
         updated = existing.rstrip() + "\n\n" + block + "\n"
     atomic_write(str(path), updated)
@@ -369,20 +414,27 @@ def _read_settings(path: Path) -> Dict:
     return settings
 
 
-#: What a command scaffold-ide wrote contains, in each version: the script by path,
-#: the module the first cut ran with ``-m``, and the hook before that.
-_OWN_HOOK_MARKERS = (
-    "agent_skills/hooks/validate_contract.py",
-    "agent_skills.hooks.validate_contract",
-    "fluid validate ${tool_input.file_path}",
-)
+#: The command the first scaffold-ide hook ran, character for character.
+_LEGACY_HOOK_COMMAND = "fluid validate ${tool_input.file_path}"
+_HOOK_SCRIPT_SUFFIX = "/agent_skills/hooks/validate_contract.py"
 
 
 def _is_validate_handler(handler: object) -> bool:
-    """This hook as some version of scaffold-ide wrote it; never a user's own hook."""
-    command = handler.get("command", "") if isinstance(handler, dict) else ""
-    normalised = command.replace("\\", "/") if isinstance(command, str) else ""
-    return any(marker in normalised for marker in _OWN_HOOK_MARKERS)
+    """This hook as some version of scaffold-ide wrote it; never a user's own hook.
+
+    Matches exactly: the legacy command, or ``<python> <path>/agent_skills/hooks/
+    validate_contract.py`` as two shell tokens. A wrapper around either is the user's.
+    """
+    command = handler.get("command") if isinstance(handler, dict) else None
+    if not isinstance(command, str):
+        return False
+    if command.strip() == _LEGACY_HOOK_COMMAND:
+        return True
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    return len(tokens) == 2 and tokens[1].replace("\\", "/").endswith(_HOOK_SCRIPT_SUFFIX)
 
 
 def _without_validate_hook(post: list) -> list:
@@ -432,13 +484,29 @@ def _write_claude_settings(root: Path, python_bin: str) -> list[Path]:
 
 
 def _ignore_in_git(root: Path, rel: str) -> Optional[Path]:
-    """Add ``rel`` to ``root/.gitignore`` unless a line already names it."""
+    """Add ``rel`` to ``root/.gitignore`` unless a line already names it.
+
+    Appends in binary mode, so the file's mode, line endings and every other byte stay
+    as they were. A ``.gitignore`` that cannot be appended to is not fatal: the entry
+    to add by hand is logged.
+    """
     gitignore = root / ".gitignore"
-    existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
-    if rel in {line.strip().lstrip("/") for line in existing.splitlines()}:
+    try:
+        if gitignore.exists() and not gitignore.is_file():
+            raise OSError(f"{gitignore} is not a regular file")
+        existing = gitignore.read_bytes() if gitignore.exists() else b""
+        lines = {
+            line.strip().lstrip("/") for line in existing.decode("utf-8", "replace").splitlines()
+        }
+        if rel in lines:
+            return None
+        newline = b"\r\n" if b"\r\n" in existing else b"\n"
+        separator = b"" if not existing or existing.endswith(b"\n") else newline
+        with open(gitignore, "ab") as handle:
+            handle.write(separator + rel.encode("utf-8") + newline)
+    except OSError as exc:
+        LOG.warning("could not update %s (%s): add the line %r to it by hand", gitignore, exc, rel)
         return None
-    prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
-    atomic_write(str(gitignore), f"{prefix}{rel}\n")
     return gitignore
 
 
@@ -591,6 +659,96 @@ def _emit_generic(root: Path, python_bin: str, force: bool) -> list[Path]:
     return written
 
 
+def _preflight(root: Path, target: str) -> None:
+    """Raise every error an existing file's content or type can cause, before any write."""
+    if target == "claude-code":
+        _read_settings(root / ".claude" / "settings.json")
+        _read_settings(root / ".claude" / "settings.local.json")
+        _check_instructions(root / "CLAUDE.md")
+    elif target == "generic":
+        _check_instructions(root / "AGENTS.md")
+
+
+#: The four always-loaded steering files earlier scaffold-ide versions wrote, per target.
+_LEGACY_STEERING_DIRS = {
+    "kiro": (".kiro/steering", ".md"),
+    "cursor": (".cursor/rules", ".mdc"),
+    "cline": (".clinerules", ".md"),
+    "generic": (".ai/steering", ".md"),
+}
+_LEGACY_STEERING_STEMS = (
+    "01-forge-cli",
+    "02-contract-schema",
+    "03-pipeline-decisions",
+    "04-guardrails",
+)
+#: The first Markdown heading of each of those files, in every version that wrote them.
+_LEGACY_STEERING_TITLES = frozenset(
+    {
+        "# forge-cli — agentic guide",
+        "# contract.fluid.yaml — schema cheatsheet",
+        "# When to call which `fluid` command — decision tree",
+        "# Guardrails — what's free with `pip install data-product-forge`",
+    }
+)
+
+
+def _first_h1(path: Path) -> Optional[str]:
+    """The first ``# `` line after an optional ``---`` frontmatter block."""
+    try:
+        lines = path.read_bytes().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    start = 0
+    if lines and lines[0].strip() == "---":
+        for i, line in enumerate(lines[1:], start=1):
+            if line.strip() == "---":
+                start = i + 1
+                break
+    for line in lines[start:]:
+        if line.startswith("# "):
+            return line.strip()
+    return None
+
+
+def _legacy_steering(root: Path, target: str) -> list[Path]:
+    """Steering files an earlier scaffold-ide wrote: right name and right first heading."""
+    if target not in _LEGACY_STEERING_DIRS:
+        return []
+    directory, suffix = _LEGACY_STEERING_DIRS[target]
+    found = []
+    for stem in _LEGACY_STEERING_STEMS:
+        path = root / directory / f"{stem}{suffix}"
+        if path.is_file() and _first_h1(path) in _LEGACY_STEERING_TITLES:
+            found.append(path)
+    return found
+
+
+def _retire_legacy_steering(
+    root: Path, target: str, force: bool, log: logging.Logger
+) -> list[Path]:
+    """Remove (``--force``) or report the steering files the index replaced."""
+    legacy = _legacy_steering(root, target)
+    if not legacy:
+        return []
+    if not force:
+        log.warning(
+            "earlier scaffold-ide versions wrote steering files that contradict the new index: "
+            "%s. Re-run with --force to remove them.",
+            ", ".join(p.relative_to(root).as_posix() for p in legacy),
+        )
+        return []
+    removed = []
+    for path in legacy:
+        try:
+            path.unlink()
+        except OSError as exc:
+            log.warning("could not remove %s: %s", path, exc)
+        else:
+            removed.append(path)
+    return removed
+
+
 _DISPATCH: Dict[str, Callable[[Path, str, bool], list[Path]]] = {
     "kiro": _emit_kiro,
     "cursor": _emit_cursor,
@@ -627,15 +785,21 @@ def run(args, logger: logging.Logger | None = None) -> int:
         raise MissingOptionalDependency(
             "mcp", "mcp", "fluid scaffold-ide (the IDE entry it writes launches `fluid mcp serve`)"
         )
+    _preflight(out_root, target)
     if not out_root.exists():
         out_root.mkdir(parents=True, exist_ok=True)
 
     written = _DISPATCH[target](out_root, python_bin, force)
+    removed = _retire_legacy_steering(out_root, target, force, log)
     info(log, "scaffold_ide_written", target=target, count=len(written), out=str(out_root))
     # User-facing summary.
     success(f"scaffold-ide({target}): wrote {len(written)} file(s) under {out_root}")
     for p in written:
         cprint(f"  - {p.relative_to(out_root)}")
+    if removed:
+        cprint(f"removed {len(removed)} legacy steering file(s):")
+        for p in removed:
+            cprint(f"  - {p.relative_to(out_root)}")
     cprint("\nNext steps:")
     cprint("  1. Open this workspace in your IDE.")
     cprint(f"  2. The IDE will auto-spawn `fluid mcp serve` ({_mcp_tool_count()} tools).")

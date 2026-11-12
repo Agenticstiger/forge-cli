@@ -29,15 +29,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`fluid scaffold-ide` installs the skills and writes a short index instead of four steering
   files.** The always-loaded text drops from 11,196 characters to about 2,100. It names each
-  skill where it is installed (`.claude/skills/` for Claude Code, `.agents/skills/` for the other
-  targets) and states the rules an agent must not break. The steering it replaced named a command
-  that does not exist (`fluid generate-artifacts`; the stage is `fluid generate artifacts`) and
-  counted 13 MCP tools: the count now comes from the server's registry (16). `--force` replaces
+  skill where it is installed (`.claude/skills/` for Claude Code, `.kiro/skills/` for Kiro,
+  `.agents/skills/` for the other targets) and states the rules an agent must not break. The
+  steering it replaced named a command that does not exist (`fluid generate-artifacts`; the
+  stage is `fluid generate artifacts`) and counted 13 MCP tools: the count now comes from the
+  server's registry (16). `--force` replaces
   only the marked block in an existing `CLAUDE.md` or `AGENTS.md`, where it used to overwrite the
   whole file. The validate hook goes into `.claude/settings.local.json`, since it names this
   machine's interpreter, and that file is added to `.gitignore`; its other settings are kept, and
   the handler an earlier version wrote into the shared `.claude/settings.json` is removed, leaving
-  that file's other handlers, a user's own validate hooks included.
+  that file's other handlers, a user's own validate hooks included (only the exact commands
+  scaffold-ide wrote are removed). Every error an existing file can cause (an invalid
+  `.claude/settings.json`, a `CLAUDE.md` or `AGENTS.md` that is not UTF-8) is raised before the
+  first write, and a file whose scaffold-ide markers are not exactly one BEGIN then one END is
+  refused and left untouched. The `.gitignore` entry is appended in place, keeping the file's
+  mode and line endings; a `.gitignore` that cannot be appended to only logs a warning. The four
+  steering files earlier versions wrote (`01-forge-cli` to `04-guardrails` under
+  `.kiro/steering/`, `.cursor/rules/`, `.clinerules/`, `.ai/steering/`) are removed with
+  `--force` when their first heading is unchanged, and listed in a warning without it.
 
 - **A non-interactive run with no LLM configured authors with an installed coding agent.** When
   nothing names one (no `--llm-provider`, `--llm-endpoint` or `--llm-model`, no `FLUID_LLM_*`,
