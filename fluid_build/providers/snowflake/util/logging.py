@@ -17,6 +17,7 @@ from typing import Any, Dict, List
 from fluid_build.observability.secret_redactor import (
     _URL_USERINFO_RE,
     is_sensitive_key_name,
+    redact_jose_tokens,
     redact_known_values,
 )
 
@@ -117,19 +118,9 @@ SENSITIVE_PATTERNS = [
     # Azure keys (for external stages)
     re.compile(r'"azure_sas_token":\s*"[^"]*"', re.IGNORECASE),
     re.compile(r"AZURE_STORAGE_SAS_TOKEN=[^\s;&]+", re.IGNORECASE),
-    # Third-party / provider token shapes (S-010)
-    # JWT (three base64url parts separated by dots)
-    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
-    # JWT (two-segment header.payload, no signature)
-    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
-    # Generic 3-segment JWT — prefix-agnostic (does NOT require the ``eyJ``
-    # header). Mirrors the global ``secret_redactor._JWT_RE`` so a JWT signed
-    # with a non-JSON / non-``eyJ`` header (or any three high-entropy base64url
-    # runs) is masked by this layer too (CLAUDE.md symmetry). Placed AFTER the
-    # two ``eyJ``-anchored patterns so the tighter, header-anchored spans win
-    # first. Each segment is bounded-min {12,} (not unbounded) to keep it from
-    # matching short dotted identifiers / version strings.
-    re.compile(r"\b[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b"),
+    # Third-party / provider token shapes (S-010). JWTs are not in this list:
+    # redact_string() masks them with the global layer's redact_jose_tokens, the one
+    # implementation both layers share (CLAUDE.md symmetry).
     # Stripe restricted / live / test secret keys
     re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}"),
     # GitHub personal access tokens, OAuth tokens, app installation tokens
@@ -264,6 +255,9 @@ def redact_string(text: str) -> str:
     # password containing ``;`` ``,`` ``}`` ``]`` ``"`` ``&`` or a space is
     # masked whole, which no assignment pattern can guarantee.
     redacted = redact_known_values(text, placeholder="[REDACTED]")
+    # JWTs, JWSs and JWEs: the global layer's rule, so a dotted table name survives
+    # here exactly as it does there.
+    redacted = redact_jose_tokens(redacted, placeholder="[REDACTED]")
 
     for pattern in SENSITIVE_PATTERNS:
         # Three substitution shapes, dispatched on the pattern's groups:

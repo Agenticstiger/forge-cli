@@ -99,19 +99,29 @@ def test_sensitive_patterns_group_counts_are_handled_by_redact_string() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _spaced_header_jwt() -> str:
+    """A JWT whose header does NOT base64url-encode to ``eyJ``: one written with spaces
+    (``{ "alg": ... }`` encodes to ``eyA``). Built at runtime so no literal token sits in
+    the file."""
+    import base64
+
+    parts = (b'{ "alg": "HS256" }', b'{"sub":"user1234567"}', bytes(32))
+    return ".".join(base64.urlsafe_b64encode(part).rstrip(b"=").decode() for part in parts)
+
+
 class TestSnowflakeRedactionSymmetryGaps:
     """Gaps ``redact_string`` previously leaked while the global
     ``redact_secret_text`` twin caught them."""
 
     # -- Gap 5: generic non-``eyJ`` 3-segment JWT --------------------------
     def test_generic_non_eyj_three_segment_jwt_masked(self) -> None:
-        # A JWT whose header does NOT base64url-encode to ``eyJ`` (or any three
-        # high-entropy base64url runs) — previously only the ``eyJ``-anchored
-        # patterns existed here, so this leaked.
-        jwt = "aGVhZGVyMTIzNDU2.cGF5bG9hZDEyMzQ1Ng.c2lnbmF0dXJlMTIz"
-        out = redact_string(f"stage token {jwt} accepted")
-        assert jwt not in out
-        assert "[REDACTED]" in out
+        jwt = _spaced_header_jwt()
+        assert not jwt.startswith("eyJ")
+        assert redact_string(f"stage token {jwt} accepted") == "stage token [REDACTED] accepted"
+        # A fully qualified table name has the same shape and is no token. The rule this
+        # layer shared with the global one masked it ("table=[REDACTED]").
+        name = "loaded northwind_towers.bronze_smart_meters.smart_meters rows=340"
+        assert redact_string(name) == name
 
     def test_eyj_anchored_jwt_still_masked(self) -> None:
         # The tighter eyJ-anchored patterns must still win (positioned first).
@@ -165,9 +175,13 @@ class TestSnowflakeRedactionSymmetryGaps:
     def test_gaps_symmetric_with_global_twin(self) -> None:
         from fluid_build.observability.secret_redactor import redact_secret_text
 
-        jwt = "aGVhZGVyMTIzNDU2.cGF5bG9hZDEyMzQ1Ng.c2lnbmF0dXJlMTIz"
-        assert jwt not in redact_string(f"t {jwt} x")
-        assert jwt not in redact_secret_text(f"t {jwt} x")
+        # A non-``eyJ`` JWT, masked by both layers...
+        jwt = _spaced_header_jwt()
+        assert jwt.split(".")[0] not in redact_string(f"t {jwt} x")
+        assert jwt.split(".")[0] not in redact_secret_text(f"t {jwt} x")
+        # ...and a fully qualified name of the same shape, kept by both.
+        name = "northwind_towers.bronze_smart_meters.smart_meters"
+        assert redact_string(f"t {name} x") == redact_secret_text(f"t {name} x") == f"t {name} x"
 
         value = "MIIEvQIBADANBgkqhkiNONPEMVALUE0123456789"  # pragma: allowlist secret
         line = f"private_key={value}"

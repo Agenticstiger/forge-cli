@@ -162,6 +162,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   land such an expose (`payload.landed_by`) and asks no table for it. An expose that no build
   writes, or that another build may write, still reports its missing source, and the drift
   verdict and exit code are unchanged.
+- **Log redaction no longer masks fully qualified names.** `fluid apply` printed
+  `databricks.load table=***REDACTED***` for `northwind_towers.bronze_smart_meters.smart_meters`
+  and the name of the next table, whose last part had 11 characters: the generic JWT rule masked
+  any three dotted runs of 12 or more characters. Such a run is now masked only when its first
+  part is a JOSE header (base64url of a JSON object, the check detect-secrets makes), so
+  `catalog.schema.table`, `project.dataset.table` and `DB.SCHEMA.TABLE` names stay readable in
+  logs and errors. Tokens are still masked, in both redaction layers (the Snowflake one now uses
+  the global rule), and more of them than before: a JWE (one with direct encryption has an empty
+  encrypted key), a JWS with a short or empty payload or signature, a header written with spaces
+  or newlines, and a token glued to a word (`token_eyJ…`). The rule no longer scans quadratically
+  on `a-a-a-…` input. `redact_secret_text()` loses its `keep_dotted_names` keyword (0.28.0):
+  logs and printed errors now apply the same rule.
 
 ## [0.29.0] — 2026-11-12
 
