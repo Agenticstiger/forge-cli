@@ -188,9 +188,9 @@ def failure_hints(address: str) -> List[str]:
     if not address.startswith(f"{RESOURCE_TYPE}."):
         return []
     return [
-        "Databricks did not turn on data quality monitoring for this schema (its tables were "
-        "created first). It needs a Unity Catalog workspace with serverless compute, and "
-        "MANAGE on the schema for this identity (the schema's owner has it).",
+        "Databricks refused the data quality monitor on this schema; the schema's tables are "
+        "in place (they come first). Monitoring needs a Unity Catalog workspace with "
+        "serverless compute, and MANAGE on the schema for this identity (its owner has it).",
         "Or turn it off for the expose: set contract.dq.monitoring.enabled: false, then "
         "re-run fluid apply.",
     ]

@@ -155,7 +155,7 @@ def test_a_refused_monitor_fails_the_apply_with_the_way_out(workspace, fake, cap
 
     rc, out = apply_contract(capfd, write_contract(workspace, _monitored()))
     assert rc != 0
-    assert "Databricks did not turn on data quality monitoring for this schema" in out
+    assert "Databricks refused the data quality monitor on this schema" in out
     assert "set contract.dq.monitoring.enabled: false, then re-run fluid apply" in out
     # created first, and kept: a re-run converges
     assert {"main.sales.orders", "main.sales.notes"} <= set(fake.tables)

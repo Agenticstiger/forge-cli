@@ -408,7 +408,7 @@ class TestApplyFailure:
         assert err.event == "opentofu_apply_failed"
         assert err.context["resource"] == f"{MONITOR}.{KEY}"
         first, second, last = err.suggestions[-3:]
-        assert first.startswith("Databricks did not turn on data quality monitoring")
+        assert first.startswith("Databricks refused the data quality monitor on this schema")
         assert "MANAGE on the schema" in first
         assert "contract.dq.monitoring.enabled: false" in second
         assert last.startswith("To see what exists")
