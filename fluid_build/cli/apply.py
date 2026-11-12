@@ -372,16 +372,17 @@ def _jobs_from_state(engine_kwargs: Dict[str, Any], contract: Dict[str, Any]) ->
 
 
 def _gate_databricks_sdk_for_apply(
-    contract: Dict[str, Any], build_id: Optional[str], dry_run: bool
+    contract: Dict[str, Any], build_id: Optional[str], dry_run: bool, engine: str
 ) -> None:
     """Refuse, before anything is applied, a build phase that starts Databricks job runs
     without databricks-sdk, which starts them. Otherwise ``tofu apply`` would provision the
-    jobs and the build would then fail. A dry run starts none.
+    jobs and the build would then fail. Only the OpenTofu engine starts them (the native one
+    provisions no job), and a dry run starts none.
 
     Raises:
         CLIError: ``apply_databricks_sdk_missing``.
     """
-    if dry_run or not _databricks_job_runs(contract, build_id):
+    if dry_run or engine != "opentofu" or not _databricks_job_runs(contract, build_id):
         return
     import importlib.util
 
@@ -2123,7 +2124,10 @@ def run(args, logger: logging.Logger) -> int:
             _gate_build_ids_for_apply(source_contract)
             _gate_selected_build_for_apply(source_contract, resolved_build_id)
             _gate_databricks_sdk_for_apply(
-                source_contract, resolved_build_id, bool(getattr(args, "dry_run", False))
+                source_contract,
+                resolved_build_id,
+                bool(getattr(args, "dry_run", False)),
+                apply_engine,
             )
     except CLIError as exc:
         _log_apply_failure(logger, start_time, exc)

@@ -349,6 +349,11 @@ def _apply_via_opentofu(
     if applied_state is not None:
         # After the bindings: a job the build phase starts writes tables already protected.
         applied_state.extend(runner.tofu_state_resources(str(workdir), env=env))
+        if not applied_state:  # an apply that provisioned a job leaves a state with it
+            cprint(
+                f"  ⚠️  could not read the applied state back (tofu show -json in {workdir}): "
+                "the build phase cannot find the jobs this apply provisioned."
+            )
 
     info(logger, "opentofu_apply_ok", provider=provider, **applied)
     return 0

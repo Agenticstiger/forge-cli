@@ -740,6 +740,21 @@ def job_product(contract: Mapping[str, Any]) -> str:
     return str(contract.get("id") or contract.get("name") or "product")
 
 
+def job_build_id(contract: Mapping[str, Any], build: Mapping[str, Any]) -> str:
+    """The build a job is named and tagged (``BUILD_TAG``) after: its ``id``, or, since the
+    schema does not require one, its position in ``builds[]``."""
+    if build.get("id"):
+        return str(build["id"])
+    builds = list(contract.get("builds") or [])
+    for index, candidate in enumerate(builds):
+        if candidate is build:
+            return str(index)
+    for index, candidate in enumerate(builds):
+        if candidate == build:
+            return str(index)
+    return "unknown"
+
+
 def compile_dbt_jobs(
     contract: Mapping[str, Any],
     tables: Sequence[Any],
@@ -761,7 +776,7 @@ def compile_dbt_jobs(
     for index, build in enumerate(contract.get("builds") or []):
         if not isinstance(build, Mapping) or not is_databricks_job_build(build):
             continue
-        build_id = str(build.get("id") or index)
+        build_id = job_build_id(contract, build)
         item = _Build(
             build, build_id, f"builds[{index}] ({build_id})", product, warehouse, run_as_allowed
         )

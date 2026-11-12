@@ -368,7 +368,11 @@ class TestStartAndWait:
         assert rc == 1
         assert "could not start a run of Databricks job 'fluid sales.orders transform' (5)" in out
         assert "PermissionError" in out and TOKEN not in out
-        assert api.writes() == ["run-now"]
+        # Tried three times, always with the one token: Databricks starts one run at most.
+        assert api.writes() == ["run-now"] * 3
+        tokens = {b["idempotency_token"] for _m, e, _q, b in api.calls if e == "run-now"}
+        assert len(tokens) == 1
+        assert "if Databricks started it anyway, it is on the job's page:" in out
 
     def test_a_poll_that_fails_says_the_run_may_still_be_going(self, capsys) -> None:
         api = _Api([_run("RUNNING")])
@@ -382,10 +386,75 @@ class TestStartAndWait:
         api.do = flaky  # type: ignore[method-assign]
         rc, out = _go(api, capsys)
         assert rc == 1
-        assert "could not read run 77: ConnectionError: connection reset" in out
-        # Cancelled, so nothing the apply started is left running.
-        assert api.writes() == ["run-now", "runs/cancel"] and "cancelled run 77" in out
+        assert "could not read run 77 (ConnectionError: connection reset); trying again" in out
+        assert "could not read run 77 5 times in a row" in out and "may still be going" in out
+        # A run that cannot be seen is never cancelled: it may be well under way.
+        assert api.writes() == ["run-now"]
         assert f"run page: {URL}" in out
+
+    def test_one_failed_read_is_tried_again_and_the_run_goes_on(self, capsys) -> None:
+        # A plain 500, 502 or 504 the SDK does not repeat: one says nothing about the run.
+        api = _Api([_run("RUNNING"), _run("TERMINATED", code="SUCCESS")])
+        first = api.do
+        failed: list = []
+
+        def once(method: str, path: str, query: Any = None, body: Any = None, **kw: Any) -> Any:
+            if path.endswith("runs/get") and not failed:
+                failed.append(1)
+                raise RuntimeError("502 Bad Gateway")
+            return first(method, path, query=query, body=body, **kw)
+
+        api.do = once  # type: ignore[method-assign]
+        rc, out = _go(api, capsys)
+        assert rc == 0, out
+        assert "trying again" in out and "succeeded" in out
+        assert api.writes() == ["run-now"]
+
+    def test_run_now_is_tried_again_with_the_same_token(self, capsys) -> None:
+        api = _Api([_run("TERMINATED", code="SUCCESS")])
+        first = api.do
+        tries: list = []
+
+        def slow(method: str, path: str, query: Any = None, body: Any = None, **kw: Any) -> Any:
+            if path.endswith("run-now"):
+                tries.append(body["idempotency_token"])
+                if len(tries) < 3:
+                    raise TimeoutError("read timed out")
+            return first(method, path, query=query, body=body, **kw)
+
+        api.do = slow  # type: ignore[method-assign]
+        rc, out = _go(api, capsys)
+        assert rc == 0, out
+        assert len(tries) == 3 and len(set(tries)) == 1
+
+    def test_ctrl_c_once_the_run_has_ended_cancels_nothing(self, capsys) -> None:
+        api = _Api(
+            [_run("TERMINATED", code="SUCCESS", tasks=[_task("SUCCESS")])],
+            fail={"runs/get-output": KeyboardInterrupt()},
+        )
+        with pytest.raises(KeyboardInterrupt):
+            _go(api, capsys)
+        assert api.writes() == ["run-now"]
+
+    def test_sigterm_while_waiting_cancels_the_run(self, capsys) -> None:
+        import os
+        import signal
+        import threading
+
+        if threading.current_thread() is not threading.main_thread():
+            pytest.skip("a signal handler needs the main thread")
+        before = signal.getsignal(signal.SIGTERM)
+        api = _Api([_run("RUNNING")])
+
+        class _Kill(_Time):
+            def sleep(self, seconds: float) -> None:
+                os.kill(os.getpid(), signal.SIGTERM)  # what a cancelled CI job sends
+                super().sleep(seconds)
+
+        with pytest.raises(KeyboardInterrupt):
+            _go(api, capsys, time_=_Kill())
+        assert api.writes() == ["run-now", "runs/cancel"]
+        assert signal.getsignal(signal.SIGTERM) is before  # put back
 
 
 # ── choosing what to run ────────────────────────────────────────────────────
@@ -634,14 +703,49 @@ def test_a_run_id_from_the_list_is_printed_as_a_number_only(capsys) -> None:
     assert "waiting for the workspace's limit" in out  # nothing but a number counts as a run
 
 
-def test_a_run_that_can_be_neither_read_nor_cancelled_is_said_to_go_on(capsys) -> None:
+def test_a_run_that_cannot_be_cancelled_at_the_cap_is_said(capsys) -> None:
+    api = _Api([_run("RUNNING")], fail={"runs/cancel": ConnectionError("down")})
+    rc, out = _go(api, capsys, env={TIMEOUT_ENV: "30"})
+    assert rc == 1
+    assert "could not cancel run 77: ConnectionError: down" in out
+    assert "did not end within 30s." in out and f"run page: {URL}" in out
+
+
+@pytest.mark.parametrize("value", ["\u00b2", "9" * 5000])
+def test_a_timeout_int_cannot_read_is_said_before_anything_starts(capsys, value) -> None:
+    # str.isdigit() takes a superscript two and a 5000-digit number; int() refuses both.
+    api = _Api([_run("TERMINATED", code="SUCCESS")])
+    rc, out = _go(api, capsys, env={TIMEOUT_ENV: value})
+    assert rc == 0, out
+    assert "is not a whole number of seconds above 0" in out
+
+
+def test_a_build_without_an_id_finds_the_job_the_emitter_tagged_by_position(capsys) -> None:
+    build = {"engine": "dbt", "execution": {"runtime": {"platform": "databricks"}}}
+    contract = {"id": "sales.orders", "builds": [build]}
+    api = _Api([_run("TERMINATED", code="SUCCESS")])
+    rc = run_job_build(
+        contract,
+        build,
+        {"0": [JobRef(5)]},
+        client_factory=lambda: _Client(api),
+        env={},
+        sleep=_Time().sleep,
+        clock=_Time().clock,
+    )
+    out = " ".join(capsys.readouterr().out.split())
+    assert rc == 0, out
+    assert "started run 77 of Databricks job 'fluid sales.orders 0' (5)" in out
+
+
+def test_a_queued_run_of_the_job_is_not_the_one_ahead(capsys) -> None:
     api = _Api(
-        [_run("RUNNING")],
-        fail={"runs/get": ConnectionError("down"), "runs/cancel": ConnectionError("down")},
+        [_run("QUEUED"), _run("TERMINATED", code="SUCCESS")],
+        active=[{"run_id": 90, "status": {"state": "QUEUED"}}, {"run_id": 77}],
     )
     rc, out = _go(api, capsys)
-    assert rc == 1
-    assert "could not cancel run 77" in out and "run 77 may still be going" in out
+    assert rc == 0
+    assert "behind run 90" not in out and "waiting for the workspace's limit" in out
 
 
 @pytest.mark.parametrize("value", ["1h", "0", "-5", "soon"])

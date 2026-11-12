@@ -19,8 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `amend` and `create-only` still only provision, and a continuous job is not started.
   - The job's settings, schedule and pause state are never changed.
   - `FLUID_DATABRICKS_RUN_TIMEOUT_SECONDS` caps the wait: an hour, or the job's own timeouts
-    and retries plus 15 minutes. The run is cancelled at the cap, on Ctrl-C, or when it can
-    no longer be read.
+    and retries plus 15 minutes. The run is cancelled at the cap and on Ctrl-C, SIGTERM or
+    SIGHUP. A run that cannot be read five times in a row is left as it is, and the apply
+    says so. run-now is retried with the same idempotency token, so a retry never starts a
+    second run.
   - A missing `databricks-sdk` (the `[databricks]` extra) is refused before anything is
     applied.
 

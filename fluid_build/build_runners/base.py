@@ -132,18 +132,19 @@ def _report_databricks_job_build(
     ``_databricks_job_run.py``). Counted and recorded as
     :func:`_report_externally_run_build` counts a Flink job.
     """
-    product = contract.get("id") or contract.get("name") or "product"
+    from fluid_build.iac.providers.databricks_jobs import job_build_id, job_product
+
+    name = f"fluid {job_product(contract)} {job_build_id(contract, build)}"
     if is_continuous_build(build):
         how = "continuously; Databricks keeps it running, so fluid apply starts no run of it."
     else:
         how = (
-            "on its trigger (fluid apply provisions it). fluid apply --mode amend-and-build "
-            "starts a run now and waits for it; so do the job's page and: "
+            "on its trigger (fluid apply provisions it). An apply to databricks with --mode "
+            "amend-and-build starts a run now and waits for it; so do the job's page and: "
             "databricks jobs run-now <job id>."
         )
     cprint(
-        f"\n⏭️  Build '{build_id}' - dbt runs in the Databricks workspace as job "
-        f"'fluid {product} {build_id}' {how}",
+        f"\n⏭️  Build '{build_id}' - dbt runs in the Databricks workspace as job '{name}' {how}",
         markup=False,
     )
     _record_run_elsewhere(build_id, report)

@@ -236,3 +236,13 @@ class TestDatabricksSdkIsCheckedFirst:
     ) -> None:
         assert _apply(copy.deepcopy(_CONTRACT), *flags) == 0
         tofu.assert_called_once()
+
+
+def test_the_native_engine_never_needs_the_sdk() -> None:
+    """Only the OpenTofu engine provisions the job and starts its run."""
+    from fluid_build.cli.apply import _gate_databricks_sdk_for_apply
+
+    with mock.patch("importlib.util.find_spec", return_value=None):
+        _gate_databricks_sdk_for_apply(copy.deepcopy(_CONTRACT), None, False, "native")
+        with pytest.raises(CLIError):
+            _gate_databricks_sdk_for_apply(copy.deepcopy(_CONTRACT), None, False, "opentofu")

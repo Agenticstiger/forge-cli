@@ -30,12 +30,14 @@ build here once ``tofu apply`` has succeeded and the masks and row filters are b
    (``GET /api/2.2/jobs/runs/get-output``). Every credential value in the environment is
    masked in what is printed, and terminal control sequences are removed.
 
-The wait is capped (:func:`wait_budget`). At the cap, on Ctrl-C, and when the run can no
-longer be read (the SDK has already retried), the run is cancelled before the build fails,
-so ``fluid apply`` leaves nothing running that it started (an interrupted load cancels its
-INSERT the same way, ``_databricks_load.py``); a cancel that fails too is said, with the run
-page. A continuous job is never started here: Databricks keeps it running, and a run of it
-does not end.
+The wait is capped (:func:`wait_budget`). At the cap, and on Ctrl-C, SIGTERM or SIGHUP while
+the run is waited on, the run is cancelled before the build fails, so ``fluid apply`` leaves
+nothing running that it started (an interrupted load cancels its INSERT the same way,
+``_databricks_load.py``); a cancel that fails is said, with the run page. A run that cannot
+be read five times in a row is left as it is, never cancelled unseen, and the build fails
+saying so. run-now is tried again with the same idempotency token, so a retry never starts
+a second run. A continuous job is never started here: Databricks keeps it running, and a
+run of it does not end.
 
 Polling follows databricks-sdk-py's run waiter (``JobsAPI.wait_get_run_job_terminated_or_
 skipped``: a poll a second longer each time, at most 10 s; Apache-2.0), and the failed-task
@@ -51,10 +53,24 @@ import logging
 import os
 import re
 import shlex
+import signal
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from fluid_build._console import cprint
 from fluid_build._console import error as console_error
@@ -71,6 +87,9 @@ SLACK_SECONDS = 900
 HEARTBEAT_SECONDS = 60
 #: Lines of a failed task's output that are printed.
 TAIL_LINES = 30
+#: Tries of run-now (one idempotency token), and reads of a run in a row that may fail.
+_START_ATTEMPTS = 3
+_READ_ATTEMPTS = 5
 
 _JOBS = "/api/2.2/jobs"
 _REPLACE_MODES = ("replace", "replace-and-build")
@@ -148,9 +167,9 @@ def wait_budget(settings: Mapping[str, Any], env: Mapping[str, str]) -> int:
     ``runtime.timeout`` is never cut short. A task without a timeout, or one retried without
     end, leaves the hour.
     """
-    raw = str(env.get(TIMEOUT_ENV) or "").strip()
-    if raw.isdigit() and int(raw) > 0:
-        return int(raw)
+    override, _raw = _timeout_override(env)
+    if override is not None:
+        return override
     own = _whole(settings.get("timeout_seconds"))
     if not own:
         tasks = [task for task in settings.get("tasks") or [] if isinstance(task, Mapping)]
@@ -162,6 +181,15 @@ def wait_budget(settings: Mapping[str, Any], env: Mapping[str, str]) -> int:
             interval = _whole(task.get("min_retry_interval_millis")) // 1000
             own += timeout * (retries + 1) + interval * retries
     return max(DEFAULT_TIMEOUT_SECONDS, own + SLACK_SECONDS) if own > 0 else DEFAULT_TIMEOUT_SECONDS
+
+
+def _timeout_override(env: Mapping[str, str]) -> Tuple[Optional[int], str]:
+    """``FLUID_DATABRICKS_RUN_TIMEOUT_SECONDS`` as whole seconds above 0, or ``None``; and
+    the raw value. ASCII digits only: ``str.isdigit`` also takes ``²``, which ``int`` refuses."""
+    raw = str(env.get(TIMEOUT_ENV) or "").strip()
+    if raw.isascii() and raw.isdigit() and len(raw) <= 9 and int(raw) > 0:
+        return int(raw), raw
+    return None, raw
 
 
 def full_refresh_commands(settings: Mapping[str, Any]) -> Optional[List[str]]:
@@ -201,9 +229,14 @@ def run_job_build(
 
     ``jobs`` is :func:`jobs_in_state` of the apply that provisioned it.
     """
-    from fluid_build.iac.providers.databricks_jobs import BUILD_TAG, PRODUCT_TAG, job_product
+    from fluid_build.iac.providers.databricks_jobs import (
+        BUILD_TAG,
+        PRODUCT_TAG,
+        job_build_id,
+        job_product,
+    )
 
-    build_id = str(build.get("id") or "unknown")
+    build_id = job_build_id(contract, build)
     product = job_product(contract)
     name = f"fluid {product} {build_id}"
     full_refresh = (mode or "").strip().lower() in _REPLACE_MODES
@@ -219,9 +252,9 @@ def run_job_build(
         found = "no Databricks job" if not refs else f"{len(refs)} Databricks jobs"
         console_error(
             f"Build '{build_id}' - this apply's OpenTofu state holds {found} tagged "
-            f"{PRODUCT_TAG}={product}, {BUILD_TAG}={build_id}, so no run was "
-            "started. fluid apply provisions the job when it applies the contract to databricks; "
-            "check that the contract's provider is databricks, then re-run fluid apply."
+            f"{PRODUCT_TAG}={product}, {BUILD_TAG}={build_id}, so no run was started. Either "
+            "the state could not be read back after the apply (said above), or the contract "
+            "was not applied to databricks; fix that, then re-run fluid apply."
         )
         return 1
     try:
@@ -269,41 +302,75 @@ def start_and_wait(
     label = f"Databricks job '{name}' ({job.job_id})"
     try:
         settings = _job_settings(api, job.job_id)
-        body: Dict[str, Any] = {
-            "job_id": job.job_id,
-            "idempotency_token": uuid.uuid4().hex,
-            "queue": {"enabled": True},
-        }
-        if full_refresh:
-            commands = full_refresh_commands(settings)
-            if commands is None:
-                console_error(
-                    f"Build '{build_id}' - replace-and-build runs dbt with --full-refresh, and "
-                    f"{label} has no dbt commands to add it to, so no run was started. Re-run "
-                    "fluid apply to bring the job back to what the contract declares."
-                )
-                return 1
-            body["dbt_commands"] = commands
-        started = api.do("POST", f"{_JOBS}/run-now", body=body)
-        run_id = int((started or {})["run_id"])
+    except Exception as exc:  # noqa: BLE001
+        console_error(f"Build '{build_id}' - could not read {label}: {_failure(exc)}")
+        return 1
+    body: Dict[str, Any] = {
+        "job_id": job.job_id,
+        "idempotency_token": uuid.uuid4().hex,
+        "queue": {"enabled": True},
+    }
+    if full_refresh:
+        commands = full_refresh_commands(settings)
+        if commands is None:
+            console_error(
+                f"Build '{build_id}' - replace-and-build runs dbt with --full-refresh, and "
+                f"{label} has no dbt commands to add it to, so no run was started. Re-run "
+                "fluid apply to bring the job back to what the contract declares."
+            )
+            return 1
+        body["dbt_commands"] = commands
+    # Decided before the run starts, so nothing between run-now and the wait can fail.
+    budget = wait_budget(settings, env)
+    override, raw = _timeout_override(env)
+    try:
+        run_id = _run_now(api, body, sleep)
     except Exception as exc:  # noqa: BLE001
         console_error(f"Build '{build_id}' - could not start a run of {label}: {_failure(exc)}")
+        if job.url:
+            say(f"   if Databricks started it anyway, it is on the job's page: {clean(job.url)}")
         return 1
     LOG.debug("databricks_job_run_started job_id=%s run_id=%s", job.job_id, run_id)
     say(f"\n🚀 Build '{build_id}' - started run {run_id} of {label}")
-    budget = wait_budget(settings, env)
-    raw = str(env.get(TIMEOUT_ENV) or "").strip()
-    if raw and not (raw.isdigit() and int(raw) > 0):
+    if raw and override is None:
         say(
             f"   {TIMEOUT_ENV}={clean(raw)!r} is not a whole number of seconds above 0: "
             f"waiting up to {_duration(budget)}"
         )
     start = clock()
-    try:
-        return _wait(api, job.job_id, run_id, build_id, budget, start, say, sleep, clock)
-    except KeyboardInterrupt:
-        _cancel(api, run_id, say)
-        raise
+    with _cancelled_if_interrupted(api, run_id, say):
+        ended = _wait(api, job.job_id, run_id, build_id, budget, start, say, sleep, clock)
+    if ended is None:
+        return 1
+    # The run has ended: an interrupt from here on stops the report, never a run.
+    return _report_end(api, ended.run, run_id, build_id, ended.elapsed, ended.url, say)
+
+
+@dataclass(frozen=True)
+class _Ended:
+    """A run that reached a terminal state, as the last poll saw it."""
+
+    run: Mapping[str, Any]
+    elapsed: float
+    url: str
+
+
+def _run_now(api: Any, body: Mapping[str, Any], sleep: Callable[[float], None]) -> int:
+    """``POST run-now``; tried again with the same idempotency token when it fails.
+
+    Databricks starts at most one run per token, so a retry after a timeout or a server
+    error (neither of which the SDK repeats for a POST) gets back the run the first try
+    may already have started, and never a second one.
+    """
+    for attempt in range(1, _START_ATTEMPTS + 1):
+        try:
+            started = api.do("POST", f"{_JOBS}/run-now", body=dict(body))
+            return int((started or {})["run_id"])
+        except Exception:  # noqa: BLE001
+            if attempt == _START_ATTEMPTS:
+                raise
+            sleep(2 * attempt)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _wait(
@@ -316,29 +383,45 @@ def _wait(
     say: Say,
     sleep: Callable[[float], None],
     clock: Callable[[], float],
-) -> int:
+) -> Optional[_Ended]:
+    """Poll the run until it ends: what it ended as, or ``None`` once its failure is said."""
     last: Optional[Tuple[str, str]] = None
     queued_why: Optional[str] = None
     noted = start
     url = ""
     delay = 0
+    failed_reads = 0
     while True:
         try:
             run = api.do("GET", f"{_JOBS}/runs/get", query={"run_id": run_id}) or {}
         except Exception as exc:  # noqa: BLE001
-            console_error(f"Build '{build_id}' - could not read run {run_id}: {_failure(exc)}.")
-            if not _cancel(api, run_id, say):
-                say(f"   run {run_id} may still be going")
-            if url:
-                say(f"   run page: {url}")
-            return 1
+            # The SDK repeats only some failures (not a 500, 502 or 504), and one failed read
+            # says nothing about the run: try again, and never cancel a run that cannot be seen.
+            failed_reads += 1
+            if failed_reads == 1:
+                say(
+                    f"   {_clock(clock() - start)} could not read run {run_id} "
+                    f"({_failure(exc)}); trying again"
+                )
+            if failed_reads >= _READ_ATTEMPTS:
+                console_error(
+                    f"Build '{build_id}' - could not read run {run_id} {failed_reads} times in "
+                    f"a row: {_failure(exc)}. fluid apply leaves it as it is; it may still be "
+                    "going."
+                )
+                if url:
+                    say(f"   run page: {url}")
+                return None
+            sleep(5 * failed_reads)
+            continue
+        failed_reads = 0
         if not url and run.get("run_page_url"):
             url = clean(run["run_page_url"])
             say(f"   run page: {url}")
         now = clock()
         phase, why = _phase(run)
         if phase == "TERMINATED":
-            return _report_end(api, run, run_id, build_id, now - start, url, say)
+            return _Ended(run, now - start, url)
         if phase != "QUEUED":
             queued_why = None
         elif not why:
@@ -363,9 +446,50 @@ def _wait(
             if url:
                 say(f"   run page: {url}")
             LOG.debug("databricks_job_run_timed_out run_id=%s budget=%s", run_id, budget)
-            return 1
+            return None
         delay = min(delay + 1, 10)
         sleep(delay)
+
+
+@contextmanager
+def _cancelled_if_interrupted(api: Any, run_id: int, say: Say) -> Iterator[None]:
+    """Ctrl-C, SIGTERM or SIGHUP (a CI job cancelled, a terminal closed) while the run is
+    waited on cancels it, then interrupts as Ctrl-C always does."""
+    previous = _interrupt_on_terminate()
+    try:
+        yield
+    except KeyboardInterrupt:
+        _cancel(api, run_id, say)
+        raise
+    finally:
+        for signum, handler in previous.items():
+            try:
+                signal.signal(signum, handler)
+            except (TypeError, ValueError, OSError):
+                pass
+
+
+def _interrupt_on_terminate() -> Dict[int, Any]:
+    """Make SIGTERM and SIGHUP raise ``KeyboardInterrupt``; the handlers they replaced.
+
+    Only the main thread may set a handler, so elsewhere nothing changes.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    previous: Dict[int, Any] = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            previous[signum] = signal.signal(signum, _raise_interrupt)
+        except (ValueError, OSError):
+            continue
+    return previous
+
+
+def _raise_interrupt(signum: int, frame: Any) -> None:
+    raise KeyboardInterrupt
 
 
 def _report_end(
@@ -412,10 +536,13 @@ def _queued_behind(api: Any, job_id: int, run_id: int) -> str:
     except Exception:  # noqa: BLE001 — the reason is a courtesy
         return ""
     runs = listed.get("runs") if isinstance(listed, Mapping) else None
+    # Only a run that is going is ahead: another queued run waits as this one does.
     others = [
         other
-        for other in (_whole(r.get("run_id")) for r in runs or [] if isinstance(r, Mapping))
-        if other and other != run_id
+        for other, entry in (
+            (_whole(r.get("run_id")), r) for r in runs or [] if isinstance(r, Mapping)
+        )
+        if other and other != run_id and _phase(entry)[0] not in ("QUEUED", "TERMINATED")
     ]
     if others:  # newest first: the last one started first
         return f"behind run {others[-1]} of this job, which runs one at a time"
