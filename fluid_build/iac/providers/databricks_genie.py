@@ -850,7 +850,9 @@ def _update_found(
 ) -> None:
     live = _call(client, "read the Genie space", lambda: _get(client, space_id))
     title = _title_kept(live.get("title"), space.title, say)
-    changes = differences(live, space, serialized)
+    changes = differences(
+        live, space, serialized, _tables_of_space(client, live, space, serialized)
+    )
     if not changes:
         say(f"    {space.title!r}: no change ({_url(space_id)})")
     elif dry_run:
@@ -1142,9 +1144,45 @@ def _taken_title(exc: BaseException) -> bool:
     )
 
 
-def differences(live: Mapping[str, Any], space: Space, serialized: Mapping[str, Any]) -> List[str]:
+def _tables_of_space(
+    client: Any, live: Mapping[str, Any], space: Space, serialized: Mapping[str, Any]
+) -> set:
+    """The space's tables, as :func:`differences` names a change: the ones it asks for, and
+    each data source leaving the space that is still a table in Unity Catalog (a product, or an
+    expose, left out). One that is a metric view, or is gone, is said as a metric view."""
+    path = ("data_sources", "tables")
+    try:
+        held = json.loads(live.get("serialized_space") or "{}")
+    except (TypeError, ValueError):
+        held = {}
+    wanted = {
+        str(t.get("identifier")) for t in _dig(serialized, path) or () if isinstance(t, Mapping)
+    }
+    leaving = sorted(
+        str(t.get("identifier"))
+        for t in _dig(held, path) or ()
+        if isinstance(t, Mapping) and str(t.get("identifier")) not in wanted
+    )
+    tables = set(space.tables)
+    for name in leaving:
+        try:
+            info = _read_table(client, name)
+        except Exception:  # noqa: BLE001 — only the word for the change depends on it
+            info = None
+        if info and str(info.get("table_type") or "").upper() != "METRIC_VIEW":
+            tables.add(name)
+    return tables
+
+
+def differences(
+    live: Mapping[str, Any],
+    space: Space,
+    serialized: Mapping[str, Any],
+    tables: Optional[Collection[str]] = None,
+) -> List[str]:
     """What differs between the live space and the one the contract asks for, by name. A title
-    the service suffixed because another space has it counts as the same title."""
+    the service suffixed because another space has it counts as the same title. ``tables`` are
+    the data sources to name as tables (any other as a metric view); by default the space's."""
     changes = []
     if not _same_title(live.get("title"), space.title):
         changes.append("title")
@@ -1162,7 +1200,9 @@ def differences(live: Mapping[str, Any], space: Space, serialized: Mapping[str, 
             serialized, ("config", "sample_questions")
         ):
             named.append("sample questions")
-        named += _source_changes(held, serialized, set(space.tables))
+        named += _source_changes(
+            held, serialized, set(space.tables) if tables is None else set(tables)
+        )
         if _dig(held, ("instructions", "text_instructions")) != _dig(
             serialized, ("instructions", "text_instructions")
         ):

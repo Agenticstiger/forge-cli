@@ -658,6 +658,19 @@ def test_a_metric_view_over_the_table_becomes_a_data_source_once_it_exists(fake)
     assert "updated 'Site 360': metric views (" in Run(fake)(site_contract()).text
 
 
+def test_an_expose_taken_out_of_the_product_is_said_as_a_table_not_a_metric_view(fake):
+    doc = site_contract()
+    second = copy.deepcopy(doc["exposes"][0])
+    second["exposeId"] = "site_history"
+    second["binding"]["location"]["table"] = "site_history"
+    doc["exposes"].append(second)
+    fake.create_table("main.asset.site_history", [("site_id", "string", False)])
+    Run(fake)(doc)
+    run = Run(fake)(site_contract())  # the history expose is gone; its table stays in UC
+    (line,) = [s for s in run.said if "updated 'Site 360'" in s]
+    assert "tables" in line and "metric views" not in line
+
+
 def test_a_metric_view_sent_where_the_service_does_not_keep_it_would_never_converge(fake):
     """The stand-in keeps a space as the live service does: a metric view sent under
     ``data_sources.metric_views`` comes back among the tables (measured 2026-11-12)."""
