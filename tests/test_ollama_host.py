@@ -306,8 +306,14 @@ class TestSavedAddressesHoldNoCredentials:
 
     def test_inline_setup_keeps_the_credentials_in_ollama_host(self, tmp_path, monkeypatch):
         # ai_config.json holds the address without them; the environment keeps them.
+        from fluid_build.cli import ai_setup
         from fluid_build.cli.ai_setup import _save_ai_config, run_ai_setup_inline
 
+        # Hermetic: another test may have set the session-level skip, the real
+        # ~/.fluid must not be read, and the run must not depend on litellm.
+        monkeypatch.setattr(ai_setup, "_ai_setup_skipped", False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr("fluid_build._optional.is_available", lambda name: True)
         monkeypatch.delenv("FLUID_ALLOW_PLAINTEXT_AI_SECRETS", raising=False)
         secret_host = "http://alice:s3cret@127.0.0.1:9"  # pragma: allowlist secret
         with (
