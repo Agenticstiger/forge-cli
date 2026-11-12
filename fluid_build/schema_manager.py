@@ -73,6 +73,19 @@ def format_schema_error(error: Any) -> str:
     whole object and the subschema it must not match.
     """
     value = error.validator_value
+    path = list(error.absolute_path)
+    if (
+        error.validator == "anyOf"
+        and path[-1:] == ["engine"]
+        and "builds" in path
+        and str(error.instance).strip().lower() == "lakeflow"
+    ):
+        # The engine of the 0.7.7 preview: an older schema's message would only say that
+        # 'lakeflow' is not valid under any of its engines.
+        return (
+            "'lakeflow' (a Databricks Lakeflow Declarative Pipeline) is an engine of the 0.7.7 "
+            "preview schema: declare fluidVersion: 0.7.7 to use it"
+        )
     if error.validator == "not" and isinstance(value, dict) and list(value) == ["required"]:
         why = error.schema.get("description") if isinstance(error.schema, dict) else None
         if isinstance(why, str) and why:

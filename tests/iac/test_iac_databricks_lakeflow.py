@@ -256,6 +256,16 @@ def test_schema_0_7_6_rejects_the_lakeflow_engine():
     assert any("lakeflow" in e.message or list(e.absolute_path)[-1:] == ["engine"] for e in errors)
 
 
+def test_an_older_schema_says_the_lakeflow_engine_needs_fluid_version_0_7_7():
+    from fluid_build.schema_manager import format_schema_error
+
+    contract = _contract()
+    contract["fluidVersion"] = "0.7.6"
+    [engine] = [e for e in _schema_errors("0.7.6", contract) if e.absolute_path[-1] == "engine"]
+    message = format_schema_error(engine)
+    assert "0.7.7" in message and "fluidVersion" in message, message
+
+
 # ── 2. engine predicates ────────────────────────────────────────────────────
 @pytest.mark.parametrize("engine", ["lakeflow", " Lakeflow "])
 def test_lakeflow_engine_is_recognised_ignoring_case_and_space(engine):
