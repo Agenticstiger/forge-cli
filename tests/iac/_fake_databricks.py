@@ -1901,7 +1901,7 @@ class FakeDatabricks:
         new = names - set(before)
         added = []
         for child in sorted(n for n in names if n in self.tables):
-            for c in self.tables[child]["constraints"]:
+            for c in self.tables[child].get("constraints") or ():
                 if c["type"] != "FOREIGN KEY" or c["parent"] not in names:
                     continue
                 if child not in new and c["parent"] not in new:
