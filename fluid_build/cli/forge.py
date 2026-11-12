@@ -567,8 +567,9 @@ def register(subparsers: argparse._SubParsersAction):
         help=(
             "Headless agent-drivable preset. Bundles --yes + all "
             "FLUID_FORGE_NO_{PICKER,PREVIEW,WELCOME,STREAMING_PREVIEW}=1 + "
-            "emits JSON-Lines progress events (forge.start, forge.done, "
-            "forge.contract_written, forge.cost) to stdout so the IDE's "
+            "emits JSON-Lines events (forge.start, forge.contract_written, "
+            "forge.file_written, forge.plan with --emit-plan, forge.error on "
+            "a failure, forge.done) to stdout so the IDE's "
             "shell tool can parse them. Any of --llm-provider, --llm-model, "
             "--llm-endpoint or --context selects AI mode (strictly "
             "non-interactive; a failed generation exits non-zero). With no "

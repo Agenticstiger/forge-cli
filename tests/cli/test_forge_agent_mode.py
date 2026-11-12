@@ -337,6 +337,25 @@ def test_agent_flag_registered_in_argparse():
     assert getattr(args, "blank", False) is True
 
 
+def test_agent_flag_help_names_the_events_the_stream_sends():
+    """``--agent``'s help lists the stream's events: forge.error too, never a phantom one."""
+    import argparse
+
+    from fluid_build.cli import forge as forge_mod
+
+    parser = argparse.ArgumentParser()
+    sp = parser.add_subparsers()
+    forge_mod.register(sp)
+    forge_parser = sp.choices["forge"]
+    (agent,) = [a for a in forge_parser._actions if "--agent" in a.option_strings]
+
+    for event in ("forge.start", "forge.contract_written", "forge.file_written"):
+        assert event in agent.help
+    for event in ("forge.plan", "forge.error", "forge.done"):
+        assert event in agent.help
+    assert "forge.cost" not in agent.help  # listed once, never sent
+
+
 # ---------------------------------------------------------------------------
 # 6. Explicit AI flags under --agent select AI mode (never a silent blank)
 # ---------------------------------------------------------------------------
