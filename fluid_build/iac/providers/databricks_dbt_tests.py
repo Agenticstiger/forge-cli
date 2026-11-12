@@ -90,6 +90,11 @@ class CompiledTests:
 
 
 def _refusal(kind: str, message: str, fix: str) -> UnsupportedBindingError:
+    # A name from the project's own YAML (a path, a source) can hold an unpaired surrogate,
+    # which a YAML escape loads and no terminal prints: the refusal spells it as that escape.
+    message, fix = (
+        text.encode("utf-8", "backslashreplace").decode("utf-8") for text in (message, fix)
+    )
     return UnsupportedBindingError(f"databricks-job-dq-{kind}", message, (fix,))
 
 

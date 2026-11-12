@@ -495,6 +495,13 @@ class TestRefusals:
         assert "plain text" in text
         text.encode("utf-8")  # the refusal prints: it names the path escaped
 
+    def test_a_refusal_names_a_lone_surrogate_from_the_project_escaped(self, tmp_path):
+        # The model-paths reach the refusal's text, which fluid plan prints.
+        _project(tmp_path, config='model-paths: ["m\\ud83d"]\n')
+        text = self._refused(tmp_path, _contract(), "model")
+        assert "m\\ud83d" in text
+        text.encode("utf-8")
+
     def test_an_empty_test_paths_is_refused(self, tmp_path):
         _project(tmp_path, config="test-paths: []\n")
         self._refused(tmp_path, _contract(), "test-path")
