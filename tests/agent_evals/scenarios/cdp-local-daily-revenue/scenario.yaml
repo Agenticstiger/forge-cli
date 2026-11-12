@@ -1,0 +1,23 @@
+title: CDP aggregating a local ADP through consumes[]
+contracts: [products/daily_revenue/contract.fluid.yaml]
+forge:
+  target_dir: products/daily_revenue
+  args: [--from-product, products/orders_enriched/contract.fluid.yaml]
+checks:
+  - {id: product_type, path: metadata.productType, equals: CDP}
+  - {id: layer, path: metadata.layer, equals: Gold}
+  - {id: domain, path: domain, equals: sales}
+  - {id: owner_team, path: metadata.owner.team, equals: sales-data}
+  - id: consumes
+    consumes:
+      - {productId: sales.orders_enriched, exposeId: orders_enriched}
+  - {id: expose, path: 'exposes[exposeId=daily_revenue].exposeId', equals: daily_revenue}
+  - id: columns
+    expose: daily_revenue
+    columns: {order_date: date, country: string, revenue: decimal, order_count: integer}
+  - {id: required, expose: daily_revenue, required: [order_date, country, revenue, order_count]}
+  - {id: country_not_null, expose: daily_revenue, not_null: country}
+  - {id: daily_0400, cron: '0 4 * * *'}
+  - {id: platform_local, path: 'exposes[exposeId=daily_revenue].binding.platform', equals: local}
+  - {id: parquet, path: 'exposes[exposeId=daily_revenue].binding.format', equals: parquet}
+  - {id: reads_orders_enriched_output, contains: orders_enriched.parquet}

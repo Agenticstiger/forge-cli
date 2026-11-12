@@ -1,0 +1,1 @@
+Change the existing data product in contract.fluid.yaml in this directory, and nothing else. Add a column discount_amount (decimal, optional, not required) to the orders_raw table, and add a quality rule that checks amount is greater than or equal to 0 (an accuracy rule on amount). Keep everything else in the contract exactly as it is.

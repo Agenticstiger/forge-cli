@@ -1,0 +1,40 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: payments.merchant_daily_volume
+name: merchant_daily_volume
+domain: payments
+metadata:
+  productType: CDP
+  layer: Gold
+  owner:
+    team: payments-data
+consumes:
+- {productId: payments.payments_clean, exposeId: payments_clean}
+builds:
+- id: aggregate_volume
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: >-
+      SELECT merchant_id, CAST(paid_at AS DATE) AS day, SUM(amount) AS total_amount,
+      CAST(COUNT(*) AS INTEGER) AS payment_count
+      FROM payments_clean GROUP BY 1, 2
+    parameters:
+      inputs:
+      - {name: payments_clean, path: ../payments_clean/runtime/out/payments_clean.parquet, format: parquet}
+  execution:
+    trigger: {type: schedule, cron: 0 3 * * *}
+    runtime: {platform: local}
+exposes:
+- exposeId: merchant_daily_volume
+  kind: table
+  binding:
+    platform: local
+    format: parquet
+    location: {path: runtime/out/merchant_daily_volume.parquet}
+  contract:
+    schema:
+    - {name: merchant_id, type: string, required: true}
+    - {name: day, type: date, required: true}
+    - {name: total_amount, type: 'decimal(14,2)', required: true}
+    - {name: payment_count, type: integer, required: true}

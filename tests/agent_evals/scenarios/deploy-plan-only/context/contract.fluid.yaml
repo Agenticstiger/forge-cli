@@ -1,0 +1,68 @@
+# A source-aligned (SDP / Bronze) product: one CSV in, one parquet file out, run daily.
+# It names a team and no email, because the request it was written for gave none.
+fluidVersion: 0.7.6
+kind: DataProduct
+id: sales.orders_raw
+name: orders_raw
+description: Raw orders from the shop's daily CSV export, with types and checks.
+domain: sales
+metadata:
+  productType: SDP
+  layer: Bronze
+  owner:
+    team: sales-data
+builds:
+- id: ingest_orders
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: SELECT * FROM read_csv_auto('data/orders.csv', header=true)
+  execution:
+    trigger:
+      type: schedule
+      cron: 0 2 * * *
+    runtime:
+      platform: local
+exposes:
+- exposeId: orders_raw
+  kind: table
+  description: One row per order, as exported.
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: runtime/out/orders_raw.parquet
+  contract:
+    schema:
+    - name: order_id
+      type: string
+      required: true
+      description: Order identifier from the shop.
+    - name: customer_id
+      type: string
+      required: true
+      sensitivity: internal
+    - name: order_ts
+      type: timestamp
+      required: true
+    - name: amount
+      type: decimal(12,2)
+      required: true
+    - name: currency
+      type: string
+      required: true
+      description: ISO-4217 currency code.
+    dq:
+      rules:
+      - id: order_id_unique
+        type: uniqueness
+        selector: order_id
+        threshold: 1.0
+        operator: '>='
+        severity: error
+      - id: customer_id_not_null
+        type: completeness
+        selector: customer_id
+        threshold: 1.0
+        operator: '>='
+        severity: error

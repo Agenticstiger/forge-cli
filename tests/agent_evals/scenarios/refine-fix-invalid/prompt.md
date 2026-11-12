@@ -1,0 +1,1 @@
+fluid validate fails on contract.fluid.yaml in this directory. Fix the file so that it validates, without changing what the product is: a raw source-aligned ingest of data/shipments.csv, written to a local file. Edit contract.fluid.yaml in place.

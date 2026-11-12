@@ -1,0 +1,29 @@
+title: Three-product chain SDP to ADP to CDP on local parquet
+arms: [no-skill, skill]
+contracts:
+  - products/payments_raw/contract.fluid.yaml
+  - products/payments_clean/contract.fluid.yaml
+  - products/merchant_daily_volume/contract.fluid.yaml
+checks:
+  - {id: raw_type, file: products/payments_raw/contract.fluid.yaml, path: metadata.productType, equals: SDP}
+  - {id: raw_layer, file: products/payments_raw/contract.fluid.yaml, path: metadata.layer, equals: Bronze}
+  - {id: raw_reads_csv, file: products/payments_raw/contract.fluid.yaml, contains: data/payments.csv}
+  - {id: clean_type, file: products/payments_clean/contract.fluid.yaml, path: metadata.productType, equals: ADP}
+  - {id: clean_layer, file: products/payments_clean/contract.fluid.yaml, path: metadata.layer, equals: Silver}
+  - id: clean_consumes
+    file: products/payments_clean/contract.fluid.yaml
+    consumes:
+      - {productId: payments.payments_raw, exposeId: payments_raw}
+  - {id: clean_reads_raw_output, file: products/payments_clean/contract.fluid.yaml, contains: payments_raw.parquet}
+  - {id: clean_payment_id_unique, file: products/payments_clean/contract.fluid.yaml, expose: payments_clean, unique: payment_id}
+  - {id: volume_type, file: products/merchant_daily_volume/contract.fluid.yaml, path: metadata.productType, equals: CDP}
+  - {id: volume_layer, file: products/merchant_daily_volume/contract.fluid.yaml, path: metadata.layer, equals: Gold}
+  - id: volume_consumes
+    file: products/merchant_daily_volume/contract.fluid.yaml
+    consumes:
+      - {productId: payments.payments_clean, exposeId: payments_clean}
+  - id: volume_columns
+    file: products/merchant_daily_volume/contract.fluid.yaml
+    expose: merchant_daily_volume
+    columns: {merchant_id: string, day: date, total_amount: decimal, payment_count: integer}
+  - {id: volume_reads_clean_output, file: products/merchant_daily_volume/contract.fluid.yaml, contains: payments_clean.parquet}

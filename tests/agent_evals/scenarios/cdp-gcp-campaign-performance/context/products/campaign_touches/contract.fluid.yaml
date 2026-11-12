@@ -1,0 +1,52 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: marketing.campaign_touches
+name: campaign_touches
+description: One row per campaign touch with its delivery numbers.
+domain: marketing
+metadata:
+  productType: ADP
+  layer: Silver
+  owner:
+    team: growth-analytics
+builds:
+- id: build_campaign_touches
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: >-
+      SELECT campaign_id, touch_ts, impressions, clicks, spend
+      FROM `acme-marketing.bronze.ad_touches`
+  execution:
+    trigger:
+      type: schedule
+      cron: 0 5 * * *
+    runtime:
+      platform: gcp
+exposes:
+- exposeId: campaign_touches
+  kind: table
+  binding:
+    platform: gcp
+    format: bigquery_table
+    location:
+      project: acme-marketing
+      dataset: silver
+      table: campaign_touches
+  contract:
+    schema:
+    - name: campaign_id
+      type: string
+      required: true
+    - name: touch_ts
+      type: timestamp
+      required: true
+    - name: impressions
+      type: integer
+      required: true
+    - name: clicks
+      type: integer
+      required: true
+    - name: spend
+      type: decimal(12,2)
+      required: true
