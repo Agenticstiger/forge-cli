@@ -526,3 +526,8 @@ def test_accuracy_without_a_threshold_is_not_run():
         (res,) = execute_quality_checks([rule], "t", execute, "databricks")
         assert not res.passed and res.actual == "not executed" and "no threshold" in res.message
     assert seen == []
+
+
+def test_parse_range_refuses_a_bound_too_large_for_a_float():
+    assert parse_range(">= " + "9" * 400) == []
+    assert parse_range("between 0 and " + "9" * 400) == []

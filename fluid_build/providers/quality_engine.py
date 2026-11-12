@@ -17,6 +17,7 @@ via provider-specific SQL engines.  Supports five rule types:
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -140,14 +141,16 @@ def parse_range(constraint: Any) -> List[Tuple[str, float]]:
         return []
     m = _RANGE_BETWEEN.match(constraint)
     if m:
-        return [(">=", float(m.group(1))), ("<=", float(m.group(2)))]
-    bounds = []
-    for part in _RANGE_AND.split(constraint.strip()):
-        m = _RANGE_BOUND.match(part)
-        if not m:
-            return []
-        bounds.append((m.group(1), float(m.group(2))))
-    return bounds
+        bounds = [(">=", float(m.group(1))), ("<=", float(m.group(2)))]
+    else:
+        bounds = []
+        for part in _RANGE_AND.split(constraint.strip()):
+            m = _RANGE_BOUND.match(part)
+            if not m:
+                return []
+            bounds.append((m.group(1), float(m.group(2))))
+    # A bound too large for a float would reach SQL as ``inf``: not a number.
+    return bounds if all(math.isfinite(n) for _, n in bounds) else []
 
 
 @dataclass(frozen=True)

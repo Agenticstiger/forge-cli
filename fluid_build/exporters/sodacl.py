@@ -468,7 +468,7 @@ def _bound_checks(selector: str, threshold, operator: str) -> tuple[list[Any], s
     if threshold is None:
         return [], (
             "bound rule declares no 'threshold', so there is nothing to "
-            "assert (the native engine treats this as a no-op pass)"
+            "assert (the native engine reports it as not run, too)"
         )
     if operator in (">=", ">"):
         return [f"min({selector}) {operator} {_num(threshold)}"], ""

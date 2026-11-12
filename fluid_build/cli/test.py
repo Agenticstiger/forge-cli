@@ -304,13 +304,13 @@ def _results_options(args: argparse.Namespace, contract_path: Path):
         # The product's own schema is refused here, before any statement runs, from
         # the contract as written; write_results checks again with the overlay applied.
         try:
-            import yaml
+            from fluid_build.loader import load_contract
 
-            raw = yaml.safe_load(Path(contract_path).read_text(encoding="utf-8"))
+            written = load_contract(contract_path)
         except Exception:  # noqa: BLE001 - an unreadable contract is the run's to report
-            raw = None
-        if isinstance(raw, dict):
-            refuse_product_schema(parsed, raw)
+            written = None
+        if isinstance(written, dict):
+            refuse_product_schema(parsed, written)
     if dashboard:
         from ._test_dashboard_databricks import parse_dashboard_path
 

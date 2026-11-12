@@ -423,3 +423,16 @@ def test_unparseable_timestamps_do_not_republish():
     api = stale_published("garbage", "also garbage")
     assert ensure(api)["action"] == "unchanged"
     assert PUBLISH_CALL not in api.verbs()
+
+
+@pytest.mark.parametrize(
+    "first, second, later",
+    [
+        ("2026-11-12T21:16:40.1Z", "2026-11-12T21:16:40.05Z", True),
+        ("2026-11-12T21:16:40.123456789Z", "2026-11-12T21:16:40.1234Z", True),
+        ("2026-11-12T21:16:39Z", "2026-11-12T21:16:40.000001Z", False),
+    ],
+)
+def test_later_reads_any_fraction_length(first, second, later):
+    # Python 3.10's fromisoformat takes only 3 or 6 fraction digits.
+    assert dash._later(first, second) is later

@@ -92,7 +92,9 @@ def parse_results_table(value: Any) -> Tuple[str, str, str]:
 def _expose_tables(contract: Mapping[str, Any]) -> Dict[str, Tuple[str, str, str]]:
     """``expose id -> (catalog, schema, table)`` for each expose bound to a table."""
     out: Dict[str, Tuple[str, str, str]] = {}
-    for idx, expose in enumerate(contract.get("exposes") or []):
+    exposes = contract.get("exposes")
+    # A malformed ``exposes`` (not a list) is the validator's to report.
+    for idx, expose in enumerate(exposes if isinstance(exposes, list) else []):
         if not isinstance(expose, dict):
             continue
         binding = expose.get("binding") if isinstance(expose.get("binding"), dict) else {}

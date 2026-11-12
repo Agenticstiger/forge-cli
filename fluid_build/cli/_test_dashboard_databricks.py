@@ -368,11 +368,18 @@ def _is_not_found(exc: BaseException) -> bool:
 
 def _later(first: Any, second: Any) -> bool:
     """Whether timestamp ``first`` is after ``second`` (``False`` when either is unreadable)."""
+    import re
     from datetime import datetime
 
+    def parse(value: Any) -> datetime:
+        text = str(value).replace("Z", "+00:00")
+        # Python 3.10's fromisoformat takes only 3 or 6 fraction digits; the API
+        # may send 1 to 9. Pad or cut the fraction to 6.
+        text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], text, count=1)
+        return datetime.fromisoformat(text)
+
     try:
-        a = datetime.fromisoformat(str(first).replace("Z", "+00:00"))
-        b = datetime.fromisoformat(str(second).replace("Z", "+00:00"))
+        a, b = parse(first), parse(second)
     except (TypeError, ValueError):
         return False
     try:

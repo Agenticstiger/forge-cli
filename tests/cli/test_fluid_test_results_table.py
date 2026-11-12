@@ -534,3 +534,8 @@ def test_unparseable_contract_skips_the_early_product_schema_check(tmp_path):
         args_for(path, results_table="main.energy.results"), path
     )
     assert table == "main.energy.results" and dashboard is None
+
+
+def test_a_malformed_exposes_is_left_to_the_validator():
+    rt.refuse_product_schema(("main", "dq", "results"), {"exposes": 5})
+    rt.refuse_product_schema(("main", "dq", "results"), {"exposes": "x"})
