@@ -957,6 +957,49 @@ class _Client:
         self.api_client = _ApiClient(endpoint)
 
 
+# ---------------------------------------------------------------------- Genie space rules
+# What the Genie API refuses in a ``serialized_space`` (databricks/databricks-agent-skills
+# ``create-genie-agent.md``: ids of 32 lowercase hex characters, id-keyed lists sorted by id,
+# tables by identifier, text fields arrays of strings).
+_GENIE_TEXT_FIELDS = ("question", "content", "description", "sql", "synonyms")
+
+
+def _genie_order_problem(items: List[Any], path: str) -> Optional[str]:
+    if not items or not all(isinstance(i, dict) for i in items):
+        return None
+    keyed = [i.get("id") for i in items if "id" in i]
+    if keyed and keyed != sorted(keyed):
+        return f"{path} must be sorted by id"
+    named = [i.get("identifier") for i in items if "identifier" in i]
+    if named and named != sorted(named):
+        return f"{path} must be sorted by identifier"
+    return None
+
+
+def _genie_item_problem(node: Dict[str, Any], path: str, ids: List[str]) -> Optional[str]:
+    if "id" in node:
+        if not re.fullmatch(r"[0-9a-f]{32}", str(node["id"])):
+            return f"{path}.id {node['id']!r} is not 32 lowercase hex characters"
+        ids.append(node["id"])
+    bad = next((k for k in _GENIE_TEXT_FIELDS if k in node and not isinstance(node[k], list)), None)
+    return f"Expected an array for {bad}" if bad else None
+
+
+def _genie_problem(node: Any, path: str, ids: List[str]) -> Optional[str]:
+    """The first rule ``node`` (a part of a serialized space) breaks; collects every id."""
+    if isinstance(node, dict):
+        children = [(f"{path}.{key}", value) for key, value in node.items()]
+        problem = _genie_item_problem(node, path, ids)
+    elif isinstance(node, list):
+        children = [(f"{path}[{i}]", value) for i, value in enumerate(node)]
+        problem = _genie_order_problem(node, path)
+    else:
+        return None
+    for child_path, value in children:
+        problem = problem or _genie_problem(value, child_path, ids)
+    return problem
+
+
 # ---------------------------------------------------------------------- the server
 class FakeDatabricks:
     def __init__(
@@ -1007,6 +1050,22 @@ class FakeDatabricks:
         self.table_rows: Dict[str, List[Dict[str, Any]]] = {}
         # False: an INSERT answers with no row count, as a statement that returns none would
         self.insert_reports_count = True
+        # Genie spaces by space_id, kept as the service keeps them (serialized_space is the
+        # string it returns: what was sent, minus every ``false`` flag, as measured on a live
+        # workspace), and the permissions set on each one directly: {(key, name): level}.
+        self.genie_spaces: Dict[str, Dict[str, Any]] = {}
+        self.genie_acl: Dict[str, Dict[Tuple[str, str], str]] = {}
+        # metric views by full name: {"source": table full name, "comment": ...}
+        self.metric_views: Dict[str, Dict[str, Any]] = {}
+        self._space_seq = 0
+        self._space_count = 0
+        # A new space stays out of the list for this many list calls (the live list showed one
+        # about 9 s after it was made, 2026-11-12); 0 lists it at once.
+        self.genie_list_lag = 0
+        # True: the Permissions API keeps a user's or service principal's name lower-cased
+        # (whether it does is unmeasured; this exercises a service that does)
+        self.genie_acl_folds_case = False
+        self._genie_hidden: Dict[str, int] = {}
         self._marker = 0
         self._job_seq = 0
         self._object_ids: Dict[str, int] = {}  # workspace path -> object_id
@@ -1294,14 +1353,23 @@ class FakeDatabricks:
         a("POST", r"/api/2\.0/sql/statements/?", self._exec_sql)
         a("GET", r"/api/2\.0/sql/statements/([^/]+)", self._get_stmt)
         a("GET", r"/api/2\.0/sql/warehouses/([^/]+)", self._get_wh)
+        # ---- Genie spaces and their permissions (databricks-sdk-py service/dashboards.py, iam.py)
+        a("GET", r"/api/2\.0/genie/spaces", self._genie_list)
+        a("POST", r"/api/2\.0/genie/spaces", self._genie_create)
+        a("GET", r"/api/2\.0/genie/spaces/([^/]+)", self._genie_get)
+        a("PATCH", r"/api/2\.0/genie/spaces/([^/]+)", self._genie_patch)
+        a("DELETE", r"/api/2\.0/genie/spaces/([^/]+)", self._genie_trash)
+        a("GET", r"/api/2\.0/permissions/genie/([^/]+)", self._genie_get_acl)
+        a("PUT", r"/api/2\.0/permissions/genie/([^/]+)", self._genie_put_acl)
 
     # ------------------------------------------------------------------ handlers
     def _me(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        name = getattr(self, "me_user_name", _USER)
         return 200, {
             "id": "1",
-            "userName": _USER,
+            "userName": name,
             "active": True,
-            "emails": [{"value": _USER, "primary": True}],
+            "emails": [{"value": name, "primary": True}],
         }
 
     def _nf_setting(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
@@ -1465,10 +1533,260 @@ class FakeDatabricks:
     def _list_tables(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
         cat = (q.get("catalog_name") or [""])[0]
         sch = (q.get("schema_name") or [""])[0]
-        names = sorted(n for n in self.tables if n.rsplit(".", 1)[0] == f"{cat}.{sch}")
-        return 200, self._page(
-            names, q, "tables", lambda n: {"name": n.rsplit(".", 1)[1], "full_name": n}
+        names = sorted(
+            n for n in [*self.tables, *self.metric_views] if n.rsplit(".", 1)[0] == f"{cat}.{sch}"
         )
+        return 200, self._page(names, q, "tables", self._table_row)
+
+    def _table_row(self, full: str) -> Dict[str, Any]:
+        row: Dict[str, Any] = {"name": full.rsplit(".", 1)[1], "full_name": full}
+        view = self.metric_views.get(full)
+        if view is not None:
+            # A metric view's definition is its YAML; ``source`` names the table it reads.
+            row["table_type"] = "METRIC_VIEW"
+            row["view_definition"] = f"version: 1.1\nsource: {view['source']}\n"
+            if view.get("comment"):
+                row["comment"] = view["comment"]
+        else:
+            row["table_type"] = "MANAGED"
+        return row
+
+    def add_metric_view(self, full_name: str, source: str, comment: str = "") -> None:
+        """Seed a metric view over ``source`` (a table full name)."""
+        with self._lock:
+            self.metric_views[full_name] = {"source": source, "comment": comment}
+
+    # -- Genie spaces
+    _GENIE_LEVELS = ("CAN_READ", "CAN_RUN", "CAN_EDIT", "CAN_MANAGE")
+
+    @staticmethod
+    def _as_stored(raw: str) -> str:
+        """``serialized_space`` as the live service keeps it: every ``false`` flag left out, and
+        a metric view sent under ``data_sources.metric_views`` moved among the tables (both
+        measured 2026-11-12)."""
+        doc = FakeDatabricks._without_false(json.loads(raw))
+        sources = doc.get("data_sources") or {}
+        views = sources.pop("metric_views", None)
+        if views:
+            sources["tables"] = sorted(
+                [*sources.get("tables", []), *views], key=lambda t: t["identifier"]
+            )
+        return json.dumps(doc)
+
+    @staticmethod
+    def _without_false(doc: Any) -> Any:
+        if isinstance(doc, dict):
+            return {k: FakeDatabricks._without_false(v) for k, v in doc.items() if v is not False}
+        if isinstance(doc, list):
+            return [FakeDatabricks._without_false(v) for v in doc]
+        return doc
+
+    def _genie_check(self, raw: Any) -> Optional[str]:
+        """What the service would refuse in a ``serialized_space``, or ``None``."""
+        try:
+            doc = json.loads(raw)
+        except (TypeError, ValueError):
+            return "serialized_space is not JSON"
+        if doc.get("version") != 2:
+            return f"unsupported serialized_space version {doc.get('version')!r}"
+        ids: List[str] = []
+        problem = _genie_problem(doc, "serialized_space", ids)
+        if problem:
+            return problem
+        if len(ids) != len(set(ids)):
+            return "ids must be unique"
+        if len((doc.get("instructions") or {}).get("text_instructions") or []) > 1:
+            return "At most 1 text instruction is allowed"
+        for source in (doc.get("data_sources") or {}).get("tables") or []:
+            if source.get("identifier") not in {**self.tables, **self.metric_views}:
+                return f"Table {source.get('identifier')!r} does not exist"
+        return None
+
+    def _genie_title_taken(self, title: str, parent: str, other_than: str = "") -> bool:
+        return any(
+            s["title"] == title and s["parent_path"] == parent and sid != other_than
+            for sid, s in self.genie_spaces.items()
+        )
+
+    def _genie_doc(self, space_id: str, serialized: bool) -> Dict[str, Any]:
+        doc = dict(self.genie_spaces[space_id])
+        if not serialized:
+            doc.pop("serialized_space", None)
+        return doc
+
+    def _genie_list(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        ids = sorted(self.genie_spaces)
+        size = int((q.get("page_size") or ["100"])[0])
+        start = int((q.get("page_token") or ["0"])[0])
+        spaces = []
+        for space_id in ids[start : start + size]:
+            if self._genie_hidden.get(space_id, 0) > 0:
+                self._genie_hidden[space_id] -= 1
+                continue
+            doc = self._genie_doc(space_id, serialized=False)
+            # The list leaves out parent_path and etag, as the live API does.
+            doc.pop("parent_path", None)
+            doc.pop("etag", None)
+            spaces.append(doc)
+        out: Dict[str, Any] = {"spaces": spaces}
+        if start + size < len(ids):
+            out["next_page_token"] = str(start + size)
+        return 200, out
+
+    def _genie_etag(self) -> str:
+        self._space_seq += 1
+        return f"{self._space_seq:064x}"
+
+    def _genie_create(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        b = b or {}
+        if not b.get("warehouse_id"):
+            return _err(400, "INVALID_PARAMETER_VALUE", "warehouse_id is required")
+        problem = self._genie_check(b.get("serialized_space"))
+        if problem:
+            return _err(400, "INVALID_PARAMETER_VALUE", problem)
+        with self._lock:
+            self._space_count += 1
+            space_id = f"01f1{self._space_count:028x}"
+            parent = b.get("parent_path") or f"/Users/{_USER}"
+            title = b.get("title") or ""
+            if self._genie_title_taken(title, parent):
+                # The service keeps titles unique in a folder by suffixing the new one.
+                title = f"{title} 2026-11-12 20:35:27"
+            self._genie_hidden[space_id] = self.genie_list_lag
+            self.genie_spaces[space_id] = {
+                "space_id": space_id,
+                "title": title,
+                "description": b.get("description") or "",
+                "warehouse_id": b["warehouse_id"],
+                "parent_path": parent,
+                "serialized_space": self._as_stored(b["serialized_space"]),
+                "etag": self._genie_etag(),
+            }
+            self.genie_acl[space_id] = {}
+        doc = self._genie_doc(space_id, serialized=True)
+        doc.pop("parent_path", None)  # the live create answers without it
+        return 200, doc
+
+    def _genie_get(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        space_id = m.group(1)
+        if space_id not in self.genie_spaces:
+            return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Space {space_id} does not exist.")
+        wanted = (q.get("include_serialized_space") or ["false"])[0].lower() == "true"
+        return 200, self._genie_doc(space_id, serialized=wanted)
+
+    def _genie_patch(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        space_id = m.group(1)
+        b = b or {}
+        with self._lock:
+            space = self.genie_spaces.get(space_id)
+            if space is None:
+                return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Space {space_id} does not exist.")
+            if b.get("etag") and b["etag"] != space["etag"]:
+                return _err(409, "ABORTED", "The space was modified; the etag does not match.")
+            if "serialized_space" in b:
+                problem = self._genie_check(b["serialized_space"])
+                if problem:
+                    return _err(400, "INVALID_PARAMETER_VALUE", problem)
+                space["serialized_space"] = self._as_stored(b["serialized_space"])
+            if "title" in b and self._genie_title_taken(
+                b["title"], space["parent_path"], other_than=space_id
+            ):
+                return _err(409, "ALREADY_EXISTS", f"A space named {b['title']} already exists.")
+            for key in ("title", "description", "warehouse_id", "parent_path"):
+                if key in b:
+                    space[key] = b[key]
+            space["etag"] = self._genie_etag()
+        return 200, self._genie_doc(space_id, serialized=True)
+
+    def _genie_trash(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        space_id = m.group(1)
+        with self._lock:
+            if self.genie_spaces.pop(space_id, None) is None:
+                return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Space {space_id} does not exist.")
+            self.genie_acl.pop(space_id, None)
+        return 200, {}
+
+    def _genie_get_acl(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        space_id = m.group(1)
+        if space_id not in self.genie_spaces:
+            return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Space {space_id} does not exist.")
+        # The creator's and the admins' CAN_MANAGE come from the folders, as on a live
+        # workspace; only what was set on the space itself is direct.
+        acl: List[Dict[str, Any]] = [
+            {
+                "user_name": _USER,
+                "all_permissions": [
+                    {
+                        "permission_level": "CAN_MANAGE",
+                        "inherited": True,
+                        "inherited_from_object": ["/directories/1"],
+                    }
+                ],
+            },
+            {
+                "group_name": "admins",
+                "all_permissions": [
+                    {
+                        "permission_level": "CAN_MANAGE",
+                        "inherited": True,
+                        "inherited_from_object": ["/directories/"],
+                    }
+                ],
+            },
+        ]
+        for (key, name), level in sorted(self.genie_acl[space_id].items()):
+            acl.append(
+                {key: name, "all_permissions": [{"permission_level": level, "inherited": False}]}
+            )
+        return 200, {
+            "object_id": f"/genie/{space_id}",
+            "object_type": "genie",
+            "access_control_list": acl,
+        }
+
+    def _genie_put_acl(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        space_id = m.group(1)
+        if space_id not in self.genie_spaces:
+            return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Space {space_id} does not exist.")
+        direct: Dict[Tuple[str, str], str] = {}
+        for entry in (b or {}).get("access_control_list") or []:
+            level = entry.get("permission_level")
+            if level not in self._GENIE_LEVELS:
+                return _err(400, "INVALID_PARAMETER_VALUE", f"Invalid permission level {level}")
+            keys = [k for k in ("user_name", "group_name", "service_principal_name") if k in entry]
+            if len(keys) != 1:
+                return _err(400, "INVALID_PARAMETER_VALUE", "one principal per entry")
+            name = entry[keys[0]]
+            if self.genie_acl_folds_case and keys[0] != "group_name":
+                name = name.lower()
+            direct[(keys[0], name)] = level
+        with self._lock:
+            self.genie_acl[space_id] = direct
+        return self._genie_get_acl(m, q, b)
+
+    def add_genie_space(
+        self,
+        title: str,
+        description: str,
+        serialized: Optional[Dict] = None,
+        parent_path: Optional[str] = None,
+    ) -> str:
+        """Seed a space someone made (brownfield), returning its space_id: by default in the
+        deploy user's own folder, ``parent_path`` for one made by anyone else."""
+        with self._lock:
+            self._space_count += 1
+            space_id = f"01f1{self._space_count:028x}"
+            self.genie_spaces[space_id] = {
+                "space_id": space_id,
+                "title": title,
+                "description": description,
+                "warehouse_id": self.warehouse_id,
+                "parent_path": parent_path or f"/Users/{_USER}",
+                "serialized_space": json.dumps(serialized or {"version": 2}),
+                "etag": self._genie_etag(),
+            }
+            self.genie_acl[space_id] = {}
+        return space_id
 
     def _page(
         self, names: List[str], q: Any, key: str, row: Callable[[str], Any]

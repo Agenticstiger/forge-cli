@@ -347,6 +347,27 @@ The `AgentPolicyValidator` in `fluid_build/policy/agent_policy.py` checks for:
 - Use case validity against the FLUID schema
 - Token limit sanity checks
 
+### A Databricks Genie space for a product
+
+A Databricks product can ask for an AI/BI Genie space, where people ask the product's own
+example questions in natural language:
+
+```yaml
+extensions:
+  databricksGenie: {}        # or {title: "Site 360"}
+```
+
+`fluid apply` creates the space after the tables, masks and row filters, and keeps it in step:
+the tables with each column's description, allowed values and synonyms, every metric view over
+them, `semantics.labels.ai-example-questions` as sample questions, and one instruction from
+`ai-instructions`, `ai-synonyms`, the metrics and the `agentPolicy` (allowed and denied use
+cases, purpose limitation). The space never widens access. Genie answers as the person asking,
+under their Unity Catalog grants. Prompt matching is never turned on. Only the principals with
+`SELECT` get `CAN RUN`. An `agentPolicy` that denies `qa` or `analysis`, or allows neither, refuses the space. The space is
+found again by the marker `[fluid-genie:<product id>]` at the end of its description, only in the
+deploying identity's own folder (one anywhere else is left alone), and removing the block trashes
+it. Code: `fluid_build/iac/providers/databricks_genie.py`.
+
 ---
 
 ## For AI-Assisted Project Creation (Forge)

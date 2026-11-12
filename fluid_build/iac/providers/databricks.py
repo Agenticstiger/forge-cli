@@ -105,6 +105,12 @@ resources, with no new schema field (fluid-schema 0.7.6):
   mapping is refused, not upgraded: setting ``delta.columnMapping.mode`` upgrades
   the table's Delta protocol, which older readers cannot read, and that is the
   owner's call to make in Databricks, not a side effect of an apply.
+* ``extensions.databricksGenie`` gives the product an AI/BI Genie space: its tables, the
+  metric views over them, its example questions as sample questions, and its semantics and
+  ``agentPolicy`` as instructions. The provider has no Genie space resource, so
+  :meth:`DatabricksIacPlugin.converge_output_ports` creates, updates or trashes it through the
+  Genie API after the masks and row filters are in place, and finds it again by a marker in its
+  description (``databricks_genie.py``).
 
 * ``binding.location.region`` is the region the workspace is in, declared so a
   contract's ``sovereignty`` policy can check it (``policy/sovereignty.py``
@@ -2214,6 +2220,11 @@ class DatabricksIacPlugin:
         compiled = _compile(contract, os.environ)
         if compiled.refusals:
             raise compiled.refusals[0]
+        # A Genie space the contract asks for and the apply would refuse after ``tofu apply``
+        # stops the run here instead, before anything is written.
+        genie = _genie(contract, compiled, os.environ)
+        if genie.refusals:
+            raise genie.refusals[0]
         _enforce_sovereignty(contract, compiled.tables)
         # Only now, with the contract compiled and its sovereignty upheld, may the dbt jobs'
         # fluid_keys scripts look up other products' tables on the warehouse; ``plan_notices``
@@ -2366,6 +2377,9 @@ class DatabricksIacPlugin:
             preview(targets, say, client_factory)
             _declare_keys(contract, say, client_factory, dry_run=True)
         else:
+            from .databricks_genie import preflight
+
+            preflight(_genie(contract, _compile(contract, os.environ), os.environ), client_factory)
             pre_apply(targets, say, client_factory)
 
     def post_apply(
@@ -2408,6 +2422,29 @@ class DatabricksIacPlugin:
         builds = [b for b in contract.get("builds") or [] if isinstance(b, Mapping)]
         if any(is_dbt_build(b) and not is_databricks_job_build(b) for b in builds):
             _declare_keys(contract, say or print, client_factory)
+
+    def converge_output_ports(
+        self,
+        contract: Mapping[str, Any],
+        say: Optional[Callable[[str], None]] = None,
+        dry_run: bool = False,
+        client_factory: Optional[Callable[[], Any]] = None,
+    ) -> None:
+        """After ``tofu apply`` and :meth:`post_apply`: create, update or trash the product's
+        Genie space (``databricks_genie.converge``), which ``extensions.databricksGenie`` asks
+        for. With ``dry_run`` it prints what it would do and writes nothing. Raises
+        :class:`UnsupportedBindingError` for what it cannot do."""
+        from .databricks_genie import converge
+
+        compiled = _compile(contract, os.environ)
+        if compiled.refusals:
+            raise compiled.refusals[0]
+        converge(
+            _genie(contract, compiled, os.environ),
+            say or print,
+            client_factory=client_factory,
+            dry_run=dry_run,
+        )
 
     def plan_notices(self, contract: Mapping[str, Any]) -> List[str]:
         """What the apply cannot do itself and someone must: ``USE CATALOG``; and the dbt jobs
@@ -2668,6 +2705,9 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     compiled = _compile(contract, os.environ)
     if compiled.refusals:
         raise compiled.refusals[0]
+    genie = _genie(contract, compiled, os.environ)
+    if genie.refusals:
+        raise genie.refusals[0]
     actions: List[Dict[str, Any]] = []
     for body in compiled.data.get("databricks_catalog", {}).values():
         actions.append(
@@ -2734,9 +2774,26 @@ def validate_databricks_binding(
     reports every refusal at stage 2, with the emitter's message, instead of
     the first one at apply. The warnings name what applies but loses precision.
     """
-    compiled = _compile(contract, os.environ if env is None else env, validating=True)
-    errors = [f"{exc} {' '.join(exc.remediation)}".strip() for exc in compiled.refusals]
-    return errors, _scale_zero_warnings(compiled.tables) + compiled.warnings
+    env = os.environ if env is None else env
+    compiled = _compile(contract, env, validating=True)
+    refusals = list(compiled.refusals)
+    warnings = _scale_zero_warnings(compiled.tables) + compiled.warnings
+    # Without one resolved table a Genie refusal would only repeat the table's own.
+    if compiled.tables or not refusals:
+        genie = _genie(contract, compiled, env)
+        refusals += genie.refusals
+        warnings += genie.warnings
+    errors = [f"{exc} {' '.join(exc.remediation)}".strip() for exc in refusals]
+    return errors, warnings
+
+
+def _genie(contract: Mapping[str, Any], compiled: _Compiled, env: Mapping[str, str]) -> Any:
+    """The Genie space ``contract`` asks for, from this compile's tables and grants
+    (``databricks_genie.compile_space``); imported here, the Light CLI's ``--help`` never
+    needs it."""
+    from .databricks_genie import compile_space
+
+    return compile_space(contract, compiled.tables, compiled.grants, env)
 
 
 @dataclass(frozen=True)
