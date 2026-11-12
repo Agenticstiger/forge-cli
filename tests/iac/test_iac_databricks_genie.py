@@ -1038,3 +1038,12 @@ def test_a_new_space_the_next_apply_could_not_find_is_trashed_and_said(fake):
         Run(fake)(site_contract())
     assert "where the next apply looks for it, so it was trashed" in str(exc.value)
     assert fake.genie_spaces == {}
+
+
+def test_a_policy_that_denies_analysis_refuses_the_space():
+    """A Genie space answers by analysing the data, so denying analysis rules it out too."""
+    doc = site_contract()
+    doc["exposes"][0]["policy"]["agentPolicy"]["deniedUseCases"].append("analysis")
+    doc["exposes"][0]["policy"]["agentPolicy"]["allowedUseCases"] = ["qa"]
+    (refusal,) = compiled(doc).refusals
+    assert refusal.kind == "databricks-genie-policy" and "denies 'analysis'" in str(refusal)

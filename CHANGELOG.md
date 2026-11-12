@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limitation). The principals with `SELECT` get `CAN RUN` on it. A space never widens access:
   Genie answers as the person asking, under their Unity Catalog grants. Prompt matching, which
   samples values with the author's permissions, is never turned on. A product whose
-  `agentPolicy` denies `qa`, or allows neither `qa` nor `analysis`, is refused at `fluid validate`. A re-apply
+  `agentPolicy` denies `qa` or `analysis`, or allows neither, is refused at `fluid validate`. A re-apply
   finds the space by a `[fluid-genie:<product id>]` marker at the end of its description, in the
   deploying identity's own folder only (a space carrying the marker anywhere else is left alone,
   with a note), and updates it with its `etag`. A second apply changes nothing, and removing the

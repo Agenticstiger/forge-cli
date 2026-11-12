@@ -113,7 +113,7 @@ _KEPT_LEVELS = frozenset({"CAN_EDIT", "CAN_MANAGE"})
 _LEVEL_RANK = {"CAN_READ": 1, "CAN_RUN": 2, "CAN_EDIT": 3, "CAN_MANAGE": 4}
 _PAGE_SIZE = 100
 #: The use cases a Genie space is: answering questions about the data, by analysing it. One of
-#: them allowed is enough; ``qa`` denied refuses the space.
+#: them allowed is enough; either one denied refuses the space.
 _GENIE_USE_CASES = ("qa", "analysis")
 _NOT_SENSITIVE = frozenset({"", "none", "public", "internal"})
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
@@ -344,15 +344,20 @@ def _policy_refusals(table: Any) -> List[UnsupportedBindingError]:
                 f"Remove extensions.{EXTENSION_KEY}, or allow AI access in agentPolicy.",
             )
         )
-    if "qa" in denied or (allowed and not set(_GENIE_USE_CASES) & set(allowed)):
+    refused = [case for case in _GENIE_USE_CASES if case in denied]
+    if refused or (allowed and not set(_GENIE_USE_CASES) & set(allowed)):
         out.append(
             _refusal(
                 "policy",
                 f"{where} "
-                + ("denies 'qa'" if "qa" in denied else "allows neither 'qa' nor 'analysis'")
+                + (
+                    f"denies {' and '.join(repr(c) for c in refused)}"
+                    if refused
+                    else "allows neither 'qa' nor 'analysis'"
+                )
                 + " (question answering over the data), which is what a Genie space is.",
                 f"Remove extensions.{EXTENSION_KEY}, or allow 'qa' in agentPolicy.allowedUseCases "
-                "(and take it out of deniedUseCases).",
+                "(and take 'qa' and 'analysis' out of deniedUseCases).",
             )
         )
     return out
