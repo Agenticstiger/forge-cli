@@ -498,7 +498,12 @@ def _share_sql(check: DqCheck, ref: str, column: str, parent: Optional[Tuple[str
 
 def _schema_sql(check: DqCheck, ref: str) -> str:
     """One failing row per contract column the table lacks or types otherwise, read from the
-    built table (``adapter.get_columns_in_relation``, as dbt_expectations reads it)."""
+    built table (``adapter.get_columns_in_relation``, as dbt_expectations reads it).
+
+    ``ref`` is called outside the ``execute`` guard: dbt records a test's parents while it
+    parses (``execute`` false then), and selects a test by them, so a ``ref`` only inside the
+    guard leaves the test without a parent and ``dbt build --select +model+`` never runs it
+    (seen live: 11 tests found, 10 run)."""
     from .databricks_access import quote
 
     for name, _kind in check.columns:
@@ -508,11 +513,12 @@ def _schema_sql(check: DqCheck, ref: str) -> str:
         for name, kind in check.columns
     )
     return (
+        f"{{%- set relation = {ref} -%}}\n"
         f"{{%- set expected = {{{expected}}} -%}}\n"
         "{%- set problems = [] -%}\n"
         "{%- if execute -%}\n"
         "  {%- set actual = {} -%}\n"
-        f"  {{%- for column in adapter.get_columns_in_relation({ref}) -%}}\n"
+        "  {%- for column in adapter.get_columns_in_relation(relation) -%}\n"
         "    {%- do actual.update({column.name | lower: column.dtype | lower"
         " | replace(' ', '')}) -%}\n"
         "  {%- endfor -%}\n"

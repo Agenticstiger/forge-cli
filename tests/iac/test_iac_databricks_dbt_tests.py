@@ -202,18 +202,26 @@ class _Adapter:
         return self.columns
 
 
-def _render(text: str, columns: Optional[List[_Column]] = None):
-    """Render a generated file as dbt would: ``(sql, config kwargs, adapter calls)``."""
+def _render(text: str, columns: Optional[List[_Column]] = None, *, execute: bool = True):
+    """Render a generated file as dbt would: ``(sql, config kwargs, adapter calls)``.
+    ``execute=False`` is dbt's parse, which records the ``ref`` calls as the test's parents."""
     configs: Dict[str, Any] = {}
     adapter = _Adapter(columns or [])
     env = jinja2.Environment(extensions=["jinja2.ext.do"], undefined=jinja2.StrictUndefined)
+    refs: List[str] = []
+
+    def ref(name: str) -> str:
+        refs.append(name)
+        return f"`main`.`sales`.`{name}`"
+
     sql = env.from_string(text).render(
         config=lambda **kwargs: configs.update(kwargs) or "",
-        ref=lambda name: f"`main`.`sales`.`{name}`",
+        ref=ref,
         source=lambda source, table: f"`main`.`{source}`.`{table}`",
         adapter=adapter,
-        execute=True,
+        execute=execute,
     )
+    _render.refs = refs  # type: ignore[attr-defined]
     return sql, configs, adapter.calls
 
 
@@ -352,7 +360,26 @@ class TestRefusals:
 # ── what dbt runs ────────────────────────────────────────────────────────────
 
 
+PARSED = [
+    ("not_null", {}),
+    ("unique", {}),
+    ("accepted_values", {"values": ("A",)}),
+    ("regex", {"pattern": "^A$"}),
+    ("bounds", {"bounds": ((">=", 0.0),)}),
+    ("freshness", {"max_age_seconds": 60}),
+    ("schema", {"column": None, "columns": (("id", "bigint"),)}),
+    ("not_null", {"share": (">=", 0.5)}),
+]
+
+
 class TestRendering:
+    @pytest.mark.parametrize("kind, fields", PARSED)
+    def test_every_test_refs_its_model_while_dbt_parses(self, kind, fields):
+        # dbt selects a test by the parents its parse recorded (``execute`` false):
+        # a ``ref`` only behind ``if execute`` left the schema test unselected, live.
+        _render(dq.render(_check(kind, **fields), "orders"), execute=False)
+        assert _render.refs == ["orders"]  # type: ignore[attr-defined]
+
     def test_the_config_sets_severity_enabled_tag_and_the_rule(self):
         _, configs, _ = _render(dq.render(_check("not_null", severity="warn"), "orders"))
         assert configs == {
