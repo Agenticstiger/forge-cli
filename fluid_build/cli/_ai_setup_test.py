@@ -191,11 +191,6 @@ def _validate_ai_test_endpoint(provider_name: str, endpoint: str) -> Optional[st
     parsed = urlsplit(raw)
     if parsed.username or parsed.password:
         return "AI test endpoint URLs must not embed credentials."
-    # litellm-routed providers (the default) use a ``litellm://`` sentinel
-    # that's not a real URL — litellm owns auth + transport, so there's no
-    # plaintext-credential risk to validate against. Accept the sentinel.
-    if parsed.scheme == "litellm":
-        return None
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return "AI test endpoint must be an absolute HTTP(S) URL."
     host = (parsed.hostname or "").lower()
@@ -253,10 +248,13 @@ def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[st
             host = saved_for_provider.get("ollama_host")
             if host and not os.environ.get("OLLAMA_HOST"):
                 os.environ["OLLAMA_HOST"] = _sanitize_ollama_host(str(host))
+            # Only an operator-supplied endpoint is validated; with none, the
+            # call goes through litellm, which owns the address.
+            if endpoint_override:
+                endpoint_error = _validate_ai_test_endpoint(pname, endpoint_override)
+                if endpoint_error:
+                    return None, endpoint_error
             endpoint = endpoint_override or provider.default_endpoint(model, dict(os.environ))
-            endpoint_error = _validate_ai_test_endpoint(pname, endpoint)
-            if endpoint_error:
-                return None, endpoint_error
             return (
                 LlmConfig(
                     provider=pname,
@@ -272,9 +270,10 @@ def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[st
             return None, f"No API key found for {PROVIDER_DISPLAY_NAMES.get(pname, pname)}."
         endpoint = endpoint_override or saved_for_provider.get("endpoint")
         config = _make_cloud_config(pname, api_key, model=model, endpoint=endpoint)
-        endpoint_error = _validate_ai_test_endpoint(pname, config.endpoint)
-        if endpoint_error:
-            return None, endpoint_error
+        if config.endpoint:
+            endpoint_error = _validate_ai_test_endpoint(pname, config.endpoint)
+            if endpoint_error:
+                return None, endpoint_error
         return (
             config,
             None,
@@ -391,8 +390,48 @@ def _check_ai_test_model_availability(
     return "available", available
 
 
+def _is_litellm_backed(provider: Any) -> bool:
+    from fluid_build.llm.litellm_backend import LiteLLMProvider
+
+    return isinstance(provider, LiteLLMProvider)
+
+
+def _run_litellm_smoke_call(provider: Any, config: LlmConfig) -> tuple[str, dict, int]:
+    """The diagnostic call for a litellm-backed provider: the call forge itself makes.
+
+    litellm owns the address, auth and transport, so there is no URL to POST to.
+    """
+    from fluid_build.llm.providers import get_cumulative_token_usage
+
+    cap = (
+        _AI_TEST_GEMINI_OUTPUT_TOKENS
+        if config.provider == "gemini"
+        else _AI_TEST_DEFAULT_OUTPUT_TOKENS
+    )
+    before = get_cumulative_token_usage()
+    started = time.perf_counter()
+    text = provider.invoke_blocking(
+        config,
+        _AI_TEST_SYSTEM_PROMPT,
+        _AI_TEST_USER_PROMPT,
+        extra_payload={"max_tokens": cap, "timeout": config.timeout_seconds},
+    )
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    after = get_cumulative_token_usage()
+    usage = {key: after[key] - before[key] for key in after}
+    if "FLUID_OK" not in (text or ""):
+        raise CopilotGenerationError(
+            "ai_test_unexpected_response",
+            f"AI test response from {config.provider} was not the expected diagnostic token.",
+            suggestions=["Try again, or choose a different model with `fluid ai setup`."],
+        )
+    return "FLUID_OK", usage, latency_ms
+
+
 def _run_ai_smoke_call(provider: Any, config: LlmConfig) -> tuple[str, dict, int]:
     """Issue the diagnostic call. Returns (text, usage, latency_ms)."""
+    if _is_litellm_backed(provider):
+        return _run_litellm_smoke_call(provider, config)
     headers, payload = _with_freeform_ai_test_payload(provider, config)
     started = time.perf_counter()
     try:
@@ -454,6 +493,12 @@ def _classify_ai_test_error(error_code: str, status_code: Optional[int]) -> int:
 
     0 OK / 2 config / 3 auth / 4 resource / 5 network. See AGENTS.md for the contract.
     """
+    if error_code in {"copilot_llm_auth_failed", "copilot_llm_permission_denied"}:
+        return _AI_TEST_EXIT_AUTH
+    if error_code == "copilot_litellm_request_failed":
+        # A provider "not found" (a model it does not have) is a resource problem;
+        # timeouts, connection errors and the rest stay network.
+        return _AI_TEST_EXIT_RESOURCE if status_code == 404 else _AI_TEST_EXIT_NETWORK
     if error_code in {"ai_test_request_failed", "ai_test_model_preflight_failed"}:
         if status_code is None:
             return _AI_TEST_EXIT_NETWORK
@@ -471,7 +516,10 @@ def _http_status_from_cause(exc: CopilotGenerationError) -> Optional[int]:
     cause = exc.__cause__
     if isinstance(cause, httpx.HTTPStatusError):
         return cause.response.status_code
-    return None
+    # litellm's exceptions (the original error, chained by ``_translate_litellm_exception``)
+    # carry the provider's HTTP status.
+    status = getattr(cause, "status_code", None)
+    return status if isinstance(status, int) else None
 
 
 def _new_ai_test_report(
@@ -653,7 +701,7 @@ def run_ai_test(console: Any, args: Any) -> tuple[int, dict]:
         table.add_column("Result", style="green")
         table.add_row("Provider", label)
         table.add_row("Model", _safe_ai_test_display(config.model))
-        table.add_row("Endpoint", _safe_ai_test_display(endpoint))
+        table.add_row("Endpoint", _safe_ai_test_display(endpoint) or "provider default")
         table.add_row(
             "Model availability",
             (
@@ -673,7 +721,7 @@ def run_ai_test(console: Any, args: Any) -> tuple[int, dict]:
         from fluid_build.cli.console import cprint
 
         cprint(f"AI Provider Test: ready ({label}, {_safe_ai_test_display(config.model)})")
-        cprint(f"  Endpoint: {_safe_ai_test_display(endpoint)}")
+        cprint(f"  Endpoint: {_safe_ai_test_display(endpoint) or 'provider default'}")
         cprint(f"  Model availability: {availability}")
         cprint(f"  Live call: {text}")
         cprint(f"  Latency: {latency_text}")

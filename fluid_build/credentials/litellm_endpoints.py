@@ -13,9 +13,9 @@ Copilot ones) is protected outright. Any other ``<NAME>_API_BASE`` is the
 project's own setting and follows the name-shape rule.
 
 Vendored because importing litellm takes seconds and dotenv hydration runs on
-every command. Generated from the litellm 1.83.14, 1.97.0, 1.105.0, 1.106.0
-and 1.108.0 wheels (FLUID's floor, the last release Python 3.10 can import, and
-the newest), as the union of:
+every command. Generated from the litellm 1.83.14, 1.97.0, 1.105.0, 1.106.0,
+1.108.0 and 1.109.0 wheels (FLUID's floor, the last release Python 3.10 can
+import, and the newest), as the union of:
 
 * ``<PROVIDER>_API_BASE`` for every ``litellm.provider_list`` entry (``-``
   read as ``_``);
@@ -45,9 +45,11 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
     {
         "A2A_AGENT_API_BASE",
         "A2A_API_BASE",
+        "ABLITERATION_API_BASE",
         "AGENTCORE_GATEWAY_URL",
         "AI21_API_BASE",
         "AI21_CHAT_API_BASE",
+        "AIAND_API_BASE",
         "AIHUBMIX_API_BASE",
         "AIML_API_BASE",
         "AIOHTTP_OPENAI_API_BASE",
@@ -75,6 +77,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "BEDROCK_MANTLE_API_BASE",
         "BESPOKE_API_BASE",
         "BFL_API_BASE",
+        "BIGMODEL_API_BASE",
         "BLACK_FOREST_LABS_API_BASE",
         "BRAVE_API_BASE",
         "BYTEZ_API_BASE",
@@ -83,6 +86,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "CHATGPT_API_BASE",
         "CHUTES_API_BASE",
         "CLARIFAI_API_BASE",
+        "CLF_AI_GATEWAY_API_BASE",
         "CLOUDFLARE_API_BASE",
         "CODESTRAL_API_BASE",
         "COGNITION_API_BASE",
@@ -120,6 +124,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "ELEVENLABS_API_BASE",
         "EMPIRIOLABS_API_BASE",
         "EMPOWER_API_BASE",
+        "EU_JEV_API_BASE",
         "EXA_API_BASE",
         "FAL_AI_API_BASE",
         "FAL_AI_QUEUE_API_BASE",
@@ -148,6 +153,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "HEROKU_API_BASE",
         "HF_API_BASE",
         "HOSTED_VLLM_API_BASE",
+        "HOSTINGER_ROUTER_API_BASE",
         "HUGGINGFACE_API_BASE",
         "HUMANLOOP_API_BASE",
         "HYPERBOLIC_API_BASE",
@@ -155,6 +161,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "INFERENCEAPIS_API_BASE",
         "INFINITY_API_BASE",
         "JINA_AI_API_BASE",
+        "KYMA_API_BASE",
         "LAMBDA_AI_API_BASE",
         "LAMBDA_API_BASE",
         "LANGFLOW_API_BASE",
@@ -182,6 +189,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "MONGODB_API_BASE",
         "MOONSHOT_API_BASE",
         "MORPH_API_BASE",
+        "NACE_API_BASE",
         "NADIR_API_BASE",
         "NANO_GPT_API_BASE",
         "NEBIUS_API_BASE",
@@ -199,7 +207,10 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "OPENAI_API_BASE",
         "OPENAI_CHATGPT_API_BASE",
         "OPENAI_LIKE_API_BASE",
+        "OPENCODE_GO_API_BASE",
+        "OPENINFER_API_BASE",
         "OPENROUTER_API_BASE",
+        "OPENSEARCH_API_BASE",
         "OPEN_SANDBOX_API_BASE",
         "OVHCLOUD_API_BASE",
         "PARALLEL_AI_API_BASE",
@@ -223,6 +234,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "RAGFLOW_API_BASE",
         "RECRAFT_API_BASE",
         "REDUCTO_API_BASE",
+        "REFUSELESS_API_BASE",
         "REKA_API_BASE",
         "REPLICATE_API_BASE",
         "RUNWAYML_API_BASE",
@@ -245,6 +257,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "SONIOX_API_BASE",
         "STABILITY_API_BASE",
         "STRANDS_DECIDER_API_BASE",
+        "STREAMLAKE_API_BASE",
         "SYNTHETIC_API_BASE",
         "TAVILY_API_BASE",
         "TENCENT_ANTHROPIC_API_BASE",
@@ -283,6 +296,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "XINFERENCE_API_BASE",
         "YOUCOM_API_BASE",
         "ZAI_API_BASE",
+        "ZEROGPU_API_BASE",
     }
 )
 

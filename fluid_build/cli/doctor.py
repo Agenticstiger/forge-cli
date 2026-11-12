@@ -1411,7 +1411,10 @@ def _print_copilot_readiness(readiness: LlmReadinessCheck, verbose: bool = False
     """Render the copilot readiness summary without leaking secrets."""
     status_text = "✅ Ready" if readiness.ready else "⚠️  Setup needed"
     auth_text = "Configured" if readiness.auth_available else "Missing"
-    endpoint_text = readiness.endpoint or "Not configured"
+    # No endpoint of ours is not "not configured": litellm picks the provider's own.
+    endpoint_text = readiness.endpoint or (
+        "Provider default" if readiness.provider else "Not configured"
+    )
 
     if RICH_AVAILABLE:
         console = Console()

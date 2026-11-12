@@ -306,6 +306,8 @@ def _forge_build_copilot_options(
     Extracted verbatim from ``run_ai_copilot_mode`` (behaviour-preserving) to
     shrink that god-function; the returned dict is mutated downstream.
     """
+    from fluid_build.llm.providers import agent_loop_requested
+
     return {
         "llm_provider": get_cli_arg_fn(args, "llm_provider"),
         "llm_model": get_cli_arg_fn(args, "llm_model"),
@@ -322,6 +324,9 @@ def _forge_build_copilot_options(
         "fragment_first": bool(get_cli_arg_fn(args, "fragments", False)),
         "no_fragments": bool(get_cli_arg_fn(args, "no_fragments", False)),
         "no_generate": bool(get_cli_arg_fn(args, "no_generate", False)),
+        # The provider is resolved from these options, and the agent loop (by flag
+        # or FLUID_COPILOT_AGENT_LOOP) must never auto-pick a coding agent.
+        "agent_loop": agent_loop_requested(get_cli_arg_fn(args, "agent_loop", False)),
         # Pre-write preview UX (invariants I1/I4/I5):
         #   auto_yes  — skip the [Y/n] prompt, panel still renders
         #   show_work — stream reasoning/tool calls live as the agent runs
@@ -1034,12 +1039,9 @@ def _forge_project_creation_core(
     context = rc.context
     copilot_options = rc.copilot_options
     perf_stats = rc.perf_stats
-    # Parsed as a boolean, not by presence: ``FLUID_COPILOT_AGENT_LOOP=0`` is
-    # the documented way to turn the loop off, and a bare ``bool()`` of the
-    # string turned it on.
-    use_agent_loop = bool(get_cli_arg_fn(args, "agent_loop", False)) or os.environ.get(
-        "FLUID_COPILOT_AGENT_LOOP", ""
-    ).strip().lower() in {"1", "true", "yes", "on"}
+    from fluid_build.llm.providers import agent_loop_requested
+
+    use_agent_loop = agent_loop_requested(get_cli_arg_fn(args, "agent_loop", False))
 
     if scaffold_template:
         success_result = copilot.create_project(

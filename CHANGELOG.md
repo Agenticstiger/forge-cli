@@ -23,6 +23,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   granted. The contract-tests local action grants its outputs the same way. The DuckDB
   acquisition runner's landing got this fix in 0.19.0 (#699). Found on the demo lab on 0.18.2,
   still in 0.28.0.
+- **Local Ollama works through every automatic path, and `fluid ai test` probes the provider it
+  names.** With no endpoint set, `LlmConfig.endpoint` carried a telemetry label,
+  `litellm://<provider>/<model>`. Ollama calls sent it to litellm as `api_base`, so no call
+  reached the daemon, and `fluid ai test` posted to it and failed with "AI test network error
+  ... (UnsupportedProtocol)" for every litellm provider. The endpoint now holds only a real
+  address: the one `--llm-endpoint` or `FLUID_LLM_ENDPOINT` states, else Ollama's `OLLAMA_HOST`,
+  else none (litellm's own default). A bare `OLLAMA_HOST=myhost` means `http://myhost:11434`, as
+  in Ollama's own client. The routing model's calls keep a stated endpoint. `fluid ai test`
+  sends its probe through the call `fluid forge` makes and exits 4 when the provider says the
+  model does not exist. `fluid doctor` shows "Provider default" instead of the label.
+- **`fluid forge --agent` with `--llm-provider`, `--llm-model`, `--llm-endpoint` or `--context`
+  runs AI mode.** It dropped those flags, wrote a TODO placeholder contract and reported
+  `exit_code 0`, which an IDE agent reads as success. It now authors with forge's AI,
+  non-interactively, and a failed generation exits non-zero. AI-mode runs now emit
+  `forge.contract_written`, which the stream promised but only blank mode sent. `--agent` with
+  no AI flag still writes the blank contract.
+- **A Claude Code login problem is reported as one.** `claude -p` reports a failure on stdout,
+  as a JSON result with `is_error: true`, and leaves stderr empty, so forge showed
+  "claude-code exited with code 1:" and no reason. Forge now reads that result: a login problem
+  says the agent "is installed but not authenticated" with the sign-in hint, any other failure
+  shows the agent's own message, and `is_error: true` is a failure even at exit code 0.
+- **`fluid doctor` reports an installed coding agent as ready.** With `FLUID_LLM_PROVIDER` set to
+  `claude-code`, `codex`, `cursor` or `kiro`, readiness said "No API key found"; it now checks
+  that the agent's CLI is on PATH, and says so when it is not. Each CLI keeps its own sign-in.
+
+### Changed
+
+- **A non-interactive run with no LLM configured authors with an installed coding agent.** When
+  nothing names one (no `--llm-provider`, `--llm-endpoint` or `--llm-model`, no `FLUID_LLM_*`,
+  `OLLAMA_HOST` or provider key variable, no keyring key, no `fluid ai setup` provider) and stdin
+  is not a terminal or `--non-interactive` is set, forge uses a running local Ollama first, so
+  local data stays local, else the first of `claude`, `codex`, `cursor-agent` and `kiro-cli` on
+  PATH, and logs which one and how to override it. It works on the base install: the agents need
+  no litellm. Interactive runs still only offer the agent, and `--agent-loop` never picks one
+  (the agents have no tool use).
+- **Forge runs `claude -p` apart from your own Claude Code setup.** Each call replaces Claude
+  Code's agent system prompt with forge's (`--system-prompt`) and turns off tools, MCP servers,
+  your settings (hooks, plugins, `CLAUDE.md`) and session persistence (`--tools ""`,
+  `--strict-mcp-config`, `--setting-sources=`, `--no-session-persistence`), and drops
+  `CLAUDECODE`, as Anthropic's Agent SDK does. Each flag is passed only when the installed
+  `claude --help` lists it. Claude Code authentication that lives in a setting (an
+  `apiKeyHelper`, or Bedrock or Vertex variables in `settings.json`) must come from the shell
+  environment instead.
 
 ## [0.28.0] — 2026-11-06
 

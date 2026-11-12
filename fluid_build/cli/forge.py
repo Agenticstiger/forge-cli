@@ -568,10 +568,13 @@ def register(subparsers: argparse._SubParsersAction):
             "FLUID_FORGE_NO_{PICKER,PREVIEW,WELCOME,STREAMING_PREVIEW}=1 + "
             "emits JSON-Lines progress events (forge.start, forge.done, "
             "forge.contract_written, forge.cost) to stdout so the IDE's "
-            "shell tool can parse them. Defaults to --blank when no mode "
-            "flag is provided (avoids dropping into the interactive picker "
-            "the agent cannot navigate). Use this from inside any agentic "
-            "IDE (Kiro, Cursor, Claude Code, Cline)."
+            "shell tool can parse them. Any of --llm-provider, --llm-model, "
+            "--llm-endpoint or --context selects AI mode (strictly "
+            "non-interactive; a failed generation exits non-zero). With no "
+            "mode flag and no AI flag it defaults to --blank (avoids "
+            "dropping into the interactive picker the agent cannot "
+            "navigate). Use this from inside any agentic IDE (Kiro, "
+            "Cursor, Claude Code, Cline)."
         ),
     )
     parser.add_argument(
@@ -1282,6 +1285,12 @@ def _setup_agent_mode(args: Any) -> None:
         os.environ.setdefault(var, "1")
     args.yes = True
 
+    # An explicit AI flag is the agent choosing AI mode: no blank forcing,
+    # and the AI path must never block on a prompt (``non_interactive`` is
+    # what the rest of forge reads to skip inline setup and confirmations).
+    if _agent_chose_ai(args):
+        args.non_interactive = True
+
     # If the agent didn't pick a mode, default to --blank: it's the
     # only mode that succeeds without an LLM round-trip, so it's the
     # safest fallback when invoked under ``--agent --data-product-type X``
@@ -1295,10 +1304,19 @@ def _setup_agent_mode(args: Any) -> None:
             bool(getattr(args, "refine", None)),
             bool(getattr(args, "from_product", None)),
             bool(getattr(args, "from_product_list", None)),
+            _agent_chose_ai(args),
         ]
     )
     if no_mode:
         args.blank = True
+
+
+def _agent_chose_ai(args: Any) -> bool:
+    """True when the agent passed any explicit AI flag (selects AI mode)."""
+    return any(
+        bool(getattr(args, flag, None))
+        for flag in ("llm_provider", "llm_model", "llm_endpoint", "context")
+    )
 
 
 def _agent_run_id() -> str:
@@ -1431,9 +1449,10 @@ def _emit_forge_plan(args: Any, contract_path: Optional[Path]) -> None:
             "gate-check, then `fluid bundle && fluid plan` for the pipeline."
         ),
         note=(
-            "You (the IDE's agent) are the LLM. Fill in these fields using "
-            "your own Edit tool; do NOT shell-run `fluid forge --ai` (that "
-            "would need a second LLM API key)."
+            "You (the IDE's agent) are the LLM: fill in these fields using "
+            "your own Edit tool. Running `fluid forge --agent --llm-provider "
+            "<name>` instead has forge's own AI author the contract, which "
+            "needs a second LLM."
         ),
     )
 
@@ -2026,6 +2045,10 @@ def load_context(
     )
 
 
+# ``diff_snapshots`` action -> the agent JSONL event's ``action``.
+_AGENT_EVENT_ACTIONS = {"create": "created", "update": "modified"}
+
+
 def _write_forge_receipt(
     *,
     flow: str,
@@ -2084,8 +2107,11 @@ def _write_forge_receipt(
             )
             # Agent-mode JSONL: one event per changed file. The agent's
             # caller can highlight new contracts in its UI without
-            # parsing the receipt.
-            if is_agent and entry.action in ("created", "modified"):
+            # parsing the receipt. ``diff_snapshots`` says "create" /
+            # "update"; the events use the blank path's "created" /
+            # "modified" so every mode speaks one vocabulary.
+            event_action = _AGENT_EVENT_ACTIONS.get(entry.action)
+            if is_agent and event_action:
                 _emit_agent_jsonl(
                     (
                         "forge.contract_written"
@@ -2093,7 +2119,7 @@ def _write_forge_receipt(
                         else "forge.file_written"
                     ),
                     path=str(entry.path),
-                    action=entry.action,
+                    action=event_action,
                     size=entry.size,
                 )
 

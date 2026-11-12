@@ -18,12 +18,14 @@ to a :class:`LiteLLMProvider` shim.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
 import sys
 import threading
 import time
+import urllib.parse
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 from fluid_build.llm.providers import (
@@ -255,6 +257,43 @@ def _is_anthropic_model(model_id: str) -> bool:
     return "claude" in lower
 
 
+def _ollama_base_url(env: Mapping[str, str]) -> str:
+    """``OLLAMA_HOST`` as a URL, or ``""`` when unset.
+
+    Ollama's own variable accepts forms litellm and ``urllib`` cannot dial as
+    they are (a bare ``host``, ``host:port``, ``:port``), so it is normalised
+    with the convention of ollama-python's ``_parse_host`` (MIT,
+    github.com/ollama/ollama-python, ``ollama/_client.py``): no scheme means
+    ``http`` on the default port 11434; an explicit ``http://`` or ``https://``
+    without a port means port 80 or 443; a path is kept. Both reads of
+    ``OLLAMA_HOST`` in this module go through here, so they agree.
+    """
+    host = (env.get("OLLAMA_HOST") or "").strip()
+    if not host:
+        return ""
+    port = 11434
+    scheme, _, hostport = host.partition("://")
+    if not hostport:
+        scheme, hostport = "http", host
+    elif scheme == "http":
+        port = 80
+    elif scheme == "https":
+        port = 443
+    try:
+        split = urllib.parse.urlsplit(f"{scheme}://{hostport}")
+        name = split.hostname or "127.0.0.1"
+        port = split.port or port
+    except ValueError:  # e.g. a non-numeric port: leave it to fail visibly at the dial
+        return f"{scheme}://{hostport}".rstrip("/")
+    try:
+        if isinstance(ipaddress.ip_address(name), ipaddress.IPv6Address):
+            name = f"[{name}]"  # urlsplit strips the brackets
+    except ValueError:
+        pass  # a hostname, not an IP literal
+    path = split.path.strip("/")
+    return f"{scheme}://{name}:{port}" + (f"/{path}" if path else "")
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -283,8 +322,27 @@ class LiteLLMProvider(LlmProvider):
     # ----- LlmProvider abstract API ------------------------------------
 
     def default_endpoint(self, model: str, env: Mapping[str, str]) -> str:
-        """litellm owns auth/endpoints; return a sentinel for telemetry."""
-        return f"litellm://{self.name}/{model}"
+        """The endpoint the operator pointed us at; empty when litellm picks it.
+
+        litellm owns auth and transport, so a hosted provider has no endpoint of
+        ours to report and ``LlmConfig.endpoint`` stays empty. Ollama is the one
+        exception: its own ``OLLAMA_HOST`` is a real daemon address, so it is
+        reported. Never a placeholder URL: every consumer of ``config.endpoint``
+        treats a non-empty value as an address to dial.
+        """
+        return _ollama_base_url(env) if self.name == "ollama" else ""
+
+    def _apply_ollama_api_base(self, payload: Dict[str, Any], config: LlmConfig) -> None:
+        """Point an Ollama call at an explicit endpoint, else ``OLLAMA_HOST``.
+
+        With neither set, ``api_base`` is left out and litellm uses its own
+        default (``http://localhost:11434``, ``litellm/llms/ollama/common_utils.py``).
+        """
+        if self.name != "ollama":
+            return
+        api_base = config.endpoint or _ollama_base_url(os.environ)
+        if api_base:
+            payload["api_base"] = api_base
 
     def build_request(
         self, config: LlmConfig, system_prompt: str, user_prompt: str
@@ -312,11 +370,7 @@ class LiteLLMProvider(LlmProvider):
             payload["max_tokens"] = int(max_tokens)
         if config.api_key:
             payload["api_key"] = config.api_key
-        # Ollama: litellm needs the daemon endpoint as api_base.
-        if self.name == "ollama":
-            payload["api_base"] = config.endpoint or os.environ.get(
-                "OLLAMA_HOST", "http://localhost:11434"
-            )
+        self._apply_ollama_api_base(payload, config)
         _maybe_inject_cache_control(payload, model_id)
         return ({}, payload)
 
@@ -502,10 +556,7 @@ class LiteLLMProvider(LlmProvider):
         }
         if config.api_key:
             payload["api_key"] = config.api_key
-        if self.name == "ollama":
-            payload["api_base"] = config.endpoint or os.environ.get(
-                "OLLAMA_HOST", "http://localhost:11434"
-            )
+        self._apply_ollama_api_base(payload, config)
         _maybe_inject_cache_control(payload, model_id)
         return ("litellm://internal", {}, payload)
 
@@ -734,7 +785,7 @@ def _list_ollama_models(env: Mapping[str, str]) -> Optional[List[str]]:
     reachable so preflight degrades to "unavailable" rather than
     falsely rejecting models.
     """
-    base = env.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    base = _ollama_base_url(env) or "http://localhost:11434"
     try:
         import urllib.error
         import urllib.request

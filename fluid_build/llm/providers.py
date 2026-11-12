@@ -30,6 +30,7 @@ __all__ = [
     "normalize_llm_provider_name",
     "query_ollama_models",
     "reset_llm_caches",
+    "agent_loop_requested",
     "preflight_llm_provider",
     "resolve_llm_config",
     "resolve_model_name",
@@ -45,6 +46,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -239,6 +241,10 @@ class LlmConfig:
     # contract.fluid.yaml into the workspace with its own tools). Ignored by
     # every other provider.
     agent_mode: str = "envelope"
+    # True when the operator stated ``endpoint`` (``--llm-endpoint`` or
+    # ``FLUID_LLM_ENDPOINT``) rather than the provider deriving it. A stated
+    # endpoint is where every call goes, so routing calls keep it.
+    endpoint_explicit: bool = False
 
     def for_routing(self) -> "LlmConfig":
         """Return a shallow copy configured for the routing model.
@@ -253,7 +259,7 @@ class LlmConfig:
         overrides: Dict[str, Any] = {"model": self.routing_model}
         if self.routing_endpoint:
             overrides["endpoint"] = self.routing_endpoint
-        else:
+        elif not self.endpoint_explicit:
             # Re-derive endpoint for the routing model using the same
             # provider's default-endpoint logic.
             provider = BUILTIN_LLM_PROVIDERS.get(self.provider)
@@ -771,15 +777,61 @@ _KEYLESS_PROVIDERS: frozenset = frozenset(
     {"ollama", "mcp-sampling", "mcp_sampling", "claude-code", "codex", "cursor", "kiro"}
 )
 
+# The keyless providers that do not go through litellm: the call is made by the
+# MCP client or by an installed agent CLI, so a missing litellm extra is no obstacle.
+_NON_LITELLM_PROVIDERS: frozenset = _KEYLESS_PROVIDERS - {"ollama"}
+
 
 def _provider_name_from(args: Any, env: Mapping[str, str]) -> str:
     """The provider name the flags and environment select (flag, env, key sniff, default)."""
     return (
+        _explicit_provider_name(args, env)
+        or _infer_provider_from_env(
+            env,
+            non_interactive=bool(getattr(args, "non_interactive", False)),
+            allow_agents=_agents_allowed(args, env),
+        )
+        or "gemini"
+    )
+
+
+def agent_loop_requested(flag: Any, environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether this run asks for the multi-turn agent loop.
+
+    ``flag`` is the ``--agent-loop`` value (callers read it their own way, e.g.
+    the CLI's ``get_cli_arg``), or ``FLUID_COPILOT_AGENT_LOOP`` set to a truthy
+    value. It is parsed as a boolean, not by presence:
+    ``FLUID_COPILOT_AGENT_LOOP=0`` is the documented way to turn the loop off.
+    """
+    env = os.environ if environ is None else environ
+    return bool(flag) or (
+        env.get("FLUID_COPILOT_AGENT_LOOP", "").strip().lower() in {"1", "true", "yes", "on"}
+    )
+
+
+def _agents_allowed(args: Any, env: Mapping[str, str]) -> bool:
+    """Whether the keyless auto-pick may choose a coding agent for this run.
+
+    Not for the agent loop (it needs tool use, which the agents do not offer),
+    and not when ``--llm-endpoint`` / ``--llm-model`` (or their routing twins)
+    state where or what to call: that destination is never swapped for an agent.
+    """
+    return not (
+        agent_loop_requested(getattr(args, "agent_loop", False), env)
+        or any(
+            getattr(args, name, None)
+            for name in ("llm_endpoint", "llm_model", "llm_routing_endpoint", "llm_routing_model")
+        )
+    )
+
+
+def _explicit_provider_name(args: Any, env: Mapping[str, str]) -> Optional[str]:
+    """The provider the operator named: ``--llm-provider``, else the env selectors."""
+    return (
         getattr(args, "llm_provider", None)
         or env.get("FLUID_LLM_PROVIDER")
         or env.get("FLUID_FORGE_AGENT")
-        or _infer_provider_from_env(env)
-        or "gemini"
+        or None
     )
 
 
@@ -793,8 +845,9 @@ _AGENT_LOOP_ALTERNATIVES = (
 def preflight_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = None) -> None:
     """Fail fast when the selected provider cannot be used on this install.
 
-    Cheap and side-effect free (no key lookup, no network, no litellm import):
-    it only resolves the provider adapter, which raises
+    Cheap and side-effect free (no key lookup, no litellm import, no network
+    beyond the localhost Ollama probe of the keyless auto-pick): it only
+    resolves the provider adapter, which raises
     :class:`~fluid_build._optional.MissingOptionalDependency` when a
     litellm-backed provider is chosen and litellm is absent. Call it before
     anything that reads workspace context or memory.
@@ -805,14 +858,20 @@ def preflight_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = Non
     from fluid_build._optional import MissingOptionalDependency, ensure_installed
 
     env = dict(environ or os.environ)
-    agent_loop = bool(getattr(args, "agent_loop", False))
-    if not (
-        getattr(args, "llm_provider", None)
-        or env.get("FLUID_LLM_PROVIDER")
-        or env.get("FLUID_FORGE_AGENT")
-    ):
+    agent_loop = agent_loop_requested(getattr(args, "agent_loop", False), env)
+    if not _explicit_provider_name(args, env):
         # Nothing chosen: inference reads the keyring and probes Ollama, and every
-        # provider it can pick (or the gemini default) needs litellm. Fail first.
+        # provider it can pick (or the gemini default) needs litellm, except the
+        # coding agent a non-interactive run auto-picks. Without litellm, that
+        # agent is the only provider that can run; otherwise fail first.
+        from fluid_build._optional import is_available
+
+        if not is_available("litellm") and _lean_keyless_autopick(
+            env,
+            non_interactive=bool(getattr(args, "non_interactive", False)),
+            allow_agents=_agents_allowed(args, env),
+        ):
+            return
         ensure_installed(
             "litellm",
             "litellm",
@@ -887,6 +946,15 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
         )
 
     model_notes: List[str] = []
+    if not _explicit_provider_name(args, env) and provider.name in _NON_LITELLM_PROVIDERS:
+        # Nothing named a provider and it is not a key-based one, so the keyless
+        # auto-pick chose it: say which, and how to override.
+        note = (
+            f"No LLM provider is configured; using {provider.name}, the first coding agent "
+            f"found on PATH. Override with --llm-provider."
+        )
+        model_notes.append(note)
+        LOG.warning(note)
     preflight_requested = _model_preflight_requested(args, env)
     available_models: Optional[List[str]] = None
 
@@ -956,6 +1024,7 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
             model_source = "live_preflight"
 
     endpoint = getattr(args, "llm_endpoint", None) or env.get("FLUID_LLM_ENDPOINT")
+    endpoint_explicit = bool(endpoint)
     if not endpoint:
         endpoint = provider.default_endpoint(model, env)
 
@@ -1025,6 +1094,7 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
         model_resolution_notes=model_notes,
         tier_models=tier_models,
         agent_mode=agent_mode,
+        endpoint_explicit=endpoint_explicit,
     )
 
 
@@ -1405,6 +1475,7 @@ from fluid_build.llm.provider_resolve import (  # noqa: E402,F401
     _infer_provider_from_explicit_keys,
     _infer_provider_from_keyring,
     _keyring_key,
+    _lean_keyless_autopick,
     _resolve_api_key,
     clear_api_key_from_keyring,
     save_api_key_to_keyring,
@@ -1573,7 +1644,26 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
 
     # Resolve API key: env vars → config file
     api_key = _resolve_api_key(provider.name, env) or saved_key
-    auth_ok = bool(api_key) or provider.name == "ollama"
+    from fluid_build.llm.coding_agent import _AGENT_SPECS
+
+    agent = _AGENT_SPECS.get(provider.name)
+    if agent is not None:
+        # A coding agent is ready when its CLI is installed; its login or key is the
+        # CLI's own business and is not pre-checked. Search the PATH of the
+        # environment we were given, as the real call's child process would.
+        if not shutil.which(agent.binary, path=env.get("PATH", "")):
+            return LlmReadinessCheck(
+                ready=False,
+                provider=provider.name,
+                model=provider.default_model,
+                auth_available=False,
+                error=f"The '{agent.binary}' CLI for {provider.name} is not on PATH.",
+            )
+        auth_ok = True
+    else:
+        auth_ok = (
+            bool(api_key) or provider.name == "ollama" or bool(getattr(provider, "keyless", False))
+        )
 
     if not auth_ok:
         LOG.debug("LLM readiness: provider=%s found but no API key", provider.name)
@@ -1588,11 +1678,11 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
     model = env.get("FLUID_LLM_MODEL") or saved_model or provider.default_model
     endpoint = env.get("FLUID_LLM_ENDPOINT") or provider.default_endpoint(model, env)
 
-    # Every built-in provider runs through litellm, which is an extra since 0.28.0.
-    # A configured key is not "ready" without it.
+    # Every built-in provider except the keyless agent/MCP ones runs through
+    # litellm, which is an extra since 0.28.0. A configured key is not "ready" without it.
     from fluid_build._optional import is_available
 
-    if not is_available("litellm"):
+    if provider.name not in _NON_LITELLM_PROVIDERS and not is_available("litellm"):
         return LlmReadinessCheck(
             ready=False,
             provider=provider.name,

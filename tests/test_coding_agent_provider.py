@@ -74,6 +74,15 @@ def _argv(rec):
     return rec.calls[0]["argv"]
 
 
+@pytest.fixture(autouse=True)
+def _no_real_help_probe(monkeypatch):
+    """Never run the real ``claude --help``; an empty help lists no flag."""
+    cap._cli_help.cache_clear()
+    monkeypatch.setattr(cap, "_run_help", lambda binary: "")
+    yield
+    cap._cli_help.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # Per-agent argv + output parsing
 # ---------------------------------------------------------------------------
@@ -103,7 +112,8 @@ def test_claude_code_argv_and_structured_output(monkeypatch):
     assert "--json-schema" in argv
     schema_str = argv[argv.index("--json-schema") + 1]
     assert "contract" in schema_str and "recommended_template" in schema_str
-    # system via flag, user via stdin
+    # system via flag (help lists no --system-prompt here, so the append fallback),
+    # user via stdin
     assert "--append-system-prompt" in argv
     assert argv[argv.index("--append-system-prompt") + 1] == "SYS-PROMPT"
     assert rec.calls[0]["stdin"] == "USER-PROMPT"
@@ -217,6 +227,15 @@ def test_keyed_agent_without_key_is_not_preblocked(monkeypatch):
 
 def test_not_authenticated_marker(monkeypatch):
     rec = _Recorder(rc=1, stderr="Error: not logged in. Please run /login")
+    _install(monkeypatch, rec)
+    provider = get_llm_provider("claude-code")
+    with pytest.raises(CopilotGenerationError) as exc:
+        provider.invoke_blocking(_cfg("claude-code"), "SYS", "USER")
+    assert exc.value.event == "coding_agent_not_authenticated"
+
+
+def test_not_authenticated_marker_wording_from_stderr_only(monkeypatch):
+    rec = _Recorder(rc=1, stderr="Failed to authenticate: OAuth session expired")
     _install(monkeypatch, rec)
     provider = get_llm_provider("claude-code")
     with pytest.raises(CopilotGenerationError) as exc:
