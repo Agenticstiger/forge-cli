@@ -147,6 +147,19 @@ def test_an_expose_no_runner_alone_lands_still_reports_its_missing_source(
     assert f"Could not determine source table for expose {unlanded}" in caplog.text
 
 
+def test_an_expose_a_table_backs_is_planned_as_before() -> None:
+    """``landed_by`` says why no table backs an expose, so one that names its
+    ``source_table`` keeps the payload it had, whichever build writes it."""
+    contract = _landing_contract([_INGEST], ["rows"])
+    contract["exposes"][0]["source_table"] = "staged"
+
+    actions = plan_actions(contract, logger=logging.getLogger("t"))
+
+    (materialize,) = [a for a in actions if a.get("op") == "materialize"]
+    assert materialize["payload"]["source_table"] == "staged"
+    assert "landed_by" not in materialize["payload"]
+
+
 def test_the_planner_knows_every_acquisition_runner() -> None:
     """Which exposes a runner lands follows the planner's own engine list,
     kept apart from the runners' registry to keep the dbt runner out of it."""

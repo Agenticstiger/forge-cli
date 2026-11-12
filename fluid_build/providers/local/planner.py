@@ -341,7 +341,7 @@ def plan_actions(
         source_table = _determine_source_table(
             _ei["_raw"] if isinstance(_ei.get("_raw"), dict) else {}, builds, loaded_tables, log
         )
-        landed_by = _landed_by_runner(expose_id, builds)
+        landed_by = [] if source_table else _landed_by_runner(expose_id, builds)
 
         # Infer format
         fmt = _infer_format(out_path, _ei["_format"])
@@ -357,7 +357,8 @@ def plan_actions(
                     "format": fmt,
                     "source_table": source_table,
                     "schema": _ei["_schema"],
-                    # The builds whose runners land it: validate_plan asks it for no table.
+                    # No table backs it, as its builds' runners land it: validate_plan
+                    # asks for none. Never set beside a source_table.
                     **({"landed_by": landed_by} if landed_by else {}),
                 },
             }
