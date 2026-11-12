@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Keys for two or more providers stop the run, even with Ollama running.** With
+  `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` both set (or one provider's key and `OLLAMA_HOST`) and
+  nothing naming a provider, a run without a TTY skipped both keys and used a running local
+  Ollama, and interactive setup used the first key it found. Forge now stops with
+  `copilot_no_llm_provider` and names the keys, without asking Ollama; interactive setup,
+  `fluid ai test` and `fluid doctor` say the same and use none of them. A `fluid ai setup`
+  choice and a single keyring key still come first, and `GEMINI_API_KEY` with `GOOGLE_API_KEY` is
+  one provider. Pick one with `--llm-provider` or `FLUID_LLM_PROVIDER`.
+
+### Fixed
+
+- **Interactive `fluid forge` keeps the provider, model and endpoint you state.** Its inline
+  setup put the saved or first-found provider over `--llm-provider`, `--llm-model` and
+  `--llm-endpoint`, and over `FLUID_LLM_PROVIDER`, `FLUID_FORGE_AGENT`, `FLUID_LLM_MODEL` and
+  `FLUID_LLM_ENDPOINT`, so `fluid forge --llm-provider ollama` could call Anthropic. A run that
+  names its provider now skips inline setup and resolves as a run without a TTY does. Otherwise
+  setup fills only what the run leaves unstated, and an agent it finds is not used when the run
+  states an endpoint or a model, or runs the agent loop. The welcome panel and the interview's
+  "What I see" panel name the provider the run uses, not the saved one. `fluid init`'s AI path
+  does the same, and its handoff no longer offers AI setup for a provider named by a variable.
+- **Interactive setup no longer picks GitHub Models from `GITHUB_API_KEY`.** It took any variable
+  in `PROVIDER_ENV_VARS`, so `GITHUB_API_KEY` alone selected github, which setup then failed to
+  build (`KeyError: 'github'`). It now reads the key variables a run without a TTY reads:
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY` or `GEMINI_API_KEY` (it missed the
+  second). GitHub Models stays a provider you name with `--llm-provider github`. `fluid ai test`
+  and `fluid init`'s check for a configured AI follow the same rule.
+- **`fluid ai test` tests the provider `FLUID_LLM_PROVIDER` or `FLUID_FORGE_AGENT` names.** It
+  read only `--llm-provider`, so with `FLUID_LLM_PROVIDER=anthropic` it tested the saved
+  provider, which forge would not use. A provider named this way also gets `FLUID_LLM_API_KEY`,
+  as with the flag. A coding agent or `mcp-sampling` named either way is not tested, and the
+  command now says so, where `claude-code` failed as "Unsupported AI provider 'claude_code'".
+
+## [0.29.0] — 2026-11-12
+
 ### Added
 
 - **Agent Skills for coding agents.** Four skills in the agentskills.io `SKILL.md` format ship
@@ -77,17 +113,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **With no provider selected, forge stops instead of using gemini.** It used to send
   `FLUID_LLM_API_KEY` to Google whatever key it was, and with two provider keys set it asked for
   a gemini key. It now fails with `copilot_no_llm_provider` and says why (nothing configured,
-  several keys, a key that names no provider, or a `fluid ai setup` choice that the command does
-  not read), in the words `fluid doctor` shows. Pass `--llm-provider`, or set
-  `FLUID_LLM_PROVIDER` or the key of exactly one provider.
-- **Keys for two or more providers stop the run, even with Ollama running.** With
-  `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` both set (or one provider's key and `OLLAMA_HOST`) and
-  nothing naming a provider, a run without a TTY skipped both keys and used a running local
-  Ollama, and interactive setup used the first key it found. Forge now stops with
-  `copilot_no_llm_provider` and names the keys, without asking Ollama; interactive setup,
-  `fluid ai test` and `fluid doctor` say the same and use none of them. A `fluid ai setup`
-  choice and a single keyring key still come first, and `GEMINI_API_KEY` with `GOOGLE_API_KEY` is
-  one provider. Pick one with `--llm-provider` or `FLUID_LLM_PROVIDER`.
+  several keys, a key that names no provider, or a saved coding agent the run passes over), in
+  the words `fluid doctor` shows. Pass `--llm-provider`, or set `FLUID_LLM_PROVIDER` or the key
+  of exactly one provider.
+- **Runs without a terminal use the saved `fluid ai setup` choice.** Only the interactive setup
+  applied it before, so `fluid doctor`, which read it, and forge disagreed. Selection now walks one
+  order, and `fluid doctor` uses the same function: a named provider (`--llm-provider`,
+  `FLUID_LLM_PROVIDER`, `FLUID_FORGE_AGENT`), then exactly one key variable, then the saved
+  choice, then exactly one keyring key, then a local Ollama or, with nothing configured and no
+  terminal, the first coding-agent CLI on `PATH`. The saved model and Ollama host fill only what
+  the run does not state, and the environment's `OLLAMA_HOST` wins over the saved host. A run that
+  names its provider takes nothing from the saved choice. The saved `endpoint` is not applied:
+  state it with `--llm-endpoint` or `FLUID_LLM_ENDPOINT`. A saved coding agent is passed over
+  where the auto-pick is (a stated endpoint or model, or the agent loop), and saved names go
+  through the provider registry, so a hand-written `claude` counts as `anthropic`.
 - **`LlmProvider.list_available_models` takes an `endpoint` keyword**, the address the call will
   go to, passed only when the operator states one. A provider plugin that overrides the method
   with the two-argument signature keeps working until an endpoint is stated.
@@ -153,26 +192,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a model the endpoint has. All three now ask the stated endpoint. A `--tiered` stage now
   calls a stated endpoint too, as the routing model already did; it called the provider's
   default address instead.
-- **Interactive `fluid forge` keeps the provider, model and endpoint you state.** Its inline
-  setup put the saved or first-found provider over `--llm-provider`, `--llm-model` and
-  `--llm-endpoint`, and over `FLUID_LLM_PROVIDER`, `FLUID_FORGE_AGENT`, `FLUID_LLM_MODEL` and
-  `FLUID_LLM_ENDPOINT`, so `fluid forge --llm-provider ollama` could call Anthropic. A run that
-  names its provider now skips inline setup and resolves as a run without a TTY does. Otherwise
-  setup fills only what the run leaves unstated, and an agent it finds is not used when the run
-  states an endpoint or a model, or runs the agent loop. The welcome panel and the interview's
-  "What I see" panel name the provider the run uses, not the saved one. `fluid init`'s AI path
-  does the same, and its handoff no longer offers AI setup for a provider named by a variable.
-- **Interactive setup no longer picks GitHub Models from `GITHUB_API_KEY`.** It took any variable
-  in `PROVIDER_ENV_VARS`, so `GITHUB_API_KEY` alone selected github, which setup then failed to
-  build (`KeyError: 'github'`). It now reads the key variables a run without a TTY reads:
-  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY` or `GEMINI_API_KEY` (it missed the
-  second). GitHub Models stays a provider you name with `--llm-provider github`. `fluid ai test`
-  and `fluid init`'s check for a configured AI follow the same rule.
-- **`fluid ai test` tests the provider `FLUID_LLM_PROVIDER` or `FLUID_FORGE_AGENT` names.** It
-  read only `--llm-provider`, so with `FLUID_LLM_PROVIDER=anthropic` it tested the saved
-  provider, which forge would not use. A provider named this way also gets `FLUID_LLM_API_KEY`,
-  as with the flag. A coding agent or `mcp-sampling` named either way is not tested, and the
-  command now says so, where `claude-code` failed as "Unsupported AI provider 'claude_code'".
+- **`fluid forge --agent` stdout carries only the JSON-Lines events.** `AGENT_IDE.md` promises one
+  JSON object per line, but in blank mode 28 of 32 stdout lines were Rich panels. Everything meant
+  for a person now goes to stderr, including the install hint for a missing extra.
+- **`fluid mission run` no longer picks a coding agent it cannot use.** A mission always runs the
+  tool-use loop, but it auto-picked a coding agent and then failed mid-run with
+  `NotImplementedError`. It now resolves its LLM as an agent-loop run.
 
 ### Security
 
