@@ -152,6 +152,36 @@ def test_the_gate_logs_nothing_when_no_type_changed(caplog: pytest.LogCaptureFix
     assert [r.message for r in caplog.records] == []
 
 
+def _through_the_strict_gate(declared: str, observed: str) -> None:
+    """One column through ``enforce_schema_policy_or_raise`` under ``schemaPolicy: strict``.
+
+    ``declared`` is the contract's type for it, ``observed`` the type the
+    runner's fingerprint reports for the source.
+    """
+    from fluid_build.api.schema import SchemaFingerprint
+    from fluid_build.build_runners._acquisition_common import (
+        enforce_schema_policy_or_raise,
+    )
+
+    class _Ctx:
+        contract = {
+            "exposes": [
+                {
+                    "contract": {
+                        "schema": [{"name": "c", "type": declared}],
+                        "schemaPolicy": "strict",
+                    }
+                }
+            ]
+        }
+
+    class _Runner:
+        def fingerprint(self, _ctx: object) -> SchemaFingerprint:
+            return SchemaFingerprint.of([SchemaColumn(name="c", type=observed)])
+
+    enforce_schema_policy_or_raise(_Ctx(), _Runner())
+
+
 def test_the_rename_reaches_the_operator_through_the_real_gate(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -165,33 +195,9 @@ def test_the_rename_reaches_the_operator_through_the_real_gate(
     """
     import logging
 
-    from fluid_build.api.schema import SchemaColumn, SchemaFingerprint
-    from fluid_build.build_runners._acquisition_common import (
-        enforce_schema_policy_or_raise,
-    )
-
-    contract = {
-        "exposes": [
-            {
-                "contract": {
-                    "schema": [{"name": "big", "type": "double"}],
-                    "schemaPolicy": "strict",
-                }
-            }
-        ]
-    }
-
-    class _Ctx:
-        def __init__(self) -> None:
-            self.contract = contract
-
-    class _Runner:
-        def fingerprint(self, _ctx: object) -> SchemaFingerprint:
-            # What a DuckDB 2.0 install now infers for the same source bytes.
-            return SchemaFingerprint.of([SchemaColumn(name="big", type="hugeint")])
-
     with caplog.at_level(logging.WARNING):
-        enforce_schema_policy_or_raise(_Ctx(), _Runner())
+        # What a DuckDB 2.0 install now infers for the same source bytes.
+        _through_the_strict_gate(declared="double", observed="hugeint")
 
     assert "acquisition_schema_family_rename" in [
         r.message for r in caplog.records
@@ -257,3 +263,89 @@ def test_an_all_null_column_round_trips() -> None:
     assert _event("string", '"NULL"') == "none"
     # ... but a column that gains a real type is still drift.
     assert _event("string", "integer") == "type_changed"
+
+
+# ── DuckDB's names for VARCHAR are one type, not a family rename ─────────
+
+#: What ``duckdb_types()`` gives the logical type VARCHAR on duckdb 1.5.1 and
+#: 2.0.0, less ``json`` (see the installed-DuckDB test below). A column
+#: declared with any of them DESCRIBEs as VARCHAR.
+_DUCKDB_VARCHAR_NAMES = ("varchar", "string", "text", "char", "bpchar", "nvarchar")
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [*itertools.permutations(_DUCKDB_VARCHAR_NAMES, 2), ("STRING", "VARCHAR")],
+)
+def test_duckdbs_names_for_varchar_are_one_type(old: str, new: str) -> None:
+    """A contract that types text STRING (Spark, Databricks) against DuckDB.
+
+    DuckDB DESCRIBEs every text column as VARCHAR whatever it was declared as,
+    so without this each STRING column failed the gate as ``type_changed`` on
+    every ingest, under every policy but ``evolve_all``. Nothing moved, so the
+    rename note stays silent too: it is for a physical type that did move
+    (DOUBLE -> HUGEINT), and here it would claim a width change that does not
+    happen, once per text column per run.
+    """
+    assert _event(old, new) == "none"
+    assert family_rename_note(old, new) is None
+
+
+def test_an_all_null_column_that_fills_with_text_is_not_drift() -> None:
+    """Discover writes ``string`` for an all-null column; text then DESCRIBEs as VARCHAR.
+
+    While STRING and VARCHAR were two families this was ``type_changed``: the
+    all-null case passed only for as long as the column stayed empty.
+    """
+    assert _event("string", '"NULL"') == "none"
+    assert _event("string", "varchar") == "none"
+    assert _event("varchar", '"NULL"') == "none"
+    # A real type is still drift, whichever spelling the text side uses.
+    for name in _DUCKDB_VARCHAR_NAMES:
+        assert _event(name, "integer") == "type_changed", name
+        assert _event("integer", name) == "type_changed", name
+
+
+def test_every_installed_duckdb_name_for_varchar_is_one_type() -> None:
+    """Over the INSTALLED DuckDB's own list, so a new alias fails here first."""
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(":memory:")
+    try:
+        names = [
+            row[0]
+            for row in con.execute(
+                "SELECT DISTINCT lower(type_name) FROM duckdb_types() "
+                "WHERE logical_type = 'VARCHAR'"
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+    assert "string" in names, f"the query read no VARCHAR names: {names}"
+    # JSON is the json extension's own type: DESCRIBE reports it as JSON and a
+    # cast into it validates the text, so VARCHAR -> JSON is a real change.
+    wrong = [
+        name
+        for name in names
+        if name != "json"
+        and (_event("varchar", name) != "none" or family_rename_note("varchar", name))
+    ]
+    assert wrong == [], f"duckdb {duckdb.__version__}: not read as VARCHAR: {wrong}"
+
+
+def test_a_string_contract_passes_the_strict_gate_quietly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The reported case: VARCHAR is what DuckDB DESCRIBEs for a Postgres text column."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        _through_the_strict_gate(declared="STRING", observed="VARCHAR")
+    assert "acquisition_schema_family_rename" not in [r.message for r in caplog.records]
+
+
+def test_a_string_column_that_turns_numeric_still_fails_the_strict_gate() -> None:
+    from fluid_build._errors import SchemaDriftError
+
+    with pytest.raises(SchemaDriftError) as raised:
+        _through_the_strict_gate(declared="STRING", observed="INTEGER")
+    assert "c/type_changed" in raised.value.why

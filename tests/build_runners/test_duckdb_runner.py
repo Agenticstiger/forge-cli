@@ -432,6 +432,26 @@ def test_a_database_source_that_drifts_from_its_declared_schema_is_refused(tmp_p
     assert not out.exists()
 
 
+def test_a_contract_that_types_text_string_lands_under_a_strict_policy(csv_contract, tmp_path):
+    """STRING is the Spark and Databricks name for DuckDB's VARCHAR.
+
+    DuckDB DESCRIBEs the CSV's text column as VARCHAR whatever the contract
+    calls it, so a ``schemaPolicy: strict`` contract typed STRING failed every
+    ingest with ``SchemaDriftError`` while the gate read the two as different
+    types."""
+    csv_contract["exposes"][0]["contract"] = {
+        "schemaPolicy": "strict",
+        "schema": [
+            {"name": "id", "type": "BIGINT"},
+            {"name": "customer", "type": "STRING"},
+            {"name": "amount", "type": "DOUBLE"},
+        ],
+    }
+    rc = execute_duckdb_build(csv_contract["builds"][0], csv_contract, tmp_path, dry_run=False)
+    assert rc == 0
+    assert Path(csv_contract["exposes"][0]["binding"]["location"]["path"]).exists()
+
+
 # ── postgres (docker-required) ────────────────────────────────────────────
 
 

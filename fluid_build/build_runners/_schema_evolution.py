@@ -111,18 +111,29 @@ _TYPE_FAMILIES: Tuple[Tuple[str, ...], ...] = (
         "timestamptz_ns",
     ),
     ("time", "time_ns", "timetz", "time with time zone"),
-    # Non-numeric spellings of one physical type. `string`/`null` covers an
-    # all-null column: discover writes `string` for it and DuckDB keeps
-    # inferring the quoted `"NULL"`. It deliberately does NOT include a real
-    # type, so `string` -> `integer` once data arrives is still drift.
-    ("varchar", "bpchar"),
+    # Non-numeric spellings of one physical type.
+    #
+    # VARCHAR under every name DuckDB gives it (_VARCHAR_NAMES): Spark and
+    # Databricks spell it STRING, and DuckDB DESCRIBEs the column as VARCHAR
+    # whatever it was declared as, so a STRING-typed contract otherwise failed
+    # every ingest. `null` and `type` cover an all-null column and DuckDB's
+    # meta type: discover writes `string` for both, and DuckDB keeps inferring
+    # the quoted `"NULL"` until data arrives. No other real type is here, so
+    # `string` -> `integer` once data arrives is still drift.
+    ("varchar", "string", "text", "char", "bpchar", "nvarchar", "null", "type"),
     ("bit", "bitstring"),
     ("boolean", "logical"),
     ("array", "list"),
     ("struct", "tuple"),
     ("variant", "union"),
-    ("string", "null", "type"),
 )
+
+#: The names ``duckdb_types()`` gives the logical type VARCHAR (measured on
+#: duckdb 1.5.1 and 2.0.0, and listed as aliases in DuckDB's data-type docs),
+#: less ``json``, the json extension's own type, which validates its text. A
+#: column declared with any of them DESCRIBEs as VARCHAR, so a change between
+#: two of them moves nothing, unlike the rest of their family.
+_VARCHAR_NAMES = frozenset({"varchar", "string", "text", "char", "bpchar", "nvarchar"})
 
 _FAMILY_OF: Dict[str, int] = {
     name: index for index, names in enumerate(_TYPE_FAMILIES) for name in names
@@ -144,12 +155,15 @@ def family_rename_note(old: str, new: str) -> Optional[str]:
     """A line for the operator when a type change was only a spelling change.
 
     Returned so the caller can SAY the physical type moved while not failing on
-    it. ``None`` when the two are not one family.
+    it. ``None`` when the two are not one family, or are one type under two
+    names (STRING and VARCHAR).
     """
     if old.strip().lower() == new.strip().lower():
         return None  # nothing changed: a rename note for X -> X is noise
     if not _same_type_family(old, new):
         return None
+    if {old.strip().strip('"').lower(), new.strip().strip('"').lower()} <= _VARCHAR_NAMES:
+        return None  # one type, two spellings: nothing moved, so nothing to report
     return (
         f"column type {old!r} -> {new!r}: the same physical type under two names "
         "(DuckDB 1.5 and 2.0 infer these differently for identical input), so "
