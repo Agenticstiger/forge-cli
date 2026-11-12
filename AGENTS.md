@@ -365,8 +365,8 @@ cases, purpose limitation). The space never widens access. Genie answers as the 
 under their Unity Catalog grants. Prompt matching is never turned on. Only the principals with
 `SELECT` get `CAN RUN`. An `agentPolicy` that denies `qa` or `analysis`, or allows neither, refuses the space. The space is
 found again by the marker `[fluid-genie:<product id>]` at the end of its description, only in the
-deploying identity's own folder (one anywhere else is left alone), and removing the block trashes
-it.
+deploying identity's own folder or in `parentPath` (one anywhere else is left alone), and removing
+the block trashes a space in the identity's own folder.
 
 A product deployed from more than one identity (a laptop and CI) sets `parentPath`: a workspace
 folder that a workspace admin creates, with `CAN_MANAGE` only for those identities. The space is

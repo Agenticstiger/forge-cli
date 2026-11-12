@@ -1270,11 +1270,14 @@ def test_a_space_in_this_identitys_own_folder_is_moved_into_the_parent_path(fake
     Run(fake)(site_contract())
     space_id = only_space(fake)["space_id"]
     dry = Run(fake)(site_contract(parentPath=SALES), dry_run=True)
-    assert dry.writes() == [] and f"would move space {space_id}" in dry.text
+    assert dry.writes() == [] and f"would move 'Site 360' ({space_id}) from" in dry.text
     run = Run(fake)(site_contract(parentPath=SALES))
     assert set(fake.genie_spaces) == {space_id} and only_space(fake)["parent_path"] == SALES
     assert run.writes()[0] == ("PATCH", f"/api/2.0/genie/spaces/{space_id}")
-    assert f"moved space {space_id} from this identity's own folder into /genie/sales" in run.text
+    assert (
+        f"moved 'Site 360' ({space_id}) from this identity's own folder into /genie/sales"
+        in run.text
+    )
     assert Run(fake)(site_contract(parentPath=SALES)).writes() == []
 
 
@@ -1427,6 +1430,7 @@ def test_dropping_the_block_leaves_a_space_in_the_parent_path_with_a_note(fake):
     run = Run(fake)(without_block(site_contract()))
     assert set(fake.genie_spaces) == {space_id} and run.writes() == []
     assert f"left alone: space {space_id}" in run.text and SALES in run.text
+    assert "If it is this product's space in its parentPath folder, trash it there" in run.text
 
 
 # ---------------------------------------------------------------------- plan, diff, generate iac

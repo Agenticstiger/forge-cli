@@ -328,8 +328,8 @@ def workspace_folder(path: str) -> str:
     2026-11-12). terraform-provider-databricks compares a dashboard's ``parent_path`` the same
     way (``common.WorkspacePathPrefixDiffSuppress``); here the prefix counts only as a whole
     segment. Workspace paths are case-sensitive (``/shared/x`` is not ``/Shared/x``: 404,
-    measured), so nothing is folded, and nothing is trimmed: a folder named ``"/x "`` is not
-    ``/x``."""
+    measured), so nothing is folded, and nothing is trimmed: a folder the API names ``"/x "``
+    is not ``/x``. (The contract's own value is trimmed first, by :func:`_block_parent_path`.)"""
     path = str(path or "")
     if path == "/Workspace" or path.startswith("/Workspace/"):
         path = path[len("/Workspace") :]
@@ -946,8 +946,9 @@ def converge(
     serialized = _with_metric_views(client, space)
     space_id = str(found[0]["space_id"]) if found else ""
     if not found and own:
-        space_id = str(own.pop()["space_id"])
-        _move(client, space_id, space, say, dry_run)
+        moving = own.pop()
+        space_id = str(moving["space_id"])
+        _move(client, moving, space, say, dry_run)
     if space_id:
         _update_found(client, space_id, space, serialized, say, dry_run)
     elif dry_run:
@@ -1080,13 +1081,16 @@ def _group_levels(doc: Any, group: str) -> set:
     return levels
 
 
-def _move(client: Any, space_id: str, space: Space, say: Say, dry_run: bool) -> None:
+def _move(client: Any, moving: Mapping[str, Any], space: Space, say: Say, dry_run: bool) -> None:
     """Move a space from this identity's own folder into ``parentPath`` (``PATCH parent_path``,
     measured 2026-11-12), so its id, link and conversations stay."""
+    space_id = str(moving.get("space_id"))
+    what = (
+        f"{moving.get('title')!r} ({space_id}) from this identity's own folder into "
+        f"{space.parent_path}"
+    )
     if dry_run:
-        say(
-            f"    would move space {space_id} from this identity's own folder into {space.parent_path}"
-        )
+        say(f"    would move {what}")
         return
     _call(
         client,
@@ -1102,7 +1106,7 @@ def _move(client: Any, space_id: str, space: Space, say: Say, dry_run: bool) -> 
             f"the space is in {parent or 'a folder this identity cannot read'}.",
             (f"Move it into {space.parent_path} by hand, or trash it, then re-run fluid apply.",),
         )
-    say(f"    moved space {space_id} from this identity's own folder into {space.parent_path}")
+    say(f"    moved {what}")
 
 
 def _trash_copy(
@@ -1308,7 +1312,7 @@ def _retire(product_id: str, say: Say, factory: Optional[ClientFactory], dry_run
     try:
         found = _find(client, marker(product_id))
         if found:
-            found = _placed(client, found, say)[0]
+            found = _placed(client, found, say, hint=_RETIRED_HINT)[0]
     except Exception as exc:  # noqa: BLE001
         if _status(exc) not in (403, 404):
             say(f"  note: not checked for a Genie space an earlier apply made: {_scrub(exc)}")
@@ -1352,8 +1356,16 @@ def _find(client: Any, token: str) -> List[Dict[str, Any]]:
         query = {"page_size": _PAGE_SIZE, "page_token": token_next}
 
 
+#: Said with each space a removed block leaves: the folder ``parentPath`` named is no longer
+#: known, so the product's own space there looks like anyone's.
+_RETIRED_HINT = (
+    " If it is this product's space in its parentPath folder, trash it there: without "
+    f"extensions.{EXTENSION_KEY} this apply cannot tell that folder from any other."
+)
+
+
 def _placed(
-    client: Any, found: List[Dict[str, Any]], say: Say, folder: str = ""
+    client: Any, found: List[Dict[str, Any]], say: Say, folder: str = "", hint: str = ""
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """``found`` by folder: ``(the product's spaces, this identity's own copies)``.
 
@@ -1392,7 +1404,7 @@ def _placed(
                 f"{_marker_of(space)} but is in {parent or 'a folder this identity cannot read'}, "
                 "not in " + (f"{folder} or " if folder else "") + "this identity's own folder, "
                 "so it is not taken for the product's. Trash it, or take the marker out of its "
-                "description."
+                "description." + hint
             )
     return product, own
 
