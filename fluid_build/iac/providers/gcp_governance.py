@@ -76,7 +76,7 @@ from ..access import normalize_access_grants
 from ..base import UnsupportedBindingError
 from ..column_access import authz_readers, column_masks, column_readers, restrictions_for
 from ..governance_labels import governance_labels
-from ..naming import safe_ident
+from ..naming import bounded_ident, safe_ident
 from ..principals import GCP, gcp_grants, principal_map, resolve_principal
 from ..provider_match import canonical_cloud
 from ..row_access import row_filters_for
@@ -249,10 +249,7 @@ def taxonomy_region(bq_location: str) -> str:
 
 def _bounded(text: str, limit: int) -> str:
     """``text`` cut to ``limit`` characters, a short hash keeping cut names distinct."""
-    if len(text) <= limit:
-        return text
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
-    return f"{text[: limit - 9]}-{digest}"
+    return bounded_ident(text, limit, "-")
 
 
 def product_key_ring(cid: str, dataset: str) -> str:
