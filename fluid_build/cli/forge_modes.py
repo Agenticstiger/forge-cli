@@ -1271,7 +1271,8 @@ def run_ai_copilot_mode(
                 failed = f"--seed-from failed for {_seed_from!s}: {type(_seed_exc).__name__}"
                 # What load_seed accepts; there is no --verbose to point at.
                 accepts = (
-                    "--seed-from takes a *.odps.yaml or *.odcs.yaml file, or a directory of them"
+                    "--seed-from takes an ODPS or ODCS file (*.odps.yaml, *.odcs.yaml, or "
+                    "one with kind: DataProduct or DataContract), or a directory of them"
                 )
                 console_error(f"{failed} ({accepts})")
                 # ``--agent``'s forge.error gets the same words, not the exception:
