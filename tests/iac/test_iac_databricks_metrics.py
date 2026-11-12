@@ -437,6 +437,25 @@ REFUSALS = [
     (_with("dimensions.0.expr", "main.tools.lookup(country_code)"), "quoted or qualified"),
     (_with("metrics.0.filter", "IDENTIFIER('secret')('a', 'b') = 'x'"), "calls IDENTIFIER()"),
     (_with("metrics.0.filter", "upper(site_status) = 'AI_QUERY('"), None),  # a literal: fine
+    # A quote inside a backtick-quoted name opens no literal: the call between them is seen.
+    (
+        _with(
+            "metrics.0.filter",
+            'exists(array(1), `a\'` -> true) AND length(secret("s", "k")) > 0 '
+            "AND exists(array(1), `'b` -> true)",
+        ),
+        "calls secret()",
+    ),
+    (
+        _with(
+            "metrics.0.filter",
+            "exists(array(1), `a'` -> true)) + 0 * (exists(array(1), `'b` -> true)",
+        ),
+        "parentheses do not balance",
+    ),
+    (_with("metrics.0.filter", "site_status = 'ON_AIR"), "does not close"),
+    (_with("metrics.0.filter", "`site_status = 'x'"), "does not close"),
+    (_with("metrics.0.filter", "`we(ird` = 'x' OR site_status = 'y'"), None),
     (_append("measures", {"name": "ghost", "agg": "sum"}), "has no expr"),
     (_with("measures.0.agg", "stddev"), "unsupported agg 'stddev'"),
     (_with("measures.0.agg", "percentile"), None),  # default 0.5: compiles
@@ -618,7 +637,10 @@ def test_dry_run_prints_the_statements_and_runs_none(fake):
 @pytest.mark.parametrize(
     ("seed", "why"),
     [
-        (lambda fake: fake.create_table(VIEW, [("x", "string", True)]), "it is a MANAGED"),
+        (
+            lambda fake: fake.create_table(VIEW, [("x", "string", True)]),
+            "it is a managed table, not a metric view",
+        ),
         (
             lambda fake: _execute(
                 fake,

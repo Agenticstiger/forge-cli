@@ -144,7 +144,9 @@ _SUB_DAY = frozenset({"hour", "minute"})
 _TOKEN_RE = re.compile(
     r"`(?:``|[^`])*`|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|(?<![A-Za-z0-9_$])[A-Za-z_][A-Za-z0-9_]*"
 )
-_LITERAL_RE = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"")
+#: A quoted span as Databricks SQL reads it, left to right: a backtick-quoted name or a string
+#: literal (either quote). One pass, so a quote inside one span never opens another.
+_SPAN_RE = re.compile(r"`(?:``|[^`])*`|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"")
 _MEASURE_CALL_RE = re.compile(r"(?i)\bmeasure\s*\(")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 #: Functions a contract expression may not call. A metric view evaluates its expressions with
@@ -423,7 +425,7 @@ class _ViewCompiler:
         text = self._allowed(raw, what)
         if text is None:
             return None
-        scan = _LITERAL_RE.sub(" ", text)
+        scan = _blank(text, names=False)  # string literals out, quoted names kept
         refused_call = _refused_call(scan)
         if refused_call is not None:
             self.refuse(
@@ -476,9 +478,15 @@ class _ViewCompiler:
                 "Rewrite it as a plain SQL expression over the table's columns.",
             )
             return None
-        if not _semantics.parens_balanced(
-            _LITERAL_RE.sub(" ", text)
-        ):  # a ')' in '...' closes nothing
+        code = _blank(text, names=True)  # a '(' in '...' or `...` opens nothing
+        if any(quote in code for quote in "'\"`"):
+            self.refuse(
+                "invalid",
+                f"{what} is {raw!r}, which opens a quote or a quoted name it does not close.",
+                "Close every quote and backtick it opens.",
+            )
+            return None
+        if not _semantics.parens_balanced(code):
             self.refuse(
                 "invalid",
                 f"{what} is {raw!r}, whose parentheses do not balance.",
@@ -643,9 +651,9 @@ class _ViewCompiler:
         elif kind == "derived":
             self.refuse(
                 "unsupported",
-                f"{what} ({name}) is a derived metric. Its expr names other metrics, which "
-                "a metric view reads only through MEASURE(), and rewriting the expression is "
-                "not done: it is refused rather than guessed.",
+                f"{what} ({name}) is a derived metric: its expr names other metrics, which a "
+                "metric view reads only through MEASURE(), and forge-cli does not rewrite the "
+                "expression, so it is refused rather than approximated.",
                 "Express it as a ratio of two metrics, or remove it for Databricks.",
             )
         else:
@@ -812,9 +820,15 @@ class _ViewCompiler:
                 )
 
 
+def _blank(text: str, *, names: bool) -> str:
+    """``text`` with each string literal, and with ``names`` each backtick-quoted name, replaced
+    by a space: what SQL reads as code, found in one pass as Databricks lexes it."""
+    return _SPAN_RE.sub(lambda m: m.group(0) if m.group(0)[0] == "`" and not names else " ", text)
+
+
 def _refused_call(text: str) -> Optional[str]:
-    """The first call in ``text`` (literals blanked) that may not run with the owner's rights,
-    as written, or ``None``."""
+    """The first call in ``text`` (string literals blanked, quoted names kept) that may not run
+    with the owner's rights, as written, or ``None``."""
     for match in _CALL_RE.finditer(text):
         call = match.group(1)
         name = call.lower()
@@ -992,6 +1006,16 @@ def _stored(info: Mapping[str, Any]) -> Any:
         return None
 
 
+#: How a ``table_type`` reads in a message.
+_KINDS = {
+    "MANAGED": "a managed table",
+    "EXTERNAL": "an external table",
+    "VIEW": "a view",
+    "MATERIALIZED_VIEW": "a materialized view",
+    "STREAMING_TABLE": "a streaming table",
+}
+
+
 def _classify(session: Session, view: MetricView) -> _Live:
     info = read_table(session.client, view.full_name)
     if info is None:
@@ -1000,7 +1024,7 @@ def _classify(session: Session, view: MetricView) -> _Live:
     found = (info.get("properties") or {}).get(PRODUCT_PROPERTY)
     owner = str(info.get("owner") or "")
     if kind != METRIC_VIEW:
-        why = f"it is a {kind or 'table'}, not a metric view"
+        why = f"it is {_KINDS.get(kind, 'a ' + (kind.lower() or 'table'))}, not a metric view"
     elif found != view.product_id:
         why = (
             f"it is the metric view of product {found!r}"
