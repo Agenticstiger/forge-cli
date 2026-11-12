@@ -30,6 +30,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   REST API (the `[databricks]` extra), since the databricks/databricks provider has no Genie
   space resource. One space per product; a space over several products is a follow-up.
 
+- **Databricks: Unity Catalog primary and foreign keys from the contract.** A column tagged
+  `primary-key` (all of them, in schema order, for a composite key; each must be
+  `required: true`) becomes the table's PRIMARY KEY, and one tagged `foreign-key` with
+  `labels.references: <product id>.<column>` becomes a FOREIGN KEY to that product's table,
+  so Catalog Explorer draws the entity-relationship diagram and Genie can join the products.
+  The parent may live in another contract: it is found by the `fluid_product_id` tag every
+  forge table carries (`system.information_schema.table_tags`), wherever an overlay put it.
+  `fluid apply` declares the keys on the SQL warehouse after `tofu apply` (the provider has no
+  constraint argument), re-declares any that are missing, replaces or drops the ones it
+  declared (named `fluid_pk_<table>` / `fluid_fk_<table>__<columns>`) when the contract changes,
+  and leaves any other key in place. A key that cannot be declared yet (its parent not
+  deployed, say) is skipped with the reason and the fix, never failing the run;
+  `--mode dry-run` prints the statements. Because a dbt `table` build's `CREATE OR REPLACE`
+  drops a table's keys and every foreign key that references it (measured on a warehouse),
+  each Databricks dbt job that writes a keyed table gets a second task, `fluid_keys`, that
+  declares them again after dbt, with the contract's own foreign keys into those tables, in a
+  script that passes over a key it cannot add instead of failing the run. Such a key (a key
+  column the dbt model leaves nullable, say) is reported by the next `fluid apply`, and the
+  script needs a SQL warehouse that runs SQL scripting. A dbt build that
+  `--mode amend-and-build` runs locally is followed by the same re-declaration.
+
 ### Fixed
 
 - **`fluid ai models --provider` works, and takes the names `fluid forge --llm-provider`
@@ -83,6 +104,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CHAR(3)`), which DuckDB neither enforces nor reports, and a change between them logs no
   rename warning. An all-null column that `fluid init --discover` wrote as `string` now also
   passes once text arrives. `STRING` to `INTEGER` is still drift.
+- **`fluid diff` reports no plan-validation failure for an expose an acquisition build lands.**
+  `fluid diff` plans the contract with the local provider, which leaves an acquisition build
+  (`pattern: acquisition` on duckdb, dlt, airbyte, meltano, kafka-connect or debezium) to its
+  runner, so no table in that plan backs the expose the build writes. The plan printed "Could
+  not determine source table", "Plan validation failed with 1 errors: … materialize missing
+  source_table" and `local_plan_validation_failed` before the live check reported the expose as
+  matching, and `fluid apply --mode amend` printed the same. The plan now records the builds that
+  land such an expose (`payload.landed_by`) and asks no table for it. An expose that no build
+  writes, or that another build may write, still reports its missing source, and the drift
+  verdict and exit code are unchanged.
 
 ## [0.29.0] — 2026-11-12
 

@@ -156,7 +156,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ...providers._sql_safety import validate_ident, validate_sql_type_param_payload
@@ -182,7 +182,16 @@ from ..provider_match import canonical_cloud, is_cloud
 from ..versions import required_providers
 from .databricks_access import TableEnforcement, compile_enforcement
 from .databricks_auth import tofu_env_overlay
-from .databricks_enforce import Target, post_apply, pre_apply, preview, unprotected
+from .databricks_enforce import (
+    SqlRunner,
+    Target,
+    default_client,
+    post_apply,
+    pre_apply,
+    preview,
+    scrub,
+    unprotected,
+)
 from .databricks_jobs import (
     CompiledJobs,
     DbtJob,
@@ -190,6 +199,18 @@ from .databricks_jobs import (
     dbt_written_exposes,
     run_as_allowlist,
 )
+from .databricks_keys import (
+    Candidate,
+    KeyTarget,
+    TableKeys,
+    compile_keys,
+    deploying_identity,
+    foreign_keys,
+    own_candidates,
+    rebuild_script,
+    reconcile,
+)
+from .databricks_keys import lookup as lookup_key_tables
 from .databricks_retention import Retention, check_expire
 
 _LOG = logging.getLogger(__name__)
@@ -302,6 +323,8 @@ class _Table:
     column_comments: Tuple[Tuple[str, str], ...] = ()
     #: ``(column, sensitivity)`` per column the contract classifies.
     classified: Tuple[Tuple[str, str], ...] = ()
+    #: Its primary key and foreign key references (``databricks_keys.py``), if it has any.
+    keys: Optional[TableKeys] = None
 
     @property
     def full_name(self) -> str:
@@ -939,6 +962,7 @@ def _resolve_table(
     contract: Mapping[str, Any],
     validating: bool,
     builds: Sequence[Mapping[str, Any]] = (),
+    warnings: Optional[List[str]] = None,
 ) -> Optional[_Table]:
     """One Databricks expose → :class:`_Table`, or ``None`` with its refusals."""
     binding = exposure.get("binding") or {}
@@ -976,6 +1000,8 @@ def _resolve_table(
             refusals.append(exc)
     if len(refusals) > before:
         return None
+    full_name = f"{names['database']}.{names['schema']}.{names['table']}"
+    keys = compile_keys(where, full_name, exposure, columns, [] if warnings is None else warnings)
     return _Table(
         index=index,
         expose_id=expose_id,
@@ -992,6 +1018,7 @@ def _resolve_table(
         comment=comment,
         column_comments=tuple(column_comments),
         classified=tuple(classified),
+        keys=keys,
     )
 
 
@@ -1310,9 +1337,14 @@ def _refuse_build_hosts(
 
 
 def _compile(
-    contract: Mapping[str, Any], env: Mapping[str, str], *, validating: bool = False
+    contract: Mapping[str, Any],
+    env: Mapping[str, str],
+    *,
+    validating: bool = False,
+    key_lookup: Optional[KeyLookup] = None,
 ) -> _Compiled:
-    """The whole module for ``contract``, and every refusal, in one pass."""
+    """The whole module for ``contract``, and every refusal, in one pass (``key_lookup``:
+    :func:`_rebuild_scripts`)."""
     compiled = _Compiled()
     refusals = compiled.refusals
     _refuse_build_hosts(contract, refusals)
@@ -1355,6 +1387,7 @@ def _compile(
             )
         _emit_grants(compiled, table, cid, privileges.get(table.full_name, {}))
         _emit_tags(compiled, table, cid, contract)
+    _check_own_keys(compiled, contract)
     _merge_jobs(
         compiled,
         compile_dbt_jobs(
@@ -1363,6 +1396,7 @@ def _compile(
             warehouse,
             validating=validating,
             run_as_allowed=run_as_allowlist(env),
+            rebuild_script=_rebuild_scripts(compiled, contract, builds, key_lookup),
         ),
     )
 
@@ -1373,6 +1407,138 @@ def _compile(
         unique.setdefault(f"{refusal.kind}:{refusal}", refusal)
     compiled.refusals = list(unique.values())
     return compiled
+
+
+#: ``products → {product id: its tables}``, the live half of a foreign key's resolution.
+KeyLookup = Callable[[Sequence[str]], Mapping[str, Sequence[Candidate]]]
+
+
+def _check_own_keys(compiled: _Compiled, contract: Mapping[str, Any]) -> None:
+    """A ``fluid validate`` warning for each foreign key to this contract's own product that no
+    expose's declared primary key takes. One to another product is resolved at apply time."""
+    contract_id = _text(contract.get("id"))
+    keyed = [(t, t.keys) for t in compiled.tables if t.keys is not None]
+    own = own_candidates(contract_id, [keys for _t, keys in keyed])
+    for table, keys in keyed:
+        mine = tuple(r for r in keys.references if r.product == contract_id)
+        if not mine:
+            continue
+        notes: List[str] = []
+        foreign_keys(replace(keys, references=mine), own, notes, own_id=contract_id)
+        compiled.warnings.extend(f"{table.where}: {note}" for note in notes)
+
+
+def _rebuild_scripts(
+    compiled: _Compiled,
+    contract: Mapping[str, Any],
+    builds: Sequence[Mapping[str, Any]],
+    key_lookup: Optional[KeyLookup],
+) -> Callable[[Mapping[str, Any]], Optional[str]]:
+    """The ``fluid_keys`` script of each Databricks dbt job, by its build; ``None`` for a job
+    that writes no table with a key (``databricks_keys.rebuild_script``).
+
+    A job's script declares again what its build's ``CREATE OR REPLACE`` drops: the keys of the
+    tables it writes, and the foreign keys of this contract's other tables that reference them.
+    Its foreign keys to other products need ``key_lookup``, which only ``emit`` passes; without
+    it (``fluid validate``, the native planner) a script holds the primary keys and the foreign
+    keys to this contract's own tables.
+    """
+    contract_id = _text(contract.get("id"))
+    keyed = [(t, t.keys) for t in compiled.tables if t.keys is not None]
+    written: Dict[int, List[TableKeys]] = {}
+    for build in builds:
+        if not is_databricks_job_build(build):
+            continue
+        tables = [
+            keys
+            for table, keys in keyed
+            if any(
+                w is build for w in builds_writing_expose(table.exposure.get("exposeId"), builds)
+            )
+        ]
+        if tables:
+            written[id(build)] = tables
+    if not written:
+        return lambda build: None
+    candidates: Dict[str, Sequence[Candidate]] = dict(
+        own_candidates(contract_id, [keys for _t, keys in keyed])
+    )
+    others = sorted(
+        {r.product for tables in written.values() for k in tables for r in k.references}
+        - {contract_id}
+    )
+    if others and key_lookup is not None:
+        candidates.update(key_lookup(others))
+    resolved = [
+        (keys.full_name, fk)
+        for _t, keys in keyed
+        for fk in foreign_keys(keys, candidates, own_id=contract_id)
+    ]
+    scripts: Dict[int, str] = {}
+    for build_id, tables in written.items():
+        names = {keys.full_name for keys in tables}
+        drops = [(child, fk) for child, fk in resolved if child in names or fk.parent in names]
+        scripts[build_id] = rebuild_script(tables, drops)
+    return lambda build: scripts.get(id(build))
+
+
+def _declare_keys(
+    contract: Mapping[str, Any],
+    say: Callable[[str], None],
+    client_factory: Optional[Callable[[], Any]] = None,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Declare the contract's primary and foreign keys on its live tables
+    (``databricks_keys.reconcile``). A key is metadata: this never raises, and says what it
+    could not do."""
+    try:
+        compiled = _compile(contract, os.environ)
+        if compiled.refusals:
+            return  # the hooks that gate have refused already
+        targets = [KeyTarget(t.full_name, t.keys) for t in compiled.tables]
+        reconcile(targets, _text(contract.get("id")), say, client_factory, dry_run=dry_run)
+    except Exception as exc:  # noqa: BLE001 — a key never fails the run
+        say(f"\n  Unity Catalog keys: not declared ({type(exc).__name__}: {scrub(exc)}).")
+
+
+#: How long ``emit`` waits for the live key lookup: a plan should not hang on a warehouse.
+_KEY_LOOKUP_TIMEOUT_SECONDS = 120
+
+
+def _live_key_lookup(
+    products: Sequence[str], failures: Optional[List[str]] = None
+) -> Mapping[str, Sequence[Candidate]]:
+    """Other products' live tables, for the ``fluid_keys`` scripts ``emit`` writes.
+
+    Best effort, and what it could not read is added to ``failures``: a module still emits
+    without a credential (``fluid generate iac``), and ``fluid apply`` resolves, declares and
+    reports the keys itself after ``tofu apply`` (``databricks_keys.reconcile``).
+    """
+    said: List[str] = []
+    try:
+        warehouse = str(os.environ.get(WAREHOUSE_ENV) or "").strip()
+        if not warehouse:
+            said.append(f"{WAREHOUSE_ENV} is not set")
+            return {}
+        client = default_client()
+        runner = SqlRunner(client, warehouse, timeout=_KEY_LOOKUP_TIMEOUT_SECONDS)
+        return lookup_key_tables(runner, client, products, deploying_identity(client), said)
+    except Exception as exc:  # noqa: BLE001 — no live answer is no foreign key in the script
+        said.append(f"{type(exc).__name__}: {scrub(exc)}")
+        return {}
+    finally:
+        if failures is not None:
+            failures.extend(said)
+
+
+def _references_another_product(compiled: _Compiled, contract: Mapping[str, Any]) -> bool:
+    """Whether a dbt job's script may need the live lookup: the contract has a job, and a
+    table that references a product other than its own."""
+    own = _text(contract.get("id"))
+    return bool(compiled.jobs) and any(
+        r.product != own for t in compiled.tables if t.keys for r in t.keys.references
+    )
 
 
 def _resolve_tables(
@@ -1393,6 +1559,7 @@ def _resolve_tables(
             contract=contract,
             validating=validating,
             builds=builds,
+            warnings=compiled.warnings,
         )
         if table is not None:
             compiled.tables.append(table)
@@ -2059,6 +2226,17 @@ class DatabricksIacPlugin:
         if genie.refusals:
             raise genie.refusals[0]
         _enforce_sovereignty(contract, compiled.tables)
+        # Only now, with the contract compiled and its sovereignty upheld, may the dbt jobs'
+        # fluid_keys scripts look up other products' tables on the warehouse; ``plan_notices``
+        # says when it could not.
+        failures: List[str] = []
+        if _references_another_product(compiled, contract):
+            compiled = _compile(
+                contract,
+                os.environ,
+                key_lookup=lambda products: _live_key_lookup(products, failures),
+            )
+        self._key_lookup_failures = (_contract_key(contract), failures)
         # Decided once, here: ``plan_notices`` of the same run says what this paused, so a
         # transient read error cannot pause a job without the notice (or the reverse).
         to_pause = _jobs_to_pause(compiled, contract)
@@ -2197,6 +2375,7 @@ class DatabricksIacPlugin:
         say = say or print
         if dry_run:
             preview(targets, say, client_factory)
+            _declare_keys(contract, say, client_factory, dry_run=True)
         else:
             from .databricks_genie import preflight
 
@@ -2214,13 +2393,35 @@ class DatabricksIacPlugin:
         longer restricts, and revoke ``SELECT`` from the restricted principals of any table
         it could not bind (``databricks_enforce.post_apply``). ``after_failed_apply`` is the
         bind-only mode for an apply that failed part way: it drops nothing and skips a table
-        that was never created."""
+        that was never created. Then, after an apply that succeeded, the contract's Unity
+        Catalog keys (:func:`_declare_keys`)."""
         post_apply(
             self._enforcement_targets(contract),
             say or print,
             client_factory,
             after_failed_apply=after_failed_apply,
         )
+        if not after_failed_apply:
+            _declare_keys(contract, say or print, client_factory)
+
+    def post_build(
+        self,
+        contract: Mapping[str, Any],
+        say: Optional[Callable[[str], None]] = None,
+        client_factory: Optional[Callable[[], Any]] = None,
+    ) -> None:
+        """After ``fluid apply --mode amend-and-build`` ran the contract's builds here.
+
+        A dbt build run on this machine against a Databricks table rebuilt it with CREATE OR
+        REPLACE, which drops the keys the apply declared, so they are declared again. A build
+        that runs as a Databricks job does that in its job's ``fluid_keys`` task, and a landing
+        (``INSERT OVERWRITE``) keeps them: neither needs this.
+        """
+        from ...build_runners.base import is_dbt_build
+
+        builds = [b for b in contract.get("builds") or [] if isinstance(b, Mapping)]
+        if any(is_dbt_build(b) and not is_databricks_job_build(b) for b in builds):
+            _declare_keys(contract, say or print, client_factory)
 
     def converge_output_ports(
         self,
@@ -2262,6 +2463,16 @@ class DatabricksIacPlugin:
                 f"{CERTIFICATION_TAG} is set on {', '.join(certified)}: a system governed tag, "
                 "so this identity needs the ASSIGN permission on it, which an account or "
                 "workspace admin grants, or the tag assignment fails."
+            )
+        failed = getattr(self, "_key_lookup_failures", None)
+        self._key_lookup_failures = None  # used once, as the pause decision is
+        if failed is not None and failed[1] and failed[0] == _contract_key(contract):
+            notices.append(
+                "the fluid_keys task of this contract's dbt jobs declares no foreign key to "
+                "another product's table it could not look up now ("
+                + "; ".join(failed[1])
+                + "). fluid apply still declares them on the tables after the apply, and the "
+                "next apply that can look them up writes them into the task's script."
             )
         decided = getattr(self, "_pause_decision", None)
         self._pause_decision = None  # used once: the next run decides again

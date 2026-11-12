@@ -17,7 +17,13 @@ sent in ``functions``; CREATE OR REPLACE of one a filter or mask uses is refused
 refuses it), ALTER TABLE SET / DROP ROW FILTER, ALTER COLUMN SET / DROP MASK, and REVOKE SELECT.
 The bindings are served on the table (``row_filter``, ``columns[].mask``) as Unity Catalog serves
 them, and a CREATE OR REPLACE TABLE keeps them (Databricks docs: REPLACE preserves row filters
-and column masks). ``fail_on(substring, message)`` makes every statement containing it FAIL,
+and column masks). The key constraints forge-cli declares (``databricks_keys.py``): ALTER TABLE
+ADD CONSTRAINT ... PRIMARY KEY / FOREIGN KEY ... REFERENCES and DROP CONSTRAINT [IF EXISTS],
+served as ``table_constraints``, with the rules and error texts a warehouse showed (a key needs
+NOT NULL columns, a foreign key its parent's primary key, a referenced primary key does not
+drop), and the ``fluid_product_id`` lookup on ``system.information_schema.table_tags``. A CREATE
+OR REPLACE TABLE drops the table's keys and the foreign keys that reference it, and a DROP
+COLUMN the keys on that column, as they do live. ``fail_on(substring, message)`` makes every statement containing it FAIL,
 for the fail-safe tests; ``fail_route(method, path_part)`` answers matching requests with an
 error, to fail a ``tofu apply`` part way; ``timeline`` orders statements against permission changes.
 Any other statement FAILS (state ``FAILED``) and stays visible in ``sql_log``, so a new
@@ -69,7 +75,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 NOT_FOUND = "NOT_FOUND"
@@ -258,6 +264,169 @@ def _new_table(cols: List[Dict[str, Any]], tail: Dict[str, Any], marker: int) ->
         "table_type": "MANAGED",
         "created_at": int(time.time() * 1000),
         "marker": marker,
+        "constraints": [],
+    }
+
+
+# ---------------------------------------------------------------------- key constraints
+# As measured on a Databricks SQL warehouse (dbsql 2026.45, 2026-11-12; see
+# ``fluid_build/iac/providers/databricks_keys.py``): the error texts below are the live ones.
+def _constraint_action(
+    fake: "FakeDatabricks", full: str, t: Dict[str, Any], action: str
+) -> Optional[Tuple[bool, str]]:
+    """``ALTER TABLE <full>`` ADD CONSTRAINT ... PRIMARY KEY / FOREIGN KEY and DROP CONSTRAINT;
+    ``None`` for any other action."""
+    m = re.match(
+        r"ADD\s+CONSTRAINT\s+`?([^`\s]+)`?\s+PRIMARY\s+KEY\s*\(([^)]*)\)\s*$", action, re.I
+    )
+    if m:
+        return _add_primary_key(fake, full, t, m.group(1), _names(m.group(2)))
+    m = re.match(
+        r"ADD\s+CONSTRAINT\s+`?([^`\s]+)`?\s+FOREIGN\s+KEY\s*\(([^)]*)\)\s+REFERENCES\s+"
+        rf"{_FULL}\s*\(([^)]*)\)\s*$",
+        action,
+        re.I,
+    )
+    if m:
+        cname, inner, pcat, psch, pname, pinner = m.groups()
+        parent = f"{pcat}.{psch}.{pname}"
+        return _add_foreign_key(fake, full, t, cname, _names(inner), parent, _names(pinner))
+    m = re.match(r"DROP\s+CONSTRAINT\s+(IF\s+EXISTS\s+)?`?([^`\s]+)`?\s*$", action, re.I)
+    if m:
+        return _drop_constraint(fake, full, t, m.group(2), bool(m.group(1)))
+    return None
+
+
+def _schema_constraint_names(fake: "FakeDatabricks", full: str) -> Set[str]:
+    schema = full.rsplit(".", 1)[0] + "."
+    return {
+        c["name"]
+        for name, table in fake.tables.items()
+        if name.startswith(schema)
+        for c in table.get("constraints") or []
+    }
+
+
+def _add_primary_key(
+    fake: "FakeDatabricks", full: str, t: Dict[str, Any], name: str, cols: List[str]
+) -> Tuple[bool, str]:
+    have = {c["name"]: c for c in t["columns"]}
+    missing = [c for c in cols if c not in have]
+    if missing:
+        return False, f"[UNRESOLVED_COLUMN] {missing[0]}"
+    if name in _schema_constraint_names(fake, full):
+        return False, f"[DELTA_CONSTRAINT_ALREADY_EXISTS] Constraint '{name}' already exists."
+    held = next((c for c in t["constraints"] if c["type"] == "PRIMARY KEY"), None)
+    if held is not None:
+        return (
+            False,
+            "[RESOURCE_ALREADY_EXISTS.UC_CHILD_COLUMNS_ALREADY_EXIST_IN_PRIMARY_KEY_OR_UNIQUE_"
+            f"CONSTRAINT] Failed to create PRIMARY KEY constraint {name}: table already has a "
+            f"PRIMARY KEY constraint: {held['name']}.",
+        )
+    loose = [c for c in cols if have[c]["nullable"]]
+    if loose:
+        return (
+            False,
+            f"Cannot create the primary key `{name}` because its child column(s) `{loose[0]}` "
+            "is nullable. Please change the column nullability and retry.",
+        )
+    t["constraints"].append({"type": "PRIMARY KEY", "name": name, "columns": cols})
+    return True, ""
+
+
+def _add_foreign_key(
+    fake: "FakeDatabricks",
+    full: str,
+    t: Dict[str, Any],
+    name: str,
+    cols: List[str],
+    parent: str,
+    parent_cols: List[str],
+) -> Tuple[bool, str]:
+    missing = [c for c in cols if c not in {col["name"] for col in t["columns"]}]
+    if missing:
+        return False, f"[UNRESOLVED_COLUMN] {missing[0]}"
+    target = fake.tables.get(parent)
+    if target is None:
+        return False, f"[TABLE_OR_VIEW_NOT_FOUND] The table or view {parent} cannot be found."
+    pk = next((c for c in target["constraints"] if c["type"] == "PRIMARY KEY"), None)
+    if pk is None:
+        return (
+            False,
+            "[NOT_FOUND.UC_REFERENTIAL_CONSTRAINT_DOES_NOT_EXIST] Table "
+            f"`{parent}` does not have either a primary key constraint or a UNIQUE constraint.",
+        )
+    if list(pk["columns"]) != list(parent_cols):
+        return (
+            False,
+            "The foreign key parent columns do not match the referenced primary key child "
+            f"columns or any unique constraint columns. Foreign key parent columns are "
+            f"({', '.join(parent_cols)}).",
+        )
+    if name in _schema_constraint_names(fake, full):
+        return False, f"[DELTA_CONSTRAINT_ALREADY_EXISTS] Constraint '{name}' already exists."
+    same = next(
+        (c for c in t["constraints"] if c["type"] == "FOREIGN KEY" and c["columns"] == cols), None
+    )
+    if same is not None:
+        return (
+            False,
+            f"[CONSTRAINT_ALREADY_EXISTS_WITH_SERVER_MESSAGE] Failed to create foreign key "
+            f"constraint `{name}`: table `{full}` already has a foreign key constraint: "
+            f"`{same['name']}`, that has the same set of child columns. SQLSTATE: 42710",
+        )
+    t["constraints"].append(
+        {
+            "type": "FOREIGN KEY",
+            "name": name,
+            "columns": cols,
+            "parent": parent,
+            "parent_columns": parent_cols,
+        }
+    )
+    return True, ""
+
+
+def _drop_constraint(
+    fake: "FakeDatabricks", full: str, t: Dict[str, Any], name: str, if_exists: bool
+) -> Tuple[bool, str]:
+    held = next((c for c in t["constraints"] if c["name"] == name), None)
+    if held is None:
+        if if_exists:
+            return True, ""
+        return False, f"[DELTA_CONSTRAINT_DOES_NOT_EXIST] Cannot drop nonexistent constraint {name}"
+    if held["type"] == "PRIMARY KEY" and _referencing(fake, full):
+        return (
+            False,
+            f"Cannot delete constraint `{name}` with non empty child constraints. Set the "
+            "argument CASCADE to true to delete both this constraint and all child constraints.",
+        )
+    t["constraints"].remove(held)
+    return True, ""
+
+
+def _referencing(fake: "FakeDatabricks", full: str) -> List[Tuple[str, Dict[str, Any]]]:
+    """``(table, foreign key)`` for every foreign key that references ``full``."""
+    return [
+        (name, c)
+        for name, table in fake.tables.items()
+        for c in table.get("constraints") or []
+        if c["type"] == "FOREIGN KEY" and c["parent"] == full
+    ]
+
+
+def _constraint_doc(c: Dict[str, Any]) -> Dict[str, Any]:
+    """One ``table_constraints[]`` entry, as the Tables API serves it."""
+    if c["type"] == "PRIMARY KEY":
+        return {"primary_key_constraint": {"name": c["name"], "child_columns": list(c["columns"])}}
+    return {
+        "foreign_key_constraint": {
+            "name": c["name"],
+            "child_columns": list(c["columns"]),
+            "parent_table": c["parent"],
+            "parent_columns": list(c["parent_columns"]),
+        }
     }
 
 
@@ -302,6 +471,10 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
             for col in new["columns"]:
                 if col["name"] in kept:
                     col["mask"] = kept[col["name"]]
+            # Its keys are not kept, and every foreign key elsewhere that referenced it goes
+            # too (measured on a warehouse, 2026-11-12).
+            for _child, fk in _referencing(fake, full):
+                fake.tables[_child]["constraints"].remove(fk)
         fake.tables[full] = new
         fake.table_rows.pop(full, None)  # a new table holds no rows
         return True, ""
@@ -459,6 +632,10 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
         cols[idx].pop("mask")
         return True, ""
 
+    keyed = _constraint_action(fake, full, t, action)
+    if keyed is not None:
+        return keyed
+
     m = re.match(r"ADD\s+COLUMN\s+(.*)$", action, re.S | re.I)
     if m:
         body = m.group(1).strip()
@@ -498,6 +675,8 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
         if missing and not ie:
             return False, f"[UNRESOLVED_COLUMN] {missing[0]}"
         t["columns"] = [c for c in cols if c["name"] not in drop]
+        # A key on a dropped column goes with it (measured, 2026-11-12).
+        t["constraints"] = [c for c in t["constraints"] if not set(c["columns"]) & set(drop)]
         return True, ""
 
     m = re.match(r"RENAME\s+COLUMN\s+`?([^`\s]+)`?\s+TO\s+`?([^`\s]+)`?\s*$", action, re.I)
@@ -571,6 +750,45 @@ def _count_doc(n: int) -> Dict[str, Any]:
             "total_row_count": 1,
         },
         "result": {"row_count": 1, "data_array": [[str(n)]]},
+    }
+
+
+def _table_tags_query(fake: "FakeDatabricks", s: str) -> Optional[Tuple[bool, str, Dict[str, Any]]]:
+    """The tables carrying a tag with one of the given values, from
+    ``system.information_schema.table_tags`` (the parent lookup of ``databricks_keys.py``)."""
+    m = re.match(
+        r"SELECT\s+catalog_name\s*,\s*schema_name\s*,\s*table_name\s*,\s*tag_value\s+FROM\s+"
+        rf"system\.information_schema\.table_tags\s+WHERE\s+tag_name\s*=\s*{_QUOTED}\s+AND\s+"
+        r"tag_value\s+IN\s*\((.*)\)\s*$",
+        s,
+        re.S | re.I,
+    )
+    if m is None:
+        return None
+    key = _unescape(m.group(1))
+    values = {_unescape(v) for v in re.findall(_QUOTED, m.group(2))}
+    rows = [
+        [*name.split("."), value]
+        for (kind, name, tag), value in sorted(fake.tags.items())
+        if kind == "tables" and tag == key and value in values and name in fake.tables
+    ]
+    return True, "", _rows_doc(("catalog_name", "schema_name", "table_name", "tag_value"), rows)
+
+
+def _rows_doc(names: Sequence[str], rows: List[List[str]]) -> Dict[str, Any]:
+    """The result of a query of string columns, as the Statement Execution API sends it."""
+    return {
+        "manifest": {
+            "format": "JSON_ARRAY",
+            "schema": {
+                "column_count": len(names),
+                "columns": [
+                    {"name": n, "type_name": "STRING", "position": i} for i, n in enumerate(names)
+                ],
+            },
+            "total_row_count": len(rows),
+        },
+        "result": {"row_count": len(rows), "data_array": rows},
     }
 
 
@@ -671,6 +889,9 @@ def _data_statement(fake: "FakeDatabricks", sql: str) -> Optional[Tuple[bool, st
             for row in fetched
         ]
         return True, "", _insert_doc(len(fetched), fake.insert_reports_count)
+    tagged = _table_tags_query(fake, s)
+    if tagged is not None:
+        return tagged
     m = re.match(rf"SELECT\s+COUNT\(\s*(?:\*|1)\s*\)\s+FROM\s+{_FULL}\s*$", s, re.I)
     if m:
         full = ".".join(m.groups())
@@ -1032,6 +1253,17 @@ class FakeDatabricks:
     def tags_on(self, entity_type: str, full_name: str) -> Dict[str, str]:
         """The tags an entity holds, ``{key: value}``."""
         return {k: v for (t, n, k), v in self.tags.items() if t == entity_type and n == full_name}
+
+    def keys_on(self, full_name: str) -> List[Tuple[str, ...]]:
+        """A table's keys: ``("PRIMARY KEY", name, cols)`` / ``("FOREIGN KEY", name, cols,
+        parent, parent_cols)``, columns comma-joined."""
+        out: List[Tuple[str, ...]] = []
+        for c in self.tables[full_name]["constraints"]:
+            row: Tuple[str, ...] = (c["type"], c["name"], ",".join(c["columns"]))
+            if c["type"] == "FOREIGN KEY":
+                row += (c["parent"], ",".join(c["parent_columns"]))
+            out.append(row)
+        return out
 
     def grant_catalog(self, catalog: str, principal: str, *privileges: str) -> None:
         """Seed catalog-level privileges (e.g. ``USE_CATALOG``); schemas and tables inherit them."""
@@ -1602,6 +1834,8 @@ class FakeDatabricks:
                 col["partition_index"] = t["partitions"].index(c["name"])
             cols.append(col)
         extra = {"row_filter": t["row_filter"]} if t.get("row_filter") else {}
+        if t.get("constraints"):
+            extra["table_constraints"] = [_constraint_doc(c) for c in t["constraints"]]
         return {
             **extra,
             "name": name,

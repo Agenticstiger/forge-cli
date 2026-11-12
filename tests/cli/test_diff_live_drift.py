@@ -1088,6 +1088,32 @@ def test_apply_under_evolve_safe_then_diff_is_not_drift(workspace):
     ] == [("plan_tier", "added", "include", "allowed")]
 
 
+def test_diff_of_what_the_build_landed_reports_no_plan_failure(workspace, caplog):
+    """``fluid diff`` plans the contract with the local provider, where the
+    acquisition build's expose has no table: its runner lands it. The plan
+    reported "materialize missing source_table" and
+    ``local_plan_validation_failed`` before the expose's ``match``."""
+    _write_parquet(
+        workspace / "src" / "subs.parquet",
+        "SELECT 's1'::VARCHAR AS subscription_id, 'c1'::VARCHAR AS customer_id, "
+        "'active'::VARCHAR AS status",
+    )
+    contract = _source_contract(workspace, "strict")
+    assert _invoke(["apply", str(contract), "--mode", "amend-and-build", "--yes"]) == (0, None)
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING):
+        rc, event = _invoke(["diff", str(contract), "--out", "diff.json", "--exit-on-drift"])
+
+    report = _report(workspace / "diff.json")
+    (expose,) = report["live"]["exposes"]
+    (materialize,) = [a for a in report["desired_actions"] if a["op"] == "materialize"]
+    assert (rc, event) == (0, None)
+    assert expose["status"] == "match"
+    assert materialize["payload"]["landed_by"] == ["ingest"]
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
 @pytest.mark.parametrize(
     ("policy", "overrides", "select_sql", "status", "action"),
     [
