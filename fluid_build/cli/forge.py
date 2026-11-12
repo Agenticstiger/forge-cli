@@ -1484,7 +1484,12 @@ def run(args, logger: logging.Logger) -> int:
 
     is_agent = bool(getattr(args, "agent", False))
     if not is_agent:
-        return _run_main(args, logger)
+        from fluid_build.cli._forge_mode_errors import take_forge_failure
+
+        try:
+            return _run_main(args, logger)
+        finally:
+            take_forge_failure()  # read by --agent only: drop it and its frames
 
     _setup_agent_mode(args)
     run_id = _agent_run_id()
@@ -1519,7 +1524,7 @@ def run(args, logger: logging.Logger) -> int:
             # point says the remedy on stderr under --agent
             # (``cli._render_missing_optional``), and an in-process caller
             # (the MCP ``forge_run``) gets the exception itself.
-            rc = _run_main(args, logger)
+            rc = _run_main_noting_failure(args, logger)
             # On success, optionally emit the structured plan checklist BEFORE
             # forge.done so consumers parsing the stream see the plan in order.
             if rc == 0 and getattr(args, "emit_plan", False):
@@ -1528,8 +1533,44 @@ def run(args, logger: logging.Logger) -> int:
                 _emit_forge_plan(args, contract_path)
             return rc
     finally:
+        _emit_forge_error(run_id, rc)
         _emit_agent_jsonl("forge.done", run_id=run_id, exit_code=int(rc or 0))
         _AGENT_EVENTS = None
+
+
+def _run_main_noting_failure(args: Any, logger: logging.Logger) -> int:
+    """``_run_main`` for an ``--agent`` run, noting an exception that propagates.
+
+    A handler that catches its failure notes it itself (``log_forge_failure``);
+    one that escapes ``_run_main`` (a missing extra) is noted here, then re-raised.
+    """
+    from fluid_build.cli._forge_mode_errors import note_forge_failure, take_forge_failure
+
+    take_forge_failure()  # an earlier in-process run's failure is not this run's
+    try:
+        return _run_main(args, logger)
+    except Exception as exc:
+        note_forge_failure(exc)
+        raise
+
+
+def _emit_forge_error(run_id: str, rc: int) -> None:
+    """Send ``forge.error`` for a failed run: why it failed, as data.
+
+    The failure is the one a handler noted. A run that failed without an
+    exception (blank mode finding a contract in place) has none to send.
+    """
+    from fluid_build.cli._forge_mode_errors import describe_forge_failure, take_forge_failure
+
+    failure = take_forge_failure()
+    if rc == 0 or failure is None:
+        return
+    try:
+        fields = describe_forge_failure(failure)
+    except Exception:  # noqa: BLE001 — never at the cost of forge.done
+        LOG.debug("forge_error_event_failed", exc_info=True)
+        return
+    _emit_agent_jsonl("forge.error", run_id=run_id, **fields)
 
 
 #: Per-process flag for the personal-memory sanitiser.  See
@@ -1947,18 +1988,23 @@ def _run_main(args, logger: logging.Logger) -> int:
         # operator-facing output is just the message + actionable
         # next steps.
         from fluid_build._optional import MissingOptionalDependency
-        from fluid_build.errors import FluidError
+        from fluid_build.cli._forge_mode_errors import (
+            describe_forge_failure,
+            is_typed_forge_error,
+            log_forge_failure,
+        )
 
         if isinstance(exc, MissingOptionalDependency):
             # "Install the extra" is the whole remedy: let the CLI entry point
             # print the install line and exit 1, with no traceback.
             raise
 
-        logger.debug("Forge command failed", exc_info=True)
-        suggestions = getattr(exc, "suggestions", None) or []
-        message = getattr(exc, "message", None) or str(exc)
-        if isinstance(exc, FluidError):
-            # Typed Fluid error — clean message + suggestions.
+        log_forge_failure(logger, "Forge command failed", exc)
+        if is_typed_forge_error(exc):
+            # Typed Fluid error — clean message + suggestions, the ones the
+            # ``--agent`` event carries (a FluidUserError's ``fix`` included).
+            failure = describe_forge_failure(exc)
+            message, suggestions = failure["message"], failure["suggestions"]
             if console:
                 console.print(
                     literal_text("Forge failed:", "red") + literal_error_text(f" {message}")
@@ -1975,7 +2021,6 @@ def _run_main(args, logger: logging.Logger) -> int:
                         cprint_literal(f"  - {s}")
         else:
             # Unexpected — full message; suggest doctor.
-            logger.exception("Forge command failed")
             if console:
                 console.print(literal_error_text(f"Forge failed: {exc}", "red"))
                 console.print(f"[dim]Run 'fluid doctor' to diagnose, or see {_DOCS_URL}[/dim]")

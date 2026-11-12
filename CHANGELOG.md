@@ -145,6 +145,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a model the endpoint has. All three now ask the stated endpoint. A `--tiered` stage now
   calls a stated endpoint too, as the routing model already did; it called the provider's
   default address instead.
+- **`fluid forge --agent` reports a failure as a `forge.error` event, not a traceback.** An AI
+  error such as `copilot_no_llm_provider` printed a full Python traceback on stderr, and the
+  stream said only `forge.done` with `exit_code` 1. A run that fails on an error now sends one
+  `forge.error` event before `forge.done`, with the error's `code`, `message`, `suggestions`
+  and, when the error catalog has one, `docs_url` (the shape of `fluid ai test --json`'s
+  `error`), redacted as the console redacts. An unexpected exception is named by its class only
+  (`code: forge_unexpected_error`, `exception`), and a failed `--seed-from` by its path and class
+  (`forge_seed_failed`), because the MCP `forge_run` hands these events to the IDE's model; it
+  also writes the failure to the server's log, since it discards forge's console output. A usage
+  error (exit 2) or a stop without an error, such as blank mode finding a contract in place,
+  still sends only `forge.done`. In every forge mode, interactive runs included, a FLUID error's
+  traceback now shows only at DEBUG (`--debug` or `FLUID_LOG_LEVEL=DEBUG`); stderr keeps its
+  message and next steps, and one that reaches forge's last handler prints them instead of its
+  event code. A crash keeps its traceback.
 - **`fluid ai test --json` prints only its report when the call fails.** litellm printed its
   "Give Feedback / Get Help" banner to stdout ahead of the JSON. Forge now sets litellm's own
   switch, `suppress_debug_info`, wherever it loads litellm (AI calls, `fluid ai setup`'s key
