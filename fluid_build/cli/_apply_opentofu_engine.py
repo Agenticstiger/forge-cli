@@ -303,6 +303,7 @@ def _apply_via_opentofu(
 
         if dry_run:
             _enforce_access(plugin, "pre_apply", contract, dry_run=True)
+            _converge_output_ports(plugin, contract, dry_run=True)
             cprint("\ndry-run: plan only — not applying.")
             info(logger, "opentofu_apply_dry_run", provider=provider, **changes)
             return 0
@@ -345,6 +346,9 @@ def _apply_via_opentofu(
     # build fills a table first. A table that cannot be bound is closed to the principals it
     # restricts (a deny-all row filter, else revoked), and the run fails.
     _enforce_access(plugin, "post_apply", contract)
+    # Output ports the cloud keeps outside OpenTofu (a Databricks Genie space) come last, on
+    # tables that exist and are protected.
+    _converge_output_ports(plugin, contract)
 
     if applied_state is not None:
         # After the bindings: a job the build phase starts writes tables already protected.
@@ -357,6 +361,33 @@ def _apply_via_opentofu(
 
     info(logger, "opentofu_apply_ok", provider=provider, **applied)
     return 0
+
+
+def _converge_output_ports(
+    plugin: Any, contract: Mapping[str, Any], *, dry_run: bool = False
+) -> None:
+    """Run a plugin's ``converge_output_ports`` hook, if it has one.
+
+    Optional plugin capability, discovered like ``post_apply``: the Databricks plugin creates,
+    updates or trashes the product's Genie space through the Genie API, since the provider has
+    no resource for one (``iac/providers/databricks_genie.py``). It runs after the access
+    enforcement, so a space only ever opens on protected tables. A failure is a typed error
+    and the run exits non-zero; the tables the apply made stay, and the next apply converges
+    the space. With ``dry_run`` the plugin prints what it would do and writes nothing.
+    """
+    run = getattr(plugin, "converge_output_ports", None)
+    if not callable(run):
+        return
+    try:
+        # Literally: its lines quote titles (anyone's, from the Genie list) and the
+        # ``[fluid-genie:...]`` marker, which Rich would read as markup.
+        run(contract, say=cprint_literal, dry_run=dry_run)
+    except UnsupportedBindingError as exc:
+        raise CLIError(
+            1,
+            "opentofu_output_port_failed",
+            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
+        ) from exc
 
 
 def _enforce_access(
@@ -382,7 +413,7 @@ def _enforce_access(
     except UnsupportedBindingError as exc:
         raise CLIError(
             1,
-            "opentofu_access_enforcement_failed",
+            getattr(exc, "event", None) or "opentofu_access_enforcement_failed",
             {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
         ) from exc
 
