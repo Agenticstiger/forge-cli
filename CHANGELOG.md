@@ -209,14 +209,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and dbt's `relationships` for its `labels.references: <product id>.<column>` against the dbt
   source the project declares for that consumed expose; accuracy is a bound on every value,
   freshness the newest value's age against `window`, schema each contract column with its
-  declared type. A threshold below 1.0 is the share of rows that must pass, as `fluid test`
-  computes it. No dbt package is installed: the regex, range, freshness, schema and share tests
+  declared type. A threshold below 1.0 is the share of rows that must pass: the non-null
+  share for completeness and the distinct share for uniqueness, as `fluid test` computes them,
+  and the share of non-null values that are allowed for valid_values. No dbt package is installed: the regex, range, freshness, schema and share tests
   are forge-cli's own SQL. Under `--mode amend-and-build`, `fluid apply` prints what dbt found
   for each rule after the run. A rule no test can run as written (anomaly or drift detection,
   valid_values with no allowed values, an unknown column, an unparseable window), a Git-sourced
   build with rules (no file can be added to a checkout), and a model or a referenced source the
-  project does not hold are refused at `fluid validate` and `fluid plan`, with the fix.
-  `fluid_build/util/dq_checks.py` is the one reading of the rules, shared by every engine.
+  project does not hold, a build whose dbt selection leaves the model out, and a rule id whose
+  test name the project's own tests already use are refused at `fluid validate` and
+  `fluid plan`, with the fix. `fluid_build/util/dq_checks.py` reads the rules once, for the
+  engines that run them; this job is its first.
 
 ### Fixed
 

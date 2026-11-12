@@ -206,7 +206,7 @@ class TestTypes:
 
     @pytest.mark.parametrize("kind", ["anomaly_detection", "drift_detection"])
     def test_history_rules_are_refused(self, kind):
-        assert "its own history" in _refused(_rule(kind, "*"))
+        assert "the table's history" in _refused(_rule(kind, "*"))
 
 
 class TestTheRuleAsWritten:

@@ -34,10 +34,11 @@ How each rule type reads:
 * ``anomaly_detection`` and ``drift_detection`` compare a table with its own history, which a
   check of the table as it stands cannot do: refused.
 
-``threshold`` is the share of rows that pass, from 0 to 1, computed as ``fluid test`` computes
-it: the non-null share for completeness, the distinct share of non-null values for uniqueness,
-the share of non-null values that are allowed for valid_values. ``1.0`` with ``>=`` or ``==``
-(or no threshold at all) means every row, a per-row check; anything else is a
+``threshold`` is the share of rows that pass, from 0 to 1: the non-null share for
+completeness and the distinct share of non-null values for uniqueness, as ``fluid test``
+computes them, and for valid_values the share of non-null values that are allowed (``fluid
+test`` checks every value of a valid_values rule, whatever its threshold). ``1.0`` with ``>=``
+or ``==`` (or no threshold at all) means every row, a per-row check; anything else is a
 :attr:`DqCheck.share`. Accuracy's threshold is its bound, not a share; freshness and schema
 rules take none.
 
@@ -290,10 +291,10 @@ class _Rule:
         if reader is None:
             if self.type in ("anomaly_detection", "drift_detection"):
                 self.refuse(
-                    "compares the table with its own history, which a check of the table as it "
-                    "stands cannot do",
-                    "Run it with Databricks data quality monitoring or fluid test, or remove it "
-                    "from this expose.",
+                    "has no check of the table as it stands here: an anomaly or a drift is "
+                    "judged against the table's history",
+                    "Check it with fluid test against the deployed table (it reads an "
+                    "anomaly_detection threshold as a row count), or remove it from this expose.",
                 )
             else:
                 self.refuse(

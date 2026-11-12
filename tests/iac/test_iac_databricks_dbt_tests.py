@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import base64
 import copy
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -304,7 +307,7 @@ class TestRefusals:
     def test_a_rule_no_test_can_run_is_refused(self, tmp_path):
         _project(tmp_path)
         rules = [{"id": "drift", "type": "drift_detection", "selector": "*", "severity": "warn"}]
-        assert "its own history" in self._refused(tmp_path, _contract(rules=rules), "rule")
+        assert "the table's history" in self._refused(tmp_path, _contract(rules=rules), "rule")
 
     def test_a_model_the_project_does_not_hold_is_refused(self, tmp_path):
         _project(tmp_path, files={"models/other.sql": "select 1\n", "models/sources.yml": SOURCES})
@@ -337,6 +340,33 @@ class TestRefusals:
         clash.parent.mkdir(parents=True)
         clash.write_text("select 1\n", encoding="utf-8")
         self._refused(tmp_path, _contract(), "path")
+
+    def test_a_test_name_the_projects_own_tests_use_is_refused(self, tmp_path):
+        # dbt names singular tests project-wide: a clash fails the whole job's parse
+        # ("dbt found two data_tests with the name"), so the plan refuses it first.
+        _project(
+            tmp_path,
+            files={
+                "models/orders.sql": "select 1\n",
+                "models/sources.yml": SOURCES,
+                "tests/mine/orders_schema.sql": "select 1 where false\n",
+            },
+        )
+        assert "tests/mine/orders_schema.sql" in self._refused(tmp_path, _contract(), "name")
+
+    def test_a_selection_that_leaves_the_model_out_is_refused(self, tmp_path):
+        _project(tmp_path)
+        contract = _contract()
+        contract["builds"][0]["properties"] = {"select": ["other_model"]}
+        assert "leaves the model out" in self._refused(tmp_path, contract, "not-selected")
+
+    def test_a_selection_it_cannot_evaluate_is_left_to_the_runs_report(self, tmp_path):
+        _project(tmp_path)
+        contract = _contract()
+        contract["builds"][0]["properties"] = {"select": ["tag:nightly"]}
+        compiled = _compile(contract, tmp_path)
+        assert not compiled.refusals, _kinds(compiled)
+        assert compiled.jobs[0].tests
 
     def test_an_empty_test_paths_is_refused(self, tmp_path):
         _project(tmp_path, config="test-paths: []\n")
@@ -540,3 +570,45 @@ class TestReport:
         contract = _contract()
         names = [c.name for c in dq.expected_tests(contract, contract["builds"][0])]
         assert names[0] == "orders_id_unique" and len(names) == 10
+
+
+# ── real dbt: the generated tests parse, and the build's selection picks each one ───────
+
+
+def _find_dbt() -> Optional[str]:
+    candidate = Path(sys.executable).parent / "dbt"
+    return str(candidate) if candidate.exists() else shutil.which("dbt")
+
+
+@pytest.mark.integration
+def test_dbt_parses_the_upload_and_selects_every_rules_test(tmp_path):
+    """dbt (any adapter) parses the uploaded project and ``dbt ls --select +orders+`` lists
+    each generated test: a test whose ``ref`` dbt cannot see at parse time would be missing,
+    as the schema test was on a live run before it was fixed."""
+    dbt = _find_dbt()
+    if dbt is None:
+        pytest.skip("dbt CLI not available")
+    pytest.importorskip("dbt.adapters.duckdb")
+    _project(tmp_path, config="profile: p\nconfig-version: 2\nversion: '1.0'\n")
+    compiled = _compile(_contract(), tmp_path)
+    assert not compiled.refusals, _kinds(compiled)
+    upload = tmp_path / "upload"
+    for rel, text in _uploaded(compiled).items():
+        target = upload / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    (upload / "profiles.yml").write_text(
+        "p:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n      path: ':memory:'\n",
+        encoding="utf-8",
+    )
+    listed = subprocess.run(
+        [dbt, "ls", "--resource-type", "test", "--select", "+orders+", "--output", "name"]
+        + ["--project-dir", str(upload), "--profiles-dir", str(upload), "--quiet"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=upload,
+        timeout=300,
+    )
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert set(listed.stdout.split()) == set(compiled.jobs[0].tests)

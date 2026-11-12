@@ -158,8 +158,20 @@ class _Project:
         self.files = files
         self.present = {rel for rel, _ in files}
         paths = _project_paths(files)
+        self.name = paths["name"][0]
         self.model_paths, self.test_paths = paths["model-paths"], paths["test-paths"]
         self._sources: Optional[Dict[str, List[Tuple[str, str]]]] = None
+
+    def singular_tests(self) -> Dict[str, str]:
+        """``{test name: path}`` of the project's own singular tests: dbt names a singular
+        test after its file, and a test name once per project."""
+        return {
+            PurePosixPath(rel).stem: rel
+            for rel in sorted(self.present)
+            if rel.endswith(".sql")
+            and any(rel.startswith(f"{path}/") for path in self.test_paths)
+            and f"/{TEST_DIR}/" not in f"/{rel}"
+        }
 
     @property
     def sources(self) -> Dict[str, List[Tuple[str, str]]]:
@@ -213,6 +225,18 @@ def _add_test(
         )
         return
     path = str(folder / model / f"{check.name}.sql")
+    taken = project.singular_tests().get(check.name)
+    if taken is not None:
+        out.refusals.append(
+            _refusal(
+                "name",
+                f"{where} the test of rule {check.rule_id!r} is named {check.name!r}, and the "
+                f"dbt project's own test {taken} has that name: dbt names a test once per "
+                "project, so the whole job would fail to parse.",
+                "Rename the rule id, or the project's test.",
+            )
+        )
+        return
     if path in project.present:
         out.refusals.append(
             _refusal(
@@ -248,8 +272,8 @@ def expected_tests(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Lis
 
 
 def _project_paths(files: Sequence[Tuple[str, bytes]]) -> Dict[str, List[str]]:
-    """``model-paths`` and ``test-paths`` of the uploaded ``dbt_project.yml``, with dbt's
-    defaults; the upload has already read it, so it parses."""
+    """``name``, ``model-paths`` and ``test-paths`` of the uploaded ``dbt_project.yml``, with
+    dbt's defaults; the upload has already read it, so it parses."""
     import yaml
 
     config: Any = {}
@@ -260,7 +284,7 @@ def _project_paths(files: Sequence[Tuple[str, bytes]]) -> Dict[str, List[str]]:
             except (UnicodeDecodeError, yaml.YAMLError):
                 config = {}
     config = config if isinstance(config, Mapping) else {}
-    out: Dict[str, List[str]] = {}
+    out: Dict[str, List[str]] = {"name": [str(config.get("name") or "")]}
     for key, default in (("model-paths", ["models"]), ("test-paths", ["tests"])):
         raw = config.get(key, default)
         entries = [raw] if isinstance(raw, str) else list(raw or [])
@@ -276,27 +300,49 @@ def _model(
     refusals: List[UnsupportedBindingError],
 ) -> Optional[str]:
     """The dbt model that writes ``table``: the build's ``properties.model`` when it writes one
-    output (as ``build_selectors`` selects it), else the model named after the table."""
+    output (as ``build_selectors`` selects it), else the model named after the table. Refused
+    when the project does not hold it, or when the build's selection provably leaves it out
+    (its tests would never run); a selection by tag, config or state cannot be told here,
+    and the run's report says which tests did not run."""
     props = build.get("properties") if isinstance(build.get("properties"), Mapping) else {}
     outputs = build.get("outputs") if isinstance(build.get("outputs"), list) else []
     named = props.get("model")
     model = str(named) if named and len(outputs) <= 1 else str(table.name)
-    model_paths = project.model_paths
-    found = any(
-        PurePosixPath(rel).stem == model
-        and PurePosixPath(rel).suffix in (".sql", ".py")
-        and any(rel.startswith(f"{path}/") for path in model_paths)
+    files = sorted(
+        rel
         for rel in project.present
+        if PurePosixPath(rel).stem == model
+        and PurePosixPath(rel).suffix in (".sql", ".py")
+        and any(rel.startswith(f"{path}/") for path in project.model_paths)
     )
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", model) or not found:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", model) or not files:
         refusals.append(
             _refusal(
                 "model",
                 f"{where} writes expose {table.expose_id!r}, whose contract rules run as dbt "
                 f"tests on the model that builds it: model {model!r}, which the dbt project's "
-                f"model-paths ({', '.join(model_paths) or 'none'}) do not hold.",
+                f"model-paths ({', '.join(project.model_paths) or 'none'}) do not hold.",
                 "Name the model in builds[].properties.model (one output per build), or name it "
                 "after the expose's binding.location.table.",
+            )
+        )
+        return None
+    from ...build_runners.dbt.runner import build_selectors
+    from .databricks_retention import DbtModel, selects_model
+
+    path = PurePosixPath(files[0])
+    below = [p for p in project.model_paths if files[0].startswith(f"{p}/")][0]
+    folders = path.parent.relative_to(below).parts
+    node = DbtModel(name=model, materialized="", fqn=(project.name, *folders, model), path=files[0])
+    selectors = build_selectors(dict(build))
+    if selects_model(selectors, node) is False:
+        refusals.append(
+            _refusal(
+                "not-selected",
+                f"{where} writes expose {table.expose_id!r} with model {model!r}, but the "
+                f"build's selection ({' '.join(selectors)!r}) leaves the model out, so dbt "
+                "would never run the tests of its contract rules.",
+                f"Select the model: properties.select: [{model!r}] (or properties.model).",
             )
         )
         return None
