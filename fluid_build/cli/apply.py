@@ -2159,8 +2159,8 @@ def run(args, logger: logging.Logger) -> int:
             args.build_id = resolved_build_id
             from fluid_build.build_runners import run_builds_from_args
 
-            build_kwargs.update(_jobs_from_state(engine_kwargs, source_contract))
-            return run_builds_from_args(args, logger, force_run=True, **build_kwargs)
+            jobs = _jobs_from_state(engine_kwargs, source_contract)
+            return run_builds_from_args(args, logger, force_run=True, **build_kwargs, **jobs)
         return rc
 
     try:

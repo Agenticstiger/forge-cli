@@ -761,3 +761,27 @@ def test_a_timeout_in_seconds_is_taken_quietly(capsys) -> None:
     api = _Api([_run("TERMINATED", code="SUCCESS")])
     rc, out = _go(api, capsys, env={TIMEOUT_ENV: "120"})
     assert rc == 0 and TIMEOUT_ENV not in out
+
+
+def test_a_sighup_the_operator_ignores_stays_ignored(capsys) -> None:
+    """`nohup fluid apply ...` ignores SIGHUP: a closed terminal must not cancel the run."""
+    import signal
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("a signal handler needs the main thread")
+    before = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    seen: list = []
+    try:
+
+        class _Look(_Time):
+            def sleep(self, seconds: float) -> None:
+                seen.append(signal.getsignal(signal.SIGHUP))
+                super().sleep(seconds)
+
+        api = _Api([_run("RUNNING"), _run("TERMINATED", code="SUCCESS")])
+        assert _go(api, capsys, time_=_Look())[0] == 0
+        assert seen and all(handler is signal.SIG_IGN for handler in seen)
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, before)

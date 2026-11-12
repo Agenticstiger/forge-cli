@@ -33,9 +33,9 @@ build here once ``tofu apply`` has succeeded and the masks and row filters are b
 The wait is capped (:func:`wait_budget`). At the cap, and on Ctrl-C, SIGTERM or SIGHUP while
 the run is waited on, the run is cancelled before the build fails, so ``fluid apply`` leaves
 nothing running that it started (an interrupted load cancels its INSERT the same way,
-``_databricks_load.py``); a cancel that fails is said, with the run page. A run that cannot
-be read five times in a row is left as it is, never cancelled unseen, and the build fails
-saying so. run-now is tried again with the same idempotency token, so a retry never starts
+``_databricks_load.py``); a cancel that fails is said, with the run page. Failed reads alone
+never cancel a run: one that cannot be read five times in a row is left as it is, and the
+build fails saying so. run-now is tried again with the same idempotency token, so a retry never starts
 a second run. A continuous job is never started here: Databricks keeps it running, and a
 run of it does not end.
 
@@ -472,7 +472,8 @@ def _cancelled_if_interrupted(api: Any, run_id: int, say: Say) -> Iterator[None]
 def _interrupt_on_terminate() -> Dict[int, Any]:
     """Make SIGTERM and SIGHUP raise ``KeyboardInterrupt``; the handlers they replaced.
 
-    Only the main thread may set a handler, so elsewhere nothing changes.
+    Only the main thread may set a handler, so elsewhere nothing changes, and a signal the
+    operator chose to ignore stays ignored (``nohup fluid apply`` must outlive its terminal).
     """
     if threading.current_thread() is not threading.main_thread():
         return {}
@@ -482,6 +483,8 @@ def _interrupt_on_terminate() -> Dict[int, Any]:
         if signum is None:
             continue
         try:
+            if signal.getsignal(signum) is signal.SIG_IGN:
+                continue
             previous[signum] = signal.signal(signum, _raise_interrupt)
         except (ValueError, OSError):
             continue

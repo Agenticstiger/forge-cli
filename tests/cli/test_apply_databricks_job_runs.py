@@ -138,7 +138,24 @@ def test_the_contract_passes_the_apply_gate() -> None:
     _gate_contract_for_apply(copy.deepcopy(_CONTRACT), LOG)
 
 
-@pytest.mark.usefixtures("workspace")
+@pytest.fixture
+def sdk_installed() -> Iterator[None]:
+    """databricks-sdk as the apply's gate sees it, whether or not this venv has it (CI's
+    `.[dev,local]` install does not)."""
+    from importlib.machinery import ModuleSpec
+
+    real = importlib.util.find_spec
+
+    def _find(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "databricks.sdk":
+            return ModuleSpec("databricks.sdk", None)
+        return real(name, *args, **kwargs)
+
+    with mock.patch("importlib.util.find_spec", side_effect=_find):
+        yield
+
+
+@pytest.mark.usefixtures("workspace", "sdk_installed")
 class TestTheBuildPhaseGetsThisApplysJobs:
     @pytest.mark.parametrize(
         "flags",
