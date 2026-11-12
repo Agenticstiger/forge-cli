@@ -26,10 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not. Like a product's space it is found again by a marker, `[fluid-genie-estate:<id>]`, in the
   deploying identity's own folder only, changes nothing on a second run, and converges to
   exactly the contracts given. `--title`, `--env` (contract overlays) and `--dry-run`;
-  `fluid genie remove --estate <id>` trashes it. A product whose `agentPolicy` rules out
-  question answering refuses the estate, and so do more than 50 tables, Genie's cap (measured).
-  A product space's update now names a table that leaves the space as a table, not as a metric
-  view.
+  `fluid genie remove --estate <id>` trashes it. Each contract passes the schema and version
+  gate `fluid apply` runs, and an unreadable one is `contract_load_failed`, naming the file. A
+  product whose `agentPolicy` rules out question answering refuses the estate, and so do more
+  than 50 tables, Genie's cap (measured). Whenever a table enters a space, Genie adds a join of
+  its own for each Unity Catalog foreign key that touches it (measured): a run reads each
+  write back, takes those duplicates out, and says so, so the next run finds no change. This
+  holds for a product's own space too. A product space's update now names a table that
+  leaves the space as a table, not as a metric view.
 
 - **A Databricks AI/BI Genie space for a data product.** With `extensions.databricksGenie: {}`
   (or `{title: ...}`) in a contract with Databricks table exposes, `fluid apply` creates the

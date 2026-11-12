@@ -378,8 +378,11 @@ fluid genie remove --estate tower-management
 ```
 
 `fluid genie apply` takes contract files, globs or folders (searched for `*.fluid.yaml`), and
-`--env` and `--dry-run` as `fluid apply` does. Apply the products first: the run checks every
-table exists and names the product of one that does not. The space holds each product's tables
+`--env` and `--dry-run` as `fluid apply` does; each contract passes the same schema and
+version gate. Apply the products first: the run checks every table exists and names the
+product of one that does not. Genie adds a join of its own for each Unity Catalog foreign key
+that touches a table entering a space; the run reads each write back and takes those out, so
+a second run changes nothing. The space holds each product's tables
 as a product space does, and a join for every foreign key the contracts declare between them
 (a column tagged `foreign-key` whose `labels.references` is `<product id>.<column>`), the same
 keys `fluid apply` declares in Unity Catalog (`databricks_keys.py`). `CAN RUN` goes only to the
