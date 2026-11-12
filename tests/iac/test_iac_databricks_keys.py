@@ -16,7 +16,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List
 
 import pytest
 
@@ -262,11 +262,12 @@ class TestPlan:
 
     def test_a_new_table_gets_its_primary_key_then_its_foreign_keys(self):
         plan = keys.plan_table("main.ops.tickets", self.K, [FK], None)
+        table = "ALTER TABLE `main`.`ops`.`tickets` ADD CONSTRAINT "
         assert [s.statement for s in plan.steps] == [
-            "ALTER TABLE `main`.`ops`.`tickets` ADD CONSTRAINT `fluid_pk_tickets` PRIMARY KEY "
-            "(`ticket_id`)",
-            "ALTER TABLE `main`.`ops`.`tickets` ADD CONSTRAINT `fluid_fk_tickets__site_id` "
-            "FOREIGN KEY (`site_id`) REFERENCES `main`.`geo`.`sites` (`site_id`)",
+            table + "`fluid_pk_tickets` PRIMARY KEY (`ticket_id`)",
+            table
+            + "`fluid_fk_tickets__site_id` FOREIGN KEY (`site_id`) REFERENCES "
+            + "`main`.`geo`.`sites` (`site_id`)",
         ]
         assert plan.exists is False
 

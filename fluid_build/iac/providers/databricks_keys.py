@@ -925,6 +925,7 @@ __all__ = [
     "KeyTarget",
     "REBUILD_FILE",
     "REBUILD_TASK",
+    "REBUILD_TIMEOUT_SECONDS",
     "TableKeys",
     "compile_keys",
     "foreign_keys",
