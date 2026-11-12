@@ -16,29 +16,58 @@ fluid forge                           # AI authoring (mode picker)
 
 That's it. Your IDE now has:
 
-- **Steering** (always-loaded guidance about forge-cli, the 11-stage pipeline,
-  and `contract.fluid.yaml`).
-- **An MCP server** (`fluid mcp serve`, auto-spawned by the IDE) exposing 13
+- **Agent Skills** (agentskills.io `SKILL.md`): `authoring-fluid-contracts`,
+  `composing-fluid-data-products`, `deploying-fluid-contracts-safely` and
+  `troubleshooting-fluid-errors`, each loaded when its task comes up.
+- **A short always-loaded index** (about 2k characters) that names each skill and
+  the rules an agent must never break.
+- **An MCP server** (`fluid mcp serve`, auto-spawned by the IDE) exposing 16
   sandboxed tools for catalog / model / contract work.
 - **Hooks** (Kiro and Claude Code only — Cursor/Cline lack a hook substrate)
-  that run `fluid validate` on save and `fluid bundle && fluid validate-artifacts`
-  before commit.
+  that run `fluid validate` after each contract edit and `fluid bundle` plus
+  `fluid validate` on the bundle before commit.
 
 ---
 
 ## What `fluid scaffold-ide` writes per target
 
-| Target | Files emitted | Hook substrate |
-|---|---|---|
-| `kiro` | `.kiro/{settings/mcp.json, steering/, hooks/, specs/}` | yes (event-driven) |
-| `cursor` | `.cursor/{mcp.json, rules/*.mdc, HOOKS.md}` | no (agent-driven) |
-| `claude-code` | `.mcp.json` + `CLAUDE.md` block + `.claude/settings.json` | yes (PostToolUse) |
-| `cline` | `.cline/mcp_settings.json` + `.clinerules/` | no (agent-driven) |
-| `generic` | `mcp.json` + `AGENTS.md` block + `.ai/steering/` | no |
+| Target | Files emitted | Skills | Hook substrate |
+|---|---|---|---|
+| `kiro` | `.kiro/{settings/mcp.json, steering/fluid.md, hooks/, specs/}` | `.agents/skills/` | yes (event-driven) |
+| `cursor` | `.cursor/{mcp.json, rules/fluid.mdc, HOOKS.md}` | `.agents/skills/` | no (agent-driven) |
+| `claude-code` | `.mcp.json` + `CLAUDE.md` block + `.claude/settings.local.json` | `.claude/skills/` | yes (PostToolUse) |
+| `cline` | `.cline/mcp_settings.json` + `.clinerules/fluid.md` | `.agents/skills/` | no (agent-driven) |
+| `generic` | `mcp.json` + `AGENTS.md` block | `.agents/skills/` | no |
 
-All targets share **one canonical pack**: any forge-cli upgrade updates the
-content in one place and `fluid scaffold-ide --force` refreshes every IDE the
-team uses.
+All targets share **one canonical pack**, the skills under
+`fluid_build/agent_skills/skills/`: any forge-cli upgrade updates the content in
+one place and `fluid scaffold-ide --force` refreshes every IDE the team uses. An
+existing `CLAUDE.md` or `AGENTS.md` keeps everything outside the marked block, and
+the validate hook goes into `.claude/settings.local.json`, because it names this
+machine's interpreter, and is added to `.gitignore`; that file keeps its other settings,
+and only a handler an earlier scaffold-ide wrote into the shared `.claude/settings.json`
+is removed from it.
+
+The Claude Code hook reads the edited file's path from the JSON Claude Code passes
+on stdin, validates only `*.fluid.yaml` / `*.fluid.yml` / `*.fluid.json` files, and
+exits 2 with the errors when validation fails, which Claude Code shows to the agent.
+It runs its script by path and calls the `fluid` console script, never `python -m`,
+which would put the project directory, where the agent writes, first on `sys.path`.
+
+## Install the skills without `scaffold-ide`
+
+The same skills ship as a Claude Code plugin and in a layout `npx skills add` reads:
+
+```text
+/plugin marketplace add Agenticstiger/forge-cli
+/plugin install fluid@forge-cli
+```
+
+```bash
+npx skills add Agenticstiger/forge-cli
+```
+
+The plugin also carries the validate hook. Neither route writes the MCP config.
 
 ---
 
@@ -46,18 +75,21 @@ team uses.
 
 After scaffolding, the IDE's agent has **two complementary channels**:
 
-1. **MCP tools** (13, sandboxed, structured) for surgical work:
+1. **MCP tools** (16, sandboxed, structured) for surgical work:
    - `list_source_adapters`, `list_source_tables`, `inspect_source_table`,
      `list_source_lineage`, `list_source_glossary` — catalog discovery.
    - `read_logical_model`, `update_entity`, `add_relationship`,
      `regenerate_physical` — logical-model edits (round-trip via the sidecar).
    - `validate_contract`, `diff_models`, `search_semantic_memory` — checks.
    - `forge_from_source` — bootstrap a logical model from a source table.
+   - `forge_run` — run `fluid forge` with the IDE's LLM through MCP sampling.
+   - `score_contract_quality`, `enrich_contract_suggestions` — read-only review.
 2. **CLI commands** (the 11-stage pipeline) via the IDE's shell tool:
-   - `fluid bundle → validate → generate-artifacts → validate-artifacts →
-     diff → plan → apply → policy-apply → verify → publish → schedule-sync`.
+   - `bundle → validate → generate artifacts → validate-artifacts → diff → plan →
+     apply → policy-apply → verify → publish → schedule-sync`, each run as
+     `fluid <stage>` (stage 3 is `fluid generate artifacts <bundle>`).
 
-Steering files tell the agent **when to use which channel**: MCP for
+The index tells the agent **when to use which channel**: MCP for
 introspection and model edits, CLI for pipeline stages.
 
 ---
@@ -67,7 +99,7 @@ introspection and model edits, CLI for pipeline stages.
 ```
 ┌──────────────────────────────┐   stdio (JSON-RPC, MCP 2025-06-18)   ┌──────────────────────────┐
 │  Agentic IDE                 │ ←──────────────────────────────────→ │  fluid mcp serve         │
-│  (Kiro/Cursor/Claude/Cline)  │                                      │  13 sandboxed tools      │
+│  (Kiro/Cursor/Claude/Cline)  │                                      │  16 sandboxed tools      │
 │   LLM ↔ tool-use loop        │                                      │  --readable-paths .      │
 └──────────────────────────────┘                                      │  --writable-paths .      │
           │                                                           └──────────────────────────┘
@@ -79,14 +111,18 @@ introspection and model edits, CLI for pipeline stages.
 A typical first session:
 
 1. User: *"Build a customer-360 CDP joining `users` and `orders`."*
-2. Agent calls MCP `list_source_tables` → discovers tables.
-3. Agent calls MCP `inspect_source_table` → schemas, sample rows.
-4. Agent shell-runs `fluid forge --from-product users --from-product orders --data-product-type CDP --yes`.
-5. Agent calls MCP `validate_contract` → schema clean.
-6. Agent shell-runs `fluid plan --out runtime/plan.json --html`.
-7. User approves; agent shell-runs `fluid apply --mode amend --env dev`.
+2. Agent reads the `composing-fluid-data-products` skill, then the upstream contracts.
+3. Agent calls MCP `list_source_tables` / `inspect_source_table` when a source
+   lives in a catalog.
+4. Agent shell-runs `fluid forge --template starter --non-interactive --yes --target-dir customer_360 --no-memory`
+   and edits the contract itself.
+5. Agent runs `fluid validate customer_360/contract.fluid.yaml --offline` until it is
+   clean (in Claude Code the hook runs it after every edit).
+6. Agent shell-runs `fluid plan customer_360/contract.fluid.yaml --env dev --mode amend --out runtime/plan.json --html`
+   and stops for review.
+7. User approves; agent shell-runs `fluid apply runtime/plan.json --env dev --mode amend`.
 
-Receipts persist to `.fluid/agents/<run-id>/{cost.json,reasoning.md,transcript.json}`.
+`fluid forge` AI runs persist receipts to `.fluid/agents/<run-id>/{cost.json,reasoning.md,transcript.json}`.
 
 ---
 
@@ -111,7 +147,14 @@ fluid scaffold-ide --target <ide> --force
 
 The canonical pack ships inside the `data-product-forge` package, so a
 `pip install -U 'data-product-forge[mcp]' && fluid scaffold-ide --target <ide> --force`
-pulls in any pipeline-stage or steering updates.
+pulls in any skill, index or hook updates.
+
+## Measuring the skills
+
+`tests/agent_evals/` runs coding agents on recorded authoring scenarios with and
+without the skills, and against `fluid forge`'s own AI mode, and grades each result
+with `fluid validate` plus fixed fidelity checks. It is opt-in and spends real model
+usage; see `tests/agent_evals/README.md`.
 
 ---
 
@@ -172,6 +215,21 @@ re-do the survey.
 - **[antigravity-awesome-skills](https://github.com/sickn33/antigravity-awesome-skills)** —
   installable library of skills across Claude Code, Cursor, Codex CLI,
   Gemini CLI, Kiro, and others.
+
+### Agent Skills
+
+- **[Agent Skills specification](https://agentskills.io/specification)** — the
+  `SKILL.md` format the pack follows; its `skills-ref` validator's rules are ported
+  into `tests/agent_skills/test_skill_pack.py`.
+- **[dbt-labs/dbt-agent-skills](https://github.com/dbt-labs/dbt-agent-skills)** and
+  **[hashicorp/agent-skills](https://github.com/hashicorp/agent-skills)** — the
+  marketplace-plus-plugin layout, and dbt's `evals/` scenarios with A/B skill sets,
+  which `tests/agent_evals/` adapts with deterministic grading.
+- **[vercel-labs/skills](https://github.com/vercel-labs/skills)** — `npx skills add`,
+  which finds the pack through `.claude-plugin/marketplace.json`.
+- **[Vercel: AGENTS.md outperforms skills](https://vercel.com/blog/agents-md-outperforms-skills-in-our-agent-evals)**
+  and **SkillsBench** (arXiv 2602.12670) — why the pack pairs on-demand skills
+  with a short always-loaded index, and keeps each skill to three supporting files.
 
 ### CLI output for agents
 
