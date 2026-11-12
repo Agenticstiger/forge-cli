@@ -241,3 +241,29 @@ def test_the_table_a_dbt_build_writes_keeps_what_dbt_made_and_the_drift_is_said(
     assert "amount: contract=double live=decimal(38,6)" in out
     assert "loaded_at: present in the live table but not declared" in out
     assert fake.sql_log[statements:] == [] and fake.tables[TABLE]["marker"] == marker
+
+
+def test_a_job_that_writes_a_keyed_table_declares_its_keys_again_after_dbt(workspace, fake, capfd):
+    document = job_contract()
+    document["exposes"][0]["contract"]["schema"][0]["tags"] = ["primary-key"]
+    path = write_contract(workspace, document)
+
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    settings = _only_job(fake)["settings"]
+    dbt_task, keys_task = settings["tasks"]
+    assert dbt_task["task_key"] == "dbt"
+    assert keys_task["task_key"] == "fluid_keys"
+    assert keys_task["depends_on"] == [{"task_key": "dbt"}]
+    assert keys_task["sql_task"] == {
+        "warehouse_id": fake.warehouse_id,
+        "file": {"path": f"/Workspace{ROOT}/fluid_keys.sql", "source": "WORKSPACE"},
+    }
+    script = fake.file_content(f"{ROOT}/fluid_keys.sql").decode("utf-8")
+    assert "DECLARE CONTINUE HANDLER FOR SQLEXCEPTION" in script
+    assert (
+        "ALTER TABLE `main`.`sales`.`orders` ADD CONSTRAINT `fluid_pk_orders` PRIMARY KEY (`id`)"
+        in script
+    )
+    # The provider reads back the task and the file as it sent them.
+    assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]

@@ -46,7 +46,18 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from ...util.binding_paths import ENV_PLACEHOLDER_RE
@@ -55,6 +66,7 @@ from ...util.cron import unix_to_quartz
 from ..base import UnsupportedBindingError
 from ..naming import TofuExpr, digest_ident, safe_ident, tofu_ref, unique_ident
 from ..source import current_contract_source
+from .databricks_keys import REBUILD_FILE, REBUILD_TASK, REBUILD_TIMEOUT_SECONDS
 
 #: The serverless environment the dbt task runs in: client version 2 and the
 #: dbt adapter, installed per run (Phase 0b ran exactly this against the provider).
@@ -737,6 +749,7 @@ def compile_dbt_jobs(
     *,
     validating: bool = False,
     run_as_allowed: FrozenSet[str] = frozenset(),
+    rebuild_script: Optional[Callable[[Mapping[str, Any]], Optional[str]]] = None,
 ) -> CompiledJobs:
     """Every Databricks dbt job of ``contract``, with its workspace files and refusals.
 
@@ -744,6 +757,10 @@ def compile_dbt_jobs(
     job runs dbt against the catalog and schema of the first one its build
     writes. ``fluid validate`` compiles with ``validating`` and no contract
     location may be known; the project files are then not read.
+
+    ``rebuild_script`` gives, for a build, the SQL that declares again the Unity Catalog
+    keys its dbt run drops (``databricks_keys.rebuild_script``), or ``None``: a job with one
+    runs it in a second task, ``fluid_keys``, after dbt.
     """
     compiled = CompiledJobs()
     builds = [b for b in contract.get("builds") or [] if isinstance(b, Mapping)]
@@ -760,7 +777,8 @@ def compile_dbt_jobs(
         table = _target_table(item, builds, tables, compiled.refusals)
         source = _project_source(item, compiled.refusals, validating=validating)
         if len(compiled.refusals) == before and table is not None and source is not None:
-            _emit_job(compiled, item, table, settings, source)
+            script = rebuild_script(build) if rebuild_script is not None else None
+            _emit_job(compiled, item, table, settings, source, script)
     return compiled
 
 
@@ -866,8 +884,17 @@ def _project_source(
 
 
 def _emit_job(
-    compiled: CompiledJobs, item: _Build, table: Any, settings: _Settings, source: _Source
+    compiled: CompiledJobs,
+    item: _Build,
+    table: Any,
+    settings: _Settings,
+    source: _Source,
+    keys_script: Optional[str] = None,
 ) -> None:
+    """The job, its uploaded project, and, with ``keys_script``, the ``fluid_keys`` task that
+    runs it after dbt (``databricks_keys.py``): uploaded next to the project, whose own files
+    dbt reads never include a top-level ``.sql`` file."""
+    keys_file = [(REBUILD_FILE, keys_script.encode("utf-8"))] if keys_script is not None else []
     dbt_task: Dict[str, Any] = {
         "commands": settings.commands,
         "warehouse_id": item.warehouse,
@@ -894,16 +921,20 @@ def _emit_job(
         dbt_task["source"] = "GIT"
         if source.directory:
             dbt_task["project_directory"] = source.directory
+        uploads = keys_file
     else:
         dbt_task["source"] = "WORKSPACE"
         # A workspace path as the jobs service reads it (Asset Bundles' file_path form).
         dbt_task["project_directory"] = _under_home("/Workspace", item.root)
-        depends = _emit_files(compiled, item, source.files)
-        if depends:
-            job["depends_on"] = depends
+        uploads = [*source.files, *keys_file]
+        compiled.data.setdefault(CURRENT_USER, {})["me"] = {}
+    depends = _emit_files(compiled, item, uploads)
+    if depends:
+        job["depends_on"] = depends
         compiled.data.setdefault(CURRENT_USER, {})["me"] = {}
     job["task"] = [
-        {"task_key": "dbt", "environment_key": "dbt", "dbt_task": dbt_task, **settings.task}
+        {"task_key": "dbt", "environment_key": "dbt", "dbt_task": dbt_task, **settings.task},
+        *([_keys_task(item)] if keys_file else []),
     ]
     compiled.resources.append(("databricks_job", item.key, f"{item.where} job", job))
     compiled.jobs.append(
@@ -913,10 +944,27 @@ def _emit_job(
             address=f"databricks_job.{item.key}",
             source=dbt_task["source"],
             trigger=settings.trigger,
-            files=tuple(rel for rel, _ in source.files),
+            files=tuple(rel for rel, _ in uploads),
             root=item.root,
         )
     )
+
+
+def _keys_task(item: _Build) -> Dict[str, Any]:
+    """The ``fluid_keys`` task: once dbt has succeeded, the uploaded script on the same
+    warehouse."""
+    return {
+        "task_key": REBUILD_TASK,
+        "depends_on": [{"task_key": "dbt"}],
+        "timeout_seconds": REBUILD_TIMEOUT_SECONDS,
+        "sql_task": {
+            "warehouse_id": item.warehouse,
+            "file": {
+                "path": _under_home("/Workspace", f"{item.root}/{REBUILD_FILE}"),
+                "source": "WORKSPACE",
+            },
+        },
+    }
 
 
 def _emit_files(
