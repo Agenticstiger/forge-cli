@@ -785,3 +785,111 @@ def test_a_sighup_the_operator_ignores_stays_ignored(capsys) -> None:
         assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
     finally:
         signal.signal(signal.SIGHUP, before)
+
+
+# ── the contract's DQ rules, as dbt tests of the run ───────────────────────
+
+DQ_BUILD: Dict[str, Any] = {
+    "id": "transform",
+    "engine": "dbt",
+    "outputs": ["orders"],
+    "execution": {"runtime": {"platform": "databricks"}},
+}
+DQ_CONTRACT: Dict[str, Any] = {
+    "id": "sales.orders",
+    "exposes": [
+        {
+            "exposeId": "orders",
+            "binding": {"platform": "databricks"},
+            "contract": {
+                "schema": [{"name": "id", "type": "bigint"}, {"name": "status", "type": "string"}],
+                "dq": {
+                    "rules": [
+                        {
+                            "id": "id_unique",
+                            "type": "uniqueness",
+                            "selector": "id",
+                            "severity": "critical",
+                        },
+                        {
+                            "id": "status_set",
+                            "type": "completeness",
+                            "selector": "status",
+                            "severity": "warn",
+                        },
+                    ]
+                },
+            },
+        }
+    ],
+    "builds": [DQ_BUILD],
+}
+DQ_LOGS = (
+    "\x1b[0m12:00:02  1 of 3 \x1b[32mPASS\x1b[0m id_unique ............ [\x1b[32mPASS\x1b[0m in 1.02s]\n"
+    "\x1b[0m12:00:03  2 of 3 \x1b[33mWARN 4\x1b[0m status_set .......... [\x1b[33mWARN 4\x1b[0m in 0.50s]\n"
+    "\x1b[0m12:00:04  Done. PASS=2 WARN=1 ERROR=0 SKIP=0 NO-OP=0 TOTAL=3\n"
+)
+
+
+def _go_dq(api: _Api, capsys: pytest.CaptureFixture) -> tuple:
+    time_ = _Time()
+    rc = run_job_build(
+        DQ_CONTRACT,
+        DQ_BUILD,
+        JOBS,
+        mode="amend-and-build",
+        client_factory=lambda: _Client(api),
+        env={},
+        sleep=time_.sleep,
+        clock=time_.clock,
+    )
+    captured = capsys.readouterr()
+    return rc, captured.out + captured.err
+
+
+def test_a_success_reports_each_contract_rule_dbt_tested(capsys) -> None:
+    api = _Api(
+        [_run("TERMINATED", code="SUCCESS", tasks=[_task("SUCCESS")])],
+        outputs={78: {"logs": DQ_LOGS}},
+    )
+    rc, out = _go_dq(api, capsys)
+    assert rc == 0, out
+    assert "contract rules as dbt tests: 1 pass, 1 warn" in out
+    assert "✓ id_unique: PASS - uniqueness id, severity error" in out
+    assert "! status_set: WARN 4 rows - completeness status, severity warn" in out
+    # One read of the task's output serves the summary and the rules.
+    assert [c[1] for c in api.calls].count("runs/get-output") == 1
+
+
+def test_a_failed_test_is_named_before_the_end_of_the_output(capsys) -> None:
+    logs = DQ_LOGS.replace("PASS\x1b[0m id_unique", "FAIL 2\x1b[0m id_unique")
+    api = _Api(
+        [_run("TERMINATED", code="RUN_EXECUTION_ERROR", tasks=[_task("RUN_EXECUTION_ERROR")])],
+        outputs={78: {"error": "dbt command failed", "logs": logs}},
+    )
+    rc, out = _go_dq(api, capsys)
+    assert rc == 1
+    flat = " ".join(out.split())
+    assert "task 'dbt': dbt command failed" in flat
+    assert "✗ id_unique: FAIL 2 rows - uniqueness id, severity error" in flat
+    assert flat.index("id_unique: FAIL 2 rows") < flat.index("dbt output:")
+
+
+def test_rules_are_reported_when_a_later_task_fails(capsys) -> None:
+    keys = {**_task("RUN_EXECUTION_ERROR", run_id=79), "task_key": "fluid_keys"}
+    api = _Api(
+        [_run("TERMINATED", code="RUN_EXECUTION_ERROR", tasks=[_task("SUCCESS"), keys])],
+        outputs={78: {"logs": DQ_LOGS}, 79: {"error": "key failed"}},
+    )
+    rc, out = _go_dq(api, capsys)
+    assert rc == 1
+    assert "✓ id_unique: PASS" in out and "task 'fluid_keys': key failed" in out
+
+
+def test_a_contract_without_rules_reports_none(capsys) -> None:
+    api = _Api(
+        [_run("TERMINATED", code="SUCCESS", tasks=[_task("SUCCESS")])],
+        outputs={78: {"logs": DQ_LOGS}},
+    )
+    rc, out = _go(api, capsys)
+    assert rc == 0 and "contract rules" not in out

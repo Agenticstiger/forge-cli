@@ -281,7 +281,21 @@ def run_job_build(
         env=os.environ if env is None else env,
         sleep=sleep,
         clock=clock,
+        dq_checks=_dq_checks(contract, build),
     )
+
+
+def _dq_checks(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Tuple[Any, ...]:
+    """The contract rules the job runs as dbt tests (``iac/providers/databricks_dbt_tests.py``),
+    which the report names one by one; none when they cannot be read, since the report is a
+    courtesy and the apply already refused a rule it could not run."""
+    try:
+        from fluid_build.iac.providers.databricks_dbt_tests import expected_tests
+
+        return tuple(expected_tests(contract, build))
+    except Exception:  # noqa: BLE001 — never fail a build over its report
+        LOG.debug("databricks_job_run_dq_checks_unread", exc_info=True)
+        return ()
 
 
 def start_and_wait(
@@ -295,8 +309,12 @@ def start_and_wait(
     say: Optional[Say] = None,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    dq_checks: Sequence[Any] = (),
 ) -> int:
-    """Run ``job`` now through ``client`` and wait for the run to end. Returns 0 or 1."""
+    """Run ``job`` now through ``client`` and wait for the run to end. Returns 0 or 1.
+
+    ``dq_checks`` are the contract rules its dbt task runs as tests: the report says what
+    dbt found for each (:func:`fluid_build.iac.providers.databricks_dbt_tests.report`)."""
     say = say or _say
     api = client.api_client
     label = f"Databricks job '{name}' ({job.job_id})"
@@ -343,7 +361,9 @@ def start_and_wait(
     if ended is None:
         return 1
     # The run has ended: an interrupt from here on stops the report, never a run.
-    return _report_end(api, ended.run, run_id, build_id, ended.elapsed, ended.url, say)
+    return _report_end(
+        api, ended.run, run_id, build_id, ended.elapsed, ended.url, say, dq_checks=dq_checks
+    )
 
 
 @dataclass(frozen=True)
@@ -506,15 +526,23 @@ def _report_end(
     elapsed: float,
     url: str,
     say: Say,
+    *,
+    dq_checks: Sequence[Any] = (),
 ) -> int:
+    from fluid_build.iac.providers.databricks_jobs import DBT_TASK_KEY
+
     code, message = _outcome(run)
     say(f"   {_clock(elapsed)} TERMINATED {code}")
     LOG.debug("databricks_job_run_ended run_id=%s result=%s", run_id, code)
     if code == "SUCCESS":
         for task_key, task in _latest_attempts(run):
-            summary = _dbt_summary(api, task["run_id"])
+            output, _unread = _task_output(api, task["run_id"])
+            summary = _dbt_summary(output)
             if summary:
                 say(f"   task '{task_key}': {summary}")
+            if task_key == DBT_TASK_KEY:
+                for line in _rule_lines(output, dq_checks):
+                    say(line)
         say(f"✅ Build '{build_id}' - Databricks run {run_id} succeeded in {_duration(elapsed)}")
         return 0
     console_error(
@@ -522,8 +550,16 @@ def _report_end(
         + (f": {message}" if message else "")
     )
     for task_key, task in _latest_attempts(run):
-        if _outcome(task)[0] != "SUCCESS":
-            _report_task(api, task_key, task["run_id"], say)
+        failed = _outcome(task)[0] != "SUCCESS"
+        if not failed and task_key != DBT_TASK_KEY:
+            continue
+        output, unread = _task_output(api, task["run_id"])
+        rules = _rule_lines(output, dq_checks) if task_key == DBT_TASK_KEY else []
+        if failed:
+            _report_task(task_key, output, unread, say, rules)
+        else:  # dbt passed and a later task failed: its tests still ran
+            for line in rules:
+                say(line)
     if url:
         say(f"   run page: {url}")
     return 1
@@ -558,26 +594,47 @@ def _queued_behind(api: Any, job_id: int, run_id: int) -> str:
     )
 
 
-def _dbt_summary(api: Any, task_run: Any) -> str:
-    """dbt's own last ``Done. PASS=...`` line of a task's output, or ``""``: what a run that
-    succeeded built, at the cost of one read that may fail without failing the build."""
+def _task_output(api: Any, task_run: Any) -> Tuple[Mapping[str, Any], Optional[BaseException]]:
+    """A task's ``runs/get-output``, read once for every line about it: ``({}, error)`` when
+    it cannot be read."""
     try:
-        output = api.do("GET", f"{_JOBS}/runs/get-output", query={"run_id": task_run}) or {}
-    except Exception:  # noqa: BLE001 — the run succeeded; its summary is a courtesy
-        return ""
+        return api.do("GET", f"{_JOBS}/runs/get-output", query={"run_id": task_run}) or {}, None
+    except Exception as exc:  # noqa: BLE001 — what is said about a task never fails the build
+        return {}, exc
+
+
+def _dbt_summary(output: Mapping[str, Any]) -> str:
+    """dbt's own last ``Done. PASS=...`` line of a task's output, or ``""``: what a run that
+    succeeded built."""
     done = [line for line in clean(output.get("logs") or "").splitlines() if "Done. PASS=" in line]
     return " ".join(_DBT_TIMESTAMP_RE.sub("", done[-1]).split()) if done else ""
 
 
-def _report_task(api: Any, task_key: str, task_run: Any, say: Say) -> None:
-    try:
-        output = api.do("GET", f"{_JOBS}/runs/get-output", query={"run_id": task_run}) or {}
-    except Exception as exc:  # noqa: BLE001
-        say(f"   task '{task_key}': its output could not be read ({_failure(exc)})")
+def _rule_lines(output: Mapping[str, Any], dq_checks: Sequence[Any]) -> List[str]:
+    """What dbt found for each contract rule the dbt task ran as a test."""
+    if not dq_checks:
+        return []
+    from fluid_build.iac.providers.databricks_dbt_tests import report
+
+    logs = clean(output.get("logs") or "")
+    return report(logs, dq_checks, truncated=bool(output.get("logs_truncated")))
+
+
+def _report_task(
+    task_key: str,
+    output: Mapping[str, Any],
+    unread: Optional[BaseException],
+    say: Say,
+    rules: Sequence[str] = (),
+) -> None:
+    if unread is not None:
+        say(f"   task '{task_key}': its output could not be read ({_failure(unread)})")
         return
     # One line: Databricks quotes the failed shell command with its newlines escaped.
     error = " ".join(clean(output.get("error") or "").replace("\\n", " ").split())
     say(f"   task '{task_key}'" + (f": {error}" if error else " failed"))
+    for line in rules:
+        say(line)
     logs = clean(output.get("logs") or output.get("error_trace") or "")
     lines = [line.rstrip() for line in logs.splitlines() if line.strip()]
     if not lines:
