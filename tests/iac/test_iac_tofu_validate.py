@@ -503,6 +503,38 @@ def test_a_databricks_dbt_job_passes_tofu_validate(source, tmp_path, monkeypatch
     assert validate.returncode == 0, validate.stderr or validate.stdout
 
 
+@pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
+def test_a_databricks_data_quality_monitor_passes_tofu_validate(tmp_path, monkeypatch):
+    """An SLO puts a ``databricks_data_quality_monitor`` on the schema, excluding the
+    product's other table there: the attributes are the pinned provider's own."""
+    monkeypatch.setenv("DATABRICKS_WAREHOUSE_ID", "wh-validate-only")
+    contract = json.loads(json.dumps(_SAMPLE_CONTRACTS["databricks"]))
+    orders = contract["exposes"][0]
+    orders["qos"] = {"freshnessSLO": "PT15M", "completenessTarget": 0.98}
+    notes = json.loads(json.dumps(orders))
+    notes.pop("qos")
+    notes["exposeId"] = "notes"
+    notes["binding"]["location"]["table"] = "notes"
+    contract["exposes"].append(notes)
+    plugin = IAC_PLUGINS["databricks"]
+    text = build_module(plugin, contract)
+    monitors = json.loads(text)["resource"]["databricks_data_quality_monitor"]
+    assert [m["anomaly_detection_config"] for m in monitors.values()] == [
+        {"excluded_table_full_names": ["main.sales.notes"]}
+    ]
+
+    (tmp_path / "main.tf.json").write_text(text)
+    write_dependency_lock(plugin, tmp_path)
+    _tofu_init_or_skip(tmp_path)
+    validate = subprocess.run(
+        [_TOFU, "validate", "-no-color"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert validate.returncode == 0, validate.stderr or validate.stdout
+
+
 # Per-cloud cross-account / cross-project shapes. Stage 1 unit tests
 # pin the dict; this pins the *.tf.json against the real ``tofu``
 # binary — catches any provider-schema mismatch in the new

@@ -66,6 +66,9 @@ class IacProviderPlugin(Protocol):
     * ``explain_plan_failure(output, contract, state)``: an
       :class:`UnsupportedBindingError` naming the fix for a failed ``tofu``
       run, or ``None``.
+    * ``apply_failure_hints(address, detail)``: suggestions for a ``tofu apply``
+      that failed on the resource at ``address``, added ahead of the engine's own
+      ``tofu state list`` hint; ``[]`` when the plugin has none.
     * ``recorded_regions(state)``: the regions the state's resources live in,
       so an apply pinned to another region is refused, not re-created there.
     * ``suppressed_drift(contract, prior_state)``: drift the module hides with

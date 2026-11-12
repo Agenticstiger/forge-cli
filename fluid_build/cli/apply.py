@@ -339,6 +339,70 @@ def _gate_build_ids_for_apply(contract: Dict[str, Any]) -> None:
         ) from exc
 
 
+def _databricks_job_runs(contract: Dict[str, Any], build_id: Optional[str]) -> bool:
+    """True when a build phase of ``contract`` starts Databricks job runs
+    (``build_runners/_databricks_job_run.py``): it needs the apply's state, and the SDK."""
+    from fluid_build.build_runners._databricks_job_run import started_builds
+
+    return bool(started_builds(contract, build_id))
+
+
+def _state_for_job_runs(
+    contract: Dict[str, Any], mode: Any, build_id: Optional[str]
+) -> Dict[str, Any]:
+    """``apply_via_opentofu`` keyword arguments: ``applied_state`` when this apply's build
+    phase starts Databricks job runs, so the engine hands back the state it leaves."""
+    from fluid_build.forge.core.apply_modes import needs_build
+
+    if needs_build(mode) and _databricks_job_runs(contract, build_id):
+        return {"applied_state": []}
+    return {}
+
+
+def _jobs_from_state(engine_kwargs: Dict[str, Any], contract: Dict[str, Any]) -> Dict[str, Any]:
+    """``run_builds_from_args`` keyword arguments: the Databricks jobs the applied state
+    holds for ``contract``, by build id (``_databricks_job_run.jobs_in_state``)."""
+    if "applied_state" not in engine_kwargs:
+        return {}
+    from fluid_build.build_runners._databricks_job_run import jobs_in_state
+    from fluid_build.iac.providers.databricks_jobs import job_product
+
+    jobs = jobs_in_state(engine_kwargs["applied_state"], job_product(contract))
+    return {"databricks_jobs": jobs}
+
+
+def _gate_databricks_sdk_for_apply(
+    contract: Dict[str, Any], build_id: Optional[str], dry_run: bool, engine: str
+) -> None:
+    """Refuse, before anything is applied, a build phase that starts Databricks job runs
+    without databricks-sdk, which starts them. Otherwise ``tofu apply`` would provision the
+    jobs and the build would then fail. Only the OpenTofu engine starts them (the native one
+    provisions no job), and a dry run starts none.
+
+    Raises:
+        CLIError: ``apply_databricks_sdk_missing``.
+    """
+    if dry_run or engine != "opentofu" or not _databricks_job_runs(contract, build_id):
+        return
+    import importlib.util
+
+    try:
+        found = importlib.util.find_spec("databricks.sdk") is not None
+    except (ImportError, ValueError):
+        found = False
+    if not found:
+        raise CLIError(
+            1,
+            "apply_databricks_sdk_missing",
+            {
+                "error": "a dbt build runs on Databricks, and the build phase starts its job "
+                "through databricks-sdk, which is not installed; nothing was applied",
+                "hint": "pip install 'data-product-forge[databricks]', or apply with "
+                "--mode amend to provision the job without starting it",
+            },
+        )
+
+
 def _gate_selected_build_for_apply(contract: Dict[str, Any], build_id: Optional[str]) -> None:
     """Refuse, before anything is applied, a ``--build-id`` that names no build.
 
@@ -2059,6 +2123,12 @@ def run(args, logger: logging.Logger) -> int:
         if needs_build(resolved_mode):
             _gate_build_ids_for_apply(source_contract)
             _gate_selected_build_for_apply(source_contract, resolved_build_id)
+            _gate_databricks_sdk_for_apply(
+                source_contract,
+                resolved_build_id,
+                bool(getattr(args, "dry_run", False)),
+                apply_engine,
+            )
     except CLIError as exc:
         _log_apply_failure(logger, start_time, exc)
         raise
@@ -2079,7 +2149,8 @@ def run(args, logger: logging.Logger) -> int:
         _hook_rc = _run_apply_hooks_for_source(args, source_contract, logger)
         if _hook_rc != 0:
             return _hook_rc
-        rc = apply_via_opentofu(args, logger, contract=source_contract)
+        engine_kwargs = _state_for_job_runs(source_contract, resolved_mode, resolved_build_id)
+        rc = apply_via_opentofu(args, logger, contract=source_contract, **engine_kwargs)
         # The OpenTofu engine provisions infrastructure only. Build-augmented
         # modes (amend-and-build / replace-and-build) still need their build
         # phase to run — mirror the native dispatch below so ``--build`` is
@@ -2088,7 +2159,8 @@ def run(args, logger: logging.Logger) -> int:
             args.build_id = resolved_build_id
             from fluid_build.cli._apply_opentofu_engine import build_after_apply
 
-            return build_after_apply(args, logger, source_contract, build_kwargs)
+            jobs = _jobs_from_state(engine_kwargs, source_contract)
+            return build_after_apply(args, logger, source_contract, {**build_kwargs, **jobs})
         return rc
 
     try:

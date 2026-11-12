@@ -1440,24 +1440,87 @@ def _offer_import_from_other_clis(console: Any) -> Optional[LlmConfig]:
     return None
 
 
+# What :func:`_setup_from_key_variables` returns when setup must stop.
+_STOP_SETUP = object()
+
+
+def _setup_from_key_variables(console: Any) -> Any:
+    """Step 2 of :func:`run_ai_setup_inline`: the key variables a run without a TTY reads.
+
+    ``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY`` and ``GEMINI_API_KEY`` /
+    ``GOOGLE_API_KEY`` select their provider. ``GITHUB_API_KEY`` never does:
+    github is used only when named (``PROVIDER_ENV_VARS``). ``OLLAMA_HOST`` is
+    step 3. Variables for two or more providers select none: as without a TTY,
+    exactly one keyring key then decides, else this names them.
+
+    Returns the config, :data:`_STOP_SETUP` when setup must stop, or ``None`` to
+    go on to step 3.
+    """
+    # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
+    from fluid_build.cli.ai_setup import PROVIDER_DISPLAY_NAMES, PROVIDER_ENV_VARS
+
+    # From ``providers``, never ``provider_resolve`` first (a circular import).
+    from fluid_build.llm.providers import (
+        _explicit_key_signals,
+        _infer_provider_from_keyring,
+        _resolve_api_key,
+        ambiguous_keys_message,
+    )
+
+    ambiguous = ambiguous_keys_message(os.environ)
+    if ambiguous:
+        kept = _infer_provider_from_keyring()
+        kept_key = _resolve_api_key(kept, os.environ) if kept else None
+        if kept and kept_key:
+            if console and RICH_AVAILABLE:
+                label = PROVIDER_DISPLAY_NAMES.get(kept, kept)
+                console.print(f"[dim]Using {label}, the one provider with a keyring key.[/dim]")
+            LOG.info("Inline AI setup: several key variables, one keyring key")
+            return _make_cloud_config(kept, kept_key)
+        if console and RICH_AVAILABLE:
+            console.print(literal_error_text(ambiguous, "yellow"))
+        LOG.info("Inline AI setup: key variables for several providers, none chosen")
+        return _STOP_SETUP
+    signals = _explicit_key_signals(os.environ)  # one provider at most here
+    pname = next(iter(signals), None)
+    if not pname or pname == "ollama":  # nothing, or OLLAMA_HOST: step 3
+        return None
+    # GOOGLE_API_KEY before GEMINI_API_KEY, as the key resolver reads them.
+    env_var = PROVIDER_ENV_VARS.get(pname)
+    if not env_var or not os.environ.get(env_var):
+        env_var = signals[pname][0]
+    env_key = os.environ[env_var]
+    if console and RICH_AVAILABLE:
+        label = PROVIDER_DISPLAY_NAMES.get(pname, pname)
+        console.print(f"[dim]Using {label} from environment.[/dim]")
+    LOG.info("Inline AI setup: loaded %s from env var", pname)
+    # 2a. Opt-in import: the key is in this shell's environment
+    #     (e.g. exported for another tool). Offer to persist it to
+    #     fluid's own keyring so it survives the next shell — strictly
+    #     opt-in, never in CI, and only the env value we already read.
+    _offer_import_env_api_key(console, pname, env_key, env_var)
+    return _make_cloud_config(pname, env_key)
+
+
 def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
     """Compact inline setup triggered when forge starts without a configured provider.
 
     Resolves an LLM config in this priority order:
 
         1. saved config file + OS keyring (``~/.fluid/ai_config.json``)
-        2. cloud provider env vars (``OPENAI_API_KEY`` etc.)
+        2. cloud provider env vars (``OPENAI_API_KEY`` etc.), never ``GITHUB_API_KEY``
         3. explicit ``OLLAMA_HOST`` env var
         4. auto-detected local Ollama (with user confirmation on TTY)
         5. interactive provider picker
 
-    Returns ``None`` if the user skips setup or stdin is not a TTY.
+    Returns ``None`` if the user skips setup, stdin is not a TTY, or key
+    variables name two or more providers (setup names them instead of choosing).
+    Callers do not run it for a provider the operator named.
     """
     # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
     from fluid_build.cli.ai_setup import (
         BUILTIN_LLM_PROVIDERS,
         PROVIDER_DISPLAY_NAMES,
-        PROVIDER_ENV_VARS,
         ask_confirmation,
         detect_ollama_available,
     )
@@ -1518,19 +1581,12 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
 
     # 2. Check cloud-provider env vars (e.g. CI environments that
     #    inject ANTHROPIC_API_KEY / OPENAI_API_KEY directly).
-    for pname, env_var in PROVIDER_ENV_VARS.items() if has_litellm else ():
-        env_key = os.environ.get(env_var)
-        if env_key:
-            if console and RICH_AVAILABLE:
-                label = PROVIDER_DISPLAY_NAMES.get(pname, pname)
-                console.print(f"[dim]Using {label} from environment.[/dim]")
-            LOG.info("Inline AI setup: loaded %s from env var", pname)
-            # 2a. Opt-in import: the key is in this shell's environment
-            #     (e.g. exported for another tool). Offer to persist it to
-            #     fluid's own keyring so it survives the next shell — strictly
-            #     opt-in, never in CI, and only the env value we already read.
-            _offer_import_env_api_key(console, pname, env_key, env_var)
-            return _make_cloud_config(pname, env_key)
+    if has_litellm:
+        chosen = _setup_from_key_variables(console)
+        if chosen is _STOP_SETUP:
+            return None
+        if chosen is not None:
+            return chosen
 
     # 3. Explicit OLLAMA_HOST env var.
     if has_litellm and os.environ.get("OLLAMA_HOST"):

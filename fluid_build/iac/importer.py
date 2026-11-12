@@ -17,7 +17,7 @@ live introspection and is wired in a follow-up — see ``AUTOGEN_SPIKE.md``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,12 @@ class ImportBlock:
     #: adopted (a Databricks grant is authoritative for its principal), so a
     #: failed import costs an honest plan, never a silent replace.
     best_effort: bool = False
+    #: ``(address, attribute)`` of the resource whose value in state completes ``id``
+    #: (its ``{}``): an import id the cloud assigns, such as a Databricks schema's UUID,
+    #: known only once that resource is in state. The import is skipped while it is not,
+    #: and the block is never rendered into a module (:func:`import_section`): an import
+    #: id there must be known before the plan.
+    id_from: Optional[Tuple[str, str]] = None
 
 
 def import_section(blocks: List[ImportBlock]) -> Dict[str, Any]:
@@ -44,6 +50,7 @@ def import_section(blocks: List[ImportBlock]) -> Dict[str, Any]:
     Returns an empty dict when there is nothing to import (so callers can
     unconditionally merge the result).
     """
-    if not blocks:
+    literal = [block for block in blocks if block.id_from is None]
+    if not literal:
         return {}
-    return {"import": [{"to": block.to, "id": block.id} for block in blocks]}
+    return {"import": [{"to": block.to, "id": block.id} for block in literal]}

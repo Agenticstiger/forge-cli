@@ -70,6 +70,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column the dbt model leaves nullable, say) is reported by the next `fluid apply`, and the
   script needs a SQL warehouse that runs SQL scripting. A dbt build that
   `--mode amend-and-build` runs locally is followed by the same re-declaration.
+- **Databricks data quality monitoring from a contract's freshness and completeness SLOs.** An
+  expose bound to Databricks that states a freshness or completeness SLO (`qos.freshnessSLO`,
+  `qos.completenessTarget`, an `observability.defaultSLIs` freshness or completeness block, or a
+  `contract.dq.rules` entry of type `freshness`, `completeness` or `anomaly_detection`) now turns on
+  Databricks data quality monitoring (formerly anomaly detection) for the schema the product owns:
+  one `databricks_data_quality_monitor` per schema, created after its tables, with the product's
+  other tables there excluded by name. Catalog Explorer then shows a Quality indicator on the table,
+  and every scan lands in `system.data_quality_monitoring.table_results`. No new contract field:
+  `contract.dq.monitoring.enabled: false` opts an expose out. Databricks learns each table's bounds
+  from its history and takes no threshold, so the SLO values choose the tables and are not the
+  bounds it checks; `fluid apply` says so, and `fluid validate` warns about a `dq.monitoring.window`
+  other than one day. A monitor turned on outside forge-cli is adopted, not created over. If
+  Databricks refuses the monitor (no serverless compute, or no MANAGE on the schema), the apply
+  fails after the tables are created, and its suggestions say what the monitor needs and name the
+  opt-out. Removing one (opting out, dropping the SLOs, removing the expose) deletes its hidden scan
+  job and what it has learned, never table data, so it is not gated, and is printed. **Cost:** scans
+  run on serverless compute billed as `DATA_QUALITY_MONITORING`, once when monitoring is turned on
+  and then as often as each table is updated. Databricks Free Edition runs it (proven 2026-11-12).
+  Expect the scans to count against its daily compute quota (their cost was not measured): a
+  workspace over the quota stops all compute for the rest of the day, so on Free Edition opt out the
+  products you do not need watched.
+
+### Changed
+
+- **`fluid apply --mode amend-and-build` runs a Databricks dbt build now.** A dbt build with
+  `execution.runtime.platform: databricks` runs as the serverless job `fluid apply` provisions.
+  `amend-and-build` and `replace-and-build` now start a run of that job after provisioning
+  and wait for it. They print the run page and each state the run enters, with the reason
+  while it is queued. A failed run fails the apply with the task's error and the end of
+  dbt's output. `replace-and-build` adds `--full-refresh` for that run only. Before, the apply
+  only provisioned the job and said how to start it, so a manual job never ran.
+  - `amend` and `create-only` still only provision, and a continuous job is not started.
+  - The job's settings, schedule and pause state are never changed.
+  - `FLUID_DATABRICKS_RUN_TIMEOUT_SECONDS` caps the wait: an hour, or the job's own timeouts
+    and retries plus 15 minutes. The run is cancelled at the cap and on Ctrl-C, SIGTERM or
+    SIGHUP. A run that cannot be read five times in a row is left as it is, and the apply
+    says so. run-now is retried with the same idempotency token, so a retry never starts a
+    second run.
+  - A missing `databricks-sdk` (the `[databricks]` extra) is refused before anything is
+    applied.
+- **Keys for two or more providers stop the run, even with Ollama running.** With
+  `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` both set (or one provider's key and `OLLAMA_HOST`) and
+  nothing naming a provider, a run without a TTY skipped both keys and used a running local
+  Ollama, and interactive setup used the first key it found. Forge now stops with
+  `copilot_no_llm_provider` and names the keys, without asking Ollama; interactive setup,
+  `fluid ai test` and `fluid doctor` say the same and use none of them, and `fluid init`'s AI
+  path exits 1 where it used to write a template instead. A `fluid ai setup`
+  choice and a single keyring key still come first, and `GEMINI_API_KEY` with `GOOGLE_API_KEY` is
+  one provider. Pick one with `--llm-provider` or `FLUID_LLM_PROVIDER`.
 
 ### Fixed
 
@@ -115,6 +164,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `forge.contract_written` and the receipt sent another, so the stream named one file twice,
   first by its absolute path and then by its path from the current directory. Only the receipt's
   event is left, as in every other mode.
+- **Interactive `fluid forge` keeps the provider, model and endpoint you state.** Its inline
+  setup put the saved or first-found provider over `--llm-provider`, `--llm-model` and
+  `--llm-endpoint`, and over `FLUID_LLM_PROVIDER`, `FLUID_FORGE_AGENT`, `FLUID_LLM_MODEL` and
+  `FLUID_LLM_ENDPOINT`, so `fluid forge --llm-provider ollama` could call Anthropic. A run that
+  names its provider now skips inline setup and resolves as a run without a TTY does. Otherwise
+  setup fills only what the run leaves unstated, and an agent it finds is not used when the run
+  states an endpoint or a model, or runs the agent loop. The welcome panel and the interview's
+  "What I see" panel name the provider the run uses, not the saved one. `fluid init`'s AI path
+  does the same, and its handoff no longer offers AI setup for a provider named by a variable.
+- **Interactive setup no longer picks GitHub Models from `GITHUB_API_KEY`.** It took any variable
+  in `PROVIDER_ENV_VARS`, so `GITHUB_API_KEY` alone selected github, which setup then failed to
+  build (`KeyError: 'github'`). It now reads the key variables a run without a TTY reads:
+  `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY` or `GEMINI_API_KEY` (it missed the
+  second). GitHub Models stays a provider you name with `--llm-provider github`. `fluid ai test`
+  and `fluid init`'s check for a configured AI follow the same rule.
+- **`fluid ai test` tests the provider `FLUID_LLM_PROVIDER` or `FLUID_FORGE_AGENT` names.** It
+  read only `--llm-provider`, so with `FLUID_LLM_PROVIDER=anthropic` it tested the saved
+  provider, which forge would not use. A provider named this way also gets `FLUID_LLM_API_KEY`,
+  as with the flag. A coding agent or `mcp-sampling` named either way is not tested, and the
+  command now says so, where `claude-code` failed as "Unsupported AI provider 'claude_code'".
 - **A contract that types its text columns `STRING` passes the DuckDB acquisition's schema
   gate.** DuckDB reports every text column as `VARCHAR`, and the gate read `STRING` and `VARCHAR`
   as two types, so a contract written for Spark or Databricks stopped every ingest with "source

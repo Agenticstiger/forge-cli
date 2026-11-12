@@ -87,6 +87,24 @@ def _explicit_key_signals(env: Mapping[str, str]) -> Dict[str, List[str]]:
     return signals
 
 
+def ambiguous_keys_message(env: Mapping[str, str]) -> Optional[str]:
+    """Why the key variables select no provider, when they name two or more.
+
+    ``None`` when they name one provider or none. Forge, ``fluid doctor``,
+    interactive setup and ``fluid ai test`` all stop with this message. None of
+    them picks one of the keys, or a running Ollama, in the operator's place
+    (founder decision, 2026-11-12: stop and name the keys).
+    """
+    signals = _explicit_key_signals(env)
+    if len(signals) < 2:
+        return None
+    names = ", ".join(name for present in signals.values() for name in present)
+    return (
+        f"No LLM provider is selected: {names} are all set, so none of them is "
+        "chosen. Pick one with --llm-provider or FLUID_LLM_PROVIDER."
+    )
+
+
 def _canonical_provider_name(name: Any) -> Optional[str]:
     """*name* as the provider registry spells it, ``None`` when it is not a name.
 
@@ -159,13 +177,9 @@ def no_provider_message(env: Mapping[str, str]) -> str:
             "is not used when the run states an endpoint or a model, or runs the agent "
             "loop. Name a provider with --llm-provider."
         )
-    signals = _explicit_key_signals(env)
-    if len(signals) > 1:
-        names = ", ".join(name for present in signals.values() for name in present)
-        return (
-            f"No LLM provider is selected: {names} are all set, so none of them is "
-            "chosen. Pick one with --llm-provider or FLUID_LLM_PROVIDER."
-        )
+    ambiguous = ambiguous_keys_message(env)
+    if ambiguous:
+        return ambiguous
     if env.get("FLUID_LLM_API_KEY"):
         return (
             "No LLM provider is selected: FLUID_LLM_API_KEY does not say which provider "
@@ -311,12 +325,19 @@ def _infer_provider_from_ambient(
        rung: for the agent loop, which needs tool use, and when the operator
        stated an endpoint or model.
 
+    Neither rung answers when key variables name two or more providers
+    (:func:`ambiguous_keys_message`): the operator set those keys, and a
+    running Ollama is not a choice between them. The run stops and names them.
+
     Only call this AFTER the saved config and the keyring have been
     consulted — ambient services must not override an explicit
     operator choice.  See :func:`_infer_provider_from_env` for the full
     resolution ladder.
     """
 
+    if len(_explicit_key_signals(env)) > 1:
+        # Checked before the Ollama probe, so nothing is dialled either.
+        return None
     # Resolve via the host module: ``detect_ollama_available`` is
     # defined later in the host's module body, so an import-time
     # binding would be ``None``. Late-resolution at call time picks
@@ -341,7 +362,8 @@ def _infer_provider_from_env(
     1. Exactly one explicit key variable: a deliberate per-run choice.
     2. The provider ``fluid ai setup`` saved, unless :func:`_passed_over`.
     3. Exactly one keyring key.
-    4. Ambient discovery (:func:`_infer_provider_from_ambient`).
+    4. Ambient discovery (:func:`_infer_provider_from_ambient`), except when
+       key variables name two or more providers: then nothing is selected.
 
     The rest of the ladder after a named provider, shared by the real selection
     and :func:`check_llm_readiness`, so ``fluid doctor`` names what a run uses.
