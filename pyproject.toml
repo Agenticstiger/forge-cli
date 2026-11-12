@@ -659,6 +659,12 @@ fluid_build = [
   "policy/data/cloud_regions/*.md",
   "copilot/**/*.yaml",
   "copilot/**/*.md",
+  # The Agent Skills pack: `fluid scaffold-ide` copies these into a workspace,
+  # and the installed directory is a loadable Claude Code plugin. The manifest
+  # is named on its own because a `*` glob does not match a dot-directory.
+  "agent_skills/skills/**/*",
+  "agent_skills/hooks/*.json",
+  "agent_skills/.claude-plugin/plugin.json",
   "schemas/**/*.json",
   "schemas/**/*.yaml",
   "templates/**/*",
@@ -897,7 +903,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short --strict-markers --disable-warnings -m 'not live_llm and not live_judge'"
+addopts = "-v --tb=short --strict-markers --disable-warnings -m 'not live_llm and not live_judge and not agent_eval'"
 # Backstop: bound any single test at 10 min (pytest-timeout, thread
 # method). If a test ever DEADLOCKS in isolation it then FAILS FAST with
 # a thread-stack dump of exactly where it's stuck, instead of silently
@@ -922,6 +928,7 @@ markers = [
     "runtime: Tests for runtime generators",
     "live_llm: Tests that call a real LLM (cost ~$0.0001/run; require an API key in env)",
     "live_judge: Opt-in tests that call the real JudgeAgent against an LLM (cost ~$0.001/run; require an API key in env)",
+    "agent_eval: Opt-in eval of coding agents authoring FLUID contracts with and without the agent skills (runs claude -p on your subscription; set FLUID_AGENT_EVAL=1)",
     "redteam: Deterministic adversarial tests for the agentic layer (zero-token, no LLM)",
     "emulated: Stage-1 keyless integration tests backed by in-process emulators (moto, fakesnow); run on every PR via ci.yml",
     "emulated_heavy: Stage-2 Docker-based emulated integration tests (bigquery-emulator, LocalStack); admin-gated via integration-emulated-heavy.yml",

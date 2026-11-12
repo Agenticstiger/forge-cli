@@ -1,0 +1,11 @@
+{
+  "name": "fluid",
+  "description": "Agent Skills for FLUID data products with the fluid CLI: author and validate contracts, compose SDP, ADP and CDP products, deploy through reviewed plans, and fix errors. Validates each edited contract.",
+  "author": {
+    "name": "Agentics Transformation Limited"
+  },
+  "homepage": "https://agenticstiger.github.io/forge_docs/",
+  "repository": "https://github.com/Agenticstiger/forge-cli",
+  "license": "Apache-2.0",
+  "keywords": ["fluid", "data-products", "data-contracts", "data-mesh", "forge-cli"]
+}

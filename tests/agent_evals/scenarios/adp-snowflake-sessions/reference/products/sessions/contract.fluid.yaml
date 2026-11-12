@@ -1,0 +1,64 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: web.sessions
+name: sessions
+description: Page events grouped into user sessions.
+domain: web
+metadata:
+  productType: ADP
+  layer: Silver
+  owner:
+    team: web-analytics
+consumes:
+- productId: web.page_events_raw
+  exposeId: page_events
+builds:
+- id: build_sessions
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: >-
+      SELECT user_id || '-' || TO_VARCHAR(MIN(event_ts)) AS session_id, user_id,
+      MIN(event_ts) AS started_at, MAX(event_ts) AS ended_at, COUNT(*) AS page_count
+      FROM WEB_RAW.PUBLIC.PAGE_EVENTS GROUP BY user_id, DATE_TRUNC('hour', event_ts)
+  execution:
+    trigger:
+      type: schedule
+      cron: 30 5 * * *
+    runtime:
+      platform: snowflake
+exposes:
+- exposeId: sessions
+  kind: table
+  binding:
+    platform: snowflake
+    format: snowflake_table
+    location:
+      database: WEB_SILVER
+      schema: PUBLIC
+      table: SESSIONS
+  contract:
+    schema:
+    - name: session_id
+      type: string
+      required: true
+    - name: user_id
+      type: string
+      required: true
+    - name: started_at
+      type: timestamp
+      required: true
+    - name: ended_at
+      type: timestamp
+      required: true
+    - name: page_count
+      type: integer
+      required: true
+    dq:
+      rules:
+      - id: session_id_unique
+        type: uniqueness
+        selector: session_id
+        threshold: 1.0
+        operator: '>='
+        severity: error

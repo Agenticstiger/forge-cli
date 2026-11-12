@@ -1,0 +1,27 @@
+title: Refine an existing contract by adding a column and a rule
+contracts: [contract.fluid.yaml]
+forge:
+  target_dir: "."
+  args: [--refine, contract.fluid.yaml]
+checks:
+  - id: columns
+    expose: orders_raw
+    columns: {order_id: string, customer_id: string, order_ts: timestamp, amount: decimal, currency: string, discount_amount: decimal}
+  - {id: discount_optional, path: 'exposes[exposeId=orders_raw].contract.schema[name=discount_amount].required', not_equals: true}
+  - {id: amount_rule_selector, path: 'exposes[exposeId=orders_raw].contract.dq.rules[type=accuracy].selector', equals: amount}
+  - {id: amount_rule_operator, path: 'exposes[exposeId=orders_raw].contract.dq.rules[type=accuracy].operator', in: ['>=', '>']}
+  - id: untouched
+    from: contract.fluid.yaml
+    preserved:
+      - id
+      - name
+      - domain
+      - metadata
+      - builds
+      - 'exposes[exposeId=orders_raw].binding'
+      - 'exposes[exposeId=orders_raw].contract.schema[name=order_id]'
+      - 'exposes[exposeId=orders_raw].contract.schema[name=customer_id]'
+      - 'exposes[exposeId=orders_raw].contract.schema[name=order_ts]'
+      - 'exposes[exposeId=orders_raw].contract.schema[name=amount]'
+      - 'exposes[exposeId=orders_raw].contract.schema[name=currency]'
+      - 'exposes[exposeId=orders_raw].contract.dq.rules[id=order_id_unique]'

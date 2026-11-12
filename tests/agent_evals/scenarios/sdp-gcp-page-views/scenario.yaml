@@ -1,0 +1,22 @@
+title: SDP on BigQuery from a source table
+contracts: [contract.fluid.yaml]
+checks:
+  - {id: product_type, path: metadata.productType, equals: SDP}
+  - {id: layer, path: metadata.layer, equals: Bronze}
+  - {id: name, path: name, matches: '(.*[._-])?page_views_raw'}
+  - {id: domain, path: domain, equals: marketing}
+  - {id: owner_team, path: metadata.owner.team, equals: web-analytics}
+  - {id: expose, path: 'exposes[exposeId=page_views_raw].exposeId', equals: page_views_raw}
+  - id: columns
+    expose: page_views_raw
+    columns: {event_id: string, user_id: string, page_url: string, viewed_at: timestamp, referrer: string}
+  - {id: required, expose: page_views_raw, required: [event_id, page_url, viewed_at]}
+  - {id: user_id_pii, path: 'exposes[exposeId=page_views_raw].contract.schema[name=user_id].sensitivity', equals: pii}
+  - {id: event_id_unique, expose: page_views_raw, unique: event_id}
+  - {id: platform_gcp, path: 'exposes[exposeId=page_views_raw].binding.platform', equals: gcp}
+  - {id: format_bigquery_table, path: 'exposes[exposeId=page_views_raw].binding.format', equals: bigquery_table}
+  - {id: project, path: 'exposes[exposeId=page_views_raw].binding.location.project', equals: acme-web}
+  - {id: dataset, path: 'exposes[exposeId=page_views_raw].binding.location.dataset', equals: raw_web}
+  - {id: table, path: 'exposes[exposeId=page_views_raw].binding.location.table', equals: page_views}
+  - {id: every_15_minutes, cron: '*/15 * * * *'}
+  - {id: reads_source, contains: acme-web.landing.page_view_events}

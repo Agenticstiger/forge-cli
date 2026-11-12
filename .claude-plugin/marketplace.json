@@ -1,0 +1,15 @@
+{
+  "name": "forge-cli",
+  "description": "Agent Skills and hooks for building FLUID data products with the fluid CLI.",
+  "owner": {
+    "name": "Agentics Transformation Limited"
+  },
+  "plugins": [
+    {
+      "name": "fluid",
+      "source": "./fluid_build/agent_skills",
+      "description": "Author, compose, deploy and troubleshoot FLUID data product contracts with the fluid CLI.",
+      "category": "data"
+    }
+  ]
+}

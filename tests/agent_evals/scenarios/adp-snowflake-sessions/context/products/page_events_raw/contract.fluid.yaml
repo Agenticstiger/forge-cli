@@ -1,0 +1,47 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: web.page_events_raw
+name: page_events_raw
+description: Raw page events from the web tracker.
+domain: web
+metadata:
+  productType: SDP
+  layer: Bronze
+  owner:
+    team: web-analytics
+builds:
+- id: ingest_page_events
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: SELECT event_id, user_id, page_url, event_ts FROM WEB_SOURCE.PUBLIC.TRACKER_EVENTS
+  execution:
+    trigger:
+      type: schedule
+      cron: 0 * * * *
+    runtime:
+      platform: snowflake
+exposes:
+- exposeId: page_events
+  kind: table
+  binding:
+    platform: snowflake
+    format: snowflake_table
+    location:
+      database: WEB_RAW
+      schema: PUBLIC
+      table: PAGE_EVENTS
+  contract:
+    schema:
+    - name: event_id
+      type: string
+      required: true
+    - name: user_id
+      type: string
+      required: true
+    - name: page_url
+      type: string
+      required: true
+    - name: event_ts
+      type: timestamp
+      required: true

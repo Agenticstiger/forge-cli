@@ -1,0 +1,64 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: sales.daily_revenue
+name: daily_revenue
+description: Revenue and order count per day and country.
+domain: sales
+metadata:
+  productType: CDP
+  layer: Gold
+  owner:
+    team: sales-data
+consumes:
+- productId: sales.orders_enriched
+  exposeId: orders_enriched
+builds:
+- id: aggregate_revenue
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: >-
+      SELECT CAST(order_ts AS DATE) AS order_date, country, SUM(amount) AS revenue,
+      CAST(COUNT(*) AS INTEGER) AS order_count
+      FROM orders_enriched GROUP BY 1, 2
+    parameters:
+      inputs:
+      - name: orders_enriched
+        path: ../orders_enriched/runtime/out/orders_enriched.parquet
+        format: parquet
+  execution:
+    trigger:
+      type: schedule
+      cron: 0 4 * * *
+    runtime:
+      platform: local
+exposes:
+- exposeId: daily_revenue
+  kind: table
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: runtime/out/daily_revenue.parquet
+  contract:
+    schema:
+    - name: order_date
+      type: date
+      required: true
+    - name: country
+      type: string
+      required: true
+    - name: revenue
+      type: decimal(14,2)
+      required: true
+    - name: order_count
+      type: integer
+      required: true
+    dq:
+      rules:
+      - id: country_not_null
+        type: completeness
+        selector: country
+        threshold: 1.0
+        operator: '>='
+        severity: error

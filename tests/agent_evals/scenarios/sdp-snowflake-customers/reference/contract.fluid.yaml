@@ -1,0 +1,66 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: crm.customers_raw
+name: customers_raw
+description: Raw customers copied hourly from the CRM source table.
+domain: crm
+metadata:
+  productType: SDP
+  layer: Bronze
+  owner:
+    team: crm-data
+builds:
+- id: ingest_customers
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: >-
+      SELECT customer_id, email, full_name, created_at, country
+      FROM CRM_SOURCE.PUBLIC.CUSTOMERS
+  execution:
+    trigger:
+      type: schedule
+      cron: 0 * * * *
+    runtime:
+      platform: snowflake
+exposes:
+- exposeId: customers_raw
+  kind: table
+  description: One row per customer, as held in the CRM.
+  binding:
+    platform: snowflake
+    format: snowflake_table
+    location:
+      database: CRM_RAW
+      schema: PUBLIC
+      table: CUSTOMERS
+  contract:
+    schema:
+    - name: customer_id
+      type: string
+      required: true
+    - name: email
+      type: string
+      sensitivity: pii
+    - name: full_name
+      type: string
+      sensitivity: pii
+    - name: created_at
+      type: timestamp
+      required: true
+    - name: country
+      type: string
+    dq:
+      rules:
+      - id: customer_id_unique
+        type: uniqueness
+        selector: customer_id
+        threshold: 1.0
+        operator: '>='
+        severity: error
+      - id: customer_id_not_null
+        type: completeness
+        selector: customer_id
+        threshold: 1.0
+        operator: '>='
+        severity: error

@@ -1,0 +1,60 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: marketing.campaign_daily_performance
+name: campaign_daily_performance
+description: Impressions, clicks, spend and click-through rate per campaign and day.
+domain: marketing
+metadata:
+  productType: CDP
+  layer: Gold
+  classification: internal
+  owner:
+    team: growth-analytics
+consumes:
+- productId: marketing.campaign_touches
+  exposeId: campaign_touches
+builds:
+- id: build_campaign_daily
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: >-
+      SELECT campaign_id, DATE(touch_ts) AS day, SUM(impressions) AS impressions,
+      SUM(clicks) AS clicks, SUM(spend) AS spend,
+      SAFE_DIVIDE(SUM(clicks), SUM(impressions)) AS ctr
+      FROM `acme-marketing.silver.campaign_touches` GROUP BY campaign_id, day
+  execution:
+    trigger:
+      type: schedule
+      cron: 0 6 * * *
+    runtime:
+      platform: gcp
+exposes:
+- exposeId: campaign_daily_performance
+  kind: table
+  binding:
+    platform: gcp
+    format: bigquery_table
+    location:
+      project: acme-marketing
+      dataset: gold
+      table: campaign_daily_performance
+  contract:
+    schema:
+    - name: campaign_id
+      type: string
+      required: true
+    - name: day
+      type: date
+      required: true
+    - name: impressions
+      type: integer
+      required: true
+    - name: clicks
+      type: integer
+      required: true
+    - name: spend
+      type: decimal(14,2)
+      required: true
+    - name: ctr
+      type: decimal(8,6)

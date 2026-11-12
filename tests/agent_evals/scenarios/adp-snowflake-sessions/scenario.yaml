@@ -1,0 +1,27 @@
+title: ADP on Snowflake consuming a Snowflake SDP
+contracts: [products/sessions/contract.fluid.yaml]
+forge:
+  target_dir: products/sessions
+  args: [--from-product, products/page_events_raw/contract.fluid.yaml]
+checks:
+  - {id: product_type, path: metadata.productType, equals: ADP}
+  - {id: layer, path: metadata.layer, equals: Silver}
+  - {id: id, path: id, equals: web.sessions}
+  - {id: domain, path: domain, equals: web}
+  - {id: owner_team, path: metadata.owner.team, equals: web-analytics}
+  - id: consumes
+    consumes:
+      - {productId: web.page_events_raw, exposeId: page_events}
+  - {id: expose, path: 'exposes[exposeId=sessions].exposeId', equals: sessions}
+  - id: columns
+    expose: sessions
+    columns: {session_id: string, user_id: string, started_at: timestamp, ended_at: timestamp, page_count: integer}
+  - {id: required, expose: sessions, required: [session_id, user_id, started_at, ended_at, page_count]}
+  - {id: session_id_unique, expose: sessions, unique: session_id}
+  - {id: platform_snowflake, path: 'exposes[exposeId=sessions].binding.platform', equals: snowflake}
+  - {id: format_snowflake_table, path: 'exposes[exposeId=sessions].binding.format', equals: snowflake_table}
+  - {id: database, path: 'exposes[exposeId=sessions].binding.location.database', equals: WEB_SILVER}
+  - {id: schema, path: 'exposes[exposeId=sessions].binding.location.schema', equals: PUBLIC}
+  - {id: table, path: 'exposes[exposeId=sessions].binding.location.table', equals: SESSIONS}
+  - {id: daily_0530, cron: '30 5 * * *'}
+  - {id: reads_upstream_table, contains: WEB_RAW.PUBLIC.PAGE_EVENTS}

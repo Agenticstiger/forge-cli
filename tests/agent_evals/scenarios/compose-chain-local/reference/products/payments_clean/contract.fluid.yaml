@@ -1,0 +1,43 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: payments.payments_clean
+name: payments_clean
+domain: payments
+metadata:
+  productType: ADP
+  layer: Silver
+  owner:
+    team: payments-data
+consumes:
+- {productId: payments.payments_raw, exposeId: payments_raw}
+builds:
+- id: clean_payments
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: >-
+      SELECT DISTINCT payment_id, merchant_id, paid_at, CAST(amount AS DECIMAL(12,2)) AS amount, currency
+      FROM payments_raw
+    parameters:
+      inputs:
+      - {name: payments_raw, path: ../payments_raw/runtime/out/payments_raw.parquet, format: parquet}
+  execution:
+    trigger: {type: schedule, cron: 0 2 * * *}
+    runtime: {platform: local}
+exposes:
+- exposeId: payments_clean
+  kind: table
+  binding:
+    platform: local
+    format: parquet
+    location: {path: runtime/out/payments_clean.parquet}
+  contract:
+    schema:
+    - {name: payment_id, type: string, required: true}
+    - {name: merchant_id, type: string, required: true}
+    - {name: paid_at, type: timestamp, required: true}
+    - {name: amount, type: 'decimal(12,2)', required: true}
+    - {name: currency, type: string, required: true}
+    dq:
+      rules:
+      - {id: payment_id_unique, type: uniqueness, selector: payment_id, threshold: 1.0, operator: '>=', severity: error}

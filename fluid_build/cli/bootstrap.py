@@ -516,7 +516,7 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
         (
             _cmd(
                 "scaffold-ide",
-                "Generate agentic-IDE config (.kiro/, .cursor/rules/, .claude/, .clinerules/, or generic AGENTS.md + mcp.json) so any agentic IDE can drive forge-cli.",
+                "Generate agentic-IDE config (.kiro/, .cursor/rules/, .claude/, .clinerules/, or generic AGENTS.md + mcp.json) and install the FLUID Agent Skills so any agentic IDE can drive forge-cli.",
             ),
         ),
     ),

@@ -1,0 +1,80 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: sales.orders_enriched
+name: orders_enriched
+description: Orders joined with the customer's country.
+domain: sales
+metadata:
+  productType: ADP
+  layer: Silver
+  owner:
+    team: sales-data
+consumes:
+- productId: sales.orders_raw
+  exposeId: orders_raw
+- productId: sales.customers_raw
+  exposeId: customers_raw
+builds:
+- id: enrich_orders
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: >-
+      SELECT o.order_id, o.customer_id, o.order_ts, o.amount, o.currency, c.country
+      FROM orders_raw o JOIN customers_raw c ON o.customer_id = c.customer_id
+    parameters:
+      inputs:
+      - name: orders_raw
+        path: ../orders_raw/runtime/out/orders_raw.parquet
+        format: parquet
+      - name: customers_raw
+        path: ../customers_raw/runtime/out/customers_raw.parquet
+        format: parquet
+  execution:
+    trigger:
+      type: schedule
+      cron: 0 3 * * *
+    runtime:
+      platform: local
+exposes:
+- exposeId: orders_enriched
+  kind: table
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: runtime/out/orders_enriched.parquet
+  contract:
+    schema:
+    - name: order_id
+      type: string
+      required: true
+    - name: customer_id
+      type: string
+      required: true
+    - name: order_ts
+      type: timestamp
+      required: true
+    - name: amount
+      type: decimal(12,2)
+      required: true
+    - name: currency
+      type: string
+      required: true
+    - name: country
+      type: string
+      required: true
+    dq:
+      rules:
+      - id: order_id_unique
+        type: uniqueness
+        selector: order_id
+        threshold: 1.0
+        operator: '>='
+        severity: error
+      - id: country_not_null
+        type: completeness
+        selector: country
+        threshold: 1.0
+        operator: '>='
+        severity: error

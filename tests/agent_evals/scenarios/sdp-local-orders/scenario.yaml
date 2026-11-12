@@ -1,0 +1,20 @@
+title: SDP from a local CSV, the pilot's request
+# The 2026-11-06 pilot request, word for word. "a local DuckDB table" tests that no
+# duckdb format is invented; the owner is named without an email.
+contracts: [contract.fluid.yaml]
+checks:
+  - {id: product_type, path: metadata.productType, equals: SDP}
+  - {id: layer, path: metadata.layer, equals: Bronze}
+  - {id: name, path: name, matches: '(.*[._-])?orders_raw'}
+  - {id: domain, path: domain, equals: sales}
+  - {id: owner_team, path: metadata.owner.team, equals: sales-data}
+  - {id: expose, path: 'exposes[exposeId=orders_raw].exposeId', equals: orders_raw}
+  - id: columns
+    expose: orders_raw
+    columns: {order_id: string, customer_id: string, order_ts: timestamp, amount: decimal, currency: string}
+  - {id: required, expose: orders_raw, required: [order_id, customer_id, order_ts, amount, currency]}
+  - {id: customer_id_internal, path: 'exposes[exposeId=orders_raw].contract.schema[name=customer_id].sensitivity', equals: internal}
+  - {id: daily_0200, cron: '0 2 * * *'}
+  - {id: platform_local, path: 'exposes[exposeId=orders_raw].binding.platform', equals: local}
+  - {id: order_id_unique, expose: orders_raw, unique: order_id}
+  - {id: reads_source, contains: data/orders.csv}

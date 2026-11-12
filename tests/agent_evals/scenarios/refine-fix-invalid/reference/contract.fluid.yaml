@@ -1,0 +1,44 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: logistics.shipments_raw
+name: shipments_raw
+description: Raw shipments from the carrier CSV export.
+domain: logistics
+metadata:
+  productType: SDP
+  layer: Bronze
+  owner:
+    team: logistics-data
+builds:
+- id: ingest_shipments
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: SELECT * FROM read_csv_auto('data/shipments.csv', header=true)
+  execution:
+    trigger:
+      type: schedule
+      cron: 0 1 * * *
+    runtime:
+      platform: local
+exposes:
+- exposeId: shipments_raw
+  kind: table
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: runtime/out/shipments_raw.parquet
+  contract:
+    schema:
+    - name: shipment_id
+      type: string
+      required: true
+    - name: order_id
+      type: string
+      required: true
+    - name: shipped_at
+      type: timestamp
+      required: true
+    - name: carrier
+      type: string
