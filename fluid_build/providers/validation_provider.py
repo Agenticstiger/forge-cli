@@ -322,3 +322,16 @@ class ValidationProvider(ABC):
                 path="contract.dq.rules",
             )
         ]
+
+    def run_quality_results(
+        self,
+        resource_spec: Dict[str, Any],
+        rules: List[Dict[str, Any]],
+    ) -> Optional[List[Any]]:
+        """Every rule's ``QualityCheckResult``, the passing ones included.
+
+        ``None`` (the default) means this provider reports failures only,
+        through :meth:`run_quality_checks`. A provider that returns the full
+        list lets a report record what each passing rule measured, too.
+        """
+        return None

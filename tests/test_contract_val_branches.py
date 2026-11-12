@@ -328,18 +328,20 @@ class TestProviderDetection:
         }
         mock_result = MagicMock(is_valid=True, errors=[], warnings=[])
         mock_schema.return_value.validate_contract.return_value = mock_result
+        from fluid_build.providers.databricks_validation import DatabricksValidationProvider
+
         v = ContractValidator(
             contract_path=Path("test.yaml"), use_cache=False, track_history=False, check_data=False
         )
-        report = v.validate()
-        # No live Unity Catalog check yet: a warning, never an "unknown provider" error
-        warnings = [
-            i
-            for i in report.issues
-            if i.message
-            == "Live validation against Unity Catalog is not available for provider 'databricks' yet"
-        ]
-        assert len(warnings) == 1
+        with (
+            patch("fluid_build.cli.contract_validation.DATABRICKS_VALIDATION_AVAILABLE", True),
+            patch.object(DatabricksValidationProvider, "validate_connection", return_value=True),
+        ):
+            report = v.validate()
+        # The Unity Catalog provider, never an "unknown provider" error
+        assert report.provider_name == "databricks"
+        assert isinstance(v.validation_provider, DatabricksValidationProvider)
+        assert not any("Unknown provider" in i.message for i in report.issues)
 
     @patch("fluid_build.cli.contract_validation.load_contract_with_overlay")
     @patch("fluid_build.cli.contract_validation.FluidSchemaManager")
