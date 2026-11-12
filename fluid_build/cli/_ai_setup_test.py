@@ -235,34 +235,62 @@ def _resolve_cloud_api_key(
         return None
 
 
-def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[str]]:
+def _untested_agent_message(named: Optional[str]) -> Optional[str]:
+    """Why ``fluid ai test`` does not test *named*, when it is an agent; else ``None``.
+
+    Forge hands an agent's calls to its CLI, or to the IDE for ``mcp-sampling``,
+    so there is no API call to test. Any spelling forge accepts counts
+    (``MCP-Sampling``, ``claude_code``): the registry does not list
+    ``mcp-sampling``, so the name is normalized here.
+    """
+    # From ``providers``, never ``provider_resolve`` first (a circular import).
+    from fluid_build.llm.providers import _NON_LITELLM_PROVIDERS, _canonical_provider_name
+
+    agent = (_canonical_provider_name(named) or "").lower().replace("_", "-")
+    if agent not in _NON_LITELLM_PROVIDERS:
+        return None
+    if agent == "mcp-sampling":
+        return (
+            "fluid ai test does not test mcp-sampling: the IDE that runs forge's MCP "
+            "server answers those calls with its own model."
+        )
+    return (
+        f"fluid ai test does not test {agent}: forge hands its calls to that agent's "
+        "CLI, which signs in by itself. 'fluid doctor' checks that the CLI is installed."
+    )
+
+
+def _key_variable_choice() -> tuple[Optional[str], Optional[str]]:
+    """The provider the key variables select, as in forge, else why none.
+
+    One provider's key variables select it (never ``GITHUB_API_KEY``;
+    ``OLLAMA_HOST`` is checked after this). Two or more providers' select none:
+    exactly one keyring key then decides. Returns ``(provider, None)``,
+    ``(None, message)`` to stop, or ``(None, None)`` when no key variable applies.
+    """
     # From ``providers``, never ``provider_resolve`` first (a circular import).
     from fluid_build.llm.providers import (
-        _NON_LITELLM_PROVIDERS,
-        _canonical_provider_name,
         _explicit_key_signals,
         _infer_provider_from_keyring,
         ambiguous_keys_message,
-        named_llm_provider,
     )
+
+    ambiguous = ambiguous_keys_message(os.environ)
+    if ambiguous:
+        kept = _infer_provider_from_keyring()
+        return (kept, None) if kept else (None, ambiguous)
+    return next((p for p in _explicit_key_signals(os.environ) if p != "ollama"), None), None
+
+
+def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[str]]:
+    from fluid_build.llm.providers import named_llm_provider
 
     # The provider the run names, read as forge reads it: --llm-provider, then
     # FLUID_LLM_PROVIDER, then FLUID_FORGE_AGENT.
     named = named_llm_provider(args, os.environ)
-    # Any spelling forge accepts (``MCP-Sampling``, ``claude_code``): the
-    # registry does not list ``mcp-sampling``, so lower-case it here.
-    agent = (_canonical_provider_name(named) or "").lower()
-    if agent in _NON_LITELLM_PROVIDERS:
-        agent = agent.replace("_", "-")
-        if agent == "mcp-sampling":
-            return None, (
-                "fluid ai test does not test mcp-sampling: the IDE that runs forge's MCP "
-                "server answers those calls with its own model."
-            )
-        return None, (
-            f"fluid ai test does not test {agent}: forge hands its calls to that agent's "
-            "CLI, which signs in by itself. 'fluid doctor' checks that the CLI is installed."
-        )
+    untested = _untested_agent_message(named)
+    if untested:
+        return None, untested
     provider_override = _normalize_ai_test_provider(named)
     model_override = getattr(args, "llm_model", None) or os.environ.get("FLUID_LLM_MODEL")
     endpoint_override = getattr(args, "llm_endpoint", None) or os.environ.get("FLUID_LLM_ENDPOINT")
@@ -305,52 +333,30 @@ def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[st
             return None, f"No API key found for {PROVIDER_DISPLAY_NAMES.get(pname, pname)}."
         endpoint = endpoint_override or saved_for_provider.get("endpoint")
         config = _make_cloud_config(pname, api_key, model=model, endpoint=endpoint)
+        config.timeout_seconds = timeout
         if config.endpoint:
             endpoint_error = _validate_ai_test_endpoint(pname, config.endpoint)
             if endpoint_error:
                 return None, endpoint_error
-        return (
-            config,
-            None,
-        )
+        return config, None
 
     if provider_override:
-        config, error = _build_for_provider(provider_override, named=True)
-        if config:
-            config.timeout_seconds = timeout
-        return config, error
+        return _build_for_provider(provider_override, named=True)
 
     if saved.get("provider"):
         config, error = _build_for_provider(str(saved["provider"]))
         if config:
-            config.timeout_seconds = timeout
             return config, None
         LOG.debug("Saved AI config was not test-ready: %s", error)
 
-    # One provider's key variables, the ones forge reads: never GITHUB_API_KEY.
-    # Two or more providers' (OLLAMA_HOST names Ollama) select none: as in
-    # forge, exactly one keyring key then decides, else the test stops.
-    ambiguous = ambiguous_keys_message(os.environ)
-    if ambiguous:
-        kept = _infer_provider_from_keyring()
-        if not kept:
-            return None, ambiguous
-        config, error = _build_for_provider(kept, allow_saved=False)
-        if config:
-            config.timeout_seconds = timeout
-        return config, error
-    for pname in _explicit_key_signals(os.environ):
-        if pname != "ollama":
-            config, error = _build_for_provider(pname, allow_saved=False)
-            if config:
-                config.timeout_seconds = timeout
-            return config, error
+    pname, stop = _key_variable_choice()
+    if stop:
+        return None, stop
+    if pname:
+        return _build_for_provider(pname, allow_saved=False)
 
     if os.environ.get("OLLAMA_HOST") or detect_ollama_available(os.environ):
-        config, error = _build_for_provider("ollama", allow_saved=False)
-        if config:
-            config.timeout_seconds = timeout
-        return config, error
+        return _build_for_provider("ollama", allow_saved=False)
 
     return None, "No AI provider configured. Run 'fluid ai setup' or set a provider API key."
 

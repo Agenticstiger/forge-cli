@@ -378,6 +378,27 @@ def _session_env_is_restored(monkeypatch):
             os.environ[name] = value
 
 
+@pytest.fixture
+def no_llm_key_variables(monkeypatch):
+    """No provider key variable or LLM selector is set.
+
+    Provider selection reads the key variables (``OPENAI_API_KEY``,
+    ``ANTHROPIC_API_KEY``, ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``,
+    ``OLLAMA_HOST``) and the named selectors from the environment. A test that
+    needs none of them set asks for this fixture.
+    """
+    for name in (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OLLAMA_HOST",
+        "FLUID_LLM_PROVIDER",
+        "FLUID_FORGE_AGENT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _noop_assert_safe_url(url, *, allow_private=False):  # noqa: ARG001
     """Replacement for safe_http.assert_safe_url used in unit tests.
 

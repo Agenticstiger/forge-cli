@@ -40,21 +40,13 @@ def test_inline_setup_loads_saved_coding_agent_keyless(monkeypatch):
     assert cfg.api_key is None
 
 
+@pytest.mark.usefixtures("no_llm_key_variables")
 def test_inline_setup_auto_selects_claude_code_when_only_agent(monkeypatch):
     # No saved config, no cloud key, no Ollama, claude on PATH, non-interactive
     # -> step 4.5 auto-selects keyless Claude Code (mirrors the Ollama branch).
     monkeypatch.setattr(ai_setup, "_ai_setup_skipped", False, raising=False)
     monkeypatch.setattr(ai_setup, "_load_ai_config", lambda: None)
     monkeypatch.setattr(ai_setup, "PROVIDER_ENV_VARS", {}, raising=False)
-    # Setup reads the key variables from the environment: none may be set.
-    for var in (
-        "OLLAMA_HOST",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-    ):
-        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(ai_setup, "detect_ollama_available", lambda env: False)
     monkeypatch.setattr(
         ai_setup.shutil, "which", lambda b: "/usr/local/bin/claude" if b == "claude" else None
@@ -150,20 +142,12 @@ def test_offer_import_env_key_skips_on_shape_mismatch(monkeypatch):
     assert called["asked"] is False
 
 
+@pytest.mark.usefixtures("no_llm_key_variables")
 def test_inline_setup_no_agent_no_key_returns_none(monkeypatch):
     # Nothing available + non-interactive -> None (existing behavior preserved).
     monkeypatch.setattr(ai_setup, "_ai_setup_skipped", False, raising=False)
     monkeypatch.setattr(ai_setup, "_load_ai_config", lambda: None)
     monkeypatch.setattr(ai_setup, "PROVIDER_ENV_VARS", {}, raising=False)
-    # Setup reads the key variables from the environment: none may be set.
-    for var in (
-        "OLLAMA_HOST",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-    ):
-        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(ai_setup, "detect_ollama_available", lambda env: False)
     monkeypatch.setattr(ai_setup.shutil, "which", lambda b: None)
     monkeypatch.setattr(ai_setup.sys, "stdin", types.SimpleNamespace(isatty=lambda: False))

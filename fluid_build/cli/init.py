@@ -902,6 +902,36 @@ def _ensure_gitignore_template(workspace_root: Path) -> None:
         pass  # Best-effort — gitignore is a nice-to-have, not load-bearing.
 
 
+def _setup_ai_mode_llm(args) -> str:
+    """Pick the LLM for ``fluid init``'s AI path, as ``fluid forge``'s ``run()`` does.
+
+    A provider the operator named (``FLUID_LLM_PROVIDER``, ``FLUID_FORGE_AGENT``)
+    skips inline setup. Otherwise setup fills only what the run leaves unstated
+    (``FLUID_LLM_MODEL`` and ``FLUID_LLM_ENDPOINT`` win). Returns ``"ready"``,
+    ``"stop"`` when setup named the keys of two or more providers and chose
+    none, or ``"template"`` when no provider is available.
+    """
+    from fluid_build._optional import is_available
+    from fluid_build.llm.providers import (
+        ambiguous_keys_message,
+        fill_llm_args_from_setup,
+        named_llm_provider,
+    )
+
+    from .ai_setup import run_ai_setup_inline, set_session_env
+
+    if named_llm_provider(args):
+        return "ready"
+    llm_config = run_ai_setup_inline(console if RICH_AVAILABLE else None)
+    if llm_config:
+        if fill_llm_args_from_setup(args, llm_config) and llm_config.api_key:
+            set_session_env(llm_config.provider, llm_config.api_key)
+        return "ready"
+    if is_available("litellm") and ambiguous_keys_message(os.environ):
+        return "stop"
+    return "template"
+
+
 def _ai_mode(args, logger: logging.Logger) -> int:
     """Let AI design the data product — delegates to forge copilot inline."""
     if RICH_AVAILABLE:
@@ -916,29 +946,14 @@ def _ai_mode(args, logger: logging.Logger) -> int:
         )
 
     try:
-        from fluid_build.llm.providers import fill_llm_args_from_setup, named_llm_provider
-
-        from .ai_setup import run_ai_setup_inline, set_session_env
         from .forge import run_ai_copilot_mode
 
-        # Run inline LLM setup — same as forge.py:run() does: not for a provider
-        # the operator named (FLUID_LLM_PROVIDER, FLUID_FORGE_AGENT), and it
-        # fills only what the run leaves unstated (FLUID_LLM_MODEL and
-        # FLUID_LLM_ENDPOINT win).
-        _console = console if RICH_AVAILABLE else None
-        named = named_llm_provider(args)
-        llm_config = None if named else run_ai_setup_inline(_console)
-        if llm_config:
-            if fill_llm_args_from_setup(args, llm_config) and llm_config.api_key:
-                set_session_env(llm_config.provider, llm_config.api_key)
-        elif not named:
-            from fluid_build._optional import is_available
-            from fluid_build.llm.providers import ambiguous_keys_message
-
-            if is_available("litellm") and ambiguous_keys_message(os.environ):
-                # Setup named the keys of two or more providers and chose none:
-                # stop, as forge does without a TTY, rather than write a template.
-                return 1
+        choice = _setup_ai_mode_llm(args)
+        if choice == "stop":
+            # Setup named the keys of two or more providers and chose none:
+            # stop, as forge does without a TTY, rather than write a template.
+            return 1
+        if choice == "template":
             if RICH_AVAILABLE:
                 from .forge_dialogs import print_dialog_status
 
