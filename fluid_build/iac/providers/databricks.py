@@ -2381,12 +2381,14 @@ class DatabricksIacPlugin:
         dry_run: bool = False,
         client_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
-        """Before ``tofu apply``: refuse a metric view whose name an object this module did
-        not create holds (``databricks_metrics.pre_apply``), then bind the contract's column
-        masks and row filter on the tables that already exist
-        (``databricks_enforce.pre_apply``), so a grant the apply adds lands on a protected
-        table. With ``dry_run`` it prints every statement the hooks would run, and runs none.
-        Raises :class:`UnsupportedBindingError` to stop the run before the apply."""
+        """Before ``tofu apply``: check the Genie space's client (``databricks_genie.preflight``);
+        settle the metric views (``databricks_metrics.pre_apply``: refuse a name an object this
+        module did not create holds, revoke readers the contract no longer names, drop this
+        product's views it no longer declares); then bind the contract's column masks and row
+        filter on the tables that already exist (``databricks_enforce.pre_apply``), so a grant
+        the apply adds lands on a protected table. With ``dry_run`` it prints every statement
+        the hooks would run, and runs none. Raises :class:`UnsupportedBindingError` to stop the
+        run before the apply."""
         targets, views = self._hook_state(contract)
         say = say or print
         if dry_run:
