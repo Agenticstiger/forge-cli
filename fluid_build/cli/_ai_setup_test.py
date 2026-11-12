@@ -236,22 +236,26 @@ def _resolve_cloud_api_key(
 
 
 def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[str]]:
-    from fluid_build.llm.provider_resolve import (
+    # From ``providers``, never ``provider_resolve`` first (a circular import).
+    from fluid_build.llm.providers import (
+        _NON_LITELLM_PROVIDERS,
         _canonical_provider_name,
         _explicit_key_signals,
         _infer_provider_from_keyring,
         ambiguous_keys_message,
+        named_llm_provider,
     )
-    from fluid_build.llm.providers import _NON_LITELLM_PROVIDERS, named_llm_provider
 
     # The provider the run names, read as forge reads it: --llm-provider, then
     # FLUID_LLM_PROVIDER, then FLUID_FORGE_AGENT.
     named = named_llm_provider(args, os.environ)
-    agent = _canonical_provider_name(named)
+    # Any spelling forge accepts (``MCP-Sampling``, ``claude_code``): the
+    # registry does not list ``mcp-sampling``, so lower-case it here.
+    agent = (_canonical_provider_name(named) or "").lower()
     if agent in _NON_LITELLM_PROVIDERS:
         return None, (
-            f"fluid ai test does not test {agent}: forge hands its calls to that agent, "
-            "which signs in by itself. 'fluid doctor' checks that it is installed."
+            f"fluid ai test does not test {agent.replace('_', '-')}: forge hands its calls "
+            "to that agent, which signs in by itself. 'fluid doctor' checks that it is installed."
         )
     provider_override = _normalize_ai_test_provider(named)
     model_override = getattr(args, "llm_model", None) or os.environ.get("FLUID_LLM_MODEL")

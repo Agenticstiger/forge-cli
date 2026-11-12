@@ -1523,7 +1523,8 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
     #    (OLLAMA_HOST names Ollama) select none: as without a TTY, exactly one
     #    keyring key then decides, else setup names them and stops.
     if has_litellm:
-        from fluid_build.llm.provider_resolve import (
+        # From ``providers``, never ``provider_resolve`` first (a circular import).
+        from fluid_build.llm.providers import (
             _explicit_key_signals,
             _infer_provider_from_keyring,
             _resolve_api_key,

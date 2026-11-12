@@ -543,12 +543,14 @@ def _is_ai_configured() -> bool:
     except Exception:  # pragma: no cover — import guard for partial installs
         return False
 
-    from fluid_build.llm.provider_resolve import (
+    # From ``providers``: importing ``provider_resolve`` first is a circular import,
+    # and a plain ``fluid init`` has loaded neither by now.
+    from fluid_build.llm.providers import (
         _infer_provider_from_explicit_keys,
         _infer_provider_from_keyring,
         ambiguous_keys_message,
+        named_llm_provider,
     )
-    from fluid_build.llm.providers import named_llm_provider
 
     if named_llm_provider(None):
         return True
@@ -936,7 +938,9 @@ def _ai_mode(args, logger: logging.Logger) -> int:
                 print_dialog_status(
                     console,
                     status="info",
-                    message="No AI provider configured — using template mode instead.",
+                    # "selected": setup also returns nothing when keys for two
+                    # providers are set, after naming them.
+                    message="No AI provider selected — using template mode instead.",
                     detail="Run 'fluid ai setup' anytime to enable AI-assisted generation.",
                 )
             args.template = "customer-360"

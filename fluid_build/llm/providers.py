@@ -1691,14 +1691,21 @@ def call_llm_streaming(
 # extracted to ``cli/_llm_provider_resolve.py``. Re-exported here
 # under the same names so existing call sites and test patches keep
 # resolving.
+# Import these from here, not from ``provider_resolve``: that module binds this
+# one's names when it loads, so importing it first is a circular import.
 from fluid_build.llm.provider_resolve import (  # noqa: E402,F401
     _LLM_KEYRING_PREFIX,
+    _canonical_provider_name,
+    _explicit_key_signals,
     _get_api_key_from_keyring,
     _infer_provider_from_env,
+    _infer_provider_from_explicit_keys,
+    _infer_provider_from_keyring,
     _keyring_key,
     _lean_keyless_autopick,
     _resolve_api_key,
     _saved_choice_for,
+    ambiguous_keys_message,
     clear_api_key_from_keyring,
     no_provider_message,
     save_api_key_to_keyring,

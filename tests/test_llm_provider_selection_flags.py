@@ -679,3 +679,56 @@ def test_ai_test_says_it_does_not_test_a_named_agent(world: _World, value: str) 
 
     assert config is None
     assert f"does not test {value}" in error
+
+
+# ── 5. review follow-up: the helpers load in a fresh interpreter ───────────
+
+
+_FRESH_CALLS = (
+    "from fluid_build.cli.init import _is_ai_configured; print(_is_ai_configured())",
+    "from argparse import Namespace; from fluid_build.cli.ai_setup import _resolve_ai_test_config; "
+    "print(_resolve_ai_test_config(Namespace(llm_provider=None, llm_model=None, "
+    "llm_endpoint=None, llm_timeout_seconds=None))[1])",
+    "from fluid_build.cli.ai_setup import run_ai_setup_inline; print(run_ai_setup_inline(None))",
+)
+
+
+@pytest.mark.parametrize("call", _FRESH_CALLS, ids=["init", "ai-test", "setup"])
+def test_the_helpers_work_in_a_fresh_interpreter(tmp_path: Path, call: str) -> None:
+    # ``provider_resolve`` and ``providers`` import each other, so importing
+    # ``provider_resolve`` first fails. ``fluid init`` loads neither before its
+    # post-init check, which then raised and lost the "first data product" offer.
+    import subprocess
+
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+        "PYTHON_KEYRING_BACKEND": "keyring.backends.null.Keyring",
+        # Two providers' keys: every call stops before it could probe an Ollama.
+        "OPENAI_API_KEY": OPENAI_KEY,
+        "ANTHROPIC_API_KEY": ANTHROPIC_KEY,
+        "HTTP_PROXY": "http://127.0.0.1:9",
+        "HTTPS_PROXY": "http://127.0.0.1:9",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", call],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
+@pytest.mark.parametrize("spelling", ["MCP-Sampling", "Mcp_Sampling", "Claude-Code", "claude_code"])
+def test_ai_test_knows_an_agent_in_any_spelling(world: _World, spelling: str) -> None:
+    world.monkeypatch.setenv("FLUID_LLM_PROVIDER", spelling)
+
+    config, error = _ai_test()
+
+    assert config is None
+    assert "does not test" in error
+    assert spelling.lower().replace("_", "-") in error
