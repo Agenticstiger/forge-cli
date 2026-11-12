@@ -329,7 +329,7 @@ class TestRefusals:
         contract = _contract()
         contract["consumes"] = []
         text = self._refused(tmp_path, contract, "reference")
-        assert "consumes[] does not list crm.customers_v1" in text
+        assert "consumes[] does not list 'crm.customers_v1'" in text
 
     def test_a_user_file_where_a_test_goes_is_refused(self, tmp_path):
         _project(tmp_path)

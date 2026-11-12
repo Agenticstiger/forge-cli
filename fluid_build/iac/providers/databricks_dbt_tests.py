@@ -42,7 +42,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from ...util.contract import builds_writing_expose
 from ...util.dq_checks import DqCheck, describe, has_rules, read_rules
@@ -121,12 +121,10 @@ def compile_tests(
     if not has_rules(exposures):
         return out
     rules = read_rules(contract, exposures)
-    for refused in rules.refusals:
-        out.refusals.append(
-            _refusal(
-                "rule", f"{where} expose {refused.expose_id!r}: {refused.message}.", refused.fix
-            )
-        )
+    out.refusals.extend(
+        _refusal("rule", f"{where} expose {r.expose_id!r}: {r.message}.", r.fix)
+        for r in rules.refusals
+    )
     if git:
         out.refusals.append(
             _refusal(
@@ -137,69 +135,96 @@ def compile_tests(
                 "Point repository at the local dbt project (fluid apply uploads it).",
             )
         )
+    if git or files is None or out.refusals:
         return out
-    if files is None or out.refusals:
+    project = _Project(files)
+    models = {
+        table.expose_id: _model(build, table, project, where, out.refusals) for table in tables
+    }
+    folder = _test_folder(project, where, out.refusals)
+    if folder is None or out.refusals:
         return out
-
-    project = _project_paths(files)
-    present = {rel for rel, _ in files}
-    sources = None
-    models: Dict[str, str] = {}
-    for table in tables:
-        model = _model(build, table, project["model-paths"], present, where, out.refusals)
-        if model is not None:
-            models[table.expose_id] = model
-    if out.refusals:
-        return out
-    if not project["test-paths"]:
-        out.refusals.append(
-            _refusal(
-                "test-path",
-                f"{where} dbt_project.yml sets test-paths to an empty list, so dbt reads no "
-                "test file and the contract rules would not run.",
-                "Leave test-paths out (dbt reads tests/), or name a directory.",
-            )
-        )
-        return out
-    folder = PurePosixPath(project["test-paths"][0]) / TEST_DIR
     for check in rules.checks:
-        model = models[check.expose_id]
-        source = None
-        if check.reference is not None:
-            if sources is None:
-                sources = _declared_sources(files)
-            source = _source_for(check, sources, where, out.refusals)
-            if source is None:
-                continue
-        try:
-            text = render(check, model, source)
-        except ValueError:
-            out.refusals.append(
-                _refusal(
-                    "column",
-                    f"{where} rule {check.rule_id!r} on expose {check.expose_id!r} reads a "
-                    "column whose name is not a plain identifier (letters, digits and _), and "
-                    "the tests name columns only that way.",
-                    "Rename the column in the contract and the model.",
-                )
-            )
-            continue
-        path = str(folder / model / f"{check.name}.sql")
-        if path in present:
-            out.refusals.append(
-                _refusal(
-                    "path",
-                    f"{where} the dbt project already holds {path}, where forge-cli writes the "
-                    f"test for rule {check.rule_id!r}: {folder}/ is the generated tests' folder.",
-                    f"Move the file out of {folder}/.",
-                )
-            )
-            continue
-        out.files.append((path, text.encode("utf-8")))
-        out.tests.append(DqTest(check=check, model=model, path=path))
+        _add_test(out, check, str(models[check.expose_id]), folder, project, where)
     if out.refusals:
         out.files, out.tests = [], []
     return out
+
+
+class _Project:
+    """The uploaded dbt project as the tests read it: its paths, and its declared sources."""
+
+    def __init__(self, files: Sequence[Tuple[str, bytes]]) -> None:
+        self.files = files
+        self.present = {rel for rel, _ in files}
+        paths = _project_paths(files)
+        self.model_paths, self.test_paths = paths["model-paths"], paths["test-paths"]
+        self._sources: Optional[Dict[str, List[Tuple[str, str]]]] = None
+
+    @property
+    def sources(self) -> Dict[str, List[Tuple[str, str]]]:
+        if self._sources is None:
+            self._sources = _declared_sources(self.files)
+        return self._sources
+
+
+def _test_folder(
+    project: _Project, where: str, refusals: List[UnsupportedBindingError]
+) -> Optional[PurePosixPath]:
+    """``<first test path>/fluid_dq``, where the generated tests go."""
+    if project.test_paths:
+        return PurePosixPath(project.test_paths[0]) / TEST_DIR
+    refusals.append(
+        _refusal(
+            "test-path",
+            f"{where} dbt_project.yml sets test-paths to an empty list, so dbt reads no "
+            "test file and the contract rules would not run.",
+            "Leave test-paths out (dbt reads tests/), or name a directory.",
+        )
+    )
+    return None
+
+
+def _add_test(
+    out: CompiledTests,
+    check: DqCheck,
+    model: str,
+    folder: PurePosixPath,
+    project: _Project,
+    where: str,
+) -> None:
+    """The file for ``check`` into ``out``, or its refusal."""
+    source = None
+    if check.reference is not None:
+        source = _source_for(check, project.sources, where, out.refusals)
+        if source is None:
+            return
+    try:
+        text = render(check, model, source)
+    except ValueError:
+        out.refusals.append(
+            _refusal(
+                "column",
+                f"{where} rule {check.rule_id!r} on expose {check.expose_id!r} reads a "
+                "column whose name is not a plain identifier (letters, digits and _), and "
+                "the tests name columns only that way.",
+                "Rename the column in the contract and the model.",
+            )
+        )
+        return
+    path = str(folder / model / f"{check.name}.sql")
+    if path in project.present:
+        out.refusals.append(
+            _refusal(
+                "path",
+                f"{where} the dbt project already holds {path}, where forge-cli writes the "
+                f"test for rule {check.rule_id!r}: {folder}/ is the generated tests' folder.",
+                f"Move the file out of {folder}/.",
+            )
+        )
+        return
+    out.files.append((path, text.encode("utf-8")))
+    out.tests.append(DqTest(check=check, model=model, path=path))
 
 
 def expected_tests(contract: Mapping[str, Any], build: Mapping[str, Any]) -> List[DqCheck]:
@@ -246,8 +271,7 @@ def _project_paths(files: Sequence[Tuple[str, bytes]]) -> Dict[str, List[str]]:
 def _model(
     build: Mapping[str, Any],
     table: Any,
-    model_paths: Sequence[str],
-    present: Sequence[str],
+    project: _Project,
     where: str,
     refusals: List[UnsupportedBindingError],
 ) -> Optional[str]:
@@ -257,11 +281,12 @@ def _model(
     outputs = build.get("outputs") if isinstance(build.get("outputs"), list) else []
     named = props.get("model")
     model = str(named) if named and len(outputs) <= 1 else str(table.name)
+    model_paths = project.model_paths
     found = any(
         PurePosixPath(rel).stem == model
         and PurePosixPath(rel).suffix in (".sql", ".py")
         and any(rel.startswith(f"{path}/") for path in model_paths)
-        for rel in present
+        for rel in project.present
     )
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", model) or not found:
         refusals.append(
@@ -280,10 +305,19 @@ def _model(
 
 def _declared_sources(files: Sequence[Tuple[str, bytes]]) -> Dict[str, List[Tuple[str, str]]]:
     """``{source table name: [(source name, table name)]}`` from every properties file the
-    upload carries. A file that does not parse is passed over: dbt reports it itself."""
+    upload carries."""
+    found: Dict[str, List[Tuple[str, str]]] = {}
+    for doc in _properties_docs(files):
+        for source_name, table_name in _source_tables(doc):
+            found.setdefault(table_name.lower(), []).append((source_name, table_name))
+    return found
+
+
+def _properties_docs(files: Sequence[Tuple[str, bytes]]) -> Iterator[Mapping[str, Any]]:
+    """Each YAML document of the upload but dbt's top-level project files. One that does not
+    parse is passed over: dbt reports it itself."""
     import yaml
 
-    found: Dict[str, List[Tuple[str, str]]] = {}
     for rel, data in files:
         if PurePosixPath(rel).suffix not in (".yml", ".yaml") or rel in _PROJECT_YAML:
             continue
@@ -291,14 +325,20 @@ def _declared_sources(files: Sequence[Tuple[str, bytes]]) -> Dict[str, List[Tupl
             doc = yaml.safe_load(data.decode("utf-8"))
         except (UnicodeDecodeError, yaml.YAMLError):
             continue
-        for source in doc.get("sources") or [] if isinstance(doc, Mapping) else []:
-            if not isinstance(source, Mapping) or not isinstance(source.get("name"), str):
-                continue
-            for table in source.get("tables") or []:
-                if isinstance(table, Mapping) and isinstance(table.get("name"), str):
-                    pair = (source["name"], table["name"])
-                    found.setdefault(table["name"].lower(), []).append(pair)
-    return found
+        if isinstance(doc, Mapping):
+            yield doc
+
+
+def _source_tables(doc: Mapping[str, Any]) -> Iterator[Tuple[str, str]]:
+    """``(source name, table name)`` for each table a properties document declares."""
+    sources = doc.get("sources")
+    for source in sources if isinstance(sources, list) else []:
+        if not isinstance(source, Mapping) or not isinstance(source.get("name"), str):
+            continue
+        tables = source.get("tables")
+        for table in tables if isinstance(tables, list) else []:
+            if isinstance(table, Mapping) and isinstance(table.get("name"), str):
+                yield source["name"], table["name"]
 
 
 def _source_for(
@@ -314,10 +354,10 @@ def _source_for(
             _refusal(
                 "reference",
                 f"{where} rule {check.rule_id!r} on expose {check.expose_id!r} checks that every "
-                f"{check.column} exists in {reference.product_id}.{reference.column}, and "
-                f"consumes[] does not list {reference.product_id}: a dbt test reads the other "
+                f"{check.column} exists in {reference.product_id!r}.{reference.column!r}, and "
+                f"consumes[] does not list {reference.product_id!r}: a dbt test reads the other "
                 "product from the dbt source the project declares for the expose it consumes.",
-                f"List {reference.product_id} in consumes[] with the exposeId of its table, and "
+                f"List {reference.product_id!r} in consumes[] with the exposeId of its table, and "
                 "declare that table as a dbt source the model reads.",
             )
         )
@@ -330,12 +370,12 @@ def _source_for(
         _refusal(
             "reference",
             f"{where} rule {check.rule_id!r} on expose {check.expose_id!r} checks that every "
-            f"{check.column} exists in {reference.product_id}.{reference.column}, read from the "
+            f"{check.column} exists in {reference.product_id!r}.{reference.column!r}, read from the "
             f"dbt source table named {reference.expose_id!r} (the expose this product consumes "
             "it by), and the project declares "
             + (f"{len(candidates)} ({listed})." if candidates else "none."),
-            f"Declare exactly one dbt source table named {reference.expose_id} for "
-            f"{reference.product_id}, as the model reads it.",
+            f"Declare exactly one dbt source table named {reference.expose_id!r} for "
+            f"{reference.product_id!r}, as the model reads it.",
         )
     )
     return None
@@ -532,7 +572,8 @@ def _schema_sql(check: DqCheck, ref: str) -> str:
         "{%- endif -%}\n"
         "{%- for problem in problems %}\n"
         "select '{{ problem[0] }}' as column_name, '{{ problem[1] }}' as problem,"
-        " '{{ problem[2] }}' as expected_type,"
+        ' \'{{ problem[2] | replace("\\\\", "\\\\\\\\") | replace("\'", "\\\\\'") }}\''
+        " as expected_type,"
         ' \'{{ problem[3] | replace("\\\\", "\\\\\\\\") | replace("\'", "\\\\\'") }}\''
         " as actual_type\n"
         "{%- if not loop.last %}\nunion all{% endif %}\n"
@@ -557,6 +598,15 @@ def results(logs: str) -> Dict[str, Tuple[str, Optional[int]]]:
     return found
 
 
+def _outcome(status: Optional[str], failures: Optional[int], truncated: bool) -> str:
+    """What dbt said of one test, in words."""
+    if status is None:
+        return "not in the task's output" + (" (Databricks kept only its end)" if truncated else "")
+    if failures is not None:
+        return f"{status} {failures} {'row' if failures == 1 else 'rows'}"
+    return status
+
+
 def report(logs: str, checks: Sequence[DqCheck], *, truncated: bool = False) -> List[str]:
     """Lines for ``fluid apply``: a summary, then one line per contract rule's test with what
     dbt printed for it. Empty when the build tests no rule."""
@@ -576,15 +626,7 @@ def report(logs: str, checks: Sequence[DqCheck], *, truncated: bool = False) -> 
         status, failures = found.get(check.name, (None, None))
         key = status or "MISSING"
         tally[key] = tally.get(key, 0) + 1
-        if status is None:
-            outcome = "not in the task's output" + (
-                " (Databricks kept only its end)" if truncated else ""
-            )
-        elif failures is not None:
-            unit = "row" if failures == 1 else "rows"
-            outcome = f"{status} {failures} {unit}"
-        else:
-            outcome = status
+        outcome = _outcome(status, failures, truncated)
         lines.append(
             f"     {marks.get(key, '?')} {check.name}: {outcome} - {describe(check)}, "
             f"severity {check.severity}"

@@ -755,6 +755,8 @@ class _Source:
     git: Optional[Dict[str, Any]] = None
     directory: Optional[str] = None
     files: Tuple[Tuple[str, bytes], ...] = ()
+    #: The dbt tests of the contract's DQ rules among ``files``, by name (``_with_tests``).
+    tests: Tuple[str, ...] = ()
 
 
 def job_product(contract: Mapping[str, Any]) -> str:
@@ -811,12 +813,11 @@ def compile_dbt_jobs(
         settings = _job_settings(item, compiled)
         table = _target_table(item, builds, tables, compiled.refusals)
         source = _project_source(item, compiled.refusals, validating=validating)
-        tests: Tuple[str, ...] = ()
         if source is not None:
-            source, tests = _with_tests(contract, item, builds, tables, source, compiled.refusals)
+            source = _with_tests(contract, item, builds, tables, source, compiled.refusals)
         if len(compiled.refusals) == before and table is not None and source is not None:
             script = rebuild_script(build) if rebuild_script is not None else None
-            _emit_job(compiled, item, table, settings, source, script, tests)
+            _emit_job(compiled, item, table, settings, source, script)
     return compiled
 
 
@@ -827,9 +828,9 @@ def _with_tests(
     tables: Sequence[Any],
     source: _Source,
     refusals: List[UnsupportedBindingError],
-) -> Tuple[_Source, Tuple[str, ...]]:
-    """``source`` with the dbt tests the contract's DQ rules run as, and their names
-    (``databricks_dbt_tests.py``). A Git checkout takes none, so its rules are refused."""
+) -> _Source:
+    """``source`` with the dbt tests the contract's DQ rules run as (``databricks_dbt_tests.py``).
+    A Git checkout takes none, so its rules are refused."""
     from .databricks_dbt_tests import compile_tests, written_tables
 
     git = source.git is not None
@@ -844,7 +845,7 @@ def _with_tests(
     )
     refusals.extend(compiled.refusals)
     if not compiled.files:
-        return source, ()
+        return source
     files = tuple(sorted((*source.files, *compiled.files)))
     if len(files) > MAX_PROJECT_FILES:
         refusals.append(
@@ -856,10 +857,8 @@ def _with_tests(
                 "Use a GIT source for a project this size.",
             )
         )
-    return (
-        _Source(git=source.git, directory=source.directory, files=files),
-        tuple(test.name for test in compiled.tests),
-    )
+    tests = tuple(test.name for test in compiled.tests)
+    return _Source(git=source.git, directory=source.directory, files=files, tests=tests)
 
 
 def _job_settings(item: _Build, compiled: CompiledJobs) -> _Settings:
@@ -970,7 +969,6 @@ def _emit_job(
     settings: _Settings,
     source: _Source,
     keys_script: Optional[str] = None,
-    tests: Tuple[str, ...] = (),
 ) -> None:
     """The job, its uploaded project, and, with ``keys_script``, the ``fluid_keys`` task that
     runs it after dbt (``databricks_keys.py``): uploaded next to the project, whose own files
@@ -1013,10 +1011,8 @@ def _emit_job(
     if depends:
         job["depends_on"] = depends
         compiled.data.setdefault(CURRENT_USER, {})["me"] = {}
-    job["task"] = [
-        {"task_key": DBT_TASK_KEY, "environment_key": "dbt", "dbt_task": dbt_task, **settings.task},
-        *([_keys_task(item)] if keys_file else []),
-    ]
+    dbt = {"task_key": DBT_TASK_KEY, "environment_key": "dbt", "dbt_task": dbt_task}
+    job["task"] = [{**dbt, **settings.task}, *([_keys_task(item)] if keys_file else [])]
     compiled.resources.append(("databricks_job", item.key, f"{item.where} job", job))
     compiled.jobs.append(
         DbtJob(
@@ -1027,7 +1023,7 @@ def _emit_job(
             trigger=settings.trigger,
             files=tuple(rel for rel, _ in uploads),
             root=item.root,
-            tests=tests,
+            tests=source.tests,
         )
     )
 
