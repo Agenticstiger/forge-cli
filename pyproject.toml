@@ -659,8 +659,12 @@ fluid_build = [
   "policy/data/cloud_regions/*.md",
   "copilot/**/*.yaml",
   "copilot/**/*.md",
-  # The Agent Skills pack: `fluid scaffold-ide` copies these into a workspace.
+  # The Agent Skills pack: `fluid scaffold-ide` copies these into a workspace,
+  # and the installed directory is a loadable Claude Code plugin. The manifest
+  # is named on its own because a `*` glob does not match a dot-directory.
   "agent_skills/skills/**/*",
+  "agent_skills/hooks/*.json",
+  "agent_skills/.claude-plugin/plugin.json",
   "schemas/**/*.json",
   "schemas/**/*.yaml",
   "templates/**/*",

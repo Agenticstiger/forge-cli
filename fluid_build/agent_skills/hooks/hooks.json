@@ -1,0 +1,17 @@
+{
+  "description": "Validate a FLUID contract after each edit and show the errors to the agent.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/validate_contract.py\"",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
