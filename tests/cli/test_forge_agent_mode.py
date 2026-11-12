@@ -868,3 +868,32 @@ def test_agent_error_text_is_redacted(tmp_path, capsys, monkeypatch, _agent_env)
     assert leaked not in out
     event = next(e for e in _json_lines_only(out) if e["event"] == "forge.error")
     assert event["code"] == "copilot_litellm_request_failed"
+
+
+# ---------------------------------------------------------------------------
+# 9. One contract written, one forge.contract_written event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("inside_cwd", [True, False], ids=["under-cwd", "outside-cwd"])
+def test_agent_blank_reports_its_contract_once(
+    inside_cwd, tmp_path, capsys, monkeypatch, _agent_env
+):
+    """Blank mode used to send its own event as well as the receipt's: two for one file."""
+    from fluid_build.cli import forge as forge_mod
+
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    product = (work if inside_cwd else tmp_path) / "product"
+    args = _agent_args(["--blank", "--data-product-type", "SDP"], tmp_path)
+    args.target_dir = str(product)
+
+    assert forge_mod.run(args, logging.getLogger("test")) == 0
+
+    events = _json_lines_only(capsys.readouterr().out)
+    written = [(e["path"], e["action"]) for e in events if e["event"] == "forge.contract_written"]
+    contract = product / "contract.fluid.yaml"
+    path = "product/contract.fluid.yaml" if inside_cwd else str(contract.resolve())
+    assert written == [(path, "created")]
+    assert "forge.error" not in [e["event"] for e in events]

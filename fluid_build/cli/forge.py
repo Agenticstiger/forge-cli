@@ -1148,20 +1148,9 @@ def _run_blank_mode(args: Any, logger: logging.Logger) -> int:
     if not result_path:
         return 1
 
-    # Agent-mode JSONL: blank-mode bypasses ``_write_forge_receipt`` (no LLM
-    # cost to record), so we emit ``forge.contract_written`` directly here
-    # to keep the event stream contract consistent.
-    if bool(get_cli_arg(args, "agent", False)):
-        try:
-            size = result_path.stat().st_size
-        except OSError:
-            size = -1
-        _emit_agent_jsonl(
-            "forge.contract_written",
-            path=str(result_path),
-            action="created",
-            size=size,
-        )
+    # No ``forge.contract_written`` here: ``_run_main`` writes the receipt after
+    # this returns, and the receipt emits one event per file written, for every
+    # mode (``_write_forge_receipt``).
 
     # In --agent mode we skip the interactive CI-pipeline prompt entirely.
     # The agent can shell-run ``fluid scaffold-ci --system <name>`` separately

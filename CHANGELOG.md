@@ -163,6 +163,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Give Feedback / Get Help" banner to stdout ahead of the JSON. Forge now sets litellm's own
   switch, `suppress_debug_info`, wherever it loads litellm (AI calls, `fluid ai setup`'s key
   check, the agent loop), so no command prints the banner. The error is reported as before.
+- **`fluid forge --agent --blank` reports its contract once.** Blank mode sent its own
+  `forge.contract_written` and the receipt sent another, so the stream named one file twice,
+  first by its absolute path and then by its path from the current directory. Only the receipt's
+  event is left, as in every other mode.
 
 ### Security
 
