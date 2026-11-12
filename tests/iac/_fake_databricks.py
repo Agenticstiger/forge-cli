@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
 import os
 import re
@@ -1737,6 +1738,43 @@ class FakeDatabricks:
                 return f"Table {source.get('identifier')!r} does not exist"
         return None
 
+    def _with_uc_joins(self, stored: str, before: Iterable[str]) -> str:
+        """A written space as the live service keeps it: for each table that entered it (every
+        one, on a create), a join added for each Unity Catalog FOREIGN KEY between two of its
+        tables that touches that table, beside the ones it was sent (the child under its own
+        name, the parent as ``<name>_2``, MANY_TO_ONE; measured 2026-11-13). ``before``: the
+        tables the space held."""
+        doc = json.loads(stored)
+        names = {t.get("identifier") for t in (doc.get("data_sources") or {}).get("tables") or []}
+        new = names - set(before)
+        added = []
+        for child in sorted(n for n in names if n in self.tables):
+            for c in self.tables[child]["constraints"]:
+                if c["type"] != "FOREIGN KEY" or c["parent"] not in names:
+                    continue
+                if child not in new and c["parent"] not in new:
+                    continue
+                left, right = child.rsplit(".", 1)[1], c["parent"].rsplit(".", 1)[1] + "_2"
+                on = " AND ".join(
+                    f"`{left}`.`{a}` = `{right}`.`{b}`"
+                    for a, b in zip(c["columns"], c["parent_columns"], strict=True)
+                )
+                digest = hashlib.sha256(f"{child}\0{c['name']}".encode()).hexdigest()
+                added.append(
+                    {
+                        "id": "01f1" + digest[:28],
+                        "left": {"identifier": child, "alias": left},
+                        "right": {"identifier": c["parent"], "alias": right},
+                        "sql": [on, "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"],
+                    }
+                )
+        if not added:
+            return stored
+        instructions = doc.setdefault("instructions", {})
+        joins = [*(instructions.get("join_specs") or []), *added]
+        instructions["join_specs"] = sorted(joins, key=lambda j: j["id"])
+        return json.dumps(doc)
+
     def _genie_title_taken(self, title: str, parent: str, other_than: str = "") -> bool:
         return any(
             s["title"] == title and s["parent_path"] == parent and sid != other_than
@@ -1794,7 +1832,7 @@ class FakeDatabricks:
                 "description": b.get("description") or "",
                 "warehouse_id": b["warehouse_id"],
                 "parent_path": parent,
-                "serialized_space": self._as_stored(b["serialized_space"]),
+                "serialized_space": self._with_uc_joins(self._as_stored(b["serialized_space"]), ()),
                 "etag": self._genie_etag(),
             }
             self.genie_acl[space_id] = {}
@@ -1822,7 +1860,11 @@ class FakeDatabricks:
                 problem = self._genie_check(b["serialized_space"])
                 if problem:
                     return _err(400, "INVALID_PARAMETER_VALUE", problem)
-                space["serialized_space"] = self._as_stored(b["serialized_space"])
+                was = json.loads(space["serialized_space"]).get("data_sources") or {}
+                space["serialized_space"] = self._with_uc_joins(
+                    self._as_stored(b["serialized_space"]),
+                    [t.get("identifier") for t in was.get("tables") or []],
+                )
             if "title" in b and self._genie_title_taken(
                 b["title"], space["parent_path"], other_than=space_id
             ):

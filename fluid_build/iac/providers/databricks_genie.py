@@ -928,6 +928,7 @@ def _update_found(
             lambda: _update(client, space_id, space, serialized, live.get("etag"), title),
         )
         say(f"    updated {space.title!r}: {', '.join(changes)} ({_url(space_id)})")
+        _keep_as_sent(client, space_id, space, serialized, say, made="updated")
 
 
 def _create_new(client: Any, space: Space, serialized: Mapping[str, Any], say: Say) -> str:
@@ -939,7 +940,48 @@ def _create_new(client: Any, space: Space, serialized: Mapping[str, Any], say: S
     _title_kept(created.get("title"), space.title, say)
     _wait_listed(client, space, space_id, say)
     _found_again(client, space_id)
+    _keep_as_sent(client, space_id, space, serialized, say, made="made")
     return space_id
+
+
+def _keep_as_sent(
+    client: Any,
+    space_id: str,
+    space: Space,
+    serialized: Mapping[str, Any],
+    say: Say,
+    *,
+    made: str,
+) -> None:
+    """Set the space back to what was sent when the service added to it as it wrote it.
+
+    Measured on a live workspace (2026-11-13): whenever a table enters a space (a create, or
+    an update that adds one) Genie adds a join for each Unity Catalog foreign key between two
+    of the space's tables that touches it (its own id, the parent aliased ``<table>_2``),
+    beside the joins it was sent. An update with the same tables keeps exactly what it is
+    sent, so one more makes the space what the contracts ask. Left so, the next run would
+    update the space again.
+    """
+    live = _call(client, "read the Genie space back", lambda: _get(client, space_id))
+    changes = differences(live, space, serialized)
+    if not changes:
+        return
+    title = _title_kept(live.get("title"), space.title, lambda _line: None)
+    _call(
+        client,
+        "set the Genie space back",
+        lambda: _update(client, space_id, space, serialized, live.get("etag"), title),
+    )
+    path = ("instructions", "join_specs")
+    held, sent = (len(_dig(doc, path) or ()) for doc in (_held(live), serialized))
+    if changes == ["joins"] and held > sent:
+        say(
+            f"    note: Genie added {held - sent} join(s) of its own as it {made} the space, "
+            "from the tables' Unity Catalog foreign keys; they were taken out, and the space "
+            f"holds the {sent} the contracts declare."
+        )
+    else:
+        say(f"    note: the space differed from what was sent ({', '.join(changes)}); set back.")
 
 
 def _found_again(client: Any, space_id: str) -> None:

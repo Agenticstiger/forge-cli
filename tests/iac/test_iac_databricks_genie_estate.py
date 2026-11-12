@@ -536,6 +536,41 @@ def test_a_first_run_creates_and_shares_and_a_second_changes_nothing(fake):
     assert fake.unknown == []
 
 
+def test_joins_genie_adds_from_unity_catalog_keys_are_taken_out_at_once(fake):
+    # Whenever a table enters a space, Genie adds a join for each Unity Catalog foreign key that
+    # touches it, beside the ones it is sent (measured 2026-11-13); left so, every next run would
+    # update the space.
+    for child, column, parent in (
+        (TENANCY_T, "site_id", SITES_T),
+        (BILLING_T, "tenancy_id", TENANCY_T),
+    ):
+        fake.tables[child]["constraints"].append(
+            {
+                "type": "FOREIGN KEY",
+                "name": f"fluid_fk_{child.rsplit('.', 1)[1]}__{column}",
+                "columns": [column],
+                "parent": parent,
+                "parent_columns": [column],
+            }
+        )
+    ours = space_of(*three()).serialized["instructions"]["join_specs"]
+
+    first = Run(fake)(*three())
+    assert [w[0] for w in first.writes()] == ["POST", "PATCH", "PUT"]
+    assert "Genie added 2 join(s) of its own as it made the space" in first.text
+    assert "the space holds the 3 the contracts declare" in first.text
+    assert json.loads(only_space(fake)["serialized_space"])["instructions"]["join_specs"] == ours
+    assert Run(fake)(*three()).writes() == []
+
+    Run(fake)(sites(), tenancy())  # billing leaves the space
+    back = Run(fake)(*three())  # and comes back: Genie joins it again
+    assert [w[0] for w in back.writes()] == ["PATCH", "PATCH", "PUT"]
+    assert "Genie added 1 join(s) of its own as it updated the space" in back.text
+    assert json.loads(only_space(fake)["serialized_space"])["instructions"]["join_specs"] == ours
+    again = Run(fake)(*three())
+    assert again.writes() == [] and "'towers': no change" in again.text
+
+
 def test_a_product_left_out_of_a_run_leaves_the_space(fake):
     Run(fake)(*three())
     run = Run(fake)(sites(), tenancy())
