@@ -966,3 +966,47 @@ def test_a_dbt_job_created_with_its_restricted_table_is_paused_until_the_next_ap
     assert "is created paused" not in out
 
     assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]
+
+
+# ── primary and foreign keys ────────────────────────────────────────────────
+def _keyed(product_id: str = "dbx.fake.orders", table: str = "orders", ref: str = "") -> dict:
+    """``orders`` with ``id`` its primary key; with ``ref``, ``region`` a foreign key to it."""
+    contract = make_contract(product_id=product_id)
+    expose = contract["exposes"][0]
+    expose["exposeId"] = table
+    expose["binding"]["location"]["table"] = table
+    schema = expose["contract"]["schema"]
+    schema[0]["tags"] = ["primary-key"]
+    if ref:
+        schema[2].update(tags=["foreign-key"], labels={"references": ref})
+    return contract
+
+
+@requires_sdk
+def test_apply_declares_the_keys_and_a_child_finds_its_parent_by_its_product_tag(
+    workspace, fake, capfd
+):
+    parent = write_contract(workspace, _keyed())
+    rc, out = apply_contract(capfd, parent)
+    assert rc == 0, out
+    assert fake.keys_on(TABLE) == [("PRIMARY KEY", "fluid_pk_orders", "id")]
+    assert "done: primary key fluid_pk_orders (id)" in out
+
+    # The child is another contract: its parent is found by the fluid_product_id tag
+    # tofu put on the parent's table, not by any assumption about where it lives.
+    (workspace / "child").mkdir()
+    child = _keyed("dbx.fake.returns", "returns", ref="dbx.fake.orders.id")
+    child["exposes"][0]["contract"]["schema"][2]["type"] = "bigint"
+    child_path = write_contract(workspace / "child", child)
+    rc, out = apply_contract(capfd, child_path)
+    assert rc == 0, out
+    assert fake.keys_on("main.sales.returns") == [
+        ("PRIMARY KEY", "fluid_pk_returns", "id"),
+        ("FOREIGN KEY", "fluid_fk_returns_region", "region", TABLE, "id"),
+    ]
+
+    statements = len(fake.sql_log)
+    rc, out = apply_contract(capfd, child_path)
+    assert rc == 0 and "tofu plan: +0 ~0 -0" in out, out
+    assert not [s for s in fake.sql_log[statements:] if "CONSTRAINT" in s]
+    assert fake.unknown == []

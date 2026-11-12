@@ -363,6 +363,43 @@ def _enforce_access(
         ) from exc
 
 
+def build_after_apply(
+    args, logger: logging.Logger, contract: Mapping[str, Any], build_kwargs: Mapping[str, Any]
+) -> int:
+    """The build phase of a build-augmented mode, after a ``tofu apply`` that succeeded, then
+    the plugin's ``post_build`` hook once every build succeeded (:func:`after_builds`)."""
+    from fluid_build.build_runners import run_builds_from_args
+
+    rc = run_builds_from_args(args, logger, force_run=True, **build_kwargs)
+    if rc == 0:
+        after_builds(args, contract)
+    return rc
+
+
+def after_builds(args, contract: Mapping[str, Any]) -> None:
+    """The plugin's ``post_build`` hook, if it has one, after a build phase that succeeded.
+
+    Optional plugin capability, discovered like ``plan_notices``, and advisory: a dbt build run
+    here may have rebuilt a table with CREATE OR REPLACE, which drops what the apply declared on
+    it that dbt does not (the Databricks plugin's Unity Catalog keys), and the plugin declares
+    it again. It never changes the run's exit code.
+    """
+    try:
+        plugin = get_iac_plugin(
+            _resolve_provider(contract, getattr(args, "provider", None) or "auto")
+        )
+    except Exception:  # noqa: BLE001 — the apply resolved it already; nothing to add here
+        return
+    run = getattr(plugin, "post_build", None)
+    if not callable(run):
+        return
+    try:
+        with contract_source(source_contract_file(getattr(args, "contract", None))):
+            run(contract, say=cprint)
+    except Exception as exc:  # noqa: BLE001 — advisory: the build's own result stands
+        cprint(f"  after the build: {type(exc).__name__}: {redact_secret_text(str(exc))}")
+
+
 def _enforce_after_failed_apply(plugin: Any, contract: Mapping[str, Any]) -> None:
     """Best effort, bind-only ``post_apply`` for a ``tofu apply`` that failed part way.
 
