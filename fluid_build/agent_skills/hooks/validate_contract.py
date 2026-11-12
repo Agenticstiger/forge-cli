@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -59,13 +58,33 @@ def contract_path(payload: Any) -> Optional[str]:
     return None
 
 
+def find_fluid() -> Optional[str]:
+    """The ``fluid`` console script: beside this interpreter first, then on PATH.
+
+    Searched by hand rather than with ``shutil.which``, which on Windows looks in the
+    working directory first, even with ``path=`` given. The working directory, and any
+    relative PATH entry, is skipped: it is the project the agent writes to, so a
+    ``fluid.cmd`` planted there must never run on its next edit. Console scripts are
+    ``fluid.exe`` on Windows (pip and uv install them so), never ``.bat`` or ``.cmd``.
+    """
+    name = "fluid.exe" if os.name == "nt" else "fluid"
+    here = os.path.realpath(os.getcwd())
+    dirs = [str(Path(sys.executable).parent), *os.environ.get("PATH", "").split(os.pathsep)]
+    for directory in dirs:
+        if not directory or not os.path.isabs(directory):
+            continue
+        if os.path.realpath(directory) == here:
+            continue
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def validate_command(path: str) -> Optional[List[str]]:
-    """``fluid validate`` for ``path``: the console script beside this interpreter, else PATH."""
-    beside = shutil.which("fluid", path=str(Path(sys.executable).parent))
-    fluid = beside or shutil.which("fluid")
-    if not fluid:
-        return None
-    return [fluid, "validate", path, "--offline"]
+    """``fluid validate`` for ``path``, or ``None`` when no ``fluid`` is found."""
+    fluid = find_fluid()
+    return None if fluid is None else [fluid, "validate", path, "--offline"]
 
 
 def _clip(text: str) -> str:

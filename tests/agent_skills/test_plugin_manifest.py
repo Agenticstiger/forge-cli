@@ -178,6 +178,43 @@ def test_a_relative_path_cannot_become_an_option() -> None:
         assert command[2] == path
 
 
+def _script(directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / ("fluid.exe" if os.name == "nt" else "fluid")
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def test_a_fluid_in_the_project_directory_is_never_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows ``shutil.which`` searches the working directory first, so a ``fluid``
+    the agent wrote into the project would win. The hook searches by hand and skips the
+    working directory and relative PATH entries, so the real one on PATH still runs."""
+    project = tmp_path / "project"
+    _script(project)
+    real = _script(tmp_path / "tools")
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(hook.sys, "executable", str(tmp_path / "py" / "python"))
+    monkeypatch.setenv("PATH", os.pathsep.join([".", str(project), str(tmp_path / "tools")]))
+    assert hook.find_fluid() == str(real)
+
+    monkeypatch.setenv("PATH", os.pathsep.join([".", str(project)]))
+    assert hook.find_fluid() is None
+
+
+def test_the_console_script_beside_the_interpreter_comes_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    beside = _script(tmp_path / "venv" / "bin")
+    _script(tmp_path / "elsewhere")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(hook.sys, "executable", str(tmp_path / "venv" / "bin" / "python"))
+    monkeypatch.setenv("PATH", str(tmp_path / "elsewhere"))
+    assert hook.validate_command("/w/c.fluid.yaml")[0] == str(beside)
+
+
 def test_the_hook_runs_the_real_validator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PYTHONPATH", str(REPO_ROOT))
     good = tmp_path / "contract.fluid.yaml"
