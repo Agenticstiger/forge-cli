@@ -1,0 +1,23 @@
+title: SDP on Snowflake from a source table
+contracts: [contract.fluid.yaml]
+checks:
+  - {id: product_type, path: metadata.productType, equals: SDP}
+  - {id: layer, path: metadata.layer, equals: Bronze}
+  - {id: name, path: name, matches: '(.*[._-])?customers_raw'}
+  - {id: domain, path: domain, equals: crm}
+  - {id: owner_team, path: metadata.owner.team, equals: crm-data}
+  - {id: expose, path: 'exposes[exposeId=customers_raw].exposeId', equals: customers_raw}
+  - id: columns
+    expose: customers_raw
+    columns: {customer_id: string, email: string, full_name: string, created_at: timestamp, country: string}
+  - {id: required, expose: customers_raw, required: [customer_id, created_at]}
+  - {id: email_pii, path: 'exposes[exposeId=customers_raw].contract.schema[name=email].sensitivity', equals: pii}
+  - {id: full_name_pii, path: 'exposes[exposeId=customers_raw].contract.schema[name=full_name].sensitivity', equals: pii}
+  - {id: customer_id_unique, expose: customers_raw, unique: customer_id}
+  - {id: platform_snowflake, path: 'exposes[exposeId=customers_raw].binding.platform', equals: snowflake}
+  - {id: format_snowflake_table, path: 'exposes[exposeId=customers_raw].binding.format', equals: snowflake_table}
+  - {id: database, path: 'exposes[exposeId=customers_raw].binding.location.database', equals: CRM_RAW}
+  - {id: schema, path: 'exposes[exposeId=customers_raw].binding.location.schema', equals: PUBLIC}
+  - {id: table, path: 'exposes[exposeId=customers_raw].binding.location.table', equals: CUSTOMERS}
+  - {id: hourly, cron: '0 * * * *'}
+  - {id: reads_source, contains: CRM_SOURCE.PUBLIC.CUSTOMERS}

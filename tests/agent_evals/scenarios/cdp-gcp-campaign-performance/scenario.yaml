@@ -1,0 +1,26 @@
+title: CDP on BigQuery consuming a BigQuery ADP
+contracts: [products/campaign_daily_performance/contract.fluid.yaml]
+forge:
+  target_dir: products/campaign_daily_performance
+  args: [--from-product, products/campaign_touches/contract.fluid.yaml]
+checks:
+  - {id: product_type, path: metadata.productType, equals: CDP}
+  - {id: layer, path: metadata.layer, equals: Gold}
+  - {id: classification, path: metadata.classification, equals: internal}
+  - {id: domain, path: domain, equals: marketing}
+  - {id: owner_team, path: metadata.owner.team, equals: growth-analytics}
+  - id: consumes
+    consumes:
+      - {productId: marketing.campaign_touches, exposeId: campaign_touches}
+  - {id: expose, path: 'exposes[exposeId=campaign_daily_performance].exposeId', equals: campaign_daily_performance}
+  - id: columns
+    expose: campaign_daily_performance
+    columns: {campaign_id: string, day: date, impressions: integer, clicks: integer, spend: decimal, ctr: decimal}
+  - {id: required, expose: campaign_daily_performance, required: [campaign_id, day, impressions, clicks, spend]}
+  - {id: platform_gcp, path: 'exposes[exposeId=campaign_daily_performance].binding.platform', equals: gcp}
+  - {id: format_bigquery_table, path: 'exposes[exposeId=campaign_daily_performance].binding.format', equals: bigquery_table}
+  - {id: project, path: 'exposes[exposeId=campaign_daily_performance].binding.location.project', equals: acme-marketing}
+  - {id: dataset, path: 'exposes[exposeId=campaign_daily_performance].binding.location.dataset', equals: gold}
+  - {id: table, path: 'exposes[exposeId=campaign_daily_performance].binding.location.table', equals: campaign_daily_performance}
+  - {id: daily_0600, cron: '0 6 * * *'}
+  - {id: reads_upstream_table, contains: acme-marketing.silver.campaign_touches}

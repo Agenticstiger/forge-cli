@@ -1,0 +1,3 @@
+shipment_id,order_id,shipped_at,carrier
+S-1,O-1001,2026-11-02T08:00:00,DHL
+S-2,O-1002,2026-11-02T09:30:00,UPS

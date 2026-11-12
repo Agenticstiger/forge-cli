@@ -1,0 +1,25 @@
+title: ADP joining two local SDPs through consumes[]
+contracts: [products/orders_enriched/contract.fluid.yaml]
+forge:
+  target_dir: products/orders_enriched
+  args: [--from-product, products/orders_raw/contract.fluid.yaml, --from-product, products/customers_raw/contract.fluid.yaml]
+checks:
+  - {id: product_type, path: metadata.productType, equals: ADP}
+  - {id: layer, path: metadata.layer, equals: Silver}
+  - {id: domain, path: domain, equals: sales}
+  - {id: owner_team, path: metadata.owner.team, equals: sales-data}
+  - id: consumes
+    consumes:
+      - {productId: sales.orders_raw, exposeId: orders_raw}
+      - {productId: sales.customers_raw, exposeId: customers_raw}
+  - {id: expose, path: 'exposes[exposeId=orders_enriched].exposeId', equals: orders_enriched}
+  - id: columns
+    expose: orders_enriched
+    columns: {order_id: string, customer_id: string, order_ts: timestamp, amount: decimal, currency: string, country: string}
+  - {id: order_id_unique, expose: orders_enriched, unique: order_id}
+  - {id: country_not_null, expose: orders_enriched, not_null: country}
+  - {id: daily_0300, cron: '0 3 * * *'}
+  - {id: platform_local, path: 'exposes[exposeId=orders_enriched].binding.platform', equals: local}
+  - {id: parquet, path: 'exposes[exposeId=orders_enriched].binding.format', equals: parquet}
+  - {id: reads_orders_output, reads_upstream: {productId: sales.orders_raw, exposeId: orders_raw, file: orders_raw.parquet}}
+  - {id: reads_customers_output, reads_upstream: {productId: sales.customers_raw, exposeId: customers_raw, file: customers_raw.parquet}}

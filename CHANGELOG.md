@@ -7,7 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Agent Skills for coding agents.** Four skills in the agentskills.io `SKILL.md` format ship
+  in `fluid_build/agent_skills/`: `authoring-fluid-contracts`, `composing-fluid-data-products`,
+  `deploying-fluid-contracts-safely` and `troubleshooting-fluid-errors`. They teach the scaffold,
+  edit and `fluid validate` loop, `consumes[]` wiring, the reviewed-plan pipeline, and the
+  `ERR_*` codes. Their reference sheets are generated from the stable bundled schema, the error
+  catalog and the product-type registry (`scripts/gen_agent_skill_references.py`), and a test
+  fails when they drift; every `fluid` command and YAML example in them is checked against the
+  CLI. The same directory is a Claude Code plugin, listed by `.claude-plugin/marketplace.json`
+  (`/plugin marketplace add Agenticstiger/forge-cli`, then `/plugin install fluid@forge-cli`),
+  and `npx skills add Agenticstiger/forge-cli` installs it too.
+- **An eval harness for the skills** (`tests/agent_evals/`). It runs 11 scenarios (authoring,
+  refining, composing and a plan-only deploy) with an agent without the skills and one with
+  them, and 9 of them through `fluid forge`'s own AI mode too. It
+  grades each contract with `fluid validate` plus fixed fidelity checks, and reports pass@1,
+  fidelity, tokens, cost and wall time. It is opt-in (marker `agent_eval` plus
+  `FLUID_AGENT_EVAL=1`) and never runs in the default test lane.
+
+### Changed
+
+- **`fluid scaffold-ide` installs the skills and writes a short index instead of four steering
+  files.** The always-loaded text drops from 11,196 characters to about 2,100. It names each
+  skill where it is installed (`.claude/skills/` for Claude Code, `.kiro/skills/` for Kiro,
+  `.agents/skills/` for the other targets) and states the rules an agent must not break. The
+  steering it replaced named a command that does not exist (`fluid generate-artifacts`; the
+  stage is `fluid generate artifacts`) and counted 13 MCP tools: the count now comes from the
+  server's registry (16). `--force` replaces
+  only the marked block in an existing `CLAUDE.md` or `AGENTS.md`, where it used to overwrite the
+  whole file. The validate hook goes into `.claude/settings.local.json`, since it names this
+  machine's interpreter, and that file is added to `.gitignore`; its other settings are kept, and
+  the handler an earlier version wrote into the shared `.claude/settings.json` is removed, leaving
+  that file's other handlers, a user's own validate hooks included (only the exact commands
+  scaffold-ide wrote are removed). Every error an existing file can cause (an invalid
+  `.claude/settings.json`, a `CLAUDE.md` or `AGENTS.md` that is not UTF-8) is raised before the
+  first write, and a file whose scaffold-ide markers are not exactly one BEGIN then one END is
+  refused and left untouched. The `.gitignore` entry is appended in place, keeping the file's
+  mode and line endings; a `.gitignore` that cannot be appended to only logs a warning. The four
+  steering files earlier versions wrote (`01-forge-cli` to `04-guardrails` under
+  `.kiro/steering/`, `.cursor/rules/`, `.clinerules/`, `.ai/steering/`) are removed with
+  `--force` when their first heading is unchanged, and listed in a warning without it.
+
+- **A non-interactive run with no LLM configured authors with an installed coding agent.** When
+  nothing names one (no `--llm-provider`, `--llm-endpoint` or `--llm-model`, no `FLUID_LLM_*`,
+  `OLLAMA_HOST` or provider key variable, no keyring key, no `fluid ai setup` provider) and stdin
+  is not a terminal or `--non-interactive` is set, forge uses a running local Ollama first, so
+  local data stays local, else the first of `claude`, `codex`, `cursor-agent` and `kiro-cli` on
+  PATH, and logs which one and how to override it. It works on the base install: the agents need
+  no litellm. Interactive runs still only offer the agent, and `--agent-loop` never picks one
+  (the agents have no tool use).
+- **Forge runs `claude -p` apart from your own Claude Code setup.** Each call replaces Claude
+  Code's agent system prompt with forge's (`--system-prompt`) and turns off tools, MCP servers,
+  your settings (hooks, plugins, `CLAUDE.md`) and session persistence (`--tools ""`,
+  `--strict-mcp-config`, `--setting-sources=`, `--no-session-persistence`), and drops
+  `CLAUDECODE`, as Anthropic's Agent SDK does. Each flag is passed only when the installed
+  `claude --help` lists it. Claude Code authentication that lives in a setting (an
+  `apiKeyHelper`, or Bedrock or Vertex variables in `settings.json`) must come from the shell
+  environment instead.
+- **`OLLAMA_HOST` may name any machine, as in Ollama's own client.** The chat call already dialled
+  it, but detection, forge's default-model pick and `fluid ai setup` ignored a non-local host with
+  a warning and asked localhost, so the model came from one daemon and the call went to another.
+  Every Ollama read now goes through one helper, `fluid_build/llm/ollama_host.py`. A project
+  `.env` still cannot set `OLLAMA_HOST`. `fluid ai test --endpoint` accepts any Ollama host, over
+  http or https. A stated endpoint is read the same way (`--llm-endpoint gpu-box` means
+  `http://gpu-box:11434`) and keeps a `user:password@`, sent as basic auth. `fluid doctor` and
+  `fluid ai setup` show it masked, and `~/.fluid/ai_config.json` stores a saved address without
+  it unless `FLUID_ALLOW_PLAINTEXT_AI_SECRETS` is set, as for API keys.
+- **With no provider selected, forge stops instead of using gemini.** It used to send
+  `FLUID_LLM_API_KEY` to Google whatever key it was, and with two provider keys set it asked for
+  a gemini key. It now fails with `copilot_no_llm_provider` and says why (nothing configured,
+  several keys, a key that names no provider, or a `fluid ai setup` choice that the command does
+  not read), in the words `fluid doctor` shows. Pass `--llm-provider`, or set
+  `FLUID_LLM_PROVIDER` or the key of exactly one provider.
+- **`LlmProvider.list_available_models` takes an `endpoint` keyword**, the address the call will
+  go to, passed only when the operator states one. A provider plugin that overrides the method
+  with the two-argument signature keeps working until an endpoint is stated.
+
 ### Fixed
+
+- **The Claude Code hook `fluid scaffold-ide` writes validates contracts.** It ran
+  `fluid validate ${tool_input.file_path}` behind `if: Edit(...) | Write(...)`. Claude Code
+  substitutes nothing into a hook command, so the shell failed on the substitution, and an `if`
+  holds one permission rule, not an OR. The new hook reads the edited path from the JSON on stdin,
+  validates only `*.fluid.yaml`, `*.fluid.yml` and `*.fluid.json` files, and exits 2 with the
+  errors, which Claude Code shows to the agent. A re-run replaces the old hook. It runs its
+  script by path and the `fluid` console script, never `python -m`: that would put the project
+  directory, which the agent writes to, first on `sys.path`, so a planted `json.py` would run on
+  the next edit. Terminal control sequences are stripped from what it prints.
 
 - **An embedded-SQL build whose output is outside the contract's directory replaces it on every
   run, not only the first.** The local provider grants such an output (in a directory the
@@ -58,43 +145,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a model the endpoint has. All three now ask the stated endpoint. A `--tiered` stage now
   calls a stated endpoint too, as the routing model already did; it called the provider's
   default address instead.
-
-### Changed
-
-- **A non-interactive run with no LLM configured authors with an installed coding agent.** When
-  nothing names one (no `--llm-provider`, `--llm-endpoint` or `--llm-model`, no `FLUID_LLM_*`,
-  `OLLAMA_HOST` or provider key variable, no keyring key, no `fluid ai setup` provider) and stdin
-  is not a terminal or `--non-interactive` is set, forge uses a running local Ollama first, so
-  local data stays local, else the first of `claude`, `codex`, `cursor-agent` and `kiro-cli` on
-  PATH, and logs which one and how to override it. It works on the base install: the agents need
-  no litellm. Interactive runs still only offer the agent, and `--agent-loop` never picks one
-  (the agents have no tool use).
-- **Forge runs `claude -p` apart from your own Claude Code setup.** Each call replaces Claude
-  Code's agent system prompt with forge's (`--system-prompt`) and turns off tools, MCP servers,
-  your settings (hooks, plugins, `CLAUDE.md`) and session persistence (`--tools ""`,
-  `--strict-mcp-config`, `--setting-sources=`, `--no-session-persistence`), and drops
-  `CLAUDECODE`, as Anthropic's Agent SDK does. Each flag is passed only when the installed
-  `claude --help` lists it. Claude Code authentication that lives in a setting (an
-  `apiKeyHelper`, or Bedrock or Vertex variables in `settings.json`) must come from the shell
-  environment instead.
-- **`OLLAMA_HOST` may name any machine, as in Ollama's own client.** The chat call already dialled
-  it, but detection, forge's default-model pick and `fluid ai setup` ignored a non-local host with
-  a warning and asked localhost, so the model came from one daemon and the call went to another.
-  Every Ollama read now goes through one helper, `fluid_build/llm/ollama_host.py`. A project
-  `.env` still cannot set `OLLAMA_HOST`. `fluid ai test --endpoint` accepts any Ollama host, over
-  http or https. A stated endpoint is read the same way (`--llm-endpoint gpu-box` means
-  `http://gpu-box:11434`) and keeps a `user:password@`, sent as basic auth. `fluid doctor` and
-  `fluid ai setup` show it masked, and `~/.fluid/ai_config.json` stores a saved address without
-  it unless `FLUID_ALLOW_PLAINTEXT_AI_SECRETS` is set, as for API keys.
-- **With no provider selected, forge stops instead of using gemini.** It used to send
-  `FLUID_LLM_API_KEY` to Google whatever key it was, and with two provider keys set it asked for
-  a gemini key. It now fails with `copilot_no_llm_provider` and says why (nothing configured,
-  several keys, a key that names no provider, or a `fluid ai setup` choice that the command does
-  not read), in the words `fluid doctor` shows. Pass `--llm-provider`, or set
-  `FLUID_LLM_PROVIDER` or the key of exactly one provider.
-- **`LlmProvider.list_available_models` takes an `endpoint` keyword**, the address the call will
-  go to, passed only when the operator states one. A provider plugin that overrides the method
-  with the two-argument signature keeps working until an endpoint is stated.
 
 ### Security
 

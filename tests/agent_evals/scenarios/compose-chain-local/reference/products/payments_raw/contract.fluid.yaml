@@ -1,0 +1,33 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: payments.payments_raw
+name: payments_raw
+domain: payments
+metadata:
+  productType: SDP
+  layer: Bronze
+  owner:
+    team: payments-data
+builds:
+- id: ingest_payments
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: SELECT * FROM read_csv_auto('data/payments.csv', header=true)
+  execution:
+    trigger: {type: schedule, cron: 0 1 * * *}
+    runtime: {platform: local}
+exposes:
+- exposeId: payments_raw
+  kind: table
+  binding:
+    platform: local
+    format: parquet
+    location: {path: runtime/out/payments_raw.parquet}
+  contract:
+    schema:
+    - {name: payment_id, type: string, required: true}
+    - {name: merchant_id, type: string, required: true}
+    - {name: paid_at, type: timestamp, required: true}
+    - {name: amount, type: 'decimal(12,2)', required: true}
+    - {name: currency, type: string, required: true}

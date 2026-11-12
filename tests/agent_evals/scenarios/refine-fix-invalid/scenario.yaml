@@ -1,0 +1,15 @@
+title: Fix an invalid contract without changing the product
+contracts: [contract.fluid.yaml]
+forge:
+  target_dir: "."
+  args: [--refine, contract.fluid.yaml]
+checks:
+  - {id: product_type, path: metadata.productType, equals: SDP}
+  - {id: layer, path: metadata.layer, equals: Bronze}
+  - {id: platform_local, path: 'exposes[exposeId=shipments_raw].binding.platform', equals: local}
+  - {id: file_format, path: 'exposes[exposeId=shipments_raw].binding.format', in: [parquet, csv]}
+  - {id: owner_email_removed, path: metadata.owner_email, absent: true}
+  - id: untouched
+    from: contract.fluid.yaml
+    preserved: [id, name, domain, builds, 'exposes[exposeId=shipments_raw].contract.schema']
+  - {id: reads_source, contains: data/shipments.csv}

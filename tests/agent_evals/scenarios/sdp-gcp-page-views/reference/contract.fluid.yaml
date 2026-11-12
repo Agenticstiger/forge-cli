@@ -1,0 +1,66 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: marketing.page_views_raw
+name: page_views_raw
+description: Raw page views copied every 15 minutes from the landing dataset.
+domain: marketing
+metadata:
+  productType: SDP
+  layer: Bronze
+  owner:
+    team: web-analytics
+builds:
+- id: ingest_page_views
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: >-
+      SELECT event_id, user_id, page_url, viewed_at, referrer
+      FROM `acme-web.landing.page_view_events`
+  execution:
+    trigger:
+      type: schedule
+      cron: '*/15 * * * *'
+    runtime:
+      platform: gcp
+exposes:
+- exposeId: page_views_raw
+  kind: table
+  description: One row per page view event.
+  binding:
+    platform: gcp
+    format: bigquery_table
+    location:
+      project: acme-web
+      dataset: raw_web
+      table: page_views
+  contract:
+    schema:
+    - name: event_id
+      type: string
+      required: true
+    - name: user_id
+      type: string
+      sensitivity: pii
+    - name: page_url
+      type: string
+      required: true
+    - name: viewed_at
+      type: timestamp
+      required: true
+    - name: referrer
+      type: string
+    dq:
+      rules:
+      - id: event_id_unique
+        type: uniqueness
+        selector: event_id
+        threshold: 1.0
+        operator: '>='
+        severity: error
+      - id: event_id_not_null
+        type: completeness
+        selector: event_id
+        threshold: 1.0
+        operator: '>='
+        severity: error

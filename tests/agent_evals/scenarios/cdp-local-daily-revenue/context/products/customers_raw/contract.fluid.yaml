@@ -1,0 +1,43 @@
+fluidVersion: 0.7.6
+kind: DataProduct
+id: sales.customers_raw
+name: customers_raw
+description: Raw customers from the CRM's daily CSV export.
+domain: sales
+metadata:
+  productType: SDP
+  layer: Bronze
+  owner:
+    team: sales-data
+builds:
+- id: ingest_customers
+  pattern: embedded-logic
+  engine: sql
+  properties:
+    sql: SELECT * FROM read_csv_auto('data/customers.csv', header=true)
+  execution:
+    trigger:
+      type: schedule
+      cron: 0 1 * * *
+    runtime:
+      platform: local
+exposes:
+- exposeId: customers_raw
+  kind: table
+  binding:
+    platform: local
+    format: parquet
+    location:
+      path: runtime/out/customers_raw.parquet
+  contract:
+    schema:
+    - name: customer_id
+      type: string
+      required: true
+    - name: country
+      type: string
+      required: false
+      description: ISO-3166 alpha-2 country code.
+    - name: signup_date
+      type: date
+      required: false
