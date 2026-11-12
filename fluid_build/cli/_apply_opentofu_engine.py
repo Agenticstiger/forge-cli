@@ -284,8 +284,9 @@ def _apply_via_opentofu(
         retired = _retired_definitions(changes, removals)
         if retired:
             cprint(
-                f"  {len(retired)} job(s), workspace file(s) or folder(s) removed (no table data "
-                "lost; not gated; a job's run history goes with it): " + ", ".join(retired)
+                f"  {len(retired)} job(s), workspace file(s), folder(s) or data quality "
+                "monitor(s) removed (no table data lost; not gated; a job's run history and "
+                "what a monitor has learned go with them): " + ", ".join(retired)
             )
         _report_plan_notices(plugin, contract, logger)
         # In-place updates that delete data — a dropped column — which the destroy
@@ -330,7 +331,7 @@ def _apply_via_opentofu(
                 "opentofu apply raw output tail: %s",
                 _tail(apply_result.stderr or apply_result.stdout),
             )
-            raise _apply_failure(apply_result, str(workdir))
+            raise _apply_failure(apply_result, str(workdir), plugin)
         applied = runner.change_summary(apply_result)
         record(applied)
 
@@ -970,7 +971,10 @@ def _adopt_existing(
     for block in candidates:
         if block.to in in_state:
             continue
-        result = runner.tofu_import(workdir, block.to, block.id, env=env)
+        import_id = _import_id(block, workdir, env)
+        if import_id is None:
+            continue
+        result = runner.tofu_import(workdir, block.to, import_id, env=env)
         if result.ok:
             adopted += 1
             if held is not None:
@@ -986,6 +990,21 @@ def _adopt_existing(
             )
     if adopted:
         cprint(f"  brownfield:  adopted {adopted} pre-existing resource(s) into state")
+
+
+def _import_id(block: Any, workdir: str, env: Mapping[str, str]) -> Optional[str]:
+    """``block.id``, or for a block whose id the cloud assigns (``ImportBlock.id_from``) that id
+    completed from state, which the imports before it have just filled. ``None`` when the
+    resource it derives from is not in state: then neither exists yet, and there is nothing
+    to adopt."""
+    if getattr(block, "id_from", None) is None:
+        return block.id
+    address, attribute = block.id_from
+    for resource in runner.tofu_state_resources(workdir, env=env):
+        if resource.get("address") == address:
+            value = (resource.get("values") or {}).get(attribute)
+            return block.id.replace("{}", value) if isinstance(value, str) and value else None
+    return None
 
 
 @dataclass
@@ -1526,9 +1545,16 @@ ACCESS_ONLY_RESOURCE_TYPES = frozenset(
 #: no table data: a Databricks job (its run history goes with it) and a workspace
 #: file of a dbt project uploaded from the build's repository. Removing a build
 #: from the contract removes them, ungated, with a line saying so (founder
-#: decision for the Databricks provider, 2026-10-29).
+#: decision for the Databricks provider, 2026-10-29). A schema's data quality
+#: monitor is one too: deleting it deletes its hidden scan job and what it has
+#: learned, never a row (``iac/providers/databricks_quality.py``).
 RUN_DEFINITION_RESOURCE_TYPES = frozenset(
-    {"databricks_job", "databricks_workspace_file", "databricks_directory"}
+    {
+        "databricks_job",
+        "databricks_workspace_file",
+        "databricks_directory",
+        "databricks_data_quality_monitor",
+    }
 )
 
 
@@ -1658,7 +1684,7 @@ def _mentions_state_lock(text: str) -> bool:
     return "state lock" in low or "locking state" in low
 
 
-def _apply_failure(result: Any, workdir: str) -> CLIError:
+def _apply_failure(result: Any, workdir: str, plugin: Any = None) -> CLIError:
     """The error for a failed ``tofu apply``: what failed, on which resource, and the way on.
 
     ``-json`` puts every diagnostic on stdout as one JSON line, so the raw tail
@@ -1666,11 +1692,14 @@ def _apply_failure(result: Any, workdir: str) -> CLIError:
     a summary, the resource address and the provider's detail; output that holds
     none (a crash, a timeout) falls back to the first ``Error:``, else the exit
     code. Tofu records state as it goes, so what was created before the failure
-    is normally tracked and a re-run converges: the suggestions say so.
+    is normally tracked and a re-run converges: the suggestions say so. A plugin's
+    optional ``apply_failure_hints(address, detail)`` puts its own way on first, for the
+    resource that failed.
     """
     diagnostics = _diagnostics(getattr(result, "events", None))
     context: Dict[str, Any] = {}
     locked = False
+    address = detail = ""
     if diagnostics:
         first = diagnostics[0]
         # Redacted before it is cut: a credential split at the limit (a URL that lost
@@ -1696,6 +1725,9 @@ def _apply_failure(result: Any, workdir: str) -> CLIError:
         locked = _mentions_state_lock(output)
     err = CLIError(1, "opentofu_apply_failed", context)
     hints = [f"To see what exists, run 'tofu state list' in {shlex.quote(workdir)}"]
+    plugin_hints = getattr(plugin, "apply_failure_hints", None)
+    if address and callable(plugin_hints):
+        hints = list(plugin_hints(address, detail)) + hints
     if locked:
         hints.append("The state is locked: wait for the other run, or 'tofu force-unlock <id>'")
     err.suggestions = list(err.suggestions) + hints
