@@ -309,6 +309,41 @@ def _hermetic_keyring():
         keyring.set_keyring(previous)
 
 
+@pytest.fixture(scope="session")
+def _empty_fluid_home(tmp_path_factory):
+    return tmp_path_factory.mktemp("no-fluid-home")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_saved_ai_config(monkeypatch, _empty_fluid_home):
+    """No test reads the developer's saved ``fluid ai setup`` choice.
+
+    Provider selection and ``fluid doctor`` read it through
+    ``_ai_config_shared.load_ai_config``: the ``llm:`` section of the unified
+    ``~/.fluid/config.yaml``, then ``~/.fluid/ai_config.json``. A contributor's
+    own saved provider would change what a test resolves, as the OS keyring
+    would without ``_hermetic_keyring``. Both default paths point into a
+    per-test directory that does not exist, so nothing one test saves reaches
+    another. A test that wants a saved choice patches ``load_ai_config`` or
+    ``_CONFIG_FILE`` itself, or sets ``FLUID_CONFIG`` / ``FLUID_HOME``, which
+    ``unified_config_path`` reads before the home default.
+    """
+    import os
+    import sys
+    import uuid
+
+    home = _empty_fluid_home / uuid.uuid4().hex
+    config_file = home / "ai_config.json"
+    monkeypatch.setattr("fluid_build._ai_config_shared._CONFIG_FILE", config_file)
+    ai_setup = sys.modules.get("fluid_build.cli.ai_setup")
+    if ai_setup is not None:
+        # The same object: ``ai_setup`` re-exports the constant, and its write
+        # path reads it there.
+        monkeypatch.setattr(ai_setup, "_CONFIG_FILE", config_file)
+    if not (os.environ.get("FLUID_CONFIG") or os.environ.get("FLUID_HOME")):
+        monkeypatch.setenv("FLUID_CONFIG", str(home / "config.yaml"))
+
+
 def _noop_assert_safe_url(url, *, allow_private=False):  # noqa: ARG001
     """Replacement for safe_http.assert_safe_url used in unit tests.
 

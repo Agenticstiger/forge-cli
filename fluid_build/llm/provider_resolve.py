@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import shutil
 import sys
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 LOG = logging.getLogger("fluid.cli.llm_providers.resolve")
 
@@ -86,26 +86,77 @@ def _explicit_key_signals(env: Mapping[str, str]) -> Dict[str, List[str]]:
     return signals
 
 
+def _canonical_provider_name(name: Any) -> Optional[str]:
+    """*name* as the provider registry spells it, ``None`` when it is not a name.
+
+    A hand-written ``~/.fluid/config.yaml`` may say ``claude`` or ``claude_code``;
+    the registry answers ``anthropic`` and ``claude-code``. A name it does not
+    know (a plugin provider) comes back as written.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return None
+    registry = getattr(_host(), "BUILTIN_LLM_PROVIDERS", {})
+    key = name.strip().lower()
+    provider = registry.get(key) or registry.get(key.replace("_", "-"))
+    return provider.name if provider is not None else name.strip()
+
+
 def _saved_provider_name() -> Optional[str]:
-    """The provider ``fluid ai setup`` saved, if any (``~/.fluid``)."""
+    """The provider ``fluid ai setup`` saved, if any (``~/.fluid``), by its canonical name."""
     try:
         from fluid_build._ai_config_shared import load_ai_config
 
         name = (load_ai_config() or {}).get("provider")
     except Exception:  # noqa: BLE001 — an unreadable config names nothing
         return None
-    return name if isinstance(name, str) and name else None
+    return _canonical_provider_name(name)
+
+
+def _saved_choice_for(args: Any, env: Dict[str, str], provider: str) -> dict:
+    """The active ``fluid ai setup`` entry when it is *provider*'s, else ``{}``.
+
+    It fills in what a run does not state, for that provider only: its model,
+    and its Ollama host, set in *env* here when ``OLLAMA_HOST`` is not. A run
+    that names its provider (``--llm-provider``, ``FLUID_LLM_PROVIDER``,
+    ``FLUID_FORGE_AGENT``) takes nothing from it: a named provider without a
+    stated model gets its catalog model, which Command Center's drafting call
+    relies on. Shared by ``check_llm_readiness`` and ``resolve_llm_config``.
+    """
+    if _host()._explicit_provider_name(args, env):
+        return {}
+    try:
+        from fluid_build._ai_config_shared import load_ai_config
+
+        saved = load_ai_config()
+    except Exception:  # noqa: BLE001 — an unreadable config supplies nothing
+        return {}
+    if not saved or _canonical_provider_name(saved.get("provider")) != provider:
+        return {}
+    if provider == "ollama" and saved.get("ollama_host") and not env.get("OLLAMA_HOST"):
+        env["OLLAMA_HOST"] = saved["ollama_host"]
+    return saved
+
+
+def _passed_over(saved: str, allow_agents: bool) -> bool:
+    """Whether a run passes over the saved provider *saved*.
+
+    Only an agent (a coding-agent CLI or MCP sampling), and only where the keyless
+    auto-pick is off too (``allow_agents=False``): an agent cannot call a stated
+    endpoint, may not get a stated model meant for another LLM, and has no tool use
+    for the agent loop.
+    """
+    return not allow_agents and saved in _host()._NON_LITELLM_PROVIDERS
 
 
 def no_provider_message(env: Mapping[str, str]) -> str:
     """Why no LLM provider is selected. ``fluid doctor`` and forge both say this."""
     saved = _saved_provider_name()
-    if saved:
-        # Only a command that does not read the saved choice gets here: the
-        # readiness ladder (``fluid doctor``) uses it.
+    if saved in _host()._NON_LITELLM_PROVIDERS:
+        # The one saved choice the ladder passes over (:func:`_passed_over`).
         return (
-            f"No LLM provider is selected for this run: 'fluid ai setup' saved {saved}, "
-            f"but this command does not read the saved choice. Pass --llm-provider {saved}."
+            f"No LLM provider is selected: 'fluid ai setup' saved {saved}, and an agent "
+            "is not used when the run states an endpoint or a model, or runs the agent "
+            "loop. Name a provider with --llm-provider."
         )
     signals = _explicit_key_signals(env)
     if len(signals) > 1:
@@ -216,29 +267,30 @@ def _first_coding_agent_on_path(env: Mapping[str, str]) -> Optional[str]:
 def _lean_keyless_autopick(
     env: Mapping[str, str], *, non_interactive: bool = False, allow_agents: bool = True
 ) -> Optional[str]:
-    """The coding agent a run without litellm auto-picks, else ``None``.
+    """The agent a run without litellm selects, else ``None``.
 
-    The ambient rung of the ladder without its keyring read, so the litellm
-    preflight stays cheap: a non-interactive run, no configuring variable, no
-    saved provider, an agent CLI on PATH, and no local Ollama (it needs litellm,
-    and a running one is never silently swapped for a cloud agent).
-    ``allow_agents=False`` (the agent loop, or a stated endpoint or model)
-    disables it.
+    The selection ladder without its keyring read, so the litellm preflight
+    stays cheap. A key variable, a keyring key and Ollama all need litellm, so
+    two rungs can answer: an agent ``fluid ai setup`` saved, and the keyless
+    auto-pick (a non-interactive run, no configuring variable, no saved
+    provider, an agent CLI on PATH, and no local Ollama: a running one is never
+    silently swapped for a cloud agent). ``allow_agents=False`` (the agent loop,
+    or a stated endpoint or model) disables both.
     """
+    if _infer_provider_from_explicit_keys(env):
+        return None
+    saved = _saved_provider_name()
+    if saved:
+        # Below the saved rung only providers that need litellm remain.
+        if saved in _host()._NON_LITELLM_PROVIDERS and not _passed_over(saved, allow_agents):
+            return saved
+        return None
     if not allow_agents or not _is_non_interactive(non_interactive):
         return None
     if _configured_by_env(env):
         return None
     agent = _first_coding_agent_on_path(env)
     if agent is None:
-        return None
-    try:
-        from fluid_build._ai_config_shared import load_ai_config
-
-        saved = load_ai_config()
-    except Exception:  # noqa: BLE001 — detection must never hard-fail
-        saved = None
-    if saved and saved.get("provider"):
         return None
     detect_fn = getattr(_host(), "detect_ollama_available", None)
     if detect_fn is not None and detect_fn(env):
@@ -260,7 +312,7 @@ def _infer_provider_from_ambient(
 
     Only call this AFTER the saved config and the keyring have been
     consulted — ambient services must not override an explicit
-    operator choice.  See :func:`check_llm_readiness` for the full
+    operator choice.  See :func:`_infer_provider_from_env` for the full
     resolution ladder.
     """
 
@@ -280,16 +332,25 @@ def _infer_provider_from_ambient(
     return None
 
 
-# Backwards-compatible alias for callers outside this module that
-# imported ``_infer_provider_from_env``.  The new code paths inside
-# :func:`check_llm_readiness` use the split functions above so the
-# saved config gets a chance to win over ambient Ollama.
 def _infer_provider_from_env(
     env: Mapping[str, str], *, non_interactive: bool = False, allow_agents: bool = True
 ) -> Optional[str]:
+    """The provider the environment selects when no provider is named.
+
+    1. Exactly one explicit key variable: a deliberate per-run choice.
+    2. The provider ``fluid ai setup`` saved, unless :func:`_passed_over`.
+    3. Exactly one keyring key.
+    4. Ambient discovery (:func:`_infer_provider_from_ambient`).
+
+    The rest of the ladder after a named provider, shared by the real selection
+    and :func:`check_llm_readiness`, so ``fluid doctor`` names what a run uses.
+    """
     explicit = _infer_provider_from_explicit_keys(env)
     if explicit:
         return explicit
+    saved = _saved_provider_name()
+    if saved and not _passed_over(saved, allow_agents):
+        return saved
     keyring_match = _infer_provider_from_keyring()
     if keyring_match:
         return keyring_match

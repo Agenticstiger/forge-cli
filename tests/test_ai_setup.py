@@ -262,13 +262,10 @@ class TestCheckLlmReadiness:
     def test_not_ready_without_keys(self):
         from fluid_build.cli.forge_copilot_llm_providers import check_llm_readiness
 
-        # Patch every step in the resolution ladder so the real config
-        # file isn't read, no ambient Ollama is picked up, and no
-        # keyring entry leaks in.  The provider-precedence fix split
-        # ``_infer_provider_from_env`` into explicit / keyring /
-        # ambient helpers — ``check_llm_readiness`` calls them
-        # individually so every test-time Ollama install must be
-        # mocked at the ambient step.
+        # Readiness walks the selection ladder (``_provider_name_from``), so
+        # every rung's input is emptied: no key variable in the environment
+        # handed in, no saved config (never the real ~/.fluid), the hermetic
+        # keyring from conftest, no ambient Ollama and no agent CLI on PATH.
         with (
             patch("fluid_build.cli._ai_config_shared.load_ai_config", return_value=None),
             patch(
@@ -276,19 +273,15 @@ class TestCheckLlmReadiness:
                 Path("/nonexistent/ai_config.json"),
             ),
             patch(
-                "fluid_build.cli.forge_copilot_llm_providers._infer_provider_from_explicit_keys",
-                return_value=None,
+                "fluid_build.cli.forge_copilot_llm_providers.detect_ollama_available",
+                return_value=False,
             ),
             patch(
-                "fluid_build.cli.forge_copilot_llm_providers._infer_provider_from_keyring",
-                return_value=None,
-            ),
-            patch(
-                "fluid_build.cli.forge_copilot_llm_providers._infer_provider_from_ambient",
+                "fluid_build.llm.provider_resolve._first_coding_agent_on_path",
                 return_value=None,
             ),
         ):
-            result = check_llm_readiness({})
+            result = check_llm_readiness({"PATH": "/nonexistent"})
             assert not result.ready
             assert result.error is not None
 
@@ -1048,11 +1041,8 @@ class TestGeminiIsDefaultProvider:
 
         args = argparse.Namespace(llm_provider=None, llm_model=None, llm_endpoint=None)
 
+        # The keyring is conftest's empty in-memory one.
         with (
-            patch(
-                "fluid_build.cli.forge_copilot_llm_providers._infer_provider_from_keyring",
-                return_value=None,
-            ),
             patch(
                 "fluid_build.cli.forge_copilot_llm_providers.detect_ollama_available",
                 return_value=False,
