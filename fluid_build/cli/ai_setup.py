@@ -1450,6 +1450,7 @@ def run_ai_setup_inline(console: Any) -> Optional[LlmConfig]:
 
     Returns ``None`` if the user skips setup, stdin is not a TTY, or key
     variables name two or more providers (setup names them instead of choosing).
+    Callers do not run it for a provider the operator named.
     """
     # Resolve deferred symbols via the module ``__getattr__`` lazy-import seam.
     from fluid_build.cli.ai_setup import (

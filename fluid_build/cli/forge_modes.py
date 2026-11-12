@@ -1111,6 +1111,22 @@ def _render_ai_copilot_error(console: Any, exc: BaseException) -> None:
                 )
 
 
+def _with_run_provider(findings: Any, args: Any) -> Any:
+    """The welcome scan's *findings*, showing the provider this run uses.
+
+    The scan reads the saved choice and the environment, never the flags, so
+    ``--llm-provider`` (or the provider inline setup put into *args*) replaces
+    its guess.
+    """
+    from fluid_build.llm.providers import named_llm_provider
+
+    provider = named_llm_provider(args)
+    if provider:
+        findings.ai_configured = True
+        findings.ai_provider_hint = provider
+    return findings
+
+
 def run_ai_copilot_mode(
     args: Any,
     logger: logging.Logger,
@@ -1163,7 +1179,7 @@ def run_ai_copilot_mode(
                     run_welcome_scan,
                 )
 
-                _findings = run_welcome_scan()
+                _findings = _with_run_provider(run_welcome_scan(), args)
                 render_welcome(_findings, console=console)
             except Exception:  # noqa: BLE001 — welcome must never block forge
                 pass

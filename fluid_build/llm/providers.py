@@ -32,6 +32,8 @@ __all__ = [
     "reset_llm_caches",
     "agent_loop_requested",
     "preflight_llm_provider",
+    "fill_llm_args_from_setup",
+    "named_llm_provider",
     "remember_named_llm_provider",
     "resolve_llm_config",
     "resolve_model_name",
@@ -52,6 +54,7 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterator, List, Mapping, Optional
 
 import httpx
@@ -907,6 +910,78 @@ def remember_named_llm_provider(args: Any, environ: Optional[Mapping[str, str]] 
         return
     env = os.environ if environ is None else environ
     setattr(args, _NAMED_PROVIDER_ATTR, _explicit_provider_name(args, env))
+
+
+def named_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """The provider the operator named for this run, else ``None``.
+
+    ``--llm-provider``, else ``FLUID_LLM_PROVIDER``, else ``FLUID_FORGE_AGENT``:
+    the first thing every selection reads (:func:`_provider_name_from`). A run
+    that names one does not run interactive setup, which cannot know the name.
+    """
+    env = os.environ if environ is None else environ
+    flag = _stated_arg(args, "llm_provider")
+    return flag or _explicit_provider_name(None, env)
+
+
+def _stated_arg(args: Any, name: str) -> Optional[str]:
+    """``args.<name>`` when the run states it, else ``None``.
+
+    Only a non-empty string counts, so a test double's invented attribute does not.
+    """
+    value = getattr(args, name, None)
+    return value if isinstance(value, str) and value else None
+
+
+def fill_llm_args_from_setup(
+    args: Any, config: LlmConfig, environ: Optional[Mapping[str, str]] = None
+) -> bool:
+    """Put what interactive setup found into *args*, under what the operator stated.
+
+    Inline setup (``cli.ai_setup.run_ai_setup_inline``) finds a provider without
+    reading the run's flags, so what the operator stated wins:
+
+    * A named provider (:func:`named_llm_provider`) takes nothing from setup.
+    * An agent that setup found (a coding-agent CLI or MCP sampling) is not used
+      when the run states an endpoint or a model, or runs the agent loop, as in
+      a run without a TTY (``provider_resolve._passed_over``).
+    * Otherwise setup's provider goes into ``args.llm_provider``, recorded first
+      as not named (:func:`remember_named_llm_provider`). Its model and endpoint
+      fill ``args.llm_model`` and ``args.llm_endpoint`` only where the run states
+      neither the flag nor ``FLUID_LLM_MODEL`` / ``FLUID_LLM_ENDPOINT``.
+
+    Returns whether setup's provider is used. Only then may the caller put its
+    key into the session (``cli.ai_setup.set_session_env``).
+    """
+    env = os.environ if environ is None else environ
+    remember_named_llm_provider(args, env)
+    recorded = _recorded_named_provider(args)
+    if isinstance(recorded, str) and recorded:  # the operator named a provider
+        return False
+    # The run's own statements only, so a test double's invented attribute
+    # does not read as a stated endpoint, model or agent loop.
+    stated = SimpleNamespace(
+        agent_loop=getattr(args, "agent_loop", False) is True,
+        **{
+            name: _stated_arg(args, name)
+            for name in ("llm_endpoint", "llm_model", "llm_routing_endpoint", "llm_routing_model")
+        },
+    )
+    if config.provider in _NON_LITELLM_PROVIDERS and not _agents_allowed(stated, env):
+        # A constant line: *config* holds a key (CodeQL
+        # py/clear-text-logging-sensitive-data).
+        LOG.warning(
+            "Not using the agent setup found: an agent is not used when the run states "
+            "an endpoint or a model, or runs the agent loop. Name a provider with "
+            "--llm-provider."
+        )
+        return False
+    args.llm_provider = config.provider
+    if not (_stated_arg(args, "llm_model") or env.get("FLUID_LLM_MODEL")):
+        args.llm_model = config.model
+    if not (_stated_arg(args, "llm_endpoint") or env.get("FLUID_LLM_ENDPOINT")):
+        args.llm_endpoint = config.endpoint
+    return True
 
 
 def _unnamed_provider_note(

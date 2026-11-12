@@ -153,6 +153,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a model the endpoint has. All three now ask the stated endpoint. A `--tiered` stage now
   calls a stated endpoint too, as the routing model already did; it called the provider's
   default address instead.
+- **Interactive `fluid forge` keeps the provider, model and endpoint you state.** Its inline
+  setup put the saved or first-found provider over `--llm-provider`, `--llm-model` and
+  `--llm-endpoint`, and over `FLUID_LLM_PROVIDER`, `FLUID_FORGE_AGENT`, `FLUID_LLM_MODEL` and
+  `FLUID_LLM_ENDPOINT`, so `fluid forge --llm-provider ollama` could call Anthropic. A run that
+  names its provider now skips inline setup and resolves as a run without a TTY does. Otherwise
+  setup fills only what the run leaves unstated, and an agent it finds is not used when the run
+  states an endpoint or a model, or runs the agent loop. The welcome panel and the interview's
+  "What I see" panel name the provider the run uses, not the saved one. `fluid init`'s AI path
+  does the same, and its handoff no longer offers AI setup for a provider named by a variable.
 - **Interactive setup no longer picks GitHub Models from `GITHUB_API_KEY`.** It took any variable
   in `PROVIDER_ENV_VARS`, so `GITHUB_API_KEY` alone selected github, which setup then failed to
   build (`KeyError: 'github'`). It now reads the key variables a run without a TTY reads:

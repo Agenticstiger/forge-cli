@@ -1861,34 +1861,29 @@ def _run_main(args, logger: logging.Logger) -> int:
         if console and not get_cli_arg(args, "non_interactive", False) and not _picker_ran:
             print_welcome_panel(console)
 
-        # Check LLM readiness; load saved config or offer inline setup
-        if not get_cli_arg(args, "non_interactive", False):
+        # Check LLM readiness; load saved config or offer inline setup. Setup
+        # cannot see the run's flags, so a run that names its provider
+        # (--llm-provider, FLUID_LLM_PROVIDER, FLUID_FORGE_AGENT) skips it and
+        # resolves as a run without a TTY does. The copilot's preflight still
+        # fails first on a provider this install cannot run (no litellm), before
+        # anything reads the keyring.
+        from fluid_build.llm.providers import named_llm_provider
+
+        if not get_cli_arg(args, "non_interactive", False) and not named_llm_provider(args):
             from fluid_build.cli.ai_setup import run_ai_setup_inline
 
-            # An explicit litellm-backed --llm-provider on an install without
-            # litellm fails here, before the setup flow reads the OS keyring or
-            # offers to import or prompt for a key it could not use.
-            if get_cli_arg(args, "llm_provider", None):
-                from fluid_build.llm.providers import preflight_llm_provider
-
-                preflight_llm_provider(args)
-
-            # Always go through inline setup — it handles all cases:
+            # Inline setup handles every run that names no provider:
             # 1. Config file exists with key → loads it, sets env vars, returns config
             # 2. Keyring has key → loads it, sets env vars, returns config
             # 3. Nothing found → prompts user interactively
             llm_config = run_ai_setup_inline(console)
             if llm_config:
-                from fluid_build.llm.providers import remember_named_llm_provider
+                from fluid_build.llm.providers import fill_llm_args_from_setup
 
-                # First keep what the operator named: FLUID_LLM_API_KEY goes only to
-                # that provider, never to the one setup found.
-                remember_named_llm_provider(args)
-                # Inject into args so copilot's resolve_llm_config() finds them
-                args.llm_provider = llm_config.provider
-                args.llm_model = llm_config.model
-                args.llm_endpoint = llm_config.endpoint
-                if llm_config.api_key:
+                # Setup fills only what the operator left unstated
+                # (--llm-model, --llm-endpoint and their FLUID_LLM_* twins win),
+                # and its key goes into the session only with its own provider.
+                if fill_llm_args_from_setup(args, llm_config) and llm_config.api_key:
                     from fluid_build.cli.ai_setup import set_session_env
 
                     set_session_env(llm_config.provider, llm_config.api_key)

@@ -702,6 +702,8 @@ class TestIsAiConfigured:
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
             "OLLAMA_HOST",
+            "FLUID_LLM_PROVIDER",
+            "FLUID_FORGE_AGENT",
         ):
             monkeypatch.delenv(key, raising=False)
         with patch("fluid_build.cli.ai_setup._load_ai_config", return_value=None):

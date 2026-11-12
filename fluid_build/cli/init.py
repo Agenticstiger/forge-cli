@@ -528,8 +528,9 @@ def run(args, logger: logging.Logger) -> int:
 def _is_ai_configured() -> bool:
     """Return True if a saved AI config (or environment fallback) is usable.
 
-    Mirrors the resolution order in :func:`ai_setup.run_ai_setup_inline`:
-    saved config → the key variables of exactly one
+    Mirrors what forge does before :func:`ai_setup.run_ai_setup_inline`: a
+    provider named by ``FLUID_LLM_PROVIDER`` / ``FLUID_FORGE_AGENT`` (forge
+    then runs no setup) → saved config → the key variables of exactly one
     provider (``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``, ``GEMINI_API_KEY`` /
     ``GOOGLE_API_KEY``, or ``OLLAMA_HOST``), or of several when exactly one
     provider has a keyring key, which setup then uses. ``GITHUB_API_KEY`` does
@@ -547,6 +548,10 @@ def _is_ai_configured() -> bool:
         _infer_provider_from_keyring,
         ambiguous_keys_message,
     )
+    from fluid_build.llm.providers import named_llm_provider
+
+    if named_llm_provider(None):
+        return True
 
     saved = _load_ai_config()
     if saved and saved.get("provider"):
@@ -909,23 +914,22 @@ def _ai_mode(args, logger: logging.Logger) -> int:
         )
 
     try:
+        from fluid_build.llm.providers import fill_llm_args_from_setup, named_llm_provider
+
         from .ai_setup import run_ai_setup_inline, set_session_env
         from .forge import run_ai_copilot_mode
 
-        # Run inline LLM setup — same as forge.py:run() does.
+        # Run inline LLM setup — same as forge.py:run() does: not for a provider
+        # the operator named (FLUID_LLM_PROVIDER, FLUID_FORGE_AGENT), and it
+        # fills only what the run leaves unstated (FLUID_LLM_MODEL and
+        # FLUID_LLM_ENDPOINT win).
         _console = console if RICH_AVAILABLE else None
-        llm_config = run_ai_setup_inline(_console)
+        named = named_llm_provider(args)
+        llm_config = None if named else run_ai_setup_inline(_console)
         if llm_config:
-            from fluid_build.llm.providers import remember_named_llm_provider
-
-            # FLUID_LLM_API_KEY goes only to a provider the operator named.
-            remember_named_llm_provider(args)
-            args.llm_provider = llm_config.provider
-            args.llm_model = llm_config.model
-            args.llm_endpoint = llm_config.endpoint
-            if llm_config.api_key:
+            if fill_llm_args_from_setup(args, llm_config) and llm_config.api_key:
                 set_session_env(llm_config.provider, llm_config.api_key)
-        else:
+        elif not named:
             if RICH_AVAILABLE:
                 from .forge_dialogs import print_dialog_status
 
