@@ -142,8 +142,8 @@ def _skip_where_litellm_cannot_reply() -> None:
 
 
 # The providers forge picks without a name: the one keyring key or key variable
-# (openai, anthropic, gemini), interactive setup's scan of PROVIDER_ENV_VARS
-# (github too), a running Ollama. Such a run never gets FLUID_LLM_API_KEY. Forge
+# (openai, anthropic, gemini), interactive setup's key import (a gh login:
+# github), a running Ollama. Such a run never gets FLUID_LLM_API_KEY. Forge
 # reaches every other provider only by being named.
 _PICKED_WITHOUT_A_NAME = frozenset({"openai", "anthropic", "gemini", "github", "ollama"})
 

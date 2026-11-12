@@ -594,6 +594,7 @@ def run_adaptive_copilot_interview(
             console=console,
             target_dir=target_dir,
             project_memory=project_memory,
+            ai_provider=getattr(llm_config, "provider", None),
         )
         # Schema-coverage gate: if anything required is missing,
         # fall through to the gap-filler bootstrap so the LLM still

@@ -354,10 +354,17 @@ def test_interactive_forge_records_what_was_named_before_setup_s_pick(
         forge_run(args, logging.getLogger("test"))
 
     ran_with = seen["args"]
-    assert ran_with.llm_provider == "openai"
-    assert ran_with.llm_provider_named == flag
     env = world.env(FLUID_LLM_API_KEY=GENERIC_KEY, OPENAI_API_KEY=OPENAI_KEY)
-    assert providers.resolve_llm_config(ran_with, env).api_key == OPENAI_KEY
+    config = providers.resolve_llm_config(ran_with, env)
+    if flag is None:
+        assert ran_with.llm_provider == "openai"
+        assert ran_with.llm_provider_named is None
+        assert config.api_key == OPENAI_KEY
+    else:
+        # A named provider skips setup, so the key goes to the provider named.
+        assert ran_with.llm_provider == flag
+        assert config.provider == flag
+        assert config.api_key == GENERIC_KEY
 
 
 # ── fluid doctor and fluid ai test ─────────────────────────────────────────

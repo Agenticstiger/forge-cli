@@ -250,6 +250,7 @@ def collect_signals(
     target_dir: Optional[Path] = None,
     project_memory: Any = None,
     active_agent: str = "",
+    ai_provider: Optional[str] = None,
 ) -> InterviewSignals:
     """Pull every signal the system already has into a single record.
 
@@ -261,6 +262,9 @@ def collect_signals(
     data-product-type picker to the codes the agent's spec declares
     in ``supported_data_product_types``. Empty / unknown agent names
     leave the picker unfiltered (all three types).
+
+    ``ai_provider``: the provider the run resolved. It replaces the scan's
+    guess, which reads the saved choice and cannot see ``--llm-provider``.
     """
     cwd = (target_dir or Path.cwd()).resolve()
     sig = InterviewSignals(cwd_name=cwd.name, active_agent=active_agent)
@@ -289,6 +293,9 @@ def collect_signals(
         sig.ai_provider = findings.ai_provider_hint
     except Exception as exc:  # noqa: BLE001
         LOG.debug("welcome_scan_unavailable: %s", exc)
+    if isinstance(ai_provider, str) and ai_provider:
+        sig.ai_configured = True
+        sig.ai_provider = ai_provider
 
     try:
         from fluid_build.cli.workspace_config import (
@@ -439,6 +446,7 @@ def run_world_class_bootstrap(
     project_memory: Any = None,
     auto_mode: bool = False,
     active_agent: str = "",
+    ai_provider: Optional[str] = None,
 ) -> None:
     """Drive the world-class interview against ``state``.
 
@@ -451,6 +459,9 @@ def run_world_class_bootstrap(
     ``supported_data_product_types`` allowlist. The interview's
     inference path falls back to the first allowed type when the
     workspace lock or scan-suggested type is forbidden by the agent.
+
+    ``ai_provider``: the provider the run uses, shown in the "What I see"
+    panel (see :func:`collect_signals`).
     """
     from fluid_build.cli.forge_dialogs import ask_friendly_text
 
@@ -462,6 +473,7 @@ def run_world_class_bootstrap(
         target_dir=target_dir,
         project_memory=project_memory,
         active_agent=active_agent,
+        ai_provider=ai_provider,
     )
 
     # Pre-fill anything we can infer without asking, BEFORE rendering
