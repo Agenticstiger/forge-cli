@@ -268,7 +268,10 @@ class TestContractValidator:
 
     @patch("fluid_build.cli.contract_validation.load_contract_with_overlay")
     @patch("fluid_build.cli.contract_validation.FluidSchemaManager")
-    def test_databricks_provider_not_implemented(self, MockSM, mock_load):
+    def test_databricks_connection_failure_says_what_to_fix(self, MockSM, mock_load):
+        from fluid_build.providers.databricks.statements import StatementError
+        from fluid_build.providers.databricks_validation import DatabricksValidationProvider
+
         contract = self._make_contract()
         contract["exposes"][0]["binding"]["platform"] = "databricks"
         mock_load.return_value = contract
@@ -277,8 +280,16 @@ class TestContractValidator:
         mock_sm.validate_contract.return_value = mock_result
 
         v = ContractValidator(Path("test.yaml"), use_cache=False, check_data=False)
-        report = v.validate()
-        assert any("Unity Catalog is not available" in w.message for w in report.get_warnings())
+        no_warehouse = StatementError("DATABRICKS_WAREHOUSE_ID is not set")
+        with (
+            patch("fluid_build.cli.contract_validation.DATABRICKS_VALIDATION_AVAILABLE", True),
+            patch.object(
+                DatabricksValidationProvider, "validate_connection", side_effect=no_warehouse
+            ),
+        ):
+            report = v.validate()
+        errors = [i for i in report.get_errors() if i.category == "connection"]
+        assert errors and "DATABRICKS_WAREHOUSE_ID is not set" in errors[0].message
 
     @patch("fluid_build.cli.contract_validation.load_contract_with_overlay")
     @patch("fluid_build.cli.contract_validation.FluidSchemaManager")

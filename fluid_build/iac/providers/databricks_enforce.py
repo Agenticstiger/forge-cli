@@ -281,21 +281,26 @@ class SqlRunner:
         """Run one statement to ``SUCCEEDED``; :class:`StatementFailed` otherwise."""
         self.execute(statement)
 
-    def execute(self, statement: str) -> Mapping[str, Any]:
-        """:meth:`run`, and the finished statement's document (its ``result`` and ``manifest``)."""
+    def execute(
+        self, statement: str, parameters: Optional[Sequence[Mapping[str, Any]]] = None
+    ) -> Mapping[str, Any]:
+        """:meth:`run`, and the finished statement's document (its ``result`` and ``manifest``).
+
+        ``parameters`` binds the statement's ``:name`` markers (``{"name", "value", "type"}``
+        each), so a value never becomes statement text.
+        """
         do = self._client.api_client.do
         doc: Any = None
+        body: Dict[str, Any] = {
+            "warehouse_id": self._warehouse,
+            "statement": statement,
+            "wait_timeout": "30s",
+            "on_wait_timeout": "CONTINUE",
+        }
+        if parameters:
+            body["parameters"] = [dict(p) for p in parameters]
         try:
-            doc = do(
-                "POST",
-                "/api/2.0/sql/statements/",
-                body={
-                    "warehouse_id": self._warehouse,
-                    "statement": statement,
-                    "wait_timeout": "30s",
-                    "on_wait_timeout": "CONTINUE",
-                },
-            )
+            doc = do("POST", "/api/2.0/sql/statements/", body=body)
             deadline = time.monotonic() + self._timeout
             while self._state(doc) in ("PENDING", "RUNNING"):
                 if time.monotonic() > deadline:
