@@ -810,7 +810,12 @@ _NON_LITELLM_PROVIDERS: frozenset = _KEYLESS_PROVIDERS - {"ollama"}
 
 
 def _provider_name_from(args: Any, env: Mapping[str, str]) -> Optional[str]:
-    """The provider the flags and environment select (flag, env, key sniff, ambient).
+    """The provider the flags and environment select.
+
+    The named provider (``--llm-provider``, ``FLUID_LLM_PROVIDER``,
+    ``FLUID_FORGE_AGENT``), else :func:`_infer_provider_from_env`: one key
+    variable, the saved ``fluid ai setup`` choice, one keyring key, then ambient
+    discovery. :func:`check_llm_readiness` calls this too (``args=None``).
 
     ``None`` when nothing selects one. There is no default provider: guessing
     one would send ``FLUID_LLM_API_KEY`` to a vendor it may not belong to, and
@@ -838,17 +843,27 @@ def agent_loop_requested(flag: Any, environ: Optional[Mapping[str, str]] = None)
 
 
 def _agents_allowed(args: Any, env: Mapping[str, str]) -> bool:
-    """Whether the keyless auto-pick may choose a coding agent for this run.
+    """Whether an agent this run did not name may be used: auto-picked or saved.
 
     Not for the agent loop (it needs tool use, which the agents do not offer),
-    and not when ``--llm-endpoint`` / ``--llm-model`` (or their routing twins)
-    state where or what to call: that destination is never swapped for an agent.
+    and not when ``--llm-endpoint`` / ``--llm-model`` (or their routing twins,
+    as flags or ``FLUID_LLM_*`` variables) state where or what to call: that
+    destination is never swapped for an agent.
     """
     return not (
         agent_loop_requested(getattr(args, "agent_loop", False), env)
         or any(
             getattr(args, name, None)
             for name in ("llm_endpoint", "llm_model", "llm_routing_endpoint", "llm_routing_model")
+        )
+        or any(
+            env.get(var)
+            for var in (
+                "FLUID_LLM_ENDPOINT",
+                "FLUID_LLM_MODEL",
+                "FLUID_LLM_ROUTING_ENDPOINT",
+                "FLUID_LLM_ROUTING_MODEL",
+            )
         )
     )
 
@@ -1009,14 +1024,21 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
         raise CopilotGenerationError("copilot_no_llm_provider", no_provider_message(env))
     provider = get_llm_provider(provider_name)
 
+    # The saved ``fluid ai setup`` choice fills in the model and the Ollama host
+    # this run does not state, for its own provider and only when the run names
+    # none: what ``check_llm_readiness`` reports.
+    saved = _saved_choice_for(args, env, provider.name)
+
     # A stated endpoint is where the call goes, so the Ollama model pick and the
     # model preflight below ask that daemon, not OLLAMA_HOST or localhost.
     stated_endpoint = getattr(args, "llm_endpoint", None) or env.get("FLUID_LLM_ENDPOINT")
     models_endpoint = stated_endpoint if isinstance(stated_endpoint, str) else None
 
-    # Resolve model: explicit flag → env var → catalog default → class default.
+    # Resolve model: explicit flag → env var → saved choice → catalog default → class default.
     catalog_default = get_catalog_default(provider.name)
-    explicit_model = getattr(args, "llm_model", None) or env.get("FLUID_LLM_MODEL")
+    explicit_model = (
+        getattr(args, "llm_model", None) or env.get("FLUID_LLM_MODEL") or saved.get("model")
+    )
     if explicit_model:
         model = resolve_model_name(provider.name, explicit_model)
         model_source = "explicit"
@@ -1066,9 +1088,13 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
     if unnamed_note:
         model_notes.append(unnamed_note)
         LOG.warning(unnamed_note)
-    if not _explicit_provider_name(args, env) and provider.name in _NON_LITELLM_PROVIDERS:
-        # Nothing named a provider and it is not a key-based one, so the keyless
-        # auto-pick chose it: say which, and how to override.
+    if (
+        not _explicit_provider_name(args, env)
+        and not saved
+        and provider.name in _NON_LITELLM_PROVIDERS
+    ):
+        # Nothing named or saved a provider and it is not a key-based one, so the
+        # keyless auto-pick chose it: say which, and how to override.
         note = (
             f"No LLM provider is configured; using {provider.name}, the first coding agent "
             f"found on PATH. Override with --llm-provider."
@@ -1593,13 +1619,11 @@ def call_llm_streaming(
 from fluid_build.llm.provider_resolve import (  # noqa: E402,F401
     _LLM_KEYRING_PREFIX,
     _get_api_key_from_keyring,
-    _infer_provider_from_ambient,
     _infer_provider_from_env,
-    _infer_provider_from_explicit_keys,
-    _infer_provider_from_keyring,
     _keyring_key,
     _lean_keyless_autopick,
     _resolve_api_key,
+    _saved_choice_for,
     clear_api_key_from_keyring,
     no_provider_message,
     save_api_key_to_keyring,
@@ -1672,82 +1696,31 @@ class LlmReadinessCheck:
 def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadinessCheck:
     """Non-throwing check of whether an LLM provider is accessible.
 
-    Resolution ladder (highest precedence first):
+    The provider comes from the ladder the real selection walks
+    (:func:`_provider_name_from`), so ``fluid doctor`` names what a run uses:
 
-    1. ``FLUID_LLM_PROVIDER`` env var — explicit selector wins everything.
-    2. Explicit API-key env vars (``OPENAI_API_KEY`` /
-       ``ANTHROPIC_API_KEY`` / ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``
-       / ``OLLAMA_HOST``) when exactly one is set — deliberate
-       per-run override.
+    1. A named provider: ``FLUID_LLM_PROVIDER`` or ``FLUID_FORGE_AGENT``.
+    2. Exactly one explicit key variable (``OPENAI_API_KEY`` /
+       ``ANTHROPIC_API_KEY`` / ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY`` /
+       ``OLLAMA_HOST``) — a deliberate per-run choice.
     3. ``~/.fluid/ai_config.json`` — the user's persisted choice from
        ``fluid ai setup``.  This MUST beat ambient detection (e.g.
        Ollama running on ``localhost:11434``); operators report
        confusion when ``fluid doctor`` shows ``ollama`` despite
        having configured Gemini / Anthropic / OpenAI explicitly.
-    4. Keyring — a saved provider key in the OS keyring.
-    5. Ambient Ollama on localhost — last-resort discovery.
+    4. Keyring — exactly one saved provider key in the OS keyring.
+    5. Ambient discovery — a local Ollama, then (non-interactive, nothing
+       configured) the first coding-agent CLI on PATH.
+
+    Unless the provider was named (rung 1), the saved choice's model, key and
+    Ollama host apply when it is that provider's: ``GOOGLE_API_KEY=…`` plus a
+    saved ``{provider: gemini, model: gemini-2.5-pro}`` reports the saved model.
 
     Used by ``fluid doctor`` and forge.
     """
     env = dict(environ or os.environ)
 
-    saved = None
-    saved_model = None
-    saved_key = None
-
-    # Step 1 — explicit env-var selector. Only this step names the provider, so
-    # only here may FLUID_LLM_API_KEY count as its key (_resolve_api_key).
-    provider_name = env.get("FLUID_LLM_PROVIDER")
-    named = bool(provider_name)
-
-    # Step 2 — explicit API-key env vars (deliberate per-run override).
-    if not provider_name:
-        provider_name = _infer_provider_from_explicit_keys(env)
-
-    # Step 3 — saved ``~/.fluid/ai_config.json`` choice.
-    #
-    # Read the saved config through the tier-0 ``_ai_config_shared`` leaf, NOT
-    # ``cli.ai_setup``. Importing ``ai_setup`` here (from inside the LLM-provider
-    # module) is the edge that closed the ``ai_setup <-> llm_providers`` import
-    # cycle; the leaf owns the shared config-loading surface so neither module
-    # imports the other for it.
-    if not provider_name:
-        try:
-            from fluid_build._ai_config_shared import load_ai_config
-
-            saved = load_ai_config()
-            if saved:
-                provider_name = saved.get("provider")
-                saved_model = saved.get("model")
-                saved_key = saved.get("api_key")
-                LOG.debug("LLM readiness: found provider=%s in config file", provider_name)
-        except ImportError:
-            pass
-
-    # Step 4 — keyring fallback.
-    if not provider_name:
-        provider_name = _infer_provider_from_keyring()
-
-    # Step 5 — last-resort ambient discovery (Ollama on localhost).
-    if not provider_name:
-        provider_name = _infer_provider_from_ambient(env)
-
-    # Even when the provider was selected via env-var inference, we
-    # still want the saved config's model + key for the matching
-    # provider — that way ``GOOGLE_API_KEY=…`` plus a saved
-    # ``ai_config.json`` of ``{provider: gemini, model: gemini-2.5-pro}``
-    # honours the saved model.
-    if provider_name and saved is None:
-        try:
-            from fluid_build._ai_config_shared import load_ai_config
-
-            saved = load_ai_config()
-            if saved and saved.get("provider") == provider_name:
-                saved_model = saved.get("model")
-                saved_key = saved.get("api_key")
-        except ImportError:
-            pass
-
+    provider_name = _provider_name_from(None, env)
     if not provider_name:
         LOG.debug("LLM readiness: no provider detected from env or config")
         return LlmReadinessCheck(
@@ -1763,13 +1736,14 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
             error=f"Unknown LLM provider '{provider_name}'.",
         )
 
-    # For ollama from config, ensure OLLAMA_HOST is set
-    if provider.name == "ollama" and saved and saved.get("ollama_host"):
-        if not env.get("OLLAMA_HOST"):
-            env["OLLAMA_HOST"] = saved["ollama_host"]
+    # The saved choice's model, key and Ollama host, when it is this provider's.
+    saved = _saved_choice_for(None, env, provider.name)
 
     # Resolve API key: env vars → config file
-    api_key = _resolve_api_key(provider.name, env, named=named) or saved_key
+    # FLUID_LLM_API_KEY counts only for a provider named with FLUID_LLM_PROVIDER or
+    # FLUID_FORGE_AGENT, never for one the ladder picked, the saved choice included.
+    named = _provider_is_named(None, env, provider.name)
+    api_key = _resolve_api_key(provider.name, env, named=named) or saved.get("api_key")
     from fluid_build.llm.coding_agent import _AGENT_SPECS
 
     agent = _AGENT_SPECS.get(provider.name)
@@ -1801,7 +1775,7 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
             error=f"No API key found for {provider.name}. Run 'fluid ai setup'.",
         )
 
-    model = env.get("FLUID_LLM_MODEL") or saved_model or provider.default_model
+    model = env.get("FLUID_LLM_MODEL") or saved.get("model") or provider.default_model
     endpoint = env.get("FLUID_LLM_ENDPOINT") or provider.default_endpoint(model, env)
 
     # Every built-in provider except the keyless agent/MCP ones runs through
