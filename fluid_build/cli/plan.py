@@ -319,13 +319,19 @@ def run(args, logger: logging.Logger) -> int:
         # checker validate runs) decides by default, before any plan is generated
         # or written: a blocking verdict raises and no plan.json is written. It
         # builds no provider, so a plain plan stays off the cloud SDKs.
-        # ``--check-sovereignty`` asks the provider's hook too, before the write
-        # below; ``--no-check-sovereignty`` skips the check, logged at WARNING for
-        # audit as ``fluid apply --no-verify-plan-binding`` is.
+        # ``--check-sovereignty`` runs it too and then asks the provider's hook,
+        # before the write below: a hook that reports nothing must not make the
+        # explicit check weaker than the default. ``--no-check-sovereignty`` skips
+        # the check, said on the console and logged at WARNING for audit, as
+        # ``fluid apply --no-verify-plan-binding`` is.
         check_sovereignty = getattr(args, "check_sovereignty", None)
-        if check_sovereignty is None:
+        if check_sovereignty is not False:
             _gate_sovereignty(contract, args.contract, logger)
-        elif check_sovereignty is False:
+        else:
+            warning(
+                "Sovereignty check skipped (--no-check-sovereignty): the plan is written "
+                "whatever the contract's sovereignty policy says."
+            )
             warn(
                 logger,
                 "--no-check-sovereignty: the sovereignty check was SKIPPED. The plan "

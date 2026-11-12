@@ -82,13 +82,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the policy only with `--check-sovereignty`, so a contract `fluid validate` refuses
   (`enforcementMode: strict`, or a region in `deniedRegions`, which blocks in every mode) still
   got a plan. Now plan runs the same policy engine before it plans: a blocking verdict exits 1
-  (`ERR_SOVEREIGNTY_VIOLATION`) and writes no `plan.json`. The default check builds no cloud
-  provider. `--check-sovereignty` still asks the provider's own hook too and prints the verdict,
-  and it now also refuses before the plan is written. The new `--no-check-sovereignty` writes the
-  plan anyway and logs a WARNING (event `sovereignty_check_skipped`); it changes nothing in
-  `fluid apply`, which keeps its own checks (on Databricks and GCP it refuses such a placement
-  itself). The generated CI pipelines already pass `--check-sovereignty`; a failing plan stage
-  now leaves no plan file.
+  (`ERR_SOVEREIGNTY_VIOLATION`) before any plan is written. The default check builds no cloud
+  provider. `--check-sovereignty` runs the same check, then asks the provider's own hook and
+  prints the verdict, also before the plan is written: a hook that reports nothing no longer
+  passes a contract `fluid validate` refuses. The new `--no-check-sovereignty` writes the plan
+  anyway, says so on the console and logs a WARNING (event `sovereignty_check_skipped`); it
+  changes nothing in `fluid apply`, which keeps its own checks (on Databricks and GCP it refuses
+  such a placement itself). The generated CI pipelines already pass `--check-sovereignty`; a
+  failing plan stage now writes no plan file (one left at `--out` by an earlier run stays as it
+  was).
 - **Databricks: Unity Catalog tag values are written as the contract states them.** The
   governance labels became tags with GCP's label slugs: lowercased, spaces and punctuation
   turned into `-`, cut at 63 characters (`business_value =
@@ -196,8 +198,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logs and errors. Tokens are still masked, in both redaction layers (the Snowflake one now uses
   the global rule), and more of them than before: a JWE (one with direct encryption has an empty
   encrypted key), a JWS with a short or empty payload or signature, a header written with spaces
-  or newlines, and a token glued to a word (`token_eyJ…`). The rule no longer scans quadratically
-  on `a-a-a-…` input. `redact_secret_text()` loses its `keep_dotted_names` keyword (0.28.0):
+  or newlines, and a token glued to a word (`token_eyJ…`). The JWT rules no longer scan
+  quadratically on input such as `a-a-a-…` or `eyJ-eyJ-…` (200,000 characters took 30 s or more;
+  now under a second). `redact_secret_text()` loses its `keep_dotted_names` keyword (0.28.0):
   logs and printed errors now apply the same rule.
 
 ## [0.29.0] — 2026-11-12

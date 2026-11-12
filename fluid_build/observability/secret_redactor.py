@@ -99,23 +99,25 @@ _SENSITIVE_KEY_PARTS = (
 # (``x-eyJ…``, ``token_eyJ…``) is :data:`_JWT_RE`'s.
 _JWT_ANCHORED_RE = re.compile(
     r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+"
-    r"(?:\.[A-Za-z0-9_-]+){0,2}"
+    r"(?:\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)?"
 )
 # Two-segment JWT (header.payload, no signature). Anchored on the ``eyJ``
 # base64url prefix of the JSON ``{"`` header so we don't redact arbitrary
 # dotted identifiers. Complements ``_JWT_ANCHORED_RE``, which needs three segments.
-_JWT_TWO_SEGMENT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
-# Three dotted runs of 12 or more characters, masked only when the first one holds a
-# JOSE header (:func:`_mask_if_jose`): a header written with a space or a newline
-# (``{ "`` encodes to ``eyA``, ``{\n`` to ``ewo``; trufflehog's JWT detector anchors on
-# ``ewogIC`` for these), or one glued to a word (``token_eyJ…``, ``x-eyJ…``), where
-# :data:`_JWT_ANCHORED_RE` does not start. This rule used to mask every run of this
-# shape unseen, and a fully qualified table name has it: ``fluid apply`` printed
-# ``table=***REDACTED***`` for ``northwind_towers.bronze_smart_meters.smart_meters``
-# and the name of the next table, whose last part had 11 characters. A run starts
-# where no base64url character precedes it, for the reason given above (``a-a-a-…``).
+# It starts where :data:`_JWT_ANCHORED_RE` does, for the same reason.
+_JWT_TWO_SEGMENT_RE = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
+# Two or three dotted runs (12 or more characters, then 10 or more, then 12 or more),
+# masked only when the first one holds a JOSE header (:func:`_mask_if_jose`): one
+# written with a space or a newline (``{ "`` encodes to ``eyA``, ``{\n`` to ``ewo``;
+# trufflehog's JWT detector anchors on ``ewogIC`` for these), or one glued to a word
+# (``token_eyJ…``, ``x-eyJ…``), where the two ``eyJ`` rules do not start. It used to
+# mask any three runs of 12 or more unseen, and a fully qualified table name is three:
+# ``fluid apply`` printed ``table=***REDACTED***`` for
+# ``northwind_towers.bronze_smart_meters.smart_meters`` and the name of the next table,
+# whose last part had 11 characters. A run starts where no base64url character
+# precedes it, for the reason given above (``a-a-a-…``).
 _JWT_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b"
+    r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{12,})?\b"
 )
 # How many ``eyJ`` inside a run's first segment :func:`_mask_if_jose` tries as the start
 # of a header. Bounded, so a run of many cannot cost a decode each.

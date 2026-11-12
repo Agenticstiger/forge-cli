@@ -718,6 +718,8 @@ _JOSE_TOKENS = {
     "short payload": _jose(b'{"alg":"HS256"}', b"{}", _SIGNATURE),
     "glued after _": "token_" + _jose(b'{"alg":"HS256","typ":"JWT"}', _PAYLOAD, _SIGNATURE),
     "glued after -": "x-" + _jose(b'{"alg":"HS256","typ":"JWT"}', _PAYLOAD, _SIGNATURE),
+    "two segments (no signature)": _jose(b'{"alg":"none"}', _PAYLOAD),
+    "two segments glued after -": "x-" + _jose(b'{"alg":"none"}', _PAYLOAD),
 }
 
 #: Fully qualified names the old prefix-agnostic rule masked (three runs of 12+), and
@@ -781,6 +783,10 @@ class TestJoseTokensAndDottedNames:
         runs = "aGVhZGVyMTIzNDU2.cGF5bG9hZDEyMzQ1Ng.c2lnbmF0dXJlMTIz"
         assert redact_secret_text(f"id {runs} end") == f"id {runs} end"
 
+    def test_the_words_after_a_token_are_kept(self):
+        token = _JOSE_TOKENS["compact JWS"]
+        assert redact_secret_text(f"got {token}.Next step") == "got ***REDACTED***.Next step"
+
     def test_the_snowflake_twin_shares_the_rule(self):
         import fluid_build.observability.secret_redactor as g
         import fluid_build.providers.snowflake.util.logging as sf
@@ -789,7 +795,13 @@ class TestJoseTokensAndDottedNames:
 
     @pytest.mark.parametrize(
         "evil",
-        ["a-" * 100_000, "eyJ_" * 50_000, "eyJ." * 50_000, ("abcdefghijklmn." * 3 + " ") * 5_000],
+        [
+            "a-" * 100_000,
+            "eyJ-" * 50_000,
+            "eyJ_" * 50_000,
+            "eyJ." * 50_000,
+            ("abcdefghijklmn." * 3 + " ") * 5_000,
+        ],
     )
     def test_the_scan_stays_linear(self, evil):
         import time
@@ -800,7 +812,7 @@ class TestJoseTokensAndDottedNames:
         redact_jose_tokens(evil)
         elapsed = time.perf_counter() - start
         # Linear: well under 0.2 s here. The ``\b``-anchored rules re-scanned the run
-        # from every ``-`` (``a-`` * 100,000 took about 30 s).
+        # from every ``-`` (``a-`` * 100,000 took about 30 s, ``eyJ-`` * 50,000 about 40 s).
         assert elapsed < 2.0, f"possible ReDoS regression: {elapsed:.2f}s"
 
 

@@ -308,8 +308,8 @@ class TestPlanExitCode:
         path = self._write(tmp_path, _contract(region="eu-central-1"))
         assert run(self._args(tmp_path, path), LOG) == 0
 
-    def test_no_check_sovereignty_skips_the_check_and_says_so(self, tmp_path, caplog):
-        """``--no-check-sovereignty`` writes the plan anyway, logged at WARNING."""
+    def test_no_check_sovereignty_skips_the_check_and_says_so(self, tmp_path, caplog, capsys):
+        """``--no-check-sovereignty`` writes the plan anyway: on the console and at WARNING."""
         from fluid_build.cli.plan import run
 
         path = self._write(tmp_path, _contract())
@@ -317,6 +317,22 @@ class TestPlanExitCode:
             assert run(self._args(tmp_path, path, check_sovereignty=False), LOG) == 0
         assert (tmp_path / "plan.json").exists()
         assert "sovereignty check was SKIPPED" in caplog.text
+        assert "Sovereignty check skipped (--no-check-sovereignty)" in capsys.readouterr().out
+
+    def test_a_clean_provider_hook_does_not_weaken_check_sovereignty(self, tmp_path, monkeypatch):
+        """The explicit flag runs the default check first, so a hook that reports
+        nothing cannot pass a contract ``fluid validate`` refuses."""
+        import fluid_build.cli.plan as plan_mod
+        from fluid_build._contract_loader import CLIError
+
+        monkeypatch.setattr(
+            plan_mod, "_hook_provider", lambda *_a, **_k: ("aws", _CleanHookProvider())
+        )
+        path = self._write(tmp_path, _contract())
+        with pytest.raises(CLIError) as excinfo:
+            plan_mod.run(self._args(tmp_path, path, check_sovereignty=True), LOG)
+        assert excinfo.value.event == "sovereignty_violation"
+        assert not (tmp_path / "plan.json").exists()
 
 
 class TestPlanChecksSovereigntyByDefault:
