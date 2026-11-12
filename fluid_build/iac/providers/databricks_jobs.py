@@ -31,6 +31,11 @@ SQL warehouse ``DATABRICKS_WAREHOUSE_ID`` names. No schema field is added
 * ``execution.retries``, ``notifications``, ``runtime.timeout`` and
   ``runtime.serviceAccount``: the task's retries and timeout, the job's email
   notifications and its ``run_as``.
+* ``exposes[].contract.dq.rules`` of each expose the build writes: one dbt test
+  per check, uploaded beside the project under ``<test path>/fluid_dq/``
+  (``databricks_dbt_tests.py``), which ``dbt build`` runs after the model; a
+  rule no test can run is refused, and so is a Git source with rules, since no
+  file can be added to a checkout.
 
 The catalog and schema dbt writes to are those of the first Databricks expose
 the build writes (``builds[].outputs``). Everything the job would accept with
@@ -155,6 +160,8 @@ class DbtJob:
     files: Tuple[str, ...]
     #: Where the files go, below the applying identity's home (WORKSPACE source).
     root: str = ""
+    #: The dbt tests its contract's DQ rules run as, by name (``databricks_dbt_tests.py``).
+    tests: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -801,10 +808,55 @@ def compile_dbt_jobs(
         settings = _job_settings(item, compiled)
         table = _target_table(item, builds, tables, compiled.refusals)
         source = _project_source(item, compiled.refusals, validating=validating)
+        tests: Tuple[str, ...] = ()
+        if source is not None:
+            source, tests = _with_tests(contract, item, builds, tables, source, compiled.refusals)
         if len(compiled.refusals) == before and table is not None and source is not None:
             script = rebuild_script(build) if rebuild_script is not None else None
-            _emit_job(compiled, item, table, settings, source, script)
+            _emit_job(compiled, item, table, settings, source, script, tests)
     return compiled
+
+
+def _with_tests(
+    contract: Mapping[str, Any],
+    item: _Build,
+    builds: Sequence[Mapping[str, Any]],
+    tables: Sequence[Any],
+    source: _Source,
+    refusals: List[UnsupportedBindingError],
+) -> Tuple[_Source, Tuple[str, ...]]:
+    """``source`` with the dbt tests the contract's DQ rules run as, and their names
+    (``databricks_dbt_tests.py``). A Git checkout takes none, so its rules are refused."""
+    from .databricks_dbt_tests import compile_tests, written_tables
+
+    git = source.git is not None
+    compiled = compile_tests(
+        contract,
+        item.build,
+        item.where,
+        written_tables(item.build, builds, tables),
+        # No file at all: ``fluid validate`` without a contract location (``_project_source``).
+        None if git or not source.files else source.files,
+        git=git,
+    )
+    refusals.extend(compiled.refusals)
+    if not compiled.files:
+        return source, ()
+    files = tuple(sorted((*source.files, *compiled.files)))
+    if len(files) > MAX_PROJECT_FILES:
+        refusals.append(
+            _refusal(
+                "project-size",
+                f"{item.where} the dbt project and the {len(compiled.files)} tests of its "
+                f"contract rules upload {len(files)} files; the workspace upload takes "
+                f"{MAX_PROJECT_FILES} at most, since each is a resource in the module.",
+                "Use a GIT source for a project this size.",
+            )
+        )
+    return (
+        _Source(git=source.git, directory=source.directory, files=files),
+        tuple(test.name for test in compiled.tests),
+    )
 
 
 def _job_settings(item: _Build, compiled: CompiledJobs) -> _Settings:
@@ -915,6 +967,7 @@ def _emit_job(
     settings: _Settings,
     source: _Source,
     keys_script: Optional[str] = None,
+    tests: Tuple[str, ...] = (),
 ) -> None:
     """The job, its uploaded project, and, with ``keys_script``, the ``fluid_keys`` task that
     runs it after dbt (``databricks_keys.py``): uploaded next to the project, whose own files
@@ -971,6 +1024,7 @@ def _emit_job(
             trigger=settings.trigger,
             files=tuple(rel for rel, _ in uploads),
             root=item.root,
+            tests=tests,
         )
     )
 
