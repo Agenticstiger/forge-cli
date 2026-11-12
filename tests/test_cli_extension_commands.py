@@ -20,7 +20,8 @@ def test_parser_exposes_ai_models_and_forge_tier_controls():
     ai_args = parser.parse_args(["ai", "models", "--provider", "openai", "--json"])
     assert ai_args.cmd == "ai"
     assert ai_args.ai_action == "models"
-    assert ai_args.provider == "openai"
+    # Not ``provider``: the global checks read that as an infrastructure provider.
+    assert ai_args.llm_provider == "openai"
     assert ai_args.json is True
 
     forge_args = parser.parse_args(
