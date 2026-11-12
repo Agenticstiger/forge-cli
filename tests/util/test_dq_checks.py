@@ -173,7 +173,7 @@ class TestTypes:
         assert (check.kind, check.bounds, check.share) == ("bounds", ((">=", 0.0),), None)
 
     def test_accuracy_without_a_threshold_is_refused(self):
-        assert "no numeric threshold" in _refused(_rule("accuracy", "antenna_count"))
+        assert "no finite numeric threshold" in _refused(_rule("accuracy", "antenna_count"))
 
     def test_freshness_is_the_newest_values_age_in_seconds(self):
         check = _one(
@@ -235,6 +235,36 @@ class TestShares:
 
 
 class TestRefusals:
+    @pytest.mark.parametrize("threshold", [10**400, float("inf"), float("nan")])
+    def test_a_threshold_no_float_holds_is_refused_not_raised(self, threshold):
+        assert "finite" in _refused(_rule("accuracy", "antenna_count", threshold=threshold))
+        assert "finite" in _refused(_rule("completeness", "site_id", threshold=threshold))
+
+    def test_a_window_too_long_to_count_is_refused_not_raised(self):
+        window = "PT" + "9" * 30 + "S"
+        assert "fixed ISO 8601" in _refused(_rule("freshness", "_ingested_at", window=window))
+
+    @pytest.mark.parametrize("constraint", ["between 100 and 0", "> 5 and < 1", "> 3 and <= 3"])
+    def test_a_range_no_value_meets_is_refused(self, constraint):
+        columns = [
+            {
+                "name": "x",
+                "type": "INTEGER",
+                "validationRules": [{"type": "range", "constraint": constraint}],
+            }
+        ]
+        contract = {
+            "id": "p",
+            "exposes": [
+                {
+                    "exposeId": "t",
+                    "contract": {"schema": columns, "dq": {"rules": [_rule("valid_values", "x")]}},
+                }
+            ],
+        }
+        read = read_rules(contract, contract["exposes"])
+        assert "no value can meet" in read.refusals[0].message
+
     def test_an_unknown_column_is_refused(self):
         assert "does not declare" in _refused(_rule("completeness", "nope"))
 
@@ -289,6 +319,7 @@ def test_parse_enum_reads_pipes_or_commas():
         ("between -1 and 10", ((">=", -1.0), ("<=", 10.0))),
         ("0 to 10", None),
         (">= 0 or <= 2", None),
+        (">= " + "9" * 400, None),
     ],
 )
 def test_parse_range(text, bounds):

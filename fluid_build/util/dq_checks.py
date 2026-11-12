@@ -48,6 +48,7 @@ reported and do not (``warn``), the two levels a dbt test has.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -212,6 +213,29 @@ def _unique(check: DqCheck, taken: Set[str]) -> DqCheck:
     return replace(check, name=name)
 
 
+def _finite(value: Any) -> Optional[float]:
+    """``value`` as a finite float; ``None`` for a bool, a non-number, an infinity, NaN, or
+    an integer too large for a float (YAML loads any number of digits)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _empty(bounds: Sequence[Tuple[str, float]]) -> bool:
+    """Whether no number meets every bound (``between 100 and 0``, ``> 5 and < 1``)."""
+    lows = [(v, op == ">") for op, v in bounds if op in (">", ">=")]
+    highs = [(v, op == "<") for op, v in bounds if op in ("<", "<=")]
+    if not lows or not highs:
+        return False
+    low = max(lows, key=lambda b: (b[0], b[1]))
+    high = min(highs, key=lambda b: (b[0], not b[1]))
+    return low[0] > high[0] or (low[0] == high[0] and (low[1] or high[1]))
+
+
 def _number(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else repr(float(value))
 
@@ -232,13 +256,17 @@ def parse_range(constraint: Any) -> Optional[Tuple[Tuple[str, float], ...]]:
         return None
     between = _BETWEEN_RE.match(constraint)
     if between is not None:
-        return ((">=", float(between.group(1))), ("<=", float(between.group(2))))
-    bounds = []
-    for part in _AND_RE.split(constraint.strip()):
-        match = _BOUND_RE.match(part)
-        if match is None:
-            return None
-        bounds.append((match.group(1), float(match.group(2))))
+        pairs = [(">=", between.group(1)), ("<=", between.group(2))]
+    else:
+        pairs = []
+        for part in _AND_RE.split(constraint.strip()):
+            match = _BOUND_RE.match(part)
+            if match is None:
+                return None
+            pairs.append((match.group(1), match.group(2)))
+    bounds = [(op, float(text)) for op, text in pairs]
+    if not all(math.isfinite(value) for _op, value in bounds):
+        return None  # digits past a float's range
     return tuple(bounds)
 
 
@@ -369,19 +397,19 @@ class _Rule:
 
     def _accuracy(self) -> List[Dict[str, Any]]:
         columns = self._selected(required=True)
-        threshold = self.rule.get("threshold")
+        threshold = _finite(self.rule.get("threshold"))
         operator = self._operator()
-        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        if threshold is None:
             self.refuse(
-                "has no numeric threshold, the bound each value of an accuracy rule meets",
+                "has no finite numeric threshold, the bound each value of an accuracy rule "
+                "meets",
                 "Set threshold to the bound and operator to the comparison (>= 0, say).",
             )
             return []
         if operator is None:
             return []
         return [
-            {"kind": "bounds", "column": c, "bounds": ((operator, float(threshold)),)}
-            for c in columns
+            {"kind": "bounds", "column": c, "bounds": ((operator, threshold),)} for c in columns
         ]
 
     def _freshness(self) -> List[Dict[str, Any]]:
@@ -407,7 +435,10 @@ class _Rule:
         window = self.rule.get("window")
         from fluid_build.providers.quality_engine import parse_duration_seconds
 
-        seconds = parse_duration_seconds(str(window)) if window else None
+        try:
+            seconds = parse_duration_seconds(str(window)) if window else None
+        except (OverflowError, ValueError):
+            seconds = None  # more digits than a duration holds
         if seconds is None:
             self.refuse(
                 f"has window {window!r}, which is not a fixed ISO 8601 duration",
@@ -494,9 +525,7 @@ class _Rule:
 
     @staticmethod
     def _number_or_none(value: Any) -> Optional[float]:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        return float(value)
+        return _finite(value)
 
     def _operator_or_none(self) -> Optional[str]:
         raw = self.rule.get("operator")
@@ -516,14 +545,14 @@ class _Rule:
         threshold = self.rule.get("threshold")
         if threshold is None:
             return None
-        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        value = _finite(threshold)
+        if value is None:
             self.refuse(
-                f"has threshold {threshold!r}, which is not a number",
+                f"has threshold {threshold!r}, which is not a finite number",
                 "Set threshold to the share of rows that must pass, from 0 to 1.",
             )
             return None
         operator = self._operator()
-        value = float(threshold)
         if not 0.0 <= value <= 1.0:
             self.refuse(
                 f"has threshold {threshold}, and a threshold is the share of rows that pass, "
@@ -590,6 +619,12 @@ class _Rule:
 
     def _range(self, name: str, constraint: Any) -> Optional[Dict[str, Any]]:
         bounds = parse_range(constraint)
+        if bounds is not None and _empty(bounds):
+            self.refuse(
+                f"reads column {name!r}, whose range {constraint!r} no value can meet",
+                "Write the lower bound first: 'between 0 and 100', '>= 0 and <= 100'.",
+            )
+            return None
         if bounds is not None:
             return {"kind": "bounds", "bounds": bounds}
         self.refuse(
