@@ -1371,6 +1371,18 @@ def test_a_parent_folder_every_user_can_open_is_said_not_refused(fake):
     assert only_space(fake)["parent_path"] == SALES
 
 
+def test_the_account_users_group_counts_as_every_user(fake):
+    """Under identity federation the account's own all-users group can be granted on a folder."""
+    in_sales(fake)
+    fake.folder_acl["/genie"] = {("group_name", "account users"): "CAN_MANAGE"}
+    run = Run(fake)
+    with pytest.raises(genie.GenieError) as exc:
+        run(site_contract(parentPath=SALES))
+    assert "holds CAN_MANAGE on the folder /genie/sales (the account users group)" in str(exc.value)
+    assert "away from account users" in exc.value.remediation[0]
+    assert run.writes() == []
+
+
 def test_folder_permissions_this_identity_cannot_read_stop_the_apply(fake):
     in_sales(fake)
     fake.fail_route("GET", "/api/2.0/permissions/directories/", 403, "no CAN_MANAGE")

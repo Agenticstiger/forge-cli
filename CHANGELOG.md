@@ -40,7 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundary. `fluid validate` refuses anything under `/Shared`: every workspace user holds
   `CAN_MANAGE` there (measured), so each could read every reader's conversations. `fluid apply`
   stops before `tofu apply` when the folder is missing or not a folder, when its permissions
-  cannot be read, or when the `users` group holds `CAN_EDIT` or `CAN_MANAGE` on it. Removing the
+  cannot be read, or when a group of every user (`users`, or `account users` under identity
+  federation) holds `CAN_EDIT` or `CAN_MANAGE` on it. Removing the
   whole block leaves a space in `parentPath` in place, with a note naming it: without the block,
   the apply no longer knows which folder to trust.
 

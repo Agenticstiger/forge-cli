@@ -111,6 +111,9 @@ WORKSPACE_STATUS_PATH = "/api/2.0/workspace/get-status"
 FOLDER_PERMISSIONS_PATH = "/api/2.0/permissions/directories/{}"
 #: The group every workspace user is in, as the Permissions API names it.
 ALL_USERS = "users"
+#: Every group that holds every user: the workspace's own, and the account's (granted on a
+#: workspace object under identity federation).
+ALL_USERS_GROUPS = (ALL_USERS, "account users")
 #: The folder that grants :data:`ALL_USERS` ``CAN_MANAGE`` directly; every folder and space under
 #: it inherits that (measured on a live workspace, 2026-11-12), and a workspace permission
 #: cannot be taken away below the folder that grants it ("objects in a folder inherit all
@@ -981,8 +984,8 @@ def _at_most_one(spaces: Sequence[Mapping[str, Any]], space: Space) -> None:
 
 
 def _check_folder(client: Any, folder: str, say: Say) -> None:
-    """Stop unless ``folder`` is a workspace folder on which the :data:`ALL_USERS` group (every
-    workspace user) holds neither ``CAN_EDIT`` nor ``CAN_MANAGE``, directly or inherited.
+    """Stop unless ``folder`` is a workspace folder on which no group of every user
+    (:data:`ALL_USERS_GROUPS`) holds ``CAN_EDIT`` or ``CAN_MANAGE``, directly or inherited.
 
     A space inherits every permission on its folder (measured, 2026-11-12): whoever can edit
     the folder can edit the space's instructions, and whoever manages it can also read every
@@ -997,31 +1000,41 @@ def _check_folder(client: Any, folder: str, say: Say) -> None:
         f"read the permissions on the folder {folder}",
         lambda: client.api_client.do("GET", FOLDER_PERMISSIONS_PATH.format(object_id)),
     )
-    held = sorted(_group_levels(acl, ALL_USERS), key=lambda level: _LEVEL_RANK.get(level, 0))
-    if held and held[-1] in _KEPT_LEVELS:
+    group, level = _broadest(acl)
+    if level in _KEPT_LEVELS:
         harm = "edit the space's instructions"
-        if held[-1] == "CAN_MANAGE":
+        if level == "CAN_MANAGE":
             harm = (
                 "edit the space's instructions, read every reader's conversations and make a "
                 "space there that the apply would take for the product's"
             )
         raise GenieError(
-            f"every workspace user holds {held[-1]} on the folder {folder} (the {ALL_USERS} "
-            f"group), and a Genie space inherits its folder's permissions: each of them could "
-            f"{harm}.",
+            f"every workspace user holds {level} on the folder {folder} (the {group} group), "
+            f"and a Genie space inherits its folder's permissions: each of them could {harm}.",
             (
-                f"Take CAN_EDIT and CAN_MANAGE on {folder} away from {ALL_USERS}, or set "
+                f"Take CAN_EDIT and CAN_MANAGE on {folder} away from {group}, or set "
                 f"{_WHERE}.parentPath to a folder that only the identities deploying the product "
                 f"can edit or manage (not under {SHARED_FOLDER}, which grants {ALL_USERS} "
                 "CAN_MANAGE).",
             ),
         )
-    if held:
+    if level:
         say(
-            f"    note: every workspace user holds {held[-1]} on {folder}, which the space "
-            "inherits: they can open it, and each answer still follows the asker's own Unity "
-            "Catalog grants."
+            f"    note: every workspace user holds {level} on {folder} (the {group} group), "
+            "which the space inherits: they can open it, and each answer still follows the "
+            "asker's own Unity Catalog grants."
         )
+
+
+def _broadest(acl: Any) -> Tuple[str, str]:
+    """The group of every user holding the highest level on a folder, and that level (``""``
+    for none of them)."""
+    best = (ALL_USERS, "")
+    for group in ALL_USERS_GROUPS:
+        for level in _group_levels(acl, group):
+            if _LEVEL_RANK.get(level, 0) > _LEVEL_RANK.get(best[1], 0):
+                best = (group, level)
+    return best
 
 
 def _folder_object_id(client: Any, folder: str) -> str:
