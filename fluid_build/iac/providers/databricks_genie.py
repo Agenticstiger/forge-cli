@@ -45,12 +45,18 @@ for a product whose ``agentPolicy`` rules out question answering is refused.
 Identity, without state. The databricks/databricks provider has no Genie space resource (v1.142.0
 ships only the Private Preview ``databricks_genie_agent``, a typed definition of another shape),
 so the space lives outside OpenTofu. Its description ends with ``[fluid-genie:<product id>]``:
-each apply lists the spaces, adopts the one carrying the marker, updates it (``PATCH`` with the
-space's ``etag``) only when what the contract asks differs from what it holds, and trashes it
-once the contract drops the block. No local record, so a fresh CI runner finds the same space;
-two spaces carrying one product's marker stop the apply. The service keeps the space as sent,
-except that it leaves out a ``false`` flag, so the module never sends one and a second apply
-compares equal.
+each apply lists the spaces, adopts the one carrying the marker in the deploying identity's own
+folder (where the API puts a space it creates), updates it (``PATCH`` with the space's ``etag``)
+only when what the contract asks differs from what it holds, and trashes it once the contract
+drops the block. A space carrying the marker anywhere else is left alone with a note, so a copy
+someone plants is never filled, shared to the readers or trashed. No local record, so a fresh CI
+runner finds the same space; two spaces carrying one product's marker stop the apply.
+
+Measured on a live workspace (2026-11-12) and handled: the service keeps a space as sent except
+that it leaves out a ``false`` flag (never sent, so a second apply compares equal); a new space
+shows in the list some seconds after it is made (a create waits for it, or an apply straight
+after would make a second); and a title another space in the folder already has comes back
+suffixed with a timestamp (kept, since a ``PATCH`` to a taken title is 409).
 
 The client is the ``databricks.sdk.WorkspaceClient`` the masks and row filters use
 (``databricks_enforce.default_client``), through ``api_client.do``. The paths are the SDK's own
@@ -64,6 +70,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -107,7 +114,15 @@ _PAGE_SIZE = 100
 #: The use case a Genie space is: answering questions about the data.
 _GENIE_USE_CASE = "qa"
 _NOT_SENSITIVE = frozenset({"", "none", "public", "internal"})
-_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+#: What the service appends to a title another space in the folder already has (it keeps titles
+#: unique there: ``Site 360 2026-11-12 20:35:27``), and a PATCH to a taken title is 409
+#: ALREADY_EXISTS (both measured 2026-11-12).
+_TITLE_SUFFIX = re.compile(r" \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+#: A new space shows in the list some seconds after it is made (9 s measured, 2026-11-12), so
+#: an apply waits for it, at most this long: one run straight after would make a second space.
+LIST_WAIT_SECONDS = 60.0
+_POLL_SECONDS = 2.0
 
 Say = Callable[[str], None]
 ClientFactory = Callable[[], Any]
@@ -756,6 +771,7 @@ def converge(
     client = _client(client_factory)
     say("\n  Databricks Genie space (Genie API, not OpenTofu):")
     found = _call(client, "list the Genie spaces", lambda: _find(client, space.marker))
+    found = _call(client, "check whose Genie spaces those are", lambda: _owned(client, found, say))
     if len(found) > 1:
         raise GenieError(
             f"{len(found)} Genie spaces carry {space.marker} in their description: "
@@ -806,6 +822,7 @@ def _update_found(
     dry_run: bool,
 ) -> None:
     live = _call(client, "read the Genie space", lambda: _get(client, space_id))
+    title = _title_kept(live.get("title"), space.title, say)
     changes = differences(live, space, serialized)
     if not changes:
         say(f"    {space.title!r}: no change ({_url(space_id)})")
@@ -815,7 +832,7 @@ def _update_found(
         _call(
             client,
             "update the Genie space",
-            lambda: _update(client, space_id, space, serialized, live.get("etag")),
+            lambda: _update(client, space_id, space, serialized, live.get("etag"), title),
         )
         say(f"    updated {space.title!r}: {', '.join(changes)} ({_url(space_id)})")
 
@@ -826,7 +843,51 @@ def _create_new(client: Any, space: Space, serialized: Mapping[str, Any], say: S
     if not space_id:
         raise GenieError("the Genie API created a space and returned no space_id.")
     say(f"    created {space.title!r}: {_summary(serialized, space.tables)} ({_url(space_id)})")
+    _title_kept(created.get("title"), space.title, say)
+    _wait_listed(client, space, space_id, say)
     return space_id
+
+
+def _wait_listed(client: Any, space: Space, space_id: str, say: Say) -> None:
+    """Return once the list shows the new space (at most :data:`LIST_WAIT_SECONDS`), so the
+    next apply finds it instead of making a second one."""
+    deadline = time.monotonic() + LIST_WAIT_SECONDS
+    while True:
+        try:
+            if any(str(s.get("space_id")) == space_id for s in _find(client, space.marker)):
+                return
+        except Exception:  # noqa: BLE001 — the space exists; only the wait is cut short
+            pass
+        if time.monotonic() >= deadline:
+            say(
+                "    note: the Genie list does not show the new space yet; an apply in the next "
+                "minute could make a second one, which the apply after refuses until one is "
+                "trashed."
+            )
+            return
+        time.sleep(_POLL_SECONDS)
+
+
+def _title_kept(live: Any, wanted: str, say: Say) -> str:
+    """The title to send: ``wanted``, or the live one when the service suffixed it because
+    another space in the folder has ``wanted`` (sending ``wanted`` again is 409), said as
+    such."""
+    live = str(live or "")
+    if live != wanted and _same_title(live, wanted):
+        say(
+            f"    note: the space is titled {live!r}: another space in this identity's folder is "
+            f"already called {wanted!r} and Genie keeps titles unique there. Give this one a "
+            f"title of its own with extensions.{EXTENSION_KEY}.title."
+        )
+        return live
+    return wanted
+
+
+def _same_title(live: Any, wanted: str) -> bool:
+    live = str(live or "")
+    return live == wanted or (
+        live.startswith(wanted) and bool(_TITLE_SUFFIX.fullmatch(live[len(wanted) :]))
+    )
 
 
 def _retire(product_id: str, say: Say, factory: Optional[ClientFactory], dry_run: bool) -> None:
@@ -847,6 +908,8 @@ def _retire(product_id: str, say: Say, factory: Optional[ClientFactory], dry_run
         return
     try:
         found = _find(client, marker(product_id))
+        if found:
+            found = _owned(client, found, say)
     except Exception as exc:  # noqa: BLE001
         if _status(exc) not in (403, 404):
             say(f"  note: not checked for a Genie space an earlier apply made: {_scrub(exc)}")
@@ -872,20 +935,65 @@ def _retire(product_id: str, say: Say, factory: Optional[ClientFactory], dry_run
 
 
 def _find(client: Any, token: str) -> List[Dict[str, Any]]:
-    """Every space whose description carries ``token``, across the list's pages."""
+    """Every space whose description ends with ``token``, across the list's pages (a
+    description that only quotes another product's marker is not that product's)."""
     found: List[Dict[str, Any]] = []
     query: Dict[str, Any] = {"page_size": _PAGE_SIZE}
     seen: set = set()
     while True:
         page = client.api_client.do("GET", SPACES_PATH, query=query) or {}
         for space in page.get("spaces") or ():
-            if isinstance(space, Mapping) and token in str(space.get("description") or ""):
+            description = str(space.get("description") or "") if isinstance(space, Mapping) else ""
+            if description.rstrip().endswith(token):
                 found.append(dict(space))
         token_next = page.get("next_page_token")
         if not token_next or token_next in seen:
             return found
         seen.add(token_next)
         query = {"page_size": _PAGE_SIZE, "page_token": token_next}
+
+
+def _owned(client: Any, found: List[Dict[str, Any]], say: Say) -> List[Dict[str, Any]]:
+    """The spaces in ``found`` that this identity made: the ones in its own folder,
+    ``/Users/<userName>``, where the Genie API puts a space it creates (measured
+    2026-11-12; the list leaves ``parent_path`` out, a plain GET has it).
+
+    A space anyone else made carrying the marker is left alone, with a note: adopting it would
+    fill it with the product, share it to the readers and keep its maker's ``CAN_MANAGE``
+    (inherited from their folder, which a share cannot remove), and that level can read the
+    readers' conversations. Only this identity and an admin can make a space in its folder.
+    """
+    if not found:
+        return []
+    home = f"/users/{_enforce.deploy_identity(client).lower()}"
+    mine = []
+    for space in found:
+        space_id = str(space.get("space_id"))
+        try:
+            parent = str(
+                client.api_client.do("GET", f"{SPACES_PATH}/{quote(space_id)}").get("parent_path")
+                or ""
+            )
+        except Exception:  # noqa: BLE001 — a space it cannot read is not one it made
+            parent = ""
+        folder = parent.rstrip("/").lower()
+        if folder == home or folder.startswith(home + "/"):
+            mine.append(space)
+            continue
+        say(
+            f"    note: left alone: space {space_id} ({space.get('title')!r}) carries "
+            f"{_marker_of(space)} but is in {parent or 'a folder this identity cannot read'}, not "
+            "in this identity's own folder, so it is not taken for the product's. Trash it, or "
+            "take the marker out of its description."
+        )
+    return mine
+
+
+def _marker_of(space: Mapping[str, Any]) -> str:
+    """The marker a listed space's description ends with (for a message)."""
+    text = str(space.get("description") or "").rstrip()
+    start = text.rfind("[fluid-genie:")
+    return text[start:] if start >= 0 else "a product's marker"
 
 
 def _get(client: Any, space_id: str) -> Dict[str, Any]:
@@ -896,9 +1004,9 @@ def _get(client: Any, space_id: str) -> Dict[str, Any]:
     )
 
 
-def _body(space: Space, serialized: Mapping[str, Any]) -> Dict[str, Any]:
+def _body(space: Space, serialized: Mapping[str, Any], title: str = "") -> Dict[str, Any]:
     return {
-        "title": space.title,
+        "title": title or space.title,
         "description": space.description,
         "warehouse_id": space.warehouse_id,
         "serialized_space": json.dumps(serialized, sort_keys=True),
@@ -910,14 +1018,28 @@ def _create(client: Any, space: Space, serialized: Mapping[str, Any]) -> Dict[st
 
 
 def _update(
-    client: Any, space_id: str, space: Space, serialized: Mapping[str, Any], etag: Any
+    client: Any,
+    space_id: str,
+    space: Space,
+    serialized: Mapping[str, Any],
+    etag: Any,
+    title: str = "",
 ) -> None:
-    body = _body(space, serialized)
+    body = _body(space, serialized, title)
     if etag:
         body["etag"] = etag
     try:
         client.api_client.do("PATCH", f"{SPACES_PATH}/{quote(space_id)}", body=body)
-    except Exception as exc:  # noqa: BLE001 — a 409 is someone else's edit, said as such
+    except Exception as exc:  # noqa: BLE001 — a 409 is a taken title or someone else's edit
+        if _status(exc) == 409 and _taken_title(exc):
+            raise GenieError(
+                f"another Genie space in this identity's folder is already called "
+                f"{body['title']!r}, and Genie keeps titles unique there.",
+                (
+                    f"Give this space a title of its own with extensions.{EXTENSION_KEY}.title, "
+                    "or rename the other space.",
+                ),
+            ) from exc
         if _status(exc) == 409:
             raise GenieError(
                 "the Genie space changed while this apply was updating it (its etag no longer "
@@ -927,10 +1049,20 @@ def _update(
         raise
 
 
+def _taken_title(exc: BaseException) -> bool:
+    """A 409 for a title another space holds (``ALREADY_EXISTS``), not for a stale etag."""
+    code = str(getattr(exc, "error_code", "") or "")
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    return code in ("ALREADY_EXISTS", "RESOURCE_ALREADY_EXISTS") or bool(
+        names & {"AlreadyExists", "ResourceAlreadyExists"}
+    )
+
+
 def differences(live: Mapping[str, Any], space: Space, serialized: Mapping[str, Any]) -> List[str]:
-    """What differs between the live space and the one the contract asks for, by name."""
+    """What differs between the live space and the one the contract asks for, by name. A title
+    the service suffixed because another space has it counts as the same title."""
     changes = []
-    if live.get("title") != space.title:
+    if not _same_title(live.get("title"), space.title):
         changes.append("title")
     if (live.get("description") or "") != space.description:
         changes.append("description")
@@ -1074,6 +1206,12 @@ def _share(client: Any, space_id: str, readers: Sequence[str], say: Say, dry_run
     )
     held = _direct_levels(doc)
     wanted = {key: level for key, level in held.items() if level in _KEPT_LEVELS}
+    kept = sorted(key[1] for key in wanted if key[1] not in readers)
+    if kept:
+        say(
+            f"    note: {', '.join(kept)} also hold CAN_EDIT or CAN_MANAGE on the space, set on it "
+            "directly; fluid apply keeps them (CAN_MANAGE can read other people's conversations)."
+        )
     for principal in readers:
         key = acl_key(principal)
         wanted.setdefault(key, READER_LEVEL)
@@ -1105,7 +1243,7 @@ def acl_key(principal: str) -> Tuple[str, str]:
     grants to (``iac/principals.py::_databricks_identity``)."""
     if "@" in principal:
         return ("user_name", principal)
-    if _UUID.match(principal):
+    if _UUID.fullmatch(principal):
         return ("service_principal_name", principal)
     return ("group_name", principal)
 

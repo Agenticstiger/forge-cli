@@ -909,3 +909,98 @@ def test_the_stand_in_refuses_what_the_service_refuses(fake, space, words):
     with pytest.raises(Exception) as exc:
         fake.client().api_client.do("POST", genie.SPACES_PATH, body=body)
     assert exc.value.status_code == 400 and words in str(exc.value)
+
+
+# ---------------------------------------------------------------------- whose space it is
+
+
+def test_a_space_planted_in_someone_elses_folder_is_never_adopted_shared_or_trashed(fake):
+    """Adopting it would share it to the readers while its maker keeps CAN_MANAGE (inherited
+    from their folder), which reads the readers' conversations."""
+    decoy = fake.add_genie_space(
+        "Site 360", f"looks like it {MARKER}", parent_path="/Users/mallory@towers.io"
+    )
+    before = copy.deepcopy(fake.genie_spaces[decoy])
+    run = Run(fake)(site_contract())
+    assert fake.genie_spaces[decoy] == before and fake.genie_acl[decoy] == {}
+    (ours,) = set(fake.genie_spaces) - {decoy}
+    assert fake.genie_spaces[ours]["parent_path"] == "/Users/fake-user@example.test"
+    assert f"left alone: space {decoy}" in run.text and "/Users/mallory@towers.io" in run.text
+    assert "created 'Site 360'" in run.text
+    # Asked again: the product's own space, not the decoy, and still no refusal for two.
+    assert "'Site 360': no change" in Run(fake)(site_contract()).text
+    retire = Run(fake)(without_block(site_contract()))
+    assert set(fake.genie_spaces) == {decoy}
+    assert (
+        f"trashed 'Site 360' ({ours})" in retire.text
+        and f"left alone: space {decoy}" in retire.text
+    )
+
+
+def test_a_marker_quoted_inside_a_description_is_not_a_match(fake):
+    quoted = fake.add_genie_space("Notes", f"see {MARKER} for the site space; ours is elsewhere")
+    Run(fake)(site_contract())
+    assert len(fake.genie_spaces) == 2 and fake.genie_spaces[quoted]["title"] == "Notes"
+
+
+def test_the_folder_match_ignores_case(fake):
+    """Unity Catalog names a user by email, which Databricks compares without case."""
+    space_id = fake.add_genie_space(
+        "old", f"made earlier {MARKER}", parent_path="/Users/Fake-User@Example.test"
+    )
+    Run(fake)(site_contract())
+    assert set(fake.genie_spaces) == {space_id} and only_space(fake)["title"] == "Site 360"
+
+
+def test_direct_editors_and_managers_that_are_not_readers_are_named(fake):
+    Run(fake)(site_contract())
+    space_id = only_space(fake)["space_id"]
+    fake.genie_acl[space_id][("user_name", "editor@towers.io")] = "CAN_MANAGE"
+    run = Run(fake)(site_contract())
+    assert "note: editor@towers.io also hold CAN_EDIT or CAN_MANAGE" in run.text
+
+
+# ---------------------------------------------------------------------- what the live run taught
+
+
+@pytest.fixture
+def no_wait(monkeypatch):
+    monkeypatch.setattr(genie, "_POLL_SECONDS", 0.0)
+
+
+def test_an_apply_straight_after_a_create_finds_the_space_not_a_second_one(fake, no_wait):
+    """The list shows a new space only some seconds later; the create waits for it."""
+    fake.genie_list_lag = 3
+    Run(fake)(site_contract())
+    assert "'Site 360': no change" in Run(fake)(site_contract()).text
+    assert len(fake.genie_spaces) == 1
+
+
+def test_a_list_that_never_shows_the_new_space_is_said_not_waited_on_forever(
+    fake, no_wait, monkeypatch
+):
+    monkeypatch.setattr(genie, "LIST_WAIT_SECONDS", 0.0)
+    fake.genie_list_lag = 1000
+    run = Run(fake)(site_contract())
+    assert "created 'Site 360'" in run.text and "does not show the new space yet" in run.text
+
+
+def test_a_title_another_space_has_is_kept_as_the_service_suffixed_it_and_said(fake):
+    fake.add_genie_space("Site 360", "the other team's Site 360")
+    first = Run(fake)(site_contract())
+    ours = [s for s in fake.genie_spaces.values() if s["description"].endswith(MARKER)]
+    assert ours[0]["title"] == "Site 360 2026-11-12 20:35:27"
+    assert "another space in this identity's folder is already called 'Site 360'" in first.text
+    second = Run(fake)(site_contract())
+    assert second.writes() == [] and "'Site 360': no change" in second.text
+    assert "already called 'Site 360'" in second.text  # said on every apply until it is fixed
+
+
+def test_renaming_the_space_to_a_title_another_space_has_says_so(fake):
+    Run(fake)(site_contract())
+    fake.add_genie_space("Tower Passport", "someone else's")
+    with pytest.raises(genie.GenieError) as exc:
+        Run(fake)(site_contract(title="Tower Passport"))
+    assert "already called 'Tower Passport'" in str(exc.value)
+    assert "title of its own" in exc.value.remediation[0]
+    assert "changed while this apply" not in str(exc.value)

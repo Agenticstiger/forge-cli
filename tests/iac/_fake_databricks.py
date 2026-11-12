@@ -838,6 +838,10 @@ class FakeDatabricks:
         self.metric_views: Dict[str, Dict[str, Any]] = {}
         self._space_seq = 0
         self._space_count = 0
+        # A new space stays out of the list for this many list calls (the live list showed one
+        # about 9 s after it was made, 2026-11-12); 0 lists it at once.
+        self.genie_list_lag = 0
+        self._genie_hidden: Dict[str, int] = {}
         self._marker = 0
         self._job_seq = 0
         self._object_ids: Dict[str, int] = {}  # workspace path -> object_id
@@ -1362,6 +1366,12 @@ class FakeDatabricks:
                 return f"Table {source.get('identifier')!r} does not exist"
         return None
 
+    def _genie_title_taken(self, title: str, parent: str, other_than: str = "") -> bool:
+        return any(
+            s["title"] == title and s["parent_path"] == parent and sid != other_than
+            for sid, s in self.genie_spaces.items()
+        )
+
     def _genie_doc(self, space_id: str, serialized: bool) -> Dict[str, Any]:
         doc = dict(self.genie_spaces[space_id])
         if not serialized:
@@ -1374,6 +1384,9 @@ class FakeDatabricks:
         start = int((q.get("page_token") or ["0"])[0])
         spaces = []
         for space_id in ids[start : start + size]:
+            if self._genie_hidden.get(space_id, 0) > 0:
+                self._genie_hidden[space_id] -= 1
+                continue
             doc = self._genie_doc(space_id, serialized=False)
             # The list leaves out parent_path and etag, as the live API does.
             doc.pop("parent_path", None)
@@ -1398,17 +1411,25 @@ class FakeDatabricks:
         with self._lock:
             self._space_count += 1
             space_id = f"01f1{self._space_count:028x}"
+            parent = b.get("parent_path") or f"/Users/{_USER}"
+            title = b.get("title") or ""
+            if self._genie_title_taken(title, parent):
+                # The service keeps titles unique in a folder by suffixing the new one.
+                title = f"{title} 2026-11-12 20:35:27"
+            self._genie_hidden[space_id] = self.genie_list_lag
             self.genie_spaces[space_id] = {
                 "space_id": space_id,
-                "title": b.get("title") or "",
+                "title": title,
                 "description": b.get("description") or "",
                 "warehouse_id": b["warehouse_id"],
-                "parent_path": b.get("parent_path") or f"/Users/{_USER}",
+                "parent_path": parent,
                 "serialized_space": self._as_stored(b["serialized_space"]),
                 "etag": self._genie_etag(),
             }
             self.genie_acl[space_id] = {}
-        return 200, self._genie_doc(space_id, serialized=True)
+        doc = self._genie_doc(space_id, serialized=True)
+        doc.pop("parent_path", None)  # the live create answers without it
+        return 200, doc
 
     def _genie_get(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
         space_id = m.group(1)
@@ -1431,6 +1452,10 @@ class FakeDatabricks:
                 if problem:
                     return _err(400, "INVALID_PARAMETER_VALUE", problem)
                 space["serialized_space"] = self._as_stored(b["serialized_space"])
+            if "title" in b and self._genie_title_taken(
+                b["title"], space["parent_path"], other_than=space_id
+            ):
+                return _err(409, "ALREADY_EXISTS", f"A space named {b['title']} already exists.")
             for key in ("title", "description", "warehouse_id", "parent_path"):
                 if key in b:
                     space[key] = b[key]
@@ -1501,9 +1526,14 @@ class FakeDatabricks:
         return self._genie_get_acl(m, q, b)
 
     def add_genie_space(
-        self, title: str, description: str, serialized: Optional[Dict] = None
+        self,
+        title: str,
+        description: str,
+        serialized: Optional[Dict] = None,
+        parent_path: Optional[str] = None,
     ) -> str:
-        """Seed a space someone made (brownfield), returning its space_id."""
+        """Seed a space someone made (brownfield), returning its space_id: by default in the
+        deploy user's own folder, ``parent_path`` for one made by anyone else."""
         with self._lock:
             self._space_count += 1
             space_id = f"01f1{self._space_count:028x}"
@@ -1512,7 +1542,7 @@ class FakeDatabricks:
                 "title": title,
                 "description": description,
                 "warehouse_id": self.warehouse_id,
-                "parent_path": f"/Users/{_USER}",
+                "parent_path": parent_path or f"/Users/{_USER}",
                 "serialized_space": json.dumps(serialized or {"version": 2}),
                 "etag": self._genie_etag(),
             }

@@ -364,8 +364,9 @@ them, `semantics.labels.ai-example-questions` as sample questions, and one instr
 cases, purpose limitation). The space never widens access. Genie answers as the person asking,
 under their Unity Catalog grants. Prompt matching is never turned on. Only the principals with
 `SELECT` get `CAN RUN`. An `agentPolicy` that rules out `qa` refuses the space. The space is
-found again by the marker `[fluid-genie:<product id>]` in its description, and removing the block
-trashes it. Code: `fluid_build/iac/providers/databricks_genie.py`.
+found again by the marker `[fluid-genie:<product id>]` at the end of its description, only in the
+deploying identity's own folder (one anywhere else is left alone), and removing the block trashes
+it. Code: `fluid_build/iac/providers/databricks_genie.py`.
 
 ---
 
