@@ -108,16 +108,28 @@ def run_apply(args: argparse.Namespace, logger: logging.Logger) -> int:
     from fluid_build.iac.providers.databricks import genie_estate
     from fluid_build.iac.providers.databricks_genie_estate import converge_estate
 
-    contracts: List[Tuple[str, Mapping[str, Any]]] = [
-        (label, resolve(load_contract_with_overlay(str(path), args.env, logger)))
-        for label, path in contract_paths(args.contracts)
-    ]
+    # The loader says "overlay_applied" for each contract it reads (``fluid.loader``), which for
+    # a pack is one line per product; the header names the overlay once instead. A missing
+    # overlay still warns, and --log-level DEBUG shows every line.
+    loader_log = logging.getLogger("fluid.loader")
+    level = loader_log.level
+    if logger.getEffectiveLevel() > logging.DEBUG:
+        loader_log.setLevel(logging.WARNING)
+    try:
+        contracts: List[Tuple[str, Mapping[str, Any]]] = [
+            (label, resolve(load_contract_with_overlay(str(path), args.env, logger)))
+            for label, path in contract_paths(args.contracts)
+        ]
+    finally:
+        loader_log.setLevel(level)
     estate = genie_estate(args.estate, contracts, title=args.title)
     say = cprint_literal
-    say(
-        f"Genie estate {args.estate}: {len(contracts)} contract(s), "
-        f"{len(estate.owners)} table(s), {estate.joins} join(s)"
-    )
+    header = f"Genie estate {args.estate}: {len(contracts)} contract(s)"
+    if args.env:
+        header += f" (--env {args.env})"
+    if estate.space is not None:
+        header += f", {len(estate.owners)} table(s), {estate.joins} join(s)"
+    say(header)
     for warning in estate.warnings:
         say(f"  note: {warning}")
     for refusal in estate.refusals[1:]:
