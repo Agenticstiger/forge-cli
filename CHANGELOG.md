@@ -83,6 +83,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider, which forge would not use. A provider named this way also gets `FLUID_LLM_API_KEY`,
   as with the flag. A coding agent or `mcp-sampling` named either way is not tested, and the
   command now says so, where `claude-code` failed as "Unsupported AI provider 'claude_code'".
+- **A contract that types its text columns `STRING` passes the DuckDB acquisition's schema
+  gate.** DuckDB reports every text column as `VARCHAR`, and the gate read `STRING` and `VARCHAR`
+  as two types, so a contract written for Spark or Databricks stopped every ingest with "source
+  schema drift detected", one `type_changed→fail` per text column, under every `schemaPolicy`
+  but `evolve_all`. DuckDB's own names for the type (`VARCHAR`, `STRING`, `TEXT`, `CHAR`,
+  `BPCHAR`, `NVARCHAR`) are now one type, with or without a length (`VARCHAR(255)`,
+  `CHAR(3)`), which DuckDB neither enforces nor reports, and a change between them logs no
+  rename warning. An all-null column that `fluid init --discover` wrote as `string` now also
+  passes once text arrives. `STRING` to `INTEGER` is still drift.
 
 ## [0.29.0] — 2026-11-12
 
