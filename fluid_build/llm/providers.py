@@ -32,6 +32,7 @@ __all__ = [
     "reset_llm_caches",
     "agent_loop_requested",
     "preflight_llm_provider",
+    "remember_named_llm_provider",
     "resolve_llm_config",
     "resolve_model_name",
     "resolve_ollama_model",
@@ -758,23 +759,35 @@ def live_provider_models(
     *,
     api_key: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
+    named: bool = False,
 ) -> Optional[List[str]]:
-    """Fetch live provider model ids when supported by the adapter."""
+    """Fetch live provider model ids when supported by the adapter.
+
+    ``named``: the operator named this provider, so ``FLUID_LLM_API_KEY`` may
+    be its key (see ``provider_resolve._resolve_api_key``).
+    """
     env = dict(environ or os.environ)
     provider = get_llm_provider(provider_name)
-    return provider.list_available_models(api_key or _resolve_api_key(provider.name, env), env)
+    return provider.list_available_models(
+        api_key or _resolve_api_key(provider.name, env, named=named), env
+    )
 
 
 def has_llm_api_key(
     provider_name: str,
     environ: Optional[Mapping[str, str]] = None,
+    *,
+    named: bool = False,
 ) -> bool:
-    """Return whether the provider can resolve credentials without exposing them."""
+    """Return whether the provider can resolve credentials without exposing them.
+
+    ``named`` as for :func:`live_provider_models`.
+    """
     env = dict(environ or os.environ)
     provider = get_llm_provider(provider_name)
     if provider.name == "ollama":
         return detect_ollama_available(env)
-    return bool(_resolve_api_key(provider.name, env))
+    return bool(_resolve_api_key(provider.name, env, named=named))
 
 
 # Providers that never require an LLM API key — the call is paid for
@@ -863,6 +876,84 @@ def _explicit_provider_name(args: Any, env: Mapping[str, str]) -> Optional[str]:
         or env.get("FLUID_FORGE_AGENT")
         or None
     )
+
+
+# Interactive forge puts the provider its inline setup found into
+# ``args.llm_provider``, where it would read as named. Before that, it records
+# here what the operator named (``None`` for nothing), so ``FLUID_LLM_API_KEY``
+# still goes only to a provider the operator named.
+_NAMED_PROVIDER_ATTR = "llm_provider_named"
+_NOT_RECORDED = object()
+
+
+def _recorded_named_provider(args: Any) -> Any:
+    """What :func:`remember_named_llm_provider` recorded on *args*, else ``_NOT_RECORDED``.
+
+    Only a string or ``None`` is a record; anything else (no attribute, a
+    test double's auto-attribute) is not.
+    """
+    value = getattr(args, _NAMED_PROVIDER_ATTR, _NOT_RECORDED)
+    return value if value is None or isinstance(value, str) else _NOT_RECORDED
+
+
+def remember_named_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = None) -> None:
+    """Record which provider the operator named, before ``args.llm_provider`` is replaced.
+
+    Call it before putting a provider that setup found into ``args.llm_provider``.
+    A record already made is kept, so a second setup cannot turn its own pick
+    into a named provider.
+    """
+    if _recorded_named_provider(args) is not _NOT_RECORDED:
+        return
+    env = os.environ if environ is None else environ
+    setattr(args, _NAMED_PROVIDER_ATTR, _explicit_provider_name(args, env))
+
+
+def _unnamed_provider_note(
+    args: Any, env: Mapping[str, str], provider_name: str, named: bool
+) -> Optional[str]:
+    """Why ``FLUID_LLM_API_KEY`` is not used for *provider_name*, else ``None``.
+
+    ``FLUID_LLM_API_KEY`` does not say which vendor it is for, so a provider
+    forge picked itself never gets it (``provider_resolve._resolve_api_key``).
+    The note is logged, so it is built from provider names alone and never from
+    anything that holds or resolves a key (CodeQL
+    py/clear-text-logging-sensitive-data).
+    """
+    if named or not env.get("FLUID_LLM_API_KEY"):
+        return None
+    recorded = _recorded_named_provider(args)
+    if isinstance(recorded, str) and recorded:  # interactive setup replaced the choice
+        return (
+            f"FLUID_LLM_API_KEY is set but not used: it is for {recorded}, the provider "
+            f"you named, and this run uses {provider_name}."
+        )
+    return (
+        "FLUID_LLM_API_KEY is set but not used: it goes only to a provider named with "
+        f"--llm-provider or FLUID_LLM_PROVIDER, and forge picked {provider_name} itself. "
+        f"Pass --llm-provider {provider_name} to use the key with it."
+    )
+
+
+def _same_llm_provider(first: str, second: str) -> bool:
+    """Whether two provider names select the same provider (``claude`` is ``anthropic``)."""
+    return normalize_llm_provider_name(first) == normalize_llm_provider_name(second)
+
+
+def _provider_is_named(args: Any, env: Mapping[str, str], provider_name: str) -> bool:
+    """Whether *provider_name*, the provider this run uses, is one the operator named.
+
+    Without a record, a named provider always wins inference, so the run uses
+    it whenever one is named. With one, ``args.llm_provider`` may be what setup
+    found, which counts only when it is the provider the operator named.
+    """
+    recorded = _recorded_named_provider(args)
+    explicit = _explicit_provider_name(args, env)
+    if recorded is _NOT_RECORDED:
+        return bool(explicit)
+    if not recorded:
+        return False
+    return recorded == explicit or _same_llm_provider(recorded, provider_name)
 
 
 _AGENT_LOOP_ALTERNATIVES = (
@@ -968,7 +1059,9 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
             ],
         )
 
-    api_key = _resolve_api_key(provider.name, env)
+    named = _provider_is_named(args, env, provider.name)
+    api_key = _resolve_api_key(provider.name, env, named=named)
+    unnamed_note = _unnamed_provider_note(args, env, provider.name, named)
     # A third-party provider plugin may declare ``keyless = True`` (class attr)
     # when it authenticates by some other means (e.g. an ambient cloud identity
     # or its own env var validated at call time) — same escape the built-in
@@ -981,8 +1074,9 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
             "copilot_missing_llm_api_key",
             f"No API key was configured for the {provider.name} copilot adapter.",
             suggestions=[
+                *([unnamed_note] if unnamed_note else []),
                 "Run 'fluid ai setup' to configure a provider interactively",
-                "Set FLUID_LLM_API_KEY or the provider-specific API key environment variable",
+                "Set the provider's own key variable, or FLUID_LLM_API_KEY with --llm-provider",
                 "Examples: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY",
                 "For local models, use --llm-provider ollama and optionally --llm-endpoint",
                 "For keyless authoring: run forge from your IDE (mcp-sampling), or use a "
@@ -991,6 +1085,9 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
         )
 
     model_notes: List[str] = []
+    if unnamed_note:
+        model_notes.append(unnamed_note)
+        LOG.warning(unnamed_note)
     if (
         not _explicit_provider_name(args, env)
         and not saved
@@ -1643,7 +1740,10 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
     saved = _saved_choice_for(None, env, provider.name)
 
     # Resolve API key: env vars → config file
-    api_key = _resolve_api_key(provider.name, env) or saved.get("api_key")
+    # FLUID_LLM_API_KEY counts only for a provider named with FLUID_LLM_PROVIDER or
+    # FLUID_FORGE_AGENT, never for one the ladder picked, the saved choice included.
+    named = _provider_is_named(None, env, provider.name)
+    api_key = _resolve_api_key(provider.name, env, named=named) or saved.get("api_key")
     from fluid_build.llm.coding_agent import _AGENT_SPECS
 
     agent = _AGENT_SPECS.get(provider.name)

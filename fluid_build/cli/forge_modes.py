@@ -308,7 +308,7 @@ def _forge_build_copilot_options(
     """
     from fluid_build.llm.providers import agent_loop_requested
 
-    return {
+    options = {
         "llm_provider": get_cli_arg_fn(args, "llm_provider"),
         "llm_model": get_cli_arg_fn(args, "llm_model"),
         "llm_endpoint": get_cli_arg_fn(args, "llm_endpoint"),
@@ -357,6 +357,14 @@ def _forge_build_copilot_options(
         "seed_allow_remote": bool(get_cli_arg_fn(args, "seed_allow_remote", False)),
         "seed_no_remote": bool(get_cli_arg_fn(args, "seed_no_remote", False)),
     }
+    # Interactive setup may have put the provider it found into llm_provider.
+    # Carry what the operator named, so FLUID_LLM_API_KEY still goes only to that
+    # provider (providers.remember_named_llm_provider).
+    not_recorded = object()
+    named = get_cli_arg_fn(args, "llm_provider_named", not_recorded)
+    if named is not not_recorded:
+        options["llm_provider_named"] = named
+    return options
 
 
 def _forge_install_pause_handler(

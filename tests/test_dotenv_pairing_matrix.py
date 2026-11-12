@@ -141,9 +141,21 @@ def _skip_where_litellm_cannot_reply() -> None:
     )
 
 
+# The providers forge picks without a name: the one keyring key or key variable
+# (openai, anthropic, gemini), interactive setup's scan of PROVIDER_ENV_VARS
+# (github too), a running Ollama. Such a run never gets FLUID_LLM_API_KEY. Forge
+# reaches every other provider only by being named.
+_PICKED_WITHOUT_A_NAME = frozenset({"openai", "anthropic", "gemini", "github", "ollama"})
+
+
 def _llm_call(provider: str, endpoint_var: str) -> None:
     """What ``fluid forge`` does with FLUID_LLM_BACKEND=litellm: resolve the key,
     hand it to litellm, and let litellm read the endpoint from the environment.
+
+    The key is resolved as for a named provider and, for one forge can pick
+    itself (:data:`_PICKED_WITHOUT_A_NAME`), as for a picked one too, since a
+    pairing must hold however the run chose its provider. Each distinct key is
+    sent once, so where both ways find the same key the listener sees one call.
 
     litellm is called only for a loopback endpoint; a test that gets that far
     is skipped where litellm cannot build its reply
@@ -154,19 +166,25 @@ def _llm_call(provider: str, endpoint_var: str) -> None:
     from fluid_build.llm.litellm_backend import _litellm_model_for
     from fluid_build.llm.provider_resolve import _resolve_api_key
 
-    key = _resolve_api_key(provider, os.environ)
+    keys: List[Optional[str]] = []
+    for named in (True, False) if provider in _PICKED_WITHOUT_A_NAME else (True,):
+        key = _resolve_api_key(provider, os.environ, named=named)
+        if key not in keys:
+            keys.append(key)
 
-    def complete() -> Any:
-        _skip_where_litellm_cannot_reply()
-        return litellm.completion(
-            model=_litellm_model_for(provider, "test-model"),
-            messages=[{"role": "user", "content": "ping"}],
-            api_key=key,
-            num_retries=0,
-            timeout=5,
-        )
+    for key in keys:
 
-    send_if_loopback(os.environ.get(endpoint_var), complete)
+        def complete(key: Optional[str] = key) -> Any:
+            _skip_where_litellm_cannot_reply()
+            return litellm.completion(
+                model=_litellm_model_for(provider, "test-model"),
+                messages=[{"role": "user", "content": "ping"}],
+                api_key=key,
+                num_retries=0,
+                timeout=5,
+            )
+
+        send_if_loopback(os.environ.get(endpoint_var), complete)
 
 
 def _openai_sdk_call() -> None:
@@ -576,7 +594,7 @@ def test_a_decoy_credential_does_not_pair_an_llm_endpoint_with_the_keyring_key(
     "provider,endpoint,credential",
     [
         ("openai", "OPENAI_BASE_URL", "OPENAI_API_KEY"),
-        ("openai", "OPENAI_API_BASE", "FLUID_LLM_API_KEY"),
+        ("openai", "OPENAI_API_BASE", "OPENAI_API_KEY"),
         ("anthropic", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"),
         ("gemini", "GEMINI_API_BASE", "GEMINI_API_KEY"),
         ("gemini", "GEMINI_API_BASE", "GOOGLE_API_KEY"),
@@ -607,6 +625,36 @@ def test_the_credential_the_reader_sends_pairs_its_endpoint(
 
 
 @pytest.mark.parametrize(
+    "provider,endpoint",
+    [
+        ("openai", "OPENAI_API_BASE"),
+        ("openai", "OPENAI_BASE_URL"),
+        ("anthropic", "ANTHROPIC_BASE_URL"),
+        ("gemini", "GEMINI_API_BASE"),
+        ("github", "GITHUB_API_BASE"),
+    ],
+)
+def test_a_project_fluid_llm_api_key_does_not_pair_a_provider_forge_can_pick(
+    project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    listener: Listener,
+    provider: str,
+    endpoint: str,
+) -> None:
+    # The keyring holds one key, so forge picks its provider without a name, and
+    # a provider forge picked never gets FLUID_LLM_API_KEY: the keyring key is
+    # what goes out. The project's FLUID_LLM_API_KEY is a decoy and pairs nothing.
+    _keyring_holds(monkeypatch, provider)
+    (project / ".env").write_text(f"{endpoint}={listener.url}\nFLUID_LLM_API_KEY={PROJECT_KEY}\n")
+
+    hydrate_dotenv(project)
+    _llm_call(provider, endpoint)
+
+    assert endpoint not in os.environ
+    assert listener.saw(OPERATOR_KEY) == []
+
+
+@pytest.mark.parametrize(
     "provider,endpoint", [("groq", "GROQ_API_BASE"), ("openai", "OPENAI_BASE_URL")]
 )
 def test_the_harness_sees_a_key_sent_to_an_operator_endpoint(
@@ -630,7 +678,8 @@ def test_the_harness_sees_a_key_sent_to_an_operator_endpoint(
 def test_an_exported_fluid_llm_api_key_refuses_a_project_openai_endpoint(
     project: Path, monkeypatch: pytest.MonkeyPatch, listener: Listener
 ) -> None:
-    # _resolve_api_key prefers FLUID_LLM_API_KEY to the project's OPENAI_API_KEY.
+    # For a named openai, _resolve_api_key prefers FLUID_LLM_API_KEY to the
+    # project's OPENAI_API_KEY.
     monkeypatch.setenv("FLUID_LLM_API_KEY", OPERATOR_KEY)
     (project / ".env").write_text(f"OPENAI_BASE_URL={listener.url}\nOPENAI_API_KEY={DECOY_KEY}\n")
 
@@ -639,6 +688,124 @@ def test_an_exported_fluid_llm_api_key_refuses_a_project_openai_endpoint(
 
     assert listener.saw(OPERATOR_KEY) == []
     assert "OPENAI_BASE_URL" not in os.environ
+
+
+# ── interactive setup puts no stored key where a project endpoint reads ─────
+
+
+@pytest.mark.parametrize(
+    "provider,endpoint,credential",
+    [
+        ("openai", "OPENAI_BASE_URL", "OPENAI_API_KEY"),
+        ("anthropic", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"),
+        # setup writes GOOGLE_API_KEY, which forge reads before GEMINI_API_KEY
+        ("gemini", "GEMINI_API_BASE", "GEMINI_API_KEY"),
+    ],
+)
+def test_interactive_setup_never_sends_the_saved_key_to_a_project_endpoint(
+    project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    listener: Listener,
+    caplog: pytest.LogCaptureFixture,
+    provider: str,
+    endpoint: str,
+    credential: str,
+) -> None:
+    # The project pairs its own endpoint with its own key; ``fluid ai setup``
+    # saved this provider with a keyring key. Interactive forge's setup copied
+    # the saved key into the provider's variable (set_session_env), over the
+    # project's, so the saved key went to the project's host.
+    import fluid_build.cli.ai_setup as ai_setup
+    import fluid_build.llm.providers as llm_providers
+
+    (project / ".env").write_text(f"{endpoint}={listener.url}\n{credential}={PROJECT_KEY}\n")
+    hydrate_dotenv(project)
+    assert os.environ[endpoint] == listener.url  # the pairing holds
+    _keyring_holds(monkeypatch, provider)
+    monkeypatch.setattr(ai_setup, "_ai_setup_skipped", False)
+    monkeypatch.setattr(ai_setup, "_load_ai_config", lambda: {"provider": provider, "model": "m"})
+    monkeypatch.setattr(
+        ai_setup, "_load_key_from_keyring", lambda name: OPERATOR_KEY if name == provider else None
+    )
+
+    # What interactive ``fluid forge`` does (cli/forge.py): setup, then its key.
+    with caplog.at_level(logging.WARNING):
+        config = ai_setup.run_ai_setup_inline(None)
+        args = types.SimpleNamespace(llm_provider=None, llm_model=None, llm_endpoint=None)
+        llm_providers.remember_named_llm_provider(args, os.environ)
+        args.llm_provider = config.provider
+        if config.api_key:
+            ai_setup.set_session_env(config.provider, config.api_key)
+    _llm_call(provider, endpoint)
+
+    assert listener.saw(OPERATOR_KEY) == []
+    assert listener.saw(PROJECT_KEY) != []
+    # The warning names the endpoint, never the provider string setup worked
+    # with: that can come from classifying a typed key (CodeQL
+    # py/clear-text-logging-sensitive-data).
+    warned = [r.getMessage() for r in caplog.records if "Your key is not used" in r.getMessage()]
+    assert warned and all(endpoint in message for message in warned)
+
+
+@pytest.mark.parametrize(
+    "provider,endpoint,credential",
+    [
+        ("openai", "OPENAI_BASE_URL", "OPENAI_API_KEY"),
+        # no group is mapped to groq, so every LLM endpoint the project set counts
+        ("groq", "GROQ_API_BASE", "FLUID_LLM_API_KEY"),
+    ],
+)
+def test_setup_checks_no_key_against_a_project_endpoint(
+    project: Path, listener: Listener, provider: str, endpoint: str, credential: str
+) -> None:
+    # ``fluid ai setup`` checks a typed or imported key with one litellm call,
+    # and litellm reads the endpoint from the environment.
+    import fluid_build.cli.ai_setup as ai_setup
+    from fluid_build.cli.forge_copilot_llm_litellm import get_litellm_provider
+
+    _skip_where_litellm_cannot_reply()
+    (project / ".env").write_text(f"{endpoint}={listener.url}\n{credential}={PROJECT_KEY}\n")
+    hydrate_dotenv(project)
+    assert os.environ[endpoint] == listener.url  # the pairing holds
+
+    error = ai_setup._validate_api_key(get_litellm_provider(provider), OPERATOR_KEY)
+
+    assert listener.saw(OPERATOR_KEY) == []
+    assert error is not None and error.startswith("not checked:") and endpoint in error
+
+
+def test_setup_asks_for_no_key_it_could_not_check(
+    project: Path, monkeypatch: pytest.MonkeyPatch, listener: Listener
+) -> None:
+    # Asking three times for a key that can be neither checked nor used, with
+    # "2 attempt(s) left", helps nobody: setup says why once and stops.
+    import fluid_build.cli.ai_setup as ai_setup
+
+    (project / ".env").write_text(f"OPENAI_BASE_URL={listener.url}\nOPENAI_API_KEY={PROJECT_KEY}\n")
+    hydrate_dotenv(project)
+    asked: List[Any] = []
+    monkeypatch.setattr(ai_setup.Prompt, "ask", lambda *a, **k: asked.append(a) or OPERATOR_KEY)
+    printed: List[str] = []
+    console = types.SimpleNamespace(print=lambda *a, **k: printed.append(str(a[0]) if a else ""))
+
+    result = ai_setup._collect_and_validate_api_key(
+        console, provider_choice="openai", tier="balanced"
+    )
+
+    assert result is None
+    assert asked == []
+    assert listener.requests == []
+    assert any("Not asking for a" in line and "OPENAI_BASE_URL" in line for line in printed)
+
+
+def test_setup_still_sets_the_key_where_no_project_endpoint_reads(project: Path) -> None:
+    import fluid_build.cli.ai_setup as ai_setup
+
+    (project / ".env").write_text(f"OPENAI_API_KEY={PROJECT_KEY}\n")  # a key, no endpoint
+    hydrate_dotenv(project)
+    ai_setup.set_session_env("openai", OPERATOR_KEY)
+
+    assert os.environ["OPENAI_API_KEY"] == OPERATOR_KEY
 
 
 _FAKE_CODEX = """#!{python}
@@ -678,10 +845,10 @@ def _install_fake_codex(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def _run_codex() -> None:
+    import fluid_build.llm.providers as llm_providers
     from fluid_build.llm.coding_agent import get_coding_agent_provider
-    from fluid_build.llm.providers import LlmConfig
 
-    config = LlmConfig(provider="codex", model="codex", endpoint="", api_key=None)
+    config = llm_providers.LlmConfig(provider="codex", model="codex", endpoint="", api_key=None)
     try:
         get_coding_agent_provider("codex").invoke_blocking(config, "system", "user")
     except Exception:  # noqa: BLE001 — the listener answers 401

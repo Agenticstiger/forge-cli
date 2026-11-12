@@ -202,8 +202,16 @@ def _validate_ai_test_endpoint(provider_name: str, endpoint: str) -> Optional[st
     return None
 
 
-def _resolve_cloud_api_key(provider: str, saved: Optional[dict] = None) -> Optional[str]:
-    if os.environ.get("FLUID_LLM_API_KEY"):
+def _resolve_cloud_api_key(
+    provider: str, saved: Optional[dict] = None, *, named: bool = False
+) -> Optional[str]:
+    """The key ``fluid ai test`` sends to *provider*.
+
+    ``FLUID_LLM_API_KEY`` counts only when *named* (``--llm-provider``): it does
+    not say which vendor it is for, so a saved or env-inferred provider never
+    gets it (``llm/provider_resolve._resolve_api_key``).
+    """
+    if named and os.environ.get("FLUID_LLM_API_KEY"):
         return os.environ["FLUID_LLM_API_KEY"]
     if provider == "gemini":
         for env_var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
@@ -236,7 +244,7 @@ def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[st
     saved = _load_ai_config() or {}
 
     def _build_for_provider(
-        pname: str, *, allow_saved: bool = True
+        pname: str, *, allow_saved: bool = True, named: bool = False
     ) -> tuple[Optional[LlmConfig], Optional[str]]:
         provider = BUILTIN_LLM_PROVIDERS.get(pname)
         if not provider:
@@ -264,7 +272,7 @@ def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[st
                 ),
                 None,
             )
-        api_key = _resolve_cloud_api_key(pname, saved_for_provider)
+        api_key = _resolve_cloud_api_key(pname, saved_for_provider, named=named)
         if not api_key:
             return None, f"No API key found for {PROVIDER_DISPLAY_NAMES.get(pname, pname)}."
         endpoint = endpoint_override or saved_for_provider.get("endpoint")
@@ -279,7 +287,7 @@ def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[st
         )
 
     if provider_override:
-        config, error = _build_for_provider(provider_override)
+        config, error = _build_for_provider(provider_override, named=True)
         if config:
             config.timeout_seconds = timeout
         return config, error
