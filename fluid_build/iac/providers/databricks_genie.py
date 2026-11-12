@@ -1415,7 +1415,8 @@ def _share(client: Any, space_id: str, readers: Sequence[str], say: Say, dry_run
     if kept:
         say(
             f"    note: {', '.join(kept)} also hold CAN_EDIT or CAN_MANAGE on the space, set on it "
-            "directly; fluid apply keeps them (CAN_MANAGE can read other people's conversations)."
+            f"directly; {_VOICE.get().command} keeps them (CAN_MANAGE can read other people's "
+            "conversations)."
         )
     for principal in readers:
         key = acl_key(principal)

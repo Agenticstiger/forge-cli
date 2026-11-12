@@ -344,9 +344,7 @@ def test_a_reference_that_makes_no_join_is_said():
     keyless["exposes"][0]["contract"]["schema"][0].pop("tags")
     result = estate(keyless, tenancy())
     assert joins_of(result.space) == []
-    assert any(
-        f"references {SITES}, which tags no column primary-key" in w for w in result.warnings
-    )
+    assert any(f"references {SITES}, which declares no primary key" in w for w in result.warnings)
 
     by_country = tenancy()
     by_country["exposes"][0]["contract"]["schema"].append(column("country", fk=f"{SITES}.country"))
@@ -356,6 +354,25 @@ def test_a_reference_that_makes_no_join_is_said():
         f"column country references {SITES}.country, which is not the primary key of exactly "
         f"one table of {SITES}" in w
         for w in result.warnings
+    )
+
+
+def test_what_a_tables_keys_lose_is_said_as_fluid_apply_says_it():
+    nullable = sites()
+    nullable["exposes"][0]["contract"]["schema"][0].pop("required")
+    result = estate(nullable, tenancy())
+    assert joins_of(result.space) == []
+    assert any(
+        w.startswith(f"{SITES} exposes[0] (site_master) tags site_id primary-key without required")
+        for w in result.warnings
+    )
+
+    garbled = tenancy()
+    garbled["exposes"][0]["contract"]["schema"][1]["labels"]["references"] = "site_id"
+    result = estate(sites(), garbled)
+    assert joins_of(result.space) == []
+    assert any(
+        "labels.references is 'site_id', not <product id>.<column>" in w for w in result.warnings
     )
 
 
@@ -614,6 +631,16 @@ def test_a_space_planted_with_the_marker_in_another_folder_is_left_alone(fake):
     run = Run(fake)(*three())
     assert f"left alone: space {planted} ('Planted') carries {MARKER}" in run.text
     assert len(fake.genie_spaces) == 2 and fake.genie_acl[planted] == {}
+
+
+def test_a_direct_editor_is_kept_and_said_in_the_estates_words(fake):
+    Run(fake)(*three())
+    space_id = only_space(fake)["space_id"]
+    fake.genie_acl[space_id][("user_name", "editor@towers.example")] = "CAN_EDIT"
+    run = Run(fake)(*three())
+    assert "editor@towers.example also hold CAN_EDIT or CAN_MANAGE" in run.text
+    assert "fluid genie apply keeps them" in run.text
+    assert fake.genie_acl[space_id][("user_name", "editor@towers.example")] == "CAN_EDIT"
 
 
 def test_an_edit_in_between_says_to_re_run_the_estates_command(fake):

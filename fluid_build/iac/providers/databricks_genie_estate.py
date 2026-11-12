@@ -65,7 +65,7 @@ from urllib.parse import quote
 from ...providers._sql_safety import validate_ident
 from ..base import UnsupportedBindingError
 from . import databricks_genie as genie
-from .databricks_keys import Candidate, TableKeys, foreign_keys
+from .databricks_keys import Candidate, TableKeys, compile_keys, foreign_keys
 
 #: The marker's tag: a space's description ends with ``[fluid-genie-estate:<id>]``. A product's
 #: ends with ``[fluid-genie:<id>]``; neither can end the other, each starting with its own tag.
@@ -307,6 +307,7 @@ def _serialized_space(
             }
         ]
     }
+    warnings += key_warnings(members)
     joins = join_specs(key, members, warnings)
     if joins:
         instructions["join_specs"] = joins
@@ -372,6 +373,19 @@ def _label(member: Member, table: Any) -> str:
 # ---------------------------------------------------------------------- joins
 
 
+def key_warnings(members: Sequence[Member]) -> List[str]:
+    """What each table's keys lose before any join is made (``databricks_keys.compile_keys``):
+    a primary key on a column that is not required, a ``labels.references`` that names no
+    product and column. ``fluid apply`` says the same of its Unity Catalog keys."""
+    out: List[str] = []
+    for member in _by_product(members):
+        for table in _tables_of(member):
+            notes: List[str] = []
+            compile_keys(table.where, table.full_name, table.exposure, table.columns, notes)
+            out += [f"{member.product_id} {note}" for note in notes]
+    return out
+
+
 def join_specs(key: str, members: Sequence[Member], warnings: List[str]) -> List[Dict[str, Any]]:
     """One ``join_spec`` per foreign key between the estate's tables, sorted by id.
 
@@ -404,8 +418,9 @@ def join_specs(key: str, members: Sequence[Member], warnings: List[str]) -> List
                     )
                 elif not candidates[ref.product]:
                     warnings.append(
-                        f"{at} column {ref.column} references {ref.product}, which tags no column "
-                        "primary-key: the space has no join for it."
+                        f"{at} column {ref.column} references {ref.product}, which declares no "
+                        "primary key (a column tagged primary-key and required: true): the space "
+                        "has no join for it."
                     )
                 else:
                     joinable.append(ref)
