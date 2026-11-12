@@ -50,11 +50,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finds the space by a `[fluid-genie:<product id>]` marker at the end of its description, in the
   deploying identity's own folder only (a space carrying the marker anywhere else is left alone,
   with a note), and updates it with its `etag`. A second apply changes nothing, and removing the
-  block trashes the space. Deploy a product from one identity (CI, say): a space another
-  identity made is left alone, and that identity makes its own.
+  block trashes the space. Deploy a product from one identity (CI, say), or name a shared folder
+  with `parentPath` (below): a space another identity made in its own folder is left alone.
   `fluid apply --mode dry-run` prints what would change. The space is made through the Genie
   REST API (the `[databricks]` extra), since the databricks/databricks provider has no Genie
   space resource. One space per product; `fluid genie apply` makes one over several products.
+
+- **One Genie space for a product deployed from more than one identity.**
+  `extensions.databricksGenie.parentPath` names a workspace folder, such as `/genie/<domain>`.
+  A workspace admin creates it and gives `CAN_MANAGE` only to the identities that deploy the
+  product. `fluid apply` creates the space there and adopts only a space directly in that
+  folder, so a laptop and CI keep one space instead of one each. A space an earlier apply made
+  in the identity's own folder is moved in and keeps its conversations. A copy left there
+  afterwards is trashed. A space inherits its folder's permissions, so the folder is the trust
+  boundary. `fluid validate` refuses anything under `/Shared`: every workspace user holds
+  `CAN_MANAGE` there (measured), so each could read every reader's conversations. `fluid apply`
+  stops before `tofu apply` when the folder is missing or not a folder, when its permissions
+  cannot be read, or when a group of every user (`users`, or `account users` under identity
+  federation) holds `CAN_EDIT` or `CAN_MANAGE` on it. Removing the block, or removing or
+  changing `parentPath`, leaves the space in the old folder, with a note naming it: the apply
+  trusts only the folder the contract names now.
+
+- **`fluid plan` lists the Genie space** as a `databricks_genie_space` action with its title,
+  folder, tables and readers. `fluid diff` counts it among the contract's resources and never
+  reports it as drift, since nothing compares it with an apply. **`fluid generate iac` adds a
+  note** that the module it writes holds no Genie space, so a plain `tofu apply` makes none.
 
 - **Databricks: Unity Catalog primary and foreign keys from the contract.** A column tagged
   `primary-key` (all of them, in schema order, for a composite key; each must be

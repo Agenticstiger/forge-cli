@@ -4,9 +4,9 @@
 """A data product's Databricks AI/BI Genie space: compiled from its contract, kept in step by
 ``fluid apply``.
 
-A contract opts in with ``extensions.databricksGenie`` (``{}``, or ``{title: ...}``). The product
-gets one space holding its Databricks tables and any metric view over them, where people ask
-the product's own example questions in natural language.
+A contract opts in with ``extensions.databricksGenie`` (``{}``, or ``{title: ..., parentPath:
+...}``). The product gets one space holding its Databricks tables and any metric view over them,
+where people ask the product's own example questions in natural language.
 
 What the space holds (``serialized_space`` version 2, the body ``POST /api/2.0/genie/spaces``
 takes; field rules from databricks/databricks-agent-skills ``databricks-genie-agents``
@@ -51,6 +51,16 @@ only when what the contract asks differs from what it holds, and trashes it once
 drops the block. A space carrying the marker anywhere else is left alone with a note, so a copy
 someone plants is never filled, shared to the readers or trashed. No local record, so a fresh CI
 runner finds the same space; two spaces carrying one product's marker stop the apply.
+
+Deployed from more than one identity (a laptop and CI), each would make its own space in its
+own folder, so ``parentPath`` names one workspace folder for the space instead. A space inherits
+its folder's permissions (measured), so the folder's permissions become the trust boundary:
+whoever can edit or manage the folder can edit the space and make one there carrying the marker.
+So the apply adopts only a space directly in that folder, and refuses a folder in which the
+``users`` group (every workspace user) holds ``CAN_EDIT`` or ``CAN_MANAGE``: all of ``/Shared``,
+which grants it ``CAN_MANAGE``, refused offline. A space an earlier apply made in the identity's
+own folder is moved into the named one (``PATCH parent_path``, which keeps its conversations), and
+a copy left in it once the product's space is there is trashed.
 
 Measured on a live workspace (2026-11-12) and handled: the service keeps a space as sent except
 that it leaves out a ``false`` flag (never sent, so a second apply compares equal); a new space
@@ -100,10 +110,22 @@ from . import databricks_enforce as _enforce
 
 #: The contract's opt-in: ``extensions.databricksGenie``.
 EXTENSION_KEY = "databricksGenie"
-_BLOCK_KEYS = frozenset({"title"})
+_BLOCK_KEYS = frozenset({"title", "parentPath"})
 
 SPACES_PATH = "/api/2.0/genie/spaces"
 PERMISSIONS_PATH = "/api/2.0/permissions/genie/{}"
+WORKSPACE_STATUS_PATH = "/api/2.0/workspace/get-status"
+FOLDER_PERMISSIONS_PATH = "/api/2.0/permissions/directories/{}"
+#: The group every workspace user is in, as the Permissions API names it.
+ALL_USERS = "users"
+#: Every group that holds every user: the workspace's own, and the account's (granted on a
+#: workspace object under identity federation).
+ALL_USERS_GROUPS = (ALL_USERS, "account users")
+#: The folder that grants :data:`ALL_USERS` ``CAN_MANAGE`` directly; every folder and space under
+#: it inherits that (measured on a live workspace, 2026-11-12), and a workspace permission
+#: cannot be taken away below the folder that grants it ("objects in a folder inherit all
+#: permissions settings of that folder", Databricks access control docs).
+SHARED_FOLDER = "/Shared"
 TABLES_PATH = "/api/2.1/unity-catalog/tables"
 WAREHOUSE_ENV = "DATABRICKS_WAREHOUSE_ID"
 DATABRICKS_EXTRA_INSTALL = "pip install 'data-product-forge[databricks]'"
@@ -172,6 +194,8 @@ class Voice:
     scope: str = "product"
     #: Where the space's title is set.
     title_setting: str = f"extensions.{EXTENSION_KEY}.title"
+    #: Where the space's folder is set, ``""`` for a space that has no setting for it.
+    folder_setting: str = f"extensions.{EXTENSION_KEY}.parentPath"
     #: How to ask for no space instead, at the start of a sentence.
     opt_out: str = f"Remove extensions.{EXTENSION_KEY}"
     #: The line that heads what a converge prints.
@@ -208,10 +232,19 @@ class Space:
     serialized: Dict[str, Any]
     #: The marker its description ends with, when it is not the product's (an estate's).
     token: str = ""
+    #: The workspace folder the space lives in (``parentPath``, as :func:`workspace_folder`
+    #: writes it), or ``""``: the deploying identity's own folder, where the API puts a space
+    #: when the create names none.
+    parent_path: str = ""
 
     @property
     def marker(self) -> str:
         return self.token or marker(self.product_id)
+
+    @property
+    def folder(self) -> str:
+        """Where the space lives, for a message."""
+        return self.parent_path or "this identity's folder"
 
 
 @dataclass
@@ -255,6 +288,7 @@ def compile_space(
     if not requested(contract):
         return out
     title = _block_title(contract, out)
+    parent_path = _block_parent_path(contract, out)
     out.refusals += _table_refusals(tables)
     if out.refusals:
         return out
@@ -279,6 +313,7 @@ def compile_space(
         tables=tuple(t.full_name for t in ordered),
         readers=_readers(tables, grants),
         serialized=serialized,
+        parent_path=parent_path,
     )
     return out
 
@@ -331,6 +366,69 @@ def _block_title(contract: Mapping[str, Any], out: Compiled) -> str:
         )
     )
     return ""
+
+
+def workspace_folder(path: str) -> str:
+    """``path`` as the Genie API reads a space's ``parent_path`` back: without the
+    ``/Workspace`` prefix a create accepts and without a trailing ``/`` (both measured,
+    2026-11-12). terraform-provider-databricks compares a dashboard's ``parent_path`` the same
+    way (``common.WorkspacePathPrefixDiffSuppress``); here the prefix counts only as a whole
+    segment. Workspace paths are case-sensitive (``/shared/x`` is not ``/Shared/x``: 404,
+    measured), so nothing is folded, and nothing is trimmed: a folder the API names ``"/x "``
+    is not ``/x``. (The contract's own value is trimmed first, by :func:`_block_parent_path`.)"""
+    path = str(path or "")
+    if path == "/Workspace" or path.startswith("/Workspace/"):
+        path = path[len("/Workspace") :]
+    return path.rstrip("/")
+
+
+def _block_parent_path(contract: Mapping[str, Any], out: Compiled) -> str:
+    """The folder ``parentPath`` names, as :func:`workspace_folder` writes it, or ``""`` without
+    one; what is wrong with it goes into ``out.refusals``."""
+    block = contract["extensions"][EXTENSION_KEY]
+    if not isinstance(block, Mapping) or "parentPath" not in block:
+        return ""
+    raw = block["parentPath"]
+    where = f"{_WHERE}.parentPath"
+    folder = workspace_folder(raw.strip()) if isinstance(raw, str) else ""
+    if not isinstance(raw, str) or not raw.strip():
+        problem = "not a folder path"
+    elif any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        problem = "a path with a control character in it"
+    elif not raw.strip().startswith("/"):
+        problem = "not absolute, and Genie takes a folder from the workspace root"
+    elif not folder:
+        problem = "the workspace root, and the space goes in a folder"
+    elif any(part in ("", ".", "..") for part in folder.split("/")[1:]):
+        problem = "a path with an empty, '.' or '..' part"
+    else:
+        problem = ""
+    if problem:
+        out.refusals.append(
+            _refusal(
+                "invalid",
+                f"{where} is {raw!r}: {problem}.",
+                f"Set {where} to a workspace folder such as /genie/<domain>, or leave it out for "
+                "the deploying identity's own folder.",
+            )
+        )
+        return ""
+    if folder == SHARED_FOLDER or folder.startswith(SHARED_FOLDER + "/"):
+        out.refusals.append(
+            _refusal(
+                "folder",
+                f"{where} is {raw!r}, in {SHARED_FOLDER}, where every workspace user holds "
+                f"CAN_MANAGE (the {ALL_USERS} group, granted on {SHARED_FOLDER} itself and "
+                "inherited by every folder in it). Each of them could then edit the Genie space's "
+                "instructions, read every reader's conversations, and make a space there that the "
+                "apply takes for the product's.",
+                f"Use a folder outside {SHARED_FOLDER} that a workspace admin creates (/genie/<domain> "
+                "at the workspace root, say, which only admins can write) and gives CAN_MANAGE only "
+                "to the identities that deploy the product.",
+            )
+        )
+        return ""
+    return folder
 
 
 def _table_refusals(tables: Sequence[Any]) -> List[UnsupportedBindingError]:
@@ -412,6 +510,50 @@ def _policy_refusals(table: Any) -> List[UnsupportedBindingError]:
             )
         )
     return out
+
+
+#: The plan op of a Genie space: its words name no kind the engines' shadow comparison counts
+#: (``iac/shadow.py`` matches table, view, schema, ...), since no module holds the space.
+PLAN_OP = "databricks.genie_space.converge"
+
+
+def space_plan_action(space: Space) -> Dict[str, Any]:
+    """The space as a plan action: ``fluid plan`` lists it (``plan.py``, through the plugin's
+    ``planned_output_ports``) and ``fluid diff`` counts it among the resources the contract asks
+    for (``databricks.py::planned_objects``).
+
+    No OpenTofu resource: ``fluid apply`` makes it through the Genie API after ``tofu apply``,
+    so no module or state holds it, and ``fluid diff``'s verdict does not read it (the live
+    check reads the tables, the state check the module's resources). Identified as the space
+    itself is, by the product's id, with no space id: none is known before an apply finds or
+    makes it. ``op`` and ``action_type`` both, as every plan action carries them.
+    """
+    return {
+        "action_id": f"genie_space_{space.product_id}",
+        "op": PLAN_OP,
+        "action_type": PLAN_OP,
+        "provider": "databricks",
+        "resource_type": "databricks_genie_space",
+        "resource_id": space.product_id,
+        "description": f"Genie space {space.title!r}{_in(space)}: fluid apply creates or "
+        "updates it through the Genie API, after tofu apply",
+        "title": space.title,
+        "parent_path": space.parent_path or None,
+        "tables": list(space.tables),
+        "readers": list(space.readers),
+    }
+
+
+def module_notice(contract: Mapping[str, Any]) -> Optional[str]:
+    """What ``fluid generate iac`` says about a contract that asks for a space: the module it
+    writes holds none, and a plain ``tofu apply`` of it makes none."""
+    if not requested(contract):
+        return None
+    return (
+        f"{_WHERE} asks for a Genie space, which this module does not hold: fluid apply "
+        "creates, updates or trashes it through the Genie API after tofu apply, so a plain "
+        "tofu apply of this module makes no space."
+    )
 
 
 def _description(contract: Mapping[str, Any], product_id: str) -> str:
@@ -852,33 +994,249 @@ def _converge(
         return
     require_warehouse(space)
     client = _client(client_factory)
-    voice = _VOICE.get()
-    say(f"\n  {voice.heading}")
+    say(f"\n  {_VOICE.get().heading}")
+    if space.parent_path:
+        _check_folder(client, space.parent_path, say)
     found = _call(client, "list the Genie spaces", lambda: _find(client, space.marker))
-    found = _call(client, "check whose Genie spaces those are", lambda: _owned(client, found, say))
-    if len(found) > 1:
-        raise GenieError(
-            f"{len(found)} Genie spaces carry {space.marker} in their description: "
-            + ", ".join(str(s.get("space_id")) for s in found)
-            + f". {voice.command} keeps one space per {voice.scope} and cannot tell which is the "
-            f"{voice.scope}'s.",
-            ("Trash the extra spaces (or remove the marker from their description), then re-run.",),
-        )
+    found, own = _call(
+        client,
+        "check whose Genie spaces those are",
+        lambda: _placed(client, found, say, space.parent_path),
+    )
+    # One space per product. A copy in this identity's own folder is moved into parentPath
+    # when the folder has none yet (one copy only: which one would be a guess), and trashed
+    # once the product's space is there.
+    _at_most_one(found or own, space)
     serialized = _with_metric_views(client, space)
-    if found:
-        space_id = str(found[0]["space_id"])
+    space_id = str(found[0]["space_id"]) if found else ""
+    if not found and own:
+        moving = own.pop()
+        space_id = str(moving["space_id"])
+        _move(client, moving, space, say, dry_run)
+    if space_id:
         _update_found(client, space_id, space, serialized, say, dry_run)
     elif dry_run:
-        say(f"    would create {space.title!r}: {_summary(serialized, space.tables)}")
+        say(f"    would create {space.title!r}{_in(space)}: {_summary(serialized, space.tables)}")
         if space.readers:
             say(f"    would share it ({READER_LEVEL}) with {', '.join(space.readers)}")
-        say("    dry-run: no Genie space was created, changed or shared.")
+        say(_DRY_RUN)
         return
     else:
         space_id = _create_new(client, space, serialized, say)
     _share(client, space_id, space.readers, say, dry_run)
+    for copy in own:
+        _trash_copy(client, copy, space, say, dry_run)
     if dry_run:
-        say("    dry-run: no Genie space was created, changed or shared.")
+        say(_DRY_RUN)
+
+
+_DRY_RUN = "    dry-run: no Genie space was created, changed, moved, shared or trashed."
+
+
+def _in(space: Space) -> str:
+    """`` in <folder>`` for a space ``parentPath`` places, else nothing (its own folder)."""
+    return f" in {space.parent_path}" if space.parent_path else ""
+
+
+def _at_most_one(spaces: Sequence[Mapping[str, Any]], space: Space) -> None:
+    voice = _VOICE.get()
+    if len(spaces) > 1:
+        raise GenieError(
+            f"{len(spaces)} Genie spaces carry {space.marker} in their description: "
+            + ", ".join(str(s.get("space_id")) for s in spaces)
+            + f". {voice.command} keeps one space per {voice.scope} and cannot tell which is the "
+            f"{voice.scope}'s.",
+            ("Trash the extra spaces (or remove the marker from their description), then re-run.",),
+        )
+
+
+def _check_folder(client: Any, folder: str, say: Say) -> None:
+    """Stop unless ``folder`` is a workspace folder on which no group of every user
+    (:data:`ALL_USERS_GROUPS`) holds ``CAN_EDIT`` or ``CAN_MANAGE``, directly or inherited.
+
+    A space inherits every permission on its folder (measured, 2026-11-12): whoever can edit
+    the folder can edit the space's instructions, and whoever manages it can also read every
+    reader's conversations and make a space there carrying the product's marker, which the
+    apply then adopts. The folder's permissions are the trust boundary, and one every user
+    holds is none. Permissions this identity cannot read stop the apply too: they could be
+    those.
+    """
+    object_id = _folder_object_id(client, folder)
+    acl = _call(
+        client,
+        f"read the permissions on the folder {folder}",
+        lambda: client.api_client.do("GET", FOLDER_PERMISSIONS_PATH.format(object_id)),
+    )
+    group, level = _broadest(acl, folder)
+    if level in _KEPT_LEVELS:
+        harm = "edit the space's instructions"
+        if level == "CAN_MANAGE":
+            harm = (
+                "edit the space's instructions, read every reader's conversations and make a "
+                "space there that the apply would take for the product's"
+            )
+        raise GenieError(
+            f"every workspace user holds {level} on the folder {folder} (the {group} group), "
+            f"and a Genie space inherits its folder's permissions: each of them could {harm}.",
+            (
+                f"Take CAN_EDIT and CAN_MANAGE on {folder} away from {group}, or set "
+                f"{_WHERE}.parentPath to a folder that only the identities deploying the product "
+                f"can edit or manage (not under {SHARED_FOLDER}, which grants {ALL_USERS} "
+                "CAN_MANAGE).",
+            ),
+        )
+    if level:
+        say(
+            f"    note: every workspace user holds {level} on {folder} (the {group} group), "
+            "which the space inherits: they can open it, and each answer still follows the "
+            "asker's own Unity Catalog grants."
+        )
+
+
+def _broadest(acl: Any, folder: str) -> Tuple[str, str]:
+    """The group of every user holding the highest level on ``folder``, and that level (``""``
+    for none of them). Any other answer than the measured shape stops the apply: every folder
+    lists at least ``admins`` (measured), so an empty list, an entry without its levels or a
+    level this module does not know could hide a grant to every user."""
+    entries = acl.get("access_control_list") if isinstance(acl, Mapping) else None
+    if not isinstance(entries, list) or not entries:
+        raise _unreadable(folder, "came back without an access control list")
+    best = (ALL_USERS, "")
+    for entry in entries:
+        group = entry.get("group_name") if isinstance(entry, Mapping) else None
+        if group not in ALL_USERS_GROUPS:
+            continue
+        for level in _held_levels(entry, folder):
+            if _LEVEL_RANK[level] > _LEVEL_RANK.get(best[1], 0):
+                best = (str(group), level)
+    return best
+
+
+def _held_levels(entry: Mapping[str, Any], folder: str) -> List[str]:
+    """The levels a group of every user holds on ``folder``, upper-cased; an entry that does
+    not say them plainly stops the apply."""
+    held = entry.get("all_permissions")
+    levels = [
+        str(item.get("permission_level") or "").upper()
+        for item in (held if isinstance(held, list) else ())
+        if isinstance(item, Mapping)
+    ]
+    unknown = [level for level in levels if level not in _LEVEL_RANK]
+    if not levels or unknown:
+        raise _unreadable(
+            folder,
+            f"do not say plainly what the {entry.get('group_name')} group holds "
+            f"({unknown or held!r})",
+        )
+    return levels
+
+
+def _unreadable(folder: str, what: str) -> GenieError:
+    return GenieError(
+        f"the permissions on the folder {folder} {what}, so whether every workspace user can "
+        "edit or manage it is unknown.",
+        (f"Check the permissions on {folder}, then re-run fluid apply.",),
+    )
+
+
+def _folder_object_id(client: Any, folder: str) -> str:
+    """The object id of the folder ``parentPath`` names, for the Permissions API path; a folder
+    that does not exist, or a path that is no folder, stops the apply with what to do."""
+    where = f"{_WHERE}.parentPath"
+    try:
+        status = client.api_client.do("GET", WORKSPACE_STATUS_PATH, query={"path": folder}) or {}
+    except Exception as exc:  # noqa: BLE001 — a missing folder is said as such
+        if _status(exc) != 404:
+            raise GenieError(
+                f"could not read the folder {folder}: {type(exc).__name__}: {_scrub(exc)}",
+                (_remediation(_status(exc), f"read the folder {folder}"),),
+            ) from exc
+        raise GenieError(
+            f"{where} names {folder}, and the workspace has no such folder (Genie makes a space "
+            "only in a folder that exists).",
+            (
+                f"A workspace admin creates {folder} (outside {SHARED_FOLDER}) and gives CAN_MANAGE "
+                "on it only to the identities that deploy the product; then re-run fluid apply.",
+            ),
+        ) from exc
+    kind = str(status.get("object_type") or "") if isinstance(status, Mapping) else ""
+    if kind.upper() != "DIRECTORY":
+        raise GenieError(
+            f"{where} names {folder}, which is "
+            + (f"a {kind.lower()}" if kind else "not a folder")
+            + ", and a Genie space goes in a folder.",
+            (f"Set {where} to a workspace folder.",),
+        )
+    object_id = status.get("object_id")
+    if object_id is None or str(object_id) == "":
+        raise GenieError(
+            f"the workspace answered for the folder {folder} without its object id, so its "
+            "permissions cannot be read.",
+            (f"Check that {folder} is a workspace folder, then re-run fluid apply.",),
+        )
+    return quote(str(object_id))
+
+
+def _move(client: Any, moving: Mapping[str, Any], space: Space, say: Say, dry_run: bool) -> None:
+    """Move a space from this identity's own folder into ``parentPath`` (``PATCH parent_path``,
+    measured 2026-11-12), so its id, link and conversations stay."""
+    space_id = str(moving.get("space_id"))
+    what = (
+        f"{moving.get('title')!r} ({space_id}) from this identity's own folder into "
+        f"{space.parent_path}"
+    )
+    if dry_run:
+        say(f"    would move {what}")
+        return
+    try:
+        client.api_client.do(
+            "PATCH", f"{SPACES_PATH}/{quote(space_id)}", body={"parent_path": space.parent_path}
+        )
+    except Exception as exc:  # noqa: BLE001 — a taken title is said as such
+        if _status(exc) == 409:
+            raise GenieError(
+                f"could not move space {space_id} into {space.parent_path}: another space there "
+                f"is already called {moving.get('title')!r}, the title this space has now, and "
+                "Genie keeps titles unique in a folder (measured for a create and a rename).",
+                (
+                    "Rename that space, or this one in Genie, then re-run fluid apply: it sets "
+                    f"the contract's title (extensions.{EXTENSION_KEY}.title) after the move.",
+                ),
+            ) from exc
+        raise GenieError(
+            f"could not move the Genie space into {space.parent_path}: "
+            f"{type(exc).__name__}: {_scrub(exc)}",
+            (_remediation(_status(exc), f"move the Genie space into {space.parent_path}"),),
+        ) from exc
+    parent = _call(client, "read the moved Genie space", lambda: _parent(client, space_id))
+    if workspace_folder(parent) != space.parent_path:
+        raise GenieError(
+            f"the Genie API accepted the move of space {space_id} into {space.parent_path}, and "
+            f"the space is in {parent or 'a folder this identity cannot read'}.",
+            (f"Move it into {space.parent_path} by hand, or trash it, then re-run fluid apply.",),
+        )
+    say(f"    moved {what}")
+
+
+def _trash_copy(
+    client: Any, copy: Mapping[str, Any], space: Space, say: Say, dry_run: bool
+) -> None:
+    """Trash a space carrying the marker in this identity's own folder, now that the product's
+    space is the one in ``parentPath``."""
+    space_id = str(copy.get("space_id"))
+    what = (
+        f"{copy.get('title')!r} ({space_id}), a copy in this identity's own folder: the product's "
+        f"space is the one{_in(space)}"
+    )
+    if dry_run:
+        say(f"    would trash {what}")
+        return
+    _call(
+        client,
+        "trash the Genie space",
+        lambda: client.api_client.do("DELETE", f"{SPACES_PATH}/{quote(space_id)}"),
+    )
+    say(f"    trashed {what}")
 
 
 def _with_metric_views(client: Any, space: Space) -> Dict[str, Any]:
@@ -913,7 +1271,7 @@ def _update_found(
     dry_run: bool,
 ) -> None:
     live = _call(client, "read the Genie space", lambda: _get(client, space_id))
-    title = _title_kept(live.get("title"), space.title, say)
+    title = _title_kept(live.get("title"), space, say)
     changes = differences(
         live, space, serialized, _tables_of_space(client, live, space, serialized)
     )
@@ -936,10 +1294,13 @@ def _create_new(client: Any, space: Space, serialized: Mapping[str, Any], say: S
     space_id = str(created.get("space_id") or "")
     if not space_id:
         raise GenieError("the Genie API created a space and returned no space_id.")
-    say(f"    created {space.title!r}: {_summary(serialized, space.tables)} ({_url(space_id)})")
-    _title_kept(created.get("title"), space.title, say)
+    say(
+        f"    created {space.title!r}{_in(space)}: {_summary(serialized, space.tables)} "
+        f"({_url(space_id)})"
+    )
+    _title_kept(created.get("title"), space, say)
     _wait_listed(client, space, space_id, say)
-    _found_again(client, space_id)
+    _found_again(client, space, space_id)
     _keep_as_sent(client, space_id, space, serialized, say, made="made")
     return space_id
 
@@ -966,7 +1327,7 @@ def _keep_as_sent(
     changes = differences(live, space, serialized)
     if not changes:
         return
-    title = _title_kept(live.get("title"), space.title, lambda _line: None)
+    title = _title_kept(live.get("title"), space, lambda _line: None)
     _call(
         client,
         "set the Genie space back",
@@ -984,12 +1345,20 @@ def _keep_as_sent(
         say(f"    note: the space differed from what was sent ({', '.join(changes)}); set back.")
 
 
-def _found_again(client: Any, space_id: str) -> None:
+def _found_again(client: Any, space: Space, space_id: str) -> None:
     """Stop, and trash the new space, when it is not where the next apply looks for it: a
     space every apply could not find would be made again on each one."""
-    home = _call(client, "read which identity this run is", lambda: _home(client))
+    home = ""
+    if not space.parent_path:
+        home = _call(client, "read which identity this run is", lambda: _home(client))
+    where = space.parent_path or f"this identity's own folder ({home})"
     parent = _call(client, "read the new Genie space", lambda: _parent(client, space_id))
-    if _in_folder(parent, home):
+    landed = (
+        workspace_folder(parent) == space.parent_path
+        if space.parent_path
+        else _in_folder(parent, home)
+    )
+    if landed:
         return
     run = _VOICE.get().run
     try:
@@ -1001,17 +1370,26 @@ def _found_again(client: Any, space_id: str) -> None:
     except GenieError as exc:
         raise GenieError(
             f"the Genie API put the new space {space_id} in "
-            f"{parent or 'a folder this identity cannot read'}, not in this identity's own folder "
-            f"({home}), where the next {run} looks for it, and trashing it failed: {exc}",
+            f"{parent or 'a folder this identity cannot read'}, not in {where}, where the next "
+            f"{run} looks for it, and trashing it failed: {exc}",
             (f"Trash space {space_id} by hand before the next {run}, which would make another.",),
         ) from exc
     raise GenieError(
         f"the Genie API put the new space in {parent or 'a folder this identity cannot read'}, "
-        f"not in this identity's own folder ({home}), where the next {run} looks for it, so it "
-        f"was trashed rather than made again on every {run}.",
+        f"not in {where}, where the next {run} looks for it, so it was trashed rather than made "
+        f"again on every {run}.",
         (
-            "Deploy with an identity whose home folder is /Users/<its userName>, or report this "
-            "to forge-cli with the folder named above.",
+            (
+                (
+                    f"Check that {space.parent_path} is a folder this identity can read, or report "
+                    "this to forge-cli with the folder named above."
+                )
+                if space.parent_path
+                else (
+                    "Deploy with an identity whose home folder is /Users/<its userName>, or report "
+                    "this to forge-cli with the folder named above."
+                )
+            ),
         ),
     )
 
@@ -1038,14 +1416,15 @@ def _wait_listed(client: Any, space: Space, space_id: str, say: Say) -> None:
         time.sleep(_POLL_SECONDS)
 
 
-def _title_kept(live: Any, wanted: str, say: Say) -> str:
-    """The title to send: ``wanted``, or the live one when the service suffixed it because
-    another space in the folder has ``wanted`` (sending ``wanted`` again is 409), said as
+def _title_kept(live: Any, space: Space, say: Say) -> str:
+    """The title to send: the contract's, or the live one when the service suffixed it because
+    another space in the folder has the contract's (sending that again is 409), said as
     such."""
     live = str(live or "")
+    wanted = space.title
     if live != wanted and _same_title(live, wanted):
         say(
-            f"    note: the space is titled {live!r}: another space in this identity's folder is "
+            f"    note: the space is titled {live!r}: another space in {space.folder} is "
             f"already called {wanted!r} and Genie keeps titles unique there. Give this one a "
             f"title of its own with {_VOICE.get().title_setting}."
         )
@@ -1062,9 +1441,12 @@ def _same_title(live: Any, wanted: str) -> bool:
 
 def preflight(compiled: Compiled, client_factory: Optional[ClientFactory] = None) -> None:
     """Before ``tofu apply``: the client a space the contract asks for needs (the SDK extra and
-    the credential), so a missing one stops the run before anything is applied."""
+    the credential), and the folder ``parentPath`` names (:func:`_check_folder`), so a missing
+    one, or a folder every workspace user can edit, stops the run before anything is applied."""
     if compiled.space is not None:
-        _client(client_factory)
+        client = _client(client_factory)
+        if compiled.space.parent_path:
+            _check_folder(client, compiled.space.parent_path, lambda _line: None)
 
 
 def _retire(product_id: str, say: Say, factory: Optional[ClientFactory], dry_run: bool) -> None:
@@ -1086,7 +1468,7 @@ def _retire(product_id: str, say: Say, factory: Optional[ClientFactory], dry_run
     try:
         found = _find(client, marker(product_id))
         if found:
-            found = _owned(client, found, say)
+            found = _placed(client, found, say)[0]
     except Exception as exc:  # noqa: BLE001
         if _status(exc) not in (403, 404):
             say(f"  note: not checked for a Genie space an earlier apply made: {_scrub(exc)}")
@@ -1130,37 +1512,57 @@ def _find(client: Any, token: str) -> List[Dict[str, Any]]:
         query = {"page_size": _PAGE_SIZE, "page_token": token_next}
 
 
-def _owned(client: Any, found: List[Dict[str, Any]], say: Say) -> List[Dict[str, Any]]:
-    """The spaces in ``found`` that this identity made: the ones in its own folder,
-    ``/Users/<userName>``, where the Genie API puts a space it creates (measured
+def _placed(
+    client: Any, found: List[Dict[str, Any]], say: Say, folder: str = ""
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """``found`` by folder: ``(the product's spaces, this identity's own copies)``.
+
+    The product's are the spaces in ``folder`` itself (``parentPath``, compared as
+    :func:`workspace_folder` writes it, case and all) or, without one, in this identity's own
+    folder, ``/Users/<userName>``, where the Genie API puts a space it creates (measured
     2026-11-12; the list leaves ``parent_path`` out, a plain GET has it). A service
     principal's folder is ``/Users/<application id>``, its userName, the folder Databricks Asset
-    Bundles' default ``root_path`` builds from ``workspace.current_user.userName``.
+    Bundles' default ``root_path`` builds from ``workspace.current_user.userName``. With
+    ``folder``, the spaces in this identity's own folder are its copies, from an apply before
+    ``parentPath`` was set.
 
     A space anyone else made carrying the marker is left alone, with a note: adopting it would
     fill it with the product, share it to the readers and keep its maker's ``CAN_MANAGE``
     (inherited from their folder, which a share cannot remove), and that level can read the
-    readers' conversations. Only this identity and an admin can make a space in its folder. A
-    failure to read a space's folder other than 403 or 404 is raised, not taken for "someone
-    else's": that would make a second space for the product.
+    readers' conversations. Only this identity and an admin can make a space in its folder, and
+    only whom ``folder``'s permissions let (:func:`_check_folder`) in that one. A failure to read
+    a space's folder other than 403 or 404 is raised, not taken for "someone else's": that would
+    make a second space for the product.
     """
     if not found:
-        return []
+        return [], []
     home = _home(client)
-    mine = []
+    voice = _VOICE.get()
+    scope, setting, run = voice.scope, voice.folder_setting, voice.run
+    product: List[Dict[str, Any]] = []
+    own: List[Dict[str, Any]] = []
     for space in found:
         space_id = str(space.get("space_id"))
         parent = _parent(client, space_id)
-        if _in_folder(parent, home):
-            mine.append(space)
-            continue
-        say(
-            f"    note: left alone: space {space_id} ({space.get('title')!r}) carries "
-            f"{_marker_of(space)} but is in {parent or 'a folder this identity cannot read'}, not "
-            "in this identity's own folder, so it is not taken for the product's. Trash it, or "
-            "take the marker out of its description."
-        )
-    return mine
+        if folder and workspace_folder(parent) == folder:
+            product.append(space)
+        elif _in_folder(parent, home):
+            (own if folder else product).append(space)
+        else:
+            say(
+                f"    note: left alone: space {space_id} ({space.get('title')!r}) carries "
+                f"{_marker_of(space)} but is in {parent or 'a folder this identity cannot read'}, "
+                "not in " + (f"{folder} or " if folder else "") + "this identity's own folder, "
+                f"so it is not taken for the {scope}'s. Trash it, or take the marker out of its "
+                "description."
+                + (
+                    f" If it is this {scope}'s own space, left in a folder the contract no longer "
+                    f"names as {setting}, trash it there by hand: the {run} trusts no other folder."
+                    if setting
+                    else ""
+                )
+            )
+    return product, own
 
 
 def _home(client: Any) -> str:
@@ -1210,7 +1612,10 @@ def _body(space: Space, serialized: Mapping[str, Any], title: str = "") -> Dict[
 
 
 def _create(client: Any, space: Space, serialized: Mapping[str, Any]) -> Dict[str, Any]:
-    return client.api_client.do("POST", SPACES_PATH, body=_body(space, serialized)) or {}
+    body = _body(space, serialized)
+    if space.parent_path:
+        body["parent_path"] = space.parent_path
+    return client.api_client.do("POST", SPACES_PATH, body=body) or {}
 
 
 def _update(
@@ -1230,7 +1635,7 @@ def _update(
         voice = _VOICE.get()
         if _status(exc) == 409 and _taken_title(exc):
             raise GenieError(
-                f"another Genie space in this identity's folder is already called "
+                f"another Genie space in {space.folder} is already called "
                 f"{body['title']!r}, and Genie keeps titles unique there.",
                 (
                     f"Give this space a title of its own with {voice.title_setting}, "

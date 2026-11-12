@@ -37,7 +37,7 @@ a product space.
 
 Identity, as a product space's, without state: the description ends with
 ``[fluid-genie-estate:<id>]``, a run adopts the space carrying it in the deploying identity's own
-folder only (``databricks_genie._owned``), and two such spaces stop the run. The space converges
+folder only (``databricks_genie._placed``), and two such spaces stop the run. The space converges
 to exactly the contracts given, so a contract left out of a run leaves the space.
 ``fluid genie remove --estate <id>`` trashes it. The products are applied first (``fluid
 apply``): each run checks that every table exists before it writes, and names the product of
@@ -90,6 +90,7 @@ def voice(estate_id: str, command: str = _COMMAND) -> genie.Voice:
         run="run",
         scope="estate",
         title_setting="--title",
+        folder_setting="",
         opt_out="Leave that product out of the estate",
         heading=f"Databricks Genie space for the estate {estate_id} (Genie API):",
     )
@@ -636,7 +637,9 @@ def remove_estate(
         say(f"\n  {speaking.heading}")
         found = genie._call(client, "list the Genie spaces", lambda: genie._find(client, token))
         found = genie._call(
-            client, "check whose Genie spaces those are", lambda: genie._owned(client, found, say)
+            client,
+            "check whose Genie spaces those are",
+            lambda: genie._placed(client, found, say)[0],
         )
         if not found:
             say(f"    no Genie space in this identity's folder carries {token}: nothing to trash.")
