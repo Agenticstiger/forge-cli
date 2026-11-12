@@ -13,7 +13,7 @@ builds:
   pattern: embedded-logic
   engine: sql
   properties:
-    sql: SELECT * FROM read_csv_auto('products/payments_raw/data/payments.csv', header=true)
+    sql: SELECT * FROM read_csv_auto('data/payments.csv', header=true)
   execution:
     trigger: {type: schedule, cron: 0 1 * * *}
     runtime: {platform: local}

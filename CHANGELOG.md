@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLI. The same directory is a Claude Code plugin, listed by `.claude-plugin/marketplace.json`
   (`/plugin marketplace add Agenticstiger/forge-cli`, then `/plugin install fluid@forge-cli`),
   and `npx skills add Agenticstiger/forge-cli` installs it too.
-- **An eval harness for the skills** (`tests/agent_evals/`). It runs 11 authoring scenarios
-  three ways: an agent without the skills, one with them, and `fluid forge`'s own AI mode. It
+- **An eval harness for the skills** (`tests/agent_evals/`). It runs 11 scenarios (authoring,
+  refining, composing and a plan-only deploy) with an agent without the skills and one with
+  them, and 9 of them through `fluid forge`'s own AI mode too. It
   grades each contract with `fluid validate` plus fixed fidelity checks, and reports pass@1,
   fidelity, tokens, cost and wall time. It is opt-in (marker `agent_eval` plus
   `FLUID_AGENT_EVAL=1`) and never runs in the default test lane.

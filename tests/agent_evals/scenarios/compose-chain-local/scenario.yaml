@@ -14,7 +14,7 @@ checks:
     file: products/payments_clean/contract.fluid.yaml
     consumes:
       - {productId: payments.payments_raw, exposeId: payments_raw}
-  - {id: clean_reads_raw_output, file: products/payments_clean/contract.fluid.yaml, contains: payments_raw.parquet}
+  - {id: clean_reads_raw_output, file: products/payments_clean/contract.fluid.yaml, reads_upstream: {productId: payments.payments_raw, exposeId: payments_raw, file: payments_raw.parquet}}
   - {id: clean_payment_id_unique, file: products/payments_clean/contract.fluid.yaml, expose: payments_clean, unique: payment_id}
   - {id: volume_type, file: products/merchant_daily_volume/contract.fluid.yaml, path: metadata.productType, equals: CDP}
   - {id: volume_layer, file: products/merchant_daily_volume/contract.fluid.yaml, path: metadata.layer, equals: Gold}
@@ -26,4 +26,4 @@ checks:
     file: products/merchant_daily_volume/contract.fluid.yaml
     expose: merchant_daily_volume
     columns: {merchant_id: string, day: date, total_amount: decimal, payment_count: integer}
-  - {id: volume_reads_clean_output, file: products/merchant_daily_volume/contract.fluid.yaml, contains: payments_clean.parquet}
+  - {id: volume_reads_clean_output, file: products/merchant_daily_volume/contract.fluid.yaml, reads_upstream: {productId: payments.payments_clean, exposeId: payments_clean, file: payments_clean.parquet}}

@@ -20,4 +20,4 @@ checks:
   - {id: daily_0400, cron: '0 4 * * *'}
   - {id: platform_local, path: 'exposes[exposeId=daily_revenue].binding.platform', equals: local}
   - {id: parquet, path: 'exposes[exposeId=daily_revenue].binding.format', equals: parquet}
-  - {id: reads_orders_enriched_output, contains: orders_enriched.parquet}
+  - {id: reads_orders_enriched_output, reads_upstream: {productId: sales.orders_enriched, exposeId: orders_enriched, file: orders_enriched.parquet}}

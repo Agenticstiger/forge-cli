@@ -21,5 +21,5 @@ checks:
   - {id: daily_0300, cron: '0 3 * * *'}
   - {id: platform_local, path: 'exposes[exposeId=orders_enriched].binding.platform', equals: local}
   - {id: parquet, path: 'exposes[exposeId=orders_enriched].binding.format', equals: parquet}
-  - {id: reads_orders_output, contains: orders_raw.parquet}
-  - {id: reads_customers_output, contains: customers_raw.parquet}
+  - {id: reads_orders_output, reads_upstream: {productId: sales.orders_raw, exposeId: orders_raw, file: orders_raw.parquet}}
+  - {id: reads_customers_output, reads_upstream: {productId: sales.customers_raw, exposeId: customers_raw, file: customers_raw.parquet}}
