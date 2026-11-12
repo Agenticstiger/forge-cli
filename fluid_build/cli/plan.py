@@ -352,6 +352,10 @@ def run(args, logger: logging.Logger) -> int:
             plan["actions"] = list(existing) + schedule_actions
             plan["total_actions"] = len(plan["actions"])
 
+        # What the apply makes outside OpenTofu (a Databricks Genie space), before the digests.
+        if not streaming:
+            _append_output_port_actions(plan, contract, args, logger)
+
         # --- Packaging truthfulness (RFC-packaging-modes.md file 8) ---------
         # plan.json is the digest-bound artifact the human reviews, and
         # untouched it would list container-*creation* actions for containers
@@ -856,6 +860,83 @@ def _validate_plan_actions(plan: Dict[str, Any], logger: logging.Logger) -> None
             cprint_literal(f"   • {err}")
     else:
         cprint(f"\n✓  All {len(typed)} actions pass schema validation")
+
+
+def _append_output_port_actions(
+    plan: Dict[str, Any], contract: Dict[str, Any], args, logger: logging.Logger
+) -> None:
+    """Add to ``plan`` the actions an IaC plugin names for what ``fluid apply`` makes after
+    ``tofu apply`` (its ``planned_output_ports`` hook, beside ``converge_output_ports``): the
+    Databricks plugin's Genie space (:func:`_output_port_actions`).
+
+    They come last and depend on nothing in the graph, since they run after the whole tofu
+    apply; one a planner already listed (the native ``provider.plan``) is kept once. The
+    OpenTofu engine applies from the contract, never from plan actions, so they change what is
+    reviewed, not what is applied; ``planDigest`` covers them. Never on a managed streaming
+    plan, whose apply runs no OpenTofu and checks its actions against its artifacts one for
+    one."""
+    actions = list(plan.get("actions") or [])
+    present = {a.get("action_id") for a in actions if isinstance(a, dict)}
+    added = [
+        action
+        for action in _output_port_actions(contract, args, logger)
+        if action.get("action_id") not in present
+    ]
+    if not added:
+        return
+    for action in added:
+        actions.append({"step": len(actions) + 1, "depends_on": [], **action})
+    plan["actions"] = actions
+    plan["total_actions"] = len(actions)
+    graph = plan.get("dependency_graph")
+    if isinstance(graph, dict) and isinstance(graph.get("nodes"), list):
+        graph["nodes"] = graph["nodes"] + [a.get("action_id") for a in added]
+
+
+def _output_port_actions(
+    contract: Dict[str, Any], args, logger: logging.Logger
+) -> List[Dict[str, Any]]:
+    """The hook's actions, from the contract as the apply reads it: its ``{{ env.* }}``
+    resolved, the one provider ``_resolve_provider`` picks (``--provider``, or the contract's
+    only cloud: an ambiguous or mismatched one lists nothing, since the apply refuses it too),
+    and the contract's directory known, where a local dbt build's project is read from. The
+    plugin is the one the apply runs: ``_resolve_provider`` loads an operator-allowed
+    entry-point plugin as the apply does. A hook that fails lists nothing, with a warning:
+    ``fluid validate`` and ``fluid apply`` refuse the contract with the reason, and the plan of
+    the rest stays readable."""
+    import copy
+
+    # Function-local: ``iac`` pulls every provider plugin, off the ``fluid --help`` cold path.
+    from fluid_build.iac import IAC_PLUGINS
+    from fluid_build.iac.source import contract_source, source_contract_file
+
+    from ._common import resolve_env_templates_in_contract
+    from .generate_iac import _resolve_provider
+
+    try:
+        resolved = resolve_env_templates_in_contract(copy.deepcopy(dict(contract)))
+    except Exception as exc:  # noqa: BLE001 - the plan of everything else still stands
+        warn(logger, "plan_output_ports_skipped", error=f"{type(exc).__name__}: {exc}")
+        return []
+    try:
+        provider = _resolve_provider(resolved, getattr(args, "provider", None) or "auto")
+    except CLIError:
+        return []
+    hook = getattr(IAC_PLUGINS.get(provider), "planned_output_ports", None)
+    if not callable(hook):
+        return []
+    try:
+        with contract_source(source_contract_file(getattr(args, "contract", None))):
+            return [dict(action) for action in hook(resolved)]
+    except Exception as exc:  # noqa: BLE001 - the plan of everything else still stands
+        warn(
+            logger,
+            "plan_output_ports_skipped",
+            provider=provider,
+            kind=getattr(exc, "kind", None),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return []
 
 
 def _plan_schedule_actions(

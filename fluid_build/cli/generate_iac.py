@@ -15,9 +15,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from typing import Any, List
 
 from fluid_build._errors import FluidUserError
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.iac import (
     IAC_PLUGINS,
     assemble_tofu_document,
@@ -127,6 +128,7 @@ def run(args, logger: logging.Logger) -> int:
             actions = native_actions(contract, logger, offline=True)
             resources = plugin.emit(contract, actions)
             data = plugin.emit_data(contract, actions)
+            notices = _module_notices(plugin, contract)
         count = sum(len(items) for items in resources.values())
         provider_cfg = provider_config(plugin, contract)
         document = assemble_tofu_document(
@@ -200,10 +202,27 @@ def run(args, logger: logging.Logger) -> int:
     cprint("\nReview and apply with OpenTofu:")
     cprint(f"  tofu -chdir={out_dir} init")
     cprint(f"  tofu -chdir={out_dir} plan")
+    _say_notices(notices, logger)
 
     if getattr(args, "shadow", False):
         _print_shadow_report(contract, plugin, logger)
     return 0
+
+
+def _module_notices(plugin: Any, contract: Any) -> List[str]:
+    """What the module leaves out that `fluid apply` does make (a Databricks Genie space,
+    through its REST API), from the plugin's optional ``standalone_module_notices``: said with
+    the module, as AWS CDK's synth prints a construct's ``Annotations.addInfo``, so a reviewer's
+    plain `tofu apply` holds no surprise."""
+    notes = getattr(plugin, "standalone_module_notices", None)
+    return [str(note) for note in notes(contract)] if callable(notes) else []
+
+
+def _say_notices(notices: List[str], logger: logging.Logger) -> None:
+    for notice in notices:
+        info(logger, "generate_iac_notice", notice=notice)
+        # Literally: a plugin's note may quote contract text, which Rich would read as markup.
+        cprint_literal(f"\nNote: {notice}")
 
 
 def _refuse_an_unset_aws_account(rendered: str) -> None:

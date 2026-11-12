@@ -126,7 +126,10 @@ resources, with no new schema field (fluid-schema 0.7.6):
   ``agentPolicy`` as instructions. The provider has no Genie space resource, so
   :meth:`DatabricksIacPlugin.converge_output_ports` creates, updates or trashes it through the
   Genie API after the masks and row filters are in place, and finds it again by a marker in its
-  description (``databricks_genie.py``).
+  description (``databricks_genie.py``): in the deploying identity's own folder, or in the
+  workspace folder ``extensions.databricksGenie.parentPath`` names, which a product deployed
+  from more than one identity shares. ``fluid plan`` lists the space as a
+  ``databricks_genie_space`` action, and ``fluid generate iac`` notes that its module holds none.
 
 * ``binding.location.region`` is the region the workspace is in, declared so a
   contract's ``sovereignty`` policy can check it (``policy/sovereignty.py``
@@ -2430,6 +2433,32 @@ class DatabricksIacPlugin:
             "Or remove the column restrictions and row filters from the contract.",
         )
 
+    def planned_output_ports(self, contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        """``fluid plan``'s actions for what :meth:`converge_output_ports` makes after ``tofu
+        apply``: the Genie space ``extensions.databricksGenie`` asks for
+        (``databricks_genie.space_plan_action``). A contract that asks for one and that the
+        emitter refuses raises the refusal, which ``fluid plan`` says as a warning."""
+        from .databricks_genie import requested, space_plan_action
+
+        if not requested(contract):
+            return []
+        compiled = _compile(contract, os.environ)
+        if compiled.refusals:
+            raise compiled.refusals[0]
+        genie = _genie(contract, compiled, os.environ)
+        if genie.refusals:
+            raise genie.refusals[0]
+        return [space_plan_action(genie.space)] if genie.space is not None else []
+
+    def standalone_module_notices(self, contract: Mapping[str, Any]) -> List[str]:
+        """What a module ``fluid generate iac`` writes leaves out that ``fluid apply`` makes:
+        the Genie space ``extensions.databricksGenie`` asks for (Genie API, after ``tofu
+        apply``). Printed under the module's path; nothing is refused for it."""
+        from .databricks_genie import module_notice
+
+        notice = module_notice(contract)
+        return [notice] if notice else []
+
     @staticmethod
     def _hook_state(
         contract: Mapping[str, Any],
@@ -2871,6 +2900,11 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     actions.extend(compiled.metric_views.plan_actions())
     actions.extend(_monitor_actions(compiled.monitors))
     actions.extend(_job_actions(compiled.jobs))
+    if genie.space is not None:
+        from .databricks_genie import space_plan_action
+
+        # Not in the module: listed so the plan shows what the apply does after tofu apply.
+        actions.append(space_plan_action(genie.space))
     unique: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for action in actions:
         unique.setdefault((action["resource_type"], action["resource_id"]), action)
