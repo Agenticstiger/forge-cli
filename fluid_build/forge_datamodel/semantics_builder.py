@@ -313,6 +313,76 @@ def normalized_time_type_params(grain: Optional[str]) -> Optional[Dict[str, str]
     return {"timeGranularity": canonical}
 
 
+#: ``measures[].agg`` (the schema's enum) → the SQL aggregate it compiles to. Shared by the
+#: consumers that render a measure as SQL (the MCP query compiler and the Databricks metric
+#: view), so one contract aggregates the same way on every path. ``count_distinct`` renders
+#: ``COUNT(DISTINCT …)`` and ``percentile`` the ordered-set ``PERCENTILE_CONT`` (see
+#: :func:`aggregate_call`).
+AGGREGATE_FUNCTIONS: Dict[str, str] = {
+    "sum": "SUM",
+    "avg": "AVG",
+    "count": "COUNT",
+    "count_distinct": "COUNT",
+    "min": "MIN",
+    "max": "MAX",
+    "median": "MEDIAN",
+    "percentile": "PERCENTILE_CONT",
+}
+
+#: ``aggParams.percentile`` when an ``agg: percentile`` measure gives none: 0.5, the median.
+#: The dbt MetricFlow bridge keeps its own copy, pinned equal by tests, so every consumer
+#: answers the same number for one contract.
+DEFAULT_PERCENTILE = 0.5
+
+
+def percentile_params(measure_name: str, measure: Mapping[str, Any]) -> Tuple[float, bool]:
+    """``(percentile, use_discrete)`` from ``measure.aggParams``; :class:`ValueError` if bad.
+
+    The percentile is interpolated into SQL as a literal (an aggregate's argument must be a
+    constant), so this check is the safety boundary: a real number in [0, 1], never a bool.
+    """
+    params = measure.get("aggParams") or {}
+    if not isinstance(params, Mapping):
+        raise ValueError(f"Measure {measure_name!r} has non-object aggParams")
+    raw = params.get("percentile", DEFAULT_PERCENTILE)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 <= float(raw) <= 1:
+        raise ValueError(
+            f"Measure {measure_name!r} has invalid aggParams.percentile "
+            f"{raw!r}; expected a number in [0, 1]"
+        )
+    return float(raw), bool(params.get("useDiscretePercentile"))
+
+
+def aggregate_call(measure_name: str, measure: Mapping[str, Any], expr: str) -> str:
+    """``AGG(expr)`` for one ``measures[]`` entry; :class:`ValueError` on an unknown ``agg``.
+
+    ``expr`` is the caller's: already validated, and rewritten where its target needs it.
+    ``count_distinct`` is ``COUNT(DISTINCT expr)``; ``percentile`` is the ANSI ordered-set
+    ``PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY expr)`` (``p`` from ``aggParams.percentile``,
+    default :data:`DEFAULT_PERCENTILE`; ``useDiscretePercentile`` selects ``PERCENTILE_DISC``).
+    A target without that aggregate refuses ``percentile`` before calling this.
+    """
+    agg = measure.get("agg")
+    if not isinstance(agg, str) or agg not in AGGREGATE_FUNCTIONS:
+        raise ValueError(
+            f"Measure {measure_name!r} has unsupported agg "
+            f"{agg!r}; supported: {sorted(AGGREGATE_FUNCTIONS)}"
+        )
+    if agg == "count_distinct":
+        return f"COUNT(DISTINCT {expr})"
+    if agg == "percentile":
+        percentile, use_discrete = percentile_params(measure_name, measure)
+        fn = "PERCENTILE_DISC" if use_discrete else "PERCENTILE_CONT"
+        return f"{fn}({percentile:g}) WITHIN GROUP (ORDER BY {expr})"
+    return f"{AGGREGATE_FUNCTIONS[agg]}({expr})"
+
+
+def parens_balanced(expr: str) -> bool:
+    """Every ``(`` closes in order and none closes early: a contract expression is spliced
+    into a larger statement, and an unbalanced one would escape its place in it."""
+    return _parens_balanced(expr)
+
+
 def default_agg_time_dimension(dimensions: List[Mapping[str, Any]]) -> Optional[str]:
     """The model-level default aggregation time dimension: the first
     declared time dimension. Populating it (instead of leaving the

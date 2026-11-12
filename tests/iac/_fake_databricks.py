@@ -118,6 +118,24 @@ def _err(status: int, code: str, msg: str) -> Tuple[int, Dict[str, Any]]:
     return status, {"error_code": code, "message": msg}
 
 
+#: A service principal's application id, the name of its /Users folder.
+_APP_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def _bare(path: str) -> str:
+    """A workspace path as the service reads it back: without the ``/Workspace`` prefix a
+    create accepts and without a trailing ``/`` (measured 2026-11-12)."""
+    if path == "/Workspace" or path.startswith("/Workspace/"):
+        path = path[len("/Workspace") :]
+    return path.rstrip("/") or "/"
+
+
+def _folder_chain(folder: str) -> List[str]:
+    """``folder`` and every folder above it, the root first."""
+    parts = [p for p in folder.split("/") if p]
+    return ["/"] + ["/" + "/".join(parts[: i + 1]) for i in range(len(parts))]
+
+
 # ---------------------------------------------------------------------- SQL interpreter
 def _skip_quoted(s: str, i: int) -> int:
     """Index just past the quoted run (' or `) that starts at ``s[i]``."""
@@ -440,6 +458,146 @@ def _coldef_param(txt: str) -> Dict[str, str]:
     return {"name": m.group(1), "type": m.group(2).strip().lower()}
 
 
+#: What a metric view keeps outside its stored ``view_definition`` (measured on Databricks SQL
+#: 2026.45: the YAML read back has no ``comment``, ``display_name`` or ``synonyms``).
+_METRIC_VIEW_METADATA = ("comment", "display_name", "synonyms")
+_PROPERTY_RE = re.compile(r"'((?:[^'\\]|\\.)*)'\s*=\s*'((?:[^'\\]|\\.)*)'")
+
+
+def _metric_view_properties(text: str) -> Dict[str, str]:
+    def unescape(v: str) -> str:
+        return re.sub(r"\\(.)", r"\1", v)
+
+    return {unescape(k): unescape(v) for k, v in _PROPERTY_RE.findall(text or "")}
+
+
+def _metric_view_doc(body: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """The parsed definition, or ``(None, error)`` as Databricks words a bad one."""
+    import yaml
+
+    try:
+        doc = yaml.safe_load(body)
+    except yaml.YAMLError as exc:
+        return None, f"[METRIC_VIEW_INVALID_VIEW_DEFINITION] invalid YAML: {exc}"
+    if not isinstance(doc, dict) or doc.get("version") != 1.1:
+        return None, "[METRIC_VIEW_INVALID_VIEW_DEFINITION] version must be 1.1"
+    if not doc.get("dimensions") and not doc.get("measures"):
+        return None, "[METRIC_VIEW_INVALID_VIEW_DEFINITION] no dimensions or measures"
+    return doc, ""
+
+
+def _metric_view_record(fake: "FakeDatabricks", doc: Dict[str, Any]) -> Dict[str, Any]:
+    import yaml
+
+    stored = {k: v for k, v in doc.items() if k != "comment"}
+    columns = []
+    for kind in ("dimensions", "measures"):
+        items = []
+        for item in doc.get(kind) or []:
+            items.append({k: v for k, v in item.items() if k not in _METRIC_VIEW_METADATA})
+            columns.append(
+                {
+                    "name": item["name"],
+                    "type": "string" if kind == "dimensions" else "double",
+                    "nullable": True,
+                    "comment": item.get("comment"),
+                }
+            )
+        if kind in stored:
+            stored[kind] = items
+    return {
+        "table_type": "METRIC_VIEW",
+        "columns": columns,
+        "partitions": [],
+        "cluster_keys": [],
+        "comment": doc.get("comment"),
+        "view_definition": yaml.safe_dump(stored, sort_keys=False),
+        "created_at": int(time.time() * 1000),
+    }
+
+
+def _metric_view_statement(fake: "FakeDatabricks", s: str) -> Optional[Tuple[bool, str]]:
+    """CREATE / ALTER / DROP of a metric view, and GRANT on a table: ``None`` for any other."""
+    m = re.match(
+        rf"CREATE\s+(OR\s+REPLACE\s+)?VIEW\s+{_FULL}\s+WITH\s+METRICS\s+LANGUAGE\s+YAML\s+"
+        r"(?:TBLPROPERTIES\s*\((.*?)\)\s+)?AS\s+\$\$(.*)\$\$$",
+        s,
+        re.S | re.I,
+    )
+    if m:
+        replace, cat, sch, name, props, body = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        if f"{cat}.{sch}" not in fake.schemas:
+            return False, f"[SCHEMA_NOT_FOUND] {cat}.{sch}"
+        old = fake.tables.get(full)
+        if old is not None and old.get("table_type") != "METRIC_VIEW":
+            return False, f"[EXPECT_VIEW_NOT_TABLE.NO_ALTERNATIVE] {full}"
+        if old is not None and not replace:
+            return False, f"[TABLE_OR_VIEW_ALREADY_EXISTS] {full}"
+        doc, err = _metric_view_doc(body)
+        if doc is None:
+            return False, err
+        source = str(doc.get("source") or "")
+        if fake.tables.get(source, {}).get("table_type") not in ("MANAGED", "EXTERNAL"):
+            return False, f"[TABLE_OR_VIEW_NOT_FOUND] {source}"
+        record = _metric_view_record(fake, doc)
+        record["properties"] = _metric_view_properties(props or "")
+        record["owner"] = _USER  # whoever creates (or replaces) a view owns it
+        fake.tables[full] = record
+        # Replacing a view drops its grants (measured live).
+        fake.grants.pop(("table", full), None)
+        return True, ""
+
+    m = re.match(rf"ALTER\s+VIEW\s+{_FULL}\s+AS\s+\$\$(.*)\$\$$", s, re.S | re.I)
+    if m:
+        cat, sch, name, body = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        old = fake.tables.get(full)
+        if old is None or old.get("table_type") != "METRIC_VIEW":
+            return False, f"[TABLE_OR_VIEW_NOT_FOUND] {full}"
+        doc, err = _metric_view_doc(body)
+        if doc is None:
+            return False, err
+        record = _metric_view_record(fake, doc)
+        record["properties"] = old["properties"]  # ALTER VIEW ... AS keeps them, and the grants
+        record["owner"] = old.get("owner", _USER)
+        fake.tables[full] = record
+        return True, ""
+
+    m = re.match(rf"ALTER\s+VIEW\s+{_FULL}\s+SET\s+TBLPROPERTIES\s*\((.*)\)$", s, re.S | re.I)
+    if m:
+        cat, sch, name, props = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        if full not in fake.tables:
+            return False, f"[TABLE_OR_VIEW_NOT_FOUND] {full}"
+        fake.tables[full]["properties"].update(_metric_view_properties(props))
+        return True, ""
+
+    m = re.match(rf"DROP\s+VIEW\s+(IF\s+EXISTS\s+)?{_FULL}\s*$", s, re.I)
+    if m:
+        ie, cat, sch, name = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        if full not in fake.tables:
+            return (True, "") if ie else (False, f"[TABLE_OR_VIEW_NOT_FOUND] {full}")
+        if fake.tables[full].get("table_type") != "METRIC_VIEW":
+            return False, f"[WRONG_COMMAND_FOR_OBJECT_TYPE] {full} is a table"
+        del fake.tables[full]
+        fake.grants.pop(("table", full), None)
+        return True, ""
+
+    m = re.match(rf"GRANT\s+(\w+)\s+ON\s+TABLE\s+{_FULL}\s+TO\s+`((?:[^`]|``)+)`\s*$", s, re.I)
+    if m:
+        priv, cat, sch, name, who = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        if full not in fake.tables:
+            return False, f"[TABLE_OR_VIEW_NOT_FOUND] {full}"
+        held = fake.grants.setdefault(("table", full), {})
+        who = who.replace("``", "`")
+        held[who] = sorted(set(held.get(who, [])) | {priv.upper()})
+        return True, ""
+    return None
+
+
 def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
     """Run one statement against ``fake``; return (ok, error message)."""
     s = sql.strip().rstrip(";").strip()
@@ -563,6 +721,10 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
             return False, "[TABLE_OR_VIEW_NOT_FOUND]"
         t["comment"] = _unescape(text)
         return True, ""
+
+    handled = _metric_view_statement(fake, s)
+    if handled is not None:
+        return handled
 
     m = re.match(rf"ALTER\s+TABLE\s+{_FULL}\s+(.*)$", s, re.S | re.I)
     if not m:
@@ -1073,6 +1235,16 @@ class FakeDatabricks:
         # workspace), and the permissions set on each one directly: {(key, name): level}.
         self.genie_spaces: Dict[str, Dict[str, Any]] = {}
         self.genie_acl: Dict[str, Dict[Tuple[str, str], str]] = {}
+        # Workspace folders' own permissions, {folder: {(key, name): level}}, over the ones a
+        # live workspace starts with (measured 2026-11-12, ``_folder_own_acl``). A folder and a
+        # space inherit every permission of the folders above them.
+        self.folder_acl: Dict[str, Dict[Tuple[str, str], str]] = {}
+        # True: a create or move answers 200 and leaves the space where it was (a service that
+        # stopped reading parent_path, which is Public Preview)
+        self.genie_ignores_parent_path = False
+        # Where a create that names no parent_path puts the space: the deploy user's own folder,
+        # unless a test that switches identities (me_user_name) moves it to the new one's
+        self.genie_default_parent: Optional[str] = None
         # metric views by full name: {"source": table full name, "comment": ...}
         self.metric_views: Dict[str, Dict[str, Any]] = {}
         self._space_seq = 0
@@ -1324,6 +1496,7 @@ class FakeDatabricks:
         a("GET", r"/api/2\.1/unity-catalog/functions/([^/]+)", self._get_function)
         a("GET", r"/api/2\.1/unity-catalog/functions", self._list_functions)
         a("GET", r"/api/2\.1/unity-catalog/tables", self._list_tables)
+        a("GET", r"/api/2\.1/unity-catalog/table-summaries", self._table_summaries)
         a("GET", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._get_table)
         a("DELETE", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._delete_table)
         a("GET", r"/api/2\.1/unity-catalog/permissions/([a-z_]+)/([^/]+)", self._get_perms)
@@ -1388,6 +1561,7 @@ class FakeDatabricks:
         a("DELETE", r"/api/2\.0/genie/spaces/([^/]+)", self._genie_trash)
         a("GET", r"/api/2\.0/permissions/genie/([^/]+)", self._genie_get_acl)
         a("PUT", r"/api/2\.0/permissions/genie/([^/]+)", self._genie_put_acl)
+        a("GET", r"/api/2\.0/permissions/directories/([0-9]+)", self._folder_get_acl)
 
     # ------------------------------------------------------------------ handlers
     # -- data quality monitoring. Shapes as Free Edition answered them on 2026-11-12: a second
@@ -1654,7 +1828,14 @@ class FakeDatabricks:
             if view.get("comment"):
                 row["comment"] = view["comment"]
         else:
-            row["table_type"] = "MANAGED"
+            # A table, or a metric view made by ``CREATE VIEW ... WITH METRICS``, whose record
+            # keeps its type, its stored YAML and its comment.
+            table = self.tables[full]
+            row["table_type"] = table.get("table_type") or "MANAGED"
+            if row["table_type"] == "METRIC_VIEW":
+                for key in ("view_definition", "comment"):
+                    if table.get(key):
+                        row[key] = table[key]
         return row
 
     def add_metric_view(self, full_name: str, source: str, comment: str = "") -> None:
@@ -1750,10 +1931,14 @@ class FakeDatabricks:
         problem = self._genie_check(b.get("serialized_space"))
         if problem:
             return _err(400, "INVALID_PARAMETER_VALUE", problem)
+        refused = self._genie_parent_refused(b)
+        if refused:
+            return refused
         with self._lock:
             self._space_count += 1
             space_id = f"01f1{self._space_count:028x}"
-            parent = b.get("parent_path") or f"/Users/{_USER}"
+            asked = None if self.genie_ignores_parent_path else b.get("parent_path")
+            parent = _bare(asked or self.genie_default_parent or f"/Users/{_USER}")
             title = b.get("title") or ""
             if self._genie_title_taken(title, parent):
                 # The service keeps titles unique in a folder by suffixing the new one.
@@ -1789,6 +1974,9 @@ class FakeDatabricks:
                 return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Space {space_id} does not exist.")
             if b.get("etag") and b["etag"] != space["etag"]:
                 return _err(409, "ABORTED", "The space was modified; the etag does not match.")
+            refused, b = self._genie_moved(b)
+            if refused:
+                return refused
             if "serialized_space" in b:
                 problem = self._genie_check(b["serialized_space"])
                 if problem:
@@ -1798,6 +1986,14 @@ class FakeDatabricks:
                 b["title"], space["parent_path"], other_than=space_id
             ):
                 return _err(409, "ALREADY_EXISTS", f"A space named {b['title']} already exists.")
+            # Titles are unique in a folder (measured for a create and a rename); a move onto a
+            # taken one is answered as the rename is (assumed, not measured).
+            if "parent_path" in b and self._genie_title_taken(
+                b.get("title", space["title"]), b["parent_path"], other_than=space_id
+            ):
+                return _err(
+                    409, "ALREADY_EXISTS", f"A space named {space['title']} already exists."
+                )
             for key in ("title", "description", "warehouse_id", "parent_path"):
                 if key in b:
                     space[key] = b[key]
@@ -1816,39 +2012,111 @@ class FakeDatabricks:
         space_id = m.group(1)
         if space_id not in self.genie_spaces:
             return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Space {space_id} does not exist.")
-        # The creator's and the admins' CAN_MANAGE come from the folders, as on a live
-        # workspace; only what was set on the space itself is direct.
-        acl: List[Dict[str, Any]] = [
-            {
-                "user_name": _USER,
-                "all_permissions": [
-                    {
-                        "permission_level": "CAN_MANAGE",
-                        "inherited": True,
-                        "inherited_from_object": ["/directories/1"],
-                    }
-                ],
-            },
-            {
-                "group_name": "admins",
-                "all_permissions": [
-                    {
-                        "permission_level": "CAN_MANAGE",
-                        "inherited": True,
-                        "inherited_from_object": ["/directories/"],
-                    }
-                ],
-            },
-        ]
-        for (key, name), level in sorted(self.genie_acl[space_id].items()):
-            acl.append(
-                {key: name, "all_permissions": [{"permission_level": level, "inherited": False}]}
-            )
+        # Every level on the space's folder and the folders above it is inherited, as on a live
+        # workspace (the creator's CAN_MANAGE comes from their folder); only what was set on the
+        # space itself is direct.
+        folders = _folder_chain(self.genie_spaces[space_id]["parent_path"])
         return 200, {
             "object_id": f"/genie/{space_id}",
             "object_type": "genie",
-            "access_control_list": acl,
+            "access_control_list": self._acl_doc(folders, self.genie_acl[space_id]),
         }
+
+    # ---- workspace folders: what a Genie space's parent_path must be, and their permissions
+
+    def _folder_own_acl(self, folder: str) -> Dict[Tuple[str, str], str]:
+        """The levels set on ``folder`` itself: ``folder_acl``'s, else the ones a live workspace
+        starts with (measured 2026-11-12): the root grants admins CAN_MANAGE, /Shared grants
+        users CAN_MANAGE, a /Users/<name> folder grants <name> CAN_MANAGE."""
+        if folder in self.folder_acl:
+            return self.folder_acl[folder]
+        if folder == "/":
+            return {("group_name", "admins"): "CAN_MANAGE"}
+        if folder == "/Shared":
+            return {("group_name", "users"): "CAN_MANAGE"}
+        parts = folder.split("/")
+        if len(parts) == 3 and parts[1] == "Users" and parts[2]:
+            key = "service_principal_name" if _APP_ID.fullmatch(parts[2]) else "user_name"
+            return {(key, parts[2]): "CAN_MANAGE"}
+        return {}
+
+    def _is_folder(self, folder: str) -> bool:
+        parts = folder.split("/")
+        home = len(parts) == 3 and parts[1] == "Users" and bool(parts[2])
+        return folder in ("/", "/Shared", "/Users") or home or folder in self.workspace_dirs
+
+    def _folder_id(self, folder: str) -> int:
+        """A folder's object_id: the root's is 0, as on a live workspace."""
+        if folder == "/":
+            return 0
+        with self._lock:
+            return self._object_ids.setdefault(folder, len(self._object_ids) + 1)
+
+    def _acl_doc(
+        self, inherited_from: Sequence[str], direct: Dict[Tuple[str, str], str]
+    ) -> List[Dict[str, Any]]:
+        """``access_control_list`` as the Permissions API answers it: one entry per principal,
+        each level it holds from the folders ``inherited_from`` (the root renders as
+        ``/directories/``, as measured) and the ones set directly."""
+        held: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for folder in inherited_from:
+            source = f"/directories/{self._folder_id(folder) or ''}"
+            for key, level in sorted(self._folder_own_acl(folder).items()):
+                held.setdefault(key, []).append(
+                    {
+                        "permission_level": level,
+                        "inherited": True,
+                        "inherited_from_object": [source],
+                    }
+                )
+        for key, level in sorted(direct.items()):
+            held.setdefault(key, []).append({"permission_level": level, "inherited": False})
+        return [{kind: name, "all_permissions": levels} for (kind, name), levels in held.items()]
+
+    def _folder_get_acl(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        wanted = int(m.group(1))
+        folder = next(
+            (
+                path
+                for path in ("/", "/Shared", *sorted(self.workspace_dirs), *self._object_ids)
+                if self._is_folder(path) and self._folder_id(path) == wanted
+            ),
+            None,
+        )
+        if folder is None:
+            return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Directory {wanted} does not exist.")
+        return 200, {
+            "object_id": f"/directories/{wanted}",
+            "object_type": "directory",
+            "access_control_list": self._acl_doc(
+                _folder_chain(folder)[:-1], self._folder_own_acl(folder)
+            ),
+        }
+
+    def _genie_moved(
+        self, body: Dict[str, Any]
+    ) -> Tuple[Optional[Tuple[int, Any]], Dict[str, Any]]:
+        """A PATCH body with its ``parent_path`` as the service keeps it (no ``/Workspace``, no
+        trailing ``/``; left out by a service that ignores it), or the refusal of one."""
+        refused = self._genie_parent_refused(body)
+        if refused or "parent_path" not in body:
+            return refused, body
+        moved = {**body, "parent_path": _bare(body["parent_path"])}
+        if self.genie_ignores_parent_path:
+            moved.pop("parent_path")
+        return None, moved
+
+    def _genie_parent_refused(self, body: Dict[str, Any]) -> Optional[Tuple[int, Any]]:
+        """A ``parent_path`` the service refuses, as it refuses it (measured 2026-11-12): a
+        relative one with 400, a folder that does not exist (case and all) with 404."""
+        if "parent_path" not in body:
+            return None
+        raw = str(body["parent_path"] or "")
+        if not raw.startswith("/"):
+            return _err(400, "BAD_REQUEST", f"requirement failed: {raw} is not absolute.")
+        if not self._is_folder(_bare(raw)):
+            return _err(404, "NOT_FOUND", f"Tree node with path {_bare(raw)} does not exist")
+        return None
 
     def _genie_put_acl(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
         space_id = m.group(1)
@@ -1893,6 +2161,30 @@ class FakeDatabricks:
             }
             self.genie_acl[space_id] = {}
         return space_id
+
+    def _table_summaries(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        """ListTableSummaries: the tables of a catalog; the name patterns are SQL LIKEs."""
+        cat = (q.get("catalog_name") or [""])[0]
+
+        def like(key: str) -> "re.Pattern[str]":
+            text = (q.get(key) or ["%"])[0]
+            body = "".join(".*" if c == "%" else "." if c == "_" else re.escape(c) for c in text)
+            return re.compile(f"^{body}$")
+
+        schemas, tables = like("schema_name_pattern"), like("table_name_pattern")
+        names = sorted(
+            n
+            for n in self.tables
+            if n.split(".")[0] == cat
+            and schemas.match(n.split(".")[1])
+            and tables.match(n.split(".")[2])
+        )
+        return 200, self._page(
+            names,
+            q,
+            "tables",
+            lambda n: {"full_name": n, "table_type": self.tables[n].get("table_type")},
+        )
 
     def _page(
         self, names: List[str], q: Any, key: str, row: Callable[[str], Any]
@@ -1958,6 +2250,7 @@ class FakeDatabricks:
             "comment": t.get("comment"),
             "storage_location": f"s3://fake-root/{full}",
             "created_at": t["created_at"],
+            **({"view_definition": t["view_definition"]} if t.get("view_definition") else {}),
         }
 
     def _delete_table(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
@@ -2255,7 +2548,19 @@ class FakeDatabricks:
                 "size": len(self.workspace_files[path]),
             }
         if path in self.workspace_dirs:
-            return 200, {"path": path, "object_type": "DIRECTORY", "object_id": 1}
+            return 200, {
+                "path": path,
+                "object_type": "DIRECTORY",
+                "object_id": self._folder_id(path),
+            }
+        # The folders a live workspace has from the start, with or without /Workspace.
+        bare = _bare(path) if path.startswith("/") else path
+        if self._is_folder(bare):
+            return 200, {
+                "path": path,
+                "object_type": "DIRECTORY",
+                "object_id": self._folder_id(bare),
+            }
         return _err(404, "RESOURCE_DOES_NOT_EXIST", f"Path ({path}) doesn't exist.")
 
     def _ws_delete(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:

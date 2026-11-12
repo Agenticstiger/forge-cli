@@ -24,11 +24,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finds the space by a `[fluid-genie:<product id>]` marker at the end of its description, in the
   deploying identity's own folder only (a space carrying the marker anywhere else is left alone,
   with a note), and updates it with its `etag`. A second apply changes nothing, and removing the
-  block trashes the space. Deploy a product from one identity (CI, say): a space another
-  identity made is left alone, and that identity makes its own.
+  block trashes the space. Deploy a product from one identity (CI, say), or name a shared folder
+  with `parentPath` (below): a space another identity made in its own folder is left alone.
   `fluid apply --mode dry-run` prints what would change. The space is made through the Genie
   REST API (the `[databricks]` extra), since the databricks/databricks provider has no Genie
   space resource. One space per product; a space over several products is a follow-up.
+
+- **One Genie space for a product deployed from more than one identity.**
+  `extensions.databricksGenie.parentPath` names a workspace folder, such as `/genie/<domain>`.
+  A workspace admin creates it and gives `CAN_MANAGE` only to the identities that deploy the
+  product. `fluid apply` creates the space there and adopts only a space directly in that
+  folder, so a laptop and CI keep one space instead of one each. A space an earlier apply made
+  in the identity's own folder is moved in and keeps its conversations. A copy left there
+  afterwards is trashed. A space inherits its folder's permissions, so the folder is the trust
+  boundary. `fluid validate` refuses anything under `/Shared`: every workspace user holds
+  `CAN_MANAGE` there (measured), so each could read every reader's conversations. `fluid apply`
+  stops before `tofu apply` when the folder is missing or not a folder, when its permissions
+  cannot be read, or when a group of every user (`users`, or `account users` under identity
+  federation) holds `CAN_EDIT` or `CAN_MANAGE` on it. Removing the block, or removing or
+  changing `parentPath`, leaves the space in the old folder, with a note naming it: the apply
+  trusts only the folder the contract names now.
+
+- **`fluid plan` lists the Genie space** as a `databricks_genie_space` action with its title,
+  folder, tables and readers. `fluid diff` counts it among the contract's resources and never
+  reports it as drift, since nothing compares it with an apply. **`fluid generate iac` adds a
+  note** that the module it writes holds no Genie space, so a plain `tofu apply` makes none.
 
 - **Databricks: Unity Catalog primary and foreign keys from the contract.** A column tagged
   `primary-key` (all of them, in schema order, for a composite key; each must be
@@ -71,6 +91,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Expect the scans to count against its daily compute quota (their cost was not measured): a
   workspace over the quota stops all compute for the rest of the day, so on Free Edition opt out the
   products you do not need watched.
+
+- **Databricks: a Unity Catalog metric view from each expose's `semantics` block.** `fluid apply`
+  creates `<catalog>.<schema>.<table>_semantic_model` beside the table, in the product's own
+  schema, as metric view YAML 1.1, so Genie, AI/BI dashboards and SQL
+  (`SELECT country_code, MEASURE(site_count) ... GROUP BY ALL`) read the contract's semantic model
+  natively. Entities and dimensions become dimensions (an entity as its key column, a time
+  dimension at its `timeGranularity`); a measure is its aggregate; a simple metric is that
+  aggregate with its filter as `FILTER (WHERE ...)`; a ratio is `MEASURE(numerator) /
+  NULLIF(MEASURE(denominator), 0)`; a `nonAdditiveDimension` is a window measure
+  (`semiadditive: last` for `max`, `first` for `min`). Descriptions become comments, a column's
+  `businessName` the dimension's `display_name` and its `labels.synonyms` its synonyms; the
+  model's `ai-synonyms` and `ai-instructions` labels go into the view's comment. Reading the view
+  is exactly the principals that may read the table: `SELECT` granted to them, revoked from
+  anyone else, revokes first and before the apply. The provider has no metric view resource
+  (terraform-provider-databricks#4827), so the view is created on the SQL warehouse after
+  `tofu apply`, like the column masks: `CREATE VIEW` when it is missing, `ALTER VIEW ... AS`
+  (which keeps its grants) when its definition changed, nothing when it did not, and
+  `DROP VIEW`, before the apply, once the contract no longer declares it (in the schemas its
+  tables are in, so another environment of the product keeps its own). `--mode dry-run` prints
+  every statement. What metric view YAML cannot express is refused at `fluid validate`, not
+  approximated: derived metrics, a ratio with a filter, a non-additive dimension that is no time
+  dimension, `hour` or `minute` on a `DATE`, colliding names, a name that is no column, and
+  calls that would lend the view owner's rights to its readers. Verified live on Databricks Free
+  Edition with the semantics block of an industry-model gold product (`HONESTLY_TESTED.md`).
 
 - **`fluid test` checks a Databricks product live, and can keep its results in Unity Catalog.**
   `fluid test` used to answer "Live validation against Unity Catalog is not available" for
@@ -152,6 +196,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pinned provider, 1.140.0): no table, schema or data is replaced or destroyed, and no
   `--allow-data-loss` is needed. Until that apply, `fluid verify` reports the old values as tag
   drift. On Free Edition, a product carrying the old values planned `+0 ~17 -0`.
+- **`fluid apply` on a Databricks contract with `exposes[].semantics` needs the `[databricks]`
+  extra** (databricks-sdk), which creates the metric view, and refuses before `tofu apply` when it
+  is missing, as it does for column masks. A semantics block the metric view cannot hold (a
+  derived metric, say) now fails `fluid validate` for a Databricks binding.
+- `fluid apply` prints what the Databricks access hooks say (statements, server errors) as data,
+  not Rich markup: a `[word]` in a description no longer vanishes from the dry-run, and a `[/word]`
+  no longer ends the run with an unexpected error.
+- The MCP query compiler and the Databricks metric view render a measure's aggregate through one
+  helper (`forge_datamodel/semantics_builder.py::aggregate_call`); the compiler's SQL and errors
+  are unchanged.
 - **The native quality engine runs the rules a contract already declares in full.** A
   `valid_values` rule that names no values takes them from its column: its `enum`
   validationRule (`"A | B"` or `"A,B"`), its `regex` validationRule, its `range`

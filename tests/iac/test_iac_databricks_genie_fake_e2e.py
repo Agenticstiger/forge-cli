@@ -137,3 +137,27 @@ def test_an_invalid_block_is_refused_before_tofu_runs(workspace, fake, capfd):
     rc, out = apply_contract(capfd, path)
     assert rc != 0 and "databricks-genie-invalid" in out
     assert fake.tables == {} and fake.genie_spaces == {}
+
+
+def test_a_shared_folder_keeps_one_space_for_two_identities(workspace, fake, capfd):
+    """``parentPath``: a laptop and CI deploy one product and keep one space."""
+    path = write_contract(workspace, genie_contract(parentPath="/genie/orders"))
+    # The folder a workspace admin makes first: without it the apply stops before tofu.
+    rc, out = apply_contract(capfd, path)
+    assert rc != 0 and "the workspace has no such folder" in out, out
+    assert fake.tables == {} and fake.genie_spaces == {}
+
+    fake.workspace_dirs.update({"/genie", "/genie/orders"})
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    (space,) = fake.genie_spaces.values()
+    assert space["parent_path"] == "/genie/orders"
+    assert "created 'Databricks test orders' in /genie/orders" in out
+
+    # CI applies the same contract as its own service principal: the same space, unchanged.
+    fake.me_user_name = "3f2a9c1e-7b4d-4e8a-9f0c-2d6b8e1a5c37"
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert "'Databricks test orders': no change" in out
+    assert len(fake.genie_spaces) == 1
+    assert fake.unknown == []
