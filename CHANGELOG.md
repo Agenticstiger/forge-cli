@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid ai models --provider` works, and takes the names `fluid forge --llm-provider`
+  takes.** The flag stored its value where the global infrastructure `--provider` keeps its
+  own, so the global check read `gemini` as an infrastructure provider: every
+  `fluid ai models --provider <name>` exited 2 with "Unknown provider 'gemini' — installed
+  providers: aws, databricks, gcp, local, snowflake (see `fluid providers`)". The flag now has
+  its own slot, and its names come from the LLM provider registry: the built-ins, the keyless
+  `mcp-sampling` and coding agents (`claude-code`, `codex`, `cursor`, `kiro`), and installed
+  `fluid_build.llm_providers` plugins, each shown with the model plan forge would use. An
+  unknown name is refused with the built-in names, as `fluid forge --llm-provider` refuses it;
+  the flag used to list five hard-coded names. The docs noted the exit in 0.18.1; it was still
+  there in 0.29.0.
+- **Receipt run ids no longer repeat in one process.** `generate_run_id`, the `run_id` of
+  `.fluid/init-receipt.json` and `forge-receipt.json`, paired a millisecond timestamp with 32
+  random bits, so ids made in the same millisecond could collide by the birthday bound: 1000 ids
+  in a tight loop repeated one in roughly 1 run of 10,000, which made `test_run_ids_are_unique`
+  flaky on CI. The suffix is now monotonic, as in a ULID or a UUIDv7 (RFC 9562, section 6.2): a
+  random 31-bit start in each new millisecond, plus one for each later id in it. Ids from one
+  process never repeat and always increase, also when the clock steps back, and a forked child
+  starts its own sequence. The format is unchanged (`<11 hex digits>-<8 hex digits>`), and
+  nothing in forge parses it.
 - **`fluid forge --agent` reports a failure as a `forge.error` event, not a traceback.** An AI
   error such as `copilot_no_llm_provider` printed a full Python traceback on stderr, and the
   stream said only `forge.done` with `exit_code` 1. A run that fails on an error now sends one
