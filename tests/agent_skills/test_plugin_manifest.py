@@ -146,11 +146,37 @@ def test_a_payload_it_cannot_read_never_blocks() -> None:
     assert hook.main(io.StringIO("[]"), io.StringIO()) == 0
 
 
-def test_a_missing_fluid_is_reported_without_blocking(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_missing_fluid_is_shown_to_the_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exit 1 would reach only the transcript: the agent would think the contract checked."""
     monkeypatch.setattr(hook, "validate_command", lambda path: None)
     err = io.StringIO()
-    assert hook.main(_payload("/w/contract.fluid.yaml"), err) == 1
-    assert "pip install data-product-forge" in err.getvalue()
+    assert hook.main(_payload("/w/contract.fluid.yaml"), err) == 2
+    message = err.getvalue()
+    assert "/w/contract.fluid.yaml was not validated" in message
+    assert "pip install data-product-forge" in message
+    assert "fluid validate /w/contract.fluid.yaml --offline" in message
+
+
+def test_a_validator_that_runs_too_long_is_shown_to_the_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def too_slow(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="fluid", timeout=hook.TIMEOUT_S)
+
+    monkeypatch.setattr(hook, "validate_command", lambda path: ["fluid", "validate", path])
+    monkeypatch.setattr(hook.subprocess, "run", too_slow)
+    err = io.StringIO()
+    assert hook.main(_payload("/w/contract.fluid.yaml"), err) == 2
+    message = err.getvalue()
+    assert "/w/contract.fluid.yaml was not validated" in message
+    assert f"more than {hook.TIMEOUT_S}s" in message
+
+
+def test_the_hook_outlasts_its_own_validator_timeout() -> None:
+    """Claude Code stops a hook at its timeout; the script's own message must come first."""
+    (entry,) = _load(HOOKS)["hooks"]["PostToolUse"]
+    (handler,) = entry["hooks"]
+    assert handler["timeout"] > hook.TIMEOUT_S
 
 
 def test_a_failed_validation_is_shown_to_the_agent(monkeypatch: pytest.MonkeyPatch) -> None:

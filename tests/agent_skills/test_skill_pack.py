@@ -128,6 +128,21 @@ def test_each_skill_stays_focused(skill: Path) -> None:
         assert rel.parts[0] in {"references", "scripts", "assets"}, rel
 
 
+def test_hidden_files_are_not_part_of_a_skill(tmp_path: Path) -> None:
+    """An editable install reads the source tree, where Finder drops a binary .DS_Store."""
+    skill = tmp_path / "some-skill"
+    (skill / "references").mkdir(parents=True)
+    (skill / "__pycache__").mkdir()
+    (skill / ".git").mkdir()
+    for rel in ("SKILL.md", "references/sheet.md"):
+        (skill / rel).write_text("text\n", encoding="utf-8")
+    (skill / ".DS_Store").write_bytes(b"\x00\x00\x00\x01Bud1\xff")
+    (skill / "references" / ".sheet.md.swp").write_bytes(b"\xff\xfe")
+    (skill / "__pycache__" / "x.cpython-312.pyc").write_bytes(b"\x00")
+    (skill / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    assert skill_files(skill) == [Path("SKILL.md"), Path("references/sheet.md")]
+
+
 @pytest.mark.parametrize("skill", SKILLS, ids=_ids(SKILLS))
 def test_links_resolve_inside_the_skill(skill: Path) -> None:
     """A skill can be installed on its own, so it may only link to its own files."""

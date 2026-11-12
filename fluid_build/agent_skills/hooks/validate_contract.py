@@ -6,7 +6,10 @@
 Claude Code runs this after every Edit or Write and hands it the tool call as JSON on
 stdin; it does not put the file path into the command line. A file that is not a
 contract is ignored. A contract that fails ``fluid validate`` exits 2, which Claude Code
-shows to the agent; a valid contract exits 0 and prints nothing.
+shows to the agent; a valid contract exits 0 and prints nothing. A contract it could not
+validate (no ``fluid`` found, or ``fluid validate`` ran out of time) exits 2 as well:
+exit 1 would show only in the transcript, and the agent would take an unchecked contract
+for a checked one.
 
 It always runs as a script, by path: the plugin hook as
 ``python3 "${CLAUDE_PLUGIN_ROOT}/hooks/validate_contract.py"``, and the hook that
@@ -30,6 +33,8 @@ from pathlib import Path
 from typing import Any, List, Optional, TextIO
 
 CONTRACT_SUFFIXES = (".fluid.yaml", ".fluid.yml", ".fluid.json")
+#: Below the 90 s that hooks.json and scaffold-ide give the whole hook, so this hook's
+#: own message reaches the agent before Claude Code stops it.
 TIMEOUT_S = 60
 MAX_LINES = 40
 #: Terminal control sequences: OSC (title, clipboard, links), CSI, the other ESC pairs,
@@ -106,20 +111,23 @@ def main(stdin: TextIO = sys.stdin, stderr: TextIO = sys.stderr) -> int:
     shown = printable(path)
     if command is None:
         print(
-            "The FLUID contract was not validated: fluid is not installed or not on PATH "
-            "(pip install data-product-forge).",
+            f"{shown} was not validated: the fluid CLI is not installed or not on PATH. "
+            "Install it (pip install data-product-forge) or tell the user, then run: "
+            f"fluid validate {shown} --offline",
             file=stderr,
         )
-        return 1
+        return 2
     try:
         proc = subprocess.run(  # noqa: S603 - list argv, no shell
             command, capture_output=True, text=True, timeout=TIMEOUT_S, check=False
         )
     except subprocess.TimeoutExpired:
         print(
-            f"fluid validate took more than {TIMEOUT_S}s on {shown}; run it yourself.", file=stderr
+            f"{shown} was not validated: fluid validate took more than {TIMEOUT_S}s. "
+            f"Run it yourself: fluid validate {shown} --offline",
+            file=stderr,
         )
-        return 1
+        return 2
     if proc.returncode == 0:
         return 0
     print(

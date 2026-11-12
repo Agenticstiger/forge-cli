@@ -5,8 +5,8 @@
 
 This directory is three things at once, from one copy of the files:
 
-* package data, which ``fluid scaffold-ide`` copies into a workspace's
-  ``.claude/skills/`` or ``.agents/skills/``;
+* package data, which ``fluid scaffold-ide`` copies into the skills directory of the
+  IDE it targets;
 * a Claude Code plugin root (``.claude-plugin/plugin.json``, ``hooks/hooks.json``,
   ``skills/``) that the repository's ``.claude-plugin/marketplace.json`` lists;
 * the layout ``npx skills add`` (vercel-labs/skills) installs, found through that
@@ -35,12 +35,19 @@ def skill_dirs() -> List[Path]:
 
 
 def skill_files(skill_dir: Path) -> List[Path]:
-    """Every file a skill ships, relative to its directory, in a stable order."""
-    return sorted(
-        p.relative_to(skill_dir)
-        for p in skill_dir.rglob("*")
-        if p.is_file() and "__pycache__" not in p.parts
-    )
+    """Every file a skill ships, relative to its directory, in a stable order.
+
+    Hidden files and directories (a Finder ``.DS_Store``, an editor's swap file) and
+    ``__pycache__`` are not part of a skill. The wheel leaves them out too, since its
+    ``*`` glob skips dot entries, but an editable install reads this directory as it is.
+    """
+    found = []
+    for path in skill_dir.rglob("*"):
+        rel = path.relative_to(skill_dir)
+        hidden = any(part.startswith(".") or part == "__pycache__" for part in rel.parts)
+        if path.is_file() and not hidden:
+            found.append(rel)
+    return sorted(found)
 
 
 def frontmatter(skill_md: Path) -> Dict[str, object]:
