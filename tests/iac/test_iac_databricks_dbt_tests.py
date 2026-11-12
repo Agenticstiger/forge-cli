@@ -309,6 +309,22 @@ class TestRefusals:
         rules = [{"id": "drift", "type": "drift_detection", "selector": "*", "severity": "warn"}]
         assert "the table's history" in self._refused(tmp_path, _contract(rules=rules), "rule")
 
+    def test_an_anomaly_rule_is_left_to_data_quality_monitoring(self, tmp_path):
+        # databricks_quality.py (#864) turns monitoring on for an expose with such a rule,
+        # and the monitor learns its bounds: no dbt test, no refusal.
+        _project(tmp_path)
+        anomaly = {"id": "volume", "type": "anomaly_detection", "selector": "*", "severity": "warn"}
+        compiled = _compile(_contract(rules=[*RULES, anomaly]), tmp_path)
+        assert not compiled.refusals, _kinds(compiled)
+        assert "volume" not in compiled.jobs[0].tests
+
+    def test_an_anomaly_rule_with_monitoring_turned_off_is_refused(self, tmp_path):
+        _project(tmp_path)
+        anomaly = {"id": "volume", "type": "anomaly_detection", "selector": "*", "severity": "warn"}
+        contract = _contract(rules=[anomaly])
+        contract["exposes"][0]["contract"]["dq"]["monitoring"] = {"enabled": False}
+        assert "monitoring back on" in self._refused(tmp_path, contract, "rule")
+
     def test_a_model_the_project_does_not_hold_is_refused(self, tmp_path):
         _project(tmp_path, files={"models/other.sql": "select 1\n", "models/sources.yml": SOURCES})
         assert "'orders'" in self._refused(tmp_path, _contract(), "model")
@@ -450,7 +466,7 @@ class TestRefusals:
         self._refused(tmp_path, contract, "column")
 
     def test_fluid_validate_without_a_contract_file_still_reads_the_rules(self):
-        rules = [{"id": "a", "type": "anomaly_detection", "selector": "*", "severity": "warn"}]
+        rules = [{"id": "a", "type": "drift_detection", "selector": "*", "severity": "warn"}]
         compiled = _compile(_contract(rules=rules), None, validating=True)
         assert "databricks-job-dq-rule" in _kinds(compiled)
 

@@ -122,10 +122,26 @@ def compile_tests(
     if not has_rules(exposures):
         return out
     rules = read_rules(contract, exposures)
-    out.refusals.extend(
-        _refusal("rule", f"{where} expose {r.expose_id!r}: {r.message}.", r.fix)
-        for r in rules.refusals
-    )
+    monitored = _monitored(exposures)
+    for refused in rules.refusals:
+        if refused.rule_type == "anomaly_detection":
+            if refused.expose_id in monitored:
+                continue  # Databricks data quality monitoring runs it (databricks_quality.py)
+            out.refusals.append(
+                _refusal(
+                    "rule",
+                    f"{where} expose {refused.expose_id!r}: {refused.message}, and the expose "
+                    "turns Databricks data quality monitoring off (contract.dq.monitoring."
+                    "enabled: false), which would learn its bounds.",
+                    "Turn the monitoring back on, check the rule with fluid test, or remove it.",
+                )
+            )
+            continue
+        out.refusals.append(
+            _refusal(
+                "rule", f"{where} expose {refused.expose_id!r}: {refused.message}.", refused.fix
+            )
+        )
     if git:
         out.refusals.append(
             _refusal(
@@ -194,6 +210,14 @@ class _Project:
         if self._sources is None:
             self._sources = _declared_sources(self.files)
         return self._sources
+
+
+def _monitored(exposures: Sequence[Mapping[str, Any]]) -> set:
+    """The exposeIds whose tables Databricks data quality monitoring watches: it runs their
+    ``anomaly_detection`` rules (learning the bounds), which a dbt test cannot."""
+    from .databricks_quality import monitoring_request
+
+    return {str(e.get("exposeId") or "") for e in exposures if monitoring_request(e)}
 
 
 def _test_folder(
