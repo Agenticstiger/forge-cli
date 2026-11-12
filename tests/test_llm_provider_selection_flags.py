@@ -14,6 +14,7 @@
    ``--llm-provider``, ``--llm-model``, ``--llm-endpoint`` and their
    ``FLUID_LLM_*`` twins. A named provider now skips setup, and setup fills
    only what the run leaves unstated.
+4. ``fluid ai test`` ignored ``FLUID_LLM_PROVIDER`` and ``FLUID_FORGE_AGENT``.
 
 Hermetic: the keyring, the Ollama probe, the saved ``fluid ai setup`` choice,
 HOME and PATH are patched, so nothing reads the real ``~/.fluid``, finds an
@@ -44,6 +45,7 @@ ANTHROPIC_KEY = "anthropic-env-key-test-0002"  # pragma: allowlist secret
 GEMINI_KEY = "gemini-env-key-test-0003"  # pragma: allowlist secret
 GITHUB_KEY = "github-env-key-test-0004"  # pragma: allowlist secret
 ONPREM = "https://llm.internal.test/v1"
+GENERIC_KEY = "generic-llm-key-test-0005"  # pragma: allowlist secret
 
 
 _VARS = (
@@ -620,3 +622,60 @@ def test_the_welcome_panel_names_the_run_s_provider(world: _World) -> None:
 
     assert named.ai_provider_hint == "anthropic"
     assert unnamed.ai_provider_hint == "openai"
+
+
+# ── 4. fluid ai test honours the provider the run names ─────────────────────
+
+
+def test_ai_test_honours_fluid_llm_provider(world: _World) -> None:
+    world.saved = {"provider": "openai", "model": "gpt-saved-test"}
+    world.keyring["openai"] = OPENAI_KEY
+    world.monkeypatch.setenv("FLUID_LLM_PROVIDER", "anthropic")
+    world.monkeypatch.setenv("ANTHROPIC_API_KEY", ANTHROPIC_KEY)
+
+    config, error = _ai_test()
+
+    assert error is None
+    assert (config.provider, config.api_key) == ("anthropic", ANTHROPIC_KEY)
+
+
+def test_ai_test_gives_a_provider_named_by_a_variable_the_generic_key(world: _World) -> None:
+    world.monkeypatch.setenv("FLUID_LLM_PROVIDER", "openai")
+    world.monkeypatch.setenv("FLUID_LLM_API_KEY", GENERIC_KEY)
+
+    config, error = _ai_test()
+
+    assert error is None
+    assert (config.provider, config.api_key) == ("openai", GENERIC_KEY)
+
+
+def test_ai_test_honours_fluid_forge_agent(world: _World) -> None:
+    # It tested the saved provider, which this run would not use.
+    world.saved = {"provider": "openai", "model": "gpt-saved-test"}
+    world.keyring["openai"] = OPENAI_KEY
+    world.monkeypatch.setenv("FLUID_FORGE_AGENT", "codex")
+
+    config, error = _ai_test()
+
+    assert config is None
+    assert "codex" in error
+
+
+def test_ai_test_flag_beats_the_variable(world: _World) -> None:
+    world.monkeypatch.setenv("FLUID_LLM_PROVIDER", "anthropic")
+    world.monkeypatch.setenv("OPENAI_API_KEY", OPENAI_KEY)
+
+    config, error = _ai_test(llm_provider="openai")
+
+    assert error is None
+    assert config.provider == "openai"
+
+
+@pytest.mark.parametrize("value", ["claude-code", "codex"])
+def test_ai_test_says_it_does_not_test_a_named_agent(world: _World, value: str) -> None:
+    world.monkeypatch.setenv("FLUID_FORGE_AGENT", value)
+
+    config, error = _ai_test()
+
+    assert config is None
+    assert f"does not test {value}" in error

@@ -168,6 +168,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `GOOGLE_API_KEY` or `GEMINI_API_KEY` (it missed the
   second). GitHub Models stays a provider you name with `--llm-provider github`. `fluid ai test`
   and `fluid init`'s check for a configured AI follow the same rule.
+- **`fluid ai test` tests the provider `FLUID_LLM_PROVIDER` or `FLUID_FORGE_AGENT` names.** It
+  read only `--llm-provider`, so with `FLUID_LLM_PROVIDER=anthropic` it tested the saved
+  provider, which forge would not use. A provider named this way also gets `FLUID_LLM_API_KEY`,
+  as with the flag. A coding agent or `mcp-sampling` named either way is not tested, and the
+  command now says so, where `claude-code` failed as "Unsupported AI provider 'claude_code'".
 
 ### Security
 
