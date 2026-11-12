@@ -240,12 +240,95 @@ def test_statements_create_with_properties_and_alter_keeps_the_view():
     assert mark.startswith(f"ALTER VIEW {name} SET TBLPROPERTIES ('fluid.product_id' = ")
 
 
-def test_the_view_is_named_after_the_table_without_a_model_name():
+def test_the_view_is_named_after_its_table_whatever_the_model_is_called():
+    # Forge's own emitters name the model after its table; the schema calls the name
+    # human-readable. Neither may become the view's name.
+    for name in ("site_360", "Site 360 model", None, 42):
+        semantics = copy.deepcopy(SEMANTICS)
+        semantics["name"] = name
+        assert only_view(site_contract(semantics)).full_name == VIEW
+
+
+def test_a_table_named_like_another_tables_view_is_refused():
+    contract = site_contract()
+    clash = copy.deepcopy(contract["exposes"][0])
+    clash["exposeId"] = "clash"
+    clash["binding"]["location"]["table"] = "site_360_semantic_model"
+    del clash["semantics"]
+    contract["exposes"].append(clash)
+    assert any("already takes" in str(r) for r in refusals_of(contract))
+
+
+def test_an_entity_is_its_key_column_and_one_on_no_column_is_left_out():
     semantics = copy.deepcopy(SEMANTICS)
-    del semantics["name"]
-    assert only_view(site_contract(semantics)).full_name == "main.sales.site_360_semantic_model"
-    semantics["name"] = "Site_Metrics"
-    assert only_view(site_contract(semantics)).full_name == "main.sales.site_metrics"
+    semantics["entities"] = [
+        {"name": "site", "type": "primary", "expr": "site_id"},
+        {"name": "tower", "type": "foreign"},  # no column "tower": a join key the view cannot hold
+    ]
+    semantics["dimensions"].insert(
+        0, {"name": "site", "type": "categorical", "expr": "site_status"}
+    )
+    compiled = compile_views(site_contract(semantics))
+    assert compiled.refusals == []
+    fields = [
+        d["name"] for d in yaml.safe_load(compiled.metric_views.views[0].definition)["dimensions"]
+    ]
+    assert fields[:2] == ["site_id", "site"]
+    assert "tower" not in fields
+    assert any("entities[1] (tower) is the key 'tower'" in w for w in compiled.warnings)
+
+
+def test_a_table_qualifying_its_own_column_is_the_source():
+    semantics = copy.deepcopy(SEMANTICS)
+    semantics["measures"][1]["expr"] = "site_360.tenancy_count"
+    measures = yaml.safe_load(only_view(site_contract(semantics)).definition)["measures"]
+    assert measures[1]["expr"] == "AVG(source.tenancy_count)"
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected"),
+    [
+        ("EXTRACT(YEAR FROM snapshot_date)", "EXTRACT(YEAR FROM source.snapshot_date)"),
+        ("snapshot_date + INTERVAL 1 DAY", "source.snapshot_date + INTERVAL 1 DAY"),
+        ("captured_at::date", "source.captured_at::date"),
+        ("DATEADD(MONTH, 1, snapshot_date)", "DATEADD(MONTH, 1, source.snapshot_date)"),
+        ("CAST(year AS STRING)", "CAST(source.year AS STRING)"),
+    ],
+)
+def test_a_unit_or_type_keyword_named_like_a_column_stays_a_keyword(expr, expected):
+    contract = site_contract()
+    for name in ("year", "day", "date", "month"):
+        contract["exposes"][0]["contract"]["schema"].append({"name": name, "type": "int"})
+    semantics = contract["exposes"][0]["semantics"]
+    semantics["dimensions"].append({"name": "derived", "type": "categorical", "expr": expr})
+    semantics["dimensions"].append(
+        {"name": "year_of", "type": "categorical", "expr": "EXTRACT(YEAR FROM snapshot_date)"}
+    )
+    fields = {
+        d["name"]: d["expr"] for d in yaml.safe_load(only_view(contract).definition)["dimensions"]
+    }
+    assert fields["derived"] == expected
+
+
+def test_a_dimension_named_like_a_keyword_it_uses_compiles():
+    semantics = copy.deepcopy(SEMANTICS)
+    semantics["dimensions"].append(
+        {"name": "year", "type": "categorical", "expr": "EXTRACT(YEAR FROM snapshot_date)"}
+    )
+    fields = {
+        d["name"]: d["expr"]
+        for d in yaml.safe_load(only_view(site_contract(semantics)).definition)["dimensions"]
+    }
+    assert fields["year"] == "EXTRACT(YEAR FROM source.snapshot_date)"
+
+
+def test_two_fields_differing_only_in_a_literals_case_collide():
+    semantics = copy.deepcopy(SEMANTICS)
+    semantics["dimensions"] += [
+        {"name": "flag", "type": "categorical", "expr": "site_status = 'A'"},
+        {"name": "flag", "type": "categorical", "expr": "site_status = 'a'"},
+    ]
+    assert any("share one namespace" in str(r) for r in refusals_of(site_contract(semantics)))
 
 
 def test_the_plan_and_validate_see_the_view(monkeypatch):
@@ -456,7 +539,10 @@ REFUSALS = [
     (_with("metrics.0.filter", "site_status = 'ON_AIR"), "does not close"),
     (_with("metrics.0.filter", "`site_status = 'x'"), "does not close"),
     (_with("metrics.0.filter", "`we(ird` = 'x' OR site_status = 'y'"), None),
-    (_append("measures", {"name": "ghost", "agg": "sum"}), "has no expr"),
+    (_append("measures", {"name": "ghost", "agg": "sum"}), "'ghost', which is no column of"),
+    (_with("dimensions.0.expr", "region_code"), "'region_code', which is no column of"),
+    (_with("measures.1.expr", "length(\"secret\"('s', 'k'))"), "quoted or qualified"),
+    (_with("measures.1.expr", "length(`x`secret('s', 'k'))"), "calls secret()"),
     (_with("measures.0.agg", "stddev"), "unsupported agg 'stddev'"),
     (_with("measures.0.agg", "percentile"), None),  # default 0.5: compiles
     (
@@ -473,9 +559,6 @@ REFUSALS = [
     ),
     (_with("description", "Price in $$"), "holds $$"),
     (_with("labels", {"ai-instructions": "Use ${env:SECRET}"}), "holds ${"),
-    (_with("name", "site-360"), "it names the metric view"),
-    (_with("name", 42), "it names the metric view"),
-    (_with("name", "site_360"), "a name exposes[0] (orders) already takes"),
 ]
 
 
@@ -601,27 +684,52 @@ def test_select_on_the_view_is_exactly_the_tables_readers(fake):
     assert fake.grants[("table", VIEW)][DEPLOY_USER] == ["SELECT"]  # this run's own: left
 
 
-def test_a_view_the_contract_no_longer_declares_is_dropped(fake):
+def _view_statement(full: str, product: str) -> str:
+    return (
+        f"CREATE VIEW {full} WITH METRICS LANGUAGE YAML TBLPROPERTIES ('fluid.product_id' = "
+        f"'{product}') AS $$version: 1.1\nsource: {TABLE}\nmeasures:\n- name: n\n  expr: COUNT(1)\n$$"
+    )
+
+
+def test_a_view_the_contract_no_longer_declares_is_dropped_before_the_apply(fake):
     run, doc = Run(fake), site_contract()
     run.post(doc)
-    other = "main.sales.someone_elses"
-    ok, err = _execute(
-        fake,
-        f"CREATE VIEW {other} WITH METRICS LANGUAGE YAML TBLPROPERTIES ('fluid.product_id' = "
-        f"'other.product') AS $$version: 1.1\nsource: {TABLE}\nmeasures:\n- name: n\n  expr: COUNT(1)\n$$",
-    )
-    assert ok, err
-    renamed = site_contract()
-    renamed["exposes"][0]["semantics"]["name"] = "site_metrics"
+    fake.create_table("main.archive.kept", [("x", "string", True)])
+    ours_moved = "main.archive.site_360_old_semantic_model"  # its table moved to sales
+    ours_renamed = "main.sales.site_360_v0_semantic_model"  # its table was renamed
+    theirs = "main.sales.someone_elses_semantic_model"
+    for full, product in (
+        (ours_moved, "dbx.fake.orders"),
+        (ours_renamed, "dbx.fake.orders"),
+        (theirs, "other.product"),
+    ):
+        ok, err = _execute(fake, _view_statement(full, product))
+        assert ok, err
     before = len(fake.sql_log)
-    run.post(renamed)
-    assert "DROP VIEW IF EXISTS `main`.`sales`.`site_360_semantic_model`" in run.statements(before)
-    assert VIEW not in fake.tables and "main.sales.site_metrics" in fake.tables
-    assert other in fake.tables  # another product's view is left alone
-    del renamed["exposes"][0]["semantics"]
-    run.post(renamed)
-    assert "main.sales.site_metrics" not in fake.tables
-    assert "dropped metric view main.sales.site_metrics" in run.text
+    run.pre(doc)
+    dropped = [s for s in run.statements(before) if s.startswith("DROP VIEW")]
+    assert dropped == [
+        "DROP VIEW IF EXISTS `main`.`archive`.`site_360_old_semantic_model`",
+        "DROP VIEW IF EXISTS `main`.`sales`.`site_360_v0_semantic_model`",
+    ]
+    assert theirs in fake.tables and VIEW in fake.tables
+    del doc["exposes"][0]["semantics"]
+    run.pre(doc)
+    assert VIEW not in fake.tables
+    assert f"dropped metric view {VIEW}" in run.text
+
+
+def test_a_stale_view_whose_name_sql_cannot_hold_is_left_and_said(fake):
+    run, doc = Run(fake), site_contract()
+    run.post(doc)
+    ok, err = _execute(fake, _view_statement("main.sales.old_semantic_model", "dbx.fake.orders"))
+    assert ok, err
+    fake.tables["main.sales.odd-name_semantic_model"] = fake.tables.pop(
+        "main.sales.old_semantic_model"
+    )
+    run.pre(site_contract())
+    assert "main.sales.odd-name_semantic_model" in fake.tables
+    assert "its name is no plain identifier" in run.text
 
 
 def test_dry_run_prints_the_statements_and_runs_none(fake):
@@ -735,3 +843,63 @@ def test_lock_restricted_leaves_the_views_of_unrestricted_tables(fake):
     restricted = mv.MetricViews(plan.product_id, [replace(plan.views[0], restricted=True)])
     mv.lock_restricted(restricted, run.said.append, fake.client)
     assert fake.grants[("table", VIEW)] == {"analysts": []}
+
+
+def test_a_failed_grant_or_update_still_revokes_who_the_contract_no_longer_names(fake):
+    run = Run(fake)
+    run.post(site_contract(readers=("group:analysts", "group:bi")))
+    fake.fail_on("GRANT SELECT ON TABLE `main`.`sales`.`site_360_semantic_model` TO `ghost`")
+    with pytest.raises(UnsupportedBindingError, match="grant SELECT to ghost failed"):
+        run.post(site_contract(readers=("group:bi", "group:ghost")))
+    assert "SELECT" not in fake.grants[("table", VIEW)].get("analysts", [])
+    changed = site_contract(readers=("group:ghost",))
+    changed["exposes"][0]["semantics"]["description"] = "Changed."
+    fake.fail_on("ALTER VIEW")
+    with pytest.raises(UnsupportedBindingError, match="update metric view"):
+        run.post(changed)
+    assert "SELECT" not in fake.grants[("table", VIEW)].get("bi", [])
+
+
+def test_pre_apply_narrows_who_reads_before_the_apply(fake):
+    run = Run(fake)
+    run.post(site_contract(readers=("group:analysts", "group:bi")))
+    before = len(fake.sql_log)
+    run.pre(site_contract(readers=("group:bi",)))
+    assert run.statements(before) == [
+        "REVOKE SELECT ON TABLE `main`.`sales`.`site_360_semantic_model` FROM `analysts`"
+    ]
+    assert "metric view readers, before the apply" in run.text
+
+
+def test_all_privileges_held_by_a_non_reader_is_revoked(fake):
+    run, doc = Run(fake), site_contract()
+    run.post(doc)
+    fake.grant("table", VIEW, "intruder", "ALL_PRIVILEGES")
+    before = len(fake.sql_log)
+    run.post(doc)
+    assert run.statements(before) == [
+        "REVOKE ALL PRIVILEGES ON TABLE `main`.`sales`.`site_360_semantic_model` FROM `intruder`"
+    ]
+    assert fake.grants[("table", VIEW)]["intruder"] == []
+
+
+def test_the_shadow_report_does_not_count_the_view_as_a_missing_opentofu_resource(monkeypatch):
+    from fluid_build.iac.shadow import native_logical_resources
+
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, "wh-1")
+    kinds = {r.kind for r in native_logical_resources(dbx.planned_objects(site_contract()))}
+    assert "view" not in kinds
+
+
+def test_the_engine_prints_what_the_hooks_say_as_data(monkeypatch, capsys):
+    from fluid_build.cli import _apply_opentofu_engine as engine
+
+    said: List[str] = []
+
+    class Plugin:
+        def pre_apply(self, contract, say, dry_run=False):
+            say("comment: Share of rows [/total] and [bold]")
+
+    monkeypatch.setattr(engine, "cprint_literal", said.append)
+    engine._enforce_access(Plugin(), "pre_apply", {}, dry_run=True)
+    assert said == ["comment: Share of rows [/total] and [bold]"]

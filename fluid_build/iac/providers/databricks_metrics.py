@@ -6,17 +6,21 @@
 Each Databricks expose that declares a ``semantics`` block gets one metric view, so Genie,
 AI/BI dashboards and SQL read the contract's semantic model natively
 (``SELECT country_code, MEASURE(site_count) FROM ... GROUP BY ALL``). The view is
-``<catalog>.<schema>.<semantics.name>`` (``<table>_semantic_model`` when the model has no
-name), beside its table in the product's own schema, so a schema dropped with its product
-takes the view with it and nothing lands outside what the product owns.
+``<catalog>.<schema>.<table>_semantic_model``, beside its table in the product's own schema, so
+nothing lands outside what the product owns. It is named after its table, not after
+``semantics.name``: the schema calls that a human-readable name, and forge's own emitters set it to
+the table's name, which would be the table's own name in Unity Catalog.
 
 The definition is metric view YAML version 1.1 (Databricks, "Metric view YAML syntax
 reference"). The mapping follows the Apache Ossie Databricks converter
 (``apache/ossie-converters`` ``databricks/``, Apache-2.0) where FLUID and OSI meet, and refuses
 what the YAML cannot hold rather than approximating it:
 
-* ``source`` is the expose's table. ``entities`` (the primary key, foreign keys) and
-  ``dimensions`` are the view's ``dimensions``; a time dimension's ``timeGranularity`` is applied
+* ``source`` is the expose's table. ``dimensions`` are the view's dimensions, and so are the
+  ``entities`` (the primary key, foreign keys): an entity over a bare column is that column under
+  the column's name (``customer`` over ``customer_id`` is ``customer_id``), and one whose key is no
+  column of the table is left out with a warning, since a metric view holds no join. A time
+  dimension's ``timeGranularity`` is applied
   the way MetricFlow presents a dimension at its grain: a ``DATE`` column at ``day`` is used as it
   is, a coarser grain on a ``DATE`` is ``TRUNC(col, 'MONTH')`` (still a ``DATE``), anything else
   ``DATE_TRUNC('MONTH', col)``; ``hour`` or ``minute`` on a ``DATE`` is refused.
@@ -33,7 +37,8 @@ what the YAML cannot hold rather than approximating it:
   measured live), where MetricFlow without ``window_groupings`` takes one latest value for the
   whole query. A dimension that is not a declared time dimension is refused.
 * Every reference to a column of the table, in a dimension, a measure or a filter, is written
-  ``source.<column>``. A bare name in a metric view expression reads a field or a measure of the
+  ``source.<column>`` (``<table>.<column>`` too); a word in a unit or type position
+  (``EXTRACT(YEAR FROM d)``, ``INTERVAL 1 DAY``, ``x::DATE``) is left as it is. A bare name in a metric view expression reads a field or a measure of the
   view before a column (measured live: a dimension shadowing ``site_status`` made a filter on it
   read the dimension, and a window measure named like a column broke every window measure that
   read the column, ``METRIC_VIEW_WINDOW_MEASURE_REFERENCES_WINDOW_MEASURE``). A name that is no
@@ -60,17 +65,26 @@ like the column masks (``databricks_enforce.py``), around ``tofu apply``:
 
 * :func:`pre_apply` refuses, before anything is applied, a view whose name is taken by an object
   this module did not create: another kind of table, a view without this product's
-  ``fluid.product_id`` property, or one the deploy identity does not own.
+  ``fluid.product_id`` property, or one the deploy identity does not own. It then revokes reading
+  each existing view from whoever the contract no longer names, so a ``tofu apply`` that fails
+  part way leaves no removed reader able to read.
 * :func:`post_apply` runs after the masks and row filters are bound. It creates a missing view
   with ``CREATE VIEW`` (never ``CREATE OR REPLACE``: replacing a view drops its grants, measured
   live, and makes whoever replaces it its owner) and updates a changed one with ``ALTER VIEW ...
   AS``, which keeps its grants. The view carries ``fluid.product_id``, ``fluid.expose_id`` and
   ``fluid.definition_sha256`` as properties; one whose digest and stored structure match is
-  left alone, so a second apply runs nothing. ``SELECT`` on the view is exactly the principals
-  that may read its table (``SELECT`` or ``ALL_PRIVILEGES`` there, from ``accessPolicy.grants``
-  and ``policy.authz.readers``): granted to them, revoked from anyone else. Readers also need
-  ``USE SCHEMA`` (the module grants it) and ``USE CATALOG`` (named by the plan notice). A view
-  of this product that the contract no longer declares is dropped once the apply succeeds.
+  left alone, so a second apply runs nothing. Reading the view is exactly the principals that
+  may read its table (``SELECT`` or ``ALL_PRIVILEGES`` there, from ``accessPolicy.grants`` and
+  ``policy.authz.readers``): ``SELECT`` granted to them, ``SELECT`` and ``ALL PRIVILEGES`` revoked
+  from anyone else, revokes first and each on its own. Readers also need ``USE SCHEMA`` (the
+  module grants it) and ``USE CATALOG`` (named by the plan notice).
+* A view of this product that the contract no longer declares, in any schema of its tables'
+  catalogs (its table renamed or moved, its semantics or its expose removed), is dropped before
+  ``tofu apply``: dropping a view only narrows who reads, and a schema the apply removes must be
+  empty (``databricks_schema`` is never ``force_destroy``). It is found by name
+  (``*_semantic_model``, ``table-summaries``) and dropped only with this product's
+  ``fluid.product_id`` and the deploy identity as owner. A product moved to another catalog leaves
+  its old views there; drop them by hand.
 * A metric view reads its table with its owner's rights, and Unity Catalog applies the table's
   row filter and column masks to whoever queries the view (a row filter measured live). When
   binding them fails, :func:`lock_restricted` revokes ``SELECT`` on the views over restricted
@@ -174,11 +188,18 @@ _FORBIDDEN_FUNCTIONS = frozenset(
     }
 )
 _FORBIDDEN_PREFIXES = ("ai_", "read_")
-_NAME = r"(?:`(?:``|[^`])*`|[A-Za-z_][A-Za-z0-9_]*)"
-#: Every call: a name, quoted or not, qualified or not, before ``(`` (string literals blanked).
-_CALL_RE = re.compile(rf"(?<![A-Za-z0-9_$`])({_NAME}(?:\s*\.\s*{_NAME})*)\s*\(")
+_NAME = r"(?:`(?:``|[^`])*`|\"(?:\"\"|[^\"])*\"|[A-Za-z_][A-Za-z0-9_]*)"
+#: Every call: a name (backtick-quoted, double-quoted, which ANSI quoting reads as a name, or
+#: bare), qualified or not, before ``(``, in text whose single-quoted literals are blanked.
+_CALL_RE = re.compile(rf"(?<![A-Za-z0-9_$])({_NAME}(?:\s*\.\s*{_NAME})*)\s*\(")
 #: What a name may follow and still not be a column: ``CAST(x AS <type>)``.
 _AFTER_AS_RE = re.compile(r"(?i)\bAS$")
+#: What a word may follow and be a unit or a type, not a column: ``::``, ``EXTRACT(``, an
+#: ``INTERVAL`` amount, the unit argument of the date-arithmetic functions.
+_UNIT_CONTEXT_RE = re.compile(
+    r"(?is)(?:::|\bextract\s*\(|\binterval\s+[-+]?(?:\d+(?:\.\d+)?|'(?:''|[^'])*')|"
+    r"\b(?:dateadd|datediff|date_add|date_diff|timestampadd|timestampdiff)\s*\()\s*$"
+)
 
 Say = Callable[[str], None]
 ClientFactory = Callable[[], Any]
@@ -290,8 +311,10 @@ class MetricViews:
         """The views as the native planner's actions (``databricks.planned_objects``)."""
         return [
             {
-                "op": "databricks.metric_view.ensure",
-                # No provider resource: fluid apply creates it on the SQL warehouse.
+                # No provider resource: fluid apply creates it on the SQL warehouse, so the
+                # op names no kind ``iac/shadow.py`` compares with the OpenTofu module (as a
+                # grant names none); "view" in it would read as a resource the module lacks.
+                "op": "databricks.semantic_model.ensure",
                 "resource_type": "databricks_metric_view",
                 "resource_id": view.full_name,
                 "source": view.source,
@@ -331,11 +354,14 @@ class _Ratio:
 class _ViewCompiler:
     """One expose's ``semantics`` block → metric view YAML, or refusals."""
 
-    def __init__(self, table: Any, semantics: Mapping[str, Any], refusals: List[Any]):
+    def __init__(
+        self, table: Any, semantics: Mapping[str, Any], refusals: List[Any], warnings: List[str]
+    ):
         self.table = table
         self.semantics = semantics
         self.where = f"{table.where} semantics"
         self.refusals = refusals
+        self.warnings = warnings
         self.failed = False
         #: The table's columns by the lower-case name Unity Catalog stores.
         self.columns: Dict[str, Mapping[str, Any]] = {c["name"]: c for c in table.columns}
@@ -343,12 +369,15 @@ class _ViewCompiler:
         for column in (table.exposure.get("contract") or {}).get("schema") or []:
             if isinstance(column, Mapping):
                 self.schema_columns[str(column.get("name") or "").strip().lower()] = column
-        #: Every name the model declares, lower-cased: a bare one in an expression would read it.
+        #: Every field or measure name the view will hold, lower-cased: a bare one in an
+        #: expression would read it. An entity over a bare column is that column, no name of its own.
         self.declared: Set[str] = {
             entry["name"].strip().lower()
             for kind in ("entities", "dimensions", "measures", "metrics")
             for entry in semantics.get(kind) or []
-            if isinstance(entry, Mapping) and isinstance(entry.get("name"), str)
+            if isinstance(entry, Mapping)
+            and isinstance(entry.get("name"), str)
+            and not (kind == "entities" and _plain_ident(entry.get("expr") or entry["name"]))
         }
         #: Names taken in the view (fields and measures share one namespace, ignoring case).
         self.taken: Dict[str, str] = {}
@@ -425,8 +454,8 @@ class _ViewCompiler:
         text = self._allowed(raw, what)
         if text is None:
             return None
-        scan = _blank(text, names=False)  # string literals out, quoted names kept
-        refused_call = _refused_call(scan)
+        scan = _blank(text, keep="`")  # string literals out, quoted names kept
+        refused_call = _refused_call(_blank(text, keep='`"'))
         if refused_call is not None:
             self.refuse(
                 "invalid",
@@ -450,7 +479,7 @@ class _ViewCompiler:
                 "a ratio of two measures is a ratio metric.",
             )
             return None
-        qualified, bare = _qualify(text, self.columns)
+        qualified, bare = _qualify(text, self.columns, self.table.name)
         shadowed = sorted({n for n in bare if n.lower() in self.declared})
         if shadowed:
             self.refuse(
@@ -478,7 +507,7 @@ class _ViewCompiler:
                 "Rewrite it as a plain SQL expression over the table's columns.",
             )
             return None
-        code = _blank(text, names=True)  # a '(' in '...' or `...` opens nothing
+        code = _blank(text)  # a '(' in '...' or `...` opens nothing
         if any(quote in code for quote in "'\"`"):
             self.refuse(
                 "invalid",
@@ -495,15 +524,15 @@ class _ViewCompiler:
             return None
         return text
 
-    def missing_column(self, entry: Mapping[str, Any], name: str, what: str) -> bool:
-        """Refuse an entry with no ``expr`` whose name is no column: it would read nothing."""
-        if entry.get("expr") is not None or name.lower() in self.columns:
+    def no_column(self, raw: str, name: str, what: str) -> bool:
+        """Refuse a bare name that is no column of the table: the view would read nothing."""
+        column = _plain_ident(raw)
+        if column is None or column.lower() in self.columns:
             return False
         self.refuse(
             "invalid",
-            f"{what} ({name}) has no expr, and {self.table.full_name} has no column {name!r} for "
-            "it to read.",
-            "Give it an expr over the table's columns, or declare the column in contract.schema.",
+            f"{what} ({name}) reads {raw!r}, which is no column of {self.table.full_name}.",
+            "Name a column of contract.schema, or write the expression over its columns.",
         )
         return True
 
@@ -519,22 +548,34 @@ class _ViewCompiler:
         name = self.name(entry.get("name"), f"{what}.name")
         if name is None:
             return
-        raw = entry.get("expr") or name
+        raw = str(entry.get("expr") or name).strip()
+        column = _plain_ident(raw)
+        if kind == "entities" and column is not None:
+            if column.lower() not in self.columns:
+                self.warnings.append(
+                    f"{what} ({name}) is the key {raw!r}, which is no column of "
+                    f"{self.table.full_name}: an entity is a join key, and the metric view, which "
+                    "holds no join, leaves it out."
+                )
+                return
+            name = column  # an entity is its key column, under the column's own name
+        elif self.no_column(raw, name, what):
+            return
         is_time = kind == "dimensions" and str(entry.get("type") or "") == "time"
         prior = self.fields.get(name.lower())
-        if prior is not None and not is_time and str(raw).strip().lower() == prior.raw.lower():
+        if prior is not None and not is_time and raw == prior.raw:
             return  # an entity and a dimension over one column: one field
-        if not self.claim(name, f"{what} ({name})") or self.missing_column(entry, name, what):
+        if not self.claim(name, f"{what} ({name})"):
             return
         expr = self.expression(raw, f"{what}.expr")
         if expr is not None and is_time:
-            expr = self._time_expr(entry, str(raw), expr, what)
+            expr = self._time_expr(entry, raw, expr, what)
         if expr is None:
             return
         document: Dict[str, Any] = {"name": name, "expr": expr}
-        self._describe(document, entry, str(raw), what)
+        self._describe(document, entry, raw, what)
         self.dimension_docs.append(document)
-        self.fields[name.lower()] = _Field(name=name, raw=str(raw).strip(), is_time=is_time)
+        self.fields[name.lower()] = _Field(name=name, raw=raw, is_time=is_time)
 
     def _time_expr(self, entry: Mapping[str, Any], raw: str, expr: str, what: str) -> Optional[str]:
         params = entry.get("typeParams")
@@ -623,9 +664,10 @@ class _ViewCompiler:
         name = self.name(entry.get("name"), f"{what}.name")
         if name is None or not self.claim(name, f"{what} ({name})"):
             return
-        if self.missing_column(entry, name, what):
+        raw = str(entry.get("expr") or name).strip()
+        if self.no_column(raw, name, what):
             return
-        expr = self.expression(entry.get("expr") or name, f"{what}.expr")
+        expr = self.expression(raw, f"{what}.expr")
         window = self._window(entry, what)
         if expr is None or window is False:
             return
@@ -790,21 +832,6 @@ class _ViewCompiler:
             parts.append(f"Instructions: {instructions}")
         return "\n\n".join(parts) or None
 
-    def view_name(self) -> Optional[str]:
-        raw = self.semantics.get("name")
-        if raw is None or (isinstance(raw, str) and not raw.strip()):
-            return f"{self.table.name}{DEFAULT_SUFFIX}"
-        name = _plain_ident(raw)
-        if name is None:
-            self.refuse(
-                "invalid",
-                f"{self.where}.name is {raw!r}: it names the metric view, so it must be a plain "
-                "identifier (letters, digits and underscores, not starting with a digit).",
-                f"Rename it, or leave it out to name the view {self.table.name}{DEFAULT_SUFFIX}.",
-            )
-            return None
-        return name.lower()
-
     def property_values(self, product_id: str) -> None:
         """Refuse a property value the CREATE statement could not hold as itself."""
         for value, what in (
@@ -820,10 +847,10 @@ class _ViewCompiler:
                 )
 
 
-def _blank(text: str, *, names: bool) -> str:
-    """``text`` with each string literal, and with ``names`` each backtick-quoted name, replaced
-    by a space: what SQL reads as code, found in one pass as Databricks lexes it."""
-    return _SPAN_RE.sub(lambda m: m.group(0) if m.group(0)[0] == "`" and not names else " ", text)
+def _blank(text: str, keep: str = "") -> str:
+    """``text`` with each quoted span replaced by a space unless its quote is in ``keep``:
+    what SQL reads as code, the spans found in one pass as Databricks lexes them."""
+    return _SPAN_RE.sub(lambda m: m.group(0) if m.group(0)[0] in keep else " ", text)
 
 
 def _refused_call(text: str) -> Optional[str]:
@@ -832,20 +859,22 @@ def _refused_call(text: str) -> Optional[str]:
     for match in _CALL_RE.finditer(text):
         call = match.group(1)
         name = call.lower()
-        if "`" in call or "." in call:
+        if "`" in call or '"' in call or "." in call:
             return f"{call}() (a quoted or qualified function name)"
         if name in _FORBIDDEN_FUNCTIONS or name.startswith(_FORBIDDEN_PREFIXES):
             return f"{call}()"
     return None
 
 
-def _qualify(text: str, columns: Mapping[str, Any]) -> Tuple[str, List[str]]:
+def _qualify(text: str, columns: Mapping[str, Any], table: str = "") -> Tuple[str, List[str]]:
     """``text`` with each name of a column in ``columns`` written ``source.<name>``, and the
     other names it reads.
 
     A name is a column reference unless it is in a string literal, follows a ``.`` (a field of
     a struct, or a name already qualified), is called (``name(``), prefixes a typed literal
-    (``DATE'2026-01-01'``) or names a type (``CAST(x AS DATE)``).
+    (``DATE'2026-01-01'``), names a type (``CAST(x AS DATE)``, ``x::DATE``) or a unit
+    (``EXTRACT(YEAR FROM d)``, ``INTERVAL 1 DAY``, ``DATEADD(MONTH, 1, d)``). ``<table>.<column>``,
+    the table qualifying its own column, is ``source.<column>``.
     """
     out: List[str] = []
     bare: List[str] = []
@@ -857,11 +886,15 @@ def _qualify(text: str, columns: Mapping[str, Any]) -> Tuple[str, List[str]]:
         before = text[: match.start()].rstrip()
         after = text[match.end() :].lstrip()
         typed = after.startswith(("'", '"')) or _AFTER_AS_RE.search(before)  # DATE'..', AS DATE
-        if before.endswith(".") or after.startswith("(") or typed:
+        unit = _UNIT_CONTEXT_RE.search(before)
+        if before.endswith(".") or after.startswith("(") or typed or unit:
             continue
         name = token[1:-1].replace("``", "`") if token[0] == "`" else token
         if name.lower() in columns:
             out += [text[last : match.start()], f"{SOURCE}.{token}"]
+            last = match.end()
+        elif table and name.lower() == table.lower() and after.startswith("."):
+            out += [text[last : match.start()], SOURCE]
             last = match.end()
         else:
             bare.append(name)
@@ -917,13 +950,13 @@ def _compile_view(
     refusals: List[UnsupportedBindingError],
     warnings: List[str],
 ) -> Optional[MetricView]:
-    compiler = _ViewCompiler(table, table.exposure["semantics"], refusals)
-    view_name = compiler.view_name()
+    compiler = _ViewCompiler(table, table.exposure["semantics"], refusals, warnings)
+    view_name = f"{table.name}{DEFAULT_SUFFIX}"
     compiler.compile_fields()
     compiler.compile_measures()
     comment = compiler.comment()
     compiler.property_values(product_id)
-    if compiler.failed or view_name is None:
+    if compiler.failed:
         return None
     if not compiler.dimension_docs and not compiler.measure_docs:
         warnings.append(
@@ -1103,24 +1136,39 @@ def _exempt(session: Session, info: Optional[Mapping[str, Any]]) -> Set[str]:
 
 def _grant_steps(
     session: Session, view: MetricView, live: Optional[Mapping[str, Any]]
-) -> List[Step]:
-    """``[(statement, what)]`` that make ``SELECT`` on the view exactly its readers."""
+) -> Tuple[List[Step], List[Step]]:
+    """``(revokes, grants)`` that make reading the view exactly its readers: ``SELECT`` granted to
+    each reader, ``SELECT`` and ``ALL PRIVILEGES`` revoked from everyone else but the view's owner
+    and this run's identity."""
     name = quote_table(view.full_name)
     exempt = _exempt(session, live)
     held = _permissions(session, view.full_name) if live is not None else {}
-    holding = {p.lower() for p, privileges in held.items() if "SELECT" in privileges}
     wanted = {p.lower(): p for p in view.readers}
-    steps = [
+    revokes: List[Step] = []
+    for principal, privileges in sorted(held.items()):
+        if principal.lower() in wanted or principal.lower() in exempt:
+            continue
+        if "SELECT" in privileges:
+            revokes.append(
+                (
+                    f"REVOKE SELECT ON TABLE {name} FROM {quote_principal(principal)}",
+                    f"revoke SELECT from {principal}",
+                )
+            )
+        if "ALL_PRIVILEGES" in privileges:
+            revokes.append(
+                (
+                    revoke_all_statement(view.full_name, principal),
+                    f"revoke ALL PRIVILEGES from {principal}",
+                )
+            )
+    holding = {p.lower() for p, privileges in held.items() if "SELECT" in privileges}
+    grants = [
         (f"GRANT SELECT ON TABLE {name} TO {quote_principal(p)}", f"grant SELECT to {p}")
         for lower, p in sorted(wanted.items())
         if lower not in holding and lower not in exempt
     ]
-    steps += [
-        (f"REVOKE SELECT ON TABLE {name} FROM {quote_principal(p)}", f"revoke SELECT from {p}")
-        for p, privileges in sorted(held.items())
-        if "SELECT" in privileges and p.lower() not in wanted and p.lower() not in exempt
-    ]
-    return steps
+    return revokes, grants
 
 
 def _definition_steps(view: MetricView, live: _Live) -> List[Step]:
@@ -1177,24 +1225,31 @@ def _preview_view(session: Optional[Session], view: MetricView, say: Say) -> Non
         _say_statement(say, statement)
     try:
         assert session is not None
-        steps = _grant_steps(session, view, live.info if live.state == "ours" else None)
+        revokes, grants = _grant_steps(session, view, live.info if live.state == "ours" else None)
     except Exception:  # noqa: BLE001 — unread: say what the contract asks
-        steps = [("", f"grant SELECT to {p}") for p in view.readers]
-    for _statement, what in steps:
+        revokes, grants = [], [("", f"grant SELECT to {p}") for p in view.readers]
+    for _statement, what in revokes:
+        say(f"    before apply: {what}")
+    for _statement, what in grants:
         say(f"    after apply: {what}")
 
 
 def pre_apply(plan: MetricViews, say: Say, client_factory: Optional[ClientFactory] = None) -> None:
-    """Refuse, before ``tofu apply``, a view whose name an object this module did not create
-    holds: creating ours would fail, and replacing it would take it over."""
-    if not plan.views:
+    """Before ``tofu apply``: refuse a view whose name an object this module did not create holds
+    (creating ours would fail, and replacing it would take it over), then revoke reading each
+    existing view from whoever the contract no longer names, so no later failure leaves it open,
+    and drop this product's views the contract no longer declares (:func:`_drop_stale`)."""
+    if not plan.views and not plan.schemas:
         return
-    session = _session(client_factory, say, required=True)
-    assert session is not None
-    conflicts = []
+    session = _session(client_factory, say, required=bool(plan.views))
+    if session is None:
+        return
+    conflicts, narrowing = [], []
     for view in plan.views:
         try:
             live = _classify(session, view)
+            if live.state == "ours":
+                narrowing.append((view, _grant_steps(session, view, live.info)[0]))
         except Exception as exc:  # noqa: BLE001 — every failure here is a typed refusal
             raise MetricViewError(
                 f"could not read {view.full_name} from Unity Catalog: {type(exc).__name__}: "
@@ -1207,23 +1262,35 @@ def pre_apply(plan: MetricViews, say: Say, client_factory: Optional[ClientFactor
         raise MetricViewError(
             "the metric view name is taken, so nothing was applied: " + "; ".join(conflicts) + ".",
             (
-                "Give the semantic model another name (semantics.name), or drop or rename the "
-                "existing object in Databricks. A view of this product that another identity "
-                "owns can be handed back with ALTER VIEW <name> OWNER TO <the deploy identity>.",
+                "Rename the table, or drop or rename the existing object in Databricks. A view "
+                "of this product that another identity owns can be handed back with ALTER VIEW "
+                "<name> OWNER TO <the deploy identity>.",
             ),
         )
+    for view, revokes in narrowing:
+        if revokes:
+            say(f"\n  {view.full_name}: metric view readers, before the apply")
+        for statement, what in revokes:
+            try:
+                session.runner.run(statement)
+            except StatementFailed as exc:
+                raise MetricViewError(
+                    f"{view.full_name}: {what} failed before the apply, so nothing was applied: "
+                    f"{exc}",
+                    ("Fix the cause (this identity must own the view), then re-run fluid apply.",),
+                ) from exc
+            say(f"    done: {what}")
+    _drop_stale(session, plan, say)
 
 
 def post_apply(plan: MetricViews, say: Say, client_factory: Optional[ClientFactory] = None) -> None:
-    """Create or update every view, make its grants the contract's, drop the views this
-    product no longer declares; raise :class:`MetricViewError` naming what failed."""
-    if not plan.views and not plan.schemas:
+    """Create or update every view and make its grants the contract's; raise
+    :class:`MetricViewError` naming what failed."""
+    if not plan.views:
         return
-    session = _session(client_factory, say, required=bool(plan.views))
-    if session is None:
-        return
-    failed = [problem for view in plan.views if (problem := _converge(session, view, say))]
-    _drop_stale(session, plan, say)
+    session = _session(client_factory, say, required=True)
+    assert session is not None
+    failed = [problem for view in plan.views for problem in _converge(session, view, say)]
     if failed:
         raise MetricViewError(
             "the apply succeeded, but these metric views are not as the contract says: "
@@ -1235,60 +1302,72 @@ def post_apply(plan: MetricViews, say: Say, client_factory: Optional[ClientFacto
         )
 
 
-def _converge(session: Session, view: MetricView, say: Say) -> Optional[str]:
-    """Make one view the contract's; what failed, or ``None``."""
+def _converge(session: Session, view: MetricView, say: Say) -> List[str]:
+    """Make one view the contract's; what failed. Access narrows first, each revoke on its own,
+    then the definition, then each grant: no failure leaves a removed reader able to read."""
     try:
         live = _classify(session, view)
         if live.state == "foreign":
-            return f"{view.full_name}: {live.why}"
-        steps = _definition_steps(view, live)
-        steps += _grant_steps(session, view, live.info if live.state == "ours" else None)
+            return [f"{view.full_name}: {live.why}"]
+        revokes, grants = _grant_steps(session, view, live.info if live.state == "ours" else None)
+        definition = _definition_steps(view, live)
     except Exception as exc:  # noqa: BLE001
-        return f"{view.full_name}: it could not be read ({type(exc).__name__}: {scrub(exc)})"
-    if steps:
+        return [f"{view.full_name}: it could not be read ({type(exc).__name__}: {scrub(exc)})"]
+    if revokes or definition or grants:
         say(f"\n  {view.full_name}: metric view")
-    for statement, what in steps:
-        try:
-            session.runner.run(statement)
-        except StatementFailed as exc:
-            say(f"    FAILED: {what}: {exc}")
-            return f"{view.full_name}: {what} failed: {exc}"
-        say(f"    done: {what}")
+    failed = [f for step in revokes if (f := _run_step(session, view, step, say))]
+    for step in definition:
+        problem = _run_step(session, view, step, say)
+        if problem:
+            return [*failed, problem]  # no grant on a view that is not what the contract says
+    return failed + [f for step in grants if (f := _run_step(session, view, step, say))]
+
+
+def _run_step(session: Session, view: MetricView, step: Step, say: Say) -> Optional[str]:
+    statement, what = step
+    try:
+        session.runner.run(statement)
+    except StatementFailed as exc:
+        say(f"    FAILED: {what}: {exc}")
+        return f"{view.full_name}: {what} failed: {exc}"
+    say(f"    done: {what}")
     return None
 
 
-def _schema_tables(session: Session, where: str, say: Say) -> List[Mapping[str, Any]]:
-    """The tables and views of one schema; none (with a note) when they cannot be listed."""
-    catalog, schema = where.split(".", 1)
+def _catalog_views(session: Session, catalog: str, say: Say) -> List[Mapping[str, Any]]:
+    """Every metric view of one catalog named as this module names one (``*_semantic_model``,
+    ``GET /api/2.1/unity-catalog/table-summaries``); none, with a note, when unlisted."""
+    query = {"catalog_name": catalog, "table_name_pattern": f"%{DEFAULT_SUFFIX}"}
     try:
-        query = {"catalog_name": catalog, "schema_name": schema}
-        return _list_named(session.client, "/api/2.1/unity-catalog/tables", query, "tables")
+        rows = _list_named(
+            session.client, "/api/2.1/unity-catalog/table-summaries", query, "tables"
+        )
     except Exception as exc:  # noqa: BLE001 — unknown contents: drop nothing
-        if not _enforce.is_not_found(exc):  # a schema not created yet holds no view
+        if not _enforce.is_not_found(exc):
             say(
-                f"  note: metric views in {where} were not checked for removal: its tables "
+                f"  note: metric views in catalog {catalog} were not checked for removal: they "
                 f"could not be listed ({type(exc).__name__}: {scrub(exc)})."
             )
         return []
+    return [row for row in rows if str(row.get("table_type") or "").upper() == METRIC_VIEW]
 
 
 def _stale_views(session: Session, plan: MetricViews, say: Say) -> Iterator[Mapping[str, Any]]:
-    """This product's metric views in its schemas that the contract no longer declares."""
+    """This product's metric views, in any schema of its tables' catalogs, that the contract no
+    longer declares: a schema the apply removes then holds none of them."""
     expected = {view.full_name.lower() for view in plan.views}
-    for where in plan.schemas:
-        for row in _schema_tables(session, where, say):
-            full = str(row.get("full_name") or f"{where}.{row.get('name')}")
-            listed = str(row.get("table_type") or "").upper()
-            if full.lower() in expected or listed not in ("", METRIC_VIEW):
+    for catalog in sorted({where.split(".", 1)[0] for where in plan.schemas}):
+        for row in _catalog_views(session, catalog, say):
+            full = str(row.get("full_name") or "")
+            if not full or full.lower() in expected:
                 continue
             try:
-                info = row if listed and "properties" in row else read_table(session.client, full)
+                info = read_table(session.client, full) or {}
             except Exception as exc:  # noqa: BLE001 — unread: leave it
                 say(
                     f"  note: metric view {full} was not checked for removal ({type(exc).__name__})"
                 )
                 continue
-            info = info or {}
             ours = (info.get("properties") or {}).get(PRODUCT_PROPERTY) == plan.product_id
             if ours and str(info.get("table_type") or "").upper() == METRIC_VIEW:
                 yield {**info, "full_name": full}
@@ -1309,11 +1388,16 @@ def _drop_stale(session: Session, plan: MetricViews, say: Say, *, dry_run: bool 
                 f"  left metric view {full}: owned by {owner or 'unknown'}, not the deploy identity"
             )
         elif dry_run:
-            say(f"  would drop metric view {full}: the contract no longer declares it")
+            say(f"  before apply: drop metric view {full}: the contract no longer declares it")
         else:
+            try:
+                statement = f"DROP VIEW IF EXISTS {quote_table(full)}"
+            except ValueError:
+                say(f"  left metric view {full}: its name is no plain identifier; drop it by hand")
+                continue
             _run_noted(
                 session,
-                f"DROP VIEW IF EXISTS {quote_table(full)}",
+                statement,
                 say,
                 done=f"  dropped metric view {full}: the contract no longer declares it",
                 failed=f"  note: metric view {full} was not dropped",
@@ -1367,10 +1451,18 @@ def _close(session: Session, view: MetricView, say: Say) -> None:
         if principal.lower() in exempt:
             continue
         statements = []
-        if "SELECT" in privileges:
-            statements.append(f"REVOKE SELECT ON TABLE {name} FROM {quote_principal(principal)}")
-        if "ALL_PRIVILEGES" in privileges:
-            statements.append(revoke_all_statement(view.full_name, principal))
+        try:
+            if "SELECT" in privileges:
+                statements.append(
+                    f"REVOKE SELECT ON TABLE {name} FROM {quote_principal(principal)}"
+                )
+            if "ALL_PRIVILEGES" in privileges:
+                statements.append(revoke_all_statement(view.full_name, principal))
+        except ValueError:
+            say(
+                f"    fail-safe: NOT CLOSED for {principal!r} on {view.full_name}: revoke it by hand"
+            )
+            continue
         for statement in statements:
             _run_noted(
                 session,

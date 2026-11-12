@@ -42,7 +42,7 @@ pytestmark = [
     pytest.mark.skipif(runner.tofu_path() is None, reason="tofu binary not installed"),
 ]
 
-VIEW = "main.sales.orders_metrics"
+VIEW = "main.sales.orders_semantic_model"
 SEMANTICS: Dict[str, Any] = {
     "name": "orders_metrics",
     "description": "Orders, as the shop counts them.",
@@ -108,7 +108,7 @@ def test_apply_creates_the_metric_view_and_a_second_apply_changes_nothing(worksp
     assert view["properties"]["fluid.product_id"] == "dbx.fake.orders"
     assert view["comment"] == "Orders, as the shop counts them."
     assert fake.grants[("table", VIEW)] == {"analysts": ["SELECT"], "bi": ["SELECT"]}
-    assert "done: create metric view main.sales.orders_metrics" in out
+    assert "done: create metric view main.sales.orders_semantic_model" in out
     assert "MEASURE(revenue) / NULLIF(MEASURE(orders), 0)" in view["view_definition"]
 
     before = len(fake.sql_log)
@@ -122,7 +122,7 @@ def test_dry_run_prints_the_metric_view_and_runs_nothing(workspace, fake, capfd)
     rc, out = apply_contract(capfd, write_contract(workspace, _contract()), "--mode", "dry-run")
     assert rc == 0, out
     assert "Unity Catalog metric views (run on the SQL warehouse after tofu apply)" in out
-    assert "CREATE VIEW `main`.`sales`.`orders_metrics` WITH METRICS LANGUAGE YAML" in out
+    assert "CREATE VIEW `main`.`sales`.`orders_semantic_model` WITH METRICS LANGUAGE YAML" in out
     assert "after apply: grant SELECT to analysts" in out
     assert "dry-run: none of these statements ran." in out
     assert VIEW not in fake.tables and _view_statements(fake) == []
@@ -134,7 +134,7 @@ def test_dropping_the_semantics_drops_the_view(workspace, fake, capfd):
     rc, out = apply_contract(capfd, write_contract(workspace, _contract(None)))
     assert rc == 0, out
     assert VIEW not in fake.tables
-    assert "dropped metric view main.sales.orders_metrics" in out
+    assert "dropped metric view main.sales.orders_semantic_model" in out
 
 
 def test_validate_refuses_what_the_yaml_cannot_express(workspace, fake, capfd):

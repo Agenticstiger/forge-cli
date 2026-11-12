@@ -1450,6 +1450,7 @@ class FakeDatabricks:
         a("GET", r"/api/2\.1/unity-catalog/functions/([^/]+)", self._get_function)
         a("GET", r"/api/2\.1/unity-catalog/functions", self._list_functions)
         a("GET", r"/api/2\.1/unity-catalog/tables", self._list_tables)
+        a("GET", r"/api/2\.1/unity-catalog/table-summaries", self._table_summaries)
         a("GET", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._get_table)
         a("DELETE", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._delete_table)
         a("GET", r"/api/2\.1/unity-catalog/permissions/([a-z_]+)/([^/]+)", self._get_perms)
@@ -1938,6 +1939,25 @@ class FakeDatabricks:
             }
             self.genie_acl[space_id] = {}
         return space_id
+
+    def _table_summaries(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        """ListTableSummaries: every table of a catalog, ``table_name_pattern`` a SQL LIKE."""
+        cat = (q.get("catalog_name") or [""])[0]
+        like = (q.get("table_name_pattern") or ["%"])[0]
+        rx = re.compile(
+            "^"
+            + "".join(".*" if c == "%" else "." if c == "_" else re.escape(c) for c in like)
+            + "$"
+        )
+        names = sorted(
+            n for n in self.tables if n.split(".")[0] == cat and rx.match(n.split(".")[2])
+        )
+        return 200, self._page(
+            names,
+            q,
+            "tables",
+            lambda n: {"full_name": n, "table_type": self.tables[n].get("table_type")},
+        )
 
     def _page(
         self, names: List[str], q: Any, key: str, row: Callable[[str], Any]
