@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fluid_build.llm_providers` plugins, each shown with the model plan forge would use. An
   unknown name is refused with the built-in names, as `fluid forge --llm-provider` refuses it;
   the flag used to list five hard-coded names. The docs noted the exit in 0.18.1; it was still
-  there in 0.28.0.
+  there in 0.29.0.
 - **Receipt run ids no longer repeat in one process.** `generate_run_id`, the `run_id` of
   `.fluid/init-receipt.json` and `forge-receipt.json`, paired a millisecond timestamp with 32
   random bits, so ids made in the same millisecond could collide by the birthday bound: 1000 ids
@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process never repeat and always increase, also when the clock steps back, and a forked child
   starts its own sequence. The format is unchanged (`<11 hex digits>-<8 hex digits>`), and
   nothing in forge parses it.
+
+## [0.29.0] — 2026-11-12
 
 ### Added
 
@@ -100,9 +102,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **With no provider selected, forge stops instead of using gemini.** It used to send
   `FLUID_LLM_API_KEY` to Google whatever key it was, and with two provider keys set it asked for
   a gemini key. It now fails with `copilot_no_llm_provider` and says why (nothing configured,
-  several keys, a key that names no provider, or a `fluid ai setup` choice that the command does
-  not read), in the words `fluid doctor` shows. Pass `--llm-provider`, or set
-  `FLUID_LLM_PROVIDER` or the key of exactly one provider.
+  several keys, a key that names no provider, or a saved coding agent the run passes over), in
+  the words `fluid doctor` shows. Pass `--llm-provider`, or set `FLUID_LLM_PROVIDER` or the key
+  of exactly one provider.
+- **Runs without a terminal use the saved `fluid ai setup` choice.** Only the interactive setup
+  applied it before, so `fluid doctor`, which read it, and forge disagreed. Selection now walks one
+  order, and `fluid doctor` uses the same function: a named provider (`--llm-provider`,
+  `FLUID_LLM_PROVIDER`, `FLUID_FORGE_AGENT`), then exactly one key variable, then the saved
+  choice, then exactly one keyring key, then a local Ollama or, with nothing configured and no
+  terminal, the first coding-agent CLI on `PATH`. The saved model and Ollama host fill only what
+  the run does not state, and the environment's `OLLAMA_HOST` wins over the saved host. A run that
+  names its provider takes nothing from the saved choice. The saved `endpoint` is not applied:
+  state it with `--llm-endpoint` or `FLUID_LLM_ENDPOINT`. A saved coding agent is passed over
+  where the auto-pick is (a stated endpoint or model, or the agent loop), and saved names go
+  through the provider registry, so a hand-written `claude` counts as `anthropic`.
 - **`LlmProvider.list_available_models` takes an `endpoint` keyword**, the address the call will
   go to, passed only when the operator states one. A provider plugin that overrides the method
   with the two-argument signature keeps working until an endpoint is stated.
@@ -168,6 +181,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a model the endpoint has. All three now ask the stated endpoint. A `--tiered` stage now
   calls a stated endpoint too, as the routing model already did; it called the provider's
   default address instead.
+- **`fluid forge --agent` stdout carries only the JSON-Lines events.** `AGENT_IDE.md` promises one
+  JSON object per line, but in blank mode 28 of 32 stdout lines were Rich panels. Everything meant
+  for a person now goes to stderr, including the install hint for a missing extra.
+- **`fluid mission run` no longer picks a coding agent it cannot use.** A mission always runs the
+  tool-use loop, but it auto-picked a coding agent and then failed mid-run with
+  `NotImplementedError`. It now resolves its LLM as an agent-loop run.
 
 ### Security
 
