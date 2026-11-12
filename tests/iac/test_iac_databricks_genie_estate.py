@@ -27,7 +27,6 @@ import pytest
 
 from fluid_build.cli import genie as genie_cli
 from fluid_build.cli._common import CLIError
-from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.providers import databricks as dbx
 from fluid_build.iac.providers import databricks_enforce
 from fluid_build.iac.providers import databricks_genie as genie
