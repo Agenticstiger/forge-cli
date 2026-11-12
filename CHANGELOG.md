@@ -53,27 +53,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Databricks: a Unity Catalog metric view from each expose's `semantics` block.** `fluid apply`
   creates `<catalog>.<schema>.<table>_semantic_model` beside the table, in the product's own
-  schema, as metric view YAML 1.1, so Genie, AI/BI
-  dashboards and SQL (`SELECT country_code, MEASURE(site_count) ... GROUP BY ALL`) read the
-  contract's semantic model natively. Entities and dimensions become dimensions (an entity as
-  its key column, a time dimension at its `timeGranularity`); a measure is its aggregate; a simple metric is that
+  schema, as metric view YAML 1.1, so Genie, AI/BI dashboards and SQL
+  (`SELECT country_code, MEASURE(site_count) ... GROUP BY ALL`) read the contract's semantic model
+  natively. Entities and dimensions become dimensions (an entity as its key column, a time
+  dimension at its `timeGranularity`); a measure is its aggregate; a simple metric is that
   aggregate with its filter as `FILTER (WHERE ...)`; a ratio is `MEASURE(numerator) /
   NULLIF(MEASURE(denominator), 0)`; a `nonAdditiveDimension` is a window measure
   (`semiadditive: last` for `max`, `first` for `min`). Descriptions become comments, a column's
   `businessName` the dimension's `display_name` and its `labels.synonyms` its synonyms; the
-  model's `ai-synonyms` and `ai-instructions` labels go into the view's comment. `SELECT` on the
-  view goes to exactly the principals that may read the table (revokes first, before the apply).
-  The provider has no metric view
-  resource (terraform-provider-databricks#4827), so the view is created on the SQL warehouse after
-  `tofu apply`, like the column masks: `CREATE VIEW` when it is missing, `ALTER VIEW ... AS` (which
-  keeps its grants) when its definition changed, nothing when it did not, and `DROP VIEW`, before
-  the apply, once the contract no longer declares it (in the schemas its tables are in, so another
-  environment of the product keeps its own).
-  `--mode dry-run` prints every statement. What metric view YAML
-  cannot express is refused at `fluid validate`, not approximated: derived metrics, a ratio with
-  a filter, a non-additive dimension that is no time dimension, `hour` or `minute` on a `DATE`,
-  colliding names. Verified live on Databricks Free Edition with the semantics block of an
-  industry-model gold product (`HONESTLY_TESTED.md`).
+  model's `ai-synonyms` and `ai-instructions` labels go into the view's comment. Reading the view
+  is exactly the principals that may read the table: `SELECT` granted to them, revoked from
+  anyone else, revokes first and before the apply. The provider has no metric view resource
+  (terraform-provider-databricks#4827), so the view is created on the SQL warehouse after
+  `tofu apply`, like the column masks: `CREATE VIEW` when it is missing, `ALTER VIEW ... AS`
+  (which keeps its grants) when its definition changed, nothing when it did not, and
+  `DROP VIEW`, before the apply, once the contract no longer declares it (in the schemas its
+  tables are in, so another environment of the product keeps its own). `--mode dry-run` prints
+  every statement. What metric view YAML cannot express is refused at `fluid validate`, not
+  approximated: derived metrics, a ratio with a filter, a non-additive dimension that is no time
+  dimension, `hour` or `minute` on a `DATE`, colliding names, a name that is no column, and
+  calls that would lend the view owner's rights to its readers. Verified live on Databricks Free
+  Edition with the semantics block of an industry-model gold product (`HONESTLY_TESTED.md`).
 
 ### Changed
 
