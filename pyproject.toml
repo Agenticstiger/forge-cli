@@ -659,6 +659,8 @@ fluid_build = [
   "policy/data/cloud_regions/*.md",
   "copilot/**/*.yaml",
   "copilot/**/*.md",
+  # The Agent Skills pack: `fluid scaffold-ide` copies these into a workspace.
+  "agent_skills/skills/**/*",
   "schemas/**/*.json",
   "schemas/**/*.yaml",
   "templates/**/*",
