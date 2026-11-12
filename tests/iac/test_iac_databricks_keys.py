@@ -955,3 +955,18 @@ def test_a_dropped_key_says_what_changed():
         "the contract now references geo.other_v1, and main.geo.sites is not one of its tables"
         in drop.what
     )
+
+
+def test_a_key_is_not_moved_to_a_sibling_on_a_partial_view_of_its_product():
+    # main.geo.sites (the live parent) could not be read; main.geo.sites2 could and has the
+    # same primary key. The key stays on sites rather than move to sites2.
+    k = _keys(TestResolve.REF)
+    live = _live(_pk("fluid_pk_tickets", "ticket_id"), _fk("fluid_fk_tickets__site_id", "site_id"))
+    cands = {SITES: [keys.Candidate("main.geo.sites2", ("site_id",))]}
+    fks = keys.foreign_keys(k, cands)
+    assert fks[0].parent == "main.geo.sites2"
+    plan = keys.plan_table("main.ops.tickets", k, fks, live, candidates=cands, unknown={SITES})
+    assert plan.fk_drops == [] and plan.fk_adds == []
+    assert (
+        "is kept on main.geo.sites: not every table of geo.sites_v1 could be read" in plan.notes[0]
+    )

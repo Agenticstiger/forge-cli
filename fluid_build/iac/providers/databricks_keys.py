@@ -622,6 +622,15 @@ def plan_table(
                 )
                 del wanted[fk.columns]
             continue
+        if want is not None and _product(fk, keys) in unknown:
+            # Not every table of its product could be read, so ``want`` is a guess from part of
+            # them: the key stays where it is rather than move to a sibling of its parent.
+            del wanted[fk.columns]
+            plan.notes.append(
+                f"foreign key ({', '.join(fk.columns)}) is kept on {fk.parent}: not every table "
+                f"of {_product(fk, keys)} could be read, so it is not moved to {want.parent}."
+            )
+            continue
         why = (
             "its parent changed" if want is not None else _stale(fk, keys, fks, candidates, unknown)
         )
@@ -631,6 +640,13 @@ def plan_table(
     for fk in wanted.values():
         plan.fk_adds.append(Step(fk.describe(), foreign_key_statement(full_name, fk)))
     return plan
+
+
+def _product(fk: ForeignKey, keys: Optional[TableKeys]) -> Optional[str]:
+    """The one product a foreign key's columns reference now, or ``None``."""
+    refs = {r.column: r.product for r in keys.references} if keys is not None else {}
+    products = {refs.get(c) for c in fk.columns}
+    return next(iter(products)) if len(products) == 1 else None
 
 
 def _stale(
