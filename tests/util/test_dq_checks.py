@@ -209,6 +209,19 @@ class TestTypes:
         assert "its own history" in _refused(_rule(kind, "*"))
 
 
+class TestTheRuleAsWritten:
+    def test_each_check_keeps_the_rules_severity_threshold_and_operator(self):
+        check = _one(_rule("completeness", "site_id", severity="critical", threshold=1.0))
+        assert (check.severity, check.rule_severity) == ("error", "critical")
+        assert (check.rule_threshold, check.rule_operator) == (1.0, None)
+        check = _one(_rule("completeness", "site_id", threshold=0.95, operator=">"))
+        assert (check.rule_threshold, check.rule_operator, check.share) == (0.95, ">", (">", 0.95))
+
+    def test_a_freshness_check_has_no_threshold(self):
+        check = _one(_rule("freshness", "_ingested_at", window="PT1H", severity="info"))
+        assert (check.rule_severity, check.rule_threshold) == ("info", None)
+
+
 class TestShares:
     def test_every_row_when_the_threshold_is_one(self):
         assert _one(_rule("completeness", "site_id", threshold=1.0, operator="==")).share is None

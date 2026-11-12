@@ -122,6 +122,12 @@ class DqCheck:
     strict: bool = False
     #: ``schema``: ``(column, FLUID type)`` for each column that must exist.
     columns: Tuple[Tuple[str, str], ...] = ()
+    #: The rule as written, for an engine with more levels than two (Lakeflow fails an
+    #: update on ``critical`` and drops the row on ``error``) or a report with one row per
+    #: rule: its ``severity`` (lower case), ``threshold`` and ``operator``.
+    rule_severity: str = ""
+    rule_threshold: Optional[float] = None
+    rule_operator: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -320,6 +326,9 @@ class _Rule:
                     rule_type=self.type,
                     expose_id=self.expose_id,
                     severity=severity,
+                    rule_severity=str(self.rule.get("severity") or "").strip().lower(),
+                    rule_threshold=self._number_or_none(self.rule.get("threshold")),
+                    rule_operator=self._operator_or_none(),
                     **item,
                 )
             )
@@ -481,6 +490,16 @@ class _Rule:
             return name
         folded = [c for c in self.columns if c.lower() == name.lower()]
         return folded[0] if len(folded) == 1 else None
+
+    @staticmethod
+    def _number_or_none(value: Any) -> Optional[float]:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    def _operator_or_none(self) -> Optional[str]:
+        raw = self.rule.get("operator")
+        return str(raw).strip() if raw is not None else None
 
     def _operator(self) -> Optional[str]:
         operator = str(self.rule.get("operator") or ">=").strip()
