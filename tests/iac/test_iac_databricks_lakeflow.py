@@ -805,3 +805,14 @@ def test_verify_says_a_missing_pipeline_table_comes_from_an_update():
     assert "amend-and-build" in str(said)
     plain = _severity(diff, None, None, missing_table="c.s.t")
     assert "Run fluid apply to create it" in str(plain)
+
+
+def test_a_reference_to_a_product_not_in_consumes_resolves_through_the_workspace(tmp_path):
+    """The rule reader names no expose for a product consumes[] does not list (a
+    source-aligned product consumes nothing): its one Databricks table with the column is the
+    one the check reads."""
+    contract = _edit(c=lambda c: c.pop("consumes"))
+    sql = _sql(_compile(contract, tmp_path))
+    view = sql.split("`capacity__capacity_site_ref`", 1)[1].split(";", 1)[0]
+    assert "LEFT JOIN" in view
+    assert "`fluid_iactest_ldp`.`bronze_sites`.`sites`" in view

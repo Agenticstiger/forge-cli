@@ -20,8 +20,8 @@ How each rule type reads:
   ``validationRules`` (``enum`` ``"A | B"`` or ``"A,B"``; ``regex``; ``range`` ``">= 0"``,
   ``">= 0 and <= 100"`` or ``"between 0 and 100"``) or as its
   ``labels.references: <product id>.<column>``, the foreign-key convention the Unity Catalog
-  keys read too, naming a product this one lists in ``consumes[]``. Each declaration is a
-  check. A column with none falls back to values the rule itself lists (``"<column> valid
+  keys read too; ``consumes[]`` says which of that product's exposes holds the column. Each
+  declaration is a check. A column with none falls back to values the rule itself lists (``"<column> valid
   values: A, B."`` in its description, as ``fluid test`` reads it); with neither, the rule is
   refused.
 * ``accuracy``: every value of each selected column meets ``<operator> <threshold>``, the bound
@@ -82,11 +82,11 @@ _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 @dataclass(frozen=True)
 class Reference:
-    """Where a value must exist: ``column`` of the table ``expose_id`` of ``product_id``, a
-    product the contract consumes."""
+    """Where a value must exist: ``column`` of a table of ``product_id``. ``expose_id`` is the
+    expose ``consumes[]`` lists that product by, or ``None`` when it does not list it."""
 
     product_id: str
-    expose_id: str
+    expose_id: Optional[str]
     column: str
 
 
@@ -153,38 +153,36 @@ def read_rules(contract: Mapping[str, Any], exposes: Sequence[Mapping[str, Any]]
     product = str(contract.get("id") or "")
     taken: Set[str] = set()
     for exposure in exposes:
-        expose_id = str(exposure.get("exposeId") or "")
-        spec = exposure.get("contract")
-        spec = spec if isinstance(spec, Mapping) else {}
-        dq = spec.get("dq")
-        dq = dq if isinstance(dq, Mapping) else {}
-        columns = [
-            c
-            for c in spec.get("schema") or []
-            if isinstance(c, Mapping) and isinstance(c.get("name"), str) and c["name"]
-        ]
-        for rule in dq.get("rules") or []:
-            if not isinstance(rule, Mapping):
-                continue
+        expose_id, columns, rules = _parts(exposure)
+        for rule in rules:
             reader = _Rule(rule, expose_id, columns, consumes, product)
             checks = reader.read()
-            if reader.refusals:
-                out.refusals.extend(reader.refusals)
-                continue
-            for check in checks:
-                out.checks.append(_unique(check, taken))
+            out.refusals.extend(reader.refusals)
+            out.checks.extend(_unique(check, taken) for check in checks)
     return out
 
 
 def has_rules(exposes: Sequence[Mapping[str, Any]]) -> bool:
     """Whether any of ``exposes`` declares a ``contract.dq.rules[]`` entry."""
-    for exposure in exposes:
-        spec = exposure.get("contract") if isinstance(exposure, Mapping) else None
-        dq = spec.get("dq") if isinstance(spec, Mapping) else None
-        rules = dq.get("rules") if isinstance(dq, Mapping) else None
-        if isinstance(rules, list) and any(isinstance(r, Mapping) for r in rules):
-            return True
-    return False
+    return any(_parts(exposure)[2] for exposure in exposes if isinstance(exposure, Mapping))
+
+
+def _parts(
+    exposure: Mapping[str, Any]
+) -> Tuple[str, List[Mapping[str, Any]], List[Mapping[str, Any]]]:
+    """An expose's id, its named schema columns and its DQ rules."""
+    spec = exposure.get("contract")
+    spec = spec if isinstance(spec, Mapping) else {}
+    dq = spec.get("dq")
+    dq = dq if isinstance(dq, Mapping) else {}
+    columns = [
+        c
+        for c in spec.get("schema") or []
+        if isinstance(c, Mapping) and isinstance(c.get("name"), str) and c["name"]
+    ]
+    rules = dq.get("rules")
+    rules = [r for r in rules if isinstance(r, Mapping)] if isinstance(rules, list) else []
+    return str(exposure.get("exposeId") or ""), columns, rules
 
 
 def _base_name(rule_id: str) -> str:
@@ -518,60 +516,68 @@ class _Rule:
         return (operator, value)
 
     def _allowed(self, name: str) -> Optional[List[Dict[str, Any]]]:
-        """What column ``name`` declares as its allowed values; ``None`` after a refusal."""
+        """What column ``name`` declares as its allowed values; ``None`` after a refusal.
+        A ``custom`` validationRule is no allowed-values declaration and is left alone."""
         column = self.columns[name]
-        found: List[Dict[str, Any]] = []
         refused = len(self.refusals)
+        readers = {"enum": self._enum, "regex": self._regex, "range": self._range}
+        found: List[Dict[str, Any]] = []
         rules = column.get("validationRules")
         for entry in rules if isinstance(rules, list) else []:
-            if not isinstance(entry, Mapping):
-                continue
-            kind = str(entry.get("type") or "").strip().lower()
-            constraint = entry.get("constraint")
-            if kind == "enum":
-                values = parse_enum(constraint)
-                if not values:
-                    self.refuse(
-                        f"reads column {name!r}, whose enum validationRule lists no value",
-                        "Write the values as the constraint: 'A | B | C'.",
-                    )
-                elif any(_CONTROL_RE.search(v) for v in values):
-                    self.refuse(
-                        f"reads column {name!r}, whose enum holds a control character",
-                        "Remove it from the value.",
-                    )
-                else:
-                    found.append({"kind": "accepted_values", "values": tuple(values)})
-            elif kind == "regex":
-                if not isinstance(constraint, str) or not constraint:
-                    self.refuse(
-                        f"reads column {name!r}, whose regex validationRule has no pattern",
-                        "Write the pattern as the constraint: '^[A-Z]{2}$'.",
-                    )
-                elif _CONTROL_RE.search(constraint):
-                    self.refuse(
-                        f"reads column {name!r}, whose regex holds a control character",
-                        "Write it with an escape (\\t, \\n) instead.",
-                    )
-                else:
-                    found.append({"kind": "regex", "pattern": constraint})
-            elif kind == "range":
-                bounds = parse_range(constraint)
-                if bounds is None:
-                    self.refuse(
-                        f"reads column {name!r}, whose range {constraint!r} is not '>= 0', "
-                        "'>= 0 and <= 100' or 'between 0 and 100'",
-                        "Write the range in one of those forms.",
-                    )
-                else:
-                    found.append({"kind": "bounds", "bounds": bounds})
+            kind = (
+                str(entry.get("type") or "").strip().lower() if isinstance(entry, Mapping) else ""
+            )
+            item = readers[kind](name, entry.get("constraint")) if kind in readers else None
+            if item is not None:
+                found.append(item)
         labels = column.get("labels")
         target = labels.get("references") if isinstance(labels, Mapping) else None
-        if target is not None:
-            reference = self._reference(name, target)
-            if reference is not None:
-                found.append({"kind": "reference", "reference": reference})
+        reference = self._reference(name, target) if target is not None else None
+        if reference is not None:
+            found.append({"kind": "reference", "reference": reference})
         return None if len(self.refusals) > refused else found
+
+    def _enum(self, name: str, constraint: Any) -> Optional[Dict[str, Any]]:
+        values = parse_enum(constraint)
+        if not values:
+            self.refuse(
+                f"reads column {name!r}, whose enum validationRule lists no value",
+                "Write the values as the constraint: 'A | B | C'.",
+            )
+        elif any(_CONTROL_RE.search(v) for v in values):
+            self.refuse(
+                f"reads column {name!r}, whose enum holds a control character",
+                "Remove it from the value.",
+            )
+        else:
+            return {"kind": "accepted_values", "values": tuple(values)}
+        return None
+
+    def _regex(self, name: str, constraint: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(constraint, str) or not constraint:
+            self.refuse(
+                f"reads column {name!r}, whose regex validationRule has no pattern",
+                "Write the pattern as the constraint: '^[A-Z]{2}$'.",
+            )
+        elif _CONTROL_RE.search(constraint):
+            self.refuse(
+                f"reads column {name!r}, whose regex holds a control character",
+                "Write it with an escape (\\t, \\n) instead.",
+            )
+        else:
+            return {"kind": "regex", "pattern": constraint}
+        return None
+
+    def _range(self, name: str, constraint: Any) -> Optional[Dict[str, Any]]:
+        bounds = parse_range(constraint)
+        if bounds is not None:
+            return {"kind": "bounds", "bounds": bounds}
+        self.refuse(
+            f"reads column {name!r}, whose range {constraint!r} is not '>= 0', "
+            "'>= 0 and <= 100' or 'between 0 and 100'",
+            "Write the range in one of those forms.",
+        )
+        return None
 
     def _listed_values(self, name: str) -> List[Dict[str, Any]]:
         """Values the rule itself lists, for a column that declares none; a refusal when the
@@ -585,7 +591,7 @@ class _Rule:
             f"reads column {name!r}, which declares no allowed values, and the rule lists none",
             f"Declare them on column {name!r}: validationRules [{{type: enum, constraint: "
             "'A | B'}] (or regex, or range), or labels.references: <product id>.<column> for "
-            "a value that must exist in a product this one consumes.",
+            "a value that must exist in another product's column.",
         )
         return []
 
@@ -613,25 +619,18 @@ class _Rule:
                 if c.get("productId") == product_id and c.get("exposeId")
             }
         )
-        if len(exposes) != 1:
-            listed = any(c.get("productId") == product_id for c in self.consumes)
-            why = (
-                f"consumes[] lists {product_id} by {len(exposes)} exposes, so which table holds "
-                "the column is ambiguous"
-                if listed and exposes
-                else (
-                    f"consumes[] lists {product_id} with no exposeId"
-                    if listed
-                    else f"consumes[] does not list {product_id}, so its table is unknown"
-                )
-            )
+        if len(exposes) > 1:
             self.refuse(
-                f"reads column {name!r}, which references {text!r}; {why}",
+                f"reads column {name!r}, which references {text!r}, and consumes[] lists "
+                f"{product_id} by {len(exposes)} exposes ({', '.join(exposes)}), so which table "
+                "holds the column is ambiguous",
                 f"List {product_id} in consumes[] once, with the exposeId of the table that "
                 f"holds {column}.",
             )
             return None
-        return Reference(product_id, exposes[0], column)
+        # Not consumed (a source-aligned product consumes nothing): an engine that finds the
+        # product's table another way can still check it; one that cannot refuses.
+        return Reference(product_id, exposes[0] if exposes else None, column)
 
     def refuse(self, problem: str, fix: str) -> None:
         self.refusals.append(
