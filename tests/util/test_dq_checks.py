@@ -13,10 +13,9 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+from fluid_build.providers.quality_engine import value_domain
 from fluid_build.util.dq_checks import (
     Reference,
-    parse_enum,
-    parse_range,
     read_rules,
 )
 
@@ -73,6 +72,16 @@ def _rule(type_: str, selector: str = "tenancy_id", **fields: Any) -> Dict[str, 
     return {"id": f"r_{type_}", "type": type_, "selector": selector, "severity": "error", **fields}
 
 
+def _with_column(column: Dict[str, Any], **fields: Any):
+    """The checks of one valid_values rule on a product whose only column is ``column``."""
+    rule = _rule("valid_values", column["name"], **fields)
+    contract = {
+        "id": "p",
+        "exposes": [{"exposeId": "t", "contract": {"schema": [column], "dq": {"rules": [rule]}}}],
+    }
+    return read_rules(contract, contract["exposes"])
+
+
 def _one(*rules: Dict[str, Any], **kwargs: Any):
     read = _read(*rules, **kwargs)
     assert not read.refusals, [r.message for r in read.refusals]
@@ -127,6 +136,30 @@ class TestTypes:
         assert check.kind == "reference"
         assert check.reference == Reference("bronze.asset.site_master_v1", "site_master", "site_id")
         assert check.severity == "warn"
+
+    def test_the_values_the_rule_lists_win_over_the_columns_as_fluid_test_reads_them(self):
+        # providers/quality_engine.py::value_domain: the rule's own list, else the column
+        # (grid_kwh declares a range, which then does not apply).
+        rule = _rule("valid_values", "grid_kwh", description="grid_kwh valid values: 1, 2.")
+        assert value_domain(rule, COLUMNS) == value_domain(rule)
+        check = _one(rule)
+        assert (check.kind, check.values) == ("accepted_values", ("1", "2"))
+
+    def test_an_enum_splits_on_pipes_and_commas_alike(self):
+        column = {"name": "code", "type": "STRING"}
+        column["validationRules"] = [{"type": "enum", "constraint": "A | B, C"}]
+        (check,) = _with_column(column).checks
+        assert check.values == ("A", "B", "C") == value_domain(_rule("x", "code"), [column]).values
+
+    def test_only_the_first_declaration_of_a_kind_counts_as_in_fluid_test(self):
+        column = {"name": "code", "type": "STRING"}
+        column["validationRules"] = [
+            {"type": "regex", "constraint": "  "},  # no pattern: passed over
+            {"type": "regex", "constraint": "^[A-Z]+$"},
+            {"type": "regex", "constraint": "^[0-9]+$"},
+        ]
+        (check,) = _with_column(column).checks
+        assert (check.kind, check.pattern) == ("regex", "^[A-Z]+$")
 
     def test_valid_values_falls_back_to_values_the_description_lists(self):
         check = _one(
@@ -312,12 +345,6 @@ class TestNames:
         assert check.name == "site_id_check"
 
 
-def test_parse_enum_reads_pipes_or_commas():
-    assert parse_enum("A | B |C") == ["A", "B", "C"]
-    assert parse_enum("A,B") == ["A", "B"]
-    assert parse_enum(None) == []
-
-
 @pytest.mark.parametrize(
     "text, bounds",
     [
@@ -329,5 +356,12 @@ def test_parse_enum_reads_pipes_or_commas():
         (">= " + "9" * 400, None),
     ],
 )
-def test_parse_range(text, bounds):
-    assert parse_range(text) == bounds
+def test_a_range_reads_as_fluid_test_reads_it_or_is_refused(text, bounds):
+    column = {"name": "n", "type": "DOUBLE"}
+    column["validationRules"] = [{"type": "range", "constraint": text}]
+    read = _with_column(column)
+    if bounds is None:  # fluid test passes such a range over; here it is refused, with the fix
+        assert not read.checks and "is not '>= 0'" in read.refusals[0].message
+    else:
+        assert [check.bounds for check in read.checks] == [bounds]
+        assert value_domain(_rule("x", "n"), [column]).bounds == bounds

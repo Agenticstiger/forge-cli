@@ -16,14 +16,14 @@ How each rule type reads:
   comma-separated; each gets its own check.
 * ``uniqueness``: ``unique`` on the one selected column. A list is refused: it could mean each
   column or their combination, and ``fluid test`` reads one column too.
-* ``valid_values``: the allowed values live on each selected column, as its
-  ``validationRules`` (``enum`` ``"A | B"`` or ``"A,B"``; ``regex``; ``range`` ``">= 0"``,
-  ``">= 0 and <= 100"`` or ``"between 0 and 100"``) or as its
-  ``labels.references: <product id>.<column>``, the foreign-key convention the Unity Catalog
-  keys read too; ``consumes[]`` says which of that product's exposes holds the column. Each
-  declaration is a check. A column with none falls back to values the rule itself lists (``"<column> valid
-  values: A, B."`` in its description, as ``fluid test`` reads it); with neither, the rule is
-  refused.
+* ``valid_values``: a valid value of each selected column is what ``fluid test`` takes it
+  to be (``providers/quality_engine.py::value_domain``): the values the rule itself lists
+  (``"<column> valid values: A, B."`` in its description), or else every declaration the
+  column makes, which must all hold: its first ``enum`` (``"A | B"`` or ``"A,B"``), ``regex``
+  and ``range`` (``">= 0"``, ``">= 0 and <= 100"`` or ``"between 0 and 100"``)
+  validationRule, and its ``labels.references: <product id>.<column>``, the foreign-key
+  convention the Unity Catalog keys read too; ``consumes[]`` says which of that product's
+  exposes holds the column. Each is a check. With none, the rule is refused.
 * ``accuracy``: every value of each selected column meets ``<operator> <threshold>``, the bound
   ``fluid test`` checks (``providers/quality_engine.py::_check_accuracy``).
 * ``freshness``: the newest value of the one selected date or timestamp column is no older than
@@ -74,10 +74,6 @@ KINDS = (
 #: The base types a freshness check can measure.
 _TEMPORAL = ("date", "datetime", "smalldatetime", "timestamp")
 
-_NUMBER = r"-?\d+(?:\.\d+)?"
-_BETWEEN_RE = re.compile(rf"^\s*between\s+({_NUMBER})\s+and\s+({_NUMBER})\s*$", re.IGNORECASE)
-_BOUND_RE = re.compile(rf"^\s*(>=|<=|>|<)\s*({_NUMBER})\s*$")
-_AND_RE = re.compile(r"\s+and\s+", re.IGNORECASE)
 _NAME_RE = re.compile(r"[^0-9a-z_]+")
 #: A control character, or a UTF-16 surrogate with no partner (YAML's "\ud83d" escape
 #: loads one), which no UTF-8 file can hold: refused wherever a rule's text reaches a check.
@@ -246,34 +242,19 @@ def _number(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else repr(float(value))
 
 
-def parse_enum(constraint: Any) -> List[str]:
-    """An ``enum`` constraint's values: ``"A | B"`` (as the industry packs write it) or
-    ``"A,B"`` (as ``fluid import dbt`` writes it), each stripped, empty ones dropped."""
-    if not isinstance(constraint, str):
-        return []
-    parts = constraint.split("|") if "|" in constraint else constraint.split(",")
-    return [part.strip() for part in parts if part.strip()]
-
-
-def parse_range(constraint: Any) -> Optional[Tuple[Tuple[str, float], ...]]:
-    """A ``range`` constraint's bounds, or ``None`` when it is not one of ``">= 0"``,
-    ``">= 0 and <= 100"`` (any of ``>= > <= <``) or ``"between 0 and 100"``."""
-    if not isinstance(constraint, str) or not constraint.strip():
-        return None
-    between = _BETWEEN_RE.match(constraint)
-    if between is not None:
-        pairs = [(">=", between.group(1)), ("<=", between.group(2))]
-    else:
-        pairs = []
-        for part in _AND_RE.split(constraint.strip()):
-            match = _BOUND_RE.match(part)
-            if match is None:
-                return None
-            pairs.append((match.group(1), match.group(2)))
-    bounds = [(op, float(text)) for op, text in pairs]
-    if not all(math.isfinite(value) for _op, value in bounds):
-        return None  # digits past a float's range
-    return tuple(bounds)
+def _declared(column: Mapping[str, Any], kind: str) -> Optional[str]:
+    """The constraint of the column's first ``kind`` validationRule, as ``fluid test`` picks
+    it (``providers/quality_engine.py::_column_constraint``)."""
+    rules = column.get("validationRules")
+    for entry in rules if isinstance(rules, list) else []:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("type") or "").strip().lower() != kind:
+            continue
+        constraint = entry.get("constraint")
+        if isinstance(constraint, str) and constraint.strip():
+            return constraint.strip()
+    return None
 
 
 def describe(check: DqCheck) -> str:
@@ -400,12 +381,7 @@ class _Rule:
         share = self._share()
         found: List[Dict[str, Any]] = []
         for name in columns:
-            declared = self._allowed(name)
-            if declared is None:  # refused
-                continue
-            if not declared:
-                declared = self._listed_values(name)
-            for item in declared:
+            for item in self._allowed(name) or []:
                 found.append({**item, "column": name, "share": share})
         return found
 
@@ -579,91 +555,88 @@ class _Rule:
         return (operator, value)
 
     def _allowed(self, name: str) -> Optional[List[Dict[str, Any]]]:
-        """What column ``name`` declares as its allowed values; ``None`` after a refusal.
-        A ``custom`` validationRule is no allowed-values declaration and is left alone."""
+        """What a valid value of column ``name`` is, read as ``fluid test`` reads it
+        (``providers/quality_engine.py::value_domain``), each part a check; ``None`` after a
+        refusal, which there is when neither the rule nor the column declares one. A
+        ``custom`` validationRule declares no allowed values."""
+        from fluid_build.providers.quality_engine import extract_valid_values, value_domain
+
+        rule = {**self.rule, "selector": name}
         column = self.columns[name]
         refused = len(self.refusals)
-        readers = {"enum": self._enum, "regex": self._regex, "range": self._range}
-        found: List[Dict[str, Any]] = []
-        rules = column.get("validationRules")
-        for entry in rules if isinstance(rules, list) else []:
-            kind = (
-                str(entry.get("type") or "").strip().lower() if isinstance(entry, Mapping) else ""
+        listed = extract_valid_values(rule)
+        if listed:  # the values the rule lists win, as value_domain has it
+            found = [self._values(name, listed)]
+        else:
+            domain = value_domain(rule, [column])
+            found = [
+                self._values(name, domain.values) if domain.values else None,
+                self._regex(name, domain.pattern) if domain.pattern else None,
+                self._range(name, _declared(column, "range"), domain.bounds),
+                self._labelled_reference(name, column),
+            ]
+        if len(self.refusals) > refused:
+            return None
+        declared = [item for item in found if item is not None]
+        if not declared:
+            self.refuse(
+                f"reads column {name!r}, which declares no allowed values, and the rule lists "
+                "none",
+                f"Declare them on column {name!r}: validationRules [{{type: enum, constraint: "
+                "'A | B'}] (or regex, or range), or labels.references: <product id>.<column> for "
+                "a value that must exist in another product's column.",
             )
-            item = readers[kind](name, entry.get("constraint")) if kind in readers else None
-            if item is not None:
-                found.append(item)
-        labels = column.get("labels")
-        target = labels.get("references") if isinstance(labels, Mapping) else None
-        reference = self._reference(name, target) if target is not None else None
-        if reference is not None:
-            found.append({"kind": "reference", "reference": reference})
-        return None if len(self.refusals) > refused else found
+            return None
+        return declared
 
-    def _enum(self, name: str, constraint: Any) -> Optional[Dict[str, Any]]:
-        values = parse_enum(constraint)
-        if not values:
+    def _values(self, name: str, values: Sequence[Any]) -> Optional[Dict[str, Any]]:
+        texts = tuple(str(value) for value in values)
+        if any(_CONTROL_RE.search(value) for value in texts):
             self.refuse(
-                f"reads column {name!r}, whose enum validationRule lists no value",
-                "Write the values as the constraint: 'A | B | C'.",
-            )
-        elif any(_CONTROL_RE.search(v) for v in values):
-            self.refuse(
-                f"reads column {name!r}, whose enum holds a control character",
+                f"reads column {name!r}, whose allowed values hold a control character or an "
+                "unpaired surrogate",
                 "Remove it from the value.",
             )
-        else:
-            return {"kind": "accepted_values", "values": tuple(values)}
-        return None
+            return None
+        return {"kind": "accepted_values", "values": texts}
 
-    def _regex(self, name: str, constraint: Any) -> Optional[Dict[str, Any]]:
-        if not isinstance(constraint, str) or not constraint:
-            self.refuse(
-                f"reads column {name!r}, whose regex validationRule has no pattern",
-                "Write the pattern as the constraint: '^[A-Z]{2}$'.",
-            )
-        elif _CONTROL_RE.search(constraint):
+    def _regex(self, name: str, pattern: str) -> Optional[Dict[str, Any]]:
+        if _CONTROL_RE.search(pattern):
             self.refuse(
                 f"reads column {name!r}, whose regex holds a control character or an unpaired "
                 "surrogate",
                 "Write it with an escape (\\t, \\n) instead.",
             )
-        else:
-            return {"kind": "regex", "pattern": constraint}
-        return None
+            return None
+        return {"kind": "regex", "pattern": pattern}
 
-    def _range(self, name: str, constraint: Any) -> Optional[Dict[str, Any]]:
-        bounds = parse_range(constraint)
-        if bounds is not None and _empty(bounds):
+    def _range(
+        self, name: str, constraint: Optional[str], bounds: Sequence[Tuple[str, float]]
+    ) -> Optional[Dict[str, Any]]:
+        """``bounds`` (``quality_engine.parse_range`` of ``constraint``), or the refusal of a
+        range ``fluid test`` cannot read, which it passes over, or that no value can meet."""
+        if constraint is None:
+            return None
+        if not bounds:
+            self.refuse(
+                f"reads column {name!r}, whose range {constraint!r} is not '>= 0', "
+                "'>= 0 and <= 100' or 'between 0 and 100'",
+                "Write the range in one of those forms.",
+            )
+            return None
+        if _empty(bounds):
             self.refuse(
                 f"reads column {name!r}, whose range {constraint!r} no value can meet",
                 "Write the lower bound first: 'between 0 and 100', '>= 0 and <= 100'.",
             )
             return None
-        if bounds is not None:
-            return {"kind": "bounds", "bounds": bounds}
-        self.refuse(
-            f"reads column {name!r}, whose range {constraint!r} is not '>= 0', "
-            "'>= 0 and <= 100' or 'between 0 and 100'",
-            "Write the range in one of those forms.",
-        )
-        return None
+        return {"kind": "bounds", "bounds": tuple(bounds)}
 
-    def _listed_values(self, name: str) -> List[Dict[str, Any]]:
-        """Values the rule itself lists, for a column that declares none; a refusal when the
-        rule lists none either."""
-        from fluid_build.engines.dbt._test_mapping import valid_values
-
-        values = [str(v).strip() for v in valid_values(self.rule) if str(v).strip()]
-        if values and not any(_CONTROL_RE.search(v) for v in values):
-            return [{"kind": "accepted_values", "values": tuple(values)}]
-        self.refuse(
-            f"reads column {name!r}, which declares no allowed values, and the rule lists none",
-            f"Declare them on column {name!r}: validationRules [{{type: enum, constraint: "
-            "'A | B'}] (or regex, or range), or labels.references: <product id>.<column> for "
-            "a value that must exist in another product's column.",
-        )
-        return []
+    def _labelled_reference(self, name: str, column: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        labels = column.get("labels")
+        target = labels.get("references") if isinstance(labels, Mapping) else None
+        reference = self._reference(name, target) if target is not None else None
+        return None if reference is None else {"kind": "reference", "reference": reference}
 
     def _reference(self, name: str, target: Any) -> Optional[Reference]:
         text = target.strip() if isinstance(target, str) else ""
@@ -725,7 +698,5 @@ __all__ = [
     "SEVERITIES",
     "describe",
     "has_rules",
-    "parse_enum",
-    "parse_range",
     "read_rules",
 ]
