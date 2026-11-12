@@ -24,6 +24,7 @@ was one candidate): that is the manual live tier.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
@@ -249,6 +250,31 @@ def test_amend_provisions_the_job_and_starts_no_run(workspace, fake, capfd):
     assert len(fake.jobs) == 1 and fake.job_runs == {}
 
 
+def _sdk_missing() -> bool:
+    try:
+        return importlib.util.find_spec("databricks.sdk") is None
+    except ModuleNotFoundError:
+        return True
+
+
+@pytest.fixture
+def run_client(monkeypatch, fake: FakeDatabricks) -> None:
+    """The client the build phase starts the job through.
+
+    With the [databricks] extra installed it is the real SDK, against the stand-in. CI's lane
+    installs `.[dev,test-emulators]`, which has no SDK; there it is the stand-in's own HTTP
+    client and the SDK gate is lifted, so the run is still driven end to end.
+    """
+    if _sdk_missing():
+        monkeypatch.setattr(
+            "fluid_build.build_runners._databricks_job_run._default_client", fake.client
+        )
+        monkeypatch.setattr(
+            "fluid_build.cli.apply._gate_databricks_sdk_for_apply", lambda *_a, **_k: None
+        )
+
+
+@pytest.mark.usefixtures("run_client")
 def test_amend_and_build_starts_the_job_this_apply_provisioned_and_waits(workspace, fake, capfd):
     path = write_contract(workspace, job_contract())
     rc, out = apply_contract(capfd, path, "--mode", "amend-and-build")
@@ -271,6 +297,7 @@ def test_amend_and_build_starts_the_job_this_apply_provisioned_and_waits(workspa
     assert not [r for r in fake.requests[started:] if r[0] == "POST" and "jobs/run" not in r[1]]
 
 
+@pytest.mark.usefixtures("run_client")
 def test_a_failed_run_fails_amend_and_build_with_dbt_s_output(workspace, fake, capfd):
     fake.run_states = []
     fake.run_result = {
