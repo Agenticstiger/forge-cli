@@ -126,6 +126,39 @@ def test_the_one_key_variable_s_provider_gets_that_key(world: _World) -> None:
     assert config.api_key == OPENAI_KEY
 
 
+def test_the_saved_choice_s_provider_gets_its_own_key(world: _World) -> None:
+    # A run without a TTY uses the provider ``fluid ai setup`` saved. That
+    # provider is picked, not named, so it gets its keyring key, never the
+    # generic one. Two keyring keys, so the keyring rung picks nothing itself.
+    world.saved = {"provider": "anthropic", "model": "claude-sonnet-4-5"}
+    world.keyring.update(anthropic=ANTHROPIC_KEY, openai=OPENAI_KEY)
+    env = world.env(FLUID_LLM_API_KEY=GENERIC_KEY)
+
+    config = providers.resolve_llm_config(_args(non_interactive=True), env)
+    readiness = providers.check_llm_readiness(env)
+
+    assert config.provider == "anthropic"
+    assert config.api_key == ANTHROPIC_KEY
+    assert any("FLUID_LLM_API_KEY is set but not used" in n for n in config.model_resolution_notes)
+    assert readiness.provider == "anthropic"
+
+
+def test_the_saved_choice_without_a_key_of_its_own_is_not_ready(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The generic key does not make the saved provider ready either.
+    monkeypatch.setattr("fluid_build._optional.is_available", lambda name: True)
+    world.saved = {"provider": "anthropic", "model": "claude-sonnet-4-5"}
+    env = world.env(FLUID_LLM_API_KEY=GENERIC_KEY)
+
+    with pytest.raises(providers.CopilotGenerationError) as info:
+        providers.resolve_llm_config(_args(non_interactive=True), env)
+    readiness = providers.check_llm_readiness(env)
+
+    assert info.value.event == "copilot_missing_llm_api_key"
+    assert readiness.provider == "anthropic" and readiness.ready is False
+
+
 def test_the_key_never_reaches_an_ollama_on_the_wire(
     world: _World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
