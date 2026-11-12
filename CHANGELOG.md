@@ -80,6 +80,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   several keys, a key that names no provider, or a `fluid ai setup` choice that the command does
   not read), in the words `fluid doctor` shows. Pass `--llm-provider`, or set
   `FLUID_LLM_PROVIDER` or the key of exactly one provider.
+- **Keys for two or more providers stop the run, even with Ollama running.** With
+  `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` both set (or one provider's key and `OLLAMA_HOST`) and
+  nothing naming a provider, a run without a TTY skipped both keys and used a running local
+  Ollama. Forge now stops with `copilot_no_llm_provider` and names the keys, without asking
+  Ollama, and `fluid doctor` says the same. A `fluid ai setup` choice and a single keyring key
+  still come first, and `GEMINI_API_KEY` with `GOOGLE_API_KEY` is one provider. Pick one with
+  `--llm-provider` or `FLUID_LLM_PROVIDER`.
 - **`LlmProvider.list_available_models` takes an `endpoint` keyword**, the address the call will
   go to, passed only when the operator states one. A provider plugin that overrides the method
   with the two-argument signature keeps working until an endpoint is stated.
