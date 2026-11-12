@@ -200,52 +200,7 @@ def _refusals(estate_id: str, members: Sequence[Member]) -> List[UnsupportedBind
     products: Dict[str, str] = {}
     tables: Dict[str, str] = {}
     for member in members:
-        product = member.product_id
-        if not product:
-            out.append(
-                genie._refusal(
-                    "invalid",
-                    f"{member.source} has no id, and the estate names each product by its id (the "
-                    "id its foreign keys reference).",
-                    "Give the contract an id.",
-                )
-            )
-            continue
-        if product in products:
-            out.append(
-                genie._refusal(
-                    "invalid",
-                    f"{member.source} and {products[product]} are both {product}, and an estate "
-                    "holds each product once.",
-                    "Name one of them.",
-                )
-            )
-            continue
-        products[product] = member.source
-        if not member.tables and not member.refusals:
-            out.append(
-                genie._refusal(
-                    "no-table",
-                    f"{member.source} ({product}) binds no table expose to databricks, so it has "
-                    "no table for the estate's space.",
-                    "Leave it out of the estate, or bind an expose to databricks "
-                    "(binding.platform: databricks).",
-                )
-            )
-        for table in member.tables:
-            other = tables.setdefault(table.full_name, product)
-            if other != product:
-                out.append(
-                    genie._refusal(
-                        "invalid",
-                        f"{table.full_name} is a table of both {other} and {product}.",
-                        "Give each product its own table, or leave one of them out.",
-                    )
-                )
-            out += [
-                UnsupportedBindingError(r.kind, f"{product} {r}", r.remediation)
-                for r in genie._policy_refusals(table)
-            ]
+        out += _member_refusals(member, products, tables)
     if len(tables) > genie.MAX_TABLES:
         out.append(
             genie._refusal(
@@ -255,6 +210,60 @@ def _refusals(estate_id: str, members: Sequence[Member]) -> List[UnsupportedBind
                 "Split the estate into smaller ones (one --estate each).",
             )
         )
+    return out
+
+
+def _member_refusals(
+    member: Member, products: Dict[str, str], tables: Dict[str, str]
+) -> List[UnsupportedBindingError]:
+    """What one contract makes the estate refuse: no id, a product given twice, no Databricks
+    table, a table another product has, a policy that rules Genie out. Records its product in
+    ``products`` and its tables in ``tables``."""
+    product = member.product_id
+    if not product:
+        return [
+            genie._refusal(
+                "invalid",
+                f"{member.source} has no id, and the estate names each product by its id (the "
+                "id its foreign keys reference).",
+                "Give the contract an id.",
+            )
+        ]
+    if product in products:
+        return [
+            genie._refusal(
+                "invalid",
+                f"{member.source} and {products[product]} are both {product}, and an estate "
+                "holds each product once.",
+                "Name one of them.",
+            )
+        ]
+    products[product] = member.source
+    out: List[UnsupportedBindingError] = []
+    if not member.tables and not member.refusals:
+        out.append(
+            genie._refusal(
+                "no-table",
+                f"{member.source} ({product}) binds no table expose to databricks, so it has "
+                "no table for the estate's space.",
+                "Leave it out of the estate, or bind an expose to databricks "
+                "(binding.platform: databricks).",
+            )
+        )
+    for table in member.tables:
+        other = tables.setdefault(table.full_name, product)
+        if other != product:
+            out.append(
+                genie._refusal(
+                    "invalid",
+                    f"{table.full_name} is a table of both {other} and {product}.",
+                    "Give each product its own table, or leave one of them out.",
+                )
+            )
+        out += [
+            UnsupportedBindingError(r.kind, f"{product} {r}", r.remediation)
+            for r in genie._policy_refusals(table)
+        ]
     return out
 
 
@@ -393,7 +402,6 @@ def join_specs(key: str, members: Sequence[Member], warnings: List[str]) -> List
     The parents are the estate's own tables with a primary key, so a foreign key resolves here
     as ``fluid apply`` resolves it in Unity Catalog, among the estate's products only.
     """
-    held = {m.product_id: m for m in members}
     candidates: Dict[str, List[Candidate]] = {
         m.product_id: [
             Candidate(t.full_name, t.keys.primary)
@@ -410,21 +418,7 @@ def join_specs(key: str, members: Sequence[Member], warnings: List[str]) -> List
             if keys is None or not keys.references:
                 continue
             at = f"{member.product_id} {table.where}"
-            joinable = []
-            for ref in keys.references:
-                if ref.product not in held:
-                    warnings.append(
-                        f"{at} column {ref.column} references {ref.product}, which is not in the "
-                        "estate: the space has no join for it."
-                    )
-                elif not candidates[ref.product]:
-                    warnings.append(
-                        f"{at} column {ref.column} references {ref.product}, which declares no "
-                        "primary key (a column tagged primary-key and required: true): the space "
-                        "has no join for it."
-                    )
-                else:
-                    joinable.append(ref)
+            joinable = _with_a_parent(at, keys, candidates, warnings)
             if not joinable:
                 continue
             found = foreign_keys(
@@ -433,16 +427,48 @@ def join_specs(key: str, members: Sequence[Member], warnings: List[str]) -> List
                 [],
                 own_id=member.product_id,
             )
-            joined = {column for fk in found for column in fk.columns}
-            for ref in joinable:
-                if ref.column not in joined:
-                    warnings.append(
-                        f"{at} column {ref.column} references {ref.product}.{ref.parent_column}, "
-                        f"which is not the primary key of exactly one table of {ref.product}: "
-                        "the space has no join for it."
-                    )
+            _say_unjoined(at, joinable, found, warnings)
             specs += [_join_spec(key, keys, fk, aliases) for fk in found]
     return genie._by_id(specs)
+
+
+def _with_a_parent(
+    at: str,
+    keys: TableKeys,
+    candidates: Mapping[str, Sequence[Candidate]],
+    warnings: List[str],
+) -> List[Any]:
+    """The references whose product the estate holds with a primary key; each other one said."""
+    joinable = []
+    for ref in keys.references:
+        if ref.product not in candidates:
+            warnings.append(
+                f"{at} column {ref.column} references {ref.product}, which is not in the "
+                "estate: the space has no join for it."
+            )
+        elif not candidates[ref.product]:
+            warnings.append(
+                f"{at} column {ref.column} references {ref.product}, which declares no "
+                "primary key (a column tagged primary-key and required: true): the space "
+                "has no join for it."
+            )
+        else:
+            joinable.append(ref)
+    return joinable
+
+
+def _say_unjoined(
+    at: str, joinable: Sequence[Any], found: Sequence[Any], warnings: List[str]
+) -> None:
+    """Each reference the resolution made no foreign key of."""
+    joined = {column for fk in found for column in fk.columns}
+    for ref in joinable:
+        if ref.column not in joined:
+            warnings.append(
+                f"{at} column {ref.column} references {ref.product}.{ref.parent_column}, "
+                f"which is not the primary key of exactly one table of {ref.product}: "
+                "the space has no join for it."
+            )
 
 
 def _join_spec(key: str, keys: TableKeys, fk: Any, aliases: Mapping[str, str]) -> Dict[str, Any]:

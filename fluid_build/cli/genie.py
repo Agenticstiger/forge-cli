@@ -198,8 +198,6 @@ def contract_paths(items: Sequence[str]) -> List[Tuple[str, Path]]:
     a glob reaches no symlink and no ignored or build-output folder (``.git``, ``node_modules``,
     ``.venv``, ``target``, ...) below where it starts; a file named outright is read as named.
     Every path passes the CLI's path validator (``cli/security.py``) before it is read."""
-    from glob import glob
-
     from fluid_build.cli._common import CLIError
     from fluid_build.cli.security import validate_cli_path
     from fluid_build.util.upstream_discovery import BUILD_OUTPUT_DIRS, IGNORED_DIRS
@@ -207,32 +205,8 @@ def contract_paths(items: Sequence[str]) -> List[Tuple[str, Path]]:
     skip = IGNORED_DIRS | BUILD_OUTPUT_DIRS
     found: List[Path] = []
     for item in items:
-        if _GLOB_CHARS & set(item):
-            base = _glob_base(item)
-            # As ``fluid publish`` expands one: ``**`` is one folder level, never a walk that
-            # follows symlinked folders (two symlink loops made a recursive glob run forever).
-            # A folder argument is the recursive search.
-            matches = [m for m in sorted(glob(item)) if _reachable(Path(m), base, skip)]
-        else:
-            matches = [item]
-        if not matches:
-            raise CLIError(1, "contract_file_not_found", {"path": item})
-        for match in matches:
-            path = Path(match)
-            if path.is_dir():
-                inside = _contracts_in(path, skip)
-                if not inside:
-                    raise CLIError(
-                        1,
-                        "genie_estate_no_contracts",
-                        {
-                            "path": match,
-                            "error": f"{match} holds no {' / '.join(CONTRACT_SUFFIXES)} file",
-                        },
-                    )
-                found += inside
-            else:
-                found.append(path)
+        for match in _matches(item, skip):
+            found += _folder_contracts(match, skip) if Path(match).is_dir() else [Path(match)]
     missing = [str(p) for p in found if not p.is_file()]
     if missing:
         raise CLIError(1, "contract_file_not_found", {"path": ", ".join(missing)})
@@ -243,6 +217,39 @@ def contract_paths(items: Sequence[str]) -> List[Tuple[str, Path]]:
         (str(given), validate_cli_path(given, mode="read", file_type="contract"))
         for given in unique.values()
     ]
+
+
+def _matches(item: str, skip: frozenset) -> List[str]:
+    """What one argument names: itself, or what its glob matches that a walk would reach."""
+    from glob import glob
+
+    from fluid_build.cli._common import CLIError
+
+    if _GLOB_CHARS & set(item):
+        base = _glob_base(item)
+        # As ``fluid publish`` expands one: ``**`` is one folder level, never a walk that
+        # follows symlinked folders (two symlink loops made a recursive glob run forever).
+        # A folder argument is the recursive search.
+        matches = [m for m in sorted(glob(item)) if _reachable(Path(m), base, skip)]
+    else:
+        matches = [item]
+    if not matches:
+        raise CLIError(1, "contract_file_not_found", {"path": item})
+    return matches
+
+
+def _folder_contracts(folder: str, skip: frozenset) -> List[Path]:
+    """The contract files a folder argument holds; none is an error that names it."""
+    from fluid_build.cli._common import CLIError
+
+    inside = _contracts_in(Path(folder), skip)
+    if not inside:
+        raise CLIError(
+            1,
+            "genie_estate_no_contracts",
+            {"path": folder, "error": f"{folder} holds no {' / '.join(CONTRACT_SUFFIXES)} file"},
+        )
+    return inside
 
 
 def _glob_base(pattern: str) -> Path:
