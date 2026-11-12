@@ -33,7 +33,7 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from fluid_build.cli.console import cprint, cprint_literal, literal_text, success, warning
 from fluid_build.cli.console import error as console_error
@@ -116,6 +116,12 @@ Examples:
 
   # Enable drift detection
   fluid test contract.fluid.yaml --check-drift
+
+  # Databricks: JUnit for Jenkins, plus one row per check in a Unity Catalog
+  # table and an AI/BI dashboard over it
+  fluid test contract.fluid.yaml --env databricks --output junit \
+      --output-file results.xml --results-table ops.dq.fluid_test_results \
+      --results-dashboard "/Workspace/Shared/fluid/Data quality"
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -220,7 +226,76 @@ Examples:
         ),
     )
 
+    # --- results table + dashboard (Databricks Unity Catalog) ---
+    p.add_argument(
+        "--results-table",
+        metavar="CATALOG.SCHEMA.TABLE",
+        help=(
+            "Append this run's results to a Unity Catalog table, one row per check: each "
+            "data-quality rule plus the schema, row-count and metadata checks (the same "
+            "cases as --output junit, which still works beside it). The table is created "
+            "if missing, in a schema you already have: forge never creates the catalog or "
+            "the schema, and refuses the product's own schema. Signs in like `fluid apply` "
+            "(DATABRICKS_HOST and a token or an OAuth client) and writes on "
+            "DATABRICKS_WAREHOUSE_ID."
+        ),
+    )
+    p.add_argument(
+        "--results-dashboard",
+        metavar="WORKSPACE_PATH",
+        help=(
+            "With --results-table: keep an AI/BI dashboard over that table at this "
+            "workspace path, e.g. '/Workspace/Shared/fluid/Data quality' (the last part is "
+            "its name). It shows each product's pass rate, the failing rules and the trend. "
+            "Created on first use, found by its path afterwards and updated only when its "
+            "definition changed (an edit made in the dashboard editor is replaced then); "
+            "published without embedded credentials, so viewers need SELECT on the table."
+        ),
+    )
+
     p.set_defaults(cmd=COMMAND, func=run)
+
+
+def _write_results(report, contract, results_table: str, results_dashboard) -> None:
+    """Append the run to the results table, then keep the dashboard over it."""
+    from ._test_results_databricks import parse_results_table, write_results
+
+    write_results(report, contract, results_table)
+    if results_dashboard:
+        from ._test_dashboard_databricks import ensure_dashboard
+
+        ensure_dashboard(results_dashboard, parse_results_table(results_table))
+
+
+def _results_options(args: argparse.Namespace):
+    """``(table, dashboard path)`` of the results flags, checked before any test runs."""
+    table = getattr(args, "results_table", None)
+    dashboard = getattr(args, "results_dashboard", None)
+    if dashboard and not table:
+        raise CLIError(
+            2,
+            "test_results_dashboard_needs_table",
+            {"results_dashboard": dashboard, "fix": "add --results-table CATALOG.SCHEMA.TABLE"},
+        )
+    if table and getattr(args, "engine", "native") == "soda":
+        raise CLIError(
+            2,
+            "test_results_table_needs_native_engine",
+            {
+                "results_table": table,
+                "why": "--results-table records the native engine's per-rule results",
+                "fix": "drop --engine soda, or drop --results-table",
+            },
+        )
+    if table:
+        from ._test_results_databricks import parse_results_table
+
+        parse_results_table(table)
+    if dashboard:
+        from ._test_dashboard_databricks import parse_dashboard_path
+
+        parse_dashboard_path(dashboard)
+    return table, dashboard
 
 
 # ======================================================================
@@ -236,6 +311,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         # condition, so a CI log parser sees one identity for "the contract
         # file isn't there" rather than one slug per command.
         raise CLIError(1, "contract_file_not_found", {"path": str(contract_path)})
+
+    # A malformed results flag fails before any check runs (or any compute starts).
+    results_table, results_dashboard = _results_options(args)
 
     # Soda engine dispatch — generates SodaCL from the contract's quality
     # block and shells out to the user's installed `soda` binary. Skipped
@@ -297,6 +375,11 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     publish_url = getattr(args, "publish", None)
     if publish_url:
         _publish_results(report, publish_url, logger)
+
+    # --- results table + dashboard (Unity Catalog). After the report is out,
+    # so a JUnit file exists even when the write fails. ---
+    if results_table:
+        _write_results(report, validator.contract or {}, results_table, results_dashboard)
 
     # --- exit code ---
     if not report.is_valid():
@@ -647,6 +730,9 @@ def _output_json(report, output_file: Optional[str] = None) -> None:
                 "message": c.message,
                 "expected": c.expected,
                 "actual": c.actual,
+                "rule_id": getattr(c, "rule_id", None),
+                "rule_type": getattr(c, "rule_type", None),
+                "expose_id": getattr(c, "expose_id", None),
             }
             for c in getattr(report, "checks", [])
         ],
@@ -681,12 +767,15 @@ def _output_junit(report, output_file: Optional[str] = None) -> None:
     ts.set("time", f"{report.duration:.3f}")
     ts.set("timestamp", report.validation_time.isoformat())
 
+    from ._test_cases import rule_checks as _rule_checks
+    from ._test_cases import structural_categories as _structural_categories
+
     classname = f"fluid.test.{report.contract_id}"
     total = 0
     failures = 0
 
     # ── one testcase per executed data-quality rule ──
-    rule_checks = [c for c in getattr(report, "checks", []) if c.category == "quality"]
+    rule_checks = _rule_checks(report)
     for check in rule_checks:
         total += 1
         tc = ET.SubElement(ts, "testcase")
@@ -707,33 +796,7 @@ def _output_junit(report, output_file: Optional[str] = None) -> None:
         fail.text = "\n".join(body)
 
     # ── one testcase per structural check category ──
-    categories_seen: Dict[str, List] = {}
-    for issue in report.issues:
-        categories_seen.setdefault(issue.category, []).append(issue)
-
-    structural_categories = [
-        "schema",
-        "connection",
-        "binding",
-        "missing_resource",
-        "missing_field",
-        "type_mismatch",
-        "mode_mismatch",
-        "extra_field",
-        "empty_table",
-        "row_count_below_threshold",
-        "quality",
-        "metadata",
-        "drift",
-    ]
-    if rule_checks:
-        # The per-rule cases above already carry every rule outcome; a
-        # roll-up ``quality`` case on top would double-count them.
-        structural_categories.remove("quality")
-
-    extra_categories = [c for c in categories_seen if c not in structural_categories]
-    if rule_checks and "quality" in extra_categories:
-        extra_categories.remove("quality")
+    structural_categories, extra_categories, categories_seen = _structural_categories(report)
 
     for cat in structural_categories + extra_categories:
         total += 1
