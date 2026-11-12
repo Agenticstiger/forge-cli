@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as two types, so a contract written for Spark or Databricks stopped every ingest with "source
   schema drift detected", one `type_changed→fail` per text column, under every `schemaPolicy`
   but `evolve_all`. DuckDB's own names for the type (`VARCHAR`, `STRING`, `TEXT`, `CHAR`,
-  `BPCHAR`, `NVARCHAR`) are now one type, and a change between them logs no rename warning. An
-  all-null column that `fluid init --discover` wrote as `string` now also passes once text
-  arrives. `STRING` to `INTEGER` is still drift.
+  `BPCHAR`, `NVARCHAR`) are now one type, with or without a length (`VARCHAR(255)`,
+  `CHAR(3)`), which DuckDB neither enforces nor reports, and a change between them logs no
+  rename warning. An all-null column that `fluid init --discover` wrote as `string` now also
+  passes once text arrives. `STRING` to `INTEGER` is still drift.
 
 ## [0.29.0] — 2026-11-12
 

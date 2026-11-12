@@ -21,6 +21,7 @@ Decision matrix (events × policies):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -135,19 +136,34 @@ _TYPE_FAMILIES: Tuple[Tuple[str, ...], ...] = (
 #: two of them moves nothing, unlike the rest of their family.
 _VARCHAR_NAMES = frozenset({"varchar", "string", "text", "char", "bpchar", "nvarchar"})
 
+#: ``VARCHAR(255)``, ``CHAR (3)``: a name and a length. DuckDB accepts a length
+#: on each VARCHAR name but neither enforces nor reports it (measured on 1.5.1
+#: and 2.0.0: six letters land in a VARCHAR(3) column, which DESCRIBEs as plain
+#: VARCHAR), so for those names the length is dropped before the lookup.
+_NAME_AND_LENGTH = re.compile(r"([a-z]+)\s*\(\s*\d+\s*\)")
+
 _FAMILY_OF: Dict[str, int] = {
     name: index for index, names in enumerate(_TYPE_FAMILIES) for name in names
 }
 
 
-def _same_type_family(old: str, new: str) -> bool:
-    """Whether ``old`` and ``new`` are two spellings of one physical type.
+def _type_key(name: str) -> str:
+    """``name`` as the family table spells it.
 
     Quotes are stripped because ``typeof(NULL)`` is the quoted string
     ``"NULL"``, which is how an all-null column reaches here.
     """
-    a = _FAMILY_OF.get(old.strip().strip('"').lower())
-    b = _FAMILY_OF.get(new.strip().strip('"').lower())
+    key = name.strip().strip('"').lower()
+    sized = _NAME_AND_LENGTH.fullmatch(key)
+    if sized and sized.group(1) in _VARCHAR_NAMES:
+        return sized.group(1)
+    return key
+
+
+def _same_type_family(old: str, new: str) -> bool:
+    """Whether ``old`` and ``new`` are two spellings of one physical type."""
+    a = _FAMILY_OF.get(_type_key(old))
+    b = _FAMILY_OF.get(_type_key(new))
     return a is not None and a == b
 
 
@@ -162,7 +178,7 @@ def family_rename_note(old: str, new: str) -> Optional[str]:
         return None  # nothing changed: a rename note for X -> X is noise
     if not _same_type_family(old, new):
         return None
-    if {old.strip().strip('"').lower(), new.strip().strip('"').lower()} <= _VARCHAR_NAMES:
+    if {_type_key(old), _type_key(new)} <= _VARCHAR_NAMES:
         return None  # one type, two spellings: nothing moved, so nothing to report
     return (
         f"column type {old!r} -> {new!r}: the same physical type under two names "
