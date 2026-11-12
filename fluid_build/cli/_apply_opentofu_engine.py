@@ -1693,8 +1693,8 @@ def _apply_failure(result: Any, workdir: str, plugin: Any = None) -> CLIError:
     none (a crash, a timeout) falls back to the first ``Error:``, else the exit
     code. Tofu records state as it goes, so what was created before the failure
     is normally tracked and a re-run converges: the suggestions say so. A plugin's
-    optional ``apply_failure_hints(address, detail)`` puts its own way on first, for the
-    resource that failed.
+    optional ``apply_failure_hints(address, detail)`` adds its way on for the resource that
+    failed, ahead of the engine's own ``tofu state list`` hint.
     """
     diagnostics = _diagnostics(getattr(result, "events", None))
     context: Dict[str, Any] = {}

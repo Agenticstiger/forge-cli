@@ -646,6 +646,82 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ["Pass the product id to roll back: fluid rollback <product-id>"],
         None,
     ),
+    # ── fluid test results table / dashboard (Databricks) ──────────────────
+    "test_results_table_invalid": (
+        [
+            "Name the table as catalog.schema.table, e.g. --results-table ops.dq.fluid_test_results",
+            "Each part may hold letters, digits and underscores only",
+        ],
+        None,
+    ),
+    "test_results_table_in_product_schema": (
+        [
+            "Put the results table in a schema of its own: every product writes to it, "
+            + "and fluid apply owns each product's schema",
+            "Create one with CREATE SCHEMA <catalog>.dq, then pass "
+            + "--results-table <catalog>.dq.fluid_test_results",
+        ],
+        None,
+    ),
+    "test_results_table_mismatch": (
+        [
+            "The table exists without the fluid test results columns, so nothing was written",
+            "Point --results-table at a new table name; forge creates it with the right columns",
+        ],
+        None,
+    ),
+    "test_results_write_failed": (
+        [
+            "Check DATABRICKS_HOST, the token or OAuth client, and DATABRICKS_WAREHOUSE_ID",
+            "The schema must exist and this identity needs USE CATALOG, USE SCHEMA, "
+            + "CREATE TABLE and MODIFY on it",
+            "The test report above is unaffected: rerun fluid test once the write can succeed",
+        ],
+        None,
+    ),
+    "test_results_dashboard_needs_table": (
+        [
+            "--results-dashboard draws the --results-table table: pass both",
+        ],
+        None,
+    ),
+    "test_results_table_needs_native_engine": (
+        [
+            "--results-table records the native engine's per-rule results; drop --engine soda",
+            "Or keep --engine soda and its JUnit or JSON output, without --results-table",
+        ],
+        None,
+    ),
+    "test_results_table_needs_live_checks": (
+        [
+            "--results-table records the live checks of a run, and --no-data runs none",
+            "Drop --no-data to test and record, or drop --results-table",
+        ],
+        None,
+    ),
+    "test_results_dashboard_invalid": (
+        [
+            "Give a workspace path whose last part is the name, e.g. "
+            + "--results-dashboard '/Workspace/Shared/fluid/Data quality'",
+            "The path must start with / and have no empty, . or .. parts",
+        ],
+        None,
+    ),
+    "test_results_dashboard_path_taken": (
+        [
+            "Something other than a dashboard already sits at that workspace path",
+            "Choose another --results-dashboard path, or move that object away",
+        ],
+        None,
+    ),
+    "test_results_dashboard_failed": (
+        [
+            "The results were written; only the dashboard step failed",
+            "This identity needs CAN MANAGE on the dashboard (or write access to its folder) "
+            + "and CAN USE on DATABRICKS_WAREHOUSE_ID",
+        ],
+        None,
+    ),
     # ── apply safety gates ─────────────────────────────────────────────────
     "iceberg_catalog_move_blocked": (
         [

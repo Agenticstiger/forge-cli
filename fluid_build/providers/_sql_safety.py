@@ -67,6 +67,28 @@ def quote_string_literal(value: str, *, backslash_escapes: bool = True) -> str:
     return "'" + escaped.replace("'", "''") + "'"
 
 
+# Dialects that take a quote inside ``'...'`` only as ``\'``. Spark SQL
+# (Databricks) reads ``'it''s'`` as the adjacent literals ``'it'`` and ``'s'``
+# and joins them into ``its`` (checked on a SQL warehouse); BigQuery rejects
+# it. Both honour backslash escapes, so ``\\`` is doubled first.
+_BACKSLASH_QUOTE_DIALECTS = frozenset({"bigquery", "databricks", "spark"})
+
+
+def quote_string_literal_for(dialect: str | None, value: str) -> str:
+    """Quote ``value`` as a string literal of ``dialect`` that reads back as ``value``.
+
+    :func:`quote_string_literal` for every dialect that doubles a quote, and
+    ``'...\\'...'`` for the ones in :data:`_BACKSLASH_QUOTE_DIALECTS`: with
+    every backslash doubled before the quotes are escaped, no value can end
+    the literal early on either.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid SQL string literal: {value!r}")
+    if (dialect or "").strip().lower() in _BACKSLASH_QUOTE_DIALECTS:
+        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    return quote_string_literal(value, backslash_escapes=dialect_uses_backslash_escapes(dialect))
+
+
 def quote_ansi_string_literal(value: str) -> str:
     """Quote a SQL string literal for a *standard-conforming* dialect.
 
