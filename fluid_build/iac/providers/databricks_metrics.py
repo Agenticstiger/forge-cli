@@ -151,14 +151,30 @@ _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 #: its owner's rights (the deploy identity) for everyone who queries it, so a call that reads a
 #: secret, reaches a network connection or a model endpoint, reads files or streams, or reflects
 #: into the JVM would lend that identity to every reader; one that asks who is querying is
-#: refused by Databricks in a metric view. The row filter's predicates are held tighter still
-#: (``databricks_access.ALLOWED_FUNCTIONS``).
-_FORBIDDEN_CALL_RE = re.compile(
-    r"(?i)(?<![\w.])("
-    r"secret|try_secret|http_request|vector_search|ai_\w+|read_\w+|java_method|try_reflect|"
-    r"reflect|current_user|session_user|user|is_member|is_account_group_member|current_recipient"
-    r")\s*\("
+#: refused by Databricks in a metric view; ``IDENTIFIER()`` names a function from a string. The
+#: row filter's predicates are held tighter still (``databricks_access.ALLOWED_FUNCTIONS``).
+_FORBIDDEN_FUNCTIONS = frozenset(
+    {
+        "secret",
+        "try_secret",
+        "http_request",
+        "vector_search",
+        "java_method",
+        "reflect",
+        "try_reflect",
+        "current_user",
+        "session_user",
+        "user",
+        "is_member",
+        "is_account_group_member",
+        "current_recipient",
+        "identifier",
+    }
 )
+_FORBIDDEN_PREFIXES = ("ai_", "read_")
+_NAME = r"(?:`(?:``|[^`])*`|[A-Za-z_][A-Za-z0-9_]*)"
+#: Every call: a name, quoted or not, qualified or not, before ``(`` (string literals blanked).
+_CALL_RE = re.compile(rf"(?<![A-Za-z0-9_$`])({_NAME}(?:\s*\.\s*{_NAME})*)\s*\(")
 #: What a name may follow and still not be a column: ``CAST(x AS <type>)``.
 _AFTER_AS_RE = re.compile(r"(?i)\bAS$")
 
@@ -408,13 +424,15 @@ class _ViewCompiler:
         if text is None:
             return None
         scan = _LITERAL_RE.sub(" ", text)
-        forbidden = _FORBIDDEN_CALL_RE.search(scan)
-        if forbidden is not None:
+        refused_call = _refused_call(scan)
+        if refused_call is not None:
             self.refuse(
                 "invalid",
-                f"{what} calls {forbidden.group(1)}(): a metric view evaluates its expressions "
-                "with its owner's rights for everyone who queries it, so it may not read secrets, "
-                "reach a connection, a model or a file, reflect, or ask who is querying.",
+                f"{what} calls {refused_call}: a metric view evaluates its expressions with its "
+                "owner's rights for everyone who queries it, so it may not read secrets, reach a "
+                "connection, a model or a file, reflect, ask who is querying, name a function "
+                "from a string, or call a function by a quoted or qualified name (another "
+                "schema's function runs with the owner's rights too).",
                 "Compute the value in the table's build and reference the column.",
             )
             return None
@@ -458,7 +476,9 @@ class _ViewCompiler:
                 "Rewrite it as a plain SQL expression over the table's columns.",
             )
             return None
-        if not _semantics.parens_balanced(text):
+        if not _semantics.parens_balanced(
+            _LITERAL_RE.sub(" ", text)
+        ):  # a ')' in '...' closes nothing
             self.refuse(
                 "invalid",
                 f"{what} is {raw!r}, whose parentheses do not balance.",
@@ -790,6 +810,19 @@ class _ViewCompiler:
                     "no control character, '${' or '$$', and no empty value.",
                     "Rename it.",
                 )
+
+
+def _refused_call(text: str) -> Optional[str]:
+    """The first call in ``text`` (literals blanked) that may not run with the owner's rights,
+    as written, or ``None``."""
+    for match in _CALL_RE.finditer(text):
+        call = match.group(1)
+        name = call.lower()
+        if "`" in call or "." in call:
+            return f"{call}() (a quoted or qualified function name)"
+        if name in _FORBIDDEN_FUNCTIONS or name.startswith(_FORBIDDEN_PREFIXES):
+            return f"{call}()"
+    return None
 
 
 def _qualify(text: str, columns: Mapping[str, Any]) -> Tuple[str, List[str]]:

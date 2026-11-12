@@ -431,6 +431,12 @@ REFUSALS = [
         _with("metrics.0.filter", "is_account_group_member('admins')"),
         "calls is_account_group_member()",
     ),
+    (_with("measures.1.expr", "length(`secret`('s', 'k'))"), "a quoted or qualified function"),
+    (_with("measures.1.expr", "length(system.builtin.secret('s', 'k'))"), "quoted or qualified"),
+    (_with("dimensions.0.expr", "builtin . ai_query('ep', country_code)"), "quoted or qualified"),
+    (_with("dimensions.0.expr", "main.tools.lookup(country_code)"), "quoted or qualified"),
+    (_with("metrics.0.filter", "IDENTIFIER('secret')('a', 'b') = 'x'"), "calls IDENTIFIER()"),
+    (_with("metrics.0.filter", "upper(site_status) = 'AI_QUERY('"), None),  # a literal: fine
     (_append("measures", {"name": "ghost", "agg": "sum"}), "has no expr"),
     (_with("measures.0.agg", "stddev"), "unsupported agg 'stddev'"),
     (_with("measures.0.agg", "percentile"), None),  # default 0.5: compiles
