@@ -24,6 +24,7 @@ was one candidate): that is the manual live tier.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
@@ -241,6 +242,79 @@ def test_the_table_a_dbt_build_writes_keeps_what_dbt_made_and_the_drift_is_said(
     assert "amount: contract=double live=decimal(38,6)" in out
     assert "loaded_at: present in the live table but not declared" in out
     assert fake.sql_log[statements:] == [] and fake.tables[TABLE]["marker"] == marker
+
+
+def test_amend_provisions_the_job_and_starts_no_run(workspace, fake, capfd):
+    rc, out = apply_contract(capfd, write_contract(workspace, job_contract()))
+    assert rc == 0, out
+    assert len(fake.jobs) == 1 and fake.job_runs == {}
+
+
+def _sdk_missing() -> bool:
+    try:
+        return importlib.util.find_spec("databricks.sdk") is None
+    except ModuleNotFoundError:
+        return True
+
+
+@pytest.fixture
+def run_client(monkeypatch, fake: FakeDatabricks) -> None:
+    """The client the build phase starts the job through.
+
+    With the [databricks] extra installed it is the real SDK, against the stand-in. CI's lane
+    installs `.[dev,test-emulators]`, which has no SDK; there it is the stand-in's own HTTP
+    client and the SDK gate is lifted, so the run is still driven end to end.
+    """
+    if _sdk_missing():
+        monkeypatch.setattr(
+            "fluid_build.build_runners._databricks_job_run._default_client", fake.client
+        )
+        monkeypatch.setattr(
+            "fluid_build.cli.apply._gate_databricks_sdk_for_apply", lambda *_a, **_k: None
+        )
+
+
+@pytest.mark.usefixtures("run_client")
+def test_amend_and_build_starts_the_job_this_apply_provisioned_and_waits(workspace, fake, capfd):
+    path = write_contract(workspace, job_contract())
+    rc, out = apply_contract(capfd, path, "--mode", "amend-and-build")
+    assert rc == 0, out
+
+    ((job_id, job),) = fake.jobs.items()
+    ((run_id, run),) = fake.job_runs.items()
+    assert run["job_id"] == job_id  # the id this apply's state holds for the build
+    assert run["body"]["queue"] == {"enabled": True}
+    assert "dbt_commands" not in run["body"]
+    assert run["polls"] == 3  # PENDING, RUNNING, then the end
+    name = "fluid dbx.fake.orders dbt_daily"
+    assert f"started run {run_id} of Databricks job '{name}' ({job_id})" in out
+    assert f"run page: {fake.endpoint}/#job/{job_id}/run/{run_id}" in out
+    assert "PENDING" in out and "RUNNING" in out and "TERMINATED SUCCESS" in out
+    assert f"Databricks run {run_id} succeeded" in out and "Executed: 1" in out
+    # Running it now wrote nothing to the job: its schedule stays as the apply set it.
+    assert job["settings"]["schedule"]["pause_status"] == "UNPAUSED"
+    started = fake.requests.index(("POST", "/api/2.2/jobs/run-now"))
+    assert not [r for r in fake.requests[started:] if r[0] == "POST" and "jobs/run" not in r[1]]
+
+
+@pytest.mark.usefixtures("run_client")
+def test_a_failed_run_fails_amend_and_build_with_dbt_s_output(workspace, fake, capfd):
+    fake.run_states = []
+    fake.run_result = {
+        "code": "RUN_EXECUTION_ERROR",
+        "message": "Task dbt failed with message: dbt command failed.",
+        "error": "dbt command failed",
+        "logs": "Running with dbt=1.10.0\nCompilation Error in model orders (models/orders.sql)\n"
+        "  [UNRESOLVED_COLUMN] A column with name `nope` cannot be resolved.",
+    }
+    rc, out = apply_contract(
+        capfd, write_contract(workspace, job_contract()), "--mode", "amend-and-build"
+    )
+    assert rc == 1, out
+    assert "ended RUN_EXECUTION_ERROR" in out
+    assert "task 'dbt': dbt command failed" in out
+    assert "A column with name `nope` cannot be resolved." in out
+    assert "Failed: 1" in out
 
 
 def test_a_job_that_writes_a_keyed_table_declares_its_keys_again_after_dbt(workspace, fake, capfd):

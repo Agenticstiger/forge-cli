@@ -119,22 +119,63 @@ def _report_externally_run_build(
     _record_run_elsewhere(build_id, report)
 
 
-def _report_databricks_job_build(contract: Dict[str, Any], build_id: str, report: Any) -> None:
+def _report_databricks_job_build(
+    contract: Dict[str, Any], build: Dict[str, Any], build_id: str, report: Any
+) -> None:
     """Say that a dbt build runs in its Databricks workspace, as a job; not here.
 
     ``fluid apply`` provisions the job through OpenTofu
     (``iac/providers/databricks_jobs.py``) and Databricks runs dbt on the job's
-    trigger, so a local run would be a second, unscheduled copy of it. Counted
-    and recorded as :func:`_report_externally_run_build` counts a Flink job.
+    trigger, so a local run would be a second, unscheduled copy of it. Said when
+    no apply in this process provisioned the job, and for a continuous job, which
+    Databricks keeps running (a ``-and-build`` apply starts any other one:
+    ``_databricks_job_run.py``). Counted and recorded as
+    :func:`_report_externally_run_build` counts a Flink job.
     """
-    product = contract.get("id") or contract.get("name") or "product"
+    from fluid_build.iac.providers.databricks_jobs import job_build_id, job_product
+
+    name = f"fluid {job_product(contract)} {job_build_id(contract, build)}"
+    if is_continuous_build(build):
+        how = "continuously; Databricks keeps it running, so fluid apply starts no run of it."
+    else:
+        how = (
+            "on its trigger (fluid apply provisions it). An apply to databricks with --mode "
+            "amend-and-build starts a run now and waits for it; so do the job's page and: "
+            "databricks jobs run-now <job id>."
+        )
     cprint(
-        f"\n⏭️  Build '{build_id}' - dbt runs in the Databricks workspace as job "
-        f"'fluid {product} {build_id}' on its trigger (fluid apply provisions it); "
-        "start a run now from the job's page, or with: databricks jobs run-now <job id>.",
+        f"\n⏭️  Build '{build_id}' - dbt runs in the Databricks workspace as job '{name}' {how}",
         markup=False,
     )
     _record_run_elsewhere(build_id, report)
+
+
+def _databricks_job_build(
+    contract: Dict[str, Any],
+    build: Dict[str, Any],
+    report: Any,
+    databricks_jobs: Optional[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> Optional[int]:
+    """Run a dbt build that runs as a Databricks job: its exit code, or ``None`` when
+    Databricks runs it on its own (no apply here provisioned it, or it is continuous).
+
+    A build that writes no Databricks table has no job, and fails. With the jobs the
+    provisioning apply handed over, a run of the build's job starts now and is waited
+    for (``_databricks_job_run.run_job_build``).
+    """
+    build_id = build.get("id", "unknown")
+    if not _writes_a_databricks_table(contract, build):
+        # No Databricks table: no plugin provisions its job, so nothing would run it.
+        return _refuse_unprovisioned_databricks_build(build_id)
+    if databricks_jobs is None or is_continuous_build(build):
+        _report_databricks_job_build(contract, build, build_id, report)
+        return None
+    from ._databricks_job_run import run_job_build
+
+    return run_job_build(
+        contract, build, databricks_jobs, dry_run=args.dry_run, mode=getattr(args, "mode", None)
+    )
 
 
 def _writes_a_databricks_table(contract: Dict[str, Any], build: Dict[str, Any]) -> bool:
@@ -1214,6 +1255,7 @@ def run_builds_from_args(
     force_run: bool = False,
     plan_data: Optional[Dict[str, Any]] = None,
     contract: Optional[Dict[str, Any]] = None,
+    databricks_jobs: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Execute builds from a FLUID contract.
 
@@ -1244,6 +1286,10 @@ def run_builds_from_args(
     Each build is recorded on the running ``fluid apply``'s Command Center
     report, when there is one (``observability.apply_run``): its status and
     the run record it wrote, and why the build phase failed.
+
+    ``databricks_jobs`` (build id to the jobs the OpenTofu state holds) comes from
+    the ``fluid apply`` that just provisioned them: a dbt build that runs on
+    Databricks then runs its job now (:func:`_databricks_job_build`).
     """
     # Deferred imports to avoid circular import at module-load time:
     # base.py -> python.runner -> base.py (for _resolve_env_placeholders).
@@ -1458,16 +1504,18 @@ def run_builds_from_args(
             continue
 
         if is_databricks_job_build(build):
-            if _writes_a_databricks_table(contract, build):
-                _report_databricks_job_build(contract, build_id, report)
+            job_result = _databricks_job_build(contract, build, report, databricks_jobs, args)
+            if job_result is None:
                 total_external += 1
                 continue
-            # No Databricks table: no plugin provisions its job, so nothing would run it.
-            result = _refuse_unprovisioned_databricks_build(build_id)
+            result = job_result
             _report_build(report, contract_path.parent, product_id, build_id, result, runs_before)
-            total_failed += 1
-            if args.fail_fast:
-                break
+            if result == 0:
+                total_executed += 1
+            else:
+                total_failed += 1
+                if args.fail_fast:
+                    break
             continue
 
         if _runs_outside_forge_continuously(build):

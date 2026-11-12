@@ -164,6 +164,12 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "Per-`tofu` invocation wall-clock cap",
     ),
     (
+        "FLUID_DATABRICKS_RUN_TIMEOUT_SECONDS",
+        "3600s, or the job's own limits + 15 min",
+        "How long `fluid apply --mode amend-and-build` waits for a Databricks job run "
+        "before it cancels the run",
+    ),
+    (
         "FLUID_TOFU_S3_LOCKFILE",
         "on (OpenTofu 1.10+)",
         "Set =0 to skip S3-native state locking when the deploying role cannot "
