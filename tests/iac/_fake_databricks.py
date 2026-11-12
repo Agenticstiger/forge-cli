@@ -441,6 +441,146 @@ def _coldef_param(txt: str) -> Dict[str, str]:
     return {"name": m.group(1), "type": m.group(2).strip().lower()}
 
 
+#: What a metric view keeps outside its stored ``view_definition`` (measured on Databricks SQL
+#: 2026.45: the YAML read back has no ``comment``, ``display_name`` or ``synonyms``).
+_METRIC_VIEW_METADATA = ("comment", "display_name", "synonyms")
+_PROPERTY_RE = re.compile(r"'((?:[^'\\]|\\.)*)'\s*=\s*'((?:[^'\\]|\\.)*)'")
+
+
+def _metric_view_properties(text: str) -> Dict[str, str]:
+    def unescape(v: str) -> str:
+        return re.sub(r"\\(.)", r"\1", v)
+
+    return {unescape(k): unescape(v) for k, v in _PROPERTY_RE.findall(text or "")}
+
+
+def _metric_view_doc(body: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """The parsed definition, or ``(None, error)`` as Databricks words a bad one."""
+    import yaml
+
+    try:
+        doc = yaml.safe_load(body)
+    except yaml.YAMLError as exc:
+        return None, f"[METRIC_VIEW_INVALID_VIEW_DEFINITION] invalid YAML: {exc}"
+    if not isinstance(doc, dict) or doc.get("version") != 1.1:
+        return None, "[METRIC_VIEW_INVALID_VIEW_DEFINITION] version must be 1.1"
+    if not doc.get("dimensions") and not doc.get("measures"):
+        return None, "[METRIC_VIEW_INVALID_VIEW_DEFINITION] no dimensions or measures"
+    return doc, ""
+
+
+def _metric_view_record(fake: "FakeDatabricks", doc: Dict[str, Any]) -> Dict[str, Any]:
+    import yaml
+
+    stored = {k: v for k, v in doc.items() if k != "comment"}
+    columns = []
+    for kind in ("dimensions", "measures"):
+        items = []
+        for item in doc.get(kind) or []:
+            items.append({k: v for k, v in item.items() if k not in _METRIC_VIEW_METADATA})
+            columns.append(
+                {
+                    "name": item["name"],
+                    "type": "string" if kind == "dimensions" else "double",
+                    "nullable": True,
+                    "comment": item.get("comment"),
+                }
+            )
+        if kind in stored:
+            stored[kind] = items
+    return {
+        "table_type": "METRIC_VIEW",
+        "columns": columns,
+        "partitions": [],
+        "cluster_keys": [],
+        "comment": doc.get("comment"),
+        "view_definition": yaml.safe_dump(stored, sort_keys=False),
+        "created_at": int(time.time() * 1000),
+    }
+
+
+def _metric_view_statement(fake: "FakeDatabricks", s: str) -> Optional[Tuple[bool, str]]:
+    """CREATE / ALTER / DROP of a metric view, and GRANT on a table: ``None`` for any other."""
+    m = re.match(
+        rf"CREATE\s+(OR\s+REPLACE\s+)?VIEW\s+{_FULL}\s+WITH\s+METRICS\s+LANGUAGE\s+YAML\s+"
+        r"(?:TBLPROPERTIES\s*\((.*?)\)\s+)?AS\s+\$\$(.*)\$\$$",
+        s,
+        re.S | re.I,
+    )
+    if m:
+        replace, cat, sch, name, props, body = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        if f"{cat}.{sch}" not in fake.schemas:
+            return False, f"[SCHEMA_NOT_FOUND] {cat}.{sch}"
+        old = fake.tables.get(full)
+        if old is not None and old.get("table_type") != "METRIC_VIEW":
+            return False, f"[EXPECT_VIEW_NOT_TABLE.NO_ALTERNATIVE] {full}"
+        if old is not None and not replace:
+            return False, f"[TABLE_OR_VIEW_ALREADY_EXISTS] {full}"
+        doc, err = _metric_view_doc(body)
+        if doc is None:
+            return False, err
+        source = str(doc.get("source") or "")
+        if fake.tables.get(source, {}).get("table_type") not in ("MANAGED", "EXTERNAL"):
+            return False, f"[TABLE_OR_VIEW_NOT_FOUND] {source}"
+        record = _metric_view_record(fake, doc)
+        record["properties"] = _metric_view_properties(props or "")
+        record["owner"] = _USER  # whoever creates (or replaces) a view owns it
+        fake.tables[full] = record
+        # Replacing a view drops its grants (measured live).
+        fake.grants.pop(("table", full), None)
+        return True, ""
+
+    m = re.match(rf"ALTER\s+VIEW\s+{_FULL}\s+AS\s+\$\$(.*)\$\$$", s, re.S | re.I)
+    if m:
+        cat, sch, name, body = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        old = fake.tables.get(full)
+        if old is None or old.get("table_type") != "METRIC_VIEW":
+            return False, f"[TABLE_OR_VIEW_NOT_FOUND] {full}"
+        doc, err = _metric_view_doc(body)
+        if doc is None:
+            return False, err
+        record = _metric_view_record(fake, doc)
+        record["properties"] = old["properties"]  # ALTER VIEW ... AS keeps them, and the grants
+        record["owner"] = old.get("owner", _USER)
+        fake.tables[full] = record
+        return True, ""
+
+    m = re.match(rf"ALTER\s+VIEW\s+{_FULL}\s+SET\s+TBLPROPERTIES\s*\((.*)\)$", s, re.S | re.I)
+    if m:
+        cat, sch, name, props = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        if full not in fake.tables:
+            return False, f"[TABLE_OR_VIEW_NOT_FOUND] {full}"
+        fake.tables[full]["properties"].update(_metric_view_properties(props))
+        return True, ""
+
+    m = re.match(rf"DROP\s+VIEW\s+(IF\s+EXISTS\s+)?{_FULL}\s*$", s, re.I)
+    if m:
+        ie, cat, sch, name = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        if full not in fake.tables:
+            return (True, "") if ie else (False, f"[TABLE_OR_VIEW_NOT_FOUND] {full}")
+        if fake.tables[full].get("table_type") != "METRIC_VIEW":
+            return False, f"[WRONG_COMMAND_FOR_OBJECT_TYPE] {full} is a table"
+        del fake.tables[full]
+        fake.grants.pop(("table", full), None)
+        return True, ""
+
+    m = re.match(rf"GRANT\s+(\w+)\s+ON\s+TABLE\s+{_FULL}\s+TO\s+`((?:[^`]|``)+)`\s*$", s, re.I)
+    if m:
+        priv, cat, sch, name, who = m.groups()
+        full = f"{cat}.{sch}.{name}"
+        if full not in fake.tables:
+            return False, f"[TABLE_OR_VIEW_NOT_FOUND] {full}"
+        held = fake.grants.setdefault(("table", full), {})
+        who = who.replace("``", "`")
+        held[who] = sorted(set(held.get(who, [])) | {priv.upper()})
+        return True, ""
+    return None
+
+
 def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
     """Run one statement against ``fake``; return (ok, error message)."""
     s = sql.strip().rstrip(";").strip()
@@ -564,6 +704,10 @@ def _execute(fake: "FakeDatabricks", sql: str) -> Tuple[bool, str]:
             return False, "[TABLE_OR_VIEW_NOT_FOUND]"
         t["comment"] = _unescape(text)
         return True, ""
+
+    handled = _metric_view_statement(fake, s)
+    if handled is not None:
+        return handled
 
     m = re.match(rf"ALTER\s+TABLE\s+{_FULL}\s+(.*)$", s, re.S | re.I)
     if not m:
@@ -1353,6 +1497,7 @@ class FakeDatabricks:
         a("GET", r"/api/2\.1/unity-catalog/functions/([^/]+)", self._get_function)
         a("GET", r"/api/2\.1/unity-catalog/functions", self._list_functions)
         a("GET", r"/api/2\.1/unity-catalog/tables", self._list_tables)
+        a("GET", r"/api/2\.1/unity-catalog/table-summaries", self._table_summaries)
         a("GET", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._get_table)
         a("DELETE", r"/api/2\.1/unity-catalog/tables/([^/]+)", self._delete_table)
         a("GET", r"/api/2\.1/unity-catalog/permissions/([a-z_]+)/([^/]+)", self._get_perms)
@@ -1683,7 +1828,14 @@ class FakeDatabricks:
             if view.get("comment"):
                 row["comment"] = view["comment"]
         else:
-            row["table_type"] = "MANAGED"
+            # A table, or a metric view made by ``CREATE VIEW ... WITH METRICS``, whose record
+            # keeps its type, its stored YAML and its comment.
+            table = self.tables[full]
+            row["table_type"] = table.get("table_type") or "MANAGED"
+            if row["table_type"] == "METRIC_VIEW":
+                for key in ("view_definition", "comment"):
+                    if table.get(key):
+                        row[key] = table[key]
         return row
 
     def add_metric_view(self, full_name: str, source: str, comment: str = "") -> None:
@@ -1965,6 +2117,30 @@ class FakeDatabricks:
             self.genie_acl[space_id] = {}
         return space_id
 
+    def _table_summaries(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:
+        """ListTableSummaries: the tables of a catalog; the name patterns are SQL LIKEs."""
+        cat = (q.get("catalog_name") or [""])[0]
+
+        def like(key: str) -> "re.Pattern[str]":
+            text = (q.get(key) or ["%"])[0]
+            body = "".join(".*" if c == "%" else "." if c == "_" else re.escape(c) for c in text)
+            return re.compile(f"^{body}$")
+
+        schemas, tables = like("schema_name_pattern"), like("table_name_pattern")
+        names = sorted(
+            n
+            for n in self.tables
+            if n.split(".")[0] == cat
+            and schemas.match(n.split(".")[1])
+            and tables.match(n.split(".")[2])
+        )
+        return 200, self._page(
+            names,
+            q,
+            "tables",
+            lambda n: {"full_name": n, "table_type": self.tables[n].get("table_type")},
+        )
+
     def _page(
         self, names: List[str], q: Any, key: str, row: Callable[[str], Any]
     ) -> Dict[str, Any]:
@@ -2029,6 +2205,7 @@ class FakeDatabricks:
             "comment": t.get("comment"),
             "storage_location": f"s3://fake-root/{full}",
             "created_at": t["created_at"],
+            **({"view_definition": t["view_definition"]} if t.get("view_definition") else {}),
         }
 
     def _delete_table(self, m: Any, q: Any, b: Any) -> Tuple[int, Any]:

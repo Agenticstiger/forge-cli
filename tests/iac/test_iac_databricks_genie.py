@@ -129,6 +129,15 @@ def site_contract(**block: Any) -> Dict[str, Any]:
                     "name": "site_360_semantic_model",
                     "defaultAggTimeDimension": "snapshot_date",
                     "entities": [{"name": "site_id", "type": "primary", "expr": "site_id"}],
+                    # A non-additive measure is ordered by a time dimension of its own model
+                    # (MetricFlow's rule, and the metric view's window).
+                    "dimensions": [
+                        {
+                            "name": "snapshot_date",
+                            "type": "time",
+                            "typeParams": {"timeGranularity": "day"},
+                        }
+                    ],
                     "measures": [
                         {
                             "name": "site_count",
@@ -1128,7 +1137,11 @@ def test_a_missing_sdk_stops_a_genie_apply_before_tofu(monkeypatch):
     with pytest.raises(genie.GenieError) as exc:
         PLUGIN.pre_apply(site_contract(), say=print, client_factory=missing)
     assert "databricks-sdk is not installed" in str(exc.value)
-    PLUGIN.pre_apply(without_block(site_contract()), say=print, client_factory=missing)
+    # Without the block, and with no metric view to make (its semantics would declare one),
+    # nothing needs the client before tofu apply.
+    plain = without_block(site_contract())
+    del plain["exposes"][0]["semantics"]
+    PLUGIN.pre_apply(plain, say=print, client_factory=missing)
 
     class Plugin:
         def pre_apply(self, contract, say=None, dry_run=False):

@@ -87,6 +87,12 @@ resources, with no new schema field (fluid-schema 0.7.6):
   A predicate that is not one boolean expression over the table's columns is
   ``databricks-row-filter-invalid``; ``access: allow``, a principal with no SQL test and a text
   mask on a non-string column are refused too. ``fluid verify`` checks the bindings.
+* An expose's ``semantics`` block is a Unity Catalog metric view beside its table,
+  ``<catalog>.<schema>.<table>_semantic_model``, created on the SQL warehouse after
+  ``tofu apply`` (the provider has no metric view resource, terraform-provider-databricks#4827),
+  readable by exactly the principals that read the table, and dropped before the apply once the
+  contract no longer declares it, in the schemas its tables are in. What metric view YAML cannot
+  express is refused (``databricks_metrics.py``).
 * An expose that states a freshness or completeness SLO (``qos.freshnessSLO``,
   ``qos.completenessTarget``, ``observability.defaultSLIs``, a ``contract.dq.rules``
   entry of type ``freshness``, ``completeness`` or ``anomaly_detection``) turns on
@@ -191,6 +197,7 @@ from ..principals import (
 )
 from ..provider_match import canonical_cloud, is_cloud
 from ..versions import required_providers
+from . import databricks_metrics as _metric_views
 from .databricks_access import TableEnforcement, compile_enforcement
 from .databricks_auth import tofu_env_overlay
 from .databricks_enforce import (
@@ -374,6 +381,8 @@ class _Compiled:
     warnings: List[str] = field(default_factory=list)
     #: ``(entity type, full name, tag key, tag value)`` per tag assignment emitted.
     tags: List[Tuple[str, str, str, str]] = field(default_factory=list)
+    #: The metric views of the exposes that declare ``semantics`` (``databricks_metrics.py``).
+    metric_views: _metric_views.MetricViews = field(default_factory=_metric_views.MetricViews)
     #: The data quality monitor emitted per schema (``databricks_quality.py``).
     monitors: List[SchemaMonitor] = field(default_factory=list)
 
@@ -1409,6 +1418,9 @@ def _compile(
         _emit_grants(compiled, table, cid, privileges.get(table.full_name, {}))
         _emit_tags(compiled, table, cid, contract)
     _check_own_keys(compiled, contract)
+    compiled.metric_views = _metric_views.compile_metric_views(
+        contract, compiled.tables, privileges, refusals, compiled.warnings
+    )
     _emit_quality_monitors(compiled, cid)
     _merge_jobs(
         compiled,
@@ -2420,11 +2432,14 @@ class DatabricksIacPlugin:
         )
 
     @staticmethod
-    def _enforcement_targets(contract: Mapping[str, Any]) -> List[Target]:
+    def _hook_state(
+        contract: Mapping[str, Any],
+    ) -> Tuple[List[Target], _metric_views.MetricViews]:
         compiled = _compile(contract, os.environ)
         if compiled.refusals:
             raise compiled.refusals[0]
-        return [Target(table.full_name, table.enforcement) for table in compiled.tables]
+        targets = [Target(table.full_name, table.enforcement) for table in compiled.tables]
+        return targets, compiled.metric_views
 
     def pre_apply(
         self,
@@ -2433,20 +2448,25 @@ class DatabricksIacPlugin:
         dry_run: bool = False,
         client_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
-        """Before ``tofu apply``: bind the contract's column masks and row filter on the
-        tables that already exist (``databricks_enforce.pre_apply``), so a grant the apply
-        adds lands on a protected table. With ``dry_run`` it prints every statement either
-        hook would run, and runs none. Raises :class:`UnsupportedBindingError` to stop the
+        """Before ``tofu apply``: check the Genie space's client (``databricks_genie.preflight``);
+        settle the metric views (``databricks_metrics.pre_apply``: refuse a name an object this
+        module did not create holds, revoke readers the contract no longer names, drop this
+        product's views it no longer declares); then bind the contract's column masks and row
+        filter on the tables that already exist (``databricks_enforce.pre_apply``), so a grant
+        the apply adds lands on a protected table. With ``dry_run`` it prints every statement
+        the hooks would run, and runs none. Raises :class:`UnsupportedBindingError` to stop the
         run before the apply."""
-        targets = self._enforcement_targets(contract)
+        targets, views = self._hook_state(contract)
         say = say or print
         if dry_run:
             preview(targets, say, client_factory)
             _declare_keys(contract, say, client_factory, dry_run=True)
+            _metric_views.preview(views, say, client_factory)
         else:
             from .databricks_genie import preflight
 
             preflight(_genie(contract, _compile(contract, os.environ), os.environ), client_factory)
+            _metric_views.pre_apply(views, say, client_factory)
             pre_apply(targets, say, client_factory)
 
     def post_apply(
@@ -2458,18 +2478,23 @@ class DatabricksIacPlugin:
     ) -> None:
         """After ``tofu apply``: bind on the tables it created, drop what the contract no
         longer restricts, and revoke ``SELECT`` from the restricted principals of any table
-        it could not bind (``databricks_enforce.post_apply``). ``after_failed_apply`` is the
-        bind-only mode for an apply that failed part way: it drops nothing and skips a table
-        that was never created. Then, after an apply that succeeded, the contract's Unity
-        Catalog keys (:func:`_declare_keys`)."""
-        post_apply(
-            self._enforcement_targets(contract),
-            say or print,
-            client_factory,
-            after_failed_apply=after_failed_apply,
-        )
+        it could not bind (``databricks_enforce.post_apply``). When a binding fails, ``SELECT`` on
+        the metric views over restricted tables is revoked before the error is raised. After an
+        apply that succeeded, the contract's Unity Catalog keys (:func:`_declare_keys`), then its
+        metric views created, updated and granted (``databricks_metrics.post_apply``).
+        ``after_failed_apply`` is the bind-only mode for an apply that failed part way: it drops
+        nothing, skips a table that was never created and leaves the keys and the metric views
+        to the next apply."""
+        targets, views = self._hook_state(contract)
+        say = say or print
+        try:
+            post_apply(targets, say, client_factory, after_failed_apply=after_failed_apply)
+        except UnsupportedBindingError:
+            _metric_views.lock_restricted(views, say, client_factory)
+            raise
         if not after_failed_apply:
-            _declare_keys(contract, say or print, client_factory)
+            _declare_keys(contract, say, client_factory)
+            _metric_views.post_apply(views, say, client_factory)
 
     def post_build(
         self,
@@ -2844,6 +2869,7 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "tag_value": tag_value,
             }
         )
+    actions.extend(compiled.metric_views.plan_actions())
     actions.extend(_monitor_actions(compiled.monitors))
     actions.extend(_job_actions(compiled.jobs))
     unique: Dict[Tuple[str, str], Dict[str, Any]] = {}
