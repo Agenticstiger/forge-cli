@@ -124,7 +124,7 @@ def compile_tests(
     rules = read_rules(contract, exposures)
     monitored = _monitored(exposures)
     for refused in rules.refusals:
-        if refused.rule_type == "anomaly_detection":
+        if refused.rule_type == "anomaly_detection" and refused.needs_history:
             if refused.expose_id in monitored:
                 continue  # Databricks data quality monitoring runs it (databricks_quality.py)
             out.refusals.append(
@@ -224,17 +224,31 @@ def _test_folder(
     project: _Project, where: str, refusals: List[UnsupportedBindingError]
 ) -> Optional[PurePosixPath]:
     """``<first test path>/fluid_dq``, where the generated tests go."""
-    if project.test_paths:
-        return PurePosixPath(project.test_paths[0]) / TEST_DIR
-    refusals.append(
-        _refusal(
-            "test-path",
-            f"{where} dbt_project.yml sets test-paths to an empty list, so dbt reads no "
-            "test file and the contract rules would not run.",
-            "Leave test-paths out (dbt reads tests/), or name a directory.",
+    if not project.test_paths:
+        refusals.append(
+            _refusal(
+                "test-path",
+                f"{where} dbt_project.yml sets test-paths to an empty list, so dbt reads no "
+                "test file and the contract rules would not run.",
+                "Leave test-paths out (dbt reads tests/), or name a directory.",
+            )
         )
-    )
-    return None
+        return None
+    first = project.test_paths[0]
+    try:
+        first.encode("utf-8")
+    except UnicodeEncodeError:  # an unpaired surrogate (a YAML escape loads one)
+        refusals.append(
+            _refusal(
+                "test-path",
+                f"{where} dbt_project.yml's first test path {first!r} holds an unpaired "
+                "surrogate, which no file path can hold, and the contract rules' tests are "
+                "written under it.",
+                "Write the test path in plain text.",
+            )
+        )
+        return None
+    return PurePosixPath(first) / TEST_DIR
 
 
 def _add_test(

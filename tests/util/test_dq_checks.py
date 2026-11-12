@@ -207,6 +207,13 @@ class TestTypes:
     @pytest.mark.parametrize("kind", ["anomaly_detection", "drift_detection"])
     def test_history_rules_are_refused(self, kind):
         assert "the table's history" in _refused(_rule(kind, "*"))
+        assert all(refusal.needs_history for refusal in _read(_rule(kind, "*")).refusals)
+
+    def test_a_history_rule_written_wrong_is_refused_for_that(self):
+        # An engine that keeps the history (data quality monitoring) still needs a rule it
+        # can read: this refusal is not one it takes over.
+        (refusal,) = _read(_rule("anomaly_detection", "*", severity="bogus")).refusals
+        assert "severity" in refusal.message and not refusal.needs_history
 
 
 class TestTheRuleAsWritten:

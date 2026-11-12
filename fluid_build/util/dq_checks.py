@@ -145,6 +145,10 @@ class DqRefusal:
     #: The rule's ``type``: an engine that runs some types another way (Databricks data quality
     #: monitoring learns ``anomaly_detection`` bounds itself) can tell which refusals are its own.
     rule_type: str = ""
+    #: The one refusal such an engine takes over: the rule is judged against the table's
+    #: history. A rule it cannot read either (a bad severity, an id holding a control
+    #: character) is refused with ``needs_history`` false, as any other.
+    needs_history: bool = False
 
 
 @dataclass
@@ -332,6 +336,7 @@ class _Rule:
                     "judged against the table's history",
                     "Check it with fluid test against the deployed table (it reads an "
                     "anomaly_detection threshold as a row count), or remove it from this expose.",
+                    needs_history=True,
                 )
             else:
                 self.refuse(
@@ -697,7 +702,7 @@ class _Rule:
         # product's table another way can still check it; one that cannot refuses.
         return Reference(product_id, exposes[0] if exposes else None, column)
 
-    def refuse(self, problem: str, fix: str) -> None:
+    def refuse(self, problem: str, fix: str, *, needs_history: bool = False) -> None:
         self.refusals.append(
             DqRefusal(
                 rule_id=self.rule_id,
@@ -705,6 +710,7 @@ class _Rule:
                 message=f"rule {self.rule_id!r} ({self.type or 'no type'}) {problem}",
                 fix=fix,
                 rule_type=self.type,
+                needs_history=needs_history,
             )
         )
 

@@ -318,6 +318,15 @@ class TestRefusals:
         assert not compiled.refusals, _kinds(compiled)
         assert "volume" not in compiled.jobs[0].tests
 
+    @pytest.mark.parametrize("field, value", [("severity", "bogus"), ("id", "vol\nume")])
+    def test_a_monitored_anomaly_rule_written_wrong_is_still_refused(self, tmp_path, field, value):
+        # Monitoring takes over only what needs the table's history.
+        _project(tmp_path)
+        anomaly = {"id": "volume", "type": "anomaly_detection", "selector": "*", "severity": "warn"}
+        anomaly[field] = value
+        text = self._refused(tmp_path, _contract(rules=[*RULES, anomaly]), "rule")
+        assert "monitoring back on" not in text
+
     def test_an_anomaly_rule_with_monitoring_turned_off_is_refused(self, tmp_path):
         _project(tmp_path)
         anomaly = {"id": "volume", "type": "anomaly_detection", "selector": "*", "severity": "warn"}
@@ -478,6 +487,13 @@ class TestRefusals:
         del contract["builds"][0]["properties"]
         compiled = _compile(contract, tmp_path, validating=True)
         assert "databricks-job-dq-model" not in _kinds(compiled), _kinds(compiled)
+
+    def test_a_test_path_no_file_can_hold_is_refused_not_raised(self, tmp_path):
+        # YAML's escape loads a lone surrogate: no test file could be written under it.
+        _project(tmp_path, config='test-paths: ["t\\ud83d"]\n')
+        text = self._refused(tmp_path, _contract(), "test-path")
+        assert "plain text" in text
+        text.encode("utf-8")  # the refusal prints: it names the path escaped
 
     def test_an_empty_test_paths_is_refused(self, tmp_path):
         _project(tmp_path, config="test-paths: []\n")
