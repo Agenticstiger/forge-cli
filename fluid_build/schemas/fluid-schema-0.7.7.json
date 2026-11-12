@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://open-data-protocol.github.io/fluid/schema/fluid-schema-0.7.7.json",
   "title": "FLUID 0.7.7 — Preview: recursive streaming types",
-  "description": "Opt-in preview. Adds recursive struct fields, array elements and map key/value types. Stable 0.7.6 is unchanged.",
+  "description": "Opt-in preview. Adds recursive struct fields, array elements and map key/value types, and the lakeflow build engine (Databricks Lakeflow Declarative Pipelines). Stable 0.7.6 is unchanged.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -3234,7 +3234,8 @@
                 "dlt",
                 "kafka-connect",
                 "debezium",
-                "flink"
+                "flink",
+                "lakeflow"
               ]
             },
             {
@@ -3242,7 +3243,7 @@
             }
           ],
           "default": "dbt",
-          "description": "Build/ingestion engine. Transformation engines: dbt, sql, python, spark, glue, custom. Adapter-qualified dbt engines (dbt-<adapter>, e.g. dbt-glue, dbt-snowflake, dbt-bigquery) are accepted too and route through the dbt build runner, which derives the adapter from the suffix. Ingestion engines (acquisition pattern only): duckdb (zero-infra files/JDBC), airbyte (350+ SaaS), meltano (Singer 600+ taps), dlt (Python-native), kafka-connect (streaming), debezium (CDC). AWS Glue: glue (Spark ETL jobs managed by Glue). NEW in v0.7.6: flink (Apache Flink jobs, usually long-running streaming SQL with properties.language: flink_sql). forge-cli validates and plans a flink build but ships no runner for it: the platform that runs the job, such as the Flink Kubernetes Operator or AWS Managed Service for Apache Flink, executes it. Put deployment settings under properties.parameters, for example parallelism and upgradeMode, as the Flink Kubernetes Operator's job spec names them, and flinkConfiguration."
+          "description": "Build/ingestion engine. Transformation engines: dbt, sql, python, spark, glue, custom. Adapter-qualified dbt engines (dbt-<adapter>, e.g. dbt-glue, dbt-snowflake, dbt-bigquery) are accepted too and route through the dbt build runner, which derives the adapter from the suffix. Ingestion engines (acquisition pattern only): duckdb (zero-infra files/JDBC), airbyte (350+ SaaS), meltano (Singer 600+ taps), dlt (Python-native), kafka-connect (streaming), debezium (CDC). AWS Glue: glue (Spark ETL jobs managed by Glue). NEW in v0.7.6: flink (Apache Flink jobs, usually long-running streaming SQL with properties.language: flink_sql). forge-cli validates and plans a flink build but ships no runner for it: the platform that runs the job, such as the Flink Kubernetes Operator or AWS Managed Service for Apache Flink, executes it. Put deployment settings under properties.parameters, for example parallelism and upgradeMode, as the Flink Kubernetes Operator's job spec names them, and flinkConfiguration. NEW in v0.7.7: lakeflow (a Databricks Lakeflow Declarative Pipeline: pattern embedded-logic, properties.sql is the SELECT of the dataset an expose binds; forge-cli writes the materialized view around it, with the expose's columns and its dq.rules as pipeline expectations, and fluid apply provisions one serverless pipeline per build)."
         },
         "capabilities": {
           "type": "array",
