@@ -559,7 +559,8 @@ def test_joins_genie_adds_from_unity_catalog_keys_are_taken_out_at_once(fake):
     assert "Genie added 2 join(s) of its own as it made the space" in first.text
     assert "the space holds the 3 the contracts declare" in first.text
     assert json.loads(only_space(fake)["serialized_space"])["instructions"]["join_specs"] == ours
-    assert Run(fake)(*three()).writes() == []
+    rerun = Run(fake)(*three())
+    assert rerun.writes() == []
 
     Run(fake)(sites(), tenancy())  # billing leaves the space
     back = Run(fake)(*three())  # and comes back: Genie joins it again
@@ -583,7 +584,8 @@ def test_a_product_left_out_of_a_run_leaves_the_space(fake):
         ("group_name", "analysts"): "CAN_RUN",
         ("group_name", "stewards"): "CAN_RUN",
     }
-    assert Run(fake)(sites(), tenancy()).writes() == []
+    rerun = Run(fake)(sites(), tenancy())
+    assert rerun.writes() == []
 
 
 def test_a_table_not_applied_yet_is_named_with_its_product_before_anything_is_written(fake):
@@ -617,16 +619,19 @@ def test_remove_trashes_the_estates_space_and_nothing_else(fake):
     )
 
     dry = Run(fake)
-    assert dry.remove(dry_run=True) == 1 and dry.writes() == []
+    removed = dry.remove(dry_run=True)
+    assert removed == 1 and dry.writes() == []
     assert f"would trash 'towers' ({estate_id})" in dry.text
 
     run = Run(fake)
-    assert run.remove() == 1
+    removed = run.remove()
+    assert removed == 1
     assert run.writes() == [("DELETE", f"/api/2.0/genie/spaces/{estate_id}")]
     assert set(fake.genie_spaces) == {product_space, other_estate}
 
     again = Run(fake)
-    assert again.remove() == 0 and again.writes() == []
+    removed = again.remove()
+    assert removed == 0 and again.writes() == []
     assert f"no Genie space in this identity's folder carries {MARKER}: nothing to trash." in (
         again.text
     )
