@@ -58,6 +58,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Set,
     Tuple,
 )
 from urllib.parse import quote as url_quote
@@ -92,6 +93,7 @@ _READ_ATTEMPTS = 5
 #: Event-log pages read for one update, newest first (250 events each).
 _EVENT_PAGES = 20
 _ERRORS_SHOWN = 3
+_MAX_TAG_PAGES = 100
 #: Where a failed expectation's error starts quoting the record that failed it. Databricks'
 #: EXPECTATION_VIOLATION text reads "... Violated expectations: '<rule>'. Input data: '{...}'.
 #: Output record: '{...}'. Missing input data: false": a row of the table, or of what its query
@@ -571,17 +573,33 @@ def _entity(kind: str, name: str) -> str:
 
 
 def _tags_on(api: Any, kind: str, name: str) -> Dict[str, Tuple[str, str]]:
-    """The tags set on ``name`` itself (not inherited): key to ``(value, updated_by)``."""
-    got = _mapping(api.do("GET", _entity(kind, name)))
-    items = got.get("tag_assignments")
-    return {
-        str(item.get("tag_key")): (
-            str(item.get("tag_value") or ""),
-            str(item.get("updated_by") or ""),
-        )
-        for item in (items if isinstance(items, list) else ())
-        if isinstance(item, Mapping) and item.get("tag_key") and not item.get("inherited")
-    }
+    """The tags set on ``name`` itself (not inherited): key to ``(value, updated_by)``.
+
+    Every page of the list is read, as ``fluid verify`` reads it
+    (``_verify_databricks._live_tags``): a tag on a later page read as absent would be set
+    again, or never removed. A token seen twice, or more than :data:`_MAX_TAG_PAGES` pages,
+    is a list that never ends, and an error.
+    """
+    tags: Dict[str, Tuple[str, str]] = {}
+    token: Optional[str] = None
+    seen: Set[str] = set()
+    for _ in range(_MAX_TAG_PAGES):
+        query = {"page_token": token} if token else None
+        got = _mapping(api.do("GET", _entity(kind, name), query=query))
+        items = got.get("tag_assignments")
+        for item in items if isinstance(items, list) else ():
+            if isinstance(item, Mapping) and item.get("tag_key") and not item.get("inherited"):
+                tags[str(item["tag_key"])] = (
+                    str(item.get("tag_value") or ""),
+                    str(item.get("updated_by") or ""),
+                )
+        token = str(got.get("next_page_token") or "") or None
+        if not token:
+            return tags
+        if token in seen:
+            break
+        seen.add(token)
+    raise RuntimeError(f"the tag list of {name} never ended")
 
 
 def _set_tags(

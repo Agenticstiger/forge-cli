@@ -198,14 +198,13 @@ class _Api:
         no_table: bool = False,
         fail_update_reads: bool = False,
         fail_post_tag: Optional[str] = None,
+        tag_page_size: int = 0,
     ) -> None:
         self.states = list(states or ["WAITING_FOR_RESOURCES", "RUNNING", "COMPLETED"])
         self.events = _good_events() if events is None else events
-        self.properties = (
-            {"fluid.tags": "old_key,fluid_layer", "fluid.column_tags": "method,dropped_col"}
-            if properties is None
-            else properties
-        )
+        self.properties = {} if properties is None else properties
+        #: Tags per page of a tag list (0: one page), as the real list pages them.
+        self.tag_page_size = tag_page_size
         self.tags = tags if tags is not None else {}
         #: ``(kind, name, key) -> updated_by``; a tag not listed was set by ``me``.
         self.owners = dict(owners or {})
@@ -246,17 +245,23 @@ class _Api:
             kind, name, key = found.groups()
             held = self.tags.setdefault((kind, name), {})
             if method == "GET":
-                return {
-                    "tag_assignments": [
-                        {
-                            "tag_key": k,
-                            "tag_value": v,
-                            "updated_by": self.owners.get((kind, name, k), ME),
-                            "inherited": (kind, name, k) in self.inherited,
-                        }
-                        for k, v in held.items()
-                    ]
-                }
+                listed = [
+                    {
+                        "tag_key": k,
+                        "tag_value": v,
+                        "updated_by": self.owners.get((kind, name, k), ME),
+                        "inherited": (kind, name, k) in self.inherited,
+                    }
+                    for k, v in held.items()
+                ]
+                if not self.tag_page_size:
+                    return {"tag_assignments": listed}
+                start = int((query or {}).get("page_token") or 0)
+                end = start + self.tag_page_size
+                page: Dict[str, Any] = {"tag_assignments": listed[start:end]}
+                if end < len(listed):
+                    page["next_page_token"] = str(end)
+                return page
             assert method == "DELETE"
             held.pop(key, None)
             return {}
@@ -610,6 +615,37 @@ def test_tags_are_set_changed_removed_and_left_alone(compiled):
     assert api.tags[declassified] == {"other": "keep"}
     # No table-property record is read any more.
     assert api.paths("GET", "/unity-catalog/tables/") == []
+
+
+def test_every_page_of_a_tag_list_is_read(compiled):
+    """A declared tag on the second page is not set again, and a stale one there is removed."""
+    api = _Api(
+        tags={("tables", TABLE): {"stray": "keep", "fluid_layer": "Silver", "old_key": "x"}},
+        owners={("tables", TABLE, "stray"): "steward@example.com"},
+        tag_page_size=1,
+    )
+    rc, _lines = _wait(api, compiled)
+
+    assert rc == 0
+    writes = api.tag_writes()
+    assert ("POST", TABLE, "fluid_layer") not in writes
+    assert ("DELETE", TABLE, "old_key") in writes
+    assert ("DELETE", TABLE, "stray") not in writes
+
+
+def test_a_tag_list_that_never_ends_fails_the_build(compiled, capsys):
+    class _Endless(_Api):
+        def do(self, method, path, query=None, body=None, **kw):
+            if method == "GET" and "entity-tag-assignments" in path:
+                self.calls.append((method, path, query, body))
+                return {"tag_assignments": [], "next_page_token": "same"}
+            return super().do(method, path, query, body, **kw)
+
+    api = _Endless()
+    rc, lines = _wait(api, compiled)
+
+    assert rc == 1
+    assert "never ended" in _text(lines, capsys)
 
 
 def test_an_unreadable_identity_removes_nothing_but_still_sets(compiled):
