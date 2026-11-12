@@ -1412,7 +1412,10 @@ def _print_copilot_readiness(readiness: LlmReadinessCheck, verbose: bool = False
     status_text = "✅ Ready" if readiness.ready else "⚠️  Setup needed"
     auth_text = "Configured" if readiness.auth_available else "Missing"
     # No endpoint of ours is not "not configured": litellm picks the provider's own.
-    endpoint_text = readiness.endpoint or (
+    # An endpoint can carry ``user:password@``, so it is shown masked.
+    from fluid_build.llm.providers import redact_endpoint
+
+    endpoint_text = redact_endpoint(readiness.endpoint) or (
         "Provider default" if readiness.provider else "Not configured"
     )
 

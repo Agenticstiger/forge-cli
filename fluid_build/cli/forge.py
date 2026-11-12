@@ -28,7 +28,7 @@ from fluid_build._console import literal_error_text, literal_text
 from fluid_build.cli.artifact_envelope import dump_json_with_envelope
 from fluid_build.cli.artifact_paths import product_forge_receipt_path
 from fluid_build.cli.artifact_receipts import ReceiptBuilder
-from fluid_build.cli.artifact_scan import diff_snapshots, snapshot_workspace
+from fluid_build.cli.artifact_scan import ArtifactSnapshot, diff_snapshots, snapshot_workspace
 from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_banner import print_v2_banner
@@ -1657,12 +1657,12 @@ def _run_main(args, logger: logging.Logger) -> int:
             return _run_watch(args, logger)
 
         # --- Snapshot for the forge receipt ---
-        # Scan cwd before any mode runs so the diff catches every file the
-        # mode handler wrote.  find_workspace_root is cheap and localised;
-        # if this isn't a workspace yet, we fall back to cwd and still
-        # produce a receipt.
+        # Scan cwd (and an explicit --target-dir) before any mode runs so the
+        # diff catches every file the mode handler wrote.  find_workspace_root
+        # is cheap and localised; if this isn't a workspace yet, we fall back
+        # to cwd and still produce a receipt.
         scan_root = Path.cwd()
-        before_snapshot = snapshot_workspace(scan_root)
+        before_snapshot = _forge_snapshot(scan_root, args)
         import fluid_build.cli.forge as _self
 
         _self.reset_token_usage()
@@ -2049,6 +2049,23 @@ def load_context(
 _AGENT_EVENT_ACTIONS = {"create": "created", "update": "modified"}
 
 
+def _forge_snapshot(scan_root: Path, args: Any) -> ArtifactSnapshot:
+    """Snapshot *scan_root*, plus the explicit ``--target-dir`` when one is given.
+
+    The cwd scan reaches contracts two directory levels down. A target outside
+    cwd, or deeper than that, needs its own scan, or the receipt and the
+    ``--agent`` ``forge.contract_written`` event miss the contract written
+    there. A file under both roots is keyed by its resolved path, so it is
+    counted once; one outside cwd is reported by its absolute path.
+    """
+    snapshot = snapshot_workspace(scan_root)
+    target_dir = get_cli_arg(args, "target_dir", None)
+    if isinstance(target_dir, (str, os.PathLike)) and str(target_dir):
+        # ``~`` as the writer reads it (``forge_modes`` expands the target too).
+        snapshot.files.update(snapshot_workspace(Path(target_dir).expanduser()).files)
+    return snapshot
+
+
 def _write_forge_receipt(
     *,
     flow: str,
@@ -2070,7 +2087,7 @@ def _write_forge_receipt(
     recently modified one.
     """
     try:
-        after_snapshot = snapshot_workspace(scan_root)
+        after_snapshot = _forge_snapshot(scan_root, args)
         entries = diff_snapshots(before_snapshot, after_snapshot)
         # Ignore no-op rows — the receipt only records what changed.
         changed = [e for e in entries if e.action != "unchanged"]

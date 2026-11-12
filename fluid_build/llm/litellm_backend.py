@@ -18,16 +18,15 @@ to a :class:`LiteLLMProvider` shim.
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
 import os
 import sys
 import threading
 import time
-import urllib.parse
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
+from fluid_build.llm.ollama_host import ollama_base_url, ollama_daemon_url
 from fluid_build.llm.providers import (
     CopilotGenerationError,
     LlmConfig,
@@ -257,43 +256,6 @@ def _is_anthropic_model(model_id: str) -> bool:
     return "claude" in lower
 
 
-def _ollama_base_url(env: Mapping[str, str]) -> str:
-    """``OLLAMA_HOST`` as a URL, or ``""`` when unset.
-
-    Ollama's own variable accepts forms litellm and ``urllib`` cannot dial as
-    they are (a bare ``host``, ``host:port``, ``:port``), so it is normalised
-    with the convention of ollama-python's ``_parse_host`` (MIT,
-    github.com/ollama/ollama-python, ``ollama/_client.py``): no scheme means
-    ``http`` on the default port 11434; an explicit ``http://`` or ``https://``
-    without a port means port 80 or 443; a path is kept. Both reads of
-    ``OLLAMA_HOST`` in this module go through here, so they agree.
-    """
-    host = (env.get("OLLAMA_HOST") or "").strip()
-    if not host:
-        return ""
-    port = 11434
-    scheme, _, hostport = host.partition("://")
-    if not hostport:
-        scheme, hostport = "http", host
-    elif scheme == "http":
-        port = 80
-    elif scheme == "https":
-        port = 443
-    try:
-        split = urllib.parse.urlsplit(f"{scheme}://{hostport}")
-        name = split.hostname or "127.0.0.1"
-        port = split.port or port
-    except ValueError:  # e.g. a non-numeric port: leave it to fail visibly at the dial
-        return f"{scheme}://{hostport}".rstrip("/")
-    try:
-        if isinstance(ipaddress.ip_address(name), ipaddress.IPv6Address):
-            name = f"[{name}]"  # urlsplit strips the brackets
-    except ValueError:
-        pass  # a hostname, not an IP literal
-    path = split.path.strip("/")
-    return f"{scheme}://{name}:{port}" + (f"/{path}" if path else "")
-
-
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -330,7 +292,7 @@ class LiteLLMProvider(LlmProvider):
         reported. Never a placeholder URL: every consumer of ``config.endpoint``
         treats a non-empty value as an address to dial.
         """
-        return _ollama_base_url(env) if self.name == "ollama" else ""
+        return ollama_base_url(env) if self.name == "ollama" else ""
 
     def _apply_ollama_api_base(self, payload: Dict[str, Any], config: LlmConfig) -> None:
         """Point an Ollama call at an explicit endpoint, else ``OLLAMA_HOST``.
@@ -340,7 +302,7 @@ class LiteLLMProvider(LlmProvider):
         """
         if self.name != "ollama":
             return
-        api_base = config.endpoint or _ollama_base_url(os.environ)
+        api_base = ollama_base_url(os.environ, config.endpoint)
         if api_base:
             payload["api_base"] = api_base
 
@@ -478,7 +440,10 @@ class LiteLLMProvider(LlmProvider):
         return available_models[0]
 
     def list_available_models(
-        self, api_key: Optional[str], env: Mapping[str, str]
+        self,
+        api_key: Optional[str],
+        env: Mapping[str, str],
+        endpoint: Optional[str] = None,
     ) -> Optional[List[str]]:
         """Return the model ids litellm knows for this provider.
 
@@ -487,16 +452,17 @@ class LiteLLMProvider(LlmProvider):
         kept current upstream — so a stale catalog default in
         fluid_build can be auto-corrected to a live name. Falls back
         to ``None`` (preflight unavailable) when litellm is missing or
-        the provider isn't in its registry.
+        the provider isn't in its registry. For Ollama the list is the
+        live one of the daemon at *endpoint*, else ``OLLAMA_HOST``.
         """
         try:
             litellm = _get_litellm()
         except CopilotGenerationError:
             return None
-        # Ollama: hit the local daemon for live model list. Everything
+        # Ollama: ask the daemon for its live model list. Everything
         # else: read litellm's static models_by_provider map.
         if self.name == "ollama":
-            return _list_ollama_models(env)
+            return _list_ollama_models(env, endpoint)
         provider_key = _LITELLM_PREFIX_BY_PROVIDER.get(self.name, self.name)
         registry = getattr(litellm, "models_by_provider", None) or {}
         ids = registry.get(provider_key)
@@ -776,23 +742,29 @@ class LiteLLMProvider(LlmProvider):
 # ---------------------------------------------------------------------------
 
 
-def _list_ollama_models(env: Mapping[str, str]) -> Optional[List[str]]:
-    """Hit the local Ollama daemon for its installed model list.
+def _list_ollama_models(
+    env: Mapping[str, str], endpoint: Optional[str] = None
+) -> Optional[List[str]]:
+    """Ask the Ollama daemon for its installed model list.
 
-    litellm doesn't ship a static Ollama catalog (model ids depend on
-    what the user has pulled). The daemon's ``/api/tags`` endpoint
-    returns the live list. Returns ``None`` if the daemon isn't
-    reachable so preflight degrades to "unavailable" rather than
-    falsely rejecting models.
+    The daemon is the one the chat call dials: *endpoint* when given, else
+    ``OLLAMA_HOST``, else the default local address. litellm doesn't ship a
+    static Ollama catalog (model ids depend on what the user has pulled). The
+    daemon's ``/api/tags`` endpoint returns the live list. Returns ``None`` if
+    the daemon isn't reachable so preflight degrades to "unavailable" rather
+    than falsely rejecting models.
     """
-    base = _ollama_base_url(env) or "http://localhost:11434"
+    base = ollama_daemon_url(env, endpoint)
+    if not base.startswith(("http://", "https://")):
+        return None  # only an HTTP daemon has a model list; never a file:// read
     try:
-        import urllib.error
-        import urllib.request
+        # httpx, as the chat call's transport: it sends ``user:password@`` as
+        # basic auth, which urllib cannot, and follows no redirect.
+        import httpx
 
-        req = urllib.request.Request(f"{base}/api/tags")
-        with urllib.request.urlopen(req, timeout=2.0) as resp:  # nosec B310 — local daemon
-            payload = json.loads(resp.read().decode("utf-8"))
+        resp = httpx.get(f"{base}/api/tags", timeout=2.0)
+        resp.raise_for_status()
+        payload = resp.json()
     except Exception:  # noqa: BLE001 — daemon down → preflight unavailable
         return None
     models = payload.get("models") if isinstance(payload, dict) else None

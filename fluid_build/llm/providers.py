@@ -56,6 +56,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional
 import httpx
 
 from fluid_build._contract_loader import CLIError
+from fluid_build.llm.ollama_host import ollama_daemon_url
 
 # Per-provider response_format helpers (``openai_response_format``,
 # ``gemini_response_schema_config``, ``anthropic_tool_definition``,
@@ -271,17 +272,25 @@ class LlmConfig:
 
     @property
     def redacted_endpoint(self) -> str:
-        endpoint = self.endpoint
-        # Redact common credential query parameters
-        endpoint = re.sub(
-            r"([?&](?:key|token|api_key|auth|secret|credential|password)=)[^&]+",
-            r"\1***",
-            endpoint,
-            flags=re.I,
-        )
-        # Redact userinfo in URLs (user:pass@host)
-        endpoint = re.sub(r"(https?://)([^@/]+)@", r"\1***:***@", endpoint)
-        return endpoint
+        return redact_endpoint(self.endpoint)
+
+
+def redact_endpoint(endpoint: str) -> str:
+    """*endpoint* fit to show a person: credential query values and all userinfo masked.
+
+    The whole ``user:password@`` goes, not only the password: a token is often
+    passed as a bare username (``https://TOKEN@host``).
+    """
+    endpoint = endpoint or ""
+    # Redact common credential query parameters
+    endpoint = re.sub(
+        r"([?&](?:key|token|api_key|auth|secret|credential|password)=)[^&]+",
+        r"\1***",
+        endpoint,
+        flags=re.I,
+    )
+    # Redact userinfo in URLs (user:pass@host); a URL scheme is case-insensitive.
+    return re.sub(r"(https?://)([^@/]+)@", r"\1***:***@", endpoint, flags=re.I)
 
 
 # ---------------------------------------------------------------------------
@@ -323,10 +332,15 @@ class LlmProvider(ABC):
         return _prompt_cache_metrics(0, 0)
 
     def list_available_models(
-        self, api_key: Optional[str], env: Mapping[str, str]
+        self,
+        api_key: Optional[str],
+        env: Mapping[str, str],
+        endpoint: Optional[str] = None,
     ) -> Optional[List[str]]:
         """Return live provider model ids when a model-list API exists.
 
+        *endpoint* is the address the operator stated for the provider, when
+        there is one: the list must come from where the call will go.
         Providers without a lightweight list endpoint return ``None``.
         Callers should treat that as "preflight unavailable", not as
         "this provider has no models".
@@ -782,16 +796,17 @@ _KEYLESS_PROVIDERS: frozenset = frozenset(
 _NON_LITELLM_PROVIDERS: frozenset = _KEYLESS_PROVIDERS - {"ollama"}
 
 
-def _provider_name_from(args: Any, env: Mapping[str, str]) -> str:
-    """The provider name the flags and environment select (flag, env, key sniff, default)."""
-    return (
-        _explicit_provider_name(args, env)
-        or _infer_provider_from_env(
-            env,
-            non_interactive=bool(getattr(args, "non_interactive", False)),
-            allow_agents=_agents_allowed(args, env),
-        )
-        or "gemini"
+def _provider_name_from(args: Any, env: Mapping[str, str]) -> Optional[str]:
+    """The provider the flags and environment select (flag, env, key sniff, ambient).
+
+    ``None`` when nothing selects one. There is no default provider: guessing
+    one would send ``FLUID_LLM_API_KEY`` to a vendor it may not belong to, and
+    ask for that vendor's key when other keys are set.
+    """
+    return _explicit_provider_name(args, env) or _infer_provider_from_env(
+        env,
+        non_interactive=bool(getattr(args, "non_interactive", False)),
+        allow_agents=_agents_allowed(args, env),
     )
 
 
@@ -861,8 +876,8 @@ def preflight_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = Non
     agent_loop = agent_loop_requested(getattr(args, "agent_loop", False), env)
     if not _explicit_provider_name(args, env):
         # Nothing chosen: inference reads the keyring and probes Ollama, and every
-        # provider it can pick (or the gemini default) needs litellm, except the
-        # coding agent a non-interactive run auto-picks. Without litellm, that
+        # provider it can pick needs litellm, except the coding agent a
+        # non-interactive run auto-picks. Without litellm, that
         # agent is the only provider that can run; otherwise fail first.
         from fluid_build._optional import is_available
 
@@ -898,7 +913,15 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
     """Resolve provider, model, endpoint, and API key from flags and env vars."""
     env = dict(environ or os.environ)
     provider_name = _provider_name_from(args, env)
+    if provider_name is None:
+        # The suggestions come from the error catalog (``_error_catalog``).
+        raise CopilotGenerationError("copilot_no_llm_provider", no_provider_message(env))
     provider = get_llm_provider(provider_name)
+
+    # A stated endpoint is where the call goes, so the Ollama model pick and the
+    # model preflight below ask that daemon, not OLLAMA_HOST or localhost.
+    stated_endpoint = getattr(args, "llm_endpoint", None) or env.get("FLUID_LLM_ENDPOINT")
+    models_endpoint = stated_endpoint if isinstance(stated_endpoint, str) else None
 
     # Resolve model: explicit flag → env var → catalog default → class default.
     catalog_default = get_catalog_default(provider.name)
@@ -907,7 +930,7 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
         model = resolve_model_name(provider.name, explicit_model)
         model_source = "explicit"
     elif provider.name == "ollama":
-        model = resolve_ollama_model(env)
+        model = resolve_ollama_model(env, models_endpoint)
         model_source = "ollama"
     else:
         model = catalog_default or provider.default_model
@@ -963,7 +986,10 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
         if available_models is not None:
             return available_models
         try:
-            available_models = provider.list_available_models(api_key, env)
+            # The keyword goes only with a stated endpoint, so a provider plugin
+            # written against the two-argument signature keeps working without one.
+            stated = {"endpoint": models_endpoint} if models_endpoint else {}
+            available_models = provider.list_available_models(api_key, env, **stated)
         except Exception as exc:  # noqa: BLE001
             raise CopilotGenerationError(
                 "copilot_llm_model_preflight_failed",
@@ -1023,7 +1049,7 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
             model = replacement
             model_source = "live_preflight"
 
-    endpoint = getattr(args, "llm_endpoint", None) or env.get("FLUID_LLM_ENDPOINT")
+    endpoint = stated_endpoint
     endpoint_explicit = bool(endpoint)
     if not endpoint:
         endpoint = provider.default_endpoint(model, env)
@@ -1478,6 +1504,7 @@ from fluid_build.llm.provider_resolve import (  # noqa: E402,F401
     _lean_keyless_autopick,
     _resolve_api_key,
     clear_api_key_from_keyring,
+    no_provider_message,
     save_api_key_to_keyring,
 )
 
@@ -1626,7 +1653,7 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
         LOG.debug("LLM readiness: no provider detected from env or config")
         return LlmReadinessCheck(
             ready=False,
-            error="No LLM provider configured. Run 'fluid ai setup' or set an API key env var.",
+            error=no_provider_message(env),
         )
 
     provider = BUILTIN_LLM_PROVIDERS.get(provider_name)
@@ -1802,23 +1829,7 @@ def build_llm_run_plan(config: "LlmConfig", *, tiered: bool = False) -> Dict[str
 # ---------------------------------------------------------------------------
 
 
-_LOCALHOST_PREFIXES = (
-    "http://localhost",
-    "http://127.0.0.1",
-    "http://[::1]",
-    "http://0.0.0.0",
-)
-
 _ollama_available_cache: Optional[bool] = None
-
-
-def _ollama_host(env: Mapping[str, str]) -> str:
-    host = (env.get("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
-    # SSRF guard: only allow localhost targets for Ollama.
-    if not any(host.lower().startswith(prefix) for prefix in _LOCALHOST_PREFIXES):
-        LOG.warning("OLLAMA_HOST points to a non-localhost address (%s), ignoring.", host)
-        return "http://localhost:11434"
-    return host
 
 
 def detect_ollama_available(env: Mapping[str, str]) -> bool:
@@ -1827,7 +1838,7 @@ def detect_ollama_available(env: Mapping[str, str]) -> bool:
     if _ollama_available_cache is not None:
         return _ollama_available_cache
     try:
-        resp = httpx.get(f"{_ollama_host(env)}/api/version", timeout=1.0)
+        resp = httpx.get(f"{ollama_daemon_url(env)}/api/version", timeout=1.0)
         _ollama_available_cache = resp.status_code == 200
     except Exception:  # noqa: BLE001
         _ollama_available_cache = False
@@ -1847,14 +1858,18 @@ def _parse_param_size(value: str) -> float:
     return number
 
 
-def query_ollama_models(env: Mapping[str, str]) -> List[Dict[str, Any]]:
-    """Query the local Ollama instance for downloaded models.
+def query_ollama_models(
+    env: Mapping[str, str], endpoint: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Query the Ollama daemon for downloaded models.
 
-    Returns a list of model dicts sorted by parameter size (largest first),
-    or an empty list if Ollama is unreachable.
+    The daemon is *endpoint* when given, else ``OLLAMA_HOST``, else the
+    default local address: the one the chat call dials. Returns a list of
+    model dicts sorted by parameter size (largest first), or an empty list
+    if Ollama is unreachable.
     """
     try:
-        resp = httpx.get(f"{_ollama_host(env)}/api/tags", timeout=2.0)
+        resp = httpx.get(f"{ollama_daemon_url(env, endpoint)}/api/tags", timeout=2.0)
         resp.raise_for_status()
         models = resp.json().get("models") or []
         for m in models:
@@ -1866,9 +1881,9 @@ def query_ollama_models(env: Mapping[str, str]) -> List[Dict[str, Any]]:
         return []
 
 
-def resolve_ollama_model(env: Mapping[str, str]) -> str:
-    """Return the best locally-available Ollama model, or the static fallback."""
-    models = query_ollama_models(env)
+def resolve_ollama_model(env: Mapping[str, str], endpoint: Optional[str] = None) -> str:
+    """Return the best model the Ollama daemon has, or the static fallback."""
+    models = query_ollama_models(env, endpoint)
     if models:
         return models[0]["name"]
     return get_catalog_default("ollama") or OllamaProvider.default_model

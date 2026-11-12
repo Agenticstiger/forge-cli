@@ -11,7 +11,7 @@ together.
 Resolves host-module dependencies via the
 ``module-attribute-access`` indirection pattern so test patches on
 ``fluid_build.cli.ai_setup.<helper>`` (e.g. ``_save_ai_config``,
-``_sanitize_ollama_host``) flow through to this module.
+``_normalize_ollama_host``) flow through to this module.
 """
 
 from __future__ import annotations
@@ -33,8 +33,15 @@ def _host():
     return _as
 
 
-def _sanitize_ollama_host(host: str) -> str:
-    return _host()._sanitize_ollama_host(host)
+def _normalize_ollama_host(host: str) -> str:
+    return _host()._normalize_ollama_host(host)
+
+
+def _shown(host: str) -> str:
+    """*host* as printed to the terminal: credentials in the address masked."""
+    from fluid_build.llm.providers import redact_endpoint
+
+    return redact_endpoint(host)
 
 
 def _save_ai_config(*args, **kwargs):
@@ -70,7 +77,7 @@ def _poll_for_ollama(
         char = spinner_chars[tick % len(spinner_chars)]
         try:
             console.print(
-                f"[dim]{char} Waiting for Ollama at {host}… "
+                f"[dim]{char} Waiting for Ollama at {_shown(host)}… "
                 f"({int(deadline - time.time())}s left, Ctrl-C to give up)[/dim]"
             )
         except Exception:  # noqa: BLE001
@@ -129,14 +136,14 @@ def _setup_ollama(console: Any) -> Optional[Any]:
     LlmConfig = host_mod.LlmConfig
 
     provider = BUILTIN_LLM_PROVIDERS["ollama"]
-    host = _sanitize_ollama_host(os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
+    host = _normalize_ollama_host(os.environ.get("OLLAMA_HOST") or "")
     os.environ["OLLAMA_HOST"] = host
 
     available_models = _query_ollama_models(host)
     if not available_models:
         console.print(
             "[yellow]Couldn't reach Ollama at "
-            f"[bold]{host}[/bold] (no models installed or daemon not running)."
+            f"[bold]{_shown(host)}[/bold] (no models installed or daemon not running)."
             "[/yellow]\n"
             "[dim]Install: [bold cyan]https://ollama.com[/bold cyan]  ·  "
             "Then: [bold]ollama pull llama3.1[/bold][/dim]"

@@ -272,8 +272,12 @@ class BaseStageAgent:
             or get_catalog_tier_model(provider_name, self.tier)
             or session.llm_config.model
         )
-        provider = BUILTIN_LLM_PROVIDERS[provider_name]
-        endpoint = provider.default_endpoint(tier_model, dict(os.environ))
+        if session.llm_config.endpoint_explicit:
+            # A stated endpoint is where every call goes, as in ``LlmConfig.for_routing``.
+            endpoint = session.llm_config.endpoint
+        else:
+            provider = BUILTIN_LLM_PROVIDERS[provider_name]
+            endpoint = provider.default_endpoint(tier_model, dict(os.environ))
         return dataclasses.replace(session.llm_config, model=tier_model, endpoint=endpoint)
 
     def cache_namespace(self) -> str:
