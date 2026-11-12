@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from typing import Any, Dict, Iterator, List
 
 import pytest
@@ -1386,6 +1387,74 @@ def test_the_account_users_group_counts_as_every_user(fake):
     assert run.writes() == []
 
 
+class _FolderClient:
+    """Answers the two folder reads with canned documents, as an odd service might."""
+
+    def __init__(self, status: Any, acl: Any):
+        self.api_client = self
+        self._status, self._acl = status, acl
+        self.paths: List[str] = []
+
+    def do(self, method: str, path: str, query: Any = None, body: Any = None) -> Any:
+        self.paths.append(path)
+        return self._status if path == genie.WORKSPACE_STATUS_PATH else self._acl
+
+
+_DIR = {"object_type": "DIRECTORY", "object_id": 5}
+_ADMINS = {"group_name": "admins", "all_permissions": [{"permission_level": "CAN_MANAGE"}]}
+
+
+@pytest.mark.parametrize(
+    "acl",
+    [
+        None,
+        [],
+        {},
+        {"access_control_list": []},
+        {"access_control_list": [_ADMINS, {"group_name": "users"}]},
+        {"access_control_list": [_ADMINS, {"group_name": "users", "all_permissions": None}]},
+        {"access_control_list": [_ADMINS, {"group_name": "users", "all_permissions": ["x"]}]},
+        {
+            "access_control_list": [
+                _ADMINS,
+                {"group_name": "users", "all_permissions": [{"permission_level": "CAN_OWN"}]},
+            ]
+        },
+    ],
+)
+def test_folder_permissions_of_another_shape_stop_the_apply(acl):
+    """Every folder lists admins at least: an answer that says less could hide a grant."""
+    with pytest.raises(genie.GenieError):
+        genie._check_folder(_FolderClient(_DIR, acl), SALES, lambda _line: None)
+
+
+def test_a_level_in_another_case_counts_and_a_folder_without_its_id_stops():
+    acl = {
+        "access_control_list": [
+            _ADMINS,
+            {"group_name": "users", "all_permissions": [{"permission_level": "can_manage"}]},
+        ]
+    }
+    with pytest.raises(genie.GenieError) as exc:
+        genie._check_folder(_FolderClient(_DIR, acl), SALES, lambda _line: None)
+    assert "holds CAN_MANAGE" in str(exc.value)
+    no_id = _FolderClient({"object_type": "DIRECTORY"}, {"access_control_list": [_ADMINS]})
+    with pytest.raises(genie.GenieError) as exc:
+        genie._check_folder(no_id, SALES, lambda _line: None)
+    assert "without its object id" in str(exc.value)
+    assert not any("None" in path for path in no_id.paths)
+
+
+def test_a_move_onto_a_title_the_folder_holds_says_so(fake):
+    in_sales(fake)
+    Run(fake)(site_contract())
+    fake.add_genie_space("Site 360", "another product's", parent_path=SALES)
+    with pytest.raises(genie.GenieError) as exc:
+        Run(fake)(site_contract(parentPath=SALES))
+    assert "another space there is already called 'Site 360'" in str(exc.value)
+    assert "title of its own" in exc.value.remediation[0]
+
+
 def test_folder_permissions_this_identity_cannot_read_stop_the_apply(fake):
     in_sales(fake)
     fake.fail_route("GET", "/api/2.0/permissions/directories/", 403, "no CAN_MANAGE")
@@ -1430,7 +1499,7 @@ def test_dropping_the_block_leaves_a_space_in_the_parent_path_with_a_note(fake):
     run = Run(fake)(without_block(site_contract()))
     assert set(fake.genie_spaces) == {space_id} and run.writes() == []
     assert f"left alone: space {space_id}" in run.text and SALES in run.text
-    assert "If it is this product's space in its parentPath folder, trash it there" in run.text
+    assert "left in a folder the contract no longer names as" in run.text
 
 
 # ---------------------------------------------------------------------- plan, diff, generate iac
@@ -1468,13 +1537,121 @@ def test_the_plan_lists_the_space_as_an_action_outside_the_module(monkeypatch):
     ]
     # fluid plan's hook lists the same action, and none for a contract the emitter refuses.
     assert PLUGIN.planned_output_ports(doc) == [action]
-    assert PLUGIN.planned_output_ports(site_contract(parentPath="/Shared/x")) == []
+    assert PLUGIN.planned_output_ports(without_block(doc)) == []
+    with pytest.raises(UnsupportedBindingError):  # fluid plan says it as a warning
+        PLUGIN.planned_output_ports(site_contract(parentPath="/Shared/x"))
     (own,) = [
         a
         for a in dbx.planned_objects(site_contract())
         if a["resource_type"] == "databricks_genie_space"
     ]
     assert own["parent_path"] is None and " in " not in own["description"].split(":")[0]
+
+
+def _plan_args(**kw: Any) -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(**{"provider": None, "contract": None, **kw})
+
+
+def _planned_spaces(doc: Dict[str, Any], **kw: Any) -> List[Dict[str, Any]]:
+    from fluid_build.cli import plan as plan_cli
+
+    plan: Dict[str, Any] = {"actions": []}
+    plan_cli._append_output_port_actions(plan, doc, _plan_args(**kw), logging.getLogger("t"))
+    return [a for a in plan["actions"] if a.get("resource_type") == "databricks_genie_space"]
+
+
+def test_the_plan_reads_the_contract_as_the_apply_does(monkeypatch):
+    """Its {{ env.* }} resolved: the readers are who the apply shares the space with."""
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, "wh-1")
+    monkeypatch.setenv("FLUID_TEST_NOC", "noc@towers.io")
+    doc = site_contract()
+    doc["exposes"][0]["binding"]["principals"][NOC] = "{{ env.FLUID_TEST_NOC }}"
+    (listed,) = _planned_spaces(doc)
+    assert "noc@towers.io" in listed["readers"]
+    assert not any("{{" in reader for reader in listed["readers"])
+
+
+def test_the_plan_lists_the_space_only_for_the_provider_the_apply_runs(monkeypatch):
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, "wh-1")
+    doc = site_contract()
+    doc["exposes"].append(
+        {
+            "exposeId": "events",
+            "kind": "table",
+            "binding": {
+                "platform": "gcp",
+                "format": "bigquery_table",
+                "location": {"project": "p-1", "dataset": "d", "table": "events"},
+            },
+            "contract": {"schema": [{"name": "id", "type": "STRING"}]},
+        }
+    )
+    assert len(_planned_spaces(doc, provider="databricks")) == 1
+    assert _planned_spaces(doc, provider="gcp") == []
+    assert _planned_spaces(doc) == []  # two clouds: the apply needs --provider too
+
+
+def test_a_refused_contract_is_said_by_the_plan_not_dropped(monkeypatch, caplog):
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, "wh-1")
+    with caplog.at_level(logging.WARNING):
+        assert _planned_spaces(site_contract(parentPath="/Shared/x")) == []
+    assert "plan_output_ports_skipped" in caplog.text and "databricks-genie-folder" in caplog.text
+
+
+def test_a_plan_that_already_holds_the_space_does_not_list_it_twice(monkeypatch):
+    """The native planner (``provider.plan``, the path a plan without the action parser takes)
+    lists the space through ``planned_objects`` already."""
+    from fluid_build.cli import plan as plan_cli
+
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, "wh-1")
+    doc = site_contract(parentPath=SALES)
+    plan = {"actions": dbx.planned_objects(doc)}
+    before = len(plan["actions"])
+    plan_cli._append_output_port_actions(plan, doc, _plan_args(), logging.getLogger("t"))
+    assert len(plan["actions"]) == before
+    assert [a for a in plan["actions"] if a["resource_type"] == "databricks_genie_space"]
+
+
+def test_the_plan_lists_the_space_of_a_product_with_a_local_dbt_build(monkeypatch, tmp_path, capfd):
+    """A local dbt project is read from the contract's directory, which the plan must know."""
+    from ._databricks_cli import isolate_workspace, make_contract, run_fluid, write_contract
+
+    isolate_workspace(
+        monkeypatch,
+        tmp_path,
+        host="https://adb-1.azuredatabricks.net",
+        warehouse_id="wh-0123456789abcdef",
+        plugin_cache=str(tmp_path),
+    )
+    project = tmp_path / "dbt"
+    (project / "models").mkdir(parents=True)
+    (project / "dbt_project.yml").write_text("name: p\n", encoding="utf-8")
+    (project / "models" / "orders.sql").write_text("select 1 as id", encoding="utf-8")
+    doc = make_contract()
+    doc["builds"] = [
+        {
+            "id": "dbt_daily",
+            "engine": "dbt",
+            "pattern": "hybrid-reference",
+            "repository": "./dbt",
+            "properties": {"model": "orders", "select": "orders+"},
+            "outputs": ["orders"],
+            "execution": {
+                "trigger": {"type": "schedule", "cron": "0 2 * * *"},
+                "runtime": {"platform": "databricks"},
+            },
+        }
+    ]
+    doc["extensions"] = {genie.EXTENSION_KEY: {}}
+    path = write_contract(tmp_path, doc)
+    rc, out = run_fluid(capfd, "plan", path, "--out", str(tmp_path / "plan.json"))
+    assert rc == 0, out
+    actions = json.loads((tmp_path / "plan.json").read_text())["actions"]
+    assert [
+        a["resource_id"] for a in actions if a.get("resource_type") == "databricks_genie_space"
+    ] == ["dbx.fake.orders"]
 
 
 def test_generate_iac_notes_the_space_its_module_does_not_hold():

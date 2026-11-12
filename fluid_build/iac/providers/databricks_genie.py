@@ -1001,7 +1001,7 @@ def _check_folder(client: Any, folder: str, say: Say) -> None:
         f"read the permissions on the folder {folder}",
         lambda: client.api_client.do("GET", FOLDER_PERMISSIONS_PATH.format(object_id)),
     )
-    group, level = _broadest(acl)
+    group, level = _broadest(acl, folder)
     if level in _KEPT_LEVELS:
         harm = "edit the space's instructions"
         if level == "CAN_MANAGE":
@@ -1027,14 +1027,40 @@ def _check_folder(client: Any, folder: str, say: Say) -> None:
         )
 
 
-def _broadest(acl: Any) -> Tuple[str, str]:
-    """The group of every user holding the highest level on a folder, and that level (``""``
-    for none of them)."""
+def _broadest(acl: Any, folder: str) -> Tuple[str, str]:
+    """The group of every user holding the highest level on ``folder``, and that level (``""``
+    for none of them). Any other answer than the measured shape stops the apply: every folder
+    lists at least ``admins`` (measured), so an empty list, an entry without its levels or a
+    level this module does not know could hide a grant to every user."""
+    entries = acl.get("access_control_list") if isinstance(acl, Mapping) else None
+    if not isinstance(entries, list) or not entries:
+        raise GenieError(
+            f"the permissions on the folder {folder} came back without an access control list, "
+            "so whether every workspace user can edit or manage it is unknown.",
+            (_remediation(None, f"read the permissions on the folder {folder}"),),
+        )
     best = (ALL_USERS, "")
-    for group in ALL_USERS_GROUPS:
-        for level in _group_levels(acl, group):
-            if _LEVEL_RANK.get(level, 0) > _LEVEL_RANK.get(best[1], 0):
-                best = (group, level)
+    for entry in entries:
+        group = entry.get("group_name") if isinstance(entry, Mapping) else None
+        if group not in ALL_USERS_GROUPS:
+            continue
+        held = entry.get("all_permissions")
+        levels = [
+            str(item.get("permission_level") or "").upper()
+            for item in (held if isinstance(held, list) else ())
+            if isinstance(item, Mapping)
+        ]
+        unknown = [level for level in levels if level not in _LEVEL_RANK]
+        if not levels or unknown:
+            raise GenieError(
+                f"the permissions on the folder {folder} do not say plainly what the {group} "
+                f"group holds ({unknown or held!r}), so whether every workspace user can edit "
+                "or manage it is unknown.",
+                (f"Check the permissions on {folder}, then re-run fluid apply.",),
+            )
+        for level in levels:
+            if _LEVEL_RANK[level] > _LEVEL_RANK.get(best[1], 0):
+                best = (str(group), level)
     return best
 
 
@@ -1066,19 +1092,14 @@ def _folder_object_id(client: Any, folder: str) -> str:
             + ", and a Genie space goes in a folder.",
             (f"Set {where} to a workspace folder.",),
         )
-    return quote(str(status.get("object_id")))
-
-
-def _group_levels(doc: Any, group: str) -> set:
-    """Every level ``group`` holds in a Permissions API document, direct or inherited."""
-    levels: set = set()
-    entries = doc.get("access_control_list") if isinstance(doc, Mapping) else None
-    for entry in entries or ():
-        if isinstance(entry, Mapping) and entry.get("group_name") == group:
-            for held in entry.get("all_permissions") or ():
-                if isinstance(held, Mapping) and held.get("permission_level"):
-                    levels.add(str(held["permission_level"]))
-    return levels
+    object_id = status.get("object_id")
+    if object_id is None or str(object_id) == "":
+        raise GenieError(
+            f"the workspace answered for the folder {folder} without its object id, so its "
+            "permissions cannot be read.",
+            (f"Check that {folder} is a workspace folder, then re-run fluid apply.",),
+        )
+    return quote(str(object_id))
 
 
 def _move(client: Any, moving: Mapping[str, Any], space: Space, say: Say, dry_run: bool) -> None:
@@ -1092,13 +1113,26 @@ def _move(client: Any, moving: Mapping[str, Any], space: Space, say: Say, dry_ru
     if dry_run:
         say(f"    would move {what}")
         return
-    _call(
-        client,
-        f"move the Genie space into {space.parent_path}",
-        lambda: client.api_client.do(
+    try:
+        client.api_client.do(
             "PATCH", f"{SPACES_PATH}/{quote(space_id)}", body={"parent_path": space.parent_path}
-        ),
-    )
+        )
+    except Exception as exc:  # noqa: BLE001 — a taken title is said as such
+        if _status(exc) == 409:
+            raise GenieError(
+                f"could not move space {space_id} into {space.parent_path}: another space there "
+                f"is already called {moving.get('title')!r}, and Genie keeps titles unique in a "
+                "folder (measured for a create and a rename).",
+                (
+                    f"Give this space a title of its own with extensions.{EXTENSION_KEY}.title, "
+                    "or rename the other space, then re-run fluid apply.",
+                ),
+            ) from exc
+        raise GenieError(
+            f"could not move the Genie space into {space.parent_path}: "
+            f"{type(exc).__name__}: {_scrub(exc)}",
+            (_remediation(_status(exc), f"move the Genie space into {space.parent_path}"),),
+        ) from exc
     parent = _call(client, "read the moved Genie space", lambda: _parent(client, space_id))
     if workspace_folder(parent) != space.parent_path:
         raise GenieError(
@@ -1312,7 +1346,7 @@ def _retire(product_id: str, say: Say, factory: Optional[ClientFactory], dry_run
     try:
         found = _find(client, marker(product_id))
         if found:
-            found = _placed(client, found, say, hint=_RETIRED_HINT)[0]
+            found = _placed(client, found, say)[0]
     except Exception as exc:  # noqa: BLE001
         if _status(exc) not in (403, 404):
             say(f"  note: not checked for a Genie space an earlier apply made: {_scrub(exc)}")
@@ -1356,16 +1390,8 @@ def _find(client: Any, token: str) -> List[Dict[str, Any]]:
         query = {"page_size": _PAGE_SIZE, "page_token": token_next}
 
 
-#: Said with each space a removed block leaves: the folder ``parentPath`` named is no longer
-#: known, so the product's own space there looks like anyone's.
-_RETIRED_HINT = (
-    " If it is this product's space in its parentPath folder, trash it there: without "
-    f"extensions.{EXTENSION_KEY} this apply cannot tell that folder from any other."
-)
-
-
 def _placed(
-    client: Any, found: List[Dict[str, Any]], say: Say, folder: str = "", hint: str = ""
+    client: Any, found: List[Dict[str, Any]], say: Say, folder: str = ""
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """``found`` by folder: ``(the product's spaces, this identity's own copies)``.
 
@@ -1404,7 +1430,9 @@ def _placed(
                 f"{_marker_of(space)} but is in {parent or 'a folder this identity cannot read'}, "
                 "not in " + (f"{folder} or " if folder else "") + "this identity's own folder, "
                 "so it is not taken for the product's. Trash it, or take the marker out of its "
-                "description." + hint
+                "description. If it is this product's own space, left in a folder the contract no "
+                f"longer names as {_WHERE}.parentPath, trash it there by hand: the apply trusts no "
+                "other folder."
             )
     return product, own
 

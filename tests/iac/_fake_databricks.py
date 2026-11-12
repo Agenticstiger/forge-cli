@@ -1728,6 +1728,14 @@ class FakeDatabricks:
                 b["title"], space["parent_path"], other_than=space_id
             ):
                 return _err(409, "ALREADY_EXISTS", f"A space named {b['title']} already exists.")
+            # Titles are unique in a folder (measured for a create and a rename); a move onto a
+            # taken one is answered as the rename is (assumed, not measured).
+            if "parent_path" in b and self._genie_title_taken(
+                b.get("title", space["title"]), b["parent_path"], other_than=space_id
+            ):
+                return _err(
+                    409, "ALREADY_EXISTS", f"A space named {space['title']} already exists."
+                )
             for key in ("title", "description", "warehouse_id", "parent_path"):
                 if key in b:
                     space[key] = b[key]

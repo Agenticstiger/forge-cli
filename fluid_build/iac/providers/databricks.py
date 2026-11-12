@@ -2358,15 +2358,19 @@ class DatabricksIacPlugin:
     def planned_output_ports(self, contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
         """``fluid plan``'s actions for what :meth:`converge_output_ports` makes after ``tofu
         apply``: the Genie space ``extensions.databricksGenie`` asks for
-        (``databricks_genie.space_plan_action``). A contract the emitter refuses lists none here;
-        ``fluid validate`` and ``fluid apply`` say why."""
-        from .databricks_genie import space_plan_action
+        (``databricks_genie.space_plan_action``). A contract that asks for one and that the
+        emitter refuses raises the refusal, which ``fluid plan`` says as a warning."""
+        from .databricks_genie import requested, space_plan_action
 
+        if not requested(contract):
+            return []
         compiled = _compile(contract, os.environ)
         if compiled.refusals:
-            return []
-        space = _genie(contract, compiled, os.environ).space
-        return [space_plan_action(space)] if space is not None else []
+            raise compiled.refusals[0]
+        genie = _genie(contract, compiled, os.environ)
+        if genie.refusals:
+            raise genie.refusals[0]
+        return [space_plan_action(genie.space)] if genie.space is not None else []
 
     def standalone_module_notices(self, contract: Mapping[str, Any]) -> List[str]:
         """What a module ``fluid generate iac`` writes leaves out that ``fluid apply`` makes:

@@ -41,9 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CAN_MANAGE` there (measured), so each could read every reader's conversations. `fluid apply`
   stops before `tofu apply` when the folder is missing or not a folder, when its permissions
   cannot be read, or when a group of every user (`users`, or `account users` under identity
-  federation) holds `CAN_EDIT` or `CAN_MANAGE` on it. Removing the
-  whole block leaves a space in `parentPath` in place, with a note naming it: without the block,
-  the apply no longer knows which folder to trust.
+  federation) holds `CAN_EDIT` or `CAN_MANAGE` on it. Removing the block, or removing or
+  changing `parentPath`, leaves the space in the old folder, with a note naming it: the apply
+  trusts only the folder the contract names now.
 
 - **`fluid plan` lists the Genie space** as a `databricks_genie_space` action with its title,
   folder, tables and readers. `fluid diff` counts it among the contract's resources and never
