@@ -181,7 +181,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ...providers._sql_safety import validate_ident, validate_sql_type_param_payload
 from ...util.binding_paths import ENV_PLACEHOLDER_RE
@@ -1383,6 +1383,43 @@ def _refuse_build_hosts(
             )
 
 
+def _emit_tables(
+    compiled: _Compiled,
+    contract: Mapping[str, Any],
+    cid: str,
+    warehouse: str,
+    region: str,
+    privileges: Mapping[str, Mapping[str, set]],
+) -> Tuple[Dict[str, TofuExpr], Dict[str, Tuple[Dict[str, str], List[Tuple[str, str, str]]]]]:
+    """Each resolved table: a table of the module's own (its grants and tags), or one a
+    Lakeflow pipeline owns (its schema and readers only). Returns, for the pipelines' tables,
+    the schema reference and the tags ``fluid apply`` sets after an update."""
+    dbt_written = dbt_written_exposes(contract, compiled.tables)
+    lakeflow_written = lakeflow_written_exposes(contract, compiled.tables)
+    schemas: Dict[str, TofuExpr] = {}
+    tags: Dict[str, Tuple[Dict[str, str], List[Tuple[str, str, str]]]] = {}
+    for table in compiled.tables:
+        granted = privileges.get(table.full_name, {})
+        if table.expose_id in lakeflow_written:
+            schemas[table.full_name] = _emit_pipeline_table(
+                compiled, table, cid, region, granted, contract
+            )
+            tags[table.full_name] = _pipeline_tags(compiled, table, contract)
+            continue
+        _emit_table(
+            compiled, table, cid, warehouse, region, dbt_owned=table.expose_id in dbt_written
+        )
+        if table.expose_id in dbt_written and (table.comment or table.column_comments):
+            compiled.warnings.append(
+                f"{table.where} is written by dbt, whose CREATE OR REPLACE sets the table and "
+                "column comments: Unity Catalog shows the dbt model's descriptions (with "
+                "persist_docs), not the contract's, so fluid apply sets none."
+            )
+        _emit_grants(compiled, table, cid, granted)
+        _emit_tags(compiled, table, cid, contract)
+    return schemas, tags
+
+
 def _compile(
     contract: Mapping[str, Any],
     env: Mapping[str, str],
@@ -1421,50 +1458,25 @@ def _compile(
     region = next((table.region for table in compiled.tables if table.region), "")
     cid = safe_ident(contract.get("id") or contract.get("name") or "product")
     privileges = _table_privileges(contract, targets, refusals)
-    dbt_written = dbt_written_exposes(contract, compiled.tables)
-    lakeflow_written = lakeflow_written_exposes(contract, compiled.tables)
-    pipeline_schemas: Dict[str, TofuExpr] = {}
-    pipeline_tags: Dict[str, Tuple[Dict[str, str], List[Tuple[str, str, str]]]] = {}
-    for table in compiled.tables:
-        if table.expose_id in lakeflow_written:
-            pipeline_schemas[table.full_name] = _emit_pipeline_table(
-                compiled, table, cid, region, privileges.get(table.full_name, {}), contract
-            )
-            pipeline_tags[table.full_name] = _pipeline_tags(compiled, table, contract)
-            continue
-        _emit_table(
-            compiled, table, cid, warehouse, region, dbt_owned=table.expose_id in dbt_written
-        )
-        if table.expose_id in dbt_written and (table.comment or table.column_comments):
-            compiled.warnings.append(
-                f"{table.where} is written by dbt, whose CREATE OR REPLACE sets the table and "
-                "column comments: Unity Catalog shows the dbt model's descriptions (with "
-                "persist_docs), not the contract's, so fluid apply sets none."
-            )
-        _emit_grants(compiled, table, cid, privileges.get(table.full_name, {}))
-        _emit_tags(compiled, table, cid, contract)
+    schemas, tags = _emit_tables(compiled, contract, cid, warehouse, region, privileges)
     _check_own_keys(compiled, contract)
     compiled.metric_views = _metric_views.compile_metric_views(
         contract, compiled.tables, privileges, refusals, compiled.warnings
     )
     _emit_quality_monitors(compiled, cid)
-    _merge_jobs(
-        compiled,
-        compile_dbt_jobs(
-            contract,
-            compiled.tables,
-            warehouse,
-            validating=validating,
-            run_as_allowed=run_as_allowlist(env),
-            rebuild_script=_rebuild_scripts(compiled, contract, builds, key_lookup),
-        ),
+    jobs = compile_dbt_jobs(
+        contract,
+        compiled.tables,
+        warehouse,
+        validating=validating,
+        run_as_allowed=run_as_allowlist(env),
+        rebuild_script=_rebuild_scripts(compiled, contract, builds, key_lookup),
     )
-    _merge_pipelines(
-        compiled,
-        compile_lakeflow_pipelines(
-            contract, compiled.tables, schemas=pipeline_schemas, tags=pipeline_tags
-        ),
-    )
+    _merge_part(compiled, jobs)
+    compiled.jobs = jobs.jobs
+    pipelines = compile_lakeflow_pipelines(contract, compiled.tables, schemas=schemas, tags=tags)
+    _merge_part(compiled, pipelines)
+    compiled.pipelines = pipelines.pipelines
 
     # A grant applies to every Databricks expose, so its refusal (an unmapped
     # principal, say) would otherwise be reported once per table.
@@ -1880,18 +1892,6 @@ def _pipeline_tags(
     return on_table, on_columns
 
 
-def _merge_pipelines(compiled: _Compiled, pipelines: CompiledPipelines) -> None:
-    """The Lakeflow pipelines' resources, data sources, refusals and warnings, into
-    ``compiled``."""
-    compiled.refusals.extend(pipelines.refusals)
-    compiled.warnings.extend(pipelines.warnings)
-    compiled.pipelines = pipelines.pipelines
-    for rtype, key, owner, body in pipelines.resources:
-        _claim(compiled, rtype, key, owner, body)
-    for dtype, entries in pipelines.data.items():
-        compiled.data.setdefault(dtype, {}).update(entries)
-
-
 def _emit_table(
     compiled: _Compiled, table: _Table, cid: str, warehouse: str, region: str, *, dbt_owned: bool
 ) -> None:
@@ -2285,14 +2285,14 @@ def _emit_column_tags(compiled: _Compiled, table: _Table, table_key: str) -> Non
         )
 
 
-def _merge_jobs(compiled: _Compiled, jobs: CompiledJobs) -> None:
-    """The dbt jobs' resources, data sources, refusals and warnings, into ``compiled``."""
-    compiled.refusals.extend(jobs.refusals)
-    compiled.warnings.extend(jobs.warnings)
-    compiled.jobs = jobs.jobs
-    for rtype, key, owner, body in jobs.resources:
+def _merge_part(compiled: _Compiled, part: Union[CompiledJobs, CompiledPipelines]) -> None:
+    """The dbt jobs' or the Lakeflow pipelines' resources, data sources, refusals and
+    warnings, into ``compiled``."""
+    compiled.refusals.extend(part.refusals)
+    compiled.warnings.extend(part.warnings)
+    for rtype, key, owner, body in part.resources:
         _claim(compiled, rtype, key, owner, body)
-    for dtype, entries in jobs.data.items():
+    for dtype, entries in part.data.items():
         compiled.data.setdefault(dtype, {}).update(entries)
 
 
@@ -3238,6 +3238,26 @@ class ManagedTable:
     column_tags: Tuple[Tuple[str, str, str], ...] = ()
 
 
+def _pipeline_readers_and_tags(compiled: _Compiled, readers: Dict[str, List[str]]) -> None:
+    """A pipeline's table, as ``fluid verify`` checks it: read through ``SELECT`` on its
+    schema (``_emit_pipeline_table``), and carrying the tags ``fluid apply`` sets after an
+    update (``LakeflowPipeline.table_tags``) rather than tag resources."""
+    by_schema: Dict[str, List[str]] = {}
+    for table in compiled.tables:
+        if table.full_name in compiled.lakeflow_written:
+            by_schema.setdefault(f"{table.catalog}.{table.schema}", []).append(table.full_name)
+    for kind, full_name, principal, privileges in compiled.grants:
+        if kind == "schema" and "SELECT" in privileges:
+            for table_name in by_schema.get(full_name, ()):
+                if principal not in readers.setdefault(table_name, []):
+                    readers[table_name].append(principal)
+    for pipeline in compiled.pipelines:
+        compiled.tags.extend(("tables", pipeline.table, k, v) for k, v in pipeline.table_tags)
+        compiled.tags.extend(
+            ("columns", f"{pipeline.table}.{c}", k, v) for c, k, v in pipeline.column_tags
+        )
+
+
 def managed_objects(
     contract: Mapping[str, Any], env: Optional[Mapping[str, str]] = None
 ) -> Tuple[List[ManagedTable], List[DbtJob]]:
@@ -3248,23 +3268,7 @@ def managed_objects(
     for kind, full_name, principal, _privileges in compiled.grants:
         if kind == "table" and principal not in readers.setdefault(full_name, []):
             readers[full_name].append(principal)
-    # A pipeline's table is read through SELECT on its schema (``_emit_pipeline_table``),
-    # and carries the tags fluid apply sets after an update, not tag resources.
-    pipelines = {pipeline.table: pipeline for pipeline in compiled.pipelines}
-    for kind, full_name, principal, privileges in compiled.grants:
-        if kind != "schema" or "SELECT" not in privileges:
-            continue
-        for table in compiled.tables:
-            if table.full_name in compiled.lakeflow_written and (
-                f"{table.catalog}.{table.schema}" == full_name
-            ):
-                if principal not in readers.setdefault(table.full_name, []):
-                    readers[table.full_name].append(principal)
-    for table_name, pipeline in pipelines.items():
-        for tag_key, tag_value in pipeline.table_tags:
-            compiled.tags.append(("tables", table_name, tag_key, tag_value))
-        for column, tag_key, tag_value in pipeline.column_tags:
-            compiled.tags.append(("columns", f"{table_name}.{column}", tag_key, tag_value))
+    _pipeline_readers_and_tags(compiled, readers)
     # The module checks every schema against the one declared region, so verify
     # checks every table against it too, not only the expose that declared it.
     region = next((table.region for table in compiled.tables if table.region), "")

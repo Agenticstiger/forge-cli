@@ -1542,12 +1542,18 @@ def run_builds_from_args(
         build_id = build.get("id", "unknown")
         runs_before = _run_ids(contract_path.parent, product_id, build_id) if report else None
 
-        if is_lakeflow_build(build):
-            pipeline_result = _lakeflow_build(contract, build, report, databricks_pipelines, args)
-            if pipeline_result is None:
+        if is_lakeflow_build(build) or is_databricks_job_build(build):
+            # Runs in the Databricks workspace: a Lakeflow pipeline update or a dbt job run,
+            # started now when this apply provisioned it, else reported as run there.
+            workspace_result = (
+                _lakeflow_build(contract, build, report, databricks_pipelines, args)
+                if is_lakeflow_build(build)
+                else _databricks_job_build(contract, build, report, databricks_jobs, args)
+            )
+            if workspace_result is None:
                 total_external += 1
                 continue
-            result = pipeline_result
+            result = workspace_result
             _report_build(report, contract_path.parent, product_id, build_id, result, runs_before)
             if result == 0:
                 total_executed += 1
@@ -1560,21 +1566,6 @@ def run_builds_from_args(
         if is_externally_run_build(build):
             _report_externally_run_build(build, build_id, report, contract)
             total_external += 1
-            continue
-
-        if is_databricks_job_build(build):
-            job_result = _databricks_job_build(contract, build, report, databricks_jobs, args)
-            if job_result is None:
-                total_external += 1
-                continue
-            result = job_result
-            _report_build(report, contract_path.parent, product_id, build_id, result, runs_before)
-            if result == 0:
-                total_executed += 1
-            else:
-                total_failed += 1
-                if args.fail_fast:
-                    break
             continue
 
         if _runs_outside_forge_continuously(build):

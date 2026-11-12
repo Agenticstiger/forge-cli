@@ -499,6 +499,60 @@ def _check_problem(
     return None
 
 
+def _written_rules(table: Any) -> Dict[str, Mapping[str, Any]]:
+    """The expose's ``contract.dq.rules[]`` as written, by id."""
+    spec = table.exposure.get("contract") or {}
+    dq = spec.get("dq") if isinstance(spec, Mapping) else None
+    return {
+        str(rule.get("id")): rule
+        for rule in ((dq or {}).get("rules") or [])
+        if isinstance(rule, Mapping)
+    }
+
+
+def _severity(rule: Mapping[str, Any], check: DqCheck) -> str:
+    """The rule's severity as written; ``dq_checks``' level when it is not one of four."""
+    severity = str(rule.get("severity") or "").strip().lower()
+    if severity in _SEVERITIES:
+        return severity
+    return "error" if check.severity == "error" else "warn"
+
+
+def _referenced_table(
+    check: DqCheck, resolve: ReferenceResolver
+) -> Tuple[Optional[str], Optional[Tuple[str, str, str]]]:
+    """``(the referenced table, None)`` for a reference check, or ``(None, problem)``."""
+    assert check.reference is not None
+    ref = check.reference
+    try:
+        validate_ident(ref.column.lower())
+        full_name, why_not = resolve(ref.product_id, ref.expose_id, ref.column)
+    except ValueError:
+        full_name, why_not = None, "that column is not a plain identifier"
+    if full_name is not None:
+        return full_name, None
+    return None, (
+        "reference-unresolved",
+        f"rule {check.rule_id!r} checks {check.column} against {ref.product_id} "
+        f"{ref.expose_id}.{ref.column}, and {why_not}.",
+        "Keep the referenced product's contract in this workspace (the directory holding "
+        "fluid.workspace.yaml, or a root in FLUID_UPSTREAM_CONTRACTS), bound to a Databricks "
+        "table with that column; or remove the rule.",
+    )
+
+
+def _view_problem(table: Any, check: DqCheck) -> Optional[Tuple[str, str, str]]:
+    name = _view_name(table, check)
+    if check.kind not in VIEW_KINDS or len(name) <= _MAX_NAME:
+        return None
+    return (
+        "rule-id",
+        f"check view {name} would be longer than the {_MAX_NAME} characters a Unity Catalog "
+        "name holds.",
+        "Shorten the rule id.",
+    )
+
+
 def _rules(
     table: Any,
     contract: Mapping[str, Any],
@@ -513,13 +567,7 @@ def _rules(
         refusals.append(
             _refusal("rule-unexpressible", f"{table.where}: {refusal.message}", refusal.fix)
         )
-    spec = table.exposure.get("contract") or {}
-    dq = spec.get("dq") if isinstance(spec, Mapping) else None
-    written = {
-        str(rule.get("id")): rule
-        for rule in ((dq or {}).get("rules") or [])
-        if isinstance(rule, Mapping)
-    }
+    written = _written_rules(table)
     known = {column["name"] for column in table.columns}
     grouped: Dict[str, List[DqCheck]] = {}
     referenced: Dict[str, str] = {}
@@ -527,41 +575,12 @@ def _rules(
     for check in read.checks:
         if check.rule_id in refused:
             continue
-        rule = written.get(check.rule_id) or {}
-        severity = str(rule.get("severity") or "").strip().lower()
-        if severity not in _SEVERITIES:
-            severity = "error" if check.severity == "error" else "warn"
-        problem = _check_problem(check, severity, known, table)
+        severity = _severity(written.get(check.rule_id) or {}, check)
+        problem = _check_problem(check, severity, known, table) or _view_problem(table, check)
         if problem is None and check.kind == "reference":
-            assert check.reference is not None
-            try:
-                validate_ident(check.reference.column.lower())
-                full_name, why_not = resolve(
-                    check.reference.product_id, check.reference.expose_id, check.reference.column
-                )
-            except ValueError:
-                full_name, why_not = None, "that column is not a plain identifier"
-            if full_name is None:
-                problem = (
-                    "reference-unresolved",
-                    f"rule {check.rule_id!r} checks {check.column} against "
-                    f"{check.reference.product_id} {check.reference.expose_id}."
-                    f"{check.reference.column}, and {why_not}.",
-                    "Keep the referenced product's contract in this workspace (the directory "
-                    "holding fluid.workspace.yaml, or a root in FLUID_UPSTREAM_CONTRACTS), "
-                    "bound to a Databricks table with that column; or remove the rule.",
-                )
-            else:
+            full_name, problem = _referenced_table(check, resolve)
+            if full_name is not None:
                 referenced[check.name] = full_name
-        if problem is None and check.kind in VIEW_KINDS:
-            name = _view_name(table, check)
-            if len(name) > _MAX_NAME:
-                problem = (
-                    "rule-id",
-                    f"check view {name} would be longer than the {_MAX_NAME} characters a "
-                    "Unity Catalog name holds.",
-                    "Shorten the rule id.",
-                )
         if problem is not None:
             kind, message, fix = problem
             refusals.append(_refusal(kind, f"{table.where}: {message}", fix))
@@ -569,14 +588,15 @@ def _rules(
             grouped.pop(check.rule_id, None)
             continue
         grouped.setdefault(check.rule_id, []).append(check)
-    rules = []
-    for rule_id, checks in grouped.items():
-        rule = written.get(rule_id) or {}
-        severity = str(rule.get("severity") or "").strip().lower()
-        if severity not in _SEVERITIES:
-            severity = "error" if checks[0].severity == "error" else "warn"
-        rules.append(_Rule(rule_id, severity, tuple(checks), str(rule.get("description") or "")))
-    return rules, referenced
+    return [
+        _Rule(
+            rule_id,
+            _severity(written.get(rule_id) or {}, checks[0]),
+            tuple(checks),
+            str((written.get(rule_id) or {}).get("description") or ""),
+        )
+        for rule_id, checks in grouped.items()
+    ], referenced
 
 
 def render_pipeline_sql(
