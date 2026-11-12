@@ -401,7 +401,7 @@ def test_range_rule_counts_values_outside_the_bounds_on_databricks():
     rule = {"id": "r", "type": "valid_values", "selector": "grid_kwh", "severity": "error"}
     (res,) = execute_quality_checks([rule], "`c`.`s`.`t`", execute, "databricks", columns=ENERGY)
     assert res.passed and res.expected == "0 values outside >= 0"
-    assert "WHERE `grid_kwh` IS NOT NULL AND NOT (`grid_kwh` >= 0.0)" in seen[0]
+    assert seen[0].endswith("WHERE `grid_kwh` IS NOT NULL AND NOT (`grid_kwh` >= 0.0)")
 
 
 def test_valid_values_over_columns_checks_each_against_its_own_domain():
@@ -437,7 +437,7 @@ def test_valid_values_over_columns_with_an_undeclared_column_is_not_executed():
     assert "nothing checked for 'free_text'" in res.message
 
 
-def test_value_domain_order_rule_list_then_enum_regex_range_reference():
+def test_value_domain_is_the_rule_list_else_every_column_declaration():
     columns = [
         {
             "name": "a",
@@ -460,8 +460,69 @@ def test_value_domain_order_rule_list_then_enum_regex_range_reference():
     ]
     listed = {"id": "r", "selector": "a", "description": "a valid values: K, L."}
     assert value_domain(listed, columns) == ValueDomain(values=("K", "L"))
-    assert value_domain({"selector": "a"}, columns) == ValueDomain(values=("X", "Y"))
-    assert value_domain({"selector": "b"}, columns) == ValueDomain(pattern="^x$")
+    assert value_domain({"selector": "a"}, columns) == ValueDomain(
+        values=("X", "Y"), pattern="^x$", bounds=((">=", 0.0),), reference=("p.q", "col")
+    )
+    assert value_domain({"selector": "b"}, columns) == ValueDomain(
+        pattern="^x$", bounds=((">=", 0.0),)
+    )
     assert value_domain({"selector": "c"}, columns) == ValueDomain(bounds=((">=", 0.0),))
     assert value_domain({"selector": "d"}, columns) == ValueDomain(reference=("p.q", "col"))
     assert value_domain({"selector": "zz"}, columns) == ValueDomain()
+
+
+def test_every_column_declaration_is_checked_in_one_statement():
+    # A column with an enum, a regex and a range: a value that breaks any of them is
+    # invalid (the range used to be dropped when a regex came first).
+    columns = [
+        {
+            "name": "pct",
+            "validationRules": [
+                {"type": "regex", "constraint": "^[0-9]+$"},
+                {"type": "range", "constraint": ">= 0 and <= 100"},
+                {"type": "enum", "constraint": "0,50,100,150"},
+            ],
+        }
+    ]
+    seen, execute = _recording([1])
+    rule = {"id": "p", "type": "valid_values", "selector": "pct", "severity": "error"}
+    (res,) = execute_quality_checks([rule], "t", execute, "databricks", columns=columns)
+    assert len(seen) == 1
+    where = seen[0].split("WHERE", 1)[1]
+    assert "NOT IN ('0', '50', '100', '150')" in where
+    assert "NOT (`pct` RLIKE '^[0-9]+$')" in where
+    assert "NOT (`pct` >= 0.0 AND `pct` <= 100.0)" in where
+    assert where.count(" OR ") == 2
+    assert not res.passed and res.actual == "1 invalid value(s)"
+
+
+def test_a_column_with_values_and_a_reference_checks_both():
+    columns = [
+        {
+            "name": "site_id",
+            "validationRules": [{"type": "regex", "constraint": "^S[0-9]+$"}],
+            "labels": {"references": "acme.sites.site_id"},
+        }
+    ]
+    seen, execute = _recording([0, 2])
+    rule = {"id": "ref", "type": "valid_values", "selector": "site_id", "severity": "warn"}
+    (res,) = execute_quality_checks(
+        [rule],
+        "t",
+        execute,
+        "databricks",
+        columns=columns,
+        resolve_reference=lambda product, column: "`m`.`s`.`sites`",
+    )
+    assert len(seen) == 2 and "RLIKE" in seen[0] and "NOT EXISTS" in seen[1]
+    assert not res.passed and "2 value(s) of 'site_id' are not in acme.sites.site_id" in res.message
+    assert res.actual == "0 invalid value(s); 2 value(s) missing"
+
+
+def test_accuracy_without_a_threshold_is_not_run():
+    seen, execute = _recording([])
+    for selector in ("a", "a,b"):
+        rule = {"id": "acc", "type": "accuracy", "selector": selector, "severity": "error"}
+        (res,) = execute_quality_checks([rule], "t", execute, "databricks")
+        assert not res.passed and res.actual == "not executed" and "no threshold" in res.message
+    assert seen == []

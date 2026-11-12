@@ -684,6 +684,13 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         None,
     ),
+    "test_results_table_needs_live_checks": (
+        [
+            "--results-table records the live checks of a run, and --no-data runs none",
+            "Drop --no-data to test and record, or drop --results-table",
+        ],
+        None,
+    ),
     "test_results_dashboard_invalid": (
         [
             "Give a workspace path whose last part is the name, e.g. "

@@ -151,7 +151,8 @@ def test_structure_filter_on_rule_datasets_but_not_on_failing_list(definition):
     sql = {d["name"]: "".join(d["queryLines"]) for d in definition["datasets"]}
     for name in ("fluid_dq_overall", "fluid_dq_products", "fluid_dq_trend"):
         assert "COALESCE(rule_type, '') <> 'structure'" in sql[name]
-    assert "structure" not in sql["fluid_dq_failing"]
+    # last_run's CTE names 'structure'; the rows listed (after FROM latest) are not filtered.
+    assert "structure" not in sql["fluid_dq_failing"].split("FROM latest", 1)[1]
     assert "WHERE NOT passed" in sql["fluid_dq_failing"]
 
 
@@ -369,3 +370,56 @@ def test_no_host_means_no_url():
         PATH, TABLE, client_factory=lambda: FakeClient(api, host=""), warehouse_id="wh"
     )
     assert result["url"] is None
+
+
+def test_dashboard_without_the_sdk_names_the_extra():
+    def no_sdk():
+        raise ModuleNotFoundError("No module named 'databricks'")
+
+    with pytest.raises(CLIError) as ei:
+        dash.ensure_dashboard(PATH, TABLE, client_factory=no_sdk, warehouse_id="wh")
+    assert ei.value.event == "test_results_dashboard_failed"
+    assert "data-product-forge[databricks]" in ei.value.context["fix"]
+
+
+def test_latest_run_is_the_latest_one_that_tested_rules(definition):
+    sql = {d["name"]: "".join(d["queryLines"]) for d in definition["datasets"]}
+    latest_users = ("fluid_dq_overall", "fluid_dq_products", "fluid_dq_failing")
+    for name in latest_users:
+        assert "WITH last_run AS" in sql[name], name
+        assert "MAX(CASE WHEN" in sql[name] and "JOIN last_run" in sql[name], name
+        assert "COALESCE(" in sql[name] and "MAX(run_time)" in sql[name], name
+    assert not any("QUALIFY" in s for s in sql.values())
+
+
+def stale_published(update_time, revision_create_time):
+    dashboard = live_dashboard()
+    dashboard["update_time"] = update_time
+    return FakeApi(
+        status=existing_status(),
+        dashboard=dashboard,
+        published={"revision_create_time": revision_create_time},
+    )
+
+
+PUBLISH_CALL = ("POST", f"{dash.DASHBOARDS_PATH}/dash-1/published")
+
+
+def test_unchanged_draft_newer_than_published_revision_is_published():
+    api = stale_published("2026-11-12T10:05:00Z", "2026-11-12T10:00:00Z")
+    result = ensure(api)
+    assert result["action"] == "unchanged"
+    assert PUBLISH_CALL in api.verbs()
+    assert "PATCH" not in [v[0] for v in api.verbs()]
+
+
+def test_unchanged_draft_older_than_published_revision_is_not_republished():
+    api = stale_published("2026-11-12T10:00:00Z", "2026-11-12T10:05:00Z")
+    assert ensure(api)["action"] == "unchanged"
+    assert PUBLISH_CALL not in api.verbs()
+
+
+def test_unparseable_timestamps_do_not_republish():
+    api = stale_published("garbage", "also garbage")
+    assert ensure(api)["action"] == "unchanged"
+    assert PUBLISH_CALL not in api.verbs()

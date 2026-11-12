@@ -1023,13 +1023,19 @@ class ContractValidator:
     ) -> None:
         """One :class:`CheckOutcome` per rule from the provider's full results, so a
         passing rule carries what was measured too."""
-        by_id = {getattr(r, "rule_id", None): r for r in results}
+        # Results come back in rule order; a queue per id pairs the n-th rule
+        # with an id with the n-th result for it, so two rules sharing an id
+        # cannot hide one's failure behind the other's pass.
+        queues: Dict[Any, List[Any]] = {}
+        for result in results:
+            queues.setdefault(getattr(result, "rule_id", None), []).append(result)
         for rule in rules:
             if not isinstance(rule, dict) or not rule.get("id"):
                 continue
-            result = by_id.get(rule["id"])
-            if result is None:
+            queue = queues.get(rule["id"])
+            if not queue:
                 continue
+            result = queue.pop(0)
             self.report.record_check(
                 CheckOutcome(
                     name=f"{expose_id}.{rule['id']}",
@@ -1118,8 +1124,7 @@ class ContractValidator:
             binding = expose.get("binding", {})
             location = binding.get("location", {})
             props = location.get("properties", {})
-            self._validate_bigquery_resource(expose, path, props)
-            return True
+            return self._validate_bigquery_resource(expose, path, props)
         elif self.provider_name == "aws" and self._iceberg_outside_glue(expose, path):
             return False
         elif self.provider_name in ("snowflake", "aws", "local", "databricks"):
@@ -1130,8 +1135,11 @@ class ContractValidator:
 
     def _validate_bigquery_resource(
         self, expose: Dict[str, Any], path: str, props: Dict[str, Any]
-    ) -> None:
-        """Validate against actual BigQuery table using provider abstraction."""
+    ) -> bool:
+        """Validate against actual BigQuery table using provider abstraction.
+
+        Returns whether the live columns were compared with the contract.
+        """
         if not self.validation_provider:
             self.report.add_issue(
                 "warning",
@@ -1139,7 +1147,7 @@ class ContractValidator:
                 "No validation provider initialized, skipping resource validation",
                 path,
             )
-            return
+            return False
 
         project = props.get("project", self.project)
         dataset = props.get("dataset")
@@ -1162,7 +1170,7 @@ class ContractValidator:
                 suggestion=f"Add the following properties to binding.location.properties: {', '.join(missing)}",
                 documentation_url="https://agenticstiger.github.io/forge_docs/providers/gcp.html",
             )
-            return
+            return False
 
         table_fqn = f"{project}.{dataset}.{table}"
 
@@ -1248,6 +1256,7 @@ class ContractValidator:
                 LOG.info(f"✅ Resource '{table_fqn}' validated successfully")
             else:
                 LOG.warning(f"⚠️  Resource '{table_fqn}' validation found issues")
+            return True
 
         except Exception as e:
             self.report.add_issue(
@@ -1258,6 +1267,7 @@ class ContractValidator:
                 suggestion="Check provider credentials and network connectivity",
                 documentation_url="https://agenticstiger.github.io/forge_docs/advanced/production-troubleshooting.html",
             )
+            return False
 
     def _iceberg_outside_glue(self, expose: Dict[str, Any], path: str) -> bool:
         """Report an Iceberg table cataloged outside Glue as not checked.
@@ -1300,19 +1310,22 @@ class ContractValidator:
         expose_id = expose.get("id") or expose.get("exposeId") or "unknown"
 
         try:
-            # Cache lookup
+            # Cache lookup. Databricks is always read live: its columns are a free
+            # metadata read, and a cached row count would report an hour-old table
+            # (and write it to a results table) after a build changed it.
+            cache = None if self.provider_name == "databricks" else self.cache
             actual_schema = None
             cache_key = self._resource_cache_key(expose, expose_id)
-            if self.cache:
-                actual_schema = self.cache.get_schema(cache_key, self.provider_name)
+            if cache:
+                actual_schema = cache.get_schema(cache_key, self.provider_name)
                 if actual_schema:
                     LOG.info("Using cached schema for %s", cache_key)
 
             # Fetch from provider
             if actual_schema is None:
                 actual_schema = self.validation_provider.get_resource_schema(expose)
-                if self.cache and actual_schema:
-                    self.cache.set_schema(cache_key, self.provider_name, actual_schema)
+                if cache and actual_schema:
+                    cache.set_schema(cache_key, self.provider_name, actual_schema)
 
             # Validate
             result = self.validation_provider.validate_resource(expose, actual_schema)

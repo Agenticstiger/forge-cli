@@ -7,6 +7,7 @@ results writer (rows, insert statements, write_results) against a fake client.""
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -306,31 +307,40 @@ def col(name):
     return [n for n, _, _ in rt.RESULT_COLUMNS].index(name)
 
 
-def test_insert_statements_batches_25_rows():
-    stmts = rt.insert_statements("`c`.`s`.`t`", [row_dict(i) for i in range(60)])
-    assert [len(p) // len(rt.RESULT_COLUMNS) for _, p in stmts] == [25, 25, 10]
+@pytest.mark.parametrize("count", [1, 60])
+def test_insert_is_one_statement_with_one_rows_parameter(count):
+    sql, params = rt.insert_statement("`c`.`s`.`t`", [row_dict(i) for i in range(count)])
+    assert isinstance(sql, str)
+    assert [p["name"] for p in params] == ["rows"]
+    payload = json.loads(params[0]["value"])
+    assert isinstance(payload, list) and len(payload) == count
+    names = {n for n, _, _ in rt.RESULT_COLUMNS}
+    assert all(set(item) == names for item in payload)
+    assert [item["rule_id"] for item in payload] == [f"rule{i}" for i in range(count)]
 
 
-def test_insert_statement_markers_casts_and_param_values():
-    ((sql, params),) = rt.insert_statements("`c`.`s`.`t`", [row_dict(0), row_dict(1)])
-    n = len(rt.RESULT_COLUMNS)
+def test_insert_statement_unpacks_the_json_array_in_sql():
+    sql, _ = rt.insert_statement("`c`.`s`.`t`", [row_dict(0)])
     assert sql.startswith("INSERT INTO `c`.`s`.`t` (run_id, run_time,")
-    assert f"CAST(:r0c{col('run_time')} AS TIMESTAMP)" in sql
-    assert f"CAST(:r1c{col('passed')} AS BOOLEAN)" in sql
-    assert f":r0c{col('run_id')}," in sql and "CAST(:r0c0" not in sql
-    assert len(params) == 2 * n
-    by_name = {p["name"]: p for p in params}
-    assert by_name[f"r0c{col('passed')}"]["value"] == "true"
-    assert by_name[f"r1c{col('passed')}"]["value"] == "false"
-    assert by_name[f"r0c{col('run_time')}"]["value"] == "2026-01-02T03:04:05.000006Z"
-    assert "value" not in by_name[f"r0c{col('layer')}"]
+    assert "from_json(:rows, 'ARRAY<STRUCT<" in sql and "explode(" in sql
+    assert "CAST(r.run_time AS TIMESTAMP)" in sql and "CAST(r.passed AS BOOLEAN)" in sql
+
+
+def test_insert_statement_payload_encodes_booleans_times_and_nulls():
+    _, params = rt.insert_statement("`c`.`s`.`t`", [row_dict(0), row_dict(1)])
+    first, second = json.loads(params[0]["value"])
+    assert first["passed"] == "true" and second["passed"] == "false"
+    assert first["run_time"] == "2026-01-02T03:04:05.000006Z"
+    assert first["layer"] is None
 
 
 def test_insert_statement_never_inlines_values():
     row = row_dict(0)
     row["message"] = "x'); DROP TABLE t; --"
-    ((sql, _),) = rt.insert_statements("`c`.`s`.`t`", [row])
-    assert "DROP TABLE" not in sql
+    row["rule_id"] = "very-distinctive-rule-id"
+    sql, params = rt.insert_statement("`c`.`s`.`t`", [row])
+    assert "DROP TABLE" not in sql and "very-distinctive-rule-id" not in sql
+    assert "DROP TABLE" in params[0]["value"]
 
 
 # ---------------------------------------------------------- write_results
@@ -385,7 +395,8 @@ def test_write_results_creates_checks_columns_then_inserts(capsys):
     assert name == "main.dq.results" and count == 1 + 12
     assert sql[0].startswith("CREATE TABLE IF NOT EXISTS `main`.`dq`.`results` (")
     assert "COMMENT 'One fluid test invocation'" in sql[0] and "USING DELTA" in sql[0]
-    assert [c[0] for c in api.calls[:3]] == ["POST", "GET", "POST"]
+    assert [c[0] for c in api.calls] == ["POST", "GET", "POST"]
+    assert len(sql) == 2
     assert api.calls[1][1] == "/api/2.1/unity-catalog/tables/main.dq.results"
     assert sql[1].startswith("INSERT INTO `main`.`dq`.`results`")
     out = capsys.readouterr()
@@ -436,3 +447,90 @@ def test_write_results_status_goes_to_stderr_only(capsys):
     write(FakeApi())
     captured = capsys.readouterr()
     assert captured.out == "" and captured.err.startswith("Results:")
+
+
+def test_write_results_without_the_sdk_names_the_extra():
+    def no_sdk():
+        raise ModuleNotFoundError("No module named 'databricks'")
+
+    with pytest.raises(CLIError) as ei:
+        rt.write_results(
+            make_report(), contract(), "main.dq.results", client_factory=no_sdk, warehouse_id="wh"
+        )
+    assert ei.value.event == "test_results_write_failed"
+    assert "data-product-forge[databricks]" in ei.value.context["fix"]
+
+
+# ------------------------------------------- unattributed quality issues
+
+
+def test_unattributed_quality_issue_keeps_a_quality_structural_case():
+    report = make_report()
+    report.record_check(rule_check("e1.c1", True))
+    report.add_issue("error", "quality", "Quality check execution failed", "exposes[1].dq")
+    builtin, extra, by_category = fluid_test_cases().structural_categories(report)
+    assert "quality" in builtin or "quality" in extra
+    assert [i.path for i in by_category["quality"]] == ["exposes[1].dq"]
+    rows = rows_for(report)
+    (quality,) = [r for r in rows if r["rule_id"] == "quality"]
+    assert quality["rule_type"] == "structure" and quality["passed"] is False
+
+
+def test_quality_roll_up_keeps_only_the_issues_no_rule_case_carries():
+    report = make_report()
+    report.record_check(rule_check("e1.c1", False))
+    report.add_issue("error", "quality", "rule failed", "exposes[0].contract.dq.rules.c1")
+    report.add_issue("error", "quality", "could not run", "exposes[1].dq")
+    _, _, by_category = fluid_test_cases().structural_categories(report)
+    assert [i.path for i in by_category["quality"]] == ["exposes[1].dq"]
+
+
+def test_rule_attributed_quality_issues_leave_no_quality_structural_case(tmp_path):
+    report = make_report()
+    report.record_check(rule_check("e1.c1", False))
+    report.add_issue("error", "quality", "rule failed", "exposes[0].contract.dq.rules.c1")
+    builtin, extra, by_category = fluid_test_cases().structural_categories(report)
+    assert "quality" not in builtin and "quality" not in extra and "quality" not in by_category
+    assert "quality" not in [r["rule_id"] for r in rows_for(report)]
+    out = tmp_path / "j.xml"
+    fluid_test._output_junit(report, str(out))
+    names = [c.get("name") for c in ET.parse(out).getroot().findall("testcase")]
+    assert "quality" not in names
+
+
+# ------------------------------------------------- early flag refusals
+
+
+def test_no_data_with_results_table_is_refused_before_validation(contract_file, no_validator):
+    with pytest.raises(CLIError) as ei:
+        fluid_test.run(args_for(contract_file, results_table="c.s.t", no_data=True), LOG)
+    assert ei.value.exit_code == 2
+    assert ei.value.event == "test_results_table_needs_live_checks"
+
+
+def write_contract(tmp_path, text=None):
+    p = tmp_path / "contract.fluid.yaml"
+    if text is None:
+        text = (
+            "fluidVersion: 0.7.3\nid: x\nexposes:\n  - id: e1\n    binding:\n"
+            "      platform: databricks\n      location:\n        database: main\n"
+            "        schema: energy\n        table: meters\n"
+        )
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def test_results_table_in_the_product_schema_is_refused_before_validation(tmp_path, no_validator):
+    path = write_contract(tmp_path)
+    with pytest.raises(CLIError) as ei:
+        fluid_test.run(args_for(path, results_table="main.energy.results"), LOG)
+    assert ei.value.exit_code == 2
+    assert ei.value.event == "test_results_table_in_product_schema"
+
+
+def test_unparseable_contract_skips_the_early_product_schema_check(tmp_path):
+    path = write_contract(tmp_path, "exposes: [unclosed\n  - : :\n")
+    table, dashboard = fluid_test._results_options(
+        args_for(path, results_table="main.energy.results"), path
+    )
+    assert table == "main.energy.results" and dashboard is None

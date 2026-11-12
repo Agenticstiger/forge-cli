@@ -267,7 +267,7 @@ def _write_results(report, contract, results_table: str, results_dashboard) -> N
         ensure_dashboard(results_dashboard, parse_results_table(results_table))
 
 
-def _results_options(args: argparse.Namespace):
+def _results_options(args: argparse.Namespace, contract_path: Path):
     """``(table, dashboard path)`` of the results flags, checked before any test runs."""
     table = getattr(args, "results_table", None)
     dashboard = getattr(args, "results_dashboard", None)
@@ -287,10 +287,30 @@ def _results_options(args: argparse.Namespace):
                 "fix": "drop --engine soda, or drop --results-table",
             },
         )
+    if table and getattr(args, "no_data", False):
+        raise CLIError(
+            2,
+            "test_results_table_needs_live_checks",
+            {
+                "results_table": table,
+                "why": "--no-data runs no live check, so there would be no result to record",
+                "fix": "drop --no-data, or drop --results-table",
+            },
+        )
     if table:
-        from ._test_results_databricks import parse_results_table
+        from ._test_results_databricks import parse_results_table, refuse_product_schema
 
-        parse_results_table(table)
+        parsed = parse_results_table(table)
+        # The product's own schema is refused here, before any statement runs, from
+        # the contract as written; write_results checks again with the overlay applied.
+        try:
+            import yaml
+
+            raw = yaml.safe_load(Path(contract_path).read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - an unreadable contract is the run's to report
+            raw = None
+        if isinstance(raw, dict):
+            refuse_product_schema(parsed, raw)
     if dashboard:
         from ._test_dashboard_databricks import parse_dashboard_path
 
@@ -313,7 +333,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         raise CLIError(1, "contract_file_not_found", {"path": str(contract_path)})
 
     # A malformed results flag fails before any check runs (or any compute starts).
-    results_table, results_dashboard = _results_options(args)
+    results_table, results_dashboard = _results_options(args, contract_path)
 
     # Soda engine dispatch — generates SodaCL from the contract's quality
     # block and shells out to the user's installed `soda` binary. Skipped

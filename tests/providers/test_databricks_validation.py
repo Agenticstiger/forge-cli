@@ -372,6 +372,8 @@ def test_reference_ambiguous_is_not_executed(provider, live):
         )
     (res,) = provider.run_quality_results(REF_EXPOSE, [REF_RULE])
     assert res.actual == "not executed" and "ambiguous" in res.message
+    # The message lands in the shared results table: other tables are not named.
+    assert "main.a.sites" not in res.message and "main.b.sites" not in res.message
 
 
 def test_reference_lookup_cached_per_product_and_column(provider, live):
@@ -427,3 +429,25 @@ def test_reference_two_candidates_elsewhere_stay_ambiguous(provider, live):
         )
     (res,) = provider.run_quality_results(REF_EXPOSE, [REF_RULE])
     assert res.actual == "not executed" and "ambiguous" in res.message
+
+
+def test_failed_tag_lookup_is_cached_as_a_lookup_error(provider, live, monkeypatch):
+    answer = live._answer
+
+    def failing_tags(body):
+        if "table_tags" in body["statement"]:
+            return {
+                "statement_id": "s",
+                "status": {"state": "FAILED", "error": {"message": "[INSUFFICIENT_PERMISSIONS]"}},
+            }
+        return answer(body)
+
+    monkeypatch.setattr(live, "_answer", failing_tags)
+    rules = [REF_RULE, {**REF_RULE, "id": "fk2"}]
+    results = provider.run_quality_results(REF_EXPOSE, rules)
+    tag_queries = [b for b in live.sql if "table_tags" in b["statement"]]
+    assert len(tag_queries) == 1
+    assert len(results) == 2
+    for res in results:
+        assert not res.passed and res.actual == "not executed"
+        assert "lookup" in res.message and "failed" in res.message

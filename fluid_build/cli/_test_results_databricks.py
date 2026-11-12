@@ -26,6 +26,7 @@ validated identifiers, backtick-quoted.
 
 from __future__ import annotations
 
+import json
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -61,7 +62,6 @@ STRUCTURE_RULE_TYPE = "structure"
 
 _CASTS = {"run_time": "TIMESTAMP", "passed": "BOOLEAN"}
 _TABLE_COMMENT = "fluid test results: one row per check per run (data-product-forge)"
-_BATCH_ROWS = 25
 _MAX_TEXT = 2000
 TABLES_PATH = "/api/2.1/unity-catalog/tables"
 
@@ -242,34 +242,39 @@ def _value(name: str, value: Any) -> Any:
     return value
 
 
-def insert_statements(ref: str, rows: Sequence[Mapping[str, Any]]) -> List[Tuple[str, List]]:
-    """``(statement, parameters)`` for ``rows``, at most ``_BATCH_ROWS`` rows each."""
+def insert_statement(ref: str, rows: Sequence[Mapping[str, Any]]) -> Tuple[str, List]:
+    """One ``INSERT`` for every row of the run, and its one parameter.
+
+    The rows travel as a single JSON array bound to ``:rows`` and are unpacked in
+    SQL (``from_json`` + ``explode``), so the run is appended in one statement:
+    all of it or none of it, whatever its size. A run split over several
+    statements could be left half-written, and the dashboard would take that
+    half for the latest run.
+    """
     from fluid_build.providers.databricks.statements import param
 
     names = [name for name, _, _ in RESULT_COLUMNS]
-    out: List[Tuple[str, List]] = []
-    for start in range(0, len(rows), _BATCH_ROWS):
-        batch = rows[start : start + _BATCH_ROWS]
-        tuples: List[str] = []
-        params: List[Dict[str, Any]] = []
-        for i, row in enumerate(batch):
-            cells = []
-            for j, name in enumerate(names):
-                marker = f"r{i}c{j}"
-                cells.append(
-                    f"CAST(:{marker} AS {_CASTS[name]})" if name in _CASTS else f":{marker}"
-                )
-                params.append(param(marker, _value(name, row.get(name))))
-            tuples.append("(" + ", ".join(cells) + ")")
-        statement = f"INSERT INTO {ref} ({', '.join(names)}) VALUES\n" + ",\n".join(tuples)
-        out.append((statement, params))
-    return out
+    struct = ", ".join(f"{name}: STRING" for name in names)
+    select = ", ".join(
+        f"CAST(r.{name} AS {_CASTS[name]})" if name in _CASTS else f"r.{name}" for name in names
+    )
+    statement = (
+        f"INSERT INTO {ref} ({', '.join(names)})\n"
+        f"SELECT {select}\n"
+        f"FROM (SELECT explode(from_json(:rows, 'ARRAY<STRUCT<{struct}>>')) AS r)"
+    )
+    payload = [{name: _value(name, row.get(name)) for name in names} for row in rows]
+    return statement, [param("rows", json.dumps(payload))]
 
 
 def _fix_for(error: str, table: Tuple[str, str, str]) -> Optional[str]:
     """The one action that fixes a failed write, when the error says which."""
     catalog, schema, _ = table
     upper = error.upper()
+    if "NO MODULE NAMED 'DATABRICKS" in upper:
+        from fluid_build.providers.databricks.statements import DATABRICKS_EXTRA_INSTALL
+
+        return f"Install the Databricks extra: {DATABRICKS_EXTRA_INSTALL}"
     if "SCHEMA_NOT_FOUND" in upper or "NO_SUCH_SCHEMA" in upper:
         return f"Create the schema first (forge never creates it): CREATE SCHEMA `{catalog}`.`{schema}`"
     if "CATALOG_NOT_FOUND" in upper or "NO_SUCH_CATALOG" in upper:
@@ -337,8 +342,8 @@ def write_results(
         runner = StatementRunner(client, warehouse_id or warehouse_id_from_env())
         runner.run(_create_table_sql(ref))
         _check_columns(client, full_name)
-        for statement, params in insert_statements(ref, rows):
-            runner.run(statement, params)
+        statement, params = insert_statement(ref, rows)
+        runner.run(statement, params)
     except CLIError:
         raise
     except Exception as exc:  # noqa: BLE001 - every failure becomes one safe message
@@ -355,7 +360,7 @@ def write_results(
 __all__ = [
     "RESULT_COLUMNS",
     "STRUCTURE_RULE_TYPE",
-    "insert_statements",
+    "insert_statement",
     "parse_results_table",
     "refuse_product_schema",
     "results_rows",

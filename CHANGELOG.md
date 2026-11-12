@@ -62,8 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     it): run id and time, product id, version and layer, expose and table, rule id, type and
     severity, passed, observed value, threshold, message, forge version. The table is created if
     missing in a schema the operator already has; forge never creates the catalog or the schema,
-    refuses the product's own schema, and writes nothing into an existing table without these
-    columns. Every value is a bound parameter.
+    refuses the product's own schema (before any check runs), and writes nothing into an
+    existing table without these columns. A run is appended in one statement, so it is never
+    half-written, and every value is a bound parameter. It refuses `--no-data`, which runs no
+    live check to record; Databricks schemas are read live, never from the validation cache.
   - `--results-dashboard WORKSPACE_PATH` keeps an AI/BI (Lakeview) dashboard over that table:
     the pass rate of the latest runs, the pass rate per product (coloured by layer), the failing
     checks and the daily trend. It is found by its workspace path (no state file, so ephemeral CI
@@ -111,10 +113,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `valid_values` column against its own declaration); a `uniqueness` or `freshness` rule over
   several columns is reported as not run, never guessed. A `schema` rule passes when the live
   table has every contract column with its type, and fails, at the rule's severity, when it
-  does not or could not be read. Every rule's result, passed or not, now carries what was
-  measured (`--output json` adds `rule_id`, `rule_type` and `expose_id` to each check). On
-  the tower-management industry pack `fluid test` ran 38 of its 168 rules before; it now runs
-  every rule of every deployed product.
+  does not or could not be read. An `accuracy` rule with no threshold is reported as not run
+  (it used to pass whenever the column held a value). Every rule's result, passed or not, now
+  carries what was measured (`--output json` adds `rule_id`, `rule_type` and `expose_id` to
+  each check). `--engine soda` renders the same column declarations (`valid values`,
+  `valid regex`, `valid min` / `valid max`, one check per listed column); a reference or a
+  strict bound stays unmapped there. On the tower-management industry pack `fluid test` ran
+  38 of its 168 rules before; it now runs every rule of every deployed product.
 
 ### Fixed
 

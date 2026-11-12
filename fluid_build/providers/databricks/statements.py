@@ -95,12 +95,25 @@ class StatementRunner:
         self._sql = SqlRunner(
             client, warehouse_id, timeout=timeout_seconds, poll=poll_seconds, sleep=sleep
         )
+        self._unreachable: Optional[str] = None
 
     def run(
         self, sql: str, parameters: Optional[Sequence[Mapping[str, Any]]] = None
     ) -> List[tuple]:
-        """Run ``sql`` (``:name`` markers bound from ``parameters``) and return its rows."""
-        doc = self._sql.execute(sql, parameters)
+        """Run ``sql`` (``:name`` markers bound from ``parameters``) and return its rows.
+
+        A statement that failed because the warehouse did not answer (a timeout, a
+        transport error, a cancelled statement), rather than because of its SQL, stops
+        the ones after it: each would wait out the same timeout.
+        """
+        if self._unreachable:
+            raise StatementError(f"not run: {self._unreachable}")
+        try:
+            doc = self._sql.execute(sql, parameters)
+        except StatementError as exc:
+            if not str(exc).startswith("FAILED"):
+                self._unreachable = f"an earlier statement did not complete ({exc})"
+            raise
         columns = ((doc.get("manifest") or {}).get("schema") or {}).get("columns") or []
         types = [str(c.get("type_name") or "").upper() for c in columns]
         statement_id = str(doc.get("statement_id") or "")

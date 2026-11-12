@@ -283,3 +283,128 @@ def test_provider_exception_becomes_issue_not_crash(tmp_path):
 def test_rule_kind_normalises_case_and_space(value):
     assert cv._rule_kind({"type": value}) == "schema"
     assert cv._rule_kind("nope") == "" and cv._rule_kind({}) == ""
+
+
+# ------------------------------------------------ gcp: a failed read is not a pass
+
+
+def gcp_expose(rules, **props):
+    location = {"properties": {"project": "p", "dataset": "d", "table": "t", **props}}
+    return {**expose(rules), "binding": {"platform": "gcp", "location": location}}
+
+
+def gcp_validator(provider, tmp_path):
+    v = make_validator(provider, tmp_path)
+    v.provider_name = "gcp"
+    return v
+
+
+def test_bigquery_read_failure_leaves_the_schema_rule_not_executed(tmp_path):
+    p = FakeProvider(schema_error=RuntimeError("bigquery down"))
+    v = gcp_validator(p, tmp_path)
+    v._validate_single_expose(gcp_expose([SCHEMA_RULE]), 0)
+    c = check(v, "e1.conforms")
+    assert not c.passed and c.actual == "not executed"
+    assert "Schema conforms" not in (c.message or "")
+
+
+def test_bigquery_resource_returns_false_on_each_early_exit(tmp_path):
+    v = gcp_validator(FakeProvider(live=live(("a", "string"))), tmp_path)
+    assert v._validate_bigquery_resource(gcp_expose([]), "p", {"project": "p"}) is False
+    v.validation_provider = None
+    full = {"project": "p", "dataset": "d", "table": "t"}
+    assert v._validate_bigquery_resource(gcp_expose([]), "p", full) is False
+    assert v._validate_against_actual_resource(gcp_expose([]), "p") is False
+
+
+def test_bigquery_resource_returns_true_when_columns_were_compared(tmp_path):
+    v = gcp_validator(FakeProvider(live=live(("a", "string"), ("b", "int"))), tmp_path)
+    assert v._validate_against_actual_resource(gcp_expose([]), "p") is True
+
+
+# ------------------------------------------------------- duplicate rule ids
+
+
+def test_two_rules_sharing_an_id_are_paired_with_their_own_results_in_order(tmp_path):
+    results = [
+        QualityCheckResult("d", "completeness", "a", False, "error", "bad", "1.0", "0.5"),
+        QualityCheckResult("d", "completeness", "b", True, "error", "ok", "1.0", "1.0"),
+    ]
+    rules = [
+        {"id": "d", "type": "completeness", "selector": "a"},
+        {"id": "d", "type": "completeness", "selector": "b"},
+    ]
+    p = FakeProvider(live=live(("a", "string"), ("b", "int")), results=results)
+    v = make_validator(p, tmp_path)
+    v._validate_single_expose(expose(rules), 0)
+    outcomes = [c for c in v.report.checks if c.name == "e1.d"]
+    assert [c.passed for c in outcomes] == [False, True]
+    assert [c.actual for c in outcomes] == ["0.5", "1.0"]
+
+
+# --------------------------------------------- the schema cache and Databricks
+
+
+class CountingProvider(FakeProvider):
+    """Row count 0 on the first read, 5 on the second; empty tables are an issue."""
+
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    def get_resource_schema(self, resource_spec):
+        self.reads += 1
+        count = 0 if self.reads == 1 else 5
+        return ResourceSchema(
+            ResourceType.TABLE,
+            "c.s.t",
+            [FieldSchema("a", "string", "NULLABLE"), FieldSchema("b", "int", "NULLABLE")],
+            row_count=count,
+        )
+
+    def validate_resource(self, contract_spec, actual_schema):
+        from fluid_build.providers.validation_provider import ValidationIssue
+
+        issues = []
+        if actual_schema.row_count == 0:
+            issues.append(
+                ValidationIssue(
+                    severity="warning", category="empty_table", message="empty", path="p"
+                )
+            )
+        return ValidationResult("x", True, issues, actual_schema)
+
+
+def cached_validator(provider_name, tmp_path, monkeypatch):
+    from fluid_build.providers.validation_cache import ValidationCache
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    provider = CountingProvider()
+    v = make_validator(provider, tmp_path)
+    v.provider_name = provider_name
+    v.use_cache = True
+    v.cache = ValidationCache(cache_dir=tmp_path / "cache", ttl=3600)
+    return v, provider
+
+
+def empty_table_issues(v):
+    return [i for i in v.report.issues if i.category == "empty_table"]
+
+
+def test_databricks_never_reads_the_schema_cache(tmp_path, monkeypatch):
+    v, provider = cached_validator("databricks", tmp_path, monkeypatch)
+    e = expose([])
+    v._validate_generic_resource(e, "p")
+    assert len(empty_table_issues(v)) == 1
+    v._validate_generic_resource(e, "p")
+    assert provider.reads == 2
+    assert len(empty_table_issues(v)) == 1  # the second read saw 5 rows
+    assert list((tmp_path / "cache").glob("*.json")) == []
+
+
+def test_snowflake_still_uses_the_schema_cache(tmp_path, monkeypatch):
+    v, provider = cached_validator("snowflake", tmp_path, monkeypatch)
+    e = expose([])
+    v._validate_generic_resource(e, "p")
+    v._validate_generic_resource(e, "p")
+    assert provider.reads == 1

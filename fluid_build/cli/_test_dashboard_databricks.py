@@ -109,9 +109,20 @@ def _table_column(name: str, kind: str, title: str, order: int) -> Dict[str, Any
 def dashboard_definition(table: Tuple[str, str, str]) -> Dict[str, Any]:
     """The ``serialized_dashboard`` for a results table (validated name parts)."""
     ref = ".".join(f"`{p}`" for p in table)
+    # Each product's latest run is the latest one that tested rules (a run that
+    # tested none, say a product that declares none, counts only when no other
+    # did), so the rule widgets always show a product's last real result.
     latest = (
-        f"WITH latest AS (\n  SELECT * FROM {ref}\n"
-        "  QUALIFY run_time = MAX(run_time) OVER (PARTITION BY product_id)\n)\n"
+        "WITH last_run AS (\n"
+        "  SELECT product_id, COALESCE(\n"
+        f"    MAX(CASE WHEN {_RULES_ONLY} THEN run_time END), MAX(run_time)\n"
+        "  ) AS run_time\n"
+        f"  FROM {ref} GROUP BY product_id\n"
+        "),\n"
+        "latest AS (\n"
+        f"  SELECT t.* FROM {ref} AS t JOIN last_run AS l\n"
+        "    ON t.product_id = l.product_id AND t.run_time = l.run_time\n"
+        ")\n"
     )
     pass_pct = "ROUND(100 * AVG(CASE WHEN passed THEN 1.0 ELSE 0.0 END), 1)"
     datasets = [
@@ -355,6 +366,21 @@ def _is_not_found(exc: BaseException) -> bool:
     )
 
 
+def _later(first: Any, second: Any) -> bool:
+    """Whether timestamp ``first`` is after ``second`` (``False`` when either is unreadable)."""
+    from datetime import datetime
+
+    try:
+        a = datetime.fromisoformat(str(first).replace("Z", "+00:00"))
+        b = datetime.fromisoformat(str(second).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    try:
+        return a > b
+    except TypeError:  # one naive, one aware
+        return False
+
+
 def _same(theirs: Any, ours: Mapping[str, Any]) -> bool:
     """Whether a stored ``serialized_dashboard`` holds our datasets and pages."""
     try:
@@ -463,12 +489,16 @@ def ensure_dashboard(
         published_path = f"{DASHBOARDS_PATH}/{quote(dashboard_id, safe='')}/published"
         publish = action != "unchanged"
         if not publish:
+            # Unchanged here, but a run whose PATCH landed and whose publish failed
+            # left the published revision behind the draft: publish it then.
             try:
-                api.do("GET", published_path)
+                published = api.do("GET", published_path)
             except Exception as exc:  # noqa: BLE001
                 if not _is_not_found(exc):
                     raise
                 publish = True
+            else:
+                publish = _later(current.get("update_time"), published.get("revision_create_time"))
         if publish:
             api.do(
                 "POST", published_path, body={"embed_credentials": False, "warehouse_id": warehouse}
@@ -476,14 +506,15 @@ def ensure_dashboard(
     except CLIError:
         raise
     except Exception as exc:  # noqa: BLE001 - every failure becomes one safe message
-        raise CLIError(
-            1,
-            "test_results_dashboard_failed",
-            {
-                "results_dashboard": f"{folder}/{name}",
-                "error": f"{type(exc).__name__}: {scrub(exc)}",
-            },
-        ) from None
+        context = {
+            "results_dashboard": f"{folder}/{name}",
+            "error": f"{type(exc).__name__}: {scrub(exc)}",
+        }
+        if isinstance(exc, ImportError):
+            from fluid_build.providers.databricks.statements import DATABRICKS_EXTRA_INSTALL
+
+            context["fix"] = f"Install the Databricks extra: {DATABRICKS_EXTRA_INSTALL}"
+        raise CLIError(1, "test_results_dashboard_failed", context) from None
     host = str(getattr(getattr(client, "config", None), "host", "") or "").rstrip("/")
     url = f"{host}/dashboardsv3/{dashboard_id}/published" if host else None
     _status(f"Dashboard {action}: {folder}/{name}" + (f" ({url})" if url else ""))

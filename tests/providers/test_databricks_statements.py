@@ -180,3 +180,40 @@ def test_warehouse_id_from_env_trims_and_reads_os_environ(monkeypatch):
     assert warehouse_id_from_env({"DATABRICKS_WAREHOUSE_ID": " wh "}) == "wh"
     monkeypatch.setenv("DATABRICKS_WAREHOUSE_ID", "from-env")
     assert warehouse_id_from_env() == "from-env"
+
+
+# ------------------------------------------------------- circuit breaker
+
+
+def test_timeout_stops_the_statements_after_it_without_an_api_call():
+    r, api = runner([running("PENDING")] * 50 + [{}], timeout_seconds=0)
+    with pytest.raises(StatementError, match="did not finish"):
+        r.run("q1")
+    calls = len(api.calls)
+    with pytest.raises(StatementError) as exc:
+        r.run("q2")
+    assert str(exc.value).startswith("not run:")
+    assert len(api.calls) == calls
+
+
+def test_transport_failure_stops_the_statements_after_it_without_an_api_call():
+    r, api = runner([RuntimeError("connection reset")])
+    with pytest.raises(StatementError, match="RuntimeError"):
+        r.run("q1")
+    with pytest.raises(StatementError) as exc:
+        r.run("q2")
+    assert str(exc.value).startswith("not run:")
+    assert len(api.calls) == 1
+
+
+def test_a_sql_error_does_not_stop_the_statements_after_it():
+    failed = {
+        "statement_id": "sid-1",
+        "status": {"state": "FAILED", "error": {"message": "[TABLE_OR_VIEW_NOT_FOUND] t"}},
+    }
+    r, api = runner([failed, ok([["7"]], [("n", "LONG")])])
+    with pytest.raises(StatementError) as first:
+        r.run("q1")
+    assert not str(first.value).startswith("not run:")
+    assert r.run("q2") == [(7,)]
+    assert len([c for c in api.calls if c[0] == "POST"]) == 2

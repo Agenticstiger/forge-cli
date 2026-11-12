@@ -11,6 +11,7 @@ table from ever disagreeing about what ran.
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Tuple
 
 #: The structural check categories, in report order. ``quality`` stands for
@@ -33,6 +34,10 @@ STRUCTURAL_CATEGORIES: Tuple[str, ...] = (
 )
 
 
+#: The path of an issue raised for one rule: ``exposes[0].contract.dq.rules.<id>``.
+_RULE_PATH = re.compile(r"\.rules\.[^.]+$")
+
+
 def rule_checks(report) -> List:
     """The data-quality rules that ran, one ``CheckOutcome`` each."""
     return [c for c in getattr(report, "checks", []) if c.category == "quality"]
@@ -52,11 +57,18 @@ def structural_categories(report) -> Tuple[List[str], List[str], Dict[str, List]
     builtin = list(STRUCTURAL_CATEGORIES)
     if rule_checks(report):
         # The per-rule cases already carry every rule outcome; a roll-up
-        # ``quality`` case on top would double-count them.
-        builtin.remove("quality")
+        # ``quality`` case on top would double-count them. A quality issue no
+        # rule case carries (an expose whose rules could not run at all) still
+        # needs a case, so the roll-up stays, with only those issues.
+        unattributed = [
+            i for i in by_category.get("quality", []) if not _RULE_PATH.search(i.path or "")
+        ]
+        if unattributed:
+            by_category["quality"] = unattributed
+        else:
+            builtin.remove("quality")
+            by_category.pop("quality", None)
     extra = [c for c in by_category if c not in builtin]
-    if rule_checks(report) and "quality" in extra:
-        extra.remove("quality")
     return builtin, extra, by_category
 
 

@@ -354,7 +354,15 @@ class DatabricksValidationProvider(ValidationProvider):
         """
         key = (product_id, column.lower(), (prefer_catalog or "").lower())
         if key not in self._references:
-            self._references[key] = self._find_reference(product_id, column, prefer_catalog)
+            try:
+                self._references[key] = self._find_reference(product_id, column, prefer_catalog)
+            except Exception as exc:  # noqa: BLE001 - one failed lookup, said once per rule
+                from fluid_build.providers.databricks.statements import scrub
+
+                self._references[key] = LookupError(
+                    f"the lookup of the table tagged {PRODUCT_TAG}={product_id} failed "
+                    f"({type(exc).__name__}: {scrub(exc)})"
+                )
         found = self._references[key]
         if isinstance(found, LookupError):
             raise found
@@ -390,10 +398,12 @@ class DatabricksValidationProvider(ValidationProvider):
                 "visible to this identity (has that product been applied?)"
             )
         if len(having) > 1:
-            listed = ", ".join(".".join(p) for p in having[:3])
             return LookupError(
+                # The tables are not named: this message is written to the shared
+                # results table, whose readers may not see them.
                 f"{len(having)} tables tagged {PRODUCT_TAG}={product_id} have a column "
-                f"{column!r} ({listed}), so which one it references is ambiguous"
+                f"{column!r}, so which one it references is ambiguous; keep the tag on the "
+                "product's own table only"
             )
         try:
             return sql_table_ref(having[0])

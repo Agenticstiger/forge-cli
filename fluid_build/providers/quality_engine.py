@@ -152,9 +152,9 @@ def parse_range(constraint: Any) -> List[Tuple[str, float]]:
 
 @dataclass(frozen=True)
 class ValueDomain:
-    """What a valid value of one column is: the first declaration found of
-    the rule's own values, the column's ``enum``, ``regex`` or ``range``
-    validationRule, or its ``labels.references``."""
+    """What a valid value of one column is: the rule's own value list, or else
+    every declaration the column makes (its ``enum``, ``regex`` and ``range``
+    validationRules and its ``labels.references``), all of which must hold."""
 
     values: Tuple[str, ...] = ()
     pattern: Optional[str] = None
@@ -165,16 +165,17 @@ class ValueDomain:
 def value_domain(rule: Dict[str, Any], columns: Any = None, column: Optional[str] = None):
     """The :class:`ValueDomain` of ``column`` (default: the rule's selector)."""
     sub = rule if column is None else {**rule, "selector": column}
-    values = extract_valid_values(sub, columns)
-    if values:
-        return ValueDomain(values=tuple(values))
-    pattern = extract_value_pattern(sub, columns)
-    if pattern:
-        return ValueDomain(pattern=pattern)
-    bounds = parse_range(_column_constraint(columns, sub.get("selector") or "", "range"))
-    if bounds:
-        return ValueDomain(bounds=tuple(bounds))
-    return ValueDomain(reference=extract_reference(sub, columns))
+    listed = extract_valid_values(sub)
+    if listed:
+        return ValueDomain(values=tuple(listed))
+    name = sub.get("selector") or ""
+    enum = _column_constraint(columns, name, "enum")
+    return ValueDomain(
+        values=tuple(v.strip() for v in re.split(r"[|,]", enum) if v.strip()) if enum else (),
+        pattern=extract_value_pattern(sub, columns),
+        bounds=tuple(parse_range(_column_constraint(columns, name, "range"))),
+        reference=extract_reference(sub, columns),
+    )
 
 
 #: ``resolve_reference(product id, column) -> table reference for SQL``; raises
@@ -304,22 +305,31 @@ def _validity_pattern_sql(table_ref: str, column: str, pattern: str, dialect: st
     anchored pattern (``^[A-Z]{2}$``) means the same on all of them.
     """
     col = _qi(column, dialect)
+    return (
+        f"SELECT COUNT(*) AS invalid_count FROM {table_ref} "
+        f"WHERE {col} IS NOT NULL AND {_pattern_mismatch(col, pattern, dialect)}"
+    )
+
+
+def _pattern_mismatch(col: str, pattern: str, dialect: str) -> str:
+    """The predicate "the (quoted) column ``col`` does not match ``pattern``"."""
     literal = quote_string_literal_for(dialect, pattern)
     name = _dialect(dialect)
     if name == "databricks":
-        mismatch = f"NOT ({col} RLIKE {literal})"
-    elif name == "bigquery":
-        mismatch = f"NOT REGEXP_CONTAINS({col}, {literal})"
-    elif name == "snowflake":
-        mismatch = f"REGEXP_INSTR({col}, {literal}) = 0"
-    elif name in ("ansi", "duckdb"):
-        mismatch = f"NOT regexp_matches({col}, {literal})"
-    else:
-        raise ValueError(f"no regular-expression test for SQL dialect {dialect!r}")
-    return (
-        f"SELECT COUNT(*) AS invalid_count FROM {table_ref} "
-        f"WHERE {col} IS NOT NULL AND {mismatch}"
-    )
+        return f"NOT ({col} RLIKE {literal})"
+    if name == "bigquery":
+        return f"NOT REGEXP_CONTAINS({col}, {literal})"
+    if name == "snowflake":
+        return f"REGEXP_INSTR({col}, {literal}) = 0"
+    if name in ("ansi", "duckdb"):
+        return f"NOT regexp_matches({col}, {literal})"
+    raise ValueError(f"no regular-expression test for SQL dialect {dialect!r}")
+
+
+def _range_violation(col: str, bounds: Tuple[Tuple[str, float], ...]) -> str:
+    """The predicate "the (quoted) column ``col`` is outside ``bounds``"."""
+    inside = " AND ".join(f"{col} {op} {float(n)!r}" for op, n in bounds if op in _OPERATORS)
+    return f"NOT ({inside})"
 
 
 def _validity_range_sql(
@@ -327,10 +337,9 @@ def _validity_range_sql(
 ) -> str:
     """Count non-null values of ``column`` outside the declared bounds."""
     col = _qi(column, dialect)
-    inside = " AND ".join(f"{col} {op} {float(n)!r}" for op, n in bounds if op in _OPERATORS)
     return (
         f"SELECT COUNT(*) AS invalid_count FROM {table_ref} "
-        f"WHERE {col} IS NOT NULL AND NOT ({inside})"
+        f"WHERE {col} IS NOT NULL AND {_range_violation(col, bounds)}"
     )
 
 
@@ -935,6 +944,22 @@ def _check_accuracy(
     execute_fn,
     dialect: str = "ansi",
 ) -> QualityCheckResult:
+    if threshold is None:
+        # A bound with nothing to compare against checks nothing; reading it as
+        # passed whenever the column holds a value made a gate read green.
+        return QualityCheckResult(
+            rule_id=rule_id,
+            rule_type="accuracy",
+            selector=selector,
+            passed=False,
+            severity=severity,
+            message=(
+                f"Rule '{rule_id}' is an accuracy rule with no threshold, so nothing was "
+                "checked. Declare a threshold and an operator (>=, >, <=, <, == or !=)."
+            ),
+            expected="a threshold to compare with",
+            actual="not executed",
+        )
     columns = rule_columns(selector)
     if len(columns) > 1:
         return _check_accuracy_columns(
@@ -1100,24 +1125,23 @@ def _check_validity(
     rule_type: str = "validity",
     resolve_reference: Optional[ReferenceResolver] = None,
 ) -> QualityCheckResult:
+    col = _qi(selector, dialect)
+    violations: List[str] = []
+    kinds: List[str] = []
     if domain.values:
-        col = _qi(selector, dialect)
         # The literals are contract-supplied, so the quoting must hold on the
         # *target* dialect (a value ending in a backslash must not end the
         # literal early and append live SQL to this predicate).
         escaped = ", ".join(quote_string_literal_for(dialect, str(v)) for v in domain.values)
-        sql = (
-            f"SELECT COUNT(*) AS invalid_count FROM {table_ref} "
-            f"WHERE {col} IS NOT NULL AND {col} NOT IN ({escaped})"
-        )
-        expected = "0 invalid values"
-    elif domain.pattern:
-        sql = _validity_pattern_sql(table_ref, selector, domain.pattern, dialect)
-        expected = f"0 values not matching {domain.pattern}"
-    elif domain.bounds:
-        sql = _validity_range_sql(table_ref, selector, domain.bounds, dialect)
-        expected = "0 values outside " + " and ".join(f"{op} {n:g}" for op, n in domain.bounds)
-    elif domain.reference is not None:
+        violations.append(f"{col} NOT IN ({escaped})")
+        kinds.append("invalid values")
+    if domain.pattern:
+        violations.append(_pattern_mismatch(col, domain.pattern, dialect))
+        kinds.append(f"values not matching {domain.pattern}")
+    if domain.bounds:
+        violations.append(_range_violation(col, domain.bounds))
+        kinds.append("values outside " + " and ".join(f"{op} {n:g}" for op, n in domain.bounds))
+    if not violations and domain.reference is not None:
         return _check_reference(
             rule_id,
             selector,
@@ -1130,6 +1154,13 @@ def _check_validity(
             dialect,
             rule_type,
         )
+    if violations:
+        invalid = violations[0] if len(violations) == 1 else f"({' OR '.join(violations)})"
+        sql = (
+            f"SELECT COUNT(*) AS invalid_count FROM {table_ref} "
+            f"WHERE {col} IS NOT NULL AND {invalid}"
+        )
+        expected = "0 " + kinds[0] if len(kinds) == 1 else "0 " + "; 0 ".join(kinds)
     else:
         # A misconfigured gate is a failed gate. Forcing 'warning' here
         # overrode the author's declared severity, so a rule declared
@@ -1153,7 +1184,7 @@ def _check_validity(
     rows = execute_fn(sql)
     invalid_count = rows[0][0] if rows and rows[0][0] is not None else 0
     passed = int(invalid_count) == 0
-    return QualityCheckResult(
+    result = QualityCheckResult(
         rule_id=rule_id,
         rule_type=rule_type,
         selector=selector,
@@ -1166,6 +1197,36 @@ def _check_validity(
         ),
         expected=expected,
         actual=f"{invalid_count} invalid value(s)",
+    )
+    if domain.reference is None:
+        return result
+    # The column also references another product: that must hold too.
+    reference = _check_reference(
+        rule_id,
+        selector,
+        severity,
+        description,
+        domain.reference,
+        resolve_reference,
+        table_ref,
+        execute_fn,
+        dialect,
+        rule_type,
+    )
+    failed = [r.message for r in (result, reference) if not r.passed]
+    return QualityCheckResult(
+        rule_id=rule_id,
+        rule_type=rule_type,
+        selector=selector,
+        passed=not failed,
+        severity=severity,
+        message="; ".join(failed) if failed else result.message,
+        expected=f"{result.expected}; {reference.expected}",
+        actual=(
+            "not executed"
+            if reference.actual == "not executed"
+            else f"{result.actual}; {reference.actual}"
+        ),
     )
 
 

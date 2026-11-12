@@ -289,11 +289,14 @@ def _dq_rules_to_checks(
     unmapped: list[UnmappedRule],
 ) -> list[Any]:
     """Convert ``contract.dq.rules[]`` to SodaCL checks, accounting for each."""
+    from fluid_build.providers.quality_engine import expose_columns
+
     checks: list[Any] = []
+    columns = expose_columns(dict(expose))
     for rule in _dq_rules(expose):
         rule_id = str(rule.get("id") or "unnamed")
         rule_type = str(rule.get("type") or "").strip().lower()
-        emitted, reason = _convert_dq_rule(rule, rule_type)
+        emitted, reason = _convert_dq_rule(rule, rule_type, columns)
         if emitted:
             checks.extend(emitted)
             mapped.append(f"{expose_id}.{rule_id}")
@@ -309,11 +312,15 @@ def _dq_rules_to_checks(
     return checks
 
 
-def _convert_dq_rule(rule: Mapping[str, Any], rule_type: str) -> tuple[list[Any], str]:
+def _convert_dq_rule(
+    rule: Mapping[str, Any], rule_type: str, columns: Any = None
+) -> tuple[list[Any], str]:
     """Map one ``$defs.dqRule`` to SodaCL checks, or explain why we can't.
 
     Returns ``(checks, reason)``. ``checks`` empty ⇒ unmapped, and ``reason``
-    says why in terms the contract author can act on.
+    says why in terms the contract author can act on. ``columns`` is the
+    expose's ``contract.schema``: a valid_values rule reads its column's
+    declarations from it, as the native engine does.
     """
     selector = rule.get("selector")
     selector = selector.strip() if isinstance(selector, str) else ""
@@ -337,6 +344,20 @@ def _convert_dq_rule(rule: Mapping[str, Any], rule_type: str) -> tuple[list[Any]
 
     if not selector:
         return [], "rule declares no 'selector' (column name)"
+    from fluid_build.providers.quality_engine import rule_columns
+
+    listed = rule_columns(selector)
+    if len(listed) > 1:
+        # As the native engine reads it: every listed column must hold.
+        if rule_type not in ("completeness", "accuracy", "anomaly_detection") + _VALIDITY:
+            return [], f"a {rule_type} rule takes one column, not {len(listed)}"
+        per_column: list[Any] = []
+        for column in listed:
+            emitted, reason = _convert_dq_rule({**rule, "selector": column}, rule_type, columns)
+            if not emitted:
+                return [], f"column {column!r}: {reason}"
+            per_column.extend(emitted)
+        return per_column, ""
     if not _SAFE_COLUMN.match(selector):
         # SodaCL check expressions are parsed by an ANTLR grammar; an
         # exotic identifier would produce a confusing parse error deep
@@ -351,8 +372,8 @@ def _convert_dq_rule(rule: Mapping[str, Any], rule_type: str) -> tuple[list[Any]
         # Column-scoped anomaly_detection delegates to the same bound logic
         # the native engine uses (``_check_anomaly_detection`` → ``_check_accuracy``).
         return _bound_checks(selector, threshold, operator)
-    if rule_type in ("validity", "valid_values"):
-        return _valid_values_checks(selector, rule)
+    if rule_type in _VALIDITY:
+        return _valid_values_checks(selector, rule, columns)
     if rule_type == "freshness":
         return _freshness_checks(selector, rule)
 
@@ -362,6 +383,8 @@ def _convert_dq_rule(rule: Mapping[str, Any], rule_type: str) -> tuple[list[Any]
         "anomaly_detection, drift_detection"
     )
 
+
+_VALIDITY = ("validity", "valid_values")
 
 # SodaCL threshold comparators (soda-core 3.x supports =, !=, <, >, <=, >=).
 _SODACL_OPERATORS = {
@@ -472,18 +495,45 @@ def _bound_checks(selector: str, threshold, operator: str) -> tuple[list[Any], s
     )
 
 
-def _valid_values_checks(selector: str, rule: Mapping[str, Any]) -> tuple[list[Any], str]:
-    """validity / valid_values ⇒ ``invalid_count(col) = 0`` + ``valid values``."""
-    from fluid_build.providers.quality_engine import extract_valid_values
+def _valid_values_checks(
+    selector: str, rule: Mapping[str, Any], columns: Any = None
+) -> tuple[list[Any], str]:
+    """validity / valid_values ⇒ ``invalid_count(col) = 0`` with the column's
+    ``valid values`` / ``valid regex`` / ``valid min`` / ``valid max``.
 
-    values = extract_valid_values(rule)
-    if not values:
+    The allowed values come from the native engine's own reading
+    (``quality_engine.value_domain``): the rule's list, else every declaration
+    the column makes. One SodaCL cannot express (a strict bound, a reference to
+    another product's table) leaves the rule unmapped rather than half-checked.
+    """
+    from fluid_build.providers.quality_engine import value_domain
+
+    domain = value_domain(dict(rule), columns, selector)
+    config: dict[str, Any] = {}
+    if domain.values:
+        config["valid values"] = list(domain.values)
+    if domain.pattern:
+        config["valid regex"] = domain.pattern
+    for op, bound in domain.bounds:
+        if op not in (">=", "<="):
+            return [], (
+                f"range bound {op} {bound:g} has no SodaCL equivalent (valid min and "
+                "valid max are inclusive)"
+            )
+        config["valid min" if op == ">=" else "valid max"] = _num_value(bound)
+    if domain.reference is not None:
+        product, column = domain.reference
+        return [], (
+            f"the column references {product}.{column}, another product's table, "
+            "which SodaCL cannot look up"
+        )
+    if not config:
         return [], (
             "valid_values rule declares no allowed values — declare them in "
-            'the description ("COLUMN valid values: A, B, C.") or as a '
-            "'validValues' list"
+            'the description ("COLUMN valid values: A, B, C."), as an enum, regex or '
+            "range validationRule on the column, or as a 'validValues' list"
         )
-    return [{f"invalid_count({selector}) = 0": {"valid values": list(values)}}], ""
+    return [{f"invalid_count({selector}) = 0": config}], ""
 
 
 def _freshness_checks(selector: str, rule: Mapping[str, Any]) -> tuple[list[Any], str]:
