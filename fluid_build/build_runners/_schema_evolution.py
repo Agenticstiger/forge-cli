@@ -140,7 +140,7 @@ _VARCHAR_NAMES = frozenset({"varchar", "string", "text", "char", "bpchar", "nvar
 #: on each VARCHAR name but neither enforces nor reports it (measured on 1.5.1
 #: and 2.0.0: six letters land in a VARCHAR(3) column, which DESCRIBEs as plain
 #: VARCHAR), so for those names the length is dropped before the lookup.
-_NAME_AND_LENGTH = re.compile(r"([a-z]+)\s*\(\s*\d+\s*\)")
+_NAME_AND_LENGTH = re.compile(r"([a-z]+)\s*\(\s*[0-9]+\s*\)")
 
 _FAMILY_OF: Dict[str, int] = {
     name: index for index, names in enumerate(_TYPE_FAMILIES) for name in names

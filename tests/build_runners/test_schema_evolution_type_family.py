@@ -82,6 +82,10 @@ def test_a_real_type_change_still_fails() -> None:
         ("integer", "varchar"),
         ("timestamp", "date"),
         ("double", "boolean"),
+        # A length is dropped only from a VARCHAR name, and only a bare one.
+        ("varchar(255)", "integer"),
+        ("VARCHAR(255)[]", "VARCHAR"),
+        ("decimal(12,2)", "VARCHAR"),
     ):
         assert _event(old, new) == "type_changed", f"{old} -> {new} is real drift"
 
@@ -296,12 +300,6 @@ def test_duckdbs_names_for_varchar_are_one_type(old: str, new: str) -> None:
     """
     assert _event(old, new) == "none"
     assert family_rename_note(old, new) is None
-
-
-def test_only_a_length_on_a_varchar_name_is_dropped() -> None:
-    assert _event("varchar(255)", "integer") == "type_changed"
-    assert _event("VARCHAR(255)[]", "VARCHAR") == "type_changed"  # a list is not text
-    assert _event("decimal(12,2)", "VARCHAR") == "type_changed"
 
 
 def test_an_all_null_column_that_fills_with_text_is_not_drift() -> None:
