@@ -145,6 +145,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a model the endpoint has. All three now ask the stated endpoint. A `--tiered` stage now
   calls a stated endpoint too, as the routing model already did; it called the provider's
   default address instead.
+- **`fluid ai test --json` prints only its report when the call fails.** litellm printed its
+  "Give Feedback / Get Help" banner to stdout ahead of the JSON. Forge now sets litellm's own
+  switch, `suppress_debug_info`, wherever it loads litellm (AI calls, `fluid ai setup`'s key
+  check, the agent loop), so no command prints the banner. The error is reported as before.
 
 ### Security
 
