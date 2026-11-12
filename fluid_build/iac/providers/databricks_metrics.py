@@ -82,12 +82,12 @@ like the column masks (``databricks_enforce.py``), around ``tofu apply``:
   (its table renamed, its semantics or its expose removed), is dropped before ``tofu apply``:
   dropping a view only narrows who reads. It is found by name (``*_semantic_model``,
   ``table-summaries``) and dropped only with this product's ``fluid.product_id`` and the deploy
-  identity as owner. Only those schemas are looked in, so another environment of the product (an
-  overlay that changes the schema, in the same catalog, under the same identity) keeps its views.
-  The cost is the one the column masks' functions share: a view left in a schema the contract
-  stops using (its table moved, its last expose removed) is not found, and OpenTofu's destroy of
-  that schema (never ``force_destroy``) then fails while the schema holds it; drop it by hand
-  (``DROP VIEW <name>``) and re-run.
+  identity as owner. Only those schemas are looked in here, so another environment of the
+  product (an overlay that changes the schema, in the same catalog, under the same identity)
+  keeps its views. A schema the contract stops using (its table moved, its last expose removed)
+  is the plan's to name: OpenTofu's state holds it and the saved plan destroys it, and
+  ``databricks_vacated.py`` drops this product's views there, by the same checks, before the
+  apply, so the destroy (never ``force_destroy``) is not refused.
 * A metric view reads its table with its owner's rights, and Unity Catalog applies the table's
   row filter and column masks to whoever queries the view (a row filter measured live). When
   binding them fails, :func:`lock_restricted` revokes ``SELECT`` on the views over restricted

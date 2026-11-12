@@ -302,8 +302,10 @@ def _apply_via_opentofu(
 
         _enforce_data_loss_gate(args, logger, provider, changes, data_changes, lost_in_place)
 
+        destroyed = _planned_destroys(plugin, changes, str(workdir), env)
         if dry_run:
             _enforce_access(plugin, "pre_apply", contract, dry_run=True)
+            _prepare_destroys(plugin, contract, destroyed, dry_run=True)
             _converge_output_ports(plugin, contract, dry_run=True)
             cprint("\ndry-run: plan only — not applying.")
             info(logger, "opentofu_apply_dry_run", provider=provider, **changes)
@@ -313,6 +315,7 @@ def _apply_via_opentofu(
         # grant the apply adds lands on a protected table. A failure stops the run here:
         # nothing has been applied.
         _enforce_access(plugin, "pre_apply", contract)
+        _prepare_destroys(plugin, contract, destroyed)
         imported.keep()
 
     # ``fluid apply`` is the headline state-changing command, so a receiver
@@ -322,7 +325,7 @@ def _apply_via_opentofu(
     # (``resolve_lineage_emitter`` returns the null emitter), and every
     # emit call soft-fails — lineage never breaks an apply.
     with _apply_lineage(contract, provider=provider, planned=changes) as record:
-        apply_result = runner.tofu_apply(str(workdir), env=env)
+        apply_result, waited = _apply_saved_plan(plugin, contract, destroyed, str(workdir), env)
         if not apply_result.ok:
             # A table the failed apply created, its grants and the job that fills it can all
             # exist with no mask or filter: bind what exists (never drop) before failing.
@@ -332,7 +335,7 @@ def _apply_via_opentofu(
                 _tail(apply_result.stderr or apply_result.stdout),
             )
             raise _apply_failure(apply_result, str(workdir), plugin)
-        applied = runner.change_summary(apply_result)
+        applied = _applied(changes, apply_result, waited)
         record(applied)
 
     cprint(f"\n  tofu apply complete: +{applied['add']} ~{applied['change']} -{applied['remove']}")
@@ -376,19 +379,25 @@ def _converge_output_ports(
     and the run exits non-zero; the tables the apply made stay, and the next apply converges
     the space. With ``dry_run`` the plugin prints what it would do and writes nothing.
     """
-    run = getattr(plugin, "converge_output_ports", None)
+    # Its lines quote titles (anyone's, from the Genie list) and the ``[fluid-genie:...]``
+    # marker, which Rich would read as markup.
+    _run_hook(
+        plugin, "converge_output_ports", "opentofu_output_port_failed", contract, dry_run=dry_run
+    )
+
+
+def _run_hook(plugin: Any, hook: str, event: str, *args: Any, **kwargs: Any) -> None:
+    """Run the plugin's optional ``hook``, if it has one, with what it prints going out
+    literally: it quotes the contract and the server (statements, names, a server's error text
+    with its ``[ERROR_CLASS]``), data, not markup, so a "[word]" in it neither vanishes nor
+    raises. A typed refusal is the run's error (:func:`_binding_error`, under ``event``)."""
+    run = getattr(plugin, hook, None)
     if not callable(run):
         return
     try:
-        # Literally: its lines quote titles (anyone's, from the Genie list) and the
-        # ``[fluid-genie:...]`` marker, which Rich would read as markup.
-        run(contract, say=cprint_literal, dry_run=dry_run)
+        run(*args, say=cprint_literal, **kwargs)
     except UnsupportedBindingError as exc:
-        raise CLIError(
-            1,
-            "opentofu_output_port_failed",
-            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
-        ) from exc
+        raise _binding_error(exc, event) from exc
 
 
 def _enforce_access(
@@ -403,22 +412,139 @@ def _enforce_access(
     plugin prints the statements and runs none. What a hook prints is data (table names,
     statements, a server's error text with its ``[ERROR_CLASS]``), so it goes out literally.
     """
-    run = getattr(plugin, hook, None)
-    if not callable(run):
-        return
-    # What the hooks print quotes the contract and the server (statements, descriptions, errors):
-    # data, not markup, so a "[word]" in it neither vanishes nor raises.
+    # ``post_apply`` takes no ``dry_run``: it never runs in one.
+    flags = {"dry_run": True} if dry_run else {}
+    _run_hook(plugin, hook, "opentofu_access_enforcement_failed", contract, **flags)
+
+
+def _planned_destroys(
+    plugin: Any, changes: Mapping[str, int], workdir: str, env: Mapping[str, str]
+) -> List[Dict[str, Any]]:
+    """What the saved plan only deletes (``runner.planned_deletes``), for the plugin's
+    ``prepare_destroys`` and ``unblock_destroys``. ``[]`` for a plugin without
+    ``prepare_destroys`` or a plan that removes nothing; a plan that cannot be read back is
+    said, and nothing is cleared before the apply."""
+    if not callable(getattr(plugin, "prepare_destroys", None)) or not changes.get("remove"):
+        return []
+    shown = runner.tofu_show_plan(workdir, plan_file="tfplan", env=env)
+    if shown is None:
+        cprint(
+            "  note: the saved plan could not be read back, so what the provider plugin made "
+            "outside OpenTofu in the resources it destroys is not cleared first."
+        )
+        return []
+    return runner.planned_deletes(shown)
+
+
+def _prepare_destroys(
+    plugin: Any,
+    contract: Mapping[str, Any],
+    destroyed: List[Dict[str, Any]],
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Run the plugin's ``prepare_destroys`` hook, if it has one, before ``tofu apply``.
+
+    Optional plugin capability, discovered like ``pre_apply``: the Databricks plugin drops what
+    it made outside OpenTofu (metric views, column mask and row filter functions) in the
+    schemas the plan destroys, which Unity Catalog would otherwise refuse to delete
+    (``iac/providers/databricks_vacated.py``). It gets the plan's deletes
+    (:func:`_planned_destroys`). With ``dry_run`` it prints the statements and runs none. What
+    it prints quotes live objects, so it goes out literally; a refusal stops the run before the
+    apply.
+    """
+    if destroyed:
+        _run_hook(
+            plugin,
+            "prepare_destroys",
+            "opentofu_destroy_preparation_failed",
+            contract,
+            destroyed,
+            dry_run=dry_run,
+        )
+
+
+def _apply_saved_plan(
+    plugin: Any,
+    contract: Mapping[str, Any],
+    destroyed: List[Dict[str, Any]],
+    workdir: str,
+    env: Mapping[str, str],
+) -> Tuple[Any, int]:
+    """``tofu apply`` of the saved plan, with the destroys it could not make yet resumed
+    (:func:`_resume_blocked_destroys`): the result that stands, and how many destroys waited
+    for a second apply (0 when none did)."""
+    result = runner.tofu_apply(workdir, env=env)
+    if result.ok:
+        return result, 0
+    return _resume_blocked_destroys(plugin, contract, result, destroyed, workdir, env) or (
+        result,
+        0,
+    )
+
+
+def _applied(changes: Mapping[str, int], result: Any, waited: int) -> Dict[str, int]:
+    """What the apply made: its summary, or after a resume the plan's own changes (the first
+    apply made all but the destroys that waited, the second plan held nothing else), with the
+    second apply's destroys in place of those that waited."""
+    applied = runner.change_summary(result)
+    if not waited:
+        return applied
+    return {**changes, "remove": int(changes["remove"]) - waited + applied["remove"]}
+
+
+def _resume_blocked_destroys(
+    plugin: Any,
+    contract: Mapping[str, Any],
+    result: Any,
+    destroyed: List[Dict[str, Any]],
+    workdir: str,
+    env: Mapping[str, str],
+) -> Optional[Tuple[Any, int]]:
+    """Finish the destroys a ``tofu apply`` could not make yet: ``(the second apply's result,
+    how many waited)``, or ``None`` and the apply's own failure stands.
+
+    OpenTofu destroys a resource and then what holds it, inside one apply. Unity Catalog keeps
+    the functions of a table's column masks and row filter until the table is gone, and refuses
+    to delete a schema that holds them, so a schema the contract stopped using fails to destroy
+    in the very apply that destroyed its tables. Optional plugin capability
+    ``unblock_destroys(contract, blocked, say) -> bool``: the Databricks plugin drops those
+    functions once no table uses them, and says what it dropped
+    (``iac/providers/databricks_vacated.py``). Fails closed: it resumes only when every
+    resource the apply failed on is a delete of the saved plan and no error is left
+    unaccounted for, the plugin cleared something, and the plan made after it holds nothing but
+    some of those deletes, which the data-loss gate already passed.
+    """
+    unblock = getattr(plugin, "unblock_destroys", None)
+    errored = runner.errored_resources(result)
+    planned = {entry["address"]: entry for entry in destroyed}
+    if not callable(unblock) or not errored or len(_diagnostics(result.events)) != len(errored):
+        return None  # nothing to resume, or an error no failed resource accounts for
+    if any(action != "delete" or address not in planned for address, action in errored):
+        return None
+    waited = sorted({address for address, _action in errored})
     try:
-        if dry_run:
-            run(contract, say=cprint_literal, dry_run=True)
-        else:
-            run(contract, say=cprint_literal)
-    except UnsupportedBindingError as exc:
-        raise CLIError(
-            1,
-            getattr(exc, "event", None) or "opentofu_access_enforcement_failed",
-            {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
-        ) from exc
+        cleared = unblock(contract, [planned[address] for address in waited], say=cprint_literal)
+    except Exception as exc:  # noqa: BLE001 — the apply's own failure is what the run raises
+        cprint_literal(
+            f"  what holds {', '.join(waited)} could not be cleared: {type(exc).__name__}"
+        )
+        return None
+    if not cleared:
+        return None
+    plan = runner.tofu_plan(workdir, env=env)
+    removals = {address for address, _kind in runner.planned_removals(plan)}
+    only_those = {"add": 0, "change": 0, "remove": len(removals)}
+    if not (plan.ok and removals and removals <= set(waited)) or (
+        runner.change_summary(plan) != only_those
+    ):
+        cprint_literal(
+            "  not destroyed again: the plan made after the apply holds more than "
+            + ", ".join(waited)
+        )
+        return None
+    cprint(f"  tofu plan (the destroys that waited): +0 ~0 -{len(removals)}")
+    return runner.tofu_apply(workdir, env=env), len(waited)
 
 
 def build_after_apply(
@@ -740,10 +866,12 @@ def emit_module(
     return module, actions
 
 
-def _binding_error(exc: UnsupportedBindingError) -> CLIError:
+def _binding_error(exc: UnsupportedBindingError, event: str = "unsupported_binding") -> CLIError:
+    """A typed refusal as the run's error, under ``event``, or the refusal's own when its class
+    names one (a Genie space's ``opentofu_output_port_failed``)."""
     return CLIError(
         1,
-        "unsupported_binding",
+        getattr(exc, "event", None) or event,
         {"kind": exc.kind, "error": str(exc), "remediation": list(exc.remediation)},
     )
 

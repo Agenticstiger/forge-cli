@@ -23,7 +23,7 @@ import signal
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 # Per-command wall-clock cap. A hung ``tofu`` (e.g., an unauthenticated
 # interactive auth prompt that ``-input=false`` did not catch, or a cloud
@@ -521,6 +521,18 @@ def tofu_state_rm(
     return _run(["state", "rm", *addresses], workdir=workdir, env=env, command="state-rm")
 
 
+def _resource_events(
+    result: TofuResult, kind: str, body: str
+) -> Iterator[Tuple[str, Mapping[str, Any]]]:
+    """``(action, resource)`` of each ``kind`` event of a ``-json`` stream (OpenTofu's
+    machine-readable UI): a ``planned_change`` carries them under ``change``, an
+    ``apply_*`` hook event under ``hook``."""
+    for event in result.events:
+        if event.get("type") == kind:
+            detail = event.get(body) or {}
+            yield str(detail.get("action") or ""), detail.get("resource") or {}
+
+
 def planned_removals(result: TofuResult) -> List[Tuple[str, str]]:
     """``(address, resource type)`` of every resource a plan deletes or replaces.
 
@@ -529,16 +541,41 @@ def planned_removals(result: TofuResult) -> List[Tuple[str, str]]:
     that remove an object). The ``change_summary`` event's ``remove`` counts the
     same resources, so a caller can tell which of them hold data.
     """
-    out: List[Tuple[str, str]] = []
-    for event in result.events:
-        if event.get("type") != "planned_change":
+    return [
+        (str(resource.get("addr") or ""), str(resource.get("resource_type") or ""))
+        for action, resource in _resource_events(result, "planned_change", "change")
+        if action in ("delete", "replace")
+    ]
+
+
+def errored_resources(result: TofuResult) -> List[Tuple[str, str]]:
+    """``(address, action)`` of every resource ``tofu apply -json`` failed on, from its
+    ``apply_errored`` events (the diagnostic that follows one carries no address)."""
+    return [
+        (str(resource.get("addr") or ""), action)
+        for action, resource in _resource_events(result, "apply_errored", "hook")
+    ]
+
+
+def planned_deletes(shown: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """``{"address", "type", "before"}`` of each managed resource a saved plan, as ``tofu
+    show -json`` prints it, only deletes (a replaced one comes back, so it is not one)."""
+    deletes: List[Dict[str, Any]] = []
+    for change in shown.get("resource_changes") or []:
+        detail = change.get("change") if isinstance(change, Mapping) else None
+        if not isinstance(detail, Mapping) or change.get("mode", "managed") != "managed":
             continue
-        change = event.get("change") or {}
-        if change.get("action") not in ("delete", "replace"):
+        if list(detail.get("actions") or []) != ["delete"]:
             continue
-        resource = change.get("resource") or {}
-        out.append((str(resource.get("addr") or ""), str(resource.get("resource_type") or "")))
-    return out
+        before = detail.get("before")
+        deletes.append(
+            {
+                "address": str(change.get("address") or ""),
+                "type": str(change.get("type") or ""),
+                "before": before if isinstance(before, Mapping) else {},
+            }
+        )
+    return deletes
 
 
 def change_summary(result: TofuResult) -> Dict[str, int]:

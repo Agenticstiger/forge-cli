@@ -135,7 +135,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tofu apply`, like the column masks: `CREATE VIEW` when it is missing, `ALTER VIEW ... AS`
   (which keeps its grants) when its definition changed, nothing when it did not, and
   `DROP VIEW`, before the apply, once the contract no longer declares it (in the schemas its
-  tables are in, so another environment of the product keeps its own). `--mode dry-run` prints
+  tables are in, or one the plan destroys, so another environment of the product keeps its
+  own). `--mode dry-run` prints
   every statement. What metric view YAML cannot express is refused at `fluid validate`, not
   approximated: derived metrics, a ratio with a filter, a non-additive dimension that is no time
   dimension, `hour` or `minute` on a `DATE`, colliding names, a name that is no column, and
@@ -284,6 +285,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the engines that run them; this job is its first.
 
 ### Fixed
+
+- **Databricks: a schema the contract stops using is destroyed, not left failing the apply.**
+  When a table moves to another schema, or a schema's last expose is removed, the plan destroys
+  the old schema, and Unity Catalog refuses to delete a schema that still holds anything. The
+  product's metric views and the functions of its column masks and row filters are no OpenTofu
+  resource, so `fluid apply` failed there ("Schema is not empty") until someone dropped them by
+  hand. Now, in each schema the saved plan destroys and the contract no longer names, it drops
+  this product's metric views over the tables the plan destroys before `tofu apply`, and the
+  mask and row filter functions once `tofu apply` has destroyed the tables that used them, then
+  finishes the schema's destroy with a second, destroy-only plan. A function a table still uses
+  is never dropped (Unity Catalog binds a mask by the function's name). Only the deploy
+  identity's objects go, a view only with this product's `fluid.product_id`, and only in schemas
+  this environment's own OpenTofu state holds, so another environment of the product keeps its
+  objects. Anything else the schema holds is named, with what to do. `--mode dry-run` prints the
+  drops and runs none.
 
 - **Quality checks measured a constant on BigQuery (and would have on Databricks).** The
   completeness, uniqueness, accuracy and valid_values checks quoted their column the ANSI way,
