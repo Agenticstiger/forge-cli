@@ -248,6 +248,7 @@ from .databricks_quality import (
     SchemaMonitor,
     failure_hints,
     monitor_notices,
+    monitoring_request,
     plan_monitors,
     window_warnings,
 )
@@ -1705,6 +1706,31 @@ def _keys(cid: str, table: _Table) -> Tuple[str, str, str]:
     )
 
 
+def _unmonitored_pipeline_tables(compiled: _Compiled) -> List[str]:
+    """A ``fluid validate`` warning for each Lakeflow pipeline's table whose SLOs ask for data
+    quality monitoring, which ``fluid apply`` does not turn on for a pipeline's table yet.
+
+    The monitor is created after its schema's tables so that its first scan sees them, and
+    a pipeline creates its table at its first update, after ``tofu apply``; whether the
+    schema-level scan covers a materialized view is not verified yet. The table's
+    ``contract.dq.rules`` are not in the warning: they are the pipeline's expectations.
+    """
+    warnings: List[str] = []
+    for table in compiled.tables:
+        if table.full_name not in compiled.lakeflow_written:
+            continue
+        asked = [a for a in monitoring_request(table.exposure) if not a.startswith("contract.")]
+        if asked:
+            warnings.append(
+                f"{table.where} is published by a Lakeflow pipeline: fluid apply turns on no "
+                f"data quality monitoring for its table, so {', '.join(asked)} "
+                f"{'is' if len(asked) == 1 else 'are'} not monitored. Its contract.dq.rules "
+                "are the pipeline's expectations, counted on each update. Set "
+                "contract.dq.monitoring.enabled to false to say so in the contract."
+            )
+    return warnings
+
+
 def _emit_quality_monitors(compiled: _Compiled, cid: str) -> None:
     """Databricks data quality monitoring on each owned schema one of its tables asks it for
     (``databricks_quality.py``), keyed like the schema it watches.
@@ -1718,12 +1744,11 @@ def _emit_quality_monitors(compiled: _Compiled, cid: str) -> None:
     a table that scan misses may wait up to two weeks for its health indicator (Databricks
     docs, "intelligent scanning").
     """
-    # A pipeline's table has no databricks_sql_table: the pipeline creates it at its first
-    # update, after tofu apply.
     tables = [
         table for table in compiled.tables if table.full_name not in compiled.lakeflow_written
     ]
     compiled.warnings.extend(window_warnings(tables))
+    compiled.warnings.extend(_unmonitored_pipeline_tables(compiled))
     for monitor in plan_monitors(tables):
         key = _schema_key(cid, monitor.catalog, monitor.schema)
         body = monitor.body(tofu_ref(f"databricks_schema.{key}.schema_id"))

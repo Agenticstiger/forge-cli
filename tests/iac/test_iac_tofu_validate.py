@@ -577,6 +577,8 @@ def test_a_databricks_lakeflow_pipeline_passes_tofu_validate(tmp_path, monkeypat
     text = build_module(plugin, contract)
     resources = json.loads(text)["resource"]
     assert "databricks_sql_table" not in resources
+    # The completeness rule asks for data quality monitoring, which names a schema's tables.
+    assert "databricks_data_quality_monitor" not in resources
     assert len(resources["databricks_pipeline"]) == 1
     assert len(resources["databricks_workspace_file"]) == 1
 

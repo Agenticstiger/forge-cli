@@ -816,3 +816,33 @@ def test_a_reference_to_a_product_not_in_consumes_resolves_through_the_workspace
     view = sql.split("`capacity__capacity_site_ref`", 1)[1].split(";", 1)[0]
     assert "LEFT JOIN" in view
     assert "`fluid_iactest_ldp`.`bronze_sites`.`sites`" in view
+
+
+# ── data quality monitoring (databricks_quality.py), 2026-11-13 ────────────
+def test_a_pipeline_table_gets_no_quality_monitor_and_its_slo_is_warned(tmp_path):
+    """A monitor is created after its schema's databricks_sql_table, which a pipeline's table
+    does not have: the pipeline creates the table at its first update."""
+    contract = _edit(q=lambda c: c["exposes"][0].update(qos={"freshnessSLO": "PT1H"}))
+    compiled = _compile(contract, tmp_path)
+    assert dbx.QUALITY_MONITOR not in compiled.resources
+    (warning,) = [w for w in compiled.warnings if "data quality monitoring" in w]
+    assert "qos.freshnessSLO is not monitored" in warning
+    assert "contract.dq.monitoring.enabled" in warning
+
+
+def test_a_pipeline_tables_rules_are_expectations_not_a_monitor(tmp_path):
+    """The base contract's completeness and freshness rules would turn monitoring on for a
+    table forge-cli creates; on a pipeline's table they are expectations, and no warning."""
+    compiled = _compile(_contract(), tmp_path)
+    assert dbx.QUALITY_MONITOR not in compiled.resources
+    assert not [w for w in compiled.warnings if "data quality monitoring" in w]
+
+
+def test_monitoring_switched_off_says_nothing(tmp_path):
+    def off(contract):
+        expose = contract["exposes"][0]
+        expose["qos"] = {"freshnessSLO": "PT1H"}
+        expose["contract"]["dq"]["monitoring"] = {"enabled": False}
+
+    compiled = _compile(_edit(o=off), tmp_path)
+    assert not [w for w in compiled.warnings if "data quality monitoring" in w]

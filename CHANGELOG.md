@@ -183,15 +183,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The pipeline owns its table: no table resource is created for it, readers get `SELECT` on
     the product's schema, and the table's and its columns' tags are set after each update
     `fluid apply` runs. Masks, row filters, write grants, partitions, `lifecycle.expire` and a
-    cron trigger are refused on a lakeflow build for now.
+    cron trigger are refused on a lakeflow build for now. Unity Catalog keys and data quality
+    monitoring are not set up on a pipeline's table yet: `fluid validate` warns about a
+    declared key and about a freshness or completeness SLO there.
   - `fluid apply --mode amend-and-build` starts an update and waits for it
     (`replace-and-build`: a full refresh), then prints each rule's counts from the pipeline's
     event log. A failed update fails the apply with its error. `amend` and `create-only` only
     provision. A continuous pipeline is not started, but its tags are set once its table
     exists. A tag the contract no longer declares is removed when the deploying identity set
-    it, so a steward's tag stays. A triggered pipeline does not retry a
-    failed update (`pipelines.numUpdateRetryAttempts` is 0; Lakeflow's default is five), since
-    the same rows would fail the same rule.
+    it, so a steward's tag stays. A triggered pipeline does not retry a failed update
+    (`pipelines.numUpdateRetryAttempts` is 0; Lakeflow's default is five), since the same rows
+    would fail the same rule.
   - Removing a pipeline needs `--allow-data-loss`: deleting a pipeline can delete its tables.
 
 ### Changed
