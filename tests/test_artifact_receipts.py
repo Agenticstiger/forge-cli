@@ -5,9 +5,15 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import textwrap
 import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from fluid_build.cli import artifact_receipts
 from fluid_build.cli.artifact_receipts import (
@@ -71,22 +77,49 @@ class TestGenerateRunId:
         assert generate_run_id() == f"{ms:011x}-ffffffff"
         assert generate_run_id() == f"{ms + 1:011x}-ffffffff"
 
-    def test_a_forked_child_starts_its_own_sequence(self, monkeypatch):
-        """``_reset_run_id_state`` runs in the child after ``os.fork()``."""
-        ms = int(time.time() * 1000)
-        monkeypatch.setattr(artifact_receipts, "_last_ms", -1)
-        monkeypatch.setattr(artifact_receipts, "_last_suffix", 0)
-        monkeypatch.setattr(
-            artifact_receipts, "time", SimpleNamespace(time=lambda: (ms + 0.5) / 1000)
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="os.fork is POSIX only")
+    def test_a_forked_child_starts_its_own_sequence(self):
+        """A real ``os.fork()``, in a fresh interpreter with no other threads.
+
+        Without the at-fork reset, the child continues the parent's sequence
+        and makes the same id as the parent's next one (``...-00000006``).
+        """
+        script = textwrap.dedent(
+            """
+            import os, types
+            from fluid_build.cli import artifact_receipts as ar
+            ar.time = types.SimpleNamespace(time=lambda: 1_800_000_000.0005)
+            seeds = iter([5, 9])
+            ar.secrets = types.SimpleNamespace(randbits=lambda k: next(seeds))
+            print(ar.generate_run_id(), flush=True)
+            read_end, write_end = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.write(write_end, ar.generate_run_id().encode())
+                os._exit(0)
+            os.close(write_end)
+            os.waitpid(pid, 0)
+            print(os.read(read_end, 64).decode())
+            print(ar.generate_run_id())
+            """
         )
-        seeds = iter([5, 9])
-        monkeypatch.setattr(
-            artifact_receipts, "secrets", SimpleNamespace(randbits=lambda k: next(seeds))
+        root = Path(artifact_receipts.__file__).resolve().parents[2]
+        paths = [str(root), os.environ.get("PYTHONPATH", "")]
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in paths if p)}
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=root,
+            env=env,
+            check=True,
         )
-        assert generate_run_id() == f"{ms:011x}-00000005"
-        artifact_receipts._reset_run_id_state()
-        # The parent's next id would be ...-00000006; the child seeds its own.
-        assert generate_run_id() == f"{ms:011x}-00000009"
+        ms = 1_800_000_000_000
+        parent_first, child, parent_next = result.stdout.split()
+        assert parent_first == f"{ms:011x}-00000005"
+        assert child == f"{ms:011x}-00000009"
+        assert parent_next == f"{ms:011x}-00000006"
 
 
 class TestReceiptEntryToDict:

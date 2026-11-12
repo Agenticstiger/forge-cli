@@ -68,8 +68,10 @@ def acme_plugin(monkeypatch):
     monkeypatch.setattr(md, "entry_points", entry_points)
 
 
-@pytest.fixture(scope="module")
-def parser():
+@pytest.fixture
+def parser(monkeypatch):
+    # The global --provider defaults to $FLUID_PROVIDER; keep the shell's value out.
+    monkeypatch.delenv("FLUID_PROVIDER", raising=False)
     return build_parser()
 
 
@@ -101,7 +103,8 @@ def test_an_unknown_name_is_refused_with_exactly_the_registry(parser, capsys):
     assert [name.strip("'\" ") for name in listed.split(",")] == list(BUILTIN_PROVIDER_CHOICES)
 
 
-def test_the_command_prints_the_plan_it_was_asked_for(capsys):
+def test_the_command_prints_the_plan_it_was_asked_for(capsys, monkeypatch):
+    monkeypatch.delenv("FLUID_PROVIDER", raising=False)
     assert main(["ai", "models", "--provider", "gemini", "--json"]) == 0
     assert list(json.loads(capsys.readouterr().out)) == ["gemini"]
 
