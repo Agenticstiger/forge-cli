@@ -899,10 +899,11 @@ def _output_port_actions(
     """The hook's actions, from the contract as the apply reads it: its ``{{ env.* }}``
     resolved, the one provider ``_resolve_provider`` picks (``--provider``, or the contract's
     only cloud: an ambiguous or mismatched one lists nothing, since the apply refuses it too),
-    and the contract's directory known, where a local dbt build's project is read from.
-    In-tree plugins only (``IAC_PLUGINS``: nothing is loaded from an entry point to plan). A
-    hook that fails lists nothing, with a warning: ``fluid validate`` and ``fluid apply``
-    refuse the contract with the reason, and the plan of the rest stays readable."""
+    and the contract's directory known, where a local dbt build's project is read from. The
+    plugin is the one the apply runs: ``_resolve_provider`` loads an operator-allowed
+    entry-point plugin as the apply does. A hook that fails lists nothing, with a warning:
+    ``fluid validate`` and ``fluid apply`` refuse the contract with the reason, and the plan of
+    the rest stays readable."""
     import copy
 
     # Function-local: ``iac`` pulls every provider plugin, off the ``fluid --help`` cold path.

@@ -1130,11 +1130,11 @@ def _move(client: Any, moving: Mapping[str, Any], space: Space, say: Say, dry_ru
         if _status(exc) == 409:
             raise GenieError(
                 f"could not move space {space_id} into {space.parent_path}: another space there "
-                f"is already called {moving.get('title')!r}, and Genie keeps titles unique in a "
-                "folder (measured for a create and a rename).",
+                f"is already called {moving.get('title')!r}, the title this space has now, and "
+                "Genie keeps titles unique in a folder (measured for a create and a rename).",
                 (
-                    f"Give this space a title of its own with extensions.{EXTENSION_KEY}.title, "
-                    "or rename the other space, then re-run fluid apply.",
+                    "Rename that space, or this one in Genie, then re-run fluid apply: it sets "
+                    f"the contract's title (extensions.{EXTENSION_KEY}.title) after the move.",
                 ),
             ) from exc
         raise GenieError(

@@ -1452,7 +1452,7 @@ def test_a_move_onto_a_title_the_folder_holds_says_so(fake):
     with pytest.raises(genie.GenieError) as exc:
         Run(fake)(site_contract(parentPath=SALES))
     assert "another space there is already called 'Site 360'" in str(exc.value)
-    assert "title of its own" in exc.value.remediation[0]
+    assert "Rename that space, or this one in Genie" in exc.value.remediation[0]
 
 
 def test_folder_permissions_this_identity_cannot_read_stop_the_apply(fake):
