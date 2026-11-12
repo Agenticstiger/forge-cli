@@ -8,7 +8,9 @@ Pinned (Stage 1: real ``tofu`` and ``databricks/databricks`` 1.140.0, the stand-
 with OpenTofu and then the metric view of its ``semantics`` on the warehouse, with ``SELECT`` for
 the table's readers; a second apply plans nothing and runs no metric view statement;
 ``--mode dry-run`` prints the ``CREATE VIEW`` and runs none; a contract that drops the semantics
-drops the view; ``fluid validate`` refuses what metric view YAML cannot express.
+drops the view; ``fluid validate`` refuses what metric view YAML cannot express; the product's
+Genie space (``extensions.databricksGenie``, converged after the metric views) lists the view the
+same apply made among its tables.
 
 Not proven here: what real Databricks accepts and answers (the Free Edition run in the PR,
 HONESTLY_TESTED.md).
@@ -17,6 +19,7 @@ HONESTLY_TESTED.md).
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from typing import Any, Dict, Iterator, List
 
@@ -144,3 +147,17 @@ def test_validate_refuses_what_the_yaml_cannot_express(workspace, fake, capfd):
     assert rc != 0, out
     assert "derived metric" in out
     assert fake.sql_log == []
+
+
+def test_the_products_genie_space_holds_the_metric_view_the_apply_made(workspace, fake, capfd):
+    # Genie reads the contract's semantic model through the metric view: the space is converged
+    # after the metric views, so the first apply already lists the view beside its table.
+    semantics = {**SEMANTICS, "labels": {"ai-example-questions": "What is revenue per order?"}}
+    contract = _contract(semantics)
+    contract["extensions"] = {"databricksGenie": {}}
+    rc, out = apply_contract(capfd, write_contract(workspace, contract))
+    assert rc == 0, out
+    (space,) = fake.genie_spaces.values()
+    tables = json.loads(space["serialized_space"])["data_sources"]["tables"]
+    assert [t["identifier"] for t in tables] == ["main.sales.orders", VIEW]
+    assert "1 table(s), 1 metric view(s)" in out
