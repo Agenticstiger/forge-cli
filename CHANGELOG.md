@@ -213,7 +213,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   share for completeness and the distinct share for uniqueness, as `fluid test` computes them,
   and the share of non-null values that are allowed for valid_values. No dbt package is installed: the regex, range, freshness, schema and share tests
   are forge-cli's own SQL. Under `--mode amend-and-build`, `fluid apply` prints what dbt found
-  for each rule after the run. A rule no test can run as written (anomaly or drift detection,
+  for each rule after the run. The `fluid_keys` task that declares the table's Unity Catalog keys
+  again now runs once dbt has ended, whatever its outcome: a failing rule fails dbt after its
+  model replaced the table, and the table keeps its keys. A rule no test can run as written (anomaly or drift detection,
   valid_values with no allowed values, an unknown column, an unparseable window), a Git-sourced
   build with rules (no file can be added to a checkout), and a model or a referenced source the
   project does not hold, a build whose dbt selection leaves the model out, and a rule id whose
