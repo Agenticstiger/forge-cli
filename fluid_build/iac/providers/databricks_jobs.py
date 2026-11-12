@@ -71,6 +71,11 @@ MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_PROJECT_BYTES = 20 * 1024 * 1024
 MAX_PROJECT_FILES = 1000
 
+#: The tags every job carries. ``fluid apply --mode amend-and-build`` finds a build's job in
+#: the apply's state by them (``build_runners/_databricks_job_run.py::jobs_in_state``).
+PRODUCT_TAG = "fluid_product"
+BUILD_TAG = "fluid_build"
+
 #: The data source that names the deploying identity's home folder.
 CURRENT_USER = "databricks_current_user"
 _HOME = tofu_ref(f"data.{CURRENT_USER}.me.home")
@@ -730,6 +735,11 @@ class _Source:
     files: Tuple[Tuple[str, bytes], ...] = ()
 
 
+def job_product(contract: Mapping[str, Any]) -> str:
+    """The product a job is named (``fluid <product> <build>``) and tagged (``PRODUCT_TAG``) after."""
+    return str(contract.get("id") or contract.get("name") or "product")
+
+
 def compile_dbt_jobs(
     contract: Mapping[str, Any],
     tables: Sequence[Any],
@@ -747,7 +757,7 @@ def compile_dbt_jobs(
     """
     compiled = CompiledJobs()
     builds = [b for b in contract.get("builds") or [] if isinstance(b, Mapping)]
-    product = str(contract.get("id") or contract.get("name") or "product")
+    product = job_product(contract)
     for index, build in enumerate(contract.get("builds") or []):
         if not isinstance(build, Mapping) or not is_databricks_job_build(build):
             continue
@@ -877,7 +887,7 @@ def _emit_job(
     job: Dict[str, Any] = {
         "name": item.name,
         "max_concurrent_runs": 1,
-        "tags": {"fluid_product": item.product, "fluid_build": item.build_id},
+        "tags": {PRODUCT_TAG: item.product, BUILD_TAG: item.build_id},
         "environment": [
             {
                 "environment_key": "dbt",

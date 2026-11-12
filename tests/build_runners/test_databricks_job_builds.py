@@ -1,13 +1,16 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""A dbt build that runs in a Databricks workspace as a job is not run here.
+"""A dbt build that runs in a Databricks workspace as a job is never run locally.
 
-``fluid apply`` provisions the job (``iac/providers/databricks_jobs.py``) and
-Databricks runs dbt on its trigger, so the build runner reports the build and
-neither runs it nor warns about a continuous trigger. A local dbt build is
-unchanged. Driven the way ``tests/test_flink_engine.py`` drives an externally
-run build; no dbt, no network.
+``fluid apply`` provisions the job (``iac/providers/databricks_jobs.py``). When that
+apply hands the build runner the jobs it provisioned (``databricks_jobs``), a
+``-and-build`` mode starts a run of the job now and waits for it
+(``_databricks_job_run.py``, pinned in ``test_databricks_job_run.py``); a continuous
+job is left to Databricks. Without them the build runner reports the build as one
+Databricks runs on its trigger, and never warns about a continuous trigger. A
+local dbt build is unchanged. Driven the way ``tests/test_flink_engine.py`` drives
+an externally run build; no dbt, no network.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from typing import Any, Dict
 import pytest
 import yaml
 
+from fluid_build.build_runners._databricks_job_run import JobRef
 from fluid_build.build_runners.base import (
     _batch_runner_for,
     continuous_trigger_warnings,
@@ -102,6 +106,24 @@ def no_local_run(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("fluid_build.build_runners.dbt.runner.execute_dbt_build", _must_not_run)
     monkeypatch.setattr("fluid_build.build_runners.python.runner.execute_build", _must_not_run)
+
+
+@pytest.fixture
+def recorded_builds(monkeypatch: pytest.MonkeyPatch) -> list:
+    """What the build runner records on the running apply's Command Center report."""
+    import fluid_build.observability.apply_run as apply_run
+
+    recorded: list = []
+
+    class _Report:
+        def record_build(self, **kwargs: Any) -> None:
+            recorded.append(kwargs)
+
+        def build_failed(self, event: str) -> None:
+            raise AssertionError(event)
+
+    monkeypatch.setattr(apply_run, "current_apply_run", lambda: _Report())
+    return recorded
 
 
 def _flat(capsys: pytest.CaptureFixture) -> str:
@@ -200,24 +222,12 @@ class TestRunBuilds:
         assert JOB_LINE in out and "Run outside forge-cli: 1" in out
 
     def test_the_run_report_records_it_skipped_for_running_outside_forge(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_local_run: None
+        self, tmp_path: Path, recorded_builds: list, no_local_run: None
     ) -> None:
-        import fluid_build.observability.apply_run as apply_run
-
-        recorded: list = []
-
-        class _Report:
-            def record_build(self, **kwargs: Any) -> None:
-                recorded.append(kwargs)
-
-            def build_failed(self, event: str) -> None:
-                raise AssertionError(event)
-
-        monkeypatch.setattr(apply_run, "current_apply_run", lambda: _Report())
         path = tmp_path / "contract.fluid.yaml"
         path.write_text(yaml.safe_dump(_contract(_build())), encoding="utf-8")
         assert run_builds_from_args(_args(path, dry_run=True), logging.getLogger("t")) == 0
-        assert recorded == [
+        assert recorded_builds == [
             {"build_id": "transform", "status": "skipped", "reason": "runs_outside_forge"}
         ]
 
@@ -284,6 +294,96 @@ class TestRunBuilds:
         assert ran == ["local"]  # the Databricks job build was not handed over
         assert JOB_LINE in out and "Run outside forge-cli: 1" in out
         assert "Executed: 1" in out
+
+
+class TestAfterTheApplyThatProvisionedIt:
+    """``fluid apply`` hands over the jobs its state holds: the build runs now."""
+
+    JOBS = {"transform": [JobRef(5)], "second": [JobRef(6)]}
+
+    @pytest.fixture
+    def started(self, monkeypatch: pytest.MonkeyPatch) -> list:
+        calls: list = []
+
+        def _run(contract: Any, build: Any, jobs: Any, **kwargs: Any) -> int:
+            calls.append((build["id"], jobs, kwargs))
+            return 1 if build["id"] == "broken" else 0
+
+        monkeypatch.setattr("fluid_build.build_runners._databricks_job_run.run_job_build", _run)
+        return calls
+
+    def _apply(self, tmp_path: Path, contract: Dict[str, Any], **kwargs: Any) -> int:
+        path = tmp_path / "contract.fluid.yaml"
+        path.write_text(yaml.safe_dump(contract), encoding="utf-8")
+        args = _args(path, dry_run=kwargs.pop("dry_run", False))
+        args.fail_fast = kwargs.pop("fail_fast", False)
+        args.mode = kwargs.pop("mode", "amend-and-build")
+        return run_builds_from_args(args, logging.getLogger("t"), databricks_jobs=self.JOBS)
+
+    def test_the_build_runs_now_and_counts_as_executed(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture, no_local_run: None, started: list
+    ) -> None:
+        assert self._apply(tmp_path, _contract(_build(trigger="schedule"))) == 0
+        assert [(build_id, kwargs) for build_id, _jobs, kwargs in started] == [
+            ("transform", {"dry_run": False, "mode": "amend-and-build"})
+        ]
+        assert started[0][1] is self.JOBS
+        out = _flat(capsys)
+        assert "Executed: 1" in out and "Run outside forge-cli" not in out
+        assert JOB_LINE not in out
+
+    def test_the_mode_and_a_dry_run_reach_it(
+        self, tmp_path: Path, no_local_run: None, started: list
+    ) -> None:
+        assert self._apply(tmp_path, _contract(_build()), mode="replace-and-build") == 0
+        assert self._apply(tmp_path, _contract(_build()), dry_run=True) == 0
+        assert [kwargs for _b, _j, kwargs in started] == [
+            {"dry_run": False, "mode": "replace-and-build"},
+            {"dry_run": True, "mode": "amend-and-build"},
+        ]
+
+    def test_a_failed_run_fails_the_build_phase_and_fail_fast_stops_there(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture, no_local_run: None, started: list
+    ) -> None:
+        contract = _contract(_build(build_id="broken"), _build(build_id="second"))
+        assert self._apply(tmp_path, contract) == 1
+        assert [build_id for build_id, _j, _k in started] == ["broken", "second"]
+        assert "Failed: 1" in capsys.readouterr().err  # the console prints errors to stderr
+
+        started.clear()
+        assert self._apply(tmp_path, contract, fail_fast=True) == 1
+        assert [build_id for build_id, _j, _k in started] == ["broken"]
+
+    def test_a_continuous_job_is_left_to_databricks(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture, no_local_run: None, started: list
+    ) -> None:
+        assert self._apply(tmp_path, _contract(_build(trigger="continuous"))) == 0
+        assert started == []
+        out = _flat(capsys)
+        assert f"{JOB_LINE} continuously; Databricks keeps it running" in out
+        assert "Run outside forge-cli: 1" in out
+
+    def test_the_run_report_records_how_the_run_ended(
+        self, tmp_path: Path, recorded_builds: list, no_local_run: None, started: list
+    ) -> None:
+        contract = _contract(_build(), _build(build_id="broken"))
+        assert self._apply(tmp_path, contract) == 1
+        assert [(r["build_id"], r["status"]) for r in recorded_builds] == [
+            ("transform", "succeeded"),
+            ("broken", "failed"),
+        ]
+
+    def test_a_build_that_writes_no_databricks_table_is_still_refused(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture, no_local_run: None, started: list
+    ) -> None:
+        contract = _contract(_build())
+        contract["exposes"][0]["binding"] = {
+            "platform": "aws",
+            "format": "parquet",
+            "location": {"bucket": "b", "path": "orders/"},
+        }
+        assert self._apply(tmp_path, contract) == 1
+        assert started == [] and "databricks-job-no-target" in _flat(capsys)
 
 
 class TestNoSchedulerStartsAJobBuild:

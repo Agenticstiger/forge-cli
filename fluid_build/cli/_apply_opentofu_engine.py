@@ -55,7 +55,11 @@ from .generate_iac import _resolve_provider, native_actions
 
 
 def apply_via_opentofu(
-    args, logger: logging.Logger, contract: Optional[Mapping[str, Any]] = None
+    args,
+    logger: logging.Logger,
+    contract: Optional[Mapping[str, Any]] = None,
+    *,
+    applied_state: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
     """Run ``fluid apply`` through the OpenTofu engine. Returns an exit code.
 
@@ -65,14 +69,24 @@ def apply_via_opentofu(
     the gate cannot reach ``tofu`` unvalidated. Without it the contract is
     loaded from ``args.contract``.
 
+    ``applied_state``, when given, receives the resources of the state a
+    successful apply leaves (``runner.tofu_state_resources``, read once and not
+    refreshed): the build phase starts the jobs it provisioned by the ids there.
+    A dry run applies nothing and leaves it empty.
+
     Every compile of the run sees the contract's file (``iac/source.py``), so a
     plugin that ships a build's local files finds them as the runners do.
     """
     with contract_source(source_contract_file(getattr(args, "contract", None))):
-        return _apply_via_opentofu(args, logger, contract)
+        return _apply_via_opentofu(args, logger, contract, applied_state)
 
 
-def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping[str, Any]]) -> int:
+def _apply_via_opentofu(
+    args,
+    logger: logging.Logger,
+    contract: Optional[Mapping[str, Any]],
+    applied_state: Optional[List[Dict[str, Any]]] = None,
+) -> int:
     # Plan-binding verification — must run BEFORE any tofu apply so a
     # tampered plan.json is rejected before infra changes. The native
     # apply path (cli/apply.py::_verify_plan_digests) had this gate; the
@@ -331,6 +345,10 @@ def _apply_via_opentofu(args, logger: logging.Logger, contract: Optional[Mapping
     # build fills a table first. A table that cannot be bound is closed to the principals it
     # restricts (a deny-all row filter, else revoked), and the run fails.
     _enforce_access(plugin, "post_apply", contract)
+
+    if applied_state is not None:
+        # After the bindings: a job the build phase starts writes tables already protected.
+        applied_state.extend(runner.tofu_state_resources(str(workdir), env=env))
 
     info(logger, "opentofu_apply_ok", provider=provider, **applied)
     return 0
