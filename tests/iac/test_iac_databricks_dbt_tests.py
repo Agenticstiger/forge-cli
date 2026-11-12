@@ -443,6 +443,33 @@ class TestRefusals:
         compiled = _compile(_contract(), tmp_path)
         assert not compiled.refusals, _kinds(compiled)
 
+    def test_validate_cannot_judge_a_selection_named_by_an_env_placeholder(self, tmp_path):
+        _project(tmp_path)
+        contract = _contract()
+        contract["builds"][0]["properties"] = {"model": "orders", "select": ["{{ env.SEL }}"]}
+        compiled = _compile(contract, tmp_path, validating=True)
+        assert "databricks-job-dq-not-selected" not in _kinds(compiled), _kinds(compiled)
+
+    @pytest.mark.parametrize("where", ["rule id", "enum", "regex", "source name"])
+    def test_an_unpaired_surrogate_is_refused_not_raised(self, tmp_path, where):
+        # YAML's "\ud83d" escape loads a lone surrogate, which no UTF-8 file can hold.
+        lone = "x\ud83d"
+        # The project's YAML carries the escape itself, which yaml.safe_load decodes.
+        escaped = 'name: "crm\\ud83d"'
+        sources = SOURCES.replace("name: crm", escaped) if where == "source name" else SOURCES
+        _project(tmp_path, files={"models/orders.sql": "select 1\n", "models/sources.yml": sources})
+        contract = _contract()
+        rules = contract["exposes"][0]["contract"]["dq"]["rules"]
+        schema = contract["exposes"][0]["contract"]["schema"]
+        if where == "rule id":
+            rules[0]["id"] = lone
+        elif where == "enum":
+            schema[1]["validationRules"][0]["constraint"] = f"NEW | {lone}"
+        elif where == "regex":
+            schema[2]["validationRules"][0]["constraint"] = f"^{lone}$"
+        compiled = _compile(contract, tmp_path)
+        assert compiled.refusals, "a lone surrogate must be refused"
+
     def test_validate_defers_a_model_named_by_an_env_placeholder(self, tmp_path):
         # fluid validate reads the contract before {{ env.* }} is substituted.
         _project(tmp_path)

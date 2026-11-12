@@ -287,7 +287,19 @@ def _add_test(
             )
         )
         return
-    out.files.append((path, text.encode("utf-8")))
+    try:
+        data = text.encode("utf-8")
+    except UnicodeEncodeError:  # an unpaired surrogate from the project's own YAML
+        out.refusals.append(
+            _refusal(
+                "text",
+                f"{where} the test of rule {check.rule_id!r} names a value from the dbt project "
+                "(a source or table name) holding an unpaired surrogate, which no file can hold.",
+                "Write the name in plain text in the project's properties YAML.",
+            )
+        )
+        return
+    out.files.append((path, data))
     out.tests.append(DqTest(check=check, model=model, path=path))
 
 
@@ -381,7 +393,8 @@ def _model(
     folders = path.parent.relative_to(below).parts
     node = DbtModel(name=model, materialized="", fqn=(project.name, *folders, model), path=files[0])
     selectors = build_selectors(dict(build))
-    if selects_model(selectors, node) is False:
+    unresolved = any(ENV_PLACEHOLDER_RE.search(str(item)) for item in selectors)
+    if not unresolved and selects_model(selectors, node) is False:
         refusals.append(
             _refusal(
                 "not-selected",

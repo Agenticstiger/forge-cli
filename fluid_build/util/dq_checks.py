@@ -79,7 +79,9 @@ _BETWEEN_RE = re.compile(rf"^\s*between\s+({_NUMBER})\s+and\s+({_NUMBER})\s*$", 
 _BOUND_RE = re.compile(rf"^\s*(>=|<=|>|<)\s*({_NUMBER})\s*$")
 _AND_RE = re.compile(r"\s+and\s+", re.IGNORECASE)
 _NAME_RE = re.compile(r"[^0-9a-z_]+")
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+#: A control character, or a UTF-16 surrogate with no partner (YAML's "\ud83d" escape
+#: loads one), which no UTF-8 file can hold: refused wherever a rule's text reaches a check.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 
 
 @dataclass(frozen=True)
@@ -301,6 +303,13 @@ class _Rule:
     # ── reading ───────────────────────────────────────────────────────────────
 
     def read(self) -> List[DqCheck]:
+        if _CONTROL_RE.search(self.rule_id) or _CONTROL_RE.search(self.expose_id):
+            self.refuse(
+                "has an id (or its expose's) holding a control character or an unpaired "
+                "surrogate",
+                "Write the id in plain text.",
+            )
+            return []
         severity = SEVERITIES.get(str(self.rule.get("severity") or "").strip().lower())
         if severity is None:
             self.refuse(
@@ -610,7 +619,8 @@ class _Rule:
             )
         elif _CONTROL_RE.search(constraint):
             self.refuse(
-                f"reads column {name!r}, whose regex holds a control character",
+                f"reads column {name!r}, whose regex holds a control character or an unpaired "
+                "surrogate",
                 "Write it with an escape (\\t, \\n) instead.",
             )
         else:
