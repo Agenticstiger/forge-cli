@@ -463,3 +463,47 @@ def test_distinct_names_produce_no_collision_warning():
     )
     assert errors == []
     assert warnings == []
+
+
+# ── one aggregate rendering for every SQL consumer of a measure ─────────────
+
+
+def test_the_mcp_query_compiler_and_the_shared_helper_render_the_same_aggregate():
+    from fluid_build.forge_datamodel import semantics_builder as sb
+    from fluid_build.output_ports.mcp import query_compiler as qc
+
+    assert qc.DEFAULT_PERCENTILE == sb.DEFAULT_PERCENTILE == 0.5
+    assert qc._AGG_FUNCTIONS is sb.AGGREGATE_FUNCTIONS
+    measure = {
+        "agg": "percentile",
+        "aggParams": {"percentile": 0.25, "useDiscretePercentile": True},
+    }
+    assert sb.aggregate_call("m", measure, "x") == "PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY x)"
+    assert qc._render_measure_expression("m", {**measure, "expr": "x"}) == (
+        "PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY x) AS m"
+    )
+    assert sb.aggregate_call("m", {"agg": "count_distinct"}, "id") == "COUNT(DISTINCT id)"
+    assert sb.aggregate_call("m", {"agg": "avg"}, "x") == "AVG(x)"
+    assert sb.aggregate_call("m", {"agg": "percentile"}, "x") == (
+        "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)"
+    )
+
+
+@pytest.mark.parametrize("bad", [True, 2, -0.1, "0.5", float("nan")])
+def test_a_bad_percentile_is_refused_by_both(bad):
+    from fluid_build.forge_datamodel import semantics_builder as sb
+    from fluid_build.output_ports.mcp import query_compiler as qc
+
+    measure = {"agg": "percentile", "aggParams": {"percentile": bad}, "expr": "x"}
+    with pytest.raises(ValueError, match="invalid aggParams.percentile"):
+        sb.aggregate_call("m", measure, "x")
+    with pytest.raises(qc.QueryValidationError, match="invalid aggParams.percentile"):
+        qc._render_measure_expression("m", measure)
+
+
+def test_an_agg_outside_the_schema_is_refused():
+    from fluid_build.forge_datamodel import semantics_builder as sb
+
+    with pytest.raises(ValueError, match="unsupported agg 'mode'"):
+        sb.aggregate_call("m", {"agg": "mode"}, "x")
+    assert sb.parens_balanced("(a) and (b)") and not sb.parens_balanced("a) or (b")

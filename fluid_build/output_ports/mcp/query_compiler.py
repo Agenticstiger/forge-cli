@@ -56,6 +56,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
 
+from fluid_build.forge_datamodel import semantics_builder as _semantics_builder
 from fluid_build.output_ports.mcp.auth import MTLS_IDENTITY_ATTRS
 from fluid_build.providers._sql_safety import (
     validate_ident,
@@ -740,24 +741,14 @@ def _declared_grain(dimension: Mapping[str, Any]) -> Optional[str]:
     return normalize_time_grain(type_params.get("timeGranularity"))
 
 
-_AGG_FUNCTIONS = {
-    "sum": "SUM",
-    "avg": "AVG",
-    "count": "COUNT",
-    "count_distinct": "COUNT",  # rendered with DISTINCT below
-    "min": "MIN",
-    "max": "MAX",
-    "median": "MEDIAN",
-    "percentile": "PERCENTILE_CONT",
-}
-
-
-# The contract-schema default when a percentile measure carries no
-# ``aggParams.percentile``. MUST stay identical to the dbt MetricFlow
-# bridge's default (``engines/dbt/semantic_models.py``) so the governed
-# query path and the exported dbt project answer the same number for the
+# ``measures[].agg`` → SQL aggregate, and the default percentile, shared with the
+# Databricks metric view (``forge_datamodel/semantics_builder.py``) so every path that
+# renders a measure as SQL aggregates it the same way. The default MUST stay identical
+# to the dbt MetricFlow bridge's (``engines/dbt/semantic_models.py``, pinned by tests) so
+# the governed query path and the exported dbt project answer the same number for the
 # same contract. 0.5 == median.
-DEFAULT_PERCENTILE = 0.5
+_AGG_FUNCTIONS = _semantics_builder.AGGREGATE_FUNCTIONS
+DEFAULT_PERCENTILE = _semantics_builder.DEFAULT_PERCENTILE
 
 
 def _resolve_percentile_params(measure_name: str, measure: Mapping[str, Any]) -> Tuple[float, bool]:
@@ -767,18 +758,13 @@ def _resolve_percentile_params(measure_name: str, measure: Mapping[str, Any]) ->
     dbt-semantic-interfaces' ``agg_params``. The percentile value is
     validated to a real number in [0, 1] — it is interpolated into SQL
     as a literal (aggregate arguments must be constants), so validation
-    here is the safety boundary.
+    here is the safety boundary
+    (:func:`~fluid_build.forge_datamodel.semantics_builder.percentile_params`).
     """
-    params = measure.get("aggParams") or {}
-    if not isinstance(params, Mapping):
-        raise QueryValidationError(f"Measure {measure_name!r} has non-object aggParams")
-    raw = params.get("percentile", DEFAULT_PERCENTILE)
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 <= float(raw) <= 1:
-        raise QueryValidationError(
-            f"Measure {measure_name!r} has invalid aggParams.percentile "
-            f"{raw!r}; expected a number in [0, 1]"
-        )
-    return float(raw), bool(params.get("useDiscretePercentile"))
+    try:
+        return _semantics_builder.percentile_params(measure_name, measure)
+    except ValueError as exc:
+        raise QueryValidationError(str(exc)) from None
 
 
 def _render_measure_expression(
@@ -818,10 +804,7 @@ def _render_measure_expression(
     if not isinstance(expr_raw, str):
         raise QueryValidationError(f"Measure {measure_name!r} has non-string expr")
     validate_sql_expression_allowlist(expr_raw)
-    sql_func = _AGG_FUNCTIONS[agg_raw]
     projection_alias = validate_ident(alias or measure_name)
-    if agg_raw == "count_distinct":
-        return f"COUNT(DISTINCT {expr_raw}) AS {projection_alias}"
     if agg_raw == "percentile":
         if dialect in ("bigquery", "athena"):
             raise QueryValidationError(
@@ -830,10 +813,9 @@ def _render_measure_expression(
                 "Use 'median'-free approximations engine-side or query a "
                 "different measure."
             )
-        percentile, use_discrete = _resolve_percentile_params(measure_name, measure)
-        fn = "PERCENTILE_DISC" if use_discrete else "PERCENTILE_CONT"
-        return f"{fn}({percentile:g}) WITHIN GROUP (ORDER BY {expr_raw}) " f"AS {projection_alias}"
-    return f"{sql_func}({expr_raw}) AS {projection_alias}"
+        # Validated here so the error is a QueryValidationError, as it always was.
+        _resolve_percentile_params(measure_name, measure)
+    return f"{_semantics_builder.aggregate_call(measure_name, measure, expr_raw)} AS {projection_alias}"
 
 
 def compile_semantic_query(
