@@ -986,8 +986,9 @@ def _wait_listed(client: Any, space: Space, space_id: str, say: Say) -> None:
             pass
         if time.monotonic() >= deadline:
             run = _VOICE.get().run
+            article = "an" if run[:1] in "aeiou" else "a"
             say(
-                f"    note: the Genie list does not show the new space yet; another {run} in the "
+                f"    note: the Genie list does not show the new space yet; {article} {run} in the "
                 f"next minute could make a second one, which the {run} after refuses until one "
                 "is trashed."
             )

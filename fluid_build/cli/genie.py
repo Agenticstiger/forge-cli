@@ -59,7 +59,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "contracts",
         nargs="+",
         metavar="CONTRACT",
-        help="contract files, glob patterns, or folders (searched for *.fluid.yaml)",
+        help="contract files, glob patterns, or folders (searched for *.fluid.yaml at any depth)",
     )
     _estate_argument(apply)
     apply.add_argument("--title", default="", help="the space's title (default: the estate id)")
@@ -100,8 +100,6 @@ def _estate_argument(parser: argparse.ArgumentParser) -> None:
 
 def run_apply(args: argparse.Namespace, logger: logging.Logger) -> int:
     """``fluid genie apply``: compile the estate from the contracts, then converge its space."""
-    from fluid_build.cli._common import load_contract_with_overlay
-    from fluid_build.cli._common import resolve_env_templates_in_contract as resolve
     from fluid_build.cli._logging import info
     from fluid_build.cli.console import cprint_literal
     from fluid_build.iac.base import UnsupportedBindingError
@@ -117,7 +115,7 @@ def run_apply(args: argparse.Namespace, logger: logging.Logger) -> int:
         loader_log.setLevel(logging.WARNING)
     try:
         contracts: List[Tuple[str, Mapping[str, Any]]] = [
-            (label, resolve(load_contract_with_overlay(str(path), args.env, logger)))
+            (label, _contract(label, path, args.env, logger))
             for label, path in contract_paths(args.contracts)
         ]
     finally:
@@ -169,9 +167,34 @@ def run_remove(args: argparse.Namespace, logger: logging.Logger) -> int:
     return 0
 
 
+def _contract(label: str, path: Path, env: Any, logger: logging.Logger) -> Mapping[str, Any]:
+    """One contract, read with its overlay and gated as ``fluid apply`` gates one (a pre-0.7
+    ``fluidVersion`` or a schema-invalid document stops the run); a failure names the file."""
+    from fluid_build._errors import FluidUserError
+    from fluid_build.cli._common import CLIError, load_contract_with_overlay
+    from fluid_build.cli._common import resolve_env_templates_in_contract as resolve
+    from fluid_build.cli.plan import _gate_contract_for_plan_or_apply
+
+    try:
+        contract = resolve(load_contract_with_overlay(str(path), env, logger))
+    except (CLIError, FluidUserError):
+        raise
+    except Exception as exc:  # noqa: BLE001 — a bad file is a typed error, as in fluid apply
+        raise CLIError(
+            1, "contract_load_failed", {"path": label, "env": env, "error": str(exc)}
+        ) from exc
+    try:
+        _gate_contract_for_plan_or_apply(contract, logger, command="genie")
+    except CLIError as exc:
+        exc.context.setdefault("path", label)
+        raise
+    return contract
+
+
 def contract_paths(items: Sequence[str]) -> List[Tuple[str, Path]]:
-    """``(label, path)`` per contract: each item a file, a glob pattern (``**`` too) or a
-    folder searched for :data:`CONTRACT_SUFFIXES`, in that order, each file once. A folder or
+    """``(label, path)`` per contract: each item a file, a glob pattern (expanded as ``fluid
+    publish`` expands one, ``**`` a single level) or a folder searched for
+    :data:`CONTRACT_SUFFIXES` at any depth, in that order, each file once. A folder or
     a glob reaches no symlink and no ignored or build-output folder (``.git``, ``node_modules``,
     ``.venv``, ``target``, ...) below where it starts; a file named outright is read as named.
     Every path passes the CLI's path validator (``cli/security.py``) before it is read."""
@@ -186,9 +209,10 @@ def contract_paths(items: Sequence[str]) -> List[Tuple[str, Path]]:
     for item in items:
         if _GLOB_CHARS & set(item):
             base = _glob_base(item)
-            matches = [
-                m for m in sorted(glob(item, recursive=True)) if _reachable(Path(m), base, skip)
-            ]
+            # As ``fluid publish`` expands one: ``**`` is one folder level, never a walk that
+            # follows symlinked folders (two symlink loops made a recursive glob run forever).
+            # A folder argument is the recursive search.
+            matches = [m for m in sorted(glob(item)) if _reachable(Path(m), base, skip)]
         else:
             matches = [item]
         if not matches:
@@ -243,7 +267,8 @@ def _reachable(path: Path, base: Path, skip: frozenset) -> bool:
         current = current / part
         if current.is_symlink():
             return False
-    return not any(part in skip for part in below[:-1])
+    folders = below if path.is_dir() else below[:-1]
+    return not any(part in skip for part in folders)
 
 
 def _contracts_in(folder: Path, skip: frozenset) -> List[Path]:

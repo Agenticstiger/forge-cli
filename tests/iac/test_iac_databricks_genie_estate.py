@@ -746,3 +746,48 @@ def test_fluid_genie_refusals_and_failures_are_typed_errors_with_their_fix(works
     assert rc == 1 and "ERR_GENIE_ESTATE_FAILED" in out
     assert "then re-run fluid genie apply" in out and "Genie (AI/BI) is enabled" in out
     assert fake.genie_spaces == {}
+
+
+def test_a_glob_reaches_no_ignored_folder_it_names_and_follows_no_symlink_loop(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    write_contract(tmp_path, sites(), "ok/a.fluid.yaml")
+    write_contract(tmp_path, tenancy(), "target/b.fluid.yaml")
+    assert [label for label, _ in genie_cli.contract_paths(["*"])] == ["ok/a.fluid.yaml"]
+    # Two symlink loops made a recursive glob run forever; a glob is one level per ``**``.
+    (tmp_path / "ok" / "loop0").symlink_to(tmp_path)
+    (tmp_path / "ok" / "loop1").symlink_to(tmp_path)
+    labels = [label for label, _ in genie_cli.contract_paths(["**/*.fluid.yaml"])]
+    assert labels == ["ok/a.fluid.yaml"]
+
+
+def test_a_failed_remove_says_to_re_run_remove(fake):
+    fake.fail_route("GET", "/api/2.0/genie/spaces", 500, "INTERNAL_ERROR: down")
+    with pytest.raises(genie.GenieError) as exc:
+        Run(fake).remove()
+    assert exc.value.remediation == (
+        "The workspace is busy or unavailable: re-run fluid genie remove in a minute.",
+    )
+
+
+def test_a_contract_fluid_apply_would_refuse_stops_the_run_with_its_file(workspace, fake, capfd):
+    broken = tenancy()
+    broken["exposes"][0]["policy"] = "readers: everyone"
+    write_contract(workspace, broken, "bad/shape/dp005.fluid.yaml")
+    rc, out = run_fluid(capfd, "genie", "apply", "pack", "bad/shape", "--estate", ESTATE)
+    assert rc == 1 and "ERR_GENIE_CONTRACT_INVALID" in out
+    assert "bad/shape/dp005.fluid.yaml" in out
+
+    old = sites()
+    old["fluidVersion"] = "0.5.7"
+    write_contract(workspace, old, "bad/old/dp001.fluid.yaml")
+    rc, out = run_fluid(capfd, "genie", "apply", "bad/old", "--estate", ESTATE)
+    assert rc == 1 and "ERR_CONTRACT_VERSION_UNSUPPORTED" in out
+
+    garbled = workspace / "bad" / "yaml" / "dp016.fluid.yaml"
+    garbled.parent.mkdir(parents=True)
+    garbled.write_text("id: [unclosed\n", encoding="utf-8")
+    rc, out = run_fluid(capfd, "genie", "apply", "bad/yaml", "--estate", ESTATE)
+    assert rc == 1 and "ERR_CONTRACT_LOAD_FAILED" in out and "bad/yaml/dp016.fluid.yaml" in out
+    assert fake.genie_spaces == {}

@@ -997,6 +997,11 @@ def test_a_list_that_never_shows_the_new_space_is_said_not_waited_on_forever(
     fake.genie_list_lag = 1000
     run = Run(fake)(site_contract())
     assert "created 'Site 360'" in run.text and "does not show the new space yet" in run.text
+    # The product's own words, as before the estate's Voice.
+    assert (
+        "an apply in the next minute could make a second one, which the apply after refuses "
+        "until one is trashed." in run.text
+    )
 
 
 def test_a_title_another_space_has_is_kept_as_the_service_suffixed_it_and_said(fake):

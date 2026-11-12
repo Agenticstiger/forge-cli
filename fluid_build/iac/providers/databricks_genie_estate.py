@@ -82,10 +82,11 @@ def estate_marker(estate_id: str) -> str:
     return f"[{ESTATE_TAG}:{estate_id}]"
 
 
-def voice(estate_id: str) -> genie.Voice:
-    """How an estate space's messages name what keeps it in step."""
+def voice(estate_id: str, command: str = _COMMAND) -> genie.Voice:
+    """How an estate space's messages name what keeps it in step (``command``: the one the
+    run is, so a failed ``fluid genie remove`` says to re-run that)."""
     return genie.Voice(
-        command=_COMMAND,
+        command=command,
         run="run",
         scope="estate",
         title_setting="--title",
@@ -603,7 +604,7 @@ def remove_estate(
     if not _ESTATE_ID.fullmatch(estate_id):
         raise invalid_estate_id(estate_id)
     token = estate_marker(estate_id)
-    speaking = voice(estate_id)
+    speaking = voice(estate_id, command="fluid genie remove")
     with genie.speaking(speaking):
         client = genie._client(client_factory)
         say(f"\n  {speaking.heading}")
