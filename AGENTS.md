@@ -370,6 +370,24 @@ found again by the marker `[fluid-genie:<product id>]` at the end of its descrip
 deploying identity's own folder (one anywhere else is left alone), and removing the block trashes
 it. Code: `fluid_build/iac/providers/databricks_genie.py`.
 
+### One Genie space over several products (an estate)
+
+```bash
+fluid genie apply tower-management/ --estate tower-management --title "Tower Management"
+fluid genie remove --estate tower-management
+```
+
+`fluid genie apply` takes contract files, globs or folders (searched for `*.fluid.yaml`), and
+`--env` and `--dry-run` as `fluid apply` does. Apply the products first: the run checks every
+table exists and names the product of one that does not. The space holds each product's tables
+as a product space does, and a join for every foreign key the contracts declare between them
+(a column tagged `foreign-key` whose `labels.references` is `<product id>.<column>`), the same
+keys `fluid apply` declares in Unity Catalog (`databricks_keys.py`). `CAN RUN` goes only to the
+principals that read every table of the estate, because the space describes them all. The space
+is found again by `[fluid-genie-estate:<id>]` at the end of its description, in the deploying
+identity's own folder, and converges to exactly the contracts given. Code:
+`fluid_build/cli/genie.py`, `fluid_build/iac/providers/databricks_genie_estate.py`.
+
 ---
 
 ## For AI-Assisted Project Creation (Forge)

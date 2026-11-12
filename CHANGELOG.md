@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid genie apply`: one Databricks Genie space over several data products (an estate).**
+  `fluid genie apply <contracts|globs|folders...> --estate <id>` creates or updates one AI/BI
+  Genie space over the Databricks tables of every contract given, so a question can join the
+  products: `fluid genie apply tower-management/ --estate tower-management`. Each table carries
+  what a product's own space says of it (column descriptions, allowed values, synonyms, example
+  questions, one instruction section from its semantics, metrics and `agentPolicy`), and the space
+  gets a join for every foreign key the contracts declare between its tables: a column tagged
+  `foreign-key` whose `labels.references` is `<product id>.<column>`, resolved as `fluid apply`
+  resolves it for Unity Catalog. A join is MANY_TO_ONE from the referencing table, ONE_TO_ONE
+  when the foreign key is that table's own primary key, a composite key is one join, and a key
+  to its own table joins a second alias. A reference to a product the estate does not hold is
+  said and left out. `CAN RUN` goes only to the principals that read every table of the estate,
+  since the space describes them all; the others are named. The products are applied first: the
+  run checks that every table exists before it writes and names the product of one that does
+  not. Like a product's space it is found again by a marker, `[fluid-genie-estate:<id>]`, in the
+  deploying identity's own folder only, changes nothing on a second run, and converges to
+  exactly the contracts given. `--title`, `--env` (contract overlays) and `--dry-run`;
+  `fluid genie remove --estate <id>` trashes it. A product whose `agentPolicy` rules out
+  question answering refuses the estate, and so do more than 50 tables, Genie's cap (measured).
+  A product space's update now names a table that leaves the space as a table, not as a metric
+  view.
+
 - **A Databricks AI/BI Genie space for a data product.** With `extensions.databricksGenie: {}`
   (or `{title: ...}`) in a contract with Databricks table exposes, `fluid apply` creates the
   product's Genie space once its tables, masks and row filters are in place. The space holds
@@ -28,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity made is left alone, and that identity makes its own.
   `fluid apply --mode dry-run` prints what would change. The space is made through the Genie
   REST API (the `[databricks]` extra), since the databricks/databricks provider has no Genie
-  space resource. One space per product; a space over several products is a follow-up.
+  space resource. One space per product; `fluid genie apply` makes one over several products.
 
 - **Databricks: Unity Catalog primary and foreign keys from the contract.** A column tagged
   `primary-key` (all of them, in schema order, for a composite key; each must be
