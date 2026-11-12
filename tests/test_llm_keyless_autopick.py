@@ -363,6 +363,18 @@ class TestAgentLoopNeverAutoPicksAnAgent:
         assert agent_loop_requested(False, {"FLUID_COPILOT_AGENT_LOOP": "on"}) is True
         assert agent_loop_requested(False, {"FLUID_COPILOT_AGENT_LOOP": "0"}) is False
 
+    def test_a_mission_never_auto_picks_an_agent(self, world):
+        # ``fluid mission run`` always runs the loop, without the flag.
+        import argparse
+
+        from fluid_build.cli.mission import _resolve_mission_llm_config
+
+        world.install("claude-code")
+        args = argparse.Namespace(llm_provider=None, llm_model=None, llm_endpoint=None)
+        config, message = _resolve_mission_llm_config(args)
+        assert config is None
+        assert "copilot_no_llm_provider" in message  # stopped before any agent ran
+
 
 class TestAgentReadinessNeedsTheBinary:
     """``fluid doctor`` says "Ready" for a coding agent only when its CLI is on PATH.

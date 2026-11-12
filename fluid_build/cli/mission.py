@@ -259,10 +259,16 @@ def _resolve_workspace_root(args: argparse.Namespace) -> Path:
 
 def _resolve_mission_llm_config(args: argparse.Namespace):
     """Resolve the LLM config, or ``(None, message)`` when unavailable."""
+    import copy
+
     from fluid_build.llm.providers import CopilotGenerationError, resolve_llm_config
 
+    # A mission always runs the tool-use agent loop, which no coding agent can
+    # serve: say so, so neither a saved nor an auto-picked agent is chosen.
+    loop_args = copy.copy(args)
+    loop_args.agent_loop = True
     try:
-        return resolve_llm_config(args, environ=None), None
+        return resolve_llm_config(loop_args, environ=None), None
     except CopilotGenerationError as exc:
         return None, str(exc)
 
