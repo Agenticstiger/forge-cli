@@ -979,7 +979,9 @@ class TestGeminiIsDefaultProvider:
     2. ``_prompt_for_api_key`` numbered menu — Gemini's free path is the
        first option and ``default=1`` selects it.
     3. ``resolve_llm_config`` resolution chain — when no flag, env var, or
-       env-var-inferred provider is present, the fallback is ``"gemini"``.
+       env-var-inferred provider is present, there is no silent fallback to
+       any provider: forge stops with ``copilot_no_llm_provider`` (founder
+       decision, 2026-11-12).
 
     The card was filed when OpenAI was the default everywhere; this suite
     prevents accidental regression to that state.
@@ -1021,11 +1023,11 @@ class TestGeminiIsDefaultProvider:
         connect_snippet = src[connect_idx : connect_idx + 400]
         assert "default=1" in connect_snippet, "ask_numbered_choice default= regressed"
 
-    def test_resolve_llm_config_falls_back_to_gemini_when_unconfigured(self, monkeypatch):
+    def test_resolve_llm_config_stops_when_no_provider_is_selected(self, monkeypatch):
         """With no flags, no FLUID_LLM_PROVIDER, no inferable provider env,
         and no API key already saved in the keyring, resolve_llm_config
-        should pick gemini and surface the missing-API-key error rather
-        than silently dropping to OpenAI."""
+        stops with ``copilot_no_llm_provider``: it neither guesses gemini
+        nor drops to OpenAI."""
         from fluid_build.cli.forge_copilot_llm_providers import (
             CopilotGenerationError,
             resolve_llm_config,
@@ -1065,24 +1067,25 @@ class TestGeminiIsDefaultProvider:
                 "fluid_build.cli.forge_copilot_llm_providers._resolve_api_key",
                 return_value=None,
             ),
+            # No saved ``fluid ai setup`` choice either (never the real ~/.fluid).
+            patch("fluid_build._ai_config_shared.load_ai_config", return_value=None),
         ):
             with pytest.raises(CopilotGenerationError) as exc_info:
                 resolve_llm_config(args, environ={})
 
-        # The error message — not just the event slug — must specifically
-        # mention the gemini adapter, proving the fallback resolved to
-        # gemini before the API-key check fired. ``CopilotGenerationError``
-        # carries the user-facing detail string in ``message``.
+        # No provider was guessed: the error says so, names no vendor, and
+        # carries the catalog's how-to-pick suggestions.
+        assert exc_info.value.event == "copilot_no_llm_provider"
         message = getattr(exc_info.value, "message", "") or ""
-        assert "gemini" in message.lower(), message
+        assert "no llm provider" in message.lower(), message
+        assert "gemini" not in message.lower(), message
         assert "openai" not in message.lower(), message
+        assert any("--llm-provider" in item for item in exc_info.value.suggestions)
 
     def test_resolve_llm_config_explicit_keys_still_win_over_gemini_default(self, monkeypatch):
-        """The Gemini-first fallback is the *no-signal* default. Operators
-        who set OPENAI_API_KEY / ANTHROPIC_API_KEY / explicit
-        ``--llm-provider openai`` must still get the provider they asked
-        for. Otherwise the fallback would be a regression for everyone
-        who explicitly opts into a different provider."""
+        """Operators who set OPENAI_API_KEY / ANTHROPIC_API_KEY / explicit
+        ``--llm-provider openai`` get the provider they asked for; Gemini
+        is only the first choice the interactive setup offers."""
         from fluid_build.cli.forge_copilot_llm_providers import _infer_provider_from_env
 
         for key in (

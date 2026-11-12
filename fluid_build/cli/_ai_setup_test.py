@@ -64,8 +64,8 @@ def detect_ollama_available(*args, **kwargs):
     return _host().detect_ollama_available(*args, **kwargs)
 
 
-def _sanitize_ollama_host(*args, **kwargs):
-    return _host()._sanitize_ollama_host(*args, **kwargs)
+def _normalize_ollama_host(*args, **kwargs):
+    return _host()._normalize_ollama_host(*args, **kwargs)
 
 
 def _resolve_cloud_api_key(*args, **kwargs):
@@ -193,10 +193,9 @@ def _validate_ai_test_endpoint(provider_name: str, endpoint: str) -> Optional[st
         return "AI test endpoint URLs must not embed credentials."
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return "AI test endpoint must be an absolute HTTP(S) URL."
-    host = (parsed.hostname or "").lower()
     if provider_name == "ollama":
-        if parsed.scheme != "http" or host not in {"localhost", "127.0.0.1", "::1"}:
-            return "Ollama AI test endpoints must stay on localhost."
+        # Any host, over http or https: the same as every other Ollama read
+        # (fluid_build/llm/ollama_host.py). Ollama sends no API key.
         return None
     if parsed.scheme != "https":
         return "Cloud AI test endpoints must use HTTPS to avoid sending API keys over plaintext."
@@ -247,7 +246,7 @@ def _resolve_ai_test_config(args: Any) -> tuple[Optional[LlmConfig], Optional[st
         if pname == "ollama":
             host = saved_for_provider.get("ollama_host")
             if host and not os.environ.get("OLLAMA_HOST"):
-                os.environ["OLLAMA_HOST"] = _sanitize_ollama_host(str(host))
+                os.environ["OLLAMA_HOST"] = _normalize_ollama_host(str(host))
             # Only an operator-supplied endpoint is validated; with none, the
             # call goes through litellm, which owns the address.
             if endpoint_override:
@@ -354,7 +353,10 @@ def _check_ai_test_model_availability(
     provider: Any, config: LlmConfig
 ) -> tuple[str, Optional[list[str]]]:
     try:
-        available = provider.list_available_models(config.api_key, dict(os.environ))
+        # The list comes from where the test call goes: the --endpoint, if any.
+        # The keyword goes only with an endpoint (two-argument plugins keep working).
+        stated = {"endpoint": config.endpoint} if config.endpoint else {}
+        available = provider.list_available_models(config.api_key, dict(os.environ), **stated)
     except httpx.HTTPStatusError as exc:
         raise CopilotGenerationError(
             "ai_test_model_preflight_failed",

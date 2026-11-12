@@ -196,7 +196,7 @@ class TestOllamaApiBase:
         assert _payload(second).get("api_base") == _payload(first).get("api_base")
 
 
-# Forms of OLLAMA_HOST -> the URL both reads of it use. Same rules as
+# Forms of OLLAMA_HOST -> the URL every read of it uses. Same rules as
 # ollama-python's ``_parse_host``: no scheme means http on 11434; an explicit
 # scheme without a port means that scheme's default port; a path is kept.
 _OLLAMA_HOST_FORMS = [
@@ -221,35 +221,35 @@ _OLLAMA_HOST_FORMS = [
 class TestOllamaHostForms:
     @pytest.mark.parametrize("host, expected", _OLLAMA_HOST_FORMS)
     def test_base_url(self, host, expected):
-        from fluid_build.llm.litellm_backend import _ollama_base_url
+        from fluid_build.llm.ollama_host import ollama_base_url
 
-        assert _ollama_base_url({"OLLAMA_HOST": host}) == expected
+        assert ollama_base_url({"OLLAMA_HOST": host}) == expected
 
     @pytest.mark.parametrize("env", [{}, {"OLLAMA_HOST": ""}, {"OLLAMA_HOST": "  "}])
     def test_unset_stays_empty_for_litellm_to_choose(self, env):
-        from fluid_build.llm.litellm_backend import _ollama_base_url
+        from fluid_build.llm.ollama_host import ollama_base_url
 
-        assert _ollama_base_url(env) == ""
+        assert ollama_base_url(env) == ""
 
     def test_an_unparseable_port_is_left_to_fail_at_the_dial(self):
-        from fluid_build.llm.litellm_backend import _ollama_base_url
+        from fluid_build.llm.ollama_host import ollama_base_url
 
-        assert _ollama_base_url({"OLLAMA_HOST": "myhost:abc"}) == "http://myhost:abc"
+        assert ollama_base_url({"OLLAMA_HOST": "myhost:abc"}) == "http://myhost:abc"
 
     @pytest.mark.parametrize("host, expected", _OLLAMA_HOST_FORMS)
     def test_the_model_list_dials_the_same_url(self, host, expected):
         from fluid_build.llm.litellm_backend import _list_ollama_models
 
-        with mock.patch("urllib.request.urlopen", side_effect=OSError("down")) as urlopen:
+        with mock.patch("httpx.get", side_effect=OSError("down")) as get:
             assert _list_ollama_models({"OLLAMA_HOST": host}) is None
-        assert urlopen.call_args.args[0].full_url == f"{expected}/api/tags"
+        assert get.call_args.args[0] == f"{expected}/api/tags"
 
     def test_the_model_list_defaults_to_localhost(self):
         from fluid_build.llm.litellm_backend import _list_ollama_models
 
-        with mock.patch("urllib.request.urlopen", side_effect=OSError("down")) as urlopen:
+        with mock.patch("httpx.get", side_effect=OSError("down")) as get:
             _list_ollama_models({})
-        assert urlopen.call_args.args[0].full_url == "http://localhost:11434/api/tags"
+        assert get.call_args.args[0] == "http://localhost:11434/api/tags"
 
     def test_resolved_endpoint_and_api_base_use_the_bare_host_port(self):
         config = resolve_llm_config(_args(llm_provider="ollama"), {"OLLAMA_HOST": "myhost"})

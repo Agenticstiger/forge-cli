@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import shutil
 import sys
-from typing import Mapping, Optional
+from typing import Dict, List, Mapping, Optional, Tuple
 
 LOG = logging.getLogger("fluid.cli.llm_providers.resolve")
 
@@ -65,6 +65,63 @@ def _bind_constants_from_host() -> None:
 _bind_constants_from_host()
 
 
+# Each built-in provider and the explicit variables that name it. Exactly one
+# provider named this way selects it; several select none, and
+# :func:`no_provider_message` says so.
+_EXPLICIT_KEY_VARS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("openai", ("OPENAI_API_KEY",)),
+    ("anthropic", ("ANTHROPIC_API_KEY",)),
+    ("gemini", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
+    ("ollama", ("OLLAMA_HOST",)),
+)
+
+
+def _explicit_key_signals(env: Mapping[str, str]) -> Dict[str, List[str]]:
+    """Each provider an explicit variable names, with the names of the ones set."""
+    signals: Dict[str, List[str]] = {}
+    for provider, names in _EXPLICIT_KEY_VARS:
+        present = [name for name in names if env.get(name)]
+        if present:
+            signals[provider] = present
+    return signals
+
+
+def _saved_provider_name() -> Optional[str]:
+    """The provider ``fluid ai setup`` saved, if any (``~/.fluid``)."""
+    try:
+        from fluid_build._ai_config_shared import load_ai_config
+
+        name = (load_ai_config() or {}).get("provider")
+    except Exception:  # noqa: BLE001 — an unreadable config names nothing
+        return None
+    return name if isinstance(name, str) and name else None
+
+
+def no_provider_message(env: Mapping[str, str]) -> str:
+    """Why no LLM provider is selected. ``fluid doctor`` and forge both say this."""
+    saved = _saved_provider_name()
+    if saved:
+        # Only a command that does not read the saved choice gets here: the
+        # readiness ladder (``fluid doctor``) uses it.
+        return (
+            f"No LLM provider is selected for this run: 'fluid ai setup' saved {saved}, "
+            f"but this command does not read the saved choice. Pass --llm-provider {saved}."
+        )
+    signals = _explicit_key_signals(env)
+    if len(signals) > 1:
+        names = ", ".join(name for present in signals.values() for name in present)
+        return (
+            f"No LLM provider is selected: {names} are all set, so none of them is "
+            "chosen. Pick one with --llm-provider or FLUID_LLM_PROVIDER."
+        )
+    if env.get("FLUID_LLM_API_KEY"):
+        return (
+            "No LLM provider is selected: FLUID_LLM_API_KEY does not say which provider "
+            "the key is for. Pick one with --llm-provider or FLUID_LLM_PROVIDER."
+        )
+    return "No LLM provider configured. Run 'fluid ai setup' or set an API key env var."
+
+
 def _infer_provider_from_explicit_keys(env: Mapping[str, str]) -> Optional[str]:
     """Return the provider when the operator supplied exactly one explicit
     API-key env var.
@@ -79,17 +136,9 @@ def _infer_provider_from_explicit_keys(env: Mapping[str, str]) -> Optional[str]:
     which only fires once every other resolution step has failed.
     """
 
-    detected = []
-    if env.get("OPENAI_API_KEY"):
-        detected.append("openai")
-    if env.get("ANTHROPIC_API_KEY"):
-        detected.append("anthropic")
-    if env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY"):
-        detected.append("gemini")
-    if env.get("OLLAMA_HOST"):
-        detected.append("ollama")
-    if len(detected) == 1:
-        return detected[0]
+    signals = _explicit_key_signals(env)
+    if len(signals) == 1:
+        return next(iter(signals))
     return None
 
 

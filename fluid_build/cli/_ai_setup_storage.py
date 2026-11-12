@@ -117,6 +117,26 @@ def _allow_plaintext_ai_secrets() -> bool:
     }
 
 
+def _without_credentials(url: str) -> str:
+    """*url* minus any ``user:password@``, unless plaintext AI secrets are allowed."""
+    if _allow_plaintext_ai_secrets():
+        return url
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        scheme, rest = "", url
+    # The authority ends at the first "/", "?" or "#" (RFC 3986 section 3.2).
+    cut = min((i for i in (rest.find(c) for c in "/?#") if i != -1), default=len(rest))
+    authority, tail = rest[:cut], rest[cut:]
+    if "@" not in authority:
+        return url
+    LOG.warning(
+        "Credentials in a saved AI address were not written to %s; keep them in the "
+        "environment (for example OLLAMA_HOST).",
+        _config_file(),
+    )
+    return f"{scheme}{sep}{authority.rpartition('@')[2]}{tail}"
+
+
 def _read_config_file() -> Optional[dict]:
     """Read + JSON-parse ``~/.fluid/ai_config.json`` (delegates to the leaf).
 
@@ -226,10 +246,13 @@ def _save_ai_config(
             LOG.warning("Plaintext local AI credential fallback is enabled.")
         else:
             LOG.debug("Keyring unavailable; sensitive AI value was not persisted.")
+    # A URL can carry ``user:password@``. Like an API key, it is written to the
+    # file only behind the plaintext opt-in; otherwise the address is saved
+    # without it and the credentials stay in the environment (OLLAMA_HOST, ...).
     if endpoint:
-        entry["endpoint"] = endpoint
+        entry["endpoint"] = _without_credentials(endpoint)
     if ollama_host:
-        entry["ollama_host"] = ollama_host
+        entry["ollama_host"] = _without_credentials(ollama_host)
 
     providers[provider] = entry
     return _write_config_map(active=provider, providers=providers)
