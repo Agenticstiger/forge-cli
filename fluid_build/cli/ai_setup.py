@@ -1737,7 +1737,12 @@ def _provider_model_plan(provider_name: str) -> dict:
         get_catalog_tier_models,
     )
 
-    provider = BUILTIN_LLM_PROVIDERS[provider_name]
+    provider = BUILTIN_LLM_PROVIDERS.get(provider_name)
+    if provider is None:
+        # ``mcp-sampling`` and plugin providers are not in the built-in dict.
+        from fluid_build.llm.providers import get_llm_provider
+
+        provider = get_llm_provider(provider_name)
     model = get_catalog_default(provider_name) or provider.default_model
     routing_model = get_catalog_routing_model(provider_name, model)
     tier_models = get_catalog_tier_models(provider_name)
@@ -1770,10 +1775,13 @@ def show_ai_models(
         if name in BUILTIN_LLM_PROVIDERS
     ]
     if provider_filter:
+        from fluid_build.cli._llm_provider_plugins import LlmProviderChoices
+
         requested = provider_filter.strip().lower()
         if requested == "claude":
             requested = "anthropic"
-        provider_names = [name for name in provider_names if name == requested]
+        # Any name ``fluid forge --llm-provider`` takes, not only the four above.
+        provider_names = [requested] if requested in LlmProviderChoices() else []
 
     plans = {name: _provider_model_plan(name) for name in provider_names}
     if as_json:
@@ -1899,10 +1907,17 @@ def register(subparsers) -> None:
         "models",
         help="Show provider defaults, routing model, and tiered model plan",
     )
+    # The registry ``fluid forge --llm-provider`` reads: built-ins (listed in
+    # --help and in an invalid-choice error) and pip-installed plugins. The
+    # dest keeps the value off ``args.provider``: the global checks read that
+    # as an infrastructure provider, which made every value here exit 2.
+    from fluid_build.cli._llm_provider_plugins import LlmProviderChoices
+
     models_parser.add_argument(
         "--provider",
-        choices=["gemini", "openai", "anthropic", "claude", "ollama"],
-        help="Limit output to one provider",
+        dest="llm_provider",
+        choices=LlmProviderChoices(),
+        help="Limit output to one LLM provider (any `fluid forge --llm-provider` name)",
     )
     models_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     test_parser = ai_sub.add_parser(
@@ -2057,7 +2072,7 @@ def _run_ai_command(args, logger: logging.Logger) -> int:
     if action == "models":
         show_ai_models(
             console,
-            provider_filter=getattr(args, "provider", None),
+            provider_filter=getattr(args, "llm_provider", None),
             as_json=bool(getattr(args, "json", False)),
         )
         return 0

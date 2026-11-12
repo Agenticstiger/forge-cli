@@ -5,8 +5,16 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+
+from fluid_build.cli import artifact_receipts
 from fluid_build.cli.artifact_receipts import (
     ReceiptBuilder,
     ReceiptDocument,
@@ -14,6 +22,26 @@ from fluid_build.cli.artifact_receipts import (
     generate_run_id,
 )
 from fluid_build.cli.artifact_writer import ArtifactWriter
+
+#: Run by the fork test in a fresh interpreter: an id in the parent, one in a
+#: forked child, then the parent's next id, all in one millisecond.
+_FORK_SCRIPT = """
+import os, types
+from fluid_build.cli import artifact_receipts as ar
+ar.time = types.SimpleNamespace(time=lambda: 1_800_000_000.0005)
+seeds = iter([5, 9])
+ar.secrets = types.SimpleNamespace(randbits=lambda k: next(seeds))
+print(ar.generate_run_id(), flush=True)
+read_end, write_end = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.write(write_end, ar.generate_run_id().encode())
+    os._exit(0)
+os.close(write_end)
+os.waitpid(pid, 0)
+print(os.read(read_end, 64).decode())
+print(ar.generate_run_id())
+"""
 
 
 class TestGenerateRunId:
@@ -28,6 +56,74 @@ class TestGenerateRunId:
         """Tight loop generation must not collide on random bits."""
         ids = {generate_run_id() for _ in range(1000)}
         assert len(ids) == 1000
+
+    def test_ids_in_one_millisecond_never_repeat(self, monkeypatch):
+        """The collision behind the flake above (``999 == 1000``), made certain.
+
+        With the clock stopped and the random source fixed, a random suffix
+        repeats at once. Uniqueness in one process must not rest on chance.
+        """
+        frozen = time.time()
+        monkeypatch.setattr(artifact_receipts, "time", SimpleNamespace(time=lambda: frozen))
+        monkeypatch.setattr(
+            artifact_receipts,
+            "secrets",
+            SimpleNamespace(token_hex=lambda n=32: "ab" * n, randbits=lambda k: 0x1234),
+        )
+        ids = [generate_run_id() for _ in range(1000)]
+        assert len(set(ids)) == 1000
+        assert ids == sorted(ids)
+
+
+class TestRunIdSequence:
+    """Order and uniqueness at the edges: the clock, a used-up suffix, a fork."""
+
+    def test_ids_keep_increasing_when_the_clock_steps_back(self, monkeypatch):
+        start = time.time()
+        clock = iter([start, start - 1.0, start - 2.0])
+        monkeypatch.setattr(artifact_receipts, "time", SimpleNamespace(time=lambda: next(clock)))
+        ids = [generate_run_id() for _ in range(3)]
+        assert len(set(ids)) == 3
+        assert ids == sorted(ids)
+
+    def test_a_used_up_suffix_moves_to_the_next_millisecond(self, monkeypatch):
+        ms = int(time.time() * 1000)
+        monkeypatch.setattr(artifact_receipts, "_last_ms", -1)
+        monkeypatch.setattr(artifact_receipts, "_last_suffix", 0)
+        # +0.5 ms so the float round trip cannot land on the millisecond before.
+        monkeypatch.setattr(
+            artifact_receipts, "time", SimpleNamespace(time=lambda: (ms + 0.5) / 1000)
+        )
+        monkeypatch.setattr(
+            artifact_receipts, "secrets", SimpleNamespace(randbits=lambda k: 0xFFFFFFFF)
+        )
+        assert generate_run_id() == f"{ms:011x}-ffffffff"
+        assert generate_run_id() == f"{ms + 1:011x}-ffffffff"
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="os.fork is POSIX only")
+    def test_a_forked_child_starts_its_own_sequence(self):
+        """A real ``os.fork()``, in a fresh interpreter with no other threads.
+
+        Without the at-fork reset, the child continues the parent's sequence
+        and makes the same id as the parent's next one (``...-00000006``).
+        """
+        root = Path(artifact_receipts.__file__).resolve().parents[2]
+        paths = [str(root), os.environ.get("PYTHONPATH", "")]
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in paths if p)}
+        result = subprocess.run(
+            [sys.executable, "-c", _FORK_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=root,
+            env=env,
+            check=True,
+        )
+        ms = 1_800_000_000_000
+        parent_first, child, parent_next = result.stdout.split()
+        assert parent_first == f"{ms:011x}-00000005"
+        assert child == f"{ms:011x}-00000009"
+        assert parent_next == f"{ms:011x}-00000006"
 
 
 class TestReceiptEntryToDict:
