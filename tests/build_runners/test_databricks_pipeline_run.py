@@ -22,6 +22,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import pytest
 
 from fluid_build.build_runners import _databricks_pipeline_run as pipeline_run
+
+#: The deploying identity the fake workspace answers ``/scim/v2/Me`` with.
+ME = "deployer@example.com"
 from fluid_build.build_runners._databricks_job_run import TIMEOUT_ENV
 from fluid_build.build_runners._databricks_pipeline_run import (
     PipelineRef,
@@ -189,6 +192,9 @@ class _Api:
         events: Optional[List[Dict[str, Any]]] = None,
         properties: Optional[Dict[str, str]] = None,
         tags: Optional[Dict[Tuple[str, str], Dict[str, str]]] = None,
+        owners: Optional[Dict[Tuple[str, str, str], str]] = None,
+        inherited: Optional[set] = None,
+        me: Optional[str] = ME,
         no_table: bool = False,
         fail_update_reads: bool = False,
         fail_post_tag: Optional[str] = None,
@@ -201,6 +207,10 @@ class _Api:
             else properties
         )
         self.tags = tags if tags is not None else {}
+        #: ``(kind, name, key) -> updated_by``; a tag not listed was set by ``me``.
+        self.owners = dict(owners or {})
+        self.inherited = set(inherited or ())
+        self.me = me
         self.no_table = no_table
         self.fail_update_reads = fail_update_reads
         self.fail_post_tag = fail_post_tag
@@ -220,6 +230,10 @@ class _Api:
             return {"events": self.events}
         if re.fullmatch(r"/api/2\.0/pipelines/[^/]+/stop", path):
             return {}
+        if path == "/api/2.0/preview/scim/v2/Me":
+            if self.me is None:
+                raise RuntimeError("401 unauthenticated")
+            return {"userName": self.me}
         if path.startswith("/api/2.1/unity-catalog/tables/"):
             if self.no_table:
                 raise RuntimeError("404 TABLE_DOES_NOT_EXIST")
@@ -233,7 +247,15 @@ class _Api:
             held = self.tags.setdefault((kind, name), {})
             if method == "GET":
                 return {
-                    "tag_assignments": [{"tag_key": k, "tag_value": v} for k, v in held.items()]
+                    "tag_assignments": [
+                        {
+                            "tag_key": k,
+                            "tag_value": v,
+                            "updated_by": self.owners.get((kind, name, k), ME),
+                            "inherited": (kind, name, k) in self.inherited,
+                        }
+                        for k, v in held.items()
+                    ]
                 }
             assert method == "DELETE"
             held.pop(key, None)
@@ -245,6 +267,7 @@ class _Api:
             self.tags.setdefault((body["entity_type"], body["entity_name"]), {})[
                 body["tag_key"]
             ] = body["tag_value"]
+            self.owners.pop((body["entity_type"], body["entity_name"], body["tag_key"]), None)
             return {}
         raise AssertionError(f"unexpected {method} {path}")
 
@@ -343,7 +366,7 @@ def _resource(
 
 
 # 1. started_pipeline_builds --------------------------------------------------
-def test_started_pipeline_builds_lists_manual_lakeflow_builds_only():
+def test_started_pipeline_builds_lists_lakeflow_builds_only():
     contract = _contract()
     continuous = copy.deepcopy(contract["builds"][0])
     continuous["id"] = "build-stream"
@@ -351,9 +374,10 @@ def test_started_pipeline_builds_lists_manual_lakeflow_builds_only():
     dbt = {"id": "build-dbt", "engine": "dbt", "properties": {"model": "x"}}
     contract["builds"] += [continuous, dbt]
 
-    assert [b["id"] for b in started_pipeline_builds(contract, None)] == [BUILD]
+    # A continuous one is run too: Databricks keeps it running, so only its tags are set.
+    assert [b["id"] for b in started_pipeline_builds(contract, None)] == [BUILD, "build-stream"]
     assert [b["id"] for b in started_pipeline_builds(contract, BUILD)] == [BUILD]
-    assert started_pipeline_builds(contract, "build-stream") == []
+    assert [b["id"] for b in started_pipeline_builds(contract, "build-stream")] == ["build-stream"]
     assert started_pipeline_builds(contract, "build-dbt") == []
     assert started_pipeline_builds(contract, "nope") == []
 
@@ -510,21 +534,27 @@ def test_failed_update_says_the_error_and_sets_no_tags(compiled, capsys):
 
 # 6. tags after a completed update ---------------------------------------------
 def test_tags_are_set_changed_removed_and_left_alone(compiled):
+    """Declared tags are set; an undeclared tag the deploying identity set is removed (a
+    dropped label, whatever ran the updates since); a steward's tag and an inherited one stay."""
     table = ("tables", TABLE)
     column = ("columns", f"{TABLE}.site_id")
-    # ``method`` is still a column but no longer classified; ``dropped_col`` is gone from the
-    # table (and took its tags with it), so it is not read or written at all.
-    old_column = ("columns", f"{TABLE}.method")
+    declassified = ("columns", f"{TABLE}.method")
     api = _Api(
         tags={
             table: {
                 "fluid_layer": "Silver",  # declared, unchanged
                 "fluid_version": "0.0.1",  # declared, changed
-                "old_key": "x",  # recorded, no longer declared
-                "stray": "keep",  # neither declared nor recorded
+                "old_key": "x",  # set by this identity, no longer declared
+                "stray": "keep",  # a steward's
+                "domain_tag": "keep",  # inherited from the schema
             },
-            old_column: {"fluid_sensitivity": "pii", "other": "keep"},
-        }
+            declassified: {"fluid_sensitivity": "pii", "other": "keep"},
+        },
+        owners={
+            ("tables", TABLE, "stray"): "steward@example.com",
+            ("columns", f"{TABLE}.method", "other"): "steward@example.com",
+        },
+        inherited={("tables", TABLE, "domain_tag")},
     )
     rc, _lines = _wait(api, compiled)
 
@@ -534,24 +564,82 @@ def test_tags_are_set_changed_removed_and_left_alone(compiled):
     assert ("DELETE", TABLE, "fluid_layer") not in writes
     assert ("DELETE", TABLE, "old_key") in writes
     assert ("DELETE", TABLE, "stray") not in writes
+    assert ("DELETE", TABLE, "domain_tag") not in writes
     assert ("POST", TABLE, "fluid_owner_team") in writes
     assert ("DELETE", TABLE, "fluid_version") in writes
     assert writes.index(("DELETE", TABLE, "fluid_version")) < writes.index(
         ("POST", TABLE, "fluid_version")
     )
     assert ("DELETE", f"{TABLE}.method", "fluid_sensitivity") in writes
-    assert not [p for p in api.paths("GET", "entity-tag-assignments") if "dropped_col" in p]
-    assert not [w for w in writes if "dropped_col" in w[1]]
-    assert api.tags[table] == {
-        "fluid_layer": "Silver",
-        "fluid_version": "0.7.7",
-        "fluid_owner_team": "data-platform",
-        "fluid_product_id": PRODUCT,
-        "fluid_product_name": "Capacity",
-        "stray": "keep",
-    }
     assert api.tags[column] == {"fluid_sensitivity": "internal"}
-    assert api.tags[old_column] == {"other": "keep"}
+    assert api.tags[declassified] == {"other": "keep"}
+    # No table-property record is read any more.
+    assert api.paths("GET", "/unity-catalog/tables/") == []
+
+
+def test_an_unreadable_identity_removes_nothing_but_still_sets(compiled):
+    table = ("tables", TABLE)
+    api = _Api(tags={table: {"old_key": "x"}}, me=None)
+    rc, lines = _wait(api, compiled)
+    assert rc == 0
+    assert [w for w in api.tag_writes() if w[0] == "DELETE"] == []
+    assert ("POST", TABLE, "fluid_owner_team") in api.tag_writes()
+    assert any("left in place" in line for line in lines)
+
+
+def test_a_continuous_pipeline_gets_its_tags_without_an_update(compiled):
+    api = _Api()
+    rc = pipeline_run.tag_running_pipeline(
+        _Client(api), compiled, build_id=BUILD, name="fluid x b", say=lambda line: None
+    )
+    assert rc == 0
+    assert not [p for m, p, _q, _b in api.calls if p.endswith("/updates")]
+    assert ("POST", TABLE, "fluid_owner_team") in api.tag_writes()
+
+
+def test_a_continuous_pipeline_without_its_table_yet_waits_for_it(compiled):
+    api = _Api(no_table=True)
+    said: List[str] = []
+    rc = pipeline_run.tag_running_pipeline(
+        _Client(api), compiled, build_id=BUILD, name="fluid x b", say=said.append
+    )
+    assert rc == 0
+    assert api.tag_writes() == []
+    assert any("next apply" in line for line in said)
+
+
+def test_a_ctrl_c_during_the_start_request_stops_the_pipeline(compiled):
+    class Interrupting(_Api):
+        def do(self, method, path, query=None, body=None, **kw):
+            if method == "POST" and path.endswith("/updates"):
+                self.calls.append((method, path, query, body))
+                raise KeyboardInterrupt
+            return super().do(method, path, query=query, body=body, **kw)
+
+    api = Interrupting()
+    with pytest.raises(KeyboardInterrupt):
+        _wait(api, compiled)
+    assert api.paths("POST", "/stop")
+
+
+def test_malformed_event_payloads_do_not_raise():
+    events = [
+        {"event_type": "flow_progress", "details": "x", "origin": "x"},
+        {
+            "event_type": "flow_progress",
+            "details": {
+                "flow_progress": {
+                    "data_quality": {
+                        "expectations": [{"name": "r", "dataset": "d", "passed_records": "x"}],
+                        "dropped_records": None,
+                    }
+                }
+            },
+            "origin": {"flow_name": "d"},
+        },
+    ]
+    counts, dropped = pipeline_run.quality(events)
+    assert counts == {("d", "r"): (0, 0)} and dropped == {"d": 0}
 
 
 def test_no_table_yet_removes_nothing_and_still_sets_tags(compiled):
@@ -669,13 +757,14 @@ def test_a_contract_that_does_not_compile_says_why_and_starts_nothing(monkeypatc
     assert api.calls == []
 
 
-def test_databricks_job_runs_counts_manual_lakeflow_builds_only():
+def test_databricks_job_runs_counts_lakeflow_builds():
     from fluid_build.cli.apply import _databricks_job_runs
 
     contract = _contract()
     assert _databricks_job_runs(contract, None) is True
+    # A continuous one too: the build phase sets its tags, so it needs the state and the SDK.
     contract["builds"][0]["execution"]["trigger"] = {"type": "continuous"}
-    assert _databricks_job_runs(contract, None) is False
+    assert _databricks_job_runs(contract, None) is True
 
 
 def test_jobs_from_state_hands_over_the_pipelines_and_no_jobs():

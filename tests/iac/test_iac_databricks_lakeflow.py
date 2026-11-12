@@ -427,11 +427,12 @@ class TestSql:
     def test_a_schema_rule_adds_no_constraint_and_no_view(self, sql):
         assert "capacity_schema" not in sql
 
-    def test_the_properties_carry_the_product_and_the_tag_list(self, sql):
+    def test_the_properties_carry_the_product_and_no_tag_record(self, sql):
         assert "'fluid.product_id' = 'silver.test.capacity_v1'" in sql
         assert "'fluid.build_id' = 'build-capacity'" in sql
-        (line,) = [ln for ln in sql.splitlines() if "'fluid.tags'" in ln]
-        assert "fluid_product_id" in line
+        # The tags the run removes are the ones the deploying identity set (updated_by),
+        # never a record an update could overwrite.
+        assert "fluid.tags" not in sql and "fluid.column_tags" not in sql
 
     def test_the_users_query_follows_as(self, sql):
         assert f"\nAS\n{QUERY}\n;\n" in sql
@@ -737,3 +738,70 @@ def test_a_pipeline_table_with_keys_is_warned_and_left_out_of_key_reconciling(
     with contract_source(tmp_path / "capacity" / "contract.fluid.yaml"):
         dbx._declare_keys(contract, lambda line: None)
     assert seen == [[]]
+
+
+# ── defect scan, 2026-11-12 ────────────────────────────────────────────────
+def test_two_rules_sharing_an_id_are_refused(tmp_path):
+    def duplicate(contract):
+        rules = contract["exposes"][0]["contract"]["dq"]["rules"]
+        rules.append({**rules[1], "selector": "site_id", "severity": "warn"})
+        rules.append({**rules[2], "id": rules[2]["id"].upper()})
+
+    compiled = _compile(_edit(d=duplicate), tmp_path)
+    refused = [str(r) for r in compiled.refusals if r.kind == "databricks-lakeflow-rule-id"]
+    assert len(refused) == 2, refused
+
+
+def test_a_raw_string_with_a_backslash_is_closed(tmp_path):
+    from fluid_build.iac.providers.databricks_lakeflow import _left_open
+
+    assert _left_open("SELECT r'C:\\' AS p FROM t") is None
+    assert _left_open('SELECT R"a\\" AS p') is None
+    assert _left_open("SELECT r'x FROM t") == "a ' string"
+    assert _left_open("SELECT bar'x\\'y' FROM t") is None  # not raw: the r ends a word
+
+
+@pytest.mark.parametrize(
+    "upstream_edit",
+    [
+        lambda e: e.update(binding="x"),
+        lambda e: e["binding"].update(location=["x"]),
+        lambda e: e.update(contract="x"),
+    ],
+)
+def test_a_malformed_upstream_is_an_unresolved_reference_not_a_crash(tmp_path, upstream_edit):
+    upstream = _upstream()
+    upstream_edit(upstream["exposes"][0])
+    (tmp_path / "fluid.workspace.yaml").write_text("version: 1\n", encoding="utf-8")
+    (tmp_path / "sites").mkdir()
+    (tmp_path / "sites" / "contract.fluid.yaml").write_text(yaml.safe_dump(upstream), "utf-8")
+    (tmp_path / "capacity").mkdir()
+    path = tmp_path / "capacity" / "contract.fluid.yaml"
+    path.write_text(yaml.safe_dump(_contract()), encoding="utf-8")
+    with contract_source(path):
+        compiled = dbx._compile(_contract(), ENV)
+    assert "databricks-lakeflow-reference-unresolved" in _kinds(compiled)
+
+
+def test_the_schema_check_covers_views_too(tmp_path):
+    compiled = _compile(_contract(), tmp_path)
+    (grant,) = compiled.resources["databricks_grant"].values()
+    condition = str(grant["lifecycle"]["precondition"][0]["condition"])
+    (key,) = compiled.data["databricks_views"]
+    assert f"data.databricks_views.{key}.ids" in condition and "setunion(" in condition
+
+
+def test_a_pipeline_tables_readers_are_told_they_need_use_catalog(tmp_path):
+    with contract_source(_workspace(tmp_path, _contract())):
+        notices = dbx.DatabricksIacPlugin().plan_notices(_contract())
+    assert any("USE CATALOG on catalog fluid_iactest_ldp" in n and "analysts" in n for n in notices)
+
+
+def test_verify_says_a_missing_pipeline_table_comes_from_an_update():
+    from fluid_build.cli._verify_databricks import _compare, _severity
+
+    diff = _compare({}, [{"name": "id", "type": "bigint", "nullable": True}])
+    said = _severity(diff, None, None, missing_table="c.s.t", pipeline_written=True)
+    assert "amend-and-build" in str(said)
+    plain = _severity(diff, None, None, missing_table="c.s.t")
+    assert "Run fluid apply to create it" in str(plain)

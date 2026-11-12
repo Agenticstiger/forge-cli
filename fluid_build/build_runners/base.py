@@ -186,15 +186,17 @@ def _lakeflow_build(
     databricks_pipelines: Optional[Dict[str, Any]],
     args: argparse.Namespace,
 ) -> Optional[int]:
-    """Run a lakeflow build: start an update of its Lakeflow pipeline and wait for it
-    (``_databricks_pipeline_run.run_pipeline_build``); its exit code, or ``None`` when
-    Databricks runs it on its own (no apply here provisioned it, or it is continuous)."""
+    """Run a lakeflow build (``_databricks_pipeline_run.run_pipeline_build``): a triggered one
+    gets an update, waited for; a continuous one, which Databricks keeps running, only its
+    tags. Its exit code, or ``None`` when Databricks runs it on its own: no apply here
+    provisioned it, or a continuous one's tags were set."""
     build_id = build.get("id", "unknown")
-    if databricks_pipelines is None or is_continuous_build(build):
+    continuous = is_continuous_build(build)
+    if databricks_pipelines is None:
         product = contract.get("id") or contract.get("name") or "product"
         how = (
             "continuously; Databricks keeps it running, so fluid apply starts no update of it."
-            if is_continuous_build(build)
+            if continuous
             else "(fluid apply provisions it). An apply to databricks with --mode "
             "amend-and-build starts an update now and waits for it; so does the pipeline's page."
         )
@@ -209,7 +211,7 @@ def _lakeflow_build(
 
     from ._databricks_pipeline_run import run_pipeline_build
 
-    return run_pipeline_build(
+    result = run_pipeline_build(
         contract,
         build,
         databricks_pipelines,
@@ -217,6 +219,10 @@ def _lakeflow_build(
         mode=getattr(args, "mode", None),
         contract_file=source_contract_file(getattr(args, "contract", None)),
     )
+    if continuous and result == 0:
+        _record_run_elsewhere(build_id, report)
+        return None
+    return result
 
 
 def _writes_a_databricks_table(contract: Dict[str, Any], build: Dict[str, Any]) -> bool:

@@ -101,11 +101,6 @@ ON_VIOLATION = {
 #: ... and on a whole-table check, which has no row of the product to drop.
 ON_TABLE_VIOLATION = {"info": "", "warn": "", "error": "", "critical": " ON VIOLATION FAIL UPDATE"}
 
-#: Table properties the definition sets: the tag keys ``fluid apply`` set on the table and
-#: the columns it tagged, so the next run can remove the ones the contract no longer has.
-TAGS_PROPERTY = "fluid.tags"
-COLUMN_TAGS_PROPERTY = "fluid.column_tags"
-
 #: Unity Catalog's identifier length limit.
 _MAX_NAME = 255
 
@@ -129,6 +124,10 @@ _PROPERTY_KEYS = frozenset({"sql", "language", "tags", "labels"})
 _LEADING_COMMENT_RE = re.compile(r"\A\s*(?:--[^\n]*(?:\n|\Z)|/\*.*?\*/)", re.S)
 _QUERY_START_RE = re.compile(r"\A\s*(?:select|with|from|values|table)\b|\A\s*\(", re.I)
 _SAFE_TEXT_RE = re.compile(r"[^A-Za-z0-9_.:-]")
+
+
+def _WORD_CHAR(char: str) -> bool:  # noqa: N802 - reads as the lexer's character class
+    return char.isalnum() or char == "_"
 
 
 @dataclass(frozen=True)
@@ -281,9 +280,11 @@ def _left_open(sql: str) -> Optional[str]:
             end = sql.find("\n", i)
             i = n if end < 0 else end + 1
         elif char in ("'", '"'):
+            # A raw literal (r'...' / R"...") has no escapes: a backslash is itself.
+            raw = i > 0 and sql[i - 1] in "rR" and (i < 2 or not _WORD_CHAR(sql[i - 2]))
             i += 1
             while i < n and sql[i] != char:
-                i += 2 if sql[i] == "\\" else 1
+                i += 2 if sql[i] == "\\" and not raw else 1
             if i >= n:
                 return f"a {char} string"
             i += 1
@@ -563,8 +564,24 @@ def _written_rules(table: Any) -> Dict[str, Mapping[str, Any]]:
     }
 
 
+def _duplicate_rule_ids(table: Any) -> Set[str]:
+    """Rule ids (lower-cased) that more than one of the expose's dq rules uses."""
+    spec = table.exposure.get("contract") or {}
+    dq = spec.get("dq") if isinstance(spec, Mapping) else None
+    seen: Dict[str, int] = {}
+    for rule in ((dq or {}).get("rules") or []) if isinstance(dq, Mapping) else []:
+        if isinstance(rule, Mapping) and rule.get("id") is not None:
+            key = str(rule.get("id")).strip().lower()
+            seen[key] = seen.get(key, 0) + 1
+    return {key for key, count in seen.items() if count > 1}
+
+
 def _severity(rule: Mapping[str, Any], check: DqCheck) -> str:
-    """The rule's severity as written; ``dq_checks``' level when it is not one of four."""
+    """The rule's severity as written (``DqCheck.rule_severity`` when the reader carries it,
+    else the rule itself); ``dq_checks``' level when it is not one of four."""
+    carried = str(getattr(check, "rule_severity", "") or "").strip().lower()
+    if carried in _SEVERITIES:
+        return carried
     severity = str(rule.get("severity") or "").strip().lower()
     if severity in _SEVERITIES:
         return severity
@@ -622,12 +639,23 @@ def _rules(
             _refusal("rule-unexpressible", f"{table.where}: {refusal.message}", refusal.fix)
         )
     written = _written_rules(table)
+    duplicates = _duplicate_rule_ids(table)
+    for rule_id in sorted(duplicates):
+        refusals.append(
+            _refusal(
+                "rule-id",
+                f"{table.where}: more than one dq rule has the id {rule_id!r} (ids name the "
+                "expectations, which Databricks compares without case), so one would take the "
+                "other's severity.",
+                "Give each rule an id of its own.",
+            )
+        )
     known = {column["name"] for column in table.columns}
     grouped: Dict[str, List[DqCheck]] = {}
     referenced: Dict[str, str] = {}
     refused: Set[str] = set()
     for check in read.checks:
-        if check.rule_id in refused:
+        if check.rule_id in refused or check.rule_id.lower() in duplicates:
             continue
         severity = _severity(written.get(check.rule_id) or {}, check)
         problem = _check_problem(check, severity, known, table) or _view_problem(table, check)
@@ -661,8 +689,6 @@ def render_pipeline_sql(
     *,
     product: str,
     build_id: str,
-    table_tags: Sequence[Tuple[str, str]] = (),
-    column_tags: Sequence[Tuple[str, str, str]] = (),
     refusals: Optional[List[UnsupportedBindingError]] = None,
 ) -> str:
     """The pipeline's source: one check view per whole-table check, then the table with one
@@ -695,12 +721,7 @@ def render_pipeline_sql(
     clauses = []
     if table.comment is not None:
         clauses.append("COMMENT " + _literal(table.comment, "table comment", where, refusals))
-    properties = [
-        ("fluid.product_id", product),
-        ("fluid.build_id", build_id),
-        (TAGS_PROPERTY, ",".join(key for key, _ in table_tags)),
-        (COLUMN_TAGS_PROPERTY, ",".join(sorted({column for column, _, _ in column_tags}))),
-    ]
+    properties = [("fluid.product_id", product), ("fluid.build_id", build_id)]
     clauses.append(
         "TBLPROPERTIES (\n"
         + ",\n".join(
@@ -736,16 +757,19 @@ def render_pipeline_sql(
 
 def _databricks_table_with(expose: Mapping[str, Any], column: str) -> Optional[str]:
     """``catalog.schema.table`` of an expose bound to a Databricks table with ``column``."""
-    binding = expose.get("binding") or {}
-    if canonical_cloud(binding.get("platform")) != "databricks":
+    binding = expose.get("binding")
+    if not isinstance(binding, Mapping) or canonical_cloud(binding.get("platform")) != "databricks":
         return None
-    schema = (expose.get("contract") or {}).get("schema") or []
-    if not any(
+    spec = expose.get("contract")
+    schema = spec.get("schema") if isinstance(spec, Mapping) else None
+    if not isinstance(schema, list) or not any(
         isinstance(c, Mapping) and str(c.get("name") or "").lower() == column.lower()
         for c in schema
     ):
         return None
-    location = binding.get("location") or {}
+    location = binding.get("location")
+    if not isinstance(location, Mapping):
+        return None
     parts = [str(location.get(k) or "").strip().lower() for k in ("database", "schema", "table")]
     try:
         return ".".join(validate_ident(part) for part in parts)
@@ -896,8 +920,6 @@ def compile_lakeflow_pipelines(
             referenced,
             product=product,
             build_id=build_id,
-            table_tags=table_tag_pairs,
-            column_tags=column_tag_pairs,
             refusals=compiled.refusals,
         )
         if len(compiled.refusals) > before:
@@ -1011,13 +1033,11 @@ def _emit(
 
 __all__ = [
     "CHANNEL",
-    "COLUMN_TAGS_PROPERTY",
     "RETRY_SETTING",
     "CompiledPipelines",
     "LakeflowPipeline",
     "ON_TABLE_VIOLATION",
     "ON_VIOLATION",
-    "TAGS_PROPERTY",
     "compile_lakeflow_pipelines",
     "lakeflow_written_exposes",
     "render_pipeline_sql",

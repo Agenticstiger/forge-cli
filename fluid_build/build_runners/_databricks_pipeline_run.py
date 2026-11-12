@@ -10,30 +10,29 @@ succeeded, as it hands a Databricks dbt job to ``_databricks_job_run.py``:
 
 1. The pipeline is the one this apply's OpenTofu state holds for the build, found by the tags
    the emitter puts on it (``fluid_product``, ``fluid_build``; :func:`pipelines_in_state`).
-2. Before the update, the table's ``fluid.tags`` and ``fluid.column_tags`` properties (the tag
-   keys the previous run set, which the definition records) are read, so tags the contract no
-   longer has can be removed afterwards.
-3. One update starts now (``POST /api/2.0/pipelines/{id}/updates``); ``replace-and-build`` asks
+2. One update starts now (``POST /api/2.0/pipelines/{id}/updates``); ``replace-and-build`` asks
    for a full refresh. A pipeline that is already updating is not started twice: the build
    fails, naming the update that runs.
-4. The update is polled until it is ``COMPLETED``, ``FAILED`` or ``CANCELED``
+3. The update is polled until it is ``COMPLETED``, ``FAILED`` or ``CANCELED``
    (``GET /api/2.0/pipelines/{id}/updates/{update_id}``): a line for every state it enters,
    and a line a minute while nothing changes.
-5. The update's event log (``GET /api/2.0/pipelines/{id}/events``) gives each expectation's
+4. The update's event log (``GET /api/2.0/pipelines/{id}/events``) gives each expectation's
    passed and failed records and each dataset's dropped records (``flow_progress``
    ``data_quality``): one line per rule, as the pipeline graph's Data quality tab shows them.
    A ``FAIL UPDATE`` rule that failed records nothing (Lakeflow writes no metrics for it), so
    the update's own error says which rule stopped it.
-6. A completed update sets the table's tags and its columns' ``fluid_sensitivity`` tags as
-   the contract declares them, and removes the ones step 2 found that it no longer declares
-   (the tags a table forge-cli owns gets from OpenTofu; on a pipeline's table they wait for
-   the table to exist, and survive later updates). A tag that cannot be set fails the build.
+5. A completed update sets the table's tags and its columns' tags as the contract declares
+   them (the tags a table forge-cli owns gets from OpenTofu; on a pipeline's table they wait
+   for the table to exist, and survive later updates). A tag on the table or a column that the
+   contract does not declare is removed when the deploying identity set it (the tag API's
+   ``updated_by``), so a label the contract dropped goes, whatever ran the updates since, and
+   a tag a steward set stays. A tag that cannot be set or removed fails the build.
 
 A ``FAILED`` or ``CANCELED`` update fails the build with the event log's errors, credentials
 masked. The wait is capped as a job run's is (``FLUID_DATABRICKS_RUN_TIMEOUT_SECONDS``, an hour
 by default); at the cap, and on Ctrl-C, SIGTERM or SIGHUP, the update is stopped
 (``POST /api/2.0/pipelines/{id}/stop``) before the build fails. A continuous pipeline is
-never started here: Databricks keeps it running.
+never started here (Databricks keeps it running): its tags are set, once its table exists.
 
 The polling, the interrupt handling and the printing are the job runner's
 (``_databricks_job_run.py``, after databricks-sdk-py's waiters); the update states and the
@@ -58,7 +57,6 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
-    Set,
     Tuple,
 )
 from urllib.parse import quote as url_quote
@@ -106,14 +104,14 @@ class PipelineRef:
 def started_pipeline_builds(
     contract: Mapping[str, Any], build_id: Optional[str]
 ) -> List[Mapping[str, Any]]:
-    """The lakeflow builds a ``-and-build`` apply of ``contract`` starts an update of: every
-    one that is not continuous (``build_id`` empty), or the one ``build_id`` names."""
+    """The lakeflow builds a ``-and-build`` apply of ``contract`` runs: every one
+    (``build_id`` empty), or the one ``build_id`` names. A triggered one gets an update; a
+    continuous one, which Databricks keeps running, only its tags."""
     return [
         build
         for build in contract.get("builds") or []
         if isinstance(build, Mapping)
         and is_lakeflow_build(build)
-        and not is_continuous_build(dict(build))
         and (not build_id or build.get("id") == build_id)
     ]
 
@@ -185,9 +183,13 @@ def run_pipeline_build(
     name = f"fluid {product} {build_id}"
     full_refresh = (mode or "").strip().lower() in _REPLACE_MODES
     how = " (full refresh)" if full_refresh else ""
+    continuous = is_continuous_build(dict(build))
     if dry_run:
         _say(
-            f"\n🔍 [DRY RUN] Build '{build_id}' - would start an update{how} of Lakeflow "
+            f"\n🔍 [DRY RUN] Build '{build_id}' - would set the tags of continuous Lakeflow "
+            f"pipeline '{name}' (Databricks keeps it running)."
+            if continuous
+            else f"\n🔍 [DRY RUN] Build '{build_id}' - would start an update{how} of Lakeflow "
             f"pipeline '{name}' and wait for it."
         )
         return 0
@@ -223,6 +225,8 @@ def run_pipeline_build(
             f"'{name}': {_failure(exc)}"
         )
         return 1
+    if continuous:
+        return tag_running_pipeline(client, compiled, build_id=build_id, name=name)
     return update_and_wait(
         client,
         refs[0],
@@ -234,6 +238,32 @@ def run_pipeline_build(
         sleep=sleep,
         clock=clock,
     )
+
+
+def tag_running_pipeline(
+    client: Any, compiled: Any, *, build_id: str, name: str, say: Optional[Say] = None
+) -> int:
+    """A continuous pipeline's tags: Databricks keeps it running, so no update is started;
+    once its table exists, its tags are set as after an update. Returns 0 or 1."""
+    say = say or _say
+    api = client.api_client
+    try:
+        api.do("GET", f"{_TABLES}/{url_quote(compiled.table, safe='')}")
+    except Exception:  # noqa: BLE001 - not there yet (or not readable): nothing to tag now
+        say(
+            f"\n⏭️  Build '{build_id}' - continuous Lakeflow pipeline '{name}' runs in "
+            f"Databricks; {compiled.table} is not there yet, so its tags are set by the next "
+            "apply after its first update."
+        )
+        return 0
+    say(f"\n⏭️  Build '{build_id}' - continuous Lakeflow pipeline '{name}' runs in Databricks")
+    problems = _sync_tags(api, compiled, say)
+    if problems:
+        console_error(
+            f"Build '{build_id}' - the table's tags could not all be set: {'; '.join(problems)}."
+        )
+        return 1
+    return 0
 
 
 def update_and_wait(
@@ -253,40 +283,44 @@ def update_and_wait(
     say = say or _say
     api = client.api_client
     label = f"Lakeflow pipeline '{name}' ({pipeline.pipeline_id})"
-    previous = _recorded_tags(api, compiled.table)
     override, raw = _timeout_override(env)
     budget = override or DEFAULT_TIMEOUT_SECONDS
-    try:
-        started = (
-            api.do(
-                "POST",
-                f"{_PIPELINES}/{pipeline.pipeline_id}/updates",
-                body={"full_refresh": full_refresh},
+    # One guard from the start request to the end of the wait: a Ctrl-C or SIGTERM while the
+    # request is in flight stops what it may have started (the pipeline is known before the
+    # update is), and one while the update runs stops it.
+    with _stopped_if_interrupted(api, pipeline.pipeline_id, say):
+        try:
+            started = (
+                api.do(
+                    "POST",
+                    f"{_PIPELINES}/{pipeline.pipeline_id}/updates",
+                    body={"full_refresh": full_refresh},
+                )
+                or {}
             )
-            or {}
+            update_id = str(started["update_id"])
+        except Exception as exc:  # noqa: BLE001
+            console_error(
+                f"Build '{build_id}' - could not start an update of {label}: {_failure(exc)}"
+            )
+            if pipeline.url:
+                say(f"   pipeline page: {clean(pipeline.url)}")
+            return 1
+        LOG.debug(
+            "lakeflow_update_started pipeline_id=%s update_id=%s", pipeline.pipeline_id, update_id
         )
-        update_id = str(started["update_id"])
-    except Exception as exc:  # noqa: BLE001
-        console_error(f"Build '{build_id}' - could not start an update of {label}: {_failure(exc)}")
+        say(
+            f"\n🚀 Build '{build_id}' - started update {update_id}"
+            f"{' (full refresh)' if full_refresh else ''} of {label}"
+        )
         if pipeline.url:
             say(f"   pipeline page: {clean(pipeline.url)}")
-        return 1
-    LOG.debug(
-        "lakeflow_update_started pipeline_id=%s update_id=%s", pipeline.pipeline_id, update_id
-    )
-    say(
-        f"\n🚀 Build '{build_id}' - started update {update_id}"
-        f"{' (full refresh)' if full_refresh else ''} of {label}"
-    )
-    if pipeline.url:
-        say(f"   pipeline page: {clean(pipeline.url)}")
-    if raw and override is None:
-        say(
-            f"   {TIMEOUT_ENV}={clean(raw)!r} is not a whole number of seconds above 0: "
-            f"waiting up to {_duration(budget)}"
-        )
-    start = clock()
-    with _stopped_if_interrupted(api, pipeline.pipeline_id, say):
+        if raw and override is None:
+            say(
+                f"   {TIMEOUT_ENV}={clean(raw)!r} is not a whole number of seconds above 0: "
+                f"waiting up to {_duration(budget)}"
+            )
+        start = clock()
         state = _wait(
             api, pipeline.pipeline_id, update_id, build_id, budget, start, say, sleep, clock
         )
@@ -299,7 +333,7 @@ def update_and_wait(
         for message in _errors(events)[:_ERRORS_SHOWN]:
             say(f"   {message}")
         return 1
-    problems = _sync_tags(api, compiled, previous, say)
+    problems = _sync_tags(api, compiled, say)
     if problems:
         console_error(
             f"Build '{build_id}' - update {update_id} completed, but the table's tags could not "
@@ -397,6 +431,17 @@ def _stop(api: Any, pipeline_id: str, say: Say) -> bool:
     return True
 
 
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _count(value: Any) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _update_events(api: Any, pipeline_id: str, update_id: str) -> List[Mapping[str, Any]]:
     """The update's events, oldest first: newest-first pages until the update's own start
     (``create_update``) or :data:`_EVENT_PAGES` pages. A read that fails ends the reading."""
@@ -407,23 +452,24 @@ def _update_events(api: Any, pipeline_id: str, update_id: str) -> List[Mapping[s
         if token:
             query["page_token"] = token
         try:
-            got = api.do("GET", f"{_PIPELINES}/{pipeline_id}/events", query=query) or {}
+            got = _mapping(api.do("GET", f"{_PIPELINES}/{pipeline_id}/events", query=query))
         except Exception as exc:  # noqa: BLE001 - the report says what could not be read
             LOG.debug("lakeflow_events_unread pipeline_id=%s error=%s", pipeline_id, exc)
             break
-        page = [e for e in got.get("events") or [] if isinstance(e, Mapping)]
-        mine = [e for e in page if (e.get("origin") or {}).get("update_id") == update_id]
+        raw = got.get("events")
+        page = [e for e in raw if isinstance(e, Mapping)] if isinstance(raw, list) else []
+        mine = [e for e in page if _mapping(e.get("origin")).get("update_id") == update_id]
         events.extend(mine)
         if any(e.get("event_type") == "create_update" for e in mine):
             break
-        token = got.get("next_page_token")
+        token = got.get("next_page_token") if isinstance(got.get("next_page_token"), str) else None
         if not token:
             break
     return list(reversed(events))
 
 
 def quality(
-    events: Iterable[Mapping[str, Any]]
+    events: Iterable[Mapping[str, Any]],
 ) -> Tuple[Dict[Tuple[str, str], Tuple[int, int]], Dict[str, int]]:
     """``({(dataset, expectation): (passed, failed)}, {dataset: dropped})`` from an update's
     ``flow_progress`` events. A batch flow reports its counts once, possibly repeated; the
@@ -433,27 +479,28 @@ def quality(
     for event in events:
         if event.get("event_type") != "flow_progress":
             continue
-        progress = ((event.get("details") or {}).get("flow_progress")) or {}
-        data_quality = progress.get("data_quality") if isinstance(progress, Mapping) else None
+        progress = _mapping(_mapping(event.get("details")).get("flow_progress"))
+        data_quality = progress.get("data_quality")
         if not isinstance(data_quality, Mapping):
             continue
-        for item in data_quality.get("expectations") or []:
+        items = data_quality.get("expectations")
+        for item in items if isinstance(items, list) else ():
             if not isinstance(item, Mapping):
                 continue
             key = (str(item.get("dataset") or ""), str(item.get("name") or ""))
-            passed, failed = int(item.get("passed_records") or 0), int(
-                item.get("failed_records") or 0
-            )
+            passed, failed = _count(item.get("passed_records")), _count(item.get("failed_records"))
             seen = counts.get(key, (0, 0))
             counts[key] = (max(seen[0], passed), max(seen[1], failed))
-        flow = str((event.get("origin") or {}).get("flow_name") or "")
+        flow = str(_mapping(event.get("origin")).get("flow_name") or "")
         if flow:
-            dropped[flow] = max(dropped.get(flow, 0), int(data_quality.get("dropped_records") or 0))
+            dropped[flow] = max(dropped.get(flow, 0), _count(data_quality.get("dropped_records")))
     return counts, dropped
 
 
 def _report_quality(events: Sequence[Mapping[str, Any]], compiled: Any, say: Say) -> None:
-    """One line per rule: its dataset, severity and counts, or why there are none."""
+    """One line per rule: its dataset, severity and counts, or why there are none. A rule
+    with failures is marked ⚠ when it only counts them (info, warn) and ✗ when it drops the
+    rows or fails the update (error, critical)."""
     counts, dropped = quality(events)
     if not compiled.expectations:
         return
@@ -463,13 +510,13 @@ def _report_quality(events: Sequence[Mapping[str, Any]], compiled: Any, say: Say
         short = dataset.rsplit(".", 1)[-1]
         got = counts.get((dataset, rule))
         if got is None:
-            line = "no counts (a FAIL UPDATE rule that failed, or a dataset not updated)"
+            line, mark = "no counts (a FAIL UPDATE rule that failed, or a dataset not updated)", "?"
         else:
             passed, failed = got
             line = f"passed {passed}, failed {failed}"
             if severity == "error" and failed and short == compiled.table.rsplit(".", 1)[-1]:
                 line += f" (dropped {dropped.get(dataset, failed)})"
-        mark = "✓" if got is not None and got[1] == 0 else "✗" if got is not None else "?"
+            mark = "✓" if not failed else "⚠" if severity in ("info", "warn") else "✗"
         say(f"     {mark} {rule.ljust(width)}  {severity:<8} {short}: {line}")
 
 
@@ -480,8 +527,8 @@ def _errors(events: Sequence[Mapping[str, Any]]) -> List[str]:
         if str(event.get("level") or "") != "ERROR":
             continue
         text = " ".join(clean(event.get("message") or "").split())
-        error = (event.get("error") or {}) if isinstance(event.get("error"), Mapping) else {}
-        for exception in error.get("exceptions") or []:
+        exceptions = _mapping(event.get("error")).get("exceptions")
+        for exception in exceptions if isinstance(exceptions, list) else ():
             if isinstance(exception, Mapping) and exception.get("message"):
                 text += " - " + " ".join(clean(exception["message"]).split())
                 break
@@ -490,53 +537,53 @@ def _errors(events: Sequence[Mapping[str, Any]]) -> List[str]:
     return out
 
 
-def _recorded_tags(api: Any, table: str) -> Tuple[Set[str], Set[str]]:
-    """``(table tag keys, tagged columns)`` the previous run recorded in the table's
-    properties; empty before the first update (the table does not exist yet)."""
+def _identity(api: Any) -> Optional[str]:
+    """The deploying identity's user name, as the tag API's ``updated_by`` names it; ``None``
+    when it cannot be read (nothing is then removed)."""
     try:
-        got = api.do("GET", f"{_TABLES}/{url_quote(table, safe='')}") or {}
-    except Exception:  # noqa: BLE001 - no table yet, or no read: nothing to remove
-        return set(), set()
-    from fluid_build.iac.providers.databricks_lakeflow import COLUMN_TAGS_PROPERTY, TAGS_PROPERTY
-
-    properties = got.get("properties") or {}
-
-    def keys(name: str) -> Set[str]:
-        return {k for k in str(properties.get(name) or "").split(",") if k}
-
-    return keys(TAGS_PROPERTY), keys(COLUMN_TAGS_PROPERTY)
+        me = _mapping(api.do("GET", "/api/2.0/preview/scim/v2/Me"))
+    except Exception:  # noqa: BLE001 - said by the caller
+        return None
+    name = me.get("userName")
+    return str(name) if name else None
 
 
 def _entity(kind: str, name: str) -> str:
     return f"{_TAGS}/{kind}/{url_quote(name, safe='')}/tags"
 
 
-def _tags_on(api: Any, kind: str, name: str) -> Dict[str, str]:
-    got = api.do("GET", _entity(kind, name)) or {}
+def _tags_on(api: Any, kind: str, name: str) -> Dict[str, Tuple[str, str]]:
+    """The tags set on ``name`` itself (not inherited): key to ``(value, updated_by)``."""
+    got = _mapping(api.do("GET", _entity(kind, name)))
+    items = got.get("tag_assignments")
     return {
-        str(item.get("tag_key")): str(item.get("tag_value") or "")
-        for item in got.get("tag_assignments") or []
-        if isinstance(item, Mapping) and item.get("tag_key")
+        str(item.get("tag_key")): (
+            str(item.get("tag_value") or ""),
+            str(item.get("updated_by") or ""),
+        )
+        for item in (items if isinstance(items, list) else ())
+        if isinstance(item, Mapping) and item.get("tag_key") and not item.get("inherited")
     }
 
 
 def _set_tags(
-    api: Any, kind: str, name: str, wanted: Mapping[str, str], remove: Set[str]
+    api: Any, kind: str, name: str, wanted: Mapping[str, str], me: Optional[str]
 ) -> List[str]:
-    """Make ``name``'s tags hold ``wanted`` and none of ``remove``; what failed."""
+    """Make ``name``'s tags hold ``wanted``, and drop the ones the deploying identity ``me``
+    set that the contract no longer declares; what failed."""
     problems: List[str] = []
     try:
         current = _tags_on(api, kind, name)
     except Exception as exc:  # noqa: BLE001
         return [f"could not read the tags of {name}: {_failure(exc)}"]
-    for key in sorted(remove - set(wanted)):
-        if key in current:
-            try:
-                api.do("DELETE", f"{_entity(kind, name)}/{url_quote(key, safe='')}")
-            except Exception as exc:  # noqa: BLE001
-                problems.append(f"{key} on {name}: {_failure(exc)}")
+    stale = sorted(k for k, (_v, by) in current.items() if k not in wanted and me and by == me)
+    for key in stale:
+        try:
+            api.do("DELETE", f"{_entity(kind, name)}/{url_quote(key, safe='')}")
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"{key} on {name}: {_failure(exc)}")
     for key, value in sorted(wanted.items()):
-        if current.get(key) == value:
+        if key in current and current[key][0] == value:
             continue
         try:
             if key in current:
@@ -551,23 +598,21 @@ def _set_tags(
     return problems
 
 
-def _sync_tags(api: Any, compiled: Any, previous: Tuple[Set[str], Set[str]], say: Say) -> List[str]:
-    """Set the table's and its columns' tags as the contract declares them; remove the ones
-    the previous run set that it no longer declares."""
-    table_keys, tagged_columns = previous
+def _sync_tags(api: Any, compiled: Any, say: Say) -> List[str]:
+    """Set the table's and its columns' tags as the contract declares them, and remove the
+    ones the deploying identity set that it no longer declares (on the table and on every
+    column the table has)."""
+    me = _identity(api)
+    if me is None:
+        say("   could not read the deploying identity: tags no longer declared are left in place")
     wanted = dict(compiled.table_tags)
-    problems = _set_tags(api, "tables", compiled.table, wanted, table_keys)
+    problems = _set_tags(api, "tables", compiled.table, wanted, me)
     on_columns: Dict[str, Dict[str, str]] = {}
     for column, key, value in compiled.column_tags:
         on_columns.setdefault(column, {})[key] = value
-    # A recorded column the table no longer has took its tags with it.
-    for column in sorted(set(on_columns) | (tagged_columns & set(compiled.columns))):
+    for column in compiled.columns or sorted(on_columns):
         problems += _set_tags(
-            api,
-            "columns",
-            f"{compiled.table}.{column}",
-            on_columns.get(column, {}),
-            {"fluid_sensitivity"},
+            api, "columns", f"{compiled.table}.{column}", on_columns.get(column, {}), me
         )
     if not problems:
         say(
@@ -583,5 +628,6 @@ __all__ = [
     "quality",
     "run_pipeline_build",
     "started_pipeline_builds",
+    "tag_running_pipeline",
     "update_and_wait",
 ]

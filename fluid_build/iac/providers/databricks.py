@@ -1905,11 +1905,16 @@ def _schema_holds_only(
     name at plan time (provider 1.140.0, ``catalog/data_tables.go``); a schema this apply
     creates is read at apply, empty. The names interpolated passed ``_ident``."""
     key = f"{schema_key}_tables"
-    compiled.data.setdefault("databricks_tables", {})[key] = {
+    listing = {
         "catalog_name": catalog_name,
         "schema_name": tofu_ref(f"databricks_schema.{schema_key}.name"),
     }
-    others = f'setsubtract(data.databricks_tables.{key}.ids, ["{table.full_name}"])'
+    # Tables and views: the provider lists views apart (``data.databricks_views``), and a
+    # SELECT on the schema reads another team's view, and through it the data behind it.
+    compiled.data.setdefault("databricks_tables", {})[key] = dict(listing)
+    compiled.data.setdefault("databricks_views", {})[key] = dict(listing)
+    both = f"setunion(data.databricks_tables.{key}.ids, data.databricks_views.{key}.ids)"
+    others = f'setsubtract({both}, ["{table.full_name}"])'
     return {
         "condition": tofu_ref(f"length({others}) == 0"),
         "error_message": TofuExpr(
@@ -2529,8 +2534,16 @@ def _use_catalog_notices(compiled: _Compiled) -> List[str]:
     ``fluid verify`` checks it.
     """
     readers: Dict[str, List[str]] = {}
-    for kind, full_name, principal, _privileges in compiled.grants:
-        if kind == "table":
+    # A pipeline's table is read through SELECT on its schema (``_emit_pipeline_table``).
+    pipeline_schemas = {
+        f"{t.catalog}.{t.schema}"
+        for t in compiled.tables
+        if t.full_name in compiled.lakeflow_written
+    }
+    for kind, full_name, principal, privileges in compiled.grants:
+        if kind == "table" or (
+            kind == "schema" and "SELECT" in privileges and full_name in pipeline_schemas
+        ):
             catalog = full_name.split(".")[0]
             if principal not in readers.setdefault(catalog, []):
                 readers[catalog].append(principal)
