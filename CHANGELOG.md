@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A Databricks AI/BI Genie space for a data product.** With `extensions.databricksGenie: {}`
+  (or `{title: ...}`) in a contract with Databricks table exposes, `fluid apply` creates the
+  product's Genie space once its tables, masks and row filters are in place. The space holds
+  the tables, with each column's description, allowed values, range, example and synonyms from
+  the contract, and every metric view over them. `semantics.labels.ai-example-questions`
+  become its sample questions. Its one instruction is built from `ai-instructions`,
+  `ai-synonyms`, the grain, the key, the snapshot rule, each metric's definition and SQL, the
+  `consumes` lineage, and the expose's `agentPolicy` (allowed and denied use cases, purpose
+  limitation). The principals with `SELECT` get `CAN RUN` on it. A space never widens access:
+  Genie answers as the person asking, under their Unity Catalog grants. Prompt matching, which
+  samples values with the author's permissions, is never turned on. A product whose
+  `agentPolicy` rules out question answering (`qa`) is refused at `fluid validate`. A re-apply
+  finds the space by a `[fluid-genie:<product id>]` marker in its description and updates it
+  with its `etag`, a second apply changes nothing, and removing the block trashes the space.
+  `fluid apply --mode dry-run` prints what would change. The space is made through the Genie
+  REST API (the `[databricks]` extra), since the databricks/databricks provider has no Genie
+  space resource. One space per product; a space over several products is a follow-up.
+
 ### Fixed
 
 - **`fluid ai models --provider` works, and takes the names `fluid forge --llm-provider`
