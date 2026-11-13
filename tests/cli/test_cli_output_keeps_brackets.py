@@ -140,10 +140,11 @@ def test_validate_json_is_unchanged(tmp_path, capsys):
     assert doc["errors"][0].startswith("exposes[orders] declares governance.lakeFormation")
 
 
-def _result(errors, warnings) -> SimpleNamespace:
+def _result(errors, warnings, notes=()) -> SimpleNamespace:
     return SimpleNamespace(
         errors=list(errors),
         warnings=list(warnings),
+        notes=list(notes),
         is_valid=not errors,
         schema_version="0.7.5",
         validation_time=0.0,
@@ -156,7 +157,7 @@ def test_validate_prints_markup_like_messages_verbatim(capsys, quiet):
     args = SimpleNamespace(quiet=quiet, verbose=False, strict=False)
 
     validate_mod._output_text_results(
-        _result([f"error: {MARKUP_LIKE}"], [f"warning: {MARKUP_LIKE}"]),
+        _result([f"error: {MARKUP_LIKE}"], [f"warning: {MARKUP_LIKE}"], [f"note: {MARKUP_LIKE}"]),
         args,
         logging.getLogger("test"),
     )
@@ -165,6 +166,7 @@ def test_validate_prints_markup_like_messages_verbatim(capsys, quiet):
     assert f"error: {MARKUP_LIKE}" in out
     if not quiet:
         assert f"warning: {MARKUP_LIKE}" in out
+        assert f"note: {MARKUP_LIKE}" in out
 
 
 def test_validate_bundle_issue_keeps_its_severity(monkeypatch, tmp_path, capsys):

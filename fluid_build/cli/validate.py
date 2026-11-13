@@ -1661,21 +1661,12 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
         if not args.quiet:
             cprint()
 
-    # Warnings
-    if result.warnings and not args.quiet:
-        cprint("Validation Warnings:")
-        cprint("====================")
-        for i, warning in enumerate(result.warnings, 1):
-            _cprint_literal(f"{i:2}. {warning}")
-        cprint()
-
-    # Notes ask nothing of the author, so --strict never counts them (exit code below).
-    if result.notes and not args.quiet:
-        cprint("Validation Notes:")
-        cprint("=================")
-        for i, note in enumerate(result.notes, 1):
-            _cprint_literal(f"{i:2}. {note}")
-        cprint()
+    # Warnings, then notes: a note asks nothing of the author, so --strict never counts one.
+    if not args.quiet:
+        if result.warnings:
+            _print_numbered("Validation Warnings:", result.warnings)
+        if result.notes:
+            _print_numbered("Validation Notes:", result.notes)
 
     # Verbose information
     if args.verbose and not args.quiet:
@@ -1698,6 +1689,15 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
         return 1
     else:
         return 0
+
+
+def _print_numbered(title: str, items: List[str]) -> None:
+    """``title``, underlined, each item numbered from 1, then a blank line."""
+    cprint(title)
+    cprint("=" * len(title))
+    for i, item in enumerate(items, 1):
+        _cprint_literal(f"{i:2}. {item}")
+    cprint()
 
 
 def _explain_strict_failure(warnings: List[str], quiet: bool) -> None:
@@ -1960,13 +1960,8 @@ def _run_bundle_validation(
             f"({s.get('error', 0)} error, {s.get('warning', 0)} warning, "
             f"{s.get('info', 0)} info)"
         )
-        # A bundle that passes still lists its warnings and its contract's notes, as a
-        # contract file does.
         for issue in report.issues:
-            listed = issue.severity == "warning" or (
-                issue.severity == "info" and issue.code == "CONTRACT-RULE"
-            )
-            if verbose or report.status == "fail" or listed:
+            if verbose or report.status == "fail" or _listed_on_pass(issue):
                 _cprint_literal(f"   [{issue.severity}] {_bundle_issue_text(issue)}")
         if strict and not any(issue.severity == "error" for issue in report.issues):
             warnings = [_bundle_issue_text(i) for i in report.issues if i.severity == "warning"]
@@ -1992,6 +1987,14 @@ def _run_bundle_validation(
 
 #: The report code of an overlay warning ``fluid bundle --env`` recorded.
 _OVERLAY_WARNING_CODE = "OVERLAY-WARNING"
+
+
+def _listed_on_pass(issue: Any) -> bool:
+    """Whether a bundle that passes lists ``issue``: its warnings and its contract's notes,
+    as a contract file does. The bundle validators' own info stays under ``--verbose``."""
+    return issue.severity == "warning" or (
+        issue.severity == "info" and issue.code == "CONTRACT-RULE"
+    )
 
 
 def _bundle_issue_text(issue: Any) -> str:
@@ -2139,35 +2142,16 @@ def _bundle_contract_rule_issues(
     _run_extension_validators(contract, result, logger)
     _run_role_validators(contract, result, logger)
 
-    issues = [
+    # A note is the report's info: counted and listed, never failed on by --strict.
+    found = (("error", result.errors), ("warning", result.warnings), ("info", result.notes))
+    return [
         ValidationIssue(
             file="contract.resolved.yaml",
             validator="contract",
-            severity="error",
+            severity=severity,
             message=msg,
             code="CONTRACT-RULE",
         )
-        for msg in result.errors
+        for severity, messages in found
+        for msg in messages
     ]
-    issues.extend(
-        ValidationIssue(
-            file="contract.resolved.yaml",
-            validator="contract",
-            severity="warning",
-            message=msg,
-            code="CONTRACT-RULE",
-        )
-        for msg in result.warnings
-    )
-    # A note is the report's info: counted, listed, never failed on by --strict.
-    issues.extend(
-        ValidationIssue(
-            file="contract.resolved.yaml",
-            validator="contract",
-            severity="info",
-            message=msg,
-            code="CONTRACT-RULE",
-        )
-        for msg in result.notes
-    )
-    return issues
