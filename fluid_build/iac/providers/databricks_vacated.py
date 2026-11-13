@@ -167,6 +167,12 @@ def _contents(
             {**query, "include_browse": "true"},
             "tables",
         )
+        listed = _list_named(session.client, "/api/2.1/unity-catalog/functions", query, "functions")
+    except Exception as exc:  # noqa: BLE001 — a missing schema is an answer; the rest is raised on
+        if _enforce.is_not_found(exc):
+            return None
+        raise
+    try:
         # Metric views are listed by table-summaries (databricks_metrics._schema_views reads
         # them there): every name either listing gives is read.
         summaries = _list_named(
@@ -175,11 +181,10 @@ def _contents(
             {"catalog_name": catalog, "schema_name_pattern": schema, "table_name_pattern": "%"},
             "tables",
         )
-        listed = _list_named(session.client, "/api/2.1/unity-catalog/functions", query, "functions")
-    except Exception as exc:  # noqa: BLE001 — a missing schema is an answer; the rest is raised on
-        if _enforce.is_not_found(exc):
-            return None
-        raise
+    except Exception as exc:  # noqa: BLE001 — an answer only when it is "not found"
+        if not _enforce.is_not_found(exc):
+            raise
+        summaries = []  # the Tables list alone, which found the schema
     names = {str(row.get("full_name") or f"{where}.{row.get('name')}") for row in rows}
     # The pattern is a SQL LIKE, so `_` matches any character: keep this schema's rows only.
     names |= {

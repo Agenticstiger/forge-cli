@@ -19,7 +19,8 @@ refuses it), ALTER TABLE SET / DROP ROW FILTER, ALTER COLUMN SET / DROP MASK, an
 The bindings are served on the table (``row_filter``, ``columns[].mask``) as Unity Catalog serves
 them, and a CREATE OR REPLACE TABLE keeps them (Databricks docs: REPLACE preserves row filters
 and column masks). A schema that still holds a table, a view, a function or a volume is not
-deleted (``Schema is not empty``), as Unity Catalog refuses it. The key constraints forge-cli declares (``databricks_keys.py``): ALTER TABLE
+deleted (``Schema is not empty``), as Unity Catalog refuses it. The key constraints forge-cli
+declares (``databricks_keys.py``): ALTER TABLE
 ADD CONSTRAINT ... PRIMARY KEY / FOREIGN KEY ... REFERENCES and DROP CONSTRAINT [IF EXISTS],
 served as ``table_constraints``, with the rules and error texts a warehouse showed (a key needs
 NOT NULL columns, a foreign key its parent's primary key, a referenced primary key does not

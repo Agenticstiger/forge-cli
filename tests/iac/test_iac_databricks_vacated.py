@@ -416,3 +416,12 @@ def test_a_metric_view_only_table_summaries_lists_is_still_found(fake):
     run.deploy(_contract())
     run.prepare(client_factory=lambda: _TablesListWithoutViews(fake.client()))
     assert VIEW not in fake.tables
+
+
+def test_a_table_summaries_listing_that_is_not_found_falls_back_to_the_tables_list(fake):
+    run = Run(fake)
+    run.deploy(_contract())
+    fake.fail_route("GET", r"^/api/2\.1/unity-catalog/table-summaries$", 404, "not here")
+    run.prepare()
+    assert VIEW not in fake.tables
+    assert "not checked" not in run.text
