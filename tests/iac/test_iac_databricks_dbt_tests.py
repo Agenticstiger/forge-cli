@@ -634,10 +634,10 @@ class TestRendering:
         sql, _, _ = _render(text, columns)
         rows = [line for line in sql.splitlines() if line.startswith("select ")]
         assert rows == [
-            "select 'amount' as column_name, 'type' as problem, 'decimal(12,2)' as expected_type,"
-            " 'decimal(10,2)' as actual_type",
-            "select 'gone' as column_name, 'missing' as problem, 'string' as expected_type,"
-            " '' as actual_type",
+            "select 'amount' as column_name, 'type' as problem, "
+            + "'decimal(12,2)' as expected_type, 'decimal(10,2)' as actual_type",
+            "select 'gone' as column_name, 'missing' as problem, "
+            + "'string' as expected_type, '' as actual_type",
         ]
         assert "union all" in sql
 
