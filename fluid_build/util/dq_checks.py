@@ -16,14 +16,14 @@ How each rule type reads:
   comma-separated; each gets its own check.
 * ``uniqueness``: ``unique`` on the one selected column. A list is refused: it could mean each
   column or their combination, and ``fluid test`` reads one column too.
-* ``valid_values``: the allowed values live on each selected column, as its
-  ``validationRules`` (``enum`` ``"A | B"`` or ``"A,B"``; ``regex``; ``range`` ``">= 0"``,
-  ``">= 0 and <= 100"`` or ``"between 0 and 100"``) or as its
-  ``labels.references: <product id>.<column>``, the foreign-key convention the Unity Catalog
-  keys read too; ``consumes[]`` says which of that product's exposes holds the column. Each
-  declaration is a check. A column with none falls back to values the rule itself lists (``"<column> valid
-  values: A, B."`` in its description, as ``fluid test`` reads it); with neither, the rule is
-  refused.
+* ``valid_values``: a valid value of each selected column is what ``fluid test`` takes it
+  to be (``providers/quality_engine.py::value_domain``): the values the rule itself lists
+  (``"<column> valid values: A, B."`` in its description), or else every declaration the
+  column makes, which must all hold: its first ``enum`` (``"A | B"`` or ``"A,B"``), ``regex``
+  and ``range`` (``">= 0"``, ``">= 0 and <= 100"`` or ``"between 0 and 100"``)
+  validationRule, and its ``labels.references: <product id>.<column>``, the foreign-key
+  convention the Unity Catalog keys read too; ``consumes[]`` says which of that product's
+  exposes holds the column. Each is a check. With none, the rule is refused.
 * ``accuracy``: every value of each selected column meets ``<operator> <threshold>``, the bound
   ``fluid test`` checks (``providers/quality_engine.py::_check_accuracy``).
 * ``freshness``: the newest value of the one selected date or timestamp column is no older than
@@ -34,10 +34,11 @@ How each rule type reads:
 * ``anomaly_detection`` and ``drift_detection`` compare a table with its own history, which a
   check of the table as it stands cannot do: refused.
 
-``threshold`` is the share of rows that pass, from 0 to 1, computed as ``fluid test`` computes
-it: the non-null share for completeness, the distinct share of non-null values for uniqueness,
-the share of non-null values that are allowed for valid_values. ``1.0`` with ``>=`` or ``==``
-(or no threshold at all) means every row, a per-row check; anything else is a
+``threshold`` is the share of rows that pass, from 0 to 1: the non-null share for
+completeness and the distinct share of non-null values for uniqueness, as ``fluid test``
+computes them, and for valid_values the share of non-null values that are allowed (``fluid
+test`` checks every value of a valid_values rule, whatever its threshold). ``1.0`` with ``>=``
+or ``==`` (or no threshold at all) means every row, a per-row check; anything else is a
 :attr:`DqCheck.share`. Accuracy's threshold is its bound, not a share; freshness and schema
 rules take none.
 
@@ -47,6 +48,7 @@ reported and do not (``warn``), the two levels a dbt test has.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -72,12 +74,10 @@ KINDS = (
 #: The base types a freshness check can measure.
 _TEMPORAL = ("date", "datetime", "smalldatetime", "timestamp")
 
-_NUMBER = r"-?\d+(?:\.\d+)?"
-_BETWEEN_RE = re.compile(rf"^\s*between\s+({_NUMBER})\s+and\s+({_NUMBER})\s*$", re.IGNORECASE)
-_BOUND_RE = re.compile(rf"^\s*(>=|<=|>|<)\s*({_NUMBER})\s*$")
-_AND_RE = re.compile(r"\s+and\s+", re.IGNORECASE)
 _NAME_RE = re.compile(r"[^0-9a-z_]+")
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+#: A control character, or a UTF-16 surrogate with no partner (YAML's "\ud83d" escape
+#: loads one), which no UTF-8 file can hold: refused wherever a rule's text reaches a check.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 
 
 @dataclass(frozen=True)
@@ -122,6 +122,12 @@ class DqCheck:
     strict: bool = False
     #: ``schema``: ``(column, FLUID type)`` for each column that must exist.
     columns: Tuple[Tuple[str, str], ...] = ()
+    #: The rule as written, for an engine with more levels than two (Lakeflow fails an
+    #: update on ``critical`` and drops the row on ``error``) or a report with one row per
+    #: rule: its ``severity`` (lower case), ``threshold`` and ``operator``.
+    rule_severity: str = ""
+    rule_threshold: Optional[float] = None
+    rule_operator: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +141,10 @@ class DqRefusal:
     #: The rule's ``type``: an engine that runs some types another way (Databricks data quality
     #: monitoring learns ``anomaly_detection`` bounds itself) can tell which refusals are its own.
     rule_type: str = ""
+    #: The one refusal such an engine takes over: the rule is judged against the table's
+    #: history. A rule it cannot read either (a bad severity, an id holding a control
+    #: character) is refused with ``needs_history`` false, as any other.
+    needs_history: bool = False
 
 
 @dataclass
@@ -205,34 +215,46 @@ def _unique(check: DqCheck, taken: Set[str]) -> DqCheck:
     return replace(check, name=name)
 
 
+def _finite(value: Any) -> Optional[float]:
+    """``value`` as a finite float; ``None`` for a bool, a non-number, an infinity, NaN, or
+    an integer too large for a float (YAML loads any number of digits)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _empty(bounds: Sequence[Tuple[str, float]]) -> bool:
+    """Whether no number meets every bound (``between 100 and 0``, ``> 5 and < 1``)."""
+    lows = [(v, op == ">") for op, v in bounds if op in (">", ">=")]
+    highs = [(v, op == "<") for op, v in bounds if op in ("<", "<=")]
+    if not lows or not highs:
+        return False
+    low = max(lows, key=lambda b: (b[0], b[1]))
+    high = min(highs, key=lambda b: (b[0], not b[1]))
+    return low[0] > high[0] or (low[0] == high[0] and (low[1] or high[1]))
+
+
 def _number(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else repr(float(value))
 
 
-def parse_enum(constraint: Any) -> List[str]:
-    """An ``enum`` constraint's values: ``"A | B"`` (as the industry packs write it) or
-    ``"A,B"`` (as ``fluid import dbt`` writes it), each stripped, empty ones dropped."""
-    if not isinstance(constraint, str):
-        return []
-    parts = constraint.split("|") if "|" in constraint else constraint.split(",")
-    return [part.strip() for part in parts if part.strip()]
-
-
-def parse_range(constraint: Any) -> Optional[Tuple[Tuple[str, float], ...]]:
-    """A ``range`` constraint's bounds, or ``None`` when it is not one of ``">= 0"``,
-    ``">= 0 and <= 100"`` (any of ``>= > <= <``) or ``"between 0 and 100"``."""
-    if not isinstance(constraint, str) or not constraint.strip():
-        return None
-    between = _BETWEEN_RE.match(constraint)
-    if between is not None:
-        return ((">=", float(between.group(1))), ("<=", float(between.group(2))))
-    bounds = []
-    for part in _AND_RE.split(constraint.strip()):
-        match = _BOUND_RE.match(part)
-        if match is None:
-            return None
-        bounds.append((match.group(1), float(match.group(2))))
-    return tuple(bounds)
+def _declared(column: Mapping[str, Any], kind: str) -> Optional[str]:
+    """The constraint of the column's first ``kind`` validationRule, as ``fluid test`` picks
+    it (``providers/quality_engine.py::_column_constraint``)."""
+    rules = column.get("validationRules")
+    for entry in rules if isinstance(rules, list) else []:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("type") or "").strip().lower() != kind:
+            continue
+        constraint = entry.get("constraint")
+        if isinstance(constraint, str) and constraint.strip():
+            return constraint.strip()
+    return None
 
 
 def describe(check: DqCheck) -> str:
@@ -266,6 +288,13 @@ class _Rule:
     # ── reading ───────────────────────────────────────────────────────────────
 
     def read(self) -> List[DqCheck]:
+        if _CONTROL_RE.search(self.rule_id) or _CONTROL_RE.search(self.expose_id):
+            self.refuse(
+                "has an id (or its expose's) holding a control character or an unpaired "
+                "surrogate",
+                "Write the id in plain text.",
+            )
+            return []
         severity = SEVERITIES.get(str(self.rule.get("severity") or "").strip().lower())
         if severity is None:
             self.refuse(
@@ -284,10 +313,11 @@ class _Rule:
         if reader is None:
             if self.type in ("anomaly_detection", "drift_detection"):
                 self.refuse(
-                    "compares the table with its own history, which a check of the table as it "
-                    "stands cannot do",
-                    "Run it with Databricks data quality monitoring or fluid test, or remove it "
-                    "from this expose.",
+                    "has no check of the table as it stands here: an anomaly or a drift is "
+                    "judged against the table's history",
+                    "Check it with fluid test against the deployed table (it reads an "
+                    "anomaly_detection threshold as a row count), or remove it from this expose.",
+                    needs_history=True,
                 )
             else:
                 self.refuse(
@@ -320,6 +350,9 @@ class _Rule:
                     rule_type=self.type,
                     expose_id=self.expose_id,
                     severity=severity,
+                    rule_severity=str(self.rule.get("severity") or "").strip().lower(),
+                    rule_threshold=self._number_or_none(self.rule.get("threshold")),
+                    rule_operator=self._operator_or_none(),
                     **item,
                 )
             )
@@ -348,30 +381,25 @@ class _Rule:
         share = self._share()
         found: List[Dict[str, Any]] = []
         for name in columns:
-            declared = self._allowed(name)
-            if declared is None:  # refused
-                continue
-            if not declared:
-                declared = self._listed_values(name)
-            for item in declared:
+            for item in self._allowed(name) or []:
                 found.append({**item, "column": name, "share": share})
         return found
 
     def _accuracy(self) -> List[Dict[str, Any]]:
         columns = self._selected(required=True)
-        threshold = self.rule.get("threshold")
+        threshold = _finite(self.rule.get("threshold"))
         operator = self._operator()
-        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        if threshold is None:
             self.refuse(
-                "has no numeric threshold, the bound each value of an accuracy rule meets",
+                "has no finite numeric threshold, the bound each value of an accuracy rule "
+                "meets",
                 "Set threshold to the bound and operator to the comparison (>= 0, say).",
             )
             return []
         if operator is None:
             return []
         return [
-            {"kind": "bounds", "column": c, "bounds": ((operator, float(threshold)),)}
-            for c in columns
+            {"kind": "bounds", "column": c, "bounds": ((operator, threshold),)} for c in columns
         ]
 
     def _freshness(self) -> List[Dict[str, Any]]:
@@ -397,7 +425,10 @@ class _Rule:
         window = self.rule.get("window")
         from fluid_build.providers.quality_engine import parse_duration_seconds
 
-        seconds = parse_duration_seconds(str(window)) if window else None
+        try:
+            seconds = parse_duration_seconds(str(window)) if window else None
+        except (OverflowError, ValueError):
+            seconds = None  # more digits than a duration holds
         if seconds is None:
             self.refuse(
                 f"has window {window!r}, which is not a fixed ISO 8601 duration",
@@ -482,6 +513,14 @@ class _Rule:
         folded = [c for c in self.columns if c.lower() == name.lower()]
         return folded[0] if len(folded) == 1 else None
 
+    @staticmethod
+    def _number_or_none(value: Any) -> Optional[float]:
+        return _finite(value)
+
+    def _operator_or_none(self) -> Optional[str]:
+        raw = self.rule.get("operator")
+        return str(raw).strip() if raw is not None else None
+
     def _operator(self) -> Optional[str]:
         operator = str(self.rule.get("operator") or ">=").strip()
         if operator not in OPERATORS:
@@ -496,14 +535,14 @@ class _Rule:
         threshold = self.rule.get("threshold")
         if threshold is None:
             return None
-        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        value = _finite(threshold)
+        if value is None:
             self.refuse(
-                f"has threshold {threshold!r}, which is not a number",
+                f"has threshold {threshold!r}, which is not a finite number",
                 "Set threshold to the share of rows that must pass, from 0 to 1.",
             )
             return None
         operator = self._operator()
-        value = float(threshold)
         if not 0.0 <= value <= 1.0:
             self.refuse(
                 f"has threshold {threshold}, and a threshold is the share of rows that pass, "
@@ -516,84 +555,88 @@ class _Rule:
         return (operator, value)
 
     def _allowed(self, name: str) -> Optional[List[Dict[str, Any]]]:
-        """What column ``name`` declares as its allowed values; ``None`` after a refusal.
-        A ``custom`` validationRule is no allowed-values declaration and is left alone."""
+        """What a valid value of column ``name`` is, read as ``fluid test`` reads it
+        (``providers/quality_engine.py::value_domain``), each part a check; ``None`` after a
+        refusal, which there is when neither the rule nor the column declares one. A
+        ``custom`` validationRule declares no allowed values."""
+        from fluid_build.providers.quality_engine import extract_valid_values, value_domain
+
+        rule = {**self.rule, "selector": name}
         column = self.columns[name]
         refused = len(self.refusals)
-        readers = {"enum": self._enum, "regex": self._regex, "range": self._range}
-        found: List[Dict[str, Any]] = []
-        rules = column.get("validationRules")
-        for entry in rules if isinstance(rules, list) else []:
-            kind = (
-                str(entry.get("type") or "").strip().lower() if isinstance(entry, Mapping) else ""
+        listed = extract_valid_values(rule)
+        if listed:  # the values the rule lists win, as value_domain has it
+            found = [self._values(name, listed)]
+        else:
+            domain = value_domain(rule, [column])
+            found = [
+                self._values(name, domain.values) if domain.values else None,
+                self._regex(name, domain.pattern) if domain.pattern else None,
+                self._range(name, _declared(column, "range"), domain.bounds),
+                self._labelled_reference(name, column),
+            ]
+        if len(self.refusals) > refused:
+            return None
+        declared = [item for item in found if item is not None]
+        if not declared:
+            self.refuse(
+                f"reads column {name!r}, which declares no allowed values, and the rule lists "
+                "none",
+                f"Declare them on column {name!r}: validationRules [{{type: enum, constraint: "
+                "'A | B'}] (or regex, or range), or labels.references: <product id>.<column> for "
+                "a value that must exist in another product's column.",
             )
-            item = readers[kind](name, entry.get("constraint")) if kind in readers else None
-            if item is not None:
-                found.append(item)
+            return None
+        return declared
+
+    def _values(self, name: str, values: Sequence[Any]) -> Optional[Dict[str, Any]]:
+        texts = tuple(str(value) for value in values)
+        if any(_CONTROL_RE.search(value) for value in texts):
+            self.refuse(
+                f"reads column {name!r}, whose allowed values hold a control character or an "
+                "unpaired surrogate",
+                "Remove it from the value.",
+            )
+            return None
+        return {"kind": "accepted_values", "values": texts}
+
+    def _regex(self, name: str, pattern: str) -> Optional[Dict[str, Any]]:
+        if _CONTROL_RE.search(pattern):
+            self.refuse(
+                f"reads column {name!r}, whose regex holds a control character or an unpaired "
+                "surrogate",
+                "Write it with an escape (\\t, \\n) instead.",
+            )
+            return None
+        return {"kind": "regex", "pattern": pattern}
+
+    def _range(
+        self, name: str, constraint: Optional[str], bounds: Sequence[Tuple[str, float]]
+    ) -> Optional[Dict[str, Any]]:
+        """``bounds`` (``quality_engine.parse_range`` of ``constraint``), or the refusal of a
+        range ``fluid test`` cannot read, which it passes over, or that no value can meet."""
+        if constraint is None:
+            return None
+        if not bounds:
+            self.refuse(
+                f"reads column {name!r}, whose range {constraint!r} is not '>= 0', "
+                "'>= 0 and <= 100' or 'between 0 and 100'",
+                "Write the range in one of those forms.",
+            )
+            return None
+        if _empty(bounds):
+            self.refuse(
+                f"reads column {name!r}, whose range {constraint!r} no value can meet",
+                "Write the lower bound first: 'between 0 and 100', '>= 0 and <= 100'.",
+            )
+            return None
+        return {"kind": "bounds", "bounds": tuple(bounds)}
+
+    def _labelled_reference(self, name: str, column: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         labels = column.get("labels")
         target = labels.get("references") if isinstance(labels, Mapping) else None
         reference = self._reference(name, target) if target is not None else None
-        if reference is not None:
-            found.append({"kind": "reference", "reference": reference})
-        return None if len(self.refusals) > refused else found
-
-    def _enum(self, name: str, constraint: Any) -> Optional[Dict[str, Any]]:
-        values = parse_enum(constraint)
-        if not values:
-            self.refuse(
-                f"reads column {name!r}, whose enum validationRule lists no value",
-                "Write the values as the constraint: 'A | B | C'.",
-            )
-        elif any(_CONTROL_RE.search(v) for v in values):
-            self.refuse(
-                f"reads column {name!r}, whose enum holds a control character",
-                "Remove it from the value.",
-            )
-        else:
-            return {"kind": "accepted_values", "values": tuple(values)}
-        return None
-
-    def _regex(self, name: str, constraint: Any) -> Optional[Dict[str, Any]]:
-        if not isinstance(constraint, str) or not constraint:
-            self.refuse(
-                f"reads column {name!r}, whose regex validationRule has no pattern",
-                "Write the pattern as the constraint: '^[A-Z]{2}$'.",
-            )
-        elif _CONTROL_RE.search(constraint):
-            self.refuse(
-                f"reads column {name!r}, whose regex holds a control character",
-                "Write it with an escape (\\t, \\n) instead.",
-            )
-        else:
-            return {"kind": "regex", "pattern": constraint}
-        return None
-
-    def _range(self, name: str, constraint: Any) -> Optional[Dict[str, Any]]:
-        bounds = parse_range(constraint)
-        if bounds is not None:
-            return {"kind": "bounds", "bounds": bounds}
-        self.refuse(
-            f"reads column {name!r}, whose range {constraint!r} is not '>= 0', "
-            "'>= 0 and <= 100' or 'between 0 and 100'",
-            "Write the range in one of those forms.",
-        )
-        return None
-
-    def _listed_values(self, name: str) -> List[Dict[str, Any]]:
-        """Values the rule itself lists, for a column that declares none; a refusal when the
-        rule lists none either."""
-        from fluid_build.engines.dbt._test_mapping import valid_values
-
-        values = [str(v).strip() for v in valid_values(self.rule) if str(v).strip()]
-        if values and not any(_CONTROL_RE.search(v) for v in values):
-            return [{"kind": "accepted_values", "values": tuple(values)}]
-        self.refuse(
-            f"reads column {name!r}, which declares no allowed values, and the rule lists none",
-            f"Declare them on column {name!r}: validationRules [{{type: enum, constraint: "
-            "'A | B'}] (or regex, or range), or labels.references: <product id>.<column> for "
-            "a value that must exist in another product's column.",
-        )
-        return []
+        return None if reference is None else {"kind": "reference", "reference": reference}
 
     def _reference(self, name: str, target: Any) -> Optional[Reference]:
         text = target.strip() if isinstance(target, str) else ""
@@ -632,7 +675,7 @@ class _Rule:
         # product's table another way can still check it; one that cannot refuses.
         return Reference(product_id, exposes[0] if exposes else None, column)
 
-    def refuse(self, problem: str, fix: str) -> None:
+    def refuse(self, problem: str, fix: str, *, needs_history: bool = False) -> None:
         self.refusals.append(
             DqRefusal(
                 rule_id=self.rule_id,
@@ -640,6 +683,7 @@ class _Rule:
                 message=f"rule {self.rule_id!r} ({self.type or 'no type'}) {problem}",
                 fix=fix,
                 rule_type=self.type,
+                needs_history=needs_history,
             )
         )
 
@@ -654,7 +698,5 @@ __all__ = [
     "SEVERITIES",
     "describe",
     "has_rules",
-    "parse_enum",
-    "parse_range",
     "read_rules",
 ]
