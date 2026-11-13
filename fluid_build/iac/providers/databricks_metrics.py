@@ -82,12 +82,12 @@ like the column masks (``databricks_enforce.py``), around ``tofu apply``:
   (its table renamed, its semantics or its expose removed), is dropped before ``tofu apply``:
   dropping a view only narrows who reads. It is found by name (``*_semantic_model``,
   ``table-summaries``) and dropped only with this product's ``fluid.product_id`` and the deploy
-  identity as owner. Only those schemas are looked in, so another environment of the product (an
-  overlay that changes the schema, in the same catalog, under the same identity) keeps its views.
-  The cost is the one the column masks' functions share: a view left in a schema the contract
-  stops using (its table moved, its last expose removed) is not found, and OpenTofu's destroy of
-  that schema (never ``force_destroy``) then fails while the schema holds it; drop it by hand
-  (``DROP VIEW <name>``) and re-run.
+  identity as owner. Only those schemas are looked in here, so another environment of the
+  product (an overlay that changes the schema, in the same catalog, under the same identity)
+  keeps its views. A schema the contract stops using (its table moved, its last expose removed)
+  is the plan's to name: OpenTofu's state holds it and the saved plan destroys it, and
+  ``databricks_vacated.py`` drops this product's views there, by the same checks, before the
+  apply, so the destroy (never ``force_destroy``) is not refused.
 * A metric view reads its table with its owner's rights, and Unity Catalog applies the table's
   row filter and column masks to whoever queries the view (a row filter measured live). When
   binding them fails, :func:`lock_restricted` revokes ``SELECT`` on the views over restricted
@@ -940,6 +940,12 @@ def _qualify(text: str, columns: Mapping[str, Any], table: str = "") -> Tuple[st
     return "".join(out), bare
 
 
+def product_id_of(contract: Mapping[str, Any]) -> str:
+    """The id a contract's metric views carry as ``fluid.product_id``: its ``id``, else its
+    ``name``."""
+    return str(contract.get("id") or contract.get("name") or "").strip()
+
+
 def compile_metric_views(
     contract: Mapping[str, Any],
     tables: Sequence[Any],
@@ -953,7 +959,7 @@ def compile_metric_views(
     ``expose_id``, ``catalog``, ``schema``, ``name``, ``full_name``, ``columns``, ``exposure``,
     ``enforcement``); ``privileges`` is ``{table full name: {principal: privileges}}``.
     """
-    product_id = str(contract.get("id") or contract.get("name") or "").strip()
+    product_id = product_id_of(contract)
     plan = MetricViews(
         product_id=product_id,
         schemas=tuple(sorted({f"{t.catalog}.{t.schema}" for t in tables})),
@@ -1534,6 +1540,7 @@ __all__ = [
     "PRODUCT_PROPERTY",
     "compile_metric_views",
     "lock_restricted",
+    "product_id_of",
     "post_apply",
     "pre_apply",
     "preview",

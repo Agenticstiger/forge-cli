@@ -709,7 +709,8 @@ def test_a_view_the_contract_no_longer_declares_is_dropped_before_the_apply(fake
     run.pre(doc)
     dropped = [s for s in run.statements(before) if s.startswith("DROP VIEW")]
     assert dropped == ["DROP VIEW IF EXISTS `main`.`sales`.`site_360_v0_semantic_model`"]
-    # Only the product's own schemas are looked in: one it no longer uses is not (a known limit).
+    # pre_apply looks only in the schemas the contract uses; one it stopped using is the plan's
+    # to name (prepare_destroys, test_iac_databricks_vacated.py).
     assert ours_moved in fake.tables
     assert theirs in fake.tables and VIEW in fake.tables
     del doc["exposes"][0]["semantics"]

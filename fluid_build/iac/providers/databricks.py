@@ -106,6 +106,13 @@ resources, with no new schema field (fluid-schema 0.7.6):
   values pick the tables and are not thresholds the monitor checks. Its results are the
   Quality indicator on the table in Catalog Explorer and
   ``system.data_quality_monitoring.table_results``; removing it is not gated.
+* A schema the contract stops using (its table moved, its last expose removed) is destroyed by
+  the plan. The metric views and the mask and row filter functions this product made there are
+  no OpenTofu resource, and Unity Catalog does not delete a schema that holds them, so
+  :meth:`DatabricksIacPlugin.prepare_destroys` drops them before ``tofu apply`` and
+  :meth:`~DatabricksIacPlugin.unblock_destroys` drops the functions the apply's destroyed tables
+  used, once they are gone, before the engine resumes that schema's destroy
+  (``databricks_vacated.py``).
 * A dbt build that runs on Databricks (``execution.runtime.platform:
   databricks``) becomes a serverless ``databricks_job`` with a ``dbt_task``, and
   a local project its ``databricks_workspace_file`` uploads
@@ -206,6 +213,7 @@ from ..principals import (
 from ..provider_match import canonical_cloud, is_cloud
 from ..versions import required_providers
 from . import databricks_metrics as _metric_views
+from . import databricks_vacated as _vacated
 from .databricks_access import TableEnforcement, compile_enforcement
 from .databricks_auth import tofu_env_overlay
 from .databricks_enforce import (
@@ -2861,6 +2869,31 @@ class DatabricksIacPlugin:
             _declare_keys(contract, say, client_factory)
             _metric_views.post_apply(views, say, client_factory)
 
+    def prepare_destroys(
+        self,
+        contract: Mapping[str, Any],
+        destroyed: Iterable[Mapping[str, Any]],
+        say: Optional[Callable[[str], None]] = None,
+        dry_run: bool = False,
+        client_factory: Optional[Callable[[], Any]] = None,
+    ) -> None:
+        """Before ``tofu apply``: clear what this product made outside OpenTofu in the schemas
+        the plan destroys (``databricks_vacated.prepare``); ``dry_run`` prints, runs none."""
+        _vacated.prepare(
+            _vacated_of(contract, destroyed), say or print, client_factory, dry_run=dry_run
+        )
+
+    def unblock_destroys(
+        self,
+        contract: Mapping[str, Any],
+        blocked: Iterable[Mapping[str, Any]],
+        say: Optional[Callable[[str], None]] = None,
+        client_factory: Optional[Callable[[], Any]] = None,
+    ) -> List[str]:
+        """After an apply that failed at destroying ``blocked``: drop what its destroyed tables
+        used there (``databricks_vacated.unblock``); the addresses of those it cleared."""
+        return list(_vacated.unblock(_vacated_of(contract, blocked), say or print, client_factory))
+
     def post_build(
         self,
         contract: Mapping[str, Any],
@@ -3300,6 +3333,19 @@ def validate_databricks_binding(
         warnings += genie.warnings
     errors = [f"{exc} {' '.join(exc.remediation)}".strip() for exc in refusals]
     return errors, warnings
+
+
+def _vacated_of(
+    contract: Mapping[str, Any], destroyed: Iterable[Mapping[str, Any]]
+) -> _vacated.Vacated:
+    """The schemas among a plan's deletes that ``contract`` no longer uses
+    (``databricks_vacated.vacated``); a contract that does not compile raises its refusal."""
+    compiled = _compile(contract, os.environ)
+    if compiled.refusals:
+        raise compiled.refusals[0]
+    declared = {f"{table.catalog}.{table.schema}" for table in compiled.tables}
+    # From the contract, not the compiled views: one with no Databricks expose left compiles none.
+    return _vacated.vacated(destroyed, declared, _metric_views.product_id_of(contract))
 
 
 def _genie(contract: Mapping[str, Any], compiled: _Compiled, env: Mapping[str, str]) -> Any:

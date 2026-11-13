@@ -17,7 +17,10 @@ OpenTofu, in two hooks ``fluid apply`` calls around ``tofu apply``:
   function carries this module's name prefix. A filter an admin set by hand is left alone.
   Dropping widens access, so it waits for the apply to succeed and is printed as such. After an
   apply that succeeded it also drops this module's superseded functions that no table in the
-  schema uses and this run's identity owns (:func:`drop_orphan_functions`).
+  schema uses and this run's identity owns (:func:`drop_orphan_functions`). Those are the
+  contract's schemas; in a schema the contract stops using, which the plan destroys, the
+  functions go by the same rules, once OpenTofu has destroyed the tables that used them
+  (``databricks_vacated.py``).
 
 Both read the live bindings first (``GET /api/2.1/unity-catalog/tables/{name}``:
 ``row_filter.function_name`` / ``input_column_names`` and ``columns[].mask.function_name``,

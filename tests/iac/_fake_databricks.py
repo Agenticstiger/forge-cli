@@ -18,7 +18,9 @@ sent in ``functions``; CREATE OR REPLACE of one a filter or mask uses is refused
 refuses it), ALTER TABLE SET / DROP ROW FILTER, ALTER COLUMN SET / DROP MASK, and REVOKE SELECT.
 The bindings are served on the table (``row_filter``, ``columns[].mask``) as Unity Catalog serves
 them, and a CREATE OR REPLACE TABLE keeps them (Databricks docs: REPLACE preserves row filters
-and column masks). The key constraints forge-cli declares (``databricks_keys.py``): ALTER TABLE
+and column masks). A schema that still holds a table, a view, a function or a volume is not
+deleted (``Schema is not empty``), as Unity Catalog refuses it. The key constraints forge-cli
+declares (``databricks_keys.py``): ALTER TABLE
 ADD CONSTRAINT ... PRIMARY KEY / FOREIGN KEY ... REFERENCES and DROP CONSTRAINT [IF EXISTS],
 served as ``table_constraints``, with the rules and error texts a warehouse showed (a key needs
 NOT NULL columns, a foreign key its parent's primary key, a referenced primary key does not
@@ -1760,7 +1762,10 @@ class FakeDatabricks:
         full = m.group(1)
         if full not in self.schemas:
             return _err(404, "SCHEMA_DOES_NOT_EXIST", f"Schema '{full}' does not exist.")
-        if any(t.startswith(full + ".") for t in self.tables):
+        # Unity Catalog deletes a schema only when it holds nothing: no table or view, and no
+        # function or volume either (a schema holding functions measured live, 2026-11-03).
+        held = (*self.tables, *self.metric_views, *self.functions, *self.volumes)
+        if any(name.rsplit(".", 1)[0] == full for name in held):
             return _err(400, "INVALID_STATE", "Schema is not empty")
         del self.schemas[full]
         self.grants.pop(("schema", full), None)

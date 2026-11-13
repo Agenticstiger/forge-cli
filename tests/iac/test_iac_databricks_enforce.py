@@ -612,16 +612,25 @@ def test_a_refusal_from_a_hook_is_a_typed_error_with_its_fix(hook):
     assert exc.value.context["remediation"] == ["fix it"]
 
 
+def _source(function) -> str:
+    return __import__("inspect").getsource(function)
+
+
 def test_the_engine_runs_the_hooks_around_tofu_apply_in_this_order():
-    source = __import__("inspect").getsource(engine._apply_via_opentofu)
+    source = _source(engine._apply_via_opentofu)
     pre = source.index('_enforce_access(plugin, "pre_apply", contract)')
+    prepare = source.index("_prepare_destroys(plugin, contract, destroyed)")
     keep = source.index("imported.keep()")
-    apply = source.index("runner.tofu_apply(")
+    apply = source.index("_apply_saved_plan(")
     post = source.index('_enforce_access(plugin, "post_apply", contract)')
     gate = source.index("_enforce_data_loss_gate(")
     dry = source.index('_enforce_access(plugin, "pre_apply", contract, dry_run=True)')
-    assert gate < dry < source.index('cprint("\\ndry-run: plan only')
-    assert gate < pre < keep < apply < post
+    dry_prepare = source.index("_prepare_destroys(plugin, contract, destroyed, dry_run=True)")
+    assert gate < dry < dry_prepare < source.index('cprint("\\ndry-run: plan only')
+    assert gate < pre < prepare < keep < apply < post
+    # The saved plan is applied first; a destroy that waited is resumed only after it failed.
+    saved = _source(engine._apply_saved_plan)
+    assert saved.index("runner.tofu_apply(") < saved.index("_resume_blocked_destroys(")
 
 
 # ── after a tofu apply that failed part way ─────────────────────────────────
@@ -712,10 +721,10 @@ def test_the_engine_prints_an_enforcement_failure_after_a_failed_apply_and_never
 
 
 def test_the_engine_binds_before_it_raises_the_apply_failure():
-    source = __import__("inspect").getsource(engine._apply_via_opentofu)
+    source = _source(engine._apply_via_opentofu)
     bind = source.index("_enforce_after_failed_apply(plugin, contract)")
     failed = source.index("raise _apply_failure(")
-    assert source.index("runner.tofu_apply(") < bind < failed
+    assert source.index("_apply_saved_plan(") < bind < failed
 
 
 # ── a function someone else made under the hashed name ──────────────────────
