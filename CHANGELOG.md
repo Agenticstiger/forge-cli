@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fluid validate` warns about what a template or a guess leaves in a contract.** Four
+  authoring-lint rules run after the contract rules, as warnings: `fluid validate` passes and
+  `--strict` fails, as on any warning. A placeholder email
+  (`ERR_CONTRACT_PLACEHOLDER_EMAIL`) is an address at a domain reserved for documentation
+  (example.com, example.org, example.net, or a `.example`, `.test`, `.invalid` or `.localhost`
+  name, RFC 2606 and RFC 6761), at a stand-in domain (company.com, yourcompany.com and the
+  like), or with a stand-in mailbox (test@, noreply@, owner@). In the agent eval of #851 the
+  embedded forge arm made up an owner address in all 9 of its runs; the fix the warning gives
+  is the address the request gives, or no address (`metadata.owner.email` is optional). A
+  starter-template value (`ERR_CONTRACT_TEMPLATE_RESIDUE`) is one only an unedited
+  `fluid forge --template starter` writes: `starter-product`, `starter_table`, `SELECT 1 AS id`,
+  the `data-team` owner, the starter's description and semantic model. A placeholder value
+  (`ERR_CONTRACT_PLACEHOLDER_VALUE`) is TODO, FIXME, TBD, CHANGEME or a `<...>` stand-in such as
+  `<your-team>` (not a type such as `array<string>`, an operator or HTML). An SDP build that
+  joins (`ERR_CONTRACT_SDP_JOINS`) contradicts the product's own classification: an SDP
+  (Bronze) reads one source as it is, so a product that joins is an ADP (Silver). Each warning
+  names its place and ends with what to write instead, so the text output is enough to act on.
+  Many shipped examples and quickstart templates carry a placeholder owner email on purpose
+  (it is the value to replace), so they now validate with that warning.
+
+- **`fluid validate --format json` gives every finding a code, a JSON pointer, a fix and an
+  example.** Next to `errors`, `warnings` and `notes` (unchanged lists of strings), a document
+  with at least one finding has `issues`: one entry per finding, in that order, with
+  `severity`, `code` (a stable `ERR_*` code from the error catalog), `pointer` (an RFC 6901
+  JSON pointer into the contract; `""` is the whole document), `message`, `fix`, `example`
+  (YAML to write or a command to run) and `docs_url`. A schema error's code names the keyword
+  that failed (`ERR_CONTRACT_SCHEMA_REQUIRED`, `_UNKNOWN_FIELD`, `_TYPE`, `_ENUM`, `_PATTERN`,
+  `_FORMAT`, `_NO_VARIANT`, `_NOT_ALLOWED`, `_BOUNDS`), its pointer is the instance location (the
+  unexpected key itself for a field the object does not take), and every contract rule's
+  finding carries the code of its check (`ERR_CONTRACT_PRODUCT_TYPE_INCONSISTENT`,
+  `ERR_CONTRACT_GCP_BINDING`, ...) with the pointer its message names. A clean contract keeps
+  the document it always had. The error catalog gains 38 codes, and each of the 44 codes a
+  finding can carry has a fix and an example that is valid FLUID and passes the lint (pinned
+  by `tests/cli/test_validate_issues.py`, which also fails a new finding recorded without a
+  code); the troubleshooting skill's `error-codes.md` lists them. Shape borrowed from Spectral's results and ruff's JSON diagnostics, with the location
+  written as JSON Schema 2020-12 writes `instanceLocation`.
+
+### Changed
+
+- **An SDP that consumes a product the workspace cannot resolve is a warning.** It used to be
+  reported under `--verbose` only, because an ADP or a CDP may consume a product of another
+  workspace. An SDP accepts no upstream of any type, so the rule holds whatever the upstream
+  is: the warning (`ERR_CONTRACT_SDP_CONSUMES_PRODUCTS`) names the `consumes[]` entry and says
+  to classify the product ADP (Silver) or delete the entry. An upstream whose type is known
+  still fails validation, as before.
+
+- **The Claude Code validate hook shows each finding's code, pointer and fix.** It runs
+  `fluid validate --format json`: a failing contract is shown to the agent one finding per
+  line, with its fix, and a passing contract with warnings now reaches the agent as
+  `additionalContext` instead of nothing, without blocking the edit. The authoring skill's
+  checklist asks for a contract that validates with no warnings.
+
 ## [0.30.1] — 2026-11-13
 
 ### Fixed
