@@ -3139,16 +3139,18 @@ def _job_actions(jobs: Sequence[DbtJob]) -> List[Dict[str, Any]]:
     """Plan actions for the dbt jobs and the project files they upload."""
     actions: List[Dict[str, Any]] = []
     for job in jobs:
-        actions.append(
-            {
-                "op": "databricks.job.ensure",
-                "resource_type": "databricks_job",
-                "resource_id": job.name,
-                "build": job.build_id,
-                "source": job.source,
-                "trigger": job.trigger,
-            }
-        )
+        action: Dict[str, Any] = {
+            "op": "databricks.job.ensure",
+            "resource_type": "databricks_job",
+            "resource_id": job.name,
+            "build": job.build_id,
+            "source": job.source,
+            "trigger": job.trigger,
+        }
+        if job.tests:
+            # The contract's DQ rules, each a dbt test the job runs (databricks_dbt_tests.py).
+            action["dq_tests"] = list(job.tests)
+        actions.append(action)
         actions.extend(
             {
                 "op": "databricks.workspace_file.ensure",
