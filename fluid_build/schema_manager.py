@@ -17,10 +17,11 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Mapping, Optional, Union
+from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Mapping, Optional, Tuple, Union
 
 import yaml
 
+from ._validation_issues import json_pointer, message_pointer
 from .errors import ValidationError as FluidValidationError
 
 # Try to import jsonschema for proper validation.
@@ -103,6 +104,81 @@ def format_schema_error(error: Any) -> str:
     return f"fails {error.validator}: {error.validator_value!r} (value not shown)"
 
 
+def _unexpected_key(error: Any) -> Optional[str]:
+    """The first key an ``additionalProperties`` error is about, or ``None``."""
+    if error.validator != "additionalProperties" or not isinstance(error.instance, dict):
+        return None
+    schema = error.schema if isinstance(error.schema, dict) else {}
+    known = schema.get("properties") or {}
+    patterns = list((schema.get("patternProperties") or {}).keys())
+    for key in error.instance:
+        # re.search, as jsonschema's additionalProperties reads these keys.
+        if key not in known and not any(re.search(p, str(key)) for p in patterns):
+            return key
+    return None
+
+
+#: The catalog event of a JSON-Schema error, by the keyword that failed: the
+#: ``code`` its ``issues[]`` entry carries in ``fluid validate --format json``.
+_SCHEMA_EVENTS = {
+    "required": "contract_schema_required",
+    "dependentRequired": "contract_schema_required",
+    "dependencies": "contract_schema_required",
+    "additionalProperties": "contract_schema_unknown_field",
+    "unevaluatedProperties": "contract_schema_unknown_field",
+    "propertyNames": "contract_schema_unknown_field",
+    "type": "contract_schema_type",
+    "enum": "contract_schema_enum",
+    "const": "contract_schema_enum",
+    "pattern": "contract_schema_pattern",
+    "format": "contract_schema_format",
+    "oneOf": "contract_schema_no_variant",
+    "anyOf": "contract_schema_no_variant",
+    "not": "contract_schema_not_allowed",
+    **{
+        keyword: "contract_schema_bounds"
+        for keyword in (
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+            "minLength",
+            "maxLength",
+            "minItems",
+            "maxItems",
+            "uniqueItems",
+            "contains",
+            "minContains",
+            "maxContains",
+            "minProperties",
+            "maxProperties",
+        )
+    },
+}
+
+
+def schema_error_event(error: Any) -> str:
+    """The catalog event of a jsonschema ``error`` (``contract_schema_invalid`` for the rest)."""
+    return _SCHEMA_EVENTS.get(str(error.validator), "contract_schema_invalid")
+
+
+def schema_error_pointer(error: Any) -> str:
+    """The RFC 6901 pointer of a jsonschema ``error``: its instance location.
+
+    As JSON Schema's ``instanceLocation``, the object for a missing property;
+    the key itself for one the object does not take (``additionalProperties``,
+    ``not: {required: [...]}``), because that is the key to delete or rename.
+    """
+    path = list(error.absolute_path)
+    key = _unexpected_key(error)
+    if key is None and error.validator == "not" and isinstance(error.instance, dict):
+        value = error.validator_value
+        if isinstance(value, dict) and list(value) == ["required"]:
+            key = next((k for k in value["required"] if k in error.instance), None)
+    return json_pointer([*path, key] if key is not None else path)
+
+
 def _locate_error(error: Any, locate: Callable[..., Optional[str]]) -> Optional[str]:
     """Where the value an error is about was written, by ``locate``.
 
@@ -112,14 +188,9 @@ def _locate_error(error: Any, locate: Callable[..., Optional[str]]) -> Optional[
     other keys into it.
     """
     path = list(error.absolute_path)
-    if error.validator == "additionalProperties" and isinstance(error.instance, dict):
-        schema = error.schema if isinstance(error.schema, dict) else {}
-        known = schema.get("properties") or {}
-        patterns = list((schema.get("patternProperties") or {}).keys())
-        for key in error.instance:
-            # re.search, as jsonschema's additionalProperties reads these keys.
-            if key not in known and not any(re.search(p, str(key)) for p in patterns):
-                return locate([*path, key])
+    key = _unexpected_key(error)
+    if key is not None:
+        return locate([*path, key])
     if error.validator == "required":
         return locate(path, definition=True)
     return locate(path)
@@ -378,19 +449,54 @@ class ValidationResult:
     #: What is worth saying but asks nothing of the author: shown with the result, never an
     #: error or a warning, so ``--strict`` does not fail on one (SARIF's ``note`` level).
     notes: List[str] = field(default_factory=list)
+    #: Per message: the catalog event of the check that found it, the RFC 6901 pointer to
+    #: where it is, and the fix when the check knows one better than the catalog's (``""``
+    #: otherwise). What its ``issues[]`` entry in ``fluid validate --format json`` carries
+    #: (``fluid_build._validation_issues``). The messages stay plain strings.
+    issue_meta: Dict[str, Tuple[str, str, str]] = field(default_factory=dict)
 
-    def add_error(self, error: str) -> None:
-        """Add a validation error."""
+    def _tag(
+        self, message: str, event: Optional[str], pointer: Optional[str], fix: Optional[str]
+    ) -> None:
+        if event is not None:
+            self.issue_meta[message] = (event, pointer or "", fix or "")
+
+    def add_error(
+        self,
+        error: str,
+        *,
+        event: Optional[str] = None,
+        pointer: Optional[str] = None,
+        fix: Optional[str] = None,
+    ) -> None:
+        """Add a validation error, found by the check ``event``, at ``pointer``."""
         self.errors.append(error)
         self.is_valid = False
+        self._tag(error, event, pointer, fix)
 
-    def add_warning(self, warning: str) -> None:
-        """Add a validation warning."""
+    def add_warning(
+        self,
+        warning: str,
+        *,
+        event: Optional[str] = None,
+        pointer: Optional[str] = None,
+        fix: Optional[str] = None,
+    ) -> None:
+        """Add a validation warning, found by the check ``event``, at ``pointer``."""
         self.warnings.append(warning)
+        self._tag(warning, event, pointer, fix)
 
-    def add_note(self, note: str) -> None:
+    def add_note(
+        self,
+        note: str,
+        *,
+        event: Optional[str] = None,
+        pointer: Optional[str] = None,
+        fix: Optional[str] = None,
+    ) -> None:
         """Add a note: shown with the result, never counted by ``--strict``."""
         self.notes.append(note)
+        self._tag(note, event, pointer, fix)
 
     def get_summary(self) -> str:
         """Get a human-readable summary."""
@@ -773,14 +879,22 @@ class FluidSchemaManager:
         if schema_version is None:
             detected = self.detect_version(contract)
             if detected is None:
-                result.add_error("No fluidVersion specified in contract")
+                result.add_error(
+                    "No fluidVersion specified in contract",
+                    event="contract_schema_required",
+                    pointer="",
+                )
                 return result
             schema_version = detected
         elif isinstance(schema_version, str):
             try:
                 schema_version = SchemaVersion.parse(schema_version)
             except ValueError as e:
-                result.add_error(f"Invalid schema version: {e}")
+                result.add_error(
+                    f"Invalid schema version: {e}",
+                    event="invalid_schema_version",
+                    pointer="/fluidVersion",
+                )
                 return result
 
         result.schema_version = schema_version
@@ -788,7 +902,11 @@ class FluidSchemaManager:
         # Get appropriate schema
         schema = self.get_schema(schema_version, offline_only=offline_only)
         if schema is None:
-            result.add_error(f"Schema not available for version {schema_version}")
+            result.add_error(
+                f"Schema not available for version {schema_version}",
+                event="schema_not_available",
+                pointer="/fluidVersion",
+            )
             return result
 
         # Perform validation
@@ -808,11 +926,17 @@ class FluidSchemaManager:
                 result.is_valid = False
 
         except Exception as e:
-            result.add_error(f"Validation failed with error: {str(e)}")
+            result.add_error(
+                f"Validation failed with error: {str(e)}", event="validation_error", pointer=""
+            )
 
         # Version compatibility warnings — only 0.7.x is supported.
         if schema_version.major == 0 and schema_version.minor < 7:
-            result.add_warning(f"Schema version {schema_version} is deprecated")
+            result.add_warning(
+                f"Schema version {schema_version} is deprecated",
+                event="contract_version_unsupported",
+                pointer="/fluidVersion",
+            )
 
         result.validation_time = time.time() - start_time
         return result
@@ -831,7 +955,8 @@ class FluidSchemaManager:
 
         before = len(result.errors)
         for position, expose in enumerate(contract.get("exposes") or []):
-            for column in (expose.get("contract") or {}).get("schema") or []:
+            columns = (expose.get("contract") or {}).get("schema") or []
+            for index, column in enumerate(columns):
                 if {"fields", "element", "key", "value"} & column.keys():
                     try:
                         # The path the compiler labels the same column with, so the
@@ -840,13 +965,27 @@ class FluidSchemaManager:
                             column, path=f"exposes[{position}].contract.schema.{column['name']}"
                         )
                     except ValueError as exc:
-                        result.add_error(str(exc))
+                        result.add_error(
+                            str(exc),
+                            event="contract_streaming_types",
+                            pointer=json_pointer(
+                                ["exposes", position, "contract", "schema", index]
+                            ),
+                        )
         for message in validation_errors(contract):
             # A column the loop above reported is the compiler's first error too.
             if message.removeprefix("Managed Flink: ") not in result.errors:
-                result.add_error(message)
+                result.add_error(
+                    message,
+                    event="contract_managed_flink",
+                    pointer=message_pointer(message.removeprefix("Managed Flink: "), contract),
+                )
         for message in validation_warnings(contract):
-            result.add_warning(message)
+            result.add_warning(
+                message,
+                event="contract_managed_flink",
+                pointer=message_pointer(message.removeprefix("Managed Flink: "), contract),
+            )
         return len(result.errors) == before
 
     def _validate_with_jsonschema(
@@ -869,12 +1008,18 @@ class FluidSchemaManager:
             errors = sorted(validator.iter_errors(contract), key=lambda e: e.path)
 
             for error in errors:
-                result.add_error(f"{_error_path(error, locate)}: {format_schema_error(error)}")
+                result.add_error(
+                    f"{_error_path(error, locate)}: {format_schema_error(error)}",
+                    event=schema_error_event(error),
+                    pointer=schema_error_pointer(error),
+                )
 
             return len(errors) == 0
 
         except Exception as e:
-            result.add_error(f"JSON Schema validation error: {str(e)}")
+            result.add_error(
+                f"JSON Schema validation error: {str(e)}", event="validation_error", pointer=""
+            )
             return False
 
     def _validate_basic(
@@ -886,7 +1031,11 @@ class FluidSchemaManager:
         ``jsonschema`` is a hard dependency, so this is a defensive
         fallback rather than a supported code path.
         """
-        result.add_warning(f"Using basic validation for v{schema_version}")
+        result.add_warning(
+            f"Using basic validation for v{schema_version}",
+            event="optional_dependency_missing",
+            pointer="",
+        )
 
         required_fields = [
             "fluidVersion",
@@ -899,7 +1048,9 @@ class FluidSchemaManager:
         ]
         for field in required_fields:
             if field not in contract:
-                result.add_error(f"Missing required field: {field}")
+                result.add_error(
+                    f"Missing required field: {field}", event="contract_schema_required", pointer=""
+                )
 
         return len(result.errors) == 0
 
@@ -968,13 +1119,19 @@ def validate_contract_file(
 
     except FileNotFoundError:
         result = ValidationResult(is_valid=False)
-        result.add_error(f"Contract file not found: {file_path}")
+        result.add_error(
+            f"Contract file not found: {file_path}", event="contract_file_not_found", pointer=""
+        )
         return result
     except (yaml.YAMLError, json.JSONDecodeError) as e:
         result = ValidationResult(is_valid=False)
-        result.add_error(f"Invalid contract file format: {e}")
+        result.add_error(
+            f"Invalid contract file format: {e}", event="contract_load_failed", pointer=""
+        )
         return result
     except Exception as e:
         result = ValidationResult(is_valid=False)
-        result.add_error(f"Error reading contract file: {e}")
+        result.add_error(
+            f"Error reading contract file: {e}", event="contract_load_failed", pointer=""
+        )
         return result

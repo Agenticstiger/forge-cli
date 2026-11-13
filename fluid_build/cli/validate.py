@@ -346,8 +346,12 @@ def run(args, logger: logging.Logger) -> int:
             locate=locate,
         )
 
+        from fluid_build._validation_issues import message_pointer
+
         for warning in overlay_warnings:
-            validation_result.add_warning(warning)
+            validation_result.add_warning(
+                warning, event="contract_overlay", pointer=message_pointer(warning, contract)
+            )
 
         # Show schema if requested
         if args.show_schema:
@@ -945,9 +949,17 @@ def _run_contract_rules(
         sovereignty_valid, sovereignty_messages = validate_sovereignty(contract)
         for msg in sovereignty_messages:
             if "❌" in msg:
-                validation_result.add_error(msg)
+                _add_findings(
+                    validation_result, contract, "contract_sovereignty", [msg], anchor="sovereignty"
+                )
             elif "⚠️" in msg:
-                validation_result.add_warning(msg)
+                _add_findings(
+                    validation_result,
+                    contract,
+                    "contract_sovereignty",
+                    warnings=[msg],
+                    anchor="sovereignty",
+                )
             else:
                 if args.verbose:
                     info(logger, msg)
@@ -958,9 +970,9 @@ def _run_contract_rules(
         agent_policy_valid, agent_messages = validate_agent_policy(contract)
         for msg in agent_messages:
             if "❌" in msg:
-                validation_result.add_error(msg)
+                _add_findings(validation_result, contract, "contract_agent_policy", [msg])
             elif "⚠️" in msg:
-                validation_result.add_warning(msg)
+                _add_findings(validation_result, contract, "contract_agent_policy", warnings=[msg])
             else:
                 if args.verbose:
                     info(logger, msg)
@@ -1007,8 +1019,11 @@ def _run_contract_rules(
                 try:
                     normalize_metadata_in_place(_copy.deepcopy(metadata))
                 except ProductTypeError as pte:
-                    validation_result.add_error(f"metadata consistency: {pte}")
-                    validation_result.is_valid = False
+                    validation_result.add_error(
+                        f"metadata consistency: {pte}",
+                        event="contract_product_type_inconsistent",
+                        pointer="/metadata",
+                    )
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"Metadata consistency check skipped: {exc}")
@@ -1020,9 +1035,13 @@ def _run_contract_rules(
         # JSON Schema cannot express uniqueness across a nested key, which
         # is why this is a code check. Resolved through module-self so the
         # test seam on the helper keeps working.
-        for msg in _self._duplicate_contract_id_errors(contract):
-            validation_result.add_error(msg)
-            validation_result.is_valid = False
+        _add_findings(
+            validation_result,
+            contract,
+            "contract_duplicate_id",
+            _self._duplicate_contract_id_errors(contract),
+            anchor="exposes",
+        )
 
         # --- Iceberg streaming-sink checks (RFC-streaming-extension §6.8) --
         # Catch the connector's silent-fail-at-first-record traps at validate
@@ -1042,17 +1061,21 @@ def _run_contract_rules(
             )
 
             ice_errors, ice_warnings = validate_iceberg_sink(contract)
-            for msg in ice_errors:
-                validation_result.add_error(msg)
-                validation_result.is_valid = False
-            for msg in ice_warnings:
-                validation_result.add_warning(msg)
+            _add_findings(
+                validation_result,
+                contract,
+                "contract_iceberg_sink",
+                ice_errors,
+                ice_warnings,
+                anchor="exposes",
+            )
         except Exception as exc:  # noqa: BLE001 — reported, never swallowed
             validation_result.add_error(
                 f"Iceberg sink check could not run ({type(exc).__name__}: {exc}); "
-                "the contract was NOT checked for streaming-sink defects"
+                "the contract was NOT checked for streaming-sink defects",
+                event="contract_check_failed",
+                pointer="",
             )
-            validation_result.is_valid = False
 
         # --- Confluent Tableflow binding checks (RFC-streaming-extension §15) --
         # A confluent-bound Iceberg expose carries hard Tableflow inputs
@@ -1063,17 +1086,21 @@ def _run_contract_rules(
             from fluid_build.iac.providers.confluent import validate_confluent_binding
 
             cf_errors, cf_warnings = validate_confluent_binding(contract)
-            for msg in cf_errors:
-                validation_result.add_error(msg)
-                validation_result.is_valid = False
-            for msg in cf_warnings:
-                validation_result.add_warning(msg)
+            _add_findings(
+                validation_result,
+                contract,
+                "contract_confluent_binding",
+                cf_errors,
+                cf_warnings,
+                anchor="exposes",
+            )
         except Exception as exc:  # noqa: BLE001 — reported, never swallowed
             validation_result.add_error(
                 f"Confluent binding check could not run ({type(exc).__name__}: {exc}); "
-                "the contract was NOT checked for Tableflow binding defects"
+                "the contract was NOT checked for Tableflow binding defects",
+                event="contract_check_failed",
+                pointer="",
             )
-            validation_result.is_valid = False
 
         # --- Databricks: everything its emitter refuses, from the same pass ---
         from fluid_build.iac.source import contract_source, source_contract_file
@@ -1091,17 +1118,21 @@ def _run_contract_rules(
             from fluid_build.iac.iceberg_validation import validate_iceberg_bindings
 
             ice_errors, ice_warnings = validate_iceberg_bindings(contract)
-            for msg in ice_errors:
-                validation_result.add_error(msg)
-                validation_result.is_valid = False
-            for msg in ice_warnings:
-                validation_result.add_warning(msg)
+            _add_findings(
+                validation_result,
+                contract,
+                "contract_iceberg_binding",
+                ice_errors,
+                ice_warnings,
+                anchor="exposes",
+            )
         except Exception as exc:  # noqa: BLE001 — reported, never swallowed
             validation_result.add_error(
                 f"Iceberg binding check could not run ({type(exc).__name__}: {exc}); "
-                "the contract was NOT checked for Iceberg prerequisite defects"
+                "the contract was NOT checked for Iceberg prerequisite defects",
+                event="contract_check_failed",
+                pointer="",
             )
-            validation_result.is_valid = False
 
         # --- GCP binding checks (anti-no-op gate) ---------------------------
         # The GCP IaC emitter resolves each expose to a BigQuery / GCS /
@@ -1113,11 +1144,14 @@ def _run_contract_rules(
             from fluid_build.iac.providers.gcp import validate_gcp_binding
 
             gcp_errors, gcp_warnings = validate_gcp_binding(contract)
-            for msg in gcp_errors:
-                validation_result.add_error(msg)
-                validation_result.is_valid = False
-            for msg in gcp_warnings:
-                validation_result.add_warning(msg)
+            _add_findings(
+                validation_result,
+                contract,
+                "contract_gcp_binding",
+                gcp_errors,
+                gcp_warnings,
+                anchor="exposes",
+            )
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"GCP binding check skipped: {exc}")
@@ -1130,11 +1164,14 @@ def _run_contract_rules(
             from fluid_build.iac.governance_validation import validate_governance
 
             gov_errors, gov_warnings = validate_governance(contract)
-            for msg in gov_errors:
-                validation_result.add_error(msg)
-                validation_result.is_valid = False
-            for msg in gov_warnings:
-                validation_result.add_warning(msg)
+            _add_findings(
+                validation_result,
+                contract,
+                "contract_governance",
+                gov_errors,
+                gov_warnings,
+                anchor="exposes",
+            )
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"Governance binding check skipped: {exc}")
@@ -1148,11 +1185,14 @@ def _run_contract_rules(
             from fluid_build.output_ports.vector import validate_vector_binding
 
             vec_errors, vec_warnings = validate_vector_binding(contract)
-            for msg in vec_errors:
-                validation_result.add_error(msg)
-                validation_result.is_valid = False
-            for msg in vec_warnings:
-                validation_result.add_warning(msg)
+            _add_findings(
+                validation_result,
+                contract,
+                "contract_vector_binding",
+                vec_errors,
+                vec_warnings,
+                anchor="exposes",
+            )
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"Vector binding check skipped: {exc}")
@@ -1167,12 +1207,19 @@ def _run_contract_rules(
         try:
             from fluid_build.build_runners.base import continuous_trigger_warnings
 
-            for msg in continuous_trigger_warnings(contract):
-                validation_result.add_warning(msg)
+            _add_findings(
+                validation_result,
+                contract,
+                "contract_continuous_trigger",
+                warnings=continuous_trigger_warnings(contract),
+                anchor="builds",
+            )
         except Exception as exc:  # noqa: BLE001 — reported, never swallowed
             validation_result.add_warning(
                 f"Continuous-trigger check could not run ({type(exc).__name__}: {exc}); "
-                "the contract was NOT checked for a continuous trigger on a batch build"
+                "the contract was NOT checked for a continuous trigger on a batch build",
+                event="contract_check_failed",
+                pointer="",
             )
 
         # --- An id the build phase refuses (WARNING) -----------------------
@@ -1211,11 +1258,14 @@ def _run_contract_rules(
                     )
                     pkg_errors.extend(ov_errors)
                     pkg_warnings.extend(ov_warnings)
-            for msg in pkg_errors:
-                validation_result.add_error(msg)
-                validation_result.is_valid = False
-            for msg in pkg_warnings:
-                validation_result.add_warning(msg)
+            _add_findings(
+                validation_result,
+                contract,
+                "contract_packaging",
+                pkg_errors,
+                pkg_warnings,
+                anchor="packaging",
+            )
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"Packaging check skipped: {exc}")
@@ -1234,11 +1284,14 @@ def _run_contract_rules(
             )
 
             sem_errors, sem_warnings = validate_semantics_block(contract)
-            for msg in sem_errors:
-                validation_result.add_error(msg)
-                validation_result.is_valid = False
-            for msg in sem_warnings:
-                validation_result.add_warning(msg)
+            _add_findings(
+                validation_result,
+                contract,
+                "contract_semantics",
+                sem_errors,
+                sem_warnings,
+                anchor="exposes",
+            )
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"Semantic-model check skipped: {exc}")
@@ -1255,21 +1308,112 @@ def _run_contract_rules(
                 contract,
                 contract_path=_Path(contract_path) if contract_path else None,
             )
-            any_hard = False
             for v in composition_violations:
-                is_unknown = v.upstream_type is None
                 msg = f"composition rule: {v.reason} (upstream={v.upstream_id!r})"
-                if is_unknown:
-                    if args.verbose:
-                        info(logger, msg)
-                else:
-                    validation_result.add_error(msg)
-                    any_hard = True
-            if any_hard:
-                validation_result.is_valid = False
+                pointer = _consume_pointer(contract, v.upstream_id)
+                if v.upstream_type is not None:
+                    validation_result.add_error(
+                        msg, event="contract_composition_violation", pointer=pointer
+                    )
+                elif v.target_type == "SDP":
+                    # An SDP accepts no upstream of any type, so an upstream this
+                    # workspace cannot resolve breaks the rule all the same.
+                    what, fix = _sdp_consumes_message(pointer, v.upstream_id)
+                    validation_result.add_warning(
+                        f"{what} {fix}",
+                        event="contract_sdp_consumes_products",
+                        pointer=pointer,
+                        fix=fix,
+                    )
+                elif args.verbose:
+                    # An ADP or CDP may consume a product of another workspace.
+                    info(logger, msg)
         except Exception as exc:  # pragma: no cover — defensive
             if args.verbose:
                 info(logger, f"Composition rule check skipped: {exc}")
+
+        # --- Authoring lint (WARNINGS) -------------------------------------
+        # What an unedited template or an agent's guess leaves in a contract:
+        # placeholder emails, starter-template values, TODO / <...> stand-ins,
+        # and an SDP build that joins. Warnings, so plain validate passes and
+        # --strict fails. A crash is reported, never swallowed.
+        try:
+            from fluid_build.cli._authoring_lint import lint_contract
+
+            for finding in lint_contract(contract):
+                validation_result.add_warning(
+                    finding.message,
+                    event=finding.event,
+                    pointer=finding.pointer,
+                    fix=finding.fix,
+                )
+        except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+            validation_result.add_warning(
+                f"Authoring lint could not run ({type(exc).__name__}: {exc}); the contract "
+                "was NOT checked for placeholder emails, template values or placeholders",
+                event="contract_check_failed",
+                pointer="",
+            )
+
+
+def _add_findings(
+    validation_result: ValidationResult,
+    contract: Mapping[str, Any],
+    event: str,
+    errors: Sequence[str] = (),
+    warnings: Sequence[str] = (),
+    notes: Sequence[str] = (),
+    *,
+    anchor: str = "",
+) -> None:
+    """Record a check's messages, each tagged with the check (``event``) and its pointer.
+
+    The pointer is the place the message names (``exposes[orders] ...`` is
+    ``/exposes/0``), else ``anchor``, the top-level block the check reads, when the
+    contract has one. ``fluid validate --format json`` reports both in ``issues[]``.
+    """
+    from fluid_build._validation_issues import anchor as _anchor
+    from fluid_build._validation_issues import message_pointer
+
+    default = _anchor(contract, anchor) if anchor else ""
+    for msg in errors:
+        validation_result.add_error(
+            msg, event=event, pointer=message_pointer(msg, contract, default)
+        )
+    for msg in warnings:
+        validation_result.add_warning(
+            msg, event=event, pointer=message_pointer(msg, contract, default)
+        )
+    for msg in notes:
+        validation_result.add_note(
+            msg, event=event, pointer=message_pointer(msg, contract, default)
+        )
+
+
+def _consume_pointer(contract: Mapping[str, Any], upstream_id: str) -> str:
+    """The pointer to the ``consumes[]`` entry naming ``upstream_id`` (``/consumes`` if none)."""
+    from fluid_build._validation_issues import json_pointer
+
+    for index, entry in enumerate(contract.get("consumes") or []):
+        if isinstance(entry, Mapping) and upstream_id in (
+            str(entry.get("productId")),
+            str(entry.get("ref")),
+            str(entry.get("provider")),
+        ):
+            return json_pointer(["consumes", index])
+    return "/consumes"
+
+
+def _sdp_consumes_message(pointer: str, upstream_id: str) -> Tuple[str, str]:
+    """What is wrong with an SDP that consumes ``upstream_id``, and the fix."""
+    index = pointer.rsplit("/", 1)[-1]
+    where = f"consumes[{index}]" if index.isdigit() else "consumes"
+    return (
+        f"{where}: an SDP (Bronze) reads source systems, never other data products, so "
+        f"it cannot consume {upstream_id!r}.",
+        f"If this product builds on {upstream_id!r}, set metadata.productType to ADP and "
+        "metadata.layer to Silver; otherwise delete the entry.",
+    )
 
 
 def _databricks_binding_check(validation_result, contract: Mapping[str, Any]) -> None:
@@ -1288,17 +1432,20 @@ def _databricks_binding_check(validation_result, contract: Mapping[str, Any]) ->
     except Exception as exc:  # noqa: BLE001 — reported, never swallowed
         validation_result.add_error(
             f"Databricks binding check could not run ({type(exc).__name__}: {exc}); "
-            "the contract was NOT checked for Databricks binding defects"
+            "the contract was NOT checked for Databricks binding defects",
+            event="contract_check_failed",
+            pointer="",
         )
-        validation_result.is_valid = False
         return
-    for msg in errors:
-        validation_result.add_error(msg)
-        validation_result.is_valid = False
-    for msg in warnings:
-        validation_result.add_warning(msg)
-    for msg in notes:
-        validation_result.add_note(msg)
+    _add_findings(
+        validation_result,
+        contract,
+        "contract_databricks_binding",
+        errors,
+        warnings,
+        notes,
+        anchor="exposes",
+    )
 
 
 def _build_id_check(validation_result, contract: Mapping[str, Any]) -> None:
@@ -1320,11 +1467,13 @@ def _build_id_check(validation_result, contract: Mapping[str, Any]) -> None:
         validation_result.add_warning(
             f"Build-id check could not run ({type(exc).__name__}: {exc}); "
             "contract.id and builds[].id were NOT checked against the ids the build "
-            "phase accepts"
+            "phase accepts",
+            event="contract_check_failed",
+            pointer="",
         )
         return
     if message is not None:
-        validation_result.add_warning(message)
+        _add_findings(validation_result, contract, "contract_build_id", warnings=[message])
 
 
 def _duplicate_contract_id_errors(contract: Mapping[str, Any]) -> List[str]:
@@ -1506,10 +1655,16 @@ def _run_extension_validators(
     # ``redact_secret_text`` pre-redaction; we just fold each error into the
     # ValidationResult so output formatting / exit code / strict mode are
     # unchanged.
+    from fluid_build._validation_issues import anchor, message_pointer
     from fluid_build.extension_schemas import run_extension_validators
 
+    default = anchor(contract, "extensions")
     for err in run_extension_validators(contract, logger):
-        validation_result.add_error(_in_fragment(err, locate))
+        validation_result.add_error(
+            _in_fragment(err, locate),
+            event="contract_extension",
+            pointer=message_pointer(err, contract, default),
+        )
 
 
 def _in_fragment(err: str, locate: Optional[Callable[..., Optional[str]]]) -> str:
@@ -1549,6 +1704,7 @@ def _run_role_validators(
     validator yields one typed error, never a crash) live in the unified
     :mod:`fluid_build.plugin_manager`.
     """
+    from fluid_build._validation_issues import message_pointer
     from fluid_build.plugin_manager import collect_validator_findings
 
     for f in collect_validator_findings(contract, logger):
@@ -1558,11 +1714,12 @@ def _run_role_validators(
         msg = f"[{plugin}] {code}: {f.get('message', '')}".rstrip()
         if path:
             msg += f" (at {path})"
+        pointer = message_pointer(str(path), contract) if path else ""
         severity = f.get("severity", "info")
         if severity in ("error", "critical"):
-            validation_result.add_error(msg)
+            validation_result.add_error(msg, event="contract_validator_finding", pointer=pointer)
         elif severity == "warn":
-            validation_result.add_warning(msg)
+            validation_result.add_warning(msg, event="contract_validator_finding", pointer=pointer)
         else:
             logger.debug("validator info finding: %s", msg)
 
@@ -1633,6 +1790,13 @@ def _output_json_results(result: ValidationResult, args) -> int:
     if result.notes:
         # Only when there is one: a contract without notes keeps the document it always had.
         output["notes"] = result.notes
+    from fluid_build._validation_issues import build_issues
+
+    issues = build_issues(result)
+    if issues:
+        # Each finding again, with its code, pointer, fix and example: only when there
+        # is one, so a clean contract keeps the document it always had.
+        output["issues"] = issues
     output["validation_time"] = result.validation_time
 
     _cprint_json(json.dumps(output, indent=2))

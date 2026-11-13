@@ -5,6 +5,9 @@
 Every failure prints a stable `ERR_<EVENT>` code next to its message. Find the
 code here and do what the first suggestion says, then re-run the command. A code
 missing from this table has no curated advice: read the message it printed.
+`fluid validate --format json` gives every finding in a contract as an entry of
+`issues`, with its code, a JSON `pointer` to the place, a `fix` and an `example`:
+the `ERR_CONTRACT_*` codes below.
 Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 
 | Code | What to do | Docs page |
@@ -102,3 +105,41 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 | `ERR_TEST_RESULTS_DASHBOARD_PATH_TAKEN` | Something other than a dashboard already sits at that workspace path. Choose another --results-dashboard path, or move that object away. | advanced/production-troubleshooting.html |
 | `ERR_TEST_RESULTS_DASHBOARD_FAILED` | The results were written; only the dashboard step failed. This identity needs CAN MANAGE on the dashboard (or write access to its folder) and CAN USE on DATABRICKS_WAREHOUSE_ID. | advanced/production-troubleshooting.html |
 | `ERR_ICEBERG_CATALOG_MOVE_BLOCKED` | Run the printed `tofu state rm` commands: they release the resources from this contract's OpenTofu state and touch nothing in the cloud. Then re-run fluid apply. The released Glue database/table or Snowflake EXTERNAL VOLUME stays in place; delete it by hand only if nothing else uses it. | cli/apply.html#iceberg-catalog-move-guard |
+| `ERR_CONTRACT_PLACEHOLDER_EMAIL` | Write the address the request gives; if it gives none, delete the key (a contract needs no email: metadata.owner.email is optional). Never make an address up from a team or product name: an example.com, company.com, test@ or noreply@ address reaches nobody. | cli/validate.html |
+| `ERR_CONTRACT_TEMPLATE_RESIDUE` | Replace the starter value with the request's own: an id of <domain>.<name>, the team the request names, the real build and the real output. Delete what the request does not ask for, such as the starter's builds or semantics, rather than keep the starter's. | cli/validate.html |
+| `ERR_CONTRACT_PLACEHOLDER_VALUE` | Replace the placeholder (TODO, FIXME, TBD, CHANGEME or <...>) with the value the request gives, or delete the key when it is optional. When the request leaves the value open, choose the smallest valid one and say so in your report instead of leaving a placeholder. | cli/validate.html |
+| `ERR_CONTRACT_SDP_JOINS` | An SDP (Bronze) reads one source as it is: if the product combines sources, set metadata.productType to ADP and metadata.layer to Silver. Otherwise read the one source without the join. | cli/validate.html |
+| `ERR_CONTRACT_SDP_CONSUMES_PRODUCTS` | An SDP (Bronze) reads source systems, never other data products: if this product builds on the product consumes[] names, set metadata.productType to ADP and metadata.layer to Silver. Otherwise delete the consumes[] entry and read the source system in the build. | cli/validate.html |
+| `ERR_CONTRACT_SCHEMA_REQUIRED` | Add the property the message names to the object at the pointer: the schema requires it there. fluid validate <contract> --show-schema prints the schema, with the required properties of each object. | cli/validate.html |
+| `ERR_CONTRACT_SCHEMA_UNKNOWN_FIELD` | Delete or rename the property the message names: the object at the pointer does not take it. Check its spelling and nesting against the schema: fluid validate <contract> --show-schema. | cli/validate.html |
+| `ERR_CONTRACT_SCHEMA_TYPE` | Change the value at the pointer to the type the message names: a string, a number, true or false, a list or a mapping. Quote a value YAML would read as another type (yes, no, on, off, 1.0, 02:00). | cli/validate.html |
+| `ERR_CONTRACT_SCHEMA_ENUM` | Use one of the values the message lists, spelled exactly: case matters (Bronze, not bronze). | cli/validate.html |
+| `ERR_CONTRACT_SCHEMA_PATTERN` | Rewrite the value at the pointer so it matches the pattern the message shows. A value that ends in a line break fails too: a YAML \| block keeps one, \|- drops it. | cli/validate.html |
+| `ERR_CONTRACT_SCHEMA_FORMAT` | Write the value in the format the message names (an email address, a date-time such as 2026-11-13T02:00:00Z, a URI), or delete the key when it is optional. | cli/validate.html |
+| `ERR_CONTRACT_SCHEMA_NO_VARIANT` | The value at the pointer matches none of the shapes allowed there: compare it with the schema (fluid validate <contract> --show-schema) and fix the field that differs. For a binding, the platform decides the format and the location fields it needs. | cli/validate.html |
+| `ERR_CONTRACT_SCHEMA_NOT_ALLOWED` | Delete the property the message names: this object does not take it, often because another property chose a variant without it. | cli/validate.html |
+| `ERR_CONTRACT_SCHEMA_BOUNDS` | Bring the value at the pointer inside the limit the message names: a minimum or maximum, a length, a number of items, or items that must be unique. | cli/validate.html |
+| `ERR_CONTRACT_SCHEMA_INVALID` | Fix the value at the pointer as the message says; fluid validate <contract> --show-schema prints the rule it broke. | cli/validate.html |
+| `ERR_CONTRACT_STREAMING_TYPES` | Give the nested column the type the message asks for: a struct its fields, an array its element, a map its key and value, each with a type of its own. | cli/validate.html |
+| `ERR_CONTRACT_MANAGED_FLINK` | Change the build or the expose the message names so the managed Flink lane can run it; the message names the field and the value it needs. | cli/validate.html |
+| `ERR_CONTRACT_SOVEREIGNTY` | Move the binding into a region that sovereignty.allowedRegions lists, or widen allowedRegions when the request allows it. A region in sovereignty.deniedRegions is refused in every enforcement mode. | concepts/sovereignty.html |
+| `ERR_CONTRACT_AGENT_POLICY` | Change exposes[].policy.agentPolicy as the message says: the models and use cases it allows or denies must not contradict each other. | cli/validate.html |
+| `ERR_CONTRACT_PRODUCT_TYPE_INCONSISTENT` | Make metadata.productType and metadata.layer agree: SDP with Bronze, ADP with Silver, CDP with Gold (or set only one of them). | cli/validate.html |
+| `ERR_CONTRACT_DUPLICATE_ID` | Give each output port its own contract id: change or delete the exposes[].contract.id the message names. | cli/validate.html |
+| `ERR_CONTRACT_COMPOSITION_VIOLATION` | Consume only products of a type this product accepts: SDP takes none, ADP takes SDP and ADP, CDP takes SDP, ADP and CDP. Or correct this product's metadata.productType if it was set wrong. | cli/validate.html |
+| `ERR_CONTRACT_ICEBERG_SINK` | Fix the streaming Iceberg sink field the message names; the message gives the value or the variable it needs. | cli/validate.html |
+| `ERR_CONTRACT_CONFLUENT_BINDING` | Fix the Confluent (Tableflow) binding field the message names; the message gives the value it needs. | cli/validate.html |
+| `ERR_CONTRACT_DATABRICKS_BINDING` | Fix the Databricks binding or setting the message names (a SQL warehouse in DATABRICKS_WAREHOUSE_ID, no workspace host in the contract). | cli/validate.html |
+| `ERR_CONTRACT_ICEBERG_BINDING` | Fix the Iceberg binding field the message names: a catalog kind FLUID knows, and one storage location per external volume. | cli/validate.html |
+| `ERR_CONTRACT_GCP_BINDING` | Fix the GCP binding field the message names; its remediation is part of the message. | cli/validate.html |
+| `ERR_CONTRACT_GOVERNANCE` | Change the governance or access-policy field the message names, or bind the expose to a platform that enforces it. | cli/validate.html |
+| `ERR_CONTRACT_VECTOR_BINDING` | Fix the pgvector binding field the message names (binding.vectorConfig and the columns it reads). | cli/validate.html |
+| `ERR_CONTRACT_CONTINUOUS_TRIGGER` | Give a batch build a schedule trigger (type: schedule and a cron), or use an engine that runs continuously. | cli/validate.html |
+| `ERR_CONTRACT_BUILD_ID` | Rename the id the message names: a letter or _ first, then at most 127 letters, digits, _, - or . | cli/validate.html |
+| `ERR_CONTRACT_PACKAGING` | Fix the packaging block as the message says; plan, generate iac and apply decide from the same block. | cli/validate.html |
+| `ERR_CONTRACT_SEMANTICS` | Write a measure's expr as the column it aggregates (agg: sum, expr: amount), never as an aggregate (SUM(amount)), which aggregates twice. | cli/validate.html |
+| `ERR_CONTRACT_EXTENSION` | Fix the extensions block the message names: the plugin that owns that key wrote the message. | cli/validate.html |
+| `ERR_CONTRACT_VALIDATOR_FINDING` | The validator plugin named in brackets wrote this finding: do what it says, or ask that plugin's owner. | cli/validate.html |
+| `ERR_CONTRACT_OVERLAY` | Key the overlay's list entries by id (exposeId, id) instead of position, so each patch lands on the entry it means. | cli/validate.html |
+| `ERR_CONTRACT_CHECK_FAILED` | A check crashed, so the contract was NOT checked for what it covers: run fluid validate <contract> --verbose and report the error with the contract. | cli/validate.html |
+| `ERR_CONTRACT_FINDING` | Do what the message says at the place it names, then run fluid validate again. | cli/validate.html |
