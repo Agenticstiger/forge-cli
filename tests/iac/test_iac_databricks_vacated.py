@@ -173,7 +173,7 @@ def test_the_view_goes_before_the_apply_and_the_functions_once_their_table_is_go
     run.destroy_table(OLD)
     assert "Schema is not empty" in run.delete_schema("main.sales")
     before = len(fake.sql_log)
-    assert run.unblock() is True
+    assert run.unblock() == [SCHEMA_DELETE["address"]]
     assert sorted(run.drops(before)) == sorted(
         "DROP FUNCTION IF EXISTS " + ".".join(f"`{p}`" for p in name.split("."))
         for name in functions
@@ -194,7 +194,7 @@ def test_a_dry_run_prints_the_drops_and_runs_none(fake):
         "  main.sales",
         f"    before apply: drop metric view {VIEW}: it reads {OLD}, which this apply destroys",
     ]
-    assert "Schemas this apply destroys: what this product made there outside OpenTofu" in run.text
+    assert "Schemas this apply destroys, and what is in them outside OpenTofu" in run.text
     assert "      DROP VIEW IF EXISTS `main`.`sales`.`orders_semantic_model`" in run.text
     assert f"    after tofu destroys {OLD}: drop function main.sales.fluid_rf_orders_" in run.text
     assert "      DROP FUNCTION IF EXISTS `main`.`sales`.`fluid_mask_orders_region_" in run.text
@@ -251,7 +251,7 @@ def test_only_this_products_and_this_identitys_objects_go_and_never_a_bound_func
 
     run.destroy_table(OLD)
     before = len(fake.sql_log)
-    assert run.unblock() is False  # the schema still holds what is not this run's to drop
+    assert run.unblock() == []  # the schema still holds what is not this run's to drop
     assert len(ours) == 2 and len(run.drops(before)) == 2 and not ours & set(fake.functions)
     assert {kept_filter, planted, "main.sales.normalize"} <= set(fake.functions)
     assert fake.tables["main.sales.orders_stg"]["row_filter"]["function_name"] == kept_filter
@@ -294,7 +294,7 @@ def test_another_environment_of_the_product_keeps_its_view_and_functions(fake):
 
     run.prepare()
     run.destroy_table(OLD)
-    assert run.unblock() is True
+    assert run.unblock() == [SCHEMA_DELETE["address"]]
     assert run.held("main.sales") == []
     assert run.held("main.sales_stg") == staging
 
@@ -308,7 +308,7 @@ def test_a_schema_that_cannot_be_read_drops_nothing(fake):
     assert run.drops(before) == [] and VIEW in fake.tables
     assert "not checked: main.sales could not be read" in run.text
     run.destroy_table(OLD)
-    assert run.unblock() is False
+    assert run.unblock() == []
 
 
 def test_a_drop_that_fails_is_named_and_the_destroy_is_not_asked_for_again(fake):
@@ -317,7 +317,7 @@ def test_a_drop_that_fails_is_named_and_the_destroy_is_not_asked_for_again(fake)
     run.prepare()
     run.destroy_table(OLD)
     fake.fail_on("DROP FUNCTION", "[INTERNAL_ERROR] injected failure")
-    assert run.unblock() is False
+    assert run.unblock() == []
     assert "FAILED: drop function main.sales.fluid_" in run.text
 
 
@@ -329,7 +329,7 @@ def test_without_a_client_nothing_is_checked_and_it_says_so(fake):
     run.prepare(client_factory=broken)
     assert "main.sales: what this product made outside OpenTofu there" in run.text
     assert "was not checked: no Databricks client" in run.text
-    assert run.unblock(client_factory=broken) is False
+    assert run.unblock(client_factory=broken) == []
 
 
 def test_vacated_takes_the_schemas_the_plan_destroys_that_the_contract_does_not_name():
@@ -355,3 +355,64 @@ def test_vacated_takes_the_schemas_the_plan_destroys_that_the_contract_does_not_
     # Without catalog_name and name, the id names the schema.
     only_id = [{"type": "databricks_schema", "before": {"id": "main.legacy"}}]
     assert vacated_mod.vacated(only_id, (), "p").schemas == ("main.legacy",)
+
+
+def test_a_definition_or_a_row_of_an_odd_shape_is_left_never_raised(fake, monkeypatch):
+    run = Run(fake)
+    run.deploy(_contract())
+    # Unity Catalog keeps what YAML it was given: an impossible date is a ValueError to PyYAML.
+    _metric_view(fake, "main.sales.theirs_semantic_model", "other.product")
+    odd = "version: 1.1\nsource: main.sales.orders\nwhen: 2024-02-30\n"
+    fake.tables["main.sales.theirs_semantic_model"]["view_definition"] = odd
+    fake.tables[VIEW]["view_definition"] = odd
+    run.prepare()
+    assert VIEW in fake.tables and "main.sales.theirs_semantic_model" in fake.tables
+    assert f"{VIEW} (a metric view whose definition names no table)" in run.text
+    assert "main.sales.theirs_semantic_model (a metric view of product 'other.product')" in run.text
+
+    # Anything else that breaks while one schema is read leaves it as it is, with a note.
+    def broken(objects):
+        raise RuntimeError("an unexpected row")
+
+    monkeypatch.setattr(vacated_mod, "_holders", broken)
+    run.said.clear()
+    run.prepare()
+    assert "not checked: main.sales could not be read (RuntimeError: an unexpected row)" in run.text
+    run.destroy_table(OLD)
+    assert run.unblock() == []
+
+
+def test_a_contract_with_no_databricks_expose_left_still_names_its_views(fake):
+    run = Run(fake)
+    run.deploy(_contract())
+    bare = _contract("other")
+    bare["exposes"] = []
+    PLUGIN.prepare_destroys(bare, DESTROYED, say=run.said.append, client_factory=fake.client)
+    assert VIEW not in fake.tables
+
+
+class _TablesListWithoutViews:
+    """The stand-in's client, its Tables list leaving metric views out (they stay listed by
+    table-summaries)."""
+
+    def __init__(self, inner: Any):
+        self._inner = inner
+        self.api_client = self
+
+    def do(self, method: str, path: str, **kw: Any) -> Any:
+        out = self._inner.api_client.do(method, path, **kw)
+        if method == "GET" and path == "/api/2.1/unity-catalog/tables":
+            out = {
+                **out,
+                "tables": [
+                    r for r in out.get("tables") or [] if r.get("table_type") != "METRIC_VIEW"
+                ],
+            }
+        return out
+
+
+def test_a_metric_view_only_table_summaries_lists_is_still_found(fake):
+    run = Run(fake)
+    run.deploy(_contract())
+    run.prepare(client_factory=lambda: _TablesListWithoutViews(fake.client()))
+    assert VIEW not in fake.tables

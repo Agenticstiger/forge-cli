@@ -940,6 +940,12 @@ def _qualify(text: str, columns: Mapping[str, Any], table: str = "") -> Tuple[st
     return "".join(out), bare
 
 
+def product_id_of(contract: Mapping[str, Any]) -> str:
+    """The id a contract's metric views carry as ``fluid.product_id``: its ``id``, else its
+    ``name``."""
+    return str(contract.get("id") or contract.get("name") or "").strip()
+
+
 def compile_metric_views(
     contract: Mapping[str, Any],
     tables: Sequence[Any],
@@ -953,7 +959,7 @@ def compile_metric_views(
     ``expose_id``, ``catalog``, ``schema``, ``name``, ``full_name``, ``columns``, ``exposure``,
     ``enforcement``); ``privileges`` is ``{table full name: {principal: privileges}}``.
     """
-    product_id = str(contract.get("id") or contract.get("name") or "").strip()
+    product_id = product_id_of(contract)
     plan = MetricViews(
         product_id=product_id,
         schemas=tuple(sorted({f"{t.catalog}.{t.schema}" for t in tables})),
@@ -1534,6 +1540,7 @@ __all__ = [
     "PRODUCT_PROPERTY",
     "compile_metric_views",
     "lock_restricted",
+    "product_id_of",
     "post_apply",
     "pre_apply",
     "preview",

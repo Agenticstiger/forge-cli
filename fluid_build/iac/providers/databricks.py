@@ -2565,10 +2565,10 @@ class DatabricksIacPlugin:
         blocked: Iterable[Mapping[str, Any]],
         say: Optional[Callable[[str], None]] = None,
         client_factory: Optional[Callable[[], Any]] = None,
-    ) -> bool:
-        """After an apply that failed only at destroying ``blocked``: drop what its destroyed
-        tables used there (``databricks_vacated.unblock``); ``True`` to destroy them again."""
-        return _vacated.unblock(_vacated_of(contract, blocked), say or print, client_factory)
+    ) -> List[str]:
+        """After an apply that failed at destroying ``blocked``: drop what its destroyed tables
+        used there (``databricks_vacated.unblock``); the addresses of those it cleared."""
+        return list(_vacated.unblock(_vacated_of(contract, blocked), say or print, client_factory))
 
     def post_build(
         self,
@@ -2990,7 +2990,8 @@ def _vacated_of(
     if compiled.refusals:
         raise compiled.refusals[0]
     declared = {f"{table.catalog}.{table.schema}" for table in compiled.tables}
-    return _vacated.vacated(destroyed, declared, compiled.metric_views.product_id)
+    # From the contract, not the compiled views: one with no Databricks expose left compiles none.
+    return _vacated.vacated(destroyed, declared, _metric_views.product_id_of(contract))
 
 
 def _genie(contract: Mapping[str, Any], compiled: _Compiled, env: Mapping[str, str]) -> Any:

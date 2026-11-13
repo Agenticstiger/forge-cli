@@ -65,7 +65,7 @@ def _plan(*removed: str, add: int = 0, change: int = 0) -> Any:
 
 
 class Plugin:
-    def __init__(self, cleared: Any = True):
+    def __init__(self, cleared: Any = (SCHEMA,)):
         self.cleared = cleared
         self.calls: List[List[Dict[str, Any]]] = []
         self.prepared: List[Dict[str, Any]] = []
@@ -206,7 +206,7 @@ def test_any_other_failure_is_left_as_it_is(tofu, events):
     assert plugin.calls == [] and tofu["plan"] == 0 and tofu["apply"] == 0
 
 
-@pytest.mark.parametrize("cleared", [False, RuntimeError("boom")], ids=["nothing", "raised"])
+@pytest.mark.parametrize("cleared", [(), RuntimeError("boom")], ids=["nothing", "raised"])
 def test_nothing_cleared_is_not_resumed(tofu, cleared):
     assert _resume(Plugin(cleared), _errored(SCHEMA), DIAGNOSTIC) is None
     assert tofu["plan"] == 0 and tofu["apply"] == 0
@@ -272,3 +272,11 @@ def test_after_a_resume_the_totals_are_the_plans_own():
         "change": 1,
         "remove": 0,
     }
+
+
+def test_a_failed_destroy_the_plugin_did_not_clear_is_not_resumed(tofu):
+    table = DESTROYED[1]["address"]
+    plugin = Plugin(cleared=(SCHEMA,))
+    assert _resume(plugin, _errored(SCHEMA), _errored(table), DIAGNOSTIC, DIAGNOSTIC) is None
+    assert plugin.calls == [DESTROYED[:2]]  # the waited destroys, by address
+    assert tofu["plan"] == 0 and tofu["apply"] == 0

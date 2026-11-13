@@ -90,6 +90,8 @@ class Vacated:
     schemas: Tuple[str, ...] = ()
     #: Lower-case full names of the tables the plan destroys in those schemas.
     tables: FrozenSet[str] = frozenset()
+    #: ``(catalog.schema, plan address)`` of each schema, as the plan names both.
+    addresses: Tuple[Tuple[str, str], ...] = ()
 
 
 def _name(before: Any, *keys: str) -> str:
@@ -115,11 +117,13 @@ def vacated(
     entries = [entry for entry in destroyed if isinstance(entry, Mapping)]
     keep = {str(name).lower() for name in declared}
     schemas: Dict[str, str] = {}
+    addresses: Dict[str, str] = {}
     for entry in entries:
         if entry.get("type") == "databricks_schema":
             name = _name(entry.get("before"), "catalog_name", "name")
             if name and name.lower() not in keep:
                 schemas.setdefault(name.lower(), name)
+                addresses.setdefault(name, str(entry.get("address") or ""))
     tables = frozenset(
         full.lower()
         for full in (
@@ -129,7 +133,10 @@ def vacated(
         )
         if full and full.lower().rsplit(".", 1)[0] in schemas
     )
-    return Vacated(str(product_id or ""), tuple(schemas[key] for key in sorted(schemas)), tables)
+    ordered = tuple(schemas[key] for key in sorted(schemas))
+    return Vacated(
+        str(product_id or ""), ordered, tables, tuple((name, addresses[name]) for name in ordered)
+    )
 
 
 @dataclass
@@ -160,14 +167,28 @@ def _contents(
             {**query, "include_browse": "true"},
             "tables",
         )
+        # Metric views are listed by table-summaries (databricks_metrics._schema_views reads
+        # them there): every name either listing gives is read.
+        summaries = _list_named(
+            session.client,
+            "/api/2.1/unity-catalog/table-summaries",
+            {"catalog_name": catalog, "schema_name_pattern": schema, "table_name_pattern": "%"},
+            "tables",
+        )
         listed = _list_named(session.client, "/api/2.1/unity-catalog/functions", query, "functions")
     except Exception as exc:  # noqa: BLE001 — a missing schema is an answer; the rest is raised on
         if _enforce.is_not_found(exc):
             return None
         raise
+    names = {str(row.get("full_name") or f"{where}.{row.get('name')}") for row in rows}
+    # The pattern is a SQL LIKE, so `_` matches any character: keep this schema's rows only.
+    names |= {
+        str(row.get("full_name") or "")
+        for row in summaries
+        if str(row.get("full_name") or "").lower().rsplit(".", 1)[0] == where.lower()
+    }
     objects: Dict[str, Mapping[str, Any]] = {}
-    for row in rows:
-        full = str(row.get("full_name") or f"{where}.{row.get('name')}")
+    for full in sorted(name for name in names if name):
         info = read_table(session.client, full)
         if info is not None:
             objects[full] = info
@@ -181,7 +202,7 @@ def _source(info: Mapping[str, Any]) -> str:
     """The table a metric view reads (its definition's ``source``), or ``""``."""
     try:
         document = yaml.safe_load(str(info.get("view_definition") or ""))
-    except yaml.YAMLError:
+    except Exception:  # noqa: BLE001 — YAMLError, or a ValueError for an impossible date
         return ""
     return str(document.get("source") or "").strip() if isinstance(document, Mapping) else ""
 
@@ -196,6 +217,11 @@ def _exists(session: Session, full: str, present: Iterable[str]) -> bool:
         return True
 
 
+def _named(binding: Any) -> str:
+    """The ``function_name`` of a row filter or mask the Tables API serves, or ``""``."""
+    return str(binding.get("function_name") or "") if isinstance(binding, Mapping) else ""
+
+
 def _holders(objects: Mapping[str, Mapping[str, Any]]) -> Dict[str, List[str]]:
     """``{function (full name, lower case): [objects whose row filter or a mask names it]}``.
 
@@ -203,8 +229,8 @@ def _holders(objects: Mapping[str, Mapping[str, Any]]) -> Dict[str, List[str]]:
     catalog and schema, so no form of it can make a bound function look unbound."""
     holders: Dict[str, List[str]] = {}
     for full, info in sorted(objects.items()):
-        bound = [(info.get("row_filter") or {}).get("function_name")]
-        bound += [(c.get("mask") or {}).get("function_name") for c in _live_columns(info).values()]
+        bound = [_named(info.get("row_filter"))]
+        bound += [_named(c.get("mask")) for c in _live_columns(info).values()]
         for name in filter(None, bound):
             parts = _bare(name).split(".")
             home = full.lower().split(".")[: max(0, 3 - len(parts))]
@@ -225,17 +251,21 @@ class _Clearing:
 
     def run(self) -> _Outcome:
         try:
-            read = _contents(self.session, self.where)
-            self.me = self.session.identity if read is not None else ""
-        except Exception as exc:  # noqa: BLE001 — unknown contents: drop nothing
+            self._clear()
+        except Exception as exc:  # noqa: BLE001 — what cannot be read is left as it is
+            more = " more" if self.out.dropped else ""
             self.say(
                 f"    not checked: {self.where} could not be read ({type(exc).__name__}: "
-                f"{scrub(exc)}), so nothing in it was dropped"
+                f"{scrub(exc)}), so nothing{more} in it was dropped"
             )
             self.out.unread = True
-            return self.out
+        return self.out
+
+    def _clear(self) -> None:
+        read = _contents(self.session, self.where)
         if read is None:
-            return self.out  # the schema is gone already
+            return  # the schema is gone already
+        self.me = self.session.identity
         objects, functions = read
         self.present = frozenset(full.lower() for full in objects)
         for full, info in sorted(objects.items()):
@@ -249,15 +279,18 @@ class _Clearing:
         for name in functions:
             full = f"{self.where}.{name}"
             self._function(full, holders.get(_bare(full), []))
-        return self.out
 
     def _view(self, full: str, info: Mapping[str, Any]) -> None:
-        found = (info.get("properties") or {}).get(_metrics.PRODUCT_PROPERTY)
-        source = _source(info)
+        properties = info.get("properties")
+        found = (
+            properties.get(_metrics.PRODUCT_PROPERTY) if isinstance(properties, Mapping) else None
+        )
         if not self.vac.product_id or found != self.vac.product_id:
             whose = f"of product {found!r}" if found else "this module did not create"
             self.out.left.append(f"{full} (a metric view {whose})")
-        elif not source:
+            return
+        source = _source(info)
+        if not source:
             self.out.left.append(f"{full} (a metric view whose definition names no table)")
         elif source.lower() in self.vac.tables:
             self._drop_owned(full, info, "VIEW", f"it reads {source}, which this apply destroys")
@@ -364,7 +397,7 @@ def prepare(
         if not lines:
             continue
         if not shown:
-            say("\n  Schemas this apply destroys: what this product made there outside OpenTofu")
+            say("\n  Schemas this apply destroys, and what is in them outside OpenTofu")
             shown = True
         say(f"  {where}")
         for line in lines:
@@ -373,24 +406,27 @@ def prepare(
         say("    dry-run: none of these statements ran.")
 
 
-def unblock(vac: Vacated, say: Say, client_factory: Optional[ClientFactory] = None) -> bool:
-    """After a ``tofu apply`` that failed only at destroying ``vac.schemas``: drop what this
-    product made there that the apply's own destroys freed (the functions of the tables it
-    destroyed), by :func:`prepare`'s rules. ``True`` when something was dropped, no drop failed
-    and nothing it can see is left, so destroying the schemas again can succeed."""
+def unblock(
+    vac: Vacated, say: Say, client_factory: Optional[ClientFactory] = None
+) -> Tuple[str, ...]:
+    """After a ``tofu apply`` that failed at destroying ``vac.schemas``: drop what this product
+    made there that the apply's own destroys freed (the functions of the tables it destroyed),
+    by :func:`prepare`'s rules. The plan addresses of the schemas it cleared: something was
+    dropped there, no drop failed and nothing it can see is left, so destroying them again can
+    succeed."""
     if not vac.schemas:
-        return False
+        return ()
     session = _session(vac, say, client_factory)
     if session is None:
-        return False
-    dropped, clear = 0, True
-    for where in vac.schemas:
+        return ()
+    cleared: List[str] = []
+    for where, address in vac.addresses:
         say(f"\n  {where}: tofu apply could not destroy it yet: it held what this product made")
         out = _Clearing(session, Vacated(vac.product_id, (where,)), where, say, False).run()
         _say_left(where, out, say)
-        dropped += out.dropped
-        clear = clear and not (out.failed or out.left or out.unread or out.waiting)
-    return dropped > 0 and clear
+        if out.dropped and not (out.failed or out.left or out.unread or out.waiting):
+            cleared.append(address)
+    return tuple(cleared)
 
 
 __all__ = ["Vacated", "prepare", "unblock", "vacated"]

@@ -77,6 +77,14 @@ class IacProviderPlugin(Protocol):
       the current state before the plan.
     * ``catalog_move_spec()``: the ``CatalogMoveSpec`` of an out-of-tree cloud
       whose emitter moved its catalog resources (``iac/catalog_moves.py``).
+    * ``prepare_destroys(contract, destroyed, say, dry_run)``: before ``tofu
+      apply``, clears what the plugin made outside OpenTofu in the resources the
+      saved plan only deletes (``destroyed``: ``{address, type, before}`` each),
+      so the cloud does not refuse their destroy.
+    * ``unblock_destroys(contract, blocked, say)``: after an apply that failed
+      at destroying ``blocked`` (some of those), clears what the apply's own
+      destroys freed, and returns the addresses it cleared; the engine plans and
+      applies those destroys again only when they are every resource that failed.
     """
 
     #: Short cloud name, e.g. "gcp" / "aws" / "snowflake".

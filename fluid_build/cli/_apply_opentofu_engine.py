@@ -508,12 +508,12 @@ def _resume_blocked_destroys(
     the functions of a table's column masks and row filter until the table is gone, and refuses
     to delete a schema that holds them, so a schema the contract stopped using fails to destroy
     in the very apply that destroyed its tables. Optional plugin capability
-    ``unblock_destroys(contract, blocked, say) -> bool``: the Databricks plugin drops those
-    functions once no table uses them, and says what it dropped
-    (``iac/providers/databricks_vacated.py``). Fails closed: it resumes only when every
-    resource the apply failed on is a delete of the saved plan and no error is left
-    unaccounted for, the plugin cleared something, and the plan made after it holds nothing but
-    some of those deletes, which the data-loss gate already passed.
+    ``unblock_destroys(contract, blocked, say)``: the addresses of the destroys it cleared (the
+    Databricks plugin drops those functions once no table uses them, and says what it dropped,
+    ``iac/providers/databricks_vacated.py``). Fails closed: it resumes only when every
+    resource the apply failed on is a delete of the saved plan that the plugin cleared, no
+    error is left unaccounted for, and the plan made after it holds nothing but some of those
+    deletes, which the data-loss gate already passed.
     """
     unblock = getattr(plugin, "unblock_destroys", None)
     errored = runner.errored_resources(result)
@@ -524,14 +524,15 @@ def _resume_blocked_destroys(
         return None
     waited = sorted({address for address, _action in errored})
     try:
-        cleared = unblock(contract, [planned[address] for address in waited], say=cprint_literal)
+        blocked = [planned[address] for address in waited]
+        cleared = set(unblock(contract, blocked, say=cprint_literal) or ())
     except Exception as exc:  # noqa: BLE001 — the apply's own failure is what the run raises
         cprint_literal(
             f"  what holds {', '.join(waited)} could not be cleared: {type(exc).__name__}"
         )
         return None
-    if not cleared:
-        return None
+    if cleared != set(waited):
+        return None  # a failure the plugin did not clear: the apply's own error stands
     plan = runner.tofu_plan(workdir, env=env)
     removals = {address for address, _kind in runner.planned_removals(plan)}
     only_those = {"add": 0, "change": 0, "remove": len(removals)}
