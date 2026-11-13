@@ -65,7 +65,8 @@ resources, with no new schema field (fluid-schema 0.7.6):
   writes ``COMMENT '...'`` (``parseComment``), so a trailing backslash would escape the
   closing quote; one holding ``${`` is refused too, since Spark may substitute it. On a
   table a dbt build writes, the comments are dbt's (its ``CREATE OR REPLACE`` sets them
-  from the model, with ``persist_docs``), so the module sets none.
+  from the model, with ``persist_docs``), so the module sets none, and ``fluid validate``
+  says so in a note (not a warning: there is nothing to fix, so ``--strict`` passes).
 * Unity Catalog's certification (the system governed tag ``system.certification_status``)
   is ``deprecated`` when the expose's ``lifecycle.state`` (else the product's) is
   ``deprecated``, else ``certified`` when the label ``certification: certified`` (the
@@ -402,6 +403,9 @@ class _Compiled:
     dbt_written: List[str] = field(default_factory=list)
     #: What applies but is worth saying (``fluid validate`` warnings).
     warnings: List[str] = field(default_factory=list)
+    #: What is worth saying but asks nothing of the author (``fluid validate`` notes, which
+    #: ``--strict`` never fails on).
+    notes: List[str] = field(default_factory=list)
     #: ``(entity type, full name, tag key, tag value)`` per tag assignment emitted.
     tags: List[Tuple[str, str, str, str]] = field(default_factory=list)
     #: The metric views of the exposes that declare ``semantics`` (``databricks_metrics.py``).
@@ -1419,7 +1423,9 @@ def _emit_tables(
             compiled, table, cid, warehouse, region, dbt_owned=table.expose_id in dbt_written
         )
         if table.expose_id in dbt_written and (table.comment or table.column_comments):
-            compiled.warnings.append(
+            # A note, not a warning: the descriptions are wanted and persist_docs is the
+            # supported path, so there is nothing to fix, and --strict must not fail on it.
+            compiled.notes.append(
                 f"{table.where} is written by dbt, whose CREATE OR REPLACE sets the table and "
                 "column comments: Unity Catalog shows the dbt model's descriptions (with "
                 "persist_docs), not the contract's, so fluid apply sets none."
@@ -3314,16 +3320,23 @@ def planned_objects(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
 
 def validate_databricks_binding(
-    contract: Mapping[str, Any], env: Optional[Mapping[str, str]] = None
+    contract: Mapping[str, Any],
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    notes: Optional[List[str]] = None,
 ) -> Tuple[List[str], List[str]]:
     """``(errors, warnings)``: what ``fluid generate iac`` / ``fluid apply`` would refuse.
 
     The same pass the emitter runs (:func:`_compile`), so ``fluid validate``
     reports every refusal at stage 2, with the emitter's message, instead of
     the first one at apply. The warnings name what applies but loses precision.
+    ``notes``, when given, receives what is worth saying but asks nothing of the
+    author (a dbt-written table's comments), which ``--strict`` never fails on.
     """
     env = os.environ if env is None else env
     compiled = _compile(contract, env, validating=True)
+    if notes is not None:
+        notes.extend(compiled.notes)
     refusals = list(compiled.refusals)
     warnings = _scale_zero_warnings(compiled.tables) + compiled.warnings
     # Without one resolved table a Genie refusal would only repeat the table's own.

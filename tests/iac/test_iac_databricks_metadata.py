@@ -13,7 +13,7 @@ it from the one ``_compile`` pass, so ``fluid validate``, the emitter, the plann
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import pytest
 
@@ -212,8 +212,12 @@ class TestComments:
         assert "comment" not in table
         assert all("comment" not in column for column in table["column"])
         assert {"comment", "column"} <= set(table["lifecycle"]["ignore_changes"])
-        _errors, warnings = dbx.validate_databricks_binding(contract)
-        assert any("persist_docs" in w and "exposes[0] (tickets)" in w for w in warnings)
+        # A note, not a warning: there is nothing to fix, so ``--strict`` must pass.
+        notes: List[str] = []
+        _errors, warnings = dbx.validate_databricks_binding(contract, notes=notes)
+        assert any("persist_docs" in n and "exposes[0] (tickets)" in n for n in notes)
+        assert not any("persist_docs" in w for w in warnings)
+        assert not any("persist_docs" in w for w in dbx.validate_databricks_binding(contract)[1])
         (managed,), _ = dbx.managed_objects(contract)
         assert managed.comment is None and managed.column_comments == ()
 

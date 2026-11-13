@@ -1275,7 +1275,7 @@ def _run_contract_rules(
 def _databricks_binding_check(validation_result, contract: Mapping[str, Any]) -> None:
     """What the Databricks emitter would refuse (no SQL warehouse in
     DATABRICKS_WAREHOUSE_ID, a contract-named host, Iceberg, governance applied
-    but never enforced), and its warnings, into the result.
+    but never enforced), and its warnings and notes, into the result.
 
     Fails closed: a check that cannot be imported or that raises is an error,
     never a gate silently switched off (the Iceberg-sink block above says why).
@@ -1283,7 +1283,8 @@ def _databricks_binding_check(validation_result, contract: Mapping[str, Any]) ->
     try:
         from fluid_build.iac.providers.databricks import validate_databricks_binding
 
-        errors, warnings = validate_databricks_binding(contract)
+        notes: List[str] = []
+        errors, warnings = validate_databricks_binding(contract, notes=notes)
     except Exception as exc:  # noqa: BLE001 — reported, never swallowed
         validation_result.add_error(
             f"Databricks binding check could not run ({type(exc).__name__}: {exc}); "
@@ -1296,6 +1297,8 @@ def _databricks_binding_check(validation_result, contract: Mapping[str, Any]) ->
         validation_result.is_valid = False
     for msg in warnings:
         validation_result.add_warning(msg)
+    for msg in notes:
+        validation_result.add_note(msg)
 
 
 def _build_id_check(validation_result, contract: Mapping[str, Any]) -> None:
@@ -1625,9 +1628,12 @@ def _output_json_results(result: ValidationResult, args) -> int:
             "schema_version": str(result.schema_version) if result.schema_version else None,
             "errors": result.errors,
             "warnings": result.warnings,
-            "validation_time": result.validation_time,
         }
     )
+    if result.notes:
+        # Only when there is one: a contract without notes keeps the document it always had.
+        output["notes"] = result.notes
+    output["validation_time"] = result.validation_time
 
     _cprint_json(json.dumps(output, indent=2))
     return 0 if result.is_valid and (not args.strict or not result.warnings) else 1
@@ -1661,6 +1667,14 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
         cprint("====================")
         for i, warning in enumerate(result.warnings, 1):
             _cprint_literal(f"{i:2}. {warning}")
+        cprint()
+
+    # Notes ask nothing of the author, so --strict never counts them (exit code below).
+    if result.notes and not args.quiet:
+        cprint("Validation Notes:")
+        cprint("=================")
+        for i, note in enumerate(result.notes, 1):
+            _cprint_literal(f"{i:2}. {note}")
         cprint()
 
     # Verbose information
@@ -1946,9 +1960,13 @@ def _run_bundle_validation(
             f"({s.get('error', 0)} error, {s.get('warning', 0)} warning, "
             f"{s.get('info', 0)} info)"
         )
-        # A bundle that passes still lists its warnings, as a contract file does.
+        # A bundle that passes still lists its warnings and its contract's notes, as a
+        # contract file does.
         for issue in report.issues:
-            if verbose or report.status == "fail" or issue.severity == "warning":
+            listed = issue.severity == "warning" or (
+                issue.severity == "info" and issue.code == "CONTRACT-RULE"
+            )
+            if verbose or report.status == "fail" or listed:
                 _cprint_literal(f"   [{issue.severity}] {_bundle_issue_text(issue)}")
         if strict and not any(issue.severity == "error" for issue in report.issues):
             warnings = [_bundle_issue_text(i) for i in report.issues if i.severity == "warning"]
@@ -2140,5 +2158,16 @@ def _bundle_contract_rule_issues(
             code="CONTRACT-RULE",
         )
         for msg in result.warnings
+    )
+    # A note is the report's info: counted, listed, never failed on by --strict.
+    issues.extend(
+        ValidationIssue(
+            file="contract.resolved.yaml",
+            validator="contract",
+            severity="info",
+            message=msg,
+            code="CONTRACT-RULE",
+        )
+        for msg in result.notes
     )
     return issues

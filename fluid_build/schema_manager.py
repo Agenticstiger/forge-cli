@@ -375,6 +375,9 @@ class ValidationResult:
     validation_time: Optional[float] = None
     #: What was validated, as the summary names it.
     subject: str = "FLUID contract"
+    #: What is worth saying but asks nothing of the author: shown with the result, never an
+    #: error or a warning, so ``--strict`` does not fail on one (SARIF's ``note`` level).
+    notes: List[str] = field(default_factory=list)
 
     def add_error(self, error: str) -> None:
         """Add a validation error."""
@@ -384,6 +387,10 @@ class ValidationResult:
     def add_warning(self, warning: str) -> None:
         """Add a validation warning."""
         self.warnings.append(warning)
+
+    def add_note(self, note: str) -> None:
+        """Add a note: shown with the result, never counted by ``--strict``."""
+        self.notes.append(note)
 
     def get_summary(self) -> str:
         """Get a human-readable summary."""
