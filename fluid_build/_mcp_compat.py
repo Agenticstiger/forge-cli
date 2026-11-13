@@ -12,9 +12,11 @@ kwargs accept both spellings).  Everything else forge-cli touches survived
 with a compatible shape — verified against the installed 2.0.0 wheel, not
 the migration guide, which oversells several removals:
 
-- ``mcp.server.stdio.stdio_server`` and ``mcp.server.sse.SseServerTransport``
-  still exist with v1-compatible interfaces (the guide calls them internal;
-  the ``mcp-sdk-drift`` CI job is the tripwire if a 2.x minor drops them).
+- ``mcp.server.stdio.stdio_server``,
+  ``mcp.server.streamable_http_manager.StreamableHTTPSessionManager`` and
+  ``mcp.server.transport_security.TransportSecuritySettings`` still exist with
+  v1-compatible interfaces (the guide calls some of them internal; the
+  ``mcp-sdk-drift`` CI job is the tripwire if a 2.x minor drops them).
 - ``ClientSession`` / ``ClientSessionGroup`` / ``StdioServerParameters`` and
   ``mcp.client.session_group.{SseServerParameters,StreamableHttpParameters}``
   are intact, as are ``ServerSession.create_message`` and
@@ -138,6 +140,27 @@ def get_server_api() -> tuple[type, type]:
     from mcp.server.fastmcp import Context, FastMCP  # type: ignore[no-redef]
 
     return FastMCP, Context
+
+
+def lowlevel_server(app: Any) -> "Server":
+    """Return the lowlevel ``Server`` behind a high-level app from
+    :func:`get_server_api`.
+
+    The Streamable HTTP session manager takes the lowlevel server, exactly as
+    the SDK's own ``streamable_http_app()`` builds it. Neither generation
+    exposes it publicly: v1 ``FastMCP`` keeps it in ``_mcp_server``, v2
+    ``MCPServer`` in ``_lowlevel_server``. A missing attribute means the SDK
+    moved it, so this fails loudly rather than serving nothing.
+    """
+    require_sdk()
+    name = "_lowlevel_server" if is_v2() else "_mcp_server"
+    server = getattr(app, name, None)
+    if server is None:
+        raise RuntimeError(
+            f"mcp SDK layout changed: {type(app).__name__} has no {name!r}; "
+            "update fluid_build._mcp_compat.lowlevel_server"
+        )
+    return server
 
 
 def build_lowlevel_server(
@@ -327,3 +350,30 @@ async def open_inmemory_session(server: "Server", **client_kwargs: Any) -> Async
                 await session.initialize()
                 yield session
             tg.cancel_scope.cancel()
+
+
+@asynccontextmanager
+async def open_streamable_http_session(
+    url: str, *, headers: Optional[Dict[str, str]] = None, **client_kwargs: Any
+) -> AsyncIterator[Any]:
+    """Yield an initialised ``ClientSession`` connected to ``url`` over
+    Streamable HTTP, sending ``headers`` (e.g. ``Authorization``) on every
+    request.
+
+    Both generations ship ``streamable_http_client(url, http_client=...)`` and
+    ``create_mcp_http_client(headers=...)`` (httpx on v1, httpx2 on v2, chosen
+    by the SDK). The transport yields three values on v1 (the third is a
+    session-ID getter) and two on v2, so only the first two are used.
+    ``client_kwargs`` pass through to ``ClientSession`` (see
+    :func:`self_attesting_client_kwargs`).
+    """
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.shared._httpx_utils import create_mcp_http_client
+
+    async with create_mcp_http_client(headers=headers) as http_client:
+        async with streamable_http_client(url, http_client=http_client) as streams:
+            read_stream, write_stream = streams[0], streams[1]
+            async with ClientSession(read_stream, write_stream, **client_kwargs) as session:
+                await session.initialize()
+                yield session

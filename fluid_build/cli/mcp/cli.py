@@ -19,7 +19,9 @@ from fluid_build.cli.mcp.policy import _build_fastmcp_app, _build_policy_from_ar
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser(COMMAND, help="Serve staged forge tools over MCP stdio")
+    parser = subparsers.add_parser(
+        COMMAND, help="Serve forge's authoring tools over MCP (stdio or HTTP)"
+    )
     # ``required=False`` so a bare ``fluid mcp`` doesn't blow up
     # with the bare-bones argparse "the following arguments are
     # required: mcp_action" error.  ``run`` catches the
@@ -27,7 +29,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     # describing the ``serve`` action.
     parser.set_defaults(func=run)
     sp = parser.add_subparsers(dest="mcp_action", required=False)
-    serve = sp.add_parser("serve", help="Run the MCP stdio server")
+    serve = sp.add_parser(
+        "serve",
+        help="Run the MCP server (stdio, or --transport http for remote clients)",
+    )
     serve.add_argument(
         "--read-only",
         action="store_true",
@@ -115,13 +120,14 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "for every catalog call, including one that does not ask for it."
         ),
     )
+    from fluid_build.cli import mcp_output_port as _output_port
+
+    _output_port.add_http_transport_arguments(serve, default_port=_output_port.AUTHORING_HTTP_PORT)
     serve.set_defaults(func=run)
     # Attach the consumer-side output-port action group under the
     # same ``fluid mcp`` parent so operators see one MCP surface
     # with two distinct flavours (authoring vs consumption).
-    from fluid_build.cli.mcp_output_port import attach_to_mcp_subparsers
-
-    attach_to_mcp_subparsers(sp)
+    _output_port.attach_to_mcp_subparsers(sp)
 
 
 def run(args, logger: logging.Logger) -> int:
@@ -135,6 +141,8 @@ def run(args, logger: logging.Logger) -> int:
         # Build first: when the SDK is missing this raises, and the process must
         # not be left with a policy installed for a server that never started.
         app = _build_fastmcp_app(policy)
+        if (getattr(args, "transport", None) or "stdio") == "http":
+            return _serve_http(app, policy, args, logger)
         _set_policy(policy)
         try:
             asyncio.run(app.run_stdio_async())
@@ -149,6 +157,51 @@ def run(args, logger: logging.Logger) -> int:
     if callable(func):
         return func(args, logger)
     return 1
+
+
+def _serve_http(app, policy, args, logger: logging.Logger) -> int:
+    """Serve ``app`` over MCP Streamable HTTP (``fluid_build._mcp_http``).
+
+    Auth comes from the same ``FLUID_MCP_AUTH_*`` variables as the output port.
+    A bad value, or an unauthenticated non-loopback ``--host``, stops here with
+    exit 2 before anything listens.
+    """
+    import sys
+
+    from fluid_build import _mcp_http
+    from fluid_build._mcp_compat import lowlevel_server
+    from fluid_build.cli.mcp_output_port import AUTHORING_HTTP_PORT, _http_auth_validator
+
+    command = "fluid mcp serve"
+    host = getattr(args, "host", None) or "127.0.0.1"
+    port = int(getattr(args, "port", None) or AUTHORING_HTTP_PORT)
+    validator = _http_auth_validator()
+    refusal = _mcp_http.bind_refusal(command=command, host=host, port=port, validator=validator)
+    if refusal is not None:
+        sys.stderr.write(refusal)
+        sys.stderr.flush()
+        return 2
+    _set_policy(policy)
+    sys.stderr.write(
+        _mcp_http.startup_message(
+            command=command, host=host, port=port, validator=validator, what="these tools"
+        )
+    )
+    sys.stderr.flush()
+    try:
+        asyncio.run(
+            _mcp_http.serve_streamable_http(
+                lowlevel_server(app),
+                command=command,
+                host=host,
+                port=port,
+                validator=validator,
+                logger=logger,
+            )
+        )
+    except KeyboardInterrupt:
+        return 0
+    return 0
 
 
 def _render_mcp_guide() -> int:
@@ -168,12 +221,23 @@ def _render_mcp_guide() -> int:
         SubcommandEntry(
             name="serve",
             description=(
-                "Run the MCP stdio server.  Exposes the staged forge tool "
+                "Run the MCP server.  Exposes the staged forge tool "
                 "surface (catalog reads, contract regeneration, semantic "
-                "memory search) over JSON-RPC for Claude Code, Cursor, "
-                "Continue, and any MCP client."
+                "memory search) over stdio for Claude Code, Cursor, "
+                "Continue, and any MCP client that starts it, or over "
+                "Streamable HTTP (--transport http) for remote clients "
+                "and agent harnesses."
             ),
             example="fluid mcp serve --read-only",
+        ),
+        SubcommandEntry(
+            name="serve --transport http",
+            description=(
+                "Serve the same tools at http://127.0.0.1:8766/mcp. Set "
+                "FLUID_MCP_AUTH_TOKEN to require a bearer token; any --host "
+                "other than loopback needs one."
+            ),
+            example='FLUID_MCP_AUTH_TOKEN="$(openssl rand -hex 32)" fluid mcp serve --transport http',
         ),
     ]
     guide = SubcommandGuide(

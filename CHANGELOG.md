@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fluid mcp serve --transport http`: the authoring tools over MCP Streamable HTTP, for remote
+  clients and hosted agent harnesses.** `fluid mcp serve` spoke only stdio, so a host that attaches
+  MCP servers by URL (an agent harness, Anthropic's MCP connector, `claude mcp add --transport
+  http`) could not use it. `--transport http` serves the same tools, with the same `--read-only`,
+  `--allow-tools` and path sandbox, at `http://127.0.0.1:8766/mcp` (`--host`, `--port`; the output
+  port keeps 8765, so both can run). Auth is the output port's: `FLUID_MCP_AUTH_TOKEN` (the default
+  `shared-token` mode) or `FLUID_MCP_AUTH_MODE=jwt`. Clients send `Authorization: Bearer <token>`;
+  a request without it gets 401, with `WWW-Authenticate`, before any session exists. A session
+  answers only the identity that opened it: another caller presenting its `Mcp-Session-Id` gets 404.
+
+### Changed
+
+- **`fluid mcp output-port serve --transport http` speaks Streamable HTTP at `/mcp`; the HTTP+SSE
+  endpoints `/sse` and `/messages/` are gone.** The MCP specification deprecated HTTP+SSE in its
+  2025-03-26 revision. Both servers now share one transport (`fluid_build/_mcp_http.py`) on the
+  SDK's `StreamableHTTPSessionManager`, starlette and uvicorn from the `[mcp]` extra; nothing new
+  is installed. Point clients at `http://<host>:<port>/mcp`. Verified identity, row filters and
+  audit records still bind per request.
+- **An MCP server without auth listens on loopback only.** Both servers refuse, with exit 2 and the
+  fix, to listen beyond loopback (`127.0.0.0/8`, `::1`, `localhost`) without auth, or with a shared
+  token shorter than 32 characters; the output port used to warn and serve. Without auth a request
+  must also carry a loopback `Host` header (DNS-rebinding protection; anything else gets 421), so a
+  gateway behind a reverse proxy that forwards its public name needs its own token, as the proxy
+  templates in `examples/mcp-output-port-docker/proxy/` already said. On both servers, with or
+  without auth, a browser `Origin` from another machine gets 403.
+
 ## [0.30.1] — 2026-11-13
 
 ### Fixed

@@ -11,7 +11,7 @@ So, like ``jurisdiction``, they are verified-only: a value the client supplies
 about itself never binds them, whatever the auth mode, and a gateway that could
 never honour them refuses to start instead of serving every call a denial.
 
-These tests drive the resolver, the real HTTP/SSE transport, the in-memory
+These tests drive the resolver, the real Streamable HTTP transport, the in-memory
 stdio session and the real CLI.
 """
 
@@ -31,18 +31,16 @@ import pytest
 
 duckdb = pytest.importorskip("duckdb")
 
-from mcp import ClientSession  # noqa: E402
-from mcp.client.sse import sse_client  # noqa: E402
-
 from fluid_build._mcp_compat import (  # noqa: E402
     open_inmemory_session,
+    open_streamable_http_session,
     self_attesting_client_kwargs,
 )
 from fluid_build.output_ports.mcp import OutputPortMcpServer, OutputPortPolicy  # noqa: E402
 from fluid_build.output_ports.mcp import auth as auth_mod  # noqa: E402
 
 from ._fixtures import make_expose, write_customer_csv  # noqa: E402
-from .test_extensibility_and_runtime import _free_port, _running_sse_server  # noqa: E402
+from .test_extensibility_and_runtime import _free_port, _running_http_server  # noqa: E402
 
 TOKEN = "test-shared-token-not-a-secret"  # pragma: allowlist secret
 CERT_ATTRS = ("client_cn", "client_fingerprint")
@@ -150,18 +148,18 @@ def test_verified_certificate_attributes_still_bind(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------
-# End to end: unauthenticated HTTP/SSE and stdio
+# End to end: unauthenticated HTTP and stdio
 # ---------------------------------------------------------------------
 
 
-async def _sample_over_sse(port: int, headers: Dict[str, str], **attest: Any) -> Dict[str, Any]:
-    async with sse_client(f"http://127.0.0.1:{port}/sse", headers=headers) as (read, write):
-        async with ClientSession(
-            read, write, **self_attesting_client_kwargs("cn-test", "1.0.0", **attest)
-        ) as session:
-            await session.initialize()
-            result = await session.call_tool("sample", {"limit": 10})
-            return json.loads(result.content[0].text)
+async def _sample_over_http(port: int, headers: Dict[str, str], **attest: Any) -> Dict[str, Any]:
+    async with open_streamable_http_session(
+        f"http://127.0.0.1:{port}/mcp",
+        headers=headers,
+        **self_attesting_client_kwargs("cn-test", "1.0.0", **attest),
+    ) as session:
+        result = await session.call_tool("sample", {"limit": 10})
+        return json.loads(result.content[0].text)
 
 
 def _isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, env: Dict[str, str]) -> Path:
@@ -190,8 +188,8 @@ async def test_unauthenticated_http_does_not_bind_a_self_attested_cn(
     )
     server = _server(_cn_expose(tmp_path), tmp_path)
     port = _free_port()
-    with _running_sse_server(server, port):
-        payload = await _sample_over_sse(
+    with _running_http_server(server, port):
+        payload = await _sample_over_http(
             port, {"X-Client-CN": "C0001"}, client_cn="C0002", client_fingerprint="ff"
         )
     assert payload.get("rows") is None, payload
@@ -210,8 +208,8 @@ async def test_unauthenticated_http_without_a_proxy_does_not_bind_a_self_atteste
     _isolated_env(monkeypatch, tmp_path, {"FLUID_MCP_AUTH_MODE": "none"})
     server = _server(_cn_expose(tmp_path), tmp_path)
     port = _free_port()
-    with _running_sse_server(server, port):
-        payload = await _sample_over_sse(port, {}, client_cn="C0003")
+    with _running_http_server(server, port):
+        payload = await _sample_over_http(port, {}, client_cn="C0003")
     assert payload.get("rows") is None, payload
     assert payload.get("error"), payload
 
@@ -276,7 +274,14 @@ def _write_contract(tmp_path: Path, *, cn_filter: bool) -> Path:
     return contract
 
 
-def _serve(tmp_path: Path, env_overrides: Dict[str, str], *, transport: str, cn_filter: bool):
+def _serve(
+    tmp_path: Path,
+    env_overrides: Dict[str, str],
+    *,
+    transport: str,
+    cn_filter: bool,
+    extra_args: tuple = (),
+):
     repo_root = Path(__file__).resolve().parents[2]
     env = {k: v for k, v in os.environ.items() if k not in _AUTH_ENV_VARS}
     env.update(
@@ -308,6 +313,7 @@ def _serve(tmp_path: Path, env_overrides: Dict[str, str], *, transport: str, cn_
             str(_free_port()),
             "--readable-paths",
             str(tmp_path),
+            *extra_args,
         ],
         cwd=str(tmp_path),
         env=env,
@@ -339,6 +345,24 @@ def test_cli_certificate_row_filter_without_auth_refuses_to_start(tmp_path: Path
     output = proc.stdout + proc.stderr
     assert proc.returncode == 2, output
     assert "caller.client_cn" in output
+    assert "Traceback" not in output
+
+
+@pytest.mark.parametrize("auth_env", list(UNAUTHENTICATED_HTTP_ENVS), ids=str)
+def test_cli_unauthenticated_http_beyond_loopback_refuses_to_start(tmp_path: Path, auth_env: str):
+    """Without auth the gateway listens on loopback only: a wider --host
+    stops with exit 2 before the contract is even loaded."""
+    proc = _serve(
+        tmp_path,
+        UNAUTHENTICATED_HTTP_ENVS[auth_env],
+        transport="http",
+        cn_filter=False,
+        extra_args=("--host", "0.0.0.0"),
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 2, output
+    assert "fluid mcp output-port: refusing to listen on 0.0.0.0" in output
+    assert "--host 127.0.0.1" in output
     assert "Traceback" not in output
 
 

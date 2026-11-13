@@ -64,12 +64,17 @@ This directory carries two ready-to-edit templates:
    range can assert any client certificate.
 
 4. **Start the gateway** (binds to `127.0.0.1:8765` so only the proxy
-   can reach it):
+   can reach it; MCP Streamable HTTP at `/mcp`):
 
     ```bash
     fluid mcp output-port serve ./contract.fluid.yaml \
       --transport http --host 127.0.0.1 --port 8765
     ```
+
+   Keep `FLUID_MCP_AUTH_TOKEN` set here. Without auth the gateway listens
+   on loopback only and accepts only a loopback `Host` header (DNS-rebinding
+   protection), so a request the proxy forwards under its public name gets
+   `421 Invalid Host header`.
 
 5. **Start the proxy:**
 
@@ -78,8 +83,8 @@ This directory carries two ready-to-edit templates:
     nginx -c $(pwd)/nginx.conf
     ```
 
-6. **Configure your MCP client** with the client cert + the bearer
-   token. (Claude Desktop's MCP config supports both via the
+6. **Configure your MCP client** with the client cert, the bearer
+   token and the URL `https://mcp.your-domain.example/mcp`. (Claude Desktop's MCP config supports both via the
    `headers` field; Cursor needs a wrapper script.)
 
 ## Honest limits

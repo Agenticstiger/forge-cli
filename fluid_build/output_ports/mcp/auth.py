@@ -252,6 +252,26 @@ class AuthValidator:
             return bool(self.jwt_issuer and self.jwt_audience and self.jwt_jwks_url)
         return False
 
+    def disabled_reason(self) -> str:
+        """Why :meth:`is_enabled` is False, naming the variables to set.
+
+        Never includes a configured value. Meaningless when auth is enabled.
+        """
+        if self.mode == "none":
+            return "FLUID_MCP_AUTH_MODE=none"
+        if self.mode == "jwt":
+            missing = [
+                name
+                for name, value in (
+                    ("FLUID_MCP_JWT_ISSUER", self.jwt_issuer),
+                    ("FLUID_MCP_JWT_AUDIENCE", self.jwt_audience),
+                    ("FLUID_MCP_JWT_JWKS_URL", self.jwt_jwks_url),
+                )
+                if not value
+            ]
+            return f"FLUID_MCP_AUTH_MODE=jwt but {', '.join(missing)} is unset"
+        return f"FLUID_MCP_AUTH_MODE={self.mode} but FLUID_MCP_AUTH_TOKEN is unset"
+
     def validate(self, headers: Mapping[str, str]) -> AuthDecision:
         """Validate a request's headers and return an
         :class:`AuthDecision`. Headers are case-insensitive — pass
