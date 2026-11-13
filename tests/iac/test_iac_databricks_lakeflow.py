@@ -930,3 +930,12 @@ def test_converge_leaves_an_earlier_genie_space_of_pipeline_tables_alone(tmp_pat
         dbx.DatabricksIacPlugin().converge_output_ports(contract, said.append)
     assert called == []
     assert any("Genie space: left as it is" in line for line in said)
+
+
+def test_the_genie_block_of_a_product_of_pipeline_tables_is_still_checked(tmp_path):
+    contract = _edit(
+        g=lambda c: c.setdefault("extensions", {}).update(databricksGenie={"tittle": "x"})
+    )
+    genie = dbx._genie(contract, _compile(contract, tmp_path), ENV)
+    assert genie.space is None
+    assert genie.refusals and "tittle" in str(genie.refusals[0])

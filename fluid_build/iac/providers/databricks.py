@@ -3308,8 +3308,10 @@ def _genie(contract: Mapping[str, Any], compiled: _Compiled, env: Mapping[str, s
     from .databricks_genie import Compiled, compile_space
 
     if _genie_waits_for_pipelines(contract, compiled):
-        # No space yet (_pipeline_table_warnings); converge_output_ports leaves an existing one.
-        return Compiled(product_id=str(contract.get("id") or "").strip())
+        # No space yet (_pipeline_table_warnings), and converge_output_ports leaves an existing
+        # one; the block and the tables are still checked, as they would be with the space.
+        checked = compile_space(contract, compiled.tables, compiled.grants, env)
+        return Compiled(product_id=checked.product_id, refusals=checked.refusals)
     return compile_space(contract, _tables_before_build(compiled), compiled.grants, env)
 
 
