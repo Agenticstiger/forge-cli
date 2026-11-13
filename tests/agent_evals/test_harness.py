@@ -1610,12 +1610,58 @@ def test_the_codex_config_is_toml_with_the_isolation_the_claude_arms_have(
     assert files[str(run_dir.resolve() / "home")] == "write"
     assert files[str(run_dir.resolve() / "tmp")] == "write"
     paths = [Path(k).resolve() for k, v in files.items() if not k.startswith(":") and v == "read"]
-    assert bin_dir.resolve() in paths and harness.REPO_ROOT.resolve() in paths
     home, root = Path.home().resolve(), harness.REPO_ROOT.resolve()
+    assert bin_dir.resolve() in paths and root / "fluid_build" in paths
+    prefixes = (Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve())
     for path in paths:
         assert path != home and path not in home.parents, f"{path} exposes the home directory"
-        assert path not in root.parents, f"{path} holds this checkout and its siblings"
-    assert not {home, root.parent} & set(paths)
+        # The checkout's own files (git-ignored settings, the reference solutions) stay out.
+        assert path != root and path not in root.parents, f"{path} exposes the checkout"
+        assert path in (bin_dir.resolve(), root / "fluid_build") or any(
+            p == path or p in path.parents for p in prefixes
+        ), f"{path} is neither fluid_build nor the interpreter's"
+    denied = {k for k, v in files.items() if v == "deny"}
+    assert str(run_dir.resolve() / "codex-home") in denied
+    assert any(k.endswith("codex-home/*") for k in denied), "every sibling run's API key too"
+    assert str(root / "fluid_build" / "agent_skills") in denied, "no-skill must not find skills"
+
+
+def test_a_codex_arm_imports_fluid_from_a_directory_holding_only_the_package(
+    tmp_path: Path,
+) -> None:
+    """Python lists a PYTHONPATH entry to import from it, so PYTHONPATH must not be the
+    checkout: the checkout would then have to be readable to the agent's commands."""
+    bin_dir = tmp_path / "run" / "bin"
+    env = harness._codex_env(bin_dir, tmp_path / "run")
+    src = Path(env["PYTHONPATH"])
+    assert src == bin_dir / "src"
+    assert [p.name for p in src.iterdir()] == ["fluid_build"]
+    assert (src / "fluid_build").resolve() == harness.REPO_ROOT.resolve() / "fluid_build"
+    shim_src = harness._shims(tmp_path / "run", src, None) / "fluid"
+    assert f"PYTHONPATH={src}" in shim_src.read_text(encoding="utf-8")
+
+
+def test_the_grader_never_follows_a_link_out_of_the_workspace(tmp_path: Path) -> None:
+    """An agent with a shell can link a contract to a secret; the grader runs as the
+    operator, outside any sandbox, and must not read or validate it."""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("aws_secret_access_key = not-a-real-key\n", encoding="utf-8")
+    ws = harness.prepare_workspace(ORDERS, tmp_path / "ws")
+    (ws / "contract.fluid.yaml").symlink_to(secret)
+    (ws / "notes.md").symlink_to(secret)
+    graded = harness.grade(ORDERS, ws)
+    assert not graded.valid
+    assert "leaves the workspace" in graded.validate_output
+    assert "not-a-real-key" not in json.dumps(graded.to_dict())
+    target = harness.Target({}, "", ws)
+    assert harness.run_check({"id": "x", "in_file": "notes.md", "matches": "key"}, target) == (
+        False,
+        "notes.md leaves the workspace",
+    )
+    assert harness.run_check({"id": "y", "exists_file": "notes.md"}, target)[0] is False
+    (ws / "inside.md").write_text("a key\n", encoding="utf-8")
+    (ws / "link.md").symlink_to(ws / "inside.md")
+    assert harness.run_check({"id": "z", "in_file": "link.md", "matches": "key"}, target)[0]
 
 
 def test_the_codex_rules_forbid_exactly_the_stages_the_claude_arms_lack() -> None:

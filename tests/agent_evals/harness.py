@@ -689,8 +689,23 @@ def _check_reads_upstream(check: Dict[str, Any], target: Target) -> Tuple[bool, 
     return False, f"consumes {pair} but no build reads {spec['exposeId']}"
 
 
+def _in_workspace(ws: Path, rel: str) -> Optional[Path]:
+    """``ws / rel`` when it resolves inside the workspace, else ``None``. The grader runs
+    as the operator, outside any sandbox, and an agent can plant a symlink in its
+    workspace (a Codex arm has a shell): a contract linked to ``~/.aws/credentials``
+    must not be read, let alone validated into ``results.json``."""
+    path = ws / rel
+    try:
+        inside = path.resolve().is_relative_to(ws.resolve())
+    except (OSError, RuntimeError):  # a symlink loop
+        return None
+    return path if inside else None
+
+
 def _check_in_file(check: Dict[str, Any], target: Target) -> Tuple[bool, str]:
-    path = target.ws / check["in_file"]
+    path = _in_workspace(target.ws, check["in_file"])
+    if path is None:
+        return False, f"{check['in_file']} leaves the workspace"
     if not path.is_file():
         return False, f"{check['in_file']} missing"
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -702,10 +717,15 @@ def _check_in_file(check: Dict[str, Any], target: Target) -> Tuple[bool, str]:
     return True, "ok"
 
 
+def _exists_inside(ws: Path, rel: str) -> bool:
+    path = _in_workspace(ws, rel)
+    return path is not None and path.is_file()
+
+
 #: Check kinds by the key that names them, in the order they are tried.
 _CHECKS: Tuple[Tuple[str, Callable[[Dict[str, Any], Target], Tuple[bool, str]]], ...] = (
     ("transcript", lambda c, t: _check_transcript(c, t.transcript)),
-    ("exists_file", lambda c, t: ((t.ws / c["exists_file"]).is_file(), c["exists_file"])),
+    ("exists_file", lambda c, t: (_exists_inside(t.ws, c["exists_file"]), c["exists_file"])),
     ("in_file", _check_in_file),
     ("path", lambda c, t: _check_path(c, t.doc)),
     ("columns", _check_columns),
@@ -807,7 +827,11 @@ def _load_contracts(
     valid = True
     outputs = []
     for rel in scenario.contracts:
-        path = ws / rel
+        path = _in_workspace(ws, rel)
+        if path is None:
+            valid = False
+            outputs.append(f"{rel}: leaves the workspace (a symlink?), not read")
+            continue
         if not path.is_file():
             valid = False
             outputs.append(f"{rel}: missing")
@@ -1212,11 +1236,13 @@ def _agent_workspace(
     arm: str,
     run_dir: Path,
     env_for: Callable[[Path, Path], Dict[str, str]],
+    src: Optional[Path] = None,
 ) -> Tuple[Path, Path, Dict[str, str]]:
     """An agent run's workspace, ``bin/`` and environment (``env_for(bin_dir, run_dir)``),
-    with a skill arm's skills installed."""
+    with a skill arm's skills installed. ``fluid`` imports from ``src`` (default: this
+    checkout)."""
     ws = prepare_workspace(scenario, run_dir / "workspace")
-    bin_dir = _shims(run_dir, REPO_ROOT, None)
+    bin_dir = _shims(run_dir, src or REPO_ROOT, None)
     env = env_for(bin_dir, run_dir)
     target = ARM_SPECS[arm].scaffold
     if target:
@@ -1294,7 +1320,7 @@ def _codex_env(bin_dir: Path, run_dir: Path) -> Dict[str, str]:
     fresh directories, so nothing of the operator's loads. No API key is in it:
     ``_codex_login`` stores one in that ``CODEX_HOME``.
     """
-    env = _child_env(bin_dir, REPO_ROOT)
+    env = _child_env(bin_dir, _package_root(bin_dir))
     env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     dirs = {
         "HOME": run_dir / "home",
@@ -1307,26 +1333,43 @@ def _codex_env(bin_dir: Path, run_dir: Path) -> Dict[str, str]:
     return env
 
 
-def _codex_readable(bin_dir: Path) -> List[Path]:
-    """What ``fluid`` reads outside the workspace: the shims, this checkout, and every
-    directory this process imports from (the interpreter, the venv, editable installs).
+def _package_root(bin_dir: Path) -> Path:
+    """A run-owned ``PYTHONPATH`` entry that holds only ``fluid_build``, a symlink to this
+    checkout's package.
 
-    Never the home directory or one of its ancestors, and never a directory that holds
-    this checkout (the main checkout, for a worktree, which would expose its siblings):
-    ``fluid_build`` comes from ``PYTHONPATH``, this checkout.
+    Python lists a ``PYTHONPATH`` entry to import from it, so the checkout itself there
+    would have to be readable by a Codex arm's commands, git-ignored files
+    (``.claude/settings.local.json``) and the scenarios' reference solutions included.
+    """
+    root = bin_dir / "src"
+    link = root / "fluid_build"
+    root.mkdir(parents=True, exist_ok=True)
+    if not link.is_symlink():
+        link.symlink_to(REPO_ROOT.resolve() / "fluid_build", target_is_directory=True)
+    return root
+
+
+def _codex_readable(bin_dir: Path) -> List[Path]:
+    """What ``fluid`` reads outside the workspace: the shims, this checkout's
+    ``fluid_build`` package (never the checkout), the interpreter and the venv, and the
+    ``sys.path`` entries inside them (the standard library, site-packages).
+
+    An entry outside them, such as an editable install's project root, is left out:
+    granting it would expose that whole project. ``fluid`` needs none (an optional SDK
+    import falls back on ``ImportError``). The home directory and its ancestors are never
+    granted.
     """
     home = Path.home().resolve()
-    root = REPO_ROOT.resolve()
-    candidates = [bin_dir, root, Path(sys.prefix), Path(sys.base_prefix)]
-    candidates += [Path(p) for p in sys.path if p]
+    prefixes = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()}
+    candidates = [bin_dir, REPO_ROOT / "fluid_build", *prefixes]
+    for entry in sys.path:
+        resolved = Path(entry).resolve() if entry else None
+        if resolved and any(p == resolved or p in resolved.parents for p in prefixes):
+            candidates.append(resolved)
     out: List[Path] = []
     for path in candidates:
-        try:
-            resolved = path.resolve()
-        except OSError:
-            continue
-        broad = resolved == home or resolved in home.parents or resolved in root.parents
-        if broad or not resolved.is_dir():
+        resolved = path.resolve()
+        if resolved == home or resolved in home.parents or not resolved.is_dir():
             continue
         if resolved not in out:
             out.append(resolved)
@@ -1339,10 +1382,23 @@ def _codex_config(run_dir: Path, readable: Sequence[Path]) -> str:
     The permissions profile is the counterpart of the Claude arms' scoped ``Read`` and
     ``Edit``: commands write only in the workspace and this run's ``home`` and ``tmp``,
     read only those and ``readable`` (plus Codex's ``:minimal`` platform set), and have
-    no network. Measured with ``codex sandbox`` on 0.154.0: the operator's home was
-    unreadable and ``fluid validate`` ran.
+    no network. Every run's ``codex-home`` is denied outright: it holds the API key while a
+    run lasts, and ``:minimal`` can cover the temp dir the runs live in (``/tmp`` was
+    writable on macOS). Measured with ``codex sandbox`` on 0.154.0: the operator's home,
+    the checkout's own files and ``codex-home/auth.json`` were unreadable, and
+    ``fluid validate`` ran.
     """
     writable = [run_dir / "home", run_dir / "tmp"]
+    work_root = run_dir.parents[2]  # work_root/<scenario>/<arm>/run-<n>
+    denied = [
+        # The packaged skills: a codex-no-skill run must not find them through PYTHONPATH,
+        # and codex-skill reads its own copy in the workspace. No fluid stage a Codex arm
+        # may run reads them (scaffold-ide is forbidden).
+        _toml(str(REPO_ROOT.resolve() / "fluid_build" / "agent_skills")),
+        _toml(str(run_dir / "codex-home")),
+        _toml(str(work_root / "*" / "*" / "*" / "codex-home")),
+        _toml(str(work_root / "*" / "*" / "*" / "codex-home" / "*")),
+    ]
     lines = [
         "# One eval run's Codex config, written by tests/agent_evals/harness.py.",
         'approval_policy = "never"',
@@ -1370,6 +1426,7 @@ def _codex_config(run_dir: Path, readable: Sequence[Path]) -> str:
         '":workspace_roots" = "write"',
         *(f'{_toml(str(path))} = "write"' for path in writable),
         *(f'{_toml(str(path))} = "read"' for path in readable if path not in writable),
+        *(f'{path} = "deny"' for path in denied),
         "",
         f"[permissions.{CODEX_PROFILE}.network]",
         "enabled = false",
@@ -1554,7 +1611,8 @@ def run_codex_arm(scenario: Scenario, arm: str, cfg: RunConfig, run_dir: Path) -
     index, which Codex reads; it writes no hook, so this arm measures the skills and the
     index without the Claude arm's validate hook.
     """
-    ws, bin_dir, env = _agent_workspace(scenario, arm, run_dir, _codex_env)
+    src = _package_root(run_dir / "bin")
+    ws, bin_dir, env = _agent_workspace(scenario, arm, run_dir, _codex_env, src)
     codex_home = _write_codex_home(run_dir, bin_dir)
     try:
         if cfg.codex_provider == "openai":
