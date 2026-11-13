@@ -196,6 +196,104 @@ def test_a_failed_validation_is_shown_to_the_agent(monkeypatch: pytest.MonkeyPat
     assert "fluid validate /w/contract.fluid.yaml --offline" in message
 
 
+def _json_run(returncode: int, report: dict):
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=returncode, stdout=json.dumps(report), stderr="")
+
+    return fake_run
+
+
+_EMAIL_ISSUE = {
+    "severity": "warning",
+    "code": "ERR_CONTRACT_PLACEHOLDER_EMAIL",
+    "pointer": "/metadata/owner/email",
+    "message": "metadata.owner.email: 'sales-data@example.com' is a placeholder address: "
+    "example.com is reserved for documentation (RFC 2606), so no mailbox is at it. "
+    "Write the address the request gives; if it gives none, delete the key.",
+    "fix": "Write the address the request gives; if it gives none, delete the key.",
+    "example": "metadata:\n  owner:\n    team: sales-data\n",
+    "docs_url": "https://agenticstiger.github.io/forge_docs/cli/validate.html",
+}
+
+
+def test_the_hook_asks_for_json_so_it_can_show_each_fix() -> None:
+    command = hook.validate_command("/w/contract.fluid.yaml")
+    if command is not None:
+        assert command[1:] == [
+            "validate",
+            "/w/contract.fluid.yaml",
+            "--offline",
+            "--format",
+            "json",
+        ]
+
+
+def test_a_failure_shows_each_issue_with_its_code_pointer_and_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enum = {
+        "severity": "error",
+        "code": "ERR_CONTRACT_SCHEMA_ENUM",
+        "pointer": "/metadata/productType",
+        "message": "metadata.productType: 'XDP' is not one of ['SDP', 'ADP', 'CDP']",
+        "fix": "Use one of the values the message lists, spelled exactly.",
+    }
+    report = {"valid": False, "errors": [enum["message"]], "issues": [enum, _EMAIL_ISSUE]}
+    monkeypatch.setattr(hook, "validate_command", lambda path: ["fluid", "validate", path])
+    monkeypatch.setattr(hook.subprocess, "run", _json_run(1, report))
+    err = io.StringIO()
+
+    assert hook.main(_payload("/w/contract.fluid.yaml"), err) == 2
+    message = err.getvalue()
+    assert "- ERR_CONTRACT_SCHEMA_ENUM at /metadata/productType: metadata.productType" in message
+    assert "  Fix: Use one of the values the message lists, spelled exactly." in message
+    # The lint's message already ends with its fix: it is not printed twice.
+    assert message.count("if it gives none, delete the key") == 1
+    assert "fluid validate /w/contract.fluid.yaml --offline" in message
+
+
+def test_a_pass_with_warnings_tells_the_agent_without_blocking_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = {"valid": True, "errors": [], "warnings": [_EMAIL_ISSUE["message"]]}
+    report["issues"] = [_EMAIL_ISSUE]
+    monkeypatch.setattr(hook, "validate_command", lambda path: ["fluid", "validate", path])
+    monkeypatch.setattr(hook.subprocess, "run", _json_run(0, report))
+    out, err = io.StringIO(), io.StringIO()
+
+    assert hook.main(_payload("/w/contract.fluid.yaml"), err, out) == 0
+    assert err.getvalue() == ""
+    context = json.loads(out.getvalue())["hookSpecificOutput"]
+    assert context["hookEventName"] == "PostToolUse"
+    assert "ERR_CONTRACT_PLACEHOLDER_EMAIL at /metadata/owner/email" in context["additionalContext"]
+    assert "never invent a value" in context["additionalContext"]
+
+
+def test_a_clean_pass_prints_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    report = {"valid": True, "errors": [], "warnings": []}
+    monkeypatch.setattr(hook, "validate_command", lambda path: ["fluid", "validate", path])
+    monkeypatch.setattr(hook.subprocess, "run", _json_run(0, report))
+    out, err = io.StringIO(), io.StringIO()
+
+    assert hook.main(_payload("/w/contract.fluid.yaml"), err, out) == 0
+    assert (out.getvalue(), err.getvalue()) == ("", "")
+
+
+def test_an_older_fluid_without_issues_still_shows_its_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = {"valid": True, "errors": [], "warnings": ["exposes[0]: a warning"]}
+    monkeypatch.setattr(hook, "validate_command", lambda path: ["fluid", "validate", path])
+    monkeypatch.setattr(hook.subprocess, "run", _json_run(0, report))
+    out = io.StringIO()
+
+    assert hook.main(_payload("/w/contract.fluid.yaml"), io.StringIO(), out) == 0
+    assert (
+        "- exposes[0]: a warning"
+        in json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
+    )
+
+
 def test_a_relative_path_cannot_become_an_option() -> None:
     path = hook.contract_path({"tool_input": {"file_path": "--report=x.fluid.yaml"}})
     assert path is not None and Path(path).is_absolute()
