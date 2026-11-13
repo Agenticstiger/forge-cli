@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-11-13
+
 ### Added
 
 - **`fluid genie apply`: one Databricks Genie space over several data products (an estate).**
@@ -308,7 +310,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounds (it stays refused where the expose turns monitoring off). The `fluid_keys` task that
   declares the table's Unity Catalog keys again now runs once dbt has ended, whatever its
   outcome: a failing rule fails dbt after its model replaced the table, and the table keeps its
-  keys. Refused at `fluid validate` and `fluid plan`, with the fix: a rule no test can run as
+  keys. Refused at `fluid validate`, `fluid generate iac` and `fluid apply`, with the fix: a rule
+  no test can run as
   written (drift detection, valid_values with no allowed values, an unknown column, an
   unparseable window, a threshold no number holds, a range no value meets), a Git-sourced build
   with rules (no file can be added to a checkout), a model or a referenced source the project
