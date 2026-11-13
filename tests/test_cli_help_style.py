@@ -49,6 +49,7 @@ _VERBS = (
     "demo",
     "publish",
     "market",
+    "genie",
     "import",
     "policy-check",
     "test",

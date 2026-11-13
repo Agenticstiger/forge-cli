@@ -488,8 +488,8 @@ class TestSovereigntyOnEmit:
 SCHEMA_TAGS = {
     "cost_center": "cx-001",
     "data_classification": "confidential",
-    "fluid_jurisdiction": "eu",
-    "fluid_regulation": "gdpr",
+    "fluid_jurisdiction": "EU",
+    "fluid_regulation": "GDPR",
     "fluid_residency": "true",
     "gdpr_article": "art6-1b-contractual",
 }
@@ -528,6 +528,21 @@ def _tags_on(doc: Dict[str, Any], entity_type: str) -> Dict[str, str]:
         for body in doc["resource"].get(TAG, {}).values()
         if body["entity_type"] == entity_type
     }
+
+
+def _refused_on_both_securables(contract: Dict[str, Any], kind: str, text: str) -> None:
+    """``kind`` from emit and from the planner, and one validate error per securable: the
+    schema and the table both carry the contract's labels."""
+    for call in (
+        lambda: IAC_PLUGINS["databricks"].emit(contract),
+        lambda: dbx.planned_objects(contract),
+    ):
+        with pytest.raises(UnsupportedBindingError) as raised:
+            call()
+        assert raised.value.kind == kind
+        assert text in str(raised.value)
+    errors, _ = dbx.validate_databricks_binding(contract)
+    assert len(errors) == 2 and all(text in e for e in errors)
 
 
 class TestGovernanceTags:
@@ -620,17 +635,7 @@ class TestGovernanceTags:
     def test_two_labels_that_meet_at_one_tag_key_are_refused_never_overwritten(self):
         contract = _governed()
         contract["labels"] = {"cost-center": "a", "cost_center": "b"}
-        for call in (
-            lambda: IAC_PLUGINS["databricks"].emit(contract),
-            lambda: dbx.planned_objects(contract),
-        ):
-            with pytest.raises(UnsupportedBindingError) as raised:
-                call()
-            assert raised.value.kind == "databricks-tag-collision"
-            assert "cost_center" in str(raised.value)
-        errors, _ = dbx.validate_databricks_binding(contract)
-        # the schema and the table both carry the contract's labels
-        assert len(errors) == 2 and all("cost_center" in e for e in errors)
+        _refused_on_both_securables(contract, "databricks-tag-collision", "cost_center")
 
     def test_more_tags_than_a_securable_holds_is_refused_never_dropped(self):
         contract = _contract()
@@ -663,6 +668,75 @@ class TestGovernanceTags:
         (table,), _ = dbx.managed_objects(_governed())
         assert dict(table.tags) == TABLE_TAGS
         assert dict(table.schema_tags) == SCHEMA_TAGS
+
+
+class TestTagValuesAsWritten:
+    """A Unity Catalog tag value is the contract's text, not the GCP label slug of it."""
+
+    def test_a_value_is_written_as_the_contract_states_it_not_as_a_label_slug(self):
+        # The 0.29.0 shape: lowercased, punctuation and spaces as '-', cut at 63
+        # ('a-single-unrenewed-ground-lease-can-strand-a-multi-tenant-tower').
+        sentence = (
+            "A single unrenewed ground lease can strand a multi-tenant tower and its entire "
+            "revenue stream; mastered terms and expiry dates are what the renewal radar runs on."
+        )
+        contract = _governed()
+        contract["labels"] = {
+            "business-value": f"  {sentence}  ",
+            "Standards": "IFRS 16 leases; ISO 4217 currency codes",
+            "consumers": "real-estate-managers, finance-analysts, legal-counsel",
+            "office": "Zürich: Bahnhofstrasse 1/3 (key=value)",
+        }
+        contract["sovereignty"].update(jurisdiction="US", regulatoryFramework=["GDPR", "CCPA"])
+        contract["exposes"][0].setdefault("policy", {})["classification"] = "Restricted"
+        tags = _tags_on(_module(contract), "tables")
+        assert tags["business_value"] == sentence
+        assert tags["standards"] == "IFRS 16 leases; ISO 4217 currency codes"
+        assert tags["consumers"] == "real-estate-managers, finance-analysts, legal-counsel"
+        assert tags["office"] == "Zürich: Bahnhofstrasse 1/3 (key=value)"
+        assert tags["fluid_jurisdiction"] == "US"
+        assert tags["fluid_regulation"] == "GDPR, CCPA"
+        assert tags["fluid_classification"] == "Restricted"
+        # The keys are as before: GCP's label alphabet, each '-' an '_'.
+        assert {"business_value", "standards", "consumers", "office"} <= set(tags)
+
+    def test_a_changed_value_keeps_the_address_and_import_id_so_it_updates_in_place(self):
+        before, after = _governed(), _governed()
+        after["labels"]["cost-center"] = "CX 001 (Finance)"
+        assert set(_module(before)["resource"][TAG]) == set(_module(after)["resource"][TAG])
+        ids = [
+            sorted(b.id for b in IAC_PLUGINS["databricks"].discover_imports(c) if TAG in b.to)
+            for c in (before, after)
+        ]
+        assert ids[0] == ids[1]
+
+    def test_a_value_longer_than_a_tag_value_holds_is_refused_never_cut(self):
+        contract = _governed()
+        contract["labels"]["grain"] = "x" * 256
+        assert _tags_on(_module(contract), "tables")["grain"] == "x" * 256
+        contract["labels"]["grain"] = "x" * 257
+        _refused_on_both_securables(
+            contract, "databricks-tag-value-too-long", "'grain' is 257 characters"
+        )
+
+    def test_a_value_that_is_not_a_string_is_spelled_as_yaml_spells_it(self):
+        # The schema allows only strings, but ``fluid generate iac`` emits without it.
+        from fluid_build.iac.governance_labels import governance_labels
+
+        contract = _contract()
+        contract["labels"] = {"pii": True, "archived": False, "gone": None, "ratio": 1.5}
+        labels = governance_labels(contract, contract["exposes"][0], verbatim_values=True)
+        assert labels == {"pii": "true", "archived": "false", "ratio": "1.5"}
+
+    def test_gcp_and_aws_labels_keep_the_label_alphabet(self):
+        from fluid_build.iac.governance_labels import governance_labels
+
+        contract = _governed()
+        contract["labels"] = {"business-value": "A Tower; Its Revenue"}
+        labels = governance_labels(contract, contract["exposes"][0])
+        assert labels["business-value"] == "a-tower--its-revenue"
+        assert labels["fluid_jurisdiction"] == "eu"
+        assert labels["fluid_regulation"] == "gdpr"
 
 
 def test_a_build_that_names_its_own_host_is_refused():

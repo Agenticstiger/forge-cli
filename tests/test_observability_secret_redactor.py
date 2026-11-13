@@ -12,7 +12,13 @@ from io import StringIO
 import pytest
 
 from fluid_build.cli import _setup_enhanced_logging
-from fluid_build.observability.secret_redactor import SecretRedactingFilter, redact_secret_text
+from fluid_build.observability.secret_redactor import (
+    SecretRedactingFilter,
+    forget_known_secrets,
+    redact_jose_tokens,
+    redact_secret_text,
+    register_secrets,
+)
 
 
 @pytest.fixture
@@ -689,33 +695,170 @@ class TestDatabricksCredentials:
         assert "v4lue-xyz" not in redact_secret_text('{"%s": "v4lue-xyz"}' % name)
 
 
-class TestJwtAnchoring:
-    """Error text a person reads keeps a dotted table name; logs keep the #389 rule."""
+def _b64url(raw: bytes) -> str:
+    import base64
+
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _jose(header: bytes, *rest: bytes) -> str:
+    """A compact JOSE token built at runtime, so no literal token sits in the file."""
+    return ".".join([_b64url(header), *(_b64url(part) for part in rest)])
+
+
+_SIGNATURE = bytes(range(32))
+_PAYLOAD = b'{"sub":"1234567890","name":"x"}'
+
+#: Each shape the JOSE rule must mask, in both layers and through the logging filter.
+_JOSE_TOKENS = {
+    "compact JWS": _jose(b'{"alg":"HS256","typ":"JWT"}', _PAYLOAD, _SIGNATURE),
+    "header with spaces": _jose(b'{ "alg": "HS256" }', _PAYLOAD, _SIGNATURE),
+    "header with newlines": _jose(b'{\n  "alg": "HS256"\n}', _PAYLOAD, _SIGNATURE),
+    "JWE, direct encryption (no encrypted key)": _jose(
+        b'{"alg":"dir","enc":"A256GCM"}', b"", b"0123456789ab", b"ciphertext here", bytes(16)
+    ),
+    "JWE with an encrypted key": _jose(
+        b'{"alg":"RSA-OAEP","enc":"A256GCM"}', bytes(64), b"0123456789ab", b"ciphertext", bytes(16)
+    ),
+    "unsecured JWS (empty signature)": _jose(b'{"alg":"none"}', _PAYLOAD, b""),
+    "short payload": _jose(b'{"alg":"HS256"}', b"{}", _SIGNATURE),
+    "glued after _": "token_" + _jose(b'{"alg":"HS256","typ":"JWT"}', _PAYLOAD, _SIGNATURE),
+    "glued after -": "x-" + _jose(b'{"alg":"HS256","typ":"JWT"}', _PAYLOAD, _SIGNATURE),
+    "two segments (no signature)": _jose(b'{"alg":"none"}', _PAYLOAD),
+    "JWE, direct encryption, header with spaces": _jose(
+        b'{ "alg": "dir", "enc": "A256GCM" }', b"", b"0123456789ab", b"ciphertext here", bytes(16)
+    ),
+    "JWE with a key, header with newlines": _jose(
+        b'{\n "alg": "RSA-OAEP", "enc": "A256GCM"\n}', bytes(64), b"0123456789ab", b"ct", bytes(16)
+    ),
+    "two segments glued after -": "x-" + _jose(b'{"alg":"none"}', _PAYLOAD),
+}
+
+#: Fully qualified names the old prefix-agnostic rule masked (three runs of 12+), and
+#: the 47-character one it never did (its last part has 11).
+_DOTTED_NAMES = [
+    "northwind_towers.bronze_smart_meters.smart_meters",
+    "northwind_towers.bronze_site_master.site_master",
+    "northwind_towers.bronze_smart_meters.smart_meters.reading_timestamp",
+    "ANALYTICS_DB.PUBLIC_SCHEMA.CUSTOMER_ORDERS",
+    "my-gcp-project.customer_analytics.daily_revenue_summary",
+    "my-gcp-project.CustomerAnalytics.DailyRevenueSummary",
+    "module.databricks_tables_main.databricks_sql_table.northwind_meters",
+    "monkeyJar_inventory.bronze_inventory_x.inventory_items",
+]
+
+
+def _leaked(token: str, out: str) -> list:
+    return [part for part in token.split(".") if len(part) >= 8 and part in out]
+
+
+class TestJoseTokensAndDottedNames:
+    """JOSE tokens are masked by their header; a dotted name is never a token."""
+
+    @pytest.fixture(autouse=True)
+    def _no_registered_secrets(self):
+        # The exact-match registry is process-wide: a literal another test in this
+        # worker registered (a base64 key of bytes(range(32)), say) would mask part
+        # of these tokens first. The expectations here are the JOSE rule's alone.
+        held = sys.modules[redact_secret_text.__module__]._known_secrets
+        forget_known_secrets()
+        yield
+        forget_known_secrets()
+        register_secrets(held)
+
+    @pytest.mark.parametrize("name", _DOTTED_NAMES)
+    def test_a_fully_qualified_name_survives_every_path(self, name):
+        from fluid_build._console import literal_error_text
+        from fluid_build.providers.snowflake.util.logging import redact_string
+
+        text = f"databricks.load table={name} rows=340"
+        assert redact_secret_text(text) == text
+        assert redact_string(text) == text
+        assert literal_error_text(text).plain == text
+
+    @pytest.mark.parametrize("name", _DOTTED_NAMES)
+    def test_a_fully_qualified_name_survives_the_logging_filter(self, name):
+        logger, stream = _exc_logger("test.secret_redactor.dotted_name")
+        logger.info("databricks.load table=%s rows=%d deleted=true", name, 340)
+        assert stream.getvalue().strip() == f"databricks.load table={name} rows=340 deleted=true"
+
+    @pytest.mark.parametrize("shape", sorted(_JOSE_TOKENS))
+    def test_a_jose_token_is_masked_in_both_layers(self, shape):
+        from fluid_build.providers.snowflake.util.logging import redact_string
+
+        token = _JOSE_TOKENS[shape]
+        line = f"token {token} end"
+        assert _leaked(token, redact_secret_text(line)) == []
+        assert _leaked(token, redact_string(line)) == []
+
+    @pytest.mark.parametrize("shape", sorted(_JOSE_TOKENS))
+    def test_a_jose_token_is_masked_by_the_logging_filter(self, shape):
+        token = _JOSE_TOKENS[shape]
+        logger, stream = _exc_logger("test.secret_redactor.jose")
+        logger.info("refresh returned %s", token)
+        assert _leaked(token, stream.getvalue()) == []
+        assert "***REDACTED***" in stream.getvalue()
+
+    def test_three_runs_that_are_not_a_token_are_left_alone(self):
+        # The old rule's own example of "any three high-entropy runs": base64 of
+        # "header123456", "payload123456" and "signature123", whose first part is no
+        # JSON object, so it is no JOSE header.
+        runs = "aGVhZGVyMTIzNDU2.cGF5bG9hZDEyMzQ1Ng.c2lnbmF0dXJlMTIz"
+        assert redact_secret_text(f"id {runs} end") == f"id {runs} end"
 
     @pytest.mark.parametrize(
-        "name",
+        "glued",
         [
-            "my-gcp-project.customer_analytics.daily_revenue_summary",
-            "ANALYTICS_DB.PUBLIC_SCHEMA.CUSTOMER_ORDERS",
+            "northwind_towers.x-" + _jose(b'{"alg":"none"}', _PAYLOAD),
+            "northwind_towers.bronze_smart_meters.smart_meters.reading.x-"
+            + _jose(b'{"alg":"none"}', _PAYLOAD),
+            "token_"
+            + _jose(b'{ "alg": "dir", "enc": "A256GCM" }', b"", b"0123456789ab", b"ct", b"tag"),
+            "x-" + _jose(b'{\n "alg": "HS256"\n}', _PAYLOAD, _SIGNATURE),
         ],
     )
-    def test_fully_qualified_table_names_survive_in_error_text(self, name):
-        from fluid_build._console import literal_error_text
+    def test_a_header_glued_anywhere_in_a_run_is_found(self, glued):
+        from fluid_build.providers.snowflake.util.logging import redact_string
 
-        text = f"Table {name} not found"
-        assert redact_secret_text(text, keep_dotted_names=True) == text
-        assert literal_error_text(text).plain == text
-        # Log redaction keeps the prefix-agnostic three-segment rule.
-        assert name not in redact_secret_text(text)
+        for out in (redact_secret_text(f"got {glued} end"), redact_string(f"got {glued} end")):
+            assert _leaked(glued.split("x-")[-1].split("token_")[-1], out) == []
+        assert redact_secret_text(f"got {glued} end").startswith(
+            "got northwind_towers." if glued.startswith("northwind") else "got "
+        )
 
-    @pytest.mark.parametrize("keep_dotted_names", [False, True])
-    def test_three_and_two_segment_jwts_are_still_masked(self, keep_dotted_names):
-        header = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
-        three = f"{header}.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"
-        two = f"{header}.eyJzdWIiOiIxMjM0NTY3ODkwIn0"
-        for token in (three, two):
-            out = redact_secret_text(f"token {token} end", keep_dotted_names=keep_dotted_names)
-            assert "eyJ" not in out
+    def test_a_short_json_part_of_a_name_is_no_header(self):
+        # e30 is base64url of {}: JSON, but no JOSE header has no alg.
+        name = "northwind_towers.e30.daily_revenue_summary"
+        assert redact_secret_text(f"loaded {name}") == f"loaded {name}"
+
+    def test_the_words_after_a_token_are_kept(self):
+        token = _JOSE_TOKENS["compact JWS"]
+        assert redact_secret_text(f"got {token}.Next step") == "got ***REDACTED***.Next step"
+
+    def test_the_snowflake_twin_shares_the_rule(self):
+        from fluid_build.providers.snowflake.util.logging import redact_jose_tokens as twin
+
+        assert twin is redact_jose_tokens
+
+    @pytest.mark.parametrize(
+        "evil",
+        [
+            "a-" * 100_000,
+            "eyJ-" * 50_000,
+            "eyJ_" * 50_000,
+            "eyJ." * 50_000,
+            ("abcdefghijklmn." * 3 + " ") * 5_000,
+        ],
+    )
+    def test_the_scan_stays_linear(self, evil):
+        import time
+
+        start = time.perf_counter()
+        redact_jose_tokens(evil)
+        elapsed = time.perf_counter() - start
+        # Linear: well under 0.2 s here. The ``\b``-anchored rules re-scanned the run
+        # from every ``-`` (``a-`` * 100,000 took about 30 s, ``eyJ-`` * 50,000 about 40 s).
+        assert elapsed < 2.0, f"possible ReDoS regression: {elapsed:.2f}s"
 
 
 class TestUrlUserinfoKeepsAMaskedPassword:

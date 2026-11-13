@@ -68,6 +68,10 @@ shows in the list some seconds after it is made (a create waits for it, or an ap
 after would make a second); and a title another space in the folder already has comes back
 suffixed with a timestamp (kept, since a ``PATCH`` to a taken title is 409).
 
+One space over several products (an estate, ``fluid genie apply``) reuses this module's
+compile helpers, identity rule and converge (``databricks_genie_estate.py``); its messages name
+its own command through :class:`Voice`.
+
 The client is the ``databricks.sdk.WorkspaceClient`` the masks and row filters use
 (``databricks_enforce.default_client``), through ``api_client.do``. The paths are the SDK's own
 (databricks-sdk-py ``service/dashboards.py`` and ``service/iam.py``). No message carries a
@@ -81,6 +85,8 @@ import json
 import os
 import re
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from difflib import get_close_matches
 from typing import (
@@ -89,6 +95,7 @@ from typing import (
     Collection,
     Dict,
     Iterable,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -175,6 +182,41 @@ def marker(product_id: str) -> str:
 
 
 @dataclass(frozen=True)
+class Voice:
+    """How a space's messages name what keeps it in step: a product's space (``fluid apply``
+    and the contract's block, the defaults) or an estate's (``databricks_genie_estate.py``)."""
+
+    #: The command that converges the space again.
+    command: str = "fluid apply"
+    #: One run of it, as in "the next apply".
+    run: str = "apply"
+    #: What the space is the one space of.
+    scope: str = "product"
+    #: Where the space's title is set.
+    title_setting: str = f"extensions.{EXTENSION_KEY}.title"
+    #: Where the space's folder is set, ``""`` for a space that has no setting for it.
+    folder_setting: str = f"extensions.{EXTENSION_KEY}.parentPath"
+    #: How to ask for no space instead, at the start of a sentence.
+    opt_out: str = f"Remove extensions.{EXTENSION_KEY}"
+    #: The line that heads what a converge prints.
+    heading: str = "Databricks Genie space (Genie API, not OpenTofu):"
+
+
+PRODUCT_VOICE = Voice()
+_VOICE: ContextVar[Voice] = ContextVar("databricks_genie_voice", default=PRODUCT_VOICE)
+
+
+@contextmanager
+def speaking(voice: Voice) -> Iterator[None]:
+    """The messages said inside the block name what ``voice`` names."""
+    token = _VOICE.set(voice)
+    try:
+        yield
+    finally:
+        _VOICE.reset(token)
+
+
+@dataclass(frozen=True)
 class Space:
     """What the contract asks the product's Genie space to be."""
 
@@ -188,6 +230,8 @@ class Space:
     readers: Tuple[str, ...]
     #: ``serialized_space``, without the metric views (those are read at apply time).
     serialized: Dict[str, Any]
+    #: The marker its description ends with, when it is not the product's (an estate's).
+    token: str = ""
     #: The workspace folder the space lives in (``parentPath``, as :func:`workspace_folder`
     #: writes it), or ``""``: the deploying identity's own folder, where the API puts a space
     #: when the create names none.
@@ -195,7 +239,7 @@ class Space:
 
     @property
     def marker(self) -> str:
-        return marker(self.product_id)
+        return self.token or marker(self.product_id)
 
     @property
     def folder(self) -> str:
@@ -212,6 +256,8 @@ class Compiled:
     warnings: List[str] = field(default_factory=list)
     #: The contract's id: what a space it asked for earlier is found by, block or no block.
     product_id: str = ""
+    #: How the converge's messages name what keeps the space.
+    voice: Voice = PRODUCT_VOICE
 
 
 # ---------------------------------------------------------------------- compile (pure)
@@ -437,13 +483,14 @@ def _policy_refusals(table: Any) -> List[UnsupportedBindingError]:
     where = f"{table.where} policy.agentPolicy"
     allowed = _string_list(policy.get("allowedUseCases"))
     denied = _string_list(policy.get("deniedUseCases"))
+    opt_out = _VOICE.get().opt_out
     if isinstance(policy.get("allowedModels"), list) and not policy["allowedModels"]:
         out.append(
             _refusal(
                 "policy",
                 f"{where}.allowedModels is [], which means no AI access, and a Genie space answers "
                 "questions with a model.",
-                f"Remove extensions.{EXTENSION_KEY}, or allow AI access in agentPolicy.",
+                f"{opt_out}, or allow AI access in agentPolicy.",
             )
         )
     refused = [case for case in _GENIE_USE_CASES if case in denied]
@@ -458,7 +505,7 @@ def _policy_refusals(table: Any) -> List[UnsupportedBindingError]:
                     else "allows neither 'qa' nor 'analysis'"
                 )
                 + " (question answering over the data), which is what a Genie space is.",
-                f"Remove extensions.{EXTENSION_KEY}, or allow 'qa' in agentPolicy.allowedUseCases "
+                f"{opt_out}, or allow 'qa' in agentPolicy.allowedUseCases "
                 "(and take 'qa' and 'analysis' out of deniedUseCases).",
             )
         )
@@ -652,12 +699,16 @@ def _instruction_lines(
         else:
             lines += section
     lines += _lineage_lines(contract)
-    lines.append(
-        "How access works: Genie runs each query as the person asking, under that person's own "
-        "Unity Catalog grants, so column masks and row filters apply. This space grants no "
-        "access to data: a table the person cannot SELECT returns no rows."
-    )
+    lines.append(ACCESS_LINE)
     return lines
+
+
+#: The instruction's last line, in every space.
+ACCESS_LINE = (
+    "How access works: Genie runs each query as the person asking, under that person's own "
+    "Unity Catalog grants, so column masks and row filters apply. This space grants no "
+    "access to data: a table the person cannot SELECT returns no rows."
+)
 
 
 def _table_section(contract: Mapping[str, Any], table: Any, warnings: List[str]) -> List[str]:
@@ -916,21 +967,34 @@ def converge(
 
     Runs after ``tofu apply`` and the masks and row filters, so the tables exist and are
     protected first. With ``dry_run`` it reads and prints, and writes nothing. Raises
-    :class:`GenieError` (or a refusal) for what it cannot do.
+    :class:`GenieError` (or a refusal) for what it cannot do. Its messages name what
+    ``compiled.voice`` names.
     """
+    with speaking(compiled.voice):
+        _converge(compiled, say, client_factory, dry_run)
+
+
+def require_warehouse(space: Space) -> None:
+    """Stop when no SQL warehouse is named: a Genie space runs its queries on one."""
+    if not space.warehouse_id:
+        raise GenieError(
+            f"{WAREHOUSE_ENV} is not set, and a Genie space runs its queries on that warehouse.",
+            (f"Set {WAREHOUSE_ENV} to the id of a SQL warehouse in the workspace.",),
+        )
+
+
+def _converge(
+    compiled: Compiled, say: Say, client_factory: Optional[ClientFactory], dry_run: bool
+) -> None:
     if compiled.refusals:
         raise compiled.refusals[0]
     space = compiled.space
     if space is None:
         _retire(compiled.product_id, say, client_factory, dry_run)
         return
-    if not space.warehouse_id:
-        raise GenieError(
-            f"{WAREHOUSE_ENV} is not set, and a Genie space runs its queries on that warehouse.",
-            (f"Set {WAREHOUSE_ENV} to the id of a SQL warehouse in the workspace.",),
-        )
+    require_warehouse(space)
     client = _client(client_factory)
-    say("\n  Databricks Genie space (Genie API, not OpenTofu):")
+    say(f"\n  {_VOICE.get().heading}")
     if space.parent_path:
         _check_folder(client, space.parent_path, say)
     found = _call(client, "list the Genie spaces", lambda: _find(client, space.marker))
@@ -975,11 +1039,13 @@ def _in(space: Space) -> str:
 
 
 def _at_most_one(spaces: Sequence[Mapping[str, Any]], space: Space) -> None:
+    voice = _VOICE.get()
     if len(spaces) > 1:
         raise GenieError(
             f"{len(spaces)} Genie spaces carry {space.marker} in their description: "
             + ", ".join(str(s.get("space_id")) for s in spaces)
-            + ". fluid apply keeps one space per product and cannot tell which is the product's.",
+            + f". {voice.command} keeps one space per {voice.scope} and cannot tell which is the "
+            f"{voice.scope}'s.",
             ("Trash the extra spaces (or remove the marker from their description), then re-run.",),
         )
 
@@ -1206,7 +1272,9 @@ def _update_found(
 ) -> None:
     live = _call(client, "read the Genie space", lambda: _get(client, space_id))
     title = _title_kept(live.get("title"), space, say)
-    changes = differences(live, space, serialized)
+    changes = differences(
+        live, space, serialized, _tables_of_space(client, live, space, serialized)
+    )
     if not changes:
         say(f"    {space.title!r}: no change ({_url(space_id)})")
     elif dry_run:
@@ -1218,6 +1286,7 @@ def _update_found(
             lambda: _update(client, space_id, space, serialized, live.get("etag"), title),
         )
         say(f"    updated {space.title!r}: {', '.join(changes)} ({_url(space_id)})")
+        _keep_as_sent(client, space_id, space, serialized, say, made="updated")
 
 
 def _create_new(client: Any, space: Space, serialized: Mapping[str, Any], say: Say) -> str:
@@ -1232,7 +1301,48 @@ def _create_new(client: Any, space: Space, serialized: Mapping[str, Any], say: S
     _title_kept(created.get("title"), space, say)
     _wait_listed(client, space, space_id, say)
     _found_again(client, space, space_id)
+    _keep_as_sent(client, space_id, space, serialized, say, made="made")
     return space_id
+
+
+def _keep_as_sent(
+    client: Any,
+    space_id: str,
+    space: Space,
+    serialized: Mapping[str, Any],
+    say: Say,
+    *,
+    made: str,
+) -> None:
+    """Set the space back to what was sent when the service added to it as it wrote it.
+
+    Measured on a live workspace (2026-11-13): whenever a table enters a space (a create, or
+    an update that adds one) Genie adds a join for each Unity Catalog foreign key between two
+    of the space's tables that touches it (its own id, the parent aliased ``<table>_2``),
+    beside the joins it was sent. An update with the same tables keeps exactly what it is
+    sent, so one more makes the space what the contracts ask. Left so, the next run would
+    update the space again.
+    """
+    live = _call(client, "read the Genie space back", lambda: _get(client, space_id))
+    changes = differences(live, space, serialized)
+    if not changes:
+        return
+    title = _title_kept(live.get("title"), space, lambda _line: None)
+    _call(
+        client,
+        "set the Genie space back",
+        lambda: _update(client, space_id, space, serialized, live.get("etag"), title),
+    )
+    path = ("instructions", "join_specs")
+    held, sent = (len(_dig(doc, path) or ()) for doc in (_held(live), serialized))
+    if changes == ["joins"] and held > sent:
+        say(
+            f"    note: Genie added {held - sent} join(s) of its own as it {made} the space, "
+            "from the tables' Unity Catalog foreign keys; they were taken out, and the space "
+            f"holds the {sent} the contracts declare."
+        )
+    else:
+        say(f"    note: the space differed from what was sent ({', '.join(changes)}); set back.")
 
 
 def _found_again(client: Any, space: Space, space_id: str) -> None:
@@ -1250,6 +1360,7 @@ def _found_again(client: Any, space: Space, space_id: str) -> None:
     )
     if landed:
         return
+    run = _VOICE.get().run
     try:
         _call(
             client,
@@ -1260,13 +1371,13 @@ def _found_again(client: Any, space: Space, space_id: str) -> None:
         raise GenieError(
             f"the Genie API put the new space {space_id} in "
             f"{parent or 'a folder this identity cannot read'}, not in {where}, where the next "
-            f"apply looks for it, and trashing it failed: {exc}",
-            (f"Trash space {space_id} by hand before the next apply, which would make another.",),
+            f"{run} looks for it, and trashing it failed: {exc}",
+            (f"Trash space {space_id} by hand before the next {run}, which would make another.",),
         ) from exc
     raise GenieError(
         f"the Genie API put the new space in {parent or 'a folder this identity cannot read'}, "
-        f"not in {where}, where the next apply looks for it, so it was trashed rather than made "
-        "again on every apply.",
+        f"not in {where}, where the next {run} looks for it, so it was trashed rather than made "
+        f"again on every {run}.",
         (
             (
                 (
@@ -1294,10 +1405,12 @@ def _wait_listed(client: Any, space: Space, space_id: str, say: Say) -> None:
         except Exception:  # noqa: BLE001 — the space exists; only the wait is cut short
             pass
         if time.monotonic() >= deadline:
+            run = _VOICE.get().run
+            article = "an" if run[:1] in "aeiou" else "a"
             say(
-                "    note: the Genie list does not show the new space yet; an apply in the next "
-                "minute could make a second one, which the apply after refuses until one is "
-                "trashed."
+                f"    note: the Genie list does not show the new space yet; {article} {run} in the "
+                f"next minute could make a second one, which the {run} after refuses until one "
+                "is trashed."
             )
             return
         time.sleep(_POLL_SECONDS)
@@ -1313,7 +1426,7 @@ def _title_kept(live: Any, space: Space, say: Say) -> str:
         say(
             f"    note: the space is titled {live!r}: another space in {space.folder} is "
             f"already called {wanted!r} and Genie keeps titles unique there. Give this one a "
-            f"title of its own with extensions.{EXTENSION_KEY}.title."
+            f"title of its own with {_VOICE.get().title_setting}."
         )
         return live
     return wanted
@@ -1424,6 +1537,8 @@ def _placed(
     if not found:
         return [], []
     home = _home(client)
+    voice = _VOICE.get()
+    scope, setting, run = voice.scope, voice.folder_setting, voice.run
     product: List[Dict[str, Any]] = []
     own: List[Dict[str, Any]] = []
     for space in found:
@@ -1438,10 +1553,14 @@ def _placed(
                 f"    note: left alone: space {space_id} ({space.get('title')!r}) carries "
                 f"{_marker_of(space)} but is in {parent or 'a folder this identity cannot read'}, "
                 "not in " + (f"{folder} or " if folder else "") + "this identity's own folder, "
-                "so it is not taken for the product's. Trash it, or take the marker out of its "
-                "description. If it is this product's own space, left in a folder the contract no "
-                f"longer names as {_WHERE}.parentPath, trash it there by hand: the apply trusts no "
-                "other folder."
+                f"so it is not taken for the {scope}'s. Trash it, or take the marker out of its "
+                "description."
+                + (
+                    f" If it is this {scope}'s own space, left in a folder the contract no longer "
+                    f"names as {setting}, trash it there by hand: the {run} trusts no other folder."
+                    if setting
+                    else ""
+                )
             )
     return product, own
 
@@ -1468,10 +1587,11 @@ def _in_folder(parent: str, home: str) -> bool:
 
 
 def _marker_of(space: Mapping[str, Any]) -> str:
-    """The marker a listed space's description ends with (for a message)."""
+    """The marker a listed space's description ends with (for a message): a product's
+    ``[fluid-genie:...]`` or an estate's ``[fluid-genie-estate:...]``."""
     text = str(space.get("description") or "").rstrip()
-    start = text.rfind("[fluid-genie:")
-    return text[start:] if start >= 0 else "a product's marker"
+    start = text.rfind("[fluid-genie")
+    return text[start:] if start >= 0 else "a fluid-genie marker"
 
 
 def _get(client: Any, space_id: str) -> Dict[str, Any]:
@@ -1512,20 +1632,21 @@ def _update(
     try:
         client.api_client.do("PATCH", f"{SPACES_PATH}/{quote(space_id)}", body=body)
     except Exception as exc:  # noqa: BLE001 — a 409 is a taken title or someone else's edit
+        voice = _VOICE.get()
         if _status(exc) == 409 and _taken_title(exc):
             raise GenieError(
                 f"another Genie space in {space.folder} is already called "
                 f"{body['title']!r}, and Genie keeps titles unique there.",
                 (
-                    f"Give this space a title of its own with extensions.{EXTENSION_KEY}.title, "
+                    f"Give this space a title of its own with {voice.title_setting}, "
                     "or rename the other space.",
                 ),
             ) from exc
         if _status(exc) == 409:
             raise GenieError(
-                "the Genie space changed while this apply was updating it (its etag no longer "
-                "matched), so nothing was overwritten.",
-                ("Re-run fluid apply.",),
+                f"the Genie space changed while this {voice.run} was updating it (its etag no "
+                "longer matched), so nothing was overwritten.",
+                (f"Re-run {voice.command}.",),
             ) from exc
         raise
 
@@ -1539,37 +1660,85 @@ def _taken_title(exc: BaseException) -> bool:
     )
 
 
-def differences(live: Mapping[str, Any], space: Space, serialized: Mapping[str, Any]) -> List[str]:
+def _tables_of_space(
+    client: Any, live: Mapping[str, Any], space: Space, serialized: Mapping[str, Any]
+) -> set:
+    """The space's tables, as :func:`differences` names a change: the ones it asks for, and
+    each data source leaving the space that is still a table in Unity Catalog (a product, or an
+    expose, left out). One that is a metric view, or is gone, is said as a metric view."""
+    path = ("data_sources", "tables")
+    held = _held(live)
+    wanted = {
+        str(t.get("identifier")) for t in _dig(serialized, path) or () if isinstance(t, Mapping)
+    }
+    leaving = sorted(
+        str(t.get("identifier"))
+        for t in _dig(held, path) or ()
+        if isinstance(t, Mapping) and str(t.get("identifier")) not in wanted
+    )
+    tables = set(space.tables)
+    for name in leaving:
+        try:
+            info = _read_table(client, name)
+        except Exception:  # noqa: BLE001 — only the word for the change depends on it
+            info = None
+        if info and str(info.get("table_type") or "").upper() != "METRIC_VIEW":
+            tables.add(name)
+    return tables
+
+
+def differences(
+    live: Mapping[str, Any],
+    space: Space,
+    serialized: Mapping[str, Any],
+    tables: Optional[Collection[str]] = None,
+) -> List[str]:
     """What differs between the live space and the one the contract asks for, by name. A title
-    the service suffixed because another space has it counts as the same title."""
-    changes = []
-    if not _same_title(live.get("title"), space.title):
-        changes.append("title")
-    if (live.get("description") or "") != space.description:
-        changes.append("description")
-    if live.get("warehouse_id") != space.warehouse_id:
-        changes.append("warehouse")
-    try:
-        held = json.loads(live.get("serialized_space") or "{}")
-    except (TypeError, ValueError):
-        held = {}
+    the service suffixed because another space has it counts as the same title. ``tables`` are
+    the data sources to name as tables (any other as a metric view); by default the space's."""
+    changes = [
+        name
+        for name, same in (
+            ("title", _same_title(live.get("title"), space.title)),
+            ("description", (live.get("description") or "") == space.description),
+            ("warehouse", live.get("warehouse_id") == space.warehouse_id),
+        )
+        if not same
+    ]
+    held = _held(live)
     if held != serialized:
-        named = []
-        if _dig(held, ("config", "sample_questions")) != _dig(
-            serialized, ("config", "sample_questions")
-        ):
-            named.append("sample questions")
-        named += _source_changes(held, serialized, set(space.tables))
-        if _dig(held, ("instructions", "text_instructions")) != _dig(
-            serialized, ("instructions", "text_instructions")
-        ):
-            named.append("instructions")
-        if _dig(held, ("instructions", "sql_snippets")) != _dig(
-            serialized, ("instructions", "sql_snippets")
-        ):
-            named.append("SQL snippets")
+        own = set(space.tables if tables is None else tables)
+        named = (
+            _changed_parts(held, serialized, _CONFIG_PARTS)
+            + _source_changes(held, serialized, own)
+            + _changed_parts(held, serialized, _INSTRUCTION_PARTS)
+        )
         changes += named or ["other settings"]
     return changes
+
+
+#: The parts of ``serialized_space`` an update names a change of, as :func:`differences`
+#: names them: the sample questions, then the data sources, then these instructions.
+_CONFIG_PARTS = ((("config", "sample_questions"), "sample questions"),)
+_INSTRUCTION_PARTS = (
+    (("instructions", "text_instructions"), "instructions"),
+    (("instructions", "join_specs"), "joins"),
+    (("instructions", "sql_snippets"), "SQL snippets"),
+)
+
+
+def _changed_parts(
+    held: Any, wanted: Any, parts: Sequence[Tuple[Tuple[str, ...], str]]
+) -> List[str]:
+    return [name for path, name in parts if _dig(held, path) != _dig(wanted, path)]
+
+
+def _held(live: Mapping[str, Any]) -> Any:
+    """The live space's ``serialized_space``, parsed; ``{}`` when it holds no JSON."""
+    try:
+        return json.loads(live.get("serialized_space") or "{}")
+    except (TypeError, ValueError):
+        return {}
 
 
 def _source_changes(held: Any, wanted: Any, own: set) -> List[str]:
@@ -1694,7 +1863,8 @@ def _share(client: Any, space_id: str, readers: Sequence[str], say: Say, dry_run
     if kept:
         say(
             f"    note: {', '.join(kept)} also hold CAN_EDIT or CAN_MANAGE on the space, set on it "
-            "directly; fluid apply keeps them (CAN_MANAGE can read other people's conversations)."
+            f"directly; {_VOICE.get().command} keeps them (CAN_MANAGE can read other people's "
+            "conversations)."
         )
     for principal in readers:
         key = acl_key(principal)
@@ -1811,14 +1981,15 @@ def _call(client: Any, what: str, fn: Callable[[], Any]) -> Any:
 
 def _remediation(status: Optional[int], what: str) -> str:
     """What to do about a failed call, by its HTTP status."""
+    command = _VOICE.get().command
     if status in (403, 404):
         genie = "Genie (AI/BI) is enabled in the workspace and that " if "Genie" in what else ""
-        return f"Check that {genie}this identity may {what}, then re-run fluid apply."
+        return f"Check that {genie}this identity may {what}, then re-run {command}."
     if status == 400:
-        return "Fix what the message names, then re-run fluid apply."
+        return f"Fix what the message names, then re-run {command}."
     if status == 429 or (status or 0) >= 500:
-        return "The workspace is busy or unavailable: re-run fluid apply in a minute."
-    return "Check DATABRICKS_HOST and the credential, then re-run fluid apply."
+        return f"The workspace is busy or unavailable: re-run {command} in a minute."
+    return f"Check DATABRICKS_HOST and the credential, then re-run {command}."
 
 
 #: The HTTP status each databricks-sdk error class stands for (``databricks/sdk/errors/
@@ -1865,11 +2036,14 @@ def _summary(serialized: Mapping[str, Any], own: Sequence[str]) -> str:
     tables = sum(1 for name in sources if name in own)
     views = len(sources) - tables
     questions = len(_dig(serialized, ("config", "sample_questions")) or ())
+    joins = len(_dig(serialized, ("instructions", "join_specs")) or ())
     measures = len(_dig(serialized, ("instructions", "sql_snippets", "measures")) or ())
     parts = [f"{tables} table(s)"]
     if views:
         parts.append(f"{views} metric view(s)")
     parts.append(f"{questions} sample question(s)")
+    if joins:
+        parts.append(f"{joins} join(s)")
     if measures:
         parts.append(f"{measures} measure snippet(s)")
     return ", ".join(parts)

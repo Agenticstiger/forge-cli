@@ -86,18 +86,41 @@ _SENSITIVE_KEY_PARTS = (
     "session_token",
     "token",
 )
-_JWT_RE = re.compile(r"\b[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b")
-# Three-segment JWT anchored on the ``eyJ`` base64url prefix of the JSON ``{"``
-# header (gitleaks' ``jwt`` rule and detect-secrets' ``JwtTokenDetector`` anchor
-# the same way). Used instead of the prefix-agnostic ``_JWT_RE`` for text a person
-# reads (``redact_secret_text(..., keep_dotted_names=True)``), where ``_JWT_RE``
-# would hide a fully qualified name such as
-# ``my-gcp-project.customer_analytics.daily_revenue_summary``. Logs keep ``_JWT_RE``.
-_JWT_ANCHORED_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+# A JWT, JWS or JWE in compact form (RFC 7519, RFC 7515 §7.1, RFC 7516 §7.1):
+# base64url segments joined by ``.``, the first of them the protected header, a JSON
+# object. Every JOSE library writes that object as ``{"``, which base64url-encodes to
+# ``eyJ``, so this rule anchors there, as gitleaks' ``jwt`` rule (``ey``) and
+# detect-secrets' ``JwtTokenDetector`` (``eyJ``) do. A JWS has a payload and a
+# signature after the header, a JWE an encrypted key, IV, ciphertext and tag. The
+# second segment may be empty: a JWE with direct encryption has no encrypted key
+# (``header..iv.ciphertext.tag``), and a detached JWS has no payload. The rule starts
+# where no base64url character precedes ``eyJ``; ``\b`` also matched after every ``-``,
+# which made the scan quadratic on ``eyJ-eyJ-…``. A header glued to a word
+# (``x-eyJ…``, ``token_eyJ…``) is :data:`_JWT_RE`'s.
+_JWT_ANCHORED_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+"
+    r"(?:\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)?"
+)
 # Two-segment JWT (header.payload, no signature). Anchored on the ``eyJ``
 # base64url prefix of the JSON ``{"`` header so we don't redact arbitrary
-# dotted identifiers. Complements ``_JWT_RE`` which requires three segments.
-_JWT_TWO_SEGMENT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
+# dotted identifiers. Complements ``_JWT_ANCHORED_RE``, which needs three segments.
+# It starts where :data:`_JWT_ANCHORED_RE` does, for the same reason.
+_JWT_TWO_SEGMENT_RE = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
+# A run of 12 or more characters and every dotted segment after it, empty ones included
+# (a JWE has five), masked from the first segment that holds a JOSE header
+# (:func:`_mask_if_jose`): one
+# written with a space or a newline (``{ "`` encodes to ``eyA``, ``{\n`` to ``ewo``;
+# trufflehog's JWT detector anchors on ``ewogIC`` for these), or one glued to a word
+# (``token_eyJ…``, ``x-eyJ…``), where the two ``eyJ`` rules do not start. It used to
+# mask any three runs of 12 or more unseen, and a fully qualified table name is three:
+# ``fluid apply`` printed ``table=***REDACTED***`` for
+# ``northwind_towers.bronze_smart_meters.smart_meters`` and the name of the next table,
+# whose last part had 11 characters. A run starts where no base64url character
+# precedes it, for the reason given above (``a-a-a-…``).
+_JWT_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{12,}(?:\.[A-Za-z0-9_-]*)+")
+# How many places inside one segment :func:`_mask_if_jose` tries as the start of a glued
+# header. Bounded, so a segment of many cannot cost a decode each.
+_GLUED_HEADER_TRIES = 6
 _BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)([^\s,;]+)")
 # SECURITY_REVIEW S-010: provider-specific token shapes. These don't
 # need surrounding assignment syntax — the string itself is distinctive
@@ -578,19 +601,83 @@ def _mask_assignment(match: "re.Match[str]") -> str:
     return f"{match.group('key')}{match.group('sep')}{quote}{_REDACTED}{quote}"
 
 
-def redact_secret_text(
-    text: str, *, extra_secrets: Iterable[str] = (), keep_dotted_names: bool = False
-) -> str:
+def _is_jose_header(segment: str) -> bool:
+    """Whether ``segment`` is a JOSE protected header: base64url of a JSON object with
+    the ``alg`` member that RFC 7515 and RFC 7516 (section 4.1.1 each) require.
+
+    detect-secrets' ``JwtTokenDetector.is_formally_valid`` checks a JWT the same way,
+    by decoding its parts and parsing them as JSON. A dotted name's part decodes to
+    bytes that are not JSON, and ``alg`` keeps a short one such as ``e30`` (``{}``) from
+    counting. The imports are deferred: ``base64`` stays off the ``fluid --help`` path,
+    which loads this module for its logging filter.
+    """
+    import base64
+    import json
+
+    try:
+        decoded = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+        return isinstance(decoded, dict) and "alg" in decoded
+    except (ValueError, RecursionError):
+        # binascii.Error, UnicodeDecodeError and JSONDecodeError are ValueErrors.
+        return False
+
+
+def _holds_jose_header(segment: str) -> bool:
+    """Whether ``segment`` is a JOSE header, or ends in one glued to a word.
+
+    A header is base64url of ``{``, so it starts with ``e``: a glued one starts at an
+    ``e`` after ``-`` or ``_`` (``x-ewog…``, ``token_eyAi…``) or at an ``eyJ``
+    (``tokeneyJ…``). At most :data:`_GLUED_HEADER_TRIES` of those places are tried.
+    """
+    if _is_jose_header(segment):
+        return True
+    tries = 0
+    at = segment.find("e", 1)
+    while at > 0 and tries < _GLUED_HEADER_TRIES:
+        if segment[at - 1] in "-_" or segment.startswith("eyJ", at):
+            tries += 1
+            if _is_jose_header(segment[at:]):
+                return True
+        at = segment.find("e", at + 1)
+    return False
+
+
+def _mask_if_jose(match: "re.Match[str]", placeholder: str) -> str:
+    """The ``_JWT_RE`` run ``match`` with the JOSE token in it masked, else unchanged.
+
+    The token may start in any segment: one glued after a dotted name
+    (``northwind_towers.x-<header>.<payload>``) is masked, the name kept.
+    """
+    segments = match.group(0).split(".")
+    for index, segment in enumerate(segments):
+        if _holds_jose_header(segment):
+            return ".".join(segments[:index] + [placeholder])
+    return match.group(0)
+
+
+def redact_jose_tokens(text: str, *, placeholder: str = _REDACTED) -> str:
+    """``text`` with every JWT, JWS and JWE masked, and dotted names left as written.
+
+    One implementation for both redaction layers: the Snowflake twin
+    (``providers/snowflake/util/logging.py``) calls it with its own placeholder, as it
+    imports ``_URL_USERINFO_RE``, so the two cannot drift.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    text = _JWT_ANCHORED_RE.sub(placeholder, text)
+    # Before the two-segment rule, which would mask an ``eyJ`` payload and its
+    # signature and leave a header this rule no longer sees as one token.
+    text = _JWT_RE.sub(lambda match: _mask_if_jose(match, placeholder), text)
+    return _JWT_TWO_SEGMENT_RE.sub(placeholder, text)
+
+
+def redact_secret_text(text: str, *, extra_secrets: Iterable[str] = ()) -> str:
     """Redact secret-like substrings in plain text.
 
     ``extra_secrets`` are literals to mask for THIS call only — for callers
     that hold a credential but must not register it process-wide (e.g. the
     Snowflake IaC table COMMENT, which carries whatever one contract spelled
     inline and should not affect redaction of anything else).
-
-    ``keep_dotted_names`` masks a three-segment JWT only when it has the ``eyJ``
-    header, so a fully qualified table name in an error a person reads survives.
-    Log redaction leaves it off and keeps the prefix-agnostic rule.
     """
     if not isinstance(text, str) or not text:
         return text
@@ -602,8 +689,7 @@ def redact_secret_text(
     # PEM blocks first: a multiline key block can itself contain ``.``/``=``
     # runs that would otherwise be partially mangled by the token regexes.
     redacted = _PEM_PRIVATE_KEY_RE.sub(_REDACTED, redacted)
-    redacted = (_JWT_ANCHORED_RE if keep_dotted_names else _JWT_RE).sub(_REDACTED, redacted)
-    redacted = _JWT_TWO_SEGMENT_RE.sub(_REDACTED, redacted)
+    redacted = redact_jose_tokens(redacted)
     # S-010: provider-token shapes run before the assignment regex so
     # ``api_key=sk_live_...`` hits the Stripe pattern in addition to the
     # assignment pattern, which also works.

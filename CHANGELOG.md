@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid genie apply`: one Databricks Genie space over several data products (an estate).**
+  `fluid genie apply <contracts|globs|folders...> --estate <id>` creates or updates one AI/BI
+  Genie space over the Databricks tables of every contract given, so a question can join the
+  products: `fluid genie apply tower-management/ --estate tower-management`. Each table carries
+  what a product's own space says of it (column descriptions, allowed values, synonyms, example
+  questions, one instruction section from its semantics, metrics and `agentPolicy`), and the space
+  gets a join for every foreign key the contracts declare between its tables: a column tagged
+  `foreign-key` whose `labels.references` is `<product id>.<column>`, resolved as `fluid apply`
+  resolves it for Unity Catalog. A join is MANY_TO_ONE from the referencing table, ONE_TO_ONE
+  when the foreign key is that table's own primary key, a composite key is one join, and a key
+  to its own table joins a second alias. A reference to a product the estate does not hold is
+  said and left out. `CAN RUN` goes only to the principals that read every table of the estate,
+  since the space describes them all; the others are named. The products are applied first: the
+  run checks that every table exists before it writes and names the product of one that does
+  not. Like a product's space it is found again by a marker, `[fluid-genie-estate:<id>]`, in the
+  deploying identity's own folder only, changes nothing on a second run, and converges to
+  exactly the contracts given. `--title`, `--env` (contract overlays) and `--dry-run`;
+  `fluid genie remove --estate <id>` trashes it. Each contract passes the schema and version
+  gate `fluid apply` runs, and an unreadable one is `contract_load_failed`, naming the file. A
+  product whose `agentPolicy` rules out question answering refuses the estate, and so do more
+  than 50 tables, Genie's cap (measured). Whenever a table enters a space, Genie adds a join of
+  its own for each Unity Catalog foreign key that touches it (measured): a run reads each
+  write back, takes those duplicates out, and says so, so the next run finds no change. This
+  holds for a product's own space too. A product space's update now names a table that
+  leaves the space as a table, not as a metric view.
+
 - **A Databricks AI/BI Genie space for a data product.** With `extensions.databricksGenie: {}`
   (or `{title: ...}`) in a contract with Databricks table exposes, `fluid apply` creates the
   product's Genie space once its tables, masks and row filters are in place. The space holds
@@ -28,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `parentPath` (below): a space another identity made in its own folder is left alone.
   `fluid apply --mode dry-run` prints what would change. The space is made through the Genie
   REST API (the `[databricks]` extra), since the databricks/databricks provider has no Genie
-  space resource. One space per product; a space over several products is a follow-up.
+  space resource. One space per product; `fluid genie apply` makes one over several products.
 
 - **One Genie space for a product deployed from more than one identity.**
   `extensions.databricksGenie.parentPath` names a workspace folder, such as `/genie/<domain>`.
@@ -167,6 +193,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path exits 1 where it used to write a template instead. A `fluid ai setup`
   choice and a single keyring key still come first, and `GEMINI_API_KEY` with `GOOGLE_API_KEY` is
   one provider. Pick one with `--llm-provider` or `FLUID_LLM_PROVIDER`.
+- **`fluid plan` refuses a contract its own sovereignty policy blocks, by default.** It checked
+  the policy only with `--check-sovereignty`, so a contract `fluid validate` refuses
+  (`enforcementMode: strict`, or a region in `deniedRegions`, which blocks in every mode) still
+  got a plan. Now plan runs the same policy engine before it plans: a blocking verdict exits 1
+  (`ERR_SOVEREIGNTY_VIOLATION`) before any plan is written. The refusal names each expose and
+  carries the findings as the error's `errors`, the way `local_plan_validation_failed` does, so
+  an engine-API caller such as Command Center's plan endpoint shows it. The default check builds
+  no cloud provider. `--check-sovereignty` runs the same check, then asks the provider's own
+  hook and prints the verdict, also before the plan is written: a hook that reports nothing no
+  longer passes a contract `fluid validate` refuses. The new `--no-check-sovereignty` writes the
+  plan anyway, says so on the console and logs a WARNING (event `sovereignty_check_skipped`); it
+  changes nothing in `fluid apply`, which keeps its own checks (on Databricks and GCP it refuses
+  such a placement itself). The generated CI pipelines already pass `--check-sovereignty`; a
+  failing plan stage now writes no plan file (one left at `--out` by an earlier run stays as it
+  was).
+- **Databricks: Unity Catalog tag values are written as the contract states them.** The
+  governance labels became tags with GCP's label slugs: lowercased, spaces and punctuation
+  turned into `-`, cut at 63 characters (`business_value =
+  'a-single-unrenewed-ground-lease-can-strand-a-multi-tenant-tower'`, `fluid_jurisdiction =
+  'us'`). A tag value takes up to 256 characters with case, spaces and punctuation, so the value
+  is now the contract's text less surrounding whitespace, and `fluid_regulation` joins the
+  frameworks with `, ` (`GDPR, CCPA`). A longer value is refused as
+  `databricks-tag-value-too-long` rather than cut. Tag keys are unchanged (each `-` still
+  becomes `_`), and GCP labels and AWS tags keep the label alphabet.
+  **On an existing deployment** the next `fluid apply` updates each changed
+  `databricks_entity_tag_assignment` in place (`~`; `tag_value` has no replace modifier in the
+  pinned provider, 1.140.0): no table, schema or data is replaced or destroyed, and no
+  `--allow-data-loss` is needed. Until that apply, `fluid verify` reports the old values as tag
+  drift. On Free Edition, a product carrying the old values planned `+0 ~17 -0`.
 - **`fluid apply` on a Databricks contract with `exposes[].semantics` needs the `[databricks]`
   extra** (databricks-sdk), which creates the metric view, and refuses before `tofu apply` when it
   is missing, as it does for column masks. A semantics block the metric view cannot hold (a
@@ -322,6 +377,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   land such an expose (`payload.landed_by`) and asks no table for it. An expose that no build
   writes, or that another build may write, still reports its missing source, and the drift
   verdict and exit code are unchanged.
+- **Log redaction no longer masks fully qualified names.** `fluid apply` printed
+  `databricks.load table=***REDACTED***` for `northwind_towers.bronze_smart_meters.smart_meters`
+  and the name of the next table, whose last part had 11 characters: the generic JWT rule masked
+  any three dotted runs of 12 or more characters. Such a run is now masked only when its first
+  part is a JOSE header (base64url of a JSON object, the check detect-secrets makes), so
+  `catalog.schema.table`, `project.dataset.table` and `DB.SCHEMA.TABLE` names stay readable in
+  logs and errors. Tokens are still masked, in both redaction layers (the Snowflake one now uses
+  the global rule), and more of them than before: a JWE (one with direct encryption has an empty
+  encrypted key), a JWS with a short or empty payload or signature, a header written with spaces
+  or newlines, and a token glued to a word (`token_eyJ…`). The JWT rules no longer scan
+  quadratically on input such as `a-a-a-…` or `eyJ-eyJ-…` (200,000 characters took 30 s or more;
+  now under a second). `redact_secret_text()` loses its `keep_dotted_names` keyword (0.28.0):
+  logs and printed errors now apply the same rule.
 
 ## [0.29.0] — 2026-11-12
 

@@ -30,7 +30,7 @@ from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.providers import databricks as dbx
 from fluid_build.iac.providers import databricks_genie as genie
 
-from ._fake_databricks import FakeDatabricks
+from ._fake_databricks import FakeDatabricks, writes_since
 
 pytestmark = [pytest.mark.unit, pytest.mark.databricks]
 
@@ -517,11 +517,7 @@ class Run:
         return "\n".join(self.said)
 
     def writes(self) -> List[Any]:
-        return [
-            r
-            for r in self.fake.requests[self.start :]
-            if r[0] in ("POST", "PATCH", "PUT", "DELETE")
-        ]
+        return writes_since(self.fake, self.start)
 
 
 def only_space(fake: FakeDatabricks) -> Dict[str, Any]:
@@ -666,6 +662,19 @@ def test_a_metric_view_over_the_table_becomes_a_data_source_once_it_exists(fake)
     # Dropped in Unity Catalog, it leaves the space on the next apply.
     fake.metric_views.clear()
     assert "updated 'Site 360': metric views (" in Run(fake)(site_contract()).text
+
+
+def test_an_expose_taken_out_of_the_product_is_said_as_a_table_not_a_metric_view(fake):
+    doc = site_contract()
+    second = copy.deepcopy(doc["exposes"][0])
+    second["exposeId"] = "site_history"
+    second["binding"]["location"]["table"] = "site_history"
+    doc["exposes"].append(second)
+    fake.create_table("main.asset.site_history", [("site_id", "string", False)])
+    Run(fake)(doc)
+    run = Run(fake)(site_contract())  # the history expose is gone; its table stays in UC
+    (line,) = [s for s in run.said if "updated 'Site 360'" in s]
+    assert "tables" in line and "metric views" not in line
 
 
 def test_a_metric_view_sent_where_the_service_does_not_keep_it_would_never_converge(fake):
@@ -998,6 +1007,11 @@ def test_a_list_that_never_shows_the_new_space_is_said_not_waited_on_forever(
     fake.genie_list_lag = 1000
     run = Run(fake)(site_contract())
     assert "created 'Site 360'" in run.text and "does not show the new space yet" in run.text
+    # The product's own words, as before the estate's Voice.
+    assert (
+        "an apply in the next minute could make a second one, which the apply after refuses "
+        "until one is trashed." in run.text
+    )
 
 
 def test_a_title_another_space_has_is_kept_as_the_service_suffixed_it_and_said(fake):

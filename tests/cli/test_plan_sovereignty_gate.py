@@ -289,7 +289,7 @@ class TestPlanExitCode:
         path.write_text(yaml.safe_dump(contract), encoding="utf-8")
         return path
 
-    def test_violating_contract_exits_non_zero(self, tmp_path):
+    def test_violating_contract_exits_non_zero_and_writes_no_plan(self, tmp_path, capsys):
         from fluid_build._contract_loader import CLIError
         from fluid_build.cli.plan import run
 
@@ -299,6 +299,8 @@ class TestPlanExitCode:
 
         assert excinfo.value.exit_code == 1
         assert excinfo.value.event == "sovereignty_violation"
+        assert not (tmp_path / "plan.json").exists()
+        assert "Plan saved" not in capsys.readouterr().out
 
     def test_compliant_contract_exits_zero(self, tmp_path):
         from fluid_build.cli.plan import run
@@ -306,9 +308,102 @@ class TestPlanExitCode:
         path = self._write(tmp_path, _contract(region="eu-central-1"))
         assert run(self._args(tmp_path, path), LOG) == 0
 
-    def test_flag_off_does_not_gate(self, tmp_path):
-        """Without the flag the check does not run, so nothing blocks."""
+    def test_no_check_sovereignty_skips_the_check_and_says_so(self, tmp_path, caplog, capsys):
+        """``--no-check-sovereignty`` writes the plan anyway: on the console and at WARNING."""
         from fluid_build.cli.plan import run
 
         path = self._write(tmp_path, _contract())
-        assert run(self._args(tmp_path, path, check_sovereignty=False), LOG) == 0
+        with caplog.at_level(logging.WARNING):
+            assert run(self._args(tmp_path, path, check_sovereignty=False), LOG) == 0
+        assert (tmp_path / "plan.json").exists()
+        assert "sovereignty check was SKIPPED" in caplog.text
+        assert "Sovereignty check skipped (--no-check-sovereignty)" in capsys.readouterr().out
+
+    def test_a_clean_provider_hook_does_not_weaken_check_sovereignty(self, tmp_path, monkeypatch):
+        """The explicit flag runs the default check first, so a hook that reports
+        nothing cannot pass a contract ``fluid validate`` refuses."""
+        from fluid_build._contract_loader import CLIError
+        from fluid_build.cli import plan as plan_mod
+
+        monkeypatch.setattr(
+            plan_mod, "_hook_provider", lambda *_a, **_k: ("aws", _CleanHookProvider())
+        )
+        path = self._write(tmp_path, _contract())
+        with pytest.raises(CLIError) as excinfo:
+            plan_mod.run(self._args(tmp_path, path, check_sovereignty=True), LOG)
+        assert excinfo.value.event == "sovereignty_violation"
+        assert not (tmp_path / "plan.json").exists()
+
+
+class TestPlanChecksSovereigntyByDefault:
+    """``fluid plan`` with no flag refuses what ``fluid validate`` refuses."""
+
+    pytestmark = pytest.mark.unit
+
+    def _run(self, tmp_path, contract):
+        from fluid_build.cli.plan import run
+
+        path = TestPlanExitCode._write(tmp_path, contract)
+        return run(TestPlanExitCode._args(tmp_path, path, check_sovereignty=None), LOG)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},  # strict, outside allowedRegions and in deniedRegions
+            {"denied": False},  # strict, outside allowedRegions
+            {"mode": "advisory"},  # an explicit deny blocks in every mode
+        ],
+        ids=["strict-denied", "strict-not-allowed", "advisory-denied"],
+    )
+    def test_a_blocking_contract_is_refused_and_no_plan_is_written(self, tmp_path, kwargs, capsys):
+        from fluid_build._contract_loader import CLIError
+
+        with pytest.raises(CLIError) as excinfo:
+            self._run(tmp_path, _contract(**kwargs))
+        assert (excinfo.value.exit_code, excinfo.value.event) == (1, "sovereignty_violation")
+        assert not (tmp_path / "plan.json").exists()
+        out = capsys.readouterr().out
+        assert "us-east-1" in out and "Sovereignty check FAILED" in out
+        # The expose is named, printed literally (Rich would take "[id]" for markup).
+        assert "[customer_events]" in out
+        # The findings ride on the error, as local_plan_validation_failed's do, so an
+        # engine-API caller (Command Center's plan endpoint) can show the refusal.
+        context = excinfo.value.context
+        assert context["errors"] and all("[customer_events]" in e for e in context["errors"])
+        assert "us-east-1" in " ".join(context["errors"]) and context["message"]
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"region": "eu-central-1"},  # compliant
+            {"mode": "advisory", "denied": False},  # advisory: a warning, not a block
+            {"sovereignty": False},  # no policy to check
+        ],
+        ids=["compliant", "advisory-not-allowed", "no-policy"],
+    )
+    def test_a_contract_that_does_not_block_plans_as_before(self, tmp_path, kwargs, capsys):
+        assert self._run(tmp_path, _contract(**kwargs)) == 0
+        assert (tmp_path / "plan.json").exists()
+        assert "Sovereignty check" not in capsys.readouterr().out
+
+    def test_the_default_check_builds_no_provider(self, tmp_path, monkeypatch):
+        """A plain plan stays off the cloud SDKs (Command Center's plan relies on it)."""
+        from fluid_build._contract_loader import CLIError
+        from fluid_build.cli import plan as plan_mod
+
+        def no_provider(*_args, **_kwargs):
+            raise AssertionError("the default sovereignty check built a provider")
+
+        monkeypatch.setattr(plan_mod, "build_provider", no_provider)
+        with pytest.raises(CLIError):
+            self._run(tmp_path, _contract())
+
+    @pytest.mark.parametrize(
+        "argv, expected",
+        [([], None), (["--check-sovereignty"], True), (["--no-check-sovereignty"], False)],
+    )
+    def test_the_flag_has_three_states(self, argv, expected):
+        from fluid_build.cli import build_parser
+
+        args = build_parser().parse_args(["plan", "contract.fluid.yaml", *argv])
+        assert args.check_sovereignty is expected

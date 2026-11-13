@@ -725,9 +725,7 @@ def clean(text: Any) -> str:
     from fluid_build.observability.secret_redactor import redact_secret_text
 
     plain = _CONTROL_RE.sub("", _ANSI_RE.sub("", str(text or "")))
-    return redact_secret_text(
-        plain, extra_secrets=credential_values(os.environ), keep_dotted_names=True
-    )
+    return redact_secret_text(plain, extra_secrets=credential_values(os.environ))
 
 
 def _failure(exc: BaseException) -> str:
