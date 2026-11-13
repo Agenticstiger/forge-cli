@@ -65,6 +65,7 @@ def _make_validation_result(valid=True, errors=None, warnings=None, schema_versi
     result.is_valid = valid
     result.errors = errors or []
     result.warnings = warnings or []
+    result.notes = []
     result.schema_version = schema_version
     result.validation_time = 0.01
     result.get_summary = Mock(return_value="Summary")

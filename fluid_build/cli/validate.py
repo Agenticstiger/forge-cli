@@ -1275,7 +1275,7 @@ def _run_contract_rules(
 def _databricks_binding_check(validation_result, contract: Mapping[str, Any]) -> None:
     """What the Databricks emitter would refuse (no SQL warehouse in
     DATABRICKS_WAREHOUSE_ID, a contract-named host, Iceberg, governance applied
-    but never enforced), and its warnings, into the result.
+    but never enforced), and its warnings and notes, into the result.
 
     Fails closed: a check that cannot be imported or that raises is an error,
     never a gate silently switched off (the Iceberg-sink block above says why).
@@ -1283,7 +1283,8 @@ def _databricks_binding_check(validation_result, contract: Mapping[str, Any]) ->
     try:
         from fluid_build.iac.providers.databricks import validate_databricks_binding
 
-        errors, warnings = validate_databricks_binding(contract)
+        notes: List[str] = []
+        errors, warnings = validate_databricks_binding(contract, notes=notes)
     except Exception as exc:  # noqa: BLE001 — reported, never swallowed
         validation_result.add_error(
             f"Databricks binding check could not run ({type(exc).__name__}: {exc}); "
@@ -1296,6 +1297,8 @@ def _databricks_binding_check(validation_result, contract: Mapping[str, Any]) ->
         validation_result.is_valid = False
     for msg in warnings:
         validation_result.add_warning(msg)
+    for msg in notes:
+        validation_result.add_note(msg)
 
 
 def _build_id_check(validation_result, contract: Mapping[str, Any]) -> None:
@@ -1625,9 +1628,12 @@ def _output_json_results(result: ValidationResult, args) -> int:
             "schema_version": str(result.schema_version) if result.schema_version else None,
             "errors": result.errors,
             "warnings": result.warnings,
-            "validation_time": result.validation_time,
         }
     )
+    if result.notes:
+        # Only when there is one: a contract without notes keeps the document it always had.
+        output["notes"] = result.notes
+    output["validation_time"] = result.validation_time
 
     _cprint_json(json.dumps(output, indent=2))
     return 0 if result.is_valid and (not args.strict or not result.warnings) else 1
@@ -1655,13 +1661,12 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
         if not args.quiet:
             cprint()
 
-    # Warnings
-    if result.warnings and not args.quiet:
-        cprint("Validation Warnings:")
-        cprint("====================")
-        for i, warning in enumerate(result.warnings, 1):
-            _cprint_literal(f"{i:2}. {warning}")
-        cprint()
+    # Warnings, then notes: a note asks nothing of the author, so --strict never counts one.
+    if not args.quiet:
+        if result.warnings:
+            _print_numbered("Validation Warnings:", result.warnings)
+        if result.notes:
+            _print_numbered("Validation Notes:", result.notes)
 
     # Verbose information
     if args.verbose and not args.quiet:
@@ -1684,6 +1689,15 @@ def _output_text_results(result: ValidationResult, args, logger: logging.Logger)
         return 1
     else:
         return 0
+
+
+def _print_numbered(title: str, items: List[str]) -> None:
+    """``title``, underlined, each item numbered from 1, then a blank line."""
+    cprint(title)
+    cprint("=" * len(title))
+    for i, item in enumerate(items, 1):
+        _cprint_literal(f"{i:2}. {item}")
+    cprint()
 
 
 def _explain_strict_failure(warnings: List[str], quiet: bool) -> None:
@@ -1946,9 +1960,8 @@ def _run_bundle_validation(
             f"({s.get('error', 0)} error, {s.get('warning', 0)} warning, "
             f"{s.get('info', 0)} info)"
         )
-        # A bundle that passes still lists its warnings, as a contract file does.
         for issue in report.issues:
-            if verbose or report.status == "fail" or issue.severity == "warning":
+            if verbose or report.status == "fail" or _listed_on_pass(issue):
                 _cprint_literal(f"   [{issue.severity}] {_bundle_issue_text(issue)}")
         if strict and not any(issue.severity == "error" for issue in report.issues):
             warnings = [_bundle_issue_text(i) for i in report.issues if i.severity == "warning"]
@@ -1974,6 +1987,14 @@ def _run_bundle_validation(
 
 #: The report code of an overlay warning ``fluid bundle --env`` recorded.
 _OVERLAY_WARNING_CODE = "OVERLAY-WARNING"
+
+
+def _listed_on_pass(issue: Any) -> bool:
+    """Whether a bundle that passes lists ``issue``: its warnings and its contract's notes,
+    as a contract file does. The bundle validators' own info stays under ``--verbose``."""
+    return issue.severity == "warning" or (
+        issue.severity == "info" and issue.code == "CONTRACT-RULE"
+    )
 
 
 def _bundle_issue_text(issue: Any) -> str:
@@ -2121,24 +2142,16 @@ def _bundle_contract_rule_issues(
     _run_extension_validators(contract, result, logger)
     _run_role_validators(contract, result, logger)
 
-    issues = [
+    # A note is the report's info: counted and listed, never failed on by --strict.
+    found = (("error", result.errors), ("warning", result.warnings), ("info", result.notes))
+    return [
         ValidationIssue(
             file="contract.resolved.yaml",
             validator="contract",
-            severity="error",
+            severity=severity,
             message=msg,
             code="CONTRACT-RULE",
         )
-        for msg in result.errors
+        for severity, messages in found
+        for msg in messages
     ]
-    issues.extend(
-        ValidationIssue(
-            file="contract.resolved.yaml",
-            validator="contract",
-            severity="warning",
-            message=msg,
-            code="CONTRACT-RULE",
-        )
-        for msg in result.warnings
-    )
-    return issues

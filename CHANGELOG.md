@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fluid validate --strict` no longer fails a dbt-built Databricks product that describes its
+  tables.** 0.30.0 warned on every Databricks expose a dbt build writes when the contract has a
+  table or column description: dbt's `CREATE OR REPLACE` sets the comments (with
+  `persist_docs`), so `fluid apply` sets none. There is nothing to fix, yet `--strict` turned
+  the warning into an error, so stage 2 of the pipelines `fluid generate ci` writes
+  (`VALIDATE_STRICT` defaults to true) failed for every such product. The message is now a
+  note, with the same text: `fluid validate` prints it under "Validation Notes:", `--format
+  json` lists it under `notes` (a key present only when there is a note), and a bundle reports
+  it as an `info` issue, which a passing bundle lists as a contract file does. `--strict`
+  counts warnings only.
+
 ## [0.30.0] — 2026-11-13
 
 ### Added
