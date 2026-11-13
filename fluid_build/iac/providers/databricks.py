@@ -1462,9 +1462,10 @@ def _compile(
     schemas, tags = _emit_tables(compiled, contract, cid, warehouse, region, privileges)
     _check_own_keys(compiled, contract)
     compiled.metric_views = _metric_views.compile_metric_views(
-        contract, compiled.tables, privileges, refusals, compiled.warnings
+        contract, _tables_before_build(compiled), privileges, refusals, compiled.warnings
     )
     _emit_quality_monitors(compiled, cid)
+    compiled.warnings.extend(_pipeline_table_warnings(compiled, contract))
     jobs = compile_dbt_jobs(
         contract,
         compiled.tables,
@@ -1706,19 +1707,29 @@ def _keys(cid: str, table: _Table) -> Tuple[str, str, str]:
     )
 
 
-def _unmonitored_pipeline_tables(compiled: _Compiled) -> List[str]:
-    """A ``fluid validate`` warning for each Lakeflow pipeline's table whose SLOs ask for data
-    quality monitoring, which ``fluid apply`` does not turn on for a pipeline's table yet.
+def _tables_before_build(compiled: _Compiled) -> List[_Table]:
+    """The tables that exist once ``tofu apply`` has run: every table but a Lakeflow
+    pipeline's, which the pipeline creates at its first update, in the build phase. What is
+    set up on a table at or right after ``tofu apply`` (a data quality monitor, a metric view,
+    a Genie space) is set up on these only."""
+    return [table for table in compiled.tables if table.full_name not in compiled.lakeflow_written]
 
-    The monitor is created after its schema's tables so that its first scan sees them, and
-    a pipeline creates its table at its first update, after ``tofu apply``; whether the
-    schema-level scan covers a materialized view is not verified yet. The table's
-    ``contract.dq.rules`` are not in the warning: they are the pipeline's expectations.
+
+def _pipeline_table_warnings(compiled: _Compiled, contract: Mapping[str, Any]) -> List[str]:
+    """A ``fluid validate`` warning for each thing a Lakeflow pipeline's table asks for that
+    ``fluid apply`` does not set up on it yet (:func:`_tables_before_build`): data quality
+    monitoring its SLOs ask for, the metric view its ``semantics`` asks for, and its place in
+    the product's Genie space.
+
+    Whether the schema-level monitoring scan covers a materialized view is not verified yet
+    either. The table's ``contract.dq.rules`` are not in the warnings: they are the pipeline's
+    expectations.
     """
+    from .databricks_genie import requested as genie_requested
+
+    pipeline_tables = [t for t in compiled.tables if t.full_name in compiled.lakeflow_written]
     warnings: List[str] = []
-    for table in compiled.tables:
-        if table.full_name not in compiled.lakeflow_written:
-            continue
+    for table in pipeline_tables:
         asked = [a for a in monitoring_request(table.exposure) if not a.startswith("contract.")]
         if asked:
             warnings.append(
@@ -1728,6 +1739,24 @@ def _unmonitored_pipeline_tables(compiled: _Compiled) -> List[str]:
                 "are the pipeline's expectations, counted on each update. Set "
                 "contract.dq.monitoring.enabled to false to say so in the contract."
             )
+        if isinstance(table.exposure.get("semantics"), Mapping):
+            warnings.append(
+                f"{table.where} is published by a Lakeflow pipeline: its semantics get no metric "
+                "view yet. fluid apply creates a metric view right after tofu apply, and the "
+                "pipeline creates the table the view reads at its first update, after that."
+            )
+    if pipeline_tables and genie_requested(contract):
+        names = ", ".join(t.full_name for t in pipeline_tables)
+        warnings.append(
+            (
+                "extensions.databricksGenie: no Genie space is created, since every table of "
+                "this product is a Lakeflow pipeline's"
+                if len(pipeline_tables) == len(compiled.tables)
+                else f"extensions.databricksGenie: the Genie space leaves out {names}"
+            )
+            + ". fluid apply sets the space up right after tofu apply, and a pipeline creates "
+            "its table at its first update, after that."
+        )
     return warnings
 
 
@@ -1744,11 +1773,8 @@ def _emit_quality_monitors(compiled: _Compiled, cid: str) -> None:
     a table that scan misses may wait up to two weeks for its health indicator (Databricks
     docs, "intelligent scanning").
     """
-    tables = [
-        table for table in compiled.tables if table.full_name not in compiled.lakeflow_written
-    ]
+    tables = _tables_before_build(compiled)
     compiled.warnings.extend(window_warnings(tables))
-    compiled.warnings.extend(_unmonitored_pipeline_tables(compiled))
     for monitor in plan_monitors(tables):
         key = _schema_key(cid, monitor.catalog, monitor.schema)
         body = monitor.body(tofu_ref(f"databricks_schema.{key}.schema_id"))
@@ -3269,10 +3295,15 @@ def validate_databricks_binding(
 def _genie(contract: Mapping[str, Any], compiled: _Compiled, env: Mapping[str, str]) -> Any:
     """The Genie space ``contract`` asks for, from this compile's tables and grants
     (``databricks_genie.compile_space``); imported here, the Light CLI's ``--help`` never
-    needs it."""
-    from .databricks_genie import compile_space
+    needs it. A Lakeflow pipeline's table is left out (:func:`_tables_before_build`), and a
+    product whose tables are all a pipeline's gets no space."""
+    from .databricks_genie import Compiled, compile_space, requested
 
-    return compile_space(contract, compiled.tables, compiled.grants, env)
+    tables = _tables_before_build(compiled)
+    if requested(contract) and compiled.tables and not tables:
+        # Every table is a Lakeflow pipeline's: no space yet (_pipeline_table_warnings).
+        return Compiled(product_id=str(contract.get("id") or "").strip())
+    return compile_space(contract, tables, compiled.grants, env)
 
 
 def genie_estate(

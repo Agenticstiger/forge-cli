@@ -846,3 +846,69 @@ def test_monitoring_switched_off_says_nothing(tmp_path):
 
     compiled = _compile(_edit(o=off), tmp_path)
     assert not [w for w in compiled.warnings if "data quality monitoring" in w]
+
+
+# ── what is set up right after tofu apply (metric views, Genie), 2026-11-13 ─────
+_SEMANTICS = {
+    "name": "capacity_semantic_model",
+    "entities": [{"name": "site_id", "type": "primary", "expr": "site_id"}],
+    "dimensions": [{"name": "method", "type": "categorical", "expr": "method"}],
+    "measures": [{"name": "total_load", "agg": "sum", "expr": "load_kg"}],
+}
+
+
+def _with_plain_table(contract):
+    """A second expose, a plain Databricks table in another schema (no build writes it)."""
+    plain = copy.deepcopy(contract["exposes"][0])
+    plain["exposeId"] = "sites_seen"
+    plain["binding"]["location"].update(schema="silver_seen", table="sites_seen")
+    plain["contract"].pop("dq", None)
+    contract["exposes"].append(plain)
+    contract["accessPolicy"]["grants"][0]["resources"].append(
+        "$.exposes[?(@.exposeId=='sites_seen')]"
+    )
+
+
+def test_a_pipeline_tables_semantics_get_no_metric_view_and_say_so(tmp_path):
+    """A metric view is created right after tofu apply, over a table the pipeline only
+    creates at its first update: CREATE VIEW would fail the first apply."""
+    contract = _edit(s=lambda c: c["exposes"][0].update(semantics=copy.deepcopy(_SEMANTICS)))
+    compiled = _compile(contract, tmp_path)
+    assert compiled.metric_views.views == []
+    assert not [r for r in compiled.refusals if r.kind.startswith("databricks-metric")]
+    (warning,) = [w for w in compiled.warnings if "metric view" in w]
+    assert "semantics get no metric view yet" in warning
+
+
+def test_the_plain_table_beside_a_pipeline_keeps_its_metric_view(tmp_path):
+    def both(contract):
+        _with_plain_table(contract)
+        for expose in contract["exposes"]:
+            expose["semantics"] = copy.deepcopy(_SEMANTICS)
+
+    compiled = _compile(_edit(b=both), tmp_path)
+    assert [v.source for v in compiled.metric_views.views] == [
+        "fluid_iactest_ldp.silver_seen.sites_seen"
+    ]
+
+
+def test_a_product_of_pipeline_tables_only_gets_no_genie_space_and_no_refusal(tmp_path):
+    contract = _edit(g=lambda c: c.setdefault("extensions", {}).update(databricksGenie={}))
+    compiled = _compile(contract, tmp_path)
+    genie = dbx._genie(contract, compiled, ENV)
+    assert genie.space is None and genie.refusals == []
+    assert any("no Genie space is created" in w for w in compiled.warnings)
+
+
+def test_the_genie_space_leaves_a_pipeline_table_out(tmp_path):
+    def both(contract):
+        _with_plain_table(contract)
+        contract.setdefault("extensions", {})["databricksGenie"] = {}
+
+    contract = _edit(b=both)
+    compiled = _compile(contract, tmp_path)
+    genie = dbx._genie(contract, compiled, ENV)
+    assert genie.refusals == []
+    assert genie.space.tables == ("fluid_iactest_ldp.silver_seen.sites_seen",)
+    (warning,) = [w for w in compiled.warnings if "Genie" in w]
+    assert "leaves out fluid_iactest_ldp.silver_capacity.capacity" in warning

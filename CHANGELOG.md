@@ -183,9 +183,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The pipeline owns its table: no table resource is created for it, readers get `SELECT` on
     the product's schema, and the table's and its columns' tags are set after each update
     `fluid apply` runs. Masks, row filters, write grants, partitions, `lifecycle.expire` and a
-    cron trigger are refused on a lakeflow build for now. Unity Catalog keys and data quality
-    monitoring are not set up on a pipeline's table yet: `fluid validate` warns about a
-    declared key and about a freshness or completeness SLO there.
+    cron trigger are refused on a lakeflow build for now. Unity Catalog keys, data quality
+    monitoring, a metric view (`semantics`) and a place in the Genie space are not set up on a
+    pipeline's table yet: each is set up at or right after `tofu apply`, and the pipeline
+    creates its table at its first update, after that. `fluid validate` warns about each.
   - `fluid apply --mode amend-and-build` starts an update and waits for it
     (`replace-and-build`: a full refresh), then prints each rule's counts from the pipeline's
     event log. A failed update fails the apply with its error, less the row a failed
