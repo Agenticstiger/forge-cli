@@ -31,6 +31,11 @@ SQL warehouse ``DATABRICKS_WAREHOUSE_ID`` names. No schema field is added
 * ``execution.retries``, ``notifications``, ``runtime.timeout`` and
   ``runtime.serviceAccount``: the task's retries and timeout, the job's email
   notifications and its ``run_as``.
+* ``exposes[].contract.dq.rules`` of each expose the build writes: one dbt test
+  per check, uploaded beside the project under ``<test path>/fluid_dq/``
+  (``databricks_dbt_tests.py``), which ``dbt build`` runs after the model; a
+  rule no test can run is refused, and so is a Git source with rules, since no
+  file can be added to a checkout.
 
 The catalog and schema dbt writes to are those of the first Databricks expose
 the build writes (``builds[].outputs``). Everything the job would accept with
@@ -87,6 +92,9 @@ MAX_PROJECT_FILES = 1000
 #: the apply's state by them (``build_runners/_databricks_job_run.py::jobs_in_state``).
 PRODUCT_TAG = "fluid_product"
 BUILD_TAG = "fluid_build"
+
+#: The key of the job's dbt task: what a run's report finds the dbt output under.
+DBT_TASK_KEY = "dbt"
 
 #: The data source that names the deploying identity's home folder.
 CURRENT_USER = "databricks_current_user"
@@ -155,6 +163,8 @@ class DbtJob:
     files: Tuple[str, ...]
     #: Where the files go, below the applying identity's home (WORKSPACE source).
     root: str = ""
+    #: The dbt tests its contract's DQ rules run as, by name (``databricks_dbt_tests.py``).
+    tests: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -745,6 +755,8 @@ class _Source:
     git: Optional[Dict[str, Any]] = None
     directory: Optional[str] = None
     files: Tuple[Tuple[str, bytes], ...] = ()
+    #: The dbt tests of the contract's DQ rules among ``files``, by name (``_with_tests``).
+    tests: Tuple[str, ...] = ()
 
 
 def job_product(contract: Mapping[str, Any]) -> str:
@@ -801,10 +813,52 @@ def compile_dbt_jobs(
         settings = _job_settings(item, compiled)
         table = _target_table(item, builds, tables, compiled.refusals)
         source = _project_source(item, compiled.refusals, validating=validating)
+        if source is not None:
+            source = _with_tests(contract, item, builds, tables, source, compiled.refusals)
         if len(compiled.refusals) == before and table is not None and source is not None:
             script = rebuild_script(build) if rebuild_script is not None else None
             _emit_job(compiled, item, table, settings, source, script)
     return compiled
+
+
+def _with_tests(
+    contract: Mapping[str, Any],
+    item: _Build,
+    builds: Sequence[Mapping[str, Any]],
+    tables: Sequence[Any],
+    source: _Source,
+    refusals: List[UnsupportedBindingError],
+) -> _Source:
+    """``source`` with the dbt tests the contract's DQ rules run as (``databricks_dbt_tests.py``).
+    A Git checkout takes none, so its rules are refused."""
+    from .databricks_dbt_tests import compile_tests, written_tables
+
+    git = source.git is not None
+    compiled = compile_tests(
+        contract,
+        item.build,
+        item.where,
+        written_tables(item.build, builds, tables),
+        # No file at all: ``fluid validate`` without a contract location (``_project_source``).
+        None if git or not source.files else source.files,
+        git=git,
+    )
+    refusals.extend(compiled.refusals)
+    if not compiled.files:
+        return source
+    files = tuple(sorted((*source.files, *compiled.files)))
+    if len(files) > MAX_PROJECT_FILES:
+        refusals.append(
+            _refusal(
+                "project-size",
+                f"{item.where} the dbt project and the {len(compiled.files)} tests of its "
+                f"contract rules upload {len(files)} files; the workspace upload takes "
+                f"{MAX_PROJECT_FILES} at most, since each is a resource in the module.",
+                "Use a GIT source for a project this size.",
+            )
+        )
+    tests = tuple(test.name for test in compiled.tests)
+    return _Source(git=source.git, directory=source.directory, files=files, tests=tests)
 
 
 def _job_settings(item: _Build, compiled: CompiledJobs) -> _Settings:
@@ -957,10 +1011,8 @@ def _emit_job(
     if depends:
         job["depends_on"] = depends
         compiled.data.setdefault(CURRENT_USER, {})["me"] = {}
-    job["task"] = [
-        {"task_key": "dbt", "environment_key": "dbt", "dbt_task": dbt_task, **settings.task},
-        *([_keys_task(item)] if keys_file else []),
-    ]
+    dbt = {"task_key": DBT_TASK_KEY, "environment_key": "dbt", "dbt_task": dbt_task}
+    job["task"] = [{**dbt, **settings.task}, *([_keys_task(item)] if keys_file else [])]
     compiled.resources.append(("databricks_job", item.key, f"{item.where} job", job))
     compiled.jobs.append(
         DbtJob(
@@ -971,16 +1023,21 @@ def _emit_job(
             trigger=settings.trigger,
             files=tuple(rel for rel, _ in uploads),
             root=item.root,
+            tests=source.tests,
         )
     )
 
 
 def _keys_task(item: _Build) -> Dict[str, Any]:
-    """The ``fluid_keys`` task: once dbt has succeeded, the uploaded script on the same
-    warehouse."""
+    """The ``fluid_keys`` task: once dbt has ended, the uploaded script on the same warehouse.
+    ``run_if: ALL_DONE``, not the default ALL_SUCCESS: a contract rule's test of severity
+    error fails dbt after its model's CREATE OR REPLACE dropped the table's keys, and the
+    run that finds bad data must not also leave the table keyless (the script passes over a
+    key it cannot add, such as one on a table dbt did not rebuild)."""
     return {
         "task_key": REBUILD_TASK,
-        "depends_on": [{"task_key": "dbt"}],
+        "depends_on": [{"task_key": DBT_TASK_KEY}],
+        "run_if": "ALL_DONE",
         "timeout_seconds": REBUILD_TIMEOUT_SECONDS,
         "sql_task": {
             "warehouse_id": item.warehouse,
@@ -1044,6 +1101,7 @@ def _emit_files(
 
 
 __all__ = [
+    "DBT_TASK_KEY",
     "CompiledJobs",
     "DbtJob",
     "compile_dbt_jobs",

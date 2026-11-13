@@ -251,6 +251,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   strict bound stays unmapped there. On the tower-management industry pack `fluid test` ran
   38 of its 168 rules before; it now runs every rule of every deployed product.
 
+- **A Databricks dbt job runs its contract's data-quality rules as dbt tests.** Each rule in
+  `exposes[].contract.dq.rules` of an expose a Databricks dbt build writes becomes a singular
+  dbt test, `tests/fluid_dq/<model>/<rule id>.sql`, uploaded beside the project (your own files
+  upload byte for byte). The job's `dbt build` runs each test right after its model, so the run
+  page lists every rule by its id, passed, warned or failed; a rule of severity `critical` or
+  `error` that fails skips the models below it and fails the run, `warn` and `info` are reported
+  and do not. uniqueness runs dbt's `unique`, completeness `not_null` on each selected column (a
+  comma-separated selector is one test per column). valid_values allows what `fluid test` allows
+  (`quality_engine.value_domain`): the values the rule's description lists (`<column> valid
+  values: A, B.`), as dbt's `accepted_values`, or else every declaration of the column, which
+  must all hold: `accepted_values` for its `enum` validationRule (`A | B` or `A,B`), a regex
+  test for its `regex`, a range test for its `range` (`>= 0`, `>= 0 and <= 100`, `between 0 and
+  100`), and dbt's `relationships` for its `labels.references: <product id>.<column>` against
+  the dbt source the project declares for that consumed expose; accuracy is a bound on every
+  value, freshness the newest value's age against `window`, schema each contract column with its
+  declared type. A threshold below 1.0 is the share of rows that must pass: the non-null share
+  for completeness and the distinct share for uniqueness, as `fluid test` computes them, and the
+  share of non-null values that are allowed for valid_values. No dbt package is installed: the
+  regex, range, freshness, schema and share tests are forge-cli's own SQL. Under `--mode
+  amend-and-build`, `fluid apply` prints what dbt found for each rule after the run. An
+  `anomaly_detection` rule is left to Databricks data quality monitoring, which learns its
+  bounds (it stays refused where the expose turns monitoring off). The `fluid_keys` task that
+  declares the table's Unity Catalog keys again now runs once dbt has ended, whatever its
+  outcome: a failing rule fails dbt after its model replaced the table, and the table keeps its
+  keys. Refused at `fluid validate` and `fluid plan`, with the fix: a rule no test can run as
+  written (drift detection, valid_values with no allowed values, an unknown column, an
+  unparseable window, a threshold no number holds, a range no value meets), a Git-sourced build
+  with rules (no file can be added to a checkout), a model or a referenced source the project
+  does not hold, a build whose dbt selection leaves the model out, and a rule id whose test name
+  the project's own tests already use. `fluid_build/util/dq_checks.py` reads the rules once, for
+  the engines that run them; this job is its first.
+
 ### Fixed
 
 - **Quality checks measured a constant on BigQuery (and would have on Databricks).** The
