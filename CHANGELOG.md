@@ -167,6 +167,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path exits 1 where it used to write a template instead. A `fluid ai setup`
   choice and a single keyring key still come first, and `GEMINI_API_KEY` with `GOOGLE_API_KEY` is
   one provider. Pick one with `--llm-provider` or `FLUID_LLM_PROVIDER`.
+- **`fluid plan` refuses a contract its own sovereignty policy blocks, by default.** It checked
+  the policy only with `--check-sovereignty`, so a contract `fluid validate` refuses
+  (`enforcementMode: strict`, or a region in `deniedRegions`, which blocks in every mode) still
+  got a plan. Now plan runs the same policy engine before it plans: a blocking verdict exits 1
+  (`ERR_SOVEREIGNTY_VIOLATION`) before any plan is written. The refusal names each expose and
+  carries the findings as the error's `errors`, the way `local_plan_validation_failed` does, so
+  an engine-API caller such as Command Center's plan endpoint shows it. The default check builds
+  no cloud provider. `--check-sovereignty` runs the same check, then asks the provider's own
+  hook and prints the verdict, also before the plan is written: a hook that reports nothing no
+  longer passes a contract `fluid validate` refuses. The new `--no-check-sovereignty` writes the
+  plan anyway, says so on the console and logs a WARNING (event `sovereignty_check_skipped`); it
+  changes nothing in `fluid apply`, which keeps its own checks (on Databricks and GCP it refuses
+  such a placement itself). The generated CI pipelines already pass `--check-sovereignty`; a
+  failing plan stage now writes no plan file (one left at `--out` by an earlier run stays as it
+  was).
+- **Databricks: Unity Catalog tag values are written as the contract states them.** The
+  governance labels became tags with GCP's label slugs: lowercased, spaces and punctuation
+  turned into `-`, cut at 63 characters (`business_value =
+  'a-single-unrenewed-ground-lease-can-strand-a-multi-tenant-tower'`, `fluid_jurisdiction =
+  'us'`). A tag value takes up to 256 characters with case, spaces and punctuation, so the value
+  is now the contract's text less surrounding whitespace, and `fluid_regulation` joins the
+  frameworks with `, ` (`GDPR, CCPA`). A longer value is refused as
+  `databricks-tag-value-too-long` rather than cut. Tag keys are unchanged (each `-` still
+  becomes `_`), and GCP labels and AWS tags keep the label alphabet.
+  **On an existing deployment** the next `fluid apply` updates each changed
+  `databricks_entity_tag_assignment` in place (`~`; `tag_value` has no replace modifier in the
+  pinned provider, 1.140.0): no table, schema or data is replaced or destroyed, and no
+  `--allow-data-loss` is needed. Until that apply, `fluid verify` reports the old values as tag
+  drift. On Free Edition, a product carrying the old values planned `+0 ~17 -0`.
 - **`fluid apply` on a Databricks contract with `exposes[].semantics` needs the `[databricks]`
   extra** (databricks-sdk), which creates the metric view, and refuses before `tofu apply` when it
   is missing, as it does for column masks. A semantics block the metric view cannot hold (a
@@ -290,6 +319,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   land such an expose (`payload.landed_by`) and asks no table for it. An expose that no build
   writes, or that another build may write, still reports its missing source, and the drift
   verdict and exit code are unchanged.
+- **Log redaction no longer masks fully qualified names.** `fluid apply` printed
+  `databricks.load table=***REDACTED***` for `northwind_towers.bronze_smart_meters.smart_meters`
+  and the name of the next table, whose last part had 11 characters: the generic JWT rule masked
+  any three dotted runs of 12 or more characters. Such a run is now masked only when its first
+  part is a JOSE header (base64url of a JSON object, the check detect-secrets makes), so
+  `catalog.schema.table`, `project.dataset.table` and `DB.SCHEMA.TABLE` names stay readable in
+  logs and errors. Tokens are still masked, in both redaction layers (the Snowflake one now uses
+  the global rule), and more of them than before: a JWE (one with direct encryption has an empty
+  encrypted key), a JWS with a short or empty payload or signature, a header written with spaces
+  or newlines, and a token glued to a word (`token_eyJ…`). The JWT rules no longer scan
+  quadratically on input such as `a-a-a-…` or `eyJ-eyJ-…` (200,000 characters took 30 s or more;
+  now under a second). `redact_secret_text()` loses its `keep_dotted_names` keyword (0.28.0):
+  logs and printed errors now apply the same rule.
 
 ## [0.29.0] — 2026-11-12
 

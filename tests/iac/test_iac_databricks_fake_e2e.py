@@ -214,6 +214,35 @@ def test_a_changed_label_value_updates_the_tag_in_place(workspace, fake, capfd):
     ) in (fake.requests)
 
 
+def test_slug_values_a_deployment_carries_are_rewritten_in_place(
+    workspace, fake, capfd, monkeypatch
+):
+    """Up to 0.29.0 a tag value was its GCP label slug (``cx-001--finance-``). The next
+    apply rewrites each changed tag in place, one ``~`` each, and replaces nothing."""
+    from fluid_build.iac.providers import databricks as dbx
+
+    real = dbx.governance_labels
+
+    def as_slugs(contract, exposure, **kwargs):
+        return real(contract, exposure, **{**kwargs, "verbatim_values": False})
+
+    path = write_contract(workspace, _governed(**{**LABELS, "cost-center": "CX 001 (Finance)"}))
+    monkeypatch.setattr(dbx, "governance_labels", as_slugs)
+    assert apply_contract(capfd, path)[0] == 0
+    assert fake.tags_on("tables", TABLE)["cost_center"] == "cx-001--finance-"
+    marker = fake.tables[TABLE]["marker"]
+
+    monkeypatch.setattr(dbx, "governance_labels", real)
+    rc, out = apply_contract(capfd, path, "--mode", "dry-run")
+    assert rc == 0 and "tofu plan: +0 ~2 -0" in out, out  # the schema's tag and the table's
+    rc, out = apply_contract(capfd, path)
+    assert rc == 0, out
+    assert fake.tags_on("tables", TABLE)["cost_center"] == "CX 001 (Finance)"
+    assert fake.tags_on("schemas", "main.sales")["cost_center"] == "CX 001 (Finance)"
+    assert fake.tables[TABLE]["marker"] == marker and fake.replaced == []
+    assert "tofu plan: +0 ~0 -0" in apply_contract(capfd, path, "--mode", "dry-run")[1]
+
+
 def test_removing_a_label_destroys_only_its_assignment_without_allow_data_loss(
     workspace, fake, capfd
 ):

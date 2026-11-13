@@ -87,7 +87,7 @@ def _redact_error_str(value: Any) -> str:
     """
     from fluid_build.observability.secret_redactor import redact_secret_text
 
-    return redact_secret_text(_redact_str(str(value)), keep_dotted_names=True)
+    return redact_secret_text(_redact_str(str(value)))
 
 
 def literal_error_text(text: Any, style: str = "") -> RichText:

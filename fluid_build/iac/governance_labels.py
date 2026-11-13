@@ -6,9 +6,12 @@
 The contract's and the expose's ``labels``, and its classification, jurisdiction,
 regulatory framework and residency, written onto the resources a product owns: GCP
 labels on the dataset, table and key, AWS tags on the bucket and key and parameters on
-the Glue table. So the regulation a product falls under is on the resource and can be
-found there, not only in the contract. The values are coerced to GCP's label alphabet
-(the stricter of the two), so both clouds carry the same keys and values.
+the Glue table, Unity Catalog tags on the Databricks schema and table. So the
+regulation a product falls under is on the resource and can be found there, not only
+in the contract. The keys are coerced to GCP's label alphabet (the strictest), so every
+cloud carries the same keys, and so are the values unless a caller asks for them
+``verbatim_values``: a Unity Catalog tag value keeps case, spaces and punctuation, so
+the Databricks module writes the contract's words, not a slug of them.
 """
 
 from __future__ import annotations
@@ -24,8 +27,26 @@ def _label(value: Any) -> str:
     return _LABEL_KEY_RE.sub("-", str(value).strip().lower())[:63]
 
 
+def _verbatim(value: Any) -> str:
+    """A string as written, less the surrounding whitespace a Unity Catalog tag refuses.
+
+    The schema allows only strings; a YAML ``true`` or ``null`` that reaches an emitter
+    unvalidated (``fluid generate iac`` has no schema gate) is spelled as YAML spells it,
+    and ``null`` makes no tag, rather than Python's ``True`` and ``None``.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value).strip()
+
+
 def governance_labels(
-    contract: Mapping[str, Any], exposure: Mapping[str, Any], *, limit: Optional[int] = 60
+    contract: Mapping[str, Any],
+    exposure: Mapping[str, Any],
+    *,
+    limit: Optional[int] = 60,
+    verbatim_values: bool = False,
 ) -> Dict[str, str]:
     """The contract's governance as GCP labels: its labels, classification and regulation.
 
@@ -36,7 +57,13 @@ def governance_labels(
     prefixed ``l_``; empty values are dropped; at most ``limit`` (60, GCP's cap) are
     kept, in key order. ``limit=None`` keeps them all, for a caller that must refuse
     a count its target cannot hold rather than drop labels silently.
+
+    ``verbatim_values`` keeps each value as the contract writes it, less surrounding
+    whitespace, and joins the regulatory frameworks with ``", "``: for a target whose
+    tag values take any text (Unity Catalog), which refuses a value too long for it
+    rather than cut it. The keys are coerced either way.
     """
+    value_of, separator = (_verbatim, ", ") if verbatim_values else (_label, "_")
     out: Dict[str, str] = {}
     for source in (contract.get("labels"), exposure.get("labels")):
         if isinstance(source, Mapping):
@@ -44,7 +71,7 @@ def governance_labels(
                 k = _label(key)
                 if k and not k[0].isalpha():
                     k = f"l_{k}"[:63]
-                v = _label(value)
+                v = value_of(value)
                 if k and v:
                     out[k] = v
     policy = exposure.get("policy") if isinstance(exposure.get("policy"), Mapping) else {}
@@ -52,17 +79,17 @@ def governance_labels(
         "classification"
     )
     if classification:
-        out["fluid_classification"] = _label(classification)
+        out["fluid_classification"] = value_of(classification)
     sovereignty = (
         contract.get("sovereignty") if isinstance(contract.get("sovereignty"), Mapping) else {}
     )
     if sovereignty.get("jurisdiction"):
-        out["fluid_jurisdiction"] = _label(sovereignty["jurisdiction"])
+        out["fluid_jurisdiction"] = value_of(sovereignty["jurisdiction"])
     frameworks = sovereignty.get("regulatoryFramework") or sovereignty.get("regulations")
     if isinstance(frameworks, str):
         frameworks = [frameworks]
     if isinstance(frameworks, list) and frameworks:
-        out["fluid_regulation"] = _label("_".join(str(f) for f in frameworks))
+        out["fluid_regulation"] = value_of(separator.join(str(f) for f in frameworks))
     if sovereignty.get("dataResidency") is not None:
         out["fluid_residency"] = "true" if sovereignty.get("dataResidency") else "false"
     keys = sorted(out)

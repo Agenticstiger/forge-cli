@@ -17,7 +17,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import cprint, cprint_literal, warning
 
@@ -206,13 +206,19 @@ transformations, access grants, and orchestration tasks.
         action="store_true",
         help="ask provider to estimate cost of planned actions",
     )
+    # Three states: unset (the default check), --check-sovereignty (the provider hook
+    # too, and the verdict printed) and --no-check-sovereignty (skipped, logged).
     p.add_argument(
         "--check-sovereignty",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "check data sovereignty constraints (provider hook, else the "
-            "built-in policy engine); exits 1 when the contract's "
-            "enforcementMode is 'strict' and the check fails"
+            "the contract's sovereignty policy is checked before the plan is "
+            "written (the check fluid validate runs), and a blocking verdict "
+            "(enforcementMode 'strict', or an explicitly denied region) exits 1 "
+            "and writes no plan. --check-sovereignty also asks the provider's "
+            "own hook and prints the verdict; --no-check-sovereignty skips the "
+            "check, logged at WARNING (apply keeps its own checks)"
         ),
     )
     # ``default=SUPPRESS`` so a global ``fluid --provider X plan ...`` is not
@@ -305,6 +311,36 @@ def run(args, logger: logging.Logger) -> int:
         # value. Validate it here, on every plan path, with the same registry
         # and the same ``provider_unknown`` error apply raises.
         _gate_provider_flag(getattr(args, "provider", None), logger)
+
+        # --- Sovereignty gate ------------------------------------------------
+        # ``fluid validate`` refuses a contract whose own sovereignty policy blocks
+        # where it puts data, and ``fluid plan`` wrote a plan for it anyway unless
+        # ``--check-sovereignty`` was passed. Now the built-in policy engine (the
+        # checker validate runs) decides by default, before any plan is generated
+        # or written: a blocking verdict raises and no plan.json is written. It
+        # builds no provider, so a plain plan stays off the cloud SDKs.
+        # ``--check-sovereignty`` runs it too and then asks the provider's hook,
+        # before the write below: a hook that reports nothing must not make the
+        # explicit check weaker than the default. ``--no-check-sovereignty`` skips
+        # the check, said on the console and logged at WARNING for audit, as
+        # ``fluid apply --no-verify-plan-binding`` is.
+        check_sovereignty = getattr(args, "check_sovereignty", None)
+        if check_sovereignty is not False:
+            _gate_sovereignty(contract, args.contract, logger)
+        else:
+            warning(
+                "Sovereignty check skipped (--no-check-sovereignty): the plan is written "
+                "whatever the contract's sovereignty policy says."
+            )
+            warn(
+                logger,
+                "--no-check-sovereignty: the sovereignty check was SKIPPED. The plan "
+                "is written whatever the contract's sovereignty policy says; fluid "
+                "apply keeps its own checks. Make sure this is recorded in the change "
+                "log.",
+                event="sovereignty_check_skipped",
+                contract=args.contract,
+            )
 
         info(
             logger,
@@ -427,6 +463,24 @@ def run(args, logger: logging.Logger) -> int:
                 context={"bundle": str(bundle_path), "error": str(exc)},
             )
 
+        # --check-sovereignty: the provider's hook, else the built-in engine, with
+        # the verdict printed. Before the write, like the default gate, so a
+        # blocking verdict leaves no plan behind. The *contract* decides what
+        # blocks: ``_report_sovereignty`` reports True only when its
+        # ``sovereignty.enforcementMode`` is strict, a finding is an error (an
+        # explicitly denied region), or a provider hook reported violations.
+        hook_provider = None
+        provider_flag: Optional[str] = None
+        if check_sovereignty or getattr(args, "estimate_cost", False):
+            provider_flag, hook_provider = _hook_provider(args, contract, logger)
+        # NB: deliberately *not* gated on ``hook_provider`` — a provider that
+        # failed to build must not silently swallow an explicitly requested
+        # governance check. ``_report_sovereignty`` handles ``None``.
+        if check_sovereignty and _report_sovereignty(
+            contract, hook_provider, provider_flag, logger
+        ):
+            raise CLIError(1, "sovereignty_violation", {"contract": args.contract})
+
         # Write plan to file (idempotent - only if changed)
         write_json_idempotent(args.out, plan)
 
@@ -440,58 +494,32 @@ def run(args, logger: logging.Logger) -> int:
         else:
             _display_plan_simple(plan, logger, output_path=args.out)
 
-        # --- Advanced hooks: cost estimation & sovereignty checking ---
-        sovereignty_blocked = False
-        if getattr(args, "estimate_cost", False) or getattr(args, "check_sovereignty", False):
+        # --- Advanced hook: cost estimation ---
+        if getattr(args, "estimate_cost", False) and hook_provider:
             from fluid_build.cli.hooks import run_estimate_cost
 
-            # Build provider for hook invocation
-            provider_flag = getattr(args, "provider", None)
-            project_flag = getattr(args, "project", None)
-            region_flag = getattr(args, "region", None)
-            if not provider_flag:
-                provider_flag, loc = resolve_provider_from_contract(contract)
-                if not project_flag:
-                    project_flag = loc.get("project")
-                if not region_flag:
-                    region_flag = loc.get("region")
-            try:
-                hook_provider = build_provider(provider_flag, project_flag, region_flag, logger)
-            except Exception:
-                hook_provider = None
-
             actions_list = plan.get("actions", [])
-
-            if getattr(args, "estimate_cost", False) and hook_provider:
-                estimate = run_estimate_cost(hook_provider, actions_list, logger)
-                if estimate is not None:
-                    cprint(
-                        f"\nEstimated cost: ${estimate.monthly:.2f}/month"
-                        f" + ${estimate.one_time:.2f} one-time"
-                        f" ({estimate.currency})"
-                    )
-                    if estimate.notes:
-                        cprint(f"  Note: {estimate.notes}")
-                    plan["cost_estimate"] = estimate.to_dict()
-                    # Re-inject digests — cost_estimate was added AFTER the
-                    # first inject, so planDigest no longer covers the plan
-                    # body. Recompute to keep the stage-7 tamper gate honest.
-                    # ``force=True``: the plan is already bound from the
-                    # injection above; this is a deliberate, in-process
-                    # re-bind over a mutation we just made ourselves, so we
-                    # opt past inject_digests' overwrite guard (J7).
-                    plan = inject_digests(plan, bundle_path=bundle_path, force=True)
-                    write_json_idempotent(args.out, plan)
-                else:
-                    cprint("\nCost estimation: not supported by this provider")
-
-            # NB: deliberately *not* gated on ``hook_provider`` — a provider that
-            # failed to build must not silently swallow an explicitly requested
-            # governance check. ``_report_sovereignty`` handles ``None``.
-            if getattr(args, "check_sovereignty", False):
-                sovereignty_blocked = _report_sovereignty(
-                    contract, hook_provider, provider_flag, logger
+            estimate = run_estimate_cost(hook_provider, actions_list, logger)
+            if estimate is not None:
+                cprint(
+                    f"\nEstimated cost: ${estimate.monthly:.2f}/month"
+                    f" + ${estimate.one_time:.2f} one-time"
+                    f" ({estimate.currency})"
                 )
+                if estimate.notes:
+                    cprint(f"  Note: {estimate.notes}")
+                plan["cost_estimate"] = estimate.to_dict()
+                # Re-inject digests — cost_estimate was added AFTER the
+                # first inject, so planDigest no longer covers the plan
+                # body. Recompute to keep the stage-7 tamper gate honest.
+                # ``force=True``: the plan is already bound from the
+                # injection above; this is a deliberate, in-process
+                # re-bind over a mutation we just made ourselves, so we
+                # opt past inject_digests' overwrite guard (J7).
+                plan = inject_digests(plan, bundle_path=bundle_path, force=True)
+                write_json_idempotent(args.out, plan)
+            else:
+                cprint("\nCost estimation: not supported by this provider")
 
         # --- HTML visualization (--html flag, absorbs preview/viz-plan) ---
         html_path = getattr(args, "html_output", None)
@@ -503,15 +531,6 @@ def run(args, logger: logging.Logger) -> int:
                 cprint(f"HTML report: {html_path}")
             except Exception:
                 warn(logger, "plan visualizer not available", event="html_render_skipped")
-
-        # Fail closed on a blocking sovereignty verdict. The *contract* decides
-        # what blocks — ``_report_sovereignty`` only reports True when the
-        # contract's own ``sovereignty.enforcementMode`` is strict (or a
-        # provider hook reported violations outright). The plan file is still
-        # written; the non-zero exit is what makes ``--check-sovereignty``
-        # usable as a CI gate rather than advisory output.
-        if sovereignty_blocked:
-            raise CLIError(1, "sovereignty_violation", {"contract": args.contract})
 
         info(
             logger,
@@ -601,7 +620,7 @@ def _report_sovereignty(
                     f"  — source: {pname} provider hook"
                 )
                 for v in violations:
-                    cprint(f"  - {v}")
+                    cprint_literal(f"  - {v}")
                 warn(
                     logger,
                     "sovereignty violations reported by provider hook",
@@ -640,44 +659,123 @@ def _report_sovereignty(
         )
         return False
 
-    from ..policy.sovereignty import DEFAULT_ENFORCEMENT_MODE
-    from ..policy.sovereignty import validate_sovereignty as _policy_check
-
-    # Read the default from the engine, never re-hardcode it — the mode shown
-    # to the operator must be the mode the verdict was computed under.
-    mode = sovereignty.get("enforcementMode", DEFAULT_ENFORCEMENT_MODE)
-    is_valid, messages = _policy_check(contract)
+    blocked, mode, messages = _policy_engine_verdict(contract)
     source = f"source: built-in policy engine, enforcementMode={mode}; {reason}"
 
     if messages:
         cprint(f"\nSovereignty check: {len(messages)} finding(s)  — {source}")
         for m in messages:
-            cprint(f"  - {m}")
+            cprint_literal(f"  - {m}")
     else:
         cprint(f"\nSovereignty check: PASS  — {source}")
 
-    # Block on the engine's own verdict OR on any error-severity finding.
-    # ``is_valid`` alone is not enough: it returns True under advisory/audit
-    # even for findings the engine itself classified as errors (an explicitly
-    # denied region is always an error, whatever the mode). ``fluid validate``
-    # blocks on those — see cli/validate.py, which routes every "❌" message to
-    # ``add_error`` — so plan must too, or the same contract would pass one
-    # stage and fail the next. enforcementMode still does real work: under
-    # advisory it downgrades an allowedRegions mismatch to a warning, and
-    # warnings do not block here.
-    has_error_finding = any("❌" in m for m in messages)
-    if not is_valid or has_error_finding:
-        cprint(f"\n❌ Sovereignty check FAILED — enforcementMode is '{mode}'.")
-        warn(
-            logger,
-            "sovereignty check failed under strict enforcement",
-            event="sovereignty_violations",
-            source="policy_engine",
-            enforcement_mode=mode,
-            count=len(messages),
-        )
+    if blocked:
+        _report_blocked(mode, len(messages), logger)
         return True
     return False
+
+
+def _policy_engine_verdict(contract: Dict[str, Any]) -> Tuple[bool, str, List[str]]:
+    """The built-in policy engine's verdict: ``(blocks, enforcementMode, findings)``.
+
+    It blocks on the engine's own verdict OR on any error-severity finding.
+    ``is_valid`` alone is not enough: it returns True under advisory/audit even
+    for findings the engine itself classified as errors (an explicitly denied
+    region is always an error, whatever the mode). ``fluid validate`` blocks on
+    those — see cli/validate.py, which routes every "❌" message to
+    ``add_error`` — so plan must too, or the same contract would pass one stage
+    and fail the next. enforcementMode still does real work: under advisory it
+    downgrades an allowedRegions mismatch to a warning, and warnings do not block.
+    """
+    from ..policy.sovereignty import DEFAULT_ENFORCEMENT_MODE
+    from ..policy.sovereignty import validate_sovereignty as _policy_check
+
+    sovereignty = contract.get("sovereignty") or {}
+    # Read the default from the engine, never re-hardcode it — the mode shown
+    # to the operator must be the mode the verdict was computed under.
+    mode = sovereignty.get("enforcementMode", DEFAULT_ENFORCEMENT_MODE)
+    is_valid, messages = _policy_check(contract)
+    has_error_finding = any("❌" in m for m in messages)
+    return (not is_valid or has_error_finding), mode, messages
+
+
+def _report_blocked(mode: str, count: int, logger: logging.Logger) -> None:
+    cprint(f"\n❌ Sovereignty check FAILED — enforcementMode is '{mode}'.")
+    warn(
+        logger,
+        "sovereignty check failed",
+        event="sovereignty_violations",
+        source="policy_engine",
+        enforcement_mode=mode,
+        count=count,
+    )
+
+
+def _gate_sovereignty(contract: Dict[str, Any], where: str, logger: logging.Logger) -> None:
+    """``fluid plan``'s default sovereignty check: refuse what ``fluid validate`` refuses.
+
+    The built-in policy engine decides (:func:`_policy_engine_verdict`); no provider
+    is built. Silent when nothing blocks, and when the contract declares no policy,
+    so a plan prints what it always printed. On a blocking verdict it prints the
+    findings and raises, before any plan is generated or written.
+
+    Raises:
+        CLIError: ``sovereignty_violation`` (exit 1).
+    """
+    sovereignty = contract.get("sovereignty")
+    if not isinstance(sovereignty, dict) or not sovereignty:
+        return
+    blocked, mode, messages = _policy_engine_verdict(contract)
+    if not blocked:
+        return
+    cprint(
+        f"\nSovereignty check: {len(messages)} finding(s)  — source: built-in policy "
+        f"engine, enforcementMode={mode}"
+    )
+    for m in messages:
+        # Literal: a finding names its expose as ``[id]``, which Rich would take for markup.
+        cprint_literal(f"  - {m}")
+    _report_blocked(mode, len(messages), logger)
+    # ``errors`` and ``message``, as ``local_plan_validation_failed`` carries them: a caller
+    # of the engine API (Command Center's plan endpoint) shows a refusal that has them
+    # instead of falling back to a plan this gate never saw.
+    errors = [m.split("\n", 1)[0].split(" ", 1)[-1].strip() for m in messages if "❌" in m]
+    raise CLIError(
+        1,
+        "sovereignty_violation",
+        {
+            "command": "plan",
+            "contract": where,
+            "errors": errors or [m.split("\n", 1)[0] for m in messages],
+            "message": (
+                f"The contract's sovereignty policy (enforcementMode {mode}) blocks where it "
+                "puts data, so fluid plan wrote no plan."
+            ),
+        },
+    )
+
+
+def _hook_provider(
+    args: argparse.Namespace, contract: Dict[str, Any], logger: logging.Logger
+) -> Tuple[Optional[str], Any]:
+    """The provider the cost and sovereignty hooks ask, with its name.
+
+    The provider is ``None`` when it cannot be built; the name is what the
+    contract or ``--provider`` says, for the report.
+    """
+    provider_flag = getattr(args, "provider", None)
+    project_flag = getattr(args, "project", None)
+    region_flag = getattr(args, "region", None)
+    if not provider_flag:
+        provider_flag, loc = resolve_provider_from_contract(contract)
+        if not project_flag:
+            project_flag = loc.get("project")
+        if not region_flag:
+            region_flag = loc.get("region")
+    try:
+        return provider_flag, build_provider(provider_flag, project_flag, region_flag, logger)
+    except Exception:
+        return provider_flag, None
 
 
 def _gate_provider_flag(requested: Optional[str], logger: logging.Logger) -> None:
