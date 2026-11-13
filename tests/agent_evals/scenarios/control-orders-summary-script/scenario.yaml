@@ -1,0 +1,9 @@
+title: Negative control, a plain Python script over a CSV
+# A data task with no data product in it: no FLUID skill should fire and no contract
+# should appear.
+should_trigger: false
+arms: [no-skill, skill]
+checks:
+  - {id: script, exists_file: summarize.py}
+  - {id: reads_csv, in_file: summarize.py, matches: 'orders\.csv'}
+  - {id: by_currency, in_file: summarize.py, matches: 'currency'}

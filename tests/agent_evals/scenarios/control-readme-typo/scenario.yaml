@@ -1,0 +1,9 @@
+title: Negative control, a typo in a FLUID workspace's README
+# A near miss: the workspace holds a valid contract, and the request is about the
+# README next to it. No FLUID skill should fire, and the contract must stay as it is.
+should_trigger: false
+arms: [no-skill, skill]
+checks:
+  - {id: typo_fixed, in_file: README.md, matches: 'which we receive from the shop system'}
+  - {id: typo_gone, in_file: README.md, not_matches: 'recieve'}
+  - {id: rest_kept, in_file: README.md, matches: 'The contract is contract\.fluid\.yaml;'}

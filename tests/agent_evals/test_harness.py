@@ -11,13 +11,17 @@ The live run is ``test_live_eval.py`` (marker ``agent_eval``, off by default).
 
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict
@@ -54,8 +58,14 @@ def _edit(ws: Path, rel: str, change) -> None:
 
 
 def test_the_scenarios_cover_the_matrix() -> None:
-    """At least ten: SDP, ADP and CDP; local, Snowflake and GCP; refine; compose."""
+    """At least ten: SDP, ADP and CDP; local, Snowflake and GCP; refine; compose; and at
+    least three negative controls, which run no forge arm and expect no contract."""
     assert len(SCENARIOS) >= 10, [s.id for s in SCENARIOS]
+    controls = [s for s in SCENARIOS if not s.should_trigger]
+    assert len(controls) >= 3, [s.id for s in controls]
+    for control in controls:
+        assert "forge" not in control.arms, control.id
+        assert control.contracts == [], control.id
     types, platforms = set(), set()
     for scenario in SCENARIOS:
         for rel in scenario.contracts:
@@ -76,10 +86,11 @@ def test_the_scenarios_cover_the_matrix() -> None:
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=[s.id for s in SCENARIOS])
 def test_scenario_is_well_formed(scenario: harness.Scenario) -> None:
     assert scenario.prompt and scenario.title
-    assert set(scenario.arms) <= set(harness.ARMS)
+    assert set(scenario.arms) <= set(harness.CONDITIONS)
     ids = [c["id"] for c in scenario.checks]
     assert len(ids) == len(set(ids)), "check ids must be unique"
-    assert not {"no_invented_email", "no_template_residue"} & set(ids), "those always run"
+    reserved = {"no_invented_email", "no_template_residue", "no_skill_fired", "contracts_untouched"}
+    assert not reserved & set(ids), "those are the grader's own"
     assert len(scenario.checks) >= 3
     for rel in scenario.contracts:
         assert (scenario.reference_dir / rel).is_file(), f"no reference for {rel}"
@@ -328,10 +339,36 @@ def test_agents_may_not_touch_anything_outside_their_workspace() -> None:
     tools = set(harness.ALLOWED_TOOLS)
     assert not tools & {"Read", "Write", "Edit", "Bash", "Bash(fluid *)", "Glob", "Grep"}
     assert {"Read(./**)", "Edit(./**)"} <= tools
-    for banned in ("apply", "publish", "scaffold-ide", "schedule-sync", "policy-apply"):
+    banned_stages = ("apply", "publish", "scaffold-ide", "schedule-sync", "policy-apply")
+    assert set(harness.CODEX_FORBIDDEN_STAGES) == set(banned_stages), "the Codex rules agree"
+    for banned in banned_stages:
         assert not any(f"fluid {banned}" in tool for tool in tools), banned
     for shell in ("find", "cp", "mv", "rm", "cat", "curl", "python", "sh", "env"):
         assert not any(tool.startswith(f"Bash({shell}") for tool in tools), shell
+
+
+def test_concurrent_workers_share_one_work_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``run``'s workers ask for their first run directories at once. Without a lock each
+    made a root of its own (three on the 2026-11-13 live run); a slow ``mkdtemp`` makes
+    that race certain."""
+    real = tempfile.mkdtemp
+
+    def slow_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        time.sleep(0.05)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(harness.tempfile, "mkdtemp", slow_mkdtemp)
+    cfg = harness.RunConfig(out=harness.HERE / "runs" / "x")
+    start = threading.Barrier(8)
+
+    def first_dir(i: int) -> Path:
+        start.wait()
+        return cfg.run_dir(f"s{i}", "skill").parents[2]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        roots = set(pool.map(first_dir, range(8)))
+    shutil.rmtree(cfg.work_root)
+    assert roots == {cfg.work_root}
 
 
 def test_workspaces_live_outside_every_repository() -> None:
@@ -340,9 +377,13 @@ def test_workspaces_live_outside_every_repository() -> None:
     root is a fresh mkdtemp, so no other local user can prepare it."""
     cfg = harness.RunConfig(out=harness.HERE / "runs" / "x")
     run_dir = cfg.run_dir("sdp-local-orders", "no-skill")
+    assert run_dir.name == "run-1"
     assert harness.REPO_ROOT not in run_dir.parents
     assert Path(tempfile.gettempdir()).resolve() in run_dir.resolve().parents
-    assert cfg.run_dir("other", "skill").parents[1] == run_dir.parents[1], "one root per run"
+    assert cfg.run_dir("other", "skill").parents[2] == run_dir.parents[2], "one root per run"
+    second = cfg.run_dir("sdp-local-orders", "no-skill", 2)
+    assert second != run_dir and second.name == "run-2", "a trial of its own"
+    assert second.parents[2] == run_dir.parents[2]
     assert (cfg.work_root.stat().st_mode & 0o777) == 0o700
     other = harness.RunConfig(out=harness.HERE / "runs" / "x")
     assert other.run_dir("sdp-local-orders", "no-skill") != run_dir
@@ -581,6 +622,19 @@ def test_resolve_keeps_a_dot_inside_a_selector_value() -> None:
     assert harness._split_path("a[k=v.w].b[0].c") == ["a[k=v.w]", "b[0]", "c"]
 
 
+def _arms_rows(report: str) -> Dict[str, list]:
+    """The report's Arms table as ``{arm: [agent, version, model, effort]}``."""
+    lines = report.splitlines()
+    start = lines.index("| Arm | Agent | Version | Model | Effort |") + 2
+    rows: Dict[str, list] = {}
+    for line in lines[start:]:
+        if not line.startswith("|"):
+            break
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        rows[cells[0]] = cells[1:]
+    return rows
+
+
 def test_run_stamps_meta_on_every_record_and_the_report_says_when_it_is_mixed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -591,7 +645,11 @@ def test_run_stamps_meta_on_every_record_and_the_report_says_when_it_is_mixed(
     monkeypatch.setattr(
         harness,
         "run_one",
-        lambda s, arm, cfg, stamp=None: {**_rec(s.id, arm), "run_meta": dict(stamp or {})},
+        lambda s, arm, cfg, stamp=None, trial=1: {
+            **_rec(s.id, arm),
+            "trial": trial,
+            "run_meta": dict(stamp or {}),
+        },
     )
     out = tmp_path / "out"
     for scenario in scenarios:
@@ -604,26 +662,34 @@ def test_run_stamps_meta_on_every_record_and_the_report_says_when_it_is_mixed(
     }
     assert all(set(harness.RUN_META_KEYS) <= set(r["run_meta"]) for r in data["runs"])
     report = (out / "report.md").read_text(encoding="utf-8")
-    assert "Model: mixed: opus (1 runs), sonnet (1 runs);" in report
-    assert "Claude Code 2.1.1" in report
+    agent, version, model, effort = _arms_rows(report)["skill"]
+    assert model == "mixed: opus (1 runs), sonnet (1 runs)"
+    assert (agent, version, effort) == ("claude-code", "2.1.1", "medium")
 
 
 def test_the_header_shows_one_value_when_records_agree_and_falls_back_to_meta() -> None:
     meta = _meta(model="sonnet")
-    assert "Model: sonnet;" in harness.render_report(meta, [_rec("a", "skill")])
+    assert _arms_rows(harness.render_report(meta, [_rec("a", "skill")]))["skill"][2] == "sonnet"
     one = _rec("a", "skill", run_meta={"model": "opus"})
     two = _rec("b", "skill")  # unstamped: the meta value
-    assert "Model: mixed: opus (1 runs), sonnet (1 runs);" in harness.render_report(
-        meta, [one, two]
-    )
+    rows = _arms_rows(harness.render_report(meta, [one, two]))
+    assert rows["skill"][2] == "mixed: opus (1 runs), sonnet (1 runs)"
+    agree = [_rec(s, "skill", run_meta={"model": "opus"}) for s in "ab"]
+    assert _arms_rows(harness.render_report(meta, agree))["skill"][2] == "opus"
 
 
 def test_what_the_stream_reported_is_not_a_run_meta_value() -> None:
-    """An agent record's own ``model`` is the stream's model id, not the alias run with."""
-    meta = _meta(model="sonnet", claude_code_version="2.1.322 (Claude Code)")
+    """An agent record's own ``model`` is the stream's model id, not what the run asked
+    for; only ``run_meta.model_reported`` adds ``(ran ...)``."""
+    meta = _meta(model="sonnet")
     agent = _rec("a", "skill", model="claude-sonnet-5-5", claude_code_version="2.1.322")
-    report = harness.render_report(meta, [agent, _rec("b", "forge")])
-    assert "Model: sonnet; Claude Code 2.1.322 (Claude Code)" in report
+    rows = _arms_rows(harness.render_report(meta, [agent, _rec("b", "forge")]))
+    assert rows["skill"][2] == "sonnet"
+    ran = _rec("a", "skill", run_meta={"model": "sonnet", "model_reported": "claude-sonnet-5-5"})
+    same = _rec("a", "forge", run_meta={"model": "sonnet", "model_reported": "sonnet"})
+    rows = _arms_rows(harness.render_report(_meta(arms=["skill", "forge"]), [ran, same]))
+    assert rows["skill"][2] == "sonnet (ran claude-sonnet-5-5)"
+    assert rows["forge"][2] == "sonnet"
 
 
 # ---------------------------------------------------------------------------
@@ -823,3 +889,1183 @@ def test_regrade_passes_the_record_to_agent_arms_as_the_transcript(tmp_path: Pat
     assert any(
         not c["passed"] for c in checks.values() if "apply" in c["detail"]
     ), "the recorded fluid apply must reach the transcript checks"
+
+
+# ---------------------------------------------------------------------------
+# pass@k and pass^k
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "c, k, at_k, hat_k",
+    [
+        (0, 1, 0.0, 0.0),
+        (0, 2, 0.0, 0.0),
+        (0, 3, 0.0, 0.0),
+        (1, 1, 1 / 3, 1 / 3),
+        (1, 2, 2 / 3, 0.0),
+        (1, 3, 1.0, 0.0),
+        (2, 1, 2 / 3, 2 / 3),
+        (2, 2, 1.0, 1 / 3),
+        (2, 3, 1.0, 0.0),
+        (3, 1, 1.0, 1.0),
+        (3, 2, 1.0, 1.0),
+        (3, 3, 1.0, 1.0),
+    ],
+)
+def test_pass_at_k_and_pass_hat_k_known_values(c: int, k: int, at_k: float, hat_k: float) -> None:
+    assert harness.pass_at_k(3, c, k) == pytest.approx(at_k)
+    assert harness.pass_hat_k(3, c, k) == pytest.approx(hat_k)
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 5])
+def test_at_k_equal_to_n_is_any_and_all(n: int) -> None:
+    for c in range(n + 1):
+        assert harness.pass_at_k(n, c, n) == (1.0 if c > 0 else 0.0)
+        assert harness.pass_hat_k(n, c, n) == (1.0 if c == n else 0.0)
+
+
+@pytest.mark.parametrize("k", [0, -1, 4])
+def test_pass_at_k_needs_k_between_one_and_n(k: int) -> None:
+    with pytest.raises(ValueError):
+        harness.pass_at_k(3, 1, k)
+    with pytest.raises(ValueError):
+        harness.pass_hat_k(3, 1, k)
+
+
+# ---------------------------------------------------------------------------
+# Several runs per scenario: summarise and the report
+# ---------------------------------------------------------------------------
+
+
+def _runs(scenario: str, arm: str, outcomes: str, **extra: Any) -> list:
+    """One record per character of ``outcomes``: ``p`` passes, anything else fails."""
+    return [
+        _rec(scenario, arm, passed=ch == "p", trial=i, **extra)
+        for i, ch in enumerate(outcomes, start=1)
+    ]
+
+
+def _table(report: str, first_cell: str) -> Dict[str, Dict[str, str]]:
+    """The report table whose header starts ``| <first_cell> |``: ``{row: {column: cell}}``."""
+    lines = report.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith(f"| {first_cell} |"))
+    header = [c.strip() for c in lines[start].strip("|").split("|")]
+    rows: Dict[str, Dict[str, str]] = {}
+    for line in lines[start + 2 :]:
+        if not line.startswith("|"):
+            break
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        rows[cells[0]] = dict(zip(header[1:], cells[1:], strict=True))
+    return rows
+
+
+def test_summarise_with_three_runs_per_scenario_means_over_scenarios() -> None:
+    records = _runs("a", "skill", "ppp") + _runs("b", "skill", "pff")
+    s = harness.summarise(records, "skill", k=3)
+    assert (s["runs"], s["scenarios"], s["min_runs"]) == (6, 2, 3)
+    assert (s["valid"], s["passed"]) == (6, 4)
+    assert s["valid_rate"] == pytest.approx(1.0)
+    assert s["pass_rate"] == pytest.approx((1.0 + 1 / 3) / 2)
+    assert s["fidelity"] == pytest.approx((1.0 + (1.0 + 0.5 + 0.5) / 3) / 2)
+    assert s["pass_at_k"] == pytest.approx(1.0)  # b has one pass in 3 runs: any of 3 passes
+    assert s["pass_hat_k"] == pytest.approx(0.5)  # a: all 3 pass; b: not all
+    two = harness.summarise(records, "skill", k=2)
+    assert two["pass_at_k"] == pytest.approx((1.0 + 2 / 3) / 2)
+    assert two["pass_hat_k"] == pytest.approx(0.5)
+
+
+def test_summarise_weighs_scenarios_not_runs() -> None:
+    records = _runs("a", "skill", "pppp") + _runs("b", "skill", "f")
+    s = harness.summarise(records, "skill")
+    assert s["runs"] == 5 and s["passed"] == 4
+    assert s["pass_rate"] == pytest.approx(0.5), "mean of 1.0 and 0.0, not 4/5"
+
+
+def test_summarise_leaves_out_pass_at_k_when_a_scenario_has_fewer_runs() -> None:
+    records = _runs("a", "skill", "ppp") + _runs("b", "skill", "pp")
+    s = harness.summarise(records, "skill", k=3)
+    assert s["min_runs"] == 2
+    assert "pass_at_k" not in s and "pass_hat_k" not in s
+    assert "pass_at_k" in harness.summarise(records, "skill", k=2)
+    assert "pass_at_k" not in harness.summarise(records, "skill"), "no k, no estimate"
+
+
+def test_summarise_counts_errored_runs_as_failures_in_every_trial() -> None:
+    records = _runs("a", "skill", "ppp")
+    records[2].update(timed_out=True, error=True)  # its workspace grades as a pass
+    s = harness.summarise(records, "skill", k=3)
+    assert (s["runs"], s["passed"], s["valid"], s["timeouts"]) == (3, 2, 2, 1)
+    assert s["pass_rate"] == pytest.approx(2 / 3)
+    assert s["fidelity"] == pytest.approx(2 / 3)
+    assert s["pass_at_k"] == 1.0 and s["pass_hat_k"] == 0.0
+
+
+def test_summarise_cost_and_turns_are_none_when_no_run_reported_them() -> None:
+    codex_usage = {"input_tokens": 5, "output_tokens": 1, "cost_usd": None, "turns": None}
+    records = _runs("a", "codex-skill", "pp", usage=codex_usage)
+    s = harness.summarise(records, "codex-skill")
+    assert s["cost_usd"] is None and s["turns"] is None
+    assert s["input_tokens"] == 10
+    records.append(_rec("a", "codex-skill", trial=3))  # one run that did report a cost
+    s = harness.summarise(records, "codex-skill")
+    assert s["cost_usd"] == 0.5 and s["turns"] == 1
+
+
+def _three_run_meta(**extra: Any) -> Dict[str, Any]:
+    return _meta(arms=["skill"], scenarios=["a", "b"], **extra)
+
+
+def test_the_report_with_three_runs_adds_pass_at_k_and_pass_hat_k() -> None:
+    records = _runs("a", "skill", "ppp") + _runs("b", "skill", "ppf")
+    report = harness.render_report(_three_run_meta(), records)
+    assert "3 runs per scenario and arm" in report
+    header = next(ln for ln in report.splitlines() if ln.startswith("| Arm | Runs |"))
+    assert "| pass@3 | pass^3 |" in header
+    score = _score_row(report, "skill")
+    assert score["Runs"] == "6"
+    assert score["valid@1"] == "6/6 (100%)"
+    assert score["pass@1"] == "5/6 (83%)"
+    assert score["pass@3"] == "100%"
+    assert score["pass^3"] == "50%"
+    assert score["Fidelity"] == "92%"
+    assert "| a | 3/3 pass, 100% |" in report
+    assert "| b | 2/3 pass, 83% |" in report
+    assert "- b / skill: x (1/3)" in report
+    assert "- a / skill" not in report
+
+
+def _score_row(report: str, arm: str) -> Dict[str, str]:
+    lines = report.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("| Arm | Runs |"))
+    header = [c.strip() for c in lines[start].strip("|").split("|")]
+    for line in lines[start + 2 :]:
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if cells[0] == arm:
+            return dict(zip(header, cells, strict=True))
+    raise AssertionError(f"no {arm} row")
+
+
+def test_the_report_with_one_run_has_no_pass_at_k_columns() -> None:
+    report = harness.render_report(_meta(), [_rec("a", "skill"), _rec("b", "skill")])
+    header = next(ln for ln in report.splitlines() if ln.startswith("| Arm | Runs |"))
+    assert "pass@1" in header and "pass^" not in header
+    assert not any(f"pass@{n}" in header for n in (2, 3))
+    assert "one run per scenario and arm" in report
+    assert "| a | pass 1/1 |" in report
+
+
+def test_a_scenario_with_fewer_runs_drops_the_pass_at_k_columns_to_the_smallest_k() -> None:
+    records = _runs("a", "skill", "ppp") + _runs("b", "skill", "pp")
+    report = harness.render_report(_three_run_meta(), records)
+    assert "2-3 runs per scenario and arm" in report
+    assert "| pass@2 | pass^2 |" in next(
+        ln for ln in report.splitlines() if ln.startswith("| Arm | Runs |")
+    )
+
+
+def test_a_codex_arm_row_shows_no_cost_or_turns() -> None:
+    usage = {"input_tokens": 100, "output_tokens": 7, "cache_read_tokens": 40}
+    usage.update(cost_usd=None, turns=None)
+    stamp = {"agent": "codex", "provider": "ollama", "model": "m", "effort": "medium"}
+    records = _runs("a", "codex-skill", "pp", usage=usage, run_meta=stamp)
+    report = harness.render_report(_meta(arms=["codex-skill"], scenarios=["a"]), records)
+    score = _score_row(report, "codex-skill")
+    assert (score["Cost"], score["Turns"]) == ("-", "-")
+    assert (score["Input tok"], score["Cache-read tok"]) == ("200", "80")
+    assert _arms_rows(report)["codex-skill"][0] == "codex (ollama)"
+    assert "mixed" not in report
+
+
+# ---------------------------------------------------------------------------
+# run(): trials, merging, controls, conditions
+# ---------------------------------------------------------------------------
+
+
+def _fake_run_one(calls: list, wall_s: float = 10.0):
+    def fake(s, arm, cfg, stamp=None, trial=1):
+        calls.append((s.id, arm, trial))
+        record = {
+            **_rec(s.id, arm),
+            "trial": trial,
+            "wall_s": wall_s,
+            "run_meta": dict(stamp or {}),
+        }
+        if not s.should_trigger:
+            record["control"] = True
+        return record
+
+    return fake
+
+
+@pytest.fixture
+def quiet_run(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(harness, "_git_head", lambda path: "abc123")
+    monkeypatch.setattr(harness, "_claude_version", lambda claude: "2.1.1")
+    monkeypatch.setattr(harness, "_codex_version", lambda codex: "0.1.0")
+
+
+def _by_pair(data: Dict[str, Any]) -> Dict[tuple, list]:
+    pairs: Dict[tuple, list] = {}
+    for r in data["runs"]:
+        pairs.setdefault((r["scenario"], r["arm"]), []).append(r)
+    return pairs
+
+
+def test_run_makes_one_record_per_trial_and_a_second_run_replaces_only_its_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, quiet_run: None
+) -> None:
+    orders = ORDERS
+    control = next(s for s in SCENARIOS if s.id == "control-readme-typo")
+    calls: list = []
+    monkeypatch.setattr(harness, "run_one", _fake_run_one(calls))
+    out = tmp_path / "out"
+    harness.run([orders, control], ["no-skill", "skill"], harness.RunConfig(out=out, runs=3), 2)
+    assert len(calls) == 12
+    data = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    pairs = _by_pair(data)
+    assert len(pairs) == 4
+    for key, runs in pairs.items():
+        assert [r["trial"] for r in runs] == [1, 2, 3], key
+    assert data["meta"]["controls"] == [control.id]
+    assert data["meta"]["scenarios"] == [control.id, orders.id], "in the scenario order"
+    assert "3 runs per scenario and arm" in (out / "report.md").read_text(encoding="utf-8")
+
+    calls.clear()
+    monkeypatch.setattr(harness, "run_one", _fake_run_one(calls, wall_s=99.0))
+    harness.run([orders], ["skill"], harness.RunConfig(out=out, runs=1), 1)
+    assert calls == [(orders.id, "skill", 1)]
+    after = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    pairs = _by_pair(after)
+    assert len(after["runs"]) == 12, "nothing lost, nothing added"
+    redone = {r["trial"]: r["wall_s"] for r in pairs[(orders.id, "skill")]}
+    assert redone == {1: 99.0, 2: 10.0, 3: 10.0}
+    assert all(r["wall_s"] == 10.0 for r in pairs[(orders.id, "no-skill")])
+    assert after["meta"]["controls"] == [control.id], "the earlier run's scenarios are kept"
+    assert {r["scenario"] for r in after["runs"]} == {orders.id, control.id}
+
+
+def test_every_arm_runs_the_conditions_a_scenario_lists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, quiet_run: None
+) -> None:
+    """``codex-skill`` runs wherever ``skill`` is listed; a control lists no forge."""
+    control = next(s for s in SCENARIOS if s.id == "control-duckdb-top-customers")
+    assert "forge" in ORDERS.arms and "forge" not in control.arms
+    calls: list = []
+    monkeypatch.setattr(harness, "run_one", _fake_run_one(calls))
+    monkeypatch.setattr(harness, "preflight", lambda arms, cfg: None)
+    arms = ["codex-no-skill", "codex-skill", "forge"]
+    harness.run([ORDERS, control], arms, harness.RunConfig(out=tmp_path / "out"), 1)
+    assert sorted(calls) == sorted(
+        [
+            (ORDERS.id, "codex-no-skill", 1),
+            (ORDERS.id, "codex-skill", 1),
+            (ORDERS.id, "forge", 1),
+            (control.id, "codex-no-skill", 1),
+            (control.id, "codex-skill", 1),
+        ]
+    )
+
+
+def test_run_refuses_before_starting_anything_when_it_cannot_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list = []
+    monkeypatch.setattr(harness, "run_one", _fake_run_one(calls))
+    with pytest.raises(SystemExit, match="cannot run"):
+        harness.run([ORDERS], ["skill"], harness.RunConfig(out=tmp_path / "out", runs=0), 1)
+    assert calls == [] and not (tmp_path / "out").exists()
+
+
+# ---------------------------------------------------------------------------
+# Negative controls: which skills fired
+# ---------------------------------------------------------------------------
+
+SKILL = harness.FLUID_SKILLS[0]
+CONTROLS = [s for s in SCENARIOS if not s.should_trigger]
+
+
+def test_the_skill_names_this_file_relies_on_exist() -> None:
+    assert "authoring-fluid-contracts" in harness.FLUID_SKILLS
+    assert len(harness.FLUID_SKILLS) == 4
+
+
+@pytest.mark.parametrize(
+    "transcript, expected",
+    [
+        ({"skills_invoked": ["authoring-fluid-contracts"]}, ["authoring-fluid-contracts"]),
+        ({"skills_invoked": ["fluid:authoring-fluid-contracts"]}, ["authoring-fluid-contracts"]),
+        (
+            {"skill_files_read": ["/tmp/ws/.claude/skills/authoring-fluid-contracts/SKILL.md"]},
+            ["authoring-fluid-contracts"],
+        ),
+        (
+            {"bash_commands": ["head .claude/skills/composing-fluid-data-products/SKILL.md"]},
+            ["composing-fluid-data-products"],
+        ),
+        (
+            {
+                "bash_commands": [
+                    "/bin/zsh -lc \"sed -n '1,200p' "
+                    '/tmp/x/ws/.agents/skills/deploying-fluid-contracts-safely/SKILL.md"'
+                ]
+            },
+            ["deploying-fluid-contracts-safely"],
+        ),
+        (
+            {
+                "skills_invoked": ["troubleshooting-fluid-errors"],
+                "bash_commands": ["head .claude/skills/authoring-fluid-contracts/SKILL.md"],
+            },
+            ["authoring-fluid-contracts", "troubleshooting-fluid-errors"],
+        ),
+        ({"bash_commands": ["ls .agents/skills", "ls .claude/skills/"]}, []),
+        ({"skills_invoked": ["frontend-design", "other:pdf"]}, []),
+        ({"skill_files_read": ["/tmp/ws/.claude/skills/frontend-design/SKILL.md"]}, []),
+        ({"bash_commands": ["head .claude/skills/authoring-fluid-contracts-extra/SKILL.md"]}, []),
+        ({"bash_commands": ["cat AGENTS.md", "fluid validate contract.fluid.yaml"]}, []),
+        ({}, []),
+        (None, []),
+    ],
+)
+def test_fired_skills(transcript: Any, expected: list) -> None:
+    assert harness.fired_skills(transcript) == expected
+
+
+def _control(scenario_id: str) -> harness.Scenario:
+    return next(s for s in CONTROLS if s.id == scenario_id)
+
+
+@pytest.mark.parametrize("scenario", CONTROLS, ids=[s.id for s in CONTROLS])
+def test_a_controls_reference_passes_with_and_without_a_transcript(
+    scenario: harness.Scenario, tmp_path: Path
+) -> None:
+    ws = _workspace(scenario, tmp_path)
+    plain = harness.grade(scenario, ws)
+    assert plain.valid and plain.passed and plain.fidelity == 1.0
+    ids = [c.id for c in plain.checks]
+    assert ids[0] == "contracts_untouched" and "no_skill_fired" not in ids
+    assert "no_invented_email" not in ids, "a control has no contract to hold an email"
+    watched = harness.grade(scenario, ws, {"bash_commands": ["ls", "head x.py"]})
+    assert watched.passed and "no_skill_fired" in [c.id for c in watched.checks]
+
+
+def test_a_contract_written_by_a_control_run_fails_contracts_untouched(tmp_path: Path) -> None:
+    scenario = _control("control-orders-summary-script")
+    ws = _workspace(scenario, tmp_path)
+    (ws / "new.fluid.yaml").write_text("name: x\n", encoding="utf-8")
+    graded = harness.grade(scenario, ws)
+    assert _failed(graded) == ["contracts_untouched"]
+    assert "new.fluid.yaml" in next(c.detail for c in graded.checks if not c.passed)
+    assert graded.valid, "a contract nobody asked for is not an invalid expected one"
+    assert not graded.passed
+
+
+def test_a_changed_or_deleted_context_contract_fails_contracts_untouched(tmp_path: Path) -> None:
+    scenario = _control("control-readme-typo")
+    changed = _workspace(scenario, tmp_path / "changed")
+    path = changed / "contract.fluid.yaml"
+    path.write_text(path.read_text(encoding="utf-8") + "# edited\n", encoding="utf-8")
+    assert _failed(harness.grade(scenario, changed)) == ["contracts_untouched"]
+    deleted = _workspace(scenario, tmp_path / "deleted")
+    (deleted / "contract.fluid.yaml").unlink()
+    assert _failed(harness.grade(scenario, deleted)) == ["contracts_untouched"]
+    assert harness._contract_changes(scenario, _workspace(scenario, tmp_path / "same")) == []
+
+
+@pytest.mark.parametrize("hidden", [".agents/skills/x/references", ".claude/skills/y/refs"])
+def test_a_skills_example_contract_in_a_dot_directory_is_not_a_contract_change(
+    hidden: str, tmp_path: Path
+) -> None:
+    scenario = _control("control-orders-summary-script")
+    ws = _workspace(scenario, tmp_path)
+    (ws / hidden).mkdir(parents=True)
+    (ws / hidden / "example.contract.fluid.yaml").write_text("name: x\n", encoding="utf-8")
+    assert harness.grade(scenario, ws).passed
+
+
+def test_a_fluid_skill_read_fails_no_skill_fired_only_with_a_transcript(tmp_path: Path) -> None:
+    scenario = _control("control-duckdb-top-customers")
+    ws = _workspace(scenario, tmp_path)
+    read = {"bash_commands": [f"head .claude/skills/{SKILL}/SKILL.md"]}
+    graded = harness.grade(scenario, ws, read)
+    assert _failed(graded) == ["no_skill_fired"]
+    assert SKILL in next(c.detail for c in graded.checks if not c.passed)
+    assert _failed(harness.grade(scenario, ws, {"skills_invoked": [f"fluid:{SKILL}"]})) == [
+        "no_skill_fired"
+    ]
+    assert harness.grade(scenario, ws, None).passed, "nothing ran: nothing to score"
+    assert harness.grade(scenario, ws, {}).passed
+
+
+def test_a_positive_scenario_never_gets_the_control_checks(tmp_path: Path) -> None:
+    ws = _workspace(ORDERS, tmp_path)
+    graded = harness.grade(ORDERS, ws, {"bash_commands": [f"head skills/{SKILL}/SKILL.md"]})
+    assert graded.passed
+    assert not {"contracts_untouched", "no_skill_fired"} & {c.id for c in graded.checks}
+
+
+def test_in_file_checks_say_why_they_fail(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("Hello World\nsecond line\n", encoding="utf-8")
+    target = harness.Target({}, "", tmp_path)
+
+    def run(**check: Any) -> tuple:
+        return harness.run_check({"id": "c", "in_file": "a.txt", **check}, target)
+
+    assert run(matches="hello world")[0] is True, "case-insensitive"
+    assert run(matches="^second")[0] is True, "line anchors"
+    assert run(matches="hello", not_matches="goodbye")[0] is True
+    ok, detail = run(matches="absent")
+    assert not ok and "absent" in detail
+    ok, detail = run(not_matches="world")
+    assert not ok and "has" in detail
+    assert run(matches="hello", not_matches="second")[0] is False
+    missing = harness.run_check({"id": "c", "in_file": "nope.txt", "matches": "x"}, target)
+    assert missing == (False, "nope.txt missing")
+
+
+def test_a_missing_file_for_an_in_file_check_fails_it_on_a_real_control(tmp_path: Path) -> None:
+    scenario = _control("control-readme-typo")
+    ws = harness.prepare_workspace(scenario, tmp_path / "ws")  # the typo is still there
+    assert set(_failed(harness.grade(scenario, ws))) == {"typo_fixed", "typo_gone"}
+    (ws / "README.md").unlink()
+    assert set(_failed(harness.grade(scenario, ws))) == {"typo_fixed", "typo_gone", "rest_kept"}
+
+
+def _ctl(scenario: str, arm: str, *, fired=False, touched=False, done=True, **extra: Any) -> dict:
+    checks = [
+        {"id": "contracts_untouched", "passed": not touched, "detail": ""},
+        {"id": "no_skill_fired", "passed": not fired, "detail": ""},
+        {"id": "script", "passed": done, "detail": ""},
+    ]
+    record = _rec(scenario, arm, passed=not (fired or touched or not done), **extra)
+    record["grade"]["checks"] = checks
+    record["control"] = True
+    if fired:
+        record["skills_invoked"] = [SKILL]
+    return record
+
+
+def _control_records() -> list:
+    return [
+        _ctl("c1", "skill"),
+        _ctl("c1", "skill", fired=True),
+        _ctl("c1", "skill", touched=True),
+        _ctl("c2", "skill", done=False),
+        _ctl("c2", "skill", timed_out=True, error=True),
+        _ctl("c1", "no-skill"),
+        _ctl("c2", "no-skill"),
+    ]
+
+
+def test_summarise_controls_counts_fired_touched_and_done() -> None:
+    records = _control_records()
+    assert harness.summarise_controls(records, "skill") == {
+        "runs": 5,
+        "fired": 1,
+        "touched": 1,
+        "done": 3,
+    }
+    assert harness.summarise_controls(records, "no-skill") == {
+        "runs": 2,
+        "fired": 0,
+        "touched": 0,
+        "done": 2,
+    }
+    assert harness.summarise_controls(records, "forge")["runs"] == 0
+    assert harness.summarise(records, "skill")["runs"] == 0, "controls are not scenarios"
+
+
+def test_the_report_has_a_negative_controls_table_and_marks_controls() -> None:
+    records = _control_records() + _runs("a", "skill", "p")
+    meta = _meta(arms=["no-skill", "skill"], scenarios=["a", "c1", "c2"], controls=["c1", "c2"])
+    report = harness.render_report(meta, records)
+    assert "## Negative controls" in report
+    assert "| skill | 5 | 1/5 (20%) | 1/5 (20%) | 3/5 (60%) |" in report
+    assert "| no-skill | 2 | 0/2 (0%) | 0/2 (0%) | 2/2 (100%) |" in report
+    assert "plus 2 negative controls" in report
+    assert "| c1 (control) |" in report and "| a |" in report
+    scenario_rows = _table(report, "Scenario")
+    assert set(scenario_rows) == {"a", "c1 (control)", "c2 (control)"}
+    # The scoring table counts only the positive scenarios.
+    assert _score_row(report, "skill")["Runs"] == "1"
+    assert "## Negative controls" not in harness.render_report(_meta(), [_rec("a", "skill")])
+
+
+# ---------------------------------------------------------------------------
+# The Claude Code argv, the claude shim, effort
+# ---------------------------------------------------------------------------
+
+
+def test_the_claude_argv_pins_model_and_effort() -> None:
+    argv = harness._agent_argv(harness.RunConfig(out=Path(".")), "do it")
+    assert argv[argv.index("--model") + 1] == "claude-sonnet-5-5" == harness.DEFAULT_MODEL
+    assert argv[argv.index("--effort") + 1] == "medium" == harness.DEFAULT_EFFORT
+    custom = harness._agent_argv(harness.RunConfig(out=Path("."), model="m", effort="max"), "x")
+    assert custom[custom.index("--model") + 1] == "m"
+    assert custom[custom.index("--effort") + 1] == "max"
+
+
+def test_the_defaults_are_the_documented_ones() -> None:
+    assert harness.DEFAULT_ARMS == ("no-skill", "skill", "forge")
+    assert set(harness.DEFAULT_ARMS) <= set(harness.ARMS)
+    assert harness.CONDITIONS == ("no-skill", "skill", "forge")
+    assert {a.condition for a in harness.ARM_SPECS.values()} == set(harness.CONDITIONS)
+    assert harness.ARM_SPECS["codex-skill"].scaffold == "generic"
+    assert harness.ARM_SPECS["skill"].scaffold == "claude-code"
+    assert harness.ARM_SPECS["codex-no-skill"].scaffold is None
+
+
+def test_isolated_adds_effort_only_when_the_call_has_none() -> None:
+    assert harness.isolated(["-p"], "low")[-2:] == ["--effort", "low"]
+    assert "--effort" not in harness.isolated(["-p"])
+    for kept in (["--effort", "high"], ["--effort=high"]):
+        out = harness.isolated(["-p", *kept], "low")
+        assert "low" not in out
+        assert harness._flag_value(out, "--effort") == "high"
+        assert sum(a.startswith("--effort") for a in out) == 1
+
+
+def test_flag_value_reads_both_spellings() -> None:
+    assert harness._flag_value(["--model", "a"], "--model") == "a"
+    assert harness._flag_value(["--model=b"], "--model") == "b"
+    assert harness._flag_value(["--model"], "--model") is None
+    assert harness._flag_value([], "--model") is None
+
+
+def _run_shim(tmp_path: Path, monkeypatch, argv: list, effort: Any) -> dict:
+    fake = tmp_path / "fake_claude.py"
+    fake.write_text(
+        "import json, sys\nsys.stdin.read()\nprint(json.dumps({'num_turns': 1}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO("prompt"))
+    real_run = subprocess.run
+    monkeypatch.setattr(
+        harness.subprocess,
+        "run",
+        lambda a, **kw: real_run([sys.executable, str(fake), *a[1:]], **kw),
+    )
+    calls = tmp_path / "calls"
+    assert harness.claude_shim("claude", str(calls), argv, effort) == 0
+    (log,) = calls.glob("*.json")
+    return json.loads(log.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    "argv, effort, model, logged_effort",
+    [
+        (["-p", "--model", "m1"], "low", "m1", "low"),
+        (["-p", "--model=m2", "--effort", "high"], "low", "m2", "high"),
+        (["-p", "--effort=max"], "low", None, "max"),
+        (["-p"], None, None, None),
+    ],
+)
+def test_the_claude_shim_logs_the_model_and_effort_of_the_final_call(
+    tmp_path: Path, monkeypatch, argv: list, effort: Any, model: Any, logged_effort: Any
+) -> None:
+    entry = _run_shim(tmp_path, monkeypatch, argv, effort)
+    assert entry["model"] == model
+    assert entry["effort"] == logged_effort
+    assert entry["result"] == {"num_turns": 1}
+
+
+def test_the_claude_shim_line_carries_the_effort_when_given(tmp_path: Path) -> None:
+    pinned = harness._shims(tmp_path / "a", harness.REPO_ROOT, "/opt/claude", "high")
+    assert "claude-shim --effort high /opt/claude " in (pinned / "claude").read_text("utf-8")
+    plain = harness._shims(tmp_path / "b", harness.REPO_ROOT, "/opt/claude")
+    text = (plain / "claude").read_text("utf-8")
+    assert "claude-shim /opt/claude " in text and "--effort" not in text
+
+
+def test_main_passes_the_shims_effort_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list = []
+
+    def fake(real: str, log: str, argv: Any, effort: Any = None) -> int:
+        seen.append((real, log, list(argv), effort))
+        return 7
+
+    monkeypatch.setattr(harness, "claude_shim", fake)
+    assert harness.main(["claude-shim", "--effort", "low", "REAL", "LOG", "-p", "--x"]) == 7
+    assert harness.main(["claude-shim", "REAL", "LOG", "-p"]) == 7
+    assert seen == [("REAL", "LOG", ["-p", "--x"], "low"), ("REAL", "LOG", ["-p"], None)]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["run", "--runs", "0"],
+        ["run", "--runs", "-2"],
+        ["run", "--effort", "ultra"],
+        ["run", "--codex-provider", "bedrock"],
+    ],
+)
+def test_the_run_command_rejects_bad_flags_before_running_anything(
+    args: list, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.setattr(harness, "run", lambda *a, **k: pytest.fail("must not run"))
+    with pytest.raises(SystemExit) as exc:
+        harness.main(args)
+    assert exc.value.code == 2
+    assert capsys.readouterr().err
+
+
+def test_the_run_command_builds_its_config_from_the_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict = {}
+
+    def fake_run(scenarios, arms, cfg, concurrency):
+        seen.update(arms=arms, cfg=cfg, concurrency=concurrency)
+        cfg.out.mkdir(parents=True, exist_ok=True)
+        (cfg.out / "report.md").write_text("report", encoding="utf-8")
+        return [{"grade": {}}]
+
+    monkeypatch.setattr(harness, "run", fake_run)
+    out = tmp_path / "out"
+    argv = ["run", "--arms", "no-skill,codex-skill", "--scenarios", "sdp-local-orders"]
+    argv += ["--runs", "3", "--effort", "high", "--model", "m", "--out", str(out)]
+    argv += ["--codex-model", "gx", "--codex-effort", "low", "--codex-provider", "ollama"]
+    assert harness.main(argv) == 0
+    cfg = seen["cfg"]
+    assert seen["arms"] == ["no-skill", "codex-skill"]
+    assert (cfg.runs, cfg.effort, cfg.model) == (3, "high", "m")
+    assert (cfg.codex_model, cfg.codex_effort, cfg.codex_provider) == ("gx", "low", "ollama")
+
+
+# ---------------------------------------------------------------------------
+# Codex isolation
+# ---------------------------------------------------------------------------
+
+FAKE_KEY = "sk-test-not-real"  # pragma: allowlist secret
+
+
+def _codex_cfg(tmp_path: Path, **extra: Any) -> harness.RunConfig:
+    defaults: Dict[str, Any] = {"codex_model": "gpt-test", "work_root": tmp_path / "work"}
+    return harness.RunConfig(out=tmp_path / "out", **{**defaults, **extra})
+
+
+def test_the_codex_env_is_the_runs_own_and_carries_no_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test-not-real")  # pragma: allowlist secret
+    monkeypatch.setenv("CODEX_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("CODEX_HOME", "/operators/codex")
+    run_dir = tmp_path / "run"
+    bin_dir = run_dir / "bin"
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in harness._child_env(bin_dir, Path("/src")), "premise"
+    env = harness._codex_env(bin_dir, run_dir)
+    assert env["HOME"] == str(run_dir / "home")
+    assert env["TMPDIR"] == str(run_dir / "tmp")
+    assert env["CODEX_HOME"] == str(run_dir / "codex-home")
+    for name in ("home", "tmp", "codex-home"):
+        assert ((run_dir / name).stat().st_mode & 0o777) == 0o700, name
+    for name in ("CLAUDE_CODE_OAUTH_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY"):
+        assert name not in env, name
+    assert FAKE_KEY not in " ".join(env.values())
+    assert env["PATH"].startswith(str(bin_dir))
+
+
+def test_the_codex_argv(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    cfg = _codex_cfg(tmp_path)
+    argv = harness._codex_argv(cfg, "do it", ws)
+    assert argv[:2] == ["codex", "exec"]
+    assert "--json" in argv and "--ephemeral" in argv
+    assert argv[argv.index("--cd") + 1] == str(ws)
+    assert argv[argv.index("--model") + 1] == "gpt-test"
+    assert 'model_reasoning_effort="medium"' in argv
+    assert argv[argv.index('model_reasoning_effort="medium"') - 1] == "-c"
+    assert argv[-2] == "--" and argv[-1].startswith("do it")
+    assert argv[-1].endswith(harness.NON_INTERACTIVE)
+    assert not any("model_provider" in a for a in argv), "openai is Codex's own default"
+    ollama = harness._codex_argv(_codex_cfg(tmp_path, codex_provider="ollama"), "x", ws)
+    assert ollama[ollama.index('model_provider="ollama"') - 1] == "-c"
+    assert ollama[-2] == "--"
+    high = harness._codex_argv(_codex_cfg(tmp_path, codex_effort="high"), "x", ws)
+    assert 'model_reasoning_effort="high"' in high
+
+
+def test_the_codex_config_is_toml_with_the_isolation_the_claude_arms_have(
+    tmp_path: Path,
+) -> None:
+    tomllib = pytest.importorskip("tomllib")
+    run_dir = tmp_path / "run"
+    bin_dir = run_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    readable = harness._codex_readable(bin_dir)
+    doc = tomllib.loads(harness._codex_config(run_dir.resolve(), readable))
+    assert doc["approval_policy"] == "never"
+    assert doc["web_search"] == "disabled"
+    assert doc["history"]["persistence"] == "none"
+    assert doc["skills"]["bundled"]["enabled"] is False
+    assert set(doc["features"]) == set(harness.CODEX_DISABLED_FEATURES)
+    assert all(v is False for v in doc["features"].values())
+    assert doc["default_permissions"] == harness.CODEX_PROFILE
+    profile = doc["permissions"][harness.CODEX_PROFILE]
+    assert profile["network"]["enabled"] is False
+    files = profile["filesystem"]
+    assert files[":workspace_roots"] == "write"
+    assert files[str(run_dir.resolve() / "home")] == "write"
+    assert files[str(run_dir.resolve() / "tmp")] == "write"
+    paths = [Path(k).resolve() for k, v in files.items() if not k.startswith(":") and v == "read"]
+    assert bin_dir.resolve() in paths and harness.REPO_ROOT.resolve() in paths
+    home, root = Path.home().resolve(), harness.REPO_ROOT.resolve()
+    for path in paths:
+        assert path != home and path not in home.parents, f"{path} exposes the home directory"
+        assert path not in root.parents, f"{path} holds this checkout and its siblings"
+    assert not {home, root.parent} & set(paths)
+
+
+def test_the_codex_rules_forbid_exactly_the_stages_the_claude_arms_lack() -> None:
+    rules = harness._codex_rules().splitlines()
+    pattern = re.compile(
+        r'^prefix_rule\(pattern = \["fluid", "([a-z-]+)"\], decision = "forbidden", '
+        r'justification = "fluid \1 is not allowed in this eval\."\)$'
+    )
+    stages = [m.group(1) for m in map(pattern.match, rules) if m]
+    assert len(stages) == len(rules), rules
+    assert sorted(stages) == sorted(harness.CODEX_FORBIDDEN_STAGES)
+    for stage in harness.CODEX_FORBIDDEN_STAGES:
+        assert not any(f"fluid {stage}" in tool for tool in harness.ALLOWED_TOOLS), stage
+    assert all('decision = "forbidden"' in rule for rule in rules)
+
+
+def test_the_codex_home_has_a_config_and_rules(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    bin_dir = harness._shims(run_dir, harness.REPO_ROOT, None)
+    home = harness._write_codex_home(run_dir, bin_dir)
+    assert home == run_dir / "codex-home"
+    assert (home / "config.toml").read_text("utf-8").startswith("# One eval run's Codex config")
+    rules = home / "rules" / f"{harness.CODEX_PROFILE}.rules"
+    assert rules.read_text("utf-8") == harness._codex_rules()
+    assert not (home / "auth.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Codex output
+# ---------------------------------------------------------------------------
+
+VALIDATE = "/bin/zsh -lc 'fluid validate contract.fluid.yaml --offline'"
+APPLY = "/bin/zsh -lc 'fluid apply contract.fluid.yaml'"
+CODEX_REJECTION = (
+    "2026-11-13T18:16:12.746710Z ERROR codex_core::tools::router: error=exec_command failed: "
+    'CreateProcess { message: "Rejected(\\"`' + APPLY + "` rejected: fluid apply is not allowed "
+    'in this eval.\\")" }\n'
+)
+
+
+def _codex_lines(*, tail: tuple = ()) -> list:
+    events = [
+        {"type": "thread.started", "thread_id": "t1"},
+        {
+            "type": "item.completed",
+            "item": {"id": "i0", "type": "error", "message": "Model metadata for x not found"},
+        },
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"id": "i1", "type": "reasoning", "text": "think"}},
+        {
+            "type": "item.started",
+            "item": {
+                "id": "i2",
+                "type": "command_execution",
+                "command": VALIDATE,
+                "aggregated_output": "",
+                "exit_code": None,
+                "status": "in_progress",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "i2",
+                "type": "command_execution",
+                "command": VALIDATE,
+                "aggregated_output": "ok",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        },
+        {"type": "item.completed", "item": {"id": "i3", "type": "agent_message", "text": "DONE"}},
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 16025,
+                "cached_input_tokens": 8000,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 378,
+                "reasoning_output_tokens": 0,
+            },
+        },
+        *tail,
+    ]
+    return [json.dumps(e) for e in events] + ["not json", ""]
+
+
+def test_parse_codex_stream_reads_commands_rejections_and_usage() -> None:
+    info = harness.parse_codex_stream(_codex_lines(), CODEX_REJECTION)
+    assert info["bash_commands"] == [VALIDATE, APPLY]
+    assert info["rejected_commands"] == [APPLY]
+    assert info["permission_denials"] == 1
+    assert info["tools_used"] == {"command_execution": 1}
+    assert info["result"] == {"is_error": False, "error": None}, "an error item is a warning"
+    usage = info["usage"]
+    assert (usage["input_tokens"], usage["cache_read_tokens"], usage["output_tokens"]) == (
+        8025,
+        8000,
+        378,
+    )
+    assert usage["cost_usd"] is None and usage["turns"] is None
+    assert info["skills_invoked"] == [] and info["skill_files_read"] == []
+
+
+def test_parse_codex_stream_without_a_rejection_has_no_denials() -> None:
+    info = harness.parse_codex_stream(_codex_lines())
+    assert info["bash_commands"] == [VALIDATE]
+    assert info["rejected_commands"] == [] and info["permission_denials"] == 0
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        ({"type": "turn.failed", "error": {"message": "boom"}},),
+        ({"type": "error", "message": "boom"},),
+    ],
+)
+def test_a_fatal_codex_event_makes_the_run_an_error(tail: tuple) -> None:
+    info = harness.parse_codex_stream(_codex_lines(tail=tail))
+    assert info["result"] == {"is_error": True, "error": "boom"}
+
+
+def test_codex_usage_sums_turns_and_never_reports_a_zero_cost() -> None:
+    usage = harness.codex_usage(
+        [
+            {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 2},
+            {"input_tokens": 5, "cache_write_input_tokens": 3, "reasoning_output_tokens": 1},
+        ]
+    )
+    assert usage["input_tokens"] == 11 and usage["cache_read_tokens"] == 4
+    assert usage["cache_creation_tokens"] == 3 and usage["reasoning_tokens"] == 1
+    assert usage["cost_usd"] is None and usage["turns"] is None
+    assert harness.codex_usage([])["input_tokens"] == 0
+
+
+def test_a_rejected_fluid_apply_fails_no_apply_as_a_denied_claude_call_does(
+    tmp_path: Path,
+) -> None:
+    info = harness.parse_codex_stream(_codex_lines(), CODEX_REJECTION)
+    ok, detail = harness._check_transcript({"transcript": "no_apply"}, info)
+    assert not ok and "fluid apply" in detail
+    clean = harness.parse_codex_stream(_codex_lines())
+    assert harness._check_transcript({"transcript": "no_apply"}, clean)[0]
+    scenario = next(s for s in SCENARIOS if s.id == "deploy-plan-only")
+    ws = _workspace(scenario, tmp_path)
+    assert "not_applied" in _failed(harness.grade(scenario, ws, info))
+    assert "not_applied" not in _failed(harness.grade(scenario, ws, clean))
+
+
+# ---------------------------------------------------------------------------
+# Codex login and a whole Codex run, against a fake codex
+# ---------------------------------------------------------------------------
+
+FAKE_CODEX = """\
+import json, os, shutil, sys
+log = {log!r}
+args = sys.argv[1:]
+with open(log, "a", encoding="utf-8") as f:
+    entry = {{"argv": args, "env_keys": sorted(os.environ), "stdin": None}}
+    if args[:1] == ["login"]:
+        entry["stdin"] = sys.stdin.read()
+    f.write(json.dumps(entry) + "\\n")
+if args == ["--version"]:
+    print("codex-cli 0.test")
+elif args[:1] == ["login"]:
+    if {fail!r}:
+        sys.stderr.write("rejected key " + entry["stdin"] + "\\n")
+        sys.exit(1)
+    with open(os.path.join(os.environ["CODEX_HOME"], "auth.json"), "w") as f:
+        f.write("{{}}")
+elif args[:1] == ["exec"]:
+    ws = args[args.index("--cd") + 1]
+    with open(log + ".exec", "w", encoding="utf-8") as f:
+        json.dump(
+            {{
+                "auth": os.path.exists(os.path.join(os.environ["CODEX_HOME"], "auth.json")),
+                "home": os.environ["HOME"],
+                "cwd": os.getcwd(),
+                "argv": args,
+            }},
+            f,
+        )
+    if {reference!r}:
+        shutil.copy({reference!r}, os.path.join(ws, "contract.fluid.yaml"))
+    for line in {lines!r}:
+        print(line)
+"""
+
+
+def _fake_codex(tmp_path: Path, *, fail: bool = False, reference: Any = None) -> tuple:
+    log = tmp_path / "codex.log"
+    script = tmp_path / "fake_codex.py"
+    script.write_text(
+        FAKE_CODEX.format(
+            log=str(log),
+            fail=fail,
+            reference=str(reference) if reference else "",
+            lines=_codex_lines(),
+        ),
+        encoding="utf-8",
+    )
+    shim = tmp_path / "shim" / "codex"
+    harness._write_shim(
+        shim, [f'exec {shlex.quote(sys.executable)} {shlex.quote(str(script))} "$@"']
+    )
+    return shim, log
+
+
+def _calls(log: Path) -> list:
+    if not log.is_file():
+        return []
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+def test_the_codex_login_sends_the_key_on_stdin_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODEX_API_KEY", FAKE_KEY)
+    shim, log = _fake_codex(tmp_path)
+    cfg = _codex_cfg(tmp_path, codex=str(shim))
+    run_dir = tmp_path / "run"
+    env = harness._codex_env(run_dir / "bin", run_dir)
+    harness._codex_login(cfg, env, run_dir)
+    (call,) = _calls(log)
+    assert call["argv"] == ["login", "--with-api-key"]
+    assert call["stdin"] == FAKE_KEY
+    assert FAKE_KEY not in " ".join(call["argv"])
+    assert not {"CODEX_API_KEY", "OPENAI_API_KEY"} & set(call["env_keys"])
+    assert (run_dir / "codex-home" / "auth.json").is_file()
+
+
+def test_the_codex_login_prefers_codex_api_key_and_falls_back_to_openai_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEX_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert harness._codex_api_key() is None
+    monkeypatch.setenv("OPENAI_API_KEY", "second")
+    assert harness._codex_api_key() == "second"
+    monkeypatch.setenv("CODEX_API_KEY", "first")
+    assert harness._codex_api_key() == "first"
+    monkeypatch.setenv("CODEX_API_KEY", "")
+    assert harness._codex_api_key() == "second"
+
+
+def test_a_failed_codex_login_never_repeats_the_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODEX_API_KEY", FAKE_KEY)
+    shim, _ = _fake_codex(tmp_path, fail=True)
+    cfg = _codex_cfg(tmp_path, codex=str(shim))
+    run_dir = tmp_path / "run"
+    env = harness._codex_env(run_dir / "bin", run_dir)
+    with pytest.raises(RuntimeError, match=r"codex login failed \(1\)") as exc:
+        harness._codex_login(cfg, env, run_dir)
+    assert FAKE_KEY not in str(exc.value) and "***" in str(exc.value)
+    monkeypatch.delenv("CODEX_API_KEY")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="no CODEX_API_KEY"):
+        harness._codex_login(cfg, env, run_dir)
+
+
+def _codex_record(tmp_path: Path, arm: str, monkeypatch: pytest.MonkeyPatch, **cfg_extra: Any):
+    monkeypatch.setenv("CODEX_API_KEY", FAKE_KEY)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(harness, "_git_head", lambda path: "abc123")
+    shim, log = _fake_codex(tmp_path, reference=ORDERS.reference_dir / "contract.fluid.yaml")
+    cfg = _codex_cfg(tmp_path, codex=str(shim), codex_effort="high", **cfg_extra)
+    stamp = harness._arm_stamps(cfg, [arm], harness._run_meta(cfg))[arm]
+    record = harness.run_one(ORDERS, arm, cfg, stamp, trial=2)
+    return record, Path(record["run_dir"]), log
+
+
+def test_a_codex_arm_runs_end_to_end_against_a_fake_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record, run_dir, log = _codex_record(tmp_path, "codex-no-skill", monkeypatch)
+    assert "harness_error" not in record, record
+    assert (record["scenario"], record["arm"], record["trial"]) == (ORDERS.id, "codex-no-skill", 2)
+    assert run_dir.name == "run-2"
+    assert record["grade"]["passed"] and record["grade"]["valid"]
+    assert record["error"] is False and "control" not in record
+    assert record["bash_commands"] == [VALIDATE]
+    assert record["usage"]["input_tokens"] == 8025 and record["usage"]["cost_usd"] is None
+    meta = record["run_meta"]
+    assert set(harness.RUN_META_KEYS) <= set(meta)
+    assert (meta["agent"], meta["provider"], meta["model"]) == ("codex", "openai", "gpt-test")
+    assert (meta["effort"], meta["agent_version"]) == ("high", "codex-cli 0.test")
+    assert meta["model_reported"] is None
+    codex_home = run_dir / "codex-home"
+    assert not (codex_home / "auth.json").exists(), "the login does not outlive the run"
+    assert (codex_home / "config.toml").is_file()
+    assert (codex_home / "rules" / f"{harness.CODEX_PROFILE}.rules").is_file()
+    assert (run_dir / "transcript.jsonl").is_file() and (run_dir / "result.json").is_file()
+    seen = json.loads(log.with_name("codex.log.exec").read_text(encoding="utf-8"))
+    assert seen["auth"] is True, "logged in before it ran"
+    assert seen["home"] == str(run_dir / "home")
+    assert seen["cwd"] == str(run_dir / "workspace")
+    assert "--ephemeral" in seen["argv"] and "gpt-test" in seen["argv"]
+    exec_call = next(c for c in _calls(log) if c["argv"][:1] == ["exec"])
+    assert not {"CODEX_API_KEY", "OPENAI_API_KEY"} & set(exec_call["env_keys"])
+    assert not (run_dir / "workspace" / ".agents").exists(), "no skills in the no-skill arm"
+
+
+def test_the_codex_skill_arm_installs_the_skills_and_the_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record, run_dir, _ = _codex_record(tmp_path, "codex-skill", monkeypatch)
+    assert "harness_error" not in record, record
+    ws = run_dir / "workspace"
+    assert (ws / ".agents" / "skills").is_dir()
+    assert (ws / "AGENTS.md").is_file()
+    assert "grade" in record and record["run_meta"]["agent"] == "codex"
+    assert record["arm"] == "codex-skill"
+
+
+def test_the_ollama_provider_logs_in_nowhere_and_needs_no_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CODEX_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(harness, "_git_head", lambda path: "abc123")
+    shim, log = _fake_codex(tmp_path, reference=ORDERS.reference_dir / "contract.fluid.yaml")
+    cfg = _codex_cfg(tmp_path, codex=str(shim), codex_provider="ollama")
+    stamp = harness._arm_stamps(cfg, ["codex-no-skill"], harness._run_meta(cfg))["codex-no-skill"]
+    record = harness.run_one(ORDERS, "codex-no-skill", cfg, stamp)
+    assert record["grade"]["passed"] and record["run_meta"]["provider"] == "ollama"
+    assert not any(c["argv"][:1] == ["login"] for c in _calls(log))
+    exec_call = next(c for c in _calls(log) if c["argv"][:1] == ["exec"])
+    assert 'model_provider="ollama"' in exec_call["argv"]
+
+
+def test_a_codex_run_that_cannot_log_in_is_a_harness_error_and_leaves_no_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODEX_API_KEY", FAKE_KEY)
+    shim, _ = _fake_codex(tmp_path, fail=True)
+    record = harness.run_one(ORDERS, "codex-no-skill", _codex_cfg(tmp_path, codex=str(shim)))
+    assert "grade" not in record and "codex login failed" in record["harness_error"]
+    assert FAKE_KEY not in json.dumps(record)
+    assert not list((tmp_path / "work").rglob("auth.json"))
+
+
+# ---------------------------------------------------------------------------
+# preflight, and the per-arm run meta
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_names_each_thing_a_codex_arm_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CODEX_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    cfg = harness.RunConfig(out=tmp_path, codex="no-such-codex-binary-for-this-test")
+    with pytest.raises(SystemExit) as exc:
+        harness.preflight(["codex-skill"], cfg)
+    message = str(exc.value)
+    assert message.startswith("cannot run: ")
+    assert "not on PATH" in message and "no-such-codex-binary" in message
+    assert "--codex-model" in message
+    assert "CODEX_API_KEY" in message and "ollama" in message
+
+
+def test_preflight_passes_a_fully_set_up_codex_arm_and_needs_no_key_for_ollama(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CODEX_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    shim, _ = _fake_codex(tmp_path)
+    ollama = harness.RunConfig(
+        out=tmp_path, codex=str(shim), codex_model="m", codex_provider="ollama"
+    )
+    harness.preflight(["codex-no-skill", "codex-skill"], ollama)
+    openai = harness.RunConfig(out=tmp_path, codex=str(shim), codex_model="m")
+    with pytest.raises(SystemExit, match="CODEX_API_KEY"):
+        harness.preflight(["codex-skill"], openai)
+    monkeypatch.setenv("OPENAI_API_KEY", FAKE_KEY)
+    harness.preflight(["codex-skill"], openai)
+
+
+def test_preflight_lets_the_default_arms_run_with_no_codex_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CODEX_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    cfg = harness.RunConfig(out=tmp_path, codex="no-such-codex-binary-for-this-test")
+    harness.preflight(harness.DEFAULT_ARMS, cfg)
+
+
+def test_preflight_refuses_zero_runs_and_unknown_arms(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="--runs must be 1 or more"):
+        harness.preflight(["skill"], harness.RunConfig(out=tmp_path, runs=0))
+    with pytest.raises(SystemExit, match="unknown arm"):
+        harness.preflight(["skil"], harness.RunConfig(out=tmp_path))
+
+
+def test_each_arm_is_stamped_with_its_own_agent_version_model_and_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(harness, "_git_head", lambda path: "abc123")
+    monkeypatch.setattr(harness, "_claude_version", lambda claude: "2.1.9")
+    monkeypatch.setattr(harness, "_codex_version", lambda codex: "0.9.9")
+    cfg = harness.RunConfig(
+        out=tmp_path,
+        model="opus-x",
+        effort="high",
+        codex_model="gx",
+        codex_effort="low",
+        codex_provider="ollama",
+    )
+    common = harness._run_meta(cfg)
+    assert set(common) == {"forge_src", "forge_src_commit", "skills_commit"}
+    stamps = harness._arm_stamps(cfg, ["skill", "forge", "codex-skill"], common)
+    for arm in ("skill", "forge"):
+        assert stamps[arm] == {
+            **common,
+            "agent": "claude-code",
+            "agent_version": "2.1.9",
+            "model": "opus-x",
+            "effort": "high",
+        }
+    assert stamps["codex-skill"] == {
+        **common,
+        "agent": "codex",
+        "agent_version": "0.9.9",
+        "provider": "ollama",
+        "model": "gx",
+        "effort": "low",
+    }
+    assert all(set(harness.RUN_META_KEYS) <= set(s) for s in stamps.values())
+
+
+def test_a_version_is_only_looked_up_for_an_agent_that_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(harness, "_git_head", lambda path: "abc123")
+    monkeypatch.setattr(harness, "_claude_version", lambda claude: "2.1.9")
+    monkeypatch.setattr(
+        harness, "_codex_version", lambda codex: pytest.fail("no codex arm is running")
+    )
+    cfg = harness.RunConfig(out=tmp_path)
+    stamps = harness._arm_stamps(cfg, ["no-skill"], {})
+    assert stamps["no-skill"]["agent_version"] == "2.1.9"
+    assert "provider" not in stamps["no-skill"]
+    monkeypatch.setattr(harness, "_codex_version", lambda codex: "0.9.9")
+    monkeypatch.setattr(
+        harness, "_claude_version", lambda claude: pytest.fail("no claude arm is running")
+    )
+    assert harness._arm_stamps(cfg, ["codex-no-skill"], {})["codex-no-skill"]["agent"] == "codex"
+
+
+def test_a_missing_cli_has_an_unknown_version() -> None:
+    assert harness._cli_version("no-such-binary-for-this-test") == "unknown"
