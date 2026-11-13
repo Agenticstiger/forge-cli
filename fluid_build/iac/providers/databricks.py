@@ -133,6 +133,8 @@ resources, with no new schema field (fluid-schema 0.7.6):
   workspace folder ``extensions.databricksGenie.parentPath`` names, which a product deployed
   from more than one identity shares. ``fluid plan`` lists the space as a
   ``databricks_genie_space`` action, and ``fluid generate iac`` notes that its module holds none.
+  ``fluid genie apply`` makes one space over several products, joined on their foreign keys
+  (:func:`genie_estate`, ``databricks_genie_estate.py``).
 
 * ``binding.location.region`` is the region the workspace is in, declared so a
   contract's ``sovereignty`` policy can check it (``policy/sovereignty.py``
@@ -2951,6 +2953,38 @@ def _genie(contract: Mapping[str, Any], compiled: _Compiled, env: Mapping[str, s
     from .databricks_genie import compile_space
 
     return compile_space(contract, compiled.tables, compiled.grants, env)
+
+
+def genie_estate(
+    estate_id: str,
+    contracts: Sequence[Tuple[str, Mapping[str, Any]]],
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    title: str = "",
+) -> Any:
+    """The Genie space over ``contracts`` (``(source, contract)`` pairs) that ``fluid genie
+    apply`` asks for (``databricks_genie_estate.compile_estate``). Each contract is compiled as
+    ``fluid apply`` compiles it, so the space holds the tables and grants that apply made, and
+    its ``sovereignty`` policy is held as :meth:`DatabricksIacPlugin.emit` holds it. Imported
+    here, the Light CLI's ``--help`` never needs it."""
+    from .databricks_genie_estate import Member, compile_estate
+
+    env = os.environ if env is None else env
+    members = []
+    for source, contract in contracts:
+        compiled = _compile(contract, env)
+        if not compiled.refusals:
+            _enforce_sovereignty(contract, compiled.tables)
+        members.append(
+            Member(
+                source,
+                contract,
+                tuple(compiled.tables),
+                tuple(compiled.grants),
+                tuple(compiled.refusals),
+            )
+        )
+    return compile_estate(estate_id, members, env, title=title)
 
 
 @dataclass(frozen=True)

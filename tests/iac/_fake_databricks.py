@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
 import os
 import re
@@ -1127,6 +1128,8 @@ class _Client:
 # ``create-genie-agent.md``: ids of 32 lowercase hex characters, id-keyed lists sorted by id,
 # tables by identifier, text fields arrays of strings).
 _GENIE_TEXT_FIELDS = ("question", "content", "description", "sql", "synonyms")
+#: The relationship types a join's ``--rt=FROM_RELATIONSHIP_TYPE_<type>--`` tag may name.
+_GENIE_RELATIONSHIPS = ("ONE_TO_ONE", "ONE_TO_MANY", "MANY_TO_ONE", "MANY_TO_MANY")
 
 
 def _genie_order_problem(items: List[Any], path: str) -> Optional[str]:
@@ -1163,6 +1166,32 @@ def _genie_problem(node: Any, path: str, ids: List[str]) -> Optional[str]:
     for child_path, value in children:
         problem = problem or _genie_problem(value, child_path, ids)
     return problem
+
+
+def _genie_limit_problem(doc: Dict[str, Any]) -> Optional[str]:
+    """The service's limits on a whole ``serialized_space``: one text instruction, a known
+    relationship tag on each join, 50 tables. The last two measured on a live workspace
+    (2026-11-12), with these messages; a join's tables and its unqualified columns are not
+    checked when a space is made."""
+    instructions = doc.get("instructions") or {}
+    if len(instructions.get("text_instructions") or []) > 1:
+        return "At most 1 text instruction is allowed"
+    for spec in instructions.get("join_specs") or []:
+        for part in spec.get("sql") or []:
+            tag = re.fullmatch(r"--rt=FROM_RELATIONSHIP_TYPE_([A-Za-z_]+)--", str(part))
+            if tag and tag.group(1) not in _GENIE_RELATIONSHIPS:
+                return (
+                    f"Failed to parse export proto: FROM_RELATIONSHIP_TYPE_{tag.group(1)} "
+                    "(of class java.lang.String)"
+                )
+    if len((doc.get("data_sources") or {}).get("tables") or []) > 50:
+        return "A space can have at most 50 tables."
+    return None
+
+
+def writes_since(fake: "FakeDatabricks", start: int) -> List[Tuple[str, str]]:
+    """The writes (POST, PATCH, PUT, DELETE) ``fake`` served after its ``start``-th request."""
+    return [r for r in fake.requests[start:] if r[0] in ("POST", "PATCH", "PUT", "DELETE")]
 
 
 # ---------------------------------------------------------------------- the server
@@ -1882,12 +1911,50 @@ class FakeDatabricks:
             return problem
         if len(ids) != len(set(ids)):
             return "ids must be unique"
-        if len((doc.get("instructions") or {}).get("text_instructions") or []) > 1:
-            return "At most 1 text instruction is allowed"
+        problem = _genie_limit_problem(doc)
+        if problem:
+            return problem
         for source in (doc.get("data_sources") or {}).get("tables") or []:
             if source.get("identifier") not in {**self.tables, **self.metric_views}:
                 return f"Table {source.get('identifier')!r} does not exist"
         return None
+
+    def _with_uc_joins(self, stored: str, before: Iterable[str]) -> str:
+        """A written space as the live service keeps it: for each table that entered it (every
+        one, on a create), a join added for each Unity Catalog FOREIGN KEY between two of its
+        tables that touches that table, beside the ones it was sent (the child under its own
+        name, the parent as ``<name>_2``, MANY_TO_ONE; measured 2026-11-13). ``before``: the
+        tables the space held."""
+        doc = json.loads(stored)
+        names = {t.get("identifier") for t in (doc.get("data_sources") or {}).get("tables") or []}
+        new = names - set(before)
+        added = []
+        for child in sorted(n for n in names if n in self.tables):
+            for c in self.tables[child].get("constraints") or ():
+                if c["type"] != "FOREIGN KEY" or c["parent"] not in names:
+                    continue
+                if child not in new and c["parent"] not in new:
+                    continue
+                left, right = child.rsplit(".", 1)[1], c["parent"].rsplit(".", 1)[1] + "_2"
+                on = " AND ".join(
+                    f"`{left}`.`{a}` = `{right}`.`{b}`"
+                    for a, b in zip(c["columns"], c["parent_columns"], strict=True)
+                )
+                digest = hashlib.sha256(f"{child}\0{c['name']}".encode()).hexdigest()
+                added.append(
+                    {
+                        "id": "01f1" + digest[:28],
+                        "left": {"identifier": child, "alias": left},
+                        "right": {"identifier": c["parent"], "alias": right},
+                        "sql": [on, "--rt=FROM_RELATIONSHIP_TYPE_MANY_TO_ONE--"],
+                    }
+                )
+        if not added:
+            return stored
+        instructions = doc.setdefault("instructions", {})
+        joins = [*(instructions.get("join_specs") or []), *added]
+        instructions["join_specs"] = sorted(joins, key=lambda j: j["id"])
+        return json.dumps(doc)
 
     def _genie_title_taken(self, title: str, parent: str, other_than: str = "") -> bool:
         return any(
@@ -1950,7 +2017,7 @@ class FakeDatabricks:
                 "description": b.get("description") or "",
                 "warehouse_id": b["warehouse_id"],
                 "parent_path": parent,
-                "serialized_space": self._as_stored(b["serialized_space"]),
+                "serialized_space": self._with_uc_joins(self._as_stored(b["serialized_space"]), ()),
                 "etag": self._genie_etag(),
             }
             self.genie_acl[space_id] = {}
@@ -1981,7 +2048,11 @@ class FakeDatabricks:
                 problem = self._genie_check(b["serialized_space"])
                 if problem:
                     return _err(400, "INVALID_PARAMETER_VALUE", problem)
-                space["serialized_space"] = self._as_stored(b["serialized_space"])
+                was = json.loads(space["serialized_space"]).get("data_sources") or {}
+                space["serialized_space"] = self._with_uc_joins(
+                    self._as_stored(b["serialized_space"]),
+                    [t.get("identifier") for t in was.get("tables") or []],
+                )
             if "title" in b and self._genie_title_taken(
                 b["title"], space["parent_path"], other_than=space_id
             ):

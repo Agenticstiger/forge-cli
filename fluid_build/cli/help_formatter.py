@@ -223,6 +223,10 @@ def print_main_help(parser: argparse.ArgumentParser) -> None:
         [
             ("publish", "Publish to enterprise data catalogs"),
             ("market", "Browse & discover data products  [dim]--blueprints[/dim]"),
+            (
+                "genie",
+                "One Databricks Genie space over several products  [dim]apply · remove[/dim]",
+            ),
             ("import", "Import existing dbt/Terraform/SQL projects"),
             ("mcp", "Serve forge tools over Model Context Protocol  [dim]serve[/dim]"),
         ],
