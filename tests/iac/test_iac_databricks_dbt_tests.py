@@ -267,7 +267,7 @@ class TestTheJobUploadsATestPerCheck:
         ]["task"]
         assert task["dbt_task"]["commands"] == ["dbt deps", "dbt build --select +orders+"]
 
-    def test_the_plan_lists_the_tests_of_the_job(self, tmp_path, monkeypatch):
+    def test_planned_objects_lists_the_tests_of_the_job(self, tmp_path, monkeypatch):
         monkeypatch.setenv(dbx.WAREHOUSE_ENV, WAREHOUSE)
         _project(tmp_path)
         with contract_source(tmp_path / "contract.fluid.yaml"):
@@ -368,7 +368,8 @@ class TestRefusals:
 
     def test_a_test_name_the_projects_own_tests_use_is_refused(self, tmp_path):
         # dbt names singular tests project-wide: a clash fails the whole job's parse
-        # ("dbt found two data_tests with the name"), so the plan refuses it first.
+        # ("dbt found two data_tests with the name"), so fluid validate, generate iac and
+        # apply refuse it before any run.
         _project(
             tmp_path,
             files={
@@ -496,7 +497,7 @@ class TestRefusals:
         text.encode("utf-8")  # the refusal prints: it names the path escaped
 
     def test_a_refusal_names_a_lone_surrogate_from_the_project_escaped(self, tmp_path):
-        # The model-paths reach the refusal's text, which fluid plan prints.
+        # The model-paths reach the refusal's text, which fluid validate prints.
         _project(tmp_path, config='model-paths: ["m\\ud83d"]\n')
         text = self._refused(tmp_path, _contract(), "model")
         assert "m\\ud83d" in text
