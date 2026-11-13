@@ -733,10 +733,10 @@ def _http_auth_validator() -> AuthValidator:
                     "FLUID_MCP_AUTH_MODE": exc.value,
                     "expected": exc.expected,
                     "hint": (
-                        "mTLS is not a gateway mode: terminate it at a reverse proxy "
-                        "(examples/mcp-output-port-docker/proxy/), run the gateway with "
-                        "shared-token or jwt, and list the proxy's address in "
-                        "FLUID_MCP_TRUSTED_PROXIES so its X-Client-CN header is honoured."
+                        "mTLS is not an auth mode: terminate it at a reverse proxy "
+                        "(examples/mcp-output-port-docker/proxy/) and run the server with "
+                        "shared-token or jwt. The output port honours the proxy's "
+                        "X-Client-CN header once its address is in FLUID_MCP_TRUSTED_PROXIES."
                     ),
                 },
             ) from None

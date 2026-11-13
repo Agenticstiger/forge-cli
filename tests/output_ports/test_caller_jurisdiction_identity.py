@@ -212,7 +212,7 @@ def test_stdio_with_a_pinned_contract_refuses_at_startup() -> None:
 def test_http_without_auth_refuses_too(monkeypatch: pytest.MonkeyPatch) -> None:
     """The subtler half: HTTP alone is not enough.
 
-    `_AuthMiddleware` returns early when auth is not configured, so it never
+    The HTTP auth gate (`fluid_build._mcp_http`) skips auth when it is not configured, so it never
     stamps the attributes this gate reads. An earlier version of this feature's
     own documentation missed exactly this and blamed the transport instead.
     """

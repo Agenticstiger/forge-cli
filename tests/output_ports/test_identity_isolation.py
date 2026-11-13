@@ -4,7 +4,7 @@
 """Concurrency regression: per-request identity isolation on the MCP gateway.
 
 Pins the fix for the HIGH-severity cross-client identity bleed. The
-HTTP/SSE transport serves MANY concurrent MCP clients over ONE shared
+HTTP transport serves MANY concurrent MCP clients over ONE shared
 :class:`SessionState`. The pre-fix code CACHED the first authenticated
 client's identity onto that shared state:
 

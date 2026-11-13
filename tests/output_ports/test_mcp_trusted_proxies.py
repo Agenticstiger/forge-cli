@@ -277,7 +277,7 @@ def test_trusted_proxies_error_example_is_a_single_address_not_a_wide_range(bad:
 
 
 # ---------------------------------------------------------------------
-# End to end over the real HTTP/SSE transport
+# End to end over the real Streamable HTTP transport
 # ---------------------------------------------------------------------
 
 

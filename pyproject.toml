@@ -352,8 +352,9 @@ litellm = [
 #   repo:  https://github.com/modelcontextprotocol/python-sdk
 #
 # mcp floor 1.30: advisories fixed in 1.23.0, 1.27.2 (GHSA-jpw9, an SSE session
-# not bound to its principal; the gateway uses ``SseServerTransport``), 1.28.1
-# and 1.30.0; 2.0.* and 2.1.* carry them too and were fixed in 2.2.0.
+# not bound to its principal), 1.28.1 and 1.30.0; 2.0.* and 2.1.* carry them too
+# and were fixed in 2.2.0. Both servers' HTTP transport (fluid_build/_mcp_http.py)
+# relies on the Streamable HTTP session manager tying a session to its principal.
 #
 # pyjwt is declared explicitly because fluid_build/output_ports/mcp/auth.py
 # imports ``jwt`` directly. Floor 2.15.0: every release up to 2.14.0 has
