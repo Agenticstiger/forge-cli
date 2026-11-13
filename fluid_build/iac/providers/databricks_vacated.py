@@ -197,13 +197,18 @@ def _exists(session: Session, full: str, present: Iterable[str]) -> bool:
 
 
 def _holders(objects: Mapping[str, Mapping[str, Any]]) -> Dict[str, List[str]]:
-    """``{function (bare, lower case): [objects whose row filter or a mask names it]}``."""
+    """``{function (full name, lower case): [objects whose row filter or a mask names it]}``.
+
+    The Tables API names the function in full; a shorter name is read against the object's own
+    catalog and schema, so no form of it can make a bound function look unbound."""
     holders: Dict[str, List[str]] = {}
     for full, info in sorted(objects.items()):
         bound = [(info.get("row_filter") or {}).get("function_name")]
         bound += [(c.get("mask") or {}).get("function_name") for c in _live_columns(info).values()]
         for name in filter(None, bound):
-            holders.setdefault(_bare(name), []).append(full)
+            parts = _bare(name).split(".")
+            home = full.lower().split(".")[: max(0, 3 - len(parts))]
+            holders.setdefault(".".join([*home, *parts]), []).append(full)
     return holders
 
 
@@ -380,7 +385,7 @@ def unblock(vac: Vacated, say: Say, client_factory: Optional[ClientFactory] = No
         return False
     dropped, clear = 0, True
     for where in vac.schemas:
-        say(f"\n  {where}: tofu apply could not destroy it yet; what this product made there")
+        say(f"\n  {where}: tofu apply could not destroy it yet: it held what this product made")
         out = _Clearing(session, Vacated(vac.product_id, (where,)), where, say, False).run()
         _say_left(where, out, say)
         dropped += out.dropped

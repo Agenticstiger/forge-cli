@@ -259,6 +259,21 @@ def test_only_this_products_and_this_identitys_objects_go_and_never_a_bound_func
         assert f"main.sales.{view}_semantic_model" in fake.tables
 
 
+def test_a_function_a_table_names_without_its_schema_still_counts_as_used(fake):
+    run = Run(fake)
+    fake.create_table("main.sales.orders_stg", LIVE)
+    bound = "main.sales.fluid_rf_orders_stg_12345678"
+    fake.add_function(bound, [("region", "string")], "BOOLEAN", "true", owner=DEPLOY_USER)
+    fake.tables["main.sales.orders_stg"]["row_filter"] = {
+        "function_name": "fluid_rf_orders_stg_12345678",
+        "input_column_names": ["region"],
+    }
+    before = len(fake.sql_log)
+    run.prepare()
+    assert run.drops(before) == [] and bound in fake.functions
+    assert f"{bound} (the row filter or a mask of main.sales.orders_stg)" in run.text
+
+
 def test_a_schema_the_contract_still_names_is_not_looked_in(fake):
     run = Run(fake)
     run.deploy(_contract())
