@@ -32,6 +32,7 @@ from fluid_build.util.contract import (
     is_continuous_build,
     is_databricks_job_build,
     is_externally_run_build,
+    is_lakeflow_build,
 )
 
 LOG = logging.getLogger("fluid.build_runners")
@@ -176,6 +177,52 @@ def _databricks_job_build(
     return run_job_build(
         contract, build, databricks_jobs, dry_run=args.dry_run, mode=getattr(args, "mode", None)
     )
+
+
+def _lakeflow_build(
+    contract: Dict[str, Any],
+    build: Dict[str, Any],
+    report: Any,
+    databricks_pipelines: Optional[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> Optional[int]:
+    """Run a lakeflow build (``_databricks_pipeline_run.run_pipeline_build``): a triggered one
+    gets an update, waited for; a continuous one, which Databricks keeps running, only its
+    tags. Its exit code, or ``None`` when Databricks runs it on its own: no apply here
+    provisioned it, or a continuous one's tags were set."""
+    build_id = build.get("id", "unknown")
+    continuous = is_continuous_build(build)
+    if databricks_pipelines is None:
+        product = contract.get("id") or contract.get("name") or "product"
+        how = (
+            "continuously; Databricks keeps it running, so fluid apply starts no update of it."
+            if continuous
+            else "(fluid apply provisions it). An apply to databricks with --mode "
+            "amend-and-build starts an update now and waits for it; so does the pipeline's page."
+        )
+        cprint(
+            f"\n⏭️  Build '{build_id}' - runs in the Databricks workspace as Lakeflow pipeline "
+            f"'fluid {product} {build_id}' {how}",
+            markup=False,
+        )
+        _record_run_elsewhere(build_id, report)
+        return None
+    from fluid_build.iac.source import source_contract_file
+
+    from ._databricks_pipeline_run import run_pipeline_build
+
+    result = run_pipeline_build(
+        contract,
+        build,
+        databricks_pipelines,
+        dry_run=args.dry_run,
+        mode=getattr(args, "mode", None),
+        contract_file=source_contract_file(getattr(args, "contract", None)),
+    )
+    if continuous and result == 0:
+        _record_run_elsewhere(build_id, report)
+        return None
+    return result
 
 
 def _writes_a_databricks_table(contract: Dict[str, Any], build: Dict[str, Any]) -> bool:
@@ -1256,6 +1303,7 @@ def run_builds_from_args(
     plan_data: Optional[Dict[str, Any]] = None,
     contract: Optional[Dict[str, Any]] = None,
     databricks_jobs: Optional[Dict[str, Any]] = None,
+    databricks_pipelines: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Execute builds from a FLUID contract.
 
@@ -1290,6 +1338,8 @@ def run_builds_from_args(
     ``databricks_jobs`` (build id to the jobs the OpenTofu state holds) comes from
     the ``fluid apply`` that just provisioned them: a dbt build that runs on
     Databricks then runs its job now (:func:`_databricks_job_build`).
+    ``databricks_pipelines`` is the same for the Lakeflow pipelines of lakeflow builds
+    (:func:`_lakeflow_build`).
     """
     # Deferred imports to avoid circular import at module-load time:
     # base.py -> python.runner -> base.py (for _resolve_env_placeholders).
@@ -1498,17 +1548,18 @@ def run_builds_from_args(
         build_id = build.get("id", "unknown")
         runs_before = _run_ids(contract_path.parent, product_id, build_id) if report else None
 
-        if is_externally_run_build(build):
-            _report_externally_run_build(build, build_id, report, contract)
-            total_external += 1
-            continue
-
-        if is_databricks_job_build(build):
-            job_result = _databricks_job_build(contract, build, report, databricks_jobs, args)
-            if job_result is None:
+        if is_lakeflow_build(build) or is_databricks_job_build(build):
+            # Runs in the Databricks workspace: a Lakeflow pipeline update or a dbt job run,
+            # started now when this apply provisioned it, else reported as run there.
+            workspace_result = (
+                _lakeflow_build(contract, build, report, databricks_pipelines, args)
+                if is_lakeflow_build(build)
+                else _databricks_job_build(contract, build, report, databricks_jobs, args)
+            )
+            if workspace_result is None:
                 total_external += 1
                 continue
-            result = job_result
+            result = workspace_result
             _report_build(report, contract_path.parent, product_id, build_id, result, runs_before)
             if result == 0:
                 total_executed += 1
@@ -1516,6 +1567,11 @@ def run_builds_from_args(
                 total_failed += 1
                 if args.fail_fast:
                     break
+            continue
+
+        if is_externally_run_build(build):
+            _report_externally_run_build(build, build_id, report, contract)
+            total_external += 1
             continue
 
         if _runs_outside_forge_continuously(build):

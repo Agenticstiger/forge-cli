@@ -121,9 +121,19 @@ def get_build_engine(build: Mapping[str, Any]) -> Optional[str]:
 #: Flink. forge-cli validates and plans such a build but ships no runner for
 #: it, and never runs its ``properties.sql`` as its own SQL. ``engine: flink``
 #: is new in schema 0.7.6; ``properties.language: flink_sql`` is how 0.7.5 and
-#: older contracts declare the same job.
-EXTERNALLY_RUN_ENGINES = frozenset({"flink"})
+#: older contracts declare the same job. ``engine: lakeflow`` (schema 0.7.7) is a
+#: Databricks Lakeflow Declarative Pipeline: ``fluid apply`` provisions it
+#: (``iac/providers/databricks_lakeflow.py``) and, under ``--mode amend-and-build``,
+#: starts an update of it, but its SQL only ever runs in the pipeline.
+LAKEFLOW_ENGINE = "lakeflow"
+EXTERNALLY_RUN_ENGINES = frozenset({"flink", LAKEFLOW_ENGINE})
 EXTERNALLY_RUN_LANGUAGES = frozenset({"flink_sql"})
+
+
+def is_lakeflow_build(build: Mapping[str, Any]) -> bool:
+    """True when the build is a Databricks Lakeflow Declarative Pipeline (``engine: lakeflow``)."""
+    engine = get_build_engine(build)
+    return isinstance(engine, str) and engine.strip().lower() == LAKEFLOW_ENGINE
 
 
 def is_externally_run_build(build: Mapping[str, Any]) -> bool:

@@ -616,7 +616,11 @@ def _tags_dimension(client: Any, table: Any, live_table: Mapping[str, Any]) -> D
         "message": f"{len(findings)} of {checked} missing or changed",
         "findings": findings,
         "fix": (
-            "Run fluid apply to set them again; a dbt CREATE OR REPLACE may have dropped "
+            "Run fluid apply --mode amend-and-build: it sets a Lakeflow pipeline's table tags "
+            "after the update it starts (a continuous pipeline's once its table exists); an "
+            "update run from Databricks sets none"
+            if getattr(table, "pipeline_written", False)
+            else "Run fluid apply to set them again; a dbt CREATE OR REPLACE may have dropped "
             "them (whether Databricks keeps tags across it is undocumented)"
         ),
     }
@@ -864,12 +868,21 @@ def _jobs_dimension(
     }
 
 
+#: How a Lakeflow pipeline's table comes to exist: plain ``fluid apply`` provisions the
+#: pipeline, and only an update creates the table.
+_CREATED_BY_PIPELINE = (
+    "Its Lakeflow pipeline creates it on its first update: run fluid apply --mode "
+    "amend-and-build, or start an update from the pipeline's page"
+)
+
+
 def _severity(
     diff: Mapping[str, Any],
     access: Optional[Mapping[str, Any]],
     jobs: Optional[Mapping[str, Any]],
     missing_table: str = "",
     residency: Optional[Mapping[str, Any]] = None,
+    pipeline_written: bool = False,
     tags: Optional[Mapping[str, Any]] = None,
     enforcement: Optional[Mapping[str, Any]] = None,
     retention: Optional[Mapping[str, Any]] = None,
@@ -890,7 +903,7 @@ def _severity(
     actions: List[str] = []
     if missing_table:
         reasons.append(f"table {missing_table} does not exist")
-        actions.append("Run fluid apply to create it")
+        actions.append(_CREATED_BY_PIPELINE if pipeline_written else "Run fluid apply to create it")
     for finding in (access or {}).get("findings") or []:
         reasons.append(finding["message"])
         actions.append(f"An admin of catalog {finding['catalog']} runs: {finding['fix']}")
@@ -994,12 +1007,14 @@ def verify_databricks_expose(
     except Exception as exc:  # noqa: BLE001 — every SDK/HTTP failure is reported, not raised
         if not _is_not_found(exc):
             return _error(f"Unity Catalog GetTable {target} failed: {_failure(exc)}", target=target)
+        pipeline_written = bool(getattr(table, "pipeline_written", False))
         if reference_only:
-            return _error(
-                f"Table not found: {target} (run fluid apply)", target=target, exists=False
-            )
+            how = _CREATED_BY_PIPELINE if pipeline_written else "run fluid apply"
+            return _error(f"Table not found: {target} ({how})", target=target, exists=False)
         diff = _compare({}, declared)
-        severity = _severity(diff, None, None, missing_table=target)
+        severity = _severity(
+            diff, None, None, missing_table=target, pipeline_written=pipeline_written
+        )
         return {
             "status": "mismatch",
             "exists": False,

@@ -1227,3 +1227,58 @@ def test_an_unpaused_job_on_an_unprotected_table_has_no_paused_finding(workspace
     )
 
     assert verify(workspace, contract)["dimensions"]["jobs"]["status"] == "pass"
+
+
+def test_verify_compiles_a_databricks_expose_from_its_contract_file(tmp_path, monkeypatch):
+    """``fluid verify`` hands a Databricks expose to its inspector inside the contract file's
+    ``contract_source`` block, as ``fluid apply`` compiles it: a Lakeflow reference check
+    resolves the referenced product from the workspace around that file, so without it the
+    pipeline (and the tags it is checked for) would drop out of what verify expects."""
+    import argparse
+    import logging
+
+    import yaml
+
+    from fluid_build.cli import _verify_databricks, verify
+    from fluid_build.iac.source import current_contract_source
+
+    contract = {
+        "fluidVersion": "0.7.6",
+        "kind": "DataProduct",
+        "id": "demo.databricks.orders",
+        "name": "Orders",
+        "metadata": {"owner": {"team": "data-platform"}},
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "kind": "table",
+                "binding": {
+                    "platform": "databricks",
+                    "format": "delta_table",
+                    "location": {"database": "main", "schema": "sales", "table": "orders"},
+                },
+                "contract": {"schema": [{"name": "id", "type": "bigint"}]},
+            }
+        ],
+    }
+    path = tmp_path / "contract.fluid.yaml"
+    path.write_text(yaml.safe_dump(contract), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    seen = []
+
+    def inspector(expose_id, expose, **_kwargs):
+        seen.append(current_contract_source())
+        return {"status": "match", "dimensions": {}}
+
+    monkeypatch.setattr(_verify_databricks, "verify_databricks_expose", inspector)
+    args = argparse.Namespace(
+        contract=str(path),
+        expose_id=None,
+        strict=False,
+        fail_on_warning=False,
+        out=None,
+        show_diffs=False,
+        env=None,
+    )
+    verify.run(args, logging.getLogger("test"))
+    assert seen and seen[0] is not None and seen[0].resolve() == path.resolve()
