@@ -2896,6 +2896,14 @@ class DatabricksIacPlugin:
         compiled = _compile(contract, os.environ)
         if compiled.refusals:
             raise compiled.refusals[0]
+        if _genie_waits_for_pipelines(contract, compiled):
+            # The block still asks for a space, and converge reads a missing one as a block
+            # removed: it would trash the space an earlier apply made. Left as it is instead.
+            (say or print)(
+                "\n  Databricks Genie space: left as it is. Every table of this product is a "
+                "Lakeflow pipeline's, which fluid apply does not put in a space yet."
+            )
+            return
         converge(
             _genie(contract, compiled, os.environ),
             say or print,
@@ -3297,13 +3305,20 @@ def _genie(contract: Mapping[str, Any], compiled: _Compiled, env: Mapping[str, s
     (``databricks_genie.compile_space``); imported here, the Light CLI's ``--help`` never
     needs it. A Lakeflow pipeline's table is left out (:func:`_tables_before_build`), and a
     product whose tables are all a pipeline's gets no space."""
-    from .databricks_genie import Compiled, compile_space, requested
+    from .databricks_genie import Compiled, compile_space
 
-    tables = _tables_before_build(compiled)
-    if requested(contract) and compiled.tables and not tables:
-        # Every table is a Lakeflow pipeline's: no space yet (_pipeline_table_warnings).
+    if _genie_waits_for_pipelines(contract, compiled):
+        # No space yet (_pipeline_table_warnings); converge_output_ports leaves an existing one.
         return Compiled(product_id=str(contract.get("id") or "").strip())
-    return compile_space(contract, tables, compiled.grants, env)
+    return compile_space(contract, _tables_before_build(compiled), compiled.grants, env)
+
+
+def _genie_waits_for_pipelines(contract: Mapping[str, Any], compiled: _Compiled) -> bool:
+    """Whether ``contract`` asks for a Genie space and every one of its tables is a Lakeflow
+    pipeline's (:func:`_tables_before_build` holds none of them)."""
+    from .databricks_genie import requested
+
+    return requested(contract) and bool(compiled.tables) and not _tables_before_build(compiled)
 
 
 def genie_estate(

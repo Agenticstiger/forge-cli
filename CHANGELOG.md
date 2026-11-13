@@ -186,7 +186,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     cron trigger are refused on a lakeflow build for now. Unity Catalog keys, data quality
     monitoring, a metric view (`semantics`) and a place in the Genie space are not set up on a
     pipeline's table yet: each is set up at or right after `tofu apply`, and the pipeline
-    creates its table at its first update, after that. `fluid validate` warns about each.
+    creates its table at its first update, after that. `fluid validate` warns about each, and
+    a Genie space an earlier apply made for a product of pipeline tables only is left as it is.
   - `fluid apply --mode amend-and-build` starts an update and waits for it
     (`replace-and-build`: a full refresh), then prints each rule's counts from the pipeline's
     event log. A failed update fails the apply with its error, less the row a failed

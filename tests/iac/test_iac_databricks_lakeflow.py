@@ -912,3 +912,21 @@ def test_the_genie_space_leaves_a_pipeline_table_out(tmp_path):
     assert genie.space.tables == ("fluid_iactest_ldp.silver_seen.sites_seen",)
     (warning,) = [w for w in compiled.warnings if "Genie" in w]
     assert "leaves out fluid_iactest_ldp.silver_capacity.capacity" in warning
+
+
+def test_converge_leaves_an_earlier_genie_space_of_pipeline_tables_alone(tmp_path, monkeypatch):
+    """A missing space reads as a block removed, and converge would trash the space an earlier
+    apply made (a product converted to lakeflow): it is not called at all."""
+    from fluid_build.iac.providers import databricks_genie
+
+    contract = _edit(g=lambda c: c.setdefault("extensions", {}).update(databricksGenie={}))
+    called: List[Any] = []
+    monkeypatch.setattr(databricks_genie, "converge", lambda *a, **k: called.append(a))
+    monkeypatch.setattr(databricks_genie, "_retire", lambda *a, **k: called.append(a))
+    said: List[str] = []
+    for key, value in ENV.items():
+        monkeypatch.setenv(key, value)
+    with contract_source(_workspace(tmp_path, contract)):
+        dbx.DatabricksIacPlugin().converge_output_ports(contract, said.append)
+    assert called == []
+    assert any("Genie space: left as it is" in line for line in said)
