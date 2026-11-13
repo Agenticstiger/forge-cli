@@ -13,10 +13,7 @@ CLI the user already has installed:
 * **Cursor** — ``cursor-agent -p`` (reuses ``CURSOR_API_KEY``)
 * **Amazon Kiro** — ``kiro --no-interactive`` (reuses ``KIRO_API_KEY``)
 
-This is the standalone-terminal sibling of
-:class:`~fluid_build.llm.providers.MCPSamplingProvider`,
-which serves the in-IDE case (forge driven by the host's ``forge_run`` tool).
-Both reuse the same :class:`LlmProvider` seam, so selection is purely by
+It reuses the :class:`LlmProvider` seam, so selection is purely by
 provider name (``claude-code``/``codex``/``cursor``/``kiro``) — there is no
 separate backend switch.
 
@@ -715,7 +712,7 @@ class CodingAgentProvider(LlmProvider):
     ) -> Iterator[str]:
         # Streaming is deferred: yield the blocking result as one chunk. The
         # runtime's streaming wrapper concatenates chunks, so this is
-        # transparent (same pattern as MCPSamplingProvider).
+        # transparent.
         yield self.invoke_blocking(config, system_prompt, user_prompt, extra_payload=extra_payload)
 
 

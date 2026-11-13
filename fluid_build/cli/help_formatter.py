@@ -451,7 +451,7 @@ def print_forge_help() -> None:
         [
             (
                 "--llm-provider NAME",
-                "openai/anthropic/gemini/ollama, or keyless: mcp-sampling (in-IDE), "
+                "openai/anthropic/gemini/ollama, or keyless: "
                 "claude-code / codex / cursor / kiro (local agent CLI)",
             ),
             ("--llm-model NAME", "Model identifier"),

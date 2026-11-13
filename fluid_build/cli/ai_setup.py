@@ -1742,7 +1742,7 @@ def _provider_model_plan(provider_name: str) -> dict:
 
     provider = BUILTIN_LLM_PROVIDERS.get(provider_name)
     if provider is None:
-        # ``mcp-sampling`` and plugin providers are not in the built-in dict.
+        # Plugin providers are not in the built-in dict.
         from fluid_build.llm.providers import get_llm_provider
 
         provider = get_llm_provider(provider_name)
@@ -1964,7 +1964,7 @@ def register(subparsers) -> None:
 
 _SETUP_KEYLESS_ALTERNATIVES = (
     "Or author with no API key at all. Run fluid forge --llm-provider claude-code | codex | cursor | kiro "
-    "(uses that agent's own login), --llm-provider mcp-sampling (from your IDE), "
+    "(uses that agent's own login), "
     "or fluid forge --template starter (no AI)."
 )
 

@@ -57,8 +57,8 @@ HOST_CREDENTIAL_ENV = (
 # that asks for one.
 NO_CLIENT_CERT = os.path.join(os.devnull, "fluid-no-client-certificate")
 
-# The suppression below mutates the process environment. forge_run's in-process
-# worker thread can run alongside forge_from_source, so windows are serialised
+# The suppression below mutates the process environment. a server thread can run alongside
+# another attach, so windows are serialised
 # (and re-entrant within one thread) rather than interleaved: two overlapping
 # windows could otherwise restore the host credentials while the second attach
 # is still inside its own.

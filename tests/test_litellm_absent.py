@@ -5,7 +5,7 @@
 
 litellm left the base install in 0.28.0. The litellm-backed providers fail up
 front with the install line and the keyless alternatives; the keyless coding
-agents, ``mcp-sampling`` and template/blank forge keep working; the places
+agents and template/blank forge keep working; the places
 that only ever used litellm opportunistically (price table, token counting,
 deprecation hints) degrade to their built-in fallbacks.
 """
@@ -45,7 +45,7 @@ class TestProviderGate:
         assert info.value.event == "copilot_litellm_unavailable"
         assert info.value.exit_code == 1
 
-    @pytest.mark.parametrize("name", ["claude-code", "codex", "cursor", "kiro", "mcp-sampling"])
+    @pytest.mark.parametrize("name", ["claude-code", "codex", "cursor", "kiro"])
     def test_keyless_providers_resolve_without_litellm(self, block, name):  # noqa: F811
         block("litellm")
         from fluid_build.llm.providers import get_llm_provider
@@ -144,7 +144,7 @@ class TestCliSurface:
             flat = " ".join(out.split())
             assert rc == 1, out
             assert "pip install 'data-product-forge[litellm]'" in flat
-            for keyless in ("claude-code", "codex", "cursor", "kiro", "mcp-sampling", "--template"):
+            for keyless in ("claude-code", "codex", "cursor", "kiro", "--template"):
                 assert keyless in flat
             assert "Traceback" not in out
         assert asked == []

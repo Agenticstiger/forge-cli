@@ -708,13 +708,6 @@ class TestAgentReadinessNeedsTheBinary:
         assert ready.ready is True
         assert ready.provider == "ollama"
 
-    def test_mcp_sampling_is_not_ready_through_this_check(self, world):
-        # It only works inside an MCP host that selects it explicitly.
-        ready = check_llm_readiness(
-            {"FLUID_LLM_PROVIDER": "mcp-sampling", "PATH": str(world.bindir)}
-        )
-        assert ready.ready is False
-
     def test_a_plugin_declaring_keyless_is_still_ready(self, world):
         class _Plugin:
             name = "myplugin"

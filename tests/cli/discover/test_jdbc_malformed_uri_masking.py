@@ -4,9 +4,7 @@
 """A JDBC URI that cannot be used never has its password in an error.
 
 ``_parse_uri`` quotes the URI it refuses, and ``_run_from_jdbc_source`` prints
-that text. Over MCP ``forge_from_source`` that is the server's console and log
-(and a mysql URI's error is raised from the gate itself), and
-``fetch_sample_rows`` returns the message to the model. Each message, and each
+that text. ``fetch_sample_rows`` returns the message to the model. Each message, and each
 exception chained to it, has the password masked as a connect error has.
 """
 
@@ -22,7 +20,6 @@ import fluid_build.cli._forge_data_model_jdbc as jdbc_cli
 from fluid_build.cli._forge_data_model_jdbc import _run_from_jdbc_source
 from fluid_build.cli.discover._jdbc_introspect import _parse_uri
 from fluid_build.cli.forge_db_tools import dispatch_db_tool
-from fluid_build.cli.mcp.dispatch import _call_tool
 
 PW = "fakePw7Qx"  # pragma: allowlist secret
 A = "fakePwA7Qx"  # pragma: allowlist secret
@@ -218,23 +215,6 @@ class TestRunFromJdbcSourcePrintsNoPassword:
         assert _run_from_jdbc_source(args, logging.getLogger("fluid.test.jdbc")) != 0
         assert any("could not use postgres://u:***@db/x" in line for line in printed)
         _assert_masked(printed + _all_output(capfd, caplog), [A, B])
-
-
-class TestMcpForgeFromSourceEchoesNoPassword:
-    @pytest.mark.parametrize("kind,uri,pieces", MALFORMED, ids=IDS)
-    def test_mcp_path(self, kind, uri, pieces, printed, no_connect, capfd, caplog, tmp_path):
-        caplog.set_level(logging.DEBUG)
-        out = tmp_path / "contract.fluid.yaml"
-        with pytest.raises(Exception) as caught:
-            _call_tool(
-                "forge_from_source",
-                {"source": kind, "uri": uri, "output_path": str(out)},
-                read_only=False,
-                allow_inline_credentials=True,
-                allow_metadata_service=True,
-            )
-        _assert_masked(_texts_of(caught.value) + printed + _all_output(capfd, caplog), pieces)
-        assert not out.exists()
 
 
 class TestFetchSampleRowsReturnsNoPassword:

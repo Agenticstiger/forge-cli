@@ -652,7 +652,7 @@ def _raise_missing_litellm(args, logger):
 
 
 def test_agent_missing_extra_still_propagates_in_process(tmp_path, capsys, monkeypatch):
-    """An in-process caller (the MCP ``forge_run``) gets the exception, after forge.done.
+    """An in-process caller gets the exception, after forge.done.
 
     The stream says which extra is missing, in forge.error, before forge.done.
     """
@@ -766,8 +766,8 @@ def _agent_env(monkeypatch):
 def test_agent_crash_is_named_by_class_not_text(tmp_path, capsys, monkeypatch, _agent_env):
     """An unexpected exception: its class and a pointer to stderr, never its text.
 
-    The MCP ``forge_run`` hands these events to the IDE's model, and an
-    exception's text can carry paths or provider detail.
+    These events can reach a model, and an exception's text can carry paths
+    or provider detail.
     """
     args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
     events, _ = _run_agent(args, capsys, monkeypatch, ai_result=RuntimeError("/secret/path"))
@@ -826,48 +826,6 @@ def test_agent_seed_failure_is_a_forge_error_without_the_exception_text(
         "kind: DataProduct or DataContract), or a directory of them"
     ]
     assert "exception" not in error
-
-
-def test_mcp_forge_run_logs_the_failure_for_the_server(tmp_path, monkeypatch, caplog, _agent_env):
-    """MCP ``forge_run`` discards forge's console output, so it logs the failure itself.
-
-    Forge marks its own record of a typed failure as shown on the console, and
-    the server's console handler drops it: without this line the server log has
-    nothing on a failed run.
-    """
-    from fluid_build.cli import forge as forge_mod
-    from fluid_build.cli import mcp as mcp_mod
-    from fluid_build.cli.mcp import McpPolicy, _run_forge_inproc
-    from fluid_build.llm.providers import CopilotGenerationError
-
-    def _fail(args, logger):
-        raise CopilotGenerationError("mcp_sampling_failed", "The IDE refused the request.")
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(forge_mod, "run_ai_copilot_mode", _fail)
-    monkeypatch.setattr(
-        mcp_mod,
-        "_policy",
-        lambda: McpPolicy(
-            readable_paths=(tmp_path,),
-            writable_paths=(tmp_path,),
-            writable_namespaces=("history", "audit"),
-        ),
-    )
-    with caplog.at_level(logging.INFO, logger="fluid.mcp.forge_run"):
-        result = _run_forge_inproc("ai", str(tmp_path / "product"), "SDP", None)
-
-    assert result["exit_code"] == 1
-    assert [e["event"] for e in result["events"]][-2:] == ["forge.error", "forge.done"]
-    (logged,) = [
-        r
-        for r in caplog.records
-        if r.name == "fluid.mcp.forge_run" and r.levelno == logging.WARNING
-    ]
-    assert logged.getMessage() == (
-        "forge_run failed: mcp_sampling_failed: 'The IDE refused the request.'"
-    )
-    assert not getattr(logged, "fluid_console_shown", False)
 
 
 def test_agent_error_text_is_redacted(tmp_path, capsys, monkeypatch, _agent_env):

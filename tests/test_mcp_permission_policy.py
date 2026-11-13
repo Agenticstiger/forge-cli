@@ -43,38 +43,36 @@ from fluid_build.cli.mcp import (
 
 class TestToolCapabilityRegistry:
     def test_v1_logical_pipeline_tools_registered(self):
-        """Pin the original 7 logical-pipeline tools as a *subset*.
+        """Pin the original logical-pipeline tools as a *subset*.
 
-        The registry has grown beyond the original 7 (V1.5 added 6
+        The registry has grown beyond the original set (V1.5 added the
         source-catalog tools: list_source_adapters, list_source_tables,
-        inspect_source_table, list_source_lineage, list_source_glossary,
-        forge_from_source). The original set must continue to exist
+        inspect_source_table, list_source_lineage, list_source_glossary).
+        The original set must continue to exist
         — any rename / removal would break the LLM-agentic
         contract Claude Code / Cursor depend on.
         """
-        original_seven = {
+        original_six = {
             "read_logical_model",
             "update_entity",
             "add_relationship",
             "regenerate_physical",
             "validate_contract",
             "diff_models",
-            "search_semantic_memory",
         }
-        assert original_seven.issubset(set(TOOL_CAPABILITIES.keys()))
+        assert original_six.issubset(set(TOOL_CAPABILITIES.keys()))
 
     def test_v15_source_catalog_tools_registered(self):
-        """V1.5 adds six source-catalog tools, all named ``*_source_*``
+        """V1.5 adds five source-catalog tools, all named ``*_source_*``
         to disambiguate from the existing publish-catalog role."""
-        v15_six = {
+        v15_five = {
             "list_source_adapters",
             "list_source_tables",
             "inspect_source_table",
             "list_source_lineage",
             "list_source_glossary",
-            "forge_from_source",
         }
-        assert v15_six.issubset(set(TOOL_CAPABILITIES.keys()))
+        assert v15_five.issubset(set(TOOL_CAPABILITIES.keys()))
 
     def test_read_only_tools_are_nonmutating(self):
         """Every read tool must declare no mutation and no namespace writes
@@ -83,7 +81,6 @@ class TestToolCapabilityRegistry:
             "read_logical_model",
             "validate_contract",
             "diff_models",
-            "search_semantic_memory",
         ):
             cap = TOOL_CAPABILITIES[name]
             assert cap.mutates_files is False
@@ -105,10 +102,6 @@ class TestToolCapabilityRegistry:
         declared so the sandbox check catches both."""
         cap = TOOL_CAPABILITIES["regenerate_physical"]
         assert set(cap.file_path_args) == {"path", "contract_path"}
-
-    def test_search_semantic_memory_declares_read_namespace(self):
-        cap = TOOL_CAPABILITIES["search_semantic_memory"]
-        assert cap.reads_namespaces == ("memory/semantic",)
 
     def test_tool_definitions_derived_from_registry(self):
         """tools/list output must be backed by TOOL_CAPABILITIES so there
@@ -488,7 +481,6 @@ class TestVisibleTools:
         assert "read_logical_model" in names
         assert "validate_contract" in names
         assert "diff_models" in names
-        assert "search_semantic_memory" in names
         # Mutating tools gone:
         assert "update_entity" not in names
         assert "add_relationship" not in names

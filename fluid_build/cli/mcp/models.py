@@ -11,42 +11,13 @@ monolith into focused, testable modules.
 
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field
-
-# NB: the request-scoped sampling ContextVars + their get/set/reset helpers
-# (and the ``mcp.server.fastmcp.Context`` type they were annotated with) moved
-# to the tier-0 leaf ``fluid_build._mcp_sampling_context``; see the re-export
-# below. That is why this module no longer imports ``contextvars`` or the MCP
-# SDK ``Context`` type directly.
 
 COMMAND = "mcp"
 MCP_PROTOCOL_VERSION = "2025-06-18"
-
-# ---------------------------------------------------------------------------
-# Sampling-context bridge — request-scoped via contextvars + anyio token
-#
-# The two ``ContextVar`` objects and their get/set/reset helpers moved to the
-# tier-0 shared leaf ``fluid_build._mcp_sampling_context`` so the LLM provider
-# surface (``fluid_build.llm.providers.MCPSamplingProvider``) can READ them
-# without importing anything under ``cli`` (the ``copilot -> cli`` cycle the
-# ``[tool.importlinter]`` contracts forbid — ``llm`` is imported by ``copilot``).
-# This ``cli.mcp.server`` side, which WRITES them around a copilot-driving tool
-# call, keeps using the same names via this re-export.
-# ---------------------------------------------------------------------------
-
-from fluid_build._mcp_sampling_context import (  # noqa: E402,F401
-    _SAMPLING_CTX,
-    _SAMPLING_TOKEN,
-    _reset_sampling_context,
-    _set_sampling_context,
-    get_sampling_context,
-)
 
 # ---------------------------------------------------------------------------
 # Tool capability model + policy
@@ -125,42 +96,9 @@ _CATALOG_SOURCE_LIST = (
     "datahub",
     "datamesh_manager",
 )
-# JDBC-introspectable databases. The catalog tools (list_source_tables /
-# inspect_source_table / list_source_lineage / list_source_glossary) do NOT
-# accept these — JDBC is a one-shot synthesis path only. ``forge_from_source``
-# is the only tool that dispatches to JDBC (via ``_run_from_jdbc_source``).
-_JDBC_SOURCE_LIST = (
-    "postgres",
-    "postgresql",
-    "mysql",
-    "sqlite",
-)
 _SOURCE_ENUM = list(_CATALOG_SOURCE_LIST)
-_FORGE_FROM_SOURCE_ENUM = list(_CATALOG_SOURCE_LIST + _JDBC_SOURCE_LIST)
 
-# Modeling-technique enum is derived from the pluggable modeling-technique
-# registry (issue #248), EXCLUDING ``custom`` — the bring-your-own-model
-# technique needs a ``--logical-model`` file path the MCP wire can't supply.
-# Built-in data_vault_2 / dimensional / flat + any plugin techniques flow
-# through. Hardcoding the list (e.g. ``["data_vault_2", "dimensional"]``) drops
-# the source-aligned ``flat`` technique and any future plugins.
-from fluid_build.copilot import modeling_techniques as _modeling_techniques
-
-_modeling_techniques.discover_modeling_techniques()
-_TECHNIQUE_ENUM = [
-    name
-    for name in _modeling_techniques.list_modeling_techniques()
-    if not ((_t := _modeling_techniques.get_modeling_technique(name)) and _t.requires_logical_model)
-]
-
-# Closed-enum ``Literal`` aliases for the FastMCP-derived tool signatures
-# (server.py). FastMCP introspects the Python signature and emits the
-# ``Literal`` members verbatim into the published ``inputSchema.enum`` — so the
-# technique enum advertised to MCP clients tracks the registry (incl. ``flat``)
-# rather than a hardcoded subset.
 _CatalogSourceLiteral = Literal[tuple(_SOURCE_ENUM)]  # type: ignore[valid-type]
-_ForgeSourceLiteral = Literal[tuple(_FORGE_FROM_SOURCE_ENUM)]  # type: ignore[valid-type]
-_TechniqueLiteral = Literal[tuple(_TECHNIQUE_ENUM)]  # type: ignore[valid-type]
 
 _CREDENTIALS_DESCRIPTION = (
     "Credential lookup envelope. Pass ONLY the credential_id; "
@@ -260,7 +198,7 @@ _FQN_REQ = {
 # remains as the canonical description-source-of-truth — every
 # description string here is also exposed as a module-level constant
 # reused by the legacy registry, so the two surfaces never drift.
-# ``tests/cli/test_mcp_judge_enrich_tools.py`` pins both.
+# ``tests/cli/test_mcp_advertised_schema.py`` pins both.
 # ---------------------------------------------------------------------
 
 
@@ -315,7 +253,7 @@ class ScopeArg(BaseModel):
 # Per-tool argument descriptions — module-level constants so the legacy
 # ``TOOL_CAPABILITIES[*].input_schema`` registry and the FastMCP-derived
 # ``Annotated[T, Field(description=...)]`` signatures stay symmetric.
-# ``test_mcp_judge_enrich_tools.py::test_curated_registry_matches_signatures``
+# ``test_mcp_advertised_schema.py::test_curated_registry_matches_signatures``
 # pins them.
 # ---------------------------------------------------------------------
 
@@ -335,54 +273,12 @@ _VALIDATE_LOGICAL_PATH_DESCRIPTION = "Optional path to a .model.json sidecar to 
 _VALIDATE_CONTRACT_PATH_DESCRIPTION = "Optional path to a Fluid contract to validate."
 _DIFF_OLD_DESCRIPTION = "Path to the older .model.json sidecar."
 _DIFF_NEW_DESCRIPTION = "Path to the newer .model.json sidecar."
-_SEMANTIC_QUERY_DESCRIPTION = "Free-text query to search past forged models against."
-_SEMANTIC_MODE_DESCRIPTION = "Retrieval mode. 'hybrid' is best when the VectorBackend is enabled."
-_SEMANTIC_LIMIT_DESCRIPTION = "Maximum number of records to return."
 _ADAPTER_DISPATCH_DESCRIPTION = "Catalog adapter to dispatch against."
 _ALLOW_METADATA_SERVICE_DESCRIPTION = (
-    "Catalog sources only. Request the credential resolver's fallback to "
+    "Request the credential resolver's fallback to "
     "cloud-metadata-service auth (instance profile, workload identity, gcloud "
     "ADC). Off by default. Refused with an error unless the server was started "
-    "with --allow-metadata-service (or FLUID_ALLOW_METADATA_SERVICE=1). A JDBC "
-    "source (postgres/postgresql/mysql/sqlite) ignores it: there only the "
-    "server's own opt-in lets a URI use this host's database credentials, files "
-    "or identity."
-)
-_TECHNIQUE_DESCRIPTION = "Modeling technique: Data Vault 2.0 or Dimensional (Kimball)."
-_NAME_DESCRIPTION = "Logical-model name. Defaults to the schema name."
-_ENGINE_FORGE_DESCRIPTION = "Build engine for the emitted Fluid contract."
-_OUTPUT_PATH_DESCRIPTION = (
-    "Destination path for the Fluid contract. Must resolve "
-    "under one of the server's --writable-paths roots."
-)
-_LOGICAL_PATH_OUT_DESCRIPTION = (
-    "Optional explicit path for the .model.json sidecar; " "defaults to <output_path>.model.json."
-)
-_FORGE_FROM_SOURCE_URI_DESCRIPTION = (
-    "JDBC URI for postgres/postgresql/mysql/sqlite sources. "
-    "Carries credentials inline (no credential_id needed). "
-    "Example: postgresql://user:pass@host:5432/db. "  # pragma: allowlist secret
-    "Ignored for catalog sources (snowflake/unity/bigquery/dataplex/glue/datahub/datamesh_manager)."
-)
-_FORGE_RUN_MODE_DESCRIPTION = "Forge run mode (see tool description)."
-_FORGE_RUN_TARGET_DIR_DESCRIPTION = (
-    "Workspace-relative directory for the produced "
-    "contract.fluid.yaml. Must lie under one of the "
-    "server's --writable-paths roots."
-)
-_FORGE_RUN_PRODUCT_TYPE_DESCRIPTION = "Data Mesh product type or medallion layer."
-_FORGE_RUN_PROMPT_DESCRIPTION = (
-    "For mode='diag': the prompt to send to the IDE's LLM. " "Ignored in other modes."
-)
-_FORGE_RUN_FROM_PRODUCTS_DESCRIPTION = (
-    "For mode='ai': upstream product ids or paths to "
-    "compose this product from. Repeatable. Ignored "
-    "in other modes."
-)
-_SCORE_CONTRACT_PATH_DESCRIPTION = "Path to a contract.fluid.yaml file."
-_SCORE_INLINE_DESCRIPTION = "Inline contract dict (alternative to contract_path)."
-_SCORE_INCLUDE_ARTIFACTS_DESCRIPTION = (
-    "If true, run enrichment first and feed artifacts to the judge."
+    "with --allow-metadata-service (or FLUID_ALLOW_METADATA_SERVICE=1)."
 )
 
 
@@ -510,35 +406,6 @@ TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
             "additionalProperties": False,
         },
     ),
-    "search_semantic_memory": ToolCapability(
-        name="search_semantic_memory",
-        description="Search the semantic memory namespace",
-        reads_namespaces=("memory/semantic",),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Free-text query to search past forged models against.",
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["exact", "keyword", "vector", "hybrid"],
-                    "description": "Retrieval mode. 'hybrid' is best when the VectorBackend is enabled.",
-                    "default": "hybrid",
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 50,
-                    "default": 5,
-                    "description": "Maximum number of records to return.",
-                },
-            },
-            "required": ["query"],
-            "additionalProperties": False,
-        },
-    ),
     # ---------------------------------------------------------------
     # V1.5 — metadata source-catalog tools.
     #
@@ -547,9 +414,7 @@ TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
     # role (``providers/catalogs/`` writes to DMM / Splunk / etc.).
     # Every tool here is READ-ONLY against external metadata APIs
     # (Snowflake INFORMATION_SCHEMA, Unity tables.get, …) — no data
-    # values are ever fetched. ``forge_from_source`` is the only
-    # one that mutates files (writes a Fluid contract / sidecar),
-    # so it carries ``mutates_files=True``.
+    # values are ever fetched.
     #
     # MCP-specific defense: every tool's ``arguments`` MUST include
     # ``credentials.credential_id`` — never the credential value.
@@ -665,193 +530,6 @@ TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
                 },
             },
             "required": ["source", "credentials"],
-            "additionalProperties": False,
-        },
-    ),
-    "forge_from_source": ToolCapability(
-        name="forge_from_source",
-        description=(
-            "Forge a logical data-model + Fluid contract from a metadata-source "
-            "catalog scope OR a JDBC-introspectable database. Catalog sources "
-            "(snowflake/unity/bigquery/dataplex/glue/datahub/datamesh_manager) "
-            "read tables / lineage / glossary, run the staged pipeline (Logical "
-            "→ Builder → Readme → Transformation → Validator), and write the "
-            "contract + .model.json sidecar — they require "
-            "credentials.credential_id and a scope. JDBC sources "
-            "(postgres/postgresql/mysql/sqlite) use duckdb-extension "
-            "introspection — they require ``uri`` (URI carries credentials "
-            "inline). Both branches write to output_path which must resolve "
-            "under --writable-paths."
-        ),
-        mutates_files=True,
-        file_path_args=("output_path", "logical_path"),
-        writes_namespaces=("history", "audit"),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "source": {"type": "string", "enum": _FORGE_FROM_SOURCE_ENUM},
-                "credentials": _CREDENTIALS_PROP,
-                "scope": _SCOPE_PROP,
-                "uri": {
-                    "type": "string",
-                    "description": _FORGE_FROM_SOURCE_URI_DESCRIPTION,
-                },
-                "technique": {
-                    "type": "string",
-                    "enum": _TECHNIQUE_ENUM,
-                    "default": "data_vault_2",
-                    "description": _TECHNIQUE_DESCRIPTION,
-                },
-                "name": {
-                    "type": "string",
-                    "description": _NAME_DESCRIPTION,
-                },
-                "engine": {
-                    "type": "string",
-                    "default": "dbt",
-                    "description": _ENGINE_FORGE_DESCRIPTION,
-                },
-                "output_path": {
-                    "type": "string",
-                    "description": _OUTPUT_PATH_DESCRIPTION,
-                },
-                "logical_path": {
-                    "type": "string",
-                    "description": _LOGICAL_PATH_OUT_DESCRIPTION,
-                },
-                "allow_metadata_service": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": _ALLOW_METADATA_SERVICE_DESCRIPTION,
-                },
-            },
-            # Catalog sources need credentials + scope; JDBC sources need
-            # ``uri``. The Python dispatcher (``_call_tool``) does the
-            # source-specific required-field check post-decode. Listing only
-            # ``source`` + ``output_path`` here keeps both shapes valid at
-            # the JSON Schema layer while preserving useful client autocomplete.
-            "required": ["source", "output_path"],
-            "additionalProperties": False,
-        },
-    ),
-    "forge_run": ToolCapability(
-        name="forge_run",
-        description=(
-            "Run `fluid forge` inside the MCP subprocess so LLM calls route "
-            "back through the IDE via `sampling/createMessage`. The IDE pays "
-            "for the LLM — no API key on the user's machine.\n\n"
-            "Modes:\n"
-            "  - 'blank': deterministic scaffold, no LLM (always works).\n"
-            "  - 'diag': single sampling round-trip with the given prompt "
-            "(diagnostic; proves the IDE's LLM is reachable).\n"
-            "  - 'ai': full forge copilot loop with sampling-backed LLM "
-            "(requires client to advertise the 'sampling' capability)."
-        ),
-        mutates_files=True,
-        file_path_args=("target_dir",),
-        writes_namespaces=("history", "audit"),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "mode": {
-                    "type": "string",
-                    "enum": ["blank", "diag", "ai"],
-                    "default": "blank",
-                    "description": "Forge run mode (see tool description).",
-                },
-                "target_dir": {
-                    "type": "string",
-                    "description": (
-                        "Workspace-relative directory for the produced "
-                        "contract.fluid.yaml. Must lie under one of the "
-                        "server's --writable-paths roots."
-                    ),
-                },
-                "data_product_type": {
-                    "type": "string",
-                    "enum": ["SDP", "ADP", "CDP", "Bronze", "Silver", "Gold"],
-                    "description": "Data Mesh product type or medallion layer.",
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": (
-                        "For mode='diag': the prompt to send to the IDE's LLM. "
-                        "Ignored in other modes."
-                    ),
-                },
-                "from_products": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "For mode='ai': upstream product ids or paths to "
-                        "compose this product from. Repeatable. Ignored "
-                        "in other modes."
-                    ),
-                },
-            },
-            "required": ["mode"],
-            "additionalProperties": False,
-        },
-    ),
-    "score_contract_quality": ToolCapability(
-        name="score_contract_quality",
-        description=(
-            "Run the out-of-loop LLM-as-judge on a finalised data-product "
-            "contract and return a 6-axis scorecard (correctness, "
-            "completeness, security, governance, performance, "
-            "documentation; each 0..5; total 0..30). Read-only — does NOT "
-            "modify the contract on disk. Pass either ``contract_path`` "
-            "or ``contract`` (inline dict). Set ``include_artifacts=true`` "
-            "to also run the deterministic enrichment pass first so the "
-            "judge sees recommended dbt tests / freshness / clustering "
-            "and credits those axes accordingly."
-        ),
-        read_path_args=("contract_path",),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "contract_path": {
-                    "type": "string",
-                    "description": "Path to a contract.fluid.yaml file.",
-                },
-                "contract": {
-                    "type": "object",
-                    "description": "Inline contract dict (alternative to contract_path).",
-                    "additionalProperties": True,
-                },
-                "include_artifacts": {
-                    "type": "boolean",
-                    "description": "If true, run enrichment first and feed artifacts to the judge.",
-                    "default": False,
-                },
-            },
-            "additionalProperties": False,
-        },
-    ),
-    "enrich_contract_suggestions": ToolCapability(
-        name="enrich_contract_suggestions",
-        description=(
-            "Run the post-synthesis deterministic enrichment pass over a "
-            "contract and return suggested additions (dbt tests, freshness "
-            "block, physical layout). Read-only — does NOT modify the "
-            "contract on disk. Equivalent to what ``fluid forge`` runs "
-            "automatically after synthesis. Useful for command_center "
-            "previews + 'what would enrichment add?' answers."
-        ),
-        read_path_args=("contract_path",),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "contract_path": {
-                    "type": "string",
-                    "description": "Path to a contract.fluid.yaml file.",
-                },
-                "contract": {
-                    "type": "object",
-                    "description": "Inline contract dict (alternative to contract_path).",
-                    "additionalProperties": True,
-                },
-            },
             "additionalProperties": False,
         },
     ),

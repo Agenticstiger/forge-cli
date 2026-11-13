@@ -1500,38 +1500,6 @@ def test_g18_the_mcp_validate_tool_composes_a_ref_that_stays_inside_its_director
     assert "$ref" not in json.dumps(report)
 
 
-def test_g18_the_mcp_tools_resolve_a_contract_path_to_the_composed_document(fx: Path) -> None:
-    from fluid_build.cli.mcp.dispatch import _resolve_contract_argument
-
-    assert _resolve_contract_argument({"contract_path": str(fx)}) == expected_document(None)
-
-
-def test_g18_score_contract_quality_judges_the_composed_contract(
-    fx: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The judge is stubbed (the real one calls a model): what is checked is the contract it
-    is handed."""
-    from fluid_build.cli.mcp import dispatch
-    from fluid_build.copilot.agents import judge_agent
-
-    seen: List[Dict[str, Any]] = []
-
-    class Result:
-        total, model, critique_applied, axes = 0, "stub", False, {}
-
-    class StubJudge:
-        def judge(self, contract: Dict[str, Any], build_artifacts: Any = None) -> Result:
-            seen.append(contract)
-            return Result()
-
-    monkeypatch.setattr(judge_agent, "JudgeAgent", StubJudge)
-
-    dispatch._call_tool("score_contract_quality", {"contract_path": str(fx)}, read_only=True)
-
-    assert seen == [expected_document(None)]
-    assert not _has_ref_key(seen[0])
-
-
 # ── G-19 / G-28 · a ref that cannot be resolved ────────────────────────────
 
 #: FX-BROKEN: a dangling ref in a fragment of the base, and one in a fragment of the overlay.

@@ -30,7 +30,7 @@ Design (mirrors the existing plugin substrate — this is **not** a new mechanis
   passes ``--llm-provider <x>``), never when iterating for ``--help``.
 * **Precedence: built-ins always win.** A plugin whose name clashes with a
   built-in provider (``openai`` / ``anthropic`` / ``gemini`` / ``ollama`` /
-  ``claude`` / ``github`` / ``mcp-sampling`` / the coding agents) is refused
+  ``claude`` / ``github`` / the coding agents) is refused
   registration with a warning — it can never silently shadow a built-in.
 
 Security note: an entry-point plugin runs arbitrary code in-process at host
@@ -65,9 +65,8 @@ BUILTIN_PROVIDER_CHOICES: Tuple[str, ...] = (
     "claude",
     "gemini",
     "ollama",
-    # Keyless: route the LLM through the IDE (mcp-sampling) or a local
-    # coding-agent CLI instead of forge's own API key.
-    "mcp-sampling",
+    # Keyless: route the LLM through a local coding-agent CLI instead of
+    # forge's own API key.
     "claude-code",
     "codex",
     "cursor",
@@ -83,14 +82,14 @@ def _reserved_builtin_names() -> frozenset:
     """Return every provider name a plugin is forbidden from shadowing.
 
     Derived from the live built-in registry (so a future built-in is covered
-    automatically) plus ``github`` and the ``mcp-sampling`` aliases, which are
-    resolved by dedicated code paths rather than the ``BUILTIN_LLM_PROVIDERS``
+    automatically) plus ``github``, which is
+    resolved by a dedicated code path rather than the ``BUILTIN_LLM_PROVIDERS``
     dict. Reads keys only — never instantiates a provider.
     """
     from fluid_build.llm.providers import BUILTIN_LLM_PROVIDERS
 
     names = {str(k).strip().lower() for k in BUILTIN_LLM_PROVIDERS.keys()}
-    names |= {"github", "mcp-sampling", "mcp_sampling"}
+    names |= {"github"}
     return frozenset(names)
 
 

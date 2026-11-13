@@ -298,27 +298,6 @@ def test_mcp_serve_without_the_sdk_prints_the_install_line_and_exits_1(block, cl
     assert "No module named" not in out and "Unexpected error" not in out
 
 
-def test_mcp_sampling_provider_without_the_sdk_reports_the_missing_context(block, cli):
-    # Outside an MCP tool call there is no sampling context, so the right answer
-    # is the "no context" error. It used to be ``No module named 'mcp'``, because
-    # ``mcp.types`` was imported before the context was checked.
-    block("mcp")
-    rc, out = cli(
-        "forge",
-        "--llm-provider",
-        "mcp-sampling",
-        "--non-interactive",
-        "--yes",
-        "--target-dir",
-        "out",
-        "--domain",
-        "sales",
-    )
-    assert rc == 1
-    assert "MCP sampling context not active" in out
-    assert "No module named" not in out and "Unexpected error" not in out
-
-
 def test_mcp_generation_probe_survives_a_missing_sdk(block):
     block("mcp")
     from fluid_build import _mcp_compat

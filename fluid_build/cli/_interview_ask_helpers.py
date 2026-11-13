@@ -767,8 +767,7 @@ def _ask_data_model_question(
         # V1.5 — user picked the catalog branch. Capture which
         # configured source (when more than one is set up) plus the
         # database/schema scope. The actual forge later runs through
-        # ``run_from_source_command`` (or the MCP forge_from_source
-        # tool) so this prompt is metadata-only.
+        # ``run_from_source_command`` so this prompt is metadata-only.
         chosen_source = configured_sources[0] if configured_sources else None
         if len(configured_sources) > 1:
             sub_match = ask_flexible_choice(

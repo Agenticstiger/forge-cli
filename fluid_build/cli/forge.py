@@ -397,7 +397,7 @@ def register(subparsers: argparse._SubParsersAction):
         "--llm-provider",
         choices=LlmProviderChoices(),
         help=(
-            "LLM provider for copilot. Keyless options: mcp-sampling (in-IDE), "
+            "LLM provider for copilot. Keyless options: "
             "claude-code / codex / cursor / kiro (local agent CLI). Third-party "
             "providers installed via the fluid_build.llm_providers entry point "
             "are also accepted."
@@ -1246,7 +1246,7 @@ def _print_next_steps(console: Any, target_dir: Path, contract_path: Path) -> No
 # object per line (NDJSON, as AGENT_IDE.md promises), so the agent's parser
 # is ``for line in stdout: json.loads(line)``. ``run`` keeps the real stdout
 # for the events and points ``sys.stdout`` at stderr for the rest of the run
-# (``contextlib.redirect_stdout``, as the MCP ``forge_run`` dispatch does), so
+# (``contextlib.redirect_stdout``), so
 # every human-facing writer moves without being touched: Rich consoles built
 # without ``file=`` (Rich looks ``sys.stdout`` up at each write), ``print``,
 # and a provider SDK's banner. Outside ``--agent`` nothing changes.
@@ -1362,7 +1362,7 @@ _PLAN_BY_PRODUCT_TYPE: Dict[str, List[Dict[str, Any]]] = {
             "step": "Add quality[]",
             "description": "Declarative quality rules (uniqueness, freshness, schema)",
             "fields": ["quality[].rule", "quality[].entity"],
-            "mcp_tools": ["search_semantic_memory"],
+            "mcp_tools": [],
         },
     ],
     "ADP": [
@@ -1370,7 +1370,7 @@ _PLAN_BY_PRODUCT_TYPE: Dict[str, List[Dict[str, Any]]] = {
             "step": "Define consumes[]",
             "description": "Upstream SDP/ADP products this aggregate is built from",
             "fields": ["consumes[].productId", "consumes[].version"],
-            "mcp_tools": ["list_source_lineage", "search_semantic_memory"],
+            "mcp_tools": ["list_source_lineage"],
         },
         {
             "step": "Define models[].entities[] for the aggregate",
@@ -1396,7 +1396,7 @@ _PLAN_BY_PRODUCT_TYPE: Dict[str, List[Dict[str, Any]]] = {
             "step": "Define consumes[]",
             "description": "Upstream products feeding this consumer-aligned product",
             "fields": ["consumes[].productId", "consumes[].version"],
-            "mcp_tools": ["list_source_lineage", "search_semantic_memory"],
+            "mcp_tools": ["list_source_lineage"],
         },
         {
             "step": "Define models[].entities[] for the consumer view",
@@ -1513,7 +1513,7 @@ def run(args, logger: logging.Logger) -> int:
             # A missing extra still propagates, as it always has: the CLI entry
             # point says the remedy on stderr under --agent
             # (``cli._render_missing_optional``), and an in-process caller
-            # (the MCP ``forge_run``) gets the exception itself.
+            # gets the exception itself.
             rc = _run_main_noting_failure(args, logger)
             # On success, optionally emit the structured plan checklist BEFORE
             # forge.done so consumers parsing the stream see the plan in order.

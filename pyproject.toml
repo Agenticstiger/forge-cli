@@ -287,7 +287,7 @@ litellm = [
 ]
 
 # MCP server and output-port gateway (``fluid mcp serve``,
-# ``fluid mcp output-port serve``, keyless ``mcp-sampling``). mcp left the base
+# ``fluid mcp output-port serve``). mcp left the base
 # install in 0.28.0; ``[standard]`` also installs it.
 #
 # Official Anthropic-maintained Model Context Protocol Python SDK.
@@ -585,7 +585,7 @@ databricks = "fluid_build.providers.databricks:DatabricksProvider"
 # instance). Discovery is lazy (``cli/_llm_provider_plugins.py``) so ``fluid
 # --help`` never scans it, and governed by FLUID_PLUGINS_ALLOWLIST /
 # FLUID_PLUGINS_BLOCKLIST like every other plugin group. Built-in provider names
-# (openai / anthropic / gemini / ollama / claude / github / mcp-sampling / the
+# (openai / anthropic / gemini / ollama / claude / github / the
 # coding agents) always win — a plugin can never silently shadow a built-in.
 # Built-ins are seeded in code, so this group is declared by THIRD-PARTY
 # packages only (listing the built-ins here would self-shadow).
@@ -1080,7 +1080,7 @@ forbidden_modules = ["fluid_build.cli"]
 # made ``cli/__init__.py`` fragile under collection. The runtime was relocated
 # to the cli-free lower tier ``fluid_build.llm`` (plus the tier-0 leaves
 # ``_console`` / ``_agent_progress`` / ``_agent_voice`` / ``_industry_skills`` /
-# ``_ai_config_shared`` / ``_mcp_sampling_context``); the old ``cli`` module
+# ``_ai_config_shared``); the old ``cli`` module
 # paths remain as ``sys.modules`` object-alias re-export shims so the ~40 cli
 # importers and every ``patch("fluid_build.cli.forge_copilot_llm_providers.*")``
 # test target keep resolving to the same module objects.

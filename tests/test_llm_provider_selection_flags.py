@@ -712,7 +712,7 @@ def test_the_helpers_work_in_a_fresh_interpreter(tmp_path: Path, call: str) -> N
     assert result.returncode == 0, result.stderr[-2000:]
 
 
-@pytest.mark.parametrize("spelling", ["MCP-Sampling", "Mcp_Sampling", "Claude-Code", "claude_code"])
+@pytest.mark.parametrize("spelling", ["Claude-Code", "claude_code"])
 def test_ai_test_knows_an_agent_in_any_spelling(world: _World, spelling: str) -> None:
     world.monkeypatch.setenv("FLUID_LLM_PROVIDER", spelling)
 
@@ -754,12 +754,3 @@ def test_init_still_uses_a_template_when_nothing_is_configured(
     world: _World, tmp_path: Path
 ) -> None:
     assert _init_ai_mode_without_setup(world, tmp_path) == (0, ["customer-360"])
-
-
-def test_ai_test_says_the_ide_answers_mcp_sampling(world: _World) -> None:
-    world.monkeypatch.setenv("FLUID_LLM_PROVIDER", "MCP-Sampling")
-
-    config, error = _ai_test()
-
-    assert config is None
-    assert "does not test mcp-sampling" in error and "IDE" in error and "doctor" not in error

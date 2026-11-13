@@ -3,7 +3,7 @@
 
 """Tests for the pluggable metadata-source registry (issue #247).
 
-``fluid forge data-model from-source`` and the ``forge_from_source`` MCP tool
+``fluid forge data-model from-source`` and the MCP source tools
 used to hardcode their source list in an argparse ``choices`` enum, an MCP
 ``Literal``, and two duplicated dispatch dicts. The
 ``copilot.catalog.source_registry`` makes the source list a registry that

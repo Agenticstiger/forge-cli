@@ -237,7 +237,7 @@ V1_PUBLIC_API: List[Tuple[str, str]] = [
     # adapters; every entry here is documented in the user-facing
     # docs/cli/catalogs/ pages and routed through the public
     # ``fluid forge data-model from-source`` and MCP
-    # ``forge_from_source`` surfaces. Removing or renaming any of
+    # source-tool surfaces. Removing or renaming any of
     # them silently breaks downstream `from x import y` imports.
     ("fluid_build.copilot.catalog", "CatalogAdapter"),
     ("fluid_build.copilot.catalog", "CatalogTable"),

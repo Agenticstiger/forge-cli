@@ -1,15 +1,11 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""A1 — keyless LLM providers must not trip the api-key gate.
+"""Keyless LLM providers must not trip the api-key gate.
 
-``resolve_llm_config`` historically raised ``copilot_missing_llm_api_key``
-for any non-``ollama`` provider that lacked an API key. ``mcp-sampling`` is
-keyless by design — the MCP client (the IDE) pays for the LLM via
-``sampling/createMessage`` and forge never sees a key — so
-``fluid forge --agent --llm-provider mcp-sampling`` must resolve a config
-with ``api_key=None`` instead of raising. Before this fix the in-IDE keyless
-path only "worked" when an API key happened to be present in the environment.
+``resolve_llm_config`` raises ``copilot_missing_llm_api_key`` for any provider
+that needs a key and has none. ``ollama`` is keyless by design and must still
+resolve a config with ``api_key=None``; a keyed provider must still be refused.
 
 The OS keyring is hermetic here (autouse ``_hermetic_keyring`` fixture in
 ``tests/conftest.py``), so an empty ``environ`` genuinely means
@@ -31,20 +27,6 @@ pytestmark = pytest.mark.unit
 def _args(provider=None, model=None):
     """Minimal argparse-like namespace; unset attrs default to None via getattr."""
     return SimpleNamespace(llm_provider=provider, llm_model=model)
-
-
-def test_mcp_sampling_resolves_without_api_key():
-    cfg = resolve_llm_config(_args(provider="mcp-sampling"), environ={})
-    assert cfg.provider == "mcp-sampling"
-    assert cfg.api_key is None
-
-
-def test_mcp_sampling_underscore_alias_resolves_without_api_key():
-    # ``get_llm_provider`` canonicalises the underscore alias to the hyphen
-    # form; the keyless gate must still exempt it.
-    cfg = resolve_llm_config(_args(provider="mcp_sampling"), environ={})
-    assert cfg.provider == "mcp-sampling"
-    assert cfg.api_key is None
 
 
 def test_ollama_remains_keyless():

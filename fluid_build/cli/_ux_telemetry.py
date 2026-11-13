@@ -60,7 +60,6 @@ _KNOWN_PROVIDERS = frozenset(
         "claude",
         "gemini",
         "ollama",
-        "mcp-sampling",
         "claude-code",
         "codex",
         "cursor",

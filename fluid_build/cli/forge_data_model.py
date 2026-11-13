@@ -597,8 +597,7 @@ def run_from_source_command(args: Any, logger: logging.Logger) -> int:
 
     * ``--source <catalog>`` (snowflake, unity, bigquery, dataplex,
       glue, datahub, datamesh_manager) — the credential-resolver-built
-      catalog adapter. Same guarantees as the MCP ``forge_from_source``
-      tool — no credentials ever leak into the audit trail.
+      catalog adapter. No credentials ever leak into the audit trail.
     * ``--source <jdbc>`` (postgres, postgresql, mysql, sqlite) —
       a duckdb-extension-based introspection path. Reads ``--uri``,
       attaches the source via ``INSTALL <ext>; LOAD <ext>; ATTACH``,

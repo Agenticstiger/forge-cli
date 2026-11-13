@@ -5,8 +5,7 @@
 
 Mirrors the structure of ``from_intent.pipeline`` and
 ``from_ddl.pipeline`` so every entry point looks the same to
-downstream callers (the CLI dispatcher, the MCP forge_from_source
-tool, the AI-mode interview branch).
+downstream callers (the CLI dispatcher, the AI-mode interview branch).
 
 Three steps:
 

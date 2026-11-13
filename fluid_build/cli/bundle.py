@@ -250,8 +250,7 @@ def _restores_logging_state(fn):
     every later caller in the same interpreter — including pytest's
     ``caplog``, which captures at the root (the symptom was unrelated tests
     asserting on captured records flaking by run order). One-shot in a real
-    CLI process, but corrupting under test runners, the ``forge_run`` MCP
-    tool, and any library embedding of the CLI. Snapshotting each affected
+    CLI process, but corrupting under test runners and any library embedding of the CLI. Snapshotting each affected
     logger's handlers + ``propagate`` on entry and restoring them on exit
     keeps the redirect scoped to the single call.
     """
