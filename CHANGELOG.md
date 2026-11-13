@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The agent-skills eval harness measures variance, a second agent and false triggers.**
+  `tests/agent_evals/harness.py run --runs N` repeats every scenario and arm, and the report
+  adds pass@N (at least one of N runs passes) and pass^N (all N pass) next to pass@1, the
+  full-pass rate. Two Codex arms (`codex-no-skill`, `codex-skill`, both `codex exec`) measure
+  the skills on a second agent, under the Claude arms' isolation in Codex's own terms: a fresh
+  `CODEX_HOME` and `HOME` per run, the API key stored there instead of in any environment, and
+  a permissions profile that keeps reads and writes in the workspace, with no network. Three
+  negative controls (`should_trigger: false`) catch a FLUID skill that fires on a request it
+  does not cover. Each record's `run_meta` names its agent, the agent's version, and the model
+  and effort it was pinned to; Claude runs pin `claude-sonnet-5-5` at `medium` by default. Test
+  code only: nothing in `fluid_build/` changes.
+
 ## [0.30.1] — 2026-11-13
 
 ### Fixed
