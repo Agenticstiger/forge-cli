@@ -259,8 +259,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between the gates and dispatch was what ran: a digest-verified plan whose action list was
   replaced after the gate wrote the replacement's SQL, with exit 0. The actions now come from
   the verified plan, or from the contract as the gate checked it, and the file is read once.
-  `--config-override` still never reaches simple-mode actions, so it cannot re-plan a bound
-  plan's `replace` either.
 
 ## [0.30.1] — 2026-11-13
 
