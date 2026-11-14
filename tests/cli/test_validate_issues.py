@@ -230,7 +230,7 @@ def test_only_contact_fields_are_read_for_addresses() -> None:
 @pytest.mark.parametrize(
     "value",
     [
-        "postgresql://svc:Hunter2Secret99@db.staging.test:5432/orders",
+        "postgresql://svc:Hunter2Secret99@db.staging.test:5432/orders",  # pragma: allowlist secret
         "redis://:Hunter2Secret99@cache.example.org/0",
         "svc:Hunter2Secret99@db.example.com",
         # the final security check's attack strings: a credential's tail is never an address
@@ -260,7 +260,7 @@ def test_a_starter_value_is_named_by_its_token_never_quoted() -> None:
 
     dsn = (
         "postgresql://svc_reader:"
-        + "Xk9vQ2mLp7RtZs4WbN8cYh3JdF6gUe1AqPw0Lm5n"
+        + "Xk9vQ2mLp7RtZs4WbN8cYh3JdF6gUe1AqPw0Lm5n"  # pragma: allowlist secret
         + "@db.corp.com/starter_table"
     )
     contract = _contract(exposes=[{"binding": {"location": {"dsn": dsn}}}])
@@ -274,7 +274,7 @@ def test_catalog_auth_values_are_never_read() -> None:
     """The repo never quotes a ``catalogAuth`` value (``_UNQUOTED_VALUE_PATHS``)."""
     from fluid_build.cli._authoring_lint import lint_contract
 
-    secret = "TODO starter_table s3cr3t-owner@example.com"
+    secret = "TODO starter_table s3cr3t-owner@example.com"  # pragma: allowlist secret
     contract = _contract(exposes=[{"binding": {"catalogAuth": {"tokenEnv": secret}}}])
 
     assert all("s3cr3t" not in f.message for f in lint_contract(contract))
