@@ -1055,7 +1055,7 @@ _EXPOSE = (
     "  contract:\n    schema:\n    - name: order_id\n      type: string\n"
 )
 _CONTRACT = (
-    "fluidVersion: 0.7.6\nkind: DataProduct\nid: sales.orders_raw\nname: orders_raw\n"
+    "fluidVersion: {FLUID_VERSION}\nkind: DataProduct\nid: sales.orders_raw\nname: orders_raw\n"
     + _OWNER
     + _EXPOSE
 )
@@ -1075,13 +1075,13 @@ _SHOW_SCHEMA = "fluid validate contract.fluid.yaml --offline --show-schema"
 #: A schema error's example is the block its pointer is in, written right (first match
 #: wins); the event's own example when it is in none of them.
 _BLOCK_EXAMPLES: Tuple[Tuple[str, str], ...] = (
-    (r"/exposes/\d+/binding(/|$)", _LOCAL_BINDING),
-    (r"/exposes/\d+/contract/schema(/|$)", _COLUMN),
-    (r"/exposes/\d+/contract/dq(/|$)", _DQ),
-    (r"/exposes(/|$)", _EXPOSE),
-    (r"/builds(/|$)", _BUILD),
-    (r"/metadata(/|$)", _METADATA),
-    (r"(/[^/]+)?$", _CONTRACT),
+    (r"/exposes/\d+/binding(/|\Z)", _LOCAL_BINDING),
+    (r"/exposes/\d+/contract/schema(/|\Z)", _COLUMN),
+    (r"/exposes/\d+/contract/dq(/|\Z)", _DQ),
+    (r"/exposes(/|\Z)", _EXPOSE),
+    (r"/builds(/|\Z)", _BUILD),
+    (r"/metadata(/|\Z)", _METADATA),
+    (r"(/[^/]+)?\Z", _CONTRACT),
 )
 _EXAMPLES: Dict[str, str] = {
     "contract_placeholder_email": _OWNER,
@@ -1144,9 +1144,9 @@ _EXAMPLES: Dict[str, str] = {
     "contract_check_failed": _VERBOSE,
     "contract_finding": "fluid validate contract.fluid.yaml --offline",
     # CLIError events that fluid validate also reports as findings
-    "invalid_schema_version": "fluidVersion: 0.7.6\n",
-    "schema_not_available": "fluidVersion: 0.7.6\n",
-    "contract_version_unsupported": "fluidVersion: 0.7.6\n",
+    "invalid_schema_version": "fluidVersion: {FLUID_VERSION}\n",
+    "schema_not_available": "fluidVersion: {FLUID_VERSION}\n",
+    "contract_version_unsupported": "fluidVersion: {FLUID_VERSION}\n",
     "validation_error": _VERBOSE,
     "optional_dependency_missing": "fluid doctor",
     "contract_file_not_found": "fluid validate contract.fluid.yaml --offline",
@@ -1207,22 +1207,30 @@ def fix_for(event: str) -> str:
     return " ".join(s.rstrip(".") + "." for s in suggestions_for(event))
 
 
+def _with_version(example: str) -> str:
+    """``example`` with the newest stable schema version in it: one typed here goes stale."""
+    if "{FLUID_VERSION}" not in example:
+        return example
+    from fluid_build.schema_manager import FluidSchemaManager  # loaded by validate already
+
+    return example.replace("{FLUID_VERSION}", FluidSchemaManager.latest_bundled_version())
+
+
 def example_for(event: str, pointer: Optional[str] = None) -> Optional[str]:
     """A minimal example of the fix for ``event``: YAML to write, or a command.
 
     For a JSON-Schema finding at ``pointer``, the example of the block it is in (a
     binding, a column, a build, ...): the event alone does not say which block it is.
     """
+    example = _EXAMPLES.get(event)
     if pointer is not None and event.startswith("contract_schema_"):
-        for pattern, example in _BLOCK_EXAMPLES:
-            if re.match(pattern, pointer):
-                return example
-    return _EXAMPLES.get(event)
+        example = next((e for p, e in _BLOCK_EXAMPLES if re.match(p, pointer)), example)
+    return None if example is None else _with_version(example)
 
 
 def block_examples() -> List[str]:
     """The examples a JSON-Schema finding can get by its place (for the catalog tests)."""
-    return [example for _pattern, example in _BLOCK_EXAMPLES]
+    return [_with_version(example) for _pattern, example in _BLOCK_EXAMPLES]
 
 
 def validation_events() -> List[str]:

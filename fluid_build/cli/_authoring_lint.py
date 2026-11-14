@@ -6,7 +6,8 @@
 ``fluid validate`` runs these rules after its other contract rules. Each flags a
 value the schema accepts but no real contract ships:
 
-* ``contract_placeholder_email``: an address at a domain reserved for
+* ``contract_placeholder_email``: a contact address (owner, steward, oncall,
+  support: a key that names a way to reach someone) at a domain reserved for
   documentation (RFC 2606, RFC 6761: example.com, ``.test``, ``.invalid``), at a
   stand-in domain (company.com, yourcompany.com), or with a stand-in mailbox
   (test@, noreply@, owner@). The CLI cannot see the request, so it cannot tell an
@@ -62,11 +63,18 @@ def _finding(event: str, parts: Path, what: str, fix: str) -> LintFinding:
     return LintFinding(event, json_pointer(parts), f"{what} {fix}", fix)
 
 
+#: Blocks whose values the lint never reads or quotes: a ``catalogAuth`` field names an
+#: environment variable, and a secret pasted in its place must not be printed
+#: (``schema_manager._UNQUOTED_VALUE_PATHS``, which ``format_schema_error`` honours).
+_UNREAD_KEYS = frozenset({"catalogAuth"})
+
+
 def _strings(node: Any, parts: Path = ()) -> Iterator[Tuple[Path, str]]:
     """Every string value in ``node``, with the path to it, in document order."""
     if isinstance(node, Mapping):
         for key, value in node.items():
-            yield from _strings(value, (*parts, key))
+            if key not in _UNREAD_KEYS:
+                yield from _strings(value, (*parts, key))
     elif isinstance(node, list):
         for index, value in enumerate(node):
             yield from _strings(value, (*parts, index))
@@ -95,7 +103,15 @@ def _key(parts: Path) -> str:
 
 # ── placeholder email ───────────────────────────────────────────────────────
 
-_EMAIL = re.compile(r"(?<![\w.%+-])([A-Za-z0-9._%+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)")
+#: An address; never one that starts after ``:`` or ``/``, which is a URI's userinfo
+#: (``scheme://user:password@host``), not a mailbox.
+_EMAIL = re.compile(r"(?<![\w.%+:/-])([A-Za-z0-9._%+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)")
+#: A key that holds a way to reach someone: the contact emails this rule is about.
+#: An access grant's principal is not one (the governance check owns principals).
+_CONTACT_KEY = re.compile(
+    r"e-?mail|contact|owner|oncall|on_call|maintainer|steward|author|dpo|support|notif|alert",
+    re.I,
+)
 #: RFC 2606 section 3: second-level names reserved for documentation, with any subdomain.
 _RESERVED_DOMAINS = ("example.com", "example.net", "example.org")
 #: RFC 2606 section 2 and RFC 6761: top-level names no mailbox is ever at.
@@ -180,6 +196,8 @@ def _why_placeholder(local: str, domain: str) -> Optional[str]:
 
 def _placeholder_emails(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
     for parts, value in _strings(contract):
+        if not _CONTACT_KEY.search(_key(parts)) or "://" in value:
+            continue  # not a contact field, or a URI (whose userinfo is no address)
         for match in _EMAIL.finditer(value):
             local, domain = match.group(1), match.group(2)
             if not domain.rsplit(".", 1)[-1].isalpha():

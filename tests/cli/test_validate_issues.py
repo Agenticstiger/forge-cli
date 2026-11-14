@@ -202,14 +202,58 @@ def test_an_address_that_may_be_real_is_not_flagged(run, address: str) -> None:
     assert "issues" not in doc
 
 
-def test_a_placeholder_address_inside_a_text_is_flagged_where_it_is(run) -> None:
-    contract = _contract(description="Questions go to analysts@example.com.")
+def test_a_placeholder_address_inside_a_contact_text_is_flagged_where_it_is(run) -> None:
+    contract = _contract(metadata={"owner": {"oncall": "Page analysts@example.com first."}})
 
     _, doc = _json(run, contract)
 
     [issue] = _issues(doc, "ERR_CONTRACT_PLACEHOLDER_EMAIL")
-    assert issue["pointer"] == "/description"
+    assert issue["pointer"] == "/metadata/owner/oncall"
     assert issue["fix"] == "Replace it with the real address the request gives, or remove it."
+
+
+def test_only_contact_fields_are_read_for_addresses() -> None:
+    """An access grant's principal is the governance check's: not a contact."""
+    from fluid_build.cli._authoring_lint import lint_contract
+
+    contract = _contract(
+        accessPolicy={"grants": [{"principal": "group:analysts@example.com"}]},
+        description="Questions go to analysts@example.com.",
+    )
+
+    assert not [f for f in lint_contract(contract) if f.event == "contract_placeholder_email"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "postgresql://svc:Hunter2Secret99@db.staging.test:5432/orders",
+        "redis://:Hunter2Secret99@cache.example.org/0",
+        "svc:Hunter2Secret99@db.example.com",
+    ],
+)
+def test_a_uris_credentials_are_never_read_as_an_address(value: str) -> None:
+    """``user:password@host`` is a URI's userinfo: echoing the "address" would print the
+    password past the console's URL redaction (security review of this change)."""
+    from fluid_build.cli._authoring_lint import lint_contract
+
+    contract = _contract(metadata={"owner": {"oncall": value}}, support_email=value)
+
+    findings = lint_contract(contract)
+
+    assert not [f for f in findings if f.event == "contract_placeholder_email"]
+    assert all("Hunter2Secret99" not in f.message for f in findings)
+
+
+def test_catalog_auth_values_are_never_read() -> None:
+    """The repo never quotes a ``catalogAuth`` value (``_UNQUOTED_VALUE_PATHS``)."""
+    from fluid_build.cli._authoring_lint import lint_contract
+
+    secret = "TODO starter_table s3cr3t-owner@example.com"
+    contract = _contract(exposes=[{"binding": {"catalogAuth": {"tokenEnv": secret}}}])
+
+    assert all("s3cr3t" not in f.message for f in lint_contract(contract))
+    assert not [f for f in lint_contract(contract) if "catalogAuth" in f.pointer]
 
 
 @pytest.mark.parametrize(

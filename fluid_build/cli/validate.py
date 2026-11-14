@@ -1069,6 +1069,7 @@ def _run_contract_rules(
                 event="contract_check_failed",
                 pointer="",
             )
+            validation_result.is_valid = False
 
         # --- Confluent Tableflow binding checks (RFC-streaming-extension §15) --
         # A confluent-bound Iceberg expose carries hard Tableflow inputs
@@ -1094,6 +1095,7 @@ def _run_contract_rules(
                 event="contract_check_failed",
                 pointer="",
             )
+            validation_result.is_valid = False
 
         # --- Databricks: everything its emitter refuses, from the same pass ---
         from fluid_build.iac.source import contract_source, source_contract_file
@@ -1126,6 +1128,7 @@ def _run_contract_rules(
                 event="contract_check_failed",
                 pointer="",
             )
+            validation_result.is_valid = False
 
         # --- GCP binding checks (anti-no-op gate) ---------------------------
         # The GCP IaC emitter resolves each expose to a BigQuery / GCS /
@@ -1441,6 +1444,7 @@ def _databricks_binding_check(validation_result, contract: Mapping[str, Any]) ->
             event="contract_check_failed",
             pointer="",
         )
+        validation_result.is_valid = False
         return
     _add_findings(
         validation_result,
