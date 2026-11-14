@@ -143,14 +143,19 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     ``tests/perf/test_startup_budget.py`` asserts the two produce an identical
     ``fluid mcp serve`` flag surface so this cold-path copy never drifts.
     """
-    parser = subparsers.add_parser(_COMMAND, help="Serve staged forge tools over MCP stdio")
+    parser = subparsers.add_parser(
+        _COMMAND, help="Serve forge's authoring tools over MCP (stdio or HTTP)"
+    )
     # ``required=False`` so a bare ``fluid mcp`` doesn't blow up with the
     # bare-bones argparse "the following arguments are required: mcp_action"
     # error. ``run`` catches the ``mcp_action is None`` case and renders a
     # Rich-friendly panel describing the ``serve`` action.
     parser.set_defaults(func=run)
     sp = parser.add_subparsers(dest="mcp_action", required=False)
-    serve = sp.add_parser("serve", help="Run the MCP stdio server")
+    serve = sp.add_parser(
+        "serve",
+        help="Run the MCP server (stdio, or --transport http for remote clients)",
+    )
     serve.add_argument(
         "--read-only",
         action="store_true",
@@ -238,14 +243,15 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "for every catalog call, including one that does not ask for it."
         ),
     )
+    from fluid_build.cli import mcp_output_port as _output_port
+
+    _output_port.add_http_transport_arguments(serve, default_port=_output_port.AUTHORING_HTTP_PORT)
     serve.set_defaults(func=run)
     # Attach the consumer-side output-port action group under the same
     # ``fluid mcp`` parent so operators see one MCP surface with two distinct
     # flavours (authoring vs consumption). ``mcp_output_port`` is lightweight
     # (argparse + ``_common``) and stays off the heavy import path.
-    from fluid_build.cli.mcp_output_port import attach_to_mcp_subparsers
-
-    attach_to_mcp_subparsers(sp)
+    _output_port.attach_to_mcp_subparsers(sp)
 
 
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:

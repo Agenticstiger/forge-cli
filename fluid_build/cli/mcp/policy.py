@@ -97,7 +97,7 @@ def _filter_visible_tools(tools: List[Dict[str, Any]], policy: McpPolicy) -> Lis
 
 @dataclass(frozen=True)
 class McpPolicy:
-    """Access-control policy for an MCP stdio server process.
+    """Access-control policy for an MCP server process (stdio or HTTP).
 
     ``allowed_tools = None`` means "all tools allowed"; an empty tuple
     means "no tools allowed" (useful for a pure-inspection server).
@@ -278,8 +278,9 @@ _current_policy: Optional[McpPolicy] = None
 def _set_policy(policy: McpPolicy) -> None:
     """Install the active policy for this connection.
 
-    Tools read the policy via :func:`_policy` to gate access. Single-stdio-
-    connection scope, so module-level is safe.
+    Tools read the policy via :func:`_policy` to gate access. One policy per
+    server process (over HTTP every client gets the operator's policy), so
+    module-level is safe.
     """
     global _current_policy
     _current_policy = policy
