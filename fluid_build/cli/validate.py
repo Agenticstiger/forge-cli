@@ -1336,7 +1336,7 @@ def _composition_check(
                 )
             elif args.verbose:
                 info(logger, msg)
-    except Exception as exc:  # pragma: no cover — defensive
+    except Exception as exc:  # pragma: no cover (defensive)
         if args.verbose:
             info(logger, f"Composition rule check skipped: {exc}")
 
@@ -1360,7 +1360,7 @@ def _authoring_lint_check(
             validation_result.add_warning(
                 finding.message, event=finding.event, pointer=finding.pointer, fix=finding.fix
             )
-    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+    except Exception as exc:  # noqa: BLE001 (reported, never swallowed)
         validation_result.add_warning(
             f"Authoring lint could not run ({type(exc).__name__}: {exc}); the contract "
             "was NOT checked for placeholder emails, template values or placeholders",
