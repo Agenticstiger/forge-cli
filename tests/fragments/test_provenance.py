@@ -66,7 +66,7 @@ HEAD = (
     "domain: analytics\n"
     "metadata:\n"
     "  layer: Silver\n"
-    "  owner: {team: analytics, email: analytics@example.com}\n"
+    "  owner: {team: analytics}\n"
 )
 
 BUILD_ORDERS = (
@@ -386,7 +386,7 @@ def test_h02_json_root_keeps_its_own_errors_unprefixed_and_names_its_fragments(
                 "name": "Orders",
                 "description": "x",
                 "domain": "analytics",
-                "metadata": {"layer": "Silver", "owner": {"team": "t", "email": "t@example.com"}},
+                "metadata": {"layer": "Silver", "owner": {"team": "t"}},
                 "exposes": [inline, {"$ref": "./extra.json"}],
             },
             indent=2,
@@ -670,12 +670,12 @@ def test_h05_overlay_value_over_an_owner_fragment_is_named_after_the_overlay(
         root,
         _indent_item(EXPOSE_ORDERS),
         files={
-            "shared/team.yaml": "team: platform-ops\nemail: ops@example.com\n",
+            "shared/team.yaml": "team: platform-ops\noncall: platform-ops\n",
             "overlays/prod.yaml": "metadata:\n  owner:\n    team: 42  # the bad one\n",
         },
     )
     text = contract.read_text(encoding="utf-8").replace(
-        "  owner: {team: analytics, email: analytics@example.com}\n",
+        "  owner: {team: analytics}\n",
         "  owner: {$ref: ./shared/team.yaml}\n",
     )
     contract.write_text(text, encoding="utf-8")
@@ -816,7 +816,7 @@ def test_h08_text_file_at_an_object_position_is_named_by_its_file_without_a_line
         root, _indent_item(EXPOSE_ORDERS), files={"meta.md": "# Meta\n\nSome text\n"}
     )
     text = contract.read_text(encoding="utf-8").replace(
-        "metadata:\n  layer: Silver\n  owner: {team: analytics, email: analytics@example.com}\n",
+        "metadata:\n  layer: Silver\n  owner: {team: analytics}\n",
         "metadata: {$ref: ./meta.md}\n",
     )
     contract.write_text(text, encoding="utf-8")
@@ -897,7 +897,8 @@ def test_h10_build_fragment_with_query_for_sql_names_the_key_and_the_object(
 def test_h11_json_output_carries_the_prefix_inside_the_error_strings(
     tmp_path: Path, capsys: pytest.CaptureFixture
 ) -> None:
-    """SPEC GAP SG-26, characterised: no new field; ``valid`` and ``schema_version`` as before."""
+    """SPEC GAP SG-26, characterised: no file or line field, the prefix stays inside the
+    error strings; ``issues`` (code, pointer, fix) is the one key an error adds."""
     root = tmp_path / "p"
     contract = _product(
         root,
@@ -920,7 +921,15 @@ def test_h11_json_output_carries_the_prefix_inside_the_error_strings(
         )
     ]
     assert doc["warnings"] == []
-    assert set(doc) == {"valid", "schema_version", "errors", "warnings", "validation_time"}
+    assert list(doc) == [
+        "valid",
+        "schema_version",
+        "errors",
+        "warnings",
+        "issues",
+        "validation_time",
+    ]
+    assert [i["message"] for i in doc["issues"]] == doc["errors"]
 
 
 # ── H-12: every failure class names the ref, the file and the pointer ───
@@ -1703,7 +1712,7 @@ PARITY_ROOT = (
 )
 
 PARITY_FILES = {
-    "shared/team.yaml": "team: platform-ops\nemail: ops@example.com\n",
+    "shared/team.yaml": "team: platform-ops\noncall: platform-ops\n",
     "shared/params.yaml": "retries: 3\nmode: base\n",
     "ext/acme.yaml": "owner: acme\nnested:\n  a: 1\n",
     "docs/usage.md": "# Usage\n\nS5-USAGE: join on `id`.\n",

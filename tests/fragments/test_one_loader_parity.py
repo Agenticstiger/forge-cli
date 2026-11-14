@@ -45,12 +45,15 @@ _CHECKOUT = Path(__file__).resolve().parents[2]
 # ── the sentinels ───────────────────────────────────────────────────────
 
 S1_PATH, DEV_PATH = "runtime/out/S1-prod.csv", "runtime/out/dev.csv"
-S2_SQL, DEV_SQL = "-- S2-PROD\nSELECT 1 AS id\n", "-- S2-DEV\nSELECT 1 AS id\n"
+S2_SQL, DEV_SQL = (
+    "-- S2-PROD\nSELECT CAST(1 AS INTEGER) AS id\n",
+    "-- S2-DEV\nSELECT CAST(1 AS INTEGER) AS id\n",
+)
 S3_MODE, DEV_MODE = "S3-prod", "dev"
 S4_TEXT = "P-TEXT"
 S5_USAGE = "# Usage\n\nS5-USAGE: join on `id`.\n"
 
-TEAM = {"team": "platform-ops", "email": "ops@example.com"}
+TEAM = {"team": "platform-ops"}
 PARAMS = {"batch_size": 100, "retries": 3}
 ACME = {"region": "eu", "tier": "gold"}
 SCHEMA = [
@@ -1799,7 +1802,7 @@ def _workspace(root: Path, *, team: Dict[str, Any]) -> Path:
 def test_g24_validate_with_no_argument_composes_every_product_as_the_explicit_form_does(
     tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ws = _workspace(tmp_path, team={"team": "commerce-data", "email": "c@example.com"})
+    ws = _workspace(tmp_path, team={"team": "commerce-data"})
 
     rc, text = run_in(ws, ["validate"], capsys, monkeypatch)
     explicit = [
@@ -1914,7 +1917,7 @@ def test_g26_product_add_dq_lands_beside_the_ref_and_merges_into_the_fragments_e
 _TEMPLATED_SQL = (
     "{{ config(materialized='table') }}\n"
     "-- db: {{ env.G27_DATABASE }}\n"
-    "SELECT 1 AS id, '{{ env.G27_DATABASE }}' AS db\n"
+    "SELECT CAST(1 AS INTEGER) AS id, '{{ env.G27_DATABASE }}' AS db\n"
 )
 
 

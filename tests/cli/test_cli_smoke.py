@@ -44,7 +44,7 @@ MINIMAL_CONTRACT_071 = {
     "domain": "testing",
     "metadata": {
         "layer": "Bronze",
-        "owner": {"team": "qa", "email": "qa@example.com"},
+        "owner": {"team": "qa"},
     },
     "consumes": [],
     "builds": [
@@ -52,7 +52,7 @@ MINIMAL_CONTRACT_071 = {
             "id": "noop_build",
             "pattern": "embedded-logic",
             "engine": "sql",
-            "properties": {"sql": "SELECT 1 AS id"},
+            "properties": {"sql": "SELECT CAST(1 AS INTEGER) AS id"},
         }
     ],
     "exposes": [
@@ -432,7 +432,7 @@ class TestLoaderIntegration:
     def test_overlay_merges_correctly(self, tmp_path, _clean_env):
         """Overlay values should override base values in the loaded contract."""
         base = dict(MINIMAL_CONTRACT_071)
-        base["metadata"] = {"layer": "Bronze", "owner": {"team": "qa", "email": "qa@example.com"}}
+        base["metadata"] = {"layer": "Bronze", "owner": {"team": "qa"}}
         contract_file = _write_contract(tmp_path, base)
 
         overlays_dir = tmp_path / "overlays"

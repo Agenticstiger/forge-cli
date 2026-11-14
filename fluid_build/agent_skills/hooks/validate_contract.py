@@ -6,7 +6,10 @@
 Claude Code runs this after every Edit or Write and hands it the tool call as JSON on
 stdin; it does not put the file path into the command line. A file that is not a
 contract is ignored. A contract that fails ``fluid validate`` exits 2, which Claude Code
-shows to the agent; a valid contract exits 0 and prints nothing. A contract it could not
+shows to the agent, with each finding's code, JSON pointer and fix. A valid contract
+exits 0: silently when it is clean, and with its warnings as ``additionalContext`` when
+it has some (a placeholder email, a starter-template value), so the agent sees what
+``--strict`` would fail on without being blocked on it. A contract it could not
 validate (no ``fluid`` found, or ``fluid validate`` ran out of time) exits 2 as well:
 exit 1 would show only in the transcript, and the agent would take an unchecked contract
 for a checked one.
@@ -91,7 +94,7 @@ def find_fluid() -> Optional[str]:
 def validate_command(path: str) -> Optional[List[str]]:
     """``fluid validate`` for ``path``, or ``None`` when no ``fluid`` is found."""
     fluid = find_fluid()
-    return None if fluid is None else [fluid, "validate", path, "--offline"]
+    return None if fluid is None else [fluid, "validate", path, "--offline", "--format", "json"]
 
 
 def _clip(text: str) -> str:
@@ -101,7 +104,43 @@ def _clip(text: str) -> str:
     return "\n".join(lines)
 
 
-def main(stdin: TextIO = sys.stdin, stderr: TextIO = sys.stderr) -> int:
+def _report(stdout: str) -> Optional[dict]:
+    """The JSON document ``fluid validate --format json`` printed, or ``None``."""
+    start = stdout.find("{")
+    try:
+        document = json.loads(stdout[start:]) if start >= 0 else None
+    except ValueError:
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def _issue_lines(issue: dict) -> List[str]:
+    """``- <code> at <pointer>: <message>``, then its fix unless the message ends with it."""
+    message, fix = str(issue.get("message", "")), str(issue.get("fix") or "")
+    where = issue.get("pointer") or "(the whole contract)"
+    lines = [f"- {issue.get('code')} at {where}: {message}"]
+    return lines + [f"  Fix: {fix}"] if fix and fix not in message else lines
+
+
+def findings(report: dict, severities: tuple) -> List[str]:
+    """The lines for the findings of ``severities``: code, pointer, message and fix.
+
+    A ``fluid`` older than its ``issues`` list gives the messages alone.
+    """
+    issues = report.get("issues")
+    if not isinstance(issues, list):
+        keys = {"error": "errors", "warning": "warnings"}
+        return [f"- {m}" for s in severities if s in keys for m in report.get(keys[s]) or []]
+    lines: List[str] = []
+    for issue in issues:
+        if isinstance(issue, dict) and issue.get("severity") in severities:
+            lines.extend(_issue_lines(issue))
+    return lines
+
+
+def main(
+    stdin: TextIO = sys.stdin, stderr: TextIO = sys.stderr, stdout: TextIO = sys.stdout
+) -> int:
     try:
         payload = json.load(stdin)
     except ValueError:
@@ -130,10 +169,30 @@ def main(stdin: TextIO = sys.stdin, stderr: TextIO = sys.stderr) -> int:
             file=stderr,
         )
         return 2
+    report = _report(proc.stdout)
     if proc.returncode == 0:
+        warnings = findings(report, ("warning",)) if report else []
+        if warnings:
+            context = (
+                f"fluid validate passed for {shown}, with warnings that fail --strict:\n"
+                f"{_clip(chr(10).join(warnings))}\n"
+                "Fix each one with what the request gives; never invent a value to "
+                "silence a warning."
+            )
+            json.dump(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PostToolUse",
+                        "additionalContext": context,
+                    }
+                },
+                stdout,
+            )
         return 0
+    errors = findings(report, ("error", "warning")) if report else []
+    shown_output = "\n".join(errors) if errors else proc.stdout + proc.stderr
     print(
-        f"fluid validate failed for {shown}:\n{_clip(proc.stdout + proc.stderr)}\n"
+        f"fluid validate failed for {shown}:\n{_clip(shown_output)}\n"
         f"Fix these errors, then run: fluid validate {shown} --offline",
         file=stderr,
     )

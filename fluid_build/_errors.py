@@ -74,6 +74,8 @@ _DOC_ROUTES = {
     "iceberg-catalog-move": "cli/apply.html#iceberg-catalog-move-guard",
     # the command's own Errors section
     "policy-compile#errors": "cli/policy-compile.html#errors",
+    # the command whose findings carry these codes (``fluid validate``'s issues[])
+    "validate": "cli/validate.html",
 }
 _DOC_FALLBACK = "advanced/production-troubleshooting.html"
 

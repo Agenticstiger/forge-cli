@@ -155,7 +155,7 @@ def _base_doc(**over: Any) -> Dict[str, Any]:
         "domain": "commerce",
         "metadata": {
             "layer": "Bronze",
-            "owner": {"team": "commerce-data", "email": "commerce@example.com"},
+            "owner": {"team": "commerce-data"},
         },
     }
     doc.update(over)
@@ -1011,8 +1011,8 @@ def test_f15_a_json_overlay_that_refs_a_yaml_fragment_and_back(tmp_path: Path) -
 
 # ── F-16 · per-environment SQL ─────────────────────────────────────────────
 
-_SQL_DEV = "-- S2-DEV\nSELECT 1 AS id\n"
-_SQL_PROD = "-- S2-PROD\nSELECT 1 AS id\n"
+_SQL_DEV = "-- S2-DEV\nSELECT CAST(1 AS INTEGER) AS id\n"
+_SQL_PROD = "-- S2-PROD\nSELECT CAST(1 AS INTEGER) AS id\n"
 
 
 def _sql_product(root: Path) -> Path:

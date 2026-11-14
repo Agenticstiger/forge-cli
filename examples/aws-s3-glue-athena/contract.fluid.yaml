@@ -20,7 +20,6 @@ metadata:
   layer: Silver
   owner:
     team: web-analytics
-    email: web-analytics@example.com
 
 # ─── Access Policy (enforced on AWS by the binding's Lake Formation grants) ─
 
