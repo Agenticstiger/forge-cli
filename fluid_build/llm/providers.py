@@ -1691,8 +1691,8 @@ def call_llm_streaming(
 # extracted to ``cli/_llm_provider_resolve.py``. Re-exported here
 # under the same names so existing call sites and test patches keep
 # resolving.
-# Import these from here, not from ``provider_resolve``: that module binds this
-# one's names when it loads, so importing it first is a circular import.
+# ``provider_resolve`` binds this module's names at the end of its own load, so
+# either module can be imported first.
 from fluid_build.llm.provider_resolve import (  # noqa: E402,F401
     _LLM_KEYRING_PREFIX,
     _canonical_provider_name,

@@ -21,13 +21,6 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-# ``_init`` indirection — these helpers reference ``RICH_AVAILABLE``
-# (and a few other module toggles) on the original ``cli.init``
-# namespace. Tests routinely
-# ``patch("fluid_build.cli.init.RICH_AVAILABLE", False)`` to exercise
-# the no-rich code path; resolving via attribute access at call time
-# means those patches still flow through after the physical extraction.
-from fluid_build.cli import init as _init  # noqa: E402
 from fluid_build.cli._logging import info, warn
 from fluid_build.cli.console import cprint, success
 
@@ -36,6 +29,11 @@ def _rich_available() -> bool:
     """Read ``RICH_AVAILABLE`` from the canonical ``cli.init`` module
     so test patches on ``fluid_build.cli.init.RICH_AVAILABLE`` flow
     through to the moved DAG helpers."""
+    # Imported here, at call time: ``cli.init`` re-exports this module's
+    # helpers when it loads, so a module-level import made
+    # ``import fluid_build.cli._init_dag_helpers`` fail when run first.
+    from fluid_build.cli import init as _init
+
     return getattr(_init, "RICH_AVAILABLE", False)
 
 

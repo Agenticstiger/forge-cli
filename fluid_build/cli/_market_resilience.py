@@ -38,9 +38,6 @@ def _bind_from_host() -> None:
             g[name] = getattr(host, name)
 
 
-_bind_from_host()
-
-
 class CircuitBreaker:
     """Circuit breaker pattern for handling service failures"""
 
@@ -310,6 +307,13 @@ class BaseCatalogConnector:
             filtered_products.append(product)
 
         return filtered_products[: filters.limit]
+
+
+# Bound after this module's own definitions: ``market`` imports
+# ``BaseCatalogConnector`` and friends from here when it loads, so binding first made
+# ``import fluid_build.cli._market_resilience`` fail when run first (circular
+# import). The bound names are only read at call time.
+_bind_from_host()
 
 
 # Imports the observability extraction left at this position; restored

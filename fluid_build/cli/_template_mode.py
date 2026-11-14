@@ -35,11 +35,6 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from fluid_build._console import literal_error_text
 
 # ── Project ──
-# ``_fm`` indirection: ``forge_modes`` re-imports the symbols defined
-# here at module top, AND keeps the ``_populate_richer_receipt`` helper
-# that this module references via ``_fm.<name>`` so test patches that
-# target ``fluid_build.cli.forge_modes.<name>`` resolve at call time.
-from fluid_build.cli import forge_modes as _fm  # noqa: E402
 from fluid_build.cli._forge_mode_errors import log_forge_failure
 from fluid_build.cli.console import cprint, success
 from fluid_build.cli.console import error as console_error
@@ -1558,3 +1553,13 @@ def _maybe_apply_enrichment(
         return patched
 
     return patched if ans in ("y", "yes") else contract
+
+
+# ``_fm`` indirection: ``forge_modes`` re-imports the symbols defined here,
+# AND keeps the ``_populate_richer_receipt`` helper that this module
+# references via ``_fm.<name>`` so test patches that target
+# ``fluid_build.cli.forge_modes.<name>`` resolve at call time. Imported last,
+# not first: importing ``forge_modes`` before this module's names exist made
+# ``import fluid_build.cli._template_mode`` fail when run first (circular
+# import).
+from fluid_build.cli import forge_modes as _fm  # noqa: E402

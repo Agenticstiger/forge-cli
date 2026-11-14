@@ -17,14 +17,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
-from fluid_build.cli import viz_graph as _viz
 from fluid_build.cli._common import CLIError
 from fluid_build.cli._logging import error, info, warn
-from fluid_build.cli.viz_graph import (
-    GraphConfig,
-    GraphMetrics,
-    ProductionLogger,
-)
 
 # Reference module-level helpers via the ``_viz`` alias rather than
 # importing them directly. Tests routinely
@@ -198,3 +192,15 @@ def _write_output(
             "error", "Output write failed", error=str(e), output_path=config.output_path
         )
         raise CLIError(1, "output_write_failed", {"error": str(e), "path": config.output_path})
+
+
+# Imported last, not first: ``viz_graph`` re-exports this module's writers
+# when it loads, so importing it before they exist made
+# ``import fluid_build.cli.viz_renderers.output`` fail when run first
+# (circular import). ``_viz`` and the names below are only read at call time.
+from fluid_build.cli import viz_graph as _viz  # noqa: E402
+from fluid_build.cli.viz_graph import (  # noqa: E402
+    GraphConfig,
+    GraphMetrics,
+    ProductionLogger,
+)
