@@ -29,7 +29,11 @@ import it, and the catalog is imported when issues are built, not before.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+#: RFC 6901: ``("exposes", 0, "contract")`` is ``/exposes/0/contract``; ``()`` is ``""``.
+#: The formatter ``contract_refs`` already uses (standard library only).
+from fluid_build.util.ref_confinement import format_pointer as json_pointer
 
 #: The keys of an ``issues[]`` entry, in the order they are written.
 ISSUE_KEYS = ("severity", "code", "pointer", "message", "fix", "example", "docs_url")
@@ -51,13 +55,6 @@ _NAMED_ITEM = re.compile(
 )
 #: The keys a list item of a contract is named by, in the order they are tried.
 _ITEM_KEYS = ("exposeId", "id", "name", "productId", "ref")
-
-
-def json_pointer(parts: Iterable[Any]) -> str:
-    """RFC 6901: ``("exposes", 0, "contract")`` is ``/exposes/0/contract``; ``()`` is ``""``."""
-    from fluid_build.util.ref_confinement import format_pointer
-
-    return format_pointer(list(parts))
 
 
 def _index(items: Sequence[Any], token: str) -> Optional[int]:
