@@ -358,7 +358,7 @@ description:
 domain: ops
 metadata:
   layer: Silver
-  owner: {{team: platform-ops, email: ops@example.com}}
+  owner: {{team: platform-ops}}
 builds:
   - id: transform
     pattern: embedded-logic
@@ -584,7 +584,7 @@ description: Order events published to Kafka.
 domain: commerce
 metadata:
   layer: Bronze
-  owner: {team: commerce-data, email: commerce@example.com}
+  owner: {team: commerce-data}
 exposes:
   - exposeId: orders_events
     kind: topic

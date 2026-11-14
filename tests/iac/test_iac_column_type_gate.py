@@ -209,7 +209,7 @@ def _contract(platform, columns, binding=None):
         "name": "Types demo",
         "description": "column type gate",
         "domain": "demo",
-        "metadata": {"layer": "Silver", "owner": {"team": "data", "email": "data@example.com"}},
+        "metadata": {"layer": "Silver", "owner": {"team": "data"}},
         "exposes": [
             {
                 "exposeId": "orders",
