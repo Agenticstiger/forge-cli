@@ -20,15 +20,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
-from fluid_build.cli.viz_graph import (
-    THEMES,
-    GraphConfig,
-    GraphMetrics,
-    _escape_label,
-    _get_theme_value,
-    _safe_id,
-)
-
 
 def _create_html_wrapper(svg_content: str, config: GraphConfig, metrics: GraphMetrics) -> str:
     """Create an enhanced HTML wrapper for SVG content."""
@@ -175,3 +166,14 @@ def _create_html_wrapper(svg_content: str, config: GraphConfig, metrics: GraphMe
 
 
 # --------------------------- Enhanced CLI Registration & Runner --------------------------- #
+
+
+# Imported last, not first: ``viz_graph`` re-exports this module's renderers
+# when it loads, so importing it before they exist made
+# ``import fluid_build.cli.viz_renderers.html`` fail when run first (circular
+# import). The names below are only read at call time.
+from fluid_build.cli.viz_graph import (  # noqa: E402
+    GraphConfig,
+    GraphMetrics,
+    _get_theme_value,
+)

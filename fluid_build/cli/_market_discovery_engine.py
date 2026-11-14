@@ -99,9 +99,6 @@ def _bind_from_host() -> None:
             g[name] = getattr(host, name)
 
 
-_bind_from_host()
-
-
 class MarketDiscoveryEngine:
     """
     Unified data product discovery engine that searches across
@@ -423,6 +420,13 @@ class MarketDiscoveryEngine:
 # ==========================================
 # Output Formatters
 # ==========================================
+
+
+# Bound after this module's own definitions: ``market`` imports
+# ``MarketDiscoveryEngine`` from here when it loads, so binding first made
+# ``import fluid_build.cli._market_discovery_engine`` fail when run first (circular
+# import). The bound names are only read at call time.
+_bind_from_host()
 
 
 # Render helpers — physically extracted to ``cli/_market_render.py``

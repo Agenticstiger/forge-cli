@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -294,16 +295,36 @@ class AuthProvider:
 # Snowflake / Databricks) were physically extracted into the
 # ``_auth_provider_impls`` sibling module so ~1,400 LOC of
 # credential-resolution + service-detection logic lives in a
-# dedicated file. Re-imported here at module top so existing test
-# patches that target ``fluid_build.cli.auth.<ProviderClass>``
-# still resolve via the namespace.
-from fluid_build.cli._auth_provider_impls import (  # noqa: E402,F401
-    AWSAuthProvider,
-    AzureAuthProvider,
-    DatabricksAuthProvider,
-    GoogleCloudAuthProvider,
-    SnowflakeAuthProvider,
+# dedicated file. They stay reachable as
+# ``fluid_build.cli.auth.<ProviderClass>`` (imports and test patches),
+# resolved on first attribute access (PEP 562) rather than imported
+# here: those classes subclass ``AuthProvider`` from this module, so an
+# eager import at this point made ``import
+# fluid_build.cli._auth_provider_impls`` (or ``_auth_provider_azure``)
+# fail when run first (circular import). Code in this module reaches
+# them through the module (``_self.<ProviderClass>``), because a bare
+# global name never consults ``__getattr__``.
+_PROVIDER_CLASSES = frozenset(
+    {
+        "AWSAuthProvider",
+        "AzureAuthProvider",
+        "DatabricksAuthProvider",
+        "GoogleCloudAuthProvider",
+        "SnowflakeAuthProvider",
+    }
 )
+
+
+def __getattr__(name: str) -> Any:
+    if name in _PROVIDER_CLASSES:
+        from fluid_build.cli import _auth_provider_impls
+
+        return getattr(_auth_provider_impls, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> List[str]:
+    return sorted(set(globals()) | _PROVIDER_CLASSES)
 
 
 class AuthManager:
@@ -318,16 +339,21 @@ class AuthManager:
 
     def _initialize_providers(self):
         """Initialize available authentication providers"""
+        # Through the module, not bare names: the classes resolve lazily
+        # (see ``__getattr__`` above), and a patched
+        # ``fluid_build.cli.auth.<ProviderClass>`` still takes effect here.
+        _self = sys.modules[__name__]
+
         provider_classes = {
-            "google_cloud": GoogleCloudAuthProvider,
-            "gcp": GoogleCloudAuthProvider,  # Alias
-            "google": GoogleCloudAuthProvider,  # Alias
-            "aws": AWSAuthProvider,
-            "amazon": AWSAuthProvider,  # Alias
-            "azure": AzureAuthProvider,
-            "microsoft": AzureAuthProvider,  # Alias
-            "snowflake": SnowflakeAuthProvider,
-            "databricks": DatabricksAuthProvider,
+            "google_cloud": _self.GoogleCloudAuthProvider,
+            "gcp": _self.GoogleCloudAuthProvider,  # Alias
+            "google": _self.GoogleCloudAuthProvider,  # Alias
+            "aws": _self.AWSAuthProvider,
+            "amazon": _self.AWSAuthProvider,  # Alias
+            "azure": _self.AzureAuthProvider,
+            "microsoft": _self.AzureAuthProvider,  # Alias
+            "snowflake": _self.SnowflakeAuthProvider,
+            "databricks": _self.DatabricksAuthProvider,
         }
 
         for provider_name, provider_class in provider_classes.items():

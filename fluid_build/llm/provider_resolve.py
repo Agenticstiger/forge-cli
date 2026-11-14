@@ -62,9 +62,6 @@ def _bind_constants_from_host() -> None:
             g[name] = getattr(host, name)
 
 
-_bind_constants_from_host()
-
-
 # Each built-in provider and the explicit variables that name it. Exactly one
 # provider named this way selects it; several select none, and
 # :func:`no_provider_message` says so.
@@ -515,3 +512,10 @@ def _get_api_key_from_keyring(provider: str) -> Optional[str]:
     except Exception:  # noqa: BLE001
         _log_keyring_failure("read")
         return None
+
+
+# Bound after this module's own definitions: ``fluid_build.llm.providers``
+# imports names from here when it loads, so binding first made
+# ``import fluid_build.llm.provider_resolve`` fail when run first (circular
+# import). The bound names are only read at call time.
+_bind_constants_from_host()

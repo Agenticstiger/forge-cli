@@ -17,7 +17,6 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from fluid_build.cli import init as _init
 from fluid_build.cli._logging import error, info
 from fluid_build.cli.artifact_envelope import dump_json_with_envelope
 from fluid_build.cli.artifact_paths import workspace_init_receipt_path
@@ -652,3 +651,10 @@ def _bridge_init_template_to_forge(
         get_target_directory_fn=lambda _a, _default: project_dir,
     )
     return rc == 0
+
+
+# Imported last, not first: ``cli.init`` re-exports this module's handlers
+# when it loads, so importing it before they exist made
+# ``import fluid_build.cli._init_modes`` fail when run first (circular
+# import). Every ``_init.X`` reference runs at call time, after this line.
+from fluid_build.cli import init as _init  # noqa: E402

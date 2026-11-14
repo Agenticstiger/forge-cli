@@ -47,9 +47,6 @@ def _bind_classes_from_host() -> None:
             g[name] = getattr(host, name)
 
 
-_bind_classes_from_host()
-
-
 class AdvancedSearchEngine:
     """Advanced search engine with ranking, faceting, and suggestions"""
 
@@ -309,6 +306,12 @@ class AdvancedSearchEngine:
 
 # Global advanced search engine instance
 advanced_search_engine = AdvancedSearchEngine(logging.getLogger(__name__))
+
+# Bound after this module's own definitions: ``market`` imports
+# ``AdvancedSearchEngine`` and its instance from here when it loads, so binding first made
+# ``import fluid_build.cli._market_search_engine`` fail when run first (circular
+# import). The bound names are only read at call time.
+_bind_classes_from_host()
 
 # ==========================================
 # Resilience and Error Handling

@@ -657,7 +657,11 @@ adapter resolver chain.
 Top files >1500 LOC are being extracted to natural seams using the
 **module-attribute-access indirection pattern** (`_module = original;
 ... _module._fn(...)`) so test patches on the original module flow
-through to the extracted helper. Reductions this session:
+through to the extracted helper. Import the original module at the end of the helper, or inside the
+function that uses it, never at the helper's top: the original re-exports
+the helper's names, so a top import makes `import <helper>` fail when it
+runs first. `tests/test_import_cycles.py` imports every module first, each
+in a fresh interpreter. Reductions this session:
 
 * `cli/market.py` — 2614 → 2493 (-121 LOC) via `cli/_market_render.py`
   (format_table_output + format_detailed_output + format_json_output).
