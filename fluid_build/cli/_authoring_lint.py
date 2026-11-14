@@ -305,6 +305,8 @@ _MARKER = re.compile(r"\b(TODO|FIXME|TBD)\b")
 _FILL_IN = re.compile(r"\b(change[_-]?me|replace[_-]?me|fill[_-]?me[_-]?in|lorem ipsum)\b", re.I)
 #: ``<your-team>``, ``<domain>.<name>``; not ``array<string>`` (a type), ``<=`` or ``</b>``.
 _ANGLE = re.compile(r"(?<![\w<])<([A-Za-z][A-Za-z0-9 _.:-]{0,60})>")
+#: A markdown code span, which may run across a folded line.
+_CODE_SPAN = re.compile(r"`[^`]*`")
 #: HTML a description may carry, which is markup, not a stand-in.
 _HTML_TAGS = frozenset(
     {"a", "b", "br", "code", "em", "hr", "i", "li", "ol", "p", "pre", "small", "span"}
@@ -323,7 +325,8 @@ def _placeholder(value: str, parts: Path) -> Optional[str]:
         return marker.group(0)
     if _key(parts) in _CODE_KEYS:
         return None
-    for match in _ANGLE.finditer(value):
+    # In a `code span` a <...> is a command's metavariable (`fluid <verb> --env x`), not a gap.
+    for match in _ANGLE.finditer(_CODE_SPAN.sub(" ", value)):
         if match.group(1).strip().lower() not in _HTML_TAGS:
             return match.group(0)
     return None

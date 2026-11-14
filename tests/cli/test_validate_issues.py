@@ -376,6 +376,15 @@ def test_operators_types_markup_and_lower_case_words_are_not_placeholders(run) -
     assert code == 0, doc.get("issues")
 
 
+def test_a_metavariable_in_a_code_span_is_not_a_placeholder() -> None:
+    """From the demo env: a description that shows a command, `fluid <verb> --env x`."""
+    from fluid_build.cli._authoring_lint import lint_contract
+
+    contract = _contract(description="Each overlay applies via `fluid <verb>\n --env aws`.")
+
+    assert not [f for f in lint_contract(contract) if f.event == "contract_placeholder_value"]
+
+
 def test_an_sdp_build_that_joins_is_a_warning(run) -> None:
     sql = "SELECT o.*, c.name FROM orders o JOIN customers c ON o.customer_id = c.id"
     _, doc = _json(run, _contract(builds=[{"properties": {"sql": sql}}]))
