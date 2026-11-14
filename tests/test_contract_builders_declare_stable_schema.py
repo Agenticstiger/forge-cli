@@ -41,12 +41,6 @@ def pinned(monkeypatch: pytest.MonkeyPatch) -> str:
     return PINNED
 
 
-def test_the_streaming_preview(pinned: str) -> None:
-    from fluid_build.cli._streaming_contract_preview import shape_contract_from_context
-
-    assert shape_contract_from_context({})["fluidVersion"] == pinned
-
-
 def test_a_product_type_answer_and_the_contract_it_shapes(pinned: str) -> None:
     from fluid_build.forge.product_types import ProductTypeAnswer, shape_contract
 
@@ -115,7 +109,6 @@ ALLOWED = {
 #: keep a version in a constant either, which the forms below cannot see.
 BUILDERS = (
     "cli/_forge_data_model_jdbc.py",
-    "cli/_streaming_contract_preview.py",
     "cli/discover/emitter.py",
     "cli/import_workflow/airbyte.py",
     "cli/import_workflow/dbt.py",

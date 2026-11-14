@@ -550,6 +550,8 @@ def _init_ai_mode(
         mock.patch("fluid_build.cli.ai_setup.run_ai_setup_inline", _setup),
         mock.patch("fluid_build.cli.ai_setup.set_session_env", lambda provider, key: None),
         mock.patch("fluid_build.cli.forge.run_ai_copilot_mode", _copilot),
+        # Someone at the keyboard: without one, init scaffolds the template instead.
+        mock.patch("fluid_build.cli.forge_ai._interactive", lambda args: True),
     ):
         init_mod._ai_mode(Namespace(name="demo-product", yes=True), logging.getLogger("test"))
     return seen.get("args"), setup_calls
@@ -582,35 +584,6 @@ def test_init_counts_a_named_provider_as_ai_configured(world: _World) -> None:
     world.monkeypatch.setenv("FLUID_LLM_PROVIDER", "anthropic")
 
     assert _is_ai_configured() is True
-
-
-def test_the_interview_panel_names_the_run_s_provider(
-    world: _World, tmp_path: Path, deterministic_welcome_scan: None
-) -> None:
-    # The scan reads the saved choice; the run was named anthropic.
-    from fluid_build.cli._world_class_interview import collect_signals
-
-    world.monkeypatch.setattr("fluid_build.cli._welcome_scan.Path.home", lambda: tmp_path / "home")
-    world.saved = {"provider": "openai", "model": "gpt-saved-test"}
-
-    assert collect_signals(target_dir=tmp_path).ai_provider == "openai"
-    sig = collect_signals(target_dir=tmp_path, ai_provider="anthropic")
-
-    assert (sig.ai_configured, sig.ai_provider) == (True, "anthropic")
-
-
-def test_the_welcome_panel_names_the_run_s_provider(world: _World) -> None:
-    from fluid_build.cli._welcome_scan import WelcomeFindings
-    from fluid_build.cli.forge_modes import _with_run_provider
-
-    def _saved_openai() -> WelcomeFindings:
-        return WelcomeFindings(ai_configured=True, ai_provider_hint="openai")
-
-    named = _with_run_provider(_saved_openai(), Namespace(llm_provider="anthropic"))
-    unnamed = _with_run_provider(_saved_openai(), Namespace(llm_provider=None))
-
-    assert named.ai_provider_hint == "anthropic"
-    assert unnamed.ai_provider_hint == "openai"
 
 
 # ── 4. fluid ai test honours the provider the run names ─────────────────────
@@ -712,7 +685,7 @@ def test_the_helpers_work_in_a_fresh_interpreter(tmp_path: Path, call: str) -> N
     assert result.returncode == 0, result.stderr[-2000:]
 
 
-@pytest.mark.parametrize("spelling", ["MCP-Sampling", "Mcp_Sampling", "Claude-Code", "claude_code"])
+@pytest.mark.parametrize("spelling", ["Claude-Code", "claude_code"])
 def test_ai_test_knows_an_agent_in_any_spelling(world: _World, spelling: str) -> None:
     world.monkeypatch.setenv("FLUID_LLM_PROVIDER", spelling)
 
@@ -754,12 +727,3 @@ def test_init_still_uses_a_template_when_nothing_is_configured(
     world: _World, tmp_path: Path
 ) -> None:
     assert _init_ai_mode_without_setup(world, tmp_path) == (0, ["customer-360"])
-
-
-def test_ai_test_says_the_ide_answers_mcp_sampling(world: _World) -> None:
-    world.monkeypatch.setenv("FLUID_LLM_PROVIDER", "MCP-Sampling")
-
-    config, error = _ai_test()
-
-    assert config is None
-    assert "does not test mcp-sampling" in error and "IDE" in error and "doctor" not in error

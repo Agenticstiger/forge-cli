@@ -132,6 +132,9 @@ class CostSnapshot:
     unknown_models: List[str] = field(default_factory=list)
     cumulative_usd: Optional[float] = None
     """Cumulative USD across the whole process (vs ``total_usd`` for this run)."""
+    mode: Optional[str] = None
+    """``llm`` for an AI-mode run. ``fluid stats --by mode`` reads it; a receipt without it
+    is classed by its token count, which a coding-agent hand-off does not report."""
 
     @classmethod
     def empty(cls) -> "CostSnapshot":

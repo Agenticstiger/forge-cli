@@ -238,10 +238,9 @@ def _resolve_cloud_api_key(
 def _untested_agent_message(named: Optional[str]) -> Optional[str]:
     """Why ``fluid ai test`` does not test *named*, when it is an agent; else ``None``.
 
-    Forge hands an agent's calls to its CLI, or to the IDE for ``mcp-sampling``,
-    so there is no API call to test. Any spelling forge accepts counts
-    (``MCP-Sampling``, ``claude_code``): the registry does not list
-    ``mcp-sampling``, so the name is normalized here.
+    Forge hands an agent's calls to its CLI, so there is no API call to test.
+    Any spelling forge accepts counts (``Claude_Code``): the registry does not
+    list the agents, so the name is normalized here.
     """
     # From ``providers``, never ``provider_resolve`` first (a circular import).
     from fluid_build.llm.providers import _NON_LITELLM_PROVIDERS, _canonical_provider_name
@@ -249,11 +248,6 @@ def _untested_agent_message(named: Optional[str]) -> Optional[str]:
     agent = (_canonical_provider_name(named) or "").lower().replace("_", "-")
     if agent not in _NON_LITELLM_PROVIDERS:
         return None
-    if agent == "mcp-sampling":
-        return (
-            "fluid ai test does not test mcp-sampling: the IDE that runs forge's MCP "
-            "server answers those calls with its own model."
-        )
     return (
         f"fluid ai test does not test {agent}: forge hands its calls to that agent's "
         "CLI, which signs in by itself. 'fluid doctor' checks that the CLI is installed."

@@ -190,12 +190,8 @@ V1_PUBLIC_API: List[Tuple[str, str]] = [
     ("fluid_build.copilot.store.backends.null", "NullBackend"),
     ("fluid_build.copilot.store.backends.file", "FileBackend"),
     ("fluid_build.copilot.store.backends.sqlite", "SqliteBackend"),
-    ("fluid_build.copilot.store.backends.postgres", "PostgresBackend"),
-    ("fluid_build.copilot.store.backends.vector", "VectorBackend"),
     ("fluid_build.copilot.store.factory", "resolve_store"),
     ("fluid_build.copilot.store.keys", "generate_cache_key"),
-    ("fluid_build.copilot.store.semantic_writer", "auto_semantic_write_enabled"),
-    ("fluid_build.copilot.store.semantic_writer", "write_semantic_record"),
     # ---- Industry packs ---------------------------------------------
     ("fluid_build.copilot.industry", "IndustryPack"),
     ("fluid_build.copilot.industry", "IndustryPackCompiler"),
@@ -237,7 +233,7 @@ V1_PUBLIC_API: List[Tuple[str, str]] = [
     # adapters; every entry here is documented in the user-facing
     # docs/cli/catalogs/ pages and routed through the public
     # ``fluid forge data-model from-source`` and MCP
-    # ``forge_from_source`` surfaces. Removing or renaming any of
+    # source-tool surfaces. Removing or renaming any of
     # them silently breaks downstream `from x import y` imports.
     ("fluid_build.copilot.catalog", "CatalogAdapter"),
     ("fluid_build.copilot.catalog", "CatalogTable"),

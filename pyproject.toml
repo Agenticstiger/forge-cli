@@ -235,16 +235,8 @@ copilot = [
 ]
 
 
-# Optional embedding-backed semantic search for the memory/semantic namespace.
-# When this extra is installed AND the backing store is a SqliteBackend,
-# ``VectorBackend`` upgrades from stdlib ``difflib`` ranking to a real
-# vector index (via ``sqlite-vec``). Without the extra it silently
-# falls back to the stdlib path — no crash, no import error.
-vector = [
-  "sqlite-vec>=0.1",
-]
 
-# Postgres-backed staged memory store.
+# Postgres driver for the MCP output port (``fluid mcp output-port serve``).
 postgres = [
   "psycopg[binary]>=3.1",
 ]
@@ -287,7 +279,7 @@ litellm = [
 ]
 
 # MCP server and output-port gateway (``fluid mcp serve``,
-# ``fluid mcp output-port serve``, keyless ``mcp-sampling``). mcp left the base
+# ``fluid mcp output-port serve``). mcp left the base
 # install in 0.28.0; ``[standard]`` also installs it.
 #
 # Official Anthropic-maintained Model Context Protocol Python SDK.
@@ -542,7 +534,7 @@ test-emulators-heavy = [
 
 # One-shot install for contributors
 all = [
-  "data-product-forge[local,aws,gcp,snowflake,viz,odps,tui,copilot,vector,postgres,docs,litellm,mcp,lineage,dev]"
+  "data-product-forge[local,aws,gcp,snowflake,viz,odps,tui,copilot,postgres,docs,litellm,mcp,lineage,dev]"
 ]
 
 [project.scripts]
@@ -586,7 +578,7 @@ databricks = "fluid_build.providers.databricks:DatabricksProvider"
 # instance). Discovery is lazy (``cli/_llm_provider_plugins.py``) so ``fluid
 # --help`` never scans it, and governed by FLUID_PLUGINS_ALLOWLIST /
 # FLUID_PLUGINS_BLOCKLIST like every other plugin group. Built-in provider names
-# (openai / anthropic / gemini / ollama / claude / github / mcp-sampling / the
+# (openai / anthropic / gemini / ollama / claude / github / the
 # coding agents) always win — a plugin can never silently shadow a built-in.
 # Built-ins are seeded in code, so this group is declared by THIRD-PARTY
 # packages only (listing the built-ins here would self-shadow).
@@ -792,7 +784,6 @@ google-cloud-dataplex = "google"
 snowflake-connector-python = "snowflake"
 databricks-sdk = "databricks"
 acryl-datahub = "datahub"
-sqlite-vec = "sqlite_vec"
 data-product-forge-sdk = ["fluid_sdk", "fluid_provider_sdk"]
 
 [tool.deptry.per_rule_ignores]
@@ -904,7 +895,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short --strict-markers --disable-warnings -m 'not live_llm and not live_judge and not agent_eval'"
+addopts = "-v --tb=short --strict-markers --disable-warnings -m 'not live_llm and not agent_eval'"
 # Backstop: bound any single test at 10 min (pytest-timeout, thread
 # method). If a test ever DEADLOCKS in isolation it then FAILS FAST with
 # a thread-stack dump of exactly where it's stuck, instead of silently
@@ -928,7 +919,6 @@ markers = [
     "policy: Tests for policy validators",
     "runtime: Tests for runtime generators",
     "live_llm: Tests that call a real LLM (cost ~$0.0001/run; require an API key in env)",
-    "live_judge: Opt-in tests that call the real JudgeAgent against an LLM (cost ~$0.001/run; require an API key in env)",
     "agent_eval: Opt-in eval of coding agents authoring FLUID contracts with and without the agent skills (runs claude -p on your subscription, and codex exec with an API key when asked; set FLUID_AGENT_EVAL=1)",
     "redteam: Deterministic adversarial tests for the agentic layer (zero-token, no LLM)",
     "emulated: Stage-1 keyless integration tests backed by in-process emulators (moto, fakesnow); run on every PR via ci.yml",
@@ -1081,7 +1071,7 @@ forbidden_modules = ["fluid_build.cli"]
 # made ``cli/__init__.py`` fragile under collection. The runtime was relocated
 # to the cli-free lower tier ``fluid_build.llm`` (plus the tier-0 leaves
 # ``_console`` / ``_agent_progress`` / ``_agent_voice`` / ``_industry_skills`` /
-# ``_ai_config_shared`` / ``_mcp_sampling_context``); the old ``cli`` module
+# ``_ai_config_shared``); the old ``cli`` module
 # paths remain as ``sys.modules`` object-alias re-export shims so the ~40 cli
 # importers and every ``patch("fluid_build.cli.forge_copilot_llm_providers.*")``
 # test target keep resolving to the same module objects.

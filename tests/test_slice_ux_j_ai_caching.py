@@ -1,7 +1,7 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""Slice UX-J: regression tests for model routing, precompiled skills, and discovery cache."""
+"""Slice UX-J: regression tests for model routing and precompiled skills."""
 
 from __future__ import annotations
 
@@ -13,16 +13,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from fluid_build.cli.artifact_discovery_cache import (
-    compute_file_tree_hash,
-    discovery_cache_enabled,
-    load_discovery_cache,
-    write_discovery_cache,
-)
-from fluid_build.cli.artifact_paths import (
-    workspace_discovery_cache_path,
-    workspace_skills_compiled_path,
-)
+from fluid_build.cli.artifact_paths import workspace_skills_compiled_path
 from fluid_build.cli.forge_copilot_llm_providers import (
     LlmConfig,
     _default_routing_model,
@@ -220,99 +211,3 @@ class TestCompiledSkillsMemoryCache:
         assert loaded["industry"] == "Test Industry"
         assert loaded["canonical_model"] == "Test Model"
         assert "tools" not in loaded
-
-
-# ---------------------------------------------------------------------------
-# J.3 — Discovery cache on disk
-# ---------------------------------------------------------------------------
-
-
-class TestDiscoveryDiskCache:
-    def test_hash_is_stable_for_same_files(self, tmp_path: Path):
-        f1 = tmp_path / "a.txt"
-        f2 = tmp_path / "b.txt"
-        f1.write_text("hello")
-        f2.write_text("world")
-        h1 = compute_file_tree_hash([f1, f2])
-        h2 = compute_file_tree_hash([f1, f2])
-        assert h1 == h2
-
-    def test_hash_changes_when_file_modified(self, tmp_path: Path):
-        f1 = tmp_path / "a.txt"
-        f1.write_text("v1")
-        h1 = compute_file_tree_hash([f1])
-        f1.write_text("v2")
-        h2 = compute_file_tree_hash([f1])
-        assert h1 != h2
-
-    def test_hash_changes_when_file_added(self, tmp_path: Path):
-        f1 = tmp_path / "a.txt"
-        f1.write_text("hello")
-        h1 = compute_file_tree_hash([f1])
-        f2 = tmp_path / "b.txt"
-        f2.write_text("world")
-        h2 = compute_file_tree_hash([f1, f2])
-        assert h1 != h2
-
-    def test_hash_order_independent(self, tmp_path: Path):
-        f1 = tmp_path / "a.txt"
-        f2 = tmp_path / "b.txt"
-        f1.write_text("hello")
-        f2.write_text("world")
-        h_forward = compute_file_tree_hash([f1, f2])
-        h_reverse = compute_file_tree_hash([f2, f1])
-        assert h_forward == h_reverse
-
-    def test_write_and_load_cache_round_trip(self, tmp_path: Path):
-        from fluid_build.cli.forge_copilot_discovery import DiscoveryReport
-
-        ws = tmp_path / "ws"
-        ws.mkdir()
-        (ws / ".fluid").mkdir()
-
-        report = DiscoveryReport(
-            workspace_roots=[str(ws)],
-            files_scanned=42,
-            detected_sources=[{"path": "test.csv"}],
-            provider_hints=["local"],
-        )
-        tree_hash = "abc123"
-        write_discovery_cache(ws, report, tree_hash)
-
-        cache_path = workspace_discovery_cache_path(ws)
-        assert cache_path.is_file()
-
-        loaded = load_discovery_cache(ws, tree_hash)
-        assert loaded is not None
-        assert loaded["files_scanned"] == 42
-        assert loaded["provider_hints"] == ["local"]
-
-    def test_load_returns_none_on_hash_mismatch(self, tmp_path: Path):
-        from fluid_build.cli.forge_copilot_discovery import DiscoveryReport
-
-        ws = tmp_path / "ws"
-        ws.mkdir()
-        (ws / ".fluid").mkdir()
-
-        report = DiscoveryReport(workspace_roots=[str(ws)])
-        write_discovery_cache(ws, report, "hash_v1")
-
-        assert load_discovery_cache(ws, "hash_v2") is None
-
-    def test_load_returns_none_when_no_file(self, tmp_path: Path):
-        assert load_discovery_cache(tmp_path, "any") is None
-
-    def test_load_tolerates_corrupt_json(self, tmp_path: Path):
-        ws = tmp_path / "ws"
-        (ws / ".fluid").mkdir(parents=True)
-        cache_path = workspace_discovery_cache_path(ws)
-        cache_path.write_text("not valid json {{{")
-        assert load_discovery_cache(ws, "any") is None
-
-    def test_discovery_cache_enabled_env_switch(self, monkeypatch):
-        monkeypatch.delenv("FLUID_DISCOVERY_CACHE", raising=False)
-        assert discovery_cache_enabled() is True
-        monkeypatch.setenv("FLUID_DISCOVERY_CACHE", "0")
-        assert discovery_cache_enabled() is False
-        monkeypatch.setenv("FLUID_DISCOVERY_CACHE", "1")
-        assert discovery_cache_enabled() is True

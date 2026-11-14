@@ -4,7 +4,7 @@
 """
 MCP stdio server for staged forge model operations.
 
-The server exposes fourteen tools over MCP stdio and applies a four-layer
+The server exposes 11 tools over MCP stdio and applies a four-layer
 access-control model before every ``tools/call``:
 
 1. **Tool allow/deny list** — only the tools explicitly permitted by
@@ -67,13 +67,8 @@ if TYPE_CHECKING:  # pragma: no cover — type-checkers only; never at runtime
         _SOURCE_ADAPTERS,
         _build_source_adapter,
         _call_tool,
-        _dispatch_enrich_contract_suggestions,
-        _dispatch_forge_from_jdbc_source,
-        _dispatch_score_contract_quality,
         _import_adapter_class,
         _list_source_adapters,
-        _resolve_contract_argument,
-        _run_forge_inproc,
         _scope_from_args,
         write_audit_event,
     )
@@ -84,9 +79,6 @@ if TYPE_CHECKING:  # pragma: no cover — type-checkers only; never at runtime
         TOOL_CAPABILITIES,
         CredentialsArg,
         ScopeArg,
-        _reset_sampling_context,
-        _set_sampling_context,
-        get_sampling_context,
     )
     from fluid_build.cli.mcp.policy import (  # noqa: F401
         McpPolicy,
@@ -104,9 +96,6 @@ if TYPE_CHECKING:  # pragma: no cover — type-checkers only; never at runtime
         _mcp_app,
         add_relationship,
         diff_models,
-        enrich_contract_suggestions,
-        forge_from_source,
-        forge_run,
         inspect_source_table,
         list_source_adapters,
         list_source_glossary,
@@ -114,8 +103,6 @@ if TYPE_CHECKING:  # pragma: no cover — type-checkers only; never at runtime
         list_source_tables,
         read_logical_model,
         regenerate_physical,
-        score_contract_quality,
-        search_semantic_memory,
         update_entity,
         validate_contract,
     )
@@ -221,8 +208,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "--allow-metadata-service: one with no non-blank key, secret or token "
             "of its own as a value, a path to a file on this host (a key file, "
             "gcloud ADC), a named AWS profile, or an endpoint this host's netrc "
-            "or DataHub settings would sign in to. "
-            "forge_from_source also needs this flag for a JDBC URI that carries a password."
+            "or DataHub settings would sign in to."
         ),
     )
     serve.add_argument(
@@ -234,9 +220,6 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "or through an inline credential block that authenticates as this host "
             "(a named AWS profile, a key file on this host, a netrc login, an Azure CLI or "
             "browser login, or Google ADC included). "
-            "forge_from_source also needs this flag for a JDBC URI that would use this "
-            "host's database credentials, files or identity; there the client's "
-            "allow_metadata_service plays no part. "
             "OFF by default: it uses this host's ambient cloud identity, so a request is "
             "refused unless the operator opts in. FLUID_ALLOW_METADATA_SERVICE=1 in the "
             "server's environment opts in too, and goes further: it turns the fallback on "
@@ -278,13 +261,8 @@ _LAZY_EXPORTS = {
     "_SOURCE_ADAPTERS": "dispatch",
     "_build_source_adapter": "dispatch",
     "_call_tool": "dispatch",
-    "_dispatch_enrich_contract_suggestions": "dispatch",
-    "_dispatch_forge_from_jdbc_source": "dispatch",
-    "_dispatch_score_contract_quality": "dispatch",
     "_import_adapter_class": "dispatch",
     "_list_source_adapters": "dispatch",
-    "_resolve_contract_argument": "dispatch",
-    "_run_forge_inproc": "dispatch",
     "_scope_from_args": "dispatch",
     "write_audit_event": "dispatch",
     # models
@@ -294,9 +272,6 @@ _LAZY_EXPORTS = {
     "TOOL_CAPABILITIES": "models",
     "CredentialsArg": "models",
     "ScopeArg": "models",
-    "get_sampling_context": "models",
-    "_reset_sampling_context": "models",
-    "_set_sampling_context": "models",
     # policy
     "McpPolicy": "policy",
     "check_tool_permission": "policy",
@@ -318,16 +293,11 @@ _LAZY_EXPORTS = {
     "regenerate_physical": "server",
     "validate_contract": "server",
     "diff_models": "server",
-    "search_semantic_memory": "server",
     "list_source_adapters": "server",
     "list_source_tables": "server",
     "inspect_source_table": "server",
     "list_source_lineage": "server",
     "list_source_glossary": "server",
-    "forge_from_source": "server",
-    "forge_run": "server",
-    "score_contract_quality": "server",
-    "enrich_contract_suggestions": "server",
 }
 
 
@@ -364,9 +334,6 @@ __all__ = [
     "TOOL_CAPABILITIES",
     "CredentialsArg",
     "ScopeArg",
-    "get_sampling_context",
-    "_reset_sampling_context",
-    "_set_sampling_context",
     # Policy
     "McpPolicy",
     "check_tool_permission",
@@ -386,27 +353,17 @@ __all__ = [
     "regenerate_physical",
     "validate_contract",
     "diff_models",
-    "search_semantic_memory",
     "list_source_adapters",
     "list_source_tables",
     "inspect_source_table",
     "list_source_lineage",
     "list_source_glossary",
-    "forge_from_source",
-    "forge_run",
-    "score_contract_quality",
-    "enrich_contract_suggestions",
     # Dispatch
     "_call_tool",
-    "_dispatch_score_contract_quality",
-    "_dispatch_enrich_contract_suggestions",
-    "_dispatch_forge_from_jdbc_source",
     "_list_source_adapters",
     "_SOURCE_ADAPTERS",
     "_import_adapter_class",
     "_scope_from_args",
-    "_resolve_contract_argument",
-    "_run_forge_inproc",
     "_build_source_adapter",
     "write_audit_event",
 ]

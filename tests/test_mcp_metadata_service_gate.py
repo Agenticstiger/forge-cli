@@ -37,7 +37,6 @@ _CATALOG_TOOLS = (
     "inspect_source_table",
     "list_source_lineage",
     "list_source_glossary",
-    "forge_from_source",
 )
 
 
@@ -147,25 +146,6 @@ class TestCallToolGate:
             )
         assert captured_resolvers[0].allow_metadata_service is True
 
-    def test_jdbc_forge_from_source_refuses_too(self, tmp_path):
-        """JDBC sources never use the resolver, and the JDBC path ignores the
-        argument: asking for the fallback does not let a client-named sqlite
-        path through, which the operator's opt-in alone decides (see
-        test_mcp_jdbc_source_gate.TestClientMetadataArgumentIsIgnored)."""
-        db = tmp_path / "source.db"
-        with pytest.raises(RuntimeError, match="--allow-metadata-service"):
-            _call_tool(
-                "forge_from_source",
-                {
-                    "source": "sqlite",
-                    "uri": f"sqlite:///{db}",
-                    "output_path": str(tmp_path / "out.fluid.yaml"),
-                    "allow_metadata_service": True,
-                },
-                read_only=False,
-            )
-        assert not db.exists()
-
 
 class TestServerWiring:
     def test_serve_flag_parses_into_policy(self):
@@ -201,33 +181,6 @@ class TestServerWiring:
         assert "equivalent" not in flag.help
         assert "FLUID_ALLOW_METADATA_SERVICE=1" in flag.help
         assert "does not ask for it" in flag.help
-
-    @pytest.mark.parametrize("module", ["fluid_build.cli.mcp", "fluid_build.cli.mcp.cli"])
-    @pytest.mark.parametrize(
-        ("option", "what"),
-        [
-            ("--allow-inline-credentials", "a JDBC URI that carries a password"),
-            (
-                "--allow-metadata-service",
-                "a JDBC URI that would use this host's database credentials, files or identity",
-            ),
-        ],
-    )
-    def test_serve_help_says_the_flag_also_governs_jdbc_uris(self, module, option, what):
-        """docs/MCP.md item 7: forge_from_source with a postgres, mysql or sqlite
-        source is gated by these two flags too (``_gate_jdbc_source``), and the
-        client's own allow_metadata_service plays no part there."""
-        register = importlib.import_module(module).register
-        parser = argparse.ArgumentParser()
-        register(parser.add_subparsers(dest="cmd"))
-        for name in ("mcp", "serve"):
-            sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
-            parser = sub.choices[name]
-        flag = next(a for a in parser._actions if option in a.option_strings)
-        text = " ".join(flag.help.split())
-        assert f"forge_from_source also needs this flag for {what}" in text
-        if option == "--allow-metadata-service":
-            assert "there the client's allow_metadata_service plays no part" in text
 
     def test_env_var_turns_it_on_for_a_call_that_does_not_ask(
         self, captured_resolvers, monkeypatch
@@ -288,18 +241,6 @@ class TestSchemaIsHonest:
 
         prop = asyncio.run(_go())["properties"]["allow_metadata_service"]
         assert "--allow-metadata-service" in prop["description"]
-
-    @pytest.mark.parametrize("tool", _CATALOG_TOOLS)
-    def test_schema_says_a_jdbc_source_ignores_it(self, tool):
-        """forge_from_source's JDBC branch never reads the argument; only the
-        operator's opt-in opens a JDBC host-identity URI (pinned in
-        test_mcp_jdbc_source_gate.TestClientMetadataArgumentIsIgnored)."""
-        from fluid_build.cli.mcp import TOOL_CAPABILITIES
-
-        prop = TOOL_CAPABILITIES[tool].input_schema["properties"]["allow_metadata_service"]
-        text = prop["description"]
-        assert "catalog sources only" in text.lower()
-        assert "A JDBC source" in text and "ignores it" in text
 
 
 @pytest.fixture

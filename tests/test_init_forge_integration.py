@@ -339,7 +339,7 @@ class TestForgeBlank:
 class TestForgeCopilotNonInteractive:
     """Scenario 13: fluid forge --non-interactive"""
 
-    @patch("fluid_build.cli.forge._run_copilot", return_value=1)
+    @patch("fluid_build.cli.forge.run_ai_copilot_mode", return_value=1)
     def test_non_interactive_copilot_handles_no_llm(self, mock_copilot, logger):
         """Scenario 13: --non-interactive with no LLM exits gracefully."""
         from fluid_build.cli.forge import run
@@ -372,38 +372,6 @@ class TestForgeHelp:
         assert result == 0
 
 
-class TestForgeMemory:
-    """Scenarios 15-16: fluid forge --show-memory / --reset-memory"""
-
-    @patch("fluid_build.cli.forge.handle_memory_management", return_value=0)
-    def test_forge_show_memory(self, mock_memory, logger):
-        """Scenario 15: --show-memory delegates to memory management."""
-        from fluid_build.cli.forge import run
-
-        args = _make_forge_args(show_memory=True)
-
-        with patch("fluid_build.cli.forge.Console") as mock_cls:
-            mock_cls.return_value = MagicMock()
-            result = run(args, logger)
-
-        assert result == 0
-        mock_memory.assert_called_once()
-
-    @patch("fluid_build.cli.forge.handle_memory_management", return_value=0)
-    def test_forge_reset_memory(self, mock_memory, logger):
-        """Scenario 16: --reset-memory delegates to memory management."""
-        from fluid_build.cli.forge import run
-
-        args = _make_forge_args(reset_memory=True)
-
-        with patch("fluid_build.cli.forge.Console") as mock_cls:
-            mock_cls.return_value = MagicMock()
-            result = run(args, logger)
-
-        assert result == 0
-        mock_memory.assert_called_once()
-
-
 # ============================================================================
 # HANDOVER SCENARIOS
 # ============================================================================
@@ -411,50 +379,6 @@ class TestForgeMemory:
 
 class TestInitForgeHandover:
     """Scenarios 18-20: init → forge handover points."""
-
-    def test_init_ai_mode_delegates_to_forge_copilot(self, tmp_path, logger, monkeypatch):
-        """Scenario 18: init's _ai_mode delegates to forge's run_ai_copilot_mode."""
-        monkeypatch.chdir(tmp_path)
-
-        from fluid_build.cli.init import _ai_mode
-
-        args = _make_init_args(name="ai-product")
-
-        mock_copilot = MagicMock(return_value=0)
-
-        with (
-            patch("fluid_build.cli.init.RICH_AVAILABLE", False),
-            patch("fluid_build.cli.init.find_workspace_root", return_value=tmp_path),
-            patch("fluid_build.cli.init.load_workspace_config") as mock_ws_config,
-            patch("fluid_build.cli.init.CopilotAgent", create=True),
-            patch("fluid_build.cli.init.ContextValidationError", create=True),
-            patch("fluid_build.cli.init.build_interview_summary_from_context", create=True),
-            patch("fluid_build.cli.init.get_cli_arg", create=True),
-            patch("fluid_build.cli.init.get_target_directory", create=True),
-            patch("fluid_build.cli.init.load_context", create=True),
-        ):
-            # Mock workspace config
-            mock_ws_config.return_value = SimpleNamespace(
-                name="test-ws",
-                domain="analytics",
-                owner_team="team",
-                owner_email="",
-                provider="local",
-                products_dir=".",
-            )
-
-            # Patch the actual forge copilot call
-            with patch("fluid_build.cli.forge_modes.run_ai_copilot_mode", mock_copilot):
-                # _ai_mode imports forge.run_ai_copilot_mode as _run_copilot
-                with patch.object(
-                    __import__("fluid_build.cli.forge", fromlist=["run_ai_copilot_mode"]),
-                    "run_ai_copilot_mode",
-                    mock_copilot,
-                ):
-                    result = _ai_mode(args, logger)
-
-        # Should have delegated to forge copilot (0=success or ImportError fallback)
-        assert result in (0, 1)
 
     def test_detect_mode_returns_none_for_workspace_with_products(
         self, tmp_path, logger, monkeypatch
@@ -746,7 +670,7 @@ class TestErrorScenarios:
 
         assert result == 1
 
-    @patch("fluid_build.cli.forge._run_copilot", return_value=1)
+    @patch("fluid_build.cli.forge.run_ai_copilot_mode", return_value=1)
     def test_forge_no_tty_no_llm_exits_gracefully(self, mock_copilot, logger):
         """Scenario 23: No TTY + no LLM config exits 1 without crash."""
         from fluid_build.cli.forge import run

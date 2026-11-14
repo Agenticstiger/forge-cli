@@ -8,14 +8,9 @@ round-trip. This suite exercises the shape the real pipeline hits:
 
 * SqliteBackend — TTL expiry, metadata round-trip, cross-namespace
   clear, fluid_version tagging round-trip.
-* VectorBackend — hybrid search actually ranks the closer match first;
-  exact-match mode delegates to the backing store unchanged.
 * Cross-backend — same (put, get) invariants hold for
-  FileBackend / SqliteBackend / VectorBackend so the pipeline can swap
-  without regressions.
-
-Postgres has its own integration test gated on ``FLUID_TEST_POSTGRES``;
-nothing here requires a running DB.
+  FileBackend / SqliteBackend so the pipeline can swap without
+  regressions.
 """
 
 from __future__ import annotations
@@ -29,7 +24,6 @@ import pytest
 
 from fluid_build.copilot.store.backends.file import FileBackend
 from fluid_build.copilot.store.backends.sqlite import SqliteBackend
-from fluid_build.copilot.store.backends.vector import VectorBackend
 from fluid_build.copilot.store.factory import resolve_store
 
 # ---------------------------------------------------------------------------
@@ -105,52 +99,6 @@ class TestSqliteBackendE2E:
 
 
 # ---------------------------------------------------------------------------
-# VectorBackend
-# ---------------------------------------------------------------------------
-
-
-class TestVectorBackendE2E:
-    def _make(self, tmp_path: Path) -> VectorBackend:
-        return VectorBackend(FileBackend(root=tmp_path / "vec", workspace_root=tmp_path))
-
-    def test_hybrid_search_ranks_closer_match_first(self, tmp_path: Path):
-        store = self._make(tmp_path)
-        store.put(
-            "memory/semantic",
-            "orders",
-            {"description": "customer orders revenue model"},
-        )
-        store.put(
-            "memory/semantic",
-            "inventory",
-            {"description": "warehouse inventory levels"},
-        )
-
-        results = store.search("memory/semantic", "orders revenue", mode="hybrid", limit=5)
-        assert len(results) >= 1
-        # "orders" record is the closer match; it must rank first.
-        assert results[0].key == "orders"
-
-    def test_exact_mode_delegates_to_backing_store_by_key(self, tmp_path: Path):
-        """``mode='exact'`` performs a key lookup on the backing store, not a
-        substring match. Verify delegation produces the same record."""
-        store = self._make(tmp_path)
-        store.put("memory/semantic", "k1", {"description": "alpha bravo"})
-        store.put("memory/semantic", "k2", {"description": "charlie delta"})
-        results = store.search("memory/semantic", "k1", mode="exact", limit=5)
-        assert len(results) == 1
-        assert results[0].key == "k1"
-
-    def test_keyword_mode_substring_matches_value_body(self, tmp_path: Path):
-        store = self._make(tmp_path)
-        store.put("memory/semantic", "k1", {"description": "alpha bravo"})
-        store.put("memory/semantic", "k2", {"description": "charlie delta"})
-        results = store.search("memory/semantic", "alpha", mode="keyword", limit=5)
-        assert len(results) == 1
-        assert results[0].key == "k1"
-
-
-# ---------------------------------------------------------------------------
 # Cross-backend invariants
 # ---------------------------------------------------------------------------
 
@@ -163,10 +111,6 @@ class TestVectorBackendE2E:
             id="file",
         ),
         pytest.param(lambda p: SqliteBackend(path=p / "invariant.sqlite3"), id="sqlite"),
-        pytest.param(
-            lambda p: VectorBackend(FileBackend(root=p / "vec", workspace_root=p)),
-            id="vector",
-        ),
     ],
 )
 def test_backend_roundtrip_invariant(make, tmp_path: Path):
@@ -183,18 +127,6 @@ def test_backend_roundtrip_invariant(make, tmp_path: Path):
 # ---------------------------------------------------------------------------
 # Factory end-to-end (checks env-var driven resolution)
 # ---------------------------------------------------------------------------
-
-
-def test_factory_vector_with_sqlite_backing(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("FLUID_STORE_BACKEND", "vector")
-    monkeypatch.setenv("FLUID_STORE_VECTOR_BACKING", "sqlite")
-    monkeypatch.setenv("FLUID_STORE_PATH", str(tmp_path / "vec-sqlite.sqlite3"))
-    store = resolve_store(workspace_root=tmp_path)
-    assert isinstance(store, VectorBackend)
-    assert isinstance(store.backing_store, SqliteBackend)
-    # Round-trip survives through the wrapper + sqlite backing.
-    store.put("memory/semantic", "k", {"description": "alpha"})
-    assert store.get("memory/semantic", "k").value["description"] == "alpha"
 
 
 def test_factory_null_backend_silently_no_ops(tmp_path: Path, monkeypatch):

@@ -207,43 +207,6 @@ class TestEnforceCore:
         assert "embeddable_columns" in d
 
 
-class TestRegistration:
-    def test_ai_ready_in_domain_agents(self):
-        from fluid_build.cli.forge_agents import DOMAIN_AGENTS
-
-        assert "ai_ready" in DOMAIN_AGENTS
-
-    def test_get_agent_resolves(self):
-        from fluid_build.cli.forge_agents import AiReadyAgent, get_agent
-
-        agent = get_agent("ai_ready")
-        assert isinstance(agent, AiReadyAgent)
-        assert agent.name == "ai_ready"
-
-    def test_listed_as_builtin(self):
-        from fluid_build.cli.forge_agents import get_all_domain_names, list_agents
-
-        assert "ai_ready" in get_all_domain_names()
-        entry = next(a for a in list_agents() if a["name"] == "ai_ready")
-        assert entry["source"] == "built-in"
-
-    def test_agent_enforce_delegates_to_core(self):
-        from fluid_build.cli.forge_agents import AiReadyAgent
-
-        contract = _contract()
-        report = AiReadyAgent().enforce_ai_ready(contract)
-        assert isinstance(report, AiReadyReport)
-        assert contract["exposes"][0]["policy"]["agentPolicy"]["auditRequired"] is True
-
-    def test_spec_loads_and_validates(self):
-        from fluid_build.cli.forge_agent_specs import load_builtin_agent_spec
-
-        spec = load_builtin_agent_spec("ai_ready")
-        assert spec.name == "ai_ready"
-        assert spec.questions  # non-empty
-        assert spec.suggestion_defaults["recommended_template"]
-
-
 def _full_contract():
     """A complete, schema-valid v0.7.5 contract (exposes carry a binding)."""
     return {

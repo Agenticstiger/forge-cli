@@ -6,15 +6,15 @@ from __future__ import annotations
 from fluid_build.cli import build_parser
 
 
-def test_parser_registers_roadmap_memory_and_mcp_commands():
+def test_parser_registers_roadmap_and_mcp_commands():
     parser = build_parser()
     choices = parser._subparsers._group_actions[0].choices
     assert "roadmap" in choices
-    assert "memory" in choices
+    assert "memory" not in choices
     assert "mcp" in choices
 
 
-def test_parser_exposes_ai_models_and_forge_tier_controls():
+def test_parser_exposes_ai_models_and_forge_llm_controls():
     parser = build_parser()
 
     ai_args = parser.parse_args(["ai", "models", "--provider", "openai", "--json"])
@@ -27,16 +27,11 @@ def test_parser_exposes_ai_models_and_forge_tier_controls():
     forge_args = parser.parse_args(
         [
             "forge",
-            "--tiered",
             "--require-llm",
-            "--llm-routing-model",
-            "gpt-4.1-nano",
         ]
     )
     assert forge_args.cmd == "forge"
-    assert forge_args.tiered is True
     assert forge_args.require_llm is True
-    assert forge_args.llm_routing_model == "gpt-4.1-nano"
 
 
 def test_generate_transformation_and_dbt_aliases_parse_to_same_runner():

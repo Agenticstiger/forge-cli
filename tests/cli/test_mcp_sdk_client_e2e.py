@@ -3,13 +3,11 @@
 
 """End-to-end SDK↔SDK integration tests.
 
-The existing live tests (``test_mcp_forge_run_live.py``,
-``test_scaffold_ide.py::test_mcp_handshake_lives``) spawn the real
-``fluid mcp serve`` subprocess but act as the client using **hand-rolled
-JSON-RPC**. That proves wire compatibility, but it doesn't exercise the
-sampling callback round-trip the same way a real ``ClientSession`` does
-(no anyio task-group machinery, no SDK-side request-id correlation, no
-SDK-side capability negotiation).
+The existing live test (``test_scaffold_ide.py::test_mcp_handshake_lives``)
+spawns the real ``fluid mcp serve`` subprocess but acts as the client using
+**hand-rolled JSON-RPC**. That proves wire compatibility, but it doesn't
+exercise a real ``ClientSession`` (no anyio task-group machinery, no
+SDK-side request-id correlation, no SDK-side capability negotiation).
 
 This file uses the official ``mcp.client.session.ClientSession`` +
 ``mcp.client.stdio.stdio_client`` so we get **SDK on both ends**. If
@@ -17,13 +15,11 @@ This file uses the official ``mcp.client.session.ClientSession`` +
 Kiro, Cline) — which all use the SDK or compatible implementations —
 will see identical behaviour.
 
-Three shapes verified:
+Two shapes verified:
 
-1. SDK↔SDK initialize + list_tools — returns the 14 forge tools.
+1. SDK↔SDK initialize + list_tools: returns the 11 forge tools.
 2. SDK↔SDK call_tool against a read-only tool (``validate_contract`` on
    the hello-world example) — returns a structured score.
-3. SDK↔SDK call_tool against ``forge_run mode='blank'`` — produces a
-   real contract.fluid.yaml on disk.
 """
 
 from __future__ import annotations
@@ -81,14 +77,11 @@ def test_sdk_client_lists_all_14_forge_tools(tmp_path: Path):
         "regenerate_physical",
         "validate_contract",
         "diff_models",
-        "search_semantic_memory",
         "list_source_adapters",
         "list_source_tables",
         "inspect_source_table",
         "list_source_lineage",
         "list_source_glossary",
-        "forge_from_source",
-        "forge_run",
     }
     missing = expected - set(names)
     assert not missing, f"missing tools: {missing}; got {names}"
@@ -129,54 +122,3 @@ def test_sdk_client_calls_validate_contract(tmp_path: Path):
     # passes_schema is bool; we don't assert which value because the example
     # contract may legitimately have warnings (e.g. missing semantics block).
     assert "passes_schema" in body
-
-
-# ---------------------------------------------------------------------------
-# 3. SDK↔SDK call_tool against forge_run mode='blank' — produces a contract
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.slow
-def test_sdk_client_runs_forge_run_blank(tmp_path: Path):
-    """The deepest path: SDK → forge_run tool → in-process forge.run() →
-    contract.fluid.yaml on disk. Exercises the threading bridge
-    (``asyncio.to_thread``) used by the sampling path.
-
-    REGRESSION GATE: ``forge --agent`` writes JSON-Lines events to stdout;
-    inside ``forge_run`` that stdout MUST be captured and surfaced as the
-    ``events`` field on the result, NOT leaked onto the MCP wire (which
-    would crash the SDK's strict JSON-RPC parser with a
-    ``JSONRPCMessage`` validation error).
-    """
-    target = tmp_path / "product"
-
-    async def _run() -> dict:
-        async with stdio_client(_server_params(tmp_path)) as (read, write):
-            async with ClientSession(read, write) as client:
-                await client.initialize()
-                result = await client.call_tool(
-                    "forge_run",
-                    arguments={
-                        "mode": "blank",
-                        "target_dir": str(target),
-                        "data_product_type": "SDP",
-                    },
-                )
-                assert not _mcp_attr(result, "is_error", "isError", False), result
-                return json.loads(result.content[0].text)
-
-    payload = asyncio.run(_run())
-    assert payload["mode"] == "blank"
-    assert payload["exit_code"] == 0
-    assert payload["contract_exists"] is True
-    assert (target / "contract.fluid.yaml").is_file()
-
-    # Regression: forge's JSONL events must be surfaced as structured data
-    # in the tool result, never leaked onto the MCP wire. If this list is
-    # empty for blank mode, forge stopped emitting events; if the stdio
-    # collision returns, the SDK call would error before we get here.
-    events = payload.get("events", [])
-    event_names = [e["event"] for e in events]
-    assert "forge.start" in event_names, event_names
-    assert "forge.done" in event_names, event_names
-    assert "forge.contract_written" in event_names, event_names

@@ -60,7 +60,6 @@ _KNOWN_PROVIDERS = frozenset(
         "claude",
         "gemini",
         "ollama",
-        "mcp-sampling",
         "claude-code",
         "codex",
         "cursor",
@@ -106,16 +105,6 @@ class UXTelemetry:
     extras: Dict[str, Any] = field(default_factory=dict)
 
     # ----- recording API ----------------------------------------------
-
-    def mark_first_panel(self) -> None:
-        if self.first_panel_at is None:
-            self.first_panel_at = time.monotonic()
-
-    def record_question(self) -> None:
-        self.questions_asked += 1
-
-    def record_inference(self, count: int = 1) -> None:
-        self.inferences_used += max(0, int(count))
 
     def record_preview(self, *, accepted: bool) -> None:
         self.preview_rendered = True

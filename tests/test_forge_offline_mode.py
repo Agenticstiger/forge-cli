@@ -211,12 +211,10 @@ def test_non_interactive_defaults_bare():
 
 
 def test_non_interactive_defaults_from_flags(tmp_path):
-    args = _parse_forge_args(
-        "-d", str(tmp_path / "orders_pipeline"), "--provider", "snowflake", "--domain", "finance"
-    )
+    args = _parse_forge_args("-d", str(tmp_path / "orders_pipeline"), "--provider", "snowflake")
     pid, domain, provider = forge_modes_mod._guided_non_interactive_defaults(args)
     assert pid == "orders_pipeline"
-    assert domain == "finance"
+    assert domain == "analytics"
     assert provider == "snowflake"
 
 

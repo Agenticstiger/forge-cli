@@ -10,7 +10,6 @@ Dataplex, AWS Glue, DataHub, Data Mesh Manager) and runs the staged
 forge pipeline against the resulting :class:`LogicalDraft`.
 
 User-facing CLI: ``fluid forge data-model from-source ...``.
-MCP-tool: ``forge_from_source``.
 Pipeline coordinator: ``StageCoordinator.from_catalog``.
 
 The "source" vocabulary in user-facing CLI / MCP / config disambiguates

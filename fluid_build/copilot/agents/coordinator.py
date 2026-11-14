@@ -51,7 +51,6 @@ from fluid_build.copilot.schemas.stage_outputs import (
     PhysicalDraft,
     ValidationReport,
 )
-from fluid_build.copilot.store.semantic_writer import write_semantic_record
 from fluid_build.forge_datamodel.from_ddl.parser import TableDefinition
 from fluid_build.forge_datamodel.logical_canonicalizer import canonicalize_logical_draft
 from fluid_build.llm.providers import get_catalog_tier_model
@@ -302,26 +301,20 @@ class StageCoordinator(_RepairLoopMixin):
         contract: Dict[str, Any],
         physical: Optional[PhysicalDraft],
     ) -> None:
-        """Run the final two checkpointed stages: enrichment + judge.
+        """Run the final checkpointed stage: enrichment.
 
-        Both are fail-open — a failure in either logs at DEBUG and
-        the run still returns a CoordinatorResult to the caller. The
-        purpose of running them here (rather than in the runtime as
-        before) is to bring them inside the checkpoint envelope so
-        a Ctrl-C between validator and judge doesn't lose 30 seconds
-        of work.
+        Fail-open: a failure logs at DEBUG and the run still returns a
+        CoordinatorResult to the caller. Running it here brings it inside
+        the checkpoint envelope so a Ctrl-C after the validator doesn't
+        lose the work.
 
         Skipped entirely when ``physical`` is None — without a
-        validated physical artifact there's no enrichment / judge
-        signal to write.
+        validated physical artifact there's no enrichment signal to write.
         """
         if physical is None:
             return
-        # Gate: only run when post-synthesis is configured by the
-        # runtime. The legacy runtime path still runs enrichment/judge
-        # directly; the staged path through the coordinator gets them
-        # under the checkpoint envelope. Operators who want to skip
-        # entirely set FLUID_COPILOT_POST_SYNTHESIS=0.
+        # Operators who want to skip this stage entirely set
+        # FLUID_COPILOT_POST_SYNTHESIS=0.
         if os.environ.get("FLUID_COPILOT_POST_SYNTHESIS") == "0":
             return
         saver = self._get_saver()
@@ -348,24 +341,6 @@ class StageCoordinator(_RepairLoopMixin):
             physical.provenance["enrichment_artifacts"] = enrichment_artifacts
         except Exception:  # pragma: no cover — defensive
             pass
-        # ----- judge -------------------------------------------------
-        with saver.skip_if_done(run_id, "judge") as restored:
-            if restored is not None:
-                judge_result: Optional[Dict[str, Any]] = (
-                    restored.payload if isinstance(restored.payload, dict) else None
-                )
-            else:
-                judge_result = self._run_judge_stage(contract, build_artifacts=enrichment_artifacts)
-                self._save_stage(
-                    run_id,
-                    "judge",
-                    judge_result if judge_result is not None else {},
-                )
-        try:
-            physical.provenance = dict(physical.provenance or {})
-            physical.provenance["judge_result"] = judge_result
-        except Exception:  # pragma: no cover — defensive
-            pass
 
     def _run_enrichment_stage(
         self,
@@ -379,30 +354,6 @@ class StageCoordinator(_RepairLoopMixin):
             return enrich_contract(contract)
         except Exception as exc:  # noqa: BLE001 — fail-open
             _log.debug("enrichment stage failed (skipping): %s", exc)
-            return None
-
-    def _run_judge_stage(
-        self,
-        contract: Dict[str, Any],
-        *,
-        build_artifacts: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Best-effort LLM-as-judge pass. Returns ``None`` on any
-        failure or when the judge is disabled by env-var."""
-        try:
-            from fluid_build.copilot.agents.judge_agent import JudgeAgent
-
-            result = JudgeAgent().judge(contract, build_artifacts=build_artifacts)
-            return {
-                "score": getattr(result, "total", None),
-                "axes": {
-                    axis: getattr(score, "score", None)
-                    for axis, score in (getattr(result, "axes", {}) or {}).items()
-                },
-                "model": getattr(result, "model", None),
-            }
-        except Exception as exc:  # noqa: BLE001 — fail-open
-            _log.debug("judge stage failed (skipping): %s", exc)
             return None
 
     def from_tables(
@@ -501,10 +452,6 @@ class StageCoordinator(_RepairLoopMixin):
                 self._maybe_run_post_synthesis_stages(
                     run_id=run_id, contract=contract, physical=physical
                 )
-                # D7 — auto-write memory/semantic on successful forge (opt-in).
-                # Gated by FLUID_COPILOT_SEMANTIC_MEMORY; swallows errors so
-                # a broken store never poisons a successful forge result.
-                write_semantic_record(session.store, logical, source_type="tables")
                 # A2 — episodic memory writer. Records a "forge.success"
                 # event so future runs can resume / branch on prior
                 # outcomes. Best-effort: a store error MUST NOT poison
@@ -612,10 +559,6 @@ class StageCoordinator(_RepairLoopMixin):
                 self._maybe_run_post_synthesis_stages(
                     run_id=run_id, contract=contract, physical=physical
                 )
-                # D7 — auto-write memory/semantic on successful forge (opt-in).
-                # See module-level comment in ``store.semantic_writer`` for
-                # the privacy / predictability rationale behind the opt-in.
-                write_semantic_record(session.store, logical, source_type="intent")
                 # A2 — episodic memory writer.
                 self._record_forge_episode(
                     session,
@@ -740,12 +683,6 @@ class StageCoordinator(_RepairLoopMixin):
                     contract = physical.contract
                 self._maybe_run_post_synthesis_stages(
                     run_id=run_id, contract=contract, physical=physical
-                )
-                # D7 — auto-write memory/semantic on successful forge (opt-in).
-                write_semantic_record(
-                    session.store,
-                    logical,
-                    source_type=f"catalog:{getattr(adapter, 'name', 'unknown')}",
                 )
                 # A2 — episodic memory writer.
                 self._record_forge_episode(
@@ -1138,8 +1075,7 @@ class StageCoordinator(_RepairLoopMixin):
 
         Best-effort: any error in the store path is swallowed so a
         store failure can never poison a successful forge result.
-        Honors ``FLUID_COPILOT_EPISODIC_MEMORY=0`` for opt-out
-        symmetry with the semantic writer.
+        Honors ``FLUID_COPILOT_EPISODIC_MEMORY=0`` for opt-out.
         """
         if os.environ.get("FLUID_COPILOT_EPISODIC_MEMORY") == "0":
             return
@@ -1176,8 +1112,7 @@ class StageCoordinator(_RepairLoopMixin):
             except Exception:  # pragma: no cover — defensive
                 pass
             # Light counters — useful for ranking without bloating
-            # the store with full IR copies (memory/semantic stores
-            # the full record; episodic is a slim event log).
+            # the store with full IR copies (episodic is a slim event log).
             dv2 = getattr(logical, "dv2", None)
             if dv2 is not None:
                 payload["dv2_counts"] = {

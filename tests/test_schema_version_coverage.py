@@ -83,9 +83,3 @@ class TestSchemaVersionCoverage:
         for preview in FluidSchemaManager.PREVIEW_VERSIONS:
             assert preview in FluidSchemaManager.BUNDLED_VERSIONS
             assert latest != preview
-
-    def test_copilot_targets_latest_version(self):
-        """The copilot prompt helpers must target the latest bundled version."""
-        from fluid_build.cli.forge_copilot_prompts import _latest_fluid_version
-
-        assert _latest_fluid_version() == FluidSchemaManager.latest_bundled_version()

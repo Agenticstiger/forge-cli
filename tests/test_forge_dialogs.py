@@ -98,8 +98,6 @@ class TestForgeDialogs:
         repo_root = Path(__file__).resolve().parents[1]
         for relative_path in (
             "fluid_build/cli/forge.py",
-            "fluid_build/cli/forge_agents.py",
-            "fluid_build/cli/forge_copilot_interview.py",
             "fluid_build/cli/forge_dialogs.py",
         ):
             text = (repo_root / relative_path).read_text(encoding="utf-8")

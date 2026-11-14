@@ -320,8 +320,6 @@ def test_a_blank_passthrough_keeps_the_quickstart_account_with_its_password_pinn
     assert project_endpoint_in_effect("Snowflake")
     env = dict(os.environ)
     assert "SNOWFLAKE_CONFIG_PATH" in SnowflakeIacPlugin().credential_env(env)
-    mcp = _snowflake_mcp_env({**env, "FLUID_SNOWFLAKE_MCP": "1"})
-    assert list(Path(mcp["SNOWFLAKE_HOME"]).iterdir()) == []
 
 
 def test_a_blank_operator_credential_pairs_only_an_account_behind_a_blank_variable() -> None:
@@ -603,44 +601,6 @@ def test_opentofu_keeps_the_operator_s_config_for_the_operator_s_account(
     overlay = SnowflakeIacPlugin().credential_env(dict(os.environ))
 
     assert "SNOWFLAKE_CONFIG_PATH" not in overlay
-
-
-def _snowflake_mcp_env(source: Mapping[str, str]) -> Dict[str, str]:
-    from fluid_build.cli import hosted_mcp
-
-    spec = hosted_mcp.HOSTED_MCP_REGISTRY["snowflake"]
-    return hosted_mcp.HostedMcpClient(spec, env=dict(source))._subprocess_env()
-
-
-def test_the_hosted_snowflake_mcp_gets_an_empty_snowflake_home_for_a_project_account(
-    project: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The connector reads connections.toml / config.toml from SNOWFLAKE_HOME
-    # (~/.snowflake) for a named connection, and SNOWFLAKE_CONNECTIONS too.
-    monkeypatch.setenv("SNOWFLAKE_CONNECTIONS", "[default]\npassword = 'x'\n")
-    monkeypatch.setenv("SNOWFLAKE_DEFAULT_CONNECTION_NAME", "default")
-    (project / ".env").write_text(QUICKSTART_ENV)
-    hydrate_dotenv(project)
-
-    env = _snowflake_mcp_env({**os.environ, "FLUID_SNOWFLAKE_MCP": "1"})
-
-    home = Path(env["SNOWFLAKE_HOME"])
-    assert home.is_dir() and list(home.iterdir()) == []
-    assert "SNOWFLAKE_CONNECTIONS" not in env
-    assert "SNOWFLAKE_DEFAULT_CONNECTION_NAME" not in env
-    assert (env["SNOWFLAKE_ACCOUNT"], env["SNOWFLAKE_PASSWORD"]) == ("xy12345", PROJECT_KEY)
-
-
-def test_the_hosted_snowflake_mcp_keeps_the_operator_s_setup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "operator-acct")
-    monkeypatch.setenv("SNOWFLAKE_DEFAULT_CONNECTION_NAME", "default")
-
-    env = _snowflake_mcp_env({**os.environ, "FLUID_SNOWFLAKE_MCP": "1"})
-
-    assert "SNOWFLAKE_HOME" not in env
-    assert env["SNOWFLAKE_DEFAULT_CONNECTION_NAME"] == "default"
 
 
 def _snowflake_pairing_names() -> List[str]:
@@ -1332,7 +1292,7 @@ def test_the_dbt_profile_never_pairs_the_project_account_with_the_operator_s_aut
     assert output["account"] != "xy12345"
 
 
-def test_opentofu_and_the_hosted_mcp_get_no_project_authenticator(project: Path) -> None:
+def test_opentofu_gets_no_project_authenticator(project: Path) -> None:
     from fluid_build.iac.credentials import build_tofu_env
     from fluid_build.iac.providers.snowflake import SnowflakeIacPlugin
 
@@ -1341,15 +1301,12 @@ def test_opentofu_and_the_hosted_mcp_get_no_project_authenticator(project: Path)
 
     tofu = build_tofu_env()
     tofu.update(SnowflakeIacPlugin().credential_env(tofu))
-    mcp = _snowflake_mcp_env({**os.environ, "FLUID_SNOWFLAKE_MCP": "1"})
 
     assert tofu["SNOWFLAKE_ACCOUNT_NAME"] == "xy12345"
     assert "SNOWFLAKE_AUTHENTICATOR" not in tofu
-    assert mcp["SNOWFLAKE_ACCOUNT"] == "myorg-xy12345"
-    assert "SNOWFLAKE_AUTHENTICATOR" not in mcp
 
 
-def test_opentofu_and_mcp_never_get_the_project_account_with_an_operator_authenticator(
+def test_opentofu_never_gets_the_project_account_with_an_operator_authenticator(
     project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from fluid_build.iac.credentials import build_tofu_env
@@ -1361,10 +1318,8 @@ def test_opentofu_and_mcp_never_get_the_project_account_with_an_operator_authent
 
     tofu = build_tofu_env()
     tofu.update(SnowflakeIacPlugin().credential_env(tofu))
-    mcp = _snowflake_mcp_env({**os.environ, "FLUID_SNOWFLAKE_MCP": "1"})
 
     assert tofu.get("SNOWFLAKE_ACCOUNT_NAME") != "xy12345"
-    assert mcp.get("SNOWFLAKE_ACCOUNT") != "myorg-xy12345"
 
 
 @pytest.mark.parametrize(

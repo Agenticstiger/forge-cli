@@ -37,32 +37,6 @@ def _hermetic():
 
 
 class TestItem1ToolResearch:
-    def test_research_invokes_semantic_memory_tool(self, tmp_path):
-        """When the registry has ``search_semantic_memory``, the
-        modeler invokes it during the research phase."""
-        from fluid_build.copilot.agents.modeler_agent import (
-            _ensure_tool_registry,
-            _run_tool_research_phase,
-        )
-
-        session = StageSession(store=NullBackend(), workspace_root=tmp_path)
-        _ensure_tool_registry(session)
-        # The default registry includes ``search_semantic_memory``
-        # because we passed a (Null) store.
-        assert "search_semantic_memory" in session.tool_registry.tools
-
-        summaries = _run_tool_research_phase(
-            session,
-            name="customer_orders",
-            tables=None,
-        )
-        # At least one tool was actually invoked.
-        assert len(session.tool_registry.invocations) >= 1
-        assert any(
-            inv.tool_name == "search_semantic_memory" for inv in session.tool_registry.invocations
-        )
-        # Summary records the tool name.
-        assert any(s["tool"] == "search_semantic_memory" for s in summaries)
 
     def test_research_with_no_registry_returns_empty(self, tmp_path):
         """No tool_registry on session → empty summary list, no

@@ -473,23 +473,3 @@ def describe_fragment_layout(
     if not isinstance(contract, dict):
         return []
     return [site.target for site in fragment_sites(contract, parts, taken)]
-
-
-def is_complex_enough_for_fragments(contract: Dict[str, Any]) -> bool:
-    """Return ``True`` if the contract would benefit from fragment splitting.
-
-    Heuristic: has 2+ builds, OR has sovereignty/accessPolicy,
-    OR has 2+ exposes.  Simple single-build contracts stay flat.
-    """
-    if not isinstance(contract, dict):
-        return False
-    builds = contract.get("builds")
-    exposes = contract.get("exposes")
-    has_governance = bool(
-        isinstance(contract.get("sovereignty"), dict)
-        or isinstance(contract.get("accessPolicy"), dict)
-    )
-    has_multiple_builds = isinstance(builds, list) and len(builds) >= 2
-    has_multiple_exposes = isinstance(exposes, list) and len(exposes) >= 2
-
-    return has_governance or has_multiple_builds or has_multiple_exposes

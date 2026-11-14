@@ -212,15 +212,6 @@ def test_litellm_backend_raises_the_stable_code_with_the_hint(block):
     )
 
 
-def test_llm_router_without_litellm_names_the_extra(block):
-    block("litellm")
-    from fluid_build.llm.router import _build_router
-
-    with pytest.raises(MissingOptionalDependency) as info:
-        _build_router([{"model_name": "m", "litellm_params": {"model": "m"}}])
-    assert "pip install 'data-product-forge[litellm]'" in str(info.value)
-
-
 def test_doctor_without_litellm_says_how_to_install_it(block, cli):
     block("litellm")
     rc, out = cli("doctor", "--verbose")
@@ -298,27 +289,6 @@ def test_mcp_serve_without_the_sdk_prints_the_install_line_and_exits_1(block, cl
     assert "No module named" not in out and "Unexpected error" not in out
 
 
-def test_mcp_sampling_provider_without_the_sdk_reports_the_missing_context(block, cli):
-    # Outside an MCP tool call there is no sampling context, so the right answer
-    # is the "no context" error. It used to be ``No module named 'mcp'``, because
-    # ``mcp.types`` was imported before the context was checked.
-    block("mcp")
-    rc, out = cli(
-        "forge",
-        "--llm-provider",
-        "mcp-sampling",
-        "--non-interactive",
-        "--yes",
-        "--target-dir",
-        "out",
-        "--domain",
-        "sales",
-    )
-    assert rc == 1
-    assert "MCP sampling context not active" in out
-    assert "No module named" not in out and "Unexpected error" not in out
-
-
 def test_mcp_generation_probe_survives_a_missing_sdk(block):
     block("mcp")
     from fluid_build import _mcp_compat
@@ -356,19 +326,6 @@ def test_output_port_server_without_the_sdk_names_the_extra(tmp_path):
     expected = _hint("The MCP output-port server", "mcp", "mcp")
     assert f"MSG={expected!r}" in proc.stdout, proc.stdout + proc.stderr
     assert "mcp>=1.0,<2.0" not in proc.stdout
-
-
-def test_mcp_delegates_name_the_extra(block):
-    block("mcp")
-    from fluid_build.cli.dbt_mcp import DbtMcpClient
-
-    async def open_it():
-        async with DbtMcpClient()._open_real_session():
-            pass
-
-    with pytest.raises(MissingOptionalDependency) as info:
-        asyncio.run(open_it())
-    assert str(info.value) == _hint("The dbt MCP delegate", "mcp", "mcp")
 
 
 # ── aws / boto3 ──────────────────────────────────────────────────────────────
@@ -545,19 +502,6 @@ def test_lineage_without_openlineage_warns_once_naming_the_extra_and_does_not_ra
 # ── duckdb / vowl ────────────────────────────────────────────────────────────
 
 
-def test_fetch_sample_rows_without_duckdb_names_the_local_extra(block):
-    block("duckdb")
-    from fluid_build.cli.forge_db_tools import _fetch_sample_rows
-
-    result = _fetch_sample_rows(
-        {"table": "orders"}, {"FLUID_FORGE_DB_URI": "sqlite:///does-not-matter.db"}
-    )
-    assert result == {
-        "error": "DuckDbNotInstalled",
-        "message": _hint("fetch_sample_rows", "duckdb", "local"),
-    }
-
-
 def test_odcs_validate_without_vowl_says_so_and_how_to_install(block, cli, tmp_path):
     block("vowl")
     contract = tmp_path / "c.odcs.yaml"
@@ -634,27 +578,6 @@ def test_broken_litellm_is_a_typed_error_not_a_raw_import_error(monkeypatch):
         lb._get_litellm()
     assert type(info.value).__name__ == "CopilotGenerationError"
     assert "installed but failed to import" in str(info.value.message)
-
-
-def test_mcp_delegate_dispatch_returns_the_install_hint():
-    from fluid_build.cli import dbt_mcp
-
-    exc = MissingOptionalDependency("mcp", "mcp", "The dbt MCP delegate")
-
-    class Boom:
-        def __init__(self, env=None):
-            pass
-
-        def call_tool(self, *a, **k):
-            raise exc
-
-    orig = dbt_mcp.DbtMcpClient
-    dbt_mcp.DbtMcpClient = Boom
-    try:
-        out = dbt_mcp.dispatch_dbt_mcp_tool("dbt.x", {})
-    finally:
-        dbt_mcp.DbtMcpClient = orig
-    assert "data-product-forge[mcp]" in out["message"]
 
 
 def test_lineage_warning_keeps_the_install_line_alone():

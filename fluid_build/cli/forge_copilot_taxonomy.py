@@ -6,28 +6,20 @@
 from __future__ import annotations
 
 __all__ = [
-    "CANONICAL_MODEL_LABELS",
-    "SUPPORTING_STANDARD_LABELS",
     "USE_CASE_CHOICES",
     "USE_CASE_LABELS",
     "CI_PROVIDER_VALUES",
     "CI_COMPLEXITY_VALUES",
     "clean_text",
     "canonicalize_use_case_text",
-    "infer_modeling_context",
-    "normalize_canonical_model",
     "normalize_ci_complexity",
     "normalize_ci_provider",
     "normalize_use_case",
-    "format_use_case_label",
     "normalize_copilot_context",
-    "normalize_supporting_standards",
 ]
 
 import re
 from typing import Any, Dict, List, Optional
-
-from fluid_build.cli import forge_standards_modeling as _standards
 
 USE_CASE_CHOICES: List[Dict[str, str]] = [
     {"label": "Analytics & BI", "value": "analytics"},
@@ -39,15 +31,6 @@ USE_CASE_CHOICES: List[Dict[str, str]] = [
 ]
 
 USE_CASE_LABELS = {choice["value"]: choice["label"] for choice in USE_CASE_CHOICES}
-
-# Canonical-model + supporting-standard taxonomy now lives in the single shared
-# ``forge_standards_modeling`` registry so the declarative domain-agent path and
-# this generative path never drift. These module constants are derived snapshots
-# of that registry (kept as plain dicts for the existing consumers that import
-# them, e.g. ``forge_copilot_contract_helpers._modeling_description_suffix``).
-CANONICAL_MODEL_LABELS = _standards.canonical_model_labels()
-
-SUPPORTING_STANDARD_LABELS = _standards.supporting_standard_labels()
 
 USE_CASE_ALIASES = {
     "analytics": "analytics",
@@ -89,11 +72,6 @@ USE_CASE_ALIASES = {
     "not certain": "other",
     "unsure": "other",
 }
-
-# Canonical-model + supporting-standard alias tables are owned by the shared
-# ``forge_standards_modeling`` registry (see ``normalize_canonical_model`` /
-# ``normalize_supporting_standards`` below, which delegate to it).
-
 
 # CI/CD providers — must stay in sync with PipelineProvider in
 # ``fluid_build/forge/core/pipeline_templates.py``. Inlined here to avoid
@@ -197,228 +175,6 @@ def normalize_use_case(value: Any) -> Optional[str]:
     return None
 
 
-def format_use_case_label(use_case: Any, use_case_other: Any = None) -> str:
-    """Return the user-facing use-case label for display surfaces."""
-    other_text = clean_text(use_case_other)
-    canonical = normalize_use_case(use_case)
-    if canonical == "other" and other_text:
-        return other_text
-    if canonical:
-        return USE_CASE_LABELS.get(canonical, canonical.replace("_", " ").title())
-    if other_text:
-        return other_text
-    raw = clean_text(use_case)
-    return raw or USE_CASE_LABELS["analytics"]
-
-
-def _dedupe_preserve_order(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    normalized: list[str] = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            normalized.append(value)
-    return normalized
-
-
-def _listify_strings(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item or "").strip()]
-    text = clean_text(value).replace("\n", ",")
-    return [item.strip() for item in text.split(",") if item.strip()]
-
-
-def normalize_canonical_model(value: Any) -> Optional[str]:
-    """Normalize canonical-model variants to stable internal values.
-
-    Delegates to the shared ``forge_standards_modeling`` registry so the
-    generative path recognises every canonical model the declarative domain
-    agents declare (all 12 domains), not just the legacy four.
-    """
-    return _standards.normalize_canonical_model(value)
-
-
-def normalize_supporting_standards(value: Any) -> list[str]:
-    """Normalize supporting standards into a stable ordered list.
-
-    Delegates to the shared ``forge_standards_modeling`` registry (single
-    source of truth shared with the declarative domain-agent path).
-    """
-    return _standards.normalize_supporting_standards(value)
-
-
-def _combined_intent_text(context: Dict[str, Any]) -> str:
-    parts: list[str] = []
-    for key in (
-        "domain",
-        "project_goal",
-        "data_sources",
-        "use_case",
-        "use_case_other",
-        "primary_entity",
-        "time_dimension",
-    ):
-        value = clean_text(context.get(key))
-        if value:
-            parts.append(value)
-    for key in ("primary_measures", "primary_dimensions", "supporting_standards"):
-        parts.extend(_listify_strings(context.get(key)))
-    return canonicalize_use_case_text(" ".join(parts))
-
-
-def _looks_telco(text: str, domain: str) -> bool:
-    return domain == "telco" or any(
-        token in text
-        for token in (
-            "telco",
-            "telecom",
-            "subscriber",
-            "oss",
-            "bss",
-            "tm forum",
-            "tmf",
-            "sid",
-            "service assurance",
-        )
-    )
-
-
-def _looks_retail(text: str, domain: str) -> bool:
-    return domain == "retail" or any(
-        token in text
-        for token in (
-            "retail",
-            "commerce",
-            "omnichannel",
-            "basket",
-            "inventory",
-            "store",
-            "sku",
-            "customer 360",
-            "recommendation",
-            "traceability",
-        )
-    )
-
-
-def _looks_healthcare(text: str, domain: str) -> bool:
-    return domain == "healthcare" or any(
-        token in text
-        for token in (
-            "healthcare",
-            "clinical",
-            "patient",
-            "ehr",
-            "emr",
-            "fhir",
-            "hipaa",
-            "claims",
-            "population health",
-            "omop",
-        )
-    )
-
-
-def infer_modeling_context(context: Dict[str, Any]) -> Dict[str, Any]:
-    """Infer canonical modeling guidance from domain and user intent."""
-    domain = clean_text(context.get("domain")).lower()
-    text = _combined_intent_text(context)
-    use_case = normalize_use_case(context.get("use_case")) or ""
-
-    canonical_model = normalize_canonical_model(context.get("canonical_model"))
-    supporting_standards = normalize_supporting_standards(context.get("supporting_standards"))
-
-    digital_retail = any(
-        token in text
-        for token in (
-            "adobe",
-            "xdm",
-            "digital experience",
-            "experience event",
-            "web sdk",
-            "profile",
-            "journey",
-        )
-    )
-    retail_traceability = any(
-        token in text
-        for token in (
-            "traceability",
-            "epcis",
-            "cbv",
-            "chain of custody",
-            "lot",
-            "serial",
-            "trade item",
-            "supply chain",
-        )
-    )
-    healthcare_interop = any(
-        token in text
-        for token in (
-            "fhir",
-            "hl7",
-            "ehr",
-            "emr",
-            "interoperability",
-            "clinical integration",
-            "care coordination",
-        )
-    )
-    healthcare_analytics = any(
-        token in text
-        for token in (
-            "omop",
-            "research",
-            "population health",
-            "cohort",
-            "claims",
-            "secondary use",
-            "observational",
-        )
-    )
-
-    if canonical_model is None:
-        if digital_retail:
-            canonical_model = "adobe_xdm"
-        elif retail_traceability:
-            canonical_model = "gs1_gdm"
-        elif _looks_telco(text, domain):
-            canonical_model = "tmf_sid"
-        elif _looks_healthcare(text, domain):
-            if healthcare_interop:
-                canonical_model = "hl7_fhir"
-            elif healthcare_analytics or use_case in {"analytics", "ml_pipeline", "data_platform"}:
-                canonical_model = "omop_cdm"
-            else:
-                canonical_model = (
-                    "hl7_fhir" if use_case in {"etl_pipeline", "streaming"} else "omop_cdm"
-                )
-        elif _looks_retail(text, domain):
-            canonical_model = "nrf_arts"
-
-    # Domain-declared fallback: for a recognised domain whose free-text signals
-    # did not pin a canonical model (notably the 8 verticals these heuristics do
-    # not encode), defer to the domain agent's declared default so the
-    # generative path agrees with the declarative path. Single source of truth:
-    # the shared standards-modeling registry reading the agent spec.
-    if canonical_model is None and domain:
-        domain_defaults = _standards.domain_standard_defaults(domain)
-        if domain_defaults["canonical_model"]:
-            canonical_model = domain_defaults["canonical_model"]
-            supporting_standards.extend(domain_defaults["supporting_standards"])
-
-    if canonical_model == "nrf_arts" and _looks_retail(text, domain):
-        supporting_standards.append("gs1_gdm")
-    if canonical_model == "gs1_gdm" or retail_traceability:
-        supporting_standards.extend(["gs1_gdm", "gs1_epcis_cbv"])
-
-    return {
-        "canonical_model": canonical_model,
-        "supporting_standards": _dedupe_preserve_order(supporting_standards),
-    }
-
-
 def normalize_ci_provider(value: Any) -> Optional[str]:
     """Canonicalize a CI provider string into a ``PipelineProvider`` value.
 
@@ -460,28 +216,6 @@ def normalize_copilot_context(context: Dict[str, Any]) -> Dict[str, Any]:
         normalized["use_case_other"] = other_text
     else:
         normalized.pop("use_case_other", None)
-    canonical_model = normalize_canonical_model(normalized.get("canonical_model"))
-    if canonical_model:
-        normalized["canonical_model"] = canonical_model
-    else:
-        normalized.pop("canonical_model", None)
-    supporting_standards = normalize_supporting_standards(normalized.get("supporting_standards"))
-    if supporting_standards:
-        normalized["supporting_standards"] = supporting_standards
-    else:
-        normalized.pop("supporting_standards", None)
-
-    inferred = infer_modeling_context(normalized)
-    if inferred["canonical_model"] and not normalized.get("canonical_model"):
-        normalized["canonical_model"] = inferred["canonical_model"]
-    merged_supporting = _dedupe_preserve_order(
-        normalize_supporting_standards(normalized.get("supporting_standards"))
-        + list(inferred["supporting_standards"])
-    )
-    if merged_supporting:
-        normalized["supporting_standards"] = merged_supporting
-    else:
-        normalized.pop("supporting_standards", None)
 
     # CI/CD pipeline preferences (auto-scaffold inside `fluid forge`).
     ci_provider = normalize_ci_provider(normalized.get("ci_provider"))

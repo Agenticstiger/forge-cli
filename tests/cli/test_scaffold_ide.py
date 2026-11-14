@@ -186,7 +186,7 @@ def test_mcp_config_shape(tmp_path: Path, target: str):
     assert "list_source_tables" in auto
     # Mutating tools must require confirmation — never auto-approved.
     assert "update_entity" not in auto
-    assert "forge_from_source" not in auto
+    assert "regenerate_physical" not in auto
 
 
 def test_python_must_be_absolute(tmp_path: Path):

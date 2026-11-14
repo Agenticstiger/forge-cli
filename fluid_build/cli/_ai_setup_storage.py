@@ -354,20 +354,15 @@ def _resolve_domain_slug(domain_or_context: Any) -> Optional[str]:
 
     The one gate through which anything reaches the persisted history — it
     never returns anything but a bare ``[a-z0-9._-]`` slug, which is what
-    keeps prompt text / paths / PII out of the file. A ``Mapping`` is run
-    through the shared :func:`detect_domain` detector (deferred import so the
-    ``fluid --help`` cold path never pulls in the YAML keyword loader);
-    anything else, or an unrecognised domain, yields ``None``.
+    keeps prompt text / paths / PII out of the file. A ``Mapping``
+    contributes its ``domain`` value; anything else, or an unrecognised
+    domain, yields ``None``.
     """
     if isinstance(domain_or_context, str):
         candidate: Optional[str] = domain_or_context
     elif isinstance(domain_or_context, Mapping):
-        try:
-            from fluid_build.cli.forge_domain_enrichment import detect_domain
-
-            candidate = detect_domain(dict(domain_or_context))
-        except Exception:  # noqa: BLE001 — detection is best-effort
-            candidate = None
+        value = domain_or_context.get("domain")
+        candidate = value if isinstance(value, str) else None
     else:
         candidate = None
 
@@ -385,7 +380,7 @@ def record_domain_detection(
     """Record one domain detection under ``domain_history`` in ``ai_config.json``.
 
     Accepts either an already-resolved domain slug or the interview *context*
-    (from which the slug is derived via :func:`detect_domain`). Increments the
+    (whose ``domain`` value is the slug). Increments the
     domain's running ``count`` and refreshes ``last_seen`` (ISO-8601 UTC),
     **preserving every other key in the file** — provider entries, the active
     marker, and every sibling ``domain_history`` domain all survive the

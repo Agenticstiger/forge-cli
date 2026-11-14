@@ -29,38 +29,15 @@ from fluid_build.cli._forge_mode_errors import (
     forge_mode_error_boundary,
 )
 from fluid_build.cli.forge_copilot_llm_providers import CopilotGenerationError
-from fluid_build.cli.forge_modes import (
-    run_ai_copilot_mode,
-    run_domain_agent_mode,
-    run_guided_mode,
-)
+from fluid_build.cli.forge_modes import run_guided_mode
 
 # Golden console strings — verbatim from the pre-refactor except blocks.
-GOLDEN_AI_GENERIC = "AI Copilot failed: boom"
-GOLDEN_AI_COPILOT_ERR = "❌ AI Copilot failed: friendly message"
-GOLDEN_AI_TIP = (
-    "[yellow]Tip: Run 'fluid ai setup' to configure your LLM provider,[/yellow]\n"
-    "[yellow]or use 'fluid forge --blank' / guided mode without AI.[/yellow]"
-)
-GOLDEN_DOMAIN_GENERIC = "❌ Domain agent failed: boom"
 GOLDEN_GUIDED_GENERIC = "Guided mode failed: boom"
 
 
 def _printed(console: MagicMock) -> str:
     """Concatenate every positional arg passed to ``console.print``."""
     return "\n".join(str(call.args[0]) for call in console.print.call_args_list if call.args)
-
-
-def _style_of(console: MagicMock, needle: str) -> str:
-    """The Rich style of the printed ``Text`` containing ``needle``.
-
-    The messages print as ``Text`` (not markup), so the colour is a ``Text`` style,
-    not a ``[red]`` tag in the string the golden strings above compare.
-    """
-    for call in console.print.call_args_list:
-        if call.args and needle in str(call.args[0]):
-            return str(getattr(call.args[0], "style", ""))
-    raise AssertionError(f"nothing printed containing {needle!r}")
 
 
 # ── unit: the boundary in isolation ───────────────────────────────────
@@ -224,134 +201,6 @@ class TestGuidedModeErrorParity:
         logger.info.assert_any_call("Guided mode cancelled")
 
 
-# ── characterization: run_domain_agent_mode ───────────────────────────
-
-
-class TestDomainAgentModeErrorParity:
-    def _args(self):
-        return argparse.Namespace(
-            non_interactive=True, dry_run=False, agent="finance", context=None
-        )
-
-    def _kwargs(self, ai_agents, console):
-        return dict(
-            ai_agents=ai_agents,
-            gather_context_fn=MagicMock(return_value={}),
-            load_context_fn=MagicMock(return_value={}),
-            get_target_directory_fn=MagicMock(return_value=Path("/tmp/p")),
-            context_error_cls=Exception,
-            console_factory=lambda: console,
-        )
-
-    def test_exception_returns_1_with_golden_message(self):
-        console = MagicMock()
-        logger = MagicMock()
-        ai_agents = {"finance": MagicMock(side_effect=RuntimeError("boom"))}
-        result = run_domain_agent_mode(self._args(), logger, **self._kwargs(ai_agents, console))
-        assert result == 1
-        logger.exception.assert_any_call("Domain agent mode failed")
-        assert GOLDEN_DOMAIN_GENERIC in _printed(console)
-
-    def test_keyboard_interrupt_propagates(self):
-        # Pre-refactor the domain handler had no ``except KeyboardInterrupt``;
-        # the interrupt must still propagate (no cancel_label on its boundary).
-        console = MagicMock()
-        logger = MagicMock()
-        ai_agents = {"finance": MagicMock(side_effect=KeyboardInterrupt())}
-        with pytest.raises(KeyboardInterrupt):
-            run_domain_agent_mode(self._args(), logger, **self._kwargs(ai_agents, console))
-
-
-# ── characterization: run_ai_copilot_mode ─────────────────────────────
-
-
-class TestAiCopilotModeErrorParity:
-    def _args(self):
-        return argparse.Namespace(non_interactive=True, dry_run=False)
-
-    def _kwargs(self, copilot_class, console):
-        return dict(
-            copilot_class=copilot_class,
-            get_cli_arg_fn=lambda a, name, default=None: default,
-            load_context_fn=MagicMock(),
-            get_target_directory_fn=MagicMock(return_value=Path("/tmp/p")),
-            context_error_cls=Exception,
-            build_interview_summary_fn=MagicMock(return_value={}),
-            console_factory=lambda: console,
-        )
-
-    def test_generic_exception_returns_1_with_golden_message(self):
-        console = MagicMock()
-        logger = MagicMock()
-        copilot_class = MagicMock(side_effect=RuntimeError("boom"))
-        result = run_ai_copilot_mode(self._args(), logger, **self._kwargs(copilot_class, console))
-        assert result == 1
-        logger.exception.assert_any_call("AI Copilot mode failed")
-        printed = _printed(console)
-        assert GOLDEN_AI_GENERIC in printed
-        assert _style_of(console, GOLDEN_AI_GENERIC) == "red"
-        # No api-key hint for a non-key error.
-        assert "fluid ai setup" not in printed
-
-    def test_key_error_exception_prints_setup_tip(self):
-        console = MagicMock()
-        logger = MagicMock()
-        copilot_class = MagicMock(side_effect=RuntimeError("missing api_key for provider"))
-        result = run_ai_copilot_mode(self._args(), logger, **self._kwargs(copilot_class, console))
-        assert result == 1
-        assert GOLDEN_AI_TIP in _printed(console)
-
-    def test_copilot_generation_error_shows_friendly_message(self):
-        console = MagicMock()
-        logger = MagicMock()
-        copilot_class = MagicMock(
-            side_effect=CopilotGenerationError(
-                "internal_error_code",
-                "friendly message",
-                suggestions=["try this"],
-            )
-        )
-        result = run_ai_copilot_mode(self._args(), logger, **self._kwargs(copilot_class, console))
-        assert result == 1
-        printed = _printed(console)
-        assert GOLDEN_AI_COPILOT_ERR in printed
-        assert _style_of(console, GOLDEN_AI_COPILOT_ERR) == "red"
-        assert _style_of(console, "• try this") == "dim"
-        assert "• try this" in printed
-        # The internal error code must never surface to the user.
-        assert "internal_error_code" not in printed
-
-    def test_copilot_generation_error_without_console_uses_plain_fallback(self):
-        logger = MagicMock()
-        copilot_class = MagicMock(
-            side_effect=CopilotGenerationError(
-                "internal_error_code",
-                "friendly message",
-                suggestions=["try this"],
-            )
-        )
-        with (
-            patch("fluid_build.cli.forge_modes.console_error") as mock_err,
-            patch("fluid_build.cli.forge_modes.cprint_literal") as mock_cprint,
-        ):
-            result = run_ai_copilot_mode(
-                self._args(),
-                logger,
-                **self._kwargs(copilot_class, None),
-            )
-        assert result == 1
-        mock_err.assert_any_call("AI Copilot failed: friendly message")
-        mock_cprint.assert_any_call("  • try this")
-
-    def test_keyboard_interrupt_returns_130(self):
-        console = MagicMock()
-        logger = MagicMock()
-        copilot_class = MagicMock(side_effect=KeyboardInterrupt())
-        result = run_ai_copilot_mode(self._args(), logger, **self._kwargs(copilot_class, console))
-        assert result == 130
-        logger.info.assert_any_call("AI Copilot cancelled by user")
-
-
 # ── a failure is logged once, noted for --agent, described as data ────
 
 
@@ -513,37 +362,6 @@ class TestDescribeForgeFailure:
 
 
 class TestHandlersNoteTheirFailure:
-    def test_the_agent_loop_notes_a_typed_failure_without_a_traceback(
-        self, tmp_path, caplog, monkeypatch
-    ):
-        from fluid_build.cli._forge_mode_errors import take_forge_failure
-        from fluid_build.cli._template_mode import _create_project_agent_loop
-
-        error = CopilotGenerationError("copilot_no_llm_provider", "No LLM provider configured.")
-
-        def _resolve(*args, **kwargs):
-            raise error
-
-        monkeypatch.setattr(
-            "fluid_build.cli.forge_copilot_llm_providers.resolve_llm_config", _resolve
-        )
-        logger = logging.getLogger("test.forge.agent_loop")
-        with caplog.at_level(logging.DEBUG, logger=logger.name):
-            ok = _create_project_agent_loop(
-                target_dir=tmp_path,
-                context={},
-                copilot_options={},
-                copilot=None,
-                dry_run=False,
-                logger=logger,
-                console=None,
-            )
-
-        assert ok is False
-        assert take_forge_failure() is error
-        assert not [r for r in caplog.records if r.exc_info and r.levelno > logging.DEBUG]
-        # Nothing printed it (no console), so its log line stays on the console.
-        assert caplog.records[0].fluid_console_shown is False
 
     @pytest.mark.parametrize(
         "exc",

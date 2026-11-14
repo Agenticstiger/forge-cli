@@ -98,8 +98,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "--allow-metadata-service: one with no non-blank key, secret or token "
             "of its own as a value, a path to a file on this host (a key file, "
             "gcloud ADC), a named AWS profile, or an endpoint this host's netrc "
-            "or DataHub settings would sign in to. "
-            "forge_from_source also needs this flag for a JDBC URI that carries a password."
+            "or DataHub settings would sign in to."
         ),
     )
     serve.add_argument(
@@ -111,9 +110,6 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "or through an inline credential block that authenticates as this host "
             "(a named AWS profile, a key file on this host, a netrc login, an Azure CLI or "
             "browser login, or Google ADC included). "
-            "forge_from_source also needs this flag for a JDBC URI that would use this "
-            "host's database credentials, files or identity; there the client's "
-            "allow_metadata_service plays no part. "
             "OFF by default: it uses this host's ambient cloud identity, so a request is "
             "refused unless the operator opts in. FLUID_ALLOW_METADATA_SERVICE=1 in the "
             "server's environment opts in too, and goes further: it turns the fallback on "

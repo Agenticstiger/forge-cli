@@ -6,8 +6,7 @@
 Today every staged agent does one LLM call with a static prompt.
 World-class agentic systems let agents call tools mid-draft —
 e.g. BuilderAgent calls ``inspect_table`` against the catalog
-while drafting, ModelerAgent retrieves from ``memory/semantic``
-mid-prompt instead of seeded once at start.
+while drafting.
 
 This module ships the registry primitive. Agents that adopt
 tool-use:
@@ -151,18 +150,16 @@ class ToolRegistry:
 def build_default_tool_registry(
     *,
     catalog_adapter: Optional[Any] = None,
-    store: Optional[Any] = None,
 ) -> ToolRegistry:
     """Build the default tool catalog for v1.5+ staged agents.
 
     When a catalog adapter is available, register catalog
     introspection tools (``inspect_table``, ``list_tables``,
-    ``get_lineage``). When a store is available, register
-    semantic-memory retrieval (``search_semantic_memory``).
+    ``get_lineage``).
 
-    Both are best-effort — missing inputs simply produce a
-    smaller registry. The modeler's tool loop (v1.6) checks
-    ``registry.tools`` to pick which tools the LLM can call.
+    Best-effort: a missing adapter simply produces an empty registry.
+    The modeler's tool loop (v1.6) checks ``registry.tools`` to pick which
+    tools the LLM can call.
     """
     registry = ToolRegistry()
 
@@ -202,39 +199,6 @@ def build_default_tool_registry(
                 },
                 handler=lambda **kwargs: [
                     t.model_dump() for t in catalog_adapter.list_tables(_make_scope(**kwargs))
-                ],
-            )
-        )
-
-    if store is not None:
-        registry.register(
-            Tool(
-                name="search_semantic_memory",
-                description=(
-                    "Search the memory/semantic namespace for prior forged "
-                    "models similar to the current draft. Use when an entity "
-                    "or relationship feels familiar — there may be a past "
-                    "model that can be a starting point."
-                ),
-                input_schema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "limit": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 10,
-                            "default": 3,
-                        },
-                    },
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
-                handler=lambda query, limit=3: [
-                    {"key": getattr(r, "key", None), "value": getattr(r, "value", None)}
-                    for r in (
-                        store.search("memory/semantic", query, mode="hybrid", limit=limit) or []
-                    )
                 ],
             )
         )

@@ -7,26 +7,15 @@ from __future__ import annotations
 
 __all__ = [
     "ask_numbered_choice",
-    "build_copilot_analysis_text",
-    "build_standard_next_steps",
-    "print_assumptions_panel",
-    "print_copilot_intro_panel",
-    "print_copilot_recovery_panel",
     "print_forge_performance_summary",
-    "print_free_tier_guide",
     "print_interview_phase",
     "print_welcome_panel",
-    "show_copilot_analysis",
-    "show_domain_analysis",
-    "show_lines_panel",
-    "show_next_steps_panel",
 ]
 
 
 import os
 import sys
-from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Mapping, Sequence
 
 try:
     from rich.panel import Panel
@@ -267,29 +256,16 @@ def ask_numbered_choice(
     return options[default - 1][0]
 
 
-def show_lines_panel(
-    console: Any,
-    lines: Sequence[str],
-    *,
-    title: str,
-    border_style: str,
-) -> None:
-    """Print a simple multi-line panel when Rich is available."""
-    if not console or not RICH_AVAILABLE or not lines:
-        return
-    console.print(_build_panel("\n".join(lines), title=title, border_style=border_style))
-
-
 def print_welcome_panel(console: Any) -> None:
     """Render the interactive mode chooser welcome panel."""
     if not console or not RICH_AVAILABLE:
         return
     welcome_text = (
         "🔨 **Forge** — Add a data product to this workspace\n\n"
-        "AI Copilot will interview you and generate a validated contract.\n"
+        "Your coding agent, or one LLM call, writes the contract with the FLUID skills.\n"
         "[dim]Use [bold]--blank[/bold] to skip AI and start from an empty contract.[/dim]\n\n"
-        "[dim]Power-user options: [bold]fluid forge --help[/bold] — LLM config, "
-        "memory, discovery flags.[/dim]"
+        "[dim]Power-user options: [bold]fluid forge --help[/bold] (LLM and "
+        "coding-agent flags).[/dim]"
     )
     console.print(_build_panel(welcome_text, title="FLUID Forge", border_style="blue"))
 
@@ -314,231 +290,6 @@ def print_interview_phase(
         console.print(f"\n[dim cyan]{breadcrumb}[/dim cyan]\n")
     else:
         console.print(f"\n{breadcrumb}\n")
-
-
-def print_copilot_intro_panel(console: Any) -> None:
-    """Render the concise intro used when copilot is ready to start."""
-    if not console or not RICH_AVAILABLE:
-        return
-    intro_text = """
-🤖 **AI Copilot** is ready
-
-Here's what happens next:
-  1. I'll ask about your goal and data sources
-  2. Suggest a template and output format
-  3. Generate a validated contract.fluid.yaml
-  4. Scaffold the project files
-
-[dim]Answer with a number, short phrase, or natural language.
-Type 'skip' or 'not sure' — I'll pick sensible defaults.[/dim]
-    """.strip()
-    console.print(_build_panel(intro_text, title="Starting AI Copilot", border_style="blue"))
-
-
-def print_copilot_recovery_panel(
-    console: Any,
-    *,
-    message: str,
-    suggestions: Sequence[str],
-) -> None:
-    """Render the onboarding recovery panel when copilot prerequisites are missing."""
-    if not console or not RICH_AVAILABLE:
-        return
-    lines = [
-        "🤖 **AI Copilot** can't start yet",
-        "",
-        message,
-    ]
-    if suggestions:
-        lines.extend(["", "Helpful next steps:"])
-        lines.extend(f"• {item}" for item in suggestions[:4])
-    console.print(
-        _build_panel("\n".join(lines), title="Copilot Setup Needed", border_style="yellow")
-    )
-
-
-def print_free_tier_guide(console: Any) -> None:
-    """Show links to free LLM API key providers."""
-    if not console or not RICH_AVAILABLE:
-        return
-    lines = [
-        "[bold]No API key? Here's how to get one free:[/bold]",
-        "",
-        "  [cyan]Google AI Studio[/cyan]  Free Gemini key (15 req/min)",
-        "  https://aistudio.google.com/apikey",
-        "",
-        "  [cyan]OpenRouter[/cyan]        Free models available",
-        "  https://openrouter.ai/keys",
-        "",
-        "  [cyan]Ollama[/cyan]            Run models locally (no key needed)",
-        "  https://ollama.com/download",
-    ]
-    show_lines_panel(console, lines, title="Free AI Options", border_style="blue")
-
-
-def print_assumptions_panel(console: Any, assumptions: Sequence[str]) -> None:
-    """Render the bounded assumptions summary shown after interviews."""
-    if not console or not RICH_AVAILABLE or not assumptions:
-        return
-    assumption_lines = "\n".join(f"• {item}" for item in assumptions[:4])
-    console.print(_build_panel(assumption_lines, title="📝 Assumptions Used", border_style="cyan"))
-
-
-def build_copilot_analysis_text(
-    *,
-    context: Mapping[str, Any],
-    suggestions: Mapping[str, Any],
-    use_case_label: str,
-    memory_lines: Sequence[str],
-) -> str:
-    """Build the copilot analysis panel body."""
-    lines = [
-        f"🎯 **Project Goal:** {context.get('project_goal', 'Not specified')}",
-        f"📊 **Data Sources:** {context.get('data_sources', 'Not specified')}",
-        f"🏗️ **Use Case:** {use_case_label}",
-        f"⚙️ **Complexity:** {context.get('complexity', 'intermediate')}",
-        "",
-        "🤖 **AI Recommendations:**",
-        f"• **Template:** {suggestions['recommended_template']}",
-        f"• **Provider:** {suggestions['recommended_provider']}",
-        "• **Patterns:** "
-        + (", ".join(suggestions.get("recommended_patterns", [])) or "Standard patterns"),
-        "",
-        "💡 **Architecture Suggestions:**",
-    ]
-
-    for suggestion in suggestions.get("architecture_suggestions", []):
-        lines.append(f"• {suggestion}")
-
-    best_practices = list(suggestions.get("best_practices", []) or [])
-    if best_practices:
-        lines.extend(["", "✨ **Best Practices:**"])
-        lines.extend(f"• {practice}" for practice in best_practices)
-
-    assumptions = list(context.get("assumptions_used") or [])
-    if assumptions:
-        lines.extend(["", "📝 **Assumptions Used:**"])
-        lines.extend(f"• {item}" for item in assumptions[:4])
-
-    if memory_lines:
-        lines.extend(["", "🧠 **Project Memory Guidance:**"])
-        lines.extend(f"• {line}" for line in memory_lines)
-
-    return "\n".join(lines)
-
-
-def show_copilot_analysis(
-    console: Any,
-    *,
-    context: Mapping[str, Any],
-    suggestions: Mapping[str, Any],
-    use_case_label: str,
-    memory_lines: Sequence[str],
-) -> None:
-    """Render the copilot AI analysis panel."""
-    if not console or not RICH_AVAILABLE:
-        return
-    text = build_copilot_analysis_text(
-        context=context,
-        suggestions=suggestions,
-        use_case_label=use_case_label,
-        memory_lines=memory_lines,
-    )
-    console.print(_build_panel(text.strip(), title="🧠 AI Analysis", border_style="blue"))
-
-
-def build_domain_analysis_text(
-    *,
-    goal: str,
-    data_sources: str,
-    product_type: str,
-    suggestions: Mapping[str, Any],
-    domain: str,
-) -> str:
-    """Build the shared domain-agent analysis body."""
-    patterns = ", ".join(suggestions.get("recommended_patterns", []) or ["Standard scaffolding"])
-    return (
-        f"🎯 **Project Goal:** {goal}\n"
-        f"📊 **Data Sources:** {data_sources}\n"
-        f"🏷️ **Domain Focus:** {product_type}\n\n"
-        "🤖 **Recommendations:**\n"
-        f"• Template: {suggestions.get('recommended_template')}\n"
-        f"• Provider: {suggestions.get('recommended_provider')}\n"
-        f"• Patterns: {patterns}\n\n"
-        f"[dim]Optimized for {domain} workflows and guardrails.[/dim]"
-    )
-
-
-def show_domain_analysis(
-    console: Any,
-    *,
-    goal: str,
-    data_sources: str,
-    product_type: str,
-    suggestions: Mapping[str, Any],
-    domain: str,
-) -> None:
-    """Render the domain-agent analysis panel."""
-    if not console or not RICH_AVAILABLE:
-        return
-    console.print(
-        _build_panel(
-            build_domain_analysis_text(
-                goal=goal,
-                data_sources=data_sources,
-                product_type=product_type,
-                suggestions=suggestions,
-                domain=domain,
-            ).strip(),
-            title="🧠 AI Analysis",
-            border_style="blue",
-        )
-    )
-
-
-def build_standard_next_steps(
-    *,
-    target_dir: Optional[Path] = None,
-    provider: str = "local",
-) -> str:
-    """Build the shared official-command next-steps text."""
-    lines: list[str] = []
-    if target_dir:
-        contract_path = target_dir / "contract.fluid.yaml"
-        lines.extend(
-            [
-                f"[bold]Project folder:[/bold]  {target_dir}",
-                f"[bold]Contract file:[/bold]   {contract_path}",
-                "",
-                "[bold]Next steps:[/bold]",
-                f"  cd {target_dir}",
-                f"  {FORGE_VALIDATE_COMMAND}",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "[bold]Next steps:[/bold]",
-                f"  {FORGE_VALIDATE_COMMAND}",
-            ]
-        )
-    return "\n".join(lines)
-
-
-def show_next_steps_panel(
-    console: Any,
-    *,
-    target_dir: Optional[Path] = None,
-    provider: str = "local",
-) -> None:
-    """Render the shared next-steps panel."""
-    if not console or not RICH_AVAILABLE:
-        return
-    text = build_standard_next_steps(
-        target_dir=target_dir,
-        provider=provider,
-    )
-    console.print(_build_panel(text.strip(), title="Forge Complete", border_style="green"))
 
 
 # ---------------------------------------------------------------------------

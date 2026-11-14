@@ -236,12 +236,11 @@ def _mcp_server_block(python_bin: str) -> Dict:
         "disabled": False,
         "autoApprove": [
             # Read-only tools the agent can auto-approve. Mutating tools
-            # (update_entity, add_relationship, regenerate_physical,
-            # forge_from_source) still surface a confirmation.
+            # (update_entity, add_relationship, regenerate_physical)
+            # still surface a confirmation.
             "read_logical_model",
             "validate_contract",
             "diff_models",
-            "search_semantic_memory",
             "list_source_adapters",
             "list_source_tables",
             "inspect_source_table",

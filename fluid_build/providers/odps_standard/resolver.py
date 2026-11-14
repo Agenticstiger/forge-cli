@@ -204,8 +204,7 @@ class ContractResolver:
                 raise RemoteFetchDisabled(
                     f"Cannot resolve contractId {contract_id!r}: remote "
                     f"fetch is disabled by default (SSRF defence). "
-                    f"Opt in with --allow-remote (fluid opds import), "
-                    f"--seed-allow-remote (fluid forge), or "
+                    f"Opt in with --allow-remote (fluid opds import) or "
                     f"allow_remote=True (Python library). The fetcher "
                     f"rejects internal/private IPs and pins the validated "
                     f"IP at the TCP layer; even so, only enable when you "
@@ -275,7 +274,7 @@ class ContractResolver:
             raise RemoteFetchDisabled(
                 f"Cannot resolve contractId {contract_id!r} via hint URL: "
                 f"remote fetch is disabled by default (SSRF defence). "
-                f"Opt in with --allow-remote, --seed-allow-remote, or "
+                f"Opt in with --allow-remote or "
                 f"allow_remote=True."
             )
         tried.append(str(hint))

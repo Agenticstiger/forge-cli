@@ -17,7 +17,6 @@ __all__ = [
     "BUILTIN_LLM_PROVIDERS",
     "PROVIDER_DISPLAY_NAMES",
     "check_llm_readiness",
-    "clear_api_key_from_keyring",
     "get_catalog_default",
     "get_catalog_routing_model",
     "get_catalog_tier_models",
@@ -38,11 +37,8 @@ __all__ = [
     "resolve_llm_config",
     "resolve_model_name",
     "resolve_ollama_model",
-    "save_api_key_to_keyring",
     "call_llm",
     "call_llm_streaming",
-    "streaming_is_enabled",
-    "live_provider_models",
 ]
 
 import json
@@ -142,18 +138,6 @@ def _get_timeout_seconds(args: Any, env: Mapping[str, str]) -> int:
     except (TypeError, ValueError):
         return 120
     return max(1, min(3600, value))
-
-
-def streaming_is_enabled() -> bool:
-    """Slice UX-I kill-switch for SSE streaming of LLM responses.
-
-    Set ``FLUID_LLM_STREAMING=0`` to disable streaming across all
-    providers.  The legacy blocking ``call_llm`` path is preserved
-    in full; every call site that wants streaming checks this helper
-    and falls back to ``call_llm`` when it returns False.
-    """
-    value = os.environ.get("FLUID_LLM_STREAMING", "1").strip().lower()
-    return value not in {"0", "false", "no", "off"}
 
 
 # Provider → environment variable mapping.  Shared across ai_setup.py and
@@ -496,8 +480,8 @@ _LITELLM_ALTERNATIVES = (
 def _require_litellm(provider_name: str) -> None:
     """Fail now, before any context or memory is loaded, when litellm is absent.
 
-    Only the litellm-backed providers reach this; keyless coding agents and
-    ``mcp-sampling`` return earlier. The error is a
+    Only the litellm-backed providers reach this; keyless coding agents
+    return earlier. The error is a
     :class:`~fluid_build._optional.MissingOptionalDependency`, which the CLI
     prints as the install line and exits 1 on, with no traceback.
     """
@@ -520,13 +504,6 @@ def get_llm_provider(name: str) -> LlmProvider:
     → ``"anthropic"``) and dispatched through
     :func:`get_litellm_provider`.
 
-    Special case ``"mcp-sampling"`` / ``"mcp_sampling"``: returns the
-    :class:`MCPSamplingProvider` shim which routes LLM calls back to the
-    MCP client (the IDE) via ``sampling/createMessage``. The IDE pays for
-    the LLM; forge never sees an API key. Requires an active sampling
-    channel — typically installed when forge runs inside the ``forge_run``
-    MCP tool.
-
     Third-party plugins (entry-point group ``fluid_build.llm_providers``) are
     resolved AFTER the built-ins and BEFORE the litellm catch-all: a built-in
     name always wins a clash, then a discovered plugin resolves, and finally any
@@ -539,8 +516,6 @@ def get_llm_provider(name: str) -> LlmProvider:
     front, carrying the install line and the keyless alternatives.
     """
     normalized = (name or "").strip().lower()
-    if normalized in ("mcp-sampling", "mcp_sampling"):
-        return MCPSamplingProvider()
     # Coding-agent providers (claude-code/codex/cursor/kiro) shell out to a
     # local agent CLI — keyless for Claude Code, key-reusing for the rest.
     # Resolved BEFORE the litellm delegation so their hyphenated names aren't
@@ -577,162 +552,6 @@ def get_llm_provider(name: str) -> LlmProvider:
     return get_litellm_provider(canonical)
 
 
-class MCPSamplingProvider(LlmProvider):
-    """Route LLM calls through the MCP client's ``sampling/createMessage``.
-
-    Why this exists
-    ---------------
-    Data-team members on Cursor / Kiro / Claude Code shouldn't need a
-    separate LLM API key — their IDE already pays for an LLM. MCP sampling
-    is the canonical spec mechanism: the server (forge) asks the client
-    (IDE) to make the LLM call. Human-in-the-loop is mandatory per spec —
-    the IDE shows the user the prompt before sending and the user approves.
-
-    Implementation
-    --------------
-    Borrowed-not-built on the official
-    `modelcontextprotocol/python-sdk <https://github.com/modelcontextprotocol/python-sdk>`_
-    (which itself is built on `anyio <https://anyio.readthedocs.io>`_).
-    The bridge to the SDK is the ``(ctx, anyio_token)`` pair stored in
-    :class:`contextvars.ContextVar` (Python stdlib, request-scoped state
-    propagates across ``asyncio.to_thread`` automatically since 3.9). The
-    FastMCP ``forge_run`` tool installs them on entry and clears on exit.
-    From a worker thread (forge runs in ``asyncio.to_thread``),
-    :meth:`invoke_blocking` calls :func:`anyio.from_thread.run` —
-    the canonical anyio primitive for "call async code from a
-    non-event-loop thread" — to dispatch ``ctx.session.create_message``
-    back into the SDK's loop. The SDK handles every detail of the
-    spec-compliant wire format, request-id correlation, capability
-    checks, and human-in-the-loop UX.
-
-    How it's invoked
-    ----------------
-    Set ``FLUID_LLM_BACKEND=mcp-sampling`` (or pass ``--llm-provider
-    mcp-sampling``). ``call_llm(provider, ...)`` then routes through this
-    class's :meth:`invoke_blocking`, which reads the active sampling
-    context and raises an actionable :class:`CopilotGenerationError` if
-    forge is running outside an MCP tool-call context.
-
-    Streaming is not supported in v1; callers fall back to blocking.
-    """
-
-    name = "mcp-sampling"
-    default_model = "mcp-sampling"
-
-    def default_endpoint(self, model: str, env: Mapping[str, str]) -> str:
-        # No HTTP endpoint — the transport is stdio JSON-RPC to the MCP client.
-        return "mcp://sampling"
-
-    def build_request(
-        self, config: "LlmConfig", system_prompt: str, user_prompt: str
-    ) -> tuple[Dict[str, str], Dict[str, Any]]:
-        # ``call_llm`` calls ``invoke_blocking`` directly on the provider —
-        # this method is only invoked via the legacy HTTP path which doesn't
-        # apply to MCP sampling. Return inert placeholders so the abstract
-        # contract is satisfied.
-        return ({}, {})
-
-    def extract_text(self, response_json: Dict[str, Any]) -> str:
-        # Same: not used by the MCP sampling path.
-        return str(response_json.get("text", ""))
-
-    def invoke_blocking(
-        self,
-        config: "LlmConfig",
-        system_prompt: str,
-        user_prompt: str,
-        *,
-        extra_payload: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        # Lazy imports avoid an import cycle: ``mcp.py`` imports the
-        # provider catalog from this module (via LiteLLM), so importing
-        # ``mcp`` at module-load time here would deadlock.
-        from fluid_build._mcp_sampling_context import get_sampling_context
-
-        ctx, anyio_token = get_sampling_context()
-        if ctx is None or anyio_token is None:
-            raise CopilotGenerationError(
-                "mcp_sampling_unavailable",
-                "MCP sampling context not active. forge_run installs it for "
-                "the duration of an MCP tool call; outside that context the "
-                "IDE has no way to receive sampling requests.",
-                suggestions=[
-                    "Invoke forge via the `forge_run` MCP tool from your IDE "
-                    "(installs the sampling context automatically).",
-                    "Or set FLUID_LLM_BACKEND=litellm and an LLM API key "
-                    "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY).",
-                ],
-            )
-
-        # Imported only once a sampling context exists: that context is installed
-        # by the MCP server, so the SDK is present whenever this line is reached,
-        # and a terminal run without ``mcp`` gets the no-context error above, not
-        # an ImportError.
-        import anyio.from_thread
-
-        from fluid_build._optional import require
-
-        mcp_types = require("mcp.types", "mcp", "MCP sampling")
-        SamplingMessage, TextContent = mcp_types.SamplingMessage, mcp_types.TextContent
-
-        max_tokens = int(getattr(config, "max_tokens", 4096) or 4096)
-        temperature = getattr(config, "temperature", None)
-        sampling_kwargs: Dict[str, Any] = {
-            "messages": [
-                SamplingMessage(
-                    role="user",
-                    content=TextContent(type="text", text=user_prompt),
-                )
-            ],
-            "max_tokens": max_tokens,
-            "system_prompt": system_prompt,
-            "include_context": "thisServer",
-        }
-        if temperature is not None:
-            sampling_kwargs["temperature"] = float(temperature)
-
-        # We're on a worker thread (forge runs under ``asyncio.to_thread``).
-        # ``anyio.from_thread.run`` dispatches the coroutine to the SDK's
-        # event loop and blocks this thread until the response arrives.
-        # The ``token`` was captured by the ``forge_run`` tool via
-        # ``anyio.lowlevel.current_token()`` and propagated here through
-        # the ContextVar (auto-propagates across ``asyncio.to_thread``).
-        async def _do_sample() -> Any:
-            return await ctx.session.create_message(**sampling_kwargs)
-
-        try:
-            result = anyio.from_thread.run(_do_sample, token=anyio_token)
-        except Exception as exc:  # noqa: BLE001
-            raise CopilotGenerationError(
-                "mcp_sampling_failed",
-                f"MCP sampling round-trip failed: {exc}",
-                suggestions=[
-                    "Check that your IDE supports the 'sampling' capability.",
-                    "Fall back to FLUID_LLM_BACKEND=litellm + an API key.",
-                ],
-            ) from exc
-
-        # CreateMessageResult.content is either a TextContent or a list.
-        content = result.content
-        if hasattr(content, "text"):
-            return content.text
-        if isinstance(content, list):
-            return "".join(b.text for b in content if hasattr(b, "text"))
-        return ""
-
-    def invoke_streaming(
-        self,
-        config: "LlmConfig",
-        system_prompt: str,
-        user_prompt: str,
-        *,
-        extra_payload: Optional[Dict[str, Any]] = None,
-    ) -> "Iterator[str]":
-        # Streaming via MCP sampling isn't in the spec yet — fall back
-        # to blocking. The caller's loop sees one chunk == full text.
-        yield self.invoke_blocking(config, system_prompt, user_prompt, extra_payload=extra_payload)
-
-
 # ---------------------------------------------------------------------------
 # Config Resolution
 # ---------------------------------------------------------------------------
@@ -757,25 +576,6 @@ def _model_preflight_requested(args: Any, env: Mapping[str, str]) -> bool:
     )
 
 
-def live_provider_models(
-    provider_name: str,
-    *,
-    api_key: Optional[str] = None,
-    environ: Optional[Mapping[str, str]] = None,
-    named: bool = False,
-) -> Optional[List[str]]:
-    """Fetch live provider model ids when supported by the adapter.
-
-    ``named``: the operator named this provider, so ``FLUID_LLM_API_KEY`` may
-    be its key (see ``provider_resolve._resolve_api_key``).
-    """
-    env = dict(environ or os.environ)
-    provider = get_llm_provider(provider_name)
-    return provider.list_available_models(
-        api_key or _resolve_api_key(provider.name, env, named=named), env
-    )
-
-
 def has_llm_api_key(
     provider_name: str,
     environ: Optional[Mapping[str, str]] = None,
@@ -784,7 +584,7 @@ def has_llm_api_key(
 ) -> bool:
     """Return whether the provider can resolve credentials without exposing them.
 
-    ``named`` as for :func:`live_provider_models`.
+    ``named`` as the provider name it was asked for.
     """
     env = dict(environ or os.environ)
     provider = get_llm_provider(provider_name)
@@ -795,20 +595,16 @@ def has_llm_api_key(
 
 # Providers that never require an LLM API key — the call is paid for
 # elsewhere, so the api-key gate below must skip them. ``ollama`` runs a
-# local server; ``mcp-sampling`` routes the call back through the MCP client
-# (the IDE) via ``sampling/createMessage`` so the IDE's own LLM answers and
-# forge never sees a key. Part B's coding-agent providers
+# local server. Part B's coding-agent providers
 # (claude-code/codex/cursor/kiro) are appended here too — they shell out to an
 # installed agent CLI, and any per-agent key (CODEX_API_KEY, CURSOR_API_KEY,
 # KIRO_API_KEY) is validated *inside* the provider at call time, not at this
 # resolve-time gate. ``provider.name`` is always canonical (hyphen form); the
 # underscore alias is included defensively.
-_KEYLESS_PROVIDERS: frozenset = frozenset(
-    {"ollama", "mcp-sampling", "mcp_sampling", "claude-code", "codex", "cursor", "kiro"}
-)
+_KEYLESS_PROVIDERS: frozenset = frozenset({"ollama", "claude-code", "codex", "cursor", "kiro"})
 
-# The keyless providers that do not go through litellm: the call is made by the
-# MCP client or by an installed agent CLI, so a missing litellm extra is no obstacle.
+# The keyless providers that do not go through litellm: the call is made by an
+# installed agent CLI, so a missing litellm extra is no obstacle.
 _NON_LITELLM_PROVIDERS: frozenset = _KEYLESS_PROVIDERS - {"ollama"}
 
 
@@ -942,7 +738,7 @@ def fill_llm_args_from_setup(
     reading the run's flags, so what the operator stated wins:
 
     * A named provider (:func:`named_llm_provider`) takes nothing from setup.
-    * An agent that setup found (a coding-agent CLI or MCP sampling) is not used
+    * An agent that setup found (a coding-agent CLI) is not used
       when the run states an endpoint or a model, or runs the agent loop, as in
       a run without a TTY (``provider_resolve._passed_over``).
     * Otherwise setup's provider goes into ``args.llm_provider``, recorded first
@@ -1033,8 +829,7 @@ def _provider_is_named(args: Any, env: Mapping[str, str], provider_name: str) ->
 
 _AGENT_LOOP_ALTERNATIVES = (
     "Or author without it: --template starter. The agent loop needs a provider that "
-    "supports tool use, which the keyless providers (claude-code, codex, cursor, kiro, "
-    "mcp-sampling) do not."
+    "supports tool use, which the keyless providers (claude-code, codex, cursor, kiro) do not."
 )
 
 
@@ -1154,8 +949,7 @@ def resolve_llm_config(args: Any, environ: Optional[Mapping[str, str]] = None) -
                 "Set the provider's own key variable, or FLUID_LLM_API_KEY with --llm-provider",
                 "Examples: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY",
                 "For local models, use --llm-provider ollama and optionally --llm-endpoint",
-                "For keyless authoring: run forge from your IDE (mcp-sampling), or use a "
-                "local coding agent (e.g. --llm-provider claude-code)",
+                "For keyless authoring: use a local coding agent (e.g. --llm-provider claude-code)",
             ],
         )
 
@@ -1511,7 +1305,7 @@ def _record_call_in_run_tracker(
         delta_in = max(0, _cumulative_usage["input_tokens"] - int(before.get("input_tokens", 0)))
         delta_out = max(0, _cumulative_usage["output_tokens"] - int(before.get("output_tokens", 0)))
         # Pull the litellm-supplied USD + cache tokens off the thread
-        # locals if available; non-litellm providers (MCP sampling) yield
+        # locals if available; non-litellm providers (coding agents) yield
         # None/zero which still drives a correct call into record_call.
         usd_override: Optional[float] = None
         cache_creation = 0
@@ -1706,9 +1500,7 @@ from fluid_build.llm.provider_resolve import (  # noqa: E402,F401
     _resolve_api_key,
     _saved_choice_for,
     ambiguous_keys_message,
-    clear_api_key_from_keyring,
     no_provider_message,
-    save_api_key_to_keyring,
 )
 
 
@@ -1860,7 +1652,7 @@ def check_llm_readiness(environ: Optional[Mapping[str, str]] = None) -> LlmReadi
     model = env.get("FLUID_LLM_MODEL") or saved.get("model") or provider.default_model
     endpoint = env.get("FLUID_LLM_ENDPOINT") or provider.default_endpoint(model, env)
 
-    # Every built-in provider except the keyless agent/MCP ones runs through
+    # Every built-in provider except the keyless agent ones runs through
     # litellm, which is an extra since 0.28.0. A configured key is not "ready" without it.
     from fluid_build._optional import is_available
 
