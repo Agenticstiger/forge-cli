@@ -587,3 +587,148 @@ def test_a_path_no_rule_can_carry_gets_no_rules_and_no_headless_run(
         "claude", _config("claude-code"), request, headless=False, prompt="P"
     )
     assert not any(t.startswith("Edit(") for t in argv[argv.index("--allowedTools") + 1].split(","))
+
+
+def test_a_failed_agent_refine_puts_the_original_back_and_keeps_a_draft(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = VALID + "description: keep me\n"
+    (workspace / "contract.fluid.yaml").write_text(original, encoding="utf-8")
+    _stub_agent(monkeypatch)  # the agent overwrites the contract with VALID
+    monkeypatch.setattr(
+        forge_ai,
+        "validate_contract",
+        lambda path, workspace: forge_ai.ValidationOutcome(False, ["builds: required"]),
+    )
+    args = _args(refine="contract.fluid.yaml")
+    with pytest.raises(CopilotGenerationError) as exc:
+        forge_ai.drive_headless(
+            "claude-code", forge_ai.build_request(args), _config("claude-code"), args=args
+        )
+    assert exc.value.event == "forge_contract_invalid"
+    assert (workspace / "contract.fluid.yaml").read_text(encoding="utf-8") == original
+    drafts = list(workspace.glob(".fluid/agents/*/contract.draft.yaml"))
+    assert len(drafts) == 1 and drafts[0].read_text(encoding="utf-8") == VALID
+
+
+def test_a_failed_fresh_agent_run_leaves_no_invalid_contract(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_agent(monkeypatch)
+    monkeypatch.setattr(
+        forge_ai,
+        "validate_contract",
+        lambda path, workspace: forge_ai.ValidationOutcome(False, ["builds: required"]),
+    )
+    with pytest.raises(CopilotGenerationError):
+        forge_ai.drive_headless(
+            "claude-code", forge_ai.build_request(_args()), _config("claude-code"), args=_args()
+        )
+    assert not (workspace / "contract.fluid.yaml").exists()
+    assert list(workspace.glob(".fluid/agents/*/contract.draft.yaml"))
+
+
+def test_an_agent_that_deletes_the_refined_contract_gets_it_restored(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fluid_build.llm.coding_agent as ca
+
+    (workspace / "contract.fluid.yaml").write_text(VALID, encoding="utf-8")
+    _stub_agent(monkeypatch, write=False)
+
+    def deleting_agent(argv, *, stdin, timeout, cwd, env):
+        (Path(cwd) / "contract.fluid.yaml").unlink()
+        return 0, "", ""
+
+    monkeypatch.setattr(ca, "_run_agent", deleting_agent)
+    args = _args(refine="contract.fluid.yaml")
+    with pytest.raises(CopilotGenerationError) as exc:
+        forge_ai.drive_headless(
+            "claude-code", forge_ai.build_request(args), _config("claude-code"), args=args
+        )
+    assert exc.value.event == "forge_contract_missing"
+    assert (workspace / "contract.fluid.yaml").read_text(encoding="utf-8") == VALID
+
+
+def test_headless_timeout_is_a_typed_error(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    import fluid_build.llm.coding_agent as ca
+
+    _stub_agent(monkeypatch)
+
+    def slow(argv, *, stdin, timeout, cwd, env):
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    monkeypatch.setattr(ca, "_run_agent", slow)
+    monkeypatch.setenv("FLUID_FORGE_AGENT_TIMEOUT_SECONDS", "7")
+    with pytest.raises(CopilotGenerationError) as exc:
+        forge_ai.drive_headless(
+            "claude-code", forge_ai.build_request(_args()), _config("claude-code"), args=_args()
+        )
+    assert exc.value.event == "coding_agent_timeout" and "7s" in exc.value.message
+
+
+def test_declining_the_one_call_contract_restores_the_original(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = VALID + "description: keep me\n"
+    (workspace / "contract.fluid.yaml").write_text(original, encoding="utf-8")
+    _stub_llm(monkeypatch, [VALID])
+    monkeypatch.setattr(
+        forge_ai, "validate_contract", lambda path, workspace: forge_ai.ValidationOutcome(True)
+    )
+    monkeypatch.setattr(forge_ai, "_interactive", lambda a: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    args = _args(refine="contract.fluid.yaml", yes=False, non_interactive=False)
+    assert forge_ai.one_call(forge_ai.build_request(args), _config(), args=args) == 1
+    assert (workspace / "contract.fluid.yaml").read_text(encoding="utf-8") == original
+
+
+def test_an_upstream_outside_the_workspace_gets_an_exact_read_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    other = tmp_path / "other" / "contract.fluid.yaml"
+    other.parent.mkdir(parents=True)
+    ws.mkdir()
+    other.write_text(VALID, encoding="utf-8")
+    monkeypatch.chdir(ws)
+    request = forge_ai.build_request(_args(from_product=[str(other)]))
+    assert f"Read(/{other.resolve().as_posix()})" in forge_ai.agent_rules(request)
+
+
+def test_ci_is_scaffolded_after_a_kept_contract_but_not_under_agent(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fluid_build.cli.forge as forge_cli
+
+    calls: List[Path] = []
+    monkeypatch.setattr(
+        forge_cli, "_scaffold_ci_pipeline", lambda a, t, *rest, **kw: calls.append(t)
+    )
+    request = forge_ai.build_request(_args())
+    forge_ai._scaffold_ci(request, _args(ci="github_actions"), console=None)
+    forge_ai._scaffold_ci(request, _args(agent=True), console=None)
+    assert calls == [request.target_dir]
+
+
+def test_validate_runs_the_real_fluid_cli(workspace: Path) -> None:
+    """No stub: the installed ``fluid validate --offline --format json``, as forge runs it."""
+    from fluid_build.agent_skills import SKILLS_DIR
+    from fluid_build.agent_skills.hooks.validate_contract import find_fluid
+
+    if find_fluid() is None:
+        pytest.skip("no `fluid` console script in this environment")
+    bad = workspace / "bad.fluid.yaml"
+    bad.write_text("fluidVersion: 0.7.6\nkind: DataProduct\n", encoding="utf-8")
+    outcome = forge_ai.validate_contract(bad, workspace=workspace)
+    assert not outcome.valid and outcome.errors
+    good = workspace / "good.fluid.yaml"
+    example = (
+        SKILLS_DIR / "authoring-fluid-contracts" / "references" / "example.contract.fluid.yaml"
+    )
+    good.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+    assert forge_ai.validate_contract(good, workspace=workspace).valid

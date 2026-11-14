@@ -55,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       Run `fluid generate transformation`, `fluid export` or `fluid split` after forge instead.
   - `--no-memory` is still accepted and ignored. Installed `scaffold-ide` indexes pass it.
   - `fluid init --agent`, which scaffolded a domain-agent spec.
+- **The copilot memory store's `postgres` and `vector` backends, and the `[vector]` extra.**
+  `FLUID_STORE_BACKEND=postgres` or `vector` now logs a warning and uses the default file store,
+  so `fluid forge data-model` keeps running.
 - **Five MCP tools that ran forge's own LLM inside the calling agent's request:** `forge_run`,
   `forge_from_source`, `score_contract_quality`, `enrich_contract_suggestions` and
   `search_semantic_memory`. Also removed: `--llm-provider mcp-sampling`, which only `forge_run`

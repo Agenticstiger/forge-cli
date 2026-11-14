@@ -334,7 +334,7 @@ way as the table below, and every command takes `-h`.
 | Core | `init` `forge` `validate` `plan` `apply` | Scaffold a product, check it, preview the change, deploy it. |
 | Generate | `generate transformation` `generate schedule` `generate ci` `generate iac` `generate standard` | dbt and SQL; Airflow, Dagster or Prefect DAGs; CI pipelines for seven systems; OpenTofu; open-standard exports. |
 | Governance | `policy-check` `policy-compile` `test` `verify` | Lint the contract, compile policy to native IAM, test against live data, check a deployment after the fact. |
-| Agents | `mcp serve` `mcp output-port serve` `mission` | (`[mcp]` extra) Serve the tooling to an MCP client; serve data through the policy gate; run missions whose success criteria are verified deterministically rather than judged by a model. |
+| Agents | `mcp serve` `mcp output-port serve` `scaffold-ide` | (`[mcp]` extra) Serve the tooling to an MCP client; serve data through the policy gate; install the FLUID Agent Skills into your coding agent. |
 | Brownfield | `import` `split` `publish` `market` | Bring in an existing dbt, Terraform or SQL project; split a contract into fragments; publish to a catalog; search catalogs for products that already exist. |
 | Safety | `bundle` `diff` `rollback` `verify-signature` | Snapshot and restore around an apply; verify a bundle's cosign signature and SLSA attestation. |
 | Utilities | `config` `auth` `doctor` `providers` `exporters` `version` | Credentials, health checks, and what the installed release supports. |

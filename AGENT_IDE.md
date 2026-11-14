@@ -21,7 +21,7 @@ That's it. Your IDE now has:
   `troubleshooting-fluid-errors`, each loaded when its task comes up.
 - **A short always-loaded index** (about 2k characters) that names each skill and
   the rules an agent must never break.
-- **An MCP server** (`fluid mcp serve`, auto-spawned by the IDE) exposing 16
+- **An MCP server** (`fluid mcp serve`, auto-spawned by the IDE) exposing 11
   sandboxed tools for catalog / model / contract work.
 - **Hooks** (Kiro and Claude Code only — Cursor/Cline lack a hook substrate)
   that run `fluid validate` after each contract edit and `fluid bundle` plus
@@ -75,15 +75,12 @@ The plugin also carries the validate hook. Neither route writes the MCP config.
 
 After scaffolding, the IDE's agent has **two complementary channels**:
 
-1. **MCP tools** (16, sandboxed, structured) for surgical work:
+1. **MCP tools** (11, sandboxed, structured) for surgical work:
    - `list_source_adapters`, `list_source_tables`, `inspect_source_table`,
      `list_source_lineage`, `list_source_glossary` — catalog discovery.
    - `read_logical_model`, `update_entity`, `add_relationship`,
      `regenerate_physical` — logical-model edits (round-trip via the sidecar).
-   - `validate_contract`, `diff_models`, `search_semantic_memory` — checks.
-   - `forge_from_source` — bootstrap a logical model from a source table.
-   - `forge_run` — run `fluid forge` with the IDE's LLM through MCP sampling.
-   - `score_contract_quality`, `enrich_contract_suggestions` — read-only review.
+   - `validate_contract`, `diff_models` — checks.
 2. **CLI commands** (the 11-stage pipeline) via the IDE's shell tool:
    - `bundle → validate → generate artifacts → validate-artifacts → diff → plan →
      apply → policy-apply → verify → publish → schedule-sync`, each run as
@@ -99,7 +96,7 @@ introspection and model edits, CLI for pipeline stages.
 ```
 ┌──────────────────────────────┐   stdio (JSON-RPC, MCP 2025-06-18)   ┌──────────────────────────┐
 │  Agentic IDE                 │ ←──────────────────────────────────→ │  fluid mcp serve         │
-│  (Kiro/Cursor/Claude/Cline)  │                                      │  16 sandboxed tools      │
+│  (Kiro/Cursor/Claude/Cline)  │                                      │  11 sandboxed tools      │
 │   LLM ↔ tool-use loop        │                                      │  --readable-paths .      │
 └──────────────────────────────┘                                      │  --writable-paths .      │
           │                                                           └──────────────────────────┘
@@ -173,33 +170,16 @@ below either inspired specific pieces of this design or solve adjacent
 problems — name them up-front so the next maintainer doesn't have to
 re-do the survey.
 
-### MCP server & sampling
+### MCP server
 
 - **[modelcontextprotocol/python-sdk](https://github.com/modelcontextprotocol/python-sdk)** —
   the official Python SDK. **Borrowed-not-built**: forge's MCP server in
-  `fluid_build/cli/mcp.py` runs on `FastMCP`, every tool is registered via
-  `@_mcp_app.tool()`, and `MCPSamplingProvider` calls back through
-  `ctx.session.create_message()` (the canonical server-side sampling
-  primitive). The earlier hand-rolled stdio loop + `SamplingChannel` were
-  removed when the SDK landed — the SDK is the only path forward.
-- **[anyio](https://anyio.readthedocs.io/)** — bridges forge's sync
-  `LlmProvider` interface to the SDK's async `ctx.session.create_message`.
-  We use `anyio.from_thread.run(coro, token=token)` with the token obtained
-  via `anyio.lowlevel.current_token()` — the canonical "call async from a
-  non-event-loop thread" idiom. Mirrors the SDK's own anyio-based internals,
-  cheaper than `asyncio.run_coroutine_threadsafe` to maintain since it works
-  across event-loop impls. Already a transitive dep via the MCP SDK.
-- **[contextvars](https://docs.python.org/3/library/contextvars.html)**
-  (Python stdlib) — request-scoped state for the
-  `(Context, anyio_token)` pair the `forge_run` tool installs. Propagates
-  automatically across the `asyncio.to_thread` boundary that forge runs
-  under (Python ≥3.9 guarantee). Replaces an earlier module-level
-  `threading.Lock`-guarded globals pattern — closes a `/borrow-before-build`
-  miss caught in the second-pass audit.
-- **MCP spec** — protocol version `2025-06-18`. forge's MCP server
-  speaks this version (negotiated automatically by the SDK at
-  `initialize`). Sampling is documented at
-  [modelcontextprotocol.io/specification/.../sampling](https://modelcontextprotocol.io/specification/draft/client/sampling).
+  `fluid_build/cli/mcp/` runs on `FastMCP`, and every tool is registered via
+  `@_mcp_app.tool()`. The earlier hand-rolled stdio loop was removed when the SDK landed.
+  MCP sampling, which ran forge's own LLM inside the calling agent's request, was removed
+  on 2026-11-13 with the `forge_run` tool: the calling agent brings its own model.
+- **MCP spec** — protocol version `2025-06-18`. forge's MCP server speaks this version
+  (negotiated automatically by the SDK at `initialize`).
 
 ### Cross-IDE rules / config
 

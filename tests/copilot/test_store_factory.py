@@ -32,3 +32,19 @@ def test_sqlite_store_supports_root_namespace_query_and_clear(tmp_path: Path, mo
     cleared = store.clear("memory")
     assert cleared == 2
     assert store.query("memory", limit=10) == []
+
+
+def test_a_removed_backend_falls_back_to_the_file_store_with_one_warning(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    import logging
+
+    from fluid_build.copilot.store import factory
+    from fluid_build.copilot.store.backends.file import FileBackend
+
+    monkeypatch.setattr(factory, "_LOGGED_NULL", set())
+    with caplog.at_level(logging.WARNING):
+        first = factory.resolve_store(backend="postgres", path=tmp_path, workspace_root=tmp_path)
+        factory.resolve_store(backend="postgres", path=tmp_path, workspace_root=tmp_path)
+    assert isinstance(first, FileBackend)
+    assert sum("was removed" in r.getMessage() for r in caplog.records) == 1

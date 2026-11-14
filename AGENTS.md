@@ -803,7 +803,7 @@ onprem = "my_pkg.iac:OnPremIacPlugin"
 - **Repository**: [https://github.com/Agenticstiger/forge-cli](https://github.com/Agenticstiger/forge-cli)
 - **Agent Policy Examples**: `examples/0.7.1/ai-restricted-data.yaml`
 - **Policy Validator Source**: `fluid_build/policy/agent_policy.py`
-- **Forge Agents Source**: `fluid_build/cli/forge_agents.py`
+- **Forge AI mode source**: `fluid_build/cli/forge_ai.py`
 
 ---
 

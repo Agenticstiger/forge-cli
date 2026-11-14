@@ -634,6 +634,7 @@ def one_call(request: AuthoringRequest, config: Any, *, args: Any, console: Any 
         _say(console, "Nothing written.")
         return 1
     _say(console, f"Wrote {request.shown_path()}: `fluid validate` passed.")
+    _self._scaffold_ci(request, args, console)
     return 0
 
 
@@ -795,11 +796,22 @@ def agent_rules(request: AuthoringRequest) -> List[str]:
     if not rule_safe(shown):
         return []
     edit = f"/{shown}" if shown.startswith("/") else f"./{shown}"
-    return [
+    rules = [
         f"Edit({edit})",
         f"Bash(fluid validate {shown} --offline)",
         f"Bash(fluid validate {shown} --offline --format json)",
     ]
+    # ``Read(./**)`` covers the workspace. A contract or an upstream outside it gets an
+    # exact read rule of its own, or the headless agent could not read it at all.
+    for extra in (request.contract_path, *request.upstreams):
+        try:
+            extra.relative_to(request.workspace)
+            continue
+        except ValueError:
+            posix = extra.as_posix()
+        if rule_safe(posix):
+            rules.append(f"Read(/{posix})")
+    return rules
 
 
 def claude_argv(
@@ -893,8 +905,16 @@ def hand_off(
         return 0
     _say(console, f"Opening {agent} with the FLUID skills. Exit it when the contract is done.")
     started = time.time()
+    original = _snapshot(request.contract_path)
     _self._run_interactive(argv, cwd=request.workspace, env=_agent_env(agent))
-    return _self._finish_agent_run(agent, request, config, started, console=console)
+    return _self._finish_agent_run(
+        agent, request, config, started, console=console, args=args, original=original
+    )
+
+
+def _snapshot(path: Path) -> Optional[bytes]:
+    """The contract's bytes before an agent touches it, or None when there is none yet."""
+    return path.read_bytes() if path.is_file() else None
 
 
 def drive_headless(
@@ -914,6 +934,7 @@ def drive_headless(
     # The agent may edit the contract file and nothing else, so forge makes its folder.
     request.target_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
+    original = _snapshot(request.contract_path)
     timeout = int(os.environ.get("FLUID_FORGE_AGENT_TIMEOUT_SECONDS") or _AGENT_TIMEOUT_SECONDS)
     try:
         rc, stdout, stderr = _run_agent(
@@ -943,6 +964,8 @@ def drive_headless(
         console=console,
         tokens=usage,
         usd=float(usd) if isinstance(usd, (int, float)) else None,
+        args=args,
+        original=original,
     )
 
 
@@ -964,26 +987,61 @@ def _finish_agent_run(
     console: Any = None,
     tokens: Optional[Dict[str, Any]] = None,
     usd: Optional[float] = None,
+    args: Any = None,
+    original: Optional[bytes] = None,
 ) -> int:
-    """Forge's own gate after an agent run: the contract exists and validates."""
+    """Forge's own gate after an agent run: the contract exists and validates.
+
+    A failed run leaves the workspace as it was: the agent's version is kept as a draft
+    under ``.fluid/agents/<run-id>/``, and the original contract (``--refine``) is put
+    back. A fresh product's invalid file is removed. This is the one-call path's rule too.
+    """
     import fluid_build.cli.forge_ai as _self
 
-    if not request.contract_path.is_file():
+    path = request.contract_path
+    if not path.is_file():
+        if original is not None:
+            _restore(path, original)
         raise _error(
             "forge_contract_missing",
             f"{agent} finished without writing {request.shown_path()}.",
             [f"Run fluid forge again, or ask {agent} to write that file."],
         )
-    outcome = _self.validate_contract(request.contract_path, workspace=request.workspace)
+    outcome = _self.validate_contract(path, workspace=request.workspace)
     _self._write_receipt(request, config, started, tokens=tokens, usd=usd)
     if not outcome.valid:
+        draft = _self._save_draft(request, path.read_text(encoding="utf-8"))
+        _restore(path, original)
+        kept = "The original contract is back in place. " if original is not None else ""
         raise _error(
             "forge_contract_invalid",
-            f"{request.shown_path()} does not pass fluid validate.",
+            f"{agent}'s contract does not pass fluid validate. {kept}Its version is at {draft}.",
             [
                 *[f"fluid validate: {err}" for err in outcome.errors[:5]],
-                f"Fix it, then run: fluid validate {request.shown_path()} --offline",
+                f"Fix the draft, then run: fluid validate {draft} --offline",
             ],
         )
     _say(console, f"{request.shown_path()} passes `fluid validate`.")
+    _self._scaffold_ci(request, args, console)
     return 0
+
+
+def _scaffold_ci(request: AuthoringRequest, args: Any, console: Any) -> None:
+    """``--ci`` / ``--ci-complexity`` after a contract is kept, the way blank mode runs it.
+
+    With nobody at the keyboard and no ``--ci``, the scaffolder skips without asking.
+    ``--agent`` runs skip it: the caller runs ``fluid scaffold-ci`` itself, as in blank mode.
+    """
+    if args is None or _arg(args, "agent", False):
+        return
+    import fluid_build.cli.forge as forge_cli
+
+    forge_cli._scaffold_ci_pipeline(
+        args,
+        request.target_dir,
+        {},
+        console,
+        ask_dialog_question_fn=forge_cli.ask_dialog_question,
+        get_cli_arg_fn=forge_cli.get_cli_arg,
+        dry_run=False,
+    )
