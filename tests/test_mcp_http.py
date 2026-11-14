@@ -125,8 +125,8 @@ def _serving(validator: Any, *, host: str = "127.0.0.1") -> Iterator[str]:
                     on_uvicorn=lambda server: holder.__setitem__("server", server),
                 )
             )
-        except BaseException as exc:  # noqa: BLE001 - surfaced by the bind wait below
-            holder["error"] = exc
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 - SystemExit: uvicorn's bind failure
+            holder["error"] = exc  # surfaced by the bind wait below
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()

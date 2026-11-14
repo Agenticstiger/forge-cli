@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import json
 import logging
 import os
@@ -293,8 +292,8 @@ def test_a_cancelled_call_keeps_its_turn_until_its_thread_finishes(
         first = asyncio.create_task(server_mod._dispatch_sync_tool("list_source_adapters", {}))
         assert await asyncio.wait_for(asyncio.to_thread(first_started.wait, 5), timeout=6)
         first.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await first
+        (outcome,) = await asyncio.gather(first, return_exceptions=True)
+        assert isinstance(outcome, asyncio.CancelledError)
         second = asyncio.create_task(server_mod._dispatch_sync_tool("validate_contract", {}))
         await asyncio.sleep(0.2)
         assert not second.done()  # waits for the cancelled call's thread
@@ -331,8 +330,8 @@ def test_a_cancelled_call_that_has_not_started_never_runs(monkeypatch: pytest.Mo
         second = asyncio.create_task(server_mod._dispatch_sync_tool("validate_contract", {}))
         await asyncio.sleep(0.1)
         second.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await second
+        (outcome,) = await asyncio.gather(second, return_exceptions=True)
+        assert isinstance(outcome, asyncio.CancelledError)
         release.set()
         await asyncio.wait_for(first, timeout=5)
         # A third call proves the worker has moved past the cancelled one.
