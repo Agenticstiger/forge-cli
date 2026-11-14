@@ -14,7 +14,6 @@ __all__ = [
     "ask_friendly_text",
     "ask_secret_text",
     "build_choice",
-    "normalize_choice_value",
     "normalize_prompt_choices",
     "resolve_choice_input",
 ]
@@ -29,15 +28,15 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from fluid_build._console import literal_error_text
 
-# Import ``normalize_provider_name`` from its LIGHT defining module rather than
-# the heavy ``forge_copilot_runtime`` re-export. ``forge_copilot_runtime`` pulls
-# the LLM/discovery stack (httpx) and the schema_manager chain (jsonschema),
-# which would drag the whole forge AI runtime onto the ``fluid --help`` cold
-# path (forge_dialogs → forge_agent_specs → forge_agents → forge.register).
-# ``forge_copilot_contract_helpers`` is the canonical definition site and is
-# dependency-light.
-from .forge_copilot_contract_helpers import normalize_provider_name
 from .forge_copilot_taxonomy import normalize_use_case
+
+
+def normalize_provider_name(value: Any) -> str:
+    """Normalize infrastructure provider aliases (gcp, aws, local, snowflake)."""
+    if value is None:
+        return "local"
+    return str(value).strip().lower().replace("-", "_")
+
 
 try:
     from rich.panel import Panel
@@ -288,33 +287,16 @@ def ask_friendly_text(
     required: bool,
     default: Optional[str] = None,
 ) -> Optional[str]:
-    """Ask a free-text question with one gentle retry for required fields.
-
-    Phase 0.5 #19 — slash commands like ``:ai-setup`` are detected
-    BEFORE the answer is treated as content. The user can re-enter
-    AI setup, toggle ``--show-work``, or abort gracefully without
-    leaving the interview. After a slash command runs, the prompt
-    repeats so the user can answer the original question.
-    """
-    from fluid_build.cli._interview_slash_commands import maybe_handle_slash_command
-
-    # Up to 5 successive slash commands, then resume the prompt.
-    for _ in range(5):
-        answer = _read_free_text(console, prompt, default=default)
-        if answer and maybe_handle_slash_command(answer, console=console):
-            continue
-        if answer:
-            return answer
-        break
+    """Ask a free-text question with one gentle retry for required fields."""
+    answer = _read_free_text(console, prompt, default=default)
+    if answer:
+        return answer
 
     if not required:
         return None
     if console:
         console.print("[dim]A short answer is enough here. A phrase works fine.[/dim]")
     retry = _read_free_text(console, prompt, default=default)
-    if retry and maybe_handle_slash_command(retry, console=console):
-        # Slash command on the retry — give one more chance.
-        retry = _read_free_text(console, prompt, default=default)
     return retry or None
 
 
@@ -496,25 +478,6 @@ def resolve_choice_input(
         )
 
     return ChoiceMatchResult(status="unresolved", raw_input=raw_text)
-
-
-def normalize_choice_value(
-    raw_value: Any,
-    *,
-    field_name: str,
-    choices: List[Any],
-    default: Optional[str] = None,
-) -> Optional[str]:
-    """Normalize a direct context value against a choice list."""
-    match = resolve_choice_input(
-        field_name=field_name,
-        raw_input=str(raw_value or "").strip(),
-        choices=choices,
-        allow_skip=True,
-    )
-    if match.status in {"matched", "confirmed", "custom"} and match.value:
-        return str(match.value)
-    return default
 
 
 def ask_confirmation(

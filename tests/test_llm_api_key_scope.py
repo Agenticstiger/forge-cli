@@ -276,27 +276,6 @@ def test_the_first_record_is_kept(world: _World) -> None:
     assert args.llm_provider_named is None
 
 
-def test_the_copilot_options_carry_the_record(world: _World) -> None:
-    from fluid_build.cli.forge import get_cli_arg
-    from fluid_build.cli.forge_modes import _forge_build_copilot_options
-
-    args = Namespace(llm_provider="openai", llm_provider_named=None)
-    options = _forge_build_copilot_options(
-        args, get_cli_arg_fn=get_cli_arg, is_non_interactive=False
-    )
-    env = world.env(FLUID_LLM_API_KEY=GENERIC_KEY, OPENAI_API_KEY=OPENAI_KEY)
-
-    config = providers.resolve_llm_config(SimpleNamespace(**options), env)
-
-    assert options["llm_provider_named"] is None
-    assert config.api_key == OPENAI_KEY
-    # without a record nothing is added, so a flag still names the provider
-    plain = _forge_build_copilot_options(
-        Namespace(llm_provider="openai"), get_cli_arg_fn=get_cli_arg, is_non_interactive=False
-    )
-    assert "llm_provider_named" not in plain
-
-
 @pytest.fixture
 def fake_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)

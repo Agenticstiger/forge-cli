@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import functools
 import json
 import logging
 import os
@@ -23,7 +22,7 @@ import sys
 import time
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fluid_build._console import literal_error_text, literal_text
 from fluid_build.cli.artifact_envelope import dump_json_with_envelope
@@ -33,92 +32,43 @@ from fluid_build.cli.artifact_scan import ArtifactSnapshot, diff_snapshots, snap
 from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.cli.console import error as console_error
 from fluid_build.cli.forge_banner import print_v2_banner
-from fluid_build.cli.forge_copilot_memory import (
-    CopilotMemoryStore,
-    resolve_copilot_memory_root,
-    summarize_copilot_memory,
-)
-from fluid_build.cli.forge_copilot_taxonomy import normalize_copilot_context
 from fluid_build.cli.forge_ui import print_welcome_panel
 from fluid_build.cli.next_steps import print_next_steps
 
-if TYPE_CHECKING:  # resolve annotation names for ruff/type-checkers only
-    from fluid_build.cli.forge_copilot_agent import (
-        AIAgent,
-        CopilotAgentBase,
-    )
-    from fluid_build.cli.forge_copilot_runtime import (
-        CopilotGenerationError,
-        CopilotGenerationResult,
-    )
-
-# NOTE: The forge AI runtime (``forge_agents`` / ``forge_copilot_*`` /
-# ``forge_data_model`` / ``forge_dialogs`` / ``forge_modes`` / ``forge_context``)
-# transitively pulls ``httpx`` (LLM providers) and ``jsonschema`` (the
-# ``schema_manager`` chain). ``register`` only needs argparse, so every one of
-# those heavy module-scope imports is resolved lazily via ``__getattr__`` below
-# and stays off the ``fluid --help`` / ``build_parser()`` cold path.
+# NOTE: ``forge_dialogs`` / ``forge_modes`` / ``forge_context`` and the LLM provider
+# layer (``httpx``) are resolved lazily via ``__getattr__`` below, so they stay off
+# the ``fluid --help`` / ``build_parser()`` cold path (``register`` only needs argparse).
 #
 # Several of these symbols are patched by tests at module scope
-# (``patch("…cli.forge.CopilotAgent")``, ``…resolve_llm_config``,
-# ``…build_capability_matrix``, ``…generate_copilot_artifacts``,
-# ``…discover_local_context``, ``…_run_copilot``, ``…ask_confirmation``) or
-# imported from this module (``from …cli.forge import AIAgent``), so they MUST
-# remain resolvable module attributes — that is exactly what ``__getattr__``
-# provides. Runtime use sites resolve via ``import fluid_build.cli.forge as
-# _self; _self.X`` so those patches flow through. Annotations referencing
-# ``CopilotAgentBase`` / ``CopilotGenerationResult`` / ``AIAgent`` etc. are safe
-# at module scope because ``from __future__ import annotations`` keeps them as
-# lazy strings.
+# (``patch("…cli.forge.build_capability_matrix")``, ``…ask_confirmation``,
+# ``…_scaffold_ci_pipeline``), so they MUST remain resolvable module attributes,
+# which is exactly what ``__getattr__`` provides. Runtime use sites resolve via
+# ``import fluid_build.cli.forge as _self; _self.X`` so those patches flow through.
 
 # alias -> (heavy source module, real symbol name)
 _DEFERRED_FORGE_IMPORTS: Dict[str, tuple] = {
     "_get_cli_arg": ("forge_context", "get_cli_arg"),
     "_get_target_dir": ("forge_context", "get_target_directory"),
-    "_handle_memory": ("forge_context", "handle_memory_management"),
     "_load_ctx": ("forge_context", "load_context"),
-    "_resolve_store": ("forge_context", "resolve_memory_store"),
-    "AIAgent": ("forge_copilot_agent", "AIAgent"),
-    "CopilotAgentBase": ("forge_copilot_agent", "CopilotAgentBase"),
-    "recommend_template_for_use_case": (
-        "forge_copilot_agent",
-        "recommend_template_for_use_case",
-    ),
-    "build_interview_summary_from_context": (
-        "forge_copilot_interview",
-        "build_interview_summary_from_context",
-    ),
     "get_cumulative_prompt_cache_metrics": (
         "forge_copilot_llm_providers",
         "get_cumulative_prompt_cache_metrics",
     ),
     "reset_token_usage": ("forge_copilot_llm_providers", "reset_token_usage"),
-    "CopilotGenerationError": ("forge_copilot_runtime", "CopilotGenerationError"),
-    "CopilotGenerationResult": ("forge_copilot_runtime", "CopilotGenerationResult"),
-    "build_capability_matrix": ("forge_copilot_runtime", "build_capability_matrix"),
-    "discover_local_context": ("forge_copilot_runtime", "discover_local_context"),
-    "generate_copilot_artifacts": (
-        "forge_copilot_runtime",
-        "generate_copilot_artifacts",
-    ),
-    "normalize_provider_name": ("forge_copilot_runtime", "normalize_provider_name"),
-    "normalize_template_name": ("forge_copilot_runtime", "normalize_template_name"),
-    "resolve_llm_config": ("forge_copilot_runtime", "resolve_llm_config"),
+    "build_capability_matrix": ("_capability_matrix", "build_capability_matrix"),
     "ask_confirmation": ("forge_dialogs", "ask_confirmation"),
     "ask_dialog_question": ("forge_dialogs", "ask_dialog_question"),
     "_scaffold_ci_pipeline": ("forge_modes", "_scaffold_ci_pipeline"),
-    "_run_copilot": ("forge_modes", "run_ai_copilot_mode"),
     "_run_guided": ("forge_modes", "run_guided_mode"),
 }
 
 
 def __getattr__(name: str):
-    """Lazily resolve the heavy forge AI-runtime imports (PEP 562).
+    """Lazily resolve the heavy forge imports (PEP 562).
 
     Keeps ``httpx`` + the ``schema_manager`` → ``jsonschema`` chain off the
     ``fluid --help`` path while exposing the symbols as module attributes so the
-    various ``patch("…cli.forge.<symbol>")`` test seams (and
-    ``from …cli.forge import AIAgent`` re-exports) keep working.
+    various ``patch("…cli.forge.<symbol>")`` test seams keep working.
     """
     spec = _DEFERRED_FORGE_IMPORTS.get(name)
     if spec is not None:
@@ -126,18 +76,6 @@ def __getattr__(name: str):
 
         module = importlib.import_module(f"fluid_build.cli.{spec[0]}")
         return getattr(module, spec[1])
-    if name == "CopilotAgent":
-        return _build_copilot_agent_class()
-    if name == "DOMAIN_AGENTS":
-        from fluid_build.cli.forge_agents import DOMAIN_AGENTS
-
-        return DOMAIN_AGENTS
-    if name == "DOMAIN_AGENTS_AVAILABLE":
-        from fluid_build.cli.forge_agents import DOMAIN_AGENTS
-
-        return bool(DOMAIN_AGENTS)
-    if name == "AI_AGENTS":
-        return _build_ai_agents()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -224,94 +162,6 @@ class ForgeMode(Enum):
     BLANK = "blank"
 
 
-@functools.lru_cache(maxsize=1)
-def _build_copilot_agent_class() -> type:
-    """Build (and cache) the public ``CopilotAgent`` class lazily.
-
-    The class subclasses ``CopilotAgentBase`` from the heavy
-    ``forge_copilot_agent`` module — evaluating the base at module scope would
-    force that import onto the ``fluid --help`` path, so the class is built on
-    first access to ``forge.CopilotAgent`` (via ``__getattr__``) instead.
-
-    Memoised with ``functools.lru_cache(maxsize=1)`` — the repo's standard
-    memoisation idiom (cf. ``_load_domain_keywords`` /
-    ``_dbt_command_supports_adapter``) — rather than a hand-rolled module global
-    + bare ``if`` check. lru_cache is internally lock-guarded, so two threads
-    racing on the first access get the *same* class object (stable ``isinstance``
-    / identity), and it exposes ``_build_copilot_agent_class.cache_clear()`` as a
-    clean reset hook for tests. Patching is unaffected: tests still
-    ``patch("…cli.forge.CopilotAgent")`` / ``from …cli.forge import
-    CopilotAgent`` — both resolve through ``__getattr__``, which sets/reads a
-    real module attribute that *shadows* this builder.
-    """
-    import fluid_build.cli.forge as _self
-    from fluid_build.cli.forge_copilot_agent import CopilotAgentBase
-
-    class CopilotAgent(CopilotAgentBase):
-        """Public copilot agent wired to the compatibility aliases in this module."""
-
-        def _resolve_llm_config_dependency(self, options):
-            return _self.resolve_llm_config(options)
-
-        def _discover_local_context_dependency(self, options):
-            return _self.discover_local_context(
-                getattr(options, "discovery_path", None),
-                discover=getattr(options, "discover", True),
-                workspace_root=Path.cwd(),
-                logger=LOG,
-            )
-
-        def _build_capability_matrix_dependency(self):
-            return _self.build_capability_matrix()
-
-        def _generate_copilot_artifacts_dependency(
-            self,
-            context: Dict[str, Any],
-            *,
-            llm_config: Any,
-            discovery_report: Any,
-            project_memory: Any,
-            team_memory: Any = None,
-            capability_matrix: Any,
-        ) -> "CopilotGenerationResult":
-            return _self.generate_copilot_artifacts(
-                context,
-                llm_config=llm_config,
-                discovery_report=discovery_report,
-                project_memory=project_memory,
-                team_memory=team_memory,
-                capability_matrix=capability_matrix,
-                logger=LOG,
-            )
-
-        def _make_memory_store_dependency(self, project_root: Path) -> CopilotMemoryStore:
-            return CopilotMemoryStore(project_root, logger=LOG)
-
-        def _ask_confirmation_dependency(self, prompt: str, preview: str) -> bool:
-            if self.console and RICH_AVAILABLE:
-                return _self.ask_confirmation(
-                    self.console,
-                    prompt,
-                    default=False,
-                    title="🧠 Save Project Memory?",
-                    preview=preview,
-                    border_style="cyan",
-                )
-            return super()._ask_confirmation_dependency(prompt, preview)
-
-    return CopilotAgent
-
-
-def _build_ai_agents():
-    import fluid_build.cli.forge as _self
-
-    agents = {"copilot": _self.CopilotAgent}
-    domain_agents = _self.DOMAIN_AGENTS
-    if domain_agents:
-        agents.update(domain_agents)
-    return agents
-
-
 # ---------------------------------------------------------------------------
 # CLI registration
 # ---------------------------------------------------------------------------
@@ -360,17 +210,6 @@ def register(subparsers: argparse._SubParsersAction):
             "right acquisition engine via the capability catalog."
         ),
     )
-    try:
-        from fluid_build.cli.forge_agents import get_all_domain_names
-
-        domain_names = ", ".join(get_all_domain_names())
-    except Exception:  # noqa: BLE001
-        domain_names = "finance, healthcare, retail, telco"
-    parser.add_argument(
-        "--domain",
-        help=f"Domain expertise agent ({domain_names}). "
-        "Custom: drop a YAML in .fluid/agents/ — see docs at https://agenticstiger.github.io/forge_docs/cli/agents.html",
-    )
     parser.add_argument(
         "--non-interactive",
         action="store_true",
@@ -383,7 +222,10 @@ def register(subparsers: argparse._SubParsersAction):
     )
     parser.add_argument(
         "--context",
-        help='Additional context as JSON or file path (e.g., \'{"provider":"gcp","domain":"retail"}\')',
+        help=(
+            "AI mode: the product to build, as text or a file path (what it reads and "
+            "produces, owner, schedule, rules). Required when nobody is at the keyboard."
+        ),
     )
 
     # --- LLM flags ---
@@ -397,7 +239,7 @@ def register(subparsers: argparse._SubParsersAction):
         "--llm-provider",
         choices=LlmProviderChoices(),
         help=(
-            "LLM provider for copilot. Keyless options: mcp-sampling (in-IDE), "
+            "LLM provider for copilot. Keyless options: "
             "claude-code / codex / cursor / kiro (local agent CLI). Third-party "
             "providers installed via the fluid_build.llm_providers entry point "
             "are also accepted."
@@ -410,26 +252,14 @@ def register(subparsers: argparse._SubParsersAction):
         choices=["envelope", "agentic"],
         help=(
             "Drive mode for coding-agent providers (claude-code/codex/cursor/kiro): "
-            "'envelope' (agent returns the contract JSON on stdout; default) or "
-            "'agentic' (agent writes contract.fluid.yaml into the workspace)."
+            "'agentic' (default; the agent writes contract.fluid.yaml in the workspace "
+            "with the FLUID skills and its own tools) or 'envelope' (one call: the agent "
+            "returns the contract and forge validates it)."
         ),
-    )
-    parser.add_argument(
-        "--llm-routing-model",
-        help="Fast/cheap model for interview clarification and AI self-evaluation",
-    )
-    parser.add_argument(
-        "--llm-routing-endpoint",
-        help="HTTP endpoint override for the routing model",
     )
     parser.add_argument(
         "--llm-endpoint",
         help="Exact HTTP endpoint override for the selected LLM adapter",
-    )
-    parser.add_argument(
-        "--tiered",
-        action="store_true",
-        help="Use provider-local model tiers: deep for modeling, fast for routing",
     )
     parser.add_argument(
         "--require-llm",
@@ -453,37 +283,6 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     parser.add_argument(
-        "--prompt-profile",
-        dest="prompt_profile",
-        metavar="NAME",
-        help=(
-            "Swap the entire set of default prompt-guidance files "
-            "(agent_specs/_defaults/*.yaml) for a named profile under "
-            "agent_specs/prompt_profiles/<name>/. Bundled: eu-gdpr-strict, "
-            "ai-lab-permissive. Single-name, single-swap (no stacking). The "
-            "active profile is stamped into metadata.provenance.prompt_profile. "
-            "Env fallback: FLUID_PROMPT_PROFILE."
-        ),
-    )
-    parser.add_argument(
-        "--prompt-overlay",
-        dest="prompt_overlay",
-        metavar="A,B,C",
-        action="append",
-        help=(
-            "Stack one or more prompt overlays (agent_specs/prompt_overlays/"
-            "<name>.yaml) ON TOP of the defaults + any --prompt-profile. "
-            "Overlays patch labelled sections (replace/append/prepend) and may "
-            "ship validator_rules. Applied left-to-right (later wins on "
-            "conflict). Comma-separate or repeat the flag. Untrusted overlays "
-            "are traversal-safe + safe_load-only; an overlay that drops a "
-            "load-bearing anchor sentence is rejected. Set FLUID_OVERLAY_STRICT=1 "
-            "to reject any unsigned overlay (ed25519). Active overlays are "
-            "stamped into metadata.provenance.prompt_overlays. Env fallback: "
-            "FLUID_PROMPT_OVERLAYS."
-        ),
-    )
-    parser.add_argument(
         "--no-llm",
         action="store_true",
         help=(
@@ -503,53 +302,6 @@ def register(subparsers: argparse._SubParsersAction):
             "existing `fluid validate --offline`). Pair with "
             "--non-interactive for a headless, prompt-free run."
         ),
-    )
-    parser.add_argument(
-        "--watch",
-        action="store_true",
-        help=(
-            "Watch the discovery path (cwd + any --discovery-path) and "
-            "re-generate the contract whenever a source file changes — like "
-            "`dbt run --watch` / nodemon. Rapid saves are debounced into a "
-            "single regeneration; the contract forge writes itself never "
-            "retriggers the loop. Regeneration is non-interactive and "
-            "network-free (the offline guided path), so a full interview is "
-            "never re-run per change. Ctrl-C stops cleanly. Tune with "
-            "FLUID_FORGE_WATCH_INTERVAL / FLUID_FORGE_WATCH_DEBOUNCE (seconds)."
-        ),
-    )
-    parser.add_argument(
-        "--seed-from",
-        dest="seed_from",
-        help=(
-            "[experimental — pre-processor only] Structural seed for the LLM. "
-            "Accepts a Bitol ODPS file (*.odps.yaml), a directory containing "
-            "the ODPS doc + sibling ODCS files (or only ODCS files), or a "
-            "lone ODCS file (*.odcs.yaml). The schema/quality/qos from the "
-            "seed are treated as ground truth; the LLM fills in builds, "
-            "execution, and governance. Today the seed pre-processor "
-            "(fluid_build.cli.forge_copilot_seed.load_seed) is callable as "
-            "a library; the copilot runtime hand-off + ground-truth diff "
-            "guard wiring is on a follow-up commit."
-        ),
-    )
-    parser.add_argument(
-        "--seed-allow-remote",
-        dest="seed_allow_remote",
-        action="store_true",
-        help=(
-            "[experimental] When --seed-from has http(s) contractId "
-            "references, allow http(s) fetch. Default is OFF (since "
-            "the May 2026 SSRF hardening); the fetcher rejects "
-            "internal/private IPs and pins the validated IP, but "
-            "still only enable when you trust the upstream catalog."
-        ),
-    )
-    parser.add_argument(
-        "--seed-no-remote",
-        dest="seed_no_remote",
-        action="store_true",
-        help=argparse.SUPPRESS,  # deprecated — default is already remote-off
     )
     parser.add_argument(
         "--yes",
@@ -589,15 +341,6 @@ def register(subparsers: argparse._SubParsersAction):
             "the contract (no LLM call, deterministic). Used after "
             "`--agent --blank` so the IDE's agent (which is itself an LLM) "
             "knows exactly what to author. Implies --agent."
-        ),
-    )
-    parser.add_argument(
-        "--show-work",
-        action="store_true",
-        help=(
-            "Stream the agent's reasoning and tool calls live as they happen. "
-            "Reasoning + transcript also persist to "
-            ".fluid/agents/<run-id>/{reasoning.md,transcript.json}."
         ),
     )
     parser.add_argument(
@@ -646,17 +389,6 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
     parser.add_argument(
-        "--also-emit",
-        dest="also_emit",
-        default=None,
-        metavar="FORMATS",
-        help=(
-            "After writing the FLUID contract, also emit additional standards "
-            "(comma-separated: odcs, opds, odps). Defaults to 'odcs' for CDP "
-            "products and empty otherwise."
-        ),
-    )
-    parser.add_argument(
         "--browser",
         action="store_true",
         help=(
@@ -665,79 +397,14 @@ def register(subparsers: argparse._SubParsersAction):
             "key still pastes back into the terminal (preview)."
         ),
     )
-    # Gap 5 — apply post-synthesis enrichment artifacts back into the
-    # contract (dbt tests, freshness, physical layout). Conservative
-    # merge: never overwrites user-set fields. OFF by default; the
-    # confirmation prompt is bypassed with --yes.
-    parser.add_argument(
-        "--apply-enrichment",
-        dest="apply_enrichment",
-        action="store_true",
-        default=False,
-        help=(
-            "Land the post-synthesis enrichment artifacts (dbt tests, "
-            "freshness, physical layout) back into the contract itself. "
-            "Shows a unified diff and prompts before writing; pair with "
-            "--yes to bypass the prompt. Default OFF: behavior is "
-            "unchanged without this flag."
-        ),
-    )
-
-    # --- Discovery ---
-    parser.add_argument(
-        "--discover",
-        dest="discover",
-        action="store_true",
-        default=True,
-        help="Inspect local files and manifests before generation",
-    )
-    parser.add_argument(
-        "--no-discover",
-        dest="discover",
-        action="store_false",
-        help="Skip local discovery and rely only on explicit context",
-    )
-    parser.add_argument(
-        "--discovery-path",
-        help="Additional path to scan for metadata-only discovery",
-    )
-
-    # --- Memory ---
-    parser.add_argument(
-        "--memory",
-        dest="memory",
-        action="store_true",
-        default=True,
-        help="Load project-scoped copilot memory",
-    )
+    # ``--no-memory`` is a hidden no-op. The scaffold-ide indexes already installed in users'
+    # CLAUDE.md/AGENTS.md, the authoring SKILL.md and the eval harness all pass it; dropping the
+    # flag would make argparse reject those commands.
     parser.add_argument(
         "--no-memory",
-        dest="memory",
-        action="store_false",
-        help="Do not load project-scoped copilot memory for this run",
-    )
-    parser.add_argument(
-        "--save-memory",
+        dest="no_memory",
         action="store_true",
-        help="Persist copilot memory after a successful non-interactive run",
-    )
-    parser.add_argument(
-        "--show-memory",
-        action="store_true",
-        help="Show the current copilot memory summary and exit",
-    )
-    parser.add_argument(
-        "--reset-memory",
-        action="store_true",
-        help="Delete the copilot memory file and exit",
-    )
-    parser.add_argument(
-        "--memory-json",
-        action="store_true",
-        help=(
-            "When combined with --show-memory, emit the layered memory dump "
-            "as machine-readable JSON instead of a Rich panel."
-        ),
+        help=argparse.SUPPRESS,
     )
 
     # --- CI/CD auto-scaffolding (post-generation hook) ---
@@ -798,236 +465,12 @@ def register(subparsers: argparse._SubParsersAction):
     # template branch (which reads ``args.template``) sees it too.
     # argparse aliases only set the dest, not extra attributes.
 
-    # --- Agent loop opt-in (slice UX-K) ---
-    parser.add_argument(
-        "--agent-loop",
-        action="store_true",
-        default=False,
-        help=(
-            "Use the multi-turn agent loop instead of the single-shot prompt. "
-            "The LLM discovers your workspace, picks a template, builds and "
-            "validates the contract iteratively via tool calls. "
-            "Requires a tool-use-capable model (gpt-4.1-mini, claude-sonnet-4-6, gemini-2.5-flash)."
-        ),
-    )
-
-    # --- Transformation engine generation ---
-    parser.add_argument(
-        "--no-generate",
-        action="store_true",
-        default=False,
-        help="Skip transformation engine artifact generation (dbt project, SQL scripts, etc.)",
-    )
-
-    # --- Fragment layout control ---
-    fragment_group = parser.add_mutually_exclusive_group()
-    fragment_group.add_argument(
-        "--fragments",
-        action="store_true",
-        default=False,
-        help=(
-            "Force fragment-first layout — split the generated contract into "
-            "composable files under fragments/ with $ref pointers."
-        ),
-    )
-    fragment_group.add_argument(
-        "--no-fragments",
-        action="store_true",
-        default=False,
-        help="Force flat single-file layout (skip automatic fragment splitting).",
-    )
-
-    # --- Resume / time-travel flags (resumability) ---
-    # Default: a bare `fluid forge` auto-detects an incomplete run in
-    # the cwd and prompts (default = continue). --resume <id> jumps to
-    # a specific run; --resume (bare) takes the most recent.
-    parser.add_argument(
-        "--resume",
-        nargs="?",
-        const="__RESUME_BARE__",
-        default=None,
-        metavar="RUN_ID",
-        help=(
-            "Resume an interrupted forge run. With no argument, picks the "
-            "most-recent paused run in this workspace. Pass a run-id (or "
-            "unambiguous prefix) to jump to a specific one. See "
-            "'fluid agents list' for paused runs."
-        ),
-    )
-    parser.add_argument(
-        "--no-resume",
-        action="store_true",
-        default=False,
-        help=(
-            "Skip the auto-detect-and-prompt for paused runs. Always start "
-            "fresh, even when a paused run exists in this directory."
-        ),
-    )
-    parser.add_argument(
-        "--from-stage",
-        dest="from_stage",
-        default=None,
-        metavar="STAGE",
-        help=(
-            "Time-travel to a specific stage (requires --resume). Stages: "
-            "logical, contract_forge, builder, readme, transformation, "
-            "validator, enrichment, judge."
-        ),
-    )
-    parser.add_argument(
-        "--fork",
-        dest="fork",
-        default=None,
-        metavar="RUN_ID",
-        help=(
-            "Like --resume but assigns a new run id and copies stages up "
-            "to --from-stage. Requires --from-stage."
-        ),
-    )
-    parser.add_argument(
-        "--or-fail",
-        dest="or_fail",
-        action="store_true",
-        default=False,
-        help=(
-            "Require --resume to find a resumable run; exit 1 if none "
-            "exists. Useful for scripts that should fail-fast rather "
-            "than start fresh."
-        ),
-    )
-
     parser.set_defaults(func=run)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-class _ResumeFlagError(Exception):
-    """Raised by ``_resolve_resume_args`` on incompatible flag combinations.
-
-    Carries an ``exit_code`` so the dispatcher can return the right
-    POSIX code without sniffing the exception message. Defaults to 2
-    (usage error per ``argparse`` convention); the ``--or-fail`` policy
-    violation overrides to 1 (per spec).
-    """
-
-    def __init__(self, message: str, *, exit_code: int = 2) -> None:
-        super().__init__(message)
-        self.exit_code = exit_code
-
-
-def _resolve_resume_args(
-    args: Any,
-    *,
-    workspace_root: Path,
-    console: Optional[Any] = None,
-) -> None:
-    """Validate resume/fork/from-stage flags and resolve the run-id.
-
-    Mutates ``args``:
-      * sets ``args._resume_run_id`` to the resolved run-id (or None)
-      * normalises ``args.resume`` (None for absent, "" for bare,
-        "<id>" for explicit)
-      * sets ``args._resume_explicit`` (True when --resume appeared)
-
-    Raises :class:`_ResumeFlagError` on invalid combinations:
-      * --fork without --from-stage (exit 2)
-      * --from-stage with an unknown stage name (Did-you-mean) (exit 2)
-      * --resume <id> with an unknown id (exit 2)
-      * --or-fail without a resumable run (exit 1 — policy violation,
-        not a usage error)
-    """
-    from fluid_build.cli._forge_resume import (
-        ResumeError,
-        maybe_prompt_resume,
-        validate_from_stage,
-    )
-
-    # Defensive type-guards — tests that build args via MagicMock have
-    # every attribute auto-attr'd to a Mock instance. argparse always
-    # passes None / str / bool for these flags; coerce non-conforming
-    # values to None/False so the validator never sees a Mock object.
-    # Mirrors the same guard pattern in ``_forge_resume.py``.
-    def _str_or_none(value: Any) -> Optional[str]:
-        return value if isinstance(value, str) else None
-
-    def _bool_or_false(value: Any) -> bool:
-        return bool(value) if isinstance(value, bool) else False
-
-    resume_raw = _str_or_none(getattr(args, "resume", None))
-    # Argparse stores "__RESUME_BARE__" when the flag appeared without a
-    # value; None when it didn't appear; "<id>" when explicit.
-    if resume_raw == "__RESUME_BARE__":
-        args.resume = None
-        args._resume_explicit = True
-    elif resume_raw is None:
-        args.resume = None
-        args._resume_explicit = False
-    else:
-        args.resume = resume_raw
-        args._resume_explicit = True
-    # Coerce the other resume-shaped flags too — test fixtures auto-attr
-    # them to MagicMock truthies; the policy checks below treat any
-    # truthy as "flag set", which corrupts the no-flags path.
-    args.no_resume = _bool_or_false(getattr(args, "no_resume", False))
-    args.or_fail = _bool_or_false(getattr(args, "or_fail", False))
-
-    # --fork requires --from-stage
-    fork_target = getattr(args, "fork", None)
-    from_stage = getattr(args, "from_stage", None)
-    # Defensive type-guard — tests that build args via MagicMock have
-    # ``from_stage`` auto-attr'd to a Mock instance, which then crashes
-    # deep in ``validate_from_stage``'s ``.lower()`` call. argparse
-    # always passes ``None`` or ``str``; coerce anything else to
-    # ``None`` so the validator never sees a non-string.
-    if from_stage is not None and not isinstance(from_stage, str):
-        from_stage = None
-    if isinstance(fork_target, str) and not fork_target.strip():
-        fork_target = None
-    elif fork_target is not None and not isinstance(fork_target, str):
-        fork_target = None
-    if fork_target and not from_stage:
-        raise _ResumeFlagError(
-            "--fork requires --from-stage (which stage of the source run to fork from)"
-        )
-    # --from-stage requires --resume or --fork
-    if from_stage and not (args._resume_explicit or fork_target):
-        raise _ResumeFlagError("--from-stage requires --resume <run-id> or --fork <run-id>")
-    if from_stage:
-        ok, msg = validate_from_stage(from_stage)
-        if not ok:
-            raise _ResumeFlagError(msg)
-
-    # Resolve the run-id.
-    try:
-        run_id = maybe_prompt_resume(args, workspace_root=workspace_root)
-    except ResumeError as exc:
-        # ``--or-fail`` policy violation (no resumable run in cwd) →
-        # exit 1 per spec; usage errors (typo'd id, ambiguous prefix,
-        # --no-resume + --or-fail) → exit 2 (argparse convention).
-        # We distinguish by message prefix so the dispatcher reports
-        # the right POSIX code without sniffing exception types.
-        msg = str(exc)
-        is_policy_violation = (
-            getattr(args, "or_fail", False)
-            and "No resumable run found" in msg
-            and "not found" not in msg  # disambiguates "Run X not found"
-        )
-        if is_policy_violation:
-            raise _ResumeFlagError(msg, exit_code=1) from exc
-        raise _ResumeFlagError(msg) from exc
-
-    args._resume_run_id = run_id
-    if run_id and console:
-        try:
-            console.print(
-                f"\n[bold cyan]↻ Resuming run {run_id}[/bold cyan]"
-                + (f" from stage [bold]{from_stage}[/bold]" if from_stage else "")
-            )
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def get_target_directory(args, default_name: str = "my-fluid-project") -> Path:
@@ -1062,23 +505,6 @@ def _forge_offline_requested(args: Any) -> bool:
     if raw is None:
         return False
     return raw.strip().lower() not in ("", "0", "false", "no", "off")
-
-
-def resolve_memory_store(args, logger: logging.Logger) -> CopilotMemoryStore:
-    import fluid_build.cli.forge as _self
-
-    return _self._resolve_store(args, logger, memory_store_class=CopilotMemoryStore)
-
-
-def handle_memory_management(args, logger: logging.Logger) -> int:
-    import fluid_build.cli.forge as _self
-
-    return _self._handle_memory(
-        args,
-        logger,
-        memory_store_class=CopilotMemoryStore,
-        console_factory=Console if RICH_AVAILABLE else None,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1246,7 +672,7 @@ def _print_next_steps(console: Any, target_dir: Path, contract_path: Path) -> No
 # object per line (NDJSON, as AGENT_IDE.md promises), so the agent's parser
 # is ``for line in stdout: json.loads(line)``. ``run`` keeps the real stdout
 # for the events and points ``sys.stdout`` at stderr for the rest of the run
-# (``contextlib.redirect_stdout``, as the MCP ``forge_run`` dispatch does), so
+# (``contextlib.redirect_stdout``), so
 # every human-facing writer moves without being touched: Rich consoles built
 # without ``file=`` (Rich looks ``sys.stdout`` up at each write), ``print``,
 # and a provider SDK's banner. Outside ``--agent`` nothing changes.
@@ -1279,7 +705,6 @@ def _setup_agent_mode(args: Any) -> None:
         "FLUID_FORGE_NO_PICKER",
         "FLUID_FORGE_NO_PREVIEW",
         "FLUID_FORGE_NO_WELCOME",
-        "FLUID_FORGE_NO_STREAMING_PREVIEW",
     ):
         os.environ.setdefault(var, "1")
     args.yes = True
@@ -1362,7 +787,7 @@ _PLAN_BY_PRODUCT_TYPE: Dict[str, List[Dict[str, Any]]] = {
             "step": "Add quality[]",
             "description": "Declarative quality rules (uniqueness, freshness, schema)",
             "fields": ["quality[].rule", "quality[].entity"],
-            "mcp_tools": ["search_semantic_memory"],
+            "mcp_tools": [],
         },
     ],
     "ADP": [
@@ -1370,7 +795,7 @@ _PLAN_BY_PRODUCT_TYPE: Dict[str, List[Dict[str, Any]]] = {
             "step": "Define consumes[]",
             "description": "Upstream SDP/ADP products this aggregate is built from",
             "fields": ["consumes[].productId", "consumes[].version"],
-            "mcp_tools": ["list_source_lineage", "search_semantic_memory"],
+            "mcp_tools": ["list_source_lineage"],
         },
         {
             "step": "Define models[].entities[] for the aggregate",
@@ -1396,7 +821,7 @@ _PLAN_BY_PRODUCT_TYPE: Dict[str, List[Dict[str, Any]]] = {
             "step": "Define consumes[]",
             "description": "Upstream products feeding this consumer-aligned product",
             "fields": ["consumes[].productId", "consumes[].version"],
-            "mcp_tools": ["list_source_lineage", "search_semantic_memory"],
+            "mcp_tools": ["list_source_lineage"],
         },
         {
             "step": "Define models[].entities[] for the consumer view",
@@ -1513,7 +938,7 @@ def run(args, logger: logging.Logger) -> int:
             # A missing extra still propagates, as it always has: the CLI entry
             # point says the remedy on stderr under --agent
             # (``cli._render_missing_optional``), and an in-process caller
-            # (the MCP ``forge_run``) gets the exception itself.
+            # gets the exception itself.
             rc = _run_main_noting_failure(args, logger)
             # On success, optionally emit the structured plan checklist BEFORE
             # forge.done so consumers parsing the stream see the plan in order.
@@ -1563,111 +988,10 @@ def _emit_forge_error(run_id: str, rc: int) -> None:
     _emit_agent_jsonl("forge.error", run_id=run_id, **fields)
 
 
-#: Per-process flag for the personal-memory sanitiser.  See
-#: ``_sanitize_personal_memory_once`` for the rationale — issue #51 fix.
-_PERSONAL_MEMORY_SANITISED: bool = False
-
-
-def _sanitize_personal_memory_once() -> None:
-    """Run the personal-memory poison sanitiser exactly once per process.
-
-    Issue #51 fix: ``_sanitize_existing_personal_memory`` (the on-disk
-    cleanup helper introduced by P1a) was previously only invoked from
-    ``tests/conftest.py``.  A real engineer whose ``~/.fluid/personal-memory.json``
-    got poisoned by an earlier test run (or by hand) never had the
-    file rewritten — the in-memory ``_strip_poisoned_values`` cleared
-    the values for the current run but the next run would re-read the
-    same poison.
-
-    Calling the sanitiser once per process at the entry to ``fluid
-    forge`` closes that gap.  The helper is idempotent and safe when
-    the file is absent (documented in the helper's docstring).  Best
-    effort: any error is logged at DEBUG and never blocks the run.
-
-    The module-level flag avoids repeating the disk read on subsequent
-    in-process invocations (notably the test suite, where ``_run_main``
-    is called many times per session).
-    """
-    global _PERSONAL_MEMORY_SANITISED
-    if _PERSONAL_MEMORY_SANITISED:
-        return
-    _PERSONAL_MEMORY_SANITISED = True
-    try:
-        from fluid_build.cli.forge_copilot_personal_memory import (
-            _sanitize_existing_personal_memory,
-        )
-
-        _sanitize_existing_personal_memory()
-    except Exception as exc:  # noqa: BLE001 — best effort, never blocks the run
-        LOG.debug("personal_memory_sanitise_failed: %s", exc)
-
-
 def _run_main(args, logger: logging.Logger) -> int:
     """Main entry point for ``fluid forge``."""
-    _sanitize_personal_memory_once()
     console = Console() if RICH_AVAILABLE else None
     try:
-        # --- Prompt profile (single-name, single-swap) ---
-        # Resolve from --prompt-profile or FLUID_PROMPT_PROFILE and activate it
-        # process-wide BEFORE any prompt is built or contract written, so both
-        # the AI system prompt and the provenance stamp observe it. An
-        # unknown/unsafe name is a hard, clear error — never a silent fallback.
-        from fluid_build.cli.forge_copilot_prompts import (
-            PromptProfileError,
-            set_prompt_profile,
-        )
-
-        _cli_profile = getattr(args, "prompt_profile", None)
-        if not isinstance(_cli_profile, str):
-            # Robust against non-string args (e.g. a MagicMock in tests); real
-            # argparse always yields a str or None.
-            _cli_profile = None
-        _profile_name = _cli_profile or os.environ.get("FLUID_PROMPT_PROFILE") or None
-        try:
-            set_prompt_profile(_profile_name)
-        except PromptProfileError as exc:
-            if console:
-                console.print(
-                    literal_text("Invalid --prompt-profile:", "red") + literal_error_text(f" {exc}")
-                )
-            else:
-                console_error(f"Invalid --prompt-profile: {exc}")
-            return 2
-        if _profile_name:
-            LOG.debug("Forge: prompt profile active: %s", _profile_name)
-
-        # --- Prompt overlays (stackable, compose ON TOP of the profile) ---
-        # Activate AFTER the profile so the anchor-integrity guard's base
-        # guidance already reflects it. Load + signature-policy + anchor-guard
-        # all happen here; any failure is a hard, clear error (never a silent
-        # fall-back). Imported lazily so the crypto/overlay module never loads
-        # on the ``fluid --help`` cold path.
-        from fluid_build.cli.forge_prompt_overlays import (
-            PromptOverlayError,
-            activate_prompt_overlays,
-        )
-
-        _overlay_spec = getattr(args, "prompt_overlay", None)
-        if not isinstance(_overlay_spec, (str, list, tuple)):
-            _overlay_spec = None
-        if not _overlay_spec:
-            _overlay_spec = os.environ.get("FLUID_PROMPT_OVERLAYS") or None
-        try:
-            _active_overlays = activate_prompt_overlays(_overlay_spec)
-        except PromptOverlayError as exc:
-            if console:
-                console.print(
-                    literal_text("Invalid --prompt-overlay:", "red") + literal_error_text(f" {exc}")
-                )
-            else:
-                console_error(f"Invalid --prompt-overlay: {exc}")
-            return 2
-        if _active_overlays:
-            LOG.debug(
-                "Forge: prompt overlays active: %s",
-                ", ".join(o.name for o in _active_overlays),
-            )
-
         if getattr(args, "forge_subcommand", None) == "data-model":
             from fluid_build.cli.forge_data_model import run as run_data_model
 
@@ -1693,18 +1017,6 @@ def _run_main(args, logger: logging.Logger) -> int:
             )
             return 0
 
-        # --- Memory management shortcuts ---
-        if get_cli_arg(args, "show_memory", False) or get_cli_arg(args, "reset_memory", False):
-            return handle_memory_management(args, logger)
-
-        # --- Watch mode (Trello #69d4c9cb — Forge UX: `fluid forge --watch`) ---
-        # Re-generate the contract whenever a watched source file changes.
-        # Intercepts before the mode picker / AI setup because watch owns the
-        # whole run: it loops, regenerating non-interactively (offline guided,
-        # no network) on each debounced change until Ctrl-C.
-        if get_cli_arg(args, "watch", False):
-            return _run_watch(args, logger)
-
         # --- Snapshot for the forge receipt ---
         # Scan cwd (and an explicit --target-dir) before any mode runs so the
         # diff catches every file the mode handler wrote.  find_workspace_root
@@ -1715,28 +1027,6 @@ def _run_main(args, logger: logging.Logger) -> int:
         import fluid_build.cli.forge as _self
 
         _self.reset_token_usage()
-
-        # --- Resume detection + flag validation (Phase R1) ---
-        # Validate flag combinations and surface a resume prompt before
-        # any other work. The resolved run-id (or None) lands on
-        # ``args._resume_run_id`` so downstream coordinators can pick
-        # it up from one canonical place.
-        try:
-            _resolve_resume_args(args, workspace_root=scan_root, console=console)
-        except _ResumeFlagError as exc:
-            if console:
-                console.print(literal_error_text(f"{exc}", "red"))
-            else:
-                console_error(str(exc))
-            return exc.exit_code
-
-        # --- Startup prune-hint (non-blocking, once per run) ---
-        try:
-            from fluid_build.cli._forge_resume import maybe_print_prune_hint
-
-            maybe_print_prune_hint(scan_root)
-        except Exception:  # noqa: BLE001 — never block on the hint
-            LOG.debug("prune_hint_failed", exc_info=True)
 
         # --- Top-level flag aliases ---
         # ``--no-llm`` and ``--deterministic`` were added at the
@@ -2021,19 +1311,10 @@ def _run_main(args, logger: logging.Logger) -> int:
 
 
 def run_ai_copilot_mode(args, logger: logging.Logger) -> int:
-    import fluid_build.cli.forge as _self
+    """AI mode: the shipped FLUID skills drive the authoring (``cli/forge_ai.py``)."""
+    import fluid_build.cli.forge_ai as _forge_ai
 
-    return _self._run_copilot(
-        args,
-        logger,
-        copilot_class=_self.CopilotAgent,
-        get_cli_arg_fn=get_cli_arg,
-        load_context_fn=load_context,
-        get_target_directory_fn=get_target_directory,
-        context_error_cls=ContextValidationError,
-        build_interview_summary_fn=_self.build_interview_summary_from_context,
-        console_factory=Console if RICH_AVAILABLE else None,
-    )
+    return _forge_ai.run_ai_mode(args, logger)
 
 
 def run_guided_mode(args, logger: logging.Logger) -> int:
@@ -2044,41 +1325,6 @@ def run_guided_mode(args, logger: logging.Logger) -> int:
         args,
         logger,
         get_target_directory_fn=get_target_directory,
-        console_factory=Console if RICH_AVAILABLE else None,
-    )
-
-
-def _watch_regenerate(args, logger: logging.Logger) -> int:
-    """One non-interactive, network-free contract regeneration for watch mode.
-
-    A watch loop cannot re-run a full interview per change, so it reuses the
-    deterministic **offline guided** path: re-derive answers from flags/defaults
-    and (over)write the contract. ``create_and_validate_contract`` overwrites in
-    place, so the regeneration is idempotent — safe to run on every change.
-    """
-    import fluid_build.cli.forge as _self
-
-    # Watch implies headless regeneration — force it so the guided path never
-    # blocks on a prompt or fails the interactive-TTY guard.
-    args.non_interactive = True
-    return _self.run_guided_mode(args, logger)
-
-
-def _run_watch(args, logger: logging.Logger) -> int:
-    """Enter the forge watch loop — regenerate the contract on source change.
-
-    Delegates the loop to ``_forge_watch.run_watch_mode`` (imported lazily so it
-    stays off the ``fluid --help`` path) and injects ``_watch_regenerate`` as the
-    per-change callback. Resolving through the module (``_self``) keeps the test
-    patch seams (``forge._watch_regenerate`` / ``forge.run_guided_mode``) live.
-    """
-    import fluid_build.cli.forge as _self
-    from fluid_build.cli._forge_watch import run_watch_mode
-
-    return run_watch_mode(
-        args,
-        logger,
-        regenerate_fn=_self._watch_regenerate,
         console_factory=Console if RICH_AVAILABLE else None,
     )
 
@@ -2283,21 +1529,16 @@ def _format_forge_command(args, flow: str) -> str:
 
 
 __all__ = [
-    "AIAgent",
-    "AI_AGENTS",  # noqa: F822 — resolved lazily via module __getattr__
     "COMMAND",
     "ContextValidationError",
-    "CopilotAgent",  # noqa: F822 — resolved lazily via module __getattr__
     "ForgeError",
     "ForgeMode",
     "InvalidProjectNameError",
     "ProjectGenerationError",
     "get_cli_arg",
     "get_target_directory",
-    "handle_memory_management",
     "load_context",
     "register",
-    "resolve_memory_store",
     "run",
     "run_ai_copilot_mode",
     "run_guided_mode",

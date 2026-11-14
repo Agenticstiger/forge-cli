@@ -70,15 +70,6 @@ def auto_find_contract(args: Any) -> bool:
     return False
 
 
-def redact_secrets(text: str) -> str:
-    """Best-effort redaction of common secret patterns in text."""
-    redacted = re.sub(r"(Bearer\s+)[^\s]+", r"\1***", text, flags=re.I)
-    redacted = re.sub(r"(x-api-key[\"']?\s*:\s*[\"'])[^\"']+", r"\1***", redacted, flags=re.I)
-    redacted = re.sub(r"(api[_-]?key[\"']?\s*[:=]\s*[\"']?)\S+", r"\1***", redacted, flags=re.I)
-    redacted = redacted.replace(str(Path.home()), "~")
-    return redacted
-
-
 def load_yaml_json(path: Path) -> Any:
     """Load a YAML or JSON file by suffix. Single source of truth for the
     ``if .yaml then yaml.safe_load else json.load`` pattern that was

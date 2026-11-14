@@ -60,14 +60,6 @@ ALLOWED = {
     ): "fixed tip text defined two lines above",
     ("forge", "cprint(f'\\n{hint_text}')"): "fixed tip text defined two lines above",
     (
-        "forge_modes",
-        "console.print(f\"[cyan]Recommended Template:[/cyan] {suggestions.get('recommended_template')}\")",
-    ): "a template name from the internal catalog, not an exception",
-    (
-        "forge_modes",
-        "console.print(f\"[cyan]Recommended Provider:[/cyan] {suggestions.get('recommended_provider')}\")",
-    ): "a provider name from the internal catalog, not an exception",
-    (
         "forge_data_model",
         "cprint(f'[red]{exc.event}:[/red]', end=' ')",
     ): "exc.event is a snake_case identifier; the message follows through cprint_literal",
@@ -87,10 +79,6 @@ ALLOWED = {
         "_apply_opentofu_engine",
         "cprint(f'  access enforcement after the failed apply could not run: {type(exc).__name__}')",
     ): "prints the exception class name only, never its text",
-    (
-        "_interview_slash_commands",
-        "console.print(f'[yellow]Unknown command: :{name}. Did you mean [bold]:{suggestion}[/bold]? (:help lists all)[/yellow]')",
-    ): "a command name from the fixed slash-command table, not an exception",
     (
         "_subcommand_guide",
         "cprint(f'[yellow]Recommended:[/yellow] {hint.rationale}')",
@@ -220,58 +208,6 @@ def _error() -> CopilotGenerationError:
     )
 
 
-def test_forge_modes_ai_copilot_error_renderer() -> None:
-    from fluid_build.cli import forge_modes
-
-    console, buf = _console()
-    forge_modes._render_ai_copilot_error(console, _error())
-    assert buf.getvalue().count(HINT) == 2  # in the message and in the suggestion
-
-
-def test_template_mode_minimal_flow_error() -> None:
-    # _template_mode and forge_modes import each other; forge_modes must load first.
-    import importlib
-
-    importlib.import_module("fluid_build.cli.forge_modes")
-    _template_mode = importlib.import_module("fluid_build.cli._template_mode")
-
-    def boom(context, options):
-        raise _error()
-
-    copilot = SimpleNamespace(
-        generate_project_artifacts=boom, _attempt_generation_recovery=lambda **kw: None
-    )
-    console, buf = _console()
-    ok = _template_mode._create_project_minimal(
-        copilot=copilot,
-        target_dir=Path("."),
-        context={},
-        copilot_options={},
-        dry_run=False,
-        logger=logging.getLogger("t"),
-        console=console,
-    )
-    assert ok is False
-    assert buf.getvalue().count(HINT) == 2
-
-
-def test_forge_copilot_agent_error_print(monkeypatch: pytest.MonkeyPatch) -> None:
-    from fluid_build.cli import forge_copilot_agent as fca
-
-    agent = object.__new__(fca.CopilotAgentBase)
-    console, buf = _console()
-    agent.console = console
-    monkeypatch.setattr(fca, "normalize_copilot_context", lambda c: c)
-
-    def boom(context, options):
-        raise _error()
-
-    monkeypatch.setattr(agent, "generate_project_artifacts", boom, raising=False)
-    monkeypatch.setattr(agent, "_attempt_generation_recovery", lambda **kw: None, raising=False)
-    assert agent.create_project(Path("."), {}, {}, dry_run=True) is False
-    assert buf.getvalue().count(HINT) == 2
-
-
 def test_doctor_next_steps_and_readiness(capsys: pytest.CaptureFixture[str], monkeypatch) -> None:
     from fluid_build.cli import doctor
 
@@ -338,60 +274,6 @@ def test_cprint_literal_masks_bare_token_shapes(capsys: pytest.CaptureFixture[st
     out = capsys.readouterr().out
     _assert_masked(out)
     assert HINT in " ".join(out.split())
-
-
-def test_forge_modes_renderer_masks_secrets() -> None:
-    from fluid_build.cli import forge_modes
-
-    console, buf = _console()
-    forge_modes._render_ai_copilot_error(console, _leaky_error())
-    forge_modes._render_ai_copilot_error(console, RuntimeError(_SECRET_LINE))
-    _assert_masked(buf.getvalue())
-    assert HINT in buf.getvalue()
-
-
-def test_template_mode_renderer_masks_secrets() -> None:
-    import importlib
-
-    importlib.import_module("fluid_build.cli.forge_modes")
-    _template_mode = importlib.import_module("fluid_build.cli._template_mode")
-
-    def boom(context, options):
-        raise _leaky_error()
-
-    copilot = SimpleNamespace(
-        generate_project_artifacts=boom, _attempt_generation_recovery=lambda **kw: None
-    )
-    console, buf = _console()
-    _template_mode._create_project_minimal(
-        copilot=copilot,
-        target_dir=Path("."),
-        context={},
-        copilot_options={},
-        dry_run=False,
-        logger=logging.getLogger("t"),
-        console=console,
-    )
-    _assert_masked(buf.getvalue())
-    assert HINT in buf.getvalue()
-
-
-def test_copilot_agent_renderer_masks_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
-    from fluid_build.cli import forge_copilot_agent as fca
-
-    agent = object.__new__(fca.CopilotAgentBase)
-    console, buf = _console()
-    agent.console = console
-    monkeypatch.setattr(fca, "normalize_copilot_context", lambda c: c)
-
-    def boom(context, options):
-        raise _leaky_error()
-
-    monkeypatch.setattr(agent, "generate_project_artifacts", boom, raising=False)
-    monkeypatch.setattr(agent, "_attempt_generation_recovery", lambda **kw: None, raising=False)
-    agent.create_project(Path("."), {}, {}, dry_run=True)
-    _assert_masked(buf.getvalue())
-    assert HINT in buf.getvalue()
 
 
 def test_doctor_renderers_mask_secrets(monkeypatch: pytest.MonkeyPatch) -> None:

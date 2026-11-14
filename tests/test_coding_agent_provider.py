@@ -14,6 +14,7 @@ typed error paths.
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 
 import pytest
@@ -108,10 +109,10 @@ def test_claude_code_argv_and_structured_output(monkeypatch):
     assert argv[0].endswith("claude")
     assert "-p" in argv and "--output-format" in argv and "json" in argv
     assert "--bare" not in argv  # bare mode would demand ANTHROPIC_API_KEY
-    # schema is passed inline as a JSON string mentioning the envelope shape
+    # schema is passed inline as a JSON string naming the one field it holds
     assert "--json-schema" in argv
     schema_str = argv[argv.index("--json-schema") + 1]
-    assert "contract" in schema_str and "recommended_template" in schema_str
+    assert "contract_yaml" in schema_str
     # system via flag (help lists no --system-prompt here, so the append fallback),
     # user via stdin
     assert "--append-system-prompt" in argv
@@ -143,6 +144,18 @@ def test_claude_code_model_passthrough_when_explicit(monkeypatch):
     assert "--model" in argv and argv[argv.index("--model") + 1] == "claude-opus-4-8"
 
 
+def test_agentic_mode_on_an_envelope_call_is_not_a_warning(monkeypatch, caplog):
+    # Only fluid forge AI mode drives an agent that writes the file; every other caller
+    # makes an envelope call, so FLUID_FORGE_AGENT_MODE=agentic (the default) is no fault.
+    monkeypatch.setenv("CODEX_API_KEY", "ck-test")
+    _install(monkeypatch, _Recorder(stdout="ENVELOPE_TEXT"))
+    config = _cfg("codex")
+    config.agent_mode = "agentic"
+    with caplog.at_level(logging.WARNING):
+        get_llm_provider("codex").invoke_blocking(config, "SYS", "USER")
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 def test_codex_argv_schema_file_and_raw_output(monkeypatch):
     monkeypatch.setenv("CODEX_API_KEY", "ck-test")
     rec = _Recorder(stdout="ENVELOPE_TEXT_FROM_CODEX", capture_schema_file=True)
@@ -154,7 +167,9 @@ def test_codex_argv_schema_file_and_raw_output(monkeypatch):
     argv = _argv(rec)
     assert argv[0].endswith("codex") and "exec" in argv
     assert "--output-schema" in argv
-    assert "--sandbox" not in argv  # envelope mode stays read-only
+    # Envelope mode is read-only, and runs in a scratch dir that is no git repository.
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert "--skip-git-repo-check" in argv
     # codex has no system-prompt flag: system is prepended into the positional
     assert rec.calls[0]["stdin"] is None
     assert argv[-1].startswith("SYS-PROMPT") and "USER-PROMPT" in argv[-1]

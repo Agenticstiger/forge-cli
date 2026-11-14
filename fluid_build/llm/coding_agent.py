@@ -13,10 +13,7 @@ CLI the user already has installed:
 * **Cursor** — ``cursor-agent -p`` (reuses ``CURSOR_API_KEY``)
 * **Amazon Kiro** — ``kiro --no-interactive`` (reuses ``KIRO_API_KEY``)
 
-This is the standalone-terminal sibling of
-:class:`~fluid_build.llm.providers.MCPSamplingProvider`,
-which serves the in-IDE case (forge driven by the host's ``forge_run`` tool).
-Both reuse the same :class:`LlmProvider` seam, so selection is purely by
+It reuses the :class:`LlmProvider` seam, so selection is purely by
 provider name (``claude-code``/``codex``/``cursor``/``kiro``) — there is no
 separate backend switch.
 
@@ -198,7 +195,9 @@ _AGENT_SPECS: Dict[str, AgentSpec] = {
         system_prompt_flag="",
         schema_mode="file",
         schema_flag="--output-schema",
-        base_args=("exec",),
+        # Read-only sandbox, and no git check: the one-call run happens in a scratch tempdir,
+        # which is not a git repository, and it needs no writes.
+        base_args=("exec", "--sandbox", "read-only", "--skip-git-repo-check"),
         model_flag="--model",
         output_mode="raw",
         cost_field=None,
@@ -368,11 +367,10 @@ def _lists_flag(help_text: str, flag: str) -> bool:
 
 
 def _response_schema() -> Dict[str, Any]:
-    # Permissive variant (NOT the OpenAI-hardened one): nested objects keep
-    # additionalProperties:true because the contract is free-form.
-    from fluid_build.llm.response_schema import FORGE_RESPONSE_SCHEMA
+    """The answer ``--json-schema`` / ``--output-schema`` asks for: the contract's YAML."""
+    from fluid_build.llm.response_schema import CONTRACT_RESPONSE_SCHEMA
 
-    return FORGE_RESPONSE_SCHEMA
+    return CONTRACT_RESPONSE_SCHEMA
 
 
 def _write_temp_json(obj: Any) -> str:
@@ -578,14 +576,14 @@ class CodingAgentProvider(LlmProvider):
         # meaning for a subprocess — schema is conveyed via the agent's own
         # flags below — so it is intentionally ignored.
         _reset_agent_cost_state()
-        # Agentic mode is plumbed (LlmConfig.agent_mode / --forge-agent-mode) but
-        # the runtime doesn't yet dispatch the agent-writes-the-file loop, so the
-        # envelope path runs instead. Warn loudly rather than silently no-op the
-        # opt-in flag. (Wiring the agentic loop is the documented follow-up.)
+        # This is always an envelope call: the agent returns the contract as text.
+        # Only `fluid forge` AI mode drives an agent that writes the file itself
+        # (Claude Code, cli/forge_ai.py), so agentic mode here is not an error.
         if getattr(config, "agent_mode", "envelope") == "agentic":
-            LOG.warning(
-                "coding_agent_agentic_not_wired: --forge-agent-mode agentic is not "
-                "yet dispatched by the runtime; proceeding in envelope mode."
+            LOG.debug(
+                "coding_agent_envelope_call: %s returns the contract as text; only "
+                "Claude Code in fluid forge AI mode writes the file itself.",
+                self._spec.name,
             )
         spec = self._spec
 
@@ -715,7 +713,7 @@ class CodingAgentProvider(LlmProvider):
     ) -> Iterator[str]:
         # Streaming is deferred: yield the blocking result as one chunk. The
         # runtime's streaming wrapper concatenates chunks, so this is
-        # transparent (same pattern as MCPSamplingProvider).
+        # transparent.
         yield self.invoke_blocking(config, system_prompt, user_prompt, extra_payload=extra_payload)
 
 

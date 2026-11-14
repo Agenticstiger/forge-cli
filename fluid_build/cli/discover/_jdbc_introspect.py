@@ -195,7 +195,7 @@ _QUERY_SECRET = re.compile(
 class _UnusableUriError(ValueError):
     """A JDBC URI that cannot be used, quoted with its password already masked.
 
-    Raised by :func:`_parse_uri` and :func:`_uri_scheme` only. The message
+    Raised by :func:`_parse_uri` only. The message
     shows the URI with the password masked where it sits (:func:`_masked_uri`),
     so a caller prints it as it is: masking it again by substring would also
     hide every other place the password's text appears, the source kind in
@@ -294,22 +294,6 @@ def _error_text(exc: BaseException, uri: str) -> str:
     if isinstance(exc, _UnusableUriError):
         return str(exc)
     return _mask_uri_password(str(exc), uri)
-
-
-def _uri_scheme(uri: str) -> str:
-    """The scheme before ``uri``'s ``://``; :class:`_UnusableUriError` when it has none.
-
-    For a caller that takes the source kind from the URI itself. Without this
-    the text before the first ``://`` would be quoted as the kind, and for a
-    URI with a missing slash that text holds the password.
-    """
-    scheme, sep, _tail = uri.partition("://")
-    if sep and _SCHEME.fullmatch(scheme):
-        return scheme
-    raise _UnusableUriError(
-        "Unsupported JDBC source: the URI does not start with postgres://, postgresql://, "
-        f"mysql:// or sqlite://. Got: {_masked_uri(uri)!r}"
-    )
 
 
 _host_credential_env_suppressed = host_credential_env_suppressed

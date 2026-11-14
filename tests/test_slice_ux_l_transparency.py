@@ -12,7 +12,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from fluid_build.cli.forge_copilot_discovery import DiscoveryReport
 from fluid_build.cli.forge_ui import print_forge_performance_summary
 
 
@@ -148,36 +147,3 @@ class TestPerformanceSummaryPanel:
 
     def test_none_console_does_not_crash(self):
         print_forge_performance_summary(None, {"provider": "test"})
-
-
-class TestDiscoveryReportCacheFields:
-    def test_default_fields(self):
-        r = DiscoveryReport(workspace_roots=["."])
-        assert r.cache_hit is False
-        assert r.scan_time_ms == 0
-
-    def test_cache_hit_field_set(self):
-        r = DiscoveryReport(workspace_roots=["."], cache_hit=True)
-        assert r.cache_hit is True
-
-
-class TestInterviewSkipMarker:
-    def test_is_context_sufficient_sets_marker(self):
-        from fluid_build.cli.forge_copilot_interview import (
-            bootstrap_interview_state,
-            is_context_sufficient,
-        )
-
-        state = bootstrap_interview_state(
-            {
-                "project_goal": "Sales analytics",
-                "data_sources": "warehouse tables",
-                "use_case": "analytics",
-            },
-            discovery_report=MagicMock(
-                existing_contracts=[],
-                provider_hints=[],
-                sample_files=[],
-            ),
-        )
-        assert is_context_sufficient(state.normalized_context)

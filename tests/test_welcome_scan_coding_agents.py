@@ -4,10 +4,7 @@
 """A2/A3 — the welcome scan detects AI coding-agent CLIs and surfaces keyless
 authoring (no API key needed).
 
-Reliable signal: which agent CLIs are on PATH (``shutil.which``). A live MCP
-sampling channel is deliberately *not* probed here — it only exists inside the
-non-interactive ``forge_run`` tool, never in the interactive path where the
-welcome scan runs, so checking it would be dead code.
+Reliable signal: which agent CLIs are on PATH (``shutil.which``).
 """
 
 from __future__ import annotations

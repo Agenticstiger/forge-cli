@@ -410,11 +410,6 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
     ),
     **_register(
         NOT_A_CONTRACT,
-        "parses the text the tool has just generated",
-        *_site("cli/mcp/dispatch.py", "_dispatch_forge_from_jdbc_source"),
-    ),
-    **_register(
-        NOT_A_CONTRACT,
         "the policy bindings file `policy-compile` wrote, or the file `generate artifacts` just wrote",
         *_site("cli/policy_apply.py", "run"),
         *_site("forge/core/artifact_fanout.py", "_emit_policies"),
@@ -433,20 +428,6 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
         *_site("cli/_welcome_scan.py", "_probe_specialization_suggestion"),
         *_site("cli/viz_graph.py", "_run_mesh_mode"),
         *_site("cli/workspace_config.py", "discover_workspace_products"),
-    ),
-    **_register(
-        ACCEPTED,
-        "the copilot tools and missions read a contract to show it to a model",
-        *_site(
-            "cli/forge_copilot_tools.py",
-            "_dispatch_check_pii_classification",
-            "_dispatch_discover_workspace_contracts",
-            "_dispatch_read_upstream_schema",
-        ),
-        *_site("cli/forge_copilot_discovery.py", "_summarize_existing_contract"),
-        *_site("cli/forge_modes.py", "run_ai_copilot_mode"),
-        *_site("copilot/checkpoint_stale.py", "_load_contract_from_disk"),
-        *_site("copilot/missions/checks.py", "load_contract_for_checks"),
     ),
     **_register(
         ACCEPTED,
@@ -614,7 +595,6 @@ def test_g20_docs_build_and_the_mcp_dispatcher_route_through_the_loader() -> Non
 
     assert Site("fluid_build/cli/docs_build.py", "_load_contract_quiet") not in sites
     assert Site("fluid_build/cli/mcp/dispatch.py", "_contract_file") not in sites
-    assert Site("fluid_build/cli/mcp/dispatch.py", "_resolve_contract_argument") not in sites
     assert Site("fluid_build/cli/mcp/dispatch.py", "_call_tool") not in sites
 
 

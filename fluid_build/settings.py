@@ -149,22 +149,8 @@ _REGISTRY: List[_SettingSpec] = [
         category="forge",
     ),
     _SettingSpec(
-        key="FLUID_FORGE_NO_STREAMING_PREVIEW",
-        description="Suppress the live contract growth panel.",
-        default=False,
-        cast=_to_bool,
-        category="forge",
-    ),
-    _SettingSpec(
         key="FLUID_FORGE_PICKER_ALWAYS",
         description="Force the picker even for return users.",
-        default=False,
-        cast=_to_bool,
-        category="forge",
-    ),
-    _SettingSpec(
-        key="FLUID_FORGE_LEGACY_COPILOT",
-        description="Bypass the staged copilot pipeline; use the linear runtime.",
         default=False,
         cast=_to_bool,
         category="forge",

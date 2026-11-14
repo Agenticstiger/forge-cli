@@ -206,7 +206,6 @@ new extra installed). `uv` is dev-time only — not a runtime dep.
 - **Generating a new CI system template**: extend `fluid_build/forge/core/pipeline_templates.py`. The 11-stage sequence + the `--install-mode {pypi,dev-source}` semantics must be preserved across systems. Jenkins is the reference implementation; GitHub Actions / GitLab / Azure / Bitbucket / CircleCI / Tekton port from it.
 - **Adding a new Path-B scheduler**: extend `fluid_build/providers/<provider>/plan/schedule.py` with a `SchedulePlanner`-compatible interface. Stage 6 `fluid plan` invokes it; stage 7 apply executes the resulting actions alongside DDL.
 - **Adding a new publish target / catalog backend**: drop a new module under `fluid_build/build_runners/catalog_registrars/<name>.py` that defines a `CatalogRegistrar` (the sync HTTP-level shape — see `datahub.py` as the reference) and ends with a `register_catalog_backend(CatalogBackendSpec(...))` call. The spec declares the canonical name, optional aliases, the registrar factory, and a flat `env_vars` mapping (config key → tuple of accepted env vars). That single file makes the backend visible on both publish surfaces — `fluid publish --target <name>` and contract `properties.catalog.register: [<name>]` — and applies the env-var overrides via `config_manager._apply_catalog_env_overrides`. No edits to `providers/catalogs/__init__.py`, `_catalog.py`, or `publish.py` are required. Command Center (`fluid-command-center`) keeps a custom config shape as a hand-wired `BaseCatalogProvider` subclass under `providers/catalogs/`; Data Mesh Manager is a catalog backend (`build_runners/catalog_registrars/datamesh_manager.py`) reached with `fluid publish --target datamesh-manager`, plus the `fluid datamesh-manager` command, and is not a provider; new backends should prefer the registrar shape unless they truly need the async-native surface.
-- **Adding a copilot tool that takes a path**: accept `workspace_root: Optional[Path]` as a kwarg from `dispatch_tool_call`; confine the LLM-supplied path with `resolved.relative_to(workspace_root)` and apply a suffix allow-list + size cap. Reference implementation: `cli/forge_copilot_tools.py::_dispatch_read_sample_schema`.
 - **Emitting new SQL DDL**: identifiers must go through `fluid_build/providers/_sql_safety.py::validate_ident`; string literals through `quote_string_literal`. Inline `.replace("'", "''")` is considered a regression — it diverges from the central helper.
 - **Adding a secret pattern to logs**: extend `fluid_build/providers/snowflake/util/logging.py::SENSITIVE_PATTERNS`/`SENSITIVE_KEYS` AND mirror the addition into `fluid_build/observability/secret_redactor.py` to keep the two redactor layers symmetric.
 
@@ -235,9 +234,7 @@ A 2026-04-16 security review (see `SECURITY_REVIEW.md` if committed, or the PR #
 
 - **Two redaction layers stay symmetric.** `observability/secret_redactor.py::SecretRedactingFilter` is the global log filter; `providers/snowflake/util/logging.py` has a Snowflake-provider-local twin. New secret-shaped patterns (JWT, Stripe, GitHub token, provider-specific key names) should land in both.
 - **Path validation is order-sensitive.** `cli/security.py::validate_input_path` calls `_reject_raw_traversal(raw)` BEFORE `Path.resolve()` (so `..` can't be silently collapsed), then runs `_validate_path_security(resolved)` for forbidden-path checks. `FORBIDDEN_PATHS` is platform-aware via `_build_forbidden_paths()` — macOS includes `/private/etc` because `/etc` resolves there.
-- **Copilot tool confinement.** Path-accepting copilot tools (`read_sample_schema`, `discover_workspace`) receive a `workspace_root` kwarg from `cli/forge_copilot_tools.py::dispatch_tool_call` and MUST confine the LLM's path argument. `discover_workspace` ignores the LLM's own `workspace_path` argument by design — scope is fixed by the invoking CLI.
 - **Encrypted credential store fails loud.** `credentials/encrypted_store.py::_load_store` raises `CredentialError` on `InvalidToken` — never silently returns `{}` (which previously caused destructive overwrite on next write with the wrong key).
-- **Tool errors are typed, not text.** `dispatch_tool_call` returns `{"error": <ExcName>, "message": "Tool … failed — see server logs"}` on exception; the full `exc` goes to `LOG.warning(..., exc_info=True)` where the redactor can scrub it. Exception text is never round-tripped into the LLM context (prevents path / hostname / env-var leaks).
 - **Subprocess argv sanitisation.** `cli/auth.py::_sanitize_argv` redacts values of `--password`, `--token`, `--api-key`, `--key-file`, any flag ending in `-secret`/`-key`/`-token`/`-password`/`-passphrase`. Called from `AuthProvider._run_command` before DEBUG-logging the command.
 - **`$ref` resolution is confined.** Every external `$ref` goes through `util/ref_confinement.py::confine_ref`: URL schemes (`file://` included) and absolute paths are refused, and the `Path.resolve()`-d target must be `is_relative_to` the ref root — the root contract's directory unless the caller passes `ref_root=` / sets `FLUID_REF_ROOT` (process-wide, so an env root that is not a directory or does not contain the contract is ignored for that contract with a `ref_root_env_ignored` WARNING; an unusable `ref_root=` raises). Nested refs are held to the same root. Bundled OpenAPI fragments have no root, so only `#/...` refs reach openapi-spec-validator. A new `$ref` resolver must call `confine_ref`, not re-implement it.
 
@@ -410,78 +407,47 @@ identity's own folder, and converges to exactly the contracts given. Code:
 
 ## For AI-Assisted Project Creation (Forge)
 
-FLUID Forge includes AI-powered project creation via a 5-mode picker:
+`fluid forge` opens a mode picker (AI / Compose / Refine / Template / Blank). AI mode runs on the
+shipped FLUID skills in `fluid_build/agent_skills/`, the same text a coding agent reads:
 
 ```bash
-fluid forge                          # 5-mode picker: AI / Compose / Refine / Template / Blank
-fluid forge --blank                  # No-AI scaffold
-fluid forge --template starter       # Template (alias --scaffold)
-fluid forge --refine contract.yaml   # Iterate on existing contract (1 question)
-fluid forge --from-product <id>      # Compose ADP/CDP from existing products
-fluid forge --data-product-type ADP  # Set Data Mesh productType (or Silver alias)
-fluid forge --yes                    # Skip the [Y/n] prompt; cost still shown
-fluid forge --show-work              # Stream agent reasoning + tool calls
+fluid forge                                     # picker: AI / Compose / Refine / Template / Blank
+fluid forge --blank                             # no-AI scaffold
+fluid forge --template starter                  # template (alias --scaffold)
+fluid forge --non-interactive --context intent.txt --target-dir products/orders
+fluid forge --refine contract.fluid.yaml --context "add a status column"
+fluid forge --from-product products/orders_raw/contract.fluid.yaml --context "daily totals"
+fluid forge --yes                               # keep the validated contract without the [Y/n]
 ```
 
-The interview is **mode-aware**: compose runs ~3 questions seeded from upstream schemas, refine asks "what to change?", standard mode runs the world-class bootstrap (detect-first inferences, examples in every prompt, productType-first, `:auto` escape, schema-coverage gate). Slash commands inside the interview: `:ai-setup`, `:override`, `:show-work`, `:doctor`, `:help`, `:quit`.
+How AI mode runs (`fluid_build/cli/forge_ai.py`):
 
-Cost is visible before it's spent: every run renders `.fluid/agents/<run-id>/{cost.json,reasoning.md,transcript.json}` and `.fluid/forge-receipt.json`. Aggregate across runs via `fluid stats --by provider|type|engine`.
+- **With a coding agent** (`--llm-provider claude-code|codex|cursor|kiro`, or the one `fluid ai
+  setup` saved): an interactive run opens the agent in the workspace with the skills loaded and
+  the request as its first prompt, and the agent asks its own questions. A non-interactive run
+  drives Claude Code headless. It may read the workspace, edit the one contract file and run
+  `fluid validate` on it, exactly (`CLAUDE_ALLOWED_TOOLS` + `agent_rules`). No `fluid` stage
+  with an output flag is allowed. Codex, Cursor and Kiro take the one-call path when nobody
+  is at the keyboard. `--forge-agent-mode envelope` makes Claude Code one call too.
+- **Otherwise** one LLM call (litellm, the `[ai]` extra) whose system prompt is the skills' text.
+  Forge runs `fluid validate --offline` and feeds the errors back, at most 3 attempts.
+- Either way forge's own gate is `fluid validate --offline`, and each run writes
+  `.fluid/agents/<run-id>/cost.json`, which `fluid stats` aggregates.
 
-AI authoring through an API-key provider runs on the **LiteLLM unified backend** (one API across OpenAI / Anthropic / Gemini / Bedrock / Azure / Vertex / Groq / Cohere / Mistral / Ollama). litellm is an extra since 0.28.0, not part of the base install: `[litellm]` (alias `[ai]`), or `[standard]` for AI + MCP. Without it, a litellm-backed `--llm-provider` fails up front with the install line; the keyless coding-agent providers (`claude-code`, `codex`, `cursor`, `kiro`), `mcp-sampling` and `--template`/`--blank` forge need no extra. MCP (`fluid mcp serve`, `fluid mcp output-port serve`, `scaffold-ide`) needs `[mcp]` and OpenLineage emission needs `[lineage]`; all three gate through `fluid_build/_optional.py`.
+On #851's eval a coding agent with the skills scored 11/11 and the embedded copilot it replaced
+scored 0/9. The copilot's interview, prompt library, response envelope, agent loop, memory,
+missions, judge, domain agents and prompt profiles were deleted on 2026-11-13. The multi-agent
+fleet under `fluid_build/copilot/agents/` stays: it is the data-model engine behind
+`fluid forge data-model *` and `fluid generate transformation`.
+
+litellm is an extra since 0.28.0, not part of the base install: `[litellm]` (alias `[ai]`), or
+`[standard]` for AI + MCP. Without it, a litellm-backed `--llm-provider` fails up front with the
+install line; the coding-agent providers (`claude-code`, `codex`, `cursor`, `kiro`) and
+`--template`/`--blank` forge need no extra. MCP (`fluid mcp serve`, `fluid mcp output-port serve`,
+`scaffold-ide`) needs `[mcp]` and OpenLineage emission needs `[lineage]`; all three gate through
+`fluid_build/_optional.py`.
 
 When you add code that uses one of them: route it through `require()` / `is_available()`, never a module-scope import. `.[dev]` installs all three, so only `scripts/ci/bare_install_smoke.sh` (the bare wheel, asserting the hints) and `scripts/ci/dep_budget.py` (the base package count per target) see a regression. boto3 no longer arrives through litellm, so AWS paths need `[aws]`.
-
-```bash
-pip install "data-product-forge[litellm]"
-export FLUID_LLM_BACKEND=litellm
-fluid forge --llm-provider gemini --llm-model gemini-2.5-flash
-```
-
-### Domain Agents
-
-The `fluid_build/cli/forge_agents.py` module implements domain-specific AI agents:
-
-| Agent | Domain | What It Creates |
-|-------|--------|----------------|
-| Analytics Agent | Business analytics | Dashboards, KPI tracking, trend analysis |
-| ML Pipeline Agent | Machine learning | Feature stores, model serving, experiment tracking |
-| ETL Agent | Data engineering | Ingestion pipelines, transformations, quality gates |
-| Streaming Agent | Real-time data | Event processing, windowing, alerting |
-| Compliance Agent | Governance | Policy-first contracts with full access control |
-
-Each agent:
-1. Asks domain-specific questions about your requirements
-2. Analyzes requirements and recommends templates, providers, and patterns
-3. Generates a complete FLUID project with contract, tests, and CI config
-4. Validates the generated contract against the FLUID schema
-
-### Extending with Custom Agents
-
-```python
-from fluid_build.cli.forge_agents import AIAgentBase
-
-class MyDomainAgent(AIAgentBase):
-    def __init__(self):
-        super().__init__(
-            name="my-domain",
-            description="Custom agent for my domain",
-            domain="my-domain"
-        )
-
-    def get_questions(self):
-        return [
-            {"id": "goal", "text": "What is your data product goal?", "type": "text"},
-            {"id": "provider", "text": "Target cloud?", "type": "choice",
-             "options": ["local", "gcp", "aws", "snowflake"]},
-        ]
-
-    def analyze_requirements(self, context):
-        return {
-            "recommended_template": "analytics",
-            "recommended_provider": context.get("provider", "local"),
-            "suggested_quality_rules": ["not_null", "uniqueness"],
-        }
-```
 
 ---
 
@@ -705,8 +671,7 @@ in a fresh interpreter. Reductions this session:
 Files still over 1500 LOC (slated for follow-up): `datamesh_manager.py`
 (2595), `forge_modes.py` (2459), `init.py` (1920), `ai_setup.py`
 (1888), `forge_data_model.py` (1825 — gained ~120 from Phase 2.6),
-`forge_copilot_llm_providers.py` (1687), `forge_copilot_tools.py`
-(1614), `forge_copilot_runtime.py` (1590), `apply.py` (~1580 with
+`apply.py` (~1580 with
 the federation gate), `coordinator.py` (1522).
 
 ## Plugin extension points (2026-05-12)
@@ -842,7 +807,7 @@ onprem = "my_pkg.iac:OnPremIacPlugin"
 - **Repository**: [https://github.com/Agenticstiger/forge-cli](https://github.com/Agenticstiger/forge-cli)
 - **Agent Policy Examples**: `examples/0.7.1/ai-restricted-data.yaml`
 - **Policy Validator Source**: `fluid_build/policy/agent_policy.py`
-- **Forge Agents Source**: `fluid_build/cli/forge_agents.py`
+- **Forge AI mode source**: `fluid_build/cli/forge_ai.py`
 
 ---
 

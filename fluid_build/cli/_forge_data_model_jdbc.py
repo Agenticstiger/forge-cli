@@ -42,9 +42,9 @@ def _run_from_jdbc_source(
 
     ``operator_supplied`` is passed by the command-line branch only: the
     operator typed ``--uri``, so it may use this host's client certificate and
-    libpq settings. It is never read from ``args``, so the MCP
-    ``forge_from_source`` shim, which builds ``args`` from a client's request,
-    keeps the default pin (see ``introspect_jdbc``).
+    libpq settings. It is never read from ``args``, so a caller that builds
+    ``args`` from a client's request keeps the default pin (see
+    ``introspect_jdbc``).
 
     Implementation note: we don't reuse the catalog adapter
     abstraction here because there's no credential resolver — the URI

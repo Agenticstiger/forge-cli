@@ -129,7 +129,7 @@ below. Directive from the user: "nothing left behind."
   no-store session) fall through with no crash and no empty-list key.
   Pinned by `tests/copilot/test_modeler_semantic_retrieval.py`.
 - **B2 — Optional embedding-backed VectorBackend** · `use_embeddings=True`
-  on the opt-in path; gated on `pip install "data-product-forge[vector]"`.
+  on the opt-in path (removed 2026-11-13 with the copilot's memory store).
   Missing extra → warn-and-fallback; present extra → hash-based
   ranking that token-overlap-heavy records score above
   substring-overlap records. Pinned by

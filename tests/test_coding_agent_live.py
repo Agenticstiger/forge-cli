@@ -24,16 +24,23 @@ from types import SimpleNamespace
 import pytest
 
 from fluid_build.cli.forge_copilot_coding_agent import get_coding_agent_provider
-from fluid_build.cli.forge_copilot_contract_helpers import extract_json_object
 from fluid_build.cli.forge_copilot_llm_providers import resolve_llm_config
 
 pytestmark = pytest.mark.integration
 
 _SYSTEM = (
     "You generate FLUID DataProduct contracts. Respond with ONLY a JSON object "
-    "matching the provided schema — no prose, no markdown fences."
+    "matching the provided schema (the whole contract as YAML text in "
+    "contract_yaml), no prose, no markdown fences."
 )
 _USER = "Create a minimal DataProduct contract for a daily sales table named 'sales'."
+
+
+def _extract_json_object(text):
+    """Parse the agent's envelope string as one JSON object (raises if it is not)."""
+    payload = json.loads(text)
+    assert isinstance(payload, dict)
+    return payload
 
 
 def _resolve(provider_name):
@@ -48,9 +55,9 @@ def test_claude_code_live_keyless_envelope_roundtrip():
         pytest.skip("claude CLI not installed")
     provider = get_coding_agent_provider("claude-code")
     out = provider.invoke_blocking(_resolve("claude-code"), _SYSTEM, _USER)
-    payload = extract_json_object(out)  # raises if not parseable
+    payload = _extract_json_object(out)
     assert isinstance(payload, dict)
-    assert "contract" in payload
+    assert "contract_yaml" in payload
 
 
 @pytest.mark.parametrize(
@@ -68,5 +75,5 @@ def test_keyed_agent_live_envelope_roundtrip(provider_name, binary, key_env):
         pytest.skip(f"{key_env} not set")
     provider = get_coding_agent_provider(provider_name)
     out = provider.invoke_blocking(_resolve(provider_name), _SYSTEM, _USER)
-    payload = extract_json_object(out)
+    payload = _extract_json_object(out)
     assert isinstance(payload, dict)

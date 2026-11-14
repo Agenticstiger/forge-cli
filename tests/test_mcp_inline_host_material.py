@@ -46,7 +46,6 @@ _CATALOG_TOOLS = (
     "inspect_source_table",
     "list_source_lineage",
     "list_source_glossary",
-    "forge_from_source",
 )
 
 # Test values only: none of these is a credential anywhere.

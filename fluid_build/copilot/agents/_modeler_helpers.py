@@ -444,9 +444,6 @@ def _run_tool_research_phase(
 
     For every modeler invocation:
 
-    * Always call ``search_semantic_memory`` (when registered)
-      with the contract name + intent description as the query —
-      surfaces prior forges similar to this one.
     * When tables are provided and ``inspect_table`` is
       registered, call it for the first 5 tables to enrich the
       prompt with deeper per-table metadata than what the
@@ -469,40 +466,7 @@ def _run_tool_research_phase(
 
     summaries: List[Dict[str, Any]] = []
 
-    # 1. Semantic memory search (always when registered).
-    if "search_semantic_memory" in getattr(registry, "tools", {}):
-        try:
-            query = name
-            if intent is not None:
-                query = " ".join(
-                    filter(
-                        None,
-                        [
-                            name,
-                            getattr(intent, "domain", "") or "",
-                            getattr(intent, "description", "") or "",
-                        ],
-                    )
-                )
-            registry.invoke(
-                "search_semantic_memory",
-                {
-                    "query": query,
-                    "limit": 3,
-                },
-            )
-            inv = registry.invocations[-1]
-            summaries.append(
-                {
-                    "tool": "search_semantic_memory",
-                    "success": inv.success,
-                    "result_count": (len(inv.result) if isinstance(inv.result, list) else 0),
-                }
-            )
-        except Exception:  # pragma: no cover — defensive
-            pass
-
-    # 2. Per-table inspection (when adapter + tool registered).
+    # Per-table inspection (when adapter + tool registered).
     if "inspect_table" in getattr(registry, "tools", {}) and tables:
         for table in list(tables)[:5]:
             try:
@@ -540,7 +504,6 @@ def _ensure_tool_registry(session: StageSession) -> None:
 
         registry = build_default_tool_registry(
             catalog_adapter=getattr(session, "catalog_adapter", None),
-            store=getattr(session, "store", None),
         )
         # Attribute set lazily to avoid bloating the dataclass; a
         # future v1.6 ``StageSession`` field will make this

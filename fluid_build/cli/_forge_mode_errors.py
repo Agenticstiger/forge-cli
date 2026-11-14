@@ -170,8 +170,7 @@ def forge_mode_error_boundary(
 # Each handler that swallows one hands it to :func:`log_forge_failure`, which
 # notes it here; ``forge.run`` reads the note back and, under ``--agent``,
 # writes it as one ``forge.error`` event. A ``ContextVar``, not a module global:
-# the MCP ``forge_run`` runs forge in a worker thread, and a run reads only its
-# own note.
+# a run in a worker thread reads only its own note.
 
 _RUN_FAILURE: ContextVar[Optional[BaseException]] = ContextVar(
     "fluid_forge_run_failure", default=None
@@ -248,9 +247,9 @@ def describe_forge_failure(exc: BaseException) -> Dict[str, Any]:
     when the error catalog has one. The text is redacted as the console redacts
     it, since the events go to stdout directly, past the logging redactor. An
     exception that is not a FLUID error is named by its class (``exception``),
-    never by its text: that can carry paths or provider detail, and the MCP
-    ``forge_run`` returns these events to the IDE's model, where the copilot
-    tools' typed-error rule (SECURITY_REVIEW I7) applies. stderr has the detail.
+    never by its text: that can carry paths or provider detail, and these events
+    can reach a model, where the copilot tools' typed-error rule
+    (SECURITY_REVIEW I7) applies. stderr has the detail.
     """
     from fluid_build._console import _redact_error_str
 

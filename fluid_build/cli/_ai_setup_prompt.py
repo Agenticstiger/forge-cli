@@ -90,7 +90,6 @@ def _body_for_reason(reason: str) -> str:
         return (
             "AI was skipped earlier this session. You can:\n"
             "  • Run [bold cyan]fluid ai setup[/bold cyan] to configure now\n"
-            "  • Type [bold]:ai-setup[/bold] inside the interview to resume\n"
             "  • Use [bold]fluid forge --blank[/bold] for a no-AI scaffold\n"
         )
     if reason == "rescue":

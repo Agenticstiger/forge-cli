@@ -627,39 +627,6 @@ def _prompt_for_api_key_loop(
     return _collect_and_validate_api_key(console, provider_choice=provider_choice, tier=tier)
 
 
-def rotate_api_key_interactive(console: Any) -> Optional[LlmConfig]:
-    """Re-prompt for an API key after a mid-run 401, persist it, and return it.
-
-    Called by the copilot recovery path when an in-flight LLM call is rejected
-    with an authentication error (expired / revoked / wrong key). It renders a
-    clear "key rejected" panel, then reuses the standard provider-pick →
-    validate → persist → ``set_session_env`` flow (:func:`_prompt_for_api_key`),
-    so the freshly-entered key is written to config/keyring *and* exported into
-    the process env — letting the caller re-resolve and retry the same run
-    without restarting.
-
-    Returns the new :class:`LlmConfig`, or ``None`` if there's no interactive
-    console or the user cancels (in which case the original auth error should
-    surface unchanged).
-    """
-    if not console or not RICH_AVAILABLE:
-        return None
-    from fluid_build.cli.forge_ui import show_lines_panel
-
-    show_lines_panel(
-        console,
-        [
-            "The API key was rejected by the provider (HTTP 401).",
-            "It looks expired, revoked, or mistyped.",
-            "",
-            "Enter a fresh key to continue this run — your progress is kept.",
-        ],
-        title="🔑 API Key Rejected",
-        border_style="yellow",
-    )
-    return _prompt_for_api_key(console)
-
-
 def _collect_and_validate_api_key(
     console: Any,
     *,
@@ -1742,7 +1709,7 @@ def _provider_model_plan(provider_name: str) -> dict:
 
     provider = BUILTIN_LLM_PROVIDERS.get(provider_name)
     if provider is None:
-        # ``mcp-sampling`` and plugin providers are not in the built-in dict.
+        # Plugin providers are not in the built-in dict.
         from fluid_build.llm.providers import get_llm_provider
 
         provider = get_llm_provider(provider_name)
@@ -1964,7 +1931,7 @@ def register(subparsers) -> None:
 
 _SETUP_KEYLESS_ALTERNATIVES = (
     "Or author with no API key at all. Run fluid forge --llm-provider claude-code | codex | cursor | kiro "
-    "(uses that agent's own login), --llm-provider mcp-sampling (from your IDE), "
+    "(uses that agent's own login), "
     "or fluid forge --template starter (no AI)."
 )
 

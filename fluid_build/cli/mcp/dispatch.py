@@ -10,26 +10,16 @@ monolith into focused, testable modules.
 
 from __future__ import annotations
 
-import argparse as _argparse
-import json
 import logging
 import os
-import re
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import unquote
 
 import yaml
 
-from fluid_build.cli.mcp.models import (
-    _CATALOG_SOURCE_LIST,
-    _JDBC_SOURCE_LIST,
-    TOOL_CAPABILITIES,
-)
-from fluid_build.cli.mcp.policy import _path_is_writable
+from fluid_build.cli.mcp.models import _CATALOG_SOURCE_LIST
 from fluid_build.copilot.store.audit_trail import write_audit_event
-from fluid_build.copilot.store.factory import resolve_store
 from fluid_build.copilot.store.history import archive_snapshot
 from fluid_build.forge_datamodel.emit.fluid_contract import build_contract_from_logical
 from fluid_build.forge_datamodel.emit.validator import FluidContractValidator
@@ -240,16 +230,6 @@ def _call_tool(
         )
     if name == "diff_models":
         return diff_logical_models(Path(arguments["old"]), Path(arguments["new"]))
-    if name == "search_semantic_memory":
-        store = resolve_store(workspace_root=Path.cwd())
-        results = store.search(
-            "memory/semantic",
-            str(arguments.get("query") or ""),
-            mode=str(arguments.get("mode") or "hybrid"),
-            limit=int(arguments.get("limit") or 5),
-        )
-        return {"results": [record.value for record in results]}
-
     # ---------------------------------------------------------------
     # V1.5 — metadata source-catalog tools.
     # ---------------------------------------------------------------
@@ -306,116 +286,6 @@ def _call_tool(
         )
         return {"terms": [t.model_dump(mode="json", by_alias=True) for t in terms]}
 
-    if name == "forge_from_source":
-        if read_only:
-            raise RuntimeError("Server is running in read-only mode")
-
-        # JDBC sources route through a separate code path that doesn't
-        # need a credential resolver — the URI carries everything. This
-        # mirrors ``cli/forge_data_model.py::run_from_source_command``
-        # which forks ``--source <jdbc>`` early to ``_run_from_jdbc_source``.
-        # MCP gets the same one-shot synthesis (no separate connect step).
-        jdbc_kinds = {"postgres", "postgresql", "mysql", "sqlite"}
-        source_value = str(arguments.get("source") or "").lower().strip()
-        if source_value in jdbc_kinds:
-            # A JDBC source reaches a database — and this host's credentials,
-            # files and identity — just as a catalog credential block does, so
-            # it is classified under the same operator gates before any
-            # connection is attempted.
-            _gate_jdbc_source(
-                source_value,
-                arguments.get("uri"),
-                allow_inline_credentials=allow_inline_credentials,
-                allow_metadata_service=allow_metadata_service,
-            )
-            return _dispatch_forge_from_jdbc_source(arguments)
-
-        # ``resolve_store`` is imported at module level — do NOT
-        # re-import inside this branch, otherwise Python treats it
-        # as a function-local for the entire ``_call_tool`` body
-        # and the search_semantic_memory branch above this one
-        # crashes with UnboundLocalError.
-        from fluid_build.copilot.agents.base import StageSession
-        from fluid_build.copilot.agents.logical_agent import LogicalAgent
-
-        adapter = build_adapter(arguments)
-        scope = _scope_from_args(arguments)
-        technique = str(arguments.get("technique") or "data_vault_2")
-        engine = str(arguments.get("engine") or "dbt")
-        model_name = str(arguments.get("name") or scope.schema_name or "forged_model")
-        output_path = arguments.get("output_path")
-        if not output_path:
-            raise RuntimeError("forge_from_source requires 'output_path'")
-
-        store = resolve_store(workspace_root=Path.cwd())
-        session = StageSession(store=store)
-        logical = LogicalAgent().from_catalog(
-            session,
-            name=model_name,
-            adapter=adapter,
-            scope=scope,
-            technique=technique,
-        )
-        sidecar_payload = logical.model_dump(mode="json", by_alias=True)
-        contract = build_contract_from_logical(logical, build_engine=engine)
-
-        contract_path = Path(str(output_path))
-        sidecar_path = (
-            Path(str(arguments.get("logical_path")))
-            if arguments.get("logical_path")
-            else contract_path.with_name(f"{contract_path.name}.model.json")
-        )
-        contract.setdefault("labels", {})
-        contract["labels"] = dict(contract["labels"])
-        contract["labels"]["modelSidecar"] = sidecar_path.name
-
-        validation = FluidContractValidator().validate(logical=logical, contract=contract)
-        if not validation.passes_schema:
-            raise RuntimeError(
-                "forge_from_source produced an invalid contract: "
-                + "; ".join(issue.message for issue in validation.issues[:5])
-            )
-
-        contract_path.parent.mkdir(parents=True, exist_ok=True)
-        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-        sidecar_path.write_text(
-            json.dumps(sidecar_payload, indent=2, default=str), encoding="utf-8"
-        )
-        contract_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
-        archive_snapshot(contract=contract, logical_model=sidecar_payload)
-
-        _write_audit_event(
-            "mcp_forge_from_source",
-            payload={
-                **adapter.audit_context(),
-                "scope": scope.model_dump(mode="json", by_alias=True),
-                "technique": technique,
-                "model_name": model_name,
-                "contract_path": str(contract_path),
-                "sidecar_path": str(sidecar_path) if sidecar_path else None,
-                "table_count": (
-                    len(logical.dimensional.facts) + len(logical.dimensional.dimensions)
-                    if logical.dimensional
-                    else (len(logical.dv2.hubs) if logical.dv2 else 0)
-                ),
-            },
-        )
-        return {
-            "logical": sidecar_payload,
-            "contract_path": str(contract_path),
-            "sidecar_path": str(sidecar_path) if sidecar_path else None,
-            "validation": validation.model_dump(mode="json", by_alias=True),
-        }
-
-    # ``forge_run`` is NOT dispatched through ``_call_tool`` — it's a FastMCP
-    # tool with its own async implementation (see ``forge_run`` above) so it
-    # can call ``ctx.session.create_message`` for the sampling round-trip.
-    # Any caller that lands here with name='forge_run' is a bug.
-
-    if name == "score_contract_quality":
-        return _dispatch_score_contract_quality(arguments)
-    if name == "enrich_contract_suggestions":
-        return _dispatch_enrich_contract_suggestions(arguments)
     raise RuntimeError(f"Unknown tool {name}")
 
 
@@ -474,95 +344,24 @@ def _readable_ref_root(path: Path, readable: Tuple[Path, ...]) -> Optional[Path]
     return max(holders, key=lambda r: len(r.parts)) if holders else contract.parent
 
 
-def _resolve_contract_argument(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Accept either ``contract_path`` (filesystem) or ``contract`` (inline dict).
-
-    Path takes precedence when both supplied. The path read is what the
-    capability's ``read_path_args`` policy gates on; inline dicts come
-    straight from the MCP caller (command_center / IDE) without
-    filesystem confinement.
-    """
-    path_arg = arguments.get("contract_path")
-    inline = arguments.get("contract")
-    if path_arg:
-        return _contract_file(path_arg)
-    if inline is not None:
-        if not isinstance(inline, dict):
-            raise RuntimeError("'contract' argument must be a dict")
-        return inline
-    raise RuntimeError("Pass either 'contract_path' or 'contract'")
-
-
-def _dispatch_score_contract_quality(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """MCP shim around :class:`JudgeAgent`. Read-only — no contract writes."""
-    from fluid_build.copilot.agents.judge_agent import JudgeAgent
-
-    contract = _resolve_contract_argument(arguments)
-    build_artifacts: Optional[Dict[str, Any]] = None
-    if bool(arguments.get("include_artifacts")):
-        from fluid_build.copilot.enrichment import enrich_contract as _enrich
-
-        try:
-            build_artifacts = _enrich(contract)
-        except Exception:  # noqa: BLE001 — judging without artifacts is still valid
-            build_artifacts = None
-    result = JudgeAgent().judge(contract, build_artifacts=build_artifacts)
-    return {
-        "total": result.total,
-        "axes": {axis: score.score for axis, score in result.axes.items()},
-        "axis_reasoning": {axis: score.reasoning for axis, score in result.axes.items()},
-        "axis_suggestions": {axis: list(score.suggestions) for axis, score in result.axes.items()},
-        "model": result.model,
-        "critique_applied": bool(getattr(result, "critique_applied", False)),
-        "max_total": len(result.axes) * 5,
-    }
-
-
-def _dispatch_enrich_contract_suggestions(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """MCP shim around :func:`enrich_contract`. Read-only — returns
-    suggestions; does not apply them to the contract on disk."""
-    from fluid_build.copilot.enrichment import enrich_contract as _enrich
-
-    contract = _resolve_contract_argument(arguments)
-    artifacts = _enrich(contract)
-    if artifacts is None:
-        return {"enabled": False, "artifacts": None}
-    return {"enabled": True, "artifacts": artifacts}
-
-
 # ---------------------------------------------------------------------------
 # V1.5 source-catalog dispatch helpers.
 # ---------------------------------------------------------------------------
 
 
 def _list_source_adapters() -> List[Dict[str, Any]]:
-    """Enumerate the source-catalog + JDBC adapters this build of
-    forge-cli can dispatch to.
+    """Enumerate the source-catalog adapters the catalog tools can reach.
 
-    The list is static — it reflects what code is shipped, not what
-    the operator has configured. To list configured *credentials*
-    (which catalogs the operator has actually set up), use the
-    ``fluid ai status`` CLI surface (Sprint C). The MCP tool is
-    deliberately inventory-only: it tells the LLM which catalog
-    types are reachable, not which specific credentials are saved.
-
-    Catalog adapters (kind=catalog) are implemented in
-    ``fluid_build.copilot.catalog.<name>`` and follow the 9 patterns
-    in ``catalog._patterns``. JDBC adapters (kind=jdbc) route through
-    :mod:`fluid_build.cli._forge_data_model_jdbc` — duckdb-extension
-    introspection over a ``--uri`` payload.
-
-    Future adapters (Apache Atlas, Alation, Microsoft Purview, …) get
-    added here when they land — and inherit the same patterns
-    automatically.
+    The list is static: it reflects what code is shipped, not what the operator has
+    configured (``fluid ai status`` lists configured credentials). Each adapter lives in
+    ``fluid_build.copilot.catalog.<name>`` and follows the patterns in
+    ``catalog._patterns``. JDBC databases are not listed: no MCP tool reads them since
+    ``forge_from_source`` was dropped (2026-11-13); ``fluid forge data-model from-source
+    --uri`` still does.
     """
-    catalog_entries = [
+    return [
         {"name": name, "status": "available", "kind": "catalog"} for name in _CATALOG_SOURCE_LIST
     ]
-    jdbc_entries = [
-        {"name": name, "status": "available", "kind": "jdbc"} for name in _JDBC_SOURCE_LIST
-    ]
-    return catalog_entries + jdbc_entries
 
 
 # Single source of truth for catalog dispatch. Every adapter
@@ -570,11 +369,8 @@ def _list_source_adapters() -> List[Dict[str, Any]]:
 # class reference here. New adapters land by adding one entry.
 #
 # JDBC sources (postgres / postgresql / mysql / sqlite) are NOT in this
-# table — they route through ``_dispatch_forge_from_jdbc_source`` which
-# uses duckdb-extension introspection rather than a credential-resolver
-# adapter. ``_build_source_adapter`` only handles catalog sources;
-# ``forge_from_source`` short-circuits to the JDBC path before calling
-# it. The catalog-only tools (list_source_tables, inspect_source_table,
+# table. ``_build_source_adapter`` only handles catalog sources; the
+# catalog-only tools (list_source_tables, inspect_source_table,
 # list_source_lineage, list_source_glossary) reject JDBC sources via
 # the ``Literal[...]`` enum on their Annotated signatures.
 _SOURCE_ADAPTERS: Dict[str, str] = {
@@ -588,83 +384,6 @@ _SOURCE_ADAPTERS: Dict[str, str] = {
         "fluid_build.copilot.catalog.datamesh_manager:DataMeshManagerCatalogAdapter"
     ),
 }
-
-
-def _dispatch_forge_from_jdbc_source(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """MCP shim around :func:`_run_from_jdbc_source` (the CLI's JDBC path).
-
-    JDBC sources (postgres / postgresql / mysql / sqlite) carry credentials
-    inline in a ``--uri`` payload, so they bypass the credential resolver
-    entirely. This shim builds a minimal argparse-Namespace shaped like the
-    ``fluid forge data-model from-source`` parser produces, dispatches to
-    the shared duckdb-attach helper, and re-reads the produced contract so
-    the MCP caller gets the same dict shape catalog sources return.
-
-    Audit event: ``mcp_forge_from_jdbc_source`` is written (no credentials —
-    URI password is masked; only the source kind + output path land in the
-    forensic trail).
-    """
-    from fluid_build.cli._forge_data_model_jdbc import _run_from_jdbc_source
-
-    source = str(arguments.get("source") or "").lower().strip()
-    uri = arguments.get("uri")
-    output_path = arguments.get("output_path")
-    if not uri:
-        raise RuntimeError(
-            f"forge_from_source --source {source!r} requires 'uri'. "
-            "Example: postgresql://user:pass@host:5432/db"  # pragma: allowlist secret
-        )
-    if not output_path:
-        raise RuntimeError("forge_from_source requires 'output_path'")
-
-    # The JDBC helper consumes ``args.source``, ``args.uri``, ``args.output``,
-    # ``args.name``, ``args.schema_name``, ``args.tables``. Build an
-    # argparse Namespace with exactly those attributes — leaving the rest
-    # absent is fine since the helper uses ``getattr(args, ..., None)``.
-    scope = arguments.get("scope") or {}
-    if not isinstance(scope, dict):
-        scope = {}
-    namespace = _argparse.Namespace(
-        source=source,
-        uri=str(uri),
-        output=str(output_path),
-        name=arguments.get("name"),
-        schema_name=scope.get("schema") or scope.get("schema_name"),
-        tables=scope.get("tables") or None,
-    )
-    jdbc_logger = logging.getLogger("fluid.mcp.forge_from_jdbc_source")
-    # No operator_supplied here, ever: the URI is the client's, so a password
-    # connection stays pinned to its own material and never presents this
-    # host's client certificate or libpq settings.
-    rc = _run_from_jdbc_source(namespace, jdbc_logger)
-    if rc != 0:
-        raise RuntimeError(
-            f"forge_from_source: JDBC introspection failed for source={source!r} "
-            f"(exit_code={rc}). See server logs."
-        )
-
-    # Re-read the emitted contract so the MCP caller gets a structured
-    # response (mirroring the catalog branch's shape).
-    contract_path = Path(str(output_path))
-    contract_text = contract_path.read_text(encoding="utf-8")
-    contract_data = yaml.safe_load(contract_text) or {}
-
-    _write_audit_event(
-        "mcp_forge_from_jdbc_source",
-        payload={
-            "source": source,
-            "output_path": str(contract_path),
-            # Deliberately NOT logging the URI — passwords can be embedded.
-        },
-    )
-
-    return {
-        "kind": "jdbc",
-        "source": source,
-        "contract_path": str(contract_path),
-        "contract_exists": contract_path.is_file(),
-        "table_count": len(contract_data.get("exposes") or []),
-    }
 
 
 def _import_adapter_class(dotted_path: str) -> Any:
@@ -722,317 +441,6 @@ def _metadata_service_opt_in(arguments: Dict[str, Any], *, allow_metadata_servic
 def _operator_allows_metadata_service(allow_metadata_service: bool) -> bool:
     """The operator's opt-in: ``--allow-metadata-service`` or the env var."""
     return allow_metadata_service or os.environ.get("FLUID_ALLOW_METADATA_SERVICE") == "1"
-
-
-_JDBC_URI_SCHEMES = {
-    "postgres": ("postgres", "postgresql"),
-    "mysql": ("mysql",),
-    "sqlite": ("sqlite",),
-}
-
-# An absolute path on Windows, which libpq also reads as a socket directory.
-_WINDOWS_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")
-
-
-def _scan_to(text: str, pos: int, stops: str) -> int:
-    """The index of the first character at or after ``pos`` that is in ``stops``."""
-    while pos < len(text) and text[pos] not in stops:
-        pos += 1
-    return pos
-
-
-def _libpq_uri_parts(uri: str) -> Tuple[str, str, List[str]]:
-    """``(user, password, hosts)`` of a postgres URI, read the way libpq reads it.
-
-    Adapted from ``conninfo_uri_parse_options`` in PostgreSQL's
-    ``src/interfaces/libpq/fe-connect.c`` (PostgreSQL License): the
-    ``user:password`` part ends at the first ``@`` before any ``/``, and is
-    percent-decoded. ``hosts`` is :func:`_libpq_hosts` of the rest.
-    """
-    rest = uri.partition("://")[2]
-    user = password = ""
-    if "@" in rest[: _scan_to(rest, 0, "/")]:
-        userinfo, _, rest = rest.partition("@")
-        user, _, password = userinfo.partition(":")
-    return unquote(user), unquote(password), _libpq_hosts(rest)
-
-
-def _libpq_hosts(rest: str) -> List[str]:
-    """Every host libpq would take from ``rest``, the part of a URI after its user information.
-
-    Adapted from ``conninfo_uri_parse_options`` / ``conninfo_uri_parse_params``
-    in PostgreSQL's ``src/interfaces/libpq/fe-connect.c`` (PostgreSQL License):
-    the host list is a run of comma-separated ``host[:port]`` items that ends at
-    ``/`` or ``?``, where an item that opens with ``[`` is an IPv6 address up to
-    ``]``; query parameters are ``key=value`` pairs split on ``&``; and every
-    part is percent-decoded (``+`` is not a space). libpq decodes the host part
-    as one string and only then splits it on ``,``, so an encoded comma
-    (``%2C``) separates hosts like a bare one: ``db%2C`` is ``db`` and then the
-    default socket. The result is every item of the decoded host list plus every
-    comma-separated item of a ``host=`` or ``hostaddr=`` parameter. A spelling
-    libpq would refuse is read leniently: this only classifies, it never
-    connects.
-    """
-    hosts: List[str] = []
-    pos = 0
-    while True:
-        if rest.startswith("[", pos):
-            end = _scan_to(rest, pos, "]")
-            host = rest[pos + 1 : end]
-            pos = end + 1
-        else:
-            end = _scan_to(rest, pos, ":/?,")
-            host = rest[pos:end]
-            pos = end
-        if rest.startswith(":", pos):
-            pos = _scan_to(rest, pos + 1, "/?,")
-        hosts.extend(unquote(host).split(","))
-        if not rest.startswith(",", pos):
-            break
-        pos += 1
-    for pair in rest[pos:].partition("?")[2].split("&"):
-        key, _, value = pair.partition("=")
-        if unquote(key) in ("host", "hostaddr"):
-            hosts.extend(unquote(value).split(","))
-    return hosts
-
-
-# Removed from a URL before it is split (CPython's
-# ``urllib.parse._UNSAFE_URL_BYTES_TO_REMOVE``, bpo-43882).
-_URLLIB_REMOVES = str.maketrans("", "", "\t\r\n")
-
-
-def _urllib_host_part(uri: str) -> str:
-    """``uri`` from its host part on, where urllib, and so the attach, finds it.
-
-    Mirrors ``urllib.parse.urlsplit`` and ``_NetlocResultMixinStr._hostinfo``
-    (CPython ``Lib/urllib/parse.py``): the netloc runs from ``//`` to the first
-    ``/``, ``?`` or ``#``, and the user information inside it to its *last*
-    ``@``. libpq ends the user information at the first ``@`` instead, so an
-    ``@`` typed in a password moves libpq's host but not urllib's.
-    """
-    rest = uri.translate(_URLLIB_REMOVES).partition("://")[2]
-    return rest[rest.rfind("@", 0, _scan_to(rest, 0, "/?#")) + 1 :]
-
-
-def _more_than_one_at_before_the_host(uri: str) -> bool:
-    """Whether readers can disagree on where ``uri``'s password ends."""
-    rest = uri.partition("://")[2]
-    return rest.count("@", 0, _scan_to(rest, 0, "/")) > 1
-
-
-def _libpq_local_socket(host: str) -> bool:
-    """Whether libpq reaches ``host`` through one of this host's unix sockets.
-
-    libpq's ``host`` rules: an empty host is the default socket directory, a
-    host that looks like an absolute path is a socket directory (on Windows a
-    drive-letter path too), and one that starts with ``@`` is an
-    abstract-namespace socket. A blank host counts as empty here, which is
-    stricter than libpq (it looks ``" "`` up as a host name).
-    """
-    host = host.strip()
-    return not host or host.startswith(("/", "\\", "@")) or bool(_WINDOWS_DRIVE_PATH.match(host))
-
-
-def _gate_jdbc_source(
-    source: str,
-    uri: Optional[str],
-    *,
-    allow_inline_credentials: bool,
-    allow_metadata_service: bool,
-) -> None:
-    """Classify a ``forge_from_source`` JDBC request like a catalog credential block.
-
-    A JDBC URI (``postgres`` / ``postgresql`` / ``mysql`` / ``sqlite``) reaches
-    a database over the LLM-facing wire, so it is gated exactly as an inline
-    catalog credential is:
-
-    * a **password in the URI** is the caller's own inline material — it needs
-      ``--allow-inline-credentials`` (the same gate inline blocks need), and the
-      connection is then pinned to that password (``_jdbc_introspect``);
-    * **no password** means the connection would fall back to THIS host's own
-      database credentials (``PGPASSWORD`` / ``~/.pgpass`` / a libpq service /
-      ``MYSQL_PWD``) and send them to the host the client chose — the
-      host-identity case, so it needs ``--allow-metadata-service``;
-    * a **sqlite** URI names a file on THIS host's disk, which an MCP client
-      must not be able to choose, so it needs ``--allow-metadata-service`` too;
-    * a URI with **no user name** authenticates as this host's login name
-      (``PGUSER`` / the OS user), a mysql URI naming **localhost** goes
-      through this host's unix socket, where socket authentication identifies
-      the server's OS user, and so does a **postgres host that is empty, blank
-      or a socket path** — an empty URI host, an empty element of a host list
-      (``db,`` / ``,db``, also with the comma percent-encoded: ``db%2C``), a
-      percent-encoded path (``%2Fvar%2Frun%2Fpostgresql``),
-      an ``@`` abstract socket, or such a value in a ``host=`` / ``hostaddr=``
-      query parameter: all are this host's identity, so they need
-      ``--allow-metadata-service`` as well as the inline opt-in for a password.
-
-    A postgres host is the one the attach connects to. The attach reads the URI
-    with urllib, whose user information runs to the last ``@`` before the
-    host, and builds key=value pairs from its fields, so the raw URI never
-    reaches libpq: ``user:Summer2024@@db`` connects over TCP to ``db``. The host
-    list urllib gives it is checked, and so is that same host part with its
-    query, read with libpq's stricter rules (percent-decoding, ``host=``; see
-    :func:`_libpq_hosts`). A URI urllib cannot read never connects; it is
-    classified on libpq's own reading of the whole URI
-    (:func:`_libpq_uri_parts`), and a refusal there says so when more than one
-    ``@`` makes the end of the password ambiguous. A mysql URI urllib cannot
-    give a host and port has no such second reading; it is refused whatever
-    the flags, since none would make it connect.
-
-    The URI must be a string whose scheme matches the source
-    (``postgres://`` / ``postgresql://``, ``mysql://``, ``sqlite://``).
-
-    Refused otherwise with a typed :class:`McpToolRefusal` naming the exact
-    flag, so the refusal reaches the client intact. ``allow_metadata_service``
-    here is the operator's opt-in; the client's argument of that name is not
-    read on the JDBC path. Nor is ``credentials.credential_id``, a catalog-source
-    field: the JDBC path connects with ``uri`` alone, so no refusal here offers
-    a saved source. The operator's own CLI (``fluid forge data-model
-    from-source`` / ``fluid init --discover``) never passes through this gate.
-    """
-    from fluid_build.cli.discover._jdbc_introspect import (
-        _MISSING_HOSTNAME,
-        _normalize_kind,
-        _parse_uri,
-        _uri_problem,
-    )
-
-    if not uri:
-        # The dispatcher raises its own actionable "requires 'uri'" error.
-        return
-    if not isinstance(uri, str):
-        raise McpToolRefusal("forge_from_source refused a JDBC source: 'uri' must be a string.")
-    kind = _normalize_kind(source)  # raises ValueError on an unsupported kind
-    schemes = _JDBC_URI_SCHEMES[kind]
-    scheme, sep, _rest = uri.partition("://")
-    if not sep or scheme.lower() not in schemes:
-        raise McpToolRefusal(
-            f"forge_from_source refused a {source} source: the URI scheme must be "
-            f"{' or '.join(s + '://' for s in schemes)}."
-        )
-
-    if kind == "sqlite":
-        if not _operator_allows_metadata_service(allow_metadata_service):
-            raise McpToolRefusal(
-                "forge_from_source refused a sqlite source over MCP: the URI names a "
-                "file on this server's disk, and an MCP client must not choose a "
-                "server-side path. Run it from the CLI (`fluid forge data-model "
-                "from-source`), or restart the server with --allow-metadata-service (or "
-                "FLUID_ALLOW_METADATA_SERVICE=1 in the server's environment) to allow a "
-                "client-named server path."
-            )
-        return
-
-    local_socket = False
-    ambiguous_at = False
-    if kind == "postgres":
-        parsed: Optional[Dict[str, Any]]
-        try:
-            parsed = _parse_uri(uri, kind)
-        except ValueError:
-            parsed = None
-        if parsed is None:
-            # The attach reads the URI with this same parser, so it would stop
-            # before connecting. The client still learns which flag libpq's
-            # own reading of the URI needs, instead of an unclassified error.
-            libpq_user, libpq_password, hosts = _libpq_uri_parts(uri)
-            parsed = {"user": libpq_user, "password": libpq_password}
-            ambiguous_at = _more_than_one_at_before_the_host(uri)
-        else:
-            # The attach never hands the URI to libpq: it builds key=value
-            # pairs from urllib's fields. So the hosts are the list it connects
-            # to, plus that same host part (and its query) read with libpq's
-            # rules, which is stricter: it percent-decodes and reads host=.
-            hosts = str(parsed.get("host") or "").split(",")
-            hosts += _libpq_hosts(_urllib_host_part(uri))
-        local_socket = any(_libpq_local_socket(host) for host in hosts)
-    else:
-        problem = _uri_problem(uri)
-        if problem is not None:
-            # No second reading would name a host here, and the attach would
-            # refuse the URI before connecting, so no flag can make it usable,
-            # and the refusal does not ask for one. _uri_problem never quotes the
-            # URI, and returns rather than raises, so this refusal carries
-            # neither the password nor urllib's error.
-            hint = ""
-            if problem == _MISSING_HOSTNAME:
-                # A mysql client reads an empty host as localhost: the same
-                # host-identity class as a URI naming it.
-                hint = (
-                    " A mysql client reads an empty host as localhost, this server's "
-                    "unix socket, which needs --allow-metadata-service; name the "
-                    "database server's host (127.0.0.1 for TCP on this machine)."
-                )
-            raise McpToolRefusal(
-                f"forge_from_source refused a mysql source over MCP: the URI has no "
-                f"usable host and port: {problem}. No flag would make it connect, and "
-                f"nothing was contacted.{hint}"
-            )
-        parsed = _parse_uri(uri, kind)
-    has_password = bool(parsed.get("password"))
-    host_identity = None
-    if not parsed.get("user"):
-        host_identity = (
-            "the URI has no user name, so the connection would log in as this host's "
-            "own login name (PGUSER or the OS user)"
-        )
-    elif kind == "mysql" and str(parsed.get("host") or "").rstrip(".").lower() == "localhost":
-        host_identity = (
-            "a mysql 'localhost' is reached through this host's unix socket, where "
-            "socket authentication identifies the server's OS user (use 127.0.0.1 "
-            "for TCP)"
-        )
-    elif local_socket and ambiguous_at:
-        host_identity = (
-            "the URI has more than one '@' before its host, so where the password ends "
-            "is ambiguous. libpq ends it at the first '@' and then reads a host that is "
-            "empty, blank or a socket path: this host's unix socket, where peer or trust "
-            "authentication identifies the server's OS user. urllib, which this server's "
-            "attach uses, cannot read the URI, so the attach would refuse it before "
-            "connecting"
-        )
-    elif local_socket:
-        host_identity = (
-            "a postgres host that is empty, blank or a socket path (in the host list, "
-            "or in a host or hostaddr parameter) is this host's unix socket, where peer "
-            "or trust authentication identifies the server's OS user whatever password "
-            "the URI carries"
-        )
-    if host_identity is not None:
-        if not _operator_allows_metadata_service(allow_metadata_service):
-            raise McpToolRefusal(
-                f"forge_from_source refused a JDBC source over MCP: {host_identity}. "
-                "Run it from the CLI (`fluid forge data-model from-source`), or restart "
-                "the server with --allow-metadata-service (or "
-                "FLUID_ALLOW_METADATA_SERVICE=1 in the server's environment)."
-            )
-        if not has_password:
-            return
-    if has_password:
-        if not allow_inline_credentials:
-            raise McpToolRefusal(
-                "forge_from_source refused an inline JDBC credential over MCP: the URI "
-                "carries a password, a secret that would travel over the LLM-facing "
-                "wire. Run it from the CLI (`fluid forge data-model from-source`), or "
-                "restart the server with --allow-inline-credentials if the caller is a "
-                "trusted in-process CLI harness."
-            )
-        return
-
-    # No password: the connection would authenticate with this host's own
-    # credential material and reach the host the client named.
-    if not _operator_allows_metadata_service(allow_metadata_service):
-        raise McpToolRefusal(
-            "forge_from_source refused a JDBC source with no password over MCP: with no "
-            "password in the URI, the connection falls back to this host's own database "
-            "credentials (PGPASSWORD, ~/.pgpass, a libpq service or MYSQL_PWD) and would "
-            "send them to the host the client named. Put the caller's own password in "
-            "the URI (with --allow-inline-credentials), run it from the CLI (`fluid "
-            "forge data-model from-source`), or restart the server with "
-            "--allow-metadata-service (or FLUID_ALLOW_METADATA_SERVICE=1 in the server's "
-            "environment)."
-        )
 
 
 def _gate_inline_host_identity(resolver: Any) -> None:
@@ -1198,114 +606,3 @@ def _scope_from_args(arguments: Dict[str, Any]) -> Any:
         if k in arguments
     }
     return CatalogScope.model_validate(flat)
-
-
-def _log_forge_errors(events: List[Dict[str, Any]], logger: logging.Logger) -> None:
-    """Write each ``forge.error`` event of an in-process run to the server's log.
-
-    ``_run_forge_inproc`` discards forge's console output, and forge marks its own
-    record of a typed failure as shown on that console, so the server's console
-    handler drops it. Without this line a failed ``forge_run`` leaves the server
-    log empty, though the tool errors' "see server logs" points there.
-    """
-    for event in events:
-        if event["event"] == "forge.error":
-            # ``%r``: a newline in the message stays one log line, not a forged second.
-            logger.warning("forge_run failed: %s: %r", event.get("code"), event.get("message"))
-
-
-def _run_forge_inproc(
-    mode: str,
-    target_dir: str,
-    data_product_type: Optional[str],
-    from_products: Optional[List[str]],
-) -> Dict[str, Any]:
-    """Run ``fluid forge`` in-process (sync). Called from ``forge_run`` via
-    ``asyncio.to_thread``. ``MCPSamplingProvider`` (if used) routes back to
-    the IDE's LLM via the sampling-context bridge.
-
-    Critical: ``fluid forge --agent`` writes JSON-Lines progress events to
-    stdout, and stdout IS the MCP wire — the MCP client's JSON-RPC parser
-    rejects anything that isn't a well-formed ``JSONRPCMessage``. We capture
-    forge's stdout for the duration of the run and surface the parsed events
-    in the tool result (so Claude Code / Cursor / Kiro see structured forge
-    progress alongside the standard ``exit_code`` + ``contract_path`` fields)
-    without polluting the MCP wire.
-    """
-    import contextlib
-    import io
-
-    import fluid_build.cli.mcp as _mcp_pkg
-    from fluid_build.cli import forge as forge_mod
-
-    # Defense-in-depth: re-validate ``target_dir`` against the active
-    # ``--writable-paths`` policy. The async tool wrapper at ``forge_run``
-    # already gates via ``check_tool_permission`` with the full argument
-    # dict, but a future regression in that wrapper (e.g. forgetting to
-    # plumb a new argument) must NOT silently let an attacker-controlled
-    # path through to ``mkdir(parents=True)`` + ``write_text``. This
-    # second check is the belt-and-braces fail-closed gate.
-    #
-    # Resolve ``_policy`` through the PACKAGE module object (``_mcp_pkg``,
-    # imported above), NOT a function-local ``from ...policy import _policy``.
-    # The sandbox tests patch the package-level symbol
-    # (``monkeypatch.setattr(mcp_mod, "_policy", ...)``); a local re-import
-    # would re-bind to the original and bypass the patch, silently defeating
-    # the writable-paths confinement check this gate exists to enforce. Pinned
-    # by tests/cli/test_mcp_forge_run_permission.py.
-    policy = _mcp_pkg._policy()
-    resolved = Path(str(target_dir)).expanduser().resolve()
-    if not _path_is_writable(resolved, policy.writable_paths):
-        roots_str = ", ".join(str(p) for p in policy.writable_paths)
-        raise PermissionError(
-            f"forge_run: target_dir {resolved} is not within any "
-            f"--writable-paths root ({roots_str})"
-        )
-
-    parser = _argparse.ArgumentParser()
-    sp = parser.add_subparsers()
-    forge_mod.register(sp)
-
-    argv = ["forge", "--agent", "-d", str(target_dir)]
-    if data_product_type:
-        argv += ["--data-product-type", str(data_product_type)]
-    if mode == "blank":
-        argv += ["--blank"]
-    elif mode == "ai":
-        for fp in from_products or []:
-            argv += ["--from-product", str(fp)]
-        argv += ["--llm-provider", "mcp-sampling"]
-
-    args = parser.parse_args(argv)
-    forge_logger = logging.getLogger("fluid.mcp.forge_run")
-    captured = io.StringIO()
-    with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
-        rc = forge_mod.run(args, forge_logger)
-    raw_stdout = captured.getvalue()
-
-    # Forge's --agent mode emits one JSON object per line. Parse them out;
-    # everything else (Rich console banners, etc.) is best-effort discarded
-    # since stdout was redirected to suppress it from the wire.
-    events: List[Dict[str, Any]] = []
-    for line in raw_stdout.splitlines():
-        line = line.strip()
-        if not (line.startswith("{") and line.endswith("}")):
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict) and isinstance(obj.get("event"), str):
-            events.append(obj)
-
-    _log_forge_errors(events, forge_logger)
-
-    contract_path = Path(target_dir) / "contract.fluid.yaml"
-    return {
-        "mode": mode,
-        "exit_code": rc,
-        "target_dir": str(target_dir),
-        "contract_path": str(contract_path),
-        "contract_exists": contract_path.is_file(),
-        "events": events,
-    }

@@ -115,93 +115,6 @@ def test_stats_picks_up_product_type_from_contract(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
-# fluid stats --judge — aggregates judge.json receipts across runs.
-# ---------------------------------------------------------------------------
-
-
-def _seed_judge_run(
-    workspace: Path,
-    *,
-    run_id: str | None = None,
-    total: int = 24,
-    axes: dict | None = None,
-    model: str = "claude-opus-4-7",
-) -> Path:
-    """Drop a synthetic judge.json into .fluid/agents/<run-id>/."""
-    rid = run_id or new_run_id()
-    run_dir = workspace / ".fluid" / "agents" / rid
-    run_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "total": total,
-        "model": model,
-        "run_id": rid,
-        "axes": axes
-        or {
-            "correctness": {"score": 4, "reasoning": "ok", "suggestions": []},
-            "completeness": {"score": 4, "reasoning": "ok", "suggestions": []},
-            "security": {"score": 3, "reasoning": "ok", "suggestions": []},
-            "governance": {"score": 4, "reasoning": "ok", "suggestions": []},
-            "performance": {"score": 4, "reasoning": "ok", "suggestions": []},
-            "documentation": {"score": 5, "reasoning": "ok", "suggestions": []},
-        },
-    }
-    (run_dir / "judge.json").write_text(json.dumps(payload), encoding="utf-8")
-    return run_dir
-
-
-def test_stats_judge_aggregates(tmp_path, capsys):
-    _seed_judge_run(tmp_path, total=24)
-    _seed_judge_run(
-        tmp_path,
-        total=18,
-        axes={
-            "correctness": 3,
-            "completeness": 3,
-            "security": 2,
-            "governance": 4,
-            "performance": 3,
-            "documentation": 3,
-        },
-    )
-
-    args = Namespace(root=str(tmp_path), since="365d", by=None, emit_json=True, judge=True)
-    rc = stats_run(args, logging.getLogger("test"))
-    assert rc == 0
-    parsed = json.loads(capsys.readouterr().out)
-    assert parsed["runs_count"] == 2
-    assert parsed["average_total"] == pytest.approx(21.0)
-    # Flat axes from int payload + nested axes from dict payload both
-    # roll up under the same axis name.
-    assert "correctness" in parsed["axes"]
-    assert parsed["axes"]["correctness"] == pytest.approx(3.5)
-
-
-def test_stats_judge_empty_workspace(tmp_path, capsys):
-    args = Namespace(root=str(tmp_path), since="365d", by=None, emit_json=True, judge=True)
-    rc = stats_run(args, logging.getLogger("test"))
-    assert rc == 0
-    parsed = json.loads(capsys.readouterr().out)
-    assert parsed["runs_count"] == 0
-    assert parsed["average_total"] == 0
-    assert parsed["axes"] == {}
-
-
-def test_stats_judge_unreadable_file_is_skipped(tmp_path, capsys):
-    good = _seed_judge_run(tmp_path, total=20)
-    # Drop a corrupted judge.json under a second run dir.
-    bad_dir = tmp_path / ".fluid" / "agents" / "20260101-000000-deadbe"
-    bad_dir.mkdir(parents=True)
-    (bad_dir / "judge.json").write_text("{not-valid-json")
-
-    args = Namespace(root=str(tmp_path), since="365d", by=None, emit_json=True, judge=True)
-    stats_run(args, logging.getLogger("test"))
-    parsed = json.loads(capsys.readouterr().out)
-    assert parsed["runs_count"] == 1  # only the good one
-    assert parsed["average_total"] == pytest.approx(20.0)
-    assert good.exists()  # sanity
-
-
-# ---------------------------------------------------------------------------
 # H22 — Deterministic runs (no LLM call) are visible to fluid stats
 # ---------------------------------------------------------------------------
 #
@@ -268,51 +181,8 @@ def test_stats_groups_by_mode_separates_deterministic(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
-# H20 — ``--judge --by X`` is rejected with a clear error instead of
-# silently dropping ``--by``. UX-finding 08 caught this: ``--judge``
-# short-circuited at line 91 *before* consuming ``--by``, so the user
-# got the ungrouped table either way.
-# ---------------------------------------------------------------------------
-
-
-def test_stats_judge_by_provider_is_rejected(tmp_path, capsys):
-    """``--judge --by provider`` returns non-zero with a helpful error."""
-    _seed_judge_run(tmp_path)
-
-    args = Namespace(root=str(tmp_path), since="365d", by="provider", emit_json=True, judge=True)
-    rc = stats_run(args, logging.getLogger("test"))
-    assert rc == 2  # non-zero exit
-    captured = capsys.readouterr()
-    # The rejection message points the user at the --json escape hatch.
-    assert "--judge --by provider" in captured.err
-    assert "not yet supported" in captured.err
-    assert "--json" in captured.err
-
-
-def test_stats_judge_by_type_is_rejected(tmp_path, capsys):
-    """Same rejection for the ``type`` dim."""
-    _seed_judge_run(tmp_path)
-
-    args = Namespace(root=str(tmp_path), since="365d", by="type", emit_json=True, judge=True)
-    rc = stats_run(args, logging.getLogger("test"))
-    assert rc == 2
-    assert "--judge --by type" in capsys.readouterr().err
-
-
-def test_stats_judge_without_by_still_works(tmp_path, capsys):
-    """The plain ``--judge`` path stays green — H20 only rejects the combo."""
-    _seed_judge_run(tmp_path, total=24)
-
-    args = Namespace(root=str(tmp_path), since="365d", by=None, emit_json=True, judge=True)
-    rc = stats_run(args, logging.getLogger("test"))
-    assert rc == 0
-    parsed = json.loads(capsys.readouterr().out)
-    assert parsed["runs_count"] == 1
-
-
-# ---------------------------------------------------------------------------
 # H21 — ``--since garbage`` raises a clean error instead of silently
-# no-filtering (mirrors the ``--older-than`` behaviour in memory_cmd).
+# no-filtering.
 # ---------------------------------------------------------------------------
 
 

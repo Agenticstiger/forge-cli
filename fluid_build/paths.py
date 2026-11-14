@@ -71,16 +71,6 @@ def rollback_state_file(*, root: Optional[Path] = None) -> Path:
     return workspace_dotfluid(root=root) / "rollback-state.json"
 
 
-def agents_dir(*, root: Optional[Path] = None) -> Path:
-    """``<root>/.fluid/agents`` — per-run AI transcripts + receipts."""
-    return workspace_dotfluid(root=root) / "agents"
-
-
-def agent_run_dir(run_id: str, *, root: Optional[Path] = None) -> Path:
-    """``<root>/.fluid/agents/<run-id>``."""
-    return agents_dir(root=root) / run_id
-
-
 def runs_dir(*, root: Optional[Path] = None) -> Path:
     """``<root>/.fluid/runs`` — engine run records (state-store)."""
     return workspace_dotfluid(root=root) / "runs"
@@ -159,8 +149,6 @@ __all__ = [
     "user_home",
     "workspace_dotfluid",
     "rollback_state_file",
-    "agents_dir",
-    "agent_run_dir",
     "runs_dir",
     "run_record_dir",
     "dlq_dir",

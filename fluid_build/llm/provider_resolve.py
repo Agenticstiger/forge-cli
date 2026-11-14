@@ -13,9 +13,8 @@ Lifted from ``cli/forge_copilot_llm_providers.py`` (host file was
   whatever signal we can find.
 * :func:`_resolve_api_key` — env var first, keyring fallback;
   ``FLUID_LLM_API_KEY`` only for a provider the operator named.
-* :func:`save_api_key_to_keyring` / :func:`clear_api_key_from_keyring`
-  / :func:`_get_api_key_from_keyring` / :func:`_keyring_key` —
-  keyring round-trips for cloud-provider secrets.
+* :func:`_get_api_key_from_keyring` / :func:`_keyring_key`: keyring reads
+  for cloud-provider secrets.
 
 The host module re-imports each at module top so existing call sites
 keep resolving.
@@ -513,30 +512,6 @@ def _get_api_key_from_keyring(provider: str) -> Optional[str]:
     except Exception:  # noqa: BLE001
         _log_keyring_failure("read")
         return None
-
-
-def save_api_key_to_keyring(provider: str, api_key: str) -> bool:
-    """Persist an LLM API key in the OS keyring for future runs."""
-    try:
-        from fluid_build.credentials.keyring_store import KeyringCredentialStore
-
-        KeyringCredentialStore.set_credential(_keyring_key(provider), api_key)
-        return True
-    except Exception:  # noqa: BLE001
-        _log_keyring_failure("write")
-        return False
-
-
-def clear_api_key_from_keyring(provider: str) -> bool:
-    """Remove a saved LLM API key from the OS keyring."""
-    try:
-        from fluid_build.credentials.keyring_store import KeyringCredentialStore
-
-        KeyringCredentialStore.delete_credential(_keyring_key(provider))
-        return True
-    except Exception:  # noqa: BLE001
-        _log_keyring_failure("delete")
-        return False
 
 
 # Bound after this module's own definitions: ``fluid_build.llm.providers``

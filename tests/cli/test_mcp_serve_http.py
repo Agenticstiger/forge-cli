@@ -344,8 +344,8 @@ def test_a_cancelled_call_that_has_not_started_never_runs(monkeypatch: pytest.Mo
 def test_calls_waiting_their_turn_hold_no_shared_worker_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Queued calls wait in the tool executor, so asyncio.to_thread (forge_run,
-    the SDK) still gets a thread while one slow call holds the tool worker."""
+    """Queued calls wait in the tool executor, so asyncio.to_thread (the SDK)
+    still gets a thread while one slow call holds the tool worker."""
     from fluid_build.cli.mcp import server as server_mod
 
     started, release, _ = _blocking_tool(monkeypatch)

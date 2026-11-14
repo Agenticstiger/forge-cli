@@ -39,24 +39,6 @@ def _logical_model() -> LogicalDraft:
     )
 
 
-def test_mcp_search_semantic_memory_uses_configured_store(tmp_path: Path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("FLUID_STORE_BACKEND", "sqlite")
-    monkeypatch.setenv("FLUID_STORE_PATH", str(tmp_path / "mcp.sqlite3"))
-
-    from fluid_build.copilot.store.factory import resolve_store
-
-    store = resolve_store(workspace_root=tmp_path)
-    store.put("memory/semantic", "orders", {"description": "orders revenue semantic model"})
-
-    result = _call_tool(
-        "search_semantic_memory",
-        {"query": "revenue", "mode": "keyword", "limit": 5},
-        read_only=True,
-    )
-    assert result["results"][0]["description"] == "orders revenue semantic model"
-
-
 def test_mcp_regenerate_physical_writes_contract(tmp_path: Path):
     logical_path = tmp_path / "orders.model.json"
     contract_path = tmp_path / "orders.fluid.yaml"

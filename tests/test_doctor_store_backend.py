@@ -28,6 +28,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from fluid_build.cli import doctor
 
 LOG = logging.getLogger(__name__)
@@ -87,41 +89,6 @@ class TestInspectStoreBackend:
         # Missing file is non-fatal — auto-create.
         assert info["ok"] == "true"
 
-    def test_postgres_backend_without_dsn_reports_not_ok(self, monkeypatch):
-        monkeypatch.setenv("FLUID_STORE_BACKEND", "postgres")
-        monkeypatch.delenv("FLUID_STORE_DSN", raising=False)
-        info = doctor._inspect_store_backend()
-        assert info["class"] == "PostgresBackend"
-        assert info["ok"] == "false"
-        assert "DSN missing" in info["status"]
-        # DSN field must be redacted-shape even when missing —
-        # never a raw connection string in the visible payload.
-        assert info["location"].startswith("(") or "***" in info["location"]
-
-    def test_postgres_backend_with_bad_dsn_does_not_raise(self, monkeypatch):
-        # Use a bogus DSN; psycopg.connect will throw — our wrapper
-        # must swallow into ``ok=false`` rather than crashing doctor.
-        monkeypatch.setenv("FLUID_STORE_BACKEND", "postgres")
-        monkeypatch.setenv(
-            "FLUID_STORE_DSN",
-            "postgresql://postgres:wrong@127.0.0.1:1/nodb",
-        )
-        info = doctor._inspect_store_backend()
-        assert info["class"] == "PostgresBackend"
-        # Either psycopg unavailable OR connect failed — both flow to ok=false.
-        assert info["ok"] == "false"
-        assert info["status"]  # non-empty
-        # Password must never leak into the visible location.
-        assert "wrong" not in info["location"]
-
-    def test_vector_backend_describes_backing_store(self, monkeypatch):
-        monkeypatch.setenv("FLUID_STORE_BACKEND", "vector")
-        monkeypatch.setenv("FLUID_STORE_VECTOR_BACKING", "sqlite")
-        info = doctor._inspect_store_backend()
-        assert info["class"] == "VectorBackend"
-        assert "backing=sqlite" in info["location"]
-        assert info["ok"] == "true"
-
     def test_null_backend_reports_no_persistence(self, monkeypatch):
         monkeypatch.setenv("FLUID_STORE_BACKEND", "null")
         info = doctor._inspect_store_backend()
@@ -135,6 +102,18 @@ class TestInspectStoreBackend:
         assert info["ok"] == "false"
         assert "unrecognised" in info["status"].lower()
         assert info["class"] == "(unknown)"
+
+    @pytest.mark.parametrize("removed", ["postgres", "vector"])
+    def test_a_removed_backend_reports_the_file_store_and_asks_to_unset(
+        self, monkeypatch, tmp_path, removed
+    ):
+        monkeypatch.setenv("FLUID_STORE_BACKEND", removed)
+        monkeypatch.setenv("FLUID_STORE_ROOT", str(tmp_path / "store"))
+        info = doctor._inspect_store_backend()
+        assert info["backend"] == "file" and info["class"] == "FileBackend"
+        assert f"FLUID_STORE_BACKEND={removed} was removed" in info["status"]
+        assert "Unset the variable" in info["status"]
+        assert info["ok"] == "false"
 
     def test_required_keys_present_on_every_branch(self, monkeypatch):
         for backend in ("file", "sqlite", "null", "vector", "made-up"):
@@ -170,11 +149,11 @@ class TestPrintStoreBackendStatus:
 
     def test_renders_warning_icon_when_ok_false(self, capsys):
         info = {
-            "env": "postgres",
-            "backend": "postgres",
-            "class": "PostgresBackend",
-            "location": "(FLUID_STORE_DSN unset)",
-            "status": "DSN missing — PostgresBackend cannot connect",
+            "env": "file",
+            "backend": "file",
+            "class": "FileBackend",
+            "location": "/read-only/store",
+            "status": "path exists but not readable+writable",
             "ok": "false",
             "schema_version": "",
         }

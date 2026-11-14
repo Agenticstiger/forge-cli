@@ -67,19 +67,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`fluid forge` AI mode runs on the shipped FLUID skills.** These are the four Agent Skills in
+  `fluid_build/agent_skills/`, the same text a coding agent reads.
+  - With a coding agent (`--llm-provider claude-code|codex|cursor|kiro`, or the one `fluid ai
+    setup` saved), an interactive run opens the agent in the workspace with the skills loaded and
+    your request as its first prompt. The agent asks its own follow-up questions.
+  - A non-interactive run drives Claude Code headless. It may read the workspace, edit the one
+    contract file, and run `fluid validate` on that file, nothing wider. Codex, Cursor and Kiro
+    take the one-call path when nobody is at the keyboard.
+  - Without a coding agent, forge makes one LLM call (the `[ai]` extra) whose system prompt is the
+    skills' text, runs `fluid validate --offline`, and feeds the errors back, for at most 3
+    attempts.
+  - Every path ends with forge's own `fluid validate --offline` and a
+    `.fluid/agents/<run-id>/cost.json` receipt that `fluid stats` reads.
+
+  Why: on #851's eval a coding agent with these skills passed 11 of 11 scenarios, and the
+  embedded copilot passed 0 of 9. On today's Sonnet the copilot's prompt is refused outright:
+  8 of 9 runs failed with a `[reasoning_extraction]` safeguard error. The copilot's old response
+  format made `owner` a required field, which is where its invented owner emails came from.
+- **`--forge-agent-mode` defaults to `agentic`.** `envelope` makes one call through the agent,
+  with no tools.
+- **AI mode does not overwrite a contract.** Without `--refine` it refuses when the target
+  directory already holds `contract.fluid.yaml`. A non-interactive run needs `--context`.
+- **`fluid mcp serve` serves 11 tools.** `list_source_adapters` lists the 7 catalogs the catalog
+  tools read. JDBC databases remain available through `fluid forge data-model from-source --uri`.
 - **An SDP that consumes a product the workspace cannot resolve is a warning.** It used to be
   reported under `--verbose` only, because an ADP or a CDP may consume a product of another
   workspace. An SDP accepts no upstream of any type, so the rule holds whatever the upstream
   is: the warning (`ERR_CONTRACT_SDP_CONSUMES_PRODUCTS`) names the `consumes[]` entry and says
   to classify the product ADP (Silver) or delete the entry. An upstream whose type is known
   still fails validation, as before.
-
 - **The Claude Code validate hook shows each finding's code, pointer and fix.** It runs
   `fluid validate --format json`: a failing contract is shown to the agent one finding per
   line, with its fix, and a passing contract with warnings now reaches the agent as
   `additionalContext` instead of nothing, without blocking the edit. The authoring skill's
   checklist asks for a contract that validates with no warnings.
-
 - **The agent-skills eval harness measures variance, a second agent and false triggers.**
   `tests/agent_evals/harness.py run --runs N` repeats every scenario and arm, and the report
   adds pass@N (at least one of N runs passes) and pass^N (all N pass) next to pass@1, the
@@ -104,6 +126,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gateway behind a reverse proxy that forwards its public name needs its own token, as the proxy
   templates in `examples/mcp-output-port-docker/proxy/` already said. On both servers, with or
   without auth, a browser `Origin` from another machine gets 403.
+
+### Removed
+
+- **The embedded copilot: 37k lines (1.5 MB, a tenth) of the base wheel's Python.** This removes the interview, the
+  prompt library, the response envelope and its repair runtime, the agent loop and its tool
+  registry, copilot memory, missions, the judge, domain agents and tiered routing. The
+  data-model engine under `fluid_build/copilot/agents/` stays: it runs `fluid forge data-model *`
+  and `fluid generate transformation`.
+  - `fluid mission` and `fluid memory`.
+  - `fluid stats --judge`.
+  - These `fluid forge` flags:
+    - `--agent-loop` (use a coding agent instead);
+    - `--prompt-profile`, `--prompt-overlay`, `--domain`;
+    - `--memory`, `--save-memory`, `--show-memory`, `--reset-memory`, `--memory-json`;
+    - `--resume`, `--no-resume`, `--from-stage`, `--fork`, `--or-fail`, `--watch`;
+    - `--tiered`, `--llm-routing-model`, `--llm-routing-endpoint`;
+    - `--seed-from`, `--seed-allow-remote`;
+    - `--discover`, `--no-discover`, `--discovery-path`, `--show-work`;
+    - `--no-generate`, `--also-emit`, `--fragments`, `--no-fragments`, `--apply-enrichment`.
+      Run `fluid generate transformation`, `fluid export` or `fluid split` after forge instead.
+  - `--no-memory` is still accepted and ignored. Installed `scaffold-ide` indexes pass it.
+  - `fluid init --agent`, which scaffolded a domain-agent spec.
+  - The opt-in `web_search` and `web_fetch` agent tools (`FLUID_AGENT_WEB_TOOLS`), which only
+    the agent loop offered.
+- **The copilot memory store's `postgres` and `vector` backends, and the `[vector]` extra.**
+  `FLUID_STORE_BACKEND=postgres` or `vector` now logs a warning and uses the default file store,
+  so `fluid forge data-model` keeps running. `fluid doctor` reports the file store and asks you
+  to unset the variable.
+- **Five MCP tools that ran forge's own LLM inside the calling agent's request:** `forge_run`,
+  `forge_from_source`, `score_contract_quality`, `enrich_contract_suggestions` and
+  `search_semantic_memory`. Also removed: `--llm-provider mcp-sampling`, which only `forge_run`
+  used.
 
 ### Fixed
 

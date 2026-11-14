@@ -145,8 +145,7 @@ class CatalogAdapter(ABC):
     need the resolver chain) and **one-off scripts** that already
     have a typed ``*Credentials`` object in hand. Production
     code paths — the CLI's ``fluid forge data-model from-source``
-    and the MCP ``forge_from_source`` tool — both use
-    :meth:`from_resolver`.
+    uses :meth:`from_resolver`.
     """
 
     name: str

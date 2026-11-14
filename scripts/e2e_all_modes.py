@@ -22,7 +22,7 @@ Phases (gates in parens):
     3. Memory concept           — no external deps; tests legacy-migration,
                                    cross-run persistence, cache-key
                                    invalidation on technique/industry
-                                   change, and fluid memory CLI output.
+                                   change.
     4. Live Gemini              — gate: GEMINI_API_KEY. Runs the 4
                                    canonical scenarios through the real
                                    ModelerAgent LLM path and checks
@@ -1208,16 +1208,6 @@ def _phase2_cli(workspace: Path) -> PhaseResult:
             )
         )
 
-    # 2f. memory status works
-    r = _run_fluid(["memory", "status"], cwd=workspace)
-    _check(
-        result,
-        r.returncode == 0,
-        "fluid memory status exits 0",
-        phase="cli",
-        detail_on_fail=f"rc={r.returncode} stderr={r.stderr[:300]}",
-    )
-
     # 2g. version (compact banner form)
     r = _run_fluid(["version"], cwd=workspace)
     _check(
@@ -1363,18 +1353,6 @@ def _phase3_memory(workspace: Path) -> PhaseResult:
         detail_on_fail=f"before={before} after={after} cleared={cleared}",
     )
     result.phase_data["clear_stats"] = {"before": before, "after": after, "cleared": cleared}
-
-    # 3e. fluid memory status via CLI prints something sensible.
-    env = {"FLUID_STORE_ROOT": str(store_root)}
-    r = _run_fluid(["memory", "status"], cwd=workspace, env=env)
-    _check(
-        result,
-        r.returncode == 0,
-        "fluid memory status works with custom FLUID_STORE_ROOT",
-        phase="memory",
-        detail_on_fail=f"rc={r.returncode} stderr={r.stderr[:300]}",
-    )
-    result.phase_data["memory_status_stdout_head"] = r.stdout[:500]
 
     result.duration_s = round(time.time() - start, 3)
     result.ok = all(f.severity != "error" for f in result.findings)

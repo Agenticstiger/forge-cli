@@ -5,8 +5,7 @@
 
 Each staged agent (``logical`` / ``builder`` / ``transformation`` / ``readme``
 / ``validator`` / ``critic`` / ``contract_forge``) has a role-identity fragment
-in ``cli/agent_specs/_defaults/agent_voice/<stage>.yaml``. Both the CLI prompt
-builder (:mod:`fluid_build.cli.forge_copilot_prompts`) and the copilot agents
+in ``cli/agent_specs/_defaults/agent_voice/<stage>.yaml``. The copilot agents
 (:class:`fluid_build.copilot.agents.base.BaseStageAgent`) prepend these to the
 system prompt.
 
@@ -14,10 +13,7 @@ This module is a **tier-0 shared leaf** — stdlib + ``pyyaml`` only, with no
 ``fluid_build.*`` upstreams. It sits below both ``cli`` and ``copilot`` so
 ``copilot.agents.base`` can read the voice fragment without importing anything
 under ``cli`` (the ``copilot -> cli`` edge the ``[tool.importlinter]`` contracts
-forbid). ``forge_copilot_prompts`` re-exports :func:`agent_voice` (and the
-``_AGENT_VOICES`` / ``_load_agent_voices`` internals) so existing call sites and
-test patches keep resolving via that namespace.
-
+forbid). 
 The voice YAML files stay in ``cli/agent_specs/_defaults/agent_voice/`` (package
 data alongside the other prompt defaults); this leaf resolves that directory by
 a package-relative path — a *data-file* reference, not a code import of ``cli``.
@@ -31,8 +27,7 @@ from typing import Mapping
 import yaml
 
 # The voice fragments are bundled package data under
-# ``cli/agent_specs/_defaults/agent_voice`` (kept next to the other prompt
-# defaults consumed by ``forge_copilot_prompts``). Locating the directory by a
+# ``cli/agent_specs/_defaults/agent_voice``. Locating the directory by a
 # package-relative path — ``fluid_build/`` is this module's parent — is a data
 # lookup, not an import edge, so the leaf carries no ``cli`` code dependency.
 _AGENT_VOICE_DIR: Path = (

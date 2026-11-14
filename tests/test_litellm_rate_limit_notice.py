@@ -10,10 +10,9 @@ frozen spinner. We add a stderr notice ``Rate limited. Waiting {N}s before
 retrying...`` before each retry wait, deriving N from the server's Retry-After
 (reusing ``error_classification.parse_retry_after``) with a sane default.
 
-Harness mirrors ``tests/test_litellm_router.py``: a fake ``litellm`` module is
-dropped into ``sys.modules`` and ``forge_llm_router.get_router`` is patched so
-the bare-completion vs Router paths are exercised without a real litellm. All
-sleeps are monkeypatched to no-ops so the suite stays fast.
+Harness: a fake ``litellm`` module is dropped into ``sys.modules`` so the
+completion path is exercised without a real litellm. All sleeps are
+monkeypatched to no-ops so the suite stays fast.
 
 Borrow receipt: litellm exposes NO native pre-retry callback hook
 (BerriAI/litellm#19806 — "Closed as not planned"), so a thin adapt-a-wrapper is
@@ -63,10 +62,7 @@ def _make_cfg(provider: str, model: str):
 
 
 def _force_direct_path(monkeypatch) -> None:
-    """Route ``_completion_via_router_or_direct`` at the bare litellm.completion."""
-    from fluid_build.cli import forge_llm_router
-
-    monkeypatch.setattr(forge_llm_router, "get_router", lambda model: None)
+    """``_completion_via_router_or_direct`` always calls the bare litellm.completion now."""
 
 
 def _capture_sleeps(monkeypatch) -> List[float]:
@@ -179,41 +175,6 @@ def test_invoke_blocking_default_wait_when_no_retry_after(monkeypatch, capsys):
 
     assert text == "ok"
     assert slept == [_DEFAULT_RATE_LIMIT_WAIT_S]
-    assert "Rate limited. Waiting 2s before retrying..." in capsys.readouterr().err
-
-
-# ---------------------------------------------------------------------------
-# invoke_blocking — Router path (retry surfaces via router.completion)
-# ---------------------------------------------------------------------------
-
-
-def test_invoke_blocking_router_path_notice_and_recovery(monkeypatch, capsys):
-    """The wrapper is the single observable envelope — it makes the Router
-    path's 429 visible too, without the bare litellm.completion ever running."""
-    fake = _fake_litellm(extra_spec=["Router"])
-    fake.completion.side_effect = AssertionError(
-        "bare litellm.completion must not run on the Router path"
-    )
-    monkeypatch.setitem(sys.modules, "litellm", fake)
-
-    router_instance = mock.MagicMock()
-    router_instance.completion.side_effect = [
-        _FakeRateLimitError("429"),
-        _success_response("router-recovered"),
-    ]
-    from fluid_build.cli import forge_llm_router
-
-    monkeypatch.setattr(forge_llm_router, "get_router", lambda model: router_instance)
-    _capture_sleeps(monkeypatch)
-
-    from fluid_build.cli.forge_copilot_llm_litellm import LiteLLMProvider
-
-    provider = LiteLLMProvider("anthropic")
-    text = provider.invoke_blocking(_make_cfg("anthropic", "claude-sonnet-4-6"), "s", "u")
-
-    assert text == "router-recovered"
-    assert router_instance.completion.call_count == 2
-    fake.completion.assert_not_called()
     assert "Rate limited. Waiting 2s before retrying..." in capsys.readouterr().err
 
 

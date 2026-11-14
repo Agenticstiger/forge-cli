@@ -3,10 +3,10 @@
 
 """StageCoordinator checkpoint integration pins.
 
-The coordinator wraps each of the 8 stages in ``skip_if_done``:
+The coordinator wraps each of the 7 stages in ``skip_if_done``:
 
     logical → contract_forge → builder ∥ readme ∥ transformation →
-    validator → enrichment → judge
+    validator → enrichment
 
 These tests use a recording mock store to assert which stages were
 ``skip_if_done``-wrapped, which were ``put``, and that the contract
@@ -216,9 +216,8 @@ def test_every_stage_wraps_in_skip_if_done(monkeypatch):
     ):
         assert stage in wrapped_stages, f"stage {stage!r} not skip_if_done-wrapped"
 
-    # Enrichment + judge run post-synthesis when physical landed.
+    # Enrichment runs post-synthesis when physical landed.
     assert "enrichment" in wrapped_stages
-    assert "judge" in wrapped_stages
 
     # Every stage was also ``put`` (since no cache pre-existed).
     put_stages = {stage for (_, stage, *_rest) in store.put_calls}
@@ -230,7 +229,6 @@ def test_every_stage_wraps_in_skip_if_done(monkeypatch):
         "transformation",
         "validator",
         "enrichment",
-        "judge",
     } <= put_stages
 
 
@@ -336,7 +334,7 @@ def test_partial_parallel_checkpoint_lets_other_workers_run(monkeypatch):
     LangGraph partial-super-step pattern — one of N parallel workers
     landed, the other two re-run."""
     monkeypatch.delenv("FLUID_COPILOT_PARALLEL_PHYSICAL", raising=False)
-    monkeypatch.setenv("FLUID_COPILOT_POST_SYNTHESIS", "0")  # Skip enrichment/judge
+    monkeypatch.setenv("FLUID_COPILOT_POST_SYNTHESIS", "0")  # Skip enrichment
 
     # Track which agents were actually called.
     called: List[str] = []
@@ -470,7 +468,6 @@ def test_contract_hash_flows_from_contract_forge_onward(monkeypatch):
         "transformation",
         "validator",
         "enrichment",
-        "judge",
     ):
         assert hash_by_stage.get(later_stage) == forge_hash, (
             f"stage {later_stage!r} hash {hash_by_stage.get(later_stage)!r} "

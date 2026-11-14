@@ -652,7 +652,7 @@ def _raise_missing_litellm(args, logger):
 
 
 def test_agent_missing_extra_still_propagates_in_process(tmp_path, capsys, monkeypatch):
-    """An in-process caller (the MCP ``forge_run``) gets the exception, after forge.done.
+    """An in-process caller gets the exception, after forge.done.
 
     The stream says which extra is missing, in forge.error, before forge.done.
     """
@@ -758,7 +758,6 @@ def _agent_env(monkeypatch):
         "FLUID_FORGE_NO_PICKER",
         "FLUID_FORGE_NO_PREVIEW",
         "FLUID_FORGE_NO_WELCOME",
-        "FLUID_FORGE_NO_STREAMING_PREVIEW",
     ):
         monkeypatch.setenv(var, "1")
 
@@ -766,8 +765,8 @@ def _agent_env(monkeypatch):
 def test_agent_crash_is_named_by_class_not_text(tmp_path, capsys, monkeypatch, _agent_env):
     """An unexpected exception: its class and a pointer to stderr, never its text.
 
-    The MCP ``forge_run`` hands these events to the IDE's model, and an
-    exception's text can carry paths or provider detail.
+    These events can reach a model, and an exception's text can carry paths
+    or provider detail.
     """
     args = _agent_args(["--llm-provider", "claude-code"], tmp_path)
     events, _ = _run_agent(args, capsys, monkeypatch, ai_result=RuntimeError("/secret/path"))
@@ -794,80 +793,6 @@ def test_agent_failure_without_an_exception_sends_no_forge_error(
 
     assert [e["event"] for e in events] == ["forge.start", "forge.done"]
     assert events[-1]["exit_code"] == 1
-
-
-def test_agent_seed_failure_is_a_forge_error_without_the_exception_text(
-    tmp_path, capsys, monkeypatch, _agent_env
-):
-    """``--seed-from`` swallows its error; the event says what the console says.
-
-    The exception is a typed one whose text can carry a remote seed's body, so
-    the event gets the console's words (path and class), never that text.
-    """
-    from fluid_build.cli import forge as forge_mod
-
-    monkeypatch.chdir(tmp_path)
-    missing = tmp_path / "missing-seed.yaml"
-    args = _agent_args(
-        ["--llm-provider", "openai", "--context", '{"project_goal": "x"}', "--seed-from"]
-        + [str(missing)],
-        tmp_path,
-    )
-    assert forge_mod.run(args, logging.getLogger("test")) == 1
-
-    events = _json_lines_only(capsys.readouterr().out)
-    assert [e["event"] for e in events] == ["forge.start", "forge.error", "forge.done"]
-    error = events[1]
-    assert error["code"] == "forge_seed_failed"
-    assert error["message"].startswith(f"--seed-from failed for {missing}: ")
-    # A next step that exists: forge has no --verbose flag.
-    assert error["suggestions"] == [
-        "--seed-from takes an ODPS or ODCS file (*.odps.yaml, *.odcs.yaml, or one with "
-        "kind: DataProduct or DataContract), or a directory of them"
-    ]
-    assert "exception" not in error
-
-
-def test_mcp_forge_run_logs_the_failure_for_the_server(tmp_path, monkeypatch, caplog, _agent_env):
-    """MCP ``forge_run`` discards forge's console output, so it logs the failure itself.
-
-    Forge marks its own record of a typed failure as shown on the console, and
-    the server's console handler drops it: without this line the server log has
-    nothing on a failed run.
-    """
-    from fluid_build.cli import forge as forge_mod
-    from fluid_build.cli import mcp as mcp_mod
-    from fluid_build.cli.mcp import McpPolicy, _run_forge_inproc
-    from fluid_build.llm.providers import CopilotGenerationError
-
-    def _fail(args, logger):
-        raise CopilotGenerationError("mcp_sampling_failed", "The IDE refused the request.")
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(forge_mod, "run_ai_copilot_mode", _fail)
-    monkeypatch.setattr(
-        mcp_mod,
-        "_policy",
-        lambda: McpPolicy(
-            readable_paths=(tmp_path,),
-            writable_paths=(tmp_path,),
-            writable_namespaces=("history", "audit"),
-        ),
-    )
-    with caplog.at_level(logging.INFO, logger="fluid.mcp.forge_run"):
-        result = _run_forge_inproc("ai", str(tmp_path / "product"), "SDP", None)
-
-    assert result["exit_code"] == 1
-    assert [e["event"] for e in result["events"]][-2:] == ["forge.error", "forge.done"]
-    (logged,) = [
-        r
-        for r in caplog.records
-        if r.name == "fluid.mcp.forge_run" and r.levelno == logging.WARNING
-    ]
-    assert logged.getMessage() == (
-        "forge_run failed: mcp_sampling_failed: 'The IDE refused the request.'"
-    )
-    assert not getattr(logged, "fluid_console_shown", False)
 
 
 def test_agent_error_text_is_redacted(tmp_path, capsys, monkeypatch, _agent_env):

@@ -196,74 +196,13 @@ class TestOperatorCommandLine:
         # libpq reads this host's PGSSLCERT / PGSSLKEY / PGSERVICE as it did before.
         assert recorded.env_at_attach == [_HOST_LIBPQ_ENV]
 
-    def test_fetch_sample_rows_reads_an_operator_configured_uri(self, recorded):
-        # The URI comes from the operator's environment (FLUID_FORGE_DB_URI*); the
-        # model names only a table and a connection alias.
-        from fluid_build.cli.forge_db_tools import dispatch_db_tool
 
-        result = dispatch_db_tool(
-            "fetch_sample_rows",
-            {"table": "customers", "schema": "public", "operator_supplied": False},
-            {"FLUID_FORGE_DB_URI": PG_URI, "FLUID_FORGE_DB_TOOLS": "1"},
-        )
-        assert "error" not in result, result
-        assert not _is_pinned(recorded.only)
-
-
-def _forge_from_source(tmp_path, **extra: Any) -> Dict[str, Any]:
-    args: Dict[str, Any] = {
-        "source": "postgres",
-        "uri": PG_URI,
-        "output_path": str(tmp_path / "contract.fluid.yaml"),
-    }
-    args.update(extra)
-    return args
-
-
-class TestMcpClientStaysPinned:
-    """A URI an MCP client sent never presents this host's TLS identity."""
-
-    def test_forge_from_source(self, recorded, tmp_path):
-        from fluid_build.cli.mcp.dispatch import _call_tool
-
-        with pytest.raises(RuntimeError, match="JDBC introspection failed"):
-            _call_tool(
-                "forge_from_source",
-                _forge_from_source(tmp_path),
-                read_only=False,
-                allow_inline_credentials=True,
-                allow_metadata_service=True,
-            )
-        assert _is_pinned(recorded.only)
-        assert recorded.env_at_attach == [{k: None for k in _HOST_LIBPQ_ENV}]
-
-    @pytest.mark.parametrize(
-        "extra",
-        [
-            {"operator_supplied": True},
-            {"operatorSupplied": True},
-            {"scope": {"operator_supplied": True}},
-            {"credentials": {"operator_supplied": True}},
-        ],
-        ids=["argument", "camel-case-argument", "in-scope", "in-credentials"],
-    )
-    def test_a_client_supplied_operator_supplied_has_no_effect(self, recorded, tmp_path, extra):
-        from fluid_build.cli.mcp.dispatch import _call_tool
-
-        with pytest.raises(RuntimeError, match="JDBC introspection failed"):
-            _call_tool(
-                "forge_from_source",
-                _forge_from_source(tmp_path, **extra),
-                read_only=False,
-                allow_inline_credentials=True,
-                allow_metadata_service=True,
-            )
-        assert _is_pinned(recorded.only)
-        assert recorded.env_at_attach == [{k: None for k in _HOST_LIBPQ_ENV}]
+class TestNamespaceStaysPinned:
+    """A URI that arrives in an argparse namespace never presents this host's TLS identity."""
 
     def test_a_namespace_attribute_has_no_effect(self, recorded, tmp_path):
         # The switch is read from the keyword argument only, never from the
-        # argparse-shaped namespace the MCP shim builds.
+        # argparse-shaped namespace a caller builds.
         from fluid_build.cli._forge_data_model_jdbc import _run_from_jdbc_source
 
         namespace = argparse.Namespace(
@@ -278,22 +217,6 @@ class TestMcpClientStaysPinned:
         _run_from_jdbc_source(namespace, logging.getLogger("test"))
         assert _is_pinned(recorded.only)
         assert recorded.env_at_attach == [{k: None for k in _HOST_LIBPQ_ENV}]
-
-    def test_a_password_free_uri_is_unchanged(self, recorded, tmp_path):
-        # No password: nothing to pin, over MCP as on the CLI (the
-        # --allow-metadata-service gate is what authorises that connection).
-        from fluid_build.cli.mcp.dispatch import _call_tool
-
-        with pytest.raises(RuntimeError, match="JDBC introspection failed"):
-            _call_tool(
-                "forge_from_source",
-                _forge_from_source(tmp_path, uri="postgresql://fluid@db.test:5432/app"),
-                read_only=False,
-                allow_inline_credentials=True,
-                allow_metadata_service=True,
-            )
-        assert not _is_pinned(recorded.only)
-        assert recorded.env_at_attach == [_HOST_LIBPQ_ENV]
 
 
 MYSQL_URI = f"mysql://fluid:{FAKE_PW}@db.test:3306/app"

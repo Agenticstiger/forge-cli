@@ -48,26 +48,6 @@ def _strip(text: str) -> str:
 
 
 # ---------------------------------------------------------------------
-# fluid memory
-# ---------------------------------------------------------------------
-
-
-def test_memory_bare_invocation_renders_guide(capsys, monkeypatch) -> None:
-    from fluid_build.cli import memory_cmd
-
-    rc = memory_cmd.run(
-        argparse.Namespace(memory_action=None),
-        LOGGER,
-    )
-    assert rc == 0
-    out = _strip(capsys.readouterr().out)
-    assert "fluid memory" in out
-    assert "status" in out
-    assert "show" in out
-    assert "search" in out
-
-
-# ---------------------------------------------------------------------
 # fluid auth
 # ---------------------------------------------------------------------
 

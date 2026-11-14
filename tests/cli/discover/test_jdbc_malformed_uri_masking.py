@@ -4,9 +4,7 @@
 """A JDBC URI that cannot be used never has its password in an error.
 
 ``_parse_uri`` quotes the URI it refuses, and ``_run_from_jdbc_source`` prints
-that text. Over MCP ``forge_from_source`` that is the server's console and log
-(and a mysql URI's error is raised from the gate itself), and
-``fetch_sample_rows`` returns the message to the model. Each message, and each
+that text. ``fetch_sample_rows`` returns the message to the model. Each message, and each
 exception chained to it, has the password masked as a connect error has.
 """
 
@@ -21,8 +19,6 @@ import pytest
 import fluid_build.cli._forge_data_model_jdbc as jdbc_cli
 from fluid_build.cli._forge_data_model_jdbc import _run_from_jdbc_source
 from fluid_build.cli.discover._jdbc_introspect import _parse_uri
-from fluid_build.cli.forge_db_tools import dispatch_db_tool
-from fluid_build.cli.mcp.dispatch import _call_tool
 
 PW = "fakePw7Qx"  # pragma: allowlist secret
 A = "fakePwA7Qx"  # pragma: allowlist secret
@@ -220,34 +216,6 @@ class TestRunFromJdbcSourcePrintsNoPassword:
         _assert_masked(printed + _all_output(capfd, caplog), [A, B])
 
 
-class TestMcpForgeFromSourceEchoesNoPassword:
-    @pytest.mark.parametrize("kind,uri,pieces", MALFORMED, ids=IDS)
-    def test_mcp_path(self, kind, uri, pieces, printed, no_connect, capfd, caplog, tmp_path):
-        caplog.set_level(logging.DEBUG)
-        out = tmp_path / "contract.fluid.yaml"
-        with pytest.raises(Exception) as caught:
-            _call_tool(
-                "forge_from_source",
-                {"source": kind, "uri": uri, "output_path": str(out)},
-                read_only=False,
-                allow_inline_credentials=True,
-                allow_metadata_service=True,
-            )
-        _assert_masked(_texts_of(caught.value) + printed + _all_output(capfd, caplog), pieces)
-        assert not out.exists()
-
-
-class TestFetchSampleRowsReturnsNoPassword:
-    @pytest.mark.parametrize("kind,uri,pieces", MALFORMED, ids=IDS)
-    def test_tool_result(self, kind, uri, pieces, no_connect, capfd, caplog):
-        caplog.set_level(logging.DEBUG)
-        result = dispatch_db_tool(
-            "fetch_sample_rows", {"table": "orders"}, env={"FLUID_FORGE_DB_URI": uri}
-        )
-        assert result.get("error"), result
-        _assert_masked([repr(result)] + _all_output(capfd, caplog), pieces)
-
-
 # A URI without '://', a typo an operator can make in FLUID_FORGE_DB_URI or in
 # --uri. The password may hold characters repr() escapes (both quote kinds, a
 # tab), and '://' may still come later, in the query or in the password itself.
@@ -265,14 +233,6 @@ NO_SCHEME_SEPARATOR = [
 
 
 class TestUriWithoutSchemeSeparator:
-    @pytest.mark.parametrize("uri", NO_SCHEME_SEPARATOR, ids=repr)
-    def test_fetch_sample_rows(self, uri, no_connect, capfd, caplog):
-        caplog.set_level(logging.DEBUG)
-        result = dispatch_db_tool(
-            "fetch_sample_rows", {"table": "orders"}, env={"FLUID_FORGE_DB_URI": uri}
-        )
-        assert result.get("error") == "InvalidConnectionUri", result
-        _assert_masked([repr(result), str(result)] + _all_output(capfd, caplog), [A, B])
 
     @pytest.mark.parametrize("uri", NO_SCHEME_SEPARATOR, ids=repr)
     def test_cli_path(self, uri, printed, no_connect, capfd, caplog, tmp_path):
@@ -297,20 +257,6 @@ class TestUriWithoutSchemeSeparator:
 
         uri = f"postgres:/u:{A}://{B}@db/app"  # pragma: allowlist secret
         assert f"{A}://{B}" in _uri_password_readings(uri)
-
-    def test_fetch_sample_rows_says_what_is_wrong(self, no_connect):
-        uri = f"postgres:/u:{PW}@db/app?application_name=x://y"  # pragma: allowlist secret
-        result = dispatch_db_tool(
-            "fetch_sample_rows", {"table": "orders"}, env={"FLUID_FORGE_DB_URI": uri}
-        )
-        assert result == {
-            "error": "InvalidConnectionUri",
-            "message": (
-                "Unsupported JDBC source: the URI does not start with postgres://, "
-                "postgresql://, mysql:// or sqlite://. "
-                "Got: 'postgres:***@db/app?application_name=x://y'"
-            ),
-        }
 
 
 # The stock logins of the official database images: the password is the user
@@ -385,13 +331,6 @@ class TestPasswordEqualToAnotherPartOfTheUri:
         )
         assert rc == 2
         assert printed == [f"JDBC introspection failed: {expected}"]
-
-    @pytest.mark.parametrize("kind,uri,expected", STOCK_LOGINS, ids=STOCK_IDS)
-    def test_fetch_sample_rows(self, kind, uri, expected, no_connect):
-        result = dispatch_db_tool(
-            "fetch_sample_rows", {"table": "orders"}, env={"FLUID_FORGE_DB_URI": uri}
-        )
-        assert result == {"error": "InvalidConnectionUri", "message": expected}
 
     def test_a_driver_error_is_still_masked_wherever_the_password_appears(
         self, printed, monkeypatch, tmp_path

@@ -10,15 +10,13 @@ Pins the wire-level contract of every catalog tool added to
 * ``list_source_tables`` / ``inspect_source_table`` /
   ``list_source_lineage`` / ``list_source_glossary`` — read-only
   metadata reads.
-* ``forge_from_source`` — write tool; runs the staged Logical
-  pipeline and emits a ``.model.json`` sidecar.
 
 Three categories of pin:
 
 1. **Tool registry shape.** Every tool present in
    ``TOOL_CAPABILITIES`` with the right read/write classification.
 2. **Permission policy.** Read tools pass under ``--read-only``;
-   write tools (``forge_from_source``) are blocked.
+   a write tool's path arguments are held to ``--writable-paths``.
 3. **Dispatch smoke.** Calling each tool with a stubbed adapter
    returns the expected JSON shape and writes the audit event.
 
@@ -102,8 +100,8 @@ class _StubAdapter(CatalogAdapter):
 
 
 class TestToolRegistryShape:
-    def test_six_source_tools_registered(self):
-        """The plan promises 6 source-catalog MCP tools; every one
+    def test_five_source_tools_registered(self):
+        """The plan promises 5 source-catalog MCP tools; every one
         must appear in ``TOOL_CAPABILITIES``."""
         expected = {
             "list_source_adapters",
@@ -111,38 +109,16 @@ class TestToolRegistryShape:
             "inspect_source_table",
             "list_source_lineage",
             "list_source_glossary",
-            "forge_from_source",
         }
         registered = {t for t in TOOL_CAPABILITIES if t in expected}
         assert registered == expected
-
-    def test_only_forge_from_source_mutates(self):
-        """All 5 read tools must have ``mutates_files=False``;
-        ``forge_from_source`` is the sole writer."""
-        for name, cap in TOOL_CAPABILITIES.items():
-            if not name.startswith(("list_source_", "inspect_source_", "forge_from_source")):
-                continue
-            if name == "forge_from_source":
-                assert cap.mutates_files is True
-                assert "output_path" in cap.file_path_args
-            else:
-                assert (
-                    cap.mutates_files is False
-                ), f"{name} should be read-only — got mutates_files=True"
-
-    def test_forge_from_source_writes_history_and_audit(self):
-        """The write tool's writes_namespaces must include both
-        ``history`` and ``audit`` so the policy gate enforces both."""
-        cap = TOOL_CAPABILITIES["forge_from_source"]
-        assert "history" in cap.writes_namespaces
-        assert "audit" in cap.writes_namespaces
 
     def test_descriptions_mention_credential_id(self):
         """Every catalog tool's description names ``credential_id``
         so an LLM scanning ``tools/list`` knows what arg to pass."""
         for name in TOOL_CAPABILITIES:
             if not name.startswith(
-                ("list_source_t", "inspect_source", "list_source_l", "list_source_g", "forge_from")
+                ("list_source_t", "inspect_source", "list_source_l", "list_source_g")
             ):
                 continue
             cap = TOOL_CAPABILITIES[name]
@@ -175,13 +151,7 @@ class TestToolRegistryShape:
         that's the whole "no raw secrets over the wire" contract from the
         security model.
 
-        ``forge_from_source`` is the only exception: it ALSO accepts JDBC
-        sources (postgres / postgresql / mysql / sqlite) which carry creds
-        inline in ``uri`` and don't go through the credential resolver. The
-        Python dispatcher does a source-specific required-field check
-        (see ``_dispatch_forge_from_jdbc_source`` and the catalog branch
-        in ``_call_tool``), so credentials is optional at the schema layer
-        and conditionally required at dispatch time."""
+        """
         catalog_only_tools = [
             "list_source_tables",
             "inspect_source_table",
@@ -199,31 +169,6 @@ class TestToolRegistryShape:
                 "properties", {}
             ), f"{name} schema must declare credentials property"
 
-        # forge_from_source: credentials property must still be present
-        # (catalog sources need it) but is optional at the JSON Schema
-        # layer because JDBC sources use ``uri`` instead.
-        forge_schema = TOOL_CAPABILITIES["forge_from_source"].input_schema
-        assert forge_schema is not None
-        assert "credentials" in forge_schema.get("properties", {})
-        assert "uri" in forge_schema.get(
-            "properties", {}
-        ), "forge_from_source must advertise 'uri' for JDBC sources"
-
-    def test_forge_from_source_schema_has_technique_enum(self):
-        """``forge_from_source.technique`` must be a closed enum so clients know
-        the valid values — defends against hallucinated free-form techniques
-        like 'star schema' that the dispatch would silently default away.
-
-        Registry-driven (issue #248): the enum is the pluggable modeling-technique
-        registry MINUS ``custom`` (bring-your-own needs a ``--logical-model`` file
-        the MCP wire can't supply). Built-in analytical (data_vault_2 /
-        dimensional) + source-aligned (flat) techniques are present."""
-        schema = TOOL_CAPABILITIES["forge_from_source"].input_schema
-        technique = schema["properties"]["technique"]
-        assert set(technique["enum"]) == {"data_vault_2", "dimensional", "flat"}
-        assert "custom" not in technique["enum"]
-        assert "engine" in schema["properties"]
-
 
 # ----------------------------------------------------------------------
 # Permission policy
@@ -231,16 +176,6 @@ class TestToolRegistryShape:
 
 
 class TestPermissionPolicy:
-    def test_read_only_blocks_forge_from_source(self):
-        """Under ``--read-only``, the write tool is blocked."""
-        policy = McpPolicy(read_only=True)
-        with pytest.raises(PermissionError, match="read-only"):
-            check_tool_permission(
-                "forge_from_source",
-                {"output_path": "/tmp/x.fluid.yaml"},
-                policy=policy,
-            )
-
     def test_read_only_allows_read_tools(self):
         """Read-only doesn't block any of the 5 read tools."""
         policy = McpPolicy(read_only=True)
@@ -254,7 +189,7 @@ class TestPermissionPolicy:
             check_tool_permission(name, {}, policy=policy)  # no exception
 
     def test_writable_paths_sandbox_blocks_outside_paths(self, tmp_path):
-        """``forge_from_source`` writes ``output_path`` — the path
+        """``regenerate_physical`` writes ``contract_path``: the path
         must resolve under one of ``writable_paths`` or the policy
         gate rejects."""
         sandbox = tmp_path / "allowed"
@@ -265,15 +200,18 @@ class TestPermissionPolicy:
         )
         # Inside sandbox — passes.
         check_tool_permission(
-            "forge_from_source",
-            {"output_path": str(sandbox / "model.json")},
+            "regenerate_physical",
+            {"path": str(sandbox / "model.json"), "contract_path": str(sandbox / "c.fluid.yaml")},
             policy=policy,
         )
         # Outside sandbox — blocked.
         with pytest.raises(PermissionError, match="writable-paths"):
             check_tool_permission(
-                "forge_from_source",
-                {"output_path": str(tmp_path / "outside" / "model.json")},
+                "regenerate_physical",
+                {
+                    "path": str(sandbox / "model.json"),
+                    "contract_path": str(tmp_path / "outside" / "c.fluid.yaml"),
+                },
                 policy=policy,
             )
 
@@ -412,44 +350,6 @@ class TestDispatchSmoke:
         )
         assert len(result["terms"]) == 1
         assert result["terms"][0]["term"] == "Order"
-
-    @pytest.mark.xfail(
-        strict=False,
-        reason="emitter defaults to fluidVersion 0.7.3 \u2014 needs PR-3+ for build_runners + matching emitter update",
-    )
-    def test_forge_from_source_writes_contract_and_sidecar(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            "fluid_build.cli.mcp._build_source_adapter",
-            lambda args, **_kwargs: _StubAdapter(),
-        )
-        monkeypatch.setattr(
-            "fluid_build.cli.mcp.write_audit_event", lambda *a, **kw: tmp_path / "audit.json"
-        )
-        monkeypatch.setenv("HOME", str(tmp_path))
-
-        contract_path = tmp_path / "forged.fluid.yaml"
-        result = _call_tool(
-            "forge_from_source",
-            {
-                "source": "stub",
-                "credentials": {"credential_id": "stub-prod"},
-                "scope": {"database": "DB", "schema_name": "SCH"},
-                "technique": "data_vault_2",
-                "name": "stub_smoke",
-                "output_path": str(contract_path),
-            },
-            read_only=False,
-        )
-
-        sidecar_path = contract_path.with_name(f"{contract_path.name}.model.json")
-        assert contract_path.exists()
-        assert sidecar_path.exists()
-        assert result["contract_path"] == str(contract_path)
-        assert result["sidecar_path"] == str(sidecar_path)
-        contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
-        assert contract["kind"] == "DataProduct"
-        assert contract["labels"]["modelSidecar"] == sidecar_path.name
-        assert result["validation"]["passes_schema"] is True
 
 
 # ----------------------------------------------------------------------

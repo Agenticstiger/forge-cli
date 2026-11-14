@@ -390,23 +390,6 @@ class TestItem4Annotations:
 
 
 class TestItem1ToolRegistry:
-    def test_registry_attached_after_modeler_call(self, tmp_path):
-        """Calling ``_ensure_tool_registry`` populates
-        ``session.tool_registry`` so the v1.6+ LLM modeler tool
-        loop can pick it up."""
-        from fluid_build.copilot.agents.modeler_agent import (
-            _ensure_tool_registry,
-        )
-
-        session = StageSession(store=NullBackend(), workspace_root=tmp_path)
-        # Not set yet.
-        assert getattr(session, "tool_registry", None) is None
-        _ensure_tool_registry(session)
-        registry = getattr(session, "tool_registry", None)
-        assert registry is not None
-        # Default registry has at least the semantic-search tool
-        # because the session has a (Null) store.
-        assert "search_semantic_memory" in registry.tools
 
     def test_existing_registry_preserved(self, tmp_path):
         """An operator who pre-attaches a custom registry must NOT

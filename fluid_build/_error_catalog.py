@@ -334,8 +334,7 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
             "Run 'fluid ai setup' to configure a provider interactively",
             "Or set a provider key: OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY",
             "For local models: --llm-provider ollama (no key required)",
-            "For keyless authoring: run forge from your IDE (mcp-sampling) or "
-            "--llm-provider claude-code",
+            "For keyless authoring: --llm-provider claude-code",
         ],
         "secrets",
     ),
