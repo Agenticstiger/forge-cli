@@ -772,8 +772,10 @@ def build_contract_from_logical(
     * ``data_quality_score_min`` → ``labels.dataQualityScore``
     * ``freshness_sla_set`` (single value) → ``labels.freshnessSla``
 
-    Contracts forged from intents / DDL (no catalog signal) get the
-    legacy defaults — same behaviour as before V1.5.
+    Contracts forged from DDL (no catalog signal) get the legacy
+    defaults — same behaviour as before V1.5. A contract forged from an
+    intent gets the intent's ``data_product.owner`` as ``dominant_owner``
+    (source ``intent``) when the intent names one, else the defaults.
     """
     from fluid_build.schema_manager import FluidSchemaManager
 
@@ -834,9 +836,9 @@ def build_contract_from_logical(
         # ``tag`` = catalog tag like ``team:analytics``; that's the
         # authoritative signal. ``table_owner`` = the creating
         # principal's identity (less authoritative but still real).
-        # When neither is set, the contract's hardcoded
-        # ``data-team`` default is in play and reviewers should
-        # set a real team owner.
+        # ``intent`` = the intent's ``data_product.owner``. When none
+        # is set, the contract's hardcoded ``data-team`` default is in
+        # play and reviewers should set a real team owner.
         labels["catalogOwnerSource"] = owner_source
     sensitivity_tags = summary.get("sensitivity_tags") or []
     if sensitivity_tags:
