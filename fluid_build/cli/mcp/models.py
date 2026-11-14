@@ -12,7 +12,7 @@ monolith into focused, testable modules.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -285,10 +285,12 @@ _ALLOW_METADATA_SERVICE_DESCRIPTION = (
 
 
 #: The source-catalog tool, and the values of its ``kind`` and
-#: ``response_format`` arguments.
+#: ``response_format`` arguments. The values are read from the ``Literal``
+#: types in the tool's signature, so the schema the SDK advertises and the
+#: dispatch checks share one list.
 SOURCE_CATALOG_TOOL = "source_catalog"
-SOURCE_CATALOG_KINDS: Tuple[str, ...] = ("adapters", "tables", "table", "lineage", "glossary")
-RESPONSE_FORMATS: Tuple[str, ...] = ("concise", "detailed")
+SOURCE_CATALOG_KINDS: Tuple[str, ...] = get_args(_SourceCatalogKindLiteral)
+RESPONSE_FORMATS: Tuple[str, ...] = get_args(_ResponseFormatLiteral)
 
 _SOURCE_CATALOG_DESCRIPTION = (
     "Read metadata from a source catalog (Snowflake, Unity, BigQuery, Dataplex, Glue, "
