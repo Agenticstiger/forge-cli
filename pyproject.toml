@@ -344,17 +344,18 @@ litellm = [
 #   repo:  https://github.com/modelcontextprotocol/python-sdk
 #
 # mcp floor 1.30: advisories fixed in 1.23.0, 1.27.2 (GHSA-jpw9, an SSE session
-# not bound to its principal; the gateway uses ``SseServerTransport``), 1.28.1
-# and 1.30.0; 2.0.* and 2.1.* carry them too and were fixed in 2.2.0.
+# not bound to its principal), 1.28.1 and 1.30.0; 2.0.* and 2.1.* carry them too
+# and were fixed in 2.2.0. Both servers' HTTP transport (fluid_build/_mcp_http.py)
+# relies on the Streamable HTTP session manager tying a session to its principal.
 #
 # pyjwt is declared explicitly because fluid_build/output_ports/mcp/auth.py
 # imports ``jwt`` directly. Floor 2.15.0: every release up to 2.14.0 has
 # advisories on the PyJWKClient/decode path auth.py uses (e.g.
 # GHSA-ffc3-869f-jxw9); [crypto] for the RS256/ES256/EdDSA verifiers.
 #
-# starlette and uvicorn are declared because the output-port transport
-# (fluid_build/output_ports/mcp/_transport.py) imports them directly; mcp
-# requires both, so they add nothing to the install. Floors as mcp states them.
+# starlette and uvicorn are declared because both MCP servers' HTTP transport
+# (fluid_build/_mcp_http.py) imports them directly; mcp requires both, so they
+# add nothing to the install. Floors as mcp states them.
 mcp = [
   "mcp>=1.30,!=2.0.*,!=2.1.*,<3.0",
   "pyjwt[crypto]>=2.15.0",
@@ -918,7 +919,7 @@ markers = [
     "policy: Tests for policy validators",
     "runtime: Tests for runtime generators",
     "live_llm: Tests that call a real LLM (cost ~$0.0001/run; require an API key in env)",
-    "agent_eval: Opt-in eval of coding agents authoring FLUID contracts with and without the agent skills (runs claude -p on your subscription; set FLUID_AGENT_EVAL=1)",
+    "agent_eval: Opt-in eval of coding agents authoring FLUID contracts with and without the agent skills (runs claude -p on your subscription, and codex exec with an API key when asked; set FLUID_AGENT_EVAL=1)",
     "redteam: Deterministic adversarial tests for the agentic layer (zero-token, no LLM)",
     "emulated: Stage-1 keyless integration tests backed by in-process emulators (moto, fakesnow); run on every PR via ci.yml",
     "emulated_heavy: Stage-2 Docker-based emulated integration tests (bigquery-emulator, LocalStack); admin-gated via integration-emulated-heavy.yml",

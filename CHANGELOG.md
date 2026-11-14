@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fluid mcp serve --transport http`: the authoring tools over MCP Streamable HTTP, for remote
+  clients and hosted agent harnesses.** `fluid mcp serve` spoke only stdio, so a host that attaches
+  MCP servers by URL (an agent harness, Anthropic's MCP connector, `claude mcp add --transport
+  http`) could not use it. `--transport http` serves the same tools, with the same `--read-only`,
+  `--allow-tools` and path sandbox, at `http://127.0.0.1:8766/mcp` (`--host`, `--port`; the output
+  port keeps 8765, so both can run). Auth is the output port's: `FLUID_MCP_AUTH_TOKEN` (the default
+  `shared-token` mode) or `FLUID_MCP_AUTH_MODE=jwt`. Clients send `Authorization: Bearer <token>`;
+  a request without it gets 401, with `WWW-Authenticate`, before any session exists. A session
+  answers only the identity that opened it: another caller presenting its `Mcp-Session-Id` gets 404.
+
 ### Changed
 
 - **`fluid forge` AI mode runs on the shipped FLUID skills.** These are the four Agent Skills in
@@ -33,6 +45,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory already holds `contract.fluid.yaml`. A non-interactive run needs `--context`.
 - **`fluid mcp serve` serves 11 tools.** `list_source_adapters` lists the 7 catalogs the catalog
   tools read. JDBC databases remain available through `fluid forge data-model from-source --uri`.
+- **The agent-skills eval harness measures variance, a second agent and false triggers.**
+  `tests/agent_evals/harness.py run --runs N` repeats every scenario and arm, and the report
+  adds pass@N (at least one of N runs passes) and pass^N (all N pass) next to pass@1, the
+  full-pass rate. Two Codex arms (`codex-no-skill`, `codex-skill`, both `codex exec`) measure
+  the skills on a second agent, under the Claude arms' isolation in Codex's own terms: a fresh
+  `CODEX_HOME` and `HOME` per run, the API key stored there instead of in any environment, and
+  a permissions profile that keeps reads and writes in the workspace, with no network. Three
+  negative controls (`should_trigger: false`) catch a FLUID skill that fires on a request it
+  does not cover. Each record's `run_meta` names its agent, the agent's version, and the model
+  and effort it was pinned to; Claude runs pin `claude-sonnet-5-5` at `medium` by default. Test
+  code only: nothing in `fluid_build/` changes.
+- **`fluid mcp output-port serve --transport http` speaks Streamable HTTP at `/mcp`; the HTTP+SSE
+  endpoints `/sse` and `/messages/` are gone.** The MCP specification deprecated HTTP+SSE in its
+  2025-03-26 revision. Both servers now share one transport (`fluid_build/_mcp_http.py`) on the
+  SDK's `StreamableHTTPSessionManager`, starlette and uvicorn from the `[mcp]` extra; nothing new
+  is installed. Point clients at `http://<host>:<port>/mcp`. Verified identity, row filters and
+  audit records still bind per request.
+- **An MCP server without auth listens on loopback only.** Both servers refuse, with exit 2 and the
+  fix, to listen beyond loopback (`127.0.0.0/8`, `::1`, `localhost`) without auth, or with a shared
+  token shorter than 32 characters; the output port used to warn and serve. Without auth a request
+  must also carry a loopback `Host` header (DNS-rebinding protection; anything else gets 421), so a
+  gateway behind a reverse proxy that forwards its public name needs its own token, as the proxy
+  templates in `examples/mcp-output-port-docker/proxy/` already said. On both servers, with or
+  without auth, a browser `Origin` from another machine gets 403.
 
 ### Removed
 

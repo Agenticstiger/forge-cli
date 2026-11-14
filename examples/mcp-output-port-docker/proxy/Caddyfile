@@ -58,10 +58,13 @@ mcp.your-domain.example {
     }
 
     # 4. Forward to the gateway. The gateway listens on
-    #    127.0.0.1:8765 by default (`--transport http`); the proxy
-    #    is the only thing that touches it from outside.
+    #    127.0.0.1:8765 by default (`--transport http`) and answers MCP
+    #    at /mcp; the proxy is the only thing that touches it from outside.
+    #    The gateway must run with FLUID_MCP_AUTH_TOKEN (step 4 above):
+    #    without auth it accepts only a loopback Host header, and the
+    #    public name forwarded here would get 421.
     reverse_proxy 127.0.0.1:8765 {
-        flush_interval -1   # SSE: don't buffer
+        flush_interval -1   # streamed MCP responses (SSE): don't buffer
         # Forward the client cert subject to the gateway as a header
         # so the gateway can stamp it onto the audit event for
         # cryptographic identity attribution beyond what the bearer

@@ -10,8 +10,15 @@ monolith into focused, testable modules.
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import contextvars
+import functools
+import json
 import logging
-from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Optional, Tuple
+import threading
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -115,20 +122,60 @@ def _get_mcp_app() -> "FastMCP":
     return _mcp_app
 
 
+#: Set by ``fluid mcp serve --transport http`` (:func:`serve_tools_off_loop`).
+#: Over HTTP one event loop serves uvicorn and every client's session, and a
+#: catalog tool waits on the network, so a tool must not run on that loop:
+#: one slow call would stall every other client and delay Ctrl-C. Each call
+#: runs on the one thread of ``_tool_executor()`` instead, so calls stay one at
+#: a time, as stdio runs them one at a time on the loop: the tools were never
+#: written to run concurrently.
+_TOOLS_OFF_LOOP = False
+_TOOL_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_TOOL_EXECUTOR_GUARD = threading.Lock()
+
+
+def serve_tools_off_loop() -> None:
+    """Run every sync tool on a dedicated worker thread, one at a time (HTTP serving)."""
+    global _TOOLS_OFF_LOOP
+    _TOOLS_OFF_LOOP = True
+
+
+def _tool_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """The single worker thread tool calls run on when served over HTTP.
+
+    One worker, not a lock: a call waiting its turn sits in the executor's
+    queue and holds no thread, so the default executor (the SDK uses it
+    through ``asyncio.to_thread``) is never starved. A client that
+    cancels its call (``notifications/cancelled``, or a dropped session)
+    cancels the queued future, so a waiting call never runs; a running call
+    cannot be cancelled and keeps the thread until it finishes, so the next
+    call never runs beside it.
+    """
+    global _TOOL_EXECUTOR
+    with _TOOL_EXECUTOR_GUARD:
+        if _TOOL_EXECUTOR is None:
+            _TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="fluid-mcp-tool"
+            )
+        return _TOOL_EXECUTOR
+
+
 async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Permission-gate + sync execution for a fast read/write tool.
 
-    NB: deliberately calls ``_call_tool`` SYNCHRONOUSLY (no
-    ``asyncio.to_thread``). The fast tools (file reads, validator runs,
-    catalog enumerations) complete in single-digit milliseconds, so the
-    event-loop block is negligible — and going through a worker thread
-    causes a real race when a client pipelines requests (e.g. the
+    NB: over stdio this deliberately calls ``_call_tool`` SYNCHRONOUSLY (no
+    ``asyncio.to_thread``). With one client the event-loop block is
+    harmless — and going through a worker thread causes a real race when
+    a client pipelines requests (e.g. the
     ``tests/test_mcp_protocol_smoke.py`` smoke test sends 3 messages then
     closes stdin): the SDK can hit stdin-EOF and start shutting down
     before the worker thread's response makes it to stdout, producing
     a missing-response failure plus ``ValueError: I/O operation on
     closed file`` on the worker thread. Sync dispatch guarantees each
     response is fully flushed before the next request is read.
+
+    Over HTTP (``_TOOLS_OFF_LOOP``) the call runs in a worker thread
+    instead; there is no stdin to close, and the loop must stay free.
     """
     from fluid_build.cli.mcp.dispatch import McpToolRefusal, _call_tool
 
@@ -136,14 +183,22 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
         "fluid_build.cli.mcp.policy", fromlist=["check_tool_permission"]
     ).check_tool_permission
     check_tool_permission(name, arguments, policy=_policy())
+    call = functools.partial(
+        _call_tool,
+        name,
+        arguments,
+        read_only=_policy().read_only,
+        allow_inline_credentials=_policy().allow_inline_credentials,
+        allow_metadata_service=_policy().allow_metadata_service,
+    )
     try:
-        return _call_tool(
-            name,
-            arguments,
-            read_only=_policy().read_only,
-            allow_inline_credentials=_policy().allow_inline_credentials,
-            allow_metadata_service=_policy().allow_metadata_service,
-        )
+        if _TOOLS_OFF_LOOP:
+            # As asyncio.to_thread does: the call keeps this request's context.
+            context = contextvars.copy_context()
+            return await asyncio.get_running_loop().run_in_executor(
+                _tool_executor(), functools.partial(context.run, call)
+            )
+        return call()
     except McpToolRefusal as exc:
         # Surface the refusal (which names the server flag to set) as the
         # SDK's ToolError; SDK 2.x would mask a bare RuntimeError.

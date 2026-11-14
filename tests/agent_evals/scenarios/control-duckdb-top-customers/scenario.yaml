@@ -1,0 +1,9 @@
+title: Negative control, a DuckDB query over a CSV
+# A near miss: DuckDB and a CSV source, as in an SDP request, but the ask is one query
+# file. No FLUID skill should fire and no contract should appear.
+should_trigger: false
+arms: [no-skill, skill]
+checks:
+  - {id: query_file, exists_file: top_customers.sql}
+  - {id: reads_csv, in_file: top_customers.sql, matches: 'orders\.csv'}
+  - {id: top_five, in_file: top_customers.sql, matches: 'limit\s+5\b'}

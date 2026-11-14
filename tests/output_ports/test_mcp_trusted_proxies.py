@@ -9,8 +9,8 @@ forwards the verified client certificate as ``X-Client-CN`` /
 ``X-Client-Fingerprint``. Those headers are only as trustworthy as the hop
 that set them, so the gateway reads them solely when the TCP peer is listed
 in ``FLUID_MCP_TRUSTED_PROXIES`` (uvicorn ``--forwarded-allow-ips``
-semantics, default: trust nobody). These tests drive the real HTTP/SSE
-transport, the real CLI and the real audit sink.
+semantics, default: trust nobody). These tests drive the real Streamable
+HTTP transport, the real CLI and the real audit sink.
 """
 
 from __future__ import annotations
@@ -26,16 +26,16 @@ import pytest
 
 duckdb = pytest.importorskip("duckdb")
 
-from mcp import ClientSession  # noqa: E402
-from mcp.client.sse import sse_client  # noqa: E402
-
-from fluid_build._mcp_compat import self_attesting_client_kwargs  # noqa: E402
+from fluid_build._mcp_compat import (  # noqa: E402
+    open_streamable_http_session,
+    self_attesting_client_kwargs,
+)
 from fluid_build.output_ports.mcp import OutputPortMcpServer, OutputPortPolicy  # noqa: E402
 from fluid_build.output_ports.mcp import auth as auth_mod  # noqa: E402
 
 from ._fixtures import make_expose, write_customer_csv  # noqa: E402
 from .test_cli_list_and_doctor import _make_demo  # noqa: E402
-from .test_extensibility_and_runtime import _free_port, _running_sse_server  # noqa: E402
+from .test_extensibility_and_runtime import _free_port, _running_http_server  # noqa: E402
 
 TOKEN = "test-shared-token-not-a-secret"
 CERT_HEADERS = {"X-Client-CN": "C0001", "X-Client-Fingerprint": "ab12cd34"}
@@ -277,7 +277,7 @@ def test_trusted_proxies_error_example_is_a_single_address_not_a_wide_range(bad:
 
 
 # ---------------------------------------------------------------------
-# End to end over the real HTTP/SSE transport
+# End to end over the real Streamable HTTP transport
 # ---------------------------------------------------------------------
 
 
@@ -313,15 +313,13 @@ def _audit_records(audit_root: Path) -> List[Dict[str, Any]]:
     ]
 
 
-async def _sample_over_sse(port: int, headers: Dict[str, str]) -> Dict[str, Any]:
-    url = f"http://127.0.0.1:{port}/sse"
-    async with sse_client(url, headers=headers) as (read_stream, write_stream):
-        async with ClientSession(
-            read_stream, write_stream, **self_attesting_client_kwargs("cn-test", "1.0.0")
-        ) as session:
-            await session.initialize()
-            result = await session.call_tool("sample", {"limit": 10})
-            return json.loads(result.content[0].text)
+async def _sample_over_http(port: int, headers: Dict[str, str]) -> Dict[str, Any]:
+    url = f"http://127.0.0.1:{port}/mcp"
+    async with open_streamable_http_session(
+        url, headers=headers, **self_attesting_client_kwargs("cn-test", "1.0.0")
+    ) as session:
+        result = await session.call_tool("sample", {"limit": 10})
+        return json.loads(result.content[0].text)
 
 
 def _auth_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
@@ -345,8 +343,10 @@ async def test_direct_client_cannot_choose_its_certificate_cn(
     audit_root = _auth_env(monkeypatch, tmp_path)
     server = _cn_filtered_server(tmp_path)
     port = _free_port()
-    with _running_sse_server(server, port):
-        payload = await _sample_over_sse(port, {"Authorization": f"Bearer {TOKEN}", **CERT_HEADERS})
+    with _running_http_server(server, port):
+        payload = await _sample_over_http(
+            port, {"Authorization": f"Bearer {TOKEN}", **CERT_HEADERS}
+        )
     assert payload.get("rows") is None, payload
     assert payload.get("error"), payload
     records = _audit_records(audit_root)
@@ -372,8 +372,8 @@ async def test_forwarded_for_header_cannot_impersonate_a_trusted_proxy(
     monkeypatch.setenv("FLUID_MCP_TRUSTED_PROXIES", "192.0.2.10")
     server = _cn_filtered_server(tmp_path)
     port = _free_port()
-    with _running_sse_server(server, port):
-        payload = await _sample_over_sse(
+    with _running_http_server(server, port):
+        payload = await _sample_over_http(
             port,
             {
                 "Authorization": f"Bearer {TOKEN}",
@@ -392,8 +392,10 @@ async def test_trusted_proxy_certificate_identity_binds_and_is_audited(
     monkeypatch.setenv("FLUID_MCP_TRUSTED_PROXIES", "127.0.0.1,::1")
     server = _cn_filtered_server(tmp_path)
     port = _free_port()
-    with _running_sse_server(server, port):
-        payload = await _sample_over_sse(port, {"Authorization": f"Bearer {TOKEN}", **CERT_HEADERS})
+    with _running_http_server(server, port):
+        payload = await _sample_over_http(
+            port, {"Authorization": f"Bearer {TOKEN}", **CERT_HEADERS}
+        )
     assert payload.get("error") is None, payload
     assert [row["customer_id"] for row in payload["rows"]] == ["C0001"]
     record = _audit_records(audit_root)[0]

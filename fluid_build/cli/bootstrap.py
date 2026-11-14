@@ -558,7 +558,9 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
         "version_cmd", "version", (_cmd("version", "Show version and system information"),)
     ),
     CoreCommand("roadmap_cmd", "roadmap", (_cmd("roadmap", "Show the staged forge roadmap"),)),
-    CoreCommand("mcp", "mcp", (_cmd("mcp", "Serve staged forge tools over MCP stdio"),)),
+    CoreCommand(
+        "mcp", "mcp", (_cmd("mcp", "Serve forge's authoring tools over MCP (stdio or HTTP)"),)
+    ),
     CoreCommand(
         "export_opds",
         "export-opds",

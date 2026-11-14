@@ -378,7 +378,7 @@ class OutputPortMcpServer:
     Public surface intentionally narrow — instantiate, then call
     :meth:`run` on an asyncio event loop. The class wraps
     :class:`mcp.server.lowlevel.Server` so callers who want to reuse
-    the dispatch loop (e.g. for SSE in a future PR) can subclass
+    the dispatch loop (e.g. for another transport) can subclass
     cleanly.
     """
 
@@ -468,7 +468,7 @@ class OutputPortMcpServer:
         ) -> List[TextContent | EmbeddedResource] | CallToolResult:
             # Identity binding — resolved FRESH per request from the
             # request context (NOT cached on the shared SessionState).
-            # On HTTP/SSE one process serves many concurrent clients
+            # On HTTP one process serves many concurrent clients
             # over one SessionState; caching the first client's identity
             # bled it onto every later client (wrong agentPolicy
             # principal + wrong tenant rowFilter). The MCP protocol
@@ -745,7 +745,7 @@ class OutputPortMcpServer:
         self, request_context: Any
     ) -> tuple[Optional[str], Optional[str], Dict[str, Any]]:
         """Resolve the CALLING client's identity for THIS request — never
-        cached on the shared SessionState. On HTTP/SSE one process serves many
+        cached on the shared SessionState. On HTTP one process serves many
         concurrent clients over one SessionState, so caching bled the first
         client's identity onto every later client. The SDK isolates identity
         per request via the request context (v1: the ``request_ctx``
@@ -915,7 +915,7 @@ class OutputPortMcpServer:
         would authorise itself past a data-residency rule by typing a string —
         and it would work precisely on the unauthenticated deployments least
         able to notice. So this reads ``request.scope["fluid_auth_attrs"]``
-        alone, the map the HTTP ``_AuthMiddleware`` writes only after
+        alone, the map the HTTP auth gate (``fluid_build._mcp_http``) writes only after
         validating a JWT or mTLS identity, and never ``clientInfo``.
 
         There is no no-auth fallback, on purpose. Returns ``None`` when there
@@ -956,7 +956,7 @@ class OutputPortMcpServer:
         ``model_id`` / ``use_case`` are the CALLING client's identity
         resolved per-request by :meth:`_resolve_request_identity` — not
         read from the shared SessionState, which would gate every
-        concurrent HTTP/SSE client under the first client's identity.
+        concurrent HTTP client under the first client's identity.
 
         ``caller_jurisdiction`` comes from
         :meth:`_resolve_verified_jurisdiction`, which reads the verified
@@ -1042,7 +1042,7 @@ class OutputPortMcpServer:
         ``caller_attributes`` is the CALLING client's per-request
         identity (resolved by :meth:`_resolve_request_identity`),
         threaded explicitly into the data-tool handlers so each
-        concurrent HTTP/SSE client's ``${caller.*}`` rowFilters resolve
+        concurrent HTTP client's ``${caller.*}`` rowFilters resolve
         against ITS OWN identity — not whatever happens to be cached on
         the shared SessionState.
 
@@ -1201,18 +1201,18 @@ class OutputPortMcpServer:
     # ------------------------------------------------------------------
 
     # Transport / lifecycle bodies live in ``_transport.py`` (extracted
-    # from this god-class — stdio + HTTP/SSE serving is a distinct
+    # from this god-class — stdio + Streamable HTTP serving is a distinct
     # concern from protocol-handler registration + policy). These thin
     # delegations keep the public method surface + the ``run_stdio``
     # CLI entry point unchanged. Routed through the ``_transport``
     # module so a test patching ``_transport.run_async`` flows through.
     async def run_http_async(self, *, host: str = "127.0.0.1", port: int = 8765) -> None:
-        """Serve the gateway over MCP-SSE (Starlette + uvicorn).
+        """Serve the gateway over MCP Streamable HTTP at ``/mcp`` (starlette + uvicorn).
         See :func:`_transport.run_http_async`."""
         return await _transport.run_http_async(self, host=host, port=port)
 
     def stop_http(self, *, force: bool = False) -> None:
-        """Signal a running HTTP/SSE transport to shut down.
+        """Signal a running Streamable HTTP transport to shut down.
         Pass ``force=True`` for an immediate stop that does not wait for
         lingering connections to drain. See :func:`_transport.stop_http`."""
         _transport.stop_http(self, force=force)
