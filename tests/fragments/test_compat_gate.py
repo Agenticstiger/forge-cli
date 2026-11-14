@@ -160,6 +160,19 @@ def run_job(argv, cwd):
 def drive(jobs_file, results_file):
     import fluid_build
 
+    # Added after v0.24.0 on purpose, and pinned on their own by
+    # tests/cli/test_validate_issues.py: the authoring lint's warnings and the
+    # issues[] list of validate --format json. Off on this side, so everything
+    # else must still read as v0.24.0's did. v0.24.0 has neither module.
+    try:
+        import fluid_build._validation_issues as issues
+        import fluid_build.cli._authoring_lint as lint
+    except ImportError:
+        pass
+    else:
+        lint.lint_contract = lambda contract: []
+        issues.build_issues = lambda result: []
+
     jobs = json.load(open(jobs_file))
     results = {"fluid_build_file": fluid_build.__file__, "jobs": {}}
     started = time.time()
