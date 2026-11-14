@@ -244,7 +244,7 @@ def test_emit_plan_emits_forge_plan_event(tmp_path: Path):
 
     # Each step must surface the relevant MCP tools (when applicable).
     consumes_step = next(s for s in plan["next_steps"] if "consumes" in s["step"].lower())
-    assert "list_source_lineage" in consumes_step["mcp_tools"]
+    assert "source_catalog" in consumes_step["mcp_tools"]
 
     # The note must describe the real split: the agent fills the fields itself,
     # while --agent plus an AI flag runs forge's own AI with a second LLM.

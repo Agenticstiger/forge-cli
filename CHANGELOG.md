@@ -65,6 +65,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a request without it gets 401, with `WWW-Authenticate`, before any session exists. A session
   answers only the identity that opened it: another caller presenting its `Mcp-Session-Id` gets 404.
 
+- **`source_catalog` takes `response_format`: `concise` (the default) or `detailed`.** `concise`
+  leaves out vendor-specific payloads (`catalog_specific`), empty fields and false key flags (a
+  table's `tags` are kept whole, so a key-only tag stays), lists
+  tables by `fqn`, `name` and `description`, and gives lineage as the upstream and downstream
+  FQNs. `detailed` returns every field, as the five former tools did. The pattern is the one in
+  Anthropic's "Writing effective tools for agents".
+- **A `fluid mcp serve` result too large to send inline comes back as a resource.** When a tool's
+  result is estimated at more than `FLUID_MCP_INLINE_TOKEN_LIMIT` tokens (default 6,000, about
+  24 KB of the indented JSON text the call would send; `0` sends everything inline), the call returns a short envelope (its size, a
+  summary with each list's length, what to do next) and an MCP `resource_link` to
+  `fluid://artifacts/<id>`, which `resources/read` serves. Over stdio the envelope also names a
+  file holding the same JSON, in a private temporary directory (0700, files 0600) removed when the
+  server exits normally; a server killed by a signal leaves it in the system temporary directory.
+  The server keeps its last 32 such results, up to 64 MB, until it stops. Claude Code warns above
+  10,000 tokens of tool output and cuts at 25,000, and some agent harnesses spill anything above
+  about 6,000 tokens to a file of their own.
+- **`fluid mcp serve` describes itself at `initialize`.** Its `instructions` say, key words first,
+  when to reach for its tools: clients that defer tool loading, such as Claude Code's tool search,
+  load only tool names and this text at session start.
+
 ### Changed
 
 - **`fluid forge` AI mode runs on the shipped FLUID skills.** These are the four Agent Skills in
@@ -89,8 +109,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with no tools.
 - **AI mode does not overwrite a contract.** Without `--refine` it refuses when the target
   directory already holds `contract.fluid.yaml`. A non-interactive run needs `--context`.
-- **`fluid mcp serve` serves 11 tools.** `list_source_adapters` lists the 7 catalogs the catalog
-  tools read. JDBC databases remain available through `fluid forge data-model from-source --uri`.
+- **`fluid mcp serve` lists only the 7 catalogs as source adapters.** JDBC databases remain
+  available through `fluid forge data-model from-source --uri`.
+- **`fluid mcp serve`: one `source_catalog` tool replaces the five source-catalog tools, so the
+  server has 7 tools.** `list_source_adapters`, `list_source_tables`, `inspect_source_table`,
+  `list_source_lineage` and `list_source_glossary` are now `source_catalog` with `kind` set to
+  `adapters`, `tables`, `table`, `lineage` or `glossary`; the other arguments keep their names, and
+  no alias keeps the old names. Every result names its `kind`, and a `tables` result is now
+  `{"kind": "tables", "tables": [...]}`, a `table` result `{"kind": "table", "table": {...}}`. A
+  call that lacks what its kind needs (`fqn` for `table` and `lineage`, `scope` for `tables`,
+  `source` and `credentials` for every kind but `adapters`) is refused before any credential is
+  resolved, with the argument and an example. An adapter's own refusal (an unknown credential id,
+  a scope field its catalog needs) is passed on in the adapter's words, without the driver's
+  error text; a connection failure, a permission denial (it quotes the catalog's own message)
+  and a credential that fails validation stay in the server log. On MCP SDK 2.x a client now reads these messages, and the adapter builder's, where
+  it used to get "Error executing tool". The `tools/list` schemas shrink from 3,440 to 1,892
+  tokens (tiktoken o200k_base, an offline proxy for a client's tokenizer): 15,464 to 8,364 bytes.
+- **`fluid mcp serve` stops on a tool name it does not know.** An unknown name in `--allow-tools`
+  or `--deny-tools` exits 2, and the message names what replaced a renamed tool (`list_source_tables
+  is now source_catalog with kind=tables`). The names were never checked, so a deny list written
+  for one of the five tools would have denied nothing and left `source_catalog` callable.
+  `fluid scaffold-ide` now writes `source_catalog` into the IDE's `autoApprove` list; a config an
+  older scaffold-ide wrote lists the five old names until it is generated again.
 - **An SDP that consumes a product the workspace cannot resolve is a warning.** It used to be
   reported under `--verbose` only, because an ADP or a CDP may consume a product of another
   workspace. An SDP accepts no upstream of any type, so the rule holds whatever the upstream
@@ -161,6 +201,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A source-catalog listing failed through an MCP client whenever its scope named no
+  tables.** `fluid mcp serve` turned the client's `scope` back into a dict with every unset field
+  as `null`, and `"tables": null` failed validation, so `list_source_tables` (now
+  `source_catalog` with `kind=tables`) and a scoped `list_source_glossary` failed for an ordinary
+  `{"database": ..., "schema": ...}` scope: on MCP SDK 2.x as "Error executing tool". Unset fields
+  are now left out.
 - **`fluid forge data-model from-intent` keeps the owner the intent names.** The contract's
   `metadata.owner.team` was always `data-team`, whatever `data_product.owner` said, so every
   contract forged from an intent (each Command Center draft among them) lost its owner and

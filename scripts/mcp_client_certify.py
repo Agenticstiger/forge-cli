@@ -95,7 +95,7 @@ def _check_direct_jsonrpc(repo_root: Path, timeout: int) -> CertificationCheck:
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": {"name": "list_source_adapters", "arguments": {}},
+            "params": {"name": "source_catalog", "arguments": {"kind": "adapters"}},
         },
     ]
     proc = subprocess.run(
@@ -164,7 +164,9 @@ def _check_mcp_inspector(repo_root: Path, timeout: int) -> CertificationCheck:
             "--method",
             "tools/call",
             "--tool-name",
-            "list_source_adapters",
+            "source_catalog",
+            "--tool-arg",
+            "kind=adapters",
             *server,
         ],
         cwd=repo_root,

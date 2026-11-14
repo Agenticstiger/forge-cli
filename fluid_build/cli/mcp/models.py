@@ -12,7 +12,7 @@ monolith into focused, testable modules.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -99,6 +99,8 @@ _CATALOG_SOURCE_LIST = (
 _SOURCE_ENUM = list(_CATALOG_SOURCE_LIST)
 
 _CatalogSourceLiteral = Literal[tuple(_SOURCE_ENUM)]  # type: ignore[valid-type]
+_SourceCatalogKindLiteral = Literal["adapters", "tables", "table", "lineage", "glossary"]
+_ResponseFormatLiteral = Literal["concise", "detailed"]
 
 _CREDENTIALS_DESCRIPTION = (
     "Credential lookup envelope. Pass ONLY the credential_id; "
@@ -273,12 +275,67 @@ _VALIDATE_LOGICAL_PATH_DESCRIPTION = "Optional path to a .model.json sidecar to 
 _VALIDATE_CONTRACT_PATH_DESCRIPTION = "Optional path to a Fluid contract to validate."
 _DIFF_OLD_DESCRIPTION = "Path to the older .model.json sidecar."
 _DIFF_NEW_DESCRIPTION = "Path to the newer .model.json sidecar."
-_ADAPTER_DISPATCH_DESCRIPTION = "Catalog adapter to dispatch against."
+_ADAPTER_DISPATCH_DESCRIPTION = "The catalog to read. Not needed for kind=adapters."
 _ALLOW_METADATA_SERVICE_DESCRIPTION = (
     "Request the credential resolver's fallback to "
     "cloud-metadata-service auth (instance profile, workload identity, gcloud "
     "ADC). Off by default. Refused with an error unless the server was started "
     "with --allow-metadata-service (or FLUID_ALLOW_METADATA_SERVICE=1)."
+)
+
+
+#: The source-catalog tool, and the values of its ``kind`` and
+#: ``response_format`` arguments. The values are read from the ``Literal``
+#: types in the tool's signature, so the schema the SDK advertises and the
+#: dispatch checks share one list.
+SOURCE_CATALOG_TOOL = "source_catalog"
+SOURCE_CATALOG_KINDS: Tuple[str, ...] = get_args(_SourceCatalogKindLiteral)
+RESPONSE_FORMATS: Tuple[str, ...] = get_args(_ResponseFormatLiteral)
+
+_SOURCE_CATALOG_DESCRIPTION = (
+    "Read metadata from a source catalog (Snowflake, Unity, BigQuery, Dataplex, Glue, "
+    "DataHub, Data Mesh Manager): the adapters, a scope's tables, one table, its lineage, "
+    "or glossary terms. Metadata only, never table data."
+)
+_SOURCE_KIND_DESCRIPTION = (
+    "adapters: the catalogs this server can read (needs nothing else). tables: the tables "
+    "in a scope. table: one table's columns, keys, owner and tags. lineage: one table's "
+    "upstream and downstream tables. glossary: business-glossary terms. Every kind but "
+    "adapters needs source and credentials; table and lineage also need fqn."
+)
+_RESPONSE_FORMAT_DESCRIPTION = (
+    "concise (default) leaves out vendor-specific payloads, empty fields and false key "
+    "flags, and lists tables by fqn, name and description only. detailed returns every "
+    "field the catalog gave."
+)
+
+#: Tool names that no longer exist, and what to use instead. ``fluid mcp serve``
+#: refuses them in ``--allow-tools`` / ``--deny-tools`` (with this hint) rather
+#: than ignoring them: a deny list naming a renamed tool would deny nothing.
+RETIRED_TOOL_HINTS: Dict[str, str] = {
+    "list_source_adapters": "is now source_catalog with kind=adapters",
+    "list_source_tables": "is now source_catalog with kind=tables",
+    "inspect_source_table": "is now source_catalog with kind=table",
+    "list_source_lineage": "is now source_catalog with kind=lineage",
+    "list_source_glossary": "is now source_catalog with kind=glossary",
+    "forge_run": "was removed; no tool replaces it",
+    "forge_from_source": "was removed; no tool replaces it",
+    "score_contract_quality": "was removed; no tool replaces it",
+    "enrich_contract_suggestions": "was removed; no tool replaces it",
+    "search_semantic_memory": "was removed; no tool replaces it",
+}
+
+#: The server's ``instructions`` (sent at ``initialize``). Clients that defer
+#: tool loading, such as Claude Code's tool search, load only tool names and
+#: this text at session start, and cut it at 4,096 characters: it says when to
+#: reach for these tools, key words first.
+SERVER_INSTRUCTIONS = (
+    "FLUID data products: validate a contract (contract.fluid.yaml); read, diff and edit "
+    "its .model.json logical model; regenerate the contract and physical files from it; "
+    "read source-catalog metadata (tables, columns, keys, lineage, glossary) from "
+    "Snowflake, Unity Catalog, BigQuery, Dataplex, Glue, DataHub or Data Mesh Manager. "
+    "Reads catalog metadata, never table data. A result too large to send inline comes "
+    "back as a fluid://artifacts/ resource."
 )
 
 
@@ -407,129 +464,48 @@ TOOL_CAPABILITIES: Dict[str, ToolCapability] = {
         },
     ),
     # ---------------------------------------------------------------
-    # V1.5 — metadata source-catalog tools.
-    #
-    # User-facing vocabulary uses "source" / "metadata source" to
-    # disambiguate from forge-cli's existing publish-target catalog
-    # role (``providers/catalogs/`` writes to DMM / Splunk / etc.).
-    # Every tool here is READ-ONLY against external metadata APIs
-    # (Snowflake INFORMATION_SCHEMA, Unity tables.get, …) — no data
-    # values are ever fetched.
-    #
-    # MCP-specific defense: every tool's ``arguments`` MUST include
-    # ``credentials.credential_id`` — never the credential value.
-    # See ``copilot/catalog/credentials.py`` for the resolver chain.
+    # Source-catalog metadata, one tool. The five tools it replaced
+    # (list_source_adapters, list_source_tables, inspect_source_table,
+    # list_source_lineage, list_source_glossary) shared every argument, so
+    # one tool with a ``kind`` discriminator advertises the shared schema
+    # once (github/github-mcp-server consolidates its read tools behind a
+    # ``method`` argument the same way, MIT). Read-only against external
+    # metadata APIs: no data values are ever fetched. ``credentials`` takes
+    # only a ``credential_id``, never a secret (``copilot/catalog/credentials.py``).
     # ---------------------------------------------------------------
-    "list_source_adapters": ToolCapability(
-        name="list_source_adapters",
-        description=(
-            "List the metadata-source catalog adapters this server can dispatch "
-            "(snowflake, unity, bigquery, dataplex, glue, datahub, datamesh_manager). "
-            "Read-only — does not contact any external catalog."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        },
-    ),
-    "list_source_tables": ToolCapability(
-        name="list_source_tables",
-        description=(
-            "Enumerate tables in a metadata-source catalog scope "
-            "(database/schema/catalog as the catalog defines it). "
-            "Returns lightweight CatalogTable summaries; use inspect_source_table "
-            "for full per-table metadata. Requires credentials.credential_id."
-        ),
+    SOURCE_CATALOG_TOOL: ToolCapability(
+        name=SOURCE_CATALOG_TOOL,
+        description=_SOURCE_CATALOG_DESCRIPTION,
         reads_namespaces=("audit",),
         input_schema={
             "type": "object",
             "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": list(SOURCE_CATALOG_KINDS),
+                    "description": _SOURCE_KIND_DESCRIPTION,
+                },
                 "source": {
                     "type": "string",
                     "enum": _SOURCE_ENUM,
-                    "description": "Catalog adapter to dispatch against.",
+                    "description": _ADAPTER_DISPATCH_DESCRIPTION,
                 },
                 "credentials": _CREDENTIALS_PROP,
                 "scope": _SCOPE_PROP,
-                "allow_metadata_service": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": _ALLOW_METADATA_SERVICE_DESCRIPTION,
-                },
-            },
-            "required": ["source", "credentials"],
-            "additionalProperties": False,
-        },
-    ),
-    "inspect_source_table": ToolCapability(
-        name="inspect_source_table",
-        description=(
-            "Return full metadata for one fully-qualified table in a "
-            "metadata-source catalog (columns, descriptions, owner, tags, "
-            "primary key, foreign keys). Requires credentials.credential_id."
-        ),
-        reads_namespaces=("audit",),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "source": {"type": "string", "enum": _SOURCE_ENUM},
-                "credentials": _CREDENTIALS_PROP,
                 "fqn": _FQN_REQ,
                 "allow_metadata_service": {
                     "type": "boolean",
                     "default": False,
                     "description": _ALLOW_METADATA_SERVICE_DESCRIPTION,
                 },
-            },
-            "required": ["source", "credentials", "fqn"],
-            "additionalProperties": False,
-        },
-    ),
-    "list_source_lineage": ToolCapability(
-        name="list_source_lineage",
-        description=(
-            "Return upstream + downstream lineage chains for one fully-qualified "
-            "table in a metadata-source catalog. Returns empty lists when the "
-            "catalog has no lineage data. Requires credentials.credential_id."
-        ),
-        reads_namespaces=("audit",),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "source": {"type": "string", "enum": _SOURCE_ENUM},
-                "credentials": _CREDENTIALS_PROP,
-                "fqn": _FQN_REQ,
-                "allow_metadata_service": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": _ALLOW_METADATA_SERVICE_DESCRIPTION,
+                "response_format": {
+                    "type": "string",
+                    "enum": list(RESPONSE_FORMATS),
+                    "default": "concise",
+                    "description": _RESPONSE_FORMAT_DESCRIPTION,
                 },
             },
-            "required": ["source", "credentials", "fqn"],
-            "additionalProperties": False,
-        },
-    ),
-    "list_source_glossary": ToolCapability(
-        name="list_source_glossary",
-        description=(
-            "Return business-glossary terms relevant to a metadata-source "
-            "catalog scope. Requires credentials.credential_id."
-        ),
-        reads_namespaces=("audit",),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "source": {"type": "string", "enum": _SOURCE_ENUM},
-                "credentials": _CREDENTIALS_PROP,
-                "scope": _SCOPE_PROP,
-                "allow_metadata_service": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": _ALLOW_METADATA_SERVICE_DESCRIPTION,
-                },
-            },
-            "required": ["source", "credentials"],
+            "required": ["kind"],
             "additionalProperties": False,
         },
     ),

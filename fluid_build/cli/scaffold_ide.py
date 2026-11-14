@@ -241,11 +241,7 @@ def _mcp_server_block(python_bin: str) -> Dict:
             "read_logical_model",
             "validate_contract",
             "diff_models",
-            "list_source_adapters",
-            "list_source_tables",
-            "inspect_source_table",
-            "list_source_lineage",
-            "list_source_glossary",
+            "source_catalog",
         ],
     }
 

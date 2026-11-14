@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-MCP FastMCP server: app instance and 11 async tool registrations.
+MCP FastMCP server: app instance and 7 async tool registrations.
 
 Split from ``fluid_build.cli.mcp`` (issue #11) to reduce the 2 446-line
 monolith into focused, testable modules.
@@ -46,17 +46,24 @@ from fluid_build.cli.mcp.models import (
     _CREDENTIALS_DESCRIPTION,
     _DIFF_NEW_DESCRIPTION,
     _DIFF_OLD_DESCRIPTION,
+    _FQN_DESCRIPTION,
     _PATH_LOGICAL_DESCRIPTION,
     _PATH_LOGICAL_SHORT_DESCRIPTION,
     _REGEN_CONTRACT_OUT_DESCRIPTION,
     _REGEN_ENGINE_DESCRIPTION,
+    _RESPONSE_FORMAT_DESCRIPTION,
     _SCOPE_DESCRIPTION,
+    _SOURCE_KIND_DESCRIPTION,
     _VALIDATE_CONTRACT_PATH_DESCRIPTION,
     _VALIDATE_LOGICAL_PATH_DESCRIPTION,
+    SERVER_INSTRUCTIONS,
+    SOURCE_CATALOG_TOOL,
     TOOL_CAPABILITIES,
     CredentialsArg,
     ScopeArg,
     _CatalogSourceLiteral,
+    _ResponseFormatLiteral,
+    _SourceCatalogKindLiteral,
 )
 from fluid_build.cli.mcp.policy import _policy
 
@@ -115,9 +122,10 @@ def _get_mcp_app() -> "FastMCP":
         # is the whole point of the laziness.
         globals()["Context"] = Context
 
-        app = ServerCls(name="forge-cli-mcp")
+        app = ServerCls(name="forge-cli-mcp", instructions=SERVER_INSTRUCTIONS)
         for fn, tool_kwargs in _PENDING_TOOLS:
             app.tool(**tool_kwargs)(fn)
+        _register_artifact_resource(app)
         _mcp_app = app
     return _mcp_app
 
@@ -191,14 +199,23 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
         allow_inline_credentials=_policy().allow_inline_credentials,
         allow_metadata_service=_policy().allow_metadata_service,
     )
+    hint = _offload_hint(name, arguments)
+
+    def call_and_offload() -> Any:
+        # A large result is serialized here too, so over HTTP that work runs
+        # on the worker thread with the tool, never on the event loop.
+        from fluid_build.cli.mcp import artifacts
+
+        return artifacts.offload_if_large(call(), tool=name, hint=hint)
+
     try:
         if _TOOLS_OFF_LOOP:
             # As asyncio.to_thread does: the call keeps this request's context.
             context = contextvars.copy_context()
             return await asyncio.get_running_loop().run_in_executor(
-                _tool_executor(), functools.partial(context.run, call)
+                _tool_executor(), functools.partial(context.run, call_and_offload)
             )
-        return call()
+        return call_and_offload()
     except McpToolRefusal as exc:
         # Surface the refusal (which names the server flag to set) as the
         # SDK's ToolError; SDK 2.x would mask a bare RuntimeError.
@@ -207,8 +224,42 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
         raise get_tool_error()(str(exc)) from exc
 
 
+def _offload_hint(name: str, arguments: Dict[str, Any]) -> str:
+    """What would make this call's result smaller, for an offloaded result's
+    envelope; empty when nothing would."""
+    if name != SOURCE_CATALOG_TOOL:
+        return ""
+    ways = []
+    if arguments.get("kind") == "tables" and not (arguments.get("scope") or {}).get("tables"):
+        ways.append("name the tables you need in scope.tables")
+    if arguments.get("response_format") == "detailed":
+        ways.append("ask for response_format=concise")
+    return f"For less, {' or '.join(ways)}." if ways else ""
+
+
+def _register_artifact_resource(app: Any) -> None:
+    """Serve offloaded tool results (``fluid://artifacts/<id>``) through
+    ``resources/read``; :mod:`fluid_build.cli.mcp.artifacts` keeps them."""
+    from fluid_build.cli.mcp import artifacts
+
+    @app.resource(
+        artifacts.URI_TEMPLATE,
+        name="tool_result",
+        description="A tool result too large to send inline, as JSON.",
+        mime_type="application/json",
+    )
+    def tool_result(artifact_id: str) -> str:
+        try:
+            return artifacts.read(artifact_id)
+        except LookupError as exc:
+            # As a ResourceError the message reaches an SDK 2.x client.
+            from fluid_build._mcp_compat import get_resource_error
+
+            raise get_resource_error()(str(exc)) from exc
+
+
 # ----------------------------------------------------------------------
-# Tool registrations (11 tools, one @_forge_tool() per capability in
+# Tool registrations (7 tools, one @_forge_tool() per capability in
 # TOOL_CAPABILITIES). Each is a thin async wrapper that gates on policy and
 # delegates the actual work to :func:`_call_tool`.
 #
@@ -309,114 +360,36 @@ async def diff_models(
     return await _dispatch_sync_tool("diff_models", {"old": old, "new": new})
 
 
-@_forge_tool(description=TOOL_CAPABILITIES["list_source_adapters"].description)
-async def list_source_adapters() -> Dict[str, Any]:
-    """List the metadata-source catalog adapters this server can dispatch."""
-    return await _dispatch_sync_tool("list_source_adapters", {})
-
-
-@_forge_tool(description=TOOL_CAPABILITIES["list_source_tables"].description)
-async def list_source_tables(
+@_forge_tool(description=TOOL_CAPABILITIES[SOURCE_CATALOG_TOOL].description)
+async def source_catalog(
+    kind: Annotated[_SourceCatalogKindLiteral, Field(description=_SOURCE_KIND_DESCRIPTION)],
     source: Annotated[
-        _CatalogSourceLiteral,
+        Optional[_CatalogSourceLiteral],
         Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
-    ],
-    credentials: Annotated[CredentialsArg, Field(description=_CREDENTIALS_DESCRIPTION)],
-    scope: Annotated[ScopeArg, Field(description=_SCOPE_DESCRIPTION)],
+    ] = None,
+    credentials: Annotated[
+        Optional[CredentialsArg], Field(description=_CREDENTIALS_DESCRIPTION)
+    ] = None,
+    scope: Annotated[Optional[ScopeArg], Field(description=_SCOPE_DESCRIPTION)] = None,
+    fqn: Annotated[Optional[str], Field(description=_FQN_DESCRIPTION)] = None,
     allow_metadata_service: Annotated[
         bool, Field(description=_ALLOW_METADATA_SERVICE_DESCRIPTION)
     ] = False,
+    response_format: Annotated[
+        _ResponseFormatLiteral, Field(description=_RESPONSE_FORMAT_DESCRIPTION)
+    ] = "concise",
 ) -> Dict[str, Any]:
-    """Enumerate tables in a metadata-source catalog scope."""
+    """Read source-catalog metadata; ``kind`` picks what."""
     return await _dispatch_sync_tool(
-        "list_source_tables",
+        SOURCE_CATALOG_TOOL,
         {
+            "kind": kind,
             "source": source,
-            "credentials": _dump_envelope(credentials),
-            "scope": _dump_envelope(scope),
-            "allow_metadata_service": allow_metadata_service,
-        },
-    )
-
-
-@_forge_tool(description=TOOL_CAPABILITIES["inspect_source_table"].description)
-async def inspect_source_table(
-    source: Annotated[
-        _CatalogSourceLiteral,
-        Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
-    ],
-    credentials: Annotated[CredentialsArg, Field(description=_CREDENTIALS_DESCRIPTION)],
-    fqn: Annotated[
-        str,
-        Field(
-            description="Fully-qualified table name (DB.SCHEMA.TABLE for Snowflake, project.dataset.table for BigQuery, etc.)."
-        ),
-    ],
-    allow_metadata_service: Annotated[
-        Optional[bool], Field(description=_ALLOW_METADATA_SERVICE_DESCRIPTION)
-    ] = None,
-) -> Dict[str, Any]:
-    """Return full metadata for one fully-qualified table in a metadata-source catalog."""
-    return await _dispatch_sync_tool(
-        "inspect_source_table",
-        {
-            "source": source,
-            "credentials": _dump_envelope(credentials),
-            "fqn": fqn,
-            "allow_metadata_service": allow_metadata_service,
-        },
-    )
-
-
-@_forge_tool(description=TOOL_CAPABILITIES["list_source_lineage"].description)
-async def list_source_lineage(
-    source: Annotated[
-        _CatalogSourceLiteral,
-        Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
-    ],
-    credentials: Annotated[CredentialsArg, Field(description=_CREDENTIALS_DESCRIPTION)],
-    fqn: Annotated[
-        str,
-        Field(
-            description="Fully-qualified table name (DB.SCHEMA.TABLE for Snowflake, project.dataset.table for BigQuery, etc.)."
-        ),
-    ],
-    allow_metadata_service: Annotated[
-        Optional[bool], Field(description=_ALLOW_METADATA_SERVICE_DESCRIPTION)
-    ] = None,
-) -> Dict[str, Any]:
-    """Return upstream + downstream lineage chains for one fully-qualified table."""
-    return await _dispatch_sync_tool(
-        "list_source_lineage",
-        {
-            "source": source,
-            "credentials": _dump_envelope(credentials),
-            "fqn": fqn,
-            "allow_metadata_service": allow_metadata_service,
-        },
-    )
-
-
-@_forge_tool(description=TOOL_CAPABILITIES["list_source_glossary"].description)
-async def list_source_glossary(
-    source: Annotated[
-        _CatalogSourceLiteral,
-        Field(description=_ADAPTER_DISPATCH_DESCRIPTION),
-    ],
-    credentials: Annotated[CredentialsArg, Field(description=_CREDENTIALS_DESCRIPTION)],
-    scope: Annotated[Optional[ScopeArg], Field(description=_SCOPE_DESCRIPTION)] = None,
-    allow_metadata_service: Annotated[
-        Optional[bool], Field(description=_ALLOW_METADATA_SERVICE_DESCRIPTION)
-    ] = None,
-) -> Dict[str, Any]:
-    """Return business-glossary terms relevant to a metadata-source catalog scope."""
-    return await _dispatch_sync_tool(
-        "list_source_glossary",
-        {
-            "source": source,
-            "credentials": _dump_envelope(credentials),
+            "credentials": _dump_envelope(credentials) if credentials else None,
             "scope": _dump_envelope(scope) if scope else None,
+            "fqn": fqn,
             "allow_metadata_service": allow_metadata_service,
+            "response_format": response_format,
         },
     )
 
@@ -429,8 +402,11 @@ def _dump_envelope(env: Optional[BaseModel]) -> Dict[str, Any]:
     ``_call_tool`` dispatch still speak plain dicts, so we round-trip here.
     ``by_alias=True`` preserves the wire-shape (``schema`` not
     ``schema_name``) so the existing ``_scope_from_args`` flat-fallback
-    keeps working.
+    keeps working. ``exclude_none=True`` leaves out what the client did not
+    send: a scope dumped with ``"tables": None`` fails ``CatalogScope``
+    (``tables`` is a list), so every listing with a scope that named no
+    tables, the usual case, failed through the SDK.
     """
     if env is None:
         return {}
-    return env.model_dump(mode="json", by_alias=True, exclude_none=False)
+    return env.model_dump(mode="json", by_alias=True, exclude_none=True)

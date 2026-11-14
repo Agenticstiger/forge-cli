@@ -159,11 +159,11 @@ def test_serve_over_http_lists_and_calls_tools(tmp_path: Path) -> None:
                 url, headers={"Authorization": f"Bearer {TOKEN}"}
             ) as session:
                 names = {tool.name for tool in (await session.list_tools()).tools}
-                adapters = await session.call_tool("list_source_adapters", {})
+                adapters = await session.call_tool("source_catalog", {"kind": "adapters"})
                 return names, json.loads(adapters.content[0].text)
 
         names, adapters = asyncio.run(_round_trip())
-        assert {"validate_contract", "list_source_adapters", "diff_models"} <= names
+        assert {"validate_contract", "source_catalog", "diff_models"} <= names
         # --read-only prunes the mutating tools over HTTP exactly as over stdio.
         assert not {"update_entity", "add_relationship", "regenerate_physical"} & names
         assert any(entry.get("name") == "snowflake" for entry in adapters["adapters"])
@@ -207,7 +207,9 @@ def test_over_http_a_slow_tool_leaves_the_event_loop_free(monkeypatch: pytest.Mo
     monkeypatch.setattr(server_mod, "_TOOLS_OFF_LOOP", True)
 
     async def _scenario():
-        call = asyncio.create_task(server_mod._dispatch_sync_tool("list_source_adapters", {}))
+        call = asyncio.create_task(
+            server_mod._dispatch_sync_tool("source_catalog", {"kind": "adapters"})
+        )
         # Only reachable while the tool is still blocked if the loop is free.
         assert await asyncio.wait_for(asyncio.to_thread(started.wait, 5), timeout=6)
         assert not call.done()
@@ -215,7 +217,7 @@ def test_over_http_a_slow_tool_leaves_the_event_loop_free(monkeypatch: pytest.Mo
         return await asyncio.wait_for(call, timeout=5), threading.get_ident()
 
     result, loop_thread = asyncio.run(_scenario())
-    assert result == {"tool": "list_source_adapters"}
+    assert result == {"tool": "source_catalog"}
     assert threads and threads[0] != loop_thread
 
 
@@ -229,7 +231,7 @@ def test_over_stdio_tools_still_run_on_the_loop(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(server_mod, "_TOOLS_OFF_LOOP", False)
 
     async def _scenario():
-        await server_mod._dispatch_sync_tool("list_source_adapters", {})
+        await server_mod._dispatch_sync_tool("source_catalog", {"kind": "adapters"})
         return threading.get_ident()
 
     loop_thread = asyncio.run(_scenario())
@@ -276,7 +278,7 @@ def test_a_cancelled_call_keeps_its_turn_until_its_thread_finishes(
             active[0] += 1
             peak[0] = max(peak[0], active[0])
         try:
-            if name == "list_source_adapters":
+            if name == "source_catalog":
                 first_started.set()
                 release_first.wait(timeout=10)
             return {"tool": name}
@@ -289,7 +291,9 @@ def test_a_cancelled_call_keeps_its_turn_until_its_thread_finishes(
     monkeypatch.setattr(server_mod, "_TOOLS_OFF_LOOP", True)
 
     async def _scenario():
-        first = asyncio.create_task(server_mod._dispatch_sync_tool("list_source_adapters", {}))
+        first = asyncio.create_task(
+            server_mod._dispatch_sync_tool("source_catalog", {"kind": "adapters"})
+        )
         assert await asyncio.wait_for(asyncio.to_thread(first_started.wait, 5), timeout=6)
         first.cancel()
         (outcome,) = await asyncio.gather(first, return_exceptions=True)
@@ -315,7 +319,7 @@ def test_a_cancelled_call_that_has_not_started_never_runs(monkeypatch: pytest.Mo
 
     def _call_tool(name, arguments, **_):
         ran.append(name)
-        if name == "list_source_adapters":
+        if name == "source_catalog":
             started.set()
             release.wait(timeout=10)
         return {"tool": name}
@@ -325,7 +329,9 @@ def test_a_cancelled_call_that_has_not_started_never_runs(monkeypatch: pytest.Mo
     monkeypatch.setattr(server_mod, "_TOOLS_OFF_LOOP", True)
 
     async def _scenario():
-        first = asyncio.create_task(server_mod._dispatch_sync_tool("list_source_adapters", {}))
+        first = asyncio.create_task(
+            server_mod._dispatch_sync_tool("source_catalog", {"kind": "adapters"})
+        )
         assert await asyncio.wait_for(asyncio.to_thread(started.wait, 5), timeout=6)
         second = asyncio.create_task(server_mod._dispatch_sync_tool("validate_contract", {}))
         await asyncio.sleep(0.1)
@@ -338,7 +344,7 @@ def test_a_cancelled_call_that_has_not_started_never_runs(monkeypatch: pytest.Mo
         return await asyncio.wait_for(server_mod._dispatch_sync_tool("diff_models", {}), timeout=5)
 
     assert asyncio.run(_scenario()) == {"tool": "diff_models"}
-    assert ran == ["list_source_adapters", "diff_models"]
+    assert ran == ["source_catalog", "diff_models"]
 
 
 def test_calls_waiting_their_turn_hold_no_shared_worker_thread(
@@ -352,10 +358,14 @@ def test_calls_waiting_their_turn_hold_no_shared_worker_thread(
     monkeypatch.setattr(server_mod, "_TOOLS_OFF_LOOP", True)
 
     async def _scenario():
-        first = asyncio.create_task(server_mod._dispatch_sync_tool("list_source_adapters", {}))
+        first = asyncio.create_task(
+            server_mod._dispatch_sync_tool("source_catalog", {"kind": "adapters"})
+        )
         assert await asyncio.wait_for(asyncio.to_thread(started.wait, 5), timeout=6)
         queued = [
-            asyncio.create_task(server_mod._dispatch_sync_tool("list_source_adapters", {}))
+            asyncio.create_task(
+                server_mod._dispatch_sync_tool("source_catalog", {"kind": "adapters"})
+            )
             for _ in range(48)
         ]
         await asyncio.sleep(0.1)

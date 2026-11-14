@@ -770,7 +770,7 @@ _PLAN_BY_PRODUCT_TYPE: Dict[str, List[Dict[str, Any]]] = {
             "step": "Define acquisition[]",
             "description": "How data is acquired from the source system",
             "fields": ["acquisition[].source", "acquisition[].mode"],
-            "mcp_tools": ["list_source_adapters", "list_source_tables", "inspect_source_table"],
+            "mcp_tools": ["source_catalog"],
         },
         {
             "step": "Define models[].entities[]",
@@ -781,7 +781,7 @@ _PLAN_BY_PRODUCT_TYPE: Dict[str, List[Dict[str, Any]]] = {
                 "models[].entities[].fields[]",
                 "models[].entities[].primaryKey",
             ],
-            "mcp_tools": ["inspect_source_table", "list_source_lineage"],
+            "mcp_tools": ["source_catalog"],
         },
         {
             "step": "Add quality[]",
@@ -795,13 +795,13 @@ _PLAN_BY_PRODUCT_TYPE: Dict[str, List[Dict[str, Any]]] = {
             "step": "Define consumes[]",
             "description": "Upstream SDP/ADP products this aggregate is built from",
             "fields": ["consumes[].productId", "consumes[].version"],
-            "mcp_tools": ["list_source_lineage"],
+            "mcp_tools": ["source_catalog"],
         },
         {
             "step": "Define models[].entities[] for the aggregate",
             "description": "Aggregate-level entities (joined/grouped)",
             "fields": ["models[].entities[].name", "models[].entities[].fields[]"],
-            "mcp_tools": ["inspect_source_table", "read_logical_model"],
+            "mcp_tools": ["source_catalog", "read_logical_model"],
         },
         {
             "step": "Define transformations[]",
@@ -821,7 +821,7 @@ _PLAN_BY_PRODUCT_TYPE: Dict[str, List[Dict[str, Any]]] = {
             "step": "Define consumes[]",
             "description": "Upstream products feeding this consumer-aligned product",
             "fields": ["consumes[].productId", "consumes[].version"],
-            "mcp_tools": ["list_source_lineage"],
+            "mcp_tools": ["source_catalog"],
         },
         {
             "step": "Define models[].entities[] for the consumer view",

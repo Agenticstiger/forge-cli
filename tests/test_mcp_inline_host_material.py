@@ -41,12 +41,8 @@ from tests._infrastructure.http_auth_logger import HttpAuthLogger
 _ENV = "FLUID_ALLOW_METADATA_SERVICE"
 _REFUSED = "refused inline"
 
-_CATALOG_TOOLS = (
-    "list_source_tables",
-    "inspect_source_table",
-    "list_source_lineage",
-    "list_source_glossary",
-)
+# The kinds of ``source_catalog`` that read a catalog (``adapters`` reads nothing).
+_CATALOG_KINDS = ("tables", "table", "lineage", "glossary")
 
 # Test values only: none of these is a credential anywhere.
 _CALLER_TOKEN = "caller-test-token"  # pragma: allowlist secret
@@ -159,7 +155,13 @@ _SCOPE = {"database": "analytics", "schema_name": "sales", "catalog": "main", "t
 
 
 def _args(source: str, inline: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
-    return {"source": source, "credentials": {"inline": inline}, "scope": dict(_SCOPE), **extra}
+    return {
+        "kind": "tables",
+        "source": source,
+        "credentials": {"inline": inline},
+        "scope": dict(_SCOPE),
+        **extra,
+    }
 
 
 def _bigquery(path: str) -> Dict[str, Any]:
@@ -271,7 +273,7 @@ class TestInlinePathIsRefused:
         with watch_opens(*host.files) as opened:
             with pytest.raises(McpToolRefusal) as exc:
                 _call_tool(
-                    "list_source_tables",
+                    "source_catalog",
                     _args(spec.source, spec.build(host)),
                     read_only=True,
                     allow_inline_credentials=True,
@@ -285,20 +287,22 @@ class TestInlinePathIsRefused:
         with watch_opens(*host.files) as opened:
             with pytest.raises(McpToolRefusal):
                 _call_tool(
-                    "list_source_tables",
+                    "source_catalog",
                     _args(spec.source, spec.build(host), allow_metadata_service=True),
                     read_only=True,
                     allow_inline_credentials=True,
                 )
         assert opened == []
 
-    @pytest.mark.parametrize("tool", _CATALOG_TOOLS)
-    def test_every_catalog_tool(self, host, tool):
+    @pytest.mark.parametrize("kind", _CATALOG_KINDS)
+    def test_every_catalog_kind(self, host, kind):
         args = _args("bigquery", _bigquery(str(host.mounted_key)))
-        args.update(fqn="proj.sales.orders", output_path=str(host.home / "out.fluid.yaml"))
+        args.update(
+            kind=kind, fqn="proj.sales.orders", output_path=str(host.home / "out.fluid.yaml")
+        )
         with watch_opens(*host.files) as opened:
             with pytest.raises(McpToolRefusal):
-                _call_tool(tool, args, read_only=False, allow_inline_credentials=True)
+                _call_tool("source_catalog", args, read_only=False, allow_inline_credentials=True)
         assert opened == []
 
     @pytest.mark.parametrize("source", ["bigquery", "dataplex"])
@@ -361,7 +365,7 @@ class TestOperatorOptInKeepsTodaysBehaviour:
         with watch_opens(*host.files) as opened:
             with pytest.raises(Exception):
                 _call_tool(
-                    "list_source_tables",
+                    "source_catalog",
                     _args(spec.source, spec.build(host)),
                     read_only=True,
                     allow_inline_credentials=True,
@@ -376,7 +380,7 @@ class TestOperatorOptInKeepsTodaysBehaviour:
         with watch_opens(*host.files) as opened:
             with pytest.raises(Exception):
                 _call_tool(
-                    "list_source_tables",
+                    "source_catalog",
                     _args("unity", block),
                     read_only=True,
                     allow_inline_credentials=True,
@@ -431,8 +435,9 @@ class TestValueMaterialAndSavedSources:
         with watch_opens(*host.files) as opened:
             with pytest.raises(Exception):
                 _call_tool(
-                    "list_source_tables",
+                    "source_catalog",
                     {
+                        "kind": "tables",
                         "source": "bigquery",
                         "credentials": {"credential_id": "bq-saved"},
                         "scope": _SCOPE,
@@ -482,7 +487,7 @@ class TestHostNetrcLogin:
         _write_netrc(path, "127.0.0.1")
         with pytest.raises(McpToolRefusal) as exc:
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _args(source, block(endpoint.url)),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -496,7 +501,7 @@ class TestHostNetrcLogin:
         _write_netrc(host.home / ".netrc", "localhost")
         with pytest.raises(McpToolRefusal):
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _args("unity", _unity_pat(redirecting_endpoint.url)),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -508,7 +513,7 @@ class TestHostNetrcLogin:
         _needs("datahub")
         with pytest.raises(Exception):
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _args("datahub", _datahub(endpoint.url)),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -523,7 +528,7 @@ class TestHostNetrcLogin:
         _write_netrc(host.home / ".netrc", "127.0.0.1")
         with pytest.raises(Exception):
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _args("datahub", _datahub(endpoint.url)),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -537,7 +542,7 @@ class TestHostNetrcLogin:
         _write_netrc(host.home / ".netrc", "localhost")
         try:
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _args("unity", _unity_pat(redirecting_endpoint.url)),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -587,7 +592,7 @@ class TestHostNetrcLogin:
         _write_netrc(host.home / ".netrc", "127.0.0.1")
         try:
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _args("unity", block(endpoint.url)),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -621,12 +626,12 @@ class TestHostNetrcLogin:
         """Its ``httpx`` client applies netrc only when asked to, so it is not refused."""
         _write_netrc(host.home / ".netrc", "127.0.0.1")
         out = _call_tool(
-            "list_source_tables",
+            "source_catalog",
             _args("datamesh_manager", {"server": endpoint.url, "api_key": _CALLER_TOKEN}),
             read_only=True,
             allow_inline_credentials=True,
         )
-        assert out == {"tables": []}
+        assert out == {"kind": "tables", "tables": []}
         assert endpoint.authorizations == [f"Bearer {_CALLER_TOKEN}"]
 
 
@@ -637,7 +642,7 @@ class TestDataHubHostConfiguration:
         monkeypatch.setenv("DATAHUB_GMS_TOKEN", "host-gms-test-token")
         with pytest.raises(McpToolRefusal) as exc:
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _args("datahub", _datahub("__from_env__")),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -658,7 +663,7 @@ class TestDataHubHostConfiguration:
         monkeypatch.setenv("DATAHUB_SYSTEM_CLIENT_SECRET", _SYSTEM_VALUE)
         with pytest.raises(McpToolRefusal) as exc:
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _args("datahub", self._oauth_block(endpoint.url)),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -674,7 +679,7 @@ class TestDataHubHostConfiguration:
         monkeypatch.setenv("DATAHUB_SYSTEM_CLIENT_SECRET", _SYSTEM_VALUE)
         with pytest.raises(Exception):
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _args("datahub", self._oauth_block(endpoint.url)),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -688,7 +693,7 @@ class TestDataHubHostConfiguration:
         monkeypatch.setenv("DATAHUB_CLIENT_CERT_PATH", str(cert))
         with pytest.raises(McpToolRefusal) as exc:
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _args("datahub", _datahub(endpoint.url)),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -731,6 +736,7 @@ def _stdio_cases(host: FakeHost, url: str) -> Dict[str, Dict[str, Any]]:
             # Controls: neither is refused, in either session.
             "control-dmm": _args("datamesh_manager", {"server": url, "api_key": _CALLER_TOKEN}),
             "control-saved-source": {
+                "kind": "tables",
                 "source": "bigquery",
                 "credentials": {"credential_id": "bq-saved"},
                 "scope": dict(_SCOPE),
@@ -793,7 +799,7 @@ def _stdio_run(server_flags: List[str], root: Path) -> StdioRun:
                         for case, arguments in _stdio_cases(host, endpoint.url).items():
                             log.write_text("", encoding="utf-8")
                             endpoint.clear()
-                            result = await client.call_tool("list_source_tables", arguments)
+                            result = await client.call_tool("source_catalog", arguments)
                             seen[case] = (result, read_child_log(log), list(endpoint.requests))
                 return seen
 

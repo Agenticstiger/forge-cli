@@ -72,16 +72,29 @@ def _get_advertised_input_schema(tool_name: str) -> dict:
     return asyncio.run(_go())
 
 
-def test_advertised_schema_list_source_tables_carries_source_enum():
+def _non_null(prop: dict) -> dict:
+    """An optional argument is advertised as ``anyOf: [<schema>, {type: null}]``;
+    return the non-null branch, with the property's own description carried over."""
+    branches = [b for b in prop.get("anyOf", []) if b.get("type") != "null"]
+    if not branches:
+        return prop
+    assert len(branches) == 1, prop
+    merged = dict(branches[0])
+    if "description" in prop:
+        merged["description"] = prop["description"]
+    return merged
+
+
+def test_advertised_schema_source_catalog_carries_source_enum():
     """The seven curated catalog sources must surface as a JSON Schema enum
     so Claude Code / Cursor / Kiro can autocomplete the value.
 
     Before H4 this advertised ``{type: string}`` with no enum: the
-    curated ``TOOL_CAPABILITIES["list_source_tables"].input_schema``
+    curated ``TOOL_CAPABILITIES["source_catalog"].input_schema``
     never reached the wire.
     """
-    schema = _get_advertised_input_schema("list_source_tables")
-    source_prop = schema["properties"]["source"]
+    schema = _get_advertised_input_schema("source_catalog")
+    source_prop = _non_null(schema["properties"]["source"])
     assert source_prop["type"] == "string"
     assert set(source_prop["enum"]) == {
         "snowflake",
@@ -93,16 +106,16 @@ def test_advertised_schema_list_source_tables_carries_source_enum():
         "datamesh_manager",
     }
     # Description must reach the client too.
-    assert "dispatch" in source_prop["description"].lower()
+    assert "catalog to read" in source_prop["description"].lower()
 
 
-def test_advertised_schema_list_source_tables_carries_credentials_envelope():
+def test_advertised_schema_source_catalog_carries_credentials_envelope():
     """The credentials envelope must reach the client as a nested object
     schema with ``credential_id`` documented, not a bare ``{type: object}``.
     """
-    schema = _get_advertised_input_schema("list_source_tables")
+    schema = _get_advertised_input_schema("source_catalog")
     # FastMCP refs the BaseModel via $defs; resolve it.
-    cred_ref = schema["properties"]["credentials"]["$ref"]
+    cred_ref = _non_null(schema["properties"]["credentials"])["$ref"]
     cred_name = cred_ref.split("/")[-1]
     cred_def = schema["$defs"][cred_name]
     assert "credential_id" in cred_def["properties"]
@@ -113,10 +126,10 @@ def test_advertised_schema_list_source_tables_carries_credentials_envelope():
     assert "credential_id" in schema["properties"]["credentials"]["description"]
 
 
-def test_advertised_schema_list_source_tables_carries_scope_envelope():
+def test_advertised_schema_source_catalog_carries_scope_envelope():
     """The scope envelope must surface every documented field."""
-    schema = _get_advertised_input_schema("list_source_tables")
-    scope_ref = schema["properties"]["scope"]["$ref"]
+    schema = _get_advertised_input_schema("source_catalog")
+    scope_ref = _non_null(schema["properties"]["scope"])["$ref"]
     scope_name = scope_ref.split("/")[-1]
     scope_def = schema["$defs"][scope_name]
     # ``database`` + ``schema`` + ``catalog`` + ``tables`` all present.
@@ -128,41 +141,53 @@ def test_advertised_schema_list_source_tables_carries_scope_envelope():
     assert scope_def["additionalProperties"] is False
 
 
-def test_advertised_schema_inspect_source_table_carries_fqn_description():
-    """Curated FQN description must reach the client for every catalog tool
-    that takes a ``fqn`` argument."""
-    schema = _get_advertised_input_schema("inspect_source_table")
-    fqn_desc = schema["properties"]["fqn"]["description"]
+def test_advertised_schema_source_catalog_carries_fqn_description():
+    """Curated FQN description must reach the client for the ``fqn`` argument
+    that ``kind=table`` and ``kind=lineage`` take."""
+    schema = _get_advertised_input_schema("source_catalog")
+    fqn_desc = _non_null(schema["properties"]["fqn"])["description"]
     # Curated description names each catalog format. At least one must
     # survive the trip.
     assert "Snowflake" in fqn_desc or "snowflake" in fqn_desc.lower()
 
 
-def test_curated_registry_matches_advertised_schema_for_source_tools():
-    """TOOL_CAPABILITIES[*].input_schema and the FastMCP-advertised schema
-    MUST agree on the source enum for every catalog-only tool. This
-    catches drift when adapters are added to one surface but not the
-    other.
+def test_advertised_schema_source_catalog_requires_only_kind_and_lists_every_kind():
+    """Only ``kind`` is required in the static schema; the per-kind requirements
+    (source, credentials, fqn) are enforced at dispatch. The ``kind`` enum and the
+    ``response_format`` enum reach the client."""
+    schema = _get_advertised_input_schema("source_catalog")
+    assert schema["required"] == ["kind"]
+    assert set(schema["properties"]["kind"]["enum"]) == {
+        "adapters",
+        "tables",
+        "table",
+        "lineage",
+        "glossary",
+    }
+    assert set(schema["properties"]["response_format"]["enum"]) == {"concise", "detailed"}
+
+
+def test_curated_registry_matches_advertised_schema_for_source_catalog():
+    """TOOL_CAPABILITIES["source_catalog"].input_schema and the FastMCP-advertised
+    schema MUST agree on the source and kind enums and on the required list. This
+    catches drift when adapters are added to one surface but not the other.
     """
     from fluid_build.cli.mcp import TOOL_CAPABILITIES
 
-    for tool_name in (
-        "list_source_tables",
-        "inspect_source_table",
-        "list_source_lineage",
-        "list_source_glossary",
-    ):
-        curated = TOOL_CAPABILITIES[tool_name].input_schema
-        curated_enum = set(curated["properties"]["source"]["enum"])
-        advertised = _get_advertised_input_schema(tool_name)
-        advertised_enum = set(advertised["properties"]["source"]["enum"])
+    curated = TOOL_CAPABILITIES["source_catalog"].input_schema
+    advertised = _get_advertised_input_schema("source_catalog")
+    for prop in ("source", "kind"):
+        curated_enum = set(curated["properties"][prop]["enum"])
+        advertised_enum = set(_non_null(advertised["properties"][prop])["enum"])
         assert curated_enum == advertised_enum, (
-            f"Schema drift in {tool_name}: curated={curated_enum} " f"advertised={advertised_enum}"
+            f"Schema drift in source_catalog.{prop}: curated={curated_enum} "
+            f"advertised={advertised_enum}"
         )
+    assert curated["required"] == advertised["required"] == ["kind"]
 
 
-def test_list_source_adapters_reports_the_catalog_sources_only():
-    """``list_source_adapters`` lists the 7 catalogs the catalog tools read. JDBC databases
+def test_source_catalog_adapters_reports_the_catalog_sources_only():
+    """``source_catalog kind=adapters`` lists the 7 catalogs the tool reads. JDBC databases
     are not listed: no MCP tool reads them since ``forge_from_source`` was dropped."""
     from fluid_build.cli.mcp import _list_source_adapters
 

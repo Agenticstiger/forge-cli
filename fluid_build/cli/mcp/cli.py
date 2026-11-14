@@ -13,9 +13,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 
 from fluid_build.cli.mcp.models import COMMAND, DEFAULT_WRITABLE_NAMESPACES
-from fluid_build.cli.mcp.policy import _build_fastmcp_app, _build_policy_from_args, _set_policy
+from fluid_build.cli.mcp.policy import (
+    _build_fastmcp_app,
+    _build_policy_from_args,
+    _set_policy,
+    tool_name_refusal,
+)
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -44,8 +50,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         metavar="TOOL[,TOOL...]",
         help=(
             "Comma-separated allowlist of tool names. Tools outside the "
-            "list are blocked and hidden from tools/list. Default: all "
-            "tools allowed."
+            "list are blocked and hidden from tools/list. A name that is "
+            "not a tool stops the server. Default: all tools allowed."
         ),
     )
     serve.add_argument(
@@ -54,7 +60,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         metavar="TOOL[,TOOL...]",
         help=(
             "Comma-separated blocklist of tool names. Evaluated before "
-            "--allow-tools so denial wins."
+            "--allow-tools so denial wins. A name that is not a tool stops "
+            "the server."
         ),
     )
     serve.add_argument(
@@ -134,12 +141,22 @@ def run(args, logger: logging.Logger) -> int:
         return _render_mcp_guide()
     if action == "serve":
         policy = _build_policy_from_args(args)
+        refusal = tool_name_refusal(policy)
+        if refusal is not None:
+            sys.stderr.write(refusal)
+            sys.stderr.flush()
+            return 2
         # Build first: when the SDK is missing this raises, and the process must
         # not be left with a policy installed for a server that never started.
         app = _build_fastmcp_app(policy)
         if (getattr(args, "transport", None) or "stdio") == "http":
             return _serve_http(app, policy, args, logger)
         _set_policy(policy)
+        # Over stdio the client shares this machine, so an offloaded result is
+        # also written to a file it can open (fluid_build/cli/mcp/artifacts.py).
+        from fluid_build.cli.mcp import artifacts
+
+        artifacts.write_files_for_local_client()
         try:
             asyncio.run(app.run_stdio_async())
         except KeyboardInterrupt:
@@ -162,8 +179,6 @@ def _serve_http(app, policy, args, logger: logging.Logger) -> int:
     A bad value, or an unauthenticated non-loopback ``--host``, stops here with
     exit 2 before anything listens.
     """
-    import sys
-
     from fluid_build import _mcp_http
     from fluid_build._mcp_compat import lowlevel_server
     from fluid_build.cli.mcp_output_port import AUTHORING_HTTP_PORT, _http_auth_validator
@@ -222,8 +237,8 @@ def _render_mcp_guide() -> int:
             name="serve",
             description=(
                 "Run the MCP server.  Exposes the staged forge tool "
-                "surface (catalog reads, contract regeneration, semantic "
-                "memory search) over stdio for Claude Code, Cursor, "
+                "surface (source-catalog reads, contract validation, "
+                "logical-model edits) over stdio for Claude Code, Cursor, "
                 "Continue, and any MCP client that starts it, or over "
                 "Streamable HTTP (--transport http) for remote clients "
                 "and agent harnesses."

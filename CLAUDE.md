@@ -76,7 +76,7 @@ copilot's envelope prompt is refused outright (`[reasoning_extraction]` safeguar
 - **Kept on purpose:** `copilot/agents` minus the judge, `copilot/catalog`, `copilot/schemas`,
   the store's session/audit parts, `copilot/checkpoint`, `copilot/cost`. They are the
   deterministic data-model engine behind `fluid forge data-model *`, `fluid generate
-  transformation`, the MCP output port's audit trail and the 11 remaining MCP tools.
+  transformation`, the MCP output port's audit trail and the remaining MCP tools.
 - **Command Center contract** (`tests/cli/test_command_center_contract.py`): `forge data-model
   from-intent` (`--deterministic` | `--llm-provider`), `stats --json`, and the in-process
   imports `copilot.pii`, `copilot.enrichment`, `forge_datamodel.emit.validator`,

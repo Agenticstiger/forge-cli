@@ -124,6 +124,25 @@ def get_tool_error() -> type:
     return ToolError
 
 
+def get_resource_error() -> type:
+    """Return the exception class a resource template raises for a read that
+    cannot be served (an unknown or evicted id).
+
+    v2's template layer re-raises only ``ResourceError`` (and ``MCPError``)
+    as they are; any other exception becomes "Error creating resource from
+    template <uri>", without its message. v1 keeps the message either way.
+    Same module move as :func:`get_tool_error`.
+    """
+    require_sdk()
+    if is_v2():
+        from mcp.server.mcpserver.exceptions import ResourceError
+
+        return ResourceError
+    from mcp.server.fastmcp.exceptions import ResourceError  # type: ignore[no-redef]
+
+    return ResourceError
+
+
 def get_server_api() -> tuple[type, type]:
     """Return ``(ServerCls, Context)`` for the high-level decorator API.
 
