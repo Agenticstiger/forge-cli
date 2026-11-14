@@ -222,7 +222,8 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
 #: Per-tool advice an offloaded result adds on getting a smaller one.
 _OFFLOAD_HINTS = {
     SOURCE_CATALOG_TOOL: (
-        "For less, name the tables you need in scope.tables, or keep " "response_format=concise."
+        "For less, name the tables you need in scope.tables, and leave "
+        "response_format at concise, the default."
     ),
 }
 
@@ -239,7 +240,13 @@ def _register_artifact_resource(app: Any) -> None:
         mime_type="application/json",
     )
     def tool_result(artifact_id: str) -> str:
-        return artifacts.read(artifact_id)
+        try:
+            return artifacts.read(artifact_id)
+        except LookupError as exc:
+            # As a ResourceError the message reaches an SDK 2.x client.
+            from fluid_build._mcp_compat import get_resource_error
+
+            raise get_resource_error()(str(exc)) from exc
 
 
 # ----------------------------------------------------------------------
@@ -386,8 +393,11 @@ def _dump_envelope(env: Optional[BaseModel]) -> Dict[str, Any]:
     ``_call_tool`` dispatch still speak plain dicts, so we round-trip here.
     ``by_alias=True`` preserves the wire-shape (``schema`` not
     ``schema_name``) so the existing ``_scope_from_args`` flat-fallback
-    keeps working.
+    keeps working. ``exclude_none=True`` leaves out what the client did not
+    send: a scope dumped with ``"tables": None`` fails ``CatalogScope``
+    (``tables`` is a list), so every listing with a scope that named no
+    tables, the usual case, failed through the SDK.
     """
     if env is None:
         return {}
-    return env.model_dump(mode="json", by_alias=True, exclude_none=False)
+    return env.model_dump(mode="json", by_alias=True, exclude_none=True)

@@ -6,8 +6,9 @@
 Claude Code warns above 10,000 tokens of tool output and cuts at 25,000, and
 some agent harnesses spill anything above about 6,000 tokens to a file of their
 own. A ``fluid mcp serve`` result over the inline budget
-(``FLUID_MCP_INLINE_TOKEN_LIMIT``, default 6,000 estimated tokens; ``0`` sends
-everything inline) is kept here instead. The call returns a short envelope (the
+(``FLUID_MCP_INLINE_TOKEN_LIMIT``, default 6,000 tokens, estimated from the
+JSON text the call would send; ``0`` sends everything inline) is kept here
+instead. The call returns a short envelope (the
 sizes, a summary, what to do next) and an MCP ``resource_link`` to the full JSON
 (MCP spec 2025-06-18, "Resource Links"), which the server serves through
 ``resources/read``. Over stdio, where the client runs on this machine, the
@@ -16,7 +17,9 @@ read resources.
 
 The store is bounded (:data:`MAX_ARTIFACTS`, :data:`MAX_TOTAL_BYTES`) and lives
 as long as the process. Its files sit in a private temporary directory (mode
-0700, files 0600) that is removed at exit. An id is a random UUID, so a link is
+0700, files 0600) that is removed when the process exits normally; a process
+killed by a signal leaves it in the system temporary directory. An MCP client
+ends a stdio server by closing its stdin, which is a normal exit. An id is a random UUID, so a link is
 not guessable; any caller the server admits can read any link it is given,
 which grants nothing the same call would not.
 
@@ -166,7 +169,7 @@ def read(artifact_id: str) -> str:
     """The JSON kept under ``artifact_id``, for ``resources/read``."""
     text = _STORE.get(artifact_id)
     if text is None:
-        raise ValueError(
+        raise LookupError(
             f"No tool result {URI_PREFIX}{artifact_id}: the server keeps only its last "
             f"{MAX_ARTIFACTS} large results, and only until it stops. Call the tool again."
         )
@@ -180,10 +183,12 @@ def offload_if_large(result: Any, *, tool: str, hint: str = "") -> Any:
     limit = inline_token_limit()
     if limit == 0 or not isinstance(result, dict):
         return result
-    text = json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
-    tokens = estimate_tokens(text)
+    # Measured on the text the call would send: the SDK writes a dict result
+    # as JSON indented by 2. The kept copy is compact.
+    tokens = estimate_tokens(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     if tokens <= limit:
         return result
+    text = json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
     artifact_id, path = _STORE.put(text, write_file=_WRITE_FILES)
     uri = URI_PREFIX + artifact_id
     size = len(text.encode("utf-8"))

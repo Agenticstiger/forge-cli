@@ -50,8 +50,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         metavar="TOOL[,TOOL...]",
         help=(
             "Comma-separated allowlist of tool names. Tools outside the "
-            "list are blocked and hidden from tools/list. Default: all "
-            "tools allowed."
+            "list are blocked and hidden from tools/list. A name that is "
+            "not a tool stops the server. Default: all tools allowed."
         ),
     )
     serve.add_argument(
@@ -60,7 +60,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         metavar="TOOL[,TOOL...]",
         help=(
             "Comma-separated blocklist of tool names. Evaluated before "
-            "--allow-tools so denial wins."
+            "--allow-tools so denial wins. A name that is not a tool stops "
+            "the server."
         ),
     )
     serve.add_argument(

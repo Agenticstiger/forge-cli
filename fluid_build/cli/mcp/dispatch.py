@@ -377,7 +377,14 @@ _MISSING_ARGUMENT_HINTS: Dict[str, str] = {
         "fqn, the table's fully qualified name (DB.SCHEMA.TABLE on Snowflake, "
         "project.dataset.table on BigQuery)"
     ),
+    "scope": (
+        'scope, what to list (for example {"database": "DB", "schema": "SALES"}; '
+        "Unity takes catalog and schema)"
+    ),
 }
+
+#: Scope fields a direct caller may pass at the top level (``_scope_from_args``).
+_FLAT_SCOPE_KEYS = ("database", "schema", "schema_name", "catalog", "tables")
 
 #: A column's key flags. ``concise`` drops them when false, which is their
 #: default, so an absent flag reads as "not a key".
@@ -411,6 +418,9 @@ def _source_catalog(arguments: Dict[str, Any], build_adapter: Any) -> Dict[str, 
     missing = [key for key in ("source", "credentials") if not arguments.get(key)]
     if kind in ("table", "lineage") and not fqn:
         missing.append("fqn")
+    if kind == "tables" and arguments.get("scope") is None:
+        if not any(key in arguments for key in _FLAT_SCOPE_KEYS):
+            missing.append("scope")
     if missing:
         needs = "; ".join(_MISSING_ARGUMENT_HINTS[key] for key in missing)
         raise McpToolUsageError(f"source_catalog kind={kind} needs {needs}.")

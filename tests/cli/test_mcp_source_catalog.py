@@ -159,13 +159,21 @@ def test_kind_adapters_needs_nothing_else_and_builds_no_adapter(built):
 @pytest.mark.parametrize(
     "kind, arguments, needs",
     [
-        ("tables", {}, ["source", "credentials"]),
-        ("tables", {"source": "snowflake"}, ["credentials"]),
+        ("tables", {}, ["source", "credentials", "scope"]),
+        ("tables", {"source": "snowflake"}, ["credentials", "scope"]),
+        ("tables", {"source": "snowflake", "credentials": _CREDS}, ["scope"]),
         ("table", {"source": "snowflake", "credentials": _CREDS}, ["fqn"]),
         ("lineage", {"source": "snowflake", "credentials": _CREDS, "fqn": "  "}, ["fqn"]),
         ("glossary", {"credentials": _CREDS}, ["source"]),
     ],
-    ids=["tables-both", "tables-credentials", "table-fqn", "lineage-blank-fqn", "glossary-source"],
+    ids=[
+        "tables-all",
+        "tables-credentials",
+        "tables-scope",
+        "table-fqn",
+        "lineage-blank-fqn",
+        "glossary-source",
+    ],
 )
 def test_a_missing_argument_is_named_before_any_adapter_is_built(built, kind, arguments, needs):
     with pytest.raises(McpToolUsageError) as exc:
@@ -195,10 +203,17 @@ def test_an_unknown_kind_or_format_is_a_usage_error(built, arguments, fragment):
 # ---------------------------------------------------------------------------
 
 _SNOWFLAKE = {"source": "snowflake", "credentials": _CREDS}
+_SCOPE = {"scope": {"database": "DB", "schema": "SCH"}}
+
+
+def test_an_empty_scope_object_is_a_scope(built):
+    """``scope: {}`` passes, as it did for ``list_source_tables``: Data Mesh
+    Manager lists every domain on an empty scope; other adapters refuse."""
+    assert _call(kind="tables", scope={}, **_SNOWFLAKE)["kind"] == "tables"
 
 
 def test_concise_tables_are_fqn_name_and_description(built):
-    concise = _call(kind="tables", **_SNOWFLAKE)
+    concise = _call(kind="tables", **_SNOWFLAKE, **_SCOPE)
     assert concise == {
         "kind": "tables",
         "tables": [
@@ -206,7 +221,7 @@ def test_concise_tables_are_fqn_name_and_description(built):
             {"fqn": "DB.SCH.T1", "name": "T1", "description": "Table 1"},
         ],
     }
-    detailed = _call(kind="tables", response_format="detailed", **_SNOWFLAKE)
+    detailed = _call(kind="tables", response_format="detailed", **_SNOWFLAKE, **_SCOPE)
     assert detailed["tables"] == [
         t.model_dump(mode="json", by_alias=True) for t in _StubAdapter().list_tables(None)
     ]
@@ -337,8 +352,21 @@ def test_the_store_keeps_only_the_newest_results(tmp_path):
 
 
 def test_reading_an_unknown_result_says_what_to_do(store):
-    with pytest.raises(ValueError, match="Call the tool again"):
+    with pytest.raises(LookupError, match="Call the tool again"):
         artifacts.read("0" * 32)
+
+
+def test_the_budget_counts_the_indented_text_the_call_would_send(store, monkeypatch):
+    """The SDK sends a dict result as JSON indented by 2, so a result whose
+    compact form fits can still be over the budget."""
+    result = _large_result()
+    compact = artifacts.estimate_tokens(json.dumps(result, separators=(",", ":")))
+    indented = artifacts.estimate_tokens(json.dumps(result, ensure_ascii=False, indent=2))
+    assert compact < indented
+    monkeypatch.setenv(artifacts.INLINE_TOKEN_LIMIT_ENV, str(compact))
+    out = artifacts.offload_if_large(result, tool="source_catalog")
+    envelope = attr(out, "structured_content", "structuredContent")["result"]
+    assert envelope["estimated_tokens"] == indented
 
 
 def test_a_large_result_is_read_back_through_the_sdk(built, store, monkeypatch):
@@ -356,7 +384,7 @@ def test_a_large_result_is_read_back_through_the_sdk(built, store, monkeypatch):
         async with open_inmemory_session(lowlevel_server(app)) as session:
             result = await session.call_tool(
                 "source_catalog",
-                {"kind": "tables", "source": "snowflake", "credentials": _CREDS},
+                {"kind": "tables", "source": "snowflake", "credentials": _CREDS, **_SCOPE},
             )
             blocks = {block.type: block for block in result.content}
             read = await session.read_resource(blocks["resource_link"].uri)
@@ -368,6 +396,55 @@ def test_a_large_result_is_read_back_through_the_sdk(built, store, monkeypatch):
     full = json.loads(read.contents[0].text)
     assert full["kind"] == "tables"
     assert [t["fqn"] for t in full["tables"]] == ["DB.SCH.T0", "DB.SCH.T1"]
+
+
+def test_a_scope_that_names_no_tables_reaches_the_adapter_through_the_sdk(built, monkeypatch):
+    """Through the SDK the scope arrives as a ``ScopeArg``; dumped with its
+    unset fields as ``None`` it failed ``CatalogScope`` validation, so a
+    listing with an ordinary scope failed (on main too, as ``list_source_tables``)."""
+    from fluid_build._mcp_compat import lowlevel_server, open_inmemory_session
+    from fluid_build.cli.mcp import policy as policy_module
+
+    policy = _build_policy_from_args(SimpleNamespace())
+    monkeypatch.setattr(policy_module, "_current_policy", policy)
+    app = policy_module._build_fastmcp_app(policy)
+
+    async def scenario():
+        async with open_inmemory_session(lowlevel_server(app)) as session:
+            return await session.call_tool(
+                "source_catalog",
+                {"kind": "tables", "source": "snowflake", "credentials": _CREDS, **_SCOPE},
+            )
+
+    result = asyncio.run(scenario())
+    assert attr(result, "is_error", "isError") is False
+    assert [t["fqn"] for t in json.loads(result.content[0].text)["tables"]] == [
+        "DB.SCH.T0",
+        "DB.SCH.T1",
+    ]
+    assert built[0]["scope"] == {"database": "DB", "schema": "SCH"}
+
+
+def test_an_expired_result_says_why_through_the_sdk(store, monkeypatch):
+    """On SDK 2.x only a ResourceError keeps its message; any other exception
+    reaches the client as "Error creating resource from template"."""
+    from fluid_build._mcp_compat import lowlevel_server, open_inmemory_session
+    from fluid_build.cli.mcp import policy as policy_module
+
+    policy = _build_policy_from_args(SimpleNamespace())
+    monkeypatch.setattr(policy_module, "_current_policy", policy)
+    app = policy_module._build_fastmcp_app(policy)
+
+    async def scenario():
+        async with open_inmemory_session(lowlevel_server(app)) as session:
+            try:
+                await session.read_resource(artifacts.URI_PREFIX + "0" * 32)
+            except Exception as exc:  # noqa: BLE001 - the SDK's error type differs by generation
+                return str(exc)
+            return "no error"
+
+    message = asyncio.run(scenario())
+    assert "Call the tool again" in message
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +473,7 @@ def test_a_renamed_tool_in_the_deny_list_is_refused_with_its_new_name():
     refusal = tool_name_refusal(policy)
     assert "--deny-tools names no such tool: list_source_tables, nope." in refusal
     assert "  list_source_tables is now source_catalog with kind=tables." in refusal
+    assert "  --deny-tools takes source_catalog whole, with every kind it reads." in refusal
     assert "nope is" not in refusal
     assert "  Tools: " + ", ".join(sorted(TOOL_CAPABILITIES)) + "." in refusal
 
@@ -405,6 +483,7 @@ def test_a_removed_tool_in_the_allow_list_is_refused():
     refusal = tool_name_refusal(policy)
     assert "--allow-tools names no such tool: forge_run." in refusal
     assert "  forge_run was removed; no tool replaces it." in refusal
+    assert "takes source_catalog whole" not in refusal
 
 
 def test_known_tool_names_pass():
@@ -437,3 +516,113 @@ def test_fluid_mcp_serve_stops_on_an_unknown_tool_name(tmp_path):
     assert "fluid mcp serve: --deny-tools names no such tool: list_source_tables." in proc.stderr
     assert "list_source_tables is now source_catalog with kind=tables." in proc.stderr
     assert proc.stdout == ""
+
+
+# ---------------------------------------------------------------------------
+# Which transport names a file (the wiring in cli.py)
+# ---------------------------------------------------------------------------
+
+
+def _server_env(**extra):
+    env = {k: v for k, v in os.environ.items() if k != "COLUMNS"}
+    env.update({artifacts.INLINE_TOKEN_LIMIT_ENV: "20", **extra})
+    return env
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _wait_for_port(port: int, proc: subprocess.Popen, timeout: float = 60.0) -> None:
+    import socket
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(f"server exited early: {proc.stderr.read()!r}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.2)
+    raise AssertionError("server did not listen in time")
+
+
+@pytest.mark.slow
+def test_over_stdio_an_offloaded_result_also_names_a_file(tmp_path):
+    import time
+
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "fluid_build.cli", "mcp", "serve", "--read-only"],
+        env=_server_env(),
+        cwd=str(tmp_path),
+    )
+
+    async def scenario():
+        async with stdio_client(params) as streams:
+            async with ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                result = await session.call_tool("source_catalog", {"kind": "adapters"})
+                envelope = json.loads(result.content[0].text)
+                text = Path(envelope["path"]).read_text(encoding="utf-8")
+                read = await session.read_resource(envelope["resource"])
+                return envelope, text, read.contents[0].text
+
+    envelope, file_text, resource_text = asyncio.run(scenario())
+    assert envelope["offloaded"] is True
+    assert file_text == resource_text
+    directory = Path(envelope["path"]).parent
+    deadline = time.monotonic() + 15
+    while directory.exists() and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert not directory.exists(), "a server that exits normally removes its directory"
+
+
+@pytest.mark.slow
+def test_over_http_an_offloaded_result_names_no_file(tmp_path):
+    import secrets
+    import signal
+
+    from fluid_build._mcp_compat import open_streamable_http_session
+
+    token, port = secrets.token_hex(32), _free_port()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "fluid_build.cli", "mcp", "serve", "--transport", "http"]
+        + ["--port", str(port)],
+        cwd=tmp_path,
+        env=_server_env(FLUID_MCP_AUTH_TOKEN=token),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_port(port, proc)
+
+        async def scenario():
+            async with open_streamable_http_session(
+                f"http://127.0.0.1:{port}/mcp", headers={"Authorization": f"Bearer {token}"}
+            ) as session:
+                result = await session.call_tool("source_catalog", {"kind": "adapters"})
+                return json.loads(result.content[0].text)
+
+        envelope = asyncio.run(scenario())
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    assert envelope["offloaded"] is True
+    assert envelope["resource"].startswith(artifacts.URI_PREFIX)
+    assert "path" not in envelope

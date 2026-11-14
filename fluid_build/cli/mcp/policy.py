@@ -290,6 +290,8 @@ def tool_name_refusal(policy: McpPolicy) -> Optional[str]:
         for name in unknown:
             if name in RETIRED_TOOL_HINTS:
                 lines.append(f"  {name} {RETIRED_TOOL_HINTS[name]}.")
+        if any(RETIRED_TOOL_HINTS.get(name, "").startswith("is now ") for name in unknown):
+            lines.append(f"  {flag} takes source_catalog whole, with every kind it reads.")
     if not lines:
         return None
     lines.append(f"  Tools: {', '.join(sorted(TOOL_CAPABILITIES))}.")

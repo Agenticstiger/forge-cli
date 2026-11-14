@@ -72,10 +72,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Anthropic's "Writing effective tools for agents".
 - **A `fluid mcp serve` result too large to send inline comes back as a resource.** When a tool's
   result is estimated at more than `FLUID_MCP_INLINE_TOKEN_LIMIT` tokens (default 6,000, about
-  24 KB of JSON; `0` sends everything inline), the call returns a short envelope (its size, a
+  24 KB of the indented JSON text the call would send; `0` sends everything inline), the call returns a short envelope (its size, a
   summary with each list's length, what to do next) and an MCP `resource_link` to
   `fluid://artifacts/<id>`, which `resources/read` serves. Over stdio the envelope also names a
-  file holding the same JSON, in a private temporary directory (0700, files 0600) removed at exit.
+  file holding the same JSON, in a private temporary directory (0700, files 0600) removed when the
+  server exits normally; a server killed by a signal leaves it in the system temporary directory.
   The server keeps its last 32 such results, up to 64 MB, until it stops. Claude Code warns above
   10,000 tokens of tool output and cuts at 25,000, and some agent harnesses spill anything above
   about 6,000 tokens to a file of their own.
@@ -115,9 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `adapters`, `tables`, `table`, `lineage` or `glossary`; the other arguments keep their names, and
   no alias keeps the old names. Every result names its `kind`, and a `tables` result is now
   `{"kind": "tables", "tables": [...]}`, a `table` result `{"kind": "table", "table": {...}}`. A
-  call that lacks what its kind needs (`fqn` for `table` and `lineage`, `source` and `credentials`
-  for every kind but `adapters`) is refused before any credential is resolved, with the argument
-  and an example. On MCP SDK 2.x a client now reads that message, and the adapter builder's, where
+  call that lacks what its kind needs (`fqn` for `table` and `lineage`, `scope` for `tables`,
+  `source` and `credentials` for every kind but `adapters`) is refused before any credential is
+  resolved, with the argument and an example. On MCP SDK 2.x a client now reads that message, and the adapter builder's, where
   it used to get "Error executing tool". The `tools/list` schemas shrink from 3,440 to 1,892
   tokens (tiktoken o200k_base, an offline proxy for a client's tokenizer): 15,464 to 8,364 bytes.
 - **`fluid mcp serve` stops on a tool name it does not know.** An unknown name in `--allow-tools`
@@ -195,6 +196,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used.
 
 ### Fixed
+
+- **A source-catalog listing failed through an MCP client whenever its scope named no
+  tables.** `fluid mcp serve` turned the client's `scope` back into a dict with every unset field
+  as `null`, and `"tables": null` failed validation, so `list_source_tables` (now
+  `source_catalog` with `kind=tables`) and a scoped `list_source_glossary` failed for an ordinary
+  `{"database": ..., "schema": ...}` scope: on MCP SDK 2.x as "Error executing tool". Unset fields
+  are now left out.
 
 - **Every `fluid_build` module imports when it is the first one loaded.** Thirteen modules
   raised `ImportError: cannot import name ... from partially initialized module` when imported
