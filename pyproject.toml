@@ -815,8 +815,7 @@ DEP001 = [
   "openapi_spec_validator",
 ]
 # A soft import that degrades when the package is absent, so no extra declares it:
-#   opentelemetry (observability/tracing.py, cli/_ux_telemetry.py: tracing is a
-#   no-op without it).
+#   opentelemetry (observability/tracing.py: tracing is a no-op without it).
 DEP003 = ["opentelemetry"]
 # Used only on a dev path, never a hard requirement of the installed CLI:
 #   pytest: api/conformance/runner.py runs inside a pytest session and calls

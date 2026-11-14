@@ -327,18 +327,10 @@ def print_forge_performance_summary(
     if label and model:
         lines.append(f"  [bold]Provider[/bold]    {label} / {model}")
 
-    # Mode (agent-loop vs single-shot)
-    if stats.get("agent_loop_rounds"):
-        rounds = stats["agent_loop_rounds"]
-        tool_calls = stats.get("agent_loop_tool_calls", 0)
-        lines.append(
-            f"  [bold]Mode[/bold]        agent-loop ({rounds} rounds, {tool_calls} tool calls)"
-        )
-    else:
-        # Streaming
-        streaming = stats.get("streaming")
-        if streaming is not None:
-            lines.append(f"  [bold]Streaming[/bold]   {'on' if streaming else 'off'}")
+    # Streaming
+    streaming = stats.get("streaming")
+    if streaming is not None:
+        lines.append(f"  [bold]Streaming[/bold]   {'on' if streaming else 'off'}")
 
     # Discovery
     discovery_files = stats.get("discovery_files", 0)
@@ -380,9 +372,7 @@ def print_forge_performance_summary(
     gen_time = stats.get("generation_time_s", 0)
     gen_attempts = stats.get("generation_attempts", 0)
     if gen_time > 0:
-        if stats.get("agent_loop_rounds"):
-            lines.append(f"  [bold]Time[/bold]        {gen_time:.1f}s")
-        elif gen_attempts > 1:
+        if gen_attempts > 1:
             lines.append(f"  [bold]Generation[/bold]  {gen_attempts} attempts, {gen_time:.1f}s")
         else:
             lines.append(f"  [bold]Generation[/bold]  {gen_time:.1f}s")
@@ -406,7 +396,7 @@ def print_forge_performance_summary(
     tips = []
     if not stats.get("skills_loaded"):
         tips.append("Run [bold]fluid skills install <industry>[/bold] for domain-aware contracts")
-    if not stats.get("streaming") and not stats.get("agent_loop_rounds"):
+    if not stats.get("streaming"):
         tips.append("Set [bold]FLUID_LLM_STREAMING=1[/bold] to see tokens as they arrive")
 
     if tips:

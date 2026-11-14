@@ -285,8 +285,8 @@ def _lean_keyless_autopick(
     two rungs can answer: an agent ``fluid ai setup`` saved, and the keyless
     auto-pick (a non-interactive run, no configuring variable, no saved
     provider, an agent CLI on PATH, and no local Ollama: a running one is never
-    silently swapped for a cloud agent). ``allow_agents=False`` (the agent loop,
-    or a stated endpoint or model) disables both.
+    silently swapped for a cloud agent). ``allow_agents=False`` (a stated
+    endpoint or model) disables both.
     """
     if _infer_provider_from_explicit_keys(env):
         return None
@@ -318,8 +318,7 @@ def _infer_provider_from_ambient(
     2. Non-interactive runs only, and only when nothing is configured: the first
        coding-agent CLI on PATH. Interactive runs keep "offer, don't force"
        (the ``fluid ai setup`` inline offer). ``allow_agents=False`` skips this
-       rung: for the agent loop, which needs tool use, and when the operator
-       stated an endpoint or model.
+       rung when the operator stated an endpoint or model.
 
     Neither rung answers when key variables name two or more providers
     (:func:`ambiguous_keys_message`): the operator set those keys, and a

@@ -478,26 +478,14 @@ class TestLeanKeylessAutoPick:
         with pytest.raises(MissingOptionalDependency):
             preflight_llm_provider(self._args(), env)
 
-    def test_the_agent_loop_never_auto_picks_an_agent(
+    def test_the_retired_agent_loop_variable_does_not_block_the_pick(
         self, block, monkeypatch, tmp_path
     ):  # noqa: F811
         from fluid_build.llm.providers import _provider_name_from, preflight_llm_provider
 
-        env = self._lean(block, monkeypatch, tmp_path)
-        with pytest.raises(MissingOptionalDependency) as info:
-            preflight_llm_provider(self._args(agent_loop=True), env)
-        assert "--template starter" in str(info.value)
-        assert _provider_name_from(self._args(agent_loop=True), env) != "claude-code"
-
-    def test_the_agent_loop_env_route_never_auto_picks_an_agent(
-        self, block, monkeypatch, tmp_path
-    ):  # noqa: F811
-        from fluid_build.llm.providers import preflight_llm_provider
-
         env = {**self._lean(block, monkeypatch, tmp_path), "FLUID_COPILOT_AGENT_LOOP": "1"}
-        with pytest.raises(MissingOptionalDependency) as info:
-            preflight_llm_provider(self._args(), env)
-        assert "--template starter" in str(info.value)
+        preflight_llm_provider(self._args(), env)
+        assert _provider_name_from(self._args(), env) == "claude-code"
 
 
 def test_agent_search_uses_only_the_given_environment(monkeypatch, tmp_path):

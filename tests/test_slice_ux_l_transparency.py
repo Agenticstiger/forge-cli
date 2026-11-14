@@ -53,26 +53,6 @@ class TestPerformanceSummaryPanel:
         assert "skipped" in output
         assert "15.1s" in output
 
-    def test_agent_loop_panel(self):
-        console, buf = _make_console()
-        stats = {
-            "provider": "openai",
-            "model": "gpt-4o",
-            "streaming": True,
-            "agent_loop_rounds": 5,
-            "agent_loop_tool_calls": 7,
-            "discovery_files": 42,
-            "discovery_cache_hit": False,
-            "skills_loaded": False,
-            "generation_time_s": 19.3,
-        }
-        print_forge_performance_summary(console, stats)
-        output = buf.getvalue()
-        assert "agent-loop" in output
-        assert "5 rounds" in output
-        assert "7 tool calls" in output
-        assert "not installed" in output
-
     def test_retry_panel(self):
         console, buf = _make_console()
         stats = {

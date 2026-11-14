@@ -249,9 +249,9 @@ class PreviewPanel:
     def persist_artifacts(self) -> None:
         """Write every artifact under ``.fluid/agents/<run-id>/``.
 
-        Always writes; safe to call multiple times. Per-iteration callers
-        should invoke this on every agent loop tick so Ctrl-C anywhere
-        leaves a recoverable record on disk (invariant **I1**).
+        Always writes; safe to call multiple times. Callers should invoke it
+        at each step of a run so Ctrl-C anywhere leaves a recoverable record
+        on disk (invariant **I1**).
 
         Uses ``default=str`` for cost.json/transcript.json so unexpected
         non-JSON types (e.g. MagicMock objects from mocked-provider test

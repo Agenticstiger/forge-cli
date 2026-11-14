@@ -1889,7 +1889,6 @@ def _phase7_llm_providers(workspace: Path) -> PhaseResult:
         fluid_dir.mkdir(parents=True, exist_ok=True)
         run_env = {
             "FLUID_STORE_BACKEND": "null",
-            "FLUID_COPILOT_SEMANTIC_MEMORY": "0",
             "FLUID_LLM_TIMEOUT_SECONDS": str(llm_timeout),
             "FLUID_QUIET": "1",
             "FLUID_NONINTERACTIVE": "1",
