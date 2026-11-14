@@ -1624,12 +1624,24 @@ def test_the_codex_config_is_toml_with_the_isolation_the_claude_arms_have(
     assert str(run_dir.resolve() / "codex-home") in denied
     assert any(k.endswith("codex-home/*") for k in denied), "every sibling run's API key too"
     assert str(root / "fluid_build" / "agent_skills") in denied, "no-skill must not find skills"
-    for temp in ("/tmp", "/var/tmp"):  # other sessions' scratch files and runs live there
-        assert str(Path(temp).resolve() / "**") in denied, temp
+
+
+def _temp_denies(run_dir: Path) -> set:
+    tomllib = pytest.importorskip("tomllib")
+    doc = tomllib.loads(harness._codex_config(run_dir, []))
+    files = doc["permissions"][harness.CODEX_PROFILE]["filesystem"]
+    return {k for k, v in files.items() if v == "deny" and k.endswith("/**")}
+
+
+def test_the_shared_temp_dirs_are_denied_unless_they_hold_the_run() -> None:
+    """Other sessions' scratch files, checkout copies and a concurrent harness's runs live
+    in /tmp and /var/tmp. A run inside one keeps that one (macOS puts mkdtemp under
+    /var/folders, Linux under /tmp); the README says to keep TMPDIR out of /tmp."""
+    tmp, var_tmp = (str(Path(p).resolve() / "**") for p in ("/tmp", "/var/tmp"))
+    elsewhere = Path("/srv/evals/w/s/codex-skill/run-1")
+    assert _temp_denies(elsewhere) == {tmp, var_tmp}
     under_tmp = Path("/tmp").resolve() / "w" / "s" / "codex-skill" / "run-1"
-    files = tomllib.loads(harness._codex_config(under_tmp, readable))["permissions"]
-    denied = {k for k, v in files[harness.CODEX_PROFILE]["filesystem"].items() if v == "deny"}
-    assert str(Path("/tmp").resolve() / "**") not in denied, "the run's own temp root stays"
+    assert _temp_denies(under_tmp) == {var_tmp}, "the run's own temp root stays"
 
 
 def test_a_codex_arm_imports_fluid_from_a_directory_holding_only_the_package(
