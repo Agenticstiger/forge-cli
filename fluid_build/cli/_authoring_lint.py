@@ -342,7 +342,9 @@ _CODE_KEYS = frozenset(
 
 def _placeholder(value: str, parts: Path) -> Optional[str]:
     if _key(parts) in _CODE_KEYS:
-        value = _SQL_LITERAL.sub("''", value)  # a literal is data; a comment's TODO is not
+        # A literal is data ('TODO' as a status); a comment's TODO is not. Comments are
+        # matched first, so an apostrophe in one ("-- it's a TODO") opens no literal.
+        value = _SQL_NOISE.sub(lambda m: m.group(0) if m.group(0)[:1] in "-/" else "''", value)
     marker = _MARKER.search(value) or _FILL_IN.search(value)
     if marker:
         return marker.group(0)

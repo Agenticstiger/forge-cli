@@ -120,7 +120,9 @@ def _message_pointer(message: str, document: Any, default: str) -> str:
     # ``[orders]`` is an expose named in brackets, as the sovereignty check writes it.
     text = re.sub(r"^[^\w\[]+", "", message)
     if text.startswith("["):
-        text = "exposes" + text
+        bracketed = _resolve(document, _LEADING_PATH.match("exposes" + text).group("path"))
+        if len(bracketed) >= 2:  # "[orders]" named an expose; "[WARN]" names nothing
+            return json_pointer(bracketed)
     located = _LOCATED.match(text)
     if located:
         text = located.group("path")

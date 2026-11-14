@@ -170,8 +170,8 @@ def drive(jobs_file, results_file):
     except ImportError:
         pass
     else:
-        lint.lint_contract = lambda contract: []
-        issues.build_issues = lambda result: []
+        lint.lint_contract = lambda *args, **kwargs: []
+        issues.build_issues = lambda *args, **kwargs: []
 
     jobs = json.load(open(jobs_file))
     results = {"fluid_build_file": fluid_build.__file__, "jobs": {}}

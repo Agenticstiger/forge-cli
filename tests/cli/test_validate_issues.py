@@ -690,6 +690,16 @@ def test_a_todo_value_in_sql_is_data_but_a_todo_comment_is_not() -> None:
     assert _lint(_contract(builds=[{"properties": {"sql": comment}}]), "contract_placeholder_value")
 
 
+def test_an_apostrophe_in_a_sql_comment_does_not_hide_its_todo() -> None:
+    sql = "SELECT * FROM t -- it's a TODO"
+
+    assert _lint(_contract(builds=[{"properties": {"sql": sql}}]), "contract_placeholder_value")
+
+
+def test_a_bracket_that_names_no_expose_keeps_the_default() -> None:
+    assert message_pointer("[WARN] something", BASE, default="/sovereignty") == "/sovereignty"
+
+
 def test_a_backslash_escape_does_not_hide_a_join() -> None:
     sql = "SELECT 'it\\'s' AS a, o.* FROM orders o JOIN customers c ON o.c = c.id"
 
