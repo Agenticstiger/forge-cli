@@ -732,3 +732,221 @@ def test_validate_runs_the_real_fluid_cli(workspace: Path) -> None:
     )
     good.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
     assert forge_ai.validate_contract(good, workspace=workspace).valid
+
+
+# ---------------------------------------------------------------------------
+# Answers, prompts and intents the first version misread
+# ---------------------------------------------------------------------------
+
+
+def test_extract_skips_a_shell_block_before_the_contract() -> None:
+    answer = f"Then run:\n```bash\nfluid validate contract.fluid.yaml\n```\n\n```yaml\n{VALID}```"
+    assert forge_ai.extract_contract_yaml(answer).strip() == VALID.strip()
+
+
+def test_extract_prefers_the_yaml_block_to_a_shell_block_naming_fluid_version() -> None:
+    answer = f"```bash\ngrep fluidVersion contract.fluid.yaml\n```\n```yaml\n{VALID}```"
+    assert forge_ai.extract_contract_yaml(answer).strip() == VALID.strip()
+
+
+@pytest.mark.parametrize(
+    "text", ["~10M events/day from Kafka, owned by data@example.com", "a\x00b"]
+)
+def test_free_text_that_looks_like_a_path_stays_the_intent(workspace: Path, text: str) -> None:
+    assert forge_ai._read_intent(text) == text
+
+
+def test_the_agent_prompt_leads_with_its_own_line(workspace: Path) -> None:
+    request = forge_ai.build_request(_args(context="/compact the orders feed"))
+    for prompt in (
+        forge_ai.agent_prompt(request, interactive=False),
+        forge_ai.interactive_argv("claude-code", "/bin/claude", _config("claude-code"), request)[1],
+    ):
+        assert prompt.splitlines()[0] == "FLUID data product request:"
+        assert "/compact the orders feed" in prompt
+
+
+def test_a_refine_prompt_carries_the_whole_contract(workspace: Path) -> None:
+    long = VALID + "".join(f"# note {i}\n" for i in range(forge_ai.UPSTREAM_MAX_CHARS // 8))
+    (workspace / "contract.fluid.yaml").write_text(long, encoding="utf-8")
+    request = forge_ai.build_request(_args(refine="contract.fluid.yaml"))
+    assert long.rstrip() in forge_ai.user_prompt(request)
+
+
+# ---------------------------------------------------------------------------
+# Records: one folder per run, a receipt on every paid exit, nothing left behind
+# ---------------------------------------------------------------------------
+
+
+def _runs(root: Path) -> List[Path]:
+    return sorted(root.glob(".fluid/agents/*"))
+
+
+def test_a_failed_one_call_keeps_its_draft_and_receipt_in_one_run_folder(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_llm(monkeypatch, [VALID] * forge_ai.MAX_ATTEMPTS)
+    monkeypatch.setattr(
+        forge_ai,
+        "validate_contract",
+        lambda path, workspace: forge_ai.ValidationOutcome(False, ["owner: required"]),
+    )
+    with pytest.raises(CopilotGenerationError):
+        forge_ai.one_call(forge_ai.build_request(_args()), _config(), args=_args())
+    (run,) = _runs(workspace)
+    assert (run / "contract.draft.yaml").is_file()
+    cost = json.loads((run / "cost.json").read_text(encoding="utf-8"))
+    assert cost["provider"] == "anthropic" and cost["mode"] == "llm"
+
+
+def test_a_dry_run_into_a_new_folder_leaves_nothing_behind(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_llm(monkeypatch, [VALID])
+    monkeypatch.setattr(
+        forge_ai, "validate_contract", lambda path, workspace: forge_ai.ValidationOutcome(True)
+    )
+    args = _args(dry_run=True, target_dir="products/new")
+    assert forge_ai.one_call(forge_ai.build_request(args), _config(), args=args) == 0
+    assert not (workspace / "products").exists() and not (workspace / ".fluid").exists()
+
+
+def test_a_declined_contract_removes_its_new_folder_and_keeps_the_receipt(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_llm(monkeypatch, [VALID])
+    monkeypatch.setattr(
+        forge_ai, "validate_contract", lambda path, workspace: forge_ai.ValidationOutcome(True)
+    )
+    monkeypatch.setattr(forge_ai, "_interactive", lambda a: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    args = _args(target_dir="products/new", yes=False, non_interactive=False)
+    assert forge_ai.one_call(forge_ai.build_request(args), _config(), args=args) == 1
+    assert not (workspace / "products").exists()
+    (run,) = _runs(workspace)
+    assert (run / "cost.json").is_file()
+
+
+def test_a_kept_contract_records_its_run_in_the_product_folder(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_llm(monkeypatch, [VALID])
+    monkeypatch.setattr(
+        forge_ai, "validate_contract", lambda path, workspace: forge_ai.ValidationOutcome(True)
+    )
+    args = _args(target_dir="products/new")
+    assert forge_ai.one_call(forge_ai.build_request(args), _config(), args=args) == 0
+    product = workspace / "products" / "new"
+    assert (product / "contract.fluid.yaml").read_text(encoding="utf-8") == VALID
+    (run,) = _runs(product)
+    assert (run / "cost.json").is_file() and not _runs(workspace)
+
+
+def test_a_timed_out_agent_run_restores_the_workspace_and_keeps_a_draft(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    import fluid_build.llm.coding_agent as ca
+
+    _stub_agent(monkeypatch)
+
+    def slow(argv, *, stdin, timeout, cwd, env):
+        (Path(cwd) / "contract.fluid.yaml").write_text("fluidVersion: 0.7.6\n", encoding="utf-8")
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    monkeypatch.setattr(ca, "_run_agent", slow)
+    with pytest.raises(CopilotGenerationError) as exc:
+        forge_ai.drive_headless(
+            "claude-code", forge_ai.build_request(_args()), _config("claude-code"), args=_args()
+        )
+    assert exc.value.event == "coding_agent_timeout"
+    assert not (workspace / "contract.fluid.yaml").exists()
+    (run,) = _runs(workspace)
+    draft = run / "contract.draft.yaml"
+    assert draft.read_text(encoding="utf-8") == "fluidVersion: 0.7.6\n"
+    assert str(draft) in exc.value.message and (run / "cost.json").is_file()
+
+
+def test_a_failed_agent_run_puts_the_refined_contract_back_and_records_its_cost(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = VALID + "description: keep me\n"
+    (workspace / "contract.fluid.yaml").write_text(original, encoding="utf-8")
+    report = {"is_error": True, "result": "rate limited", "total_cost_usd": 0.05}
+    _stub_agent(monkeypatch, rc=1, stdout=json.dumps(report))  # it overwrites with VALID
+    args = _args(refine="contract.fluid.yaml")
+    with pytest.raises(CopilotGenerationError) as exc:
+        forge_ai.drive_headless(
+            "claude-code", forge_ai.build_request(args), _config("claude-code"), args=args
+        )
+    assert exc.value.event == "coding_agent_failed" and "rate limited" in exc.value.message
+    assert (workspace / "contract.fluid.yaml").read_text(encoding="utf-8") == original
+    (run,) = _runs(workspace)
+    assert (run / "contract.draft.yaml").read_text(encoding="utf-8") == VALID
+    assert json.loads((run / "cost.json").read_text(encoding="utf-8"))["total_usd"] == 0.05
+
+
+def test_a_failed_agent_run_in_a_new_folder_removes_the_folder(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fluid_build.llm.coding_agent as ca
+
+    _stub_agent(monkeypatch)
+
+    def failing(argv, *, stdin, timeout, cwd, env):
+        (Path(cwd) / "products" / "new" / "contract.fluid.yaml").write_text(VALID, encoding="utf-8")
+        return 1, "", "boom"
+
+    monkeypatch.setattr(ca, "_run_agent", failing)
+    args = _args(target_dir="products/new")
+    with pytest.raises(CopilotGenerationError):
+        forge_ai.drive_headless(
+            "claude-code", forge_ai.build_request(args), _config("claude-code"), args=args
+        )
+    assert not (workspace / "products").exists()
+    (run,) = _runs(workspace)
+    assert (run / "contract.draft.yaml").is_file() and (run / "cost.json").is_file()
+
+
+def test_an_agent_that_writes_nothing_still_gets_a_receipt(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_agent(monkeypatch, write=False, stdout=json.dumps({"total_cost_usd": 0.02}))
+    with pytest.raises(CopilotGenerationError) as exc:
+        forge_ai.drive_headless(
+            "claude-code", forge_ai.build_request(_args()), _config("claude-code"), args=_args()
+        )
+    assert exc.value.event == "forge_contract_missing"
+    (run,) = _runs(workspace)
+    assert json.loads((run / "cost.json").read_text(encoding="utf-8"))["total_usd"] == 0.02
+
+
+# ---------------------------------------------------------------------------
+# fluid init's AI path
+# ---------------------------------------------------------------------------
+
+
+def test_init_with_nobody_to_describe_the_product_scaffolds_the_template(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import logging
+    from argparse import Namespace
+
+    import fluid_build.cli.forge as forge_cli
+    from fluid_build.cli import init as init_mod
+
+    scaffolded: List[str] = []
+
+    def template_mode(args: Any, logger: Any) -> int:
+        scaffolded.append(args.template)
+        return 0
+
+    monkeypatch.setattr(init_mod, "_setup_ai_mode_llm", lambda args: "ready")
+    monkeypatch.setattr(init_mod, "template_mode", template_mode)
+    monkeypatch.setattr(forge_ai, "_interactive", lambda a: False)
+    monkeypatch.setattr(
+        forge_cli, "run_ai_copilot_mode", lambda a, l: pytest.fail("AI mode needs a description")
+    )
+    assert init_mod._ai_mode(Namespace(name="demo", yes=True), logging.getLogger("t")) == 0
+    assert scaffolded == ["customer-360"]

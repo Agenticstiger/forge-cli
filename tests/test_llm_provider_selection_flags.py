@@ -550,6 +550,8 @@ def _init_ai_mode(
         mock.patch("fluid_build.cli.ai_setup.run_ai_setup_inline", _setup),
         mock.patch("fluid_build.cli.ai_setup.set_session_env", lambda provider, key: None),
         mock.patch("fluid_build.cli.forge.run_ai_copilot_mode", _copilot),
+        # Someone at the keyboard: without one, init scaffolds the template instead.
+        mock.patch("fluid_build.cli.forge_ai._interactive", lambda args: True),
     ):
         init_mod._ai_mode(Namespace(name="demo-product", yes=True), logging.getLogger("test"))
     return seen.get("args"), setup_calls

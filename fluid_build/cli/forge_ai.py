@@ -87,7 +87,9 @@ _NON_INTERACTIVE_NOTE = (
     "reasonable assumption where the request is silent, and say so in your final message."
 )
 
-_FENCE_RE = re.compile(r"```[ \t]*(?:ya?ml)?[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
+#: A fenced block and its info string (```yaml, ```bash, ```): every fence is read as a
+#: whole, so a ```bash block before the ```yaml one cannot shift the pairing.
+_FENCE_RE = re.compile(r"```([^\n`]*)\r?\n(.*?)```", re.DOTALL)
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +107,11 @@ class AuthoringRequest:
     refine: bool = False
     upstreams: List[Path] = field(default_factory=list)
     facts: List[str] = field(default_factory=list)
+    #: Names the run's ``.fluid/agents/<run-id>/``, which holds its receipt and any draft.
+    run_id: str = field(default_factory=lambda: _new_run_id())
+    #: The folders the contract's path still needs, deepest first. A run that keeps
+    #: nothing removes those it left empty and keeps its records in the workspace.
+    new_dirs: Tuple[Path, ...] = ()
 
     @property
     def target_dir(self) -> Path:
@@ -116,6 +123,21 @@ class AuthoringRequest:
             return str(self.contract_path.relative_to(self.workspace))
         except ValueError:
             return str(self.contract_path)
+
+
+def _new_run_id() -> str:
+    from fluid_build.cli._preview_panel import new_run_id
+
+    return new_run_id()
+
+
+def _missing_dirs(folder: Path) -> Tuple[Path, ...]:
+    """``folder`` and each parent of it that does not exist yet, deepest first."""
+    missing: List[Path] = []
+    while not folder.exists() and folder != folder.parent:
+        missing.append(folder)
+        folder = folder.parent
+    return tuple(missing)
 
 
 def _arg(args: Any, name: str, default: Any = None) -> Any:
@@ -135,7 +157,9 @@ def _read_intent(value: Any) -> str:
         path = Path(text).expanduser()
         if len(text) < 4096 and path.is_file():
             return path.read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, RuntimeError, ValueError):
+        # Free text is not a path: "~10M events/day" makes expanduser raise RuntimeError
+        # (no user "10M events"), and a NUL byte makes is_file raise ValueError.
         pass
     return text.strip()
 
@@ -177,7 +201,7 @@ def _resolve_product_id(ref: str, args: Any, workspace: Path) -> Path:
         resolved = resolve_upstream_paths([ref], workspace_root=workspace, extra_search_paths=extra)
         if not resolved or not Path(resolved[0]).is_file():
             raise LookupError(ref)
-    except Exception as exc:  # noqa: BLE001 — every resolver failure has the same remedy
+    except Exception as exc:  # noqa: BLE001 - every resolver failure has the same remedy
         LOG.debug("forge_upstream_resolve_failed", exc_info=True)
         raise _error(
             "forge_upstream_not_found",
@@ -234,13 +258,15 @@ def build_request(args: Any) -> AuthoringRequest:
         value = _arg(args, attr)
         if value:
             facts.append(f"{flag} {value}")
+    contract_path = contract_path.resolve()
     return AuthoringRequest(
         intent=_read_intent(_arg(args, "context")),
         workspace=workspace,
-        contract_path=contract_path.resolve(),
+        contract_path=contract_path,
         refine=bool(refine),
         upstreams=_upstream_paths(args, workspace),
         facts=facts,
+        new_dirs=_missing_dirs(contract_path.parent),
     )
 
 
@@ -298,7 +324,7 @@ def user_prompt(request: AuthoringRequest) -> str:
             "",
             "Change this existing contract. Keep everything the request does not change:",
             "```yaml",
-            _bounded(current, UPSTREAM_MAX_CHARS).rstrip(),
+            current.rstrip(),
             "```",
         ]
     for upstream in request.upstreams:
@@ -350,7 +376,7 @@ def agent_prompt(request: AuthoringRequest, *, interactive: bool) -> str:
     path = request.shown_path()
     lines: List[str] = []
     if request.intent:
-        lines += [request.intent, ""]
+        lines += ["FLUID data product request:", "", request.intent, ""]
     elif interactive:
         lines += [
             "Help me author a FLUID data product contract. Ask me what it reads, what it "
@@ -407,12 +433,13 @@ def extract_contract_yaml(text: str) -> str:
                 return yaml.safe_dump(data["contract"], sort_keys=False)
             if "fluidVersion" in data:
                 return yaml.safe_dump(data, sort_keys=False)
-    blocks = [block.strip() for block in _FENCE_RE.findall(stripped)]
-    for block in blocks:
-        if "fluidVersion" in block:
-            return block + "\n"
-    if blocks:
-        return max(blocks, key=len) + "\n"
+    blocks = [(lang.strip().lower(), body.strip()) for lang, body in _FENCE_RE.findall(stripped)]
+    yamlish = [body for lang, body in blocks if lang in ("", "yaml", "yml")]
+    for body in [*yamlish, *(body for _, body in blocks)]:
+        if "fluidVersion" in body:
+            return body + "\n"
+    if yamlish:
+        return max(yamlish, key=len) + "\n"
     return stripped + "\n"
 
 
@@ -455,7 +482,7 @@ def _fluid_command() -> List[str]:
 
 def _run_validate(argv: List[str], *, cwd: Path) -> Tuple[int, str, str]:
     """Run ``fluid validate``. The only subprocess seam of the repair loop."""
-    proc = subprocess.run(  # noqa: S603 — list argv, no shell, the install's own CLI
+    proc = subprocess.run(  # noqa: S603 - list argv, no shell, the install's own CLI
         argv,
         cwd=str(cwd),
         capture_output=True,
@@ -498,7 +525,7 @@ def _console() -> Any:
         from rich.console import Console
 
         return Console()
-    except Exception:  # noqa: BLE001 — rich is a base dependency; never fail on it
+    except Exception:  # noqa: BLE001 - rich is a base dependency; never fail on it
         return None
 
 
@@ -589,6 +616,7 @@ def one_call(request: AuthoringRequest, config: Any, *, args: Any, console: Any 
     path = request.contract_path
     original = path.read_bytes() if path.exists() else None
     keep = False
+    dry_run = bool(_arg(args, "dry_run", False))
     contract_text = ""
     errors: List[str] = []
     _say(console, f"Writing {request.shown_path()} with {config.provider} ({config.model}).")
@@ -621,7 +649,7 @@ def one_call(request: AuthoringRequest, config: Any, *, args: Any, console: Any 
                     f"fluid validate {draft} --offline",
                 ],
             )
-        if _arg(args, "dry_run", False):
+        if dry_run:
             _say(console, contract_text)
             _say(console, "Dry run: the contract is valid; nothing written.")
             return 0
@@ -629,7 +657,11 @@ def one_call(request: AuthoringRequest, config: Any, *, args: Any, console: Any 
     finally:
         if not keep:
             _restore(path, original)
-    _self._write_receipt(request, config, started, tokens=None, kept=keep)
+            _tidy(request)
+        # A dry run writes nothing. Any other run was paid for, kept or not, so
+        # fluid stats counts it.
+        if not dry_run:
+            _self._write_receipt(request, config, started, tokens=None, kept=keep)
     if not keep:
         _say(console, "Nothing written.")
         return 1
@@ -645,11 +677,29 @@ def _restore(path: Path, original: Optional[bytes]) -> None:
         path.write_bytes(original)
 
 
+def _records_root(request: AuthoringRequest, *, kept: bool) -> Path:
+    """The folder whose ``.fluid/agents/`` holds this run's records.
+
+    The product folder, unless the run made that folder and keeps nothing in it: then the
+    workspace, so a discarded run does not leave the folder behind.
+    """
+    return request.target_dir if kept or not request.new_dirs else request.workspace
+
+
+def _tidy(request: AuthoringRequest) -> None:
+    """Remove the folders a discarded run made for its contract, while they are empty."""
+    for folder in request.new_dirs:
+        try:
+            folder.rmdir()  # only an empty folder: whatever an agent left there keeps it
+        except OSError:
+            return
+
+
 def _save_draft(request: AuthoringRequest, contract_text: str) -> Path:
     """Keep a rejected answer next to the run's receipts, out of the workspace's way."""
-    from fluid_build.cli._preview_panel import new_run_id, run_dir_for
+    from fluid_build.cli._preview_panel import run_dir_for
 
-    run_dir = run_dir_for(request.target_dir, new_run_id())
+    run_dir = run_dir_for(_records_root(request, kept=False), request.run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     draft = run_dir / "contract.draft.yaml"
     draft.write_text(contract_text, encoding="utf-8")
@@ -676,7 +726,7 @@ def _confirm(
                 yaml.safe_load(contract_text),
                 console=console,
             )
-        except Exception:  # noqa: BLE001 — the diff is a courtesy, never a blocker
+        except Exception:  # noqa: BLE001 - the diff is a courtesy, never a blocker
             LOG.debug("forge_ai_refine_diff_failed", exc_info=True)
     auto_yes = bool(_arg(args, "yes", False)) or not _interactive(args)
     if auto_yes or os.environ.get("FLUID_FORGE_NO_PREVIEW"):
@@ -702,11 +752,7 @@ def _write_receipt(
 
     Written for a declined run too: its tokens were spent all the same.
     """
-    from fluid_build.cli._preview_panel import (
-        PreviewPanel,
-        capture_cost_snapshot,
-        new_run_id,
-    )
+    from fluid_build.cli._preview_panel import PreviewPanel, capture_cost_snapshot
 
     try:
         cost = capture_cost_snapshot(
@@ -718,13 +764,16 @@ def _write_receipt(
             cost.total_tokens = cost.input_tokens + cost.output_tokens
         if usd is not None:
             cost.total_usd = usd
-        panel = PreviewPanel(run_id=new_run_id(), target_dir=request.target_dir, cost=cost)
+        cost.mode = "llm"
+        panel = PreviewPanel(
+            run_id=request.run_id, target_dir=_records_root(request, kept=kept), cost=cost
+        )
         if kept and request.contract_path.exists():
             panel.add_file(
                 request.contract_path.name, request.contract_path.read_text(encoding="utf-8")
             )
         panel.persist_artifacts()
-    except Exception:  # noqa: BLE001 — a receipt must never fail the run
+    except Exception:  # noqa: BLE001 - a receipt must never fail the run
         LOG.debug("forge_ai_receipt_failed", exc_info=True)
 
 
@@ -741,7 +790,7 @@ def _agent_env(agent: str) -> Dict[str, str]:
     try:
         fluid_dir = str(Path(_fluid_command()[0]).parent)
         env["PATH"] = os.pathsep.join([fluid_dir, env.get("PATH", "")])
-    except Exception:  # noqa: BLE001 — the agent then finds fluid on PATH, or reports it
+    except Exception:  # noqa: BLE001 - the agent then finds fluid on PATH, or reports it
         LOG.debug("forge_ai_fluid_dir_unknown", exc_info=True)
     return env
 
@@ -917,6 +966,28 @@ def _snapshot(path: Path) -> Optional[bytes]:
     return path.read_bytes() if path.is_file() else None
 
 
+def _abandon(request: AuthoringRequest, original: Optional[bytes]) -> Optional[Path]:
+    """Put the workspace back after a failed agent run.
+
+    The agent's changed contract, if it left one, becomes a draft under
+    ``.fluid/agents/<run-id>/``, and the original (or no file) is restored. Returns the
+    draft path, or None when the agent changed nothing.
+    """
+    path = request.contract_path
+    draft = None
+    if path.is_file():
+        current = path.read_bytes()
+        if original is None or current != original:
+            draft = _save_draft(request, current.decode("utf-8", errors="replace"))
+    _restore(path, original)
+    _tidy(request)
+    return draft
+
+
+def _draft_note(draft: Optional[Path]) -> str:
+    return f" Its partial contract is at {draft}; the workspace is as it was." if draft else ""
+
+
 def drive_headless(
     agent: str, request: AuthoringRequest, config: Any, *, args: Any, console: Any = None
 ) -> int:
@@ -941,21 +1012,32 @@ def drive_headless(
             argv, stdin=stdin, timeout=timeout, cwd=str(request.workspace), env=_agent_env(agent)
         )
     except subprocess.TimeoutExpired as exc:
+        draft = _self._abandon(request, original)
+        _self._write_receipt(request, config, started, tokens=None, kept=False)
         raise _error(
             "coding_agent_timeout",
-            f"{agent} did not finish within {timeout}s.",
+            f"{agent} did not finish within {timeout}s.{_draft_note(draft)}",
             ["Raise the budget with FLUID_FORGE_AGENT_TIMEOUT_SECONDS."],
         ) from exc
     report = _agent_report(_ANSI_RE.sub("", stdout or ""))
-    if rc != 0 or report.get("is_error"):
-        reason = str(report.get("result") or (stderr or "").strip() or f"exit code {rc}")
-        raise _error(
-            "coding_agent_failed",
-            f"{agent} failed: {reason[-600:]}",
-            [f"Run `{Path(binary).name}` yourself to confirm it is signed in and working."],
-        )
     usage = report.get("usage") if isinstance(report.get("usage"), dict) else None
     usd = report.get("total_cost_usd")
+    if rc != 0 or report.get("is_error"):
+        reason = str(report.get("result") or (stderr or "").strip() or f"exit code {rc}")
+        draft = _self._abandon(request, original)
+        _self._write_receipt(
+            request,
+            config,
+            started,
+            tokens=usage,
+            usd=float(usd) if isinstance(usd, (int, float)) else None,
+            kept=False,
+        )
+        raise _error(
+            "coding_agent_failed",
+            f"{agent} failed: {reason[-600:]}{_draft_note(draft)}",
+            [f"Run `{Path(binary).name}` yourself to confirm it is signed in and working."],
+        )
     return _self._finish_agent_run(
         agent,
         request,
@@ -1002,16 +1084,17 @@ def _finish_agent_run(
     if not path.is_file():
         if original is not None:
             _restore(path, original)
+        _tidy(request)
+        _self._write_receipt(request, config, started, tokens=tokens, usd=usd, kept=False)
         raise _error(
             "forge_contract_missing",
             f"{agent} finished without writing {request.shown_path()}.",
             [f"Run fluid forge again, or ask {agent} to write that file."],
         )
     outcome = _self.validate_contract(path, workspace=request.workspace)
-    _self._write_receipt(request, config, started, tokens=tokens, usd=usd)
     if not outcome.valid:
-        draft = _self._save_draft(request, path.read_text(encoding="utf-8"))
-        _restore(path, original)
+        draft = _self._abandon(request, original) or path
+        _self._write_receipt(request, config, started, tokens=tokens, usd=usd, kept=False)
         kept = "The original contract is back in place. " if original is not None else ""
         raise _error(
             "forge_contract_invalid",
@@ -1021,6 +1104,7 @@ def _finish_agent_run(
                 f"Fix the draft, then run: fluid validate {draft} --offline",
             ],
         )
+    _self._write_receipt(request, config, started, tokens=tokens, usd=usd)
     _say(console, f"{request.shown_path()} passes `fluid validate`.")
     _self._scaffold_ci(request, args, console)
     return 0

@@ -482,10 +482,19 @@ def run(args, logger: logging.Logger) -> int:
         if isinstance(e, _FUE):
             raise
         error(logger, "init_failed", error=str(e))
+        # A CLIError's str() is its event slug; show its message and next actions.
+        message = getattr(e, "message", None) or str(e)
+        suggestions = [str(s) for s in (getattr(e, "suggestions", None) or [])]
         if RICH_AVAILABLE:
-            console.print(f"[red]❌ Init failed: {e}[/red]")
+            from fluid_build._console import literal_error_text
+
+            console.print(literal_error_text(f"❌ Init failed: {message}", "red"))
+            for suggestion in suggestions:
+                console.print(literal_error_text(f"  • {suggestion}"))
         else:
-            console_error(f"Init failed: {e}")
+            console_error(f"Init failed: {message}")
+            for suggestion in suggestions:
+                console_error(f"  - {suggestion}")
         return 1
 
 
@@ -879,9 +888,9 @@ def _ai_mode(args, logger: logging.Logger) -> int:
     if RICH_AVAILABLE:
         console.print(
             Panel(
-                "🤖 [bold]AI Copilot[/bold]\n\n"
-                "I'll ask about your data and goals, then generate\n"
-                "a production-ready contract tailored to your needs.",
+                "🤖 [bold]AI mode[/bold]\n\n"
+                "Your coding agent, or one LLM call, writes the contract with the\n"
+                "FLUID skills. Forge keeps it once `fluid validate` passes.",
                 title="AI-Assisted Setup",
                 border_style="blue",
             )
@@ -904,6 +913,24 @@ def _ai_mode(args, logger: logging.Logger) -> int:
                     status="info",
                     message="No AI provider configured — using template mode instead.",
                     detail="Run 'fluid ai setup' anytime to enable AI-assisted generation.",
+                )
+            args.template = "customer-360"
+            return template_mode(args, logger)
+
+        # AI mode needs a description when nobody is at the keyboard, and init has no
+        # --context flag to carry one. Scaffold the template instead of failing.
+        from .forge_ai import _interactive as _ai_interactive
+
+        if not getattr(args, "context", None) and not _ai_interactive(args):
+            if RICH_AVAILABLE:
+                from .forge_dialogs import print_dialog_status
+
+                print_dialog_status(
+                    console,
+                    status="info",
+                    message="No product description to give AI mode here; using a template.",
+                    detail="Describe it later: fluid forge --refine <dir>/contract.fluid.yaml "
+                    '--context "<what it reads, produces, owner, schedule, rules>"',
                 )
             args.template = "customer-360"
             return template_mode(args, logger)
