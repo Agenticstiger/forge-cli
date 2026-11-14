@@ -162,8 +162,9 @@ def attach_to_mcp_subparsers(sp: argparse._SubParsersAction) -> None:
         metavar="TOOL[,TOOL...]",
         help=(
             "Comma-separated allowlist of tool names. Tools outside the "
-            "list are blocked and hidden from tools/list. Default: all "
-            "tools allowed (subject to other gates)."
+            "list are blocked and hidden from tools/list. A name that is "
+            "not a tool stops the server. Default: all tools allowed "
+            "(subject to other gates)."
         ),
     )
     serve.add_argument(
@@ -172,7 +173,8 @@ def attach_to_mcp_subparsers(sp: argparse._SubParsersAction) -> None:
         metavar="TOOL[,TOOL...]",
         help=(
             "Comma-separated blocklist of tool names. Evaluated before "
-            "--allow-tools so denial wins."
+            "--allow-tools so denial wins. A name that is not a tool stops "
+            "the server."
         ),
     )
     serve.add_argument(
@@ -400,6 +402,11 @@ def _run_serve(args, logger: logging.Logger) -> int:
         )
         sys.stderr.flush()
     policy = _build_policy(args, contract_path=contract_path, expose=expose, contract=contract)
+    tool_refusal = _tool_name_refusal(policy)
+    if tool_refusal is not None:
+        sys.stderr.write(tool_refusal)
+        sys.stderr.flush()
+        return 2
     # Boot-time auditRequired enforcement. The contract can declare
     # ``policy.agentPolicy.auditRequired: true``; the gateway always
     # writes to ``~/.fluid/store/audit/`` so a local sink is implicit,
@@ -870,6 +877,31 @@ def _cert_identity_gate_unsatisfiable(
         "FLUID_MCP_JWT_ISSUER, FLUID_MCP_JWT_AUDIENCE and FLUID_MCP_JWT_JWKS_URL.\n"
         f"{tail}"
     )
+
+
+def _tool_name_refusal(policy: OutputPortPolicy) -> Optional[str]:
+    """The startup refusal for an ``--allow-tools`` / ``--deny-tools`` name that
+    names no output-port tool, or ``None``.
+
+    Mirrors ``fluid mcp serve`` (``cli.mcp.policy.tool_name_refusal``): a mistyped
+    deny name would otherwise deny nothing and leave the tool callable.
+    """
+    from fluid_build.output_ports.mcp import OUTPUT_PORT_TOOL_CAPABILITIES as known
+
+    lines = []
+    for flag, names in (
+        ("--allow-tools", policy.allowed_tools or ()),
+        ("--deny-tools", policy.denied_tools),
+    ):
+        unknown = [name for name in names if name not in known]
+        if unknown:
+            lines.append(
+                f"fluid mcp output-port serve: {flag} names no such tool: {', '.join(unknown)}."
+            )
+    if not lines:
+        return None
+    lines.append(f"  Tools: {', '.join(sorted(known))}.")
+    return "\n".join(lines) + "\n"
 
 
 def _build_policy(args, *, contract_path: Path, expose, contract=None) -> OutputPortPolicy:
