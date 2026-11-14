@@ -1,0 +1,1 @@
+Write a small Python script, summarize.py, in this directory. It reads data/orders.csv and prints the total amount per currency, one line per currency (the currency code, a space, the total), sorted by currency code. Use only the Python standard library.
