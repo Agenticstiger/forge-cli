@@ -50,14 +50,16 @@ _CONTRACT: Dict[str, Any] = {
     "name": "Orders",
     "description": "Inline SQL build.",
     "domain": "Demo",
-    "metadata": {"layer": "Bronze", "owner": {"team": "dp", "email": "dp@example.com"}},
+    # No placeholder email and no starter SQL: the authoring lint would warn on either,
+    # and test_validate_plan_build_ids_warning needs this contract to pass --strict.
+    "metadata": {"layer": "Bronze", "owner": {"team": "dp"}},
     "builds": [
         {
             "id": "make_rows",
             "description": "Inline rows.",
             "pattern": "embedded-logic",
             "engine": "sql",
-            "properties": {"sql": "SELECT 1 AS id"},
+            "properties": {"sql": "SELECT CAST(1 AS INTEGER) AS id"},
             "outputs": ["rows"],
         }
     ],

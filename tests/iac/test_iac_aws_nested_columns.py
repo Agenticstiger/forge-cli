@@ -53,7 +53,7 @@ def _contract(columns=None):
         "name": "Nested demo",
         "description": "nested Glue columns",
         "domain": "demo",
-        "metadata": {"layer": "Silver", "owner": {"team": "data", "email": "data@example.com"}},
+        "metadata": {"layer": "Silver", "owner": {"team": "data"}},
         "exposes": [
             {
                 "exposeId": "orders",

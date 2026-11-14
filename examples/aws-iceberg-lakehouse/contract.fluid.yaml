@@ -21,7 +21,6 @@ metadata:
   layer: Gold
   owner:
     team: data-engineering
-    email: data-eng@example.com
 
 # ─── Access Policy ─────────────────────────────────────────────────
 

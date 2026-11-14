@@ -946,7 +946,7 @@ def test_fluid_validate_fails_closed_when_the_check_cannot_run(monkeypatch):
         def __init__(self) -> None:
             self.errors: List[str] = []
 
-        def add_error(self, message: str) -> None:
+        def add_error(self, message: str, **tags: Any) -> None:  # event=, pointer=
             self.errors.append(message)
 
     def broken(contract):

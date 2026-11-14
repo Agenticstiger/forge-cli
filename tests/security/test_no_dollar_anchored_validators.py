@@ -1477,7 +1477,7 @@ _ACCEPTED: Dict[Tuple[str, str, str], str] = {
     ): "an overlay rule searches the serialized contract for text, not a whole value",
     (
         "fluid_build/schema_manager.py",
-        "_locate_error",
+        "_unexpected_key",
         "<run time: p>",
     ): (
         "mirrors jsonschema, which applies patternProperties with re.search; anything "

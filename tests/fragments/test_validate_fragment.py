@@ -91,7 +91,9 @@ def _root_doc(version: str = "0.7.6") -> Dict[str, Any]:
         "id": "frag.test",
         "name": "Fragment test",
         "domain": "ops",
-        "metadata": {"layer": "Silver", "owner": {"team": "ops", "email": "ops@example.com"}},
+        # No owner email: a placeholder address is an authoring-lint warning, and
+        # test_k19 needs a whole contract that validates clean.
+        "metadata": {"layer": "Silver", "owner": {"team": "ops"}},
         "exposes": [{"$ref": "./fragments/exposes/orders.yaml"}],
     }
 
