@@ -101,6 +101,22 @@ from fluid_build.copilot.agents._modeler_helpers import (  # noqa: E402,F401
 )
 
 
+def _apply_intent_owner(summary: Dict[str, Any], intent: BusinessIntent) -> None:
+    """Set the contract owner from the intent's ``data_product.owner``, and only from it.
+
+    The contract emitter maps ``summary["dominant_owner"]`` to ``metadata.owner.team``
+    and otherwise writes ``data-team``, which ``fluid validate`` flags as template
+    residue. A provider-supplied ``dominant_owner`` is dropped: it would put a guessed
+    team on the contract.
+    """
+    summary.pop("dominant_owner", None)
+    summary.pop("dominant_owner_source", None)
+    owner = (intent.data_product.owner or "").strip()
+    if owner:
+        summary["dominant_owner"] = owner
+        summary["dominant_owner_source"] = "intent"
+
+
 class ModelerAgent(BaseStageAgent):
     """Modeler stage. Uses heuristics by default and LLMs when configured."""
 
@@ -448,6 +464,7 @@ class ModelerAgent(BaseStageAgent):
         deterministic.description = provider_result.description or deterministic.description
         deterministic.review_notes = list(provider_result.review_notes or [])
         deterministic.source_summary.update(provider_result.source_summary or {})
+        _apply_intent_owner(deterministic.source_summary, intent)
         deterministic.source_summary["source_kind"] = "intent"
         deterministic.source_summary["logical_backbone"] = "deterministic_intent"
         return deterministic
@@ -1021,6 +1038,7 @@ class ModelerAgent(BaseStageAgent):
 
         osi = self._osi_from_intent(intent)
         summary = {"source_kind": "intent", "metric_count": len(intent.metrics)}
+        _apply_intent_owner(summary, intent)
         spec = get_modeling_technique(technique)
         branch = spec.branch if spec is not None else None
         if branch == "dv2":
