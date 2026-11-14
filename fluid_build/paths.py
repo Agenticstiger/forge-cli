@@ -109,11 +109,6 @@ def apply_report_html(*, root: Optional[Path] = None) -> Path:
 # ── User-global paths (under ~/.fluid/) ──────────────────────────────
 
 
-def user_config_file(*, root: Optional[Path] = None) -> Path:
-    """``~/.fluid/config.yaml`` — global behavior + provider defaults."""
-    return (root or user_home()) / "config.yaml"
-
-
 def user_credentials_file(*, root: Optional[Path] = None) -> Path:
     """``~/.fluid/credentials.yaml`` — Fernet-encrypted credential store."""
     return (root or user_home()) / "credentials.yaml"
@@ -156,7 +151,6 @@ __all__ = [
     "skills_compiled_cache",
     "runtime_dir",
     "apply_report_html",
-    "user_config_file",
     "user_credentials_file",
     "user_ai_config",
     "user_personal_memory",

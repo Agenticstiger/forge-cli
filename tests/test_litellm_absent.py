@@ -412,12 +412,21 @@ class TestLeanKeylessAutoPick:
     def _args(**kw):
         from types import SimpleNamespace
 
-        return SimpleNamespace(**{"llm_provider": None, "agent_loop": False, **kw})
+        return SimpleNamespace(**{"llm_provider": None, **kw})
 
-    def test_agent_on_path_passes_the_preflight(self, block, monkeypatch, tmp_path):  # noqa: F811
+    @pytest.mark.parametrize(
+        "extra_env",
+        [{}, {"FLUID_COPILOT_AGENT_LOOP": "1"}],
+        ids=["plain", "retired-agent-loop-variable"],
+    )
+    def test_agent_on_path_passes_the_preflight(
+        self, block, monkeypatch, tmp_path, extra_env
+    ):  # noqa: F811
+        # FLUID_COPILOT_AGENT_LOOP once stopped this pick. The loop it asked for
+        # is gone, so the variable changes nothing.
         from fluid_build.llm.providers import _provider_name_from, preflight_llm_provider
 
-        env = self._lean(block, monkeypatch, tmp_path)
+        env = {**self._lean(block, monkeypatch, tmp_path), **extra_env}
         preflight_llm_provider(self._args(), env)
         assert _provider_name_from(self._args(), env) == "claude-code"
 
@@ -477,15 +486,6 @@ class TestLeanKeylessAutoPick:
         env = self._lean(block, monkeypatch, tmp_path, tty=True)
         with pytest.raises(MissingOptionalDependency):
             preflight_llm_provider(self._args(), env)
-
-    def test_the_retired_agent_loop_variable_does_not_block_the_pick(
-        self, block, monkeypatch, tmp_path
-    ):  # noqa: F811
-        from fluid_build.llm.providers import _provider_name_from, preflight_llm_provider
-
-        env = {**self._lean(block, monkeypatch, tmp_path), "FLUID_COPILOT_AGENT_LOOP": "1"}
-        preflight_llm_provider(self._args(), env)
-        assert _provider_name_from(self._args(), env) == "claude-code"
 
 
 def test_agent_search_uses_only_the_given_environment(monkeypatch, tmp_path):
