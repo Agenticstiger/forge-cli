@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<your-team>` (not a type such as `array<string>`, an operator or HTML). An SDP build that
   joins (`ERR_CONTRACT_SDP_JOINS`) contradicts the product's own classification: an SDP
   (Bronze) reads one source as it is, so a product that joins is an ADP (Silver). Each warning
-  names its place and ends with what to write instead, so the text output is enough to act on.
+  names its place and ends with what to write instead, so the text output is enough to act on;
+  the same warnings are a bundle's (`fluid validate <bundle>.tgz`) `CONTRACT-RULE` issues.
   Many shipped examples and quickstart templates carry a placeholder owner email on purpose
   (it is the value to replace), so they now validate with that warning; the three AWS examples
   the test suite validates with `--strict` drop theirs.

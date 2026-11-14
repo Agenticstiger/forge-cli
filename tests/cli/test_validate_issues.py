@@ -309,6 +309,23 @@ def test_a_starter_template_value_is_a_warning_at_its_place(
     assert issue["fix"] and issue["fix"] in issue["message"]
 
 
+def test_the_starter_id_fix_is_a_valid_id_whatever_the_name(run) -> None:
+    contract = _contract(id="starter-product.x", name="Sales Orders Raw", domain="Sales Ops")
+
+    _, doc = _json(run, contract)
+
+    [issue] = _issues(doc, "ERR_CONTRACT_TEMPLATE_RESIDUE")
+    assert issue["fix"].endswith(": sales_ops.sales_orders_raw.")
+
+
+def test_a_mailto_placeholder_is_flagged() -> None:
+    from fluid_build.cli._authoring_lint import lint_contract
+
+    contract = _contract(metadata={"owner": {"oncall": "mailto:test@example.com"}})
+
+    assert [f.pointer for f in lint_contract(contract)] == ["/metadata/owner/oncall"]
+
+
 def test_the_starter_id_fix_names_the_contracts_own_domain_and_name(run) -> None:
     _, doc = _json(run, _contract(id="starter-product.starter"))
 

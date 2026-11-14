@@ -108,7 +108,7 @@ def _key(parts: Path) -> str:
 #: (``password=secret@host``): a message quotes what it matches, and a fragment of a
 #: credential would slip past the console's URL redaction.
 _EMAIL = re.compile(
-    r"(?<![^\s<(\"',;])([A-Za-z0-9._+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)(?!\.?[\w@-])"
+    r"(?:(?<![^\s<(\"',;])|(?<=mailto:))([A-Za-z0-9._+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)(?!\.?[\w@-])"
 )
 #: A key that holds a way to reach someone: the contact emails this rule is about.
 #: An access grant's principal is not one (the governance check owns principals).
@@ -249,12 +249,19 @@ def _residue_token(value: str) -> Optional[str]:
     return next((token for token in _RESIDUE_TOKENS if token in text), None)
 
 
+def _slug(text: str) -> str:
+    """``text`` as an id part: lower case, any other run of characters one ``_``."""
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
 def _residue_fix(parts: Path, contract: Mapping[str, Any]) -> str:
     if parts == ("id",):
         domain, name = contract.get("domain"), contract.get("name")
         if isinstance(domain, str) and isinstance(name, str):
             if _residue_token(domain) is None and _residue_token(name) is None:
-                return f"Write the product's own id, <domain>.<name>: {domain}.{name}."
+                if _slug(domain) and _slug(name):
+                    example = f"{_slug(domain)}.{_slug(name)}"
+                    return f"Write the product's own id, <domain>.<name>: {example}."
         return "Write the product's own id, <domain>.<name>, for example sales.orders_raw."
     if "semantics" in parts:
         return "Delete exposes[].semantics unless the product needs a semantic model."
@@ -331,7 +338,8 @@ def _placeholder_values(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
             "contract_placeholder_value",
             parts,
             f"{_dotted(parts)}: {found!r} is a placeholder, not a value.",
-            "Write the real value, never a guess, or delete the key when it is optional.",
+            "Write the real value, or delete the key when it is optional; when it is "
+            "required and nothing gives it, say so rather than make one up.",
         )
 
 

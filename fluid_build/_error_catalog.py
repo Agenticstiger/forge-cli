@@ -771,8 +771,8 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         [
             "Replace the placeholder (TODO, FIXME, TBD, CHANGEME or <...>) with the real "
             + "value, or delete the key when it is optional",
-            "When no value is known, choose the smallest valid one and note the "
-            + "assumption instead of leaving a placeholder",
+            "When the key is required and nothing gives its value, say so (in your "
+            + "report, or to the owner) rather than make one up",
         ],
         "validate",
     ),
