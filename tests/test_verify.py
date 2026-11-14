@@ -483,8 +483,10 @@ class TestRunStrictAndOutput:
 
 # ---------------------------------------------------------------------------
 # run() – reference-only contracts downgrade missing-table errors to INFO
-# (Bug 6: verify on hybrid-reference contracts like A1 should not hard-fail
-# under --strict when the external dbt/Airflow project hasn't run yet)
+# (Bug 6: verify on hybrid-reference contracts like A1 must not report an
+# error when the external dbt/Airflow project hasn't run yet; a --strict run
+# that verified nothing else still fails, see
+# tests/cli/test_verify_strict_nothing_verified.py)
 # ---------------------------------------------------------------------------
 
 
@@ -511,12 +513,19 @@ class TestRunReferenceOnly:
             ],
         }
 
-    def test_reference_only_missing_table_returns_0_under_strict(self, tmp_path):
-        """Fresh A1 deploy: external dbt hasn't run, table missing → should
-        NOT exit 1 under --strict. The whole point of bug 6."""
+    @pytest.mark.parametrize("warn_only, expected", [(True, 0), (False, 1)])
+    def test_reference_only_missing_table_is_not_an_error_under_strict(
+        self, tmp_path, warn_only, expected
+    ):
+        """Fresh A1 deploy: external dbt hasn't run, table missing. Bug 6: that
+        is INFO, never an error. It is not a check either, so a --strict run
+        whose only expose is such a table verified nothing and exits 1
+        (``_nothing_verified_fails``); --warn-only accepts it for a first
+        deploy. Beside one checked expose it passes, as before."""
         contract_path = tmp_path / "c.yaml"
         contract_path.write_text("id: t\n")
         args = _make_args(contract=str(contract_path), strict=True)
+        args.warn_only = warn_only
         with (
             patch(
                 "fluid_build.cli.verify.load_contract_with_overlay",
@@ -536,9 +545,9 @@ class TestRunReferenceOnly:
             ),
         ):
             result = run(args, logging.getLogger("test"))
-        # Strict mode, but reference-only + exists=False → downgraded to
-        # INFO and excluded from error_count, so exit 0.
-        assert result == 0
+        # reference-only + exists=False → INFO, excluded from error_count; the
+        # exit code is the nothing-verified rule's.
+        assert result == expected
 
     def test_non_reference_missing_table_still_hard_fails_under_strict(self, tmp_path):
         """Regression guard: non-reference (imperative/declarative) contracts
@@ -895,7 +904,9 @@ class TestUnverifiableIsNotAFailure:
         assert summary["unsupported"] == 1
         assert summary["error"] == 0
 
-    def test_strict_does_not_turn_a_skip_into_a_failure(self, tmp_path):
+    def test_strict_fails_a_run_whose_only_expose_was_skipped(self, tmp_path, capsys):
+        """The skip is still not an error. But a --strict run whose only expose
+        was skipped verified nothing, and fails on that; --warn-only accepts it."""
         contract_path = tmp_path / "c.yaml"
         contract_path.write_text("id: t\n")
         args = _make_args(contract=str(contract_path), strict=True)
@@ -903,4 +914,10 @@ class TestUnverifiableIsNotAFailure:
             "fluid_build.cli.verify.load_contract_with_overlay",
             return_value=self._contract("kafka_topic"),
         ):
+            assert run(args, logging.getLogger("test")) == 1
+            captured = capsys.readouterr()
+            assert "Error: 0" in captured.err
+            assert "nothing was verified" in " ".join((captured.out + captured.err).split())
+
+            args.warn_only = True
             assert run(args, logging.getLogger("test")) == 0

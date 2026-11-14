@@ -177,7 +177,11 @@ Use Cases:
             "region drift, a local csv/parquet output whose columns differ from "
             "the declared schema) and on verification errors. Non-critical drift "
             "(nullable-vs-required constraints, extra columns) is reported and "
-            "downgraded to a warning — add --fail-on-warning to gate on those too."
+            "downgraded to a warning — add --fail-on-warning to gate on those too. "
+            "Also exits non-zero when nothing was verified: every expose was "
+            "skipped (no verifier for its binding, or a reference-only table not "
+            "built yet). A run that verified at least one expose only reports its "
+            "skips. --warn-only downgrades the nothing-verified failure."
         ),
     )
 
@@ -188,7 +192,8 @@ Use Cases:
         help=(
             "Exit non-zero on ANY mismatch, including the non-critical drift "
             "--strict downgrades. Use for a CI gate that must not let a "
-            "required→nullable change through."
+            "required→nullable change through. Like --strict, also fails a run "
+            "that verified nothing."
         ),
     )
 
@@ -253,8 +258,9 @@ Use Cases:
         "--warn-only",
         action="store_true",
         help=(
-            "Downgrade --reconcile-dbt / --reconcile-lineage / --state-drift drift "
-            "to a warning (exit 0). Reports the drift but does not fail the build."
+            "Downgrade --reconcile-dbt / --reconcile-lineage / --state-drift drift, "
+            "and the failure of a --strict run that verified nothing, to a warning "
+            "(exit 0). Reports it but does not fail the build."
         ),
     )
 
@@ -1355,6 +1361,47 @@ def _state_drift_fails(report: Optional[Any], args: argparse.Namespace) -> bool:
     return True
 
 
+def _nothing_verified_fails(
+    args: argparse.Namespace, checked: int, unsupported: int, not_built: int
+) -> bool:
+    """Does a ``--strict`` run that verified nothing fail?
+
+    ``--strict`` is the flag a CI gate keys on, so its exit 0 has to mean at
+    least one expose was checked. When every expose was skipped (no verifier
+    for its binding, or a reference-only table its external pipeline has not
+    built yet), the run used to exit 0 on "Match: 0, Mismatch: 0, Error: 0".
+    A run that checked at least one expose only reports its skips, as before.
+    ``--fail-on-warning``, the stricter gate, fails the same way, and
+    ``--warn-only`` downgrades the failure to a warning. The ``--reconcile-*``
+    and ``--state-drift`` sections are not expose checks: they gate on their
+    own.
+    """
+    strict = bool(getattr(args, "strict", False))
+    if not (strict or getattr(args, "fail_on_warning", False)):
+        return False
+    skipped = unsupported + not_built
+    if checked > 0 or skipped == 0:
+        return False
+    parts = []
+    if unsupported:
+        parts.append(f"{unsupported} with no verifier for the binding")
+    if not_built:
+        parts.append(f"{not_built} reference-only, not built yet")
+    what = f"nothing was verified: all {skipped} expose(s) were skipped ({'; '.join(parts)})"
+    if getattr(args, "warn_only", False):
+        warning(f"--warn-only: {what}. Not failing the build.")
+        return False
+    if not_built:
+        next_step = "Re-run once the external pipeline has built the table(s), or pass --warn-only."
+    else:
+        next_step = (
+            "forge-cli has no verifier for these bindings yet; pass --warn-only "
+            "to accept a run that checks nothing."
+        )
+    console_error(f"{'--strict' if strict else '--fail-on-warning'}: {what}. {next_step}")
+    return True
+
+
 @_traced_stage("verify")
 def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Main verify command execution"""
@@ -1717,8 +1764,13 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     mismatch_count = 0
     error_count = 0
     # Exposes forge has no verifier for. Reported, never counted as a failure —
-    # "we did not check" is not "the check failed".
+    # "we did not check" is not "the check failed". A run that skipped every
+    # expose verified nothing, though, and fails ``--strict`` on that
+    # (``_nothing_verified_fails``).
     unsupported_count = 0
+    # Reference-only tables the external pipeline has not built yet: reported as
+    # INFO, not an error, and not a check either.
+    not_built_count = 0
     # Track critical-severity mismatches separately so ``--strict``
     # can differentiate breaking drift (missing fields, type mismatches,
     # region mismatches) from non-breaking constraint drift
@@ -1797,6 +1849,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 # Don't count as error or mismatch: the shape cannot
                 # be compared, so we report nothing either way. This
                 # mirrors how ``fluid diff`` treats a missing baseline.
+                not_built_count += 1
                 continue
             # Not markup: a message such as "pip install 'data-product-forge[aws]'"
             # lost its ``[aws]`` to Rich, which read it as a style tag.
@@ -2014,12 +2067,15 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     cprint("\n" + "=" * 80)
     cprint("📊 Verification Summary")
     cprint("=" * 80)
-    cprint(f"Total verified: {len(results)}")
+    # Exposes, not checks: a skipped expose is counted here and verified nothing.
+    cprint(f"Total exposes: {len(results)}")
     success(f"Match: {match_count}")
     warning(f"Mismatch: {mismatch_count}")
     console_error(f"Error: {error_count}")
     if unsupported_count:
         cprint(f"⏭️  Skipped (no verifier for the format): {unsupported_count}")
+    if not_built_count:
+        cprint(f"🔵 Not built yet (reference-only): {not_built_count}")
 
     if mismatch_count > 0 or error_count > 0:
         cprint("\n💡 Next Steps:")
@@ -2041,6 +2097,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 "mismatch": mismatch_count,
                 "error": error_count,
                 "unsupported": unsupported_count,
+                "not_built": not_built_count,
             },
             "results": results,
         }
@@ -2119,6 +2176,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             "insufficient privileges). If the target lives in a shared pool, the "
             "platform team may still owe this product USAGE on it."
         )
+        return 1
+
+    checked_count = len(results) - unsupported_count - not_built_count
+    if _nothing_verified_fails(args, checked_count, unsupported_count, not_built_count):
         return 1
 
     # Exit with error code if strict mode and CRITICAL issues found.
