@@ -14,7 +14,6 @@ __all__ = [
     "ask_friendly_text",
     "ask_secret_text",
     "build_choice",
-    "normalize_choice_value",
     "normalize_prompt_choices",
     "resolve_choice_input",
 ]
@@ -479,25 +478,6 @@ def resolve_choice_input(
         )
 
     return ChoiceMatchResult(status="unresolved", raw_input=raw_text)
-
-
-def normalize_choice_value(
-    raw_value: Any,
-    *,
-    field_name: str,
-    choices: List[Any],
-    default: Optional[str] = None,
-) -> Optional[str]:
-    """Normalize a direct context value against a choice list."""
-    match = resolve_choice_input(
-        field_name=field_name,
-        raw_input=str(raw_value or "").strip(),
-        choices=choices,
-        allow_skip=True,
-    )
-    if match.status in {"matched", "confirmed", "custom"} and match.value:
-        return str(match.value)
-    return default
 
 
 def ask_confirmation(

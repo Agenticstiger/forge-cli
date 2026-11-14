@@ -120,11 +120,11 @@ class AuthoringRequest:
 
 
 def _arg(args: Any, name: str, default: Any = None) -> Any:
-    """Read an argparse attribute without letting a MagicMock invent one."""
-    if hasattr(args, "__dict__") and name in vars(args):
-        value = vars(args)[name]
-        return default if value is None else value
-    return default
+    """``forge_context.get_cli_arg``, with an explicit ``None`` read as unset."""
+    from fluid_build.cli.forge_context import get_cli_arg
+
+    value = get_cli_arg(args, name, None)
+    return default if value is None else value
 
 
 def _read_intent(value: Any) -> str:

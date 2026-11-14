@@ -15,7 +15,6 @@ __all__ = [
     "normalize_ci_complexity",
     "normalize_ci_provider",
     "normalize_use_case",
-    "format_use_case_label",
     "normalize_copilot_context",
 ]
 
@@ -174,20 +173,6 @@ def normalize_use_case(value: Any) -> Optional[str]:
     if "other" in text or "not sure" in text or "unsure" in text:
         return "other"
     return None
-
-
-def format_use_case_label(use_case: Any, use_case_other: Any = None) -> str:
-    """Return the user-facing use-case label for display surfaces."""
-    other_text = clean_text(use_case_other)
-    canonical = normalize_use_case(use_case)
-    if canonical == "other" and other_text:
-        return other_text
-    if canonical:
-        return USE_CASE_LABELS.get(canonical, canonical.replace("_", " ").title())
-    if other_text:
-        return other_text
-    raw = clean_text(use_case)
-    return raw or USE_CASE_LABELS["analytics"]
 
 
 def normalize_ci_provider(value: Any) -> Optional[str]:

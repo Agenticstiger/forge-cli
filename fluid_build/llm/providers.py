@@ -41,8 +41,6 @@ __all__ = [
     "save_api_key_to_keyring",
     "call_llm",
     "call_llm_streaming",
-    "streaming_is_enabled",
-    "live_provider_models",
 ]
 
 import json
@@ -142,18 +140,6 @@ def _get_timeout_seconds(args: Any, env: Mapping[str, str]) -> int:
     except (TypeError, ValueError):
         return 120
     return max(1, min(3600, value))
-
-
-def streaming_is_enabled() -> bool:
-    """Slice UX-I kill-switch for SSE streaming of LLM responses.
-
-    Set ``FLUID_LLM_STREAMING=0`` to disable streaming across all
-    providers.  The legacy blocking ``call_llm`` path is preserved
-    in full; every call site that wants streaming checks this helper
-    and falls back to ``call_llm`` when it returns False.
-    """
-    value = os.environ.get("FLUID_LLM_STREAMING", "1").strip().lower()
-    return value not in {"0", "false", "no", "off"}
 
 
 # Provider → environment variable mapping.  Shared across ai_setup.py and
@@ -592,25 +578,6 @@ def _model_preflight_requested(args: Any, env: Mapping[str, str]) -> bool:
     )
 
 
-def live_provider_models(
-    provider_name: str,
-    *,
-    api_key: Optional[str] = None,
-    environ: Optional[Mapping[str, str]] = None,
-    named: bool = False,
-) -> Optional[List[str]]:
-    """Fetch live provider model ids when supported by the adapter.
-
-    ``named``: the operator named this provider, so ``FLUID_LLM_API_KEY`` may
-    be its key (see ``provider_resolve._resolve_api_key``).
-    """
-    env = dict(environ or os.environ)
-    provider = get_llm_provider(provider_name)
-    return provider.list_available_models(
-        api_key or _resolve_api_key(provider.name, env, named=named), env
-    )
-
-
 def has_llm_api_key(
     provider_name: str,
     environ: Optional[Mapping[str, str]] = None,
@@ -619,7 +586,7 @@ def has_llm_api_key(
 ) -> bool:
     """Return whether the provider can resolve credentials without exposing them.
 
-    ``named`` as for :func:`live_provider_models`.
+    ``named`` as the provider name it was asked for.
     """
     env = dict(environ or os.environ)
     provider = get_llm_provider(provider_name)

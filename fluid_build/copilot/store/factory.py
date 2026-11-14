@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 from .backends.file import FileBackend
 from .backends.null import NullBackend
@@ -21,68 +21,6 @@ _log = logging.getLogger(__name__)
 # per process even if ``resolve_store`` is called repeatedly with the
 # disabled value (which a long-running forge runtime can easily do).
 _LOGGED_NULL: set[str] = set()
-
-
-def _safe_store_init(
-    backend_factory: Callable[[], Store],
-    *,
-    fallback_factory: Optional[Callable[[], Store]] = None,
-    label: str = "backend",
-) -> Store:
-    """Construct a store, falling back if construction raises.
-
-    Mirrors the swallow-and-warn shape used elsewhere in the codebase
-    (e.g. ``providers/__init__.py::_discover_entrypoints``) so a transient DB outage or a missing
-    optional dep doesn't crash a forge mid-flight.
-
-    On failure: logs a single WARNING, then either returns
-    ``fallback_factory()`` (typically ``FileBackend``) or, if no
-    fallback was provided, falls all the way through to
-    ``NullBackend`` so a forge can still complete.
-    """
-
-    try:
-        return backend_factory()
-    except Exception as exc:  # noqa: BLE001
-        if fallback_factory is None:
-            _log.warning(
-                "Store %s init failed (%s: %s); using NullBackend — "
-                "memory will not be persisted this run.",
-                label,
-                type(exc).__name__,
-                exc,
-            )
-            return NullBackend()
-        _log.warning(
-            "Store %s init failed (%s: %s); falling back to a local "
-            "FileBackend so the forge can continue. Re-check your "
-            "FLUID_STORE_* config before the next run.",
-            label,
-            type(exc).__name__,
-            exc,
-        )
-        try:
-            return fallback_factory()
-        except Exception as fb_exc:  # noqa: BLE001 - last-resort guard
-            _log.warning(
-                "Fallback store init also failed (%s: %s); using "
-                "NullBackend so the forge can still complete.",
-                type(fb_exc).__name__,
-                fb_exc,
-            )
-            return NullBackend()
-
-
-def _file_fallback_factory(*, path: Optional[str | Path], workspace: Path) -> Callable[[], Store]:
-    """Construct a FileBackend factory for use as a graceful fallback."""
-
-    def _build() -> Store:
-        root = Path(
-            path or os.environ.get("FLUID_STORE_ROOT") or (Path.home() / ".fluid" / "store")
-        ).expanduser()
-        return FileBackend(root=root, workspace_root=workspace)
-
-    return _build
 
 
 def resolve_store(

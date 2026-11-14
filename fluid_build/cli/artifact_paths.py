@@ -249,11 +249,6 @@ def product_forge_receipt_path(product_root: Path) -> Path:
     return product_state_dir(product_root) / PRODUCT_FORGE_RECEIPT_FILENAME
 
 
-def workspace_discovery_cache_path(workspace_root: Path) -> Path:
-    """Return ``<workspace_root>/.fluid/discovery-cache.json``."""
-    return workspace_state_dir(workspace_root) / WORKSPACE_DISCOVERY_CACHE_FILENAME
-
-
 # ---------------------------------------------------------------------------
 # CI provenance header identifier
 # ---------------------------------------------------------------------------

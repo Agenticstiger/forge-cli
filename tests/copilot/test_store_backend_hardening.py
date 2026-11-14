@@ -18,12 +18,10 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from fluid_build.copilot.store import factory as factory_module
-from fluid_build.copilot.store.backends.file import FileBackend
 from fluid_build.copilot.store.backends.null import NullBackend
 from fluid_build.copilot.store.backends.sqlite import (
     _MIGRATIONS,
@@ -174,37 +172,3 @@ def test_migration_table_stays_dense(tmp_path: Path) -> None:
         assert (
             version in _MIGRATIONS
         ), f"_MIGRATIONS is missing version {version}; bump _SCHEMA_VERSION only when the migration exists"
-
-
-# ---------------------------------------------------------------------------
-# #52 — PostgresBackend graceful degrade.
-# ---------------------------------------------------------------------------
-
-
-def test_safe_store_init_uses_explicit_fallback(tmp_path: Path, caplog) -> None:
-    """``_safe_store_init`` must run the fallback factory when the
-    primary raises — pinning the shared helper directly so other
-    backends (Snowflake, etc.) can reuse it later."""
-    from fluid_build.copilot.store.factory import _safe_store_init
-
-    def boom() -> Any:
-        raise RuntimeError("primary unavailable")
-
-    def fb() -> Any:
-        return FileBackend(root=tmp_path / "fb-root", workspace_root=tmp_path)
-
-    with caplog.at_level(logging.WARNING):
-        store = _safe_store_init(boom, fallback_factory=fb, label="ThingThatFails")
-    assert isinstance(store, FileBackend)
-
-
-def test_safe_store_init_returns_null_when_no_fallback() -> None:
-    """No fallback factory + primary failure → NullBackend so the
-    forge can still complete (better than crashing on init)."""
-    from fluid_build.copilot.store.factory import _safe_store_init
-
-    def boom() -> Any:
-        raise RuntimeError("primary unavailable")
-
-    store = _safe_store_init(boom, label="NoFallback")
-    assert isinstance(store, NullBackend)
