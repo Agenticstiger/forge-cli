@@ -8,9 +8,9 @@ One rule holds on every path: ``fluid validate --offline`` decides what is valid
 * **Interactive, with a coding agent** (Claude Code, Codex, Cursor or Kiro): forge opens
   the agent in the workspace with the skills loaded and the request as its first prompt.
   The agent asks its own follow-up questions. Forge validates the contract when it exits.
-* **Non-interactive, with Claude Code or Codex**: forge drives the agent headless. Its
-  tools are limited to reading and editing the workspace and running read-only ``fluid``
-  stages.
+* **Non-interactive, with Claude Code**: forge drives it headless. It may read the
+  workspace, edit the one contract file and run ``fluid validate`` on that file, and
+  nothing wider (:data:`CLAUDE_ALLOWED_TOOLS`, :func:`agent_rules`).
 * **Otherwise**: one LLM call whose system prompt is the skills' own text. Forge validates
   the answer and feeds the errors back, for at most :data:`MAX_ATTEMPTS` attempts.
 
@@ -45,43 +45,42 @@ LOG = logging.getLogger(__name__)
 #: Attempts the one-call path makes before it gives up (Instructor's ``max_retries``).
 MAX_ATTEMPTS = 3
 CONTRACT_FILE = "contract.fluid.yaml"
-#: Coding agents forge drives headless with their own tools. Cursor and Kiro take the
-#: one-call path when nobody is at the keyboard: their headless permission flags have no
-#: measured configuration yet.
-HEADLESS_AGENTS = ("claude-code", "codex")
+#: Coding agents forge drives headless with their own tools: Claude Code only, the
+#: configuration the eval measured, with per-file permission rules. Codex, Cursor and Kiro
+#: take the one-call path when nobody is at the keyboard. Codex's workspace-write sandbox
+#: would let the agent rewrite anything in the workspace, the ``fluid`` install of a
+#: project venv included, which forge then runs to validate.
+HEADLESS_AGENTS = ("claude-code",)
 #: Upper bound on one upstream contract copied into a one-call prompt.
 UPSTREAM_MAX_CHARS = 20_000
 _VALIDATE_TIMEOUT_SECONDS = 120
 _AGENT_TIMEOUT_SECONDS = 900
 _MAX_TURNS = 60
 
-#: What Claude Code may do without asking. It may read and edit inside the workspace, read
-#: the skills, and run the ``fluid`` stages that change nothing outside the workspace. It
-#: may not run ``apply``, ``publish``, ``scaffold-ide`` or an AI-mode ``forge``.
-#: Adapted from ``tests/agent_evals/harness.py::ALLOWED_TOOLS``, the configuration that
-#: scored 11/11.
+#: What Claude Code may do without asking, before the per-run rules from
+#: :func:`agent_rules`: read the workspace and the skills, list and count files, and read
+#: ``fluid`` help. There is no wildcard on a ``fluid`` stage. ``bundle --out``,
+#: ``plan --out``/``--html``, ``diff --out``, ``generate artifacts --out`` and
+#: ``validate --report`` each write to any absolute path, and a contract the agent wrote
+#: can make that file shell-executable, for example ``~/.zshenv``. ``ls``, ``head`` and
+#: ``wc`` stay: Claude Code refuses them on paths outside the working directory. Narrowed
+#: from ``tests/agent_evals/harness.py::ALLOWED_TOOLS`` after this branch's security review.
 CLAUDE_ALLOWED_TOOLS: Tuple[str, ...] = (
     "Read(./**)",
-    "Edit(./**)",
     "Skill",
     "TodoWrite",
     "Bash(ls *)",
     "Bash(head *)",
     "Bash(wc *)",
-    "Bash(mkdir *)",
     "Bash(fluid --help)",
     "Bash(fluid --version)",
-    "Bash(fluid validate *)",
+    "Bash(fluid validate --help)",
     "Bash(fluid forge --help)",
-    "Bash(fluid forge --template *)",
-    "Bash(fluid forge --blank *)",
-    "Bash(fluid generate --help)",
-    "Bash(fluid generate artifacts *)",
-    "Bash(fluid bundle *)",
-    "Bash(fluid plan *)",
-    "Bash(fluid diff *)",
-    "Bash(fluid status *)",
 )
+#: Isolation flags a headless Claude Code run cannot do without. Without them the run would
+#: load the workspace's own settings, hooks and MCP servers. Forge refuses rather than run
+#: without them.
+_CLAUDE_REQUIRED_FLAGS = ("--setting-sources", "--strict-mcp-config")
 
 _NON_INTERACTIVE_NOTE = (
     "You are running non-interactively: nobody will answer questions. Make the smallest "
@@ -769,8 +768,29 @@ def _claude_index() -> str:
     return _index(str(SKILLS_DIR))
 
 
+def agent_rules(request: AuthoringRequest) -> List[str]:
+    """The per-run permission rules: edit the one contract file, and validate it exactly.
+
+    Exact matches, with no wildcard, so the agent cannot add ``--report <path>``,
+    ``--cache-dir`` or ``--probe`` to the validate command. An absolute path takes Claude
+    Code's ``//`` form.
+    """
+    shown = request.shown_path()
+    edit = f"/{shown}" if Path(shown).is_absolute() else f"./{shown}"
+    return [
+        f"Edit({edit})",
+        f"Bash(fluid validate {shown} --offline)",
+        f"Bash(fluid validate {shown} --offline --format json)",
+    ]
+
+
 def claude_argv(
-    binary: str, config: Any, *, headless: bool, prompt: Optional[str] = None
+    binary: str,
+    config: Any,
+    request: AuthoringRequest,
+    *,
+    headless: bool,
+    prompt: Optional[str] = None,
 ) -> List[str]:
     """Claude Code with the skills pack as a plugin and the always-loaded skills index."""
     from fluid_build.agent_skills import PACK_DIR
@@ -779,22 +799,28 @@ def claude_argv(
     help_text = _cli_help(binary)
     argv = [binary]
     if headless:
+        missing = [flag for flag in _CLAUDE_REQUIRED_FLAGS if not _lists_flag(help_text, flag)]
+        if missing:
+            raise _error(
+                "coding_agent_too_old",
+                f"This Claude Code does not list {', '.join(missing)}, which forge needs to "
+                "run it headless without the workspace's own settings and MCP servers.",
+                [
+                    "Update Claude Code (`claude update`), then run forge again.",
+                    "Or run forge in a terminal, where it opens Claude Code for you.",
+                ],
+            )
         argv += ["-p", "--output-format", "json", "--permission-mode", "dontAsk"]
-        argv += ["--max-turns", str(_MAX_TURNS)]
-        for tokens in (
-            ("--setting-sources=",),
-            ("--strict-mcp-config",),
-            ("--no-session-persistence",),
-        ):
-            if _lists_flag(help_text, tokens[0].rstrip("=")):
-                argv += tokens
+        argv += ["--max-turns", str(_MAX_TURNS), "--setting-sources=", "--strict-mcp-config"]
+        if _lists_flag(help_text, "--no-session-persistence"):
+            argv.append("--no-session-persistence")
     elif prompt is not None:
         # The prompt goes before the variadic --allowedTools, which would swallow it.
         argv.append(prompt)
     if _lists_flag(help_text, "--plugin-dir"):
         argv += ["--plugin-dir", str(PACK_DIR)]
     argv += ["--append-system-prompt", _claude_index()]
-    tools = [*CLAUDE_ALLOWED_TOOLS, f"Read(/{PACK_DIR}/**)"]
+    tools = [*CLAUDE_ALLOWED_TOOLS, *agent_rules(request), f"Read(/{PACK_DIR}/**)"]
     argv += ["--allowedTools", ",".join(tools)]
     model = getattr(config, "model", "")
     if model and model != "claude-code":
@@ -802,14 +828,9 @@ def claude_argv(
     return argv
 
 
-def codex_argv(
-    binary: str, config: Any, workspace: Path, prompt: str, *, headless: bool
-) -> List[str]:
-    """Codex in its workspace-write sandbox: edits stay in the workspace, no network."""
-    argv = [binary]
-    if headless:
-        argv += ["exec", "--sandbox", "workspace-write", "--skip-git-repo-check"]
-    argv += ["-C", str(workspace)]
+def codex_argv(binary: str, config: Any, workspace: Path, prompt: str) -> List[str]:
+    """Interactive Codex in the workspace. Codex asks before each command it runs."""
+    argv = [binary, "-C", str(workspace)]
     model = getattr(config, "model", "")
     if model and model != "codex":
         argv += ["--model", str(model)]
@@ -820,9 +841,9 @@ def codex_argv(
 def interactive_argv(agent: str, binary: str, config: Any, request: AuthoringRequest) -> List[str]:
     prompt = agent_prompt(request, interactive=True)
     if agent == "claude-code":
-        return claude_argv(binary, config, headless=False, prompt=prompt)
+        return claude_argv(binary, config, request, headless=False, prompt=prompt)
     if agent == "codex":
-        return codex_argv(binary, config, request.workspace, prompt, headless=False)
+        return codex_argv(binary, config, request.workspace, prompt)
     if agent == "cursor":
         return [binary, prompt]
     return [binary, "chat", prompt]  # kiro-cli
@@ -858,15 +879,14 @@ def drive_headless(
     from fluid_build.llm.coding_agent import _ANSI_RE, _run_agent
 
     binary = _binary(agent)
-    prompt = agent_prompt(request, interactive=False)
-    if agent == "claude-code":
-        argv, stdin = claude_argv(binary, config, headless=True), prompt
-    else:
-        argv, stdin = codex_argv(binary, config, request.workspace, prompt, headless=True), None
+    stdin = agent_prompt(request, interactive=False)
+    argv = claude_argv(binary, config, request, headless=True)
     if _arg(args, "dry_run", False):
         _say(console, f"Dry run: forge would run {agent} headless in {request.workspace}.")
         return 0
     _say(console, f"Running {agent} with the FLUID skills on {request.shown_path()}.")
+    # The agent may edit the contract file and nothing else, so forge makes its folder.
+    request.target_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
     timeout = int(os.environ.get("FLUID_FORGE_AGENT_TIMEOUT_SECONDS") or _AGENT_TIMEOUT_SECONDS)
     try:

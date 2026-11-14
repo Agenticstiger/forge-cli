@@ -339,7 +339,7 @@ def test_routing(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "hand_off": "claude-code"
     }
     assert _route(monkeypatch, "claude-code", _args(), False) == {"drive_headless": "claude-code"}
-    assert _route(monkeypatch, "codex", _args(), False) == {"drive_headless": "codex"}
+    assert _route(monkeypatch, "codex", _args(), False) == {"one_call": "codex"}
     assert _route(monkeypatch, "kiro", _args(), False) == {"one_call": "kiro"}
     assert _route(monkeypatch, "anthropic", _args(), False) == {"one_call": "anthropic"}
     assert _route(monkeypatch, "claude-code", _args(forge_agent_mode="envelope"), False) == {
@@ -360,52 +360,73 @@ def test_headless_run_without_a_description_is_a_typed_error(
 # ---------------------------------------------------------------------------
 
 
-def test_claude_headless_argv_is_the_measured_configuration(
-    monkeypatch: pytest.MonkeyPatch,
+_HELP = "--setting-sources --strict-mcp-config --no-session-persistence --plugin-dir"
+
+
+def test_claude_headless_argv_grants_the_contract_file_and_nothing_wider(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import fluid_build.llm.coding_agent as ca
     from fluid_build.agent_skills import PACK_DIR
 
-    monkeypatch.setattr(
-        ca,
-        "_cli_help",
-        lambda binary: "--setting-sources --strict-mcp-config "
-        "--no-session-persistence --plugin-dir",
-    )
-    argv = forge_ai.claude_argv("claude", _config("claude-code", "sonnet"), headless=True)
+    monkeypatch.setattr(ca, "_cli_help", lambda binary: _HELP)
+    request = forge_ai.build_request(_args(target_dir="products/orders"))
+    argv = forge_ai.claude_argv("claude", _config("claude-code", "sonnet"), request, headless=True)
     assert argv[:2] == ["claude", "-p"]
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
     assert argv[argv.index("--plugin-dir") + 1] == str(PACK_DIR)
     assert "--setting-sources=" in argv and "--strict-mcp-config" in argv
     tools = argv[argv.index("--allowedTools") + 1].split(",")
-    assert "Bash(fluid validate *)" in tools and f"Read(/{PACK_DIR}/**)" in tools
-    assert not any("apply" in t or "publish" in t or t == "Bash(fluid forge *)" for t in tools)
+    contract = str(Path("products/orders/contract.fluid.yaml"))
+    assert f"Edit(./{contract})" in tools
+    assert f"Bash(fluid validate {contract} --offline)" in tools
+    assert f"Read(/{PACK_DIR}/**)" in tools
+    # No rule lets the agent write elsewhere: no Edit wildcard, and no fluid stage with a
+    # wildcard (bundle/plan/diff --out, validate --report all take absolute paths).
+    assert not any(t.startswith("Edit(") and "*" in t for t in tools)
+    assert not any(t.startswith("Bash(fluid") and "*" in t for t in tools)
     assert argv[argv.index("--model") + 1] == "sonnet"
     assert "authoring-fluid-contracts" in argv[argv.index("--append-system-prompt") + 1]
 
 
-def test_claude_interactive_prompt_precedes_variadic_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_headless_claude_refuses_without_its_isolation_flags(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import fluid_build.llm.coding_agent as ca
 
     monkeypatch.setattr(ca, "_cli_help", lambda binary: "--plugin-dir")
+    with pytest.raises(CopilotGenerationError) as exc:
+        forge_ai.claude_argv(
+            "claude", _config("claude-code"), forge_ai.build_request(_args()), headless=True
+        )
+    assert exc.value.event == "coding_agent_too_old"
+    assert "--setting-sources" in exc.value.message
+
+
+def test_an_absolute_contract_path_takes_the_double_slash_rule(tmp_path: Path) -> None:
+    outside = tmp_path / "elsewhere"
+    request = forge_ai.AuthoringRequest(
+        intent="x", workspace=tmp_path / "ws", contract_path=outside / "contract.fluid.yaml"
+    )
+    assert forge_ai.agent_rules(request)[0] == f"Edit(/{outside / 'contract.fluid.yaml'})"
+
+
+def test_claude_interactive_prompt_precedes_variadic_flags(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fluid_build.llm.coding_agent as ca
+
+    monkeypatch.setattr(ca, "_cli_help", lambda binary: "--plugin-dir")
+    request = forge_ai.build_request(_args())
     argv = forge_ai.claude_argv(
-        "claude", _config("claude-code", "claude-code"), headless=False, prompt="P"
+        "claude", _config("claude-code", "claude-code"), request, headless=False, prompt="P"
     )
     assert argv[1] == "P" and "-p" not in argv and "--model" not in argv
 
 
-def test_codex_headless_runs_in_its_workspace_sandbox(workspace: Path) -> None:
-    argv = forge_ai.codex_argv("codex", _config("codex", "codex"), workspace, "P", headless=True)
-    assert argv == [
-        "codex",
-        "exec",
-        "--sandbox",
-        "workspace-write",
-        "--skip-git-repo-check",
-        "-C",
-        str(workspace),
-        "P",
-    ]
+def test_codex_opens_interactively_in_the_workspace(workspace: Path) -> None:
+    argv = forge_ai.codex_argv("codex", _config("codex", "codex"), workspace, "P")
+    assert argv == ["codex", "-C", str(workspace), "P"]
 
 
 def _stub_agent(monkeypatch: pytest.MonkeyPatch, **kw: Any) -> Dict[str, Any]:
@@ -414,7 +435,7 @@ def _stub_agent(monkeypatch: pytest.MonkeyPatch, **kw: Any) -> Dict[str, Any]:
     seen: Dict[str, Any] = {}
     monkeypatch.setattr(forge_ai, "_binary", lambda agent: "/bin/" + agent)
     monkeypatch.setattr(forge_ai, "_agent_env", lambda agent: {"PATH": "/bin"})
-    monkeypatch.setattr(ca, "_cli_help", lambda binary: "--plugin-dir")
+    monkeypatch.setattr(ca, "_cli_help", lambda binary: _HELP)
 
     def run_agent(argv: List[str], *, stdin: Any, timeout: int, cwd: str, env: Dict[str, str]):
         seen.update(argv=argv, stdin=stdin, cwd=cwd)
@@ -464,7 +485,7 @@ def test_agent_that_writes_nothing_fails_the_gate(
     _stub_agent(monkeypatch, write=False)
     with pytest.raises(CopilotGenerationError) as exc:
         forge_ai.drive_headless(
-            "codex", forge_ai.build_request(_args()), _config("codex"), args=_args()
+            "claude-code", forge_ai.build_request(_args()), _config("claude-code"), args=_args()
         )
     assert exc.value.event == "forge_contract_missing"
 
@@ -503,7 +524,32 @@ def test_invalid_agent_contract_reports_the_errors(
     )
     with pytest.raises(CopilotGenerationError) as exc:
         forge_ai.drive_headless(
-            "codex", forge_ai.build_request(_args()), _config("codex"), args=_args()
+            "claude-code", forge_ai.build_request(_args()), _config("claude-code"), args=_args()
         )
     assert exc.value.event == "forge_contract_invalid"
     assert "fluid validate: builds: required" in exc.value.suggestions
+
+
+def test_headless_run_makes_the_target_folder_first(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fluid_build.llm.coding_agent as ca
+
+    _stub_agent(monkeypatch)
+    made: Dict[str, bool] = {}
+
+    def run_agent(argv: List[str], *, stdin: Any, timeout: int, cwd: str, env: Dict[str, str]):
+        target = Path(cwd) / "products" / "new"
+        made["dir"] = target.is_dir()
+        (target / "contract.fluid.yaml").write_text(VALID, encoding="utf-8")
+        return 0, "", ""
+
+    monkeypatch.setattr(ca, "_run_agent", run_agent)
+    monkeypatch.setattr(
+        forge_ai, "validate_contract", lambda path, workspace: forge_ai.ValidationOutcome(True)
+    )
+    request = forge_ai.build_request(_args(target_dir="products/new"))
+    assert (
+        forge_ai.drive_headless("claude-code", request, _config("claude-code"), args=_args()) == 0
+    )
+    assert made["dir"]

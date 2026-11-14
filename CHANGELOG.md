@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - With a coding agent (`--llm-provider claude-code|codex|cursor|kiro`, or the one `fluid ai
     setup` saved), an interactive run opens the agent in the workspace with the skills loaded and
     your request as its first prompt. The agent asks its own follow-up questions.
-  - A non-interactive run drives Claude Code or Codex headless. Its tools are limited to reading
-    and editing the workspace and running read-only `fluid` stages.
+  - A non-interactive run drives Claude Code headless. It may read the workspace, edit the one
+    contract file, and run `fluid validate` on that file, nothing wider. Codex, Cursor and Kiro
+    take the one-call path when nobody is at the keyboard.
   - Without a coding agent, forge makes one LLM call (the `[ai]` extra) whose system prompt is the
     skills' text, runs `fluid validate --offline`, and feeds the errors back, for at most 3
     attempts.

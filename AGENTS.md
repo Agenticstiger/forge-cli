@@ -425,8 +425,10 @@ How AI mode runs (`fluid_build/cli/forge_ai.py`):
 - **With a coding agent** (`--llm-provider claude-code|codex|cursor|kiro`, or the one `fluid ai
   setup` saved): an interactive run opens the agent in the workspace with the skills loaded and
   the request as its first prompt, and the agent asks its own questions. A non-interactive run
-  drives Claude Code or Codex headless, with tools limited to the workspace and read-only
-  `fluid` stages (`CLAUDE_ALLOWED_TOOLS`). `--forge-agent-mode envelope` makes it one call.
+  drives Claude Code headless. It may read the workspace, edit the one contract file and run
+  `fluid validate` on it, exactly (`CLAUDE_ALLOWED_TOOLS` + `agent_rules`). No `fluid` stage
+  with an output flag is allowed. Codex, Cursor and Kiro take the one-call path when nobody
+  is at the keyboard. `--forge-agent-mode envelope` makes Claude Code one call too.
 - **Otherwise** one LLM call (litellm, the `[ai]` extra) whose system prompt is the skills' text.
   Forge runs `fluid validate --offline` and feeds the errors back, at most 3 attempts.
 - Either way forge's own gate is `fluid validate --offline`, and each run writes
