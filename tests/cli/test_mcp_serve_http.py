@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -256,3 +257,49 @@ def test_serve_http_moves_tools_off_the_loop(monkeypatch: pytest.MonkeyPatch) ->
     )
     assert rc == 0
     assert server_mod._TOOLS_OFF_LOOP is True
+
+
+def test_a_cancelled_call_keeps_its_turn_until_its_thread_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client can cancel a call it started. The worker thread cannot be
+    cancelled, so the next call must wait for it rather than run beside it."""
+    from fluid_build.cli.mcp import dispatch as dispatch_mod
+    from fluid_build.cli.mcp import policy as policy_mod
+    from fluid_build.cli.mcp import server as server_mod
+
+    counter = threading.Lock()
+    active, peak = [0], [0]
+    first_started, release_first = threading.Event(), threading.Event()
+
+    def _call_tool(name, arguments, **_):
+        with counter:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        try:
+            if name == "list_source_adapters":
+                first_started.set()
+                release_first.wait(timeout=10)
+            return {"tool": name}
+        finally:
+            with counter:
+                active[0] -= 1
+
+    monkeypatch.setattr(dispatch_mod, "_call_tool", _call_tool)
+    monkeypatch.setattr(policy_mod, "_current_policy", policy_mod.McpPolicy())
+    monkeypatch.setattr(server_mod, "_TOOLS_OFF_LOOP", True)
+
+    async def _scenario():
+        first = asyncio.create_task(server_mod._dispatch_sync_tool("list_source_adapters", {}))
+        assert await asyncio.wait_for(asyncio.to_thread(first_started.wait, 5), timeout=6)
+        first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+        second = asyncio.create_task(server_mod._dispatch_sync_tool("validate_contract", {}))
+        await asyncio.sleep(0.2)
+        assert not second.done()  # waits for the cancelled call's thread
+        release_first.set()
+        return await asyncio.wait_for(second, timeout=5)
+
+    assert asyncio.run(_scenario()) == {"tool": "validate_contract"}
+    assert peak[0] == 1

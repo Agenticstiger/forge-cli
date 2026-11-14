@@ -97,7 +97,7 @@ def _filter_visible_tools(tools: List[Dict[str, Any]], policy: McpPolicy) -> Lis
 
 @dataclass(frozen=True)
 class McpPolicy:
-    """Access-control policy for an MCP stdio server process.
+    """Access-control policy for an MCP server process (stdio or HTTP).
 
     ``allowed_tools = None`` means "all tools allowed"; an empty tuple
     means "no tools allowed" (useful for a pure-inspection server).

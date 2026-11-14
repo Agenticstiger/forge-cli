@@ -766,10 +766,10 @@ def _jurisdiction_gate_unsatisfiable(policy, *, transport: str) -> Optional[str]
     way: the HTTP transport's auth gate (``fluid_build._mcp_http``) stamps it after validating a
     JWT or mTLS identity. Two configurations can therefore never produce one:
 
-    * ``--transport stdio`` — a pipe carries no headers, so the middleware
-      never runs;
-    * ``--transport http`` with no ``FLUID_MCP_AUTH_MODE`` — the middleware
-      short-circuits before stamping anything when auth is not configured.
+    * ``--transport stdio`` — a pipe carries no headers, so the HTTP auth
+      gate never runs;
+    * ``--transport http`` with no ``FLUID_MCP_AUTH_MODE`` — the gate skips
+      auth, and so stamps nothing, when auth is not configured.
 
     In both the gate is not merely weaker. It refuses 100% of calls, forever,
     and the operator sees a stream of per-call denials rather than one cause.

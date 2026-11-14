@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Dict, List, Literal, Optional, Tuple
 
@@ -149,11 +150,15 @@ def _get_mcp_app() -> "FastMCP":
 #: Over HTTP one event loop serves uvicorn and every client's session, and a
 #: catalog tool waits on the network, so a tool must not run on that loop:
 #: one slow call would stall every other client and delay Ctrl-C. Each call
-#: runs in a worker thread instead, still one at a time (``_tool_call_lock``),
-#: as stdio runs them one at a time on the loop; the tools were never written
-#: to run concurrently.
+#: runs in a worker thread instead, still one at a time, as stdio runs them
+#: one at a time on the loop: the tools were never written to run
+#: concurrently.
 _TOOLS_OFF_LOOP = False
-_TOOL_CALL_LOCK: Optional[Tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = None
+#: Held by the worker thread for the whole call (``_one_at_a_time``), not by
+#: the awaiting task: a client can cancel its call (``notifications/cancelled``,
+#: or a dropped session), and a thread cannot be cancelled, so a lock the task
+#: held would be released while its call still ran beside the next one.
+_TOOL_THREAD_LOCK = threading.Lock()
 
 
 def serve_tools_off_loop() -> None:
@@ -162,13 +167,9 @@ def serve_tools_off_loop() -> None:
     _TOOLS_OFF_LOOP = True
 
 
-def _tool_call_lock() -> asyncio.Lock:
-    """The lock that serialises off-loop tool calls, one per event loop."""
-    global _TOOL_CALL_LOCK
-    loop = asyncio.get_running_loop()
-    if _TOOL_CALL_LOCK is None or _TOOL_CALL_LOCK[0] is not loop:
-        _TOOL_CALL_LOCK = (loop, asyncio.Lock())
-    return _TOOL_CALL_LOCK[1]
+def _one_at_a_time(call: Any) -> Any:
+    with _TOOL_THREAD_LOCK:
+        return call()
 
 
 async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -211,8 +212,7 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
     )
     try:
         if _TOOLS_OFF_LOOP:
-            async with _tool_call_lock():
-                return await asyncio.to_thread(call)
+            return await asyncio.to_thread(_one_at_a_time, call)
         return call()
     except McpToolRefusal as exc:
         # Surface the refusal (which names the server flag to set) as the
