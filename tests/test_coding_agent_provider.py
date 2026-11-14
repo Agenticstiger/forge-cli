@@ -154,7 +154,9 @@ def test_codex_argv_schema_file_and_raw_output(monkeypatch):
     argv = _argv(rec)
     assert argv[0].endswith("codex") and "exec" in argv
     assert "--output-schema" in argv
-    assert "--sandbox" not in argv  # envelope mode stays read-only
+    # Envelope mode is read-only, and runs in a scratch dir that is no git repository.
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert "--skip-git-repo-check" in argv
     # codex has no system-prompt flag: system is prepended into the positional
     assert rec.calls[0]["stdin"] is None
     assert argv[-1].startswith("SYS-PROMPT") and "USER-PROMPT" in argv[-1]

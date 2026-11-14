@@ -440,7 +440,7 @@ def print_forge_help() -> None:
             ("--dry-run", "Preview without creating files"),
             ("--non-interactive", "Use defaults without prompting"),
             ("--yes, -y", "Skip the pre-write preview prompt (panel still renders)"),
-            ("--context VALUE", "Additional AI context (JSON string or file path)"),
+            ("--context VALUE", "The product to build: text or a file path (AI mode)"),
         ],
     )
 
@@ -462,7 +462,7 @@ def print_forge_help() -> None:
     # Examples
     console.print("  [bold bright_green]Examples[/bold bright_green]")
     examples = [
-        ("fluid forge", "AI copilot (interactive)"),
+        ("fluid forge", "AI mode: your coding agent, or one LLM call, with the FLUID skills"),
         ("fluid forge --provider gcp", "Target GCP"),
         ("fluid forge --llm-provider ollama --llm-model gemma4", "Use local Ollama model"),
         ("fluid forge --blank --target-dir ./out", "Empty scaffold"),

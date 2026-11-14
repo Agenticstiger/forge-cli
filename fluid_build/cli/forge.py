@@ -222,7 +222,10 @@ def register(subparsers: argparse._SubParsersAction):
     )
     parser.add_argument(
         "--context",
-        help='Additional context as JSON or file path (e.g., \'{"provider":"gcp","domain":"retail"}\')',
+        help=(
+            "AI mode: the product to build, as text or a file path (what it reads and "
+            "produces, owner, schedule, rules). Required when nobody is at the keyboard."
+        ),
     )
 
     # --- LLM flags ---

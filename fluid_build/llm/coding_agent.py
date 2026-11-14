@@ -195,7 +195,9 @@ _AGENT_SPECS: Dict[str, AgentSpec] = {
         system_prompt_flag="",
         schema_mode="file",
         schema_flag="--output-schema",
-        base_args=("exec",),
+        # Read-only sandbox, and no git check: the one-call run happens in a scratch tempdir,
+        # which is not a git repository, and it needs no writes.
+        base_args=("exec", "--sandbox", "read-only", "--skip-git-repo-check"),
         model_flag="--model",
         output_mode="raw",
         cost_field=None,

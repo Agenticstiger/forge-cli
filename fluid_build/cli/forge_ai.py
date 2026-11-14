@@ -214,11 +214,14 @@ def build_request(args: Any) -> AuthoringRequest:
             target_dir = workspace / target_dir
         contract_path = target_dir / CONTRACT_FILE
         if contract_path.exists():
+            shown = os.path.relpath(contract_path, workspace)
+            if shown.startswith(".."):
+                shown = str(contract_path)
             raise _error(
                 "forge_contract_exists",
-                f"{contract_path} already exists; AI mode does not overwrite a contract.",
+                f"{shown} already exists; AI mode does not overwrite a contract.",
                 [
-                    f"To change it, run: fluid forge --refine {contract_path}",
+                    f"To change it, run: fluid forge --refine {shown}",
                     "To start a new product, pass another --target-dir.",
                 ],
             )
@@ -768,15 +771,30 @@ def _claude_index() -> str:
     return _index(str(SKILLS_DIR))
 
 
+#: Characters a path cannot carry inside a Claude Code permission rule:
+#: - the rules are joined with ``,``;
+#: - parentheses delimit a rule;
+#: - ``*?[]`` are glob syntax;
+#: - a space stops the exact Bash rule from matching once the agent quotes the path.
+_RULE_UNSAFE = re.compile(r"[\s,()*?\[\]\\]")
+
+
+def rule_safe(path: str) -> bool:
+    """True when ``path`` can sit inside a Claude Code permission rule unchanged."""
+    return not _RULE_UNSAFE.search(path)
+
+
 def agent_rules(request: AuthoringRequest) -> List[str]:
     """The per-run permission rules: edit the one contract file, and validate it exactly.
 
     Exact matches, with no wildcard, so the agent cannot add ``--report <path>``,
     ``--cache-dir`` or ``--probe`` to the validate command. An absolute path takes Claude
-    Code's ``//`` form.
+    Code's ``//`` form. A path no rule can carry (:func:`rule_safe`) gets no rules.
     """
-    shown = request.shown_path()
-    edit = f"/{shown}" if Path(shown).is_absolute() else f"./{shown}"
+    shown = Path(request.shown_path()).as_posix()
+    if not rule_safe(shown):
+        return []
+    edit = f"/{shown}" if shown.startswith("/") else f"./{shown}"
     return [
         f"Edit({edit})",
         f"Bash(fluid validate {shown} --offline)",
@@ -799,6 +817,14 @@ def claude_argv(
     help_text = _cli_help(binary)
     argv = [binary]
     if headless:
+        shown = Path(request.shown_path()).as_posix()
+        if not rule_safe(shown):
+            raise _error(
+                "forge_contract_path_unsupported",
+                f"{shown}: a headless run needs a contract path without whitespace or any "
+                "of these characters: , ( ) * ? [ ] \\",
+                ["Pass a --target-dir without them, or run forge in a terminal."],
+            )
         missing = [flag for flag in _CLAUDE_REQUIRED_FLAGS if not _lists_flag(help_text, flag)]
         if missing:
             raise _error(
@@ -829,7 +855,7 @@ def claude_argv(
 
 
 def codex_argv(binary: str, config: Any, workspace: Path, prompt: str) -> List[str]:
-    """Interactive Codex in the workspace. Codex asks before each command it runs."""
+    """Interactive Codex in the workspace, under the user's own Codex approval settings."""
     argv = [binary, "-C", str(workspace)]
     model = getattr(config, "model", "")
     if model and model != "codex":

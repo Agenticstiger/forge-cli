@@ -553,3 +553,37 @@ def test_headless_run_makes_the_target_folder_first(
         forge_ai.drive_headless("claude-code", request, _config("claude-code"), args=_args()) == 0
     )
     assert made["dir"]
+
+
+@pytest.mark.parametrize(
+    "path, safe",
+    [
+        ("products/orders/contract.fluid.yaml", True),
+        ("/abs/products/contract.fluid.yaml", True),
+        ("my products/contract.fluid.yaml", False),
+        ("a,b/contract.fluid.yaml", False),
+        ("x(1)/contract.fluid.yaml", False),
+        ("p*/contract.fluid.yaml", False),
+        ("C:\\work\\contract.fluid.yaml", False),
+    ],
+)
+def test_rule_safe(path: str, safe: bool) -> None:
+    assert forge_ai.rule_safe(path) is safe
+
+
+def test_a_path_no_rule_can_carry_gets_no_rules_and_no_headless_run(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fluid_build.llm.coding_agent as ca
+
+    monkeypatch.setattr(ca, "_cli_help", lambda binary: _HELP)
+    request = forge_ai.build_request(_args(target_dir="my products/orders"))
+    assert forge_ai.agent_rules(request) == []
+    with pytest.raises(CopilotGenerationError) as exc:
+        forge_ai.claude_argv("claude", _config("claude-code"), request, headless=True)
+    assert exc.value.event == "forge_contract_path_unsupported"
+    # Interactive still opens, with the read-only base rules only: the user approves edits.
+    argv = forge_ai.claude_argv(
+        "claude", _config("claude-code"), request, headless=False, prompt="P"
+    )
+    assert not any(t.startswith("Edit(") for t in argv[argv.index("--allowedTools") + 1].split(","))
