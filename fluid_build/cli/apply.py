@@ -849,22 +849,30 @@ def register(subparsers: argparse._SubParsersAction):
 
 
 def _actions_from_source(
-    src: str,
-    env: str | None,
+    *,
+    contract: Dict[str, Any],
     provider,
     logger: logging.Logger,
-    *,
+    plan_data: Optional[Dict[str, Any]] = None,
     mode: Optional[str] = None,
 ):
-    """
-    Extract actions from source (supports 0.7.1 provider actions).
+    """Resolve the actions simple mode dispatches, from what the gates checked.
 
-    For providers with a plan() method (like AwsProvider, GcpProvider), delegate
-    to the provider's planner which generates service-level actions the provider
-    can dispatch (e.g. s3.ensure_bucket, glue.ensure_table).
+    ``contract`` is the contract the pre-apply gate validated and
+    ``plan_data`` the digest-verified ``plan.json`` (``None`` for a contract
+    source), both loaded once by ``run()``. Nothing here opens a file: it
+    used to read the source a second time, so a file rewritten after the
+    gates was what ran (TOCTOU).
 
-    For other providers or when no planner is available, fall back to the 0.7.1
-    ProviderActionParser which infers high-level actions (provisionDataset, etc.).
+    For a plan, the actions are its recorded ``actions``. A destructive mode
+    (``replace`` / ``replace-and-build``) instead re-plans ``contract``, the
+    plan's verified embedded copy, with the provider's native planner.
+
+    For a contract, a provider with a ``plan()`` method (like AwsProvider,
+    GcpProvider) generates service-level actions it can dispatch (e.g.
+    ``s3.ensure_bucket``, ``glue.ensure_table``). For other providers, or
+    when no planner is available, the 0.7.1 ProviderActionParser infers
+    high-level actions (``provisionDataset``, etc.).
 
     The optional ``mode`` argument is forwarded to provider planners that
     accept it so destructive modes (``replace`` / ``replace-and-build``)
@@ -872,25 +880,22 @@ def _actions_from_source(
     that don't accept ``mode`` (older signatures) fall back to the
     mode-less call.
     """
-    if src.endswith(".json"):
-        # Load pre-generated execution plan.
-        data = read_json(src)
-        # When the plan embeds the contract AND a destructive mode is
-        # in play, re-translate via the provider's native planner so
-        # the actions are CTAS-shaped + carry the pre-flight CLONE.
-        # Without this, the abstract ``provisionDataset`` / ``scheduleTask``
-        # actions baked into plan.json would dispatch via the abstract
-        # handler which only emits ``INSERT INTO`` regardless of mode.
-        embedded_contract = data.get("contract") if isinstance(data.get("contract"), dict) else None
+    if plan_data is not None:
+        # When a destructive mode is in play, re-translate the embedded
+        # contract via the provider's native planner so the actions are
+        # CTAS-shaped + carry the pre-flight CLONE. Without this, the
+        # abstract ``provisionDataset`` / ``scheduleTask`` actions baked into
+        # plan.json would dispatch via the abstract handler which only emits
+        # ``INSERT INTO`` regardless of mode.
         is_destructive = (mode or "").lower() in ("replace", "replace-and-build")
         if (
-            embedded_contract
+            contract
             and is_destructive
             and hasattr(provider, "plan")
             and callable(getattr(provider, "plan", None))
         ):
             try:
-                native_actions = provider.plan(embedded_contract, mode=mode)
+                native_actions = provider.plan(contract, mode=mode)
             except TypeError:
                 native_actions = None
             except Exception as exc:  # noqa: BLE001
@@ -906,10 +911,7 @@ def _actions_from_source(
                     len(native_actions),
                 )
                 return native_actions
-        return data.get("actions", [])
-
-    # Load contract
-    contract = load_contract_with_overlay(src, env, logger)
+        return plan_data.get("actions", [])
 
     # Prefer provider.plan() when available — it generates service-level
     # actions (s3.*, glue.*, athena.*) that the provider's apply() can dispatch.
@@ -1462,6 +1464,7 @@ def _run_simple_apply(
     *,
     args,
     contract: Dict[str, Any],
+    gated_contract: Dict[str, Any],
     resolved_mode,
     execution_id: str,
     start_time: float,
@@ -1476,6 +1479,11 @@ def _run_simple_apply(
     actions, show the preview / confirmation, honour ``--dry-run``, dispatch
     to the provider, write rollback state, then render + report. Returns the
     process exit code (``0`` success / ``1`` failure).
+
+    The actions come from ``gated_contract`` (the contract as the pre-apply
+    gate checked it) and ``plan_data`` (the digest-verified plan), never from
+    the file; ``contract`` (which carries ``--config-override``) only picks
+    the provider, project and region, and is what the provider applies with.
 
     ALL apply gates — plan-binding digest, plan/apply mode-mismatch,
     federation-consumes drift, and the data-loss safety gate — run in
@@ -1551,15 +1559,15 @@ def _run_simple_apply(
 
         provider.anchor_dir = source_contract_dir(args.contract, logger, plan_data=plan_data)
 
-    # Get actions from contract — pass the resolved apply mode so
-    # destructive modes (replace / replace-and-build) trigger
+    # Get actions from what the gates checked — pass the resolved apply mode
+    # so destructive modes (replace / replace-and-build) trigger
     # CREATE OR REPLACE TABLE + pre-flight CLONE snapshot in
     # the provider's planner.
     actions = _actions_from_source(
-        args.contract,
-        args.env,
-        provider,
-        logger,
+        contract=gated_contract,
+        plan_data=plan_data,
+        provider=provider,
+        logger=logger,
         mode=resolved_mode.value if resolved_mode is not None else None,
     )
 
@@ -2140,6 +2148,14 @@ def run(args, logger: logging.Logger) -> int:
     except CLIError as exc:
         _log_apply_failure(logger, start_time, exc)
         raise
+    # Simple mode plans its actions from this copy: the contract exactly as
+    # the gate above checked it (for a plan.json, its verified embedded
+    # contract). ``source_contract`` is shared and can still change before
+    # dispatch: the apply hooks get it, and ``--config-override`` is merged
+    # into it after the gate.
+    import copy as _copy
+
+    gated_contract = _copy.deepcopy(source_contract)
     # A YAML source hands the build runner the gated contract; a plan.json
     # keeps handing it the attested plan (``plan_kwargs``), which embeds it.
     build_kwargs: Dict[str, Any] = plan_kwargs or {"contract": source_contract}
@@ -2202,11 +2218,13 @@ def run(args, logger: logging.Logger) -> int:
             # SECURITY (TOCTOU): ``verified_plan_data`` is the deep copy of
             # exactly the structure the planDigest covered. Provider dispatch
             # derives the contract from it (``contract = plan_data.get(...)``
-            # below), so what drives DDL is provably what was digest-checked,
-            # never a re-read of the file. Operator-supplied
-            # ``--config-override`` is still applied afterwards (an explicit
-            # apply-time input, not plan tampering) and mutates a child of
-            # this copy only.
+            # below) and simple mode takes its ``actions`` from it, so what
+            # drives DDL is provably what was digest-checked, never a re-read
+            # of the file. Operator-supplied ``--config-override`` is still
+            # applied afterwards (an explicit apply-time input, not plan
+            # tampering) and mutates a child of this copy only; the actions,
+            # and a destructive mode's re-plan of ``gated_contract``, never
+            # see it.
             plan_data = verified_plan_data
 
             contract = plan_data.get("contract", {})
@@ -2239,8 +2257,8 @@ def run(args, logger: logging.Logger) -> int:
                 use_simple_mode = False
             else:
                 # plan.py flat format. Simple-mode path handles actions via
-                # ``_actions_from_source`` which reads plan_data["actions"]
-                # when args.contract is a .json file.
+                # ``_actions_from_source``, which takes the verified plan's
+                # ``actions`` (``plan_data`` below), never the file's.
                 plan = None
                 use_simple_mode = True
         else:
@@ -2422,6 +2440,7 @@ def run(args, logger: logging.Logger) -> int:
             return _run_simple_apply(
                 args=args,
                 contract=contract,
+                gated_contract=gated_contract,
                 resolved_mode=resolved_mode,
                 execution_id=execution_id,
                 start_time=start_time,

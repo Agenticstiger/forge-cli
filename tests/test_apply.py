@@ -108,65 +108,84 @@ class TestRegister:
 
 
 class TestActionsFromSource:
-    def test_json_source_reads_actions(self, tmp_path):
+    """It resolves actions from the copies ``run()`` gated, and opens no file."""
+
+    @pytest.fixture(autouse=True)
+    def _no_file_is_opened(self):
+        refuse = Mock(side_effect=AssertionError("_actions_from_source re-read the source"))
+        with (
+            patch("fluid_build.cli.apply.read_json", new=refuse),
+            patch("fluid_build.cli.apply.load_contract_with_overlay", new=refuse),
+        ):
+            yield
+
+    def test_json_source_reads_actions(self):
         plan = {"actions": [{"op": "ensure_dataset"}, {"op": "ensure_table"}]}
-        json_file = tmp_path / "plan.json"
-        json_file.write_text(json.dumps(plan))
         provider = _make_provider()
 
-        with patch("fluid_build.cli.apply.read_json", return_value=plan):
-            actions = _actions_from_source(str(json_file), None, provider, logger)
+        actions = _actions_from_source(
+            contract={"id": "test"}, plan_data=plan, provider=provider, logger=logger
+        )
 
         assert len(actions) == 2
         assert actions[0]["op"] == "ensure_dataset"
 
-    def test_yaml_source_uses_provider_plan(self, tmp_path):
-        contract_file = tmp_path / "contract.fluid.yaml"
-        contract_file.write_text("id: test\nname: Test\n")
+    def test_yaml_source_uses_provider_plan(self):
         provider = Mock()
         provider.plan.return_value = [{"op": "s3.ensure_bucket"}]
         contract = {"id": "test"}
 
-        with patch("fluid_build.cli.apply.load_contract_with_overlay", return_value=contract):
-            actions = _actions_from_source(str(contract_file), None, provider, logger)
+        actions = _actions_from_source(contract=contract, provider=provider, logger=logger)
 
         assert len(actions) == 1
         assert actions[0]["op"] == "s3.ensure_bucket"
+        provider.plan.assert_called_once_with(contract, mode=None)
 
-    def test_yaml_source_fallback_to_parser(self, tmp_path):
-        contract_file = tmp_path / "contract.fluid.yaml"
-        contract_file.write_text("id: test\n")
+    def test_yaml_source_fallback_to_parser(self):
         # A spec-less mock with no plan() method
         provider = Mock(spec=[])
-        contract = {"id": "test"}
 
-        with patch("fluid_build.cli.apply.load_contract_with_overlay", return_value=contract):
-            actions = _actions_from_source(str(contract_file), None, provider, logger)
+        actions = _actions_from_source(contract={"id": "test"}, provider=provider, logger=logger)
 
         assert isinstance(actions, list)
 
-    def test_json_source_empty_actions(self, tmp_path):
-        plan = {"actions": []}
-        json_file = tmp_path / "empty_plan.json"
-        json_file.write_text(json.dumps(plan))
+    def test_json_source_empty_actions(self):
         provider = _make_provider()
 
-        with patch("fluid_build.cli.apply.read_json", return_value=plan):
-            actions = _actions_from_source(str(json_file), None, provider, logger)
+        actions = _actions_from_source(
+            contract={"id": "test"}, plan_data={"actions": []}, provider=provider, logger=logger
+        )
 
         assert actions == []
 
-    def test_provider_plan_exception_falls_back(self, tmp_path):
-        contract_file = tmp_path / "contract.fluid.yaml"
-        contract_file.write_text("id: test\n")
+    def test_provider_plan_exception_falls_back(self):
         provider = Mock()
         provider.plan.side_effect = Exception("plan failed")
-        contract = {"id": "test"}
 
-        with patch("fluid_build.cli.apply.load_contract_with_overlay", return_value=contract):
-            actions = _actions_from_source(str(contract_file), None, provider, logger)
+        actions = _actions_from_source(contract={"id": "test"}, provider=provider, logger=logger)
 
         assert isinstance(actions, list)
+
+    def test_destructive_plan_replans_the_given_contract(self):
+        """A replace re-plans the contract it is handed (the verified embedded
+        copy), not ``plan_data["contract"]``, which ``--config-override``
+        mutates after the gate."""
+        verified = {"id": "verified"}
+        plan = {"contract": {"id": "overridden"}, "actions": [{"op": "recorded"}]}
+        provider = Mock()
+        provider.plan.return_value = [{"op": "replanned"}]
+
+        actions = _actions_from_source(
+            contract=verified, plan_data=plan, provider=provider, logger=logger, mode="replace"
+        )
+
+        assert actions == [{"op": "replanned"}]
+        provider.plan.assert_called_once_with(verified, mode="replace")
+
+    def test_takes_keyword_arguments_only(self):
+        """The old ``(path, env, provider, logger)`` call fails loudly."""
+        with pytest.raises(TypeError):
+            _actions_from_source("plan.json", None, _make_provider(), logger)  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
