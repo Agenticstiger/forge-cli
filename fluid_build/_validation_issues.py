@@ -63,7 +63,7 @@ def json_pointer(parts: Iterable[Any]) -> str:
 def _index(items: Sequence[Any], token: str) -> Optional[int]:
     """The position in ``items`` that ``token`` selects: a position, or an item's name."""
     token = token.strip().strip("'\"")
-    if token.isdigit():
+    if token.isascii() and token.isdigit():
         position = int(token)
         return position if position < len(items) else None
     for key in _ITEM_KEYS:
@@ -95,6 +95,17 @@ def _resolve(document: Mapping[str, Any], path: str) -> List[Any]:
 
 
 def message_pointer(message: str, document: Any, default: str = "") -> str:
+    """Where in ``document`` a check's ``message`` is about (see :func:`_message_pointer`).
+
+    Never raises: a message or a document of an unexpected shape gets ``default``.
+    """
+    try:
+        return _message_pointer(message, document, default)
+    except Exception:  # noqa: BLE001 - a pointer must never fail the check that found it
+        return default
+
+
+def _message_pointer(message: str, document: Any, default: str) -> str:
     """Where in ``document`` a check's ``message`` is about, as a JSON pointer.
 
     Checks write their messages for people: most start with the path they are
@@ -105,8 +116,11 @@ def message_pointer(message: str, document: Any, default: str = "") -> str:
     """
     if not isinstance(document, Mapping):
         return default
-    # A marker before the path (``❌``, ``⚠️``, ``- ``) is not part of it.
-    text = re.sub(r"^\W+", "", message)
+    # A marker before the path (``❌``, ``⚠️``, ``- ``) is not part of it; a leading
+    # ``[orders]`` is an expose named in brackets, as the sovereignty check writes it.
+    text = re.sub(r"^[^\w\[]+", "", message)
+    if text.startswith("["):
+        text = "exposes" + text
     located = _LOCATED.match(text)
     if located:
         text = located.group("path")

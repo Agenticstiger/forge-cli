@@ -20,9 +20,9 @@ Copy this checklist and tick it off as you go:
       product: edit only the lines the request changes and leave every other field as it is.
 - [ ] Replace every starter value (table below).
 - [ ] Validate. Fix the first reported path, validate again, until it prints
-      `Valid FLUID contract` with no warnings. A warning is a placeholder or a starter
-      value left in the contract; `--format json` lists each one in `issues` with its
-      `pointer` and its `fix`.
+      `Valid FLUID contract` with no warnings (`--strict` fails on any). Many are a
+      placeholder or a starter value left in the contract; `--format json` lists each
+      finding in `issues` with its `pointer` and its `fix`.
 - [ ] Report what you built, each assumption you made, and the final validate line.
 
 ```bash

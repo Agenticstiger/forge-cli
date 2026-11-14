@@ -647,3 +647,163 @@ def test_every_example_is_valid_fluid_that_passes_the_lint(
     assert isinstance(doc, dict), example
     code, result = _json(run, _contract(**doc), "--strict")
     assert code == 0, f"{example}: {result}"
+
+
+# ---------------------------------------------------------------------------
+# Defect scan of this change: each confirmed defect, pinned
+# ---------------------------------------------------------------------------
+
+
+def _lint(contract: Dict[str, Any], event: str) -> List[Any]:
+    from fluid_build.cli._authoring_lint import lint_contract
+
+    return [f for f in lint_contract(contract) if f.event == event]
+
+
+@pytest.mark.parametrize(
+    "sql", ["SELECT 1 AS identifier FROM t", "select 1 as id_x from t", "SELECT 1 AS ids"]
+)
+def test_a_longer_name_is_not_the_starter_sql(sql: str) -> None:
+    assert not _lint(_contract(builds=[{"properties": {"sql": sql}}]), "contract_template_residue")
+
+
+def test_residue_is_reported_whatever_else_the_value_holds() -> None:
+    contract = _contract(description="starter-product, contact test@example.com")
+
+    assert [f.pointer for f in _lint(contract, "contract_template_residue")] == ["/description"]
+
+
+@pytest.mark.parametrize(
+    "markup", ["<h1>Orders</h1>", "<blockquote>x</blockquote>", "Press <kbd>Enter</kbd>"]
+)
+def test_html_markup_is_not_a_placeholder(markup: str) -> None:
+    assert not _lint(_contract(description=markup), "contract_placeholder_value")
+
+
+def test_a_todo_value_in_sql_is_data_but_a_todo_comment_is_not() -> None:
+    data = "SELECT * FROM t WHERE status = 'TODO'"
+    comment = "SELECT * FROM t -- TODO: filter cancelled orders"
+
+    assert not _lint(
+        _contract(builds=[{"properties": {"sql": data}}]), "contract_placeholder_value"
+    )
+    assert _lint(_contract(builds=[{"properties": {"sql": comment}}]), "contract_placeholder_value")
+
+
+def test_a_backslash_escape_does_not_hide_a_join() -> None:
+    sql = "SELECT 'it\\'s' AS a, o.* FROM orders o JOIN customers c ON o.c = c.id"
+
+    assert _lint(_contract(builds=[{"properties": {"sql": sql}}]), "contract_sdp_joins")
+
+
+def test_an_address_under_a_contact_block_is_read() -> None:
+    """``$defs.notification`` puts the address in ``target``, under ``notifications``."""
+    notifications = [{"type": "email", "target": "test@example.com"}]
+    contract = _contract(builds=[{"execution": {"notifications": notifications}}])
+
+    [finding] = _lint(contract, "contract_placeholder_email")
+    assert finding.pointer == "/builds/0/execution/notifications/0/target"
+
+
+@pytest.mark.parametrize("key", ["endpoint", "authorizedUsers", "authorization"])
+def test_a_key_that_only_contains_a_contact_word_is_not_a_contact(key: str) -> None:
+    contract = _contract(exposes=[{"binding": {"location": {key: "svc@db.example.com"}}}])
+
+    assert not _lint(contract, "contract_placeholder_email")
+
+
+def test_an_sdp_with_builds_of_the_wrong_type_keeps_the_other_findings() -> None:
+    from fluid_build.cli._authoring_lint import lint_contract
+
+    contract = _contract(description="TODO")
+    contract["builds"] = 5
+
+    assert [f.event for f in lint_contract(contract)] == ["contract_placeholder_value"]
+
+
+@pytest.mark.parametrize("message", ["expose '²': bad", "exposes[²] x", "builds[³].sql: y"])
+def test_a_non_ascii_digit_never_breaks_the_pointer(message: str) -> None:
+    document = {"exposes": [{"exposeId": "²"}], "builds": []}
+
+    assert message_pointer(message, document, default="/d") in {"/exposes/0", "/builds"}
+
+
+def test_a_duplicate_contract_id_on_a_non_ascii_expose_id_is_reported(run) -> None:
+    contract = _contract()
+    second = copy.deepcopy(contract["exposes"][0])
+    second["exposeId"] = "²"
+    contract["exposes"][0]["contract"]["id"] = second["contract"]["id"] = "sales.orders"
+    contract["exposes"].append(second)
+
+    code, doc = _json(run, contract)
+
+    assert code == 1, "the run reports, it does not crash"
+    assert _issues(doc, "ERR_CONTRACT_DUPLICATE_ID")
+
+
+def test_a_sovereignty_message_points_at_the_expose_it_names() -> None:
+    message = "❌ [orders_raw] Region 'us-east1' is not in allowedRegions"
+
+    assert message_pointer(message, BASE, default="/sovereignty") == "/exposes/0"
+
+
+@pytest.mark.parametrize(
+    ("contract_id", "build_id", "pointer"),
+    [("1orders", "ingest_orders", "/id"), ("sales.orders_raw", "2bad", "/builds/0/id")],
+)
+def test_a_build_id_warning_points_at_the_id(run, contract_id, build_id, pointer) -> None:
+    _, doc = _json(run, _contract(id=contract_id, builds=[{"id": build_id}]))
+
+    [issue] = _issues(doc, "ERR_CONTRACT_BUILD_ID")
+    assert issue["pointer"] == pointer
+
+
+def test_a_top_level_schema_error_gets_its_own_example() -> None:
+    assert catalog.example_for("contract_schema_pattern", "/id") == "id: sales.orders_raw\n"
+    assert catalog.example_for("contract_schema_enum", "/fluidVersion").startswith("fluidVersion:")
+    assert catalog.example_for("contract_schema_required", "").startswith("fluidVersion:")
+
+
+def test_a_bundles_contract_rule_issues_carry_code_pointer_and_fix(
+    run, tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    from fluid_build.cli import main
+
+    contract = tmp_path / "contract.fluid.yaml"
+    contract.write_text(
+        yaml.safe_dump(_contract(metadata={"owner": {"email": "x@example.com"}})),
+        encoding="utf-8",
+    )
+    assert main(["bundle", str(contract), "--format", "tgz", "--out", str(tmp_path / "b.tgz")]) == 0
+    capsys.readouterr()
+    main(["validate", str(tmp_path / "b.tgz"), "--offline", "--format", "json"])
+    out = capsys.readouterr().out
+    report = json.loads(out[out.index("{") :])
+
+    [issue] = [i for i in report["issues"] if i.get("rule") == "ERR_CONTRACT_PLACEHOLDER_EMAIL"]
+    assert issue["code"] == "CONTRACT-RULE"
+    assert issue["pointer"] == "/metadata/owner/email" and issue["fix"] and issue["example"]
+
+
+def test_a_finding_in_a_fragment_names_the_fragments_file_and_line(
+    tmp_path: Path, run, capsys: pytest.CaptureFixture
+) -> None:
+    from fluid_build.cli import main
+
+    root = tmp_path / "p"
+    (root / "frag").mkdir(parents=True)
+    (root / "frag" / "owner.yaml").write_text(
+        "team: sales-data\nemail: x@example.com\n", encoding="utf-8"
+    )
+    doc = _contract()
+    doc["metadata"]["owner"] = {"$ref": "./frag/owner.yaml"}
+    (root / "contract.fluid.yaml").write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    capsys.readouterr()
+    main(["validate", str(root / "contract.fluid.yaml"), "--offline", "--format", "json"])
+    out = capsys.readouterr().out
+    report = json.loads(out[out.index("{") :])
+
+    [issue] = [i for i in report["issues"] if i["code"] == "ERR_CONTRACT_PLACEHOLDER_EMAIL"]
+    assert issue["message"].startswith("frag/owner.yaml:2 (metadata.owner.email):"), issue
+    assert issue["pointer"] == "/metadata/owner/email"

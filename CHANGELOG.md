@@ -29,7 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   joins (`ERR_CONTRACT_SDP_JOINS`) contradicts the product's own classification: an SDP
   (Bronze) reads one source as it is, so a product that joins is an ADP (Silver). Each warning
   names its place and ends with what to write instead, so the text output is enough to act on;
-  the same warnings are a bundle's (`fluid validate <bundle>.tgz`) `CONTRACT-RULE` issues.
+  the same warnings are a bundle's (`fluid validate <bundle>.tgz`) `CONTRACT-RULE` issues,
+  each with its `rule` (the `ERR_*` code), `pointer`, `fix`, `example` and `docs_url`. A
+  contract scaffolded by `fluid forge --template` or `fluid init` keeps its placeholder owner
+  and starter values until they are replaced, so stage 2 of a generated pipeline (`fluid
+  validate <bundle> --strict`) fails on them until then.
   Many shipped examples and quickstart templates carry a placeholder owner email on purpose
   (it is the value to replace), so they now validate with that warning; the three AWS examples
   the test suite validates with `--strict` drop theirs.
@@ -45,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unexpected key itself for a field the object does not take), and every contract rule's
   finding carries the code of its check (`ERR_CONTRACT_PRODUCT_TYPE_INCONSISTENT`,
   `ERR_CONTRACT_GCP_BINDING`, ...) with the pointer its message names. A clean contract keeps
-  the document it always had. The error catalog gains 38 codes, and each of the 44 codes a
+  the document it always had. The error catalog gains 38 codes, and each of the 45 codes a
   finding can carry has a fix and an example that is valid FLUID and passes the lint (pinned
   by `tests/cli/test_validate_issues.py`, which also fails a new finding recorded without a
   code); the troubleshooting skill's `error-codes.md` lists them. Shape borrowed from Spectral's results and ruff's JSON diagnostics, with the location

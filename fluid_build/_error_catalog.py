@@ -1081,7 +1081,8 @@ _BLOCK_EXAMPLES: Tuple[Tuple[str, str], ...] = (
     (r"/exposes(/|\Z)", _EXPOSE),
     (r"/builds(/|\Z)", _BUILD),
     (r"/metadata(/|\Z)", _METADATA),
-    (r"(/[^/]+)?\Z", _CONTRACT),
+    (r"/fluidVersion\Z", "fluidVersion: {FLUID_VERSION}\n"),
+    (r"\Z", _CONTRACT),
 )
 _EXAMPLES: Dict[str, str] = {
     "contract_placeholder_email": _OWNER,

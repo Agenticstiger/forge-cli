@@ -63,6 +63,13 @@ class ValidationIssue:
     line: Optional[int] = None
     column: Optional[int] = None
     code: Optional[str] = None
+    #: A contract rule's finding, as ``fluid validate --format json`` lists it in
+    #: ``issues``: its ``ERR_*`` code, RFC 6901 pointer, fix, example and docs link.
+    rule: Optional[str] = None
+    pointer: Optional[str] = None
+    fix: Optional[str] = None
+    example: Optional[str] = None
+    docs_url: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -77,6 +84,9 @@ class ValidationIssue:
             d["column"] = self.column
         if self.code is not None:
             d["code"] = self.code
+        for key in ("rule", "pointer", "fix", "example", "docs_url"):
+            if getattr(self, key) is not None:
+                d[key] = getattr(self, key)
         return d
 
 

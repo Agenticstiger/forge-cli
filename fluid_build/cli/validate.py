@@ -918,7 +918,7 @@ def _validate_contract_for_version(
         offline_only=args.offline,
         locate=locate,
     )
-    _run_contract_rules(contract, target_version, validation_result, args, logger)
+    _run_contract_rules(contract, target_version, validation_result, args, logger, locate=locate)
     return validation_result
 
 
@@ -928,6 +928,7 @@ def _run_contract_rules(
     validation_result: ValidationResult,
     args,
     logger: logging.Logger,
+    locate: Optional[Callable[..., Optional[str]]] = None,
 ) -> None:
     """The contract-level rules ``fluid validate`` runs after JSON-Schema.
 
@@ -1294,7 +1295,7 @@ def _run_contract_rules(
 
         # --- Composition rules, then the authoring lint (WARNINGS) -----------
         _composition_check(validation_result, contract, args, logger)
-        _authoring_lint_check(validation_result, contract)
+        _authoring_lint_check(validation_result, contract, locate)
 
 
 def _composition_check(
@@ -1340,7 +1341,11 @@ def _composition_check(
             info(logger, f"Composition rule check skipped: {exc}")
 
 
-def _authoring_lint_check(validation_result: ValidationResult, contract: Mapping[str, Any]) -> None:
+def _authoring_lint_check(
+    validation_result: ValidationResult,
+    contract: Mapping[str, Any],
+    locate: Optional[Callable[..., Optional[str]]] = None,
+) -> None:
     """The authoring lint (:mod:`fluid_build.cli._authoring_lint`), as warnings.
 
     What an unedited template or an agent's guess leaves in a contract:
@@ -1351,7 +1356,7 @@ def _authoring_lint_check(validation_result: ValidationResult, contract: Mapping
     try:
         from fluid_build.cli._authoring_lint import lint_contract
 
-        for finding in lint_contract(contract):
+        for finding in lint_contract(contract, locate):
             validation_result.add_warning(
                 finding.message, event=finding.event, pointer=finding.pointer, fix=finding.fix
             )
@@ -1402,7 +1407,8 @@ def _consume_pointer(contract: Mapping[str, Any], upstream_id: str) -> str:
     """The pointer to the ``consumes[]`` entry naming ``upstream_id`` (``/consumes`` if none)."""
     from fluid_build._validation_issues import json_pointer
 
-    for index, entry in enumerate(contract.get("consumes") or []):
+    consumes = contract.get("consumes")
+    for index, entry in enumerate(consumes if isinstance(consumes, list) else []):
         if isinstance(entry, Mapping) and upstream_id in (
             str(entry.get("productId")),
             str(entry.get("ref")),
@@ -1482,7 +1488,25 @@ def _build_id_check(validation_result, contract: Mapping[str, Any]) -> None:
         )
         return
     if message is not None:
-        _add_findings(validation_result, contract, "contract_build_id", warnings=[message])
+        validation_result.add_warning(
+            message, event="contract_build_id", pointer=_build_id_pointer(contract, message)
+        )
+
+
+def _build_id_pointer(contract: Mapping[str, Any], message: str) -> str:
+    """``/id`` for a ``contract.id`` warning, ``/builds/N/id`` for a build's id."""
+    from fluid_build._validation_issues import json_pointer
+
+    kind, _, rest = message.partition(" ")
+    if kind == "contract.id":
+        return "/id"
+    quoted = rest.split("'")
+    value = quoted[1] if len(quoted) > 2 else None
+    builds = contract.get("builds")
+    for index, build in enumerate(builds if isinstance(builds, list) else []):
+        if isinstance(build, Mapping) and value is not None and str(build.get("id")) == value:
+            return json_pointer(["builds", index, "id"])
+    return "/builds"
 
 
 def _duplicate_contract_id_errors(contract: Mapping[str, Any]) -> List[str]:
@@ -2315,8 +2339,14 @@ def _bundle_contract_rule_issues(
     _run_extension_validators(contract, result, logger)
     _run_role_validators(contract, result, logger)
 
+    from fluid_build._validation_issues import build_issues
+
     # A note is the report's info: counted and listed, never failed on by --strict.
+    # build_issues lists the same findings in the same order (errors, warnings, notes),
+    # each with the check's code, its pointer, a fix and an example.
     found = (("error", result.errors), ("warning", result.warnings), ("info", result.notes))
+    rows = [(severity, msg) for severity, messages in found for msg in messages]
+    issues = build_issues(result)
     return [
         ValidationIssue(
             file="contract.resolved.yaml",
@@ -2324,7 +2354,18 @@ def _bundle_contract_rule_issues(
             severity=severity,
             message=msg,
             code="CONTRACT-RULE",
+            **_issue_fields(issues[index] if index < len(issues) else {}),
         )
-        for severity, messages in found
-        for msg in messages
+        for index, (severity, msg) in enumerate(rows)
     ]
+
+
+def _issue_fields(issue: Mapping[str, Any]) -> Dict[str, Any]:
+    """A bundle row's share of an ``issues[]`` entry: its code, pointer, fix and example."""
+    return {
+        "rule": issue.get("code"),
+        "pointer": issue.get("pointer"),
+        "fix": issue.get("fix"),
+        "example": issue.get("example"),
+        "docs_url": issue.get("docs_url"),
+    }

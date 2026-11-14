@@ -37,7 +37,7 @@ them.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterator, List, Mapping, Optional, Tuple
 
 from fluid_build._validation_issues import json_pointer
@@ -57,10 +57,11 @@ class LintFinding:
     pointer: str
     message: str
     fix: str
+    parts: Path = ()
 
 
 def _finding(event: str, parts: Path, what: str, fix: str) -> LintFinding:
-    return LintFinding(event, json_pointer(parts), f"{what} {fix}", fix)
+    return LintFinding(event, json_pointer(parts), f"{what} {fix}", fix, parts)
 
 
 #: Blocks whose values the lint never reads or quotes: a ``catalogAuth`` field names an
@@ -110,12 +111,27 @@ def _key(parts: Path) -> str:
 _EMAIL = re.compile(
     r"(?:(?<![^\s<(\"',;])|(?<=mailto:))([A-Za-z0-9._+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)(?!\.?[\w@-])"
 )
-#: A key that holds a way to reach someone: the contact emails this rule is about.
-#: An access grant's principal is not one (the governance check owns principals).
-_CONTACT_KEY = re.compile(
-    r"e-?mail|contact|owner|oncall|on_call|maintainer|steward|author|dpo|support|notif|alert",
-    re.I,
+#: The words of a key that holds a way to reach someone: the contact emails this rule
+#: is about. An access grant's principal is not one (the governance check owns those).
+_CONTACT_WORDS = frozenset(
+    """email emails mail contact contacts owner owners oncall maintainer maintainers steward
+    stewards author authors dpo support alert alerts notification notifications notify
+    escalation""".split()
 )
+
+
+def _is_contact_path(parts: Path) -> bool:
+    """Whether a key on ``parts`` names a contact: ``ownerEmail``, ``on_call``, ``notifications``."""
+    for part in parts:
+        if not isinstance(part, str):
+            continue
+        words = [w.lower() for w in re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+", part)]
+        joined = "".join(words)
+        if _CONTACT_WORDS.intersection(words) or joined in _CONTACT_WORDS or "oncall" in joined:
+            return True
+    return False
+
+
 #: RFC 2606 section 3: second-level names reserved for documentation, with any subdomain.
 _RESERVED_DOMAINS = ("example.com", "example.net", "example.org")
 #: RFC 2606 section 2 and RFC 6761: top-level names no mailbox is ever at.
@@ -200,7 +216,7 @@ def _why_placeholder(local: str, domain: str) -> Optional[str]:
 
 def _placeholder_emails(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
     for parts, value in _strings(contract):
-        if not _CONTACT_KEY.search(_key(parts)) or "://" in value:
+        if not _is_contact_path(parts) or "://" in value:
             continue  # not a contact field, or a URI (whose userinfo is no address)
         for match in _EMAIL.finditer(value):
             local, domain = match.group(1), match.group(2)
@@ -238,6 +254,8 @@ _RESIDUE_TOKENS = (
     "minimal starter contract",
     "starter template",
 )
+#: Each token on its own, not as part of a longer name (``select 1 as identifier``).
+_RESIDUE_TOKEN_RE = {t: rf"(?<![\w-]){re.escape(t)}(?![\w-])" for t in _RESIDUE_TOKENS}
 #: Residue only as a whole value: a real team's name may contain the word.
 _RESIDUE_VALUES = frozenset({"data-team"})
 
@@ -246,7 +264,7 @@ def _residue_token(value: str) -> Optional[str]:
     text = re.sub(r"\s+", " ", value.strip().lower())
     if text in _RESIDUE_VALUES:
         return text
-    return next((token for token in _RESIDUE_TOKENS if token in text), None)
+    return next((t for t in _RESIDUE_TOKENS if re.search(_RESIDUE_TOKEN_RE[t], text)), None)
 
 
 def _slug(text: str) -> str:
@@ -282,8 +300,8 @@ def _template_residue(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
     reported_semantics = set()
     for parts, value in _strings(contract):
         token = _residue_token(value)
-        if token is None or _EMAIL.search(value):
-            continue  # an address is the placeholder-email rule's
+        if token is None:
+            continue
         if "semantics" in parts:
             # The starter's semantic model is one block: report it once, as a block.
             parts = parts[: parts.index("semantics") + 1]
@@ -309,8 +327,11 @@ _ANGLE = re.compile(r"(?<![\w<])<([A-Za-z][A-Za-z0-9 _.:-]{0,60})>")
 _CODE_SPAN = re.compile(r"`[^`]*`")
 #: HTML a description may carry, which is markup, not a stand-in.
 _HTML_TAGS = frozenset(
-    {"a", "b", "br", "code", "em", "hr", "i", "li", "ol", "p", "pre", "small", "span"}
-    | {"strong", "sub", "sup", "table", "td", "th", "tr", "u", "ul", "div", "img"}
+    """a abbr address article aside b blockquote body br caption center cite code col
+    colgroup dd del details dfn div dl dt em figcaption figure font footer h1 h2 h3 h4 h5
+    h6 head header hr html i img ins kbd li main mark nav ol p pre q s samp section small
+    span strike strong sub summary sup table tbody td tfoot th thead time tr tt u ul var
+    wbr""".split()
 )
 #: Keys whose value is code (SQL, an expression, a regex): ``<`` there is an operator.
 _CODE_KEYS = frozenset(
@@ -320,6 +341,8 @@ _CODE_KEYS = frozenset(
 
 
 def _placeholder(value: str, parts: Path) -> Optional[str]:
+    if _key(parts) in _CODE_KEYS:
+        value = _SQL_LITERAL.sub("''", value)  # a literal is data; a comment's TODO is not
     marker = _MARKER.search(value) or _FILL_IN.search(value)
     if marker:
         return marker.group(0)
@@ -355,7 +378,8 @@ _JOIN = re.compile(r"\bJOIN\b(?!\s+(?:LATERAL|UNNEST|TABLE|FLATTEN|EXPLODE)\b)",
 
 #: A comment or a string literal, left to right in one pass; one left open runs to the
 #: end, so an unterminated ``/*`` or ``'`` is read once, not once per later match.
-_SQL_NOISE = re.compile(r"--[^\n]*|/\*.*?(?:\*/|\Z)|'(?:[^']|'')*(?:'|\Z)", re.S)
+_SQL_LITERAL = re.compile(r"'(?:[^'\\]|\\.|'')*(?:'|\Z)", re.S)
+_SQL_NOISE = re.compile(r"--[^\n]*|/\*.*?(?:\*/|\Z)|" + _SQL_LITERAL.pattern, re.S)
 
 
 def _sql_code(sql: str) -> str:
@@ -374,7 +398,8 @@ def _sdp_joins(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
     product_type = get_product_type(str(declared)) if declared else None
     if product_type is None or product_type.code != "SDP":
         return
-    for index, build in enumerate(contract.get("builds") or []):
+    builds = contract.get("builds")
+    for index, build in enumerate(builds if isinstance(builds, list) else []):
         properties = build.get("properties") if isinstance(build, Mapping) else None
         sql = properties.get("sql") if isinstance(properties, Mapping) else None
         if not isinstance(sql, str) or not _JOIN.search(_sql_code(sql)):
@@ -389,11 +414,23 @@ def _sdp_joins(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
         )
 
 
-def lint_contract(contract: Any) -> List[LintFinding]:
-    """Every authoring-lint finding in ``contract``, rule by rule, in document order."""
+def lint_contract(contract: Any, locate: Optional[Any] = None) -> List[LintFinding]:
+    """Every authoring-lint finding in ``contract``, rule by rule, in document order.
+
+    ``locate`` (the loader's, as JSON-Schema errors get it) names the fragment file and
+    line a value was written at: ``frag/owner.yaml:3 (metadata.owner.email): ...``.
+    """
     if not isinstance(contract, Mapping):
         return []
     findings: List[LintFinding] = []
     for rule in (_placeholder_emails, _template_residue, _placeholder_values, _sdp_joins):
         findings.extend(rule(contract))
-    return findings
+    return [_located(f, locate) for f in findings] if locate is not None else findings
+
+
+def _located(finding: LintFinding, locate: Any) -> LintFinding:
+    where = locate(list(finding.parts))
+    dotted = _dotted(finding.parts)
+    if not where or not finding.message.startswith(dotted):
+        return finding
+    return replace(finding, message=f"{where} ({dotted}){finding.message[len(dotted):]}")
