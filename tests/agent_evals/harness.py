@@ -45,7 +45,8 @@ Every agent arm runs apart from the operator's own setup and data:
   the workspace only and only the ``fluid`` stages a scenario needs; Codex: a
   permissions profile that writes only in the workspace, reads only it and what
   ``fluid`` imports, and has no network, plus execpolicy rules that forbid the
-  ``fluid`` stages the Claude list leaves out.
+  ``fluid`` stages that act on an account or outside the workspace. Codex has no tool
+  allowlist, so any other command runs, inside that profile.
 
 The forge arm gets the same environment. The ``claude -p`` that forge itself starts
 runs in forge's own temp directory and carries ``--setting-sources=``,
@@ -142,8 +143,11 @@ CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CODEX_PROVIDERS = ("openai", "ollama")
 #: The permissions profile a Codex arm runs under (``default_permissions``).
 CODEX_PROFILE = "fluid-eval"
-#: fluid stages a Codex arm may not run, as execpolicy ``forbidden`` rules: those
-#: ``ALLOWED_TOOLS`` leaves out of the Claude arms (``test_harness`` checks the two agree).
+#: fluid stages a Codex arm may not run, as execpolicy ``forbidden`` rules: the ones that
+#: act on an account or outside the workspace, which ``ALLOWED_TOOLS`` never grants the
+#: Claude arms either (``test_harness`` checks both). It is not the complement of
+#: ``ALLOWED_TOOLS``: Codex has no tool allowlist, so any other command runs, inside the
+#: permissions profile (workspace only, no network).
 CODEX_FORBIDDEN_STAGES = ("apply", "publish", "scaffold-ide", "schedule-sync", "policy-apply")
 #: Codex features that reach past the workspace and its shell (from ``codex features
 #: list``, 0.154.0): hosted tools, apps and plugins, browser and computer use, memories,
@@ -299,6 +303,12 @@ def load_scenario(path: Path) -> Scenario:
     meta = yaml.safe_load((path / "scenario.yaml").read_text(encoding="utf-8")) or {}
     forge = meta.get("forge") or {}
     should_trigger = bool(meta.get("should_trigger", True))
+    wrong = [a for a in meta.get("arms") or () if a not in CONDITIONS]
+    if wrong:
+        raise SystemExit(
+            f"scenario {path.name}: arms names conditions ({', '.join(CONDITIONS)}), "
+            f"not {wrong}: skill runs both skill arms"
+        )
     contracts = meta.get("contracts")
     return Scenario(
         id=path.name,
@@ -850,12 +860,20 @@ def _load_contracts(
     return docs, texts, valid, outputs
 
 
-def fired_skills(transcript: Optional[Dict[str, Any]]) -> List[str]:
+#: A shell read of every skill at once (``cat .agents/skills/*/SKILL.md``).
+_ALL_SKILLS_READ = re.compile(r"skills/\*+/(?:\*+/)*SKILL\.md")
+
+
+def fired_skills(
+    transcript: Optional[Dict[str, Any]], installed: Optional[Sequence[str]] = None
+) -> List[str]:
     """The FLUID skills a run used: a ``Skill`` tool call naming one (``fluid:<name>``
     from the plugin counts), or a read of one of its files, with the ``Read`` tool or a
-    shell command naming its directory (``head .claude/skills/<name>/SKILL.md``). Codex
-    has no skill tool: it lists each skill's ``SKILL.md`` path and reads the file with a
-    shell command, so for Codex the shell commands are the whole record."""
+    shell command that names its directory (``head .claude/skills/<name>/SKILL.md``,
+    ``cd .agents/skills && cat <name>/SKILL.md``). A glob over every skill's
+    ``SKILL.md`` fires each one ``installed`` in the workspace (all, when not given).
+    Codex has no skill tool: it lists each skill's ``SKILL.md`` path and reads the
+    file with a shell command, so for Codex the shell commands are the whole record."""
     if not transcript:
         return []
     fired = set()
@@ -865,10 +883,19 @@ def fired_skills(transcript: Optional[Dict[str, Any]]) -> List[str]:
             fired.add(base)
     texts = [*(transcript.get("skill_files_read") or []), *(transcript.get("bash_commands") or [])]
     for skill in FLUID_SKILLS:
-        path = re.compile(rf"skills/{re.escape(skill)}(?![\w-])")
+        name = re.escape(skill)
+        path = re.compile(rf"skills/{name}(?![\w-])|(?<![\w-]){name}/(?:SKILL\.md|references/)")
         if any(path.search(str(text)) for text in texts):
             fired.add(skill)
+    if any(_ALL_SKILLS_READ.search(str(text)) for text in texts):
+        fired |= set(FLUID_SKILLS if installed is None else installed)
     return sorted(fired)
+
+
+def _installed_skills(ws: Path) -> List[str]:
+    """The FLUID skills a scaffold-ide target put in the workspace."""
+    roots = (".claude/skills", ".agents/skills", ".kiro/skills")
+    return [s for s in FLUID_SKILLS if any((ws / r / s / "SKILL.md").is_file() for r in roots)]
 
 
 def _contracts_in(root: Path) -> Dict[str, bytes]:
@@ -922,7 +949,7 @@ def grade(scenario: Scenario, ws: Path, transcript: Optional[Dict[str, Any]] = N
         changed = _contract_changes(scenario, ws)
         results = [CheckResult("contracts_untouched", not changed, f"{changed}")]
         if transcript is not None:
-            fired = fired_skills(transcript)
+            fired = fired_skills(transcript, _installed_skills(ws))
             results.append(CheckResult("no_skill_fired", not fired, f"{fired}"))
     default = scenario.contracts[0] if scenario.contracts else ""
     for check in scenario.checks:
@@ -1436,7 +1463,7 @@ def _codex_config(run_dir: Path, readable: Sequence[Path]) -> str:
 
 
 def _codex_rules() -> str:
-    """execpolicy rules: the fluid stages ``ALLOWED_TOOLS`` keeps from the Claude arms.
+    """execpolicy rules: the ``CODEX_FORBIDDEN_STAGES`` of fluid.
 
     Codex has no tool allowlist. A ``forbidden`` rule rejects the command before it runs,
     and the agent is told so, as a Claude arm is told of a denied call.
@@ -1572,7 +1599,8 @@ def parse_codex_stream(lines: Iterable[str], stderr: str = "") -> Dict[str, Any]
     Event and item names follow codex-rs ``exec/src/exec_events.rs``: ``turn.completed``
     carries ``usage``, ``turn.failed`` and a top-level ``error`` end the run, and each
     ``item.completed`` has a typed ``item`` (``command_execution`` holds the shell
-    command). An ``error`` *item* is a warning. A command an execpolicy rule rejects is
+    command). An ``error`` *item* is a warning, and a top-level ``error`` that a
+    ``turn.completed`` follows was recovered from (a reconnect). A command an execpolicy rule rejects is
     read from stderr, so the transcript keeps the attempt as a Claude transcript keeps a
     denied call. Codex reads a skill with a shell command, so a skill read shows up in
     ``bash_commands`` (see ``fired_skills``).
@@ -1588,13 +1616,19 @@ def parse_codex_stream(lines: Iterable[str], stderr: str = "") -> Dict[str, Any]
     }
     usage: List[Dict[str, Any]] = []
     error: Optional[str] = None
+    transient = False  # a top-level ``error`` a later ``turn.completed`` recovers from
     for line in lines:
         try:
             msg = json.loads(line)
         except ValueError:
             continue
-        if isinstance(msg, dict):
-            error = _codex_event(info, usage, msg) or error
+        if not isinstance(msg, dict):
+            continue
+        found = _codex_event(info, usage, msg)
+        if found is not None:
+            error, transient = found, msg.get("type") == "error"
+        elif transient and msg.get("type") == "turn.completed":
+            error, transient = None, False
     for command in _CODEX_REJECTED.findall(stderr or ""):
         info["bash_commands"].append(command)
         info["rejected_commands"].append(command)
@@ -1756,7 +1790,15 @@ def preflight(arms: Sequence[str], cfg: RunConfig) -> None:
         problems.append(f"unknown arm(s) {unknown}; choose from {', '.join(ARMS)}")
     if cfg.runs < 1:
         problems.append(f"--runs must be 1 or more, not {cfg.runs}")
-    if any(ARM_SPECS[a].agent == "codex" for a in arms if a in ARM_SPECS):
+    agents = {ARM_SPECS[a].agent for a in arms if a in ARM_SPECS}
+    if "claude-code" in agents and cfg.effort not in CLAUDE_EFFORTS:
+        problems.append(f"--effort must be one of {', '.join(CLAUDE_EFFORTS)}, not {cfg.effort!r}")
+    if "codex" in agents:
+        if cfg.codex_provider not in CODEX_PROVIDERS:
+            problems.append(
+                f"--codex-provider must be one of {', '.join(CODEX_PROVIDERS)}, "
+                f"not {cfg.codex_provider!r}"
+            )
         if shutil.which(cfg.codex) is None:
             problems.append(f"the codex arms need the codex CLI; {cfg.codex!r} is not on PATH")
         if not cfg.codex_model:
@@ -1802,7 +1844,10 @@ def run(
     earlier: Dict[str, Any] = {}
     if (cfg.out / "results.json").is_file():
         earlier = json.loads((cfg.out / "results.json").read_text(encoding="utf-8"))
+    earlier_meta = earlier.get("meta") or {}
     kept = [r for r in earlier.get("runs", []) if _run_key(r) not in redone]
+    for r in kept:  # stamped before records carried run_meta: keep its own run's values
+        r.setdefault("run_meta", {k: v for k, v in earlier_meta.items() if k in _LEGACY_META})
     every = load_scenarios()
     ids = {s.id for s in scenarios} | set((earlier.get("meta") or {}).get("scenarios", []))
     order = [s.id for s in every]
@@ -1820,6 +1865,7 @@ def run(
         "arms": [a for a in ARMS if a in used_arms],
         "scenarios": [i for i in order if i in ids],
         "controls": [s.id for s in every if s.id in ids and not s.should_trigger],
+        **({"notes": earlier_meta["notes"]} if "notes" in earlier_meta else {}),
         **common,
     }
     (cfg.out / "results.json").write_text(
@@ -1827,6 +1873,10 @@ def run(
     )
     (cfg.out / "report.md").write_text(render_report(meta, records), encoding="utf-8")
     return records
+
+
+#: What a ``meta`` written before records carried ``run_meta`` held about every run.
+_LEGACY_META = ("model", "claude_code_version", "forge_src", "forge_src_commit", "skills_commit")
 
 
 def _run_key(r: Dict[str, Any]) -> Tuple[Any, Any, int]:
@@ -2077,6 +2127,12 @@ def summarise_controls(records: Sequence[Dict[str, Any]], arm: str) -> Dict[str,
         checks = (r.get("grade") or {}).get("checks") or []
         return any(c["id"] == check_id and not c["passed"] for c in checks)
 
+    def fired(r: Dict[str, Any]) -> bool:
+        # The grade's own check knows which skills the workspace had installed.
+        checks = (r.get("grade") or {}).get("checks") or []
+        own = [c for c in checks if c["id"] == "no_skill_fired"]
+        return not own[0]["passed"] if own else bool(fired_skills(r))
+
     def done(r: Dict[str, Any]) -> bool:
         if run_status(r):
             return False
@@ -2084,7 +2140,7 @@ def summarise_controls(records: Sequence[Dict[str, Any]], arm: str) -> Dict[str,
 
     return {
         "runs": len(runs),
-        "fired": sum(1 for r in runs if fired_skills(r)),
+        "fired": sum(1 for r in runs if fired(r)),
         "touched": sum(1 for r in runs if failed(r, "contracts_untouched")),
         "done": sum(1 for r in runs if done(r)),
     }
@@ -2151,7 +2207,8 @@ def _arms_table(
         if provider not in ("unknown", "openai"):
             agent = f"{agent} ({provider})"
         model = _meta_value(meta, rs, "model")
-        reported = _meta_value(meta, rs, "model_reported")
+        said = [r for r in rs if (r.get("run_meta") or {}).get("model_reported")]
+        reported = _meta_value(meta, said, "model_reported") if said else "unknown"
         if reported not in ("unknown", model):
             model = f"{model} (ran {reported})"
         version = _meta_value(meta, rs, "agent_version")
@@ -2255,6 +2312,20 @@ def _results_table(records: Sequence[Dict[str, Any]], arms: Sequence[str], k: in
     return lines + [_result_row(records, arm, k) for arm in arms]
 
 
+def _all_errored(records: Sequence[Dict[str, Any]], arms: Sequence[str]) -> List[str]:
+    """A note under the results for each arm whose every run errored: its 0% rates say
+    nothing about the contracts it would write."""
+    lines = []
+    for arm in arms:
+        runs = [r for g in _groups(records, arm).values() for r in g]
+        if runs and all(run_status(r) for r in runs):
+            lines.append(
+                f"- {arm}: all {len(runs)} runs errored (see Failed checks), so its rates say "
+                "nothing about the contracts it would write."
+            )
+    return ["", *lines] if lines else []
+
+
 def _controls_section(records: Sequence[Dict[str, Any]], arms: Sequence[str]) -> List[str]:
     control_arms = [a for a in arms if _groups(records, a, controls=True)]
     if not control_arms:
@@ -2329,6 +2400,7 @@ def render_report(meta: Dict[str, Any], records: Sequence[Dict[str, Any]]) -> st
         *_definitions(k),
         "",
         *_results_table(records, main_arms, k),
+        *_all_errored(records, main_arms),
         *_controls_section(records, arms),
         "",
         *_scenario_table(meta, records, arms, controls),

@@ -64,13 +64,15 @@ arm, with how many of the runs failed each one.
 
 A scenario with `should_trigger: false` is a request no FLUID skill covers: a stdlib
 Python script over a CSV, a README typo next to a valid contract, a DuckDB query. It runs
-the `no-skill` and `skill` conditions on each agent. Instead of the contract checks, every
-control gets two checks:
+the `no-skill` and `skill` conditions on each agent. Instead of the contract checks, a
+control run gets two checks (`grade` on a bare workspace, which has no transcript, gets only
+the second):
 
 - `no_skill_fired`: no FLUID skill was used. That means a Skill tool call naming one, or a
   read of one of its files: with the Read tool, or a shell command that names the skill's
-  directory. Codex reads a skill's `SKILL.md` with a shell command, so for Codex the shell
-  commands are the whole record.
+  directory (`cd .agents/skills && cat <name>/SKILL.md` counts too). A glob over every
+  `SKILL.md` fires each FLUID skill installed in the workspace. Codex reads a skill's
+  `SKILL.md` with a shell command, so for Codex the shell commands are the whole record.
 - `contracts_untouched`: no `*.fluid.yaml` was written, changed or deleted.
 
 The report's negative-controls table gives, per arm, the runs that fired a FLUID skill,
@@ -125,7 +127,8 @@ and `grader_commit`. A run whose workspace is gone keeps its old grade and is li
 Each run's workspace, transcript and stderr stay in the temp dir
 (`<tmp>/fluid-agent-evals-<timestamp>-XXXX/<scenario>/<arm>/run-<n>/`, a fresh `mkdtemp`;
 `results.json` records the path). An `--out` that already holds results keeps the runs a
-new call does not repeat; a run is its scenario, arm and trial number.
+new call does not repeat; a run is its scenario, arm and trial number, so redo a scenario
+with the same `--runs` it had (a smaller one replaces only the first trials).
 
 ## Pinned model and effort
 
@@ -151,11 +154,11 @@ rules in Codex's own terms:
 
 | Rule | Claude Code arms | Codex arms |
 |---|---|---|
-| Workspace | a fresh directory in the system temp dir, outside every repository (Claude Code loads each `CLAUDE.md` on the way up) | the same, and a repository of its own (Codex loads `AGENTS.md` up to the repository root) |
+| Workspace | a fresh directory in the system temp dir, outside every repository (Claude Code loads each `CLAUDE.md` on the way up), and a git repository of its own | the same (Codex loads `AGENTS.md` up to that repository root, so none from above it) |
 | Your setup | `--setting-sources=project,local`: no user CLAUDE.md, skills, plugins or hooks | a fresh `CODEX_HOME` and `HOME` per run: no user config, `AGENTS.md`, skills (Codex reads `$HOME/.agents/skills` too), rules or memories |
 | MCP and extras | `--strict-mcp-config`; auto memory off; `--no-session-persistence` | no MCP servers configured; bundled skills, web search, history, memories, apps, plugins, browser and computer use and subagents off; `--ephemeral` |
 | Environment | allowlisted (`ENV_ALLOWLIST`): no API keys, cloud credentials or tokens; cloud SDK config paths point at nothing | the same; the API key goes into the run's `CODEX_HOME` through `codex login --with-api-key` and is deleted when the run ends |
-| Tools | `--permission-mode dontAsk` with `ALLOWED_TOOLS`: reads and edits in the workspace, a few read-only shell commands, only the `fluid` stages the scenarios need | a permissions profile: writes only in the workspace and the run's `home` and `tmp`; reads only those, what `fluid` imports and Codex's `:minimal` platform set; no network. execpolicy rules forbid `fluid apply`, `publish`, `scaffold-ide`, `schedule-sync` and `policy-apply` |
+| Tools | `--permission-mode dontAsk` with `ALLOWED_TOOLS`: reads and edits in the workspace, a few read-only shell commands, only the `fluid` stages the scenarios need | a permissions profile: writes only in the workspace and the run's `home` and `tmp`; reads only those, the `fluid_build` package (never the checkout: its git-ignored files and the reference solutions), the interpreter and its venv, and Codex's `:minimal` platform set; every run's `codex-home` and the packaged skills denied; no network. execpolicy rules forbid `fluid apply`, `publish`, `scaffold-ide`, `schedule-sync` and `policy-apply` |
 
 Codex passed a `*KEY*` variable through to its commands despite
 `shell_environment_policy.exclude` (0.154.0). That is why the key is stored in

@@ -2115,3 +2115,124 @@ def test_a_version_is_only_looked_up_for_an_agent_that_runs(
 
 def test_a_missing_cli_has_an_unknown_version() -> None:
     assert harness._cli_version("no-such-binary-for-this-test") == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Defect-scan fixes: skill reads by glob or cd, recovered Codex errors, labels
+# ---------------------------------------------------------------------------
+
+AUTHORING = "authoring-fluid-contracts"
+
+
+@pytest.mark.parametrize(
+    "command, installed, expected",
+    [
+        ("cat .agents/skills/*/SKILL.md", None, list(harness.FLUID_SKILLS)),
+        ("head .claude/skills/*/SKILL.md", [AUTHORING], [AUTHORING]),
+        ("cat .agents/skills/*/SKILL.md", [], []),  # no skill installed: nothing read
+        (f"cd .agents/skills && cat {AUTHORING}/SKILL.md", None, [AUTHORING]),
+        (
+            "sed -n 1,40p composing-fluid-data-products/references/x.md",
+            None,
+            ["composing-fluid-data-products"],
+        ),
+        ("cat AGENTS.md", None, []),
+    ],
+)
+def test_a_skill_read_by_glob_or_after_cd_fires(
+    command: str, installed: Any, expected: list
+) -> None:
+    assert harness.fired_skills({"bash_commands": [command]}, installed) == expected
+
+
+def test_a_glob_read_fails_a_control_only_where_skills_are_installed(tmp_path: Path) -> None:
+    control = next(s for s in SCENARIOS if s.id == "control-orders-summary-script")
+    transcript = {"bash_commands": ["cat .agents/skills/*/SKILL.md"]}
+    bare = _workspace(control, tmp_path / "bare")
+    checks = {c.id: c for c in harness.grade(control, bare, transcript).checks}
+    assert checks["no_skill_fired"].passed, "a no-skill workspace has no skill to read"
+    skilled = _workspace(control, tmp_path / "skilled")
+    (skilled / ".agents" / "skills" / AUTHORING).mkdir(parents=True)
+    (skilled / ".agents" / "skills" / AUTHORING / "SKILL.md").write_text("x", encoding="utf-8")
+    checks = {c.id: c for c in harness.grade(control, skilled, transcript).checks}
+    assert not checks["no_skill_fired"].passed
+
+
+@pytest.mark.parametrize(
+    "events, is_error",
+    [
+        ([{"type": "error", "message": "Reconnecting"}, {"type": "turn.completed"}], False),
+        ([{"type": "turn.completed"}, {"type": "error", "message": "stream lost"}], True),
+        ([{"type": "turn.failed", "error": {"message": "x"}}, {"type": "turn.completed"}], True),
+    ],
+)
+def test_a_codex_error_a_completed_turn_follows_was_recovered_from(
+    events: list, is_error: bool
+) -> None:
+    lines = [json.dumps(e) for e in events]
+    assert harness.parse_codex_stream(lines)["result"]["is_error"] is is_error
+
+
+def test_a_run_that_never_reported_its_model_is_not_a_model_mismatch() -> None:
+    stamp = {"agent": "claude-code", "model": "claude-sonnet-5-5", "effort": "medium"}
+    records = [
+        _rec("a", "skill", run_meta={**stamp, "model_reported": "claude-sonnet-5-5"}),
+        _rec("b", "skill", run_meta={**stamp, "model_reported": "claude-sonnet-5-5"}),
+        _rec("c", "skill", timed_out=True, run_meta={**stamp, "model_reported": None}),
+    ]
+    (row,) = [
+        r for r in harness._arms_table(_meta(), records, ["skill"]) if r.startswith("| skill")
+    ]
+    assert "| claude-sonnet-5-5 |" in row and "ran" not in row
+
+
+def test_an_arm_whose_every_run_errored_is_flagged_under_the_results() -> None:
+    records = [_rec("a", "skill")] + [
+        {"scenario": s, "arm": "forge", "harness_error": "refused"} for s in ("a", "b")
+    ]
+    report = harness.render_report(_meta(arms=["skill", "forge"]), records)
+    assert "- forge: all 2 runs errored (see Failed checks)" in report
+    assert "- skill: all" not in report
+
+
+def test_preflight_refuses_an_effort_or_provider_the_agent_would_reject(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="--effort must be one of"):
+        harness.preflight(["skill"], harness.RunConfig(out=tmp_path, effort="ultra"))
+    cfg = harness.RunConfig(out=tmp_path, codex_model="m", codex_provider="Ollama")
+    with pytest.raises(SystemExit, match="--codex-provider must be one of"):
+        harness.preflight(["codex-skill"], cfg)
+
+
+def test_a_scenario_naming_an_arm_instead_of_a_condition_is_refused(tmp_path: Path) -> None:
+    bad = tmp_path / "bad-scenario"
+    bad.mkdir()
+    (bad / "prompt.md").write_text("do it", encoding="utf-8")
+    (bad / "scenario.yaml").write_text("title: t\narms: [codex-skill]\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="arms names conditions"):
+        harness.load_scenario(bad)
+
+
+def test_completing_an_old_results_file_keeps_its_runs_own_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A results.json from before records carried run_meta: its runs keep the model and
+    commits their own run recorded, not the completing run's."""
+    out = tmp_path / "out"
+    out.mkdir()
+    old_meta = _meta(model="sonnet", skills_commit="old0", notes="first batch")
+    old = {"meta": old_meta, "runs": [_rec("deploy-plan-only", "skill")]}
+    (out / "results.json").write_text(json.dumps(old), encoding="utf-8")
+    monkeypatch.setattr(harness, "_git_head", lambda path: "new1")
+    monkeypatch.setattr(harness, "_claude_version", lambda claude: "2.1.322")
+    monkeypatch.setattr(
+        harness,
+        "run_one",
+        lambda s, arm, cfg, stamp=None, trial=1: {**_rec(s.id, arm), "run_meta": dict(stamp)},
+    )
+    harness.run([ORDERS], ["skill"], harness.RunConfig(out=out), 1)
+    data = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    by_scenario = {r["scenario"]: r for r in data["runs"]}
+    assert by_scenario["deploy-plan-only"]["run_meta"]["skills_commit"] == "old0"
+    assert by_scenario["deploy-plan-only"]["run_meta"]["model"] == "sonnet"
+    assert by_scenario[ORDERS.id]["run_meta"]["skills_commit"] == "new1"
+    assert data["meta"]["notes"] == "first batch"
