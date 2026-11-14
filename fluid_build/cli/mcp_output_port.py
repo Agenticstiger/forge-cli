@@ -162,8 +162,9 @@ def attach_to_mcp_subparsers(sp: argparse._SubParsersAction) -> None:
         metavar="TOOL[,TOOL...]",
         help=(
             "Comma-separated allowlist of tool names. Tools outside the "
-            "list are blocked and hidden from tools/list. Default: all "
-            "tools allowed (subject to other gates)."
+            "list are blocked and hidden from tools/list. A name that is "
+            "not a tool stops the server. Default: all tools allowed "
+            "(subject to other gates)."
         ),
     )
     serve.add_argument(
@@ -172,7 +173,8 @@ def attach_to_mcp_subparsers(sp: argparse._SubParsersAction) -> None:
         metavar="TOOL[,TOOL...]",
         help=(
             "Comma-separated blocklist of tool names. Evaluated before "
-            "--allow-tools so denial wins."
+            "--allow-tools so denial wins. A name that is not a tool stops "
+            "the server."
         ),
     )
     serve.add_argument(

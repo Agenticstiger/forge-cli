@@ -19,7 +19,6 @@ import pytest
 
 from fluid_build.cli import mcp_output_port as cli_module
 
-_KNOWN = "describe"
 _CONTRACT = """
 fluidVersion: "0.7.4"
 kind: DataProduct
