@@ -8,8 +8,6 @@ Slice 4 makes envelope emission universal across the CLI's write sites:
 * ``save_workspace_config`` → top-level envelope in ``fluid.workspace.yaml``.
 * ``write_contract`` → envelope under ``metadata.provenance`` inside
   ``contract.fluid.yaml``.
-* ``CopilotMemoryStore.save`` → ``kind`` + ``generated_by`` alongside the
-  existing ``schema_version``/``saved_at`` fields in ``copilot-memory.json``.
 
 Read tolerance is load-bearing too: every existing loader must ignore
 unknown envelope keys rather than crashing.
@@ -27,11 +25,6 @@ from fluid_build.cli.forge_contract_factory import (
     build_minimal_contract,
     validate_contract_file,
     write_contract,
-)
-from fluid_build.cli.forge_copilot_memory import (
-    MEMORY_SCHEMA_VERSION,
-    CopilotMemoryStore,
-    CopilotProjectMemory,
 )
 from fluid_build.cli.workspace_config import (
     load_workspace_config,
@@ -136,68 +129,3 @@ class TestContractProvenanceEnvelope:
             doc["metadata"]["provenance"]["generated_by"]["command"]
             == "fluid forge --blank --target-dir my-prod"
         )
-
-
-class TestProjectMemoryEnvelope:
-    def _build_memory(self) -> CopilotProjectMemory:
-        return CopilotProjectMemory(
-            schema_version=MEMORY_SCHEMA_VERSION,
-            saved_at="2026-01-01T00:00:00Z",
-            project_profile={
-                "template": "customer-360",
-                "provider": "gcp",
-                "domain": "retail",
-                "owner": "data",
-            },
-            conventions={
-                "build_engines": ["dbt"],
-                "binding_platforms": ["bigquery"],
-                "binding_formats": ["parquet"],
-                "expose_kinds": ["table"],
-                "provider_hints": [],
-                "source_formats": {},
-                "schema_summaries": [],
-            },
-            recent_outcomes=[],
-        )
-
-    def test_save_adds_kind_and_generated_by(self, tmp_path: Path):
-        store = CopilotMemoryStore(tmp_path)
-        store.save(self._build_memory())
-
-        raw = json.loads(store.path.read_text())
-        assert raw["kind"] == "ProjectMemory"
-        assert raw["generated_by"]["tool"] == "fluid-cli"
-
-    def test_existing_schema_version_and_saved_at_preserved(self, tmp_path: Path):
-        store = CopilotMemoryStore(tmp_path)
-        store.save(self._build_memory())
-
-        raw = json.loads(store.path.read_text())
-        assert raw["schema_version"] == MEMORY_SCHEMA_VERSION
-        assert raw["saved_at"] == "2026-01-01T00:00:00Z"
-
-    def test_load_round_trip_preserves_payload(self, tmp_path: Path):
-        store = CopilotMemoryStore(tmp_path)
-        store.save(self._build_memory())
-
-        loaded = store.load()
-        assert loaded is not None
-        assert loaded.project_profile["domain"] == "retail"
-        assert loaded.project_profile["provider"] == "gcp"
-        assert loaded.conventions["build_engines"] == ["dbt"]
-
-    def test_load_ignores_extra_envelope_fields(self, tmp_path: Path):
-        """The loader must not crash on unknown envelope keys at the top level."""
-        # Hand-write a v1 file with the envelope already present.
-        store = CopilotMemoryStore(tmp_path)
-        store.save(self._build_memory())
-
-        # Tamper: add an additional "unknown_envelope_field" — loader should ignore
-        raw = json.loads(store.path.read_text())
-        raw["unknown_envelope_field"] = "ignored"
-        store.path.write_text(json.dumps(raw), encoding="utf-8")
-
-        loaded = store.load()
-        assert loaded is not None
-        assert loaded.project_profile["domain"] == "retail"

@@ -108,10 +108,10 @@ def test_claude_code_argv_and_structured_output(monkeypatch):
     assert argv[0].endswith("claude")
     assert "-p" in argv and "--output-format" in argv and "json" in argv
     assert "--bare" not in argv  # bare mode would demand ANTHROPIC_API_KEY
-    # schema is passed inline as a JSON string mentioning the envelope shape
+    # schema is passed inline as a JSON string naming the one field it holds
     assert "--json-schema" in argv
     schema_str = argv[argv.index("--json-schema") + 1]
-    assert "contract" in schema_str and "recommended_template" in schema_str
+    assert "contract_yaml" in schema_str
     # system via flag (help lists no --system-prompt here, so the append fallback),
     # user via stdin
     assert "--append-system-prompt" in argv

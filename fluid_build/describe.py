@@ -120,7 +120,7 @@ def self_describe() -> Dict[str, Any]:
     from fluid_build.schema_manager import FluidSchemaManager
 
     try:
-        from fluid_build.cli.forge_copilot_runtime import build_capability_matrix
+        from fluid_build.cli._capability_matrix import build_capability_matrix
 
         matrix = build_capability_matrix()
     except Exception:

@@ -49,8 +49,7 @@ Design mirrors the in-repo prior art :mod:`fluid_build.copilot.pii`:
   no-op.
 
 The core is a pure function so every authoring path that lands on the same
-contract produces byte-identical output; the agent (:class:`AiReadyAgent` in
-``fluid_build.cli.forge_agents``) is a thin registration + delegation shell.
+contract produces byte-identical output.
 """
 
 from __future__ import annotations

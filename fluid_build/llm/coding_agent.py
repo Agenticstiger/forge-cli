@@ -365,11 +365,10 @@ def _lists_flag(help_text: str, flag: str) -> bool:
 
 
 def _response_schema() -> Dict[str, Any]:
-    # Permissive variant (NOT the OpenAI-hardened one): nested objects keep
-    # additionalProperties:true because the contract is free-form.
-    from fluid_build.llm.response_schema import FORGE_RESPONSE_SCHEMA
+    """The answer ``--json-schema`` / ``--output-schema`` asks for: the contract's YAML."""
+    from fluid_build.llm.response_schema import CONTRACT_RESPONSE_SCHEMA
 
-    return FORGE_RESPONSE_SCHEMA
+    return CONTRACT_RESPONSE_SCHEMA
 
 
 def _write_temp_json(obj: Any) -> str:

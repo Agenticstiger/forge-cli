@@ -1,5 +1,6 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
+
 """What Command Center calls in forge-cli, pinned so a shrink cannot break it silently.
 
 Read from Command Center's ``fluid_cc_backend`` (origin/main 88067918, 2026-11-13). It

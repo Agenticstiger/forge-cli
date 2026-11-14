@@ -1,5 +1,6 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
+
 """``fluid forge`` AI mode: the shipped FLUID skills do the authoring.
 
 One rule holds on every path: ``fluid validate --offline`` decides what is valid.

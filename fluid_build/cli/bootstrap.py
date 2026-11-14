@@ -558,9 +558,6 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
         "version_cmd", "version", (_cmd("version", "Show version and system information"),)
     ),
     CoreCommand("roadmap_cmd", "roadmap", (_cmd("roadmap", "Show the staged forge roadmap"),)),
-    CoreCommand(
-        "memory_cmd", "memory", (_cmd("memory", "Inspect and manage staged memory/cache state"),)
-    ),
     CoreCommand("mcp", "mcp", (_cmd("mcp", "Serve staged forge tools over MCP stdio"),)),
     CoreCommand(
         "export_opds",
@@ -715,11 +712,6 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
     ),
     CoreCommand(
         "agents_cmd", "agents", (_cmd("agents", "Manage forge agent runs (list / show / prune)"),)
-    ),
-    CoreCommand(
-        "mission",
-        "mission",
-        (_cmd("mission", "Mission specs: trust pinning + zero-LLM success-criteria scorecards"),),
     ),
     CoreCommand(
         "describe_cmd", "describe", (_cmd("describe", "Describe this forge-cli installation"),)

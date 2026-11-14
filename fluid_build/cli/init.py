@@ -344,20 +344,6 @@ def register(subparsers: argparse._SubParsersAction):
         action="store_true",
         help="Suppress the next-steps panel and other post-success hints",
     )
-    p.add_argument(
-        "--show-work",
-        action="store_true",
-        help=(
-            "Stream the agent's reasoning and tool calls live during the "
-            "init→forge handoff. Reasoning + transcript also persist to "
-            ".fluid/agents/<run-id>/."
-        ),
-    )
-    p.add_argument(
-        "--agent",
-        metavar="NAME",
-        help="Scaffold a custom domain agent spec in .fluid/agents/ (e.g., --agent insurance)",
-    )
     # Advanced: post-run control knobs — hidden unless --advanced is passed
     mark_advanced(
         p.add_argument(
@@ -394,28 +380,6 @@ def run(args, logger: logging.Logger) -> int:
             from fluid_build.cli._init_discover_handler import run_discover
 
             return run_discover(args, logger, uri=discover_uri)
-
-        # Handle --agent: scaffold a custom domain agent spec.
-        agent_name = getattr(args, "agent", None)
-        if agent_name:
-            from fluid_build.cli.forge_agent_specs import scaffold_user_agent
-            from fluid_build.cli.security import validate_cli_path
-
-            # F7: the ``--dir`` value reaches a filesystem write here too —
-            # validate it through the platform-aware path validator before
-            # ``scaffold_user_agent`` touches disk.
-            target = getattr(args, "target_dir", None)
-            target_path = (
-                validate_cli_path(
-                    target, mode="write", must_exist=False, file_type="target directory"
-                )
-                if target
-                else None
-            )
-            path = scaffold_user_agent(agent_name, target_dir=target_path)
-            success(f"Created {path}")
-            cprint("Edit the file to customize questions, rules, and suggestions.")
-            cprint(f"Then run: fluid forge --domain {agent_name}")
 
         # If --dir is specified, switch to that directory first.
         # F7: route the operator-supplied directory through the
@@ -666,26 +630,13 @@ def _offer_first_forge(args, logger: logging.Logger) -> None:
             llm_provider=getattr(args, "llm_provider", None),
             llm_model=getattr(args, "llm_model", None),
             llm_endpoint=getattr(args, "llm_endpoint", None),
-            llm_routing_model=getattr(args, "llm_routing_model", None),
-            llm_routing_endpoint=getattr(args, "llm_routing_endpoint", None),
-            tiered=bool(getattr(args, "tiered", False)),
             require_llm=bool(getattr(args, "require_llm", False)),
-            # Discovery — init already scanned; let forge re-use the result.
-            discover=True,
-            no_discover=False,
-            discovery_path=getattr(args, "discovery_path", None),
-            # Memory / output
-            memory=True,
-            no_memory=False,
-            save_memory=True,
-            show_memory=False,
-            reset_memory=False,
+            # Output
             quiet=getattr(args, "quiet", False),
             verbose=getattr(args, "verbose", False),
             # Pre-write preview UX (Phase 0): plumbed through so the
-            # init handoff respects --yes / --show-work.
+            # init handoff respects --yes.
             yes=bool(getattr(args, "yes", False)),
-            show_work=bool(getattr(args, "show_work", False)),
             no_llm=bool(getattr(args, "no_llm", False)),
             no_cache=bool(getattr(args, "no_cache", False)),
             deterministic=bool(getattr(args, "deterministic", False)),
@@ -829,15 +780,6 @@ def _ensure_workspace(args, logger: logging.Logger) -> None:
     # .fluid/ci-state.json) remains committed.  See the git-policy
     # matrix in the redesign plan.
     _ensure_gitignore_template(cwd)
-
-    # Scaffold team memory template so the team can share conventions.
-    try:
-        from fluid_build.cli.forge_team_memory import scaffold_team_memory
-
-        tm_path = scaffold_team_memory(cwd)
-        logger.debug("Scaffolded team memory at %s", tm_path)
-    except Exception:  # noqa: BLE001 — best-effort
-        pass
 
     if RICH_AVAILABLE:
         console.print(

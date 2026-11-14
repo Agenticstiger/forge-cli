@@ -80,10 +80,8 @@ class TransformationIntent:
     """Canonical modeling technique driving the fallback skeleton naming.
 
     One of ``'data_vault_2'`` or ``'dimensional'`` (or ``None`` when the
-    interview was never run).  Populated by
-    :func:`fluid_build.cli.forge_copilot_interview.normalize_interview_value`.
-    When the LLM ships real SQL in ``additional_files`` this field is
-    informational; when it doesn't, the engine uses it to pick between
+    interview was never run). When the LLM ships real SQL in ``additional_files``
+    this field is informational; when it doesn't, the engine uses it to pick between
     hub/link/satellite skeletons and stg/dim/fct skeletons.
     """
 

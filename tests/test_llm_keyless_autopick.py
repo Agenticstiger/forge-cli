@@ -430,20 +430,6 @@ class TestSavedAgentNeverTakesAStatedDestination:
         assert config.provider == "claude-code"
         assert not [r for r in caplog.records if "first coding agent" in r.getMessage()]
 
-    def test_a_mission_never_gets_a_saved_agent(self, world):
-        # ``fluid mission run`` always runs the tool-use agent loop.
-        import argparse
-
-        from fluid_build.cli.mission import _resolve_mission_llm_config
-
-        world.install("claude-code")
-        _saved(world, provider="claude-code")
-        args = argparse.Namespace(llm_provider=None, llm_model=None, llm_endpoint=None)
-        config, message = _resolve_mission_llm_config(args)
-        assert config is None
-        assert "copilot_no_llm_provider" in message  # stopped before any agent ran
-        assert not hasattr(args, "agent_loop")  # the caller's args are left alone
-
 
 def _ladder_world(world, case):
     """Set up one ladder case; returns the environment to resolve against."""
@@ -600,30 +586,15 @@ class TestStatedDestinationBlocksAutoPick:
 class TestAgentLoopNeverAutoPicksAnAgent:
     """The agent loop needs tool use, which no coding agent offers.
 
-    It is requested by ``--agent-loop`` or ``FLUID_COPILOT_AGENT_LOOP``, and the
-    provider is resolved from the options ``_forge_build_copilot_options`` builds,
+    It is requested by an ``agent_loop`` option or ``FLUID_COPILOT_AGENT_LOOP``,
     so both routes must reach the auto-pick.
     """
 
     @staticmethod
     def _options(**kw):
-        from fluid_build.cli.forge_modes import _forge_build_copilot_options
-
-        options = _forge_build_copilot_options(
-            SimpleNamespace(**kw),
-            get_cli_arg_fn=lambda a, k, d=None: getattr(a, k, d),
-            is_non_interactive=True,
+        return SimpleNamespace(
+            llm_provider=None, llm_model=None, llm_endpoint=None, agent_loop=kw.get("agent_loop")
         )
-        return type("Args", (), options)()
-
-    def test_the_options_carry_the_flag(self):
-        assert self._options(agent_loop=True).agent_loop is True
-        assert self._options().agent_loop is False
-
-    @pytest.mark.parametrize("value", ["1", "true", "YES", " on "])
-    def test_the_options_carry_the_env_route(self, world, value):
-        world.monkeypatch.setenv("FLUID_COPILOT_AGENT_LOOP", value)
-        assert self._options().agent_loop is True
 
     def test_flag_route_ends_at_the_no_provider_error(self, world):
         world.install("claude-code")
@@ -655,18 +626,6 @@ class TestAgentLoopNeverAutoPicksAnAgent:
         assert agent_loop_requested(True, {}) is True
         assert agent_loop_requested(False, {"FLUID_COPILOT_AGENT_LOOP": "on"}) is True
         assert agent_loop_requested(False, {"FLUID_COPILOT_AGENT_LOOP": "0"}) is False
-
-    def test_a_mission_never_auto_picks_an_agent(self, world):
-        # ``fluid mission run`` always runs the loop, without the flag.
-        import argparse
-
-        from fluid_build.cli.mission import _resolve_mission_llm_config
-
-        world.install("claude-code")
-        args = argparse.Namespace(llm_provider=None, llm_model=None, llm_endpoint=None)
-        config, message = _resolve_mission_llm_config(args)
-        assert config is None
-        assert "copilot_no_llm_provider" in message  # stopped before any agent ran
 
 
 class TestAgentReadinessNeedsTheBinary:

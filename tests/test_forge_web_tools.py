@@ -12,7 +12,6 @@ Covers:
     stubbed through socket.getaddrinfo;
   * web_search provider plumbing — Tavily + Brave parse, provider
     selection, and the typed "not configured" result with no key;
-  * the forge_copilot_tools integration (surface + route);
   * the redactor masks the Tavily / Brave key shapes.
 
 No real network: httpx is mocked with respx and DNS is stubbed. Because
@@ -31,7 +30,7 @@ import pytest
 httpx = pytest.importorskip("httpx")
 respx = pytest.importorskip("respx")
 
-from fluid_build.cli import forge_copilot_tools, forge_web_tools
+from fluid_build.cli import forge_web_tools
 from fluid_build.cli.forge_web_tools import (
     dispatch_web_tool,
     is_enabled,
@@ -77,21 +76,6 @@ class TestGate:
         assert by_name["web_fetch"]["input_schema"]["properties"]["url"]["type"] == "string"
         assert by_name["web_fetch"]["input_schema"]["additionalProperties"] is False
         assert "query" in by_name["web_search"]["input_schema"]["properties"]
-
-
-# ── get_tool_definitions integration ─────────────────────────────────────────
-class TestToolListingIntegration:
-    def test_absent_when_unset(self, monkeypatch):
-        monkeypatch.delenv("FLUID_AGENT_WEB_TOOLS", raising=False)
-        names = {t["name"] for t in forge_copilot_tools.get_tool_definitions()}
-        assert "web_fetch" not in names
-        assert "web_search" not in names
-
-    def test_present_when_enabled(self, monkeypatch):
-        monkeypatch.setenv("FLUID_AGENT_WEB_TOOLS", "1")
-        names = {t["name"] for t in forge_copilot_tools.get_tool_definitions()}
-        assert "web_fetch" in names
-        assert "web_search" in names
 
 
 # ── web_fetch — SSRF-safe fetch ──────────────────────────────────────────────
@@ -263,30 +247,6 @@ class TestWebSearch:
         assert "error" in out
         # The key must not leak into the returned message.
         assert "tvly-secretkey1234567890" not in out["message"]
-
-
-# ── dispatch_tool_call integration (the real wiring) ─────────────────────────
-class TestDispatchIntegration:
-    def test_routes_web_fetch_when_enabled(self, monkeypatch):
-        monkeypatch.setenv("FLUID_AGENT_WEB_TOOLS", "1")
-        html = "<html>ok</html>"
-        with patch(
-            "fluid_build.util.safe_http.socket.getaddrinfo",
-            side_effect=_resolve_to("93.184.216.34"),
-        ):
-            with respx.mock(assert_all_called=False) as router:
-                router.get(url__regex=r"https?://[^/]+/doc").mock(
-                    return_value=httpx.Response(200, html=html)
-                )
-                out = forge_copilot_tools.dispatch_tool_call(
-                    "web_fetch", {"url": "https://example.com/doc"}
-                )
-        assert "ok" in out["text"]
-
-    def test_web_tool_unknown_when_disabled(self, monkeypatch):
-        monkeypatch.delenv("FLUID_AGENT_WEB_TOOLS", raising=False)
-        out = forge_copilot_tools.dispatch_tool_call("web_fetch", {"url": "https://example.com/"})
-        assert "error" in out and "Unknown tool" in out["error"]
 
 
 # ── redactor coverage ────────────────────────────────────────────────────────

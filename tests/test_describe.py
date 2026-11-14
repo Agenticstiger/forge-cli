@@ -93,7 +93,7 @@ def test_self_describe_degrades_when_matrix_unavailable(
     def _boom() -> dict:
         raise RuntimeError("registry exploded")
 
-    monkeypatch.setattr("fluid_build.cli.forge_copilot_runtime.build_capability_matrix", _boom)
+    monkeypatch.setattr("fluid_build.cli._capability_matrix.build_capability_matrix", _boom)
     info = self_describe()
     assert info["providers"] == []
     assert "capability matrix unavailable" in info["warnings"]

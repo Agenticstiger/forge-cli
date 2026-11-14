@@ -104,14 +104,3 @@ def test_ai_setup_key_check_prints_no_banner(
 
     assert error  # the check failed, and said so
     assert capsys.readouterr().out == ""
-
-
-def test_agent_loop_tool_call_prints_no_banner(litellm, failing_completion, capsys):
-    """The agent loop's tool-use call imports litellm directly."""
-    from fluid_build.cli.forge_copilot_agent_loop import _call_litellm_with_tools
-
-    payload = {"model": "openai/gpt-4o-mini", "messages": _MESSAGES, "api_key": _DUMMY_KEY}
-    with pytest.raises(Exception):
-        _call_litellm_with_tools(payload)
-
-    assert capsys.readouterr().out == ""

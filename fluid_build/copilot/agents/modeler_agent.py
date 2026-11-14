@@ -272,10 +272,6 @@ class ModelerAgent(BaseStageAgent):
             load_prompt_text("fragments/conceptual.yaml"),
             load_prompt_text(_fragment),
         ]
-        semantic_query = self._build_semantic_query_from_tables(
-            name=name, tables=tables, technique=technique
-        )
-        prior_context = self._retrieve_prior_similar_models(session, query=semantic_query)
         # UX-9 fix: surface the catalog-sourced ``table.comment`` /
         # ``column.comment`` to the LLM so it can echo them through
         # to ``OSIDataset.description`` / ``OSIField.description``.
@@ -311,8 +307,6 @@ class ModelerAgent(BaseStageAgent):
             "schema_constraints": self._logical_schema_constraints(technique),
             "tables": table_entries,
         }
-        if prior_context:
-            user_prompt_payload["prior_similar_models"] = prior_context
         # Item 1 — deterministic tool research phase. Dispatches
         # registered tools to gather context the LLM would
         # otherwise have to ask for. Results land in
@@ -381,12 +375,8 @@ class ModelerAgent(BaseStageAgent):
             load_prompt_text("fragments/conceptual.yaml"),
             load_prompt_text(_fragment),
         ]
-        semantic_query = self._build_semantic_query_from_intent(intent=intent, technique=technique)
-        prior_context = self._retrieve_prior_similar_models(session, query=semantic_query)
         intent_payload = json.loads(intent.model_dump_json())
         intent_payload["schema_constraints"] = self._logical_schema_constraints(technique)
-        if prior_context:
-            intent_payload["prior_similar_models"] = prior_context
         # Item 1 — tool research phase (same wiring as tables path).
         research = _run_tool_research_phase(
             session,
@@ -598,123 +588,6 @@ class ModelerAgent(BaseStageAgent):
                 "dv2": "null",
             }
         return {"technique": technique}
-
-    # ------------------------------------------------------------------
-    # Semantic-memory retrieval — seeds the LLM prompt on cache miss with
-    # top-3 structurally similar prior forged models. Fully read-only and
-    # fully optional: if the store has no ``memory/semantic`` records or
-    # the backend doesn't support vector search, we pass an empty
-    # context and the prompt degenerates to its v1.0 shape — no
-    # regression, just no uplift.
-    # ------------------------------------------------------------------
-    _SEMANTIC_RETRIEVAL_LIMIT = 3
-    _SEMANTIC_NAMESPACE = "memory/semantic"
-
-    def _retrieve_prior_similar_models(
-        self, session: StageSession, *, query: str
-    ) -> List[Dict[str, Any]]:
-        """Fetch up to 3 prior semantic-memory records whose content
-        overlaps the new intent / DDL.
-
-        Implementation delegates to the canonical
-        :func:`fluid_build.copilot.retrieval.retrieve_similar_models`
-        so there's exactly one retrieval code path. Returns the
-        payload shape the modeler's prompt expects (list of
-        ``{"key": ..., "value": ...}`` dicts) — the canonical
-        function ALSO writes ``RetrievalResult`` rows to the
-        session scratchpad so other agents and observers can read
-        retrievals from one place.
-        """
-        if not query:
-            return []
-        store = getattr(session, "store", None)
-        if store is None:
-            return []
-        try:
-            from fluid_build.copilot.retrieval import (
-                RetrievalConfig,
-                retrieve_similar_models,
-            )
-            from fluid_build.copilot.store.backends.vector import (
-                VectorBackend,
-                is_sqlite_vec_available,
-            )
-
-            # When the user installed the ``[vector]`` extra, light up
-            # the sqlite-vec embedding path so retrieval ranks by
-            # cosine similarity instead of stdlib difflib. The
-            # VectorBackend constructor guards against the extra being
-            # missing, so this stays a no-op for users who didn't.
-            if isinstance(store, VectorBackend):
-                ranker = store
-            else:
-                ranker = VectorBackend(store, use_embeddings=is_sqlite_vec_available())
-            results = retrieve_similar_models(
-                query,
-                store=ranker,
-                scratchpad=session.get_scratchpad(),
-                config=RetrievalConfig(
-                    limit=self._SEMANTIC_RETRIEVAL_LIMIT,
-                    namespace=self._SEMANTIC_NAMESPACE,
-                    mode="vector",
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001
-            LOG.debug(
-                "ModelerAgent: semantic-memory retrieval failed (%s: %s) — skipping",
-                type(exc).__name__,
-                exc,
-            )
-            return []
-        payloads: List[Dict[str, Any]] = [
-            {"key": result.key, "value": result.payload} for result in results
-        ]
-        if payloads:
-            LOG.info(
-                "ModelerAgent: seeded prompt with %d prior similar model(s) from %s",
-                len(payloads),
-                self._SEMANTIC_NAMESPACE,
-            )
-        return payloads
-
-    @staticmethod
-    def _build_semantic_query_from_intent(*, intent: BusinessIntent, technique: str) -> str:
-        """Derive a token-rich query string from a BusinessIntent. Tokens
-        drive both the stdlib difflib path and the hash-based embedder
-        in VectorBackend, so the more descriptive tokens we pack in
-        (technique, industry, metric names, entity names) the better
-        the ranking."""
-        parts: List[str] = [technique]
-        data_product = getattr(intent, "data_product", None)
-        if data_product is not None:
-            for attr in ("name", "domain", "description"):
-                value = getattr(data_product, attr, None)
-                if isinstance(value, str) and value:
-                    parts.append(value)
-        business_context = getattr(intent, "business_context", None)
-        if business_context is not None:
-            value = getattr(business_context, "description", None)
-            if isinstance(value, str) and value:
-                parts.append(value)
-        metrics = getattr(intent, "metrics", None) or []
-        for metric in metrics:
-            name = getattr(metric, "name", None)
-            if isinstance(name, str) and name:
-                parts.append(name)
-        return " ".join(parts)
-
-    @staticmethod
-    def _build_semantic_query_from_tables(
-        *, name: str, tables: Sequence[TableDefinition], technique: str
-    ) -> str:
-        """Derive a query from DDL-path inputs — table names + column
-        names carry the domain semantics sqlglot extracts."""
-        parts: List[str] = [technique, name]
-        for table in tables:
-            parts.append(table.name)
-            for column in table.columns:
-                parts.append(column.name)
-        return " ".join(parts)
 
     # ------------------------------------------------------------------
     # Defense-in-depth: repair semantic gaps from industry-pack skeletons.

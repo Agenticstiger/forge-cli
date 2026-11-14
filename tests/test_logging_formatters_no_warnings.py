@@ -135,33 +135,3 @@ def test_no_utcnow_references_in_fluid_build():
 
 
 # ── Pin 4: the hosted-MCP per-operation deadline ───────────────────────────
-
-
-def test_operation_timeout_env_knob(monkeypatch):
-    from fluid_build.cli.hosted_mcp import (
-        _DEFAULT_OPERATION_TIMEOUT_SECONDS,
-        _operation_timeout_seconds,
-    )
-
-    monkeypatch.delenv("FLUID_HOSTED_MCP_TIMEOUT_SECONDS", raising=False)
-    assert _operation_timeout_seconds() == _DEFAULT_OPERATION_TIMEOUT_SECONDS
-
-    monkeypatch.setenv("FLUID_HOSTED_MCP_TIMEOUT_SECONDS", "30")
-    assert _operation_timeout_seconds() == 30.0
-
-    monkeypatch.setenv("FLUID_HOSTED_MCP_TIMEOUT_SECONDS", "0")
-    assert _operation_timeout_seconds() is None  # explicit opt-out
-
-    monkeypatch.setenv("FLUID_HOSTED_MCP_TIMEOUT_SECONDS", "banana")
-    assert _operation_timeout_seconds() == _DEFAULT_OPERATION_TIMEOUT_SECONDS
-
-
-def test_run_async_deadline_bounds_a_stalled_operation():
-    """A session stalled at an await point fails fast instead of hanging."""
-    from fluid_build.cli.dbt_mcp import _run_async
-
-    async def _stalled():
-        await asyncio.sleep(3600)
-
-    with pytest.raises(asyncio.TimeoutError):
-        _run_async(_stalled(), timeout_seconds=0.1)

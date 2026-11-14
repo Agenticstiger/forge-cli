@@ -187,18 +187,9 @@ def test_singer_binary_lookup_refuses_a_name_ending_in_a_newline(
     assert resolve(f"{name}\n") is None
 
 
-def test_prompt_profile_name_refuses_a_trailing_newline():
-    from fluid_build.cli.forge_copilot_prompts import PromptProfileError, _resolve_profile_dir
-
-    assert _resolve_profile_dir("eu-gdpr-strict").name == "eu-gdpr-strict"
-    with pytest.raises(PromptProfileError, match="invalid prompt profile name"):
-        _resolve_profile_dir("eu-gdpr-strict\n")
-
-
 @pytest.mark.parametrize(
     ("module", "name"),
     [
-        ("fluid_build.cli.forge_domain_enrichment", "_SAFE_DOMAIN_RE"),
         ("fluid_build.cli._ai_setup_storage", "_DOMAIN_SLUG_RE"),
     ],
 )
@@ -210,14 +201,6 @@ def test_domain_slug_patterns_refuse_a_trailing_newline(module, name):
     pattern = getattr(importlib.import_module(module), name)
     assert pattern.match("finance")
     assert pattern.match("finance\n") is None
-
-
-def test_prompt_overlay_name_refuses_a_trailing_newline():
-    from fluid_build.cli.forge_prompt_overlays import PromptOverlayError, _resolve_overlay_path
-
-    assert _resolve_overlay_path("pii-lockdown").name == "pii-lockdown.yaml"
-    with pytest.raises(PromptOverlayError, match="invalid prompt overlay name"):
-        _resolve_overlay_path("pii-lockdown\n")
 
 
 # --- Identifiers written into a contract -------------------------------------
@@ -276,15 +259,6 @@ def test_odps_import_semver_check_refuses_a_trailing_newline():
 
     assert _is_semver("1.2.3", "0.7.5") is True
     assert _is_semver("1.2.3\n", "0.7.5") is False
-
-
-def test_mission_predicate_path_refuses_a_trailing_newline():
-    from fluid_build.copilot.missions.spec import MissionSpecError, validate_predicate_path
-
-    # A stripped path can still carry one at the end of an inner segment.
-    validate_predicate_path("exposes[*].contract.dq", label="checks[0]")
-    with pytest.raises(MissionSpecError, match=r"invalid path segment 'contract\\n'"):
-        validate_predicate_path("exposes[*].contract\n.dq", label="checks[0]")
 
 
 # --- Values emitted into OpenTofu ---------------------------------------------

@@ -584,35 +584,6 @@ def test_init_counts_a_named_provider_as_ai_configured(world: _World) -> None:
     assert _is_ai_configured() is True
 
 
-def test_the_interview_panel_names_the_run_s_provider(
-    world: _World, tmp_path: Path, deterministic_welcome_scan: None
-) -> None:
-    # The scan reads the saved choice; the run was named anthropic.
-    from fluid_build.cli._world_class_interview import collect_signals
-
-    world.monkeypatch.setattr("fluid_build.cli._welcome_scan.Path.home", lambda: tmp_path / "home")
-    world.saved = {"provider": "openai", "model": "gpt-saved-test"}
-
-    assert collect_signals(target_dir=tmp_path).ai_provider == "openai"
-    sig = collect_signals(target_dir=tmp_path, ai_provider="anthropic")
-
-    assert (sig.ai_configured, sig.ai_provider) == (True, "anthropic")
-
-
-def test_the_welcome_panel_names_the_run_s_provider(world: _World) -> None:
-    from fluid_build.cli._welcome_scan import WelcomeFindings
-    from fluid_build.cli.forge_modes import _with_run_provider
-
-    def _saved_openai() -> WelcomeFindings:
-        return WelcomeFindings(ai_configured=True, ai_provider_hint="openai")
-
-    named = _with_run_provider(_saved_openai(), Namespace(llm_provider="anthropic"))
-    unnamed = _with_run_provider(_saved_openai(), Namespace(llm_provider=None))
-
-    assert named.ai_provider_hint == "anthropic"
-    assert unnamed.ai_provider_hint == "openai"
-
-
 # ── 4. fluid ai test honours the provider the run names ─────────────────────
 
 

@@ -33,7 +33,7 @@ The Makefile (`make test | lint | fmt | typecheck | doctor | demo`) is the happy
 
 - **Contract-driven pipeline.** A single `contract.fluid.yaml` (schemas in `fluid_build/schemas/`, versioned) feeds `validate → plan → apply`. Providers under `fluid_build/providers/{local,gcp,aws,snowflake,odps,odcs}/` each implement the same interface; swapping `binding.platform` swaps the compiled output without touching the contract.
 
-- **Copilot agent loop** (`cli/forge_copilot_agent_loop.py`) runs a multi-turn LLM tool-use loop. Tools register into `cli/forge_copilot_tools.py::TOOL_REGISTRY` with `{name, description, input_schema, impl}`. Path-accepting tools (`read_sample_schema`, `discover_workspace`) are confined to a `workspace_root` kwarg plumbed down from `run_copilot_agent_loop` → `dispatch_tool_call` (kwarg injection, not `functools.partial` on the global registry).
+- **AI mode runs on the shipped skills** (`cli/forge_ai.py`). With a coding agent, forge opens it (interactive) or drives Claude Code / Codex headless with the skills pack as a plugin and tools limited to the workspace; otherwise one litellm call whose system prompt is the skills' text, then a `fluid validate --offline` repair loop (3 attempts). The embedded copilot (interview, prompt library, envelope, agent loop, memory, missions, judge) was deleted on 2026-11-13; `copilot/agents/` stays as the data-model engine.
 
 - **Two parallel redaction layers.** `observability/secret_redactor.py::SecretRedactingFilter` is wired into Python logging globally; `providers/snowflake/util/logging.py` has a Snowflake-provider-local `redact_string`/`redact_dict` with its own `SENSITIVE_PATTERNS`/`SENSITIVE_KEYS`. When adding a new secret shape, **extend both** to keep them symmetric.
 
@@ -54,6 +54,35 @@ Drive-by changes here can break invariants. Read the surrounding comments first.
 - `providers/_sql_safety.py` + `providers/snowflake/governance.py` — see the SQL-safety note above. Any new DDL emitter in another provider must use these helpers.
 - `cli/auth.py::_sanitize_argv` — strips credential-bearing flag values before DEBUG-logging the subprocess command. Extend `_SENSITIVE_FLAGS` / `_SENSITIVE_FLAG_SUFFIXES` for new provider-auth CLIs that use `--*-secret` / `--*-key` shapes.
 - `providers/snowflake/util/logging.py::SENSITIVE_KEYS` / `SENSITIVE_PATTERNS` — mirror additions into `observability/secret_redactor.py`.
+
+## Recent architectural changes worth knowing (2026-11-13, skills-first AI mode)
+
+The founder's rule that the AI setup be world-class AND lightweight. On #851's eval the embedded
+copilot scored 0/9 and a coding agent with the four shipped skills 11/11; on Sonnet 5.5 the
+copilot's envelope prompt is refused outright (`[reasoning_extraction]` safeguard). So:
+
+- **`fluid forge` AI mode = `cli/forge_ai.py`**, about 940 lines with docstrings. `run_ai_copilot_mode` in
+  `cli/forge.py` delegates to it. Seams for tests: `call_llm` (llm.providers), `_run_agent`
+  (llm.coding_agent), `_run_interactive` and `_run_validate` (forge_ai). Never `python -m` for
+  the validate step: it resolves the install's `fluid` with the skills hook's `find_fluid()`.
+- **Deleted:** the interview (world-class + legacy + slash commands + streaming preview), the
+  prompt library and profiles/overlays, the response envelope and its repair runtime, the agent
+  loop and tool registry, copilot memory (`fluid memory`, the `--*memory*` flags), missions
+  (`fluid mission`), the judge (`stats --judge`), resume/fork/watch, domain agents (`--domain`,
+  `fluid init --agent`), tiered routing, MCP sampling, and the five MCP tools that ran forge's
+  own LLM (`forge_run`, `forge_from_source`, `score_contract_quality`,
+  `enrich_contract_suggestions`, `search_semantic_memory`). `--no-memory` stays as a hidden no-op:
+  installed scaffold-ide indexes and the authoring skill pass it.
+- **Kept on purpose:** `copilot/agents` minus the judge, `copilot/catalog`, `copilot/schemas`,
+  the store's session/audit parts, `copilot/checkpoint`, `copilot/cost`. They are the
+  deterministic data-model engine behind `fluid forge data-model *`, `fluid generate
+  transformation`, the MCP output port's audit trail and the 11 remaining MCP tools.
+- **Command Center contract** (`tests/cli/test_command_center_contract.py`): `forge data-model
+  from-intent` (`--deterministic` | `--llm-provider`), `stats --json`, and the in-process
+  imports `copilot.pii`, `copilot.enrichment`, `forge_datamodel.emit.validator`,
+  `cli.forge_copilot_runtime.build_capability_matrix` (now a shim over `cli/_capability_matrix.py`).
+- The sections below that describe the interview, slash commands, streaming preview, self-healing
+  repair loop, agent loop, missions, memory, judge or MCP sampling are history.
 
 ## Recent architectural changes worth knowing (2026-04-16)
 
@@ -401,7 +430,7 @@ existing `LlmProvider` seam (no new backend switch — selection is by provider 
   Claude Code (step 4.5, mirroring the Ollama branch). Pins:
   `tests/test_welcome_scan_coding_agents.py`, `tests/test_coding_agent_ai_setup.py`.
 
-- **Drive modes.** Default is **envelope** (agent returns the contract JSON).
+- **Drive modes (superseded 2026-11-13: agentic is now the default, see above).** Default was **envelope** (agent returns the contract JSON).
   `--forge-agent-mode agentic` / `FLUID_FORGE_AGENT_MODE=agentic` selects the
   opt-in **agentic** mode (agent writes `contract.fluid.yaml` into the workspace) —
   the `LlmConfig.agent_mode` plumbing is wired; the full agentic read+validate loop

@@ -20,8 +20,9 @@ keep working: ``forge_modes.py`` re-exports each at module top.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fluid_build._console import literal_error_text
 
@@ -53,6 +54,20 @@ _CI_PROVIDER_ALIASES = {
     "circle_ci": "circleci",
     "circleci": "circleci",
 }
+
+
+@dataclass
+class _CiQuestion:
+    """The question shape ``forge_dialogs.ask_dialog_question`` reads (duck-typed)."""
+
+    id: str
+    field: str
+    prompt: str
+    type: str = "text"
+    choices: List[Dict[str, Any]] = field(default_factory=list)
+    required: bool = False
+    allow_skip: bool = True
+    default: Optional[str] = None
 
 
 def normalize_ci_provider(value: Optional[str]) -> Optional[str]:
@@ -89,9 +104,6 @@ def prompt_ci_menu(
     Returns ``(provider, complexity)``; ``provider`` is ``None`` when
     the user selects *None (skip)* or the prompt is cancelled.
     """
-    # Lazy import to avoid cycles through forge_modes → interview → dialogs.
-    from fluid_build.cli.forge_copilot_interview import InterviewQuestion
-
     if console:
         try:
             console.print("\n[bold blue]🛠  CI/CD pipeline[/bold blue]")
@@ -102,7 +114,7 @@ def prompt_ci_menu(
 
     effective_default = memory_default if memory_default in _CI_PROVIDER_VALUES else None
 
-    provider_question = InterviewQuestion(
+    provider_question = _CiQuestion(
         id="ci_provider",
         field="ci_provider",
         prompt="Generate a CI/CD pipeline now? Pick a provider (or 'none' to skip).",
@@ -117,7 +129,7 @@ def prompt_ci_menu(
     if not provider_value or provider_value == "none":
         return (None, complexity_default)
 
-    complexity_question = InterviewQuestion(
+    complexity_question = _CiQuestion(
         id="ci_complexity",
         field="ci_complexity",
         prompt="Pipeline complexity?",

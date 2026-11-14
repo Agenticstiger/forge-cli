@@ -431,20 +431,6 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
     ),
     **_register(
         ACCEPTED,
-        "the copilot tools and missions read a contract to show it to a model",
-        *_site(
-            "cli/forge_copilot_tools.py",
-            "_dispatch_check_pii_classification",
-            "_dispatch_discover_workspace_contracts",
-            "_dispatch_read_upstream_schema",
-        ),
-        *_site("cli/forge_copilot_discovery.py", "_summarize_existing_contract"),
-        *_site("cli/forge_modes.py", "run_ai_copilot_mode"),
-        *_site("copilot/checkpoint_stale.py", "_load_contract_from_disk"),
-        *_site("copilot/missions/checks.py", "load_contract_for_checks"),
-    ),
-    **_register(
-        ACCEPTED,
         "authoring: writes a contract back in place, so it edits the raw root (SG-41)",
         *_site("cli/product_add.py", "run"),
         *_site("cli/contract.py", "_load_contract"),

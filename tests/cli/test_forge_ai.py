@@ -1,5 +1,6 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
+
 """``fluid forge`` AI mode driven by the shipped skills (``cli/forge_ai.py``).
 
 No live agent, LLM or subprocess: ``call_llm``, ``_run_agent``, ``_run_interactive`` and

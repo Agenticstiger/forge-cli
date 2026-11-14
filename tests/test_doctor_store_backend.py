@@ -87,41 +87,6 @@ class TestInspectStoreBackend:
         # Missing file is non-fatal — auto-create.
         assert info["ok"] == "true"
 
-    def test_postgres_backend_without_dsn_reports_not_ok(self, monkeypatch):
-        monkeypatch.setenv("FLUID_STORE_BACKEND", "postgres")
-        monkeypatch.delenv("FLUID_STORE_DSN", raising=False)
-        info = doctor._inspect_store_backend()
-        assert info["class"] == "PostgresBackend"
-        assert info["ok"] == "false"
-        assert "DSN missing" in info["status"]
-        # DSN field must be redacted-shape even when missing —
-        # never a raw connection string in the visible payload.
-        assert info["location"].startswith("(") or "***" in info["location"]
-
-    def test_postgres_backend_with_bad_dsn_does_not_raise(self, monkeypatch):
-        # Use a bogus DSN; psycopg.connect will throw — our wrapper
-        # must swallow into ``ok=false`` rather than crashing doctor.
-        monkeypatch.setenv("FLUID_STORE_BACKEND", "postgres")
-        monkeypatch.setenv(
-            "FLUID_STORE_DSN",
-            "postgresql://postgres:wrong@127.0.0.1:1/nodb",
-        )
-        info = doctor._inspect_store_backend()
-        assert info["class"] == "PostgresBackend"
-        # Either psycopg unavailable OR connect failed — both flow to ok=false.
-        assert info["ok"] == "false"
-        assert info["status"]  # non-empty
-        # Password must never leak into the visible location.
-        assert "wrong" not in info["location"]
-
-    def test_vector_backend_describes_backing_store(self, monkeypatch):
-        monkeypatch.setenv("FLUID_STORE_BACKEND", "vector")
-        monkeypatch.setenv("FLUID_STORE_VECTOR_BACKING", "sqlite")
-        info = doctor._inspect_store_backend()
-        assert info["class"] == "VectorBackend"
-        assert "backing=sqlite" in info["location"]
-        assert info["ok"] == "true"
-
     def test_null_backend_reports_no_persistence(self, monkeypatch):
         monkeypatch.setenv("FLUID_STORE_BACKEND", "null")
         info = doctor._inspect_store_backend()

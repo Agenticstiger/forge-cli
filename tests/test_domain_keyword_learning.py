@@ -51,15 +51,9 @@ def keyring_mem(monkeypatch):
     return store
 
 
-# A context that trips ``detect_domain`` → "finance" (>= 2 keyword hits).
-FINANCE_CTX = {
-    "project_goal": "banking fraud detection",
-    "description": "payment risk and regulatory compliance for a fintech",
-}
-HEALTHCARE_CTX = {
-    "project_goal": "clinical patient records",
-    "description": "hospital EHR with HIPAA compliance for medical claims",
-}
+# An interview context names its domain; ``record_domain_detection`` takes the slug from it.
+FINANCE_CTX = {"domain": "finance", "project_goal": "banking fraud detection"}
+HEALTHCARE_CTX = {"domain": "healthcare", "project_goal": "clinical patient records"}
 
 
 class TestRecordDomainDetection:
@@ -97,6 +91,7 @@ class TestRecordDomainDetection:
         from fluid_build.cli._ai_setup_storage import record_domain_detection
 
         secret_ctx = {
+            "domain": "finance",
             "project_goal": "banking fraud detection",
             "description": "payment risk compliance",
             "data_sources": "s3://acme-secret-bucket/pii/customers.csv",

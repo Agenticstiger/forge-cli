@@ -427,7 +427,6 @@ def print_forge_help() -> None:
         [
             ("--target-dir, -d DIR", "Target directory for project creation"),
             ("--provider, -p NAME", "Infrastructure provider"),
-            ("--domain NAME", "Domain hint (finance, healthcare, retail, telco)"),
             (
                 "--data-product-type CODE",
                 "Data Mesh type (SDP/ADP/CDP) or layer (Bronze/Silver/Gold)",
@@ -441,7 +440,6 @@ def print_forge_help() -> None:
             ("--dry-run", "Preview without creating files"),
             ("--non-interactive", "Use defaults without prompting"),
             ("--yes, -y", "Skip the pre-write preview prompt (panel still renders)"),
-            ("--show-work", "Stream agent reasoning + tool calls live"),
             ("--context VALUE", "Additional AI context (JSON string or file path)"),
         ],
     )
@@ -455,48 +453,9 @@ def print_forge_help() -> None:
                 "claude-code / codex / cursor / kiro (local agent CLI)",
             ),
             ("--llm-model NAME", "Model identifier"),
-            ("--forge-agent-mode MODE", "Coding-agent drive mode: envelope (default) or agentic"),
-            ("--llm-routing-model NAME", "Fast model for interview and AI self-checks"),
+            ("--forge-agent-mode MODE", "Coding-agent drive mode: agentic (default) or envelope"),
             ("--llm-endpoint URL", "HTTP endpoint override"),
-            ("--tiered", "Use provider-local deep/fast model tiers"),
             ("--require-llm", "Fail loudly if AI cannot run"),
-        ],
-    )
-
-    _group_table(
-        "Discovery",
-        [
-            ("--discover", "Inspect local files before generation (default)"),
-            ("--no-discover", "Skip local discovery"),
-            ("--discovery-path PATH", "Additional path to scan"),
-        ],
-    )
-
-    _group_table(
-        "Memory",
-        [
-            ("--memory", "Load copilot memory (default)"),
-            ("--no-memory", "Skip copilot memory for this run"),
-            ("--save-memory", "Persist memory after successful run"),
-            ("--show-memory", "Show memory summary and exit"),
-            ("--reset-memory", "Delete memory file and exit"),
-        ],
-    )
-
-    _group_table(
-        "Resume",
-        [
-            ("--resume [RUN_ID]", "Resume an interrupted run (bare = most-recent)"),
-            ("--no-resume", "Always start fresh, ignore any paused runs"),
-            (
-                "--from-stage STAGE",
-                "Time-travel to a specific stage (requires --resume)",
-            ),
-            (
-                "--fork RUN_ID",
-                "Branch a new run from a checkpoint (requires --from-stage)",
-            ),
-            ("--or-fail", "Exit 1 if no resumable run exists"),
         ],
     )
 
@@ -505,7 +464,6 @@ def print_forge_help() -> None:
     examples = [
         ("fluid forge", "AI copilot (interactive)"),
         ("fluid forge --provider gcp", "Target GCP"),
-        ("fluid forge --domain finance", "Finance domain expertise"),
         ("fluid forge --llm-provider ollama --llm-model gemma4", "Use local Ollama model"),
         ("fluid forge --blank --target-dir ./out", "Empty scaffold"),
         ("fluid forge --offline", "Guided interview, no network calls"),
@@ -524,13 +482,13 @@ def print_forge_help() -> None:
     console.print()
 
     # H9 — kill-switch discoverability pointer. Pre-fix, none of the 8
-    # runtime toggles (FLUID_FORGE_NO_PICKER, FLUID_COPILOT_JUDGE, ...)
+    # runtime toggles (FLUID_FORGE_NO_PICKER, FLUID_FORGE_OFFLINE, ...)
     # were findable in --help / README / AGENTS.md; only CLAUDE.md
     # documented them.
     console.print(
         "  [dim]Tip:[/dim] [bright_cyan]fluid doctor --env[/bright_cyan] "
         "[dim]lists runtime kill switches (FLUID_FORGE_NO_PICKER, "
-        "FLUID_COPILOT_JUDGE, …) and their current values.[/dim]"
+        "FLUID_FORGE_OFFLINE, …) and their current values.[/dim]"
     )
     console.print()
 
@@ -570,10 +528,9 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
             "  fluid forge --blank                               Empty contract, no AI\n"
             "  fluid forge --provider snowflake                  Target a specific cloud\n"
             "  fluid forge --llm-provider gemini                 Use a specific LLM\n"
-            "  fluid forge --reset-memory                        Clear project memory\n"
             "  fluid forge --non-interactive --context ctx.json  CI usage\n"
             "  Tip: `fluid doctor --env` lists runtime kill switches\n"
-            "       (FLUID_FORGE_NO_PICKER, FLUID_COPILOT_JUDGE, …)."
+            "       (FLUID_FORGE_NO_PICKER, FLUID_FORGE_OFFLINE, …)."
         ),
     ),
     "demo": (

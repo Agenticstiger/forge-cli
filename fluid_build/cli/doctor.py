@@ -98,29 +98,14 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "Suppress the welcome scan panel",
     ),
     (
-        "FLUID_FORGE_NO_STREAMING_PREVIEW",
-        "streaming preview on",
-        "Disable the live contract-growth panel during the interview",
-    ),
-    (
         "FLUID_FORGE_OFFLINE",
         "online (LLM path available)",
         "Set =1 to force the local no-network guided interview (like `--offline`)",
     ),
     (
-        "FLUID_COPILOT_JUDGE",
-        "judge stage runs (=1)",
-        "Set =0 to skip the post-forge LLM judge stage",
-    ),
-    (
         "FLUID_COPILOT_ENRICHMENT",
         "enrichment stage runs (=1)",
         "Set =0 to skip the post-forge LLM enrichment stage",
-    ),
-    (
-        "FLUID_JUDGE_SELF_CRITIQUE",
-        "judge self-critique on (=1)",
-        "Set =0 to disable the judge's self-critique pass",
     ),
     (
         "FLUID_COPILOT_CHECKPOINT",
@@ -147,11 +132,6 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
         "FLUID_COST_LIMIT_USD_PER_PRODUCT",
         "no per-product cap",
         "Per-product cost ceiling, enforced inside the agent coordinator (USD)",
-    ),
-    (
-        "FLUID_INTERVIEW_LEGACY",
-        "world-class interview",
-        "Set =1 to revert to the legacy bootstrap interview",
     ),
     (
         "FLUID_RUN_ID",
@@ -195,8 +175,8 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
     ),
     (
         "FLUID_FORGE_AGENT_MODE",
-        "envelope",
-        "Coding-agent drive mode: `envelope` (default) or `agentic`",
+        "agentic",
+        "Coding-agent drive mode: `agentic` (default) or `envelope`",
     ),
     (
         "FLUID_FORGE_AGENT_TIMEOUT_SECONDS",
@@ -1570,61 +1550,6 @@ def _inspect_store_backend() -> Dict[str, str]:
         except Exception as exc:  # noqa: BLE001
             info["status"] = f"probe failed: {exc.__class__.__name__}"
             info["ok"] = "false"
-        return info
-
-    if backend == "postgres":
-        dsn = (os.environ.get("FLUID_STORE_DSN") or "").strip()
-        info["class"] = "PostgresBackend"
-        if not dsn:
-            info["location"] = "(FLUID_STORE_DSN unset)"
-            info["status"] = "DSN missing — PostgresBackend cannot connect"
-            info["ok"] = "false"
-            return info
-        # Use the same redactor the backend uses so the displayed DSN
-        # never leaks the password.
-        try:
-            from fluid_build.copilot.store.backends.postgres import _redact_dsn
-
-            info["location"] = _redact_dsn(dsn)
-        except Exception:  # noqa: BLE001
-            info["location"] = "postgresql://***"
-        try:
-            import psycopg  # type: ignore[import-not-found]
-        except Exception as exc:  # noqa: BLE001
-            info["status"] = f"psycopg not installed: {exc.__class__.__name__}"
-            info["ok"] = "false"
-            return info
-        # Ping with a hard wall-clock cap so a hung Postgres doesn't
-        # hang ``fluid doctor``. ``connect_timeout`` is documented at
-        # https://www.postgresql.org/docs/current/libpq-connect.html
-        # and is honoured by libpq/psycopg.
-        try:
-            conn = psycopg.connect(dsn, connect_timeout=2)
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("select 1")
-                    cur.fetchone()
-                    # Schema version probe: read SERVER_VERSION_NUM as a
-                    # proxy (the storage layer doesn't carry its own
-                    # versioned migration table yet — auto-CREATE TABLE
-                    # IF NOT EXISTS handles evolution today).
-                    cur.execute("show server_version_num")
-                    row = cur.fetchone()
-                    if row:
-                        info["schema_version"] = f"pg server={row[0]}"
-                info["status"] = "reachable (select 1 round-trip ok)"
-            finally:
-                conn.close()
-        except Exception as exc:  # noqa: BLE001
-            info["status"] = f"connect failed: {exc.__class__.__name__}"
-            info["ok"] = "false"
-        return info
-
-    if backend == "vector":
-        backing = (os.environ.get("FLUID_STORE_VECTOR_BACKING") or "file").strip().lower()
-        info["class"] = "VectorBackend"
-        info["location"] = f"backing={backing or 'file'}"
-        info["status"] = "wraps backing store"
         return info
 
     # Unknown backend selector — ``resolve_store`` would raise; surface

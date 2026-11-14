@@ -69,6 +69,7 @@ Env vars:
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from typing import Any, Dict, List, Mapping, Optional
@@ -94,6 +95,39 @@ _MAX_SEARCH_RESULTS = 10
 
 _TAVILY_ENDPOINT = "https://api.tavily.com/search"
 _BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+
+
+@functools.lru_cache(maxsize=1)
+def _arg_models() -> tuple:
+    """Build ``(WebFetchArgs, WebSearchArgs)`` on first use (pydantic stays off the cold path)."""
+    from pydantic import BaseModel, Field
+
+    class WebFetchArgs(BaseModel):
+        """Args for ``web_fetch``: one absolute http(s) URL, SSRF-guarded."""
+
+        url: str = Field(
+            description=(
+                "Absolute http(s):// URL to fetch. Private, loopback, "
+                "link-local, and cloud-metadata (169.254.169.254) addresses "
+                "are rejected by the SSRF guard; ftp/file/data/etc. schemes "
+                "are refused."
+            )
+        )
+
+        model_config = {"extra": "ignore"}
+
+    class WebSearchArgs(BaseModel):
+        """Args for ``web_search``: a plain-text query and a result cap."""
+
+        query: str = Field(description="Plain-text search query.")
+        max_results: int = Field(
+            default=5,
+            description="Cap on returned results (default 5, hard max 10).",
+        )
+
+        model_config = {"extra": "ignore"}
+
+    return WebFetchArgs, WebSearchArgs
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +167,7 @@ def web_tool_definitions(env: Optional[Mapping[str, str]] = None) -> List[Dict[s
     """
     if not is_enabled(env):
         return []
-    from fluid_build.cli._forge_copilot_tool_args import WebFetchArgs, WebSearchArgs
+    WebFetchArgs, WebSearchArgs = _arg_models()
 
     return [
         {
@@ -183,7 +217,7 @@ def _web_fetch(arguments: Dict[str, Any]) -> Dict[str, Any]:
     ``{"error": <ExcName>, "message": …}``; the SSRF guard fires before
     any request is issued.
     """
-    from fluid_build.cli._forge_copilot_tool_args import WebFetchArgs
+    WebFetchArgs = _arg_models()[0]
     from fluid_build.util.safe_http import UnsafeURLError, assert_safe_url, fetch_bytes
 
     try:
@@ -359,7 +393,7 @@ def _web_search(
     With no provider key the tool returns a typed ``not configured``
     result (never raises) so the agent loop continues.
     """
-    from fluid_build.cli._forge_copilot_tool_args import WebSearchArgs
+    WebSearchArgs = _arg_models()[1]
 
     env = env if env is not None else os.environ
 

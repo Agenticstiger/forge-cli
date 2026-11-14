@@ -78,29 +78,12 @@ class TestCliSurface:
         self, block, cli, monkeypatch
     ):  # noqa: F811
         block("litellm")
-        # The failure must precede the interview: nothing may load context or memory.
-        import fluid_build.cli.forge_copilot_discovery as discovery
-        import fluid_build.cli.forge_copilot_personal_memory as personal
-
-        loaded: list[str] = []
-        real_discover, real_memory = discovery.discover_local_context, personal.load_personal_memory
-        monkeypatch.setattr(
-            discovery,
-            "discover_local_context",
-            lambda *a, **k: loaded.append("context") or real_discover(*a, **k),
-        )
-        monkeypatch.setattr(
-            personal,
-            "load_personal_memory",
-            lambda *a, **k: loaded.append("memory") or real_memory(*a, **k),
-        )
         rc, out = cli("forge", "--llm-provider", "openai", "--non-interactive")
         flat = " ".join(out.split())
         assert rc == 1, out
         assert "pip install 'data-product-forge[litellm]'" in flat
         assert _ALTERNATIVES in flat
         assert "Traceback" not in out
-        assert loaded == []
 
     def test_interactive_forge_fails_before_touching_the_keyring(
         self, block, cli, monkeypatch
@@ -169,15 +152,6 @@ class TestCliSurface:
         flat = " ".join(out.split())
         assert rc == 1, out
         assert flat.count("pip install 'data-product-forge[litellm]'") == 1, out
-
-    def test_agent_loop_offers_only_what_works_there(self, block, cli):  # noqa: F811
-        block("litellm")
-        rc, out = cli("forge", "--agent-loop", "--llm-provider", "openai", "--non-interactive")
-        flat = " ".join(out.split())
-        assert rc == 1, out
-        assert "--template starter" in flat
-        assert "--llm-provider claude-code" not in flat
-        assert "Traceback" not in out
 
     def test_a_provider_not_chosen_by_flag_is_not_called_a_flag(self, block):  # noqa: F811
         block("litellm")
@@ -283,14 +257,6 @@ class TestDegradations:
         text = "select * from orders where id = 1" * 20
         assert tb.count_tokens(text, provider="openai", model="gpt-4o") == tb.estimate_tokens(text)
         assert tb._lookup_litellm_max_input_tokens("gpt-4o") is None
-
-    def test_deprecation_hint_is_none_without_litellm(self, block):  # noqa: F811
-        block("litellm")
-        from fluid_build.copilot import models
-
-        assert models._is_deprecated_in_litellm("gemini-1.5-flash") is False
-        assert models.deprecation_hint("gemini-1.5-flash") is None
-        assert models._suggest_replacement_via_litellm("gemini-1.5-flash") is None
 
 
 class TestCodingAgentWithoutLitellm:

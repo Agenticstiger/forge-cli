@@ -68,11 +68,6 @@ class LogicalAgent:
         technique: str,
         source_type: str | None = None,
     ):
-        # ModelerAgent's ``_retrieve_prior_similar_models`` runs
-        # RAG retrieval against ``memory/semantic`` directly and —
-        # post-Sprint #1 — also writes results to the session
-        # scratchpad so other agents (CriticAgent, BuilderAgent)
-        # can read them from a single place.
         return self._modeler.from_tables(
             session,
             name=name,

@@ -196,19 +196,6 @@ class TestOperatorCommandLine:
         # libpq reads this host's PGSSLCERT / PGSSLKEY / PGSERVICE as it did before.
         assert recorded.env_at_attach == [_HOST_LIBPQ_ENV]
 
-    def test_fetch_sample_rows_reads_an_operator_configured_uri(self, recorded):
-        # The URI comes from the operator's environment (FLUID_FORGE_DB_URI*); the
-        # model names only a table and a connection alias.
-        from fluid_build.cli.forge_db_tools import dispatch_db_tool
-
-        result = dispatch_db_tool(
-            "fetch_sample_rows",
-            {"table": "customers", "schema": "public", "operator_supplied": False},
-            {"FLUID_FORGE_DB_URI": PG_URI, "FLUID_FORGE_DB_TOOLS": "1"},
-        )
-        assert "error" not in result, result
-        assert not _is_pinned(recorded.only)
-
 
 class TestNamespaceStaysPinned:
     """A URI that arrives in an argparse namespace never presents this host's TLS identity."""

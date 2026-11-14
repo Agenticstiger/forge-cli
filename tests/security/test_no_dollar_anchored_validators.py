@@ -1197,11 +1197,6 @@ _ACCEPTED: Dict[Tuple[str, str, str], str] = {
         r"^[0-9*/,\-?LW#]+$",
     ): "each field comes from value.split()",
     (
-        "fluid_build/cli/forge_db_tools.py",
-        "_resolve_connection_uri",
-        r"^[A-Za-z0-9_]+$",
-    ): "matches the stripped connection name, which is the one used",
-    (
         "fluid_build/cli/import_workflow/dbt.py",
         "_safe_tags",
         r"^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$",
@@ -1221,11 +1216,6 @@ _ACCEPTED: Dict[Tuple[str, str, str], str] = {
         "_normalize_allowed_models",
         r"^[a-z0-9][a-z0-9-_.]*[a-z0-9]$|^[a-z0-9]$",
     ): "the token was stripped and its whitespace replaced with '-' just before",
-    (
-        "fluid_build/copilot/missions/spec.py",
-        "load_mission_spec_from_path",
-        r"^[a-z0-9][a-z0-9_-]*$",
-    ): "matches the stripped mission name, which is the one kept",
     (
         "fluid_build/engines/dbt/_types.py",
         "split_parameterized",
@@ -1465,16 +1455,6 @@ _ACCEPTED: Dict[Tuple[str, str, str], str] = {
         "'ABC\\n'. The hook is not wired into a live chain yet (see its module note); "
         "settle match against fullmatch before it is"
     ),
-    (
-        "fluid_build/cli/forge_copilot_contract_helpers.py",
-        "apply_overlay_validator_rules",
-        "<run time: forbid_regex>",
-    ): "an overlay rule searches the serialized contract for text, not a whole value",
-    (
-        "fluid_build/cli/forge_copilot_contract_helpers.py",
-        "apply_overlay_validator_rules",
-        "<run time: require_regex>",
-    ): "an overlay rule searches the serialized contract for text, not a whole value",
     (
         "fluid_build/schema_manager.py",
         "_locate_error",

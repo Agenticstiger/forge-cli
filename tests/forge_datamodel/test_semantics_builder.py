@@ -227,50 +227,6 @@ class TestEmittedContractRegression:
         assert regions == 2
 
 
-class TestInterviewProducerAlignment:
-    def test_interview_grain_normalizes_and_default_time_dimension_set(self) -> None:
-        from fluid_build.cli.forge_copilot_contract_helpers import (
-            _build_semantics_from_interview_summary,
-        )
-
-        semantics = _build_semantics_from_interview_summary(
-            columns=[{"name": "order_id"}],
-            interview_summary={
-                "semantic_intent": {
-                    "primary_entity": "order",
-                    "primary_measures": ["revenue"],
-                    "primary_dimensions": ["region"],
-                    "time_dimension": "order_date",
-                    "time_granularity": "daily",
-                }
-            },
-            expose_name="orders",
-            description="Orders",
-        )
-        time_dims = [d for d in semantics["dimensions"] if d.get("type") == "time"]
-        assert time_dims[0]["typeParams"] == {"timeGranularity": "day"}
-        assert semantics["defaultAggTimeDimension"] == "order_date"
-
-    def test_interview_unknown_grain_is_omitted_not_emitted_invalid(self) -> None:
-        from fluid_build.cli.forge_copilot_contract_helpers import (
-            _build_semantics_from_interview_summary,
-        )
-
-        semantics = _build_semantics_from_interview_summary(
-            columns=[{"name": "order_id"}],
-            interview_summary={
-                "semantic_intent": {
-                    "time_dimension": "order_date",
-                    "time_granularity": "fortnightly",
-                }
-            },
-            expose_name="orders",
-            description="Orders",
-        )
-        time_dims = [d for d in semantics["dimensions"] if d.get("type") == "time"]
-        assert "typeParams" not in time_dims[0]
-
-
 # ---------------------------------------------------------------------
 # The validate-time guard for the SAME double-aggregation shape.
 #

@@ -190,12 +190,8 @@ V1_PUBLIC_API: List[Tuple[str, str]] = [
     ("fluid_build.copilot.store.backends.null", "NullBackend"),
     ("fluid_build.copilot.store.backends.file", "FileBackend"),
     ("fluid_build.copilot.store.backends.sqlite", "SqliteBackend"),
-    ("fluid_build.copilot.store.backends.postgres", "PostgresBackend"),
-    ("fluid_build.copilot.store.backends.vector", "VectorBackend"),
     ("fluid_build.copilot.store.factory", "resolve_store"),
     ("fluid_build.copilot.store.keys", "generate_cache_key"),
-    ("fluid_build.copilot.store.semantic_writer", "auto_semantic_write_enabled"),
-    ("fluid_build.copilot.store.semantic_writer", "write_semantic_record"),
     # ---- Industry packs ---------------------------------------------
     ("fluid_build.copilot.industry", "IndustryPack"),
     ("fluid_build.copilot.industry", "IndustryPackCompiler"),

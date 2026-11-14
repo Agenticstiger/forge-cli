@@ -24,17 +24,14 @@ from fluid_build.cli import doctor
 LOG = logging.getLogger(__name__)
 
 
-# ── catalog: the 8 kill switches must be in the listed set ─────────────
+# ── catalog: the required kill switches must be in the listed set ─────────────
 
 
 REQUIRED_KILL_SWITCHES = (
     "FLUID_FORGE_NO_PICKER",
     "FLUID_FORGE_NO_PREVIEW",
     "FLUID_FORGE_NO_WELCOME",
-    "FLUID_FORGE_NO_STREAMING_PREVIEW",
-    "FLUID_COPILOT_JUDGE",
     "FLUID_COPILOT_ENRICHMENT",
-    "FLUID_JUDGE_SELF_CRITIQUE",
     "FLUID_COPILOT_CHECKPOINT",
 )
 
@@ -60,12 +57,12 @@ class TestTelemetryKillSwitchesListed:
 
 
 class TestEnvCatalog:
-    def test_all_eight_kill_switches_are_listed(self):
+    def test_all_required_kill_switches_are_listed(self):
         catalog_names = {row[0] for row in doctor.ENV_KILL_SWITCHES}
         for name in REQUIRED_KILL_SWITCHES:
             assert name in catalog_names, (
                 f"kill switch {name} missing from doctor.ENV_KILL_SWITCHES — "
-                "UX audit H9 mandated all 8 be surfaced"
+                "UX audit H9 mandated they be surfaced"
             )
 
     def test_each_entry_has_name_default_description(self):
@@ -100,8 +97,8 @@ class TestResolveEnvState:
         assert source == "env"
 
     def test_empty_string_renders_as_quoted_empty(self, monkeypatch):
-        monkeypatch.setenv("FLUID_COPILOT_JUDGE", "")
-        value, source = doctor._resolve_env_state("FLUID_COPILOT_JUDGE")
+        monkeypatch.setenv("FLUID_COPILOT_ENRICHMENT", "")
+        value, source = doctor._resolve_env_state("FLUID_COPILOT_ENRICHMENT")
         assert value == '""'
         assert source == "env"
 
@@ -131,7 +128,7 @@ class TestEnvListingJson:
         for row in payload["env"]:
             assert {"name", "value", "source", "default", "description"} <= row.keys()
 
-    def test_json_lists_all_eight_required_switches(self, monkeypatch):
+    def test_json_lists_all_required_switches(self, monkeypatch):
         rc, out = self._capture_json_run(monkeypatch)
         rows = json.loads(out)["env"]
         names = {row["name"] for row in rows}
@@ -159,7 +156,7 @@ class TestEnvListingJson:
 
 
 class TestEnvListingTable:
-    def test_table_output_lists_all_eight(self, monkeypatch, capsys):
+    def test_table_output_lists_all_required(self, monkeypatch, capsys):
         for name, _, _ in doctor.ENV_KILL_SWITCHES:
             monkeypatch.delenv(name, raising=False)
         args = SimpleNamespace(env=True, json=False)

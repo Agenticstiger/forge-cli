@@ -268,20 +268,3 @@ class TestEmitForgeRunSpan:
 
         assert captured["attrs"] == {"fluid.flow": "forge"}
         assert not any(k.startswith("ux.") for k in captured["attrs"])
-
-    def test_incomplete_helper_marks_false_and_emits(self, monkeypatch):
-        import logging
-
-        # Safe: forge_modes (imported at module scope) already loaded
-        # _template_mode in the correct order.
-        from fluid_build.cli import _template_mode as tm
-
-        monkeypatch.setattr(tc, "telemetry_enabled", lambda: True)
-        captured = _patch_traced_span(monkeypatch)
-
-        uxt.get_telemetry().mark_completed(True)  # pretend a stale True
-        tm._emit_incomplete_forge_span(logging.getLogger("test"))
-
-        assert uxt.get_telemetry().run_completed is False
-        assert captured["attrs"]["ux.run_completed"] is False
-        assert captured["attrs"]["fluid.flow"] == "forge"

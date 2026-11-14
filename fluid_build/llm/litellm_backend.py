@@ -115,11 +115,9 @@ def quiet_litellm(litellm: Any) -> Any:
     exception, which forge reports, and the provider-list link is in its text.
     What goes is litellm's request for bug reports and its debug-mode hint.
 
-    Every forge call into ``litellm.completion`` loads litellm here, in
-    ``ai_setup._validate_api_key``, in the agent loop's tool call or in the
-    agent loop's summarizer, and each calls this, so whichever runs first sets
-    it. The fallback router (``fluid_build.llm.router``) builds a
-    ``litellm.Router``, which sets it too. The cost and token-budget helpers
+    Every forge call into ``litellm.completion`` loads litellm here or in
+    ``ai_setup._validate_api_key``, and each calls this, so whichever runs first sets
+    it. The cost and token-budget helpers
     only read litellm's tables, after an AI call has loaded it here.
     """
     litellm.suppress_debug_info = True
@@ -887,21 +885,7 @@ def _reset_thread_local_cost_state() -> None:
 
 
 def _completion_via_router_or_direct(litellm: Any, payload: Dict[str, Any]) -> Any:
-    """Route through the Router singleton when applicable, else direct.
-
-    A 5xx on the primary deployment would otherwise kill the in-flight
-    run. The Router has the cooldown_time / num_retries / fallbacks
-    machinery already; we just need to call it instead of
-    ``litellm.completion``. Same kwargs shape, same response shape.
-    """
-    model_id = payload.get("model", "")
-    # Lazy import to keep cold-start path off the Router code; tests
-    # patch ``forge_llm_router.get_router`` to inject behaviour.
-    from fluid_build.llm import router as forge_llm_router
-
-    router = forge_llm_router.get_router(model_id)
-    if router is not None:
-        return router.completion(**payload)
+    """Call ``litellm.completion`` directly (the fallback Router was removed)."""
     return litellm.completion(**payload)
 
 
