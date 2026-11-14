@@ -51,7 +51,7 @@ def resolve_store(
     if backend_name in {"0", "none", "null", "disabled"}:
         # Fire a single WARNING per (process, backend_name) so users
         # who export ``FLUID_STORE_BACKEND=null`` to silence a noisy
-        # store see the cost of that choice once — episodic
+        # store see the cost of that choice once: episodic
         # memory will not be retained.
         if backend_name not in _LOGGED_NULL:
             _log.warning(

@@ -113,7 +113,7 @@ def test_capability_matrix_keeps_its_import_path_and_templates() -> None:
 
 def test_library_entry_points_import() -> None:
     import fluid_build
-    import fluid_build.engine  # noqa: F401 — Command Center probes it
+    import fluid_build.engine  # noqa: F401 - Command Center probes it
     from fluid_build.describe import self_describe
     from fluid_build.schema_manager import FluidSchemaManager
 

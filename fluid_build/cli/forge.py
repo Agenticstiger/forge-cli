@@ -41,8 +41,8 @@ from fluid_build.cli.next_steps import print_next_steps
 #
 # Several of these symbols are patched by tests at module scope
 # (``patch("…cli.forge.build_capability_matrix")``, ``…ask_confirmation``,
-# ``…_scaffold_ci_pipeline``), so they MUST remain resolvable module attributes
-# — that is exactly what ``__getattr__`` provides. Runtime use sites resolve via
+# ``…_scaffold_ci_pipeline``), so they MUST remain resolvable module attributes,
+# which is exactly what ``__getattr__`` provides. Runtime use sites resolve via
 # ``import fluid_build.cli.forge as _self; _self.X`` so those patches flow through.
 
 # alias -> (heavy source module, real symbol name)

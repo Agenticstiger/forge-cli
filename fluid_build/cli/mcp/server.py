@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-MCP FastMCP server — app instance and 11 async tool registrations.
+MCP FastMCP server: app instance and 11 async tool registrations.
 
 Split from ``fluid_build.cli.mcp`` (issue #11) to reduce the 2 446-line
 monolith into focused, testable modules.
@@ -153,7 +153,7 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
 
 
 # ----------------------------------------------------------------------
-# Tool registrations (11 tools — one @_forge_tool() per capability in
+# Tool registrations (11 tools, one @_forge_tool() per capability in
 # TOOL_CAPABILITIES). Each is a thin async wrapper that gates on policy and
 # delegates the actual work to :func:`_call_tool`.
 #

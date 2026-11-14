@@ -158,7 +158,7 @@ def _parse_since(spec: Optional[str]) -> Optional[datetime]:
     H21: malformed input raises :class:`ValueError` with a one-line
     example so the user gets immediate feedback instead of silently
     seeing every run unfiltered.  Empty / ``None`` legitimately means
-    "no cutoff" — those still return ``None``.
+    "no cutoff", and those still return ``None``.
     """
     if not spec:
         return None

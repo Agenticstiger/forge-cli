@@ -303,7 +303,7 @@ class StageCoordinator(_RepairLoopMixin):
     ) -> None:
         """Run the final checkpointed stage: enrichment.
 
-        Fail-open — a failure logs at DEBUG and the run still returns a
+        Fail-open: a failure logs at DEBUG and the run still returns a
         CoordinatorResult to the caller. Running it here brings it inside
         the checkpoint envelope so a Ctrl-C after the validator doesn't
         lose the work.

@@ -31,7 +31,7 @@ pytestmark = pytest.mark.integration
 _SYSTEM = (
     "You generate FLUID DataProduct contracts. Respond with ONLY a JSON object "
     "matching the provided schema (the whole contract as YAML text in "
-    "contract_yaml) — no prose, no markdown fences."
+    "contract_yaml), no prose, no markdown fences."
 )
 _USER = "Create a minimal DataProduct contract for a daily sales table named 'sales'."
 

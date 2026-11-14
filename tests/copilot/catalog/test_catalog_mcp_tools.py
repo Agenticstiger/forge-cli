@@ -189,7 +189,7 @@ class TestPermissionPolicy:
             check_tool_permission(name, {}, policy=policy)  # no exception
 
     def test_writable_paths_sandbox_blocks_outside_paths(self, tmp_path):
-        """``regenerate_physical`` writes ``contract_path`` — the path
+        """``regenerate_physical`` writes ``contract_path``: the path
         must resolve under one of ``writable_paths`` or the policy
         gate rejects."""
         sandbox = tmp_path / "allowed"

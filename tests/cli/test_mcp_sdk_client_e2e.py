@@ -17,7 +17,7 @@ will see identical behaviour.
 
 Two shapes verified:
 
-1. SDK↔SDK initialize + list_tools — returns the 11 forge tools.
+1. SDK↔SDK initialize + list_tools: returns the 11 forge tools.
 2. SDK↔SDK call_tool against a read-only tool (``validate_contract`` on
    the hello-world example) — returns a structured score.
 """

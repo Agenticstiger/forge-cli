@@ -80,7 +80,7 @@ After scaffolding, the IDE's agent has **two complementary channels**:
      `list_source_lineage`, `list_source_glossary` — catalog discovery.
    - `read_logical_model`, `update_entity`, `add_relationship`,
      `regenerate_physical` — logical-model edits (round-trip via the sidecar).
-   - `validate_contract`, `diff_models` — checks.
+   - `validate_contract`, `diff_models`: checks.
 2. **CLI commands** (the 11-stage pipeline) via the IDE's shell tool:
    - `bundle → validate → generate artifacts → validate-artifacts → diff → plan →
      apply → policy-apply → verify → publish → schedule-sync`, each run as
@@ -178,7 +178,7 @@ re-do the survey.
   `@_mcp_app.tool()`. The earlier hand-rolled stdio loop was removed when the SDK landed.
   MCP sampling, which ran forge's own LLM inside the calling agent's request, was removed
   on 2026-11-13 with the `forge_run` tool: the calling agent brings its own model.
-- **MCP spec** — protocol version `2025-06-18`. forge's MCP server speaks this version
+- **MCP spec**: protocol version `2025-06-18`. forge's MCP server speaks this version
   (negotiated automatically by the SDK at `initialize`).
 
 ### Cross-IDE rules / config

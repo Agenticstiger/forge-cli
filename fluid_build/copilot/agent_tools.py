@@ -157,7 +157,7 @@ def build_default_tool_registry(
     introspection tools (``inspect_table``, ``list_tables``,
     ``get_lineage``).
 
-    Best-effort — a missing adapter simply produces an empty registry.
+    Best-effort: a missing adapter simply produces an empty registry.
     The modeler's tool loop (v1.6) checks ``registry.tools`` to pick which
     tools the LLM can call.
     """

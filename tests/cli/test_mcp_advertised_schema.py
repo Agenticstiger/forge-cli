@@ -45,7 +45,7 @@ SAMPLE_CONTRACT = {
 # FastMCP-advertised inputSchema (H4 regression)
 #
 # Before the H4 refactor, ``TOOL_CAPABILITIES[*].input_schema`` was dead
-# code on the MCP wire — FastMCP derived the inputSchema from the bare
+# code on the MCP wire: FastMCP derived the inputSchema from the bare
 # function signature, dropping every curated description + enum. These
 # tests pin the post-refactor behaviour: descriptions + enums + nested
 # Pydantic envelopes reach the client via ``tools/list``.
@@ -56,7 +56,7 @@ def _get_advertised_input_schema(tool_name: str) -> dict:
     """Resolve the inputSchema that FastMCP will publish in ``tools/list``.
 
     Uses ``_mcp_app.list_tools()`` so we hit the SAME code path the SDK
-    invokes for a live MCP client — not the curated registry directly.
+    invokes for a live MCP client, not the curated registry directly.
     """
     import asyncio
 
@@ -76,7 +76,7 @@ def test_advertised_schema_list_source_tables_carries_source_enum():
     """The seven curated catalog sources must surface as a JSON Schema enum
     so Claude Code / Cursor / Kiro can autocomplete the value.
 
-    Before H4 this advertised ``{type: string}`` with no enum — the
+    Before H4 this advertised ``{type: string}`` with no enum: the
     curated ``TOOL_CAPABILITIES["list_source_tables"].input_schema``
     never reached the wire.
     """
@@ -98,7 +98,7 @@ def test_advertised_schema_list_source_tables_carries_source_enum():
 
 def test_advertised_schema_list_source_tables_carries_credentials_envelope():
     """The credentials envelope must reach the client as a nested object
-    schema with ``credential_id`` documented — not a bare ``{type: object}``.
+    schema with ``credential_id`` documented, not a bare ``{type: object}``.
     """
     schema = _get_advertised_input_schema("list_source_tables")
     # FastMCP refs the BaseModel via $defs; resolve it.
@@ -124,7 +124,7 @@ def test_advertised_schema_list_source_tables_carries_scope_envelope():
     assert "schema" in scope_def["properties"]
     assert "catalog" in scope_def["properties"]
     assert "tables" in scope_def["properties"]
-    # Strict-by-default — curated registry pins ``additionalProperties: false``.
+    # Strict-by-default: curated registry pins ``additionalProperties: false``.
     assert scope_def["additionalProperties"] is False
 
 

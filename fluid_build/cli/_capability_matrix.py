@@ -25,7 +25,7 @@ KNOWN_BUILD_ENGINES = {
     "dbt",
     "spark",
     "custom",
-    # Ingestion engines (SDP role) — must be advertised so the AI
+    # Ingestion engines (SDP role) must be advertised so the AI
     # path can pick the right engine for source-aligned products.
     # The build_runners directory ships dispatchers for each.
     "duckdb",
@@ -91,7 +91,7 @@ def build_capability_matrix() -> Dict[str, Any]:
     matrix = _build_capability_matrix_uncached()
     with _CAPABILITY_MATRIX_LOCK:
         # Another thread may have populated the cache between our checks;
-        # that's fine — last writer wins, the content is identical.
+        # that's fine: last writer wins, the content is identical.
         _CAPABILITY_MATRIX_CACHE = matrix
     return copy.deepcopy(matrix)
 
