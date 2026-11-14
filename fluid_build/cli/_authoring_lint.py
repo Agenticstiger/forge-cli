@@ -23,8 +23,8 @@ value the schema accepts but no real contract ships:
   ADP (Silver): a rule that follows from the contract's own classification.
 
 All are warnings: ``fluid validate`` passes and ``--strict`` fails. Every message
-says what to write instead and never asks for a value the request did not give:
-the fix for an invented address is the request's address, or none. The other
+says what to write instead, for a person and for an agent, and never invites a
+guess: the fix for an invented address is the real one, or none. The other
 rule that follows from the classification, an SDP that consumes a product this
 workspace cannot resolve, lives with the composition check in ``cli/validate.py``.
 
@@ -103,9 +103,13 @@ def _key(parts: Path) -> str:
 
 # ── placeholder email ───────────────────────────────────────────────────────
 
-#: An address; never one that starts after ``:`` or ``/``, which is a URI's userinfo
-#: (``scheme://user:password@host``), not a mailbox.
-_EMAIL = re.compile(r"(?<![\w.%+:/-])([A-Za-z0-9._%+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)")
+#: An address standing on its own: at the start, or after white space or one of ``<("',;``.
+#: So never a URI's userinfo (``user:password@host``), and never the tail of a longer token
+#: (``password=secret@host``): a message quotes what it matches, and a fragment of a
+#: credential would slip past the console's URL redaction.
+_EMAIL = re.compile(
+    r"(?<![^\s<(\"',;])([A-Za-z0-9._+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)(?!\.?[\w@-])"
+)
 #: A key that holds a way to reach someone: the contact emails this rule is about.
 #: An access grant's principal is not one (the governance check owns principals).
 _CONTACT_KEY = re.compile(
@@ -207,9 +211,12 @@ def _placeholder_emails(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
                 continue
             address = match.group(0)
             if value.strip() == address and _key(parts).lower().endswith("email"):
-                fix = "Write the address the request gives; if it gives none, delete the key."
+                fix = (
+                    "Use the owning team's real address, never a guess; if there is none, "
+                    "delete the key (it is optional)."
+                )
             else:
-                fix = "Replace it with the real address the request gives, or remove it."
+                fix = "Replace it with a real address, never a guess, or remove it."
             yield _finding(
                 "contract_placeholder_email",
                 parts,
@@ -235,11 +242,6 @@ _RESIDUE_TOKENS = (
 _RESIDUE_VALUES = frozenset({"data-team"})
 
 
-def _quoted(value: str, limit: int = 60) -> str:
-    """``value`` quoted, cut to ``limit`` characters: a message names it, it does not carry it."""
-    return repr(value if len(value) <= limit else value[: limit - 3] + "...")
-
-
 def _residue_token(value: str) -> Optional[str]:
     text = re.sub(r"\s+", " ", value.strip().lower())
     if text in _RESIDUE_VALUES:
@@ -252,21 +254,21 @@ def _residue_fix(parts: Path, contract: Mapping[str, Any]) -> str:
         domain, name = contract.get("domain"), contract.get("name")
         if isinstance(domain, str) and isinstance(name, str):
             if _residue_token(domain) is None and _residue_token(name) is None:
-                return f"Write <domain>.<name> from the request, for example {domain}.{name}."
-        return "Write <domain>.<name> from the request, for example sales.orders_raw."
+                return f"Write the product's own id, <domain>.<name>: {domain}.{name}."
+        return "Write the product's own id, <domain>.<name>, for example sales.orders_raw."
     if "semantics" in parts:
-        return "Delete exposes[].semantics unless the request asks for a semantic model."
+        return "Delete exposes[].semantics unless the product needs a semantic model."
     if parts[:1] == ("builds",):
-        return "Write the build the request describes, or delete builds if it asks for none."
+        return "Write the product's real build, or delete builds if it has none."
     if parts[:1] == ("exposes",):
-        return "Name the output after the request's: its exposeId, file or table."
+        return "Name the output after what the product publishes: its exposeId, file or table."
     if _key(parts) in {"team", "owner"}:
-        return "Write the team the request names."
+        return "Write the owning team's real name, never a guess."
     if parts == ("name",):
-        return "Write the name the request gives."
+        return "Write the product's name."
     if parts == ("description",):
-        return "Describe the product the request asks for."
-    return "Replace it with the request's own value."
+        return "Describe this product."
+    return "Replace it with the product's own value."
 
 
 def _template_residue(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
@@ -281,15 +283,11 @@ def _template_residue(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
             if parts in reported_semantics:
                 continue
             reported_semantics.add(parts)
-            message = f"{_dotted(parts)} is the starter template's semantic model"
+            message = f"{_dotted(parts)} is the starter template's semantic model ({token!r})."
         else:
-            message = f"{_dotted(parts)}: {_quoted(value)} is the starter template's value"
-        yield _finding(
-            "contract_template_residue",
-            parts,
-            f"{message} ({token!r}).",
-            _residue_fix(parts, contract),
-        )
+            # The token, never the value: a value can be a whole connection string.
+            message = f"{_dotted(parts)} still holds the starter template's {token!r}."
+        yield _finding("contract_template_residue", parts, message, _residue_fix(parts, contract))
 
 
 # ── placeholder values ──────────────────────────────────────────────────────
@@ -333,7 +331,7 @@ def _placeholder_values(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
             "contract_placeholder_value",
             parts,
             f"{_dotted(parts)}: {found!r} is a placeholder, not a value.",
-            "Write what the request gives, or delete the key when it is optional.",
+            "Write the real value, never a guess, or delete the key when it is optional.",
         )
 
 

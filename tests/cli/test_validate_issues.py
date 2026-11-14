@@ -188,7 +188,10 @@ def test_a_placeholder_owner_email_is_a_warning_with_its_fix(run, address: str) 
     assert issue["severity"] == "warning"
     assert issue["pointer"] == "/metadata/owner/email"
     assert address in issue["message"]
-    assert issue["fix"] == "Write the address the request gives; if it gives none, delete the key."
+    assert issue["fix"] == (
+        "Use the owning team's real address, never a guess; if there is none, "
+        "delete the key (it is optional)."
+    )
     assert "@" not in issue["example"], "the example must not teach another address"
 
 
@@ -209,7 +212,7 @@ def test_a_placeholder_address_inside_a_contact_text_is_flagged_where_it_is(run)
 
     [issue] = _issues(doc, "ERR_CONTRACT_PLACEHOLDER_EMAIL")
     assert issue["pointer"] == "/metadata/owner/oncall"
-    assert issue["fix"] == "Replace it with the real address the request gives, or remove it."
+    assert issue["fix"] == "Replace it with a real address, never a guess, or remove it."
 
 
 def test_only_contact_fields_are_read_for_addresses() -> None:
@@ -230,6 +233,11 @@ def test_only_contact_fields_are_read_for_addresses() -> None:
         "postgresql://svc:Hunter2Secret99@db.staging.test:5432/orders",
         "redis://:Hunter2Secret99@cache.example.org/0",
         "svc:Hunter2Secret99@db.example.com",
+        # the final security check's attack strings: a credential's tail is never an address
+        "svc:ab!Hunter2Secret99@db.staging.test",
+        "svc:p@Hunter2Secret99@db.staging.test",
+        "svc%3AHunter2Secret99@db.staging.test",
+        "smtp password=Hunter2Secret99@mail.test",
     ],
 )
 def test_a_uris_credentials_are_never_read_as_an_address(value: str) -> None:
@@ -243,6 +251,23 @@ def test_a_uris_credentials_are_never_read_as_an_address(value: str) -> None:
 
     assert not [f for f in findings if f.event == "contract_placeholder_email"]
     assert all("Hunter2Secret99" not in f.message for f in findings)
+
+
+def test_a_starter_value_is_named_by_its_token_never_quoted() -> None:
+    """A value can be a connection string: a cut-off quote of it would print a password
+    past the URL redaction, which needs the ``@`` (the final security check of this change)."""
+    from fluid_build.cli._authoring_lint import lint_contract
+
+    dsn = (
+        "postgresql://svc_reader:"
+        + "Xk9vQ2mLp7RtZs4WbN8cYh3JdF6gUe1AqPw0Lm5n"
+        + "@db.corp.com/starter_table"
+    )
+    contract = _contract(exposes=[{"binding": {"location": {"dsn": dsn}}}])
+
+    [finding] = [f for f in lint_contract(contract) if f.event == "contract_template_residue"]
+    assert "Xk9v" not in finding.message and "svc_reader" not in finding.message
+    assert "'starter_table'" in finding.message
 
 
 def test_catalog_auth_values_are_never_read() -> None:
@@ -288,7 +313,7 @@ def test_the_starter_id_fix_names_the_contracts_own_domain_and_name(run) -> None
     _, doc = _json(run, _contract(id="starter-product.starter"))
 
     [issue] = _issues(doc, "ERR_CONTRACT_TEMPLATE_RESIDUE")
-    assert issue["fix"] == "Write <domain>.<name> from the request, for example sales.orders_raw."
+    assert issue["fix"] == "Write the product's own id, <domain>.<name>: sales.orders_raw."
 
 
 def test_an_unedited_starter_scaffold_is_flagged_value_by_value(
@@ -388,7 +413,7 @@ def test_text_output_prints_the_fix_with_the_warning(run) -> None:
 
     assert code == 0
     assert "metadata.owner.email: 'sales-data@example.com' is a placeholder address" in out
-    assert "if it gives none, delete the key" in out
+    assert "if there is none, delete the key (it is optional)" in out
 
 
 # ---------------------------------------------------------------------------
