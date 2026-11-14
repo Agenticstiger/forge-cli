@@ -914,7 +914,6 @@ def _validate_contract_for_version(
     validation_result = schema_manager.validate_contract(
         contract,
         schema_version=target_version,
-        strict=args.strict,
         offline_only=args.offline,
         locate=locate,
     )
@@ -2041,7 +2040,6 @@ def _try_workspace_validate(
             )
             result = schema_manager.validate_contract(
                 contract,
-                strict=args.strict,
                 offline_only=getattr(args, "offline", False),
                 locate=locate,
             )

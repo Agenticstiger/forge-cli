@@ -850,17 +850,18 @@ class FluidSchemaManager:
         self,
         contract: Dict[str, Any],
         schema_version: Optional[Union[str, SchemaVersion]] = None,
-        strict: bool = True,
         offline_only: bool = False,
         locate: Optional[Callable[..., Optional[str]]] = None,
     ) -> ValidationResult:
         """
         Validate a FLUID contract against appropriate schema.
 
+        Warnings never make the result invalid. Failing on them is the caller's
+        policy: ``fluid validate --strict`` does it with its exit code.
+
         Args:
             contract: Contract dictionary to validate
             schema_version: Specific version to validate against (auto-detect if None)
-            strict: Whether to fail on warnings
             offline_only: Only use local schemas
             locate: For a path in ``contract``, the fragment it was written in
                 (``fragments/x.yaml:21``), or ``None`` for the root contract;
@@ -1086,17 +1087,15 @@ SchemaManager = FluidSchemaManager
 def validate_contract_file(
     file_path: str,
     schema_version: Optional[str] = None,
-    strict: bool = True,
     offline_only: bool = False,
     logger: Optional[logging.Logger] = None,
 ) -> ValidationResult:
     """
-    Validate a FLUID contract file.
+    Validate a FLUID contract file. Warnings never make the result invalid.
 
     Args:
         file_path: Path to contract file
         schema_version: Specific version to validate against
-        strict: Whether to fail on warnings
         offline_only: Only use local schemas
         logger: Logger instance
 
@@ -1114,7 +1113,7 @@ def validate_contract_file(
         # Validate
         manager = create_schema_manager(logger=logger)
         return manager.validate_contract(
-            contract, schema_version=schema_version, strict=strict, offline_only=offline_only
+            contract, schema_version=schema_version, offline_only=offline_only
         )
 
     except FileNotFoundError:
