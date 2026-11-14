@@ -167,7 +167,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carried the template value `fluid validate` flags as residue. The team now comes from
   `data_product.owner`, labelled `catalogOwnerSource: intent`, and only from it: an LLM's
   draft can neither replace nor invent the owner. An intent without one still gets `data-team`
-  and the warning that asks for a real owner.
+  and the warning that asks for a real owner. The model sidecar (`<output>.model.json`) and the
+  model doc now list the owner in their source summary, as drafts forged from a catalog do.
 - **Every `fluid_build` module imports when it is the first one loaded.** Thirteen modules
   raised `ImportError: cannot import name ... from partially initialized module` when imported
   first in a fresh interpreter (`python -c "import fluid_build.cli._init_dag_helpers"`): the

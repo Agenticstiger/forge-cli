@@ -50,6 +50,39 @@ def test_the_intent_owner_becomes_the_contract_owner(technique: str) -> None:
     assert _owner(draft) == ("retail-analytics", "intent")
 
 
+@pytest.mark.parametrize(
+    ("owner", "expected"),
+    [("  retail-analytics  ", ("retail-analytics", "intent")), ("   ", ("data-team", None))],
+)
+def test_the_owner_is_stripped_and_a_blank_one_is_no_owner(owner: str, expected) -> None:
+    draft = ModelerAgent().from_intent(
+        StageSession(store=NullBackend()),
+        intent=_retail_intent(owner=owner),
+        technique="dimensional",
+    )
+
+    assert _owner(draft) == expected
+
+
+def test_the_llm_path_keeps_the_intent_owner(monkeypatch) -> None:
+    # require_llm refuses the heuristic fallback, so this runs the LLM path:
+    # ``_llm_from_intent`` -> ``_deterministic_intent_backbone``.
+    intent = _retail_intent()
+    reply = ModelerAgent().from_intent(
+        StageSession(store=NullBackend()), intent=intent, technique="dimensional"
+    )
+    reply.source_summary.update({"dominant_owner": "guessed-team", "dominant_owner_source": "tag"})
+    monkeypatch.setattr(ModelerAgent, "call", lambda self, session, **kwargs: reply)
+    session = StageSession(
+        store=NullBackend(), llm_config=object(), active_provider="ollama", require_llm=True
+    )
+
+    draft = ModelerAgent().from_intent(session, intent=intent, technique="dimensional")
+
+    assert session.fallback_used is False
+    assert _owner(draft) == ("retail-analytics", "intent")
+
+
 def test_without_an_owner_the_default_stays() -> None:
     draft = ModelerAgent().from_intent(
         StageSession(store=NullBackend()), intent=_retail_intent(owner=""), technique="dimensional"
