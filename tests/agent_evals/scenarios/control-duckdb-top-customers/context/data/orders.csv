@@ -1,0 +1,4 @@
+order_id,customer_id,order_ts,amount,currency
+O-1001,C-17,2026-11-01T09:12:00,49.90,EUR
+O-1002,C-08,2026-11-01T10:05:00,120.00,USD
+O-1003,C-17,2026-11-02T14:30:00,15.25,EUR
