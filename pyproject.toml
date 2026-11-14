@@ -929,7 +929,7 @@ markers = [
     "runtime: Tests for runtime generators",
     "live_llm: Tests that call a real LLM (cost ~$0.0001/run; require an API key in env)",
     "live_judge: Opt-in tests that call the real JudgeAgent against an LLM (cost ~$0.001/run; require an API key in env)",
-    "agent_eval: Opt-in eval of coding agents authoring FLUID contracts with and without the agent skills (runs claude -p on your subscription; set FLUID_AGENT_EVAL=1)",
+    "agent_eval: Opt-in eval of coding agents authoring FLUID contracts with and without the agent skills (runs claude -p on your subscription, and codex exec with an API key when asked; set FLUID_AGENT_EVAL=1)",
     "redteam: Deterministic adversarial tests for the agentic layer (zero-token, no LLM)",
     "emulated: Stage-1 keyless integration tests backed by in-process emulators (moto, fakesnow); run on every PR via ci.yml",
     "emulated_heavy: Stage-2 Docker-based emulated integration tests (bigquery-emulator, LocalStack); admin-gated via integration-emulated-heavy.yml",
