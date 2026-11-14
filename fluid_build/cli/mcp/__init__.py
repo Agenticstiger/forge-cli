@@ -4,7 +4,7 @@
 """
 MCP stdio server for staged forge model operations.
 
-The server exposes fourteen tools over MCP stdio and applies a four-layer
+The server exposes 11 tools over MCP stdio and applies a four-layer
 access-control model before every ``tools/call``:
 
 1. **Tool allow/deny list** — only the tools explicitly permitted by

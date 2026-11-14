@@ -576,14 +576,14 @@ class CodingAgentProvider(LlmProvider):
         # meaning for a subprocess — schema is conveyed via the agent's own
         # flags below — so it is intentionally ignored.
         _reset_agent_cost_state()
-        # Agentic mode is plumbed (LlmConfig.agent_mode / --forge-agent-mode) but
-        # the runtime doesn't yet dispatch the agent-writes-the-file loop, so the
-        # envelope path runs instead. Warn loudly rather than silently no-op the
-        # opt-in flag. (Wiring the agentic loop is the documented follow-up.)
+        # This is always an envelope call: the agent returns the contract as text.
+        # Only `fluid forge` AI mode drives an agent that writes the file itself
+        # (Claude Code, cli/forge_ai.py), so agentic mode here is not an error.
         if getattr(config, "agent_mode", "envelope") == "agentic":
-            LOG.warning(
-                "coding_agent_agentic_not_wired: --forge-agent-mode agentic is not "
-                "yet dispatched by the runtime; proceeding in envelope mode."
+            LOG.debug(
+                "coding_agent_envelope_call: %s returns the contract as text; only "
+                "Claude Code in fluid forge AI mode writes the file itself.",
+                self._spec.name,
             )
         spec = self._spec
 

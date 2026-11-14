@@ -28,6 +28,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from fluid_build.cli import doctor
 
 LOG = logging.getLogger(__name__)
@@ -101,6 +103,18 @@ class TestInspectStoreBackend:
         assert "unrecognised" in info["status"].lower()
         assert info["class"] == "(unknown)"
 
+    @pytest.mark.parametrize("removed", ["postgres", "vector"])
+    def test_a_removed_backend_reports_the_file_store_and_asks_to_unset(
+        self, monkeypatch, tmp_path, removed
+    ):
+        monkeypatch.setenv("FLUID_STORE_BACKEND", removed)
+        monkeypatch.setenv("FLUID_STORE_ROOT", str(tmp_path / "store"))
+        info = doctor._inspect_store_backend()
+        assert info["backend"] == "file" and info["class"] == "FileBackend"
+        assert f"FLUID_STORE_BACKEND={removed} was removed" in info["status"]
+        assert "Unset the variable" in info["status"]
+        assert info["ok"] == "false"
+
     def test_required_keys_present_on_every_branch(self, monkeypatch):
         for backend in ("file", "sqlite", "null", "vector", "made-up"):
             monkeypatch.setenv("FLUID_STORE_BACKEND", backend)
@@ -135,11 +149,11 @@ class TestPrintStoreBackendStatus:
 
     def test_renders_warning_icon_when_ok_false(self, capsys):
         info = {
-            "env": "postgres",
-            "backend": "postgres",
-            "class": "PostgresBackend",
-            "location": "(FLUID_STORE_DSN unset)",
-            "status": "DSN missing — PostgresBackend cannot connect",
+            "env": "file",
+            "backend": "file",
+            "class": "FileBackend",
+            "location": "/read-only/store",
+            "status": "path exists but not readable+writable",
             "ok": "false",
             "schema_version": "",
         }

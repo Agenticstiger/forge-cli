@@ -61,7 +61,7 @@ The founder's rule that the AI setup be world-class AND lightweight. On #851's e
 copilot scored 0/9 and a coding agent with the four shipped skills 11/11; on Sonnet 5.5 the
 copilot's envelope prompt is refused outright (`[reasoning_extraction]` safeguard). So:
 
-- **`fluid forge` AI mode = `cli/forge_ai.py`**, about 940 lines with docstrings. `run_ai_copilot_mode` in
+- **`fluid forge` AI mode = `cli/forge_ai.py`**, about 1,090 lines with docstrings. `run_ai_copilot_mode` in
   `cli/forge.py` delegates to it. Seams for tests: `call_llm` (llm.providers), `_run_agent`
   (llm.coding_agent), `_run_interactive` and `_run_validate` (forge_ai). Never `python -m` for
   the validate step: it resolves the install's `fluid` with the skills hook's `find_fluid()`.
@@ -148,14 +148,14 @@ A multi-phase push landed comprehensive UX + architecture upgrades on `feat/sour
 
 - **Mode picker (`fluid forge`).** Bare invocation surfaces a 5-mode menu (AI / Compose / Refine / Template / Blank) instead of dropping into AI. Lives at `cli/_forge_mode_picker.py`. Skipped via `FLUID_FORGE_NO_PICKER=1`. Picker default is highlighted by the welcome scan; user always sees the menu.
 - **Welcome scan.** Detect-first parallel scan runs before any prompt (budget: see the 2026-11-03 section) — workspace state, AI configured, CLIs installed, sample data, cloud creds, return-user state. Lives at `cli/_welcome_scan.py`. `~/.fluid/usage.json` carries `forge_count`.
-- **Mode-aware interviews.** `forge_copilot_interview.py::run_adaptive_copilot_interview` short-circuits to `_run_compose_interview` (3 questions max for `--from-product`) or `_run_refine_interview` (1 question for `--refine`) when the runtime resolved upstreams or loaded an existing contract. Standard mode runs the world-class bootstrap (below).
-- **World-class bootstrap.** New default fresh-product interview at `cli/_world_class_interview.py`. Inferences first (`InterviewSignals`), examples in every prompt, productType-first, `:auto` escape, schema-coverage gate. Toggle via `FLUID_INTERVIEW_LEGACY=1` to revert to the legacy bootstrap.
-- **Slash commands inside the interview.** `cli/_interview_slash_commands.py` — `:ai-setup`, `:override`, `:show-work`, `:doctor`, `:help`, `:quit`. Wrapped into `forge_dialogs.ask_friendly_text` so every prompt accepts them.
+- *(Deleted 2026-11-13.)* **Mode-aware interviews.** `forge_copilot_interview.py::run_adaptive_copilot_interview` short-circuits to `_run_compose_interview` (3 questions max for `--from-product`) or `_run_refine_interview` (1 question for `--refine`) when the runtime resolved upstreams or loaded an existing contract. Standard mode runs the world-class bootstrap (below).
+- *(Deleted 2026-11-13.)* **World-class bootstrap.** New default fresh-product interview at `cli/_world_class_interview.py`. Inferences first (`InterviewSignals`), examples in every prompt, productType-first, `:auto` escape, schema-coverage gate. Toggle via `FLUID_INTERVIEW_LEGACY=1` to revert to the legacy bootstrap.
+- *(Deleted 2026-11-13.)* **Slash commands inside the interview.** `cli/_interview_slash_commands.py`: `:ai-setup`, `:override`, `:show-work`, `:doctor`, `:help`, `:quit`. Wrapped into `forge_dialogs.ask_friendly_text` so every prompt accepts them.
 - **Pre-write preview panel.** `cli/_preview_panel.py` — renders cost + file list + run-id BEFORE the writes; persists `.fluid/agents/<run-id>/{cost.json,reasoning.md,transcript.json}` so Ctrl-C at the prompt loses nothing. `--yes` skips the prompt but the panel still renders. Receipts are richened via `forge_modes.py::_populate_richer_receipt`.
-- **Streaming contract preview.** `cli/_streaming_contract_preview.py` re-shapes the seed contract after every interview answer so the user sees it grow. Toggle off with `FLUID_FORGE_NO_STREAMING_PREVIEW=1`.
+- *(Deleted 2026-11-13.)* **Streaming contract preview.** `cli/_streaming_contract_preview.py` re-shapes the seed contract after every interview answer so the user sees it grow. Toggle off with `FLUID_FORGE_NO_STREAMING_PREVIEW=1`.
 - **Composition pipeline.** `forge_datamodel/from_data_products/pipeline.py` resolves upstream products, validates composition rules (SDP rejects upstreams; ADP/CDP accept SDP+ADP), pre-fills `consumes[]`. Wired via `--from-product <ID|path>` (repeatable) and `--from-product-list <file>`.
 - **`fluid forge --refine`** loads an existing contract, asks "what to change?", feeds the existing contract verbatim to the LLM as the seed (via `_seed_contract_override`).
-- **Self-healing repair loop.** `forge_copilot_runtime.py` runs the JSON-schema validator on every emitted contract and prepends path-specific errors to the next attempt's repair feedback. Function: `forge_copilot_corrective_feedback.build_schema_validation_message`.
+- *(Deleted 2026-11-13.)* **Self-healing repair loop.** `forge_copilot_runtime.py` runs the JSON-schema validator on every emitted contract and prepends path-specific errors to the next attempt's repair feedback. Function: `forge_copilot_corrective_feedback.build_schema_validation_message`.
 - **`fluid stats`.** Aggregates `.fluid/agents/*/cost.json` across runs. `--by provider/type/engine`, `--since <spec>`, `--json`.
 - **Forge templates emit v0.7.3 directly.** Each of `forge/templates/{starter,analytics,etl_pipeline,ml_pipeline,streaming}.py` now uses the shared spec-driven builder at `forge/templates/_v073_builder.py`. The legacy v0.5-vintage methods are preserved as `_legacy_generate_contract_unused` for reference. The runtime coercion layer at `forge_modes.py::_coerce_template_contract_to_v073` is now a no-op for v0.7.3 contracts (fast-path) and remains as a safety net for any legacy out-of-tree template.
 - **LiteLLM unified backend.** `cli/forge_copilot_llm_litellm.py` ships an opt-in `LiteLLMProvider` that subclasses `LlmProvider` and routes every provider through one API. Enable via `FLUID_LLM_BACKEND=litellm` + `pip install 'data-product-forge[litellm]'`. `RunCostTracker.record_call` now accepts `usd_override` (used by litellm to feed accurate per-call cost into the cost summary). Dispatched in `forge_copilot_llm_providers.py::get_llm_provider` + short-circuits in `call_llm` and `call_llm_streaming`.
@@ -163,7 +163,7 @@ A multi-phase push landed comprehensive UX + architecture upgrades on `feat/sour
 - **Mode dispatch fix.** Picking `template` now routes to `forge_modes.run_template_mode` (no AI). Picking `blank` goes to `_run_blank_mode`. Picking `refine`/`from_product` flows through the AI runtime with the right context flags. The `--template` flag is an argparse alias of `--scaffold`.
 - **Datamesh-manager Silver↔Gold archetype swap fix.** `providers/datamesh_manager/datamesh_manager.py` had `Silver→consumer-aligned` and `Gold→aggregate` reversed. Now correctly reads `metadata.productType` first and falls back to the canonical layer mapping (Bronze→source-aligned / Silver→aggregate / Gold→consumer-aligned).
 
-Test files pinning the above: `tests/test_forge_mode_picker.py`, `tests/test_welcome_scan.py`, `tests/test_world_class_interview.py`, `tests/test_interview_modes.py`, `tests/test_preview_panel.py`, `tests/test_interruptible_authoring.py`, `tests/test_phase2_tools.py`, `tests/test_from_data_products.py`, `tests/test_stats.py`, `tests/test_self_healing_repair.py`, `tests/test_litellm_backend.py`, `tests/test_ux_telemetry.py`, `tests/test_init_forge_scenarios_e2e.py` (the matrix that runs `fluid validate` on every produced contract).
+Test files pinning the above: `tests/test_forge_mode_picker.py`, `tests/test_welcome_scan.py`, `tests/test_preview_panel.py`, `tests/test_from_data_products.py`, `tests/test_stats.py`, `tests/test_litellm_backend.py`, `tests/test_init_forge_scenarios_e2e.py` (the matrix that runs `fluid validate` on every produced contract).
 
 Key env vars introduced or honoured by the new path:
 
@@ -171,14 +171,11 @@ Key env vars introduced or honoured by the new path:
 |---|---|
 | `FLUID_LLM_BACKEND=litellm` | route every LLM call through litellm |
 | `FLUID_LITELLM_MODEL_PREFIX=<x>` | override the litellm model-name prefix for niche providers |
-| `FLUID_INTERVIEW_LEGACY=1` | revert to the legacy bootstrap interview |
 | `FLUID_FORGE_NO_PICKER=1` | suppress the mode picker (CI / scripts) |
 | `FLUID_FORGE_NO_PREVIEW=1` | suppress the pre-write preview panel + prompt |
 | `FLUID_FORGE_NO_WELCOME=1` | suppress the welcome scan render |
-| `FLUID_FORGE_NO_STREAMING_PREVIEW=1` | suppress the live contract growth panel |
 | `FLUID_FORGE_PICKER_ALWAYS=1` | force the picker even for return users |
 | `FLUID_COST_LIMIT_USD_PER_RUN=<n>` | per-run cost cap shown in the progress prefix |
-| `FLUID_INTERVIEW_LEGACY=1` | use the legacy bootstrap (fallback) |
 
 ## Recent architectural changes worth knowing (2026-05-02, world-class hardening)
 
@@ -284,7 +281,7 @@ streaming runners. Headline items:
   `from_intent`, `from_catalog`). Pin file:
   `tests/copilot/test_cost_ceiling_per_product.py`.
 
-- **Join-key self-healing.** `cli/forge_copilot_corrective_feedback.py`
+- *(Deleted 2026-11-13.)* **Join-key self-healing.** `cli/forge_copilot_corrective_feedback.py`
   adds `build_join_key_repair_message()` that detects "join key X not
   in upstream Y" errors specifically and routes to the LLM with a
   ranked list of plausible alternative keys (via
@@ -294,8 +291,6 @@ streaming runners. Headline items:
 - **Physical extractions reduced top-LOC files.**
   - `cli/_init_dag_helpers.py` (DAG generation, ~250 LOC) extracted
     from `cli/init.py`.
-  - `cli/_interview_ask_helpers.py` (slot prompt helpers) extracted
-    from `cli/forge_copilot_interview.py`.
   - `cli/_template_mode.py` extracted from `cli/forge_modes.py`.
   - `cli/_auth_provider_impls.py` extracted from `cli/auth.py`.
   - `cli/viz_renderers/{dot,output,html}.py` extracted from
@@ -315,7 +310,6 @@ Test files pinning the above (this session):
 `tests/build_runners/test_late_arrival_runner_integration.py`,
 `tests/forge/test_federation_backends.py`,
 `tests/copilot/test_cost_ceiling_per_product.py`,
-`tests/test_join_key_self_healing.py`,
 `tests/observability/test_run_id.py`.
 
 Key env vars added this session:
@@ -391,7 +385,7 @@ docker-in-docker, Lake Formation DataLakeAdmin → GrantPermissions).
 AI coding agent the user already has. Two complementary topologies, both on the
 existing `LlmProvider` seam (no new backend switch — selection is by provider name):
 
-- **In-IDE (MCP sampling, already existed; this branch fixed two bugs).**
+- *(Deleted 2026-11-13 with the `forge_run` MCP tool.)* **In-IDE (MCP sampling, already existed; this branch fixed two bugs).**
   `MCPSamplingProvider` routes the LLM call back to the host IDE via
   `sampling/createMessage`. It was reachable only through the `forge_run` MCP
   tool, but was broken keyless: (1) `--llm-provider mcp-sampling` was rejected by

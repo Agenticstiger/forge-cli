@@ -14,6 +14,7 @@ typed error paths.
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 
 import pytest
@@ -141,6 +142,18 @@ def test_claude_code_model_passthrough_when_explicit(monkeypatch):
     provider.invoke_blocking(_cfg("claude-code", model="claude-opus-4-8"), "SYS", "USER")
     argv = _argv(rec)
     assert "--model" in argv and argv[argv.index("--model") + 1] == "claude-opus-4-8"
+
+
+def test_agentic_mode_on_an_envelope_call_is_not_a_warning(monkeypatch, caplog):
+    # Only fluid forge AI mode drives an agent that writes the file; every other caller
+    # makes an envelope call, so FLUID_FORGE_AGENT_MODE=agentic (the default) is no fault.
+    monkeypatch.setenv("CODEX_API_KEY", "ck-test")
+    _install(monkeypatch, _Recorder(stdout="ENVELOPE_TEXT"))
+    config = _cfg("codex")
+    config.agent_mode = "agentic"
+    with caplog.at_level(logging.WARNING):
+        get_llm_provider("codex").invoke_blocking(config, "SYS", "USER")
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 def test_codex_argv_schema_file_and_raw_output(monkeypatch):

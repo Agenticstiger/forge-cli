@@ -180,19 +180,13 @@ ENV_KILL_SWITCHES: List[Tuple[str, str, str]] = [
     ),
     (
         "FLUID_FORGE_AGENT_TIMEOUT_SECONDS",
-        "LLM timeout (120s)",
+        "900s for a Claude Code run, the LLM timeout (120s) for one envelope call",
         "Per-agent-CLI invocation wall-clock cap",
     ),
     (
         "FLUID_FORGE_AGENT_CWD",
         "scratch tempdir",
-        "Working dir for the agent CLI (default avoids loading project CLAUDE.md/AGENTS.md)",
-    ),
-    # — Agent network-egress tools (opt-in, default OFF) —
-    (
-        "FLUID_AGENT_WEB_TOOLS",
-        "web_search/web_fetch hidden",
-        "Set =1 to expose the SSRF-safe web_search + web_fetch agent tools",
+        "Working dir for an envelope call (a Claude Code run works in the workspace)",
     ),
     # — Telemetry consent (opt-in, default OFF) —
     (
@@ -495,7 +489,7 @@ def run(args, logger: logging.Logger) -> int:
     copilot_readiness = _check_copilot_readiness()
     # MEMORY-E2E-A finding #55: surface the active memory-store backend
     # so operators can tell at a glance which one is wired (file /
-    # sqlite / postgres / vector). Inspection is read-only, swallows
+    # sqlite / null). Inspection is read-only, swallows
     # backend resolution errors, and never costs the happy path more
     # than a few ms.
     store_backend_status = _inspect_store_backend()
@@ -1267,50 +1261,6 @@ def _check_fluid_features() -> Tuple[bool, List[Dict[str, any]]]:
     except Exception:  # noqa: BLE001 - never break doctor on plugin discovery
         pass
 
-    # Agent web tools (web_search / web_fetch) — opt-in via
-    # FLUID_AGENT_WEB_TOOLS. Non-critical; surfaces whether the two
-    # network-egress tools are exposed and which search provider (if any)
-    # is configured, so operators can confirm at a glance.
-    try:
-        from fluid_build.cli.forge_web_tools import _select_search_provider, is_enabled
-
-        if is_enabled():
-            provider = _select_search_provider(os.environ)
-            search_state = (
-                f"web_search provider: {provider}"
-                if provider
-                else "web_search: no provider key (set TAVILY_API_KEY/BRAVE_API_KEY)"
-            )
-            checks.append(
-                {
-                    "check": "Agent Web Tools",
-                    "category": "ai",
-                    "status": "✅ Enabled",
-                    "ok": True,
-                    "details": f"web_fetch (SSRF-safe) + {search_state}",
-                }
-            )
-        else:
-            checks.append(
-                {
-                    "check": "Agent Web Tools",
-                    "category": "ai",
-                    "status": "⚪ Disabled (opt-in)",
-                    "ok": True,
-                    "details": "Set FLUID_AGENT_WEB_TOOLS=1 to expose web_search + web_fetch",
-                }
-            )
-    except Exception:  # noqa: BLE001 — non-critical status line
-        checks.append(
-            {
-                "check": "Agent Web Tools",
-                "category": "ai",
-                "status": "⚪ Disabled (opt-in)",
-                "ok": True,
-                "details": "Set FLUID_AGENT_WEB_TOOLS=1 to expose web_search + web_fetch",
-            }
-        )
-
     return all_ok, checks
 
 
@@ -1463,9 +1413,8 @@ def _print_copilot_readiness(readiness: LlmReadinessCheck, verbose: bool = False
 #
 # Until this slice, ``fluid doctor`` told operators about kill switches
 # and Copilot readiness but stayed silent on which memory-store backend
-# was actually wired. Operators exporting ``FLUID_STORE_BACKEND=postgres``
-# had no easy way to confirm the DSN parsed, the schema initialised,
-# and the writes would land where they expected. The inspector below
+# was actually wired, so operators had no easy way to confirm where the
+# writes would land. The inspector below
 # resolves the active backend exactly once, probes connectivity in a
 # bounded, non-blocking way, and renders a compact "Store Backend"
 # section alongside the existing Copilot Readiness panel.
@@ -1480,12 +1429,18 @@ def _inspect_store_backend() -> Dict[str, str]:
 
     Keys are stable so the ``--json`` shape is documented and the
     ``_print_store_backend_status`` renderer can rely on them.
-    Connection probes are bounded (2 s for Postgres) and any failure
-    flows back as ``ok=False`` with a ``status`` message — never an
-    exception.
+    Probes are bounded (2 s for SQLite) and any failure flows back as
+    ``ok=False`` with a ``status`` message, never an exception.
     """
+    from fluid_build.copilot.store.factory import _REMOVED_BACKENDS
+
     backend_raw = os.environ.get("FLUID_STORE_BACKEND")
     backend = (backend_raw or "file").strip().lower() or "file"
+    # postgres and vector were removed on 2026-11-13; resolve_store warns and
+    # uses the file store, so report that store and ask for the variable to go.
+    removed = backend if backend in _REMOVED_BACKENDS else ""
+    if removed:
+        backend = "file"
 
     info: Dict[str, str] = {
         "env": backend_raw if backend_raw is not None else "(unset)",
@@ -1517,6 +1472,12 @@ def _inspect_store_backend() -> Dict[str, str]:
             info["ok"] = "false"
         else:
             info["status"] = "path missing (will auto-create on first write)"
+        if removed:
+            info["status"] = (
+                f"FLUID_STORE_BACKEND={removed} was removed; using the file store, "
+                f"{info['status']}. Unset the variable."
+            )
+            info["ok"] = "false"
         return info
 
     if backend == "sqlite":

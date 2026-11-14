@@ -1354,18 +1354,6 @@ def _phase3_memory(workspace: Path) -> PhaseResult:
     )
     result.phase_data["clear_stats"] = {"before": before, "after": after, "cleared": cleared}
 
-    # 3e. fluid memory status via CLI prints something sensible.
-    env = {"FLUID_STORE_ROOT": str(store_root)}
-    r = _run_fluid(["memory", "status"], cwd=workspace, env=env)
-    _check(
-        result,
-        r.returncode == 0,
-        "fluid memory status works with custom FLUID_STORE_ROOT",
-        phase="memory",
-        detail_on_fail=f"rc={r.returncode} stderr={r.stderr[:300]}",
-    )
-    result.phase_data["memory_status_stdout_head"] = r.stdout[:500]
-
     result.duration_s = round(time.time() - start, 3)
     result.ok = all(f.severity != "error" for f in result.findings)
     return result

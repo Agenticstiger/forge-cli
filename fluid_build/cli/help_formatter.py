@@ -521,10 +521,10 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
         ),
     ),
     "forge": (
-        "Create a new data product with AI Copilot — interactive interview and "
-        "contract generation. Use --blank to skip AI entirely.",
+        "Create a new data product. AI mode writes the contract with your coding "
+        "agent, or one LLM call, using the FLUID skills. Use --blank to skip AI entirely.",
         (
-            "  fluid forge                                       Interactive AI interview\n"
+            "  fluid forge                                       Pick a mode (AI, template, …)\n"
             "  fluid forge --blank                               Empty contract, no AI\n"
             "  fluid forge --provider snowflake                  Target a specific cloud\n"
             "  fluid forge --llm-provider gemini                 Use a specific LLM\n"

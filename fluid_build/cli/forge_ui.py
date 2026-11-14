@@ -276,10 +276,10 @@ def print_welcome_panel(console: Any) -> None:
         return
     welcome_text = (
         "🔨 **Forge** — Add a data product to this workspace\n\n"
-        "AI Copilot will interview you and generate a validated contract.\n"
+        "Your coding agent, or one LLM call, writes the contract with the FLUID skills.\n"
         "[dim]Use [bold]--blank[/bold] to skip AI and start from an empty contract.[/dim]\n\n"
-        "[dim]Power-user options: [bold]fluid forge --help[/bold] — LLM config, "
-        "memory, discovery flags.[/dim]"
+        "[dim]Power-user options: [bold]fluid forge --help[/bold] (LLM and "
+        "coding-agent flags).[/dim]"
     )
     console.print(_build_panel(welcome_text, title="FLUID Forge", border_style="blue"))
 

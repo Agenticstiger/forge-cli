@@ -133,9 +133,7 @@ _GITHUB_TOKEN_RE = re.compile(r"\bgh[oprsu]_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-
 # ``AKIA``/``ASIA``, GCP ``AIza``, Slack ``xox*``, HuggingFace ``hf_``,
 # Replicate ``r8_``, GitLab ``glpat-``, Vercel ``vc_``, Tavily ``tvly-``,
 # Brave ``BSA``). A leak of any of these is a leak regardless of
-# surrounding assignment syntax — the web-search tools
-# (``cli/forge_web_tools.py``) carry the Tavily/Brave keys in request
-# headers, so their shapes are masked here too.
+# surrounding assignment syntax.
 #
 # Anthropic must run before OpenAI: ``sk-ant-...`` is a strict prefix of
 # the looser OpenAI ``sk-...`` shape, so the more specific pattern goes

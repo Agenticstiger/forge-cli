@@ -9,10 +9,8 @@ Covers:
   #9  tier-first picker
   #11 3-attempt rescue dialog
   #12 shape-detect on bad keys
-  #15 doctor promotion (rendered hint + slash command)
+  #15 doctor promotion (rendered hint)
   #18 --browser OAuth scaffold
-  #19 :ai-setup slash command
-  #3  mid-run interrupt via :override
 """
 
 from __future__ import annotations
@@ -237,31 +235,3 @@ def test_browser_oauth_raises_for_unknown_provider(console):
 
     with pytest.raises(NotImplementedError):
         open_oauth_flow(console, provider="unknown")
-
-
-# ---------------------------------------------------------------------------
-# #19 — :ai-setup slash command
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# H24 — Unknown slash commands print did-you-mean + re-prompt
-# (i.e. the typo never leaks through as the user's answer to the next
-# interview question). UX-finding 01 caught `:bogus` getting captured
-# as the user's answer; the fix is in maybe_handle_slash_command.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# #3 — mid-run :override sets override_action
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Mid-run interrupt — agent loop honours override_action
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# #15 — doctor surface in slash commands and panel
-# ---------------------------------------------------------------------------
