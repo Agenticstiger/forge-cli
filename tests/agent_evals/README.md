@@ -169,6 +169,10 @@ workspace, offline. `fluid` runs from this checkout's interpreter with its site
 directories added by a launcher, because Codex's macOS sandbox refused to exec a venv's
 `bin/python` symlink.
 
+The shared temp dirs (`/tmp`, `/var/tmp`) are denied to a Codex arm unless they hold its
+run. Keep `TMPDIR` out of `/tmp` for Codex runs (the macOS default, `/var/folders`, is
+fine): a work root under `/tmp` leaves the rest of `/tmp` readable to the agent.
+
 The scenarios are trusted input: an agent still runs as you, so do not run a scenario
 from someone you would not let use your shell.
 
