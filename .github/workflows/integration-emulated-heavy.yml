@@ -91,13 +91,14 @@ jobs:
       # .tf.json is well-formed for the real google provider. Without the binary
       # all ten skip themselves, and because they skip rather than fail, pytest
       # still exits 0 — which is exactly how this lane went green while proving
-      # nothing. Same action SHA and tofu version as iac-tests.yml, deliberately:
-      # two lanes disagreeing about the provider version would be worse than
-      # neither running.
+      # nothing. Same action SHA as iac-tests.yml, and the first tofu version
+      # (and checksum) of its matrix, deliberately: two lanes disagreeing about
+      # the provider version would be worse than neither running.
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
         with:
           tofu_version: 1.12.0
+          checksums: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137  # 1.12.0 linux_amd64 zip
 
       # ``local`` brings DuckDB: the embedded-SQL chain on the bigquery-emulator
       # runs its SQL there. Without it that test skips, and the lane-coverage

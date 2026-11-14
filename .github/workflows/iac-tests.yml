@@ -85,9 +85,26 @@ jobs:
   # Stage 1 — unit emit + tofu validate. Fast, no creds.
   # -------------------------------------------------------------------
   stage1-unit:
-    name: "Stage 1 — unit + tofu validate"
+    name: "Stage 1 — unit + tofu validate (tofu ${{ matrix.tofu.version }})"
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
+    # Stage 1 and Stage 2 run once per OpenTofu release line this repository
+    # supports: 1.12, which they ran alone until now, and the newest stable
+    # 1.13 release. A consumer that moves to 1.13 then runs a tofu these jobs
+    # ran. Each version is pinned by the SHA-256 of its linux_amd64 zip, taken
+    # from that release's SHA256SUMS after checking OpenTofu's GPG signature
+    # on it (key E3E6 E43D 84CB 852E ADB0 051D 0C0A F313 E5FD 9F80); the action
+    # refuses any other zip. Without `checksums` it would fetch SHA256SUMS at
+    # run time and install unverified when that fetch fails. Bump a version
+    # and its checksum together, in this job, stage1-lanes and stage2-emulator.
+    strategy:
+      fail-fast: false
+      matrix:
+        tofu:
+          - version: "1.12.0"
+            sha256: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137
+          - version: "1.13.9"
+            sha256: bc44eb6b06446ba83bd4072114891987f590f66cca712737a7f1147c50c539ce
     env:
       # The unit step runs under xdist: the same glibc-arena cap as ci.yml's
       # test matrix, which keeps a thread-heavy run's virtual memory flat.
@@ -100,10 +117,14 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # Unit tests run the real `tofu validate` too when the binary is on PATH
+      # (test_iac_runner.py, test_iac_aws_iceberg_catalog.py), so the whole
+      # job runs per version, not only the step below.
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
         with:
-          tofu_version: 1.12.0
+          tofu_version: ${{ matrix.tofu.version }}
+          checksums: ${{ matrix.tofu.sha256 }}
 
       # The emulator extra is never installed in this job, so it cannot change
       # what the unit step runs; the tofu lanes below install it in their own.
@@ -127,12 +148,18 @@ jobs:
   # parallel it is the longest one. Each lane fails if a file it requires only
   # skipped (scripts/ci/assert_lane_coverage.py).
   stage1-lanes:
-    name: "Stage 1 — ${{ matrix.lane.name }}"
+    name: "Stage 1 — ${{ matrix.lane.name }} (tofu ${{ matrix.tofu.version }})"
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
+        # The same versions and checksums as stage1-unit; every lane runs on each.
+        tofu:
+          - version: "1.12.0"
+            sha256: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137
+          - version: "1.13.9"
+            sha256: bc44eb6b06446ba83bd4072114891987f590f66cca712737a7f1147c50c539ce
         lane:
           # The Lake Formation bucket-policy filter is only decided when `tofu
           # plan` reads the caller identity, so it is proven by a real plan
@@ -235,7 +262,8 @@ jobs:
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
         with:
-          tofu_version: 1.12.0
+          tofu_version: ${{ matrix.tofu.version }}
+          checksums: ${{ matrix.tofu.sha256 }}
 
       - name: Install Python deps
         run: |
@@ -272,9 +300,18 @@ jobs:
   # Stage 2 — docker emulators. PR + push.
   # -------------------------------------------------------------------
   stage2-emulator:
-    name: "Stage 2 — docker emulators"
+    name: "Stage 2 — docker emulators (tofu ${{ matrix.tofu.version }})"
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
+    # The same versions and checksums as stage1-unit.
+    strategy:
+      fail-fast: false
+      matrix:
+        tofu:
+          - version: "1.12.0"
+            sha256: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137
+          - version: "1.13.9"
+            sha256: bc44eb6b06446ba83bd4072114891987f590f66cca712737a7f1147c50c539ce
     # LocalStack and GCP emulators are started as step-level docker
     # commands AFTER checkout (rather than via the job-level
     # ``services:`` block) so that:
@@ -299,7 +336,8 @@ jobs:
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
         with:
-          tofu_version: 1.12.0
+          tofu_version: ${{ matrix.tofu.version }}
+          checksums: ${{ matrix.tofu.sha256 }}
 
       - name: Install Python deps
         # The ``test-emulators-heavy`` extra ships the GCP + AWS SDK
@@ -413,6 +451,7 @@ jobs:
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
         with:
           tofu_version: 1.12.0
+          checksums: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137  # 1.12.0 linux_amd64 zip, as stage1-unit
 
       - name: Install Python deps
         run: |
@@ -474,6 +513,7 @@ jobs:
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
         with:
           tofu_version: 1.12.0
+          checksums: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137  # 1.12.0 linux_amd64 zip, as stage1-unit
 
       - name: Install Python deps
         run: |
@@ -530,6 +570,7 @@ jobs:
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
         with:
           tofu_version: 1.12.0
+          checksums: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137  # 1.12.0 linux_amd64 zip, as stage1-unit
 
       - name: Install Python deps
         run: |
