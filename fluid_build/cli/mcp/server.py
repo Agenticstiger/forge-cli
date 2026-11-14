@@ -11,6 +11,9 @@ monolith into focused, testable modules.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextvars
+import functools
 import json
 import logging
 import threading
@@ -150,26 +153,38 @@ def _get_mcp_app() -> "FastMCP":
 #: Over HTTP one event loop serves uvicorn and every client's session, and a
 #: catalog tool waits on the network, so a tool must not run on that loop:
 #: one slow call would stall every other client and delay Ctrl-C. Each call
-#: runs in a worker thread instead, still one at a time, as stdio runs them
-#: one at a time on the loop: the tools were never written to run
-#: concurrently.
+#: runs on the one thread of ``_tool_executor()`` instead, so calls stay one at
+#: a time, as stdio runs them one at a time on the loop: the tools were never
+#: written to run concurrently.
 _TOOLS_OFF_LOOP = False
-#: Held by the worker thread for the whole call (``_one_at_a_time``), not by
-#: the awaiting task: a client can cancel its call (``notifications/cancelled``,
-#: or a dropped session), and a thread cannot be cancelled, so a lock the task
-#: held would be released while its call still ran beside the next one.
-_TOOL_THREAD_LOCK = threading.Lock()
+_TOOL_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_TOOL_EXECUTOR_GUARD = threading.Lock()
 
 
 def serve_tools_off_loop() -> None:
-    """Run every sync tool in a worker thread, one at a time (HTTP serving)."""
+    """Run every sync tool on a dedicated worker thread, one at a time (HTTP serving)."""
     global _TOOLS_OFF_LOOP
     _TOOLS_OFF_LOOP = True
 
 
-def _one_at_a_time(call: Any) -> Any:
-    with _TOOL_THREAD_LOCK:
-        return call()
+def _tool_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """The single worker thread tool calls run on when served over HTTP.
+
+    One worker, not a lock: a call waiting its turn sits in the executor's
+    queue and holds no thread, so the default executor (``forge_run`` and the
+    SDK use it through ``asyncio.to_thread``) is never starved. A client that
+    cancels its call (``notifications/cancelled``, or a dropped session)
+    cancels the queued future, so a waiting call never runs; a running call
+    cannot be cancelled and keeps the thread until it finishes, so the next
+    call never runs beside it.
+    """
+    global _TOOL_EXECUTOR
+    with _TOOL_EXECUTOR_GUARD:
+        if _TOOL_EXECUTOR is None:
+            _TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="fluid-mcp-tool"
+            )
+        return _TOOL_EXECUTOR
 
 
 async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -194,8 +209,6 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
     keeps its own explicit ``asyncio.to_thread`` because it MUST run
     off the loop.
     """
-    import functools
-
     from fluid_build.cli.mcp.dispatch import McpToolRefusal, _call_tool
 
     check_tool_permission = __import__(
@@ -212,7 +225,11 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
     )
     try:
         if _TOOLS_OFF_LOOP:
-            return await asyncio.to_thread(_one_at_a_time, call)
+            # As asyncio.to_thread does: the call keeps this request's context.
+            context = contextvars.copy_context()
+            return await asyncio.get_running_loop().run_in_executor(
+                _tool_executor(), functools.partial(context.run, call)
+            )
         return call()
     except McpToolRefusal as exc:
         # Surface the refusal (which names the server flag to set) as the

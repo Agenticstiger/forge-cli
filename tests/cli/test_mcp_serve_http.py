@@ -303,3 +303,66 @@ def test_a_cancelled_call_keeps_its_turn_until_its_thread_finishes(
 
     assert asyncio.run(_scenario()) == {"tool": "validate_contract"}
     assert peak[0] == 1
+
+
+def test_a_cancelled_call_that_has_not_started_never_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A call cancelled while it waits its turn (the client sent
+    notifications/cancelled, or its session dropped) is dropped, not run later."""
+    from fluid_build.cli.mcp import dispatch as dispatch_mod
+    from fluid_build.cli.mcp import policy as policy_mod
+    from fluid_build.cli.mcp import server as server_mod
+
+    started, release, ran = threading.Event(), threading.Event(), []
+
+    def _call_tool(name, arguments, **_):
+        ran.append(name)
+        if name == "list_source_adapters":
+            started.set()
+            release.wait(timeout=10)
+        return {"tool": name}
+
+    monkeypatch.setattr(dispatch_mod, "_call_tool", _call_tool)
+    monkeypatch.setattr(policy_mod, "_current_policy", policy_mod.McpPolicy())
+    monkeypatch.setattr(server_mod, "_TOOLS_OFF_LOOP", True)
+
+    async def _scenario():
+        first = asyncio.create_task(server_mod._dispatch_sync_tool("list_source_adapters", {}))
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 5), timeout=6)
+        second = asyncio.create_task(server_mod._dispatch_sync_tool("validate_contract", {}))
+        await asyncio.sleep(0.1)
+        second.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await second
+        release.set()
+        await asyncio.wait_for(first, timeout=5)
+        # A third call proves the worker has moved past the cancelled one.
+        return await asyncio.wait_for(server_mod._dispatch_sync_tool("diff_models", {}), timeout=5)
+
+    assert asyncio.run(_scenario()) == {"tool": "diff_models"}
+    assert ran == ["list_source_adapters", "diff_models"]
+
+
+def test_calls_waiting_their_turn_hold_no_shared_worker_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Queued calls wait in the tool executor, so asyncio.to_thread (forge_run,
+    the SDK) still gets a thread while one slow call holds the tool worker."""
+    from fluid_build.cli.mcp import server as server_mod
+
+    started, release, _ = _blocking_tool(monkeypatch)
+    monkeypatch.setattr(server_mod, "_TOOLS_OFF_LOOP", True)
+
+    async def _scenario():
+        first = asyncio.create_task(server_mod._dispatch_sync_tool("list_source_adapters", {}))
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 5), timeout=6)
+        queued = [
+            asyncio.create_task(server_mod._dispatch_sync_tool("list_source_adapters", {}))
+            for _ in range(48)
+        ]
+        await asyncio.sleep(0.1)
+        free = await asyncio.wait_for(asyncio.to_thread(lambda: "free"), timeout=2)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(first, *queued), timeout=10)
+        return free
+
+    assert asyncio.run(_scenario()) == "free"
