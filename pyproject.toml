@@ -599,7 +599,7 @@ databricks = "fluid_build.providers.databricks:DatabricksProvider"
 # is imported. Declared by THIRD-PARTY packages only.
 
 [project.urls]
-Homepage = "https://agenticstiger.github.io/forge_docs/"
+Homepage = "https://fluidfabric.eu/"
 Repository = "https://github.com/Agenticstiger/forge-cli"
 Issues = "https://github.com/Agenticstiger/forge-cli/issues"
 Documentation = "https://agenticstiger.github.io/forge_docs/"

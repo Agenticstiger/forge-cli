@@ -19,6 +19,7 @@ infrastructure, and refuses to deploy anything the contract forbids.**
 [Getting started](https://agenticstiger.github.io/forge_docs/getting-started/) ·
 [Demos](https://agenticstiger.github.io/forge_docs/demos/) ·
 [FLUID Spec](https://open-data-protocol.github.io/fluid/) ·
+[FLUID Fabric](https://fluidfabric.eu/) ·
 [Changelog](https://github.com/Agenticstiger/forge-cli/blob/main/CHANGELOG.md)
 
 <div align="center">
@@ -390,9 +391,10 @@ public issue for one.
 ## License
 
 [Apache License 2.0](https://github.com/Agenticstiger/forge-cli/blob/main/LICENSE) · Copyright
-2024–2026 Agentics Transformation Limited
+2024–2026 [Agentics Transformation Limited](https://fluidfabric.eu/about/)
 
 [Documentation](https://agenticstiger.github.io/forge_docs/) ·
+[FLUID Fabric](https://fluidfabric.eu/) ·
 [PyPI](https://pypi.org/project/data-product-forge/) ·
 [Issues](https://github.com/Agenticstiger/forge-cli/issues) ·
 [Discussions](https://github.com/Agenticstiger/forge-cli/discussions) ·
