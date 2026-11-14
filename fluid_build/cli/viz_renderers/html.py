@@ -173,10 +173,7 @@ def _create_html_wrapper(svg_content: str, config: GraphConfig, metrics: GraphMe
 # ``import fluid_build.cli.viz_renderers.html`` fail when run first (circular
 # import). The names below are only read at call time.
 from fluid_build.cli.viz_graph import (  # noqa: E402
-    THEMES,
     GraphConfig,
     GraphMetrics,
-    _escape_label,
     _get_theme_value,
-    _safe_id,
 )

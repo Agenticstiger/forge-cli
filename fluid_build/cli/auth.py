@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -341,7 +342,7 @@ class AuthManager:
         # Through the module, not bare names: the classes resolve lazily
         # (see ``__getattr__`` above), and a patched
         # ``fluid_build.cli.auth.<ProviderClass>`` still takes effect here.
-        import fluid_build.cli.auth as _self
+        _self = sys.modules[__name__]
 
         provider_classes = {
             "google_cloud": _self.GoogleCloudAuthProvider,

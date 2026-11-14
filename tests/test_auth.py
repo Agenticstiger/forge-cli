@@ -5,6 +5,7 @@
 
 import argparse
 import asyncio
+import importlib
 import logging
 from unittest.mock import MagicMock, patch
 
@@ -379,7 +380,8 @@ class TestAuthManager:
 
     def test_the_lazy_provider_classes_are_the_impls_classes(self):
         import fluid_build.cli._auth_provider_impls as impls
-        import fluid_build.cli.auth as auth
+
+        auth = importlib.import_module("fluid_build.cli.auth")
 
         for name in (
             "AWSAuthProvider",

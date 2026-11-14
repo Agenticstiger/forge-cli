@@ -225,9 +225,6 @@ def _build_contract_dot(
 # import). The names below are only read at call time.
 from fluid_build.cli.viz_graph import (  # noqa: E402
     THEMES,
-    GraphConfig,
-    GraphMetrics,
     _escape_label,
-    _get_theme_value,
     _safe_id,
 )
