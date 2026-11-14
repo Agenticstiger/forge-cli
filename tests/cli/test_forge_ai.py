@@ -749,6 +749,17 @@ def test_extract_prefers_the_yaml_block_to_a_shell_block_naming_fluid_version() 
     assert forge_ai.extract_contract_yaml(answer).strip() == VALID.strip()
 
 
+def test_extract_ignores_inline_triple_backticks_before_the_contract() -> None:
+    answer = f"Use ```fluid validate``` after.\n```yaml\n{VALID}```"
+    assert forge_ai.extract_contract_yaml(answer).strip() == VALID.strip()
+
+
+def test_extract_reads_a_fence_indented_inside_a_list() -> None:
+    body = "".join(f"    {line}\n" for line in VALID.splitlines())
+    answer = f"1. The contract:\n    ```yaml\n{body}    ```\n"
+    assert forge_ai.extract_contract_yaml(answer).strip() == VALID.strip()
+
+
 @pytest.mark.parametrize(
     "text", ["~10M events/day from Kafka, owned by data@example.com", "a\x00b"]
 )
@@ -885,6 +896,30 @@ def test_a_failed_agent_run_puts_the_refined_contract_back_and_records_its_cost(
     (run,) = _runs(workspace)
     assert (run / "contract.draft.yaml").read_text(encoding="utf-8") == VALID
     assert json.loads((run / "cost.json").read_text(encoding="utf-8"))["total_usd"] == 0.05
+
+
+def test_an_interrupted_agent_run_puts_the_refined_contract_back(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fluid_build.llm.coding_agent as ca
+
+    original = VALID + "description: keep me\n"
+    (workspace / "contract.fluid.yaml").write_text(original, encoding="utf-8")
+    _stub_agent(monkeypatch)
+
+    def interrupted(argv, *, stdin, timeout, cwd, env):
+        (Path(cwd) / "contract.fluid.yaml").write_text("fluidVersion: 0.7.6\n", encoding="utf-8")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ca, "_run_agent", interrupted)
+    args = _args(refine="contract.fluid.yaml")
+    with pytest.raises(KeyboardInterrupt):
+        forge_ai.drive_headless(
+            "claude-code", forge_ai.build_request(args), _config("claude-code"), args=args
+        )
+    assert (workspace / "contract.fluid.yaml").read_text(encoding="utf-8") == original
+    (draft,) = workspace.glob(".fluid/agents/*/contract.draft.yaml")
+    assert draft.read_text(encoding="utf-8") == "fluidVersion: 0.7.6\n"
 
 
 def test_a_failed_agent_run_in_a_new_folder_removes_the_folder(

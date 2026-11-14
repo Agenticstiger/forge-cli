@@ -35,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,9 +88,11 @@ _NON_INTERACTIVE_NOTE = (
     "reasonable assumption where the request is silent, and say so in your final message."
 )
 
-#: A fenced block and its info string (```yaml, ```bash, ```): every fence is read as a
-#: whole, so a ```bash block before the ```yaml one cannot shift the pairing.
-_FENCE_RE = re.compile(r"```([^\n`]*)\r?\n(.*?)```", re.DOTALL)
+#: A fenced block and its info string (```yaml, ```bash, ```). Every fence is read as a
+#: whole, and an opening fence starts a line (as in CommonMark; indented inside a list is
+#: fine), so neither a ```bash block nor inline triple backticks before the ```yaml block
+#: can shift the pairing.
+_FENCE_RE = re.compile(r"^[ \t]*```([^\n`]*)\r?\n(.*?)```", re.DOTALL | re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +436,10 @@ def extract_contract_yaml(text: str) -> str:
                 return yaml.safe_dump(data["contract"], sort_keys=False)
             if "fluidVersion" in data:
                 return yaml.safe_dump(data, sort_keys=False)
-    blocks = [(lang.strip().lower(), body.strip()) for lang, body in _FENCE_RE.findall(stripped)]
+    blocks = [
+        (lang.strip().lower(), textwrap.dedent(body).strip())
+        for lang, body in _FENCE_RE.findall(stripped)
+    ]
     yamlish = [body for lang, body in blocks if lang in ("", "yaml", "yml")]
     for body in [*yamlish, *(body for _, body in blocks)]:
         if "fluidVersion" in body:
@@ -658,8 +664,8 @@ def one_call(request: AuthoringRequest, config: Any, *, args: Any, console: Any 
         if not keep:
             _restore(path, original)
             _tidy(request)
-        # A dry run writes nothing. Any other run was paid for, kept or not, so
-        # fluid stats counts it.
+        # A dry run writes nothing. Any other run is recorded, kept or not, so fluid
+        # stats counts it (with zero tokens when the provider failed before answering).
         if not dry_run:
             _self._write_receipt(request, config, started, tokens=None, kept=keep)
     if not keep:
@@ -1019,6 +1025,10 @@ def drive_headless(
             f"{agent} did not finish within {timeout}s.{_draft_note(draft)}",
             ["Raise the budget with FLUID_FORGE_AGENT_TIMEOUT_SECONDS."],
         ) from exc
+    except BaseException:
+        # Ctrl-C, or the agent could not start: put the workspace back, then re-raise.
+        _self._abandon(request, original)
+        raise
     report = _agent_report(_ANSI_RE.sub("", stdout or ""))
     usage = report.get("usage") if isinstance(report.get("usage"), dict) else None
     usd = report.get("total_cost_usd")
