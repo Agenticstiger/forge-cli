@@ -751,8 +751,8 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     # authoring lint: what an unedited template, or a guess, leaves in a contract
     "contract_placeholder_email": (
         [
-            "Write the address the request gives; if it gives none, delete the key "
-            + "(a contract needs no email: metadata.owner.email is optional)",
+            "Use the owning team's real address, never a guess; if there is none, delete "
+            + "the key (a contract needs no email: metadata.owner.email is optional)",
             "Never make an address up from a team or product name: an example.com, "
             + "company.com, test@ or noreply@ address reaches nobody",
         ],
@@ -760,19 +760,19 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     ),
     "contract_template_residue": (
         [
-            "Replace the starter value with the request's own: an id of <domain>.<name>, "
-            + "the team the request names, the real build and the real output",
-            "Delete what the request does not ask for, such as the starter's builds or "
+            "Replace the starter value with the product's own: an id of <domain>.<name>, "
+            + "its owning team, its real build and its real output",
+            "Delete what the product does not need, such as the starter's builds or "
             + "semantics, rather than keep the starter's",
         ],
         "validate",
     ),
     "contract_placeholder_value": (
         [
-            "Replace the placeholder (TODO, FIXME, TBD, CHANGEME or <...>) with the value "
-            + "the request gives, or delete the key when it is optional",
-            "When the request leaves the value open, choose the smallest valid one and say "
-            + "so in your report instead of leaving a placeholder",
+            "Replace the placeholder (TODO, FIXME, TBD, CHANGEME or <...>) with the real "
+            + "value, or delete the key when it is optional",
+            "When no value is known, choose the smallest valid one and note the "
+            + "assumption instead of leaving a placeholder",
         ],
         "validate",
     ),
@@ -890,7 +890,7 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     "contract_sovereignty": (
         [
             "Move the binding into a region that sovereignty.allowedRegions lists, or widen "
-            + "allowedRegions when the request allows it",
+            + "allowedRegions when the data's residency rules allow it",
             "A region in sovereignty.deniedRegions is refused in every enforcement mode",
         ],
         "sovereignty",
