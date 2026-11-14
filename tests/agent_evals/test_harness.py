@@ -1624,6 +1624,12 @@ def test_the_codex_config_is_toml_with_the_isolation_the_claude_arms_have(
     assert str(run_dir.resolve() / "codex-home") in denied
     assert any(k.endswith("codex-home/*") for k in denied), "every sibling run's API key too"
     assert str(root / "fluid_build" / "agent_skills") in denied, "no-skill must not find skills"
+    for temp in ("/tmp", "/var/tmp"):  # other sessions' scratch files and runs live there
+        assert str(Path(temp).resolve() / "**") in denied, temp
+    under_tmp = Path("/tmp").resolve() / "w" / "s" / "codex-skill" / "run-1"
+    files = tomllib.loads(harness._codex_config(under_tmp, readable))["permissions"]
+    denied = {k for k, v in files[harness.CODEX_PROFILE]["filesystem"].items() if v == "deny"}
+    assert str(Path("/tmp").resolve() / "**") not in denied, "the run's own temp root stays"
 
 
 def test_a_codex_arm_imports_fluid_from_a_directory_holding_only_the_package(
@@ -2164,6 +2170,14 @@ def test_a_glob_read_fails_a_control_only_where_skills_are_installed(tmp_path: P
         ([{"type": "error", "message": "Reconnecting"}, {"type": "turn.completed"}], False),
         ([{"type": "turn.completed"}, {"type": "error", "message": "stream lost"}], True),
         ([{"type": "turn.failed", "error": {"message": "x"}}, {"type": "turn.completed"}], True),
+        (
+            [
+                {"type": "turn.failed", "error": {"message": "x"}},
+                {"type": "error", "message": "y"},
+                {"type": "turn.completed"},
+            ],
+            True,
+        ),
     ],
 )
 def test_a_codex_error_a_completed_turn_follows_was_recovered_from(
@@ -2236,3 +2250,28 @@ def test_completing_an_old_results_file_keeps_its_runs_own_provenance(
     assert by_scenario["deploy-plan-only"]["run_meta"]["model"] == "sonnet"
     assert by_scenario[ORDERS.id]["run_meta"]["skills_commit"] == "new1"
     assert data["meta"]["notes"] == "first batch"
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process groups")
+def test_nothing_an_agent_left_running_outlives_its_run(tmp_path: Path) -> None:
+    """A background process could rewrite the workspace while it is graded."""
+    stdout, _, code, timed_out = harness._run_bounded(
+        ["/bin/sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $!"],
+        cwd=tmp_path,
+        env=dict(os.environ),
+        timeout=30,
+    )
+    assert (code, timed_out) == (0, False)
+    pid = int(stdout.strip())
+    deadline = time.monotonic() + 5
+    while _alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _alive(pid), "the leftover sleep must be killed with the run"
+
+
+def test_the_grader_reads_the_resolved_path_it_checked(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "real.md").write_text("x", encoding="utf-8")
+    (ws / "link.md").symlink_to(ws / "real.md")
+    assert harness._in_workspace(ws, "link.md") == (ws / "real.md").resolve()

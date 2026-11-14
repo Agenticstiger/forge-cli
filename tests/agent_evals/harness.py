@@ -709,7 +709,7 @@ def _in_workspace(ws: Path, rel: str) -> Optional[Path]:
         inside = path.resolve().is_relative_to(ws.resolve())
     except (OSError, RuntimeError):  # a symlink loop
         return None
-    return path if inside else None
+    return path.resolve() if inside else None
 
 
 def _check_in_file(check: Dict[str, Any], target: Target) -> Tuple[bool, str]:
@@ -1205,7 +1205,7 @@ def _decode(data: Any) -> str:
 def _kill_tree(proc: "subprocess.Popen[str]") -> None:
     """SIGKILL the child's whole process group; just the child where there is none."""
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(proc.pid, signal.SIGKILL)  # start_new_session: the pgid is the child's pid
     except (AttributeError, OSError):  # no killpg (Windows), or the group is already gone
         with contextlib.suppress(OSError):
             proc.kill()
@@ -1235,6 +1235,7 @@ def _run_bounded(
     )
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
+        _kill_tree(proc)  # whatever the agent left running in the background
         return stdout, stderr, proc.returncode, False
     except subprocess.TimeoutExpired as exc:
         partial_out, partial_err = _decode(exc.stdout), _decode(exc.stderr)
@@ -1357,6 +1358,7 @@ def _codex_env(bin_dir: Path, run_dir: Path) -> Dict[str, str]:
     for path in dirs.values():
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
     env.update({name: str(path) for name, path in dirs.items()})
+    env["TMPPREFIX"] = str(dirs["TMPDIR"] / "zsh")  # zsh's here-doc files, else /tmp/zsh
     return env
 
 
@@ -1403,6 +1405,11 @@ def _codex_readable(bin_dir: Path) -> List[Path]:
     return out
 
 
+#: Shared temp dirs Codex's ``:minimal`` set makes readable: other sessions' scratch files,
+#: checkout copies and a concurrent harness's runs live there. Denied unless they hold the run.
+_TEMP_ROOTS = ("/tmp", "/var/tmp")
+
+
 def _codex_config(run_dir: Path, readable: Sequence[Path]) -> str:
     """The ``config.toml`` of a Codex arm's ``CODEX_HOME``.
 
@@ -1411,11 +1418,16 @@ def _codex_config(run_dir: Path, readable: Sequence[Path]) -> str:
     read only those and ``readable`` (plus Codex's ``:minimal`` platform set), and have
     no network. Every run's ``codex-home`` is denied outright: it holds the API key while a
     run lasts, and ``:minimal`` can cover the temp dir the runs live in (``/tmp`` was
-    writable on macOS). Measured with ``codex sandbox`` on 0.154.0: the operator's home,
-    the checkout's own files and ``codex-home/auth.json`` were unreadable, and
-    ``fluid validate`` ran.
+    writable on macOS). So are the shared temp dirs that do not hold this run (``/tmp``,
+    ``/var/tmp``): ``:minimal`` reads them, and other sessions' scratch files, checkout
+    copies and a concurrent harness's runs live there. Measured with ``codex sandbox`` on
+    0.154.0: the operator's home, the checkout's own files, ``/private/tmp`` and every
+    ``codex-home/auth.json`` were unreadable, and ``fluid validate``, ``fluid forge
+    --template`` and a zsh here-doc (``TMPPREFIX`` points into the run's ``tmp``) ran.
     """
     writable = [run_dir / "home", run_dir / "tmp"]
+    temp_roots = {Path(r).resolve() for r in _TEMP_ROOTS}
+    temp_denied = sorted(r for r in temp_roots if r != run_dir and r not in run_dir.parents)
     work_root = run_dir.parents[2]  # work_root/<scenario>/<arm>/run-<n>
     denied = [
         # The packaged skills: a codex-no-skill run must not find them through PYTHONPATH,
@@ -1449,11 +1461,15 @@ def _codex_config(run_dir: Path, readable: Sequence[Path]) -> str:
         *(f"{name} = false" for name in CODEX_DISABLED_FEATURES),
         "",
         f"[permissions.{CODEX_PROFILE}.filesystem]",
+        "glob_scan_max_depth = 8",  # bounds ``**`` where it is expanded (not macOS)
         '":minimal" = "read"',
         '":workspace_roots" = "write"',
         *(f'{_toml(str(path))} = "write"' for path in writable),
         *(f'{_toml(str(path))} = "read"' for path in readable if path not in writable),
         *(f'{path} = "deny"' for path in denied),
+        # ``/**``: a glob deny covers only the depth it names, and ``:minimal`` grants the
+        # temp dir itself, so the dir stays listable while nothing under it is readable.
+        *(f'{_toml(str(path / "**"))} = "deny"' for path in temp_denied),
         "",
         f"[permissions.{CODEX_PROFILE}.network]",
         "enabled = false",
@@ -1617,6 +1633,7 @@ def parse_codex_stream(lines: Iterable[str], stderr: str = "") -> Dict[str, Any]
     usage: List[Dict[str, Any]] = []
     error: Optional[str] = None
     transient = False  # a top-level ``error`` a later ``turn.completed`` recovers from
+    failed: Optional[str] = None  # a ``turn.failed``, which nothing clears
     for line in lines:
         try:
             msg = json.loads(line)
@@ -1627,8 +1644,10 @@ def parse_codex_stream(lines: Iterable[str], stderr: str = "") -> Dict[str, Any]
         found = _codex_event(info, usage, msg)
         if found is not None:
             error, transient = found, msg.get("type") == "error"
+            if msg.get("type") == "turn.failed":
+                failed = found
         elif transient and msg.get("type") == "turn.completed":
-            error, transient = None, False
+            error, transient = failed, False
     for command in _CODEX_REJECTED.findall(stderr or ""):
         info["bash_commands"].append(command)
         info["rejected_commands"].append(command)
