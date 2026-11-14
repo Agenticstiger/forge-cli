@@ -12,10 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fluid validate` warns about what a template or a guess leaves in a contract.** Four
   authoring-lint rules run after the contract rules, as warnings: `fluid validate` passes and
   `--strict` fails, as on any warning. A placeholder email
-  (`ERR_CONTRACT_PLACEHOLDER_EMAIL`) is an address at a domain reserved for documentation
-  (example.com, example.org, example.net, or a `.example`, `.test`, `.invalid` or `.localhost`
-  name, RFC 2606 and RFC 6761), at a stand-in domain (company.com, yourcompany.com and the
-  like), or with a stand-in mailbox (test@, noreply@, owner@). In the agent eval of #851 the
+  (`ERR_CONTRACT_PLACEHOLDER_EMAIL`) is an address in a contact field (`email`, `owner`,
+  `steward`, `oncall`, `support` and the like; not an access grant's principal) at a domain
+  reserved for documentation (example.com, example.org, example.net, or a `.example`, `.test`,
+  `.invalid` or `.localhost` name, RFC 2606 and RFC 6761), at a stand-in domain (company.com,
+  yourcompany.com and the like), or with a stand-in mailbox (test@, noreply@, owner@). A
+  URI's `user:password@host` is never read as an address, and no rule reads a `catalogAuth`
+  block. In the agent eval of #851 the
   embedded forge arm made up an owner address in all 9 of its runs; the fix the warning gives
   is the address the request gives, or no address (`metadata.owner.email` is optional). A
   starter-template value (`ERR_CONTRACT_TEMPLATE_RESIDUE`) is one only an unedited
@@ -27,7 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Bronze) reads one source as it is, so a product that joins is an ADP (Silver). Each warning
   names its place and ends with what to write instead, so the text output is enough to act on.
   Many shipped examples and quickstart templates carry a placeholder owner email on purpose
-  (it is the value to replace), so they now validate with that warning.
+  (it is the value to replace), so they now validate with that warning; the three AWS examples
+  the test suite validates with `--strict` drop theirs.
 
 - **`fluid validate --format json` gives every finding a code, a JSON pointer, a fix and an
   example.** Next to `errors`, `warnings` and `notes` (unchanged lists of strings), a document
