@@ -217,6 +217,11 @@ _RESIDUE_TOKENS = (
 _RESIDUE_VALUES = frozenset({"data-team"})
 
 
+def _quoted(value: str, limit: int = 60) -> str:
+    """``value`` quoted, cut to ``limit`` characters: a message names it, it does not carry it."""
+    return repr(value if len(value) <= limit else value[: limit - 3] + "...")
+
+
 def _residue_token(value: str) -> Optional[str]:
     text = re.sub(r"\s+", " ", value.strip().lower())
     if text in _RESIDUE_VALUES:
@@ -260,7 +265,7 @@ def _template_residue(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
             reported_semantics.add(parts)
             message = f"{_dotted(parts)} is the starter template's semantic model"
         else:
-            message = f"{_dotted(parts)}: {value!r} is the starter template's value"
+            message = f"{_dotted(parts)}: {_quoted(value)} is the starter template's value"
         yield _finding(
             "contract_template_residue",
             parts,
@@ -321,11 +326,14 @@ def _placeholder_values(contract: Mapping[str, Any]) -> Iterator[LintFinding]:
 _JOIN = re.compile(r"\bJOIN\b(?!\s+(?:LATERAL|UNNEST|TABLE|FLATTEN|EXPLODE)\b)", re.I)
 
 
+#: A comment or a string literal, left to right in one pass; one left open runs to the
+#: end, so an unterminated ``/*`` or ``'`` is read once, not once per later match.
+_SQL_NOISE = re.compile(r"--[^\n]*|/\*.*?(?:\*/|\Z)|'(?:[^']|'')*(?:'|\Z)", re.S)
+
+
 def _sql_code(sql: str) -> str:
     """``sql`` without comments and string literals, which a keyword search must skip."""
-    sql = re.sub(r"--[^\n]*", " ", sql)
-    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
-    return re.sub(r"'(?:[^']|'')*'", "''", sql)
+    return _SQL_NOISE.sub(" ", sql)
 
 
 def _sdp_joins(contract: Mapping[str, Any]) -> Iterator[LintFinding]:

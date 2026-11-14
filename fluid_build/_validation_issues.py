@@ -55,7 +55,9 @@ _ITEM_KEYS = ("exposeId", "id", "name", "productId", "ref")
 
 def json_pointer(parts: Iterable[Any]) -> str:
     """RFC 6901: ``("exposes", 0, "contract")`` is ``/exposes/0/contract``; ``()`` is ``""``."""
-    return "".join("/" + str(part).replace("~", "~0").replace("/", "~1") for part in parts)
+    from fluid_build.util.ref_confinement import format_pointer
+
+    return format_pointer(list(parts))
 
 
 def _index(items: Sequence[Any], token: str) -> Optional[int]:

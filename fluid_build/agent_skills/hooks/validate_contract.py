@@ -114,26 +114,27 @@ def _report(stdout: str) -> Optional[dict]:
     return document if isinstance(document, dict) else None
 
 
+def _issue_lines(issue: dict) -> List[str]:
+    """``- <code> at <pointer>: <message>``, then its fix unless the message ends with it."""
+    message, fix = str(issue.get("message", "")), str(issue.get("fix") or "")
+    where = issue.get("pointer") or "(the whole contract)"
+    lines = [f"- {issue.get('code')} at {where}: {message}"]
+    return lines + [f"  Fix: {fix}"] if fix and fix not in message else lines
+
+
 def findings(report: dict, severities: tuple) -> List[str]:
-    """One line per finding of ``severities``, and its fix: code, pointer, message.
+    """The lines for the findings of ``severities``: code, pointer, message and fix.
 
     A ``fluid`` older than its ``issues`` list gives the messages alone.
     """
-    lines: List[str] = []
     issues = report.get("issues")
-    if isinstance(issues, list):
-        for issue in issues:
-            if not isinstance(issue, dict) or issue.get("severity") not in severities:
-                continue
-            message, fix = str(issue.get("message", "")), str(issue.get("fix") or "")
-            where = issue.get("pointer") or "(the whole contract)"
-            lines.append(f"- {issue.get('code')} at {where}: {message}")
-            if fix and fix not in message:
-                lines.append(f"  Fix: {fix}")
-        return lines
-    for severity, key in (("error", "errors"), ("warning", "warnings")):
-        if severity in severities:
-            lines.extend(f"- {message}" for message in report.get(key) or [])
+    if not isinstance(issues, list):
+        keys = {"error": "errors", "warning": "warnings"}
+        return [f"- {m}" for s in severities if s in keys for m in report.get(keys[s]) or []]
+    lines: List[str] = []
+    for issue in issues:
+        if isinstance(issue, dict) and issue.get("severity") in severities:
+            lines.extend(_issue_lines(issue))
     return lines
 
 

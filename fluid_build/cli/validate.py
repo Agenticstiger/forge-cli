@@ -980,15 +980,8 @@ def _run_contract_rules(
         if not agent_policy_valid:
             validation_result.is_valid = False
 
-    # Composition rules — fire on every consume[]. Resolves each
-    # upstream's productType by walking the workspace and rejects
-    # SDP-with-upstreams plus any other axiom violation. Hard errors
-    # only when both target_type AND upstream_type are known and the
-    # rule is violated. "Upstream productType unresolved" is logged
-    # under --verbose only — operators legitimately consume across
-    # workspaces / catalogs that aren't on the local filesystem, so
-    # promoting that case to a warning would trip ``--strict`` in CI
-    # for every 0.7.x reference-only contract.
+    # Composition rules and the authoring lint run last
+    # (:func:`_composition_check`, :func:`_authoring_lint_check`).
     #
     # Gate by major.minor (0.7.x). The rule's output enum
     # (SDP/ADP/CDP) was formalised on ``metadata.productType`` in
@@ -1296,64 +1289,76 @@ def _run_contract_rules(
             if args.verbose:
                 info(logger, f"Semantic-model check skipped: {exc}")
 
-        try:
-            from pathlib import Path as _Path
+        # --- Composition rules, then the authoring lint (WARNINGS) -----------
+        _composition_check(validation_result, contract, args, logger)
+        _authoring_lint_check(validation_result, contract)
 
-            from fluid_build.forge.product_types import (
-                validate_composition_for_contract,
-            )
 
-            contract_path = getattr(args, "contract", None)
-            composition_violations = validate_composition_for_contract(
-                contract,
-                contract_path=_Path(contract_path) if contract_path else None,
-            )
-            for v in composition_violations:
-                msg = f"composition rule: {v.reason} (upstream={v.upstream_id!r})"
-                pointer = _consume_pointer(contract, v.upstream_id)
-                if v.upstream_type is not None:
-                    validation_result.add_error(
-                        msg, event="contract_composition_violation", pointer=pointer
-                    )
-                elif v.target_type == "SDP":
-                    # An SDP accepts no upstream of any type, so an upstream this
-                    # workspace cannot resolve breaks the rule all the same.
-                    what, fix = _sdp_consumes_message(pointer, v.upstream_id)
-                    validation_result.add_warning(
-                        f"{what} {fix}",
-                        event="contract_sdp_consumes_products",
-                        pointer=pointer,
-                        fix=fix,
-                    )
-                elif args.verbose:
-                    # An ADP or CDP may consume a product of another workspace.
-                    info(logger, msg)
-        except Exception as exc:  # pragma: no cover — defensive
-            if args.verbose:
-                info(logger, f"Composition rule check skipped: {exc}")
+def _composition_check(
+    validation_result: ValidationResult, contract: Dict[str, Any], args: Any, logger: Any
+) -> None:
+    """The ``consumes[]`` composition rules, into the result.
 
-        # --- Authoring lint (WARNINGS) -------------------------------------
-        # What an unedited template or an agent's guess leaves in a contract:
-        # placeholder emails, starter-template values, TODO / <...> stand-ins,
-        # and an SDP build that joins. Warnings, so plain validate passes and
-        # --strict fails. A crash is reported, never swallowed.
-        try:
-            from fluid_build.cli._authoring_lint import lint_contract
+    Resolves each upstream's productType by walking the workspace and rejects
+    SDP-with-upstreams plus any other axiom violation: an error when both this
+    product's type and the upstream's are known. An ADP or CDP whose upstream
+    the workspace cannot resolve is logged under --verbose only: operators
+    legitimately consume across workspaces and catalogs that are not on the
+    local filesystem, so a warning would trip ``--strict`` in CI for every
+    reference-only contract. An SDP accepts no upstream of any type, so for an
+    SDP an unresolved upstream breaks the rule all the same: a warning.
+    """
+    try:
+        from fluid_build.forge.product_types import validate_composition_for_contract
 
-            for finding in lint_contract(contract):
-                validation_result.add_warning(
-                    finding.message,
-                    event=finding.event,
-                    pointer=finding.pointer,
-                    fix=finding.fix,
+        contract_path = getattr(args, "contract", None)
+        composition_violations = validate_composition_for_contract(
+            contract, contract_path=Path(contract_path) if contract_path else None
+        )
+        for v in composition_violations:
+            msg = f"composition rule: {v.reason} (upstream={v.upstream_id!r})"
+            pointer = _consume_pointer(contract, v.upstream_id)
+            if v.upstream_type is not None:
+                validation_result.add_error(
+                    msg, event="contract_composition_violation", pointer=pointer
                 )
-        except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+            elif v.target_type == "SDP":
+                what, fix = _sdp_consumes_message(pointer, v.upstream_id)
+                validation_result.add_warning(
+                    f"{what} {fix}",
+                    event="contract_sdp_consumes_products",
+                    pointer=pointer,
+                    fix=fix,
+                )
+            elif args.verbose:
+                info(logger, msg)
+    except Exception as exc:  # pragma: no cover — defensive
+        if args.verbose:
+            info(logger, f"Composition rule check skipped: {exc}")
+
+
+def _authoring_lint_check(validation_result: ValidationResult, contract: Mapping[str, Any]) -> None:
+    """The authoring lint (:mod:`fluid_build.cli._authoring_lint`), as warnings.
+
+    What an unedited template or an agent's guess leaves in a contract:
+    placeholder emails, starter-template values, TODO and ``<...>`` stand-ins,
+    an SDP build that joins. Plain validate passes and ``--strict`` fails. A
+    crash is reported, never swallowed.
+    """
+    try:
+        from fluid_build.cli._authoring_lint import lint_contract
+
+        for finding in lint_contract(contract):
             validation_result.add_warning(
-                f"Authoring lint could not run ({type(exc).__name__}: {exc}); the contract "
-                "was NOT checked for placeholder emails, template values or placeholders",
-                event="contract_check_failed",
-                pointer="",
+                finding.message, event=finding.event, pointer=finding.pointer, fix=finding.fix
             )
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_warning(
+            f"Authoring lint could not run ({type(exc).__name__}: {exc}); the contract "
+            "was NOT checked for placeholder emails, template values or placeholders",
+            event="contract_check_failed",
+            pointer="",
+        )
 
 
 def _add_findings(
