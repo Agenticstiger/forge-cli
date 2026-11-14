@@ -31,13 +31,15 @@ import pytest
 
 duckdb = pytest.importorskip("duckdb")
 
-from mcp import ClientSession  # noqa: E402
-from mcp.client.sse import sse_client  # noqa: E402
 from mcp.types import Implementation  # noqa: E402
 
 # In-memory client<->server harness via the SDK version-compat seam
 # (the v1 helper was removed in mcp 2.x).
-from fluid_build._mcp_compat import open_inmemory_session, self_attesting_client_kwargs
+from fluid_build._mcp_compat import (  # noqa: E402
+    open_inmemory_session,
+    open_streamable_http_session,
+    self_attesting_client_kwargs,
+)
 from fluid_build.output_ports.mcp.drivers import (  # noqa: E402
     EngineDriver,
     UnsupportedBindingError,
@@ -362,12 +364,12 @@ async def test_backpressure_semaphore_serialises_concurrent_dispatch(
 
 
 # ---------------------------------------------------------------------
-# HTTP / SSE transport integration
+# Streamable HTTP transport integration
 # ---------------------------------------------------------------------
 
 
 def _free_port() -> int:
-    """Grab a free TCP port to bind the SSE server during the test."""
+    """Grab a free TCP port to bind the HTTP server during the test."""
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -376,9 +378,9 @@ def _free_port() -> int:
 
 
 @contextmanager
-def _running_sse_server(server: OutputPortMcpServer, port: int):
-    """Spin up the SSE transport in a background thread; yield once
-    it's accepting connections."""
+def _running_http_server(server: OutputPortMcpServer, port: int):
+    """Spin up the Streamable HTTP transport in a background thread; yield
+    once it's accepting connections."""
     import threading
 
     started = threading.Event()
@@ -405,12 +407,12 @@ def _running_sse_server(server: OutputPortMcpServer, port: int):
         except OSError:
             time.sleep(0.05)
     else:
-        raise RuntimeError(f"SSE server didn't bind {port} within 5s; error={error.get('exc')}")
+        raise RuntimeError(f"HTTP server didn't bind {port} within 5s; error={error.get('exc')}")
     try:
         yield
     finally:
         # HARD-stop uvicorn. ``should_exit`` alone only breaks the accept
-        # loop; uvicorn's shutdown() then WAITS for any half-open SSE
+        # loop; uvicorn's shutdown() then WAITS for any half-open
         # stream to drain. On Python 3.13/3.14 that wait outran the old
         # join(timeout=5.0): the join silently gave up, the test "passed",
         # and a LIVE uvicorn thread leaked into the rest of the run —
@@ -432,15 +434,15 @@ def _running_sse_server(server: OutputPortMcpServer, port: int):
         # the last-resort backstops if it ever does).
         assert (
             not thread.is_alive()
-        ), "SSE server thread did not stop after force-stop — would leak a uvicorn loop"
+        ), "HTTP server thread did not stop after force-stop — would leak a uvicorn loop"
 
 
 @pytest.mark.asyncio
-async def test_http_sse_transport_serves_tools_and_enforces_policy(
+async def test_http_transport_serves_tools_and_enforces_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Spin up the gateway on a real SSE port + connect via the
-    SDK's SSE client. Verifies the HTTP transport code path is
+    """Spin up the gateway on a real port + connect via the SDK's
+    Streamable HTTP client. Verifies the HTTP transport code path is
     actually exercised end-to-end (not just compiled)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("FLUID_MCP_AUTH_TOKEN", raising=False)
@@ -458,33 +460,29 @@ async def test_http_sse_transport_serves_tools_and_enforces_policy(
     server.state.model_id = "http-test"
 
     port = _free_port()
-    with _running_sse_server(server, port):
-        url = f"http://127.0.0.1:{port}/sse"
-        async with sse_client(url) as (read_stream, write_stream):
-            async with ClientSession(
-                read_stream,
-                write_stream,
-                **self_attesting_client_kwargs("http-sse-test", "1.0.0", model="http-test"),
-            ) as session:
-                await session.initialize()
-                listing = await session.list_tools()
-                tool_names = {t.name for t in listing.tools}
-                assert "sample" in tool_names
-                result = await session.call_tool("sample", {"limit": 2})
-                payload = json.loads(result.content[0].text)
-                assert payload.get("error") is None, payload
-                assert payload["rowCount"] >= 1
+    with _running_http_server(server, port):
+        url = f"http://127.0.0.1:{port}/mcp"
+        async with open_streamable_http_session(
+            url, **self_attesting_client_kwargs("http-test-client", "1.0.0", model="http-test")
+        ) as session:
+            listing = await session.list_tools()
+            tool_names = {t.name for t in listing.tools}
+            assert "sample" in tool_names
+            result = await session.call_tool("sample", {"limit": 2})
+            payload = json.loads(result.content[0].text)
+            assert payload.get("error") is None, payload
+            assert payload["rowCount"] >= 1
 
 
-def test_http_sse_bearer_token_required_when_env_var_set(
+def test_http_bearer_token_required_when_env_var_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     """When ``FLUID_MCP_AUTH_TOKEN`` is set, every HTTP request
     must carry a matching ``Authorization: Bearer <token>`` header
-    OR the gateway returns 401 BEFORE the SSE handshake.
+    OR the gateway returns 401 before any MCP session exists.
 
-    Drives the auth check via raw HTTP (httpx) rather than the
-    SDK SSE client so we can assert the wire-level 401 status.
+    Drives the auth check via raw HTTP (httpx) rather than the SDK
+    client so we can assert the wire-level status.
     """
     import httpx
 
@@ -502,31 +500,45 @@ def test_http_sse_bearer_token_required_when_env_var_set(
     )
     server = OutputPortMcpServer(contract=contract, expose=expose, policy=policy)
     port = _free_port()
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "raw", "version": "0"},
+        },
+    }
+    headers = {"Accept": "application/json, text/event-stream"}
 
-    with _running_sse_server(server, port):
-        url = f"http://127.0.0.1:{port}/sse"
-        # Without a token → 401.
-        with httpx.stream("GET", url, timeout=2.0) as resp:
-            assert (
-                resp.status_code == 401
-            ), f"unauthenticated SSE request must be denied; got {resp.status_code}"
-        # With wrong token → 401.
-        with httpx.stream(
-            "GET", url, headers={"Authorization": "Bearer wrong"}, timeout=2.0
-        ) as resp:
-            assert resp.status_code == 401
-        # With correct token → SSE stream opens (streaming response,
-        # we just confirm it started — full SDK flow is in the
-        # other test).
-        with httpx.stream(
-            "GET",
+    with _running_http_server(server, port):
+        url = f"http://127.0.0.1:{port}/mcp"
+        # Without a token -> 401.
+        resp = httpx.post(url, json=initialize, headers=headers, timeout=5.0)
+        assert (
+            resp.status_code == 401
+        ), f"unauthenticated request must be denied; got {resp.status_code}"
+        assert resp.headers["www-authenticate"].startswith("Bearer")
+        # With wrong token -> 401.
+        resp = httpx.post(
             url,
-            headers={"Authorization": "Bearer s3cr3t-shared-token"},
-            timeout=2.0,
-        ) as resp:
-            assert (
-                resp.status_code == 200
-            ), f"authenticated SSE request must be accepted; got {resp.status_code}"
+            json=initialize,
+            headers={**headers, "Authorization": "Bearer wrong"},
+            timeout=5.0,
+        )
+        assert resp.status_code == 401
+        # With the correct token the session opens.
+        resp = httpx.post(
+            url,
+            json=initialize,
+            headers={**headers, "Authorization": "Bearer s3cr3t-shared-token"},
+            timeout=5.0,
+        )
+        assert (
+            resp.status_code == 200
+        ), f"authenticated request must be accepted; got {resp.status_code}"
+        assert resp.headers.get("mcp-session-id")
 
 
 # ---------------------------------------------------------------------

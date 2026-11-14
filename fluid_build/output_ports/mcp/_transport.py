@@ -5,7 +5,8 @@
 
 Physically extracted from the ``OutputPortMcpServer`` god-class in
 ``server.py``. These functions own *how the server is served* —
-stdio (the SDK pipe transport) and HTTP/SSE (Starlette + uvicorn) —
+stdio (the SDK pipe transport) and Streamable HTTP (shared with
+``fluid mcp serve`` in ``fluid_build._mcp_http``) —
 which is a distinct concern from the protocol-handler registration +
 policy enforcement that stays in ``server.py``.
 
@@ -35,144 +36,79 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 async def run_http_async(
     srv: "OutputPortMcpServer", *, host: str = "127.0.0.1", port: int = 8765
 ) -> None:
-    """Serve the gateway over MCP-SSE on ``host:port``.
+    """Serve the gateway over MCP Streamable HTTP at ``http://host:port/mcp``.
 
-    Borrowed transport: ``mcp.server.sse.SseServerTransport`` +
-    Starlette + uvicorn. The MCP SDK ships SseServerTransport;
-    Starlette / uvicorn come along as transitive deps of the
-    ``mcp`` extra. Operators connect via
-    ``http://host:port/sse`` from any MCP client that supports
-    the SSE transport (Claude Desktop, MCP Inspector,
-    custom HTTP-MCP clients).
+    The transport is shared with ``fluid mcp serve``
+    (:func:`fluid_build._mcp_http.serve_streamable_http`): the SDK's
+    ``StreamableHTTPSessionManager`` behind a bearer-auth gate, on starlette +
+    uvicorn from the ``[mcp]`` extra. It replaced HTTP+SSE (``/sse`` +
+    ``/messages/``), which the MCP spec deprecated in its 2025-03-26 revision.
 
-    Identity binding still flows through ``clientInfo`` —
-    SSE-bound sessions are functionally identical to stdio
-    ones; the only difference is the wire transport.
+    Authentication follows ``FLUID_MCP_AUTH_MODE`` (``shared-token`` with
+    ``FLUID_MCP_AUTH_TOKEN``, ``jwt``, or ``none``). A request without a valid
+    ``Authorization: Bearer`` header gets 401 before it reaches a session; the
+    shared-token comparison is ``hmac.compare_digest``. A verified request's
+    identity rides on its ASGI scope (``fluid_auth_attrs`` /
+    ``fluid_auth_kind``), and :meth:`OutputPortMcpServer._resolve_request_identity`
+    reads it per ``tools/call`` from ``request_context.request.scope`` — for
+    Streamable HTTP, the POST that carried the call — so one gateway serving many
+    clients never stamps one client's identity onto another. Without auth the
+    gateway listens only on loopback (``bind_refusal``).
 
-    Authentication: when ``FLUID_MCP_AUTH_TOKEN`` is set in the
-    environment, the gateway requires every HTTP request to
-    carry an ``Authorization: Bearer <token>`` header that
-    matches. Wrong / missing token → 401 Unauthorized BEFORE
-    the SSE handshake runs, so callers can't even open a
-    session. Comparison uses ``hmac.compare_digest`` to defeat
-    timing-side-channel guesses. This is a real defensive
-    layer — better than nothing — but operators MUST still
-    front the gateway with an mTLS / OAuth proxy for production
-    because shared-secret tokens are vulnerable to replay /
-    leakage. See ``examples/mcp-output-port-docker/proxy/`` for
-    a Caddy reverse-proxy template that pairs this gateway with
-    mTLS or OAuth2 enforcement.
+    Shared tokens can be replayed or leak, so for production front the gateway
+    with an mTLS / OAuth proxy; ``examples/mcp-output-port-docker/proxy/`` has a
+    Caddy template. A trusted proxy's forwarded client certificate binds through
+    :class:`_ForwardedCertIdentity`.
     """
-    import uvicorn
-    from mcp.server.sse import SseServerTransport
-    from starlette.applications import Starlette
-    from starlette.middleware import Middleware
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import JSONResponse, Response
-    from starlette.routing import Mount, Route
+    from fluid_build._mcp_http import MCP_PATH, serve_streamable_http
 
     from .auth import AuthValidator
 
     # Resolve the auth strategy from FLUID_MCP_AUTH_MODE
-    # (shared-token / jwt / none). When the validator
-    # is unconfigured (mode=none, or shared-token without
-    # FLUID_MCP_AUTH_TOKEN), the gateway runs unauthenticated
-    # and surfaces a loud warning.
+    # (shared-token / jwt / none). Unconfigured (mode=none, or shared-token
+    # without FLUID_MCP_AUTH_TOKEN) means the gateway runs unauthenticated,
+    # loopback only, with a loud warning.
     auth_validator = AuthValidator.from_env()
     if not auth_validator.is_enabled():
         srv.state.logger.warning(
-            "output_port_http_no_auth_configured: gateway is unauthenticated. "
-            "Set FLUID_MCP_AUTH_MODE=jwt|shared-token + matching "
-            "config OR front with mTLS/OAuth proxy before exposing to an "
+            "output_port_http_no_auth_configured: gateway is unauthenticated, so it "
+            "listens on loopback only. Set FLUID_MCP_AUTH_MODE=jwt|shared-token + "
+            "matching config OR front with mTLS/OAuth proxy before exposing to an "
             "untrusted network."
         )
 
     forwarded_certs = _ForwardedCertIdentity(auth_validator, srv.state.logger)
 
-    class _AuthMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            if not auth_validator.is_enabled():
-                return await call_next(request)
-            headers = dict(request.headers)
-            decision = auth_validator.validate(headers)
-            if not decision.allowed:
-                return JSONResponse(
-                    {
-                        "error": "unauthorized",
-                        "message": (
-                            f"auth ({decision.identity_kind}) refused: " f"{decision.deny_reason}"
-                        ),
-                    },
-                    status_code=401,
-                )
-            # Stash the resolved caller attributes on the request
-            # scope so the SSE handler below can merge them onto
-            # the SessionState (cryptographic identity replaces
-            # self-attestation for downstream rowFilter resolution).
-            request.scope["fluid_auth_attrs"] = dict(decision.caller_attributes)
-            request.scope["fluid_auth_kind"] = decision.identity_kind
-            forwarded_certs.bind(request, headers)
-            return await call_next(request)
+    def _stash(server: Any) -> None:
+        # Stash the uvicorn Server so stop_http() (or a test harness, or a
+        # SIGTERM handler for the HTTP path) can flip ``should_exit`` and
+        # unwind serve() cleanly. Without this the only way to stop an
+        # HTTP-mode gateway was process kill, and a test that spun one in a
+        # daemon thread leaked a spinning event loop for the rest of the run.
+        srv._uvicorn_server = server
 
-    sse_path = "/sse"
-    messages_path = "/messages/"
-    sse = SseServerTransport(messages_path)
-
-    async def handle_sse(request):
-        # NOTE: deliberately NO per-connection write of identity onto
-        # the shared SessionState here. One gateway process serves many
-        # concurrent SSE clients over ONE SessionState, so stamping the
-        # connecting client's caller_attributes / model_id / use_case
-        # onto it bled the FIRST client's identity onto every later
-        # client (wrong agentPolicy principal + wrong tenant rowFilter).
-        # The _AuthMiddleware already stashes the verified cryptographic
-        # attrs at ``request.scope["fluid_auth_attrs"]`` PER REQUEST; the
-        # dispatcher resolves them fresh per tools/call via
-        # ``OutputPortMcpServer._resolve_request_identity`` (which reads
-        # request_context.request.scope — for SSE the POST /messages/
-        # Request — and lets crypto win over self-attested clientInfo).
-        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-            await srv.server.run(
-                streams[0],
-                streams[1],
-                srv.server.create_initialization_options(),
-            )
-        return Response()
-
-    app = Starlette(
-        routes=[
-            Route(sse_path, endpoint=handle_sse),
-            Mount(messages_path, app=sse.handle_post_message),
-        ],
-        middleware=[Middleware(_AuthMiddleware)],
-    )
-    # proxy_headers=False: uvicorn otherwise rewrites ``request.client``
-    # from X-Forwarded-For whenever the peer is in FORWARDED_ALLOW_IPS
-    # (default 127.0.0.1,::1), so the trusted-proxy check above would read a
-    # header value instead of the TCP peer. The gateway's peer is the TCP
-    # peer; uvicorn's access log therefore shows the proxy's address.
-    config = uvicorn.Config(app, host=host, port=port, log_level="info", proxy_headers=False)
-    server = uvicorn.Server(config)
-    # Stash the uvicorn Server so stop_http() (or a test harness,
-    # or a future SIGTERM handler for the HTTP path) can flip
-    # ``should_exit`` and unwind serve() cleanly. Without this the
-    # only way to stop an HTTP-mode gateway was process kill —
-    # and a test that spun one in a daemon thread leaked a
-    # spinning event loop for the rest of the run.
-    srv._uvicorn_server = server
     srv.state.logger.info(
         "output_port_http_serve_start",
         extra={
             "host": host,
             "port": port,
-            "sse_path": sse_path,
+            "mcp_path": MCP_PATH,
             "auth_mode": auth_validator.mode,
             "auth_enabled": auth_validator.is_enabled(),
             "trusted_proxies": [str(n) for n in auth_validator.trusted_proxies],
         },
     )
     try:
-        await server.serve()
+        await serve_streamable_http(
+            srv.server,
+            command="fluid mcp output-port",
+            host=host,
+            port=port,
+            validator=auth_validator,
+            logger=srv.state.logger,
+            on_authenticated=forwarded_certs.bind,
+            on_uvicorn=_stash,
+        )
     finally:
         srv._uvicorn_server = None
 
@@ -265,7 +201,7 @@ class _ForwardedCertIdentity:
 
 
 def stop_http(srv: "OutputPortMcpServer", *, force: bool = False) -> None:
-    """Signal a running HTTP/SSE transport to shut down.
+    """Signal a running Streamable HTTP transport to shut down.
 
     Sets uvicorn's ``should_exit`` flag so the ``serve()`` loop
     returns at its next iteration. Safe to call from any thread
@@ -275,7 +211,7 @@ def stop_http(srv: "OutputPortMcpServer", *, force: bool = False) -> None:
     When ``force`` is True, ALSO set uvicorn's ``force_exit``. By
     itself ``should_exit`` only breaks the accept loop — uvicorn's
     ``shutdown()`` then WAITS for any still-open connection to drain
-    (a half-open MCP-SSE stream whose server-side handler hasn't
+    (a client's half-open GET stream whose server-side handler hasn't
     noticed the client went away can hold this open for a long time).
     ``force_exit`` makes ``serve()`` return immediately by cancelling
     those connections instead of waiting. Graceful (``force=False``)
@@ -358,7 +294,7 @@ def _is_clean_disconnect(exc: BaseException) -> bool:
     """True when *every* leaf exception is a stream-teardown error.
 
     A stdio client that pipes its requests then closes stdin — and any
-    HTTP/SSE client that drops mid-call — makes the SDK raise
+    HTTP client that drops mid-call — makes the SDK raise
     ``anyio.ClosedResourceError`` / ``BrokenResourceError`` /
     ``EndOfStream`` when it goes to write the (possibly executor-backed,
     so slightly delayed) response onto the now-closed stream. That's a
@@ -395,7 +331,7 @@ def run(
 ) -> int:
     """Synchronous entry point used by the CLI. ``transport``
     is one of ``"stdio"`` (default — pipe with the MCP client) or
-    ``"http"`` (MCP-SSE on ``host:port``). Returns the process
+    ``"http"`` (MCP Streamable HTTP on ``host:port/mcp``). Returns the process
     exit code (0 on clean disconnect, non-zero on startup
     failure)."""
     try:
@@ -411,7 +347,7 @@ def run(
         return 0
     except Exception as exc:  # noqa: BLE001
         # A client that closes its end mid-response (stdio EOF after
-        # piping requests; HTTP/SSE drop) is a clean disconnect, not a
+        # piping requests; an HTTP drop) is a clean disconnect, not a
         # crash — exit 0 without the alarming ERROR log.
         if _is_clean_disconnect(exc):
             srv.state.logger.info(

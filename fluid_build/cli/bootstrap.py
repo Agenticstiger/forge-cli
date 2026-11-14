@@ -561,7 +561,9 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
     CoreCommand(
         "memory_cmd", "memory", (_cmd("memory", "Inspect and manage staged memory/cache state"),)
     ),
-    CoreCommand("mcp", "mcp", (_cmd("mcp", "Serve staged forge tools over MCP stdio"),)),
+    CoreCommand(
+        "mcp", "mcp", (_cmd("mcp", "Serve forge's authoring tools over MCP (stdio or HTTP)"),)
+    ),
     CoreCommand(
         "export_opds",
         "export-opds",

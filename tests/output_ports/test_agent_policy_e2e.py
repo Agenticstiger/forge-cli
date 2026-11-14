@@ -126,7 +126,7 @@ async def test_i1_allowed_model_can_sample_data(
     # Declare the model via the real ``clientInfo`` at initialize —
     # identity is resolved PER REQUEST from the SDK's request_context
     # (``_resolve_request_identity``), never cached on the shared
-    # SessionState. (Caching bled the first HTTP/SSE client's identity
+    # SessionState. (Caching bled the first HTTP client's identity
     # onto every later client; see test_identity_isolation.py.)
     async with open_inmemory_session(
         server.server,

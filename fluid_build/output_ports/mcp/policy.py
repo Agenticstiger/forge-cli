@@ -159,7 +159,7 @@ class OutputPortPolicy:
     The claim is supplied by
     ``OutputPortMcpServer._resolve_verified_jurisdiction``, which reads the
     cryptographically verified channel — ``request.scope["fluid_auth_attrs"]``,
-    written by the HTTP ``_AuthMiddleware`` after it validates a JWT or mTLS
+    written by the HTTP auth gate (``fluid_build._mcp_http``) after it validates a JWT or mTLS
     identity — and never the caller's self-attested ``clientInfo``. That
     asymmetry is deliberate and is the control: everywhere else in this server
     self-attestation still binds when no auth is configured, and a jurisdiction
