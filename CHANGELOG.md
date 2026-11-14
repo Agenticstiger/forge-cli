@@ -169,6 +169,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`FluidSchemaManager.validate_contract` and `validate_contract_file` no longer take `strict`.**
+  Both accepted it and never read it, so a caller that asked for strict got the lenient result:
+  warnings never made the result invalid. Failing on warnings is the caller's policy, and
+  `fluid validate --strict` applies it with its exit code, unchanged. Passing `strict=` now raises
+  `TypeError`; Command Center's library path drops it in the same wave.
 - **The embedded copilot: 37k lines (1.5 MB, a tenth) of the base wheel's Python.** This removes the interview, the
   prompt library, the response envelope and its repair runtime, the agent loop and its tool
   registry, copilot memory, missions, the judge, domain agents and tiered routing. The
