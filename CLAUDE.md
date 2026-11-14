@@ -277,7 +277,11 @@ streaming runners. Headline items:
   (`_module = original_module; ... _module._fn(...)`) so test patches
   on the original module flow through to the extracted helper. Apply
   this pattern when extracting from a hot file with many test-time
-  patches.
+  patches. Import the original module at the end of the helper, or
+  inside the function that uses it, never at the helper's top: the
+  original re-exports the helper's names, so a top import makes
+  `import <helper>` fail when it runs first. `tests/test_import_cycles.py`
+  imports every module first, each in a fresh interpreter.
 
 Test files pinning the above (this session):
 `tests/providers/test_abstract_op_dispatch.py` *(since removed — see note above)*,

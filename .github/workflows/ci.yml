@@ -105,7 +105,8 @@ jobs:
   #
   # Needs the project installed (the linter walks the in-venv import
   # graph) so this job is separate from the ruff/black ``lint`` job
-  # above. Cheap (≤30s) — kept as its own job for clean failure surfaces.
+  # above. Kept as its own job for clean failure surfaces: the contracts
+  # take ≤30s, the import-order check about a minute.
   import-hygiene:
     name: Import hygiene (import-linter)
     runs-on: ubuntu-latest
@@ -118,13 +119,23 @@ jobs:
       - name: Install project (dev extras pull import-linter)
         run: |
           pip install --upgrade pip
-          pip install -e ".[dev]"
+          # local (duckdb, pandas) too, so the import-order check reaches the
+          # modules that need them.
+          pip install -e ".[dev,local]"
       - name: Run import-linter contracts
         run: lint-imports
       # Separate config: this one sets include_external_packages = True so it
       # can forbid heavy third-party SDKs on the light-CLI modules.
       - name: Run import-linter contracts (external packages)
         run: lint-imports --config .importlinter-external
+      # The contracts read the static import graph. Whether a module imports
+      # when it is the first one loaded depends on execution order, which only
+      # running it shows: each module in a fresh interpreter (the SciPy
+      # pattern). Once here, on one Python, rather than in every matrix job
+      # (they --ignore it): about a minute of imports that the version does not
+      # change.
+      - name: Import order (every module imports when loaded first)
+        run: python -m pytest tests/test_import_cycles.py -q -p no:randomly -p no:cacheprovider
       # deptry (MIT): declared-vs-imported dependency hygiene, configured in
       # [tool.deptry]. ADVISORY for 0.27.0 and 0.28.0 (continue-on-error), then
       # BLOCKING from 0.29.0: delete the continue-on-error line at that release.
@@ -234,6 +245,7 @@ jobs:
           python -m pytest \
             -n auto --dist loadscope \
             --ignore=tests/perf \
+            --ignore=tests/test_import_cycles.py \
             --junitxml=junit.xml \
             -q
 
@@ -353,6 +365,7 @@ jobs:
           python -m pytest \
             -n auto --dist loadscope \
             --ignore=tests/perf \
+            --ignore=tests/test_import_cycles.py \
             --cov=fluid_build \
             --cov-report=xml:coverage.xml \
             --cov-report=term-missing \
