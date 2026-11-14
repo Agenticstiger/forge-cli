@@ -11,13 +11,16 @@ the refusals, the typed errors, the startup line and a real client round trip.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
+import logging
 import os
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict
@@ -174,3 +177,82 @@ def test_serve_over_http_lists_and_calls_tools(tmp_path: Path) -> None:
     assert proc.returncode == 0, stderr
     assert f"fluid mcp serve: MCP Streamable HTTP at {url} (auth: shared-token" in stderr
     assert TOKEN not in stderr
+
+
+def _blocking_tool(monkeypatch: pytest.MonkeyPatch):
+    """Replace every tool with one that blocks until released, recording the
+    thread it ran on."""
+    from fluid_build.cli.mcp import dispatch as dispatch_mod
+    from fluid_build.cli.mcp import policy as policy_mod
+
+    started, release, threads = threading.Event(), threading.Event(), []
+
+    def _call_tool(name, arguments, **_):
+        threads.append(threading.get_ident())
+        started.set()
+        release.wait(timeout=10)
+        return {"tool": name}
+
+    monkeypatch.setattr(dispatch_mod, "_call_tool", _call_tool)
+    monkeypatch.setattr(policy_mod, "_current_policy", policy_mod.McpPolicy())
+    return started, release, threads
+
+
+def test_over_http_a_slow_tool_leaves_the_event_loop_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One event loop serves every HTTP client: a tool waiting on a slow catalog
+    must not stop the loop from serving the others (or from handling Ctrl-C)."""
+    from fluid_build.cli.mcp import server as server_mod
+
+    started, release, threads = _blocking_tool(monkeypatch)
+    monkeypatch.setattr(server_mod, "_TOOLS_OFF_LOOP", True)
+
+    async def _scenario():
+        call = asyncio.create_task(server_mod._dispatch_sync_tool("list_source_adapters", {}))
+        # Only reachable while the tool is still blocked if the loop is free.
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 5), timeout=6)
+        assert not call.done()
+        release.set()
+        return await asyncio.wait_for(call, timeout=5), threading.get_ident()
+
+    result, loop_thread = asyncio.run(_scenario())
+    assert result == {"tool": "list_source_adapters"}
+    assert threads and threads[0] != loop_thread
+
+
+def test_over_stdio_tools_still_run_on_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """stdio keeps synchronous dispatch: a pipelining client that closes stdin
+    must get every response flushed (tests/test_mcp_protocol_smoke.py)."""
+    from fluid_build.cli.mcp import server as server_mod
+
+    _, release, threads = _blocking_tool(monkeypatch)
+    release.set()
+    monkeypatch.setattr(server_mod, "_TOOLS_OFF_LOOP", False)
+
+    async def _scenario():
+        await server_mod._dispatch_sync_tool("list_source_adapters", {})
+        return threading.get_ident()
+
+    loop_thread = asyncio.run(_scenario())
+    assert threads == [loop_thread]
+
+
+def test_serve_http_moves_tools_off_the_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fluid_build import _mcp_http
+    from fluid_build.cli.mcp import cli as cli_mod
+    from fluid_build.cli.mcp import policy as policy_mod
+    from fluid_build.cli.mcp import server as server_mod
+
+    async def _no_serve(*args, **kwargs):
+        return None
+
+    for name in _AUTH_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(server_mod, "_TOOLS_OFF_LOOP", False)
+    monkeypatch.setattr(policy_mod, "_current_policy", None)
+    monkeypatch.setattr(_mcp_http, "serve_streamable_http", _no_serve)
+    args = argparse.Namespace(transport="http", host="127.0.0.1", port=_free_port())
+    rc = cli_mod._serve_http(
+        server_mod._get_mcp_app(), policy_mod.McpPolicy(), args, logging.getLogger("t")
+    )
+    assert rc == 0
+    assert server_mod._TOOLS_OFF_LOOP is True

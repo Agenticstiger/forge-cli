@@ -182,6 +182,10 @@ def _serve_http(app, policy, args, logger: logging.Logger) -> int:
         sys.stderr.flush()
         return 2
     _set_policy(policy)
+    # Many clients share this process's event loop: keep tools off it.
+    from fluid_build.cli.mcp import server as _server
+
+    _server.serve_tools_off_loop()
     sys.stderr.write(
         _mcp_http.startup_message(
             command=command, host=host, port=port, validator=validator, what="these tools"

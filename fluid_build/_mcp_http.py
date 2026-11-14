@@ -387,6 +387,10 @@ async def serve_streamable_http(
         raise UnsafeBindError(refusal)
     import uvicorn
 
+    # uvicorn binds the bare address: "[::1]" (URL form) does not resolve.
+    bind_host = host.strip()
+    if bind_host.startswith("[") and bind_host.endswith("]"):
+        bind_host = bind_host[1:-1]
     app = build_streamable_http_app(
         server,
         host=host,
@@ -399,7 +403,7 @@ async def serve_streamable_http(
     # 127.0.0.1), and the trusted-proxy check must read the TCP peer.
     config = uvicorn.Config(
         app,
-        host=host,
+        host=bind_host,
         port=port,
         log_level="info",
         proxy_headers=False,

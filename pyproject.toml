@@ -361,9 +361,9 @@ litellm = [
 # advisories on the PyJWKClient/decode path auth.py uses (e.g.
 # GHSA-ffc3-869f-jxw9); [crypto] for the RS256/ES256/EdDSA verifiers.
 #
-# starlette and uvicorn are declared because the output-port transport
-# (fluid_build/output_ports/mcp/_transport.py) imports them directly; mcp
-# requires both, so they add nothing to the install. Floors as mcp states them.
+# starlette and uvicorn are declared because both MCP servers' HTTP transport
+# (fluid_build/_mcp_http.py) imports them directly; mcp requires both, so they
+# add nothing to the install. Floors as mcp states them.
 mcp = [
   "mcp>=1.30,!=2.0.*,!=2.1.*,<3.0",
   "pyjwt[crypto]>=2.15.0",

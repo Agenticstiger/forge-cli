@@ -278,8 +278,9 @@ _current_policy: Optional[McpPolicy] = None
 def _set_policy(policy: McpPolicy) -> None:
     """Install the active policy for this connection.
 
-    Tools read the policy via :func:`_policy` to gate access. Single-stdio-
-    connection scope, so module-level is safe.
+    Tools read the policy via :func:`_policy` to gate access. One policy per
+    server process (over HTTP every client gets the operator's policy), so
+    module-level is safe.
     """
     global _current_policy
     _current_policy = policy

@@ -98,16 +98,18 @@ def _whoami_server() -> Any:
     return build_lowlevel_server("whoami", on_list_tools=_list_tools, on_call_tool=_call_tool)
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
+def _free_port(address: str = "127.0.0.1") -> int:
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    with socket.socket(family) as sock:
+        sock.bind((address, 0))
         return sock.getsockname()[1]
 
 
 @contextmanager
 def _serving(validator: Any, *, host: str = "127.0.0.1") -> Iterator[str]:
     """Run the shared transport in a background thread; yield its /mcp URL."""
-    port = _free_port()
+    address = host.strip("[]")
+    port = _free_port(address)
     holder: Dict[str, Any] = {}
 
     def _run() -> None:
@@ -131,7 +133,7 @@ def _serving(validator: Any, *, host: str = "127.0.0.1") -> Iterator[str]:
     deadline = time.time() + 10
     while time.time() < deadline:
         try:
-            socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+            socket.create_connection((address, port), timeout=0.2).close()
             break
         except OSError:
             if "error" in holder:
@@ -140,7 +142,7 @@ def _serving(validator: Any, *, host: str = "127.0.0.1") -> Iterator[str]:
     else:
         raise RuntimeError(f"server did not bind {port}: {holder.get('error')!r}")
     try:
-        yield f"http://127.0.0.1:{port}/mcp"
+        yield _mcp_http.endpoint_url(host, port)
     finally:
         server = holder.get("server")
         if server is not None:
@@ -328,6 +330,17 @@ def test_an_unauthenticated_server_answers_only_a_loopback_host_header() -> None
     its own name as Host, and the SDK check answers 421."""
     with _serving(AuthValidator(mode="none")) as url:
         assert _post(url, INIT, Host="evil.example:80").status_code == 421
+        assert _post(url, INIT).status_code == 200
+
+
+def test_a_bracketed_ipv6_loopback_host_binds() -> None:
+    """``--host [::1]`` is the URL form of ::1; it must serve, not fail to bind."""
+    try:
+        _free_port("::1")
+    except OSError:
+        pytest.skip("no IPv6 loopback on this machine")
+    with _serving(AuthValidator(mode="none"), host="[::1]") as url:
+        assert url.startswith("http://[::1]:")
         assert _post(url, INIT).status_code == 200
 
 

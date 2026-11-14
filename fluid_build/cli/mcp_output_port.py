@@ -945,9 +945,10 @@ def _render_output_port_guide() -> int:
         SubcommandEntry(
             name="serve",
             description=(
-                "Run the consumer-side MCP stdio server bound to one expose. "
-                "Use --allow-sql for free-form SQL or --max-sample-rows to "
-                "tune the sample cap."
+                "Run the consumer-side MCP server bound to one expose: stdio "
+                "by default, or --transport http for MCP Streamable HTTP at "
+                "/mcp. Use --allow-sql for free-form SQL or --max-sample-rows "
+                "to tune the sample cap."
             ),
             example=(
                 "fluid mcp output-port serve contract.fluid.yaml " "--expose-id customer_profiles"
@@ -964,7 +965,7 @@ def _render_output_port_guide() -> int:
         hint_provider=None,
         quick_start=(
             "fluid mcp output-port serve contract.fluid.yaml "
-            "--expose-id <id>  (Phase-1 stdio server)"
+            "--expose-id <id>  (stdio; add --transport http for remote clients)"
         ),
     )
     return render_subcommand_guide(guide)
