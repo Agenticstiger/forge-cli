@@ -40,18 +40,6 @@ def _printed(console: MagicMock) -> str:
     return "\n".join(str(call.args[0]) for call in console.print.call_args_list if call.args)
 
 
-def _style_of(console: MagicMock, needle: str) -> str:
-    """The Rich style of the printed ``Text`` containing ``needle``.
-
-    The messages print as ``Text`` (not markup), so the colour is a ``Text`` style,
-    not a ``[red]`` tag in the string the golden strings above compare.
-    """
-    for call in console.print.call_args_list:
-        if call.args and needle in str(call.args[0]):
-            return str(getattr(call.args[0], "style", ""))
-    raise AssertionError(f"nothing printed containing {needle!r}")
-
-
 # ── unit: the boundary in isolation ───────────────────────────────────
 
 

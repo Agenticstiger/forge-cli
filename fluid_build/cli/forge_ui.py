@@ -10,7 +10,6 @@ __all__ = [
     "print_forge_performance_summary",
     "print_interview_phase",
     "print_welcome_panel",
-    "show_lines_panel",
 ]
 
 
@@ -255,19 +254,6 @@ def ask_numbered_choice(
 
     # Fall back to default
     return options[default - 1][0]
-
-
-def show_lines_panel(
-    console: Any,
-    lines: Sequence[str],
-    *,
-    title: str,
-    border_style: str,
-) -> None:
-    """Print a simple multi-line panel when Rich is available."""
-    if not console or not RICH_AVAILABLE or not lines:
-        return
-    console.print(_build_panel("\n".join(lines), title=title, border_style=border_style))
 
 
 def print_welcome_panel(console: Any) -> None:

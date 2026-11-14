@@ -482,20 +482,34 @@ def run(args, logger: logging.Logger) -> int:
         if isinstance(e, _FUE):
             raise
         error(logger, "init_failed", error=str(e))
-        # A CLIError's str() is its event slug; show its message and next actions.
-        message = getattr(e, "message", None) or str(e)
-        suggestions = [str(s) for s in (getattr(e, "suggestions", None) or [])]
-        if RICH_AVAILABLE:
-            from fluid_build._console import literal_error_text
-
-            console.print(literal_error_text(f"❌ Init failed: {message}", "red"))
-            for suggestion in suggestions:
-                console.print(literal_error_text(f"  • {suggestion}"))
-        else:
-            console_error(f"Init failed: {message}")
-            for suggestion in suggestions:
-                console_error(f"  - {suggestion}")
+        _print_init_failure(e)
         return 1
+
+
+def _print_init_failure(exc: Exception) -> None:
+    """Show why init failed: a CLIError's message and next actions, not its event slug."""
+    message = getattr(exc, "message", None) or str(exc)
+    suggestions = [str(s) for s in (getattr(exc, "suggestions", None) or [])]
+    if RICH_AVAILABLE:
+        from fluid_build._console import literal_error_text
+
+        console.print(literal_error_text(f"❌ Init failed: {message}", "red"))
+        for suggestion in suggestions:
+            console.print(literal_error_text(f"  • {suggestion}"))
+    else:
+        console_error(f"Init failed: {message}")
+        for suggestion in suggestions:
+            console_error(f"  - {suggestion}")
+
+
+def _template_instead(args, logger: logging.Logger, *, message: str, detail: str) -> int:
+    """Scaffold the customer-360 template, saying why AI mode does not run."""
+    if RICH_AVAILABLE:
+        from .forge_dialogs import print_dialog_status
+
+        print_dialog_status(console, status="info", message=message, detail=detail)
+    args.template = "customer-360"
+    return template_mode(args, logger)
 
 
 def _is_ai_configured() -> bool:
@@ -905,35 +919,25 @@ def _ai_mode(args, logger: logging.Logger) -> int:
             # stop, as forge does without a TTY, rather than write a template.
             return 1
         if choice == "template":
-            if RICH_AVAILABLE:
-                from .forge_dialogs import print_dialog_status
-
-                print_dialog_status(
-                    console,
-                    status="info",
-                    message="No AI provider configured — using template mode instead.",
-                    detail="Run 'fluid ai setup' anytime to enable AI-assisted generation.",
-                )
-            args.template = "customer-360"
-            return template_mode(args, logger)
+            return _template_instead(
+                args,
+                logger,
+                message="No AI provider configured; using template mode instead.",
+                detail="Run 'fluid ai setup' anytime to enable AI-assisted generation.",
+            )
 
         # AI mode needs a description when nobody is at the keyboard, and init has no
         # --context flag to carry one. Scaffold the template instead of failing.
         from .forge_ai import _interactive as _ai_interactive
 
         if not getattr(args, "context", None) and not _ai_interactive(args):
-            if RICH_AVAILABLE:
-                from .forge_dialogs import print_dialog_status
-
-                print_dialog_status(
-                    console,
-                    status="info",
-                    message="No product description to give AI mode here; using a template.",
-                    detail="Describe it later: fluid forge --refine <dir>/contract.fluid.yaml "
-                    '--context "<what it reads, produces, owner, schedule, rules>"',
-                )
-            args.template = "customer-360"
-            return template_mode(args, logger)
+            return _template_instead(
+                args,
+                logger,
+                message="No product description to give AI mode here; using a template.",
+                detail="Describe it later: fluid forge --refine <dir>/contract.fluid.yaml "
+                '--context "<what it reads, produces, owner, schedule, rules>"',
+            )
 
         # Determine target directory for the product.
         product_name = args.name

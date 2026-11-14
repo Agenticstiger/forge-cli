@@ -17,7 +17,6 @@ __all__ = [
     "BUILTIN_LLM_PROVIDERS",
     "PROVIDER_DISPLAY_NAMES",
     "check_llm_readiness",
-    "clear_api_key_from_keyring",
     "get_catalog_default",
     "get_catalog_routing_model",
     "get_catalog_tier_models",
@@ -38,7 +37,6 @@ __all__ = [
     "resolve_llm_config",
     "resolve_model_name",
     "resolve_ollama_model",
-    "save_api_key_to_keyring",
     "call_llm",
     "call_llm_streaming",
 ]
@@ -1502,9 +1500,7 @@ from fluid_build.llm.provider_resolve import (  # noqa: E402,F401
     _resolve_api_key,
     _saved_choice_for,
     ambiguous_keys_message,
-    clear_api_key_from_keyring,
     no_provider_message,
-    save_api_key_to_keyring,
 )
 
 

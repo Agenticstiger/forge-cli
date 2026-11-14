@@ -218,40 +218,45 @@ def _resolve_product_id(ref: str, args: Any, workspace: Path) -> Path:
     return Path(resolved[0]).resolve()
 
 
-def build_request(args: Any) -> AuthoringRequest:
-    """Turn the parsed ``fluid forge`` flags into an :class:`AuthoringRequest`."""
-    workspace = Path.cwd().resolve()
-    refine = _arg(args, "refine")
-    if refine:
-        contract_path = Path(str(refine)).expanduser()
-        if contract_path.is_dir():
-            contract_path = contract_path / CONTRACT_FILE
-        if not contract_path.is_absolute():
-            contract_path = workspace / contract_path
-        if not contract_path.is_file():
-            raise _error(
-                "forge_refine_contract_missing",
-                f"--refine {refine}: there is no contract at that path.",
-                ["Pass the path of an existing contract.fluid.yaml."],
-            )
-    else:
-        target = _arg(args, "target_dir")
-        target_dir = Path(str(target)).expanduser() if target else workspace
-        if not target_dir.is_absolute():
-            target_dir = workspace / target_dir
-        contract_path = target_dir / CONTRACT_FILE
-        if contract_path.exists():
-            shown = os.path.relpath(contract_path, workspace)
-            if shown.startswith(".."):
-                shown = str(contract_path)
-            raise _error(
-                "forge_contract_exists",
-                f"{shown} already exists; AI mode does not overwrite a contract.",
-                [
-                    f"To change it, run: fluid forge --refine {shown}",
-                    "To start a new product, pass another --target-dir.",
-                ],
-            )
+def _refine_target(refine: Any, workspace: Path) -> Path:
+    """The existing contract ``--refine`` names: a file, or a folder that holds one."""
+    path = Path(str(refine)).expanduser()
+    if path.is_dir():
+        path = path / CONTRACT_FILE
+    if not path.is_absolute():
+        path = workspace / path
+    if not path.is_file():
+        raise _error(
+            "forge_refine_contract_missing",
+            f"--refine {refine}: there is no contract at that path.",
+            ["Pass the path of an existing contract.fluid.yaml."],
+        )
+    return path
+
+
+def _new_target(target: Any, workspace: Path) -> Path:
+    """Where a new product's contract goes. AI mode does not overwrite one."""
+    target_dir = Path(str(target)).expanduser() if target else workspace
+    if not target_dir.is_absolute():
+        target_dir = workspace / target_dir
+    path = target_dir / CONTRACT_FILE
+    if path.exists():
+        shown = os.path.relpath(path, workspace)
+        if shown.startswith(".."):
+            shown = str(path)
+        raise _error(
+            "forge_contract_exists",
+            f"{shown} already exists; AI mode does not overwrite a contract.",
+            [
+                f"To change it, run: fluid forge --refine {shown}",
+                "To start a new product, pass another --target-dir.",
+            ],
+        )
+    return path
+
+
+def _facts(args: Any) -> List[str]:
+    """The flags a run states about the product, as the prompt repeats them."""
     facts: List[str] = []
     for flag, attr in (
         ("--provider", "provider"),
@@ -261,6 +266,17 @@ def build_request(args: Any) -> AuthoringRequest:
         value = _arg(args, attr)
         if value:
             facts.append(f"{flag} {value}")
+    return facts
+
+
+def build_request(args: Any) -> AuthoringRequest:
+    """Turn the parsed ``fluid forge`` flags into an :class:`AuthoringRequest`."""
+    workspace = Path.cwd().resolve()
+    refine = _arg(args, "refine")
+    if refine:
+        contract_path = _refine_target(refine, workspace)
+    else:
+        contract_path = _new_target(_arg(args, "target_dir"), workspace)
     contract_path = contract_path.resolve()
     return AuthoringRequest(
         intent=_read_intent(_arg(args, "context")),
@@ -268,7 +284,7 @@ def build_request(args: Any) -> AuthoringRequest:
         contract_path=contract_path,
         refine=bool(refine),
         upstreams=_upstream_paths(args, workspace),
-        facts=facts,
+        facts=_facts(args),
         new_dirs=_missing_dirs(contract_path.parent),
     )
 
@@ -420,25 +436,42 @@ def extract_contract_yaml(text: str) -> str:
     Accepts the structured ``{"contract_yaml": ...}`` a coding agent returns, a bare JSON
     contract, a fenced ```yaml block, or bare YAML.
     """
+    stripped = (text or "").strip()
+    found = _contract_from_json(stripped) if stripped.startswith("{") else None
+    if found is None:
+        found = _contract_from_fences(stripped)
+    return found if found is not None else stripped + "\n"
+
+
+def _contract_from_json(text: str) -> Optional[str]:
+    """The contract in a JSON answer, or None when ``text`` is not one."""
     import yaml
 
-    stripped = (text or "").strip()
-    if stripped.startswith("{"):
-        try:
-            data = json.loads(stripped)
-        except ValueError:
-            data = None
-        if isinstance(data, dict):
-            inner = data.get("contract_yaml")
-            if isinstance(inner, str):
-                return extract_contract_yaml(inner)
-            if isinstance(data.get("contract"), dict):
-                return yaml.safe_dump(data["contract"], sort_keys=False)
-            if "fluidVersion" in data:
-                return yaml.safe_dump(data, sort_keys=False)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    inner = data.get("contract_yaml")
+    if isinstance(inner, str):
+        return extract_contract_yaml(inner)
+    if isinstance(data.get("contract"), dict):
+        return yaml.safe_dump(data["contract"], sort_keys=False)
+    if "fluidVersion" in data:
+        return yaml.safe_dump(data, sort_keys=False)
+    return None
+
+
+def _contract_from_fences(text: str) -> Optional[str]:
+    """The fenced block that holds the contract, or None when there is no candidate.
+
+    A yaml (or unlabelled) block that names ``fluidVersion`` comes first, then any block
+    that does, then the longest yaml block.
+    """
     blocks = [
         (lang.strip().lower(), textwrap.dedent(body).strip())
-        for lang, body in _FENCE_RE.findall(stripped)
+        for lang, body in _FENCE_RE.findall(text)
     ]
     yamlish = [body for lang, body in blocks if lang in ("", "yaml", "yml")]
     for body in [*yamlish, *(body for _, body in blocks)]:
@@ -446,7 +479,7 @@ def extract_contract_yaml(text: str) -> str:
             return body + "\n"
     if yamlish:
         return max(yamlish, key=len) + "\n"
-    return stripped + "\n"
+    return None
 
 
 def yaml_mapping_error(contract_text: str) -> Optional[str]:
