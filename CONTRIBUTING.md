@@ -438,8 +438,8 @@ Two register sites — both already have an `_SOURCE_ADAPTERS` dict:
 
 - `fluid_build/cli/forge_data_model.py::_build_catalog_adapter` —
   dispatches `--source-type atlas` from the CLI.
-- `fluid_build/cli/mcp/dispatch.py::_SOURCE_ADAPTERS` dispatches the MCP catalog
-  tools (`list_source_tables`, `inspect_source_table` and the rest).
+- `fluid_build/cli/mcp/dispatch.py::_SOURCE_ADAPTERS` dispatches the MCP
+  `source_catalog` tool.
 
 Add one entry to each:
 

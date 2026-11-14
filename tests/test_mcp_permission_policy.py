@@ -46,8 +46,7 @@ class TestToolCapabilityRegistry:
         """Pin the original logical-pipeline tools as a *subset*.
 
         The registry has grown beyond the original set (V1.5 added the
-        source-catalog tools: list_source_adapters, list_source_tables,
-        inspect_source_table, list_source_lineage, list_source_glossary).
+        source-catalog tool: source_catalog).
         The original set must continue to exist
         — any rename / removal would break the LLM-agentic
         contract Claude Code / Cursor depend on.
@@ -62,17 +61,18 @@ class TestToolCapabilityRegistry:
         }
         assert original_six.issubset(set(TOOL_CAPABILITIES.keys()))
 
-    def test_v15_source_catalog_tools_registered(self):
-        """V1.5 adds five source-catalog tools, all named ``*_source_*``
-        to disambiguate from the existing publish-catalog role."""
-        v15_five = {
+    def test_source_catalog_tool_registered(self):
+        """The source-catalog reads are one tool, ``source_catalog``, with a
+        ``kind`` argument; the five former per-read tools are gone."""
+        assert "source_catalog" in TOOL_CAPABILITIES
+        for retired in (
             "list_source_adapters",
             "list_source_tables",
             "inspect_source_table",
             "list_source_lineage",
             "list_source_glossary",
-        }
-        assert v15_five.issubset(set(TOOL_CAPABILITIES.keys()))
+        ):
+            assert retired not in TOOL_CAPABILITIES
 
     def test_read_only_tools_are_nonmutating(self):
         """Every read tool must declare no mutation and no namespace writes

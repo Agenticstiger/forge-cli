@@ -267,6 +267,35 @@ def _build_policy_from_args(args) -> McpPolicy:
     )
 
 
+def tool_name_refusal(policy: McpPolicy) -> Optional[str]:
+    """The startup refusal for a ``--allow-tools`` / ``--deny-tools`` name that
+    names no tool, or ``None``.
+
+    Unknown names are refused rather than ignored: a deny list written for a
+    tool that was since renamed would otherwise deny nothing and leave the new
+    tool callable. github/github-mcp-server (MIT) fails startup on an unknown
+    tool name the same way.
+    """
+    from fluid_build.cli.mcp.models import RETIRED_TOOL_HINTS
+
+    lines = []
+    for flag, names in (
+        ("--allow-tools", policy.allowed_tools or ()),
+        ("--deny-tools", policy.denied_tools),
+    ):
+        unknown = [name for name in names if name not in TOOL_CAPABILITIES]
+        if not unknown:
+            continue
+        lines.append(f"fluid mcp serve: {flag} names no such tool: {', '.join(unknown)}.")
+        for name in unknown:
+            if name in RETIRED_TOOL_HINTS:
+                lines.append(f"  {name} {RETIRED_TOOL_HINTS[name]}.")
+    if not lines:
+        return None
+    lines.append(f"  Tools: {', '.join(sorted(TOOL_CAPABILITIES))}.")
+    return "\n".join(lines) + "\n"
+
+
 # ---------------------------------------------------------------------------
 # FastMCP app lives in server.py (where @tool() decorators run at import time).
 # Accessed here via __getattr__ lazy import (see top of module).

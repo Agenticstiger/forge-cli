@@ -1,0 +1,439 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+"""``fluid mcp serve``'s ``source_catalog`` tool and what came with it.
+
+* one tool, with ``kind``, replaces the five source tools, and each kind's
+  missing argument is named before any adapter is built;
+* ``response_format``: ``concise`` (the default) and ``detailed``;
+* a result over the inline budget comes back as an envelope plus a
+  ``resource_link`` that ``resources/read`` serves (and, over stdio, a file);
+* the server's ``instructions``;
+* an unknown name in ``--allow-tools`` / ``--deny-tools`` stops the server.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from fluid_build._mcp_compat import attr
+from fluid_build.cli.mcp import artifacts
+from fluid_build.cli.mcp.dispatch import _MISSING_ARGUMENT_HINTS, McpToolUsageError, _call_tool
+from fluid_build.cli.mcp.models import (
+    RETIRED_TOOL_HINTS,
+    SERVER_INSTRUCTIONS,
+    SOURCE_CATALOG_KINDS,
+    TOOL_CAPABILITIES,
+)
+from fluid_build.cli.mcp.policy import _build_policy_from_args, tool_name_refusal
+from fluid_build.copilot.catalog.base import CatalogAdapter
+from fluid_build.copilot.catalog.models import (
+    CatalogColumn,
+    CatalogLineage,
+    CatalogTable,
+    GlossaryTerm,
+    LineageRef,
+)
+
+_CREDS = {"credential_id": "stub-prod"}
+_FIVE = (
+    "list_source_adapters",
+    "list_source_tables",
+    "inspect_source_table",
+    "list_source_lineage",
+    "list_source_glossary",
+)
+
+
+class _StubAdapter(CatalogAdapter):
+    """Canned metadata with the fields ``concise`` drops: vendor payloads,
+    empty values and false key flags."""
+
+    name = "stub-source"
+
+    def list_tables(self, scope):
+        return [
+            CatalogTable(
+                fqn=f"DB.SCH.T{i}",
+                database="DB",
+                schema_name="SCH",
+                name=f"T{i}",
+                description=f"Table {i}",
+                owner="data-team",
+                catalog_specific={"raw": "x" * 40},
+            )
+            for i in range(2)
+        ]
+
+    def get_table(self, fqn):
+        return CatalogTable(
+            fqn=fqn,
+            database="DB",
+            schema_name="SCH",
+            name=fqn.rsplit(".", 1)[-1],
+            description="",
+            owner="data-team",
+            columns=[
+                CatalogColumn(name="id", data_type="NUMBER", nullable=False, primary_key=True),
+                CatalogColumn(
+                    name="email",
+                    data_type="VARCHAR",
+                    description="",
+                    catalog_specific={"comment": "raw"},
+                ),
+            ],
+            catalog_specific={"vendor": {"retention": 7}},
+        )
+
+    def get_lineage(self, fqn):
+        return CatalogLineage(
+            upstream=[LineageRef(fqn="RAW.S.A", kind="upstream", transformation_type="view")],
+            downstream=[LineageRef(fqn="MART.S.B", kind="downstream")],
+        )
+
+    def list_glossary_terms(self, scope):
+        return [GlossaryTerm(term="Order", definition="A purchase.", catalog_specific={"id": 9})]
+
+
+@pytest.fixture
+def built(monkeypatch, tmp_path):
+    """Stub the adapter builder (recording each call) and the audit writer."""
+    calls = []
+
+    def _build(arguments, **_kwargs):
+        calls.append(arguments)
+        return _StubAdapter()
+
+    monkeypatch.setattr("fluid_build.cli.mcp._build_source_adapter", _build)
+    monkeypatch.setattr(
+        "fluid_build.cli.mcp.write_audit_event", lambda *a, **kw: tmp_path / "audit.json"
+    )
+    return calls
+
+
+@pytest.fixture
+def store(monkeypatch):
+    """A fresh artifact store, with files off unless a test turns them on."""
+    fresh = artifacts.ArtifactStore()
+    monkeypatch.setattr(artifacts, "_STORE", fresh)
+    monkeypatch.setattr(artifacts, "_WRITE_FILES", False)
+    yield fresh
+    fresh.close()
+
+
+def _call(**arguments):
+    return _call_tool("source_catalog", arguments, read_only=True)
+
+
+# ---------------------------------------------------------------------------
+# One tool
+# ---------------------------------------------------------------------------
+
+
+def test_one_source_tool_replaces_the_five():
+    assert "source_catalog" in TOOL_CAPABILITIES
+    assert not set(_FIVE) & set(TOOL_CAPABILITIES)
+    assert set(_FIVE) <= set(RETIRED_TOOL_HINTS)
+    schema = TOOL_CAPABILITIES["source_catalog"].input_schema
+    assert schema["required"] == ["kind"]
+    assert schema["properties"]["kind"]["enum"] == list(SOURCE_CATALOG_KINDS)
+    assert schema["properties"]["response_format"]["default"] == "concise"
+
+
+def test_kind_adapters_needs_nothing_else_and_builds_no_adapter(built):
+    result = _call(kind="adapters")
+    assert result["kind"] == "adapters"
+    assert {"snowflake", "unity", "bigquery"} <= {a["name"] for a in result["adapters"]}
+    assert built == []
+
+
+@pytest.mark.parametrize(
+    "kind, arguments, needs",
+    [
+        ("tables", {}, ["source", "credentials"]),
+        ("tables", {"source": "snowflake"}, ["credentials"]),
+        ("table", {"source": "snowflake", "credentials": _CREDS}, ["fqn"]),
+        ("lineage", {"source": "snowflake", "credentials": _CREDS, "fqn": "  "}, ["fqn"]),
+        ("glossary", {"credentials": _CREDS}, ["source"]),
+    ],
+    ids=["tables-both", "tables-credentials", "table-fqn", "lineage-blank-fqn", "glossary-source"],
+)
+def test_a_missing_argument_is_named_before_any_adapter_is_built(built, kind, arguments, needs):
+    with pytest.raises(McpToolUsageError) as exc:
+        _call(kind=kind, **arguments)
+    message = str(exc.value)
+    assert message.startswith(f"source_catalog kind={kind} needs ")
+    for key, hint in _MISSING_ARGUMENT_HINTS.items():
+        assert (hint in message) == (key in needs), key
+    assert built == []
+
+
+@pytest.mark.parametrize(
+    "arguments, fragment",
+    [
+        ({"kind": "columns"}, "kind must be one of adapters, tables, table, lineage, glossary"),
+        ({"kind": "adapters", "response_format": "full"}, "response_format must be one of"),
+    ],
+    ids=["kind", "response_format"],
+)
+def test_an_unknown_kind_or_format_is_a_usage_error(built, arguments, fragment):
+    with pytest.raises(McpToolUsageError, match=fragment):
+        _call(**arguments)
+
+
+# ---------------------------------------------------------------------------
+# response_format
+# ---------------------------------------------------------------------------
+
+_SNOWFLAKE = {"source": "snowflake", "credentials": _CREDS}
+
+
+def test_concise_tables_are_fqn_name_and_description(built):
+    concise = _call(kind="tables", **_SNOWFLAKE)
+    assert concise == {
+        "kind": "tables",
+        "tables": [
+            {"fqn": "DB.SCH.T0", "name": "T0", "description": "Table 0"},
+            {"fqn": "DB.SCH.T1", "name": "T1", "description": "Table 1"},
+        ],
+    }
+    detailed = _call(kind="tables", response_format="detailed", **_SNOWFLAKE)
+    assert detailed["tables"] == [
+        t.model_dump(mode="json", by_alias=True) for t in _StubAdapter().list_tables(None)
+    ]
+
+
+def test_concise_table_drops_vendor_payloads_empty_values_and_false_key_flags(built):
+    table = _call(kind="table", fqn="DB.SCH.ORDERS", **_SNOWFLAKE)["table"]
+    assert "catalog_specific" not in json.dumps(table)
+    assert "description" not in table  # empty string
+    assert "tags" not in table  # empty dict
+    id_column, email_column = table["columns"]
+    assert id_column["primary_key"] is True
+    assert id_column["nullable"] is False  # a false flag that means something stays
+    assert "primary_key" not in email_column and "partition_key" not in email_column
+    assert email_column["nullable"] is True
+    assert "description" not in email_column
+
+    detailed = _call(kind="table", fqn="DB.SCH.ORDERS", response_format="detailed", **_SNOWFLAKE)
+    expected = _StubAdapter().get_table("DB.SCH.ORDERS").model_dump(mode="json", by_alias=True)
+    assert detailed == {"kind": "table", "table": expected}
+
+
+def test_concise_lineage_is_the_fqns_on_each_side(built):
+    concise = _call(kind="lineage", fqn="DB.SCH.ORDERS", **_SNOWFLAKE)
+    assert concise == {
+        "kind": "lineage",
+        "lineage": {"upstream": ["RAW.S.A"], "downstream": ["MART.S.B"]},
+    }
+    detailed = _call(kind="lineage", fqn="DB.SCH.ORDERS", response_format="detailed", **_SNOWFLAKE)
+    assert detailed["lineage"]["upstream"][0]["transformation_type"] == "view"
+
+
+def test_concise_glossary_terms_are_pruned(built):
+    concise = _call(kind="glossary", **_SNOWFLAKE)
+    assert concise == {
+        "kind": "glossary",
+        "terms": [{"term": "Order", "definition": "A purchase."}],
+    }
+    detailed = _call(kind="glossary", response_format="detailed", **_SNOWFLAKE)
+    assert detailed["terms"][0]["catalog_specific"] == {"id": 9}
+
+
+# ---------------------------------------------------------------------------
+# Large results
+# ---------------------------------------------------------------------------
+
+
+def _large_result():
+    return {"kind": "tables", "tables": [{"fqn": f"DB.SCH.T{i}"} for i in range(50)]}
+
+
+def test_a_result_within_the_budget_is_returned_as_it_is(store):
+    result = {"kind": "adapters", "adapters": []}
+    assert artifacts.offload_if_large(result, tool="source_catalog") is result
+
+
+def test_a_large_result_becomes_an_envelope_and_a_resource_link(store, monkeypatch):
+    monkeypatch.setenv(artifacts.INLINE_TOKEN_LIMIT_ENV, "10")
+    result = _large_result()
+    out = artifacts.offload_if_large(result, tool="source_catalog", hint="Ask for less.")
+
+    text_block, link = out.content
+    envelope = json.loads(text_block.text)
+    assert attr(out, "structured_content", "structuredContent") == {"result": envelope}
+    assert attr(out, "is_error", "isError") is False
+    assert envelope["offloaded"] is True
+    assert envelope["tool"] == "source_catalog"
+    assert envelope["inline_token_limit"] == 10
+    assert envelope["summary"] == {"kind": "tables", "counts": {"tables": 50}}
+    assert envelope["next"].endswith("Ask for less.")
+    assert "path" not in envelope
+
+    assert link.type == "resource_link"
+    assert str(link.uri) == envelope["resource"]
+    assert envelope["resource"].startswith(artifacts.URI_PREFIX)
+    assert attr(link, "mime_type", "mimeType") == "application/json"
+    full = artifacts.read(envelope["resource"][len(artifacts.URI_PREFIX) :])
+    assert json.loads(full) == result
+    assert link.size == envelope["bytes"] == len(full.encode("utf-8"))
+
+
+def test_over_stdio_the_envelope_also_names_a_private_file(store, monkeypatch):
+    monkeypatch.setenv(artifacts.INLINE_TOKEN_LIMIT_ENV, "10")
+    monkeypatch.setattr(artifacts, "_WRITE_FILES", True)
+    out = artifacts.offload_if_large(_large_result(), tool="source_catalog")
+    envelope = attr(out, "structured_content", "structuredContent")["result"]
+    path = Path(envelope["path"])
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    artifact_id = envelope["resource"][len(artifacts.URI_PREFIX) :]
+    assert path.read_text(encoding="utf-8") == artifacts.read(artifact_id)
+    store.close()
+    assert not path.parent.exists()
+
+
+@pytest.mark.parametrize(
+    "raw, limit, warns",
+    [("0", 0, False), ("2500", 2500, False), ("many", 6000, True), ("-5", 6000, True)],
+)
+def test_the_inline_budget_setting(monkeypatch, caplog, raw, limit, warns):
+    monkeypatch.setenv(artifacts.INLINE_TOKEN_LIMIT_ENV, raw)
+    with caplog.at_level("WARNING", logger=artifacts.__name__):
+        assert artifacts.inline_token_limit() == limit
+    assert (artifacts.INLINE_TOKEN_LIMIT_ENV in caplog.text) == warns
+
+
+def test_a_zero_budget_sends_everything_inline(store, monkeypatch):
+    monkeypatch.setenv(artifacts.INLINE_TOKEN_LIMIT_ENV, "0")
+    result = _large_result()
+    assert artifacts.offload_if_large(result, tool="source_catalog") is result
+
+
+def test_the_store_keeps_only_the_newest_results(tmp_path):
+    by_count = artifacts.ArtifactStore(max_artifacts=2)
+    try:
+        first, first_path = by_count.put("a" * 10, write_file=True)
+        second, _ = by_count.put("b" * 10, write_file=True)
+        third, _ = by_count.put("c" * 10, write_file=True)
+        assert by_count.get(first) is None
+        assert not os.path.exists(first_path)
+        assert by_count.get(second) == "b" * 10 and by_count.get(third) == "c" * 10
+    finally:
+        by_count.close()
+    by_bytes = artifacts.ArtifactStore(max_total_bytes=10)
+    older, _ = by_bytes.put("x" * 8, write_file=False)
+    newer, _ = by_bytes.put("y" * 8, write_file=False)
+    assert by_bytes.get(older) is None and by_bytes.get(newer) == "y" * 8
+
+
+def test_reading_an_unknown_result_says_what_to_do(store):
+    with pytest.raises(ValueError, match="Call the tool again"):
+        artifacts.read("0" * 32)
+
+
+def test_a_large_result_is_read_back_through_the_sdk(built, store, monkeypatch):
+    """A real MCP session on the installed SDK generation: the tool call
+    returns the link, and ``resources/read`` on it returns the full result."""
+    from fluid_build._mcp_compat import lowlevel_server, open_inmemory_session
+    from fluid_build.cli.mcp import policy as policy_module
+
+    monkeypatch.setenv(artifacts.INLINE_TOKEN_LIMIT_ENV, "20")
+    policy = _build_policy_from_args(SimpleNamespace())
+    monkeypatch.setattr(policy_module, "_current_policy", policy)
+    app = policy_module._build_fastmcp_app(policy)
+
+    async def scenario():
+        async with open_inmemory_session(lowlevel_server(app)) as session:
+            result = await session.call_tool(
+                "source_catalog",
+                {"kind": "tables", "source": "snowflake", "credentials": _CREDS},
+            )
+            blocks = {block.type: block for block in result.content}
+            read = await session.read_resource(blocks["resource_link"].uri)
+            return json.loads(blocks["text"].text), blocks["resource_link"], read
+
+    envelope, link, read = asyncio.run(scenario())
+    assert envelope["offloaded"] is True
+    assert envelope["resource"] == str(link.uri)
+    full = json.loads(read.contents[0].text)
+    assert full["kind"] == "tables"
+    assert [t["fqn"] for t in full["tables"]] == ["DB.SCH.T0", "DB.SCH.T1"]
+
+
+# ---------------------------------------------------------------------------
+# Server instructions
+# ---------------------------------------------------------------------------
+
+
+def test_the_server_says_when_to_reach_for_its_tools():
+    from fluid_build._mcp_compat import lowlevel_server
+    from fluid_build.cli.mcp.server import _get_mcp_app
+
+    options = lowlevel_server(_get_mcp_app()).create_initialization_options()
+    assert options.instructions == SERVER_INSTRUCTIONS
+    # Claude Code cut instructions at 2,048 characters before v2.1.296.
+    assert len(SERVER_INSTRUCTIONS) <= 2048
+    assert SERVER_INSTRUCTIONS.startswith("FLUID data products")
+
+
+# ---------------------------------------------------------------------------
+# Unknown tool names
+# ---------------------------------------------------------------------------
+
+
+def test_a_renamed_tool_in_the_deny_list_is_refused_with_its_new_name():
+    policy = _build_policy_from_args(SimpleNamespace(deny_tools="list_source_tables,nope"))
+    refusal = tool_name_refusal(policy)
+    assert "--deny-tools names no such tool: list_source_tables, nope." in refusal
+    assert "  list_source_tables is now source_catalog with kind=tables." in refusal
+    assert "nope is" not in refusal
+    assert "  Tools: " + ", ".join(sorted(TOOL_CAPABILITIES)) + "." in refusal
+
+
+def test_a_removed_tool_in_the_allow_list_is_refused():
+    policy = _build_policy_from_args(SimpleNamespace(allow_tools="forge_run"))
+    refusal = tool_name_refusal(policy)
+    assert "--allow-tools names no such tool: forge_run." in refusal
+    assert "  forge_run was removed; no tool replaces it." in refusal
+
+
+def test_known_tool_names_pass():
+    policy = _build_policy_from_args(
+        SimpleNamespace(allow_tools="source_catalog,validate_contract", deny_tools="update_entity")
+    )
+    assert tool_name_refusal(policy) is None
+
+
+def test_fluid_mcp_serve_stops_on_an_unknown_tool_name(tmp_path):
+    env = {k: v for k, v in os.environ.items() if k != "COLUMNS"}
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "fluid_build.cli",
+            "mcp",
+            "serve",
+            "--deny-tools",
+            "list_source_tables",
+        ],
+        cwd=tmp_path,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 2
+    assert "fluid mcp serve: --deny-tools names no such tool: list_source_tables." in proc.stderr
+    assert "list_source_tables is now source_catalog with kind=tables." in proc.stderr
+    assert proc.stdout == ""

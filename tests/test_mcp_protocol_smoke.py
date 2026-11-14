@@ -52,7 +52,7 @@ def test_mcp_stdio_initialize_tools_list_and_call(tmp_path: Path):
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": {"name": "list_source_adapters", "arguments": {}},
+            "params": {"name": "source_catalog", "arguments": {"kind": "adapters"}},
         },
     ]
 
@@ -114,10 +114,11 @@ def test_mcp_stdio_initialize_tools_list_and_call(tmp_path: Path):
     tools = responses[1]["result"]["tools"]
     assert tools
     assert all(tool.get("inputSchema", {}).get("type") == "object" for tool in tools)
-    assert "list_source_adapters" in {tool["name"] for tool in tools}
+    assert "source_catalog" in {tool["name"] for tool in tools}
 
     call_result = responses[2]["result"]
     assert call_result["isError"] is False
     assert call_result["content"][0]["type"] == "text"
     payload = json.loads(call_result["content"][0]["text"])
+    assert payload["kind"] == "adapters"
     assert {item["name"] for item in payload["adapters"]} >= {"snowflake", "bigquery"}

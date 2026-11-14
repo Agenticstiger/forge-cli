@@ -75,9 +75,10 @@ The plugin also carries the validate hook. Neither route writes the MCP config.
 
 After scaffolding, the IDE's agent has **two complementary channels**:
 
-1. **MCP tools** (11, sandboxed, structured) for surgical work:
-   - `list_source_adapters`, `list_source_tables`, `inspect_source_table`,
-     `list_source_lineage`, `list_source_glossary` — catalog discovery.
+1. **MCP tools** (7, sandboxed, structured) for surgical work:
+   - `source_catalog`: catalog discovery. Its `kind` is `adapters`, `tables`,
+     `table`, `lineage` or `glossary`; `response_format` is `concise` (the default) or
+     `detailed`.
    - `read_logical_model`, `update_entity`, `add_relationship`,
      `regenerate_physical` — logical-model edits (round-trip via the sidecar).
    - `validate_contract`, `diff_models`: checks.
@@ -109,8 +110,8 @@ A typical first session:
 
 1. User: *"Build a customer-360 CDP joining `users` and `orders`."*
 2. Agent reads the `composing-fluid-data-products` skill, then the upstream contracts.
-3. Agent calls MCP `list_source_tables` / `inspect_source_table` when a source
-   lives in a catalog.
+3. Agent calls MCP `source_catalog` (`kind: tables`, then `kind: table`) when a
+   source lives in a catalog.
 4. Agent shell-runs `fluid forge --template starter --non-interactive --yes --target-dir customer_360 --no-memory`
    and edits the contract itself.
 5. Agent runs `fluid validate customer_360/contract.fluid.yaml --offline` until it is

@@ -6,10 +6,9 @@
 Pins the wire-level contract of every catalog tool added to
 ``cli/mcp.py`` in Sprint A.4:
 
-* ``list_source_adapters`` — read-only inventory of catalog types.
-* ``list_source_tables`` / ``inspect_source_table`` /
-  ``list_source_lineage`` / ``list_source_glossary`` — read-only
-  metadata reads.
+* ``source_catalog`` — one read-only tool; its ``kind`` argument picks the
+  inventory of catalog types (``adapters``) or a metadata read
+  (``tables`` / ``table`` / ``lineage`` / ``glossary``).
 
 Three categories of pin:
 
@@ -43,6 +42,7 @@ from fluid_build.cli.mcp import (
     _scope_from_args,
     check_tool_permission,
 )
+from fluid_build.cli.mcp.dispatch import McpToolUsageError
 from fluid_build.copilot.catalog.base import CatalogAdapter
 from fluid_build.copilot.catalog.models import (
     CatalogColumn,
@@ -100,31 +100,26 @@ class _StubAdapter(CatalogAdapter):
 
 
 class TestToolRegistryShape:
-    def test_five_source_tools_registered(self):
-        """The plan promises 5 source-catalog MCP tools; every one
-        must appear in ``TOOL_CAPABILITIES``."""
-        expected = {
+    def test_one_source_catalog_tool_registered(self):
+        """The source-catalog reads are the single ``source_catalog`` tool;
+        the five former per-read tools are not registered."""
+        retired = {
             "list_source_adapters",
             "list_source_tables",
             "inspect_source_table",
             "list_source_lineage",
             "list_source_glossary",
         }
-        registered = {t for t in TOOL_CAPABILITIES if t in expected}
-        assert registered == expected
+        assert "source_catalog" in TOOL_CAPABILITIES
+        assert not retired & set(TOOL_CAPABILITIES)
+        assert len(TOOL_CAPABILITIES) == 7
 
-    def test_descriptions_mention_credential_id(self):
-        """Every catalog tool's description names ``credential_id``
-        so an LLM scanning ``tools/list`` knows what arg to pass."""
-        for name in TOOL_CAPABILITIES:
-            if not name.startswith(
-                ("list_source_t", "inspect_source", "list_source_l", "list_source_g")
-            ):
-                continue
-            cap = TOOL_CAPABILITIES[name]
-            assert (
-                "credential_id" in cap.description
-            ), f"{name} description missing 'credential_id': {cap.description}"
+    def test_credentials_property_names_credential_id(self):
+        """The tool's ``credentials`` property description names
+        ``credential_id`` so an LLM scanning ``tools/list`` knows what arg to
+        pass (the top-level tool description no longer carries it)."""
+        props = TOOL_CAPABILITIES["source_catalog"].input_schema["properties"]
+        assert "credential_id" in props["credentials"]["description"]
 
     def test_every_tool_advertises_input_schema(self):
         """Gap 5 — populated ``input_schema`` lets MCP clients (Claude
@@ -146,28 +141,17 @@ class TestToolRegistryShape:
             assert isinstance(schema, dict)
             assert schema.get("type") == "object"
 
-    def test_catalog_tool_schemas_require_credentials(self):
-        """Catalog-only tools MUST require credentials in their schema —
-        that's the whole "no raw secrets over the wire" contract from the
-        security model.
-
-        """
-        catalog_only_tools = [
-            "list_source_tables",
-            "inspect_source_table",
-            "list_source_lineage",
-            "list_source_glossary",
-        ]
-        for name in catalog_only_tools:
-            cap = TOOL_CAPABILITIES[name]
-            schema = cap.input_schema
-            assert schema is not None, f"{name} missing input_schema"
-            assert "credentials" in schema.get(
-                "required", []
-            ), f"{name} schema must REQUIRE credentials"
-            assert "credentials" in schema.get(
-                "properties", {}
-            ), f"{name} schema must declare credentials property"
+    def test_catalog_tool_schema_declares_credentials_and_requires_only_kind(self):
+        """``source_catalog`` declares the ``credentials`` envelope (the "no raw
+        secrets over the wire" contract: a ``credential_id``, nothing else
+        required) and requires only ``kind`` in the static schema; a missing
+        ``credentials`` is refused at dispatch (see
+        ``test_every_kind_but_adapters_refuses_missing_credentials``)."""
+        schema = TOOL_CAPABILITIES["source_catalog"].input_schema
+        assert schema is not None, "source_catalog missing input_schema"
+        assert schema["required"] == ["kind"]
+        assert "credentials" in schema["properties"]
+        assert schema["properties"]["credentials"]["required"] == ["credential_id"]
 
 
 # ----------------------------------------------------------------------
@@ -177,16 +161,10 @@ class TestToolRegistryShape:
 
 class TestPermissionPolicy:
     def test_read_only_allows_read_tools(self):
-        """Read-only doesn't block any of the 5 read tools."""
+        """Read-only doesn't block the source-catalog tool, whatever its kind."""
         policy = McpPolicy(read_only=True)
-        for name in (
-            "list_source_adapters",
-            "list_source_tables",
-            "inspect_source_table",
-            "list_source_lineage",
-            "list_source_glossary",
-        ):
-            check_tool_permission(name, {}, policy=policy)  # no exception
+        for kind in ("adapters", "tables", "table", "lineage", "glossary"):
+            check_tool_permission("source_catalog", {"kind": kind}, policy=policy)  # no exception
 
     def test_writable_paths_sandbox_blocks_outside_paths(self, tmp_path):
         """``regenerate_physical`` writes ``contract_path``: the path
@@ -222,8 +200,9 @@ class TestPermissionPolicy:
 
 
 class TestDispatchSmoke:
-    def test_list_source_adapters_returns_inventory(self):
-        result = _call_tool("list_source_adapters", {}, read_only=True)
+    def test_adapters_kind_returns_inventory(self):
+        result = _call_tool("source_catalog", {"kind": "adapters"}, read_only=True)
+        assert result["kind"] == "adapters"
         adapters = result["adapters"]
         names = {a["name"] for a in adapters}
         # Sprint A ships snowflake + unity as ``available``; the
@@ -232,7 +211,7 @@ class TestDispatchSmoke:
         assert {"snowflake", "unity"} <= names
         assert {"bigquery", "dataplex", "glue", "datahub", "datamesh_manager"} <= names
 
-    def test_list_source_tables_routes_through_stub_adapter(self, tmp_path, monkeypatch):
+    def test_tables_kind_routes_through_stub_adapter(self, tmp_path, monkeypatch):
         """Patch ``_build_source_adapter`` to return our stub. The
         real dispatch is exercised end-to-end — argument parsing,
         scope construction, audit event write, return shape."""
@@ -255,18 +234,21 @@ class TestDispatchSmoke:
         monkeypatch.setenv("HOME", str(tmp_path))
 
         result = _call_tool(
-            "list_source_tables",
+            "source_catalog",
             {
+                "kind": "tables",
                 "source": "stub",
                 "credentials": {"credential_id": "stub-prod"},
                 "scope": {"database": "DB", "schema_name": "SCH"},
             },
             read_only=True,
         )
-        assert "tables" in result
+        assert result["kind"] == "tables"
         assert len(result["tables"]) == 2
         names = {t["name"] for t in result["tables"]}
         assert names == {"A", "B"}
+        # Concise rows carry only fqn / name / description (None dropped).
+        assert result["tables"][0] == {"fqn": "DB.SCH.A", "name": "A"}
         # Audit event recorded with non-sensitive context only.
         assert any(c["event"] == "mcp_list_source_tables" for c in captured)
         audit_payload = next(
@@ -275,7 +257,7 @@ class TestDispatchSmoke:
         assert audit_payload["catalog_name"] == "stub-source"
         assert audit_payload["result_count"] == 2
 
-    def test_inspect_source_table_returns_full_table(self, monkeypatch, tmp_path):
+    def test_table_kind_returns_full_table(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             "fluid_build.cli.mcp._build_source_adapter",
             lambda args, **_kwargs: _StubAdapter(),
@@ -284,18 +266,49 @@ class TestDispatchSmoke:
             "fluid_build.cli.mcp.write_audit_event", lambda *a, **kw: tmp_path / "x"
         )
         result = _call_tool(
-            "inspect_source_table",
+            "source_catalog",
             {
+                "kind": "table",
+                "source": "stub",
+                "credentials": {"credential_id": "stub-prod"},
+                "fqn": "DB.SCH.MY_TABLE",
+                "response_format": "detailed",
+            },
+            read_only=True,
+        )
+        assert result["kind"] == "table"
+        assert result["table"]["fqn"] == "DB.SCH.MY_TABLE"
+        assert result["table"]["columns"][0]["name"] == "id"
+        # detailed keeps every field, including the false key flags concise drops.
+        assert result["table"]["columns"][0]["primary_key"] is True
+        assert "catalog_specific" in result["table"]
+
+    def test_table_kind_concise_prunes_empty_fields(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "fluid_build.cli.mcp._build_source_adapter",
+            lambda args, **_kwargs: _StubAdapter(),
+        )
+        monkeypatch.setattr(
+            "fluid_build.cli.mcp.write_audit_event", lambda *a, **kw: tmp_path / "x"
+        )
+        result = _call_tool(
+            "source_catalog",
+            {
+                "kind": "table",
                 "source": "stub",
                 "credentials": {"credential_id": "stub-prod"},
                 "fqn": "DB.SCH.MY_TABLE",
             },
             read_only=True,
         )
-        assert result["fqn"] == "DB.SCH.MY_TABLE"
-        assert result["columns"][0]["name"] == "id"
+        table = result["table"]
+        assert result["kind"] == "table"
+        assert table["fqn"] == "DB.SCH.MY_TABLE"
+        assert table["columns"][0]["name"] == "id"
+        assert "catalog_specific" not in table
+        assert "owner" not in table  # None dropped
 
-    def test_inspect_source_table_requires_fqn(self, monkeypatch, tmp_path):
+    def test_table_kind_requires_fqn(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             "fluid_build.cli.mcp._build_source_adapter",
             lambda args, **_kwargs: _StubAdapter(),
@@ -303,14 +316,47 @@ class TestDispatchSmoke:
         monkeypatch.setattr(
             "fluid_build.cli.mcp.write_audit_event", lambda *a, **kw: tmp_path / "x"
         )
-        with pytest.raises(RuntimeError, match="requires 'fqn'"):
+        with pytest.raises(McpToolUsageError, match="source_catalog kind=table needs fqn"):
             _call_tool(
-                "inspect_source_table",
-                {"source": "stub", "credentials": {"credential_id": "x"}},
+                "source_catalog",
+                {"kind": "table", "source": "stub", "credentials": {"credential_id": "x"}},
                 read_only=True,
             )
 
-    def test_list_source_lineage_returns_typed_chain(self, monkeypatch, tmp_path):
+    def test_lineage_kind_requires_fqn(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "fluid_build.cli.mcp._build_source_adapter",
+            lambda args, **_kwargs: _StubAdapter(),
+        )
+        with pytest.raises(McpToolUsageError, match="source_catalog kind=lineage needs fqn"):
+            _call_tool(
+                "source_catalog",
+                {"kind": "lineage", "source": "stub", "credentials": {"credential_id": "x"}},
+                read_only=True,
+            )
+
+    @pytest.mark.parametrize("kind", ["tables", "table", "lineage", "glossary"])
+    def test_every_kind_but_adapters_refuses_missing_credentials(self, kind, monkeypatch):
+        """A missing ``credentials`` (or ``source``) is refused at dispatch with a
+        usage error, before any adapter is built."""
+
+        def _must_not_build(args, **_kwargs):
+            raise AssertionError("adapter built before the arguments were checked")
+
+        monkeypatch.setattr("fluid_build.cli.mcp._build_source_adapter", _must_not_build)
+        base: Dict[str, Any] = {"kind": kind, "fqn": "DB.SCH.X"}
+        with pytest.raises(McpToolUsageError, match=f"source_catalog kind={kind} needs"):
+            _call_tool("source_catalog", {**base, "source": "stub"}, read_only=True)
+        with pytest.raises(McpToolUsageError, match=f"source_catalog kind={kind} needs"):
+            _call_tool(
+                "source_catalog", {**base, "credentials": {"credential_id": "x"}}, read_only=True
+            )
+
+    def test_unknown_kind_is_refused(self):
+        with pytest.raises(McpToolUsageError, match="kind must be one of"):
+            _call_tool("source_catalog", {"kind": "tablez"}, read_only=True)
+
+    def test_lineage_kind_returns_typed_chain(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             "fluid_build.cli.mcp._build_source_adapter",
             lambda args, **_kwargs: _StubAdapter(),
@@ -319,19 +365,34 @@ class TestDispatchSmoke:
             "fluid_build.cli.mcp.write_audit_event", lambda *a, **kw: tmp_path / "x"
         )
         result = _call_tool(
-            "list_source_lineage",
+            "source_catalog",
             {
+                "kind": "lineage",
+                "source": "stub",
+                "credentials": {"credential_id": "stub-prod"},
+                "fqn": "DB.SCH.X",
+                "response_format": "detailed",
+            },
+            read_only=True,
+        )
+        assert result["kind"] == "lineage"
+        lineage = result["lineage"]
+        assert len(lineage["upstream"]) == 1
+        assert lineage["upstream"][0]["fqn"] == "raw.x.y"
+        assert lineage["downstream"] == []
+        concise = _call_tool(
+            "source_catalog",
+            {
+                "kind": "lineage",
                 "source": "stub",
                 "credentials": {"credential_id": "stub-prod"},
                 "fqn": "DB.SCH.X",
             },
             read_only=True,
         )
-        assert len(result["upstream"]) == 1
-        assert result["upstream"][0]["fqn"] == "raw.x.y"
-        assert result["downstream"] == []
+        assert concise["lineage"] == {"upstream": ["raw.x.y"], "downstream": []}
 
-    def test_list_source_glossary_returns_terms(self, monkeypatch, tmp_path):
+    def test_glossary_kind_returns_terms(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             "fluid_build.cli.mcp._build_source_adapter",
             lambda args, **_kwargs: _StubAdapter(),
@@ -340,14 +401,16 @@ class TestDispatchSmoke:
             "fluid_build.cli.mcp.write_audit_event", lambda *a, **kw: tmp_path / "x"
         )
         result = _call_tool(
-            "list_source_glossary",
+            "source_catalog",
             {
+                "kind": "glossary",
                 "source": "stub",
                 "credentials": {"credential_id": "stub-prod"},
                 "scope": {"database": "DB", "schema_name": "SCH"},
             },
             read_only=True,
         )
+        assert result["kind"] == "glossary"
         assert len(result["terms"]) == 1
         assert result["terms"][0]["term"] == "Order"
 

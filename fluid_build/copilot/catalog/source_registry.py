@@ -214,7 +214,7 @@ def is_source_adapter_blocked(name: str) -> bool:
 
 
 def source_adapter_inventory() -> List[Dict[str, str]]:
-    """Inventory for the ``list_source_adapters`` MCP tool: one dict per source
+    """Inventory of the source adapters: one dict per source
     with ``name`` / ``kind`` / ``status`` / ``origin``.
 
     ``status`` reports the allow/block policy, so a caller is never offered a

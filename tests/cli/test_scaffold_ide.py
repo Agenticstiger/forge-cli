@@ -183,7 +183,15 @@ def test_mcp_config_shape(tmp_path: Path, target: str):
     auto = set(entry["autoApprove"])
     assert "read_logical_model" in auto
     assert "validate_contract" in auto
-    assert "list_source_tables" in auto
+    assert "source_catalog" in auto
+    for retired in (
+        "list_source_adapters",
+        "list_source_tables",
+        "inspect_source_table",
+        "list_source_lineage",
+        "list_source_glossary",
+    ):
+        assert retired not in auto
     # Mutating tools must require confirmation — never auto-approved.
     assert "update_entity" not in auto
     assert "regenerate_physical" not in auto
@@ -863,9 +871,7 @@ def test_mcp_handshake_lives(tmp_path: Path, target: str):
         expected_subset = {
             "read_logical_model",
             "validate_contract",
-            "list_source_adapters",
-            "list_source_tables",
-            "inspect_source_table",
+            "source_catalog",
         }
         missing = expected_subset - names
         assert not missing, f"{target}: missing tools {missing}; got {names}"

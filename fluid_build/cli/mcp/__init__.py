@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-MCP stdio server for staged forge model operations.
+MCP server for staged forge model operations.
 
-The server exposes 11 tools over MCP stdio and applies a four-layer
-access-control model before every ``tools/call``:
+The server exposes 7 tools, over MCP stdio or Streamable HTTP
+(``--transport http``), and applies a four-layer access-control model
+before every ``tools/call``:
 
 1. **Tool allow/deny list** — only the tools explicitly permitted by
    the active :class:`McpPolicy` are callable. Denied tools are also
@@ -31,8 +32,9 @@ Package structure (split from monolithic ``mcp.py`` per issue #11):
 
 * ``models``   — ToolCapability registry, Pydantic argument envelopes, constants.
 * ``policy``   — McpPolicy dataclass, permission gating, policy builder.
-* ``server``  — FastMCP app and 14 async tool registrations.
+* ``server``  — FastMCP app and 7 async tool registrations.
 * ``dispatch`` — sync ``_call_tool`` and all dispatch helpers.
+* ``artifacts`` — results too large to send inline, served as resources.
 * ``cli``     — argparse ``run()`` + friendly guide.
 
 ---
@@ -96,13 +98,9 @@ if TYPE_CHECKING:  # pragma: no cover — type-checkers only; never at runtime
         _mcp_app,
         add_relationship,
         diff_models,
-        inspect_source_table,
-        list_source_adapters,
-        list_source_glossary,
-        list_source_lineage,
-        list_source_tables,
         read_logical_model,
         regenerate_physical,
+        source_catalog,
         update_entity,
         validate_contract,
     )
@@ -293,11 +291,7 @@ _LAZY_EXPORTS = {
     "regenerate_physical": "server",
     "validate_contract": "server",
     "diff_models": "server",
-    "list_source_adapters": "server",
-    "list_source_tables": "server",
-    "inspect_source_table": "server",
-    "list_source_lineage": "server",
-    "list_source_glossary": "server",
+    "source_catalog": "server",
 }
 
 
@@ -353,11 +347,7 @@ __all__ = [
     "regenerate_physical",
     "validate_contract",
     "diff_models",
-    "list_source_adapters",
-    "list_source_tables",
-    "inspect_source_table",
-    "list_source_lineage",
-    "list_source_glossary",
+    "source_catalog",
     # Dispatch
     "_call_tool",
     "_list_source_adapters",

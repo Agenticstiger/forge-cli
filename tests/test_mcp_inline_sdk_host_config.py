@@ -143,12 +143,18 @@ def _args(source: str, inline: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
         "catalog": "main",
         "tables": ["orders"],
     }
-    return {"source": source, "credentials": {"inline": inline}, "scope": scope, **extra}
+    return {
+        "kind": "tables",
+        "source": source,
+        "credentials": {"inline": inline},
+        "scope": scope,
+        **extra,
+    }
 
 
 def _list_tables(arguments: Dict[str, Any], *, opted_in: bool = False) -> Any:
     return _call_tool(
-        "list_source_tables",
+        "source_catalog",
         arguments,
         read_only=True,
         allow_inline_credentials=True,
@@ -255,7 +261,7 @@ class TestUnityPatBlock:
         _needs("databricks.sdk")
         plant(monkeypatch, home)
         out = _list_tables(_args("unity", _unity_pat(workspace.url)))
-        assert out == {"tables": []}
+        assert out == {"kind": "tables", "tables": []}
         assert _host_material_seen(workspace) == []
         assert _token_posts(workspace) == []
         api = _api_authorizations(workspace)
@@ -285,7 +291,7 @@ class TestUnityPatBlock:
             "oauth_client_secret": _CALLER_CLIENT_VALUE,
         }
         out = _list_tables(_args("unity", block))
-        assert out == {"tables": []}
+        assert out == {"kind": "tables", "tables": []}
         assert _host_material_seen(workspace) == []
         assert _token_posts(workspace) == [_basic(_CALLER_CLIENT, _CALLER_CLIENT_VALUE)]
         assert set(_api_authorizations(workspace)) == {f"Bearer {_MINTED}"}
@@ -491,7 +497,7 @@ class TestGlueKeyBlock:
             access_key_id=_CALLER_KEY_ID,
             secret_access_key=_CALLER_KEY_VALUE,
         )
-        assert _list_tables(_args("glue", block)) == {"tables": []}
+        assert _list_tables(_args("glue", block)) == {"kind": "tables", "tables": []}
         assert aws_host.endpoint.api_calls == [_CALLER_KEY_ID]
         # The host's session token never rides along with the caller's keys.
         assert aws_host.endpoint.session_tokens == [None]
@@ -573,7 +579,7 @@ class TestDataMeshManagerBlock:
         out = _list_tables(
             _args("datamesh_manager", {"server": endpoint.url, "api_key": _CALLER_TOKEN})
         )
-        assert out == {"tables": []}
+        assert out == {"kind": "tables", "tables": []}
         assert endpoint.authorizations == [f"Bearer {_CALLER_TOKEN}"]
 
 
@@ -666,7 +672,7 @@ def _stdio_run(server_flags: List[str], root: Path) -> StdioRun:
                         for case, arguments in cases.items():
                             workspace.clear()
                             sts.clear()
-                            result = await client.call_tool("list_source_tables", arguments)
+                            result = await client.call_tool("source_catalog", arguments)
                             seen[case] = (
                                 result,
                                 list(workspace.requests),

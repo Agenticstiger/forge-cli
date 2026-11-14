@@ -18,7 +18,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from fluid_build.cli.mcp.models import _CATALOG_SOURCE_LIST
+from fluid_build.cli.mcp.models import (
+    _CATALOG_SOURCE_LIST,
+    RESPONSE_FORMATS,
+    SOURCE_CATALOG_KINDS,
+    SOURCE_CATALOG_TOOL,
+)
 from fluid_build.copilot.store.audit_trail import write_audit_event
 from fluid_build.copilot.store.history import archive_snapshot
 from fluid_build.forge_datamodel.emit.fluid_contract import build_contract_from_logical
@@ -230,61 +235,8 @@ def _call_tool(
         )
     if name == "diff_models":
         return diff_logical_models(Path(arguments["old"]), Path(arguments["new"]))
-    # ---------------------------------------------------------------
-    # V1.5 — metadata source-catalog tools.
-    # ---------------------------------------------------------------
-    if name == "list_source_adapters":
-        return {
-            "adapters": _list_source_adapters(),
-        }
-
-    if name == "list_source_tables":
-        adapter = build_adapter(arguments)
-        scope = _scope_from_args(arguments)
-        tables = adapter.list_tables(scope)
-        _write_audit_event(
-            "mcp_list_source_tables",
-            payload={
-                **adapter.audit_context(),
-                "scope": scope.model_dump(mode="json", by_alias=True),
-                "result_count": len(tables),
-            },
-        )
-        return {"tables": [t.model_dump(mode="json", by_alias=True) for t in tables]}
-
-    if name == "inspect_source_table":
-        adapter = build_adapter(arguments)
-        fqn = str(arguments.get("fqn") or "")
-        if not fqn:
-            raise RuntimeError("inspect_source_table requires 'fqn'")
-        table = adapter.get_table(fqn)
-        _write_audit_event(
-            "mcp_inspect_source_table",
-            payload={**adapter.audit_context(), "fqn": fqn},
-        )
-        return table.model_dump(mode="json", by_alias=True)
-
-    if name == "list_source_lineage":
-        adapter = build_adapter(arguments)
-        fqn = str(arguments.get("fqn") or "")
-        if not fqn:
-            raise RuntimeError("list_source_lineage requires 'fqn'")
-        lineage = adapter.get_lineage(fqn)
-        _write_audit_event(
-            "mcp_list_source_lineage",
-            payload={**adapter.audit_context(), "fqn": fqn},
-        )
-        return lineage.model_dump(mode="json", by_alias=True)
-
-    if name == "list_source_glossary":
-        adapter = build_adapter(arguments)
-        scope = _scope_from_args(arguments)
-        terms = adapter.list_glossary_terms(scope)
-        _write_audit_event(
-            "mcp_list_source_glossary",
-            payload={**adapter.audit_context()},
-        )
-        return {"terms": [t.model_dump(mode="json", by_alias=True) for t in terms]}
+    if name == SOURCE_CATALOG_TOOL:
+        return _source_catalog(arguments, build_adapter)
 
     raise RuntimeError(f"Unknown tool {name}")
 
@@ -352,8 +304,9 @@ def _readable_ref_root(path: Path, readable: Tuple[Path, ...]) -> Optional[Path]
 def _list_source_adapters() -> List[Dict[str, Any]]:
     """Enumerate the source-catalog adapters the catalog tools can reach.
 
-    The list is static: it reflects what code is shipped, not what the operator has
-    configured (``fluid ai status`` lists configured credentials). Each adapter lives in
+    ``source_catalog`` with ``kind=adapters``. The list is static: it reflects what code is
+    shipped, not what the operator has configured (``fluid ai status`` lists configured
+    credentials). Each adapter lives in
     ``fluid_build.copilot.catalog.<name>`` and follows the patterns in
     ``catalog._patterns``. JDBC databases are not listed: no MCP tool reads them since
     ``forge_from_source`` was dropped (2026-11-13); ``fluid forge data-model from-source
@@ -369,10 +322,9 @@ def _list_source_adapters() -> List[Dict[str, Any]]:
 # class reference here. New adapters land by adding one entry.
 #
 # JDBC sources (postgres / postgresql / mysql / sqlite) are NOT in this
-# table. ``_build_source_adapter`` only handles catalog sources; the
-# catalog-only tools (list_source_tables, inspect_source_table,
-# list_source_lineage, list_source_glossary) reject JDBC sources via
-# the ``Literal[...]`` enum on their Annotated signatures.
+# table. ``_build_source_adapter`` only handles catalog sources;
+# ``source_catalog`` rejects JDBC sources via the ``Literal[...]`` enum on
+# its Annotated signature.
 _SOURCE_ADAPTERS: Dict[str, str] = {
     "snowflake": "fluid_build.copilot.catalog.snowflake:SnowflakeCatalogAdapter",
     "unity": "fluid_build.copilot.catalog.unity:UnityCatalogAdapter",
@@ -406,6 +358,150 @@ class McpToolRefusal(RuntimeError):
     ``RuntimeError`` reaches the client only as "Error executing tool <name>",
     which would hide which server flag the operator needs.
     """
+
+
+class McpToolUsageError(McpToolRefusal):
+    """A call the client can fix by changing its arguments (a missing ``fqn``,
+    an unknown catalog). Surfaced as ``ToolError`` like any refusal: the MCP
+    spec wants an argument error returned as a tool result the model can act
+    on, and its message names the argument and an example value."""
+
+
+_MISSING_ARGUMENT_HINTS: Dict[str, str] = {
+    "source": "source (one of " + ", ".join(_CATALOG_SOURCE_LIST) + ")",
+    "credentials": (
+        "credentials.credential_id (a name set up with "
+        "`fluid ai setup --source <catalog> --name <name>`)"
+    ),
+    "fqn": (
+        "fqn, the table's fully qualified name (DB.SCHEMA.TABLE on Snowflake, "
+        "project.dataset.table on BigQuery)"
+    ),
+}
+
+#: A column's key flags. ``concise`` drops them when false, which is their
+#: default, so an absent flag reads as "not a key".
+_KEY_FLAGS = ("primary_key", "partition_key", "clustering_key")
+
+
+def _source_catalog(arguments: Dict[str, Any], build_adapter: Any) -> Dict[str, Any]:
+    """Run one ``source_catalog`` call; ``kind`` picks what it reads.
+
+    Each kind's arguments are checked before any credential is resolved, so a
+    call missing one costs no catalog round trip. Every result names its
+    ``kind``; :data:`_SOURCE_READERS` does the reading.
+    """
+    kind = arguments.get("kind")
+    if kind not in SOURCE_CATALOG_KINDS:
+        raise McpToolUsageError(
+            f"source_catalog: kind must be one of {', '.join(SOURCE_CATALOG_KINDS)} "
+            f"(got {kind!r})."
+        )
+    response_format = arguments.get("response_format") or "concise"
+    if response_format not in RESPONSE_FORMATS:
+        raise McpToolUsageError(
+            f"source_catalog: response_format must be one of {', '.join(RESPONSE_FORMATS)} "
+            f"(got {response_format!r})."
+        )
+    detailed = response_format == "detailed"
+    if kind == "adapters":
+        return {"kind": kind, "adapters": _list_source_adapters()}
+
+    fqn = str(arguments.get("fqn") or "").strip()
+    missing = [key for key in ("source", "credentials") if not arguments.get(key)]
+    if kind in ("table", "lineage") and not fqn:
+        missing.append("fqn")
+    if missing:
+        needs = "; ".join(_MISSING_ARGUMENT_HINTS[key] for key in missing)
+        raise McpToolUsageError(f"source_catalog kind={kind} needs {needs}.")
+
+    adapter = build_adapter(arguments)
+    return _SOURCE_READERS[kind](adapter, arguments, fqn, detailed)
+
+
+def _read_tables(adapter: Any, arguments: Dict[str, Any], _fqn: str, detailed: bool) -> Any:
+    scope = _scope_from_args(arguments)
+    tables = adapter.list_tables(scope)
+    _write_audit_event(
+        "mcp_list_source_tables",
+        payload={
+            **adapter.audit_context(),
+            "scope": scope.model_dump(mode="json", by_alias=True),
+            "result_count": len(tables),
+        },
+    )
+    return {"kind": "tables", "tables": [_table_summary(t, detailed) for t in tables]}
+
+
+def _read_table(adapter: Any, _arguments: Dict[str, Any], fqn: str, detailed: bool) -> Any:
+    table = adapter.get_table(fqn)
+    _write_audit_event("mcp_inspect_source_table", payload={**adapter.audit_context(), "fqn": fqn})
+    return {"kind": "table", "table": _dump_model(table, detailed)}
+
+
+def _read_lineage(adapter: Any, _arguments: Dict[str, Any], fqn: str, detailed: bool) -> Any:
+    lineage = adapter.get_lineage(fqn)
+    _write_audit_event("mcp_list_source_lineage", payload={**adapter.audit_context(), "fqn": fqn})
+    if detailed:
+        return {"kind": "lineage", "lineage": lineage.model_dump(mode="json", by_alias=True)}
+    return {
+        "kind": "lineage",
+        "lineage": {
+            "upstream": [ref.fqn for ref in lineage.upstream],
+            "downstream": [ref.fqn for ref in lineage.downstream],
+        },
+    }
+
+
+def _read_glossary(adapter: Any, arguments: Dict[str, Any], _fqn: str, detailed: bool) -> Any:
+    terms = adapter.list_glossary_terms(_scope_from_args(arguments))
+    _write_audit_event("mcp_list_source_glossary", payload={**adapter.audit_context()})
+    return {"kind": "glossary", "terms": [_dump_model(term, detailed) for term in terms]}
+
+
+#: What each ``kind`` but ``adapters`` reads, and the audit event it writes
+#: (the names the five former tools wrote).
+_SOURCE_READERS = {
+    "tables": _read_tables,
+    "table": _read_table,
+    "lineage": _read_lineage,
+    "glossary": _read_glossary,
+}
+
+
+def _dump_model(model: Any, detailed: bool) -> Any:
+    """``detailed``: every field. ``concise``: the same, pruned (:func:`_prune`)."""
+    data = model.model_dump(mode="json", by_alias=True)
+    return data if detailed else _prune(data)
+
+
+def _table_summary(table: Any, detailed: bool) -> Dict[str, Any]:
+    """One row of a ``tables`` listing: ``fqn``, ``name`` and ``description``
+    when concise, every field when detailed."""
+    if detailed:
+        return table.model_dump(mode="json", by_alias=True)
+    return _prune({"fqn": table.fqn, "name": table.name, "description": table.description})
+
+
+def _prune(value: Any) -> Any:
+    """Drop what a concise result does not need: vendor payloads
+    (``catalog_specific``), ``None``, empty strings and containers, and false
+    key flags. Booleans that carry meaning when false (``nullable``) stay."""
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "catalog_specific":
+                continue
+            item = _prune(item)
+            if item is None or item == "" or item == [] or item == {}:
+                continue
+            if key in _KEY_FLAGS and item is False:
+                continue
+            out[key] = item
+        return out
+    if isinstance(value, list):
+        return [_prune(item) for item in value]
+    return value
 
 
 def _metadata_service_opt_in(arguments: Dict[str, Any], *, allow_metadata_service: bool) -> bool:
@@ -546,7 +642,7 @@ def _build_source_adapter_impl(
     source = str(arguments.get("source") or "").lower().strip()
     if not source:
         supported = ", ".join(sorted(_SOURCE_ADAPTERS))
-        raise RuntimeError(f"Source-catalog tools require 'source' (one of: {supported}).")
+        raise McpToolUsageError(f"source_catalog needs 'source' (one of: {supported}).")
     credentials_arg = arguments.get("credentials") or {}
     credential_id = credentials_arg.get("credential_id")
     inline = credentials_arg.get("inline")
@@ -556,7 +652,7 @@ def _build_source_adapter_impl(
     # are looked up via ``credential_id`` against the local
     # keyring + sources.yaml, never sent over the wire.
     if inline and not allow_inline_credentials:
-        raise RuntimeError(
+        raise McpToolRefusal(
             "Source-catalog tools refused inline credentials over MCP. "
             "Pass credentials.credential_id (a name configured via "
             "`fluid ai setup --source <catalog> --name <name>`) instead, or restart the "
@@ -567,14 +663,16 @@ def _build_source_adapter_impl(
         arguments, allow_metadata_service=allow_metadata_service
     )
     if not credential_id and not inline:
-        raise RuntimeError(
+        raise McpToolUsageError(
             "Source-catalog tools require credentials.credential_id "
             "(or credentials.inline for direct CLI callers when the "
             "server is started with --allow-inline-credentials)."
         )
     if source not in _SOURCE_ADAPTERS:
         supported = ", ".join(sorted(_SOURCE_ADAPTERS))
-        raise RuntimeError(f"Unknown source-catalog adapter: {source!r}. Supported: {supported}.")
+        raise McpToolUsageError(
+            f"Unknown source-catalog adapter: {source!r}. Supported: {supported}."
+        )
     resolver = CredentialResolver(allow_metadata_service=use_metadata_service)
     if inline and not _operator_allows_metadata_service(allow_metadata_service):
         _gate_inline_host_identity(resolver)

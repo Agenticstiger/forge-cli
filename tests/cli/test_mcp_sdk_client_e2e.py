@@ -17,7 +17,7 @@ will see identical behaviour.
 
 Two shapes verified:
 
-1. SDK↔SDK initialize + list_tools: returns the 11 forge tools.
+1. SDK↔SDK initialize + list_tools: returns the 7 forge tools.
 2. SDK↔SDK call_tool against a read-only tool (``validate_contract`` on
    the hello-world example) — returns a structured score.
 """
@@ -57,9 +57,9 @@ def _server_params(cwd: Path) -> StdioServerParameters:
 
 
 @pytest.mark.slow
-def test_sdk_client_lists_all_14_forge_tools(tmp_path: Path):
+def test_sdk_client_lists_all_7_forge_tools(tmp_path: Path):
     """Both ends use the MCP SDK. After ``ClientSession.initialize()`` the
-    server advertises all 14 forge tools in ``list_tools``.
+    server advertises all 7 forge tools in ``list_tools``.
     """
 
     async def _run() -> list[str]:
@@ -77,14 +77,11 @@ def test_sdk_client_lists_all_14_forge_tools(tmp_path: Path):
         "regenerate_physical",
         "validate_contract",
         "diff_models",
-        "list_source_adapters",
-        "list_source_tables",
-        "inspect_source_table",
-        "list_source_lineage",
-        "list_source_glossary",
+        "source_catalog",
     }
     missing = expected - set(names)
     assert not missing, f"missing tools: {missing}; got {names}"
+    assert set(names) == expected, f"unexpected tools: {set(names) - expected}"
 
 
 # ---------------------------------------------------------------------------

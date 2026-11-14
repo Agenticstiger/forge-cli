@@ -31,13 +31,10 @@ from tests._infrastructure.aws_endpoint_logger import AwsEndpointLogger, point_b
 
 _ENV = "FLUID_ALLOW_METADATA_SERVICE"
 
-# Every MCP tool whose arguments carry ``allow_metadata_service``.
-_CATALOG_TOOLS = (
-    "list_source_tables",
-    "inspect_source_table",
-    "list_source_lineage",
-    "list_source_glossary",
-)
+# Every ``source_catalog`` kind that reads a catalog: the ones whose arguments
+# carry ``allow_metadata_service`` to a credential resolver (``adapters`` builds
+# no adapter).
+_CATALOG_KINDS = ("tables", "table", "lineage", "glossary")
 
 
 class _ResolverCaptured(Exception):
@@ -76,6 +73,7 @@ def captured_resolvers(monkeypatch) -> List[Any]:
 
 def _args(**extra: Any) -> Dict[str, Any]:
     base: Dict[str, Any] = {
+        "kind": "tables",
         "source": "snowflake",
         "credentials": {"credential_id": "test-cred"},
         "scope": {"database": "DB", "schema_name": "SCH"},
@@ -129,18 +127,20 @@ class TestAdapterBuilderGate:
 
 
 class TestCallToolGate:
-    @pytest.mark.parametrize("tool", _CATALOG_TOOLS)
-    def test_every_catalog_tool_refuses_without_opt_in(self, tool, captured_resolvers):
+    @pytest.mark.parametrize("kind", _CATALOG_KINDS)
+    def test_every_catalog_kind_refuses_without_opt_in(self, kind, captured_resolvers):
         with pytest.raises(RuntimeError, match="--allow-metadata-service"):
-            _call_tool(tool, _args(allow_metadata_service=True), read_only=False)
+            _call_tool(
+                "source_catalog", _args(kind=kind, allow_metadata_service=True), read_only=False
+            )
         assert captured_resolvers == []
 
-    @pytest.mark.parametrize("tool", _CATALOG_TOOLS)
-    def test_every_catalog_tool_threads_the_operator_flag(self, tool, captured_resolvers):
+    @pytest.mark.parametrize("kind", _CATALOG_KINDS)
+    def test_every_catalog_kind_threads_the_operator_flag(self, kind, captured_resolvers):
         with pytest.raises(_ResolverCaptured):
             _call_tool(
-                tool,
-                _args(allow_metadata_service=True),
+                "source_catalog",
+                _args(kind=kind, allow_metadata_service=True),
                 read_only=False,
                 allow_metadata_service=True,
             )
@@ -203,7 +203,7 @@ class TestServerWiring:
         previous = policy_mod._current_policy
         policy_mod._set_policy(McpPolicy(allow_metadata_service=operator_allows))
         try:
-            call = _dispatch_sync_tool("list_source_tables", _args(allow_metadata_service=True))
+            call = _dispatch_sync_tool("source_catalog", _args(allow_metadata_service=True))
             if operator_allows:
                 with pytest.raises(_ResolverCaptured):
                     asyncio.run(call)
@@ -220,24 +220,24 @@ class TestServerWiring:
 
 
 class TestSchemaIsHonest:
-    @pytest.mark.parametrize("tool", _CATALOG_TOOLS)
-    def test_static_schema_names_the_server_flag(self, tool):
+    def test_static_schema_names_the_server_flag(self):
         from fluid_build.cli.mcp import TOOL_CAPABILITIES
 
-        prop = TOOL_CAPABILITIES[tool].input_schema["properties"]["allow_metadata_service"]
+        prop = TOOL_CAPABILITIES["source_catalog"].input_schema["properties"][
+            "allow_metadata_service"
+        ]
         assert "--allow-metadata-service" in prop["description"]
 
-    @pytest.mark.parametrize("tool", _CATALOG_TOOLS)
-    def test_advertised_schema_names_the_server_flag(self, tool):
+    def test_advertised_schema_names_the_server_flag(self):
         """What a live client sees in ``tools/list`` (the FastMCP-derived schema)."""
         from fluid_build._mcp_compat import attr as _mcp_attr
         from fluid_build.cli.mcp import _get_mcp_app
 
         async def _go() -> Dict[str, Any]:
             for advertised in await _get_mcp_app().list_tools():
-                if advertised.name == tool:
+                if advertised.name == "source_catalog":
                     return _mcp_attr(advertised, "input_schema", "inputSchema")  # type: ignore[no-any-return]
-            raise AssertionError(f"{tool!r} not advertised")
+            raise AssertionError("'source_catalog' not advertised")
 
         prop = asyncio.run(_go())["properties"]["allow_metadata_service"]
         assert "--allow-metadata-service" in prop["description"]
@@ -262,6 +262,7 @@ def metadata_endpoint(tmp_path, monkeypatch):
 
 def _glue_args(**extra: Any) -> Dict[str, Any]:
     base: Dict[str, Any] = {
+        "kind": "tables",
         "source": "glue",
         "credentials": {"credential_id": "not-saved-on-this-host"},
         "scope": {"database": "analytics"},
@@ -277,7 +278,7 @@ class TestHostIdentityAtTheSink:
         from fluid_build.copilot.catalog.credentials import CredentialNotFoundError
 
         with pytest.raises(CredentialNotFoundError, match="not-saved-on-this-host"):
-            _call_tool("list_source_tables", _glue_args(), read_only=True)
+            _call_tool("source_catalog", _glue_args(), read_only=True)
         assert metadata_endpoint.requests == []
 
     def test_operator_flag_alone_does_not_reach_it(self, metadata_endpoint):
@@ -285,16 +286,14 @@ class TestHostIdentityAtTheSink:
         from fluid_build.copilot.catalog.credentials import CredentialNotFoundError
 
         with pytest.raises(CredentialNotFoundError):
-            _call_tool(
-                "list_source_tables", _glue_args(), read_only=True, allow_metadata_service=True
-            )
+            _call_tool("source_catalog", _glue_args(), read_only=True, allow_metadata_service=True)
         assert metadata_endpoint.requests == []
 
     def test_operator_opt_in_plus_request_reaches_it(self, metadata_endpoint):
         """Positive control: the logger does see the SDK when both sides opt in."""
         with pytest.raises(Exception):
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _glue_args(allow_metadata_service=True),
                 read_only=True,
                 allow_metadata_service=True,
@@ -304,6 +303,7 @@ class TestHostIdentityAtTheSink:
 
 def _inline(source: str, inline: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
     base: Dict[str, Any] = {
+        "kind": "tables",
         "source": source,
         "credentials": {"inline": inline},
         "scope": {"database": "analytics"},
@@ -523,7 +523,7 @@ class TestInlineCredentialsCannotSelectHostIdentity:
         previous = policy_mod._current_policy
         policy_mod._set_policy(McpPolicy(allow_inline_credentials=True))
         try:
-            call = _dispatch_sync_tool("list_source_tables", _inline("bigquery", {"project": "p"}))
+            call = _dispatch_sync_tool("source_catalog", _inline("bigquery", {"project": "p"}))
             with pytest.raises(get_tool_error(), match="--allow-metadata-service"):
                 asyncio.run(call)
         finally:
@@ -537,7 +537,7 @@ class TestInlineCredentialsCannotSelectHostIdentity:
     def test_no_metadata_request_at_the_sink(self, metadata_endpoint, inline):
         with pytest.raises(RuntimeError, match="--allow-metadata-service"):
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _inline("glue", inline),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -548,7 +548,7 @@ class TestInlineCredentialsCannotSelectHostIdentity:
         """Positive control for the test above: the logger sees the SDK once allowed."""
         with pytest.raises(Exception):
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _inline("glue", {"region": "us-east-1"}),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -556,12 +556,12 @@ class TestInlineCredentialsCannotSelectHostIdentity:
             )
         assert metadata_endpoint.requests, "boto3 never consulted the metadata endpoint"
 
-    @pytest.mark.parametrize("tool", _CATALOG_TOOLS)
-    def test_every_catalog_tool_applies_the_inline_gate(self, tool, tmp_path):
+    @pytest.mark.parametrize("kind", _CATALOG_KINDS)
+    def test_every_catalog_kind_applies_the_inline_gate(self, kind, tmp_path):
         args = _inline("dataplex", {"project": "proj", "location": "eu"})
-        args.update(fqn="proj.ds.t", output_path=str(tmp_path / "out.fluid.yaml"))
+        args.update(kind=kind, fqn="proj.ds.t", output_path=str(tmp_path / "out.fluid.yaml"))
         with pytest.raises(RuntimeError, match="--allow-metadata-service"):
-            _call_tool(tool, args, read_only=False, allow_inline_credentials=True)
+            _call_tool("source_catalog", args, read_only=False, allow_inline_credentials=True)
 
 
 @pytest.fixture
@@ -604,7 +604,7 @@ class TestInlineNamedProfileIsHostIdentity:
     def test_no_metadata_request_at_the_sink(self, profile_metadata_endpoint, inline):
         with pytest.raises(RuntimeError, match="--allow-metadata-service"):
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _inline("glue", inline),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -615,7 +615,7 @@ class TestInlineNamedProfileIsHostIdentity:
         """Positive control: with the operator's opt-in the profile does reach it."""
         with pytest.raises(Exception):
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _inline("glue", {"region": "us-east-1", "profile_name": "default"}),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -625,7 +625,7 @@ class TestInlineNamedProfileIsHostIdentity:
 
 
 def _stdio_list_tables(server_flags: List[str], inline: Dict[str, Any], cwd: Any) -> Any:
-    """Call ``list_source_tables`` on a real ``fluid mcp serve`` over stdio."""
+    """Call ``source_catalog kind=tables`` on a real ``fluid mcp serve`` over stdio."""
     import os
     import sys
 
@@ -644,8 +644,9 @@ def _stdio_list_tables(server_flags: List[str], inline: Dict[str, Any], cwd: Any
             async with ClientSession(read, write) as client:
                 await client.initialize()
                 return await client.call_tool(
-                    "list_source_tables",
+                    "source_catalog",
                     {
+                        "kind": "tables",
                         "source": "glue",
                         "credentials": {"inline": inline},
                         # Name a table: a scope that omits ``tables`` fails
@@ -838,7 +839,7 @@ class TestBlankCredentialMaterialIsNotTheCallers:
     def test_no_request_at_the_sink(self, metadata_endpoint, keys):
         with pytest.raises(RuntimeError, match="--allow-metadata-service"):
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _inline("glue", _glue_key_block(keys)),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -857,7 +858,7 @@ class TestBlankCredentialMaterialIsNotTheCallers:
 
         with pytest.raises(CredentialNotFoundError):
             _call_tool(
-                "list_source_tables",
+                "source_catalog",
                 _inline("glue", _glue_key_block(keys)),
                 read_only=True,
                 allow_inline_credentials=True,
@@ -866,52 +867,52 @@ class TestBlankCredentialMaterialIsNotTheCallers:
         assert metadata_endpoint.requests == []
         assert metadata_endpoint.api_calls == []
 
-    @pytest.mark.parametrize("tool", _CATALOG_TOOLS)
-    def test_every_catalog_tool_refuses_blank_keys(self, metadata_endpoint, tool, tmp_path):
+    @pytest.mark.parametrize("kind", _CATALOG_KINDS)
+    def test_every_catalog_kind_refuses_blank_keys(self, metadata_endpoint, kind, tmp_path):
         args = _inline("glue", _glue_key_block({"access_key_id": "", "secret_access_key": ""}))
-        args.update(fqn="analytics.orders", output_path=str(tmp_path / "out.fluid.yaml"))
+        args.update(kind=kind, fqn="analytics.orders", output_path=str(tmp_path / "out.fluid.yaml"))
         with pytest.raises(RuntimeError, match="--allow-metadata-service"):
-            _call_tool(tool, args, read_only=False, allow_inline_credentials=True)
+            _call_tool("source_catalog", args, read_only=False, allow_inline_credentials=True)
         assert metadata_endpoint.requests == []
 
     def test_test_keys_sign_the_call_without_the_metadata_service(self, metadata_endpoint):
         """Positive control: the logger sees the SDK's call, signed with the caller's key."""
         out = _call_tool(
-            "list_source_tables",
+            "source_catalog",
             _inline("glue", _glue_key_block(_TEST_KEYS)),
             read_only=True,
             allow_inline_credentials=True,
         )
-        assert out == {"tables": []}
+        assert out == {"kind": "tables", "tables": []}
         assert metadata_endpoint.api_calls == [_TEST_KEY_ID]
         assert metadata_endpoint.requests == []
 
 
-def _glue_tool_call(tool: str, inline: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    arguments: Dict[str, Any] = {"source": "glue", "credentials": {"inline": inline}}
-    if tool in ("inspect_source_table", "list_source_lineage"):
+def _glue_tool_call(kind: str, inline: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    arguments: Dict[str, Any] = {"kind": kind, "source": "glue", "credentials": {"inline": inline}}
+    if kind in ("table", "lineage"):
         arguments["fqn"] = "analytics.orders"
     else:
         # Name a table: a scope that omits ``tables`` fails validation before
         # the adapter is built.
         arguments["scope"] = {"database": "analytics", "tables": ["orders"]}
-    return tool, arguments
+    return "source_catalog", arguments
 
 
 _EMPTY_KEYS = _glue_key_block({"access_key_id": "", "secret_access_key": ""})
 _STDIO_BLANK_CASES: Dict[str, Tuple[str, Dict[str, Any]]] = {
     **{
-        f"list-{param.id}": _glue_tool_call("list_source_tables", _glue_key_block(param.values[0]))
+        f"list-{param.id}": _glue_tool_call("tables", _glue_key_block(param.values[0]))
         for param in _BLANK_GLUE_KEYS
     },
-    "inspect-empty-keys": _glue_tool_call("inspect_source_table", _EMPTY_KEYS),
-    "lineage-empty-keys": _glue_tool_call("list_source_lineage", _EMPTY_KEYS),
-    "glossary-empty-keys": _glue_tool_call("list_source_glossary", _EMPTY_KEYS),
+    "inspect-empty-keys": _glue_tool_call("table", _EMPTY_KEYS),
+    "lineage-empty-keys": _glue_tool_call("lineage", _EMPTY_KEYS),
+    "glossary-empty-keys": _glue_tool_call("glossary", _EMPTY_KEYS),
 }
 _STDIO_CONTROL = "control-test-keys"
 _STDIO_CASES = {
     **_STDIO_BLANK_CASES,
-    _STDIO_CONTROL: _glue_tool_call("list_source_tables", _glue_key_block(_TEST_KEYS)),
+    _STDIO_CONTROL: _glue_tool_call("tables", _glue_key_block(_TEST_KEYS)),
 }
 
 # What one call produced: the tool result, then the metadata requests and the
