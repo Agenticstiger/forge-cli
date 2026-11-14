@@ -120,9 +120,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call that lacks what its kind needs (`fqn` for `table` and `lineage`, `scope` for `tables`,
   `source` and `credentials` for every kind but `adapters`) is refused before any credential is
   resolved, with the argument and an example. An adapter's own refusal (an unknown credential id,
-  a scope field its catalog needs, a missing grant) is passed on in the adapter's words, without
-  the driver's error text; a connection failure and a credential that fails validation stay in
-  the server log. On MCP SDK 2.x a client now reads these messages, and the adapter builder's, where
+  a scope field its catalog needs) is passed on in the adapter's words, without the driver's
+  error text; a connection failure, a permission denial (it quotes the catalog's own message)
+  and a credential that fails validation stay in the server log. On MCP SDK 2.x a client now reads these messages, and the adapter builder's, where
   it used to get "Error executing tool". The `tools/list` schemas shrink from 3,440 to 1,892
   tokens (tiktoken o200k_base, an offline proxy for a client's tokenizer): 15,464 to 8,364 bytes.
 - **`fluid mcp serve` stops on a tool name it does not know.** An unknown name in `--allow-tools`

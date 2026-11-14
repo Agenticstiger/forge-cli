@@ -184,8 +184,8 @@ def offload_if_large(result: Any, *, tool: str, hint: str = "") -> Any:
     if limit == 0 or not isinstance(result, dict):
         return result
     # Measured on the text the call would send: the SDK writes a dict result
-    # with pydantic_core, as JSON indented by 2 (Rust; json.dumps(indent=2) is
-    # ~80x slower on a 6.5 MB result). The kept copy is compact.
+    # with pydantic_core, as JSON indented by 2 (Rust, several times faster than
+    # json.dumps(indent=2) on a large result). The kept copy is compact.
     import pydantic_core
 
     sent = pydantic_core.to_json(result, fallback=str, indent=2)

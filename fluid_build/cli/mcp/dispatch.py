@@ -429,7 +429,7 @@ def _source_catalog(arguments: Dict[str, Any], build_adapter: Any) -> Dict[str, 
         needs = "; ".join(_MISSING_ARGUMENT_HINTS[key] for key in missing)
         raise McpToolUsageError(f"source_catalog kind={kind} needs {needs}.")
 
-    from fluid_build.copilot.catalog.base import CatalogConfigError, CatalogPermissionError
+    from fluid_build.copilot.catalog.base import CatalogConfigError
     from fluid_build.copilot.catalog.credentials import CredentialNotFoundError
 
     try:
@@ -438,11 +438,13 @@ def _source_catalog(arguments: Dict[str, Any], build_adapter: Any) -> Dict[str, 
         raise McpToolUsageError(_catalog_error_text(exc)) from exc
     try:
         return _SOURCE_READERS[kind](adapter, arguments, fqn, detailed)
-    except (CatalogConfigError, CatalogPermissionError) as exc:
+    except CatalogConfigError as exc:
         # The adapters' own refusals (a scope field the catalog needs, a missing
-        # grant) are written for the user. A CatalogConfigError raised while
-        # resolving credentials can quote a validation error and stays
-        # server-side, as does CatalogConnectionError, which carries the SDK's text.
+        # SDK extra, an identifier's shape) are written for the user. These stay
+        # server-side: a CatalogConfigError raised while resolving credentials
+        # (it can quote a validation error), a CatalogPermissionError (its message
+        # quotes the catalog's own denial: principals, account ids) and a
+        # CatalogConnectionError (the driver's text).
         raise McpToolUsageError(_catalog_error_text(exc)) from exc
 
 

@@ -230,7 +230,7 @@ def _offload_hint(name: str, arguments: Dict[str, Any]) -> str:
     if name != SOURCE_CATALOG_TOOL:
         return ""
     ways = []
-    if arguments.get("kind") == "tables":
+    if arguments.get("kind") == "tables" and not (arguments.get("scope") or {}).get("tables"):
         ways.append("name the tables you need in scope.tables")
     if arguments.get("response_format") == "detailed":
         ways.append("ask for response_format=concise")

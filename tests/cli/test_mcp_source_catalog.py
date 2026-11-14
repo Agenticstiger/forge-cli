@@ -690,17 +690,25 @@ def test_an_unknown_credential_id_is_passed_on(monkeypatch, tmp_path):
         _call(kind="tables", **_SNOWFLAKE, **_SCOPE)
 
 
-@pytest.mark.parametrize("phase", ["build", "read"])
+@pytest.mark.parametrize("phase", ["build", "read-connection", "read-permission"])
 def test_other_catalog_failures_stay_server_side(monkeypatch, tmp_path, phase):
     """A credential validation error can quote input values, and a connection
-    error carries the SDK's text: neither is turned into a client message."""
-    from fluid_build.copilot.catalog.base import CatalogConfigError, CatalogConnectionError
+    error or a permission denial carries the SDK's or the catalog's own text:
+    none is turned into a client message."""
+    from fluid_build.copilot.catalog.base import (
+        CatalogConfigError,
+        CatalogConnectionError,
+        CatalogPermissionError,
+    )
 
     if phase == "build":
         error = CatalogConfigError("Stored credentials for source 'x' failed validation: ...")
         _refusing_builder(monkeypatch, tmp_path, at_build=error)
-    else:
+    elif phase == "read-connection":
         error = CatalogConnectionError("Snowflake connection failed: driver text")
+        _refusing_builder(monkeypatch, tmp_path, at_read=error)
+    else:
+        error = CatalogPermissionError("Catalog denied a metadata read on X: arn:aws:iam::1:role/r")
         _refusing_builder(monkeypatch, tmp_path, at_read=error)
     with pytest.raises(type(error)) as exc:
         _call(kind="tables", **_SNOWFLAKE, **_SCOPE)
@@ -726,6 +734,7 @@ def test_other_catalog_failures_stay_server_side(monkeypatch, tmp_path, phase):
             "For less, ask for response_format=concise.",
         ),
         ({"kind": "lineage"}, ""),
+        ({"kind": "tables", "scope": {"tables": ["ORDERS"]}}, ""),
     ],
 )
 def test_the_offload_hint_fits_the_call(arguments, hint):
