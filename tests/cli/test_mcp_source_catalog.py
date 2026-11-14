@@ -82,6 +82,7 @@ class _StubAdapter(CatalogAdapter):
             name=fqn.rsplit(".", 1)[-1],
             description="",
             owner="data-team",
+            tags={"pii": "", "tier": "gold"},
             columns=[
                 CatalogColumn(name="id", data_type="NUMBER", nullable=False, primary_key=True),
                 CatalogColumn(
@@ -231,7 +232,7 @@ def test_concise_table_drops_vendor_payloads_empty_values_and_false_key_flags(bu
     table = _call(kind="table", fqn="DB.SCH.ORDERS", **_SNOWFLAKE)["table"]
     assert "catalog_specific" not in json.dumps(table)
     assert "description" not in table  # empty string
-    assert "tags" not in table  # empty dict
+    assert table["tags"] == {"pii": "", "tier": "gold"}  # a key-only tag is still a tag
     id_column, email_column = table["columns"]
     assert id_column["primary_key"] is True
     assert id_column["nullable"] is False  # a false flag that means something stays
@@ -361,7 +362,9 @@ def test_the_budget_counts_the_indented_text_the_call_would_send(store, monkeypa
     compact form fits can still be over the budget."""
     result = _large_result()
     compact = artifacts.estimate_tokens(json.dumps(result, separators=(",", ":")))
-    indented = artifacts.estimate_tokens(json.dumps(result, ensure_ascii=False, indent=2))
+    import pydantic_core
+
+    indented = -(-len(pydantic_core.to_json(result, indent=2)) // 4)
     assert compact < indented
     monkeypatch.setenv(artifacts.INLINE_TOKEN_LIMIT_ENV, str(compact))
     out = artifacts.offload_if_large(result, tool="source_catalog")
@@ -626,3 +629,140 @@ def test_over_http_an_offloaded_result_names_no_file(tmp_path):
     assert envelope["offloaded"] is True
     assert envelope["resource"].startswith(artifacts.URI_PREFIX)
     assert "path" not in envelope
+
+
+# ---------------------------------------------------------------------------
+# An adapter's refusal reaches the client in the adapter's words
+# ---------------------------------------------------------------------------
+
+
+def _refusing_builder(monkeypatch, tmp_path, *, at_build=None, at_read=None):
+    """Stub the builder so the adapter refuses while it is built or while it reads."""
+
+    class _Refusing(_StubAdapter):
+        def list_tables(self, scope):
+            raise at_read
+
+    def _build(arguments, **_kwargs):
+        if at_build is not None:
+            raise at_build
+        return _Refusing()
+
+    monkeypatch.setattr("fluid_build.cli.mcp._build_source_adapter", _build)
+    monkeypatch.setattr(
+        "fluid_build.cli.mcp.write_audit_event", lambda *a, **kw: tmp_path / "audit.json"
+    )
+
+
+def test_an_adapters_own_refusal_is_passed_on_without_the_sdks_text(monkeypatch, tmp_path):
+    from fluid_build.copilot.catalog.base import CatalogConfigError
+
+    _refusing_builder(
+        monkeypatch,
+        tmp_path,
+        at_read=CatalogConfigError(
+            "Snowflake CatalogScope requires 'database'.",
+            suggestions=["Pass scope.database='YOUR_DB'."],
+            original_error=RuntimeError("driver said: token=abc123"),
+        ),
+    )
+    with pytest.raises(McpToolUsageError) as exc:
+        _call(kind="tables", scope={}, **_SNOWFLAKE)
+    message = str(exc.value)
+    assert message == (
+        "Snowflake CatalogScope requires 'database'. Next: Pass scope.database='YOUR_DB'."
+    )
+    assert "abc123" not in message
+
+
+def test_an_unknown_credential_id_is_passed_on(monkeypatch, tmp_path):
+    from fluid_build.copilot.catalog.credentials import CredentialNotFoundError
+
+    _refusing_builder(
+        monkeypatch,
+        tmp_path,
+        at_build=CredentialNotFoundError(
+            "No credentials resolved for source 'nope'.",
+            suggestions=["Run `fluid ai setup --source snowflake --name nope`."],
+        ),
+    )
+    with pytest.raises(McpToolUsageError, match="No credentials resolved for source 'nope'"):
+        _call(kind="tables", **_SNOWFLAKE, **_SCOPE)
+
+
+@pytest.mark.parametrize("phase", ["build", "read"])
+def test_other_catalog_failures_stay_server_side(monkeypatch, tmp_path, phase):
+    """A credential validation error can quote input values, and a connection
+    error carries the SDK's text: neither is turned into a client message."""
+    from fluid_build.copilot.catalog.base import CatalogConfigError, CatalogConnectionError
+
+    if phase == "build":
+        error = CatalogConfigError("Stored credentials for source 'x' failed validation: ...")
+        _refusing_builder(monkeypatch, tmp_path, at_build=error)
+    else:
+        error = CatalogConnectionError("Snowflake connection failed: driver text")
+        _refusing_builder(monkeypatch, tmp_path, at_read=error)
+    with pytest.raises(type(error)) as exc:
+        _call(kind="tables", **_SNOWFLAKE, **_SCOPE)
+    assert not isinstance(exc.value, McpToolUsageError)
+
+
+# ---------------------------------------------------------------------------
+# Odds and ends the review found
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "arguments, hint",
+    [
+        ({"kind": "tables"}, "For less, name the tables you need in scope.tables."),
+        (
+            {"kind": "tables", "response_format": "detailed"},
+            "For less, name the tables you need in scope.tables or ask for "
+            "response_format=concise.",
+        ),
+        (
+            {"kind": "glossary", "response_format": "detailed"},
+            "For less, ask for response_format=concise.",
+        ),
+        ({"kind": "lineage"}, ""),
+    ],
+)
+def test_the_offload_hint_fits_the_call(arguments, hint):
+    from fluid_build.cli.mcp.server import _offload_hint
+
+    assert _offload_hint("source_catalog", arguments) == hint
+    assert _offload_hint("read_logical_model", arguments) == ""
+
+
+def test_the_source_enum_and_the_dispatch_table_name_the_same_catalogs():
+    from fluid_build.cli.mcp.dispatch import _SOURCE_ADAPTERS
+    from fluid_build.cli.mcp.models import _CATALOG_SOURCE_LIST
+
+    assert set(_CATALOG_SOURCE_LIST) == set(_SOURCE_ADAPTERS)
+
+
+def test_over_http_a_large_result_is_serialized_on_the_worker_thread(monkeypatch):
+    """Offloading serializes the whole result; over HTTP it runs where the
+    tool ran, so the event loop keeps serving other clients."""
+    import threading
+
+    from fluid_build.cli.mcp import dispatch as dispatch_module
+    from fluid_build.cli.mcp import policy as policy_module
+    from fluid_build.cli.mcp import server as server_module
+
+    seen = {}
+
+    def _record(result, *, tool, hint):
+        seen["thread"] = threading.current_thread().name
+        return result
+
+    monkeypatch.setattr(artifacts, "offload_if_large", _record)
+    monkeypatch.setattr(dispatch_module, "_call_tool", lambda *a, **kw: {"kind": "adapters"})
+    monkeypatch.setattr(
+        policy_module, "_current_policy", _build_policy_from_args(SimpleNamespace())
+    )
+    monkeypatch.setattr(server_module, "_TOOLS_OFF_LOOP", True)
+    result = asyncio.run(server_module._dispatch_sync_tool("source_catalog", {"kind": "adapters"}))
+    assert result == {"kind": "adapters"}
+    assert seen["thread"].startswith("fluid-mcp-tool")

@@ -237,8 +237,8 @@ def _render_mcp_guide() -> int:
             name="serve",
             description=(
                 "Run the MCP server.  Exposes the staged forge tool "
-                "surface (catalog reads, contract regeneration, semantic "
-                "memory search) over stdio for Claude Code, Cursor, "
+                "surface (source-catalog reads, contract validation, "
+                "logical-model edits) over stdio for Claude Code, Cursor, "
                 "Continue, and any MCP client that starts it, or over "
                 "Streamable HTTP (--transport http) for remote clients "
                 "and agent harnesses."

@@ -390,6 +390,10 @@ _FLAT_SCOPE_KEYS = ("database", "schema", "schema_name", "catalog", "tables")
 #: default, so an absent flag reads as "not a key".
 _KEY_FLAGS = ("primary_key", "partition_key", "clustering_key")
 
+#: Free-form maps of the catalog's own data, kept whole when concise: a
+#: key-only tag (``{"pii": ""}``) is still a tag.
+_OPAQUE_MAPS = ("tags",)
+
 
 def _source_catalog(arguments: Dict[str, Any], build_adapter: Any) -> Dict[str, Any]:
     """Run one ``source_catalog`` call; ``kind`` picks what it reads.
@@ -425,8 +429,31 @@ def _source_catalog(arguments: Dict[str, Any], build_adapter: Any) -> Dict[str, 
         needs = "; ".join(_MISSING_ARGUMENT_HINTS[key] for key in missing)
         raise McpToolUsageError(f"source_catalog kind={kind} needs {needs}.")
 
-    adapter = build_adapter(arguments)
-    return _SOURCE_READERS[kind](adapter, arguments, fqn, detailed)
+    from fluid_build.copilot.catalog.base import CatalogConfigError, CatalogPermissionError
+    from fluid_build.copilot.catalog.credentials import CredentialNotFoundError
+
+    try:
+        adapter = build_adapter(arguments)
+    except CredentialNotFoundError as exc:
+        raise McpToolUsageError(_catalog_error_text(exc)) from exc
+    try:
+        return _SOURCE_READERS[kind](adapter, arguments, fqn, detailed)
+    except (CatalogConfigError, CatalogPermissionError) as exc:
+        # The adapters' own refusals (a scope field the catalog needs, a missing
+        # grant) are written for the user. A CatalogConfigError raised while
+        # resolving credentials can quote a validation error and stays
+        # server-side, as does CatalogConnectionError, which carries the SDK's text.
+        raise McpToolUsageError(_catalog_error_text(exc)) from exc
+
+
+def _catalog_error_text(exc: Any) -> str:
+    """An adapter refusal as the client sees it: its message and suggestions.
+    Never ``str(exc)``, which appends ``original_error`` (the SDK's own text)."""
+    text = str(getattr(exc, "message", "") or type(exc).__name__)
+    suggestions = [str(s) for s in (getattr(exc, "suggestions", None) or [])]
+    if suggestions:
+        text += " Next: " + " ".join(suggestions)
+    return text
 
 
 def _read_tables(adapter: Any, arguments: Dict[str, Any], _fqn: str, detailed: bool) -> Any:
@@ -496,11 +523,16 @@ def _table_summary(table: Any, detailed: bool) -> Dict[str, Any]:
 def _prune(value: Any) -> Any:
     """Drop what a concise result does not need: vendor payloads
     (``catalog_specific``), ``None``, empty strings and containers, and false
-    key flags. Booleans that carry meaning when false (``nullable``) stay."""
+    key flags. Booleans that carry meaning when false (``nullable``) stay, and
+    so does each entry of :data:`_OPAQUE_MAPS`."""
     if isinstance(value, dict):
         out: Dict[str, Any] = {}
         for key, item in value.items():
             if key == "catalog_specific":
+                continue
+            if key in _OPAQUE_MAPS:
+                if item:
+                    out[key] = item
                 continue
             item = _prune(item)
             if item is None or item == "" or item == [] or item == {}:

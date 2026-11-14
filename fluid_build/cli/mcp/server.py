@@ -199,33 +199,42 @@ async def _dispatch_sync_tool(name: str, arguments: Dict[str, Any]) -> Dict[str,
         allow_inline_credentials=_policy().allow_inline_credentials,
         allow_metadata_service=_policy().allow_metadata_service,
     )
+    hint = _offload_hint(name, arguments)
+
+    def call_and_offload() -> Any:
+        # A large result is serialized here too, so over HTTP that work runs
+        # on the worker thread with the tool, never on the event loop.
+        from fluid_build.cli.mcp import artifacts
+
+        return artifacts.offload_if_large(call(), tool=name, hint=hint)
+
     try:
         if _TOOLS_OFF_LOOP:
             # As asyncio.to_thread does: the call keeps this request's context.
             context = contextvars.copy_context()
-            result = await asyncio.get_running_loop().run_in_executor(
-                _tool_executor(), functools.partial(context.run, call)
+            return await asyncio.get_running_loop().run_in_executor(
+                _tool_executor(), functools.partial(context.run, call_and_offload)
             )
-        else:
-            result = call()
+        return call_and_offload()
     except McpToolRefusal as exc:
         # Surface the refusal (which names the server flag to set) as the
         # SDK's ToolError; SDK 2.x would mask a bare RuntimeError.
         from fluid_build._mcp_compat import get_tool_error
 
         raise get_tool_error()(str(exc)) from exc
-    from fluid_build.cli.mcp import artifacts
-
-    return artifacts.offload_if_large(result, tool=name, hint=_OFFLOAD_HINTS.get(name, ""))
 
 
-#: Per-tool advice an offloaded result adds on getting a smaller one.
-_OFFLOAD_HINTS = {
-    SOURCE_CATALOG_TOOL: (
-        "For less, name the tables you need in scope.tables, and leave "
-        "response_format at concise, the default."
-    ),
-}
+def _offload_hint(name: str, arguments: Dict[str, Any]) -> str:
+    """What would make this call's result smaller, for an offloaded result's
+    envelope; empty when nothing would."""
+    if name != SOURCE_CATALOG_TOOL:
+        return ""
+    ways = []
+    if arguments.get("kind") == "tables":
+        ways.append("name the tables you need in scope.tables")
+    if arguments.get("response_format") == "detailed":
+        ways.append("ask for response_format=concise")
+    return f"For less, {' or '.join(ways)}." if ways else ""
 
 
 def _register_artifact_resource(app: Any) -> None:

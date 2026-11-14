@@ -184,11 +184,15 @@ def offload_if_large(result: Any, *, tool: str, hint: str = "") -> Any:
     if limit == 0 or not isinstance(result, dict):
         return result
     # Measured on the text the call would send: the SDK writes a dict result
-    # as JSON indented by 2. The kept copy is compact.
-    tokens = estimate_tokens(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    # with pydantic_core, as JSON indented by 2 (Rust; json.dumps(indent=2) is
+    # ~80x slower on a 6.5 MB result). The kept copy is compact.
+    import pydantic_core
+
+    sent = pydantic_core.to_json(result, fallback=str, indent=2)
+    tokens = -(-len(sent) // _BYTES_PER_TOKEN)
     if tokens <= limit:
         return result
-    text = json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
+    text = pydantic_core.to_json(result, fallback=str).decode("utf-8")
     artifact_id, path = _STORE.put(text, write_file=_WRITE_FILES)
     uri = URI_PREFIX + artifact_id
     size = len(text.encode("utf-8"))

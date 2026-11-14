@@ -66,7 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answers only the identity that opened it: another caller presenting its `Mcp-Session-Id` gets 404.
 
 - **`source_catalog` takes `response_format`: `concise` (the default) or `detailed`.** `concise`
-  leaves out vendor-specific payloads (`catalog_specific`), empty fields and false key flags, lists
+  leaves out vendor-specific payloads (`catalog_specific`), empty fields and false key flags (a
+  table's `tags` are kept whole, so a key-only tag stays), lists
   tables by `fqn`, `name` and `description`, and gives lineage as the upstream and downstream
   FQNs. `detailed` returns every field, as the five former tools did. The pattern is the one in
   Anthropic's "Writing effective tools for agents".
@@ -118,7 +119,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{"kind": "tables", "tables": [...]}`, a `table` result `{"kind": "table", "table": {...}}`. A
   call that lacks what its kind needs (`fqn` for `table` and `lineage`, `scope` for `tables`,
   `source` and `credentials` for every kind but `adapters`) is refused before any credential is
-  resolved, with the argument and an example. On MCP SDK 2.x a client now reads that message, and the adapter builder's, where
+  resolved, with the argument and an example. An adapter's own refusal (an unknown credential id,
+  a scope field its catalog needs, a missing grant) is passed on in the adapter's words, without
+  the driver's error text; a connection failure and a credential that fails validation stay in
+  the server log. On MCP SDK 2.x a client now reads these messages, and the adapter builder's, where
   it used to get "Error executing tool". The `tools/list` schemas shrink from 3,440 to 1,892
   tokens (tiktoken o200k_base, an offline proxy for a client's tokenizer): 15,464 to 8,364 bytes.
 - **`fluid mcp serve` stops on a tool name it does not know.** An unknown name in `--allow-tools`

@@ -439,13 +439,16 @@ Two register sites — both already have an `_SOURCE_ADAPTERS` dict:
 - `fluid_build/cli/forge_data_model.py::_build_catalog_adapter` —
   dispatches `--source-type atlas` from the CLI.
 - `fluid_build/cli/mcp/dispatch.py::_SOURCE_ADAPTERS` dispatches the MCP
-  `source_catalog` tool.
+  `source_catalog` tool, and `fluid_build/cli/mcp/models.py::_CATALOG_SOURCE_LIST`
+  is its `source` enum and its `kind=adapters` listing (a test pins the two equal).
 
-Add one entry to each:
+Add one entry to each `_SOURCE_ADAPTERS` dict:
 
 ```python
 "atlas": AtlasCatalogAdapter,
 ```
+
+and `"atlas"` to `_CATALOG_SOURCE_LIST`.
 
 ### 7. Write the test file
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import importlib
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -271,21 +272,30 @@ def _glue_args(**extra: Any) -> Dict[str, Any]:
     return base
 
 
+@contextlib.contextmanager
+def _credentials_not_found(match: str = ""):
+    """The resolver found no credentials: ``source_catalog`` passes that on to
+    the client as a usage error, raised from the resolver's
+    ``CredentialNotFoundError``."""
+    from fluid_build.cli.mcp.dispatch import McpToolUsageError
+    from fluid_build.copilot.catalog.credentials import CredentialNotFoundError
+
+    with pytest.raises(McpToolUsageError, match=match or None) as exc:
+        yield exc
+    assert isinstance(exc.value.__cause__, CredentialNotFoundError)
+
+
 class TestHostIdentityAtTheSink:
     """The request that matters is the one the SDK sends, not the argument."""
 
     def test_no_metadata_request_without_operator_opt_in(self, metadata_endpoint):
-        from fluid_build.copilot.catalog.credentials import CredentialNotFoundError
-
-        with pytest.raises(CredentialNotFoundError, match="not-saved-on-this-host"):
+        with _credentials_not_found(match="not-saved-on-this-host"):
             _call_tool("source_catalog", _glue_args(), read_only=True)
         assert metadata_endpoint.requests == []
 
     def test_operator_flag_alone_does_not_reach_it(self, metadata_endpoint):
         """The flag permits a request; a call that does not ask stays off it."""
-        from fluid_build.copilot.catalog.credentials import CredentialNotFoundError
-
-        with pytest.raises(CredentialNotFoundError):
+        with _credentials_not_found():
             _call_tool("source_catalog", _glue_args(), read_only=True, allow_metadata_service=True)
         assert metadata_endpoint.requests == []
 
@@ -854,9 +864,7 @@ class TestBlankCredentialMaterialIsNotTheCallers:
         """``--allow-metadata-service`` permits a block that asks for the host's
         identity (``instance_profile``). A block that names keys gets its keys
         or a refusal, never the instance role in their place."""
-        from fluid_build.copilot.catalog.credentials import CredentialNotFoundError
-
-        with pytest.raises(CredentialNotFoundError):
+        with _credentials_not_found():
             _call_tool(
                 "source_catalog",
                 _inline("glue", _glue_key_block(keys)),
