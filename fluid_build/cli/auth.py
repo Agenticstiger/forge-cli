@@ -322,6 +322,10 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def __dir__() -> List[str]:
+    return sorted(set(globals()) | _PROVIDER_CLASSES)
+
+
 class AuthManager:
     """Manages authentication for multiple providers"""
 

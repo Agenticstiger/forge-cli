@@ -110,14 +110,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Every `fluid_build` module imports when it is the first one loaded.** Thirteen modules
   raised `ImportError: cannot import name ... from partially initialized module` when imported
   first in a fresh interpreter (`python -c "import fluid_build.cli._init_dag_helpers"`): the
-  `fluid init` helpers, the template-mode runner, the three `fluid viz` renderers, three
-  `fluid market` helpers, the auth provider classes and `fluid_build.llm.provider_resolve`.
-  Each parent re-exports its helper's names, and each helper needed the parent before its own
-  names existed. No command was affected, because the CLI always loads the parent first; a test
-  or a tool that imported a helper directly passed or failed depending on what had been
-  imported before it. `fluid_build.cli.auth` now resolves its five provider classes on first
-  use (PEP 562), so importing it no longer loads them all. A new check, in CI's import-hygiene
-  job, imports every module first, each in a fresh interpreter.
+  two `fluid init` helpers, the template-mode runner, the three `fluid viz` renderers, three
+  `fluid market` helpers, the two auth provider modules, and `fluid_build.llm.provider_resolve`
+  with its `cli/_llm_provider_resolve` shim. Each parent re-exports its helper's names, and
+  each helper needed the parent before its own names existed. No command was affected, because
+  the CLI always loads the parent first; a test or a tool that imported a helper directly
+  passed or failed depending on what had been imported before it. `fluid_build.cli.auth` now
+  resolves its five provider classes on first use (PEP 562), so importing it no longer loads
+  them all. A new check, in CI's import-hygiene job, imports every module first, each in a
+  fresh interpreter.
 
 ## [0.30.1] — 2026-11-13
 

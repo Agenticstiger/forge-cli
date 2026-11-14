@@ -367,6 +367,32 @@ class TestAuthManager:
         assert "aws" in m.providers
         assert "azure" in m.providers
 
+    def test_a_patched_provider_class_reaches_the_manager(self):
+        # auth.py resolves the provider classes lazily (PEP 562) and the
+        # manager reads them through the module, so a patch on
+        # ``fluid_build.cli.auth.<Class>`` still takes effect.
+        with patch("fluid_build.cli.auth.AWSAuthProvider") as fake:
+            m = self._make()
+        assert m.providers["aws"] is fake.return_value
+        assert m.providers["amazon"] is fake.return_value
+        assert isinstance(self._make().providers["aws"], AWSAuthProvider)
+
+    def test_the_lazy_provider_classes_are_the_impls_classes(self):
+        import fluid_build.cli._auth_provider_impls as impls
+        import fluid_build.cli.auth as auth
+
+        for name in (
+            "AWSAuthProvider",
+            "AzureAuthProvider",
+            "DatabricksAuthProvider",
+            "GoogleCloudAuthProvider",
+            "SnowflakeAuthProvider",
+        ):
+            assert getattr(auth, name) is getattr(impls, name)
+            assert name in dir(auth)
+        with pytest.raises(AttributeError):
+            auth.NoSuchAuthProvider  # noqa: B018
+
     def test_get_provider_case_insensitive(self):
         m = self._make()
         p = m.get_provider("AWS")

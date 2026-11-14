@@ -18,9 +18,11 @@ stay in ``auth.py`` (all 5 subclasses inherit from it). The
 the doctor checks also stay there — only the per-provider class
 bodies moved.
 
-Test patches that target ``fluid_build.cli.auth.<ProviderClass>``
-still resolve because ``auth`` re-imports each class from this module
-at top level — the symbol is bound on both namespaces.
+``fluid_build.cli.auth.<ProviderClass>`` still resolves, for imports and
+test patches: ``auth`` looks each class up in this module on first
+attribute access (PEP 562 ``__getattr__``) instead of importing it at
+module level, because these classes subclass ``auth.AuthProvider`` and
+that eager import made this module fail when it was imported first.
 """
 
 from __future__ import annotations
