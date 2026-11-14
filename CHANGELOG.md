@@ -232,6 +232,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolves its five provider classes on first use (PEP 562), so importing it no longer loads
   them all. A new check, in CI's import-hygiene job, imports every module first, each in a
   fresh interpreter.
+- **`fluid mcp output-port serve` refuses an `--allow-tools` or `--deny-tools` name that names no
+  tool.** `fluid mcp serve` already did. Before, a mistyped deny list denied nothing and left the
+  tool callable, and a mistyped allow list served fewer tools without a word. The refusal exits 2
+  before either transport binds, names only the unknown names, and lists the tools.
 
 ## [0.30.1] — 2026-11-13
 
