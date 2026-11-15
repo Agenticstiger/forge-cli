@@ -930,6 +930,14 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "validate",
     ),
+    "contract_secret_ref": (
+        [
+            "Write the secretRef in its scheme's form (the message gives it), or have the "
+            + "operator allow it: the message names the setting (FLUID_SECRET_SCHEMES, "
+            + "FLUID_SECRET_PREFIXES or FLUID_ACQUISITION_SECRET_REF_ALLOWLIST)",
+        ],
+        "validate",
+    ),
     "contract_confluent_binding": (
         [
             "Fix the Confluent (Tableflow) binding field the message names; the message gives "
@@ -1122,6 +1130,7 @@ _EXAMPLES: Dict[str, str] = {
         "consumes:\n- productId: sales.orders_raw\n  exposeId: orders_raw\n"
     ),
     "contract_iceberg_sink": _VERBOSE,
+    "contract_secret_ref": _VERBOSE,
     "contract_confluent_binding": _VERBOSE,
     "contract_databricks_binding": (
         "# exposes[].binding\nplatform: databricks\nformat: delta_table\nlocation:\n"

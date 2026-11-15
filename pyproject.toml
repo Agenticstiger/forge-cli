@@ -891,6 +891,7 @@ module = [
     "fluid_build.secrets._file",
     "fluid_build.secrets._vault",
     "fluid_build.secrets._aws_sm",
+    "fluid_build.secrets.contract",
     # Operator egress gates: which host a contract-named URL may reach, which
     # variable may be sent there, and where a managed Flink job may deploy. A
     # silent Any is a silent allow, and strict equality is what makes a

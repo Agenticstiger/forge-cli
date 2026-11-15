@@ -128,6 +128,7 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 | `ERR_CONTRACT_DUPLICATE_ID` | Give each output port its own contract id: change or delete the exposes[].contract.id the message names. | cli/validate.html |
 | `ERR_CONTRACT_COMPOSITION_VIOLATION` | Consume only products of a type this product accepts: SDP takes none, ADP takes SDP and ADP, CDP takes SDP, ADP and CDP. Or correct this product's metadata.productType if it was set wrong. | cli/validate.html |
 | `ERR_CONTRACT_ICEBERG_SINK` | Fix the streaming Iceberg sink field the message names; the message gives the value or the variable it needs. | cli/validate.html |
+| `ERR_CONTRACT_SECRET_REF` | Write the secretRef in its scheme's form (the message gives it), or have the operator allow it: the message names the setting (FLUID_SECRET_SCHEMES, FLUID_SECRET_PREFIXES or FLUID_ACQUISITION_SECRET_REF_ALLOWLIST). | cli/validate.html |
 | `ERR_CONTRACT_CONFLUENT_BINDING` | Fix the Confluent (Tableflow) binding field the message names; the message gives the value it needs. | cli/validate.html |
 | `ERR_CONTRACT_DATABRICKS_BINDING` | Fix the Databricks binding or setting the message names (a SQL warehouse in DATABRICKS_WAREHOUSE_ID, no workspace host in the contract). | cli/validate.html |
 | `ERR_CONTRACT_ICEBERG_BINDING` | Fix the Iceberg binding field the message names: a catalog kind FLUID knows, and one storage location per external volume. | cli/validate.html |
