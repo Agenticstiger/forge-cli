@@ -203,9 +203,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `forge_from_source`, `score_contract_quality`, `enrich_contract_suggestions` and
   `search_semantic_memory`. Also removed: `--llm-provider mcp-sampling`, which only `forge_run`
   used.
+- **The UX telemetry module and its consent.** `cli/_ux_telemetry.py` and the opt-in consent
+  behind it are gone, along with `FLUID_TELEMETRY`, `DO_NOT_TRACK` and
+  `~/.fluid/config.yaml` `telemetry.enabled`. Nothing emitted the telemetry after the
+  copilot went in #881, so setting them did nothing. `fluid doctor --env` no longer lists the two
+  variables or prints the telemetry line, and `fluid doctor --env --json` is now `{"env": [...]}`
+  without the `telemetry` key.
 
 ### Fixed
 
+- **`FLUID_COPILOT_AGENT_LOOP` no longer stops a saved or detected coding agent from being
+  picked.** With it set, `fluid forge` skipped the agent that `fluid ai setup` saved and the
+  agent it finds on PATH. The loop it asked for went in #881, so the variable now does nothing,
+  like `FLUID_COPILOT_FORCE_INTERVIEW`, `FLUID_COPILOT_JUDGE`, `FLUID_COPILOT_SELF_EVAL` and
+  `FLUID_COPILOT_SEMANTIC_MEMORY`, which nothing reads either.
 - **A source-catalog listing failed through an MCP client whenever its scope named no
   tables.** `fluid mcp serve` turned the client's `scope` back into a dict with every unset field
   as `null`, and `"tables": null` failed validation, so `list_source_tables` (now

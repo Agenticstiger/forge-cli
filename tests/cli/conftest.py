@@ -182,7 +182,6 @@ def _reset_cli_process_state(monkeypatch):
         "FLUID_FORGE_AUTO_RESUME",
         "FLUID_FORGE_NO_PRUNE_HINT",
         "FLUID_COPILOT_CHECKPOINT",
-        "FLUID_COPILOT_JUDGE",
         "FLUID_COPILOT_ENRICHMENT",
         "FLUID_JUDGE_SELF_CRITIQUE",
         "FLUID_LLM_PROVIDER",

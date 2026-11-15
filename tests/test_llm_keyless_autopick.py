@@ -381,7 +381,7 @@ class TestSavedAgentNeverTakesAStatedDestination:
     """A saved coding agent is passed over wherever the auto-picked one is.
 
     It cannot call a stated endpoint, cannot be trusted with a stated (perhaps
-    on-prem) model and has no tool use for the agent loop. The run goes on
+    on-prem) model. The run goes on
     down the ladder, and stops with ``copilot_no_llm_provider`` naming the
     saved agent when nothing else selects.
     """
@@ -393,10 +393,8 @@ class TestSavedAgentNeverTakesAStatedDestination:
         [
             ({"llm_endpoint": _ONPREM}, {}),
             ({"llm_model": "my-model"}, {}),
-            ({"agent_loop": True}, {}),
             ({}, {"FLUID_LLM_ENDPOINT": _ONPREM}),
             ({}, {"FLUID_LLM_MODEL": "my-model"}),
-            ({}, {"FLUID_COPILOT_AGENT_LOOP": "1"}),
         ],
     )
     def test_the_run_stops_and_names_the_saved_agent(self, world, flags, env):
@@ -417,7 +415,7 @@ class TestSavedAgentNeverTakesAStatedDestination:
     def test_readiness_says_the_same(self, world):
         world.install("claude-code")
         _saved(world, provider="claude-code")
-        ready = check_llm_readiness({**world.env, "FLUID_COPILOT_AGENT_LOOP": "1"})
+        ready = check_llm_readiness({**world.env, "FLUID_LLM_MODEL": "my-model"})
         assert ready.ready is False
         assert "claude-code" in ready.error
 
@@ -583,49 +581,24 @@ class TestStatedDestinationBlocksAutoPick:
         assert check_llm_readiness({}).provider != "claude-code"
 
 
-class TestAgentLoopNeverAutoPicksAnAgent:
-    """The agent loop needs tool use, which no coding agent offers.
+class TestRetiredAgentLoopVariableIsIgnored:
+    """``FLUID_COPILOT_AGENT_LOOP`` no longer exists: it must not block an agent.
 
-    It is requested by an ``agent_loop`` option or ``FLUID_COPILOT_AGENT_LOOP``,
-    so both routes must reach the auto-pick.
+    The loop it asked for was removed, so a set variable changes nothing.
     """
 
-    @staticmethod
-    def _options(**kw):
-        return SimpleNamespace(
-            llm_provider=None, llm_model=None, llm_endpoint=None, agent_loop=kw.get("agent_loop")
-        )
-
-    def test_flag_route_ends_at_the_no_provider_error(self, world):
-        world.install("claude-code")
-        with pytest.raises(providers.CopilotGenerationError) as info:
-            resolve_llm_config(self._options(agent_loop=True), {})
-        assert info.value.event == "copilot_no_llm_provider"
-
-    def test_env_route_ends_at_the_no_provider_error(self, world):
-        world.install("claude-code")
-        world.monkeypatch.setenv("FLUID_COPILOT_AGENT_LOOP", "1")
-        with pytest.raises(providers.CopilotGenerationError) as info:
-            resolve_llm_config(self._options(), {})
-        assert info.value.event == "copilot_no_llm_provider"
-
-    def test_env_route_blocks_the_pick_in_selection(self, world):
+    def test_an_auto_picked_agent_is_still_picked(self, world):
         world.install("claude-code")
         env = {**world.env, "FLUID_COPILOT_AGENT_LOOP": "1"}
-        assert _provider_name_from(_args(), env) != "claude-code"
-
-    @pytest.mark.parametrize("value", ["0", "false", "no", "off", ""])
-    def test_a_falsey_env_value_keeps_the_pick(self, world, value):
-        world.install("claude-code")
-        env = {**world.env, "FLUID_COPILOT_AGENT_LOOP": value}
         assert _provider_name_from(_args(), env) == "claude-code"
+        assert _provider_name_from(_args(), dict(world.env)) == "claude-code"
 
-    def test_the_loop_check_is_one_rule(self):
-        from fluid_build.llm.providers import agent_loop_requested
-
-        assert agent_loop_requested(True, {}) is True
-        assert agent_loop_requested(False, {"FLUID_COPILOT_AGENT_LOOP": "on"}) is True
-        assert agent_loop_requested(False, {"FLUID_COPILOT_AGENT_LOOP": "0"}) is False
+    def test_a_saved_agent_is_still_used(self, world):
+        world.install("claude-code")
+        _saved(world, provider="claude-code")
+        env = {**world.env, "FLUID_COPILOT_AGENT_LOOP": "1"}
+        assert resolve_llm_config(_args(), env).provider == "claude-code"
+        assert check_llm_readiness(env).provider == "claude-code"
 
 
 class TestAgentReadinessNeedsTheBinary:

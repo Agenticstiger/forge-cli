@@ -161,17 +161,6 @@ def mock_bigquery_client():
         yield mock_client
 
 
-@pytest.fixture(autouse=True)
-def _disable_copilot_self_eval(monkeypatch):
-    """Disable self-evaluation LLM calls in all tests.
-
-    The self-evaluation feature calls ``call_llm`` a second time after
-    generation succeeds.  This interferes with tests that mock
-    ``call_llm`` with exact side-effect counts.
-    """
-    monkeypatch.setenv("FLUID_COPILOT_SELF_EVAL", "0")
-
-
 @pytest.fixture
 def deterministic_welcome_scan(monkeypatch):
     """Make ``run_welcome_scan`` return every probe's result, however slow the runner.

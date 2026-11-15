@@ -36,13 +36,8 @@ REQUIRED_KILL_SWITCHES = (
 )
 
 
-class TestTelemetryKillSwitchesListed:
-    def test_telemetry_env_vars_are_in_catalog(self):
-        names = {row[0] for row in doctor.ENV_KILL_SWITCHES}
-        assert "FLUID_TELEMETRY" in names
-        assert "DO_NOT_TRACK" in names
-
-    def test_json_includes_resolved_telemetry_state(self, monkeypatch):
+class TestEnvJson:
+    def test_json_is_the_env_rows_only(self, monkeypatch):
         for name, _, _ in doctor.ENV_KILL_SWITCHES:
             monkeypatch.delenv(name, raising=False)
         args = SimpleNamespace(env=True, json=True)
@@ -51,9 +46,14 @@ class TestTelemetryKillSwitchesListed:
             rc = doctor._run_env_listing(args, LOG)
         assert rc == 0
         payload = json.loads(buf.getvalue())
-        assert "telemetry" in payload
-        # Default is OFF (privacy-preserving) when nothing is set.
-        assert payload["telemetry"]["enabled"] is False
+        assert list(payload) == ["env"]
+        assert {row["name"] for row in payload["env"]} == {
+            row[0] for row in doctor.ENV_KILL_SWITCHES
+        }
+
+    def test_the_removed_telemetry_switches_are_not_listed(self):
+        names = {row[0] for row in doctor.ENV_KILL_SWITCHES}
+        assert not names & {"FLUID_TELEMETRY", "DO_NOT_TRACK"}
 
 
 class TestEnvCatalog:
@@ -69,10 +69,10 @@ class TestEnvCatalog:
         for entry in doctor.ENV_KILL_SWITCHES:
             assert len(entry) == 3, f"expected (name, default, description), got {entry!r}"
             name, default, desc = entry
-            # Almost all knobs are FLUID_* prefixed; documented exceptions
-            # are cross-tool/ecosystem names FLUID honours rather than owns:
-            # the ``DO_NOT_TRACK`` standard and dbt's ``DBT_EXECUTABLE``.
-            cross_tool_exceptions = {"DO_NOT_TRACK", "DBT_EXECUTABLE"}
+            # Almost all knobs are FLUID_* prefixed; the documented exception
+            # is a cross-tool name FLUID honours rather than owns: dbt's
+            # ``DBT_EXECUTABLE``.
+            cross_tool_exceptions = {"DBT_EXECUTABLE"}
             assert isinstance(name, str) and (
                 name.startswith("FLUID_") or name in cross_tool_exceptions
             ), f"env-var name must be FLUID_* (or one of {sorted(cross_tool_exceptions)}): {name!r}"

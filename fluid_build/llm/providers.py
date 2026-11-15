@@ -29,7 +29,6 @@ __all__ = [
     "normalize_llm_provider_name",
     "query_ollama_models",
     "reset_llm_caches",
-    "agent_loop_requested",
     "preflight_llm_provider",
     "fill_llm_args_from_setup",
     "named_llm_provider",
@@ -384,10 +383,7 @@ class LlmProvider(ABC):
     # ------------------------------------------------------------------
     #
     # These methods are siblings to the single-shot ``build_request`` /
-    # ``extract_text`` path.  They're only called from
-    # ``forge_copilot_agent_loop.run_copilot_agent_loop`` when
-    # ``--agent-loop`` is set; the default single-shot flow in
-    # ``generate_copilot_artifacts`` never touches them.
+    # ``extract_text`` path.
 
     def build_tool_request(
         self,
@@ -627,31 +623,15 @@ def _provider_name_from(args: Any, env: Mapping[str, str]) -> Optional[str]:
     )
 
 
-def agent_loop_requested(flag: Any, environ: Optional[Mapping[str, str]] = None) -> bool:
-    """Whether this run asks for the multi-turn agent loop.
-
-    ``flag`` is the ``--agent-loop`` value (callers read it their own way, e.g.
-    the CLI's ``get_cli_arg``), or ``FLUID_COPILOT_AGENT_LOOP`` set to a truthy
-    value. It is parsed as a boolean, not by presence:
-    ``FLUID_COPILOT_AGENT_LOOP=0`` is the documented way to turn the loop off.
-    """
-    env = os.environ if environ is None else environ
-    return bool(flag) or (
-        env.get("FLUID_COPILOT_AGENT_LOOP", "").strip().lower() in {"1", "true", "yes", "on"}
-    )
-
-
 def _agents_allowed(args: Any, env: Mapping[str, str]) -> bool:
     """Whether an agent this run did not name may be used: auto-picked or saved.
 
-    Not for the agent loop (it needs tool use, which the agents do not offer),
-    and not when ``--llm-endpoint`` / ``--llm-model`` (or their routing twins,
+    Not when ``--llm-endpoint`` / ``--llm-model`` (or their routing twins,
     as flags or ``FLUID_LLM_*`` variables) state where or what to call: that
     destination is never swapped for an agent.
     """
     return not (
-        agent_loop_requested(getattr(args, "agent_loop", False), env)
-        or any(
+        any(
             getattr(args, name, None)
             for name in ("llm_endpoint", "llm_model", "llm_routing_endpoint", "llm_routing_model")
         )
@@ -739,7 +719,7 @@ def fill_llm_args_from_setup(
 
     * A named provider (:func:`named_llm_provider`) takes nothing from setup.
     * An agent that setup found (a coding-agent CLI) is not used
-      when the run states an endpoint or a model, or runs the agent loop, as in
+      when the run states an endpoint or a model, as in
       a run without a TTY (``provider_resolve._passed_over``).
     * Otherwise setup's provider goes into ``args.llm_provider``, recorded first
       as not named (:func:`remember_named_llm_provider`). Its model and endpoint
@@ -755,9 +735,8 @@ def fill_llm_args_from_setup(
     if isinstance(recorded, str) and recorded:  # the operator named a provider
         return False
     # The run's own statements only, so a test double's invented attribute
-    # does not read as a stated endpoint, model or agent loop.
+    # does not read as a stated endpoint or model.
     stated = SimpleNamespace(
-        agent_loop=getattr(args, "agent_loop", False) is True,
         **{
             name: _stated_arg(args, name)
             for name in ("llm_endpoint", "llm_model", "llm_routing_endpoint", "llm_routing_model")
@@ -768,7 +747,7 @@ def fill_llm_args_from_setup(
         # py/clear-text-logging-sensitive-data).
         LOG.warning(
             "Not using the agent setup found: an agent is not used when the run states "
-            "an endpoint or a model, or runs the agent loop. Name a provider with "
+            "an endpoint or a model. Name a provider with "
             "--llm-provider."
         )
         return False
@@ -827,12 +806,6 @@ def _provider_is_named(args: Any, env: Mapping[str, str], provider_name: str) ->
     return recorded == explicit or _same_llm_provider(recorded, provider_name)
 
 
-_AGENT_LOOP_ALTERNATIVES = (
-    "Or author without it: --template starter. The agent loop needs a provider that "
-    "supports tool use, which the keyless providers (claude-code, codex, cursor, kiro) do not."
-)
-
-
 def preflight_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = None) -> None:
     """Fail fast when the selected provider cannot be used on this install.
 
@@ -844,12 +817,11 @@ def preflight_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = Non
     anything that reads workspace context or memory.
 
     The error is tailored to the run: ``(--llm-provider X)`` only when the flag
-    was passed, and in ``--agent-loop`` only the alternative that works there.
+    was passed.
     """
     from fluid_build._optional import MissingOptionalDependency, ensure_installed
 
     env = dict(environ or os.environ)
-    agent_loop = agent_loop_requested(getattr(args, "agent_loop", False), env)
     if not _explicit_provider_name(args, env):
         # Nothing chosen: inference reads the keyring and probes Ollama, and every
         # provider it can pick needs litellm, except the coding agent a
@@ -867,7 +839,7 @@ def preflight_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = Non
             "litellm",
             "litellm",
             "AI-assisted authoring",
-            _AGENT_LOOP_ALTERNATIVES if agent_loop else _LITELLM_ALTERNATIVES,
+            _LITELLM_ALTERNATIVES,
         )
     name = _provider_name_from(args, env)
     if not isinstance(name, str):
@@ -881,7 +853,7 @@ def preflight_llm_provider(args: Any, environ: Optional[Mapping[str, str]] = Non
             exc.module,
             exc.extra,
             f"AI-assisted authoring ({how})",
-            alternatives=_AGENT_LOOP_ALTERNATIVES if agent_loop else _LITELLM_ALTERNATIVES,
+            alternatives=_LITELLM_ALTERNATIVES,
         ) from None
 
 

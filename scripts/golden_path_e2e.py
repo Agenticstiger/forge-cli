@@ -21,8 +21,7 @@ It runs the pipeline in two lanes:
   key is in the environment, mirroring the live-LLM integration tests.
 
 Safety: every run uses an isolated temp workspace, the null store
-(``FLUID_STORE_BACKEND=null``), disabled semantic memory
-(``FLUID_COPILOT_SEMANTIC_MEMORY=0``), and cache off by default. ``apply``
+(``FLUID_STORE_BACKEND=null``), and cache off by default. ``apply``
 only ever runs ``--dry-run`` — zero warehouse DDL, zero cloud calls.
 
 The pipeline is executed ``--repeat`` times (default 2) and the runner
@@ -181,7 +180,6 @@ def _subprocess_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env["PATH"] = os.pathsep.join([bin_dir, env.get("PATH", "")])
     # Safe + hermetic defaults for every stage.
     env["FLUID_STORE_BACKEND"] = "null"
-    env["FLUID_COPILOT_SEMANTIC_MEMORY"] = "0"
     env["FLUID_QUIET"] = "1"
     env["FLUID_NONINTERACTIVE"] = "1"
     if extra:
