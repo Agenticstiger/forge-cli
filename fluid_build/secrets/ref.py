@@ -18,9 +18,10 @@ it never carries one. The parts:
 Field and version follow External Secrets' ``remoteRef {key, property,
 version}`` and 1Password's ``op://vault/item/[section/]field``.
 
-:data:`SCHEMA_PATTERNS` is the same grammar as JSON Schema patterns, one per
-scheme; ``$defs.secretRef`` in the 0.7.7 schema is built from them, and a test
-checks that the parser and the schema accept the same references.
+:data:`SCHEMA_PATTERNS` is the one grammar, as JSON Schema patterns, one per
+scheme: the parser accepts a reference when its scheme's pattern matches it,
+``$defs.secretRef`` in the 0.7.7 schema carries the same patterns, and a test
+pins the two equal. The rest of this module only explains a refusal.
 
 A scheme core does not know (a pack's, such as ``op://``) gets the generic
 grammar only; the pack's resolver judges its locator.
@@ -98,24 +99,9 @@ SCHEMA_PATTERNS: Dict[str, str] = {
 }
 
 _SCHEME = re.compile(r"[a-z][a-z0-9+.-]*\Z")
-_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _FIELD = re.compile(r"[A-Za-z0-9_.@-]+\Z")
-_FILE_SEGMENT = re.compile(r"[^/\s#?\x00-\x1f\x7f-\x9f]+\Z")
-_VAULT_MOUNT = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*\Z")
-_VAULT_PATH_SEGMENT = re.compile(_VAULT_SEGMENT + r"\Z")
-_VAULT_VERSION = re.compile(r"[1-9][0-9]*\Z")
-_AWS_NAME = re.compile(r"[A-Za-z0-9/_+=.@-]{1,512}\Z")
-_AWS_ARN = re.compile(
-    r"arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+\Z"
-)
-_AWS_VERSION = re.compile(r"[A-Za-z0-9-]{32,64}\Z")
-_GCP_LOCATOR = re.compile(
-    r"projects/[a-z0-9-]+/secrets/[A-Za-z0-9_-]{1,255}(?:/versions/(?:[1-9][0-9]*|latest))?\Z"
-)
-_AZURE_LOCATOR = re.compile(r"[A-Za-z0-9-]{3,24}/[A-Za-z0-9-]{1,127}\Z")
-_AZURE_VERSION = re.compile(r"[0-9a-f]{32}\Z")
-_PACK_LOCATOR = re.compile(r"[^\s#?\x00-\x1f\x7f-\x9f]+\Z")
-_PACK_VERSION = re.compile(r"[A-Za-z0-9._-]+\Z")
+#: :data:`SCHEMA_PATTERNS`, compiled: the accept/refuse decision.
+_GRAMMAR = {key: re.compile(pattern) for key, pattern in SCHEMA_PATTERNS.items()}
 #: ``user:password@`` before the locator's first ``/``: a URL with credentials.
 #: Matched against a parsed locator, whose ``#field`` and ``?version`` are split
 #: off, so it stops at them as the schema's lookahead does.
@@ -230,106 +216,61 @@ def parse_secret_ref(raw: object) -> SecretRef:
             scheme=scheme,
         )
 
-    checker = _CHECKS.get(scheme, _check_pack)
-    reason = checker(locator, field, version)
-    if reason:
-        raise _refuse(text, reason, scheme=scheme)
+    key = scheme if scheme in KNOWN_SCHEMES else "pack"
+    if not _GRAMMAR[key].fullmatch(f"{written}://{rest}"):
+        raise _refuse(text, _why(key, locator, field), scheme=scheme)
     return SecretRef(
         scheme=scheme, locator=locator, field=field, version=version, written_scheme=written
     )
 
 
-def _check_env(locator: str, field: Optional[str], version: Optional[str]) -> Optional[str]:
-    if field is not None or version is not None:
-        return "An environment variable has no fields or versions."
-    if not _ENV_NAME.match(locator):
-        return "An environment variable name is letters, digits and '_', not starting with a digit."
-    return None
+#: Why a reference does not match its scheme's pattern, one line per pattern.
+_WHY: Dict[str, str] = {
+    "env": (
+        "An environment variable name is letters, digits and '_', not starting with a "
+        "digit, and it takes no field or version."
+    ),
+    "file": (
+        "A file reference is an absolute path with no field or version, no empty, '.' or "
+        "'..' segment, and no whitespace, '#', '?' or control character."
+    ),
+    "vault": (
+        "A vault reference is <mount>/<path>#<field>: segments of letters, digits or '_', "
+        "'@', '=', '+', '-', '.', none starting with '.', and a version is a whole number "
+        "from 1."
+    ),
+    "aws-sm": (
+        "A Secrets Manager reference names the secret (up to 512 letters, digits and "
+        "'/_+=.@-') or its ARN, and ?version= takes a VersionId (32 to 64 letters, digits "
+        "and '-')."
+    ),
+    "gcp-sm": (
+        "The locator is projects/<project>/secrets/<secret>[/versions/<n>]: the version "
+        "goes in the path, and there are no fields."
+    ),
+    "azure-kv": (
+        "The locator is <vault-name>/<secret> with no field, and ?version= takes a Key "
+        "Vault version id (32 hexadecimal digits)."
+    ),
+    "pack": (
+        "The locator may not contain whitespace, '#', '?' or control characters, and a "
+        "version is letters, digits, '.', '_' or '-'."
+    ),
+}
 
 
-def _check_file(locator: str, field: Optional[str], version: Optional[str]) -> Optional[str]:
-    if field is not None or version is not None:
-        return "A file reference has no fields or versions: the file holds the value."
-    if not locator.startswith("/"):
+def _why(key: str, locator: str, field: Optional[str]) -> str:
+    """The message for a refused reference: a hint for the usual slips, else its line."""
+    if key == "vault" and field is None and "/" in locator.strip("/"):
+        return "A KV v2 secret holds several keys, so name one with #<field>."
+    if key == "file" and not locator.startswith("/"):
         return (
             "A file reference takes an absolute path, so file:// is followed by a third "
             "'/' (file:///run/secrets/name)."
         )
-    segments = locator[1:].split("/")
-    for segment in segments:
-        if segment in ("", ".", ".."):
-            return "The path may not contain empty, '.' or '..' segments."
-        if not _FILE_SEGMENT.match(segment):
-            return "The path may not contain whitespace, '#', '?' or control characters."
-    return None
-
-
-def _check_vault(locator: str, field: Optional[str], version: Optional[str]) -> Optional[str]:
-    mount, slash, path = locator.partition("/")
-    if not slash or not path:
-        return "A vault reference names the KV v2 mount and a path in it: <mount>/<path>."
-    if not _VAULT_MOUNT.match(mount):
-        return "The mount is letters, digits, '_', '-' or '.', not starting with '.'."
-    for segment in path.split("/"):
-        if not _VAULT_PATH_SEGMENT.match(segment):
-            return (
-                "Each path segment is letters, digits or '_', '@', '=', '+', '-', '.', "
-                "not empty and not starting with '.'."
-            )
-    if field is None:
-        return "A KV v2 secret holds several keys, so name one with #<field>."
-    if version is not None and not _VAULT_VERSION.match(version):
-        return "A KV v2 version is a whole number from 1."
-    return None
-
-
-def _check_aws_sm(locator: str, field: Optional[str], version: Optional[str]) -> Optional[str]:
-    if not (_AWS_ARN.match(locator) or (":" not in locator and _AWS_NAME.match(locator))):
-        return (
-            "A Secrets Manager reference names the secret, or its ARN: names are up to 512 "
-            "letters, digits and '/_+=.@-'."
-        )
-    if version is not None and not _AWS_VERSION.match(version):
-        return "?version= takes a Secrets Manager VersionId (32 to 64 letters, digits and '-')."
-    return None
-
-
-def _check_gcp_sm(locator: str, field: Optional[str], version: Optional[str]) -> Optional[str]:
-    if field is not None or version is not None:
-        return "A Secret Manager version goes in the path (/versions/<n>); there are no fields."
-    if not _GCP_LOCATOR.match(locator):
-        return "The locator is projects/<project>/secrets/<secret>[/versions/<n>]."
-    return None
-
-
-def _check_azure_kv(locator: str, field: Optional[str], version: Optional[str]) -> Optional[str]:
-    if field is not None:
-        return "A Key Vault secret holds one value; there are no fields."
-    if not _AZURE_LOCATOR.match(locator):
-        return "The locator is <vault-name>/<secret>: the vault's name, then the secret's."
-    if version is not None and not _AZURE_VERSION.match(version):
-        return "?version= takes a Key Vault version id (32 hexadecimal digits)."
-    return None
-
-
-def _check_pack(locator: str, field: Optional[str], version: Optional[str]) -> Optional[str]:
-    if _USERINFO.match(locator):
+    if key == "pack" and _USERINFO.match(locator):
         return (
             "It carries user:password@, like a connection URL: a reference names a secret "
             "and never holds one, so it is not shown."
         )
-    if not _PACK_LOCATOR.match(locator):
-        return "The locator may not contain whitespace, '#', '?' or control characters."
-    if version is not None and not _PACK_VERSION.match(version):
-        return "A version is letters, digits, '.', '_' or '-'."
-    return None
-
-
-_CHECKS = {
-    "env": _check_env,
-    "file": _check_file,
-    "vault": _check_vault,
-    "aws-sm": _check_aws_sm,
-    "gcp-sm": _check_gcp_sm,
-    "azure-kv": _check_azure_kv,
-}
+    return _WHY[key]
