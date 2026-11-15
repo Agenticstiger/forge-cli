@@ -180,8 +180,9 @@ Use Cases:
             "downgraded to a warning — add --fail-on-warning to gate on those too. "
             "Also exits non-zero when nothing was verified: every expose was "
             "skipped (no verifier for its binding, or a reference-only table not "
-            "built yet). A run that verified at least one expose only reports its "
-            "skips. --warn-only downgrades the nothing-verified failure."
+            "built yet) and no build's post-apply probe read a run record. A run "
+            "that verified anything only reports its skips. --warn-only "
+            "downgrades the nothing-verified failure."
         ),
     )
 
@@ -1361,16 +1362,34 @@ def _state_drift_fails(report: Optional[Any], args: argparse.Namespace) -> bool:
     return True
 
 
+def _probe_checked(check: Any) -> int:
+    """1 when a post-apply probe check read evidence, 0 when there was none.
+
+    A failed ``run_record_present`` (acquisition and dbt probes alike) means the
+    build has not run yet: like a reference-only table not built yet, nothing
+    was checked.
+    """
+    return 0 if (check.name == "run_record_present" and not check.passed) else 1
+
+
+def _named(names: List[str], limit: int = 5) -> str:
+    """``a, b, c`` — at most ``limit`` names, then how many more."""
+    shown = ", ".join(names[:limit])
+    return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
 def _nothing_verified_fails(
-    args: argparse.Namespace, checked: int, unsupported: int, not_built: int
+    args: argparse.Namespace, checked: int, unsupported: List[str], not_built: List[str]
 ) -> bool:
     """Does a ``--strict`` run that verified nothing fail?
 
-    ``--strict`` is the flag a CI gate keys on, so its exit 0 has to mean at
-    least one expose was checked. When every expose was skipped (no verifier
-    for its binding, or a reference-only table its external pipeline has not
-    built yet), the run used to exit 0 on "Match: 0, Mismatch: 0, Error: 0".
-    A run that checked at least one expose only reports its skips, as before.
+    ``--strict`` is the flag a CI gate keys on, so its exit 0 has to mean
+    something was checked. When every expose was skipped (``unsupported``: no
+    verifier for its binding; ``not_built``: a reference-only table its
+    external pipeline has not built yet) and no build's post-apply probe read
+    a run record, the run used to exit 0 on "Match: 0, Mismatch: 0, Error: 0".
+    ``checked`` counts the exposes that were verified plus those probe checks.
+    A run that checked anything only reports its skips, as before.
     ``--fail-on-warning``, the stricter gate, fails the same way, and
     ``--warn-only`` downgrades the failure to a warning. The ``--reconcile-*``
     and ``--state-drift`` sections are not expose checks: they gate on their
@@ -1379,33 +1398,33 @@ def _nothing_verified_fails(
     strict = bool(getattr(args, "strict", False))
     if not (strict or getattr(args, "fail_on_warning", False)):
         return False
-    skipped = unsupported + not_built
+    skipped = len(unsupported) + len(not_built)
     if checked > 0 or skipped == 0:
         return False
     parts = []
     if unsupported:
-        parts.append(f"{unsupported} with no verifier for the binding")
+        parts.append(f"{len(unsupported)} with no verifier for the binding: {_named(unsupported)}")
     if not_built:
-        parts.append(f"{not_built} reference-only, not built yet")
+        parts.append(f"{len(not_built)} reference-only, not built yet: {_named(not_built)}")
     what = f"nothing was verified: all {skipped} expose(s) were skipped ({'; '.join(parts)})"
     if getattr(args, "warn_only", False):
         warning(f"--warn-only: {what}. Not failing the build.")
         return False
     # Worded like ``fluid apply``'s every-build-skipped refusal
     # (build_runners/base.py), which ``--allow-skipped-builds`` waives.
+    waive = (
+        "pass --warn-only (in a generated Jenkins pipeline, set VERIFY_STRICT=false) "
+        "if the skip is expected"
+    )
     if not_built:
         # "Not built" is every reference-only error with ``exists: False``, which
         # can also be a client error; the INFO line above each one says which.
         next_step = (
-            "If the external pipeline has not built the table(s) yet, re-run once it "
-            "has; the INFO lines above give each one's error. Pass --warn-only if the "
-            "skip is expected."
+            f"Re-run once the external pipeline has built {_named(not_built)} (the INFO "
+            f"line above each gives its error), or {waive}."
         )
     else:
-        next_step = (
-            "forge-cli has no verifier for these bindings yet. Pass --warn-only if the "
-            "skip is expected."
-        )
+        next_step = f"forge-cli has no verifier for these bindings yet; {waive}."
     console_error(f"{'--strict' if strict else '--fail-on-warning'}: {what}. {next_step}")
     return True
 
@@ -1776,9 +1795,14 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     # expose verified nothing, though, and fails ``--strict`` on that
     # (``_nothing_verified_fails``).
     unsupported_count = 0
+    unsupported_exposes: List[str] = []
     # Reference-only tables the external pipeline has not built yet: reported as
     # INFO, not an error, and not a check either.
     not_built_count = 0
+    not_built_exposes: List[str] = []
+    # Post-apply probe checks (acquisition / dbt run records) that read a run
+    # record: checks too, for ``_nothing_verified_fails``.
+    probe_check_count = 0
     # Track critical-severity mismatches separately so ``--strict``
     # can differentiate breaking drift (missing fields, type mismatches,
     # region mismatches) from non-breaking constraint drift
@@ -1839,6 +1863,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         if result["status"] == "unsupported":
             cprint_literal(f"   ⏭️  Skipped: {result.get('error', 'no verifier for this format')}")
             unsupported_count += 1
+            unsupported_exposes.append(expose_name)
             continue
 
         if result["status"] == "error":
@@ -1858,6 +1883,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 # be compared, so we report nothing either way. This
                 # mirrors how ``fluid diff`` treats a missing baseline.
                 not_built_count += 1
+                not_built_exposes.append(expose_name)
                 continue
             # Not markup: a message such as "pip install 'data-product-forge[aws]'"
             # lost its ``[aws]`` to Rich, which read it as a style tag.
@@ -1989,6 +2015,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 for c in r.checks:
                     icon = "✅" if c.passed else "❌"
                     cprint_literal(f"      {icon} {c.name}: {c.detail}")
+                    probe_check_count += _probe_checked(c)
                     if not c.passed:
                         mismatch_count += 1
     except Exception as exc:  # noqa: BLE001 — verify must not crash the CLI
@@ -2018,6 +2045,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
                 for c in r.checks:
                     icon = "✅" if c.passed else "❌"
                     cprint_literal(f"      {icon} {c.name}: {c.detail}")
+                    probe_check_count += _probe_checked(c)
                     if not c.passed:
                         mismatch_count += 1
                         if c.name in CRITICAL_TRANSFORMATION_CHECK_NAMES:
@@ -2186,8 +2214,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         )
         return 1
 
-    checked_count = len(results) - unsupported_count - not_built_count
-    if _nothing_verified_fails(args, checked_count, unsupported_count, not_built_count):
+    checked_count = len(results) - unsupported_count - not_built_count + probe_check_count
+    if _nothing_verified_fails(args, checked_count, unsupported_exposes, not_built_exposes):
         return 1
 
     # Exit with error code if strict mode and CRITICAL issues found.

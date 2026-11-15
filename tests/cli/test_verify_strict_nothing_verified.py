@@ -10,8 +10,11 @@ zero checks performed. The same held for a GCP binding with no verifier and
 for a reference-only contract whose tables are not built yet.
 
 The rule: a ``--strict`` (or ``--fail-on-warning``) run fails when every expose
-was skipped. A run that checked at least one expose only reports its skips,
-as it always did. ``--warn-only`` downgrades the failure to a warning.
+was skipped and no build's post-apply probe read a run record. A run that
+checked anything only reports its skips, as it always did. ``--warn-only``, or
+``VERIFY_STRICT=false`` in a generated Jenkins pipeline, accepts the run. A
+reference-only contract whose tables are not built yet used to pass ``--strict``;
+it now fails on purpose until its external pipeline has run.
 
 Every test runs ``verify.run`` on a real contract file through the real
 argument parser; none of these paths needs cloud credentials.
@@ -21,8 +24,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pytest
 import yaml
@@ -56,13 +61,22 @@ def _local_csv(expose_id: str, path: str) -> Dict[str, Any]:
     }
 
 
+_PRODUCT_ID = "example.verify_strict"
+# A dbt build: verify's transformation probes read its run record.
+_DBT_BUILD = {"id": "transform", "engine": "dbt"}
+
+
 def _write_contract(
-    tmp_path: Path, exposes: List[Dict[str, Any]], *, reference_only: bool = False
+    tmp_path: Path,
+    exposes: List[Dict[str, Any]],
+    *,
+    reference_only: bool = False,
+    builds: Optional[List[Dict[str, Any]]] = None,
 ) -> Path:
     contract: Dict[str, Any] = {
         "fluidVersion": "0.7.5",
         "kind": "DataProduct",
-        "id": "example.verify_strict",
+        "id": _PRODUCT_ID,
         "name": "Verify strict",
         "domain": "example",
         "metadata": {"layer": "Bronze", "owner": {"team": "t", "email": "t@example.com"}},
@@ -71,6 +85,8 @@ def _write_contract(
     if reference_only:
         # The external dbt / Airflow project owns the tables.
         contract["builds"] = [{"id": "external", "pattern": "hybrid-reference"}]
+    if builds:
+        contract["builds"] = builds
     path = tmp_path / "contract.fluid.yaml"
     path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
     return path
@@ -106,8 +122,11 @@ def test_strict_fails_when_every_expose_was_skipped(two_aws_parquet: Path, capsy
     text = _printed(capsys)
     assert text.count("No verifier for this aws binding") == 2
     assert "--strict: nothing was verified: all 2 expose(s) were skipped" in text
-    assert "2 with no verifier for the binding" in text
-    assert "no verifier for these bindings yet. Pass --warn-only if the skip is expected" in text
+    assert "(2 with no verifier for the binding: orders, items)" in text
+    assert (
+        "forge-cli has no verifier for these bindings yet; pass --warn-only (in a generated "
+        "Jenkins pipeline, set VERIFY_STRICT=false) if the skip is expected"
+    ) in text
 
 
 def test_without_strict_a_run_that_verified_nothing_still_exits_0(two_aws_parquet: Path) -> None:
@@ -141,7 +160,7 @@ def test_a_gcp_binding_with_no_verifier_is_a_skip(tmp_path: Path, capsys) -> Non
 
     text = _printed(capsys)
     assert "No verifier for this GCP binding" in text
-    assert "all 1 expose(s) were skipped (1 with no verifier for the binding)" in text
+    assert "all 1 expose(s) were skipped (1 with no verifier for the binding: landing)" in text
 
 
 def test_a_reference_only_table_not_built_yet_is_a_skip(tmp_path: Path, capsys) -> None:
@@ -156,9 +175,10 @@ def test_a_reference_only_table_not_built_yet_is_a_skip(tmp_path: Path, capsys) 
     text = _printed(capsys)
     assert "reference-only — external pipeline owns creation" in text
     assert "Not built yet (reference-only): 1" in text
-    assert "(1 reference-only, not built yet)" in text
-    assert "If the external pipeline has not built the table(s) yet, re-run once it has" in text
-    assert "the INFO lines above give each one's error" in text
+    assert "(1 reference-only, not built yet: customers)" in text
+    assert "Re-run once the external pipeline has built customers" in text
+    assert "(the INFO line above each gives its error)" in text
+    assert "set VERIFY_STRICT=false" in text
     assert "could not be verified" not in text  # still not an error
 
     assert _verify(contract, "--strict", "--warn-only") == 0
@@ -224,3 +244,112 @@ def test_the_json_report_counts_both_kinds_of_skip(tmp_path: Path) -> None:
         "unsupported": 1,
         "not_built": 1,
     }
+
+
+# ── The two documented ways to accept a run that verifies nothing ─────────────
+
+
+def _jenkins_stage9_flags(verify_strict: str) -> List[str]:
+    """The flags stage 9 of a generated Jenkinsfile adds to ``fluid verify`` when
+    the build's VERIFY_STRICT parameter is ``verify_strict``: the Jenkinsfile's
+    own shell line, run with ``sh``."""
+    from fluid_build.forge.core.pipeline_templates import (
+        PipelineComplexity,
+        PipelineConfig,
+        PipelineProvider,
+        PipelineTemplateGenerator,
+    )
+
+    cfg = PipelineConfig(provider=PipelineProvider.JENKINS, complexity=PipelineComplexity.BASIC)
+    jenkinsfile = PipelineTemplateGenerator().generate_pipeline(cfg)["Jenkinsfile"]
+    [line] = [
+        ln.strip()
+        for ln in jenkinsfile.splitlines()
+        if "VERIFY_STRICT" in ln and 'set -- "$@" --strict' in ln
+    ]
+    proc = subprocess.run(
+        ["sh", "-c", f'set -- verify; {line}; shift; printf "%s\\n" "$@"'],
+        env={**os.environ, "VERIFY_STRICT": verify_strict},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [arg for arg in proc.stdout.splitlines() if arg]
+
+
+@pytest.mark.parametrize("escape", ["--warn-only", "VERIFY_STRICT=false"])
+@pytest.mark.parametrize("skip", ["no verifier", "reference-only, not built yet"])
+def test_each_documented_escape_accepts_a_run_that_verified_nothing(
+    escape: str, skip: str, tmp_path: Path
+) -> None:
+    if skip == "no verifier":
+        contract = _write_contract(tmp_path, [_aws_parquet("orders", "bronze/o1/")])
+    else:  # a fresh reference-only deploy, before its external pipeline has run
+        contract = _write_contract(
+            tmp_path, [_local_csv("customers", "runtime/out/customers.csv")], reference_only=True
+        )
+    # A generated Jenkins pipeline's stage 9 runs --strict by default, and fails.
+    assert _jenkins_stage9_flags("true") == ["--strict"]
+    assert _verify(contract, *_jenkins_stage9_flags("true")) == 1
+
+    flags = (
+        ["--strict", "--warn-only"] if escape == "--warn-only" else _jenkins_stage9_flags("false")
+    )
+
+    assert _verify(contract, *flags) == 0
+
+
+# ── Post-apply probes are checks ──────────────────────────────────────────────
+
+
+def _dbt_run_record(tmp_path: Path, **facets: int) -> None:
+    """The run record the dbt runner writes, where verify's probes read it."""
+    runs = tmp_path / ".fluid" / "runs" / _PRODUCT_ID / _DBT_BUILD["id"] / "runs"
+    runs.mkdir(parents=True)
+    record = {"state": "SUCCEEDED", "facets": facets}
+    (runs / "0001.json").write_text(json.dumps(record), encoding="utf-8")
+
+
+def test_a_dbt_run_record_the_probes_read_is_a_check(tmp_path: Path, capsys) -> None:
+    """The transformation probes read the build's run record, which verified
+    something: an expose with no verifier beside it does not fail --strict."""
+    contract = _write_contract(
+        tmp_path, [_aws_parquet("orders", "bronze/o1/")], builds=[_DBT_BUILD]
+    )
+    _dbt_run_record(tmp_path, tests_total=3, tests_passed=3, tests_failed=0)
+
+    assert _verify(contract, "--strict") == 0
+
+    text = _printed(capsys)
+    assert "dbt_tests_passed: 3/3 tests passed, 0 failed" in text
+    assert "nothing was verified" not in text
+
+
+def test_a_dbt_build_with_no_run_record_yet_is_not_a_check(tmp_path: Path, capsys) -> None:
+    contract = _write_contract(
+        tmp_path, [_aws_parquet("orders", "bronze/o1/")], builds=[_DBT_BUILD]
+    )
+
+    assert _verify(contract, "--strict") == 1
+
+    text = _printed(capsys)
+    assert "run_record_present: no dbt run record found" in text
+    assert "nothing was verified: all 1 expose(s) were skipped" in text
+
+
+def test_a_failing_dbt_probe_fails_strict_for_what_it_found(tmp_path: Path, capsys) -> None:
+    contract = _write_contract(
+        tmp_path, [_aws_parquet("orders", "bronze/o1/")], builds=[_DBT_BUILD]
+    )
+    _dbt_run_record(tmp_path, tests_total=3, tests_passed=2, tests_failed=1)
+
+    assert _verify(contract, "--strict") == 1
+
+    text = _printed(capsys)
+    assert "dbt_tests_passed: 2/3 tests passed, 1 failed" in text
+    assert "nothing was verified" not in text
+
+
+def test_the_message_names_at_most_five_exposes() -> None:
+    assert verify_mod._named(["orders", "items"]) == "orders, items"
+    assert verify_mod._named([f"e{i}" for i in range(7)]) == "e0, e1, e2, e3, e4 and 2 more"

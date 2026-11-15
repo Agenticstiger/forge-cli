@@ -91,15 +91,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (no verifier for its binding, such as an AWS bucket, a GCS bucket or a Kafka topic, or a
   reference-only table its external pipeline has not built yet), the run printed
   `Match: 0 / Mismatch: 0 / Error: 0` and exited 0, so a CI gate keyed on `--strict` passed with
-  no check performed. It now exits 1 and says which exposes were skipped and why.
-  `--fail-on-warning` fails the same way, and `--warn-only` downgrades it to a warning. A run
-  that verified at least one expose only reports its skips, as before, and a reference-only
-  table that is not built yet is still INFO, never an error. The summary's first line reads
-  `Total exposes` (it said `Total verified`, counting the skipped ones), and the `--out`
-  report's summary gains `not_built`. Stage 9 of a generated pipeline runs
-  `fluid verify --strict`, so a product none of whose exposes forge-cli can verify now fails
-  it, and a reference-only product fails it until its external pipeline has built a table
-  (in Jenkins, the `VERIFY_STRICT` parameter turns `--strict` off).
+  no check performed. It now exits 1 and names the exposes it skipped and why.
+  `--fail-on-warning` fails the same way. `--warn-only` downgrades it to a warning, and so does
+  `VERIFY_STRICT=false` in a generated Jenkins pipeline, which drops `--strict`. The library's
+  `engine.verify()` takes `warn_only=` for the same downgrade. A run that verified at least one
+  expose, or whose build's post-apply probes read a run record, only reports its skips, as
+  before. The summary's first line reads `Total exposes` (it said `Total verified`, counting
+  the skipped ones), and the `--out` report's summary gains `not_built`.
+  - **Behaviour change for reference-only contracts.** A reference-only contract whose tables
+    are not built yet used to pass `--strict`, since a missing table there is INFO. It now
+    fails on purpose: on its own such a run verified nothing. The table is still INFO, never
+    an error, and beside a checked expose the run still passes.
+  - **Generated pipelines.** Stage 9 runs `fluid verify --strict`. So a product none of whose
+    exposes forge-cli can verify now fails it, and so does a fresh reference-only deploy, until
+    its external pipeline has built a table.
 - **The IaC suite runs on OpenTofu 1.13.9 as well as 1.12.0.** Stage 1 and Stage 2 of
   `iac-tests.yml` run once per version, each pinned by the SHA-256 of its release zip, taken
   from the release's GPG-signed `SHA256SUMS`.

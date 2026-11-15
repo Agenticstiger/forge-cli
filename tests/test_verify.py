@@ -514,14 +514,18 @@ class TestRunReferenceOnly:
         }
 
     @pytest.mark.parametrize("warn_only, expected", [(True, 0), (False, 1)])
-    def test_reference_only_missing_table_is_not_an_error_under_strict(
+    def test_reference_only_missing_table_fails_strict_unless_warn_only(
         self, tmp_path, warn_only, expected
     ):
-        """Fresh A1 deploy: external dbt hasn't run, table missing. Bug 6: that
-        is INFO, never an error. It is not a check either, so a --strict run
-        whose only expose is such a table verified nothing and exits 1
-        (``_nothing_verified_fails``); --warn-only accepts it for a first
-        deploy. Beside one checked expose it passes, as before."""
+        """Fresh A1 deploy: external dbt hasn't run, table missing.
+
+        This used to exit 0 under --strict (Bug 6). It now exits 1 on purpose:
+        the table is still INFO, never an error, but it is not a check either,
+        so a --strict run whose only expose is such a table verified nothing
+        (``_nothing_verified_fails``). --warn-only, or VERIFY_STRICT=false in a
+        generated Jenkins pipeline, accepts it on a first deploy. Beside one
+        checked expose it passes, as before
+        (tests/cli/test_verify_strict_nothing_verified.py)."""
         contract_path = tmp_path / "c.yaml"
         contract_path.write_text("id: t\n")
         args = _make_args(contract=str(contract_path), strict=True)

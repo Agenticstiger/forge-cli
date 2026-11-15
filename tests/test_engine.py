@@ -440,6 +440,31 @@ async def test_bundle_returns_bundle_result_type(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_verify_strict_fails_a_run_that_verified_nothing_unless_warn_only(
+    tmp_path, monkeypatch
+):
+    """The real stage, no stubs: an AWS parquet expose has no verifier, so a
+    strict run verified nothing and fails; ``warn_only`` accepts it, as
+    ``fluid verify --strict --warn-only`` does."""
+    monkeypatch.chdir(tmp_path)
+    contract = tmp_path / "c.fluid.yaml"
+    contract.write_text(
+        "fluidVersion: '0.7.5'\nkind: DataProduct\nid: example.engine_verify\nname: E\n"
+        "domain: example\nmetadata: {layer: Bronze, owner: {team: t, email: t@example.com}}\n"
+        "exposes:\n  - exposeId: orders\n    kind: table\n"
+        "    binding: {platform: aws, format: parquet, location: {bucket: b, path: o/}}\n"
+        "    contract: {schema: [{name: id, type: string}]}\n",
+        encoding="utf-8",
+    )
+
+    strict = await engine.verify(contract, strict=True)
+    waived = await engine.verify(contract, strict=True, warn_only=True)
+
+    assert not strict.success and strict.exit_code == 1
+    assert waived.success and waived.exit_code == 0
+
+
+@pytest.mark.asyncio
 async def test_verify_reads_back_report_artifact(tmp_path, monkeypatch):
     contract = tmp_path / "c.fluid.yaml"
     contract.write_text("apiVersion: fluid.dev/v1\n")
