@@ -51,9 +51,16 @@ def _isolated_secret_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(registry, "_LOADED", {})
     monkeypatch.setattr(registry, "_REGISTERED", {})
+    # The pack discovery is read once per process; a test may patch it away,
+    # so clear the real one, captured before any test can replace it.
+    discovery = registry._entry_points
+    discovery.cache_clear()
+    for name in ("FLUID_PLUGINS_ALLOWLIST", "FLUID_PLUGINS_BLOCKLIST"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(_vault, "_UNWRAPPED", set())
     # The state lookups share outside every stage lives for the process: give
     # each test its own, and close it (revoking what it minted) afterwards.
     run._close_orphan()
     yield
     run._close_orphan()
+    discovery.cache_clear()

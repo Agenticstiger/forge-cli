@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file, a JWT login for CI (`FLUID_VAULT_JWT_ROLE`) and a response-wrapped token
   (`FLUID_VAULT_WRAPPED_TOKEN`)), and `aws-sm://<name-or-arn>[#json-key]` (alias `aws://`, from
   the `[aws]` extra). Other stores arrive as packs in the `fluid_build.secret_resolvers`
-  entry-point group; `gcp-sm://` and `azure-kv://` say which pack to install. A resolved value is
+  entry-point group, found and allowed like every other plugin (`FLUID_PLUGINS_ALLOWLIST` /
+  `_BLOCKLIST`, `fluid plugins` lists them); `gcp-sm://` and `azure-kv://` say which pack to
+  install. A resolved value is
   a `SecretStr`, registered with the exact-value redactor, cached for the run only, and audited
   as a `fluid.secret.resolve` span event that never carries it; a token forge mints is revoked
   when the run ends. No new dependency.

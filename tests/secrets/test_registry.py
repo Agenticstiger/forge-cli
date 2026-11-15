@@ -120,3 +120,61 @@ def test_pack_object_without_resolve_is_treated_as_missing(monkeypatch):
     with pytest.raises(SecretResolveError) as info:
         registry.get_resolver("op")
     assert info.value.extras["reason"] == "no_resolver"
+
+
+# ── discovery: the plugin policy, once per process ───────────────────────────
+
+
+@pytest.mark.unit
+def test_the_group_is_read_once_however_many_references_ask():
+    """check_available and get_resolver share one read (was one per call)."""
+    calls = []
+
+    def fake(**kwargs):
+        calls.append(kwargs)
+        return []
+
+    import fluid_build.plugin_manager as pm
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(importlib.metadata, "entry_points", fake)
+        for _ in range(5):
+            with pytest.raises(SecretResolveError):
+                registry.check_available("gcp-sm")
+            with pytest.raises(SecretResolveError):
+                registry.get_resolver("gcp-sm")
+    assert calls == [{"group": registry.ENTRY_POINT_GROUP}]
+    assert pm.EXTRA_GROUPS["secret_resolver"] == registry.ENTRY_POINT_GROUP
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"FLUID_PLUGINS_BLOCKLIST": "op"},
+        {"FLUID_PLUGINS_ALLOWLIST": "some_other_plugin"},
+    ],
+    ids=["blocked", "not-on-the-allowlist"],
+)
+def test_a_pack_the_plugin_policy_refuses_is_not_seen(monkeypatch, env):
+    """A resolver receives secret values: it passes the same policy as any plugin."""
+    loaded = []
+    entry = SimpleNamespace(
+        name="op", value="pack:Resolver", load=lambda: loaded.append(1) or _PackResolver
+    )
+    _patch_entry_points(monkeypatch, [entry])
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert registry.installed_packs() == {}
+    with pytest.raises(SecretResolveError) as info:
+        registry.get_resolver("op")
+    assert info.value.extras["reason"] == "no_resolver"
+    assert loaded == []
+
+
+@pytest.mark.unit
+def test_a_pack_on_the_allowlist_is_seen(monkeypatch):
+    entry = SimpleNamespace(name="op", value="pack:Resolver", load=lambda: _PackResolver)
+    _patch_entry_points(monkeypatch, [entry])
+    monkeypatch.setenv("FLUID_PLUGINS_ALLOWLIST", "op")
+    assert isinstance(registry.get_resolver("op"), _PackResolver)

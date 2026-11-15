@@ -68,6 +68,11 @@ EXTRA_GROUPS: Dict[str, str] = {
     # registered lazily in ``cli/_llm_provider_plugins.py``; listed here so
     # ``fluid plugins`` surfaces them and the allow/block policy governs them.
     LLM_PROVIDER_GROUP_KEY: "fluid_build.llm_providers",
+    # Secret-resolver packs for non-core secretRef schemes (gcp-sm://,
+    # azure-kv://, ...). Read in ``secrets/registry.py`` (its
+    # ``ENTRY_POINT_GROUP``); a resolver receives secret values, so the
+    # allow/block policy governs it like every other plugin.
+    "secret_resolver": "fluid_build.secret_resolvers",  # pragma: allowlist secret
 }
 
 

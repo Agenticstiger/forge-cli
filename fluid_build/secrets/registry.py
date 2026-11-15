@@ -12,13 +12,18 @@ other store arrives as a pack that registers a resolver in the
     [project.entry-points."fluid_build.secret_resolvers"]
     gcp-sm = "fluid_secrets_gcp:GcpSecretManagerResolver"
 
-with no core edit, the shape of ``register_iac_plugin``. A pack's scheme still
-resolves only once the operator enables it (``FLUID_SECRET_SCHEMES``), and a
-pack can never take over a core scheme: the core resolver always wins.
+with no core edit, the shape of ``register_iac_plugin``. Packs are found the
+way every other plugin is (``plugin_manager``), and pass the same allow/block
+policy (``FLUID_PLUGINS_ALLOWLIST`` / ``FLUID_PLUGINS_BLOCKLIST``): a resolver
+receives secret values, so a pack the operator has not allowed is not seen at
+all. The group is read once per process. A pack's scheme still resolves only
+once the operator enables it (``FLUID_SECRET_SCHEMES``), and a pack can never
+take over a core scheme: the core resolver always wins.
 """
 
 from __future__ import annotations
 
+import functools
 import importlib
 import logging
 import threading
@@ -100,20 +105,27 @@ def _load_core(scheme: str) -> SecretResolver:
     return resolver
 
 
+@functools.lru_cache(maxsize=1)
 def _entry_points() -> Dict[str, Any]:
-    """Installed packs by scheme name. Core scheme names are ignored."""
-    from importlib.metadata import entry_points
+    """Installed packs the plugin policy allows, by scheme name, read once per process.
+
+    Core scheme names are ignored. ``_entry_points.cache_clear()`` re-reads the
+    group (tests). Callers must not mutate the result.
+    """
+    from fluid_build import plugin_manager
 
     out: Dict[str, Any] = {}
-    for entry in entry_points(group=ENTRY_POINT_GROUP):
+    for entry in plugin_manager._entry_points(ENTRY_POINT_GROUP):
         if entry.name in CORE_SCHEMES:
             LOG.warning(
                 "ignoring secret-resolver pack %r for core scheme %s://",
                 getattr(entry, "value", entry.name),
                 entry.name,
             )
-            continue
-        out[entry.name] = entry
+        elif not plugin_manager.is_allowed(entry.name):
+            LOG.info("secret-resolver pack %r is not allowed by the plugin policy", entry.name)
+        else:
+            out[entry.name] = entry
     return out
 
 
