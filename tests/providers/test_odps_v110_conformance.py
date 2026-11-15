@@ -18,9 +18,8 @@ Where forge stands, as of this file:
   a schema bump, not silently (``validation.py::DEFAULT_API_VERSION``, pinned by
   ``test_odps_v11_type.py``). Nothing here changes that.
 * It reads v1.1.0 documents: all five official examples validate and import.
-* It does not yet carry every v1.1.0 field through import then export. The gap
-  tests below say which, and ``test_odps_import_version_pin.py`` is where the
-  import side is pinned for the fields it does carry.
+* It does not yet carry every v1.1.0 field through import then export. The
+  probes below say which fields it carries and which it loses.
 
 The fixtures in ``tests/fixtures/odps/upstream-v1.1.0/`` are the five files of
 ``docs/examples`` at tag v1.1.0 (commit 04995037fc003ead1da27f65a40a09eb0664b591
