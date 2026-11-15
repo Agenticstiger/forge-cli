@@ -158,18 +158,20 @@ class OutputPortPolicy:
 
     The claim is supplied by
     ``OutputPortMcpServer._resolve_verified_jurisdiction``, which reads the
-    cryptographically verified channel — ``request.scope["fluid_auth_attrs"]``,
-    written by the HTTP auth gate (``fluid_build._mcp_http``) after it validates a JWT or mTLS
-    identity — and never the caller's self-attested ``clientInfo``. That
-    asymmetry is deliberate and is the control: everywhere else in this server
+    cryptographically verified channel (``request.scope["fluid_auth_attrs"]``)
+    and never the caller's self-attested ``clientInfo``. That asymmetry is
+    deliberate and is the control: everywhere else in this server
     self-attestation still binds when no auth is configured, and a jurisdiction
     that a client could type would be no gate at all.
 
-    Two deployments therefore cannot satisfy such a rule, and both are refused
-    at startup by ``_jurisdiction_gate_unsatisfiable`` rather than denying
-    every call one at a time: stdio, which carries no headers so the middleware
-    never runs, and HTTP with no ``FLUID_MCP_AUTH_MODE``, where the middleware
-    short-circuits before stamping anything.
+    The HTTP auth gate (``fluid_build._mcp_http``) writes that map after it
+    authenticates a request, and a jurisdiction lands in it only from a
+    validated JWT claim mapped to ``jurisdiction``. No other deployment can
+    satisfy such a rule, so ``_jurisdiction_gate_unsatisfiable`` refuses each
+    at startup rather than denying every call one at a time: stdio, which
+    carries no headers; HTTP with auth off, where the middleware short-circuits
+    before stamping anything; HTTP with a shared token, which carries no
+    claims; and JWT auth whose claim mapping sends nothing to ``jurisdiction``.
 
     A correction worth leaving visible, because it changed what got built: an
     earlier version of this note claimed the blocker was that no HTTP transport

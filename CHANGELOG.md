@@ -273,6 +273,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool.** `fluid mcp serve` already did. Before, a mistyped deny list denied nothing and left the
   tool callable, and a mistyped allow list served fewer tools without a word. The refusal exits 2
   before either transport binds, names only the unknown names, and lists the tools.
+- **`fluid mcp output-port serve` refuses to start when a pinned jurisdiction could never be
+  verified.** A contract that pins `sovereignty.jurisdiction` (and does not allow
+  `crossBorderTransfer`) admits a call only with a verified caller jurisdiction, and only a JWT
+  claim mapped to `jurisdiction` carries one: a shared token carries no claims, and a trusted
+  proxy forwards only a certificate's CN and fingerprint. The gateway already refused stdio and
+  `FLUID_MCP_AUTH_MODE=none`. Under `shared-token` (with or without a token, behind a trusted
+  proxy or not), `jwt` without its issuer, audience and JWKS URL, or a
+  `FLUID_MCP_JWT_CLAIM_MAPPING` that sends no claim to `jurisdiction`, it started and then denied
+  every call with `missing-caller-jurisdiction`. Each now exits 2 before listening, with one
+  message that names the jurisdiction and the way out: JWT auth with the claim mapped, or
+  `sovereignty.crossBorderTransfer: true`. The gate now judges the auth validator built from the
+  same variables the server reads, instead of reading `FLUID_MCP_AUTH_MODE` itself, so the
+  message also stops saying the mode is unset when it is `none`. The README said an mTLS
+  identity could carry a jurisdiction; only a validated JWT can.
 
 ### Security
 
