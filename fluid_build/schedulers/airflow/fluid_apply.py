@@ -106,8 +106,10 @@ PASSTHROUGH_PREFIXES = (
     "POSTGRES_",
     "REDSHIFT_",
     "ATHENA_",
-    # vault:// secretRefs (VAULT_ADDR, VAULT_TOKEN)
+    # vault:// secretRefs, under Vault's names and OpenBao's (VAULT_ADDR,
+    # BAO_ADDR, BAO_TOKEN, BAO_NAMESPACE, BAO_CACERT ...)
     "VAULT_",
+    "BAO_",
     # build engines and catalog registration
     "DBT_",
     "DLT_",
@@ -205,7 +207,7 @@ _MAX_CONTRACT_PATH = 512
 # a shell can hold: the ``{{ env.NAME }}`` placeholder the loader and providers
 # resolve, the ``${NAME}`` placeholder the schema documents (dbt sources turn
 # it into ``env_var``), and an ``env://NAME`` secretRef, which
-# ``resolve_secret_ref`` reads straight from the environment.
+# ``fluid_build.secrets`` reads straight from the environment.
 _ENV_TEMPLATE_RE = re.compile(r"\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 _SHELL_TEMPLATE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _ENV_SECRET_REF_RE = re.compile(r"\s*env\s*://\s*([A-Za-z_][A-Za-z0-9_]*)\s*", re.IGNORECASE)

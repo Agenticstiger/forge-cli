@@ -18,7 +18,6 @@ from fluid_build.build_runners._acquisition_common import (
     extract_source_schemas,
     generate_run_id,
     resolve_connection_secrets,
-    resolve_secret_ref,
     setdefault_env,
     utc_now_iso,
 )
@@ -38,6 +37,12 @@ from fluid_build.build_runners._retention import RetentionConfig, parse_iso_dura
 from fluid_build.build_runners._retry import RetryPolicy, is_retryable, with_retry
 from fluid_build.build_runners._schema_evolution import EvolutionAction, resolve
 from fluid_build.build_runners._state import FileStateStore, LockHeldError
+from fluid_build.secrets import (
+    SecretPolicyError,
+    SecretRefError,
+    SecretResolveError,
+    secret_run,
+)
 
 # ── _acquisition_common ──────────────────────────────────────────────────
 
@@ -61,40 +66,58 @@ class TestRunIds:
 # ── secretRef resolution (acquisition runners) ──────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _as_the_apply_stage():
+    """resolve_secret refuses outside a pipeline stage; these cases run as ``apply``."""
+    with secret_run("apply"):
+        yield
+
+
 class TestResolveSecretRef:
-    """``env://`` short-circuit + dispatch to the cloud SecretManager backends."""
+    """The reference goes through ``fluid_build.secrets.resolve_secret`` (typed errors).
+
+    Was ``resolve_secret_ref`` raising ValueError; the grammar, scheme and store
+    errors are now SecretRefError / SecretPolicyError / SecretResolveError.
+    """
+
+    @staticmethod
+    def _resolve(ref: str) -> str:
+        out = resolve_connection_secrets({"host": "localhost", "secretRef": ref})
+        return out["password"]
 
     def test_env_scheme_reads_os_environ(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("ACQ_TEST_SECRET", "s3cret-value")
-        assert resolve_secret_ref("env://ACQ_TEST_SECRET") == "s3cret-value"
+        assert self._resolve("env://ACQ_TEST_SECRET") == "s3cret-value"
 
-    def test_env_scheme_unset_var_raises_value_error(self, monkeypatch: pytest.MonkeyPatch):
+    def test_env_scheme_unset_var_raises_resolve_error(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("ACQ_TEST_MISSING", raising=False)
-        with pytest.raises(ValueError, match="environment variable not set"):
-            resolve_secret_ref("env://ACQ_TEST_MISSING")
+        with pytest.raises(SecretResolveError, match="did not resolve"):
+            self._resolve("env://ACQ_TEST_MISSING")
 
     @pytest.mark.parametrize(
         "bad_ref",
-        ["", "no_scheme", "env://", "://identifier", "env:/missing-slash"],
+        ["no_scheme", "env://", "://identifier", "env:/missing-slash"],
     )
-    def test_malformed_secret_ref_raises_value_error(self, bad_ref: str):
-        with pytest.raises(ValueError, match="<scheme>://<identifier>"):
-            resolve_secret_ref(bad_ref)
+    def test_malformed_secret_ref_raises_ref_error(self, bad_ref: str):
+        with pytest.raises(SecretRefError, match="not a valid secret reference"):
+            self._resolve(bad_ref)
 
-    def test_unsupported_scheme_lists_supported_schemes(self):
-        with pytest.raises(ValueError, match="not supported") as excinfo:
-            resolve_secret_ref("madeup://x")
-        # The error message must enumerate supported schemes so the operator
-        # can fix the contract without grepping the source.
-        msg = str(excinfo.value)
-        assert "env" in msg
-        assert "vault" in msg
-        assert "aws" in msg
+    def test_a_scheme_the_operator_has_not_enabled_is_refused_first(self):
+        """The policy runs before any resolver is looked up, so nothing is imported."""
+        with pytest.raises(SecretPolicyError, match="madeup:// scheme is not enabled"):
+            self._resolve("madeup://x")
+
+    def test_an_enabled_scheme_without_a_pack_says_no_resolver_is_installed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("FLUID_SECRET_SCHEMES", "env,madeup")
+        with pytest.raises(SecretResolveError, match="no resolver for madeup://"):
+            self._resolve("madeup://x")
 
     def test_scheme_is_case_insensitive(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("ACQ_TEST_SECRET", "x")
-        assert resolve_secret_ref("ENV://ACQ_TEST_SECRET") == "x"
-        assert resolve_secret_ref("Env://ACQ_TEST_SECRET") == "x"
+        assert self._resolve("ENV://ACQ_TEST_SECRET") == "x"
+        assert self._resolve("Env://ACQ_TEST_SECRET") == "x"
 
 
 class TestResolveConnectionSecrets:
@@ -105,7 +128,7 @@ class TestResolveConnectionSecrets:
         """These cases exercise RESOLUTION, not the send policy.
 
         ``env://`` to a remote host now needs the operator's allowlist
-        (``build_runners/_secret_policy``), and ``db.example`` is remote. Listing
+        (``fluid_build/secrets/policy.py``), and ``db.example`` is remote. Listing
         the variables keeps these tests about what they were about, and is the
         same one-line change an operator makes on upgrade. The policy itself is
         covered in ``test_acquisition_secret_policy.py``.
@@ -170,8 +193,8 @@ class TestResolveConnectionSecrets:
             "token": "ghp_abc123",
         }
 
-    def test_unsupported_scheme_propagates_value_error(self):
-        with pytest.raises(ValueError, match="not supported"):
+    def test_unsupported_scheme_propagates_the_policy_refusal(self):
+        with pytest.raises(SecretPolicyError, match="madeup:// scheme is not enabled"):
             resolve_connection_secrets({"host": "x", "secretRef": "madeup://identifier"})
 
     def test_does_not_mutate_input_dict(self, monkeypatch: pytest.MonkeyPatch):

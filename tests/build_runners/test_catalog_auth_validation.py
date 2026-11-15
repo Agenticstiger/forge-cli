@@ -18,12 +18,12 @@ from typing import Any, Dict, Optional
 import pytest
 
 from fluid_build.build_runners._deployment_host_policy import ALLOWLIST_ENV as HOST_ALLOWLIST
-from fluid_build.build_runners._secret_policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST
 from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
     iceberg_sink_preflight,
     validate_iceberg_sink,
 )
 from fluid_build.providers._iceberg_catalog import catalog_kind_info, known_catalog_kinds
+from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST
 
 pytestmark = [pytest.mark.unit]
 

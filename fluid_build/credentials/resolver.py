@@ -26,8 +26,7 @@ class CredentialSource(Enum):
     KEYRING = 4  # OS keyring
     ENCRYPTED_FILE = 5  # Encrypted local file
     CONFIG_FILE = 6  # Config file
-    VAULT = 7  # HashiCorp Vault
-    SECRET_MANAGER = 8  # Cloud secret managers
+    SECRET_STORE = 7  # The operator's explicit store (FLUID_CREDENTIAL_STORE)
     PROVIDER_DEFAULT = 9  # Provider-specific defaults (e.g., ADC for GCP)
     PROMPT = 10  # Interactive prompt (lowest priority)
 
@@ -104,8 +103,9 @@ class BaseCredentialResolver(ABC):
         4. OS Keyring (secure local storage)
         5. Encrypted file (~/.fluid/credentials.enc)
         6. Config file (~/.fluidrc.yaml)
-        7. Vault (HashiCorp Vault)
-        8. Secret Manager (GCP/AWS/Azure)
+        7. The operator's secret store, only when FLUID_CREDENTIAL_STORE names
+           one (vault://<mount>/<prefix> or aws-sm://<prefix>; never chosen by
+           ambient variables such as AWS_REGION or GCP_PROJECT)
         9. Provider-specific default (e.g., ADC for GCP)
         10. Interactive prompt (if allowed)
 
@@ -186,17 +186,11 @@ class BaseCredentialResolver(ABC):
             if value:
                 logger.debug("Credential resolved from: config file")
 
-        # 7. Vault
+        # 7. The operator's secret store, when one is named
         if value is None and not pinned:
-            value = self._get_from_vault(key)
+            value = self._get_from_secret_store(key)
             if value:
-                logger.debug("Credential resolved from: Vault")
-
-        # 8. Secret Manager
-        if value is None and not pinned:
-            value = self._get_from_secret_manager(key)
-            if value:
-                logger.debug("Credential resolved from: secret manager")
+                logger.debug("Credential resolved from: secret store")
 
         # 9. Provider-specific default
         if value is None and not pinned:
@@ -391,66 +385,46 @@ class BaseCredentialResolver(ABC):
 
         return None
 
-    def _get_from_vault(self, key: str) -> Optional[str]:
-        """Get credential from HashiCorp Vault.
+    def _get_from_secret_store(self, key: str) -> Optional[str]:
+        """Get a credential from the store the operator named, through the secret registry.
 
-        C-009: narrowed to the vendor/domain errors we expect — the
-        ``secrets`` module raises ``ConfigurationError`` /
-        ``AuthenticationError`` for misconfig; ``ImportError`` covers
-        the optional ``hvac`` dep; ``OSError`` covers network I/O.
-        Unknown errors log at ``warning`` so operational problems
-        (transient 5xx, DNS) become visible in logs instead of
-        disappearing silently.
+        ``FLUID_CREDENTIAL_STORE`` (operator-only: ``credentials/protected_env``)
+        is a reference prefix such as ``vault://kv/fluid/credentials`` or
+        ``aws-sm://fluid/credentials``; the credential is read from
+        ``<prefix>/<provider>#<key>``: one secret per provider, one field per
+        key. Unset means no store is asked. The store used to be picked from
+        ambient variables (GCP Secret Manager when ``GCP_PROJECT`` was set, else
+        AWS Secrets Manager when ``AWS_REGION`` was), so setting a region
+        silently sent every missing credential lookup to Secrets Manager.
+
+        A secret that is not there falls through to the next source. Any other
+        failure (a store that is unreachable, a denied read, a reference the
+        operator's policy refuses) raises :class:`CredentialError`: falling
+        through would hide a broken store behind a provider default or a prompt.
         """
-        try:
-            from ..errors import AuthenticationError, ConfigurationError
-            from ..secrets import SecretSource, get_secret_manager
-        except ImportError:
-            logger.debug("secrets backend unavailable, skipping Vault")
+        store = os.environ.get("FLUID_CREDENTIAL_STORE", "").strip()
+        if not store:
             return None
+        scheme = store.partition("://")[0].strip().lower()
+        if scheme not in ("vault", "openbao", "aws-sm", "aws") or "://" not in store:
+            raise CredentialError(
+                "FLUID_CREDENTIAL_STORE must name a store whose secrets hold fields, "
+                "such as vault://<mount>/<prefix> or aws-sm://<prefix>",
+                suggestions=["export FLUID_CREDENTIAL_STORE=vault://kv/fluid/credentials"],
+            )
+        from ..secrets import SecretError, resolve_credential
 
-        secret_name = f"{self.provider}/{key}"
+        reference = f"{store.rstrip('/')}/{self.provider}#{key}"
         try:
-            manager = get_secret_manager()
-            # ``get_secret_manager`` picks ONE store for the process. Unless it
-            # picked Vault, this step would repeat, verbatim, the lookup that
-            # ``_get_from_secret_manager`` makes against the same manager next,
-            # which is how every missing key cost two AWS Secrets Manager calls.
-            if manager is None or manager.config.source is not SecretSource.HASHICORP_VAULT:
+            secret = resolve_credential(reference)
+        except SecretError as exc:
+            if exc.extras.get("reason") == "not_found":
                 return None
-            return manager.get_secret(secret_name, required=False)
-        except (ConfigurationError, AuthenticationError, OSError) as e:
-            logger.debug("Failed to read from Vault: %s", e)
-            return None
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("Unexpected error reading from Vault: %s", e)
-            return None
-
-    def _get_from_secret_manager(self, key: str) -> Optional[str]:
-        """Get credential from cloud secret manager (GCP/AWS/Azure).
-
-        C-009: same narrowing rationale as ``_get_from_vault``.
-        """
-        try:
-            from ..errors import AuthenticationError, ConfigurationError
-            from ..secrets import SecretSource, get_secret_manager
-        except ImportError:
-            logger.debug("secrets backend unavailable, skipping secret manager")
-            return None
-
-        secret_name = f"{self.provider}/{key}"
-        try:
-            manager = get_secret_manager()
-            # A Vault-backed manager was already asked by ``_get_from_vault``.
-            if manager is None or manager.config.source is SecretSource.HASHICORP_VAULT:
-                return None
-            return manager.get_secret(secret_name, required=False)
-        except (ConfigurationError, AuthenticationError, OSError) as e:
-            logger.debug("Failed to read from secret manager: %s", e)
-            return None
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("Unexpected error reading from secret manager: %s", e)
-            return None
+            raise CredentialError(
+                f"{exc.what}: {exc.why}", suggestions=[exc.fix] if exc.fix else []
+            ) from None
+        value: str = secret.get_secret_value()
+        return value
 
     def _get_from_prompt(self, key: str) -> Optional[str]:
         """Get credential from interactive prompt."""

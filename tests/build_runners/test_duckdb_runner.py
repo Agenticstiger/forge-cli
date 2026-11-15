@@ -294,14 +294,11 @@ def test_an_unreachable_database_source_fails_the_build_not_the_process(
     "refused, reason",
     [
         ({"port": "abc"}, "connection.port must be numeric"),
-        # The run record's redactor reads "<NAME>_SECRET: environment" as an
-        # assignment and masks its value, so the record says "variable not set".
-        ({"secretRef": _UNSET_SECRET_REF}, "variable not set"),
-        # The file backend refuses a name with a separator: a ConfigurationError,
-        # as every secret backend but env:// raises, not a ValueError.
-        ({"secretRef": _REFUSED_SECRET_REF}, "Invalid secret name"),
+        # The store could not produce the value: this build fails, and the apply
+        # goes on to its other builds.
+        ({"secretRef": _UNSET_SECRET_REF}, "did not resolve"),
     ],
-    ids=["port", "unset-secret-ref", "secret-backend-error"],
+    ids=["port", "unset-secret-ref"],
 )
 @pytest.mark.parametrize("kind", ["postgres", "mysql"])
 def test_a_source_the_runner_cannot_set_up_fails_the_build_with_a_run_record(
@@ -318,7 +315,10 @@ def test_a_source_the_runner_cannot_set_up_fails_the_build_with_a_run_record(
     out_path = tmp_path / "orders.parquet"
     connection = {"host": "127.0.0.1", "port": 9, "user": "fluid", "database": "app", **refused}
     contract = _database_source_contract(kind, connection, out_path)
-    rc = execute_duckdb_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+    from fluid_build.secrets import secret_run
+
+    with secret_run("apply"):
+        rc = execute_duckdb_build(contract["builds"][0], contract, tmp_path, dry_run=False)
     assert rc == 1
     assert not out_path.exists()
     runs = tmp_path / ".fluid" / "runs" / "bronze.db_orders" / "ingest_db" / "runs"
@@ -327,6 +327,32 @@ def test_a_source_the_runner_cannot_set_up_fails_the_build_with_a_run_record(
     (stream,) = record["streams"]
     assert stream["state"] == "failed"
     assert stream["error"].startswith("source: ") and reason in stream["error"], stream
+
+
+@pytest.mark.parametrize("kind", ["postgres", "mysql"])
+def test_a_secret_ref_the_grammar_refuses_raises_the_typed_error(tmp_path, kind):
+    """Changed with the secrets package: a secretRef the grammar or the
+    operator's policy refuses is raised as a typed SecretError (the CLI renders
+    its what/why/fix and the apply stops), because the contract or the policy
+    must change. A store failure only fails this build (above)."""
+    from fluid_build.secrets import SecretError, secret_run
+
+    _require_extension(kind)
+    # A file:// reference must be an absolute path under FLUID_SECRET_PREFIXES.
+    secret_ref, error_name = _REFUSED_SECRET_REF, "SecretRefError"
+    out_path = tmp_path / "orders.parquet"
+    connection = {
+        "host": "127.0.0.1",
+        "port": 9,
+        "user": "fluid",
+        "database": "app",
+        "secretRef": secret_ref,
+    }
+    contract = _database_source_contract(kind, connection, out_path)
+    with secret_run("apply"), pytest.raises(SecretError) as caught:
+        execute_duckdb_build(contract["builds"][0], contract, tmp_path, dry_run=False)
+    assert type(caught.value).__name__ == error_name
+    assert not out_path.exists()
 
 
 def test_a_postgres_enum_column_reads_as_text_as_postgres_scan_read_it():

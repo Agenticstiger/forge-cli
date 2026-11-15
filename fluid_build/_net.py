@@ -254,3 +254,36 @@ def _hostname_is_link_local(hostname: str) -> bool:
         if _is_metadata_address(ip):
             return True
     return False
+
+
+def is_loopback_host(host: object) -> bool:
+    """Return True for any address that resolves to the local loopback.
+
+    The one definition: the acquisition loopback override and the secret
+    destination policy both call it, and must agree on what never leaves
+    this machine. No DNS lookup: a name that resolves to loopback now can
+    resolve elsewhere mid-run.
+
+    Accepts:
+    - The canonical hostname ``localhost`` (case-insensitive). We don't
+      probe the OS resolver because that would couple the helper to whatever
+      ``/etc/hosts`` the operator's machine happens to have configured —
+      ``localhost`` is the one universally-understood loopback name.
+    - Any address in the IPv4 loopback range ``127.0.0.0/8`` (so
+      ``127.0.0.2``, ``127.1.2.3`` etc. are caught, not just ``127.0.0.1``).
+    - The IPv6 loopback ``::1``.
+
+    Anything else (real hostnames, public IPs, link-local addresses) is
+    treated as non-loopback and left untouched by callers.
+    """
+    if not isinstance(host, str) or not host.strip():
+        return False
+    h = host.strip().lower()
+    if h == "localhost":
+        return True
+    # Strip ``[`` / ``]`` for bracketed IPv6 forms like ``[::1]``.
+    candidate = h.lstrip("[").rstrip("]")
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False

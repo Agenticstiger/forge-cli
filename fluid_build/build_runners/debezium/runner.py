@@ -157,6 +157,13 @@ def build_connector_config(
     passed verbatim under the ``database.*`` namespace.
     """
     connector_class = resolve_debezium_class(kind)
+    if extra and connection.get("secretRef"):
+        # extra_config is merged last, so a host or credential key in it would
+        # move the resolved secret past the destination policy, which only saw
+        # the connection block. Refused before the secret is read.
+        from fluid_build.secrets.policy import refuse_destination_overrides
+
+        refuse_destination_overrides(extra, where="properties.debezium.extra_config")
     # Resolve secretRef → password (or other credential field) before any
     # ``connection.get("password")`` lookup. Inline literal values still win.
     connection = resolve_connection_secrets(dict(connection))

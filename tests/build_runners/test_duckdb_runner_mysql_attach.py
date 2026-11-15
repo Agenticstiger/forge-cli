@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Tuple
 import pytest
 
 from fluid_build.build_runners.duckdb.runner import DuckdbRunner
+from fluid_build.secrets import secret_run
 
 FAKE_PW = "runner-fake-pw-5Q"  # pragma: allowlist secret
 _BASE = {
@@ -51,7 +52,9 @@ def _attach_on(con: Any, raw: Dict[str, Any], kind: str = "mysql") -> None:
         source=types.SimpleNamespace(kind=kind, connection=types.SimpleNamespace(raw=dict(raw))),
     )
     runner = DuckdbRunner.__new__(DuckdbRunner)
-    runner._attach_external_databases(con, ctx)  # type: ignore[arg-type]
+    # resolve_secret refuses outside a pipeline stage; the attach runs inside `apply`.
+    with secret_run("apply"):
+        runner._attach_external_databases(con, ctx)  # type: ignore[arg-type]
 
 
 def _executed(raw: Dict[str, Any], kind: str = "mysql") -> List[str]:
@@ -255,25 +258,26 @@ class TestPostgresAttach:
 
     @pytest.mark.parametrize("kind", ["postgres", "mysql"])
     def test_a_secret_ref_that_does_not_resolve_fails_the_source_setup(self, kind, monkeypatch):
-        from fluid_build.build_runners.duckdb.runner import _SourceAttachError
+        """The store could not produce the value: the build fails with a run
+        record (_SourceSetupError), whose message keeps the fix."""
+        from fluid_build.build_runners.duckdb.runner import _SourceSetupError
 
         monkeypatch.delenv("RUNNER_FAKE_UNSET_SECRET", raising=False)
         raw = {k: v for k, v in _BASE.items() if k != "password"}
         raw["secretRef"] = "env://RUNNER_FAKE_UNSET_SECRET"  # pragma: allowlist secret
-        with pytest.raises(_SourceAttachError, match="RUNNER_FAKE_UNSET_SECRET") as caught:
+        with pytest.raises(_SourceSetupError, match="RUNNER_FAKE_UNSET_SECRET") as caught:
             _executed(raw, kind=kind)
-        # Still a ValueError for callers that catch the builder's refusal.
-        assert isinstance(caught.value, ValueError)
+        assert "Fix: Export RUNNER_FAKE_UNSET_SECRET" in str(caught.value)
 
     @pytest.mark.parametrize("kind", ["postgres", "mysql"])
-    def test_a_secret_backend_error_fails_the_source_setup(self, kind):
-        """Every backend but env:// raises ConfigurationError, not ValueError;
-        the file backend refuses a name with a separator before reading."""
-        from fluid_build.build_runners.duckdb.runner import _SourceSetupError
+    def test_a_malformed_secret_ref_raises_a_typed_error(self, kind):
+        """``file://`` takes an absolute path now, so ``file://a/b`` is a grammar
+        error (SecretRefError) raised before any store is asked."""
+        from fluid_build.secrets import SecretRefError
 
         raw = {k: v for k, v in _BASE.items() if k != "password"}
         raw["secretRef"] = "file://a/b"  # pragma: allowlist secret
-        with pytest.raises(_SourceSetupError, match="Invalid secret name"):
+        with pytest.raises(SecretRefError, match="not a valid secret reference"):
             _executed(raw, kind=kind)
 
     def test_a_connect_error_has_the_password_masked(self):

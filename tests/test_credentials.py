@@ -30,8 +30,9 @@ class TestCredentialSource:
         assert CredentialSource.PROMPT.value == 10
 
     def test_all_sources(self):
-        # Ensure all 10 sources defined
-        assert len(CredentialSource) == 10
+        # Vault and Secret Manager collapsed into the one SECRET_STORE step.
+        assert len(CredentialSource) == 9
+        assert CredentialSource.SECRET_STORE in CredentialSource
 
 
 class TestCredentialConfig:
@@ -134,9 +135,10 @@ class TestBaseCredentialResolver:
         resolver = ConcreteResolver("test")
         assert resolver._get_from_config("key") is None
 
-    def test_secret_manager_returns_none(self):
+    def test_secret_store_returns_none_when_no_store_is_named(self, monkeypatch):
+        monkeypatch.delenv("FLUID_CREDENTIAL_STORE", raising=False)
         resolver = ConcreteResolver("test")
-        assert resolver._get_from_secret_manager("key") is None
+        assert resolver._get_from_secret_store("key") is None
 
     def test_cli_overrides_env(self):
         resolver = ConcreteResolver("snowflake")

@@ -336,7 +336,7 @@ def test_embedded_server_file_holds_no_password_and_server_gets_it(tmp_path, mon
 
     monkeypatch.setenv("PG_PASSWORD_T211", _SECRET)
     # `env://` to a remote host needs the operator's allowlist now
-    # (build_runners/_secret_policy); this fixture's host is the bare name `db`.
+    # (fluid_build/secrets/policy.py); this fixture's host is the bare name `db`.
     # This suite is about the secret not reaching a FILE or a diagnostic once it
     # is legitimately in use, which is a different control from whether the send
     # is permitted at all.
@@ -364,15 +364,19 @@ def test_embedded_server_file_holds_no_password_and_server_gets_it(tmp_path, mon
         sink=None,
         env={},
     )
-    dbz._execute_debezium_server(
-        ctx,
-        {"engine": "debezium", "properties": {}},
-        {"mode": "embedded"},
-        {"server": {"sink": {"type": "kafka"}}, "server_binary": str(server)},
-        "initial",
-        "2026-10-13T00:00:00Z",
-        0.0,
-    )
+    from fluid_build.secrets import secret_run
+
+    # resolve_secret refuses outside a pipeline stage; the runner runs inside `apply`.
+    with secret_run("apply"):
+        dbz._execute_debezium_server(
+            ctx,
+            {"engine": "debezium", "properties": {}},
+            {"mode": "embedded"},
+            {"server": {"sink": {"type": "kafka"}}, "server_binary": str(server)},
+            "initial",
+            "2026-10-13T00:00:00Z",
+            0.0,
+        )
     config = tmp_path / ".fluid/debezium/sales.orders/b1/application.properties"
     assert _SECRET not in config.read_text()
     assert stat.S_IMODE(config.stat().st_mode) == 0o600

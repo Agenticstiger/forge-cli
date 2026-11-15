@@ -270,7 +270,7 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST",
         # Both rewrite a contract-declared loopback host to a reachable one,
         # AFTER the secretRef policy has cleared the send as local-only
-        # (build_runners/_secret_policy). A project file that could set either
+        # (fluid_build/secrets/policy). A project file that could set either
         # would redirect a credential the policy allowed only because it was
         # staying on this machine. FLUID_RUNNER_HOST_OVERRIDE was already
         # listed; the testcontainers name it also honours was not.
@@ -359,6 +359,17 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         # bearer token
         "OLLAMA_API_BASE",
         "VAULT_ADDR",
+        # the same store under OpenBao's names, its namespace (where every
+        # path is resolved) and the CA bundle that authenticates it; a project
+        # file choosing any of them would choose whose store, or which
+        # certificate, forge trusts with the operator's token
+        "BAO_ADDR",
+        "VAULT_NAMESPACE",
+        "BAO_NAMESPACE",
+        "VAULT_CACERT",
+        "BAO_CACERT",
+        # the store the credential chain reads provider credentials from
+        "FLUID_CREDENTIAL_STORE",
         # litellm routes every model call to this proxy when the switch is
         # on, and sends it the key FLUID resolved for whichever provider
         # (``api_key`` wins over LITELLM_PROXY_API_KEY), so no project file
@@ -522,6 +533,14 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
 #: Every name starting with one of these is protected.
 PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     "FLUID_OVERLAY_",
+    # the secret-reference policy (FLUID_SECRET_SCHEMES, _PREFIXES, _STAGES):
+    # which stores, locators and stages a contract's references may resolve
+    # from, decided by the operator, never by the project (secrets/policy.py)
+    "FLUID_SECRET_",
+    # how forge authenticates to the operator's Vault or OpenBao: a JWT login
+    # role, mount and token, or a runner's response-wrapped token
+    # (secrets/_vault.py)
+    "FLUID_VAULT_",
     "FLUID_MCP_JWT_",
     "FLUID_LLM_DEFAULT_MODEL_",
     # credentials the Debezium runner itself sets: it writes each credential
@@ -1427,8 +1446,8 @@ ENDPOINT_CREDENTIAL_GROUPS: Tuple[EndpointGroup, ...] = (
         ),
         ambient=True,
         read_by=(
-            "azure-identity (DefaultAzureCredential in secrets.py, "
-            "ClientSecretCredential in cli/_auth_provider_azure.py): the client "
+            "azure-identity (ClientSecretCredential in cli/_auth_provider_azure.py, "
+            "and DefaultAzureCredential in an azure-kv:// resolver pack): the client "
             "secret is posted to AZURE_AUTHORITY_HOST, the managed-identity header "
             "sent to IDENTITY_ENDPOINT / MSI_ENDPOINT, and SharedTokenCacheCredential "
             "sends the refresh token it finds in the operator's token cache to "

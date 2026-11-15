@@ -23,7 +23,8 @@ from typing import Any, Dict
 import pytest
 
 from fluid_build.build_runners._acquisition_common import resolve_connection_secrets
-from fluid_build.build_runners._secret_policy import (
+from fluid_build.secrets import secret_run
+from fluid_build.secrets.policy import (
     ALLOWLIST_ENV,
     AcquisitionSecretPolicyError,
     connection_host,
@@ -36,9 +37,12 @@ SECRET = "s3cret-value-not-for-remote-hosts"  # pragma: allowlist secret
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _clean_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(VARIABLE, SECRET)
     monkeypatch.delenv(ALLOWLIST_ENV, raising=False)
+    # resolve_secret refuses outside a pipeline stage; these tests run as `apply`.
+    with secret_run("apply"):
+        yield
 
 
 def _resolve(connection: Dict[str, Any]) -> Dict[str, Any]:
@@ -102,8 +106,8 @@ def test_the_secret_is_not_read_when_the_send_is_refused(
 ) -> None:
     """Refuse first, resolve second: a refused reference must never be read.
 
-    Checked by removing the variable entirely — if resolution were attempted it
-    would raise ValueError("environment variable not set") instead, and the
+    Checked by removing the variable entirely: if resolution were attempted it
+    would raise a SecretResolveError (variable not set) instead, and the
     policy error is what proves the order.
     """
     monkeypatch.delenv(VARIABLE, raising=False)
@@ -171,15 +175,30 @@ def test_an_inline_password_is_untouched() -> None:
     assert out["password"] == "inline"  # pragma: allowlist secret
 
 
-def test_a_store_backed_scheme_is_not_policed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """vault:// etc. name a secret the OPERATOR provisioned and granted access to.
+def test_a_store_backed_scheme_is_policed_too() -> None:
+    """vault:// and aws-sm:// are policed like env:// now.
 
-    That is already an operator decision, unlike ``env://``, which turns
-    whatever happens to be in the environment into a credential for a host the
-    contract picked. Checked at the policy layer so the test needs no backend.
+    The destination policy used to cover env:// only, on the reasoning that the
+    other schemes name a store the operator provisioned. That left the same hole
+    one step removed (a contract could name any secret the operator's identity
+    can read and send it to its own host), so every scheme needs an entry for a
+    remote host. The old assertion (vault/aws skip the policy) is flipped.
     """
-    refuse_unless_allowed("ANYTHING", host="db.example.com", scheme="vault")
-    refuse_unless_allowed("ANYTHING", host="db.example.com", scheme="aws")
+    for ref in ("vault://kv/acme/pg#password", "aws-sm://fluid/acme/pg", "aws://fluid/acme/pg"):
+        with pytest.raises(AcquisitionSecretPolicyError):
+            refuse_unless_allowed(ref, host="db.example.com")
+
+
+def test_a_store_backed_scheme_needs_its_own_listing(monkeypatch: pytest.MonkeyPatch) -> None:
+    ref = "vault://kv/acme/pg#password"
+    monkeypatch.setenv(ALLOWLIST_ENV, f"{ref}@db.example.com")
+    refuse_unless_allowed(ref, host="db.example.com")
+    with pytest.raises(AcquisitionSecretPolicyError):
+        refuse_unless_allowed(ref, host="other.example.com")
+    # an env NAME entry does not cover a vault reference
+    monkeypatch.setenv(ALLOWLIST_ENV, "pg")
+    with pytest.raises(AcquisitionSecretPolicyError):
+        refuse_unless_allowed(ref, host="db.example.com")
 
 
 # ── the premise the loopback exemption rests on ──────────────────────────
@@ -367,4 +386,8 @@ def test_the_airbyte_deployment_token_path_is_policed() -> None:
     from fluid_build.build_runners.airbyte import runner as airbyte_runner
 
     source = pathlib.Path(airbyte_runner.__file__).read_text(encoding="utf-8")
-    assert "refuse_unless_allowed(" in source, "the deployment.auth.secretRef path is unpoliced"
+    # The path now resolves through resolve_secret(host=...), which runs the
+    # destination policy itself before any store is asked.
+    assert (
+        "resolve_secret(" in source and "host=connection_host(" in source
+    ), "the deployment.auth.secretRef path is unpoliced"

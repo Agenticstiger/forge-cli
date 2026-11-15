@@ -877,13 +877,25 @@ module = [
     # sink.catalogAuth: decides what a streaming sink's catalog credential
     # becomes in the config forge-cli pushes, so a silent Any is a silent leak.
     "fluid_build.providers._iceberg_catalog_auth",
-    "fluid_build.secrets",
+    # Secret references: the grammar, the operator's policy (which schemes,
+    # prefixes and stages resolve, and where a value may go), the resolvers and
+    # the run-secrets handoff. A silent Any here is a silent allow.
+    "fluid_build.secrets.__init__",
+    "fluid_build.secrets.errors",
+    "fluid_build.secrets.ref",
+    "fluid_build.secrets.policy",
+    "fluid_build.secrets.run",
+    "fluid_build.secrets.registry",
+    "fluid_build.secrets.resolve",
+    "fluid_build.secrets._env",
+    "fluid_build.secrets._file",
+    "fluid_build.secrets._vault",
+    "fluid_build.secrets._aws_sm",
     # Operator egress gates: which host a contract-named URL may reach, which
     # variable may be sent there, and where a managed Flink job may deploy. A
     # silent Any is a silent allow, and strict equality is what makes a
     # misspelt verdict code fail here instead of falling through.
     "fluid_build.build_runners._deployment_host_policy",
-    "fluid_build.build_runners._secret_policy",
     "fluid_build.streaming.policy",
 ]
 strict = true

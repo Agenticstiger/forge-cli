@@ -8,8 +8,8 @@ scaffold writes and its setup script copies to ``.env``) holds the account,
 the user and a password. The Snowflake readers that also find a credential of
 the operator's outside the environment are pinned while such an account (or
 host) is in effect: the credential resolver reads only the CLI argument, the
-environment and the project's files (never the keyring, ``credentials.enc``,
-``~/.fluidrc.yaml`` or a secret manager), the OpenTofu provider gets an empty
+environment and the project's files (never the keyring or the operator's
+secret store), the OpenTofu provider gets an empty
 config file, and the hosted Snowflake MCP server an empty ``SNOWFLAKE_HOME``.
 So the project's own password pairs the account again, and nothing the
 operator stored goes to the host the project chose. Nor does the operator's
@@ -92,18 +92,10 @@ def _operator_stores(
     held: Mapping[str, str] = _OPERATOR_STORE,
 ) -> None:
     """Put the operator's Snowflake material where the resolver looks after the
-    environment: ``~/.fluid/credentials.enc``, ``~/.fluidrc.yaml`` and, in
-    process, the keyring and the secret manager."""
-    from fluid_build.credentials.encrypted_store import EncryptedCredentialStore
-
-    store = EncryptedCredentialStore(
-        store_path=home / ".fluid" / "credentials.enc", key_path=home / ".fluid" / ".key"
-    )
-    for key, value in held.items():
-        store.set_credential(f"snowflake.{key}", value)
-    rc = home / ".fluidrc.yaml"
-    rc.write_text("snowflake:\n" + "".join(f"  {k}: {json.dumps(v)}\n" for k, v in held.items()))
-    rc.chmod(0o600)
+    environment: in process, the keyring and the operator's secret store
+    (``FLUID_CREDENTIAL_STORE``). The encrypted file store and
+    ``~/.fluidrc.yaml`` are gone from the chain, so nothing is written for them."""
+    home.mkdir(parents=True, exist_ok=True)
     if monkeypatch is None:
         return
     from fluid_build.credentials.keyring_store import KeyringCredentialStore
@@ -116,7 +108,7 @@ def _operator_stores(
     monkeypatch.setattr(KeyringCredentialStore, "get_credential", staticmethod(keyring_get))
     monkeypatch.setattr(
         BaseCredentialResolver,
-        "_get_from_secret_manager",
+        "_get_from_secret_store",
         lambda self, key: held.get(key) if self.provider == "snowflake" else None,
     )
 
@@ -862,7 +854,7 @@ def _fluid_on_smoke(
     connects: bool = True,
 ) -> Tuple[List[Dict], List[str]]:
     """``fluid <args>`` in a copy of examples/snowflake/smoke, the operator's
-    keyring, ``credentials.enc`` and ``~/.fluidrc.yaml`` holding an OAuth
+    keyring holding an OAuth
     token, a key pair and a password, and ``~/.snowsql/config`` a password;
     returns the connect() calls and the snowsql command lines. With
     ``connects=False`` the command may also end before any connect() call."""
