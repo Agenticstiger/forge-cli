@@ -137,7 +137,7 @@ def project_endpoint_in_effect(service: str, env: Optional[Mapping[str, str]] = 
 
     Such an endpoint loaded because the project files also supply a credential
     for it; a reader that would otherwise find the operator's credential
-    outside the environment (keyring, credentials.enc, an SDK config file)
+    outside the environment (keyring, a secret store, an SDK config file)
     must then use only the project's (``credentials/resolver.py``).
     """
     return bool(project_endpoints_in_effect(service, env))

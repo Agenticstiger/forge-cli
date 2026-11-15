@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 
 from fluid_build.errors import (
-    AuthenticationError,
     ConfigurationError,
     DependencyError,
     FileSystemError,
@@ -56,7 +55,6 @@ class TestErrorSubclasses:
             FileSystemError,
             NetworkError,
             DependencyError,
-            AuthenticationError,
         ],
     )
     def test_is_fluid_error(self, cls):
@@ -80,8 +78,8 @@ class TestWrapError:
 
     def test_custom_class(self):
         orig = OSError("no access")
-        wrapped = wrap_error(orig, "Auth failed", error_class=AuthenticationError)
-        assert isinstance(wrapped, AuthenticationError)
+        wrapped = wrap_error(orig, "Cannot reach the host", error_class=NetworkError)
+        assert isinstance(wrapped, NetworkError)
 
     def test_with_context(self):
         orig = ValueError("x")

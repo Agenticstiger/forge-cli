@@ -445,7 +445,10 @@ def _apply_path_modules() -> List[Path]:
         return None
 
     todo = [package / "cli" / "apply.py"]
-    for sub in ("build_runners", "providers"):
+    # ``fluid_build.secrets`` resolves its submodules lazily (PEP 562 __getattr__),
+    # so the static import scan cannot follow ``from ..secrets import resolve_secret``
+    # into the store backends (vault, aws-sm, file) that read VAULT_* / BAO_*.
+    for sub in ("build_runners", "providers", "secrets"):
         todo.extend((package / sub).rglob("*.py"))
     seen: Set[Path] = set()
     while todo:
@@ -525,8 +528,11 @@ class TestTheWorkerPassesWhatFluidReads:
         assert name in loaded.namespace["CONTRACT_ENV_NAMES"].split()
 
         resolve = (
-            "from fluid_build.build_runners._acquisition_common import resolve_secret_ref\n"
-            f"ok = resolve_secret_ref('env://{name}') == 'pg-secret'\n"
+            "from fluid_build.build_runners._acquisition_common import resolve_connection_secrets\n"
+            "from fluid_build.secrets import secret_run\n"
+            "with secret_run('apply'):\n"
+            f"    out = resolve_connection_secrets({{'host': 'localhost', 'secretRef': 'env://{name}'}})\n"
+            "ok = out['password'] == 'pg-secret'\n"
             "(RECORD / 'resolved').write_text(str(ok))\n"
         )
         run = run_task(

@@ -51,8 +51,9 @@ LOG = logging.getLogger(__name__)
 #: Contract objects whose field values a schema error must not quote. A
 #: ``sink.catalogAuth`` field names an environment variable, and a value that
 #: fails the name pattern may be a secret pasted in its place; jsonschema's
-#: messages quote the failing instance (``'<value>' does not match ...``).
-_UNQUOTED_VALUE_PATHS = frozenset({"catalogAuth"})
+#: messages quote the failing instance (``'<value>' does not match ...``). The
+#: same holds for a ``secretRef``, which names a secret and may hold one by mistake.
+_UNQUOTED_VALUE_PATHS = frozenset({"catalogAuth", "secretRef"})
 
 #: Validators whose jsonschema message names only keys, never a value.
 _KEY_ONLY_VALIDATORS = frozenset({"required", "additionalProperties"})
@@ -96,6 +97,11 @@ def format_schema_error(error: Any) -> str:
         return str(error.message)
     if error.validator in _KEY_ONLY_VALIDATORS:
         return str(error.message)
+    if error.validator == "anyOf" and list(error.absolute_path)[-1:] == ["secretRef"]:
+        return (
+            "is not a secret reference of the form <scheme>://<locator>[#field][?version=n] "
+            "(value not shown)"
+        )
     if error.validator == "pattern":
         return f"does not match {error.validator_value!r} (value not shown)"
     if error.validator == "not" and isinstance(value, dict) and list(value) == ["pattern"]:
@@ -131,6 +137,7 @@ _SCHEMA_EVENTS = {
     "enum": "contract_schema_enum",
     "const": "contract_schema_enum",
     "pattern": "contract_schema_pattern",
+    "writeOnly": "contract_schema_not_allowed",
     "format": "contract_schema_format",
     "oneOf": "contract_schema_no_variant",
     "anyOf": "contract_schema_no_variant",
@@ -256,9 +263,29 @@ def _pattern_keyword(validator: Any, pattern: str, instance: Any, schema: Any) -
     yield jsonschema.ValidationError(message)
 
 
+def _write_only_keyword(
+    validator: Any, write_only: Any, instance: Any, schema: Any
+) -> Iterator[Any]:
+    """``writeOnly: true``: a contract may not hold a value there.
+
+    The message never carries the instance: it is a secret, or meant to be.
+    """
+    if write_only is True:
+        # Rendered after the field's path ("...password: write-only: ..."): the
+        # console redactor masks the first token after a secret-named key, so
+        # that token is the sacrificial "write-only:", never a word the sentence
+        # needs.
+        yield jsonschema.ValidationError(
+            "write-only: a contract may not hold this secret-bearing field's value; "
+            "name the secret with secretRef (<scheme>://<locator>) instead"
+        )
+
+
 @functools.lru_cache(maxsize=None)
 def _end_anchored_validator(validator_class: Any) -> Any:
-    return jsonschema.validators.extend(validator_class, {"pattern": _pattern_keyword})
+    return jsonschema.validators.extend(
+        validator_class, {"pattern": _pattern_keyword, "writeOnly": _write_only_keyword}
+    )
 
 
 def schema_validator(schema: Mapping[str, Any], default: Any = None) -> Any:

@@ -1010,7 +1010,7 @@ class TestDatabricksAdditional:
         cfg.write_text("[DEFAULT]\nhost = h\n\n[other]\nhost = o\n")
         provider = DatabricksAuthProvider({}, LOG)
         with patch(
-            "fluid_build.credentials.encrypted_store._atomic_write_bytes",
+            "fluid_build.util.atomic_write.atomic_write_bytes",
             side_effect=OSError("permission denied"),
         ):
             result = _run(provider.logout(profile="DEFAULT"))

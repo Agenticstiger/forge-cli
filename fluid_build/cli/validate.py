@@ -1036,6 +1036,9 @@ def _run_contract_rules(
             anchor="exposes",
         )
 
+        # Secret references against the grammar and the operator's policy.
+        _check_secret_refs(validation_result, contract)
+
         # --- Iceberg streaming-sink checks (RFC-streaming-extension §6.8) --
         # Catch the connector's silent-fail-at-first-record traps at validate
         # time: a sink with no Iceberg expose, the v1-deferred upsert mode,
@@ -1366,6 +1369,56 @@ def _authoring_lint_check(
             event="contract_check_failed",
             pointer="",
         )
+
+
+def _check_secret_refs(validation_result: ValidationResult, contract: Mapping[str, Any]) -> None:
+    """Record one error per secretRef the grammar or the operator's policy refuses.
+
+    The policy covers the scheme, the locator prefix and every host each value
+    would be sent to, so a contract ``fluid apply`` would refuse fails here
+    instead. Nothing is fetched: validate lints references and never reads a
+    value. Fails closed like the gates around it: a crash is an error.
+
+    A schema error at the same pointer is dropped for the lint's: a 0.7.7
+    ``$defs.secretRef`` only says that no scheme's pattern matched.
+    """
+    from fluid_build.secrets.contract import lint_secret_refs
+
+    try:
+        findings = lint_secret_refs(contract)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_error(
+            f"Secret reference check could not run ({type(exc).__name__}); "
+            "the contract's secretRefs were NOT checked",
+            event="contract_check_failed",
+            pointer="",
+        )
+        return
+    for finding in findings:
+        pointer = "/" + finding.site.pointer.replace("[", ".").replace("]", "").replace(".", "/")
+        if finding.error is not None:
+            _drop_schema_errors_at(validation_result, pointer)
+        for problem, add in (
+            (finding.error, validation_result.add_error),
+            (finding.warning, validation_result.add_warning),
+        ):
+            if problem is None:
+                continue
+            add(
+                f"{finding.site.pointer}: {problem.what}. {problem.why} Fix: {problem.fix}",
+                event="contract_secret_ref",
+                pointer=pointer,
+                fix=problem.fix,
+            )
+
+
+def _drop_schema_errors_at(validation_result: ValidationResult, pointer: str) -> None:
+    """Remove the JSON-Schema errors recorded at ``pointer`` (``contract_schema_*``)."""
+    for message in list(validation_result.errors):
+        event, at, _fix = validation_result.issue_meta.get(message, ("", "", ""))
+        if at == pointer and event.startswith("contract_schema_"):
+            validation_result.errors.remove(message)
+            validation_result.issue_meta.pop(message, None)
 
 
 def _add_findings(

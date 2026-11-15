@@ -85,10 +85,10 @@ def drop_profile(profile: Optional[str], logger: logging.Logger) -> bool:
         logger.error("%s was not changed: %s", path, refusal)
         return False
 
-    from fluid_build.credentials.encrypted_store import _atomic_write_bytes
+    from fluid_build.util.atomic_write import atomic_write_bytes
 
     # Owner-only (0600) through a temp file and a rename, never a delete.
-    _atomic_write_bytes(Path(real), text.encode("utf-8"), mode=0o600)
+    atomic_write_bytes(Path(real), text.encode("utf-8"), mode=0o600)
     logger.info(
         "Removed profile %r from %s (kept: %s). The token or secret it held stays valid "
         "until it is revoked in the Databricks workspace.",

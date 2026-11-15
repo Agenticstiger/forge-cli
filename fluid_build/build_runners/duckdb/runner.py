@@ -47,7 +47,6 @@ from fluid_build.api.runner import (
 )
 from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.api.source import AcquisitionMode
-from fluid_build.build_runners._secret_policy import AcquisitionSecretPolicyError
 from fluid_build.credentials.host_db_env import host_credential_env_suppressed
 from fluid_build.providers._duckdb_compat import first_row
 from fluid_build.providers._duckdb_sandbox import (
@@ -65,6 +64,7 @@ from fluid_build.providers._sql_safety import (
     quote_ansi_string_literal,
     validate_ident,
 )
+from fluid_build.secrets.errors import SecretPolicyError, SecretRefError
 
 from .._acquisition_common import (
     begin_acquisition_run,
@@ -835,10 +835,11 @@ class DuckdbRunner:
         / ``sqlite_<build_id>``) so two sources in the same contract /
         interpreter don't collide on a hardcoded name.
 
-        A connection block the DSN builder refuses, a ``secretRef`` that does
-        not resolve, or an upstream that cannot be reached raises a
+        A connection block the DSN builder refuses, a ``secretRef`` the store
+        cannot produce, or an upstream that cannot be reached raises a
         :class:`_SourceAttachError` (the password masked), which fails the run
-        with that reason and a run record (``_execute``).
+        with that reason and a run record (``_execute``). A ``secretRef`` the
+        grammar or the operator's policy refuses is raised as its typed error.
 
         A sqlite file is confined to :func:`_declared_roots` plus the
         operator's ``FLUID_DUCKDB_ALLOWED_DIRS`` first, and refused with
@@ -854,16 +855,16 @@ class DuckdbRunner:
                 # Resolve secretRef → password before the DSN is built; an
                 # inline literal still wins.
                 conn = resolve_connection_secrets(dict(ctx.source.connection.raw))
-            except AcquisitionSecretPolicyError:
-                # A typed user error: let the CLI render its what/why/fix panel
-                # rather than flattening it to a one-line _SourceSetupError,
-                # which drops the allowlist line the operator needs.
+            except (SecretPolicyError, SecretRefError):
+                # The contract or the operator's policy must change: let the CLI
+                # render the what/why/fix panel (stopping the apply) rather than
+                # flatten it into one failed build.
                 raise
             except Exception as exc:
-                # An unset variable or an unknown scheme (ValueError), or the
-                # secret backend's own error (ConfigurationError from vault,
-                # aws, gcp, azure or file): each names the reference, never
-                # the secret.
+                # The store could not produce the value (or the variable is
+                # unset): this build fails with a run record, like an
+                # unreachable source, and the apply goes on to the next build.
+                # The message names the reference and the fix, never the secret.
                 raise _SourceSetupError(str(exc)) from exc
             try:
                 if postgres:

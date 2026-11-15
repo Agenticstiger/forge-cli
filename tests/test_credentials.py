@@ -27,11 +27,12 @@ class TestCredentialSource:
     def test_priority_order(self):
         assert CredentialSource.CLI_ARGUMENT.value < CredentialSource.ENVIRONMENT.value
         assert CredentialSource.ENVIRONMENT.value < CredentialSource.PROMPT.value
-        assert CredentialSource.PROMPT.value == 10
+        assert CredentialSource.PROMPT.value == 7
 
     def test_all_sources(self):
-        # Ensure all 10 sources defined
-        assert len(CredentialSource) == 10
+        # Vault and Secret Manager collapsed into the one SECRET_STORE step.
+        assert len(CredentialSource) == 7
+        assert CredentialSource.SECRET_STORE in CredentialSource
 
 
 class TestCredentialConfig:
@@ -125,18 +126,17 @@ class TestBaseCredentialResolver:
         value = resolver._get_from_keyring("key")
         assert value is None or isinstance(value, str)
 
-    def test_encrypted_file_import_error(self):
+    def test_the_retired_file_sources_are_gone(self):
+        # The Fernet store (~/.fluid/credentials.enc) and ~/.fluidrc.yaml
+        # credentials were retired on 2026-11-15; the chain has no such step.
         resolver = ConcreteResolver("test")
-        value = resolver._get_from_encrypted_file("key")
-        assert value is None or isinstance(value, str)
+        assert not hasattr(resolver, "_get_from_encrypted_file")
+        assert not hasattr(resolver, "_get_from_config")
 
-    def test_config_returns_none(self):
+    def test_secret_store_returns_none_when_no_store_is_named(self, monkeypatch):
+        monkeypatch.delenv("FLUID_CREDENTIAL_STORE", raising=False)
         resolver = ConcreteResolver("test")
-        assert resolver._get_from_config("key") is None
-
-    def test_secret_manager_returns_none(self):
-        resolver = ConcreteResolver("test")
-        assert resolver._get_from_secret_manager("key") is None
+        assert resolver._get_from_secret_store("key") is None
 
     def test_cli_overrides_env(self):
         resolver = ConcreteResolver("snowflake")

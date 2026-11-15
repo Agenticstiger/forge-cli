@@ -20,7 +20,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from fluid_build.cli.console import cprint, cprint_literal, literal_error_text, literal_text
 
@@ -449,6 +449,9 @@ def run(args, logger: logging.Logger) -> int:
     # backend resolution errors, and never costs the happy path more
     # than a few ms.
     store_backend_status = _inspect_store_backend()
+    # The secret-reference setup: policy, the run-secrets handoff, the store.
+    # Reads no secret value; contacts a store only when one is configured.
+    secrets_status = _inspect_secrets()
     # --strict: the "Action needed" summary becomes the exit code, so a copilot
     # that is not ready fails a CI gate instead of printing a warning and exiting 0.
     needs_action = getattr(args, "strict", False) is True and not copilot_readiness.ready
@@ -469,6 +472,7 @@ def run(args, logger: logging.Logger) -> int:
         _json.dump(
             {
                 "store_backend": store_backend_status,
+                "secrets": secrets_status,
                 "copilot_ready": bool(copilot_readiness.ready),
                 "action_needed": not feature_checks_ok or not copilot_readiness.ready,
             },
@@ -489,6 +493,7 @@ def run(args, logger: logging.Logger) -> int:
     )
     _print_copilot_readiness(copilot_readiness, verbose)
     _print_store_backend_status(store_backend_status, verbose)
+    _print_secrets_status(secrets_status)
 
     # Show feature checks first
     if verbose or not feature_checks_ok:
@@ -1514,4 +1519,112 @@ def _print_store_backend_status(info: Dict[str, str], verbose: bool = False) -> 
     if info.get("schema_version"):
         cprint(f"Schema version:       {info['schema_version']}")
     cprint(f"Probe:                {info.get('status', '')}")
+    cprint()
+
+
+def _inspect_secrets() -> Dict[str, Any]:
+    """The secret-reference setup (``fluid_build.secrets.status``); never raises."""
+    try:
+        from fluid_build.secrets.status import secrets_status
+
+        return secrets_status()
+    except Exception as exc:  # noqa: BLE001 - doctor reports, it does not crash
+        return {"error": f"secrets status unavailable ({type(exc).__name__})"}
+
+
+def _secrets_policy_rows(info: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """The operator-policy rows: schemes, stages, prefixes, destination entries."""
+    return [
+        ("Schemes enabled", ", ".join(info.get("schemes_enabled") or []) or "(none)"),
+        ("Stages that resolve", ", ".join(info.get("stages_that_resolve") or []) or "(none)"),
+        (
+            "Locator prefixes",
+            "; ".join(
+                f"{scheme}: {', '.join(prefixes)}"
+                for scheme, prefixes in (info.get("prefixes") or {}).items()
+            )
+            or "(unrestricted)",
+        ),
+        ("Destination entries", str(info.get("destination_entries", 0))),
+    ]
+
+
+def _run_secrets_rows(handoff: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """The run-secrets file row, present only while the file is set."""
+    if not handoff.get("set"):
+        return []
+    verdict = (
+        f"{handoff.get('references', 0)} references"
+        if handoff.get("ok")
+        else f"⚠️  {handoff.get('error', 'unusable')}"
+    )
+    return [("Run-secrets file", f"{handoff.get('path')}: {verdict}")]
+
+
+def _vault_status_row(vault: Dict[str, Any]) -> Tuple[str, str]:
+    if vault.get("error"):
+        return ("Store status", f"⚠️  {vault['error']}")
+    sealed = vault.get("sealed")
+    state = "sealed" if sealed else "unsealed" if sealed is False else "unknown"
+    return ("Store status", f"reachable, {state}, version {vault.get('version')}")
+
+
+def _vault_rows(vault: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """The Vault / OpenBao rows. Never a token."""
+    if not vault.get("configured"):
+        return [("Vault / OpenBao", "not configured (BAO_ADDR / VAULT_ADDR unset)")]
+    where = vault.get("address") or "?"
+    if vault.get("namespace"):
+        where += f" (namespace {vault['namespace']})"
+    rows = [
+        ("Vault / OpenBao", where),
+        ("Store auth", str(vault.get("auth_method"))),
+        _vault_status_row(vault),
+    ]
+    if vault.get("token_ttl_seconds") is not None:
+        rows.append(("Token TTL", f"{vault['token_ttl_seconds']} s"))
+    if vault.get("token_error"):
+        rows.append(("Token", f"⚠️  {vault['token_error']}"))
+    return rows
+
+
+def _secrets_rows(info: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """``(item, value)`` rows for the Secrets section. Never a token or a value."""
+    if "error" in info and len(info) == 1:
+        return [("Status", f"⚠️  {info['error']}")]
+    rows = _secrets_policy_rows(info)
+    rows.extend(_run_secrets_rows(info.get("run_secrets_file") or {}))
+    if info.get("credential_store"):
+        rows.append(("Credential store", str(info["credential_store"])))
+    rows.extend(_vault_rows(info.get("vault") or {}))
+    aws = info.get("aws_sm") or {}
+    rows.append(
+        (
+            "aws-sm (boto3)",
+            "installed" if aws.get("boto3_installed") else "not installed ([aws] extra)",
+        )
+    )
+    packs = info.get("packs") or {}
+    if packs:
+        rows.append(("Resolver packs", ", ".join(f"{k}: {v}" for k, v in packs.items())))
+    return rows
+
+
+def _print_secrets_status(info: Dict[str, Any]) -> None:
+    """Render the Secrets section, in the Memory Store Backend section's layout."""
+    rows = _secrets_rows(info)
+    if RICH_AVAILABLE:
+        console = Console()
+        table = Table(title="🔐 Secrets", show_header=True)
+        table.add_column("Item", style="cyan", width=20)
+        table.add_column("Value", style="white")
+        for item, value in rows:
+            table.add_row(item, value)
+        console.print(table)
+        return
+    cprint("\n" + "=" * 60)
+    cprint("Secrets")
+    cprint("=" * 60)
+    for item, value in rows:
+        cprint(f"{item + ':':<22}{value}", markup=False)
     cprint()

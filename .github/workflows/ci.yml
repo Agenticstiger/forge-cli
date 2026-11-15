@@ -688,6 +688,51 @@ jobs:
         run: python scripts/cleanup_local_test_artifacts.py
 
   # ──────────────────────────────────────────────────────────────
+  # OpenBao round trip. The vault:// secret resolver against a real OpenBao
+  # 2.7.2 dev server (in memory, a throwaway root token): KV v2 reads with
+  # #field and ?version=, metadata existence, a JWT login and an unwrapped
+  # response-wrapped token, both revoked when the run ends, and
+  # `fluid secrets check --resolve`. Free and secret-less like the jobs above.
+  # Docker is CI-only for forge: tests/secrets/test_openbao_live.py skips
+  # wherever FLUID_TEST_OPENBAO_ADDR is unset.
+  # ──────────────────────────────────────────────────────────────
+  openbao-integration:
+    name: OpenBao round trip
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,local]"
+      - name: Start OpenBao 2.7.2 (dev server, in memory)
+        run: |
+          docker run -d --name fluid-openbao --cap-add=IPC_LOCK -p 127.0.0.1:8200:8200 \
+            openbao/openbao:2.7.2@sha256:5046911075e137e154ce49ab051502f4ec7cf367d484ae4a4dce665d9b90561f \
+            server -dev -dev-root-token-id=ci-dev-root -dev-listen-address=0.0.0.0:8200
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8200/v1/sys/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs fluid-openbao
+          exit 1
+      - name: Run the OpenBao round trip
+        env:
+          FLUID_TEST_OPENBAO_ADDR: http://127.0.0.1:8200
+          FLUID_TEST_OPENBAO_ROOT_TOKEN: ci-dev-root  # pragma: allowlist secret
+        run: python -m pytest -v -p no:randomly -m integration tests/secrets/test_openbao_live.py
+      - name: OpenBao logs
+        if: failure()
+        run: docker logs fluid-openbao
+
+  # ──────────────────────────────────────────────────────────────
   # DuckDB floor. pyproject.toml takes duckdb>=1.5.0 with no ceiling, and
   # DuckDB 2.0 needs Python 3.11, so the only other job on 1.5.x is the
   # Python 3.10 test leg, which gets the newest 1.5 patch, never the floor.

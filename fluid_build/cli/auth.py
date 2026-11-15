@@ -1060,36 +1060,6 @@ async def handle_doctor(
             except OSError:
                 pass
 
-    # ── Check 4: Encrypted store key file permissions ──
-    fluid_dir = os.path.expanduser("~/.fluid")
-    key_path = os.path.join(fluid_dir, ".key")
-    if os.path.exists(key_path):
-        try:
-            mode = os.stat(key_path).st_mode & 0o777
-            if mode != 0o600:
-                checks.append(
-                    DoctorCheck(
-                        name="Encryption Key Perms",
-                        status=DoctorStatus.FAIL,
-                        message=f"~/.fluid/.key has insecure permissions ({oct(mode)})",
-                        fix_hint="chmod 600 ~/.fluid/.key",
-                    )
-                )
-                if fix:
-                    os.chmod(key_path, 0o600)
-                    checks[-1].status = DoctorStatus.PASS
-                    checks[-1].message += " [FIXED]"
-            else:
-                checks.append(
-                    DoctorCheck(
-                        name="Encryption Key Perms",
-                        status=DoctorStatus.PASS,
-                        message="~/.fluid/.key has secure permissions (0o600)",
-                    )
-                )
-        except OSError:
-            pass
-
     # ── Check 5: Long-lived credentials in CI ──
     if is_ci:
         long_lived_env_vars = [

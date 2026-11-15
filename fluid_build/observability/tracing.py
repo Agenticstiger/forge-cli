@@ -50,7 +50,7 @@ import functools
 import logging
 import os
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from fluid_build.observability.secret_redactor import redact_secret_text
 
@@ -223,66 +223,105 @@ def traced_stage(stage_name: str) -> Callable[[Callable[..., int]], Callable[...
     3. Records the wall-clock duration in ms on exit.
     4. Records the exit code.
     5. Marks the span as ERROR on any exception, re-raises.
+    6. Runs the stage as a secret run (``fluid_build.secrets.secret_run``),
+       traced or not: the secret stage gate reads its name, and its end
+       revokes any store token the stage obtained.
 
-    When OTEL is disabled (no env var, or lib not installed), the
-    wrapped function is returned unchanged — zero runtime cost.
+    When OTEL is disabled (no env var, or lib not installed), no span
+    machinery runs; only the secret run is entered.
     """
 
     def decorator(func: Callable[..., int]) -> Callable[..., int]:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> int:
-            tracer = _get_tracer()
-            if tracer is None:
-                # OTEL disabled — pass through directly.
-                return func(*args, **kwargs)
+            # Every stage is a secret run, traced or not: the stage gate reads its
+            # name (only ``apply`` fetches a value by default) and its end revokes
+            # any store token the stage obtained. Stdlib-only import.
+            from fluid_build.secrets.run import secret_run
 
-            # First positional arg is typically the argparse Namespace
-            # for CLI subcommands; grab attributes defensively.
-            ns = args[0] if args else None
-            attrs = {"fluid.stage": stage_name}
-            if ns is not None:
-                attrs.update(_args_to_attrs(ns))
-
-            # Cross-stage correlation. Resolves $FLUID_RUN_ID env var,
-            # then ``.fluid/run-id.txt``, then generates+persists a new
-            # id. Once stamped here, every nested ``traced_span`` and
-            # downstream stage shares the same id — operators query
-            # ``fluid.run_id="..."`` to reconstruct a multi-stage run.
-            try:
-                from fluid_build.observability.run_id import get_or_create_run_id
-
-                attrs["fluid.run_id"] = get_or_create_run_id()
-            except Exception:  # pragma: no cover — defensive
-                # Tracing must never break the CLI. If run_id resolution
-                # fails (read-only fs, permission, etc.), continue
-                # without the attribute.
-                pass
-
-            with tracer.start_as_current_span(f"fluid.{stage_name}") as span:
-                for k, v in attrs.items():
-                    span.set_attribute(k, v)
-                start = time.monotonic()
-                try:
-                    result = func(*args, **kwargs)
-                    duration_ms = int((time.monotonic() - start) * 1000)
-                    span.set_attribute("fluid.duration_ms", duration_ms)
-                    span.set_attribute("fluid.exit_code", int(result) if result is not None else 0)
-                    return result
-                except Exception as exc:
-                    duration_ms = int((time.monotonic() - start) * 1000)
-                    span.set_attribute("fluid.duration_ms", duration_ms)
-                    span.set_attribute("fluid.exit_code", 1)
-                    # Record exception details (redacted) without
-                    # re-raising from the tracing layer itself.
-                    span.set_attribute("fluid.exception_type", type(exc).__name__)
-                    span.set_attribute("fluid.exception_message", _safe_attr(str(exc)))
-                    if _OTEL_AVAILABLE and _otel_trace is not None:
-                        span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
-                    raise
+            with secret_run(stage_name):
+                return _traced_call(func, stage_name, args, kwargs)
 
         return wrapper
 
     return decorator
+
+
+def _traced_call(
+    func: Callable[..., int], stage_name: str, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+) -> int:
+    """Run one stage entry point, inside a ``fluid.<stage>`` span when tracing is on."""
+    tracer = _get_tracer()
+    if tracer is None:
+        # OTEL disabled — pass through directly.
+        return func(*args, **kwargs)
+
+    # First positional arg is typically the argparse Namespace
+    # for CLI subcommands; grab attributes defensively.
+    ns = args[0] if args else None
+    attrs = {"fluid.stage": stage_name}
+    if ns is not None:
+        attrs.update(_args_to_attrs(ns))
+
+    # Cross-stage correlation. Resolves $FLUID_RUN_ID env var,
+    # then ``.fluid/run-id.txt``, then generates+persists a new
+    # id. Once stamped here, every nested ``traced_span`` and
+    # downstream stage shares the same id — operators query
+    # ``fluid.run_id="..."`` to reconstruct a multi-stage run.
+    try:
+        from fluid_build.observability.run_id import get_or_create_run_id
+
+        attrs["fluid.run_id"] = get_or_create_run_id()
+    except Exception:  # pragma: no cover — defensive
+        # Tracing must never break the CLI. If run_id resolution
+        # fails (read-only fs, permission, etc.), continue
+        # without the attribute.
+        pass
+
+    with tracer.start_as_current_span(f"fluid.{stage_name}") as span:
+        for k, v in attrs.items():
+            span.set_attribute(k, v)
+        start = time.monotonic()
+        try:
+            result = func(*args, **kwargs)
+            duration_ms = int((time.monotonic() - start) * 1000)
+            span.set_attribute("fluid.duration_ms", duration_ms)
+            span.set_attribute("fluid.exit_code", int(result) if result is not None else 0)
+            return result
+        except Exception as exc:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            span.set_attribute("fluid.duration_ms", duration_ms)
+            span.set_attribute("fluid.exit_code", 1)
+            # Record exception details (redacted) without
+            # re-raising from the tracing layer itself.
+            span.set_attribute("fluid.exception_type", type(exc).__name__)
+            span.set_attribute("fluid.exception_message", _safe_attr(str(exc)))
+            if _OTEL_AVAILABLE and _otel_trace is not None:
+                span.set_status(_otel_trace.Status(_otel_trace.StatusCode.ERROR))
+            raise
+
+
+def add_span_event(name: str, attributes: Optional[Dict[str, Any]] = None) -> None:
+    """Add an event to the current span (the stage's, or a child's); no-op when tracing is off.
+
+    Attribute values pass through :func:`_safe_attr`, so a secret-shaped value
+    is redacted before it reaches the collector. Callers still never pass a
+    secret value: the ``fluid.secret.resolve`` audit event carries the
+    reference and the outcome only.
+    """
+    if _get_tracer() is None or _otel_trace is None:
+        return
+    attrs: Dict[str, Any] = {k: _safe_attr(v) for k, v in (attributes or {}).items()}
+    try:
+        from fluid_build.observability.run_id import get_or_create_run_id
+
+        attrs.setdefault("fluid.run_id", get_or_create_run_id())
+    except Exception:  # pragma: no cover — tracing must never break the CLI
+        pass
+    try:
+        _otel_trace.get_current_span().add_event(name, attributes=attrs)
+    except Exception:  # pragma: no cover — tracing must never break the CLI
+        _logger.debug("otel_add_event_failed")
 
 
 class _NoOpSpan:

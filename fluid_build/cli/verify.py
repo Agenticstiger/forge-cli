@@ -1559,10 +1559,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     from fluid_build.providers.snowflake.util.config import resolve_snowflake_settings
 
     # Resolved on the first Snowflake expose, not up front. Resolving walks the
-    # credential chain for every Snowflake key (keyring, encrypted file, cloud
-    # secret managers), so doing it eagerly made a contract with no Snowflake
-    # expose at all issue 22 AWS Secrets Manager lookups whenever AWS_REGION
-    # was set, and write an encryption key under ~/.fluid.
+    # credential chain for every Snowflake key (keyring, the operator's secret
+    # store), so doing it eagerly made a contract with no Snowflake expose at
+    # all walk it for nothing (it once issued 22 AWS Secrets Manager lookups
+    # whenever AWS_REGION was set).
     snowflake_settings: Optional[Dict[str, Any]] = None
 
     # Verify each expose

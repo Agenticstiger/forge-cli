@@ -35,20 +35,15 @@ from fluid_build.build_runners._deployment_host_policy import (
     refuse_unless_host_allowed,
 )
 
+from ...secrets.errors import SecretPolicyError, SecretRefError, SecretResolveError
+from ...secrets.policy import connection_host
 from .._acquisition_common import (
     adapt_source_config,
     apply_loopback_host_override,
     extract_source_schemas,
     resolve_connection_secrets,
-    resolve_secret_ref,
     utc_now_iso,
     write_run_record_and_finalize,
-)
-from .._secret_policy import (
-    AcquisitionSecretPolicyError,
-    connection_host,
-    refuse_unless_allowed,
-    register_resolved,
 )
 
 LOG = logging.getLogger("fluid.acquire.airbyte")
@@ -92,7 +87,7 @@ class AirbyteRestClient:
         # the operator named. The runner checks this where it reads server_url,
         # before the config (and so the secretRef) is resolved; this is the
         # chokepoint for any other caller.
-        # Not the module-level ``refuse_unless_allowed`` from _secret_policy:
+        # Not ``refuse_unless_allowed`` from fluid_build.secrets.policy:
         # that polices which VARIABLE may be read for a given host, this one
         # which HOST may receive the result.
         from fluid_build.build_runners._deployment_host_policy import request_guard
@@ -330,27 +325,23 @@ def _execute_rest_mode(
     # secret backends (env://, vault://, aws://, gcp://, azure://, file://).
     api_token = auth.get("token")
     if not api_token and auth.get("secretRef"):
+        from ...secrets import resolve_secret
+
         try:
             # The contract names deployment.server_url, so this reference takes
             # the same policy as a source connection's -- the destination here
             # is that URL's host, not a connection block's.
-            _ref = str(auth["secretRef"])
-            if _ref.partition("://")[0].strip().lower() == "env":
-                refuse_unless_allowed(
-                    _ref.partition("://")[2].strip(),
-                    host=connection_host({"uri": server_url}),
-                    scheme="env",
-                )
-            api_token = resolve_secret_ref(auth["secretRef"])
-            register_resolved(api_token)
-        except AcquisitionSecretPolicyError:
+            api_token = resolve_secret(
+                str(auth["secretRef"]), host=connection_host({"uri": server_url})
+            ).get_secret_value()
+        except (SecretPolicyError, SecretRefError):
             raise
-        except (ValueError, NotImplementedError) as exc:
+        except SecretResolveError as exc:
             return _failed(
                 ctx,
                 started_at,
                 t_start,
-                f"airbyte deployment.auth.secretRef did not resolve: {exc}",
+                f"airbyte deployment.auth.secretRef: {exc}",
             )
 
     workspace_id = airbyte_props.get("workspace_id", "default-workspace")
@@ -574,6 +565,9 @@ def _execute_rest_mode(
                 "final_status": status,
             },
         )
+    except (SecretPolicyError, SecretRefError):
+        # As in embedded mode: a refusal the contract or the policy must fix.
+        raise
     except Exception as exc:  # noqa: BLE001
         LOG.error("airbyte.rest.failed err=%s", exc, exc_info=True)
         return _failed(ctx, started_at, t_start, str(exc))
@@ -697,6 +691,10 @@ def _execute_embedded_mode(
                 "image_ref": image_ref,
             },
         )
+    except (SecretPolicyError, SecretRefError):
+        # The contract or the operator's policy must change: the CLI renders the
+        # what/why/fix panel. A store failure fails this build, fix included.
+        raise
     except Exception as exc:  # noqa: BLE001
         return _failed(ctx, started_at, t_start, f"PyAirbyte run failed: {exc}")
 

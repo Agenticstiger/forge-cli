@@ -15,7 +15,7 @@ fluid_build/providers/local/    @jeffwatson-ai
 
 # Security-sensitive areas
 fluid_build/credentials/        @jeffwatson-ai
-fluid_build/secrets.py          @jeffwatson-ai
+fluid_build/secrets/            @jeffwatson-ai
 fluid_build/auth.py             @jeffwatson-ai
 .secrets.baseline               @jeffwatson-ai
 

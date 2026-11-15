@@ -48,7 +48,7 @@ despite the matching name. Those are SSRF allowlists: unset, they *permit* any
 public host and refuse private ones, and the Command Center gate still lets a
 credential reach any public ``https`` endpoint unlisted. Mirroring them would
 have reproduced the hole. The deny-unless-named shape comes from
-``_secret_policy.py``, which answers the same question -- may this credential go
+``fluid_build/secrets/policy.py``, which answers the same question -- may this credential go
 where the contract says? -- for ``connection.secretRef``.
 
 :data:`ALLOWLIST_ENV` is operator-only, registered in

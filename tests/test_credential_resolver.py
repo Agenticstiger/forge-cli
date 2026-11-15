@@ -36,7 +36,10 @@ class TestCredentialSource:
 
     def test_all_sources_exist(self):
         sources = list(CredentialSource)
-        assert len(sources) == 10
+        # The Vault and Secret Manager steps became ONE SECRET_STORE step.
+        assert len(sources) == 7
+        assert CredentialSource.SECRET_STORE in sources
+        assert not any(src.name in ("VAULT", "SECRET_MANAGER") for src in sources)
 
 
 # ── CredentialConfig ──────────────────────────────────────────────────
@@ -148,19 +151,25 @@ class TestBaseCredentialResolver:
             # Should not bubble up the ImportError
             pass
 
-    def test_vault_error_handled(self):
+    def test_secret_store_unset_asks_no_store(self, monkeypatch):
+        monkeypatch.delenv("FLUID_CREDENTIAL_STORE", raising=False)
         resolver = ConcreteResolver()
-        result = resolver._get_from_vault("key")
-        # Should return None when vault is not configured
-        assert result is None
+        assert resolver._get_from_secret_store("key") is None
 
-    def test_config_returns_none(self):
+    def test_ambient_cloud_variables_do_not_pick_a_store(self, monkeypatch):
+        """Was: AWS_REGION / GCP_PROJECT silently sent every missing lookup to a
+        cloud Secrets Manager. Only FLUID_CREDENTIAL_STORE selects a store now."""
+        monkeypatch.delenv("FLUID_CREDENTIAL_STORE", raising=False)
+        monkeypatch.setenv("AWS_REGION", "eu-west-1")
+        monkeypatch.setenv("GCP_PROJECT", "some-project")
         resolver = ConcreteResolver()
-        assert resolver._get_from_config("key") is None
+        assert resolver._get_from_secret_store("key") is None
 
-    def test_secret_manager_returns_none(self):
+    def test_a_store_that_cannot_hold_fields_is_refused(self, monkeypatch):
+        monkeypatch.setenv("FLUID_CREDENTIAL_STORE", "env://SOMETHING")
         resolver = ConcreteResolver()
-        assert resolver._get_from_secret_manager("key") is None
+        with pytest.raises(CredentialError, match="FLUID_CREDENTIAL_STORE"):
+            resolver._get_from_secret_store("key")
 
     def test_suggestions_include_env_var(self):
         resolver = ConcreteResolver(provider="gcp")

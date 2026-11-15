@@ -69,10 +69,6 @@ class DependencyError(FluidError):
     """Raised when a required dependency is missing or incompatible."""
 
 
-class AuthenticationError(FluidError):
-    """Raised on authentication / credential failures."""
-
-
 class CircuitBreakerOpenError(Exception):
     """Raised when a circuit breaker is open and requests are being rejected.
 

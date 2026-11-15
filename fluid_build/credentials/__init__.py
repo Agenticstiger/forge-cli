@@ -9,9 +9,9 @@ Secure credential resolution across all providers with multiple sources:
 - Environment variables
 - .env files
 - OS Keyring (macOS Keychain, Windows Credential Manager, Linux Secret Service)
-- Encrypted files
-- HashiCorp Vault
-- Cloud Secret Managers (GCP/AWS/Azure)
+- The operator's secret store, when FLUID_CREDENTIAL_STORE names one
+  (OpenBao / Vault KV v2, AWS Secrets Manager), through fluid_build.secrets
+- Provider defaults (e.g. GCP ADC)
 - Interactive prompts (lowest priority)
 """
 

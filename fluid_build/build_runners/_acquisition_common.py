@@ -29,10 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from fluid_build.build_runners._secret_policy import (
-    refuse_unless_allowed,
-    register_resolved,
-)
+from fluid_build._net import is_loopback_host as _is_loopback_host
 
 LOG = logging.getLogger("fluid.build_runners.acquisition")
 
@@ -285,36 +282,6 @@ def adapt_source_config(engine: str, kind: str, connection: Dict[str, Any]) -> D
     return adapter(dict(connection)) if adapter else dict(connection)
 
 
-def _is_loopback_host(host: Any) -> bool:
-    """Return True for any address that resolves to the local loopback.
-
-    Accepts:
-    - The canonical hostname ``localhost`` (case-insensitive). We don't
-      probe the OS resolver because that would couple the helper to whatever
-      ``/etc/hosts`` the operator's machine happens to have configured —
-      ``localhost`` is the one universally-understood loopback name.
-    - Any address in the IPv4 loopback range ``127.0.0.0/8`` (so
-      ``127.0.0.2``, ``127.1.2.3`` etc. are caught, not just ``127.0.0.1``).
-    - The IPv6 loopback ``::1``.
-
-    Anything else (real hostnames, public IPs, link-local addresses) is
-    treated as non-loopback and left untouched by callers.
-    """
-    if not isinstance(host, str) or not host.strip():
-        return False
-    h = host.strip().lower()
-    if h == "localhost":
-        return True
-    # Strip ``[`` / ``]`` for bracketed IPv6 forms like ``[::1]``.
-    candidate = h.lstrip("[").rstrip("]")
-    try:
-        import ipaddress
-
-        return ipaddress.ip_address(candidate).is_loopback
-    except ValueError:
-        return False
-
-
 def apply_loopback_host_override(connection: Dict[str, Any]) -> None:
     """In-place: substitute loopback host with operator-provided override.
 
@@ -389,159 +356,54 @@ def extract_source_schemas(connection: Dict[str, Any]) -> List[str]:
     return []
 
 
-# secretRef URI scheme → fluid_build.secrets.SecretSource attribute name.
-# Adding a new backend = one entry here + the corresponding SecretSource
-# value already exists in fluid_build/secrets.py.
-_SECRET_REF_BACKENDS: Dict[str, str] = {
-    "vault": "HASHICORP_VAULT",
-    "aws": "AWS_SECRETS_MANAGER",
-    "gcp": "GCP_SECRET_MANAGER",
-    "azure": "AZURE_KEY_VAULT",
-    "file": "LOCAL_FILE",
-}
-
-
-def resolve_secret_ref(secret_ref: str) -> str:
-    """Resolve a single ``secretRef`` URI to its literal value.
-
-    secretRef syntax (per FLUID 0.7.3 schema): ``<scheme>://<identifier>``.
-
-    Schemes
-    -------
-    - ``env://VAR_NAME`` — read ``os.environ[VAR_NAME]``. Short-circuits to
-      ``os.environ`` to avoid spinning up a ``SecretManager`` for the
-      hot-path local-dev case.
-    - ``vault://path``    → HashiCorp Vault    via ``SecretManager``
-    - ``aws://name``      → AWS Secrets Manager via ``SecretManager``
-    - ``gcp://name``      → GCP Secret Manager  via ``SecretManager``
-    - ``azure://name``    → Azure Key Vault     via ``SecretManager``
-    - ``file://path``     → local encrypted file via ``SecretManager``
-
-    The cloud / vault schemes delegate to ``fluid_build.secrets.SecretManager``,
-    which already implements the backend-specific clients. Adding a new scheme
-    is a one-entry change in ``_SECRET_REF_BACKENDS`` (assuming the matching
-    ``SecretSource`` already exists in ``fluid_build/secrets.py``).
-
-    Args:
-        secret_ref: URI of the form ``<scheme>://<identifier>``.
-
-    Returns:
-        The resolved literal secret string.
-
-    Raises:
-        ValueError: ``secret_ref`` is malformed, references an unset env var,
-            or uses an unsupported scheme.
-    """
-    if "://" not in secret_ref:
-        raise ValueError(f"secretRef must be of the form '<scheme>://<identifier>': {secret_ref!r}")
-    scheme, _, ident = secret_ref.partition("://")
-    scheme = scheme.strip().lower()
-    ident = ident.strip()
-    if not scheme or not ident:
-        raise ValueError(f"secretRef must be of the form '<scheme>://<identifier>': {secret_ref!r}")
-
-    # Hot path: env:// short-circuit to os.environ.
-    if scheme == "env":
-        value = os.environ.get(ident)
-        if value is None:
-            raise ValueError(f"secretRef env://{ident}: environment variable not set")
-        return value
-
-    # Cloud / vault path: delegate to the existing SecretManager registry.
-    backend = _SECRET_REF_BACKENDS.get(scheme)
-    if backend is None:
-        supported = ["env"] + sorted(_SECRET_REF_BACKENDS)
-        raise ValueError(
-            f"secretRef scheme {scheme!r} is not supported. Supported schemes: {supported}"
-        )
-
-    # Lazy import — the SecretManager pulls in optional cloud SDKs that we
-    # don't want to load on every acquisition runner import.
-    from fluid_build.secrets import SecretConfig, SecretManager, SecretSource
-
-    source = getattr(SecretSource, backend)
-    manager = SecretManager(SecretConfig(source=source))
-    value = manager.get_secret(ident, required=True)
-    if value is None:
-        raise ValueError(f"secretRef {secret_ref}: backend returned no value")
-    return value
-
-
 def resolve_connection_secrets(
     connection: Dict[str, Any], *, target_field: str = "password"
 ) -> Dict[str, Any]:
     """Resolve a connection block's ``secretRef`` into a literal credential field.
 
-    Convenience wrapper over :func:`resolve_secret_ref` for the common case
-    where a SQL- or REST-style connection block has a single ``secretRef``
-    that should be placed into a named credential field. Most acquisition
-    runners (dlt sql_database, meltano tap-postgres, airbyte source-postgres,
-    debezium connectors, …) want the secret as the ``password`` field of the
-    underlying client — that's the default.
+    Most acquisition runners (dlt sql_database, meltano tap-postgres, airbyte
+    source-postgres, debezium connectors, ...) want the secret as the
+    ``password`` field of the underlying client, which is the default.
 
     Behaviour
     ---------
     1. Returns a NEW dict; never mutates the input.
-    2. No ``secretRef`` → returns a shallow copy unchanged.
-    3. ``secretRef`` is resolved via :func:`resolve_secret_ref`. Any scheme
-       supported there works here.
+    2. No ``secretRef`` -> returns a shallow copy unchanged.
+    3. The value is fetched through :func:`fluid_build.secrets.resolve_secret`,
+       so every scheme gets the same treatment: the grammar, the operator's
+       policy (scheme, locator prefix, stage, and EVERY destination this
+       connection carries), the run's cache or its run-secrets file, a
+       ``SecretStr`` registered with the redactor, and the audit event. A
+       refusal is raised before any store is asked, as a typed
+       :class:`~fluid_build.secrets.SecretError` naming the reference, never
+       the value.
     4. The resolved value is placed in ``connection[target_field]`` IFF that
-       field is empty. An inline literal always wins over the secretRef.
+       field is empty. An inline literal always wins over the secretRef, and
+       then the reference is never read and nothing is policed: nothing is
+       fetched or sent on its account. (A 0.7.7 contract cannot carry the
+       literal: ``password`` is ``writeOnly`` there.)
     5. ``secretRef`` is removed from the returned dict so downstream client
        SDKs don't see a stray field.
 
     Args:
         connection: The raw ``properties.source.connection`` dict (the
             ``ConnectionSpec.raw`` view).
-        target_field: Field to populate with the resolved secret. Most
-            SQL-flavoured connections want ``"password"`` (the default).
-            HTTP / REST sources that authenticate with a token can pass
-            ``target_field="token"``; OAuth2 flows can pass
-            ``target_field="access_token"``. The choice belongs to the
-            runner because the secretRef schema is engine-agnostic.
-
-    Returns:
-        A new connection dict with the secret resolved into ``target_field``
-        and ``secretRef`` removed.
-
-    Example
-    -------
-    >>> os.environ["PG_PASSWORD"] = "s3cret"
-    >>> resolve_connection_secrets({
-    ...     "host": "db.example.com",
-    ...     "port": 5432,
-    ...     "user": "alice",
-    ...     "secretRef": "env://PG_PASSWORD",
-    ... })
-    {'host': 'db.example.com', 'port': 5432, 'user': 'alice', 'password': 's3cret'}
+        target_field: Field to populate with the resolved secret: ``password``
+            for SQL-flavoured connections, ``token`` or ``access_token`` for
+            REST sources. The runner chooses, because the reference is
+            engine-agnostic.
     """
     out = dict(connection)
     secret_ref = out.pop("secretRef", None)
     if not secret_ref:
         return out
-    # The policy runs BEFORE the reference is resolved, so a refused send never
-    # reads the secret. This is the one place that sees both halves the contract
-    # chose -- the variable and the destination -- which is why the check lives
-    # here and all six acquisition runners inherit it.
     if out.get(target_field):
-        # An inline literal already wins (below), so the reference is never
-        # read and nothing is sent anywhere: there is nothing to police. The
-        # upgrade note promises exactly this, and checking here would refuse a
-        # contract that has a working credential and a stale secretRef beside
-        # it.
         return out
-    scheme = str(secret_ref).partition("://")[0].strip().lower()
-    if scheme == "env":
-        variable = str(secret_ref).partition("://")[2].strip()
-        # The whole connection, so EVERY destination it carries has to clear.
-        refuse_unless_allowed(variable, connection=out, scheme="env")
-    value = resolve_secret_ref(secret_ref)
-    # #884: the literal can be echoed by a client library's own error, which the
-    # runners print. Registering it means the redactor masks it by value rather
-    # than hoping a pattern recognises its shape.
-    register_resolved(value)
-    if not out.get(target_field):
-        out[target_field] = value
+    from fluid_build.secrets import resolve_secret
+
+    # The whole connection, so EVERY destination it carries has to clear.
+    value = resolve_secret(str(secret_ref), connection=out)
+    out[target_field] = value.get_secret_value()
     return out
 
 

@@ -140,13 +140,13 @@ from ...providers._iceberg_catalog_auth import (
     parse_catalog_auth,
     raw_catalog_auth,
 )
+from ...secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
+from ...secrets.policy import allowlist as secret_ref_allowlist
+from ...secrets.policy import is_loopback, variable_allowed
 from ...util.binding_paths import ENV_PLACEHOLDER_RE
 from .._deployment_host_policy import ALLOWLIST_ENV as HOST_ALLOWLIST_ENV
 from .._deployment_host_policy import _on_allowlist
 from .._deployment_host_policy import allowlist as host_allowlist
-from .._secret_policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
-from .._secret_policy import allowlist as secret_ref_allowlist
-from .._secret_policy import is_loopback, variable_allowed
 
 LOG = logging.getLogger("fluid.acquire.iceberg_sink")
 
@@ -1553,7 +1553,7 @@ def _check_catalog_auth_destinations(
     * https, and an address no entry has to rule out (:func:`_destination_host`).
       HARD;
     * the variable paired with it in ``FLUID_ACQUISITION_SECRET_REF_ALLOWLIST``
-      (``NAME@host``), unless it is loopback (``_secret_policy.variable_allowed``);
+      (``NAME@host``), unless it is loopback (``fluid_build.secrets.policy.variable_allowed``);
     * a hostname listed in ``FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST``
       (:func:`_unlisted_host`).
 

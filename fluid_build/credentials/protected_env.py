@@ -14,12 +14,11 @@ credentials, which is what they are for. They may not carry a setting that:
   ``FLUID_REF_ROOT``, ``FLUID_UPSTREAM_CONTRACTS``, ``FLUID_WORKSPACE_ROOT``,
   ``FLUID_FORGE_AGENT_CWD``, ``FLUID_LOCAL_DUCKDB_PATH``);
 * moves where the CLI reads trusted configuration or writes state, audit and
-  logs, or picks the key of the operator's own encrypted credential store
-  (the home and XDG config directories ``HOME``, ``USERPROFILE``,
+  logs (the home and XDG config directories ``HOME``, ``USERPROFILE``,
   ``XDG_CONFIG_HOME`` ..., their Windows counterparts ``APPDATA``,
   ``LOCALAPPDATA``, ``ProgramData``, ``ALLUSERSPROFILE``, the temporary
-  directory ``TMPDIR``/``TEMP``/``TMP``, ``FLUID_SECRETS_FILE``, ``FLUID_ENCRYPTION_KEY``,
-  ``FLUID_ENCRYPTION_PASSPHRASE``, ``FLUID_USER_HOME``, ``FLUID_HOME``,
+  directory ``TMPDIR``/``TEMP``/``TMP``, ``FLUID_SECRETS_FILE``, ``FLUID_USER_HOME``,
+  ``FLUID_HOME``,
   ``FLUID_CONFIG``, ``FLUID_CACHE_DIR``, ``FLUID_LOG_FILE``,
   ``FLUID_PRICES_JSON``, ``FLUID_STATE_BACKEND``, ``FLUID_STORE_*`` locations,
   ``FLUID_AUDIT_*``, ``FLUID_ATHENA_OUTPUT_LOCATION``);
@@ -181,10 +180,6 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "FLUID_LOCAL_DUCKDB_PATH",
         # ── where trusted config is read and state, audit, logs written ──
         "FLUID_SECRETS_FILE",
-        # the key for the operator's own ~/.fluid/credentials.enc
-        # (credentials/encrypted_store.py prefers it over ~/.fluid/.key)
-        "FLUID_ENCRYPTION_KEY",
-        "FLUID_ENCRYPTION_PASSPHRASE",
         "FLUID_USER_HOME",
         "FLUID_HOME",
         "FLUID_CONFIG",
@@ -270,7 +265,7 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST",
         # Both rewrite a contract-declared loopback host to a reachable one,
         # AFTER the secretRef policy has cleared the send as local-only
-        # (build_runners/_secret_policy). A project file that could set either
+        # (fluid_build/secrets/policy). A project file that could set either
         # would redirect a credential the policy allowed only because it was
         # staying on this machine. FLUID_RUNNER_HOST_OVERRIDE was already
         # listed; the testcontainers name it also honours was not.
@@ -359,6 +354,19 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         # bearer token
         "OLLAMA_API_BASE",
         "VAULT_ADDR",
+        # the same store under OpenBao's names, its namespace (where every
+        # path is resolved) and the CA bundle that authenticates it; a project
+        # file choosing any of them would choose whose store, or which
+        # certificate, forge trusts with the operator's token
+        "BAO_ADDR",
+        "VAULT_NAMESPACE",
+        "BAO_NAMESPACE",
+        "VAULT_CACERT",
+        "BAO_CACERT",
+        # the run-secrets handoff file a runner writes for this process, and
+        # the store the credential chain reads provider credentials from
+        "FLUID_RUN_SECRETS_FILE",
+        "FLUID_CREDENTIAL_STORE",
         # litellm routes every model call to this proxy when the switch is
         # on, and sends it the key FLUID resolved for whichever provider
         # (``api_key`` wins over LITELLM_PROXY_API_KEY), so no project file
@@ -522,6 +530,14 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
 #: Every name starting with one of these is protected.
 PROTECTED_ENV_PREFIXES: Tuple[str, ...] = (
     "FLUID_OVERLAY_",
+    # the secret-reference policy (FLUID_SECRET_SCHEMES, _PREFIXES, _STAGES):
+    # which stores, locators and stages a contract's references may resolve
+    # from, decided by the operator, never by the project (secrets/policy.py)
+    "FLUID_SECRET_",
+    # how forge authenticates to the operator's Vault or OpenBao: a JWT login
+    # role, mount and token, or a runner's response-wrapped token
+    # (secrets/_vault.py)
+    "FLUID_VAULT_",
     "FLUID_MCP_JWT_",
     "FLUID_LLM_DEFAULT_MODEL_",
     # credentials the Debezium runner itself sets: it writes each credential
@@ -1190,8 +1206,8 @@ ENDPOINT_CREDENTIAL_GROUPS: Tuple[EndpointGroup, ...] = (
         ambient=True,
         read_by=(
             "providers/snowflake/util/config.py (SNOWFLAKE_ACCOUNT, SF_ACCOUNT "
-            "through credentials/resolver.py, whose chain also reads the keyring, "
-            "~/.fluid/credentials.enc, ~/.fluidrc.yaml and a secret manager for "
+            "through credentials/resolver.py, whose chain also reads the keyring "
+            "and the operator's secret store (FLUID_CREDENTIAL_STORE) for "
             "each setting on its own, and get_connection_params prefers a key "
             "path, then an OAuth token, then an authenticator, then a password); "
             "build_runners/dbt/profiles.py and engines/dbt/profiles.py (the dbt "
@@ -1427,8 +1443,8 @@ ENDPOINT_CREDENTIAL_GROUPS: Tuple[EndpointGroup, ...] = (
         ),
         ambient=True,
         read_by=(
-            "azure-identity (DefaultAzureCredential in secrets.py, "
-            "ClientSecretCredential in cli/_auth_provider_azure.py): the client "
+            "azure-identity (ClientSecretCredential in cli/_auth_provider_azure.py, "
+            "and DefaultAzureCredential in an azure-kv:// resolver pack): the client "
             "secret is posted to AZURE_AUTHORITY_HOST, the managed-identity header "
             "sent to IDENTITY_ENDPOINT / MSI_ENDPOINT, and SharedTokenCacheCredential "
             "sends the refresh token it finds in the operator's token cache to "

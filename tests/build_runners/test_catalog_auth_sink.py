@@ -22,11 +22,11 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 from fluid_build.build_runners._deployment_host_policy import ALLOWLIST_ENV as HOST_ALLOWLIST
-from fluid_build.build_runners._secret_policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST
 from fluid_build.build_runners.debezium.iceberg_sink import emit_debezium_iceberg_sink_config
 from fluid_build.build_runners.kafka_connect.iceberg_sink import emit_iceberg_sink_config
 from fluid_build.providers._iceberg_catalog import ResolvedIcebergCatalog
 from fluid_build.providers._iceberg_catalog_auth import parse_catalog_auth
+from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST
 
 pytestmark = [pytest.mark.unit]
 

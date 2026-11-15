@@ -377,6 +377,40 @@
     }
   },
   "$defs": {
+    "secretRef": {
+      "type": "string",
+      "description": "NEW in v0.7.7: A reference to a secret held in a store, never the secret itself: a contract names a secret and never carries one. Grammar: <scheme>://<locator>[#field][?version=n]. Schemes: env, file, vault, aws-sm, gcp-sm, azure-kv; aliases openbao (vault), aws (aws-sm), gcp (gcp-sm) and azure (azure-kv) are accepted; any other lower-case scheme (such as op://) is passed to the pack that resolves it. #field picks one key of a secret that holds several; ?version= pins a version where the store keeps them.",
+      "anyOf": [
+        {
+          "title": "env",
+          "pattern": "^env://[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        {
+          "title": "file",
+          "pattern": "^file://(/(?!\\.{1,2}(/|$))[^/\\s#?\\x00-\\x1f\\x7f-\\x9f]+)+$"
+        },
+        {
+          "title": "vault",
+          "pattern": "^(vault|openbao)://[A-Za-z0-9_-][A-Za-z0-9_.-]*(/[A-Za-z0-9_@=+-][A-Za-z0-9_.@=+-]*)+#[A-Za-z0-9_.@-]+(\\?version=[1-9][0-9]*)?$"
+        },
+        {
+          "title": "aws-sm",
+          "pattern": "^(aws-sm|aws)://(arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+|[A-Za-z0-9/_+=.@-]{1,512})(#[A-Za-z0-9_.@-]+)?(\\?version=[A-Za-z0-9-]{32,64})?$"
+        },
+        {
+          "title": "gcp-sm",
+          "pattern": "^(gcp-sm|gcp)://projects/[a-z0-9-]+/secrets/[A-Za-z0-9_-]{1,255}(/versions/([1-9][0-9]*|latest))?$"
+        },
+        {
+          "title": "azure-kv",
+          "pattern": "^(azure-kv|azure)://[A-Za-z0-9-]{3,24}/[A-Za-z0-9-]{1,127}(\\?version=[0-9a-f]{32})?$"
+        },
+        {
+          "title": "pack",
+          "pattern": "^(?!(env|file|vault|openbao|aws-sm|aws|gcp-sm|gcp|azure-kv|azure)://)[a-z][a-z0-9+.-]*://(?![^/#?]*:[^/#?]*@)[^\\s#?\\x00-\\x1f\\x7f-\\x9f]+(#[A-Za-z0-9_.@-]+)?(\\?version=[A-Za-z0-9._-]+)?$"
+        }
+      ]
+    },
     "descriptionObject": {
       "type": "object",
       "additionalProperties": false,
@@ -3740,7 +3774,7 @@
                   "additionalProperties": false,
                   "properties": {
                     "secretRef": {
-                      "type": "string"
+                      "$ref": "#/$defs/secretRef"
                     }
                   }
                 }
@@ -3874,13 +3908,17 @@
               "type": "string"
             },
             "secretRef": {
+              "$ref": "#/$defs/secretRef",
+              "description": "Reference to the connection's secret in the configured store, e.g. vault://kv/orgs/acme/pg#password or env://PG_PASSWORD."
+            },
+            "password": {
               "type": "string",
-              "pattern": "^[a-z][a-z0-9_+.-]*://.+",
-              "description": "Reference to a secret in the configured backend (vault://, aws://, gcp://, azure://, env://)."
+              "writeOnly": true,
+              "description": "Write-only: a contract may not hold this value. Name the secret with secretRef instead."
             },
             "user": {
               "type": "string",
-              "description": "NEW in v0.7.3: Username/principal for SQL- or REST-style sources. Required by most database drivers (Postgres/MySQL/Oracle/etc.) — without it the underlying client falls back to the OS-user identity and typically fails authentication. Goes alongside ``secretRef`` (or an inline ``password``) for the credential pair."
+              "description": "NEW in v0.7.3: Username/principal for SQL- or REST-style sources. Required by most database drivers (Postgres/MySQL/Oracle/etc.) — without it the underlying client falls back to the OS-user identity and typically fails authentication. Goes alongside ``secretRef`` for the credential pair."
             },
             "schema": {
               "type": "string",
@@ -4555,7 +4593,12 @@
           "additionalProperties": true,
           "properties": {
             "secretRef": {
-              "type": "string"
+              "$ref": "#/$defs/secretRef"
+            },
+            "token": {
+              "type": "string",
+              "writeOnly": true,
+              "description": "Write-only: a contract may not hold this value. Name the secret with secretRef instead."
             }
           }
         },

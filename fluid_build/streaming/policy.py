@@ -32,7 +32,7 @@ endpoint and the S3 endpoint. Both checks reuse two existing policies:
   A hostname needs an entry whatever it resolves to here: the deployed job
   resolves it itself, after this check, where no DNS answer seen here applies.
 - The token's variable goes through the secret-ref policy (``build_runners/
-  _secret_policy.py``, ``NAME@host``). It is paired with every host that
+  secrets/policy.py``, ``NAME@host``). It is paired with every host that
   receives the credential or a token minted from it, before the variable is read.
 
 Every variable here ends in ``_ALLOWLIST``, so ``credentials/protected_env.py``
@@ -60,10 +60,10 @@ from fluid_build.build_runners._deployment_host_policy import (
     pinned_verdict,
 )
 from fluid_build.build_runners._deployment_host_policy import allowlist as host_allowlist
-from fluid_build.build_runners._secret_policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
-from fluid_build.build_runners._secret_policy import allowlist as secret_ref_allowlist
-from fluid_build.build_runners._secret_policy import is_loopback, variable_allowed
 from fluid_build.providers._iceberg_catalog_auth import CatalogAuth, parse_catalog_auth
+from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
+from fluid_build.secrets.policy import allowlist as secret_ref_allowlist
+from fluid_build.secrets.policy import is_loopback, variable_allowed
 from fluid_build.streaming.compiler import CONTRACT_SQL_ALLOWLIST_ENV
 
 CONTEXT_ALLOWLIST_ENV = "FLUID_FLINK_KUBE_CONTEXT_ALLOWLIST"

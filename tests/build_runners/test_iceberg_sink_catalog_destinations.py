@@ -27,11 +27,11 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 from fluid_build.build_runners._deployment_host_policy import ALLOWLIST_ENV as HOST_ALLOWLIST
-from fluid_build.build_runners._secret_policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST
 from fluid_build.build_runners.kafka_connect.iceberg_sink_validation import (
     iceberg_sink_preflight,
     validate_iceberg_sink,
 )
+from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST
 from tests.build_runners import test_catalog_auth_sink as _sink_tests
 from tests.build_runners.test_catalog_auth_sink import _RecordingRun
 

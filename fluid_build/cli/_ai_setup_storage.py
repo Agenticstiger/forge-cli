@@ -165,14 +165,14 @@ def _write_config_dict(payload: dict) -> bool:
     """
     import json
 
-    from fluid_build.credentials.encrypted_store import _atomic_write_bytes
+    from fluid_build.util.atomic_write import atomic_write_bytes
 
     try:
         _config_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Owner-only read/write from the start — ``_atomic_write_bytes``
+        # Owner-only read/write from the start — ``atomic_write_bytes``
         # opens the file 0o600, so a (possibly api_key-bearing) entry is
         # never world-readable, even briefly.
-        _atomic_write_bytes(
+        atomic_write_bytes(
             _config_file(),
             json.dumps(payload, indent=2).encode("utf-8"),
             mode=0o600,

@@ -291,6 +291,7 @@ class DltRunner:
 def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
     import dlt
 
+    from ...secrets.errors import SecretPolicyError, SecretRefError
     from .._acquisition_common import begin_acquisition_run, resolve_connection_secrets
     from .._credentials import make_destination
     from .destinations import undo_bridge_writes
@@ -351,6 +352,11 @@ def _execute(ctx: RunContext, runner: DltRunner) -> RunResult:
                 source_obj = _make_sql_database_source(connection, list(ctx.source.streams))
             else:
                 raise ValueError(f"dlt runner: unsupported source.kind '{kind}'")
+    except (SecretPolicyError, SecretRefError):
+        # The contract or the operator's policy must change: the CLI renders the
+        # what/why/fix panel. A store failure falls through and fails this build;
+        # its message carries the fix.
+        raise
     except Exception as exc:  # noqa: BLE001
         LOG.error("dlt.source.build.failed err=%s", exc, exc_info=True)
         return _failed_result(ctx, started_at, str(exc), t_start)

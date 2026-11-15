@@ -100,9 +100,20 @@ def test_the_names_agree_with_the_modules_that_read_them() -> None:
         "DYLD_INSERT_LIBRARIES",
         "AWS_ENDPOINT_URL_S3",
         "GIT_CONFIG_COUNT",
-        # The key for the operator's own ~/.fluid/credentials.enc.
-        "FLUID_ENCRYPTION_KEY",
-        "FLUID_ENCRYPTION_PASSPHRASE",
+        # The secret-reference policy, the store forge authenticates to and
+        # how, and a runner's handoff file: the operator's, never the project's.
+        "FLUID_SECRET_SCHEMES",
+        "FLUID_SECRET_PREFIXES",
+        "FLUID_SECRET_STAGES",
+        "FLUID_VAULT_JWT_ROLE",
+        "FLUID_VAULT_WRAPPED_TOKEN",
+        "FLUID_RUN_SECRETS_FILE",
+        "FLUID_CREDENTIAL_STORE",
+        "BAO_ADDR",
+        "BAO_NAMESPACE",
+        "VAULT_NAMESPACE",
+        "BAO_CACERT",
+        "VAULT_CACERT",
         # SDK config files that can name a credential helper program or an
         # endpoint, and the switch that lets google-auth run one.
         "AWS_CONFIG_FILE",

@@ -24,12 +24,9 @@ class CredentialSource(Enum):
     ENVIRONMENT = 2  # Environment variables
     DOTENV = 3  # .env files
     KEYRING = 4  # OS keyring
-    ENCRYPTED_FILE = 5  # Encrypted local file
-    CONFIG_FILE = 6  # Config file
-    VAULT = 7  # HashiCorp Vault
-    SECRET_MANAGER = 8  # Cloud secret managers
-    PROVIDER_DEFAULT = 9  # Provider-specific defaults (e.g., ADC for GCP)
-    PROMPT = 10  # Interactive prompt (lowest priority)
+    SECRET_STORE = 5  # The operator's explicit store (FLUID_CREDENTIAL_STORE)
+    PROVIDER_DEFAULT = 6  # Provider-specific defaults (e.g., ADC for GCP)
+    PROMPT = 7  # Interactive prompt (lowest priority)
 
 
 @dataclass
@@ -102,12 +99,15 @@ class BaseCredentialResolver(ABC):
         2. Environment variable (current session)
         3. .env file (project-specific)
         4. OS Keyring (secure local storage)
-        5. Encrypted file (~/.fluid/credentials.enc)
-        6. Config file (~/.fluidrc.yaml)
-        7. Vault (HashiCorp Vault)
-        8. Secret Manager (GCP/AWS/Azure)
-        9. Provider-specific default (e.g., ADC for GCP)
-        10. Interactive prompt (if allowed)
+        5. The operator's secret store, only when FLUID_CREDENTIAL_STORE names
+           one (vault://<mount>/<prefix> or aws-sm://<prefix>; never chosen by
+           ambient variables such as AWS_REGION or GCP_PROJECT)
+        6. Provider-specific default (e.g., ADC for GCP)
+        7. Interactive prompt (if allowed)
+
+        The Fernet file store (``~/.fluid/credentials.enc``) and plaintext
+        credentials in ``~/.fluidrc.yaml`` were retired on 2026-11-15: keep a
+        credential in the keyring, a secret store, or the environment.
 
         Args:
             key: Credential key (e.g., "password", "account")
@@ -174,37 +174,19 @@ class BaseCredentialResolver(ABC):
             if value:
                 logger.debug("Credential resolved from: OS keyring")
 
-        # 5. Encrypted file
+        # 5. The operator's secret store, when one is named
         if value is None and not pinned:
-            value = self._get_from_encrypted_file(key)
+            value = self._get_from_secret_store(key)
             if value:
-                logger.debug("Credential resolved from: encrypted file")
+                logger.debug("Credential resolved from: secret store")
 
-        # 6. Config file
-        if value is None and not pinned:
-            value = self._get_from_config(key)
-            if value:
-                logger.debug("Credential resolved from: config file")
-
-        # 7. Vault
-        if value is None and not pinned:
-            value = self._get_from_vault(key)
-            if value:
-                logger.debug("Credential resolved from: Vault")
-
-        # 8. Secret Manager
-        if value is None and not pinned:
-            value = self._get_from_secret_manager(key)
-            if value:
-                logger.debug("Credential resolved from: secret manager")
-
-        # 9. Provider-specific default
+        # 6. Provider-specific default
         if value is None and not pinned:
             value = self._get_provider_default(key, **kwargs)
             if value:
                 logger.debug("Credential resolved from: provider default")
 
-        # 10. Interactive prompt (lowest priority)
+        # 7. Interactive prompt (lowest priority)
         if value is None and self.config.allow_prompt and required and not pinned:
             value = self._get_from_prompt(key)
             if value:
@@ -232,7 +214,7 @@ class BaseCredentialResolver(ABC):
         Then ``get_credential`` reads only the CLI argument, the environment
         and the project's files: the project files paired that endpoint with
         a credential of their own (``credentials.protected_env``), and the
-        operator's keyring, encrypted file, config file or secret manager
+        operator's keyring or secret store
         must not supply one for a host the project chose. Providers whose
         endpoints are listed there override this.
         """
@@ -328,129 +310,46 @@ class BaseCredentialResolver(ABC):
             logger.warning("Unexpected error reading from keyring: %s", e)
             return None
 
-    def _get_from_encrypted_file(self, key: str) -> Optional[str]:
-        """Get credential from encrypted file.
+    def _get_from_secret_store(self, key: str) -> Optional[str]:
+        """Get a credential from the store the operator named, through the secret registry.
 
-        C-009: narrowed exception surface. ``CredentialError`` is what
-        ``EncryptedCredentialStore._load_store`` raises on an
-        ``InvalidToken`` (see S-008 / ``encrypted_store.py``) — this is
-        a hard failure we deliberately re-raise so the user is told the
-        store is unreadable rather than silently falling through (which
-        would mask a ciphertext/key mismatch). ``OSError`` is I/O.
+        ``FLUID_CREDENTIAL_STORE`` (operator-only: ``credentials/protected_env``)
+        is a reference prefix such as ``vault://kv/fluid/credentials`` or
+        ``aws-sm://fluid/credentials``; the credential is read from
+        ``<prefix>/<provider>#<key>``: one secret per provider, one field per
+        key. Unset means no store is asked. The store used to be picked from
+        ambient variables (GCP Secret Manager when ``GCP_PROJECT`` was set, else
+        AWS Secrets Manager when ``AWS_REGION`` was), so setting a region
+        silently sent every missing credential lookup to Secrets Manager.
+
+        A secret that is not there falls through to the next source. Any other
+        failure (a store that is unreachable, a denied read, a reference the
+        operator's policy refuses) raises :class:`CredentialError`: falling
+        through would hide a broken store behind a provider default or a prompt.
         """
+        store = os.environ.get("FLUID_CREDENTIAL_STORE", "").strip()
+        if not store:
+            return None
+        scheme = store.partition("://")[0].strip().lower()
+        if scheme not in ("vault", "openbao", "aws-sm", "aws") or "://" not in store:
+            raise CredentialError(
+                "FLUID_CREDENTIAL_STORE must name a store whose secrets hold fields, "
+                "such as vault://<mount>/<prefix> or aws-sm://<prefix>",
+                suggestions=["export FLUID_CREDENTIAL_STORE=vault://kv/fluid/credentials"],
+            )
+        from ..secrets import SecretError, resolve_credential
+
+        reference = f"{store.rstrip('/')}/{self.provider}#{key}"
         try:
-            from .encrypted_store import EncryptedCredentialStore
-        except ImportError:
-            logger.debug("cryptography library not available, skipping encrypted file")
-            return None
-
-        keyring_key = f"{self.provider}.{key}"
-        try:
-            store = EncryptedCredentialStore()
-            return store.get_credential(keyring_key)
-        except CredentialError:
-            # Key mismatch / corruption — surface to caller; silent
-            # fall-through is the bug S-008 explicitly fixed.
-            raise
-        except ImportError as e:
-            logger.debug("cryptography not installed; skipping encrypted file (%s)", e)
-            return None
-        except OSError as e:
-            logger.debug("Failed to read encrypted credential file: %s", e)
-            return None
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("Unexpected error reading encrypted file: %s", e)
-            return None
-
-    def _get_from_config(self, key: str) -> Optional[str]:
-        """Get credential from config file (~/.fluidrc.yaml or ~/.fluid/config.yaml)."""
-        try:
-            import yaml as _yaml
-        except ImportError:
-            return None
-
-        config_paths = [
-            os.path.expanduser("~/.fluidrc.yaml"),
-            os.path.expanduser("~/.fluid/config.yaml"),
-        ]
-
-        for config_path in config_paths:
-            if not os.path.exists(config_path):
-                continue
-            try:
-                with open(config_path, encoding="utf-8") as f:
-                    config = _yaml.safe_load(f) or {}
-                # Try provider-scoped key first, then global
-                provider_section = config.get(self.provider, {})
-                if isinstance(provider_section, dict) and key in provider_section:
-                    return str(provider_section[key])
-                if key in config:
-                    return str(config[key])
-            except Exception as e:
-                logger.warning(f"Failed to parse config file {config_path}: {e}")
-
-        return None
-
-    def _get_from_vault(self, key: str) -> Optional[str]:
-        """Get credential from HashiCorp Vault.
-
-        C-009: narrowed to the vendor/domain errors we expect — the
-        ``secrets`` module raises ``ConfigurationError`` /
-        ``AuthenticationError`` for misconfig; ``ImportError`` covers
-        the optional ``hvac`` dep; ``OSError`` covers network I/O.
-        Unknown errors log at ``warning`` so operational problems
-        (transient 5xx, DNS) become visible in logs instead of
-        disappearing silently.
-        """
-        try:
-            from ..errors import AuthenticationError, ConfigurationError
-            from ..secrets import SecretSource, get_secret_manager
-        except ImportError:
-            logger.debug("secrets backend unavailable, skipping Vault")
-            return None
-
-        secret_name = f"{self.provider}/{key}"
-        try:
-            manager = get_secret_manager()
-            # ``get_secret_manager`` picks ONE store for the process. Unless it
-            # picked Vault, this step would repeat, verbatim, the lookup that
-            # ``_get_from_secret_manager`` makes against the same manager next,
-            # which is how every missing key cost two AWS Secrets Manager calls.
-            if manager is None or manager.config.source is not SecretSource.HASHICORP_VAULT:
+            secret = resolve_credential(reference)
+        except SecretError as exc:
+            if exc.extras.get("reason") == "not_found":
                 return None
-            return manager.get_secret(secret_name, required=False)
-        except (ConfigurationError, AuthenticationError, OSError) as e:
-            logger.debug("Failed to read from Vault: %s", e)
-            return None
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("Unexpected error reading from Vault: %s", e)
-            return None
-
-    def _get_from_secret_manager(self, key: str) -> Optional[str]:
-        """Get credential from cloud secret manager (GCP/AWS/Azure).
-
-        C-009: same narrowing rationale as ``_get_from_vault``.
-        """
-        try:
-            from ..errors import AuthenticationError, ConfigurationError
-            from ..secrets import SecretSource, get_secret_manager
-        except ImportError:
-            logger.debug("secrets backend unavailable, skipping secret manager")
-            return None
-
-        secret_name = f"{self.provider}/{key}"
-        try:
-            manager = get_secret_manager()
-            # A Vault-backed manager was already asked by ``_get_from_vault``.
-            if manager is None or manager.config.source is SecretSource.HASHICORP_VAULT:
-                return None
-            return manager.get_secret(secret_name, required=False)
-        except (ConfigurationError, AuthenticationError, OSError) as e:
-            logger.debug("Failed to read from secret manager: %s", e)
-            return None
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("Unexpected error reading from secret manager: %s", e)
-            return None
+            raise CredentialError(
+                f"{exc.what}: {exc.why}", suggestions=[exc.fix] if exc.fix else []
+            ) from None
+        value: str = secret.get_secret_value()
+        return value
 
     def _get_from_prompt(self, key: str) -> Optional[str]:
         """Get credential from interactive prompt."""
