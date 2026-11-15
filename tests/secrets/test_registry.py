@@ -115,7 +115,7 @@ def test_pack_entry_point_that_raises_on_load_gives_a_clear_error(monkeypatch):
 
 @pytest.mark.unit
 def test_pack_object_without_resolve_is_treated_as_missing(monkeypatch):
-    entry = SimpleNamespace(name="op", value="pack:Odd", load=lambda: object())
+    entry = SimpleNamespace(name="op", value="pack:Odd", load=object)
     _patch_entry_points(monkeypatch, [entry])
     with pytest.raises(SecretResolveError) as info:
         registry.get_resolver("op")

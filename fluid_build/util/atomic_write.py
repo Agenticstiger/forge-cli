@@ -36,6 +36,8 @@ def atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
         try:
             os.unlink(tmp)
         except OSError:
+            # Best effort: the temp file may be gone already, and the error
+            # being re-raised below is the one the caller needs.
             pass
         raise
     try:

@@ -68,11 +68,9 @@ class SecretResolver(Protocol):
 
     def resolve(self, ref: SecretRef, run: RunState) -> str:
         """The value of ``ref``. Raise :class:`SecretResolveError` when it cannot."""
-        ...
 
     def exists(self, ref: SecretRef, run: RunState) -> Existence:
         """Whether ``ref`` exists, without reading its value."""
-        ...
 
 
 def register_resolver(scheme: str, resolver: SecretResolver) -> None:

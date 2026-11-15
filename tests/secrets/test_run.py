@@ -86,13 +86,17 @@ def test_failing_cleanup_does_not_raise_and_others_still_run():
     assert state.cache == {}
 
 
+def _a_stage_that_fails(ran):
+    with secret_run("apply") as state:
+        state.on_close(lambda: ran.append("done"))
+        raise ValueError("stage failed")
+
+
 @pytest.mark.unit
 def test_cleanups_run_when_the_body_raises():
     ran = []
     with pytest.raises(ValueError):
-        with secret_run("apply") as state:
-            state.on_close(lambda: ran.append("done"))
-            raise ValueError("stage failed")
+        _a_stage_that_fails(ran)
     assert ran == ["done"]
     assert current_stage() is None
     assert run_mod._STATE is None

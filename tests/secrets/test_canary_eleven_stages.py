@@ -29,7 +29,6 @@ import contextlib
 import io
 import logging
 import os
-import re
 import tarfile
 import time
 import uuid
@@ -288,7 +287,9 @@ def _scan_archive_bytes(label: str, data: bytes, needles: List[bytes], depth: in
                         f"{label}!{name}", zf.read(name), needles, depth + 1
                     )
     except (tarfile.TarError, zipfile.BadZipFile, EOFError, OSError):
-        pass
+        # Bytes that only look like an archive (or a truncated one): the raw
+        # scan at the top of this function already searched them.
+        return hits
     return hits
 
 

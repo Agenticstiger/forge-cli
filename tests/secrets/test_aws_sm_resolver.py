@@ -312,7 +312,6 @@ def test_denied_is_unknown(boto):
 
 
 def test_aws_region_alone_never_reaches_aws_or_the_secret_registry(monkeypatch):
-    import fluid_build.secrets
     from fluid_build.credentials.adapters import SnowflakeCredentialAdapter
 
     def fail(*args, **kwargs):
@@ -338,7 +337,7 @@ def test_aws_region_alone_never_reaches_aws_or_the_secret_registry(monkeypatch):
     monkeypatch.setenv("GCP_PROJECT", "some-project")
     monkeypatch.delenv("FLUID_CREDENTIAL_STORE", raising=False)
     monkeypatch.setitem(sys.modules, "boto3", Boom())
-    monkeypatch.setattr(fluid_build.secrets, "resolve_credential", fail, raising=False)
+    monkeypatch.setattr("fluid_build.secrets.resolve_credential", fail, raising=False)
     monkeypatch.setattr("fluid_build.secrets.resolve.resolve_credential", fail)
 
     adapter = Adapter()

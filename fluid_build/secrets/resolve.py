@@ -11,7 +11,7 @@ The order, for a reference a contract names (:func:`resolve_secret`):
    destination the value is sent to is allowed. All of it before any store is
    asked, so a refusal never reads the secret.
 3. The run's cache: one fetch per reference per run.
-4. The run-secrets file, when the operator set :data:`RUN_SECRETS_ENV`
+4. The run-secrets file, when the operator set ``FLUID_RUN_SECRETS_FILE``
    (Command Center's ``runner-env`` handoff): the value comes from the file,
    and a reference the file does not list does not resolve at all.
 5. Otherwise the scheme's resolver (:mod:`.registry`).
@@ -36,7 +36,7 @@ from typing import Any, Mapping, Optional, Union
 from fluid_build._errors import doc_url
 
 from .errors import SecretError, SecretPolicyError, SecretResolveError
-from .handoff import RUN_SECRETS_ENV, handed, not_handed
+from .handoff import handed, not_handed
 from .policy import (
     check_prefix,
     check_scheme,
