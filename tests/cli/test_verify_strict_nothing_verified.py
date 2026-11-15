@@ -107,7 +107,7 @@ def test_strict_fails_when_every_expose_was_skipped(two_aws_parquet: Path, capsy
     assert text.count("No verifier for this aws binding") == 2
     assert "--strict: nothing was verified: all 2 expose(s) were skipped" in text
     assert "2 with no verifier for the binding" in text
-    assert "pass --warn-only" in text
+    assert "no verifier for these bindings yet. Pass --warn-only if the skip is expected" in text
 
 
 def test_without_strict_a_run_that_verified_nothing_still_exits_0(two_aws_parquet: Path) -> None:
@@ -157,7 +157,8 @@ def test_a_reference_only_table_not_built_yet_is_a_skip(tmp_path: Path, capsys) 
     assert "reference-only — external pipeline owns creation" in text
     assert "Not built yet (reference-only): 1" in text
     assert "(1 reference-only, not built yet)" in text
-    assert "Re-run once the external pipeline has built the table(s)" in text
+    assert "If the external pipeline has not built the table(s) yet, re-run once it has" in text
+    assert "the INFO lines above give each one's error" in text
     assert "could not be verified" not in text  # still not an error
 
     assert _verify(contract, "--strict", "--warn-only") == 0

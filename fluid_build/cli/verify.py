@@ -1391,12 +1391,20 @@ def _nothing_verified_fails(
     if getattr(args, "warn_only", False):
         warning(f"--warn-only: {what}. Not failing the build.")
         return False
+    # Worded like ``fluid apply``'s every-build-skipped refusal
+    # (build_runners/base.py), which ``--allow-skipped-builds`` waives.
     if not_built:
-        next_step = "Re-run once the external pipeline has built the table(s), or pass --warn-only."
+        # "Not built" is every reference-only error with ``exists: False``, which
+        # can also be a client error; the INFO line above each one says which.
+        next_step = (
+            "If the external pipeline has not built the table(s) yet, re-run once it "
+            "has; the INFO lines above give each one's error. Pass --warn-only if the "
+            "skip is expected."
+        )
     else:
         next_step = (
-            "forge-cli has no verifier for these bindings yet; pass --warn-only "
-            "to accept a run that checks nothing."
+            "forge-cli has no verifier for these bindings yet. Pass --warn-only if the "
+            "skip is expected."
         )
     console_error(f"{'--strict' if strict else '--fail-on-warning'}: {what}. {next_step}")
     return True

@@ -97,7 +97,9 @@ write. In each case only an empty table fails.
 
 Only formats the Glue table is emitted with Hive storage classes for are checked
 this way (today `parquet`, the format the builds write). Other formats keep the
-"no verifier" answer, which is reported and never fails the run.
+"no verifier" answer: it is reported and does not fail the run on its own. A
+`--strict` run in which every expose was skipped verified nothing and fails;
+`--warn-only` accepts it.
 
 ## Options
 
