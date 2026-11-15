@@ -608,7 +608,7 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
     CoreCommand(
         "secrets",
         "secrets",
-        (_cmd("secrets", "🔐 Manage acquisition-pipeline secrets (login / verify / rotate)"),),
+        (_cmd("secrets", "🔐 Check a contract's secret references; manage keychain secrets"),),
     ),
     CoreCommand(
         "market",
