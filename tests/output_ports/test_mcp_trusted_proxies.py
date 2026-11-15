@@ -451,9 +451,10 @@ def _serve(tmp_path: Path, env_overrides: Dict[str, str], *, transport: str):
     )
 
 
-@pytest.mark.parametrize("mode", ["mtls", "off", "disabled"])
+@pytest.mark.parametrize("mode", ["mtls", "off", "disabled", ""])
 def test_cli_unknown_auth_mode_exits_2_with_valid_modes_and_no_traceback(tmp_path: Path, mode: str):
-    # off and disabled never reach the jurisdiction gate's auth check: they stop here.
+    # off, disabled and set-but-empty never reach the jurisdiction gate's auth check:
+    # they stop here.
     proc = _serve(tmp_path, {"FLUID_MCP_AUTH_MODE": mode}, transport="http")
     output = proc.stdout + proc.stderr
     assert proc.returncode == 2, output
