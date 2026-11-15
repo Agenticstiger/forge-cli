@@ -33,7 +33,7 @@ forbidden_modules =
 ignore_imports =
     # boto3: each of these imports sits inside a function, guarded by
     # try/except ImportError, and runs only once an AWS code path is taken.
-    fluid_build.secrets -> boto3
+    fluid_build.secrets._aws_sm -> boto3
     fluid_build.iac.providers.aws -> boto3
     fluid_build.credentials.adapters -> boto3
     # providers/aws: the three modules below import boto3 inside functions
