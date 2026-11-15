@@ -88,6 +88,27 @@ def _load(name: str) -> Dict[str, Any]:
     return yaml.safe_load((EXAMPLES_DIR / f"{name}.odps.yaml").read_text(encoding="utf-8"))
 
 
+class KnownGap(Exception):
+    """The one failure a strict xfail in this ledger may absorb, and nothing else.
+
+    ``xfail(raises=AssertionError)`` would also absorb an assert inside the provider, and
+    ``raises=ProviderError`` any refusal, a probe that is not valid ODPS included. A gap test
+    raises this itself, and only after it has seen the exact symptom it documents.
+    """
+
+
+def _round_trip_or_gap(
+    source: Any, base_path: Path, *, refusal: str, reason: str
+) -> Dict[str, Any]:
+    """Round trip, where the one refusal named by ``refusal`` is the documented gap."""
+    try:
+        return _round_trip(source, base_path)
+    except ProviderError as exc:
+        if refusal in str(exc):
+            raise KnownGap(reason) from exc
+        raise
+
+
 # ---------------------------------------------------------------------------
 # The five official examples
 # ---------------------------------------------------------------------------
@@ -118,32 +139,50 @@ def test_example_round_trips_unchanged(name: str, tmp_path: Path) -> None:
     assert product == _load(name)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "RFC-0051: `deprecated` on an input or output port is lost on export: import keeps it "
-        "only in the verbatim source copy and the port mapper does not replay it"
-    ),
+_DEPRECATED_EXAMPLE_REASON = (
+    "RFC-0051: `deprecated` on an input or output port is lost on export: import keeps it "
+    "only in the verbatim source copy and the port mapper does not replay it"
 )
+
+
+def _without_port_deprecated(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """The document minus the port-level `deprecated` flags: what forge writes today."""
+    doc = copy.deepcopy(doc)
+    for kind in ("inputPorts", "outputPorts"):
+        for port in doc.get(kind) or []:
+            port.pop("deprecated", None)
+    return doc
+
+
+@pytest.mark.xfail(strict=True, raises=KnownGap, reason=_DEPRECATED_EXAMPLE_REASON)
 def test_deprecated_example_round_trips_unchanged(tmp_path: Path) -> None:
+    expected = _load("deprecated-data-product")
     product = _round_trip(EXAMPLES_DIR / "deprecated-data-product.odps.yaml", tmp_path)
 
-    assert product == _load("deprecated-data-product")
+    if product != expected:
+        # Exactly those flags and nothing else, or this is a new defect and not the gap.
+        assert product == _without_port_deprecated(expected)
+        raise KnownGap(_DEPRECATED_EXAMPLE_REASON)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ProviderError,
-    reason=(
-        "two output ports share the name `rawtransactions` (versions 1.0.0 and 2.0.0) and "
-        "an expose id is unique, so export refuses; import already keeps one pass-through "
-        "entry per id, and `fluid validate` accepts the duplicate"
-    ),
+_CUSTOMER_EXAMPLE_REASON = (
+    "two output ports share the name `rawtransactions` (versions 1.0.0 and 2.0.0) and an "
+    "expose id is unique, so export refuses; import keeps one pass-through entry per id and "
+    "`fluid validate` accepts the duplicate. Input ports that share a name collapse to one "
+    "too (see the same-name input probe below)"
 )
-def test_customer_example_round_trips_unchanged(tmp_path: Path) -> None:
-    product = _round_trip(EXAMPLES_DIR / "customer-data-product.odps.yaml", tmp_path)
 
+
+@pytest.mark.xfail(strict=True, raises=KnownGap, reason=_CUSTOMER_EXAMPLE_REASON)
+def test_customer_example_round_trips_unchanged(tmp_path: Path) -> None:
+    product = _round_trip_or_gap(
+        EXAMPLES_DIR / "customer-data-product.odps.yaml",
+        tmp_path,
+        refusal="Duplicate output port name",
+        reason=_CUSTOMER_EXAMPLE_REASON,
+    )
+
+    # Reached only once the refusal is gone; whatever still differs is then a new ledger entry.
     assert product == _load("customer-data-product")
 
 
@@ -276,6 +315,18 @@ GAPS = (
     # Optional `id` on the port objects themselves.
     (("inputPorts", 0, "id"), "in", f"optional id on an input port, {_NO_PORT_HOME}"),
     (("outputPorts", 0, "id"), "out", f"optional id on an output port, {_NO_PORT_HOME}"),
+    # Not new in v1.1.0: a port is named, and one name can carry several versions. Output
+    # ports with a shared name are refused (see the customer example); input ports are
+    # silently collapsed to the first, because the export keeps one input port per name.
+    (
+        ("inputPorts",),
+        [
+            {"name": "source", "version": "1.0.0", "contractId": "upstream.source"},
+            {"name": "source", "version": "2.0.0", "contractId": "upstream.source.v2"},
+        ],
+        "two input ports that share a name (versions 1.0.0 and 2.0.0) collapse to the first: "
+        "the export keeps one input port per name (mappers/ports.py, the expects path)",
+    ),
 )
 
 
@@ -306,7 +357,7 @@ def test_field_survives_import_then_export(path: Steps, value: Any, tmp_path: Pa
             value,
             reason,
             id=_pid(path),
-            marks=pytest.mark.xfail(strict=True, raises=AssertionError, reason=reason),
+            marks=pytest.mark.xfail(strict=True, raises=KnownGap, reason=reason),
         )
         for path, value, reason in GAPS
     ],
@@ -314,25 +365,31 @@ def test_field_survives_import_then_export(path: Steps, value: Any, tmp_path: Pa
 def test_field_is_lost_between_import_and_export(
     path: Steps, value: Any, reason: str, tmp_path: Path
 ) -> None:
+    # An error in _plant or in the round trip is a failure here, not the documented gap.
     product = _round_trip(_plant(path, value), tmp_path)
 
-    assert _read(product, path) == value, reason
+    if _read(product, path) != value:
+        raise KnownGap(reason)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ProviderError,
-    reason=(
-        "RFC-0035 `vendor` inside description.customProperties: the description is copied into "
-        "each per-port ODCS contract and ODCS v3.1.0 has no `vendor` (it arrived in v3.2.0), "
-        "so the sibling contract fails validation and the whole export is refused"
-    ),
+_VENDOR_IN_DESCRIPTION_REASON = (
+    "RFC-0035 `vendor` inside description.customProperties: the description is copied into "
+    "each per-port ODCS contract and ODCS v3.1.0 has no `vendor` (v3.2.0 added it), so the "
+    "sibling contract fails validation and the whole export is refused"
 )
+
+
+@pytest.mark.xfail(strict=True, raises=KnownGap, reason=_VENDOR_IN_DESCRIPTION_REASON)
 def test_vendor_inside_description_survives_import_then_export(tmp_path: Path) -> None:
     path: Steps = ("description",)
     value = {"purpose": "Orders.", "customProperties": _vendor_props("dcp")}
 
-    product = _round_trip(_plant(path, value), tmp_path)
+    product = _round_trip_or_gap(
+        _plant(path, value),
+        tmp_path,
+        refusal="'vendor' was unexpected",
+        reason=_VENDOR_IN_DESCRIPTION_REASON,
+    )
 
     assert _read(product, path) == value
 
