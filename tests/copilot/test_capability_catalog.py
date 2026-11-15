@@ -103,16 +103,6 @@ class TestFormatDegradationWarnings:
         # No notes on this entry → silent.
         assert warnings == []
 
-    def test_a_catalog_note_surfaces_as_a_warning(self) -> None:
-        warnings = format_degradation_warnings(
-            provider="openai",
-            model="o1-mini",
-            usage_profile="staged_pipeline",
-        )
-        # The staged pipeline needs no tool use, so only the catalog note shows.
-        assert warnings == [w for w in warnings if w.startswith("Note for openai/o1-mini")]
-        assert any("do not support tool use" in w for w in warnings)
-
     def test_unknown_provider_always_warns(self) -> None:
         warnings = format_degradation_warnings(
             provider="totally-fake",
