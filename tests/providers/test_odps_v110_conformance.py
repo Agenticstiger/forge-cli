@@ -121,7 +121,10 @@ def test_example_round_trips_unchanged(name: str, tmp_path: Path) -> None:
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="RFC-0051: `deprecated` on an input or output port is dropped on import",
+    reason=(
+        "RFC-0051: `deprecated` on an input or output port is lost on export: import keeps it "
+        "only in the verbatim source copy and the port mapper does not replay it"
+    ),
 )
 def test_deprecated_example_round_trips_unchanged(tmp_path: Path) -> None:
     product = _round_trip(EXAMPLES_DIR / "deprecated-data-product.odps.yaml", tmp_path)
@@ -245,8 +248,11 @@ SUPPORTED = (
     (("team", "members", 0, "id"), "member-id"),
 )
 
-_NO_HOME = "dropped on import: the product mapper parks no pass-through entry for it"
-_NO_PORT_HOME = "dropped on import: the port mapper parks no pass-through entry for it"
+# Import does keep the whole source document (extensions.odps.metadata.source), but nothing
+# on the export side reads that copy, and the mappers replay only the keys they know.
+_LOST = "lost on export: import keeps it only in the verbatim source copy"
+_NO_HOME = f"{_LOST}, and the product mapper does not replay it"
+_NO_PORT_HOME = f"{_LOST}, and the port mapper does not replay it"
 
 # What forge loses. Each one is a strict xfail: it must fail, and for this reason.
 GAPS = (
