@@ -50,15 +50,14 @@ import os
 import ssl
 import stat
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote, urlsplit
 
-from fluid_build._errors import doc_url
 from fluid_build._net import is_loopback_host
 
-from .errors import SecretResolveError
+from .errors import SecretResolveError, resolve_failure
 from .ref import SecretRef
 from .registry import Existence
 from .run import RunState
@@ -105,9 +104,7 @@ def _env(*names: str) -> Optional[str]:
 
 def _fail(ref: Optional[SecretRef], why: str, fix: str, reason: str) -> SecretResolveError:
     what = f"{ref.canonical} did not resolve" if ref is not None else "the Vault store refused"
-    return SecretResolveError(
-        what=what, why=why, fix=fix, doc=doc_url("secrets"), extras={"reason": reason}
-    )
+    return resolve_failure(what, why, fix, reason)
 
 
 def load_config(ref: Optional[SecretRef] = None) -> VaultConfig:
@@ -216,24 +213,36 @@ def _errors_text(body: Dict[str, Any]) -> str:
     return redact_secret_text(text)
 
 
+@dataclass(frozen=True)
+class _Request:
+    """What one store request sends: the verb, the path and its options.
+
+    The token and the body (a JWT login carries the JWT) stay out of the repr.
+    """
+
+    method: str
+    path: str
+    token: Optional[str] = field(default=None, repr=False)
+    json_body: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    params: Optional[Dict[str, str]] = None
+
+
 def _call(
-    ref: Optional[SecretRef],
-    config: VaultConfig,
-    run: RunState,
-    method: str,
-    path: str,
-    *,
-    token: Optional[str] = None,
-    json_body: Optional[Dict[str, Any]] = None,
-    params: Optional[Dict[str, str]] = None,
+    ref: Optional[SecretRef], config: VaultConfig, run: RunState, request: _Request
 ) -> Tuple[int, Dict[str, Any]]:
     """One request; transport failures become a :class:`SecretResolveError`."""
     import httpx
 
     client = _client(config, run)
-    headers = {"X-Vault-Token": token} if token else {}
+    headers = {"X-Vault-Token": request.token} if request.token else {}
     try:
-        response = client.request(method, path, headers=headers, json=json_body, params=params)
+        response = client.request(
+            request.method,
+            request.path,
+            headers=headers,
+            json=request.json_body,
+            params=request.params,
+        )
     except httpx.TimeoutException:
         raise _fail(
             ref,
@@ -357,7 +366,9 @@ def _unwrap(ref: Optional[SecretRef], config: VaultConfig, run: RunState, wrappe
                 "denied",
             )
     _register(wrapped)
-    status, body = _call(ref, config, run, "POST", "/v1/sys/wrapping/unwrap", token=wrapped)
+    status, body = _call(
+        ref, config, run, _Request("POST", "/v1/sys/wrapping/unwrap", token=wrapped)
+    )
     with _UNWRAPPED_LOCK:
         _UNWRAPPED.add(digest)
     token = _client_token(body) if status == 200 else None
@@ -414,7 +425,9 @@ def _jwt_login(ref: Optional[SecretRef], config: VaultConfig, run: RunState, rol
     jwt = _jwt(ref)
     _register(jwt)
     path = "/v1/auth/" + "/".join(quote(part, safe="") for part in mount.split("/")) + "/login"
-    status, body = _call(ref, config, run, "POST", path, json_body={"role": role, "jwt": jwt})
+    status, body = _call(
+        ref, config, run, _Request("POST", path, json_body={"role": role, "jwt": jwt})
+    )
     token = _client_token(body) if status == 200 else None
     if token is None:
         detail = _errors_text(body)
@@ -428,20 +441,24 @@ def _jwt_login(ref: Optional[SecretRef], config: VaultConfig, run: RunState, rol
     return token
 
 
-def _revoke_later(config: VaultConfig, run: RunState, token: str) -> None:
-    def revoke() -> None:
-        try:
-            status, _ = _call(None, config, run, "POST", "/v1/auth/token/revoke-self", token=token)
-        except SecretResolveError:
-            status = 0
-        if status not in (200, 204):
-            LOG.warning(
-                "could not revoke the store token this run obtained (HTTP %s); it lasts "
-                "until its TTL ends",
-                status,
-            )
+def _revoke(config: VaultConfig, run: RunState, token: str) -> None:
+    """Revoke a token this run obtained; a failure is a warning, never an error."""
+    try:
+        status, _ = _call(
+            None, config, run, _Request("POST", "/v1/auth/token/revoke-self", token=token)
+        )
+    except SecretResolveError:
+        status = 0
+    if status not in (200, 204):
+        LOG.warning(
+            "could not revoke the store token this run obtained (HTTP %s); it lasts "
+            "until its TTL ends",
+            status,
+        )
 
-    run.on_close(revoke)
+
+def _revoke_later(config: VaultConfig, run: RunState, token: str) -> None:
+    run.on_close(lambda: _revoke(config, run, token))
 
 
 def auth_method() -> str:
@@ -507,7 +524,7 @@ class VaultResolver:
         token = token_for(ref, config, run)
         params = {"version": ref.version} if ref.version is not None else None
         status, body = _call(
-            ref, config, run, "GET", _kv_path(ref, "data"), token=token, params=params
+            ref, config, run, _Request("GET", _kv_path(ref, "data"), token=token, params=params)
         )
         mount, _, path = ref.locator.partition("/")
         if status == 404:
@@ -535,19 +552,19 @@ class VaultResolver:
                 "Reference a KV v2 mount; this resolver reads KV v2 only.",
                 "invalid",
             )
-        field = ref.field or ""
-        if field not in secret:
+        key = ref.field or ""
+        if key not in secret:
             raise _fail(
                 ref,
-                f"the secret has no key {field!r}.",
+                f"the secret has no key {key!r}.",
                 "Correct the #field, or add the key to the secret.",
                 "not_found",
             )
-        value = secret[field]
+        value = secret[key]
         if not isinstance(value, str):
             raise _fail(
                 ref,
-                f"key {field!r} holds a {type(value).__name__}, not a string.",
+                f"key {key!r} holds a {type(value).__name__}, not a string.",
                 "Store the credential as a string.",
                 "invalid",
             )
@@ -556,7 +573,9 @@ class VaultResolver:
     def exists(self, ref: SecretRef, run: RunState) -> Existence:
         config = load_config(ref)
         token = token_for(ref, config, run)
-        status, body = _call(ref, config, run, "GET", _kv_path(ref, "metadata"), token=token)
+        status, body = _call(
+            ref, config, run, _Request("GET", _kv_path(ref, "metadata"), token=token)
+        )
         mount, _, path = ref.locator.partition("/")
         if status == 404:
             return Existence(False, "no secret at that path")
@@ -605,9 +624,9 @@ def describe() -> Dict[str, Any]:
             None,
             config,
             run,
-            "GET",
-            "/v1/sys/health",
-            params={"standbyok": "true", "perfstandbyok": "true"},
+            _Request(
+                "GET", "/v1/sys/health", params={"standbyok": "true", "perfstandbyok": "true"}
+            ),
         )
         out["reachable"] = True
         out["initialized"] = body.get("initialized")
@@ -618,7 +637,7 @@ def describe() -> Dict[str, Any]:
             if token:
                 _register(token)
                 status, body = _call(
-                    None, config, run, "GET", "/v1/auth/token/lookup-self", token=token
+                    None, config, run, _Request("GET", "/v1/auth/token/lookup-self", token=token)
                 )
                 data = _mapping(body.get("data"))
                 if status == 200:

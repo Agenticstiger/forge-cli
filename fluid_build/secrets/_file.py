@@ -18,7 +18,7 @@ import stat
 
 from fluid_build._errors import doc_url
 
-from .errors import SecretPolicyError, SecretResolveError
+from .errors import SecretPolicyError, SecretResolveError, resolve_failure
 from .policy import check_prefix
 from .ref import SecretRef
 from .registry import Existence
@@ -47,12 +47,11 @@ def _real(ref: SecretRef) -> SecretRef:
 
 
 def _unreadable(ref: SecretRef, why: str, reason: str) -> SecretResolveError:
-    return SecretResolveError(
-        what=f"{ref.canonical} did not resolve",
-        why=why,
-        fix="Mount the secret at that path for the user running fluid, or correct the path.",
-        doc=doc_url("secrets"),
-        extras={"reason": reason},
+    return resolve_failure(
+        f"{ref.canonical} did not resolve",
+        why,
+        "Mount the secret at that path for the user running fluid, or correct the path.",
+        reason,
     )
 
 

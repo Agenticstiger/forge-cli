@@ -135,49 +135,76 @@ def _emit(args, result) -> int:
 # ── Verb dispatchers ───────────────────────────────────────────────────
 
 
-def _check_rows(contract: dict, resolve: bool) -> list:
-    """One row per reference: where, what, verdict; with ``resolve``, existence too."""
-    from fluid_build.secrets import SecretError, secret_exists, secret_run
-    from fluid_build.secrets.contract import lint_secret_refs
+def _row_reference(finding) -> str | None:
+    """The reference column: canonical when it parsed, else what is safe to show."""
     from fluid_build.secrets.ref import shown
 
-    rows = []
+    raw = finding.site.raw
+    if finding.ref is not None:
+        return finding.ref.canonical
+    # A malformed value may be a secret pasted in place of its reference: never
+    # print it back.
+    return shown(raw) if raw is not None else None
+
+
+def _add_existence(row: dict, ref) -> None:
+    """Ask the store whether ``ref`` exists and record the verdict on ``row``."""
+    from fluid_build.secrets import SecretError, secret_exists
+
+    try:
+        existence = secret_exists(ref)
+        row.update(exists=existence.found, detail=existence.detail)
+    except SecretError as exc:
+        row.update(exists=None, detail=f"{exc.why} {exc.fix}".strip())
+    if row.get("exists") is not True:
+        row["ok"] = False
+
+
+def _check_row(finding, resolve: bool) -> dict:
+    row = {
+        "pointer": finding.site.pointer,
+        "reference": _row_reference(finding),
+        "scheme": finding.ref.scheme if finding.ref else None,
+        "ok": finding.ok,
+    }
+    if finding.warning is not None:
+        row["warning"] = f"{finding.warning.what}. {finding.warning.fix}"
+    if finding.error is not None:
+        row.update(
+            code=finding.error.code,
+            what=finding.error.what,
+            why=finding.error.why,
+            fix=finding.error.fix,
+        )
+    elif resolve and finding.ref is not None:
+        _add_existence(row, finding.ref)
+    return row
+
+
+def _check_rows(contract: dict, resolve: bool) -> list:
+    """One row per reference: where, what, verdict; with ``resolve``, existence too."""
+    from fluid_build.secrets import secret_run
+    from fluid_build.secrets.contract import lint_secret_refs
+
     # A run of its own, so a token --resolve obtains (a JWT login) is revoked
     # at the end. "secrets-check" is not a stage that may fetch values.
     with secret_run("secrets-check"):
-        for finding in lint_secret_refs(contract):
-            raw = finding.site.raw
-            row = {
-                "pointer": finding.site.pointer,
-                # A malformed value may be a secret pasted in place of its
-                # reference: never print it back.
-                "reference": (
-                    finding.ref.canonical
-                    if finding.ref is not None
-                    else (shown(raw) if raw is not None else None)
-                ),
-                "scheme": finding.ref.scheme if finding.ref else None,
-                "ok": finding.ok,
-            }
-            if finding.warning is not None:
-                row["warning"] = f"{finding.warning.what}. {finding.warning.fix}"
-            if finding.error is not None:
-                row.update(
-                    code=finding.error.code,
-                    what=finding.error.what,
-                    why=finding.error.why,
-                    fix=finding.error.fix,
-                )
-            elif resolve and finding.ref is not None:
-                try:
-                    existence = secret_exists(finding.ref)
-                    row.update(exists=existence.found, detail=existence.detail)
-                except SecretError as exc:
-                    row.update(exists=None, detail=f"{exc.why} {exc.fix}".strip())
-                if row.get("exists") is not True:
-                    row["ok"] = False
-            rows.append(row)
-    return rows
+        return [_check_row(finding, resolve) for finding in lint_secret_refs(contract)]
+
+
+def _print_check_row(row: dict) -> None:
+    mark = "✅" if row["ok"] else "❌"
+    reference = f": {row['reference']}" if row["reference"] else ""
+    cprint_literal(f"{mark} {row['pointer']}{reference}")
+    if "what" in row:
+        cprint_literal(f"   {row['what']}")
+        cprint_literal(f"   why: {row['why']}")
+        cprint_literal(f"   fix: {row['fix']}")
+    elif "exists" in row:
+        verdict = {True: "exists", False: "missing", None: "cannot tell"}[row["exists"]]
+        cprint_literal(f"   {verdict}: {row['detail']}")
+    if "warning" in row:
+        cprint_literal(f"   ⚠️  {row['warning']}")
 
 
 def _do_check(args, logger: logging.Logger) -> int:
@@ -193,18 +220,7 @@ def _do_check(args, logger: logging.Logger) -> int:
         cprint_literal(f"No secret references in {args.contract}.")
         return 0
     for row in rows:
-        mark = "✅" if row["ok"] else "❌"
-        reference = f": {row['reference']}" if row["reference"] else ""
-        cprint_literal(f"{mark} {row['pointer']}{reference}")
-        if "what" in row:
-            cprint_literal(f"   {row['what']}")
-            cprint_literal(f"   why: {row['why']}")
-            cprint_literal(f"   fix: {row['fix']}")
-        elif "exists" in row:
-            verdict = {True: "exists", False: "missing", None: "cannot tell"}[row["exists"]]
-            cprint_literal(f"   {verdict}: {row['detail']}")
-        if "warning" in row:
-            cprint_literal(f"   ⚠️  {row['warning']}")
+        _print_check_row(row)
     refused = sum(1 for row in rows if not row["ok"])
     if refused:
         cprint(f"{refused} of {len(rows)} secret references need attention.")

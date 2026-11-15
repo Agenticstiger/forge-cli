@@ -1532,11 +1532,9 @@ def _inspect_secrets() -> Dict[str, Any]:
         return {"error": f"secrets status unavailable ({type(exc).__name__})"}
 
 
-def _secrets_rows(info: Dict[str, Any]) -> List[Tuple[str, str]]:
-    """``(item, value)`` rows for the Secrets section. Never a token or a value."""
-    if "error" in info and len(info) == 1:
-        return [("Status", f"⚠️  {info['error']}")]
-    rows = [
+def _secrets_policy_rows(info: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """The operator-policy rows: schemes, stages, prefixes, destination entries."""
+    return [
         ("Schemes enabled", ", ".join(info.get("schemes_enabled") or []) or "(none)"),
         ("Stages that resolve", ", ".join(info.get("stages_that_resolve") or []) or "(none)"),
         (
@@ -1549,35 +1547,56 @@ def _secrets_rows(info: Dict[str, Any]) -> List[Tuple[str, str]]:
         ),
         ("Destination entries", str(info.get("destination_entries", 0))),
     ]
-    handoff = info.get("run_secrets_file") or {}
-    if handoff.get("set"):
-        verdict = (
-            f"{handoff.get('references', 0)} references"
-            if handoff.get("ok")
-            else f"⚠️  {handoff.get('error', 'unusable')}"
-        )
-        rows.append(("Run-secrets file", f"{handoff.get('path')}: {verdict}"))
+
+
+def _run_secrets_rows(handoff: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """The run-secrets file row, present only while the file is set."""
+    if not handoff.get("set"):
+        return []
+    verdict = (
+        f"{handoff.get('references', 0)} references"
+        if handoff.get("ok")
+        else f"⚠️  {handoff.get('error', 'unusable')}"
+    )
+    return [("Run-secrets file", f"{handoff.get('path')}: {verdict}")]
+
+
+def _vault_status_row(vault: Dict[str, Any]) -> Tuple[str, str]:
+    if vault.get("error"):
+        return ("Store status", f"⚠️  {vault['error']}")
+    sealed = vault.get("sealed")
+    state = "sealed" if sealed else "unsealed" if sealed is False else "unknown"
+    return ("Store status", f"reachable, {state}, version {vault.get('version')}")
+
+
+def _vault_rows(vault: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """The Vault / OpenBao rows. Never a token."""
+    if not vault.get("configured"):
+        return [("Vault / OpenBao", "not configured (BAO_ADDR / VAULT_ADDR unset)")]
+    where = vault.get("address") or "?"
+    if vault.get("namespace"):
+        where += f" (namespace {vault['namespace']})"
+    rows = [
+        ("Vault / OpenBao", where),
+        ("Store auth", str(vault.get("auth_method"))),
+        _vault_status_row(vault),
+    ]
+    if vault.get("token_ttl_seconds") is not None:
+        rows.append(("Token TTL", f"{vault['token_ttl_seconds']} s"))
+    if vault.get("token_error"):
+        rows.append(("Token", f"⚠️  {vault['token_error']}"))
+    return rows
+
+
+def _secrets_rows(info: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """``(item, value)`` rows for the Secrets section. Never a token or a value."""
+    if "error" in info and len(info) == 1:
+        return [("Status", f"⚠️  {info['error']}")]
+    rows = _secrets_policy_rows(info)
+    rows.extend(_run_secrets_rows(info.get("run_secrets_file") or {}))
     if info.get("credential_store"):
         rows.append(("Credential store", str(info["credential_store"])))
-    vault = info.get("vault") or {}
-    if not vault.get("configured"):
-        rows.append(("Vault / OpenBao", "not configured (BAO_ADDR / VAULT_ADDR unset)"))
-    else:
-        where = vault.get("address") or "?"
-        if vault.get("namespace"):
-            where += f" (namespace {vault['namespace']})"
-        rows.append(("Vault / OpenBao", where))
-        rows.append(("Store auth", str(vault.get("auth_method"))))
-        if vault.get("error"):
-            rows.append(("Store status", f"⚠️  {vault['error']}"))
-        else:
-            sealed = vault.get("sealed")
-            state = "sealed" if sealed else "unsealed" if sealed is False else "unknown"
-            rows.append(("Store status", f"reachable, {state}, version {vault.get('version')}"))
-        if vault.get("token_ttl_seconds") is not None:
-            rows.append(("Token TTL", f"{vault['token_ttl_seconds']} s"))
-        if vault.get("token_error"):
-            rows.append(("Token", f"⚠️  {vault['token_error']}"))
+    rows.extend(_vault_rows(info.get("vault") or {}))
     aws = info.get("aws_sm") or {}
     rows.append(
         (

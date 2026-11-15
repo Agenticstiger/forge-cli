@@ -15,9 +15,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Optional
 
-from fluid_build._errors import doc_url
-
-from .errors import SecretResolveError
+from .errors import SecretResolveError, resolve_failure
 from .ref import SecretRef
 from .registry import Existence
 from .run import RunState
@@ -26,13 +24,7 @@ _SCRATCH = "aws-sm.clients"
 
 
 def _fail(ref: SecretRef, why: str, fix: str, reason: str) -> SecretResolveError:
-    return SecretResolveError(
-        what=f"{ref.canonical} did not resolve",
-        why=why,
-        fix=fix,
-        doc=doc_url("secrets"),
-        extras={"reason": reason},
-    )
+    return resolve_failure(f"{ref.canonical} did not resolve", why, fix, reason)
 
 
 def _region(locator: str) -> Optional[str]:

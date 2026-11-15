@@ -189,10 +189,15 @@ def locator_prefixes(
     return out
 
 
+def _env_items(name: str, environ: Optional[Mapping[str, str]]) -> List[str]:
+    """The comma/space list in operator variable ``name`` (``os.environ`` by default)."""
+    env = os.environ if environ is None else environ
+    return _items(env.get(name))
+
+
 def allowed_stages(environ: Optional[Mapping[str, str]] = None) -> FrozenSet[str]:
     """The stages that may fetch a value. Never includes :data:`NEVER_RESOLVE_STAGES`."""
-    env = os.environ if environ is None else environ
-    listed = frozenset(normalize_stage(item) for item in _items(env.get(STAGES_ENV)))
+    listed = frozenset(normalize_stage(item) for item in _env_items(STAGES_ENV, environ))
     return (listed or DEFAULT_STAGES) - NEVER_RESOLVE_STAGES
 
 
@@ -339,8 +344,7 @@ def _grant(entry: str) -> Optional[DestinationGrant]:
 
 def destination_grants(environ: Optional[Mapping[str, str]] = None) -> List[DestinationGrant]:
     """The operator's destination allowlist, parsed; malformed entries dropped."""
-    env = os.environ if environ is None else environ
-    grants = (_grant(item) for item in _items(env.get(ALLOWLIST_ENV)))
+    grants = (_grant(item) for item in _env_items(ALLOWLIST_ENV, environ))
     return [grant for grant in grants if grant is not None]
 
 
@@ -524,6 +528,48 @@ def _suggested_entry(ref: SecretRef, host: Optional[str]) -> str:
     return f"{ref.canonical}@{host}" if host else f"{ref.canonical}@*"
 
 
+def _destination_targets(
+    connection: Optional[Mapping[str, Any]], host: Optional[str]
+) -> Optional[List[Optional[str]]]:
+    """Every destination to judge, or ``None`` when the connection has none to judge."""
+    targets: List[Optional[str]] = []
+    if connection is not None:
+        targets.extend(connection_hosts(connection))
+        if not targets and any(field_name in connection for field_name in _HOST_FIELDS):
+            return None
+    if host is not None or not targets:
+        targets.append(host)
+    return targets
+
+
+def _destination_refusal(parsed: SecretRef, target: Optional[str]) -> AcquisitionSecretPolicyError:
+    where = f"host {target!r}" if target else "a host that could not be determined"
+    what_sent = (
+        f"environment variable {parsed.locator!r}"
+        if parsed.scheme == "env"
+        else f"secret {parsed.canonical}"
+    )
+    entry = _suggested_entry(parsed, target)
+    any_host = _suggested_entry(parsed, None)
+    return AcquisitionSecretPolicyError(
+        what=f"the contract would send {what_sent} to {where} as a credential",
+        why=(
+            "A contract names both the secret to read and the host it is sent to, so "
+            "without an operator allowlist any secret this run can read could be sent "
+            "to a host the contract chose. A loopback host needs no entry; every "
+            "destination that leaves this machine does."
+        ),
+        fix=(
+            "If this is intended, set it in the OPERATOR environment (a shell or CI "
+            f"variable, not a project .env, which is ignored for this setting): "
+            f'{ALLOWLIST_ENV}="{entry}" for that host only, or '
+            f'{ALLOWLIST_ENV}="{any_host}" for any host. A host written with a port '
+            "never matches, so leave the port off."
+        ),
+        doc=doc_url("secrets"),
+    )
+
+
 def refuse_unless_allowed(
     ref: Union[SecretRef, str],
     *,
@@ -544,41 +590,11 @@ def refuse_unless_allowed(
     covered here (a known gap).
     """
     parsed = parse_secret_ref(ref) if isinstance(ref, str) else ref
-    targets: List[Optional[str]] = []
-    if connection is not None:
-        targets.extend(connection_hosts(connection))
-        if not targets and any(field_name in connection for field_name in _HOST_FIELDS):
-            return
-    if host is not None or not targets:
-        targets.append(host)
+    targets = _destination_targets(connection, host)
+    if targets is None:
+        return
     grants = destination_grants(environ)
     for target in targets:
-        if is_loopback(target):
+        if is_loopback(target) or _grants_allow(parsed, target, grants):
             continue
-        if _grants_allow(parsed, target, grants):
-            continue
-        where = f"host {target!r}" if target else "a host that could not be determined"
-        what_sent = (
-            f"environment variable {parsed.locator!r}"
-            if parsed.scheme == "env"
-            else f"secret {parsed.canonical}"
-        )
-        entry = _suggested_entry(parsed, target)
-        any_host = _suggested_entry(parsed, None)
-        raise AcquisitionSecretPolicyError(
-            what=f"the contract would send {what_sent} to {where} as a credential",
-            why=(
-                "A contract names both the secret to read and the host it is sent to, so "
-                "without an operator allowlist any secret this run can read could be sent "
-                "to a host the contract chose. A loopback host needs no entry; every "
-                "destination that leaves this machine does."
-            ),
-            fix=(
-                "If this is intended, set it in the OPERATOR environment (a shell or CI "
-                f"variable, not a project .env, which is ignored for this setting): "
-                f'{ALLOWLIST_ENV}="{entry}" for that host only, or '
-                f'{ALLOWLIST_ENV}="{any_host}" for any host. A host written with a port '
-                "never matches, so leave the port off."
-            ),
-            doc=doc_url("secrets"),
-        )
+        raise _destination_refusal(parsed, target)

@@ -171,6 +171,16 @@ def _refuse(raw: str, why: str, *, scheme: Optional[str] = None) -> SecretRefErr
     )
 
 
+def _parse_version(text: str, query: str, scheme: str) -> str:
+    """The ``version`` value of the query after ``?``, or the refusal for any other query."""
+    if "#" in query:
+        raise _refuse(text, "The field comes before the version: ...#<field>?version=<n>.")
+    key, eq, value = query.partition("=")
+    if key != "version" or not eq or not value or "&" in value:
+        raise _refuse(text, "The only query a reference takes is ?version=<n>.", scheme=scheme)
+    return value
+
+
 def parse_secret_ref(raw: object) -> SecretRef:
     """Parse one reference, or raise :class:`SecretRefError` saying what is wrong.
 
@@ -199,14 +209,7 @@ def parse_secret_ref(raw: object) -> SecretRef:
     locator_and_field, qsep, query = rest.partition("?")
     locator, fsep, field_text = locator_and_field.partition("#")
     field: Optional[str] = field_text if fsep else None
-    version: Optional[str] = None
-    if qsep:
-        if "#" in query:
-            raise _refuse(text, "The field comes before the version: ...#<field>?version=<n>.")
-        key, eq, value = query.partition("=")
-        if key != "version" or not eq or not value or "&" in value:
-            raise _refuse(text, "The only query a reference takes is ?version=<n>.", scheme=scheme)
-        version = value
+    version = _parse_version(text, query, scheme) if qsep else None
     if not locator:
         raise _refuse(text, "The locator after '://' is empty.", scheme=scheme)
     if field is not None and not _FIELD.match(field):
