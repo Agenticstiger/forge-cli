@@ -14,12 +14,11 @@ credentials, which is what they are for. They may not carry a setting that:
   ``FLUID_REF_ROOT``, ``FLUID_UPSTREAM_CONTRACTS``, ``FLUID_WORKSPACE_ROOT``,
   ``FLUID_FORGE_AGENT_CWD``, ``FLUID_LOCAL_DUCKDB_PATH``);
 * moves where the CLI reads trusted configuration or writes state, audit and
-  logs, or picks the key of the operator's own encrypted credential store
-  (the home and XDG config directories ``HOME``, ``USERPROFILE``,
+  logs (the home and XDG config directories ``HOME``, ``USERPROFILE``,
   ``XDG_CONFIG_HOME`` ..., their Windows counterparts ``APPDATA``,
   ``LOCALAPPDATA``, ``ProgramData``, ``ALLUSERSPROFILE``, the temporary
-  directory ``TMPDIR``/``TEMP``/``TMP``, ``FLUID_SECRETS_FILE``, ``FLUID_ENCRYPTION_KEY``,
-  ``FLUID_ENCRYPTION_PASSPHRASE``, ``FLUID_USER_HOME``, ``FLUID_HOME``,
+  directory ``TMPDIR``/``TEMP``/``TMP``, ``FLUID_SECRETS_FILE``, ``FLUID_USER_HOME``,
+  ``FLUID_HOME``,
   ``FLUID_CONFIG``, ``FLUID_CACHE_DIR``, ``FLUID_LOG_FILE``,
   ``FLUID_PRICES_JSON``, ``FLUID_STATE_BACKEND``, ``FLUID_STORE_*`` locations,
   ``FLUID_AUDIT_*``, ``FLUID_ATHENA_OUTPUT_LOCATION``);
@@ -181,10 +180,6 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "FLUID_LOCAL_DUCKDB_PATH",
         # ── where trusted config is read and state, audit, logs written ──
         "FLUID_SECRETS_FILE",
-        # the key for the operator's own ~/.fluid/credentials.enc
-        # (credentials/encrypted_store.py prefers it over ~/.fluid/.key)
-        "FLUID_ENCRYPTION_KEY",
-        "FLUID_ENCRYPTION_PASSPHRASE",
         "FLUID_USER_HOME",
         "FLUID_HOME",
         "FLUID_CONFIG",
@@ -1211,8 +1206,8 @@ ENDPOINT_CREDENTIAL_GROUPS: Tuple[EndpointGroup, ...] = (
         ambient=True,
         read_by=(
             "providers/snowflake/util/config.py (SNOWFLAKE_ACCOUNT, SF_ACCOUNT "
-            "through credentials/resolver.py, whose chain also reads the keyring, "
-            "~/.fluid/credentials.enc, ~/.fluidrc.yaml and a secret manager for "
+            "through credentials/resolver.py, whose chain also reads the keyring "
+            "and the operator's secret store (FLUID_CREDENTIAL_STORE) for "
             "each setting on its own, and get_connection_params prefers a key "
             "path, then an OAuth token, then an authenticator, then a password); "
             "build_runners/dbt/profiles.py and engines/dbt/profiles.py (the dbt "

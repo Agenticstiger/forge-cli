@@ -31,12 +31,6 @@ class Chain(BaseCredentialResolver):
     def _get_from_keyring(self, key):
         return None
 
-    def _get_from_encrypted_file(self, key):
-        return None
-
-    def _get_from_config(self, key):
-        return None
-
     def _get_from_dotenv(self, key):
         return None
 

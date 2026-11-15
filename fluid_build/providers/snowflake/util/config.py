@@ -396,7 +396,7 @@ def resolve_account_and_warehouse(
 
     Priority order:
     1. Explicit parameters
-    2. Credential resolver chain (keyring, encrypted file, env vars, Vault)
+    2. Credential resolver chain (env vars, .env, keyring, FLUID_CREDENTIAL_STORE)
     3. Default values
 
     Returns:

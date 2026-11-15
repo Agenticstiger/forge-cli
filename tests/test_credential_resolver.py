@@ -37,7 +37,7 @@ class TestCredentialSource:
     def test_all_sources_exist(self):
         sources = list(CredentialSource)
         # The Vault and Secret Manager steps became ONE SECRET_STORE step.
-        assert len(sources) == 9
+        assert len(sources) == 7
         assert CredentialSource.SECRET_STORE in sources
         assert not any(src.name in ("VAULT", "SECRET_MANAGER") for src in sources)
 
@@ -164,10 +164,6 @@ class TestBaseCredentialResolver:
         monkeypatch.setenv("GCP_PROJECT", "some-project")
         resolver = ConcreteResolver()
         assert resolver._get_from_secret_store("key") is None
-
-    def test_config_returns_none(self):
-        resolver = ConcreteResolver()
-        assert resolver._get_from_config("key") is None
 
     def test_a_store_that_cannot_hold_fields_is_refused(self, monkeypatch):
         monkeypatch.setenv("FLUID_CREDENTIAL_STORE", "env://SOMETHING")

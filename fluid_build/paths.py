@@ -15,7 +15,7 @@ Two roots:
   ``FLUID_USER_HOME``.
 
 Every site that previously hardcoded a string literal like
-``".fluid/agents"`` or ``"~/.fluid/credentials.yaml"`` should call
+``".fluid/agents"`` or ``"~/.fluid/ai_config.json"`` should call
 the helper here instead. One source of truth makes it possible to:
 
 * Run multiple FLUID workspaces side-by-side (point ``FLUID_WORKSPACE_ROOT``
@@ -109,11 +109,6 @@ def apply_report_html(*, root: Optional[Path] = None) -> Path:
 # ── User-global paths (under ~/.fluid/) ──────────────────────────────
 
 
-def user_credentials_file(*, root: Optional[Path] = None) -> Path:
-    """``~/.fluid/credentials.yaml`` — Fernet-encrypted credential store."""
-    return (root or user_home()) / "credentials.yaml"
-
-
 def user_ai_config(*, root: Optional[Path] = None) -> Path:
     """``~/.fluid/ai_config.json`` — interactive ai-setup state."""
     return (root or user_home()) / "ai_config.json"
@@ -151,7 +146,6 @@ __all__ = [
     "skills_compiled_cache",
     "runtime_dir",
     "apply_report_html",
-    "user_credentials_file",
     "user_ai_config",
     "user_personal_memory",
     "user_usage_file",

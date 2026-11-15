@@ -41,8 +41,10 @@ _KEYS = (
     "fluid_duckdb_allowed_dirs",
     "HTTPS_PROXY",
     "LD_PRELOAD",
-    "FLUID_ENCRYPTION_KEY",
-    "FLUID_ENCRYPTION_PASSPHRASE",
+    "FLUID_SECRET_PREFIXES",
+    "FLUID_CREDENTIAL_STORE",
+    "FLUID_RUN_SECRETS_FILE",
+    "BAO_ADDR",
     "AWS_CONFIG_FILE",
     "KUBECONFIG",
     "PROTECTED_ENV_TEST_API_KEY",
@@ -150,13 +152,18 @@ def test_environment_and_local_dotenv_files_are_filtered_too(tmp_path: Path, fil
     assert os.environ.get("PROTECTED_ENV_TEST_API_KEY") == _TEST_API_KEY
 
 
-def test_project_dotenv_cannot_choose_the_operator_store_key_or_sdk_config(tmp_path: Path) -> None:
-    # The encryption key unlocks the operator's own ~/.fluid/credentials.enc,
-    # and SDK config files can name a credential helper program to run: both
-    # belong to the operator, not to the project.
+def test_project_dotenv_cannot_choose_the_operator_secret_store_or_sdk_config(
+    tmp_path: Path,
+) -> None:
+    # The secret policy, the store forge reads and a runner's handoff file
+    # decide which secrets a run may fetch and where from, and SDK config files
+    # can name a credential helper program to run: all belong to the operator,
+    # not to the project.
     (tmp_path / ".env").write_text(
-        "FLUID_ENCRYPTION_KEY=project-chosen-key\n"  # pragma: allowlist secret
-        "FLUID_ENCRYPTION_PASSPHRASE=project-chosen-passphrase\n"  # pragma: allowlist secret
+        f"FLUID_SECRET_PREFIXES=file://{tmp_path}/\n"
+        "FLUID_CREDENTIAL_STORE=vault://kv/project-chosen\n"
+        f"FLUID_RUN_SECRETS_FILE={tmp_path / 'handoff.json'}\n"
+        "BAO_ADDR=https://store.project.example\n"
         f"AWS_CONFIG_FILE={tmp_path / 'aws-config'}\n"
         f"KUBECONFIG={tmp_path / 'kubeconfig'}\n"
         f"PROTECTED_ENV_TEST_API_KEY={_TEST_API_KEY}\n"
@@ -165,8 +172,10 @@ def test_project_dotenv_cannot_choose_the_operator_store_key_or_sdk_config(tmp_p
     hydrate_dotenv(tmp_path)
 
     for name in (
-        "FLUID_ENCRYPTION_KEY",
-        "FLUID_ENCRYPTION_PASSPHRASE",
+        "FLUID_SECRET_PREFIXES",
+        "FLUID_CREDENTIAL_STORE",
+        "FLUID_RUN_SECRETS_FILE",
+        "BAO_ADDR",
         "AWS_CONFIG_FILE",
         "KUBECONFIG",
     ):

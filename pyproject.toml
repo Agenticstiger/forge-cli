@@ -54,7 +54,7 @@ dependencies = [
   # stops dbt and litellm re-reading the project's .env around the
   # protected_env filter; 1.0.x and 1.1.x load regardless.
   "python-dotenv>=1.2.0",
-  "cryptography>=46.0.7",  # Fernet-encrypted credential store; security: >=46.0.7 closes CVE-2026-26007/39892/34073
+  "cryptography>=46.0.7",  # Snowflake key-pair auth and masking at landing; security: >=46.0.7 closes CVE-2026-26007/39892/34073
   # OS keyring is now a hard dependency (Issue 5).  Catalog source
   # secrets default to the OS keyring (encrypted-at-rest); the
   # legacy plaintext YAML fallback is gated behind
@@ -795,7 +795,7 @@ DEP002 = ["h11", "dbt-bigquery", "dbt-snowflake"]
 # (try/except ImportError, MissingExtraError, or a feature probe) and no extra
 # owns the package, so declaring them would put them on every install:
 #   git (GitPython: workspace.py), psutil (performance.py), argcomplete (cli
-#   completion), hvac / azure (secrets.py, auth), airbyte / dlt / sqlalchemy
+#   completion), azure (auth), airbyte / dlt / sqlalchemy
 #   (the airbyte and dlt runners), avro (fallback after fastavro), sklearn (an
 #   environment probe), openapi_spec_validator (bundle validation, off by default),
 #   googleapiclient (the GCP project-access probe reports "not checked" without it;
@@ -805,7 +805,6 @@ DEP001 = [
   "git",
   "psutil",
   "argcomplete",
-  "hvac",
   "azure",
   "airbyte",
   "dlt",
@@ -869,7 +868,7 @@ module = [
     "fluid_build.build_runners._masking",
     "fluid_build.cli._verify_masking",
     "fluid_build.cli.security",
-    "fluid_build.credentials.encrypted_store",
+    "fluid_build.util.atomic_write",
     "fluid_build.observability.secret_redactor",
     # The agentPolicy gate: it decides whether an agent may read production
     # data, so a silent Any is a silent allow.

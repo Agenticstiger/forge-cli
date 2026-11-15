@@ -139,10 +139,10 @@ class ArtifactStore:
                 self._dir = tempfile.mkdtemp(prefix="fluid-mcp-artifacts-")  # mode 0700
                 atexit.register(self.close)
             # The repo's 0600 writer (O_EXCL, never briefly world-readable).
-            from fluid_build.credentials.encrypted_store import _atomic_write_bytes
+            from fluid_build.util.atomic_write import atomic_write_bytes
 
             path = os.path.join(self._dir, f"{artifact_id}.json")
-            _atomic_write_bytes(Path(path), text.encode("utf-8"), mode=0o600)
+            atomic_write_bytes(Path(path), text.encode("utf-8"), mode=0o600)
             return path
         except OSError as exc:
             # The resource still serves the result; only the file is missing.

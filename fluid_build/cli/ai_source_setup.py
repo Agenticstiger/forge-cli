@@ -59,7 +59,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fluid_build.credentials.encrypted_store import _atomic_write_bytes
+from fluid_build.util.atomic_write import atomic_write_bytes
 
 _log = logging.getLogger(__name__)
 
@@ -500,7 +500,7 @@ def _save_yaml_entry(saved_name: str, source: str, config: Dict[str, Any]) -> No
         "source_type": source,
         "config": config,
     }
-    _atomic_write_bytes(
+    atomic_write_bytes(
         SOURCES_PATH,
         yaml.safe_dump(existing, sort_keys=False).encode("utf-8"),
         mode=0o600,
@@ -545,7 +545,7 @@ def _save_yaml_secrets_fallback(saved_name: str, secret_fields: Dict[str, str]) 
 
     Mode 600 on the file is the only protection — the operator was
     warned. The write is atomic and the file is created 0o600 from
-    the start (via ``_atomic_write_bytes``): the previous
+    the start (via ``atomic_write_bytes``): the previous
     ``write_text`` then ``chmod`` sequence left the secret bytes on
     disk at the umask default (commonly 0o644) until the chmod
     landed, and the ``~/.fluid`` 0o700 mitigation does not hold when
@@ -567,7 +567,7 @@ def _save_yaml_secrets_fallback(saved_name: str, secret_fields: Dict[str, str]) 
     if not isinstance(entry, dict):
         return
     entry["secrets"] = secret_fields
-    _atomic_write_bytes(
+    atomic_write_bytes(
         SOURCES_PATH,
         yaml.safe_dump(data, sort_keys=False).encode("utf-8"),
         mode=0o600,
