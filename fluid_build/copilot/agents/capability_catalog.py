@@ -3,33 +3,31 @@
 
 """Provider/model capability matrix + user-facing degradation warnings.
 
-Closes the "users switching providers silently get worse results" gap.
-The legacy path runs the same agent loop on every (provider, model)
-combination without checking whether the combination actually supports
-the features the agents depend on:
+A user who picks a provider or model that cannot do what a run needs should
+hear so before the run, not find out from quietly worse output. When
+``fluid forge data-model`` runs with an LLM (``--llm-provider``,
+``--llm-model`` or ``--llm-endpoint``), ``cli/forge_data_model.py`` calls
+:func:`emit_degradation_warnings` with ``usage_profile="staged_pipeline"``
+before the first call. That is the one live caller and the one profile.
 
-* Tool use (the multi-turn agent loop is fundamentally tool-driven —
-  Ollama / llama3 without function-calling produces an unsupervised
-  text generator, not an agent).
-* Structured output enforcement (Gemini structured output was disabled
-  in the legacy provider path because of schema-budget issues — users
-  on Gemini got JSON-mode-only responses with no schema enforcement
-  and never saw a warning).
-* Prompt caching (Anthropic-only today; toggling to OpenAI loses the
-  ~90% input-cost discount on stable system prompts).
-* Extended thinking (Opus 4.7 thinking, o-series reasoning) — none of
-  the legacy provider adapters knew about thinking budgets, so users
-  on a thinking-capable model got plain completion behaviour.
+The staged pipeline makes one LLM call per stage and validates each answer
+against a Pydantic stage model, so its only hard requirement is
+structured-output enforcement (``_STAGED_PIPELINE_REQUIREMENTS``). Tool use,
+streaming, prompt caching and extended thinking are recorded per model, but
+no profile requires them.
 
 This module:
 
-* Models capabilities as a small typed dataclass per (provider, model).
+* Models capabilities as a small typed dataclass per (provider, model),
+  with free-text ``notes`` for operational caveats.
 * Resolves capabilities via a catalog with longest-prefix model
   matching (so ``claude-3-5-sonnet-20241022`` picks up the
   ``claude-3-5-sonnet`` row).
-* Compares the resolved capabilities against the requirements of the
-  current run and emits a single, structured warning when something
-  important is missing.
+* Compares the resolved capabilities against a usage profile's
+  requirements. :func:`format_degradation_warnings` returns one line per
+  missing requirement, one when the catalog does not know the (provider,
+  model), and one per catalog note; :func:`emit_degradation_warnings`
+  also prints them unless ``quiet``.
 
 Catalog source of truth
 -----------------------
