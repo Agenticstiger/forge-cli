@@ -47,6 +47,7 @@ def _isolated_secret_env(monkeypatch, tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    from fluid_build.observability import secret_redactor
     from fluid_build.secrets import _vault, registry, run
 
     monkeypatch.setattr(registry, "_LOADED", {})
@@ -60,7 +61,14 @@ def _isolated_secret_env(monkeypatch, tmp_path):
     monkeypatch.setattr(_vault, "_UNWRAPPED", set())
     # The state lookups share outside every stage lives for the process: give
     # each test its own, and close it (revoking what it minted) afterwards.
+    # Resolving registers each value with the process-wide exact-value redactor.
+    # Put the registry back as it was, or a value a test resolved (a 1 MiB run of
+    # "a" from the file-size test) masks that text in a later test's output.
+    registered = set(secret_redactor._known_secret_set)
     run._close_orphan()
     yield
     run._close_orphan()
     discovery.cache_clear()
+    secret_redactor.forget_known_secrets()
+    for value in registered:
+        secret_redactor.register_secret(value)
