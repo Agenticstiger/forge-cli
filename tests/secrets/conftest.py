@@ -63,12 +63,15 @@ def _isolated_secret_env(monkeypatch, tmp_path):
     # each test its own, and close it (revoking what it minted) afterwards.
     # Resolving registers each value with the process-wide exact-value redactor.
     # Put the registry back as it was, or a value a test resolved (a 1 MiB run of
-    # "a" from the file-size test) masks that text in a later test's output.
+    # "a" from the file-size test) masks that text in a later test's output. Only
+    # the values: forget_known_secrets() would also forget which warnings were
+    # shown, and a warning repeated on stderr breaks a later test's output.
     registered = set(secret_redactor._known_secret_set)
     run._close_orphan()
     yield
     run._close_orphan()
     discovery.cache_clear()
-    secret_redactor.forget_known_secrets()
-    for value in registered:
-        secret_redactor.register_secret(value)
+    with secret_redactor._registry_lock:
+        secret_redactor._known_secret_set.clear()
+        secret_redactor._known_secret_set.update(registered)
+        secret_redactor._known_secrets = tuple(sorted(registered, key=lambda s: (-len(s), s)))

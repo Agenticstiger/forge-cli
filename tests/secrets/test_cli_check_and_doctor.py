@@ -59,6 +59,13 @@ def _run(capsys, *argv: str) -> tuple:
     return rc, out.out + out.err
 
 
+def _run_json(capsys, *argv: str) -> tuple:
+    """Exit code and the parsed stdout: a warning logged to stderr is not the report."""
+    rc = main(list(argv))
+    out = capsys.readouterr()
+    return rc, json.loads(out.out), out.out + out.err
+
+
 def test_a_remote_destination_is_refused_with_the_entry_to_add(tmp_path, capsys):
     contract = _contract(tmp_path, host="db.example.com", ref="aws://fluid/app/pg#password")
     rc, text = _run(capsys, "secrets", "check", str(contract))
@@ -71,9 +78,8 @@ def test_a_remote_destination_is_refused_with_the_entry_to_add(tmp_path, capsys)
 def test_the_operator_allowlist_clears_it(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv(ALLOWLIST, "aws-sm://fluid/app/pg#password@db.example.com")
     contract = _contract(tmp_path, host="db.example.com", ref="aws://fluid/app/pg#password")
-    rc, text = _run(capsys, "secrets", "check", str(contract), "--json")
+    rc, report, text = _run_json(capsys, "secrets", "check", str(contract), "--json")
     assert rc == 0, text
-    report = json.loads(text)
     assert report["ok"] is True
     (row,) = report["references"]
     assert row["pointer"] == "builds[0].properties.source.connection.secretRef"
@@ -82,9 +88,9 @@ def test_the_operator_allowlist_clears_it(tmp_path, capsys, monkeypatch):
 
 def test_a_malformed_reference_names_the_form(tmp_path, capsys):
     contract = _contract(tmp_path, host="localhost", ref="vault://kv/app/pg")
-    rc, text = _run(capsys, "secrets", "check", str(contract), "--json")
+    rc, report, _text = _run_json(capsys, "secrets", "check", str(contract), "--json")
     assert rc == 1
-    (row,) = json.loads(text)["references"]
+    (row,) = report["references"]
     assert row["code"] == "SecretRefError"
     assert "#<field>" in row["why"]
 
@@ -100,9 +106,9 @@ def test_resolve_proves_existence_and_never_reads_a_value(tmp_path, capsys, monk
 
     monkeypatch.setattr(_env.EnvResolver, "resolve", never)
     contract = _contract(tmp_path, host="localhost", ref="env://FLUID_CHECK_PG")
-    rc, text = _run(capsys, "secrets", "check", str(contract), "--resolve", "--json")
+    rc, report, text = _run_json(capsys, "secrets", "check", str(contract), "--resolve", "--json")
     assert rc == 0, text
-    (row,) = json.loads(text)["references"]
+    (row,) = report["references"]
     assert row["exists"] is True
     assert value not in text
 
