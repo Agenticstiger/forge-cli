@@ -4,6 +4,7 @@
 """Unit tests for fluid_build.cli.apply module."""
 
 import argparse
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -183,9 +184,12 @@ class TestActionsFromSource:
         provider.plan.assert_called_once_with(verified, mode="replace")
 
     def test_takes_keyword_arguments_only(self):
-        """The old ``(path, env, provider, logger)`` call fails loudly."""
-        with pytest.raises(TypeError):
-            _actions_from_source("plan.json", None, _make_provider(), logger)  # type: ignore[misc]
+        """The old ``(path, env, provider, logger)`` call shape is refused: every
+        parameter is keyword-only, so a positional call raises ``TypeError``."""
+        params = inspect.signature(_actions_from_source).parameters
+        assert {"contract", "provider", "logger"} <= set(params)
+        positional = [n for n, p in params.items() if p.kind is not inspect.Parameter.KEYWORD_ONLY]
+        assert positional == []
 
 
 # ---------------------------------------------------------------------------
