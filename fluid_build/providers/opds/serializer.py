@@ -101,6 +101,11 @@ def _build_from_fluid(contract: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# ``odpsVersion`` below is the version of this legacy document shape, which neither Bitol ODPS
+# (``apiVersion``) nor OPDS v4.1 (``schema``, ``version``, ``product``) defines. Nothing in
+# fluid_build calls this module, so it makes no claim about either standard and is not bumped
+# when one releases. The Bitol exporter is ``providers/odps_standard``, which declares its own
+# apiVersion; ``tests/providers/test_odps_v110_conformance.py`` says what it supports.
 def fluid_to_odps_document(contract: Dict[str, Any]) -> Dict[str, Any]:
     """Convert a FLUID v0.7.x contract to a minimal ODPS document.
 
@@ -129,7 +134,7 @@ def fluid_to_odps_document(contract: Dict[str, Any]) -> Dict[str, Any]:
 
     doc: Dict[str, Any] = {
         # "$schema": "https://opendataproducts.org/spec/odps-1.0.json",  # optional
-        "odpsVersion": "1.0.0",  # conservative placeholder
+        "odpsVersion": "1.0.0",  # this legacy shape's own version, see the note above the function
         "info": {
             "title": product_name,
             "version": fluid_version,
