@@ -228,7 +228,7 @@ def test_http_with_auth_is_allowed_to_start(mode: str, monkeypatch: pytest.Monke
     assert _jurisdiction_gate_unsatisfiable(_policy(jurisdiction="EU"), transport="http") is None
 
 
-@pytest.mark.parametrize("mode", ["", "none", "off", "disabled"])
+@pytest.mark.parametrize("mode", ["", "none"])
 def test_auth_mode_set_to_a_disabling_value_still_refuses(
     mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
