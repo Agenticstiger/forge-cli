@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Secret references, one grammar for every store.** A contract names a secret as
+  `<scheme>://<locator>[#field][?version=n]`: `env://NAME`, `file:///run/secrets/name`,
+  `vault://<mount>/<path>#<field>` (alias `openbao://`; KV v2 on OpenBao or Vault through the
+  Vault HTTP API, with `BAO_`/`VAULT_` address, token, namespace and CA bundle, the token helper
+  file, a JWT login for CI (`FLUID_VAULT_JWT_ROLE`) and a response-wrapped token
+  (`FLUID_VAULT_WRAPPED_TOKEN`)), and `aws-sm://<name-or-arn>[#json-key]` (alias `aws://`, from
+  the `[aws]` extra). Other stores arrive as packs in the `fluid_build.secret_resolvers`
+  entry-point group; `gcp-sm://` and `azure-kv://` say which pack to install. A resolved value is
+  a `SecretStr`, registered with the exact-value redactor, cached for the run only, and audited
+  as a `fluid.secret.resolve` span event that never carries it; a token forge mints is revoked
+  when the run ends. No new dependency.
+- **`fluid secrets check <contract>`** lints every `secretRef` against the grammar and the
+  operator's policy; `--resolve` proves each exists (KV v2 metadata, `DescribeSecret`, the file
+  or variable) without reading a value. `fluid doctor` (and `--json`, under `secrets`) reports
+  the policy, the run-secrets file and the store: address, auth method, reachability, token TTL.
+- **`FLUID_RUN_SECRETS_FILE`**, the handoff a runner such as Command Center's `runner-env` uses:
+  a 0600 JSON file of `{"<reference>": "<value>"}`. While it is set, a reference resolves from
+  the file, no store is asked, and a reference the file does not list does not resolve.
+- **Schema 0.7.7 (preview): `$defs.secretRef`** with a pattern per scheme, used by all three
+  `secretRef` fields, and write-only `connection.password` and `deployment.auth.token`:
+  `fluid validate` refuses a literal there and never echoes it.
+
 - **`fluid validate` warns about what a template or a guess leaves in a contract.** Four
   authoring-lint rules run after the contract rules, as warnings: `fluid validate` passes and
   `--strict` fails, as on any warning. A placeholder email
@@ -86,6 +108,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   load only tool names and this text at session start.
 
 ### Changed
+
+- **The secret destination policy covers every scheme, not only `env://`.** A value from
+  `vault://`, `aws-sm://`, `file://` or a pack is sent to a host that leaves this machine only
+  when the operator allows it: `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` keeps `NAME` and
+  `NAME@host` and gains `<reference>@<host>`, `<reference>@*` and `<prefix>*@<host>`. The operator
+  also decides which schemes resolve (`FLUID_SECRET_SCHEMES`, default env, file, vault, aws-sm),
+  which locators a contract may name (`FLUID_SECRET_PREFIXES`; `file://` defaults to
+  `/run/secrets/`) and which stages may fetch a value a contract names (`FLUID_SECRET_STAGES`,
+  default `apply`; `validate`, `plan`, `bundle` and `diff` never fetch one). All of them are
+  protected names: a project `.env` cannot set them.
+- **`fluid validate` lints secret references** against the grammar and that policy, so a
+  contract `fluid apply` would refuse fails at validate, with the setting that allows it.
+  Nothing is fetched. A scheme whose pack is not installed on this machine is a warning.
+- **`file://` takes an absolute path** (`file:///run/secrets/pg`) under an allowed prefix, with
+  symlinks re-checked; the `~/.fluid/secrets/<name>` lookup is gone. **`vault://` needs
+  `#field`.** A Debezium `extra_config` may not set a host or credential key
+  (`database.hostname`, `mongodb.connection.string`, ...) when the connection has a `secretRef`.
+- **The credential chain asks a secret store only when `FLUID_CREDENTIAL_STORE` names one**
+  (`vault://<mount>/<prefix>` or `aws-sm://<prefix>`; the credential is read from
+  `<prefix>/<provider>#<key>`). Setting `GCP_PROJECT` or `AWS_REGION` no longer sends credential
+  lookups to a cloud secret manager. These lookups are not stage-gated: forge names the key, and
+  a plan or diff against the warehouse connects with it.
 
 - **`fluid verify --strict` fails a run that verified nothing.** When every expose was skipped
   (no verifier for its binding, such as an AWS bucket, a GCS bucket or a Kafka topic, or a
@@ -191,6 +235,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`fluid_build.secrets.SecretManager` and `build_runners._secret_policy`**, replaced by the
+  `fluid_build.secrets` package (no compatibility shim).
+- **The Fernet credential file store** (`~/.fluid/credentials.enc`, `FLUID_ENCRYPTION_KEY`,
+  `FLUID_ENCRYPTION_PASSPHRASE`, `~/.fluid/.key` and its `fluid auth doctor` check) **and
+  plaintext credentials in `~/.fluidrc.yaml`.** Keep a credential in the keyring, a secret
+  store, or the environment.
+
 - **`FluidSchemaManager.validate_contract` and `validate_contract_file` no longer take `strict`.**
   Both accepted it and never read it, so a caller that asked for strict got the lenient result:
   warnings never made the result invalid. Failing on warnings is the caller's policy, and
@@ -289,6 +340,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity could carry a jurisdiction; only a validated JWT can.
 
 ### Security
+
+- **A secret is fetched late, by the stage that sends it, and never leaves a trace.** A canary
+  test resolves a known value through all eleven stages and fails if it appears in any artifact,
+  log line, output or span. Vault and OpenBao are reached over https (http only to a loopback
+  address), without following redirects and with TLS verification always on. A `secretRef` that
+  may be a secret pasted in its place (no `://`, or a URL with `user:password@`) is refused
+  without being echoed.
+- **The destination check reads every host a connection names.** A host list
+  (`mongodb://u:p@localhost:27017,db.example:27017`) counted only its first host, so a loopback
+  first host exempted the rest, and a `port` that is not a number (`5432,db.example:5432`) could
+  add a host the check never saw. Every host of a list must now clear, and such a port makes the
+  destination undeterminable, which only a `<reference>@*` entry allows.
 
 - **A simple-mode `fluid apply` ran the plan or contract on disk, not the copy its gates
   checked.** `fluid apply` verifies a `plan.json`'s digests and mode, and schema-gates a
