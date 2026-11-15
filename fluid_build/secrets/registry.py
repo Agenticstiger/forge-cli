@@ -33,7 +33,7 @@ from typing import Any, Dict, Optional, Protocol, runtime_checkable
 from fluid_build._errors import doc_url
 
 from .errors import SecretResolveError
-from .ref import CORE_SCHEMES, FORMS, PACK_SCHEMES, SecretRef
+from .ref import CORE_SCHEMES, FORMS, SecretRef
 from .run import RunState
 
 LOG = logging.getLogger("fluid.secrets")
@@ -200,8 +200,3 @@ def check_available(scheme: str) -> None:
             return
     if scheme not in _entry_points():
         raise _missing_pack(scheme)
-
-
-def is_pack_scheme(scheme: str) -> bool:
-    """Whether the grammar knows ``scheme`` but core has no resolver for it."""
-    return scheme in PACK_SCHEMES

@@ -32,7 +32,6 @@ _MODULES: Dict[str, Tuple[str, ...]] = {
     "ref": (
         "SecretRef",
         "parse_secret_ref",
-        "looks_like_ref",
         "SCHEMA_PATTERNS",
         "CORE_SCHEMES",
         "PACK_SCHEMES",

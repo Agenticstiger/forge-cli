@@ -138,11 +138,6 @@ class SecretRef:
         return self.canonical
 
 
-def looks_like_ref(value: object) -> bool:
-    """Whether ``value`` is written as ``<something>://...`` (a reference attempt)."""
-    return isinstance(value, str) and "://" in value
-
-
 def shown(raw: object) -> str:
     """``raw`` for a message, or :data:`NOT_SHOWN` when it may be a secret.
 
