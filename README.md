@@ -183,13 +183,16 @@ fluid mcp output-port: refusing to serve over 'stdio'.
   This contract pins sovereignty.jurisdiction to EU, so every tool call needs a
   cryptographically verified caller jurisdiction.
   'stdio' carries no headers, so no credential can supply one and every call would be denied.
-  Serve it over HTTP with auth instead:
+  Serve it over HTTP with JWT auth instead:
     FLUID_MCP_AUTH_MODE=jwt fluid mcp output-port serve --transport http
+  (plus FLUID_MCP_JWT_ISSUER / _AUDIENCE / _JWKS_URL)
+  Or set sovereignty.crossBorderTransfer: true if the data may leave EU.
 ```
 
-A jurisdiction claim binds only when a JWT or mTLS identity was verified, never from self-attested
-client metadata. The decision function has a closed vocabulary of 11 outcomes and ships its test
-vectors inside the wheel, so the gate's behaviour is inspectable without reading the source:
+A jurisdiction claim binds only from a validated JWT, never from self-attested client metadata, so
+over HTTP the same contract refuses to start unless JWT auth can supply that claim. The decision
+function has a closed vocabulary of 11 outcomes and ships its test vectors inside the wheel, so the
+gate's behaviour is inspectable without reading the source:
 
 ```bash
 python -c "import json, importlib.resources as r; \

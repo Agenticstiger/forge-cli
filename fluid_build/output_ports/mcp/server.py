@@ -915,8 +915,9 @@ class OutputPortMcpServer:
         would authorise itself past a data-residency rule by typing a string —
         and it would work precisely on the unauthenticated deployments least
         able to notice. So this reads ``request.scope["fluid_auth_attrs"]``
-        alone, the map the HTTP auth gate (``fluid_build._mcp_http``) writes only after
-        validating a JWT or mTLS identity, and never ``clientInfo``.
+        alone, the map the HTTP auth gate (``fluid_build._mcp_http``) writes only
+        after authenticating a request, and never ``clientInfo``. A jurisdiction
+        lands in that map only from a validated JWT claim mapped to it.
 
         There is no no-auth fallback, on purpose. Returns ``None`` when there
         is no request context, no verified attributes, or no jurisdiction among

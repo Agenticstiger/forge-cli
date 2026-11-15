@@ -490,7 +490,9 @@ def _run_serve(args, logger: logging.Logger) -> int:
             f"contract={contract_path.name} — ready for MCP client on stdio.\n"
         )
         sys.stderr.flush()
-    unsatisfiable = _jurisdiction_gate_unsatisfiable(policy, transport=transport)
+    unsatisfiable = _jurisdiction_gate_unsatisfiable(
+        policy, transport=transport, http_auth=http_auth
+    )
     if unsatisfiable is not None:
         sys.stderr.write(unsatisfiable)
         sys.stderr.flush()
@@ -759,68 +761,103 @@ def _http_auth_validator() -> AuthValidator:
         ) from None
 
 
-def _auth_mode_configured() -> bool:
-    """Whether ``FLUID_MCP_AUTH_MODE`` names an auth mode. It reads the variable only.
-
-    ``off``, ``disabled`` and every other value the validator refuses never get
-    here: ``_http_preflight`` stops the gateway first, with exit 2. Unset and
-    ``none`` count as no auth. ``shared-token`` without ``FLUID_MCP_AUTH_TOKEN``
-    still counts as configured, although the validator then enforces nothing.
-    """
-    mode = (os.environ.get("FLUID_MCP_AUTH_MODE") or "").strip().lower()
-    return mode not in ("", "none")
-
-
-def _jurisdiction_gate_unsatisfiable(policy, *, transport: str) -> Optional[str]:
+def _jurisdiction_gate_unsatisfiable(
+    policy, *, transport: str, http_auth: Optional[AuthValidator]
+) -> Optional[str]:
     """Refuse at startup when a jurisdiction rule could never be satisfied.
 
     A contract that pins ``sovereignty.jurisdiction`` makes every tool call
-    depend on a VERIFIED caller jurisdiction. That claim only ever arrives one
-    way: the HTTP transport's auth gate (``fluid_build._mcp_http``) stamps it after validating a
-    JWT or mTLS identity. Two configurations can therefore never produce one:
+    depend on a VERIFIED caller jurisdiction. ``--transport stdio`` can never
+    supply one: a pipe carries no headers, so the HTTP auth gate
+    (``fluid_build._mcp_http``) never runs. Over HTTP,
+    :func:`_jurisdiction_refusal_reason` says whether the auth in force ever can.
 
-    * ``--transport stdio`` — a pipe carries no headers, so the HTTP auth
-      gate never runs;
-    * ``--transport http`` with no ``FLUID_MCP_AUTH_MODE`` — the gate skips
-      auth, and so stamps nothing, when auth is not configured.
+    Where it cannot, the gate is not merely weaker. It refuses 100% of calls,
+    forever, and the operator sees a stream of per-call denials rather than one
+    cause. Failing here turns that into a single message at the one moment
+    somebody is watching.
 
-    In both the gate is not merely weaker. It refuses 100% of calls, forever,
-    and the operator sees a stream of per-call denials rather than one cause.
-    Failing here turns that into a single message at the one moment somebody
-    is watching.
-
-    Returns the message to print, or ``None`` when the gate can be satisfied.
+    ``http_auth`` is the validator ``_http_preflight`` built from the same
+    ``FLUID_MCP_AUTH_*`` variables the HTTP transport reads, or ``None`` on
+    stdio. Returns the message to print, or ``None`` when the gate can be
+    satisfied.
     """
     jurisdictions = getattr(policy, "allowed_caller_jurisdictions", None)
     if not jurisdictions:
         return None
     named = ", ".join(jurisdictions)
-    if transport != "http":
+    cross_border = (
+        f"  Or set sovereignty.crossBorderTransfer: true if the data may leave {named}.\n"
+    )
+    if transport != "http" or http_auth is None:
         return (
             f"fluid mcp output-port: refusing to serve over {transport!r}.\n"
             f"  This contract pins sovereignty.jurisdiction to {named}, so every tool "
             "call needs a cryptographically verified caller jurisdiction.\n"
             f"  {transport!r} carries no headers, so no credential can supply one and "
             "every call would be denied.\n"
-            "  Serve it over HTTP with auth instead:\n"
+            "  Serve it over HTTP with JWT auth instead:\n"
             "    FLUID_MCP_AUTH_MODE=jwt fluid mcp output-port serve --transport http\n"
             "  (plus FLUID_MCP_JWT_ISSUER / _AUDIENCE / _JWKS_URL)\n"
-            "  Or set sovereignty.crossBorderTransfer: true if the data may leave "
-            f"{named}.\n"
+            f"{cross_border}"
         )
-    if not _auth_mode_configured():
+    reason = _jurisdiction_refusal_reason(http_auth)
+    if reason is None:
+        return None
+    headline, cause, fix = reason
+    return (
+        f"fluid mcp output-port: {headline}.\n"
+        f"  This contract pins sovereignty.jurisdiction to {named}, so every tool call "
+        f"needs a verified caller jurisdiction, but {cause}. Every call would be denied.\n"
+        f"{fix}"
+        f"{cross_border}"
+    )
+
+
+def _jurisdiction_refusal_reason(http_auth: AuthValidator) -> Optional[Tuple[str, str, str]]:
+    """Why ``http_auth`` can never stamp a verified caller jurisdiction, as the
+    refusal's ``(headline, cause, fix)``, or ``None`` when it can.
+
+    The jurisdiction a pinned contract checks is read from the attributes the
+    HTTP auth gate stamps on a request it has authenticated. Only a validated
+    JWT whose claim mapping sends a claim to the ``jurisdiction`` attribute puts
+    one there: a shared token carries no claims, and a trusted proxy forwards
+    only a client certificate's CN and fingerprint. So three kinds of HTTP auth
+    never can: auth that is off (``none``; ``shared-token`` without
+    ``FLUID_MCP_AUTH_TOKEN``, which an unset ``FLUID_MCP_AUTH_MODE`` also means;
+    ``jwt`` without its issuer, audience and JWKS URL), ``shared-token`` auth,
+    and ``jwt`` auth whose ``FLUID_MCP_JWT_CLAIM_MAPPING`` maps no claim to
+    ``jurisdiction``. No configured value is ever part of the result.
+    """
+    from fluid_build.output_ports.mcp.auth import JURISDICTION_ATTR
+
+    use_jwt = (
+        "  Set FLUID_MCP_AUTH_MODE=jwt with FLUID_MCP_JWT_ISSUER, FLUID_MCP_JWT_AUDIENCE "
+        "and FLUID_MCP_JWT_JWKS_URL, and map your IdP's jurisdiction claim with "
+        "FLUID_MCP_JWT_CLAIM_MAPPING if it is not already called 'jurisdiction'.\n"
+    )
+    if not http_auth.is_enabled():
         return (
-            "fluid mcp output-port: refusing to serve unauthenticated.\n"
-            f"  This contract pins sovereignty.jurisdiction to {named}, so every tool "
-            "call needs a verified caller jurisdiction — but FLUID_MCP_AUTH_MODE is "
-            "unset, so the auth middleware never runs and no claim is ever verified. "
-            "Every call would be denied.\n"
-            "  Set FLUID_MCP_AUTH_MODE=jwt (plus FLUID_MCP_JWT_ISSUER, "
-            "FLUID_MCP_JWT_AUDIENCE, FLUID_MCP_JWT_JWKS_URL), and map your IdP's "
-            "jurisdiction claim with FLUID_MCP_JWT_CLAIM_MAPPING if it is not already "
-            "called 'jurisdiction'.\n"
+            "refusing to serve unauthenticated",
+            f"HTTP auth is off ({http_auth.disabled_reason()}), so no claim is ever verified",
+            use_jwt,
         )
-    return None
+    if http_auth.mode != "jwt":
+        return (
+            f"refusing to serve with {http_auth.mode} auth",
+            "a shared token carries no claims, and a trusted proxy forwards only a client "
+            "certificate's CN and fingerprint, so no jurisdiction is ever verified",
+            use_jwt,
+        )
+    if JURISDICTION_ATTR in http_auth.jwt_claim_mappings.values():
+        return None
+    return (
+        f"refusing to serve: no JWT claim maps to {JURISDICTION_ATTR!r}",
+        f"FLUID_MCP_JWT_CLAIM_MAPPING maps no claim to the {JURISDICTION_ATTR!r} caller "
+        "attribute, so no jurisdiction is ever verified",
+        "  Map your IdP's jurisdiction claim to it: "
+        f"FLUID_MCP_JWT_CLAIM_MAPPING=<claim>={JURISDICTION_ATTR}\n",
+    )
 
 
 def _cert_identity_gate_unsatisfiable(
