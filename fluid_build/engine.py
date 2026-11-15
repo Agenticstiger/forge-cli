@@ -1339,6 +1339,7 @@ async def verify(
     out: Optional[Path | str] = None,
     show_diffs: bool = False,
     env: Optional[str] = None,
+    warn_only: bool = False,
     timeout: Optional[float] = None,
 ) -> VerifyStageResult:
     """Run ``fluid verify`` in-process.
@@ -1346,7 +1347,9 @@ async def verify(
     Stage-9 of the 11-stage pipeline. Re-reads the deployed resources
     and compares against the contract's declared shape; surfaces drift.
     When ``out`` is supplied, the JSON drift report is parsed into
-    ``result.artifacts['report']``.
+    ``result.artifacts['report']``. ``strict`` also fails a run that
+    verified nothing (every expose skipped); ``warn_only`` downgrades that
+    failure to a warning, as ``--warn-only`` does.
     """
     from fluid_build.cli import verify as _verify
 
@@ -1356,6 +1359,7 @@ async def verify(
         "strict": strict,
         "show_diffs": show_diffs,
         "env": env,
+        "warn_only": warn_only,
     }
     if out is not None:
         overrides["out"] = str(out)

@@ -275,44 +275,45 @@ class TestApplyRegister:
 
 
 class TestActionsFromSource:
-    @patch("fluid_build.cli.apply.load_contract_with_overlay")
-    def test_json_source(self, _mock_load):
+    def test_json_source(self):
         from fluid_build.cli.apply import _actions_from_source
 
-        with patch("fluid_build.cli.apply.read_json", return_value={"actions": [{"op": "test"}]}):
-            actions = _actions_from_source(
-                "plan.json", None, MagicMock(), logging.getLogger("test")
-            )
-            assert actions == [{"op": "test"}]
+        actions = _actions_from_source(
+            contract={"name": "test"},
+            plan_data={"actions": [{"op": "test"}]},
+            provider=MagicMock(),
+            logger=logging.getLogger("test"),
+        )
+        assert actions == [{"op": "test"}]
 
-    @patch("fluid_build.cli.apply.load_contract_with_overlay")
-    def test_provider_plan_method(self, mock_load):
+    def test_provider_plan_method(self):
         from fluid_build.cli.apply import _actions_from_source
 
-        mock_load.return_value = {"name": "test"}
         provider = MagicMock()
         provider.plan.return_value = [{"op": "create"}, {"op": "insert"}]
-        actions = _actions_from_source("contract.yaml", "dev", provider, logging.getLogger("test"))
+        actions = _actions_from_source(
+            contract={"name": "test"}, provider=provider, logger=logging.getLogger("test")
+        )
         assert len(actions) == 2
 
-    @patch("fluid_build.cli.apply.load_contract_with_overlay")
-    def test_provider_plan_fails_fallback(self, mock_load):
+    def test_provider_plan_fails_fallback(self):
         from fluid_build.cli.apply import _actions_from_source
 
-        mock_load.return_value = {"name": "test"}
         provider = MagicMock()
         provider.plan.side_effect = Exception("plan failed")
-        actions = _actions_from_source("contract.yaml", "dev", provider, logging.getLogger("test"))
+        actions = _actions_from_source(
+            contract={"name": "test"}, provider=provider, logger=logging.getLogger("test")
+        )
         # Falls back to action parser or final fallback
         assert actions is not None
 
-    @patch("fluid_build.cli.apply.load_contract_with_overlay")
-    def test_no_plan_method(self, mock_load):
+    def test_no_plan_method(self):
         from fluid_build.cli.apply import _actions_from_source
 
-        mock_load.return_value = {"name": "test"}
         provider = MagicMock(spec=[])  # no plan method
-        actions = _actions_from_source("contract.yaml", "dev", provider, logging.getLogger("test"))
+        actions = _actions_from_source(
+            contract={"name": "test"}, provider=provider, logger=logging.getLogger("test")
+        )
         assert actions is not None
 
 

@@ -87,6 +87,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`fluid verify --strict` fails a run that verified nothing.** When every expose was skipped
+  (no verifier for its binding, such as an AWS bucket, a GCS bucket or a Kafka topic, or a
+  reference-only table its external pipeline has not built yet), the run printed
+  `Match: 0 / Mismatch: 0 / Error: 0` and exited 0, so a CI gate keyed on `--strict` passed with
+  no check performed. It now exits 1 and names the exposes it skipped and why.
+  `--fail-on-warning` fails the same way. `--warn-only` downgrades it to a warning, and so does
+  `VERIFY_STRICT=false` in a generated Jenkins pipeline, which drops `--strict`. The library's
+  `engine.verify()` takes `warn_only=` for the same downgrade. A run that verified at least one
+  expose, or whose build's post-apply probes read a run record, only reports its skips, as
+  before. The summary's first line reads `Total exposes` (it said `Total verified`, counting
+  the skipped ones), and the `--out` report's summary gains `not_built`.
+  - **Behaviour change for reference-only contracts.** A reference-only contract whose tables
+    are not built yet used to pass `--strict`, since a missing table there is INFO. It now
+    fails on purpose: on its own such a run verified nothing. The table is still INFO, never
+    an error, and beside a checked expose the run still passes.
+  - **Generated pipelines.** Stage 9 runs `fluid verify --strict`. So a product none of whose
+    exposes forge-cli can verify now fails it, and so does a fresh reference-only deploy, until
+    its external pipeline has built a table.
+- **The IaC suite runs on OpenTofu 1.13.9 as well as 1.12.0.** Stage 1 and Stage 2 of
+  `iac-tests.yml` run once per version, each pinned by the SHA-256 of its release zip, taken
+  from the release's GPG-signed `SHA256SUMS`.
+
 - **`fluid forge` AI mode runs on the shipped FLUID skills.** These are the four Agent Skills in
   `fluid_build/agent_skills/`, the same text a coding agent reads.
   - With a coding agent (`--llm-provider claude-code|codex|cursor|kiro`, or the one `fluid ai
@@ -251,6 +273,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool.** `fluid mcp serve` already did. Before, a mistyped deny list denied nothing and left the
   tool callable, and a mistyped allow list served fewer tools without a word. The refusal exits 2
   before either transport binds, names only the unknown names, and lists the tools.
+
+### Security
+
+- **A simple-mode `fluid apply` ran the plan or contract on disk, not the copy its gates
+  checked.** `fluid apply` verifies a `plan.json`'s digests and mode, and schema-gates a
+  contract, on the one copy it reads. Simple mode (the native provider path, the local
+  provider among them) then read the file a second time to get its actions, so a file rewritten
+  between the gates and dispatch was what ran: a digest-verified plan whose action list was
+  replaced after the gate wrote the replacement's SQL, with exit 0. The actions now come from
+  the verified plan, or from the contract as the gate checked it, and the file is read once.
 
 ## [0.30.1] — 2026-11-13
 

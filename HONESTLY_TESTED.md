@@ -27,6 +27,13 @@ Every test stage rolls up to a single pytest invocation —
 `pytest -m unit` / `-m integration` / `-m aws and integration` etc.
 Markers declared in `pyproject.toml`.
 
+**OpenTofu versions.** In `iac-tests.yml`, Stage 1 (the unit job and every
+tofu lane) and Stage 2 run once per OpenTofu version in their matrix:
+**1.12.0** and **1.13.9** today. Each is pinned by the SHA-256 of its
+`linux_amd64` release zip, read from that release's GPG-signed `SHA256SUMS`.
+Stage 3, the nightly minilake run and `integration-emulated-heavy.yml` run
+1.12.0 only.
+
 ## Coverage matrix
 
 ### AWS

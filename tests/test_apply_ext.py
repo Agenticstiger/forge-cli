@@ -184,20 +184,18 @@ class TestRun:
 
 
 class TestActionsFromSourceJsonPath:
-    def test_json_returns_empty_when_no_actions_key(self, tmp_path):
-        """Lines 67-68: JSON plan with empty dict returns []."""
-        plan = tmp_path / "plan.json"
-        plan.write_text("{}")
-
-        actions = _actions_from_source(str(plan), None, MagicMock(), LOG)
+    def test_json_returns_empty_when_no_actions_key(self):
+        """A verified plan with no ``actions`` key resolves to []."""
+        actions = _actions_from_source(contract={}, plan_data={}, provider=MagicMock(), logger=LOG)
         assert actions == []
 
-    def test_json_returns_actions_list(self, tmp_path):
-        """Lines 67-68: JSON plan with actions list is returned directly."""
-        plan = tmp_path / "plan.json"
-        plan.write_text('{"actions": [{"op": "A"}, {"op": "B"}]}')
+    def test_json_returns_actions_list(self):
+        """A verified plan's actions list is returned directly."""
+        plan = {"actions": [{"op": "A"}, {"op": "B"}]}
 
-        actions = _actions_from_source(str(plan), None, MagicMock(), LOG)
+        actions = _actions_from_source(
+            contract={}, plan_data=plan, provider=MagicMock(), logger=LOG
+        )
         assert [a["op"] for a in actions] == ["A", "B"]
 
 
