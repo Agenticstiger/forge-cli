@@ -79,11 +79,6 @@ class TestAssessCapabilities:
 
 
 class TestRequiredCapabilities:
-    def test_agent_loop_requires_tool_use_and_structured_output(self) -> None:
-        req = required_capabilities_for("agent_loop")
-        assert "tool_use" in req
-        assert "structured_output" in req
-
     def test_staged_pipeline_only_requires_structured_output(self) -> None:
         req = required_capabilities_for("staged_pipeline")
         assert "structured_output" in req
@@ -107,17 +102,6 @@ class TestFormatDegradationWarnings:
         # claude-3-5-sonnet has structured_output → no degradation.
         # No notes on this entry → silent.
         assert warnings == []
-
-    def test_missing_tool_use_warns_on_agent_loop_profile(self) -> None:
-        warnings = format_degradation_warnings(
-            provider="openai",
-            model="o1-mini",
-            usage_profile="agent_loop",
-        )
-        # o1 lacks tool_use — warn loudly.
-        assert any("tool use" in w for w in warnings)
-        # And surface the catalog note about not supporting streaming/tools.
-        assert any("do not support tool use" in w or "tool-use" in w.lower() for w in warnings)
 
     def test_unknown_provider_always_warns(self) -> None:
         warnings = format_degradation_warnings(

@@ -760,9 +760,15 @@ def _http_auth_validator() -> AuthValidator:
 
 
 def _auth_mode_configured() -> bool:
-    """Whether the HTTP transport will actually run its auth middleware."""
+    """Whether ``FLUID_MCP_AUTH_MODE`` names an auth mode. It reads the variable only.
+
+    ``off``, ``disabled`` and every other value the validator refuses never get
+    here: ``_http_preflight`` stops the gateway first, with exit 2. Unset and
+    ``none`` count as no auth. ``shared-token`` without ``FLUID_MCP_AUTH_TOKEN``
+    still counts as configured, although the validator then enforces nothing.
+    """
     mode = (os.environ.get("FLUID_MCP_AUTH_MODE") or "").strip().lower()
-    return mode not in ("", "none", "off", "disabled")
+    return mode not in ("", "none")
 
 
 def _jurisdiction_gate_unsatisfiable(policy, *, transport: str) -> Optional[str]:

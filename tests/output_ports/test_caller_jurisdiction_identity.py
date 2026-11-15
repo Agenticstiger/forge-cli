@@ -222,18 +222,24 @@ def test_http_without_auth_refuses_too(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "FLUID_MCP_AUTH_MODE" in message
 
 
-@pytest.mark.parametrize("mode", ["jwt", "shared-token", "JWT"])
+@pytest.mark.parametrize("mode", ["jwt", "shared-token"])
 def test_http_with_auth_is_allowed_to_start(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FLUID_MCP_AUTH_MODE", mode)
     assert _jurisdiction_gate_unsatisfiable(_policy(jurisdiction="EU"), transport="http") is None
 
 
-@pytest.mark.parametrize("mode", ["", "none", "off", "disabled"])
-def test_auth_mode_set_to_a_disabling_value_still_refuses(
-    mode: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Set-but-empty is the configuration mistake this has to survive."""
-    monkeypatch.setenv("FLUID_MCP_AUTH_MODE", mode)
+@pytest.mark.parametrize("mode", [None, "none"])
+def test_unset_or_none_auth_mode_refuses(mode, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The two no-auth values that reach the gate.
+
+    Set-but-empty, ``off``, ``disabled`` and any other value the validator
+    refuses stop the gateway earlier, in ``_http_preflight``
+    (``test_cli_unknown_auth_mode_exits_2_with_valid_modes_and_no_traceback``).
+    """
+    if mode is None:
+        monkeypatch.delenv("FLUID_MCP_AUTH_MODE", raising=False)
+    else:
+        monkeypatch.setenv("FLUID_MCP_AUTH_MODE", mode)
     assert (
         _jurisdiction_gate_unsatisfiable(_policy(jurisdiction="EU"), transport="http") is not None
     )

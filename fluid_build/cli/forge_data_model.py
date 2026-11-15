@@ -1076,7 +1076,7 @@ def _resolve_optional_llm_config(args: Any, logger: logging.Logger):
     # right profile for ``fluid forge data-model`` — each stage is a
     # single LLM call, so we only require structured-output
     # enforcement (not tool_use). ``FLUID_QUIET`` / ``FLUID_NONINTERACTIVE``
-    # suppress the print but still record warnings to telemetry.
+    # suppress the print; the warning count is still logged.
     try:
         import os as _os
 

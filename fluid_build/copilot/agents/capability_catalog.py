@@ -396,8 +396,7 @@ _FAMILY_OVERLAY: Tuple[ProviderCapabilities, ...] = (
         streaming=True,
         notes=(
             "gemma4 is the project's default Ollama model. Tool-use accuracy "
-            "is acceptable for the staged pipeline; the multi-turn agent loop "
-            "may need more iterations to converge than on hosted providers.",
+            "is acceptable for the staged pipeline.",
         ),
     ),
     ProviderCapabilities(
@@ -415,7 +414,7 @@ _FAMILY_OVERLAY: Tuple[ProviderCapabilities, ...] = (
         streaming=True,
         notes=(
             "gemma2 does not support tool calling. Use gemma3+ if you need "
-            "the multi-turn agent loop on Ollama.",
+            "tool calling on Ollama.",
         ),
     ),
     ProviderCapabilities(
@@ -424,9 +423,7 @@ _FAMILY_OVERLAY: Tuple[ProviderCapabilities, ...] = (
         tool_use=False,
         structured_output=False,
         streaming=True,
-        notes=(
-            "Original Gemma (1.x) does not support tool calling. Use gemma3+ for the agent loop.",
-        ),
+        notes=("Original Gemma (1.x) does not support tool calling. Use gemma3+ if you need it.",),
     ),
     ProviderCapabilities(
         provider="ollama",
@@ -739,18 +736,6 @@ def assess_capabilities(provider: str, model: str) -> ProviderCapabilities:
 # ---------------------------------------------------------------------------
 
 
-_AGENT_LOOP_REQUIREMENTS: Sequence[str] = (
-    "tool_use",
-    "structured_output",
-)
-"""Hard requirements for the multi-turn agent-loop CLI path.
-
-A run that lacks these will misbehave (no tool calls = unsupervised
-text generation; no structured output = schema-validation failures
-on every stage). Surface as warnings, not errors, so users on
-unusual models can still opt into the run with their eyes open.
-"""
-
 _STAGED_PIPELINE_REQUIREMENTS: Sequence[str] = ("structured_output",)
 """Hard requirements for the single-shot staged pipeline.
 
@@ -760,7 +745,6 @@ Pydantic stage models validate cleanly.
 """
 
 _USAGE_PROFILE_REQUIREMENTS: Dict[str, Sequence[str]] = {
-    "agent_loop": _AGENT_LOOP_REQUIREMENTS,
     "staged_pipeline": _STAGED_PIPELINE_REQUIREMENTS,
 }
 

@@ -209,6 +209,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copilot went in #881, so setting them did nothing. `fluid doctor --env` no longer lists the two
   variables or prints the telemetry line, and `fluid doctor --env --json` is now `{"env": [...]}`
   without the `telemetry` key.
+- **The capability catalog's `agent_loop` usage profile.** Nothing has passed it since the loop
+  went in #881. `required_capabilities_for("agent_loop")` now returns the staged-pipeline set, as
+  any unknown profile does, and the notes `fluid forge data-model` prints for Ollama's gemma
+  models no longer mention the agent loop.
 
 ### Fixed
 

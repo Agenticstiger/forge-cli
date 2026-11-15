@@ -35,7 +35,7 @@ class TestEmitDegradationWarnings:
         warnings = emit_degradation_warnings(
             provider="openai",
             model="o1-mini",
-            usage_profile="agent_loop",
+            usage_profile="staged_pipeline",
             quiet=True,
         )
         out = capsys.readouterr()
