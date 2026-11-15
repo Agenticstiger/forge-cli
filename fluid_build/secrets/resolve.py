@@ -1,7 +1,7 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""Resolve a secret reference: the operator's policy first, then the store.
+"""Resolve a secret reference: policy first, then the run's handoff file or the store.
 
 The order, for a reference a contract names (:func:`resolve_secret`):
 
@@ -11,7 +11,10 @@ The order, for a reference a contract names (:func:`resolve_secret`):
    destination the value is sent to is allowed. All of it before any store is
    asked, so a refusal never reads the secret.
 3. The run's cache: one fetch per reference per run.
-4. Otherwise the scheme's resolver (:mod:`.registry`).
+4. The run-secrets file, when the operator set :data:`RUN_SECRETS_ENV`
+   (Command Center's ``runner-env`` handoff): the value comes from the file,
+   and a reference the file does not list does not resolve at all.
+5. Otherwise the scheme's resolver (:mod:`.registry`).
 
 The value comes back as a pydantic ``SecretStr``, so its repr and its JSON
 dump are masked, and it is registered with the exact-value redactor
@@ -33,6 +36,7 @@ from typing import Any, Mapping, Optional, Union
 from fluid_build._errors import doc_url
 
 from .errors import SecretError, SecretPolicyError, SecretResolveError
+from .handoff import RUN_SECRETS_ENV, handed, not_handed
 from .policy import (
     check_prefix,
     check_scheme,
@@ -88,7 +92,7 @@ def _as_ref(ref: Union[SecretRef, str]) -> SecretRef:
 
 
 def _fetch(ref: SecretRef, state: RunState) -> Any:
-    """The cached or freshly fetched ``SecretStr`` for an already-allowed ref."""
+    """The cached, handed or freshly fetched ``SecretStr`` for an already-allowed ref."""
     from pydantic import SecretStr
 
     from fluid_build.observability.secret_redactor import register_secret
@@ -97,6 +101,15 @@ def _fetch(ref: SecretRef, state: RunState) -> Any:
     if cached is not None:
         _audit(ref, "cached", "cache")
         return cached
+    handoff = handed(state)
+    if handoff is not None:
+        value = handoff.get(ref.canonical)
+        if value is None:
+            raise not_handed(ref)
+        if state.keep_values:
+            state.cache[ref.canonical] = value
+        _audit(ref, "resolved", "run_secrets_file")
+        return value
     plain = _ask_resolver(ref, state)
     if not isinstance(plain, str) or not plain:
         raise SecretResolveError(
@@ -191,7 +204,8 @@ def resolve_credential(
     the store (``FLUID_CREDENTIAL_STORE``), and the stage that needs a provider
     credential (a plan or a live diff against the warehouse) is the one that
     connects with it. The never-fetch rule for validate, plan, bundle and diff
-    is about the references a contract names.
+    is about the references a contract names. The run-secrets file still
+    limits what resolves when it is set.
     """
     parsed: Optional[SecretRef] = None
     try:
@@ -220,6 +234,11 @@ def secret_exists(
     check_scheme(parsed, environ)
     check_prefix(parsed, environ)
     with state_for_lookup() as state:
+        handoff = handed(state)
+        if handoff is not None:
+            if parsed.canonical in handoff:
+                return Existence(True, "listed in the run-secrets file")
+            return Existence(False, "not listed in the run-secrets file")
         resolver = get_resolver(parsed.scheme)
         try:
             return resolver.exists(parsed, state)

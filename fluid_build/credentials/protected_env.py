@@ -368,7 +368,9 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "BAO_NAMESPACE",
         "VAULT_CACERT",
         "BAO_CACERT",
+        # the run-secrets handoff file a runner writes for this process, and
         # the store the credential chain reads provider credentials from
+        "FLUID_RUN_SECRETS_FILE",
         "FLUID_CREDENTIAL_STORE",
         # litellm routes every model call to this proxy when the switch is
         # on, and sends it the key FLUID resolved for whichever provider

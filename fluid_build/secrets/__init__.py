@@ -51,6 +51,7 @@ _MODULES: Dict[str, Tuple[str, ...]] = {
         "get_resolver",
     ),
     "contract": ("lint_secret_refs", "secret_ref_sites"),
+    "handoff": ("RUN_SECRETS_ENV",),
 }
 
 _EXPORTS: Dict[str, str] = {name: module for module, names in _MODULES.items() for name in names}
