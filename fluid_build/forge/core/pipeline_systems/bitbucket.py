@@ -124,6 +124,7 @@ class BitbucketTemplate(BasePipelineTemplate):
             },
         }
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="Bitbucket Pipelines",
             secret_surface_hint=(
@@ -247,6 +248,7 @@ class BitbucketTemplate(BasePipelineTemplate):
         pipeline["pipelines"]["branches"]["main"].append(publish_step)
 
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="Bitbucket Pipelines",
             secret_surface_hint=(

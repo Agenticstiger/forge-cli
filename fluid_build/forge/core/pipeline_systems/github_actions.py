@@ -29,6 +29,7 @@ except ImportError:
 
     yaml = _YamlFallback()  # type: ignore[assignment]
 
+from . import _keyless
 from ._base import (
     PINNED_ACTIONS,
     BasePipelineTemplate,
@@ -136,6 +137,8 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                 "run": self._render_install_setup(config),
                 "shell": "bash",
             },
+            # Keyless cloud auth before the first fluid stage that reaches the cloud.
+            *self._cloud_auth_steps(config),
         ]
         for spec in self._stage_specs(config):
             stage_body = self._render_stage_command(spec, config)
@@ -158,10 +161,14 @@ class GitHubActionsTemplate(BasePipelineTemplate):
         workflow: Dict[str, Any] = {
             "name": "fluid 11-stage pipeline",
             "on": {"workflow_dispatch": {"inputs": inputs}},
+            "permissions": {},  # Least privilege — grant per-job only
             "jobs": {
                 "pipeline": {
                     "runs-on": "ubuntu-latest",
-                    "env": job_env,
+                    # One job runs every stage, apply included, so it may ask
+                    # for an ID token when the contract binds a cloud.
+                    "permissions": _keyless.github_job_permissions(config.cloud_auth),
+                    "env": {**job_env, **_keyless.github_auth_env(config.cloud_auth)},
                     "steps": steps,
                 }
             },
@@ -172,6 +179,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                 "run": {"working-directory": config.workdir}
             }
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="GitHub Actions",
             secret_surface_hint=(
@@ -183,6 +191,17 @@ class GitHubActionsTemplate(BasePipelineTemplate):
         # json.dumps produces valid YAML (JSON is a subset). Keep it
         # this way — no yaml.dump dependency, no anchor/alias surprises.
         return {".github/workflows/fluid-pipeline.yml": content}
+
+    @staticmethod
+    def _cloud_auth_steps(config: PipelineConfig) -> List[Dict[str, Any]]:
+        """Keyless OIDC login steps for the platforms the contract binds."""
+        return _keyless.github_auth_steps(config.cloud_auth, _pin_action)
+
+    @staticmethod
+    def _job_env(config: PipelineConfig) -> Dict[str, Any]:
+        """``{"env": ...}`` for a job that reaches the cloud, or ``{}``."""
+        env = _keyless.github_auth_env(config.cloud_auth)
+        return {"env": env} if env else {}
 
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate GitHub Actions workflow"""
@@ -221,7 +240,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             "jobs": {
                 "fluid-pipeline": {
                     "runs-on": "ubuntu-latest",
-                    "permissions": self._get_deploy_job_permissions(config.oidc_provider),
+                    # The one job plans on pull requests and applies on main,
+                    # so it may ask for an ID token when a cloud is bound.
+                    "permissions": _keyless.github_job_permissions(config.cloud_auth),
+                    **self._job_env(config),
                     "steps": [
                         {"name": "Checkout code", "uses": _pin_action("actions/checkout@v4")},
                         {
@@ -231,7 +253,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                         },
                         {"name": "Install FLUID", "run": "pip install --quiet data-product-forge"},
                         *engine_install_step,
-                        *self._get_oidc_steps(config.oidc_provider),
+                        *self._cloud_auth_steps(config),
                         {"name": "FLUID Doctor Check", "run": commands["doctor"]},
                         {"name": "Validate Configuration", "run": commands["validate"]},
                         {
@@ -264,11 +286,12 @@ class GitHubActionsTemplate(BasePipelineTemplate):
         }
 
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="GitHub Actions",
             secret_surface_hint=(
-                "Settings → Secrets and variables → Actions. Reference per-job via "
-                "`env: FOO: ${{ secrets.FOO }}`."
+                "Settings → Secrets and variables → Actions → Variables (read in "
+                "the workflow as `vars.NAME`)."
             ),
         )
         runtime_notes = self._engine_runtime_notes(config, indent="# ")
@@ -278,7 +301,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             + notes_block
             + yaml.dump(workflow, indent=2)
         }
-        files[".env.ci.example"] = self._generate_env_ci_example(config.oidc_provider)
+        files[".env.ci.example"] = self._generate_env_ci_example(config.cloud_auth)
         return files
 
     def _generate_standard_workflow(self, config: PipelineConfig) -> Dict[str, str]:
@@ -427,7 +450,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     "with": {"python-version": "3.10"},
                 },
                 {"name": "Install Dependencies", "run": _install_cmd},
-                *self._get_oidc_steps(config.oidc_provider),
+                *self._cloud_auth_steps(config),
                 {
                     "name": "Generate Transformations",
                     "run": f"FLUID_ENV={env} {commands['generate_transformation']}",
@@ -495,20 +518,21 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             workflow["jobs"][job_name] = {
                 "needs": depends_on,
                 "runs-on": "ubuntu-latest",
-                "permissions": self._get_deploy_job_permissions(config.oidc_provider),
+                "permissions": _keyless.github_job_permissions(config.cloud_auth),
+                **self._job_env(config),
                 "environment": env,
                 "if": f"github.ref == 'refs/heads/main' || (github.ref == 'refs/heads/develop' && '{env}' != 'prod')",
                 "steps": deploy_steps,
             }
 
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="GitHub Actions",
             secret_surface_hint=(
-                "Settings → Secrets and variables → Actions. Then reference them "
-                "per-job via `env: FOO: ${{ secrets.FOO }}` or, for OIDC providers "
-                "(GCP/AWS/Azure), use the Workload Identity Federation steps "
-                "already wired when --oidc-provider is set."
+                "Settings → Secrets and variables → Actions → Variables (read in "
+                "the workflow as `vars.NAME`). The deploy jobs declare an "
+                "`environment`, so their OIDC subject ends in `environment:<name>`."
             ),
         )
         runtime_notes = self._engine_runtime_notes(config, indent="# ")
@@ -518,7 +542,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             + notes_block
             + yaml.dump(workflow, indent=2)
         }
-        files[".env.ci.example"] = self._generate_env_ci_example(config.oidc_provider)
+        files[".env.ci.example"] = self._generate_env_ci_example(config.cloud_auth)
         return files
 
     def _generate_advanced_workflow(self, config: PipelineConfig) -> Dict[str, str]:
@@ -590,9 +614,13 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             "jobs": {
                 "compliance-audit": {
                     "runs-on": "ubuntu-latest",
-                    "permissions": {"contents": "read"},
+                    # `fluid verify` reconciles lineage against the deployed
+                    # state, so this job reaches the cloud.
+                    "permissions": _keyless.github_job_permissions(config.cloud_auth),
+                    **self._job_env(config),
                     "steps": [
                         {"name": "Checkout", "uses": _pin_action("actions/checkout@v4")},
+                        *self._cloud_auth_steps(config),
                         {
                             "name": "Generate Compliance Report",
                             "run": "fluid policy-check ${CONTRACT:-contract.fluid.yaml} --format json --output compliance-report.json",

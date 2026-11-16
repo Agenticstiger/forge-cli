@@ -578,6 +578,32 @@ def _contract_package_extras(contract_path: str) -> List[str]:
     return sorted(extras)
 
 
+def _contract_cloud_auth(contract_path: str) -> Tuple[str, ...]:
+    """The platforms a keyless pipeline authenticates to: the cloud bindings
+    of the contract and of every overlay (a pipeline can run any of them), and
+    ``openbao`` when a ``secretRef`` in any of them is ``vault://`` or
+    ``openbao://`` (forge's vault resolver logs in with the job's OIDC token)."""
+    from fluid_build.forge.core.pipeline_systems._keyless import CLOUD_AUTH_PLATFORMS
+    from fluid_build.secrets.contract import secret_ref_sites
+
+    found = set()
+    for document in _contract_documents(contract_path):
+        bindings = [document.get("binding")]
+        bindings += [e.get("binding") for e in document.get("exposes") or [] if isinstance(e, dict)]
+        for build in document.get("builds") or []:
+            runtime = ((build or {}).get("execution") or {}).get("runtime") or {}
+            bindings.append({"platform": runtime.get("platform")} if runtime else None)
+        for binding in bindings:
+            platform = binding.get("platform") if isinstance(binding, dict) else None
+            if isinstance(platform, str) and platform.lower() in CLOUD_AUTH_PLATFORMS:
+                found.add(platform.lower())
+        for site in secret_ref_sites(document):
+            scheme = str(site.raw).partition("://")[0].lower() if "://" in str(site.raw) else ""
+            if scheme in ("vault", "openbao"):
+                found.add("openbao")
+    return tuple(p for p in CLOUD_AUTH_PLATFORMS if p in found)
+
+
 def _single_build_id(contract_path: str) -> str:
     """The contract's build id when it declares exactly one build, else ""."""
     documents = _contract_documents(contract_path)
@@ -830,6 +856,7 @@ def run(args, logger: logging.Logger) -> int:
             contract_path=pipeline_contract,
             fluid_package_spec=fluid_package_spec or None,
             package_extras=_contract_package_extras(contract_path),
+            cloud_auth=_contract_cloud_auth(contract_path),
             apply_mode_default=getattr(args, "apply_mode_default", None),
             apply_build_id_default=_single_build_id(contract_path),
             schedule_sync_default=bool(schedule_sync_default_arg),

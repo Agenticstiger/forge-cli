@@ -322,59 +322,63 @@ class TestGitlabOidcCredentialHygiene:
     """SECURITY_REVIEW S-005: generated GitLab CI templates must never
     write federated credentials to a predictable ``/tmp/*.json`` path.
 
-    The fix uses ``mktemp`` for a random filename, ``chmod 600`` to
-    restrict permissions, and ``trap 'rm -f' EXIT`` to clean up when the
-    shell exits — so the credential material exists on disk only for
-    the lifetime of the single shell invocation that consumes it.
+    The ID tokens go to files in a private ``mktemp -d`` directory (mode 700
+    by ``umask 077``), removed by a ``trap`` when the job's shell exits, so
+    the material exists on disk only for the lifetime of the job.
     """
 
-    def _generate_gitlab_yaml(self, oidc_provider):
+    def _generate_gitlab_yaml(self, cloud_auth):
         gen = PipelineTemplateGenerator()
         # STANDARD and ENTERPRISE hit the deploy-per-environment branch
         # where the OIDC credential snippet is emitted.
         config = PipelineConfig(
             provider=PipelineProvider.GITLAB_CI,
             complexity=PipelineComplexity.STANDARD,
-            oidc_provider=oidc_provider,
+            cloud_auth=cloud_auth,
         )
         result = gen.generate_pipeline(config)
         assert ".gitlab-ci.yml" in result
         return result[".gitlab-ci.yml"]
 
-    @pytest.mark.parametrize("oidc_provider", ["gcp", "aws"])
-    def test_no_literal_tmp_paths(self, oidc_provider):
-        yaml_out = self._generate_gitlab_yaml(oidc_provider)
+    @pytest.mark.parametrize("cloud_auth", [("gcp",), ("aws",), ("snowflake",), ("openbao",)])
+    def test_no_literal_tmp_paths(self, cloud_auth):
+        yaml_out = self._generate_gitlab_yaml(cloud_auth)
+        assert "/tmp/" not in yaml_out
         assert "/tmp/oidc_token.json" not in yaml_out
         assert "/tmp/aws_creds.json" not in yaml_out
 
-    @pytest.mark.parametrize("oidc_provider", ["gcp", "aws"])
-    def test_uses_mktemp_chmod_trap(self, oidc_provider):
-        yaml_out = self._generate_gitlab_yaml(oidc_provider)
-        # mktemp-backed random filename
-        assert 'CRED_FILE="$(mktemp)"' in yaml_out
-        # permission-tightening on the temp file
-        assert 'chmod 600 "$CRED_FILE"' in yaml_out
-        # cleanup on shell exit — key hygiene win
-        assert "trap 'rm -f \"$CRED_FILE\"' EXIT" in yaml_out
+    @pytest.mark.parametrize("cloud_auth", [("gcp",), ("aws",), ("snowflake",), ("openbao",)])
+    def test_uses_private_mktemp_dir_umask_and_trap(self, cloud_auth):
+        yaml_out = self._generate_gitlab_yaml(cloud_auth)
+        # mode-restricted files, in a random private directory
+        assert "umask 077" in yaml_out
+        assert 'FLUID_AUTH_DIR="$(mktemp -d)"' in yaml_out
+        # cleanup on shell exit: the key-hygiene win
+        assert "trap 'rm -rf \"$FLUID_AUTH_DIR\"' EXIT" in yaml_out
 
-    def test_gcp_consumes_cred_file(self):
-        yaml_out = self._generate_gitlab_yaml("gcp")
-        assert 'gcloud auth login --cred-file="$CRED_FILE"' in yaml_out
-        # Still reads the OIDC token from the env var (GitLab native
-        # id_tokens injection) — not from a hard-coded /tmp path.
-        assert '"${FLUID_OIDC_TOKEN}" > "$CRED_FILE"' in yaml_out
+    def test_gcp_writes_an_external_account_file_naming_the_token_file(self):
+        yaml_out = self._generate_gitlab_yaml(("gcp",))
+        assert "external_account" in yaml_out
+        assert 'export GOOGLE_APPLICATION_CREDENTIALS="$FLUID_AUTH_DIR/gcp-credentials.json"' in (
+            yaml_out
+        )
+        # The token comes from GitLab's native id_tokens injection.
+        assert '"$GCP_OIDC_TOKEN" > "$FLUID_AUTH_DIR/gcp-token"' in yaml_out
 
-    def test_aws_writes_sts_output_to_cred_file(self):
-        yaml_out = self._generate_gitlab_yaml("aws")
-        assert "aws sts assume-role-with-web-identity" in yaml_out
-        assert '> "$CRED_FILE"' in yaml_out
+    def test_aws_hands_the_sdk_the_token_file_and_assumes_nothing_itself(self):
+        yaml_out = self._generate_gitlab_yaml(("aws",))
+        assert "AWS_WEB_IDENTITY_TOKEN_FILE" in yaml_out
+        assert "sts.amazonaws.com" in yaml_out
+        # The SDK assumes the role; no credential output is captured or printed.
+        assert "aws sts assume-role-with-web-identity" not in yaml_out
 
     def test_no_oidc_no_cred_snippets(self):
-        """Smoke test: without an OIDC provider configured, none of the
-        credential-file plumbing appears in the output."""
-        yaml_out = self._generate_gitlab_yaml(oidc_provider=None)
+        """Smoke test: with no cloud bound, none of the credential-file
+        plumbing appears in the output."""
+        yaml_out = self._generate_gitlab_yaml(cloud_auth=())
         assert "mktemp" not in yaml_out
-        assert "FLUID_OIDC_TOKEN" not in yaml_out
+        assert "id_tokens" not in yaml_out
+        assert "OIDC_TOKEN" not in yaml_out
 
 
 # ── PipelineConfig.workdir + generates_artifacts ────────────────────

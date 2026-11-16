@@ -32,6 +32,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from fluid_build._env_names import ENV_NAME_RULE, is_env_name
 from fluid_build.cli.console import cprint
 
+from . import _keyless
+
 # SHA-pinned GitHub Actions for supply chain security.
 # Each entry maps action@tag to action@sha with a version comment.
 # SHAs verified via GitHub API (git/ref/tags/<version>).
@@ -43,9 +45,8 @@ PINNED_ACTIONS = {
     "actions/download-artifact@v4": "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",  # v4.3.0
     "google/osv-scanner-action/osv-scanner-action@v2": "google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2",  # v2.3.8
     "github/codeql-action/upload-sarif@v3": "github/codeql-action/upload-sarif@d77b13a0df3134d64a457ea9003f600b09fa1c8a",  # v3.36.1
-    "google-github-actions/auth@v2": "google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed",  # v2.1.13
-    "aws-actions/configure-aws-credentials@v4": "aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a",  # v4.3.1
-    "azure/login@v2": "azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5",  # v2.3.0
+    "google-github-actions/auth@v3": "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093",  # v3.0.0
+    "aws-actions/configure-aws-credentials@v6": "aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd",  # v6.3.0
     "anchore/sbom-action@v0": "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610",  # v0.24.0
     "actions/attest-build-provenance@v2": "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be",  # v2.4.0
 }
@@ -261,7 +262,10 @@ class PipelineConfig:
     enable_marketplace_publishing: bool = False
     notification_channels: List[str] = None
     custom_steps: List[Dict[str, Any]] = None
-    oidc_provider: Optional[str] = None  # "gcp", "aws", "azure", or None
+    # The cloud platforms the contract (and its overlays) bind, plus "openbao"
+    # when a secretRef uses vault:// or openbao://: what the pipeline
+    # authenticates to without a static key (``_keyless.CLOUD_AUTH_PLATFORMS``).
+    cloud_auth: Tuple[str, ...] = ()
     # Pipeline working directory, relative to the SCM checkout root. Set when
     # `fluid generate ci` is invoked from a subfolder of a git repo so the
     # generated pipeline can cd into that folder before running fluid commands.
@@ -402,6 +406,8 @@ class PipelineConfig:
 
         if self.package_extras is None:
             self.package_extras = []
+
+        self.cloud_auth = _keyless.normalize(self.cloud_auth or ())
 
 
 class PipelineTemplateGenerator:
@@ -787,149 +793,40 @@ class BasePipelineTemplate:
         comment_prefix: str,
         ci_system_name: str,
         secret_surface_hint: str,
+        cloud_auth: Tuple[str, ...] = (),
     ) -> str:
-        """Render a provider-agnostic credential-model banner.
+        """Render the credential-model banner every pipeline file starts with.
 
-        Every FLUID-aware CI pipeline needs the same thing: make the
-        provider's env vars (SNOWFLAKE_* / GOOGLE_APPLICATION_CREDENTIALS
-        / AWS_* / AZURE_* / DMM_*) available to the shell steps that
-        call ``fluid``. *How* those env vars arrive differs per CI
-        system — GitHub Actions uses ``secrets`` mapped via ``env:``,
-        GitLab injects CI/CD variables automatically, Jenkins offers
-        either agent env passthrough or the ``credentials()`` DSL, etc.
-
-        This helper emits the common "what env vars fluid expects"
-        paragraph plus a system-specific pointer so the generated
-        file is self-documenting — no hard-coded Snowflake-only list.
+        The model is keyless: a generated pipeline holds no static cloud key.
+        GitHub Actions and GitLab CI mint an OIDC ID token per job and the
+        cloud trusts it; for them the banner lists the non-secret variables
+        and what to configure on the cloud side. The other systems get the
+        same honest statement and a pointer to their own OIDC or workload
+        identity mechanism (see :mod:`._keyless`).
 
         Arguments:
           comment_prefix: ``# `` for YAML / shell; ``// `` for Groovy.
           ci_system_name: human-readable name shown in the banner.
-          secret_surface_hint: one-line hint on how THIS system
-            surfaces secrets (e.g. "Settings → Secrets and variables
-            → Actions"). Kept short — the rest is pattern-agnostic.
+          secret_surface_hint: one-line hint on where THIS system keeps
+            variables (e.g. "Settings → Secrets and variables → Actions").
+          cloud_auth: the platforms the contract binds, from
+            ``PipelineConfig.cloud_auth``.
         """
         p = comment_prefix
-        lines = [
-            f"{p}FLUID CI/CD Pipeline — {ci_system_name}",
+        lines = [f"{p}FLUID CI/CD Pipeline — {ci_system_name}", f"{p}"]
+        lines += [
+            f"{p}{line}".rstrip() for line in _keyless.banner_lines(cloud_auth, ci_system_name)
+        ]
+        lines += [
             f"{p}",
-            f"{p}Credential model (provider-agnostic):",
-            f"{p}  fluid's credential resolver reads provider auth from the runner",
-            f"{p}  environment. Each provider expects its own env vars:",
-            f"{p}    Snowflake → SNOWFLAKE_ACCOUNT / SNOWFLAKE_USER / SNOWFLAKE_PASSWORD /",
-            f"{p}                SNOWFLAKE_ROLE / SNOWFLAKE_WAREHOUSE / SNOWFLAKE_DATABASE",
-            f"{p}    GCP       → GOOGLE_APPLICATION_CREDENTIALS (or Workload Identity via OIDC)",
-            f"{p}    AWS       → AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or OIDC role)",
-            f"{p}    Azure     → AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID",
-            f"{p}    Catalog   → DMM_API_URL / DMM_API_KEY (only if using `fluid publish`)",
-            f"{p}    Command Center → FLUID_CC_ENDPOINT (base URL) / FLUID_API_KEY (sent as",
-            f"{p}                X-API-Key) / FLUID_CC_ORG_ID (the organization; optional when",
-            f"{p}                the key belongs to exactly one) for `--target fluid-command-center`",
-            f"{p}  See ``fluid_build.credentials.resolver`` for the full resolver chain.",
-            f"{p}",
-            f"{p}How to surface them in {ci_system_name}:",
-            f"{p}  {secret_surface_hint}",
+            f"{p}Where {ci_system_name} keeps variables: {secret_surface_hint}",
             f"{p}",
         ]
         return "\n".join(lines) + "\n"
 
-    def _get_oidc_steps(self, oidc_provider: Optional[str]) -> List[Dict[str, Any]]:
-        """Get OIDC authentication steps for GitHub Actions deploy jobs."""
-        if oidc_provider == "gcp":
-            return [
-                {
-                    "name": "Authenticate to Google Cloud (OIDC)",
-                    "id": "auth",
-                    "uses": _pin_action("google-github-actions/auth@v2"),
-                    "with": {
-                        "workload_identity_provider": "projects/${{ vars.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ vars.WIF_POOL }}/providers/${{ vars.WIF_PROVIDER }}",
-                        "service_account": "${{ vars.GCP_SA_EMAIL }}",
-                    },
-                }
-            ]
-        elif oidc_provider == "aws":
-            return [
-                {
-                    "name": "Configure AWS Credentials (OIDC)",
-                    "uses": _pin_action("aws-actions/configure-aws-credentials@v4"),
-                    "with": {
-                        "role-to-assume": "${{ vars.AWS_ROLE_ARN }}",
-                        "aws-region": "${{ vars.AWS_REGION }}",
-                    },
-                }
-            ]
-        elif oidc_provider == "azure":
-            return [
-                {
-                    "name": "Azure Login (OIDC)",
-                    "uses": _pin_action("azure/login@v2"),
-                    "with": {
-                        "client-id": "${{ vars.AZURE_CLIENT_ID }}",
-                        "tenant-id": "${{ vars.AZURE_TENANT_ID }}",
-                        "subscription-id": "${{ vars.AZURE_SUBSCRIPTION_ID }}",
-                    },
-                }
-            ]
-        return []
-
-    def _get_deploy_job_permissions(self, oidc_provider: Optional[str]) -> Dict[str, str]:
-        """Get permissions for a deployment job."""
-        perms = {"contents": "read"}
-        if oidc_provider:
-            perms["id-token"] = "write"
-        return perms
-
-    def _generate_env_ci_example(self, oidc_provider: Optional[str] = None) -> str:
-        """Generate .env.ci.example content with required secrets per provider."""
-        lines = [
-            "# Required CI/CD Secrets for FLUID Pipeline",
-            "# Copy these to your CI provider's secret store",
-            "#",
-            "# FLUID Configuration",
-            "FLUID_LOG_LEVEL=INFO",
-            "# CONTRACT=contract.fluid.yaml",
-            "",
-        ]
-        if oidc_provider == "gcp":
-            lines += [
-                "# GCP Workload Identity Federation (OIDC — no stored secrets needed!)",
-                "# Configure these as GitHub Actions variables (vars), not secrets:",
-                "# GCP_PROJECT_NUMBER=123456789",
-                "# WIF_POOL=fluid-pool",
-                "# WIF_PROVIDER=github-provider",
-                "# GCP_SA_EMAIL=fluid@project.iam.gserviceaccount.com",
-            ]
-        elif oidc_provider == "aws":
-            lines += [
-                "# AWS OIDC (no stored secrets needed!)",
-                "# Configure these as GitHub Actions variables (vars), not secrets:",
-                "# AWS_ROLE_ARN=arn:aws:iam::123456789:role/fluid-deploy",
-                "# AWS_REGION=us-east-1",
-            ]
-        elif oidc_provider == "azure":
-            lines += [
-                "# Azure Federated Identity (OIDC — no stored secrets needed!)",
-                "# Configure these as GitHub Actions variables (vars), not secrets:",
-                "# AZURE_CLIENT_ID=00000000-0000-0000-0000-000000000000",
-                "# AZURE_TENANT_ID=00000000-0000-0000-0000-000000000000",
-                "# AZURE_SUBSCRIPTION_ID=00000000-0000-0000-0000-000000000000",
-            ]
-        else:
-            lines += [
-                "# Provider Authentication",
-                "# Prefer OIDC/Workload Identity Federation over stored secrets.",
-                "# See: fluid forge --ci github_actions --oidc-provider gcp",
-                "#",
-                "# If OIDC is not available, configure these as CI secrets:",
-                "# SNOWFLAKE_ACCOUNT=your_account",
-                "# SNOWFLAKE_USER=your_user",
-                "# SNOWFLAKE_PASSWORD=your_password  # Use key-pair auth instead!",
-                "# GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json",
-                "# AWS_ACCESS_KEY_ID=AKIA...  # Use OIDC instead!",
-                "# AWS_SECRET_ACCESS_KEY=...",
-            ]
-        lines.append("")
-        return "\n".join(lines)
+    def _generate_env_ci_example(self, cloud_auth: Tuple[str, ...] = ()) -> str:
+        """``.env.ci.example``: the non-secret variables the keyless setup needs."""
+        return "\n".join(_keyless.env_example_lines(cloud_auth)) + "\n"
 
     # ------------------------------------------------------------------
     # 11-stage pipeline helpers (Phase 7-rest)
