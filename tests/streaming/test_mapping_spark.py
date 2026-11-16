@@ -228,7 +228,7 @@ def test_an_unknown_dialect_is_refused():
 # ── maskAtIngest ────────────────────────────────────────────────────────
 
 
-def test_mask_at_ingest_hashes_the_source_with_sha256():
+def test_mask_at_ingest_calls_the_keyed_hmac_on_the_source_bytes():
     mapping = {
         "columns": [
             {"name": "customer_id", "from": "customer.id", "maskAtIngest": "hash"},
@@ -242,9 +242,9 @@ def test_mask_at_ingest_hashes_the_source_with_sha256():
         col("qty", "string"),
     ]
     assert spark(mapping, target) == select(
-        "sha2(CAST(`src`.`event_id` AS STRING), 256) AS `event_id`",
-        "sha2(CAST(`src`.`customer`.`id` AS STRING), 256) AS `customer_id`",
-        "sha2(CAST(`src`.`quantity` AS STRING), 256) AS `qty`",
+        "fluid_mask(CAST(`src`.`event_id` AS BINARY)) AS `event_id`",
+        "fluid_mask(CAST(`src`.`customer`.`id` AS BINARY)) AS `customer_id`",
+        "fluid_mask(CAST(CAST(`src`.`quantity` AS STRING) AS BINARY)) AS `qty`",
     )
 
 
@@ -253,7 +253,7 @@ def test_a_binary_source_is_hashed_as_its_bytes():
     s = parse_stream({"kind": "kafka", "topic": "t", "format": "json", "schema": value})
     mapping = {"columns": [{"name": "payload", "from": "payload", "maskAtIngest": "hash"}]}
     sql = compile_select(s, mapping, parse_fields([col("payload", "string")]), dialect="spark")
-    assert "sha2(`src`.`payload`, 256) AS `payload`" in sql
+    assert "fluid_mask(`src`.`payload`) AS `payload`" in sql
 
 
 @pytest.mark.parametrize(
