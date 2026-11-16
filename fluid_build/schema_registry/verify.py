@@ -241,9 +241,16 @@ def _for_provider(produced: List[Subject], provider: Optional[str]) -> List[Subj
     the other cloud's registry."""
     if provider is None:
         return produced
+    from fluid_build.iac.provider_match import canonical_cloud
+
     from .produced import REGISTERING_CLOUD
 
-    return [s for s in produced if REGISTERING_CLOUD.get(s.ref.kind) == provider]
+    # The flag as the provider gate reads it (aliases, case, spaces): an unreadable
+    # spelling filters nothing out, so it can never skip a check.
+    cloud = canonical_cloud(str(provider).strip().lower())
+    if cloud not in REGISTERING_CLOUD.values():
+        return produced
+    return [s for s in produced if REGISTERING_CLOUD.get(s.ref.kind) == cloud]
 
 
 def _produced_checks(

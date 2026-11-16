@@ -215,8 +215,14 @@ def produced_set_errors(contract: Mapping[str, Any], produced: Sequence[Subject]
                 f"{ref.where}: packaging.containers.schemaRegistry is isolated, so this "
                 "product creates its registry, and the registry has no registryName"
             )
-        where = ref.glue_registry if ref.kind == "glue" else ref.url
-        key = (ref.kind, where, ref.subject)
+        # The emitters' own resource names: one Confluent subject per module whatever
+        # its url, and Glue names compared as OpenTofu names (punctuation folded).
+        from fluid_build.iac.naming import safe_ident
+
+        if ref.kind == "glue":
+            key = ("glue", safe_ident(f"{ref.glue_registry}_{ref.subject}"))
+        else:
+            key = ("confluent", safe_ident(str(ref.subject)))
         if key in seen:
             errors.append(
                 f"{ref.where}: subject {ref.subject!r} is also produced by {seen[key]}; "

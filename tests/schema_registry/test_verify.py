@@ -882,3 +882,18 @@ class TestPlanProvider:
         contract = produced_contract({"kind": "confluent", "url": "https://sr.example.com"})
         assert verify_consumed(contract, environ={}, provider="aws")[1] == []
         assert verify_consumed(contract, environ={})[1]
+
+
+@pytest.mark.parametrize("spelling", ["Confluent", " CONFLUENT ", "confluent"])
+def test_the_plan_provider_is_read_as_the_provider_gate_reads_it(spelling):
+    from .conftest import produced_contract
+
+    contract = produced_contract({"kind": "confluent", "url": "https://sr.example.com"})
+    assert verify_consumed(contract, environ={}, provider=spelling)[1]
+
+
+def test_an_unknown_provider_spelling_skips_nothing():
+    from .conftest import produced_contract
+
+    contract = produced_contract({"kind": "confluent", "url": "https://sr.example.com"})
+    assert verify_consumed(contract, environ={}, provider="nosuchcloud")[1]
