@@ -719,13 +719,10 @@ class TestCmdPublishEndToEnd:
         #   4. Printing the dry-run result does not raise
         assert code == 0
 
-    def test_publish_dry_run_payload_maps_product_consumes_to_access(self):
-        """DMM publishes product-to-product ``consumes[]`` as Access edges.
-
-        The raw ODPS-Bitol renderer still emits inputPorts, but Entropy CE
-        requires input-port ``sourceSystem`` values to resolve to SourceSystem
-        entities. Keeping product consumes as inputPorts duplicates graph nodes,
-        so the DMM provider removes those ports and emits Access agreements.
+    def test_publish_dry_run_payload_maps_product_consumes_to_input_ports_and_access(self):
+        """Each product-to-product ``consumes[]`` entry is an ODPS input port
+        naming the upstream contract (Entropy draws the edge from it) and an
+        Access agreement for the same upstream output port.
         """
         import yaml
 
@@ -746,7 +743,10 @@ class TestCmdPublishEndToEnd:
         assert payload["kind"] == "DataProduct"
         assert payload["id"] == fixture_contract["id"]
 
-        assert "inputPorts" not in payload
+        assert {(p["name"], p["contractId"]) for p in payload["inputPorts"]} == {
+            (consume["exposeId"], f"{consume['productId']}.{consume['exposeId']}")
+            for consume in fixture_contract["consumes"]
+        }
 
         expected_edges = {
             (consume["productId"], consume["exposeId"]) for consume in fixture_contract["consumes"]
