@@ -32,6 +32,13 @@ The free-form ``query_sql`` path (gated by ``--allow-sql``) goes
 through :func:`compile_free_form_sql` instead, which adds a stricter
 SELECT-only check on top of the allowlist.
 
+A query reads one expose. ``semantics.relationships`` (schema 0.7.7) is
+information here: ``describe`` returns it with the rest of the semantics
+block, and no query joins on it (cross-expose joins are phase 2 of
+RFC-semantics-tier1). A dimension's ``typeParams.validityParams`` is
+ignored: a validity window's bounds group like any time dimension, and
+no query is filtered to the version current at a point in time.
+
 Borrow-before-build — intentional divergence (per /borrow-before-build):
     Surveyed **MetricFlow** (dbt-labs, Apache-2.0; the OSI / Open
     Semantic Interchange reference compiler) and **Cube**. MetricFlow

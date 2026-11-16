@@ -1276,7 +1276,9 @@ def _run_contract_rules(
         # MCP query path and the dbt MetricFlow export. The emitters were fixed
         # to stop producing it; nothing caught it in a hand-authored or
         # third-party contract, which validated clean and then failed at query
-        # time with an opaque engine error.
+        # time with an opaque engine error. Also the references a JSON Schema
+        # cannot check: a relationship's target expose and columns, and a
+        # validity window's bounds and natural entity (0.7.7).
         try:
             from fluid_build.forge_datamodel.semantics_builder import (
                 validate_semantics_block,

@@ -13,6 +13,7 @@ exercise the minimum-schema-version gate.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import shutil
@@ -978,3 +979,311 @@ class TestPercentileRoundTrip:
         )
         contract, _ = DbtManifestImporter().import_to_contract(str(path))
         assert "measures" not in _expose(contract, "orders")["semantics"]
+
+
+# ── Schema 0.7.7: relationships and SCD validity windows ────────────────
+#
+# RFC-semantics-tier1 §4/§5, importer column: dbt `validity_params` come back
+# as `typeParams.validityParams`, and the entity graph's joins (a foreign
+# entity and the one primary/unique/natural entity of that name in the same
+# contract) as `semantics.relationships`. Only a contract that carries one
+# moves to the 0.7.7 preview that holds them.
+
+
+def _semantic_model(name: str, model: str, entities: list, dimensions: list = ()) -> dict:
+    return {
+        f"semantic_model.jaffle_shop.{name}": {
+            "name": name,
+            "resource_type": "semantic_model",
+            "package_name": "jaffle_shop",
+            "model": f"ref('{model}')",
+            "entities": entities,
+            "dimensions": list(dimensions),
+            "measures": [],
+            "depends_on": {"nodes": [f"model.jaffle_shop.{model}"]},
+            "config": {"enabled": True},
+        }
+    }
+
+
+_CUSTOMERS_SM = _semantic_model(
+    "customers", "customers", [{"name": "customer", "type": "primary", "expr": "customer_id"}]
+)
+
+_HISTORY_SM = _semantic_model(
+    "customer_history",
+    "stg_customers",
+    [{"name": "customer", "type": "natural", "expr": "customer_id"}],
+    [
+        {
+            "name": "valid_from",
+            "type": "time",
+            "type_params": {
+                "time_granularity": "day",
+                "validity_params": {"is_start": True, "is_end": False},
+            },
+        },
+        {
+            "name": "valid_to",
+            "type": "time",
+            "type_params": {
+                "time_granularity": "day",
+                "validity_params": {"is_start": False, "is_end": True},
+            },
+        },
+    ],
+)
+
+
+def _manifest_with_semantic_models(tmp_path: Path, *extra: dict) -> Path:
+    manifest = json.loads((FIXTURES / "manifest_v12.json").read_text())
+    for semantic_model in extra:
+        manifest["semantic_models"].update(copy.deepcopy(semantic_model))
+    out = tmp_path / "manifest.json"
+    out.write_text(json.dumps(manifest))
+    return out
+
+
+def _semantic_lint(contract: Dict[str, Any]) -> tuple:
+    from fluid_build.forge_datamodel.semantics_builder import validate_semantics_block
+
+    return validate_semantics_block(contract)
+
+
+class TestRelationshipAndValidityImport:
+    def test_a_project_without_them_keeps_the_stable_version(self, v12_contract):
+        contract, report = v12_contract
+        assert contract["fluidVersion"] == FluidSchemaManager.latest_bundled_version() == "0.7.6"
+        assert not any((e.get("semantics") or {}).get("relationships") for e in contract["exposes"])
+        assert not any("fluidVersion" in note for note in report.notes)
+
+    def test_entity_graph_join_becomes_a_relationship(self, tmp_path, schema_manager):
+        path = _manifest_with_semantic_models(tmp_path, _CUSTOMERS_SM)
+        contract, report = DbtManifestImporter().import_to_contract(str(path))
+        assert _expose(contract, "orders")["semantics"]["relationships"] == [
+            {
+                "name": "orders_to_customers",
+                "to": "customers",
+                "fromColumns": ["customer_id"],
+                "toColumns": ["customer_id"],
+                "cardinality": "many_to_one",
+            }
+        ]
+        assert any("relationships[orders_to_customers]" in m for m in report.mapped_one_to_one)
+        assert contract["fluidVersion"] == "0.7.7"
+        assert any("fluidVersion 0.7.7 (preview)" in note for note in report.notes)
+        result = schema_manager.validate_contract(
+            contract, schema_version="0.7.7", offline_only=True
+        )
+        assert result.is_valid, [getattr(e, "message", str(e)) for e in result.errors]
+        assert _semantic_lint(contract) == ([], [])
+
+    def test_validity_params_are_recovered(self, tmp_path, schema_manager):
+        path = _manifest_with_semantic_models(tmp_path, _HISTORY_SM)
+        contract, _ = DbtManifestImporter().import_to_contract(str(path))
+        dimensions = {
+            d["name"]: d for d in _expose(contract, "stg_customers")["semantics"]["dimensions"]
+        }
+        assert dimensions["valid_from"]["typeParams"] == {
+            "timeGranularity": "day",
+            "validityParams": {"isStart": True},
+        }
+        assert dimensions["valid_to"]["typeParams"]["validityParams"] == {"isEnd": True}
+        # A foreign entity joins a natural (SCD) key too.
+        assert _expose(contract, "orders")["semantics"]["relationships"][0]["to"] == "stg_customers"
+        assert contract["fluidVersion"] == "0.7.7"
+        result = schema_manager.validate_contract(
+            contract, schema_version="0.7.7", offline_only=True
+        )
+        assert result.is_valid, [getattr(e, "message", str(e)) for e in result.errors]
+        assert _semantic_lint(contract) == ([], [])
+
+    def test_every_target_of_the_entity_gets_a_relationship(self, tmp_path):
+        """MetricFlow joins a foreign entity to each model keyed on its name."""
+        path = _manifest_with_semantic_models(tmp_path, _CUSTOMERS_SM, _HISTORY_SM)
+        contract, report = DbtManifestImporter().import_to_contract(str(path))
+        relationships = _expose(contract, "orders")["semantics"]["relationships"]
+        assert [(r["name"], r["to"]) for r in relationships] == [
+            ("orders_to_customers", "customers"),
+            ("orders_to_stg_customers", "stg_customers"),
+        ]
+        assert not any("relationship" in u for u in report.unsupported)
+        assert _semantic_lint(contract) == ([], [])
+
+    def test_an_expression_key_is_reported_not_written(self, tmp_path):
+        expression = _semantic_model(
+            "customers",
+            "customers",
+            [{"name": "customer", "type": "primary", "expr": "CAST(customer_id AS INT)"}],
+        )
+        path = _manifest_with_semantic_models(tmp_path, expression)
+        contract, report = DbtManifestImporter().import_to_contract(str(path))
+        assert "relationships" not in _expose(contract, "orders")["semantics"]
+        assert any("is not a column both exposes declare" in u for u in report.unsupported)
+
+    def test_a_target_in_another_product_is_reported_not_written(self, tmp_path):
+        staged = _semantic_model(
+            "stg_orders",
+            "stg_orders",
+            [{"name": "customer", "type": "foreign", "expr": "customer_id"}],
+        )
+        path = _manifest_with_semantic_models(tmp_path, _CUSTOMERS_SM, staged)
+        contracts, report = DbtManifestImporter().import_to_contracts(
+            str(path), options={"split_by": "folder"}
+        )
+        exposes = {e["exposeId"]: e for c in contracts for e in c["exposes"]}
+        assert "relationships" not in exposes["stg_orders"]["semantics"]
+        assert any(
+            "foreign entity 'customer' joins customers in another product" in u
+            for u in report.unsupported
+        ), report.unsupported
+        # The marts product still gets its own join, and only it moves to 0.7.7.
+        assert exposes["orders"]["semantics"]["relationships"][0]["to"] == "customers"
+        versions = {
+            c["id"]: c["fluidVersion"]
+            for c in contracts
+            if any(e["exposeId"] == "orders" for e in c["exposes"])
+        }
+        assert set(versions.values()) == {"0.7.7"}
+        assert {c["fluidVersion"] for c in contracts if c["id"] not in versions} <= {"0.7.6"}
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_validity_window_and_relationship_survive_a_dbt_round_trip(tmp_path: Path, schema_manager):
+    """contract → fluid generate (dbt) → real ``dbt parse`` → fluid import → contract.
+
+    The bridge exports the window field for field; the importer reads it back and
+    re-derives the relationship from the entity pair the contract declares.
+    """
+    dbt = Path(sys.executable).parent / "dbt"
+    dbt_cli = str(dbt) if dbt.exists() else shutil.which("dbt")
+    if dbt_cli is None:
+        pytest.skip("dbt CLI not available")
+    from fluid_build.engines.dbt import DbtEngine
+
+    def expose(expose_id: str, columns: list, semantics: dict) -> dict:
+        return {
+            "exposeId": expose_id,
+            "kind": "table",
+            "contract": {"schema": [{"name": c, "type": "STRING"} for c in columns]},
+            "semantics": semantics,
+        }
+
+    window = {
+        "valid_from": {"isStart": True},
+        "valid_to": {"isEnd": True},
+    }
+    contract = {
+        "fluidVersion": "0.7.7",
+        "kind": "DataProduct",
+        "id": "gold.analytics.orders_v1",
+        "name": "Orders",
+        "builds": [
+            {
+                "id": "main",
+                "engine": "dbt",
+                "pattern": "hybrid-reference",
+                "execution": {"runtime": {"platform": "local"}},
+            }
+        ],
+        "exposes": [
+            expose(
+                "orders",
+                ["order_id", "customer_id", "ordered_at", "amount"],
+                {
+                    "name": "orders",
+                    "defaultAggTimeDimension": "ordered_at",
+                    "entities": [
+                        {"name": "order", "type": "primary", "expr": "order_id"},
+                        {"name": "customer", "type": "foreign", "expr": "customer_id"},
+                    ],
+                    "relationships": [
+                        {
+                            "name": "orders_to_customer_history",
+                            "to": "customer_history",
+                            "fromColumns": ["customer_id"],
+                            "toColumns": ["customer_id"],
+                            "cardinality": "many_to_one",
+                        }
+                    ],
+                    "dimensions": [
+                        {
+                            "name": "ordered_at",
+                            "type": "time",
+                            "typeParams": {"timeGranularity": "day"},
+                        }
+                    ],
+                    "measures": [{"name": "order_total", "agg": "sum", "expr": "amount"}],
+                    "metrics": [
+                        {"name": "order_total", "type": "simple", "measure": "order_total"}
+                    ],
+                },
+            ),
+            expose(
+                "customer_history",
+                ["customer_id", "segment", "valid_from", "valid_to"],
+                {
+                    "name": "customer_history",
+                    "entities": [{"name": "customer", "type": "natural", "expr": "customer_id"}],
+                    "dimensions": [{"name": "segment", "type": "categorical"}]
+                    + [
+                        {
+                            "name": name,
+                            "type": "time",
+                            "typeParams": {"timeGranularity": "day", "validityParams": flags},
+                        }
+                        for name, flags in window.items()
+                    ],
+                },
+            ),
+        ],
+    }
+    project = tmp_path / "dbt_project"
+    files = DbtEngine().generate(contract, contract["builds"][0], output_dir=project)
+    project.mkdir(parents=True)
+    for rel_path, content in files.items():
+        (project / rel_path).parent.mkdir(parents=True, exist_ok=True)
+        (project / rel_path).write_text(content, encoding="utf-8")
+    result = subprocess.run(
+        [dbt_cli, "parse", "--project-dir", str(project), "--profiles-dir", str(project)],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=project,
+        timeout=300,
+    )
+    assert result.returncode == 0, f"dbt parse failed:\n{result.stdout}\n{result.stderr}"
+
+    imported, _ = DbtManifestImporter().import_to_contract(str(project))
+    assert imported["fluidVersion"] == "0.7.7"
+    history = _expose(imported, "customer_history")["semantics"]
+    assert {
+        d["name"]: d["typeParams"]["validityParams"]
+        for d in history["dimensions"]
+        if "validityParams" in d.get("typeParams", {})
+    } == window
+    assert [e["type"] for e in history["entities"]] == ["natural"]
+    assert _expose(imported, "orders")["semantics"]["relationships"] == (
+        contract["exposes"][0]["semantics"]["relationships"]
+    )
+    check = schema_manager.validate_contract(imported, schema_version="0.7.7", offline_only=True)
+    assert check.is_valid, [getattr(e, "message", str(e)) for e in check.errors]
+    assert _semantic_lint(imported) == ([], [])
+
+
+def test_the_import_report_prints_bracketed_paths_literally(capsys):
+    """Report items quote expose paths (``exposes[orders]``); Rich markup must not eat them."""
+    from fluid_build.cli._import_workflow_handler import _print_report
+    from fluid_build.cli.import_workflow.registry import ImportReport
+
+    report = ImportReport(
+        mapped_one_to_one=["semantic_model.orders → exposes[orders].semantics"],
+        unsupported=["semantic model orders: foreign entity 'customer' matches [bold]2[/bold]"],
+        notes=["[x]: fluidVersion 0.7.7 (preview)"],
+    )
+    _print_report(report)
+    out = capsys.readouterr().out
+    assert "exposes[orders].semantics" in out
+    assert "[bold]2[/bold]" in out
+    assert "[x]: fluidVersion 0.7.7" in out

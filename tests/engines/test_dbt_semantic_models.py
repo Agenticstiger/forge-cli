@@ -775,3 +775,195 @@ def test_every_emitted_semantic_ref_resolves_to_an_emitted_model():
         )
         dangling = [r for r in _emitted_refs(generated) if r not in _model_basenames(generated)]
         assert not dangling, f"dangling semantic refs {dangling} (intent={intent is not None})"
+
+
+# ---------------------------------------------------------------------------
+# Schema 0.7.7: SCD validity windows map field for field; relationships do not
+# export (MetricFlow joins by entity name). dbt runs its semantic rules only
+# when the project has a metric, so the live proof declares one on orders.
+# ---------------------------------------------------------------------------
+
+
+def _scd_contract(**history_overrides: Any) -> Dict[str, Any]:
+    """Orders (fact, with a relationship and a metric) and an SCD customer history."""
+    contract = _contract(semantics=_semantics())
+    contract["fluidVersion"] = "0.7.7"
+    orders = contract["exposes"][0]
+    orders["contract"]["schema"].append({"name": "customer_id", "type": "STRING"})
+    orders["semantics"]["relationships"] = [
+        {
+            "name": "orders_to_customer_history",
+            "to": "customer_history",
+            "fromColumns": ["customer_id"],
+            "toColumns": ["customer_id"],
+            "cardinality": "many_to_one",
+        }
+    ]
+    history: Dict[str, Any] = {
+        "name": "customer_history",
+        "entities": [
+            {"name": "customer_sk", "type": "primary"},
+            {"name": "customer", "type": "natural", "expr": "customer_id"},
+        ],
+        "dimensions": [
+            {"name": "segment", "type": "categorical"},
+            {
+                "name": "valid_from",
+                "type": "time",
+                "typeParams": {"timeGranularity": "day", "validityParams": {"isStart": True}},
+            },
+            {
+                "name": "valid_to",
+                "type": "time",
+                "typeParams": {"timeGranularity": "day", "validityParams": {"isEnd": True}},
+            },
+        ],
+        "measures": [{"name": "versions", "agg": "count", "expr": "1"}],
+    }
+    history.update(history_overrides)
+    contract["exposes"].append(
+        {
+            "exposeId": "customer_history",
+            "kind": "table",
+            "contract": {
+                "schema": [
+                    {"name": "customer_sk", "type": "STRING", "primaryKey": True},
+                    {"name": "customer_id", "type": "STRING"},
+                    {"name": "segment", "type": "STRING"},
+                    {"name": "valid_from", "type": "TIMESTAMP"},
+                    {"name": "valid_to", "type": "TIMESTAMP"},
+                ]
+            },
+            "semantics": history,
+        }
+    )
+    return contract
+
+
+def _dimension(model: Dict[str, Any], name: str) -> Dict[str, Any]:
+    return next(d for d in model["dimensions"] if d["name"] == name)
+
+
+@pytest.mark.unit
+class TestValidityWindow:
+    def test_bounds_map_to_validity_params(self):
+        history = _model(_emit(_scd_contract()), "customer_history")
+        assert _dimension(history, "valid_from")["type_params"] == {
+            "time_granularity": "day",
+            "validity_params": {"is_start": True},
+        }
+        assert _dimension(history, "valid_to")["type_params"] == {
+            "time_granularity": "day",
+            "validity_params": {"is_end": True},
+        }
+        assert "type_params" not in _dimension(history, "segment")
+
+    def test_model_takes_dbt_scd_type_ii_shape(self, caplog):
+        with caplog.at_level("WARNING"):
+            history = _model(_emit(_scd_contract()), "customer_history")
+        # The natural entity is the primary entity; dbt rejects primary/unique
+        # entities and measures beside a validity window, so they are dropped loudly.
+        assert history["primary_entity"] == "customer"
+        assert history["entities"] == [
+            {"name": "customer", "type": "natural", "expr": "customer_id"}
+        ]
+        assert "measures" not in history and "defaults" not in history
+        assert "dropping primary entity 'customer_sk' on customer_history" in caplog.text
+        assert "measures beside a validity window" in caplog.text
+
+    def test_foreign_entities_stay_beside_a_window(self):
+        contract = _scd_contract()
+        contract["exposes"][1]["semantics"]["entities"].append(
+            {"name": "region", "type": "foreign", "expr": "segment"}
+        )
+        history = _model(_emit(contract), "customer_history")
+        assert [e["type"] for e in history["entities"]] == ["natural", "foreign"]
+
+    def test_natural_entity_without_a_window_is_dropped(self, caplog):
+        contract = _contract(
+            semantics=_semantics(
+                entities=[{"name": "order_key", "type": "natural", "expr": "order_id"}]
+            )
+        )
+        with caplog.at_level("WARNING"):
+            orders = _model(_emit(contract))
+        # dbt accepts a natural entity only with a validity window; the
+        # primary entity is derived from the key column instead.
+        assert [e["type"] for e in orders["entities"]] == ["primary"]
+        assert "primary_entity" not in orders
+        assert "dropping natural entity 'order_key'" in caplog.text
+
+    def test_malformed_window_is_dropped_whole(self, caplog):
+        contract = _scd_contract()
+        del contract["exposes"][1]["semantics"]["dimensions"][2]["typeParams"]["validityParams"]
+        with caplog.at_level("WARNING"):
+            history = _model(_emit(contract), "customer_history")
+        assert all(
+            "validity_params" not in (d.get("type_params") or {}) for d in history["dimensions"]
+        )
+        assert [e["type"] for e in history["entities"]] == ["primary"]
+        assert "primary_entity" not in history
+        assert "do not form a validity window" in caplog.text
+
+    def test_relationships_are_informational(self):
+        with_relationships = generate_semantic_models(_scd_contract())
+        contract = _scd_contract()
+        del contract["exposes"][0]["semantics"]["relationships"]
+        assert generate_semantic_models(contract) == with_relationships
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_scd_project_passes_dbt_parse_and_keeps_the_window(tmp_path: Path):
+    """ACCEPTANCE: real dbt-core parses a project with a validity window, and its
+    semantic manifest carries the bounds and the natural primary entity."""
+    dbt = _find_dbt()
+    if dbt is None:
+        pytest.skip("dbt CLI not available")
+    contract = _scd_contract()
+    out_dir = tmp_path / "dbt_project"
+    files = DbtEngine().generate(contract, contract["builds"][0], output_dir=out_dir)
+    out_dir.mkdir(parents=True)
+    for rel_path, content in files.items():
+        target = out_dir / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    result = subprocess.run(
+        [dbt, "parse", "--project-dir", str(out_dir), "--profiles-dir", str(out_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=out_dir,
+        timeout=300,
+    )
+    assert result.returncode == 0, f"dbt parse failed:\n{result.stdout}\n{result.stderr}"
+
+    import json
+
+    manifest = json.loads((out_dir / "target" / "semantic_manifest.json").read_text())
+    assert manifest["metrics"], "dbt validates semantic models only when a metric exists"
+    history = next(m for m in manifest["semantic_models"] if m["name"] == "customer_history")
+    assert history["primary_entity"] == "customer"
+    bounds = {
+        d["name"]: d["type_params"]["validity_params"]
+        for d in history["dimensions"]
+        if (d.get("type_params") or {}).get("validity_params")
+    }
+    assert bounds == {
+        "valid_from": {"is_start": True, "is_end": False},
+        "valid_to": {"is_start": False, "is_end": True},
+    }
+
+
+@pytest.mark.unit
+def test_a_window_bound_that_shares_a_name_drops_the_window(caplog):
+    """The first of two names wins, so a bound named like an entity would leave dbt one bound."""
+    contract = _scd_contract()
+    history = contract["exposes"][1]["semantics"]
+    history["entities"].append({"name": "valid_from", "type": "foreign", "expr": "segment"})
+    with caplog.at_level("WARNING"):
+        model = _model(_emit(contract), "customer_history")
+    assert all("validity_params" not in (d.get("type_params") or {}) for d in model["dimensions"])
+    assert "primary_entity" not in model
+    assert "do not form a validity window" in caplog.text

@@ -1194,3 +1194,61 @@ def test_two_dimensions_with_one_output_name_are_rejected():
             limit=10,
             table_reference="orders",
         )
+
+
+# ---------------------------------------------------------------------
+# Schema 0.7.7 (RFC-semantics-tier1 v1): relationships are information and
+# validity window bounds are ignored on the governed path. No join yet.
+# ---------------------------------------------------------------------
+
+
+_RELATIONSHIP = {
+    "name": "customer_profiles_to_customer_profiles",
+    "to": "customer_profiles",
+    "fromColumns": ["customer_id"],
+    "toColumns": ["customer_id"],
+    "cardinality": "one_to_one",
+}
+
+
+def test_relationships_and_validity_params_do_not_change_the_compiled_query():
+    annotated = _expose_with_semantics()
+    annotated["semantics"]["relationships"] = [dict(_RELATIONSHIP)]
+    annotated["semantics"]["dimensions"][0]["typeParams"] = {"validityParams": {"isStart": True}}
+
+    def compile_for(expose):
+        return compile_semantic_query(
+            expose=expose,
+            metric="active_customers",
+            dimensions=["signup_date"],
+            filters={"signup_date": "2026-01-01"},
+            limit=10,
+            table_reference="customer_profiles",
+        )
+
+    plain, with_fields = compile_for(_expose_with_semantics()), compile_for(annotated)
+    assert with_fields.sql == plain.sql
+    assert with_fields.params == plain.params
+    assert "JOIN" not in with_fields.sql.upper()
+
+
+def test_describe_returns_relationships_as_information():
+    from types import SimpleNamespace
+
+    from fluid_build.output_ports.mcp import _handlers
+
+    expose = _expose_with_semantics()
+    expose["semantics"]["relationships"] = [dict(_RELATIONSHIP)]
+    descriptor = SimpleNamespace(
+        platform="local",
+        format="csv",
+        table_reference="customer_profiles",
+        dialect="duckdb",
+        capabilities={},
+    )
+    state = SimpleNamespace(
+        expose=expose,
+        get_driver=lambda: SimpleNamespace(descriptor=lambda: descriptor),
+    )
+    payload = _handlers.tool_describe(state)
+    assert payload["semantics"]["relationships"] == [_RELATIONSHIP]
