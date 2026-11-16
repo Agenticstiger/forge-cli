@@ -8,22 +8,26 @@ Actions ``::group::``, GitLab collapsible sections, Azure Pipelines
 ``##[group]``. Anywhere else the stage gets a one-line banner.
 
 GitHub Actions parses workflow commands out of every line a step prints,
-including a child process's. So the child runs between
-``::stop-commands::<token>`` and ``::<token>::`` with a fresh random token per
-stage: text the child prints (a contract field, a provider error) cannot issue
-a workflow command.
+including a child process's. So each stage's whole body (ship's own reads of
+the contract and the child it runs) sits between ``::stop-commands::<token>``
+and ``::<token>::``, with a fresh random token per stage, and the child's
+stderr joins its stdout so no late line overtakes the resume token: text from
+the checkout (a contract field, an overlay id, a provider error) cannot issue
+a workflow command. Ship's own lines are flattened to one line (:func:`oneline`)
+and its probes of the contract print nothing (``_ship_stages._quiet_probe``).
 
 Standard library only; imported lazily by ``fluid ship``.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import secrets
 import sys
 import time
-from typing import IO, Callable, List, Mapping, Optional, Sequence, Tuple
+from typing import IO, Callable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 MODES = ("auto", "github", "gitlab", "azure", "plain")
 
@@ -90,6 +94,7 @@ class CiOutput:
         self._clock = clock
         self._token_factory = token_factory
         self._token: Optional[str] = None
+        self._depth = 0
 
     @property
     def out(self) -> IO[str]:
@@ -124,15 +129,38 @@ class CiOutput:
             self.line(f"── stage {num}/{total} · {name} " + "─" * 40)
 
     def before_child(self) -> None:
+        """Open the GitHub stop-commands fence. Re-entrant: a stage's whole body
+        is fenced (ship's own contract reads included), and the child inside it
+        re-enters without printing a second token."""
         if self.flavour == "github":
-            self._token = self._token_factory()
-            self.line(f"::stop-commands::{self._token}")
+            if self._depth == 0:
+                self._token = self._token_factory()
+                self.line(f"::stop-commands::{self._token}")
+            self._depth += 1
         self.flush()
 
     def after_child(self) -> None:
-        if self.flavour == "github" and self._token is not None:
-            self.line(f"::{self._token}::")
-            self._token = None
+        if self.flavour == "github" and self._depth:
+            self._depth -= 1
+            if self._depth == 0 and self._token is not None:
+                self.flush()
+                self.line(f"::{self._token}::")
+                self._token = None
+
+    @contextlib.contextmanager
+    def fenced(self) -> Iterator[None]:
+        """Nothing printed inside, by ship or by a child, can issue a workflow command."""
+        self.before_child()
+        try:
+            yield
+        finally:
+            self.after_child()
+
+    @property
+    def merge_child_stderr(self) -> bool:
+        """On GitHub a child's stderr joins its stdout, one pipe: a late stderr
+        line cannot reach the runner after the fence's resume token."""
+        return self.flavour == "github"
 
     def stage_end(self, num: int, name: str) -> None:
         if self.flavour == "github":

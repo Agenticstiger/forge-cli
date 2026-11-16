@@ -16,10 +16,25 @@ contract) is imported inside the function that needs it.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, NoReturn, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    NoReturn,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 BUNDLE_PATH = "runtime/bundle.tgz"
 PLAN_PATH = "runtime/plan.json"
@@ -162,10 +177,15 @@ def _resolve_build_id(flag: object, env: Mapping[str, str]) -> Optional[str]:
 
 
 def _resolve_targets(flags: Sequence[object], env: Mapping[str, str]) -> List[str]:
-    """``--target`` (repeatable) > ``$PUBLISH_TARGETS`` (space-separated) > the default."""
+    """``--target`` (repeatable) > ``$PUBLISH_TARGETS`` > the legacy ``$CATALOG`` >
+    the default, as the generated pipelines' ``${PUBLISH_TARGETS:-${CATALOG:-...}}``."""
     if flags:
         return [str(t) for t in flags]
-    return env.get("PUBLISH_TARGETS", "").split() or [DEFAULT_PUBLISH_TARGET]
+    return (
+        env.get("PUBLISH_TARGETS", "").split()
+        or env.get("CATALOG", "").split()
+        or [DEFAULT_PUBLISH_TARGET]
+    )
 
 
 def _resolve_env_name(flag_env: Optional[str], env: Mapping[str, str]) -> str:
@@ -368,10 +388,27 @@ def _skip_after_dry_run(opts: ShipOptions, what: str) -> Optional[str]:
     return None
 
 
+@contextlib.contextmanager
+def _quiet_probe() -> Iterator[None]:
+    """Ship's own look into the contract (is it reference-only? its one build?)
+    prints and logs nothing. Loading it warns about the overlays with their ids
+    copied in verbatim (``overlay_entry_added``), and on GitHub Actions a line of
+    the checkout's text is a workflow command; the stage children load the same
+    files and report them inside the stop-commands fence."""
+    previous = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            yield
+    finally:
+        logging.disable(previous)
+
+
 def _contract_reference_only(contract: str) -> bool:
     from fluid_build.cli.generate_ci import _contract_is_reference_only
 
-    return bool(_contract_is_reference_only(contract))
+    with _quiet_probe():
+        return bool(_contract_is_reference_only(contract))
 
 
 def _effective_build_id(opts: ShipOptions) -> str:
@@ -379,7 +416,8 @@ def _effective_build_id(opts: ShipOptions) -> str:
         return opts.build_id
     from fluid_build.cli.generate_ci import _single_build_id
 
-    return str(_single_build_id(opts.contract) or "")
+    with _quiet_probe():
+        return str(_single_build_id(opts.contract) or "")
 
 
 def build_stage(num: int, opts: ShipOptions, ws: Workspace) -> StageAction:
@@ -391,11 +429,13 @@ def build_stage(num: int, opts: ShipOptions, ws: Workspace) -> StageAction:
 
 
 def _bundle(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
-    if o.skip_bundle and ws.has_file(BUNDLE_PATH):
-        a.skip_reason = f"--skip-bundle: reusing {BUNDLE_PATH}"
-        return
     if o.skip_bundle:
-        a.notes.append(f"--skip-bundle: {BUNDLE_PATH} not found, bundling anyway")
+        # Reusing runtime/bundle.tgz could apply an older contract than the one
+        # given, with exit 0; bundling takes about a second, so ship always does.
+        a.notes.append(
+            "--skip-bundle is ignored: ship always bundles, so every later stage runs "
+            "the contract as it is now"
+        )
     a.argv = ["bundle", o.contract, *_env_args(o), "--format", "tgz", "--out", BUNDLE_PATH]
 
 
@@ -466,8 +506,10 @@ def _apply(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
         "--report",
         "runtime/apply-report.html",
     ]
-    build_id = _effective_build_id(o)
     if o.mode in BUILD_APPLY_MODES:
+        # Derived from the contract only here, where apply uses it: other
+        # modes never read the contract in the ship process.
+        build_id = _effective_build_id(o)
         if build_id:
             argv += ["--build-id", build_id]
     elif o.build_id:  # only an id the operator gave, never one derived from the contract
@@ -625,16 +667,18 @@ def _generation_expected(opts: ShipOptions) -> bool:
     return opts.generate_artifacts and not _contract_reference_only(opts.contract)
 
 
-def project_relative_contract(contract: str, cwd: Optional[str] = None) -> str:
-    """The contract as a cwd-relative POSIX path, or a usage error when it is
-    outside the project: ship runs from the project root, and
-    ``generate artifacts --contract-path`` refuses any other form."""
+def project_location(contract: str, cwd: Optional[str] = None) -> Tuple[str, str]:
+    """``(directory to run in, contract path relative to it in POSIX form)``.
+
+    A contract below the current directory keeps it as the project root, so a
+    checkout-relative path such as ``products/a/contract.fluid.yaml`` is what
+    ``generate artifacts --contract-path`` records. A contract anywhere else
+    (``fluid ship /tmp/x/contract.fluid.yaml``, as Command Center calls it) runs in
+    its own directory.
+    """
     base = os.path.realpath(cwd or os.getcwd())
     target = os.path.realpath(os.path.join(base, contract))
     rel = os.path.relpath(target, base)
     if rel == ".." or rel.startswith(".." + os.sep) or os.path.isabs(rel):
-        raise ShipUsageError(
-            f"contract {contract!r} is outside the project directory {base}: ship runs from the "
-            "project root and the contract must be inside it (cd there, or pass a path under it)"
-        )
-    return Path(rel).as_posix()
+        return os.path.dirname(target), os.path.basename(target)
+    return base, Path(rel).as_posix()

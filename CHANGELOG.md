@@ -302,14 +302,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `diff`, `policy-apply` and `verify` now run, and `validate` and `validate-artifacts` are
     strict by default (`--no-strict` drops it). `--env` defaults to `dev`.
   - `--skip-plan` is removed and exits 2; `--stage` and `--until` replace it.
-  - `--skip-bundle` reuses an existing `runtime/bundle.tgz` (it bundles, with a warning, if
-    there is none).
-  - The contract must be inside the current directory, and the environment name one every
-    stage accepts; ship exits 2 otherwise, before any stage runs.
+  - `--skip-bundle` is ignored: ship always bundles, so no stage plans or applies a stale
+    `runtime/bundle.tgz`.
+  - A contract outside the current directory runs in its own directory (its `runtime/` lands
+    beside it). An environment name a stage would refuse exits 2 before any stage runs.
   - Every run writes `runtime/ship-report.json` and `runtime/ship-junit.xml`
-    (`--report-dir`); calls of one run id merge into one report. Output is grouped for GitHub
-    Actions, GitLab and Azure Pipelines (`--ci-output`), and a child's output cannot issue
-    workflow commands.
+    (`--report-dir`). Calls that continue one run (same run id, env, mode and contract)
+    merge into one report; a run that bundles starts a new one. Output is grouped for GitHub
+    Actions, GitLab and Azure Pipelines (`--ci-output`). On GitHub nothing a stage prints, nor
+    ship's own reading of the contract and its overlays, can issue a workflow command.
 - **The secret destination policy covers every scheme, not only `env://`.** A value from
   `vault://`, `aws-sm://`, `file://` or a pack is sent to a host that leaves this machine only
   when the operator allows it: `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` keeps `NAME` and

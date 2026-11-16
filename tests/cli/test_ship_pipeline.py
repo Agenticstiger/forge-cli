@@ -93,6 +93,7 @@ class FakeRun:
         self.rcs = rcs or {}
         self.calls: List[List[str]] = []
         self.envs: List[Dict[str, str]] = []
+        self.stderrs: List[object] = []
 
     def __call__(self, cmd: List[str], **kwargs: object) -> subprocess.CompletedProcess:
         assert cmd[1:3] == ["-m", "fluid_build.cli"]
@@ -101,6 +102,7 @@ class FakeRun:
         env = kwargs.get("env")
         assert isinstance(env, dict)
         self.envs.append(env)
+        self.stderrs.append(kwargs.get("stderr"))
         stage = argv[0]
         if stage == "bundle":
             Path("runtime").mkdir(exist_ok=True)
@@ -571,21 +573,17 @@ def test_skip_plan_is_refused(work: Path, fake: FakeRun, caplog: pytest.LogCaptu
     assert "--stage" in caplog.text and fake.calls == []
 
 
-def test_skip_bundle_reuses_an_existing_bundle(work: Path, fake: FakeRun) -> None:
-    (work / "runtime").mkdir()
-    (work / "runtime/bundle.tgz").write_bytes(b"x")
-    assert ship_run(["--skip-bundle", "--yes", "--until", "validate"]) == 0
-    assert fake.stages == ["validate"]
-    stage1 = json.loads((work / "runtime/ship-report.json").read_text())["stages"][0]
-    assert stage1["status"] == "skipped" and "reusing" in stage1["skip_reason"]
-
-
-def test_skip_bundle_without_a_bundle_warns_and_bundles(
+def test_skip_bundle_is_ignored_so_a_stale_bundle_is_never_applied(
     work: Path, fake: FakeRun, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert ship_run(["--skip-bundle", "--until", "validate"]) == 0
+    # A reused runtime/bundle.tgz could hold an older contract than the one given,
+    # and stages 2-9 would plan, apply and verify it with exit 0.
+    (work / "runtime").mkdir()
+    (work / "runtime/bundle.tgz").write_bytes(b"stale")
+    assert ship_run(["--skip-bundle", "--yes", "--until", "validate"]) == 0
     assert fake.stages == ["bundle", "validate"]
-    assert "bundling anyway" in capsys.readouterr().out
+    assert (work / "runtime/bundle.tgz").read_bytes() == b"x"  # rebuilt, not reused
+    assert "--skip-bundle is ignored" in capsys.readouterr().out
 
 
 def test_explain_runs_nothing_writes_nothing_and_exits_zero(
@@ -636,19 +634,23 @@ def test_absolute_contract_under_the_cwd_becomes_relative(work: Path, fake: Fake
     assert fake.calls[-1][1] == "sub/c.fluid.yaml"
 
 
-def test_contract_outside_the_cwd_is_refused_before_any_stage(
+def test_a_contract_outside_the_cwd_runs_in_its_own_directory(
     work: Path,
     fake: FakeRun,
     tmp_path_factory: pytest.TempPathFactory,
-    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    other = tmp_path_factory.mktemp("elsewhere") / "contract.fluid.yaml"
-    other.write_text("id: x\n")
-    with caplog.at_level(logging.ERROR):
-        assert ship_run([str(other), "--yes"]) == 2
-        assert ship_run(["../escape.fluid.yaml", "--yes"]) == 2
-    assert "outside the project directory" in caplog.text
-    assert fake.calls == []
+    # Command Center's call: an absolute path into a per-call temp dir, from the
+    # backend's own working directory.
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    (elsewhere / "contract.fluid.yaml").write_text("fluidVersion: '0.7.5'\nid: x.y\n")
+    argv = [str(elsewhere / "contract.fluid.yaml"), "--yes", "--skip-bundle", "--env", "dev"]
+    assert ship_run([*argv, "--no-strict", "--until", "bundle"]) == 0
+    assert fake.calls[0][1] == "contract.fluid.yaml"
+    assert (elsewhere / "runtime/bundle.tgz").is_file() and not (work / "runtime").exists()
+    assert (elsewhere / "runtime/ship-report.json").is_file()
+    assert Path.cwd() == work  # ship's own directory change is undone
+    assert f"running in {elsewhere}" in capsys.readouterr().out
 
 
 def test_stage_four_without_artifacts_is_refused_when_generation_is_expected(
@@ -1031,3 +1033,225 @@ def test_apply_stage_in_a_clean_dir_exits_two(tmp_path: Path) -> None:
     done = _cli(tmp_path, "ship", "--stage", "apply", "--yes")
     assert done.returncode == 2
     assert "stage 7 apply needs runtime/plan.json" in done.stdout + done.stderr
+
+
+# ---------------------------------------------------------------------------
+# 6. Review round: the fence covers ship's own contract reads (security judge)
+# ---------------------------------------------------------------------------
+
+_HOSTILE = "zz\n::warning title=INJECTED::from-the-checkout\n"
+
+
+def _lines_outside_fences(text: str) -> List[str]:
+    """Every line GitHub would parse for workflow commands: those not between
+    ``::stop-commands::<token>`` and ``::<token>::``."""
+    outside: List[str] = []
+    token: Optional[str] = None
+    for line in text.replace("\r", "\n").splitlines():
+        match = re.fullmatch(r"::stop-commands::([0-9a-f]{32})", line)
+        if token is None and match:
+            token = match.group(1)
+        elif token is not None and line == f"::{token}::":
+            token = None
+        elif token is None:
+            outside.append(line)
+    return outside
+
+
+_OWN_MARKERS = re.compile(r"::(group::.*|endgroup::|error title=fluid ship::.*)")
+
+
+def test_parent_side_contract_reads_cannot_issue_workflow_commands(
+    work: Path,
+    fake: FakeRun,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The build id is read from the contract in the ship process; loading it
+    # warns about overlay entries with their ids copied in (overlay_entry_added).
+    import fluid_build.cli.generate_ci as generate_ci
+
+    def hostile_single_build_id(contract: str) -> str:
+        logging.getLogger("fluid_build.loader").warning("overlay adds exposeId %s", _HOSTILE)
+        print(f"printed by the probe: {_HOSTILE}")
+        return "b1"
+
+    monkeypatch.setattr(generate_ci, "_single_build_id", hostile_single_build_id)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    Path("runtime").mkdir()
+    Path("runtime/bundle.tgz").write_bytes(b"x")
+    Path("runtime/plan.json").write_text("{}")
+    with caplog.at_level(logging.WARNING):
+        assert ship_run(["--stage", "apply", "--apply-mode", "amend-and-build", "--yes"]) == 0
+    assert fake.calls[-1][-2:] == ["--build-id", "b1"]
+    out = capsys.readouterr()
+    outside = [ln for ln in _lines_outside_fences(out.out + out.err) if ln.startswith("::")]
+    assert [ln for ln in outside if not _OWN_MARKERS.fullmatch(ln)] == []
+    assert "INJECTED" not in caplog.text  # the probe's log is silenced, not printed
+
+
+def test_build_id_is_derived_from_the_contract_only_in_build_modes(
+    work: Path, fake: FakeRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fluid_build.cli.generate_ci as generate_ci
+
+    def must_not_run(contract: str) -> str:
+        raise AssertionError("the contract was read for a build id a non-build mode ignores")
+
+    monkeypatch.setattr(generate_ci, "_single_build_id", must_not_run)
+    Path("runtime").mkdir()
+    Path("runtime/bundle.tgz").write_bytes(b"x")
+    Path("runtime/plan.json").write_text("{}")
+    assert ship_run(["--stage", "apply", "--yes"]) == 0
+    assert "--build-id" not in fake.calls[-1]
+
+
+def test_on_github_each_stage_body_sits_inside_one_fence(
+    work: Path, fake: FakeRun, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert ship_run(["--until", "validate", "--yes"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    for num, name in ((1, "bundle"), (2, "validate")):
+        start = lines.index(f"::group::{num} · {name}")
+        end = lines.index("::endgroup::", start)
+        opened = re.fullmatch(r"::stop-commands::([0-9a-f]{32})", lines[start + 1])
+        assert opened, lines[start + 1]
+        assert lines[end - 1] == f"::{opened.group(1)}::"
+        # one fence per stage: the child re-enters it, no second token
+        assert sum(ln.startswith("::stop-commands::") for ln in lines[start:end]) == 1
+
+
+def test_child_stderr_joins_stdout_on_github_only(
+    work: Path, fake: FakeRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert ship_run(["--until", "bundle", "--ci-output", "plain"]) == 0
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert ship_run(["--until", "bundle"]) == 0
+    assert fake.stderrs == [None, subprocess.STDOUT]
+
+
+@pytest.mark.parametrize(
+    "bad_stage",
+    [
+        {"number": 2, "name": "validate", "status": "passed", "exit_code": "not-a-number"},
+        {"number": 2, "name": "validate", "status": "pwned"},
+        {"number": 99, "name": "x", "status": "passed"},
+    ],
+)
+def test_a_malformed_earlier_report_is_overwritten_not_trusted(
+    work: Path, fake: FakeRun, monkeypatch: pytest.MonkeyPatch, bad_stage: Dict[str, object]
+) -> None:
+    monkeypatch.setenv("FLUID_RUN_ID", "run-1")
+    Path("runtime").mkdir()
+    Path("runtime/ship-report.json").write_text(
+        json.dumps({"run_id": "run-1", "exit_code": 0, "stages": [bad_stage]})
+    )
+    assert ship_run(["--stage", "bundle"]) == 0
+    report = json.loads(Path("runtime/ship-report.json").read_text())
+    statuses = {s["number"]: s["status"] for s in report["stages"]}
+    assert statuses[1] == "passed" and statuses[2] == "not-run"
+    assert report["exit_code"] == 0
+
+
+def test_until_says_how_to_go_on(
+    work: Path, fake: FakeRun, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert ship_run(["--until", "plan", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "Stopped before stage 7 apply (--until). Review runtime/plan.json first." in out
+    assert "run the same command with --stage 7-9 in place of --until" in out
+
+
+def test_a_failed_stage_says_how_to_re_run_it(
+    work: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(ship.subprocess, "run", FakeRun({"validate": 1}))
+    with caplog.at_level(logging.ERROR):
+        assert ship_run(["--yes"]) == 1
+    assert "run the same command with --stage 2" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 7. Review round 2: run scope, Ctrl-C patience, the legacy CATALOG variable
+# ---------------------------------------------------------------------------
+
+
+def _report(work: Path) -> Dict[str, object]:
+    return json.loads((work / "runtime/ship-report.json").read_text())
+
+
+def test_a_run_that_bundles_starts_a_new_run(work: Path, fake: FakeRun) -> None:
+    assert ship_run(["--until", "bundle"]) == 0
+    first = _report(work)["run_id"]
+    assert ship_run(["--stage", "validate"]) == 0  # continues the run: one report
+    assert _report(work)["run_id"] == first
+    assert {s["number"]: s["status"] for s in _report(work)["stages"]}[1] == "passed"
+    assert ship_run(["--until", "bundle"]) == 0  # bundles again: a new run
+    assert _report(work)["run_id"] != first
+
+
+def test_a_later_stage_for_another_env_does_not_merge(work: Path, fake: FakeRun) -> None:
+    assert ship_run(["--until", "plan"]) == 0
+    assert ship_run(["--stage", "diff", "--env", "prod"]) == 0
+    statuses = {s["number"]: s["status"] for s in _report(work)["stages"]}
+    assert statuses[6] == "not-run" and _report(work)["env"] == "prod"
+
+
+def test_the_first_ctrl_c_lets_the_stage_stop_on_its_own(
+    work: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import signal
+
+    stages: List[str] = []
+
+    def child(cmd: List[str], **kwargs: object) -> subprocess.CompletedProcess:
+        stages.append(cmd[3])
+        os.kill(os.getpid(), signal.SIGINT)  # the terminal's Ctrl-C reaches ship too
+        return subprocess.CompletedProcess(cmd, 130)  # the child cleaned up and exited
+
+    monkeypatch.setattr(ship.subprocess, "run", child)
+    assert ship_run(["--yes"]) == 130
+    assert stages == ["bundle"]  # no stage after the interrupted one
+    assert "the stage is stopping on its own" in capsys.readouterr().out
+    by = {s["number"]: s for s in _report(work)["stages"]}
+    assert by[1]["failure_reason"] == "interrupted" and by[2]["status"] == "not-run"
+
+
+def test_a_second_ctrl_c_stops_waiting(work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import signal
+
+    def child(cmd: List[str], **kwargs: object) -> subprocess.CompletedProcess:
+        os.kill(os.getpid(), signal.SIGINT)
+        os.kill(os.getpid(), signal.SIGINT)  # raises KeyboardInterrupt: run() kills the child
+        raise AssertionError("the second Ctrl-C did not interrupt")
+
+    monkeypatch.setattr(ship.subprocess, "run", child)
+    assert ship_run(["--yes"]) == 130
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+def test_publish_targets_fall_back_to_the_legacy_catalog_variable() -> None:
+    assert st._resolve_targets([], {"CATALOG": "datahub"}) == ["datahub"]
+    assert st._resolve_targets([], {"PUBLISH_TARGETS": "a b", "CATALOG": "x"}) == ["a", "b"]
+    assert st._resolve_targets([], {"PUBLISH_TARGETS": " ", "CATALOG": "x"}) == ["x"]
+    assert st._resolve_targets(["t"], {"CATALOG": "x"}) == ["t"]
+
+
+def test_catalog_fallback_matches_the_generated_shell(tmp_path: Path) -> None:
+    config = PipelineConfig(
+        provider=PipelineProvider.GITHUB_ACTIONS,
+        complexity=PipelineComplexity.BASIC,
+        contract_path="contract.fluid.yaml",
+    )
+    body = GitHubActionsTemplate()._stage_specs(config)[9].command
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "fluid").write_text(_FAKE_FLUID)
+    (bin_dir / "fluid").chmod(0o755)
+    shell = _shell_argv(tmp_path, body, {"CATALOG": "datahub"}, bin_dir, 10)
+    opts = st.resolve_options(
+        parse(["contract.fluid.yaml"]), "contract.fluid.yaml", {"CATALOG": "datahub"}
+    )
+    assert shell == st.build_stage(10, opts, st.Workspace(tmp_path)).argv

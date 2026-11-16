@@ -119,30 +119,43 @@ def first_failure(records: List[StageRecord]) -> int:
 
 
 def _from_dict(raw: Dict[str, Any]) -> StageRecord:
+    """One record of an earlier report; ``ValueError`` when it is not one ship wrote
+    (the file sits in the checkout, so its content is not trusted to be well formed)."""
     status = str(raw["status"])
+    number = int(raw["number"])
+    if status not in (PASSED, FAILED, SKIPPED, NOT_RUN) or not 1 <= number <= 11:
+        raise ValueError(f"not a ship stage record: {number} {status}")
+    exit_code = raw.get("exit_code")
     return StageRecord(
-        number=int(raw["number"]),
+        number=number,
         name=str(raw["name"]),
         status=status,
         reason=(
             raw.get("skip_reason") if status in (SKIPPED, NOT_RUN) else raw.get("failure_reason")
         ),
         argv=[str(a) for a in raw.get("argv") or []],
-        exit_code=raw.get("exit_code"),
+        exit_code=None if exit_code is None else int(exit_code),
         duration_seconds=float(raw.get("duration_seconds") or 0.0),
     )
 
 
 def merge_with_previous(
-    directory: Path, run_id: str, current: List[StageRecord]
+    directory: Path,
+    run_id: str,
+    current: List[StageRecord],
+    *,
+    env: str,
+    mode: str,
+    contract: str,
 ) -> List[StageRecord]:
     """One CI job calls ``fluid ship --stage N`` once per step. When the report
-    already there belongs to the same run, keep its records for the stages this
-    invocation did not run; a different run, or a file that cannot be read, is
-    overwritten (``current`` is returned as is)."""
+    already there belongs to the same run (same run id, env, mode and contract),
+    keep its records for the stages this invocation did not run; anything else,
+    or a file that cannot be read, is overwritten (``current`` is returned)."""
     try:
         previous = json.loads((directory / REPORT_JSON).read_text(encoding="utf-8"))
-        if previous.get("run_id") != run_id:
+        same_run = (previous.get("run_id"), previous.get("env"), previous.get("mode"))
+        if same_run != (run_id, env, mode) or previous.get("contract") != contract:
             return current
         old = {int(s["number"]): _from_dict(s) for s in previous["stages"]}
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
