@@ -401,3 +401,9 @@ def test_spark_schema_is_a_ddl_string_from_json_reads():
     assert spark_schema(parse_fields(VALUE[:2])) == (
         "`event_id` STRING, `customer` STRUCT<`id`: STRING, `address`: STRUCT<`country`: STRING>>"
     )
+
+
+def test_a_map_key_spark_would_substitute_is_refused():
+    mapping = {"columns": [{"name": "channel", "from": "attributes['${env:SECRET}']"}]}
+    with pytest.raises(ValueError, match="cannot be a Spark string literal"):
+        spark(mapping, [col("channel", "string")])

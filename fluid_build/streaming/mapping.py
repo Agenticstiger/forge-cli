@@ -192,7 +192,9 @@ def _spark_literal(value: str) -> str:
     """A Spark string literal. Spark reads ``\\`` as an escape, so a value holding a
     quote, a backslash or a control character is refused instead of escaped; no path,
     field name or metadata key that reaches here can hold one."""
-    if re.search(r"['\\\x00-\x1f\x7f]", value):
+    # ``${...}`` is refused too: spark.sql() expands ${env:..} and ${spark:..} in the
+    # query text before it parses it (spark.sql.variable.substitute, on by default).
+    if re.search(r"['\\\x00-\x1f\x7f]|\$\{", value):
         raise ValueError(f"{value!r} cannot be a Spark string literal")
     return f"'{value}'"
 
