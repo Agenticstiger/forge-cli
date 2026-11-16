@@ -52,7 +52,7 @@ Prior art, adapted rather than depended on (none is a library for this):
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 from .access import AccessGrant, _split_principal
 from .base import UnsupportedBindingError
@@ -76,6 +76,18 @@ _GCP_DOMAIN_MEMBER_RE = re.compile(r"domain:[A-Za-z0-9.-]+")
 #: An IAM principal ARN, as ``governance.lakeFormation.grants[].principal`` takes it
 #: (the schema's pattern; the rest may carry an ``{{ env.* }}`` template).
 _AWS_PRINCIPAL_RE = re.compile(r"arn:aws[a-z0-9-]*:iam::\S+")
+
+#: An IAM role or user ARN: partition, account, kind, then any path and the name.
+_AWS_IAM_NAMED_RE = re.compile(r"arn:(aws[a-z0-9-]*):iam::([^:\s]+):(role|user)/(?:\S*/)?([^/\s]+)")
+
+#: A whole AWS account as a principal: its bare ID, or its ``:root`` ARN.
+_AWS_ACCOUNT_RE = re.compile(r"(?:arn:aws[a-z0-9-]*:iam::)?(\d{12})(?::root)?")
+
+#: An AWS Organizations organization or organizational unit, as a principal.
+_AWS_ORGANIZATION_RE = re.compile(r"arn:aws[a-z0-9-]*:organizations::\S+")
+
+#: Lake Formation's group of every IAM principal that IAM alone lets in.
+AWS_IAM_ALLOWED_PRINCIPALS = "IAM_ALLOWED_PRINCIPALS"
 
 #: An ``{{ env.NAME }}`` template, which ``fluid apply`` resolves before the emitter
 #: runs and ``fluid validate`` does not: an identity is checked with each template
@@ -329,6 +341,55 @@ def resolve_principal(
     )
 
 
+def aws_principal_key(identity: Any) -> str:
+    """One spelling of an AWS principal, to tell whether two name the same one.
+
+    IAM keeps one role (and one user) per name in an account, whatever its path, and
+    does not tell names apart by case (IAM API Reference, CreateRole ``RoleName``:
+    "Names are not distinguished by case"; ``Path`` is a separate parameter). So
+    ``role/Analyst`` and ``role/data/analyst`` in one account are the role
+    ``role/analyst``: the key keeps the partition, account and kind, and the name
+    lower-cased, without the path. A whole account (its ID, or its ``:root`` ARN)
+    keys as the bare ID. Anything else is the text, trimmed.
+
+    The key is for comparison only. A grant is emitted with its principal as written.
+    On a live account Lake Formation refuses a spelling IAM does not hold ("Invalid
+    path for user", "Invalid principal"; seen 2026-11-16), so matching by key makes
+    ``fluid validate`` refuse or filter such a grant before ``apply`` ever sends it.
+    """
+    text = str(identity or "").strip()
+    named = _AWS_IAM_NAMED_RE.fullmatch(text)
+    if named:
+        partition, account, kind, name = named.groups()
+        return f"arn:{partition}:iam::{account}:{kind}/{name.lower()}"
+    account = _AWS_ACCOUNT_RE.fullmatch(text)
+    if account:
+        return account.group(1)
+    return text
+
+
+def aws_principal_account(identity: Any) -> Optional[str]:
+    """The account an IAM role or user (or a whole account) belongs to, or ``None``."""
+    key = aws_principal_key(identity)
+    named = _AWS_IAM_NAMED_RE.fullmatch(key)
+    if named:
+        return named.group(2)
+    return key if _AWS_ACCOUNT_RE.fullmatch(key) else None
+
+
+def aws_principal_spans(identity: Any, accounts: Iterable[str]) -> bool:
+    """Whether ``identity`` is a set of principals that may hold one in ``accounts``.
+
+    ``IAM_ALLOWED_PRINCIPALS`` holds every IAM principal; a whole account holds every
+    role and user in it; an organization or organizational unit holds accounts this
+    module cannot list, so it is taken to hold them all.
+    """
+    key = aws_principal_key(identity)
+    if key.upper() == AWS_IAM_ALLOWED_PRINCIPALS or _AWS_ORGANIZATION_RE.fullmatch(key):
+        return True
+    return _AWS_ACCOUNT_RE.fullmatch(key) is not None and key in set(accounts)
+
+
 def member_grant(member: str, template: AccessGrant) -> AccessGrant:
     """``template``'s permissions and scope, granted to IAM member ``member``."""
     head, _, rest = member.partition(":")
@@ -370,9 +431,13 @@ def gcp_grants(
 
 __all__ = [
     "AWS",
+    "AWS_IAM_ALLOWED_PRINCIPALS",
     "DATABRICKS",
     "GCP",
     "RESERVED_TLDS",
+    "aws_principal_account",
+    "aws_principal_key",
+    "aws_principal_spans",
     "gcp_grants",
     "grant_key",
     "logical_key",

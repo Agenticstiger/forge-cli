@@ -23,6 +23,7 @@ from fluid_build.iac import build_module, get_iac_plugin
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.column_access import column_masks, restrictions_for
 from fluid_build.iac.governance_labels import governance_labels
+from fluid_build.iac.principals import aws_principal_account, aws_principal_key
 from fluid_build.iac.row_access import row_filters_for
 
 ANALYSTS = "group:analysts@northwind.example"
@@ -551,3 +552,214 @@ class TestVerifyDataCellsFilters:
     def test_a_filter_it_cannot_read_fails_closed(self):
         result = self._check(_FakeLf(["customer_id", "msisdn"], readable=False))
         assert result["status"] == "fail"
+
+
+# ── AWS: a grant is matched to the policy by the principal it names, however spelt ──
+
+
+def _aws_grants(grants: List[Dict[str, Any]], restrictions=None, row_filters=None):
+    contract = _aws(restrictions, row_filters)
+    binding = contract["exposes"][0]["binding"]
+    binding["governance"]["lakeFormation"]["grants"] = grants
+    return contract
+
+
+STEWARD_GRANT = {"principal": STEWARD_ARN, "permissions": ["SELECT", "DESCRIBE"]}
+#: The analyst role, written as IAM would also accept it: with its path, or in other case.
+ANALYST_SPELLINGS = [
+    f"arn:aws:iam::{ACCOUNT}:role/data/analysts/analyst",
+    f"arn:aws:iam::{ACCOUNT}:role/Analyst",
+    f"arn:aws:iam::{ACCOUNT}:role/ANALYST",
+]
+
+
+def _table_reads(res: Dict[str, Any], principal: str) -> List[Dict[str, Any]]:
+    """The grants that let ``principal`` read the table itself (not a masked view), every row."""
+    return [
+        g
+        for g in res.get("aws_lakeformation_permissions", {}).values()
+        if g["principal"] == principal
+        and ("table" in g or "table_with_columns" in g)
+        and "masked" not in str(g.get("table", [{}])[0].get("name", ""))
+        and {"SELECT", "ALL"}
+        & {*g.get("permissions", ()), *g.get("permissions_with_grant_option", ())}
+    ]
+
+
+class TestAwsGrantPrincipalSpelling:
+    """eDKBar8G: a read grant written differently from the policy's principal."""
+
+    @pytest.mark.parametrize(
+        "spelling, key",
+        [
+            *[(s, ANALYST_ARN) for s in ANALYST_SPELLINGS],
+            (f" {ANALYST_ARN} ", ANALYST_ARN),
+            ("arn:aws-cn:iam::123456789012:user/a/B", "arn:aws-cn:iam::123456789012:user/b"),
+            (f"arn:aws:iam::{ACCOUNT}:root", ACCOUNT),
+            ("IAM_ALLOWED_PRINCIPALS", "IAM_ALLOWED_PRINCIPALS"),
+            (
+                f"arn:aws:iam::{ACCOUNT}:saml-provider/idp",
+                f"arn:aws:iam::{ACCOUNT}:saml-provider/idp",
+            ),
+        ],
+    )
+    def test_one_key_per_role_or_user_whatever_its_path_or_case(self, spelling, key):
+        assert aws_principal_key(spelling) == key
+
+    def test_roles_in_two_accounts_or_of_two_kinds_have_two_keys(self):
+        assert aws_principal_key(ANALYST_ARN) != aws_principal_key(
+            "arn:aws:iam::210987654321:role/analyst"
+        )
+        assert aws_principal_key(ANALYST_ARN) != aws_principal_key(
+            f"arn:aws:iam::{ACCOUNT}:user/analyst"
+        )
+        assert aws_principal_account(ANALYST_SPELLINGS[0]) == ACCOUNT
+        assert aws_principal_account("IAM_ALLOWED_PRINCIPALS") is None
+
+    @pytest.mark.parametrize("spelling", ANALYST_SPELLINGS)
+    def test_a_grant_to_the_filtered_role_in_another_spelling_reads_through_the_filter(
+        self, spelling
+    ):
+        grant = {"principal": spelling, "permissions": ["SELECT", "DESCRIBE"]}
+        res = _aws_resources(_aws_grants([STEWARD_GRANT, grant], row_filters=[CONSENT]))
+        assert _table_reads(res, spelling) == [], "the filtered role reads every row"
+        (filtered,) = [
+            g for g in res["aws_lakeformation_permissions"].values() if "data_cells_filter" in g
+        ]
+        assert filtered["principal"] == spelling
+        assert filtered["data_cells_filter"][0]["name"] == "analysts_consented"
+
+    def test_the_mapped_identity_in_another_spelling_still_filters_the_plain_grant(self):
+        contract = _aws(row_filters=[CONSENT])
+        contract["exposes"][0]["binding"]["principals"][ANALYSTS] = ANALYST_SPELLINGS[0]
+        res = _aws_resources(contract)
+        assert _table_reads(res, ANALYST_ARN) == []
+
+    def test_a_select_held_only_with_the_grant_option_is_a_read_and_is_refused(self):
+        grant = {
+            "principal": ANALYST_ARN,
+            "permissions": ["DESCRIBE"],
+            "permissionsWithGrantOption": ["SELECT"],
+        }
+        err = _refusal("aws", _aws_grants([STEWARD_GRANT, grant], row_filters=[CONSENT]))
+        assert err.kind == "row-filter-unenforceable"
+        assert "permissionsWithGrantOption" in str(err)
+
+    def test_a_second_grant_option_select_beside_the_filtered_grant_is_refused(self):
+        plain = {"principal": ANALYST_ARN, "permissions": ["SELECT"]}
+        regrant = {
+            "principal": ANALYST_SPELLINGS[0],
+            "permissions": ["DESCRIBE"],
+            "permissionsWithGrantOption": ["SELECT"],
+        }
+        err = _refusal("aws", _aws_grants([plain, regrant], row_filters=[CONSENT]))
+        assert err.kind == "row-filter-unenforceable"
+
+    @pytest.mark.parametrize(
+        "everyone",
+        [
+            "IAM_ALLOWED_PRINCIPALS",
+            ACCOUNT,
+            f"arn:aws:iam::{ACCOUNT}:root",
+            "arn:aws:organizations::111122223333:organization/o-abcdefghij",
+            "arn:aws:organizations::111122223333:ou/o-abcdefghij/ou-ab12-cdef3456",
+        ],
+    )
+    def test_a_read_grant_to_a_set_that_may_hold_the_filtered_role_is_refused(self, everyone):
+        grants = [
+            {"principal": ANALYST_ARN, "permissions": ["SELECT"]},
+            {"principal": everyone, "permissions": ["SELECT"]},
+        ]
+        err = _refusal("aws", _aws_grants(grants, row_filters=[CONSENT]))
+        assert err.kind == "row-filter-unenforceable"
+
+    def test_a_read_grant_to_another_account_is_not_the_filtered_role(self):
+        grants = [
+            {"principal": ANALYST_ARN, "permissions": ["SELECT"]},
+            {"principal": "210987654321", "permissions": ["SELECT"]},
+        ]
+        res = _aws_resources(_aws_grants(grants, row_filters=[CONSENT]))
+        assert _table_reads(res, ANALYST_ARN) == []
+        assert len(_table_reads(res, "210987654321")) == 1
+
+    def test_two_filters_on_one_role_are_refused(self):
+        contract = _aws(row_filters=[CONSENT, {"principal": STEWARDS, "where": "score > 1"}])
+        contract["exposes"][0]["binding"]["principals"][STEWARDS] = ANALYST_SPELLINGS[1]
+        err = _refusal("aws", contract)
+        assert err.kind == "row-filter-unenforceable"
+
+    @pytest.mark.parametrize("spelling", ANALYST_SPELLINGS[:2])
+    def test_a_denied_column_is_excluded_from_a_grant_in_another_spelling(self, spelling):
+        grant = {"principal": spelling, "permissions": ["SELECT"]}
+        res = _aws_resources(_aws_grants([STEWARD_GRANT, grant], restrictions=[DENY_ID]))
+        assert _table_reads(res, STEWARD_ARN)[0].get("table"), "the steward reads every column"
+        (analyst,) = _table_reads(res, spelling)
+        assert analyst["table_with_columns"][0]["excluded_column_names"] == ["customer_id"]
+
+    def test_a_denied_column_under_a_grant_option_select_is_never_granted(self):
+        grant = {
+            "principal": ANALYST_ARN,
+            "permissions": ["DESCRIBE"],
+            "permissionsWithGrantOption": ["SELECT"],
+        }
+        contract = _aws_grants([STEWARD_GRANT, grant], restrictions=[DENY_ID])
+        err = _refusal("aws", contract)
+        assert err.kind == "column-restriction-unenforceable"
+        assert "permissionsWithGrantOption" in str(err)
+
+    @pytest.mark.parametrize("restriction", [DENY_ID, MASK_MSISDN])
+    def test_validate_refuses_a_grant_option_select_under_a_column_limit_as_emit_does(
+        self, restriction
+    ):
+        from fluid_build.iac.governance_validation import validate_governance
+
+        grant = {
+            "principal": ANALYST_ARN,
+            "permissions": ["DESCRIBE"],
+            "permissionsWithGrantOption": ["SELECT"],
+        }
+        errors, _warnings = validate_governance(
+            _aws_grants([STEWARD_GRANT, grant], restrictions=[restriction])
+        )
+        assert any("permissionsWithGrantOption" in str(e) for e in errors), errors
+
+    def test_a_masked_role_in_another_spelling_reads_the_view(self):
+        grant = {"principal": ANALYST_SPELLINGS[0], "permissions": ["SELECT", "DESCRIBE"]}
+        contract = _aws_grants([STEWARD_GRANT, grant], restrictions=[MASK_MSISDN])
+        res = _aws_resources(contract)
+        (analyst,) = _table_reads(res, ANALYST_SPELLINGS[0])
+        assert "msisdn" in analyst["table_with_columns"][0]["excluded_column_names"]
+        views = [t for t in res.get("aws_glue_catalog_table", {}).values() if "masked" in t["name"]]
+        assert len(views) == 1
+
+    def test_a_describe_grant_in_another_spelling_gets_no_view_of_its_own(self):
+        """Security review: a view is a read, run as its definer; a DESCRIBE grant must
+        not get one without the read grant's exclusions and row filter."""
+        grants = [
+            {"principal": ANALYST_ARN, "permissions": ["SELECT"]},
+            {"principal": f"arn:aws:iam::{ACCOUNT}:role/data/Analyst", "permissions": ["DESCRIBE"]},
+        ]
+        contract = _aws_grants(grants, restrictions=[DENY_ID, MASK_MSISDN], row_filters=[CONSENT])
+        with pytest.raises(UnsupportedBindingError) as raised:
+            _aws_resources(contract)
+        assert raised.value.kind == "lakeformation-grant-columns"
+
+    def test_a_describe_grant_beside_a_masked_read_adds_no_second_view(self):
+        grants = [
+            {"principal": ANALYST_ARN, "permissions": ["SELECT"]},
+            {"principal": STEWARD_ARN, "permissions": ["DESCRIBE"]},
+        ]
+        contract = _aws_grants(grants, restrictions=[DENY_ID, MASK_MSISDN], row_filters=[CONSENT])
+        contract["exposes"][0]["binding"]["principals"][STEWARDS] = ANALYST_ARN
+        res = _aws_resources(contract)
+        views = [t for t in res.get("aws_glue_catalog_table", {}).values() if "masked" in t["name"]]
+        assert len(views) == 1
+        sql = views[0]["view_original_text"] if "view_original_text" in views[0] else str(views[0])
+        assert "WHERE" in sql and '"customer_id"' not in sql
+
+    def test_a_filter_that_excludes_nothing_writes_an_empty_exclusion_list(self):
+        """Real AWS, 2026-11-16: an omitted excluded_column_names reads back as an empty
+        set, and tofu apply fails "Provider produced inconsistent result after apply"."""
+        res = _aws_resources(_aws(row_filters=[CONSENT]))
+        (flt,) = res["aws_lakeformation_data_cells_filter"].values()
+        assert flt["table_data"][0]["column_wildcard"] == [{"excluded_column_names": []}]
