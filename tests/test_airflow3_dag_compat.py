@@ -8,8 +8,8 @@ Airflow 3 removed ``DAG(schedule_interval=...)`` (``TypeError``) and
 import. It also moved the core operators and sensors to apache-airflow-providers-standard
 and exports ``DAG``, ``dag`` and ``task`` from ``airflow.sdk``; the old paths still
 resolve on 3.2 with a deprecation warning. Every generator (``fluid export --engine
-airflow``, ``fluid generate schedule``, ``fluid init``, ``fluid scaffold-composer``,
-``fluid schedule-sync``, the AWS, GCP and Snowflake code generators) emits the shape
+airflow`` and ``fluid generate schedule``, both through ``schedulers/airflow``, plus
+``fluid init``, ``fluid scaffold-composer`` and ``fluid schedule-sync``) emits the shape
 both versions accept without either: ``schedule=``, a fixed ``start_date``, and each
 moved name imported from its Airflow 3 home with an ``except ImportError`` fallback to
 the Airflow 2 path (``providers/common/codegen_utils.py``).
@@ -60,47 +60,6 @@ def _contract(action_prefix: str = "aws.athena") -> dict:
     }
 
 
-def _provider_actions() -> list:
-    from fluid_build.forge.core.provider_actions import ActionType
-
-    def action(action_id, kind, provider, params, depends_on=None):
-        return SimpleNamespace(
-            action_id=action_id,
-            action_type=ActionType(kind),
-            provider=provider,
-            params=params,
-            depends_on=depends_on or [],
-            description=None,
-        )
-
-    return [
-        action(
-            "provision-dataset",
-            "provisionDataset",
-            "gcp",
-            {"exposeId": "orders", "binding": {"location": {"project": "p", "dataset": "d"}}},
-        ),
-        action(
-            "schedule-build",
-            "scheduleTask",
-            "gcp",
-            {"engine": "dbt", "script": "orders_model", "buildId": "b1"},
-            ["provision-dataset"],
-        ),
-    ]
-
-
-def _runtime_dag(actions: list) -> str:
-    from fluid_build.runtimes.airflow_provider_actions import AirflowDAGGenerator
-
-    parser = MagicMock()
-    parser.parse.return_value = actions
-    with patch("fluid_build.forge.core.provider_actions.ProviderActionParser", return_value=parser):
-        return AirflowDAGGenerator(logger=logging.getLogger(__name__)).generate_dag(
-            {"id": "sales.orders", "name": "Orders", "domain": "sales"}
-        )
-
-
 def _scheduler(provider: str) -> str:
     from fluid_build.schedulers.airflow import AirflowScheduler
 
@@ -109,93 +68,17 @@ def _scheduler(provider: str) -> str:
     return code
 
 
-def _aws(taskflow: bool = False, mixed: bool = False) -> str:
-    from fluid_build.providers.aws.codegen import airflow
+def _golden(provider: str, only: tuple = ()) -> str:
+    """The golden contract of a provider (every operator it renders), optionally cut
+    down to the tasks named in ``only``."""
+    from fluid_build.schedulers.airflow import render_dag
+    from tests.schedulers.airflow_fixtures import CONTRACTS, PROVIDER_CONFIG
 
-    contract = _contract()
-    if mixed:  # an operator task upstream of a @task
-        contract["orchestration"]["tasks"][0].update(
-            action="aws.s3.ensure_bucket", params={"bucket": "b"}
-        )
-    render = airflow.generate_airflow_dag_taskflow if taskflow else airflow.generate_airflow_dag
-    return render(contract, "123456789012", "eu-west-1")
-
-
-def _gcp(dataflow: bool = False) -> str:
-    from fluid_build.providers.gcp.codegen.airflow import generate_airflow_dag
-
-    contract = _contract("gcp.bigquery")
-    contract["orchestration"]["tasks"].append(
-        {
-            "taskId": "create_orders",
-            "type": "provider_action",
-            "action": "gcp.bigquery.create_table",
-            "params": {
-                "dataset_id": "sales",
-                "table_id": "orders",
-                "schema": [{"name": "id", "type": "INT64"}],
-            },
-        }
-    )
-    if dataflow:
-        contract["orchestration"]["tasks"].append(
-            {
-                "taskId": "flow",
-                "type": "provider_action",
-                "action": "gcp.dataflow.run_template",
-                "params": {"template": "gs://t", "job_name": "j"},
-            }
-        )
-    return generate_airflow_dag(contract, "my-project", "europe-west1")
-
-
-def _snowflake() -> str:
-    """The SQL tasks (``sf.query.*``, ``sf.table.*``): ``sf.snowflake.*`` falls back to a
-    PythonOperator and never reaches SQLExecuteQueryOperator."""
-    from fluid_build.providers.snowflake.codegen.airflow import generate_airflow_dag
-
-    contract = _contract("sf.snowflake")
-    contract["orchestration"]["tasks"] = [
-        {
-            "taskId": "load",
-            "type": "provider_action",
-            "action": "sf.query.run_query",
-            "params": {"sql": "SELECT 1"},
-        },
-        {
-            "taskId": "publish",
-            "type": "provider_action",
-            "action": "sf.table.create_table",
-            "params": {"table": "ORDERS", "columns": [{"name": "ID", "type": "INTEGER"}]},
-            "dependsOn": ["load"],
-        },
-    ]
-    return generate_airflow_dag(contract, account="acct", database="DB")
-
-
-def _snowflake_orchestration() -> str:
-    """Every operator it imports, in its own task shape (tasks keyed by ``name``)."""
-    from fluid_build.providers.snowflake.orchestration.airflow_generator import generate_airflow_dag
-
-    orchestration = {
-        "schedule": "0 2 * * *",
-        "tasks": [
-            {
-                "name": "load",
-                "type": "provider_action",
-                "action": "sf.sql.execute",
-                "params": {"sql": "SELECT 1"},
-            },
-            {"name": "notify", "type": "bash", "command": "echo done"},
-            {
-                "name": "upstream",
-                "type": "sensor",
-                "external_dag_id": "raw",
-                "external_task_id": "land",
-            },
-        ],
-    }
-    return generate_airflow_dag({"id": "sales.orders", "name": "Orders"}, orchestration)
+    contract = CONTRACTS[provider]
+    if only:
+        tasks = [t for t in contract["orchestration"]["tasks"] if t["taskId"] in only]
+        contract = {**contract, "orchestration": {**contract["orchestration"], "tasks": tasks}}
+    return render_dag(contract, provider=provider, provider_config=PROVIDER_CONFIG[provider])
 
 
 def _init_dag(tmp_path: Path) -> str:
@@ -227,18 +110,13 @@ def _schedule_sync() -> str:
 
 
 RENDERS = {
-    "runtime with actions": lambda tmp: _runtime_dag(_provider_actions()),
-    "runtime without actions": lambda tmp: _runtime_dag([]),
     "scheduler aws": lambda tmp: _scheduler("aws"),
     "scheduler gcp": lambda tmp: _scheduler("gcp"),
     "scheduler snowflake": lambda tmp: _scheduler("snowflake"),
-    "aws codegen": lambda tmp: _aws(),
-    "aws codegen taskflow": lambda tmp: _aws(taskflow=True),
-    "aws codegen taskflow with an operator": lambda tmp: _aws(taskflow=True, mixed=True),
-    "gcp codegen": lambda tmp: _gcp(),
-    "gcp codegen with dataflow": lambda tmp: _gcp(dataflow=True),
-    "snowflake codegen": lambda tmp: _snowflake(),
-    "snowflake orchestration": lambda tmp: _snowflake_orchestration(),
+    "aws every operator": lambda tmp: _golden("aws"),
+    "gcp every operator": lambda tmp: _golden("gcp"),
+    "gcp without dataflow": lambda tmp: _golden("gcp", only=("ds", "tbl", "load", "topic")),
+    "snowflake every operator": lambda tmp: _golden("snowflake"),
     "fluid init": _init_dag,
     "scaffold-composer": lambda tmp: _scaffold_composer(),
     "schedule-sync": lambda tmp: _schedule_sync(),
@@ -358,8 +236,8 @@ def test_the_import_check_accepts_the_fallbacks_generators_emit():
 
 def test_the_dataflow_import_comes_only_with_a_dataflow_task(tmp_path: Path):
     """Its module needs the apache-beam provider; an unused failing import stops the DAG."""
-    assert "DataflowTemplatedJobStartOperator" not in RENDERS["gcp codegen"](tmp_path)
-    assert "DataflowTemplatedJobStartOperator" in RENDERS["gcp codegen with dataflow"](tmp_path)
+    assert "DataflowTemplatedJobStartOperator" not in RENDERS["gcp without dataflow"](tmp_path)
+    assert "DataflowTemplatedJobStartOperator" in RENDERS["gcp every operator"](tmp_path)
 
 
 def test_no_generator_emits_an_operator_its_provider_removed(tmp_path: Path):
@@ -374,89 +252,50 @@ def test_no_generator_emits_an_operator_its_provider_removed(tmp_path: Path):
             assert "BigQueryCreateTableOperator = None" in source, name
 
 
-def test_taskflow_wires_task_results_not_task_functions(tmp_path: Path):
-    source = RENDERS["aws codegen taskflow"](tmp_path)
-    assert "load_result >> publish_result" in source
-    assert "    load >> publish" not in source
-    # An operator task is wired as itself; only a @task is wired by its result.
-    assert "    load >> publish_result" in RENDERS["aws codegen taskflow with an operator"](
-        tmp_path
-    )
-
-
 def test_snowflake_sql_runs_through_sql_execute_query_with_its_hook_params(tmp_path: Path):
-    source = RENDERS["snowflake codegen"](tmp_path)
-    assert source.count("SQLExecuteQueryOperator(") == 2
-    assert "conn_id=SNOWFLAKE_CONN_ID" in source and "hook_params={" in source
+    source = RENDERS["snowflake every operator"](tmp_path)
+    assert source.count("SQLExecuteQueryOperator(") == 5
+    assert "conn_id='snowflake_default'" in source
+    assert "hook_params={'warehouse': 'COMPUTE_WH', 'database': 'ANALYTICS'}" in source
 
 
-def test_a_dataflow_import_follows_the_dispatch_not_the_prefix():
-    from fluid_build.providers.gcp.codegen.airflow import _generate_dag_imports
-
-    def imports(action: str) -> str:
-        return _generate_dag_imports([{"action": action}])
-
-    assert "DataflowTemplatedJobStartOperator" in imports("dataflow.dataflow.run_template")
-    assert "DataflowTemplatedJobStartOperator" not in imports("gcp.dataflow.launch_flex")
-    # Before the standard library imports, not after `logger = ...` (E402 in the DAG).
-    flow = imports("gcp.dataflow.run_template")
-    assert flow.index("DataflowTemplatedJobStartOperator") < flow.index("import json")
-
-
-def test_a_task_named_like_another_tasks_result_keeps_its_own_edge():
-    """``chk_result`` (an operator) and ``chk`` (a @task) must not share a variable, or the
-    edge from ``chk_result`` silently starts at ``chk``'s result instead."""
-    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag_taskflow
-
-    contract = _contract()
-    contract["orchestration"]["tasks"] = [
-        {
-            "taskId": "chk_result",
-            "type": "provider_action",
-            "action": "aws.s3.ensure_bucket",
-            "params": {"bucket": "b"},
-        },
-        {
-            "taskId": "chk",
-            "type": "provider_action",
-            "action": "aws.glue.ensure_database",
-            "params": {"database": "d"},
-        },
-        {
-            "taskId": "after",
-            "type": "provider_action",
-            "action": "aws.glue.ensure_database",
-            "params": {"database": "e"},
-            "dependsOn": ["chk_result"],
-        },
-    ]
-    source = generate_airflow_dag_taskflow(contract, "123456789012", "eu-west-1")
-    assert "    chk_result_2 = chk()" in source
-    assert "    chk_result >> after_result" in source
-
-
-@pytest.mark.parametrize("task_id", ["task", "dag", "AthenaOperator", "S3CreateBucketOperator"])
+@pytest.mark.parametrize(
+    "task_id", ["task", "dag", "AthenaOperator", "S3CreateBucketOperator", "PythonOperator"]
+)
 def test_a_task_named_like_an_imported_name_does_not_shadow_it(task_id: str):
-    """``taskId: task`` emitted ``def task():`` inside the DAG function, shadowing the
-    ``@task`` decorator (UnboundLocalError when Airflow parsed it)."""
-    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag_taskflow
+    """A task variable named ``dag`` rebinds the DAG every later task is attached to; one
+    named like an operator class breaks the next task of that kind."""
+    from fluid_build.schedulers.airflow import render_dag
 
     contract = _contract()
     contract["orchestration"]["tasks"] = [
         {
             "taskId": task_id,
             "type": "provider_action",
-            "action": "aws.glue.ensure_database",
-            "params": {"database": "d"},
-        }
+            "action": "aws.athena.query",
+            "params": {"query": "SELECT 1"},
+        },
+        {
+            "taskId": "after",
+            "type": "provider_action",
+            "action": "aws.athena.query",
+            "params": {"query": "SELECT 2"},
+            "dependsOn": [task_id],
+        },
     ]
-    tree = ast.parse(generate_airflow_dag_taskflow(contract, "123456789012", "eu-west-1"))
-    bound = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-    bound |= {
+    tree = ast.parse(render_dag(contract, provider="aws", provider_config={}))
+    assigned = [
         t.id
-        for n in ast.walk(tree)
+        for n in tree.body
         if isinstance(n, ast.Assign)
         for t in n.targets
         if isinstance(t, ast.Name)
+    ]
+    imported = {
+        a.asname or a.name
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.Import, ast.ImportFrom))
+        for a in n.names
     }
-    assert task_id not in bound, f"{task_id!r} rebinds an imported name"
+    assert assigned.count("dag") == 1, "a task variable rebinds the DAG"
+    assert not set(assigned) & imported, "a task variable shadows an import"

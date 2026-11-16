@@ -408,9 +408,13 @@ class GcpProvider(BaseProvider):
         try:
             # Generate code based on engine
             if engine == "airflow" or engine == "composer":
-                from .codegen import generate_airflow_dag
+                from fluid_build.schedulers.airflow import render_dag
 
-                code = generate_airflow_dag(contract, self.project, self.region)
+                code = render_dag(
+                    contract,
+                    provider="gcp",
+                    provider_config={"project": self.project, "region": self.region},
+                )
                 filename = f"{safe_id}_dag.py"
 
             elif engine == "dagster":

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **One Airflow renderer.** `fluid export --engine airflow` (the AWS, GCP and Snowflake
+  providers), `fluid generate schedule` and `fluid generate-airflow` all render a contract's
+  `orchestration` section through `fluid_build.schedulers.airflow.render_dag`. The per-provider
+  `codegen/airflow.py` modules, the Snowflake `orchestration/airflow_generator.py` and the
+  provider-action generator behind `generate-airflow` are gone. The same contract now gives the
+  same DAG whichever command writes it. Every provider gets the guards only some had: a task
+  never takes a name the DAG module binds, ids that sanitise alike stay two tasks, an edge to a
+  task outside the DAG is skipped instead of failing the file at import, and an operator is
+  imported only when a task uses it. Ported into the renderer: AWS Redshift, Lambda and Glue
+  catalog tasks, GCP Pub/Sub, Dataflow and BigQuery create-table, Snowflake database, schema and
+  table DDL. Differences from the old output, one by one: `tests/schedulers/golden/DIFFERENCES.md`.
+  - A DAG id now drops `.` and `-` for AWS too (`sales.orders` is DAG `sales_orders`), as the other
+    providers and `generate schedule` already did. The file `fluid export` writes keeps its name.
+  - An AWS task whose action no operator covers logs the action instead of raising "retired" at
+    run time, as the GCP and Snowflake ones did.
+  - `fluid generate-airflow` is a deprecated alias of `fluid generate schedule --scheduler
+    airflow` and says so once. `-o` is an output directory (a `.py` path still writes the one
+    DAG there). `--dag-id` and `--schedule` are gone: the contract's `orchestration.schedule` is
+    the one source. A contract with builds and no orchestration renders through its builds'
+    triggers; it no longer gets a DAG of `echo` placeholders.
+  - `generate_airflow_dag_taskflow` (AWS TaskFlow DAGs) is removed; nothing called it.
+
 ### Added
 
 - **Schema 0.7.7 (preview): semantic relationships and SCD validity windows**

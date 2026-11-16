@@ -94,7 +94,7 @@ def _unique_op_names(tasks: Sequence[Dict[str, Any]]) -> Dict[str, str]:
     task vanished with no error.
 
     Sanitize, then suffix on collision, exactly as
-    ``providers/aws/codegen/airflow._unique_task_identifiers`` (#623/#630) does
+    ``providers/common/codegen_utils.unique_task_identifiers`` (#623/#630) does
     for the DAG path. ``<name>_result`` is reserved alongside ``<name>``
     because the job body binds both.
     """

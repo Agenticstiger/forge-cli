@@ -401,9 +401,17 @@ class SnowflakeProviderEnhanced(BaseProvider):
         try:
             # Generate code based on engine
             if engine == "airflow":
-                from .codegen import generate_airflow_dag
+                from fluid_build.schedulers.airflow import render_dag
 
-                code = generate_airflow_dag(contract, self.account, self.database, self.warehouse)
+                code = render_dag(
+                    contract,
+                    provider="snowflake",
+                    provider_config={
+                        "account": self.account,
+                        "database": self.database,
+                        "warehouse": self.warehouse,
+                    },
+                )
                 filename = f"{safe_id}_dag.py"
 
             elif engine == "dagster":
