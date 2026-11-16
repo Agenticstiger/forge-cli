@@ -671,6 +671,9 @@ fluid_build = [
   # (``iac/module.py::dependency_lock``). Without it a wheel install would
   # run ``tofu init`` with no checksums to verify the provider against.
   "iac/providers/locks/*.hcl",
+  # The forge Spark runner: uploaded next to each job.json and run by spark-submit,
+  # never imported by forge (its directory is not a package), so core needs no pyspark.
+  "spark/runner/*.py",
 ]
 # Avoid shipping compiled junk, stale backups, and test fixtures.
 #
