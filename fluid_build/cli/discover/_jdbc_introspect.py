@@ -491,13 +491,23 @@ def _pg_mysql_connection(args: Dict[str, str]) -> Dict[str, Any]:
     }
 
 
-def _attach_options(kind: str, read_only: bool) -> str:
-    """The ATTACH option list: the scanner's TYPE, and READ_ONLY when asked for."""
-    return f"(TYPE {kind}, READ_ONLY)" if read_only else f"(TYPE {kind})"
+def _attach_options(kind: str, read_only: bool, secret: Optional[str] = None) -> str:
+    """The ATTACH option list: the scanner's TYPE, the secret it reads, READ_ONLY if asked."""
+    options = [f"TYPE {kind}"]
+    if secret is not None:
+        options.append(f"SECRET {_validate_alias(secret)}")
+    if read_only:
+        options.append("READ_ONLY")
+    return "(" + ", ".join(options) + ")"
 
 
 def _attach_string_postgres(
-    args: Dict[str, str], alias: str, *, operator_supplied: bool = False, read_only: bool = False
+    args: Dict[str, str],
+    alias: str,
+    *,
+    operator_supplied: bool = False,
+    read_only: bool = False,
+    secret: Optional[str] = None,
 ) -> str:
     dsn = build_attach_dsn(
         _pg_mysql_connection(args),
@@ -505,20 +515,23 @@ def _attach_string_postgres(
         postgres=True,
         operator_supplied=operator_supplied,
     )
-    return f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} {_attach_options('postgres', read_only)}"
+    options = _attach_options("postgres", read_only, secret)
+    return f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} {options}"
 
 
-def _attach_string_mysql(args: Dict[str, str], alias: str, *, read_only: bool = False) -> str:
+def _attach_string_mysql(
+    args: Dict[str, str], alias: str, *, read_only: bool = False, secret: Optional[str] = None
+) -> str:
     dsn = build_attach_dsn(_pg_mysql_connection(args), database_key="database", postgres=False)
-    return (
-        f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} {_attach_options('mysql', read_only)}"
-    )
+    options = _attach_options("mysql", read_only, secret)
+    return f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} {options}"
 
 
 def _attach_string_sqlite(args: Dict[str, str], alias: str, *, read_only: bool = False) -> str:
     path = args["path"]
     reject_control_chars(path, "sqlite path")
-    return f"ATTACH {quote_ansi_string_literal(path)} AS {alias} {_attach_options('sqlite', read_only)}"
+    options = _attach_options("sqlite", read_only)
+    return f"ATTACH {quote_ansi_string_literal(path)} AS {alias} {options}"
 
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -877,9 +890,9 @@ def introspect_jdbc(
             with the duckdb error preserved (operators want to see the
             "could not connect to server" message verbatim).
     """
-    # Refused before anything connects, in the order they always were: an
-    # unsupported source, a malformed URI, then a schema filter that is not a
-    # bare identifier (it goes into pass-through SQL as a literal).
+    # Refused before anything connects: an unsupported source, a malformed URI,
+    # then a schema filter that is not a bare identifier (it goes into
+    # pass-through SQL as a literal). A missing duckdb is refused after them.
     _parse_uri(uri, _normalize_kind(source))
     if schema_filter is not None and not _IDENT_RE.match(schema_filter):
         raise ValueError(
@@ -1026,12 +1039,28 @@ def attach_jdbc_source(
     )
 
     def _before_lock(c: Any) -> None:
+        secret: Optional[str] = None
+        if kind in ("postgres", "mysql"):
+            # Without a secret named in the ATTACH, the scanner looks for a default one
+            # in every secret storage, and the persistent storage the sandbox turned
+            # off answers "Unknown secret storage found: 'local_file'": no postgres or
+            # mysql source attached at all. An empty temporary secret lives on this
+            # connection only; the DSN carries the credentials. The build runner does
+            # the same (build_runners/duckdb/runner.py::_empty_secret_sql).
+            secret = alias
+            c.execute(f"CREATE TEMPORARY SECRET {secret} (TYPE {kind})")
         if kind == "postgres":
             attach_sql = _attach_string_postgres(
-                args, alias, operator_supplied=operator_supplied, read_only=read_only
+                args,
+                alias,
+                operator_supplied=operator_supplied,
+                read_only=read_only,
+                secret=secret,
             )
+        elif kind == "mysql":
+            attach_sql = _attach_string_mysql(args, alias, read_only=read_only, secret=secret)
         else:
-            attach_sql = attach(args, alias, read_only=read_only)  # type: ignore[misc]
+            attach_sql = _attach_string_sqlite(args, alias, read_only=read_only)
         password = args.get("password")
         masked: Optional[str] = None
         try:

@@ -423,6 +423,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid forge data-model from-source --source postgres|mysql` attaches its source again.**
+  The shared JDBC attach (`cli/discover/_jdbc_introspect.py::attach_jdbc_source`) ran a bare
+  `ATTACH ... (TYPE postgres)` in the DuckDB sandbox, which turns off persistent secret storage.
+  With no secret named in the ATTACH, the scanner looked for a default one there and failed
+  with `Unknown secret storage found: 'local_file'` before it connected. The attach now creates
+  an empty temporary secret and names it, as the DuckDB build runner already did. `fluid profile`
+  reads postgres and mysql tables through the same attach. `fluid init --discover` has its own
+  attach in `_jdbc_base.py`, which still fails this way.
+
 - **`fluid forge data-model` gave every expose the foreign entity of every relationship.** In
   the one-expose-per-dataset shape, the target of a relationship got a foreign entity on its own
   key, and the other exposes one on a column they do not have, and `fluid generate
