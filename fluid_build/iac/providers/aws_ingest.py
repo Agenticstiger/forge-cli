@@ -195,6 +195,33 @@ def _log_group_name(product: str, build_id: str) -> str:
     return f"/aws/fluid/spark/{product}/{build_id}"
 
 
+@dataclass
+class _Build:
+    """One Spark build as the emitters below read it."""
+
+    ctx: _Ctx
+    build_id: str
+    key: str
+    cfg: Mapping[str, Any]
+    config: Dict[str, Any]
+    tags: Dict[str, str]
+    region: Any
+    artifacts: str
+
+    @property
+    def runtime(self) -> str:
+        return str(self.cfg["runtime"])
+
+    @property
+    def where(self) -> str:
+        return f"Spark build {self.build_id}"
+
+    def object_uri(self, name: str) -> TofuExpr:
+        """``s3://`` of one artifact, through its object so a reader waits for the upload."""
+        bucket = tofu_ref(f"aws_s3_object.{self.key}_runner.bucket")
+        return TofuExpr(f"s3://{bucket}/{_escape(self.artifacts + name)}")
+
+
 def _emit_build(
     blocks: SparkBlocks,
     contract: Mapping[str, Any],
@@ -203,26 +230,22 @@ def _emit_build(
     product_tags: Mapping[str, str],
     applications: Dict[str, Any],
 ) -> None:
-    from fluid_build.spark import runner_source
-    from fluid_build.spark.compiler import (
-        MSK_BROKERS_PLACEHOLDER,
-        compile_job_config,
-        spark_parameters,
-    )
+    from fluid_build.spark.compiler import compile_job_config, spark_parameters
 
     bid = str(build.get("id"))
-    where = f"Spark build {bid}"
     aws_identity.refuse_unless_identity_allowed(ctx.product, build)
     job = compile_job_config(contract, build, account_ref=ctx.account_marker)
-    cfg = spark_parameters(build) or {}
-    runtime = cfg["runtime"]
-    key = safe_ident(f"{ctx.cid}_{bid}_spark")
-    tags = {**product_tags, "fluid_build": bid}
     config = copy.deepcopy(dict(job.config))
-    sink = config["sink"]
-    region = _region(blocks, sink.get("region"))
-    database, table = sink["table"].split(".", 1)
-
+    b = _Build(
+        ctx=ctx,
+        build_id=bid,
+        key=safe_ident(f"{ctx.cid}_{bid}_spark"),
+        cfg=spark_parameters(build) or {},
+        config=config,
+        tags={**product_tags, "fluid_build": bid},
+        region=_region(blocks, config["sink"].get("region")),
+        artifacts=f"{ARTIFACT_ROOT}/{ctx.product}/{bid}/",
+    )
     expose = next(
         e
         for e in contract.get("exposes") or []
@@ -230,30 +253,73 @@ def _emit_build(
     )
     loc = (expose.get("binding") or {}).get("location") or {}
     bucket, data_prefix = _warehouse.normalize_location(loc, account_ref=ctx.account_marker)
-    artifacts = f"{ARTIFACT_ROOT}/{ctx.product}/{bid}/"
-    bucket_ref = _bucket_ref(contract, expose, loc, bucket, ctx)
 
-    # The job config, its brokers from the MSK data source when it names a cluster.
-    source = config.get("source") or {}
-    msk: Optional[aws_identity.MskSource] = None
-    swaps = {ctx.account_marker: str(ctx.account)}
-    arn = source.get("mskClusterArn")
-    if arn:
-        brokers_attr = (
-            "bootstrap_brokers_sasl_iam" if source.get("auth") == "msk-iam" else "bootstrap_brokers"
+    content, msk = _job_content(blocks, b)
+    _emit_artifacts(blocks, b, _bucket_ref(contract, expose, loc, bucket, ctx), content)
+    log_name = _log_group_name(ctx.product, bid)
+    blocks.resources.setdefault("aws_cloudwatch_log_group", {})[b.key] = {
+        "name": log_name,
+        "retention_in_days": LOG_RETENTION_DAYS,
+        "kms_key_id": tofu_ref(f"aws_kms_key.{safe_ident(f'{ctx.cid}_spark_logs')}.arn"),
+        "tags": b.tags,
+    }
+
+    application_id: Any = None
+    if b.runtime == "emr-serverless":
+        application_id = _application(blocks, contract, expose, b, msk, applications)
+    elif b.runtime == "emr-ec2" and not b.cfg.get("clusterId"):
+        raise UnsupportedBindingError(
+            "spark-emr-ec2-needs-cluster",
+            f"{b.where} runs on EMR on EC2 without parameters.spark.clusterId; forge does not "
+            "create transient EMR clusters yet.",
+            ("Set parameters.spark.clusterId to the running cluster (j-...).",),
         )
-        blocks.data.setdefault("aws_msk_bootstrap_brokers", {})[key] = {"cluster_arn": arn}
+    database, table = config["sink"]["table"].split(".", 1)
+    access = aws_identity.JobAccess(
+        region=b.region,
+        account=ctx.account,
+        s3=_s3_grants(b, bucket, data_prefix),
+        database=database,
+        table=table,
+        log_group_arn=tofu_ref(f"aws_cloudwatch_log_group.{b.key}.arn"),
+        msk=msk,
+        secret_arns=_secret_arns(config, b.region, ctx),
+    )
+    role_arn = _emit_role(blocks, b, access, application_id)
+    if b.runtime == "glue":
+        _glue_job(blocks, b, job.config["mode"], role_arn)
+        args = blocks.resources["aws_glue_job"][b.key]["default_arguments"]
+        args["--config"] = b.object_uri(CONFIG_FILE)
+        args["--continuous-log-logGroup"] = log_name
+        args["--TempDir"] = b.object_uri("tmp/")
+        if msk is not None:
+            _glue_connection(blocks, b, msk)
+
+
+def _job_content(blocks: SparkBlocks, b: _Build) -> Tuple[Any, Optional[aws_identity.MskSource]]:
+    """``job.json``'s text, its brokers from the MSK data source when it names a cluster,
+    and the cluster the role reads with MSK IAM."""
+    from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER
+
+    ctx, source = b.ctx, b.config.get("source") or {}
+    swaps = {ctx.account_marker: str(ctx.account)}
+    msk: Optional[aws_identity.MskSource] = None
+    arn = source.get("mskClusterArn")
+    iam = source.get("auth") == "msk-iam"
+    if arn:
+        attr = "bootstrap_brokers_sasl_iam" if iam else "bootstrap_brokers"
+        blocks.data.setdefault("aws_msk_bootstrap_brokers", {})[b.key] = {"cluster_arn": arn}
         if source.get("bootstrapServers") == MSK_BROKERS_PLACEHOLDER:
             source["bootstrapServers"] = ctx.brokers_marker
             swaps[ctx.brokers_marker] = str(
-                tofu_ref(f"data.aws_msk_bootstrap_brokers.{key}.{brokers_attr}")
+                tofu_ref(f"data.aws_msk_bootstrap_brokers.{b.key}.{attr}")
             )
-        if source.get("auth") == "msk-iam":
-            msk = _msk(arn, source["topic"], source.get("groupIdPrefix"), where)
-    elif source.get("auth") == "msk-iam" and not cfg.get("executionRoleArn"):
+        if iam:
+            msk = _msk(arn, source["topic"], source.get("groupIdPrefix"), b.where)
+    elif iam and not b.cfg.get("executionRoleArn"):
         raise UnsupportedBindingError(
             "spark-msk-iam-needs-cluster-arn",
-            f"{where} reads its brokers by bootstrapServers with auth: msk-iam, so forge "
+            f"{b.where} reads its brokers by bootstrapServers with auth: msk-iam, so forge "
             "cannot tell which MSK cluster, topic and consumer groups to grant the role it "
             "creates; the job would fail to authenticate.",
             (
@@ -261,110 +327,68 @@ def _emit_build(
                 "Or set parameters.spark.executionRoleArn to a role that can read it.",
             ),
         )
-    text = json.dumps(config, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
-    job_content = _expression(text, swaps)
+    text = json.dumps(b.config, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+    return _expression(text, swaps), msk
 
-    # Artifacts.
+
+def _emit_artifacts(blocks: SparkBlocks, b: _Build, bucket_ref: Any, content: Any) -> None:
+    from fluid_build.spark import runner_source
+
     objects = blocks.resources.setdefault("aws_s3_object", {})
-    objects[f"{key}_runner"] = {
+    objects[f"{b.key}_runner"] = {
         "bucket": bucket_ref,
-        "key": artifacts + RUNNER_FILE,
+        "key": b.artifacts + RUNNER_FILE,
         "content": runner_source(),
         "content_type": "text/x-python",
-        "tags": tags,
+        "tags": b.tags,
     }
-    objects[f"{key}_config"] = {
+    objects[f"{b.key}_config"] = {
         "bucket": bucket_ref,
-        "key": artifacts + CONFIG_FILE,
-        "content": job_content,
+        "key": b.artifacts + CONFIG_FILE,
+        "content": content,
         "content_type": "application/json",
-        "tags": tags,
-    }
-    runner_uri = tofu_ref(f"aws_s3_object.{key}_runner.bucket")
-    script = TofuExpr(f"s3://{runner_uri}/{_escape(artifacts + RUNNER_FILE)}")
-    config_uri = TofuExpr(
-        f"s3://{tofu_ref(f'aws_s3_object.{key}_config.bucket')}/{_escape(artifacts + CONFIG_FILE)}"
-    )
-
-    # The log group.
-    log_name = _log_group_name(ctx.product, bid)
-    blocks.resources.setdefault("aws_cloudwatch_log_group", {})[key] = {
-        "name": log_name,
-        "retention_in_days": LOG_RETENTION_DAYS,
-        "kms_key_id": tofu_ref(f"aws_kms_key.{safe_ident(f'{ctx.cid}_spark_logs')}.arn"),
-        "tags": tags,
+        "tags": b.tags,
     }
 
-    # The role.
-    grants = _s3_grants(
-        bucket, data_prefix, str(config.get("checkpoint") or ""), artifacts, runtime, ctx
+
+def _emit_role(
+    blocks: SparkBlocks, b: _Build, access: aws_identity.JobAccess, application_id: Any
+) -> Any:
+    """The role the job runs as, and its ARN; a named ``executionRoleArn`` as it is."""
+    if b.cfg.get("executionRoleArn"):
+        return b.cfg["executionRoleArn"]
+    name = bounded_ident(
+        f"fluid-{b.ctx.product}-{b.build_id}-spark", aws_identity.ROLE_NAME_LIMIT, "-"
     )
-    secrets = _secret_arns(config, region, ctx)
-    access = aws_identity.JobAccess(
-        region=region,
-        account=ctx.account,
-        s3=grants,
-        database=database,
-        table=table,
-        log_group_arn=tofu_ref(f"aws_cloudwatch_log_group.{key}.arn"),
-        msk=msk,
-        secret_arns=secrets,
-    )
-    role_arn: Any = cfg.get("executionRoleArn")
-    role_name = bounded_ident(f"fluid-{ctx.product}-{bid}-spark", aws_identity.ROLE_NAME_LIMIT, "-")
-
-    application_id: Any = None
-    if runtime == "emr-serverless":
-        application_id = _application(blocks, contract, expose, cfg, ctx, msk, applications, where)
-    elif runtime == "emr-ec2" and not cfg.get("clusterId"):
-        raise UnsupportedBindingError(
-            "spark-emr-ec2-needs-cluster",
-            f"{where} runs on EMR on EC2 without parameters.spark.clusterId; forge does not "
-            "create transient EMR clusters yet.",
-            ("Set parameters.spark.clusterId to the running cluster (j-...).",),
-        )
-
-    if role_arn is None:
-        policy = f"${{data.aws_iam_policy_document.{key}_access.json}}"
-        blocks.data.setdefault("aws_iam_policy_document", {})[f"{key}_access"] = (
-            aws_identity.access_document(access)
-        )
-        if runtime == "emr-ec2":
-            # A step runs as the cluster's instance profile, which the cluster owns:
-            # forge gives its owner the job's least-privilege policy to attach.
-            blocks.resources.setdefault("aws_iam_policy", {})[key] = {
-                "name": role_name,
-                "description": (
-                    f"Least-privilege access of the forge Spark build {bid}; attach it to "
-                    f"the EMR cluster's instance-profile role or a step runtime role"
-                ),
-                "policy": TofuExpr(policy),
-                "tags": tags,
-            }
-        else:
-            trust = _trust(blocks, runtime, cfg, ctx, key, region, role_name, application_id)
-            blocks.data["aws_iam_policy_document"][f"{key}_trust"] = trust
-            blocks.resources.setdefault("aws_iam_role", {})[key] = {
-                "name": role_name,
-                "description": f"The role the forge Spark build {bid} runs as",
-                "assume_role_policy": tofu_ref(f"data.aws_iam_policy_document.{key}_trust.json"),
-                "tags": tags,
-            }
-            blocks.resources.setdefault("aws_iam_role_policy", {})[key] = {
-                "name": "fluid-spark-job",
-                "role": tofu_ref(f"aws_iam_role.{key}.id"),
-                "policy": TofuExpr(policy),
-            }
-            role_arn = tofu_ref(f"aws_iam_role.{key}.arn")
-
-    if runtime == "glue":
-        _glue_job(blocks, job.config["mode"], cfg, ctx, key, bid, tags, role_arn, script)
-        args = blocks.resources["aws_glue_job"][key]["default_arguments"]
-        args["--config"] = config_uri
-        args["--continuous-log-logGroup"] = log_name
-        args["--TempDir"] = TofuExpr(f"s3://{runner_uri}/{_escape(artifacts)}tmp/")
-        if msk is not None:
-            _glue_connection(blocks, ctx, key, bid, msk, tags)
+    documents = blocks.data.setdefault("aws_iam_policy_document", {})
+    documents[f"{b.key}_access"] = aws_identity.access_document(access)
+    policy = tofu_ref(f"data.aws_iam_policy_document.{b.key}_access.json")
+    if b.runtime == "emr-ec2":
+        # A step runs as the cluster's instance profile, which the cluster owns:
+        # forge gives its owner the job's least-privilege policy to attach.
+        blocks.resources.setdefault("aws_iam_policy", {})[b.key] = {
+            "name": name,
+            "description": (
+                f"Least-privilege access of the forge Spark build {b.build_id}; attach it "
+                "to the EMR cluster's instance-profile role or a step runtime role"
+            ),
+            "policy": policy,
+            "tags": b.tags,
+        }
+        return None
+    documents[f"{b.key}_trust"] = _trust(blocks, b, name, application_id)
+    blocks.resources.setdefault("aws_iam_role", {})[b.key] = {
+        "name": name,
+        "description": f"The role the forge Spark build {b.build_id} runs as",
+        "assume_role_policy": tofu_ref(f"data.aws_iam_policy_document.{b.key}_trust.json"),
+        "tags": b.tags,
+    }
+    blocks.resources.setdefault("aws_iam_role_policy", {})[b.key] = {
+        "name": "fluid-spark-job",
+        "role": tofu_ref(f"aws_iam_role.{b.key}.id"),
+        "policy": policy,
+    }
+    return tofu_ref(f"aws_iam_role.{b.key}.arn")
 
 
 def _bucket_ref(
@@ -383,25 +407,21 @@ def _bucket_ref(
     return ctx.x(bucket)
 
 
-def _s3_grants(
-    bucket: str,
-    data_prefix: str,
-    checkpoint: str,
-    artifacts: str,
-    runtime: str,
-    ctx: _Ctx,
-) -> Tuple[aws_identity.S3Grant, ...]:
-    by_bucket: Dict[str, Tuple[List[str], List[str]]] = {bucket: ([data_prefix], [artifacts])}
+def _s3_grants(b: _Build, bucket: str, data_prefix: str) -> Tuple[aws_identity.S3Grant, ...]:
+    """The prefixes the job writes (data, checkpoint, Glue's TempDir) and reads (artifacts)."""
+    by_bucket: Dict[str, Tuple[List[str], List[str]]] = {bucket: ([data_prefix], [b.artifacts])}
+    checkpoint = str(b.config.get("checkpoint") or "")
     if checkpoint:
         ck_bucket, ck_prefix = _split_s3(checkpoint)
         by_bucket.setdefault(ck_bucket, ([], []))[0].append(ck_prefix)
-    if runtime == "glue":
-        by_bucket[bucket][0].append(artifacts + "tmp/")
+    if b.runtime == "glue":
+        by_bucket[bucket][0].append(b.artifacts + "tmp/")
+    x = b.ctx.x
     return tuple(
         aws_identity.S3Grant(
-            bucket=ctx.x(name),
-            write=tuple(ctx.x(p) for p in dict.fromkeys(write)),
-            read=tuple(ctx.x(p) for p in dict.fromkeys(read)),
+            bucket=x(name),
+            write=tuple(x(p) for p in dict.fromkeys(write)),
+            read=tuple(x(p) for p in dict.fromkeys(read)),
         )
         for name, (write, read) in by_bucket.items()
     )
@@ -434,13 +454,12 @@ def _application(
     blocks: SparkBlocks,
     contract: Mapping[str, Any],
     expose: Mapping[str, Any],
-    cfg: Mapping[str, Any],
-    ctx: _Ctx,
+    b: _Build,
     msk: Optional[aws_identity.MskSource],
     applications: Dict[str, Any],
-    where: str,
 ) -> Any:
     """The EMR Serverless application id the job runs in, emitting it when isolated."""
+    cfg, ctx, where = b.cfg, b.ctx, b.where
     if cfg.get("applicationId"):
         return cfg["applicationId"]
     decision = resolve_packaging(contract).decision_for("emrApplication", expose.get("exposeId"))
@@ -495,20 +514,12 @@ def _msk_cluster_data(blocks: SparkBlocks, key: str, msk: aws_identity.MskSource
     return f"data.aws_msk_cluster.{key}"
 
 
-def _trust(
-    blocks: SparkBlocks,
-    runtime: str,
-    cfg: Mapping[str, Any],
-    ctx: _Ctx,
-    key: str,
-    region: Any,
-    role_name: str,
-    application_id: Any,
-) -> Dict[str, Any]:
+def _trust(blocks: SparkBlocks, b: _Build, role_name: str, application_id: Any) -> Dict[str, Any]:
     issuer = namespace = None
-    if runtime == "emr-eks":
+    if b.runtime == "emr-eks":
+        key = b.key
         blocks.data.setdefault("aws_emrcontainers_virtual_cluster", {})[key] = {
-            "virtual_cluster_id": cfg["virtualClusterId"]
+            "virtual_cluster_id": b.cfg["virtualClusterId"]
         }
         vc = f"data.aws_emrcontainers_virtual_cluster.{key}.container_provider[0]"
         blocks.data.setdefault("aws_eks_cluster", {})[key] = {"name": tofu_ref(f"{vc}.id")}
@@ -517,9 +528,9 @@ def _trust(
         )
         namespace = tofu_ref(f"{vc}.info[0].eks_info[0].namespace")
     return aws_identity.trust_document(
-        runtime,
-        account=ctx.account,
-        region=region,
+        b.runtime,
+        account=b.ctx.account,
+        region=b.region,
         role_name=role_name,
         application_id=application_id,
         eks_issuer=issuer,
@@ -527,26 +538,16 @@ def _trust(
     )
 
 
-def _glue_job(
-    blocks: SparkBlocks,
-    mode: str,
-    cfg: Mapping[str, Any],
-    ctx: _Ctx,
-    key: str,
-    bid: str,
-    tags: Mapping[str, str],
-    role_arn: Any,
-    script: Any,
-) -> None:
+def _glue_job(blocks: SparkBlocks, b: _Build, mode: str, role_arn: Any) -> None:
     streaming = mode == "streaming"
-    blocks.resources.setdefault("aws_glue_job", {})[key] = {
-        "name": bounded_ident(f"fluid-{ctx.product}-{bid}", 255, "-"),
-        "description": f"The forge Spark build {bid}",
+    blocks.resources.setdefault("aws_glue_job", {})[b.key] = {
+        "name": bounded_ident(f"fluid-{b.ctx.product}-{b.build_id}", 255, "-"),
+        "description": f"The forge Spark build {b.build_id}",
         "role_arn": role_arn,
-        "glue_version": cfg.get("glueVersion") or DEFAULT_GLUE_VERSION,
+        "glue_version": b.cfg.get("glueVersion") or DEFAULT_GLUE_VERSION,
         "command": {
             "name": "gluestreaming" if streaming else "glueetl",
-            "script_location": script,
+            "script_location": b.object_uri(RUNNER_FILE),
             "python_version": "3",
         },
         "default_arguments": {
@@ -559,27 +560,21 @@ def _glue_job(
         "max_retries": 0,
         # One run at a time: a second run would share the checkpoint.
         "execution_property": {"max_concurrent_runs": 1},
-        "tags": dict(tags),
+        "tags": dict(b.tags),
     }
 
 
-def _glue_connection(
-    blocks: SparkBlocks,
-    ctx: _Ctx,
-    key: str,
-    bid: str,
-    msk: aws_identity.MskSource,
-    tags: Mapping[str, str],
-) -> None:
+def _glue_connection(blocks: SparkBlocks, b: _Build, msk: aws_identity.MskSource) -> None:
     """A Glue ``NETWORK`` connection in one of the MSK cluster's subnets, with its
     security groups: what puts a Glue job's workers where the brokers are."""
+    key = b.key
     cluster = _msk_cluster_data(blocks, key, msk)
     blocks.data.setdefault("aws_subnet", {})[key] = {
         "id": tofu_ref(f"tolist({cluster}.broker_node_group_info[0].client_subnets)[0]")
     }
     from . import aws as _aws  # imported here: aws imports this module
 
-    name = bounded_ident(f"fluid-{ctx.product}-{bid}-msk", 255, "-")
+    name = bounded_ident(f"fluid-{b.ctx.product}-{b.build_id}-msk", 255, "-")
     blocks.resources.setdefault("aws_glue_connection", {})[key] = {
         "name": name,
         "connection_type": "NETWORK",
@@ -591,7 +586,7 @@ def _glue_connection(
             ),
             "subnet_id": tofu_ref(f"data.aws_subnet.{key}.id"),
         },
-        "tags": dict(tags),
+        "tags": dict(b.tags),
     }
     blocks.resources["aws_glue_job"][key]["connections"] = [
         tofu_ref(f"aws_glue_connection.{key}.name")
