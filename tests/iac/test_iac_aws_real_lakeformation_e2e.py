@@ -271,7 +271,7 @@ def test_real_lf_row_filter_holds_through_athena(aws_real_project, aws_account):
     """
     import boto3
 
-    account, region = aws_account["account_id"], aws_account["region"]
+    region = aws_account["region"]
     iam, lf, s3 = aws_real_boto("iam"), aws_real_boto("lakeformation"), aws_real_boto("s3")
     bucket = aws_real_project.name("lfsec-b")
     results = aws_real_project.name("lfsec-res")
