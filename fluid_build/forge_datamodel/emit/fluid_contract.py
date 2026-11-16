@@ -488,6 +488,82 @@ def _binding_for_artifact(
     return binding
 
 
+def _attach_osi_relationships(exposes: List[Dict[str, Any]], logical: LogicalDraft) -> None:
+    """Write the OSI relationships 1:1 as ``semantics.relationships`` (schema 0.7.7).
+
+    An Apache Ossie relationship is a foreign key from its ``from`` dataset, the
+    many side, to its ``to`` dataset, the columns paired by position. Where both
+    datasets are exposes of this contract (the one-expose-per-dataset shape) and
+    the columns are ones those exposes declare, the relationship goes on the
+    ``from`` expose, many_to_one, so the contract and the Ossie sidecar hold the
+    same joins, composite keys included. The foreign entity the semantics block
+    already derives for a one-column key is named after the target's key entity,
+    because dbt MetricFlow joins by entity name. Other shapes keep the foreign
+    entities alone.
+    """
+    by_id = {str(expose.get("exposeId")): expose for expose in exposes}
+    for relationship in logical.osi.relationships:
+        source = by_id.get(_slug(relationship.from_))
+        target = by_id.get(_slug(relationship.to))
+        from_columns = list(relationship.from_columns)
+        to_columns = list(relationship.to_columns)
+        if source is None or target is None or not from_columns:
+            continue
+        if len(from_columns) != len(to_columns):
+            continue
+        source_columns = set(_semantics_builder.declared_columns(source))
+        target_columns = set(_semantics_builder.declared_columns(target))
+        if not set(from_columns) <= source_columns or not set(to_columns) <= target_columns:
+            continue
+        semantics = source.get("semantics")
+        if not isinstance(semantics, dict):
+            continue
+        relationships = semantics.setdefault("relationships", [])
+        if any(existing.get("name") == relationship.name for existing in relationships):
+            continue
+        relationships.append(
+            {
+                "name": relationship.name,
+                "to": target["exposeId"],
+                "fromColumns": from_columns,
+                "toColumns": to_columns,
+                "cardinality": "many_to_one",
+            }
+        )
+        if len(from_columns) == 1 and source is not target:
+            _name_foreign_entity_after_target(
+                semantics, target, relationship.to, from_columns[0], to_columns[0]
+            )
+
+
+def _name_foreign_entity_after_target(
+    semantics: Dict[str, Any],
+    target: Dict[str, Any],
+    target_name: str,
+    from_column: str,
+    to_column: str,
+) -> None:
+    """Rename the derived foreign entity to the target's key entity, so MetricFlow joins them."""
+    target_semantics = target.get("semantics") or {}
+    keys = [
+        entity["name"]
+        for entity in target_semantics.get("entities") or []
+        if entity.get("type") in ("primary", "unique", "natural")
+        and _semantics_builder.entity_column(entity) == to_column
+    ]
+    entities = semantics.get("entities") or []
+    if len(keys) != 1 or any(entity.get("name") == keys[0] for entity in entities):
+        return
+    for entity in entities:
+        if (
+            entity.get("type") == "foreign"
+            and entity.get("name") == target_name
+            and entity.get("expr") == from_column
+        ):
+            entity["name"] = keys[0]
+            return
+
+
 def _build_flat_exposes(
     *,
     logical: LogicalDraft,
@@ -933,6 +1009,8 @@ def build_contract_from_logical(
                 expose["description"] = first_dataset.description
         exposes = [expose]
 
+    _attach_osi_relationships(exposes, logical)
+
     contract: Dict[str, Any] = {
         "fluidVersion": FluidSchemaManager.latest_bundled_version(),
         "kind": "DataProduct",
@@ -951,4 +1029,9 @@ def build_contract_from_logical(
     extensions = _assemble_extensions(logical)
     if extensions:
         contract["extensions"] = extensions
+    # Relationships live in the 0.7.7 schema: only a contract that carries one
+    # moves there, every other keeps the newest stable version and its digest.
+    needed = _semantics_builder.version_for_relationship_keys(contract)
+    if needed:
+        contract["fluidVersion"] = needed
     return contract
