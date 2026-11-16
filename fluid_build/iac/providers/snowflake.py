@@ -216,6 +216,10 @@ class SnowflakeIacPlugin:
         "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
         # Programmatic access token (PAT).
         "SNOWFLAKE_TOKEN",
+        # Workload identity federation (CI OIDC): the provider reads the job's
+        # ID token from a file, so no secret is in the environment.
+        "SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER",
+        "SNOWFLAKE_TOKEN_FILE_PATH",
         # OAuth (client-credentials / authorization-code).
         "SNOWFLAKE_OAUTH_CLIENT_ID",
         "SNOWFLAKE_OAUTH_CLIENT_SECRET",

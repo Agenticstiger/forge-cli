@@ -160,6 +160,10 @@ class ProviderOptions:
     # Authentication options
     oauth_token: Optional[str] = None
     authenticator: Optional[str] = None
+    # Workload identity federation (``authenticator`` WORKLOAD_IDENTITY): the provider
+    # (OIDC, AWS, AZURE, GCP) and, for OIDC, the file holding the ID token.
+    workload_identity_provider: Optional[str] = None
+    token_file_path: Optional[str] = None
 
     # Connection optimization
     connection_timeout: int = 60

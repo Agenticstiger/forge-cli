@@ -73,6 +73,8 @@ class SnowflakeConnection:
                 schema=kwargs.get("schema"),
                 oauth_token=kwargs.get("oauth_token"),
                 authenticator=kwargs.get("authenticator"),
+                workload_identity_provider=kwargs.get("workload_identity_provider"),
+                token_file_path=kwargs.get("token_file_path"),
                 session_params=kwargs.get("session_params"),
             )
         else:
@@ -109,7 +111,16 @@ class SnowflakeConnection:
             session_parameters=self.opts.session_params or {"QUERY_TAG": "fluid-forge"},
         )
 
-        if self.opts.oauth_token:
+        if str(self.opts.authenticator or "").upper() == "WORKLOAD_IDENTITY":
+            # snowflake-connector-python >= 3.17: for an OIDC provider the
+            # connector reads the token file itself.
+            if not kwargs.get("user"):
+                del kwargs["user"]
+            kwargs["authenticator"] = "WORKLOAD_IDENTITY"
+            kwargs["workload_identity_provider"] = self.opts.workload_identity_provider
+            if self.opts.token_file_path:
+                kwargs["token_file_path"] = self.opts.token_file_path
+        elif self.opts.oauth_token:
             kwargs["authenticator"] = "oauth"
             kwargs["token"] = self.opts.oauth_token
         elif self.opts.private_key_path:
