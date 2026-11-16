@@ -133,7 +133,8 @@ _GITHUB_SUBJECT = [
     "form, which makes a renamed or re-created repository unable to inherit the trust.",
     "Opt in, then bind to it (https://docs.github.com/en/actions/reference/security/oidc).",
     "<context> is environment:<name> for a job that declares an environment (the deploy",
-    "jobs do) and ref:refs/heads/<branch> for one that does not.",
+    "jobs do), pull_request for a job a pull request runs, and ref:refs/heads/<branch>",
+    "otherwise.",
 ]
 
 _GITLAB_SUBJECT = [
@@ -224,7 +225,9 @@ def _github_token_script(file_name: str, audience: str, exports: List[str]) -> "
             'curl -sSfG -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" '
             '--data-urlencode "audience=$OIDC_AUDIENCE" "$ACTIONS_ID_TOKEN_REQUEST_URL"'
         )
-    extract = "python3 -c 'import json, sys; print(json.load(sys.stdin)[\"value\"])'"
+    # -I (isolated): the job's working directory is the checked-out repository, and a
+    # json.py committed there would otherwise run while the token request is in reach.
+    extract = "python3 -I -c 'import json, sys; print(json.load(sys.stdin)[\"value\"])'"
     lines = [
         "set -euo pipefail",
         "umask 077",
