@@ -124,6 +124,10 @@ FORBIDDEN_ON_HELP = (
     # Gone with the lazy core commands: the forge data-model registration and
     # the copilot schemas were what pulled it onto the --help path.
     "pydantic",
+    # ``fluid profile`` reads records through DuckDB and writes RFC 8785 JSON;
+    # both load only when it runs (``fluid_build/profiler``).
+    "duckdb",
+    "rfc8785",
 )
 
 _BUILD_PARSER_PROBE = (
@@ -209,6 +213,34 @@ _PROVIDERS_CMD_PROBE = (
 )
 
 
+# ``fluid profile --help`` end to end: the command module only, no profiler part,
+# no DuckDB, no statistic registry. Measured 311 modules on 3.12 (2026-11-16);
+# ceiling = measured + 5%, rounded up.
+MAX_PROFILE_HELP_MODULES = 327
+FORBIDDEN_ON_PROFILE_HELP = (
+    "duckdb",
+    "rfc8785",
+    "flux_engine",
+    "flux_stats",
+    "fluid_build.profiler.runner",
+    "fluid_build.profiler.sources",
+    "fluid_build.profiler.document",
+)
+_PROFILE_HELP_PROBE = (
+    "import sys, io, contextlib;"
+    "from fluid_build.cli import main;"
+    "buf = io.StringIO();"
+    "ctx = contextlib.redirect_stdout(buf);"
+    "ctx.__enter__();"
+    "rc = main(['profile', '--help']);"
+    "ctx.__exit__(None, None, None);"
+    "assert rc in (0, None), rc;"
+    "assert 'records' in buf.getvalue(), buf.getvalue();"
+    "print(len(sys.modules));"
+    f"print(','.join(m for m in {FORBIDDEN_ON_PROFILE_HELP!r} if m in sys.modules))"
+)
+
+
 def _probe_discovery(code):
     out = subprocess.run(
         [sys.executable, "-c", code],
@@ -268,6 +300,20 @@ def test_fluid_providers_command_stays_light(capsys):
     assert (
         count < MAX_PROVIDERS_CMD_MODULES
     ), f"`fluid providers` imports {count} modules (budget {MAX_PROVIDERS_CMD_MODULES})."
+
+
+def test_fluid_profile_help_stays_light(capsys):
+    """``fluid profile --help`` loads neither DuckDB nor the profiler's parts."""
+    count, loaded = _probe_discovery(_PROFILE_HELP_PROBE)
+    with capsys.disabled():
+        print(
+            f"\n[startup-budget] fluid profile --help: {count} modules "
+            f"(budget {MAX_PROFILE_HELP_MODULES})"
+        )
+    assert not loaded, f"`fluid profile --help` loaded {sorted(loaded)}"
+    assert (
+        count < MAX_PROFILE_HELP_MODULES
+    ), f"`fluid profile --help` imports {count} modules (budget {MAX_PROFILE_HELP_MODULES})."
 
 
 def test_heavy_sdks_not_loaded_on_help():

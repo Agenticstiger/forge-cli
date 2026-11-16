@@ -175,9 +175,7 @@ class FakeBackend:
             return _exact(value, where)
         if domain == "timestamp":
             return _milliseconds(value, where)
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        if not isinstance(value, str):
+        if not isinstance(value, str):  # a boolean included, as the engine's reader refuses one
             raise ReadRefused(f"{where}: value class {type(value).__name__!r}")
         return unicodedata.normalize("NFC", value)
 

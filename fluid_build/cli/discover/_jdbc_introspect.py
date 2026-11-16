@@ -491,8 +491,13 @@ def _pg_mysql_connection(args: Dict[str, str]) -> Dict[str, Any]:
     }
 
 
+def _attach_options(kind: str, read_only: bool) -> str:
+    """The ATTACH option list: the scanner's TYPE, and READ_ONLY when asked for."""
+    return f"(TYPE {kind}, READ_ONLY)" if read_only else f"(TYPE {kind})"
+
+
 def _attach_string_postgres(
-    args: Dict[str, str], alias: str, *, operator_supplied: bool = False
+    args: Dict[str, str], alias: str, *, operator_supplied: bool = False, read_only: bool = False
 ) -> str:
     dsn = build_attach_dsn(
         _pg_mysql_connection(args),
@@ -500,18 +505,20 @@ def _attach_string_postgres(
         postgres=True,
         operator_supplied=operator_supplied,
     )
-    return f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE postgres)"
+    return f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} {_attach_options('postgres', read_only)}"
 
 
-def _attach_string_mysql(args: Dict[str, str], alias: str) -> str:
+def _attach_string_mysql(args: Dict[str, str], alias: str, *, read_only: bool = False) -> str:
     dsn = build_attach_dsn(_pg_mysql_connection(args), database_key="database", postgres=False)
-    return f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} (TYPE mysql)"
+    return (
+        f"ATTACH {quote_ansi_string_literal(dsn)} AS {alias} {_attach_options('mysql', read_only)}"
+    )
 
 
-def _attach_string_sqlite(args: Dict[str, str], alias: str) -> str:
+def _attach_string_sqlite(args: Dict[str, str], alias: str, *, read_only: bool = False) -> str:
     path = args["path"]
     reject_control_chars(path, "sqlite path")
-    return f"ATTACH {quote_ansi_string_literal(path)} AS {alias} (TYPE sqlite)"
+    return f"ATTACH {quote_ansi_string_literal(path)} AS {alias} {_attach_options('sqlite', read_only)}"
 
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -972,14 +979,18 @@ class AttachedSource:
     database: str
 
 
-def attach_jdbc_source(source: str, uri: str, *, operator_supplied: bool = False) -> AttachedSource:
+def attach_jdbc_source(
+    source: str, uri: str, *, operator_supplied: bool = False, read_only: bool = False
+) -> AttachedSource:
     """Attach the JDBC database *uri* names to a sandboxed in-memory DuckDB.
 
     The one place a JDBC source is opened, shared by ``fluid init --discover``
     (through :func:`introspect_jdbc`) and ``fluid profile``: the DSN is built by
     :func:`build_attach_dsn`, a URI's password is pinned to its own material
     unless the operator typed the URI (*operator_supplied*), and a connect error
-    is raised with every reading of the password masked.
+    is raised with every reading of the password masked. *read_only* attaches the
+    database ``READ_ONLY``, so nothing can write to it, and a sqlite path that does not
+    exist is not created.
 
     Raises ``ImportError`` without duckdb, ``ValueError`` for a malformed URI
     or an unsupported *source*, and whatever the driver raises on connect.
@@ -1016,9 +1027,11 @@ def attach_jdbc_source(source: str, uri: str, *, operator_supplied: bool = False
 
     def _before_lock(c: Any) -> None:
         if kind == "postgres":
-            attach_sql = _attach_string_postgres(args, alias, operator_supplied=operator_supplied)
+            attach_sql = _attach_string_postgres(
+                args, alias, operator_supplied=operator_supplied, read_only=read_only
+            )
         else:
-            attach_sql = attach(args, alias)  # type: ignore[misc]
+            attach_sql = attach(args, alias, read_only=read_only)  # type: ignore[misc]
         password = args.get("password")
         masked: Optional[str] = None
         try:
