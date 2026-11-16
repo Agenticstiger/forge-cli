@@ -1,8 +1,9 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""The run record ``fluid ship`` leaves behind: ``ship-report.json`` and
-``ship-junit.xml``, written whether the run passed or failed.
+"""The run record ``fluid ship`` leaves behind (``ship-report.json`` and
+``ship-junit.xml``, written whether the run passed or failed) and the exit
+status it ends with.
 
 Standard library only (``xml.etree`` is imported where used).
 """
@@ -12,7 +13,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Collection, Dict, List, Optional
+
+from ._ci_output import oneline
 
 PASSED = "passed"
 FAILED = "failed"
@@ -21,6 +24,30 @@ NOT_RUN = "not-run"
 
 REPORT_JSON = "ship-report.json"
 REPORT_JUNIT = "ship-junit.xml"
+
+#: ``fluid ship``'s exit status. A stage's own exit code is in its record, never
+#: in the status: a stage's 2 (``diff`` could not inspect, ``bundle`` found no
+#: file) must not read as a refused argument, and no stage code means "partial".
+EXIT_OK = 0
+EXIT_FAILED = 1  # a stage failed
+EXIT_USAGE = 2  # ship refused its arguments; argparse and fluid's crash handler exit 2 too
+EXIT_PARTIAL = 3  # a stage failed after apply changed something: those changes are live
+EXIT_INTERRUPTED = 130  # Ctrl-C
+
+_APPLY_STAGE = 7
+
+# A previous report sits in the checkout, so reading it may raise anything a
+# malformed JSON document can: a deep nesting (RecursionError), a number too
+# big for an int (OverflowError), a list where a mapping should be.
+_UNREADABLE = (
+    OSError,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    OverflowError,
+    RecursionError,
+)
 
 
 @dataclass
@@ -46,6 +73,20 @@ class StageRecord:
         }
 
 
+def exit_status(records: List[StageRecord], *, applies: bool) -> int:
+    """The exit status ``records`` end with: 0 when no stage failed, else 1, or 3
+    when the first failure came after apply passed in a mode that changes
+    something (``applies``: every mode but dry-run). Refused arguments (2) and
+    Ctrl-C (130) are decided by the caller, before or instead of this."""
+    applied = False
+    for rec in sorted(records, key=lambda r: r.number):
+        if rec.status == FAILED:
+            return EXIT_PARTIAL if applied else EXIT_FAILED
+        if rec.number == _APPLY_STAGE and rec.status == PASSED and applies:
+            applied = True
+    return EXIT_OK
+
+
 def build_report(
     records: List[StageRecord], *, run_id: str, env: str, mode: str, contract: str, exit_code: int
 ) -> Dict[str, Any]:
@@ -57,6 +98,21 @@ def build_report(
         "exit_code": exit_code,
         "stages": [r.as_dict() for r in records],
     }
+
+
+def _xml_char(char: str) -> str:
+    code = ord(char)
+    if 0xD800 <= code <= 0xDFFF or code in (0xFFFE, 0xFFFF):
+        return "U+%04X" % code
+    return char
+
+
+def _xml_safe(text: str) -> str:
+    """``text`` as XML 1.0 takes it. Control characters are spelled as escapes,
+    as ship's log lines spell them (:func:`oneline`); what XML refuses even as a
+    character reference, a lone surrogate (what a non-UTF-8 byte of an argument
+    decodes to) or U+FFFE / U+FFFF, is spelled as its code point."""
+    return "".join(_xml_char(c) for c in oneline(text))
 
 
 def junit_xml(records: List[StageRecord]) -> bytes:
@@ -89,10 +145,11 @@ def junit_xml(records: List[StageRecord]) -> bytes:
             failure = ET.SubElement(
                 case, "failure", {"message": f"stage {rec.number} {rec.name} failed"}
             )
-            failure.text = f"exit code {rec.exit_code}: fluid {' '.join(rec.argv)}"
+            failure.text = _xml_safe(f"exit code {rec.exit_code}: fluid {' '.join(rec.argv)}")
         elif rec.status in (SKIPPED, NOT_RUN):
             prefix = "" if rec.status == SKIPPED else "not run: "
-            ET.SubElement(case, "skipped", {"message": prefix + (rec.reason or rec.status)})
+            message = _xml_safe(prefix + (rec.reason or rec.status))
+            ET.SubElement(case, "skipped", {"message": message})
     root = ET.ElementTree(suite)
     ET.indent(root)
     import io
@@ -108,14 +165,6 @@ def write_reports(directory: Path, report: Dict[str, Any], records: List[StageRe
         json.dumps(report, indent=2, sort_keys=False) + "\n", encoding="utf-8"
     )
     (directory / REPORT_JUNIT).write_bytes(junit_xml(records))
-
-
-def first_failure(records: List[StageRecord]) -> int:
-    """The first non-zero stage exit code, in stage order; 0 when none failed."""
-    for rec in records:
-        if rec.exit_code:
-            return int(rec.exit_code)
-    return 0
 
 
 def _from_dict(raw: Dict[str, Any]) -> StageRecord:
@@ -144,20 +193,26 @@ def merge_with_previous(
     run_id: str,
     current: List[StageRecord],
     *,
+    selected: Collection[int],
     env: str,
     mode: str,
     contract: str,
 ) -> List[StageRecord]:
     """One CI job calls ``fluid ship --stage N`` once per step. When the report
     already there belongs to the same run (same run id, env, mode and contract),
-    keep its records for the stages this invocation did not run; anything else,
-    or a file that cannot be read, is overwritten (``current`` is returned)."""
+    keep its records for the stages this invocation did not select; anything
+    else, or a file that cannot be read, is overwritten (``current`` is returned).
+
+    A stage this invocation selected keeps this invocation's record even when it
+    never ran: a retried ``--stage 7-9`` whose apply fails leaves 8 and 9 "not
+    run", not the "passed" of the attempt before.
+    """
     try:
         previous = json.loads((directory / REPORT_JSON).read_text(encoding="utf-8"))
         same_run = (previous.get("run_id"), previous.get("env"), previous.get("mode"))
         if same_run != (run_id, env, mode) or previous.get("contract") != contract:
             return current
         old = {int(s["number"]): _from_dict(s) for s in previous["stages"]}
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except _UNREADABLE:
         return current
-    return [old[r.number] if r.status == NOT_RUN and r.number in old else r for r in current]
+    return [old[r.number] if r.number in old and r.number not in selected else r for r in current]

@@ -77,6 +77,7 @@ STAGE_NAMES: Dict[int, str] = {num: name for num, name, _ in STAGES}
 #: Stages that read runtime/bundle.tgz (stage 7 reads it too, beside the plan).
 NEEDS_BUNDLE = frozenset({2, 3, 5, 6, 7, 9})
 OPT_IN_FLAG = {10: "--publish", 11: "--schedule-sync"}
+APPLY_STAGE = 7
 
 
 class ShipUsageError(Exception):
@@ -105,6 +106,10 @@ class ShipOptions:
     scheduler_workspace: str = ""
     schedule_sync_dry_run: bool = False
     skip_bundle: bool = False
+    # False when --skip-stage drops stage 7: this pipeline applies nowhere (the
+    # generated shell's RUN_STAGE_7_APPLY=false), so a dry-run mode skips nothing.
+    # ``--stage 9`` alone keeps it True: stage 7 runs in another step of the run.
+    apply_in_pipeline: bool = True
 
 
 @dataclass
@@ -230,6 +235,7 @@ def resolve_options(args: object, contract: str, env: Mapping[str, str]) -> Ship
             bool(get("schedule_sync_dry_run")), env, "SCHEDULE_SYNC_DRY_RUN"
         ),
         skip_bundle=bool(get("skip_bundle")),
+        apply_in_pipeline=APPLY_STAGE not in {resolve_stage(t) for t in get("skip_stage") or []},
     )
 
 
@@ -259,7 +265,8 @@ def _unknown_stage(token: str) -> NoReturn:
 def resolve_stage(token: str) -> int:
     """``7``, ``apply``, ``policy``, ``generate_artifacts`` -> the stage number."""
     text = token.strip().lower()
-    if text.isdigit() and int(text) in STAGE_NAMES:
+    # ASCII only: str.isdigit() is also true for a superscript two, which int() refuses.
+    if text.isascii() and text.isdigit() and int(text) in STAGE_NAMES:
         return int(text)
     for num, name, aliases in STAGES:
         if text == name or text in aliases:
@@ -310,10 +317,21 @@ def parse_stage_spec(spec: str) -> List[int]:
 
 
 def _initial_stages(stage_spec: Optional[str], publish: bool, schedule_sync: bool) -> Set[int]:
-    """``--stage`` when given; else 1-9, plus the opt-in stages that were asked for."""
-    if stage_spec is not None:
-        return set(parse_stage_spec(stage_spec))
-    return set(range(1, 10)) | ({10} if publish else set()) | ({11} if schedule_sync else set())
+    """``--stage`` when given, else 1-9; plus the opt-in stages that were asked
+    for, either way: ``--stage 7-9 --publish`` publishes too."""
+    chosen = set(parse_stage_spec(stage_spec)) if stage_spec is not None else set(range(1, 10))
+    return chosen | ({10} if publish else set()) | ({11} if schedule_sync else set())
+
+
+def compact_spec(numbers: Sequence[int]) -> str:
+    """``[7, 8, 9, 11]`` -> ``"7-9,11"``: the ``--stage`` value naming exactly these."""
+    spans: List[List[int]] = []
+    for num in sorted(set(numbers)):
+        if spans and num == spans[-1][-1] + 1:
+            spans[-1].append(num)
+        else:
+            spans.append([num])
+    return ",".join(str(s[0]) if len(s) == 1 else f"{s[0]}-{s[-1]}" for s in spans)
 
 
 def _why_not_chosen(num: int, stage_spec: Optional[str]) -> str:
@@ -382,8 +400,20 @@ def _env_args(opts: ShipOptions) -> List[str]:
     return ["--env", opts.env]
 
 
+def applies_changes(opts: ShipOptions) -> bool:
+    """Whether stage 7 changes anything in this mode (every mode but dry-run)."""
+    return opts.mode != "dry-run"
+
+
+def _dry_run_applied_nothing(opts: ShipOptions) -> bool:
+    """As the generated shell decides it: stage 7 is in this pipeline, as a dry
+    run. A pipeline without stage 7 applies elsewhere, so its mode says nothing
+    about what is live, and verify, publish and schedule-sync run."""
+    return not applies_changes(opts) and opts.apply_in_pipeline
+
+
 def _skip_after_dry_run(opts: ShipOptions, what: str) -> Optional[str]:
-    if opts.mode == "dry-run":
+    if _dry_run_applied_nothing(opts):
         return f"APPLY_MODE dry-run applied nothing, so {what}"
     return None
 
@@ -409,6 +439,24 @@ def _contract_reference_only(contract: str) -> bool:
 
     with _quiet_probe():
         return bool(_contract_is_reference_only(contract))
+
+
+def schedules_expected(opts: ShipOptions) -> bool:
+    """Whether stage 3 writes schedule DAGs for this contract, by the rule
+    ``generate artifacts`` applies (an ``orchestration.engine``, or a build with
+    ``execution.trigger.schedule``). Only ``--explain`` asks; a run looks."""
+    from fluid_build.forge.core.artifact_fanout import (
+        FanoutError,
+        _load_schedule_contract,
+        _schedule_skip_reason,
+    )
+
+    with _quiet_probe():
+        try:
+            contract = _load_schedule_contract(Path(opts.contract), opts.env, logging.getLogger())
+        except FanoutError:  # a contract stage 3 cannot load fails stage 3 itself
+            return False
+        return _schedule_skip_reason(contract) is None
 
 
 def _effective_build_id(opts: ShipOptions) -> str:
@@ -645,7 +693,7 @@ def check_preconditions(
     for num in selected:
         ws = Workspace(root, produced)
         message = missing_input(num, ws)
-        if message and not (num == 9 and opts.mode == "dry-run"):
+        if message and not (num == 9 and _dry_run_applied_nothing(opts)):
             # verify is skipped after a dry run, so it reads nothing
             raise ShipUsageError(message)
         if num == 4 and not ws.has_dir(ARTIFACTS_DIR) and _generation_expected(opts):
@@ -675,10 +723,19 @@ def project_location(contract: str, cwd: Optional[str] = None) -> Tuple[str, str
     ``generate artifacts --contract-path`` records. A contract anywhere else
     (``fluid ship /tmp/x/contract.fluid.yaml``, as Command Center calls it) runs in
     its own directory.
+
+    Directories are compared resolved (macOS's /tmp is /private/tmp); the
+    contract file is not resolved: a symlinked contract runs where the link is,
+    under the link's name, as ``fluid bundle <link>`` would read it.
     """
     base = os.path.realpath(cwd or os.getcwd())
-    target = os.path.realpath(os.path.join(base, contract))
-    rel = os.path.relpath(target, base)
+    given = os.path.join(base, contract)
+    directory = os.path.realpath(os.path.dirname(given))
+    name = os.path.basename(given)
+    try:
+        rel = os.path.relpath(os.path.join(directory, name), base)
+    except ValueError:  # another drive (Windows): never below the current directory
+        return directory, name
     if rel == ".." or rel.startswith(".." + os.sep) or os.path.isabs(rel):
-        return os.path.dirname(target), os.path.basename(target)
+        return directory, name
     return base, Path(rel).as_posix()

@@ -11,9 +11,10 @@ One runner, used identically on a laptop and in CI::
 Apply runs the plan stage 6 wrote against the bundle stage 1 froze, never a
 re-plan from the contract, so what was reviewed is what is applied. Each stage
 is its own ``fluid`` process (``python -m fluid_build.cli <stage> ...``), so
-flag handling is exactly the standalone command's and a failing stage leaves
-the same exit code and output it would on its own. Output streams through
-unbuffered; ship adds only CI-native group markers around it.
+flag handling is exactly the standalone command's and a failing stage prints
+what it would on its own. Output streams through unbuffered; ship adds only
+CI-native group markers around it. Ship's exit status is its own (0, 1, 2, 3
+or 130, see ``_ship_report``); each stage's exit code is in the run report.
 
 Stage semantics live in :mod:`fluid_build.cli._ship_stages` and mirror the
 shell bodies generated CI files ran before (a test runs both and compares).
@@ -26,6 +27,7 @@ import argparse
 import contextlib
 import logging
 import os
+import secrets
 import shlex
 import signal
 import subprocess
@@ -42,6 +44,7 @@ from . import _ship_stages as st
 from ._common import CLIError, auto_find_contract
 
 COMMAND = "ship"
+DEFAULT_REPORT_DIR = "runtime"
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -54,15 +57,18 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "   5 diff       6 plan            7 apply                8 policy apply\n"
             "   9 verify    10 publish (--publish)   11 schedule sync (--schedule-sync)\n\n"
             "Apply runs the reviewed plan (runtime/plan.json) against the frozen bundle "
-            "(runtime/bundle.tgz). Stops at the first failing stage and returns its exit "
-            "code. Every run writes runtime/ship-report.json and runtime/ship-junit.xml. "
-            "Precedence: flag > environment variable > default."
+            "(runtime/bundle.tgz). Stops at the first failing stage. Every run that starts "
+            "a stage writes runtime/ship-report.json and runtime/ship-junit.xml, with each "
+            "stage's exit code. Precedence: flag > environment variable > default."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Stages (name or number): bundle, validate, generate-artifacts (artifacts), "
             "validate-artifacts, diff, plan, apply, policy-apply (policy), verify, publish, "
             "schedule-sync.\n\n"
+            "Exit status: 0 every selected stage passed or was skipped; 1 a stage failed; "
+            "2 ship refused its arguments; 3 a stage failed after apply changed something, "
+            "so those changes are live; 130 interrupted.\n\n"
             "Environment variables read when the flag is absent: FLUID_ENV, APPLY_MODE, "
             "APPLY_BUILD_ID, ALLOW_DATA_LOSS, NO_VERIFY_DIGEST, PUBLISH_TARGETS, SCHEDULER, "
             "SCHEDULER_DESTINATION, SCHEDULER_ENVIRONMENT_NAME, SCHEDULER_LOCATION, "
@@ -138,7 +144,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
 
     g = p.add_argument_group("publish and schedule (opt-in stages 10 and 11)")
-    g.add_argument("--publish", action="store_true", help="Run stage 10 (publish).")
+    g.add_argument(
+        "--publish", action="store_true", help="Run stage 10 (publish), with --stage too."
+    )
     g.add_argument(
         "--target",
         action="append",
@@ -146,7 +154,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         metavar="CATALOG",
         help="Catalog to publish to; repeatable (default: $PUBLISH_TARGETS, datamesh-manager).",
     )
-    g.add_argument("--schedule-sync", action="store_true", help="Run stage 11 (schedule sync).")
+    g.add_argument(
+        "--schedule-sync",
+        action="store_true",
+        help="Run stage 11 (schedule sync), with --stage too.",
+    )
     g.add_argument("--scheduler", default=None, help="Scheduler for stage 11 ($SCHEDULER).")
     g.add_argument("--scheduler-destination", default=None, help="schedule-sync --destination.")
     g.add_argument(
@@ -188,8 +200,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
     g.add_argument(
         "--report-dir",
-        default="runtime",
-        help="Where ship-report.json and ship-junit.xml go (default: runtime).",
+        default=None,
+        help=(
+            "Where ship-report.json and ship-junit.xml go (default: runtime/ beside the "
+            "contract; a relative path is taken from the current directory)."
+        ),
     )
     p.set_defaults(cmd=COMMAND, func=run)
 
@@ -201,16 +216,19 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         return _run(args, logger)
     except st.ShipUsageError as exc:
         logger.error("fluid ship: %s", _ci_output.oneline(str(exc)))
-        return 2
+        return report.EXIT_USAGE
 
 
 def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
+    # Taken from where the command was typed, before ship moves to the contract.
+    given = getattr(args, "report_dir", None)
+    report_dir = os.path.abspath(given) if given else DEFAULT_REPORT_DIR
     opts, selected, not_selected, project_dir = _prepare(args)
     with _working_directory(project_dir):
         if args.explain:
             return _explain(opts, selected, not_selected)
         st.check_preconditions(selected, opts)
-        return _run_selected(args, logger, opts, selected, not_selected)
+        return _run_selected(args, logger, opts, selected, not_selected, report_dir)
 
 
 @contextlib.contextmanager
@@ -234,11 +252,12 @@ def _run_selected(
     opts: st.ShipOptions,
     selected: List[int],
     not_selected: Dict[int, str],
+    report_dir: str,
 ) -> int:
     # A run that bundles is a new run; one that starts later picks up where the
     # last run in this directory stopped (one CI step per stage).
     fresh = 1 in selected
-    run_id = _run_id(fresh)
+    run_id = _run_id(fresh, logger)
     ctx = _Context(
         opts=opts,
         ci=_ci_output.CiOutput(_ci_output.detect(args.ci_output)),
@@ -247,13 +266,13 @@ def _run_selected(
         logger=logger,
         run_id=run_id,
         fresh=fresh,
-        report_dir=args.report_dir,
+        selected=selected,
+        report_dir=report_dir,
     )
     records = {
         num: report.StageRecord(num, st.STAGE_NAMES[num], reason=not_selected.get(num))
         for num in st.STAGE_NUMBERS
     }
-    exit_code = 0
     rows: List[Tuple[int, str, str, float]] = []
     for num in selected:
         rec = records[num]
@@ -261,10 +280,9 @@ def _run_selected(
         skipped = rec.status == report.SKIPPED
         rows.append((num, rec.name, rec.status, 0.0 if skipped else rec.duration_seconds))
         if rec.status == report.FAILED:
-            exit_code = int(rec.exit_code or 1)
             _report_abort(num, rec, ctx)
             break
-    return _finish(records, rows, exit_code, ctx)
+    return _finish(records, rows, ctx)
 
 
 @dataclass
@@ -278,6 +296,7 @@ class _Context:
     logger: logging.Logger
     run_id: str
     fresh: bool  # this run bundles: it starts a new report, never merges an old one
+    selected: List[int]  # this invocation's stages: their records are never merged in
     report_dir: str
 
 
@@ -293,7 +312,7 @@ def _prepare(
         )
     if not auto_find_contract(args):
         raise CLIError(
-            1,
+            report.EXIT_USAGE,
             "contract_required",
             {
                 "message": (
@@ -301,6 +320,10 @@ def _prepare(
                 )
             },
         )
+    if not os.path.isfile(args.contract):
+        # Before anything is written: a mistyped path never leaves a .fluid/ or a
+        # runtime/ behind in whatever directory it names.
+        raise st.ShipUsageError(f"no contract file at {args.contract!r}")
     # Every stage gets the contract as a POSIX path relative to the directory it
     # runs in (``generate artifacts --contract-path`` refuses any other form).
     project_dir, args.contract = st.project_location(args.contract)
@@ -323,16 +346,18 @@ def _run_one(num: int, rec: report.StageRecord, ctx: _Context) -> None:
     """Run stage ``num`` into ``rec``: passed, failed (with its exit code) or skipped."""
     started = time.monotonic()
     ctx.ci.stage_start(num, rec.name)
-    # The whole stage body is fenced, not only the child: building the stage
-    # reads the contract in this process (its build id, whether it is
-    # reference-only), and that text is the checkout's, not ship's.
-    with ctx.ci.fenced():
-        rc = _attempt(num, rec, ctx)
-    if rc is not None:  # a skipped stage keeps no duration and no exit code
-        rec.duration_seconds = time.monotonic() - started
-        rec.exit_code = rc
-        rec.status = report.PASSED if rc == 0 else report.FAILED
-    ctx.ci.stage_end(num, rec.name)
+    try:
+        # The whole stage body is fenced, not only the child: building the stage
+        # reads the contract in this process (its build id, whether it is
+        # reference-only), and that text is the checkout's, not ship's.
+        with ctx.ci.fenced():
+            rc = _attempt(num, rec, ctx)
+        if rc is not None:  # a skipped stage keeps no duration and no exit code
+            rec.duration_seconds = time.monotonic() - started
+            rec.exit_code = rc
+            rec.status = report.PASSED if rc == 0 else report.FAILED
+    finally:  # closed even when ship itself fails, so its error is not folded away
+        ctx.ci.stage_end(num, rec.name)
 
 
 def _attempt(num: int, rec: report.StageRecord, ctx: _Context) -> Optional[int]:
@@ -354,7 +379,12 @@ def _attempt(num: int, rec: report.StageRecord, ctx: _Context) -> Optional[int]:
         ctx.ci.info(missing)
         return 2
     if num in (1, 10):
-        Path("runtime").mkdir(parents=True, exist_ok=True)
+        try:
+            Path("runtime").mkdir(parents=True, exist_ok=True)
+        except OSError as exc:  # a file named runtime, a read-only checkout
+            rec.reason = f"cannot create runtime/: {exc.strerror or exc}"
+            ctx.ci.info(f"stage {num} {rec.name}: {rec.reason}")
+            return 1
     try:
         return _run_stage(
             ctx.fluid_bin, action.argv[0], action.argv[1:], ctx.logger, env=ctx.child_env, ci=ctx.ci
@@ -381,18 +411,27 @@ def _report_abort(num: int, rec: report.StageRecord, ctx: _Context) -> None:
 def _finish(
     records: Dict[int, report.StageRecord],
     rows: List[Tuple[int, str, str, float]],
-    exit_code: int,
     ctx: _Context,
 ) -> int:
-    """Reports, the CI summary and the closing line; returns the run's exit code."""
+    """Reports, the CI summary and the closing line; returns the exit status."""
     ordered = [records[n] for n in st.STAGE_NUMBERS]
     for rec in ordered:
         if rec.status == report.NOT_RUN and rec.reason is None:
             rec.reason = "an earlier stage failed"
-    if any(r.reason == "interrupted" for r in ordered):
-        exit_code = 130
-    _write_reports(ctx, exit_code, ordered)
+    interrupted = any(r.reason == "interrupted" for r in ordered)
+    exit_code = (
+        report.EXIT_INTERRUPTED
+        if interrupted
+        else report.exit_status(ordered, applies=st.applies_changes(ctx.opts))
+    )
+    _write_reports(ctx, ordered, interrupted)
     ctx.ci.summary(rows)
+    if exit_code == report.EXIT_PARTIAL:
+        ctx.logger.error(
+            "Stage 7 apply had passed, so its changes are live and the run is incomplete "
+            "(exit %d).",
+            exit_code,
+        )
     if exit_code == 0:
         passed = sum(1 for r in ordered if r.status == report.PASSED)
         skipped = sum(1 for r in ordered if r.status == report.SKIPPED)
@@ -402,15 +441,16 @@ def _finish(
 
 
 def _hint_after_until(ordered: List[report.StageRecord], ci: _ci_output.CiOutput) -> None:
-    """After ``--until``, say how to go on from where the run stopped."""
-    stopped = [r for r in ordered if (r.reason or "").startswith("after --until")]
+    """After ``--until``, say how to go on from where the run stopped: the stages
+    the same command would have run past the limit, as one ``--stage`` value."""
+    stopped = [r.number for r in ordered if (r.reason or "").startswith("after --until")]
     if not stopped:
         return
-    nxt = stopped[0].number
-    review = " Review runtime/plan.json first." if nxt == 7 else ""
+    nxt = stopped[0]
+    review = " Review runtime/plan.json first." if nxt == st.APPLY_STAGE else ""
     ci.info(
-        f"Stopped before stage {nxt} {stopped[0].name} (--until).{review} To go on, run the "
-        f"same command with --stage {nxt}-9 in place of --until."
+        f"Stopped before stage {nxt} {st.STAGE_NAMES[nxt]} (--until).{review} To go on, run "
+        f"the same command with --stage {st.compact_spec(stopped)} in place of --until."
     )
 
 
@@ -460,18 +500,24 @@ def _explain_stage(
         _out(f"{head} run      fluid {shlex.join(_safe_argv(action.argv))}")
     for note in action.notes:
         _out(f"     {'':<19} note: {note}")
-    _assume_outputs(num, action, ws)
+    _assume_outputs(num, action, ws, opts)
     return None
 
 
-def _assume_outputs(num: int, action: st.StageAction, ws: st.Workspace) -> None:
+def _assume_outputs(
+    num: int, action: st.StageAction, ws: st.Workspace, opts: st.ShipOptions
+) -> None:
     """What a real run would have on disk by the time later stages look."""
     if num == 1:
         ws.assume.add(st.BUNDLE_PATH)
     elif num == 6:
         ws.assume.add(st.PLAN_PATH)
     elif num == 3 and action.argv is not None:
-        ws.assume.update({"dist/artifacts", st.POLICY_BINDINGS, st.SCHEDULE_DIR})
+        # Policy bindings are always written (empty when no policy is declared);
+        # schedule DAGs only for a contract that declares something to schedule.
+        ws.assume.update({"dist/artifacts", st.POLICY_BINDINGS})
+        if st.schedules_expected(opts):
+            ws.assume.add(st.SCHEDULE_DIR)
 
 
 def _out(text: str) -> None:
@@ -485,19 +531,29 @@ def _safe_argv(argv: List[str]) -> List[str]:
     return list(_sanitize_argv(list(argv)))
 
 
-def _run_id(fresh: bool) -> str:
+def _run_id(fresh: bool, logger: logging.Logger) -> str:
     """``$FLUID_RUN_ID`` (CI sets it per job), else ``.fluid/run-id.txt``. A fresh
     run (one that bundles) replaces a persisted id, so it never merges into the
-    report of an earlier, unrelated run in the same directory."""
+    report of an earlier, unrelated run in the same directory. An id that cannot
+    be kept there (``.fluid`` is a file, the file is not text, the checkout is
+    read-only) still names this run; the stages get it through the environment."""
     from fluid_build.observability.run_id import (
         RUN_ID_ENV_VAR,
         clear_run_id,
         get_or_create_run_id,
     )
 
-    if fresh and not os.environ.get(RUN_ID_ENV_VAR):
-        clear_run_id()
-    return str(get_or_create_run_id())
+    try:
+        if fresh and not os.environ.get(RUN_ID_ENV_VAR):
+            clear_run_id()
+        return str(get_or_create_run_id())
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "fluid ship: cannot keep the run id in .fluid/run-id.txt (%s); a later "
+            "--stage run starts its own report",
+            _ci_output.oneline(str(exc)),
+        )
+        return secrets.token_hex(6)
 
 
 def _child_env(run_id: str) -> Dict[str, str]:
@@ -508,7 +564,11 @@ def _child_env(run_id: str) -> Dict[str, str]:
     return env
 
 
-def _write_reports(ctx: _Context, exit_code: int, ordered: List[report.StageRecord]) -> None:
+def _write_reports(ctx: _Context, ordered: List[report.StageRecord], interrupted: bool) -> None:
+    """The report of the whole run: this invocation's records, plus those an
+    earlier invocation of the same run left for the stages not selected now.
+    Its ``exit_code`` is the run's status, which per-stage CI steps spread over
+    several invocations."""
     opts = ctx.opts
     directory = Path(ctx.report_dir)
     try:
@@ -516,8 +576,19 @@ def _write_reports(ctx: _Context, exit_code: int, ordered: List[report.StageReco
             ordered
             if ctx.fresh
             else report.merge_with_previous(
-                directory, ctx.run_id, ordered, env=opts.env, mode=opts.mode, contract=opts.contract
+                directory,
+                ctx.run_id,
+                ordered,
+                selected=ctx.selected,
+                env=opts.env,
+                mode=opts.mode,
+                contract=opts.contract,
             )
+        )
+        status = (
+            report.EXIT_INTERRUPTED
+            if interrupted
+            else report.exit_status(merged, applies=st.applies_changes(opts))
         )
         body = report.build_report(
             merged,
@@ -525,12 +596,14 @@ def _write_reports(ctx: _Context, exit_code: int, ordered: List[report.StageReco
             env=opts.env,
             mode=opts.mode,
             contract=opts.contract,
-            exit_code=exit_code if merged is ordered else report.first_failure(merged),
+            exit_code=status,
         )
         report.write_reports(directory, body, merged)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         ctx.logger.warning(
-            "fluid ship: could not write the run report to %s: %s", ctx.report_dir, exc
+            "fluid ship: could not write the run report to %s: %s",
+            ctx.report_dir,
+            _ci_output.oneline(str(exc)),
         )
 
 
@@ -587,20 +660,22 @@ def _run_stage(
         if ci is not None:
             ci.after_child()
     if interrupts:
-        raise KeyboardInterrupt  # the stage stopped on its own; stop the run after it
+        raise KeyboardInterrupt  # the stage has ended; stop the run after it
     return 1 if rc < 0 else rc
 
 
 @contextlib.contextmanager
 def _patient_interrupts(say: Callable[[str], None]) -> Iterator[List[int]]:
-    """While a stage runs, the first Ctrl-C lets it stop on its own.
+    """While a stage runs, the first Ctrl-C lets it end on its own.
 
     A terminal sends SIGINT to the whole foreground process group, so the child
     got it too and may be cleaning up (``fluid apply`` releasing an OpenTofu
     state lock). ``subprocess.run`` would kill it 0.25s later; instead the first
-    Ctrl-C is recorded and the run stops once the child has exited. A second
-    Ctrl-C raises here, and ``subprocess.run`` kills the child, as ``make`` and
-    OpenTofu do.
+    Ctrl-C is recorded and the run stops once the child has exited. A SIGINT sent
+    to ship's process alone does not reach the child, which then runs to its
+    end; ship never forwards it, since a second SIGINT makes OpenTofu abandon a
+    running apply. A second Ctrl-C raises here, and ``subprocess.run`` kills the
+    child, as ``make`` and OpenTofu do.
     """
     hits: List[int] = []
 
@@ -608,7 +683,7 @@ def _patient_interrupts(say: Callable[[str], None]) -> Iterator[List[int]]:
         hits.append(signum)
         if len(hits) > 1:
             raise KeyboardInterrupt
-        say("interrupted: the stage is stopping on its own (press Ctrl-C again to kill it)")
+        say("interrupted: ship stops when this stage ends (press Ctrl-C again to stop it now)")
 
     try:
         previous = signal.signal(signal.SIGINT, on_sigint)
