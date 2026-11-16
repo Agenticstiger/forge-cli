@@ -272,9 +272,6 @@ class _Connection:
     def fetchall(self):
         return [("a", "VARCHAR")]
 
-    def fetchmany(self, size):
-        return []
-
 
 def test_an_error_once_records_are_read_is_named_by_its_class_alone():
     from fluid_build.profiler.sources import _fetch
