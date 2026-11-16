@@ -27,7 +27,7 @@ when the expression is a single aggregate call, and
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fluid_build.forge_datamodel import time_grains as _time_grains
 
@@ -171,13 +171,32 @@ def validate_semantics_block(contract: Mapping[str, Any]) -> Tuple[List[str], Li
     is ambiguous and the author should know. A WARNING, not an error:
     contracts carrying the collision still answer queries correctly, so
     failing them outright would break working models.
+
+    Checks the references of ``relationships`` (schema 0.7.7,
+    RFC-semantics-tier1 §4) that a JSON Schema cannot: ``to`` is an expose
+    of this contract, ``fromColumns`` and ``toColumns`` have the same length
+    (they pair up by position, as Apache Ossie's ``from_columns`` and
+    ``to_columns`` do), and every column is one its own expose's
+    ``contract.schema`` declares. Errors: a consumer that follows the
+    relationship, a join or a generator writing keys, would read columns
+    that do not exist. That the arrays are not empty is the schema's rule
+    (``minItems: 1``). It WARNS when a one-column relationship has no
+    matching entity pair, because the dbt MetricFlow export joins by entity
+    name and would not follow the relationship: entity/relationship drift.
+
+    And the validity window of a type II slowly changing dimension (§5),
+    with the rules dbt-semantic-interfaces' ``SemanticModelValidityWindowRule``
+    applies: exactly two time dimensions carry ``typeParams.validityParams``,
+    one ``isStart`` and the other ``isEnd``, and the model declares one
+    ``natural`` entity, the key whose versions the window separates. Errors:
+    without them no consumer can tell which version applies at a time.
     """
     errors: List[str] = []
     warnings: List[str] = []
     exposes = contract.get("exposes")
     if not isinstance(exposes, list):
         return errors, warnings
-    for expose in exposes:
+    for position, expose in enumerate(exposes):
         if not isinstance(expose, Mapping):
             continue
         semantics = expose.get("semantics")
@@ -222,7 +241,275 @@ def validate_semantics_block(contract: Mapping[str, Any]) -> Tuple[List[str], Li
                 f"by the underlying column."
             )
         warnings.extend(_name_collision_warnings(semantics, expose_id))
+        errors.extend(_validity_window_errors(semantics, _expose_path(expose, position)))
+    relationship_errors, relationship_warnings = _relationship_findings(exposes)
+    errors.extend(relationship_errors)
+    warnings.extend(relationship_warnings)
     return errors, warnings
+
+
+#: The entity types that can hold a relationship's target key. dbt MetricFlow joins
+#: an entity to a primary or unique entity of the same name
+#: (https://docs.getdbt.com/docs/build/join-logic), and to the natural entity of a
+#: model with a validity window.
+_TARGET_KEY_ENTITY_TYPES = frozenset({"primary", "unique", "natural"})
+
+
+def _expose_path(expose: Mapping[str, Any], position: int) -> str:
+    """``exposes[<exposeId>]``, or the position: the prefix ``fluid validate`` points at."""
+    expose_id = expose.get("exposeId")
+    return f"exposes[{expose_id if isinstance(expose_id, str) and expose_id else position}]"
+
+
+def declared_columns(expose: Mapping[str, Any]) -> List[str]:
+    """The column names ``expose``'s ``contract.schema`` declares, in order."""
+    contract = expose.get("contract")
+    schema = contract.get("schema") if isinstance(contract, Mapping) else None
+    if not isinstance(schema, list):
+        return []
+    return [
+        column["name"]
+        for column in schema
+        if isinstance(column, Mapping) and isinstance(column.get("name"), str)
+    ]
+
+
+def _column_list(value: Any) -> List[str]:
+    """A ``fromColumns`` / ``toColumns`` value as a list, or ``[]`` when the schema refuses it."""
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return []
+    return list(value)
+
+
+def _column_errors(
+    where: str, columns: Sequence[str], expose_path: str, declared: Sequence[str]
+) -> List[str]:
+    """One error per column of ``columns`` that ``declared`` (its expose's schema) lacks."""
+    if not declared:
+        named = ", ".join(repr(column) for column in columns)
+        return [
+            f"{where}: {expose_path} declares no contract.schema columns, so {named} "
+            f"cannot be checked. Declare the expose's columns."
+        ]
+    known = set(declared)
+    folded = {column.casefold(): column for column in declared}
+    errors: List[str] = []
+    for column in columns:
+        if column in known:
+            continue
+        near = folded.get(column.casefold())
+        hint = f" (did you mean {near!r}?)" if near else ""
+        errors.append(
+            f"{where}: {column!r} is not a column of {expose_path}{hint}. "
+            f"Name a column its contract.schema declares."
+        )
+    return errors
+
+
+def entity_column(entity: Mapping[str, Any]) -> Optional[str]:
+    """The column an entity keys on: its ``expr``, else its name (the schema's default)."""
+    value = entity.get("expr") or entity.get("name")
+    return value if isinstance(value, str) else None
+
+
+def _entity_names(
+    expose: Mapping[str, Any], column: str, types: Optional[FrozenSet[str]] = None
+) -> Set[str]:
+    """Case-folded names of the entities of ``expose`` keyed on ``column`` (of ``types``)."""
+    semantics = expose.get("semantics")
+    entities = semantics.get("entities") if isinstance(semantics, Mapping) else None
+    names: Set[str] = set()
+    for entity in entities if isinstance(entities, list) else []:
+        if not isinstance(entity, Mapping) or not isinstance(entity.get("name"), str):
+            continue
+        if types is not None and str(entity.get("type") or "").lower() not in types:
+            continue
+        if entity_column(entity) == column:
+            names.add(entity["name"].casefold())
+    return names
+
+
+def _relationship_findings(exposes: Sequence[Any]) -> Tuple[List[str], List[str]]:
+    """Referential errors and entity-drift warnings for every ``semantics.relationships``."""
+    errors: List[str] = []
+    warnings: List[str] = []
+    by_id: Dict[str, Tuple[Mapping[str, Any], str]] = {}
+    for position, expose in enumerate(exposes):
+        if isinstance(expose, Mapping) and isinstance(expose.get("exposeId"), str):
+            by_id.setdefault(expose["exposeId"], (expose, _expose_path(expose, position)))
+    for position, expose in enumerate(exposes):
+        if not isinstance(expose, Mapping):
+            continue
+        semantics = expose.get("semantics")
+        relationships = semantics.get("relationships") if isinstance(semantics, Mapping) else None
+        if not isinstance(relationships, list):
+            continue
+        path = _expose_path(expose, position)
+        first_with_name: Dict[str, int] = {}
+        for index, relationship in enumerate(relationships):
+            if not isinstance(relationship, Mapping):
+                continue
+            where = f"{path}.semantics.relationships[{index}]"
+            name = relationship.get("name")
+            if isinstance(name, str):
+                if name in first_with_name:
+                    errors.append(
+                        f"{where}: the name {name!r} is relationships[{first_with_name[name]}]'s "
+                        f"too. A relationship is referred to by its name, so the names in one "
+                        f"expose must differ."
+                    )
+                else:
+                    first_with_name[name] = index
+            found: List[str] = []
+            target_id = relationship.get("to")
+            target = by_id.get(target_id) if isinstance(target_id, str) else None
+            if isinstance(target_id, str) and target is None:
+                found.append(
+                    f"{where}.to: {target_id!r} is not an exposeId of this contract "
+                    f"({', '.join(sorted(by_id)) or 'none'}). A relationship joins two exposes "
+                    f"of one contract."
+                )
+            from_columns = _column_list(relationship.get("fromColumns"))
+            to_columns = _column_list(relationship.get("toColumns"))
+            if from_columns and to_columns and len(from_columns) != len(to_columns):
+                found.append(
+                    f"{where}: fromColumns has {len(from_columns)} columns and toColumns "
+                    f"{len(to_columns)}. They pair up by position, so they must be the same "
+                    f"length."
+                )
+            if from_columns:
+                found.extend(
+                    _column_errors(
+                        f"{where}.fromColumns", from_columns, path, declared_columns(expose)
+                    )
+                )
+            if to_columns and target is not None:
+                target_expose, target_path = target
+                found.extend(
+                    _column_errors(
+                        f"{where}.toColumns",
+                        to_columns,
+                        target_path,
+                        declared_columns(target_expose),
+                    )
+                )
+            errors.extend(found)
+            if found or target is None or len(from_columns) != 1 or len(to_columns) != 1:
+                continue
+            target_expose, target_path = target
+            if target_expose is expose:
+                # A self-join: one model cannot hold two entities of one name, so
+                # MetricFlow has no entity pair to declare. Nothing to drift from.
+                continue
+            from_names = _entity_names(expose, from_columns[0])
+            target_names = _entity_names(target_expose, to_columns[0], _TARGET_KEY_ENTITY_TYPES)
+            if from_names & target_names:
+                continue
+            warnings.append(
+                f"{where}: no entity pair matches this relationship, and the dbt MetricFlow "
+                f"export joins by entity name, so it will not follow the relationship. Declare "
+                f"an entity with expr {from_columns[0]!r} on {path} (type foreign) and one of "
+                f"the same name with expr {to_columns[0]!r} on {target_path} (type primary, "
+                f"unique or natural)."
+            )
+    return errors, warnings
+
+
+def _validity_params(dimension: Any) -> Optional[Mapping[str, Any]]:
+    """A dimension's ``typeParams.validityParams``, or ``None``."""
+    if not isinstance(dimension, Mapping):
+        return None
+    type_params = dimension.get("typeParams")
+    validity = type_params.get("validityParams") if isinstance(type_params, Mapping) else None
+    return validity if isinstance(validity, Mapping) else None
+
+
+def declares_validity_params(semantics: Mapping[str, Any]) -> bool:
+    """True when any dimension of ``semantics`` carries ``typeParams.validityParams``."""
+    return any(_validity_params(d) is not None for d in semantics.get("dimensions") or [])
+
+
+def validity_window(semantics: Mapping[str, Any]) -> Optional[Tuple[str, str, str]]:
+    """``(start dimension, end dimension, natural entity)`` of the model's validity window.
+
+    ``None`` when the model declares none, and when its window breaks a rule
+    :func:`validate_semantics_block` reports: a consumer acts on a well-formed
+    window only, so the dbt bridge and the validator share one definition of it.
+    """
+    if not declares_validity_params(semantics) or _validity_window_errors(semantics, ""):
+        return None
+    start = end = None
+    for dimension in semantics.get("dimensions") or []:
+        validity = _validity_params(dimension)
+        if validity is None:
+            continue
+        if validity.get("isStart") is True:
+            start = str(dimension.get("name"))
+        elif validity.get("isEnd") is True:
+            end = str(dimension.get("name"))
+    natural = next(
+        str(entity.get("name"))
+        for entity in semantics.get("entities") or []
+        if isinstance(entity, Mapping) and str(entity.get("type") or "").lower() == "natural"
+    )
+    if start is None or end is None:
+        return None
+    return start, end, natural
+
+
+def _bound_flags(validity: Mapping[str, Any]) -> str:
+    """Which ends of the window a ``validityParams`` marks, for a message."""
+    flags = [key for key in ("isStart", "isEnd") if validity.get(key) is True]
+    return " and ".join(flags) if flags else "neither isStart nor isEnd"
+
+
+def _validity_window_errors(semantics: Mapping[str, Any], expose_path: str) -> List[str]:
+    """The validity window rules (dbt-semantic-interfaces ``SemanticModelValidityWindowRule``)."""
+    errors: List[str] = []
+    bounds: List[Tuple[str, Mapping[str, Any]]] = []
+    for index, dimension in enumerate(semantics.get("dimensions") or []):
+        validity = _validity_params(dimension)
+        if validity is None:
+            continue
+        name = str(dimension.get("name") or index)
+        bounds.append((name, validity))
+        if str(dimension.get("type") or "").lower() != "time":
+            errors.append(
+                f"{expose_path}.semantics.dimensions[{index}].typeParams.validityParams: "
+                f"dimension {name!r} is {dimension.get('type')!r}, but a validity window is "
+                f"bounded by times. Make it type: time, or remove validityParams."
+            )
+    if not bounds:
+        return errors
+    starts = [name for name, validity in bounds if validity.get("isStart") is True]
+    ends = [name for name, validity in bounds if validity.get("isEnd") is True]
+    both = [n for n, v in bounds if v.get("isStart") is True and v.get("isEnd") is True]
+    if len(bounds) != 2 or len(starts) != 1 or len(ends) != 1 or both:
+        found = ", ".join(f"{name} ({_bound_flags(validity)})" for name, validity in bounds)
+        errors.append(
+            f"{expose_path}.semantics: a validity window is exactly two time dimensions, one "
+            f"with validityParams.isStart and the other with validityParams.isEnd; this model "
+            f"has {found}."
+        )
+    naturals = [
+        str(entity.get("name"))
+        for entity in semantics.get("entities") or []
+        if isinstance(entity, Mapping) and str(entity.get("type") or "").lower() == "natural"
+    ]
+    window = ", ".join(name for name, _ in bounds)
+    if not naturals:
+        errors.append(
+            f"{expose_path}.semantics: {window} declare a validity window, but the model "
+            f"declares no natural entity. The window separates the versions of one natural "
+            f"key: declare it, e.g. {{name: customer, type: natural, expr: customer_id}}."
+        )
+    elif len(naturals) > 1:
+        errors.append(
+            f"{expose_path}.semantics: a validity window separates the versions of one natural "
+            f"key, but the model declares {len(naturals)} natural entities "
+            f"({', '.join(naturals)}). Keep one."
+        )
+    return errors
 
 
 def _semantic_names(semantics: Mapping[str, Any], kind: str) -> Dict[str, str]:
@@ -294,6 +581,43 @@ def _name_collision_warnings(semantics: Mapping[str, Any], expose_id: str) -> Li
             f"dropped from every row. Rename one of them."
         )
     return messages
+
+
+#: The first schema version with ``semantics.relationships`` and
+#: ``dimensions[].typeParams.validityParams`` (opened as the 0.7.7 preview).
+RELATIONSHIPS_VERSION = "0.7.7"
+
+
+def _version_key(version: Any) -> Tuple[int, ...]:
+    """``"0.7.6"`` as ``(0, 7, 6)``; ``()`` for a value that is not a dotted version."""
+    parts = str(version or "").split(".")
+    return tuple(int(part) for part in parts) if all(p.isdigit() for p in parts) else ()
+
+
+def carries_relationship_keys(contract: Mapping[str, Any]) -> bool:
+    """True when an expose of ``contract`` declares a relationship or a validity window bound."""
+    for expose in contract.get("exposes") or []:
+        semantics = expose.get("semantics") if isinstance(expose, Mapping) else None
+        if not isinstance(semantics, Mapping):
+            continue
+        if semantics.get("relationships") or declares_validity_params(semantics):
+            return True
+    return False
+
+
+def version_for_relationship_keys(contract: Mapping[str, Any]) -> Optional[str]:
+    """The ``fluidVersion`` a generated ``contract`` needs for its relationships and validity
+    params, when its own predates them; ``None`` when it carries neither or already has it.
+
+    For a producer (the dbt importer, the data-model emitter) that writes the newest stable
+    version and only sometimes one of these fields: the contract moves to the version that
+    holds them only when it uses them, so every other contract keeps its version and digest.
+    """
+    if not carries_relationship_keys(contract):
+        return None
+    if _version_key(contract.get("fluidVersion")) >= _version_key(RELATIONSHIPS_VERSION):
+        return None
+    return RELATIONSHIPS_VERSION
 
 
 def simple_metric(name: str, measure: str, *, description: Optional[str] = None) -> Dict[str, Any]:

@@ -88,6 +88,9 @@ def format_schema_error(error: Any) -> str:
             "'lakeflow' (a Databricks Lakeflow Declarative Pipeline) is an engine of the 0.7.7 "
             "preview schema: set the contract's fluidVersion to 0.7.7 to use it"
         )
+    preview_hint = _preview_field_hint(error, path)
+    if preview_hint:
+        return preview_hint
     if error.validator == "not" and isinstance(value, dict) and list(value) == ["required"]:
         why = error.schema.get("description") if isinstance(error.schema, dict) else None
         if isinstance(why, str) and why:
@@ -110,18 +113,58 @@ def format_schema_error(error: Any) -> str:
     return f"fails {error.validator}: {error.validator_value!r} (value not shown)"
 
 
-def _unexpected_key(error: Any) -> Optional[str]:
-    """The first key an ``additionalProperties`` error is about, or ``None``."""
-    if error.validator != "additionalProperties" or not isinstance(error.instance, dict):
+#: Fields of the 0.7.7 preview, by the object that holds them (the last key of its path)
+#: and a key its path must contain: an older schema's message would only say the field
+#: was unexpected.
+_PREVIEW_FIELDS = {
+    ("semantics", "relationships"): ("exposes", "named relationships between exposes"),
+    ("typeParams", "validityParams"): (
+        "dimensions",
+        "the validity window of a slowly changing dimension",
+    ),
+}
+
+
+def _preview_field_hint(error: Any, path: List[Any]) -> Optional[str]:
+    """What to do about a 0.7.7 preview field on a contract of an older version, or ``None``.
+
+    Only when every key the object does not take is such a field: a typo next to one
+    keeps jsonschema's message, which names every unexpected key.
+    """
+    keys = _unexpected_keys(error)
+    if not keys or not path:
         return None
+    hints = []
+    for key in keys:
+        field = _PREVIEW_FIELDS.get((path[-1], key))
+        if field is None or field[0] not in path:
+            return None
+        hints.append(f"'{key}' ({field[1]})")
+    return (
+        f"{' and '.join(hints)} {'is a field' if len(hints) == 1 else 'are fields'} of the "
+        "0.7.7 preview schema: set the contract's fluidVersion to 0.7.7 to use it"
+    )
+
+
+def _unexpected_keys(error: Any) -> List[str]:
+    """The keys an ``additionalProperties`` error is about, in the object's order."""
+    if error.validator != "additionalProperties" or not isinstance(error.instance, dict):
+        return []
     schema = error.schema if isinstance(error.schema, dict) else {}
     known = schema.get("properties") or {}
     patterns = list((schema.get("patternProperties") or {}).keys())
-    for key in error.instance:
-        # re.search, as jsonschema's additionalProperties reads these keys.
-        if key not in known and not any(re.search(p, str(key)) for p in patterns):
-            return key
-    return None
+    # re.search, as jsonschema's additionalProperties reads these keys.
+    return [
+        key
+        for key in error.instance
+        if key not in known and not any(re.search(p, str(key)) for p in patterns)
+    ]
+
+
+def _unexpected_key(error: Any) -> Optional[str]:
+    """The first key an ``additionalProperties`` error is about, or ``None``."""
+    keys = _unexpected_keys(error)
+    return keys[0] if keys else None
 
 
 #: The catalog event of a JSON-Schema error, by the keyword that failed: the
