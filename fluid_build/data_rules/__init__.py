@@ -34,7 +34,7 @@ def _version(contract: Mapping[str, Any]) -> tuple:
 
 def lint_contract(contract: Mapping[str, Any]) -> List[Finding]:
     """The data-rules findings for ``contract``; none below 0.7.7, where the schema
-    refuses the fields and says to declare ``fluidVersion: 0.7.7``."""
+    refuses the fields and says to declare 0.7.7 as the ``fluidVersion``."""
     if not isinstance(contract, Mapping):
         return []
     version = _version(contract)

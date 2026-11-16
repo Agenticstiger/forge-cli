@@ -45,7 +45,9 @@ VECTORS_FILE = "fluid-sql-vectors.json"
 
 def load_vectors() -> Dict[str, Any]:
     """The vectors document shipped with this package."""
-    text = resources.files("fluid_build.fluid_sql").joinpath(VECTORS_FILE).read_text("utf-8")
+    text = (
+        resources.files("fluid_build.fluid_sql").joinpath(VECTORS_FILE).read_text(encoding="utf-8")
+    )
     return json.loads(text)
 
 
