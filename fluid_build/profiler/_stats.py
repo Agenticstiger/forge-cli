@@ -77,9 +77,11 @@ class MetricDefinition(Protocol):
     name: str
     domains: FrozenSet[str]
 
-    def measure(self, values: Sequence[Any], levels: Tuple[Fraction, ...]) -> Any: ...
+    def measure(self, values: Sequence[Any], levels: Tuple[Fraction, ...]) -> Any:
+        """The metric over *values* (``None`` for a null), at the quantile *levels*."""
 
-    def spell(self, value: Any) -> Dict[str, Any]: ...
+    def spell(self, value: Any) -> Dict[str, Any]:
+        """The canonical spelling of a value :meth:`measure` returned."""
 
 
 @runtime_checkable
@@ -88,7 +90,6 @@ class StatisticsBackend(Protocol):
 
     def metrics(self) -> Tuple[MetricDefinition, ...]:
         """Every registered column metric."""
-        ...
 
     def read_value(self, domain: str, value: Any, *, column: str, row_index: int) -> Any:
         """Read one raw value of a *domain* column as the fidelity check reads it.
@@ -98,11 +99,9 @@ class StatisticsBackend(Protocol):
         :class:`ReadRefused` for a value the reader refuses (a binary float,
         a timestamp with no offset, ...).
         """
-        ...
 
     def check_document(self, text: str) -> None:
         """Read *text* back as a profile document; raise :class:`DocumentRefused` if refused."""
-        ...
 
 
 def load_backend() -> StatisticsBackend:
