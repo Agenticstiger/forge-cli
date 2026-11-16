@@ -88,8 +88,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 def _runs(args: argparse.Namespace, logger: logging.Logger, command: str) -> List[Any]:
     from pathlib import Path
 
-    from fluid_build.build_runners.spark._apply import _desired
     from fluid_build.cli._common import CLIError, hydrate_dotenv, load_contract_with_overlay
+    from fluid_build.cli._spark_apply import _desired
     from fluid_build.cli.plan import _gate_contract_for_plan_or_apply
 
     # As fluid apply does: the project's .env may hold AWS_REGION and the operator's lists.

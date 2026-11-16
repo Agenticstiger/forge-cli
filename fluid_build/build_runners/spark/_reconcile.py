@@ -210,7 +210,8 @@ def _reconcile_one(
     if dry_run:
         out.action = "planned"
         out.message = (
-            f"would cancel {', '.join(s.run_id for s in stale)} and start the new config"
+            f"would cancel {', '.join(s.run_id for s in stale)}"
+            + ("" if matching else " and start the new config")
             if stale
             else "would start the job"
         )

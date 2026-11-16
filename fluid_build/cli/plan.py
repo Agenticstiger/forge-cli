@@ -1037,7 +1037,7 @@ def _append_output_port_actions(
     plan, whose apply runs no OpenTofu and checks its actions against its artifacts one for
     one."""
     # The Spark builds' job runs (``spark.reconcile``), which no OpenTofu resource starts.
-    from fluid_build.build_runners.spark._apply import planned_actions as _spark_actions
+    from fluid_build.cli._spark_apply import planned_actions as _spark_actions
 
     actions = list(plan.get("actions") or [])
     present = {a.get("action_id") for a in actions if isinstance(a, dict)}

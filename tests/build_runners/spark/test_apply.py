@@ -9,8 +9,8 @@ import logging
 
 import pytest
 
-from fluid_build.build_runners.spark import _apply
 from fluid_build.build_runners.spark._reconcile import Outcome
+from fluid_build.cli import _spark_apply as _apply
 from fluid_build.cli._common import CLIError
 from tests.build_runners.spark.conftest import ACCOUNT, runs_of
 

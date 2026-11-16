@@ -11,7 +11,8 @@ role, the Glue job); there is no OpenTofu resource for a job run, so runs are st
 - :mod:`._adapters` — one adapter per runtime (start, find, read, cancel);
 - :mod:`._reconcile` — ``fluid apply`` keeps streaming jobs on the declared config;
   ``fluid spark run`` starts a scheduled build for Airflow; ``fluid spark status``;
-- :mod:`._apply` — the two hooks ``fluid plan`` and ``fluid apply`` call.
+- ``fluid_build.cli._spark_apply`` — the two hooks ``fluid plan`` and ``fluid apply`` call
+  (in ``cli``: build_runners never depends on it, an import-linter contract).
 
 Nothing here is imported on the ``fluid --help`` cold path, and boto3 (the ``[aws]`` extra)
 only when a run is started or read.

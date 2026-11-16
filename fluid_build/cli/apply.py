@@ -2172,7 +2172,7 @@ def run(args, logger: logging.Logger) -> int:
 
     if apply_engine != "opentofu":
         # A Spark build's infrastructure and runs come with the OpenTofu engine only.
-        from fluid_build.build_runners.spark._apply import refuse_without_opentofu
+        from fluid_build.cli._spark_apply import refuse_without_opentofu
 
         refuse_without_opentofu(source_contract, apply_engine)
     if apply_engine == "opentofu":
@@ -2190,8 +2190,8 @@ def run(args, logger: logging.Logger) -> int:
             return _hook_rc
         engine_kwargs = _state_for_job_runs(source_contract, resolved_mode, resolved_build_id)
         # Spark job runs: compiled and checked against the bound plan before tofu apply,
-        # reconciled after it (``build_runners/spark/_apply.py``).
-        from fluid_build.build_runners.spark import _apply as _spark
+        # reconciled after it (``cli/_spark_apply.py``).
+        from fluid_build.cli import _spark_apply as _spark
 
         spark_runs = _spark.prepare(
             source_contract,
