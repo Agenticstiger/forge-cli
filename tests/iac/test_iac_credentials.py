@@ -93,6 +93,21 @@ class TestBasics:
         assert env["PATH"] == "/opt/bin"
         assert "GITHUB_TOKEN" not in env
 
+    def test_setup_opentofu_wrapper_keeps_working(self):
+        # The default wrapper runs $TOFU_CLI_PATH/tofu-bin and writes its outputs to
+        # the GITHUB_OUTPUT file (else to stdout, after the JSON forge reads). The
+        # job's other file commands and its token stay out.
+        base = {
+            "TOFU_CLI_PATH": "/opt/hostedtoolcache/tofu/1.13.9/x64",
+            "GITHUB_OUTPUT": "/home/runner/work/_temp/_runner_file_commands/set_output_1",
+            "GITHUB_ENV": "/home/runner/work/_temp/_runner_file_commands/set_env_1",
+            "GITHUB_PATH": "/home/runner/work/_temp/_runner_file_commands/add_path_1",
+            "GITHUB_TOKEN": "ghs_x",  # pragma: allowlist secret
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "x",  # pragma: allowlist secret
+        }
+        env = build_tofu_env(base=base)
+        assert set(env) == {"TOFU_CLI_PATH", "GITHUB_OUTPUT"}
+
 
 class TestOpenTofuSettings:
     @pytest.mark.parametrize(

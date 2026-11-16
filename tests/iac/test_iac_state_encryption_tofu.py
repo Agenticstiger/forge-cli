@@ -37,6 +37,7 @@ from fluid_build.cli._apply_opentofu_engine import (
     emit_module,
 )
 from fluid_build.iac import runner
+from fluid_build.iac.credentials import TOFU_WRAPPER_ENV_NAMES
 from fluid_build.iac.encryption import MIN_TOFU_VERSION, parse_state_encryption
 
 _VERSION = runner.tofu_version()
@@ -286,6 +287,8 @@ def test_each_key_provider_block_decodes_and_only_the_key_is_out_of_reach(
         "PATH": os.environ["PATH"],
         "HOME": str(tmp_path),
         "CLOUDSDK_CONFIG": str(tmp_path / "gcloud"),
+        # setup-opentofu's wrapper in CI finds the real binary through these.
+        **{name: os.environ[name] for name in TOFU_WRAPPER_ENV_NAMES if name in os.environ},
         **env,
     }
     assert runner.tofu_init(str(tmp_path), backend=False, env=child).ok

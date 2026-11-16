@@ -175,7 +175,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BREAKING: `tofu` runs with an environment allowlist, not a copy of `os.environ`.** It gets
   the process basics (`PATH`, `HOME`, user, locale, temporary and profile directories), proxies,
-  CA bundles, OpenTofu's settings by name plus `TF_TOKEN_*`, and the variable families each IaC
+  CA bundles, OpenTofu's settings by name plus `TF_TOKEN_*`, what `opentofu/setup-opentofu`'s
+  default wrapper needs (`TOFU_CLI_PATH`, `GITHUB_OUTPUT`), and the variable families each IaC
   plugin declares in the new optional `credential_env_prefixes` (`AWS_`;
   `GOOGLE_`/`GCLOUD_`/`CLOUDSDK_`/`GCE_METADATA_`; `SNOWFLAKE_`; `DATABRICKS_` with `ARM_`,
   `AZURE_`, `GOOGLE_`; `CONFLUENT_`/`TABLEFLOW_`), plus the state backend's and the encryption

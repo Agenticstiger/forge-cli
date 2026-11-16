@@ -122,6 +122,13 @@ TOFU_ENV_NAMES: FrozenSet[str] = frozenset(
 #: registry or provider mirror.
 TOFU_ENV_PREFIXES: Tuple[str, ...] = ("TF_TOKEN_",)
 
+#: What ``opentofu/setup-opentofu``'s default wrapper needs. With
+#: ``tofu_wrapper: true`` (the default), the ``tofu`` on PATH is a Node script that
+#: runs ``$TOFU_CLI_PATH/tofu-bin`` and records its output with ``setOutput``,
+#: which writes to the ``GITHUB_OUTPUT`` file; without that file it prints the
+#: outputs to stdout, after the JSON forge reads. Paths only, no credential.
+TOFU_WRAPPER_ENV_NAMES: FrozenSet[str] = frozenset({"TOFU_CLI_PATH", "GITHUB_OUTPUT"})
+
 #: The cloud families, declared once: the plugins name them, and so do the state
 #: backend and the encryption key provider of the same cloud.
 AWS_ENV_PREFIXES: Tuple[str, ...] = ("AWS_",)
@@ -183,7 +190,7 @@ def _warn_undeclared(plugin: IacProviderPlugin) -> None:
 def _allowance(
     plugin: Optional[IacProviderPlugin], clouds: Iterable[str]
 ) -> Tuple[FrozenSet[str], Tuple[str, ...]]:
-    names = set(BASE_ENV_NAMES) | set(TOFU_ENV_NAMES)
+    names = set(BASE_ENV_NAMES) | set(TOFU_ENV_NAMES) | set(TOFU_WRAPPER_ENV_NAMES)
     prefixes = list(TOFU_ENV_PREFIXES)
     if plugin is not None:
         if getattr(plugin, "credential_env_prefixes", None) is None:
