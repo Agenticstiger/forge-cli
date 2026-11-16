@@ -649,6 +649,9 @@ fluid_build = [
   # Portable agentPolicy decision vectors. Shipped inside the wheel so a
   # consumer can check their own gate against them without cloning the repo.
   "policy/data/vectors/*.json",
+  # FLUID SQL/1 conformance vectors (RFC-data-rules.md §2.9): flux-expr/2 runs the
+  # same file, so it ships in the wheel next to the validator that runs it.
+  "fluid_sql/*.json",
   "policy/data/cloud_regions/*.md",
   "copilot/**/*.yaml",
   "copilot/**/*.md",
