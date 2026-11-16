@@ -11,14 +11,23 @@ is no user-facing engine switch.
 Flow: load contract → emit ``.tf.json`` (+ optional remote backend) →
 ``tofu init`` → ``tofu plan`` (the review point; ``--mode dry-run`` stops
 here) → data-loss gate → ``tofu apply``.
+
+The proof gate splits that in two. ``fluid plan --tofu`` runs everything up
+to ``tofu plan -out`` and keeps the saved plan next to ``plan.json``, whose
+``planDigest`` covers its sha256 (:func:`plan_with_opentofu`). ``fluid apply``
+of that ``plan.json`` checks the digest and runs ``tofu apply`` of exactly that
+file, with no plan of its own (:func:`_apply_bound_plan`); OpenTofu refuses it
+if the state changed since.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import shlex
-from contextlib import contextmanager
+import tempfile
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -81,6 +90,30 @@ def apply_via_opentofu(
         return _apply_via_opentofu(args, logger, contract, applied_state)
 
 
+@dataclass
+class _Engine:
+    """One run's OpenTofu working state, from :func:`_open_engine` on."""
+
+    contract: Dict[str, Any]
+    provider: str
+    plugin: Any
+    target: "StateTarget"
+    module_path: Path
+    module: str
+    actions: Any
+    env: Dict[str, str]
+    report: Any
+
+    @property
+    def workdir(self) -> str:
+        return str(self.target.workdir)
+
+    def emit(self, logger: logging.Logger) -> None:
+        """Compile the contract for :attr:`target` and write the module."""
+        self.module, self.actions = emit_module(self.plugin, self.contract, self.target, logger)
+        self.module_path.write_text(self.module, encoding="utf-8")
+
+
 def _apply_via_opentofu(
     args,
     logger: logging.Logger,
@@ -94,8 +127,82 @@ def _apply_via_opentofu(
     # plan-binding for every cloud provider that cut over (aws / gcp /
     # snowflake). This is the same gate, replicated here so the
     # OpenTofu path matches the native path's stage-7 guarantee.
-    _verify_plan_binding_for_opentofu(args, logger)
+    plan_data = _verify_plan_binding_for_opentofu(args, logger)
+    # A plan.json from ``fluid plan --tofu`` binds a saved OpenTofu plan: read
+    # once and checked here, before init, and those bytes are what is applied.
+    bound = _bound_tofu_plan(args, plan_data, logger)
 
+    eng = _open_engine(args, logger, contract, bound=bound[0] if bound else None)
+    if bound is not None:
+        return _apply_bound_plan(eng, args, logger, *bound, applied_state=applied_state)
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    if dry_run:
+        # A dry-run is plan only and writes no state, so it never moves any
+        # either: while the move is pending it plans against the old key, the
+        # read-only path ``fluid diff`` takes (``read_target``). The copy is
+        # left to the first real apply, which a plan-only CI role with
+        # read-only state access never runs.
+        read = read_target(eng.target, eng.provider, eng.env, logger)
+        if read is not eng.target:
+            eng.target = read
+            eng.emit(logger)
+            init = runner.tofu_init(eng.workdir, backend=True, env=eng.env, reconfigure=True)
+            if not init.ok:
+                raise CLIError(
+                    1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)}
+                )
+    else:
+        # State a previous release kept at the key without the provider moves
+        # to this provider's key (OpenTofu's own ``init -migrate-state``), so
+        # the first apply after the upgrade does not plan every resource as
+        # new (see ``iac.state_migration``). Before anything reads the state.
+        reconcile_state_key(eng.target, eng.provider, eng.env, logger, migrate=True)
+
+    _guard_before_plan(eng, args, logger)
+
+    # What this run imports stays in state only once its ``tofu apply`` starts
+    # (:func:`_imports_kept_only_by_an_apply`).
+    with _imports_kept_only_by_an_apply(eng.workdir, eng.env, logger) as imported:
+        _adopt_existing(
+            eng.plugin, eng.contract, eng.actions, eng.workdir, eng.env, logger, imported.addresses
+        )
+
+        plan = runner.tofu_plan(eng.workdir, env=eng.env)
+        if not plan.ok:
+            raise _plan_failure(eng.plugin, eng.contract, plan, eng.workdir, eng.env)
+        changes = runner.change_summary(plan)
+        cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
+        _record_planned(eng, changes, dry_run)
+        destroyed = _review_plan(eng, args, logger, changes, runner.planned_removals(plan))
+        if dry_run:
+            _preview_outside_opentofu(eng, logger, destroyed, changes)
+            return 0
+        # Access enforcement the cloud keeps outside OpenTofu (Unity Catalog column masks
+        # and row filters) goes onto the tables that already exist BEFORE the apply, so a
+        # grant the apply adds lands on a protected table. A failure stops the run here:
+        # nothing has been applied.
+        _enforce_access(eng.plugin, "pre_apply", eng.contract)
+        _prepare_destroys(eng.plugin, eng.contract, destroyed)
+        imported.keep()
+
+    return _finish_apply(eng, logger, changes, destroyed, applied_state)
+
+
+def _open_engine(
+    args,
+    logger: logging.Logger,
+    contract: Optional[Mapping[str, Any]],
+    *,
+    bound: Optional[Mapping[str, Any]] = None,
+) -> _Engine:
+    """Everything up to and including ``tofu init``, shared by ``fluid apply`` and
+    ``fluid plan --tofu``: the contract, the plugin, a usable ``tofu``, the state
+    target, the module and the provider credentials.
+
+    ``bound`` is the ``opentofuPlan`` record of a saved plan being applied: one
+    made for another provider or state is refused before anything is initialised.
+    """
     contract = _load_contract(args, logger, contract)
     provider = _resolve_provider(contract, getattr(args, "provider", None) or "auto")
     report = current_report()
@@ -157,21 +264,33 @@ def _apply_via_opentofu(
         )
 
     target = resolve_state_target(args, contract, provider)
+    if bound is not None:
+        _check_plan_target(bound, provider, target)
     backend, backend_origin, workdir = target.backend, target.origin, target.workdir
     workdir.mkdir(parents=True, exist_ok=True)
-    module_path = workdir / "main.tf.json"
-    module, actions = emit_module(plugin, contract, target, logger)
-    module_path.write_text(module, encoding="utf-8")
+    eng = _Engine(
+        contract=contract,
+        provider=provider,
+        plugin=plugin,
+        target=target,
+        module_path=workdir / "main.tf.json",
+        module="",
+        actions=(),
+        env={},
+        report=report,
+    )
+    eng.emit(logger)
     # The provider version and checksums `tofu init` must accept, for a plugin
     # that ships a committed lock (iac/module.py::dependency_lock).
     write_dependency_lock(plugin, workdir)
 
     env = build_tofu_env()
     env.update(credential_overlay(plugin, env))
+    eng.env = env
     present, _absent = credential_report(plugin, env)
 
     cprint(f"\nOpenTofu engine — provider: {provider}")
-    cprint(f"  module:      {module_path}")
+    cprint(f"  module:      {eng.module_path}")
     # The resolved object, not just the backend type: the same bucket-only
     # spec keys state differently from the flag and from FLUID_STATE_BACKEND,
     # and a run that lands on an empty state re-plans every resource as new.
@@ -200,44 +319,24 @@ def _apply_via_opentofu(
     )
     if not init.ok:
         raise CLIError(1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)})
+    return eng
 
-    dry_run = bool(getattr(args, "dry_run", False))
-    if dry_run:
-        # A dry-run is plan only and writes no state, so it never moves any
-        # either: while the move is pending it plans against the old key, the
-        # read-only path ``fluid diff`` takes (``read_target``). The copy is
-        # left to the first real apply, which a plan-only CI role with
-        # read-only state access never runs.
-        read = read_target(target, provider, env, logger)
-        if read is not target:
-            target = read
-            module, actions = emit_module(plugin, contract, target, logger)
-            module_path.write_text(module, encoding="utf-8")
-            init = runner.tofu_init(str(workdir), backend=True, env=env, reconfigure=True)
-            if not init.ok:
-                raise CLIError(
-                    1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)}
-                )
-    else:
-        # State a previous release kept at the key without the provider moves
-        # to this provider's key (OpenTofu's own ``init -migrate-state``), so
-        # the first apply after the upgrade does not plan every resource as
-        # new (see ``iac.state_migration``). Before anything reads the state.
-        reconcile_state_key(target, provider, env, logger, migrate=True)
 
+def _guard_before_plan(eng: _Engine, args, logger: logging.Logger) -> None:
+    """The read-only checks against the state that run before every ``tofu plan``."""
     # One state, two clouds: a key that does not name the provider (the
     # shared ``fluid/terraform.tfstate`` a bucket-only --state-backend gives a
     # contract without packaging, or an explicit key used for both) can hold
     # the other cloud's resources, which this plan would destroy.
-    guard_state_shared_with_another_cloud(target, provider, env)
+    guard_state_shared_with_another_cloud(eng.target, eng.provider, eng.env)
 
     # Pre-plan region guard. A module now pins the region its bindings name,
     # and moving a contract's resources to it would not show as a destroy.
-    _guard_region_move(plugin, contract, str(workdir), env)
+    _guard_region_move(eng.plugin, eng.contract, eng.workdir, eng.env)
 
     # A dataset an older forge-cli applied with an authoritative access list has
     # its stale grants revoked once, before its grants become member resources.
-    _reconcile_with_state(plugin, module_path, str(workdir), env, logger)
+    _reconcile_with_state(eng.plugin, eng.module_path, eng.workdir, eng.env, logger)
 
     # Pre-plan ownership-transition guard (RFC-packaging-modes.md file 10).
     # Runs BEFORE _adopt_existing — brownfield adoption is precisely the
@@ -245,88 +344,119 @@ def _apply_via_opentofu(
     # which is where an ownership flip would otherwise first surface as a
     # destroy.
     _guard_packaging_transitions(
-        contract, str(workdir), env, args, logger, plugin=plugin, actions=actions
+        eng.contract, eng.workdir, eng.env, args, logger, plugin=eng.plugin, actions=eng.actions
     )
 
     # Pre-plan Iceberg catalog-move guard: what an older forge-cli created for
     # an Iceberg table that lives in Lakekeeper / a REST catalog (Glue resources
     # on AWS, an EXTERNAL VOLUME on Snowflake) would otherwise be planned for
     # DESTROY (iac/catalog_moves.py).
-    _guard_catalog_moves(plugin, contract, provider, str(workdir), env, logger, actions=actions)
+    _guard_catalog_moves(
+        eng.plugin, eng.contract, eng.provider, eng.workdir, eng.env, logger, actions=eng.actions
+    )
 
-    # What this run imports stays in state only once its ``tofu apply`` starts
-    # (:func:`_imports_kept_only_by_an_apply`).
-    with _imports_kept_only_by_an_apply(str(workdir), env, logger) as imported:
-        _adopt_existing(plugin, contract, actions, str(workdir), env, logger, imported.addresses)
 
-        plan = runner.tofu_plan(str(workdir), env=env)
-        if not plan.ok:
-            raise _plan_failure(plugin, contract, plan, str(workdir), env)
-        changes = runner.change_summary(plan)
-        cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
-        if report is not None:
-            report.record_infra(
-                planned=changes,
-                applied=None,
-                resources=_module_addresses(module),
-                dry_run=bool(getattr(args, "dry_run", False)),
-            )
+def _record_planned(eng: _Engine, changes: Mapping[str, int], dry_run: bool) -> None:
+    if eng.report is not None:
+        eng.report.record_infra(
+            planned=changes,
+            applied=None,
+            resources=_module_addresses(eng.module),
+            dry_run=dry_run,
+        )
 
-        # Revoking a grant destroys a member resource and loses no data: only the
-        # removals of data-bearing resources reach the data-loss gate.
-        removals = runner.planned_removals(plan)
-        data_changes, revoked = _data_bearing_changes(changes, removals)
-        if revoked:
+
+def _review_plan(
+    eng: _Engine,
+    args,
+    logger: logging.Logger,
+    changes: Mapping[str, int],
+    removals: List[Tuple[str, str]],
+    *,
+    enforce: bool = True,
+) -> List[Dict[str, Any]]:
+    """What the saved plan in the workdir does beyond its counts, then the data-loss gate.
+
+    Returns the plan's deletes for the plugin's ``prepare_destroys``. With
+    ``enforce=False`` (``fluid plan --tofu``) the gate only says whether the apply
+    will need ``--allow-data-loss``: the flag belongs to the apply that runs it.
+    """
+    # Revoking a grant destroys a member resource and loses no data: only the
+    # removals of data-bearing resources reach the data-loss gate.
+    data_changes, revoked = _data_bearing_changes(changes, removals)
+    if revoked:
+        cprint(
+            f"  {len(revoked)} access grant(s), policy tag(s) or tag assignment(s) removed "
+            "(access or metadata only, no data lost; not gated): " + ", ".join(revoked)
+        )
+    retired = _retired_definitions(changes, removals)
+    if retired:
+        cprint(
+            f"  {len(retired)} job(s), workspace file(s), folder(s) or data quality "
+            "monitor(s) removed (no table data lost; not gated; a job's run history and "
+            "what a monitor has learned go with them): " + ", ".join(retired)
+        )
+    _report_plan_notices(eng.plugin, eng.contract, logger)
+    # In-place updates that delete data — a dropped column — which the destroy
+    # count above never sees (``~`` in the summary, not ``-``).
+    lost_in_place = _in_place_changes(eng.plugin, changes, eng.workdir, eng.env)
+
+    # Report what the plan's ``lifecycle.ignore_changes`` deliberately hides.
+    # Without this, a contract whose column types no longer match the live
+    # table plans clean and applies with exit 0 — including under the
+    # destructive ``--mode replace``, where the operator reasonably reads
+    # "apply complete" as "the table now matches the contract".
+    _report_suppressed_drift(eng.plugin, eng.contract, eng.workdir, eng.env, args, logger)
+
+    if not enforce:
+        if _data_loss_blocked(data_changes, False) or lost_in_place:
             cprint(
-                f"  {len(revoked)} access grant(s), policy tag(s) or tag assignment(s) removed "
-                "(access or metadata only, no data lost; not gated): " + ", ".join(revoked)
+                "  ⚠️  this plan destroys or changes existing data: `fluid apply` will refuse "
+                "it unless given --allow-data-loss"
             )
-        retired = _retired_definitions(changes, removals)
-        if retired:
-            cprint(
-                f"  {len(retired)} job(s), workspace file(s), folder(s) or data quality "
-                "monitor(s) removed (no table data lost; not gated; a job's run history and "
-                "what a monitor has learned go with them): " + ", ".join(retired)
-            )
-        _report_plan_notices(plugin, contract, logger)
-        # In-place updates that delete data — a dropped column — which the destroy
-        # count above never sees (``~`` in the summary, not ``-``).
-        lost_in_place = _in_place_changes(plugin, changes, str(workdir), env)
+        return []
+    _enforce_data_loss_gate(args, logger, eng.provider, changes, data_changes, lost_in_place)
+    return _planned_destroys(eng.plugin, changes, eng.workdir, eng.env)
 
-        # Report what the plan's ``lifecycle.ignore_changes`` deliberately hides.
-        # Without this, a contract whose column types no longer match the live
-        # table plans clean and applies with exit 0 — including under the
-        # destructive ``--mode replace``, where the operator reasonably reads
-        # "apply complete" as "the table now matches the contract".
-        _report_suppressed_drift(plugin, contract, str(workdir), env, args, logger)
 
-        _enforce_data_loss_gate(args, logger, provider, changes, data_changes, lost_in_place)
+def _preview_outside_opentofu(
+    eng: _Engine,
+    logger: logging.Logger,
+    destroyed: List[Dict[str, Any]],
+    changes: Mapping[str, int],
+) -> None:
+    """A dry run: print what the apply would do outside OpenTofu, and stop."""
+    _enforce_access(eng.plugin, "pre_apply", eng.contract, dry_run=True)
+    _prepare_destroys(eng.plugin, eng.contract, destroyed, dry_run=True)
+    _converge_output_ports(eng.plugin, eng.contract, dry_run=True)
+    cprint("\ndry-run: plan only — not applying.")
+    info(logger, "opentofu_apply_dry_run", provider=eng.provider, **changes)
 
-        destroyed = _planned_destroys(plugin, changes, str(workdir), env)
-        if dry_run:
-            _enforce_access(plugin, "pre_apply", contract, dry_run=True)
-            _prepare_destroys(plugin, contract, destroyed, dry_run=True)
-            _converge_output_ports(plugin, contract, dry_run=True)
-            cprint("\ndry-run: plan only — not applying.")
-            info(logger, "opentofu_apply_dry_run", provider=provider, **changes)
-            return 0
-        # Access enforcement the cloud keeps outside OpenTofu (Unity Catalog column masks
-        # and row filters) goes onto the tables that already exist BEFORE the apply, so a
-        # grant the apply adds lands on a protected table. A failure stops the run here:
-        # nothing has been applied.
-        _enforce_access(plugin, "pre_apply", contract)
-        _prepare_destroys(plugin, contract, destroyed)
-        imported.keep()
 
+def _finish_apply(
+    eng: _Engine,
+    logger: logging.Logger,
+    changes: Mapping[str, int],
+    destroyed: List[Dict[str, Any]],
+    applied_state: Optional[List[Dict[str, Any]]],
+    *,
+    bound: bool = False,
+) -> int:
+    """``tofu apply`` of the saved plan in the workdir, and what follows it."""
+    plugin, contract, workdir, env = eng.plugin, eng.contract, eng.workdir, eng.env
     # ``fluid apply`` is the headline state-changing command, so a receiver
     # configured with the standard OPENLINEAGE_URL must see it. Emission was
     # previously wired only into the acquisition runners, so a real Snowflake
     # apply produced zero events. Opt-in and zero-cost when unconfigured
     # (``resolve_lineage_emitter`` returns the null emitter), and every
     # emit call soft-fails — lineage never breaks an apply.
-    with _apply_lineage(contract, provider=provider, planned=changes) as record:
-        apply_result, waited = _apply_saved_plan(plugin, contract, destroyed, str(workdir), env)
+    with _apply_lineage(contract, provider=eng.provider, planned=changes) as record:
+        apply_result, waited = _apply_saved_plan(plugin, contract, destroyed, workdir, env)
         if not apply_result.ok:
+            if bound and _saved_plan_stale(apply_result):
+                # OpenTofu checked the state against the plan's snapshot and refused:
+                # nothing was applied, so there is nothing to bind or enforce.
+                raise _stale_plan_error(apply_result)
             # A table the failed apply created, its grants and the job that fills it can all
             # exist with no mask or filter: bind what exists (never drop) before failing.
             _enforce_after_failed_apply(plugin, contract)
@@ -334,14 +464,14 @@ def _apply_via_opentofu(
                 "opentofu apply raw output tail: %s",
                 _tail(apply_result.stderr or apply_result.stdout),
             )
-            raise _apply_failure(apply_result, str(workdir), plugin)
+            raise _apply_failure(apply_result, workdir, plugin)
         applied = _applied(changes, apply_result, waited)
         record(applied)
 
     cprint(f"\n  tofu apply complete: +{applied['add']} ~{applied['change']} -{applied['remove']}")
-    if report is not None:
-        report.record_infra(
-            planned=changes, applied=applied, resources=_module_addresses(module), dry_run=False
+    if eng.report is not None:
+        eng.report.record_infra(
+            planned=changes, applied=applied, resources=_module_addresses(eng.module), dry_run=False
         )
 
     # The tables this apply created exist now, empty, and get their masks and row filter here.
@@ -356,15 +486,257 @@ def _apply_via_opentofu(
 
     if applied_state is not None:
         # After the bindings: a job the build phase starts writes tables already protected.
-        applied_state.extend(runner.tofu_state_resources(str(workdir), env=env))
+        applied_state.extend(runner.tofu_state_resources(workdir, env=env))
         if not applied_state:  # an apply that provisioned a job leaves a state with it
             cprint(
                 f"  ⚠️  could not read the applied state back (tofu show -json in {workdir}): "
                 "the build phase cannot find the jobs this apply provisioned."
             )
 
-    info(logger, "opentofu_apply_ok", provider=provider, **applied)
+    info(logger, "opentofu_apply_ok", provider=eng.provider, **applied)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# The saved OpenTofu plan: ``fluid plan --tofu`` writes it, ``fluid apply`` runs it
+# ---------------------------------------------------------------------------
+
+#: The workdir file ``tofu plan -out`` writes and ``tofu apply`` reads.
+_WORKDIR_PLAN = "tfplan"
+
+
+def plan_with_opentofu(
+    args, logger: logging.Logger, contract: Mapping[str, Any], out: str
+) -> Dict[str, Any]:
+    """``fluid plan --tofu``: run ``tofu plan -out`` as ``fluid apply`` would, and keep it.
+
+    The module, the state target and every check before the plan are the
+    apply's own (:func:`_open_engine`, :func:`_guard_before_plan`). Next to the
+    ``plan.json`` at ``out`` it writes, owner-only (0600):
+
+    - ``<stem>.tfplan``: the saved plan ``fluid apply <out>`` applies, unchanged;
+    - ``<stem>.tfplan.json``: that plan as ``tofu show -json`` prints it;
+    - ``<stem>.gitlab-tofu.json``: the GitLab ``artifacts:reports:terraform``
+      summary (:func:`runner.gitlab_plan_report`).
+
+    Returns the ``opentofuPlan`` record the caller puts into the plan before its
+    digests, so ``planDigest`` covers the saved plan's sha256.
+
+    Brownfield adoption cannot write state here: a saved plan carries the state it
+    was made from, and OpenTofu refuses it once the state has changed. So what
+    :func:`_adopt_existing` imports is handed back at once, and adopted through
+    ``import`` blocks in the plan instead: the reviewer sees it, the apply does it.
+    """
+    with contract_source(source_contract_file(getattr(args, "contract", None))):
+        return _plan_with_opentofu(args, logger, contract, Path(out))
+
+
+def _plan_with_opentofu(
+    args, logger: logging.Logger, contract: Mapping[str, Any], out: Path
+) -> Dict[str, Any]:
+    from fluid_build.forge.core.plan_digest import sha256_bytes
+    from fluid_build.iac.importer import ImportBlock, import_section
+
+    eng = _open_engine(args, logger, contract)
+    reconcile_state_key(eng.target, eng.provider, eng.env, logger, migrate=True)
+    _guard_before_plan(eng, args, logger)
+
+    with _imports_kept_only_by_an_apply(eng.workdir, eng.env, logger) as imported:
+        adopted: List[ImportBlock] = _adopt_existing(
+            eng.plugin, eng.contract, eng.actions, eng.workdir, eng.env, logger, imported.addresses
+        )
+    if adopted:
+        document = json.loads(eng.module_path.read_text(encoding="utf-8"))
+        document.setdefault("import", []).extend(import_section(adopted).get("import", []))
+        eng.module_path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+        cprint(f"  brownfield:  the saved plan adopts {len(adopted)} pre-existing resource(s)")
+
+    plan = runner.tofu_plan(eng.workdir, out_file=_WORKDIR_PLAN, env=eng.env)
+    if not plan.ok:
+        raise _plan_failure(eng.plugin, eng.contract, plan, eng.workdir, eng.env)
+    changes = runner.change_summary(plan)
+    cprint(f"\n  tofu plan: +{changes['add']} ~{changes['change']} -{changes['remove']}")
+    _review_plan(eng, args, logger, changes, runner.planned_removals(plan), enforce=False)
+
+    saved = (Path(eng.workdir) / _WORKDIR_PLAN).read_bytes()
+    os.chmod(Path(eng.workdir) / _WORKDIR_PLAN, 0o600)
+    shown = runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
+    if shown is None:
+        raise CLIError(
+            1,
+            "plan_tofu_show_failed",
+            {"error": f"`tofu show -json {_WORKDIR_PLAN}` failed in {eng.workdir}"},
+        )
+    stem = out.name[: -len(".json")] if out.name.endswith(".json") else out.name
+    names = {
+        "planFile": f"{stem}.tfplan",
+        "showJson": f"{stem}.tfplan.json",
+        "gitlabReport": f"{stem}.gitlab-tofu.json",
+    }
+    _write_private(out.parent / names["planFile"], saved)
+    # ``tofu show -json`` holds every sensitive value in plain text (the json-format
+    # docs mark them in ``*_sensitive``, they do not mask them): owner-only, like the
+    # temporary file gitlab-tofu.sh keeps it in.
+    _write_private(out.parent / names["showJson"], (json.dumps(shown) + "\n").encode())
+    _write_private(out.parent / names["gitlabReport"], runner.gitlab_plan_report(shown).encode())
+    # File names, not the directory: a long path wrapped mid-name in a terminal.
+    cprint_literal(
+        f"  saved plan:  {names['planFile']}, {names['showJson']}, {names['gitlabReport']} "
+        f"(owner-only, next to {out.name})"
+    )
+    return {
+        **names,
+        "sha256": sha256_bytes(saved),
+        "provider": eng.provider,
+        "state": eng.target.location,
+        "changes": changes,
+        "imports": sorted(block.to for block in adopted),
+    }
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` owner-only (0600), atomically: a new file is made
+    with ``mkstemp`` (0600, never through an existing link) and renamed over."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _bound_tofu_plan(
+    args, plan_data: Optional[Mapping[str, Any]], logger: logging.Logger
+) -> Optional[Tuple[Dict[str, Any], bytes]]:
+    """``(record, bytes)`` of the saved OpenTofu plan ``plan.json`` binds, or ``None``.
+
+    The file is read once, here; the bytes that matched the digest are the bytes
+    applied, so a file swapped after this check is never run. Under
+    ``--no-verify-plan-binding`` the digest is not compared (logged by the caller),
+    but the plan still has to be there: without it there is nothing reviewed to run.
+    """
+    if plan_data is None:
+        return None
+    from ..forge.core.plan_digest import PlanBindingError, tofu_plan_record, verify_tofu_plan
+
+    skip = bool(getattr(args, "no_verify_plan_binding", False))
+    try:
+        record = tofu_plan_record(plan_data)
+        if record is None:
+            return None
+        path = Path(str(args.contract)).parent / record["planFile"]
+        try:
+            data: Optional[bytes] = path.read_bytes()
+        except OSError:
+            data = None
+        if data is None or not skip:
+            verify_tofu_plan(record, data)
+    except PlanBindingError as exc:
+        raise CLIError(
+            1,
+            f"apply_plan_digest_{exc.kind.replace('-', '_')}",
+            {"kind": exc.kind, "error": str(exc)},
+        )
+    assert data is not None
+    return record, data
+
+
+def _apply_bound_plan(
+    eng: _Engine,
+    args,
+    logger: logging.Logger,
+    record: Mapping[str, Any],
+    saved: bytes,
+    *,
+    applied_state: Optional[List[Dict[str, Any]]],
+) -> int:
+    """``fluid apply plan.json`` for a plan from ``fluid plan --tofu``: ``tofu apply`` of
+    the saved plan it binds, with no plan of its own.
+
+    The checks before a plan ran when it was made, and its imports are in it. What
+    runs here reads the saved plan: the data-loss gate (the apply's
+    ``--allow-data-loss`` decides), the plugin's notices, and what the cloud keeps
+    outside OpenTofu. OpenTofu itself refuses a plan whose state has changed since.
+    """
+    dry_run = bool(getattr(args, "dry_run", False))
+    if not dry_run:
+        reconcile_state_key(eng.target, eng.provider, eng.env, logger, migrate=True)
+    plan_path = Path(eng.workdir) / _WORKDIR_PLAN
+    _write_private(plan_path, saved)
+    shown = runner.tofu_show_plan(eng.workdir, plan_file=_WORKDIR_PLAN, env=eng.env)
+    if shown is None:
+        raise CLIError(
+            1,
+            "apply_tofu_plan_unreadable",
+            {
+                "error": f"`tofu show -json` could not read the saved plan {record['planFile']}",
+                "remediation": [
+                    "The plan needs the OpenTofu version and providers it was made with; "
+                    "re-run `fluid plan --tofu` where you apply."
+                ],
+            },
+        )
+    changes = runner.saved_plan_changes(shown)
+    cprint(
+        f"\n  saved plan {record['planFile']} ({str(record['sha256'])[:19]}…): "
+        f"+{changes['add']} ~{changes['change']} -{changes['remove']}"
+    )
+    _record_planned(eng, changes, dry_run)
+    destroyed = _review_plan(eng, args, logger, changes, runner.saved_plan_removals(shown))
+    if dry_run:
+        _preview_outside_opentofu(eng, logger, destroyed, changes)
+        return 0
+    _enforce_access(eng.plugin, "pre_apply", eng.contract)
+    _prepare_destroys(eng.plugin, eng.contract, destroyed)
+    return _finish_apply(eng, logger, changes, destroyed, applied_state, bound=True)
+
+
+def _check_plan_target(record: Mapping[str, Any], provider: str, target: "StateTarget") -> None:
+    """Refuse a saved plan made for another provider or another state than this apply's."""
+    if record.get("provider") == provider and record.get("state") == target.location:
+        return
+    raise CLIError(
+        1,
+        "apply_plan_digest_tofu_plan_target",
+        {
+            "kind": "tofu-plan-target",
+            "error": f"the saved plan was made for {record.get('provider')!r} state "
+            f"{record.get('state')!r}, but this apply resolves {provider!r} state "
+            f"{target.location!r}",
+            "remediation": [
+                "Apply with the --state-backend (or FLUID_STATE_BACKEND) and working "
+                "directory the plan was made with, or re-run `fluid plan --tofu`."
+            ],
+        },
+    )
+
+
+#: How OpenTofu refuses a saved plan whose state moved on (internal/backend/local/
+#: backend_local.go): the state's serial changed, or it is another state altogether.
+_STALE_PLAN_MARKERS = ("Saved plan is stale", "different state lineage")
+
+
+def _saved_plan_stale(result: Any) -> bool:
+    output = (getattr(result, "stdout", "") or "") + (getattr(result, "stderr", "") or "")
+    return any(marker in output for marker in _STALE_PLAN_MARKERS)
+
+
+def _stale_plan_error(result: Any) -> CLIError:
+    err = CLIError(
+        1,
+        "apply_plan_digest_tofu_plan_stale",
+        {
+            "kind": "tofu-plan-stale",
+            "error": "OpenTofu refused the saved plan: the state changed after it was made "
+            "(another apply ran in between), so it no longer shows what applying it would do. "
+            "Nothing was applied.",
+        },
+    )
+    err.suggestions = ["Re-run `fluid plan --tofu`, review the new plan, then apply that one."]
+    return err
 
 
 def _converge_output_ports(
@@ -977,7 +1349,7 @@ def resolve_apply_engine(
     return resolve_engine(None, provider)
 
 
-def _verify_plan_binding_for_opentofu(args, logger: logging.Logger) -> None:
+def _verify_plan_binding_for_opentofu(args, logger: logging.Logger) -> Optional[Dict[str, Any]]:
     """Stage-7 plan-binding gate, OpenTofu-engine edition.
 
     Mirrors :func:`fluid_build.cli.apply._verify_plan_digests` — same
@@ -988,18 +1360,22 @@ def _verify_plan_binding_for_opentofu(args, logger: logging.Logger) -> None:
 
     Honours ``--no-verify-plan-binding`` (logged at WARNING). Plans
     without a ``planDigest`` are treated as tamper signals.
+
+    Returns the plan as read (``None`` for a contract input), so the saved
+    OpenTofu plan it may bind is looked up in the same copy
+    (:func:`_bound_tofu_plan`).
     """
     src = str(getattr(args, "contract", "") or "")
     if not src.endswith(".json"):
-        return  # raw contract input — no plan to verify
-    if getattr(args, "no_verify_plan_binding", False):
+        return None  # raw contract input — no plan to verify
+    skip = bool(getattr(args, "no_verify_plan_binding", False))
+    if skip:
         logger.warning(
             "--no-verify-plan-binding: plan-binding verification was SKIPPED. "
             "This is an emergency escape hatch; the apply may be running "
             "against a tampered or stale plan. Make sure this is recorded "
             "in the change log."
         )
-        return
     try:
         with open(src, encoding="utf-8") as handle:
             plan_data = json.load(handle)
@@ -1009,6 +1385,12 @@ def _verify_plan_binding_for_opentofu(args, logger: logging.Logger) -> None:
             "opentofu_engine_plan_unreadable",
             {"error": f"{src}: {exc}"},
         )
+    if not isinstance(plan_data, dict):
+        raise CLIError(
+            1, "opentofu_engine_plan_unreadable", {"error": f"{src}: root is not an object"}
+        )
+    if skip:
+        return plan_data
     # Local import — keeps the plan_digest import + tarfile dependency
     # off the hot path for raw-contract applies.
     from ..forge.core.plan_digest import PlanBindingError, verify_plan_binding
@@ -1033,6 +1415,7 @@ def _verify_plan_binding_for_opentofu(args, logger: logging.Logger) -> None:
             f"apply_plan_digest_{exc.kind.replace('-', '_')}",
             {"kind": exc.kind, "error": str(exc)},
         )
+    return plan_data
 
 
 def _load_contract(
@@ -1075,7 +1458,7 @@ def _adopt_existing(
     env: Mapping[str, str],
     logger: logging.Logger,
     held: Optional[List[str]] = None,
-) -> None:
+) -> List[Any]:
     """Brownfield adoption — ``tofu import`` each declared resource that
     already exists in the cloud, so ``tofu apply`` reconciles it instead of
     failing "already exists" against pre-provisioned infrastructure.
@@ -1091,14 +1474,16 @@ def _adopt_existing(
     exist and the plan would then show its replacement as a plain create.
 
     Each import is appended to ``held``, which the caller hands back when the run
-    does not apply (:func:`_imports_kept_only_by_an_apply`).
+    does not apply (:func:`_imports_kept_only_by_an_apply`). Returns what it imported,
+    each an ``ImportBlock`` with its id resolved, for ``fluid plan --tofu`` to render as
+    ``import`` blocks (``iac.importer.import_section``).
     """
     candidates = plugin.discover_imports(contract, actions)
     if not candidates:
-        return
+        return []
     strict = bool(getattr(plugin, "strict_adoption", False))
     in_state = set(runner.tofu_state_list(workdir, env=env))
-    adopted = 0
+    adopted: List[Any] = []
     for block in candidates:
         if block.to in in_state:
             continue
@@ -1107,7 +1492,7 @@ def _adopt_existing(
             continue
         result = runner.tofu_import(workdir, block.to, import_id, env=env)
         if result.ok:
-            adopted += 1
+            adopted.append(replace(block, id=import_id, id_from=None))
             if held is not None:
                 held.append(block.to)
         elif strict and not block.best_effort:
@@ -1120,7 +1505,8 @@ def _adopt_existing(
                 _tail(result.stderr or result.stdout, 200),
             )
     if adopted:
-        cprint(f"  brownfield:  adopted {adopted} pre-existing resource(s) into state")
+        cprint(f"  brownfield:  adopted {len(adopted)} pre-existing resource(s) into state")
+    return adopted
 
 
 def _import_id(block: Any, workdir: str, env: Mapping[str, str]) -> Optional[str]:
