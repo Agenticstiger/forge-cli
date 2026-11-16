@@ -178,3 +178,32 @@ class TestDiffLabelsTheSetting:
         args = argparse.Namespace(provider="aws", state_backend=None, workspace_dir=None)
         report = check_state_drift(contract, args, logging.getLogger("test"))
         assert report.detail.startswith("the state encryption setting is not usable"), report.detail
+
+
+class TestSavedPlanUnreadable:
+    def test_the_refusal_names_the_encryption_setting(self, tmp_path, monkeypatch):
+        import logging
+
+        monkeypatch.setattr(runner, "tofu_show_plan", lambda *a, **k: None)
+        eng = engine._Engine(
+            contract=dict(CONTRACT),
+            provider="aws",
+            plugin=get_iac_plugin("aws"),
+            target=_target(tmp_path),
+            module_path=tmp_path / "main.tf.json",
+            module="",
+            actions=(),
+            env={},
+            report=None,
+        )
+        with pytest.raises(CLIError) as raised:
+            engine._apply_bound_plan(
+                eng,
+                argparse.Namespace(dry_run=True),
+                logging.getLogger("test"),
+                {"planFile": "plan.tfplan", "sha256": "sha256:00"},
+                b"saved plan",
+                applied_state=None,
+            )
+        assert raised.value.event == "apply_tofu_plan_unreadable"
+        assert any("FLUID_STATE_ENCRYPTION" in line for line in raised.value.context["remediation"])
