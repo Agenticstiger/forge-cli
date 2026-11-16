@@ -203,7 +203,7 @@ An invariant's share is a threshold on the number of covered rows that violate i
 - The numbers are exact decimals: a consumer reads `0.5` as one half, from its text, never as the nearest binary double. They have at most 15 significant digits, so the text survives a round trip through a double (FLUX decision Q4).
 - "Holds on about 98 % of real rows" is `mustBeBetween: [1.5, 2.5], unit: percent`.
 
-The band is a rule; the measured share is a statistic. `fluid profile` (decision 11) measures each declared invariant on the real data and writes the result to a profile document. Because zero violations are disclosive, it reports "at least X %" (decision Q9). The contract never holds a measured number. FLUX will choose where in the band a run generates (a FLUX setting, which may come from a profile), inject the violations, and check the run against the band. FLUX will check a run against the band itself, as every consumer does (§2.9, change 7), and generate from a `percent` band by choosing a target strictly inside it. Three bands cannot be met in expectation: a zero-width `percent` band above 0 (`mustBe: 2`), a `rows` band other than zero violations (a count does not scale to a run of another size), and a dependency band that allows a holding share at or below one half (EXPR-SPEC-2 §9). FLUX will check such a band, generate no violation for it, and, under strictness, refuse one that zero violations would fail.
+The band is a rule; the measured share is a statistic. `fluid profile` (decision 11) measures each declared invariant on the real data and writes the result to a profile document. Because zero violations are disclosive, it reports "at least X %" (decision Q9). The contract never holds a measured number. FLUX will choose where in the band a run generates (a FLUX setting, which may come from a profile), inject the violations, and check the run against the band. FLUX will check a run against the band itself, as every consumer does (§2.9, change 7), and generate from a `percent` band by choosing a target strictly inside it. Three bands cannot be met in expectation: a zero-width `percent` band above 0 (`mustBe: 2`), a `rows` band other than zero violations (a count does not scale to a run of another size), and a dependency band that allows no holding share above one half, so that every value it allows is at least 50 % of violating rows (EXPR-SPEC-2 §9 generates a dependency only above that). FLUX will check such a band, generate no violation for it, and, under strictness, refuse one that zero violations would fail.
 
 ### 1.5 What a check counts
 
@@ -272,8 +272,8 @@ integer     = digit , { digit } ;
 
 - Keywords and function names are case-insensitive. A name is case-sensitive and names a column exactly as `contract.schema[].name` spells it. A name that is a keyword, or that does not match `[A-Za-z_][A-Za-z0-9_]*`, is double-quoted (`"order"`, `"Net Amount"`), with `""` for a quote inside it.
 - Strings are single-quoted, with `''` for a quote inside. A number is digits with an optional fraction (`3`, `1.50`); there is no exponent, and a leading `-` is negation. The digits after the point are the literal's scale.
-- An `IN` list holds literals of one type. The `NULL` literal is never an `IN` item or the operand of a comparison: `x = NULL` would always be FALSE (§2.5), so the validator refuses it and points to `x IS NULL`.
-- Whitespace is space, tab and newline. The text holds no `;`, and `--` and `/*` are refused wherever they stand outside a string literal, before parsing: SQL reads them as comments (sqlglot reads `net--1 > 0` as `net`). A double negation is written `net - -1`.
+- An `IN` list holds literals of one type. The `NULL` literal is never an `IN` item, nor an operand of `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=` or `BETWEEN`: such a comparison would always be FALSE (§2.5), so the validator refuses it and points to `IS NULL`. `a IS [NOT] DISTINCT FROM NULL` is allowed and means `a IS [NOT] NULL`.
+- Whitespace is space, tab and newline. The text holds no `;`, and `--` and `/*` are refused wherever they stand outside a string literal or a quoted name, before parsing: SQL reads them as comments (sqlglot reads `net--1 > 0` as `net`). A double negation is written `net - -1`.
 - The text is NFC-normalized before it is parsed. It is at most 4,096 code points long and nests at most 64 levels deep, the limits of EXPR-SPEC-2 §3.
 - Precedence, tightest first: unary `-`; `*` and `/`; `+` and `-`; comparisons, `IN`, `BETWEEN` and `IS`; `NOT`; `AND`; `OR`. Comparisons do not chain.
 
@@ -332,7 +332,7 @@ Type rules:
 FLUID SQL/1 is two-valued: every predicate is TRUE or FALSE, never unknown. The rules are the flux-expr/2 picks of 2026-11-16, written in SQL terms:
 
 - Arithmetic follows SQL: a NULL operand gives NULL, and `x / 0` gives NULL.
-- A comparison with a NULL operand is FALSE. That covers `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`, `IN` and `NOT IN`. `NOT IN` is one comparison, so it is FALSE when its left side is NULL, on the rows SQL's UNKNOWN would filter out. `BETWEEN` and `NOT BETWEEN` are their two comparisons: `x BETWEEN a AND b` is `x >= a AND x <= b`, and `x NOT BETWEEN a AND b` is `x < a OR x > b`. So `10 NOT BETWEEN NULL AND 5` is TRUE, as in SQL.
+- A comparison with a NULL operand is FALSE. That covers `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`, `IN` and `NOT IN`. `NOT IN` is one comparison, so it is FALSE when its left side is NULL, on the rows SQL's UNKNOWN would filter out. `BETWEEN` and `NOT BETWEEN` are their two comparisons: `x BETWEEN a AND b` is `x >= a AND x <= b`, and `x NOT BETWEEN a AND b` is `x < a OR x > b`. So `x NOT BETWEEN lo AND hi` is TRUE when x is 10, lo is NULL and hi is 5, as in SQL.
 - A bool column or bool expression that is NULL counts as FALSE where a predicate is expected.
 - `NOT`, `AND` and `OR` combine TRUE and FALSE. So `NOT (a = b)` is TRUE when `a` is NULL, while `a <> b` is FALSE: the two differ only on NULL. SQL would make both UNKNOWN. §2.8 shows how consumers render the difference exactly.
 - `IS NULL`, `IS NOT NULL`, `IS DISTINCT FROM` and `IS NOT DISTINCT FROM` are exact: they treat NULL as a value.
@@ -428,9 +428,9 @@ flux-expr/2 is spelled after flux-expr/1 (`==`, `&&`, `if(...)`). FLUX will ther
 | `check` | a rule without `determines`; a FLUX extension may name the column that a bounds or difference form determines |
 | `dependency` | a dependency `{from, to, bothWays}` |
 | a share (§1.4) | the band itself for the check; `share` and `tolerance` only as the generator's target (§1.4) |
-| `sharedColumns`, `sharedAttribute` (§5) | copy rules `c == link.<path>.<owner's column>` with `determines: c` and `when: !(link.<path>.<key> == null)`, so a row whose path reaches nothing is not covered; a path over several links uses flux-expr/2's chained links |
+| `sharedColumns`, `sharedAttribute` (§5) | copy rules `c == link.<path>.<owner's column>` with `determines: c` and `when: !(link.<path>.<key> == null)`, so a row whose path reaches nothing is not covered; a path over several links is `link.<a>.<b>.<column>` (change 9) |
 
-Seven changes follow for EXPR-SPEC-2, which the flux-expr/2 design (Agenticstiger/flux-engine#38) is to make and cite this RFC for:
+Nine changes follow for EXPR-SPEC-2, which the flux-expr/2 design (Agenticstiger/flux-engine#38) is to make and cite this RFC for:
 
 1. §1's open question has its answer: rules and dependencies are declared in the FLUID contract, under the contract digest.
 2. A half-away-from-zero rounding joins `round`, which stays half-even.
@@ -439,6 +439,8 @@ Seven changes follow for EXPR-SPEC-2, which the flux-expr/2 design (Agenticstige
 5. A rule read from FLUID covers exactly the rows its `when` selects. The implicit exclusion of rows with a NULL bound (EXPR-SPEC-2 §7) does not apply to it: such a row is covered, cannot hold, and is generated as infeasible (EXPR-SPEC-2 §8).
 6. A rule or dependency read from FLUID is identified by its contract and its `id`. FLUID makes ids unique within one contract, and two contracts that a Simulation pins may reuse an id, so FLUX keys their streams and reports by both, and FLX-6201 applies within a contract.
 7. A rule read from FLUID is checked against its own band (operator, values and unit), so FLUX and SQL consumers reach one verdict; `share` and `tolerance` stay the generator's target. A band that cannot be met in expectation (§1.4) is checked and not generated from.
+8. A rule read from FLUID compares and groups strings by the code points of the stored text, without NFC normalization (§2.3), as SQL consumers do. EXPR-SPEC-2 §4 and §9 normalize first, which differs only on text that is not in NFC.
+9. The explicit `link.` root also takes a chain (`link.a.b.col`), which the copies of a `sharedAttribute` over several links need; EXPR-SPEC-2 §5 lists it for one link only.
 
 **Conformance vectors.** forge-cli keeps `fluid-sql-vectors.json` beside the validator. Each vector gives a text, its verdict (accepted, or refused with a reason), its syntax tree, its type and scale, and its value against given rows. The validator runs the file. flux-engine runs the same file through its front end, as EXPR-SPEC-2 §12 runs flux-expr/1's vectors. DuckDB is the oracle for the SQL renderings, with the exact-rational exceptions that EXPR-SPEC-2 §12 already names. The vectors define the subset; neither parser does.
 
@@ -598,7 +600,7 @@ Errors (any one fails `fluid validate`):
 3. An entry with no form, or with two.
 4. A text outside FLUID SQL/1, with its position and the construct. The hint names `contract.quality[]` for SQL outside the subset.
 5. An unknown column, relationship or relationship column, a path over two links, or a path, summary, `sharedColumns` entry or `sharedAttribute` hop through a relationship whose target declares a validity window.
-6. A type error (§2.3), including a literal outside a column's enum, or the `NULL` literal as an `IN` item or the operand of a comparison.
+6. A type error (§2.3), including a literal outside a column's enum, or the `NULL` literal as an `IN` item or an operand of a comparison or `BETWEEN`.
 7. A `derive` target that is missing or a float, whose type differs from its value's type, or, for a number target, that has no declared scale or whose value's scale does not fit. The message says, for example, "wrap it in ROUND(x, 2)".
 8. A cycle among derived columns, within one expose, or across exposes through links and aggregates.
 9. A column with two sources (§5).
@@ -629,8 +631,8 @@ Notes, reported and never failing:
 ## Security
 
 - **Expressions are data.** No consumer runs the raw text. Renderers print SQL from the parsed tree, quote every name for the target dialect and escape every string literal again. An expression therefore cannot carry a second statement, a comment or a subquery into a dbt test, an ODCS query or a warehouse. The grammar has no statement separator, comment, subquery or function beyond §2.6. Today the ODCS exporter embeds `contract.quality[].expression` as written; the new fields do not take that path.
-- **Jinja too.** The dbt bridge writes rendered SQL into a dbt project, where test arguments are rendered as Jinja. A string literal or a name that holds `{{`, `{%` or `{#` is therefore escaped for Jinja as well as for SQL (for example, emitted inside `{% raw %}`), so a contract author cannot run Jinja during `dbt test`.
-- **One escaping path.** Mask regexes, placeholder values and prefixes, and the object names in ODCS queries go through the same quoting and escaping functions as the expression renderer, never through a separate string-building path. Conformance vectors feed each renderer hostile names and literals: quotes, `;`, `--`, `/*` and Jinja delimiters.
+- **Jinja too.** The dbt bridge writes rendered SQL into a dbt project, where test arguments are rendered as Jinja. A string literal or a name that holds `{{`, `{%` or `{#` is therefore escaped for Jinja as well as for SQL (for example inside `{% raw %}`, with `{% endraw %}` itself split or refused), and test arguments are written with a YAML emitter, never assembled by hand, so a contract author cannot run Jinja during `dbt test`.
+- **One escaping path.** Mask regexes, placeholder values and prefixes, the object names in ODCS queries and every name a relationship supplies (its target, its alias and its join columns) go through the same quoting and escaping functions as the expression renderer, never through a separate string-building path. String literals are escaped per dialect, backslashes included where the dialect reads `\` as an escape (BigQuery, Databricks, Snowflake). Conformance vectors feed each renderer hostile names and literals: quotes, backslashes, `;`, `--`, `/*` and Jinja delimiters, in expressions and in column and relationship names.
 - **Bounded parsing.** A text is at most 4,096 code points and 64 levels deep, which bounds the parser's work.
 - **Linear regexes.** forge compiles the mask regexes; users do not write them. They hold no repeated group, so matching takes linear time. Placeholder values and prefixes are matched as text, and are escaped wherever they enter an exported pattern.
 - **No execution path.** The MCP compiler never compiles these texts; `describe` only returns them.
@@ -653,7 +655,7 @@ Each step is its own PR:
 1. Schema 0.7.7 fields, the validator and `fluid-sql-vectors.json`, in forge-cli.
 2. The ODCS exporter and the importer's round trip, including the placeholder exemption in the existing `invalidValues` rules.
 3. The dbt bridge's `fluid_rule` macro and its tests, plus the placeholder exemption in the existing `accepted_values` and range tests, behind the real `dbt parse` acceptance gate that tier-1's Compatibility section names.
-4. In flux-engine, EXPR-SPEC-2 takes the seven changes of §2.9 and cites this RFC; then the FLUID reader and the SQL front end.
+4. In flux-engine, EXPR-SPEC-2 takes the nine changes of §2.9 and cites this RFC; then the FLUID reader and the SQL front end.
 5. The forge_docs pages.
 
 ## References
