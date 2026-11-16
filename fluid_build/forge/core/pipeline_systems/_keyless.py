@@ -450,6 +450,37 @@ _OTHER_SYSTEMS: Dict[str, List[str]] = {
 }
 
 
+#: The header's first line, by CI system: only GitHub Actions and GitLab are wired
+#: for keyless auth here.
+_HEADLINES: Dict[str, str] = {
+    "github": "Credential model: keyless. No static cloud key lives in this file or in CI.",
+    "gitlab": "Credential model: keyless. No static cloud key lives in this file or in CI.",
+    "jenkins": (
+        "Credential model: credentials binding (Jenkins has no native OIDC). No cloud key "
+        "lives in this file."
+    ),
+    "": (
+        "Credential model: this CI system's own OIDC or workload identity (not wired here). "
+        "No cloud key lives in this file."
+    ),
+}
+
+#: What forge reads once a job holds an ID token in a file, per platform.
+_TOKEN_READERS: Dict[str, List[str]] = {
+    "aws": ["    aws         AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE (the SDK's web identity)"],
+    "gcp": ["    gcp         GOOGLE_APPLICATION_CREDENTIALS naming an external_account file"],
+    "snowflake": [
+        "    snowflake   SNOWFLAKE_AUTHENTICATOR=WORKLOAD_IDENTITY, SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER=OIDC,",
+        "                SNOWFLAKE_TOKEN_FILE_PATH, SNOWFLAKE_ACCOUNT",
+    ],
+    "databricks": [
+        "    databricks  DATABRICKS_AUTH_TYPE=env-oidc or file-oidc, DATABRICKS_OIDC_TOKEN (or",
+        "                DATABRICKS_OIDC_TOKEN_FILEPATH), DATABRICKS_HOST, DATABRICKS_CLIENT_ID",
+    ],
+    "openbao": ["    openbao     FLUID_VAULT_JWT_FILE, FLUID_VAULT_JWT_ROLE, BAO_ADDR"],
+}
+
+
 def banner_lines(cloud_auth: Sequence[str], ci_system_name: str) -> List[str]:
     """The credential section of a pipeline's header comment (no prefix)."""
     platforms = normalize(cloud_auth)
@@ -462,12 +493,12 @@ def banner_lines(cloud_auth: Sequence[str], ci_system_name: str) -> List[str]:
         ),
         "",
     )
-    lines = ["Credential model: keyless. No static cloud key lives in this file or in CI."]
+    lines = [_HEADLINES.get(system, _HEADLINES[""])]
     if not platforms:
         lines += [
-            "  The contract binds no cloud platform (and no vault:// or openbao:// secret",
-            "  reference), so no cloud credential is configured. Re-run `fluid generate ci`",
-            "  after adding a binding to get the matching keyless setup.",
+            "  No cloud platform was detected: no contract was read, or it binds none and",
+            "  names no vault:// or openbao:// secret, so no cloud credential is configured.",
+            "  Run `fluid generate ci <contract>` to get the contract's keyless setup.",
         ]
     else:
         lines += ["  Detected from the contract and its overlays:"]
@@ -495,15 +526,13 @@ def banner_lines(cloud_auth: Sequence[str], ci_system_name: str) -> List[str]:
             "",
             "  This CI system's pipeline is not wired for OIDC here; use its own mechanism:",
             *[f"  {line}" for line in _OTHER_SYSTEMS.get(system, [])],
-            "  Once a job has an ID token in a file, forge reads it from these variables:",
-            "    snowflake   SNOWFLAKE_AUTHENTICATOR=WORKLOAD_IDENTITY, SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER=OIDC,",
-            "                SNOWFLAKE_TOKEN_FILE_PATH, SNOWFLAKE_ACCOUNT",
-            "    databricks  DATABRICKS_AUTH_TYPE=env-oidc or file-oidc, DATABRICKS_OIDC_TOKEN (or",
-            "                DATABRICKS_OIDC_TOKEN_FILEPATH), DATABRICKS_HOST, DATABRICKS_CLIENT_ID",
-            "    openbao     FLUID_VAULT_JWT_FILE, FLUID_VAULT_JWT_ROLE, BAO_ADDR",
-            "    aws, gcp    the SDKs' web identity variables (AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE,",
-            "                or a GOOGLE_APPLICATION_CREDENTIALS external_account file)",
         ]
+        readers = [line for p in platforms for line in _TOKEN_READERS[p]]
+        if readers:
+            lines += [
+                "  Once a job has an ID token in a file, forge reads it from these variables:",
+                *readers,
+            ]
     lines += [
         "",
         "  Not cloud keys, but still credentials: `fluid publish` to a catalog reads DMM_API_URL /",

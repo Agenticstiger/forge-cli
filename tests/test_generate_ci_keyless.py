@@ -455,6 +455,36 @@ def test_jenkins_says_it_has_no_native_oidc(tmp_path, monkeypatch):
     assert "never commit" in text.lower() or "never commit" in text
 
 
+def test_the_jenkins_header_names_credentials_binding_not_keyless(tmp_path, monkeypatch):
+    _write(tmp_path, _contract(_binding("aws")))
+    text = _generate(tmp_path, monkeypatch, "jenkins", "standard")["Jenkinsfile"]
+    lines = text.splitlines()
+    header = "\n".join(
+        lines[: next(i for i, line in enumerate(lines) if not line.startswith("//"))]
+    )
+    assert "Credential model: credentials binding (Jenkins has no native OIDC)" in header
+    assert "Credential model: keyless" not in text
+    # The header lists only the detected platform's token readers.
+    assert "AWS_WEB_IDENTITY_TOKEN_FILE" in header
+    assert "SNOWFLAKE_TOKEN_FILE_PATH" not in header and "FLUID_VAULT_JWT_FILE" not in header
+
+
+def test_a_pipeline_built_without_a_contract_says_so():
+    from fluid_build.forge.core.pipeline_systems import _keyless
+
+    text = "\n".join(_keyless.banner_lines((), "GitHub Actions"))
+    assert "no contract was read, or it binds none" in text
+    assert "fluid generate ci <contract>" in text
+
+
+def test_the_forge_scaffolder_reads_the_project_contract(tmp_path):
+    from fluid_build.cli import _forge_ci_scaffolder
+
+    assert _forge_ci_scaffolder._cloud_auth(tmp_path) == ()
+    _write(tmp_path, _contract(_binding("aws"), secret_ref="vault://kv/app#pw"))
+    assert _forge_ci_scaffolder._cloud_auth(tmp_path) == ("aws", "openbao")
+
+
 def test_systems_without_wiring_point_to_their_own_oidc(tmp_path, monkeypatch):
     for system, needle in (
         ("azure", "workload identity federation"),

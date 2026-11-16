@@ -12,7 +12,7 @@ import argparse
 import hashlib
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from fluid_build.cli.artifact_envelope import utc_now_iso
 from fluid_build.cli.artifact_paths import CI_HEADER_SCHEMA
@@ -42,8 +42,12 @@ def build_pipeline_config(
     enable_approvals: bool = False,
     enable_security_scan: bool = True,
     enable_marketplace_publishing: bool = False,
+    cloud_auth: Sequence[str] = (),
 ) -> PipelineConfig:
     """Coerce string inputs into a :class:`PipelineConfig`.
+
+    ``cloud_auth`` is the platforms the pipeline authenticates to keylessly
+    (``generate_ci._contract_cloud_auth`` reads them from a contract).
 
     Passing ``environments=None`` lets :meth:`PipelineConfig.__post_init__`
     pick complexity-appropriate defaults. Raises ``ValueError`` with a helpful
@@ -74,6 +78,7 @@ def build_pipeline_config(
         enable_approvals=enable_approvals,
         enable_security_scan=enable_security_scan,
         enable_marketplace_publishing=enable_marketplace_publishing,
+        cloud_auth=tuple(cloud_auth),
     )
 
 
