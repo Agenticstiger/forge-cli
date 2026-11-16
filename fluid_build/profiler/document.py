@@ -121,7 +121,10 @@ def canonical_bytes(document: Mapping[str, Any]) -> bytes:
     _check(document, [])
     import rfc8785  # a base dependency, imported here to keep it off the --help path
 
-    return rfc8785.dumps(document)
+    # Annotated, not returned bare: where rfc8785 is not installed (the strict
+    # mypy job) its dumps is Any.
+    canonical: bytes = rfc8785.dumps(document)
+    return canonical
 
 
 def digest_of(canonical: bytes) -> str:
