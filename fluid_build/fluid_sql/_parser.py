@@ -40,6 +40,7 @@ from . import _nodes as n
 from ._errors import FluidSqlError
 from ._lexer import (
     FUNCTIONS,
+    MAX_CODE_POINTS,
     MAX_DEPTH,
     MAX_ROUND_PLACES,
     Token,
@@ -119,6 +120,17 @@ def parse(text: str) -> n.Node:
     end = parser.peek()
     if end.kind != "end":
         raise _unexpected(end, "the end of the expression")
+    # The canonical text adds a space after each comma, so a dense text can grow past the
+    # limit; refusing it keeps every canonical text parseable (flux-expr/2 refuses it too).
+    from ._canonical import canonical
+
+    length = len(canonical(tree))
+    if length > MAX_CODE_POINTS:
+        raise FluidSqlError(
+            "too-long",
+            f"its canonical text is {length:,} code points long (a space after each comma); "
+            f"FLUID SQL/1 takes at most {MAX_CODE_POINTS:,}",
+        )
     return tree
 
 

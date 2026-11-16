@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `YEARS_BETWEEN` count whole units. The validator parses with its own recursive-descent
     parser, not sqlglot: sqlglot's tree merges `x NOT IN (...)` with `NOT x IN (...)`, which
     differ on NULL, and `DATE '...'` with `CAST(... AS DATE)`.
-  - `fluid_sql/fluid-sql-vectors.json` is the conformance suite that flux-expr/2 also runs: 247
+  - `fluid_sql/fluid-sql-vectors.json` is the conformance suite that flux-expr/2 also runs: 251
     vectors, each a text with its verdict, tree, canonical text, type, scale and values. It ships
     in the wheel. In the tests, DuckDB runs every accepted vector's rendering and must agree.
   - `fluid validate` runs the RFC's v1 lint. Its errors: unknown names, type and scale errors

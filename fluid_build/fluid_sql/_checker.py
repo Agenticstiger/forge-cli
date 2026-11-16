@@ -101,7 +101,7 @@ def check(
             )
         result = SqlType(t.kind, t.scale)
         if derive is not None:
-            check_derive_fit(derive, result, node.pos)
+            check_derive_fit(derive, result)  # the whole value: no one character is at fault
     else:  # pragma: no cover - a programming error
         raise ValueError(f"unknown site {site!r}")
     return Checked(

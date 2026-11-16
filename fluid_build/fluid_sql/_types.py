@@ -47,6 +47,9 @@ _TIMESTAMP_TYPES = frozenset(
 _TIMESTAMPTZ_TYPES = frozenset(
     {"timestamptz", "timestamp_tz", "timestamp_ltz", "timestamp with time zone"}
 )
+#: The widest DECIMAL precision read (PostgreSQL's limit): a wider declaration has no FLUID
+#: SQL/1 type, so no contract can make a value of unbounded width (flux-expr/2 reads it so too).
+MAX_DECIMAL_PRECISION = 1000
 _DECLARED = re.compile(r"(?P<base>[a-z0-9_ ]+?)\s*(?:\((?P<params>[^()]*)\))?\Z")
 _PRECISION_SCALE = re.compile(r"(?P<p>[0-9]+)(?:\s*,\s*(?P<s>[0-9]+))?\Z")
 
@@ -101,10 +104,11 @@ def column_type(declared: object) -> Optional[ColumnType]:
         sized = _PRECISION_SCALE.match(params.strip())
         if not sized:
             return None
+        precision = int(sized.group("p"))
+        if precision > MAX_DECIMAL_PRECISION:
+            return None
         scale = int(sized.group("s")) if sized.group("s") is not None else 0
-        return ColumnType(
-            SqlType(NUMBER, scale), declared_scale=True, precision=int(sized.group("p"))
-        )
+        return ColumnType(SqlType(NUMBER, scale), declared_scale=True, precision=precision)
     if base in _FLOAT_TYPES:
         return ColumnType(SqlType(NUMBER, None), is_float=True)
     if base in _STRING_TYPES:

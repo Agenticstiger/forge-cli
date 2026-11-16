@@ -274,7 +274,7 @@ integer     = digit , { digit } ;
 - Strings are single-quoted, with `''` for a quote inside. A number is digits with an optional fraction (`3`, `1.50`); there is no exponent, and a leading `-` is negation. The digits after the point are the literal's scale.
 - An `IN` list holds literals of one type. The `NULL` literal is never an `IN` item, nor an operand of `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=` or `BETWEEN`: such a comparison would always be FALSE (§2.5), so the validator refuses it and points to `IS NULL`. `a IS [NOT] DISTINCT FROM NULL` is allowed and means `a IS [NOT] NULL`.
 - Whitespace is space, tab and newline. The text holds no `;`, and `--` and `/*` are refused wherever they stand outside a string literal or a quoted name, before parsing: SQL reads them as comments (sqlglot reads `net--1 > 0` as `net`). A double negation is written `net - -1`.
-- The text is NFC-normalized before it is parsed. It is at most 4,096 code points long and nests at most 64 levels deep, the limits of EXPR-SPEC-2 §3. Depth: a literal or a column reference is 1 deep, and every other construct, and every pair of parentheses, is one deeper than the deepest thing directly inside it, so a chain of 63 `+` or `AND` over 64 names is 64 deep. `ROUND` takes at most 38 decimal places, the widest `DECIMAL` scale (founder picks, 2026-11-16, for both limits).
+- The text is NFC-normalized before it is parsed. It is at most 4,096 code points long, and so is its canonical text (EXPR-SPEC-2 §11's form, which adds a space after each comma, so that every canonical text parses back), and it nests at most 64 levels deep, the limits of EXPR-SPEC-2 §3. Depth: a literal or a column reference is 1 deep, and every other construct, and every pair of parentheses, is one deeper than the deepest thing directly inside it, so a chain of 63 `+` or `AND` over 64 names is 64 deep. `ROUND` takes at most 38 decimal places, the widest `DECIMAL` scale (founder picks, 2026-11-16, for both limits).
 - Precedence, tightest first: unary `-`; `*` and `/`; `+` and `-`; comparisons, `IN`, `BETWEEN` and `IS`; `NOT`; `AND`; `OR`. Comparisons do not chain.
 
 ### 2.2 Names and the row scope
@@ -303,7 +303,7 @@ Six types: bool, number, string, date, timestamp, and timestamp with time zone. 
 | `timestamptz`, `timestamp_tz`, `timestamp_ltz`, `timestamp with time zone` | timestamp with time zone (an instant) |
 | every other type (`time`, `interval`, `money`, `variant`, `json`, `array`, `struct`, `map`, the binary and spatial types and so on) | none: an expression cannot name the column |
 
-A `decimal`-family column without `(p,s)` has no declared scale. An expression can read it, but a `derive` target needs `(p,s)`. `decimal(p)` is scale 0, as in SQL.
+A `decimal`-family column without `(p,s)` has no declared scale. An expression can read it, but a `derive` target needs `(p,s)`. `decimal(p)` is scale 0, as in SQL. Precision is read up to 1,000, PostgreSQL's limit; a wider declaration has no FLUID SQL/1 type.
 
 Type rules:
 
