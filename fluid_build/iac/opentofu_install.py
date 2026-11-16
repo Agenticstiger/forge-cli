@@ -46,7 +46,7 @@ from fluid_build.iac.runner import _MIN_REQUIRED_VERSION, tofu_path, tofu_versio
 # Pinned default — a recent OpenTofu stable at/above the engine's floor
 # (``_MIN_REQUIRED_VERSION``). Override per-environment with
 # ``FLUID_OPENTOFU_VERSION`` (e.g. to match an org-standardised tofu).
-PINNED_OPENTOFU_VERSION = "1.12.1"
+PINNED_OPENTOFU_VERSION = "1.13.9"
 
 # Fixed host + scheme — never user-derived, so there is no SSRF surface.
 _RELEASE_BASE = "https://github.com/opentofu/opentofu/releases/download"
