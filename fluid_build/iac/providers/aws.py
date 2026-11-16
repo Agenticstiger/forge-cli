@@ -1437,18 +1437,22 @@ _UNEMITTED_OPS: Dict[str, Tuple[str, str]] = {
     ),
     "redshift.ensure_schema": (
         "an expose bound to platform redshift with binding.schema",
-        "Create the schema and table in a build step (dbt on Redshift), or bind the "
-        "expose to a redshift_serverless format, which fluid apply provisions.",
+        "Create the schema and table in a build step (dbt on Redshift). fluid apply "
+        "provisions Redshift Serverless compute only (format redshift_serverless: a "
+        "namespace and a workgroup), never a schema or table.",
     ),
     "redshift.ensure_table": (
         "a table expose bound to platform redshift with binding.table",
-        "Create the schema and table in a build step (dbt on Redshift), or bind the "
-        "expose to a redshift_serverless format, which fluid apply provisions.",
+        "Create the schema and table in a build step (dbt on Redshift). fluid apply "
+        "provisions Redshift Serverless compute only (format redshift_serverless: a "
+        "namespace and a workgroup), never a schema or table.",
     ),
     "events.ensure_schedule": (
         "execution.trigger of type schedule",
-        "Schedule with orchestration.engine: eventbridge and orchestration.schedule, "
-        "which fluid apply provisions, and remove execution.trigger.",
+        "Set orchestration.schedule (an EventBridge Scheduler cron() or rate() "
+        "expression, passed as written) with an orchestration.engine other than airflow, "
+        "e.g. custom: fluid apply provisions it as an EventBridge Scheduler schedule. "
+        "Remove execution.trigger.",
     ),
 }
 _OPS_NOT_YET_EMITTED = frozenset(_UNEMITTED_OPS)

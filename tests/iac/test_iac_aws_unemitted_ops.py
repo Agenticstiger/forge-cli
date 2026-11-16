@@ -528,9 +528,28 @@ def _scheduled(contract: Dict[str, Any]) -> Dict[str, Any]:
     return contract
 
 
+def _s3_policies(contract: Dict[str, Any]) -> Dict[str, Any]:
+    contract.setdefault("metadata", {})["policies"] = {"read": ["role:analysts"]}
+    contract["exposes"][0]["binding"] = {"platform": "s3", "bucket": "orders-raw"}
+    return contract
+
+
+def _redshift(contract: Dict[str, Any]) -> Dict[str, Any]:
+    contract["exposes"][0]["binding"] = {
+        "platform": "redshift",
+        "cluster": "c",
+        "schema": "sales",
+        "table": "orders",
+    }
+    return contract
+
+
 _PLANNED_BY = [
     (_policies, "iam.bind_glue_database"),
+    (_s3_policies, "iam.bind_s3_bucket"),
     (_view, "athena.create_view"),
+    (_redshift, "redshift.ensure_schema"),
+    (_redshift, "redshift.ensure_table"),
     (_scheduled, "events.ensure_schedule"),
 ]
 
@@ -557,7 +576,8 @@ class TestRefusedBeforeApply:
         errors, _warnings = validate_governance(shape(_contract()))
         assert any(op in e for e in errors), errors
 
-    @pytest.mark.parametrize(("shape", "op"), _PLANNED_BY)
+    # Not platform s3: generate iac resolves no provider for it (an empty module).
+    @pytest.mark.parametrize(("shape", "op"), [p for p in _PLANNED_BY if p[0] is not _s3_policies])
     def test_generate_iac_refuses_it(self, shape, op, tmp_path, no_aws):  # noqa: F811
         out = tmp_path / "out"
         with pytest.raises(CLIError) as excinfo:
@@ -569,6 +589,35 @@ class TestRefusedBeforeApply:
         assert excinfo.value.event == "generate_iac_failed"
         assert op in excinfo.value.context["error"]
         assert not out.exists()
+
+    def test_the_schedule_remedy_is_a_valid_contract_the_engine_provisions(self):
+        """The refusal's way out for events.ensure_schedule: a schema-valid
+        orchestration that plans an op the emitter writes, and is not refused."""
+        from fluid_build.schema_manager import FluidSchemaManager
+
+        contract = _contract(orchestration={"engine": "custom", "schedule": "rate(1 hour)"})
+        result = FluidSchemaManager().validate_contract(contract)
+        assert result.is_valid, result.errors
+        ops = {a.get("op") for a in _planned(contract)}
+        assert "eventbridge.ensure_schedule" in ops and "eventbridge.ensure_schedule" in (
+            _ACTION_EMITTERS
+        )
+        assert not ops & _OPS_NOT_YET_EMITTED
+
+    def test_the_redshift_remedy_does_not_promise_a_schema_or_table(self):
+        from fluid_build.iac.providers.aws import _UNEMITTED_OPS
+
+        for op in ("redshift.ensure_schema", "redshift.ensure_table"):
+            assert "never a schema or table" in _UNEMITTED_OPS[op][1]
+
+    def test_validate_prints_nothing_the_planner_logs(self, capsys, caplog):
+        """The planner logs as it plans; that is fluid plan's output, not validate's."""
+        from fluid_build.iac.governance_validation import validate_governance
+
+        caplog.set_level(logging.DEBUG)
+        validate_governance(_contract())
+        assert not [r for r in caplog.records if "planning_completed" in r.getMessage()]
+        assert "planning_completed" not in capsys.readouterr().err
 
     def test_a_contract_that_plans_none_of_them_validates_clean(self):
         from fluid_build.iac.governance_validation import validate_governance
