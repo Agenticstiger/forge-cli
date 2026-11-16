@@ -41,6 +41,8 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Tupl
 __all__ = [
     "CONTAINER_KINDS",
     "PLATFORM_CONTAINER_KINDS",
+    "PREVIEW_CONTAINER_KINDS",
+    "SHARED_ONLY_CONTAINER_KINDS",
     "ContainerDecision",
     "ExposurePackaging",
     "LEGACY",
@@ -96,6 +98,37 @@ PLATFORM_CONTAINER_KINDS: Mapping[str, FrozenSet[str]] = {
 }
 
 _ALL_KINDS: FrozenSet[str] = frozenset(CONTAINER_KINDS)
+
+#: NEW in schema 0.7.7 (preview): the AWS streaming container kinds
+#: (AWS streaming-to-Iceberg plan §3b). lfTagVocabulary →
+#: aws_lakeformation_lf_tag; emrApplication → aws_emrserverless_application;
+#: schemaRegistry → aws_glue_registry; athenaWorkgroup → aws_athena_workgroup;
+#: kmsKey → aws_kms_key; mwaaEnvironment → aws_mwaa_environment.
+#:
+#: Parsed and validated like :data:`CONTAINER_KINDS`, and folded the same way
+#: (``containers`` override > ``mode``), but kept OUT of ``decisions``:
+#: ``plan.json``'s ``packaging`` summary serializes ``decisions`` whole, so a
+#: new key there would change the plan digest of every contract that already
+#: declares a block. Their decisions live in ``preview_decisions`` and are read
+#: through :meth:`PackagingResolution.decision_for`. No emitter reads them yet.
+PREVIEW_CONTAINER_KINDS: Tuple[str, ...] = (
+    "lfTagVocabulary",
+    "emrApplication",
+    "schemaRegistry",
+    "athenaWorkgroup",
+    "kmsKey",
+    "mwaaEnvironment",
+)
+
+#: Kinds a product can only reference, never own. The MWAA environment is the
+#: platform team's (founder decision D4, 2026-11-16): a product ships its DAG
+#: files into the environment's bucket. So it resolves REFERENCED whenever a
+#: block is present, whatever the blanket ``mode`` says; an explicit
+#: ``isolated`` is refused (``shared-only-container``); and, because nothing
+#: of the product's is written into a pool, it never makes ``pool`` required.
+SHARED_ONLY_CONTAINER_KINDS: FrozenSet[str] = frozenset({"mwaaEnvironment"})
+
+_DECLARABLE_KINDS: Tuple[str, ...] = CONTAINER_KINDS + PREVIEW_CONTAINER_KINDS
 
 _MODES: Tuple[str, ...] = ("isolated", "shared")
 _BLOCK_KEYS = frozenset({"mode", "pool", "poolManifest", "containers"})
@@ -161,7 +194,7 @@ class PackagingError(ValueError):
       string.
     - ``"invalid-containers"`` — ``containers`` is not a mapping.
     - ``"invalid-container-kind"`` — a ``containers`` key is not one of
-      :data:`CONTAINER_KINDS`.
+      :data:`CONTAINER_KINDS` or :data:`PREVIEW_CONTAINER_KINDS`.
     - ``"invalid-container-mode"`` — a ``containers`` value is not
       ``isolated`` / ``shared``.
     - ``"pool-required"`` — some container resolved ``shared`` but no
@@ -169,6 +202,9 @@ class PackagingError(ValueError):
       question 1, resolved as *require pool*).
     - ``"cluster-isolated-unsupported"`` — ``containers.cluster: isolated``
       was declared; dedicated-cluster provisioning is v2 (RFC file 6).
+    - ``"shared-only-container"`` — a kind in
+      :data:`SHARED_ONLY_CONTAINER_KINDS` (``mwaaEnvironment``) was declared
+      ``isolated``.
     """
 
     def __init__(self, kind: str, message: str):
@@ -204,6 +240,9 @@ class ExposurePackaging:
     pool: Optional[str]
     pool_manifest: Optional[str]
     decisions: Mapping[str, ContainerDecision]
+    preview_decisions: Mapping[str, ContainerDecision] = field(
+        default_factory=lambda: _LEGACY_PREVIEW_DECISIONS
+    )
 
 
 @dataclass(frozen=True)
@@ -224,6 +263,10 @@ class PackagingResolution:
     platform does not map is unobservable, and announcing it as owned is a
     false claim. Defaults to every kind, so a resolution built by hand (or
     the :data:`LEGACY` sentinel) narrows nothing.
+
+    ``preview_decisions`` covers :data:`PREVIEW_CONTAINER_KINDS` (schema
+    0.7.7 preview), apart from ``decisions`` so the plan summary and its
+    digest keep their shape. All ``LEGACY`` when no block is declared.
     """
 
     is_legacy: bool
@@ -232,6 +275,9 @@ class PackagingResolution:
     decisions: Mapping[str, ContainerDecision]
     exposures: Tuple[ExposurePackaging, ...]
     applicable_kinds: FrozenSet[str] = field(default_factory=lambda: _ALL_KINDS)
+    preview_decisions: Mapping[str, ContainerDecision] = field(
+        default_factory=lambda: _LEGACY_PREVIEW_DECISIONS
+    )
 
     def exposure_for(self, expose_id: str) -> Optional[ExposurePackaging]:
         """The resolved exposure with this id, or ``None``."""
@@ -245,12 +291,21 @@ class PackagingResolution:
 
         With ``expose_id`` the per-exposure result wins (two-level
         precedence); otherwise — or when the id is unknown — the
-        contract-level default answers.
+        contract-level default answers. A preview kind
+        (:data:`PREVIEW_CONTAINER_KINDS`) is answered from
+        ``preview_decisions`` the same way.
         """
+        if kind in PREVIEW_CONTAINER_KINDS:
+            if expose_id is not None:
+                exposure = self.exposure_for(expose_id)
+                if exposure is not None:
+                    return exposure.preview_decisions[kind]
+            return self.preview_decisions[kind]
         if kind not in CONTAINER_KINDS:
             raise PackagingError(
                 "invalid-container-kind",
-                f"unknown container kind {kind!r} — expected one of {', '.join(CONTAINER_KINDS)}",
+                f"unknown container kind {kind!r} — expected one of "
+                f"{', '.join(_DECLARABLE_KINDS)}",
             )
         if expose_id is not None:
             exposure = self.exposure_for(expose_id)
@@ -261,6 +316,9 @@ class PackagingResolution:
 
 _LEGACY_DECISIONS: Mapping[str, ContainerDecision] = {
     kind: ContainerDecision.LEGACY for kind in CONTAINER_KINDS
+}
+_LEGACY_PREVIEW_DECISIONS: Mapping[str, ContainerDecision] = {
+    kind: ContainerDecision.LEGACY for kind in PREVIEW_CONTAINER_KINDS
 }
 
 #: The distinct LEGACY sentinel — returned (by identity) for every contract
@@ -283,6 +341,29 @@ class _Block:
     pool: Optional[str]
     pool_manifest: Optional[str]
     containers: Mapping[str, str]
+
+
+def _check_container(kind: Any, value: Any, *, where: str) -> None:
+    """Refuse one ``containers`` entry: an unknown kind, a mode other than
+    ``isolated`` / ``shared``, or ``isolated`` on a shared-only kind."""
+    if kind not in _DECLARABLE_KINDS:
+        raise PackagingError(
+            "invalid-container-kind",
+            f"{where}.containers has unknown container kind {kind!r} — "
+            f"expected one of {', '.join(_DECLARABLE_KINDS)}",
+        )
+    if value not in _MODES:
+        raise PackagingError(
+            "invalid-container-mode",
+            f"{where}.containers.{kind} must be 'isolated' or 'shared', got {value!r}",
+        )
+    if kind in SHARED_ONLY_CONTAINER_KINDS and value != "shared":
+        raise PackagingError(
+            "shared-only-container",
+            f"{where}.containers.{kind} must be 'shared' — the platform team "
+            "owns it and a product only references it (drop the key, or set "
+            "it to 'shared')",
+        )
 
 
 def _parse_block(raw: Any, *, where: str) -> _Block:
@@ -329,20 +410,23 @@ def _parse_block(raw: Any, *, where: str) -> _Block:
                 f"{where}.containers must be a mapping, got {type(containers_raw).__name__}",
             )
         for kind, value in containers_raw.items():
-            if kind not in CONTAINER_KINDS:
-                raise PackagingError(
-                    "invalid-container-kind",
-                    f"{where}.containers has unknown container kind {kind!r} — "
-                    f"expected one of {', '.join(CONTAINER_KINDS)}",
-                )
-            if value not in _MODES:
-                raise PackagingError(
-                    "invalid-container-mode",
-                    f"{where}.containers.{kind} must be 'isolated' or 'shared', got {value!r}",
-                )
+            _check_container(kind, value, where=where)
             containers[str(kind)] = str(value)
 
     return _Block(mode=mode, pool=pool, pool_manifest=manifest, containers=containers)
+
+
+def _preview_decisions(containers: Mapping[str, str], mode: str) -> Dict[str, ContainerDecision]:
+    """Fold :data:`PREVIEW_CONTAINER_KINDS` like the six kinds (override >
+    ``mode``); a shared-only kind is REFERENCED whatever ``mode`` says."""
+    return {
+        kind: (
+            ContainerDecision.REFERENCED
+            if kind in SHARED_ONLY_CONTAINER_KINDS or containers.get(kind, mode) != "isolated"
+            else ContainerDecision.OWNED
+        )
+        for kind in PREVIEW_CONTAINER_KINDS
+    }
 
 
 def _effective(
@@ -351,8 +435,11 @@ def _effective(
     base: Optional[_Block],
     where: str,
     cluster_applicable: bool = True,
-) -> Tuple[Dict[str, ContainerDecision], Optional[str], Optional[str]]:
-    """Fold one scope: ``block`` over ``base`` → (decisions, pool, manifest).
+) -> Tuple[
+    Dict[str, ContainerDecision], Dict[str, ContainerDecision], Optional[str], Optional[str]
+]:
+    """Fold one scope: ``block`` over ``base`` →
+    (decisions, preview_decisions, pool, manifest).
 
     Precedence is key-wise (``binding.packaging`` over top-level
     ``packaging``); the per-kind ``containers`` overrides win over the
@@ -418,10 +505,21 @@ def _effective(
         )
         for kind in CONTAINER_KINDS
     }
+    preview_decisions = _preview_decisions(containers, mode)
 
     # A pool must be addressable whenever anything is shared (RFC open
     # question 1, resolved: require `pool`; `poolManifest` stays optional).
-    if pool is None and any(d is ContainerDecision.REFERENCED for d in decisions.values()):
+    # A preview kind counts only when `containers` names it: a block written
+    # before 0.7.7 (`mode: shared` with every one of the six kinds overridden
+    # to isolated, no pool) must keep resolving. A shared-only kind is
+    # referenced by name and nothing is written into a pool for it, so it
+    # never requires one.
+    shared = list(decisions.values()) + [
+        d
+        for k, d in preview_decisions.items()
+        if k in containers and k not in SHARED_ONLY_CONTAINER_KINDS
+    ]
+    if pool is None and any(d is ContainerDecision.REFERENCED for d in shared):
         raise PackagingError(
             "pool-required",
             f"{where}: at least one container resolved 'shared' but no `pool` id "
@@ -429,7 +527,7 @@ def _effective(
             "it writes into (add `pool: <id>`)",
         )
 
-    return decisions, pool, manifest
+    return decisions, preview_decisions, pool, manifest
 
 
 def resolve_packaging(contract: Mapping[str, Any]) -> PackagingResolution:
@@ -473,11 +571,12 @@ def resolve_packaging(contract: Mapping[str, Any]) -> PackagingResolution:
 
     top = _parse_block(top_raw, where="packaging") if top_raw is not None else None
     if top is not None:
-        contract_decisions, pool, manifest = _effective(
+        contract_decisions, contract_preview, pool, manifest = _effective(
             top, base=None, where="packaging", cluster_applicable=contract_binds_cluster
         )
     else:
         contract_decisions, pool, manifest = dict(_LEGACY_DECISIONS), None, None
+        contract_preview = dict(_LEGACY_PREVIEW_DECISIONS)
 
     exposures = []
     for index, (expose, raw, expose_cluster) in enumerate(per_expose_raw):
@@ -495,6 +594,7 @@ def resolve_packaging(contract: Mapping[str, Any]) -> PackagingResolution:
                         pool=pool,
                         pool_manifest=manifest,
                         decisions=contract_decisions,
+                        preview_decisions=contract_preview,
                     )
                 )
             else:
@@ -510,7 +610,7 @@ def resolve_packaging(contract: Mapping[str, Any]) -> PackagingResolution:
             continue
         where = f"exposes[{index}].binding.packaging"
         block = _parse_block(raw, where=where)
-        decisions, epool, emanifest = _effective(
+        decisions, epreview, epool, emanifest = _effective(
             block, base=top, where=where, cluster_applicable=expose_cluster
         )
         exposures.append(
@@ -520,6 +620,7 @@ def resolve_packaging(contract: Mapping[str, Any]) -> PackagingResolution:
                 pool=epool,
                 pool_manifest=emanifest,
                 decisions=decisions,
+                preview_decisions=epreview,
             )
         )
 
@@ -530,6 +631,7 @@ def resolve_packaging(contract: Mapping[str, Any]) -> PackagingResolution:
         decisions=contract_decisions,
         exposures=tuple(exposures),
         applicable_kinds=applicable_kinds,
+        preview_decisions=contract_preview,
     )
 
 
