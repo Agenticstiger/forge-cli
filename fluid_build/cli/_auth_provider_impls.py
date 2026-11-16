@@ -718,6 +718,14 @@ class SnowflakeAuthProvider(AuthProvider):
             for key in ["password", "private_key_path", "oauth_token", "authenticator"]
         )
 
+    @staticmethod
+    def _required_settings(settings: Dict[str, Any]) -> List[str]:
+        """The settings a connector login needs: a workload identity login names no
+        user (Snowflake finds the service user from the token)."""
+        from fluid_build.providers.snowflake.util.config import is_workload_identity
+
+        return ["account"] if is_workload_identity(settings) else ["account", "user"]
+
     def _check_auth_with_connector(self, settings: Dict[str, Any]) -> AuthResult:
         from fluid_build.providers.snowflake.connection import SnowflakeConnection
         from fluid_build.providers.snowflake.util.config import get_connection_params
@@ -917,7 +925,7 @@ class SnowflakeAuthProvider(AuthProvider):
             self.database = settings.get("database")
             self.schema = settings.get("schema")
             self.role = settings.get("role")
-            missing = [key for key in ["account", "user"] if not settings.get(key)]
+            missing = [key for key in self._required_settings(settings) if not settings.get(key)]
             if missing and self._has_connector_auth(settings):
                 return AuthResult(
                     provider=self.name,
@@ -954,17 +962,12 @@ class SnowflakeAuthProvider(AuthProvider):
             self.schema = settings.get("schema")
             self.role = settings.get("role")
 
-            # A workload identity login names no user: Snowflake finds the service
-            # user from the token's issuer and subject.
-            workload_identity = (
-                str(settings.get("authenticator") or "").strip().upper() == "WORKLOAD_IDENTITY"
-            )
-            has_user = bool(settings.get("user")) or workload_identity
-            if not (settings.get("account") and has_user) and self._has_connector_auth(settings):
+            missing = [key for key in self._required_settings(settings) if not settings.get(key)]
+            if missing and self._has_connector_auth(settings):
                 return AuthResult(
                     provider=self.name,
                     status=AuthStatus.NOT_AUTHENTICATED,
-                    error_message="Snowflake account and user not configured",
+                    error_message="Snowflake " + " and ".join(missing) + " not configured",
                 )
 
             if self._has_connector_auth(settings):

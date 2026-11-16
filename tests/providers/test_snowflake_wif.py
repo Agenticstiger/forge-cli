@@ -171,3 +171,25 @@ class TestReadinessWithoutAUser:
         assert actions["auth_ready_missing"] == []
         assert "user" not in actions["provider_ready_missing"]
         assert "user" in _required_actions({"account": "a", "password": "p"})["auth_ready_missing"]
+
+    @pytest.mark.parametrize("method", ["login", "check_auth"])
+    def test_auth_login_and_status_do_not_ask_for_a_user(self, monkeypatch, method):
+        import asyncio
+        import logging
+
+        from fluid_build.cli._auth_provider_impls import SnowflakeAuthProvider as Provider
+        from fluid_build.cli.auth import AuthResult, AuthStatus
+
+        connected = AuthResult(provider="snowflake", status=AuthStatus.AUTHENTICATED)
+        monkeypatch.setattr(Provider, "_check_auth_with_connector", lambda self, s: connected)
+        provider = Provider({}, logging.getLogger("test"))
+
+        def settings(**values):
+            monkeypatch.setattr(Provider, "_resolve_settings", lambda self: dict(values))
+            return asyncio.run(getattr(provider, method)())
+
+        assert settings(account="org-acct", authenticator="WORKLOAD_IDENTITY") is connected
+        refused = settings(authenticator="WORKLOAD_IDENTITY")
+        assert refused.status == AuthStatus.NOT_AUTHENTICATED
+        assert "account" in refused.error_message and "user" not in refused.error_message
+        assert "user" in settings(account="org-acct", password="p").error_message

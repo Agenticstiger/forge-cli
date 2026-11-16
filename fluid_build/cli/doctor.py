@@ -774,11 +774,10 @@ def _check_snowflake_readiness() -> Dict[str, any]:
     missing = []
     if not account:
         missing.append("SNOWFLAKE_ACCOUNT")
+    from fluid_build.providers.snowflake.util.config import is_workload_identity
+
     # A workload identity login names no user (Snowflake reads it from the token).
-    workload_identity = (
-        str(settings.get("authenticator") or "").strip().upper() == "WORKLOAD_IDENTITY"
-    )
-    if not user and not workload_identity:
+    if not user and not is_workload_identity(settings):
         missing.append("SNOWFLAKE_USER")
     if not has_auth:
         missing.append(

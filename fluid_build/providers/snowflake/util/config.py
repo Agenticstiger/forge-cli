@@ -32,6 +32,14 @@ _ACCOUNT_CLOUD_SUFFIXES = frozenset({"aws", "azure", "gcp"})
 #: ``authenticator`` value of Snowflake workload identity federation.
 WORKLOAD_IDENTITY_AUTHENTICATOR = "WORKLOAD_IDENTITY"
 
+
+def is_workload_identity(settings: Mapping[str, Any]) -> bool:
+    """A workload identity federation login. It names no user: Snowflake finds the
+    service user from the token's issuer and subject."""
+    authenticator = str(settings.get("authenticator") or "").strip().upper()
+    return authenticator == WORKLOAD_IDENTITY_AUTHENTICATOR
+
+
 # Keys that carry secret material. These MUST never appear in the `_sources`
 # map returned to callers, nor be echoed into diagnostic reports.
 SECRET_KEYS = frozenset({"password", "private_key_passphrase", "oauth_token"})
@@ -512,12 +520,7 @@ def get_connection_params(
             "SNOWFLAKE_ACCOUNT, or pass an explicit Snowflake account."
         )
 
-    workload_identity = (
-        str(resolved.get("authenticator") or "").strip().upper() == WORKLOAD_IDENTITY_AUTHENTICATOR
-    )
-
-    # Workload identity federation names no user: Snowflake finds the service
-    # user from the token's issuer and subject.
+    workload_identity = is_workload_identity(resolved)
     if not resolved.get("user") and not workload_identity:
         raise ValueError(
             "Snowflake user not specified. Set SNOWFLAKE_USER or provide an explicit user."
