@@ -2915,60 +2915,16 @@ def lf_row_filters(
             "grants on a Glue table to carry the filter, so nothing would enforce it.",
             ("Grant the filtered principal SELECT in governance.lakeFormation.grants.",),
         )
-    mapping = principal_map(binding)
     # Matched by key, not as written: a grant may spell the filtered role another way
     # (its path, its case), and Lake Formation unions grants, so one left on the table
     # would read every row beside the filter.
-    by_key: Dict[str, RowFilter] = {}
-    for flt in filters:
-        for identity in resolve_principal(flt.principal, mapping, platform=AWS, where=where):
-            key = aws_principal_key(identity)
-            other = by_key.setdefault(key, flt)
-            if other is not flt:
-                raise UnsupportedBindingError(
-                    "row-filter-unenforceable",
-                    f"{where} filters {other.principal} and {flt.principal}, which both "
-                    f"resolve to {identity}; Lake Formation unions the two filters' grants, so "
-                    "that role would read the rows of either.",
-                    ("Combine the two predicates into one filter for the one role.",),
-                )
+    by_key = _lf_row_filters_by_key(filters, principal_map(binding), where)
     accounts = {a for a in map(aws_principal_account, by_key) if a}
     out: Dict[int, RowFilter] = {}
     for i, grant in enumerate(grants):
-        if not column_access.lf_grant_reads(grant):
-            continue
-        principal = str(grant.get("principal"))
-        at = f"governance.lakeFormation.grants[{i}]"
-        flt = by_key.get(aws_principal_key(principal))
-        if flt is None:
-            if aws_principal_spans(principal, accounts):
-                raise UnsupportedBindingError(
-                    "row-filter-unenforceable",
-                    f"{where} filters rows, but {at} lets {principal} read the table, and "
-                    "that names a set of principals that may hold a filtered role. Lake "
-                    "Formation unions grants, so the filtered role would read every row "
-                    "through it.",
-                    (
-                        "Grant each reader by its own IAM role or user ARN.",
-                        "Remove the grant, or move it to an expose with no row filter.",
-                    ),
-                )
-            continue
-        regrant = {str(p).upper() for p in grant.get("permissionsWithGrantOption") or ()}
-        if column_access.LF_READ_PERMISSIONS & regrant:
-            raise UnsupportedBindingError(
-                "row-filter-unenforceable",
-                f"{where} filters {flt.principal}, but {at} gives {principal} SELECT in "
-                "permissionsWithGrantOption. The filtered role reads through a data cells "
-                "filter, granted SELECT only: the grant option cannot go on the table without "
-                "letting the role grant every row, to itself or anyone, and dropping it would "
-                "take away a right the contract asks for.",
-                (
-                    "Remove SELECT (and ALL) from permissionsWithGrantOption.",
-                    "Grant the grant option to a principal no row filter names.",
-                ),
-            )
-        out[i] = flt
+        flt = _lf_grant_row_filter(grant, i, by_key, accounts, where)
+        if flt is not None:
+            out[i] = flt
     for flt in filters:
         if not any(held is flt for held in out.values()):
             raise UnsupportedBindingError(
@@ -2978,6 +2934,70 @@ def lf_row_filters(
                 ("Grant the principal SELECT, or remove the filter.",),
             )
     return out
+
+
+def _lf_row_filters_by_key(
+    filters: Sequence[RowFilter], mapping: Any, where: str
+) -> Dict[str, RowFilter]:
+    """``{aws_principal_key: row filter}`` over every identity each filter's principal
+    resolves to; two filters on one role are refused (Lake Formation unions grants)."""
+    by_key: Dict[str, RowFilter] = {}
+    for flt in filters:
+        for identity in resolve_principal(flt.principal, mapping, platform=AWS, where=where):
+            other = by_key.setdefault(aws_principal_key(identity), flt)
+            if other is not flt:
+                raise UnsupportedBindingError(
+                    "row-filter-unenforceable",
+                    f"{where} filters {other.principal} and {flt.principal}, which both "
+                    f"resolve to {identity}; Lake Formation unions the two filters' grants, so "
+                    "that role would read the rows of either.",
+                    ("Combine the two predicates into one filter for the one role.",),
+                )
+    return by_key
+
+
+def _lf_grant_row_filter(
+    grant: Any, i: int, by_key: Mapping[str, RowFilter], accounts: Iterable[str], where: str
+) -> Optional[RowFilter]:
+    """The row filter grant ``i`` must read through, or ``None`` when it reads unfiltered.
+
+    Refused: a read grant to a set that may hold a filtered role, and a filtered role's
+    ``SELECT`` with the grant option.
+    """
+    if not column_access.lf_grant_reads(grant):
+        return None
+    principal = str(grant.get("principal"))
+    at = f"governance.lakeFormation.grants[{i}]"
+    flt = by_key.get(aws_principal_key(principal))
+    if flt is None:
+        if aws_principal_spans(principal, accounts):
+            raise UnsupportedBindingError(
+                "row-filter-unenforceable",
+                f"{where} filters rows, but {at} lets {principal} read the table, and "
+                "that names a set of principals that may hold a filtered role. Lake "
+                "Formation unions grants, so the filtered role would read every row "
+                "through it.",
+                (
+                    "Grant each reader by its own IAM role or user ARN.",
+                    "Remove the grant, or move it to an expose with no row filter.",
+                ),
+            )
+        return None
+    regrant = {str(p).upper() for p in grant.get("permissionsWithGrantOption") or ()}
+    if column_access.LF_READ_PERMISSIONS & regrant:
+        raise UnsupportedBindingError(
+            "row-filter-unenforceable",
+            f"{where} filters {flt.principal}, but {at} gives {principal} SELECT in "
+            "permissionsWithGrantOption. The filtered role reads through a data cells "
+            "filter, granted SELECT only: the grant option cannot go on the table without "
+            "letting the role grant every row, to itself or anyone, and dropping it would "
+            "take away a right the contract asks for.",
+            (
+                "Remove SELECT (and ALL) from permissionsWithGrantOption.",
+                "Grant the grant option to a principal no row filter names.",
+            ),
+        )
+    return flt
 
 
 @dataclass(frozen=True)
