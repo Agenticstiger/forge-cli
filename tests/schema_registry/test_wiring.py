@@ -132,14 +132,16 @@ def test_apply_checks_before_the_engine_plans_or_applies(monkeypatch):
     contract = {"id": "x"}
     monkeypatch.setattr(engine, "_verify_plan_binding_for_opentofu", lambda a, l: None)
     monkeypatch.setattr(engine, "_bound_tofu_plan", lambda a, p, l: None)
-    monkeypatch.setattr(engine, "_open_engine", lambda *a, **k: SimpleNamespace(contract=contract))
+    monkeypatch.setattr(
+        engine, "_open_engine", lambda *a, **k: SimpleNamespace(contract=contract, provider="aws")
+    )
 
-    def verify(given, *, dry_run):
-        order.append(("verify", given, dry_run))
+    def verify(given, *, dry_run, provider):
+        order.append(("verify", given, dry_run, provider))
         raise RuntimeError("stop")
 
     monkeypatch.setattr("fluid_build.schema_registry.verify.verify_at_apply", verify)
     monkeypatch.setattr(engine, "_guard_before_plan", lambda *a: order.append("guard"))
     with pytest.raises(RuntimeError, match="stop"):
         engine._apply_via_opentofu(argparse.Namespace(dry_run=False), None, contract)
-    assert order == [("verify", contract, False)]
+    assert order == [("verify", contract, False, "aws")]

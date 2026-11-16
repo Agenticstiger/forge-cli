@@ -163,7 +163,10 @@ def produced_findings(contract: Mapping[str, Any], subject: Subject) -> Tuple[li
     errors: list = []
     warnings: list = []
     try:
-        schema_definition(subject, f"fluid.{contract.get('id') or 'product'}")
+        from fluid_build.iac.naming import safe_ident
+
+        cid = safe_ident(contract.get("id") or contract.get("name") or "product")
+        schema_definition(subject, f"fluid.{cid}")
     except ProducedSubjectError as exc:
         errors.append(str(exc))
     if not cloud_bound(contract, subject.ref.kind):

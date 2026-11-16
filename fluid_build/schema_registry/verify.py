@@ -336,6 +336,7 @@ def verify_at_apply(
     dry_run: bool = False,
     environ: Optional[Mapping[str, str]] = None,
     confluent: Optional[Callable[..., Any]] = None,
+    provider: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """``fluid apply``'s check of each consumed subject whose registry needs a credential.
 
@@ -364,6 +365,12 @@ def verify_at_apply(
         produced, errors = [], [str(exc)]
     # Produced subjects: what OpenTofu registers, and where, re-checked here, where the
     # environment tofu runs with is final (a plan made elsewhere did not see it).
+    if provider is not None:
+        # Only the subjects this run's plugin registers: a multi-cloud contract applied
+        # one provider at a time is not refused over the other cloud's registry.
+        from .produced import REGISTERING_CLOUD
+
+        produced = [s for s in produced if REGISTERING_CLOUD.get(s.ref.kind) == provider]
     _produced_checks(contract, produced, "apply", environ, errors, warnings)
     subjects = [] if dry_run else [s for s in checked_subjects(contract) if s.ref.secret_ref]
     if confluent is None:

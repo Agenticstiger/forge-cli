@@ -210,3 +210,10 @@ def test_apply_refuses_another_operator_endpoint_even_on_a_dry_run():
 def test_apply_accepts_the_contracts_registry():
     env = {**PRODUCED_ENV, "SCHEMA_REGISTRY_REST_ENDPOINT": URL + "/"}
     assert verify_at_apply(_produced_confluent(), environ=env) == []
+
+
+def test_apply_checks_only_the_subjects_this_provider_registers():
+    contract = _produced_confluent()
+    assert verify_at_apply(contract, dry_run=True, environ={}, provider="aws") == []
+    with pytest.raises(CLIError):
+        verify_at_apply(contract, dry_run=True, environ={}, provider="confluent")
