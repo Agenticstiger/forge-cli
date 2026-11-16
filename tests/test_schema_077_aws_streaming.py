@@ -434,7 +434,7 @@ class TestMaskAtIngest:
 
 
 def _spark_params(**spark):
-    return _with(lambda c: _spark(c), **spark)
+    return _with(_spark, **spark)
 
 
 class TestSparkParameters:
