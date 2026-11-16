@@ -377,10 +377,19 @@ def test_spark_builds_are_the_engine_spark_builds_with_parameters(contract):
 
 
 def test_validate_reports_the_operators_policy_and_warns_about_contract_sql(contract, monkeypatch):
-    assert validation_errors(contract) == []
+    assert validation_errors(contract) == validation_warnings(contract) == []
+    # Policy #818: a broker missing from the allowlist warns at validate, refuses at run time.
     monkeypatch.setenv(HOST_ALLOWLIST_ENV, "example.internal")
+    assert validation_errors(contract) == []
+    (warning,) = validation_warnings(contract)
+    assert "b-1.msk.example, b-2.msk.example is not in" in warning
+    with pytest.raises(FluidUserError, match="Kafka bootstrap server"):
+        job(contract)
+    # A link-local broker is refused at every stage.
+    source_of(contract)["bootstrapServers"] = "169.254.169.254:9092"
     (error,) = validation_errors(contract)
     assert error.startswith("Spark build ingest-orders:") and "Kafka bootstrap server" in error
+    source_of(contract)["bootstrapServers"] = BROKERS
     _sql_build(contract)
     assert validation_errors(contract) == []  # the allowlist is apply's, here a warning
     (warning,) = validation_warnings(contract)

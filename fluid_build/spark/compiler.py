@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
@@ -176,19 +177,54 @@ def _kafka(cfg: Mapping[str, Any], where: str) -> dict[str, Any]:
     }
 
 
-def _refuse_unless_hosts_allowed(
-    kafka: Mapping[str, Any], registry: Optional[Mapping[str, Any]], environ: Any
-) -> None:
-    """The managed Flink lane's broker and registry host rule, unchanged: the job resolves
-    each name itself, so a hostname needs the operator's entry."""
-    from fluid_build.streaming.policy import refuse_unless_source_hosts_allowed
-
+def _source_hosts(kafka: Mapping[str, Any], registry_url: Optional[str]) -> dict[str, Any]:
     source: dict[str, Any] = {}
     if kafka["mskClusterArn"] is None:
         source["bootstrapServers"] = kafka["bootstrapServers"]
-    if registry is not None:
-        source["schemaRegistryUrl"] = registry["url"]
-    refuse_unless_source_hosts_allowed({"source": source}, environ=environ)
+    if registry_url is not None:
+        source["schemaRegistryUrl"] = registry_url
+    return source
+
+
+def _unlisted_names(source: Mapping[str, Any], environ: Any) -> list[str]:
+    """The broker and registry host names the operator's host allowlist does not list."""
+    import ipaddress
+
+    from fluid_build.secrets.policy import is_loopback
+    from fluid_build.streaming.policy import is_listed
+
+    hosts = [e.rpartition(":")[0] for e in str(source.get("bootstrapServers") or "").split(",")]
+    if source.get("schemaRegistryUrl"):
+        hosts.append(urlsplit(source["schemaRegistryUrl"]).hostname or "")
+    unlisted = []
+    for host in filter(None, hosts):
+        try:
+            ipaddress.ip_address(host)
+            continue  # an address keeps the deployment host rule, applied either way
+        except ValueError:
+            pass
+        if not is_loopback(host) and not is_listed(host, environ) and host not in unlisted:
+            unlisted.append(host)
+    return unlisted
+
+
+def _refuse_unless_hosts_allowed(source: Mapping[str, Any], environ: Any, *, listed: bool) -> None:
+    """The managed Flink lane's broker and registry host rule, unchanged: the job resolves
+    each name itself, so a hostname needs the operator's entry.
+
+    ``listed=False`` (``fluid validate``) takes the names the allowlist lacks as listed,
+    so only what fails at every stage (a link-local or unreadable host) is refused;
+    :func:`validation_warnings` reports the missing entries (policy #818: a missing
+    entry warns at validate and refuses at run time).
+    """
+    from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV, refuse_unless_source_hosts_allowed
+
+    env = dict(os.environ if environ is None else environ)
+    if not listed:
+        names = _unlisted_names(source, env)
+        if names:
+            env[HOST_ALLOWLIST_ENV] = ",".join(filter(None, [env.get(HOST_ALLOWLIST_ENV), *names]))
+    refuse_unless_source_hosts_allowed({"source": source}, environ=env)
 
 
 def _refuse_unless_credential_allowed(ref: Any, url: str, where: str, environ: Any) -> None:
@@ -335,14 +371,16 @@ def compile_job_config(
     account_ref: str = "",
     environ: Optional[Mapping[str, str]] = None,
     contract_sql_gate: bool = True,
+    host_gate: bool = True,
 ) -> SparkJob:
     """The job config of one Spark build.
 
     ``account_ref`` fills the ``<account>-fluid-data`` bucket of a binding without one,
     as the IaC emitter's interpolation token or an account id. ``environ`` holds the
     operator's policy (:data:`CONTRACT_SQL_ALLOWLIST_ENV`, the broker and registry host
-    allowlist, the secrets policy). ``contract_sql_gate=False`` leaves the contract-SQL
-    allowlist to the caller (``fluid validate`` warns about it instead).
+    allowlist, the secrets policy). ``contract_sql_gate=False`` and ``host_gate=False``
+    leave the contract-SQL allowlist and the host allowlist's entries to the caller
+    (``fluid validate`` warns about them instead).
     """
     from fluid_build.spark.policy import refuse_unless_contract_sql_allowed
 
@@ -417,7 +455,9 @@ def compile_job_config(
         stream = parse_stream(records, swhere)
         kafka = _kafka(cfg, where)
         registry = _registry(stream_spec.get("registry"), stream, swhere, environ)
-        _refuse_unless_hosts_allowed(kafka, registry, environ)
+        _refuse_unless_hosts_allowed(
+            _source_hosts(kafka, registry and registry["url"]), environ, listed=host_gate
+        )
         offsets = stream_spec.get("startingOffsets", "earliest" if mode == "batch" else "latest")
         if offsets not in ("earliest", "latest"):
             raise ValueError(f"{swhere}.startingOffsets: expected earliest or latest")
@@ -518,7 +558,13 @@ def validation_errors(contract: Mapping[str, Any]) -> list[str]:
     for build in spark_builds(contract):
         try:
             # A stand-in account: a bucketless binding validates; apply passes the real one.
-            compile_job_config(contract, build, account_ref="000000000000", contract_sql_gate=False)
+            compile_job_config(
+                contract,
+                build,
+                account_ref="000000000000",
+                contract_sql_gate=False,
+                host_gate=False,
+            )
         except FluidUserError as exc:
             errors.append(f"Spark build {build.get('id')}: {exc.what}. {exc.why}")
         except (ValueError, KeyError, TypeError) as exc:
@@ -528,13 +574,32 @@ def validation_errors(contract: Mapping[str, Any]) -> list[str]:
 
 def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
     from fluid_build.streaming.compiler import managed_lane_enabled
+    from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV
 
     if not managed_lane_enabled(contract):
         return []
-    return [
-        f"Build {build.get('id')}: properties.sql is run only if the operator lists "
-        f"{contract.get('id')} in {CONTRACT_SQL_ALLOWLIST_ENV}; properties.mapping is "
-        "checked against the output before deploy and reads nothing but the stream"
-        for build in spark_builds(contract)
-        if (build.get("properties") or {}).get("sql") is not None
-    ]
+    warnings = []
+    for build in spark_builds(contract):
+        props = build.get("properties") or {}
+        if props.get("sql") is not None:
+            warnings.append(
+                f"Build {build.get('id')}: properties.sql is run only if the operator lists "
+                f"{contract.get('id')} in {CONTRACT_SQL_ALLOWLIST_ENV}; properties.mapping is "
+                "checked against the output before deploy and reads nothing but the stream"
+            )
+        stream = props.get("stream")
+        if not isinstance(stream, Mapping):
+            continue
+        try:
+            kafka = _kafka(spark_parameters(build) or {}, f"Spark build {build.get('id')}")
+        except ValueError:
+            continue  # validation_errors reports it
+        registry = stream.get("registry")
+        url = registry.get("url") if isinstance(registry, Mapping) else None
+        names = _unlisted_names(_source_hosts(kafka, url if isinstance(url, str) else None), None)
+        if names:
+            warnings.append(
+                f"Build {build.get('id')}: {', '.join(names)} is not in {HOST_ALLOWLIST_ENV}; "
+                "the job is refused at run time until the operator lists it"
+            )
+    return warnings
