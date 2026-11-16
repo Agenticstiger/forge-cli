@@ -61,6 +61,8 @@ REGION_DATA = "fluid_region"
 ARTIFACT_ROOT = "_fluid/spark"
 #: Where the compiler puts a build's checkpoint by default: ``_checkpoints/<product>/<build>/``.
 _CHECKPOINTS = "_checkpoints"
+#: The roots forge writes in a product's bucket; an output's own data never lives there.
+_RESERVED_ROOTS = (ARTIFACT_ROOT.split("/")[0], _CHECKPOINTS)
 RUNNER_FILE = "forge_spark_runner.py"
 CONFIG_FILE = "job.json"
 #: Days a Spark log group keeps events.
@@ -116,6 +118,10 @@ class _Ctx:
     account_marker: str
     brokers_marker: str
     account: TofuExpr = tofu_ref(CALLER)
+
+    def shown(self, text: str) -> str:
+        """``text`` for a message: the account marker as ``<account>``."""
+        return text.replace(self.account_marker, "<account>")
 
     def x(self, text: str) -> Any:
         """``text`` (contract-derived) with the account marker made the account
@@ -424,19 +430,23 @@ def _scoped(b: _Build, bucket: str, prefix: str, what: str) -> str:
     neighbours (``x`` matches ``x_pii/``).
     """
     prefix = prefix if prefix.endswith("/") else prefix + "/"
+    segments = prefix.split("/")
+    reserved = what != "properties.stream.checkpoint" and segments[0] in _RESERVED_ROOTS
     if (
         _BUCKET.fullmatch(bucket)
         and _PREFIX.fullmatch(prefix)
-        and ".." not in prefix.split("/")
-        and "." not in prefix.split("/")
+        and ".." not in segments
+        and "." not in segments
+        and not reserved
     ):
         return prefix
     raise UnsupportedBindingError(
         "spark-role-scope",
-        f"{b.where}: {what} (s3://{bucket}/{prefix.rstrip('/')}) is not one prefix of one "
-        "bucket, and the role forge creates for the build may read, overwrite and delete "
-        "everything it names: an empty path is the whole bucket, and a bucketless product "
-        "shares <account>-fluid-data with every other.",
+        f"{b.where}: {what} (s3://{b.ctx.shown(bucket)}/{prefix.rstrip('/')}) is not one "
+        "prefix of one bucket outside forge's _fluid/ and _checkpoints/ roots, and the "
+        "role forge creates for the build may read, overwrite and delete everything it "
+        "names: an empty path is the whole bucket, and a bucketless product shares "
+        "<account>-fluid-data with every other.",
         (
             "Set binding.location.path to the table's own prefix (letters, digits, "
             "'.', '_', '=', '-' and '/').",
@@ -467,12 +477,13 @@ def _s3_grants(b: _Build, bucket: str, data_prefix: str) -> Tuple[aws_identity.S
                 raise UnsupportedBindingError(
                     "spark-checkpoint-scope",
                     f"{b.where}: properties.stream.checkpoint is outside the product's "
-                    f"checkpoints (s3://{bucket}/{home}), and the role forge creates would "
+                    f"checkpoints (s3://{b.ctx.shown(bucket)}/{home}), and the role forge "
+                    "creates would "
                     "get write access wherever it points.",
                     (
                         "Leave properties.stream.checkpoint out: it defaults to "
-                        f"s3://{bucket}/{home}{b.build_id}/.",
-                        f"Or put it under s3://{bucket}/{home}.",
+                        f"s3://{b.ctx.shown(bucket)}/{home}{b.build_id}/.",
+                        f"Or put it under s3://{b.ctx.shown(bucket)}/{home}.",
                         "Or set parameters.spark.executionRoleArn to a role the operator "
                         "scoped.",
                     ),

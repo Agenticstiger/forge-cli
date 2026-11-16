@@ -617,3 +617,21 @@ def test_an_operator_scoped_role_takes_any_checkpoint(contract, monkeypatch):
     contract["builds"][0]["properties"]["stream"]["checkpoint"] = "s3://other-lake/ck/"
     resources, _ = emit(contract)
     assert resources["aws_glue_job"][KEY]["role_arn"] == ROLE
+
+
+@pytest.mark.parametrize("path", ["_fluid/spark/", "_checkpoints/"])
+def test_an_output_cannot_live_in_forges_own_roots(contract, path):
+    contract["exposes"][0]["binding"]["location"]["path"] = path
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert caught.value.kind == "spark-role-scope"
+
+
+def test_a_refusal_never_shows_the_internal_account_marker(contract):
+    location = contract["exposes"][0]["binding"]["location"]
+    del location["bucket"]
+    location["path"] = ""
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert "s3://<account>-fluid-data/" in str(caught.value)
+    assert "fluidacct" not in str(caught.value)
