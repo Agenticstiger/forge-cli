@@ -70,6 +70,7 @@ from ...providers._sql_safety import quote_string_literal, validate_ident
 from ...providers.aws.util import warehouse as _warehouse
 from .. import column_access, column_types
 from ..base import UnsupportedBindingError
+from ..credentials import AWS_ENV_PREFIXES
 from ..governance_labels import governance_labels
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref
@@ -641,6 +642,9 @@ class AwsIacPlugin:
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
     )
+    # Every AWS_* variable reaches tofu (iac/credentials.py): the SDK reads many more
+    # (container and web identity credentials, endpoints, the CA bundle, retries).
+    credential_env_prefixes = AWS_ENV_PREFIXES
 
     def emit(
         self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()

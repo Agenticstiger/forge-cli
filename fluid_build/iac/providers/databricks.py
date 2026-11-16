@@ -2626,6 +2626,11 @@ def _use_catalog_notices(compiled: _Compiled) -> List[str]:
     return notices
 
 
+#: What a GitHub Actions job with ``permissions: id-token: write`` sets, and the
+#: Databricks SDK reads to mint a ``github-oidc`` token.
+_GITHUB_ID_TOKEN_REQUEST_VARS = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+
+
 class DatabricksIacPlugin:
     """FLUID contract → ``databricks/databricks`` Unity Catalog resources."""
 
@@ -2638,6 +2643,11 @@ class DatabricksIacPlugin:
         "DATABRICKS_CLIENT_SECRET",
         "DATABRICKS_CONFIG_PROFILE",
     )
+    # Databricks unified auth reads DATABRICKS_*, and on Azure and GCP workspaces
+    # the cloud's own variables (ARM_*, AZURE_*, GOOGLE_*); all reach tofu
+    # (iac/credentials.py). GitHub's token request variables are added only for
+    # github-oidc (credential_env).
+    credential_env_prefixes = ("DATABRICKS_", "ARM_", "AZURE_", "GOOGLE_")
     #: The committed lock ``tofu init`` verifies the provider against
     #: (``iac/module.py::dependency_lock``).
     dependency_lock = "databricks.terraform.lock.hcl"
@@ -2685,8 +2695,17 @@ class DatabricksIacPlugin:
     def credential_env(self, env: Mapping[str, str]) -> Dict[str, str]:
         """Pin the credential the provider uses (``databricks_auth.py``): the
         environment's, or the one profile ``DATABRICKS_CONFIG_PROFILE`` names for
-        ``DATABRICKS_HOST``; never a DEFAULT profile it happens to find."""
-        return tofu_env_overlay(env)
+        ``DATABRICKS_HOST``; never a DEFAULT profile it happens to find.
+
+        With ``github-oidc`` the provider mints its token from the GitHub Actions
+        job's token request variables, which reach ``tofu`` for that method only
+        (the child environment is an allowlist, ``iac/credentials.py``)."""
+        overlay = tofu_env_overlay(env)
+        if overlay.get("DATABRICKS_AUTH_TYPE") == "github-oidc":
+            for name in _GITHUB_ID_TOKEN_REQUEST_VARS:
+                if env.get(name):
+                    overlay[name] = str(env[name])
+        return overlay
 
     def discover_imports(
         self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()

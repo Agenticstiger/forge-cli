@@ -175,14 +175,13 @@ def _plan_and_classify(
     plugin: Any, contract: Mapping[str, Any], target: Any, logger: logging.Logger
 ) -> StateDriftReport:
     from fluid_build.iac import runner
-    from fluid_build.iac.credentials import build_tofu_env
     from fluid_build.iac.module import write_dependency_lock
 
     from ._apply_opentofu_engine import (
         _guard_region_move,
         _reconcile_with_state,
         _tail,
-        credential_overlay,
+        _tofu_env,
         emit_module,
         read_target,
         recorded_legacy_backend,
@@ -202,9 +201,8 @@ def _plan_and_classify(
         # The same locked provider `fluid apply` installs (iac/module.py).
         write_dependency_lock(plugin, workdir)
 
-        env = build_tofu_env()
         try:
-            env.update(credential_overlay(plugin, env))
+            env = _tofu_env(plugin, target)
         except CLIError as exc:
             return _error(_cli_error_text(exc), location)
         init = runner.tofu_init(

@@ -221,6 +221,9 @@ class SnowflakeIacPlugin:
         "SNOWFLAKE_OAUTH_CLIENT_SECRET",
         "SNOWFLAKE_OAUTH_TOKEN_REQUEST_URL",
     )
+    # Every SNOWFLAKE_* variable reaches tofu (iac/credentials.py), the TOML
+    # config path and workload identity settings included.
+    credential_env_prefixes = ("SNOWFLAKE_",)
 
     def emit(
         self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()

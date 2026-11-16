@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shlex
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -33,7 +34,7 @@ from fluid_build.iac.backend import (
     resolve_state_backend_spec,
 )
 from fluid_build.iac.base import UnsupportedBindingError
-from fluid_build.iac.credentials import build_tofu_env, credential_report
+from fluid_build.iac.credentials import backend_clouds, build_tofu_env, credential_report
 from fluid_build.iac.module import write_dependency_lock
 from fluid_build.iac.naming import safe_ident
 from fluid_build.iac.source import contract_source, source_contract_file
@@ -166,8 +167,7 @@ def _apply_via_opentofu(
     # that ships a committed lock (iac/module.py::dependency_lock).
     write_dependency_lock(plugin, workdir)
 
-    env = build_tofu_env()
-    env.update(credential_overlay(plugin, env))
+    env = _tofu_env(plugin, target)
     present, _absent = credential_report(plugin, env)
 
     cprint(f"\nOpenTofu engine — provider: {provider}")
@@ -884,6 +884,20 @@ def credential_overlay(plugin: Any, env: Mapping[str, str]) -> Dict[str, str]:
         return plugin.credential_env(env)
     except UnsupportedBindingError as exc:
         raise _binding_error(exc)
+
+
+def _tofu_env(plugin: Any, target: StateTarget) -> Dict[str, str]:
+    """``tofu``'s environment for one run of ``plugin`` on ``target``'s state.
+
+    The allowlist (``iac/credentials.py``) for the plugin and the state
+    backend's cloud, then the plugin's ``credential_env`` overlay, derived from
+    the full environment as before. Every ``tofu`` call of the run, ``init`` to
+    ``apply``, takes this one mapping.
+    """
+    full = dict(os.environ)
+    env = build_tofu_env(plugin, clouds=backend_clouds(target.backend), base=full)
+    env.update(credential_overlay(plugin, full))
+    return env
 
 
 @contextmanager
