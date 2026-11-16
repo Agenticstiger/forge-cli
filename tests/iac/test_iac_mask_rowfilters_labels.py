@@ -717,3 +717,28 @@ class TestAwsGrantPrincipalSpelling:
         assert "msisdn" in analyst["table_with_columns"][0]["excluded_column_names"]
         views = [t for t in res.get("aws_glue_catalog_table", {}).values() if "masked" in t["name"]]
         assert len(views) == 1
+
+    def test_a_describe_grant_in_another_spelling_gets_no_view_of_its_own(self):
+        """Security review: a view is a read, run as its definer; a DESCRIBE grant must
+        not get one without the read grant's exclusions and row filter."""
+        grants = [
+            {"principal": ANALYST_ARN, "permissions": ["SELECT"]},
+            {"principal": f"arn:aws:iam::{ACCOUNT}:role/data/Analyst", "permissions": ["DESCRIBE"]},
+        ]
+        contract = _aws_grants(grants, restrictions=[DENY_ID, MASK_MSISDN], row_filters=[CONSENT])
+        with pytest.raises(UnsupportedBindingError) as raised:
+            _aws_resources(contract)
+        assert raised.value.kind == "lakeformation-grant-columns"
+
+    def test_a_describe_grant_beside_a_masked_read_adds_no_second_view(self):
+        grants = [
+            {"principal": ANALYST_ARN, "permissions": ["SELECT"]},
+            {"principal": STEWARD_ARN, "permissions": ["DESCRIBE"]},
+        ]
+        contract = _aws_grants(grants, restrictions=[DENY_ID, MASK_MSISDN], row_filters=[CONSENT])
+        contract["exposes"][0]["binding"]["principals"][STEWARDS] = ANALYST_ARN
+        res = _aws_resources(contract)
+        views = [t for t in res.get("aws_glue_catalog_table", {}).values() if "masked" in t["name"]]
+        assert len(views) == 1
+        sql = views[0]["view_original_text"] if "view_original_text" in views[0] else str(views[0])
+        assert "WHERE" in sql and '"customer_id"' not in sql

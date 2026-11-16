@@ -3100,7 +3100,12 @@ def lf_masked_views(
             )
     views: List[_LfMaskedView] = []
     for i, grant in enumerate(grants):
-        principal = str(grant.get("principal") or "") if isinstance(grant, Mapping) else ""
+        # Only a grant the emitter writes and that reads: a view is a read of its own,
+        # run as its definer, so one built for a DESCRIBE grant would hand its role
+        # the table without the read grant's exclusions or row filter.
+        if not column_access.lf_grant_reads(grant) or not grant.get("permissions"):
+            continue
+        principal = str(grant.get("principal"))
         key = aws_principal_key(principal)
         mine = [c for c, (_rule, ids) in masks.items() if key in ids]
         if not mine:
@@ -3653,16 +3658,22 @@ def _refuse_a_second_grant_beside_a_column_limit(
       a second column grant would not plan clean either.
 
     A grant with no principal or no permissions is skipped, as the emitter
-    writes nothing for it.
+    writes nothing for it. Principals are compared by
+    :func:`~fluid_build.iac.principals.aws_principal_key`.
     """
     for idx in limited:
         principal = grants[idx].get("principal")
         if not principal or not grants[idx].get("permissions"):
             continue
+        # By key: the same role in another spelling (its path, its case) is the same
+        # principal to Lake Formation.
+        key = aws_principal_key(principal)
         others = [
             other
             for other, grant in enumerate(grants)
-            if other != idx and grant.get("principal") == principal and grant.get("permissions")
+            if other != idx
+            and aws_principal_key(grant.get("principal")) == key
+            and grant.get("permissions")
         ]
         if not others:
             continue
