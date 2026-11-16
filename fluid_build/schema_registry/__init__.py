@@ -39,6 +39,7 @@ _EXPORTS = {
     "reader_changes": "compare",
     "verify_consumed": "verify",
     "attach_registry_checks": "verify",
+    "verify_at_apply": "verify",
     "validation_findings": "policy",
     "stream_from_subject": "importer",
 }

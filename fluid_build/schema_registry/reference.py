@@ -354,19 +354,32 @@ def registry_refs(contract: Mapping[str, Any]) -> List[RegistryRef]:
 
 
 def malformed_produced(contract: Mapping[str, Any]) -> Sequence[str]:
-    """Shape messages for every ``binding.properties.registry`` on a Kafka-bound expose."""
+    """Shape messages for every ``binding.properties.registry`` on a Kafka-bound expose.
+
+    The 0.7.7 schema types the field (``$defs/schemaRegistry``), so a validated
+    contract has none; this guards a contract that reached here unvalidated.
+    """
     errors: List[str] = []
     for index, exposure in enumerate(contract.get("exposes") or []):
         binding = _mapping(_mapping(exposure).get("binding"))
         spec = _mapping(binding.get("properties")).get("registry")
-        if spec is None:
-            continue
-        where = f"exposes[{index}].binding.properties.registry"
-        if not kafka_topic_binding(binding):
-            errors.append(
-                f"{where}: a registry belongs on a Kafka topic expose "
-                "(platform: kafka, or platform: confluent with format: kafka_topic)"
-            )
-            continue
-        errors.extend(shape_errors(spec, where))
+        if spec is not None and kafka_topic_binding(binding):
+            errors.extend(shape_errors(spec, f"exposes[{index}].binding.properties.registry"))
     return errors
+
+
+def stray_registries(contract: Mapping[str, Any]) -> List[str]:
+    """Warnings for a ``binding.properties.registry`` on a binding that is no Kafka topic.
+
+    Nothing reads it there, so nothing is registered: said, not refused.
+    """
+    warnings: List[str] = []
+    for index, exposure in enumerate(contract.get("exposes") or []):
+        binding = _mapping(_mapping(exposure).get("binding"))
+        if "registry" in _mapping(binding.get("properties")) and not kafka_topic_binding(binding):
+            warnings.append(
+                f"exposes[{index}].binding.properties.registry is ignored: a produced subject "
+                "is registered for a Kafka topic expose (platform: kafka, or platform: "
+                "confluent with format: kafka_topic)"
+            )
+    return warnings

@@ -24,6 +24,7 @@ from fluid_build.schema_registry.reference import (
     produced_subjects,
     registry_refs,
     shape_errors,
+    stray_registries,
 )
 
 pytestmark = pytest.mark.unit
@@ -502,9 +503,11 @@ class TestMalformedProduced:
         errors = malformed_produced(_produced_contract({"kind": "confluent", "url": "bad"}))
         assert errors and errors[0].startswith("exposes[0].binding.properties.registry.url")
 
-    def test_registry_on_non_kafka_expose(self):
-        (msg,) = malformed_produced(_produced_contract(GLUE, platform="aws", fmt="iceberg"))
-        assert "belongs on a Kafka topic expose" in msg
+    def test_registry_on_non_kafka_expose_is_a_warning_not_an_error(self):
+        contract = _produced_contract(GLUE, platform="aws", fmt="iceberg")
+        assert malformed_produced(contract) == []
+        (msg,) = stray_registries(contract)
+        assert "is ignored" in msg and "Kafka topic expose" in msg
 
     def test_no_registry_no_message(self):
         assert malformed_produced({"exposes": [{"binding": {"platform": "aws"}}]}) == []

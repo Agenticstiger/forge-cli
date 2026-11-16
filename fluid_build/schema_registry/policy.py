@@ -162,6 +162,16 @@ def _secret_ref_findings(
         refuse_unless_allowed(secret, host=host, environ=environ)
     except SecretError as exc:
         findings.append((_missing_entry(stage), f"{ref.where}.auth.secretRef: {exc}"))
+    from fluid_build.build_runners._deployment_host_policy import ALLOWLIST_ENV, is_listed
+
+    if host and not is_loopback(host) and not is_listed(host, environ):
+        findings.append(
+            (
+                _missing_entry(stage),
+                f"{ref.where}.url: host {host!r} receives the registry credential and is not "
+                f"in {ALLOWLIST_ENV}; the operator lists it there (no port)",
+            )
+        )
     return findings
 
 
@@ -198,10 +208,15 @@ def validation_findings(
     contract: Mapping[str, Any], *, environ: Optional[Mapping[str, str]] = None
 ) -> Tuple[List[str], List[str]]:
     """``fluid validate``'s registry checks: shape and egress, offline. ``(errors, warnings)``."""
-    from .reference import checked_subjects, malformed_produced, produced_subjects
+    from .reference import (
+        checked_subjects,
+        malformed_produced,
+        produced_subjects,
+        stray_registries,
+    )
 
     errors: List[str] = list(malformed_produced(contract))
-    warnings: List[str] = []
+    warnings: List[str] = stray_registries(contract)
     subjects: List[Subject] = []
     for collect in (checked_subjects, produced_subjects):
         try:

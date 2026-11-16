@@ -255,11 +255,14 @@ class TestConfluent:
                 "auth": {"secretRef": "env://SR_AUTH"},  # pragma: allowlist secret
             }
         )
-        env = {GRANTS: "SR_AUTH@sr.example.com"}
+        env = {
+            GRANTS: "SR_AUTH@sr.example.com",
+            "FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST": "sr.example.com",
+        }
         records, errors, warnings = run(contract, environ=env)  # a built client fails the test
         assert errors == []
         (warning,) = warnings
-        assert "not verified at plan" in warning
+        assert "verified at apply, where the credential is resolved" in warning
         assert records == [
             {
                 "build": "ingest",
@@ -268,7 +271,7 @@ class TestConfluent:
                 "registry": URL,
                 "subject": "orders-value",
                 "requested": "latest",
-                "result": "not-verified",
+                "result": "verified-at-apply",
             }
         ]
 
@@ -404,9 +407,9 @@ class TestProducedEgressAndEndpoint:
         _, errors, _ = run(produced_contract({"kind": "confluent", "url": "nope"}))
         assert errors and "properties.registry.url" in errors[0]
 
-    def test_a_registry_on_a_non_kafka_expose_is_reported(self):
-        _, errors, _ = run(produced_contract({"kind": "glue"}, platform="aws", fmt="iceberg"))
-        assert errors and "belongs on a Kafka topic expose" in errors[0]
+    def test_a_registry_on_a_non_kafka_expose_does_not_refuse_the_plan(self):
+        records, errors, _ = run(produced_contract({"kind": "glue"}, platform="aws", fmt="iceberg"))
+        assert (records, errors) == ([], [])
 
 
 # -------------------------------------------------------- attach_registry_checks
@@ -483,10 +486,13 @@ class TestAttach:
                 "auth": {"secretRef": "env://SR_AUTH"},  # pragma: allowlist secret
             }
         )
-        env = {GRANTS: "SR_AUTH@sr.example.com"}
+        env = {
+            GRANTS: "SR_AUTH@sr.example.com",
+            "FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST": "sr.example.com",
+        }
         result = self.attach({}, contract, environ=env)
-        assert result["schemaRegistry"]["checked"][0]["result"] == "not-verified"
-        assert any("not verified at plan" in m for m in seen)
+        assert result["schemaRegistry"]["checked"][0]["result"] == "verified-at-apply"
+        assert any("verified at apply" in m for m in seen)
 
     def test_glue_record_attached(self):
         result = self.attach({}, glue_contract(), glue=lambda: FakeGlue())

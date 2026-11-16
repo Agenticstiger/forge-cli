@@ -91,6 +91,12 @@ class TestConsumedWithoutAuth:
 
 
 class TestConsumedWithAuth:
+    @pytest.mark.parametrize("stage, severity", [("validate", "warning"), ("plan", "error")])
+    def test_an_unlisted_credential_host_is_a_missing_entry(self, stage, severity):
+        env = {GRANTS: f"SCHEMA_REGISTRY_AUTH@{HOST}"}
+        findings = subject_findings(consumed(auth=AUTH), stage=stage, environ=env)
+        assert severities(findings) == [severity] and HOSTS in messages(findings)
+
     def test_no_grant_warns_at_validate(self):
         findings = subject_findings(consumed(auth=AUTH), stage="validate", environ={})
         assert severities(findings) == ["warning"]
@@ -109,7 +115,9 @@ class TestConsumedWithAuth:
     )
     @pytest.mark.parametrize("stage", ["validate", "plan"])
     def test_grant_clears_the_finding(self, entry, stage):
-        findings = subject_findings(consumed(auth=AUTH), stage=stage, environ={GRANTS: entry})
+        findings = subject_findings(
+            consumed(auth=AUTH), stage=stage, environ={GRANTS: entry, HOSTS: HOST}
+        )
         assert findings == []
 
     def test_grant_for_another_host_does_not_cover(self):
@@ -127,7 +135,7 @@ class TestConsumedWithAuth:
     @pytest.mark.parametrize("stage", ["validate", "plan"])
     def test_http_credential_destination_is_an_error_at_every_stage(self, stage):
         subject = consumed("http://sr.example.com", auth=AUTH)
-        env = {GRANTS: "SCHEMA_REGISTRY_AUTH@sr.example.com"}
+        env = {GRANTS: "SCHEMA_REGISTRY_AUTH@sr.example.com", HOSTS: "sr.example.com"}
         findings = subject_findings(subject, stage=stage, environ=env)
         assert severities(findings) == ["error"] and "https" in messages(findings)
 
@@ -250,10 +258,11 @@ class TestValidationFindings:
         errors, _ = validation_findings(contract, environ={})
         assert any("declares no columns" in e for e in errors)
 
-    def test_registry_on_a_non_kafka_expose_is_an_error(self):
+    def test_registry_on_a_non_kafka_expose_is_a_warning(self):
         contract = produced_contract({"kind": "glue"}, platform="aws", fmt="iceberg")
-        errors, _ = validation_findings(contract, environ={})
-        assert any("belongs on a Kafka topic expose" in e for e in errors)
+        errors, warnings = validation_findings(contract, environ={})
+        assert errors == []
+        assert any("is ignored" in w and "Kafka topic expose" in w for w in warnings)
 
     def test_malformed_registry_is_an_error(self):
         contract = produced_contract({"kind": "confluent", "url": "nope"})
@@ -277,12 +286,12 @@ class TestValidationFindings:
 
     def test_consumed_without_grant_warns(self):
         contract = consumed_contract({"kind": "confluent", "url": URL, "auth": AUTH})
-        errors, warnings = validation_findings(contract, environ={})
+        errors, warnings = validation_findings(contract, environ={HOSTS: HOST})
         assert errors == [] and len(warnings) == 1
 
     def test_consumed_with_grant_is_clean(self):
         contract = consumed_contract({"kind": "confluent", "url": URL, "auth": AUTH})
-        env = {GRANTS: f"SCHEMA_REGISTRY_AUTH@{HOST}"}
+        env = {GRANTS: f"SCHEMA_REGISTRY_AUTH@{HOST}", HOSTS: HOST}
         assert validation_findings(contract, environ=env) == ([], [])
 
     def test_does_not_mutate_the_contract(self):

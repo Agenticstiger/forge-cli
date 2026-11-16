@@ -220,9 +220,8 @@ def verify_consumed(
             continue
         if subject.ref.secret_ref:
             warnings.append(
-                f"{subject.ref.where} ({subject.ref.label}): not verified at plan. The registry "
-                "needs a credential, and plan never fetches a contract secret; fluid apply "
-                "is the stage that does"
+                f"{subject.ref.where}: subject {subject.ref.subject!r} is verified at apply, "
+                "where the credential is resolved (plan never fetches a contract secret)"
             )
             records.append(
                 {
@@ -232,7 +231,7 @@ def verify_consumed(
                     "registry": subject.ref.url,
                     "subject": subject.ref.subject,
                     "requested": subject.ref.version,
-                    "result": "not-verified",
+                    "result": "verified-at-apply",
                 }
             )
             continue
@@ -297,3 +296,92 @@ def attach_registry_checks(
     if connector_registries(contract):
         LOG.info("schema_registry_connector_blocks_not_checked")
     return plan
+
+
+def verify_at_apply(
+    contract: Mapping[str, Any],
+    *,
+    dry_run: bool = False,
+    environ: Optional[Mapping[str, str]] = None,
+    confluent: Optional[Callable[..., Any]] = None,
+) -> List[Dict[str, Any]]:
+    """``fluid apply``'s check of each consumed subject whose registry needs a credential.
+
+    Plan never fetches a contract secret, so it leaves these to apply (founder
+    decision, 2026-11-16). Before any ``tofu apply``, for each such subject: the
+    egress rules at their run severity, then ``resolve_secret`` for that one host
+    (the secrets policy: scheme, prefix, the ``apply`` stage, the ``NAME@host``
+    grant), then the same read and comparison as plan, with the credential as Basic
+    auth over https. A dry run fetches nothing and checks nothing. Returns the
+    records; raises on the first failure set.
+
+    Raises:
+        CLIError: ``apply_schema_registry_failed`` with every error.
+    """
+    from urllib.parse import urlsplit
+
+    from .policy import subject_findings
+    from .reference import checked_subjects
+
+    subjects = [s for s in checked_subjects(contract) if s.ref.secret_ref]
+    if dry_run or not subjects:
+        return []
+    if confluent is None:
+        from .clients import ConfluentRegistry
+
+        confluent = ConfluentRegistry
+    errors: List[str] = []
+    records: List[Dict[str, Any]] = []
+    for subject in subjects:
+        ref = subject.ref
+        refused = [m for _, m in subject_findings(subject, stage="apply", environ=environ)]
+        if refused:
+            errors.extend(refused)
+            continue
+        from fluid_build.secrets.errors import SecretError
+        from fluid_build.secrets.resolve import resolve_secret
+
+        try:
+            secret = resolve_secret(
+                ref.secret_ref, host=urlsplit(str(ref.url)).hostname, environ=environ
+            )
+        except SecretError as exc:
+            errors.append(f"{ref.where}.auth.secretRef: {exc}")
+            continue
+        credential = (
+            secret.get_secret_value() if hasattr(secret, "get_secret_value") else str(secret)
+        )
+
+        def client(url: str, _credential: str = credential) -> Any:
+            return confluent(url, credential=_credential)
+
+        record, error = _check(subject, confluent=client, glue=lambda: None)
+        record["result"] = "incompatible" if error else record.get("result", "compatible")
+        if error:
+            errors.append(error)
+        records.append(record)
+    if errors:
+        from fluid_build.cli._common import CLIError
+
+        for message in errors:
+            LOG.error("schema_registry_check_failed: %s", message)
+        raise CLIError(
+            1,
+            "apply_schema_registry_failed",
+            {
+                "errors": errors,
+                "message": (
+                    f"{len(errors)} schema registry check(s) failed before tofu apply; "
+                    "nothing was applied. Fix the stream schema or the registry reference, "
+                    "or ask the producer about the subject."
+                ),
+            },
+        )
+    from fluid_build.cli.console import cprint
+
+    for record in records:
+        cprint(
+            f"Schema registry: {record['kind']} subject {record['subject']!r} "
+            f"version {record['version']} matches build {record['build']!r}'s stream.schema"
+        )
+    return records

@@ -19,19 +19,27 @@ Errors are :class:`RegistryError`, which quotes the registry's own message.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 _ACCEPT = "application/vnd.schemaregistry.v1+json"
 _MESSAGE_LIMIT = 500
 
 
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
 class RegistryError(Exception):
-    """A registry request failed. ``code`` is the registry's error code, when it gave one."""
+    """A registry request failed. ``code`` is the registry's error code, when it gave one.
+
+    The message quotes the registry, so control characters (a terminal escape in an
+    error body) are replaced before it is printed anywhere.
+    """
 
     def __init__(self, message: str, *, code: Optional[Union[int, str]] = None) -> None:
-        super().__init__(message)
+        super().__init__(_CONTROL.sub("?", message))
         self.code = code
 
 
@@ -51,23 +59,42 @@ def _segment(text: Union[str, int]) -> str:
 
 
 class ConfluentRegistry:
-    """A Confluent-API registry at ``url``, read with no credential."""
+    """A Confluent-API registry at ``url``.
 
-    def __init__(self, url: str, *, timeout: float = 10.0) -> None:
+    ``credential`` is the resolved ``user:password`` (an API key and secret), sent as
+    HTTP Basic auth, the way Confluent's own clients send ``basic.auth.user.info``.
+    Only ``fluid apply`` passes one, after the secrets policy cleared the host
+    (``verify.py::verify_at_apply``); the client then refuses a non-https URL, except
+    on loopback.
+    """
+
+    def __init__(
+        self, url: str, *, timeout: float = 10.0, credential: Optional[str] = None
+    ) -> None:
         self.url = url
         self.timeout = timeout
+        self._credential = credential
         self._client: Any = None
 
     def _http(self) -> Any:
         if self._client is None:
             from fluid_build.build_runners._deployment_host_policy import request_guard
+            from fluid_build.secrets.policy import is_loopback
             from fluid_build.util.safe_http import safe_httpx_client
 
+            headers = {"Accept": _ACCEPT}
+            if self._credential is not None:
+                import base64
+
+                token = base64.b64encode(self._credential.encode()).decode()
+                headers["Authorization"] = f"Basic {token}"
+            host = urlsplit(self.url).hostname
             self._client = safe_httpx_client(
                 base_url=self.url.rstrip("/") + "/",
                 allow_private=True,
+                require_https=self._credential is not None and not is_loopback(host),
                 timeout=self.timeout,
-                headers={"Accept": _ACCEPT},
+                headers=headers,
                 event_hooks={"request": [request_guard(self.url, engine="schema registry")]},
             )
         return self._client
@@ -138,7 +165,7 @@ class ConfluentRegistry:
             json={"schema": schema, "schemaType": data_format},
         )
         messages = body.get("messages") or []
-        return bool(body.get("is_compatible")), [str(m) for m in messages]
+        return bool(body.get("is_compatible")), [_CONTROL.sub("?", str(m)) for m in messages]
 
     def compatibility_level(self, subject: str) -> Optional[str]:
         """The subject's mode, falling back to the registry's global one."""
