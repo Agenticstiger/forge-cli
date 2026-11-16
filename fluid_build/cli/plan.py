@@ -240,14 +240,27 @@ transformations, access grants, and orchestration tasks.
         help=(
             "also run `tofu plan` as `fluid apply` would (OpenTofu-engine providers) "
             "and bind the saved plan into plan.json: `fluid apply plan.json` then "
-            "applies exactly that plan. Writes <out>.tfplan, <out>.tfplan.json and the "
-            "GitLab terraform report <out>.gitlab-tofu.json next to it (mode 0600)"
+            "applies exactly that plan. Next to it, mode 0600: plan.tfplan, "
+            "plan.tfplan.json and the GitLab terraform report plan.gitlab-tofu.json "
+            "(named after --out)"
         ),
     )
     p.add_argument(
         "--state-backend",
         default=None,
         help="with --tofu: the OpenTofu state `fluid apply` will use (as on apply)",
+    )
+    p.add_argument(
+        "--adopt-shared-container",
+        action="store_true",
+        default=False,
+        help="with --tofu: as on apply (take ownership of a shared pool; audited)",
+    )
+    p.add_argument(
+        "--ensure-opentofu",
+        action="store_true",
+        default=False,
+        help="with --tofu: provision a pinned, verified `tofu` if it is missing (as on apply)",
     )
     p.add_argument(
         "--html",

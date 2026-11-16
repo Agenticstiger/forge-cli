@@ -459,7 +459,9 @@ def _finish_apply(
     # (``resolve_lineage_emitter`` returns the null emitter), and every
     # emit call soft-fails — lineage never breaks an apply.
     with _apply_lineage(contract, provider=eng.provider, planned=changes) as record:
-        apply_result, waited = _apply_saved_plan(plugin, contract, destroyed, workdir, env)
+        apply_result, waited = _apply_saved_plan(
+            plugin, contract, destroyed, workdir, env, resume=not bound
+        )
         if not apply_result.ok:
             if bound and _saved_plan_stale(apply_result):
                 # OpenTofu checked the state against the plan's snapshot and refused:
@@ -545,6 +547,8 @@ def _plan_with_opentofu(
     from fluid_build.forge.core.plan_digest import sha256_bytes
     from fluid_build.iac.importer import ImportBlock, import_section
 
+    # Before anything reads or writes state: the files go next to plan.json.
+    out.parent.mkdir(parents=True, exist_ok=True)
     eng = _open_engine(args, logger, contract)
     reconcile_state_key(eng.target, eng.provider, eng.env, logger, migrate=True)
     _guard_before_plan(eng, args, logger)
@@ -553,6 +557,7 @@ def _plan_with_opentofu(
         adopted: List[ImportBlock] = _adopt_existing(
             eng.plugin, eng.contract, eng.actions, eng.workdir, eng.env, logger, imported.addresses
         )
+    _refuse_unreleased_imports(eng, adopted)
     if adopted:
         document = json.loads(eng.module_path.read_text(encoding="utf-8"))
         document.setdefault("import", []).extend(import_section(adopted).get("import", []))
@@ -600,6 +605,29 @@ def _plan_with_opentofu(
         "changes": changes,
         "imports": sorted(block.to for block in adopted),
     }
+
+
+def _refuse_unreleased_imports(eng: _Engine, adopted: List[Any]) -> None:
+    """Stop ``fluid plan --tofu`` when an adoption could not be handed back: the state would
+    hold an object no apply took over, and its ``import`` block would plan it twice."""
+    if not adopted:
+        return
+    held = sorted(
+        {block.to for block in adopted} & set(runner.tofu_state_list(eng.workdir, env=eng.env))
+    )
+    if held:
+        raise CLIError(
+            1,
+            "plan_tofu_adoption_not_released",
+            {
+                "error": "brownfield adoption imported resources the plan could not release "
+                "from state again: " + ", ".join(held),
+                "remediation": [
+                    f"tofu -chdir={shlex.quote(eng.workdir)} state rm " + " ".join(held),
+                    "then re-run `fluid plan --tofu`",
+                ],
+            },
+        )
 
 
 def _write_private(path: Path, data: bytes) -> None:
@@ -850,12 +878,15 @@ def _apply_saved_plan(
     destroyed: List[Dict[str, Any]],
     workdir: str,
     env: Mapping[str, str],
+    *,
+    resume: bool = True,
 ) -> Tuple[Any, int]:
     """``tofu apply`` of the saved plan, with the destroys it could not make yet resumed
     (:func:`_resume_blocked_destroys`): the result that stands, and how many destroys waited
-    for a second apply (0 when none did)."""
+    for a second apply (0 when none did). ``resume=False`` (a plan from ``fluid plan --tofu``)
+    never resumes: that takes a second plan, which nobody reviewed."""
     result = runner.tofu_apply(workdir, env=env)
-    if result.ok:
+    if result.ok or not resume:
         return result, 0
     return _resume_blocked_destroys(plugin, contract, result, destroyed, workdir, env) or (
         result,

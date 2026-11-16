@@ -617,17 +617,31 @@ def _source(function) -> str:
 
 
 def test_the_engine_runs_the_hooks_around_tofu_apply_in_this_order():
-    source = _source(engine._apply_via_opentofu)
-    pre = source.index('_enforce_access(plugin, "pre_apply", contract)')
-    prepare = source.index("_prepare_destroys(plugin, contract, destroyed)")
-    keep = source.index("imported.keep()")
-    apply = source.index("_apply_saved_plan(")
-    post = source.index('_enforce_access(plugin, "post_apply", contract)')
-    gate = source.index("_enforce_data_loss_gate(")
-    dry = source.index('_enforce_access(plugin, "pre_apply", contract, dry_run=True)')
-    dry_prepare = source.index("_prepare_destroys(plugin, contract, destroyed, dry_run=True)")
-    assert gate < dry < dry_prepare < source.index('cprint("\\ndry-run: plan only')
-    assert gate < pre < prepare < keep < apply < post
+    # The plan is reviewed (data-loss gate) before anything outside OpenTofu runs.
+    review = _source(engine._review_plan)
+    assert review.index("_enforce_data_loss_gate(") < review.index("_planned_destroys(")
+    dry_source = _source(engine._preview_outside_opentofu)
+    dry = dry_source.index('_enforce_access(eng.plugin, "pre_apply", eng.contract, dry_run=True)')
+    dry_prepare = dry_source.index(
+        "_prepare_destroys(eng.plugin, eng.contract, destroyed, dry_run=True)"
+    )
+    assert dry < dry_prepare < dry_source.index('cprint("\\ndry-run: plan only')
+    # Both the plan-and-apply run and the apply of a saved plan: review, the dry-run stop,
+    # pre_apply, prepare_destroys, then the apply.
+    for run, keeps in ((engine._apply_via_opentofu, True), (engine._apply_bound_plan, False)):
+        source = _source(run)
+        review_at = source.index("_review_plan(")
+        stop = source.index("_preview_outside_opentofu(")
+        pre = source.index('_enforce_access(eng.plugin, "pre_apply", eng.contract)')
+        prepare = source.index("_prepare_destroys(eng.plugin, eng.contract, destroyed)")
+        finish = source.index("_finish_apply(")
+        assert review_at < stop < pre < prepare < finish
+        if keeps:
+            assert prepare < source.index("imported.keep()") < finish
+    finish_source = _source(engine._finish_apply)
+    apply = finish_source.index("_apply_saved_plan(")
+    post = finish_source.index('_enforce_access(plugin, "post_apply", contract)')
+    assert apply < post
     # The saved plan is applied first; a destroy that waited is resumed only after it failed.
     saved = _source(engine._apply_saved_plan)
     assert saved.index("runner.tofu_apply(") < saved.index("_resume_blocked_destroys(")
@@ -721,7 +735,7 @@ def test_the_engine_prints_an_enforcement_failure_after_a_failed_apply_and_never
 
 
 def test_the_engine_binds_before_it_raises_the_apply_failure():
-    source = _source(engine._apply_via_opentofu)
+    source = _source(engine._finish_apply)
     bind = source.index("_enforce_after_failed_apply(plugin, contract)")
     failed = source.index("raise _apply_failure(")
     assert source.index("_apply_saved_plan(") < bind < failed

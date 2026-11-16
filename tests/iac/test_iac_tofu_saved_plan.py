@@ -466,3 +466,25 @@ class TestPlanAndApplyShareTheEngine:
         calls.clear()
         assert engine.apply_via_opentofu(_args(str(out)), _LOG) == 0
         assert calls == ["env", "init"]
+
+
+class TestNoUnreviewedPlan:
+    def test_a_saved_plan_never_resumes_with_a_second_plan(self, monkeypatch):
+        failed = runner.TofuResult("apply", 1, "", "boom")
+        monkeypatch.setattr(runner, "tofu_apply", lambda *a, **k: failed)
+
+        def _resume(*a, **k):
+            raise AssertionError("a bound apply must not re-plan")
+
+        monkeypatch.setattr(engine, "_resume_blocked_destroys", _resume)
+        assert engine._apply_saved_plan(None, {}, [], "/wd", {}, resume=False) == (failed, 0)
+
+    def test_an_adoption_left_in_state_stops_the_plan(self, monkeypatch, tmp_path):
+        from fluid_build.iac.importer import ImportBlock
+
+        monkeypatch.setattr(runner, "tofu_state_list", lambda *a, **k: ["x.kept"])
+        eng = argparse.Namespace(workdir=str(tmp_path), env={})
+        with pytest.raises(CLIError) as refused:
+            engine._refuse_unreleased_imports(eng, [ImportBlock(to="x.kept", id="K")])
+        assert refused.value.event == "plan_tofu_adoption_not_released"
+        engine._refuse_unreleased_imports(eng, [ImportBlock(to="x.gone", id="G")])
