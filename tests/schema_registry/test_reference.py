@@ -30,6 +30,7 @@ from fluid_build.schema_registry.reference import (
 pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parents[2]
+EXTRA_FIELD = {"secretRef": "env://X", "user": "u"}  # pragma: allowlist secret
 CONFLUENT = {"kind": "confluent", "url": "https://sr.example.com"}
 GLUE = {"kind": "glue", "registryName": "commerce"}
 
@@ -190,9 +191,11 @@ class TestShapeErrors:
         assert "hunter2secret" not in joined and "admin" not in joined
 
     def test_credential_in_unknown_field_name_only(self):
+        pasted = {"password": "hunter2secret"}  # pragma: allowlist secret
         errors = shape_errors(
-            {**CONFLUENT, "password": "hunter2secret"}, "w"
-        )  # pragma: allowlist secret
+            {**CONFLUENT, **pasted},
+            "w",
+        )
         assert errors and "hunter2secret" not in " ".join(errors)
 
     @pytest.mark.parametrize("name", ["bad name", "a/b", "", "x" * 256])
@@ -241,14 +244,21 @@ class TestShapeErrors:
 
     @pytest.mark.parametrize(
         "auth",
-        [{}, {"secretRef": 3}, {"secretRef": "env://X", "user": "u"}, "env://X", ["env://X"]],
+        [
+            {},
+            {"secretRef": 3},
+            EXTRA_FIELD,
+            "env://X",
+            ["env://X"],
+        ],
     )
     def test_bad_auth_shape(self, auth):
         errors = shape_errors({**CONFLUENT, "auth": auth}, "w")
         assert any("w.auth" in e for e in errors)
 
     def test_good_auth_shape(self):
-        assert shape_errors({**CONFLUENT, "auth": {"secretRef": "env://X"}}, "w") == []
+        auth = {"secretRef": "env://X"}  # pragma: allowlist secret
+        assert shape_errors({**CONFLUENT, "auth": auth}, "w") == []
 
 
 # ---------------------------------------------------- the three spellings
@@ -364,8 +374,10 @@ class TestFlinkCompilerPin:
 
 class TestKafkaConnectSpelling:
     def test_from_kafka_connect(self):
+        auth = {"secretRef": "env://K"}  # pragma: allowlist secret
         ref = from_kafka_connect(
-            {"url": "http://sr:8081", "auth": {"secretRef": "env://K"}}, where="w"
+            {"url": "http://sr:8081", "auth": auth},
+            where="w",
         )
         assert ref is not None
         assert (ref.kind, ref.url, ref.subject, ref.secret_ref, ref.origin) == (

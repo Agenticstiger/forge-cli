@@ -28,7 +28,7 @@ URL = "https://sr.example.com"
 REF = "env://SR_AUTH"  # pragma: allowlist secret - a reference, not a value
 ENV = {
     "FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST": "sr.example.com",
-    "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST": "env://SR_AUTH@sr.example.com",
+    "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST": "env://SR_AUTH@sr.example.com",  # pragma: allowlist secret - a test reference, not a value
 }
 
 
@@ -190,7 +190,7 @@ def _produced_confluent():
 
 PRODUCED_ENV = {
     "FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST": "sr.example.com",
-    "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST": "SCHEMA_REGISTRY_API_SECRET@sr.example.com",
+    "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST": "SCHEMA_REGISTRY_API_SECRET@sr.example.com",  # pragma: allowlist secret - a test reference, not a value
 }
 
 

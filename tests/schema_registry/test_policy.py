@@ -161,8 +161,11 @@ class TestConsumedWithAuth:
         assert bool(validate) == bool(plan)
 
     def test_unparseable_secret_ref_is_an_error(self):
+        bad = {"secretRef": "not a ref"}  # pragma: allowlist secret
         findings = subject_findings(
-            consumed(auth={"secretRef": "not a ref"}), stage="validate", environ={}
+            consumed(auth=bad),
+            stage="validate",
+            environ={},
         )
         assert severities(findings) == ["error"] and "not a secret reference" in messages(findings)
 
