@@ -186,10 +186,21 @@ def _source_hosts(kafka: Mapping[str, Any], registry_url: Optional[str]) -> dict
     return source
 
 
-def _unlisted_names(source: Mapping[str, Any], environ: Any) -> list[str]:
-    """The broker and registry host names the operator's host allowlist does not list."""
+def _is_address(host: str) -> bool:
     import ipaddress
 
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False  # a host name
+    return True
+
+
+def _unlisted_names(source: Mapping[str, Any], environ: Any) -> list[str]:
+    """The broker and registry host names the operator's host allowlist does not list.
+
+    An address is left out: it keeps the deployment host rule, applied either way.
+    """
     from fluid_build.secrets.policy import is_loopback
     from fluid_build.streaming.policy import is_listed
 
@@ -198,12 +209,9 @@ def _unlisted_names(source: Mapping[str, Any], environ: Any) -> list[str]:
         hosts.append(urlsplit(source["schemaRegistryUrl"]).hostname or "")
     unlisted = []
     for host in filter(None, hosts):
-        try:
-            ipaddress.ip_address(host)
-            continue  # an address keeps the deployment host rule, applied either way
-        except ValueError:
-            pass
-        if not is_loopback(host) and not is_listed(host, environ) and host not in unlisted:
+        if _is_address(host) or is_loopback(host) or is_listed(host, environ):
+            continue
+        if host not in unlisted:
             unlisted.append(host)
     return unlisted
 
