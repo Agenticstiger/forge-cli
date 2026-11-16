@@ -12,7 +12,7 @@ change only when the columns do.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Tuple
+from typing import Any, Mapping, Sequence, Tuple
 
 from .reference import Subject
 
@@ -126,7 +126,13 @@ def classification_metadata(
     out: dict = {}
     if classification:
         out["properties"] = {"fluid_classification": str(classification)}
-    if pii:
+    # Field tags name Avro record fields; a JSON Schema subject's paths are not those
+    # names, so it gets the classification only.
+    avro = str(((binding.get("serialization") or {}).get("value")) or "avro") in (
+        "avro",
+        "avro-confluent",
+    )
+    if pii and avro:
         out["tags"] = [{"key": f"{record}.{name}", "value": ["PII"]} for name in pii]
     return out
 
@@ -158,7 +164,7 @@ def produced_findings(contract: Mapping[str, Any], subject: Subject) -> Tuple[li
 
     The schema text OpenTofu would register, derived now, so a column type no registry
     format carries fails here and not at apply; and a subject no bound cloud's plugin
-    would register (a warning: nothing is registered for it).
+    would register (an error, as the emitter refuses it).
     """
     errors: list = []
     warnings: list = []
@@ -170,10 +176,51 @@ def produced_findings(contract: Mapping[str, Any], subject: Subject) -> Tuple[li
     except ProducedSubjectError as exc:
         errors.append(str(exc))
     if not cloud_bound(contract, subject.ref.kind):
+        # An error, like the emitter's refusal: no OpenTofu run of this contract would
+        # register it, and a produced topic with no subject is a silent gap.
         cloud = REGISTERING_CLOUD[subject.ref.kind]
-        warnings.append(
+        fix = (
+            "bind an AWS expose (the Glue registry's product)"
+            if cloud == "aws"
+            else "bind the topic with platform: confluent and format: kafka_topic"
+        )
+        errors.append(
             f"{subject.ref.where}: no expose binds {cloud}, so no OpenTofu module registers "
-            f"subject {subject.ref.subject!r}: the {subject.ref.kind} subjects of a product "
-            f"are registered by its {cloud} plugin"
+            f"subject {subject.ref.subject!r}; {fix}"
         )
     return errors, warnings
+
+
+def produced_set_errors(contract: Mapping[str, Any], produced: Sequence[Subject]) -> list:
+    """What the emitters refuse across subjects, said at validate and plan instead.
+
+    An owned Glue registry needs a name (``schema-registry-unnamed``), and one subject
+    produced twice in one registry is refused (``schema-registry-duplicate-subject``).
+    """
+    errors: list = []
+    exposes = {
+        str(e.get("exposeId") or i): e
+        for i, e in enumerate(contract.get("exposes") or [])
+        if isinstance(e, Mapping)
+    }
+    seen: dict = {}
+    for subject in produced:
+        ref = subject.ref
+        if (
+            ref.kind == "glue"
+            and not ref.registry_name
+            and owns_registry(contract, exposes.get(subject.owner, {}))
+        ):
+            errors.append(
+                f"{ref.where}: packaging.containers.schemaRegistry is isolated, so this "
+                "product creates its registry, and the registry has no registryName"
+            )
+        where = ref.glue_registry if ref.kind == "glue" else ref.url
+        key = (ref.kind, where, ref.subject)
+        if key in seen:
+            errors.append(
+                f"{ref.where}: subject {ref.subject!r} is also produced by {seen[key]}; "
+                "one subject has one producer"
+            )
+        seen.setdefault(key, ref.where)
+    return errors

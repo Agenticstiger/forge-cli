@@ -46,14 +46,26 @@ PLAN_KEY = "schemaRegistry"
 _READER_MODES = frozenset({"BACKWARD", "BACKWARD_TRANSITIVE"})
 
 
-def _writer(sv: Any) -> Tuple[List[Dict[str, Any]], str, Dict[str, str]]:
-    from .clients import parse_schema
-    from .schemas import avro_columns, json_columns
+def _say(text: str) -> None:
+    """Print contract-controlled text literally: subject names may hold ``[...]``."""
+    from fluid_build.cli.console import cprint_literal
 
-    schema = parse_schema(sv.schema)
-    if sv.data_format == "JSON":
-        return json_columns(schema), "", {}
-    return avro_columns(schema)
+    cprint_literal(text)
+
+
+def _say_warning(text: str) -> None:
+    from rich.markup import escape
+
+    from fluid_build.cli.console import warning
+
+    warning(escape(text))
+
+
+def _writer(sv: Any) -> Tuple[List[Dict[str, Any]], str, Dict[str, str], Dict[str, str]]:
+    from .clients import parse_schema
+    from .schemas import writer_columns
+
+    return writer_columns(parse_schema(sv.schema), sv.data_format)
 
 
 def _check(
@@ -65,7 +77,7 @@ def _check(
     """Read and compare one subject. ``(record, error or None)``."""
     from .clients import RegistryError
     from .compare import describe, reader_changes
-    from .schemas import UnsupportedSchema, derive, registry_format, schema_text
+    from .schemas import UnsupportedSchema, column_paths, derive, registry_format, schema_text
 
     ref = subject.ref
     expected = registry_format(subject.format)
@@ -92,7 +104,14 @@ def _check(
                 f"{at}: version {sv.version} holds a {sv.data_format} schema, and the stream's "
                 f"format {subject.format!r} reads {expected}"
             )
-        writer, full, names = _writer(sv)
+        writer, full, names, skipped = _writer(sv)
+        read = set(column_paths(subject.columns)) & set(skipped)
+        if read:
+            path = sorted(read)[0]
+            return record, (
+                f"{at}: stream.schema reads {path!r}, and version {sv.version} gives it no "
+                f"column type ({skipped[path]})"
+            )
         if ref.kind == "confluent":
             name = full.rpartition(".")[2] or subject.topic
             reader = derive(
@@ -129,8 +148,8 @@ def _check(
         )
     except RegistryError as exc:
         return record, f"{at}: the subject could not be read: {exc}"
-    except (UnsupportedSchema, ValueError) as exc:
-        return record, f"{at}: {exc}"
+    except (UnsupportedSchema, ValueError, KeyError, TypeError, AttributeError) as exc:
+        return record, f"{at}: the subject's schema could not be read ({type(exc).__name__}: {exc})"
     finally:
         close = getattr(client, "close", None)
         if callable(close):
@@ -144,16 +163,43 @@ def _check(
     return record, None
 
 
+def _aws_region(contract: Mapping[str, Any], environ: Optional[Mapping[str, str]]) -> Optional[str]:
+    """The region a Glue registry is read in: where ``fluid apply`` puts the product.
+
+    The AWS emitter's own region (every AWS binding's ``location.region``), else the
+    environment in the AWS SDK order (``AWS_REGION``, then ``AWS_DEFAULT_REGION``):
+    boto3 1.x reads only the second (the same rule as ``cli/_diff_live.py``).
+    """
+    import os
+
+    from fluid_build.iac.providers.aws import AwsIacPlugin
+
+    try:
+        region = AwsIacPlugin().provider_block_for(contract).get("region")
+    except Exception:  # noqa: BLE001 - an unemittable contract: fall back to the env
+        region = None
+    if region:
+        return str(region)
+    env = os.environ if environ is None else environ
+    return next((env[k] for k in ("AWS_REGION", "AWS_DEFAULT_REGION") if env.get(k)), None)
+
+
 def _same_endpoint(a: str, b: str) -> bool:
+    """Whether two registry URLs are one endpoint: scheme, host, port (default filled
+    in) and path, ignoring case and a trailing slash. An unreadable URL is no match."""
     from urllib.parse import urlsplit
 
-    pa, pb = urlsplit(a.strip()), urlsplit(b.strip())
-    return (pa.scheme.lower(), (pa.hostname or "").lower(), pa.port, pa.path.rstrip("/")) == (
-        pb.scheme.lower(),
-        (pb.hostname or "").lower(),
-        pb.port,
-        pb.path.rstrip("/"),
-    )
+    def key(url: str) -> Any:
+        try:
+            parts = urlsplit(url.strip())
+            scheme = parts.scheme.lower()
+            port = parts.port or {"https": 443, "http": 80}.get(scheme)
+        except ValueError:  # an unreadable port or IPv6 literal
+            return None
+        return scheme, (parts.hostname or "").lower(), port, parts.path.rstrip("/")
+
+    first = key(a)
+    return first is not None and first == key(b)
 
 
 def _operator_endpoint(
@@ -189,6 +235,17 @@ def _operator_endpoint(
         )
 
 
+def _for_provider(produced: List[Subject], provider: Optional[str]) -> List[Subject]:
+    """Only the subjects ``provider``'s plugin registers, when the run names one: a
+    multi-cloud contract planned or applied one provider at a time is not refused over
+    the other cloud's registry."""
+    if provider is None:
+        return produced
+    from .produced import REGISTERING_CLOUD
+
+    return [s for s in produced if REGISTERING_CLOUD.get(s.ref.kind) == provider]
+
+
 def _produced_checks(
     contract: Mapping[str, Any],
     produced: List[Subject],
@@ -199,8 +256,9 @@ def _produced_checks(
 ) -> None:
     """Egress, the derivable schema, and the operator's endpoint, for each produced subject."""
     from .policy import subject_findings
-    from .produced import produced_findings
+    from .produced import produced_findings, produced_set_errors
 
+    errors.extend(produced_set_errors(contract, produced))
     for subject in produced:
         errors.extend(m for _, m in subject_findings(subject, stage=stage, environ=environ))
         more_errors, more_warnings = produced_findings(contract, subject)
@@ -219,6 +277,7 @@ def verify_consumed(
     environ: Optional[Mapping[str, str]] = None,
     confluent: Optional[Callable[[str], Any]] = None,
     glue: Optional[Callable[[], Any]] = None,
+    provider: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
     """Check every consumed subject and the egress of every produced one.
 
@@ -236,7 +295,7 @@ def verify_consumed(
         produced = [] if errors else produced_subjects(contract)
     except RegistryShapeError as exc:
         return records, [*errors, str(exc)], warnings
-    _produced_checks(contract, produced, "plan", environ, errors, warnings)
+    _produced_checks(contract, _for_provider(produced, provider), "plan", environ, errors, warnings)
     if confluent is None:
         from .clients import ConfluentRegistry
 
@@ -244,7 +303,8 @@ def verify_consumed(
     if glue is None:
         from .clients import GlueRegistry
 
-        glue = GlueRegistry
+        region = _aws_region(contract, environ)
+        glue = lambda: GlueRegistry(region=region)  # noqa: E731
     for subject in consumed:
         refused = [m for s, m in subject_findings(subject, stage="plan", environ=environ)]
         if refused:
@@ -280,6 +340,7 @@ def attach_registry_checks(
     contract: Mapping[str, Any],
     *,
     environ: Optional[Mapping[str, str]] = None,
+    provider: Optional[str] = None,
     **clients: Any,
 ) -> Dict[str, Any]:
     """Run :func:`verify_consumed`; refuse the plan on an error, else record the checks.
@@ -292,7 +353,9 @@ def attach_registry_checks(
     """
     from .reference import connector_registries
 
-    records, errors, warnings = verify_consumed(contract, environ=environ, **clients)
+    records, errors, warnings = verify_consumed(
+        contract, environ=environ, provider=provider, **clients
+    )
     if errors:
         from fluid_build.cli._common import CLIError
 
@@ -310,15 +373,13 @@ def attach_registry_checks(
                 ),
             },
         )
-    from fluid_build.cli.console import cprint, warning
-
     for message in warnings:
-        warning(message)
+        _say_warning(message)
     if not records:
         return plan
     for record in records:
         if record.get("result") == "compatible":
-            cprint(
+            _say(
                 f"Schema registry: {record['kind']} subject {record['subject']!r} "
                 f"version {record['version']} matches the stream.schema of build {record['build']!r}"
             )
@@ -365,14 +426,14 @@ def verify_at_apply(
         produced, errors = [], [str(exc)]
     # Produced subjects: what OpenTofu registers, and where, re-checked here, where the
     # environment tofu runs with is final (a plan made elsewhere did not see it).
-    if provider is not None:
-        # Only the subjects this run's plugin registers: a multi-cloud contract applied
-        # one provider at a time is not refused over the other cloud's registry.
-        from .produced import REGISTERING_CLOUD
-
-        produced = [s for s in produced if REGISTERING_CLOUD.get(s.ref.kind) == provider]
-    _produced_checks(contract, produced, "apply", environ, errors, warnings)
-    subjects = [] if dry_run else [s for s in checked_subjects(contract) if s.ref.secret_ref]
+    _produced_checks(
+        contract, _for_provider(produced, provider), "apply", environ, errors, warnings
+    )
+    try:
+        consumed = [] if dry_run else checked_subjects(contract)
+    except RegistryShapeError as exc:
+        consumed, errors = [], [*errors, str(exc)]
+    subjects = [s for s in consumed if s.ref.secret_ref]
     if confluent is None:
         from .clients import ConfluentRegistry
 
@@ -423,12 +484,10 @@ def verify_at_apply(
                 ),
             },
         )
-    from fluid_build.cli.console import cprint, warning
-
     for message in warnings:
-        warning(message)
+        _say_warning(message)
     for record in records:
-        cprint(
+        _say(
             f"Schema registry: {record['kind']} subject {record['subject']!r} "
             f"version {record['version']} matches the stream.schema of build {record['build']!r}"
         )

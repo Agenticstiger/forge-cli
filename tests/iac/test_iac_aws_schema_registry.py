@@ -389,3 +389,25 @@ def test_entity_not_found_is_a_registry_error(glue):
 def test_missing_registry_is_a_registry_error(glue):
     with pytest.raises(RegistryError):
         GlueRegistry(client=glue).get_version("nope", "x")
+
+
+def test_two_registry_names_that_are_one_resource_name_are_refused():
+    from fluid_build.iac.base import UnsupportedBindingError
+    from fluid_build.iac.providers.aws_schema_registry import emit_schema_registry
+
+    def kafka(eid, registry):
+        return {
+            "exposeId": eid,
+            "binding": {
+                "platform": "kafka",
+                "format": "kafka_topic",
+                "location": {"topic": eid},
+                "properties": {"registry": {"kind": "glue", "registryName": registry}},
+            },
+            "contract": {"schema": [{"name": "id", "type": "string"}]},
+        }
+
+    contract = {"id": "p", "exposes": [kafka("a", "team-a"), kafka("b", "team_a")]}
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit_schema_registry({}, contract, "p", {})
+    assert caught.value.kind == "schema-registry-name-collision"

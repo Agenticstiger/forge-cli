@@ -121,7 +121,7 @@ def test_output_is_deterministic():
 
 
 def test_metadata_carries_classification_and_pii_tags():
-    metadata = emit(make())["confluent_schema"][KEY]["metadata"]
+    metadata = emit(make(serialization="avro"))["confluent_schema"][KEY]["metadata"]
     assert metadata["properties"] == {"fluid_classification": "Confidential"}
     assert metadata["tags"] == [
         {"key": "fluid.gold_orders.orders_v1.email", "value": ["PII"]},
@@ -305,3 +305,8 @@ def test_a_glue_registry_on_a_kafka_expose_is_skipped_when_aws_is_bound_too():
         {"exposeId": "lake", "binding": {"platform": "aws", "format": "iceberg"}}
     )
     assert "confluent_schema" not in emit(contract)
+
+
+def test_a_json_subject_gets_the_classification_but_no_field_tags():
+    metadata = emit(make(serialization="json"))["confluent_schema"][KEY]["metadata"]
+    assert metadata == {"properties": {"fluid_classification": "Confidential"}}

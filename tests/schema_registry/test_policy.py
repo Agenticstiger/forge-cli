@@ -315,10 +315,28 @@ class TestProducedFindings:
         assert any("varchar(255)" in e for e in errors)
 
     @pytest.mark.parametrize("kind, cloud", [("glue", "aws"), ("confluent", "confluent")])
-    def test_no_bound_cloud_warns_that_nothing_registers_it(self, kind, cloud):
+    def test_no_bound_cloud_is_an_error_since_nothing_registers_it(self, kind, cloud):
         registry = (
             {"kind": kind} if kind == "glue" else {"kind": kind, "url": "http://localhost:8081"}
         )
         contract = produced_contract(registry, bound=False)
-        _, warnings = validation_findings(contract, environ={})
-        assert any(f"no expose binds {cloud}" in w for w in warnings)
+        errors, _ = validation_findings(contract, environ={})
+        assert any(f"no expose binds {cloud}" in e for e in errors)
+
+
+class TestProducedSetErrors:
+    def test_an_owned_glue_registry_without_a_name_fails_at_validate(self):
+        contract = produced_contract({"kind": "glue"})
+        contract["packaging"] = {"containers": {"schemaRegistry": "isolated"}}
+        errors, _ = validation_findings(contract, environ={})
+        assert any("has no registryName" in e for e in errors)
+
+    def test_one_subject_produced_twice_fails_at_validate(self):
+        import copy
+
+        contract = produced_contract({"kind": "glue", "registryName": "r"})
+        twin = copy.deepcopy(contract["exposes"][0])
+        twin["exposeId"] = "events2"
+        contract["exposes"].append(twin)
+        errors, _ = validation_findings(contract, environ={})
+        assert any("is also produced by" in e for e in errors)

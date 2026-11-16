@@ -60,28 +60,45 @@ def schema_text(schema: Any) -> str:
 
 
 def _avro_type(
-    dtype: LogicalType, path: str, names: Mapping[str, str], used: Dict[str, str]
+    dtype: LogicalType, path: str, names: Mapping[str, str], used: Dict[str, str], ns: str
 ) -> Any:
+    """``dtype`` as Avro. ``ns`` is the enclosing namespace a nested record inherits, so
+    ``used`` holds every record's full name and none is defined twice (Avro refuses that)."""
     kind = dtype.kind
     if kind == "struct":
-        full = names.get(path) or avro_name(path.replace(".", "_"))
-        name = full.rpartition(".")[2]
-        if full in used:  # each record name is defined once (Avro forbids a redefinition)
-            full = name = f"{name}_{len(used)}"
+        writer = names.get(path)
+        if writer and writer in used:
+            # The producer reuses one record type here: refer to it by its name, as the
+            # writer schema does, so Avro resolution matches the two records by name.
+            return writer if dtype.required else ["null", writer]
+        if writer:
+            full = writer
+        else:
+            base = avro_name(path.replace(".", "_"))
+            full = f"{ns}.{base}" if ns else base
+            if full in used:
+                base = f"{base}_{len(used)}"
+                full = f"{ns}.{base}" if ns else base
         used[full] = path
+        inner_ns = full.rpartition(".")[0]
         record: Dict[str, Any] = {
             "type": "record",
-            "name": name,
-            "fields": _avro_fields(dtype.fields, path, names, used),
+            "name": full.rpartition(".")[2],
+            "fields": _avro_fields(dtype.fields, path, names, used, inner_ns),
         }
-        namespace = full.rpartition(".")[0]
-        if namespace:
-            record["namespace"] = namespace
+        if writer and inner_ns != ns:
+            record["namespace"] = inner_ns
         result: Any = record
     elif kind == "array" and dtype.element is not None:
-        result = {"type": "array", "items": _avro_type(dtype.element, f"{path}[]", names, used)}
+        result = {
+            "type": "array",
+            "items": _avro_type(dtype.element, f"{path}[]", names, used, ns),
+        }
     elif kind == "map" and dtype.value is not None:
-        result = {"type": "map", "values": _avro_type(dtype.value, f"{path}{{}}", names, used)}
+        result = {
+            "type": "map",
+            "values": _avro_type(dtype.value, f"{path}{{}}", names, used, ns),
+        }
     elif kind == "decimal":
         result = {
             "type": "bytes",
@@ -105,13 +122,12 @@ def _avro_fields(
     parent: str,
     names: Mapping[str, str],
     used: Dict[str, str],
+    ns: str,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for name, dtype in fields:
-        entry: Dict[str, Any] = {
-            "name": name,
-            "type": _avro_type(dtype, f"{parent}.{name}" if parent else name, names, used),
-        }
+        path = f"{parent}.{name}" if parent else name
+        entry: Dict[str, Any] = {"name": name, "type": _avro_type(dtype, path, names, used, ns)}
         if not dtype.required:
             entry["default"] = None
         out.append(entry)
@@ -133,11 +149,14 @@ def avro_schema(
     name. A struct without an entry is named after its path.
     """
     fields = parse_fields(list(columns), path="schema")
-    used: Dict[str, str] = {}
+    top = avro_name(name)
+    # The top record's own name is taken too: a struct column named like it would
+    # otherwise define a second record with the same full name.
+    used: Dict[str, str] = {f"{namespace}.{top}" if namespace else top: ""}
     record: Dict[str, Any] = {
         "type": "record",
-        "name": avro_name(name),
-        "fields": _avro_fields(fields, "", names or {}, used),
+        "name": top,
+        "fields": _avro_fields(fields, "", names or {}, used, namespace or ""),
     }
     if namespace:
         record["namespace"] = namespace
@@ -235,9 +254,12 @@ _AVRO_LOGICAL = {
 
 
 class _AvroReader:
-    def __init__(self) -> None:
+    def __init__(self, lenient: bool = False) -> None:
         self.named: Dict[str, Any] = {}
         self.record_names: Dict[str, str] = {}
+        #: ``lenient``: a field with no column type is left out and named here, by path.
+        self.lenient = lenient
+        self.skipped: Dict[str, str] = {}
 
     def _full(self, node: Mapping[str, Any], namespace: str) -> str:
         name = str(node.get("name") or "")
@@ -276,7 +298,10 @@ class _AvroReader:
         if logical == "decimal" and kind in ("bytes", "fixed"):
             if kind == "fixed":
                 self.named[self._full(node, namespace)] = node
-            return {"type": f"decimal({int(node['precision'])},{int(node.get('scale', 0))})"}
+            precision, scale = node.get("precision"), node.get("scale", 0)
+            if not isinstance(precision, int) or not isinstance(scale, int):
+                raise UnsupportedSchema(f"{path}: a decimal needs integer precision and scale")
+            return {"type": f"decimal({precision},{scale})"}
         if isinstance(logical, str) and logical in _AVRO_LOGICAL:
             return {"type": _AVRO_LOGICAL[logical]}
         if kind == "record":
@@ -315,7 +340,13 @@ class _AvroReader:
                 raise UnsupportedSchema(f"{path or '$'}: a record field has no name")
             name = entry["name"]
             child = f"{path}.{name}" if path else name
-            spec = self.type_spec(entry.get("type"), child, namespace, depth)
+            try:
+                spec = self.type_spec(entry.get("type"), child, namespace, depth)
+            except UnsupportedSchema as exc:
+                if not self.lenient:
+                    raise
+                self.skipped[child] = str(exc)
+                continue
             column: Dict[str, Any] = {"name": name, **spec}
             if isinstance(entry.get("doc"), str):
                 column["description"] = entry["doc"]
@@ -421,7 +452,11 @@ def _json_spec(root: Mapping[str, Any], node: Any, path: str, depth: int = 0) ->
 
 
 def _json_fields(
-    root: Mapping[str, Any], node: Mapping[str, Any], path: str, depth: int
+    root: Mapping[str, Any],
+    node: Mapping[str, Any],
+    path: str,
+    depth: int,
+    skipped: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     properties = node.get("properties") or {}
     if not isinstance(properties, Mapping):
@@ -429,7 +464,14 @@ def _json_fields(
     required = set(node.get("required") or [])
     out: List[Dict[str, Any]] = []
     for name, child in properties.items():
-        spec = _json_spec(root, child, f"{path}.{name}" if path else str(name), depth)
+        child_path = f"{path}.{name}" if path else str(name)
+        try:
+            spec = _json_spec(root, child, child_path, depth)
+        except UnsupportedSchema as exc:
+            if skipped is None:
+                raise
+            skipped[child_path] = str(exc)
+            continue
         spec["required"] = spec["required"] and name in required
         column: Dict[str, Any] = {"name": str(name), **spec}
         if isinstance(child, Mapping) and isinstance(child.get("description"), str):
@@ -455,3 +497,48 @@ def columns_from_registry(schema: Any, data_format: str) -> List[Dict[str, Any]]
     if fmt == "JSON":
         return json_columns(schema)
     raise UnsupportedSchema(f"$: forge reads AVRO and JSON subjects, not {data_format}")
+
+
+def writer_columns(
+    schema: Any, data_format: str
+) -> Tuple[List[Dict[str, Any]], str, Dict[str, str], Dict[str, str]]:
+    """A producer's schema for comparison: ``(columns, full name, record names, skipped)``.
+
+    Lenient: a field with no column type (a union of two types, an untyped JSON
+    property) is left out and listed in ``skipped`` by path with the reason, so it
+    fails the comparison only if the declared schema reads it.
+    """
+    if isinstance(schema, str):
+        schema = json.loads(schema)
+    skipped: Dict[str, str] = {}
+    if data_format.upper() == "JSON":
+        if not isinstance(schema, Mapping) or schema.get("type") not in ("object", ["object"]):
+            raise UnsupportedSchema("$: the value schema is not a JSON Schema object")
+        return _json_fields(schema, schema, "", 0, skipped), "", {}, skipped
+    if not isinstance(schema, Mapping) or schema.get("type") != "record":
+        raise UnsupportedSchema("$: the value schema is not an Avro record")
+    reader = _AvroReader(lenient=True)
+    full = reader._full(schema, "")
+    reader.named[full] = schema
+    columns = reader.fields(schema, "", full.rpartition(".")[0], 0)
+    return columns, full, dict(reader.record_names), reader.skipped
+
+
+def column_paths(columns: Sequence[Mapping[str, Any]], prefix: str = "") -> List[str]:
+    """Every field path ``columns`` declare, as :func:`writer_columns` names them."""
+    paths: List[str] = []
+
+    def walk(spec: Mapping[str, Any], path: str) -> None:
+        paths.append(path)
+        for field in spec.get("fields") or []:
+            if isinstance(field, Mapping) and isinstance(field.get("name"), str):
+                walk(field, f"{path}.{field['name']}")
+        if isinstance(spec.get("element"), Mapping):
+            walk(spec["element"], f"{path}[]")
+        if isinstance(spec.get("value"), Mapping):
+            walk(spec["value"], f"{path}{{}}")
+
+    for column in columns:
+        if isinstance(column, Mapping) and isinstance(column.get("name"), str):
+            walk(column, f"{prefix}{column['name']}")
+    return paths

@@ -224,16 +224,23 @@ class TestConfluent:
         assert "could not be read" in message and "40401" in message and "not found" in message
         assert records[0]["result"] == "incompatible"
 
-    def test_unsupported_union_in_the_subject_is_an_error(self):
-        schema = json.dumps(
-            {
-                "type": "record",
-                "name": "orders",
-                "fields": [{"name": "a", "type": ["int", "string"]}],
-            }
+    def _union_subject(self):
+        writer = json.loads(avro_text())
+        writer["fields"].append({"name": "u", "type": ["int", "string"]})
+        return json.dumps(writer)
+
+    def test_a_union_the_job_does_not_read_is_left_out(self):
+        fake = FakeConfluent(schema=self._union_subject())
+        records, errors, _ = run(confluent_contract(), confluent=fake)
+        assert errors == [] and records[0]["result"] == "compatible"
+
+    def test_a_union_the_job_reads_is_an_error(self):
+        contract = confluent_contract()
+        contract["builds"][0]["properties"]["stream"]["schema"].append(
+            {"name": "u", "type": "string"}
         )
-        _, errors, _ = run(confluent_contract(), confluent=FakeConfluent(schema=schema))
-        assert errors and "union" in errors[0]
+        _, errors, _ = run(contract, confluent=FakeConfluent(schema=self._union_subject()))
+        assert errors and "'u'" in errors[0] and "union" in errors[0]
 
     def test_a_subject_whose_schema_is_not_json_is_an_error(self):
         _, errors, _ = run(confluent_contract(), confluent=FakeConfluent(schema="syntax"))
@@ -850,3 +857,28 @@ class TestRegistryVerdictByMode:
         fake = FakeConfluent(compatible=False, messages=["reader type: int"], mode=mode)
         _, errors, _ = run(confluent_contract(), confluent=fake)
         assert errors and "reader type: int" in errors[0]
+
+
+class TestEndpointMatch:
+    @pytest.mark.parametrize(
+        "a, b, same",
+        [
+            ("https://h.example", "https://h.example:443", True),
+            ("http://h.example:80/", "http://h.example", True),
+            ("https://h.example:8443", "https://h.example", False),
+            ("https://h.example:abc", "https://h.example", False),
+        ],
+    )
+    def test_default_ports_and_unreadable_urls(self, a, b, same):
+        from fluid_build.schema_registry.verify import _same_endpoint
+
+        assert _same_endpoint(a, b) is same
+
+
+class TestPlanProvider:
+    def test_plan_for_aws_ignores_the_confluent_subjects_registry(self):
+        from .conftest import produced_contract
+
+        contract = produced_contract({"kind": "confluent", "url": "https://sr.example.com"})
+        assert verify_consumed(contract, environ={}, provider="aws")[1] == []
+        assert verify_consumed(contract, environ={})[1]

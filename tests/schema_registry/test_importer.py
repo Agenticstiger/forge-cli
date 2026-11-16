@@ -97,7 +97,8 @@ class TestStreamFromSubject:
         ref = ref_for("glue", "orders-value", registry_name="commerce", version=3)
         block = stream_from_subject(ref, environ={}, client=client)
         assert client.calls == [("commerce", "orders-value", 3)]
-        assert block["registry"] == {"kind": "glue", "registryName": "commerce"}
+        # Read at a pinned version: the block pins the version the columns came from.
+        assert block["registry"] == {"kind": "glue", "registryName": "commerce", "version": 4}
 
     def test_glue_default_registry_names_nothing(self):
         ref = ref_for("glue", "orders-value")

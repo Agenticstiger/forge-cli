@@ -224,6 +224,9 @@ def validation_findings(
         except RegistryShapeError as exc:
             if not errors:
                 errors.append(str(exc))
+    from .produced import produced_set_errors
+
+    errors.extend(produced_set_errors(contract, [s for s in subjects if s.role == "produced"]))
     for subject in subjects:
         for severity, message in subject_findings(subject, stage="validate", environ=environ):
             (errors if severity == "error" else warnings).append(message)

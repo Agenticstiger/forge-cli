@@ -2295,7 +2295,7 @@
           "properties": {
             "registry": {
               "$ref": "#/$defs/schemaRegistry",
-              "description": "NEW in v0.7.7 (preview): The registry a produced topic's subject is registered in, on a Kafka binding (platform: kafka, or platform: confluent with format: kafka_topic). The topic is this product's, so forge registers its value schema, derived from contract.schema, through OpenTofu with this compatibility: aws_glue_schema for kind glue, confluent_schema and confluent_subject_config for kind confluent. On any other platform it is ignored, and fluid validate warns."
+              "description": "NEW in v0.7.7 (preview): The registry a produced topic's subject is registered in, on a Kafka binding (platform: kafka, or platform: confluent with format: kafka_topic). The topic is this product's, so forge registers its value schema, derived from contract.schema, through OpenTofu with this compatibility: aws_glue_schema for kind glue, confluent_schema and confluent_subject_config for kind confluent. On any other platform nothing is registered and fluid validate warns; the value is still checked against this definition."
             }
           }
         },

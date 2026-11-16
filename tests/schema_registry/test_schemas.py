@@ -154,8 +154,48 @@ def test_avro_a_repeated_record_name_is_defined_once():
         {"name": "b", **struct, "required": True},
     ]
     record = avro_schema(cols, name="r", names={"a": "Same", "b": "Same"})
-    names = [f["type"]["name"] for f in record["fields"]]
-    assert len(set(names)) == 2
+    first, second = (f["type"] for f in record["fields"])
+    assert first["name"] == "Same" and second == "Same"  # the producer's one record, by name
+
+
+def test_avro_a_reused_writer_record_round_trips_by_name():
+    writer = {
+        "type": "record",
+        "name": "Order",
+        "namespace": "com.x",
+        "fields": [
+            {
+                "name": "billing",
+                "type": {
+                    "type": "record",
+                    "name": "Address",
+                    "fields": [{"name": "c", "type": "string"}],
+                },
+            },
+            {"name": "shipping", "type": "Address"},
+        ],
+    }
+    columns, full, names = avro_columns(writer)
+    reader = avro_schema(columns, name="Order", namespace="com.x", names=names)
+    assert reader["fields"][1]["type"] == "com.x.Address"
+    assert avro_columns(reader)[0] == columns
+
+
+def test_avro_a_struct_named_like_the_record_gets_its_own_name():
+    cols = [{"name": "customer", "type": "struct", "fields": [{"name": "id", "type": "string"}]}]
+    record = avro_schema(cols, name="customer", namespace="fluid.p")
+    nested = record["fields"][0]["type"][1]
+    assert nested["name"] != "customer"
+
+
+def test_avro_a_decimal_without_precision_is_unsupported_not_a_crash():
+    writer = {
+        "type": "record",
+        "name": "R",
+        "fields": [{"name": "d", "type": {"type": "bytes", "logicalType": "decimal"}}],
+    }
+    with pytest.raises(UnsupportedSchema):
+        avro_columns(writer)
 
 
 @pytest.mark.parametrize(

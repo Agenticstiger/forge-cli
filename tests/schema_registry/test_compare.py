@@ -132,3 +132,28 @@ def test_describe_limit_argument():
 
 def test_describe_empty():
     assert describe([]) == ""
+
+
+@pytest.mark.parametrize(
+    "writer, reader, fmt, ok",
+    [
+        ("long", "double", "AVRO", True),
+        ("int", "float", "AVRO", True),
+        ("date", "timestamp", "AVRO", False),
+        ("decimal(10,2)", "decimal(12,4)", "AVRO", False),
+        ("decimal(10,2)", "decimal(12,2)", "AVRO", True),
+        ("decimal(12,2)", "decimal(10,2)", "AVRO", False),
+        ("long", "double", "JSON", True),
+        ("double", "long", "JSON", False),
+    ],
+)
+def test_a_type_change_follows_the_formats_reader_rules(writer, reader, fmt, ok):
+    from fluid_build.schema_registry.compare import reader_changes
+
+    changes = reader_changes(
+        [{"name": "x", "type": reader, "required": True}],
+        [{"name": "x", "type": writer, "required": True}],
+        data_format=fmt,
+        topic="t",
+    )
+    assert (changes == []) is ok

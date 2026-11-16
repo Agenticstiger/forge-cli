@@ -74,8 +74,21 @@ def _glue_subjects(contract: Mapping[str, Any]) -> Iterator[Tuple[Subject, Mappi
             )
 
 
-def _registry_key(cid: str, name: str) -> str:
-    return safe_ident(f"{cid}_{name}")
+def _registry_key(cid: str, name: str, seen: Dict[str, str]) -> str:
+    """The resource name of registry ``name``; two names that are one name are refused.
+
+    ``safe_ident`` folds ``team-a`` and ``team_a`` into one key, and the second
+    registry would silently become the first.
+    """
+    key = safe_ident(f"{cid}_{name}")
+    if seen.setdefault(key, name) != name:
+        raise UnsupportedBindingError(
+            "schema-registry-name-collision",
+            f"registries {seen[key]!r} and {name!r} differ only in punctuation and would "
+            f"share the OpenTofu name {key!r}",
+            ("Rename one registry.",),
+        )
+    return key
 
 
 def _owned(contract: Mapping[str, Any], subject: Subject, expose: Mapping[str, Any]) -> bool:
@@ -97,6 +110,7 @@ def emit_schema_registry(
     tags: Mapping[str, str],
 ) -> None:
     """Add the registries this product owns and every produced subject's schema."""
+    seen: Dict[str, str] = {}
     for subject, expose in _glue_subjects(contract):
         ref = subject.ref
         try:
@@ -112,7 +126,7 @@ def emit_schema_registry(
             "tags": dict(tags),
         }
         if ref.registry_name:
-            key = _registry_key(cid, ref.registry_name)
+            key = _registry_key(cid, ref.registry_name, seen)
             if _owned(contract, subject, expose):
                 resources.setdefault("aws_glue_registry", {}).setdefault(
                     key,
@@ -140,7 +154,9 @@ def emit_schema_registry(
 
 def emit_schema_registry_data(data: Dict[str, Any], contract: Mapping[str, Any], cid: str) -> None:
     """Look up each named Glue registry this product references but does not own."""
+    seen: Dict[str, str] = {}
     for subject, expose in _glue_subjects(contract):
         name = subject.ref.registry_name
         if name and not owns_registry(contract, expose):
-            data.setdefault("aws_glue_registry", {})[_registry_key(cid, name)] = {"name": name}
+            key = _registry_key(cid, name, seen)
+            data.setdefault("aws_glue_registry", {})[key] = {"name": name}

@@ -5,8 +5,8 @@
 
 The subject's latest (or Nth) schema becomes ``stream.schema``, its type the
 ``format`` (``AVRO`` -> ``avro-confluent``, ``JSON`` -> ``json``), and the registry the
-``stream.registry`` reference, pinned to nothing (``latest``) so ``fluid plan`` checks
-each new producer version. The topic is the subject less a TopicNameStrategy
+``stream.registry`` reference: unpinned (``latest``) when read at latest, so
+``fluid plan`` checks each new producer version, and pinned to N when read at N. The topic is the subject less a TopicNameStrategy
 ``-value`` suffix. The market connectors (``cli/market_catalogs/confluent_schema_reg.py``
 and ``glue_schema_reg.py``) call :func:`stream_from_subject`.
 
@@ -66,6 +66,8 @@ def stream_from_subject(
         registry["registryName"] = ref.registry_name
     if ref.subject != f"{topic}-value":
         registry["subject"] = ref.subject
+    if ref.version != "latest":
+        registry["version"] = sv.version  # the columns came from this version: pin it
     return {
         "kind": "kafka",
         "topic": topic,

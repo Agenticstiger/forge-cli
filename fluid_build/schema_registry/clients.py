@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import quote, urlsplit
 
 _ACCEPT = "application/vnd.schemaregistry.v1+json"
@@ -134,13 +134,22 @@ class ConfluentRegistry:
                 f"HTTP {response.status_code} ({code}): {message[:_MESSAGE_LIMIT]}", code=code
             )
         try:
-            return response.json()
+            body = response.json()
         except ValueError:
             raise RegistryError(f"{self.url} answered {path} with no JSON") from None
+        if not isinstance(body, (dict, list)):
+            raise RegistryError(f"{self.url} answered {path} with JSON that is no object")
+        return body
+
+    def _object(self, method: str, path: str, **kwargs: Any) -> Dict[str, Any]:
+        body = self._call(method, path, **kwargs)
+        if not isinstance(body, dict):
+            raise RegistryError(f"{self.url} answered {path} with JSON that is no object")
+        return body
 
     def get_version(self, subject: str, version: Union[str, int] = "latest") -> SubjectVersion:
         """``GET /subjects/{subject}/versions/{version}``."""
-        body = self._call("GET", f"subjects/{_segment(subject)}/versions/{_segment(version)}")
+        body = self._object("GET", f"subjects/{_segment(subject)}/versions/{_segment(version)}")
         return SubjectVersion(
             subject=str(body.get("subject", subject)),
             version=int(body["version"]),
@@ -157,7 +166,7 @@ class ConfluentRegistry:
         The registry judges ``schema`` against ``version`` under the subject's own
         compatibility mode, and registers nothing.
         """
-        body = self._call(
+        body = self._object(
             "POST",
             f"compatibility/subjects/{_segment(subject)}/versions/{_segment(version)}",
             params={"verbose": "true"},
@@ -171,7 +180,7 @@ class ConfluentRegistry:
         """The subject's mode, falling back to the registry's global one."""
         for path in (f"config/{_segment(subject)}", "config"):
             try:
-                body = self._call("GET", path, params={"defaultToGlobal": "true"})
+                body = self._object("GET", path, params={"defaultToGlobal": "true"})
             except RegistryError as exc:
                 if exc.code in (404, 40401, 40408):
                     continue
