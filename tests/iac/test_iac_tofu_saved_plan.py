@@ -161,8 +161,7 @@ class TestStaleDetection:
         "text",
         [
             '{"@level":"error","diagnostic":{"summary":"Saved plan is stale"}}',
-            "Error: Saved plan does not match the given state\n"
-            "it was created from a different state lineage.",
+            "Error: Saved plan does not match the given state\nfrom a different state lineage.",
         ],
     )
     def test_tofu_refusals_read_as_stale(self, text):
