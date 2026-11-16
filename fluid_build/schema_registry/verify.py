@@ -279,12 +279,12 @@ def attach_registry_checks(
                 ),
             },
         )
-    if not records:
-        return plan
     from fluid_build.cli.console import cprint, warning
 
     for message in warnings:
         warning(message)
+    if not records:
+        return plan
     for record in records:
         if record.get("result") == "compatible":
             cprint(

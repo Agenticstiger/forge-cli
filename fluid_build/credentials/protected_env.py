@@ -344,6 +344,12 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "OPENMETADATA_HOST",
         "AZURE_PURVIEW_ACCOUNT",
         "CONFLUENT_SCHEMA_REGISTRY_URL",
+        # The confluentinc OpenTofu provider's registry (produced subjects,
+        # iac/providers/confluent.py): tofu sends the operator's
+        # SCHEMA_REGISTRY_API_KEY/SECRET to this endpoint, so a project's .env may not
+        # move it.
+        "SCHEMA_REGISTRY_REST_ENDPOINT",
+        "SCHEMA_REGISTRY_ID",
         "OPENLINEAGE_URL",
         "OPENLINEAGE_ENDPOINT",
         "OTEL_EXPORTER_OTLP_ENDPOINT",
