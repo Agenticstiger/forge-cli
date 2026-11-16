@@ -2,7 +2,7 @@
 
 **Status:** Proposed (2026-11-16) · **Target schema:** 0.7.7 (preview, per `schema_manager.PREVIEW_VERSIONS`) · **Scope:** `$defs.exposeContract` (`invariants`), `$defs.column` (`identifierFormat`, `placeholders`, `sharedAttribute`), `$defs.semanticRelationship` (`sharedColumns`), one expression language (FLUID SQL/1), and five consumers: the validator, the dbt bridge, the ODCS exporter, the MCP query compiler and FLUX
 
-**Related:** `RFC-semantics-tier1.md` (#445; its §4 relationships and §5 validity windows landed in #894) · `RFC-data-profile-port.md` (#845; measured statistics stay out of the contract) · flux-engine ADR 0008 and `docs/spec/EXPR-SPEC-2.md` (Agenticstiger/flux-engine#38, restructured in #39), which implement §2 · FLUX relational data requirements v3, §5.1 (REL-9), §5.3 (COL-4, COL-7) and §5.5 (DQ-3)
+**Related:** `RFC-semantics-tier1.md` (#445; its §4 relationships and §5 validity windows landed in #894) · `RFC-data-profile-port.md` (#845; measured statistics stay out of the contract) · flux-engine ADR 0008 and `docs/spec/EXPR-SPEC-2.md` (Agenticstiger/flux-engine#38, restructured in #39), which implement §2; every EXPR-SPEC-2 section number cited here is #38's, which #39's follow-up renumbers · FLUX relational data requirements v3, §5.1 (REL-9), §5.3 (COL-4, COL-7) and §5.5 (DQ-3)
 
 ---
 
