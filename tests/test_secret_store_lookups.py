@@ -44,6 +44,8 @@ _SNOWFLAKE_KEYS = (
     "private_key_path",
     "private_key_passphrase",
     "oauth_token",
+    "workload_identity_provider",
+    "token_file_path",
 )
 
 _STORE = "vault://kv/fluid/credentials"
