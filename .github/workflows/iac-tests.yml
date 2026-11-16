@@ -89,8 +89,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
     # Stage 1 and Stage 2 run once per OpenTofu release line this repository
-    # supports: 1.12, which they ran alone until now, and the newest stable
-    # 1.13 release. A consumer that moves to 1.13 then runs a tofu these jobs
+    # supports: 1.12, the engine floor, and the newest stable
+    # 1.13 release. A consumer on either line then runs a tofu these jobs
     # ran. Each version is pinned by the SHA-256 of its linux_amd64 zip, taken
     # from that release's SHA256SUMS after checking OpenTofu's GPG signature
     # on it (key E3E6 E43D 84CB 852E ADB0 051D 0C0A F313 E5FD 9F80); the action
@@ -101,8 +101,8 @@ jobs:
       fail-fast: false
       matrix:
         tofu:
-          - version: "1.12.0"
-            sha256: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137  # pragma: allowlist secret
+          - version: "1.12.12"
+            sha256: 723df4d3044ca2e1fd8469d715a24869889c53e7f45458b1f2ea2e40e344789d  # pragma: allowlist secret
           - version: "1.13.9"
             sha256: bc44eb6b06446ba83bd4072114891987f590f66cca712737a7f1147c50c539ce  # pragma: allowlist secret
     env:
@@ -158,8 +158,8 @@ jobs:
       matrix:
         # The same versions and checksums as stage1-unit; every lane runs on each.
         tofu:
-          - version: "1.12.0"
-            sha256: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137  # pragma: allowlist secret
+          - version: "1.12.12"
+            sha256: 723df4d3044ca2e1fd8469d715a24869889c53e7f45458b1f2ea2e40e344789d  # pragma: allowlist secret
           - version: "1.13.9"
             sha256: bc44eb6b06446ba83bd4072114891987f590f66cca712737a7f1147c50c539ce  # pragma: allowlist secret
         lane:
@@ -310,8 +310,8 @@ jobs:
       fail-fast: false
       matrix:
         tofu:
-          - version: "1.12.0"
-            sha256: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137  # pragma: allowlist secret
+          - version: "1.12.12"
+            sha256: 723df4d3044ca2e1fd8469d715a24869889c53e7f45458b1f2ea2e40e344789d  # pragma: allowlist secret
           - version: "1.13.9"
             sha256: bc44eb6b06446ba83bd4072114891987f590f66cca712737a7f1147c50c539ce  # pragma: allowlist secret
     # LocalStack and GCP emulators are started as step-level docker
@@ -452,8 +452,8 @@ jobs:
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
         with:
-          tofu_version: 1.12.0
-          checksums: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137  # 1.12.0 linux_amd64 zip, as stage1-unit  # pragma: allowlist secret
+          tofu_version: 1.12.12
+          checksums: 723df4d3044ca2e1fd8469d715a24869889c53e7f45458b1f2ea2e40e344789d  # 1.12.12 linux_amd64 zip, as stage1-unit  # pragma: allowlist secret
 
       - name: Install Python deps
         run: |
@@ -514,8 +514,8 @@ jobs:
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
         with:
-          tofu_version: 1.12.0
-          checksums: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137  # 1.12.0 linux_amd64 zip, as stage1-unit  # pragma: allowlist secret
+          tofu_version: 1.12.12
+          checksums: 723df4d3044ca2e1fd8469d715a24869889c53e7f45458b1f2ea2e40e344789d  # 1.12.12 linux_amd64 zip, as stage1-unit  # pragma: allowlist secret
 
       - name: Install Python deps
         run: |
@@ -571,8 +571,8 @@ jobs:
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
         with:
-          tofu_version: 1.12.0
-          checksums: 8d7650fd42b6d790f9f747604393ccd0a9035376bccc4f1688b905d7c5bb1137  # 1.12.0 linux_amd64 zip, as stage1-unit  # pragma: allowlist secret
+          tofu_version: 1.12.12
+          checksums: 723df4d3044ca2e1fd8469d715a24869889c53e7f45458b1f2ea2e40e344789d  # 1.12.12 linux_amd64 zip, as stage1-unit  # pragma: allowlist secret
 
       - name: Install Python deps
         run: |

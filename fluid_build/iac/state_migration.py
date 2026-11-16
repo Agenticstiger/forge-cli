@@ -71,6 +71,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -142,6 +143,34 @@ class StateReconciliation:
         """The backend a read-only caller should read: the old one while pending."""
         return self.legacy if self.outcome == PENDING else self.current
 
+    def cleanup_hint(self) -> str:
+        """The exact command that removes the old object, for the operator to run.
+
+        forge never deletes state: the old object is the only rollback until
+        the new key has been checked. Empty when the backend is not one we know
+        how to name an object for.
+        """
+        legacy = self.legacy
+        if "s3" in legacy:
+            s3 = legacy["s3"]
+            uri = f"s3://{s3['bucket']}/{s3['key']}"
+            region = f" --region {s3['region']}" if s3.get("region") else ""
+            rm = f"aws s3 rm {shlex.quote(uri)}{region}"
+            rm_lock = f"aws s3 rm {shlex.quote(uri + '.tflock')}{region}"
+            return (
+                ". Once you have checked the new state, remove the old one yourself "
+                f"(the second command clears a stale lock object): {rm}; {rm_lock}"
+            )
+        if "gcs" in legacy:
+            gcs = legacy["gcs"]
+            prefix = gcs.get("prefix")
+            obj = f"gs://{gcs['bucket']}/" + (f"{prefix}/" if prefix else "") + "default.tfstate"
+            return (
+                ". Once you have checked the new state, remove the old one yourself: "
+                f"gcloud storage rm {shlex.quote(obj)}"
+            )
+        return ""
+
     def summary(self) -> str:
         """One line for the apply's output."""
         old = backend_location(self.legacy)
@@ -149,7 +178,7 @@ class StateReconciliation:
         if self.outcome == MIGRATED:
             return (
                 f"moved {self.resources} resource(s) from {old} to {new} with "
-                "`tofu init -migrate-state`; the old object is left in place"
+                "`tofu init -migrate-state`; the old object is left in place" + self.cleanup_hint()
             )
         if self.outcome == PENDING:
             return f"read from {old}: `fluid apply` moves it to {new}"

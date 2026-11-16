@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from .base import UnsupportedBindingError
-from .principals import AWS, principal_map, resolve_principal
+from .principals import AWS, aws_principal_key, principal_map, resolve_principal
 
 LOG = logging.getLogger(__name__)
 
@@ -66,6 +66,25 @@ MASK_RULES = ("last_four", "first_four", "nullify")
 
 #: Lake Formation permissions that let a principal read a table's rows.
 LF_READ_PERMISSIONS = frozenset({"SELECT", "ALL"})
+
+
+def lf_grant_reads(grant: Any) -> bool:
+    """Whether a ``governance.lakeFormation.grants[]`` entry lets its principal read rows.
+
+    ``SELECT`` (or ``ALL``) in either list counts: one held only with the grant option
+    still lets the principal grant the table to itself, or to anyone, so it is a read.
+    This covers a grant the emitter skips (no ``permissions``) on purpose: the policy
+    derivations refuse it rather than reason about whether it will be written.
+    """
+    if not isinstance(grant, Mapping) or not grant.get("principal"):
+        return False
+    held = [*(grant.get("permissions") or ()), *(grant.get("permissionsWithGrantOption") or ())]
+    return bool(LF_READ_PERMISSIONS & {str(p).upper() for p in held})
+
+
+def lf_readers(grants: Sequence[Any]) -> FrozenSet[str]:
+    """The :func:`~fluid_build.iac.principals.aws_principal_key` of every read grantee."""
+    return frozenset(aws_principal_key(g.get("principal")) for g in grants if lf_grant_reads(g))
 
 
 @dataclass(frozen=True)
@@ -376,24 +395,19 @@ def lf_exclusions(
     mapping = principal_map(binding)
 
     def resolve(principal: str) -> Tuple[str, ...]:
-        return resolve_principal(principal, mapping, platform=AWS, where=where)
+        # Compared by key: a grant may spell the role another way (its path, its case).
+        identities = resolve_principal(principal, mapping, platform=AWS, where=where)
+        return tuple(aws_principal_key(identity) for identity in identities)
 
-    readers = frozenset(
-        str(g.get("principal"))
-        for g in grants
-        if isinstance(g, Mapping)
-        and g.get("principal")
-        and LF_READ_PERMISSIONS & set(g.get("permissions") or ())
-    )
+    readers = lf_readers(grants)
     by_column = column_readers(exposure, restrictions, resolve, readers, where=where)
     out: Dict[int, Tuple[str, ...]] = {}
     for i, grant in enumerate(grants):
-        if not isinstance(grant, Mapping):
+        if not lf_grant_reads(grant):
             continue
-        principal = str(grant.get("principal") or "")
-        if not principal or not LF_READ_PERMISSIONS & set(grant.get("permissions") or ()):
-            continue
-        excluded = tuple(c for c, allowed in by_column.items() if principal not in allowed)
+        principal = str(grant.get("principal"))
+        key = aws_principal_key(principal)
+        excluded = tuple(c for c, allowed in by_column.items() if key not in allowed)
         declared_excluded = grant.get("excludedColumns")
         declared_columns = grant.get("columns")
         if declared_columns:
@@ -415,6 +429,23 @@ def lf_exclusions(
                 (
                     "Remove excludedColumns from the grant (forge-cli writes it from the "
                     "restrictions), or change it or the restrictions until they match.",
+                ),
+            )
+        regrant = {str(p).upper() for p in grant.get("permissionsWithGrantOption") or ()}
+        if excluded and LF_READ_PERMISSIONS & regrant:
+            # Refused here, not first at emit, so `fluid validate` says it too.
+            raise UnsupportedBindingError(
+                "column-restriction-unenforceable",
+                f"{_lf_grant_where(where, i)} gives {principal} SELECT in "
+                f"permissionsWithGrantOption, and the contract's column restrictions withhold "
+                f"{list(excluded)} from it. Lake Formation takes the grant option on a "
+                "column-limited SELECT only with an include list, and on the table it would "
+                "let the principal grant itself the withheld columns.",
+                (
+                    "Remove SELECT (and ALL) from permissionsWithGrantOption; keep SELECT in "
+                    "permissions.",
+                    "Or name the columns it may read in the grant's columns, which keeps the "
+                    "grant option.",
                 ),
             )
         if excluded:
@@ -474,6 +505,8 @@ __all__ = [
     "column_masks",
     "column_readers",
     "lf_exclusions",
+    "lf_grant_reads",
+    "lf_readers",
     "lf_expected_exclusions",
     "restricted_columns",
     "restrictions_for",

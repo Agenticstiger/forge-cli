@@ -12,9 +12,14 @@ from __future__ import annotations
 
 from typing import Dict
 
-#: Minimum OpenTofu version. 1.6 is OpenTofu's first GA release and the
-#: floor for config-driven ``import {}`` blocks.
-REQUIRED_TOFU_VERSION = ">= 1.6"
+#: Minimum OpenTofu version. 1.10 added S3-native state locking
+#: (``use_lockfile``) and 1.11 added ephemeral values and write-only
+#: arguments. The floor is 1.12 because 1.11 does not fire
+#: ``lifecycle.replace_triggered_by`` when the referenced resource is
+#: *created*: adding retention to a live BigQuery table then plans an in-place
+#: update instead of a replacement, and the data-loss gate never sees it
+#: (tests/iac/test_iac_gcp_governance_plan.py pins this).
+REQUIRED_TOFU_VERSION = ">= 1.12"
 
 #: Provider local-name -> ``{source, version}``. ``source`` addresses are
 #: OpenTofu-registry namespaces; the Snowflake provider moved out of the
@@ -22,7 +27,7 @@ REQUIRED_TOFU_VERSION = ">= 1.6"
 PROVIDER_PINS: Dict[str, Dict[str, str]] = {
     "google": {"source": "hashicorp/google", "version": "~> 6.0"},
     "aws": {"source": "hashicorp/aws", "version": "~> 6.0"},
-    "snowflake": {"source": "snowflakedb/snowflake", "version": "~> 2.0"},
+    "snowflake": {"source": "snowflakedb/snowflake", "version": "~> 2.23"},
     # Confluent Cloud — Tableflow (managed Kafka→Iceberg) + Glue catalog /
     # provider integration. The managed control plane owns compaction +
     # snapshot-expiry (RFC-streaming-extension §15).

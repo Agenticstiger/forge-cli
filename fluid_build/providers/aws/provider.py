@@ -190,6 +190,10 @@ class AwsProvider(BaseProvider):
             schedule_actions = self._plan_schedule(contract)
             actions.extend(schedule_actions)
 
+            # An op the OpenTofu engine does not create yet is refused here, so
+            # `fluid plan` refuses what `fluid apply` would otherwise skip.
+            self._refuse_unemitted_ops(actions)
+
             # Order actions by dependencies
             actions = order_actions_by_dependencies(actions)
 
@@ -231,6 +235,21 @@ class AwsProvider(BaseProvider):
             self.err_kv(event="plan_failed", contract_id=contract.get("id"), error=str(e))
             # Wrap all other exceptions in ProviderError
             raise ProviderError(f"Failed to plan AWS deployment: {e}") from e
+
+    @staticmethod
+    def _refuse_unemitted_ops(actions: List[Dict[str, Any]]) -> None:
+        """``iac.providers.aws.refuse_unemitted_ops``, as a :class:`PlanValidationError`:
+        a planner that ran and refused, which ``generate iac`` and ``apply`` re-raise
+        rather than treat as a planner that could not run."""
+        # Imported here: the OpenTofu plugin is off the ``fluid --help`` cold path.
+        from fluid_build.iac.base import UnsupportedBindingError
+        from fluid_build.iac.providers.aws import refuse_unemitted_ops
+        from fluid_build.providers._plan_validation import PlanValidationError
+
+        try:
+            refuse_unemitted_ops(actions)
+        except UnsupportedBindingError as exc:
+            raise PlanValidationError(f"{exc} {' '.join(exc.remediation)}".strip()) from exc
 
     def apply(self, actions: List[Dict[str, Any]], **kwargs: Any) -> ApplyResult:
         """Native AWS apply is retired — AWS uses the OpenTofu engine.

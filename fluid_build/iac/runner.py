@@ -34,7 +34,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 # legitimately exceeds it (e.g., Lake Formation tag propagation, which
 # can take many minutes for the eventual consistency to settle).
 _DEFAULT_TOFU_TIMEOUT_SECONDS = 1800
-_MIN_REQUIRED_VERSION = (1, 6, 0)
+_MIN_REQUIRED_VERSION = (1, 12, 0)
 # S3-native state locking (``use_lockfile``) arrived in OpenTofu 1.10.
 _S3_LOCKFILE_MIN_VERSION = (1, 10, 0)
 # After SIGINT on a timeout, how long tofu gets to release its lock and exit
@@ -585,3 +585,54 @@ def change_summary(result: TofuResult) -> Dict[str, int]:
             changes = event.get("changes") or {}
             return {key: int(changes.get(key, 0)) for key in ("add", "change", "remove")}
     return {"add": 0, "change": 0, "remove": 0}
+
+
+def _managed_changes(shown: Mapping[str, Any]) -> Iterator[Tuple[Mapping[str, Any], List[str]]]:
+    """``(resource change, its actions)`` of each managed resource in a saved plan, as
+    ``tofu show -json`` prints it (opentofu.org/docs/internals/json-format)."""
+    for change in shown.get("resource_changes") or []:
+        detail = change.get("change") if isinstance(change, Mapping) else None
+        if not isinstance(detail, Mapping) or change.get("mode", "managed") != "managed":
+            continue
+        yield change, [str(action) for action in detail.get("actions") or []]
+
+
+def saved_plan_changes(shown: Mapping[str, Any]) -> Dict[str, int]:
+    """The ``{add, change, remove}`` counts of a saved plan, as :func:`change_summary`
+    reads them from a ``tofu plan -json`` stream: a replace counts as one add and one
+    remove, an import or a forget as neither."""
+    counts = {"add": 0, "change": 0, "remove": 0}
+    for _change, actions in _managed_changes(shown):
+        counts["add"] += actions.count("create")
+        counts["change"] += actions.count("update")
+        counts["remove"] += actions.count("delete")
+    return counts
+
+
+def saved_plan_removals(shown: Mapping[str, Any]) -> List[Tuple[str, str]]:
+    """``(address, resource type)`` of every resource a saved plan deletes or replaces:
+    :func:`planned_removals` for a plan read back with ``tofu show -json``."""
+    return [
+        (str(change.get("address") or ""), str(change.get("type") or ""))
+        for change, actions in _managed_changes(shown)
+        if "delete" in actions
+    ]
+
+
+def gitlab_plan_report(shown: Mapping[str, Any]) -> str:
+    """The GitLab ``artifacts:reports:terraform`` file for a saved plan.
+
+    Byte for byte what the GitLab OpenTofu component writes
+    (gitlab.com/components/opentofu ``src/gitlab-tofu.sh``, ``write_plan_json``
+    at 9e5d830a): ``jq -r`` over ``tofu show -json`` with its ``plan_jq_filter``,
+    which counts the ``create``, ``update`` and ``delete`` actions of every
+    resource change (data sources included), pretty-printed with two spaces.
+    """
+    actions = [
+        action
+        for change in shown.get("resource_changes") or []
+        if isinstance(change, Mapping) and isinstance(change.get("change"), Mapping)
+        for action in change["change"].get("actions") or []
+    ]
+    report = {key: actions.count(key) for key in ("create", "update", "delete")}
+    return json.dumps(report, indent=2) + "\n"

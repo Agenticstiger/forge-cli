@@ -390,6 +390,15 @@ class PlanBindingError(ValueError):
     - ``"plan-tamper"``     — plan's ``planDigest`` disagrees with the
       recomputed digest over the plan body. Someone edited ``plan.json``
       between stages 6 and 7.
+    - ``"tofu-plan-invalid"`` — the plan's ``opentofuPlan`` record (written by
+      ``fluid plan --tofu``) is malformed, or names its saved plan with a path
+      rather than a file name next to ``plan.json``.
+    - ``"tofu-plan-missing"`` — ``plan.json`` binds a saved OpenTofu plan, and
+      that file is not next to it.
+    - ``"tofu-plan-mismatch"`` — the saved OpenTofu plan's sha256 differs from
+      the one ``plan.json`` binds: it is not the plan that was reviewed.
+    - ``"tofu-plan-stale"`` — OpenTofu refused the saved plan because the state
+      changed after it was made (raised by ``fluid apply``, not by this module).
     """
 
     def __init__(self, kind: str, message: str):
@@ -500,13 +509,84 @@ def verify_plan_binding(
         )
 
 
+# ---------------------------------------------------------------------------
+# The saved OpenTofu plan (``fluid plan --tofu``)
+# ---------------------------------------------------------------------------
+
+#: The ``plan.json`` field that binds a saved OpenTofu plan. Not masked out of
+#: ``planDigest``, so the record (file name, sha256, state, provider) is under it.
+TOFU_PLAN_FIELD = "opentofuPlan"
+
+
+def sha256_bytes(data: bytes) -> str:
+    """``sha256:<hex>`` of raw bytes: the digest a saved OpenTofu plan is bound by."""
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def tofu_plan_record(plan: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The plan's ``opentofuPlan`` record, ``None`` when it binds no saved plan.
+
+    Raises :class:`PlanBindingError` ``tofu-plan-invalid`` for a record without a
+    ``sha256`` or whose ``planFile`` is not a bare file name: the saved plan
+    always sits next to ``plan.json``, so a path there is an edit, not a plan.
+    """
+    record = plan.get(TOFU_PLAN_FIELD)
+    if record is None:
+        return None
+    name = record.get("planFile") if isinstance(record, dict) else None
+    digest = record.get("sha256") if isinstance(record, dict) else None
+    if (
+        not isinstance(name, str)
+        or name in ("", ".", "..")
+        or Path(name).name != name
+        or "\\" in name
+        or not isinstance(digest, str)
+        or not digest.startswith("sha256:")
+    ):
+        raise PlanBindingError(
+            "tofu-plan-invalid",
+            f"plan.json's {TOFU_PLAN_FIELD} record is malformed: it needs a planFile "
+            "that is a file name next to plan.json and a sha256:<hex> digest. Re-run "
+            "``fluid plan --tofu``.",
+        )
+    return record
+
+
+def verify_tofu_plan(record: Mapping[str, Any], data: Optional[bytes]) -> None:
+    """Fail unless ``data`` is the saved OpenTofu plan ``record`` binds.
+
+    ``data`` is the file's bytes as read once by the caller (``None`` when it is
+    missing), so what was hashed is what gets applied, not a file re-read later.
+    """
+    name = record.get("planFile")
+    if data is None:
+        raise PlanBindingError(
+            "tofu-plan-missing",
+            f"plan.json binds the saved OpenTofu plan {name!r}, which is not next to "
+            "it. Keep the plan's files together (CI: pass every file ``fluid plan "
+            "--tofu`` wrote as artifacts), or re-run ``fluid plan --tofu``.",
+        )
+    actual = sha256_bytes(data)
+    if actual != record.get("sha256"):
+        raise PlanBindingError(
+            "tofu-plan-mismatch",
+            f"the saved OpenTofu plan {name!r} has digest {actual!r}, but plan.json "
+            f"binds {record.get('sha256')!r}: it is not the plan that was reviewed. "
+            "Re-run ``fluid plan --tofu`` and approve the new plan.",
+        )
+
+
 __all__ = [
     "PlanBindingError",
+    "TOFU_PLAN_FIELD",
     "coerce_keys_to_str",
     "compute_contract_digest",
     "compute_plan_digest",
     "inject_digests",
     "is_bundle_path",
     "read_bundle_digest",
+    "sha256_bytes",
+    "tofu_plan_record",
     "verify_plan_binding",
+    "verify_tofu_plan",
 ]
