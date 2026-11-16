@@ -18,8 +18,6 @@ import pytest
 
 import fluid_build.providers.snowflake.connection as connection_mod
 import fluid_build.providers.snowflake.util.config as config_mod
-from fluid_build.providers.snowflake.connection import SnowflakeConnection
-from fluid_build.providers.snowflake.util.config import get_connection_params
 
 pytestmark = pytest.mark.unit
 
@@ -60,7 +58,7 @@ def test_oidc_needs_no_user_and_passes_the_token_file(monkeypatch, tmp_path):
     token = str(tmp_path / "id_token")
     _wif(monkeypatch, SNOWFLAKE_TOKEN_FILE_PATH=token)
 
-    params = get_connection_params()
+    params = config_mod.get_connection_params()
 
     assert params["authenticator"] == "WORKLOAD_IDENTITY"
     assert params["workload_identity_provider"] == "OIDC"
@@ -75,7 +73,7 @@ def test_the_authenticator_name_is_case_insensitive(monkeypatch, tmp_path):
     _wif(monkeypatch, provider="oidc", SNOWFLAKE_TOKEN_FILE_PATH=str(tmp_path / "t"))
     monkeypatch.setenv("SNOWFLAKE_AUTHENTICATOR", "workload_identity")
 
-    params = get_connection_params()
+    params = config_mod.get_connection_params()
 
     assert params["authenticator"] == "WORKLOAD_IDENTITY"
     assert params["workload_identity_provider"] == "OIDC"
@@ -89,7 +87,7 @@ def test_wif_outranks_a_stray_password_and_key(monkeypatch, tmp_path):
         SNOWFLAKE_PRIVATE_KEY_PATH=str(tmp_path / "k.p8"),
     )
 
-    params = get_connection_params()
+    params = config_mod.get_connection_params()
 
     assert "password" not in params and "private_key_path" not in params
 
@@ -97,7 +95,7 @@ def test_wif_outranks_a_stray_password_and_key(monkeypatch, tmp_path):
 def test_a_cloud_provider_needs_no_token_file(monkeypatch):
     _wif(monkeypatch, provider="aws")
 
-    params = get_connection_params()
+    params = config_mod.get_connection_params()
 
     assert params["workload_identity_provider"] == "AWS"
     assert "token_file_path" not in params
@@ -106,21 +104,21 @@ def test_a_cloud_provider_needs_no_token_file(monkeypatch):
 def test_oidc_without_a_token_file_is_refused_with_the_variable(monkeypatch):
     _wif(monkeypatch)
     with pytest.raises(ValueError, match="SNOWFLAKE_TOKEN_FILE_PATH"):
-        get_connection_params()
+        config_mod.get_connection_params()
 
 
 def test_wif_without_a_provider_is_refused_with_the_variable(monkeypatch):
     monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "myorg-myaccount")
     monkeypatch.setenv("SNOWFLAKE_AUTHENTICATOR", "WORKLOAD_IDENTITY")
     with pytest.raises(ValueError, match="SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER"):
-        get_connection_params()
+        config_mod.get_connection_params()
 
 
 def test_other_authenticators_still_need_a_user(monkeypatch):
     monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "myorg-myaccount")
     monkeypatch.setenv("SNOWFLAKE_PASSWORD", "not-used")  # pragma: allowlist secret
     with pytest.raises(ValueError, match="user"):
-        get_connection_params()
+        config_mod.get_connection_params()
 
 
 def test_explicit_settings_outrank_the_environment(monkeypatch, tmp_path):
@@ -141,10 +139,12 @@ def test_the_connection_hands_the_connector_the_wif_parameters(monkeypatch, tmp_
         "snowflake",
         SimpleNamespace(connector=SimpleNamespace(connect=lambda **kw: seen.update(kw) or conn)),
     )
-    monkeypatch.setattr(SnowflakeConnection, "_initialize_session", lambda *a, **k: None)
+    monkeypatch.setattr(
+        connection_mod.SnowflakeConnection, "_initialize_session", lambda *a, **k: None
+    )
     _wif(monkeypatch, SNOWFLAKE_TOKEN_FILE_PATH=str(tmp_path / "id_token"))
 
-    SnowflakeConnection(**get_connection_params())._connect()
+    connection_mod.SnowflakeConnection(**config_mod.get_connection_params())._connect()
 
     assert seen["authenticator"] == "WORKLOAD_IDENTITY"
     assert seen["workload_identity_provider"] == "OIDC"
@@ -180,6 +180,8 @@ class TestReadinessWithoutAUser:
         from fluid_build.cli._auth_provider_impls import SnowflakeAuthProvider as Provider
         from fluid_build.cli.auth import AuthResult, AuthStatus
 
+        # login() first wants the connector or SnowSQL; CI's lean install has neither.
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/snowsql")
         connected = AuthResult(provider="snowflake", status=AuthStatus.AUTHENTICATED)
         monkeypatch.setattr(Provider, "_check_auth_with_connector", lambda self, s: connected)
         provider = Provider({}, logging.getLogger("test"))
