@@ -59,6 +59,8 @@ CALLER = "data.aws_caller_identity.fluid_lf_caller.account_id"
 REGION_DATA = "fluid_region"
 #: Where a build's artifacts live in its output's bucket.
 ARTIFACT_ROOT = "_fluid/spark"
+#: Where the compiler puts a build's checkpoint by default: ``_checkpoints/<product>/<build>/``.
+_CHECKPOINTS = "_checkpoints"
 RUNNER_FILE = "forge_spark_runner.py"
 CONFIG_FILE = "job.json"
 #: Days a Spark log group keeps events.
@@ -407,12 +409,74 @@ def _bucket_ref(
     return ctx.x(bucket)
 
 
+#: What a forge role's S3 grant may name: a bucket name and a prefix with no IAM
+#: wildcard (``*``, ``?``), policy variable (``$``) or ``..`` segment.
+_BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
+_PREFIX = re.compile(r"[A-Za-z0-9._=-]+(?:/[A-Za-z0-9._=-]+)*/")
+
+
+def _scoped(b: _Build, bucket: str, prefix: str, what: str) -> str:
+    """``prefix`` ending in ``/``, refused unless it names one place in one bucket.
+
+    The role forge creates can read, overwrite and delete what its prefixes match. An
+    empty prefix is the whole bucket, which a bucketless product shares with every other
+    (``<account>-fluid-data``); a wildcard or a prefix without its ``/`` reaches its
+    neighbours (``x`` matches ``x_pii/``).
+    """
+    prefix = prefix if prefix.endswith("/") else prefix + "/"
+    if (
+        _BUCKET.fullmatch(bucket)
+        and _PREFIX.fullmatch(prefix)
+        and ".." not in prefix.split("/")
+        and "." not in prefix.split("/")
+    ):
+        return prefix
+    raise UnsupportedBindingError(
+        "spark-role-scope",
+        f"{b.where}: {what} (s3://{bucket}/{prefix.rstrip('/')}) is not one prefix of one "
+        "bucket, and the role forge creates for the build may read, overwrite and delete "
+        "everything it names: an empty path is the whole bucket, and a bucketless product "
+        "shares <account>-fluid-data with every other.",
+        (
+            "Set binding.location.path to the table's own prefix (letters, digits, "
+            "'.', '_', '=', '-' and '/').",
+            "Or set parameters.spark.executionRoleArn to a role the operator scoped.",
+        ),
+    )
+
+
 def _s3_grants(b: _Build, bucket: str, data_prefix: str) -> Tuple[aws_identity.S3Grant, ...]:
-    """The prefixes the job writes (data, checkpoint, Glue's TempDir) and reads (artifacts)."""
+    """The prefixes the job writes (data, checkpoint, Glue's TempDir) and reads (artifacts).
+
+    For a role forge creates, every prefix is checked to be one place (:func:`_scoped`),
+    and a declared checkpoint must be the product's: under ``_checkpoints/<product>/`` in
+    the output's bucket. A checkpoint elsewhere would give the role write access to a
+    bucket or prefix the contract chose.
+    """
+    owned = not b.cfg.get("executionRoleArn")
+    if owned:
+        data_prefix = _scoped(b, bucket, data_prefix, "the output's location")
     by_bucket: Dict[str, Tuple[List[str], List[str]]] = {bucket: ([data_prefix], [b.artifacts])}
     checkpoint = str(b.config.get("checkpoint") or "")
     if checkpoint:
         ck_bucket, ck_prefix = _split_s3(checkpoint)
+        if owned:
+            ck_prefix = _scoped(b, ck_bucket, ck_prefix, "properties.stream.checkpoint")
+            home = f"{_CHECKPOINTS}/{b.ctx.product}/"
+            if ck_bucket != bucket or not ck_prefix.startswith(home):
+                raise UnsupportedBindingError(
+                    "spark-checkpoint-scope",
+                    f"{b.where}: properties.stream.checkpoint is outside the product's "
+                    f"checkpoints (s3://{bucket}/{home}), and the role forge creates would "
+                    "get write access wherever it points.",
+                    (
+                        "Leave properties.stream.checkpoint out: it defaults to "
+                        f"s3://{bucket}/{home}{b.build_id}/.",
+                        f"Or put it under s3://{bucket}/{home}.",
+                        "Or set parameters.spark.executionRoleArn to a role the operator "
+                        "scoped.",
+                    ),
+                )
         by_bucket.setdefault(ck_bucket, ([], []))[0].append(ck_prefix)
     if b.runtime == "glue":
         by_bucket[bucket][0].append(b.artifacts + "tmp/")

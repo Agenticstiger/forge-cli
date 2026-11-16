@@ -563,3 +563,57 @@ def test_a_glue_connection_is_named_for_the_build_and_carries_the_emulators_cata
     assert resources["aws_glue_connection"][KEY]["catalog_id"] == (
         "${data.aws_caller_identity.fluid_lf_caller.account_id}"
     )
+
+
+# --- the role reaches the product's own prefixes only (security review, finding A) ---
+
+
+@pytest.mark.parametrize(
+    "path", ["", "/", "*", "iceberg/*/", "a/../b/", "a/./b/", "${aws:username}/"]
+)
+def test_a_forge_role_never_gets_a_whole_bucket_or_a_wildcard(contract, path):
+    contract["exposes"][0]["binding"]["location"]["path"] = path
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert caught.value.kind == "spark-role-scope"
+
+
+def test_a_prefix_without_its_slash_gets_one(contract):
+    contract["exposes"][0]["binding"]["location"]["path"] = "iceberg/commerce/order_lines"
+    _, data = emit(contract)
+    rw = statement(data["aws_iam_policy_document"][f"{KEY}_access"], "ReadWrite0")
+    assert rw["resources"][0] == "arn:aws:s3:::commerce-lake/iceberg/commerce/order_lines/*"
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "s3://victim-lake/other-product/",
+        "s3://commerce-lake/",
+        "s3://commerce-lake/iceberg/other/",
+        "s3://commerce-lake/_checkpoints/other.product/x/",
+    ],
+)
+def test_a_declared_checkpoint_must_be_the_products(contract, checkpoint):
+    contract["builds"][0]["properties"]["stream"]["checkpoint"] = checkpoint
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert caught.value.kind in ("spark-checkpoint-scope", "spark-role-scope")
+
+
+def test_a_checkpoint_under_the_products_home_is_kept(contract):
+    ck = "s3://commerce-lake/_checkpoints/commerce.orders-stream/v2/"
+    contract["builds"][0]["properties"]["stream"]["checkpoint"] = ck
+    _, data = emit(contract)
+    rw = statement(data["aws_iam_policy_document"][f"{KEY}_access"], "ReadWrite0")
+    assert "arn:aws:s3:::commerce-lake/_checkpoints/commerce.orders-stream/v2/*" in rw["resources"]
+
+
+def test_an_operator_scoped_role_takes_any_checkpoint(contract, monkeypatch):
+    params = spark(contract)
+    params.update(runtime="glue", executionRoleArn=ROLE)
+    del params["applicationId"]
+    monkeypatch.setenv(aws_identity.EXECUTION_ROLE_ALLOWLIST_ENV, ROLE)
+    contract["builds"][0]["properties"]["stream"]["checkpoint"] = "s3://other-lake/ck/"
+    resources, _ = emit(contract)
+    assert resources["aws_glue_job"][KEY]["role_arn"] == ROLE
