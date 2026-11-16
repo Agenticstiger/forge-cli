@@ -511,12 +511,15 @@ class TestEngineWiring:
 
         from fluid_build.cli import _apply_opentofu_engine as engine
 
-        # The run's body (apply_via_opentofu wraps it in the contract-source block).
-        source = inspect.getsource(engine._apply_via_opentofu)
-        guard_at = source.index("_guard_packaging_transitions(")
-        adopt_at = source.index("_adopt_existing(")
-        plan_at = source.index("runner.tofu_plan(")
-        assert guard_at < adopt_at < plan_at
+        # The run's body (apply_via_opentofu wraps it in the contract-source block), and
+        # fluid plan --tofu's, both run the pre-plan guards before adoption and the plan.
+        assert "_guard_packaging_transitions(" in inspect.getsource(engine._guard_before_plan)
+        for run in (engine._apply_via_opentofu, engine._plan_with_opentofu):
+            source = inspect.getsource(run)
+            guard_at = source.index("_guard_before_plan(")
+            adopt_at = source.index("_adopt_existing(")
+            plan_at = source.index("runner.tofu_plan(")
+            assert guard_at < adopt_at < plan_at
 
     def test_the_adapter_translates_to_a_cli_error_with_remediation(self, monkeypatch):
         from fluid_build.cli import _apply_opentofu_engine as engine

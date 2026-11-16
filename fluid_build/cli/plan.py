@@ -24,6 +24,7 @@ from fluid_build.cli.console import cprint, cprint_literal, warning
 # 11-stage pipeline: stage-6 → stage-7 cryptographic plan-binding. ``plan.json``
 # carries ``bundleDigest`` (pins input bundle) + ``planDigest`` (catches
 # plan-file tampering). ``fluid apply`` re-verifies both before any DDL.
+from ..forge.core.plan_digest import TOFU_PLAN_FIELD as _TOFU_PLAN_FIELD
 from ..forge.core.plan_digest import coerce_keys_to_str, inject_digests, is_bundle_path
 from ..observability.tracing import traced_stage as _traced_stage
 from ._common import (
@@ -157,7 +158,10 @@ transformations, access grants, and orchestration tasks.
   fluid plan contract.fluid.yaml --env test --out test-plan.json
 
   # Verbose output with detailed action information
-  fluid plan contract.fluid.yaml --verbose""",
+  fluid plan contract.fluid.yaml --verbose
+
+  # Proof gate: save the OpenTofu plan; `fluid apply plan.json` applies exactly it
+  fluid plan contract.fluid.yaml --tofu --state-backend s3://bucket/key""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
@@ -230,6 +234,34 @@ transformations, access grants, and orchestration tasks.
     )
     p.add_argument("--project", help="override project/account (default: from contract)")
     p.add_argument("--region", help="override region/location (default: from contract)")
+    p.add_argument(
+        "--tofu",
+        action="store_true",
+        help=(
+            "also run `tofu plan` as `fluid apply` would (OpenTofu-engine providers) "
+            "and bind the saved plan into plan.json: `fluid apply plan.json` then "
+            "applies exactly that plan. Next to it, mode 0600: plan.tfplan, "
+            "plan.tfplan.json and the GitLab terraform report plan.gitlab-tofu.json "
+            "(named after --out)"
+        ),
+    )
+    p.add_argument(
+        "--state-backend",
+        default=None,
+        help="with --tofu: the OpenTofu state `fluid apply` will use (as on apply)",
+    )
+    p.add_argument(
+        "--adopt-shared-container",
+        action="store_true",
+        default=False,
+        help="with --tofu: as on apply (take ownership of a shared pool; audited)",
+    )
+    p.add_argument(
+        "--ensure-opentofu",
+        action="store_true",
+        default=False,
+        help="with --tofu: provision a pinned, verified `tofu` if it is missing (as on apply)",
+    )
     p.add_argument(
         "--html",
         dest="html_output",
@@ -481,6 +513,15 @@ def run(args, logger: logging.Logger) -> int:
         ):
             raise CLIError(1, "sovereignty_violation", {"contract": args.contract})
 
+        # --- The saved OpenTofu plan (proof gate) ---------------------------
+        # After every gate that can refuse the plan (the bundle, sovereignty), so a
+        # refusal leaves no saved plan behind; re-bound (``force``: a mutation made
+        # here, as for ``cost_estimate``) so planDigest covers the saved plan's
+        # sha256 and an approval of plan.json is an approval of the exact `tofu apply`.
+        if getattr(args, "tofu", False):
+            plan[_TOFU_PLAN_FIELD] = _plan_tofu(contract, bool(streaming), args, logger)
+            plan = inject_digests(plan, bundle_path=bundle_path, force=True)
+
         # Write plan to file (idempotent - only if changed)
         write_json_idempotent(args.out, plan)
 
@@ -546,6 +587,28 @@ def run(args, logger: logging.Logger) -> int:
         raise
     except Exception as e:
         raise CLIError(1, "planner_failed", context={"error": str(e)})
+
+
+def _plan_tofu(
+    contract: Dict[str, Any], streaming: bool, args: argparse.Namespace, logger: logging.Logger
+) -> Dict[str, Any]:
+    """``--tofu``: ``tofu plan -out`` for an OpenTofu-engine contract, kept next to the
+    plan (``cli/_apply_opentofu_engine.py::plan_with_opentofu``). Returns the record
+    bound into plan.json."""
+    from fluid_build.cli._apply_opentofu_engine import plan_with_opentofu, resolve_apply_engine
+
+    engine = "streaming" if streaming else resolve_apply_engine(args, logger, contract=contract)
+    if engine != "opentofu":
+        raise CLIError(
+            1,
+            "plan_tofu_unsupported",
+            {
+                "error": "--tofu saves an OpenTofu plan, and `fluid apply` does not run "
+                f"OpenTofu for this contract (its apply engine is {engine!r})",
+                "remediation": ["Plan it without --tofu."],
+            },
+        )
+    return plan_with_opentofu(args, logger, contract, args.out)
 
 
 def _planned_env(args: argparse.Namespace, bundle_path: Optional[Path]) -> Optional[str]:
