@@ -101,8 +101,6 @@ DEFAULT_QUANTILE_LEVELS: Tuple[Fraction, ...] = (Fraction(1, 4), Fraction(1, 2),
 _METRICS = ("count", "nullCount", "distinctCount", "sum", "min", "max", "quantiles")
 #: Counts of records: checked as cells, and read over every row of the table.
 _RECORD_COUNTS = frozenset({"count", "nullCount"})
-#: Order statistics: published only when enough records hold the value.
-_ORDER_STATISTICS = frozenset({"min", "max", "quantiles"})
 
 
 class ProfileError(Exception):
