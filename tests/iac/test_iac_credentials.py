@@ -209,6 +209,48 @@ class TestCloudFamilies:
         assert set(request) <= set(plugin.credential_env({**oidc, **request}))
         assert not set(request) & set(plugin.credential_env({**pat, **request}))
 
+    def test_azure_devops_job_variables_reach_databricks_only_for_its_oidc(self):
+        job = {
+            "SYSTEM_ACCESSTOKEN": "ado-token",  # pragma: allowlist secret
+            "SYSTEM_TEAMFOUNDATIONCOLLECTIONURI": "https://dev.azure.com/org/",
+            "SYSTEM_PLANID": "p",
+            "SYSTEM_JOBID": "j",
+            "SYSTEM_TEAMPROJECTID": "t",
+            "SYSTEM_HOSTTYPE": "build",
+        }
+        plugin = get_iac_plugin("databricks")
+        host = {
+            "DATABRICKS_HOST": "https://adb-1.azuredatabricks.net",
+            "DATABRICKS_CLIENT_ID": "sp",
+        }
+        ado = {**host, "DATABRICKS_AUTH_TYPE": "azure-devops-oidc", **job}
+        assert set(job) <= set(plugin.credential_env(ado))
+        github = {**host, "DATABRICKS_AUTH_TYPE": "github-oidc", **job}
+        assert not set(job) & set(plugin.credential_env(github))
+
+    def test_a_plugin_that_predates_the_allowlist_is_named_once(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ):
+        from fluid_build.iac import credentials
+
+        monkeypatch.setattr(credentials, "_WARNED", set())
+
+        class OnPrem:  # an out-of-tree plugin written before credential_env_prefixes
+            name = "onprem"
+            credential_env_vars = ("ONPREM_TOKEN",)
+
+        caplog.set_level(logging.WARNING, logger="fluid_build.iac.credentials")
+        base = {"ONPREM_TOKEN": "t", "ONPREM_URL": "https://x"}  # pragma: allowlist secret
+        assert build_tofu_env(OnPrem(), base=base) == {"ONPREM_TOKEN": "t"}
+        build_tofu_env(OnPrem(), base=base)
+        events = [json.loads(r.getMessage()) for r in caplog.records]
+        assert [(e["event"], e["plugin"]) for e in events] == [
+            ("tofu_env_plugin_undeclared", "onprem")
+        ]
+        caplog.clear()
+        build_tofu_env(get_iac_plugin("aws"), base=base)
+        assert not caplog.records
+
     def test_basics_cover_a_credential_process_helper(self):
         # aws-kc style credential_process helpers run through the shell and read
         # the user's keychain: PATH, HOME and USER must reach tofu.

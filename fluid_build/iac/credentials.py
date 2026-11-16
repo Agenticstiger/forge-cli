@@ -155,12 +155,39 @@ def backend_clouds(backend: Optional[Mapping[str, Any]]) -> Tuple[str, ...]:
     return tuple(_BACKEND_CLOUDS[kind] for kind in (backend or {}) if kind in _BACKEND_CLOUDS)
 
 
+#: Plugins already warned about (once per process).
+_WARNED: set = set()
+
+
+def _warn_undeclared(plugin: IacProviderPlugin) -> None:
+    """A plugin written before the allowlist (no ``credential_env_prefixes``) is named once."""
+    name = str(getattr(plugin, "name", None) or type(plugin).__name__)
+    if name in _WARNED:
+        return
+    _WARNED.add(name)
+    _LOG.warning(
+        json.dumps(
+            {
+                "event": "tofu_env_plugin_undeclared",
+                "plugin": name,
+                "message": (
+                    f"The IaC plugin {name} declares no credential_env_prefixes: tofu gets only "
+                    "its credential_env_vars and the basics. If its provider reads other "
+                    "variables, declare them (iac/base.py)."
+                ),
+            }
+        )
+    )
+
+
 def _allowance(
     plugin: Optional[IacProviderPlugin], clouds: Iterable[str]
 ) -> Tuple[FrozenSet[str], Tuple[str, ...]]:
     names = set(BASE_ENV_NAMES) | set(TOFU_ENV_NAMES)
     prefixes = list(TOFU_ENV_PREFIXES)
     if plugin is not None:
+        if getattr(plugin, "credential_env_prefixes", None) is None:
+            _warn_undeclared(plugin)
         names.update(getattr(plugin, "credential_env_vars", ()) or ())
         prefixes.extend(getattr(plugin, "credential_env_prefixes", ()) or ())
     for cloud in clouds:

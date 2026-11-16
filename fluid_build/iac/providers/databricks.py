@@ -2626,9 +2626,22 @@ def _use_catalog_notices(compiled: _Compiled) -> List[str]:
     return notices
 
 
-#: What a GitHub Actions job with ``permissions: id-token: write`` sets, and the
-#: Databricks SDK reads to mint a ``github-oidc`` token.
-_GITHUB_ID_TOKEN_REQUEST_VARS = ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+#: What the CI job sets and the Databricks SDK reads to mint each OIDC type's token
+#: (databricks-sdk-go ``config/experimental/auth/oidc``). They are no Databricks
+#: variables, so they reach ``tofu`` only for that auth type. ``env-oidc`` and
+#: ``file-oidc`` read ``DATABRICKS_OIDC_TOKEN`` / ``DATABRICKS_OIDC_TOKEN_FILEPATH``,
+#: which the plugin's ``DATABRICKS_`` family already passes.
+_OIDC_JOB_VARS = {
+    "github-oidc": ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"),
+    "azure-devops-oidc": (
+        "SYSTEM_ACCESSTOKEN",
+        "SYSTEM_TEAMFOUNDATIONCOLLECTIONURI",
+        "SYSTEM_PLANID",
+        "SYSTEM_JOBID",
+        "SYSTEM_TEAMPROJECTID",
+        "SYSTEM_HOSTTYPE",
+    ),
+}
 
 
 class DatabricksIacPlugin:
@@ -2697,14 +2710,13 @@ class DatabricksIacPlugin:
         environment's, or the one profile ``DATABRICKS_CONFIG_PROFILE`` names for
         ``DATABRICKS_HOST``; never a DEFAULT profile it happens to find.
 
-        With ``github-oidc`` the provider mints its token from the GitHub Actions
-        job's token request variables, which reach ``tofu`` for that method only
+        With ``github-oidc`` or ``azure-devops-oidc`` the provider mints its token
+        from the CI job's own variables, which reach ``tofu`` for that method only
         (the child environment is an allowlist, ``iac/credentials.py``)."""
         overlay = tofu_env_overlay(env)
-        if overlay.get("DATABRICKS_AUTH_TYPE") == "github-oidc":
-            for name in _GITHUB_ID_TOKEN_REQUEST_VARS:
-                if env.get(name):
-                    overlay[name] = str(env[name])
+        for name in _OIDC_JOB_VARS.get(str(overlay.get("DATABRICKS_AUTH_TYPE") or ""), ()):
+            if env.get(name):
+                overlay[name] = str(env[name])
         return overlay
 
     def discover_imports(
