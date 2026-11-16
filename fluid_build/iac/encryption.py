@@ -248,8 +248,8 @@ def require_supported_tofu(version: Optional[Tuple[int, ...]]) -> None:
         f"{STATE_ENCRYPTION_ENV} needs OpenTofu 1.11 or newer (ephemeral variables keep "
         f"the key out of the saved plan); this tofu is {found}.",
         (
-            "Upgrade OpenTofu (https://opentofu.org/docs/intro/install/), or re-run with "
-            "--ensure-opentofu",
+            "Upgrade OpenTofu to 1.11 or newer (https://opentofu.org/docs/intro/install/). "
+            "--ensure-opentofu installs a pinned build only when no tofu is on PATH",
         ),
     )
 
