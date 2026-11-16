@@ -25,10 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - An AWS task whose action no operator covers logs the action instead of raising "retired" at
     run time, as the GCP and Snowflake ones did.
   - `fluid generate-airflow` is a deprecated alias of `fluid generate schedule --scheduler
-    airflow` and says so once. `-o` is an output directory (a `.py` path still writes the one
-    DAG there). `--dag-id` and `--schedule` are gone: the contract's `orchestration.schedule` is
-    the one source. A contract with builds and no orchestration renders through its builds'
-    triggers; it no longer gets a DAG of `echo` placeholders.
+    airflow` and says so once. With no `-o` it still prints the one DAG to stdout; `-o` is an
+    output directory (written over, so a populated `dags/` works), or a `.py` path for a contract
+    that renders one DAG. It takes `--contract-path`, as `generate schedule` does, and must now
+    run from the project directory for a contract with scheduled builds. `--dag-id` and
+    `--schedule` are gone: the contract's `orchestration.schedule` is the one source. A contract
+    with builds and no orchestration renders through its builds' triggers; it no longer gets a
+    DAG of `echo` placeholders.
+  - A schedule written as a bare word (`hourly`, `daily`, `weekly`, `monthly`) is the Airflow
+    keyword of that name for AWS too. It used to map to cron: `daily` ran at 02:00, now at 00:00.
   - `generate_airflow_dag_taskflow` (AWS TaskFlow DAGs) is removed; nothing called it.
 
 ### Added

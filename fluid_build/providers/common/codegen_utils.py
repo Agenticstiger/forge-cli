@@ -205,9 +205,13 @@ def convert_schedule_to_airflow(schedule: str) -> str:
     """
     schedule_lower = schedule.lower().strip()
 
-    # Airflow native keywords
-    if schedule_lower in ("@hourly", "@daily", "@weekly", "@monthly", "@yearly", "@once"):
-        return schedule_lower
+    # Airflow native keywords, with or without the ``@`` (the AWS generator
+    # accepted the bare words; they must not fall through to the daily default).
+    bare = schedule_lower.lstrip("@")
+    if bare == "annually":
+        bare = "yearly"
+    if bare in ("hourly", "daily", "weekly", "monthly", "yearly", "once"):
+        return f"@{bare}"
 
     # Pass through cron expressions
     if schedule.count(" ") >= 4:

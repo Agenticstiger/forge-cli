@@ -281,3 +281,41 @@ def test_generate_airflow_names_one_successor_and_refuses_a_file_for_many_dags(
     assert "fluid generate schedule --scheduler airflow" in caplog.text
     assert "fluid export" not in caplog.text
     assert len(list((tmp_path / "dags").glob("*_dag.py"))) == 1
+
+
+def test_render_dag_refuses_a_contract_without_orchestration_or_tasks():
+    with pytest.raises(ValueError, match="orchestration"):
+        render_dag({"id": "x"}, provider="aws")
+    with pytest.raises(ValueError, match="no tasks"):
+        render_dag({"id": "x", "orchestration": {"tasks": []}}, provider="aws")
+
+
+def test_generate_airflow_writes_into_a_populated_dags_folder(tmp_path, monkeypatch):
+    from fluid_build.cli import generate_airflow
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "dags").mkdir()
+    (tmp_path / "dags" / "other_dag.py").write_text("# keep\n")
+    contract_path = tmp_path / "contract.fluid.yaml"
+    contract_path.write_text(yaml.safe_dump(_valid_for_export("gcp")), encoding="utf-8")
+    args = argparse.Namespace(
+        contract=str(contract_path), output="dags", env=None, verbose=False, contract_path=None
+    )
+    assert generate_airflow.run(args, LOG) == 0
+    assert (tmp_path / "dags" / "other_dag.py").read_text() == "# keep\n"
+    assert len(list((tmp_path / "dags").glob("golden_*_dag.py"))) == 1
+
+
+def test_generate_airflow_without_output_prints_only_the_dag(tmp_path, monkeypatch, capsys):
+    from fluid_build.cli import generate_airflow
+
+    monkeypatch.chdir(tmp_path)
+    contract_path = tmp_path / "contract.fluid.yaml"
+    contract_path.write_text(yaml.safe_dump(_valid_for_export("gcp")), encoding="utf-8")
+    args = argparse.Namespace(
+        contract=str(contract_path), output=None, env=None, verbose=False, contract_path=None
+    )
+    assert generate_airflow.run(args, LOG) == 0
+    out = capsys.readouterr().out
+    compile(out, "dag", "exec")
+    assert not (tmp_path / "dags").exists()

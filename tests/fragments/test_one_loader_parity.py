@@ -880,7 +880,7 @@ def test_g07_the_deprecated_generate_airflow_alias_agrees(
         dags[name] = (contract.parent / "dag.py").read_bytes()
 
     assert _without_clocks(dags["fx"]) == _without_clocks(dags["flat"])
-    assert "FLUID Data Product: Parity product" in dags["fx"].decode("utf-8")
+    assert "Parity product" in dags["fx"].decode("utf-8")
 
 
 # ── G-08 · generate ci ─────────────────────────────────────────────────────

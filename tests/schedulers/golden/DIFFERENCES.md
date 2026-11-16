@@ -25,6 +25,7 @@ difference follows, with why it is right.
 | `aws.glue.<other op>` (for example `run_job`) became a task that raised "provider-action tasks are retired" at run time | `GlueJobOperator` | The scheduler already rendered it that way, and `aws.glue.run_job` is what a Glue build synthesises to. |
 | An action with no operator raised at run time through `_execute_provider_action` | A task that logs the action and params | What the GCP and Snowflake generators and the scheduler always did. This is a loss of loudness: a task for an action nothing renders now succeeds. |
 | `aws.athena.execute_query` only; `outputLocation` only | Any `aws.athena.*` op; `output_location` or `outputLocation` | The scheduler took any op; both spellings are in contracts. With no location, the account bucket when the account is known, else `s3://results/`. |
+| Schedule `hourly`/`daily`/`weekly`/`monthly` mapped to cron (`0 * * * *`, `0 2 * * *`, `0 2 * * 0`, `0 2 1 * *`); any other word passed through | The Airflow keyword (`@hourly`, `@daily`, `@weekly`, `@monthly`); any other word is `@daily` | The shared converter, as GCP and Snowflake already had. `daily` runs at 00:00, not 02:00. Cron strings are unchanged. |
 | `_execute_provider_action` helper in every file | Gone | It only raised. The Glue Data Catalog helpers are emitted only when a task calls them. |
 | TaskFlow variant `generate_airflow_dag_taskflow` | Gone | Nothing but its own tests called it. |
 
