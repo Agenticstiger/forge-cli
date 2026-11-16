@@ -261,25 +261,77 @@ def parse_stream(spec: Any, where: str = "properties.stream") -> Stream:
     return Stream(topic, fmt, value, key_format, key, prefix, tuple(metadata))
 
 
+def _needs_read(dtype: LogicalType | None) -> bool:
+    """Whether a CAST would not do: a struct, a required value, or one inside."""
+    if dtype is None:
+        return False
+    return (
+        dtype.kind == "struct"
+        or dtype.required
+        or _needs_read(dtype.element)
+        or _needs_read(dtype.value)
+    )
+
+
+def _spark_read(sql: str, dtype: LogicalType, label: str, depth: int = 0) -> str:
+    """``sql`` read as ``dtype``: a struct field by field, by name; a required value checked.
+
+    Spark casts one struct to another by position, so a decoded record whose struct
+    holds the same fields in another order (an Avro writer schema's order) would swap
+    their values under a CAST. Reading each field by name keeps them apart. A null
+    struct stays null, and arrays and map values are read element by element.
+
+    Spark types carry no NOT NULL, so a required value the record holds as null (a
+    JSON record without the field) fails the job with ``raise_error``, as Flink fails
+    a NOT NULL column; a required field of a null struct is not read.
+    """
+    if dtype.kind == "struct":
+        cells = ", ".join(
+            f"{_spark_literal(name)}, "
+            f"{_spark_read(f'{sql}.`{name}`', child, f'{label}.{name}', depth)}"
+            for name, child in dtype.fields
+        )
+        read = f"named_struct({cells})"
+        if not dtype.required:
+            return f"CASE WHEN {sql} IS NULL THEN NULL ELSE {read} END"
+    elif dtype.kind == "array" and dtype.element is not None and _needs_read(dtype.element):
+        var = f"`fluid_e{depth}`"
+        element = _spark_read(var, dtype.element, f"{label}[]", depth + 1)
+        read = f"transform({sql}, {var} -> {element})"
+    elif dtype.kind == "map" and dtype.value is not None and _needs_read(dtype.value):
+        key, var = f"`fluid_k{depth}`", f"`fluid_v{depth}`"
+        value = _spark_read(var, dtype.value, f"{label}[]", depth + 1)
+        read = f"transform_values({sql}, ({key}, {var}) -> {value})"
+    else:
+        read = f"CAST({sql} AS {spark_type(dtype)})"
+    if not dtype.required:
+        return read
+    message = _spark_literal(f"fluid: required field {label} is null in a Kafka record")
+    return f"CASE WHEN {sql} IS NULL THEN raise_error({message}) ELSE {read} END"
+
+
 def spark_source_select(stream: Stream, where: str = "properties.stream") -> str:
     """The Spark query that makes ``source_events`` from the decoded Kafka records.
 
     The runner registers :data:`SPARK_RECORDS_TABLE`: the Kafka source's columns, with
     ``value`` decoded into a struct and ``key`` decoded into one (a raw key stays the
-    record's bytes). Every column is cast to its declared type, so a registry schema
-    that differs from the declared one fails at the job's start, not row by row.
+    record's bytes). Every column is read as its declared type, structs field by field
+    by name (:func:`_spark_read`), so a field the decoded record lacks fails the query
+    at the job's start. The runner checks the decoded types against the declared ones
+    before it runs this, because a Spark cast that loses data returns null instead of
+    failing.
     """
     columns = [
-        f"CAST(`value`.`{name}` AS {spark_type(dtype)}) AS `{name}`" for name, dtype in stream.value
+        f"{_spark_read(f'`value`.`{name}`', dtype, name)} AS `{name}`"
+        for name, dtype in stream.value
     ]
     if stream.key_format == "raw":
         ((name, dtype),) = stream.key
-        source = "`key`" if dtype.kind == "binary" else "CAST(`key` AS STRING)"
-        columns.append(f"{source} AS `{name}`")
+        columns.append(f"{_spark_read('`key`', dtype, f'key {name}')} AS `{name}`")
     else:
         prefix = len(stream.key_prefix)
         columns.extend(
-            f"CAST(`key`.`{name[prefix:]}` AS {spark_type(dtype)}) AS `{name}`"
+            f"{_spark_read(f'`key`.`{name[prefix:]}`', dtype, f'key {name}')} AS `{name}`"
             for name, dtype in stream.key
         )
     for name, source in stream.metadata:

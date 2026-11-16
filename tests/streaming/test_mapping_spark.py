@@ -305,21 +305,49 @@ def test_flink_refuses_mask_at_ingest_by_name():
 # ── the source table, from Spark's Kafka columns ────────────────────────
 
 
-def test_value_fields_are_cast_to_their_declared_types():
+def test_value_fields_are_read_as_their_declared_types():
     sql = spark_source_select(stream())
     _parses(sql)
     assert sql == (
         "SELECT\n  "
-        "CAST(`value`.`event_id` AS STRING) AS `event_id`,\n  "
-        "CAST(`value`.`customer` AS STRUCT<`id`: STRING, `address`: STRUCT<`country`: STRING>>) "
+        "CASE WHEN `value`.`event_id` IS NULL THEN raise_error('fluid: required field event_id "
+        "is null in a Kafka record') ELSE CAST(`value`.`event_id` AS STRING) END AS `event_id`,\n  "
+        "CASE WHEN `value`.`customer` IS NULL THEN NULL ELSE named_struct("
+        "'id', CAST(`value`.`customer`.`id` AS STRING), "
+        "'address', CASE WHEN `value`.`customer`.`address` IS NULL THEN NULL ELSE named_struct("
+        "'country', CAST(`value`.`customer`.`address`.`country` AS STRING)) END) END "
         "AS `customer`,\n  "
-        "CAST(`value`.`items` AS ARRAY<STRUCT<`sku`: STRING, `price`: DECIMAL(18,2)>>) AS `items`,\n  "
+        "transform(`value`.`items`, `fluid_e0` -> CASE WHEN `fluid_e0` IS NULL THEN NULL "
+        "ELSE named_struct('sku', CAST(`fluid_e0`.`sku` AS STRING), "
+        "'price', CAST(`fluid_e0`.`price` AS DECIMAL(18,2))) END) AS `items`,\n  "
         "CAST(`value`.`tags` AS ARRAY<STRING>) AS `tags`,\n  "
         "CAST(`value`.`attributes` AS MAP<STRING, STRING>) AS `attributes`,\n  "
         "CAST(`value`.`quantity` AS INT) AS `quantity`,\n  "
         "CAST(`value`.`event_time` AS TIMESTAMP) AS `event_time`"
         "\nFROM `kafka_records`"
     )
+
+
+def test_a_struct_is_read_by_field_name_not_position():
+    """Spark casts a struct by position: an Avro writer schema that orders the fields
+    differently would swap their values under a CAST, so each is read by name."""
+    nested = col(
+        "outer",
+        "array",
+        element={
+            "type": "map",
+            "key": {"type": "string", "required": True},
+            "value": {"type": "struct", "fields": [col("id", "string"), col("email", "string")]},
+        },
+    )
+    sql = spark_source_select(stream(schema=[nested]))
+    _parses(sql)
+    assert "CAST(`value`.`outer`" not in sql
+    assert (
+        "transform(`value`.`outer`, `fluid_e0` -> transform_values(`fluid_e0`, "
+        "(`fluid_k1`, `fluid_v1`) -> CASE WHEN `fluid_v1` IS NULL THEN NULL ELSE named_struct("
+        "'id', CAST(`fluid_v1`.`id` AS STRING), 'email', CAST(`fluid_v1`.`email` AS STRING)) END))"
+    ) in sql
 
 
 def test_a_json_key_reads_its_fields_under_the_prefix():
@@ -330,7 +358,8 @@ def test_a_json_key_reads_its_fields_under_the_prefix():
 
 
 @pytest.mark.parametrize(
-    ("type_", "expected"), [("string", "CAST(`key` AS STRING)"), ("binary", "`key`")]
+    ("type_", "expected"),
+    [("string", "CAST(`key` AS STRING)"), ("binary", "CAST(`key` AS BINARY)")],
 )
 def test_a_raw_key_is_the_record_key(type_, expected):
     key = {"format": "raw", "schema": [col("record_key", type_)]}
@@ -407,3 +436,29 @@ def test_a_map_key_spark_would_substitute_is_refused():
     mapping = {"columns": [{"name": "channel", "from": "attributes['${env:SECRET}']"}]}
     with pytest.raises(ValueError, match="cannot be a Spark string literal"):
         spark(mapping, [col("channel", "string")])
+
+
+def test_a_required_field_the_record_holds_as_null_fails_the_job():
+    """Spark types carry no NOT NULL: a required field is checked as it is read, inside
+    a nullable struct only when the struct is there, and inside arrays element by element."""
+    schema = [
+        col(
+            "customer",
+            "struct",
+            fields=[col("id", "string", required=True)],
+        ),
+        col("tags", "array", element={"type": "string", "required": True}),
+    ]
+    sql = spark_source_select(stream(schema=schema))
+    _parses(sql)
+    assert (
+        "CASE WHEN `value`.`customer` IS NULL THEN NULL ELSE named_struct('id', "
+        "CASE WHEN `value`.`customer`.`id` IS NULL THEN raise_error('fluid: required field "
+        "customer.id is null in a Kafka record') ELSE CAST(`value`.`customer`.`id` AS STRING) "
+        "END) END AS `customer`"
+    ) in sql
+    assert (
+        "transform(`value`.`tags`, `fluid_e0` -> CASE WHEN `fluid_e0` IS NULL THEN "
+        "raise_error('fluid: required field tags[] is null in a Kafka record') "
+        "ELSE CAST(`fluid_e0` AS STRING) END) AS `tags`"
+    ) in sql
