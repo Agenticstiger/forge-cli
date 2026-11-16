@@ -127,6 +127,55 @@ def _sanitize_name(raw: str) -> str:
     return metricflow_name(raw)
 
 
+#: The semantics collections the bridge maps. The schema requires each to be a list.
+_COLLECTIONS = ("entities", "dimensions", "measures", "metrics")
+
+
+def _listed_collections(semantics: Mapping[str, Any], expose_id: Any) -> Mapping[str, Any]:
+    """``semantics`` with each collection that is not a list read as empty, with a warning.
+
+    ``fluid generate`` also runs on contracts nobody validated. ``fluid validate`` reads such a
+    collection as empty too, and leaves the error to the schema.
+    """
+    malformed = [
+        key for key in _COLLECTIONS if key in semantics and not isinstance(semantics[key], list)
+    ]
+    if not malformed:
+        return semantics
+    for key in malformed:
+        logger.warning(
+            "semantic_models: expose %r: semantics.%s is %s, not a list, so it is read as empty "
+            "(fluid validate reports the schema error)",
+            expose_id,
+            key,
+            _yaml_kind(semantics[key]),
+        )
+    return {**semantics, **{key: [] for key in malformed}}
+
+
+def _yaml_kind(value: Any) -> str:
+    """What ``value`` is, in the words of the YAML a contract is written in."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, (int, float)):
+        return "a number"
+    if isinstance(value, str):
+        return "a string"
+    if isinstance(value, Mapping):
+        return "a mapping"
+    return f"a {type(value).__name__}"
+
+
+def _input_metrics(raw: Mapping[str, Any]) -> List[str]:
+    """A metric's ``inputMetrics`` as MetricFlow names; empty when it is not a list."""
+    names = raw.get("inputMetrics")
+    return (
+        [_sanitize_name(m) for m in names if _sanitize_name(m)] if isinstance(names, list) else []
+    )
+
+
 def _schema_columns(expose: Mapping[str, Any]) -> List[Dict[str, Any]]:
     contract_section = get_expose_contract(expose) or {}
     cols = contract_section.get("schema", [])
@@ -551,9 +600,7 @@ def _build_metrics(
                 continue
             type_params = {"measure": measure}
         elif mtype == "ratio":
-            input_metrics = [
-                _sanitize_name(m) for m in raw.get("inputMetrics") or [] if _sanitize_name(m)
-            ]
+            input_metrics = _input_metrics(raw)
             numerator = _sanitize_name(raw.get("numerator") or "") or (
                 input_metrics[0] if len(input_metrics) >= 1 else ""
             )
@@ -571,9 +618,7 @@ def _build_metrics(
             type_params = {"numerator": numerator, "denominator": denominator}
         elif mtype == "derived":
             expr = str(raw.get("expr") or "").strip()
-            input_metrics = [
-                _sanitize_name(m) for m in raw.get("inputMetrics") or [] if _sanitize_name(m)
-            ]
+            input_metrics = _input_metrics(raw)
             if not expr or not input_metrics:
                 logger.warning(
                     "semantic_models: dropping derived metric %r on %s "
@@ -791,6 +836,7 @@ def generate_semantic_models(
         if not model_name or model_name in model_names_taken:
             continue
 
+        semantics = _listed_collections(semantics, expose_id)
         window = _model_window(semantics, expose_id)
         entities = _build_entities(semantics, expose, model_name, window)
         if not entities:

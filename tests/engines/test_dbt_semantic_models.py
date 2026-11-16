@@ -21,11 +21,13 @@ Pins the card's acceptance criteria:
 from __future__ import annotations
 
 import copy
+import logging
 import shutil
 import subprocess
 import sys
+from argparse import Namespace
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 import yaml
@@ -368,16 +370,6 @@ class TestDefaultingRules:
         doc = _emit(_contract(semantics=semantics))
         assert "metrics" not in doc
 
-    def test_duplicate_element_names_dropped_first_wins(self):
-        # A measure named like an existing dimension collides in
-        # MetricFlow's per-model namespace → the measure is dropped.
-        semantics = _semantics()
-        semantics["measures"].append({"name": "status", "agg": "sum", "expr": "amount"})
-        doc = _emit(_contract(semantics=semantics))
-        measures = [m["name"] for m in _model(doc)["measures"]]
-        assert "status" not in measures
-        assert measures == ["order_total", "order_count"]
-
     def test_names_sanitized_for_metricflow(self):
         semantics = _semantics(
             measures=[{"name": "order total ($)", "agg": "sum", "expr": "amount"}],
@@ -387,6 +379,43 @@ class TestDefaultingRules:
         (measure,) = _model(doc)["measures"]
         assert measure["name"] == "order_total"
         assert doc["metrics"][0]["type_params"] == {"measure": "order_total"}
+
+
+@pytest.mark.unit
+class TestOneNamespacePerModel:
+    """MetricFlow holds one element per name in a model; ``fluid validate`` warns."""
+
+    @pytest.mark.parametrize(
+        "collection, entry, kept",
+        [
+            # A measure named like a dimension: the measure is dropped.
+            ("measures", {"name": "status", "agg": "sum", "expr": "amount"}, "dimensions"),
+            # A dimension named like an entity: the dimension is dropped.
+            ("dimensions", {"name": "customer", "type": "categorical"}, "entities"),
+            # A second dimension of one MetricFlow name: the second is dropped.
+            ("dimensions", {"name": "status!", "type": "categorical", "expr": "y"}, "dimensions"),
+        ],
+    )
+    def test_duplicate_element_names_dropped_first_wins(self, collection, entry, kept):
+        # The first keeps the name: entities, then dimensions, then measures.
+        semantics = _semantics()
+        first = next(
+            dict(element)
+            for kind in ("entities", "dimensions")
+            for element in semantics[kind]
+            if element["name"] == entry["name"].rstrip("!")
+        )
+        semantics[collection].append(entry)
+        model = _model(_emit(_contract(semantics=semantics)))
+        named = [
+            (kind, element)
+            for kind in ("entities", "dimensions", "measures")
+            for element in model.get(kind, [])
+            if element["name"] == first["name"]
+        ]
+        assert [(kind, element.get("expr")) for kind, element in named] == [
+            (kept, first.get("expr"))
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -967,3 +996,213 @@ def test_a_window_bound_that_shares_a_name_drops_the_window(caplog):
     assert all("validity_params" not in (d.get("type_params") or {}) for d in model["dimensions"])
     assert "primary_entity" not in model
     assert "do not form a validity window" in caplog.text
+
+
+def _generate_with_dbt_validate(contract: Dict[str, Any], tmp_path: Path) -> Tuple[int, Path]:
+    """``fluid generate transformation --dbt-validate`` on ``contract``: (exit code, project).
+
+    The gate runs a real ``dbt parse`` on the generated project and fails the command when it
+    does; dbt's own message goes to stdout.
+    """
+    if _find_dbt() is None:
+        pytest.skip("dbt CLI not available")
+    from fluid_build.cli.generate_speed_transformation import run
+
+    contract_path = tmp_path / "contract.fluid.yaml"
+    contract_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+    out_dir = tmp_path / "dbt_project"
+    args = Namespace(
+        list_engines=False,
+        contract=str(contract_path),
+        output=str(out_dir),
+        build_index=0,
+        model=None,
+        all_builds=False,
+        concurrency=1,
+        overwrite=True,
+        env=None,
+        verbose=False,
+        dbt_validate=True,
+    )
+    return run(args, logging.getLogger(__name__)), out_dir
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_a_forged_contract_exports_each_foreign_entity_on_its_from_model(tmp_path: Path):
+    """``fluid forge data-model`` (one expose per dataset) through ``dbt parse``."""
+    import json
+
+    from fluid_build.copilot.schemas.osi import (
+        OSIDataset,
+        OSIDimension,
+        OSIExpression,
+        OSIExpressionDialect,
+        OSIField,
+        OSIMetric,
+        OSIRelationship,
+        OSISemanticModel,
+    )
+    from fluid_build.copilot.schemas.stage_outputs import ConceptualDraft, LogicalDraft
+    from fluid_build.forge_datamodel.emit.fluid_contract import build_contract_from_logical
+    from fluid_build.forge_datamodel.semantics_builder import validate_semantics_block
+
+    def dataset(name: str, key: str, *columns: str, timed: str = "") -> OSIDataset:
+        fields = [OSIField(name=column) for column in (key, *columns)]
+        if timed:
+            fields.append(OSIField(name=timed, dimension=OSIDimension(is_time=True, grain="day")))
+        return OSIDataset(name=name, source=name, primary_key=[key], fields=fields)
+
+    def relationship(source: str, target: str, column: str) -> OSIRelationship:
+        return OSIRelationship(
+            name=f"{source}_to_{target}",
+            **{"from": source, "to": target},
+            from_columns=[column],
+            to_columns=[column],
+        )
+
+    revenue = OSIExpression(
+        dialects=[OSIExpressionDialect(dialect="ANSI_SQL", expression="SUM(amount)")]
+    )
+    osi = OSISemanticModel(
+        name="shop",
+        datasets=[
+            dataset("orders", "order_id", "customer_id", "amount", timed="ordered_at"),
+            dataset("customers", "customer_id", "segment"),
+            dataset("order_lines", "line_id", "order_id", "quantity"),
+        ],
+        relationships=[
+            relationship("orders", "customers", "customer_id"),
+            relationship("order_lines", "orders", "order_id"),
+        ],
+        metrics=[OSIMetric(name="revenue", expression=revenue)],
+    )
+    contract = build_contract_from_logical(
+        LogicalDraft(
+            name="shop",
+            description="Shop",
+            technique="flat",
+            osi=osi,
+            conceptual=ConceptualDraft(name="shop"),
+        )
+    )
+    assert validate_semantics_block(contract) == ([], [])
+    exit_code, out_dir = _generate_with_dbt_validate(contract, tmp_path)
+    assert exit_code == 0
+    manifest = json.loads((out_dir / "target" / "semantic_manifest.json").read_text())
+    assert [m["name"] for m in manifest["metrics"]] == ["revenue"]
+    foreign = {
+        model["name"]: [
+            (entity["name"], entity["expr"])
+            for entity in model["entities"]
+            if entity["type"] == "foreign"
+        ]
+        for model in manifest["semantic_models"]
+    }
+    assert foreign == {
+        "orders": [("customer", "customer_id")],
+        "customers": [],
+        "order_lines": [("order", "order_id")],
+    }
+
+
+def _region_clash_contract(*, with_metric: bool) -> Dict[str, Any]:
+    """``region`` is a dimension of orders and an entity of stores."""
+    semantics = _semantics(entities=[{"name": "order", "type": "primary", "expr": "order_id"}])
+    semantics["dimensions"].append({"name": "region", "type": "categorical"})
+    if not with_metric:
+        semantics.pop("measures")
+        semantics.pop("metrics")
+    contract = _contract(semantics=semantics)
+    contract["exposes"][0]["contract"]["schema"].append({"name": "region", "type": "STRING"})
+    contract["exposes"].append(
+        {
+            "exposeId": "stores",
+            "kind": "table",
+            "contract": {
+                "schema": [
+                    {"name": "store_id", "type": "STRING", "primaryKey": True},
+                    {"name": "region_id", "type": "STRING"},
+                ]
+            },
+            "semantics": {
+                "entities": [
+                    {"name": "store", "type": "primary", "expr": "store_id"},
+                    {"name": "region", "type": "foreign", "expr": "region_id"},
+                ]
+            },
+        }
+    )
+    return contract
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+class TestLiveElementNames:
+    """What ``fluid validate``'s name warnings say about dbt, against a real ``dbt parse``."""
+
+    def test_a_dimension_named_like_another_model_s_entity_fails_dbt_parse(
+        self, tmp_path: Path, capsys
+    ):
+        from fluid_build.forge_datamodel.semantics_builder import validate_semantics_block
+
+        contract = _region_clash_contract(with_metric=True)
+        _, warnings = validate_semantics_block(contract)
+        assert any("`dbt parse` rejects the export" in w for w in warnings), warnings
+        exit_code, _ = _generate_with_dbt_validate(contract, tmp_path)
+        # The console wraps dbt's lines at the terminal width, so match across the breaks.
+        output = " ".join(capsys.readouterr().out.split())
+        assert exit_code != 0, output
+        assert "element `region` is of type" in output and "across the model" in output, output
+
+    def test_dbt_checks_element_types_only_when_a_metric_exists(self, tmp_path: Path):
+        contract = _region_clash_contract(with_metric=False)
+        assert _generate_with_dbt_validate(contract, tmp_path)[0] == 0
+
+
+@pytest.mark.unit
+class TestCollectionsThatAreNotLists:
+    """The schema requires lists; an unvalidated contract can hold anything there."""
+
+    @pytest.mark.parametrize("key", ["entities", "dimensions", "measures", "metrics"])
+    @pytest.mark.parametrize(
+        "value, kind",
+        [
+            (5, "a number"),
+            (True, "a boolean"),
+            (1.5, "a number"),
+            ("status", "a string"),
+            ({"name": "status"}, "a mapping"),
+            (None, "null"),
+        ],
+    )
+    def test_a_collection_that_is_not_a_list_is_read_as_empty(self, key, value, kind, caplog):
+        semantics = _semantics()
+        semantics[key] = value
+        with caplog.at_level("WARNING"):
+            doc = _emit(_contract(semantics=semantics))
+        assert f"semantics.{key} is {kind}, not a list" in caplog.text
+        names = {
+            kind: [element["name"] for element in _model(doc).get(kind, [])]
+            for kind in ("entities", "dimensions", "measures")
+        }
+        names["metrics"] = [metric["name"] for metric in doc.get("metrics", [])]
+        assert (
+            names[key]
+            == {
+                "entities": ["order"],  # the primary entity derived from the key column
+                "dimensions": ["ordered_at"],  # defaultAggTimeDimension, from its schema column
+                "measures": [],
+                "metrics": [],
+            }[key]
+        )
+
+    def test_input_metrics_that_are_not_a_list(self):
+        semantics = _semantics()
+        semantics["metrics"][3]["inputMetrics"] = 7  # the derived metric
+        doc = _emit(_contract(semantics=semantics))
+        assert "order_total_2x" not in [m["name"] for m in doc["metrics"]]
+        ratio = dict(semantics["metrics"][2], inputMetrics=7)
+        semantics["metrics"][2] = ratio
+        doc = _emit(_contract(semantics=semantics))
+        assert _metric(doc, "avg_order_value")["type_params"]["numerator"] == "order_total"
