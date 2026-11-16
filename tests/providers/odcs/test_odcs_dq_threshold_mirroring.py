@@ -94,3 +94,30 @@ def test_less_than_operator_on_a_full_share_is_not_the_zero_shortcut() -> None:
 
 def test_operator_without_threshold_falls_back_to_zero() -> None:
     assert _cmp(_export("uniqueness", operator="<=")) == {"mustBe": 0}
+
+
+def test_a_threshold_without_an_operator_reads_as_at_least() -> None:
+    # ``util/dq_checks.py`` (what ``fluid test`` runs) defaults the operator to ``>=``, so a bare
+    # 0.95 is "at least 95% pass", not "every row".
+    check = _export("completeness", threshold=0.95)
+    assert check["unit"] == "percent"
+    assert _cmp(check) == {"mustBeLessOrEqualTo": 5}
+    assert _cmp(_export("completeness", threshold=1.0)) == {"mustBe": 0}
+
+
+@pytest.mark.parametrize("threshold", [99, -0.1, 1.5, "high", float("nan"), float("inf"), True])
+def test_a_threshold_that_is_not_a_share_is_not_exported(threshold: Any) -> None:
+    # ``fluid test`` refuses these; exporting 1 - 99 = -9800 percent would be nonsense.
+    check, reason = _dq_rule_to_quality(
+        {"type": "completeness", "selector": "c", "threshold": threshold, "operator": ">="}
+    )
+    assert check is None
+    assert "share of rows" in reason
+
+
+def test_an_unknown_operator_is_not_exported() -> None:
+    check, reason = _dq_rule_to_quality(
+        {"type": "completeness", "selector": "c", "threshold": 0.9, "operator": "~"}
+    )
+    assert check is None
+    assert "'~'" in reason

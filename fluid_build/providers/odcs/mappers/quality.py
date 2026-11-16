@@ -58,6 +58,7 @@ through a real contract resolver and a real DQ engine.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping, MutableMapping
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -308,9 +309,9 @@ def _attach_declared_quality(
             ctx.logger.warning(
                 "dq rule %r (type %r) on expose %r has no ODCS v3.1.0 quality form: %s. "
                 "It is NOT exported as ODCS quality; it rides along verbatim under "
-                "customProperties.fluidExtras so nothing is lost. Restate it as a dq rule "
-                "of type completeness, uniqueness, valid_values or freshness to have it "
-                "exported, or keep running it with your own engine.",
+                "customProperties.fluidExtras so nothing is lost. Fix what the reason names, "
+                "restate it as a dq rule of type completeness, uniqueness, valid_values or "
+                "freshness to have it exported, or keep running it with your own engine.",
                 rule.get("id"),
                 rule.get("type"),
                 expose_id,
@@ -382,8 +383,11 @@ def _dq_rule_to_quality(rule: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any
     library = _DQ_LIBRARY_METRICS.get(rule_type)
     if library:
         metric, dimension = library
+        comparison, reason = _dq_threshold(rule)
+        if comparison is None:
+            return None, reason
         check: Dict[str, Any] = {"type": "library", "metric": metric, "dimension": dimension}
-        check.update(_dq_threshold(rule))
+        check.update(comparison)
         check["description"] = description or (f"{rule_type} check on {selector or 'the dataset'}")
         _dq_severity(check, rule)
         return check, ""
@@ -416,37 +420,47 @@ def _dq_rule_to_quality(rule: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any
     )
 
 
-def _dq_threshold(rule: Mapping[str, Any]) -> Dict[str, Any]:
-    """The rule's ODCS comparison: exactly one operator key, plus ``unit`` when it is a share.
+def _dq_threshold(rule: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
+    """The rule's ODCS comparison, or ``(None, reason)`` when its threshold is not a share.
 
-    FLUID's ``threshold`` for completeness, uniqueness and valid_values is the share of rows
-    that PASS (``util/dq_checks.py``): ``1.0`` with ``>=`` means every row. The ODCS metrics
-    these map to (``nullValues``, ``duplicateValues``, ``invalidValues``) count the BAD rows, so
-    copying the threshold across would invert the rule. Instead:
+    The comparison is exactly one operator key, plus ``unit`` when it is a share. FLUID's
+    ``threshold`` for completeness, uniqueness and valid_values is the share of rows that PASS,
+    from 0 to 1, compared with ``operator`` (default ``>=``), as ``util/dq_checks.py`` reads it
+    for ``fluid test``: ``1.0`` with ``>=`` means every row. The ODCS metrics these map to
+    (``nullValues``, ``duplicateValues``, ``invalidValues``) count the BAD rows, so copying the
+    threshold across would invert the rule. Instead:
 
     * no threshold, or ``1.0`` with ``>=``/``==``: ``mustBe: 0``, a count of bad rows;
-    * anything else: the comparison is mirrored onto the bad share, as a percentage
+    * a share: the comparison is mirrored onto the bad share, as a percentage
       (``>= 0.95`` -> ``mustBeLessOrEqualTo: 5`` with ``unit: percent``), the same arithmetic
-      the SodaCL exporter does.
-
-    An operator with no threshold falls back to ``mustBe: 0`` rather than an operator with no
-    value, which no ODCS consumer could evaluate.
+      the SodaCL exporter does;
+    * a threshold that is not a finite number from 0 to 1, or an operator FLUID does not have:
+      not exported, the same rules ``fluid test`` refuses.
     """
     threshold = rule.get("threshold")
-    op = rule.get("operator") or ""
+    op = str(rule.get("operator") or ">=").strip()
     mirrored = _DQ_MIRRORED_OPERATORS.get(op)
-    if mirrored is None or threshold is None or isinstance(threshold, bool):
-        return {"mustBe": 0}
-    try:
-        share = float(threshold)
-    except (TypeError, ValueError):
-        return {"mustBe": 0}
+    if mirrored is None:
+        return None, f"its operator {op!r} is not one of {', '.join(_DQ_MIRRORED_OPERATORS)}"
+    if threshold is None:
+        return {"mustBe": 0}, ""
+    share: Optional[float] = None
+    if not isinstance(threshold, bool):
+        try:
+            share = float(threshold)
+        except (TypeError, ValueError):
+            share = None
+    if share is None or not math.isfinite(share) or not 0.0 <= share <= 1.0:
+        return None, (
+            f"its threshold {threshold!r} is not a share of rows from 0 to 1 "
+            "(write 0.99, not 99), so there is no bad share to compare"
+        )
     if share == 1.0 and op in (">=", "=="):
-        return {"mustBe": 0}
-    bad_percent = round((1.0 - share) * 100, 6)
+        return {"mustBe": 0}, ""
+    bad_percent: float = round((1.0 - share) * 100, 6)
     if bad_percent == int(bad_percent):
         bad_percent = int(bad_percent)
-    return {mirrored: bad_percent, "unit": "percent"}
+    return {mirrored: bad_percent, "unit": "percent"}, ""
 
 
 def _dq_severity(check: Dict[str, Any], rule: Mapping[str, Any]) -> None:

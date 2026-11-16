@@ -379,6 +379,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **ODCS exports inverted completeness, uniqueness and valid_values thresholds.** FLUID's
+  `threshold` is the share of rows that pass; ODCS `nullValues`, `duplicateValues` and
+  `invalidValues` count the rows that fail, and the export copied the threshold across, so
+  `threshold: 1.0, operator: ">="` came out as "at least one null". A full share now exports
+  `mustBe: 0`, and any other share is mirrored onto the failing share as a percentage
+  (`>= 0.95` becomes `mustBeLessOrEqualTo: 5` with `unit: percent`), the arithmetic the SodaCL
+  exporter already did. A threshold without an operator reads as `>=`, as `fluid test` reads
+  it; one that is not a share from 0 to 1 is not exported, with a warning. Every ODCS export
+  is affected, including the contracts `fluid publish --target datamesh-manager` sends.
 - **`fluid forge data-model` gave every expose the foreign entity of every relationship.** In
   the one-expose-per-dataset shape, the target of a relationship got a foreign entity on its own
   key, and the other exposes one on a column they do not have, and `fluid generate
