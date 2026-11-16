@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Schema 0.7.7 (preview): semantic relationships and SCD validity windows**
+  (RFC-semantics-tier1 §4 and §5). `exposes[].semantics.relationships[]`
+  (`$defs.semanticRelationship`) names a foreign key from the declaring expose, the many side,
+  to an expose of the same contract: `{name, to, fromColumns, toColumns, cardinality, joinType}`,
+  the column lists ordered and paired by position, so a composite key is one relationship
+  (Apache Ossie's `Relationship` shape; `cardinality` is `many_to_one` or `one_to_one`,
+  `joinType` `left` or `inner`, default `left`). `dimensions[].typeParams.validityParams`
+  (`{isStart}` / `{isEnd}`, field for field dbt's `validity_params`) marks the two bounds of a
+  type II slowly changing dimension. `fluid validate` checks what the schema cannot: the target
+  is an expose of the contract, the lists have one length, every column is one its expose
+  declares, names differ within an expose, and a window is two time dimensions (one `isStart`,
+  one `isEnd`) beside one `natural` entity. Errors. A one-column relationship with no matching
+  entity pair warns, because the dbt export joins by entity name. A 0.7.6 contract that uses
+  either field is told to declare 0.7.7.
+  - `fluid generate transformation` exports a window to MetricFlow field for field, in dbt's SCD
+    type II shape (`primary_entity:` names the natural entity), and drops what dbt rejects
+    beside one (primary or unique entities, measures) with a warning. Relationships stay
+    informational there.
+  - `fluid import dbt` recovers `validity_params`, and writes a relationship for a foreign entity
+    that matches exactly one primary, unique or natural entity of the same contract.
+  - `fluid forge data-model` writes its relationships into the contract 1:1, as its Ossie
+    sidecar already did, composite keys included.
+  - The importer and the data-model emitter move a contract to `fluidVersion: 0.7.7` only when it
+    carries one of these fields; every other contract keeps the stable version.
+  - The MCP query path returns relationships from `describe` and joins on none (phase 2).
+
 - **Secret references, one grammar for every store.** A contract names a secret as
   `<scheme>://<locator>[#field][?version=n]`: `env://NAME`, `file:///run/secrets/name`,
   `vault://<mount>/<path>#<field>` (alias `openbao://`; KV v2 on OpenBao or Vault through the
@@ -290,6 +316,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   models no longer mention the agent loop.
 
 ### Fixed
+
+- **A natural entity made `fluid generate transformation` write a dbt project `dbt parse`
+  rejected.** dbt accepts a `natural` entity only beside a validity window, and validates the
+  semantic layer whenever the project has a metric, so a contract with a natural entity and a
+  metric failed with "The use of `natural` entities is currently supported only in conjunction
+  with a validity window". The bridge now drops such an entity with a warning; with a window it
+  exports the SCD shape.
+- **The `fluid import` report lost the brackets of every path it quoted.** Its items went
+  through Rich markup, so `exposes[orders].semantics` printed as `exposes.semantics`. They now
+  print literally.
 
 - **`FLUID_COPILOT_AGENT_LOOP` no longer stops a saved or detected coding agent from being
   picked.** With it set, `fluid forge` skipped the agent that `fluid ai setup` saved and the
