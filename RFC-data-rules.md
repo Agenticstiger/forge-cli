@@ -2,7 +2,7 @@
 
 **Status:** Proposed (2026-11-16) · **Target schema:** 0.7.7 (preview, per `schema_manager.PREVIEW_VERSIONS`) · **Scope:** `$defs.exposeContract` (`invariants`), `$defs.column` (`identifierFormat`, `placeholders`, `sharedAttribute`), `$defs.semanticRelationship` (`sharedColumns`), one expression language (FLUID SQL/1), and five consumers: the validator, the dbt bridge, the ODCS exporter, the MCP query compiler and FLUX
 
-**Related:** `RFC-semantics-tier1.md` (#445; its §4 relationships and §5 validity windows landed in #894) · `RFC-data-profile-port.md` (#845; measured statistics stay out of the contract) · flux-engine ADR 0008 and `docs/spec/EXPR-SPEC-2.md` (Agenticstiger/flux-engine#38), which implement §2 · FLUX relational data requirements v3, §5.1 (REL-9), §5.3 (COL-4, COL-7) and §5.5 (DQ-3)
+**Related:** `RFC-semantics-tier1.md` (#445; its §4 relationships and §5 validity windows landed in #894) · `RFC-data-profile-port.md` (#845; measured statistics stay out of the contract) · flux-engine ADR 0008 and `docs/spec/EXPR-SPEC-2.md` (Agenticstiger/flux-engine#38, restructured in #39), which implement §2 · FLUX relational data requirements v3, §5.1 (REL-9), §5.3 (COL-4, COL-7) and §5.5 (DQ-3)
 
 ---
 
@@ -402,9 +402,9 @@ Two constructs are exact in FLUID SQL/1 but approximate in every engine. The val
 
 ### 2.9 flux-expr/2 implements FLUID SQL/1
 
-flux-expr/2 is spelled after flux-expr/1 (`==`, `&&`, `if(...)`). FLUX will therefore read a FLUID text through a SQL front end that produces flux-expr/2's syntax tree. The mapping is what decision 13 asks of flux-expr/2:
+flux-expr/2 is spelled in SQL (maintainers' decision, 2026-11-16, in Agenticstiger/flux-engine#39). Its core is FLUID SQL/1, and FLUX adds its extensions on top: `previous`, paths over several links, aggregates over children and windows. flux-expr/1 stays a language of its own, so flux-expr/2 is not a superset of it. FLUX parses a FLUID text directly. The table gives, for each FLUID SQL/1 construct, the meaning its parsed tree must have in flux-expr/2, which is what decision 13 asks. The right column writes that meaning in flux-expr/1's notation (`==`, `&&`, `if(...)`) where it has one, because that notation's null rules are exact; it is not a second spelling.
 
-| FLUID SQL/1 | flux-expr/2 |
+| FLUID SQL/1 | Meaning in flux-expr/2, in flux-expr/1's notation |
 |---|---|
 | `=`, `<>` or `!=`, `<`, `<=`, `>`, `>=` | `==`, `!=`, `<`, `<=`, `>`, `>=` |
 | `AND`, `OR`, `NOT` | `&&`, `\|\|`, `!` |
@@ -417,8 +417,8 @@ flux-expr/2 is spelled after flux-expr/1 (`==`, `&&`, `if(...)`). FLUX will ther
 | `a IS DISTINCT FROM b` | `!(a == b \|\| (a == null && b == null))` |
 | `CASE WHEN c1 THEN v1 WHEN c2 THEN v2 ELSE v3 END` | `if(c1, v1, if(c2, v2, v3))`; without `ELSE`, `null` |
 | `COALESCE(...)` | `coalesce(...)` |
-| `ROUND(x, s, 'HALF_TO_EVEN')` | `round(x, s)` |
-| `ROUND(x, s)` | a half-away-from-zero rounding, which flux-expr/2 adds |
+| `ROUND(x, s, 'HALF_TO_EVEN')` | #38's half-even `round(x, s)` |
+| `ROUND(x, s)` | rounding to s places with ties away from zero (change 2) |
 | `DAYS_BETWEEN`, `MONTHS_BETWEEN`, `YEARS_BETWEEN` | `days_between`, `months_between`, `years_between` |
 | `DATE '2026-11-16'` | `date('2026-11-16')` |
 | a column name `c` | the explicit path `row.c`, so a column named `row`, `link`, `previous` or `children`, or one that shares a relationship's name, needs no rule of its own; a quoted name that flux-expr/2's identifiers cannot spell is a FLUX refusal until flux-expr/2 can quote it |
@@ -430,11 +430,11 @@ flux-expr/2 is spelled after flux-expr/1 (`==`, `&&`, `if(...)`). FLUX will ther
 | a share (§1.4) | the band itself for the check; `share` and `tolerance` only as the generator's target (§1.4) |
 | `sharedColumns`, `sharedAttribute` (§5) | copy rules `c == link.<path>.<owner's column>` with `determines: c` and `when: !(link.<path>.<key> == null)`, so a row whose path reaches nothing is not covered; a path over several links is `link.<a>.<b>.<column>` (change 9) |
 
-Nine changes follow for EXPR-SPEC-2, which the flux-expr/2 design (Agenticstiger/flux-engine#38) is to make and cite this RFC for:
+Nine changes follow for EXPR-SPEC-2 as #38 wrote it. The restructured spec (Agenticstiger/flux-engine#39 and its follow-ups) is to take them and cite this RFC:
 
 1. §1's open question has its answer: rules and dependencies are declared in the FLUID contract, under the contract digest.
-2. A half-away-from-zero rounding joins `round`, which stays half-even.
-3. The null-safe reading of a rule whose whole expression is `c == e` applies only to rules with `determines`, the copies it was made for. A FLUID `check` written `a = b` keeps the plain comparison.
+2. `ROUND(x, s)` rounds ties away from zero, and #38's half-even `round` is `ROUND(x, s, 'HALF_TO_EVEN')`.
+3. The null-safe reading of a rule whose whole expression is one equality (`c = e`) applies only to rules with `determines`, the copies it was made for. A FLUID `check` written `a = b` keeps the plain comparison.
 4. A `bothWays` dependency is counted in each direction separately (§1.5).
 5. A rule read from FLUID covers exactly the rows its `when` selects. The implicit exclusion of rows with a NULL bound (EXPR-SPEC-2 §7) does not apply to it: such a row is covered, cannot hold, and is generated as infeasible (EXPR-SPEC-2 §8).
 6. A rule or dependency read from FLUID is identified by its contract and its `id`. FLUID makes ids unique within one contract, and two contracts that a Simulation pins may reuse an id, so FLUX keys their streams and reports by both, and FLX-6201 applies within a contract.
@@ -442,7 +442,7 @@ Nine changes follow for EXPR-SPEC-2, which the flux-expr/2 design (Agenticstiger
 8. A rule read from FLUID compares and groups strings by the code points of the stored text, without NFC normalization (§2.3), as SQL consumers do. EXPR-SPEC-2 §4 and §9 normalize first, which differs only on text that is not in NFC.
 9. The explicit `link.` root also takes a chain (`link.a.b.col`), which the copies of a `sharedAttribute` over several links need; EXPR-SPEC-2 §5 lists it for one link only.
 
-**Conformance vectors.** forge-cli keeps `fluid-sql-vectors.json` beside the validator. Each vector gives a text, its verdict (accepted, or refused with a reason), its syntax tree, its type and scale, and its value against given rows. The validator runs the file. flux-engine runs the same file through its front end, as EXPR-SPEC-2 §12 runs flux-expr/1's vectors. DuckDB is the oracle for the SQL renderings, with the exact-rational exceptions that EXPR-SPEC-2 §12 already names. The vectors define the subset; neither parser does.
+**Conformance vectors.** forge-cli keeps `fluid-sql-vectors.json` beside the validator. Each vector gives a text, its verdict (accepted, or refused with a reason), its syntax tree, its type and scale, and its value against given rows. The validator runs the file. flux-engine runs the same file through its parser, as EXPR-SPEC-2 §12 runs flux-expr/1's vectors. DuckDB is the oracle for the SQL renderings, with the exact-rational exceptions that EXPR-SPEC-2 §12 already names. The vectors define the subset; neither parser does.
 
 **Parser.** The validator parses with sqlglot, already a base dependency (`iac/row_access.py` parses row-filter predicates the same way). It accepts only the node types the grammar derives. sqlglot 30 reads `MONTHS_BETWEEN` as its own node, which carries Oracle's meaning, and `DATE '...'` as a cast. The validator accepts each only in the shape the grammar derives and gives it FLUID's meaning, and no renderer passes a FLUID text through sqlglot's dialect generators. The import stays inside the function, so `fluid --help` keeps the module budget that `tests/perf/test_startup_budget.py` pins.
 
@@ -655,7 +655,7 @@ Each step is its own PR:
 1. Schema 0.7.7 fields, the validator and `fluid-sql-vectors.json`, in forge-cli.
 2. The ODCS exporter and the importer's round trip, including the placeholder exemption in the existing `invalidValues` rules.
 3. The dbt bridge's `fluid_rule` macro and its tests, plus the placeholder exemption in the existing `accepted_values` and range tests, behind the real `dbt parse` acceptance gate that tier-1's Compatibility section names.
-4. In flux-engine, EXPR-SPEC-2 takes the nine changes of §2.9 and cites this RFC; then the FLUID reader and the SQL front end.
+4. In flux-engine, EXPR-SPEC-2 (restructured in #39) takes the nine changes of §2.9 and cites this RFC; then the FLUID reader and its SQL parser.
 5. The forge_docs pages.
 
 ## References
