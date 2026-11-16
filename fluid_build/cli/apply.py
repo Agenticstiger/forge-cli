@@ -2184,7 +2184,19 @@ def run(args, logger: logging.Logger) -> int:
         if _hook_rc != 0:
             return _hook_rc
         engine_kwargs = _state_for_job_runs(source_contract, resolved_mode, resolved_build_id)
+        # Spark job runs: compiled and checked against the bound plan before tofu apply,
+        # reconciled after it (``build_runners/spark/_apply.py``).
+        from fluid_build.build_runners.spark import _apply as _spark
+
+        spark_runs = _spark.prepare(
+            source_contract,
+            build_id=resolved_build_id,
+            verified_plan=verified_plan_data,
+            dry_run=effective_dry_run,
+        )
         rc = apply_via_opentofu(args, logger, contract=source_contract, **engine_kwargs)
+        if rc == 0:
+            rc = _spark.reconcile_after_apply(spark_runs, logger, dry_run=effective_dry_run)
         # The OpenTofu engine provisions infrastructure only. Build-augmented
         # modes (amend-and-build / replace-and-build) still need their build
         # phase to run — mirror the native dispatch below so ``--build`` is

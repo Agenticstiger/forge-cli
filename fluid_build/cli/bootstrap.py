@@ -713,6 +713,11 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
         "stats", "stats", (_cmd("stats", "Aggregate cost / token usage across forge runs"),)
     ),
     CoreCommand(
+        "spark",
+        "spark",
+        (_cmd("spark", "Start a Spark build's run (for a scheduler) or show its runs"),),
+    ),
+    CoreCommand(
         "agents_cmd", "agents", (_cmd("agents", "Manage forge agent runs (list / show / prune)"),)
     ),
     CoreCommand(
