@@ -174,7 +174,7 @@ An entry has exactly one form: `check`; `derive` with `expr`; `derive` with `agg
   | `from` | the child expose |
   | `via` | a relationship that the child declares, whose `to` is this expose |
   | `filter` | optional: a FLUID SQL/1 predicate over the child row, as in SQL's `SUM(x) FILTER (WHERE ...)`; only children for which it is TRUE count |
-  | `ifNone` | optional: a literal used when no child counts. Without it, SQL's rules apply: `sum`, `min` and `max` of nothing are NULL, and `count` is 0. |
+  | `ifNone` | optional: a literal that replaces a NULL summary, as `COALESCE` would: when no child counts, or when every counted child's `column` is NULL. Without it, SQL's rules apply: `sum`, `min` and `max` of nothing are NULL, and `count` is 0. |
 
   `count` has scale 0, `sum` has its column's scale, and `min` and `max` have their column's type.
 - **Flags.** A comparison with NULL is FALSE (§2.5), so a flag derived from a NULL speed is `FALSE`.
@@ -185,6 +185,7 @@ An entry has exactly one form: `check`; `derive` with `expr`; `derive` with `agg
 - Several `derive` invariants may determine one column, each with its own `when`. A row is covered by the first one, in declaration order, whose `when` holds, as in SQL's `CASE WHEN`. Each invariant is checked on the rows it covers. A row that none covers takes the column's other source: its own value in real data, or its own statistics in a FLUX run.
 - A path through a relationship whose foreign key is NULL, or matches no row, gives NULL for every column it reads.
 - A summary covers parent rows. A dependency does not cover a row with a NULL in a `from` column.
+- No other row is left out. A row on which a compared value is NULL is covered, and it usually violates the invariant (§2.5); write `when` to leave such rows out. EXPR-SPEC-2 §7 leaves out rows with a NULL bound by itself, and for rules read from FLUID it does not (§2.9, change 5), so FLUX and SQL consumers count the same rows.
 
 ### 1.4 Expected share of rows
 
@@ -202,7 +203,7 @@ An invariant's share is a threshold on the number of covered rows that violate i
 - The numbers are exact decimals: a consumer reads `0.5` as one half, from its text, never as the nearest binary double. They have at most 15 significant digits, so the text survives a round trip through a double (FLUX decision Q4).
 - "Holds on about 98 % of real rows" is `mustBeBetween: [1.5, 2.5], unit: percent`.
 
-The band is a rule; the measured share is a statistic. `fluid profile` (decision 11) measures each declared invariant on the real data and writes the result to a profile document. Because zero violations are disclosive, it reports "at least X %" (decision Q9). The contract never holds a measured number. FLUX will choose where in the band a run generates (a FLUX setting, which may come from a profile), inject the violations, and check the run against the band.
+The band is a rule; the measured share is a statistic. `fluid profile` (decision 11) measures each declared invariant on the real data and writes the result to a profile document. Because zero violations are disclosive, it reports "at least X %" (decision Q9). The contract never holds a measured number. FLUX will choose where in the band a run generates (a FLUX setting, which may come from a profile), inject the violations, and check the run against the band. A `percent` band becomes a target share inside it and a tolerance that keeps the check inside it; a strict bound keeps the target strictly inside. A `rows` band does not scale to a run of another size: FLUX will check it as written, generate no violation from it, and refuse, with an FLX code, one that zero violations would fail.
 
 ### 1.5 What a check counts
 
@@ -213,7 +214,7 @@ The band is a rule; the measured share is a statistic. `fluid profile` (decision
 | `derive` and `aggregate` | the parent's column `IS DISTINCT FROM` the summary over its children |
 | `dependency` | the row does not carry its key's most common `to` value |
 
-For a dependency, the violating rows of one key are its covered rows minus the rows that carry its most common `to` tuple. A NULL in a `to` column is a value. Ties do not change the count. This is the g3 measure (Kivinen and Mannila): the fewest rows to remove so that the dependency holds. With `bothWays`, the forward and the reverse dependency are counted separately, and each count must meet the threshold.
+For a dependency, the violating rows of one key are its covered rows minus the rows that carry its most common `to` tuple. A NULL in a `to` column is a value. Ties do not change the count. This is the g3 measure (Kivinen and Mannila): the fewest rows to remove so that the dependency holds. With `bothWays`, the forward and the reverse dependency are counted separately, and each count must meet the threshold. The reverse count covers the rows whose `to` column is not NULL, as the forward count covers the rows whose `from` columns are not NULL; a NULL `to` is a value in the forward count only.
 
 This is what dbt, the ODCS exporter, `fluid profile` and FLUX's own check compute. Deequ's `satisfies` makes the same choice at the top level: a row whose predicate is NULL does not satisfy it.
 
@@ -246,7 +247,7 @@ or_expr     = and_expr , { "OR" , and_expr } ;
 and_expr    = not_expr , { "AND" , not_expr } ;
 not_expr    = { "NOT" } , predicate ;
 predicate   = value , [ cmp_op , value ]
-            | value , [ "NOT" ] , "IN" , "(" , literal , { "," , literal } , ")"
+            | value , [ "NOT" ] , "IN" , "(" , in_item , { "," , in_item } , ")"
             | value , [ "NOT" ] , "BETWEEN" , value , "AND" , value
             | value , "IS" , [ "NOT" ] , "NULL"
             | value , "IS" , [ "NOT" ] , "DISTINCT" , "FROM" , value ;
@@ -264,6 +265,7 @@ case_expr   = "CASE" , "WHEN" , expr , "THEN" , expr ,
               { "WHEN" , expr , "THEN" , expr } , [ "ELSE" , expr ] , "END" ;
 column_ref  = name , [ "." , name ] ;
 literal     = number | string | "TRUE" | "FALSE" | "NULL" | "DATE" , string ;
+in_item     = [ "-" ] , number | string | "TRUE" | "FALSE" | "DATE" , string ;
 integer     = digit , { digit } ;
 (* name, number and string are lexical: see below *)
 ```
@@ -280,7 +282,7 @@ integer     = digit , { digit } ;
 An expression is evaluated for one row of the expose that declares it.
 
 - A bare name is a column of that expose's `contract.schema`.
-- `<relationship>.<column>` is a column of the row that a relationship reaches. The relationship is one of `semantics.relationships[]` on this expose, matched by `name`, and the column is in its target's schema. Both cardinalities reach at most one row. A NULL foreign key, or one that matches no row, reaches none, and the path is NULL. Against a target with a validity window, the row reached is the version valid at the declaring row's point in time, as #894 defines for the relationship.
+- `<relationship>.<column>` is a column of the row that a relationship reaches. The relationship is one of `semantics.relationships[]` on this expose, matched by `name`, and the column is in its target's schema. Both cardinalities reach at most one row. A NULL foreign key, or one that matches no row, reaches none, and the path is NULL. A path, a summary, a `sharedColumns` entry and a `sharedAttribute` hop never go through a relationship whose target declares a validity window. #894 says that the row reached is the version valid at the declaring row's point in time, but nothing yet names the declaring row's time column, and a plain key join would return one row per version. This is a validation error in v1, until a later design names that column.
 - A path crosses one link. Paths over several links (`account.group.segment`) are FLUX-only; across tables, `sharedAttribute` (§5) covers the common case.
 - In `aggregate.filter`, names resolve against the child's row: its columns and its own relationships.
 - Nested `fields`, and columns of a type with no FLUID SQL/1 type (§2.3), cannot be named.
@@ -294,7 +296,7 @@ Five types: bool, number, string, date and timestamp. NULL is a value of every t
 | `boolean`, `bool`, `bit` | bool |
 | `int`, `integer`, `int2` to `int64`, `tinyint`, `smallint`, `mediumint`, `bigint`, `long`, `longint`, `serial`, `bigserial` | number, scale 0 |
 | `decimal(p,s)`, `dec(p,s)`, `numeric(p,s)`, `number(p,s)`, `bignumeric(p,s)` | number, scale s |
-| `float`, `float4`, `float8`, `float32`, `float64`, `double`, `double precision`, `real` | number, read as the exact value the binary float holds; never a `derive` target |
+| `float`, `float4`, `float8`, `float32`, `float64`, `double`, `double precision`, `real` | number, read as the shortest decimal that converts back to the same double, so `f = 0.1` holds where `f` stores 0.1, as engines compare it (FLUX's decimal-backed floats, decision Q4, keep at most 15 significant digits); never a `derive` target |
 | `string`, `text`, `varchar`, `varchar2`, `nvarchar`, `char`, `nchar`, `character`, `clob`, `uuid`, `uniqueidentifier`, `guid`, `enum` | string |
 | `date` | date |
 | `datetime`, `datetime2`, `smalldatetime`, `timestamp`, `timestamptz`, `timestamp_tz`, `timestamp_ntz`, `timestamp_ltz`, `timestampntz` | timestamp |
@@ -313,7 +315,7 @@ Type rules:
 
 ### 2.4 Exact numbers
 
-- Every number is an exact rational. `+`, `-` and `*` are exact, and `/` gives the exact quotient: `1 / 3` is one third. Nothing is binary floating point, except a float column's stored value, which is read exactly.
+- Every number is an exact rational. `+`, `-` and `*` are exact, and `/` gives the exact quotient: `1 / 3` is one third. Nothing is binary floating point: a float column's value is read as the shortest decimal that converts back to the same double (§2.3).
 - `x / 0` is NULL, so evaluation never raises.
 - Every number has a static scale, as in EXPR-SPEC-2 §4:
   - a literal has its written scale, and a column its declared scale;
@@ -329,7 +331,7 @@ Type rules:
 FLUID SQL/1 is two-valued: every predicate is TRUE or FALSE, never unknown. The rules are the flux-expr/2 picks of 2026-11-16, written in SQL terms:
 
 - Arithmetic follows SQL: a NULL operand gives NULL, and `x / 0` gives NULL.
-- A comparison with a NULL operand is FALSE. That covers `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, `NOT IN`, `BETWEEN` and `NOT BETWEEN`. `NOT IN` and `NOT BETWEEN` are single comparisons, so they are FALSE on NULL too, the rows SQL's UNKNOWN would filter out.
+- A comparison with a NULL operand is FALSE. That covers `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`, `IN` and `NOT IN`. `NOT IN` is one comparison, so it is FALSE when its left side is NULL, on the rows SQL's UNKNOWN would filter out. `BETWEEN` and `NOT BETWEEN` are their two comparisons: `x BETWEEN a AND b` is `x >= a AND x <= b`, and `x NOT BETWEEN a AND b` is `x < a OR x > b`. So `10 NOT BETWEEN NULL AND 5` is TRUE, as in SQL.
 - A bool column or bool expression that is NULL counts as FALSE where a predicate is expected.
 - `NOT`, `AND` and `OR` combine TRUE and FALSE. So `NOT (a = b)` is TRUE when `a` is NULL, while `a <> b` is FALSE: the two differ only on NULL. SQL would make both UNKNOWN. §2.8 shows how consumers render the difference exactly.
 - `IS NULL`, `IS NOT NULL`, `IS DISTINCT FROM` and `IS NOT DISTINCT FROM` are exact: they treat NULL as a value.
@@ -417,20 +419,22 @@ flux-expr/2 is spelled after flux-expr/1 (`==`, `&&`, `if(...)`). FLUX will ther
 | `ROUND(x, s)` | a half-away-from-zero rounding, which flux-expr/2 adds |
 | `DAYS_BETWEEN`, `MONTHS_BETWEEN`, `YEARS_BETWEEN` | `days_between`, `months_between`, `years_between` |
 | `DATE '2026-11-16'` | `date('2026-11-16')` |
+| a column name `c` | the explicit path `row.c`, so a column named `row`, `link`, `previous` or `children`, or one that shares a relationship's name, needs no rule of its own; a quoted name that flux-expr/2's identifiers cannot spell is a FLUX refusal until flux-expr/2 can quote it |
 | `rel.col` | `<link>.col`, the link that the relationship's `name` names |
 | `derive: c` with `expr: e` | a rule `c == e` with `determines: c` |
 | `derive: c` with `aggregate` | a rule `c == coalesce(<function>(children.<from>.<via>, if(<filter>, <column>, null)), <ifNone>)` with `determines: c`; `count` with a filter is `count(children.<from>.<via>, <filter>)` |
 | `check` | a rule without `determines`; a FLUX extension may name the column that a bounds or difference form determines |
 | `dependency` | a dependency `{from, to, bothWays}` |
-| a share (§1.4) | `share` and `tolerance` |
-| `sharedColumns`, `sharedAttribute` (§5) | copy rules `c == <path>.c` with `determines: c` |
+| a share (§1.4) | `share` and `tolerance`, converted as §1.4 says |
+| `sharedColumns`, `sharedAttribute` (§5) | copy rules `c == <path>.<owner's column>` with `determines: c` and `when: !(<path>.<key> == null)`, so a row whose path reaches nothing is not covered; a path over several links uses flux-expr/2's chained links |
 
-Four changes follow for EXPR-SPEC-2, which the flux-expr/2 design (Agenticstiger/flux-engine#38) is to make and cite this RFC for:
+Five changes follow for EXPR-SPEC-2, which the flux-expr/2 design (Agenticstiger/flux-engine#38) is to make and cite this RFC for:
 
 1. §1's open question has its answer: rules and dependencies are declared in the FLUID contract, under the contract digest.
 2. A half-away-from-zero rounding joins `round`, which stays half-even.
 3. The null-safe reading of a rule whose whole expression is `c == e` applies only to rules with `determines`, the copies it was made for. A FLUID `check` written `a = b` keeps the plain comparison.
 4. A `bothWays` dependency is counted in each direction separately (§1.5).
+5. A rule read from FLUID covers exactly the rows its `when` selects. The implicit exclusion of rows with a NULL bound (EXPR-SPEC-2 §7) does not apply to it: such a row is covered, cannot hold, and is generated as infeasible (EXPR-SPEC-2 §8).
 
 **Conformance vectors.** forge-cli keeps `fluid-sql-vectors.json` beside the validator. Each vector gives a text, its verdict (accepted, or refused with a reason), its syntax tree, its type and scale, and its value against given rows. The validator runs the file. flux-engine runs the same file through its front end, as EXPR-SPEC-2 §12 runs flux-expr/1's vectors. DuckDB is the oracle for the SQL renderings, with the exact-rational exceptions that EXPR-SPEC-2 §12 already names. The vectors define the subset; neither parser does.
 
@@ -460,7 +464,7 @@ contract:
   - a backslash makes the next character literal (`\A`), and every other printable ASCII character stands for itself.
 
   A mask is 1 to 64 characters, with at least one symbol. There are no repeat counts (COBOL's `9(5)`): write `99999`, so that `(` and `)` stay literal. Prefixes are separate, so `ACC` needs no escaping. Lower-case codes are not in v1; a regex rule covers them.
-- **Compiled regex.** Consumers get one anchored regex per column. The example compiles to `^((MSC|TWR)[0-9]{5}|LEGACY-[A-Z][0-9]-[0-9]{2}[A-Z]{2})$`. Runs of one symbol become counts, and literals are escaped. Only groups, alternation, character ranges and counts appear, so the same text works in ECMA-262 (ODCS `logicalTypeOptions.pattern`), POSIX ERE, RE2 and Python. XSD and I-Regexp (RFC 9485) match whole values and have no anchors, so they take the body without `^` and `$`; that body is an I-Regexp.
+- **Compiled regex.** Consumers get one anchored regex per column. The example compiles to `^((MSC|TWR)[0-9]{5}|LEGACY-[A-Z][0-9]-[0-9]{2}[A-Z]{2})$`. Runs of one symbol become counts, and literals are escaped. Only groups, alternation, character ranges and counts appear, so the same text works in ECMA-262 (ODCS `logicalTypeOptions.pattern`), POSIX ERE, RE2 and Python. XSD and I-Regexp (RFC 9485) match whole values and have no anchors, so they take the body without `^` and `$`; that body is an I-Regexp. Python consumers match with `re.fullmatch`, because Python's `$` also matches before a trailing newline.
 - **Enumerable.** An alternative holds `|prefixes|` × 10^d × 26^a × 36^x values, for a mask with d `9`s, a `A`s and x `X`s, so a generator can enumerate them. FLUX's keyed Feistel permutation will decode an ordinal into the mask's mixed radix (COL-4), so every value is unique by construction. Prefix weights, and prefixes taken from a linked row, are FLUX settings.
 - **No overlap.** Two alternatives that can spell the same value are a validation error: the same length, and at every position, sets of characters that intersect. Such a value would not say which alternative made it, and a generator could not keep values unique.
 - **Uniqueness** comes from the column's key or unique flag, not from the format.
@@ -485,7 +489,7 @@ contract:
 ```
 
 - A value is a placeholder when it equals one of `values`, or starts with one of `prefixes`. Matching is exact and case-sensitive on the NFC text. NULL is never a placeholder.
-- A placeholder is exempt from the column's own value checks: `identifierFormat`, `validationRules` and the column's enum. Everywhere else (invariants, keys, relationships) it is an ordinary value. Frictionless Table Schema does the same for its `missingValues`, which it reads as null before it applies a field's constraints.
+- A placeholder is exempt from the column's own value checks: `identifierFormat`, `validationRules` and the column's enum. Everywhere else (invariants, keys, relationships) it is an ordinary value. Frictionless Table Schema does the same for its `missingValues`, which it reads as null before it applies a field's constraints. Every existing rendering of those checks gains the exemption: the dbt `accepted_values`, range and regex tests that `validationRules` produce skip placeholder rows through a `where` config, and the ODCS `invalidValues` rules accept them (the values join `validValues`, and an extended `pattern` or a `sql` rule covers the prefixes).
 - One `mustBe*` operator with `unit` bounds the number of placeholder rows, as in §1.4; `unit: percent` counts them per 100 rows of the expose. Without an operator, placeholders are declared but not bounded: consumers report them and do not fail on them.
 - Only string-family columns take placeholders.
 
@@ -516,7 +520,7 @@ semantics:
       sharedColumns: [status, access_id]    # NEW in 0.7.7
 ```
 
-- Each listed column is in both exposes' schemas, under the same name. It is copied through the link: on every row whose link reaches a target row, the column `IS NOT DISTINCT FROM` the target's. The entry is short for `derive: status` with `expr: "subscription.status"` on every row, with no violation allowed. A lower share is written as that invariant, with its operator.
+- Each listed column is in both exposes' schemas, under the same name. It is copied through the link: on every row whose link reaches a target row, the column `IS NOT DISTINCT FROM` the target's. The entry is short for `derive: status` with `expr: "subscription.status"` and `when: "subscription.subscription_id IS NOT NULL"` (the link reaches a row), with no violation allowed. A lower share is written as that invariant, with its operator.
 - Rows whose foreign key is NULL, or matches no row, are not covered.
 - The relationship's own key columns are not listed: they agree by definition.
 
@@ -559,7 +563,7 @@ A column with two sources is a validation error that names both.
 | Feature | Schema 0.7.7 | Validator lint | dbt bridge | ODCS exporter | MCP compiler | FLUX (will read) |
 |---|---|---|---|---|---|---|
 | `check` | ✓ | parse, names, types, enum literals | generated test: two-valued rendering, `when` as filter, threshold | schema-level `sql` rule: violating rows, operator and `unit` | informational, via `describe` | checks every run; generates when the bundle names the column |
-| `derive` and `expr` | ✓ | as for `check`, plus the target exists, its scale fits, it is not a float, no cycle, one source | generated test: `NOT (c IS NOT DISTINCT FROM v)` | property `transformLogic` and `transformSourceObjects`, plus a `sql` rule | informational | sets the column |
+| `derive` and `expr` | ✓ | as for `check`, plus the target exists, types match, its scale fits, it is not a float, no cycle, one source | generated test: `NOT (c IS NOT DISTINCT FROM v)` | property `transformLogic` and `transformSourceObjects`, plus a `sql` rule | informational | sets the column |
 | `derive` and `aggregate` | ✓ | `from` and `via` point here, `function` and `column` agree | generated test over a grouped join | schema-level `sql` rule | informational | sets the parent's column from its children |
 | `dependency` | ✓ | columns exist and are disjoint, `bothWays` takes one a side | generated test: g3 count per direction | schema-level `sql` rule | informational | one value per key; a bijection for `bothWays` |
 | shares | ✓ | one operator, values that fit the unit | the threshold, in rows or percent | operator and `unit`, copied | informational | generates within the band and checks against it |
@@ -575,9 +579,9 @@ A column with two sources is a validation error that names both.
 - the invariant's `id`;
 - a `dimension`: consistency for invariants and shared attributes, conformity for formats, completeness for placeholders;
 - the operator and `unit`;
-- a `query` rendered from the syntax tree, with `${table}` and the names of linked objects.
+- a `query` rendered from the syntax tree, with `${table}` and the names of linked objects. With `unit: rows` it returns the count of violating rows; with `unit: percent` it returns violating rows times 100 divided by covered rows, and 0 when no row is covered.
 
-The FLUID declarations also go into `customProperties`, as `contract.quality[]` already does, so a FLUID → ODCS → FLUID round trip keeps them. The ODCS importer reads them back from there, never from the SQL. Nothing these rules use changed in ODCS v3.2.0.
+The FLUID declarations also go into `customProperties`, on the object and on each property, as `contract.quality[]` already does, so a FLUID → ODCS → FLUID round trip keeps them. The ODCS importer reads them back from there, never from the SQL. A column's own `quality[]` still replaces only the rules forge derives from `required`, keys and `validationRules` (`to_odcs_property` replays it as written); the rules generated from the new fields are appended after it. Each generated rule carries `customProperties` `{property: fluidGenerated, value: true}`, and the importer drops marked rules, so a generated `missingValues` rule never comes back as a sentinel. Nothing these rules use changed in ODCS v3.2.0.
 
 **MCP compiler.** `describe` returns the new fields with the rest of the contract. The governed query path does not compile or enforce them. No phase 2 is planned. Excluding placeholders from a governed query on request would be a later, separate design.
 
@@ -589,9 +593,9 @@ Errors (any one fails `fluid validate`):
 2. An `id` that is missing, does not match `^[A-Za-z][A-Za-z0-9_]*$`, or is used twice in the contract.
 3. An entry with no form, or with two.
 4. A text outside FLUID SQL/1, with its position and the construct. The hint names `contract.quality[]` for SQL outside the subset.
-5. An unknown column, relationship or relationship column, or a path over two links.
+5. An unknown column, relationship or relationship column, a path over two links, or a path, summary, `sharedColumns` entry or `sharedAttribute` hop through a relationship whose target declares a validity window.
 6. A type error (§2.3), including a literal outside a column's enum.
-7. A `derive` target that is missing, a float or without a declared scale, or whose value's scale does not fit. The message says, for example, "wrap it in ROUND(x, 2)".
+7. A `derive` target that is missing or a float, whose type differs from its value's type, or, for a number target, that has no declared scale or whose value's scale does not fit. The message says, for example, "wrap it in ROUND(x, 2)".
 8. A cycle among derived columns, within one expose, or across exposes through links and aggregates.
 9. A column with two sources (§5).
 10. An `aggregate` whose `via` is not a relationship of `from` that points to this expose, whose `function` and `column` disagree, whose `filter` is not a predicate over the child, or whose `ifNone` is not a literal of the summary's type.
@@ -632,6 +636,7 @@ Notes, reported and never failing:
 - **FLUX-only syntax:** windows, aggregates inside expressions, the previous version of an entity and paths over several links.
 - **FLUID SQL/2 candidates:** string functions, regular expressions, `CAST`, timestamps, `ABS`, `LEAST` and `GREATEST`, a parameter for the as-of date, `avg` summaries (they need a rounding rule) and summaries compared with anything but equality.
 - **Cross-contract** relationships and shared attributes.
+- **Point-in-time joins** through a relationship whose target declares a validity window.
 - **Generation choices:** distributions, prefix weights, violation draws and the target inside a band. These live in FLUX documents.
 - **Measured shares and statistics.** These live in profile documents (`fluid profile`, decision 11; `RFC-data-profile-port.md`).
 - **Discovery:** finding invariants or placeholders that nobody declared (decision Q9).
@@ -642,9 +647,9 @@ Notes, reported and never failing:
 Each step is its own PR:
 
 1. Schema 0.7.7 fields, the validator and `fluid-sql-vectors.json`, in forge-cli.
-2. The ODCS exporter and the importer's round trip.
-3. The dbt bridge's `fluid_rule` macro and its tests, behind the real `dbt parse` acceptance gate that tier-1's Compatibility section names.
-4. In flux-engine, EXPR-SPEC-2 takes the four changes of §2.9 and cites this RFC; then the FLUID reader and the SQL front end.
+2. The ODCS exporter and the importer's round trip, including the placeholder exemption in the existing `invalidValues` rules.
+3. The dbt bridge's `fluid_rule` macro and its tests, plus the placeholder exemption in the existing `accepted_values`, range and regex tests, behind the real `dbt parse` acceptance gate that tier-1's Compatibility section names.
+4. In flux-engine, EXPR-SPEC-2 takes the five changes of §2.9 and cites this RFC; then the FLUID reader and the SQL front end.
 5. The forge_docs pages.
 
 ## References
