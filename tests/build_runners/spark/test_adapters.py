@@ -144,11 +144,22 @@ def test_serverless_runs_lists_this_runs_name_newest_first(serverless):
             "name": name, "type": "SPARK", "stateDetails": "running", "releaseLabel": "emr-7.12.0",
         }  # fmt: skip
 
+    active = ["CANCELLING", "PENDING", "QUEUED", "RUNNING", "SCHEDULED", "SUBMITTED"]
+    # Active runs first, every page and filtered by state; then the recent ones, unfiltered.
+    stub.add_response(
+        "list_job_runs",
+        {"jobRuns": [summary("new", serverless.run_name, NOW)], "nextToken": "t"},
+        {"applicationId": "app1", "states": active},
+    )
+    stub.add_response(
+        "list_job_runs",
+        {"jobRuns": [summary("other", "someone-else", NOW)]},
+        {"applicationId": "app1", "states": active, "nextToken": "t"},
+    )
     stub.add_response(
         "list_job_runs",
         {"jobRuns": [
             summary("old", serverless.run_name, EARLIER),
-            summary("other", "someone-else", NOW),
             summary("new", serverless.run_name, NOW),
         ]},
         {"applicationId": "app1"},
@@ -504,3 +515,18 @@ def test_adapter_for_binds_the_account_from_the_credentials(serverless, monkeypa
     client = boto3.client("emr-serverless", region_name="eu-west-1")
     adapter = ad.adapter_for(token_run, lambda service, region: client)
     assert adapter.run.role_arn == "arn:aws:iam::210987654321:role/r"
+
+
+def test_ec2_history_pages_until_this_builds_last_step(ec2_run):
+    adapter, stub = adapter_on(ec2_run, "emr")
+    active = {"ClusterId": "j-ABC", "StepStates": ["PENDING", "RUNNING", "CANCEL_PENDING"]}
+    stub.add_response("list_steps", {"Steps": []}, active)
+    others = [_step(ec2_run, f"s-{i}", "COMPLETED", NOW, name="unrelated") for i in range(3)]
+    stub.add_response("list_steps", {"Steps": others, "Marker": "m"}, {"ClusterId": "j-ABC"})
+    stub.add_response(
+        "list_steps",
+        {"Steps": [_step(ec2_run, "s-mine", "FAILED", EARLIER)], "Marker": "m2"},
+        {"ClusterId": "j-ABC", "Marker": "m"},
+    )
+    assert [(r.run_id, r.state) for r in adapter.runs()] == [("s-mine", "FAILED")]
+    stub.assert_no_pending_responses()

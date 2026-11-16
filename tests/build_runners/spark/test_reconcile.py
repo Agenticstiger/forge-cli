@@ -421,3 +421,34 @@ def test_a_retried_task_adopts_its_going_run_instead_of_starting_another(schedul
     out = once(scheduled, clock)
     assert (out.action, out.run_id) == ("succeeded", "going")
     assert "start" not in fake.calls
+
+
+def test_a_throttled_read_is_retried_and_five_in_a_row_leave_the_run_going(scheduled, clock, use):
+    class Flaky(FakeAdapter):
+        def __init__(self, fail):
+            super().__init__(start_states=("RUNNING", "SUCCEEDED"))
+            self.fail, self.reads = fail, 0
+
+        def get(self, run_id):
+            self.reads += 1
+            if 1 < self.reads <= 1 + self.fail:
+                raise ClientError({"Error": {"Code": "ThrottlingException"}}, "GetJobRun")
+            return super().get(run_id)
+
+    use(Flaky(fail=2))
+    assert once(scheduled, clock).action == "succeeded"
+    fake = Flaky(fail=5)
+    use(fake)
+    out = once(scheduled, clock)
+    assert (out.error, out.run_id) == (True, "new") and "left going" in out.message
+    assert not any(c.startswith("cancel") for c in fake.calls)
+
+
+def test_ctrl_c_during_the_start_is_a_cancelled_outcome(scheduled, clock, use):
+    class Interrupted(FakeAdapter):
+        def start(self, token):
+            raise KeyboardInterrupt
+
+    use(Interrupted())
+    out = once(scheduled, clock)
+    assert (out.action, out.error, out.run_id) == ("cancelled", True, None)

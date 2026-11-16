@@ -207,6 +207,11 @@ def _summary_id(summary: Mapping[str, Any]) -> str:
     return arn.rsplit("/", 1)[-1]
 
 
+_SERVERLESS_ACTIVE = frozenset(
+    {"SUBMITTED", "PENDING", "SCHEDULED", "QUEUED", "RUNNING", "CANCELLING"}
+)
+
+
 class EmrServerless(Adapter):
     runtime, service = "emr-serverless", "emr-serverless"
     #: How far back the reconcile looks for this build's last run.
@@ -265,18 +270,28 @@ class EmrServerless(Adapter):
         )
 
     def runs(self) -> List[RunInfo]:
+        """Every active run of this build (all pages, filtered by state: a long-running job
+        in a shared application is older than its newest runs), then its most recent ended
+        ones from :data:`LOOKBACK_PAGES` pages. Both modes: a stream moved to availableNow
+        still finds its old continuous job."""
         app = self.application_id()
-        # Both modes: a stream moved to availableNow still finds its old continuous job.
-        summaries: List[Mapping[str, Any]] = []
-        pages = self.client.get_paginator("list_job_runs").paginate(applicationId=app)
-        for number, page in enumerate(pages):
-            summaries += [
-                j for j in page.get("jobRuns") or [] if j.get("name") == self.run.run_name
-            ]
+        paginator = self.client.get_paginator("list_job_runs")
+        found: Dict[str, Mapping[str, Any]] = {}
+        for page in paginator.paginate(applicationId=app, states=sorted(_SERVERLESS_ACTIVE)):
+            found.update({_summary_id(j): j for j in page.get("jobRuns") or [] if self._mine(j)})
+        active = set(found)
+        for number, page in enumerate(paginator.paginate(applicationId=app)):
+            for j in page.get("jobRuns") or []:
+                if self._mine(j):
+                    found.setdefault(_summary_id(j), j)
             if number + 1 >= self.LOOKBACK_PAGES:
                 break
-        summaries.sort(key=lambda j: _ts(j.get("createdAt")), reverse=True)
-        return [self.get(_summary_id(j)) for j in summaries[:10]]
+        ordered = sorted(found.items(), key=lambda kv: _ts(kv[1].get("createdAt")), reverse=True)
+        ended = [rid for rid, _ in ordered if rid not in active][:5]
+        return [self.get(rid) for rid, _ in ordered if rid in active or rid in ended]
+
+    def _mine(self, summary: Mapping[str, Any]) -> bool:
+        return summary.get("name") == self.run.run_name
 
     def get(self, run_id: str) -> RunInfo:
         job = self.client.get_job_run(applicationId=self.application_id(), jobRunId=run_id)
@@ -392,6 +407,7 @@ _STEP = {
 
 class EmrEc2(Adapter):
     runtime, service = "emr-ec2", "emr"
+    LOOKBACK_PAGES = 10
 
     @property
     def cluster(self) -> str:
@@ -423,9 +439,19 @@ class EmrEc2(Adapter):
         )
         for page in pages:
             steps.update({str(s.get("Id")): s for s in page.get("Steps") or []})
-        recent = self.client.list_steps(ClusterId=self.cluster)
-        for step in recent.get("Steps") or []:
-            steps.setdefault(str(step.get("Id")), step)
+        active = set(steps)
+        # Ended steps, newest first, until this build's last one (a busy shared cluster's
+        # newer steps would otherwise hide a failed run, and every apply would restart it).
+        recent = self.client.get_paginator("list_steps").paginate(ClusterId=self.cluster)
+        for number, page in enumerate(recent):
+            page_steps = page.get("Steps") or []
+            for step in page_steps:
+                steps.setdefault(str(step.get("Id")), step)
+            if number + 1 >= self.LOOKBACK_PAGES or any(
+                s.get("Name") == self.run.run_name and str(s.get("Id")) not in active
+                for s in page_steps
+            ):
+                break
         mine = [s for s in steps.values() if s.get("Name") == self.run.run_name]
         return sorted((self._info(s) for s in mine), key=lambda i: i.created, reverse=True)
 

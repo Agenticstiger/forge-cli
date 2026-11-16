@@ -51,6 +51,8 @@ from fluid_build.build_runners.spark._adapters import (
 from fluid_build.build_runners.spark._desired import DesiredRun
 
 MAX_POLL_S = 15.0
+#: Failed reads in a row before a wait gives up (the run is never cancelled for them).
+MAX_FAILED_READS = 5
 #: How long a reconcile waits for a cancelled run to stop, and for a started one to leave
 #: its pending states; ``FLUID_SPARK_WAIT_SECONDS`` overrides both.
 DEFAULT_WAIT_S = 900
@@ -116,14 +118,25 @@ class _Clock:
     def until(
         self, read: Callable[[], RunInfo], done: Callable[[RunInfo], bool], budget: float
     ) -> RunInfo:
-        """Poll ``read`` until ``done`` or the budget is spent; the last read either way."""
+        """Poll ``read`` until ``done`` or the budget is spent; the last read either way.
+
+        A read that fails (a throttled call) is tried again; :data:`MAX_FAILED_READS` in a
+        row raise the last error, and the run is left as it is (a retried ``fluid spark
+        run`` adopts it), as the Databricks job-run waiter does."""
         deadline = self.now() + budget
         delay = 1.0
         info = read()
+        failures = 0
         while not done(info) and self.now() < deadline:
             self.sleep(min(delay, max(0.0, deadline - self.now())))
             delay = min(delay + 1.0, MAX_POLL_S)
-            info = read()
+            try:
+                info = read()
+                failures = 0
+            except Exception:  # noqa: BLE001 - counted; the last one is raised
+                failures += 1
+                if failures >= MAX_FAILED_READS:
+                    raise
         return info
 
 
@@ -352,40 +365,53 @@ def run_once(
         return reconcile(
             [run], clients=clients, restart_failed=restart, sleep=sleep, now=now, env=env
         )[0]
+    started: List[str] = []
     try:
         adapter = adapter_for(run, clients)
         out = Outcome(run.build, run.runtime, "started", where=adapter.where())
-        # A retried task (its worker killed before it could cancel) finds its run going:
-        # wait for that one rather than start a second writer of the same table.
-        going = [h for h in adapter.runs() if h.active and h.config_hash == run.config_hash]
-        if going:
-            run_id, out.action = going[0].run_id, "adopted"
-            say(f"Spark {run.build}: run {run_id} is already going on {out.where}; waiting for it")
-        else:
-            run_id = adapter.start(_token(run))
-            say(f"Spark {run.build}: started run {run_id} on {out.where}")
-        out.run_id = run_id
-        if not wait:
-            out.state = adapter.get(run_id).state
-            return out
 
         def cancel() -> None:
+            if not started:
+                return
             try:
-                adapter.cancel(run_id)
-                say(f"Spark {run.build}: cancelled run {run_id}")
+                adapter.cancel(started[0])
+                say(f"Spark {run.build}: cancelled run {started[0]}")
             except Exception as exc:  # noqa: BLE001 - say it; the interrupt goes on
-                say(f"Spark {run.build}: could not cancel run {run_id}: {_clean(exc)}")
+                say(f"Spark {run.build}: could not cancel run {started[0]}: {_clean(exc)}")
 
         clock = _Clock(sleep, now)
         try:
+            # Installed before the start: a SIGTERM right after it still cancels the run.
             with interrupt_guard(cancel):
+                # A retried task (its worker killed before it could cancel) finds its run
+                # going: wait for that one rather than start a second writer of the table.
+                going = [h for h in adapter.runs() if h.active and h.config_hash == run.config_hash]
+                if going:
+                    started.append(going[0].run_id)
+                    out.action = "adopted"
+                    say(
+                        f"Spark {run.build}: run {started[0]} is already going on "
+                        f"{out.where}; waiting for it"
+                    )
+                else:
+                    started.append(adapter.start(_token(run)))
+                    say(f"Spark {run.build}: started run {started[0]} on {out.where}")
+                run_id = out.run_id = started[0]
+                if not wait:
+                    out.state = adapter.get(run_id).state
+                    return out
                 ended = clock.until(
                     lambda: adapter.get(run_id), lambda i: i.state in TERMINAL, timeout
                 )
         except KeyboardInterrupt:
             # Ctrl-C, SIGTERM or SIGHUP (a killed Airflow task): the guard cancelled the run.
             out.action, out.error, out.state = "cancelled", True, CANCELLING
-            out.message = f"interrupted while waiting; run {run_id} was cancelled"
+            out.run_id = started[0] if started else None
+            out.message = (
+                f"interrupted while waiting; run {started[0]} was cancelled"
+                if started
+                else "interrupted before a run started"
+            )
             return out
         out.state = ended.state
         if ended.state not in TERMINAL:
@@ -398,7 +424,11 @@ def run_once(
             out.action = "succeeded"
         return out
     except Exception as exc:  # noqa: BLE001 - the AWS error is the run's outcome
-        return _error_outcome(run, exc)
+        failed = _error_outcome(run, exc)
+        if started:  # reads failed: the run is left going, and a retry adopts it
+            failed.run_id = started[0]
+            failed.message += f"; run {started[0]} was left going (a retry waits for it)"
+        return failed
 
 
 def status(
