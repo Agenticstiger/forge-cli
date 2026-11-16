@@ -688,7 +688,19 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
         ]
         for build in contract.get("builds") or []:
             props = build.get("properties") if isinstance(build, Mapping) else None
-            if isinstance(props, Mapping) and "mapping" in props and build not in builds:
+            parameters = props.get("parameters") if isinstance(props, Mapping) else None
+            # A Spark build's mapping is the forge Spark runner's (fluid_build.spark).
+            spark = (
+                build.get("engine") == "spark"
+                and isinstance(parameters, Mapping)
+                and ("spark" in parameters)
+            )
+            if (
+                isinstance(props, Mapping)
+                and "mapping" in props
+                and build not in builds
+                and not spark
+            ):
                 warnings.append(
                     f"Build {build.get('id')}: properties.mapping is compiled only by the "
                     "managed Flink lane (parameters.flink.management); nothing reads it here"
