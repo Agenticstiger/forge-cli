@@ -507,3 +507,23 @@ class TestNoUnreviewedPlan:
             engine._refuse_unreleased_imports(eng, [ImportBlock(to="x.kept", id="K")])
         assert refused.value.event == "plan_tofu_adoption_not_released"
         engine._refuse_unreleased_imports(eng, [ImportBlock(to="x.gone", id="G")])
+
+    def test_plan_and_apply_emit_the_same_module_for_the_same_target(
+        self, offline_tofu, monkeypatch
+    ):
+        # Every module of both paths comes from emit_module with the run's StateTarget, so
+        # what the target adds (its backend; state and plan encryption) is the same in both.
+        emitted: List[Any] = []
+        real_emit = engine.emit_module
+
+        def _emit(plugin, contract, target, logger):
+            module = real_emit(plugin, contract, target, logger)
+            emitted.append((target, module[0]))
+            return module
+
+        monkeypatch.setattr(engine, "emit_module", _emit)
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        assert engine.apply_via_opentofu(_args(str(out)), _LOG) == 0
+        (plan_target, plan_module), (apply_target, apply_module) = emitted
+        assert plan_target == apply_target
+        assert plan_module == apply_module
