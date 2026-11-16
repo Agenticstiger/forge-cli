@@ -1,3 +1,6 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
 """The migration never deletes state; it prints the command that would."""
 
 from fluid_build.iac.state_migration import MIGRATED, StateReconciliation
