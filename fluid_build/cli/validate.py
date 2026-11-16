@@ -1297,6 +1297,9 @@ def _run_contract_rules(
             if args.verbose:
                 info(logger, f"Semantic-model check skipped: {exc}")
 
+        # --- Rules about valid data (RFC-data-rules.md, 0.7.7) ---------------
+        _data_rules_check(validation_result, contract)
+
         # --- Composition rules, then the authoring lint (WARNINGS) -----------
         _composition_check(validation_result, contract, args, logger)
         _authoring_lint_check(validation_result, contract, locate)
@@ -1343,6 +1346,40 @@ def _composition_check(
     except Exception as exc:  # pragma: no cover (defensive)
         if args.verbose:
             info(logger, f"Composition rule check skipped: {exc}")
+
+
+def _data_rules_check(validation_result: ValidationResult, contract: Mapping[str, Any]) -> None:
+    """The data-rules lint (:mod:`fluid_build.data_rules`): errors and notes.
+
+    Invariants, identifier formats, placeholders and shared attributes, with their
+    FLUID SQL/1 texts parsed and type-checked against the exposes they are written
+    for. Nothing below 0.7.7, where the schema refuses the fields. Fails closed: a
+    crash is an error, so a contract is never passed with the check switched off.
+    """
+    try:
+        from fluid_build.data_rules import lint_contract
+
+        findings = lint_contract(contract)
+    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+        validation_result.add_error(
+            f"Data-rules check could not run ({type(exc).__name__}: {exc}); the contract's "
+            "invariants, identifier formats, placeholders and shared attributes were NOT checked",
+            event="contract_check_failed",
+            pointer="",
+        )
+        return
+    for finding in findings:
+        add = (
+            validation_result.add_error
+            if finding.severity == "error"
+            else validation_result.add_note
+        )
+        add(
+            finding.display,
+            event="contract_data_rules",
+            pointer=finding.pointer,
+            fix=finding.fix or None,
+        )
 
 
 def _authoring_lint_check(

@@ -50,5 +50,5 @@ class FluidSqlError(ValueError):
         self.reason = reason
         self.detail = message
         self.position = position
-        where = f" at character {position + 1}" if position is not None else ""
+        where = f" (at character {position + 1})" if position is not None else ""
         super().__init__(f"{message}{where}")
