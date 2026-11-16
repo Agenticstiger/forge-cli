@@ -46,6 +46,18 @@ dbt-core 1.11 + dbt-semantic-interfaces):
   shared ``DEFAULT_PERCENTILE`` (0.5 == median — identical to the MCP
   query compiler's default so both consumers answer the same number,
   and MetricFlow refuses percentile measures without agg_params).
+* **A validity window maps field for field** (0.7.7): the two time
+  dimensions with ``typeParams.validityParams`` carry
+  ``type_params.validity_params`` (``is_start`` / ``is_end``), and the
+  model takes dbt's SCD type II shape: ``primary_entity:`` names the
+  natural entity, the only key MetricFlow joins a window on. dbt rejects a
+  primary or unique entity, and measures, beside a window, so those are
+  dropped with a warning; a natural entity without a window is dropped too
+  (dbt accepts natural entities only with one), as is a window
+  ``fluid validate`` reports as malformed.
+* **Relationships are not exported** (0.7.7): MetricFlow joins by entity
+  name, so ``semantics.relationships`` is informational here and
+  ``fluid validate`` warns when one has no matching entity pair.
 * **A day-grain time spine model ships alongside** — real ``dbt parse``
   (1.11) rejects any project with semantic models but no time spine
   ("The semantic layer requires a time spine model with granularity DAY
@@ -62,9 +74,14 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Mapping, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import yaml
+
+from fluid_build.forge_datamodel.semantics_builder import (
+    declares_validity_params,
+    validity_window,
+)
 
 from ..base import GenerationResult
 from . import _test_mapping as _tm
@@ -132,8 +149,15 @@ def _build_entities(
     semantics: Mapping[str, Any],
     expose: Mapping[str, Any],
     model_name: str,
+    window: Optional[Tuple[str, str, str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Map contract entities, guaranteeing exactly one primary entity."""
+    """Map contract entities, guaranteeing exactly one primary entity.
+
+    With a validity ``window`` the model takes dbt's SCD type II shape instead:
+    the natural entity plus foreign ones, and no primary entity (the caller
+    sets ``primary_entity:`` to the natural one), because dbt rejects a primary
+    or unique entity beside a window.
+    """
     entities: List[Dict[str, Any]] = []
     seen: Set[str] = set()
     have_primary = False
@@ -147,6 +171,8 @@ def _build_entities(
         etype = str(raw.get("type") or "foreign").strip().lower()
         if etype not in ("primary", "foreign", "unique", "natural"):
             etype = "foreign"
+        if not _entity_fits_window(etype, window, raw.get("name"), model_name):
+            continue
         if etype == "primary":
             if have_primary:
                 # MetricFlow allows at most one primary entity.
@@ -161,6 +187,8 @@ def _build_entities(
         entities.append(entity)
         seen.add(name)
 
+    if window is not None:
+        return entities
     if not have_primary:
         derived = _derive_primary_entity(expose, model_name, seen)
         if derived is None:
@@ -177,6 +205,36 @@ def _build_entities(
     if not have_primary:
         return []
     return entities
+
+
+def _entity_fits_window(
+    etype: str, window: Optional[Tuple[str, str, str]], name: Any, model_name: str
+) -> bool:
+    """False, with a warning, for an entity dbt rejects given the model's validity window.
+
+    dbt accepts no primary or unique entity beside a window, and a natural entity
+    only with one (dbt-semantic-interfaces ``SemanticModelValidityWindowRule`` and
+    ``NaturalEntityConfigurationRule``).
+    """
+    if window is not None and etype in ("primary", "unique"):
+        logger.warning(
+            "semantic_models: dropping %s entity %r on %s (dbt MetricFlow accepts no "
+            "primary or unique entity beside a validity window)",
+            etype,
+            name,
+            model_name,
+        )
+        return False
+    if window is None and etype == "natural":
+        logger.warning(
+            "semantic_models: dropping natural entity %r on %s (dbt MetricFlow accepts a "
+            "natural entity only with a validity window: two time dimensions with "
+            "typeParams.validityParams)",
+            name,
+            model_name,
+        )
+        return False
+    return True
 
 
 def _derive_primary_entity(
@@ -221,8 +279,12 @@ def _derive_primary_entity(
 def _build_dimensions(
     semantics: Mapping[str, Any],
     used_names: Set[str],
+    window: Optional[Tuple[str, str, str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Map contract dimensions; time dims always get a granularity."""
+    """Map contract dimensions; time dims always get a granularity.
+
+    The bounds of a validity ``window`` also get ``validity_params``.
+    """
     dimensions: List[Dict[str, Any]] = []
     for raw in semantics.get("dimensions") or []:
         if not isinstance(raw, Mapping) or not raw.get("name"):
@@ -247,9 +309,21 @@ def _build_dimensions(
                 # MetricFlow refuses time dimensions without a granularity.
                 grain = _DEFAULT_GRAIN
             dim["type_params"] = {"time_granularity": grain}
+            bound = _window_bound(raw["name"], window)
+            if bound:
+                dim["type_params"]["validity_params"] = bound
         dimensions.append(dim)
         used_names.add(name)
     return dimensions
+
+
+def _window_bound(name: Any, window: Optional[Tuple[str, str, str]]) -> Optional[Dict[str, bool]]:
+    """``validity_params`` for a dimension that bounds the validity ``window``, else ``None``."""
+    if window is not None and name == window[0]:
+        return {"is_start": True}
+    if window is not None and name == window[1]:
+        return {"is_end": True}
+    return None
 
 
 def _resolve_agg_time_dimension(
@@ -627,6 +701,52 @@ _TIME_SPINE_MODEL_DEF: Dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
+def _model_window(semantics: Mapping[str, Any], expose_id: Any) -> Optional[Tuple[str, str, str]]:
+    """The expose's validity window, or ``None``; a malformed one is dropped with a warning."""
+    window = validity_window(semantics)
+    if window is None and declares_validity_params(semantics):
+        logger.warning(
+            "semantic_models: expose %r declares validityParams that do not form a validity "
+            "window (fluid validate names the problem) — validity params dropped",
+            expose_id,
+        )
+    return window
+
+
+def _model_measures(
+    semantics: Mapping[str, Any],
+    expose: Mapping[str, Any],
+    dimensions: List[Dict[str, Any]],
+    used_names: Set[str],
+    window: Optional[Tuple[str, str, str]],
+    model_name: str,
+) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """``(agg_time_dimension, measures)`` for one model; ``(None, [])`` when dbt would reject them.
+
+    Measures need an aggregation time dimension, and dbt accepts none beside a
+    validity window.
+    """
+    if window is not None:
+        if semantics.get("measures"):
+            logger.warning(
+                "semantic_models: expose %r has measures beside a validity window, which "
+                "dbt MetricFlow does not accept — measures + metrics dropped",
+                get_expose_id(expose),
+            )
+        return None, []
+    agg_time_dim = _resolve_agg_time_dimension(semantics, dimensions, expose, used_names)
+    if agg_time_dim is None:
+        if semantics.get("measures"):
+            logger.warning(
+                "semantic_models: expose %r has measures but no resolvable "
+                "time dimension — measures + metrics dropped",
+                get_expose_id(expose),
+            )
+        return None, []
+    time_dims = {d["name"] for d in dimensions if d.get("type") == "time"}
+    return agg_time_dim, _build_measures(semantics, used_names, time_dims, model_name)
+
+
 def generate_semantic_models(
     contract: Dict[str, Any],
     emitted_models: Optional[Set[str]] = None,
@@ -671,7 +791,8 @@ def generate_semantic_models(
         if not model_name or model_name in model_names_taken:
             continue
 
-        entities = _build_entities(semantics, expose, model_name)
+        window = _model_window(semantics, expose_id)
+        entities = _build_entities(semantics, expose, model_name, window)
         if not entities:
             logger.warning(
                 "semantic_models: skipping expose %r (no primary entity could be derived)",
@@ -680,20 +801,10 @@ def generate_semantic_models(
             continue
 
         used_names: Set[str] = {e["name"] for e in entities}
-        dimensions = _build_dimensions(semantics, used_names)
-        agg_time_dim = _resolve_agg_time_dimension(semantics, dimensions, expose, used_names)
-
-        time_dims = {d["name"] for d in dimensions if d.get("type") == "time"}
-        measures: List[Dict[str, Any]] = []
-        if agg_time_dim is None:
-            if semantics.get("measures"):
-                logger.warning(
-                    "semantic_models: expose %r has measures but no resolvable "
-                    "time dimension — measures + metrics dropped",
-                    expose_id,
-                )
-        else:
-            measures = _build_measures(semantics, used_names, time_dims, model_name)
+        dimensions = _build_dimensions(semantics, used_names, window)
+        agg_time_dim, measures = _model_measures(
+            semantics, expose, dimensions, used_names, window, model_name
+        )
 
         if emitted_models is not None and expose_id not in emitted_models:
             logger.warning(
@@ -721,6 +832,10 @@ def generate_semantic_models(
             model_def["config"] = {"meta": meta}
         if agg_time_dim is not None and measures:
             model_def["defaults"] = {"agg_time_dimension": agg_time_dim}
+        if window is not None:
+            # dbt's SCD type II shape: the natural entity stands in as the
+            # primary entity a model with dimensions must have.
+            model_def["primary_entity"] = _sanitize_name(window[2])
         model_def["entities"] = entities
         if dimensions:
             model_def["dimensions"] = dimensions
