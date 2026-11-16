@@ -47,6 +47,9 @@ _DISTINCT_PREFIX_RE = re.compile(r"(?is)^\s*distinct\s+(.+)$")
 # single-call parser deliberately skips (``SUM(a) / COUNT(b)``). The
 # trailing ``\s*\(`` is what keeps a column named ``count_of_orders``
 # from matching.
+#: What a dbt MetricFlow element name may not hold (``metricflow_name``).
+_METRICFLOW_NAME_RE = re.compile(r"[^A-Za-z0-9_]+")
+
 _ANY_AGGREGATE_CALL_RE = re.compile(
     r"(?i)\b("
     r"sum|avg|mean|min|max|median|count|"
@@ -203,7 +206,7 @@ def validate_semantics_block(contract: Mapping[str, Any]) -> Tuple[List[str], Li
         if not isinstance(semantics, Mapping):
             continue
         expose_id = str(expose.get("exposeId") or expose.get("id") or "?")
-        for entry in semantics.get("measures") or []:
+        for entry in _as_list(semantics.get("measures")):
             if not isinstance(entry, Mapping):
                 continue
             agg = entry.get("agg")
@@ -224,7 +227,7 @@ def validate_semantics_block(contract: Mapping[str, Any]) -> Tuple[List[str], Li
                 f"'expr: COUNT(DISTINCT id)' becomes 'expr: id' + "
                 f"'agg: count_distinct'."
             )
-        for entry in semantics.get("dimensions") or []:
+        for entry in _as_list(semantics.get("dimensions")):
             if not isinstance(entry, Mapping):
                 continue
             expr = entry.get("expr")
@@ -265,6 +268,19 @@ def _exported_entity_types(semantics: Any) -> FrozenSet[str]:
     if isinstance(semantics, Mapping) and validity_window(semantics) is not None:
         return frozenset({"natural", "foreign"})
     return frozenset({"primary", "unique", "foreign"})
+
+
+def metricflow_name(raw: Any) -> str:
+    """A contract name as the dbt MetricFlow element name the bridge writes for it.
+
+    MetricFlow element names are word-character identifiers that don't start with a
+    digit: everything else collapses to ``_``. Two contract names that map to one
+    MetricFlow name are one element there, and the bridge keeps the first.
+    """
+    name = _METRICFLOW_NAME_RE.sub("_", str(raw).strip()).strip("_")
+    if name and name[0].isdigit():
+        name = f"_{name}"
+    return name
 
 
 def _as_list(value: Any) -> List[Any]:
@@ -501,6 +517,19 @@ def _validity_window_errors(semantics: Mapping[str, Any], expose_path: str) -> L
             )
     if not bounds:
         return errors
+    names = [
+        metricflow_name(element["name"])
+        for kind in ("entities", "dimensions")
+        for element in _as_list(semantics.get(kind))
+        if isinstance(element, Mapping) and element.get("name")
+    ]
+    for name, _ in bounds:
+        if names.count(metricflow_name(name)) > 1:
+            errors.append(
+                f"{expose_path}.semantics: the validity window bound {name!r} shares its name "
+                f"with another entity or dimension of the model. They share one namespace in "
+                f"dbt MetricFlow, so the window would lose that bound: rename one of them."
+            )
     starts = [name for name, validity in bounds if validity.get("isStart") is True]
     ends = [name for name, validity in bounds if validity.get("isEnd") is True]
     both = [n for n, v in bounds if v.get("isStart") is True and v.get("isEnd") is True]
@@ -540,7 +569,7 @@ def _semantic_names(semantics: Mapping[str, Any], kind: str) -> Dict[str, str]:
     ``order_status`` are the same output column name.
     """
     found: Dict[str, str] = {}
-    for entry in semantics.get(kind) or []:
+    for entry in _as_list(semantics.get(kind)):
         if not isinstance(entry, Mapping):
             continue
         name = entry.get("name")
@@ -566,7 +595,7 @@ def _name_collision_warnings(semantics: Mapping[str, Any], expose_id: str) -> Li
         return messages
     measures = _semantic_names(semantics, "measures")
     metric_measure: Dict[str, Any] = {}
-    for entry in semantics.get("metrics") or []:
+    for entry in _as_list(semantics.get("metrics")):
         if isinstance(entry, Mapping) and isinstance(entry.get("name"), str):
             metric_measure.setdefault(str(entry["name"]).casefold(), entry.get("measure"))
     for folded, metric_name in _semantic_names(semantics, "metrics").items():

@@ -966,4 +966,4 @@ def test_a_window_bound_that_shares_a_name_drops_the_window(caplog):
         model = _model(_emit(contract), "customer_history")
     assert all("validity_params" not in (d.get("type_params") or {}) for d in model["dimensions"])
     assert "primary_entity" not in model
-    assert "the window is dropped" in caplog.text
+    assert "do not form a validity window" in caplog.text

@@ -326,6 +326,18 @@ class TestValidityWindow:
             "Make it type: time, or remove validityParams."
         ]
 
+    def test_a_bound_that_shares_its_metricflow_name_is_an_error(self):
+        """The bridge keeps the first of two names, so dbt would see one bound."""
+        contract = _scd()
+        contract["exposes"][0]["semantics"]["dimensions"][0]["name"] = "valid-from"
+        errors, _ = validate_semantics_block(contract)
+        assert errors == [
+            "exposes[customer_history].semantics: the validity window bound 'valid_from' shares "
+            "its name with another entity or dimension of the model. They share one namespace "
+            "in dbt MetricFlow, so the window would lose that bound: rename one of them."
+        ]
+        assert validity_window(contract["exposes"][0]["semantics"]) is None
+
     def test_validity_window_returns_the_bounds_and_the_key(self):
         semantics = _scd()["exposes"][0]["semantics"]
         assert validity_window(semantics) == ("valid_from", "valid_to", "customer")
