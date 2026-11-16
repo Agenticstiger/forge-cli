@@ -1017,6 +1017,13 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "validate",
     ),
+    "contract_data_rules": (
+        [
+            "Fix the rule the message names: invariants, identifier formats, placeholders and "
+            + "shared attributes are written as RFC-data-rules.md says, their texts in FLUID SQL/1",
+        ],
+        "validate",
+    ),
     "contract_extension": (
         [
             "Fix the extensions block the message names: the plugin that owns that key "
@@ -1157,6 +1164,10 @@ _EXAMPLES: Dict[str, str] = {
     "contract_build_id": "id: sales.orders_raw\n",
     "contract_packaging": _VERBOSE,
     "contract_semantics": _VERBOSE,
+    "contract_data_rules": (
+        "# exposes[].contract.invariants[]\n- id: gross_from_net\n  derive: gross\n"
+        "  expr: ROUND(net * (1 + tax_rate), 2)\n"
+    ),
     "contract_extension": _VERBOSE,
     "contract_validator_finding": _VERBOSE,
     "contract_overlay": "fluid validate contract.fluid.yaml --offline --env prod",
