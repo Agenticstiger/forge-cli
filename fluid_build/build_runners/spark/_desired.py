@@ -23,7 +23,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from fluid_build.build_runners.spark import _names
+from fluid_build.spark import names as _names
 
 #: The action ``fluid plan`` lists for each Spark build; ``fluid apply`` reconciles it.
 ACTION = "spark.reconcile"
@@ -188,8 +188,8 @@ class DesiredRun:
 
     def tags(self) -> Dict[str, str]:
         tags = {
-            "fluid_product": self.product,
-            "fluid_build": self.build,
+            _names.PRODUCT_TAG: self.product,
+            _names.BUILD_TAG: self.build,
             "fluid_config_hash": self.config_hash,
         }
         if self.source_id:
@@ -500,7 +500,7 @@ def desired_runs(
                 job_digest=job.digest,
                 runner_sha256=runner_sha,
                 job_uri=_names.job_config_uri(bucket, product, bid),
-                runner_uri=_names.runner_uri(bucket, runner_sha),
+                runner_uri=_names.runner_uri(bucket, product, bid, runner_sha),
                 run_name=_names.run_name(product, bid),
                 role_arn=role,
                 target=target,

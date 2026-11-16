@@ -5,8 +5,9 @@ import copy
 
 import pytest
 
-from fluid_build.build_runners.spark import _desired, _names
+from fluid_build.build_runners.spark import _desired
 from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
+from fluid_build.spark import names as _names
 from fluid_build.spark.compiler import CONTRACT_SQL_ALLOWLIST_ENV
 from tests.build_runners.spark.conftest import ACCOUNT, runs_of, spark_cfg
 
@@ -272,3 +273,15 @@ def test_names_of_different_builds_never_collide_on_hyphens():
     assert _names.glue_job_name("a-b", "c") != _names.glue_job_name("a", "b-c")
     long = _names.execution_role_name("p" * 100, "b" * 100)
     assert len(long) <= 64 and long.endswith("-spark")
+
+
+def test_the_runner_key_is_per_build_and_content_addressed(contract):
+    (run,) = _desired.desired_runs(contract, account=ACCOUNT)
+    prefix = "s3://commerce-lake/_fluid/spark/commerce.orders-stream/ingest-orders/runner/"
+    assert run.runner_uri == f"{prefix}{run.runner_sha256[:16]}/forge_spark_runner.py"
+
+
+def test_without_an_application_id_the_products_own_application_is_used(contract):
+    contract["builds"][0]["properties"]["parameters"]["spark"].pop("applicationId", None)
+    (run,) = _desired.desired_runs(contract, account=ACCOUNT)
+    assert run.target == {"applicationName": "fluid-commerce.orders-stream-spark"}
