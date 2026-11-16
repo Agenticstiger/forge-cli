@@ -46,7 +46,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser(
         COMMAND,
         help="Start a Spark build's run (for a scheduler) or show its runs",
-        description=__doc__.split("\n\n", 1)[0],
+        description=(
+            "Start a Spark build's run, or show its runs. fluid apply keeps a streaming "
+            "build running; a scheduler starts a scheduled one with fluid spark run."
+        ),
         epilog=_EPILOG,
     )
     sub = parser.add_subparsers(dest="spark_command", metavar="{run,status}")

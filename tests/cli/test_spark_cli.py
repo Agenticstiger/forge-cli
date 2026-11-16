@@ -29,6 +29,12 @@ LOG = logging.getLogger("test")
 def _env(monkeypatch):
     monkeypatch.setenv(HOST_ALLOWLIST_ENV, "msk.example,example.internal")
     monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-west-1")
+    # The account a bucketless output or a forge-created role needs: never an STS call, and
+    # never the developer's own AWS profile.
+    monkeypatch.setenv("AWS_ACCOUNT_ID", "123456789012")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")  # pragma: allowlist secret
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
 
 
 @pytest.fixture
