@@ -137,7 +137,12 @@ def _check(contract: Mapping[str, Any], args: Any, logger: logging.Logger) -> St
     try:
         target = resolve_state_target(args, resolved, provider)
     except CLIError as exc:
-        return _error(f"the state backend is not usable: {_cli_error_text(exc)}")
+        what = (
+            "the state encryption setting"
+            if str(exc.event).startswith("opentofu_state_encryption")
+            else "the state backend"
+        )
+        return _error(f"{what} is not usable: {_cli_error_text(exc)}")
     if target.backend is None and not _local_state_present(target.workdir):
         return _not_checked(
             f"no apply state for this contract at {target.workdir}: run from the directory "

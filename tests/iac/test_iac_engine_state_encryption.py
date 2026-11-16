@@ -162,3 +162,19 @@ class TestApplyFlag:
         args = parser.parse_args(["apply", "contract.fluid.yaml", "--migrate-state-encryption"])
         assert args.migrate_state_encryption is True
         assert parser.parse_args(["apply", "contract.fluid.yaml"]).migrate_state_encryption is False
+
+
+class TestDiffLabelsTheSetting:
+    def test_an_unusable_encryption_setting_is_not_called_the_backend(self, monkeypatch):
+        import logging
+
+        from fluid_build.cli._diff_state import check_state_drift
+
+        monkeypatch.setenv("FLUID_STATE_ENCRYPTION", "kms://alias/state")
+        contract = {
+            "id": "demo.encrypted",
+            "exposes": [{"exposeId": "t", "binding": {"platform": "aws", "location": {}}}],
+        }
+        args = argparse.Namespace(provider="aws", state_backend=None, workspace_dir=None)
+        report = check_state_drift(contract, args, logging.getLogger("test"))
+        assert report.detail.startswith("the state encryption setting is not usable"), report.detail
