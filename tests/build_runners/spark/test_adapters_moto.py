@@ -12,7 +12,9 @@ import threading
 
 import boto3
 import pytest
-from moto import mock_aws
+
+# moto is the [test-emulators] extra, not [dev]: the CI test lanes skip this module.
+mock_aws = pytest.importorskip("moto").mock_aws
 
 from fluid_build.build_runners.spark import _adapters as ad
 
