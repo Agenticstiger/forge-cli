@@ -2374,8 +2374,11 @@ def lf_tag_definitions(contract: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]
                 "Define the tags in the domain's or the platform's state, and keep only the "
                 "associations here: binding.governance.lakeFormation.tags names a tag "
                 "defined outside the contract by its key.",
-                "Or, in the contract that owns the vocabulary for the domain, declare it: "
-                "packaging.containers.lfTagVocabulary: isolated (schema 0.7.7).",
+                "Or, in the contract that owns the vocabulary for the domain, declare it at "
+                "the top level: packaging.containers.lfTagVocabulary: isolated (fluidVersion "
+                "0.7.7, preview). A packaging block makes the contract's other containers "
+                "follow its mode (isolated by default); a contract with a Kafka or Confluent "
+                "expose then also needs containers.cluster: shared and a pool.",
             ),
         )
     cid = aws_storage.contract_ident(contract)

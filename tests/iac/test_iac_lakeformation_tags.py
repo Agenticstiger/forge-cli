@@ -479,3 +479,22 @@ def test_a_product_associates_a_tag_the_domain_owns_without_defining_it():
     resources = _resources(contract)
     assert "aws_lakeformation_lf_tag" not in resources
     assert _association(contract)["lf_tag"] == [{"key": "classification", "value": "confidential"}]
+
+
+def test_a_domain_contract_on_a_shared_pool_still_owns_its_vocabulary():
+    contract = _contract({"classification": "confidential"}, {"classification": ["confidential"]})
+    contract["packaging"] = {
+        "mode": "shared",
+        "pool": "lake",
+        "containers": {"lfTagVocabulary": "isolated"},
+    }
+    tags = _resources(contract)["aws_lakeformation_lf_tag"]
+    assert [t["key"] for t in tags.values()] == ["classification"]
+
+
+def test_the_owner_remedy_names_what_a_packaging_block_also_decides():
+    contract = _contract({"classification": "confidential"}, {"classification": ["confidential"]})
+    contract.pop("packaging")
+    (remedy,) = [s for s in _refusal(contract).remediation if "lfTagVocabulary" in s]
+    assert "top level" in remedy and "0.7.7" in remedy
+    assert "containers.cluster: shared" in remedy

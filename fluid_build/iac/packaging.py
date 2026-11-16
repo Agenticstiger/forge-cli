@@ -110,7 +110,12 @@ _ALL_KINDS: FrozenSet[str] = frozenset(CONTAINER_KINDS)
 #: ``plan.json``'s ``packaging`` summary serializes ``decisions`` whole, so a
 #: new key there would change the plan digest of every contract that already
 #: declares a block. Their decisions live in ``preview_decisions`` and are read
-#: through :meth:`PackagingResolution.decision_for`. No emitter reads them yet.
+#: through :meth:`PackagingResolution.decision_for`. No emitter reads those
+#: decisions yet. The AWS emitter's LF-tag gate reads the declared
+#: ``containers.lfTagVocabulary`` key itself
+#: (``iac/providers/aws.py::_owns_lf_tag_vocabulary``), not the folded decision:
+#: a blanket ``mode: isolated`` resolves the kind OWNED, and must not hand every
+#: product the domain's tag vocabulary.
 PREVIEW_CONTAINER_KINDS: Tuple[str, ...] = (
     "lfTagVocabulary",
     "emrApplication",
