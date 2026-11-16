@@ -473,6 +473,19 @@ def test_detection_uses_the_cloud_names_fluid_apply_accepts(tmp_path, binding, e
     assert _contract_cloud_auth(str(tmp_path / "contract.fluid.yaml")) == expected
 
 
+@pytest.mark.parametrize(
+    "builds",
+    [["x"], [{"id": "a", "execution": "x"}], [{"id": "a", "execution": {"runtime": "sf"}}]],
+)
+def test_a_malformed_build_never_breaks_detection(tmp_path, builds):
+    from fluid_build.cli.generate_ci import _contract_cloud_auth
+
+    contract = _contract(_binding("aws"))
+    contract["builds"] = builds
+    _write(tmp_path, contract)
+    assert _contract_cloud_auth(str(tmp_path / "contract.fluid.yaml")) == ("aws",)
+
+
 def test_a_build_on_another_cloud_gets_its_own_login(tmp_path):
     from fluid_build.cli.generate_ci import _contract_cloud_auth
 

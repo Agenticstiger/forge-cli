@@ -589,14 +589,26 @@ def _contract_cloud_auth(contract_path: str) -> Tuple[str, ...]:
 
     found = set()
     for document in _contract_documents(contract_path):
+        if not isinstance(document, dict):
+            continue
         # The clouds `fluid apply` would detect (aliases such as bigquery or s3, and
         # binding.provider, included), and every build's own runtime cloud, since a
-        # build there needs a login too even beside another cloud's exposes.
-        found.update(detect_clouds(document))
-        for build in document.get("builds") or []:
+        # build there needs a login too even beside another cloud's exposes. A
+        # string where a mapping belongs is `fluid validate`'s to refuse: when
+        # detection trips on one, it runs again without the builds (read one by one
+        # below), so the rest of the contract still counts.
+        for candidate in (document, {k: v for k, v in document.items() if k != "builds"}):
+            try:
+                found.update(detect_clouds(candidate))
+                break
+            except (AttributeError, TypeError):
+                continue
+        builds = document.get("builds")
+        for build in builds if isinstance(builds, list) else []:
             if not isinstance(build, dict):
                 continue
-            runtime = (build.get("execution") or {}).get("runtime") or {}
+            execution = build.get("execution")
+            runtime = execution.get("runtime") if isinstance(execution, dict) else None
             found.add(canonical_cloud(build.get("provider")))
             found.add(canonical_cloud(runtime.get("platform") if isinstance(runtime, dict) else ""))
         for site in secret_ref_sites(document):
