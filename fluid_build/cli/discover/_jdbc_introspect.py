@@ -870,78 +870,17 @@ def introspect_jdbc(
             with the duckdb error preserved (operators want to see the
             "could not connect to server" message verbatim).
     """
-    try:
-        import duckdb
-    except ImportError as exc:
-        raise ImportError(
-            "duckdb is required for JDBC introspection. Install via ``pip install duckdb``."
-        ) from exc
-
-    kind = _normalize_kind(source)
-    args = _parse_uri(uri, kind)
-    alias = _validate_alias("source_db")
-
-    # The schema_filter goes into pass-through SQL as a literal; bound
-    # to a bare ident pattern to keep the surface tight.
+    # Refused before anything connects, in the order they always were: an
+    # unsupported source, a malformed URI, then a schema filter that is not a
+    # bare identifier (it goes into pass-through SQL as a literal).
+    _parse_uri(uri, _normalize_kind(source))
     if schema_filter is not None and not _IDENT_RE.match(schema_filter):
         raise ValueError(
             f"Invalid schema filter: {schema_filter!r}. " "Must match ``[A-Za-z_][A-Za-z0-9_]*``."
         )
 
-    from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
-
-    attach = {
-        "postgres": _attach_string_postgres,
-        "mysql": _attach_string_mysql,
-        "sqlite": _attach_string_sqlite,
-    }.get(kind)
-    # A password in a URI the operator did not type is the caller's own
-    # material: pin the connection to it and keep this host's ambient DB
-    # credentials, client certificate and service definitions out of the
-    # handshake, so an MCP client cannot borrow this host's identity. A URI the
-    # operator typed on the command line authenticates as it always did. A URI
-    # with no password is left to the host sources on purpose (the operator CLI
-    # relies on it; over MCP the --allow-metadata-service gate is what
-    # authorises it).
-    pin_own_material = (
-        kind in ("postgres", "mysql") and bool(args.get("password")) and not operator_supplied
-    )
-
-    def _before_lock(c: Any) -> None:
-        if kind == "postgres":
-            attach_sql = _attach_string_postgres(args, alias, operator_supplied=operator_supplied)
-        else:
-            attach_sql = attach(args, alias)  # type: ignore[misc]
-        password = args.get("password")
-        masked: Optional[str] = None
-        try:
-            if pin_own_material:
-                with _host_credential_env_suppressed():
-                    c.execute(attach_sql)
-            else:
-                c.execute(attach_sql)
-        except Exception as exc:
-            if not password:
-                raise
-            # The scanners quote the DSN in a connect error; keep the message,
-            # without the password.
-            masked = _mask_password(str(exc), password)
-        if masked is not None:
-            # Raised after the handler has ended, so the unmasked driver error is
-            # neither the cause nor the context of this one. Inside the handler,
-            # ``raise ... from None`` would only set __suppress_context__ (PEP 415)
-            # and leave the original, password and all, on __context__.
-            raise RuntimeError(masked)
-
-    # Install + load the extension (duckdb caches the binary, so this is fast
-    # on a second run) and ATTACH the source before the sandbox locks; the
-    # introspection queries after it reach that database and no file or URL.
-    con = secure_duckdb_connect(
-        ":memory:",
-        allow=DuckDBAllowlist.none(),
-        extensions=[kind] if attach is not None else [],
-        before_lock=_before_lock if attach is not None else None,
-    )
+    attached = attach_jdbc_source(source, uri, operator_supplied=operator_supplied)
+    con, alias, kind = attached.connection, attached.alias, attached.kind
     try:
 
         # Enumerate via duckdb's union ``information_schema`` view,
@@ -1005,6 +944,131 @@ def introspect_jdbc(
     finally:
         con.close()
 
+    return _group_introspected_rows(
+        rows,
+        table_filter,
+        pk_map,
+        fk_map,
+        check_map,
+        precision_map,
+        kind=kind,
+        database=attached.database,
+    )
+
+
+@dataclass(frozen=True)
+class AttachedSource:
+    """A sandboxed in-memory DuckDB with one JDBC source attached as :attr:`alias`.
+
+    The caller owns :attr:`connection` and closes it. Nothing else is
+    attached and no file or URL is readable: the sandbox locked after the
+    attach (:func:`fluid_build.providers._duckdb_sandbox.secure_duckdb_connect`).
+    """
+
+    connection: Any
+    alias: str
+    kind: str
+    #: The database name (postgres, mysql) or the file path (sqlite) the URI names.
+    database: str
+
+
+def attach_jdbc_source(source: str, uri: str, *, operator_supplied: bool = False) -> AttachedSource:
+    """Attach the JDBC database *uri* names to a sandboxed in-memory DuckDB.
+
+    The one place a JDBC source is opened, shared by ``fluid init --discover``
+    (through :func:`introspect_jdbc`) and ``fluid profile``: the DSN is built by
+    :func:`build_attach_dsn`, a URI's password is pinned to its own material
+    unless the operator typed the URI (*operator_supplied*), and a connect error
+    is raised with every reading of the password masked.
+
+    Raises ``ImportError`` without duckdb, ``ValueError`` for a malformed URI
+    or an unsupported *source*, and whatever the driver raises on connect.
+    """
+    try:
+        import duckdb  # noqa: F401  (the scanners below need it)
+    except ImportError as exc:
+        raise ImportError(
+            "duckdb is required for JDBC introspection. Install via ``pip install duckdb``."
+        ) from exc
+
+    kind = _normalize_kind(source)
+    args = _parse_uri(uri, kind)
+    alias = _validate_alias("source_db")
+
+    from fluid_build.providers._duckdb_sandbox import DuckDBAllowlist, secure_duckdb_connect
+
+    attach = {
+        "postgres": _attach_string_postgres,
+        "mysql": _attach_string_mysql,
+        "sqlite": _attach_string_sqlite,
+    }.get(kind)
+    # A password in a URI the operator did not type is the caller's own
+    # material: pin the connection to it and keep this host's ambient DB
+    # credentials, client certificate and service definitions out of the
+    # handshake, so an MCP client cannot borrow this host's identity. A URI the
+    # operator typed on the command line authenticates as it always did. A URI
+    # with no password is left to the host sources on purpose (the operator CLI
+    # relies on it; over MCP the --allow-metadata-service gate is what
+    # authorises it).
+    pin_own_material = (
+        kind in ("postgres", "mysql") and bool(args.get("password")) and not operator_supplied
+    )
+
+    def _before_lock(c: Any) -> None:
+        if kind == "postgres":
+            attach_sql = _attach_string_postgres(args, alias, operator_supplied=operator_supplied)
+        else:
+            attach_sql = attach(args, alias)  # type: ignore[misc]
+        password = args.get("password")
+        masked: Optional[str] = None
+        try:
+            if pin_own_material:
+                with _host_credential_env_suppressed():
+                    c.execute(attach_sql)
+            else:
+                c.execute(attach_sql)
+        except Exception as exc:
+            if not password:
+                raise
+            # The scanners quote the DSN in a connect error; keep the message,
+            # without the password.
+            masked = _mask_password(str(exc), password)
+        if masked is not None:
+            # Raised after the handler has ended, so the unmasked driver error is
+            # neither the cause nor the context of this one. Inside the handler,
+            # ``raise ... from None`` would only set __suppress_context__ (PEP 415)
+            # and leave the original, password and all, on __context__.
+            raise RuntimeError(masked)
+
+    # Install + load the extension (duckdb caches the binary, so this is fast
+    # on a second run) and ATTACH the source before the sandbox locks; the
+    # introspection queries after it reach that database and no file or URL.
+    con = secure_duckdb_connect(
+        ":memory:",
+        allow=DuckDBAllowlist.none(),
+        extensions=[kind] if attach is not None else [],
+        before_lock=_before_lock if attach is not None else None,
+    )
+    return AttachedSource(
+        connection=con,
+        alias=alias,
+        kind=kind,
+        database=args.get("dbname", args.get("path", "")),
+    )
+
+
+def _group_introspected_rows(
+    rows: List[Any],
+    table_filter: Optional[List[str]],
+    pk_map: Dict[str, Any],
+    fk_map: Dict[str, Any],
+    check_map: Dict[str, Any],
+    precision_map: Dict[Any, Any],
+    *,
+    kind: str,
+    database: str,
+) -> IntrospectedDatabase:
+    """Group ``information_schema`` rows and their constraints into tables."""
     # Group rows into IntrospectedTable.
     tables: Dict[str, IntrospectedTable] = {}
     keep = set(table_filter or [])
@@ -1036,7 +1100,7 @@ def introspect_jdbc(
 
     return IntrospectedDatabase(
         source_kind=kind,
-        database=args.get("dbname", args.get("path", "")),
+        database=database,
         tables=list(tables.values()),
     )
 
@@ -1048,5 +1112,7 @@ __all__ = [
     "IntrospectedForeignKey",
     "IntrospectedTable",
     "SUPPORTED_KINDS",
+    "AttachedSource",
+    "attach_jdbc_source",
     "introspect_jdbc",
 ]
