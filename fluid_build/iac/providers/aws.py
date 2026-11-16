@@ -92,6 +92,7 @@ from ..provider_match import is_cloud
 from ..row_access import RowFilter, row_filters_for
 from ..versions import required_providers
 from . import aws_storage
+from .aws_schema_registry import emit_schema_registry, emit_schema_registry_data
 from .aws_storage import Retention
 
 LOG = logging.getLogger(__name__)
@@ -729,6 +730,8 @@ class AwsIacPlugin:
                 masked_views=masked_views,
                 lf_tags=lf_tags,
             )
+        # Produced Kafka subjects on the Glue Schema Registry (aws_schema_registry.py).
+        emit_schema_registry(resources, contract, cid, base_tags)
         # Retention (exposes[].lifecycle) and encryption at rest
         # (binding.encryption), per bucket this product owns. Nothing is
         # added for a contract that declares neither.
@@ -799,6 +802,7 @@ class AwsIacPlugin:
         # existing key a binding names.
         _emit_product_key_policy_data(data, storage)
         _emit_existing_key_data(data, storage)
+        emit_schema_registry_data(data, contract, cid)
         return data
 
     def credential_env(self, env: Mapping[str, str]) -> Dict[str, str]:

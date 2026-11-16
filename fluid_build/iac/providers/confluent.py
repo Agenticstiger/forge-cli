@@ -102,6 +102,15 @@ class ConfluentIacPlugin:
         "CONFLUENT_CLOUD_API_SECRET",
         "TABLEFLOW_API_KEY",
         "TABLEFLOW_API_SECRET",
+        # Produced subjects (confluent_schema, confluent_subject_config) use the
+        # provider-level registry: its id, REST endpoint and API key. Nothing about
+        # the registry is written into the module, so no credential reaches the
+        # state; `fluid plan` checks the endpoint is the contract's registry url
+        # (schema_registry/verify.py).
+        "SCHEMA_REGISTRY_ID",
+        "SCHEMA_REGISTRY_REST_ENDPOINT",
+        "SCHEMA_REGISTRY_API_KEY",
+        "SCHEMA_REGISTRY_API_SECRET",
     )
     credential_env_prefixes = ("CONFLUENT_", "TABLEFLOW_")
 
@@ -111,7 +120,10 @@ class ConfluentIacPlugin:
         resources: Dict[str, Dict[str, Any]] = {}
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
         for exposure, _binding, loc in _confluent_exposures(contract):
+            if str(_binding.get("format") or "").lower() == "kafka_topic":
+                continue  # a topic, not a Tableflow table: its subject is emitted below
             _emit_tableflow(resources, loc, exposure, cid)
+        _emit_subjects(resources, contract, cid)
         return resources
 
     def emit_data(
@@ -202,20 +214,47 @@ def _emit_tableflow(
     }
 
 
+def _registry_findings(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
+    """The schema registry checks, and a ``kafka_topic`` expose that names no registry.
+
+    A ``platform: confluent`` + ``format: kafka_topic`` expose is a topic whose value
+    schema this plugin registers (:func:`_emit_subjects`), so it needs
+    ``binding.properties.registry``.
+    """
+    from ...schema_registry.policy import validation_findings
+
+    errors, warnings = validation_findings(contract)
+    for exposure, binding, _loc in _confluent_exposures(contract):
+        fmt = str(binding.get("format") or "").lower()
+        if fmt == "kafka_topic" and (binding.get("properties") or {}).get("registry") is None:
+            errors.append(
+                f"expose '{exposure.get('exposeId') or '?'}': platform=confluent with "
+                "format=kafka_topic registers the topic's value schema, and "
+                "binding.properties.registry names none"
+            )
+    return errors, warnings
+
+
 def validate_confluent_binding(contract: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
     """Plan-time gate for confluent-bound exposures (RFC §15 pt3, anti-no-op).
 
     The Tableflow emitter has hard required inputs that have no other home in the
     contract — without them it would silently emit an incomplete module. Surface
     a clean error at validate time instead. Returns ``(errors, warnings)``.
+
+    ``fluid validate`` calls this for every contract, so it also carries the schema
+    registry checks of every engine and cloud (``schema_registry/policy.py::
+    validation_findings``): the shape of ``binding.properties.registry``, offline, and
+    the egress rules with their validate severities (a missing operator entry warns).
     """
-    errors: List[str] = []
-    warnings: List[str] = []
     cid = safe_ident(contract.get("id") or contract.get("name") or "product")
     names: Dict[str, str] = {}
+    errors, warnings = _registry_findings(contract)
     for exposure, binding, loc in _confluent_exposures(contract):
         eid = exposure.get("exposeId") or "?"
         fmt = str(binding.get("format") or "").lower()
+        if fmt == "kafka_topic":
+            continue  # a topic: _registry_findings checked it
         if fmt not in _ICEBERG_FORMATS:
             errors.append(
                 f"expose '{eid}': platform=confluent requires binding.format=iceberg "
@@ -267,3 +306,78 @@ def validate_confluent_binding(contract: Mapping[str, Any]) -> Tuple[List[str], 
         else:
             names.setdefault(rname, eid)
     return errors, warnings
+
+
+def _emit_subjects(resources: Dict[str, Any], contract: Mapping[str, Any], cid: str) -> None:
+    """``confluent_subject_config`` + ``confluent_schema`` for each produced Confluent subject.
+
+    A Kafka-bound expose (``platform: kafka``, or ``platform: confluent`` with
+    ``format: kafka_topic``) whose ``binding.properties.registry`` is ``kind:
+    confluent`` (founder decision D7, 2026-11-16):
+
+    * ``confluent_subject_config``: the contract's ``compatibility``, default
+      ``BACKWARD_TRANSITIVE``, set before the first version is registered.
+    * ``confluent_schema``: the value schema derived from the expose's
+      ``contract.schema`` (``schema_registry/produced.py``), as canonical text, with
+      ``metadata``: the classification as a property and each personal-data column
+      tagged ``PII`` (Confluent data-contract field tags).
+
+    The registry itself comes from the provider-level ``SCHEMA_REGISTRY_*`` settings,
+    never from the module. The provider checks a new version with ``POST
+    /compatibility/subjects/{subject}/versions``, which Confluent Platform 7+ and
+    Confluent Cloud serve (Karapace 4.1 and Redpanda 24.2 do not, verified
+    2026-11-16). A ``kind: glue`` subject on a ``platform: kafka`` expose belongs to
+    the aws plugin and is refused here, never skipped. Arguments borrowed from
+    confluentinc/terraform-provider-confluent (MPL-2.0) docs/resources/confluent_schema.md
+    and confluent_subject_config.md.
+    """
+    from ...schema_registry.produced import (
+        ProducedSubjectError,
+        classification_metadata,
+        schema_definition,
+    )
+    from ...schema_registry.reference import produced_subjects
+    from ..base import UnsupportedBindingError
+
+    exposes = {
+        str(e.get("exposeId") or i): e
+        for i, e in enumerate(contract.get("exposes") or [])
+        if isinstance(e, Mapping)
+    }
+    for subject in produced_subjects(contract):
+        expose = exposes.get(subject.owner, {})
+        ref = subject.ref
+        if ref.kind != "confluent":
+            platform = str((expose.get("binding") or {}).get("platform") or "").lower()
+            if platform == "kafka":
+                raise UnsupportedBindingError(
+                    "schema-registry-route",
+                    f"{ref.where}: a Glue Schema Registry subject is registered by the aws "
+                    "OpenTofu plugin, and this contract is emitted by the confluent one",
+                )
+            continue
+        try:
+            data_format, definition = schema_definition(subject, f"fluid.{cid}")
+        except ProducedSubjectError as exc:
+            raise UnsupportedBindingError(exc.kind, str(exc)) from exc
+        name = safe_ident(f"{cid}_{ref.subject}")
+        if name in resources.get("confluent_schema", {}):
+            raise UnsupportedBindingError(
+                "schema-registry-duplicate-subject",
+                f"{ref.where}: subject {ref.subject!r} is produced by two exposes, or by two "
+                "that name it differently only in punctuation",
+            )
+        resources.setdefault("confluent_subject_config", {})[name] = {
+            "subject_name": ref.subject,
+            "compatibility_level": ref.effective_compatibility,
+        }
+        schema: Dict[str, Any] = {
+            "subject_name": ref.subject,
+            "format": data_format,
+            "schema": definition,
+            "depends_on": [f"confluent_subject_config.{name}"],
+        }
+        metadata = classification_metadata(contract, expose)
+        if metadata:
+            schema["metadata"] = metadata
+        resources.setdefault("confluent_schema", {})[name] = schema
