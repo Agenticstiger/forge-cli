@@ -1039,6 +1039,19 @@ def _run_contract_rules(
         # Secret references against the grammar and the operator's policy.
         _check_secret_refs(validation_result, contract)
 
+        # forge Spark builds, compiled to their job config under the operator's broker,
+        # registry and secrets policy (an unlisted host warns here, refuses at run time).
+        from fluid_build.spark import compiler as _spark
+
+        _add_findings(
+            validation_result,
+            contract,
+            "contract_spark",
+            _spark.validation_errors(contract),
+            _spark.validation_warnings(contract),
+            anchor="builds",
+        )
+
         # --- Iceberg streaming-sink checks (RFC-streaming-extension §6.8) --
         # Catch the connector's silent-fail-at-first-record traps at validate
         # time: a sink with no Iceberg expose, the v1-deferred upsert mode,

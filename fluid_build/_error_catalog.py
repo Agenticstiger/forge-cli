@@ -885,6 +885,15 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "validate",
     ),
+    "contract_spark": (
+        [
+            "Change the Spark build the message names so the forge Spark runner can run it; "
+            + "the message names the field and what it needs",
+            "A host the operator has not listed is a warning here and a refusal when the job "
+            + "is compiled for apply: ask the operator to list it",
+        ],
+        "validate",
+    ),
     # contract rules (fluid validate's checks after JSON Schema)
     "contract_sovereignty": (
         [
@@ -1116,6 +1125,7 @@ _EXAMPLES: Dict[str, str] = {
     "contract_schema_invalid": _SHOW_SCHEMA,
     "contract_streaming_types": _SHOW_SCHEMA,
     "contract_managed_flink": _VERBOSE,
+    "contract_spark": _VERBOSE,
     "contract_sovereignty": "sovereignty:\n  jurisdiction: EU\n  allowedRegions:\n  - europe-west1\n",
     "contract_agent_policy": (
         "exposes:\n- exposeId: orders_raw\n  policy:\n    agentPolicy:\n"

@@ -24,7 +24,7 @@ null propagation, and :func:`spark_source_select` reads the value, key and metad
 columns from the Spark Kafka source's own columns (``key``, ``value``, ``topic``,
 ``partition``, ``offset``, ``timestamp``, ``timestampType``, ``headers``) once the
 runner has decoded ``key`` and ``value``. A mapped column may set ``maskAtIngest:
-hash``, Spark only: the column is the SHA-256 of the source, in lowercase hex.
+hash``, Spark only: the column is the keyed HMAC-SHA256 of the source, in lowercase hex.
 """
 
 from __future__ import annotations
@@ -41,6 +41,9 @@ SOURCE_TABLE = "source_events"
 #: and ``value`` decoded (a struct, or the raw bytes of a raw key).
 SPARK_RECORDS_TABLE = "kafka_records"
 DIALECTS = ("flink", "spark")
+#: The function a ``maskAtIngest: hash`` column calls on Spark: the runner registers it as
+#: HMAC-SHA256 under the product's key (binary in, lowercase hex out, null to null).
+SPARK_MASK_FUNCTION = "fluid_mask"
 VALUE_FORMATS = ("json", "avro-confluent")
 KEY_FORMATS = ("raw", "json", "avro-confluent")
 _SRC = "src"
@@ -629,7 +632,14 @@ class _Compiler:
         raise ValueError(f"{where}: {name} cannot be read from {source_path}: {difference}")
 
     def _mask(self, ref: _Ref, target: LogicalType, override: _Override, name: str) -> str:
-        """``maskAtIngest: hash``: the SHA-256 of the source, lowercase hex; null stays null."""
+        """``maskAtIngest: hash``: the keyed HMAC-SHA256 of the source, lowercase hex.
+
+        The runner registers :data:`SPARK_MASK_FUNCTION` with the product's key, read from
+        AWS Secrets Manager at the job's start, so the digest cannot be reversed by hashing
+        a dictionary of likely values (emails, phone numbers) the way a plain SHA-256 can.
+        It reads the value's bytes: a binary as it is, anything else as its UTF-8 text.
+        Null stays null.
+        """
         where = f"{override.where}.maskAtIngest"
         if ref.dtype.kind not in _MASKABLE:
             raise ValueError(
@@ -642,8 +652,13 @@ class _Compiler:
             raise ValueError(
                 f"{where}: {name} is required, but {show(override.source)} can be null"
             )
-        value = ref.sql if ref.dtype.kind == "binary" else f"CAST({ref.sql} AS STRING)"
-        return f"sha2({value}, 256)"
+        if ref.dtype.kind == "binary":
+            value = ref.sql
+        elif ref.dtype.kind == "string":
+            value = f"CAST({ref.sql} AS BINARY)"
+        else:
+            value = f"CAST(CAST({ref.sql} AS STRING) AS BINARY)"
+        return f"{SPARK_MASK_FUNCTION}({value})"
 
     def target(self, path: tuple[str, ...], dtype: LogicalType) -> _Out:
         name = ".".join(path)
