@@ -18,7 +18,7 @@ duckdb = pytest.importorskip("duckdb")
 
 pytestmark = pytest.mark.unit
 
-SECRET = "s3cr3t-value-9431"
+SECRET = "s3cr3t-value-9431"  # pragma: allowlist secret
 
 
 def _ndjson(path: Path, *lines: str) -> Path:

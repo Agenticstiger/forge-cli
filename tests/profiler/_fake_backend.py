@@ -32,6 +32,7 @@ from fluid_build.profiler._stats import DocumentRefused, ReadRefused
 FIXTURES = Path(__file__).parent / "fixtures"
 SCHEMA_PATH = FIXTURES / "profile-1.schema.json"
 #: flux-engine main 2205253 (2026-11-16), docs/spec/profile-1.schema.json.
+# pragma: allowlist nextline secret
 SCHEMA_SHA256 = "fde1dfedd35a20556643ca9102c6886de3982b8761e8730d70d46fdc7c360674"
 
 _EVERY = frozenset({"category", "number", "timestamp"})

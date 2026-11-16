@@ -106,7 +106,7 @@ def test_an_unknown_expose_is_named_with_the_ones_there_are(workspace, registry,
 
 
 def test_an_unreadable_source_is_reported_with_its_password_masked(workspace, registry, capsys):
-    secret = "pw-77123"
+    secret = "pw-77123"  # pragma: allowlist secret
     rc = main(
         [
             "profile",
