@@ -42,6 +42,8 @@ LOG = logging.getLogger(__name__)
 
 #: The ``plan.json`` key the checks are recorded under.
 PLAN_KEY = "schemaRegistry"
+#: The compatibility modes under which the registry's own check is plan's question.
+_READER_MODES = frozenset({"BACKWARD", "BACKWARD_TRANSITIVE"})
 
 
 def _writer(sv: Any) -> Tuple[List[Dict[str, Any]], str, Dict[str, str]]:
@@ -100,13 +102,22 @@ def _check(
                 namespace=full.rpartition(".")[0] or None,
                 names=names,
             )
-            ok, messages = client.check_compatibility(
-                ref.subject, sv.version, schema_text(reader), expected
-            )
             try:
                 record["mode"] = client.compatibility_level(ref.subject)
             except RegistryError:
                 pass
+            ok, messages = client.check_compatibility(
+                ref.subject, sv.version, schema_text(reader), expected
+            )
+            # The registry judges the declared schema as the subject's next version under
+            # the subject's mode. Only a BACKWARD mode asks what plan asks (can this
+            # reader read version N's records); FORWARD and FULL also ask whether the
+            # producer's schema reads ours, which a consumer reading a subset fails. So
+            # the registry's verdict decides only under BACKWARD; the comparison below
+            # always runs.
+            if record.get("mode") not in _READER_MODES:
+                record["registryVerdict"] = "compatible" if ok else "not-compatible"
+                ok = True
             if not ok:
                 said = "; ".join(messages) or "no reason given"
                 return record, (
@@ -178,6 +189,30 @@ def _operator_endpoint(
         )
 
 
+def _produced_checks(
+    contract: Mapping[str, Any],
+    produced: List[Subject],
+    stage: str,
+    environ: Optional[Mapping[str, str]],
+    errors: List[str],
+    warnings: List[str],
+) -> None:
+    """Egress, the derivable schema, and the operator's endpoint, for each produced subject."""
+    from .policy import subject_findings
+    from .produced import produced_findings
+
+    for subject in produced:
+        errors.extend(m for _, m in subject_findings(subject, stage=stage, environ=environ))
+        more_errors, more_warnings = produced_findings(contract, subject)
+        errors.extend(more_errors)
+        warnings.extend(more_warnings)
+        if subject.ref.kind == "confluent":
+            found: List[str] = []
+            _operator_endpoint(subject, environ, errors, found)
+            # Apply is where OpenTofu registers it: an unset endpoint cannot register.
+            (errors if stage == "apply" else warnings).extend(found)
+
+
 def verify_consumed(
     contract: Mapping[str, Any],
     *,
@@ -201,10 +236,7 @@ def verify_consumed(
         produced = [] if errors else produced_subjects(contract)
     except RegistryShapeError as exc:
         return records, [*errors, str(exc)], warnings
-    for subject in produced:
-        errors.extend(m for s, m in subject_findings(subject, stage="plan", environ=environ))
-        if subject.ref.kind == "confluent":
-            _operator_endpoint(subject, environ, errors, warnings)
+    _produced_checks(contract, produced, "plan", environ, errors, warnings)
     if confluent is None:
         from .clients import ConfluentRegistry
 
@@ -288,7 +320,7 @@ def attach_registry_checks(
         if record.get("result") == "compatible":
             cprint(
                 f"Schema registry: {record['kind']} subject {record['subject']!r} "
-                f"version {record['version']} matches build {record['build']!r}'s stream.schema"
+                f"version {record['version']} matches the stream.schema of build {record['build']!r}"
             )
     plan[PLAN_KEY] = {"checked": records}
     # The kafka-connect blocks are the converter's at run time: neither checked nor
@@ -312,8 +344,9 @@ def verify_at_apply(
     egress rules at their run severity, then ``resolve_secret`` for that one host
     (the secrets policy: scheme, prefix, the ``apply`` stage, the ``NAME@host``
     grant), then the same read and comparison as plan, with the credential as Basic
-    auth over https. A dry run fetches nothing and checks nothing. Returns the
-    records; raises on the first failure set.
+    auth over https. A dry run fetches no secret and reads no registry. Every
+    produced subject gets plan's checks again, with an unset
+    ``SCHEMA_REGISTRY_REST_ENDPOINT`` an error here. Returns the records.
 
     Raises:
         CLIError: ``apply_schema_registry_failed`` with every error.
@@ -321,16 +354,22 @@ def verify_at_apply(
     from urllib.parse import urlsplit
 
     from .policy import subject_findings
-    from .reference import checked_subjects
+    from .reference import RegistryShapeError, checked_subjects, produced_subjects
 
-    subjects = [s for s in checked_subjects(contract) if s.ref.secret_ref]
-    if dry_run or not subjects:
-        return []
+    errors: List[str] = []
+    warnings: List[str] = []
+    try:
+        produced = produced_subjects(contract)
+    except RegistryShapeError as exc:
+        produced, errors = [], [str(exc)]
+    # Produced subjects: what OpenTofu registers, and where, re-checked here, where the
+    # environment tofu runs with is final (a plan made elsewhere did not see it).
+    _produced_checks(contract, produced, "apply", environ, errors, warnings)
+    subjects = [] if dry_run else [s for s in checked_subjects(contract) if s.ref.secret_ref]
     if confluent is None:
         from .clients import ConfluentRegistry
 
         confluent = ConfluentRegistry
-    errors: List[str] = []
     records: List[Dict[str, Any]] = []
     for subject in subjects:
         ref = subject.ref
@@ -377,11 +416,13 @@ def verify_at_apply(
                 ),
             },
         )
-    from fluid_build.cli.console import cprint
+    from fluid_build.cli.console import cprint, warning
 
+    for message in warnings:
+        warning(message)
     for record in records:
         cprint(
             f"Schema registry: {record['kind']} subject {record['subject']!r} "
-            f"version {record['version']} matches build {record['build']!r}'s stream.schema"
+            f"version {record['version']} matches the stream.schema of build {record['build']!r}"
         )
     return records

@@ -124,8 +124,8 @@ def test_metadata_carries_classification_and_pii_tags():
     metadata = emit(make())["confluent_schema"][KEY]["metadata"]
     assert metadata["properties"] == {"fluid_classification": "Confidential"}
     assert metadata["tags"] == [
-        {"key": "orders_v1.email", "value": ["PII"]},
-        {"key": "orders_v1.phone", "value": ["PII"]},
+        {"key": "fluid.gold_orders.orders_v1.email", "value": ["PII"]},
+        {"key": "fluid.gold_orders.orders_v1.phone", "value": ["PII"]},
     ]
 
 
@@ -297,3 +297,11 @@ def test_the_tableflow_checks_are_unchanged_for_an_iceberg_expose():
     }
     errors, _ = validate_confluent_binding(contract)
     assert errors and not any("registry" in e for e in errors)
+
+
+def test_a_glue_registry_on_a_kafka_expose_is_skipped_when_aws_is_bound_too():
+    contract = make(registry={"kind": "glue", "registryName": "commerce"}, platform="kafka")
+    contract["exposes"].append(
+        {"exposeId": "lake", "binding": {"platform": "aws", "format": "iceberg"}}
+    )
+    assert "confluent_schema" not in emit(contract)

@@ -22,8 +22,9 @@ OpenTofu (founder decision D7, 2026-11-16). For each Kafka-bound expose whose
   its plan digest are stable. A changed definition is a new schema version, and Glue
   refuses one its mode does not allow, at apply.
 
-A ``kind: confluent`` registry on a ``platform: kafka`` expose has no route through
-this plugin (the confluentinc provider registers it) and is refused, never skipped.
+A ``kind: confluent`` registry on a ``platform: kafka`` expose is the confluent
+plugin's (``fluid generate iac --provider confluent``): skipped when the contract binds
+a ``platform: confluent`` expose, else refused, since nothing would register it.
 
 Called from :class:`~.aws.AwsIacPlugin` at one site each in ``emit`` and ``emit_data``.
 Borrowed: the resource and data source arguments are hashicorp/aws's (MPL-2.0,
@@ -34,7 +35,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterator, Mapping, Tuple
 
-from ...schema_registry.produced import ProducedSubjectError, owns_registry, schema_definition
+from ...schema_registry.produced import (
+    ProducedSubjectError,
+    cloud_bound,
+    owns_registry,
+    schema_definition,
+)
 from ...schema_registry.reference import Subject, produced_subjects
 from ..base import UnsupportedBindingError
 from ..naming import safe_ident, tofu_ref
@@ -56,7 +62,7 @@ def _glue_subjects(contract: Mapping[str, Any]) -> Iterator[Tuple[Subject, Mappi
         platform = str((expose.get("binding") or {}).get("platform") or "").lower()
         if subject.ref.kind == "glue":
             yield subject, expose
-        elif platform == "kafka":
+        elif platform == "kafka" and not cloud_bound(contract, "confluent"):
             raise UnsupportedBindingError(
                 "schema-registry-route",
                 f"{subject.ref.where}: a Confluent subject is registered by the confluent "

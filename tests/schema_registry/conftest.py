@@ -73,8 +73,29 @@ def consumed_contract(registry, fmt="avro-confluent", topic="orders", columns=No
     }
 
 
-def produced_contract(registry, platform="kafka", fmt="kafka_topic", serialization="avro"):
-    """A contract with one Kafka expose that registers its value schema in ``registry``."""
+def produced_contract(
+    registry, platform="kafka", fmt="kafka_topic", serialization="avro", bound=True
+):
+    """A contract with one Kafka expose that registers its value schema in ``registry``.
+
+    ``bound`` adds an expose on the cloud whose OpenTofu plugin registers that kind
+    (aws for glue, confluent for confluent), as a real product has.
+    """
+    contract = _produced(registry, platform, fmt, serialization)
+    kind = registry.get("kind") if isinstance(registry, dict) else None
+    if bound and kind in ("glue", "confluent"):
+        cloud = "aws" if kind == "glue" else "confluent"
+        contract["exposes"].append(
+            {
+                "exposeId": "lake",
+                "kind": "table",
+                "binding": {"platform": cloud, "format": "iceberg", "location": {"table": "t"}},
+            }
+        )
+    return contract
+
+
+def _produced(registry, platform, fmt, serialization):
     return {
         "fluidVersion": "0.7.7",
         "id": "t.producer",

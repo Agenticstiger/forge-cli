@@ -305,3 +305,20 @@ class TestValidationFindings:
         monkeypatch.setenv(HOSTS, HOST)
         monkeypatch.setenv(GRANTS, f"SCHEMA_REGISTRY_API_SECRET@{HOST}")
         assert validation_findings(contract) == ([], [])
+
+
+class TestProducedFindings:
+    def test_a_column_no_registry_format_carries_fails_at_validate(self):
+        contract = produced_contract({"kind": "glue"})
+        contract["exposes"][0]["contract"]["schema"].append({"name": "v", "type": "varchar(255)"})
+        errors, _ = validation_findings(contract, environ={})
+        assert any("varchar(255)" in e for e in errors)
+
+    @pytest.mark.parametrize("kind, cloud", [("glue", "aws"), ("confluent", "confluent")])
+    def test_no_bound_cloud_warns_that_nothing_registers_it(self, kind, cloud):
+        registry = (
+            {"kind": kind} if kind == "glue" else {"kind": kind, "url": "http://localhost:8081"}
+        )
+        contract = produced_contract(registry, bound=False)
+        _, warnings = validation_findings(contract, environ={})
+        assert any(f"no expose binds {cloud}" in w for w in warnings)

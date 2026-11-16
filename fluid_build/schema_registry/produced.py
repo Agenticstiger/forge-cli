@@ -93,11 +93,14 @@ def owns_registry(contract: Mapping[str, Any], expose: Mapping[str, Any]) -> boo
     return choice == "isolated"
 
 
-def classification_metadata(contract: Mapping[str, Any], expose: Mapping[str, Any]) -> dict:
+def classification_metadata(
+    contract: Mapping[str, Any], expose: Mapping[str, Any], namespace: str = ""
+) -> dict:
     """Confluent ``metadata`` for a produced subject: classification and PII field tags.
 
     ``properties`` carries the expose's classification (else the contract's); ``tags``
-    maps each personal-data column, as ``<record>.<field>``, to ``PII`` (Confluent data
+    maps each personal-data column, by its field's full name (``<namespace>.<record>.
+    <field>``, the names :func:`schema_definition` registers), to ``PII`` (Confluent data
     contracts' field-tag shape). Empty parts are left out.
     """
     from fluid_build.api.changelog_rules import _is_pii
@@ -111,7 +114,9 @@ def classification_metadata(contract: Mapping[str, Any], expose: Mapping[str, An
     classification = policy.get("classification") or metadata_block.get("classification")
     binding = expose.get("binding") or {}
     topic = (binding.get("location") or {}).get("topic") or expose.get("exposeId") or ""
-    record = avro_name(str(topic))
+    record = ".".join(
+        [*(avro_name(part) for part in namespace.split(".") if part), avro_name(str(topic))]
+    )
     schema = ((expose.get("contract") or {}).get("schema")) or []
     pii = sorted(
         str(c.get("name"))
@@ -124,3 +129,48 @@ def classification_metadata(contract: Mapping[str, Any], expose: Mapping[str, An
     if pii:
         out["tags"] = [{"key": f"{record}.{name}", "value": ["PII"]} for name in pii]
     return out
+
+
+#: The cloud whose OpenTofu plugin registers a subject of each registry kind.
+REGISTERING_CLOUD = {"glue": "aws", "confluent": "confluent"}
+
+
+def cloud_bound(contract: Mapping[str, Any], kind: str) -> bool:
+    """Whether an expose binds the cloud that registers a ``kind`` subject.
+
+    ``fluid generate iac`` and ``fluid apply`` pick the OpenTofu plugin from the
+    exposes' clouds, and ``platform: kafka`` is none: a Glue subject is registered by
+    the aws plugin, so the contract needs an AWS-bound expose; a Confluent subject by
+    the confluent plugin, which a ``platform: confluent`` expose selects.
+    """
+    from fluid_build.iac.provider_match import is_cloud
+
+    cloud = REGISTERING_CLOUD[kind]
+    return any(
+        is_cloud((e.get("binding") or {}), cloud)
+        for e in contract.get("exposes") or []
+        if isinstance(e, Mapping)
+    )
+
+
+def produced_findings(contract: Mapping[str, Any], subject: Subject) -> Tuple[list, list]:
+    """``(errors, warnings)`` that ``fluid validate`` and ``fluid plan`` report early.
+
+    The schema text OpenTofu would register, derived now, so a column type no registry
+    format carries fails here and not at apply; and a subject no bound cloud's plugin
+    would register (a warning: nothing is registered for it).
+    """
+    errors: list = []
+    warnings: list = []
+    try:
+        schema_definition(subject, f"fluid.{contract.get('id') or 'product'}")
+    except ProducedSubjectError as exc:
+        errors.append(str(exc))
+    if not cloud_bound(contract, subject.ref.kind):
+        cloud = REGISTERING_CLOUD[subject.ref.kind]
+        warnings.append(
+            f"{subject.ref.where}: no expose binds {cloud}, so no OpenTofu module registers "
+            f"subject {subject.ref.subject!r}: the {subject.ref.kind} subjects of a product "
+            f"are registered by its {cloud} plugin"
+        )
+    return errors, warnings

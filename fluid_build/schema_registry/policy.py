@@ -227,9 +227,10 @@ def validation_findings(
     for subject in subjects:
         for severity, message in subject_findings(subject, stage="validate", environ=environ):
             (errors if severity == "error" else warnings).append(message)
-        if subject.role == "produced" and not subject.columns:
-            errors.append(
-                f"{subject.ref.where}: a produced subject is registered from the expose's "
-                "contract.schema, and it declares no columns"
-            )
+        if subject.role == "produced":
+            from .produced import produced_findings
+
+            more_errors, more_warnings = produced_findings(contract, subject)
+            errors.extend(more_errors)
+            warnings.extend(more_warnings)
     return errors, warnings

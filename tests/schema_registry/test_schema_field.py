@@ -40,7 +40,7 @@ def _validate(manager, contract):
 
 def _with_registry(registry) -> dict:
     contract = _contract()
-    contract["exposes"][0]["binding"]["properties"]["registry"] = registry
+    contract["exposes"][1]["binding"]["properties"]["registry"] = registry
     return contract
 
 
@@ -84,7 +84,7 @@ def test_refused(manager, registry):
 
 def test_other_binding_properties_stay_free_form(manager):
     contract = _contract()
-    contract["exposes"][0]["binding"]["properties"]["cluster_by"] = ["order_id"]
+    contract["exposes"][1]["binding"]["properties"]["cluster_by"] = ["order_id"]
     assert _validate(manager, contract).is_valid
 
 
@@ -106,7 +106,7 @@ def test_validate_warns_for_a_registry_on_a_binding_that_is_no_topic():
     from fluid_build.iac.providers.confluent import validate_confluent_binding
 
     contract = copy.deepcopy(_contract())
-    contract["exposes"][0]["binding"].update(platform="aws", format="iceberg")
+    contract["exposes"][1]["binding"].update(platform="aws", format="iceberg")
     errors, warnings = validate_confluent_binding(contract)
     assert any("is ignored" in w for w in warnings)
-    assert not any("exposes[0].binding.properties.registry" in e for e in errors)
+    assert not any("exposes[1].binding.properties.registry" in e for e in errors)

@@ -327,13 +327,15 @@ def _emit_subjects(resources: Dict[str, Any], contract: Mapping[str, Any], cid: 
     /compatibility/subjects/{subject}/versions``, which Confluent Platform 7+ and
     Confluent Cloud serve (Karapace 4.1 and Redpanda 24.2 do not, verified
     2026-11-16). A ``kind: glue`` subject on a ``platform: kafka`` expose belongs to
-    the aws plugin and is refused here, never skipped. Arguments borrowed from
+    the aws plugin: skipped when the contract binds an AWS expose (``--provider aws``
+    registers it), else refused, since nothing would. Arguments borrowed from
     confluentinc/terraform-provider-confluent (MPL-2.0) docs/resources/confluent_schema.md
     and confluent_subject_config.md.
     """
     from ...schema_registry.produced import (
         ProducedSubjectError,
         classification_metadata,
+        cloud_bound,
         schema_definition,
     )
     from ...schema_registry.reference import produced_subjects
@@ -349,7 +351,7 @@ def _emit_subjects(resources: Dict[str, Any], contract: Mapping[str, Any], cid: 
         ref = subject.ref
         if ref.kind != "confluent":
             platform = str((expose.get("binding") or {}).get("platform") or "").lower()
-            if platform == "kafka":
+            if platform == "kafka" and not cloud_bound(contract, "glue"):
                 raise UnsupportedBindingError(
                     "schema-registry-route",
                     f"{ref.where}: a Glue Schema Registry subject is registered by the aws "
@@ -377,7 +379,7 @@ def _emit_subjects(resources: Dict[str, Any], contract: Mapping[str, Any], cid: 
             "schema": definition,
             "depends_on": [f"confluent_subject_config.{name}"],
         }
-        metadata = classification_metadata(contract, expose)
+        metadata = classification_metadata(contract, expose, f"fluid.{cid}")
         if metadata:
             schema["metadata"] = metadata
         resources.setdefault("confluent_schema", {})[name] = schema

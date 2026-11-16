@@ -180,3 +180,33 @@ def test_the_engine_calls_it_once_before_any_tofu_apply():
     assert source.count("_verify_registry_at_apply(") == 1
     assert source.index("_verify_registry_at_apply(") < source.index("if bound is not None")
     assert verify_mod.verify_at_apply is verify_at_apply
+
+
+def _produced_confluent():
+    from .conftest import produced_contract
+
+    return produced_contract({"kind": "confluent", "url": URL})
+
+
+PRODUCED_ENV = {
+    "FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST": "sr.example.com",
+    "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST": "SCHEMA_REGISTRY_API_SECRET@sr.example.com",
+}
+
+
+def test_apply_refuses_an_unset_operator_endpoint_for_a_produced_subject():
+    with pytest.raises(CLIError) as err:
+        verify_at_apply(_produced_confluent(), environ=PRODUCED_ENV)
+    assert "SCHEMA_REGISTRY_REST_ENDPOINT" in str(err.value.context["errors"])
+
+
+def test_apply_refuses_another_operator_endpoint_even_on_a_dry_run():
+    env = {**PRODUCED_ENV, "SCHEMA_REGISTRY_REST_ENDPOINT": "https://elsewhere.example.com"}
+    with pytest.raises(CLIError) as err:
+        verify_at_apply(_produced_confluent(), dry_run=True, environ=env)
+    assert "another registry" in str(err.value.context["errors"])
+
+
+def test_apply_accepts_the_contracts_registry():
+    env = {**PRODUCED_ENV, "SCHEMA_REGISTRY_REST_ENDPOINT": URL + "/"}
+    assert verify_at_apply(_produced_confluent(), environ=env) == []

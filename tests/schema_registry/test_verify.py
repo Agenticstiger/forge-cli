@@ -834,3 +834,19 @@ class TestFlinkOnlyIsNotChecked:
 
     def test_attach_leaves_the_plan_alone(self):
         assert attach_registry_checks({"a": 1}, self.contract(), environ={}) == {"a": 1}
+
+
+class TestRegistryVerdictByMode:
+    @pytest.mark.parametrize("mode", ["FORWARD", "FULL", "FULL_TRANSITIVE", "NONE", None])
+    def test_outside_backward_the_registry_verdict_is_recorded_not_decisive(self, mode):
+        fake = FakeConfluent(compatible=False, messages=["writer lacks field"], mode=mode)
+        records, errors, _ = run(confluent_contract(), confluent=fake)
+        assert errors == []
+        assert records[0]["result"] == "compatible"
+        assert records[0]["registryVerdict"] == "not-compatible"
+
+    @pytest.mark.parametrize("mode", ["BACKWARD", "BACKWARD_TRANSITIVE"])
+    def test_under_backward_the_registry_decides(self, mode):
+        fake = FakeConfluent(compatible=False, messages=["reader type: int"], mode=mode)
+        _, errors, _ = run(confluent_contract(), confluent=fake)
+        assert errors and "reader type: int" in errors[0]

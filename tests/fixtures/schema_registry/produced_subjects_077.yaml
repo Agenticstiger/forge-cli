@@ -38,6 +38,19 @@ builds:
           - name: amount
             type: decimal(18,2)
 exposes:
+  - exposeId: orders_lake
+    kind: table
+    binding:
+      platform: aws
+      format: parquet
+      location:
+        bucket: commerce-lake
+        path: orders/
+        region: eu-west-1
+    contract:
+      schema:
+        - name: order_id
+          type: string
   - exposeId: orders_enriched
     kind: stream
     binding:
