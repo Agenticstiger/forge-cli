@@ -158,12 +158,13 @@ class TestBlock:
 class TestTofuVersion:
     def test_older_than_1_11_is_refused_with_the_upgrade(self):
         with pytest.raises(enc.StateEncryptionError) as raised:
-            enc.require_supported_tofu((1, 10, 7))
+            enc.require_supported_tofu((1, 12, 12))
         assert raised.value.event == "opentofu_state_encryption_unsupported"
-        assert "1.10.7" in str(raised.value)
+        assert "1.12.12" in str(raised.value)
+        assert "Upgrade OpenTofu to 1.13" in raised.value.remediation[0]
 
-    @pytest.mark.parametrize("version", [(1, 11, 0), (1, 13, 1), None])
-    def test_1_11_and_an_unreadable_version_pass(self, version):
+    @pytest.mark.parametrize("version", [(1, 13, 0), (1, 13, 9), None])
+    def test_1_13_and_an_unreadable_version_pass(self, version):
         enc.require_supported_tofu(version)
 
 

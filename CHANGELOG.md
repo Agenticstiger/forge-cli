@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TF_ENCRYPTION`: a pbkdf2 passphrase resolves through the operator's secret policy and reaches
   `tofu` as an ephemeral variable (`TF_VAR_fluid_state_passphrase`, in its environment only),
   an OpenBao key gets `BAO_ADDR` and a token the same way, and the KMS keys use the cloud's own
-  credentials. Needs OpenTofu 1.11 (refused with the upgrade otherwise). Existing plaintext
+  credentials. Needs OpenTofu 1.13, refused with the upgrade otherwise: before 1.13,
+  `tofu init -backend=false` (forge's local state) read an encrypted local state without the
+  encryption configuration and failed. Existing plaintext
   state is refused with the fix: run `fluid apply --migrate-state-encryption` once to read it
   through OpenTofu's `unencrypted` fallback and write it back encrypted. A state encrypted with
   no key set, a wrong key, and a key `tofu` cannot reach each get their own error.

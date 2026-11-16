@@ -114,7 +114,7 @@ class TestTofuEnv:
         assert "TF_VAR_fluid_state_passphrase" not in os.environ
 
     def test_an_old_tofu_is_refused_before_any_key_is_fetched(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(runner, "tofu_version", lambda: (1, 10, 7))
+        monkeypatch.setattr(runner, "tofu_version", lambda: (1, 12, 12))
 
         def _never(_encryption):
             raise AssertionError("the key was fetched for a tofu that cannot use it")
@@ -124,7 +124,7 @@ class TestTofuEnv:
         with pytest.raises(CLIError) as raised:
             engine._tofu_env(get_iac_plugin("aws"), target)
         assert raised.value.event == "opentofu_state_encryption_unsupported"
-        assert "1.10.7" in raised.value.context["error"]
+        assert "1.12.12" in raised.value.context["error"]
 
     def test_a_key_that_does_not_resolve_is_a_typed_error(self, tmp_path, monkeypatch):
         monkeypatch.setattr(runner, "tofu_version", lambda: (1, 13, 1))

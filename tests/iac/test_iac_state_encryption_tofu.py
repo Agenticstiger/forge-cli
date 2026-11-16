@@ -16,7 +16,7 @@ of the plan nor ``tofu state pull``; the state and the plan on disk must be
 encrypted. A planted canary shows the scan can find one. The migration of
 plaintext state and the three refusals are driven through the same pieces.
 
-Skips without ``tofu`` 1.11 or newer (ephemeral variables).
+Skips without ``tofu`` 1.13 or newer (forge refuses state encryption before 1.13).
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
         runner.tofu_path() is None or _VERSION is None or _VERSION < MIN_TOFU_VERSION,
-        reason="needs tofu 1.11 or newer",
+        reason="needs tofu 1.13 or newer",
     ),
 ]
 

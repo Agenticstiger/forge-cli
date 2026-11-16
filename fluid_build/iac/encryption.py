@@ -35,7 +35,10 @@ it once through OpenTofu's ``unencrypted`` fallback and writes it back
 encrypted. ``enforced`` forbids an ``unencrypted`` method, so that one run's
 state is not enforced; its plan still is.
 
-Requires OpenTofu 1.11 (ephemeral variables). Borrowed:
+Requires OpenTofu 1.13: ephemeral variables (1.11) key ``pbkdf2``, and before
+1.13 ``tofu init -backend=false``, which forge runs for local state, read an
+encrypted local state without the encryption configuration and failed
+(opentofu/opentofu#4077, measured on 1.12.12). Borrowed:
 opentofu.org/docs/language/state/encryption/ and the OpenTofu 1.11 ephemeral
 values. Measured on OpenTofu 1.13.1 with ``.tf.json``: a ``method`` reference
 is a bare traversal string (``"method.aes_gcm.fluid"``; ``"${...}"`` is refused
@@ -58,8 +61,9 @@ from .naming import tofu_ref
 STATE_ENCRYPTION_ENV = "FLUID_STATE_ENCRYPTION"
 #: The ephemeral variable that keys ``pbkdf2``.
 PASSPHRASE_VARIABLE = "fluid_state_passphrase"
-#: Ephemeral variables arrived in OpenTofu 1.11.
-MIN_TOFU_VERSION: Tuple[int, int, int] = (1, 11, 0)
+#: Ephemeral variables arrived in OpenTofu 1.11; 1.13 stopped ``tofu init
+#: -backend=false`` from reading a local encrypted state without its configuration.
+MIN_TOFU_VERSION: Tuple[int, int, int] = (1, 13, 0)
 #: OpenTofu's minimum for a ``pbkdf2`` passphrase.
 MIN_PASSPHRASE_LENGTH = 16
 
@@ -238,17 +242,18 @@ def encryption_variables(encryption: StateEncryption) -> Dict[str, Any]:
 
 
 def require_supported_tofu(version: Optional[Tuple[int, ...]]) -> None:
-    """Refuse a ``tofu`` older than 1.11 (``version`` from ``runner.tofu_version()``)."""
+    """Refuse a ``tofu`` older than 1.13 (``version`` from ``runner.tofu_version()``)."""
     if version is None or tuple(version) >= MIN_TOFU_VERSION:
         return
     found = ".".join(str(p) for p in version)
     raise StateEncryptionError(
         "opentofu_state_encryption_unsupported",
         "tofu-too-old",
-        f"{STATE_ENCRYPTION_ENV} needs OpenTofu 1.11 or newer (ephemeral variables keep "
-        f"the key out of the saved plan); this tofu is {found}.",
+        f"{STATE_ENCRYPTION_ENV} needs OpenTofu 1.13 or newer: before 1.13, `tofu init "
+        f"-backend=false` reads a local encrypted state without the encryption "
+        f"configuration and fails; this tofu is {found}.",
         (
-            "Upgrade OpenTofu to 1.11 or newer (https://opentofu.org/docs/intro/install/). "
+            "Upgrade OpenTofu to 1.13 or newer (https://opentofu.org/docs/intro/install/). "
             "--ensure-opentofu installs a pinned build only when no tofu is on PATH",
         ),
     )
