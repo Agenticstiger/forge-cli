@@ -76,18 +76,19 @@ class TestTofuVersionGate:
         assert tuple(int(p) for p in match.groups()) == (1, 6, 0)
 
     def test_require_version_passes_when_version_meets_floor(self, monkeypatch):
-        """A version at or above the floor (1.6.0) does not raise."""
-        monkeypatch.setattr(runner, "tofu_version", lambda: (1, 6, 0))
+        """A version at or above the floor (1.11.0) does not raise."""
+        monkeypatch.setattr(runner, "tofu_version", lambda: (1, 11, 0))
         runner.require_tofu_version()  # no raise
 
-        monkeypatch.setattr(runner, "tofu_version", lambda: (1, 9, 99))
+        monkeypatch.setattr(runner, "tofu_version", lambda: (1, 13, 9))
         runner.require_tofu_version()  # no raise
 
     def test_require_version_raises_on_too_old(self, monkeypatch):
-        """A version below the floor (1.5.x) raises ``TofuVersionError``
-        — the gate's whole purpose, so it must fail loud."""
-        monkeypatch.setattr(runner, "tofu_version", lambda: (1, 5, 9))
-        with pytest.raises(runner.TofuVersionError):
+        """A version below the floor (1.10.x, which lacks ephemeral values)
+        raises ``TofuVersionError`` — the gate's whole purpose, so it must
+        fail loud, and its message names the floor."""
+        monkeypatch.setattr(runner, "tofu_version", lambda: (1, 10, 9))
+        with pytest.raises(runner.TofuVersionError, match="1.11.0"):
             runner.require_tofu_version()
 
     def test_require_version_tolerates_unparsable_version(self, monkeypatch):

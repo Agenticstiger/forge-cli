@@ -110,7 +110,7 @@ def _make_release_zip(bin_name: str = "tofu") -> bytes:
 
 def test_ensure_opentofu_idempotent_skip_when_present(monkeypatch):
     monkeypatch.setattr(oti, "tofu_path", lambda: "/usr/local/bin/tofu")
-    monkeypatch.setattr(oti, "tofu_version", lambda: (1, 9, 0))  # >= floor (1,6,0)
+    monkeypatch.setattr(oti, "tofu_version", lambda: (1, 13, 0))  # >= floor (1,11,0)
 
     def _no_network(url):  # pragma: no cover - must never run
         raise AssertionError(f"download attempted despite usable tofu: {url}")
@@ -236,3 +236,15 @@ def test_apply_gate_does_not_provision_without_flag(monkeypatch):
     with pytest.raises(engine.CLIError) as ei:
         engine.apply_via_opentofu(_gate_args(ensure_opentofu=False), logging.getLogger("t"))
     assert ei.value.event == "opentofu_engine_no_tofu"
+
+
+def test_floor_constants_agree_and_pin_meets_floor():
+    """The three floor sites must say the same thing, and the pinned
+    install must satisfy it (D8: floor 1.11, pinned 1.13.x)."""
+    from fluid_build.iac.runner import _MIN_REQUIRED_VERSION
+    from fluid_build.iac.versions import REQUIRED_TOFU_VERSION
+
+    floor = tuple(int(p) for p in REQUIRED_TOFU_VERSION.removeprefix(">=").split("."))
+    assert _MIN_REQUIRED_VERSION[: len(floor)] == floor == (1, 11)
+    pinned = tuple(int(p) for p in oti.PINNED_OPENTOFU_VERSION.split("."))
+    assert pinned >= _MIN_REQUIRED_VERSION

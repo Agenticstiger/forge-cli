@@ -288,7 +288,7 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     ),
     "opentofu_engine_install_failed": (
         [
-            "Install OpenTofu >= 1.6.0 and ensure 'tofu' is on PATH",
+            "Install OpenTofu >= 1.11.0 and ensure 'tofu' is on PATH",
             "See https://opentofu.org/docs/intro/install/",
         ],
         "installation",

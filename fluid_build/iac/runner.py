@@ -34,7 +34,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 # legitimately exceeds it (e.g., Lake Formation tag propagation, which
 # can take many minutes for the eventual consistency to settle).
 _DEFAULT_TOFU_TIMEOUT_SECONDS = 1800
-_MIN_REQUIRED_VERSION = (1, 6, 0)
+_MIN_REQUIRED_VERSION = (1, 11, 0)
 # S3-native state locking (``use_lockfile``) arrived in OpenTofu 1.10.
 _S3_LOCKFILE_MIN_VERSION = (1, 10, 0)
 # After SIGINT on a timeout, how long tofu gets to release its lock and exit

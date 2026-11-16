@@ -12,9 +12,10 @@ from __future__ import annotations
 
 from typing import Dict
 
-#: Minimum OpenTofu version. 1.6 is OpenTofu's first GA release and the
-#: floor for config-driven ``import {}`` blocks.
-REQUIRED_TOFU_VERSION = ">= 1.6"
+#: Minimum OpenTofu version. 1.10 added S3-native state locking
+#: (``use_lockfile``) and 1.11 added ephemeral values and write-only
+#: arguments, so 1.11 is the floor the AWS streaming path builds on.
+REQUIRED_TOFU_VERSION = ">= 1.11"
 
 #: Provider local-name -> ``{source, version}``. ``source`` addresses are
 #: OpenTofu-registry namespaces; the Snowflake provider moved out of the
