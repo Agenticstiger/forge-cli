@@ -240,11 +240,11 @@ def test_apply_gate_does_not_provision_without_flag(monkeypatch):
 
 def test_floor_constants_agree_and_pin_meets_floor():
     """The three floor sites must say the same thing, and the pinned
-    install must satisfy it (D8: floor 1.11, pinned 1.13.x)."""
+    install must satisfy it (D8: floor 1.12, pinned 1.13.x)."""
     from fluid_build.iac.runner import _MIN_REQUIRED_VERSION
     from fluid_build.iac.versions import REQUIRED_TOFU_VERSION
 
     floor = tuple(int(p) for p in REQUIRED_TOFU_VERSION.removeprefix(">=").split("."))
-    assert _MIN_REQUIRED_VERSION[: len(floor)] == floor == (1, 11)
+    assert _MIN_REQUIRED_VERSION[: len(floor)] == floor == (1, 12)
     pinned = tuple(int(p) for p in oti.PINNED_OPENTOFU_VERSION.split("."))
     assert pinned >= _MIN_REQUIRED_VERSION

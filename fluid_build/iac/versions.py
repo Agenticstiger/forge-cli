@@ -14,8 +14,12 @@ from typing import Dict
 
 #: Minimum OpenTofu version. 1.10 added S3-native state locking
 #: (``use_lockfile``) and 1.11 added ephemeral values and write-only
-#: arguments, so 1.11 is the floor the AWS streaming path builds on.
-REQUIRED_TOFU_VERSION = ">= 1.11"
+#: arguments. The floor is 1.12 because 1.11 does not fire
+#: ``lifecycle.replace_triggered_by`` when the referenced resource is
+#: *created*: adding retention to a live BigQuery table then plans an in-place
+#: update instead of a replacement, and the data-loss gate never sees it
+#: (tests/iac/test_iac_gcp_governance_plan.py pins this).
+REQUIRED_TOFU_VERSION = ">= 1.12"
 
 #: Provider local-name -> ``{source, version}``. ``source`` addresses are
 #: OpenTofu-registry namespaces; the Snowflake provider moved out of the

@@ -97,8 +97,8 @@ jobs:
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
         with:
-          tofu_version: 1.11.14
-          checksums: 8279a6c6d4044899ae77190fc50c40c147615a76aca13ea605d68320c424c2a6  # 1.11.14 linux_amd64 zip  # pragma: allowlist secret
+          tofu_version: 1.12.12
+          checksums: 723df4d3044ca2e1fd8469d715a24869889c53e7f45458b1f2ea2e40e344789d  # 1.12.12 linux_amd64 zip  # pragma: allowlist secret
 
       # ``local`` brings DuckDB: the embedded-SQL chain on the bigquery-emulator
       # runs its SQL there. Without it that test skips, and the lane-coverage

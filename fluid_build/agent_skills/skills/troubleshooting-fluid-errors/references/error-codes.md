@@ -45,7 +45,7 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 | `ERR_APPLY_BUILD_IDENTIFIER_INVALID` | Rename the id to fit, for example orders_v1 instead of 1orders, and apply again. A renamed id starts over: its builds get new cursors and watermarks under .fluid/runs/, and a renamed contract.id gets a new OpenTofu workdir under .fluid/iac/<provider>/. | advanced/production-troubleshooting.html |
 | `ERR_APPLY_BUILD_ID_NOT_FOUND` | Pass one of the available build ids as --build-id: ids match exactly, case included. Run 'fluid apply <contract> --mode amend-and-build' without --build-id to run every build. | advanced/production-troubleshooting.html |
 | `ERR_OUTPUT_WRITE_FAILED` | Check that the --out path is writable and the parent directory exists. | advanced/production-troubleshooting.html |
-| `ERR_OPENTOFU_ENGINE_INSTALL_FAILED` | Install OpenTofu >= 1.11.0 and ensure 'tofu' is on PATH. See https://opentofu.org/docs/intro/install/. | getting-started/ |
+| `ERR_OPENTOFU_ENGINE_INSTALL_FAILED` | Install OpenTofu >= 1.12.0 and ensure 'tofu' is on PATH. See https://opentofu.org/docs/intro/install/. | getting-started/ |
 | `ERR_OPENTOFU_INIT_FAILED` | Check provider credentials and network access, then retry. | advanced/typed-cli-errors.html#connectivity-secrets |
 | `ERR_OPENTOFU_PLAN_FAILED` | Run 'fluid plan <contract>' and inspect the emitted plan for the failing action. | advanced/production-troubleshooting.html |
 | `ERR_OPENTOFU_APPLY_FAILED` | OpenTofu records state as it goes, so resources created before the failure are normally tracked. Fix the cause named above, then re-run 'fluid apply' to continue. Re-run with --debug to see the raw tofu output. | advanced/production-troubleshooting.html |
