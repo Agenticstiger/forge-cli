@@ -171,6 +171,7 @@ class _Lint:
         # (exposeId, relationship, column): an invariant reads the column on both ends.
         self.related: Set[Tuple[str, str, str]] = set()
         self.attribute_of: Dict[Node, str] = {}
+        self.reach_cache: Dict[str, Set[str]] = {}
 
     def run(self) -> List[Finding]:
         self.ids()
@@ -756,16 +757,17 @@ class _Lint:
             mine, theirs = expose.columns.get(from_name), target.columns.get(to_name)
             if not mine or not theirs:
                 continue
-            own, other = mine[1].get("identifierFormat"), theirs[1].get("identifierFormat")
+            own = mine[1].get("identifierFormat")
             if not isinstance(own, list):
                 continue  # a foreign key inherits its target's format
+            other = self.inherited_format(target, to_name)
             if not isinstance(other, list):
                 self.error(
                     f"{expose.column_label(from_name)}.identifierFormat",
                     expose.column_path(from_name) + ("identifierFormat",),
                     f"the foreign key {from_name} carries the values of "
-                    f"{target.column_label(to_name)}, which declares no format: a foreign key has "
-                    "its target's format",
+                    f"{target.column_label(to_name)}, which has no format, declared or "
+                    "inherited: a foreign key has its target's format",
                     "declare the format on the target column, which the foreign key inherits",
                 )
                 continue
@@ -777,6 +779,33 @@ class _Lint:
                     "whose format differs",
                     "repeat the target column's format identically, or leave it out",
                 )
+
+    def inherited_format(self, expose: Expose, column: str) -> Any:
+        """The format a column has: its own, or, for a foreign key that declares none, its
+        target's, followed down a chain of foreign keys (RFC 3: a foreign key has its
+        target's format)."""
+        seen: Set[Node] = set()
+        while (expose.expose_id, column) not in seen:
+            seen.add((expose.expose_id, column))
+            entry = expose.columns.get(column)
+            own = entry[1].get("identifierFormat") if entry else None
+            if isinstance(own, list):
+                return own
+            step = next(
+                (
+                    (self.by_id.get(rel.to), to_name)
+                    for rel in expose.relationships.values()
+                    for from_name, to_name in zip(rel.from_columns, rel.to_columns, strict=False)
+                    if from_name == column and self.by_id.get(rel.to) is not None
+                ),
+                None,
+            )
+            if step is None:
+                return None
+            target, column = step
+            assert target is not None
+            expose = target
+        return None
 
     def shared_columns(
         self, expose: Expose, target: Expose, rel: Relationship, label: str, path: Tuple[Any, ...]
@@ -891,6 +920,9 @@ class _Lint:
         ids = [expose.expose_id for expose, _ in members]
         candidates = []
         for owner in ids:
+            reach = self.reaching(owner)
+            if any(member not in reach for member in ids if member != owner):
+                continue  # some member never reaches this one: not the owner, no walk needed
             try:
                 found = {m: self.paths(m, owner) for m in ids if m != owner}
             except _TooManyPaths as dense:
@@ -996,7 +1028,10 @@ class _Lint:
         ]
 
     def reaching(self, goal: str) -> Set[str]:
-        """Every expose from which ``goal`` is reached through relationships (``goal`` too)."""
+        """Every expose from which ``goal`` is reached through relationships (``goal`` too),
+        computed once per goal."""
+        if goal in self.reach_cache:
+            return self.reach_cache[goal]
         into: DefaultDict[str, Set[str]] = defaultdict(set)
         for expose in self.exposes:
             for rel in expose.relationships.values():
@@ -1008,6 +1043,7 @@ class _Lint:
                 if source not in reached:
                     reached.add(source)
                     todo.append(source)
+        self.reach_cache[goal] = reached
         return reached
 
     def hops(self, start: str, route: Tuple[str, ...]) -> List[str]:

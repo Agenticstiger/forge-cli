@@ -1467,7 +1467,7 @@ def test_sum_without_a_column_says_so():
 def test_a_foreign_key_format_its_target_lacks_is_an_error():
     contract = _contract()
     _column(contract, "invoices", "contract_id")["identifierFormat"] = [{"mask": "999"}]
-    finding = _pick(_lint(contract), "declares no format")
+    finding = _pick(_lint(contract), "has no format, declared or inherited")
     assert finding.pointer.endswith("/identifierFormat")
 
 
@@ -1509,3 +1509,51 @@ def test_the_quality_note_has_its_own_fix():
     ]
     note = _pick(_lint(contract), "is FLUID SQL/1", severity="note")
     assert note.fix.startswith("move it to contract.invariants[]")
+
+
+# -- round 2 of the gate --------------------------------------------------------------
+
+
+def test_a_decimal_precision_with_thousands_of_leading_zeros_does_not_crash():
+    contract = _contract()
+    _expose_of(contract, "invoices")["contract"]["schema"].append(
+        {"name": "zeros", "type": "decimal(10," + "0" * 4400 + "2)"}
+    )
+    _lint(contract)
+
+
+def test_a_chained_foreign_key_inherits_the_root_format():
+    """lines.invoice_id -> invoices.invoice_id (no format) -> its own target: the middle
+    column inherits, so a foreign key repeating the root format is fine (RFC 3)."""
+    contract = _contract()
+    fmt = [{"prefixes": ["C"], "mask": "999"}]
+    _column(contract, "contracts", "contract_id")["identifierFormat"] = fmt
+    _expose_of(contract, "invoice_lines")["contract"]["schema"].append(
+        {"name": "contract_id", "type": "string", "identifierFormat": fmt}
+    )
+    _expose_of(contract, "invoice_lines")["semantics"]["relationships"].append(
+        _rel("via_invoice", "invoices", "contract_id", "contract_id")
+    )
+    assert [f for f in _errors(contract) if "format" in f.message] == []
+
+
+def test_a_long_chain_sharing_one_attribute_is_linear_enough():
+    import time
+
+    contract = _contract()
+    names = [f"c{i}" for i in range(200)]
+    for i, name in enumerate(names):
+        rels = [_rel("next", names[i + 1], "k", "k")] if i + 1 < len(names) else []
+        contract["exposes"].append(
+            _expose(
+                name,
+                [
+                    {"name": "k", "type": "string"},
+                    {"name": "seg", "type": "string", "sharedAttribute": "chain"},
+                ],
+                semantics={"relationships": rels},
+            )
+        )
+    started = time.monotonic()
+    _lint(contract)
+    assert time.monotonic() - started < 20

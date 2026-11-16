@@ -102,14 +102,18 @@ def column_type(declared: object) -> Optional[ColumnType]:
         if params is None:
             return ColumnType(SqlType(NUMBER, None))
         sized = _PRECISION_SCALE.match(params.strip())
-        if not sized or len(sized.group("p").lstrip("0")) > 4:
-            return None  # wider than MAX_DECIMAL_PRECISION, read without int() on a long text
-        if sized.group("s") is not None and len(sized.group("s").lstrip("0")) > 4:
+        if not sized:
             return None
-        precision = int(sized.group("p"))
+        # Read the digits without leading zeros, and refuse more than four before int():
+        # a longer text is wider than MAX_DECIMAL_PRECISION, and int() refuses 4,300 digits.
+        digits = sized.group("p").lstrip("0") or "0"
+        places = (sized.group("s") or "0").lstrip("0") or "0"
+        if len(digits) > 4 or len(places) > 4:
+            return None
+        precision = int(digits)
         if precision > MAX_DECIMAL_PRECISION:
             return None
-        scale = int(sized.group("s")) if sized.group("s") is not None else 0
+        scale = int(places)
         return ColumnType(SqlType(NUMBER, scale), declared_scale=True, precision=precision)
     if base in _FLOAT_TYPES:
         return ColumnType(SqlType(NUMBER, None), is_float=True)
