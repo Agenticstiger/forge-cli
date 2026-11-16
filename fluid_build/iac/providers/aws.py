@@ -1450,8 +1450,9 @@ _UNEMITTED_OPS: Dict[str, Tuple[str, str]] = {
     "events.ensure_schedule": (
         "execution.trigger of type schedule",
         "Set orchestration.schedule (an EventBridge Scheduler cron() or rate() "
-        "expression, passed as written) with an orchestration.engine other than airflow, "
-        "e.g. custom: fluid apply provisions it as an EventBridge Scheduler schedule. "
+        "expression, passed as written) with an orchestration.engine other than airflow "
+        "or mwaa, e.g. custom: fluid apply provisions it as an EventBridge Scheduler "
+        "schedule. "
         "Remove execution.trigger.",
     ),
 }
