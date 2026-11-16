@@ -578,6 +578,46 @@ def _contract_package_extras(contract_path: str) -> List[str]:
     return sorted(extras)
 
 
+def _contract_cloud_auth(contract_path: str) -> Tuple[str, ...]:
+    """The platforms a keyless pipeline authenticates to: the cloud bindings
+    of the contract and of every overlay (a pipeline can run any of them), and
+    ``openbao`` when a ``secretRef`` in any of them is ``vault://`` or
+    ``openbao://`` (forge's vault resolver logs in with the job's OIDC token)."""
+    from fluid_build.forge.core.pipeline_systems._keyless import CLOUD_AUTH_PLATFORMS
+    from fluid_build.iac.provider_match import canonical_cloud, detect_clouds
+    from fluid_build.secrets.contract import secret_ref_sites
+
+    found = set()
+    for document in _contract_documents(contract_path):
+        if not isinstance(document, dict):
+            continue
+        # The clouds `fluid apply` would detect (aliases such as bigquery or s3, and
+        # binding.provider, included), and every build's own runtime cloud, since a
+        # build there needs a login too even beside another cloud's exposes. A
+        # string where a mapping belongs is `fluid validate`'s to refuse: when
+        # detection trips on one, it runs again without the builds (read one by one
+        # below), so the rest of the contract still counts.
+        for candidate in (document, {k: v for k, v in document.items() if k != "builds"}):
+            try:
+                found.update(detect_clouds(candidate))
+                break
+            except (AttributeError, TypeError):
+                continue
+        builds = document.get("builds")
+        for build in builds if isinstance(builds, list) else []:
+            if not isinstance(build, dict):
+                continue
+            execution = build.get("execution")
+            runtime = execution.get("runtime") if isinstance(execution, dict) else None
+            found.add(canonical_cloud(build.get("provider")))
+            found.add(canonical_cloud(runtime.get("platform") if isinstance(runtime, dict) else ""))
+        for site in secret_ref_sites(document):
+            scheme = str(site.raw).partition("://")[0].lower() if "://" in str(site.raw) else ""
+            if scheme in ("vault", "openbao"):
+                found.add("openbao")
+    return tuple(p for p in CLOUD_AUTH_PLATFORMS if p in found)
+
+
 def _single_build_id(contract_path: str) -> str:
     """The contract's build id when it declares exactly one build, else ""."""
     documents = _contract_documents(contract_path)
@@ -830,6 +870,7 @@ def run(args, logger: logging.Logger) -> int:
             contract_path=pipeline_contract,
             fluid_package_spec=fluid_package_spec or None,
             package_extras=_contract_package_extras(contract_path),
+            cloud_auth=_contract_cloud_auth(contract_path),
             apply_mode_default=getattr(args, "apply_mode_default", None),
             apply_build_id_default=_single_build_id(contract_path),
             schedule_sync_default=bool(schedule_sync_default_arg),

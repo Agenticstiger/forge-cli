@@ -164,6 +164,7 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
             "stages": stages,
         }
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="Azure DevOps",
             secret_surface_hint=(
@@ -427,6 +428,7 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
             pipeline["stages"].append(publish_stage)
 
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="Azure DevOps Pipelines",
             secret_surface_hint=(

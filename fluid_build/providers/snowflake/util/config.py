@@ -11,7 +11,7 @@ import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
 from fluid_build.observability.secret_redactor import register_secrets
@@ -28,6 +28,17 @@ _ACCOUNT_HOST_RE = re.compile(r"\.snowflakecomputing\.com$", re.IGNORECASE)
 _ACCOUNT_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+\Z")
 _ACCOUNT_REGION_SEGMENT_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\Z")
 _ACCOUNT_CLOUD_SUFFIXES = frozenset({"aws", "azure", "gcp"})
+
+#: ``authenticator`` value of Snowflake workload identity federation.
+WORKLOAD_IDENTITY_AUTHENTICATOR = "WORKLOAD_IDENTITY"
+
+
+def is_workload_identity(settings: Mapping[str, Any]) -> bool:
+    """A workload identity federation login. It names no user: Snowflake finds the
+    service user from the token's issuer and subject."""
+    authenticator = str(settings.get("authenticator") or "").strip().upper()
+    return authenticator == WORKLOAD_IDENTITY_AUTHENTICATOR
+
 
 # Keys that carry secret material. These MUST never appear in the `_sources`
 # map returned to callers, nor be echoed into diagnostic reports.
@@ -278,6 +289,8 @@ def resolve_snowflake_settings(
     private_key_path: Optional[str] = None,
     private_key_passphrase: Optional[str] = None,
     oauth_token: Optional[str] = None,
+    workload_identity_provider: Optional[str] = None,
+    token_file_path: Optional[str] = None,
     project_root: Optional[Path] = None,
     environment: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -306,6 +319,8 @@ def resolve_snowflake_settings(
         "private_key_path": private_key_path,
         "private_key_passphrase": private_key_passphrase,
         "oauth_token": oauth_token,
+        "workload_identity_provider": workload_identity_provider,
+        "token_file_path": token_file_path,
     }
 
     env_fallbacks = {
@@ -320,6 +335,11 @@ def resolve_snowflake_settings(
         "private_key_path": ["SNOWFLAKE_PRIVATE_KEY_PATH"],
         "private_key_passphrase": ["SNOWFLAKE_PRIVATE_KEY_PASSPHRASE"],
         "oauth_token": ["SNOWFLAKE_OAUTH_TOKEN"],
+        # Workload identity federation. The names are the ones the
+        # snowflakedb/snowflake OpenTofu provider reads
+        # (pkg/internal/snowflakeenvs), so one set of variables drives both.
+        "workload_identity_provider": ["SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER"],
+        "token_file_path": ["SNOWFLAKE_TOKEN_FILE_PATH"],
     }
 
     resolved: Dict[str, Any] = {}
@@ -419,6 +439,34 @@ def resolve_account_and_warehouse(
     return account, warehouse
 
 
+def _workload_identity_params(resolved: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keyless connection parameters for workload identity federation.
+
+    The CI job's own OIDC token (a file the pipeline wrote), or the cloud's
+    workload identity (AWS, AZURE, GCP). No secret is held here, and nothing
+    else the environment carries (a stray password or key path) is sent.
+    """
+    provider = str(resolved.get("workload_identity_provider") or "").strip().upper()
+    if not provider:
+        raise ValueError(
+            "SNOWFLAKE_AUTHENTICATOR is WORKLOAD_IDENTITY, and "
+            "SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER is not set. Set it to OIDC (with "
+            "SNOWFLAKE_TOKEN_FILE_PATH), AWS, AZURE or GCP."
+        )
+    params: Dict[str, Any] = {
+        "authenticator": WORKLOAD_IDENTITY_AUTHENTICATOR,
+        "workload_identity_provider": provider,
+    }
+    if provider == "OIDC":
+        if not resolved.get("token_file_path"):
+            raise ValueError(
+                "SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER is OIDC, and SNOWFLAKE_TOKEN_FILE_PATH "
+                "is not set. Point it at the file holding the CI job's ID token."
+            )
+        params["token_file_path"] = resolved["token_file_path"]
+    return params
+
+
 def get_connection_params(
     account: Optional[str] = None,
     warehouse: Optional[str] = None,
@@ -460,6 +508,8 @@ def get_connection_params(
         private_key_path=kwargs.get("private_key_path"),
         private_key_passphrase=kwargs.get("private_key_passphrase"),
         oauth_token=kwargs.get("oauth_token"),
+        workload_identity_provider=kwargs.get("workload_identity_provider"),
+        token_file_path=kwargs.get("token_file_path"),
         project_root=kwargs.get("project_root"),
         environment=kwargs.get("environment"),
     )
@@ -470,14 +520,15 @@ def get_connection_params(
             "SNOWFLAKE_ACCOUNT, or pass an explicit Snowflake account."
         )
 
-    if not resolved.get("user"):
+    workload_identity = is_workload_identity(resolved)
+    if not resolved.get("user") and not workload_identity:
         raise ValueError(
             "Snowflake user not specified. Set SNOWFLAKE_USER or provide an explicit user."
         )
 
     params = {
         "account": resolved["account"],
-        "user": resolved["user"],
+        "user": resolved.get("user") or "",
         "warehouse": resolved["warehouse"],
     }
 
@@ -489,12 +540,16 @@ def get_connection_params(
         params["role"] = resolved["role"]
 
     # Authentication preference (highest to lowest trust for automation):
+    #   0. Workload identity federation (an explicit authenticator, so it
+    #      outranks anything else the environment holds)
     #   1. Key-pair  — the standard for service accounts at regulated shops
     #   2. OAuth     — federated identity, short-lived tokens
     #   3. Explicit authenticator (e.g. SSO/externalbrowser, oauth, okta)
     #   4. Password  — discouraged for automation; warn when used non-interactively
     #   5. externalbrowser default — only when stdin is a TTY
-    if resolved.get("private_key_path"):
+    if workload_identity:
+        params.update(_workload_identity_params(resolved))
+    elif resolved.get("private_key_path"):
         params["private_key_path"] = resolved["private_key_path"]
         if resolved.get("private_key_passphrase"):
             params["private_key_passphrase"] = resolved["private_key_passphrase"]

@@ -44,6 +44,7 @@ from ..access import (
     role_grants,
 )
 from ..base import UnsupportedBindingError
+from ..credentials import GCP_ENV_PREFIXES
 from ..importer import ImportBlock
 from ..naming import TofuExpr, safe_ident, tofu_ref
 from ..packaging import (
@@ -431,6 +432,10 @@ class GcpIacPlugin:
         "GOOGLE_CLOUD_PROJECT",
         "GOOGLE_REGION",
     )
+    # The provider and the Google auth library read GOOGLE_*, GCLOUD_*, CLOUDSDK_*
+    # (the gcloud config holding application default credentials) and the
+    # metadata server overrides; all of them reach tofu (iac/credentials.py).
+    credential_env_prefixes = GCP_ENV_PREFIXES
 
     def emit(
         self,

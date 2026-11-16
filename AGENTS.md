@@ -235,6 +235,7 @@ A 2026-04-16 security review (see `SECURITY_REVIEW.md` if committed, or the PR #
 - **Two redaction layers stay symmetric.** `observability/secret_redactor.py::SecretRedactingFilter` is the global log filter; `providers/snowflake/util/logging.py` has a Snowflake-provider-local twin. New secret-shaped patterns (JWT, Stripe, GitHub token, provider-specific key names) should land in both.
 - **Path validation is order-sensitive.** `cli/security.py::validate_input_path` calls `_reject_raw_traversal(raw)` BEFORE `Path.resolve()` (so `..` can't be silently collapsed), then runs `_validate_path_security(resolved)` for forbidden-path checks. `FORBIDDEN_PATHS` is platform-aware via `_build_forbidden_paths()` — macOS includes `/private/etc` because `/etc` resolves there.
 - **Secret references fail closed.** A contract `secretRef` resolves only through `secrets/resolve.py::resolve_secret`, after the operator's policy (`secrets/policy.py`) has cleared its scheme, its locator prefix, the stage (only `apply` fetches; `validate`, `plan`, `bundle` and `diff` never do) and every host the value is sent to. Provider credentials from `FLUID_CREDENTIAL_STORE` go through `resolve_credential`: scheme and prefix policy, no stage gate (forge names those keys, and a plan connects with them). Policy names are protected env names, never project files. Values are `SecretStr`, registered with the exact-value redactor, and never appear in a message, a log line or a span. (The Fernet file store this bullet used to describe was retired on 2026-11-15.)
+- **`tofu` sees only what it needs, and state can be encrypted.** The `tofu` child gets an allowlisted environment (`iac/credentials.py`): `TF_CLI_ARGS*`, `TF_VAR_*`, `TF_ENCRYPTION` and every unrelated secret stay out. `FLUID_STATE_ENCRYPTION` (a protected name; `aws-kms://`, `gcp-kms://`, `openbao://`, `pbkdf2+<secret ref>`) makes `fluid apply` emit `terraform.encryption` with `enforced = true` for state and plan (`iac/encryption.py`); a passphrase reaches `tofu` only as an ephemeral variable (`TF_VAR_` in its environment), an OpenBao token only as `BAO_TOKEN`, never in `main.tf.json`, the plan or the state. Opt-in (founder, 2026-11-15); `--migrate-state-encryption` encrypts existing state once.
 - **Subprocess argv sanitisation.** `cli/auth.py::_sanitize_argv` redacts values of `--password`, `--token`, `--api-key`, `--key-file`, any flag ending in `-secret`/`-key`/`-token`/`-password`/`-passphrase`. Called from `AuthProvider._run_command` before DEBUG-logging the command.
 - **`$ref` resolution is confined.** Every external `$ref` goes through `util/ref_confinement.py::confine_ref`: URL schemes (`file://` included) and absolute paths are refused, and the `Path.resolve()`-d target must be `is_relative_to` the ref root — the root contract's directory unless the caller passes `ref_root=` / sets `FLUID_REF_ROOT` (process-wide, so an env root that is not a directory or does not contain the contract is ignored for that contract with a `ref_root_env_ignored` WARNING; an unusable `ref_root=` raises). Nested refs are held to the same root. Bundled OpenAPI fragments have no root, so only `#/...` refs reach openapi-spec-validator. A new `$ref` resolver must call `confine_ref`, not re-implement it.
 
@@ -723,6 +724,12 @@ onprem = "my_pkg.iac:OnPremIacPlugin"
   `credential_env`, `discover_imports`, `provider_block`. Optional
   capabilities are listed on that Protocol's docstring. The entry-point name is
   the platform: `binding.platform: onprem` selects it.
+- **Environment.** `tofu` runs with an allowlisted environment
+  (`iac/credentials.py`), not a copy of `os.environ`: the process basics,
+  proxies, CA bundles, OpenTofu's own settings, and what each plugin declares.
+  Declare every variable your provider reads, exact names in
+  `credential_env_vars` and whole families in `credential_env_prefixes`
+  (`("AWS_",)`); anything else never reaches it.
 - **Schema.** `binding.platform` is a closed enum in every shipped schema, so a
   plugin serves a platform the schema admits and no built-in emitter serves
   (`kubernetes`, `postgres`, `kafka`, ...). Opening the enum is a schema change.

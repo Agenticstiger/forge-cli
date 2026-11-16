@@ -20,7 +20,8 @@ credentials, which is what they are for. They may not carry a setting that:
   directory ``TMPDIR``/``TEMP``/``TMP``, ``FLUID_SECRETS_FILE``, ``FLUID_USER_HOME``,
   ``FLUID_HOME``,
   ``FLUID_CONFIG``, ``FLUID_CACHE_DIR``, ``FLUID_LOG_FILE``,
-  ``FLUID_PRICES_JSON``, ``FLUID_STATE_BACKEND``, ``FLUID_STORE_*`` locations,
+  ``FLUID_PRICES_JSON``, ``FLUID_STATE_BACKEND``, ``FLUID_STATE_ENCRYPTION``,
+  ``FLUID_STORE_*`` locations,
   ``FLUID_AUDIT_*``, ``FLUID_ATHENA_OUTPUT_LOCATION``);
 * changes an authentication or trust mode (``FLUID_SAFE_MODE``,
   ``FLUID_AI_READY``, ``FLUID_ALLOW_*``, ``FLUID_OPENLINEAGE_ALLOW_PRIVATE``,
@@ -189,6 +190,9 @@ PROTECTED_ENV_KEYS: FrozenSet[str] = frozenset(
         "FLUID_DIAG_OUT_DIR",
         "FLUID_PRICES_JSON",
         "FLUID_STATE_BACKEND",
+        # the key OpenTofu state and plans are encrypted with (iac/encryption.py):
+        # a project file choosing it would choose who can read the state
+        "FLUID_STATE_ENCRYPTION",
         # =0 turns S3 state locking off: the operator's call, never a checkout's
         "FLUID_TOFU_S3_LOCKFILE",
         "FLUID_STORE_BACKEND",
@@ -1192,6 +1196,7 @@ ENDPOINT_CREDENTIAL_GROUPS: Tuple[EndpointGroup, ...] = (
             "SNOWFLAKE_PRIVATE_KEY_PATH",
             "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
             "SNOWFLAKE_TOKEN",
+            "SNOWFLAKE_TOKEN_FILE_PATH",
             "SNOWFLAKE_PAT",
             "SNOWFLAKE_OAUTH_TOKEN",
             "SNOWFLAKE_OAUTH_CLIENT_SECRET",

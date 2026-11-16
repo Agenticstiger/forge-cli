@@ -50,6 +50,11 @@ class IacProviderPlugin(Protocol):
     Beyond the members below, the engine reads optional capabilities with
     ``getattr``; a plugin defines only the ones it needs:
 
+    * ``credential_env_prefixes``: the variable families its provider reads
+      (``("AWS_",)``). ``tofu`` runs with an allowlisted environment
+      (``iac/credentials.py``): the basics, OpenTofu's settings,
+      ``credential_env_vars`` and these prefixes. Anything else a provider
+      reads never reaches it, so a plugin declares every variable it needs.
     * ``provider_block_for(contract)``: the ``provider {}`` settings when they
       depend on the contract, in place of :meth:`provider_block`.
     * ``dependency_lock``: a file name under ``iac/providers/locks/``, the
@@ -91,7 +96,8 @@ class IacProviderPlugin(Protocol):
     name: str
     #: OpenTofu ``required_providers`` entry for this cloud's provider(s).
     required_providers: Dict[str, Dict[str, str]]
-    #: Environment variables this cloud's OpenTofu provider authenticates with.
+    #: Environment variables this cloud's OpenTofu provider authenticates with. Each
+    #: reaches ``tofu``; whole families go in ``credential_env_prefixes``.
     credential_env_vars: Tuple[str, ...]
 
     def emit(

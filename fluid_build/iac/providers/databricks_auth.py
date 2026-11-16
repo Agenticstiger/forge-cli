@@ -63,6 +63,15 @@ _METHOD_VARS = {
     "DATABRICKS_USERNAME": "basic",
     "DATABRICKS_PASSWORD": "basic",  # pragma: allowlist secret
 }
+#: The OIDC (workload identity federation) auth types of the Databricks SDKs.
+#: Each mints its own token from the CI job's identity and exchanges it for a
+#: Databricks one on behalf of the service principal ``DATABRICKS_CLIENT_ID``,
+#: so the client id is part of the credential and there is no secret.
+#: ``github-oidc`` reads the Actions runtime variables, ``env-oidc`` the token
+#: in ``DATABRICKS_OIDC_TOKEN`` (GitLab ``id_tokens``), ``file-oidc`` the file
+#: ``DATABRICKS_OIDC_TOKEN_FILEPATH``. databricks-sdk-go ``config/auth_oidc.go``,
+#: databricks-sdk-py ``credentials_provider.py``.
+OIDC_AUTH_TYPES = frozenset({"github-oidc", "azure-devops-oidc", "env-oidc", "file-oidc"})
 _LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
@@ -190,14 +199,26 @@ def _profile_auth(env: Mapping[str, str], host: str, profile: str) -> WorkspaceA
     return WorkspaceAuth(host, auth_type, profile, {AUTH_TYPE_ENV: auth_type})
 
 
+def _missing_for(explicit: str, env: Mapping[str, str]) -> Optional[str]:
+    """What an explicit ``DATABRICKS_AUTH_TYPE`` needs from ``env`` and lacks, or ``None``."""
+    if explicit == "pat":
+        return None if env.get(TOKEN_ENV) else TOKEN_ENV
+    if explicit == "oauth-m2m":
+        if env.get(CLIENT_ID_ENV) and env.get(CLIENT_SECRET_ENV):
+            return None
+        return f"{CLIENT_ID_ENV} and {CLIENT_SECRET_ENV}"
+    if explicit in OIDC_AUTH_TYPES:
+        return None if env.get(CLIENT_ID_ENV) else CLIENT_ID_ENV
+    return None
+
+
 def _env_auth(env: Mapping[str, str], host: str) -> WorkspaceAuth:
     token = bool(env.get(TOKEN_ENV))
     client = bool(env.get(CLIENT_ID_ENV)) and bool(env.get(CLIENT_SECRET_ENV))
     explicit = str(env.get(AUTH_TYPE_ENV) or "").strip()
     if explicit:
-        missing = {"pat": not token, "oauth-m2m": not client}.get(explicit, False)
-        if missing:
-            needs = TOKEN_ENV if explicit == "pat" else f"{CLIENT_ID_ENV} and {CLIENT_SECRET_ENV}"
+        needs = _missing_for(explicit, env)
+        if needs:
             raise _refusal(
                 "credentials-missing",
                 f"{AUTH_TYPE_ENV} is {explicit}, and {needs} is not set.",
@@ -226,6 +247,8 @@ def _env_auth(env: Mapping[str, str], host: str) -> WorkspaceAuth:
         )
     overlay = {CONFIG_FILE_ENV: os.devnull, AUTH_TYPE_ENV: auth_type}
     for name, method in _METHOD_VARS.items():
+        if name == CLIENT_ID_ENV and auth_type in OIDC_AUTH_TYPES:
+            continue  # the service principal the token is exchanged for
         if env.get(name) and method != auth_type:
             overlay[name] = ""  # an empty value reads as unset to the SDK
     return WorkspaceAuth(host, auth_type, None, overlay)
@@ -285,6 +308,8 @@ def sdk_config(env: Mapping[str, str]) -> Dict[str, Any]:
     elif auth.auth_type == "oauth-m2m":
         kwargs["client_id"] = str(env[CLIENT_ID_ENV])
         kwargs["client_secret"] = str(env[CLIENT_SECRET_ENV])
+    elif auth.auth_type in OIDC_AUTH_TYPES:
+        kwargs["client_id"] = str(env[CLIENT_ID_ENV])
     return kwargs
 
 

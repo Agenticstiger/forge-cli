@@ -137,7 +137,12 @@ def _check(contract: Mapping[str, Any], args: Any, logger: logging.Logger) -> St
     try:
         target = resolve_state_target(args, resolved, provider)
     except CLIError as exc:
-        return _error(f"the state backend is not usable: {_cli_error_text(exc)}")
+        what = (
+            "the state encryption setting"
+            if str(exc.event).startswith("opentofu_state_encryption")
+            else "the state backend"
+        )
+        return _error(f"{what} is not usable: {_cli_error_text(exc)}")
     if target.backend is None and not _local_state_present(target.workdir):
         return _not_checked(
             f"no apply state for this contract at {target.workdir}: run from the directory "
@@ -175,14 +180,13 @@ def _plan_and_classify(
     plugin: Any, contract: Mapping[str, Any], target: Any, logger: logging.Logger
 ) -> StateDriftReport:
     from fluid_build.iac import runner
-    from fluid_build.iac.credentials import build_tofu_env
     from fluid_build.iac.module import write_dependency_lock
 
     from ._apply_opentofu_engine import (
         _guard_region_move,
         _reconcile_with_state,
         _tail,
-        credential_overlay,
+        _tofu_env,
         emit_module,
         read_target,
         recorded_legacy_backend,
@@ -202,9 +206,8 @@ def _plan_and_classify(
         # The same locked provider `fluid apply` installs (iac/module.py).
         write_dependency_lock(plugin, workdir)
 
-        env = build_tofu_env()
         try:
-            env.update(credential_overlay(plugin, env))
+            env = _tofu_env(plugin, target)
         except CLIError as exc:
             return _error(_cli_error_text(exc), location)
         init = runner.tofu_init(
@@ -251,10 +254,7 @@ def _plan_and_classify(
 
         plan = runner.tofu_plan_detailed(str(workdir), out_file=PLAN_FILE, env=env)
         if plan.returncode not in (0, runner.PLAN_HAS_CHANGES):
-            return _error(
-                "the refresh plan failed: " + _tail(plan.stderr or plan.stdout, _MAX_DETAIL_CHARS),
-                location,
-            )
+            return _error(_refresh_failure(plan), location)
         doc = runner.tofu_show_plan(str(workdir), plan_file=PLAN_FILE, env=env)
         if doc is None:
             return _error("the saved plan could not be read back", location)
@@ -265,6 +265,18 @@ def _plan_and_classify(
             module_path.write_bytes(previous)
         elif module_path.exists():
             module_path.unlink()
+
+
+def _refresh_failure(plan: Any) -> str:
+    """Why the refresh plan failed: a state-encryption refusal with its first fix (the
+    migration only an apply can run), else the tail of tofu's output."""
+    from ._apply_opentofu_engine import _encryption_failure, _tail
+
+    encrypted = _encryption_failure((plan.stdout or "") + (plan.stderr or ""))
+    if encrypted is None:
+        return "the refresh plan failed: " + _tail(plan.stderr or plan.stdout, _MAX_DETAIL_CHARS)
+    fix = (encrypted.suggestions or [""])[0]
+    return f"{_cli_error_text(encrypted)} {fix}".strip()
 
 
 def is_clean(report: Optional[StateDriftReport]) -> bool:

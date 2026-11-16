@@ -98,7 +98,7 @@ def tofu_env(_tofu_plugin_cache: str) -> Dict[str, str]:
     """The environment for ``tofu`` child processes — inherits PATH +
     AWS_*; overlays the shared plugin cache so the ~50 MB
     ``hashicorp/aws`` provider downloads exactly once per session."""
-    env = build_tofu_env()
+    env = build_tofu_env(get_iac_plugin("aws"))
     env["TF_PLUGIN_CACHE_DIR"] = _tofu_plugin_cache
     return env
 

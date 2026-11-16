@@ -844,6 +844,16 @@ def register(subparsers: argparse._SubParsersAction):
         "Default $FLUID_STATE_BACKEND (bucket only: keys per contract, fluid/<id>/, "
         'unlike the flag), else local; "" forces local.',
     )
+    # Once per state, after FLUID_STATE_ENCRYPTION is first set: the run reads the
+    # plaintext state and writes it back encrypted (iac/encryption.py). Hidden, as
+    # the help is at its line cap (tests/test_cli_help_style.py); the
+    # opentofu_state_not_encrypted error that needs it names it.
+    advanced_group.add_argument(
+        "--migrate-state-encryption",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
 
     p.set_defaults(cmd=COMMAND, func=run)
 
