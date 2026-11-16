@@ -57,6 +57,34 @@ def _lf_tag_definition_errors(contract: Mapping[str, Any]) -> List[str]:
     return []
 
 
+def _unemitted_op_errors(contract: Mapping[str, Any]) -> List[str]:
+    """The AWS planner's ops the OpenTofu engine does not create yet
+    (``refuse_unemitted_ops``), from the planner itself, so ``fluid validate`` refuses
+    what ``fluid plan`` and ``fluid apply`` refuse. The planner runs offline with a
+    placeholder account; one that cannot run is left to ``fluid plan`` to report."""
+    import logging
+
+    from ..providers.aws.plan.planner import plan_actions
+    from .providers.aws import refuse_unemitted_ops
+
+    if not any(
+        isinstance(e, Mapping)
+        and isinstance(e.get("binding"), Mapping)
+        and is_cloud(e["binding"], "aws")
+        for e in contract.get("exposes") or []
+    ):
+        return []
+    try:
+        actions = plan_actions(contract, "000000000000", "us-east-1", logging.getLogger(__name__))
+    except Exception:  # noqa: BLE001 - the planner's own refusals are fluid plan's to report
+        return []
+    try:
+        refuse_unemitted_ops(actions)
+    except UnsupportedBindingError as exc:
+        return [_message(exc)]
+    return []
+
+
 def _aws_refusal(
     contract: Mapping[str, Any], exposure: Mapping[str, Any], binding: Mapping[str, Any], index: int
 ) -> str:
@@ -126,6 +154,7 @@ def validate_governance(contract: Mapping[str, Any]) -> Tuple[List[str], List[st
     except UnsupportedBindingError as exc:
         errors.append(_message(exc))
     errors.extend(_lf_tag_definition_errors(contract))
+    errors.extend(_unemitted_op_errors(contract))
     for index, exposure in enumerate(contract.get("exposes") or []):
         if not isinstance(exposure, Mapping):
             continue

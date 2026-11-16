@@ -1409,23 +1409,78 @@ _OPS_OWNED_ELSEWHERE = frozenset(
 )
 
 #: Ops the AWS planner emits that nothing in the OpenTofu engine provisions
-#: yet. Each is named in a warning on every emit rather than refused: refusing
-#: them would fail contracts the MWAA fix is not about, and dropping them
-#: without a word is the defect this list exists to end.
+#: yet, each with what in the contract plans it and what to do instead. A
+#: contract that plans one is refused by ``fluid validate``, ``fluid plan``,
+#: ``fluid generate iac`` and ``fluid apply`` (:func:`refuse_unemitted_ops`):
+#: an apply that exits 0 without the access policy, view or schedule the
+#: contract declares reports a promise the tool does not keep (card usteZAAb).
+#: An op leaves this table when its emitter lands.
 #:
 #: Every op the AWS planner can produce is in :data:`_ACTION_EMITTERS`, in
 #: :data:`_OPS_OWNED_ELSEWHERE`, here, or is ``mwaa.ensure_environment``;
 #: ``tests/iac/test_iac_aws_unemitted_ops.py`` fails when one is not.
-_OPS_NOT_YET_EMITTED = frozenset(
-    {
-        "iam.bind_glue_database",
-        "iam.bind_s3_bucket",
-        "athena.create_view",
-        "redshift.ensure_schema",
-        "redshift.ensure_table",
-        "events.ensure_schedule",
-    }
-)
+_UNEMITTED_OPS: Dict[str, Tuple[str, str]] = {
+    "iam.bind_glue_database": (
+        "metadata.policies on an expose whose aws binding names binding.database",
+        "Declare who reads the table as governance.lakeFormation.grants on the aws "
+        "binding, which fluid apply writes, and drop metadata.policies from the aws overlay.",
+    ),
+    "iam.bind_s3_bucket": (
+        "metadata.policies on an expose bound to platform s3",
+        "Grant bucket access outside the contract (an IAM policy your platform team "
+        "owns), and drop metadata.policies from the s3 overlay.",
+    ),
+    "athena.create_view": (
+        "a view expose (kind: view) with binding.query",
+        "Create the view in a build step (an Athena CREATE VIEW in your dbt project), "
+        "and remove binding.query from the expose.",
+    ),
+    "redshift.ensure_schema": (
+        "an expose bound to platform redshift with binding.schema",
+        "Create the schema and table in a build step (dbt on Redshift), or bind the "
+        "expose to a redshift_serverless format, which fluid apply provisions.",
+    ),
+    "redshift.ensure_table": (
+        "a table expose bound to platform redshift with binding.table",
+        "Create the schema and table in a build step (dbt on Redshift), or bind the "
+        "expose to a redshift_serverless format, which fluid apply provisions.",
+    ),
+    "events.ensure_schedule": (
+        "execution.trigger of type schedule",
+        "Schedule with orchestration.engine: eventbridge and orchestration.schedule, "
+        "which fluid apply provisions, and remove execution.trigger.",
+    ),
+}
+_OPS_NOT_YET_EMITTED = frozenset(_UNEMITTED_OPS)
+
+
+def refuse_unemitted_ops(actions: Iterable[Any]) -> None:
+    """Refuse a plan that lists an op the OpenTofu engine does not create yet.
+
+    Every such op is named at once, with what in the contract planned it. An
+    ``orchestration.tasks[]`` step is not refused: it runs in the scheduler, and
+    its op is in the contract's own vocabulary (:func:`_account_for_unemitted_op`).
+    """
+    planned = sorted(
+        {
+            str(action.get("op"))
+            for action in actions or ()
+            if isinstance(action, Mapping)
+            and isinstance(action.get("op"), str)
+            and action["op"] in _UNEMITTED_OPS
+            and not isinstance(action.get("orchestration"), Mapping)
+        }
+    )
+    if not planned:
+        return
+    named = "; ".join(f"{op} (from {_UNEMITTED_OPS[op][0]})" for op in planned)
+    raise UnsupportedBindingError(
+        "aws-op-not-emitted",
+        f"The AWS plan for this contract lists {named}. The OpenTofu engine does not "
+        "create these yet, so fluid apply would report success without them.",
+        tuple(dict.fromkeys(_UNEMITTED_OPS[op][1] for op in planned)),
+    )
+
 
 #: The op the AWS schedule planner (``providers/aws/plan/schedule.py``) plans
 #: for ``orchestration.engine`` airflow or mwaa with an ``orchestration.schedule``.
@@ -1565,6 +1620,7 @@ def _emit_from_actions(
     requested = _mwaa_requested(contract)
     if requested is not None and not any(action.get("op") == _MWAA_OP for action in planned):
         raise _refuse_mwaa_environment(requested.name, requested)
+    refuse_unemitted_ops(planned)
     for action in planned:
         op = action.get("op")
         emitter = _ACTION_EMITTERS.get(op) if isinstance(op, str) else None
@@ -1580,9 +1636,10 @@ def _account_for_unemitted_op(action: Mapping[str, Any], requested: Optional[_Mw
     A data-plane or build op owned elsewhere (``_OPS_OWNED_ELSEWHERE``) passes.
     :data:`_MWAA_OP` is refused (:func:`_refuse_mwaa_environment`; a contract
     that asks for it is refused before the loop, in :func:`_emit_from_actions`,
-    so this guards an op handed in without that request). Anything
-    else is named in a warning: a known op nothing provisions yet, an
-    orchestration task, and an op this module does not know. The last is not
+    so this guards an op handed in without that request), and so is an op in
+    :data:`_OPS_NOT_YET_EMITTED` (:func:`refuse_unemitted_ops`, also run before
+    the loop). Anything else is named in a warning: an orchestration task, and an
+    op this module does not know. The last is not
     refused: an AWS planner op cannot reach it unclassified (the planner-
     vocabulary test sees to that), so what does is another cloud's op, which
     ``native_actions`` passes when a multi-cloud contract's first expose is not
@@ -1601,14 +1658,8 @@ def _account_for_unemitted_op(action: Mapping[str, Any], requested: Optional[_Mw
         raise _refuse_mwaa_environment(action.get("environment_name"), requested)
     # Op and id are %r: a task's op and every id come from the contract, and
     # repr keeps a control character in either out of the terminal.
-    if known in _OPS_NOT_YET_EMITTED:
-        LOG.warning(
-            "aws_planned_op_not_emitted op=%r id=%r: the plan lists it, but the OpenTofu "
-            "engine provisions nothing for it, so fluid apply will not create it",
-            known,
-            action.get("id"),
-        )
-        return
+    if known in _OPS_NOT_YET_EMITTED and not task:
+        refuse_unemitted_ops([action])
     if task:
         LOG.warning(
             "aws_orchestration_task_not_emitted op=%r id=%r: orchestration tasks run in "

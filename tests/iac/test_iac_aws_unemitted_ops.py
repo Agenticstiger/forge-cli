@@ -230,23 +230,22 @@ class TestEveryOtherOp:
         _aws().emit(_contract(), [{"op": op, "id": "a"}])
         assert not [r for r in caplog.records if op in r.getMessage()]
 
-    @pytest.mark.parametrize(
-        "op",
-        [
-            "iam.bind_glue_database",
-            "iam.bind_s3_bucket",
-            "athena.create_view",
-            "redshift.ensure_schema",
-            "redshift.ensure_table",
-            "events.ensure_schedule",
-        ],
-    )
-    def test_a_known_op_with_no_emitter_is_named_in_a_warning(self, op, caplog):
-        caplog.set_level(logging.WARNING, logger=_AWS_LOGGER)
-        _aws().emit(_contract(), [{"op": op, "id": "a"}])
-        (record,) = [r for r in caplog.records if op in r.getMessage()]
-        assert record.levelno == logging.WARNING
-        assert "aws_planned_op_not_emitted" in record.getMessage()
+    @pytest.mark.parametrize("op", sorted(_OPS_NOT_YET_EMITTED))
+    def test_a_known_op_with_no_emitter_is_refused_with_its_source_and_a_way_out(self, op):
+        """usteZAAb: an apply that exits 0 without the access policy, view or schedule
+        the contract declares reports a promise the tool does not keep."""
+        with pytest.raises(UnsupportedBindingError) as excinfo:
+            _aws().emit(_contract(), [{"op": op, "id": "a"}])
+        err = excinfo.value
+        assert err.kind == "aws-op-not-emitted"
+        assert op in str(err) and "from " in str(err)
+        assert err.remediation
+
+    def test_every_unemitted_op_is_named_at_once(self):
+        ops = sorted(_OPS_NOT_YET_EMITTED)
+        with pytest.raises(UnsupportedBindingError) as excinfo:
+            _aws().emit(_contract(), [{"op": op, "id": op} for op in ops])
+        assert all(op in str(excinfo.value) for op in ops)
 
     # A task's ``s3.ensure_bucket`` names a bucket exposes[] may not declare.
     @pytest.mark.parametrize("op", ["glue.run_job", "s3.ensure_bucket"])
@@ -504,3 +503,81 @@ class TestShadow:
                 plugin=_aws(),
                 native_actions=[{"op": "mwaa.ensure_environment", "environment_name": "e"}],
             )
+
+
+# ── usteZAAb: refused at validate and plan too, from the planner's own ops ──
+
+
+def _policies(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """``metadata.policies`` on an expose whose binding names ``binding.database``: the
+    planner plans ``iam.bind_glue_database`` for it."""
+    contract.setdefault("metadata", {})["policies"] = {"read": ["role:analysts"]}
+    contract["exposes"][0]["binding"]["database"] = "orders_db"
+    return contract
+
+
+def _view(contract: Dict[str, Any]) -> Dict[str, Any]:
+    expose = contract["exposes"][0]
+    expose["kind"] = "view"
+    expose["binding"]["query"] = "SELECT 1 AS one"
+    return contract
+
+
+def _scheduled(contract: Dict[str, Any]) -> Dict[str, Any]:
+    contract["execution"] = {"trigger": {"type": "schedule", "schedule": "0 * * * *"}}
+    return contract
+
+
+_PLANNED_BY = [
+    (_policies, "iam.bind_glue_database"),
+    (_view, "athena.create_view"),
+    (_scheduled, "events.ensure_schedule"),
+]
+
+
+class TestRefusedBeforeApply:
+    @pytest.mark.parametrize(("shape", "op"), _PLANNED_BY)
+    def test_the_real_planner_plans_the_op(self, shape, op):
+        assert op in {a.get("op") for a in _planned_raw(shape(_contract()))}
+
+    @pytest.mark.parametrize(("shape", "op"), _PLANNED_BY)
+    def test_fluid_plan_refuses_it(self, shape, op):
+        """``fluid plan`` runs ``AwsProvider.plan``; a :class:`PlanValidationError` is
+        what ``generate iac`` and ``apply`` re-raise rather than skip as best-effort."""
+        from fluid_build.providers._plan_validation import PlanValidationError
+
+        with pytest.raises(PlanValidationError) as excinfo:
+            _planned(shape(_contract()))
+        assert op in str(excinfo.value)
+
+    @pytest.mark.parametrize(("shape", "op"), _PLANNED_BY)
+    def test_fluid_validate_refuses_it(self, shape, op):
+        from fluid_build.iac.governance_validation import validate_governance
+
+        errors, _warnings = validate_governance(shape(_contract()))
+        assert any(op in e for e in errors), errors
+
+    @pytest.mark.parametrize(("shape", "op"), _PLANNED_BY)
+    def test_generate_iac_refuses_it(self, shape, op, tmp_path, no_aws):  # noqa: F811
+        out = tmp_path / "out"
+        with pytest.raises(CLIError) as excinfo:
+            generate_iac.run(
+                _args(_write(tmp_path, shape(_contract())), out), logging.getLogger("t")
+            )
+        # The planner refused it (PlanValidationError), so ``native_actions`` re-raises
+        # it rather than fall back to the data plane alone; nothing is written.
+        assert excinfo.value.event == "generate_iac_failed"
+        assert op in excinfo.value.context["error"]
+        assert not out.exists()
+
+    def test_a_contract_that_plans_none_of_them_validates_clean(self):
+        from fluid_build.iac.governance_validation import validate_governance
+
+        errors, _warnings = validate_governance(_contract())
+        assert not [e for e in errors if "OpenTofu engine does not create" in e]
+
+
+def _planned_raw(contract: Dict[str, Any]) -> list:
+    from fluid_build.providers.aws.plan.planner import plan_actions
+
+    return plan_actions(contract, ACCOUNT, "us-east-1", logging.getLogger("t"))
