@@ -1157,3 +1157,51 @@ class TestLiveElementNames:
     def test_dbt_checks_element_types_only_when_a_metric_exists(self, tmp_path: Path):
         contract = _region_clash_contract(with_metric=False)
         assert _generate_with_dbt_validate(contract, tmp_path)[0] == 0
+
+
+@pytest.mark.unit
+class TestCollectionsThatAreNotLists:
+    """The schema requires lists; an unvalidated contract can hold anything there."""
+
+    @pytest.mark.parametrize("key", ["entities", "dimensions", "measures", "metrics"])
+    @pytest.mark.parametrize(
+        "value, kind",
+        [
+            (5, "a number"),
+            (True, "a boolean"),
+            (1.5, "a number"),
+            ("status", "a string"),
+            ({"name": "status"}, "a mapping"),
+            (None, "null"),
+        ],
+    )
+    def test_a_collection_that_is_not_a_list_is_read_as_empty(self, key, value, kind, caplog):
+        semantics = _semantics()
+        semantics[key] = value
+        with caplog.at_level("WARNING"):
+            doc = _emit(_contract(semantics=semantics))
+        assert f"semantics.{key} is {kind}, not a list" in caplog.text
+        names = {
+            kind: [element["name"] for element in _model(doc).get(kind, [])]
+            for kind in ("entities", "dimensions", "measures")
+        }
+        names["metrics"] = [metric["name"] for metric in doc.get("metrics", [])]
+        assert (
+            names[key]
+            == {
+                "entities": ["order"],  # the primary entity derived from the key column
+                "dimensions": ["ordered_at"],  # defaultAggTimeDimension, from its schema column
+                "measures": [],
+                "metrics": [],
+            }[key]
+        )
+
+    def test_input_metrics_that_are_not_a_list(self):
+        semantics = _semantics()
+        semantics["metrics"][3]["inputMetrics"] = 7  # the derived metric
+        doc = _emit(_contract(semantics=semantics))
+        assert "order_total_2x" not in [m["name"] for m in doc["metrics"]]
+        ratio = dict(semantics["metrics"][2], inputMetrics=7)
+        semantics["metrics"][2] = ratio
+        doc = _emit(_contract(semantics=semantics))
+        assert _metric(doc, "avg_order_value")["type_params"]["numerator"] == "order_total"

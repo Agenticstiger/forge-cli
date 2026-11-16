@@ -331,6 +331,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   makes `dbt parse` reject the export whenever the project declares a metric
   (dbt-semantic-interfaces' `ElementConsistencyRule`). `fluid validate` now warns about both,
   comparing the names the export writes, so `--strict` fails on them.
+- **`fluid generate transformation` stopped with a `TypeError` on a semantics collection that
+  is not a list.** An unvalidated contract with, for example, `entities: 5` failed the dbt
+  generator. `entities`, `dimensions`, `measures` and `metrics` that are not lists now read as
+  empty, with a warning, as `fluid validate` reads them. A metric's `inputMetrics` that is not
+  a list reads as empty too, and the metric is dropped with the usual warning when it needs
+  them.
 - **A natural entity made `fluid generate transformation` write a dbt project `dbt parse`
   rejected.** dbt accepts a `natural` entity only beside a validity window, and validates the
   semantic layer whenever the project has a metric, so a contract with a natural entity and a
