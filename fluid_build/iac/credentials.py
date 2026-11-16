@@ -130,8 +130,18 @@ AWS_ENV_PREFIXES: Tuple[str, ...] = ("AWS_",)
 GCP_ENV_PREFIXES: Tuple[str, ...] = ("GOOGLE_", "GCLOUD_", "CLOUDSDK_", "GCE_METADATA_")
 
 #: Names inside a family that no provider reads and that hold a key for
-#: something else: model API keys (Gemini, Amazon Bedrock).
-EXCLUDED_ENV_NAMES: FrozenSet[str] = frozenset({"GOOGLE_API_KEY", "AWS_BEARER_TOKEN_BEDROCK"})
+#: something else: model API keys (Gemini, Amazon Bedrock, Azure OpenAI).
+EXCLUDED_ENV_NAMES: FrozenSet[str] = frozenset(
+    {
+        "GOOGLE_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AZURE_API_KEY",
+    }
+)
+#: Whole families of model settings and keys inside a cloud's family (Azure
+#: OpenAI, Azure AI Foundry).
+EXCLUDED_ENV_PREFIXES: Tuple[str, ...] = ("AZURE_OPENAI_", "AZURE_AI_")
 
 #: The clouds a state backend block (``terraform.backend``) authenticates with.
 _BACKEND_CLOUDS: Dict[str, str] = {"s3": "aws", "gcs": "gcp"}
@@ -167,7 +177,7 @@ def allowed_env_name(
 
 
 def _allowed(name: str, names: FrozenSet[str], prefixes: Tuple[str, ...]) -> bool:
-    if name in EXCLUDED_ENV_NAMES:
+    if name in EXCLUDED_ENV_NAMES or name.startswith(EXCLUDED_ENV_PREFIXES):
         return False
     return name in names or any(name.startswith(prefix) for prefix in prefixes)
 

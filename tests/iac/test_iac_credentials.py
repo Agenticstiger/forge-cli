@@ -64,6 +64,21 @@ class TestBasics:
         env = build_tofu_env(get_iac_plugin("aws"), base=_env())
         assert not set(UNRELATED) & set(env)
 
+    def test_model_keys_never_pass_inside_a_cloud_family(self):
+        model_keys = {
+            "GOOGLE_API_KEY": "g",  # pragma: allowlist secret
+            "GOOGLE_GENERATIVE_AI_API_KEY": "g",  # pragma: allowlist secret
+            "AZURE_API_KEY": "a",  # pragma: allowlist secret
+            "AZURE_OPENAI_API_KEY": "a",  # pragma: allowlist secret
+            "AZURE_OPENAI_ENDPOINT": "https://x.openai.azure.com",
+            "AZURE_AI_INFERENCE_KEY": "a",  # pragma: allowlist secret
+            "AWS_BEARER_TOKEN_BEDROCK": "b",  # pragma: allowlist secret
+        }
+        kept = {"GOOGLE_CREDENTIALS": "{}", "AZURE_TENANT_ID": "t", "ARM_CLIENT_ID": "c"}
+        # Databricks reads the GOOGLE_, AZURE_ and ARM_ families on GCP and Azure workspaces.
+        env = build_tofu_env(get_iac_plugin("databricks"), base={**model_keys, **kept})
+        assert env == kept
+
     def test_is_a_copy_and_never_falls_back_to_the_process_environment(self):
         base = {"PATH": "/usr/bin"}
         env = build_tofu_env(base=base)
