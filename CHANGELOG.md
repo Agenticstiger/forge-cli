@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   providers), `fluid generate schedule` and `fluid generate-airflow` all render a contract's
   `orchestration` section through `fluid_build.schedulers.airflow.render_dag`. The per-provider
   `codegen/airflow.py` modules, the Snowflake `orchestration/airflow_generator.py` and the
-  provider-action generator behind `generate-airflow` are gone. The same contract now gives the
-  same DAG whichever command writes it. Every provider gets the guards only some had: a task
+  provider-action generator behind `generate-airflow` are gone. The same contract and provider
+  settings now give the same DAG whichever command writes it (`fluid generate schedule` reads
+  the project, region and account from the contract's `metadata`, `fluid export` from the
+  provider's own settings, so give both the same). Every provider gets the guards only some had: a task
   never takes a name the DAG module binds, ids that sanitise alike stay two tasks, an edge to a
   task outside the DAG is skipped instead of failing the file at import, and an operator is
   imported only when a task uses it. Ported into the renderer: AWS Redshift, Lambda and Glue

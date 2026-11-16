@@ -21,6 +21,7 @@ from fluid_build.providers.common.codegen_utils import (
     airflow_dag_import,
     airflow_standard_import,
     convert_schedule_to_airflow,
+    detect_circular_dependencies,
     generate_file_header,
     py_str_literal,
     sanitize_identifier,
@@ -66,8 +67,9 @@ class AirflowScheduler(ScheduleEngine):
         tasks = orchestration.get("tasks", [])
         contract_id = contract.get("id", "unknown")
         contract_name = contract.get("name", contract_id)
-        schedule = orchestration.get("schedule", "0 2 * * *")
-        timezone = orchestration.get("timezone", "UTC")
+        # `or`: a null or empty value in the YAML is "not set", not a schedule.
+        schedule = orchestration.get("schedule") or "0 2 * * *"
+        timezone = orchestration.get("timezone") or "UTC"
 
         if schedule_intent:
             schedule = schedule_intent.schedule or schedule
@@ -189,6 +191,9 @@ def _render(
     """Assemble one DAG file: header, imports, DAG, helpers, tasks, edges."""
     provider_lower = (provider or "").lower()
     emit = EMITTERS.get(provider_lower)
+    # One task per id: the DAG is keyed by task id, and two blocks with one id fail
+    # Airflow's import with DuplicateTaskIdFound. The last declaration wins.
+    tasks = list({t.get("taskId") or "": t for t in tasks}.values())
     identifiers = unique_task_identifiers(tasks, reserved=RESERVED_NAMES)
 
     task_blocks: List[str] = []

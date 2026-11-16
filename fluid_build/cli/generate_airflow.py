@@ -24,7 +24,7 @@ import tempfile
 from pathlib import Path
 
 from ._common import CLIError
-from ._logging import error, warn
+from ._logging import error, info, warn
 
 COMMAND = "generate-airflow"
 SUCCESSOR = "fluid generate schedule --scheduler airflow"
@@ -88,7 +88,7 @@ def run(args, logger: logging.Logger) -> int:
         to_file = not output or Path(output).suffix == ".py"
         scratch = Path(tempfile.mkdtemp(prefix="fluid-dag-")) if to_file else None
         try:
-            with contextlib.redirect_stdout(sys.stderr) if not output else contextlib.nullcontext():
+            with contextlib.redirect_stdout(sys.stderr) if scratch else contextlib.nullcontext():
                 code = generate_schedule.run(
                     argparse.Namespace(
                         contract=args.contract,
@@ -122,6 +122,7 @@ def run(args, logger: logging.Logger) -> int:
                 if output:
                     Path(output).parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(dags[0]), output)
+                    info(logger, f"DAG written to: {output}")
                 else:
                     sys.stdout.write(dags[0].read_text(encoding="utf-8"))
             return code
@@ -131,3 +132,6 @@ def run(args, logger: logging.Logger) -> int:
     except CLIError as e:
         error(logger, f"❌ {e.event}: {e.context}")
         return e.exit_code
+    except OSError as e:
+        error(logger, f"❌ Could not write the DAG: {e}")
+        return 1

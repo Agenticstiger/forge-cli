@@ -28,7 +28,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Set, Tuple
 
 from fluid_build.providers._sql_safety import validate_ident, validate_sql_type_name
-from fluid_build.providers.common.codegen_utils import json_literal, py_str_literal
+from fluid_build.providers.common.codegen_utils import (
+    _stringify_keys,
+    json_literal,
+    py_str_literal,
+)
 
 Emitted = Tuple[str, Set[str]]
 
@@ -214,6 +218,18 @@ class TaskContext:
         return (parts[1], parts[2]) if len(parts) >= 3 else ("", "")
 
 
+def _data(value: Any) -> str:
+    """A contract mapping or list as a Python literal that parses and means the same.
+
+    ``repr`` of a YAML date is ``datetime.date(2024, 1, 1)``, which the generated
+    module cannot evaluate (it binds ``datetime`` to the class), and ``repr`` of a
+    non-string key keeps its type. A JSON round trip leaves str, number, bool,
+    None, list and dict: ``default=str`` turns a date into its text and
+    ``_stringify_keys`` mirrors ``json.dumps`` for ``on:``/``1:`` keys.
+    """
+    return repr(json.loads(json.dumps(_stringify_keys(value), default=str)))
+
+
 def _op(ctx: TaskContext, operator: str, kwargs: List[Tuple[str, str]], *uses: str) -> Emitted:
     """``<var> = <operator>(task_id=..., <kwargs>, dag=dag)`` and what it needs."""
     lines = [f"{ctx.var} = {operator}(", f"    task_id={py_str_literal(ctx.task_id)},"]
@@ -231,7 +247,7 @@ def generic_task(ctx: TaskContext) -> Emitted:
     scheduler reports as a DAG that never appears). ``default=str`` lets a
     param that YAML parses to a date serialise instead of raising.
     """
-    params_json = repr(json.dumps(ctx.params, sort_keys=True, default=str))
+    params_json = repr(json.dumps(_stringify_keys(ctx.params), sort_keys=True, default=str))
     return (
         f"{ctx.var} = PythonOperator(\n"
         f"    task_id={py_str_literal(ctx.task_id)},\n"
@@ -279,7 +295,7 @@ def gcp_task(ctx: TaskContext) -> Emitted:
                 f"        dataset_id={dataset_lit},\n"
                 f"        table_id={table_lit},\n"
                 f"        project_id={project_lit},\n"
-                f'        table_resource={{"schema": {{"fields": {fields!r}}}}},\n'
+                f'        table_resource={{"schema": {{"fields": {_data(fields)}}}}},\n'
                 f"        dag=dag,\n"
                 f"    )\n"
                 f"else:\n"
@@ -288,7 +304,7 @@ def gcp_task(ctx: TaskContext) -> Emitted:
                 f"        dataset_id={dataset_lit},\n"
                 f"        table_id={table_lit},\n"
                 f"        project_id={project_lit},\n"
-                f"        schema_fields={fields!r},\n"
+                f"        schema_fields={_data(fields)},\n"
                 f"        dag=dag,\n"
                 f"    )",
                 {"BigQueryCreateTableOperator"},
@@ -310,7 +326,7 @@ def gcp_task(ctx: TaskContext) -> Emitted:
                 ctx,
                 "BigQueryInsertJobOperator",
                 [
-                    ("configuration", repr({"query": query})),
+                    ("configuration", _data({"query": query})),
                     ("project_id", project_lit),
                     ("location", region_lit),
                 ],
@@ -353,7 +369,7 @@ def gcp_task(ctx: TaskContext) -> Emitted:
             [
                 ("job_name", py_str_literal(params.get("job_name", ctx.task_id))),
                 ("template", py_str_literal(params.get("template", ""))),
-                ("parameters", repr(params.get("parameters", {}))),
+                ("parameters", _data(params.get("parameters", {}))),
                 ("project_id", project_lit),
                 ("location", region_lit),
             ],
@@ -398,7 +414,7 @@ def aws_task(ctx: TaskContext) -> Emitted:
             [
                 ("job_name", py_str_literal(params.get("job_name", ctx.task_id))),
                 ("region_name", region_lit),
-                ("script_args", repr(params.get("script_args", {}))),
+                ("script_args", _data(params.get("script_args", {}))),
             ],
         )
     if service == "s3" and operation in ("create_bucket", "ensure_bucket"):
@@ -493,6 +509,11 @@ def snowflake_task(ctx: TaskContext) -> Emitted:
         schema = validate_ident(params.get("schema", "PUBLIC"))
         table = validate_ident(params.get("table", "UNKNOWN_TABLE"))
         columns = params.get("columns") or []
+        for column in columns:
+            if not (isinstance(column, dict) and column.get("name") and column.get("type")):
+                raise ValueError(
+                    f"task {ctx.task_id!r}: every create_table column needs a name and a type"
+                )
         cols = (
             ", ".join(
                 f"{validate_ident(c['name'])} {validate_sql_type_name(c['type'])}" for c in columns
