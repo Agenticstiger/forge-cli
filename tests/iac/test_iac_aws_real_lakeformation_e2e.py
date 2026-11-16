@@ -38,7 +38,6 @@ return 403). See ``tests/iac/_aws_stage3_bootstrap/README.md``.
 from __future__ import annotations
 
 import json
-import os
 import time
 from typing import Any, Dict, List
 
