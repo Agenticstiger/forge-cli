@@ -15,8 +15,9 @@ credential).
 - streaming: Kafka -> decode (JSON, or Confluent Avro through ABRiS) -> the source
   query -> watermark -> the select -> append to the Iceberg table, with the config's
   checkpoint and trigger.
-- batch: the same read of what the topic holds now, or the contract's own SELECT over
-  catalog tables, -> overwrite the partitions it computes.
+- batch: the contract's own SELECT over catalog tables -> overwrite the partitions it
+  computes. A topic is landed by a stream (``availableNow`` for a scheduled run), never
+  by a batch read, which sees only what Kafka still retains.
 
 The submitter puts on the classpath what the job uses: the Iceberg Spark runtime and
 its AWS bundle (EMR: the release's Iceberg; Glue: ``--datalake-formats iceberg``),
@@ -89,13 +90,17 @@ def parse_config(text: str) -> dict:
         raise JobConfigError("mode must be streaming or batch")
     if config["mode"] == "streaming" and not (config.get("source") and config.get("checkpoint")):
         raise JobConfigError("a streaming job reads a source and keeps a checkpoint")
+    if config["mode"] == "batch" and config.get("source"):
+        raise JobConfigError("a batch job runs SQL over catalog tables and reads no topic")
     return config
 
 
 def resolve_secret(ref: str) -> str:
     """A registry credential: ``env://NAME`` or ``aws-sm://<name-or-arn>[#key]``."""
-    scheme, _, locator = ref.partition("://")
-    locator, _, field = locator.partition("#")
+    scheme, _, rest = ref.partition("://")
+    # The canonical form: <scheme>://<locator>[#<field>][?version=<v>].
+    rest, _, version = rest.partition("?version=")
+    locator, _, field = rest.partition("#")
     if scheme == "env":
         value = os.environ.get(locator)
         if not value:
@@ -104,8 +109,7 @@ def resolve_secret(ref: str) -> str:
     if scheme == "aws-sm":
         import boto3  # every AWS Spark runtime has it; imported only when used
 
-        name, _, version = locator.partition("?version=")
-        kwargs = {"SecretId": name, **({"VersionId": version} if version else {})}
+        kwargs = {"SecretId": locator, **({"VersionId": version} if version else {})}
         value = boto3.client("secretsmanager").get_secret_value(**kwargs)["SecretString"]
         return str(json.loads(value)[field]) if field else value
     raise JobConfigError(f"this runner does not read {scheme} secret references")
@@ -121,8 +125,16 @@ def fetch_reader_schema(registry: dict, subject: str, version: object) -> str:
     if registry.get("auth"):
         token = base64.b64encode(resolve_secret(registry["auth"]["secretRef"]).encode()).decode()
         request.add_header("Authorization", f"Basic {token}")
-    with urllib.request.urlopen(request, timeout=_REGISTRY_TIMEOUT_S) as response:  # nosec B310
+    # No redirects: urllib would send the Authorization header on to the new location,
+    # a host the operator never allowed the credential to reach.
+    opener = urllib.request.build_opener(_NoRedirect)
+    with opener.open(request, timeout=_REGISTRY_TIMEOUT_S) as response:  # nosec B310
         return json.loads(response.read())["schema"]
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise JobConfigError(f"the schema registry answered {code} with a redirect; refused")
 
 
 def registry_conf(registry: dict) -> dict:
@@ -133,7 +145,7 @@ def registry_conf(registry: dict) -> dict:
     return conf
 
 
-def kafka_options(source: dict, mode: str) -> dict:
+def kafka_options(source: dict) -> dict:
     options = {
         "kafka.bootstrap.servers": source["bootstrapServers"],
         "subscribe": source["topic"],
@@ -142,8 +154,6 @@ def kafka_options(source: dict, mode: str) -> dict:
     }
     if source.get("groupIdPrefix"):
         options["groupIdPrefix"] = source["groupIdPrefix"]
-    if mode == "batch":
-        options["endingOffsets"] = "latest"
     if source["auth"] == "msk-iam":
         options.update(_MSK_IAM)
     elif source["auth"] != "none":
@@ -245,15 +255,14 @@ def _same_type(decoded, declared) -> bool:
     return decoded == declared
 
 
-def check_decoded(frame, column: str, ddl: str) -> None:
+def check_decoded(spark, frame, column: str, ddl: str) -> None:
     """Refuse a decoded record whose types differ from the declared ones.
 
     A Spark cast that loses data returns null instead of failing, so the source query's
     casts are safe only over the types the contract declares.
     """
-    from pyspark.sql.types import StructType
-
-    declared = StructType.fromDDL(ddl)
+    # PySpark has no StructType.fromDDL; an empty frame of the DDL is its public parser.
+    declared = spark.createDataFrame([], ddl).schema
     decoded = frame.schema[column].dataType
     if not _same_type(decoded, declared):
         raise JobConfigError(
@@ -293,9 +302,7 @@ def read_records(spark, config: dict):
     source = config["source"]
     if source.get("kind") != "kafka":
         raise JobConfigError("the source must be kafka")
-    streaming = config["mode"] == "streaming"
-    reader = spark.readStream if streaming else spark.read
-    raw = reader.format("kafka").options(**kafka_options(source, config["mode"])).load()
+    raw = spark.readStream.format("kafka").options(**kafka_options(source)).load()
     columns = [
         decode(spark, source, "value").alias("value"),
         decode(spark, source, "key").alias("key"),
@@ -311,7 +318,7 @@ def read_records(spark, config: dict):
     for column in ("value", "key"):
         spec = source[column]
         if spec is not None and spec["format"] != "raw":
-            check_decoded(records, column, spec["schema"])
+            check_decoded(spark, records, column, spec["schema"])
     return records
 
 

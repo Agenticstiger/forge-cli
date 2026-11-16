@@ -297,18 +297,51 @@ def test_an_unmasked_build_carries_no_key(contract):
     assert (config["maskedColumns"], config["maskKey"]) == ([], None)
 
 
-def test_a_batch_job_reads_the_topic_once(contract):
-    props = contract["builds"][0]["properties"]
-    props["parameters"]["spark"]["mode"] = "batch"
-    with pytest.raises(ValueError, match="keeps no position"):
+def test_a_batch_job_reads_no_topic(contract):
+    """A batch read sees only what Kafka still retains: overwriting the table with it
+    would drop every older row, so a topic is landed by a stream (availableNow)."""
+    contract["builds"][0]["properties"]["parameters"]["spark"]["mode"] = "batch"
+    with pytest.raises(ValueError, match="availableNow"):
         job(contract)
-    for key in ("trigger", "watermark"):
-        del props["stream"][key]
-    del props["stream"]["startingOffsets"]
-    config = job(contract).config
-    assert config["source"]["startingOffsets"] == "earliest"
-    assert (config["trigger"], config["watermark"], config["checkpoint"]) == (None, None, None)
-    assert config["sink"]["write"] == "overwrite"
+
+
+def test_a_new_stream_starts_at_the_latest_offset_unless_told(contract):
+    contract["builds"][0]["properties"]["stream"].pop("startingOffsets")
+    assert job(contract).config["source"]["startingOffsets"] == "latest"
+
+
+def test_the_default_checkpoint_takes_the_iac_account_token(contract):
+    del contract["exposes"][0]["binding"]["location"]["bucket"]
+    token = "${data.aws_caller_identity.current.account_id}"
+    assert job(contract, account_ref=token).config["checkpoint"] == (
+        f"s3://{token}-fluid-data/_checkpoints/commerce.orders-stream/ingest-orders/"
+    )
+
+
+def test_the_mask_key_is_under_the_operators_secret_prefixes(contract):
+    """The contract names the key's secret; without the operator's prefixes a product
+    could hash with another product's key and join against that product's table."""
+    environ = {
+        "FLUID_SECRET_PREFIXES": "aws-sm://arn:aws:secretsmanager:eu-west-1:000000000005:secret:other/"
+    }
+    environ[HOST_ALLOWLIST_ENV] = "msk.example,example.internal"
+    with pytest.raises(FluidUserError, match="outside the prefixes"):
+        job(contract, environ=environ)
+    environ[
+        "FLUID_SECRET_PREFIXES"
+    ] += ",aws-sm://arn:aws:secretsmanager:eu-west-1:000000000005:secret:commerce/"
+    assert job(contract, environ=environ).config["maskKey"] == {"secretArn": MASK_KEY_ARN}
+
+
+def test_validate_survives_a_malformed_build(contract):
+    contract["builds"][0]["properties"]["stream"].update(
+        format="avro-confluent", registry={"kind": "confluent", "url": "http://[x"}
+    )
+    assert validation_warnings(contract) == []
+    assert validation_errors(contract)
+    contract["builds"][0]["properties"]["parameters"]["spark"] = True
+    assert validation_warnings(contract) == []
+    assert validation_errors(contract) == ["Spark: parameters.spark must be an object"]
 
 
 def _sql_build(contract, sql="SELECT order_id, sku FROM commerce.order_lines"):

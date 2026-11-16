@@ -227,6 +227,22 @@ def _refuse_unless_hosts_allowed(source: Mapping[str, Any], environ: Any, *, lis
     refuse_unless_source_hosts_allowed({"source": source}, environ=env)
 
 
+def _refuse_unless_mask_key_allowed(arn: str, environ: Any) -> None:
+    """The secrets policy for the key the job hashes with, read as ``aws-sm://<arn>``.
+
+    The contract names the secret and the job's role reads it, so without the operator's
+    locator prefixes a product could hash with another product's key, and join its own
+    digests of chosen values against that product's masked table. The value never
+    leaves the job, so no destination applies.
+    """
+    from fluid_build.secrets.policy import check_prefix, check_scheme
+    from fluid_build.secrets.ref import parse_secret_ref
+
+    ref = parse_secret_ref(f"aws-sm://{arn}")
+    check_scheme(ref, environ)
+    check_prefix(ref, environ)
+
+
 def _refuse_unless_credential_allowed(ref: Any, url: str, where: str, environ: Any) -> None:
     """The secrets policy for a credential the job sends to the registry.
 
@@ -403,10 +419,15 @@ def compile_job_config(
         raise ValueError(f"{where}: parameters.spark.mode: expected one of {list(MODES)}")
     if sql is not None and mapping is not None:
         raise ValueError(f"{where}: declare properties.mapping or properties.sql, not both")
-    if stream_spec is None and (mode == "streaming" or sql is None):
+    if mode == "streaming" and stream_spec is None:
+        raise ValueError(f"{where}: a streaming job reads the records properties.stream declares")
+    if mode == "batch" and (stream_spec is not None or sql is None):
+        # A batch read of a topic sees only what Kafka still retains, so overwriting the
+        # table with it would drop every older row; a stream keeps its position instead.
         raise ValueError(
-            f"{where}: a streaming job, or a batch job without properties.sql, reads the "
-            "records properties.stream declares"
+            f"{where}: a batch job runs properties.sql over catalog tables; to land a topic "
+            "on a schedule, set parameters.spark.mode: streaming with "
+            "properties.stream.trigger.availableNow: true"
         )
     if stream_spec is None and mapping is not None:
         raise ValueError(f"{where}: properties.mapping maps properties.stream")
@@ -458,7 +479,7 @@ def compile_job_config(
         _refuse_unless_hosts_allowed(
             _source_hosts(kafka, registry and registry["url"]), environ, listed=host_gate
         )
-        offsets = stream_spec.get("startingOffsets", "earliest" if mode == "batch" else "latest")
+        offsets = stream_spec.get("startingOffsets", "latest")
         if offsets not in ("earliest", "latest"):
             raise ValueError(f"{swhere}.startingOffsets: expected earliest or latest")
         source = {
@@ -473,25 +494,18 @@ def compile_job_config(
             **_decoders(stream, registry),
         }
         source_sql = spark_source_select(stream, swhere)
-        if mode == "batch":
-            extra = sorted(k for k in ("trigger", "watermark", "checkpoint") if k in stream_spec)
-            if extra:
-                raise ValueError(
-                    f"{swhere}.{extra[0]}: a batch job reads the topic once and keeps no "
-                    "position; set parameters.spark.mode: streaming (with trigger "
-                    "availableNow: true for a scheduled catch-up run)"
-                )
-        else:
-            checkpoint = stream_spec.get(
-                "checkpoint", f"s3://{bucket}/_checkpoints/{product}/{bid}/"
-            )
-            if not isinstance(checkpoint, str) or not _CHECKPOINT.fullmatch(checkpoint):
-                raise ValueError(f"{swhere}.checkpoint: expected an s3:// URI with a prefix")
-            streaming = {
-                "trigger": _trigger(stream_spec.get("trigger"), expose, swhere),
-                "watermark": _watermark(stream_spec.get("watermark"), stream, swhere),
-                "checkpoint": checkpoint.rstrip("/") + "/",
-            }
+        # The default is built from the warehouse bucket, which may be the IaC emitter's
+        # account token; only a declared checkpoint is the contract's text to check.
+        checkpoint = stream_spec.get("checkpoint")
+        if checkpoint is None:
+            checkpoint = f"s3://{bucket}/_checkpoints/{product}/{bid}/"
+        elif not isinstance(checkpoint, str) or not _CHECKPOINT.fullmatch(checkpoint):
+            raise ValueError(f"{swhere}.checkpoint: expected an s3:// URI with a prefix")
+        streaming = {
+            "trigger": _trigger(stream_spec.get("trigger"), expose, swhere),
+            "watermark": _watermark(stream_spec.get("watermark"), stream, swhere),
+            "checkpoint": checkpoint.rstrip("/") + "/",
+        }
         if sql is None:
             select = compile_select(
                 stream,
@@ -512,8 +526,10 @@ def compile_job_config(
             f"{where}: maskAtIngest hashes with the product's key; set "
             "parameters.spark.maskKeySecretArn to the Secrets Manager secret that holds it"
         )
-    if mask_key is not None and not (isinstance(mask_key, str) and _SECRET_ARN.fullmatch(mask_key)):
-        raise ValueError(f"{where}: parameters.spark.maskKeySecretArn: expected a secret ARN")
+    if mask_key is not None:
+        if not (isinstance(mask_key, str) and _SECRET_ARN.fullmatch(mask_key)):
+            raise ValueError(f"{where}: parameters.spark.maskKeySecretArn: expected a secret ARN")
+        _refuse_unless_mask_key_allowed(mask_key, environ)
     if sql is not None:
         if contract_sql_gate:
             refuse_unless_contract_sql_allowed(product, build, environ)
@@ -555,7 +571,11 @@ def validation_errors(contract: Mapping[str, Any]) -> list[str]:
     if not managed_lane_enabled(contract):
         return []
     errors = []
-    for build in spark_builds(contract):
+    try:
+        builds = spark_builds(contract)
+    except ValueError as exc:
+        return [f"Spark: {exc}"]
+    for build in builds:
         try:
             # A stand-in account: a bucketless binding validates; apply passes the real one.
             compile_job_config(
@@ -579,7 +599,11 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
     if not managed_lane_enabled(contract):
         return []
     warnings = []
-    for build in spark_builds(contract):
+    try:
+        builds = spark_builds(contract)
+    except ValueError:
+        return []  # validation_errors reports it
+    for build in builds:
         props = build.get("properties") or {}
         if props.get("sql") is not None:
             warnings.append(
@@ -592,11 +616,12 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
             continue
         try:
             kafka = _kafka(spark_parameters(build) or {}, f"Spark build {build.get('id')}")
+            registry = stream.get("registry")
+            url = registry.get("url") if isinstance(registry, Mapping) else None
+            source = _source_hosts(kafka, url if isinstance(url, str) else None)
+            names = _unlisted_names(source, None)
         except ValueError:
             continue  # validation_errors reports it
-        registry = stream.get("registry")
-        url = registry.get("url") if isinstance(registry, Mapping) else None
-        names = _unlisted_names(_source_hosts(kafka, url if isinstance(url, str) else None), None)
         if names:
             warnings.append(
                 f"Build {build.get('id')}: {', '.join(names)} is not in {HOST_ALLOWLIST_ENV}; "

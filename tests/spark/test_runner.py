@@ -51,19 +51,17 @@ def test_an_unresolved_interpolation_is_refused(runner, contract):
 
 def test_msk_iam_sets_the_sasl_options(runner, contract):
     source = runner.parse_config(config_text(contract))["source"]
-    options = runner.kafka_options(source, "streaming")
+    options = runner.kafka_options(source)
     assert options["kafka.bootstrap.servers"] == BROKERS
     assert options["subscribe"] == "commerce.orders"
     assert options["kafka.sasl.mechanism"] == "AWS_MSK_IAM"
     assert options["kafka.security.protocol"] == "SASL_SSL"
-    assert "endingOffsets" not in options
     assert "groupIdPrefix" not in options
-    plain = runner.kafka_options({**source, "auth": "none", "groupIdPrefix": "forge-o"}, "batch")
+    plain = runner.kafka_options({**source, "auth": "none", "groupIdPrefix": "forge-o"})
     assert plain["groupIdPrefix"] == "forge-o"
     assert "kafka.sasl.mechanism" not in plain
-    assert plain["endingOffsets"] == "latest"
     with pytest.raises(runner.JobConfigError, match="unknown Kafka auth"):
-        runner.kafka_options({**source, "auth": "scram"}, "streaming")
+        runner.kafka_options({**source, "auth": "scram"})
 
 
 def test_a_registry_credential_comes_from_the_environment(runner, monkeypatch):
@@ -95,16 +93,45 @@ def test_the_reader_schema_is_fetched_by_subject_and_version(runner, monkeypatch
         def read(self):
             return json.dumps({"schema": '{"type":"record"}'}).encode()
 
-    def urlopen(request, timeout):
-        seen["url"], seen["auth"] = request.full_url, request.get_header("Authorization")
-        return Response()
+    class Opener:
+        def open(self, request, timeout):
+            seen["url"], seen["auth"] = request.full_url, request.get_header("Authorization")
+            return Response()
 
-    monkeypatch.setattr(runner.urllib.request, "urlopen", urlopen)
+    def build_opener(*handlers):
+        seen["handlers"] = handlers
+        return Opener()
+
+    monkeypatch.setattr(runner.urllib.request, "build_opener", build_opener)
     monkeypatch.setenv("REGISTRY_USER_INFO", "u:p")  # pragma: allowlist secret
     registry = {"url": "http://r:8081/", "auth": {"secretRef": "env://REGISTRY_USER_INFO"}}
     assert runner.fetch_reader_schema(registry, "a/b-value", 3) == '{"type":"record"}'
     assert seen["url"] == "http://r:8081/subjects/a%2Fb-value/versions/3"
     assert seen["auth"] == "Basic dTpw"
+    assert seen["handlers"] == (runner._NoRedirect,)
+
+
+def test_a_registry_redirect_is_refused_not_followed(runner):
+    """urllib would send the Authorization header on to the redirect's host."""
+    with pytest.raises(runner.JobConfigError, match="redirect"):
+        runner._NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://evil/")
+
+
+def test_an_aws_sm_reference_with_a_field_and_a_version(runner, monkeypatch):
+    client = _boto3(monkeypatch, {"SecretString": '{"user_info": "u:p"}'})
+    calls = []
+    client.get_secret_value = lambda **kw: calls.append(kw) or {
+        "SecretString": '{"user_info": "u:p"}'
+    }
+    assert runner.resolve_secret("aws-sm://commerce/registry#user_info?version=v1") == "u:p"
+    assert calls == [{"SecretId": "commerce/registry", "VersionId": "v1"}]
+
+
+def test_a_batch_config_that_reads_a_topic_is_refused(runner, contract):
+    config = json.loads(config_text(contract))
+    config["mode"] = "batch"
+    with pytest.raises(runner.JobConfigError, match="reads no topic"):
+        runner.parse_config(json.dumps(config))
 
 
 def test_the_runner_imports_nothing_but_the_standard_library_at_module_level():
