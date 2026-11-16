@@ -68,6 +68,10 @@ _BUCKET_RE = re.compile(r"[A-Za-z0-9._-]+")
 #: Control characters: refused in a key or prefix, which ``fluid apply``
 #: prints on its state line (a newline there would forge a line of output).
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# ``?region=<aws region>`` closing an s3 spec names the *state bucket's* region
+# (it may differ from the region the resources live in). Only this exact tail is
+# read as a region; any other ``?`` stays part of the key, as before.
+_S3_REGION_TAIL_RE = re.compile(r"\?region=([a-z]{2}(?:-[a-z]+)+-[0-9]{1,2})$")
 
 #: What a provider name in a state key may hold: an IaC plugin name (``aws``,
 #: ``databricks``, ...) and nothing that could add a path segment or a control
@@ -187,7 +191,10 @@ def parse_backend(
 
     ``None`` / empty → local state (returns ``None``). Supported specs:
 
-    * ``s3://<bucket>/<key>``     — AWS S3 backend
+    * ``s3://<bucket>/<key>``     — AWS S3 backend; a trailing
+      ``?region=<region>`` names the state bucket's region and is emitted as
+      the backend's ``region`` (without it tofu reads ``AWS_REGION``). Locking
+      (``use_lockfile``) is passed at init, see ``runner._s3_lockfile_args``.
     * ``gcs://<bucket>/<prefix>`` — Google Cloud Storage backend
 
     An explicit key / prefix in the spec always wins. When the spec omits
@@ -209,14 +216,22 @@ def parse_backend(
     spec = spec.strip()
 
     if spec.startswith("s3://"):
-        bucket, _, key = spec[len("s3://") :].partition("/")
+        rest = spec[len("s3://") :]
+        region_tail = _S3_REGION_TAIL_RE.search(rest)
+        region = region_tail.group(1) if region_tail else None
+        if region_tail:
+            rest = rest[: region_tail.start()]
+        bucket, _, key = rest.partition("/")
         if not bucket:
             raise ValueError(f"s3 backend spec needs a bucket: {spec!r}")
         _check_bucket(bucket, "s3")
         _check_path(key, "s3", "key")
         if not key:
             key = default_state_key(contract, per_contract=per_contract_default, provider=provider)
-        return {"s3": {"bucket": bucket, "key": key}}
+        s3: Dict[str, Any] = {"bucket": bucket, "key": key}
+        if region:
+            s3["region"] = region
+        return {"s3": s3}
 
     if spec.startswith("gcs://"):
         bucket, _, prefix = spec[len("gcs://") :].partition("/")
@@ -297,7 +312,8 @@ def backend_location(block: Mapping[str, Any]) -> str:
     """
     if "s3" in block:
         s3 = block["s3"]
-        return f"s3://{s3['bucket']}/{s3['key']}"
+        region = f"?region={s3['region']}" if s3.get("region") else ""
+        return f"s3://{s3['bucket']}/{s3['key']}{region}"
     if "gcs" in block:
         gcs = block["gcs"]
         prefix = gcs.get("prefix")

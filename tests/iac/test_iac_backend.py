@@ -164,3 +164,29 @@ class TestBackendInDocument:
             resources={},
         )
         assert "backend" not in doc["terraform"]
+
+
+class TestS3Region:
+    def test_region_tail_becomes_the_backend_region(self):
+        block = parse_backend("s3://b/fluid/prod.tfstate?region=eu-west-1")
+        assert block == {"s3": {"bucket": "b", "key": "fluid/prod.tfstate", "region": "eu-west-1"}}
+
+    def test_region_with_a_bucket_only_spec_keeps_the_default_key(self):
+        block = parse_backend("s3://b?region=us-east-1")
+        assert block["s3"]["bucket"] == "b"
+        assert block["s3"]["region"] == "us-east-1"
+        assert block["s3"]["key"] and "?" not in block["s3"]["key"]
+
+    def test_no_region_tail_emits_no_region(self):
+        assert "region" not in parse_backend("s3://b/k")["s3"]
+
+    def test_other_question_marks_stay_in_the_key(self):
+        assert parse_backend("s3://b/a?b")["s3"] == {"bucket": "b", "key": "a?b"}
+        # Not a region shape: left in the key, never half-read.
+        assert parse_backend("s3://b/k?region=EU")["s3"]["key"] == "k?region=EU"
+
+    def test_location_round_trips_the_region(self):
+        from fluid_build.iac.backend import backend_location
+
+        spec = "s3://b/k?region=eu-west-1"
+        assert backend_location(parse_backend(spec)) == spec
