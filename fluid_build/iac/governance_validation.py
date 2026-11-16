@@ -74,12 +74,12 @@ def _unemitted_op_errors(contract: Mapping[str, Any]) -> List[str]:
         for e in contract.get("exposes") or []
     ):
         return []
-    # Its own logger, silenced: the planner logs as it plans (planning_completed,
-    # glue_iam_binding_skipped), which is `fluid plan`'s output, not validate's.
-    quiet = logging.getLogger(f"{__name__}.offline_plan")
-    quiet.propagate = False
-    if not quiet.handlers:
-        quiet.addHandler(logging.NullHandler())
+    # A logger of its own, outside the logging tree and disabled: the planner logs
+    # as it plans (planning_completed, glue_iam_binding_skipped), which is `fluid
+    # plan`'s output, not validate's. Not getLogger(): a named logger is the
+    # manager's to configure, and the CLI's logging setup re-enables propagation.
+    quiet = logging.Logger(f"{__name__}.offline_plan")
+    quiet.disabled = True
     try:
         actions = plan_actions(contract, "000000000000", "us-east-1", quiet)
     except Exception:  # noqa: BLE001 - the planner's own refusals are fluid plan's to report
