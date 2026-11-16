@@ -55,7 +55,7 @@ def _binding(platform: str, **location: str) -> dict:
     return {"platform": platform, "format": "table", "location": location}
 
 
-def _contract(*bindings: dict, secret_ref: str = "") -> dict:
+def _contract(*bindings: dict, reference: str = "") -> dict:
     contract = {
         "fluidVersion": "0.7.3",
         "kind": "DataProduct",
@@ -65,11 +65,11 @@ def _contract(*bindings: dict, secret_ref: str = "") -> dict:
             {"exposeId": f"out_{i}", "binding": binding} for i, binding in enumerate(bindings)
         ],
     }
-    if secret_ref:
+    if reference:
         contract["builds"] = [
             {
                 "id": "ingest",
-                "properties": {"source": {"connection": {"secretRef": secret_ref}}},
+                "properties": {"source": {"connection": {"secretRef": reference}}},
             }
         ]
     return contract
@@ -137,7 +137,7 @@ def test_a_vault_secret_ref_means_openbao(tmp_path, monkeypatch, scheme):
     monkeypatch.chdir(tmp_path)
     _write(
         tmp_path,
-        _contract(_binding("local", path="o.csv"), secret_ref=f"{scheme}://kv/pg#password"),
+        _contract(_binding("local", path="o.csv"), reference=f"{scheme}://kv/pg#password"),
     )
     assert _contract_cloud_auth("contract.fluid.yaml") == ("openbao",)
 
@@ -146,14 +146,14 @@ def test_other_secret_schemes_need_no_openbao(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _write(
         tmp_path,
-        _contract(_binding("local", path="o.csv"), secret_ref="env://PG_PASSWORD"),
+        _contract(_binding("local", path="o.csv"), reference="env://PG_PASSWORD"),
     )
     assert _contract_cloud_auth("contract.fluid.yaml") == ()
 
 
 def test_all_platforms_in_wiring_order(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    _write(tmp_path, _contract(*reversed(_ALL_CLOUDS), secret_ref="vault://kv/x#y"))
+    _write(tmp_path, _contract(*reversed(_ALL_CLOUDS), reference="vault://kv/x#y"))
     assert _contract_cloud_auth("contract.fluid.yaml") == (
         "aws",
         "gcp",
@@ -169,7 +169,7 @@ def test_all_platforms_in_wiring_order(tmp_path, monkeypatch):
 def _cloud_files(tmp_path, monkeypatch, system, complexity):
     _write(
         tmp_path,
-        _contract(*_ALL_CLOUDS, secret_ref="vault://kv/pg#password"),
+        _contract(*_ALL_CLOUDS, reference="vault://kv/pg#password"),
     )
     return _generate(tmp_path, monkeypatch, system, complexity)
 
@@ -588,7 +588,7 @@ def test_the_forge_scaffolder_reads_the_project_contract(tmp_path):
     from fluid_build.cli import _forge_ci_scaffolder
 
     assert _forge_ci_scaffolder._cloud_auth(tmp_path) == ()
-    _write(tmp_path, _contract(_binding("aws"), secret_ref="vault://kv/app#pw"))
+    _write(tmp_path, _contract(_binding("aws"), reference="vault://kv/app#pw"))
     assert _forge_ci_scaffolder._cloud_auth(tmp_path) == ("aws", "openbao")
 
 
