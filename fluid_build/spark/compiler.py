@@ -7,7 +7,8 @@ forge runs one versioned PySpark runner (``runner/forge_spark_runner.py``, shipp
 as package data and never imported here) with a generated ``job.json``. The config
 says everything the job does, so the runner holds no contract logic:
 
-- the Kafka source (brokers, topic, MSK IAM or no auth, where a new job starts), how
+- the Kafka source (``parameters.spark.source``: brokers or an MSK cluster ARN, MSK IAM
+  or no auth; the topic and where a new job starts), how
   values and keys are decoded (JSON with a Spark schema, or Confluent Avro through
   ABRiS with the registry's subject and version);
 - the two queries: ``source`` turns the decoded Kafka records into ``source_events``
@@ -21,7 +22,10 @@ says everything the job does, so the runner holds no contract logic:
 
 The text is canonical JSON (sorted keys, one trailing newline), so the same contract
 always gives the same bytes and digest. It holds no credential: a registry password
-is a secret reference the runner resolves, and the job's AWS identity is its role.
+is a secret reference the runner resolves, the ``maskAtIngest`` key is a Secrets
+Manager ARN, and the job's AWS identity is its role. The operator's policy is applied
+while it compiles: the broker and registry hosts, the registry credential's secrets
+policy, and the contract-SQL allowlist.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
+from urllib.parse import urlsplit
 
 from fluid_build.providers._iceberg_catalog import (
     FAMILY_GLUE,
@@ -66,9 +71,15 @@ _PRODUCT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _BUILD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _BROKER = r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252}[A-Za-z0-9])?:[0-9]{1,5}"
 _BROKERS = re.compile(rf"{_BROKER}(?:,{_BROKER})*")
-#: An OpenTofu interpolation the job's uploader resolves before the config is written,
-#: such as ``${aws_msk_cluster.orders.bootstrap_brokers_sasl_iam}``.
-_INTERPOLATION = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_.\[\]\"-]*\}")
+#: The brokers of an MSK cluster named by ARN: the spark-infra uploader fills this in from
+#: the cluster's ``bootstrap_brokers_sasl_iam`` when it renders the job config; the runner
+#: refuses a config that still holds it.
+MSK_BROKERS_PLACEHOLDER = "${fluid_msk_bootstrap_brokers}"
+_MSK_ARN = re.compile(r"arn:aws[a-z-]*:kafka:[a-z0-9-]+:[0-9]{12}:cluster/[A-Za-z0-9_./-]{1,256}")
+_SECRET_ARN = re.compile(
+    r"arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]{1,512}"
+)
+_GROUP_PREFIX = re.compile(r"[A-Za-z0-9._-]{1,200}")
 _CHECKPOINT = re.compile(r"s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[A-Za-z0-9._/=-]*")
 _REGISTRY_URL = re.compile(r"https?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/-]*)?")
 _SUBJECT = re.compile(r"[A-Za-z0-9._-]{1,255}")
@@ -135,19 +146,79 @@ def _interval(seconds: float) -> str:
     return f"{round(seconds * 1000)} milliseconds"
 
 
-def _brokers(value: Any) -> str:
-    if not isinstance(value, str) or not (
-        _BROKERS.fullmatch(value) or _INTERPOLATION.fullmatch(value)
-    ):
+def _kafka(cfg: Mapping[str, Any], where: str) -> dict[str, Any]:
+    """``parameters.spark.source``: the cluster the job reads, as the runner connects."""
+    spec = cfg.get("source")
+    where = f"{where}: parameters.spark.source"
+    if not isinstance(spec, Mapping):
+        raise ValueError(f"{where}: a streaming build names its Kafka cluster")
+    unknown = sorted(set(spec) - {"bootstrapServers", "mskClusterArn", "auth", "groupIdPrefix"})
+    if unknown:
+        raise ValueError(f"{where}: unsupported field(s) {unknown}")
+    servers, arn = spec.get("bootstrapServers"), spec.get("mskClusterArn")
+    if (servers is None) == (arn is None):
+        raise ValueError(f"{where}: name the cluster by bootstrapServers or mskClusterArn")
+    if servers is not None and not (isinstance(servers, str) and _BROKERS.fullmatch(servers)):
+        raise ValueError(f"{where}.bootstrapServers: expected host:port[,host:port...]")
+    if arn is not None and not (isinstance(arn, str) and _MSK_ARN.fullmatch(arn)):
+        raise ValueError(f"{where}.mskClusterArn: expected an MSK cluster ARN")
+    auth = spec.get("auth", "msk-iam" if arn is not None else "none")
+    if auth not in KAFKA_AUTH:
+        raise ValueError(f"{where}.auth: expected one of {list(KAFKA_AUTH)}")
+    prefix = spec.get("groupIdPrefix")
+    if prefix is not None and not (isinstance(prefix, str) and _GROUP_PREFIX.fullmatch(prefix)):
+        raise ValueError(f"{where}.groupIdPrefix: expected letters, digits, ., _ and -")
+    return {
+        "bootstrapServers": MSK_BROKERS_PLACEHOLDER if servers is None else servers,
+        "mskClusterArn": arn,
+        "auth": auth,
+        "groupIdPrefix": prefix,
+    }
+
+
+def _refuse_unless_hosts_allowed(
+    kafka: Mapping[str, Any], registry: Optional[Mapping[str, Any]], environ: Any
+) -> None:
+    """The managed Flink lane's broker and registry host rule, unchanged: the job resolves
+    each name itself, so a hostname needs the operator's entry."""
+    from fluid_build.streaming.policy import refuse_unless_source_hosts_allowed
+
+    source: dict[str, Any] = {}
+    if kafka["mskClusterArn"] is None:
+        source["bootstrapServers"] = kafka["bootstrapServers"]
+    if registry is not None:
+        source["schemaRegistryUrl"] = registry["url"]
+    refuse_unless_source_hosts_allowed({"source": source}, environ=environ)
+
+
+def _refuse_unless_credential_allowed(ref: Any, url: str, where: str, environ: Any) -> None:
+    """The secrets policy for a credential the job sends to the registry.
+
+    The contract names both the secret and the host, so without this a product could
+    have the job's role read another product's secret and send it wherever it chose.
+    The job sends from the cluster, so a loopback host is no exemption here.
+    """
+    from fluid_build.secrets.policy import (
+        check_prefix,
+        check_scheme,
+        is_loopback,
+        refuse_unless_allowed,
+    )
+
+    parts = urlsplit(url)
+    if parts.scheme != "https":
+        raise ValueError(f"{where}.registry.url: a registry credential is sent over https only")
+    if is_loopback(parts.hostname):
         raise ValueError(
-            "bootstrap servers: expected host:port[,host:port...], or one OpenTofu "
-            "interpolation the uploader resolves, such as "
-            "${aws_msk_cluster.x.bootstrap_brokers_sasl_iam}"
+            f"{where}.registry.url: a registry credential goes to a named registry host; "
+            "loopback on the cluster is the cluster itself"
         )
-    return value
+    check_scheme(ref, environ)
+    check_prefix(ref, environ)
+    refuse_unless_allowed(ref, host=parts.hostname, environ=environ)
 
 
-def _registry(spec: Any, stream: Any, where: str) -> Optional[dict[str, Any]]:
+def _registry(spec: Any, stream: Any, where: str, environ: Any) -> Optional[dict[str, Any]]:
     if spec is None:
         if stream.uses_registry:
             raise ValueError(f"{where}.registry: avro-confluent records need their registry")
@@ -185,6 +256,7 @@ def _registry(spec: Any, stream: Any, where: str) -> Optional[dict[str, Any]]:
                 f"credential from {' or '.join(_REGISTRY_SECRET_SCHEMES)} references, "
                 f"not {ref.scheme}"
             )
+        _refuse_unless_credential_allowed(ref, url, where, environ)
         result["auth"] = {"secretRef": ref.canonical}
     return result
 
@@ -260,18 +332,17 @@ def compile_job_config(
     contract: Mapping[str, Any],
     build: Mapping[str, Any],
     *,
-    bootstrap_servers: Optional[str] = None,
-    kafka_auth: str = "msk-iam",
     account_ref: str = "",
     environ: Optional[Mapping[str, str]] = None,
+    contract_sql_gate: bool = True,
 ) -> SparkJob:
     """The job config of one Spark build.
 
-    ``bootstrap_servers`` and ``kafka_auth`` are the cluster the job reads, which the
-    contract does not name (its stream describes the records only). ``account_ref``
-    fills the ``<account>-fluid-data`` bucket of a binding without one, as the IaC
-    emitter's interpolation token or an account id. ``environ`` is read for
-    :data:`CONTRACT_SQL_ALLOWLIST_ENV` only.
+    ``account_ref`` fills the ``<account>-fluid-data`` bucket of a binding without one,
+    as the IaC emitter's interpolation token or an account id. ``environ`` holds the
+    operator's policy (:data:`CONTRACT_SQL_ALLOWLIST_ENV`, the broker and registry host
+    allowlist, the secrets policy). ``contract_sql_gate=False`` leaves the contract-SQL
+    allowlist to the caller (``fluid validate`` warns about it instead).
     """
     from fluid_build.spark.policy import refuse_unless_contract_sql_allowed
 
@@ -344,16 +415,15 @@ def compile_job_config(
         swhere = f"{where}: properties.stream"
         records = {k: v for k, v in stream_spec.items() if k not in _ENGINE_KEYS}
         stream = parse_stream(records, swhere)
-        if kafka_auth not in KAFKA_AUTH:
-            raise ValueError(f"kafka auth: expected one of {list(KAFKA_AUTH)}")
-        registry = _registry(stream_spec.get("registry"), stream, swhere)
+        kafka = _kafka(cfg, where)
+        registry = _registry(stream_spec.get("registry"), stream, swhere, environ)
+        _refuse_unless_hosts_allowed(kafka, registry, environ)
         offsets = stream_spec.get("startingOffsets", "earliest" if mode == "batch" else "latest")
         if offsets not in ("earliest", "latest"):
             raise ValueError(f"{swhere}.startingOffsets: expected earliest or latest")
         source = {
             "kind": "kafka",
-            "bootstrapServers": _brokers(bootstrap_servers),
-            "auth": kafka_auth,
+            **kafka,
             "topic": stream.topic,
             "startingOffsets": offsets,
             "includeHeaders": any(src == "headers" for _, src in stream.metadata),
@@ -396,8 +466,17 @@ def compile_job_config(
                 for c in (mapping or {}).get("columns") or []
                 if isinstance(c, Mapping) and c.get("maskAtIngest")
             )
+    mask_key = cfg.get("maskKeySecretArn")
+    if masked and mask_key is None:
+        raise ValueError(
+            f"{where}: maskAtIngest hashes with the product's key; set "
+            "parameters.spark.maskKeySecretArn to the Secrets Manager secret that holds it"
+        )
+    if mask_key is not None and not (isinstance(mask_key, str) and _SECRET_ARN.fullmatch(mask_key)):
+        raise ValueError(f"{where}: parameters.spark.maskKeySecretArn: expected a secret ARN")
     if sql is not None:
-        refuse_unless_contract_sql_allowed(product, build, environ)
+        if contract_sql_gate:
+            refuse_unless_contract_sql_allowed(product, build, environ)
         select = bind_by_name(_contract_sql(sql, bid), fields)
 
     config = {
@@ -418,5 +497,44 @@ def compile_job_config(
             "write": "append" if mode == "streaming" else "overwrite",
         },
         "maskedColumns": masked,
+        # The secret's ARN, never its value: the runner reads the key with the job's role.
+        "maskKey": {"secretArn": mask_key} if masked else None,
     }
     return SparkJob(bid, config)
+
+
+def validation_errors(contract: Mapping[str, Any]) -> list[str]:
+    """What ``fluid validate`` reports for the contract's Spark builds, on 0.7.7 or later.
+
+    The contract-SQL allowlist is a warning here (:func:`validation_warnings`), as on
+    the managed Flink lane; the host and secrets policies are errors.
+    """
+    from fluid_build._errors import FluidUserError
+    from fluid_build.streaming.compiler import managed_lane_enabled
+
+    if not managed_lane_enabled(contract):
+        return []
+    errors = []
+    for build in spark_builds(contract):
+        try:
+            # A stand-in account: a bucketless binding validates; apply passes the real one.
+            compile_job_config(contract, build, account_ref="000000000000", contract_sql_gate=False)
+        except FluidUserError as exc:
+            errors.append(f"Spark build {build.get('id')}: {exc.what}. {exc.why}")
+        except (ValueError, KeyError, TypeError) as exc:
+            errors.append(f"Spark: {exc}")
+    return errors
+
+
+def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
+    from fluid_build.streaming.compiler import managed_lane_enabled
+
+    if not managed_lane_enabled(contract):
+        return []
+    return [
+        f"Build {build.get('id')}: properties.sql is run only if the operator lists "
+        f"{contract.get('id')} in {CONTRACT_SQL_ALLOWLIST_ENV}; properties.mapping is "
+        "checked against the output before deploy and reads nothing but the stream"
+        for build in spark_builds(contract)
+        if (build.get("properties") or {}).get("sql") is not None
+    ]

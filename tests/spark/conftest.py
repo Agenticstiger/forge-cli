@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
 from fluid_build.spark.compiler import CONTRACT_SQL_ALLOWLIST_ENV
+from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV
 
 RUNNER_PATH = Path(__file__).resolve().parents[2] / "fluid_build/spark/runner/forge_spark_runner.py"
 
@@ -41,6 +43,9 @@ OUTPUT = [
     col("event_time", "timestamp_ltz(3)"),
 ]
 
+BROKERS = "b-1.msk.example:9098,b-2.msk.example:9098"
+MASK_KEY_ARN = "arn:aws:secretsmanager:eu-west-1:000000000005:secret:commerce/mask-key-AbCdEf"
+
 CONTRACT = {
     "fluidVersion": "0.7.7",
     "kind": "DataProduct",
@@ -72,7 +77,14 @@ CONTRACT = {
                         {"name": "qty", "from": "item.qty"},
                     ],
                 },
-                "parameters": {"spark": {"runtime": "emr-serverless", "mode": "streaming"}},
+                "parameters": {
+                    "spark": {
+                        "runtime": "emr-serverless",
+                        "mode": "streaming",
+                        "source": {"bootstrapServers": BROKERS, "auth": "msk-iam"},
+                        "maskKeySecretArn": MASK_KEY_ARN,
+                    }
+                },
             },
         }
     ],
@@ -96,8 +108,6 @@ CONTRACT = {
     ],
 }
 
-BROKERS = "b-1.msk.example:9098,b-2.msk.example:9098"
-
 
 @pytest.fixture
 def contract():
@@ -110,9 +120,12 @@ def build(contract):
 
 
 @pytest.fixture(autouse=True)
-def no_operator_allowlist(monkeypatch):
-    """No test inherits an operator's list from the machine it runs on."""
+def operator_policy(monkeypatch):
+    """The operator lists the example's broker and registry domains, and nothing else:
+    no test inherits an operator's list from the machine it runs on."""
     monkeypatch.delenv(CONTRACT_SQL_ALLOWLIST_ENV, raising=False)
+    monkeypatch.delenv(SECRET_REF_ALLOWLIST_ENV, raising=False)
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "msk.example,example.internal")
 
 
 @pytest.fixture(scope="session")

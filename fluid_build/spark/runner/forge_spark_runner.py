@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -138,6 +140,8 @@ def kafka_options(source: dict, mode: str) -> dict:
         "startingOffsets": source["startingOffsets"],
         "includeHeaders": "true" if source.get("includeHeaders") else "false",
     }
+    if source.get("groupIdPrefix"):
+        options["groupIdPrefix"] = source["groupIdPrefix"]
     if mode == "batch":
         options["endingOffsets"] = "latest"
     if source["auth"] == "msk-iam":
@@ -145,6 +149,50 @@ def kafka_options(source: dict, mode: str) -> dict:
     elif source["auth"] != "none":
         raise JobConfigError(f"unknown Kafka auth {source['auth']!r}")
     return options
+
+
+def mask_digest(key: bytes, value) -> str | None:
+    """``fluid_mask``: HMAC-SHA256 of the value's bytes under the product's key, lowercase hex."""
+    if value is None:
+        return None
+    return hmac.new(key, bytes(value), hashlib.sha256).hexdigest()
+
+
+def load_mask_key(secret_arn: str) -> bytes:
+    """The product's masking key, from AWS Secrets Manager with the job's role.
+
+    Held in memory only: never logged, printed, put in Spark conf or in an error.
+    """
+    import boto3  # every AWS Spark runtime has it; imported only when used
+
+    secret = boto3.client("secretsmanager").get_secret_value(SecretId=secret_arn)
+    key = secret.get("SecretBinary") or str(secret.get("SecretString") or "").encode("utf-8")
+    if not key:
+        raise JobConfigError("the maskAtIngest key secret is empty")
+    return bytes(key)
+
+
+def register_mask(spark, key: bytes) -> None:
+    """Register ``fluid_mask`` (binary -> string) for the generated SQL.
+
+    The key travels to the executors inside the function, as Spark ships any UDF; it is
+    in no conf, plan text or log. A pandas UDF when pyarrow is there (EMR and Glue have
+    it), a row UDF otherwise.
+    """
+    try:
+        import pandas as pd  # noqa: F401  (pandas_udf needs it)
+        import pyarrow  # noqa: F401
+        from pyspark.sql.functions import pandas_udf
+
+        def digests(values):
+            return values.map(lambda v: mask_digest(key, v))
+
+        function = pandas_udf(digests, "string")
+    except ImportError:
+        from pyspark.sql.functions import udf
+
+        function = udf(lambda v: mask_digest(key, v), "string")
+    spark.udf.register("fluid_mask", function)
 
 
 def configure_session(spark, config: dict) -> None:
@@ -293,6 +341,11 @@ def run(spark, config: dict) -> None:
         table=table,
         masked_columns=config.get("maskedColumns") or [],
     )
+    if config.get("maskedColumns"):
+        mask = config.get("maskKey") or {}
+        if not mask.get("secretArn"):
+            raise JobConfigError("maskAtIngest columns need maskKey.secretArn")
+        register_mask(spark, load_mask_key(mask["secretArn"]))
     output = build_output(spark, config)
     if config["mode"] == "batch":
         writer = output.writeTo(table).option("check-nullability", "false")

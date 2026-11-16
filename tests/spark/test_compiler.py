@@ -9,21 +9,30 @@ import pytest
 import sqlglot
 from sqlglot.errors import ErrorLevel
 
+from fluid_build._errors import FluidUserError
 from fluid_build.providers.aws.util.warehouse import get_iceberg_warehouse
+from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
 from fluid_build.spark.compiler import (
     CONFIG_VERSION,
     CONTRACT_SQL_ALLOWLIST_ENV,
+    MSK_BROKERS_PLACEHOLDER,
     compile_job_config,
     spark_builds,
+    validation_errors,
+    validation_warnings,
 )
 from fluid_build.spark.policy import SparkPolicyError
+from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV
 
-from .conftest import BROKERS
+from .conftest import BROKERS, MASK_KEY_ARN
 
 
 def job(contract, build=None, **kw):
-    kw.setdefault("bootstrap_servers", BROKERS)
     return compile_job_config(contract, build or contract["builds"][0], **kw)
+
+
+def source_of(contract):
+    return contract["builds"][0]["properties"]["parameters"]["spark"]["source"]
 
 
 def test_the_same_contract_gives_the_same_bytes(contract):
@@ -52,9 +61,10 @@ def test_the_config_says_what_the_job_does(contract):
     assert config["trigger"] == {"processingTime": "60000 milliseconds"}
     assert config["watermark"] == {"column": "event_time", "delay": "600000 milliseconds"}
     assert config["maskedColumns"] == ["email_hash"]
-    assert "sha2(CAST(`src`.`customer`.`email` AS STRING), 256) AS `email_hash`" in (
+    assert "fluid_mask(CAST(`src`.`customer`.`email` AS BINARY)) AS `email_hash`" in (
         config["sql"]["select"]
     )
+    assert config["maskKey"] == {"secretArn": MASK_KEY_ARN}
 
 
 def test_both_queries_are_spark_sql(contract):
@@ -107,9 +117,35 @@ def test_the_config_holds_no_credential(contract):
             "auth": {"secretRef": "aws-sm://commerce/registry#user_info"},
         },
     )
-    text = job(contract).text
-    assert "aws-sm://commerce/registry#user_info" in text
+    ref = "aws-sm://commerce/registry#user_info"
+    with pytest.raises(FluidUserError):
+        job(contract)  # the operator has not let this secret go to that host
+    environ = {
+        SECRET_REF_ALLOWLIST_ENV: f"{ref}@registry.example.internal",
+        HOST_ALLOWLIST_ENV: "msk.example,example.internal",
+    }
+    text = job(contract, environ=environ).text
+    assert ref in text
     assert "password" not in text.lower()
+
+
+@pytest.mark.parametrize(
+    ("url", "ref", "message"),
+    [
+        ("http://registry.example.internal", "env://REGISTRY_USER_INFO", "https only"),
+        ("https://localhost:8081", "env://REGISTRY_USER_INFO", "named registry host"),
+        ("https://collector.attacker.example", "aws-sm://other-product/db#password", ""),
+    ],
+)
+def test_a_registry_credential_goes_only_where_the_operator_lets_it(contract, url, ref, message):
+    """The contract names both the secret and the host: without the secrets policy the
+    job's role would read any secret it can and send it to any host."""
+    contract["builds"][0]["properties"]["stream"].update(
+        format="avro-confluent",
+        registry={"kind": "confluent", "url": url, "auth": {"secretRef": ref}},
+    )
+    with pytest.raises((ValueError, FluidUserError), match=message):
+        job(contract)
 
 
 def test_avro_reads_the_registry_subject_and_declares_the_schema_to_check(contract):
@@ -117,11 +153,15 @@ def test_avro_reads_the_registry_subject_and_declares_the_schema_to_check(contra
     stream.update(
         format="avro-confluent",
         key={"format": "avro-confluent", "schema": [{"name": "order_id", "type": "string"}]},
-        registry={"kind": "confluent", "url": "http://registry:8081", "version": 3},
+        registry={
+            "kind": "confluent",
+            "url": "http://registry.example.internal:8081",
+            "version": 3,
+        },
     )
     stream["key"]["prefix"] = "k_"
     source = job(contract).config["source"]
-    assert source["registry"] == {"url": "http://registry:8081", "auth": None}
+    assert source["registry"] == {"url": "http://registry.example.internal:8081", "auth": None}
     assert source["value"] == {
         "format": "avro-confluent",
         "subject": "commerce.orders-value",
@@ -196,23 +236,65 @@ def test_an_absent_trigger_follows_the_freshness_slo(contract):
 
 
 @pytest.mark.parametrize(
-    "brokers",
-    [None, "", "b-1:9098,", "b-1", "b-1:9098;rm -rf /", "${a} ${b}", "a:1 b:2"],
+    ("source", "message"),
+    [
+        (None, "names its Kafka cluster"),
+        ({}, "bootstrapServers or mskClusterArn"),
+        (
+            {"bootstrapServers": BROKERS, "mskClusterArn": "arn:aws:kafka:eu-west-1:1:x"},
+            "bootstrapServers or mskClusterArn",
+        ),
+        ({"bootstrapServers": "b-1"}, "host:port"),
+        ({"bootstrapServers": "b-1:9098;rm -rf /"}, "host:port"),
+        ({"bootstrapServers": "${a}"}, "host:port"),
+        ({"mskClusterArn": "arn:aws:s3:::bucket"}, "MSK cluster ARN"),
+        ({"bootstrapServers": BROKERS, "auth": "scram"}, "auth"),
+        ({"bootstrapServers": BROKERS, "groupIdPrefix": "a b"}, "groupIdPrefix"),
+        ({"bootstrapServers": BROKERS, "jaas": "x"}, "unsupported field"),
+    ],
 )
-def test_bootstrap_servers_are_a_broker_list(contract, brokers):
-    with pytest.raises(ValueError, match="bootstrap servers"):
-        job(contract, bootstrap_servers=brokers)
+def test_the_kafka_cluster_comes_from_parameters_spark_source(contract, source, message):
+    contract["builds"][0]["properties"]["parameters"]["spark"]["source"] = source
+    with pytest.raises(ValueError, match=message):
+        job(contract)
 
 
-def test_bootstrap_servers_may_be_one_interpolation_the_uploader_resolves(contract):
-    token = "${aws_msk_cluster.orders.bootstrap_brokers_sasl_iam}"
-    assert job(contract, bootstrap_servers=token).config["source"]["bootstrapServers"] == token
+def test_an_msk_cluster_arn_leaves_one_placeholder_for_the_uploader(contract):
+    arn = "arn:aws:kafka:eu-west-1:000000000005:cluster/orders/abc-1"
+    contract["builds"][0]["properties"]["parameters"]["spark"]["source"] = {"mskClusterArn": arn}
+    source = job(contract).config["source"]
+    assert source["bootstrapServers"] == MSK_BROKERS_PLACEHOLDER == "${fluid_msk_bootstrap_brokers}"
+    assert (source["mskClusterArn"], source["auth"]) == (arn, "msk-iam")
 
 
-def test_kafka_auth_is_msk_iam_or_none(contract):
-    assert job(contract, kafka_auth="none").config["source"]["auth"] == "none"
-    with pytest.raises(ValueError, match="kafka auth"):
-        job(contract, kafka_auth="sasl-plain")
+def test_kafka_auth_defaults_to_none_for_brokers_and_takes_group_id_prefix(contract):
+    source_of(contract).pop("auth")
+    source_of(contract)["groupIdPrefix"] = "forge-orders"
+    source = job(contract).config["source"]
+    assert (source["auth"], source["groupIdPrefix"]) == ("none", "forge-orders")
+
+
+def test_a_broker_the_operator_has_not_listed_is_refused(contract, monkeypatch):
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "example.internal")
+    with pytest.raises(FluidUserError, match="Kafka bootstrap server"):
+        job(contract)
+
+
+def test_masking_needs_the_products_key(contract):
+    contract["builds"][0]["properties"]["parameters"]["spark"].pop("maskKeySecretArn")
+    with pytest.raises(ValueError, match="maskKeySecretArn"):
+        job(contract)
+    contract["builds"][0]["properties"]["parameters"]["spark"]["maskKeySecretArn"] = "key"
+    with pytest.raises(ValueError, match="expected a secret ARN"):
+        job(contract)
+
+
+def test_an_unmasked_build_carries_no_key(contract):
+    columns = contract["builds"][0]["properties"]["mapping"]["columns"]
+    columns[1].pop("maskAtIngest")
+    contract["exposes"][0]["contract"]["schema"][2]["name"] = "email_hash"
+    config = job(contract).config
+    assert (config["maskedColumns"], config["maskKey"]) == ([], None)
 
 
 def test_a_batch_job_reads_the_topic_once(contract):
@@ -292,3 +374,26 @@ def test_spark_builds_are_the_engine_spark_builds_with_parameters(contract):
     assert spark_builds(contract) == [contract["builds"][0]]
     contract["builds"][0]["engine"] = "dbt"
     assert spark_builds(contract) == []
+
+
+def test_validate_reports_the_operators_policy_and_warns_about_contract_sql(contract, monkeypatch):
+    assert validation_errors(contract) == []
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "example.internal")
+    (error,) = validation_errors(contract)
+    assert error.startswith("Spark build ingest-orders:") and "Kafka bootstrap server" in error
+    _sql_build(contract)
+    assert validation_errors(contract) == []  # the allowlist is apply's, here a warning
+    (warning,) = validation_warnings(contract)
+    assert CONTRACT_SQL_ALLOWLIST_ENV in warning
+
+
+def test_validate_reports_masking_without_a_key(contract):
+    contract["builds"][0]["properties"]["parameters"]["spark"].pop("maskKeySecretArn")
+    (error,) = validation_errors(contract)
+    assert "maskKeySecretArn" in error
+
+
+def test_the_flink_lane_no_longer_claims_a_spark_builds_mapping(contract):
+    from fluid_build.streaming.compiler import validation_warnings as flink_warnings
+
+    assert not any("managed Flink lane" in w for w in flink_warnings(contract))
