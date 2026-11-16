@@ -28,6 +28,8 @@ def operator_policy(monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")  # pragma: allowlist secret
     monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-west-1")
+    monkeypatch.setenv("AWS_ACCOUNT_ID", ACCOUNT)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
     monkeypatch.delenv("AWS_ENDPOINT_URL", raising=False)
 
 

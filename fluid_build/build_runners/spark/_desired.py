@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -69,7 +70,17 @@ _CONF_TUNING = frozenset(
 _CONF_TUNING_PREFIXES = ("spark.dynamicAllocation.", "spark.sql.adaptive.")
 #: Never from a contract unless the operator lists the exact key or a prefix of it: they
 #: load code, pick classes, or set the job's environment.
-_CONF_DENIED = frozenset({"spark.archives", "spark.files", "spark.plugins"})
+_CONF_DENIED = frozenset(
+    {
+        "spark.archives",
+        "spark.files",
+        "spark.plugins",
+        # Under the adaptive prefix, but it names a class Spark loads.
+        "spark.sql.adaptive.customCostEvaluatorClass",
+    }
+)
+#: The schema's sparkConf key names; checked here too, for a caller that skips the schema.
+_CONF_KEY = re.compile(r"[A-Za-z0-9_.-]{1,256}")
 _CONF_DENIED_PREFIXES = (
     "spark.jars",
     "spark.submit.",
@@ -258,7 +269,12 @@ def _allowed_conf(user: Mapping[str, Any], where: str, env: Mapping[str, str]) -
     refused = []
     for key, value in user.items():
         name, text = str(key), str(value)
-        if not _conf_allowed(name, extra) or not text or any(c.isspace() for c in text):
+        if (
+            not _CONF_KEY.fullmatch(name)
+            or not _conf_allowed(name, extra)
+            or not text
+            or any(c.isspace() for c in text)
+        ):
             refused.append(name)
         else:
             out[name] = text

@@ -202,6 +202,7 @@ def test_identity_args_and_tags_carry_the_hash_source_and_checkpoint(run):
         "spark.executorEnv.AWS_ROLE_ARN",
         "spark.emr-serverless.driverEnv.X",
         "spark.made.up",
+        "spark.sql.adaptive.customCostEvaluatorClass",
     ],
 )
 def test_spark_conf_that_could_load_code_is_refused_unless_the_operator_lists_it(
@@ -236,3 +237,15 @@ def test_an_operator_prefix_allows_a_family(contract, monkeypatch):
     spark = contract["builds"][0]["properties"]["parameters"]["spark"]
     spark["sparkConf"] = {"spark.sql.streaming.minBatchesToRetain": "50"}
     assert _desired.desired_runs(contract, account=ACCOUNT)[0].spark_conf
+
+
+def test_a_spark_conf_key_outside_the_schema_pattern_is_refused_even_when_listed(
+    contract, monkeypatch
+):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    key = "spark.executor.memory --conf spark.jars"
+    monkeypatch.setenv(_desired.CONF_ALLOWLIST_ENV, key)
+    contract["builds"][0]["properties"]["parameters"]["spark"]["sparkConf"] = {key: "x"}
+    with pytest.raises(SparkPolicyError):
+        _desired.desired_runs(contract, account=ACCOUNT)
