@@ -165,6 +165,8 @@ def _contract(
     }
     if definitions is not None:
         contract["governance"] = {"lakeFormation": {"tagDefinitions": copy.deepcopy(definitions)}}
+        # A contract defines tags only where it owns the account's vocabulary.
+        contract["packaging"] = {"containers": {"lfTagVocabulary": "isolated"}}
     return contract
 
 

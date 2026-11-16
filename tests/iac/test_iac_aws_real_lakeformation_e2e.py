@@ -145,6 +145,8 @@ def test_real_lf_tag_definitions_and_associations(aws_real_project, aws_account)
     domain_key = f"fluid_dom_{uid}"
 
     contract = aws_iceberg_contract(bucket, database=glue_db, table="events", cid="iac.aws.lf.tbac")
+    # This contract owns the tag vocabulary it defines (packaging, schema 0.7.7).
+    contract["packaging"] = {"containers": {"lfTagVocabulary": "isolated"}}
     contract["governance"] = {
         "lakeFormation": {
             "tagDefinitions": {
@@ -269,7 +271,7 @@ def test_real_lf_row_filter_holds_through_athena(aws_real_project, aws_account):
     """
     import boto3
 
-    account, region = aws_account["account_id"], aws_account["region"]
+    region = aws_account["region"]
     iam, lf, s3 = aws_real_boto("iam"), aws_real_boto("lakeformation"), aws_real_boto("s3")
     bucket = aws_real_project.name("lfsec-b")
     results = aws_real_project.name("lfsec-res")

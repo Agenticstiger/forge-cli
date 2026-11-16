@@ -657,7 +657,7 @@ class AwsIacPlugin:
         base_tags = {"managed_by": "fluid", "fluid_contract": cid}
         packaging = resolve_packaging(contract)
 
-        # Account-level Lake Formation settings: admins + LF-tag
+        # Account-level Lake Formation settings: admins (refused) + LF-tag
         # definitions. Emitted once per contract, before per-exposure
         # resources, so a resource_lf_tags association can tell the tags
         # this module creates (and references) from those it does not.
@@ -2202,7 +2202,9 @@ def _wire_aws_deps(resources: Dict[str, Any], cid: str) -> None:
 #
 #   * ``_emit_lf_account_settings`` — fires ONCE per contract before any
 #     per-exposure emit. Honours top-level ``governance.lakeFormation``:
-#     ``admins`` → ``aws_lakeformation_data_lake_settings``,
+#     ``admins`` is refused (:func:`refuse_lake_formation_admins`): the
+#         account's authoritative ``aws_lakeformation_data_lake_settings``
+#         belongs to the platform's bootstrap, never to a product's state,
 #     ``tagDefinitions`` → one ``aws_lakeformation_lf_tag`` per key.
 #     Must run before per-resource ``resource_lf_tags`` associations, which
 #     reference the tags it wrote (see :func:`lf_tag_definitions`).
@@ -2276,30 +2278,46 @@ def _references_caller_account(contract: Mapping[str, Any]) -> bool:
     return False
 
 
+def refuse_lake_formation_admins(contract: Mapping[str, Any]) -> None:
+    """Refuse ``governance.lakeFormation.admins`` in any contract (founder decision,
+    2026-11-16).
+
+    It would emit ``aws_lakeformation_data_lake_settings``, the account's one Lake
+    Formation settings object per region, and the resource is AUTHORITATIVE:
+    ``PutDataLakeSettings`` replaces the admin list with the one sent, the provider
+    clears every setting its configuration omits (the create-database and create-table
+    default permissions, trusted resource owners, parameters), and its destroy empties
+    the admins. A product's state is the wrong owner for that: destroying the product
+    would leave the account with no Lake Formation admin, after which no grant or
+    registration can be made. It belongs to the platform's bootstrap.
+    """
+    gov = (contract.get("governance") or {}).get("lakeFormation") or {}
+    admins = gov.get("admins") if isinstance(gov, Mapping) else None
+    if not admins:
+        return
+    raise UnsupportedBindingError(
+        "lakeformation-admins-not-in-a-product",
+        "governance.lakeFormation.admins would make this product's OpenTofu state own "
+        "aws_lakeformation_data_lake_settings, the account's Lake Formation admin list. "
+        "That resource is authoritative: apply replaces the list and clears the default "
+        "permissions it does not set, and destroying the product empties it, leaving the "
+        "account with no Lake Formation admin.",
+        (
+            "Remove governance.lakeFormation.admins from the contract.",
+            "Manage Lake Formation admins in the platform's bootstrap state (one "
+            "aws_lakeformation_data_lake_settings that lists every admin and keeps the "
+            "account's other settings), or add one admin without touching the rest: read "
+            "`aws lakeformation get-data-lake-settings`, append the principal to "
+            "DataLakeAdmins, and send the whole object back with "
+            "`aws lakeformation put-data-lake-settings`.",
+        ),
+    )
+
+
 def _emit_lf_account_settings(
     resources: Dict[str, Any], contract: Mapping[str, Any], cid: str, tags: Dict[str, str]
 ) -> None:
-    gov = (contract.get("governance") or {}).get("lakeFormation") or {}
-    admins = gov.get("admins") or []
-
-    if admins:
-        # ``aws_lakeformation_data_lake_settings`` is a singleton per
-        # account+region. Use a stable resource name so re-applying with
-        # the same contract is idempotent.
-        #
-        # AUTHORITATIVE, not additive: ``PutDataLakeSettings`` replaces the
-        # admin list with the one passed, and the provider clears every
-        # setting its configuration omits (create-database / create-table
-        # default permissions, trusted resource owners, parameters). Its
-        # destroy empties the admins. An admin missing from ``admins`` is
-        # removed on apply, the applying role included. The schema's
-        # ``governance.lakeFormation.admins`` description says so; the emit
-        # is unchanged.
-        resources.setdefault("aws_lakeformation_data_lake_settings", {})[
-            safe_ident(f"{cid}_lf_settings")
-        ] = {
-            "admins": list(admins),
-        }
+    refuse_lake_formation_admins(contract)
 
     tag_defs = lf_tag_definitions(contract)
     if tag_defs:
@@ -2318,6 +2336,19 @@ def _lf_tag_definitions(contract: Mapping[str, Any]) -> Mapping[Any, Any]:
     return tag_defs if isinstance(tag_defs, Mapping) else {}
 
 
+def _owns_lf_tag_vocabulary(contract: Mapping[str, Any]) -> bool:
+    """Whether the contract's top-level ``packaging.containers.lfTagVocabulary`` is
+    ``isolated``: the one statement that this state owns the account's LF-tag keys.
+
+    Explicit only. The blanket ``mode: isolated`` most products declare resolves the
+    kind OWNED too (``iac/packaging.py``), and reading it that way would hand every
+    such product the domain's vocabulary.
+    """
+    packaging = contract.get("packaging") if isinstance(contract, Mapping) else None
+    containers = packaging.get("containers") if isinstance(packaging, Mapping) else None
+    return isinstance(containers, Mapping) and containers.get("lfTagVocabulary") == "isolated"
+
+
 def lf_tag_definitions(contract: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
     """``{resource name: aws_lakeformation_lf_tag body}``: the tags this module creates.
 
@@ -2327,11 +2358,32 @@ def lf_tag_definitions(contract: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]
     one; the key used to be skipped, and an association to it then named a resource
     the module did not declare), and two keys that are one resource name (``a-b`` and
     ``a_b``; the later used to replace the earlier). Run here, where ``fluid validate``
-    and the emitter both read the definitions, so stage 2 refuses them too.
+    and the emitter both read the definitions, so stage 2 refuses them too. Refused
+    first: definitions in a contract that does not own the vocabulary
+    (:func:`_owns_lf_tag_vocabulary`).
     """
+    definitions = _lf_tag_definitions(contract)
+    if definitions and not _owns_lf_tag_vocabulary(contract):
+        raise UnsupportedBindingError(
+            "lakeformation-tag-vocabulary-not-owned",
+            "governance.lakeFormation.tagDefinitions would make this product's OpenTofu "
+            f"state own the account's Lake Formation tags {sorted(map(str, definitions))}. "
+            "A tag key is one object per account, shared by every product that associates "
+            "it, and destroying this product would delete it for all of them.",
+            (
+                "Define the tags in the domain's or the platform's state, and keep only the "
+                "associations here: binding.governance.lakeFormation.tags names a tag "
+                "defined outside the contract by its key.",
+                "Or, in the contract that owns the vocabulary for the domain, declare it at "
+                "the top level: packaging.containers.lfTagVocabulary: isolated (fluidVersion "
+                "0.7.7, preview). A packaging block makes the contract's other containers "
+                "follow its mode (isolated by default); a contract with a Kafka or Confluent "
+                "expose then also needs containers.cluster: shared and a pool.",
+            ),
+        )
     cid = aws_storage.contract_ident(contract)
     out: Dict[str, Dict[str, Any]] = {}
-    for tag_key, tag_values in _lf_tag_definitions(contract).items():
+    for tag_key, tag_values in definitions.items():
         if not tag_values:
             raise UnsupportedBindingError(
                 "lakeformation-tag-definition",

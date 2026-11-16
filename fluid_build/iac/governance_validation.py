@@ -42,14 +42,16 @@ def _lf_grants(binding: Mapping[str, Any]) -> List[Any]:
 
 
 def _lf_tag_definition_errors(contract: Mapping[str, Any]) -> List[str]:
-    """The refusal of the contract's LF-tag definitions, which the AWS emitter creates
-    once for the whole contract; none for a contract with no expose bound to AWS."""
-    from .providers.aws import lf_tag_definitions
+    """The refusal of the contract's account-level Lake Formation block (``admins``,
+    then the LF-tag definitions), which the AWS emitter handles once for the whole
+    contract; none for a contract with no expose bound to AWS."""
+    from .providers.aws import lf_tag_definitions, refuse_lake_formation_admins
 
     for exposure in contract.get("exposes") or []:
         binding = exposure.get("binding") if isinstance(exposure, Mapping) else None
         if isinstance(binding, Mapping) and is_cloud(binding, "aws"):
             try:
+                refuse_lake_formation_admins(contract)
                 lf_tag_definitions(contract)
             except UnsupportedBindingError as exc:
                 return [_message(exc)]

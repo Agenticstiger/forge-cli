@@ -400,6 +400,7 @@ def test_a_mixed_module_passes_tofu_validate(tmp_path):
     )
     # The LF-tag the parquet table is associated with must be defined.
     contract["governance"] = {"lakeFormation": {"tagDefinitions": {"tier": ["gold"]}}}
+    contract["packaging"] = {"containers": {"lfTagVocabulary": "isolated"}}
     (tmp_path / "main.tf.json").write_text(build_module(_aws(), contract))
     _tofu_init_or_skip(tmp_path)
     done = subprocess.run(

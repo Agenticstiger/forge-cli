@@ -9,7 +9,8 @@ new list being passed" (API reference), the terraform-provider-aws resource
 clears every setting its configuration omits, and its destroy empties the
 admins. The bundled schemas used to say the opposite: that principals not
 listed are not removed. These tests pin the corrected description in every
-schema that carries the field, and that the emit itself did not change.
+schema that carries the field, and that the emitter refuses the field outright
+(founder decision, 2026-11-16): the platform's bootstrap owns the settings.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import fluid_build
+from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.providers.aws import AwsIacPlugin
 
 pytestmark = [pytest.mark.unit, pytest.mark.provider]
@@ -57,13 +59,43 @@ def test_no_schema_claims_unlisted_admins_survive(name, description):
     assert "Destroying the resource empties the admin list" in description
 
 
-def test_the_admins_emit_is_unchanged():
-    contract = {
+def _with_admins(exposes=None):
+    return {
         "id": "lf.admins",
         "governance": {"lakeFormation": {"admins": [ADMIN]}},
-        "exposes": [],
+        "exposes": exposes or [],
     }
-    resources = AwsIacPlugin().emit(contract)
-    assert resources["aws_lakeformation_data_lake_settings"] == {
-        "lf_admins_lf_settings": {"admins": [ADMIN]}
+
+
+def test_admins_are_refused_in_any_contract():
+    """Founder decision, 2026-11-16: the account's authoritative Lake Formation
+    settings belong to the platform's bootstrap. A product that owned them would
+    empty the account's admin list on destroy."""
+    with pytest.raises(UnsupportedBindingError) as excinfo:
+        AwsIacPlugin().emit(_with_admins())
+    err = excinfo.value
+    assert err.kind == "lakeformation-admins-not-in-a-product"
+    assert "empties it" in str(err)
+    assert any("put-data-lake-settings" in step for step in err.remediation)
+
+
+def test_validate_refuses_admins_as_emit_does():
+    from fluid_build.iac.governance_validation import validate_governance
+
+    expose = {
+        "exposeId": "orders",
+        "binding": {
+            "platform": "aws",
+            "format": "parquet",
+            "location": {"database": "sales", "table": "orders", "bucket": "b", "path": "o/"},
+        },
+        "contract": {"schema": [{"name": "id", "type": "string"}]},
     }
+    errors, _warnings = validate_governance(_with_admins([expose]))
+    assert any("governance.lakeFormation.admins" in e for e in errors), errors
+
+
+def test_an_empty_admin_list_is_not_refused():
+    contract = _with_admins()
+    contract["governance"]["lakeFormation"]["admins"] = []
+    assert "aws_lakeformation_data_lake_settings" not in AwsIacPlugin().emit(contract)
