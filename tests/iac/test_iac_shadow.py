@@ -97,8 +97,9 @@ class TestShadowCompare:
         assert not report.native_only
 
     def test_native_only_gap_blocks_cutover(self):
-        # native plans a Redshift schema the AWS emitter has no resource for.
-        actions = _AWS_NATIVE_MATCH + [{"op": "redshift.ensure_schema", "schema": "reporting"}]
+        # native plans a schema the AWS emitter has no resource for. Not
+        # redshift.ensure_schema: the emitter refuses that op outright (usteZAAb).
+        actions = _AWS_NATIVE_MATCH + [{"op": "catalog.ensure_schema", "schema": "reporting"}]
         report = shadow_compare(
             _aws_contract(), plugin=get_iac_plugin("aws"), native_actions=actions
         )
