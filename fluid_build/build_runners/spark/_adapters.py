@@ -192,6 +192,21 @@ _SERVERLESS = {
 }
 
 
+def _application_id(summary: Mapping[str, Any]) -> str:
+    """An application summary's id; LocalStack's has only its ARN (``.../applications/<id>``)."""
+    return str(summary.get("id") or str(summary.get("arn") or "").rsplit("/", 1)[-1])
+
+
+def _summary_id(summary: Mapping[str, Any]) -> str:
+    """A job run summary's id; LocalStack's summary has only its ARN (``.../jobruns/<id>``)."""
+    if summary.get("id"):
+        return str(summary["id"])
+    arn = str(summary.get("arn") or "")
+    if "/jobruns/" not in arn:
+        raise SparkRunError(f"an EMR Serverless job run summary names no run: {sorted(summary)}")
+    return arn.rsplit("/", 1)[-1]
+
+
 class EmrServerless(Adapter):
     runtime, service = "emr-serverless", "emr-serverless"
     #: How far back the reconcile looks for this build's last run.
@@ -208,7 +223,7 @@ class EmrServerless(Adapter):
         found = []
         for page in self.client.get_paginator("list_applications").paginate():
             found += [
-                a["id"]
+                _application_id(a)
                 for a in page.get("applications") or []
                 if a.get("name") == name and a.get("state") not in ("TERMINATING", "TERMINATED")
             ]
@@ -255,7 +270,7 @@ class EmrServerless(Adapter):
             if number + 1 >= self.LOOKBACK_PAGES:
                 break
         summaries.sort(key=lambda j: _ts(j.get("createdAt")), reverse=True)
-        return [self.get(str(j["id"])) for j in summaries[:10]]
+        return [self.get(_summary_id(j)) for j in summaries[:10]]
 
     def get(self, run_id: str) -> RunInfo:
         job = self.client.get_job_run(applicationId=self.application_id(), jobRunId=run_id)

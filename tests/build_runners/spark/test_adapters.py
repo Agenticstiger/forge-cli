@@ -452,3 +452,18 @@ def test_where_names_the_target(serverless, glue_run, ec2_run, eks_run):
     assert "fluid-job" in adapter_on(glue_run, "glue")[0].where()
     assert "vc1" in adapter_on(eks_run, "emr-containers")[0].where()
     assert "app1" in adapter_on(serverless, "emr-serverless")[0].where()
+
+
+def test_a_serverless_summary_without_an_id_is_read_by_its_arn():
+    # LocalStack Pro 2026.8.2 lists job runs with an ARN and no id (seen live).
+    arn = "arn:aws:emr-serverless:ca-central-1:000000000008:/applications/b2f154e9/jobruns/ff81f100"
+    assert ad._summary_id({"arn": arn}) == "ff81f100"
+    assert ad._summary_id({"id": "abc", "arn": arn}) == "abc"
+    with pytest.raises(ad.SparkRunError):
+        ad._summary_id({"name": "x"})
+
+
+def test_a_serverless_application_summary_without_an_id_is_read_by_its_arn():
+    arn = "arn:aws:emr-serverless:ca-central-1:000000000008:/applications/b2f154e9"
+    assert ad._application_id({"arn": arn}) == "b2f154e9"
+    assert ad._application_id({"id": "abc", "arn": arn}) == "abc"
