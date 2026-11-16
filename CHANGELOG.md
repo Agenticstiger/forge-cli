@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Schema 0.7.7 (preview): rules about valid data** (RFC-data-rules.md, implementation step 1).
+  `exposes[].contract.invariants[]` declares checks, derived columns (`derive` with `expr`, or
+  with an `aggregate` over child rows), and functional dependencies. Each carries an optional
+  `when` and a band of violating rows: one ODCS `mustBe*` operator, with `unit: rows` or
+  `percent`. Columns gain `identifierFormat` (COBOL PICTURE masks: `9` a digit, `A` an
+  upper-case letter, `X` either, a backslash escapes; prefixes are a separate list),
+  `placeholders` and `sharedAttribute`. Relationships gain `sharedColumns`. Every field is
+  optional, and a 0.7.6 contract that uses one is told to declare 0.7.7.
+  - Texts are FLUID SQL/1 (`fluid_build/fluid_sql`): a closed SQL expression subset with exact
+    numbers and two-valued truth. `ROUND(x, s)` rounds ties away from zero and
+    `ROUND(x, s, 'HALF_TO_EVEN')` rounds to even. `DAYS_BETWEEN`, `MONTHS_BETWEEN` and
+    `YEARS_BETWEEN` count whole units. The validator parses with its own recursive-descent
+    parser, not sqlglot: sqlglot's tree merges `x NOT IN (...)` with `NOT x IN (...)`, which
+    differ on NULL, and `DATE '...'` with `CAST(... AS DATE)`.
+  - `fluid_sql/fluid-sql-vectors.json` is the conformance suite that flux-expr/2 also runs: 243
+    vectors, each a text with its verdict, tree, canonical text, type, scale and values. It ships
+    in the wheel. In the tests, DuckDB runs every accepted vector's rendering and must agree.
+  - `fluid validate` runs the RFC's v1 lint. Its errors: unknown names, type and scale errors
+    ("wrap it in ROUND(x, 2)"), cycles, a column with two sources, overlapping masks, and an
+    owner of a shared attribute that is missing or ambiguous. Its notes, which `--strict` never
+    counts: same-named columns across a link, division or float arithmetic, and a
+    `contract.quality[]` expression that could become an invariant. Every finding has a JSON
+    pointer and the catalog code `ERR_CONTRACT_DATA_RULES`.
+  - What consumers do in v1: the ODCS exporter carries the declarations through `fluidExtras`,
+    so FLUID to ODCS to FLUID loses none. The dbt bridge's output is unchanged. MCP `describe`
+    returns them, and the contract digest covers them. The ODCS quality rules and the dbt
+    `fluid_rule` test are the RFC's steps 2 and 3.
+
 - **Schema 0.7.7 (preview): semantic relationships and SCD validity windows**
   (RFC-semantics-tier1 §4 and §5). `exposes[].semantics.relationships[]`
   (`$defs.semanticRelationship`) names a foreign key from the declaring expose, the many side,
