@@ -366,7 +366,12 @@ def status(
             row["where"] = adapter.where()
             history = adapter.runs()[:limit]
             row["runs"] = [
-                {**h.as_dict(), "current": h.config_hash == run.config_hash} for h in history
+                {
+                    **h.as_dict(),
+                    "details": _clean(h.details),
+                    "current": h.config_hash == run.config_hash,
+                }
+                for h in history
             ]
         except Exception as exc:  # noqa: BLE001 - one build's error is its row
             row["error"] = _error_outcome(run, exc).message

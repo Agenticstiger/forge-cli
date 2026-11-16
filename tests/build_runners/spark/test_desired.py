@@ -159,7 +159,8 @@ def test_a_json_stream_adds_no_avro_package(run):
     assert "spark.jars.repositories" not in run.spark_conf
 
 
-def test_user_spark_conf_overrides_the_defaults(contract):
+def test_an_operator_listed_spark_conf_overrides_the_defaults(contract, monkeypatch):
+    monkeypatch.setenv(_desired.CONF_ALLOWLIST_ENV, "spark.jars")
     spark_cfg(contract)["sparkConf"] = {"spark.jars": "/mine.jar", "spark.executor.memory": 4}
     conf = runs_of(contract)[0].spark_conf
     assert conf["spark.jars"] == "/mine.jar"
@@ -183,3 +184,55 @@ def test_identity_args_and_tags_carry_the_hash_source_and_checkpoint(run):
     tags = run.tags()
     assert tags["fluid_config_hash"] == run.config_hash
     assert set(tags) >= {"fluid_product", "fluid_build", "fluid_source"}
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "spark.jars",
+        "spark.jars.packages",
+        "spark.jars.repositories",
+        "spark.sql.extensions",
+        "spark.driver.extraJavaOptions",
+        "spark.executor.extraClassPath",
+        "spark.plugins",
+        "spark.submit.pyFiles",
+        "spark.sql.catalog.fluid.catalog-impl",
+        "spark.hadoop.fs.s3a.endpoint",
+        "spark.executorEnv.AWS_ROLE_ARN",
+        "spark.emr-serverless.driverEnv.X",
+        "spark.made.up",
+    ],
+)
+def test_spark_conf_that_could_load_code_is_refused_unless_the_operator_lists_it(
+    contract, monkeypatch, key
+):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    contract["builds"][0]["properties"]["parameters"]["spark"]["sparkConf"] = {key: "x"}
+    with pytest.raises(SparkPolicyError) as err:
+        _desired.desired_runs(contract, account=ACCOUNT)
+    assert key in err.value.what and _desired.CONF_ALLOWLIST_ENV in err.value.fix
+    monkeypatch.setenv(_desired.CONF_ALLOWLIST_ENV, key)
+    assert _desired.desired_runs(contract, account=ACCOUNT)[0].spark_conf[key] == "x"
+
+
+def test_spark_conf_tuning_is_allowed_and_a_value_with_whitespace_is_not(contract):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    spark = contract["builds"][0]["properties"]["parameters"]["spark"]
+    spark["sparkConf"] = {"spark.executor.memory": "4g", "spark.dynamicAllocation.enabled": "true"}
+    conf = _desired.desired_runs(contract, account=ACCOUNT)[0].spark_conf
+    assert (
+        conf["spark.executor.memory"] == "4g" and conf["spark.dynamicAllocation.enabled"] == "true"
+    )
+    spark["sparkConf"] = {"spark.executor.memory": "4g --jars s3://x/y.jar"}
+    with pytest.raises(SparkPolicyError):
+        _desired.desired_runs(contract, account=ACCOUNT)
+
+
+def test_an_operator_prefix_allows_a_family(contract, monkeypatch):
+    monkeypatch.setenv(_desired.CONF_ALLOWLIST_ENV, "spark.sql.streaming.*")
+    spark = contract["builds"][0]["properties"]["parameters"]["spark"]
+    spark["sparkConf"] = {"spark.sql.streaming.minBatchesToRetain": "50"}
+    assert _desired.desired_runs(contract, account=ACCOUNT)[0].spark_conf

@@ -20,7 +20,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from fluid_build.build_runners.spark import _names
 
@@ -38,6 +38,53 @@ _KAFKA_PACKAGE = "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
 _MSK_IAM_PACKAGE = "software.amazon.msk:aws-msk-iam-auth:2.2.0"
 _AVRO_PACKAGES = ("org.apache.spark:spark-avro_2.12:3.5.1", "za.co.absa:abris_2.12:6.4.0")
 _CONFLUENT_REPOSITORY = "https://packages.confluent.io/maven/"
+
+#: Operator-only: Spark settings a contract's ``sparkConf`` may set beyond the tuning ones,
+#: comma-separated names or ``prefix*`` (``spark.sql.streaming.*``). Unset: tuning only.
+CONF_ALLOWLIST_ENV = "FLUID_SPARK_CONF_ALLOWLIST"
+#: Resource and tuning settings, which load nothing and set no environment.
+_CONF_TUNING = frozenset(
+    {
+        "spark.executor.memory",
+        "spark.executor.cores",
+        "spark.executor.instances",
+        "spark.executor.memoryOverhead",
+        "spark.executor.memoryOverheadFactor",
+        "spark.driver.memory",
+        "spark.driver.cores",
+        "spark.driver.memoryOverhead",
+        "spark.driver.maxResultSize",
+        "spark.default.parallelism",
+        "spark.sql.shuffle.partitions",
+        "spark.sql.files.maxPartitionBytes",
+        "spark.sql.autoBroadcastJoinThreshold",
+        "spark.network.timeout",
+        "spark.task.maxFailures",
+        "spark.speculation",
+        "spark.emr-serverless.driver.disk",
+        "spark.emr-serverless.executor.disk",
+        "spark.emr-serverless.memoryOverheadFactor",
+    }
+)
+_CONF_TUNING_PREFIXES = ("spark.dynamicAllocation.", "spark.sql.adaptive.")
+#: Never from a contract unless the operator lists the exact key or a prefix of it: they
+#: load code, pick classes, or set the job's environment.
+_CONF_DENIED = frozenset({"spark.archives", "spark.files", "spark.plugins"})
+_CONF_DENIED_PREFIXES = (
+    "spark.jars",
+    "spark.submit.",
+    "spark.sql.extensions",
+    "spark.sql.catalog",
+    "spark.sql.queryExecutionListeners",
+    "spark.extraListeners",
+    "spark.hadoop.",
+    "spark.executorEnv.",
+    "spark.yarn.",
+    "spark.kubernetes.",
+    "spark.emr-serverless.driverEnv.",
+    "spark.driver.extra",
+    "spark.executor.extra",
+)
 
 
 def _sha(value: Any) -> str:
@@ -148,10 +195,16 @@ def _retry_attempts(build: Mapping[str, Any]) -> Optional[int]:
 
 
 def _submit_conf(
-    runtime: str, config: Mapping[str, Any], user: Mapping[str, str]
+    runtime: str,
+    config: Mapping[str, Any],
+    user: Mapping[str, Any],
+    where: str = "Spark build",
+    env: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, str]:
     """The Spark configuration a run is submitted with: what the runner needs on the class
-    path (its docstring lists it), then the build's ``sparkConf``, which wins."""
+    path (its docstring lists it), then the build's allowed ``sparkConf`` (:func:`_allowed_conf`).
+    """
+    env = os.environ if env is None else env
     conf: Dict[str, str] = {}
     if runtime != "glue":  # Glue's job carries --datalake-formats iceberg and its jars
         conf["spark.jars"] = _EMR_ICEBERG_JAR
@@ -170,8 +223,61 @@ def _submit_conf(
                 packages.extend(_AVRO_PACKAGES)
                 conf["spark.jars.repositories"] = _CONFLUENT_REPOSITORY
             conf["spark.jars.packages"] = ",".join(packages)
-    conf.update({str(k): str(v) for k, v in user.items()})
+    conf.update(_allowed_conf(user, where, env))
     return conf
+
+
+def _conf_allowed(name: str, extra: Sequence[str]) -> bool:
+    if name in _CONF_DENIED or name.startswith(_CONF_DENIED_PREFIXES):
+        listed = name in extra or any(e.endswith("*") and name.startswith(e[:-1]) for e in extra)
+        return listed
+    if name in _CONF_TUNING or name.startswith(_CONF_TUNING_PREFIXES):
+        return True
+    return name in extra or any(e.endswith("*") and name.startswith(e[:-1]) for e in extra)
+
+
+def _allowed_conf(user: Mapping[str, Any], where: str, env: Mapping[str, str]) -> Dict[str, str]:
+    """The build's ``sparkConf``, if every setting is one a contract may make.
+
+    A Spark setting can load code into the job (``spark.jars*``, ``spark.sql.extensions``,
+    ``spark.plugins``, an ``extraJavaOptions`` agent, a catalog implementation) or hand it
+    environment variables; that code runs with the job's role, which reads the whole Glue
+    catalog, and would get round the contract-SQL allowlist and the host allowlist. So a
+    contract sets resource and tuning settings only (:data:`_CONF_TUNING`); the operator
+    lists any other key in :data:`CONF_ALLOWLIST_ENV` (a name, or a prefix ending in ``*``).
+    A value holds no whitespace: Glue joins the settings into one ``--conf`` argument.
+
+    Raises:
+        SparkPolicyError: a setting the operator has not allowed.
+    """
+    from fluid_build._errors import doc_url
+    from fluid_build.spark.policy import SparkPolicyError
+
+    extra = [e.strip() for e in (env.get(CONF_ALLOWLIST_ENV) or "").split(",") if e.strip()]
+    out: Dict[str, str] = {}
+    refused = []
+    for key, value in user.items():
+        name, text = str(key), str(value)
+        if not _conf_allowed(name, extra) or not text or any(c.isspace() for c in text):
+            refused.append(name)
+        else:
+            out[name] = text
+    if refused:
+        raise SparkPolicyError(
+            what=f"{where}: parameters.spark.sparkConf sets {', '.join(sorted(refused))}",
+            why=(
+                "A contract sets Spark resource and tuning settings only (executor and driver "
+                "size, dynamic allocation, shuffle partitions, adaptive execution), with values "
+                "without spaces. Other settings can load code or environment into the job, "
+                "which runs with the job's role and reads what that role can read."
+            ),
+            fix=(
+                "Drop the setting, or, once it is reviewed, have the operator list it in the "
+                f"real environment: export {CONF_ALLOWLIST_ENV}=\"{','.join(sorted(refused))}\"."
+            ),
+            doc=doc_url(),
+        )
+    return out
 
 
 def _account(account: Optional[str], region: str) -> str:
@@ -279,7 +385,9 @@ def desired_runs(
             attempts = min(
                 attempts or DEFAULT_STREAMING_ATTEMPTS_PER_HOUR, _MAX_STREAMING_ATTEMPTS_PER_HOUR
             )
-        spark_conf = _submit_conf(runtime, config, cfg.get("sparkConf") or {})
+        spark_conf = _submit_conf(
+            runtime, config, cfg.get("sparkConf") or {}, f"Spark build {bid}", env
+        )
         release = None if runtime == "glue" else str(cfg.get("releaseLabel") or "emr-7.12.0")
         glue_version = str(cfg.get("glueVersion") or "5.0") if runtime == "glue" else None
         source, checkpoint = config.get("source"), config.get("checkpoint")
