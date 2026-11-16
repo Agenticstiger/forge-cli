@@ -138,12 +138,12 @@ def _failure_text(info: RunInfo) -> str:
     return f"run {info.run_id} ended {info.raw_state or info.state}{attempts}{reason}"
 
 
-def _refuse_new_source(run: DesiredRun, last: Optional[RunInfo]) -> Optional[str]:
-    if not (last and run.checkpoint_id and run.source_id):
+def _refuse_new_source(run: DesiredRun, history: Sequence[RunInfo]) -> Optional[str]:
+    """Refuse when the newest run that used this checkpoint read another stream."""
+    if not (run.checkpoint_id and run.source_id):
         return None
-    if last.checkpoint_id != run.checkpoint_id or not last.source_id:
-        return None
-    if last.source_id == run.source_id:
+    last = next((h for h in history if h.checkpoint_id == run.checkpoint_id), None)
+    if last is None or not last.source_id or last.source_id == run.source_id:
         return None
     return (
         f"the stream changed (topic {run.topic} or its cluster), but checkpoint "
@@ -166,11 +166,13 @@ def _reconcile_one(
     history = adapter.runs()
     active = [h for h in history if h.active]
     last = active[0] if active else (history[0] if history else None)
-    refusal = _refuse_new_source(run, last)
+    refusal = _refuse_new_source(adapter.run, history)  # bound: its checkpoint names the bucket
     if refusal:
         out.action, out.error, out.message = "refused", True, refusal
         return out
-    matching = [a for a in active if a.config_hash == run.config_hash and a.state != CANCELLING]
+    # The newest run with this config is kept; any other active run (an old config, or a
+    # second copy two concurrent applies started) is a second writer on the checkpoint.
+    matching = [a for a in active if a.config_hash == run.config_hash and a.state != CANCELLING][:1]
     stale = [a for a in active if a not in matching]
     if matching and not stale:
         current = matching[0]
@@ -247,18 +249,15 @@ def reconcile(
     clock, budget = _Clock(sleep, now), wait_budget(env)
     outcomes = []
     for run in runs:
-        if run.scheduled:
-            outcomes.append(
-                Outcome(
-                    run.build,
-                    run.runtime,
-                    "scheduled",
-                    message=f"a scheduler starts it: fluid spark run <contract> --build-id "
-                    f"{run.build}",
-                )
-            )
+        if run.scheduled and not run.checkpoint:
+            outcomes.append(_scheduled(run))
             continue
         try:
+            if run.scheduled:  # an availableNow stream: stop a job left from a continuous one
+                outcomes.append(
+                    _stop_continuous(run, adapter_for(run, clients), clock, budget, dry_run)
+                )
+                continue
             adapter = adapter_for(run, clients)
             outcomes.append(
                 _reconcile_one(
@@ -273,6 +272,44 @@ def reconcile(
         except Exception as exc:  # noqa: BLE001 - one build's AWS error is its outcome
             outcomes.append(_error_outcome(run, exc))
     return outcomes
+
+
+def _scheduled(run: DesiredRun) -> Outcome:
+    return Outcome(
+        run.build,
+        run.runtime,
+        "scheduled",
+        message=f"a scheduler starts it: fluid spark run <contract> --build-id {run.build}",
+    )
+
+
+def _stop_continuous(
+    run: DesiredRun, adapter: Adapter, clock: _Clock, budget: float, dry_run: bool
+) -> Outcome:
+    """A stream that moved to ``trigger.availableNow``: its scheduler starts it from now on,
+    so an active run with another config (the old continuous job) is cancelled, or the
+    scheduled runs would share its checkpoint."""
+    out = _scheduled(run)
+    out.where = adapter.where()
+    old = [h for h in adapter.runs() if h.active and h.config_hash != run.config_hash]
+    if not old:
+        return out
+    if dry_run:
+        out.message += f"; would cancel {', '.join(h.run_id for h in old)}"
+        return out
+    for h in old:
+        if h.state != CANCELLING:
+            adapter.cancel(h.run_id)
+        out.cancelled.append(h.run_id)
+        ended = clock.until(
+            lambda i=h.run_id: adapter.get(i), lambda i: i.state in TERMINAL, budget
+        )
+        if ended.state not in TERMINAL:
+            out.action, out.error, out.run_id, out.state = "failed", True, h.run_id, ended.state
+            out.message = f"run {h.run_id} was cancelled but is still {ended.raw_state}"
+            return out
+    out.message += f"; cancelled the continuous run {', '.join(out.cancelled)}"
+    return out
 
 
 def _error_outcome(run: DesiredRun, exc: BaseException) -> Outcome:
@@ -318,9 +355,16 @@ def run_once(
     try:
         adapter = adapter_for(run, clients)
         out = Outcome(run.build, run.runtime, "started", where=adapter.where())
-        run_id = adapter.start(_token(run))
+        # A retried task (its worker killed before it could cancel) finds its run going:
+        # wait for that one rather than start a second writer of the same table.
+        going = [h for h in adapter.runs() if h.active and h.config_hash == run.config_hash]
+        if going:
+            run_id, out.action = going[0].run_id, "adopted"
+            say(f"Spark {run.build}: run {run_id} is already going on {out.where}; waiting for it")
+        else:
+            run_id = adapter.start(_token(run))
+            say(f"Spark {run.build}: started run {run_id} on {out.where}")
         out.run_id = run_id
-        say(f"Spark {run.build}: started run {run_id} on {out.where}")
         if not wait:
             out.state = adapter.get(run_id).state
             return out

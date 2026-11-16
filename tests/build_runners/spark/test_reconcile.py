@@ -80,7 +80,12 @@ def use(monkeypatch):
     built = []
 
     def install(fake):
-        monkeypatch.setattr(rc, "adapter_for", lambda run, clients=None: built.append(run) or fake)
+        def adapter_for(run, clients=None):
+            built.append(run)
+            fake.run = run  # a real adapter holds its (account-bound) run
+            return fake
+
+        monkeypatch.setattr(rc, "adapter_for", adapter_for)
         return built
 
     return install
@@ -207,7 +212,9 @@ def test_dry_run_changes_nothing(run, clock, use):
 
 def test_a_scheduled_build_is_reported_and_never_touches_aws(run, clock, use):
     built = use(FakeAdapter())
-    scheduled = dataclasses.replace(run, scheduled=True, mode="batch")
+    scheduled = dataclasses.replace(
+        run, scheduled=True, mode="batch", checkpoint=None, checkpoint_id=None, source_id=None
+    )
     out = go(scheduled, clock)
     assert (out.action, out.error, built) == ("scheduled", False, [])
     assert "fluid spark run" in out.message
@@ -218,6 +225,7 @@ def test_an_aws_error_is_that_builds_outcome_and_the_others_still_reconcile(
 ):
     second = dataclasses.replace(run, build="second", run_name="fluid-second")
     good = FakeAdapter()
+    good.run = second
 
     def build(r, clients=None):
         if r.build == "ingest-orders":
@@ -244,7 +252,9 @@ def test_wait_budget_reads_the_env_and_ignores_garbage():
 
 @pytest.fixture
 def scheduled(run):
-    return dataclasses.replace(run, scheduled=True, mode="batch")
+    return dataclasses.replace(
+        run, scheduled=True, mode="batch", checkpoint=None, checkpoint_id=None, source_id=None
+    )
 
 
 def once(run, clock, say=None, **kw):
@@ -372,3 +382,42 @@ def test_the_plan_action_never_carries_the_mask_key(run):
     from tests.spark.conftest import MASK_KEY_ARN
 
     assert MASK_KEY_ARN not in str(run.plan_action(1)) and MASK_KEY_ARN not in str(run.tags())
+
+
+def test_a_new_source_on_a_checkpoint_an_older_run_used_is_refused(run, clock, use):
+    # Newest run B read another checkpoint; A, older, read this one with another stream.
+    b = info("B", "RUNNING", hash_="old", source="s2", checkpoint="other")
+    a = info("A", "CANCELLED", hash_="older", source="s1", checkpoint=run.checkpoint_id)
+    fake = FakeAdapter([b, a])
+    use(fake)
+    out = go(run, clock)
+    assert (out.action, out.error, fake.calls) == ("refused", True, [])
+
+
+def test_a_second_copy_of_the_current_config_is_cancelled(run, clock, use):
+    fake = FakeAdapter(
+        [info("a2", "RUNNING", hash_=run.config_hash), info("a1", "RUNNING", hash_=run.config_hash)]
+    )
+    fake.scripts["a1"] = ["RUNNING", "CANCELLED"]
+    use(fake)
+    out = go(run, clock)
+    assert (out.run_id, out.cancelled, out.error) == ("a2", ["a1"], False)
+    assert "start" not in fake.calls
+
+
+def test_a_stream_moved_to_available_now_cancels_its_continuous_job(run, clock, use):
+    fake = FakeAdapter([info("old", "RUNNING", hash_="continuous")])
+    fake.scripts["old"] = ["RUNNING", "CANCELLED"]
+    use(fake)
+    out = go(dataclasses.replace(run, scheduled=True), clock)
+    assert (out.action, out.cancelled, out.error) == ("scheduled", ["old"], False)
+    assert "start" not in fake.calls
+
+
+def test_a_retried_task_adopts_its_going_run_instead_of_starting_another(scheduled, clock, use):
+    fake = FakeAdapter([info("going", "RUNNING", hash_=scheduled.config_hash)])
+    fake.scripts["going"] = ["RUNNING", "SUCCEEDED"]
+    use(fake)
+    out = once(scheduled, clock)
+    assert (out.action, out.run_id) == ("succeeded", "going")
+    assert "start" not in fake.calls

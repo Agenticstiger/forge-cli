@@ -266,9 +266,9 @@ class EmrServerless(Adapter):
 
     def runs(self) -> List[RunInfo]:
         app = self.application_id()
-        mode = "BATCH" if self.run.scheduled else "STREAMING"
+        # Both modes: a stream moved to availableNow still finds its old continuous job.
         summaries: List[Mapping[str, Any]] = []
-        pages = self.client.get_paginator("list_job_runs").paginate(applicationId=app, mode=mode)
+        pages = self.client.get_paginator("list_job_runs").paginate(applicationId=app)
         for number, page in enumerate(pages):
             summaries += [
                 j for j in page.get("jobRuns") or [] if j.get("name") == self.run.run_name

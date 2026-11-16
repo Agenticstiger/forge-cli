@@ -101,6 +101,10 @@ def test_sigterm_while_waiting_cancels_the_moto_run(run):
             run, scheduled=True, mode="batch", retry_attempts=None, target={"applicationId": app_id}
         )
         backend = emrserverless_backends["123456789012"][REGION]
+        # moto's ListJobRuns fails on an application with no runs (AWS returns none).
+        emr.start_job_run(
+            applicationId=app_id, clientToken="seed", executionRoleArn=run.role_arn, name="other"
+        )
 
         def say(text):
             # moto's job runs start SUCCESS (already terminal): make this one run, as it

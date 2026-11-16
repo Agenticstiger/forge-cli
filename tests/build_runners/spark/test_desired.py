@@ -5,7 +5,7 @@ import copy
 
 import pytest
 
-from fluid_build.build_runners.spark import _desired
+from fluid_build.build_runners.spark import _desired, _names
 from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
 from fluid_build.spark.compiler import CONTRACT_SQL_ALLOWLIST_ENV
 from tests.build_runners.spark.conftest import ACCOUNT, runs_of, spark_cfg
@@ -119,7 +119,8 @@ def test_serverless_targets_the_application_by_name_unless_given_an_id(contract)
 def test_the_default_role_is_in_the_given_account(contract):
     run = runs_of(contract)[0]
     assert run.role_arn == (
-        f"arn:aws:iam::{ACCOUNT}:role/fluid-commerce.orders-stream-ingest-orders-spark"
+        f"arn:aws:iam::{ACCOUNT}:role/"
+        + _names.execution_role_name("commerce.orders-stream", "ingest-orders")
     )
 
 
@@ -264,3 +265,10 @@ def test_a_plan_needs_no_aws_account_and_binding_keeps_the_hash(contract, monkey
     assert not bound.needs_account and bound.config_hash == run.config_hash
     assert bound.job_uri.startswith(f"s3://{ACCOUNT}-fluid-data/")
     assert _desired.desired_runs(contract, account=ACCOUNT)[0] == bound
+
+
+def test_names_of_different_builds_never_collide_on_hyphens():
+    assert _names.run_name("a-b", "c") != _names.run_name("a", "b-c")
+    assert _names.glue_job_name("a-b", "c") != _names.glue_job_name("a", "b-c")
+    long = _names.execution_role_name("p" * 100, "b" * 100)
+    assert len(long) <= 64 and long.endswith("-spark")

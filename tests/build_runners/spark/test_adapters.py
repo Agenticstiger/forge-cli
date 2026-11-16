@@ -151,7 +151,7 @@ def test_serverless_runs_lists_this_runs_name_newest_first(serverless):
             summary("other", "someone-else", NOW),
             summary("new", serverless.run_name, NOW),
         ]},
-        {"applicationId": "app1", "mode": "STREAMING"},
+        {"applicationId": "app1"},
     )  # fmt: skip
     for run_id in ("new", "old"):
         stub.add_response(
