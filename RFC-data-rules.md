@@ -466,7 +466,7 @@ contract:
 - **Uniqueness** comes from the column's key or unique flag, not from the format.
 - **Regex rules.** A `validationRules` entry with `type: regex` and `identifierFormat` both apply. A regex can say what a mask cannot (lower case, variable length), but cannot be enumerated. The validator notes a column that declares both.
 - **Foreign keys.** A column in a relationship's `fromColumns` carries the values of the matching `toColumns` column, so it has that column's format. It may repeat the format identically; a different one is an error.
-- Placeholders (§4) are exempt. Only string-family columns take a format.
+- Placeholders (§4) are exempt. When a column declares both, the exported pattern also accepts its placeholders (each value escaped, each prefix escaped and followed by `.*`), and the dbt test skips placeholder rows, so every consumer applies the same exemption. Only string-family columns take a format.
 
 ---
 
@@ -486,7 +486,7 @@ contract:
 
 - A value is a placeholder when it equals one of `values`, or starts with one of `prefixes`. Matching is exact and case-sensitive on the NFC text. NULL is never a placeholder.
 - A placeholder is exempt from the column's own value checks: `identifierFormat`, `validationRules` and the column's enum. Everywhere else (invariants, keys, relationships) it is an ordinary value. Frictionless Table Schema does the same for its `missingValues`, which it reads as null before it applies a field's constraints.
-- One `mustBe*` operator with `unit` bounds the number of placeholder rows, as in §1.4. Without one, placeholders are declared but not bounded: consumers report them and do not fail on them.
+- One `mustBe*` operator with `unit` bounds the number of placeholder rows, as in §1.4; `unit: percent` counts them per 100 rows of the expose. Without an operator, placeholders are declared but not bounded: consumers report them and do not fail on them.
 - Only string-family columns take placeholders.
 
 **Why a field and not column `quality[]`.** The brief asked whether ODCS `invalidValues` with a `pattern` argument fits before adding a field. It does not:
@@ -546,6 +546,7 @@ semantics:
 **One source per value** (EXPR-SPEC-2 §10). A column has at most one source among:
 
 - the `derive` invariants on it, where several with `when`s count as one;
+- the `to` side of a `dependency`;
 - a `sharedColumns` entry;
 - membership of a `sharedAttribute` other than the owner.
 
@@ -620,8 +621,10 @@ Notes, reported and never failing:
 ## Security
 
 - **Expressions are data.** No consumer runs the raw text. Renderers print SQL from the parsed tree, quote every name for the target dialect and escape every string literal again. An expression therefore cannot carry a second statement, a comment or a subquery into a dbt test, an ODCS query or a warehouse. The grammar has no statement separator, comment, subquery or function beyond §2.6. Today the ODCS exporter embeds `contract.quality[].expression` as written; the new fields do not take that path.
+- **Jinja too.** The dbt bridge writes rendered SQL into a dbt project, where test arguments are rendered as Jinja. A string literal or a name that holds `{{`, `{%` or `{#` is therefore escaped for Jinja as well as for SQL (for example, emitted inside `{% raw %}`), so a contract author cannot run Jinja during `dbt test`.
+- **One escaping path.** Mask regexes, placeholder values and prefixes, and the object names in ODCS queries go through the same quoting and escaping functions as the expression renderer, never through a separate string-building path. Conformance vectors feed each renderer hostile names and literals: quotes, `;`, `--`, `/*` and Jinja delimiters.
 - **Bounded parsing.** A text is at most 4,096 code points and 64 levels deep, which bounds the parser's work.
-- **Linear regexes.** forge compiles the mask regexes; users do not write them. They hold no repeated group, so matching takes linear time. Placeholder prefixes are matched as prefixes, not as regexes.
+- **Linear regexes.** forge compiles the mask regexes; users do not write them. They hold no repeated group, so matching takes linear time. Placeholder values and prefixes are matched as text, and are escaped wherever they enter an exported pattern.
 - **No execution path.** The MCP compiler never compiles these texts; `describe` only returns them.
 
 ## Out of scope (deliberately)
