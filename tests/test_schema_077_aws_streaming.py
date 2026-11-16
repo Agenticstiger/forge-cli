@@ -197,6 +197,32 @@ class TestSchemaRegistry:
     def test_rejected(self, manager, registry):
         assert not _valid(manager, _registry(**registry)), registry
 
+    def test_a_glue_subject_is_a_glue_schema_name(self, manager):
+        assert _valid(manager, _registry(kind="glue", subject="orders.value-v1"))
+        assert not _valid(manager, _registry(kind="glue", subject="orders value"))
+        assert _valid(
+            manager, _registry(kind="confluent", url="https://r.example", subject="orders value")
+        )
+
+    @pytest.mark.parametrize(
+        ("registry", "says"),
+        [
+            ({"kind": "glue", "url": "https://r.example"}, "url is for kind: confluent"),
+            (
+                {"kind": "glue", "auth": {"secretRef": "env://A"}},  # pragma: allowlist secret
+                "auth is for kind: confluent",
+            ),
+            (
+                {"kind": "confluent", "url": "https://r.example", "registryName": "r"},
+                "registryName is for kind: glue",
+            ),
+        ],
+    )
+    def test_a_key_of_the_other_kind_is_named(self, manager, registry, says):
+        messages = _messages(_validate(manager, _registry(**registry)))
+        assert any(says in m for m in messages), messages
+        assert not any("should not be valid" in m for m in messages), messages
+
     def test_auth_is_the_kafka_connect_shape(self, manager):
         schema = manager._bundled_schemas["0.7.7"]
         registry = schema["$defs"]["schemaRegistry"]
@@ -455,6 +481,30 @@ class TestSparkParameters:
     def test_rejected(self, manager, spark):
         assert not _valid(manager, _spark_params(**spark)), spark
 
+    @pytest.mark.parametrize(
+        ("spark", "says"),
+        [
+            (
+                {"runtime": "emr-ec2", "applicationId": "abc"},
+                "applicationId is only valid with runtime: emr-serverless",
+            ),
+            (
+                {"runtime": "emr-serverless", "clusterId": "j-ABC"},
+                "clusterId is only valid with runtime: emr-ec2",
+            ),
+            (
+                {"runtime": "glue", "virtualClusterId": "abc"},
+                "virtualClusterId is only valid with runtime: emr-eks",
+            ),
+            ({"runtime": "glue", "releaseLabel": "emr-7.12.0"}, "glue runtime takes glueVersion"),
+            ({"runtime": "emr-ec2", "glueVersion": "5.0"}, "glueVersion is only valid with"),
+        ],
+    )
+    def test_a_field_of_another_runtime_is_named(self, manager, spark, says):
+        messages = _messages(_validate(manager, _spark_params(**spark)))
+        assert any(says in m for m in messages), messages
+        assert not any("should not be valid" in m for m in messages), messages
+
     def test_defaults_and_the_split_with_execution_are_documented(self, manager):
         spark = manager._bundled_schemas["0.7.7"]["$defs"]["sparkParameters"]
         props = spark["properties"]
@@ -574,6 +624,14 @@ class TestPackagingResolver:
         with pytest.raises(PackagingError) as raised:
             resolve_packaging({"packaging": {"containers": {kind: "shared"}}})
         assert raised.value.kind == "pool-required"
+
+    def test_a_block_written_before_077_still_resolves(self):
+        # mode: shared with each of the six kinds overridden to isolated shares
+        # nothing, so it never needed a pool; the preview kinds must not change that.
+        block = {"mode": "shared", "containers": {k: "isolated" for k in CONTAINER_KINDS}}
+        resolution = resolve_packaging({"packaging": block, "exposes": []})
+        assert resolution.pool is None
+        assert resolution.decision_for("emrApplication") is ContainerDecision.REFERENCED
 
     def test_a_binding_override_wins_for_a_new_kind(self):
         contract = {

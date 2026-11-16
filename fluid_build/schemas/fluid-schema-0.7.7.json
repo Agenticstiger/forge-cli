@@ -1463,18 +1463,26 @@
             "allOf": [
               {
                 "not": {
-                  "anyOf": [
-                    {
-                      "required": [
-                        "url"
-                      ]
-                    },
-                    {
-                      "required": [
-                        "auth"
-                      ]
-                    }
+                  "required": [
+                    "url"
                   ]
+                },
+                "description": "url is for kind: confluent; a Glue registry is named by registryName"
+              },
+              {
+                "not": {
+                  "required": [
+                    "auth"
+                  ]
+                },
+                "description": "auth is for kind: confluent; a Glue registry authenticates with the job's IAM role"
+              },
+              {
+                "properties": {
+                  "subject": {
+                    "pattern": "^[A-Za-z0-9_$#.-]{1,255}(?![\\s\\S])",
+                    "description": "A Glue schema name: letters, digits and _ $ # . - (Glue CreateSchema SchemaName)."
+                  }
                 }
               },
               {
@@ -1511,14 +1519,11 @@
             "allOf": [
               {
                 "not": {
-                  "anyOf": [
-                    {
-                      "required": [
-                        "registryName"
-                      ]
-                    }
+                  "required": [
+                    "registryName"
                   ]
-                }
+                },
+                "description": "registryName is for kind: glue; a Confluent registry is addressed by url"
               },
               {
                 "properties": {
@@ -3974,14 +3979,11 @@
           },
           "then": {
             "not": {
-              "anyOf": [
-                {
-                  "required": [
-                    "applicationId"
-                  ]
-                }
+              "required": [
+                "applicationId"
               ]
-            }
+            },
+            "description": "applicationId is only valid with runtime: emr-serverless"
           }
         },
         {
@@ -3996,14 +3998,11 @@
           },
           "then": {
             "not": {
-              "anyOf": [
-                {
-                  "required": [
-                    "clusterId"
-                  ]
-                }
+              "required": [
+                "clusterId"
               ]
-            }
+            },
+            "description": "clusterId is only valid with runtime: emr-ec2"
           }
         },
         {
@@ -4018,14 +4017,11 @@
           },
           "then": {
             "not": {
-              "anyOf": [
-                {
-                  "required": [
-                    "virtualClusterId"
-                  ]
-                }
+              "required": [
+                "virtualClusterId"
               ]
-            }
+            },
+            "description": "virtualClusterId is only valid with runtime: emr-eks"
           }
         },
         {
@@ -4041,25 +4037,19 @@
           },
           "then": {
             "not": {
-              "anyOf": [
-                {
-                  "required": [
-                    "releaseLabel"
-                  ]
-                }
+              "required": [
+                "releaseLabel"
               ]
-            }
+            },
+            "description": "releaseLabel is an EMR release; a glue runtime takes glueVersion"
           },
           "else": {
             "not": {
-              "anyOf": [
-                {
-                  "required": [
-                    "glueVersion"
-                  ]
-                }
+              "required": [
+                "glueVersion"
               ]
-            }
+            },
+            "description": "glueVersion is only valid with runtime: glue; EMR runtimes take releaseLabel"
           }
         }
       ]

@@ -509,10 +509,15 @@ def _effective(
 
     # A pool must be addressable whenever anything is shared (RFC open
     # question 1, resolved: require `pool`; `poolManifest` stays optional).
-    # A shared-only kind is referenced by name and nothing is written into a
-    # pool for it, so it alone never requires one.
+    # A preview kind counts only when `containers` names it: a block written
+    # before 0.7.7 (`mode: shared` with every one of the six kinds overridden
+    # to isolated, no pool) must keep resolving. A shared-only kind is
+    # referenced by name and nothing is written into a pool for it, so it
+    # never requires one.
     shared = list(decisions.values()) + [
-        d for k, d in preview_decisions.items() if k not in SHARED_ONLY_CONTAINER_KINDS
+        d
+        for k, d in preview_decisions.items()
+        if k in containers and k not in SHARED_ONLY_CONTAINER_KINDS
     ]
     if pool is None and any(d is ContainerDecision.REFERENCED for d in shared):
         raise PackagingError(
