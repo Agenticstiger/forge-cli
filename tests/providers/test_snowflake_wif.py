@@ -158,3 +158,16 @@ def test_the_tofu_plugin_lists_the_wif_variables():
     names = SnowflakeIacPlugin.credential_env_vars
     assert "SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER" in names
     assert "SNOWFLAKE_TOKEN_FILE_PATH" in names
+
+
+class TestReadinessWithoutAUser:
+    """A workload identity login names no user: the readiness checks agree."""
+
+    def test_auth_report_does_not_ask_for_a_user(self):
+        from fluid_build.providers.snowflake.util.auth import _required_actions
+
+        config = {"account": "org-acct", "authenticator": "WORKLOAD_IDENTITY"}
+        actions = _required_actions(config)
+        assert actions["auth_ready_missing"] == []
+        assert "user" not in actions["provider_ready_missing"]
+        assert "user" in _required_actions({"account": "a", "password": "p"})["auth_ready_missing"]

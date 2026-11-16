@@ -43,15 +43,23 @@ def _normalize_auth_config(
     return resolved
 
 
+def _workload_identity(config: Dict[str, Any]) -> bool:
+    """A workload identity login (Snowflake finds the service user from the token)."""
+    return str(config.get("authenticator") or "").strip().upper() == "WORKLOAD_IDENTITY"
+
+
 def _required_actions(config: Dict[str, Any]) -> Dict[str, list[str]]:
-    auth_ready_missing = [key for key in ["account", "user"] if not config.get(key)]
+    needed = ["account"] if _workload_identity(config) else ["account", "user"]
+    auth_ready_missing = [key for key in needed if not config.get(key)]
     if not any(
         config.get(key) for key in ["password", "private_key_path", "oauth_token", "authenticator"]
     ):
         auth_ready_missing.append("password/private-key/oauth-token/authenticator")
 
     apply_ready_missing = [
-        key for key in ["account", "user", "warehouse", "database", "schema"] if not config.get(key)
+        key
+        for key in ["account", "user", "warehouse", "database", "schema"]
+        if not config.get(key) and not (key == "user" and _workload_identity(config))
     ]
     return {
         "auth_ready_missing": auth_ready_missing,

@@ -954,9 +954,13 @@ class SnowflakeAuthProvider(AuthProvider):
             self.schema = settings.get("schema")
             self.role = settings.get("role")
 
-            if not (settings.get("account") and settings.get("user")) and self._has_connector_auth(
-                settings
-            ):
+            # A workload identity login names no user: Snowflake finds the service
+            # user from the token's issuer and subject.
+            workload_identity = (
+                str(settings.get("authenticator") or "").strip().upper() == "WORKLOAD_IDENTITY"
+            )
+            has_user = bool(settings.get("user")) or workload_identity
+            if not (settings.get("account") and has_user) and self._has_connector_auth(settings):
                 return AuthResult(
                     provider=self.name,
                     status=AuthStatus.NOT_AUTHENTICATED,
