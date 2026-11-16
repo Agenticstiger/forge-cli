@@ -37,8 +37,8 @@ accounts:
 * **Lake Formation cross-account authorization.** LF ``GrantPermissions``
   is rejected with ``AccessDeniedException`` whenever LocalStack IAM
   enforcement is on — even with the caller registered in
-  ``DataLakeAdmins`` (this module's own contract emits
-  ``aws_lakeformation_data_lake_settings`` and it still fails). See
+  ``DataLakeAdmins`` (this module's setup makes account A an admin and it
+  still fails). See
   ``docs/upstream-issues/localstack-lakeformation-grant-auth.md``. So LF
   grants can only be *created* in the non-enforcing mode, where nothing
   evaluates them: the LF permission is verified as **landed**, never as
@@ -212,9 +212,6 @@ def _cross_account_contract(
             "pool": "platform-lake-pool",
             "containers": {"bucket": "shared"},
         },
-        # Registers account A's caller as an LF data-lake admin. On real
-        # AWS this is what authorises the GrantPermissions below.
-        "governance": {"lakeFormation": {"admins": [f"arn:aws:iam::{ACCOUNT_A}:root"]}},
         "exposes": [
             {
                 "exposeId": "orders",
@@ -258,6 +255,14 @@ def _bootstrap_two_accounts(bucket: str = POOL_BUCKET) -> None:
     to a *different* tenant of the same pool — the negative control that
     makes prefix-scoping meaningful.
     """
+    # Registers account A's caller as an LF data-lake admin, as the platform's
+    # bootstrap does: a contract may not (governance.lakeFormation.admins is
+    # refused). On real AWS this is what authorises the GrantPermissions below.
+    _client("lakeformation", KEY_A).put_data_lake_settings(
+        DataLakeSettings={
+            "DataLakeAdmins": [{"DataLakePrincipalIdentifier": f"arn:aws:iam::{ACCOUNT_A}:root"}]
+        }
+    )
     s3_a = _client("s3", KEY_A)
     try:
         s3_a.create_bucket(Bucket=bucket)
