@@ -19,7 +19,7 @@ from typing import Optional
 import yaml
 
 from fluid_build.cli._errors import FluidUserError, SchemaValidationError
-from fluid_build.cli.console import cprint
+from fluid_build.cli.console import cprint, cprint_literal
 from fluid_build.cli.import_workflow import get_importer
 from fluid_build.cli.import_workflow.airbyte import SERVER_URL_ENV as AIRBYTE_SERVER_URL_ENV
 
@@ -123,19 +123,22 @@ def _default_out_path(contract: dict) -> str:
 
 
 def _print_report(report) -> None:
+    # Each item quotes the imported project (model, entity and expose names, as in
+    # ``exposes[orders].semantics``), so it prints literally: Rich markup would
+    # swallow the brackets.
     if report.mapped_one_to_one:
         cprint(f"\n  Mapped 1:1 ({len(report.mapped_one_to_one)}):")
         for x in report.mapped_one_to_one:
-            cprint(f"    • {x}")
+            cprint_literal(f"    • {x}")
     if report.required_defaults:
         cprint(f"\n  Used defaults ({len(report.required_defaults)}):")
         for x in report.required_defaults:
-            cprint(f"    • {x}")
+            cprint_literal(f"    • {x}")
     if report.unsupported:
         cprint(f"\n  Unsupported (must be re-authored, {len(report.unsupported)}):")
         for x in report.unsupported:
-            cprint(f"    ⚠ {x}")
+            cprint_literal(f"    ⚠ {x}")
     if report.notes:
         cprint("\n  Notes:")
         for x in report.notes:
-            cprint(f"    – {x}")
+            cprint_literal(f"    – {x}")

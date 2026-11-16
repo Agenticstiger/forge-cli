@@ -285,6 +285,8 @@ def _build_contracts(
     # Semantics attach once over the union so a semantic model lands on its
     # own bucket's expose without cross-bucket "dropped" noise.
     _attach_semantic_models(manifest, union_expose_by_uid, report)
+    _attach_relationships(contracts, report)
+    _pin_relationships_version(contracts, report)
 
     if multi:
         report.notes.append(
@@ -1399,9 +1401,8 @@ def _semantics_block_from_semantic_model(
             )
         if dim_type == "time":
             dimension["type"] = "time"
-            granularity = str(
-                ((raw.get("type_params") or {}).get("time_granularity")) or ""
-            ).strip()
+            type_params = raw.get("type_params") or {}
+            granularity = str(type_params.get("time_granularity") or "").strip()
             if granularity:
                 from fluid_build.forge_datamodel import time_grains as _time_grains
 
@@ -1414,6 +1415,10 @@ def _semantics_block_from_semantic_model(
                         f"granularity {granularity!r} has no contract equivalent — "
                         "granularity omitted"
                     )
+            validity = _validity_params(type_params.get("validity_params"))
+            if validity:
+                # The bound of an SCD type II validity window (schema 0.7.7).
+                dimension.setdefault("typeParams", {})["validityParams"] = validity
         else:
             dimension["type"] = "categorical"
         dimensions.append(dimension)
@@ -1482,6 +1487,124 @@ def _semantics_block_from_semantic_model(
     if measures:
         block["measures"] = measures
     return block
+
+
+def _validity_params(raw: Any) -> Dict[str, bool]:
+    """dbt ``validity_params`` as the contract's ``validityParams``: the flags that are set."""
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        key: True
+        for dbt_key, key in (("is_start", "isStart"), ("is_end", "isEnd"))
+        if raw.get(dbt_key) is True
+    }
+
+
+def _attach_relationships(contracts: List[Dict[str, Any]], report: ImportReport) -> None:
+    """Write the dbt entity graph's joins as ``semantics.relationships`` (schema 0.7.7).
+
+    MetricFlow joins a foreign entity to the primary, unique or natural entity of the
+    same name in another semantic model. Where exactly one expose of the same contract
+    has that entity, and both entities key on a column their exposes declare, the join
+    becomes a relationship: many_to_one, the two entities' columns. A target in another
+    product (``--split-by``), more than one target, or a key that is an expression is
+    reported and not written: a relationship names one expose of its own contract and
+    real columns (RFC-semantics-tier1 §4).
+    """
+    from fluid_build.forge_datamodel.semantics_builder import declared_columns, entity_column
+
+    targets: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
+    for index, contract in enumerate(contracts):
+        for expose in contract.get("exposes") or []:
+            semantics = expose.get("semantics") or {}
+            for entity in semantics.get("entities") or []:
+                if entity.get("type") in ("primary", "unique", "natural"):
+                    targets.setdefault(str(entity["name"]), []).append((index, expose))
+
+    for index, contract in enumerate(contracts):
+        for expose in contract.get("exposes") or []:
+            semantics = expose.get("semantics")
+            if not isinstance(semantics, dict):
+                continue
+            for entity in semantics.get("entities") or []:
+                if entity.get("type") != "foreign":
+                    continue
+                matches = [
+                    (where, target)
+                    for where, target in targets.get(str(entity["name"]), [])
+                    if target is not expose
+                ]
+                if not matches:
+                    continue
+                label = f"semantic model {semantics.get('name')}: foreign entity {entity['name']!r}"
+                local = [target for where, target in matches if where == index]
+                if not local:
+                    others = ", ".join(sorted(str(t["exposeId"]) for _, t in matches))
+                    report.unsupported.append(
+                        f"{label} joins {others} in another product — no relationship written "
+                        "(a relationship names an expose of its own contract)"
+                    )
+                    continue
+                if len(local) > 1:
+                    candidates = ", ".join(sorted(str(t["exposeId"]) for t in local))
+                    report.unsupported.append(
+                        f"{label} matches {len(local)} exposes ({candidates}) — no "
+                        "relationship written (its target is ambiguous)"
+                    )
+                    continue
+                target = local[0]
+                target_entity = next(
+                    e
+                    for e in target["semantics"]["entities"]
+                    if str(e.get("name")) == str(entity["name"])
+                    and e.get("type") in ("primary", "unique", "natural")
+                )
+                from_column = entity_column(entity)
+                to_column = entity_column(target_entity)
+                if from_column not in declared_columns(expose) or to_column not in declared_columns(
+                    target
+                ):
+                    report.unsupported.append(
+                        f"{label}: its key {from_column!r} -> {target['exposeId']}.{to_column!r} "
+                        "is not a column both exposes declare — no relationship written"
+                    )
+                    continue
+                relationships = semantics.setdefault("relationships", [])
+                taken = {str(r.get("name")) for r in relationships}
+                name = f"{expose['exposeId']}_to_{target['exposeId']}"
+                if name in taken:
+                    name = f"{expose['exposeId']}_{entity['name']}_to_{target['exposeId']}"
+                relationships.append(
+                    {
+                        "name": name,
+                        "to": target["exposeId"],
+                        "fromColumns": [from_column],
+                        "toColumns": [to_column],
+                        "cardinality": "many_to_one",
+                    }
+                )
+                report.mapped_one_to_one.append(
+                    f"{label} → exposes[{expose['exposeId']}].semantics.relationships[{name}] "
+                    f"(to {target['exposeId']})"
+                )
+
+
+def _pin_relationships_version(contracts: List[Dict[str, Any]], report: ImportReport) -> None:
+    """Move a contract that carries relationships or validity params to the schema that holds them.
+
+    Every other contract keeps the newest stable version, and its digest.
+    """
+    from fluid_build.forge_datamodel.semantics_builder import version_for_relationship_keys
+
+    for contract in contracts:
+        needed = version_for_relationship_keys(contract)
+        if needed is None:
+            continue
+        report.notes.append(
+            f"{contract['id']}: fluidVersion {needed} (preview) — the contract carries "
+            f"relationships or an SCD validity window, which only the {needed} schema holds"
+        )
+        contract["fluidVersion"] = needed
 
 
 def _attach_metric(
