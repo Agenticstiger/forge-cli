@@ -584,19 +584,21 @@ def _contract_cloud_auth(contract_path: str) -> Tuple[str, ...]:
     ``openbao`` when a ``secretRef`` in any of them is ``vault://`` or
     ``openbao://`` (forge's vault resolver logs in with the job's OIDC token)."""
     from fluid_build.forge.core.pipeline_systems._keyless import CLOUD_AUTH_PLATFORMS
+    from fluid_build.iac.provider_match import canonical_cloud, detect_clouds
     from fluid_build.secrets.contract import secret_ref_sites
 
     found = set()
     for document in _contract_documents(contract_path):
-        bindings = [document.get("binding")]
-        bindings += [e.get("binding") for e in document.get("exposes") or [] if isinstance(e, dict)]
+        # The clouds `fluid apply` would detect (aliases such as bigquery or s3, and
+        # binding.provider, included), and every build's own runtime cloud, since a
+        # build there needs a login too even beside another cloud's exposes.
+        found.update(detect_clouds(document))
         for build in document.get("builds") or []:
-            runtime = ((build or {}).get("execution") or {}).get("runtime") or {}
-            bindings.append({"platform": runtime.get("platform")} if runtime else None)
-        for binding in bindings:
-            platform = binding.get("platform") if isinstance(binding, dict) else None
-            if isinstance(platform, str) and platform.lower() in CLOUD_AUTH_PLATFORMS:
-                found.add(platform.lower())
+            if not isinstance(build, dict):
+                continue
+            runtime = (build.get("execution") or {}).get("runtime") or {}
+            found.add(canonical_cloud(build.get("provider")))
+            found.add(canonical_cloud(runtime.get("platform") if isinstance(runtime, dict) else ""))
         for site in secret_ref_sites(document):
             scheme = str(site.raw).partition("://")[0].lower() if "://" in str(site.raw) else ""
             if scheme in ("vault", "openbao"):

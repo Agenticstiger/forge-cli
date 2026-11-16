@@ -455,6 +455,33 @@ def test_jenkins_says_it_has_no_native_oidc(tmp_path, monkeypatch):
     assert "never commit" in text.lower() or "never commit" in text
 
 
+@pytest.mark.parametrize(
+    ("binding", "expected"),
+    [
+        ({"platform": "bigquery"}, ("gcp",)),
+        ({"platform": "s3"}, ("aws",)),
+        ({"provider": "gcp"}, ("gcp",)),
+        ({"platform": "Snowflake"}, ("snowflake",)),
+    ],
+)
+def test_detection_uses_the_cloud_names_fluid_apply_accepts(tmp_path, binding, expected):
+    from fluid_build.cli.generate_ci import _contract_cloud_auth
+
+    contract = _contract()
+    contract["exposes"] = [{"exposeId": "out", "binding": {**binding, "format": "table"}}]
+    _write(tmp_path, contract)
+    assert _contract_cloud_auth(str(tmp_path / "contract.fluid.yaml")) == expected
+
+
+def test_a_build_on_another_cloud_gets_its_own_login(tmp_path):
+    from fluid_build.cli.generate_ci import _contract_cloud_auth
+
+    contract = _contract(_binding("aws"))
+    contract["builds"] = [{"id": "dbt", "execution": {"runtime": {"platform": "databricks"}}}]
+    _write(tmp_path, contract)
+    assert _contract_cloud_auth(str(tmp_path / "contract.fluid.yaml")) == ("aws", "databricks")
+
+
 def test_the_jenkins_header_names_credentials_binding_not_keyless(tmp_path, monkeypatch):
     _write(tmp_path, _contract(_binding("aws")))
     text = _generate(tmp_path, monkeypatch, "jenkins", "standard")["Jenkinsfile"]
