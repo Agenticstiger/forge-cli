@@ -729,9 +729,9 @@ def _apply_bound_plan(
                 "error": f"`tofu show -json` could not read the saved plan {record['planFile']}",
                 "remediation": [
                     "The plan needs the OpenTofu version and providers it was made with; "
-                    "re-run `fluid plan --tofu` where you apply.",
+                    + "re-run `fluid plan --tofu` where you apply.",
                     "A plan made with FLUID_STATE_ENCRYPTION set is read only with the same "
-                    "setting, and one made without it only without it.",
+                    + "setting, and one made without it only without it.",
                 ],
             },
         )

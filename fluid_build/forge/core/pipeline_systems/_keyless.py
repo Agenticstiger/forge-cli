@@ -415,7 +415,7 @@ def gitlab_auth_script(cloud_auth: Sequence[str]) -> List[str]:
             'printf "%s" "$AWS_OIDC_TOKEN" > "$FLUID_AUTH_DIR/aws-token"',
             # The SDKs assume AWS_ROLE_ARN (a CI/CD variable) with the token themselves.
             'export AWS_WEB_IDENTITY_TOKEN_FILE="$FLUID_AUTH_DIR/aws-token" '
-            'AWS_ROLE_SESSION_NAME="fluid-ci-$CI_PIPELINE_ID"',
+            + 'AWS_ROLE_SESSION_NAME="fluid-ci-$CI_PIPELINE_ID"',
         ]
     if "gcp" in platforms:
         lines += [
@@ -428,14 +428,14 @@ def gitlab_auth_script(cloud_auth: Sequence[str]) -> List[str]:
         lines += [
             'printf "%s" "$SNOWFLAKE_OIDC_TOKEN" > "$FLUID_AUTH_DIR/snowflake-token"',
             "export SNOWFLAKE_AUTHENTICATOR=WORKLOAD_IDENTITY "
-            "SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER=OIDC "
-            'SNOWFLAKE_TOKEN_FILE_PATH="$FLUID_AUTH_DIR/snowflake-token"',
+            + "SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER=OIDC "
+            + 'SNOWFLAKE_TOKEN_FILE_PATH="$FLUID_AUTH_DIR/snowflake-token"',
         ]
     if "openbao" in platforms:
         lines += [
             'printf "%s" "$OPENBAO_OIDC_TOKEN" > "$FLUID_AUTH_DIR/openbao-token"',
             'export FLUID_VAULT_JWT_FILE="$FLUID_AUTH_DIR/openbao-token" '
-            'FLUID_VAULT_JWT_ROLE="$OPENBAO_JWT_ROLE"',
+            + 'FLUID_VAULT_JWT_ROLE="$OPENBAO_JWT_ROLE"',
         ]
     return lines
 
