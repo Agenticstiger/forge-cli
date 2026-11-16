@@ -35,6 +35,16 @@ from fluid_build.iac.backend import (
 )
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.credentials import backend_clouds, build_tofu_env, credential_report
+from fluid_build.iac.encryption import (
+    StateEncryption,
+    StateEncryptionError,
+    configured_state_encryption,
+    encryption_block,
+    encryption_env,
+    encryption_variables,
+    explain_state_failure,
+    require_supported_tofu,
+)
 from fluid_build.iac.module import write_dependency_lock
 from fluid_build.iac.naming import safe_ident
 from fluid_build.iac.source import contract_source, source_contract_file
@@ -179,6 +189,8 @@ def _apply_via_opentofu(
     if backend_origin != "default":
         state_line += f" (from {backend_origin})"
     cprint(f"  state:       {state_line}")
+    if target.encryption is not None:
+        cprint(f"  encryption:  {target.encryption.describe()}")
     cprint(f"  credentials: {', '.join(present) if present else 'none detected in environment'}")
 
     # The Command Center hears about the run now that the product, the
@@ -199,7 +211,9 @@ def _apply_via_opentofu(
         reconfigure=recorded_legacy_backend(target),
     )
     if not init.ok:
-        raise CLIError(1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)})
+        raise _encryption_failure(init.stderr or init.stdout) or CLIError(
+            1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)}
+        )
 
     dry_run = bool(getattr(args, "dry_run", False))
     if dry_run:
@@ -655,6 +669,10 @@ class StateTarget:
     #: Where a release before the provider-keyed default kept this state, when
     #: that differs from ``backend`` (``iac.backend.legacy_default_backend``).
     legacy_backend: Optional[Dict[str, Any]] = None
+    #: The key ``FLUID_STATE_ENCRYPTION`` names, or ``None``: the state is not encrypted.
+    encryption: Optional[StateEncryption] = None
+    #: ``--migrate-state-encryption``: this run reads plaintext state, writes it encrypted.
+    migrate_encryption: bool = False
 
     @property
     def location(self) -> str:
@@ -717,8 +735,28 @@ def resolve_state_target(args, contract: Mapping[str, Any], provider: str) -> St
         / provider
         / safe_ident(contract.get("id") or "contract")
     )
+    try:
+        encryption = configured_state_encryption()
+    except StateEncryptionError as exc:
+        raise _binding_error(exc)
+    migrate = bool(getattr(args, "migrate_state_encryption", False))
+    if migrate and encryption is None:
+        raise CLIError(
+            1,
+            "opentofu_state_encryption_invalid",
+            {
+                "error": "--migrate-state-encryption encrypts the state with the key "
+                "FLUID_STATE_ENCRYPTION names, and it is not set",
+                "remediation": ["Set FLUID_STATE_ENCRYPTION, then re-run"],
+            },
+        )
     return StateTarget(
-        workdir=workdir, backend=backend, origin=backend_origin, legacy_backend=legacy
+        workdir=workdir,
+        backend=backend,
+        origin=backend_origin,
+        legacy_backend=legacy,
+        encryption=encryption,
+        migrate_encryption=migrate,
     )
 
 
@@ -763,7 +801,7 @@ def reconcile_state_key(
             logger=logger,
         )
     except StateMigrationError as exc:
-        raise CLIError(
+        raise _encryption_failure(str(exc)) or CLIError(
             1,
             exc.code,
             {
@@ -816,7 +854,9 @@ def guard_state_shared_with_another_cloud(
     try:
         doc = read_state(target.workdir, env)
     except StateMigrationError as exc:
-        raise CLIError(1, exc.code, {"error": str(exc), "state": location})
+        raise _encryption_failure(str(exc)) or CLIError(
+            1, exc.code, {"error": str(exc), "state": location}
+        )
     others = sorted(other_clouds(doc.resources, provider))
     if not others:
         return
@@ -858,7 +898,9 @@ def emit_module(
     """``(main.tf.json text, native actions)`` the apply emits for ``contract``."""
     actions = native_actions(contract, logger)
     try:
-        module = build_module(plugin, contract, actions=actions, backend=target.backend)
+        module = build_module(
+            plugin, contract, actions=actions, backend=target.backend, **_encryption_args(target)
+        )
     except UnsupportedBindingError as exc:
         # The emitter refused to substitute a different resource kind for the
         # declared binding. Surface it as a typed CLI error rather than a
@@ -889,15 +931,51 @@ def credential_overlay(plugin: Any, env: Mapping[str, str]) -> Dict[str, str]:
 def _tofu_env(plugin: Any, target: StateTarget) -> Dict[str, str]:
     """``tofu``'s environment for one run of ``plugin`` on ``target``'s state.
 
-    The allowlist (``iac/credentials.py``) for the plugin and the state
-    backend's cloud, then the plugin's ``credential_env`` overlay, derived from
-    the full environment as before. Every ``tofu`` call of the run, ``init`` to
-    ``apply``, takes this one mapping.
+    The allowlist (``iac/credentials.py``) for the plugin, the state backend's
+    cloud and the encryption key's; then the plugin's ``credential_env`` overlay,
+    derived from the full environment as before; then what the encryption key
+    needs (``iac/encryption.py``), fetched now for this run. Every ``tofu`` call
+    of the run, ``init`` to ``apply``, takes this one mapping: an encrypted saved
+    plan is read back with the same key.
     """
     full = dict(os.environ)
-    env = build_tofu_env(plugin, clouds=backend_clouds(target.backend), base=full)
+    encryption = getattr(target, "encryption", None)
+    clouds = backend_clouds(target.backend) + (encryption.clouds if encryption else ())
+    env = build_tofu_env(plugin, clouds=clouds, base=full)
     env.update(credential_overlay(plugin, full))
+    if encryption is not None:
+        try:
+            require_supported_tofu(runner.tofu_version())
+            env.update(encryption_env(encryption))
+        except StateEncryptionError as exc:
+            raise _binding_error(exc)
+        if getattr(target, "migrate_encryption", False):
+            warn(
+                logging.getLogger(__name__),
+                "opentofu_state_encryption_migration",
+                message="--migrate-state-encryption: this run reads unencrypted state and "
+                "writes it back encrypted; the state is not enforced until it ends",
+                key=encryption.describe(),
+            )
     return env
+
+
+def _encryption_args(target: StateTarget) -> Dict[str, Any]:
+    """``build_module``'s encryption block and variables for ``target``, or nothing."""
+    encryption = getattr(target, "encryption", None)
+    if encryption is None:
+        return {}
+    migrate = bool(getattr(target, "migrate_encryption", False))
+    return {
+        "encryption": encryption_block(encryption, migrate=migrate),
+        "variables": encryption_variables(encryption),
+    }
+
+
+def _encryption_failure(output: str) -> Optional[CLIError]:
+    """The fix-it for a ``tofu`` run that failed on state encryption, else ``None``."""
+    refusal = explain_state_failure(output)
+    return _binding_error(refusal) if refusal is not None else None
 
 
 @contextmanager
@@ -1395,6 +1473,9 @@ def _plan_failure(
 ) -> CLIError:
     """The error for a failed ``tofu plan``: the plugin's fix-it, else the raw tail."""
     output = (plan.stdout or "") + (plan.stderr or "")
+    encrypted = _encryption_failure(output)
+    if encrypted is not None:
+        return encrypted
     explained = _explained_failure(plugin, contract, output, workdir, env)
     if explained is not None:
         return explained

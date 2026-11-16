@@ -139,8 +139,10 @@ jobs:
       - name: Stage 1 — unit (pure-function emit)
         run: .venv/bin/python -m pytest -m "unit and not slow" -q -n auto --dist loadscope
 
-      - name: Stage 1 — tofu validate (creds-free)
-        run: .venv/bin/python -m pytest tests/iac/test_iac_tofu_validate.py -q
+      # The state-encryption canary runs the apply engine's pieces against this
+      # tofu with OpenTofu's built-in terraform_data: no provider, no network.
+      - name: Stage 1 — tofu validate and state encryption (creds-free)
+        run: .venv/bin/python -m pytest tests/iac/test_iac_tofu_validate.py tests/iac/test_iac_state_encryption_tofu.py -q
 
   # The tofu lanes are independent (each runs its own files against moto or an
   # in-process stand-in, and asserts its own junit), so each is its own job:

@@ -178,6 +178,7 @@ def _plan_and_classify(
     from fluid_build.iac.module import write_dependency_lock
 
     from ._apply_opentofu_engine import (
+        _encryption_failure,
         _guard_region_move,
         _reconcile_with_state,
         _tail,
@@ -249,6 +250,9 @@ def _plan_and_classify(
 
         plan = runner.tofu_plan_detailed(str(workdir), out_file=PLAN_FILE, env=env)
         if plan.returncode not in (0, runner.PLAN_HAS_CHANGES):
+            encrypted = _encryption_failure((plan.stdout or "") + (plan.stderr or ""))
+            if encrypted is not None:
+                return _error(_cli_error_text(encrypted), location)
             return _error(
                 "the refresh plan failed: " + _tail(plan.stderr or plan.stdout, _MAX_DETAIL_CHARS),
                 location,
