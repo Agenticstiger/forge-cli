@@ -295,6 +295,11 @@ def _passphrase(encryption: StateEncryption) -> str:
 
 
 def _openbao_env() -> Dict[str, str]:
+    # The vault resolver's own config and token, not resolve_credential: no
+    # secret value is read here, only the token tofu sends to the transit engine
+    # the operator named. The address (BAO_ADDR / VAULT_ADDR) and the CA bundle
+    # are protected names, so a project file cannot redirect the token, and a
+    # token the resolver minted is revoked when the run ends.
     from fluid_build.secrets import _vault
     from fluid_build.secrets.run import state_for_lookup
 

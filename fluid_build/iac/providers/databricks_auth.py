@@ -199,21 +199,26 @@ def _profile_auth(env: Mapping[str, str], host: str, profile: str) -> WorkspaceA
     return WorkspaceAuth(host, auth_type, profile, {AUTH_TYPE_ENV: auth_type})
 
 
+def _missing_for(explicit: str, env: Mapping[str, str]) -> Optional[str]:
+    """What an explicit ``DATABRICKS_AUTH_TYPE`` needs from ``env`` and lacks, or ``None``."""
+    if explicit == "pat":
+        return None if env.get(TOKEN_ENV) else TOKEN_ENV
+    if explicit == "oauth-m2m":
+        if env.get(CLIENT_ID_ENV) and env.get(CLIENT_SECRET_ENV):
+            return None
+        return f"{CLIENT_ID_ENV} and {CLIENT_SECRET_ENV}"
+    if explicit in OIDC_AUTH_TYPES:
+        return None if env.get(CLIENT_ID_ENV) else CLIENT_ID_ENV
+    return None
+
+
 def _env_auth(env: Mapping[str, str], host: str) -> WorkspaceAuth:
     token = bool(env.get(TOKEN_ENV))
     client = bool(env.get(CLIENT_ID_ENV)) and bool(env.get(CLIENT_SECRET_ENV))
     explicit = str(env.get(AUTH_TYPE_ENV) or "").strip()
     if explicit:
-        missing = {"pat": not token, "oauth-m2m": not client}.get(explicit, False)
-        if explicit in OIDC_AUTH_TYPES:
-            missing = not env.get(CLIENT_ID_ENV)
-        if missing:
-            if explicit == "pat":
-                needs = TOKEN_ENV
-            elif explicit in OIDC_AUTH_TYPES:
-                needs = CLIENT_ID_ENV
-            else:
-                needs = f"{CLIENT_ID_ENV} and {CLIENT_SECRET_ENV}"
+        needs = _missing_for(explicit, env)
+        if needs:
             raise _refusal(
                 "credentials-missing",
                 f"{AUTH_TYPE_ENV} is {explicit}, and {needs} is not set.",

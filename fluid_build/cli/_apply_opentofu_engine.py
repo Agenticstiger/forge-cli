@@ -735,6 +735,19 @@ def resolve_state_target(args, contract: Mapping[str, Any], provider: str) -> St
         / provider
         / safe_ident(contract.get("id") or "contract")
     )
+    encryption, migrate = _state_encryption(args)
+    return StateTarget(
+        workdir=workdir,
+        backend=backend,
+        origin=backend_origin,
+        legacy_backend=legacy,
+        encryption=encryption,
+        migrate_encryption=migrate,
+    )
+
+
+def _state_encryption(args) -> Tuple[Optional[StateEncryption], bool]:
+    """``FLUID_STATE_ENCRYPTION``'s key and whether this run migrates plaintext state."""
     try:
         encryption = configured_state_encryption()
     except StateEncryptionError as exc:
@@ -750,14 +763,7 @@ def resolve_state_target(args, contract: Mapping[str, Any], provider: str) -> St
                 "remediation": ["Set FLUID_STATE_ENCRYPTION, then re-run"],
             },
         )
-    return StateTarget(
-        workdir=workdir,
-        backend=backend,
-        origin=backend_origin,
-        legacy_backend=legacy,
-        encryption=encryption,
-        migrate_encryption=migrate,
-    )
+    return encryption, migrate
 
 
 def recorded_legacy_backend(target: StateTarget) -> bool:
