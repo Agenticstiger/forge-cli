@@ -671,4 +671,4 @@ Each step is its own PR:
 - COBOL PICTURE symbols: IBM Enterprise COBOL language reference, "Symbols used in the PICTURE clause"
 - Frictionless Table Schema `missingValues`: specs.frictionlessdata.io/table-schema/; Soda missing metrics (`missing regex`): docs.soda.io
 - RFC 9485, I-Regexp: an interoperable regular expression format
-- Internal: flux-engine ADR 0008 and EXPR-SPEC-2 (Agenticstiger/flux-engine#38); FLUX relational data requirements v3; #894 (relationships and validity); #845 (data profile port); `fluid_build/providers/odcs/mappers/quality.py` (contract quality as ODCS `sql` rules); `fluid_build/engines/dbt/_test_mapping.py`; `fluid_build/iac/row_access.py` (sqlglot predicate parsing)
+- Internal: flux-engine ADR 0008 and EXPR-SPEC-2 (Agenticstiger/flux-engine#38, restructured in #39); FLUX relational data requirements v3; #894 (relationships and validity); #845 (data profile port); `fluid_build/providers/odcs/mappers/quality.py` (contract quality as ODCS `sql` rules); `fluid_build/engines/dbt/_test_mapping.py`; `fluid_build/iac/row_access.py` (sqlglot predicate parsing)
