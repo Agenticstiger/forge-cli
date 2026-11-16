@@ -31,6 +31,25 @@ class TestParse:
         )
         assert parsed.region == "us-east-2"
 
+    @pytest.mark.parametrize(
+        ("arn", "region"),
+        [
+            (
+                "arn:aws-us-gov:kms:us-gov-west-1:123456789012:key/mrk-1234abcd12ab34cd56ef1234567890ab",
+                "us-gov-west-1",
+            ),
+            ("arn:aws-cn:kms:cn-north-1:123456789012:alias/state", "cn-north-1"),
+            (
+                "arn:aws-eusc:kms:eusc-de-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+                "eusc-de-east-1",
+            ),
+        ],
+    )
+    def test_every_aws_partition_is_accepted(self, arn, region):
+        assert enc.parse_state_encryption(f"aws-kms://{arn}", {}).region == region
+        alias = enc.parse_state_encryption("aws-kms://alias/state", {"AWS_REGION": region})
+        assert alias.region == region
+
     def test_aws_kms_without_any_region_is_refused(self):
         with pytest.raises(enc.StateEncryptionError, match="names no region"):
             enc.parse_state_encryption("aws-kms://alias/fluid-state", {})

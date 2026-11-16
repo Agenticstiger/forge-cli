@@ -76,7 +76,7 @@ _FORMS = (
 # Locators are written into main.tf.json, so none may hold "$", "%", "{" or a
 # control character (OpenTofu interpolation).
 _AWS_KEY_ARN = re.compile(
-    r"arn:aws[a-z-]*:kms:(?P<region>[a-z]{2}(?:-[a-z]+)+-\d+):\d{12}:(?:key|alias)/[A-Za-z0-9/_+=,.@-]+"
+    r"arn:aws[a-z-]*:kms:(?P<region>[a-z]{2,}(?:-[a-z]+)+-\d+):\d{12}:(?:key|alias)/[A-Za-z0-9/_+=,.@-]+"
 )
 _AWS_KEY_OTHER = re.compile(r"alias/[A-Za-z0-9/_-]+|(?:mrk-)?[0-9a-fA-F-]{32,40}")
 _GCP_KEY = re.compile(
@@ -84,7 +84,8 @@ _GCP_KEY = re.compile(
     r"/cryptoKeys/[A-Za-z0-9_-]+"
 )
 _BAO_SEGMENT = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*")
-_AWS_REGION = re.compile(r"[a-z]{2}(?:-[a-z]+)+-\d+")
+#: Regions of every partition: us-east-1, us-gov-west-1, cn-north-1, eusc-de-east-1.
+_AWS_REGION = re.compile(r"[a-z]{2,}(?:-[a-z]+)+-\d+")
 
 
 class StateEncryptionError(ValueError):
