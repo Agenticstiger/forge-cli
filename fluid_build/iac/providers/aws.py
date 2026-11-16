@@ -79,7 +79,14 @@ from ..packaging import (
     PackagingResolution,
     resolve_packaging,
 )
-from ..principals import AWS, principal_map, resolve_principal
+from ..principals import (
+    AWS,
+    aws_principal_account,
+    aws_principal_key,
+    aws_principal_spans,
+    principal_map,
+    resolve_principal,
+)
 from ..provider_match import is_cloud
 from ..row_access import RowFilter, row_filters_for
 from ..versions import required_providers
@@ -2853,9 +2860,17 @@ def lf_row_filters(
 
     A filter's principal resolves through ``binding.principals`` to its IAM identities;
     each read grant held by one of them carries the filter (:func:`_emit_lakeformation`
-    grants it on a data cells filter instead of the table). A filter with no read grant
-    to carry it is refused: Lake Formation would let nobody read less. So is a filter on
-    a binding that names no Glue-catalog table (a Redshift or Kinesis format, or no
+    grants it on a data cells filter instead of the table). A grant is held by an
+    identity when the two have one :func:`~fluid_build.iac.principals.aws_principal_key`
+    (another path or case is the same role), and reads with ``SELECT`` or ``ALL`` in
+    either of its lists (:func:`column_access.lf_grant_reads`).
+
+    Refused, because Lake Formation unions grants and the filtered role would read every
+    row: a filtered role's ``SELECT`` in ``permissionsWithGrantOption``; a read grant to
+    a set that may hold a filtered role (``IAM_ALLOWED_PRINCIPALS``, its account, an
+    organization or OU); two filters on one role. A filter with no read grant to carry
+    it is refused too: Lake Formation would let nobody read less. So is a filter on a
+    binding that names no Glue-catalog table (a Redshift or Kinesis format, or no
     ``location.database``), where :func:`_emit_lakeformation` writes nothing at all.
     """
     filters = row_filters_for(exposure, index)
@@ -2901,25 +2916,66 @@ def lf_row_filters(
             ("Grant the filtered principal SELECT in governance.lakeFormation.grants.",),
         )
     mapping = principal_map(binding)
-    out: Dict[int, RowFilter] = {}
+    # Matched by key, not as written: a grant may spell the filtered role another way
+    # (its path, its case), and Lake Formation unions grants, so one left on the table
+    # would read every row beside the filter.
+    by_key: Dict[str, RowFilter] = {}
     for flt in filters:
-        identities = set(resolve_principal(flt.principal, mapping, platform=AWS, where=where))
-        held = [
-            i
-            for i, g in enumerate(grants)
-            if isinstance(g, Mapping)
-            and str(g.get("principal") or "") in identities
-            and column_access.LF_READ_PERMISSIONS & set(g.get("permissions") or ())
-        ]
-        if not held:
+        for identity in resolve_principal(flt.principal, mapping, platform=AWS, where=where):
+            key = aws_principal_key(identity)
+            other = by_key.setdefault(key, flt)
+            if other is not flt:
+                raise UnsupportedBindingError(
+                    "row-filter-unenforceable",
+                    f"{where} filters {other.principal} and {flt.principal}, which both "
+                    f"resolve to {identity}; Lake Formation unions the two filters' grants, so "
+                    "that role would read the rows of either.",
+                    ("Combine the two predicates into one filter for the one role.",),
+                )
+    accounts = {a for a in map(aws_principal_account, by_key) if a}
+    out: Dict[int, RowFilter] = {}
+    for i, grant in enumerate(grants):
+        if not column_access.lf_grant_reads(grant):
+            continue
+        principal = str(grant.get("principal"))
+        at = f"governance.lakeFormation.grants[{i}]"
+        flt = by_key.get(aws_principal_key(principal))
+        if flt is None:
+            if aws_principal_spans(principal, accounts):
+                raise UnsupportedBindingError(
+                    "row-filter-unenforceable",
+                    f"{where} filters rows, but {at} lets {principal} read the table, and "
+                    "that names a set of principals that may hold a filtered role. Lake "
+                    "Formation unions grants, so the filtered role would read every row "
+                    "through it.",
+                    (
+                        "Grant each reader by its own IAM role or user ARN.",
+                        "Remove the grant, or move it to an expose with no row filter.",
+                    ),
+                )
+            continue
+        regrant = {str(p).upper() for p in grant.get("permissionsWithGrantOption") or ()}
+        if column_access.LF_READ_PERMISSIONS & regrant:
+            raise UnsupportedBindingError(
+                "row-filter-unenforceable",
+                f"{where} filters {flt.principal}, but {at} gives {principal} SELECT in "
+                "permissionsWithGrantOption. The filtered role reads through the data cells "
+                "filter, with SELECT only, and a grant option would let it grant the table, "
+                "every row, to itself or anyone.",
+                (
+                    "Remove SELECT (and ALL) from permissionsWithGrantOption.",
+                    "Grant the grant option to a principal no row filter names.",
+                ),
+            )
+        out[i] = flt
+    for flt in filters:
+        if not any(held is flt for held in out.values()):
             raise UnsupportedBindingError(
                 "row-filter-unenforceable",
                 f"{where} filters {flt.principal}, but no governance.lakeFormation grant reads "
                 "the table as it, so the filter would narrow nothing.",
                 ("Grant the principal SELECT, or remove the filter.",),
             )
-        for i in held:
-            out[i] = flt
     return out
 
 
@@ -3023,15 +3079,11 @@ def lf_masked_views(
     mapping = principal_map(binding)
 
     def resolve(principal: str) -> Tuple[str, ...]:
-        return resolve_principal(principal, mapping, platform=AWS, where=where)
+        # Compared by key: a grant may spell the role another way (its path, its case).
+        identities = resolve_principal(principal, mapping, platform=AWS, where=where)
+        return tuple(aws_principal_key(identity) for identity in identities)
 
-    readers = frozenset(
-        str(g.get("principal"))
-        for g in grants
-        if isinstance(g, Mapping)
-        and g.get("principal")
-        and column_access.LF_READ_PERMISSIONS & set(g.get("permissions") or ())
-    )
+    readers = column_access.lf_readers(grants)
     masks = column_access.column_masks(exposure, restrictions, resolve, readers, where=where)
     schema = [
         c for c in ((exposure.get("contract") or {}).get("schema") or []) if isinstance(c, Mapping)
@@ -3049,7 +3101,8 @@ def lf_masked_views(
     views: List[_LfMaskedView] = []
     for i, grant in enumerate(grants):
         principal = str(grant.get("principal") or "") if isinstance(grant, Mapping) else ""
-        mine = [c for c, (_rule, ids) in masks.items() if principal in ids]
+        key = aws_principal_key(principal)
+        mine = [c for c, (_rule, ids) in masks.items() if key in ids]
         if not mine:
             continue
         raw = _grant_raw_columns(grant, schema, exclusions.get(i)) - set(mine)
