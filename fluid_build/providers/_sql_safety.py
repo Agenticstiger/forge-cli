@@ -89,6 +89,28 @@ def quote_string_literal_for(dialect: str | None, value: str) -> str:
     return quote_string_literal(value, backslash_escapes=dialect_uses_backslash_escapes(dialect))
 
 
+#: Dialects whose quoted identifiers are ``"..."`` with ``""`` for a quote inside.
+_DOUBLE_QUOTE_IDENT_DIALECTS = frozenset({"ansi", "duckdb", "postgres", "postgresql", "snowflake"})
+
+
+def quote_identifier_for(dialect: str | None, name: str) -> str:
+    """Quote ``name`` as an identifier of ``dialect`` that reads back as exactly ``name``.
+
+    For the FLUID SQL/1 renderer, whose names are arbitrary contract column names
+    (``Net Amount``, ``order``): :func:`validate_ident` refuses those, and quoting is
+    what makes them safe. Every quote inside is doubled, so no name can end the
+    identifier early. A name with a control character is refused, and so is a
+    dialect whose identifier quoting this module does not know yet (fail closed).
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"Invalid SQL identifier: {name!r}")
+    if _CONTROL_CHARS.search(name):
+        raise ValueError(f"Invalid SQL identifier {name!r}: control characters are not permitted")
+    if (dialect or "").strip().lower() not in _DOUBLE_QUOTE_IDENT_DIALECTS:
+        raise ValueError(f"no identifier quoting for SQL dialect {dialect!r}")
+    return '"' + name.replace('"', '""') + '"'
+
+
 def quote_ansi_string_literal(value: str) -> str:
     """Quote a SQL string literal for a *standard-conforming* dialect.
 
