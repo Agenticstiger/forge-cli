@@ -114,7 +114,9 @@ def test_the_config_holds_no_credential(contract):
         registry={
             "kind": "confluent",
             "url": "https://registry.example.internal",
-            "auth": {"secretRef": "aws-sm://commerce/registry#user_info"},
+            "auth": {
+                "secretRef": "aws-sm://commerce/registry#user_info"  # pragma: allowlist secret
+            },
         },
     )
     ref = "aws-sm://commerce/registry#user_info"
@@ -196,7 +198,7 @@ def test_avro_reads_the_registry_subject_and_declares_the_schema_to_check(contra
                 "registry": {
                     "kind": "confluent",
                     "url": "http://r:8081",
-                    "auth": {"secretRef": "vault://kv/registry#pw"},
+                    "auth": {"secretRef": "vault://kv/registry#pw"},  # pragma: allowlist secret
                 },
             },
             "not vault",
@@ -271,7 +273,10 @@ def test_kafka_auth_defaults_to_none_for_brokers_and_takes_group_id_prefix(contr
     source_of(contract).pop("auth")
     source_of(contract)["groupIdPrefix"] = "forge-orders"
     source = job(contract).config["source"]
-    assert (source["auth"], source["groupIdPrefix"]) == ("none", "forge-orders")
+    assert (source["auth"], source["groupIdPrefix"]) == (
+        "none",
+        "forge-orders",
+    )  # pragma: allowlist secret
 
 
 def test_a_broker_the_operator_has_not_listed_is_refused(contract, monkeypatch):
@@ -284,7 +289,8 @@ def test_masking_needs_the_products_key(contract):
     contract["builds"][0]["properties"]["parameters"]["spark"].pop("maskKeySecretArn")
     with pytest.raises(ValueError, match="maskKeySecretArn"):
         job(contract)
-    contract["builds"][0]["properties"]["parameters"]["spark"]["maskKeySecretArn"] = "key"
+    spark = contract["builds"][0]["properties"]["parameters"]["spark"]
+    spark["maskKeySecretArn"] = "not-an-arn"  # pragma: allowlist secret
     with pytest.raises(ValueError, match="expected a secret ARN"):
         job(contract)
 
@@ -322,7 +328,7 @@ def test_the_mask_key_is_under_the_operators_secret_prefixes(contract):
     """The contract names the key's secret; without the operator's prefixes a product
     could hash with another product's key and join against that product's table."""
     environ = {
-        "FLUID_SECRET_PREFIXES": "aws-sm://arn:aws:secretsmanager:eu-west-1:000000000005:secret:other/"
+        "FLUID_SECRET_PREFIXES": "aws-sm://arn:aws:secretsmanager:eu-west-1:000000000005:secret:other/"  # pragma: allowlist secret - a reference or test vector
     }
     environ[HOST_ALLOWLIST_ENV] = "msk.example,example.internal"
     with pytest.raises(FluidUserError, match="outside the prefixes"):

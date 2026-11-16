@@ -1089,18 +1089,6 @@ class FluidSchemaManager:
                 event="contract_managed_flink",
                 pointer=message_pointer(message.removeprefix("Managed Flink: "), contract),
             )
-        # The forge Spark runner's builds: compiled to their job config, with the
-        # operator's broker, registry and secrets policy (fluid_build.spark.compiler).
-        from fluid_build.spark import compiler as spark
-
-        for message in spark.validation_errors(contract):
-            result.add_error(
-                message,
-                event="contract_spark",
-                pointer=message_pointer(message.removeprefix("Spark: "), contract),
-            )
-        for message in spark.validation_warnings(contract):
-            result.add_warning(message, event="contract_spark")
         return len(result.errors) == before
 
     def _validate_with_jsonschema(

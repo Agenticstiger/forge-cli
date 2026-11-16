@@ -67,7 +67,10 @@ def test_msk_iam_sets_the_sasl_options(runner, contract):
 def test_a_registry_credential_comes_from_the_environment(runner, monkeypatch):
     monkeypatch.setenv("REGISTRY_USER_INFO", "user:secret")  # pragma: allowlist secret
     assert runner.resolve_secret("env://REGISTRY_USER_INFO") == "user:secret"
-    registry = {"url": "http://r:8081", "auth": {"secretRef": "env://REGISTRY_USER_INFO"}}
+    registry = {
+        "url": "http://r:8081",
+        "auth": {"secretRef": "env://REGISTRY_USER_INFO"},  # pragma: allowlist secret
+    }
     assert runner.registry_conf(registry) == {
         "schema.registry.url": "http://r:8081",
         "basic.auth.credentials.source": "USER_INFO",
@@ -104,7 +107,8 @@ def test_the_reader_schema_is_fetched_by_subject_and_version(runner, monkeypatch
 
     monkeypatch.setattr(runner.urllib.request, "build_opener", build_opener)
     monkeypatch.setenv("REGISTRY_USER_INFO", "u:p")  # pragma: allowlist secret
-    registry = {"url": "http://r:8081/", "auth": {"secretRef": "env://REGISTRY_USER_INFO"}}
+    ref = "env://REGISTRY_USER_INFO"  # pragma: allowlist secret
+    registry = {"url": "http://r:8081/", "auth": {"secretRef": ref}}
     assert runner.fetch_reader_schema(registry, "a/b-value", 3) == '{"type":"record"}'
     assert seen["url"] == "http://r:8081/subjects/a%2Fb-value/versions/3"
     assert seen["auth"] == "Basic dTpw"
@@ -124,7 +128,9 @@ def test_an_aws_sm_reference_with_a_field_and_a_version(runner, monkeypatch):
         "SecretString": '{"user_info": "u:p"}'
     }
     assert runner.resolve_secret("aws-sm://commerce/registry#user_info?version=v1") == "u:p"
-    assert calls == [{"SecretId": "commerce/registry", "VersionId": "v1"}]
+    assert calls == [
+        {"SecretId": "commerce/registry", "VersionId": "v1"}  # pragma: allowlist secret
+    ]
 
 
 def test_a_batch_config_that_reads_a_topic_is_refused(runner, contract):
@@ -174,7 +180,7 @@ def test_the_runner_ships_with_the_package():
 def test_the_mask_is_hmac_sha256_under_the_key(runner):
     # RFC 4231, test case 2.
     assert runner.mask_digest(b"Jefe", b"what do ya want for nothing?") == (
-        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"  # pragma: allowlist secret - a reference or test vector
     )
 
 
