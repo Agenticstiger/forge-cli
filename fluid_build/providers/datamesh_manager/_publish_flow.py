@@ -5,7 +5,7 @@
 
 Lifted from ``providers/datamesh_manager/datamesh_manager.py`` (host
 file was 1791 LOC). ~650 LOC of access-agreements + ODCS-per-expose
-+ umbrella-contract + ``_to_data_product`` flow methods. Split as a
++ contract-hygiene + ``_to_data_product`` flow methods. Split as a
 mixin class (:class:`_PublishFlowMixin`) so existing call sites
 (``self._publish_one(...)``) keep resolving via MRO.
 """
@@ -106,6 +106,91 @@ def stale_access_cancel_body() -> Dict[str, str]:
         "endTimestamp": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "reason": "The FLUID contract no longer consumes this output port (forge-cli publish).",
     }
+
+
+_RETIRED = "retired"
+
+
+def output_port_contract_ids(product: Optional[Mapping[str, Any]]) -> List[str]:
+    """The ``outputPorts[].contractId`` values of a data product body, in order."""
+    ids: List[str] = []
+    ports = product.get("outputPorts") if isinstance(product, Mapping) else None
+    for port in ports if isinstance(ports, list) else []:
+        cid = port.get("contractId") if isinstance(port, Mapping) else None
+        if isinstance(cid, str) and cid and cid not in ids:
+            ids.append(cid)
+    return ids
+
+
+def stale_contract_candidates(
+    existing_product: Optional[Mapping[str, Any]], product_id: str, keep_ids: set
+) -> List[str]:
+    """Contract ids a publish may retire, before reading them.
+
+    Those the product's output ports named in Entropy before this publish, inside the
+    product's own ``{product_id}.`` namespace (the ids forge derives), and not named or
+    sent now; then ``product_id`` itself, where earlier forge versions published an
+    umbrella contract. A port that names a contract outside the namespace (a pinned or
+    shared one) is never forge's to retire.
+    """
+    prefix = f"{product_id}."
+    out = [
+        cid
+        for cid in output_port_contract_ids(existing_product)
+        if cid.startswith(prefix) and cid not in keep_ids
+    ]
+    if product_id not in keep_ids:
+        out.append(product_id)
+    return out
+
+
+def _is_umbrella_contract(contract: Mapping[str, Any]) -> bool:
+    props = contract.get("customProperties")
+    return any(
+        isinstance(p, Mapping)
+        and p.get("property") == "umbrella"
+        and str(p.get("value")).lower() == "true"
+        for p in (props if isinstance(props, list) else [])
+    )
+
+
+def retired_contract_body(
+    contract: Any, contract_id: str, product_id: str
+) -> Optional[Dict[str, Any]]:
+    """The body that retires ``contract`` (``status: retired``), or ``None`` to leave it.
+
+    Left alone: anything that is not a contract body, one already retired, and a
+    contract at the bare ``product_id`` that is no umbrella forge published (someone
+    else's). The rest of the body goes back unchanged, so retiring loses nothing.
+    """
+    if not isinstance(contract, Mapping) or contract.get("status") == _RETIRED:
+        return None
+    if contract_id == product_id and not _is_umbrella_contract(contract):
+        return None
+    body = dict(contract)
+    body["status"] = _RETIRED
+    return body
+
+
+def drop_unresolved_port_contract_ids(
+    product: Mapping[str, Any], sent_ids: set, exists: Any
+) -> List[str]:
+    """Remove each ``outputPorts[].contractId`` that names a contract nobody has.
+
+    A port's contract resolves when this publish sends it, or when ``exists(id)`` says
+    Entropy has it. ``exists`` returns ``True``, ``False`` (absent: the reference is
+    dropped) or ``None`` (could not tell: the reference is kept). Returns the dropped ids.
+    """
+    dropped: List[str] = []
+    ports = product.get("outputPorts")
+    for port in ports if isinstance(ports, list) else []:
+        cid = port.get("contractId") if isinstance(port, dict) else None
+        if not isinstance(cid, str) or not cid or cid in sent_ids:
+            continue
+        if exists(cid) is False:
+            del port["contractId"]
+            dropped.append(cid)
+    return dropped
 
 
 class _PublishFlowMixin:
@@ -603,174 +688,61 @@ class _PublishFlowMixin:
             "sla_properties": len(sla_properties) if isinstance(sla_properties, list) else 0,
         }
 
-    # ---- Umbrella ODCS contract (product-level resolution target) ---------
+    # ---- Contract hygiene: stale contracts, unresolved port references ---------
 
-    # ODCS v3.1.0 is the spec forge-cli targets when publishing per-expose
-    # contracts via ``OdcsProvider``. Keep the umbrella in lockstep so a
-    # future ODCS spec bump only needs to be made in one place here (the
-    # umbrella does not use ``OdcsProvider.render`` because it has no
-    # corresponding expose to extract schema from).
-    _UMBRELLA_ODCS_API_VERSION = "v3.1.0"
-
-    def _render_product_umbrella_contract(
-        self, fluid: Mapping[str, Any], product_id: str
-    ) -> Dict[str, Any]:
-        """Render a minimal ODCS v3.1.0 contract at ``{product_id}``.
-
-        Why this exists: DMM's UI renders ``inputPorts[].contractId`` as a
-        resolved link if and only if that id maps to an existing
-        ``/api/datacontracts/{id}``. forge-cli's canonical address for a
-        product's contracts is ``{product_id}.{expose_id}`` (one per expose
-        port) — there is no per-product contract by default, so any lineage
-        reference that points at just ``{product_id}`` 404s and renders as an
-        unresolved link.
-
-        The umbrella contract fills that gap: it's a thin stub that advertises
-        "the real schemas are published as one contract per expose; see
-        members" so the UI has a valid resolution target and a human landing
-        on the page understands why it's empty.
-
-        Intentional shape choices:
-          * ``schema: []`` (empty) — an umbrella does not describe a
-            queryable surface; it's a resolution pointer. A non-empty schema
-            would be a *lie* (there is no table with these columns).
-          * ``description.purpose`` names the convention explicitly so the
-            reader isn't left wondering why the contract is empty.
-          * ``customProperties`` advertises ``umbrella: true`` so downstream
-            tooling can filter umbrellas out of "list my real contracts"
-            queries.
-        """
-        metadata = fluid.get("metadata") or {}
-        product_name = metadata.get("name") or fluid.get("name") or product_id
-        product_description = metadata.get("description") or fluid.get("description") or ""
-        status = _STATUS_MAP.get(str(metadata.get("status", "active")).lower(), "active")
-        version = str(metadata.get("version") or "1.0.0")
-
-        # Enumerate member exposes so consumers landing on the umbrella can
-        # see which per-expose contracts to dereference instead. This is NOT
-        # an ODCS schema — it's a reference list carried in customProperties,
-        # which is the only free-form field the v3.1.0 spec allows.
-        member_expose_ids: List[str] = []
-        for expose in fluid.get("exposes", []) or []:
-            if not isinstance(expose, Mapping):
-                continue
-            expose_id = expose.get("exposeId") or expose.get("id")
-            if expose_id:
-                member_expose_ids.append(str(expose_id))
-
-        purpose_lines = [
-            (
-                f"Umbrella resolution contract for data product '{product_id}'. "
-                "The product's actual per-expose schemas are published as one "
-                f"ODCS contract per output port, at '{product_id}.{{exposeId}}'."
-            )
-        ]
-        if product_description:
-            purpose_lines.append(str(product_description))
-        if member_expose_ids:
-            member_list = ", ".join(f"{product_id}.{eid}" for eid in member_expose_ids)
-            purpose_lines.append(f"Member contracts: {member_list}.")
-
-        body: Dict[str, Any] = {
-            "apiVersion": self._UMBRELLA_ODCS_API_VERSION,
-            "kind": "DataContract",
-            "id": product_id,
-            "version": version,
-            "status": status,
-            "name": product_name,
-            "description": {
-                "purpose": " ".join(purpose_lines),
-                "usage": (
-                    "Reference the per-expose contracts "
-                    f"('{product_id}.{{exposeId}}') for binding schemas. "
-                    "This umbrella is a resolution target only — its schema is "
-                    "intentionally empty."
-                ),
-            },
-            "schema": [],
-            "customProperties": [
-                {"property": "umbrella", "value": True},
-                {
-                    "property": "memberContracts",
-                    "value": [f"{product_id}.{eid}" for eid in member_expose_ids],
-                },
-            ],
-        }
-
-        # Team: use the same derivation as per-expose contracts / the product
-        # itself so the umbrella lands under the same team in DMM. ODCS v3.1.0
-        # accepts ``team: { name: <id> }`` (nested object), which matches the
-        # shape DMM's per-expose contract endpoint returns. A bare string here
-        # is rejected as an unknown teamId.
+    def _read_json_or_none(self, path: str) -> tuple:
+        """``GET path`` as ``(found, body)``: ``(True, body)``, ``(False, None)`` on a 404,
+        ``(None, None)`` when it could not be read (any other error)."""
         try:
-            team_id = self._derive_team_id(fluid)
-        except Exception:  # pragma: no cover — defensive, should not happen
-            team_id = None
-        if team_id:
-            body["team"] = {"name": str(team_id)}
-
-        tags = metadata.get("tags") or fluid.get("tags")
-        if isinstance(tags, list) and tags:
-            body["tags"] = list(tags)
-
-        # NOTE: intentionally do NOT emit ``domain`` on the umbrella.
-        # DMM's ODCS validator treats certain top-level fields (e.g. bare
-        # ``domain``) as team/owner references and 422s on unknown IDs
-        # (observed: ``The owner '<domain>' is not a known team ID``).
-        # The umbrella is a resolution stub — domain metadata already lives
-        # on the data product and per-expose contracts, so adding it here
-        # provides no value and trips the validator.
-
-        return body
-
-    def _preview_product_umbrella_contract(
-        self, fluid: Mapping[str, Any], product_id: str
-    ) -> Dict[str, Any]:
-        """Dry-run preview for the umbrella contract — no HTTP calls."""
-        body = self._render_product_umbrella_contract(fluid, product_id)
-        return {
-            "method": "PUT",
-            "url": f"{self.api_url}/api/datacontracts/{product_id}",
-            "payload": body,
-            "umbrella": True,
-        }
-
-    def _publish_product_umbrella_contract(
-        self, fluid: Mapping[str, Any], product_id: str
-    ) -> Dict[str, Any]:
-        """PUT the umbrella ODCS stub at ``/api/datacontracts/{product_id}``.
-
-        Returns a result dict with ``success``, ``contract_id``, and either
-        ``status_code`` (on success) or ``error`` / ``error_type`` (on
-        failure). A failure here is logged but does NOT propagate — a missing
-        umbrella just means product-level lineage links render unresolved in
-        the UI (pre-umbrella behavior), which is strictly no worse than
-        skipping the call.
-        """
-        body = self._render_product_umbrella_contract(fluid, product_id)
-        try:
-            resp = self._request("PUT", f"/api/datacontracts/{product_id}", json_body=body)
-            self._log.info("Published umbrella contract %s (HTTP %s)", product_id, resp.status_code)
-            return {
-                "contract_id": product_id,
-                "success": True,
-                "status_code": resp.status_code,
-                "url": f"{self.api_url}/datacontracts/{product_id}",
-                "umbrella": True,
-            }
+            resp = self._request("GET", path)
         except ProviderError as exc:
-            self._log.warning(
-                "Failed to publish umbrella contract %s (non-fatal): %s",
-                product_id,
-                exc,
-            )
-            return {
-                "contract_id": product_id,
-                "success": False,
-                "error": str(exc),
-                "error_type": "UMBRELLA_PUT_FAILED",
-                "umbrella": True,
-            }
+            if "API error 404 on" in str(exc):
+                return False, None
+            self._log.warning("Could not read %s: %s", path, exc)
+            return None, None
+        try:
+            return True, resp.json()
+        except Exception as exc:  # noqa: BLE001 — a body we cannot read is "could not tell"
+            self._log.warning("Could not read %s: %s", path, exc)
+            return None, None
+
+    def _contract_exists(self, contract_id: str) -> Optional[bool]:
+        found, _ = self._read_json_or_none(f"/api/datacontracts/{quote(contract_id, safe='')}")
+        return found
+
+    def _existing_product(self, product_id: str) -> Optional[Dict[str, Any]]:
+        """The product as Entropy holds it before this publish, or ``None``."""
+        found, body = self._read_json_or_none(f"/api/dataproducts/{quote(product_id, safe='')}")
+        return body if found and isinstance(body, dict) else None
+
+    def _retire_stale_contracts(
+        self,
+        product_id: str,
+        existing_product: Optional[Mapping[str, Any]],
+        keep_ids: set,
+    ) -> List[str]:
+        """Re-PUT each contract the product no longer names with ``status: retired``.
+
+        Never deleted: a consumer that still reads it sees the contract was retired,
+        and its history stays. See :func:`stale_contract_candidates` for which
+        contracts are forge's to retire. Best effort: a failure logs a warning and
+        the publish still succeeds.
+        """
+        retired: List[str] = []
+        for contract_id in stale_contract_candidates(existing_product, product_id, keep_ids):
+            path = f"/api/datacontracts/{quote(contract_id, safe='')}"
+            found, current = self._read_json_or_none(path)
+            body = retired_contract_body(current, contract_id, product_id) if found else None
+            if body is None:
+                continue
+            try:
+                self._request("PUT", path, json_body=body)
+            except ProviderError as exc:
+                self._log.warning("Could not retire stale contract %s: %s", contract_id, exc)
+                continue
+            self._log.info("Retired contract %s: no output port names it any more", contract_id)
+            retired.append(contract_id)
+        return retired
 
     # ---- mapping: FLUID -> Entropy Data Product ----------------------------
 

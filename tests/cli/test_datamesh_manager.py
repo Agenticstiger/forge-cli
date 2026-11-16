@@ -1720,9 +1720,13 @@ class TestDataContractIdWiring:
         )
         # The data product PUT should have dataContractId on output ports
         # dataContractId format is {product_id}.{expose_id}
-        dp_call = mock_request.call_args_list[0]
-        dp_body = dp_call[1]["json_body"]
         product_id = RICH_CONTRACT["id"]
+        dp_call = next(
+            c
+            for c in mock_request.call_args_list
+            if c[0][:2] == ("PUT", f"/api/dataproducts/{product_id}")
+        )
+        dp_body = dp_call[1]["json_body"]
         for port in dp_body.get("outputPorts", []):
             expose_id = port.get("id") or port.get("name")
             assert port["dataContractId"] == f"{product_id}.{expose_id}"
