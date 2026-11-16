@@ -76,9 +76,6 @@ DATABASE_SCHEMES: Mapping[str, str] = {
     "sqlite": "sqlite",
 }
 
-#: Rows fetched from DuckDB per round trip.
-_BATCH = 8192
-
 #: The DuckDB column types that can hold +-infinity, which the driver would read as
 #: the largest or smallest date it has.
 _MAY_BE_INFINITE = frozenset(
@@ -364,7 +361,12 @@ def _fetch(
     subject: str,
     uri: Optional[str] = None,
 ) -> Tuple[int, Dict[str, List[Any]]]:
-    """Read *columns* of *relation* (already quoted SQL) whole, batch by batch."""
+    """Read *columns* of *relation* (already quoted SQL) whole, in one read.
+
+    One ``fetchall()``, never ``fetchmany()``: on DuckDB 2.0 a result read only
+    partway keeps its connection busy (``providers/_duckdb_compat.first_row``).
+    Every value is held in memory to be measured anyway.
+    """
     try:
         described = con.execute(f"DESCRIBE SELECT * FROM {relation}").fetchall()
     except Exception as exc:  # noqa: BLE001 - every DuckDB failure is reported
@@ -379,23 +381,18 @@ def _fetch(
     infinite = [name for name in columns if types[name] in _MAY_BE_INFINITE]
     selected += [f"isinf({_quote_ident(name)})" for name in infinite]
     values: Dict[str, List[Any]] = {name: [] for name in columns}
-    rows = 0
     try:
-        cursor = con.execute(f"SELECT {', '.join(selected)} FROM {relation}")
-        while True:
-            batch = cursor.fetchmany(_BATCH)
-            if not batch:
-                break
-            for record in batch:
-                for name, flag in zip(infinite, record[len(columns) :], strict=True):
-                    if flag:
-                        raise SourceError(
-                            f"column {name!r} holds an infinite date or timestamp, "
-                            "which FLUX cannot read"
-                        )
-                for name, item in zip(columns, record[: len(columns)], strict=True):
-                    values[name].append(_wire(item))
-            rows += len(batch)
+        records = con.execute(f"SELECT {', '.join(selected)} FROM {relation}").fetchall()
+        rows = len(records)
+        for record in records:
+            for name, flag in zip(infinite, record[len(columns) :], strict=True):
+                if flag:
+                    raise SourceError(
+                        f"column {name!r} holds an infinite date or timestamp, "
+                        "which FLUX cannot read"
+                    )
+            for name, item in zip(columns, record[: len(columns)], strict=True):
+                values[name].append(_wire(item))
     except SourceError:
         raise
     except Exception as exc:  # noqa: BLE001 - every DuckDB failure is reported, none quoted
