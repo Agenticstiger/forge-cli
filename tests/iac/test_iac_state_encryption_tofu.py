@@ -210,6 +210,23 @@ def test_encrypted_state_without_the_key_or_with_another_is_explained(
     assert error is not None and error.event == "opentofu_state_decrypt_failed"
 
 
+def test_fluid_diff_reads_encrypted_state_only_with_its_key(tmp_path: Path, canary: str) -> None:
+    """``fluid diff`` / ``verify --state-drift`` take the apply's environment and module."""
+    from fluid_build.cli._diff_state import _plan_and_classify
+    from fluid_build.iac import drift as state_drift
+
+    workdir = tmp_path / "work"
+    assert _run(_BuiltinOnlyPlugin(), _target(workdir, SPEC)).ok
+
+    keyless = _plan_and_classify(_BuiltinOnlyPlugin(), _CONTRACT, _target(workdir), _LOG)
+    assert keyless.status == state_drift.ERROR
+    assert "FLUID_STATE_ENCRYPTION is not set" in (keyless.detail or "")
+
+    keyed = _plan_and_classify(_BuiltinOnlyPlugin(), _CONTRACT, _target(workdir, SPEC), _LOG)
+    assert keyed.status != state_drift.ERROR, keyed.detail
+    assert _hits(workdir, canary) == []
+
+
 #: What tofu says when it cannot decode a key provider block (measured on 1.13.1
 #: with a misspelt attribute), as against failing to reach the key it names.
 _DECODE_ERRORS = (

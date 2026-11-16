@@ -252,7 +252,9 @@ def _plan_and_classify(
         if plan.returncode not in (0, runner.PLAN_HAS_CHANGES):
             encrypted = _encryption_failure((plan.stdout or "") + (plan.stderr or ""))
             if encrypted is not None:
-                return _error(_cli_error_text(encrypted), location)
+                # What happened, then the first fix (the migration only an apply can run).
+                fix = (getattr(encrypted, "suggestions", None) or [""])[0]
+                return _error(f"{_cli_error_text(encrypted)} {fix}".strip(), location)
             return _error(
                 "the refresh plan failed: " + _tail(plan.stderr or plan.stdout, _MAX_DETAIL_CHARS),
                 location,
