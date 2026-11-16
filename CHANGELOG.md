@@ -29,7 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and one OIDC login per platform: `aws-actions/configure-aws-credentials` v6.3.0 and
   `google-github-actions/auth` v3.0.0 (pinned by SHA), Snowflake workload identity federation
   from the job's ID token in a mode-600 file, Databricks `github-oidc`, and an OpenBao JWT login
-  (`FLUID_VAULT_JWT_FILE`). GitLab gets `id_tokens` per platform. The header lists the
+  (`FLUID_VAULT_JWT_FILE`). GitHub's ID tokens last about five minutes, so the token file is
+  refreshed every four for the job's later steps, and the logins skip fork and Dependabot pull
+  requests, which get no ID token. GitLab gets `id_tokens` per platform. The header lists the
   non-secret variables and the cloud-side trust to create, bound to GitHub's immutable subject
   (`repo:OWNER@OWNER-ID/REPO@REPO-ID:...`, the default for repositories created after
   2026-07-15). Jenkins has no native OIDC and says it stays on credentials binding. No

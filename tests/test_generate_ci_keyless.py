@@ -20,6 +20,8 @@ import argparse
 import json
 import logging
 import os
+import subprocess
+import time
 from pathlib import Path
 from typing import Dict
 
@@ -28,7 +30,7 @@ import yaml
 
 from fluid_build.cli.generate_ci import _contract_cloud_auth
 from fluid_build.cli.generate_ci import run as generate_ci_run
-from fluid_build.forge.core.pipeline_systems import PipelineConfig, PipelineProvider
+from fluid_build.forge.core.pipeline_systems import PipelineConfig, PipelineProvider, _keyless
 from fluid_build.forge.core.pipeline_systems._base import PINNED_ACTIONS, PipelineComplexity
 from fluid_build.forge.core.pipeline_systems.github_actions import GitHubActionsTemplate
 from fluid_build.forge.core.pipeline_systems.gitlab_ci import GitLabCITemplate
@@ -253,12 +255,66 @@ def test_github_snowflake_step_is_wif_from_a_masked_token_file(tmp_path, monkeyp
     assert "ACTIONS_ID_TOKEN_REQUEST_URL" in run and "ACTIONS_ID_TOKEN_REQUEST_TOKEN" in run
     assert "jq" not in run
     assert "::add-mask::" in run
-    assert 'chmod 600 "$token_file"' in run and "$RUNNER_TEMP" in run
+    # Written under umask 077 and swapped in whole, so the file is 0600 and never half-written.
+    assert "umask 077" in run and "$RUNNER_TEMP" in run
+    assert 'mv -f "$token_file.new" "$token_file"' in run
+    # GitHub ID tokens last about five minutes: a background loop re-mints the file,
+    # and a refresh that gets no token keeps the last one.
+    assert "( while sleep 240; do mint || true; done ) >/dev/null 2>&1 &" in run
+    assert '[ -n "$token" ] || return 1' in run
+    # A fork or Dependabot pull request gets no ID token: the step is skipped there.
+    assert step["if"] == _keyless.GITHUB_HAS_ID_TOKEN
+    assert subprocess.run(["bash", "-n"], input=run, text=True).returncode == 0
     assert "SNOWFLAKE_AUTHENTICATOR=WORKLOAD_IDENTITY" in run
     assert "SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER=OIDC" in run
     assert "SNOWFLAKE_TOKEN_FILE_PATH=$token_file" in run
     # The token is never written to the environment (only its file path is).
     assert "SNOWFLAKE_TOKEN=" not in run
+
+
+def test_the_github_token_script_keeps_the_last_token_when_a_refresh_fails(tmp_path, monkeypatch):
+    """The generated step, run with stand-ins for curl and sleep: the first token is
+    written 0600 and masked, the one refresh gets no token, and the file keeps it."""
+    files = _cloud_files(tmp_path, monkeypatch, "github", "standard")
+    wf = _workflow(files, ".github/workflows/fluid-standard.yml")
+    step = next(s for s in wf["jobs"]["deploy-dev"]["steps"] if "Snowflake" in s.get("name", ""))
+    fakes, state, runner_temp = (tmp_path / name for name in ("bin", "state", "runner"))
+    for directory in (fakes, state, runner_temp):
+        directory.mkdir()
+    # curl answers once, then fails; sleep lets one refresh through, then ends the loop.
+    stand_ins = {
+        "curl": 'n=$(cat "$STATE/curl" 2>/dev/null || echo 0); echo $((n + 1)) > "$STATE/curl"\n'
+        '[ "$n" = 0 ] && echo \'{"value": "id-token-1"}\' && exit 0\nexit 22\n',
+        "sleep": 'n=$(cat "$STATE/sleep" 2>/dev/null || echo 0); echo $((n + 1)) > "$STATE/sleep"\n'
+        '[ "$n" = 0 ] && exit 0\ntouch "$STATE/done"\nexit 1\n',
+    }
+    for name, body in stand_ins.items():
+        (fakes / name).write_text("#!/bin/bash\n" + body, encoding="utf-8")
+        (fakes / name).chmod(0o755)
+    env = {
+        "PATH": f"{fakes}{os.pathsep}{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "STATE": str(state),
+        "RUNNER_TEMP": str(runner_temp),
+        "GITHUB_ENV": str(tmp_path / "github_env"),
+        "ACTIONS_ID_TOKEN_REQUEST_URL": "https://token.invalid/?api-version=2.0",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "request-token",  # pragma: allowlist secret
+    }
+    result = subprocess.run(
+        ["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    assert "::add-mask::id-token-1" in result.stdout
+    deadline = time.monotonic() + 10
+    while not (state / "done").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert (state / "done").exists(), "the refresh loop never ran"
+    assert (state / "curl").read_text(encoding="utf-8").strip() == "2"  # the refresh asked
+    token_file = runner_temp / "snowflake-id-token"
+    assert token_file.read_text(encoding="utf-8") == "id-token-1"
+    assert token_file.stat().st_mode & 0o777 == 0o600
+    exported = (tmp_path / "github_env").read_text(encoding="utf-8")
+    assert f"SNOWFLAKE_TOKEN_FILE_PATH={token_file}" in exported
 
 
 def test_github_openbao_step_uses_the_audience_variable(tmp_path, monkeypatch):
@@ -267,7 +323,8 @@ def test_github_openbao_step_uses_the_audience_variable(tmp_path, monkeypatch):
     step = next(s for s in wf["jobs"]["deploy-dev"]["steps"] if "OpenBao" in s.get("name", ""))
     assert step["env"] == {"OIDC_AUDIENCE": "${{ vars.OPENBAO_JWT_AUDIENCE }}"}
     assert "FLUID_VAULT_JWT_FILE=$token_file" in step["run"]
-    assert "::add-mask::" in step["run"] and "chmod 600" in step["run"]
+    assert "::add-mask::" in step["run"] and "umask 077" in step["run"]
+    assert step["if"] == _keyless.GITHUB_HAS_ID_TOKEN
 
 
 def test_github_banner_carries_the_cloud_side_and_the_immutable_subject(tmp_path, monkeypatch):

@@ -232,10 +232,19 @@ def _github_token_script(file_name: str, audience: str, exports: List[str]) -> "
         "set -euo pipefail",
         "umask 077",
         f'token_file="$RUNNER_TEMP/{file_name}"',
-        f'token="$({fetch} | {extract})"',
-        'echo "::add-mask::$token"',
-        'printf \'%s\' "$token" > "$token_file"',
-        'chmod 600 "$token_file"',
+        "mint() {",
+        f'  token="$({fetch} | {extract})"',
+        '  [ -n "$token" ] || return 1',
+        '  echo "::add-mask::$token"',
+        '  printf \'%s\' "$token" > "$token_file.new" && mv -f "$token_file.new" "$token_file"',
+        "}",
+        "mint",
+        "# GitHub's ID tokens expire after about five minutes and the request URL stays",
+        "# valid for the whole job, so a fresh one replaces the file every four minutes",
+        "# for the later steps that read it (GitHub ends the loop with the job). A failed",
+        "# refresh keeps the last token. Only the first token is masked in the log, so",
+        "# no step should print this file.",
+        "( while sleep 240; do mint || true; done ) >/dev/null 2>&1 &",
         "{",
         *[f"  {line}" for line in exports],
         '} >> "$GITHUB_ENV"',
@@ -243,9 +252,17 @@ def _github_token_script(file_name: str, audience: str, exports: List[str]) -> "
     return LiteralStr("\n".join(lines) + "\n")
 
 
+#: GitHub gives a pull request from a fork, or from Dependabot, no ID token, so the
+#: login steps are skipped there instead of failing the job before validate runs.
+GITHUB_HAS_ID_TOKEN = (
+    "github.event.pull_request.head.repo.fork != true && github.actor != 'dependabot[bot]'"
+)
+
+
 def github_auth_steps(cloud_auth: Sequence[str], pin: Any) -> List[Dict[str, Any]]:
     """Steps that authenticate a job to every detected platform. ``pin`` is
-    ``_pin_action``: every action is referenced by commit SHA."""
+    ``_pin_action``: every action is referenced by commit SHA. Each runs only where
+    GitHub hands out an ID token (:data:`GITHUB_HAS_ID_TOKEN`)."""
     platforms = normalize(cloud_auth)
     steps: List[Dict[str, Any]] = []
     if "aws" in platforms:
@@ -304,6 +321,8 @@ def github_auth_steps(cloud_auth: Sequence[str], pin: Any) -> List[Dict[str, Any
                 ),
             }
         )
+    for step in steps:
+        step["if"] = GITHUB_HAS_ID_TOKEN
     return steps
 
 
