@@ -424,7 +424,7 @@ flux-expr/2 is spelled in SQL (maintainers' decision, 2026-11-16, in Agenticstig
 | a column name `c` | the explicit path `row.c`, so a column named `row`, `link`, `previous` or `children`, or one that shares a relationship's name, needs no rule of its own; a quoted name that flux-expr/2's identifiers cannot spell is a FLUX refusal until flux-expr/2 can quote it |
 | `rel.col` | `link.<rel>.col`, always through the `link` root (EXPR-SPEC-2 §5), so a relationship named `row`, `link`, `previous` or `children`, or one that shares a column's name, still reads the linked row |
 | `derive: c` with `expr: e` | a rule `c == e` with `determines: c` |
-| `derive: c` with `aggregate` | a rule `c == coalesce(<function>(children.<from>.<via>, if(<filter>, <column>, null)), <ifNone>)` with `determines: c`; `count` with a filter is `count(children.<from>.<via>, <filter>)` |
+| `derive: c` with `aggregate` | a rule `c == <function>(children.<from>.<via>, <column>)` with `determines: c`. With a `filter`, the column becomes `if(<filter>, <column>, null)`, and `count` with a filter is `count(children.<from>.<via>, <filter>)`. Only with an `ifNone` is the summary wrapped in `coalesce(..., <ifNone>)`; without one, SQL's rules apply (§1.2) |
 | `check` | a rule without `determines`; a FLUX extension may name the column that a bounds or difference form determines |
 | `dependency` | a dependency `{from, to, bothWays}` |
 | a share (§1.4) | the band itself for the check; `share` and `tolerance` only as the generator's target (§1.4) |
