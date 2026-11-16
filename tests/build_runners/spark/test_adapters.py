@@ -9,9 +9,11 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 
-import boto3
 import pytest
-from botocore.stub import Stubber
+
+# boto3 is the [aws] extra: a lane without it skips the request-shape tests.
+boto3 = pytest.importorskip("boto3")
+Stubber = pytest.importorskip("botocore.stub").Stubber
 
 from fluid_build.build_runners.spark import _adapters as ad
 from tests.build_runners.spark.conftest import variant

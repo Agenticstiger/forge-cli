@@ -8,7 +8,9 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
-from botocore.exceptions import ClientError
+
+# botocore comes with boto3, the [aws] extra; the reconcile uses its ClientError shape.
+ClientError = pytest.importorskip("botocore.exceptions").ClientError
 
 from fluid_build.build_runners.spark import _reconcile as rc
 from fluid_build.build_runners.spark._adapters import RunInfo

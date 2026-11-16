@@ -129,6 +129,7 @@ def test_a_plan_does_not_apply_the_operators_gates_and_matches_the_gated_apply(
 
 
 def test_an_undeclared_region_is_resolved_when_the_run_starts(contract, monkeypatch):
+    pytest.importorskip("boto3")
     from fluid_build.build_runners.spark import _adapters, _desired
 
     del contract["exposes"][0]["binding"]["location"]["region"]
