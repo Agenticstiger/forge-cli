@@ -379,6 +379,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Data Mesh Manager / Entropy Data lineage was missing or stale.** Both publish paths
+  (`fluid publish --target datamesh-manager` and `fluid datamesh-manager publish`) stripped
+  every `consumes[]` input port from the ODPS product and left product-to-product lineage to
+  Access agreements, which stay `requested` across teams, so a cross-team consume drew no edge.
+  Each consume is now an ODPS input port naming the upstream contract, which Entropy draws an
+  edge from. A build source's input port now carries `customProperties[sourceSystemId]` and
+  `[type]`, the only shape Entropy links a SourceSystem by; every source-aligned product used to
+  land with its SourceSystem node and no edge to it. Agreements forge made for consumes a
+  contract no longer has are cancelled on publish (they kept drawing the edge). Checked
+  edge for edge against Entropy Data Community Edition.
 - **`fluid forge data-model` gave every expose the foreign entity of every relationship.** In
   the one-expose-per-dataset shape, the target of a relationship got a foreign entity on its own
   key, and the other exposes one on a column they do not have, and `fluid generate

@@ -578,6 +578,11 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             )
             if access_previews:
                 result["access_agreements"] = access_previews
+            # A dry run makes no call, so it cannot list them; say that it would.
+            result["stale_access_agreements"] = (
+                "On publish, Access agreements forge made earlier for consumes this "
+                "contract no longer has are cancelled (POST /api/access/{id}/cancel)."
+            )
             if is_odps_payload:
                 result["odps_lineage_mode"] = lineage_mode
             # Also preview per-expose ODCS contracts so the caller can inspect them

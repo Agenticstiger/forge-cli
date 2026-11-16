@@ -802,10 +802,18 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         :func:`~fluid_build.providers.datamesh_manager._odps_helpers.promote_input_port_native_source_system_fields`.
         """
         from fluid_build.providers.datamesh_manager._odps_helpers import (
+            ensure_odps_input_port_source_system_custom_property,
             promote_input_port_native_source_system_fields,
         )
 
-        promote_input_port_native_source_system_fields(odps_payload, payload.contract or {})
+        contract = payload.contract or {}
+        # A legacy ``consumes[].sourceSystem`` gets its ``sourceSystem`` label
+        # first, as the native provider's default mode does, so the
+        # SourceSystem ``_ensure_source_systems`` upserts for it is linked too.
+        ensure_odps_input_port_source_system_custom_property(
+            odps_payload, contract, default_from_reference=False
+        )
+        promote_input_port_native_source_system_fields(odps_payload, contract)
 
     # ── Access agreements — product-to-product lineage in DMM ────────
 
@@ -980,22 +988,18 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                     )
 
 
-# Access-agreement ids must be URL-safe (DMM routes by id). Slug rule
-# matches the legacy provider's: alphanumeric + dot/dash/underscore.
-_ACCESS_ID_UNSAFE = __import__("re").compile(r"[^A-Za-z0-9._-]")
-
-
 def _slug_access_id(consumer: str, provider: str, output_port: str) -> str:
-    # The slug uses ``__uses__`` to match the native provider's
-    # ``_access_agreement_id`` format (see
-    # ``providers/datamesh_manager/_publish_flow.py``). Previously the
-    # registrar slugged with ``__consumes__`` — different access IDs in
-    # DMM for the same conceptual edge, so a contract re-published through
-    # the registrar would create a parallel access record next to the
-    # native provider's existing one, and DMM could end up with two
-    # competing approval states for one upstream→downstream lineage edge.
-    raw = f"{consumer}__uses__{provider}__{output_port}"
-    return _ACCESS_ID_UNSAFE.sub("_", raw).strip("_")
+    """The Access-agreement id for one consume edge: the native provider's own.
+
+    Both publish paths cancel the forge agreements whose ids the current publish
+    did not mint, so they must mint the same id for the same edge. The registrar
+    used to slug with its own rule, per character and without ``~``, which
+    differed from the native one (runs collapsed, ``~`` kept) for an id holding
+    either.
+    """
+    from fluid_build.providers.datamesh_manager._publish_flow import _PublishFlowMixin
+
+    return _PublishFlowMixin._access_agreement_id(consumer, provider, output_port)
 
 
 class _HttpStatusError(Exception):

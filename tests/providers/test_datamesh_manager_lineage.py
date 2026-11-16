@@ -195,7 +195,12 @@ class TestRegistrarLineage:
         # An endTimestamp of now ends it immediately; without one Entropy keeps
         # the edge until the end of the day.
         body = json.loads(cancel.calls[0].request.content)
-        assert body["endTimestamp"].endswith("Z") and body["reason"]
+        assert body["reason"]
+        # Backdated, so a server clock behind ours still reads it as the past.
+        from datetime import datetime, timedelta, timezone
+
+        end = datetime.strptime(body["endTimestamp"], "%Y-%m-%dT%H:%M:%SZ")
+        assert end.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc) - timedelta(minutes=5)
         assert "dmm://access/gold.sales.kpis__uses__bronze.old__x?cancelled=stale" in (
             result.metadata["access_urns"]
         )
@@ -292,3 +297,52 @@ def test_both_paths_send_the_same_input_ports():
         _, registrar_product, _ = _registrar_publish(_cdp())
     _, native_product, _ = _native_publish(_cdp())
     assert registrar_product.get("inputPorts") == native_product.get("inputPorts")
+
+
+def test_two_upstreams_sharing_an_expose_id_keep_their_own_contracts():
+    """The ODPS export renames the second port (``<tail>__customers``); the
+    native publish's contract-id backfill matched ports by bare exposeId, so the
+    first port took the second upstream's pinned contract and the first
+    upstream vanished from the lineage."""
+    contract = _cdp()
+    contract["consumes"] = [
+        {"productId": "silver.b1", "exposeId": "customers", "contractId": "c.b1"},
+        {"productId": "silver.b2", "exposeId": "customers", "contractId": "c.b2"},
+    ]
+    _, product, _ = _native_publish(contract)
+    assert sorted(p["contractId"] for p in product["inputPorts"]) == ["c.b1", "c.b2"]
+
+
+def test_both_paths_mint_the_same_access_id():
+    """The reconcile cancels any forge agreement whose id the current publish
+    did not mint, so the two doors must spell one edge the same way."""
+    from fluid_build.build_runners.catalog_registrars.datamesh_manager import _slug_access_id
+
+    for args in (("gold.x", "silver.a", "cust-1"), ("gold.x", "silver/a", "c  d~e")):
+        assert _slug_access_id(*args) == DataMeshManagerProvider._access_agreement_id(*args)
+
+
+def test_both_paths_link_a_legacy_consume_source_system_the_same_way():
+    """A ``consumes[].sourceSystem`` (outside the 0.7.7 schema, still accepted)
+    gets its SourceSystem upserted on both paths, so both must link it."""
+    contract = _sdp()
+    contract["consumes"] = [
+        {"productId": "silver.crm.core", "exposeId": "accounts", "sourceSystem": "salesforce"}
+    ]
+    with respx.mock:
+        _, registrar_product, _ = _registrar_publish(contract)
+    _, native_product, _ = _native_publish(contract)
+    assert registrar_product["inputPorts"] == native_product["inputPorts"]
+    linked = {p["name"]: _custom(p).get("sourceSystemId") for p in registrar_product["inputPorts"]}
+    assert linked == {"accounts": "salesforce", "page_views": "kafka-clickstream"}
+
+
+def test_a_rejected_or_cancelled_agreement_is_not_cancelled_again():
+    from fluid_build.providers.datamesh_manager._publish_flow import stale_access_agreement_ids
+
+    existing = [
+        _access("a", "p", status="rejected", active=None),
+        _access("b", "p", status="cancelled"),
+        _access("c", "p", status="requested"),
+    ]
+    assert stale_access_agreement_ids(existing, "p", set()) == ["c"]

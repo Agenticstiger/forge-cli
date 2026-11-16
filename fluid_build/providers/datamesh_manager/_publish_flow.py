@@ -16,7 +16,7 @@ import json
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import quote
 
@@ -46,6 +46,12 @@ _ACCESS_PAGE_SIZE = 10000
 # only ever touches its own.
 _FORGE_ACCESS_MARKER = {"managedBy": "forge-cli", "source": "fluid.consumes"}
 
+# How far a stale agreement's end is backdated; see ``stale_access_cancel_body``.
+_CANCEL_CLOCK_MARGIN = timedelta(minutes=10)
+
+# Agreement states with nothing left to cancel.
+_ENDED_ACCESS = frozenset({"cancelled", "rejected"})
+
 
 def stale_access_agreement_ids(
     existing: Any, consumer_product_id: str, keep_ids: set[str]
@@ -54,9 +60,9 @@ def stale_access_agreement_ids(
 
     ``existing`` is a ``GET /api/access`` body. An agreement qualifies only when
     forge made it (``custom`` carries :data:`_FORGE_ACCESS_MARKER`), its consumer
-    is this product, and it is still active (``info.active`` is not ``False``):
-    an agreement a person made, or one already ended, is left alone. Shared by
-    both publish paths.
+    is this product, and it has not ended (``info.active`` is not ``False`` and
+    ``info.status`` is not ``cancelled`` or ``rejected``): an agreement a person
+    made, or one already over, is left alone. Shared by both publish paths.
     """
     stale: List[str] = []
     for agreement in existing if isinstance(existing, list) else []:
@@ -73,7 +79,10 @@ def stale_access_agreement_ids(
             or any(custom.get(k) != v for k, v in _FORGE_ACCESS_MARKER.items())
             or not isinstance(consumer, Mapping)
             or consumer.get("dataProductId") != consumer_product_id
-            or (isinstance(info, Mapping) and info.get("active") is False)
+            or (
+                isinstance(info, Mapping)
+                and (info.get("active") is False or info.get("status") in _ENDED_ACCESS)
+            )
         ):
             continue
         stale.append(str(access_id))
@@ -84,12 +93,17 @@ def stale_access_cancel_body() -> Dict[str, str]:
     """The ``POST /api/access/{id}/cancel`` body that ends an agreement now.
 
     Without ``endTimestamp`` Entropy ends it after the data contract's notice
-    period, or at the end of today, and the edge stays drawn until then; an
-    ``endTimestamp`` that is not in the future deactivates it immediately. The
+    period, or at the end of today, and the edge stays drawn until then. An
+    ``endTimestamp`` not in the server's future deactivates it immediately; one
+    even a second in its future leaves it active until Entropy's own sweep, and
+    a later cancel cannot move that end earlier. So the end is backdated by
+    :data:`_CANCEL_CLOCK_MARGIN`, which absorbs clock skew between this machine
+    and the server (Entropy accepts an end before the agreement's start). The
     reason lands in Entropy's audit trail as ``info.terminationReason``.
     """
+    end = datetime.now(timezone.utc) - _CANCEL_CLOCK_MARGIN
     return {
-        "endTimestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "endTimestamp": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "reason": "The FLUID contract no longer consumes this output port (forge-cli publish).",
     }
 

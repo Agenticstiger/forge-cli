@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Mapping, Optional
 
+from fluid_build.providers.odps_standard.mappers.ports import input_port_contract_id
 from fluid_build.util.contract import (
     builds_to_canonical_input_ports,
     consumes_to_canonical_ports,
@@ -177,12 +178,21 @@ def ensure_odps_input_port_contract_ids(
       ``{productId}.{exposeId}`` address.
     * **Promote** — port already has a ``contractId`` but it's just
       the upstream product reference; rewrite to expose-level form.
+
+    A port already carrying the id the ODPS export derives for one of the
+    consumes is left alone. Matching is by bare exposeId, and two upstreams
+    sharing one (``silver.b1`` and ``silver.b2`` both exposing ``customers``)
+    collapse to one key: the export renames the second port, and the first
+    port used to be overwritten with the second upstream's contract.
     """
     input_ports = odps_payload.get("inputPorts")
     if not isinstance(input_ports, list) or not input_ports:
         return
 
     canonical_ports = consumes_to_canonical_ports(fluid, logger=LOG)
+    derived_contract_ids = {
+        str(cid) for cid in (input_port_contract_id(c) for c in canonical_ports) if cid
+    }
     explicit_contract_ids: Dict[str, str] = {}
     promoted_contract_ids: Dict[str, str] = {}
     product_references: Dict[str, str] = {}
@@ -211,6 +221,8 @@ def ensure_odps_input_port_contract_ids(
         port_id = str(port_id)
 
         existing = port.get("contractId")
+        if existing and str(existing) in derived_contract_ids:
+            continue
 
         explicit = explicit_contract_ids.get(port_id)
         if explicit:
