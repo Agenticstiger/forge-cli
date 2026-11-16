@@ -421,22 +421,26 @@ def _dq_rule_to_quality(rule: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any
 
 
 def _dq_threshold(rule: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
-    """The rule's ODCS comparison, or ``(None, reason)`` when its threshold is not a share.
+    """The rule's ODCS comparison, or ``(None, reason)`` when ODCS cannot say the same thing.
 
     The comparison is exactly one operator key, plus ``unit`` when it is a share. FLUID's
     ``threshold`` for completeness, uniqueness and valid_values is the share of rows that PASS,
-    from 0 to 1, compared with ``operator`` (default ``>=``), as ``util/dq_checks.py`` reads it
-    for ``fluid test``: ``1.0`` with ``>=`` means every row. The ODCS metrics these map to
-    (``nullValues``, ``duplicateValues``, ``invalidValues``) count the BAD rows, so copying the
-    threshold across would invert the rule. Instead:
+    a number from 0 to 1 compared with ``operator`` (default ``>=``), as ``util/dq_checks.py``
+    reads it for ``fluid test``: ``1.0`` with ``>=`` means every row. The ODCS metrics these map
+    to (``nullValues``, ``duplicateValues``, ``invalidValues``) count the BAD rows, so copying
+    the threshold across inverted the rule. Instead, as the SodaCL exporter does:
 
-    * no threshold, or ``1.0`` with ``>=``/``==``: ``mustBe: 0``, a count of bad rows;
-    * a share: the comparison is mirrored onto the bad share, as a percentage
-      (``>= 0.95`` -> ``mustBeLessOrEqualTo: 5`` with ``unit: percent``), the same arithmetic
-      the SodaCL exporter does;
-    * a threshold that is not a finite number from 0 to 1, or an operator FLUID does not have:
-      not exported, the same rules ``fluid test`` refuses.
+    * no threshold, or ``1.0`` with ``>=``/``==``: ``mustBe: 0``, no bad rows;
+    * completeness: the comparison is mirrored onto the null share of all rows, as a
+      percentage (``>= 0.95`` -> ``mustBeLessOrEqualTo: 5`` with ``unit: percent``);
+    * valid_values: ``mustBe: 0`` whatever the threshold, because ``fluid test`` checks every
+      value of a valid_values rule (its share is over non-null values, ODCS's over all rows);
+    * uniqueness with a partial share: not exported. FLUID's share is distinct over non-null
+      values, which no ODCS ``duplicateValues`` percent equals;
+    * a threshold that is not a number from 0 to 1, or an operator FLUID does not have: not
+      exported.
     """
+    rule_type = rule.get("type")
     threshold = rule.get("threshold")
     op = str(rule.get("operator") or ">=").strip()
     mirrored = _DQ_MIRRORED_OPERATORS.get(op)
@@ -445,18 +449,24 @@ def _dq_threshold(rule: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any]], st
     if threshold is None:
         return {"mustBe": 0}, ""
     share: Optional[float] = None
-    if not isinstance(threshold, bool):
+    if isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
         try:
             share = float(threshold)
-        except (TypeError, ValueError):
+        except OverflowError:
             share = None
     if share is None or not math.isfinite(share) or not 0.0 <= share <= 1.0:
         return None, (
             f"its threshold {threshold!r} is not a share of rows from 0 to 1 "
             "(write 0.99, not 99), so there is no bad share to compare"
         )
-    if share == 1.0 and op in (">=", "=="):
+    if (share == 1.0 and op in (">=", "==")) or rule_type == "valid_values":
         return {"mustBe": 0}, ""
+    if rule_type == "uniqueness":
+        return None, (
+            f"its threshold {op} {threshold} is a partial uniqueness share (distinct over "
+            "non-null values), which no ODCS duplicateValues count or percent equals; only "
+            "full uniqueness (threshold 1.0 with >= or ==) is expressible"
+        )
     bad_percent: float = round((1.0 - share) * 100, 6)
     if bad_percent == int(bad_percent):
         bad_percent = int(bad_percent)

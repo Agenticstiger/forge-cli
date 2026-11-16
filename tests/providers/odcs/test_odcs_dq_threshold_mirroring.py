@@ -3,8 +3,10 @@
 
 """FLUID's completeness/uniqueness/valid_values threshold is the share of rows that PASS.
 
-ODCS ``nullValues`` / ``duplicateValues`` / ``invalidValues`` count the BAD rows, so the
-comparison is mirrored onto the bad share (``unit: percent``), as the SodaCL exporter does.
+ODCS ``nullValues`` / ``duplicateValues`` / ``invalidValues`` count the BAD rows. A full share
+is ``mustBe: 0``; a partial completeness share is mirrored onto the null share
+(``unit: percent``); valid_values is every value, as ``fluid test`` checks it; a partial
+uniqueness share has no ODCS equivalent and is not exported. The SodaCL exporter does the same.
 Copying ``threshold: 1.0, operator: '>='`` straight across used to export "at least one
 null", the opposite of the rule.
 """
@@ -54,18 +56,25 @@ def test_completeness_95_percent_is_at_most_5_percent_nulls() -> None:
     assert _cmp(check) == {"mustBeLessOrEqualTo": 5}
 
 
-def test_uniqueness_99_percent_is_at_most_1_percent_duplicates() -> None:
-    check = _export("uniqueness", threshold=0.99, operator=">=")
-    assert check["metric"] == "duplicateValues"
-    assert check["unit"] == "percent"
-    assert _cmp(check) == {"mustBeLessOrEqualTo": 1}
+def test_a_partial_uniqueness_share_is_not_exported() -> None:
+    # FLUID's uniqueness share is distinct over non-null values: for [a, a, a, a, b] that is
+    # 2/5, a bad share of 60%, while "rows involved in duplicates" is 80%. No ODCS
+    # duplicateValues percent says what the rule says (the SodaCL exporter refuses it too).
+    check, reason = _dq_rule_to_quality(
+        {"type": "uniqueness", "selector": "c", "threshold": 0.99, "operator": ">="}
+    )
+    assert check is None
+    assert "partial uniqueness" in reason
 
 
-def test_valid_values_threshold_mirrors_onto_invalid_share() -> None:
-    check = _export("valid_values", threshold=0.9, operator=">")
-    assert check["metric"] == "invalidValues"
-    assert check["unit"] == "percent"
-    assert _cmp(check) == {"mustBeLessThan": 10}
+def test_valid_values_is_every_value_whatever_the_threshold() -> None:
+    # ``fluid test`` checks every value of a valid_values rule, and its share is over non-null
+    # values while ODCS's percent is over all rows: the export says what fluid test checks.
+    for kw in ({"threshold": 0.9, "operator": ">"}, {"threshold": 0.5}):
+        check = _export("valid_values", **kw)
+        assert check["metric"] == "invalidValues"
+        assert _cmp(check) == {"mustBe": 0}
+        assert "unit" not in check
 
 
 @pytest.mark.parametrize(
@@ -105,7 +114,9 @@ def test_a_threshold_without_an_operator_reads_as_at_least() -> None:
     assert _cmp(_export("completeness", threshold=1.0)) == {"mustBe": 0}
 
 
-@pytest.mark.parametrize("threshold", [99, -0.1, 1.5, "high", float("nan"), float("inf"), True])
+@pytest.mark.parametrize(
+    "threshold", [99, -0.1, 1.5, "high", "0.9", float("nan"), float("inf"), True, 10**400]
+)
 def test_a_threshold_that_is_not_a_share_is_not_exported(threshold: Any) -> None:
     # ``fluid test`` refuses these; exporting 1 - 99 = -9800 percent would be nonsense.
     check, reason = _dq_rule_to_quality(
