@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://open-data-protocol.github.io/fluid/schema/fluid-schema-0.7.7.json",
   "title": "FLUID 0.7.7 — Preview: recursive streaming types",
-  "description": "Opt-in preview. Adds recursive struct fields, array elements and map key/value types, the lakeflow build engine (Databricks Lakeflow Declarative Pipelines), and two semantics fields: named relationships between exposes, composite keys included (exposes[].semantics.relationships), and the validity window of a slowly changing dimension (dimensions[].typeParams.validityParams). For AWS streaming to Iceberg it adds one schemaRegistry definition (Glue or Confluent) at streamSource.registry, the stream's trigger, watermark, checkpoint and startingOffsets, an opt-in maskAtIngest hash on mapped columns, the Spark build's parameters.spark, and six AWS container kinds in packaging.containers. Stable 0.7.6 is unchanged.",
+  "description": "Opt-in preview. Adds recursive struct fields, array elements and map key/value types, the lakeflow build engine (Databricks Lakeflow Declarative Pipelines), and two semantics fields: named relationships between exposes, composite keys included (exposes[].semantics.relationships), and the validity window of a slowly changing dimension (dimensions[].typeParams.validityParams). For AWS streaming to Iceberg it adds one schemaRegistry definition (Glue or Confluent) at streamSource.registry, the stream's trigger, watermark, checkpoint and startingOffsets, an opt-in maskAtIngest hash on mapped columns, the Spark build's parameters.spark, and six AWS container kinds in packaging.containers. Also rules about valid data (RFC-data-rules.md): invariants written in FLUID SQL/1 (exposes[].contract.invariants), identifier formats, placeholder values and shared attributes (exposes[].contract.schema[].identifierFormat, .placeholders, .sharedAttribute) and columns copied through a relationship (relationships[].sharedColumns). Stable 0.7.6 is unchanged.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -960,6 +960,13 @@
             }
           }
         },
+        "invariants": {
+          "type": "array",
+          "description": "NEW in v0.7.7 (preview): Rules about valid data (RFC-data-rules.md): checks, derived columns, summaries over child rows and functional dependencies, written in FLUID SQL/1, each with a band of violating rows. dbt, ODCS and FLUX consumers read them alike. contract.quality[] keeps free SQL in the warehouse's dialect, which FLUX never reads.",
+          "items": {
+            "$ref": "#/$defs/invariant"
+          }
+        },
         "tags": {
           "$ref": "#/$defs/tags",
           "description": "Contract-level tags for data quality and governance."
@@ -1217,6 +1224,135 @@
               }
             }
           }
+        },
+        "identifierFormat": {
+          "type": "array",
+          "minItems": 1,
+          "description": "NEW in v0.7.7 (preview): The identifier formats of this string column (RFC-data-rules.md section 3), a list of alternatives. A value has the format when it is one of an alternative's prefixes followed by a string its mask matches. Alternatives must not overlap, a foreign-key column repeats its target column's format or declares none, and placeholders are exempt. Consumers match one anchored regex compiled from it; uniqueness comes from the column's key, not from the format.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "mask"
+            ],
+            "properties": {
+              "prefixes": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[ -~]*$"
+                },
+                "description": "Literal prefixes, printable ASCII. One empty prefix when left out."
+              },
+              "mask": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "description": "COBOL PICTURE style: 9 is a digit, A an upper-case ASCII letter, X an upper-case ASCII letter or a digit; a backslash makes the next character literal (\\A), and every other printable ASCII character stands for itself. At least one symbol; no repeat counts (write 99999, not 9(5))."
+              }
+            }
+          },
+          "examples": [
+            [
+              {
+                "prefixes": [
+                  "MSC",
+                  "TWR"
+                ],
+                "mask": "99999"
+              },
+              {
+                "prefixes": [
+                  "LEGACY-"
+                ],
+                "mask": "A9-99AA"
+              }
+            ]
+          ]
+        },
+        "placeholders": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "NEW in v0.7.7 (preview): Placeholder values of this string column: stand-ins for a real value that is not known yet, such as TBD_0042 (RFC-data-rules.md section 4). A value is a placeholder when it equals one of values or starts with one of prefixes, case-sensitively; NULL never is. A placeholder is exempt from the column's own value checks (identifierFormat, validationRules, its enum) and an ordinary value everywhere else. One mustBe* operator with unit bounds the placeholder rows; without one they are declared and reported, never failed. A sentinel that stands for no value (UNKNOWN for NULL) is a quality[] missingValues rule instead.",
+          "properties": {
+            "values": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Whole values that are placeholders."
+            },
+            "prefixes": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "A value that starts with one of these is a placeholder."
+            },
+            "mustBe": {
+              "$ref": "#/$defs/violationBound",
+              "description": "Exactly this many placeholder rows."
+            },
+            "mustBeLessThan": {
+              "$ref": "#/$defs/violationBound",
+              "description": "Fewer placeholder rows than this."
+            },
+            "mustBeLessOrEqualTo": {
+              "$ref": "#/$defs/violationBound",
+              "description": "At most this many placeholder rows."
+            },
+            "mustBeGreaterThan": {
+              "$ref": "#/$defs/violationBound",
+              "description": "More placeholder rows than this."
+            },
+            "mustBeGreaterOrEqualTo": {
+              "$ref": "#/$defs/violationBound",
+              "description": "At least this many placeholder rows."
+            },
+            "mustBeBetween": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "$ref": "#/$defs/violationBound"
+              },
+              "description": "From lo to hi placeholder rows, both included, with lo below hi."
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "rows",
+                "percent"
+              ],
+              "default": "rows",
+              "description": "rows counts placeholder rows; percent counts them per 100 rows of the expose."
+            }
+          },
+          "examples": [
+            {
+              "values": [
+                "XXXXX"
+              ],
+              "prefixes": [
+                "TBD_"
+              ],
+              "mustBeLessOrEqualTo": 1,
+              "unit": "percent"
+            }
+          ]
+        },
+        "sharedAttribute": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_.]*$",
+          "description": "NEW in v0.7.7 (preview): The attribute this column carries with every other column of the contract that names the same one (RFC-data-rules.md section 5). The owner is the member that every other member reaches through relationships, following to, on exactly one path; on every row whose path reaches an owner row, a member IS NOT DISTINCT FROM the owner. Never inferred from column names, and not semanticType, which stays a kind of value such as email."
         },
         "tags": {
           "$ref": "#/$defs/tags",
@@ -7083,6 +7219,16 @@
           ],
           "default": "left",
           "description": "How a consumer joins the target: left keeps the declaring expose's rows that have no match, inner drops them. Defaults to left."
+        },
+        "sharedColumns": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "NEW in v0.7.7 (preview): Columns copied through this relationship (RFC-data-rules.md section 5): each is in both exposes' schemas under one name and of one type, and on every row whose link reaches a target row it IS NOT DISTINCT FROM the target's. Short for a derive of the column with expr <name>.<column> on the rows the link reaches. The relationship's own key columns are never listed: they agree by definition."
         }
       },
       "examples": [
@@ -7112,6 +7258,336 @@
           "cardinality": "many_to_one"
         }
       ]
+    },
+    "invariant": {
+      "type": "object",
+      "description": "NEW in v0.7.7 (preview): A rule about valid data (RFC-data-rules.md section 1). Exactly one form: check, a predicate every covered row satisfies; derive with expr, the column's value from the row and the rows its links reach (a generated column in PostgreSQL's sense); derive with aggregate, the column's value as a summary over child rows; or dependency, equal from values meaning equal to values. when narrows the rows it covers. One mustBe* operator with unit bounds the violating rows, as ODCS writes it; without one the invariant holds only with no violating row (mustBe: 0). A covered row violates a check when the predicate is not TRUE, and a derive when the column IS DISTINCT FROM the value.",
+      "additionalProperties": false,
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$",
+          "description": "Unique within the contract, across every expose and kind, and against dq.rules[].id and contract.quality[].rule: reports, tests, ODCS rules and FLUX's seed streams are keyed by it."
+        },
+        "description": {
+          "type": "string"
+        },
+        "check": {
+          "$ref": "#/$defs/fluidSqlText",
+          "description": "A FLUID SQL/1 predicate over the row."
+        },
+        "derive": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The column this invariant determines, with exactly one of expr and aggregate. Several derives of one column, each with its own when, cover a row in declaration order, as SQL's CASE WHEN does."
+        },
+        "expr": {
+          "$ref": "#/$defs/fluidSqlText",
+          "description": "With derive: the column's value, a FLUID SQL/1 expression of the column's type whose static scale fits the column's (wrap a product or a quotient in ROUND(x, s))."
+        },
+        "aggregate": {
+          "$ref": "#/$defs/invariantAggregate"
+        },
+        "dependency": {
+          "$ref": "#/$defs/invariantDependency"
+        },
+        "when": {
+          "$ref": "#/$defs/fluidSqlText",
+          "description": "A FLUID SQL/1 predicate: the rows the invariant covers (every row without it). A row on which a compared value is NULL is covered and usually violates the invariant; write when to leave such rows out. Not on a dependency in v1."
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "error",
+            "warning",
+            "info"
+          ],
+          "default": "error",
+          "description": "How a consumer reports a violation, in contract.quality[]'s words."
+        },
+        "mustBe": {
+          "$ref": "#/$defs/violationBound",
+          "description": "Exactly this many violating rows."
+        },
+        "mustBeLessThan": {
+          "$ref": "#/$defs/violationBound",
+          "description": "Fewer violating rows than this."
+        },
+        "mustBeLessOrEqualTo": {
+          "$ref": "#/$defs/violationBound",
+          "description": "At most this many violating rows."
+        },
+        "mustBeGreaterThan": {
+          "$ref": "#/$defs/violationBound",
+          "description": "More violating rows than this."
+        },
+        "mustBeGreaterOrEqualTo": {
+          "$ref": "#/$defs/violationBound",
+          "description": "At least this many violating rows."
+        },
+        "mustBeBetween": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/violationBound"
+          },
+          "description": "From lo to hi violating rows, both included, with lo below hi."
+        },
+        "unit": {
+          "type": "string",
+          "enum": [
+            "rows",
+            "percent"
+          ],
+          "default": "rows",
+          "description": "rows counts violating rows; percent is violating rows times 100 divided by covered rows, and 0 when no row is covered."
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "check"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "derive"
+                ]
+              },
+              {
+                "required": [
+                  "expr"
+                ]
+              },
+              {
+                "required": [
+                  "aggregate"
+                ]
+              },
+              {
+                "required": [
+                  "dependency"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "required": [
+            "derive",
+            "expr"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "check"
+                ]
+              },
+              {
+                "required": [
+                  "aggregate"
+                ]
+              },
+              {
+                "required": [
+                  "dependency"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "required": [
+            "derive",
+            "aggregate"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "check"
+                ]
+              },
+              {
+                "required": [
+                  "expr"
+                ]
+              },
+              {
+                "required": [
+                  "dependency"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "required": [
+            "dependency"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "check"
+                ]
+              },
+              {
+                "required": [
+                  "derive"
+                ]
+              },
+              {
+                "required": [
+                  "expr"
+                ]
+              },
+              {
+                "required": [
+                  "aggregate"
+                ]
+              },
+              {
+                "required": [
+                  "when"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "examples": [
+        {
+          "id": "gross_from_net",
+          "derive": "gross",
+          "expr": "ROUND(net * (1 + tax_rate), 2)"
+        },
+        {
+          "id": "due_after_issue",
+          "check": "issue_date <= due_date",
+          "mustBeLessOrEqualTo": 0.5,
+          "unit": "percent"
+        },
+        {
+          "id": "billed_base_fee_from_lines",
+          "derive": "billed_base_fee",
+          "aggregate": {
+            "function": "sum",
+            "column": "amount",
+            "from": "invoice_lines",
+            "via": "invoice",
+            "filter": "kind = 'base_fee'",
+            "ifNone": 0
+          }
+        },
+        {
+          "id": "group_name_by_id",
+          "dependency": {
+            "from": [
+              "group_id"
+            ],
+            "to": [
+              "group_name"
+            ],
+            "bothWays": true
+          }
+        }
+      ]
+    },
+    "invariantAggregate": {
+      "type": "object",
+      "description": "NEW in v0.7.7 (preview): A summary over child rows (RFC-data-rules.md section 1.2): SQL's aggregate, with SQL's null rules and its FILTER clause, declared on the parent expose. count has scale 0, sum its column's scale, min and max their column's type.",
+      "additionalProperties": false,
+      "required": [
+        "function",
+        "from",
+        "via"
+      ],
+      "properties": {
+        "function": {
+          "type": "string",
+          "enum": [
+            "count",
+            "sum",
+            "min",
+            "max"
+          ]
+        },
+        "column": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The child column summarized: none for count, a number of bounded scale for sum, any orderable type for min and max."
+        },
+        "from": {
+          "$ref": "#/$defs/identifier",
+          "description": "The child expose, an exposeId of this contract."
+        },
+        "via": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A relationship the child declares (its semantics.relationships[].name) whose to is this expose."
+        },
+        "filter": {
+          "$ref": "#/$defs/fluidSqlText",
+          "description": "A FLUID SQL/1 predicate over the child row: only children for which it is TRUE count, as in SUM(x) FILTER (WHERE ...)."
+        },
+        "ifNone": {
+          "type": [
+            "string",
+            "number"
+          ],
+          "description": "A literal of the summary's type that replaces a NULL summary, as COALESCE would: when no child counts, or every counted child's column is NULL. A date is written 'YYYY-MM-DD', quoted. Without it, sum, min and max of nothing are NULL and count is 0."
+        }
+      }
+    },
+    "invariantDependency": {
+      "type": "object",
+      "description": "NEW in v0.7.7 (preview): A functional dependency (RFC-data-rules.md section 1.2): equal values in from mean equal values in to. A row with a NULL from column is not covered; a NULL to value is a value. A key's violating rows are its covered rows minus those that carry its most common to values (the g3 measure). bothWays adds the reverse dependency, counted on its own, and takes one column a side.",
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "to"
+      ],
+      "properties": {
+        "from": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "to": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "bothWays": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "fluidSqlText": {
+      "type": "string",
+      "minLength": 1,
+      "description": "NEW in v0.7.7 (preview): A FLUID SQL/1 text (RFC-data-rules.md section 2): a closed SQL expression subset, with exact numbers and two-valued truth, at most 4,096 code points and 64 levels deep. fluid validate parses and type-checks it against the expose; SQL outside the subset belongs in contract.quality[]."
+    },
+    "violationBound": {
+      "type": "number",
+      "minimum": 0,
+      "description": "NEW in v0.7.7 (preview): A number of rows, or a percentage (unit), read as an exact decimal from its text: at most 15 significant digits, so the text survives a round trip through a double."
     },
     "exposeMcp": {
       "type": "object",
