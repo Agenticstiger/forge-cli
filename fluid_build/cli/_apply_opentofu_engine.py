@@ -602,9 +602,22 @@ def _plan_with_opentofu(
         "sha256": sha256_bytes(saved),
         "provider": eng.provider,
         "state": eng.target.location,
+        **_state_version(eng),
         "changes": changes,
         "imports": sorted(block.to for block in adopted),
     }
+
+
+def _state_version(eng: _Engine) -> Dict[str, Any]:
+    """``{"stateLineage", "stateSerial"}`` of the state now, as ``tofu state pull`` reads it,
+    or ``{}`` when it cannot be read. A saved plan records the state it was made from, and
+    OpenTofu refuses it once lineage or serial moved on (``internal/backend/local``); recording
+    them lets ``fluid apply`` refuse it too, before anything runs outside OpenTofu."""
+    try:
+        doc = read_state(Path(eng.workdir), eng.env)
+    except Exception:  # noqa: BLE001 — OpenTofu's own check at apply time still stands
+        return {}
+    return {"stateLineage": doc.lineage, "stateSerial": doc.serial}
 
 
 def _refuse_unreleased_imports(eng: _Engine, adopted: List[Any]) -> None:
@@ -715,6 +728,8 @@ def _apply_bound_plan(
                 ],
             },
         )
+    # Before the hooks: a stale plan is refused before anything outside OpenTofu runs.
+    _refuse_stale_before_hooks(eng, record)
     changes = runner.saved_plan_changes(shown)
     cprint(
         f"\n  saved plan {record['planFile']} ({str(record['sha256'])[:19]}…): "
@@ -755,6 +770,21 @@ def _check_plan_target(record: Mapping[str, Any], provider: str, target: "StateT
 _STALE_PLAN_MARKERS = ("Saved plan is stale", "different state lineage")
 
 
+def _refuse_stale_before_hooks(eng: _Engine, record: Mapping[str, Any]) -> None:
+    """Refuse a saved plan whose state moved on, read before the plugin's hooks run (a
+    Databricks ``prepare_destroys`` drops objects outside OpenTofu): ``tofu apply`` would
+    refuse it only after them. A record without the state version, or a state that cannot
+    be read, leaves the check to OpenTofu."""
+    if "stateSerial" not in record:
+        return
+    now = _state_version(eng)
+    if now and (now["stateLineage"], now["stateSerial"]) != (
+        record.get("stateLineage"),
+        record.get("stateSerial"),
+    ):
+        raise _stale_plan_error(None)
+
+
 def _saved_plan_stale(result: Any) -> bool:
     output = (getattr(result, "stdout", "") or "") + (getattr(result, "stderr", "") or "")
     return any(marker in output for marker in _STALE_PLAN_MARKERS)
@@ -766,9 +796,9 @@ def _stale_plan_error(result: Any) -> CLIError:
         "apply_plan_digest_tofu_plan_stale",
         {
             "kind": "tofu-plan-stale",
-            "error": "OpenTofu refused the saved plan: the state changed after it was made "
-            "(another apply ran in between), so it no longer shows what applying it would do. "
-            "Nothing was applied.",
+            "error": "the saved plan is stale: the state changed after it was made (another "
+            "apply ran in between), so it no longer shows what applying it would do. OpenTofu "
+            "applied nothing.",
         },
     )
     err.suggestions = ["Re-run `fluid plan --tofu`, review the new plan, then apply that one."]

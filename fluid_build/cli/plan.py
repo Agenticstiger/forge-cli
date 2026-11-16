@@ -443,12 +443,6 @@ def run(args, logger: logging.Logger) -> int:
 
         plan = apply_packaging_to_plan(plan, contract)
 
-        # --- The saved OpenTofu plan (proof gate) ---------------------------
-        # Before the digests, so planDigest covers the saved plan's sha256 and
-        # an approval of plan.json is an approval of the exact `tofu apply`.
-        if getattr(args, "tofu", False):
-            plan[_TOFU_PLAN_FIELD] = _plan_tofu(contract, bool(streaming), args, logger)
-
         # --- Plan-binding digests (stage 6 ⇒ stage 7 pipeline) --------------
         # ``bundleDigest`` pins the input bundle when the contract is a tgz;
         # ``planDigest`` catches tampering of plan.json between stages 6 and
@@ -518,6 +512,15 @@ def run(args, logger: logging.Logger) -> int:
             contract, hook_provider, provider_flag, logger
         ):
             raise CLIError(1, "sovereignty_violation", {"contract": args.contract})
+
+        # --- The saved OpenTofu plan (proof gate) ---------------------------
+        # After every gate that can refuse the plan (the bundle, sovereignty), so a
+        # refusal leaves no saved plan behind; re-bound (``force``: a mutation made
+        # here, as for ``cost_estimate``) so planDigest covers the saved plan's
+        # sha256 and an approval of plan.json is an approval of the exact `tofu apply`.
+        if getattr(args, "tofu", False):
+            plan[_TOFU_PLAN_FIELD] = _plan_tofu(contract, bool(streaming), args, logger)
+            plan = inject_digests(plan, bundle_path=bundle_path, force=True)
 
         # Write plan to file (idempotent - only if changed)
         write_json_idempotent(args.out, plan)

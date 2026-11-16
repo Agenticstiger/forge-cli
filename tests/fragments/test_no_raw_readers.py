@@ -388,7 +388,8 @@ REGISTRY: Dict[Site, Tuple[str, str]] = {
             "_load_contract",
             "_reconcile_with_state",
             "_verify_plan_binding_for_opentofu",
-            "_apply_via_opentofu",
+            # fluid plan --tofu adds import blocks to the module it emitted (main.tf.json).
+            "_plan_with_opentofu",
         ),
         # A plan.json's contract_metadata, for the source contract the plan records.
         *_site("iac/source.py", "source_contract_file"),

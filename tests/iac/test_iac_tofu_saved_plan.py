@@ -396,15 +396,34 @@ class TestEndToEnd:
             engine.apply_via_opentofu(_args(str(out)), _LOG)
         assert refused.value.event == "apply_plan_digest_plan_tamper"
 
-    def test_a_plan_made_stale_by_another_apply_is_refused(self, offline_tofu):
+    def test_a_plan_made_stale_by_another_apply_is_refused(self, offline_tofu, monkeypatch):
         out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
         # Another apply lands first and moves the state on.
         other = _plan(offline_tofu, {"id": "p1", "description": "v2"}, name="other.json")
         assert engine.apply_via_opentofu(_args(str(other)), _LOG) == 0
+        ran: List[str] = []
+        monkeypatch.setattr(engine, "_enforce_access", lambda *a, **k: ran.append("access"))
+        monkeypatch.setattr(engine, "_prepare_destroys", lambda *a, **k: ran.append("prepare"))
+        monkeypatch.setattr(runner, "tofu_apply", lambda *a, **k: ran.append("apply"))
         with pytest.raises(CLIError) as refused:
             engine.apply_via_opentofu(_args(str(out)), _LOG)
         assert refused.value.event == "apply_plan_digest_tofu_plan_stale"
+        # Refused before any hook that acts outside OpenTofu, and before tofu apply.
+        assert ran == []
         assert _state_inputs(offline_tofu) == ["v2"]
+
+    def test_opentofu_still_refuses_a_stale_plan_without_the_recorded_version(self, offline_tofu):
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        other = _plan(offline_tofu, {"id": "p1", "description": "v2"}, name="other.json")
+        assert engine.apply_via_opentofu(_args(str(other)), _LOG) == 0
+        plan = json.loads(out.read_text())
+        for key in ("stateSerial", "stateLineage"):
+            plan[TOFU_PLAN_FIELD].pop(key)
+        plan.pop("planDigest")
+        out.write_text(json.dumps(inject_digests(plan, force=True)))
+        with pytest.raises(CLIError) as refused:
+            engine.apply_via_opentofu(_args(str(out)), _LOG)
+        assert refused.value.event == "apply_plan_digest_tofu_plan_stale"
 
     def test_another_state_target_is_refused(self, offline_tofu):
         out = _plan(offline_tofu, {"id": "p1", "description": "v1"})

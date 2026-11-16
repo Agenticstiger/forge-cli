@@ -811,13 +811,15 @@ def test_a_genie_failure_is_a_typed_error_with_its_fix():
 
 
 def test_the_engine_converges_the_space_after_access_enforcement_and_in_a_dry_run():
-    source = __import__("inspect").getsource(engine._apply_via_opentofu)
+    getsource = __import__("inspect").getsource
+    source = getsource(engine._finish_apply)
     post = source.index('_enforce_access(plugin, "post_apply", contract)')
     ports = source.index("_converge_output_ports(plugin, contract)")
-    dry = source.index('_enforce_access(plugin, "pre_apply", contract, dry_run=True)')
-    dry_ports = source.index("_converge_output_ports(plugin, contract, dry_run=True)")
     assert post < ports
-    assert dry < dry_ports < source.index('cprint("\\ndry-run: plan only')
+    dry_source = getsource(engine._preview_outside_opentofu)
+    dry = dry_source.index('_enforce_access(eng.plugin, "pre_apply", eng.contract, dry_run=True)')
+    dry_ports = dry_source.index("_converge_output_ports(eng.plugin, eng.contract, dry_run=True)")
+    assert dry < dry_ports < dry_source.index('cprint("\\ndry-run: plan only')
 
 
 # ---------------------------------------------------------------------- the real SDK's errors
