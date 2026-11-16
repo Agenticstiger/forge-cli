@@ -38,7 +38,15 @@ from typing import List, Optional, Tuple
 
 from . import _nodes as n
 from ._errors import FluidSqlError
-from ._lexer import FUNCTIONS, MAX_DEPTH, Token, check_limits, normalize, tokenize
+from ._lexer import (
+    FUNCTIONS,
+    MAX_DEPTH,
+    MAX_ROUND_PLACES,
+    Token,
+    check_limits,
+    normalize,
+    tokenize,
+)
 
 _CMP_OPS = frozenset({"=", "<>", "<", "<=", ">", ">="})
 _DATE_TEXT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
@@ -463,6 +471,13 @@ class _Parser:
                 places.pos,
             )
         self.take()
+        if int(places.value) > MAX_ROUND_PLACES:
+            raise FluidSqlError(
+                "round-places",
+                f"ROUND takes at most {MAX_ROUND_PLACES} decimal places, the widest scale a SQL "
+                f"DECIMAL has, not {int(places.value)}",
+                places.pos,
+            )
         mode = n.DEFAULT_ROUND_MODE
         if self.at_op(","):
             self.take()

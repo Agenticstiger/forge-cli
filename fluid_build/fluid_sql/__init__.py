@@ -25,7 +25,7 @@ from ._canonical import canonical, quote_name, quote_string
 from ._checker import PREDICATE, VALUE, Checked, check, check_derive_fit, check_derive_target
 from ._errors import REASONS, FluidSqlError
 from ._evaluate import add_months, evaluate, months_between, round_fraction, years_between
-from ._lexer import FUNCTIONS, KEYWORDS, MAX_CODE_POINTS, MAX_DEPTH
+from ._lexer import FUNCTIONS, KEYWORDS, MAX_CODE_POINTS, MAX_DEPTH, MAX_ROUND_PLACES
 from ._nodes import Node, from_json, to_json, walk
 from ._parser import parse
 from ._render import render_duckdb
@@ -36,6 +36,7 @@ __all__ = [
     "KEYWORDS",
     "MAX_CODE_POINTS",
     "MAX_DEPTH",
+    "MAX_ROUND_PLACES",
     "PREDICATE",
     "REASONS",
     "VALUE",

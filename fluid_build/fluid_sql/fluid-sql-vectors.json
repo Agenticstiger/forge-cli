@@ -2,7 +2,7 @@
  "vectorsVersion": "1.0.0",
  "language": "FLUID SQL/1",
  "description": "FLUID SQL/1 conformance vectors (forge-cli RFC-data-rules.md section 2.9). They define the language: every implementation (forge-cli's validator, flux-expr/2) parses, checks and evaluates every vector and reaches its verdict, tree, canonical text, type, scale and values. Each vector names a model (one expose: its columns, their FLUID column types, enums and placeholders, and its relationships) and a site: predicate (check, when, aggregate.filter: the text must be a bool, and a NULL result counts as FALSE) or value (expr). With derive, the text is the expr of a derive on that column and must fit it. A refused vector gives one reason from reasonCodes and has exactly one defect. An accepted vector gives its tree (one node per construct; see nodes), its canonical text, its type and, for a number, its static scale (an integer, or unbounded), and eval cases: a row (column -> value), the links (relationship -> the row it reaches, or null for none; a relationship left out reaches none) and the result. A column left out of a row is NULL.",
- "encoding": "No JSON number appears in a row or a result. A number is a decimal string; a result of static scale s is written with exactly s digits after the point, and one of unbounded scale as its shortest decimal, or as p/q in lowest terms when no decimal is exact (1/3). Compare numbers by value. A bool is true or false, a string is itself (compared by code points, never normalized), a date is YYYY-MM-DD, a timestamp is ISO 8601 without an offset, a timestamp with time zone ISO 8601 with one (compare instants), and NULL is null. A float column's value is the shortest decimal that converts back to the double.",
+ "encoding": "No JSON number appears anywhere in this file: numbers, scales and limits are strings. A number is a decimal string; a result of static scale s is written with exactly s digits after the point, and one of unbounded scale as its shortest decimal, or as p/q in lowest terms when no decimal is exact (1/3). Compare numbers by value. A bool is true or false, a string is itself (compared by code points, never normalized), a date is YYYY-MM-DD, a timestamp is ISO 8601 without an offset, a timestamp with time zone ISO 8601 with one (compare instants), and NULL is null. A float column's value is the shortest decimal that converts back to the double.",
  "keywords": [
   "AND",
   "BETWEEN",
@@ -30,15 +30,17 @@
   "YEARS_BETWEEN"
  ],
  "limits": {
-  "maxCodePoints": 4096,
-  "maxDepth": 64,
-  "measure": "The text is NFC-normalized, then measured in code points. Depth: a literal or a column reference is 1; every other construct, and every pair of parentheses, is one more than the deepest thing directly inside it (an IN item, ROUND's places and its mode are not inside it)."
+  "maxCodePoints": "4096",
+  "maxDepth": "64",
+  "maxRoundPlaces": "38",
+  "measure": "The text is NFC-normalized, then measured in code points. Depth: a literal or a column reference is 1; every other construct, and every pair of parentheses, is one more than the deepest thing directly inside it, so a chain of 63 ANDs over 64 names is 64 deep. An IN item, ROUND's places and its mode are literals inside their construct (an IN item -1 is one number literal, depth 1). ROUND takes at most 38 places (founder pick, 2026-11-16)."
  },
  "reasonCodes": {
   "too-long": "longer than 4,096 code points after NFC normalization",
   "comment-or-semicolon": "a ';', '--' or '/*' outside a string literal or a quoted name",
   "syntax": "a text the grammar (RFC-data-rules.md section 2.1) does not derive",
   "too-deep": "nested deeper than 64 levels",
+  "round-places": "ROUND to more than 38 decimal places",
   "bad-date": "a DATE literal that is not a calendar date from 0001-01-01 to 9999-12-31 written YYYY-MM-DD",
   "multi-link-path": "a path over more than one link (rel.rel.col)",
   "unknown-column": "a name that is not a column of the expose, or of the relationship's target",
@@ -71,7 +73,7 @@
   "or": "left, right; left-associative",
   "case": "whens: [{when, then}], else when written",
   "coalesce": "args",
-  "round": "arg, scale (an integer), mode (HALF_AWAY_FROM_ZERO when none is written, or HALF_TO_EVEN)",
+  "round": "arg, scale (its digits, a string), mode (HALF_AWAY_FROM_ZERO when none is written, or HALF_TO_EVEN)",
   "date_diff": "unit (day, month, year), from, to"
  },
  "models": {
@@ -404,12 +406,12 @@
        }
       }
      },
-     "scale": 2,
+     "scale": "2",
      "mode": "HALF_AWAY_FROM_ZERO"
     },
     "canonical": "ROUND(net * (1 + tax_rate), 2)",
     "type": "number",
-    "scale": 2,
+    "scale": "2",
     "eval": [
      {
       "row": {
@@ -664,7 +666,7 @@
     },
     "canonical": "YEARS_BETWEEN(birth_date, snapshot_date)",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -1348,7 +1350,7 @@
     },
     "canonical": "CASE WHEN paid THEN 1 ELSE 0 END",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -1500,7 +1502,7 @@
     },
     "canonical": "net + NULL",
     "type": "number",
-    "scale": 2,
+    "scale": "2",
     "eval": [
      {
       "row": {
@@ -1772,7 +1774,7 @@
     },
     "canonical": "COALESCE(net, gross, 0)",
     "type": "number",
-    "scale": 2,
+    "scale": "2",
     "eval": [
      {
       "row": {
@@ -4265,7 +4267,7 @@
     },
     "canonical": "net + tax_rate",
     "type": "number",
-    "scale": 4,
+    "scale": "4",
     "eval": [
      {
       "row": {
@@ -4298,7 +4300,7 @@
     },
     "canonical": "net * tax_rate",
     "type": "number",
-    "scale": 6,
+    "scale": "6",
     "eval": [
      {
       "row": {
@@ -4331,7 +4333,7 @@
     },
     "canonical": "net * 1.50",
     "type": "number",
-    "scale": 4,
+    "scale": "4",
     "eval": [
      {
       "row": {
@@ -4363,7 +4365,7 @@
     },
     "canonical": "lines + 1",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -4439,12 +4441,12 @@
        "name": "tax_rate"
       }
      },
-     "scale": 3,
+     "scale": "3",
      "mode": "HALF_AWAY_FROM_ZERO"
     },
     "canonical": "ROUND(net * tax_rate, 3)",
     "type": "number",
-    "scale": 3,
+    "scale": "3",
     "eval": [
      {
       "row": {
@@ -4484,7 +4486,7 @@
     },
     "canonical": "CASE WHEN paid THEN net ELSE tax_rate END",
     "type": "number",
-    "scale": 4,
+    "scale": "4",
     "eval": [
      {
       "row": {
@@ -4600,7 +4602,7 @@
     },
     "canonical": "DAYS_BETWEEN(issue_date, due_date)",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -4671,7 +4673,7 @@
     },
     "canonical": "CASE WHEN net / lines > 1 THEN net ELSE 0 END",
     "type": "number",
-    "scale": 2,
+    "scale": "2",
     "eval": [
      {
       "row": {
@@ -4706,7 +4708,7 @@
     },
     "canonical": "-net",
     "type": "number",
-    "scale": 2,
+    "scale": "2",
     "eval": [
      {
       "row": {
@@ -4752,7 +4754,7 @@
     },
     "canonical": "lines - 1 - 1",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -4832,7 +4834,7 @@
     },
     "canonical": "lines + lines * 2",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -4872,7 +4874,7 @@
     },
     "canonical": "(lines + lines) * 2",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -4908,7 +4910,7 @@
     },
     "canonical": "net - -1",
     "type": "number",
-    "scale": 2,
+    "scale": "2",
     "eval": [
      {
       "row": {
@@ -4938,7 +4940,7 @@
     },
     "canonical": "-(-lines)",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -4970,12 +4972,12 @@
        "value": "3"
       }
      },
-     "scale": 6,
+     "scale": "6",
      "mode": "HALF_AWAY_FROM_ZERO"
     },
     "canonical": "ROUND(1 / 3, 6)",
     "type": "number",
-    "scale": 6,
+    "scale": "6",
     "eval": [
      {
       "row": {},
@@ -5069,12 +5071,12 @@
       "node": "column",
       "name": "net"
      },
-     "scale": 1,
+     "scale": "1",
      "mode": "HALF_AWAY_FROM_ZERO"
     },
     "canonical": "ROUND(net, 1)",
     "type": "number",
-    "scale": 1,
+    "scale": "1",
     "eval": [
      {
       "row": {
@@ -5128,12 +5130,12 @@
       "node": "column",
       "name": "net"
      },
-     "scale": 1,
+     "scale": "1",
      "mode": "HALF_TO_EVEN"
     },
     "canonical": "ROUND(net, 1, 'HALF_TO_EVEN')",
     "type": "number",
-    "scale": 1,
+    "scale": "1",
     "eval": [
      {
       "row": {
@@ -5182,12 +5184,12 @@
       "node": "column",
       "name": "net"
      },
-     "scale": 1,
+     "scale": "1",
      "mode": "HALF_AWAY_FROM_ZERO"
     },
     "canonical": "ROUND(net, 1)",
     "type": "number",
-    "scale": 1,
+    "scale": "1",
     "eval": [
      {
       "row": {
@@ -5211,12 +5213,12 @@
       "node": "column",
       "name": "net"
      },
-     "scale": 0,
+     "scale": "0",
      "mode": "HALF_AWAY_FROM_ZERO"
     },
     "canonical": "ROUND(net, 0)",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -5252,12 +5254,12 @@
       "node": "column",
       "name": "net"
      },
-     "scale": 0,
+     "scale": "0",
      "mode": "HALF_TO_EVEN"
     },
     "canonical": "ROUND(net, 0, 'HALF_TO_EVEN')",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -5293,12 +5295,12 @@
       "node": "column",
       "name": "net"
      },
-     "scale": 4,
+     "scale": "4",
      "mode": "HALF_AWAY_FROM_ZERO"
     },
     "canonical": "ROUND(net, 4)",
     "type": "number",
-    "scale": 4,
+    "scale": "4",
     "eval": [
      {
       "row": {
@@ -5322,12 +5324,12 @@
       "node": "column",
       "name": "net"
      },
-     "scale": 1,
+     "scale": "1",
      "mode": "HALF_AWAY_FROM_ZERO"
     },
     "canonical": "ROUND(net, 1)",
     "type": "number",
-    "scale": 1,
+    "scale": "1",
     "eval": [
      {
       "row": {
@@ -5336,6 +5338,46 @@
       "result": "2.3"
      }
     ]
+   }
+  },
+  {
+   "id": "round-38-places",
+   "text": "ROUND(net, 38)",
+   "site": "value",
+   "model": "invoices",
+   "note": "founder pick 2026-11-16: ROUND takes at most 38 places, the widest DECIMAL scale",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "round",
+     "arg": {
+      "node": "column",
+      "name": "net"
+     },
+     "scale": "38",
+     "mode": "HALF_AWAY_FROM_ZERO"
+    },
+    "canonical": "ROUND(net, 38)",
+    "type": "number",
+    "scale": "38",
+    "eval": [
+     {
+      "row": {
+       "net": "1.25"
+      },
+      "result": "1.25000000000000000000000000000000000000"
+     }
+    ]
+   }
+  },
+  {
+   "id": "round-39-places",
+   "text": "ROUND(net, 39)",
+   "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "round-places"
    }
   },
   {
@@ -5360,7 +5402,7 @@
     },
     "canonical": "MONTHS_BETWEEN(issue_date, due_date)",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -5422,7 +5464,7 @@
     },
     "canonical": "MONTHS_BETWEEN(DATE '2026-01-31', DATE '2026-02-01')",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {},
@@ -5452,7 +5494,7 @@
     },
     "canonical": "MONTHS_BETWEEN(DATE '2024-02-29', DATE '2025-02-28')",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {},
@@ -5482,7 +5524,7 @@
     },
     "canonical": "YEARS_BETWEEN(DATE '2000-02-29', DATE '2026-02-28')",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {},
@@ -5512,7 +5554,7 @@
     },
     "canonical": "YEARS_BETWEEN(DATE '2000-03-01', DATE '2026-02-28')",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {},
@@ -5542,7 +5584,7 @@
     },
     "canonical": "YEARS_BETWEEN(DATE '2026-02-28', DATE '2000-02-29')",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {},
@@ -5572,7 +5614,7 @@
     },
     "canonical": "DAYS_BETWEEN(DATE '2024-02-28', DATE '2024-03-01')",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {},
@@ -5602,7 +5644,7 @@
     },
     "canonical": "DAYS_BETWEEN(DATE '2026-03-01', DATE '2026-02-28')",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {},
@@ -5704,7 +5746,7 @@
     },
     "canonical": "DAYS_BETWEEN(NULL, due_date)",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -7457,7 +7499,7 @@
     },
     "canonical": "lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -7472,6 +7514,487 @@
    "id": "depth-65-additions",
    "text": "lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines + lines",
    "site": "value",
+   "model": "invoices",
+   "expect": {
+    "verdict": "refused",
+    "reason": "too-deep"
+   }
+  },
+  {
+   "id": "depth-64-ands",
+   "text": "paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid",
+   "site": "predicate",
+   "model": "invoices",
+   "note": "founder pick 2026-11-16: a flat chain counts, folded left; 63 ANDs are 64 deep",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "and",
+     "left": {
+      "node": "and",
+      "left": {
+       "node": "and",
+       "left": {
+        "node": "and",
+        "left": {
+         "node": "and",
+         "left": {
+          "node": "and",
+          "left": {
+           "node": "and",
+           "left": {
+            "node": "and",
+            "left": {
+             "node": "and",
+             "left": {
+              "node": "and",
+              "left": {
+               "node": "and",
+               "left": {
+                "node": "and",
+                "left": {
+                 "node": "and",
+                 "left": {
+                  "node": "and",
+                  "left": {
+                   "node": "and",
+                   "left": {
+                    "node": "and",
+                    "left": {
+                     "node": "and",
+                     "left": {
+                      "node": "and",
+                      "left": {
+                       "node": "and",
+                       "left": {
+                        "node": "and",
+                        "left": {
+                         "node": "and",
+                         "left": {
+                          "node": "and",
+                          "left": {
+                           "node": "and",
+                           "left": {
+                            "node": "and",
+                            "left": {
+                             "node": "and",
+                             "left": {
+                              "node": "and",
+                              "left": {
+                               "node": "and",
+                               "left": {
+                                "node": "and",
+                                "left": {
+                                 "node": "and",
+                                 "left": {
+                                  "node": "and",
+                                  "left": {
+                                   "node": "and",
+                                   "left": {
+                                    "node": "and",
+                                    "left": {
+                                     "node": "and",
+                                     "left": {
+                                      "node": "and",
+                                      "left": {
+                                       "node": "and",
+                                       "left": {
+                                        "node": "and",
+                                        "left": {
+                                         "node": "and",
+                                         "left": {
+                                          "node": "and",
+                                          "left": {
+                                           "node": "and",
+                                           "left": {
+                                            "node": "and",
+                                            "left": {
+                                             "node": "and",
+                                             "left": {
+                                              "node": "and",
+                                              "left": {
+                                               "node": "and",
+                                               "left": {
+                                                "node": "and",
+                                                "left": {
+                                                 "node": "and",
+                                                 "left": {
+                                                  "node": "and",
+                                                  "left": {
+                                                   "node": "and",
+                                                   "left": {
+                                                    "node": "and",
+                                                    "left": {
+                                                     "node": "and",
+                                                     "left": {
+                                                      "node": "and",
+                                                      "left": {
+                                                       "node": "and",
+                                                       "left": {
+                                                        "node": "and",
+                                                        "left": {
+                                                         "node": "and",
+                                                         "left": {
+                                                          "node": "and",
+                                                          "left": {
+                                                           "node": "and",
+                                                           "left": {
+                                                            "node": "and",
+                                                            "left": {
+                                                             "node": "and",
+                                                             "left": {
+                                                              "node": "and",
+                                                              "left": {
+                                                               "node": "and",
+                                                               "left": {
+                                                                "node": "and",
+                                                                "left": {
+                                                                 "node": "and",
+                                                                 "left": {
+                                                                  "node": "and",
+                                                                  "left": {
+                                                                   "node": "and",
+                                                                   "left": {
+                                                                    "node": "column",
+                                                                    "name": "paid"
+                                                                   },
+                                                                   "right": {
+                                                                    "node": "column",
+                                                                    "name": "paid"
+                                                                   }
+                                                                  },
+                                                                  "right": {
+                                                                   "node": "column",
+                                                                   "name": "paid"
+                                                                  }
+                                                                 },
+                                                                 "right": {
+                                                                  "node": "column",
+                                                                  "name": "paid"
+                                                                 }
+                                                                },
+                                                                "right": {
+                                                                 "node": "column",
+                                                                 "name": "paid"
+                                                                }
+                                                               },
+                                                               "right": {
+                                                                "node": "column",
+                                                                "name": "paid"
+                                                               }
+                                                              },
+                                                              "right": {
+                                                               "node": "column",
+                                                               "name": "paid"
+                                                              }
+                                                             },
+                                                             "right": {
+                                                              "node": "column",
+                                                              "name": "paid"
+                                                             }
+                                                            },
+                                                            "right": {
+                                                             "node": "column",
+                                                             "name": "paid"
+                                                            }
+                                                           },
+                                                           "right": {
+                                                            "node": "column",
+                                                            "name": "paid"
+                                                           }
+                                                          },
+                                                          "right": {
+                                                           "node": "column",
+                                                           "name": "paid"
+                                                          }
+                                                         },
+                                                         "right": {
+                                                          "node": "column",
+                                                          "name": "paid"
+                                                         }
+                                                        },
+                                                        "right": {
+                                                         "node": "column",
+                                                         "name": "paid"
+                                                        }
+                                                       },
+                                                       "right": {
+                                                        "node": "column",
+                                                        "name": "paid"
+                                                       }
+                                                      },
+                                                      "right": {
+                                                       "node": "column",
+                                                       "name": "paid"
+                                                      }
+                                                     },
+                                                     "right": {
+                                                      "node": "column",
+                                                      "name": "paid"
+                                                     }
+                                                    },
+                                                    "right": {
+                                                     "node": "column",
+                                                     "name": "paid"
+                                                    }
+                                                   },
+                                                   "right": {
+                                                    "node": "column",
+                                                    "name": "paid"
+                                                   }
+                                                  },
+                                                  "right": {
+                                                   "node": "column",
+                                                   "name": "paid"
+                                                  }
+                                                 },
+                                                 "right": {
+                                                  "node": "column",
+                                                  "name": "paid"
+                                                 }
+                                                },
+                                                "right": {
+                                                 "node": "column",
+                                                 "name": "paid"
+                                                }
+                                               },
+                                               "right": {
+                                                "node": "column",
+                                                "name": "paid"
+                                               }
+                                              },
+                                              "right": {
+                                               "node": "column",
+                                               "name": "paid"
+                                              }
+                                             },
+                                             "right": {
+                                              "node": "column",
+                                              "name": "paid"
+                                             }
+                                            },
+                                            "right": {
+                                             "node": "column",
+                                             "name": "paid"
+                                            }
+                                           },
+                                           "right": {
+                                            "node": "column",
+                                            "name": "paid"
+                                           }
+                                          },
+                                          "right": {
+                                           "node": "column",
+                                           "name": "paid"
+                                          }
+                                         },
+                                         "right": {
+                                          "node": "column",
+                                          "name": "paid"
+                                         }
+                                        },
+                                        "right": {
+                                         "node": "column",
+                                         "name": "paid"
+                                        }
+                                       },
+                                       "right": {
+                                        "node": "column",
+                                        "name": "paid"
+                                       }
+                                      },
+                                      "right": {
+                                       "node": "column",
+                                       "name": "paid"
+                                      }
+                                     },
+                                     "right": {
+                                      "node": "column",
+                                      "name": "paid"
+                                     }
+                                    },
+                                    "right": {
+                                     "node": "column",
+                                     "name": "paid"
+                                    }
+                                   },
+                                   "right": {
+                                    "node": "column",
+                                    "name": "paid"
+                                   }
+                                  },
+                                  "right": {
+                                   "node": "column",
+                                   "name": "paid"
+                                  }
+                                 },
+                                 "right": {
+                                  "node": "column",
+                                  "name": "paid"
+                                 }
+                                },
+                                "right": {
+                                 "node": "column",
+                                 "name": "paid"
+                                }
+                               },
+                               "right": {
+                                "node": "column",
+                                "name": "paid"
+                               }
+                              },
+                              "right": {
+                               "node": "column",
+                               "name": "paid"
+                              }
+                             },
+                             "right": {
+                              "node": "column",
+                              "name": "paid"
+                             }
+                            },
+                            "right": {
+                             "node": "column",
+                             "name": "paid"
+                            }
+                           },
+                           "right": {
+                            "node": "column",
+                            "name": "paid"
+                           }
+                          },
+                          "right": {
+                           "node": "column",
+                           "name": "paid"
+                          }
+                         },
+                         "right": {
+                          "node": "column",
+                          "name": "paid"
+                         }
+                        },
+                        "right": {
+                         "node": "column",
+                         "name": "paid"
+                        }
+                       },
+                       "right": {
+                        "node": "column",
+                        "name": "paid"
+                       }
+                      },
+                      "right": {
+                       "node": "column",
+                       "name": "paid"
+                      }
+                     },
+                     "right": {
+                      "node": "column",
+                      "name": "paid"
+                     }
+                    },
+                    "right": {
+                     "node": "column",
+                     "name": "paid"
+                    }
+                   },
+                   "right": {
+                    "node": "column",
+                    "name": "paid"
+                   }
+                  },
+                  "right": {
+                   "node": "column",
+                   "name": "paid"
+                  }
+                 },
+                 "right": {
+                  "node": "column",
+                  "name": "paid"
+                 }
+                },
+                "right": {
+                 "node": "column",
+                 "name": "paid"
+                }
+               },
+               "right": {
+                "node": "column",
+                "name": "paid"
+               }
+              },
+              "right": {
+               "node": "column",
+               "name": "paid"
+              }
+             },
+             "right": {
+              "node": "column",
+              "name": "paid"
+             }
+            },
+            "right": {
+             "node": "column",
+             "name": "paid"
+            }
+           },
+           "right": {
+            "node": "column",
+            "name": "paid"
+           }
+          },
+          "right": {
+           "node": "column",
+           "name": "paid"
+          }
+         },
+         "right": {
+          "node": "column",
+          "name": "paid"
+         }
+        },
+        "right": {
+         "node": "column",
+         "name": "paid"
+        }
+       },
+       "right": {
+        "node": "column",
+        "name": "paid"
+       }
+      },
+      "right": {
+       "node": "column",
+       "name": "paid"
+      }
+     },
+     "right": {
+      "node": "column",
+      "name": "paid"
+     }
+    },
+    "canonical": "paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid",
+    "type": "bool",
+    "eval": [
+     {
+      "row": {
+       "paid": true
+      },
+      "result": true
+     },
+     {
+      "row": {
+       "paid": null
+      },
+      "result": false
+     }
+    ]
+   }
+  },
+  {
+   "id": "depth-65-ands",
+   "text": "paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid AND paid",
+   "site": "predicate",
    "model": "invoices",
    "expect": {
     "verdict": "refused",
@@ -7877,7 +8400,7 @@
     },
     "canonical": "CASE WHEN paid THEN NULL ELSE net END",
     "type": "number",
-    "scale": 2,
+    "scale": "2",
     "eval": [
      {
       "row": {
@@ -8643,12 +9166,12 @@
        "name": "tax_rate"
       }
      },
-     "scale": 2,
+     "scale": "2",
      "mode": "HALF_AWAY_FROM_ZERO"
     },
     "canonical": "ROUND(net * tax_rate, 2)",
     "type": "number",
-    "scale": 2,
+    "scale": "2",
     "eval": [
      {
       "row": {
@@ -8787,7 +9310,7 @@
     },
     "canonical": "DAYS_BETWEEN(issue_date, due_date)",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -8813,7 +9336,7 @@
     },
     "canonical": "lines",
     "type": "number",
-    "scale": 0,
+    "scale": "0",
     "eval": [
      {
       "row": {
@@ -8850,7 +9373,7 @@
     },
     "canonical": "contract.monthly_fee",
     "type": "number",
-    "scale": 2,
+    "scale": "2",
     "eval": [
      {
       "row": {},

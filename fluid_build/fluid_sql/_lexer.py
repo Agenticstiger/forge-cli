@@ -36,6 +36,8 @@ from ._errors import FluidSqlError
 
 MAX_CODE_POINTS = 4096
 MAX_DEPTH = 64
+#: The most decimal places ROUND takes (founder pick, 2026-11-16): the widest DECIMAL scale.
+MAX_ROUND_PLACES = 38
 
 #: The words of the grammar. A column named like one of them is double-quoted.
 KEYWORDS = frozenset(

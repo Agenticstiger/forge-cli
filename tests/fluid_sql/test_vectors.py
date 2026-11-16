@@ -44,8 +44,9 @@ def test_file_lists_what_the_implementation_uses() -> None:
     assert DOCUMENT["reasonCodes"] == fs.REASONS
     assert sorted(DOCUMENT["keywords"]) == sorted(fs.KEYWORDS)
     assert DOCUMENT["functions"] == list(fs.FUNCTIONS)
-    assert DOCUMENT["limits"]["maxCodePoints"] == fs.MAX_CODE_POINTS
-    assert DOCUMENT["limits"]["maxDepth"] == fs.MAX_DEPTH
+    assert DOCUMENT["limits"]["maxCodePoints"] == str(fs.MAX_CODE_POINTS)
+    assert DOCUMENT["limits"]["maxDepth"] == str(fs.MAX_DEPTH)
+    assert DOCUMENT["limits"]["maxRoundPlaces"] == str(fs.MAX_ROUND_PLACES)
 
 
 def test_every_reason_code_is_exercised() -> None:
@@ -86,18 +87,21 @@ def test_vector_shape() -> None:
             assert expect["eval"], f"{vector['id']}: an accepted vector carries eval cases"
 
 
-def test_no_json_number_in_rows_or_results() -> None:
-    """Numbers are decimal strings, so no reader turns one into a binary double."""
-    for vector in VECTORS:
-        for case in vector["expect"].get("eval", []):
-            values = list(case["row"].values()) + [case["result"]]
-            for reached in (case.get("links") or {}).values():
-                values.extend((reached or {}).values())
-            for value in values:
-                assert not isinstance(value, (int, float)) or isinstance(value, bool), (
-                    vector["id"],
-                    value,
-                )
+def test_no_json_number_anywhere() -> None:
+    """Numbers, scales and limits are strings, as in flux-expr/1's vectors, so no reader
+    turns one into a binary double."""
+
+    def visit(value: Any, where: str) -> None:
+        if isinstance(value, dict):
+            for key, inner in value.items():
+                visit(inner, f"{where}.{key}")
+        elif isinstance(value, list):
+            for index, inner in enumerate(value):
+                visit(inner, f"{where}[{index}]")
+        else:
+            assert not isinstance(value, (int, float)) or isinstance(value, bool), where
+
+    visit(DOCUMENT, "$")
 
 
 def test_file_is_ascii() -> None:

@@ -274,7 +274,7 @@ integer     = digit , { digit } ;
 - Strings are single-quoted, with `''` for a quote inside. A number is digits with an optional fraction (`3`, `1.50`); there is no exponent, and a leading `-` is negation. The digits after the point are the literal's scale.
 - An `IN` list holds literals of one type. The `NULL` literal is never an `IN` item, nor an operand of `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=` or `BETWEEN`: such a comparison would always be FALSE (§2.5), so the validator refuses it and points to `IS NULL`. `a IS [NOT] DISTINCT FROM NULL` is allowed and means `a IS [NOT] NULL`.
 - Whitespace is space, tab and newline. The text holds no `;`, and `--` and `/*` are refused wherever they stand outside a string literal or a quoted name, before parsing: SQL reads them as comments (sqlglot reads `net--1 > 0` as `net`). A double negation is written `net - -1`.
-- The text is NFC-normalized before it is parsed. It is at most 4,096 code points long and nests at most 64 levels deep, the limits of EXPR-SPEC-2 §3. Depth: a literal or a column reference is 1 deep, and every other construct, and every pair of parentheses, is one deeper than the deepest thing directly inside it, so a chain of 63 `+` over 64 names is 64 deep.
+- The text is NFC-normalized before it is parsed. It is at most 4,096 code points long and nests at most 64 levels deep, the limits of EXPR-SPEC-2 §3. Depth: a literal or a column reference is 1 deep, and every other construct, and every pair of parentheses, is one deeper than the deepest thing directly inside it, so a chain of 63 `+` or `AND` over 64 names is 64 deep. `ROUND` takes at most 38 decimal places, the widest `DECIMAL` scale (founder picks, 2026-11-16, for both limits).
 - Precedence, tightest first: unary `-`; `*` and `/`; `+` and `-`; comparisons, `IN`, `BETWEEN` and `IS`; `NOT`; `AND`; `OR`. Comparisons do not chain.
 
 ### 2.2 Names and the row scope
@@ -346,7 +346,7 @@ Why two-valued: a row whose predicate is not TRUE does not satisfy it. Deequ's `
 
 | Call | Result |
 |---|---|
-| `ROUND(x, s)` | x rounded to s decimal places, ties away from zero, as warehouses round fixed-point numbers (founder pick, 2026-11-16); s is a non-negative integer literal; NULL gives NULL |
+| `ROUND(x, s)` | x rounded to s decimal places, ties away from zero, as warehouses round fixed-point numbers (founder pick, 2026-11-16); s is an integer literal from 0 to 38; NULL gives NULL |
 | `ROUND(x, s, 'HALF_TO_EVEN')` | ties to the even neighbor (banker's rounding), in Snowflake's spelling; `'HALF_AWAY_FROM_ZERO'` spells the default |
 | `COALESCE(a, b, ...)` | the first argument that is not NULL, else NULL; two or more arguments |
 | `CASE WHEN c THEN a ... [ELSE b] END` | as in SQL; without `ELSE`, NULL |

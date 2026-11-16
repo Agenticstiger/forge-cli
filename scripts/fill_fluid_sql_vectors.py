@@ -57,7 +57,9 @@ def main() -> int:
             "type": checked.type.kind,
         }
         if checked.type.kind == "number":
-            derived["scale"] = "unbounded" if checked.type.scale is None else checked.type.scale
+            derived["scale"] = (
+                "unbounded" if checked.type.scale is None else str(checked.type.scale)
+            )
         for key, value in derived.items():
             if key not in expect:
                 expect[key] = value

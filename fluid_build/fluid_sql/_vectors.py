@@ -195,7 +195,7 @@ def _compare_accepted(
     if checked.type.kind != expect["type"]:
         problems.append(f"type {checked.type.kind}, the vector says {expect['type']}")
     if checked.type.kind == NUMBER:
-        scale = "unbounded" if checked.type.scale is None else checked.type.scale
+        scale = "unbounded" if checked.type.scale is None else str(checked.type.scale)
         if scale != expect.get("scale"):
             problems.append(f"scale {scale}, the vector says {expect.get('scale')}")
     for index, case in enumerate(expect.get("eval", [])):

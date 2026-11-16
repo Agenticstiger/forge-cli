@@ -26,7 +26,7 @@ flux-expr/2 reproduces node for node, so its shape is part of the language:
 ``and``, ``or``    ``left``, ``right`` (left-associative)
 ``case``           ``whens``: ``[{when, then}]``, and ``else`` when written
 ``coalesce``       ``args``
-``round``          ``arg``, ``scale`` (an integer), ``mode``
+``round``          ``arg``, ``scale`` (its digits, a string), ``mode``
                    (``HALF_AWAY_FROM_ZERO`` or ``HALF_TO_EVEN``)
 ``date_diff``      ``unit`` (``day``, ``month`` or ``year``), ``from``, ``to``
 =================  =====================================================
@@ -327,7 +327,12 @@ def to_json(node: Node) -> Dict[str, Any]:
     if isinstance(node, Coalesce):
         return {"node": "coalesce", "args": [to_json(arg) for arg in node.args]}
     if isinstance(node, Round):
-        return {"node": "round", "arg": to_json(node.arg), "scale": node.scale, "mode": node.mode}
+        return {
+            "node": "round",
+            "arg": to_json(node.arg),
+            "scale": str(node.scale),
+            "mode": node.mode,
+        }
     if isinstance(node, DateDiff):
         return {
             "node": "date_diff",

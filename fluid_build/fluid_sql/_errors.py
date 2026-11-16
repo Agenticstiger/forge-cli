@@ -18,6 +18,7 @@ REASONS: Dict[str, str] = {
     "comment-or-semicolon": "a ';', '--' or '/*' outside a string literal or a quoted name",
     "syntax": "a text the grammar (RFC-data-rules.md section 2.1) does not derive",
     "too-deep": "nested deeper than 64 levels",
+    "round-places": "ROUND to more than 38 decimal places",
     "bad-date": "a DATE literal that is not a calendar date from 0001-01-01 to 9999-12-31 "
     "written YYYY-MM-DD",
     "multi-link-path": "a path over more than one link (rel.rel.col)",
