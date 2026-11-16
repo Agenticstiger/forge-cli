@@ -703,11 +703,25 @@ class TestAwsGrantPrincipalSpelling:
             "permissionsWithGrantOption": ["SELECT"],
         }
         contract = _aws_grants([STEWARD_GRANT, grant], restrictions=[DENY_ID])
-        with pytest.raises(UnsupportedBindingError):
-            res = _aws_resources(contract)
-            # Emitted at all, the analyst's grant must not reach the denied column.
-            for g in _table_reads(res, ANALYST_ARN):
-                assert "table" not in g
+        err = _refusal("aws", contract)
+        assert err.kind == "column-restriction-unenforceable"
+        assert "permissionsWithGrantOption" in str(err)
+
+    @pytest.mark.parametrize("restriction", [DENY_ID, MASK_MSISDN])
+    def test_validate_refuses_a_grant_option_select_under_a_column_limit_as_emit_does(
+        self, restriction
+    ):
+        from fluid_build.iac.governance_validation import validate_governance
+
+        grant = {
+            "principal": ANALYST_ARN,
+            "permissions": ["DESCRIBE"],
+            "permissionsWithGrantOption": ["SELECT"],
+        }
+        errors, _warnings = validate_governance(
+            _aws_grants([STEWARD_GRANT, grant], restrictions=[restriction])
+        )
+        assert any("permissionsWithGrantOption" in str(e) for e in errors), errors
 
     def test_a_masked_role_in_another_spelling_reads_the_view(self):
         grant = {"principal": ANALYST_SPELLINGS[0], "permissions": ["SELECT", "DESCRIBE"]}
@@ -742,3 +756,10 @@ class TestAwsGrantPrincipalSpelling:
         assert len(views) == 1
         sql = views[0]["view_original_text"] if "view_original_text" in views[0] else str(views[0])
         assert "WHERE" in sql and '"customer_id"' not in sql
+
+    def test_a_filter_that_excludes_nothing_writes_an_empty_exclusion_list(self):
+        """Real AWS, 2026-11-16: an omitted excluded_column_names reads back as an empty
+        set, and tofu apply fails "Provider produced inconsistent result after apply"."""
+        res = _aws_resources(_aws(row_filters=[CONSENT]))
+        (flt,) = res["aws_lakeformation_data_cells_filter"].values()
+        assert flt["table_data"][0]["column_wildcard"] == [{"excluded_column_names": []}]

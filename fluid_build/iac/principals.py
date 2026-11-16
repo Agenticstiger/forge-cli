@@ -344,13 +344,18 @@ def resolve_principal(
 def aws_principal_key(identity: Any) -> str:
     """One spelling of an AWS principal, to tell whether two name the same one.
 
-    IAM keeps one role (and one user) per name in an account, whatever its path,
-    and does not tell names apart by case ("IAM identifiers", IAM User Guide). So ``role/Analyst`` and ``role/data/analyst`` in one
-    account are the role ``role/analyst``: the key keeps the partition, account and
-    kind, and the name lower-cased, without the path. A whole account (its ID, or
-    its ``:root`` ARN) keys as the bare ID. Anything else is the text, trimmed.
+    IAM keeps one role (and one user) per name in an account, whatever its path, and
+    does not tell names apart by case (IAM API Reference, CreateRole ``RoleName``:
+    "Names are not distinguished by case"; ``Path`` is a separate parameter). So
+    ``role/Analyst`` and ``role/data/analyst`` in one account are the role
+    ``role/analyst``: the key keeps the partition, account and kind, and the name
+    lower-cased, without the path. A whole account (its ID, or its ``:root`` ARN)
+    keys as the bare ID. Anything else is the text, trimmed.
 
     The key is for comparison only. A grant is emitted with its principal as written.
+    On a live account Lake Formation refuses a spelling IAM does not hold ("Invalid
+    path for user", "Invalid principal"; seen 2026-11-16), so matching by key makes
+    ``fluid validate`` refuse or filter such a grant before ``apply`` ever sends it.
     """
     text = str(identity or "").strip()
     named = _AWS_IAM_NAMED_RE.fullmatch(text)

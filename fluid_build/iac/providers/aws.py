@@ -2959,9 +2959,10 @@ def lf_row_filters(
             raise UnsupportedBindingError(
                 "row-filter-unenforceable",
                 f"{where} filters {flt.principal}, but {at} gives {principal} SELECT in "
-                "permissionsWithGrantOption. The filtered role reads through the data cells "
-                "filter, with SELECT only, and a grant option would let it grant the table, "
-                "every row, to itself or anyone.",
+                "permissionsWithGrantOption. The filtered role reads through a data cells "
+                "filter, granted SELECT only: the grant option cannot go on the table without "
+                "letting the role grant every row, to itself or anyone, and dropping it would "
+                "take away a right the contract asks for.",
                 (
                     "Remove SELECT (and ALL) from permissionsWithGrantOption.",
                     "Grant the grant option to a principal no row filter names.",
@@ -3390,8 +3391,9 @@ def _emit_lakeformation(
             else:
                 # ``allColumns`` is the explicit form; absence defaults to it
                 # because LF requires one of these and "wildcard" is the
-                # natural row-only-filter behaviour.
-                col_block = {"column_wildcard": [{}]}
+                # natural row-only-filter behaviour. The empty list is written
+                # out: see _emit_lf_filtered_grant (an omitted one fails apply).
+                col_block = {"column_wildcard": [{"excluded_column_names": []}]}
             filter_key = safe_ident(f"{cid}_lf_filter_{table}_{filter_name}")
             resources.setdefault("aws_lakeformation_data_cells_filter", {})[filter_key] = {
                 "table_data": [_lf_filter_table_data(table_key, filter_name, row_expr, col_block)]
@@ -3485,7 +3487,11 @@ def _emit_lf_filtered_grant(
         )
     filter_key = safe_ident(f"{cid}_lf_rows_{table}_{flt.name}")
     columns_block: Dict[str, Any] = {
-        "column_wildcard": [{"excluded_column_names": list(excluded)} if excluded else {}]
+        # Always written, [] when nothing is excluded: hashicorp/aws reads an empty
+        # set back for an omitted list, and `tofu apply` then fails "Provider produced
+        # inconsistent result after apply ... excluded_column_names: was null, but now
+        # cty.SetValEmpty(cty.String)" (seen on real AWS, 2026-11-16).
+        "column_wildcard": [{"excluded_column_names": list(excluded or ())}]
     }
     resources.setdefault("aws_lakeformation_data_cells_filter", {})[filter_key] = {
         "table_data": [_lf_filter_table_data(table_key, flt.name, flt.where, columns_block)]

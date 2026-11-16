@@ -73,6 +73,8 @@ def lf_grant_reads(grant: Any) -> bool:
 
     ``SELECT`` (or ``ALL``) in either list counts: one held only with the grant option
     still lets the principal grant the table to itself, or to anyone, so it is a read.
+    This covers a grant the emitter skips (no ``permissions``) on purpose: the policy
+    derivations refuse it rather than reason about whether it will be written.
     """
     if not isinstance(grant, Mapping) or not grant.get("principal"):
         return False
@@ -427,6 +429,23 @@ def lf_exclusions(
                 (
                     "Remove excludedColumns from the grant (forge-cli writes it from the "
                     "restrictions), or change it or the restrictions until they match.",
+                ),
+            )
+        regrant = {str(p).upper() for p in grant.get("permissionsWithGrantOption") or ()}
+        if excluded and LF_READ_PERMISSIONS & regrant:
+            # Refused here, not first at emit, so `fluid validate` says it too.
+            raise UnsupportedBindingError(
+                "column-restriction-unenforceable",
+                f"{_lf_grant_where(where, i)} gives {principal} SELECT in "
+                f"permissionsWithGrantOption, and the contract's column restrictions withhold "
+                f"{list(excluded)} from it. Lake Formation takes the grant option on a "
+                "column-limited SELECT only with an include list, and on the table it would "
+                "let the principal grant itself the withheld columns.",
+                (
+                    "Remove SELECT (and ALL) from permissionsWithGrantOption; keep SELECT in "
+                    "permissions.",
+                    "Or name the columns it may read in the grant's columns, which keeps the "
+                    "grant option.",
                 ),
             )
         if excluded:
