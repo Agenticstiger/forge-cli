@@ -1457,7 +1457,7 @@ _ACCEPTED: Dict[Tuple[str, str, str], str] = {
     ),
     (
         "fluid_build/schema_manager.py",
-        "_unexpected_key",
+        "_unexpected_keys",
         "<run time: p>",
     ): (
         "mirrors jsonschema, which applies patternProperties with re.search; anything "
