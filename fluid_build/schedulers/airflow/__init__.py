@@ -4,8 +4,12 @@
 """Airflow schedule engine.
 
 Generates Airflow DAG Python files from FLUID contracts.  Provider-aware:
-dispatches to GCP, AWS, or Snowflake operator generators based on the
-``provider`` parameter.
+dispatches to GCP, AWS, or Snowflake operator emitters
+(:mod:`fluid_build.schedulers.airflow._operators`) based on the ``provider``
+parameter. This is the one renderer for a contract's ``orchestration`` section:
+``fluid generate schedule``, ``fluid export --engine airflow`` and the
+providers' ``export()`` all come through :func:`render_dag`.  A scheduled
+build's own DAG is :mod:`fluid_build.schedulers.airflow.fluid_apply`.
 """
 
 from __future__ import annotations
@@ -18,12 +22,29 @@ from fluid_build.providers.common.codegen_utils import (
     airflow_standard_import,
     convert_schedule_to_airflow,
     generate_file_header,
-    generate_task_dependencies_code,
     py_str_literal,
     sanitize_identifier,
+    unique_task_identifiers,
+)
+from fluid_build.schedulers.airflow._operators import (
+    EMITTERS,
+    HELPER_NAMES,
+    HELPERS,
+    IMPORTS,
+    RESERVED_NAMES,
+    TaskContext,
+    generic_task,
 )
 from fluid_build.schedulers.base import ScheduleEngine, ScheduleGenerationResult, ScheduleIntent
 from fluid_build.schedulers.registry import register_scheduler
+
+#: Header lines each provider adds to the DAG docstring, as
+#: ``{provider_config key: header key}``.
+_HEADER_FIELDS: Dict[str, Dict[str, str]] = {
+    "aws": {"account_id": "aws_account", "region": "aws_region"},
+    "gcp": {"project": "gcp_project", "region": "gcp_region"},
+    "snowflake": {"account": "snowflake_account", "database": "database", "warehouse": "warehouse"},
+}
 
 
 @register_scheduler
@@ -58,24 +79,15 @@ class AirflowScheduler(ScheduleEngine):
         provider_config = provider_config or {}
         provider_tasks = [t for t in tasks if t.get("type") == "provider_action"]
 
-        dag_code = generate_file_header(
-            contract_id=contract_id,
-            contract_name=contract_name,
-            provider=provider or "generic",
-            schedule=schedule,
-            timezone=timezone,
+        dag_code = _render(
+            contract_id,
+            contract_name,
+            schedule,
+            timezone,
+            provider,
+            provider_config,
+            provider_tasks,
         )
-        dag_code += "\n\n"
-        dag_code += _generate_imports(provider)
-        dag_code += "\n\n"
-        dag_code += _generate_dag_definition(
-            contract_id, contract_name, schedule, timezone, provider
-        )
-        dag_code += "\n\n"
-        dag_code += _generate_task_definitions(provider_tasks, provider, provider_config)
-        dag_code += "\n\n"
-        dag_code += generate_task_dependencies_code(provider_tasks, syntax="airflow")
-
         dag_filename = f"{sanitize_identifier(contract_id)}_dag.py"
         return {dag_filename: dag_code}
 
@@ -132,45 +144,126 @@ class AirflowScheduler(ScheduleEngine):
         return issues
 
 
+def render_dag(
+    contract: Dict[str, Any],
+    *,
+    provider: Optional[str] = None,
+    provider_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    """The DAG source for ``contract``'s ``orchestration`` section.
+
+    ``provider`` defaults to ``contract["provider"]``. ``provider_config`` takes
+    ``project`` / ``region`` (gcp), ``account_id`` / ``region`` (aws) and
+    ``connection_id`` / ``account`` / ``database`` / ``warehouse`` (snowflake).
+    Raises ``ValueError`` when the contract has no ``orchestration`` section or
+    it has no tasks: callers (a provider's ``export()``) turn that into their own
+    error.
+    """
+    orchestration = contract.get("orchestration")
+    if not orchestration:
+        raise ValueError("Contract missing orchestration section")
+    if not orchestration.get("tasks"):
+        raise ValueError("Orchestration has no tasks")
+    (files,) = (
+        AirflowScheduler()
+        .generate(contract, provider=provider, provider_config=provider_config)
+        .values()
+    )
+    return files
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _generate_imports(provider: Optional[str]) -> str:
-    """Generate import statements based on provider."""
+def _render(
+    contract_id: str,
+    contract_name: str,
+    schedule: str,
+    timezone: str,
+    provider: Optional[str],
+    provider_config: Dict[str, Any],
+    tasks: List[Dict[str, Any]],
+) -> str:
+    """Assemble one DAG file: header, imports, DAG, helpers, tasks, edges."""
+    provider_lower = (provider or "").lower()
+    emit = EMITTERS.get(provider_lower)
+    identifiers = unique_task_identifiers(tasks, reserved=RESERVED_NAMES)
+
+    task_blocks: List[str] = []
+    uses: set = set()
+    for task in tasks:
+        ctx = TaskContext(
+            task=task, var=identifiers[task.get("taskId") or ""], config=provider_config
+        )
+        code, used = (emit or (lambda c: generic_task(c)))(ctx)
+        task_blocks.append(code)
+        uses |= used
+
+    header_kwargs = {
+        header_key: provider_config[config_key]
+        for config_key, header_key in _HEADER_FIELDS.get(provider_lower, {}).items()
+        if provider_config.get(config_key)
+    }
+    dag_code = generate_file_header(
+        contract_id=contract_id,
+        contract_name=contract_name,
+        provider=provider or "generic",
+        schedule=schedule,
+        timezone=timezone,
+        **header_kwargs,
+    )
+    dag_code += "\n\n" + _generate_imports(uses)
+    dag_code += "\n\n" + _generate_dag_definition(
+        contract_id, contract_name, schedule, timezone, provider
+    )
+    helpers = [HELPERS[name] for name in HELPER_NAMES if name in uses]
+    if helpers:
+        dag_code += "\n\n# Helper functions\n\n" + "\n\n".join(h.rstrip() for h in helpers)
+    dag_code += "\n\n# Task definitions\n" + "\n\n".join(task_blocks)
+    dag_code += "\n\n" + _generate_dependencies(tasks, identifiers)
+    return dag_code
+
+
+def _generate_imports(uses: set) -> str:
+    """The shared imports plus one line per operator the tasks use."""
     base = (
         "from datetime import datetime, timedelta\n"
         "from zoneinfo import ZoneInfo\n"
         + airflow_dag_import()
         + airflow_standard_import("PythonOperator")
+        + "import json\nimport logging\n"
     )
-    base += """import json
-import logging
+    operators = [IMPORTS[name] for name in IMPORTS if name in uses]
+    if operators:
+        base += "\n".join(operators) + "\n"
+    return base + "\nlogger = logging.getLogger(__name__)"
 
-logger = logging.getLogger(__name__)"""
 
-    provider_lower = (provider or "").lower()
-    if provider_lower == "gcp":
-        base += """
-from airflow.providers.google.cloud.operators.bigquery import (
-    BigQueryCreateEmptyDatasetOperator,
-    BigQueryInsertJobOperator,
-)
-from airflow.providers.google.cloud.operators.gcs import (
-    GCSCreateBucketOperator,
-)"""
-    elif provider_lower == "aws":
-        base += """
-from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
-from airflow.providers.amazon.aws.operators.s3 import S3CreateBucketOperator
-from airflow.providers.amazon.aws.operators.athena import AthenaOperator
-from airflow.providers.amazon.aws.operators.step_function import StepFunctionStartExecutionOperator"""
-    elif provider_lower == "snowflake":
-        base += """
-from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator"""
+def _generate_dependencies(tasks: List[Dict[str, Any]], identifiers: Dict[str, str]) -> str:
+    """``upstream >> downstream`` for every edge between two tasks in this DAG.
 
-    return base
+    A dependency on a task that is not in the DAG (the non-``provider_action``
+    tasks are left out) is skipped with a comment. Emitting a name for it would
+    either leave an undefined name that fails the whole DAG at import, or, since
+    sanitising is not injective, wire the edge to a different task.
+    """
+    lines = ["# Task dependencies"]
+    for task in tasks:
+        depends_on = task.get("dependsOn") or []
+        downstream = identifiers[task.get("taskId") or ""]
+        present = [identifiers[d] for d in depends_on if d in identifiers]
+        for dep in depends_on:
+            if dep not in identifiers:
+                lines.append(f"# dependency on non-DAG task {dep!r} skipped".replace("\n", " "))
+        if len(present) == 1:
+            lines.append(f"{present[0]} >> {downstream}")
+        elif present:
+            lines.append(f"[{', '.join(present)}] >> {downstream}")
+    if len(lines) == 1:
+        lines.append("# No dependencies defined")
+    return "\n".join(lines)
 
 
 def _generate_dag_definition(
@@ -210,221 +303,4 @@ dag = DAG(
     start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo({py_str_literal(timezone)})),
     catchup=False,
     tags={tags!r},
-)"""
-
-
-def _generate_task_definitions(
-    tasks: List[Dict[str, Any]],
-    provider: Optional[str],
-    provider_config: Dict[str, Any],
-) -> str:
-    """Generate task definitions, dispatching by provider."""
-    task_code = "# Task definitions\n"
-    provider_lower = (provider or "").lower()
-
-    for task in tasks:
-        if provider_lower == "gcp":
-            task_code += _generate_gcp_task(task, provider_config)
-        elif provider_lower == "aws":
-            task_code += _generate_aws_task(task, provider_config)
-        elif provider_lower == "snowflake":
-            task_code += _generate_snowflake_task(task, provider_config)
-        else:
-            task_code += _generate_generic_task(task)
-        task_code += "\n\n"
-
-    return task_code.rstrip()
-
-
-def _generate_gcp_task(task: Dict[str, Any], config: Dict[str, Any]) -> str:
-    """Generate a GCP-specific Airflow task.
-
-    Every contract/config-derived value is emitted via ``sanitize_identifier``
-    (the LHS variable name) or ``py_str_literal`` (string kwargs) so untrusted
-    contract content cannot inject code into the generated DAG. Dict configs go
-    out via ``!r`` (repr of a dict is itself a safe, fully-escaped literal).
-    """
-    task_id = task.get("taskId")
-    action = task.get("action", "")
-    params = task.get("params", {})
-    project = config.get("project", "my-project")
-    region = config.get("region", "us-central1")
-
-    var = sanitize_identifier(task_id)
-    task_id_lit = py_str_literal(task_id)
-    project_lit = py_str_literal(project)
-    region_lit = py_str_literal(region)
-
-    action_parts = action.split(".")
-    if len(action_parts) >= 3:
-        service = action_parts[1]
-        operation = action_parts[2]
-
-        if service == "bigquery":
-            if operation == "create_dataset":
-                dataset_lit = py_str_literal(params.get("dataset_id", "unknown_dataset"))
-                location_lit = py_str_literal(params.get("location", region))
-                return f"""{var} = BigQueryCreateEmptyDatasetOperator(
-    task_id={task_id_lit},
-    dataset_id={dataset_lit},
-    project_id={project_lit},
-    location={location_lit},
-    dag=dag,
-)"""
-            elif operation in ("query", "run_query"):
-                query_sql = params.get("query", "SELECT 1")
-                bq_config = {"query": {"query": query_sql, "useLegacySql": False}}
-                return f"""{var} = BigQueryInsertJobOperator(
-    task_id={task_id_lit},
-    configuration={bq_config!r},
-    project_id={project_lit},
-    location={region_lit},
-    dag=dag,
-)"""
-        elif service in ("gcs", "storage"):
-            if operation in ("create_bucket", "ensure_bucket"):
-                bucket_lit = py_str_literal(params.get("bucket", "unknown-bucket"))
-                return f"""{var} = GCSCreateBucketOperator(
-    task_id={task_id_lit},
-    bucket_name={bucket_lit},
-    project_id={project_lit},
-    location={region_lit},
-    dag=dag,
-)"""
-
-    return _generate_generic_task(task)
-
-
-def _generate_aws_task(task: Dict[str, Any], config: Dict[str, Any]) -> str:
-    """Generate an AWS-specific Airflow task."""
-    task_id = task.get("taskId")
-    action = task.get("action", "")
-    params = task.get("params", {})
-    region = config.get("region", "us-east-1")
-
-    var = sanitize_identifier(task_id)
-    task_id_lit = py_str_literal(task_id)
-    region_lit = py_str_literal(region)
-
-    action_parts = action.split(".")
-    if len(action_parts) >= 3:
-        service = action_parts[1]
-        operation = action_parts[2]
-
-        if service == "glue":
-            job_name_lit = py_str_literal(params.get("job_name", task_id))
-            return f"""{var} = GlueJobOperator(
-    task_id={task_id_lit},
-    job_name={job_name_lit},
-    region_name={region_lit},
-    script_args={params.get("script_args", {})!r},
-    dag=dag,
-)"""
-        elif service == "s3":
-            if operation in ("create_bucket", "ensure_bucket"):
-                bucket_lit = py_str_literal(params.get("bucket", "unknown-bucket"))
-                return f"""{var} = S3CreateBucketOperator(
-    task_id={task_id_lit},
-    bucket_name={bucket_lit},
-    region_name={region_lit},
-    dag=dag,
-)"""
-        elif service == "athena":
-            query_lit = py_str_literal(params.get("query", "SELECT 1"))
-            database_lit = py_str_literal(params.get("database", "default"))
-            output_lit = py_str_literal(params.get("output_location", "s3://results/"))
-            return f"""{var} = AthenaOperator(
-    task_id={task_id_lit},
-    query={query_lit},
-    database={database_lit},
-    output_location={output_lit},
-    dag=dag,
-)"""
-
-    return _generate_generic_task(task)
-
-
-def _generate_snowflake_task(task: Dict[str, Any], config: Dict[str, Any]) -> str:
-    """Generate a Snowflake-specific Airflow task."""
-    task_id = task.get("taskId")
-    action = task.get("action", "")
-    params = task.get("params", {})
-    conn_id = config.get("connection_id", "snowflake_default")
-
-    var = sanitize_identifier(task_id)
-    task_id_lit = py_str_literal(task_id)
-    conn_lit = py_str_literal(conn_id)
-
-    action_parts = action.split(".")
-    if len(action_parts) >= 3:
-        operation = action_parts[2]
-
-        if operation in ("query", "run_query", "execute_sql"):
-            # repr() escapes embedded quotes / triple-quotes / newlines, so SQL
-            # cannot terminate the literal and inject a top-level statement.
-            sql_lit = py_str_literal(params.get("sql", params.get("query", "SELECT 1")))
-            return f"""{var} = SQLExecuteQueryOperator(
-    task_id={task_id_lit},
-    sql={sql_lit},
-    conn_id={conn_lit},
-    dag=dag,
-)"""
-
-    # Fallback: wrap action in a SQLExecuteQueryOperator SQL call (snowflake provider 6.0
-    # removed SnowflakeOperator)
-    sql_lit = py_str_literal(params.get("sql", f"-- TODO: implement {action}"))
-    return f"""{var} = SQLExecuteQueryOperator(
-    task_id={task_id_lit},
-    sql={sql_lit},
-    conn_id={conn_lit},
-    dag=dag,
-)"""
-
-
-def _generate_generic_task(task: Dict[str, Any]) -> str:
-    """Generate a generic Python task (no provider-specific operators).
-
-    **Quote safety:** the previous implementation interpolated
-    ``{params!r}`` (Python repr) inside a single-quoted string literal.
-    ``repr({'model': 'x'})`` returns ``"{'model': 'x'}"`` — a string
-    containing single quotes. When embedded in the lambda body as
-    ``'Action: foo, Params: {'model': 'x'}'`` the Python parser sees
-    the first inner ``'`` as a string terminator and fails with
-    ``SyntaxError: invalid syntax. Perhaps you forgot a comma?``
-    Airflow's scheduler rejects the DAG file at parse time; the DAG
-    never appears in ``airflow dags list``.
-
-    **Fix:** serialize via ``json.dumps`` (produces double-quoted
-    JSON, which is safe inside single-quoted Python strings) and
-    use ``repr()`` on the task_id + action strings so any embedded
-    quotes get properly escaped by Python's own repr machinery.
-    """
-    import json
-
-    task_id = task.get("taskId") or "unnamed_task"
-    action = task.get("action") or ""
-    params = task.get("params", {})
-
-    # repr() handles arbitrary quote content correctly by choosing the
-    # appropriate quote style and escaping where needed — safer than a
-    # naive f-string wrapping.
-    task_id_literal = repr(task_id)
-    action_literal = repr(action)
-    # json.dumps produces double-quoted JSON, embedded here inside
-    # the outer single-quoted f-string payload via repr().
-    params_json = repr(json.dumps(params, sort_keys=True))
-
-    # The Python identifier in ``<id> = PythonOperator(...)`` must be a legal
-    # Python name AND must match the identifier the dependency wiring emits, so
-    # route it through the shared ``sanitize_identifier`` (deterministic — the
-    # same task_id maps to the same variable in both the definition and the
-    # ``a >> b`` wiring).
-    py_id = sanitize_identifier(task_id)
-
-    return f"""{py_id} = PythonOperator(
-    task_id={task_id_literal},
-    python_callable=lambda: logger.info(
-        'Action: ' + {action_literal} + ', Params: ' + {params_json}
-    ),
-    dag=dag,
 )"""

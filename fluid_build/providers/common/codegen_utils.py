@@ -10,10 +10,11 @@ and ensure consistent behavior across AWS, GCP, and Snowflake providers.
 
 import json
 import keyword
+import logging
 import re
 from datetime import datetime
 from datetime import timezone as dt_timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List
 
 
 def sanitize_identifier(name: str) -> str:
@@ -55,13 +56,10 @@ def sanitize_identifier(name: str) -> str:
     # and ``a.b``) collapse to the same identifier. Callers must make it
     # unique themselves.
     #
-    # This used to claim that ``validate_contract_for_export`` / the
-    # schedulers' dup-id checks made collisions harmless. They do not: that
-    # validator runs only in the Snowflake and GCP providers, so on the
-    # ``generate-airflow`` path two colliding ids emitted two assignments to
-    # the same variable and one declared task silently vanished from the DAG.
-    # See ``runtimes/airflow_provider_actions._unique_task_identifiers`` for
-    # the sanitize-then-suffix treatment callers should apply.
+    # Two ids that differ only in punctuation still emit two assignments to one
+    # variable, and the second silently replaces the first. Callers that emit a
+    # variable per task use ``unique_task_identifiers`` (sanitize, then suffix
+    # on collision) instead of calling this per task.
     return sanitized
 
 
@@ -82,6 +80,46 @@ def task_identifier(name: Any) -> str:
     if raw[:1].isdigit():
         raw = f"task_{raw}"
     return sanitize_identifier(raw)
+
+
+def unique_task_identifiers(
+    tasks: List[Dict[str, Any]], reserved: Iterable[str] = ()
+) -> Dict[str, str]:
+    """Map each raw ``taskId`` to a Python variable name unique within one DAG.
+
+    :func:`sanitize_identifier` is not injective (``a-b`` and ``a.b`` both
+    become ``a_b``), so two tasks that differ only in punctuation used to emit
+    two assignments to one variable: the second overwrote the first and a
+    declared task vanished from the DAG with no error. Sanitise, then suffix on
+    collision.
+
+    ``reserved`` seeds the used set with the names the emitted module already
+    binds (``dag``, ``default_args``, the imported operator classes, ...), so a
+    ``taskId`` of ``dag`` cannot rebind one of them: the DAG would otherwise
+    break at task run time, not at import. Two tasks with the same raw id get
+    one identifier, because the DAG is keyed by task id and only the last
+    declaration can survive; a warning says so.
+    """
+    identifiers: Dict[str, str] = {}
+    used = set(reserved)
+    log = logging.getLogger(__name__)
+    for task in tasks:
+        raw = task.get("taskId") or ""
+        if raw in identifiers:
+            log.warning(
+                "airflow: duplicate taskId %r, only the last occurrence is emitted; "
+                "taskIds must be unique",
+                raw,
+            )
+            continue
+        base = sanitize_identifier(raw)
+        candidate, suffix = base, 2
+        while candidate in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        identifiers[raw] = candidate
+    return identifiers
 
 
 def py_str_literal(value: Any) -> str:
