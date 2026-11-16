@@ -22,7 +22,7 @@ REQUIRED_TOFU_VERSION = ">= 1.6"
 PROVIDER_PINS: Dict[str, Dict[str, str]] = {
     "google": {"source": "hashicorp/google", "version": "~> 6.0"},
     "aws": {"source": "hashicorp/aws", "version": "~> 6.0"},
-    "snowflake": {"source": "snowflakedb/snowflake", "version": "~> 2.0"},
+    "snowflake": {"source": "snowflakedb/snowflake", "version": "~> 2.23"},
     # Confluent Cloud — Tableflow (managed Kafka→Iceberg) + Glue catalog /
     # provider integration. The managed control plane owns compaction +
     # snapshot-expiry (RFC-streaming-extension §15).
