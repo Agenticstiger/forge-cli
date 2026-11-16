@@ -104,6 +104,7 @@ class TestFixture:
         assert {"registry", "trigger", "watermark", "checkpoint", "startingOffsets"} <= set(stream)
         assert contract["builds"][0]["properties"]["mapping"]["columns"][0]["maskAtIngest"]
         assert contract["builds"][0]["engine"] == "spark"
+        assert {"mskClusterArn", "auth", "groupIdPrefix"} <= set(_spark(contract)["source"])
         assert set(contract["packaging"]["containers"]) == set(PREVIEW_CONTAINER_KINDS)
 
     def test_077_stays_a_preview_and_076_the_default(self):
@@ -376,6 +377,20 @@ class TestSparkParameters:
                     "spark.dynamicAllocation.enabled": "true",
                 },
             },
+            {"runtime": "emr-serverless", "source": {"bootstrapServers": "b-1.kafka:9092"}},
+            {
+                "runtime": "emr-serverless",
+                "source": {"bootstrapServers": "b-1:9092,b-2:9092", "auth": "none"},
+            },
+            {
+                "runtime": "emr-eks",
+                "virtualClusterId": "abcdefghij0123456789klmno",  # pragma: allowlist secret
+                "source": {
+                    "mskClusterArn": "arn:aws-cn:kafka:cn-north-1:123456789012:cluster/c/uuid-1",
+                    "auth": "msk-iam",
+                    "groupIdPrefix": "orders",
+                },
+            },
         ],
     )
     def test_accepted(self, manager, spark):
@@ -403,6 +418,38 @@ class TestSparkParameters:
             {"runtime": "emr-serverless", "sparkConf": {"spark.executor.instances": 4}},
             {"runtime": "emr-serverless", "sparkConf": {"bad key": "x"}},
             {"runtime": "emr-serverless", "entryPoint": "s3://bucket/job.py"},
+            # parameters.spark.source: exactly one of bootstrapServers / mskClusterArn.
+            {"runtime": "emr-serverless", "source": {}},
+            {"runtime": "emr-serverless", "source": {"auth": "msk-iam"}},
+            {
+                "runtime": "emr-serverless",
+                "source": {
+                    "bootstrapServers": "b-1:9092",
+                    "mskClusterArn": "arn:aws:kafka:eu-west-1:123456789012:cluster/c/u",
+                },
+            },
+            {"runtime": "emr-serverless", "source": {"mskClusterArn": "arn:aws:kafka:eu-west-1"}},
+            {
+                "runtime": "emr-serverless",
+                "source": {"mskClusterArn": "arn:aws:kafka:eu-west-1:1234:cluster/c/u"},
+            },
+            {
+                "runtime": "emr-serverless",
+                "source": {"mskClusterArn": "arn:aws:iam::123456789012:role/not-a-cluster"},
+            },
+            {
+                "runtime": "emr-serverless",
+                "source": {"mskClusterArn": "arn:aws:kafka:eu-west-1:123456789012:cluster/c\n"},
+            },
+            {"runtime": "emr-serverless", "source": {"bootstrapServers": ""}},
+            {
+                "runtime": "emr-serverless",
+                "source": {"bootstrapServers": "b:9092", "auth": "scram"},
+            },
+            {
+                "runtime": "emr-serverless",
+                "source": {"bootstrapServers": "b:9092", "schemaRegistryUrl": "https://r"},
+            },
         ],
     )
     def test_rejected(self, manager, spark):
@@ -418,6 +465,21 @@ class TestSparkParameters:
         assert props["releaseLabel"]["default"] == "emr-7.12.0"
         assert "builds[].execution" in spark["description"]
         assert "execution.runtime" in spark["description"]
+
+    def test_the_kafka_source_mirrors_flink_and_defers_the_registry(self, manager):
+        source = manager._bundled_schemas["0.7.7"]["$defs"]["sparkParameters"]["properties"][
+            "source"
+        ]
+        assert source["oneOf"] == [
+            {"required": ["bootstrapServers"]},
+            {"required": ["mskClusterArn"]},
+        ]
+        assert source["properties"]["auth"]["enum"] == ["msk-iam", "none"]
+        assert "msk-iam with mskClusterArn" in source["properties"]["auth"]["description"]
+        assert "parameters.flink.source.bootstrapServers" in (
+            source["properties"]["bootstrapServers"]["description"]
+        )
+        assert "properties.stream.registry" in source["description"]
 
     def test_other_parameters_stay_free_form(self, manager):
         contract = _fixture()

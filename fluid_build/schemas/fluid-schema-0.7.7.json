@@ -3901,6 +3901,47 @@
             "type": "string"
           },
           "description": "Spark configuration properties for the job, name to string value (spark.sql.shuffle.partitions: \"64\")."
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The Kafka connection a streaming Spark build reads, as parameters.flink.source is for a Flink build. Exactly one of bootstrapServers or mskClusterArn. The schema registry is not here: it is properties.stream.registry ($defs/schemaRegistry).",
+          "oneOf": [
+            {
+              "required": [
+                "bootstrapServers"
+              ]
+            },
+            {
+              "required": [
+                "mskClusterArn"
+              ]
+            }
+          ],
+          "properties": {
+            "bootstrapServers": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Comma-separated host:port list of Kafka brokers. Same name and shape as parameters.flink.source.bootstrapServers."
+            },
+            "mskClusterArn": {
+              "type": "string",
+              "pattern": "^arn:aws[a-z-]*:kafka:[a-z0-9-]+:[0-9]{12}:cluster/.+(?![\\s\\S])",
+              "description": "An Amazon MSK cluster. OpenTofu resolves its brokers through an MSK data source at plan time."
+            },
+            "auth": {
+              "enum": [
+                "msk-iam",
+                "none"
+              ],
+              "description": "How the job authenticates to the brokers. Absent: msk-iam with mskClusterArn, none with bootstrapServers. SASL/SCRAM is not supported yet."
+            },
+            "groupIdPrefix": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Prefix for the consumer group ids Spark generates (the Kafka source's groupIdPrefix option). Absent: Spark's default."
+            }
+          }
         }
       },
       "allOf": [
