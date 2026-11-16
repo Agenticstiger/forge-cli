@@ -328,7 +328,9 @@ def test_a_missing_sqlite_database_is_refused_and_not_created(tmp_path):
 @pytest.mark.parametrize(
     "line, words",
     [
-        ('{"a": ' + "[" * 100000 + "]" * 100000 + "}", "nests too deeply"),
+        # Python 3.14 bounds this by the C stack, not the recursion limit, and
+        # parses 100,000 levels; 1,000,000 is past it on every supported Python.
+        ('{"a": ' + "[" * 1_000_000 + "]" * 1_000_000 + "}", "nests too deeply"),
         ('{"a": ' + "9" * 5000 + "}", "integer too long"),
     ],
 )
