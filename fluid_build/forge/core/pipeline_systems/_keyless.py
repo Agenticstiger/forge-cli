@@ -213,17 +213,20 @@ def _github_token_script(file_name: str, audience: str, exports: List[str]) -> "
     """A step that fetches the job's ID token for ``audience`` into a mode-600
     file under ``$RUNNER_TEMP``, masks it, and exports ``exports`` (``NAME=value``
     shell snippets) to the later steps."""
+    # -H @- reads the header from stdin, so the request token is in no process's
+    # argv (another user of a shared self-hosted runner could read that).
+    header = '<<<"Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"'
     if audience == "snowflakecomputing.com":
         fetch = (
-            'curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" '
-            '"$ACTIONS_ID_TOKEN_REQUEST_URL&audience=snowflakecomputing.com"'
+            'curl -sSf -H @- "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=snowflakecomputing.com" '
+            + header
         )
     else:
         # -G puts the audience in the query string, URL-encoded, after the
         # runner's own query (curl joins it with &).
         fetch = (
-            'curl -sSfG -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" '
-            '--data-urlencode "audience=$OIDC_AUDIENCE" "$ACTIONS_ID_TOKEN_REQUEST_URL"'
+            'curl -sSfG -H @- --data-urlencode "audience=$OIDC_AUDIENCE" '
+            '"$ACTIONS_ID_TOKEN_REQUEST_URL" ' + header
         )
     # -I (isolated): the job's working directory is the checked-out repository, and a
     # json.py committed there would otherwise run while the token request is in reach.

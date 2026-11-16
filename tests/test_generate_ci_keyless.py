@@ -253,6 +253,8 @@ def test_github_snowflake_step_is_wif_from_a_masked_token_file(tmp_path, monkeyp
     run = step["run"]
     assert "audience=snowflakecomputing.com" in run
     assert "ACTIONS_ID_TOKEN_REQUEST_URL" in run and "ACTIONS_ID_TOKEN_REQUEST_TOKEN" in run
+    # The request token reaches curl on stdin, never in its argv.
+    assert "-H @- " in run and '-H "Authorization' not in run
     assert "jq" not in run
     assert "::add-mask::" in run
     # Written under umask 077 and swapped in whole, so the file is 0600 and never half-written.
@@ -284,6 +286,9 @@ def test_the_github_token_script_keeps_the_last_token_when_a_refresh_fails(tmp_p
     # curl answers once, then fails; sleep lets one refresh through, then ends the loop.
     stand_ins = {
         "curl": 'n=$(cat "$STATE/curl" 2>/dev/null || echo 0); echo $((n + 1)) > "$STATE/curl"\n'
+        # The header arrives on stdin (-H @-), not in the arguments.
+        'IFS= read -r header; [ "$header" = "Authorization: bearer request-token" ] || exit 9\n'
+        'case " $* " in *request-token*) exit 8;; esac\n'
         '[ "$n" = 0 ] && echo \'{"value": "id-token-1"}\' && exit 0\nexit 22\n',
         "sleep": 'n=$(cat "$STATE/sleep" 2>/dev/null || echo 0); echo $((n + 1)) > "$STATE/sleep"\n'
         '[ "$n" = 0 ] && exit 0\ntouch "$STATE/done"\nexit 1\n',
@@ -301,7 +306,12 @@ def test_the_github_token_script_keeps_the_last_token_when_a_refresh_fails(tmp_p
         "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "request-token",  # pragma: allowlist secret
     }
     result = subprocess.run(
-        ["bash", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=30
+        ["bash", "-c", step["run"]],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     assert result.returncode == 0, result.stderr
     assert "::add-mask::id-token-1" in result.stdout
