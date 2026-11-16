@@ -76,13 +76,15 @@ from .base import (
 _STABLE_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_-]+")
 
 # ``dqRule.operator`` (fluid-schema ``$defs.dqRule``) → the ODCS
-# ``$defs.DataQualityOperators`` key with the same meaning. The ODCS definition
-# is a ``oneOf``, so a rule carries exactly one of these and no more.
-_DQ_OPERATORS = {
-    ">=": "mustBeGreaterOrEqualTo",
-    ">": "mustBeGreaterThan",
-    "<=": "mustBeLessOrEqualTo",
-    "<": "mustBeLessThan",
+# ``$defs.DataQualityOperators`` key that holds on the BAD share. FLUID's threshold is the share
+# of rows that pass; the ODCS metrics we map to count bad rows, so ``share <op> t`` becomes
+# ``bad <mirrored-op> 1 - t`` (the SodaCL exporter's ``_MIRRORED_OPERATORS``). The ODCS
+# definition is a ``oneOf``, so a rule carries exactly one of these and no more.
+_DQ_MIRRORED_OPERATORS = {
+    ">=": "mustBeLessOrEqualTo",
+    ">": "mustBeLessThan",
+    "<=": "mustBeGreaterOrEqualTo",
+    "<": "mustBeGreaterThan",
     "==": "mustBe",
     "!=": "mustNotBe",
 }
@@ -415,18 +417,36 @@ def _dq_rule_to_quality(rule: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any
 
 
 def _dq_threshold(rule: Mapping[str, Any]) -> Dict[str, Any]:
-    """The rule's ODCS comparison operator — exactly one key, as ODCS requires.
+    """The rule's ODCS comparison: exactly one operator key, plus ``unit`` when it is a share.
 
-    ``mustBe: 0`` is the default because that is what a bare
-    completeness/uniqueness rule means: no failing rows tolerated. An operator
-    with no threshold to compare against falls back to it rather than emitting
-    an operator with no value, which no ODCS consumer could evaluate.
+    FLUID's ``threshold`` for completeness, uniqueness and valid_values is the share of rows
+    that PASS (``util/dq_checks.py``): ``1.0`` with ``>=`` means every row. The ODCS metrics
+    these map to (``nullValues``, ``duplicateValues``, ``invalidValues``) count the BAD rows, so
+    copying the threshold across would invert the rule. Instead:
+
+    * no threshold, or ``1.0`` with ``>=``/``==``: ``mustBe: 0``, a count of bad rows;
+    * anything else: the comparison is mirrored onto the bad share, as a percentage
+      (``>= 0.95`` -> ``mustBeLessOrEqualTo: 5`` with ``unit: percent``), the same arithmetic
+      the SodaCL exporter does.
+
+    An operator with no threshold falls back to ``mustBe: 0`` rather than an operator with no
+    value, which no ODCS consumer could evaluate.
     """
     threshold = rule.get("threshold")
-    operator = _DQ_OPERATORS.get(rule.get("operator") or "")
-    if operator and threshold is not None:
-        return {operator: threshold}
-    return {"mustBe": 0}
+    op = rule.get("operator") or ""
+    mirrored = _DQ_MIRRORED_OPERATORS.get(op)
+    if mirrored is None or threshold is None or isinstance(threshold, bool):
+        return {"mustBe": 0}
+    try:
+        share = float(threshold)
+    except (TypeError, ValueError):
+        return {"mustBe": 0}
+    if share == 1.0 and op in (">=", "=="):
+        return {"mustBe": 0}
+    bad_percent = round((1.0 - share) * 100, 6)
+    if bad_percent == int(bad_percent):
+        bad_percent = int(bad_percent)
+    return {mirrored: bad_percent, "unit": "percent"}
 
 
 def _dq_severity(check: Dict[str, Any], rule: Mapping[str, Any]) -> None:
