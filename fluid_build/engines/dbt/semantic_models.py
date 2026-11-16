@@ -707,7 +707,7 @@ def _model_window(semantics: Mapping[str, Any], expose_id: Any) -> Optional[Tupl
     if window is None and declares_validity_params(semantics):
         logger.warning(
             "semantic_models: expose %r declares validityParams that do not form a validity "
-            "window (fluid validate names the problem) — validity params dropped",
+            "window (fluid validate names the problem), so its validity params are dropped",
             expose_id,
         )
     return window
@@ -730,7 +730,7 @@ def _model_measures(
         if semantics.get("measures"):
             logger.warning(
                 "semantic_models: expose %r has measures beside a validity window, which "
-                "dbt MetricFlow does not accept — measures + metrics dropped",
+                "dbt MetricFlow does not accept: measures + metrics dropped",
                 get_expose_id(expose),
             )
         return None, []
@@ -739,7 +739,7 @@ def _model_measures(
         if semantics.get("measures"):
             logger.warning(
                 "semantic_models: expose %r has measures but no resolvable "
-                "time dimension — measures + metrics dropped",
+                "time dimension: measures + metrics dropped",
                 get_expose_id(expose),
             )
         return None, []

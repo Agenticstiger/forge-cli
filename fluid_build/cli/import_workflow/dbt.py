@@ -1541,15 +1541,15 @@ def _attach_relationships(contracts: List[Dict[str, Any]], report: ImportReport)
                 if not local:
                     others = ", ".join(sorted(str(t["exposeId"]) for _, t in matches))
                     report.unsupported.append(
-                        f"{label} joins {others} in another product — no relationship written "
+                        f"{label} joins {others} in another product, so no relationship is written "
                         "(a relationship names an expose of its own contract)"
                     )
                     continue
                 if len(local) > 1:
                     candidates = ", ".join(sorted(str(t["exposeId"]) for t in local))
                     report.unsupported.append(
-                        f"{label} matches {len(local)} exposes ({candidates}) — no "
-                        "relationship written (its target is ambiguous)"
+                        f"{label} matches {len(local)} exposes ({candidates}), so no "
+                        "relationship is written (its target is ambiguous)"
                     )
                     continue
                 target = local[0]
@@ -1566,7 +1566,7 @@ def _attach_relationships(contracts: List[Dict[str, Any]], report: ImportReport)
                 ):
                     report.unsupported.append(
                         f"{label}: its key {from_column!r} -> {target['exposeId']}.{to_column!r} "
-                        "is not a column both exposes declare — no relationship written"
+                        "is not a column both exposes declare, so no relationship is written"
                     )
                     continue
                 relationships = semantics.setdefault("relationships", [])
@@ -1601,7 +1601,7 @@ def _pin_relationships_version(contracts: List[Dict[str, Any]], report: ImportRe
         if needed is None:
             continue
         report.notes.append(
-            f"{contract['id']}: fluidVersion {needed} (preview) — the contract carries "
+            f"{contract['id']}: fluidVersion {needed} (preview), because the contract carries "
             f"relationships or an SCD validity window, which only the {needed} schema holds"
         )
         contract["fluidVersion"] = needed
