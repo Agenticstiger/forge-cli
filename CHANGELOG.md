@@ -325,6 +325,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `from` expose only, when that expose has the column, named after the target's key entity so
   MetricFlow joins them. A contract forged into one expose (intent, DDL, dimensional) keeps
   every relationship's, as before.
+- **Nothing warned when a dimension shared its dbt MetricFlow name with an entity or another
+  dimension.** Within one expose, the dbt export keeps the first, entities before dimensions,
+  and dropped the dimension without a word. A name that is a dimension of one expose and an entity of another
+  makes `dbt parse` reject the export whenever the project declares a metric
+  (dbt-semantic-interfaces' `ElementConsistencyRule`). `fluid validate` now warns about both,
+  comparing the names the export writes, so `--strict` fails on them.
 - **A natural entity made `fluid generate transformation` write a dbt project `dbt parse`
   rejected.** dbt accepts a `natural` entity only beside a validity window, and validates the
   semantic layer whenever the project has a metric, so a contract with a natural entity and a

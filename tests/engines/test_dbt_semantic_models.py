@@ -370,16 +370,6 @@ class TestDefaultingRules:
         doc = _emit(_contract(semantics=semantics))
         assert "metrics" not in doc
 
-    def test_duplicate_element_names_dropped_first_wins(self):
-        # A measure named like an existing dimension collides in
-        # MetricFlow's per-model namespace → the measure is dropped.
-        semantics = _semantics()
-        semantics["measures"].append({"name": "status", "agg": "sum", "expr": "amount"})
-        doc = _emit(_contract(semantics=semantics))
-        measures = [m["name"] for m in _model(doc)["measures"]]
-        assert "status" not in measures
-        assert measures == ["order_total", "order_count"]
-
     def test_names_sanitized_for_metricflow(self):
         semantics = _semantics(
             measures=[{"name": "order total ($)", "agg": "sum", "expr": "amount"}],
@@ -389,6 +379,43 @@ class TestDefaultingRules:
         (measure,) = _model(doc)["measures"]
         assert measure["name"] == "order_total"
         assert doc["metrics"][0]["type_params"] == {"measure": "order_total"}
+
+
+@pytest.mark.unit
+class TestOneNamespacePerModel:
+    """MetricFlow holds one element per name in a model; ``fluid validate`` warns."""
+
+    @pytest.mark.parametrize(
+        "collection, entry, kept",
+        [
+            # A measure named like a dimension: the measure is dropped.
+            ("measures", {"name": "status", "agg": "sum", "expr": "amount"}, "dimensions"),
+            # A dimension named like an entity: the dimension is dropped.
+            ("dimensions", {"name": "customer", "type": "categorical"}, "entities"),
+            # A second dimension of one MetricFlow name: the second is dropped.
+            ("dimensions", {"name": "status!", "type": "categorical", "expr": "y"}, "dimensions"),
+        ],
+    )
+    def test_duplicate_element_names_dropped_first_wins(self, collection, entry, kept):
+        # The first keeps the name: entities, then dimensions, then measures.
+        semantics = _semantics()
+        first = next(
+            dict(element)
+            for kind in ("entities", "dimensions")
+            for element in semantics[kind]
+            if element["name"] == entry["name"].rstrip("!")
+        )
+        semantics[collection].append(entry)
+        model = _model(_emit(_contract(semantics=semantics)))
+        named = [
+            (kind, element)
+            for kind in ("entities", "dimensions", "measures")
+            for element in model.get(kind, [])
+            if element["name"] == first["name"]
+        ]
+        assert [(kind, element.get("expr")) for kind, element in named] == [
+            (kept, first.get("expr"))
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1077,3 +1104,56 @@ def test_a_forged_contract_exports_each_foreign_entity_on_its_from_model(tmp_pat
         "customers": [],
         "order_lines": [("order", "order_id")],
     }
+
+
+def _region_clash_contract(*, with_metric: bool) -> Dict[str, Any]:
+    """``region`` is a dimension of orders and an entity of stores."""
+    semantics = _semantics(entities=[{"name": "order", "type": "primary", "expr": "order_id"}])
+    semantics["dimensions"].append({"name": "region", "type": "categorical"})
+    if not with_metric:
+        semantics.pop("measures")
+        semantics.pop("metrics")
+    contract = _contract(semantics=semantics)
+    contract["exposes"][0]["contract"]["schema"].append({"name": "region", "type": "STRING"})
+    contract["exposes"].append(
+        {
+            "exposeId": "stores",
+            "kind": "table",
+            "contract": {
+                "schema": [
+                    {"name": "store_id", "type": "STRING", "primaryKey": True},
+                    {"name": "region_id", "type": "STRING"},
+                ]
+            },
+            "semantics": {
+                "entities": [
+                    {"name": "store", "type": "primary", "expr": "store_id"},
+                    {"name": "region", "type": "foreign", "expr": "region_id"},
+                ]
+            },
+        }
+    )
+    return contract
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+class TestLiveElementNames:
+    """What ``fluid validate``'s name warnings say about dbt, against a real ``dbt parse``."""
+
+    def test_a_dimension_named_like_another_model_s_entity_fails_dbt_parse(
+        self, tmp_path: Path, capsys
+    ):
+        from fluid_build.forge_datamodel.semantics_builder import validate_semantics_block
+
+        contract = _region_clash_contract(with_metric=True)
+        _, warnings = validate_semantics_block(contract)
+        assert any("`dbt parse` rejects the export" in w for w in warnings), warnings
+        exit_code, _ = _generate_with_dbt_validate(contract, tmp_path)
+        output = capsys.readouterr().out
+        assert exit_code != 0, output
+        assert "element `region` is of type" in output and "across the model" in output, output
+
+    def test_dbt_checks_element_types_only_when_a_metric_exists(self, tmp_path: Path):
+        contract = _region_clash_contract(with_metric=False)
+        assert _generate_with_dbt_validate(contract, tmp_path)[0] == 0

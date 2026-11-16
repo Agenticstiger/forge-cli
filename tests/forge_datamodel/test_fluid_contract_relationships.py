@@ -243,3 +243,31 @@ def test_no_entity_keys_on_a_column_its_expose_lacks():
         "customers": [],
         "order_lines": [("orders", "order_id")],
     }
+
+
+def test_a_one_expose_contract_with_two_relationships_to_one_target_validates_clean():
+    """The one expose repeats the target's foreign entity, as on main; validate says nothing."""
+    from fluid_build.copilot.schemas.data_model import (
+        DimensionalModel,
+        DimensionTable,
+        FactTable,
+    )
+
+    invoices = _dataset("invoices", ["invoice_id"], ["invoice_id", "customer_id"])
+    invoices_to_customers = _relationship(
+        "invoices_to_customers", "invoices", "customers", ["customer_id"], ["customer_id"]
+    )
+    logical = _logical(
+        [_ORDERS_TO_CUSTOMERS, invoices_to_customers],
+        technique="dimensional",
+        dimensional=DimensionalModel(
+            facts=[FactTable(name="fact_orders", grain_statement="one row per order")],
+            dimensions=[DimensionTable(name="dim_customer")],
+        ),
+    )
+    logical.osi.datasets.append(invoices)
+    contract = build_contract_from_logical(logical)
+    (expose,) = contract["exposes"]
+    names = [e["name"] for e in expose["semantics"]["entities"] if e["type"] == "foreign"]
+    assert names.count("customers") == 2
+    assert validate_semantics_block(contract) == ([], [])

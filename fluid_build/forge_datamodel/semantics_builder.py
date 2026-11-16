@@ -27,7 +27,18 @@ when the expression is a single aggregate call, and
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import (
+    Any,
+    Dict,
+    FrozenSet,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from fluid_build.forge_datamodel import time_grains as _time_grains
 
@@ -175,6 +186,10 @@ def validate_semantics_block(contract: Mapping[str, Any]) -> Tuple[List[str], Li
     contracts carrying the collision still answer queries correctly, so
     failing them outright would break working models.
 
+    WARNS too on the dbt MetricFlow name clashes the export drops a dimension
+    for or ``dbt parse`` rejects (:func:`_shared_name_warnings`,
+    :func:`_element_type_warnings`).
+
     Checks the references of ``relationships`` (schema 0.7.7,
     RFC-semantics-tier1 §4) that a JSON Schema cannot: ``to`` is an expose
     of this contract, ``fromColumns`` and ``toColumns`` have the same length
@@ -244,7 +259,9 @@ def validate_semantics_block(contract: Mapping[str, Any]) -> Tuple[List[str], Li
                 f"by the underlying column."
             )
         warnings.extend(_name_collision_warnings(semantics, expose_id))
+        warnings.extend(_shared_name_warnings(semantics, _expose_path(expose, position)))
         errors.extend(_validity_window_errors(semantics, _expose_path(expose, position)))
+    warnings.extend(_element_type_warnings(exposes))
     relationship_errors, relationship_warnings = _relationship_findings(exposes)
     errors.extend(relationship_errors)
     warnings.extend(relationship_warnings)
@@ -628,6 +645,151 @@ def _name_collision_warnings(semantics: Mapping[str, Any], expose_id: str) -> Li
             f"measure grouped by that dimension is rejected because both columns "
             f"would be projected under one name and one value would be silently "
             f"dropped from every row. Rename one of them."
+        )
+    return messages
+
+
+#: The collections the dbt export writes into one MetricFlow namespace per semantic model, in
+#: the order it fills it: of two elements with one name, the first wins and the other is dropped
+#: (``engines/dbt/semantic_models``: ``_build_entities``, then ``_build_dimensions``).
+_NAMESPACE_COLLECTIONS = (("entities", "entity"), ("dimensions", "dimension"))
+
+#: The entity types the dbt export knows (``engines/dbt/semantic_models._build_entities``).
+_EXPORT_ENTITY_TYPES = frozenset({"primary", "unique", "foreign", "natural"})
+
+
+class _Element(NamedTuple):
+    """An entity or dimension of one model, where the contract declares it."""
+
+    kind: str
+    collection: str
+    index: int
+    entry: Mapping[str, Any]
+
+    @property
+    def name(self) -> str:
+        return str(self.entry["name"])
+
+
+def _is_exported(kind: str, entry: Any, exported_types: FrozenSet[str]) -> bool:
+    """True when the dbt export writes ``entry``, a named entity or dimension.
+
+    It reads an entity of no type, or of a type it does not know, as ``foreign``.
+    """
+    if not isinstance(entry, Mapping) or not entry.get("name"):
+        return False
+    if kind != "entity":
+        return True
+    entity_type = str(entry.get("type") or "foreign").strip().lower()
+    return (entity_type if entity_type in _EXPORT_ENTITY_TYPES else "foreign") in exported_types
+
+
+def _exported_elements(
+    semantics: Mapping[str, Any],
+) -> Tuple[Dict[str, _Element], List[Tuple[str, _Element, _Element]]]:
+    """The entities and dimensions of a model as the dbt export writes them.
+
+    Returns ``(kept, dropped)``: ``kept`` maps each MetricFlow name to the element that holds
+    it, and ``dropped`` lists ``(name, element, holder)`` for each element whose name an
+    earlier one holds. An entity of a type the export leaves out (natural without a validity
+    window; primary or unique beside one) holds no name.
+    """
+    exported_types = _exported_entity_types(semantics)
+    kept: Dict[str, _Element] = {}
+    dropped: List[Tuple[str, _Element, _Element]] = []
+    for collection, kind in _NAMESPACE_COLLECTIONS:
+        for index, entry in enumerate(_as_list(semantics.get(collection))):
+            if not _is_exported(kind, entry, exported_types):
+                continue
+            name = metricflow_name(entry["name"])
+            if not name:
+                continue
+            element = _Element(kind, collection, index, entry)
+            if name in kept:
+                dropped.append((name, element, kept[name]))
+            else:
+                kept[name] = element
+    return kept, dropped
+
+
+def _shared_name_warnings(semantics: Mapping[str, Any], expose_path: str) -> List[str]:
+    """Warn for each dimension the dbt export drops because an entity or dimension has its name.
+
+    MetricFlow holds one element per name in a semantic model (dbt-semantic-interfaces'
+    ``UniqueAndValidNameRule`` and ``ElementConsistencyRule``), so the export keeps the first and
+    drops the other without a word. A clash with a validity window bound is already an error
+    (:func:`_validity_window_errors`). Two entities of one name are not reported: the one-expose
+    shape of ``fluid forge data-model`` writes a foreign entity per relationship, named after its
+    target, so two relationships to one target repeat a name.
+    """
+    _, dropped = _exported_elements(semantics)
+    messages: List[str] = []
+    for name, element, holder in dropped:
+        if (
+            element.kind == "entity"
+            or _validity_params(element.entry) is not None
+            or _validity_params(holder.entry) is not None
+        ):
+            continue
+        messages.append(
+            f"{expose_path}.semantics.{element.collection}[{element.index}]: {element.kind} "
+            f"{element.name!r} and {holder.kind} {holder.name!r} are one dbt MetricFlow name, "
+            f"{name!r}. Entities and dimensions share one namespace in a semantic model, so the "
+            f"dbt export keeps {holder.kind} {holder.name!r} and drops this {element.kind}. "
+            f"Rename one of them."
+        )
+    return messages
+
+
+def _modelled_exposes(exposes: Sequence[Any]) -> List[Tuple[str, Mapping[str, Any]]]:
+    """``(path, semantics)`` of each expose the dbt export writes a semantic model for.
+
+    As in the export, an expose with no semantics has none, and the first expose of each model
+    name (its exposeId as a MetricFlow name) has the model.
+    """
+    found: List[Tuple[str, Mapping[str, Any]]] = []
+    models: Set[str] = set()
+    for position, expose in enumerate(exposes):
+        semantics = expose.get("semantics") if isinstance(expose, Mapping) else None
+        if not isinstance(semantics, Mapping) or not semantics:
+            continue
+        model = metricflow_name(expose.get("exposeId") or expose.get("id") or "")
+        if model and model not in models:
+            models.add(model)
+            found.append((_expose_path(expose, position), semantics))
+    return found
+
+
+def _element_type_warnings(exposes: Sequence[Any]) -> List[str]:
+    """Warn when one MetricFlow name is a dimension of one expose and an entity of another.
+
+    dbt gives a name one element type across the semantic models of a project
+    (dbt-semantic-interfaces' ``ElementConsistencyRule``), and checks it whenever the project
+    declares a metric: ``dbt parse`` then rejects the export. Entities of one name in several
+    models are how MetricFlow joins them, so only the mix of types warns. Each model counts
+    the elements the export keeps (:func:`_exported_elements`) in the models it writes
+    (:func:`_modelled_exposes`).
+    """
+    dimensions: Dict[str, List[Tuple[str, _Element]]] = {}
+    entities: Dict[str, List[str]] = {}
+    for path, semantics in _modelled_exposes(exposes):
+        kept, _ = _exported_elements(semantics)
+        for name, element in kept.items():
+            if element.kind == "entity":
+                entities.setdefault(name, []).append(path)
+            else:
+                dimensions.setdefault(name, []).append((path, element))
+    messages: List[str] = []
+    for name, held in dimensions.items():
+        if name not in entities:
+            continue
+        path, element = held[0]
+        messages.append(
+            f"{path}.semantics.dimensions[{element.index}]: the dbt MetricFlow name {name!r} is "
+            f"a dimension of {', '.join(where for where, _ in held)} and an entity of "
+            f"{', '.join(entities[name])}. dbt MetricFlow gives a name one element type across "
+            f"the semantic models of a project, so `dbt parse` rejects the export whenever the "
+            f"project declares a metric. Rename one of them."
         )
     return messages
 
