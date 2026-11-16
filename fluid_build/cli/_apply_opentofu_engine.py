@@ -751,17 +751,17 @@ def _state_encryption(args) -> Tuple[Optional[StateEncryption], bool]:
     try:
         encryption = configured_state_encryption()
     except StateEncryptionError as exc:
-        raise _binding_error(exc)
+        raise _encryption_error(exc)
     migrate = bool(getattr(args, "migrate_state_encryption", False))
     if migrate and encryption is None:
-        raise CLIError(
-            1,
-            "opentofu_state_encryption_invalid",
-            {
-                "error": "--migrate-state-encryption encrypts the state with the key "
-                "FLUID_STATE_ENCRYPTION names, and it is not set",
-                "remediation": ["Set FLUID_STATE_ENCRYPTION, then re-run"],
-            },
+        raise _encryption_error(
+            StateEncryptionError(
+                "opentofu_state_encryption_invalid",
+                "migrate-without-key",
+                "--migrate-state-encryption encrypts the state with the key "
+                "FLUID_STATE_ENCRYPTION names, and it is not set.",
+                ("Set FLUID_STATE_ENCRYPTION, then re-run",),
+            )
         )
     return encryption, migrate
 
@@ -954,7 +954,7 @@ def _tofu_env(plugin: Any, target: StateTarget) -> Dict[str, str]:
             require_supported_tofu(runner.tofu_version())
             env.update(encryption_env(encryption))
         except StateEncryptionError as exc:
-            raise _binding_error(exc)
+            raise _encryption_error(exc)
         if getattr(target, "migrate_encryption", False):
             warn(
                 logging.getLogger(__name__),
@@ -981,7 +981,15 @@ def _encryption_args(target: StateTarget) -> Dict[str, Any]:
 def _encryption_failure(output: str) -> Optional[CLIError]:
     """The fix-it for a ``tofu`` run that failed on state encryption, else ``None``."""
     refusal = explain_state_failure(output)
-    return _binding_error(refusal) if refusal is not None else None
+    return _encryption_error(refusal) if refusal is not None else None
+
+
+def _encryption_error(exc: StateEncryptionError) -> CLIError:
+    """A state-encryption refusal as the run's error: what happened, then the fix as
+    the CLI's suggestions (a bullet list, as a plugin's plan fix-it prints)."""
+    err = CLIError(1, exc.event, {"error": str(exc)})
+    err.suggestions = list(exc.remediation)
+    return err
 
 
 @contextmanager

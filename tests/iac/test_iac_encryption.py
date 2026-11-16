@@ -223,6 +223,16 @@ class TestExplain:
         refusal = enc.explain_state_failure("encountered unencrypted payload")
         assert any("--migrate-state-encryption" in step for step in refusal.remediation)
 
+    def test_a_key_tofu_cannot_reach_is_named_with_tofus_reason(self):
+        output = (
+            '{"@message":"Error: Unable to build encryption key data","diagnostic":{"detail":'
+            '"key_provider.aws_kms.fluid failed with error: No valid credential sources found\\n'
+            'Please see https://opentofu.org/x"}}'
+        )
+        refusal = enc.explain_state_failure(output)
+        assert refusal is not None and refusal.event == "opentofu_state_encryption_unavailable"
+        assert "No valid credential sources found" in str(refusal)
+
     def test_other_failures_are_left_alone(self):
         assert enc.explain_state_failure("Error: Invalid provider configuration") is None
         assert enc.explain_state_failure("") is None

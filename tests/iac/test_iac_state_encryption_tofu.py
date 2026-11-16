@@ -277,3 +277,6 @@ def test_each_key_provider_block_decodes_and_only_the_key_is_out_of_reach(
     assert not plan.ok
     assert f"key_provider.{provider}.fluid failed" in output
     assert not any(error in output for error in _DECODE_ERRORS)
+    # ... and the apply names it as the key it cannot reach, with tofu's reason.
+    explained = _encryption_failure(plan.stdout + plan.stderr)
+    assert explained is not None and explained.event == "opentofu_state_encryption_unavailable"

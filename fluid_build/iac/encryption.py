@@ -348,12 +348,32 @@ _FAILURES = (
 )
 
 
+#: ``tofu``'s summaries when the key provider itself fails (the key cannot be
+#: reached or used: no credentials, a denied key, an unreachable store).
+_KEY_UNREACHABLE = ("Unable to build encryption key data", "Unable to fetch encryption key data")
+_REASON = re.compile(r"key_provider\.[a-z_]+\.fluid failed with error: (.{1,300}?)(?:\\n|\"|$)")
+
+
 def explain_state_failure(output: str) -> Optional[StateEncryptionError]:
     """The fix-it for a ``tofu`` run that failed on state encryption, else ``None``."""
     flat = " ".join((output or "").split())
     for needle, event, kind, message, remediation in _FAILURES:
         if needle in flat:
             return StateEncryptionError(event, kind, message, remediation)
+    if any(needle in flat for needle in _KEY_UNREACHABLE):
+        reason = _REASON.search(flat)
+        return StateEncryptionError(
+            "opentofu_state_encryption_unavailable",
+            "key-unreachable",
+            "tofu could not use the state encryption key "
+            + (f"({reason.group(1).strip()})" if reason else "that FLUID_STATE_ENCRYPTION names")
+            + ".",
+            (
+                f"Check that this identity may use the key {STATE_ENCRYPTION_ENV} names: the "
+                "cloud credentials for aws-kms / gcp-kms, BAO_ADDR and the token for openbao",
+                "Re-run with --debug to see tofu's full diagnostic",
+            ),
+        )
     return None
 
 
