@@ -2336,6 +2336,19 @@ def _lf_tag_definitions(contract: Mapping[str, Any]) -> Mapping[Any, Any]:
     return tag_defs if isinstance(tag_defs, Mapping) else {}
 
 
+def _owns_lf_tag_vocabulary(contract: Mapping[str, Any]) -> bool:
+    """Whether the contract's top-level ``packaging.containers.lfTagVocabulary`` is
+    ``isolated``: the one statement that this state owns the account's LF-tag keys.
+
+    Explicit only. The blanket ``mode: isolated`` most products declare resolves the
+    kind OWNED too (``iac/packaging.py``), and reading it that way would hand every
+    such product the domain's vocabulary.
+    """
+    packaging = contract.get("packaging") if isinstance(contract, Mapping) else None
+    containers = packaging.get("containers") if isinstance(packaging, Mapping) else None
+    return isinstance(containers, Mapping) and containers.get("lfTagVocabulary") == "isolated"
+
+
 def lf_tag_definitions(contract: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
     """``{resource name: aws_lakeformation_lf_tag body}``: the tags this module creates.
 
@@ -2345,11 +2358,29 @@ def lf_tag_definitions(contract: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]
     one; the key used to be skipped, and an association to it then named a resource
     the module did not declare), and two keys that are one resource name (``a-b`` and
     ``a_b``; the later used to replace the earlier). Run here, where ``fluid validate``
-    and the emitter both read the definitions, so stage 2 refuses them too.
+    and the emitter both read the definitions, so stage 2 refuses them too. Refused
+    first: definitions in a contract that does not own the vocabulary
+    (:func:`_owns_lf_tag_vocabulary`).
     """
+    definitions = _lf_tag_definitions(contract)
+    if definitions and not _owns_lf_tag_vocabulary(contract):
+        raise UnsupportedBindingError(
+            "lakeformation-tag-vocabulary-not-owned",
+            "governance.lakeFormation.tagDefinitions would make this product's OpenTofu "
+            f"state own the account's Lake Formation tags {sorted(map(str, definitions))}. "
+            "A tag key is one object per account, shared by every product that associates "
+            "it, and destroying this product would delete it for all of them.",
+            (
+                "Define the tags in the domain's or the platform's state, and keep only the "
+                "associations here: binding.governance.lakeFormation.tags names a tag "
+                "defined outside the contract by its key.",
+                "Or, in the contract that owns the vocabulary for the domain, declare it: "
+                "packaging.containers.lfTagVocabulary: isolated (schema 0.7.7).",
+            ),
+        )
     cid = aws_storage.contract_ident(contract)
     out: Dict[str, Dict[str, Any]] = {}
-    for tag_key, tag_values in _lf_tag_definitions(contract).items():
+    for tag_key, tag_values in definitions.items():
         if not tag_values:
             raise UnsupportedBindingError(
                 "lakeformation-tag-definition",

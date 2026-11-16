@@ -145,6 +145,8 @@ def test_real_lf_tag_definitions_and_associations(aws_real_project, aws_account)
     domain_key = f"fluid_dom_{uid}"
 
     contract = aws_iceberg_contract(bucket, database=glue_db, table="events", cid="iac.aws.lf.tbac")
+    # This contract owns the tag vocabulary it defines (packaging, schema 0.7.7).
+    contract["packaging"] = {"containers": {"lfTagVocabulary": "isolated"}}
     contract["governance"] = {
         "lakeFormation": {
             "tagDefinitions": {

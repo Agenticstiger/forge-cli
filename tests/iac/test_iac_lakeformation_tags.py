@@ -73,6 +73,8 @@ def _contract(tags: Mapping[str, str], definitions: Mapping[str, List[str]] | No
     }
     if definitions is not None:
         contract["governance"] = {"lakeFormation": {"tagDefinitions": copy.deepcopy(definitions)}}
+        # A contract defines tags only where it owns the account's vocabulary.
+        contract["packaging"] = {"containers": {"lfTagVocabulary": "isolated"}}
     return contract
 
 
@@ -436,3 +438,44 @@ def test_the_module_validates_under_tofu(tofu_binary, tofu_env, tmp_path, tags, 
     assert init.ok, f"tofu init failed:\n{init.stderr or init.stdout}"
     result = runner.tofu_validate(str(tmp_path), env=tofu_env)
     assert result.ok, f"tofu validate failed:\n{result.stderr or result.stdout}"
+
+
+# ── the account's tag vocabulary belongs to the state that declares it owns it ──
+
+
+@pytest.mark.parametrize(
+    "packaging",
+    [
+        None,
+        # The blanket mode most products declare is not a claim on the domain's tags.
+        {"mode": "isolated"},
+        {"mode": "shared", "pool": "lake", "containers": {"lfTagVocabulary": "shared"}},
+    ],
+)
+def test_definitions_in_a_contract_that_does_not_own_the_vocabulary_are_refused(packaging):
+    contract = _contract({"classification": "confidential"}, {"classification": ["confidential"]})
+    contract.pop("packaging", None)
+    if packaging is not None:
+        contract["packaging"] = packaging
+    error = _refusal(contract)
+    assert error.kind == "lakeformation-tag-vocabulary-not-owned"
+    assert "destroying this product would delete it" in str(error)
+    assert any("lfTagVocabulary: isolated" in step for step in error.remediation)
+    assert any("binding.governance.lakeFormation.tags" in step for step in error.remediation)
+    errors, _warnings = validate_governance(contract)
+    assert any("tagDefinitions" in e and "lfTagVocabulary" in e for e in errors), errors
+
+
+def test_the_owner_of_the_vocabulary_defines_its_tags():
+    contract = _contract({"classification": "confidential"}, {"classification": ["confidential"]})
+    assert contract["packaging"] == {"containers": {"lfTagVocabulary": "isolated"}}
+    tags = _resources(contract)["aws_lakeformation_lf_tag"]
+    assert [t["key"] for t in tags.values()] == ["classification"]
+
+
+def test_a_product_associates_a_tag_the_domain_owns_without_defining_it():
+    contract = _contract({"classification": "confidential"})
+    assert "packaging" not in contract
+    resources = _resources(contract)
+    assert "aws_lakeformation_lf_tag" not in resources
+    assert _association(contract)["lf_tag"] == [{"key": "classification", "value": "confidential"}]
