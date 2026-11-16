@@ -284,8 +284,7 @@ def _open_engine(
     # that ships a committed lock (iac/module.py::dependency_lock).
     write_dependency_lock(plugin, workdir)
 
-    env = build_tofu_env()
-    env.update(credential_overlay(plugin, env))
+    env = _tofu_env(plugin, target)
     eng.env = env
     present, _absent = credential_report(plugin, env)
 
@@ -320,6 +319,15 @@ def _open_engine(
     if not init.ok:
         raise CLIError(1, "opentofu_init_failed", {"error": _tail(init.stderr or init.stdout)})
     return eng
+
+
+def _tofu_env(plugin: Any, target: "StateTarget") -> Dict[str, str]:
+    """The environment every ``tofu`` call of a run gets: one builder for ``fluid plan
+    --tofu`` and ``fluid apply``, so a saved plan is applied with the credentials (and,
+    once state and plan encryption land, the key configuration) it was made with."""
+    env = build_tofu_env()
+    env.update(credential_overlay(plugin, env))
+    return env
 
 
 def _guard_before_plan(eng: _Engine, args, logger: logging.Logger) -> None:

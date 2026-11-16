@@ -442,3 +442,27 @@ class TestEndToEnd:
         assert engine.apply_via_opentofu(_args(str(out)), _LOG) == 0
         assert planned == ["plan"]
         assert _state_inputs(offline_tofu) == ["v1"]
+
+
+class TestPlanAndApplyShareTheEngine:
+    """Plan and apply build tofu's env with one function and init and plan through the
+    runner's wrappers (``tofu_init`` adds the S3 native-lock arguments), so the plan
+    holds the state lock and the saved plan is applied with the env it was made with."""
+
+    def test_both_paths_use_the_one_env_builder_and_the_runner(self, offline_tofu, monkeypatch):
+        calls: List[str] = []
+        real_env, real_init, real_plan = engine._tofu_env, runner.tofu_init, runner.tofu_plan
+        monkeypatch.setattr(
+            engine, "_tofu_env", lambda *a, **k: calls.append("env") or real_env(*a, **k)
+        )
+        monkeypatch.setattr(
+            runner, "tofu_init", lambda *a, **k: calls.append("init") or real_init(*a, **k)
+        )
+        monkeypatch.setattr(
+            runner, "tofu_plan", lambda *a, **k: calls.append("plan") or real_plan(*a, **k)
+        )
+        out = _plan(offline_tofu, {"id": "p1", "description": "v1"})
+        assert calls == ["env", "init", "plan"]
+        calls.clear()
+        assert engine.apply_via_opentofu(_args(str(out)), _LOG) == 0
+        assert calls == ["env", "init"]
