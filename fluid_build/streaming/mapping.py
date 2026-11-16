@@ -1,7 +1,7 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""Kafka records to output rows, for the opt-in managed Flink lane.
+"""Kafka records to output rows, for the managed Flink lane and the forge Spark runner.
 
 ``properties.stream`` says what the records are and ``properties.mapping`` how they
 become the exposed table's rows. forge-cli writes the job's query from the two: every
@@ -16,6 +16,15 @@ the Flink Kafka connector's own DDL: key fields through ``key.fields`` with
 (Flink 1.20 "Available Metadata"), and arrays flattened with ``CROSS JOIN UNNEST``.
 Paths into the record follow Estuary's projections and Doris' ``jsonpaths``: one
 declared path per output column, never an expression.
+
+The same mapping compiles to Spark SQL (``dialect="spark"``, Spark 3.5) for the forge
+Spark runner. Arrays flatten with ``LATERAL VIEW inline`` (struct elements) or
+``LATERAL VIEW explode`` (scalars), a built struct is ``named_struct`` with the same
+null propagation, and :func:`spark_source_select` reads the value, key and metadata
+columns from the Spark Kafka source's own columns (``key``, ``value``, ``topic``,
+``partition``, ``offset``, ``timestamp``, ``timestampType``, ``headers``) once the
+runner has decoded ``key`` and ``value``. A mapped column may set ``maskAtIngest:
+hash``, Spark only: the column is the SHA-256 of the source, in lowercase hex.
 """
 
 from __future__ import annotations
@@ -28,6 +37,10 @@ from fluid_build.providers._sql_safety import quote_ansi_string_literal, validat
 from fluid_build.streaming.types import LogicalType, columns_sql, parse_fields, parse_type
 
 SOURCE_TABLE = "source_events"
+#: The relation the Spark runner registers: the Kafka source's columns, with ``key``
+#: and ``value`` decoded (a struct, or the raw bytes of a raw key).
+SPARK_RECORDS_TABLE = "kafka_records"
+DIALECTS = ("flink", "spark")
 VALUE_FORMATS = ("json", "avro-confluent")
 KEY_FORMATS = ("raw", "json", "avro-confluent")
 _SRC = "src"
@@ -59,6 +72,37 @@ _JSON_OPTIONS = {
     "json.timestamp-format.standard": "ISO-8601",
 }
 _WIDENING = {("int", "long"), ("float", "double")}
+_SPARK_TYPES = {
+    "string": "STRING",
+    "int": "INT",
+    "long": "BIGINT",
+    "float": "FLOAT",
+    "double": "DOUBLE",
+    "boolean": "BOOLEAN",
+    "binary": "BINARY",
+    "date": "DATE",
+    # Spark 3.5's TIMESTAMP is the instant (local time zone); TIMESTAMP_NTZ is the
+    # wall-clock time, as Iceberg's timestamptz and timestamp map to Spark's.
+    "timestamp": "TIMESTAMP_NTZ",
+    "timestamp_ltz": "TIMESTAMP",
+}
+#: Spark's Kafka source column each metadata key reads, as the source table's column.
+#: Spark reads the timestamp type as an int (Kafka's TimestampType id); Flink's name
+#: for it is the column's value. Headers arrive as an array of key/value structs.
+_SPARK_METADATA = {
+    "topic": "`topic`",
+    "partition": "`partition`",
+    "offset": "`offset`",
+    "timestamp": "`timestamp`",
+    "timestamp-type": (
+        "CASE `timestampType` WHEN 0 THEN 'CreateTime' WHEN 1 THEN 'LogAppendTime' "
+        "ELSE 'NoTimestampType' END"
+    ),
+    "headers": "COALESCE(map_from_entries(`headers`), CAST(map() AS MAP<STRING, BINARY>))",
+}
+#: Source types a ``maskAtIngest: hash`` column may read: identifiers, whose text form
+#: does not depend on a session setting (a timestamp's does, on the time zone).
+_MASKABLE = {"string", "binary", "int", "long"}
 
 Step = tuple[str, str]  # ("field", name) or ("entry", map key)
 
@@ -124,6 +168,35 @@ class Stream:
         return result
 
 
+def spark_type(dtype: LogicalType) -> str:
+    """The Spark SQL type of ``dtype``, nullability left out: a CAST cannot narrow it."""
+    if dtype.kind == "struct":
+        return (
+            f"STRUCT<{', '.join(f'`{name}`: {spark_type(child)}' for name, child in dtype.fields)}>"
+        )
+    if dtype.kind == "array" and dtype.element is not None:
+        return f"ARRAY<{spark_type(dtype.element)}>"
+    if dtype.kind == "map" and dtype.key is not None and dtype.value is not None:
+        return f"MAP<{spark_type(dtype.key)}, {spark_type(dtype.value)}>"
+    if dtype.kind == "decimal":
+        return f"DECIMAL({dtype.precision},{dtype.scale})"
+    return _SPARK_TYPES[dtype.kind]
+
+
+def spark_schema(fields: Sequence[tuple[str, LogicalType]]) -> str:
+    """A field list as a Spark DDL schema string, as ``from_json`` takes it."""
+    return ", ".join(f"`{name}` {spark_type(dtype)}" for name, dtype in fields)
+
+
+def _spark_literal(value: str) -> str:
+    """A Spark string literal. Spark reads ``\\`` as an escape, so a value holding a
+    quote, a backslash or a control character is refused instead of escaped; no path,
+    field name or metadata key that reaches here can hold one."""
+    if re.search(r"['\\\x00-\x1f\x7f]", value):
+        raise ValueError(f"{value!r} cannot be a Spark string literal")
+    return f"'{value}'"
+
+
 def _object(value: Any, where: str, allowed: set[str]) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{where}: expected an object")
@@ -184,6 +257,37 @@ def parse_stream(spec: Any, where: str = "properties.stream") -> Stream:
             )
         seen.add(name.casefold())
     return Stream(topic, fmt, value, key_format, key, prefix, tuple(metadata))
+
+
+def spark_source_select(stream: Stream, where: str = "properties.stream") -> str:
+    """The Spark query that makes ``source_events`` from the decoded Kafka records.
+
+    The runner registers :data:`SPARK_RECORDS_TABLE`: the Kafka source's columns, with
+    ``value`` decoded into a struct and ``key`` decoded into one (a raw key stays the
+    record's bytes). Every column is cast to its declared type, so a registry schema
+    that differs from the declared one fails at the job's start, not row by row.
+    """
+    columns = [
+        f"CAST(`value`.`{name}` AS {spark_type(dtype)}) AS `{name}`" for name, dtype in stream.value
+    ]
+    if stream.key_format == "raw":
+        ((name, dtype),) = stream.key
+        source = "`key`" if dtype.kind == "binary" else "CAST(`key` AS STRING)"
+        columns.append(f"{source} AS `{name}`")
+    else:
+        prefix = len(stream.key_prefix)
+        columns.extend(
+            f"CAST(`key`.`{name[prefix:]}` AS {spark_type(dtype)}) AS `{name}`"
+            for name, dtype in stream.key
+        )
+    for name, source in stream.metadata:
+        if source not in _SPARK_METADATA:
+            raise ValueError(
+                f"{where}.metadata: Spark's Kafka source does not read {source}; "
+                f"it reads {sorted(_SPARK_METADATA)}"
+            )
+        columns.append(f"{_SPARK_METADATA[source]} AS `{name}`")
+    return "SELECT\n  " + ",\n  ".join(columns) + f"\nFROM `{SPARK_RECORDS_TABLE}`"
 
 
 def parse_path(text: Any, where: str) -> tuple[Step, ...]:
@@ -283,10 +387,16 @@ class _Override:
     where: str
     source: tuple[Step, ...]
     cast: LogicalType | None
+    mask: bool = False
 
 
 class _Compiler:
-    def __init__(self, stream: Stream, spec: Any, where: str, target_where: str) -> None:
+    def __init__(
+        self, stream: Stream, spec: Any, where: str, target_where: str, dialect: str = "flink"
+    ) -> None:
+        if dialect not in DIALECTS:
+            raise ValueError(f"unsupported mapping dialect {dialect!r}; expected {list(DIALECTS)}")
+        self.spark = dialect == "spark"
         self.columns = stream.columns
         self.where = where
         self.target_where = target_where
@@ -305,19 +415,10 @@ class _Compiler:
         if not isinstance(entries, list) or ("columns" in mapping and not entries):
             raise ValueError(f"{where}.columns: expected a non-empty list")
         for i, entry in enumerate(entries):
-            at = f"{where}.columns[{i}]"
-            item = _object(entry, at, {"name", "from", "cast", "description"})
-            name = item.get("name")
-            if not isinstance(name, str) or not _TARGET.fullmatch(name):
-                raise ValueError(f"{at}.name: expected an output column or a dotted path into one")
+            name, override = self._column(entry, f"{where}.columns[{i}]")
             if name in self.overrides:
-                raise ValueError(f"{at}.name: {name} is mapped twice")
-            cast = None
-            if "cast" in item:
-                if str(item["cast"]).strip().lower() in {"struct", "row", "record", "array", "map"}:
-                    raise ValueError(f"{at}.cast: only a scalar type can be a conversion target")
-                cast = parse_type({"type": item["cast"]}, path=f"{at}.cast")
-            self.overrides[name] = _Override(at, parse_path(item.get("from"), f"{at}.from"), cast)
+                raise ValueError(f"{override.where}.name: {name} is mapped twice")
+            self.overrides[name] = override
         # Each struct output path with a mapped field under it, and the first such field,
         # found once instead of scanning every override for every output path.
         self.inside: dict[str, str] = {}
@@ -326,6 +427,30 @@ class _Compiler:
             for end in range(1, len(parts)):
                 self.inside.setdefault(".".join(parts[:end]), name)
         self.used: set[str] = set()
+
+    def _column(self, entry: Any, at: str) -> tuple[str, _Override]:
+        """One ``mapping.columns`` entry: its output name and where it is read from."""
+        if not self.spark and isinstance(entry, Mapping) and "maskAtIngest" in entry:
+            raise ValueError(
+                f"{at}.maskAtIngest: hashing at ingest is a Spark runner feature; the "
+                "managed Flink lane does not apply it"
+            )
+        keys = {"name", "from", "cast", "description"} | ({"maskAtIngest"} if self.spark else set())
+        item = _object(entry, at, keys)
+        name = item.get("name")
+        if not isinstance(name, str) or not _TARGET.fullmatch(name):
+            raise ValueError(f"{at}.name: expected an output column or a dotted path into one")
+        cast = None
+        if "cast" in item:
+            if str(item["cast"]).strip().lower() in {"struct", "row", "record", "array", "map"}:
+                raise ValueError(f"{at}.cast: only a scalar type can be a conversion target")
+            cast = parse_type({"type": item["cast"]}, path=f"{at}.cast")
+        mask = "maskAtIngest" in item
+        if mask and item["maskAtIngest"] != "hash":
+            raise ValueError(f"{at}.maskAtIngest: expected hash")
+        if mask and cast is not None:
+            raise ValueError(f"{at}: a masked column is the hash of its source; drop cast")
+        return name, _Override(at, parse_path(item.get("from"), f"{at}.from"), cast, mask)
 
     def _explode(self, spec: Mapping[str, Any]) -> None:
         at = f"{self.where}.explode"
@@ -340,10 +465,14 @@ class _Compiler:
         element = array.dtype.element
         names = [name for name, _ in element.fields] if element.kind == "struct" else [alias]
         self.alias, self.element = alias, element
-        self.join = (
-            f"\nCROSS JOIN UNNEST({array.sql}) AS `{_ELEM}` "
-            f"({', '.join(f'`{name}`' for name in names)})"
-        )
+        cells = ", ".join(f"`{name}`" for name in names)
+        if self.spark:
+            # inline spreads a struct element over columns, as UNNEST does; explode
+            # yields a scalar element. Both drop a row whose array is null or empty.
+            function = "inline" if element.kind == "struct" else "explode"
+            self.join = f"\nLATERAL VIEW {function}({array.sql}) `{_ELEM}` AS {cells}"
+        else:
+            self.join = f"\nCROSS JOIN UNNEST({array.sql}) AS `{_ELEM}` ({cells})"
 
     def resolve(self, steps: tuple[Step, ...], where: str) -> _Ref:
         root = steps[0][1]
@@ -374,8 +503,8 @@ class _Compiler:
                     for name, child in element.fields
                 )
                 rebuilt = LogicalType("struct", True, fields=fields)
-                cells = ", ".join(f"`{_ELEM}`.`{name}`" for name, _ in fields)
-                ref = _Ref(f"CAST(ROW({cells}) AS {_sql_type(rebuilt)})", rebuilt, None)
+                cells = [(name, f"`{_ELEM}`.`{name}`") for name, _ in fields]
+                ref = _Ref(self._struct(cells, rebuilt), rebuilt, None)
         elif root in self.columns:
             ref = self._settle(_Ref(f"`{_SRC}`.`{root}`", self.columns[root], (steps[0],)))
         else:
@@ -384,6 +513,16 @@ class _Compiler:
             ref = self._settle(self._step(ref, step, where, show(steps[:done])))
             done += 1
         return ref
+
+    def _struct(self, cells: Sequence[tuple[str, str]], dtype: LogicalType) -> str:
+        """A struct value built from its fields' SQL, never null itself."""
+        if self.spark:
+            pairs = ", ".join(f"{_spark_literal(name)}, {sql}" for name, sql in cells)
+            return f"named_struct({pairs})"
+        return f"CAST(ROW({', '.join(sql for _, sql in cells)}) AS {_sql_type(dtype)})"
+
+    def _cast_type(self, dtype: LogicalType) -> str:
+        return spark_type(dtype) if self.spark else _sql_type(dtype)
 
     def _settle(self, ref: _Ref) -> _Ref:
         if ref.origin is not None and ref.origin in self.present:
@@ -406,7 +545,7 @@ class _Compiler:
         if dtype.kind != "map" or dtype.value is None:
             raise ValueError(f"{where}: {label} is {_describe(dtype)}, not a map")
         # A key the record does not carry reads as null.
-        literal = quote_ansi_string_literal(name)
+        literal = _spark_literal(name) if self.spark else quote_ansi_string_literal(name)
         return _Ref(f"{ref.sql}[{literal}]", _nullable(dtype.value, True), origin)
 
     def _assign(self, ref: _Ref, target: LogicalType, override: _Override | None, name: str) -> str:
@@ -425,15 +564,32 @@ class _Compiler:
                     f"{where}.cast: {_describe(source)} cannot become {_describe(cast)}; "
                     "supported: binary to string, and widening"
                 )
-            sql = f"CAST({sql} AS {_sql_type(cast)})"
+            sql = f"CAST({sql} AS {self._cast_type(cast)})"
             source = _nullable(cast, not source.required)
         difference = _difference(source, target, "")
         if difference is None:
             return sql
         if _widens(source, target) and (source.required or not target.required):
-            return f"CAST({sql} AS {_sql_type(target)})"
+            return f"CAST({sql} AS {self._cast_type(target)})"
         source_path = show(override.source) if override else f"the stream's {name}"
         raise ValueError(f"{where}: {name} cannot be read from {source_path}: {difference}")
+
+    def _mask(self, ref: _Ref, target: LogicalType, override: _Override, name: str) -> str:
+        """``maskAtIngest: hash``: the SHA-256 of the source, lowercase hex; null stays null."""
+        where = f"{override.where}.maskAtIngest"
+        if ref.dtype.kind not in _MASKABLE:
+            raise ValueError(
+                f"{where}: {show(override.source)} is {_describe(ref.dtype)}; a hash reads "
+                f"one of {sorted(_MASKABLE)}"
+            )
+        if target.kind != "string":
+            raise ValueError(f"{where}: {name} is {_describe(target)}; a hash is a string")
+        if target.required and not ref.dtype.required:
+            raise ValueError(
+                f"{where}: {name} is required, but {show(override.source)} can be null"
+            )
+        value = ref.sql if ref.dtype.kind == "binary" else f"CAST({ref.sql} AS STRING)"
+        return f"sha2({value}, 256)"
 
     def target(self, path: tuple[str, ...], dtype: LogicalType) -> _Out:
         name = ".".join(path)
@@ -444,6 +600,8 @@ class _Compiler:
                 raise ValueError(f"{override.where}: {nested} is inside {name}, mapped whole")
             self.used.add(name)
             ref = self.resolve(override.source, f"{override.where}.from")
+            if override.mask:
+                return _Out(self._mask(ref, dtype, override, name), not ref.dtype.required)
             sql = self._assign(ref, dtype, override, name)
             return _Out(sql, not ref.dtype.required)
         if dtype.kind == "struct" and nested:
@@ -479,6 +637,13 @@ class _Compiler:
         finally:
             if parent is not None and parent.origin is not None:
                 self.present.pop()
+        if self.spark:
+            names = [name for name, _ in dtype.fields]
+            built = self._struct(list(zip(names, (c.sql for c in children), strict=True)), dtype)
+            if parent is None:
+                return _Out(built, False)
+            # Fields read from one nullable struct: the output is null where that struct is.
+            return _Out(f"CASE WHEN {parent.sql} IS NULL THEN NULL ELSE {built} END", True)
         row = f"ROW({', '.join(child.sql for child in children)})"
         if parent is None:
             return _Out(f"CAST({row} AS {_sql_type(dtype)})", False)
@@ -532,9 +697,14 @@ def compile_select(
     *,
     where: str = "properties.mapping",
     target_where: str = "exposes.contract.schema",
+    dialect: str = "flink",
 ) -> str:
-    """The query forge-cli writes: every output column in the expose's order, checked."""
-    compiler = _Compiler(stream, mapping, where, target_where)
+    """The query forge-cli writes: every output column in the expose's order, checked.
+
+    ``dialect`` is ``flink`` (the managed Flink lane) or ``spark`` (the forge Spark
+    runner, Spark 3.5); both read :data:`SOURCE_TABLE` as ``src``.
+    """
+    compiler = _Compiler(stream, mapping, where, target_where, dialect)
     select = [f"{compiler.target((name, ), dtype).sql} AS `{name}`" for name, dtype in target]
     unused = sorted(set(compiler.overrides) - compiler.used)
     if unused:
