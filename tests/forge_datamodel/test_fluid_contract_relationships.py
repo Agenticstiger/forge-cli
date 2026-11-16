@@ -198,3 +198,48 @@ def test_datasets_that_slug_to_one_expose_id_get_no_relationship():
     )
     contract = build_contract_from_logical(logical)
     assert all("relationships" not in e["semantics"] for e in contract["exposes"])
+
+
+def _foreign_entities(contract):
+    return {
+        expose["exposeId"]: [
+            (entity["name"], entity["expr"])
+            for entity in expose["semantics"].get("entities", [])
+            if entity["type"] == "foreign"
+        ]
+        for expose in contract["exposes"]
+    }
+
+
+def test_a_foreign_entity_lands_on_its_from_expose_only():
+    """One expose per dataset: a relationship's foreign entity is its ``from`` dataset's.
+
+    Every expose used to get every relationship's foreign entity, the target keyed on its own
+    key and the others on a column they lack, and the dbt export carried them all.
+    """
+    lines_to_orders = _relationship(
+        "order_lines_to_orders", "order_lines", "orders", ["order_id"], ["order_id"]
+    )
+    contract = build_contract_from_logical(_logical([_ORDERS_TO_CUSTOMERS, lines_to_orders]))
+    assert _foreign_entities(contract) == {
+        "orders": [("customer", "customer_id")],
+        "customers": [],
+        "order_lines": [("order", "order_id")],
+    }
+    assert validate_semantics_block(contract) == ([], [])
+
+
+def test_no_entity_keys_on_a_column_its_expose_lacks():
+    ghost = _relationship(
+        "orders_to_customers", "orders", "customers", ["buyer_id"], ["customer_id"]
+    )
+    contract = build_contract_from_logical(_logical([ghost, _LINES_TO_ORDERS]))
+    for expose in contract["exposes"]:
+        columns = {column["name"] for column in expose["contract"]["schema"]}
+        for entity in expose["semantics"]["entities"]:
+            assert entity["expr"] in columns, (expose["exposeId"], entity)
+    assert _foreign_entities(contract) == {
+        "orders": [],
+        "customers": [],
+        "order_lines": [("orders", "order_id")],
+    }

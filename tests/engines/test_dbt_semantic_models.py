@@ -21,11 +21,13 @@ Pins the card's acceptance criteria:
 from __future__ import annotations
 
 import copy
+import logging
 import shutil
 import subprocess
 import sys
+from argparse import Namespace
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 import yaml
@@ -967,3 +969,111 @@ def test_a_window_bound_that_shares_a_name_drops_the_window(caplog):
     assert all("validity_params" not in (d.get("type_params") or {}) for d in model["dimensions"])
     assert "primary_entity" not in model
     assert "do not form a validity window" in caplog.text
+
+
+def _generate_with_dbt_validate(contract: Dict[str, Any], tmp_path: Path) -> Tuple[int, Path]:
+    """``fluid generate transformation --dbt-validate`` on ``contract``: (exit code, project).
+
+    The gate runs a real ``dbt parse`` on the generated project and fails the command when it
+    does; dbt's own message goes to stdout.
+    """
+    if _find_dbt() is None:
+        pytest.skip("dbt CLI not available")
+    from fluid_build.cli.generate_speed_transformation import run
+
+    contract_path = tmp_path / "contract.fluid.yaml"
+    contract_path.write_text(yaml.safe_dump(contract, sort_keys=False), encoding="utf-8")
+    out_dir = tmp_path / "dbt_project"
+    args = Namespace(
+        list_engines=False,
+        contract=str(contract_path),
+        output=str(out_dir),
+        build_index=0,
+        model=None,
+        all_builds=False,
+        concurrency=1,
+        overwrite=True,
+        env=None,
+        verbose=False,
+        dbt_validate=True,
+    )
+    return run(args, logging.getLogger(__name__)), out_dir
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_a_forged_contract_exports_each_foreign_entity_on_its_from_model(tmp_path: Path):
+    """``fluid forge data-model`` (one expose per dataset) through ``dbt parse``."""
+    import json
+
+    from fluid_build.copilot.schemas.osi import (
+        OSIDataset,
+        OSIDimension,
+        OSIExpression,
+        OSIExpressionDialect,
+        OSIField,
+        OSIMetric,
+        OSIRelationship,
+        OSISemanticModel,
+    )
+    from fluid_build.copilot.schemas.stage_outputs import ConceptualDraft, LogicalDraft
+    from fluid_build.forge_datamodel.emit.fluid_contract import build_contract_from_logical
+    from fluid_build.forge_datamodel.semantics_builder import validate_semantics_block
+
+    def dataset(name: str, key: str, *columns: str, timed: str = "") -> OSIDataset:
+        fields = [OSIField(name=column) for column in (key, *columns)]
+        if timed:
+            fields.append(OSIField(name=timed, dimension=OSIDimension(is_time=True, grain="day")))
+        return OSIDataset(name=name, source=name, primary_key=[key], fields=fields)
+
+    def relationship(source: str, target: str, column: str) -> OSIRelationship:
+        return OSIRelationship(
+            name=f"{source}_to_{target}",
+            **{"from": source, "to": target},
+            from_columns=[column],
+            to_columns=[column],
+        )
+
+    revenue = OSIExpression(
+        dialects=[OSIExpressionDialect(dialect="ANSI_SQL", expression="SUM(amount)")]
+    )
+    osi = OSISemanticModel(
+        name="shop",
+        datasets=[
+            dataset("orders", "order_id", "customer_id", "amount", timed="ordered_at"),
+            dataset("customers", "customer_id", "segment"),
+            dataset("order_lines", "line_id", "order_id", "quantity"),
+        ],
+        relationships=[
+            relationship("orders", "customers", "customer_id"),
+            relationship("order_lines", "orders", "order_id"),
+        ],
+        metrics=[OSIMetric(name="revenue", expression=revenue)],
+    )
+    contract = build_contract_from_logical(
+        LogicalDraft(
+            name="shop",
+            description="Shop",
+            technique="flat",
+            osi=osi,
+            conceptual=ConceptualDraft(name="shop"),
+        )
+    )
+    assert validate_semantics_block(contract) == ([], [])
+    exit_code, out_dir = _generate_with_dbt_validate(contract, tmp_path)
+    assert exit_code == 0
+    manifest = json.loads((out_dir / "target" / "semantic_manifest.json").read_text())
+    assert [m["name"] for m in manifest["metrics"]] == ["revenue"]
+    foreign = {
+        model["name"]: [
+            (entity["name"], entity["expr"])
+            for entity in model["entities"]
+            if entity["type"] == "foreign"
+        ]
+        for model in manifest["semantic_models"]
+    }
+    assert foreign == {
+        "orders": [("customer", "customer_id")],
+        "customers": [],
+        "order_lines": [("order", "order_id")],
+    }

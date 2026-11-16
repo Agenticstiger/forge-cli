@@ -318,6 +318,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid forge data-model` gave every expose the foreign entity of every relationship.** In
+  the one-expose-per-dataset shape, the target of a relationship got a foreign entity on its own
+  key, and the other exposes one on a column they do not have, and `fluid generate
+  transformation` exported them all to dbt. A relationship's foreign entity now goes on its
+  `from` expose only, when that expose has the column, named after the target's key entity so
+  MetricFlow joins them. A contract forged into one expose (intent, DDL, dimensional) keeps
+  every relationship's, as before.
 - **A natural entity made `fluid generate transformation` write a dbt project `dbt parse`
   rejected.** dbt accepts a `natural` entity only beside a validity window, and validates the
   semantic layer whenever the project has a metric, so a contract with a natural entity and a

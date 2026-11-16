@@ -147,6 +147,38 @@ def _fluid_time_grain(value: str) -> str | None:
     return _time_grains.normalize_time_grain(value)
 
 
+def _is_key_of(relationship: Any, dataset: Any) -> bool:
+    """True when ``relationship`` is a foreign key of ``dataset``: its ``from``, on a column it has.
+
+    ``from`` names the dataset by its slug, as :func:`_attach_osi_relationships` resolves it,
+    and the foreign entity keys on the first of ``from_columns``.
+    """
+    if not relationship.from_columns or _slug(relationship.from_) != _slug(dataset.name):
+        return False
+    return relationship.from_columns[0] in {field.name for field in dataset.fields}
+
+
+def _foreign_entities(logical: LogicalDraft, dataset: Optional[Any]) -> List[Dict[str, Any]]:
+    """The foreign entities of one expose: one for each relationship whose key it holds.
+
+    ``dataset`` is the expose's own dataset in the one-expose-per-dataset shape, where a
+    relationship's foreign entity goes on its ``from`` dataset only, and only when that
+    dataset has the column (:func:`_is_key_of`). ``None`` is the one expose of the legacy
+    shape, which keeps every relationship's.
+    """
+    return [
+        {
+            "name": relationship.to,
+            "type": "foreign",
+            "expr": (
+                relationship.from_columns[0] if relationship.from_columns else relationship.name
+            ),
+        }
+        for relationship in logical.osi.relationships
+        if dataset is None or _is_key_of(relationship, dataset)
+    ]
+
+
 def _fluid_semantics(
     logical: LogicalDraft, *, dataset_override: Optional[Any] = None
 ) -> Dict[str, Any]:
@@ -162,7 +194,8 @@ def _fluid_semantics(
 
     When ``dataset_override`` is ``None`` (intent / DDL forges with
     no DV2 / dimensional shape), fall back to the legacy behaviour:
-    the first OSI dataset drives the semantics.
+    the first OSI dataset drives the semantics. Foreign entities come
+    from :func:`_foreign_entities`.
     """
     semantics: Dict[str, Any] = {
         "name": (dataset_override.name if dataset_override is not None else logical.osi.name),
@@ -187,9 +220,7 @@ def _fluid_semantics(
                     "expr": primary_key,
                 }
             )
-        for relationship in logical.osi.relationships:
-            expr = relationship.from_columns[0] if relationship.from_columns else relationship.name
-            entities.append({"name": relationship.to, "type": "foreign", "expr": expr})
+        entities.extend(_foreign_entities(logical, dataset_override))
         for field in first_dataset.fields:
             if field.name in first_dataset.primary_key:
                 continue
