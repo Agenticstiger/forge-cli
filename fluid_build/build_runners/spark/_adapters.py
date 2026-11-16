@@ -215,6 +215,12 @@ class EmrServerless(Adapter):
     def __init__(self, run: DesiredRun, clients: ClientFactory) -> None:
         super().__init__(run, clients)
         self._app: Optional[str] = run.target.get("applicationId")
+        start = self.client.meta.service_model.operation_model("StartJobRun").input_shape
+        if "mode" not in start.members or "retryPolicy" not in start.members:
+            raise SparkRunError(
+                "this boto3 predates EMR Serverless streaming job runs (StartJobRun mode and "
+                "retryPolicy); upgrade it: pip install -U boto3"
+            )
 
     def application_id(self) -> str:
         if self._app:
@@ -409,9 +415,19 @@ class EmrEc2(Adapter):
         )
 
     def runs(self) -> List[RunInfo]:
-        page = self.client.list_steps(ClusterId=self.cluster)
-        steps = [s for s in page.get("Steps") or [] if s.get("Name") == self.run.run_name]
-        return sorted((self._info(s) for s in steps), key=lambda i: i.created, reverse=True)
+        """Every active step of this build (all pages: a shared cluster's newer steps can push
+        a long-running one off the first), then its most recent ended ones (one page)."""
+        steps: Dict[str, Mapping[str, Any]] = {}
+        pages = self.client.get_paginator("list_steps").paginate(
+            ClusterId=self.cluster, StepStates=["PENDING", "RUNNING", "CANCEL_PENDING"]
+        )
+        for page in pages:
+            steps.update({str(s.get("Id")): s for s in page.get("Steps") or []})
+        recent = self.client.list_steps(ClusterId=self.cluster)
+        for step in recent.get("Steps") or []:
+            steps.setdefault(str(step.get("Id")), step)
+        mine = [s for s in steps.values() if s.get("Name") == self.run.run_name]
+        return sorted((self._info(s) for s in mine), key=lambda i: i.created, reverse=True)
 
     def get(self, run_id: str) -> RunInfo:
         return self._info(self.client.describe_step(ClusterId=self.cluster, StepId=run_id)["Step"])
@@ -420,8 +436,11 @@ class EmrEc2(Adapter):
         r = self.run
         args = [
             "spark-submit",
+            # Client mode: the driver is the step's own process, so cancelling the step
+            # stops the job. In cluster mode the YARN application outlives a cancelled
+            # step, and a restart would put a second writer on the checkpoint.
             "--deploy-mode",
-            "cluster",
+            "client",
             *_conf_params(r.spark_conf),
             r.runner_uri,
             *r.entry_args(),
@@ -525,4 +544,12 @@ ADAPTERS = {a.runtime: a for a in (EmrServerless, Glue, EmrEc2, EmrEks)}
 
 
 def adapter_for(run: DesiredRun, clients: Optional[ClientFactory] = None) -> Adapter:
+    """The run's adapter, with the account its names need resolved from the credentials."""
+    if run.needs_account:
+        from fluid_build.build_runners.spark._desired import resolve_account
+
+        try:
+            run = run.bind(resolve_account(run.region))
+        except ValueError as exc:
+            raise SparkRunError(str(exc)) from exc
     return ADAPTERS[run.runtime](run, clients or default_clients)

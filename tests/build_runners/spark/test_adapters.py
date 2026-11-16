@@ -295,7 +295,7 @@ def ec2_run(run):
 
 def test_ec2_start_adds_a_spark_submit_step_that_continues_on_failure(ec2_run):
     adapter, stub = adapter_on(ec2_run, "emr")
-    args = ["spark-submit", "--deploy-mode", "cluster", *ad._conf_params(ec2_run.spark_conf)]
+    args = ["spark-submit", "--deploy-mode", "client", *ad._conf_params(ec2_run.spark_conf)]
     args += [ec2_run.runner_uri, *ec2_run.entry_args()]
     stub.add_response(
         "add_job_flow_steps",
@@ -326,11 +326,25 @@ def _step(run, step_id, state, created, name=None, reason="why"):
 
 def test_ec2_runs_filter_by_name_and_map_interrupted_to_failed(ec2_run):
     adapter, stub = adapter_on(ec2_run, "emr")
+    # Every page of active steps first: a newer step can push a running one off page one.
+    stub.add_response(
+        "list_steps",
+        {"Steps": [_step(ec2_run, "s-other", "RUNNING", NOW, name="unrelated")], "Marker": "m"},
+        {"ClusterId": "j-ABC", "StepStates": ["PENDING", "RUNNING", "CANCEL_PENDING"]},
+    )
+    stub.add_response(
+        "list_steps",
+        {"Steps": []},
+        {
+            "ClusterId": "j-ABC",
+            "StepStates": ["PENDING", "RUNNING", "CANCEL_PENDING"],
+            "Marker": "m",
+        },
+    )
     stub.add_response(
         "list_steps",
         {"Steps": [
             _step(ec2_run, "s-old", "COMPLETED", EARLIER),
-            _step(ec2_run, "s-other", "RUNNING", NOW, name="unrelated"),
             _step(ec2_run, "s-new", "INTERRUPTED", NOW, reason="cluster stopped"),
         ]},
         {"ClusterId": "j-ABC"},
@@ -467,3 +481,26 @@ def test_a_serverless_application_summary_without_an_id_is_read_by_its_arn():
     arn = "arn:aws:emr-serverless:ca-central-1:000000000008:/applications/b2f154e9"
     assert ad._application_id({"arn": arn}) == "b2f154e9"
     assert ad._application_id({"id": "abc", "arn": arn}) == "abc"
+
+
+def test_a_boto3_without_streaming_job_runs_is_refused(serverless, monkeypatch):
+    client = boto3.client("emr-serverless", region_name="eu-west-1")
+    shape = client.meta.service_model.operation_model("StartJobRun").input_shape
+    members = {k: v for k, v in shape.members.items() if k != "mode"}
+    monkeypatch.setattr(type(shape), "members", property(lambda self: members))
+    with pytest.raises(ad.SparkRunError, match="upgrade"):
+        ad.adapter_for(serverless, lambda service, region: client)
+
+
+def test_adapter_for_binds_the_account_from_the_credentials(serverless, monkeypatch):
+    import dataclasses
+
+    from fluid_build.build_runners.spark import _desired
+
+    token_run = dataclasses.replace(
+        serverless, role_arn=f"arn:aws:iam::{_desired.ACCOUNT_TOKEN}:role/r"
+    )
+    monkeypatch.setattr(_desired, "resolve_account", lambda region: "210987654321")
+    client = boto3.client("emr-serverless", region_name="eu-west-1")
+    adapter = ad.adapter_for(token_run, lambda service, region: client)
+    assert adapter.run.role_arn == "arn:aws:iam::210987654321:role/r"

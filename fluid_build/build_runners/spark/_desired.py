@@ -27,6 +27,9 @@ from fluid_build.build_runners.spark import _names
 
 #: The action ``fluid plan`` lists for each Spark build; ``fluid apply`` reconciles it.
 ACTION = "spark.reconcile"
+#: The AWS account in a run's names until it is started: plans, hashes and the bound-plan
+#: check never need credentials, and a plan made anywhere matches the apply's.
+ACCOUNT_TOKEN = "${aws_account_id}"
 #: ``maxFailedAttemptsPerHour`` of an EMR Serverless streaming job when the build sets no
 #: ``execution.retries.maxAttempts``: AWS's own default. AWS allows 1 to 10.
 DEFAULT_STREAMING_ATTEMPTS_PER_HOUR = 5
@@ -136,6 +139,25 @@ class DesiredRun:
     @property
     def long_running(self) -> bool:
         return not self.scheduled
+
+    @property
+    def needs_account(self) -> bool:
+        return any(ACCOUNT_TOKEN in v for v in (self.job_uri, self.runner_uri, self.role_arn))
+
+    def bind(self, account: str) -> "DesiredRun":
+        """This run with the account its names hold (:data:`ACCOUNT_TOKEN`); the hash stays."""
+        import dataclasses
+
+        def sub(value: str) -> str:
+            return value.replace(ACCOUNT_TOKEN, account)
+
+        return dataclasses.replace(
+            self,
+            job_uri=sub(self.job_uri),
+            runner_uri=sub(self.runner_uri),
+            role_arn=sub(self.role_arn),
+            checkpoint=sub(self.checkpoint) if self.checkpoint else self.checkpoint,
+        )
 
     def identity_args(self) -> List[str]:
         """The flags that mark a run as this build's, read back from any runtime.
@@ -296,9 +318,8 @@ def _allowed_conf(user: Mapping[str, Any], where: str, env: Mapping[str, str]) -
     return out
 
 
-def _account(account: Optional[str], region: str) -> str:
-    if account:
-        return account
+def resolve_account(region: str) -> str:
+    """The account the default AWS credentials are in, as the AWS provider resolves it."""
     from fluid_build.providers.aws.util.config import (
         account_unresolved_message,
         resolve_account_and_region,
@@ -328,8 +349,9 @@ def desired_runs(
 ) -> List[DesiredRun]:
     """Each Spark build's :class:`DesiredRun`, in contract order (``build_id``: just that one).
 
-    ``account`` is the AWS account the job runs in; when None and a name needs it (a
-    bucketless output, a role forge creates) it is resolved as the AWS provider does.
+    ``account`` binds the runs to that AWS account; when None, a name that needs one (a
+    bucketless output, a role forge creates) holds :data:`ACCOUNT_TOKEN` until the run is
+    started, so planning needs no credentials. The config hash never depends on it.
 
     Raises:
         ValueError: a build forge cannot compile, or two builds with one id.
@@ -355,7 +377,6 @@ def desired_runs(
             "location"
         ) or {}
         from fluid_build.providers.aws.util.warehouse import (
-            bucket_uses_fallback,
             normalize_location,
         )
 
@@ -367,8 +388,7 @@ def desired_runs(
                 f"Spark build {bid}: no AWS region; set the output's binding.location.region "
                 "or AWS_REGION"
             )
-        needs_account = bucket_uses_fallback(loc) or not cfg.get("executionRoleArn")
-        acct = _account(account, region) if needs_account else (account or "")
+        acct = ACCOUNT_TOKEN
         job = compile_job_config(contract, build, account_ref=acct, environ=env)
         config = job.config
         bucket, _ = normalize_location(loc, account_ref=acct)
@@ -455,7 +475,7 @@ def desired_runs(
                 job_text=job.text,
             )
         )
-    return runs
+    return [run.bind(account) for run in runs] if account else runs
 
 
 def plan_actions(contract: Mapping[str, Any], **kwargs: Any) -> List[Dict[str, Any]]:

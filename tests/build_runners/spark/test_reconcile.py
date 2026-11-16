@@ -288,12 +288,12 @@ def test_a_run_that_outlives_the_timeout_is_cancelled(scheduled, clock, use):
     assert fake.calls == ["start", "cancel new"]
 
 
-def test_ctrl_c_while_waiting_cancels_the_run_and_reraises(scheduled, clock, use):
+def test_ctrl_c_while_waiting_cancels_the_run_and_is_a_cancelled_outcome(scheduled, clock, use):
     fake = FakeAdapter(start_states=("RUNNING", "INTERRUPT"))
     use(fake)
     said = []
-    with pytest.raises(KeyboardInterrupt):
-        once(scheduled, clock, say=said.append)
+    out = once(scheduled, clock, say=said.append)
+    assert (out.action, out.error, out.run_id) == ("cancelled", True, "new")
     assert fake.calls == ["start", "cancel new"]
     assert any("cancelled run new" in line for line in said)
 

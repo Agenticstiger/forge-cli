@@ -249,3 +249,18 @@ def test_a_spark_conf_key_outside_the_schema_pattern_is_refused_even_when_listed
     contract["builds"][0]["properties"]["parameters"]["spark"]["sparkConf"] = {key: "x"}
     with pytest.raises(SparkPolicyError):
         _desired.desired_runs(contract, account=ACCOUNT)
+
+
+def test_a_plan_needs_no_aws_account_and_binding_keeps_the_hash(contract, monkeypatch):
+    def no_sts(*_a, **_k):
+        raise AssertionError("planning must not resolve the account")
+
+    monkeypatch.setattr("fluid_build.providers.aws.util.config.resolve_account_and_region", no_sts)
+    del contract["exposes"][0]["binding"]["location"]["bucket"]  # the <account>-fluid-data bucket
+    run = _desired.desired_runs(contract)[0]
+    assert run.needs_account and _desired.ACCOUNT_TOKEN in run.role_arn
+    assert _desired.ACCOUNT_TOKEN in run.plan_action(1)["payload"]["artifacts"]["jobConfig"]
+    bound = run.bind(ACCOUNT)
+    assert not bound.needs_account and bound.config_hash == run.config_hash
+    assert bound.job_uri.startswith(f"s3://{ACCOUNT}-fluid-data/")
+    assert _desired.desired_runs(contract, account=ACCOUNT)[0] == bound

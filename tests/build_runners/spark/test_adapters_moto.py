@@ -86,7 +86,7 @@ def test_glue_start_then_get_job_runs_round_trips_the_arguments(run):
 @pytest.mark.skipif(
     threading.current_thread() is not threading.main_thread(), reason="signals need the main thread"
 )
-def test_sigterm_while_waiting_cancels_the_moto_run_and_reraises(run):
+def test_sigterm_while_waiting_cancels_the_moto_run(run):
     from moto.emrserverless.models import emrserverless_backends
 
     from fluid_build.build_runners.spark._reconcile import run_once
@@ -112,8 +112,8 @@ def test_sigterm_while_waiting_cancels_the_moto_run_and_reraises(run):
         def sleep(_seconds):
             os.kill(os.getpid(), signal.SIGTERM)
 
-        with pytest.raises(KeyboardInterrupt):
-            run_once(scheduled, clients=clients, say=say, sleep=sleep)
+        out = run_once(scheduled, clients=clients, say=say, sleep=sleep)
         job = backend.job_runs[app_id][-1]
         assert job.state == "CANCELLED"
+        assert (out.action, out.error, out.run_id) == ("cancelled", True, job.id)
         assert any(job.id in line for line in said)

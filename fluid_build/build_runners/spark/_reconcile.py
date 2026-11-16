@@ -305,7 +305,8 @@ def run_once(
     """``fluid spark run``: one run of a build, for a scheduler.
 
     A scheduled build starts a run and, with ``wait``, waits for it to end; the outcome is an
-    error unless it SUCCEEDED, and Ctrl-C, SIGTERM or SIGHUP while it is waited on cancel it.
+    error unless it SUCCEEDED. Ctrl-C, SIGTERM or SIGHUP while it is waited on cancel it, and
+    the outcome is ``cancelled`` (an error), so ``--json`` still prints its one line.
     A long-running build is reconciled instead (``restart`` starts it again after a failure).
     """
     from fluid_build.build_runners._databricks_job_run import interrupt_guard
@@ -332,8 +333,16 @@ def run_once(
                 say(f"Spark {run.build}: could not cancel run {run_id}: {_clean(exc)}")
 
         clock = _Clock(sleep, now)
-        with interrupt_guard(cancel):
-            ended = clock.until(lambda: adapter.get(run_id), lambda i: i.state in TERMINAL, timeout)
+        try:
+            with interrupt_guard(cancel):
+                ended = clock.until(
+                    lambda: adapter.get(run_id), lambda i: i.state in TERMINAL, timeout
+                )
+        except KeyboardInterrupt:
+            # Ctrl-C, SIGTERM or SIGHUP (a killed Airflow task): the guard cancelled the run.
+            out.action, out.error, out.state = "cancelled", True, CANCELLING
+            out.message = f"interrupted while waiting; run {run_id} was cancelled"
+            return out
         out.state = ended.state
         if ended.state not in TERMINAL:
             cancel()
@@ -344,8 +353,6 @@ def run_once(
         else:
             out.action = "succeeded"
         return out
-    except KeyboardInterrupt:
-        raise
     except Exception as exc:  # noqa: BLE001 - the AWS error is the run's outcome
         return _error_outcome(run, exc)
 
