@@ -1,0 +1,185 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+import copy
+
+import pytest
+
+from fluid_build.build_runners.spark import _desired
+from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
+from fluid_build.spark.compiler import CONTRACT_SQL_ALLOWLIST_ENV
+from tests.build_runners.spark.conftest import ACCOUNT, runs_of, spark_cfg
+
+
+def _stream(contract):
+    return contract["builds"][0]["properties"]["stream"]
+
+
+def test_plan_action_carries_op_and_action_type_and_the_payload(run):
+    action = run.plan_action(3)
+    assert action["op"] == action["action_type"] == "spark.reconcile"
+    assert (action["step"], action["action_id"], action["id"]) == (
+        3,
+        "spark_ingest-orders",
+        "ingest-orders",
+    )
+    assert set(action["payload"]) == {
+        "product", "build", "runtime", "mode", "scheduled", "region", "target",
+        "executionRoleArn", "artifacts", "jobConfigDigest", "runnerSha256", "configHash",
+        "sourceId", "checkpointId", "stateImpact",
+    }  # fmt: skip
+    assert action["payload"]["configHash"] == run.config_hash
+    assert set(action["payload"]["artifacts"]) == {"jobConfig", "runner"}
+
+
+def test_config_hash_is_deterministic(contract):
+    assert runs_of(contract)[0].config_hash == runs_of(copy.deepcopy(contract))[0].config_hash
+
+
+def _spark_conf(c):
+    spark_cfg(c)["sparkConf"] = {"spark.executor.memory": "4g"}
+
+
+def _release(c):
+    spark_cfg(c)["releaseLabel"] = "emr-7.5.0"
+
+
+def _mapping(c):
+    c["builds"][0]["properties"]["mapping"]["columns"][0]["from"] = "customer.email"
+
+
+@pytest.mark.parametrize("change", [_spark_conf, _release, _mapping])
+def test_config_hash_changes_with_the_config(contract, change):
+    before = runs_of(contract)[0].config_hash
+    change(contract)
+    assert runs_of(contract)[0].config_hash != before
+
+
+def test_config_hash_changes_with_the_runner_source(contract, monkeypatch):
+    before = runs_of(contract)[0]
+    monkeypatch.setattr("fluid_build.spark.runner_source", lambda: "# another runner\n")
+    after = runs_of(contract)[0]
+    assert after.config_hash != before.config_hash
+    assert after.runner_sha256 != before.runner_sha256
+    assert after.runner_uri != before.runner_uri
+
+
+def test_a_new_topic_changes_the_source_but_not_the_checkpoint(contract):
+    before = runs_of(contract)[0]
+    _stream(contract)["topic"] = "commerce.orders-v2"
+    after = runs_of(contract)[0]
+    assert after.source_id != before.source_id
+    assert after.checkpoint_id == before.checkpoint_id
+    assert after.topic == "commerce.orders-v2"
+
+
+def test_a_declared_checkpoint_changes_the_checkpoint_id(contract):
+    before = runs_of(contract)[0]
+    _stream(contract)["checkpoint"] = "s3://commerce-lake/_cp/orders-v2/"
+    after = runs_of(contract)[0]
+    assert after.checkpoint_id != before.checkpoint_id
+    assert after.source_id == before.source_id
+
+
+def test_a_stream_with_a_processing_time_trigger_is_long_running(run):
+    assert run.scheduled is False and run.long_running
+
+
+def test_available_now_is_scheduled(contract):
+    _stream(contract)["trigger"] = {"availableNow": True}
+    assert runs_of(contract)[0].scheduled is True
+
+
+def test_a_batch_build_is_scheduled(contract, monkeypatch):
+    monkeypatch.setenv(CONTRACT_SQL_ALLOWLIST_ENV, "commerce.orders-stream")
+    props = contract["builds"][0]["properties"]
+    props.pop("stream"), props.pop("mapping")
+    props["sql"] = "SELECT order_id, sku FROM commerce.order_lines"
+    spark_cfg(contract).update(runtime="emr-eks", virtualClusterId="vc123", mode="batch")
+    spark_cfg(contract).pop("source")
+    batch = runs_of(contract)[0]
+    assert (batch.mode, batch.scheduled, batch.source_id) == ("batch", True, None)
+    assert batch.target == {"virtualClusterId": "vc123"}
+
+
+def test_emr_ec2_needs_a_cluster_id(contract):
+    spark_cfg(contract)["runtime"] = "emr-ec2"
+    with pytest.raises(ValueError, match="clusterId"):
+        runs_of(contract)
+    spark_cfg(contract)["clusterId"] = "j-ABC"
+    assert runs_of(contract)[0].target == {"clusterId": "j-ABC"}
+
+
+def test_serverless_targets_the_application_by_name_unless_given_an_id(contract):
+    assert runs_of(contract)[0].target == {"applicationName": "fluid-commerce.orders-stream-spark"}
+    spark_cfg(contract)["applicationId"] = "00abc"
+    assert runs_of(contract)[0].target == {"applicationId": "00abc"}
+
+
+def test_the_default_role_is_in_the_given_account(contract):
+    run = runs_of(contract)[0]
+    assert run.role_arn == (
+        f"arn:aws:iam::{ACCOUNT}:role/fluid-commerce.orders-stream-ingest-orders-spark"
+    )
+
+
+def test_the_default_role_uses_the_china_partition(contract):
+    contract["exposes"][0]["binding"]["location"]["region"] = "cn-north-1"
+    assert runs_of(contract)[0].role_arn.startswith(f"arn:aws-cn:iam::{ACCOUNT}:role/")
+
+
+def test_streaming_serverless_retries_default_to_five_and_cap_at_ten(contract):
+    assert runs_of(contract)[0].retry_attempts == 5
+    contract["builds"][0]["execution"] = {"retries": {"maxAttempts": 50}}
+    assert runs_of(contract)[0].retry_attempts == 10
+    contract["builds"][0]["execution"] = {"retries": {"maxAttempts": 3}}
+    assert runs_of(contract)[0].retry_attempts == 3
+
+
+def test_avro_confluent_adds_the_abris_package_and_the_confluent_repository(contract, monkeypatch):
+    ref = "aws-sm://commerce/registry#user_info"  # pragma: allowlist secret
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST_ENV, f"{ref}@registry.example.internal")
+    _stream(contract).update(
+        format="avro-confluent",
+        registry={
+            "kind": "confluent",
+            "url": "https://registry.example.internal",
+            "auth": {"secretRef": ref},
+        },
+    )
+    conf = runs_of(contract)[0].spark_conf
+    packages = conf["spark.jars.packages"].split(",")
+    assert any("abris" in p for p in packages) and any("spark-sql-kafka" in p for p in packages)
+    assert conf["spark.jars.repositories"] == _desired._CONFLUENT_REPOSITORY
+
+
+def test_a_json_stream_adds_no_avro_package(run):
+    assert "abris" not in run.spark_conf["spark.jars.packages"]
+    assert "aws-msk-iam-auth" in run.spark_conf["spark.jars.packages"]
+    assert "spark.jars.repositories" not in run.spark_conf
+
+
+def test_user_spark_conf_overrides_the_defaults(contract):
+    spark_cfg(contract)["sparkConf"] = {"spark.jars": "/mine.jar", "spark.executor.memory": 4}
+    conf = runs_of(contract)[0].spark_conf
+    assert conf["spark.jars"] == "/mine.jar"
+    assert conf["spark.executor.memory"] == "4"
+    assert "spark.sql.extensions" in conf
+
+
+def test_duplicate_build_ids_raise(contract):
+    contract["builds"].append(copy.deepcopy(contract["builds"][0]))
+    with pytest.raises(ValueError, match="unique"):
+        runs_of(contract)
+
+
+def test_a_build_filter_selects_one(contract):
+    assert runs_of(contract, build_id="nope") == []
+    assert [r.build for r in runs_of(contract, build_id="ingest-orders")] == ["ingest-orders"]
+
+
+def test_identity_args_and_tags_carry_the_hash_source_and_checkpoint(run):
+    assert run.entry_args()[:2] == ["--config", run.job_uri]
+    tags = run.tags()
+    assert tags["fluid_config_hash"] == run.config_hash
+    assert set(tags) >= {"fluid_product", "fluid_build", "fluid_source"}

@@ -1,0 +1,454 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+"""The four runtime adapters against botocore's Stubber, which checks every request and
+response against the real AWS API model."""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime as dt
+
+import boto3
+import pytest
+from botocore.stub import Stubber
+
+from fluid_build.build_runners.spark import _adapters as ad
+from tests.build_runners.spark.conftest import variant
+
+NOW = dt.datetime(2026, 11, 16, 12, 0, tzinfo=dt.timezone.utc)
+EARLIER = NOW - dt.timedelta(hours=1)
+ARN = "arn:aws:emr-serverless:eu-west-1:123456789012:/applications/app1/jobruns/xxxxxxxxxxxx"
+USER = "arn:aws:iam::123456789012:user/fluid"
+
+
+def stubbed(service, region="eu-west-1"):
+    client = boto3.client(service, region_name=region)
+    stub = Stubber(client)
+    stub.activate()
+    return client, stub
+
+
+def adapter_on(run, service):
+    client, stub = stubbed(service, run.region)
+    return ad.adapter_for(run, lambda s, r: client), stub
+
+
+def identity_of(run):
+    return {
+        "config_hash": run.config_hash,
+        "source_id": run.source_id,
+        "checkpoint_id": run.checkpoint_id,
+    }
+
+
+@pytest.fixture
+def serverless(run):
+    return dataclasses.replace(run, target={"applicationId": "app1"})
+
+
+# --- EMR Serverless -------------------------------------------------------------------
+
+
+def _serverless_start(run):
+    request = {
+        "applicationId": "app1",
+        "clientToken": "tok",
+        "executionRoleArn": run.role_arn,
+        "name": run.run_name,
+        "mode": "STREAMING",
+        "jobDriver": {
+            "sparkSubmit": {
+                "entryPoint": run.runner_uri,
+                "entryPointArguments": [
+                    "--config", run.job_uri, "--fluid-config-hash", run.config_hash,
+                    "--fluid-source", run.source_id, "--fluid-checkpoint", run.checkpoint_id,
+                ],
+                "sparkSubmitParameters": ad._submit_parameters(run.spark_conf),
+            }
+        },
+        "tags": run.tags(),
+    }  # fmt: skip
+    return request
+
+
+def test_serverless_streaming_start(serverless):
+    adapter, stub = adapter_on(serverless, "emr-serverless")
+    request = _serverless_start(serverless)
+    request["retryPolicy"] = {"maxFailedAttemptsPerHour": 5}
+    stub.add_response(
+        "start_job_run", {"applicationId": "app1", "jobRunId": "jr1", "arn": ARN}, request
+    )
+    assert adapter.start("tok") == "jr1"
+    stub.assert_no_pending_responses()
+    args = request["jobDriver"]["sparkSubmit"]["entryPointArguments"]
+    assert args[:4] == [
+        "--config",
+        serverless.job_uri,
+        "--fluid-config-hash",
+        serverless.config_hash,
+    ]
+    assert request["tags"]["fluid_build"] == "ingest-orders"
+
+
+def test_serverless_scheduled_start_is_batch_with_max_attempts(serverless):
+    scheduled = dataclasses.replace(serverless, scheduled=True, mode="batch", retry_attempts=2)
+    adapter, stub = adapter_on(scheduled, "emr-serverless")
+    request = _serverless_start(scheduled)
+    request.update(mode="BATCH", retryPolicy={"maxAttempts": 2})
+    stub.add_response(
+        "start_job_run", {"applicationId": "app1", "jobRunId": "jr2", "arn": ARN}, request
+    )
+    assert adapter.start("tok") == "jr2"
+
+
+def _job_run(run, state, run_id="jr1", *, created=NOW, attempt=None, details="ok", with_args=True):
+    driver = {"entryPoint": run.runner_uri}
+    if with_args:
+        driver["entryPointArguments"] = run.entry_args()
+    job = {
+        "applicationId": "app1", "jobRunId": run_id, "arn": ARN, "createdBy": USER,
+        "createdAt": created, "updatedAt": created, "executionRole": run.role_arn,
+        "state": state, "stateDetails": details, "releaseLabel": "emr-7.12.0",
+        "jobDriver": {"sparkSubmit": driver}, "tags": run.tags(),
+    }  # fmt: skip
+    if attempt:
+        job["attempt"] = attempt
+    return {"jobRun": job}
+
+
+@pytest.mark.parametrize(
+    ("raw", "state"),
+    [("SUCCESS", "SUCCEEDED"), ("SCHEDULED", "PENDING"), ("CANCELLING", "CANCELLING"),
+     ("FAILED", "FAILED"), ("RUNNING", "RUNNING")],
+)  # fmt: skip
+def test_serverless_get_normalises_state_and_reads_identity(serverless, raw, state):
+    adapter, stub = adapter_on(serverless, "emr-serverless")
+    stub.add_response(
+        "get_job_run",
+        _job_run(serverless, raw, attempt=2, details="boom"),
+        {"applicationId": "app1", "jobRunId": "jr1"},
+    )
+    info = adapter.get("jr1")
+    assert (info.state, info.raw_state, info.attempt, info.details) == (state, raw, 2, "boom")
+    assert {k: getattr(info, k) for k in identity_of(serverless)} == identity_of(serverless)
+
+
+def test_serverless_runs_lists_this_runs_name_newest_first(serverless):
+    adapter, stub = adapter_on(serverless, "emr-serverless")
+
+    def summary(run_id, name, created):
+        return {
+            "applicationId": "app1", "id": run_id, "arn": ARN, "createdBy": USER,
+            "createdAt": created, "updatedAt": created, "executionRole": USER, "state": "RUNNING",
+            "name": name, "type": "SPARK", "stateDetails": "running", "releaseLabel": "emr-7.12.0",
+        }  # fmt: skip
+
+    stub.add_response(
+        "list_job_runs",
+        {"jobRuns": [
+            summary("old", serverless.run_name, EARLIER),
+            summary("other", "someone-else", NOW),
+            summary("new", serverless.run_name, NOW),
+        ]},
+        {"applicationId": "app1", "mode": "STREAMING"},
+    )  # fmt: skip
+    for run_id in ("new", "old"):
+        stub.add_response(
+            "get_job_run",
+            _job_run(serverless, "RUNNING", run_id),
+            {"applicationId": "app1", "jobRunId": run_id},
+        )
+    assert [r.run_id for r in adapter.runs()] == ["new", "old"]
+
+
+def test_serverless_cancel(serverless):
+    adapter, stub = adapter_on(serverless, "emr-serverless")
+    stub.add_response(
+        "cancel_job_run",
+        {"applicationId": "app1", "jobRunId": "jr1"},
+        {"applicationId": "app1", "jobRunId": "jr1"},
+    )
+    adapter.cancel("jr1")
+    stub.assert_no_pending_responses()
+
+
+def _applications(*apps):
+    return {
+        "applications": [
+            {
+                "id": i,
+                "name": n,
+                "arn": ARN,
+                "releaseLabel": "emr-7.12.0",
+                "type": "Spark",
+                "state": s,
+                "createdAt": NOW,
+                "updatedAt": NOW,
+            }  # fmt: skip
+            for i, n, s in apps
+        ]
+    }
+
+
+def test_serverless_resolves_the_application_by_name(run):
+    adapter, stub = adapter_on(run, "emr-serverless")
+    name = run.target["applicationName"]
+    stub.add_response(
+        "list_applications",
+        _applications(
+            ("gone", name, "TERMINATED"), ("app9", name, "STARTED"), ("x", "other", "STARTED")
+        ),
+    )
+    assert adapter.application_id() == "app9"
+    assert adapter.application_id() == "app9"  # cached: no second call
+    stub.assert_no_pending_responses()
+
+
+@pytest.mark.parametrize(
+    ("apps", "message"),
+    [([], "no EMR Serverless application named"),
+     ([("a", "N", "STARTED"), ("b", "N", "CREATED")], "2 EMR Serverless applications")],
+)  # fmt: skip
+def test_serverless_application_lookup_needs_exactly_one_match(run, apps, message):
+    adapter, stub = adapter_on(run, "emr-serverless")
+    apps = [(i, run.target["applicationName"], s) for i, _, s in apps]
+    stub.add_response("list_applications", _applications(*apps))
+    with pytest.raises(ad.SparkRunError, match=message):
+        adapter.application_id()
+
+
+# --- Glue -----------------------------------------------------------------------------
+
+
+@pytest.fixture
+def glue_run(run):
+    return variant(
+        run, "glue", {"glueJobName": "fluid-job"}, release_label=None, glue_version="5.0"
+    )
+
+
+def test_glue_start_passes_identity_and_conf_as_arguments(glue_run):
+    adapter, stub = adapter_on(glue_run, "glue")
+    conf = sorted(glue_run.spark_conf.items())
+    arguments = {
+        "--config": glue_run.job_uri,
+        "--fluid-config-hash": glue_run.config_hash,
+        "--fluid-source": glue_run.source_id,
+        "--fluid-checkpoint": glue_run.checkpoint_id,
+        "--conf": " --conf ".join(f"{k}={v}" for k, v in conf),
+    }
+    stub.add_response(
+        "start_job_run", {"JobRunId": "jr_1"}, {"JobName": "fluid-job", "Arguments": arguments}
+    )
+    assert adapter.start("tok") == "jr_1"
+
+
+def test_glue_runs_normalise_states_and_read_arguments(glue_run):
+    adapter, stub = adapter_on(glue_run, "glue")
+    flat = dict(zip(glue_run.entry_args()[::2], glue_run.entry_args()[1::2], strict=True))
+    stub.add_response(
+        "get_job_runs",
+        {"JobRuns": [
+            {"Id": "jr_old", "JobRunState": "STOPPED", "StartedOn": EARLIER, "Arguments": flat},
+            {"Id": "jr_new", "JobRunState": "TIMEOUT", "StartedOn": NOW, "Arguments": flat,
+             "ErrorMessage": "timed out", "Attempt": 1},
+        ]},
+        {"JobName": "fluid-job", "MaxResults": 25},
+    )  # fmt: skip
+    new, old = adapter.runs()
+    assert (new.run_id, new.state, new.details) == ("jr_new", "FAILED", "timed out")
+    assert (old.run_id, old.state) == ("jr_old", "CANCELLED")
+    assert old.config_hash == glue_run.config_hash and old.checkpoint_id == glue_run.checkpoint_id
+
+
+def test_glue_get(glue_run):
+    adapter, stub = adapter_on(glue_run, "glue")
+    stub.add_response(
+        "get_job_run",
+        {"JobRun": {"Id": "jr_1", "JobRunState": "SUCCEEDED"}},
+        {"JobName": "fluid-job", "RunId": "jr_1"},
+    )
+    assert adapter.get("jr_1").state == "SUCCEEDED"
+
+
+def test_glue_cancel_reports_batch_stop_errors(glue_run):
+    adapter, stub = adapter_on(glue_run, "glue")
+    expected = {"JobName": "fluid-job", "JobRunIds": ["jr_1"]}
+    stub.add_response("batch_stop_job_run", {"SuccessfulSubmissions": [], "Errors": []}, expected)
+    adapter.cancel("jr_1")
+    error = {"JobRunId": "jr_1", "ErrorDetail": {"ErrorCode": "X", "ErrorMessage": "not running"}}
+    stub.add_response(
+        "batch_stop_job_run", {"Errors": [{"JobName": "fluid-job", **error}]}, expected
+    )
+    with pytest.raises(ad.SparkRunError, match="not running"):
+        adapter.cancel("jr_1")
+
+
+# --- EMR on EC2 -----------------------------------------------------------------------
+
+
+@pytest.fixture
+def ec2_run(run):
+    return variant(run, "emr-ec2", {"clusterId": "j-ABC"})
+
+
+def test_ec2_start_adds_a_spark_submit_step_that_continues_on_failure(ec2_run):
+    adapter, stub = adapter_on(ec2_run, "emr")
+    args = ["spark-submit", "--deploy-mode", "cluster", *ad._conf_params(ec2_run.spark_conf)]
+    args += [ec2_run.runner_uri, *ec2_run.entry_args()]
+    stub.add_response(
+        "add_job_flow_steps",
+        {"StepIds": ["s-1"]},
+        {"JobFlowId": "j-ABC", "Steps": [{
+            "Name": ec2_run.run_name,
+            "ActionOnFailure": "CONTINUE",
+            "HadoopJarStep": {"Jar": "command-runner.jar", "Args": args},
+        }]},
+    )  # fmt: skip
+    assert adapter.start("tok") == "s-1"
+    assert "--fluid-config-hash" in args and ec2_run.config_hash in args
+
+
+def _step(run, step_id, state, created, name=None, reason="why"):
+    return {
+        "Id": step_id,
+        "Name": name or run.run_name,
+        "Config": {"Jar": "command-runner.jar", "Args": run.entry_args()},
+        "ActionOnFailure": "CONTINUE",
+        "Status": {
+            "State": state,
+            "StateChangeReason": {"Message": reason},
+            "Timeline": {"CreationDateTime": created},
+        },
+    }
+
+
+def test_ec2_runs_filter_by_name_and_map_interrupted_to_failed(ec2_run):
+    adapter, stub = adapter_on(ec2_run, "emr")
+    stub.add_response(
+        "list_steps",
+        {"Steps": [
+            _step(ec2_run, "s-old", "COMPLETED", EARLIER),
+            _step(ec2_run, "s-other", "RUNNING", NOW, name="unrelated"),
+            _step(ec2_run, "s-new", "INTERRUPTED", NOW, reason="cluster stopped"),
+        ]},
+        {"ClusterId": "j-ABC"},
+    )  # fmt: skip
+    new, old = adapter.runs()
+    assert (new.run_id, new.state, new.raw_state, new.details) == (
+        "s-new", "FAILED", "INTERRUPTED", "cluster stopped",
+    )  # fmt: skip
+    assert old.state == "SUCCEEDED" and old.config_hash == ec2_run.config_hash
+
+
+def test_ec2_get_reads_describe_step(ec2_run):
+    adapter, stub = adapter_on(ec2_run, "emr")
+    stub.add_response(
+        "describe_step",
+        {"Step": _step(ec2_run, "s-1", "CANCEL_PENDING", NOW)},
+        {"ClusterId": "j-ABC", "StepId": "s-1"},
+    )
+    assert adapter.get("s-1").state == "CANCELLING"
+
+
+def test_ec2_cancel_failure_raises(ec2_run):
+    adapter, stub = adapter_on(ec2_run, "emr")
+    expected = {
+        "ClusterId": "j-ABC",
+        "StepIds": ["s-1"],
+        "StepCancellationOption": "SEND_INTERRUPT",
+    }
+    stub.add_response(
+        "cancel_steps",
+        {"CancelStepsInfoList": [{"StepId": "s-1", "Status": "SUBMITTED"}]},
+        expected,
+    )
+    adapter.cancel("s-1")
+    stub.add_response(
+        "cancel_steps",
+        {"CancelStepsInfoList": [{"StepId": "s-1", "Status": "FAILED", "Reason": "already done"}]},
+        expected,
+    )
+    with pytest.raises(ad.SparkRunError, match="already done"):
+        adapter.cancel("s-1")
+
+
+# --- EMR on EKS -----------------------------------------------------------------------
+
+
+@pytest.fixture
+def eks_run(run):
+    return variant(run, "emr-eks", {"virtualClusterId": "vc1"}, retry_attempts=3)
+
+
+def _eks_job(run, run_id, state, created=NOW, **extra):
+    driver = {"entryPoint": run.runner_uri, "entryPointArguments": run.entry_args()}
+    return {
+        "id": run_id, "name": run.run_name, "virtualClusterId": "vc1", "state": state,
+        "createdAt": created, "jobDriver": {"sparkSubmitJobDriver": driver},
+        "tags": run.tags(), **extra,
+    }  # fmt: skip
+
+
+def test_eks_start_sets_cluster_release_and_retry_policy(eks_run):
+    adapter, stub = adapter_on(eks_run, "emr-containers")
+    stub.add_response(
+        "start_job_run",
+        {"id": "eks-1", "name": eks_run.run_name, "virtualClusterId": "vc1"},
+        {
+            "name": eks_run.run_name,
+            "virtualClusterId": "vc1",
+            "clientToken": "tok",
+            "executionRoleArn": eks_run.role_arn,
+            "releaseLabel": "emr-7.12.0",
+            "jobDriver": {"sparkSubmitJobDriver": {
+                "entryPoint": eks_run.runner_uri,
+                "entryPointArguments": eks_run.entry_args(),
+                "sparkSubmitParameters": ad._submit_parameters(eks_run.spark_conf),
+            }},
+            "tags": eks_run.tags(),
+            "retryPolicyConfiguration": {"maxAttempts": 3},
+        },
+    )  # fmt: skip
+    assert adapter.start("tok") == "eks-1"
+
+
+def test_eks_runs_and_get_normalise_completed_and_read_attempts(eks_run):
+    adapter, stub = adapter_on(eks_run, "emr-containers")
+    stub.add_response(
+        "list_job_runs",
+        {"jobRuns": [
+            _eks_job(eks_run, "e-old", "COMPLETED", EARLIER),
+            _eks_job(eks_run, "e-new", "RUNNING", retryPolicyExecution={"currentAttemptCount": 3}),
+        ]},
+        {"virtualClusterId": "vc1", "name": eks_run.run_name},
+    )  # fmt: skip
+    new, old = adapter.runs()
+    assert (new.run_id, new.state, new.attempt) == ("e-new", "RUNNING", 3)
+    assert (old.state, old.config_hash) == ("SUCCEEDED", eks_run.config_hash)
+    stub.add_response(
+        "describe_job_run",
+        {"jobRun": _eks_job(eks_run, "e-old", "FAILED", failureReason="USER_ERROR")},
+        {"id": "e-old", "virtualClusterId": "vc1"},
+    )
+    got = adapter.get("e-old")
+    assert (got.state, got.details) == ("FAILED", "USER_ERROR")
+
+
+def test_eks_cancel(eks_run):
+    adapter, stub = adapter_on(eks_run, "emr-containers")
+    stub.add_response(
+        "cancel_job_run",
+        {"id": "e-1", "virtualClusterId": "vc1"},
+        {"id": "e-1", "virtualClusterId": "vc1"},
+    )
+    adapter.cancel("e-1")
+    stub.assert_no_pending_responses()
+
+
+def test_where_names_the_target(serverless, glue_run, ec2_run, eks_run):
+    assert "j-ABC" in adapter_on(ec2_run, "emr")[0].where()
+    assert "fluid-job" in adapter_on(glue_run, "glue")[0].where()
+    assert "vc1" in adapter_on(eks_run, "emr-containers")[0].where()
+    assert "app1" in adapter_on(serverless, "emr-serverless")[0].where()
