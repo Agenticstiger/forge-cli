@@ -243,12 +243,18 @@ def _refuse_unless_mask_key_allowed(arn: str, environ: Any) -> None:
     check_prefix(ref, environ)
 
 
-def _refuse_unless_credential_allowed(ref: Any, url: str, where: str, environ: Any) -> None:
+def _refuse_unless_credential_allowed(
+    ref: Any, url: str, where: str, environ: Any, *, granted: bool = True
+) -> None:
     """The secrets policy for a credential the job sends to the registry.
 
     The contract names both the secret and the host, so without this a product could
     have the job's role read another product's secret and send it wherever it chose.
     The job sends from the cluster, so a loopback host is no exemption here.
+
+    ``granted=False`` (``fluid validate``) leaves out only the operator's destination
+    grant, which :func:`validation_warnings` names instead (policy #818: a missing
+    operator entry warns at validate and refuses at compile and run).
     """
     from fluid_build.secrets.policy import (
         check_prefix,
@@ -267,10 +273,35 @@ def _refuse_unless_credential_allowed(ref: Any, url: str, where: str, environ: A
         )
     check_scheme(ref, environ)
     check_prefix(ref, environ)
-    refuse_unless_allowed(ref, host=parts.hostname, environ=environ)
+    if granted:
+        refuse_unless_allowed(ref, host=parts.hostname, environ=environ)
 
 
-def _registry(spec: Any, stream: Any, where: str, environ: Any) -> Optional[dict[str, Any]]:
+def _missing_grant(spec: Any, environ: Any) -> Optional[str]:
+    """The ``FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`` entry a registry credential lacks."""
+    from fluid_build.secrets.errors import SecretError
+    from fluid_build.secrets.policy import refuse_unless_allowed
+    from fluid_build.secrets.ref import parse_secret_ref
+
+    auth = spec.get("auth") if isinstance(spec, Mapping) else None
+    raw = auth.get("secretRef") if isinstance(auth, Mapping) else None
+    url = spec.get("url") if isinstance(spec, Mapping) else None
+    if not isinstance(raw, str) or not isinstance(url, str):
+        return None
+    try:
+        ref, host = parse_secret_ref(raw), urlsplit(url).hostname
+    except (SecretError, ValueError):
+        return None  # validation_errors reports it
+    try:
+        refuse_unless_allowed(ref, host=host, environ=environ)
+    except SecretError:
+        return f"{ref.canonical}@{host}"
+    return None
+
+
+def _registry(
+    spec: Any, stream: Any, where: str, environ: Any, *, granted: bool = True
+) -> Optional[dict[str, Any]]:
     if spec is None:
         if stream.uses_registry:
             raise ValueError(f"{where}.registry: avro-confluent records need their registry")
@@ -308,7 +339,7 @@ def _registry(spec: Any, stream: Any, where: str, environ: Any) -> Optional[dict
                 f"credential from {' or '.join(_REGISTRY_SECRET_SCHEMES)} references, "
                 f"not {ref.scheme}"
             )
-        _refuse_unless_credential_allowed(ref, url, where, environ)
+        _refuse_unless_credential_allowed(ref, url, where, environ, granted=granted)
         result["auth"] = {"secretRef": ref.canonical}
     return result
 
@@ -395,8 +426,8 @@ def compile_job_config(
     as the IaC emitter's interpolation token or an account id. ``environ`` holds the
     operator's policy (:data:`CONTRACT_SQL_ALLOWLIST_ENV`, the broker and registry host
     allowlist, the secrets policy). ``contract_sql_gate=False`` and ``host_gate=False``
-    leave the contract-SQL allowlist and the host allowlist's entries to the caller
-    (``fluid validate`` warns about them instead).
+    leave the contract-SQL allowlist, the host allowlist's entries and the registry
+    credential's destination grant to the caller (``fluid validate`` warns about them).
     """
     from fluid_build.spark.policy import refuse_unless_contract_sql_allowed
 
@@ -475,7 +506,9 @@ def compile_job_config(
         records = {k: v for k, v in stream_spec.items() if k not in _ENGINE_KEYS}
         stream = parse_stream(records, swhere)
         kafka = _kafka(cfg, where)
-        registry = _registry(stream_spec.get("registry"), stream, swhere, environ)
+        registry = _registry(
+            stream_spec.get("registry"), stream, swhere, environ, granted=host_gate
+        )
         _refuse_unless_hosts_allowed(
             _source_hosts(kafka, registry and registry["url"]), environ, listed=host_gate
         )
@@ -593,6 +626,7 @@ def validation_errors(contract: Mapping[str, Any]) -> list[str]:
 
 
 def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
+    from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
     from fluid_build.streaming.compiler import managed_lane_enabled
     from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV
 
@@ -626,5 +660,12 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
             warnings.append(
                 f"Build {build.get('id')}: {', '.join(names)} is not in {HOST_ALLOWLIST_ENV}; "
                 "the job is refused at run time until the operator lists it"
+            )
+        grant = _missing_grant(stream.get("registry"), None)
+        if grant:
+            warnings.append(
+                f"Build {build.get('id')}: the registry credential needs the operator's grant "
+                f"{grant} in {SECRET_REF_ALLOWLIST_ENV}; the job is refused at compile and run "
+                "time until it is listed"
             )
     return warnings

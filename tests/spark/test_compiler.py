@@ -445,3 +445,33 @@ def test_the_flink_lane_no_longer_claims_a_spark_builds_mapping(contract):
     from fluid_build.streaming.compiler import validation_warnings as flink_warnings
 
     assert not any("managed Flink lane" in w for w in flink_warnings(contract))
+
+
+def test_a_missing_credential_grant_warns_at_validate_and_refuses_at_compile(contract):
+    """Policy #818: a missing operator entry warns at validate, refuses at compile and run."""
+    ref = "env://SCHEMA_REGISTRY_AUTH"  # pragma: allowlist secret
+    contract["builds"][0]["properties"]["stream"].update(
+        format="avro-confluent",
+        registry={
+            "kind": "confluent",
+            "url": "https://schema-registry.example.internal",
+            "auth": {"secretRef": ref},
+        },
+    )
+    assert validation_errors(contract) == []
+    grants = [w for w in validation_warnings(contract) if SECRET_REF_ALLOWLIST_ENV in w]
+    assert len(grants) == 1
+    assert f"{ref}@schema-registry.example.internal" in grants[0]
+    with pytest.raises(FluidUserError):
+        job(contract)
+    environ = {
+        SECRET_REF_ALLOWLIST_ENV: f"{ref}@schema-registry.example.internal",
+        HOST_ALLOWLIST_ENV: "msk.example,example.internal",
+    }
+    assert job(contract, environ=environ).config["source"]["registry"]["auth"] == {"secretRef": ref}
+    # https stays an error at validate too.
+    contract["builds"][0]["properties"]["stream"]["registry"][
+        "url"
+    ] = "http://schema-registry.example.internal"
+    (error,) = validation_errors(contract)
+    assert "https only" in error
