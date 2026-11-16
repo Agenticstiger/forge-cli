@@ -1,0 +1,663 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+"""The IAM identity of a forge Spark job, and what the operator lets a contract choose.
+
+Each ``engine: spark`` build (``fluid_build/spark``) runs as one role. Without
+``parameters.spark.executionRoleArn`` forge creates that role per build. Its inline
+policy grants only what the job config (``job.json``) reads and writes:
+
+- S3: read and write on the output table's data prefix and on the build's checkpoint
+  (``<bucket>/_checkpoints/<product>/<build>/``); read only on the build's artifacts
+  (``<bucket>/_fluid/spark/<product>/<build>/``, the runner and ``job.json``); list on
+  those prefixes alone. Glue also gets its ``--TempDir`` under the artifact prefix.
+- Glue: ``GetDatabase``, ``GetTable`` and ``UpdateTable`` on the output's catalog,
+  database and table ARNs. These are the calls Iceberg's ``GlueCatalog`` makes to load a
+  table and commit to it.
+- Lake Formation: ``GetDataAccess``. It has no resource-level form, so Lake Formation's
+  own grants decide what the role reads.
+- KMS: ``Decrypt``/``GenerateDataKey`` through S3 only (``kms:ViaService``), for objects
+  of the bucket's prefixes (``kms:EncryptionContext:aws:s3:arn``), whatever key the
+  bucket uses. Also ``Decrypt`` through Secrets Manager for the job's secrets only.
+- MSK IAM: ``Connect`` on the cluster, ``DescribeTopic``/``ReadData`` on the topic, and
+  ``DescribeGroup``/``AlterGroup`` on the consumer groups the Kafka source creates.
+  ReadData needs Connect, DescribeTopic and AlterGroup. AlterGroup needs DescribeGroup.
+  (MSK developer guide, *IAM access control*: "Semantics of actions and resources".)
+- Secrets Manager: ``GetSecretValue`` on the ``maskAtIngest`` key and on an
+  ``aws-sm://`` registry credential.
+- CloudWatch Logs: write to the build's own log group.
+
+The role's trust follows the runtime:
+
+- ``emr-serverless``: ``emr-serverless.amazonaws.com``, for this account and, by
+  ``aws:SourceArn``, only the application that runs the job (the confused-deputy guard in
+  the EMR Serverless user guide, *Job runtime roles*).
+- ``glue``: ``glue.amazonaws.com``, for this account.
+- ``emr-eks``: the EKS cluster's OIDC provider, for the service accounts EMR on EKS
+  creates in the virtual cluster's namespace. The statement is the one
+  ``aws emr-containers update-role-trust-policy`` writes, with the role name in the same
+  base36 encoding (awscli ``customizations/emrcontainers``, Apache-2.0). The virtual
+  cluster and its EKS cluster are read at plan time.
+- ``emr-ec2``: a step runs as the cluster's EC2 instance profile, which belongs to the
+  cluster, not to the product. forge creates no role here. It creates the same policy as
+  a managed policy for the cluster owner to attach to that instance profile's role.
+
+``executionRoleArn`` set means forge only references the role, and the operator decides
+which roles a contract may name (:data:`EXECUTION_ROLE_ALLOWLIST_ENV`). ``sparkConf``
+keys pass a fixed allowlist of tuning settings. A key that can load code, change the
+job's identity or credentials, or move its catalog, warehouse or checkpoint is always
+refused. Any other key needs the operator's :data:`SPARK_CONF_ALLOWLIST_ENV`. Both
+follow the operator-policy severities of the Iceberg catalog-auth decision (#818): a
+missing operator entry warns in ``fluid validate`` and is refused when the IaC is
+generated or applied.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from fluid_build._errors import doc_url
+
+#: Operator-only: the roles a contract's ``executionRoleArn`` may name. An entry is a
+#: role ARN, or an ARN prefix that ends in ``/`` (a role path). Unset allows none.
+EXECUTION_ROLE_ALLOWLIST_ENV = "FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST"
+#: Operator-only: ``sparkConf`` keys beyond the built-in tuning list. An entry is a key,
+#: or a prefix that ends in ``.``. It never admits a key in :data:`DENIED_SPARK_CONF`.
+SPARK_CONF_ALLOWLIST_ENV = "FLUID_SPARK_CONF_ALLOWLIST"
+
+_OPERATOR_ONLY = (
+    "in the OPERATOR environment (a shell or CI variable; a project .env is ignored "
+    "for every *_ALLOWLIST setting)"
+)
+
+#: Always refused, whatever the operator lists. A key here, or under a prefix that ends
+#: in ``.``, could load code into the job (jars, Python files, plugins, extensions,
+#: class paths, JVM options), change who the job is or which credentials it uses
+#: (Hadoop and AWS credential providers, environment variables, Kubernetes pod
+#: settings), or move what the job writes (its catalog, warehouse and checkpoint, which
+#: the job config owns), or switch off a setting the runner relies on.
+DENIED_SPARK_CONF: Tuple[str, ...] = (
+    "spark.jars",
+    "spark.jars.",
+    "spark.files",
+    "spark.files.",
+    "spark.archives",
+    "spark.submit.",
+    "spark.pyspark.",
+    "spark.python.",
+    "spark.plugins",
+    "spark.plugins.",
+    "spark.extraListeners",
+    "spark.sql.extensions",
+    "spark.sql.catalog.",
+    "spark.sql.catalogImplementation",
+    "spark.sql.defaultCatalog",
+    "spark.sql.warehouse.dir",
+    "spark.sql.streaming.checkpointLocation",
+    "spark.sql.queryExecutionListeners",
+    "spark.sql.streaming.streamingQueryListeners",
+    "spark.sql.variable.substitute",
+    "spark.sql.session.timeZone",
+    "spark.sql.mapKeyDedupPolicy",
+    "spark.driver.extraClassPath",
+    "spark.driver.extraJavaOptions",
+    "spark.driver.extraLibraryPath",
+    "spark.executor.extraClassPath",
+    "spark.executor.extraJavaOptions",
+    "spark.executor.extraLibraryPath",
+    "spark.driver.userClassPathFirst",
+    "spark.executor.userClassPathFirst",
+    "spark.driver.defaultJavaOptions",
+    "spark.executor.defaultJavaOptions",
+    "spark.executorEnv.",
+    "spark.yarn.",
+    "spark.kubernetes.",
+    "spark.emr-serverless.driverEnv.",
+    "spark.emr-serverless.executorEnv.",
+    "spark.emr-serverless.lakeformation.",
+    "spark.hadoop.",
+    "spark.kerberos.",
+    "spark.security.",
+    "spark.authenticate",
+    "spark.authenticate.",
+    "spark.ssl.",
+    "spark.redaction.",
+    "spark.eventLog.",
+    "spark.ui.",
+    "spark.master",
+    "spark.app.",
+)
+
+#: Allowed with no operator entry: sizing and tuning settings, which change how fast and
+#: how wide the job runs, never what it runs or as whom. Exact keys, or prefixes that
+#: end in ``.``.
+DEFAULT_SPARK_CONF: Tuple[str, ...] = (
+    "spark.driver.cores",
+    "spark.driver.memory",
+    "spark.driver.memoryOverhead",
+    "spark.driver.maxResultSize",
+    "spark.executor.cores",
+    "spark.executor.memory",
+    "spark.executor.memoryOverhead",
+    "spark.executor.instances",
+    "spark.dynamicAllocation.",
+    "spark.default.parallelism",
+    "spark.memory.",
+    "spark.network.timeout",
+    "spark.task.maxFailures",
+    "spark.sql.shuffle.partitions",
+    "spark.sql.adaptive.",
+    "spark.sql.files.maxPartitionBytes",
+    "spark.sql.files.maxRecordsPerFile",
+    "spark.sql.autoBroadcastJoinThreshold",
+    "spark.sql.streaming.minBatchesToRetain",
+    "spark.sql.streaming.stateStore.providerClass",
+    "spark.sql.iceberg.",
+    "spark.emr-serverless.driver.disk",
+    "spark.emr-serverless.executor.disk",
+    "spark.emr-serverless.driver.disk.type",
+    "spark.emr-serverless.executor.disk.type",
+)
+
+_ROLE_ARN = re.compile(r"arn:aws[a-zA-Z0-9-]*:iam::[0-9]{12}:role/[A-Za-z0-9_+=,.@/-]{1,512}")
+#: A Secrets Manager secret ARN ends in ``-`` and six random characters. A partial ARN
+#: (the name only) matches its full ARN through ``-??????``.
+_FULL_SECRET_ARN = re.compile(r".*-[A-Za-z0-9]{6}")
+#: IAM's limit on a role name.
+ROLE_NAME_LIMIT = 64
+
+
+def _matches(key: str, entries: Sequence[str]) -> bool:
+    return any(key == e or (e.endswith(".") and key.startswith(e)) for e in entries)
+
+
+def _entries(name: str, environ: Optional[Mapping[str, str]]) -> List[str]:
+    env = os.environ if environ is None else environ
+    return [e.strip() for e in (env.get(name) or "").split(",") if e.strip()]
+
+
+def denied_spark_conf(conf: Mapping[str, Any]) -> List[str]:
+    """The ``sparkConf`` keys no operator entry admits."""
+    return sorted(k for k in conf if _matches(str(k), DENIED_SPARK_CONF))
+
+
+def unlisted_spark_conf(
+    conf: Mapping[str, Any], environ: Optional[Mapping[str, str]] = None
+) -> List[str]:
+    """The keys that are neither denied nor allowed by default or by the operator."""
+    listed = [*DEFAULT_SPARK_CONF, *_entries(SPARK_CONF_ALLOWLIST_ENV, environ)]
+    return sorted(
+        str(k)
+        for k in conf
+        if not _matches(str(k), DENIED_SPARK_CONF) and not _matches(str(k), listed)
+    )
+
+
+def role_listed(arn: str, environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether the operator lets a contract name ``arn`` as its execution role."""
+    entries = _entries(EXECUTION_ROLE_ALLOWLIST_ENV, environ)
+    return any(arn == e or (e.endswith("/") and arn.startswith(e)) for e in entries)
+
+
+def _spark_conf(build: Mapping[str, Any]) -> Mapping[str, Any]:
+    from fluid_build.spark.compiler import spark_parameters
+
+    conf = (spark_parameters(build) or {}).get("sparkConf") or {}
+    if not isinstance(conf, Mapping):
+        raise ValueError(f"Spark build {build.get('id')}: parameters.spark.sparkConf: an object")
+    return conf
+
+
+def identity_findings(
+    build: Mapping[str, Any], environ: Optional[Mapping[str, str]] = None
+) -> Tuple[List[str], List[str]]:
+    """``(errors, missing operator entries)`` for one Spark build's role and ``sparkConf``.
+
+    An error fails at every stage. A missing entry is a warning in ``fluid validate``
+    and a refusal in :func:`refuse_unless_identity_allowed`.
+    """
+    from fluid_build.spark.compiler import spark_parameters
+
+    bid = build.get("id")
+    errors: List[str] = []
+    missing: List[str] = []
+    try:
+        conf = _spark_conf(build)
+    except ValueError as exc:
+        return [str(exc)], []
+    denied = denied_spark_conf(conf)
+    if denied:
+        errors.append(
+            f"Spark build {bid}: parameters.spark.sparkConf sets {', '.join(denied)}. These "
+            "keys can load code into the job, change its identity or credentials, or move "
+            "its catalog, warehouse or checkpoint, which the job config owns, so no "
+            "contract may set them"
+        )
+    unlisted = unlisted_spark_conf(conf, environ)
+    if unlisted:
+        missing.append(
+            f"Spark build {bid}: parameters.spark.sparkConf sets {', '.join(unlisted)}, "
+            f"which {SPARK_CONF_ALLOWLIST_ENV} does not list"
+        )
+    arn = (spark_parameters(build) or {}).get("executionRoleArn")
+    if arn is not None:
+        if not (isinstance(arn, str) and _ROLE_ARN.fullmatch(arn)):
+            errors.append(f"Spark build {bid}: parameters.spark.executionRoleArn: a role ARN")
+        elif not role_listed(arn, environ):
+            missing.append(
+                f"Spark build {bid}: parameters.spark.executionRoleArn {arn} is not in "
+                f"{EXECUTION_ROLE_ALLOWLIST_ENV}"
+            )
+    return errors, missing
+
+
+def refuse_unless_identity_allowed(
+    product_id: Any, build: Mapping[str, Any], environ: Optional[Mapping[str, str]] = None
+) -> None:
+    """Raise :class:`~fluid_build.spark.policy.SparkPolicyError` unless the build's role
+    and ``sparkConf`` pass the operator's policy. Called before anything is emitted."""
+    from fluid_build.spark.policy import SparkPolicyError
+
+    errors, missing = identity_findings(build, environ)
+    if not errors and not missing:
+        return
+    bid = build.get("id")
+    raise SparkPolicyError(
+        what=f"Spark build {bid!r} names a role or Spark settings the operator has not allowed",
+        why=" ".join(f"{m}." for m in [*errors, *missing])
+        + " A contract that names an existing role runs the job, and the code the "
+        "product's SQL reaches, with everything that role can do; a Spark setting can "
+        "change what the job loads and as whom it runs. Unset lists allow nothing.",
+        fix=(
+            "Leave executionRoleArn out to have forge create a least-privilege role for "
+            "the build. Otherwise, once the role and settings are reviewed, have the "
+            f"operator list them {_OPERATOR_ONLY}: {EXECUTION_ROLE_ALLOWLIST_ENV} takes a "
+            "role ARN or a path prefix ending in '/'; "
+            f"{SPARK_CONF_ALLOWLIST_ENV} takes a key or a prefix ending in '.'. A key "
+            "that loads code, sets credentials or moves the catalog or checkpoint cannot "
+            "be listed."
+        ),
+        doc=doc_url(),
+    )
+
+
+def _spark_builds_or_empty(contract: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    from fluid_build.spark.compiler import spark_builds
+    from fluid_build.streaming.compiler import managed_lane_enabled
+
+    if not managed_lane_enabled(contract):
+        return []
+    try:
+        return spark_builds(contract)
+    except ValueError:
+        return []  # the Spark compiler's validation reports it
+
+
+def validation_errors(contract: Mapping[str, Any]) -> List[str]:
+    """What ``fluid validate`` refuses about the contract's Spark roles and settings."""
+    return [e for b in _spark_builds_or_empty(contract) for e in identity_findings(b)[0]]
+
+
+def validation_warnings(contract: Mapping[str, Any]) -> List[str]:
+    """The operator entries the contract's Spark builds still need (#818: warn here)."""
+    return [
+        f"{m}; the IaC is refused at generate and apply until the operator lists it"
+        for b in _spark_builds_or_empty(contract)
+        for m in identity_findings(b)[1]
+    ]
+
+
+# --- the role and its policy -------------------------------------------------
+
+
+def base36(text: str) -> str:
+    """``text`` as EMR on EKS encodes a role name in its service-account names.
+
+    The bytes of the name as one big-endian number, in lower-case base 36: awscli
+    ``customizations/emrcontainers/base36.py`` (Apache-2.0), which
+    ``update-role-trust-policy`` uses.
+    """
+    number = 0
+    for char in text:
+        number = number * 256 + ord(char)
+    alphabet, out = "0123456789abcdefghijklmnopqrstuvwxyz", ""
+    while number:
+        number, digit = divmod(number, 36)
+        out = alphabet[digit] + out
+    return out or "0"
+
+
+@dataclass(frozen=True)
+class S3Grant:
+    """One bucket's prefixes the job reads (and maybe writes)."""
+
+    bucket: Any  # a name, or an emitter expression holding the account token
+    write: Tuple[Any, ...] = ()
+    read: Tuple[Any, ...] = ()
+
+
+@dataclass(frozen=True)
+class MskSource:
+    """The MSK cluster a streaming job reads, from its ARN."""
+
+    arn: str
+    region: str
+    account: str
+    name: str
+    uuid: str
+    topic: str
+    group_prefix: str
+
+
+@dataclass(frozen=True)
+class JobAccess:
+    """Everything the job's policy names. Strings are contract text the renderer escapes,
+    or emitter expressions (``TofuExpr``) built by :mod:`aws_ingest`."""
+
+    region: Any
+    account: Any
+    s3: Tuple[S3Grant, ...]
+    database: str
+    table: str
+    log_group_arn: Any
+    msk: Optional[MskSource] = None
+    secret_arns: Tuple[str, ...] = ()
+
+
+def secret_resource(arn: str) -> str:
+    """A secret ARN as a policy resource: a partial ARN matches its random suffix."""
+    return arn if _FULL_SECRET_ARN.fullmatch(arn) else f"{arn}-??????"
+
+
+def _join(*parts: Any) -> Any:
+    """Concatenate, keeping a ``TofuExpr`` part an expression (the others escaped)."""
+    from ..naming import TofuExpr
+
+    if not any(isinstance(p, TofuExpr) for p in parts):
+        return "".join(str(p) for p in parts)
+    out = []
+    for p in parts:
+        out.append(str(p) if isinstance(p, TofuExpr) else _escape(str(p)))
+    return TofuExpr("".join(out))
+
+
+def _escape(text: str) -> str:
+    return text.replace("${", "$${").replace("%{", "%%{")
+
+
+def access_document(access: JobAccess) -> Dict[str, Any]:
+    """The job's least-privilege ``aws_iam_policy_document`` body."""
+    region, account = access.region, access.account
+    statements: List[Dict[str, Any]] = []
+    object_arns: List[Any] = []
+    for grant in access.s3:
+        bucket_arn = _join("arn:aws:s3:::", grant.bucket)
+        if grant.write:
+            statements.append(
+                {
+                    "sid": f"ReadWrite{len(statements)}",
+                    "effect": "Allow",
+                    "actions": [
+                        "s3:AbortMultipartUpload",
+                        "s3:DeleteObject",
+                        "s3:GetObject",
+                        "s3:PutObject",
+                    ],
+                    "resources": [_join(bucket_arn, "/", p, "*") for p in grant.write],
+                }
+            )
+        if grant.read:
+            statements.append(
+                {
+                    "sid": f"Read{len(statements)}",
+                    "effect": "Allow",
+                    "actions": ["s3:GetObject"],
+                    "resources": [_join(bucket_arn, "/", p, "*") for p in grant.read],
+                }
+            )
+        prefixes = [*grant.write, *grant.read]
+        statements.append(
+            {
+                "sid": f"List{len(statements)}",
+                "effect": "Allow",
+                "actions": ["s3:ListBucket"],
+                "resources": [bucket_arn],
+                "condition": [
+                    {
+                        "test": "StringLike",
+                        "variable": "s3:prefix",
+                        "values": [_join(p, "*") for p in prefixes],
+                    }
+                ],
+            }
+        )
+        statements.append(
+            {
+                "sid": f"Locate{len(statements)}",
+                "effect": "Allow",
+                "actions": ["s3:GetBucketLocation"],
+                "resources": [bucket_arn],
+            }
+        )
+        # With an S3 Bucket Key the encryption context is the bucket's ARN; without one
+        # it is the object's.
+        object_arns.extend([bucket_arn, *(_join(bucket_arn, "/", p, "*") for p in prefixes)])
+    statements.append(
+        {
+            "sid": "S3Kms",
+            "effect": "Allow",
+            "actions": ["kms:Decrypt", "kms:GenerateDataKey"],
+            "resources": ["*"],
+            "condition": [
+                {
+                    "test": "StringEquals",
+                    "variable": "kms:ViaService",
+                    "values": [_join("s3.", region, ".amazonaws.com")],
+                },
+                {
+                    "test": "StringLike",
+                    "variable": "kms:EncryptionContext:aws:s3:arn",
+                    "values": object_arns,
+                },
+            ],
+        }
+    )
+    glue = _join("arn:aws:glue:", region, ":", account, ":")
+    statements.append(
+        {
+            "sid": "GlueTable",
+            "effect": "Allow",
+            "actions": ["glue:GetDatabase", "glue:GetTable", "glue:UpdateTable"],
+            "resources": [
+                _join(glue, "catalog"),
+                _join(glue, "database/", access.database),
+                _join(glue, "table/", access.database, "/", access.table),
+            ],
+        }
+    )
+    statements.append(
+        {
+            "sid": "LakeFormationCredentials",
+            "effect": "Allow",
+            "actions": ["lakeformation:GetDataAccess"],
+            "resources": ["*"],
+        }
+    )
+    msk = access.msk
+    if msk is not None:
+        scope = f"{msk.region}:{msk.account}"
+        tail = f"{msk.name}/{msk.uuid}"
+        statements.extend(
+            [
+                {
+                    "sid": "MskConnect",
+                    "effect": "Allow",
+                    "actions": ["kafka-cluster:Connect"],
+                    "resources": [msk.arn],
+                },
+                {
+                    "sid": "MskTopic",
+                    "effect": "Allow",
+                    "actions": ["kafka-cluster:DescribeTopic", "kafka-cluster:ReadData"],
+                    "resources": [f"arn:aws:kafka:{scope}:topic/{tail}/{msk.topic}"],
+                },
+                {
+                    "sid": "MskGroup",
+                    "effect": "Allow",
+                    "actions": ["kafka-cluster:AlterGroup", "kafka-cluster:DescribeGroup"],
+                    "resources": [f"arn:aws:kafka:{scope}:group/{tail}/{msk.group_prefix}*"],
+                },
+            ]
+        )
+    if access.secret_arns:
+        secrets = [secret_resource(a) for a in access.secret_arns]
+        statements.extend(
+            [
+                {
+                    "sid": "Secrets",
+                    "effect": "Allow",
+                    "actions": ["secretsmanager:GetSecretValue"],
+                    "resources": secrets,
+                },
+                {
+                    "sid": "SecretsKms",
+                    "effect": "Allow",
+                    "actions": ["kms:Decrypt"],
+                    "resources": ["*"],
+                    "condition": [
+                        {
+                            "test": "StringEquals",
+                            "variable": "kms:ViaService",
+                            "values": [_join("secretsmanager.", region, ".amazonaws.com")],
+                        },
+                        {
+                            "test": "StringLike",
+                            "variable": "kms:EncryptionContext:SecretARN",
+                            "values": secrets,
+                        },
+                    ],
+                },
+            ]
+        )
+    statements.extend(
+        [
+            {
+                "sid": "Logs",
+                "effect": "Allow",
+                "actions": [
+                    "logs:CreateLogStream",
+                    "logs:DescribeLogStreams",
+                    "logs:PutLogEvents",
+                ],
+                "resources": [access.log_group_arn, _join(access.log_group_arn, ":*")],
+            },
+            {
+                # DescribeLogGroups has no resource-level form.
+                "sid": "LogsDescribe",
+                "effect": "Allow",
+                "actions": ["logs:DescribeLogGroups"],
+                "resources": ["*"],
+            },
+        ]
+    )
+    return {"statement": statements}
+
+
+def trust_document(
+    runtime: str,
+    *,
+    account: Any,
+    region: Any,
+    role_name: str,
+    application_id: Any = None,
+    eks_issuer: Any = None,
+    eks_namespace: Any = None,
+) -> Dict[str, Any]:
+    """The ``assume_role_policy`` document for ``runtime`` (not ``emr-ec2``: no role)."""
+    if runtime == "emr-serverless":
+        return {
+            "statement": [
+                {
+                    "effect": "Allow",
+                    "actions": ["sts:AssumeRole"],
+                    "principals": [
+                        {"type": "Service", "identifiers": ["emr-serverless.amazonaws.com"]}
+                    ],
+                    "condition": [
+                        {
+                            "test": "StringEquals",
+                            "variable": "aws:SourceAccount",
+                            "values": [account],
+                        },
+                        {
+                            "test": "ArnLike",
+                            "variable": "aws:SourceArn",
+                            "values": [
+                                _join(
+                                    "arn:aws:emr-serverless:",
+                                    region,
+                                    ":",
+                                    account,
+                                    ":/applications/",
+                                    application_id,
+                                )
+                            ],
+                        },
+                    ],
+                }
+            ]
+        }
+    if runtime == "glue":
+        return {
+            "statement": [
+                {
+                    "effect": "Allow",
+                    "actions": ["sts:AssumeRole"],
+                    "principals": [{"type": "Service", "identifiers": ["glue.amazonaws.com"]}],
+                    "condition": [
+                        {
+                            "test": "StringEquals",
+                            "variable": "aws:SourceAccount",
+                            "values": [account],
+                        }
+                    ],
+                }
+            ]
+        }
+    if runtime == "emr-eks":
+        return {
+            "statement": [
+                {
+                    "effect": "Allow",
+                    "actions": ["sts:AssumeRoleWithWebIdentity"],
+                    "principals": [
+                        {
+                            "type": "Federated",
+                            "identifiers": [
+                                _join("arn:aws:iam::", account, ":oidc-provider/", eks_issuer)
+                            ],
+                        }
+                    ],
+                    "condition": [
+                        {
+                            "test": "StringLike",
+                            "variable": _join(eks_issuer, ":sub"),
+                            "values": [
+                                _join(
+                                    "system:serviceaccount:",
+                                    eks_namespace,
+                                    ":emr-containers-sa-*-*-",
+                                    account,
+                                    "-",
+                                    base36(role_name),
+                                )
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    raise ValueError(f"no forge-owned role for runtime {runtime!r}")

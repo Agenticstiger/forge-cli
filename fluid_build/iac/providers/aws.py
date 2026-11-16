@@ -91,7 +91,7 @@ from ..principals import (
 from ..provider_match import is_cloud
 from ..row_access import RowFilter, row_filters_for
 from ..versions import required_providers
-from . import aws_storage
+from . import aws_ingest, aws_storage
 from .aws_schema_registry import emit_schema_registry, emit_schema_registry_data
 from .aws_storage import Retention
 
@@ -744,6 +744,9 @@ class AwsIacPlugin:
         # Glue ETL jobs / Step Functions / the Lambda schedule path —
         # the planner's build & orchestration ops.
         _emit_from_actions(resources, actions, cid, contract)
+        # forge Spark builds: their artifacts, log groups, roles and runtime
+        # (application, Glue job), from ``aws_ingest``. Nothing without one.
+        aws_ingest.merge(resources, aws_ingest.spark_blocks(contract, cid).resources)
         # Second pass — wire ordering edges that the literal-string fields
         # on Redshift external schemas / planned-action resources don't
         # carry by value. See :func:`_wire_aws_deps`.
@@ -803,6 +806,8 @@ class AwsIacPlugin:
         _emit_product_key_policy_data(data, storage)
         _emit_existing_key_data(data, storage)
         emit_schema_registry_data(data, contract, cid)
+        # The data half of the same Spark blocks: policy documents, MSK and EKS lookups.
+        aws_ingest.merge(data, aws_ingest.spark_blocks(contract, cid).data)
         return data
 
     def credential_env(self, env: Mapping[str, str]) -> Dict[str, str]:
