@@ -223,6 +223,21 @@ class TestSchemaRegistry:
         assert any(says in m for m in messages), messages
         assert not any("should not be valid" in m for m in messages), messages
 
+    @pytest.mark.parametrize(
+        "registry",
+        [
+            {
+                "kind": "confluent",
+                "url": "https://user:hunter2@r.example",  # pragma: allowlist secret
+            },
+            {"kind": "confluent", "url": "https://r.example", "auth": "hunter2"},
+        ],
+    )
+    def test_a_credential_pasted_into_the_registry_is_not_quoted(self, manager, registry):
+        messages = _messages(_validate(manager, _registry(**registry)))
+        assert messages
+        assert not any("hunter2" in m for m in messages), messages
+
     def test_auth_is_the_kafka_connect_shape(self, manager):
         schema = manager._bundled_schemas["0.7.7"]
         registry = schema["$defs"]["schemaRegistry"]
@@ -516,11 +531,35 @@ class TestSparkParameters:
         assert "builds[].execution" in spark["description"]
         assert "execution.runtime" in spark["description"]
 
+    @pytest.mark.parametrize(
+        ("source", "says"),
+        [
+            ({}, "set bootstrapServers (a host:port list) or mskClusterArn"),
+            ({"auth": "msk-iam"}, "set bootstrapServers (a host:port list) or mskClusterArn"),
+            (
+                {
+                    "bootstrapServers": "b-1:9092",
+                    "mskClusterArn": "arn:aws:kafka:eu-west-1:123456789012:cluster/c/u",
+                },
+                "set one of bootstrapServers or mskClusterArn, not both",
+            ),
+        ],
+    )
+    def test_the_source_rule_names_its_keys(self, manager, source, says):
+        messages = _messages(_validate(manager, _spark_params(runtime="glue", source=source)))
+        assert any(says in m for m in messages), messages
+
+    @pytest.mark.parametrize("field", ["bootstrapServers", "groupIdPrefix"])
+    @pytest.mark.parametrize("value", ["   ", " b:9092", "b:9092 ", "b:9092\nx", "b:9092\n"])
+    def test_source_text_takes_no_blank_or_line_break(self, manager, field, value):
+        source = {"bootstrapServers": "b-1:9092", field: value}
+        assert not _valid(manager, _spark_params(runtime="glue", source=source))
+
     def test_the_kafka_source_mirrors_flink_and_defers_the_registry(self, manager):
         source = manager._bundled_schemas["0.7.7"]["$defs"]["sparkParameters"]["properties"][
             "source"
         ]
-        assert source["oneOf"] == [
+        assert source["allOf"][0]["anyOf"] == [
             {"required": ["bootstrapServers"]},
             {"required": ["mskClusterArn"]},
         ]
@@ -539,6 +578,14 @@ class TestSparkParameters:
     def test_a_spark_stream_build_needs_no_sql(self, manager):
         contract = _fixture()
         assert "sql" not in contract["builds"][0]["properties"]
+        assert _valid(manager, contract)
+
+    def test_a_spark_stream_build_without_a_mapping_still_needs_sql(self, manager):
+        # Neither sql nor mapping: the build would compute nothing.
+        contract = _fixture()
+        del contract["builds"][0]["properties"]["mapping"]
+        assert not _valid(manager, contract)
+        contract["builds"][0]["properties"]["sql"] = "SELECT * FROM orders"
         assert _valid(manager, contract)
 
     def test_a_spark_build_without_a_stream_still_needs_sql(self, manager):

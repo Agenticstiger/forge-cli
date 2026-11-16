@@ -52,8 +52,10 @@ LOG = logging.getLogger(__name__)
 #: ``sink.catalogAuth`` field names an environment variable, and a value that
 #: fails the name pattern may be a secret pasted in its place; jsonschema's
 #: messages quote the failing instance (``'<value>' does not match ...``). The
-#: same holds for a ``secretRef``, which names a secret and may hold one by mistake.
-_UNQUOTED_VALUE_PATHS = frozenset({"catalogAuth", "secretRef"})
+#: same holds for a ``secretRef``, which names a secret and may hold one by mistake,
+#: and for a 0.7.7 ``stream.registry``: a credential pasted as a bare ``auth``
+#: string, or as ``user:password@`` in ``url``, fails its rule.
+_UNQUOTED_VALUE_PATHS = frozenset({"catalogAuth", "secretRef", "registry"})
 
 #: Validators whose jsonschema message names only keys, never a value.
 _KEY_ONLY_VALIDATORS = frozenset({"required", "additionalProperties"})
@@ -73,6 +75,8 @@ def format_schema_error(error: Any) -> str:
     take, reads as ``<field> is not allowed here``, or as the rule's own
     ``description`` when it carries one: jsonschema's message would quote the
     whole object and the subschema it must not match.
+    Likewise a described ``anyOf`` whose branches are each ``{required: [...]}``
+    reads as its ``description``.
     """
     value = error.validator_value
     path = list(error.absolute_path)
@@ -96,6 +100,20 @@ def format_schema_error(error: Any) -> str:
         if isinstance(why, str) and why:
             return why
         return f"{', '.join(map(str, value['required']))} is not allowed here"
+    if (
+        error.validator == "anyOf"
+        and isinstance(value, list)
+        and value
+        and all(isinstance(b, dict) and list(b) == ["required"] for b in value)
+        and isinstance(error.schema, dict)
+        and isinstance(error.schema.get("description"), str)
+        and error.schema["description"]
+    ):
+        # A described ``anyOf: [{required: [a]}, {required: [b]}]``: one of these
+        # keys is needed, and jsonschema's message quotes the object and names
+        # none of them. An undescribed rule keeps jsonschema's message, which the
+        # compat gate pins for the stable schemas.
+        return str(error.schema["description"])
     if not any(part in _UNQUOTED_VALUE_PATHS for part in error.absolute_path):
         return str(error.message)
     if error.validator in _KEY_ONLY_VALIDATORS:

@@ -3778,7 +3778,7 @@
         },
         "stream": {
           "$ref": "#/$defs/streamSource",
-          "description": "NEW in v0.7.7 (preview): The stream the build reads. On a managed Flink build (parameters.flink.management) or a Spark build (parameters.spark) sql is optional: the lane writes the query from the mapping instead. Elsewhere the stream describes what the build's own sql reads."
+          "description": "NEW in v0.7.7 (preview): The stream the build reads. On a managed Flink build (parameters.flink.management) sql is optional, and on a Spark build (parameters.spark) with a mapping it is too: the lane writes the query from the mapping instead. Elsewhere the stream describes what the build's own sql reads."
         },
         "mapping": {
           "$ref": "#/$defs/recordMapping",
@@ -3817,6 +3817,7 @@
             {
               "required": [
                 "stream",
+                "mapping",
                 "parameters"
               ],
               "properties": {
@@ -3911,23 +3912,11 @@
           "type": "object",
           "additionalProperties": false,
           "description": "The Kafka connection a streaming Spark build reads, as parameters.flink.source is for a Flink build. Exactly one of bootstrapServers or mskClusterArn. The schema registry is not here: it is properties.stream.registry ($defs/schemaRegistry).",
-          "oneOf": [
-            {
-              "required": [
-                "bootstrapServers"
-              ]
-            },
-            {
-              "required": [
-                "mskClusterArn"
-              ]
-            }
-          ],
           "properties": {
             "bootstrapServers": {
               "type": "string",
-              "minLength": 1,
-              "description": "Comma-separated host:port list of Kafka brokers. Same name and shape as parameters.flink.source.bootstrapServers."
+              "description": "Comma-separated host:port list of Kafka brokers. Same name and shape as parameters.flink.source.bootstrapServers.",
+              "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?(?![\\s\\S])"
             },
             "mskClusterArn": {
               "type": "string",
@@ -3943,10 +3932,43 @@
             },
             "groupIdPrefix": {
               "type": "string",
-              "minLength": 1,
-              "description": "Prefix for the consumer group ids Spark generates (the Kafka source's groupIdPrefix option). Absent: Spark's default."
+              "description": "Prefix for the consumer group ids Spark generates (the Kafka source's groupIdPrefix option). Absent: Spark's default.",
+              "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?(?![\\s\\S])",
+              "maxLength": 255
             }
-          }
+          },
+          "allOf": [
+            {
+              "anyOf": [
+                {
+                  "required": [
+                    "bootstrapServers"
+                  ]
+                },
+                {
+                  "required": [
+                    "mskClusterArn"
+                  ]
+                }
+              ],
+              "description": "set bootstrapServers (a host:port list) or mskClusterArn (an Amazon MSK cluster)"
+            },
+            {
+              "if": {
+                "required": [
+                  "bootstrapServers"
+                ]
+              },
+              "then": {
+                "not": {
+                  "required": [
+                    "mskClusterArn"
+                  ]
+                },
+                "description": "set one of bootstrapServers or mskClusterArn, not both"
+              }
+            }
+          ]
         }
       },
       "allOf": [
