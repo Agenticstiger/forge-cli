@@ -255,6 +255,23 @@ def validate_semantics_block(contract: Mapping[str, Any]) -> Tuple[List[str], Li
 _TARGET_KEY_ENTITY_TYPES = frozenset({"primary", "unique", "natural"})
 
 
+def _exported_entity_types(semantics: Any) -> FrozenSet[str]:
+    """The entity types the dbt MetricFlow export keeps for a model.
+
+    Beside a validity window it keeps the natural entity and foreign ones; otherwise every
+    type but natural (``engines/dbt/semantic_models._entity_fits_window``, after the
+    dbt-semantic-interfaces window rules), so the drift check counts only what dbt will see.
+    """
+    if isinstance(semantics, Mapping) and validity_window(semantics) is not None:
+        return frozenset({"natural", "foreign"})
+    return frozenset({"primary", "unique", "foreign"})
+
+
+def _as_list(value: Any) -> List[Any]:
+    """``value`` when it is a list, else ``[]``: these checks run on contracts the schema refused."""
+    return value if isinstance(value, list) else []
+
+
 def _expose_path(expose: Mapping[str, Any], position: int) -> str:
     """``exposes[<exposeId>]``, or the position: the prefix ``fluid validate`` points at."""
     expose_id = expose.get("exposeId")
@@ -401,16 +418,19 @@ def _relationship_findings(exposes: Sequence[Any]) -> Tuple[List[str], List[str]
                 # A self-join: one model cannot hold two entities of one name, so
                 # MetricFlow has no entity pair to declare. Nothing to drift from.
                 continue
-            from_names = _entity_names(expose, from_columns[0])
-            target_names = _entity_names(target_expose, to_columns[0], _TARGET_KEY_ENTITY_TYPES)
+            from_names = _entity_names(expose, from_columns[0], _exported_entity_types(semantics))
+            target_types = (
+                _exported_entity_types(target_expose.get("semantics")) & _TARGET_KEY_ENTITY_TYPES
+            )
+            target_names = _entity_names(target_expose, to_columns[0], target_types)
             if from_names & target_names:
                 continue
             warnings.append(
                 f"{where}: no entity pair matches this relationship, and the dbt MetricFlow "
                 f"export joins by entity name, so it will not follow the relationship. Declare "
                 f"an entity with expr {from_columns[0]!r} on {path} (type foreign) and one of "
-                f"the same name with expr {to_columns[0]!r} on {target_path} (type primary, "
-                f"unique or natural)."
+                f"the same name with expr {to_columns[0]!r} on {target_path} (type "
+                f"{' or '.join(sorted(target_types))})."
             )
     return errors, warnings
 
@@ -426,7 +446,7 @@ def _validity_params(dimension: Any) -> Optional[Mapping[str, Any]]:
 
 def declares_validity_params(semantics: Mapping[str, Any]) -> bool:
     """True when any dimension of ``semantics`` carries ``typeParams.validityParams``."""
-    return any(_validity_params(d) is not None for d in semantics.get("dimensions") or [])
+    return any(_validity_params(d) is not None for d in _as_list(semantics.get("dimensions")))
 
 
 def validity_window(semantics: Mapping[str, Any]) -> Optional[Tuple[str, str, str]]:
@@ -439,7 +459,7 @@ def validity_window(semantics: Mapping[str, Any]) -> Optional[Tuple[str, str, st
     if not declares_validity_params(semantics) or _validity_window_errors(semantics, ""):
         return None
     start = end = None
-    for dimension in semantics.get("dimensions") or []:
+    for dimension in _as_list(semantics.get("dimensions")):
         validity = _validity_params(dimension)
         if validity is None:
             continue
@@ -449,7 +469,7 @@ def validity_window(semantics: Mapping[str, Any]) -> Optional[Tuple[str, str, st
             end = str(dimension.get("name"))
     natural = next(
         str(entity.get("name"))
-        for entity in semantics.get("entities") or []
+        for entity in _as_list(semantics.get("entities"))
         if isinstance(entity, Mapping) and str(entity.get("type") or "").lower() == "natural"
     )
     if start is None or end is None:
@@ -467,7 +487,7 @@ def _validity_window_errors(semantics: Mapping[str, Any], expose_path: str) -> L
     """The validity window rules (dbt-semantic-interfaces ``SemanticModelValidityWindowRule``)."""
     errors: List[str] = []
     bounds: List[Tuple[str, Mapping[str, Any]]] = []
-    for index, dimension in enumerate(semantics.get("dimensions") or []):
+    for index, dimension in enumerate(_as_list(semantics.get("dimensions"))):
         validity = _validity_params(dimension)
         if validity is None:
             continue
@@ -493,7 +513,7 @@ def _validity_window_errors(semantics: Mapping[str, Any], expose_path: str) -> L
         )
     naturals = [
         str(entity.get("name"))
-        for entity in semantics.get("entities") or []
+        for entity in _as_list(semantics.get("entities"))
         if isinstance(entity, Mapping) and str(entity.get("type") or "").lower() == "natural"
     ]
     window = ", ".join(name for name, _ in bounds)

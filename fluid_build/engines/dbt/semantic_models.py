@@ -702,15 +702,41 @@ _TIME_SPINE_MODEL_DEF: Dict[str, Any] = {
 
 
 def _model_window(semantics: Mapping[str, Any], expose_id: Any) -> Optional[Tuple[str, str, str]]:
-    """The expose's validity window, or ``None``; a malformed one is dropped with a warning."""
+    """The expose's validity window, or ``None``; a window the bridge cannot emit whole is
+    dropped with a warning (dbt rejects a window with one bound)."""
     window = validity_window(semantics)
-    if window is None and declares_validity_params(semantics):
+    if window is None:
+        if declares_validity_params(semantics):
+            logger.warning(
+                "semantic_models: expose %r declares validityParams that do not form a validity "
+                "window (fluid validate names the problem), so its validity params are dropped",
+                expose_id,
+            )
+        return None
+    if not _bounds_have_unique_names(semantics, window):
         logger.warning(
-            "semantic_models: expose %r declares validityParams that do not form a validity "
-            "window (fluid validate names the problem), so its validity params are dropped",
+            "semantic_models: expose %r: a validity window bound shares its name with another "
+            "entity or dimension, and the bridge keeps only the first of two names, so the "
+            "window is dropped",
             expose_id,
         )
+        return None
     return window
+
+
+def _bounds_have_unique_names(semantics: Mapping[str, Any], window: Tuple[str, str, str]) -> bool:
+    """True when each window bound's name occurs once among the model's entities and dimensions.
+
+    Entities are emitted first and the first of two names wins (``_build_dimensions``), so a
+    bound that shares a name would be dropped and dbt would see one bound.
+    """
+    names = [
+        _sanitize_name(element["name"])
+        for kind in ("entities", "dimensions")
+        for element in (semantics.get(kind) if isinstance(semantics.get(kind), list) else [])
+        if isinstance(element, Mapping) and element.get("name")
+    ]
+    return all(names.count(_sanitize_name(bound)) == 1 for bound in window[:2])
 
 
 def _model_measures(

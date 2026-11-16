@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 from fluid_build.copilot.schemas.stage_outputs import LogicalDraft
@@ -501,7 +502,13 @@ def _attach_osi_relationships(exposes: List[Dict[str, Any]], logical: LogicalDra
     because dbt MetricFlow joins by entity name. Other shapes keep the foreign
     entities alone.
     """
-    by_id = {str(expose.get("exposeId")): expose for expose in exposes}
+    # An exposeId two datasets slug to names neither of them for sure: skip it.
+    counts = Counter(str(expose.get("exposeId")) for expose in exposes)
+    by_id = {
+        str(expose.get("exposeId")): expose
+        for expose in exposes
+        if counts[str(expose.get("exposeId"))] == 1
+    }
     for relationship in logical.osi.relationships:
         source = by_id.get(_slug(relationship.from_))
         target = by_id.get(_slug(relationship.to))
@@ -552,7 +559,16 @@ def _name_foreign_entity_after_target(
         and _semantics_builder.entity_column(entity) == to_column
     ]
     entities = semantics.get("entities") or []
-    if len(keys) != 1 or any(entity.get("name") == keys[0] for entity in entities):
+    # Entities, dimensions, measures and metrics share one namespace in MetricFlow, and the
+    # bridge drops the later of two names (entities first): a rename onto a dimension's
+    # name would drop that dimension.
+    taken = {
+        str(element.get("name")).casefold()
+        for kind in ("entities", "dimensions", "measures", "metrics")
+        for element in semantics.get(kind) or []
+        if isinstance(element, dict) and element.get("name")
+    }
+    if len(keys) != 1 or keys[0].casefold() in taken:
         return
     for entity in entities:
         if (

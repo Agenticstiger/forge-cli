@@ -27,8 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     type II shape (`primary_entity:` names the natural entity), and drops what dbt rejects
     beside one (primary or unique entities, measures) with a warning. Relationships stay
     informational there.
-  - `fluid import dbt` recovers `validity_params`, and writes a relationship for a foreign entity
-    that matches exactly one primary, unique or natural entity of the same contract.
+  - `fluid import dbt` recovers `validity_params`, and writes a relationship from a foreign entity
+    to each expose of the same contract that holds a primary, unique or natural entity of that
+    name, as MetricFlow joins it to each.
   - `fluid forge data-model` writes its relationships into the contract 1:1, as its Ossie
     sidecar already did, composite keys included.
   - The importer and the data-model emitter move a contract to `fluidVersion: 0.7.7` only when it

@@ -1500,25 +1500,27 @@ def _validity_params(raw: Any) -> Dict[str, bool]:
     }
 
 
+#: The entity types a foreign entity joins in MetricFlow: the key of another model.
+_KEY_ENTITY_TYPES = ("primary", "unique", "natural")
+
+
 def _attach_relationships(contracts: List[Dict[str, Any]], report: ImportReport) -> None:
     """Write the dbt entity graph's joins as ``semantics.relationships`` (schema 0.7.7).
 
-    MetricFlow joins a foreign entity to the primary, unique or natural entity of the
-    same name in another semantic model. Where exactly one expose of the same contract
-    has that entity, and both entities key on a column their exposes declare, the join
-    becomes a relationship: many_to_one, the two entities' columns. A target in another
-    product (``--split-by``), more than one target, or a key that is an expression is
-    reported and not written: a relationship names one expose of its own contract and
-    real columns (RFC-semantics-tier1 §4).
+    MetricFlow joins a foreign entity to every primary, unique or natural entity of the
+    same name in another semantic model (an SCD model's natural key included), so each
+    expose of the same contract that holds one becomes a relationship target: many_to_one,
+    on the two entities' columns, when both are columns their exposes declare. A target in
+    another product (``--split-by``) and a key that is an expression are reported and not
+    written: a relationship names an expose of its own contract and real columns
+    (RFC-semantics-tier1 §4).
     """
-    from fluid_build.forge_datamodel.semantics_builder import declared_columns, entity_column
-
     targets: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
     for index, contract in enumerate(contracts):
         for expose in contract.get("exposes") or []:
             semantics = expose.get("semantics") or {}
             for entity in semantics.get("entities") or []:
-                if entity.get("type") in ("primary", "unique", "natural"):
+                if entity.get("type") in _KEY_ENTITY_TYPES:
                     targets.setdefault(str(entity["name"]), []).append((index, expose))
 
     for index, contract in enumerate(contracts):
@@ -1529,64 +1531,65 @@ def _attach_relationships(contracts: List[Dict[str, Any]], report: ImportReport)
             for entity in semantics.get("entities") or []:
                 if entity.get("type") != "foreign":
                     continue
+                label = f"semantic model {semantics.get('name')}: foreign entity {entity['name']!r}"
                 matches = [
                     (where, target)
                     for where, target in targets.get(str(entity["name"]), [])
                     if target is not expose
                 ]
-                if not matches:
-                    continue
-                label = f"semantic model {semantics.get('name')}: foreign entity {entity['name']!r}"
-                local = [target for where, target in matches if where == index]
-                if not local:
-                    others = ", ".join(sorted(str(t["exposeId"]) for _, t in matches))
+                others = sorted(str(t["exposeId"]) for where, t in matches if where != index)
+                if others:
                     report.unsupported.append(
-                        f"{label} joins {others} in another product, so no relationship is written "
-                        "(a relationship names an expose of its own contract)"
+                        f"{label} joins {', '.join(others)} in another product, so no relationship "
+                        "is written for that join (a relationship names an expose of its own "
+                        "contract)"
                     )
-                    continue
-                if len(local) > 1:
-                    candidates = ", ".join(sorted(str(t["exposeId"]) for t in local))
-                    report.unsupported.append(
-                        f"{label} matches {len(local)} exposes ({candidates}), so no "
-                        "relationship is written (its target is ambiguous)"
-                    )
-                    continue
-                target = local[0]
-                target_entity = next(
-                    e
-                    for e in target["semantics"]["entities"]
-                    if str(e.get("name")) == str(entity["name"])
-                    and e.get("type") in ("primary", "unique", "natural")
-                )
-                from_column = entity_column(entity)
-                to_column = entity_column(target_entity)
-                if from_column not in declared_columns(expose) or to_column not in declared_columns(
-                    target
-                ):
-                    report.unsupported.append(
-                        f"{label}: its key {from_column!r} -> {target['exposeId']}.{to_column!r} "
-                        "is not a column both exposes declare, so no relationship is written"
-                    )
-                    continue
-                relationships = semantics.setdefault("relationships", [])
-                taken = {str(r.get("name")) for r in relationships}
-                name = f"{expose['exposeId']}_to_{target['exposeId']}"
-                if name in taken:
-                    name = f"{expose['exposeId']}_{entity['name']}_to_{target['exposeId']}"
-                relationships.append(
-                    {
-                        "name": name,
-                        "to": target["exposeId"],
-                        "fromColumns": [from_column],
-                        "toColumns": [to_column],
-                        "cardinality": "many_to_one",
-                    }
-                )
-                report.mapped_one_to_one.append(
-                    f"{label} → exposes[{expose['exposeId']}].semantics.relationships[{name}] "
-                    f"(to {target['exposeId']})"
-                )
+                for where, target in matches:
+                    if where == index:
+                        _write_relationship(expose, entity, target, label, report)
+
+
+def _write_relationship(
+    expose: Dict[str, Any],
+    entity: Dict[str, Any],
+    target: Dict[str, Any],
+    label: str,
+    report: ImportReport,
+) -> None:
+    """Record ``expose``'s foreign ``entity`` joining ``target`` as one relationship."""
+    from fluid_build.forge_datamodel.semantics_builder import declared_columns, entity_column
+
+    target_entity = next(
+        e
+        for e in target["semantics"]["entities"]
+        if str(e.get("name")) == str(entity["name"]) and e.get("type") in _KEY_ENTITY_TYPES
+    )
+    from_column = entity_column(entity)
+    to_column = entity_column(target_entity)
+    if from_column not in declared_columns(expose) or to_column not in declared_columns(target):
+        report.unsupported.append(
+            f"{label}: its key {from_column!r} -> {target['exposeId']}.{to_column!r} is not a "
+            "column both exposes declare, so no relationship is written"
+        )
+        return
+    relationships = expose["semantics"].setdefault("relationships", [])
+    taken = {str(r.get("name")) for r in relationships}
+    name = f"{expose['exposeId']}_to_{target['exposeId']}"
+    if name in taken:
+        name = f"{expose['exposeId']}_{entity['name']}_to_{target['exposeId']}"
+    relationships.append(
+        {
+            "name": name,
+            "to": target["exposeId"],
+            "fromColumns": [from_column],
+            "toColumns": [to_column],
+            "cardinality": "many_to_one",
+        }
+    )
+    report.mapped_one_to_one.append(
+        f"{label} → exposes[{expose['exposeId']}].semantics.relationships[{name}] "
+        f"(to {target['exposeId']})"
+    )
 
 
 def _pin_relationships_version(contracts: List[Dict[str, Any]], report: ImportReport) -> None:

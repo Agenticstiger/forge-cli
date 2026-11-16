@@ -1098,17 +1098,17 @@ class TestRelationshipAndValidityImport:
         assert result.is_valid, [getattr(e, "message", str(e)) for e in result.errors]
         assert _semantic_lint(contract) == ([], [])
 
-    def test_an_ambiguous_target_is_reported_not_written(self, tmp_path):
-        second = _semantic_model(
-            "stg_customers",
-            "stg_customers",
-            [{"name": "customer", "type": "primary", "expr": "customer_id"}],
-        )
-        path = _manifest_with_semantic_models(tmp_path, _CUSTOMERS_SM, second)
+    def test_every_target_of_the_entity_gets_a_relationship(self, tmp_path):
+        """MetricFlow joins a foreign entity to each model keyed on its name."""
+        path = _manifest_with_semantic_models(tmp_path, _CUSTOMERS_SM, _HISTORY_SM)
         contract, report = DbtManifestImporter().import_to_contract(str(path))
-        assert "relationships" not in _expose(contract, "orders")["semantics"]
-        assert any("matches 2 exposes (customers, stg_customers)" in u for u in report.unsupported)
-        assert contract["fluidVersion"] == "0.7.6"
+        relationships = _expose(contract, "orders")["semantics"]["relationships"]
+        assert [(r["name"], r["to"]) for r in relationships] == [
+            ("orders_to_customers", "customers"),
+            ("orders_to_stg_customers", "stg_customers"),
+        ]
+        assert not any("relationship" in u for u in report.unsupported)
+        assert _semantic_lint(contract) == ([], [])
 
     def test_an_expression_key_is_reported_not_written(self, tmp_path):
         expression = _semantic_model(

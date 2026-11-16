@@ -164,3 +164,37 @@ def test_a_single_expose_shape_keeps_foreign_entities_only():
     contract = build_contract_from_logical(logical)
     assert all("relationships" not in e["semantics"] for e in contract["exposes"])
     assert contract["fluidVersion"] == FluidSchemaManager.latest_bundled_version()
+
+
+def test_the_rename_never_takes_a_dimension_s_name():
+    """MetricFlow names share one namespace; the bridge would drop the dimension."""
+    osi = _logical([]).osi.model_copy(deep=True)
+    osi.datasets[0].fields.append(OSIField(name="customer"))
+    osi.relationships = [_ORDERS_TO_CUSTOMERS]
+    logical = _logical([_ORDERS_TO_CUSTOMERS]).model_copy(update={"osi": osi})
+    contract = build_contract_from_logical(logical)
+    orders = _semantics(contract, "orders")
+    assert "customer" in [d["name"] for d in orders["dimensions"]]
+    assert [e["name"] for e in orders["entities"] if e["type"] == "foreign"][0] == "customers"
+    assert orders["relationships"][0]["to"] == "customers"
+
+
+def test_datasets_that_slug_to_one_expose_id_get_no_relationship():
+    osi = OSISemanticModel(
+        name="shop",
+        description="Shop orders",
+        datasets=[
+            _dataset("Orders", ["id"], ["id", "c"]),
+            _dataset("orders", ["id"], ["id", "c"]),
+        ],
+        relationships=[_relationship("r", "Orders", "orders", ["c"], ["id"])],
+    )
+    logical = LogicalDraft(
+        name="shop",
+        description="Shop orders",
+        technique="flat",
+        osi=osi,
+        conceptual=ConceptualDraft(name="shop"),
+    )
+    contract = build_contract_from_logical(logical)
+    assert all("relationships" not in e["semantics"] for e in contract["exposes"])

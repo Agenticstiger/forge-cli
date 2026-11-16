@@ -954,3 +954,16 @@ def test_scd_project_passes_dbt_parse_and_keeps_the_window(tmp_path: Path):
         "valid_from": {"is_start": True, "is_end": False},
         "valid_to": {"is_start": False, "is_end": True},
     }
+
+
+@pytest.mark.unit
+def test_a_window_bound_that_shares_a_name_drops_the_window(caplog):
+    """The first of two names wins, so a bound named like an entity would leave dbt one bound."""
+    contract = _scd_contract()
+    history = contract["exposes"][1]["semantics"]
+    history["entities"].append({"name": "valid_from", "type": "foreign", "expr": "segment"})
+    with caplog.at_level("WARNING"):
+        model = _model(_emit(contract), "customer_history")
+    assert all("validity_params" not in (d.get("type_params") or {}) for d in model["dimensions"])
+    assert "primary_entity" not in model
+    assert "the window is dropped" in caplog.text

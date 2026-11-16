@@ -200,7 +200,7 @@ class TestEntityDrift:
             "relationship, and the dbt MetricFlow export joins by entity name, so it will not "
             "follow the relationship. Declare an entity with expr 'customer_id' on exposes[orders] "
             "(type foreign) and one of the same name with expr 'id' on exposes[customers] (type "
-            "primary, unique or natural)."
+            "primary or unique)."
         ]
 
     def test_a_target_entity_on_another_column_does_not_match(self):
@@ -213,11 +213,36 @@ class TestEntityDrift:
         contract["exposes"][1]["semantics"]["entities"][0]["type"] = "foreign"
         assert len(validate_semantics_block(contract)[1]) == 1
 
-    @pytest.mark.parametrize("target_type", ["primary", "unique", "natural"])
+    @pytest.mark.parametrize("target_type", ["primary", "unique"])
     def test_a_key_entity_of_the_same_name_matches(self, target_type):
         contract = _contract()
         contract["exposes"][1]["semantics"]["entities"][0]["type"] = target_type
         assert validate_semantics_block(contract)[1] == []
+
+    def test_a_natural_target_counts_only_beside_a_validity_window(self):
+        """The dbt export drops a natural entity without a window, so it joins nothing."""
+        contract = _contract()
+        target = contract["exposes"][1]
+        target["semantics"]["entities"][0]["type"] = "natural"
+        assert len(validate_semantics_block(contract)[1]) == 1
+        target["contract"]["schema"] += [
+            {"name": "valid_from", "type": "timestamp"},
+            {"name": "valid_to", "type": "timestamp"},
+        ]
+        target["semantics"]["dimensions"] = _scd()["exposes"][0]["semantics"]["dimensions"][1:]
+        assert validate_semantics_block(contract) == ([], [])
+
+    def test_a_primary_target_beside_a_validity_window_does_not_count(self):
+        """dbt rejects a primary entity beside a window, so the export drops it."""
+        contract = _contract()
+        target = contract["exposes"][1]
+        target["semantics"]["entities"].append(
+            {"name": "customer_version", "type": "natural", "expr": "region"}
+        )
+        target["semantics"]["dimensions"] = _scd()["exposes"][0]["semantics"]["dimensions"][1:]
+        errors, warnings = validate_semantics_block(contract)
+        assert errors == []
+        assert len(warnings) == 1 and "(type natural)" in warnings[0]
 
     def test_an_entity_without_expr_keys_on_its_name(self):
         contract = _contract()
@@ -304,6 +329,15 @@ class TestValidityWindow:
     def test_validity_window_returns_the_bounds_and_the_key(self):
         semantics = _scd()["exposes"][0]["semantics"]
         assert validity_window(semantics) == ("valid_from", "valid_to", "customer")
+
+    def test_a_malformed_entities_list_does_not_hide_the_other_findings(self):
+        """The schema refuses ``entities: 5``; the lint must still report the rest."""
+        contract = _scd(entities=5)
+        contract["exposes"][0]["semantics"]["measures"] = [
+            {"name": "versions", "agg": "sum", "expr": "SUM(segment)"}
+        ]
+        errors, _ = validate_semantics_block(contract)
+        assert any("itself an aggregate" in e for e in errors), errors
 
     def test_validity_window_is_none_for_a_malformed_or_absent_window(self):
         broken = _scd(entities=[])["exposes"][0]["semantics"]

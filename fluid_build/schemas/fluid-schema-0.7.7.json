@@ -6555,7 +6555,7 @@
             "many_to_one",
             "one_to_one"
           ],
-          "description": "many_to_one: many rows of the declaring expose can match one target row (an ordinary foreign key). one_to_one: each target row matches at most one row of the declaring expose."
+          "description": "many_to_one: many rows of the declaring expose can match one target row (an ordinary foreign key). one_to_one: each target row matches at most one row of the declaring expose. Against a target with a validity window (a slowly changing dimension), the one target row is the version valid at the declaring row's point in time."
         },
         "joinType": {
           "type": "string",
