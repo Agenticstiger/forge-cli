@@ -32,13 +32,13 @@ caller owns the aliases of the expose's row and of each relationship's target
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 from fluid_build.providers._sql_safety import quote_identifier_for, quote_string_literal_for
 
 from . import _nodes as n
 from ._checker import Checked
-from ._types import NUMBER
+from ._types import NUMBER, SqlType
 
 ColumnSql = Callable[[Optional[str], str], str]
 
@@ -89,22 +89,53 @@ class _DuckDB:
 
     def comparison(self, node: n.Node) -> str:
         if isinstance(node, n.Compare):
-            return f"({self.value(node.left)} {node.op} {self.value(node.right)})"
+            left, right = self.common(node.left, node.right)
+            return f"({left} {node.op} {right})"
         if isinstance(node, n.In):
-            items = ", ".join(self.value(item) for item in node.items)
+            left, *items = self.common(node.left, *node.items)
             keyword = "NOT IN" if node.negated else "IN"
-            return f"({self.value(node.left)} {keyword} ({items}))"
+            return f"({left} {keyword} ({', '.join(items)}))"
         if isinstance(node, n.Between):
             keyword = "NOT BETWEEN" if node.negated else "BETWEEN"
-            return (
-                f"({self.value(node.left)} {keyword} {self.value(node.low)} "
-                f"AND {self.value(node.high)})"
-            )
+            left, low, high = self.common(node.left, node.low, node.high)
+            return f"({left} {keyword} {low} AND {high})"
         if isinstance(node, n.IsNull):
             return f"({self.value(node.operand)} IS {'NOT ' if node.negated else ''}NULL)"
         assert isinstance(node, n.DistinctFrom)
         middle = "IS NOT DISTINCT FROM" if node.negated else "IS DISTINCT FROM"
-        return f"({self.value(node.left)} {middle} {self.value(node.right)})"
+        left, right = self.common(node.left, node.right)
+        return f"({left} {middle} {right})"
+
+    def common(self, *nodes: n.Node) -> List[str]:
+        """The SQL of ``nodes``, numbers cast to one exact type.
+
+        DuckDB unifies two DECIMALs by keeping both integer parts and the larger scale,
+        and when that needs more than 38 digits it drops scale silently:
+        ``COALESCE(a, b)`` of a ``DECIMAL(38,2)`` and a ``DECIMAL(38,4)`` is
+        ``DECIMAL(38,2)``. An explicit ``DECIMAL(38, s)`` keeps every digit of scale,
+        and a value too wide for it raises instead of comparing wrong.
+        """
+        types = [self.types.get(id(node)) for node in nodes]
+        numbers = [t for t in types if t is not None and t.kind == NUMBER]
+        if not numbers:
+            return [self.value(node) for node in nodes]
+        target = self.number_type(numbers)
+        return [
+            (
+                f"CAST({self.value(node)} AS {target})"
+                if t is None or t.kind == NUMBER
+                else self.value(node)
+            )
+            for node, t in zip(nodes, types, strict=True)
+        ]
+
+    @staticmethod
+    def number_type(types: List[SqlType]) -> str:
+        """``DECIMAL(38, s)`` for the largest bounded scale, or ``DOUBLE`` when one of
+        ``types`` is unbounded (approximate in DuckDB either way)."""
+        if any(t.scale is None for t in types):
+            return "DOUBLE"
+        return f"DECIMAL(38, {min(max(t.scale or 0 for t in types), 38)})"
 
     def value(self, node: n.Node) -> str:  # noqa: C901 - one branch per construct
         if isinstance(node, _PREDICATES):
@@ -131,21 +162,34 @@ class _DuckDB:
                 )
             return f"({self.value(node.left)} {node.op} {self.value(node.right)})"
         if isinstance(node, n.Case):
-            parts = ["CASE"]
-            for when, then in node.whens:
-                parts.append(f"WHEN {self.truth(when)} THEN {self.value(then)}")
+            values = [then for _when, then in node.whens]
             if node.else_ is not None:
-                parts.append(f"ELSE {self.value(node.else_)}")
+                values.append(node.else_)
+            rendered = self.branches(node, values)
+            parts = ["CASE"]
+            for (when, _then), sql in zip(node.whens, rendered, strict=False):
+                parts.append(f"WHEN {self.truth(when)} THEN {sql}")
+            if node.else_ is not None:
+                parts.append(f"ELSE {rendered[-1]}")
             parts.append("END")
             return "(" + " ".join(parts) + ")"
         if isinstance(node, n.Coalesce):
-            return "COALESCE(" + ", ".join(self.value(arg) for arg in node.args) + ")"
+            return "COALESCE(" + ", ".join(self.branches(node, list(node.args))) + ")"
         if isinstance(node, n.Round):
             return self.round(node)
         if isinstance(node, n.DateDiff):
             part = quote_string_literal_for("duckdb", _DATE_PARTS[node.unit])
             return f"date_sub({part}, {self.value(node.from_)}, {self.value(node.to)})"
         raise TypeError(f"not a FLUID SQL/1 node: {node!r}")  # pragma: no cover
+
+    def branches(self, node: n.Node, values: List[n.Node]) -> List[str]:
+        """The value branches of a CASE or COALESCE, numbers cast to the node's own type
+        (see :meth:`common`: DuckDB would otherwise unify them and may drop scale)."""
+        own = self.types.get(id(node))
+        if own is None or own.kind != NUMBER:
+            return [self.value(value) for value in values]
+        target = self.number_type([own])
+        return [f"CAST({self.value(value)} AS {target})" for value in values]
 
     def exact_type(self, node: n.Node) -> str:
         """DuckDB's exact type for a dividend: ``DECIMAL(38, s)``, or ``DOUBLE`` when its
@@ -157,7 +201,11 @@ class _DuckDB:
 
     def round(self, node: n.Round) -> str:
         value = self.value(node.arg)
-        if node.mode == n.DEFAULT_ROUND_MODE:
+        arg = self.types.get(id(node.arg))
+        exact = arg is not None and arg.scale is not None and arg.scale <= node.scale
+        if node.mode == n.DEFAULT_ROUND_MODE or exact:
+            # The two modes differ only on a tie, and no digit is cut when the places
+            # cover the value's scale: the CASE form's * 10^s could then only overflow.
             return f"ROUND({value}, {node.scale})"
         # Half to even in fixed point: y = x * 10^s, then back by * 10^-s (a DECIMAL
         # literal, so DuckDB stays in DECIMAL instead of dividing in DOUBLE).

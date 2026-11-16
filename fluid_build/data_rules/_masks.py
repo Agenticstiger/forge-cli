@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import string
 from dataclasses import dataclass
-from typing import FrozenSet, List, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 MAX_MASK_LENGTH = 64
 
@@ -195,11 +195,41 @@ def overlap(alternatives: Sequence[Alternative]) -> Optional[Tuple[int, int, str
     """The first two alternatives that overlap, and a value both take, or ``None``."""
     for i, first in enumerate(alternatives):
         for j in range(i + 1, len(alternatives)):
-            for a in first.patterns():
-                for b in alternatives[j].patterns():
-                    if len(a) != len(b):
-                        continue
-                    shared = [x & y for x, y in zip(a, b, strict=True)]
-                    if all(shared):
-                        return i, j, "".join(min(s) for s in shared)
+            example = _overlap_pair(first, alternatives[j])
+            if example is not None:
+                return i, j, example
+    return None
+
+
+def _overlap_pair(a: Alternative, b: Alternative) -> Optional[str]:
+    """A value both alternatives take, or ``None``.
+
+    Two patterns overlap only at one total length, and there the leading
+    ``min(len(pa), len(pb))`` characters are both prefixes' literals, so they must be
+    equal. ``b``'s prefixes are indexed by length and by those leading characters, so a
+    pair of alternatives costs about ``|prefixes a| + |prefixes b|`` comparisons, not their
+    product (thousands of prefixes stay fast).
+    """
+    tail_a = tuple(p.chars() for p in a.positions)
+    tail_b = tuple(p.chars() for p in b.positions)
+    by_length: Dict[int, List[str]] = {}
+    for prefix in b.prefixes:
+        by_length.setdefault(len(prefix), []).append(prefix)
+    index: Dict[Tuple[int, int], Dict[str, List[str]]] = {}
+    for pa in a.prefixes:
+        length_b = len(pa) + len(tail_a) - len(tail_b)
+        if length_b not in by_length:
+            continue
+        lead = min(len(pa), length_b)
+        if (length_b, lead) not in index:
+            grouped: Dict[str, List[str]] = {}
+            for pb in by_length[length_b]:
+                grouped.setdefault(pb[:lead], []).append(pb)
+            index[(length_b, lead)] = grouped
+        pattern_a = tuple(frozenset(c) for c in pa) + tail_a
+        for pb in index[(length_b, lead)].get(pa[:lead], ()):
+            pattern_b = tuple(frozenset(c) for c in pb) + tail_b
+            shared = [x & y for x, y in zip(pattern_a, pattern_b, strict=True)]
+            if all(shared):
+                return "".join(min(s) for s in shared)
     return None

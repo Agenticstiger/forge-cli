@@ -1164,10 +1164,7 @@ _EXAMPLES: Dict[str, str] = {
     "contract_build_id": "id: sales.orders_raw\n",
     "contract_packaging": _VERBOSE,
     "contract_semantics": _VERBOSE,
-    "contract_data_rules": (
-        "# exposes[].contract.invariants[]\n- id: gross_from_net\n  derive: gross\n"
-        "  expr: ROUND(net * (1 + tax_rate), 2)\n"
-    ),
+    "contract_data_rules": _VERBOSE,
     "contract_extension": _VERBOSE,
     "contract_validator_finding": _VERBOSE,
     "contract_overlay": "fluid validate contract.fluid.yaml --offline --env prod",

@@ -102,7 +102,9 @@ def column_type(declared: object) -> Optional[ColumnType]:
         if params is None:
             return ColumnType(SqlType(NUMBER, None))
         sized = _PRECISION_SCALE.match(params.strip())
-        if not sized:
+        if not sized or len(sized.group("p").lstrip("0")) > 4:
+            return None  # wider than MAX_DECIMAL_PRECISION, read without int() on a long text
+        if sized.group("s") is not None and len(sized.group("s").lstrip("0")) > 4:
             return None
         precision = int(sized.group("p"))
         if precision > MAX_DECIMAL_PRECISION:

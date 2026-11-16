@@ -1368,3 +1368,144 @@ def test_every_pointer_resolves_in_a_contract_with_many_findings():
     _shared(contract, "invoices", ["contract_id"])
     findings = _lint(contract)  # _lint resolves every pointer
     assert len([f for f in findings if f.severity == "error"]) >= 7
+
+
+# -- round 1 of the gate (defect scan and delivery review, 2026-11-16) --------------
+
+
+def test_contract_names_compare_in_nfc():
+    """RFC 2.3: the contract's own texts are NFC, so an NFD column name, enum value or
+    placeholder is named by either spelling."""
+    contract = _contract()
+    _expose_of(contract, "invoices")["contract"]["schema"].append(
+        {
+            "name": "Café",
+            "type": "string",
+            "validationRules": [{"type": "enum", "constraint": "Café,b"}],
+        }
+    )
+    for text in ("\"Café\" = 'Café'", "\"Café\" = 'Café'"):
+        _add_invariant(contract, "invoices", {"id": f"nfc_{len(text)}", "check": text})
+    assert _errors(contract) == []
+
+
+def test_two_derives_without_when_are_two_sources():
+    contract = _contract()
+    j = _add_invariant(
+        contract, "invoices", {"id": "z", "derive": "gross", "expr": "ROUND(net, 2)"}
+    )
+    finding = _pick(_lint(contract), "covers none")
+    assert "gross_from_net has no when" in finding.message
+    assert "derive invariant z" in finding.message
+    assert finding.pointer.startswith("/exposes/0/contract/schema/")
+    assert j > 0
+
+
+def test_a_derive_with_a_when_before_an_unconditional_one_is_one_source():
+    contract = _contract()
+    _invariant(contract, "invoices", "gross_from_net")["when"] = "net > 0"
+    _add_invariant(contract, "invoices", {"id": "z", "derive": "gross", "expr": "ROUND(net, 2)"})
+    assert _errors(contract) == []
+
+
+def test_an_unreachable_owner_is_found_in_bounded_time():
+    """paths() searches only exposes that can reach the goal, so a typo'd member of a
+    dense contract is reported at once (it took 9 s at ten exposes, then hung)."""
+    import time
+
+    contract = _contract()
+    names = [f"d{i}" for i in range(14)]
+    for name in names:
+        rels = [_rel(f"to_{other}", other, "k", "k") for other in names if other != name]
+        contract["exposes"].append(
+            _expose(
+                name,
+                [{"name": "k", "type": "string"}, {"name": "attr", "type": "string"}],
+                semantics={"relationships": rels},
+            )
+        )
+    _column(contract, "d0", "attr")["sharedAttribute"] = "dense"
+    _column(contract, "d1", "attr")["sharedAttribute"] = "dense"
+    contract["exposes"].append(
+        _expose("island", [{"name": "attr", "type": "string", "sharedAttribute": "dense"}])
+    )
+    started = time.monotonic()
+    findings = _lint(contract)
+    assert time.monotonic() - started < 20
+    assert any("has no owner" in f.message or "more paths" in f.message for f in findings)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda inv: inv.pop("aggregate"),
+        lambda inv: inv["aggregate"].pop("via"),
+        lambda inv: inv["aggregate"].pop("function"),
+    ],
+    ids=["derive-alone", "aggregate-without-via", "aggregate-without-function"],
+)
+def test_a_form_the_schema_refuses_gets_no_second_message(mutate):
+    contract = _contract()
+    inv = _invariant(contract, "invoices", "billed_base_fee_from_lines")
+    mutate(inv)
+    assert [f for f in _errors(contract) if "None" in f.message] == []
+
+
+def test_a_dependency_without_to_gets_no_both_ways_message():
+    contract = _contract()
+    _dependency(contract).pop("to")
+    assert [f for f in _errors(contract) if "bothWays" in f.message] == []
+
+
+def test_sum_without_a_column_says_so():
+    contract = _contract()
+    _invariant(contract, "invoices", "billed_base_fee_from_lines")["aggregate"].pop("column")
+    finding = _pick(_lint(contract), "needs a column")
+    assert "None" not in finding.message
+
+
+def test_a_foreign_key_format_its_target_lacks_is_an_error():
+    contract = _contract()
+    _column(contract, "invoices", "contract_id")["identifierFormat"] = [{"mask": "999"}]
+    finding = _pick(_lint(contract), "declares no format")
+    assert finding.pointer.endswith("/identifierFormat")
+
+
+def test_exposes_without_an_id_do_not_crash_the_shared_attribute_check():
+    contract = _contract()
+    for expose_id in (None, 5):
+        expose = _expose("x", [{"name": "s1", "type": "string", "sharedAttribute": "s"}])
+        if expose_id is None:
+            del expose["exposeId"]
+        else:
+            expose["exposeId"] = expose_id
+        contract["exposes"].append(expose)
+    _lint(contract)  # the schema reports the ids; the lint must not raise
+
+
+def test_mixed_type_prefixes_on_a_foreign_key_do_not_crash():
+    contract = _contract()
+    for expose_id in ("invoices", "contracts"):
+        _column(contract, expose_id, "contract_id")["identifierFormat"] = [
+            {"prefixes": ["a", 1], "mask": "99"}
+        ]
+    _lint(contract)
+
+
+def test_a_huge_decimal_precision_has_no_type_and_does_not_crash():
+    contract = _contract()
+    _expose_of(contract, "invoices")["contract"]["schema"].append(
+        {"name": "huge", "type": "decimal(" + "9" * 4400 + ",2)"}
+    )
+    _add_invariant(contract, "invoices", {"id": "huge_check", "check": "huge > 0"})
+    finding = _pick(_lint(contract), "has no FLUID SQL/1 type")
+    assert "huge" in finding.message
+
+
+def test_the_quality_note_has_its_own_fix():
+    contract = _contract()
+    _expose_of(contract, "invoices")["contract"]["quality"] = [
+        {"rule": "net_positive", "expression": "net > 0", "severity": "error"}
+    ]
+    note = _pick(_lint(contract), "is FLUID SQL/1", severity="note")
+    assert note.fix.startswith("move it to contract.invariants[]")

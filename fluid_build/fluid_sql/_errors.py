@@ -14,7 +14,8 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 REASONS: Dict[str, str] = {
-    "too-long": "longer than 4,096 code points after NFC normalization",
+    "too-long": "longer than 4,096 code points after NFC normalization, or a canonical text "
+    "that would be",
     "comment-or-semicolon": "a ';', '--' or '/*' outside a string literal or a quoted name",
     "syntax": "a text the grammar (RFC-data-rules.md section 2.1) does not derive",
     "too-deep": "nested deeper than 64 levels",

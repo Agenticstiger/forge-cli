@@ -51,7 +51,7 @@ from fluid_build._validation_issues import json_pointer
 from fluid_build.fluid_sql._types import NUMBER, ORDERABLE, STRING
 
 from . import _masks
-from ._model import Expose, Relationship, as_dict, as_list, build, by_id
+from ._model import Expose, Relationship, as_dict, as_list, build, by_id, nfc
 
 OPERATORS = (
     "mustBe",
@@ -84,6 +84,15 @@ _GRAMMAR_FIX = (
 )
 
 Node = Tuple[str, str]  # (exposeId, column)
+
+#: The most steps the owner-path search of a shared attribute takes (see ``_Lint.paths``).
+_PATH_STEPS = 20_000
+
+
+class _TooManyPaths(Exception):
+    def __init__(self, start: str, goal: str) -> None:
+        super().__init__(start, goal)
+        self.start, self.goal = start, goal
 
 
 @dataclass(frozen=True)
@@ -155,7 +164,8 @@ class _Lint:
         self.exposes = build(contract)
         self.by_id = by_id(self.exposes)
         self.findings: List[Finding] = []
-        self.derives: DefaultDict[Node, List[str]] = defaultdict(list)
+        # The derives of each column, in declaration order: (name, has a when).
+        self.derives: DefaultDict[Node, List[Tuple[str, bool]]] = defaultdict(list)
         self.sources: DefaultDict[Node, List[str]] = defaultdict(list)
         self.edges: DefaultDict[Node, Set[Node]] = defaultdict(set)
         # (exposeId, relationship, column): an invariant reads the column on both ends.
@@ -353,7 +363,7 @@ class _Lint:
         name: str,
         reads: Set[Node],
     ) -> None:
-        target_name = inv.get("derive")
+        target_name = nfc(inv.get("derive"))
         target = expose.model.columns.get(target_name) if isinstance(target_name, str) else None
         if target is None:
             self.error(
@@ -372,8 +382,8 @@ class _Lint:
                 for relationship, column in checked.reads:
                     if relationship is not None and column == target.name:
                         self.related.add((expose.expose_id, relationship, column))
-        else:
-            summary = self.aggregate(expose, as_dict(inv.get("aggregate")), label, path, reads)
+        elif isinstance(inv.get("aggregate"), Mapping):
+            summary = self.aggregate(expose, inv["aggregate"], label, path, reads)
             if summary is not None and target is not None:
                 try:
                     fs.check_derive_fit(target, summary)
@@ -387,7 +397,7 @@ class _Lint:
                     )
         if target is not None:
             node = (expose.expose_id, target.name)
-            self.derives[node].append(name)
+            self.derives[node].append((name, "when" in inv))
             self.edges[node] |= reads
 
     def aggregate(
@@ -399,7 +409,9 @@ class _Lint:
         reads: Set[Node],
     ) -> Optional[fs.SqlType]:
         label, path = f"{label}.aggregate", path + ("aggregate",)
-        child = self.by_id.get(agg.get("from")) if isinstance(agg.get("from"), str) else None
+        if not all(isinstance(agg.get(key), str) for key in ("function", "from", "via")):
+            return None  # the schema reports a missing or malformed required key
+        child = self.by_id.get(agg.get("from"))
         if child is None:
             self.error(
                 f"{label}.from",
@@ -409,7 +421,7 @@ class _Lint:
                 "name the child expose by its exposeId",
             )
             return None
-        via = agg.get("via")
+        via = nfc(agg.get("via"))
         rel = child.relationships.get(via) if isinstance(via, str) else None
         if rel is None:
             self.error(
@@ -437,7 +449,7 @@ class _Lint:
             )
             return None
         function = agg.get("function")
-        column_name = agg.get("column")
+        column_name = nfc(agg.get("column"))
         summary: Optional[fs.SqlType]
         if function == "count":
             if column_name is not None:
@@ -453,10 +465,14 @@ class _Lint:
             column = child.model.columns.get(column_name) if isinstance(column_name, str) else None
             if column is None:
                 self.error(
-                    f"{label}.column",
-                    path + ("column",),
-                    f"{function} needs a column of {child.label} to summarize; "
-                    f"{column_name!r} is none" + _hint(column_name, child.model.columns),
+                    f"{label}.column" if column_name is not None else label,
+                    path + ("column",) if column_name is not None else path,
+                    (
+                        f"{function} needs a column of {child.label} to summarize"
+                        if column_name is None
+                        else f"{column_name!r} is not a column of {child.label}"
+                        + _hint(column_name, child.model.columns)
+                    ),
                 )
                 return None
             if column.type is None:
@@ -537,7 +553,7 @@ class _Lint:
     ) -> None:
         dep = as_dict(inv.get("dependency"))
         sides = {
-            side: [c for c in as_list(dep.get(side)) if isinstance(c, str)]
+            side: [nfc(c) for c in as_list(dep.get(side)) if isinstance(c, str)]
             for side in ("from", "to")
         }
         known = True
@@ -559,7 +575,12 @@ class _Lint:
                 f"{', '.join(both)} on both sides: a column always determines itself",
                 "list each column on one side",
             )
-        if dep.get("bothWays") is True and (len(sides["from"]) != 1 or len(sides["to"]) != 1):
+        complete = bool(sides["from"]) and bool(sides["to"])  # else the schema reports it
+        if (
+            dep.get("bothWays") is True
+            and complete
+            and (len(sides["from"]) != 1 or len(sides["to"]) != 1)
+        ):
             self.error(
                 f"{label}.dependency.bothWays",
                 path + ("dependency", "bothWays"),
@@ -736,7 +757,17 @@ class _Lint:
             if not mine or not theirs:
                 continue
             own, other = mine[1].get("identifierFormat"), theirs[1].get("identifierFormat")
-            if not isinstance(own, list) or not isinstance(other, list):
+            if not isinstance(own, list):
+                continue  # a foreign key inherits its target's format
+            if not isinstance(other, list):
+                self.error(
+                    f"{expose.column_label(from_name)}.identifierFormat",
+                    expose.column_path(from_name) + ("identifierFormat",),
+                    f"the foreign key {from_name} carries the values of "
+                    f"{target.column_label(to_name)}, which declares no format: a foreign key has "
+                    "its target's format",
+                    "declare the format on the target column, which the foreign key inherits",
+                )
                 continue
             if _normalized(own) != _normalized(other):
                 self.error(
@@ -807,6 +838,8 @@ class _Lint:
     def shared_attributes(self) -> None:
         groups: DefaultDict[str, List[Tuple[Expose, str]]] = defaultdict(list)
         for expose in self.exposes:
+            if not expose.expose_id:
+                continue  # the schema requires an exposeId; nothing can reach this expose
             for name, (_, column) in expose.columns.items():
                 if isinstance(column.get("sharedAttribute"), str):
                     groups[column["sharedAttribute"]].append((expose, name))
@@ -858,7 +891,18 @@ class _Lint:
         ids = [expose.expose_id for expose, _ in members]
         candidates = []
         for owner in ids:
-            found = {m: self.paths(m, owner) for m in ids if m != owner}
+            try:
+                found = {m: self.paths(m, owner) for m in ids if m != owner}
+            except _TooManyPaths as dense:
+                self.error(
+                    label,
+                    path,
+                    f"the relationships from {self.by_id[dense.start].label} to "
+                    f"{self.by_id[dense.goal].label} form more paths than the lint follows, so "
+                    f"it cannot tell whether {attribute!r} has one owner path",
+                    "declare fewer relationships between the attribute's exposes",
+                )
+                return
             if all(found.values()):
                 candidates.append((owner, found))
         if not candidates:
@@ -911,25 +955,60 @@ class _Lint:
                 self.edges[node].add((owner, owner_name))
 
     def paths(self, start: str, goal: str) -> List[Tuple[str, ...]]:
-        """Up to two simple paths of relationship names from ``start`` to ``goal``."""
+        """Up to two simple paths of relationship names from ``start`` to ``goal``.
+
+        Bounded work: the walk enters only exposes that can reach ``goal`` (one reverse
+        search first, so an unreachable goal costs nothing more), stops at the second
+        path, keeps its own stack (no recursion limit), and raises :class:`_TooManyPaths`
+        after :data:`_PATH_STEPS` steps rather than enumerate a dense graph's paths.
+        """
+        reach = self.reaching(goal)
+        if start not in reach:
+            return []
         found: List[Tuple[str, ...]] = []
-
-        def walk(here: str, visited: Set[str], route: Tuple[str, ...]) -> None:
-            if len(found) >= 2:
-                return
-            expose = self.by_id.get(here)
-            for rel in expose.relationships.values() if expose else ():
-                if rel.to not in self.by_id or rel.to in visited:
-                    continue
-                if rel.to == goal:
-                    found.append(route + (rel.name,))
-                    if len(found) >= 2:
-                        return
-                    continue
-                walk(rel.to, visited | {rel.to}, route + (rel.name,))
-
-        walk(start, {start}, ())
+        steps = 0
+        stack = [(iter(self.links_into(start, reach)), {start}, ())]
+        while stack and len(found) < 2:
+            links, visited, route = stack[-1]
+            step = next(links, None)
+            if step is None:
+                stack.pop()
+                continue
+            steps += 1
+            if steps > _PATH_STEPS:
+                raise _TooManyPaths(start, goal)
+            name, to = step
+            if to in visited:
+                continue
+            if to == goal:
+                found.append(route + (name,))
+                continue
+            stack.append((iter(self.links_into(to, reach)), visited | {to}, route + (name,)))
         return found
+
+    def links_into(self, here: str, reach: Set[str]) -> List[Tuple[str, str]]:
+        """``(relationship, target)`` of ``here``'s relationships whose target is in ``reach``."""
+        expose = self.by_id.get(here)
+        return [
+            (rel.name, rel.to)
+            for rel in (expose.relationships.values() if expose else ())
+            if rel.to in reach
+        ]
+
+    def reaching(self, goal: str) -> Set[str]:
+        """Every expose from which ``goal`` is reached through relationships (``goal`` too)."""
+        into: DefaultDict[str, Set[str]] = defaultdict(set)
+        for expose in self.exposes:
+            for rel in expose.relationships.values():
+                if rel.to in self.by_id:
+                    into[rel.to].add(expose.expose_id)
+        reached, todo = {goal}, [goal]
+        while todo:
+            for source in into.get(todo.pop(), ()):
+                if source not in reached:
+                    reached.add(source)
+                    todo.append(source)
+        return reached
 
     def hops(self, start: str, route: Tuple[str, ...]) -> List[str]:
         """The exposes a route of relationship names reaches, in order."""
@@ -947,8 +1026,9 @@ class _Lint:
             sources = list(self.sources.get(node, ()))
             derives = self.derives.get(node)
             if derives:
+                self.dead_derives(node, derives)
                 word = "invariants" if len(derives) > 1 else "invariant"
-                sources.insert(0, f"derive {word} {', '.join(derives)}")
+                sources.insert(0, f"derive {word} {', '.join(name for name, _ in derives)}")
             if len(sources) < 2:
                 continue
             expose = self.by_id.get(node[0])
@@ -962,6 +1042,24 @@ class _Lint:
                 "not own",
                 "keep one source and turn the others into checks",
             )
+
+    def dead_derives(self, node: Node, derives: List[Tuple[str, bool]]) -> None:
+        """Several derives of one column cover a row by the first whose when holds
+        (RFC 1.3), so they count as one source only while each but the last has a when:
+        a derive without one covers every row left, and any derive after it covers none."""
+        for (name, has_when), (later, _) in zip(derives, derives[1:], strict=False):
+            if has_when:
+                continue
+            expose = self.by_id.get(node[0])
+            if expose is not None:
+                self.error(
+                    expose.column_label(node[1]),
+                    expose.column_path(node[1]),
+                    f"derive invariant {name} has no when, so it covers every row and derive "
+                    f"invariant {later} after it covers none: two sources for one column",
+                    f"give {name} a when, or drop {later}",
+                )
+            return
 
     def cycles(self) -> None:
         for component in _strongly_connected(self.edges):
@@ -1031,6 +1129,7 @@ class _Lint:
                     ("exposes", expose.index, "contract", "quality", k, "expression"),
                     "this expression is FLUID SQL/1: as an invariant (contract.invariants[], with "
                     "check) FLUX and every consumer would read it alike",
+                    "move it to contract.invariants[] as a check if FLUX should read it",
                 )
 
 
@@ -1039,9 +1138,13 @@ def _normalized(formats: List[Any]) -> List[Tuple[Tuple[str, ...], Any]]:
     for entry in formats:
         entry = as_dict(entry)
         prefixes = entry.get("prefixes")
-        out.append(
-            (tuple(sorted(prefixes)) if isinstance(prefixes, list) else ("",), entry.get("mask"))
-        )
+        if isinstance(prefixes, list):
+            names = tuple(
+                sorted(repr(p) for p in prefixes)
+            )  # repr: the schema reports a non-string
+        else:
+            names = (repr(""),)
+        out.append((names, repr(entry.get("mask"))))
     return sorted(out, key=repr)
 
 

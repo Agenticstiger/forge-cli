@@ -138,3 +138,56 @@ def test_the_oracle_ran_most_vectors() -> None:
             approximate += 1
     assert len(CASES) >= 100
     assert approximate <= 12
+
+
+# Wide decimals: DuckDB unifies DECIMAL(38,2) and DECIMAL(38,4) as DECIMAL(38,2) and drops
+# scale silently, so the renderer casts numbers to one exact type (defect scan, 2026-11-16).
+_WIDE = {
+    "a": "decimal(38,2)",
+    "b": "decimal(38,4)",
+    "n": "decimal(18,2)",
+    "m": "decimal(10,2)",
+    "q": "bigint",
+}
+
+
+@pytest.mark.parametrize(
+    "text, site, row, expected",
+    [
+        ("COALESCE(a, b)", fs.VALUE, {"a": None, "b": "1.2345"}, Fraction("1.2345")),
+        ("COALESCE(a, b) = 1.2345", fs.PREDICATE, {"a": None, "b": "1.2345"}, True),
+        ("a = b", fs.PREDICATE, {"a": "1.23", "b": "1.2345"}, False),
+        ("a IN (1.2345)", fs.PREDICATE, {"a": "1.23"}, False),
+        ("b BETWEEN a AND 1.23", fs.PREDICATE, {"a": "1.23", "b": "1.2345"}, False),
+        (
+            "COALESCE(m, ROUND(n * q, 0, 'HALF_TO_EVEN'))",
+            fs.VALUE,
+            {"n": "12.35", "m": "7.25", "q": "3"},
+            Fraction("7.25"),
+        ),
+        (
+            "CASE WHEN q > 1 THEN m ELSE ROUND(n * q, 0) END",
+            fs.VALUE,
+            {"n": "12.35", "m": "7.25", "q": "3"},
+            Fraction("7.25"),
+        ),
+        ("ROUND(n, 38, 'HALF_TO_EVEN')", fs.VALUE, {"n": "12.35"}, Fraction("12.35")),
+    ],
+)
+def test_wide_decimals_keep_their_scale(text, site, row, expected, connection) -> None:
+    from fluid_build.fluid_sql._types import Column, column_type
+
+    model = Model("wide", {name: Column(name, t, column_type(t)) for name, t in _WIDE.items()})
+    tree = fs.parse(text)
+    checked = fs.check(tree, model, site)
+    rendered = fs.render_duckdb(tree, checked, duckdb_column("t"), predicate=site == fs.PREDICATE)
+    selects = ", ".join(
+        f"CAST(? AS {_sql_type(model, name)}) AS {quote_identifier_for('duckdb', name)}"
+        for name in sorted(model.columns)
+    )
+    params = [row.get(name) for name in sorted(model.columns)]
+    sql = f'SELECT {rendered} FROM (SELECT {selects}) AS "t"'
+    got = _from_duckdb(connection.execute(sql, params).fetchone()[0])
+    assert got == expected, rendered
+    decoded = {k: (None if v is None else Fraction(v)) for k, v in row.items()}
+    assert fs.evaluate(tree, decoded, predicate=site == fs.PREDICATE) == expected

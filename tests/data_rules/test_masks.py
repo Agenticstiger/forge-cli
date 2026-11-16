@@ -301,3 +301,24 @@ def test_capacity_ignores_literals_in_the_mask():
     assert _masks.alternative({"prefixes": ["LEGACY-"], "mask": "A9-99AA"}).capacity() == (
         26 * 10 * 10 * 10 * 26 * 26
     )
+
+
+def test_overlap_of_thousands_of_prefixes_is_fast():
+    import time
+
+    tail = "A" * 30 + "9" * 30
+    alternatives = [
+        _masks.alternative({"prefixes": [f"{s}{i:04d}" for i in range(2000)], "mask": tail})
+        for s in "PQ"
+    ]
+    started = time.monotonic()
+    assert _masks.overlap(alternatives) is None
+    assert time.monotonic() - started < 5
+
+
+def test_overlap_finds_a_prefix_that_a_symbol_covers():
+    alternatives = [
+        _masks.alternative({"prefixes": ["T"], "mask": "999"}),
+        _masks.alternative({"mask": "A999"}),
+    ]
+    assert _masks.overlap(alternatives) == (0, 1, "T000")

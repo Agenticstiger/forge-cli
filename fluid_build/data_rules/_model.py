@@ -14,10 +14,17 @@ left out, so the lint still reports on the rest.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from fluid_build import fluid_sql as fs
+
+
+def nfc(value: Any) -> Any:
+    """``value`` NFC-normalized when it is a string: the contract's own texts (names,
+    enum values, placeholders) are compared in NFC, as FLUID SQL/1 texts are (RFC 2.3)."""
+    return unicodedata.normalize("NFC", value) if isinstance(value, str) else value
 
 
 def as_list(value: Any) -> List[Any]:
@@ -79,7 +86,7 @@ def enum_values(column: Mapping[str, Any]) -> Tuple[str, ...]:
         if not isinstance(constraint, str):
             continue
         for part in constraint.split(",") + re.split(r"[|,]", constraint):
-            part = part.strip()
+            part = nfc(part.strip())
             if part and part not in values:
                 values.append(part)
     return tuple(values)
@@ -87,8 +94,8 @@ def enum_values(column: Mapping[str, Any]) -> Tuple[str, ...]:
 
 def placeholder_lists(column: Mapping[str, Any]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
     block = as_dict(column.get("placeholders"))
-    values = tuple(v for v in as_list(block.get("values")) if isinstance(v, str) and v)
-    prefixes = tuple(p for p in as_list(block.get("prefixes")) if isinstance(p, str) and p)
+    values = tuple(nfc(v) for v in as_list(block.get("values")) if isinstance(v, str) and v)
+    prefixes = tuple(nfc(p) for p in as_list(block.get("prefixes")) if isinstance(p, str) and p)
     return values, prefixes
 
 
@@ -116,7 +123,7 @@ def build(contract: Mapping[str, Any]) -> List[Expose]:
         for position, column in enumerate(as_list(as_dict(raw.get("contract")).get("schema"))):
             if not isinstance(column, Mapping) or not isinstance(column.get("name"), str):
                 continue
-            name = column["name"]
+            name = nfc(column["name"])
             if name in expose.columns:
                 continue
             declared = column.get("type") if isinstance(column.get("type"), str) else ""
@@ -134,17 +141,20 @@ def build(contract: Mapping[str, Any]) -> List[Expose]:
         for position, rel in enumerate(as_list(semantics.get("relationships"))):
             if not isinstance(rel, Mapping) or not isinstance(rel.get("name"), str):
                 continue
-            if rel["name"] in expose.relationships:
+            name = nfc(rel["name"])
+            if name in expose.relationships:
                 continue
-            expose.relationships[rel["name"]] = Relationship(
+            expose.relationships[name] = Relationship(
                 index=position,
-                name=rel["name"],
+                name=name,
                 to=rel.get("to") if isinstance(rel.get("to"), str) else "",
                 from_columns=tuple(
-                    c for c in as_list(rel.get("fromColumns")) if isinstance(c, str)
+                    nfc(c) for c in as_list(rel.get("fromColumns")) if isinstance(c, str)
                 ),
-                to_columns=tuple(c for c in as_list(rel.get("toColumns")) if isinstance(c, str)),
-                shared_columns=tuple(as_list(rel.get("sharedColumns"))),
+                to_columns=tuple(
+                    nfc(c) for c in as_list(rel.get("toColumns")) if isinstance(c, str)
+                ),
+                shared_columns=tuple(nfc(c) for c in as_list(rel.get("sharedColumns"))),
                 raw=rel,
             )
         exposes.append(expose)
