@@ -718,13 +718,17 @@ class SnowflakeAuthProvider(AuthProvider):
             for key in ["password", "private_key_path", "oauth_token", "authenticator"]
         )
 
-    @staticmethod
-    def _required_settings(settings: Dict[str, Any]) -> List[str]:
-        """The settings a connector login needs: a workload identity login names no
-        user (Snowflake finds the service user from the token)."""
+    def _load_settings(self) -> Tuple[Dict[str, Any], List[str]]:
+        """The resolved settings (kept on the provider) and the ones a connector login
+        still lacks. A workload identity login names no user: Snowflake finds the
+        service user from the token."""
         from fluid_build.providers.snowflake.util.config import is_workload_identity
 
-        return ["account"] if is_workload_identity(settings) else ["account", "user"]
+        settings = self._resolve_settings()
+        for key in ("account", "user", "warehouse", "database", "schema", "role"):
+            setattr(self, key, settings.get(key))
+        needed = ["account"] if is_workload_identity(settings) else ["account", "user"]
+        return settings, [key for key in needed if not settings.get(key)]
 
     def _check_auth_with_connector(self, settings: Dict[str, Any]) -> AuthResult:
         from fluid_build.providers.snowflake.connection import SnowflakeConnection
@@ -918,14 +922,7 @@ class SnowflakeAuthProvider(AuthProvider):
                     ),
                 )
 
-            settings = self._resolve_settings()
-            self.account = settings.get("account")
-            self.user = settings.get("user")
-            self.warehouse = settings.get("warehouse")
-            self.database = settings.get("database")
-            self.schema = settings.get("schema")
-            self.role = settings.get("role")
-            missing = [key for key in self._required_settings(settings) if not settings.get(key)]
+            settings, missing = self._load_settings()
             if missing and self._has_connector_auth(settings):
                 return AuthResult(
                     provider=self.name,
@@ -954,15 +951,7 @@ class SnowflakeAuthProvider(AuthProvider):
     async def check_auth(self) -> AuthResult:
         """Check Snowflake authentication status"""
         try:
-            settings = self._resolve_settings()
-            self.account = settings.get("account")
-            self.user = settings.get("user")
-            self.warehouse = settings.get("warehouse")
-            self.database = settings.get("database")
-            self.schema = settings.get("schema")
-            self.role = settings.get("role")
-
-            missing = [key for key in self._required_settings(settings) if not settings.get(key)]
+            settings, missing = self._load_settings()
             if missing and self._has_connector_auth(settings):
                 return AuthResult(
                     provider=self.name,
