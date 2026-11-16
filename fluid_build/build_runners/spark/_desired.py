@@ -30,6 +30,9 @@ ACTION = "spark.reconcile"
 #: The AWS account in a run's names until it is started: plans, hashes and the bound-plan
 #: check never need credentials, and a plan made anywhere matches the apply's.
 ACCOUNT_TOKEN = "${aws_account_id}"
+#: The region (and its partition) of a build whose output declares none, likewise.
+REGION_TOKEN = "${aws_region}"
+PARTITION_TOKEN = "${aws_partition}"
 #: ``maxFailedAttemptsPerHour`` of an EMR Serverless streaming job when the build sets no
 #: ``execution.retries.maxAttempts``: AWS's own default. AWS allows 1 to 10.
 DEFAULT_STREAMING_ATTEMPTS_PER_HOUR = 5
@@ -144,15 +147,25 @@ class DesiredRun:
     def needs_account(self) -> bool:
         return any(ACCOUNT_TOKEN in v for v in (self.job_uri, self.runner_uri, self.role_arn))
 
-    def bind(self, account: str) -> "DesiredRun":
-        """This run with the account its names hold (:data:`ACCOUNT_TOKEN`); the hash stays."""
+    @property
+    def needs_region(self) -> bool:
+        return self.region == REGION_TOKEN
+
+    def bind(self, account: Optional[str] = None, region: Optional[str] = None) -> "DesiredRun":
+        """This run with the account and region its names hold (:data:`ACCOUNT_TOKEN`,
+        :data:`REGION_TOKEN`); the hash stays."""
         import dataclasses
 
         def sub(value: str) -> str:
-            return value.replace(ACCOUNT_TOKEN, account)
+            if account:
+                value = value.replace(ACCOUNT_TOKEN, account)
+            if region:
+                value = value.replace(PARTITION_TOKEN, _names.partition(region))
+            return value
 
         return dataclasses.replace(
             self,
+            region=region if region and self.needs_region else self.region,
             job_uri=sub(self.job_uri),
             runner_uri=sub(self.runner_uri),
             role_arn=sub(self.role_arn),
@@ -233,6 +246,7 @@ def _submit_conf(
     user: Mapping[str, Any],
     where: str = "Spark build",
     env: Optional[Mapping[str, str]] = None,
+    policy: bool = True,
 ) -> Dict[str, str]:
     """The Spark configuration a run is submitted with: what the runner needs on the class
     path (its docstring lists it), then the build's allowed ``sparkConf`` (:func:`_allowed_conf`).
@@ -256,7 +270,10 @@ def _submit_conf(
                 packages.extend(_AVRO_PACKAGES)
                 conf["spark.jars.repositories"] = _CONFLUENT_REPOSITORY
             conf["spark.jars.packages"] = ",".join(packages)
-    conf.update(_allowed_conf(user, where, env))
+    if policy:
+        conf.update(_allowed_conf(user, where, env))
+    else:  # planning: the operator's list is apply's to check
+        conf.update({str(k): str(v) for k, v in user.items()})
     return conf
 
 
@@ -318,6 +335,25 @@ def _allowed_conf(user: Mapping[str, Any], where: str, env: Mapping[str, str]) -
     return out
 
 
+def resolve_region(environ: Optional[Mapping[str, str]] = None) -> str:
+    """The region of the default AWS credentials: AWS_REGION, AWS_DEFAULT_REGION, the profile."""
+    env = os.environ if environ is None else environ
+    region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION")
+    if not region:
+        try:
+            import boto3
+
+            region = boto3.session.Session().region_name
+        except ImportError:
+            region = None
+    if not region:
+        raise ValueError(
+            "a Spark build's output declares no binding.location.region and the AWS "
+            "credentials name none; set AWS_REGION or the output's region"
+        )
+    return str(region)
+
+
 def resolve_account(region: str) -> str:
     """The account the default AWS credentials are in, as the AWS provider resolves it."""
     from fluid_build.providers.aws.util.config import (
@@ -346,6 +382,7 @@ def desired_runs(
     account: Optional[str] = None,
     build_id: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
+    policy: bool = True,
 ) -> List[DesiredRun]:
     """Each Spark build's :class:`DesiredRun`, in contract order (``build_id``: just that one).
 
@@ -380,23 +417,26 @@ def desired_runs(
             normalize_location,
         )
 
-        region = str(
-            loc.get("region") or env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or ""
-        )
-        if not region:
-            raise ValueError(
-                f"Spark build {bid}: no AWS region; set the output's binding.location.region "
-                "or AWS_REGION"
-            )
+        # An undeclared region is the credentials' when the run starts (REGION_TOKEN), so a
+        # plan and its apply agree whatever region each shell has.
+        region = str(loc.get("region") or REGION_TOKEN)
         acct = ACCOUNT_TOKEN
-        job = compile_job_config(contract, build, account_ref=acct, environ=env)
+        job = compile_job_config(
+            contract,
+            build,
+            account_ref=acct,
+            environ=env,
+            contract_sql_gate=policy,
+            host_gate=policy,
+        )
         config = job.config
         bucket, _ = normalize_location(loc, account_ref=acct)
         runtime = str(cfg["runtime"])
         trigger = config.get("trigger") or {}
         scheduled = config["mode"] == "batch" or bool(trigger.get("availableNow"))
         role = cfg.get("executionRoleArn") or (
-            f"arn:{_names.partition(region)}:iam::{acct}:role/"
+            f"arn:{PARTITION_TOKEN if region == REGION_TOKEN else _names.partition(region)}"
+            f":iam::{acct}:role/"
             f"{_names.execution_role_name(product, bid)}"
         )
         target: Dict[str, str] = {}
@@ -422,7 +462,7 @@ def desired_runs(
                 attempts or DEFAULT_STREAMING_ATTEMPTS_PER_HOUR, _MAX_STREAMING_ATTEMPTS_PER_HOUR
             )
         spark_conf = _submit_conf(
-            runtime, config, cfg.get("sparkConf") or {}, f"Spark build {bid}", env
+            runtime, config, cfg.get("sparkConf") or {}, f"Spark build {bid}", env, policy
         )
         release = None if runtime == "glue" else str(cfg.get("releaseLabel") or "emr-7.12.0")
         glue_version = str(cfg.get("glueVersion") or "5.0") if runtime == "glue" else None

@@ -12,7 +12,7 @@ import pytest
 from fluid_build.build_runners.spark import _apply
 from fluid_build.build_runners.spark._reconcile import Outcome
 from fluid_build.cli._common import CLIError
-from tests.build_runners.spark.conftest import runs_of
+from tests.build_runners.spark.conftest import ACCOUNT, runs_of
 
 LOG = logging.getLogger("test")
 
@@ -114,3 +114,40 @@ def test_the_plan_hook_appends_one_spark_action_at_step_one(contract, monkeypatc
     assert [(a["step"], a["op"]) for a in plan["actions"]] == [(1, "spark.reconcile")]
     assert plan["total_actions"] == 1
     assert plan["actions"][0]["payload"]["configHash"] == runs_of(contract)[0].config_hash
+
+
+def test_a_plan_does_not_apply_the_operators_gates_and_matches_the_gated_apply(
+    contract, monkeypatch
+):
+    from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV
+
+    monkeypatch.delenv(HOST_ALLOWLIST_ENV, raising=False)
+    planned = _apply.planned_actions(contract)  # fluid validate warns; plan still lists it
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "msk.example")
+    runs = _apply.prepare(contract, build_id=None, verified_plan={"actions": planned}, dry_run=True)
+    assert [r.config_hash for r in runs] == [a["payload"]["configHash"] for a in planned]
+
+
+def test_an_undeclared_region_is_resolved_when_the_run_starts(contract, monkeypatch):
+    from fluid_build.build_runners.spark import _adapters, _desired
+
+    del contract["exposes"][0]["binding"]["location"]["region"]
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "ca-central-1")
+    (action,) = _apply.planned_actions(contract)
+    assert action["payload"]["region"] == _desired.REGION_TOKEN
+    (run,) = _desired.desired_runs(contract, account=ACCOUNT)
+    adapter = _adapters.adapter_for(
+        run, lambda service, region: __import__("boto3").client(service, region_name=region)
+    )
+    assert adapter.run.region == "ca-central-1"
+    assert adapter.run.role_arn.startswith(f"arn:aws:iam::{ACCOUNT}:role/")
+
+
+def test_spark_builds_on_the_native_engine_are_refused(contract):
+    from fluid_build.cli._common import CLIError
+
+    with pytest.raises(CLIError) as err:
+        _apply.refuse_without_opentofu(contract, "native")
+    assert err.value.event == "apply_spark_needs_opentofu"
+    _apply.refuse_without_opentofu({"fluidVersion": "0.7.7", "builds": []}, "native")

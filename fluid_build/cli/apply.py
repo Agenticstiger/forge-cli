@@ -2170,6 +2170,11 @@ def run(args, logger: logging.Logger) -> int:
     # keeps handing it the attested plan (``plan_kwargs``), which embeds it.
     build_kwargs: Dict[str, Any] = plan_kwargs or {"contract": source_contract}
 
+    if apply_engine != "opentofu":
+        # A Spark build's infrastructure and runs come with the OpenTofu engine only.
+        from fluid_build.build_runners.spark._apply import refuse_without_opentofu
+
+        refuse_without_opentofu(source_contract, apply_engine)
     if apply_engine == "opentofu":
         # Apply-time plugin hooks run on EVERY engine. They used to be
         # invoked only from the native path's YAML branch, several hundred

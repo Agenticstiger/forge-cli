@@ -571,11 +571,14 @@ ADAPTERS = {a.runtime: a for a in (EmrServerless, Glue, EmrEc2, EmrEks)}
 
 def adapter_for(run: DesiredRun, clients: Optional[ClientFactory] = None) -> Adapter:
     """The run's adapter, with the account its names need resolved from the credentials."""
-    if run.needs_account:
-        from fluid_build.build_runners.spark._desired import resolve_account
+    if run.needs_region or run.needs_account:
+        from fluid_build.build_runners.spark._desired import resolve_account, resolve_region
 
         try:
-            run = run.bind(resolve_account(run.region))
+            if run.needs_region:
+                run = run.bind(region=resolve_region())
+            if run.needs_account:
+                run = run.bind(account=resolve_account(run.region))
         except ValueError as exc:
             raise SparkRunError(str(exc)) from exc
     return ADAPTERS[run.runtime](run, clients or default_clients)

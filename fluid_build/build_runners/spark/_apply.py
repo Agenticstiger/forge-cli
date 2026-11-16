@@ -61,7 +61,10 @@ def planned_actions(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """
     if not _has_spark(contract):
         return []
-    return [dict(_comparable(run.plan_action(0))) for run in _desired(contract, "plan_spark")]
+    # The operator's gates are apply's (fluid validate warns about them); they refuse a
+    # build, never change what it compiles to, so the plan's hash is the apply's.
+    runs = _desired(contract, "plan_spark", policy=False)
+    return [dict(_comparable(run.plan_action(0))) for run in runs]
 
 
 def _comparable(action: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -129,6 +132,25 @@ def prepare(
                 },
             )
     return selected
+
+
+def refuse_without_opentofu(contract: Mapping[str, Any], engine: str) -> None:
+    """Refuse a contract with Spark builds on an engine that neither provisions nor runs them
+    (the native one, chosen when the contract names several providers): its plan lists a
+    ``spark.reconcile`` that would otherwise silently never happen.
+
+    Raises:
+        CLIError: ``apply_spark_needs_opentofu``.
+    """
+    if _has_spark(contract):
+        raise _cli_error(
+            "apply_spark_needs_opentofu",
+            {
+                "error": f"the {engine} apply engine was chosen, and only the OpenTofu engine "
+                "provisions and runs Spark builds; nothing was applied",
+                "hint": "keep the Spark builds in a contract whose exposes are all on AWS",
+            },
+        )
 
 
 def reconcile_after_apply(
