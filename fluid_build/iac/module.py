@@ -38,6 +38,8 @@ def assemble_tofu_document(
     backend: Optional[Dict[str, Any]] = None,
     imports: Optional[List[ImportBlock]] = None,
     provider: Optional[Dict[str, Any]] = None,
+    encryption: Optional[Dict[str, Any]] = None,
+    variables: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble a full ``.tf.json`` document from a plugin's sub-trees.
 
@@ -47,7 +49,9 @@ def assemble_tofu_document(
     ``imports`` are optional brownfield ``import {}`` blocks (see
     ``iac.importer``); ``provider`` is the optional ``provider`` sub-tree —
     static, non-secret settings keyed by provider local name (see
-    ``IacProviderPlugin.provider_block``).
+    ``IacProviderPlugin.provider_block``); ``encryption`` is the optional
+    ``terraform.encryption`` block and ``variables`` the ``variable`` blocks it
+    reads (see ``iac.encryption``).
     """
     terraform_block: Dict[str, Any] = {
         "required_version": REQUIRED_TOFU_VERSION,
@@ -55,7 +59,11 @@ def assemble_tofu_document(
     }
     if backend is not None:
         terraform_block["backend"] = backend
+    if encryption:
+        terraform_block["encryption"] = encryption
     document: Dict[str, Any] = {"terraform": terraform_block}
+    if variables:
+        document["variable"] = variables
     # OpenTofu rejects an empty ``"resource": {}`` object ("at least one
     # object property is required") — omit the key entirely when the
     # contract produced no resources, leaving a valid, empty module.
@@ -123,12 +131,16 @@ def build_module(
     actions: Iterable[Mapping[str, Any]] = (),
     backend: Optional[Dict[str, Any]] = None,
     imports: Optional[List[ImportBlock]] = None,
+    encryption: Optional[Dict[str, Any]] = None,
+    variables: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Compile a contract through one plugin into rendered ``.tf.json`` text.
 
     ``actions`` is the native ``provider.plan()`` output for the contract;
     the plugin uses it to emit the schedule / orchestration resources that
     have no clean declarative form in ``exposes[]`` (see ``iac.base``).
+    ``encryption`` and ``variables`` carry the state encryption
+    (``iac.encryption``), as :func:`assemble_tofu_document` takes them.
     """
     provider_cfg = provider_config(plugin, contract)
     document = assemble_tofu_document(
@@ -139,6 +151,8 @@ def build_module(
         imports=imports,
         # `.tf.json` keys the provider block by the provider's local name.
         provider={plugin.name: provider_cfg} if provider_cfg else None,
+        encryption=encryption,
+        variables=variables,
     )
     return render_tofu_json(document)
 

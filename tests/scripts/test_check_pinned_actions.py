@@ -178,7 +178,7 @@ def test_entry_re_parses_all_pinned_actions_entries():
 PINNED_ACTIONS = {
     "actions/checkout@v4": "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",  # v4.3.1
     "actions/setup-python@v5": "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",  # v5.6.0
-    "google-github-actions/auth@v2": "google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed",  # v2.1.13
+    "google-github-actions/auth@v3": "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093",  # v3.0.0
 }
 """
     matches = mod.ENTRY_RE.findall(text)
@@ -191,7 +191,7 @@ PINNED_ACTIONS = {
     versions = [m[4] for m in matches]
     assert "v4.3.1" in versions
     assert "v5.6.0" in versions
-    assert "v2.1.13" in versions
+    assert "v3.0.0" in versions
 
 
 def test_entry_re_rejects_entries_without_version_comment():

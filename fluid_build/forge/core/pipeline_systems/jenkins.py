@@ -964,15 +964,23 @@ pipeline {{
         // Properties). `sh` steps inherit them automatically; no
         // changes needed here.
         //
-        // Path 2 — Jenkins credential store. After creating
-        // `string` credentials in Jenkins, uncomment + adapt:
+        // Path 2 — Jenkins credential store. Jenkins has no native OIDC,
+        // so unlike the GitHub Actions and GitLab CI pipelines this one
+        // stays on credentials binding. Prefer credentials that expire (a
+        // role session, a short-lived token from your vault, issued by a
+        // credentials plugin) over long-lived ones, and never commit
+        // them. After creating `string` credentials in Jenkins,
+        // uncomment + adapt:
         //
         //   <PROVIDER_ENV_VAR> = credentials('<your-credential-id>')
         //
         // e.g. Snowflake:  SNOWFLAKE_ACCOUNT = credentials('snowflake-account')
-        //      GCP:        GOOGLE_APPLICATION_CREDENTIALS = credentials('gcp-sa-key')
-        //      AWS:        AWS_ACCESS_KEY_ID = credentials('aws-access-key')
-        //                  AWS_SECRET_ACCESS_KEY = credentials('aws-secret-key')
+        //                  SNOWFLAKE_TOKEN_FILE_PATH = credentials('snowflake-wif-token')  // a file credential
+        //                  (with SNOWFLAKE_AUTHENTICATOR=WORKLOAD_IDENTITY,
+        //                   SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER=OIDC)
+        //
+        // An OIDC plugin that vends job ID tokens would let you use the
+        // keyless setup the GitHub Actions and GitLab pipelines carry.
         //
         // Catalog publish (only if using `fluid publish`):
         //   FLUID_API_KEY = credentials('command-center-api-key')
@@ -1197,6 +1205,7 @@ pipeline {{
 """
 
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="// ",
             ci_system_name="Jenkinsfile",
             secret_surface_hint=(

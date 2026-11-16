@@ -14,7 +14,7 @@ module is now a thin shim that re-exports everything from this
 package (back-compat for tests + downstream tools).
 """
 
-from typing import List, Optional
+from typing import List, Tuple
 
 from ._base import (
     PINNED_ACTIONS,
@@ -40,7 +40,7 @@ def generate_pipeline_template(
     complexity: str = "standard",
     environments: List[str] = None,
     enable_marketplace: bool = False,
-    oidc_provider: Optional[str] = None,
+    cloud_auth: Tuple[str, ...] = (),
 ):
     """Generate pipeline template for the given provider.
 
@@ -53,7 +53,8 @@ def generate_pipeline_template(
         complexity: Pipeline complexity (basic, standard, advanced, enterprise)
         environments: List of deployment environments
         enable_marketplace: Enable marketplace publishing
-        oidc_provider: OIDC auth provider for deploy jobs ("gcp", "aws", "azure", or None)
+        cloud_auth: platforms the deploy jobs authenticate to without a static key
+            (any of "aws", "gcp", "snowflake", "databricks", "openbao")
 
     Returns:
         Dictionary of filename -> content for pipeline files
@@ -69,7 +70,7 @@ def generate_pipeline_template(
         complexity=complexity_enum,
         environments=environments,
         enable_marketplace_publishing=enable_marketplace,
-        oidc_provider=oidc_provider,
+        cloud_auth=cloud_auth,
     )
 
     generator = PipelineTemplateGenerator()

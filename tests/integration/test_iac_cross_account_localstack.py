@@ -335,7 +335,7 @@ def applied_stack(tmp_path_factory):
     (workdir / "main.tf.json").write_text(build_module(plugin, contract), encoding="utf-8")
     (workdir / "provider.tf.json").write_text(json.dumps(_provider_sidecar()), encoding="utf-8")
 
-    env = build_tofu_env(os.environ)
+    env = build_tofu_env(plugin)
     init = runner.tofu_init(str(workdir), backend=False, env=env)
     assert init.ok, f"tofu init failed:\n{init.stderr or init.stdout}"
     planned = runner.tofu_plan(str(workdir), env=env)

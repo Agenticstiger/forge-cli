@@ -103,6 +103,7 @@ class ConfluentIacPlugin:
         "TABLEFLOW_API_KEY",
         "TABLEFLOW_API_SECRET",
     )
+    credential_env_prefixes = ("CONFLUENT_", "TABLEFLOW_")
 
     def emit(
         self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()

@@ -197,7 +197,7 @@ def run(args, logger: logging.Logger) -> int:
         cprint("Warning: --allow-empty — this module provisions nothing.")
 
     if getattr(args, "validate", False):
-        _validate_with_tofu(out_dir)
+        _validate_with_tofu(out_dir, plugin)
 
     cprint("\nReview and apply with OpenTofu:")
     cprint(f"  tofu -chdir={out_dir} init")
@@ -251,16 +251,18 @@ def _refuse_an_unset_aws_account(rendered: str) -> None:
     )
 
 
-def _validate_with_tofu(out_dir: str) -> None:
+def _validate_with_tofu(out_dir: str, plugin: Any = None) -> None:
     """Run ``tofu init -backend=false`` + ``tofu validate`` on the emitted module.
 
     ``tofu validate`` needs the provider schemas, so ``init`` (provider
     download, no backend) runs first — registry network access is required
     on the first run; later runs reuse the cached ``.terraform`` directory.
     Raises ``CLIError`` when ``tofu`` is absent or either step fails, so
-    ``--validate`` is a usable CI gate.
+    ``--validate`` is a usable CI gate. ``tofu`` gets the allowlisted
+    environment for ``plugin`` (``iac/credentials.py``), as an apply does.
     """
     from fluid_build.iac import runner
+    from fluid_build.iac.credentials import build_tofu_env
 
     if runner.tofu_path() is None:
         raise CLIError(
@@ -274,14 +276,15 @@ def _validate_with_tofu(out_dir: str) -> None:
             },
         )
     cprint("\nValidating with OpenTofu (running tofu init + validate)...")
-    init = runner.tofu_init(out_dir, backend=False)
+    env = build_tofu_env(plugin)
+    init = runner.tofu_init(out_dir, backend=False, env=env)
     if not init.ok:
         raise CLIError(
             1,
             "generate_iac_validate_failed",
             {"error": f"`tofu init` failed:\n{init.stderr or init.stdout}"},
         )
-    result = runner.tofu_validate(out_dir)
+    result = runner.tofu_validate(out_dir, env=env)
     if not result.ok:
         raise CLIError(
             1,

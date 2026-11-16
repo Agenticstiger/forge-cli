@@ -216,11 +216,18 @@ class SnowflakeIacPlugin:
         "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
         # Programmatic access token (PAT).
         "SNOWFLAKE_TOKEN",
+        # Workload identity federation (CI OIDC): the provider reads the job's
+        # ID token from a file, so no secret is in the environment.
+        "SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER",
+        "SNOWFLAKE_TOKEN_FILE_PATH",
         # OAuth (client-credentials / authorization-code).
         "SNOWFLAKE_OAUTH_CLIENT_ID",
         "SNOWFLAKE_OAUTH_CLIENT_SECRET",
         "SNOWFLAKE_OAUTH_TOKEN_REQUEST_URL",
     )
+    # Every SNOWFLAKE_* variable reaches tofu (iac/credentials.py), the TOML
+    # config path and workload identity settings included.
+    credential_env_prefixes = ("SNOWFLAKE_",)
 
     def emit(
         self, contract: Mapping[str, Any], actions: Iterable[Mapping[str, Any]] = ()

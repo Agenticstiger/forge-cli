@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fluid_build._console import literal_error_text
 
@@ -229,6 +229,16 @@ def resolve_ci_choice(
     return (None, complexity)
 
 
+def _cloud_auth(target_dir: Path) -> Tuple[str, ...]:
+    """The platforms the project's contract authenticates to, for its keyless CI."""
+    contract = Path(target_dir) / "contract.fluid.yaml"
+    if not contract.is_file():
+        return ()
+    from fluid_build.cli.generate_ci import _contract_cloud_auth
+
+    return _contract_cloud_auth(str(contract))
+
+
 def scaffold_ci_pipeline(
     args: Any,
     target_dir: Path,
@@ -299,7 +309,9 @@ def scaffold_ci_pipeline(
         return (None, None)
 
     try:
-        config = build_pipeline_config(provider=provider, complexity=complexity)
+        config = build_pipeline_config(
+            provider=provider, complexity=complexity, cloud_auth=_cloud_auth(target_dir)
+        )
         files = PipelineTemplateGenerator().generate_pipeline(config)
     except Exception as exc:  # noqa: BLE001
         if console:

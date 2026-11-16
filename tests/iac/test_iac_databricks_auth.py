@@ -172,6 +172,54 @@ class TestEnvironmentCredential:
         assert exc.kind == "databricks-credentials-missing"
         _assert_no_secret(exc)
 
+    @pytest.mark.parametrize("auth_type", sorted(auth.OIDC_AUTH_TYPES))
+    def test_an_oidc_auth_type_keeps_the_client_id_and_blanks_the_secrets(self, auth_type):
+        result = auth.resolve_workspace_auth(
+            _env(
+                DATABRICKS_AUTH_TYPE=auth_type,
+                DATABRICKS_CLIENT_ID=CLIENT_ID,
+                DATABRICKS_CLIENT_SECRET=SECRET,
+                DATABRICKS_TOKEN=TOKEN,
+            )
+        )
+        assert result.auth_type == auth_type
+        assert "DATABRICKS_CLIENT_ID" not in result.overlay
+        assert result.overlay["DATABRICKS_CLIENT_SECRET"] == ""
+        assert result.overlay["DATABRICKS_TOKEN"] == ""
+        assert result.overlay["DATABRICKS_CONFIG_FILE"] == os.devnull
+
+    def test_github_oidc_needs_only_the_client_id(self):
+        result = auth.resolve_workspace_auth(
+            _env(DATABRICKS_AUTH_TYPE="github-oidc", DATABRICKS_CLIENT_ID=CLIENT_ID)
+        )
+        assert result.auth_type == "github-oidc"
+        assert result.overlay == {
+            "DATABRICKS_CONFIG_FILE": os.devnull,
+            "DATABRICKS_AUTH_TYPE": "github-oidc",
+        }
+
+    def test_an_oidc_auth_type_without_a_client_id_is_credentials_missing(self):
+        exc = _refusal(_env(DATABRICKS_AUTH_TYPE="github-oidc", DATABRICKS_TOKEN=TOKEN))
+        assert exc.kind == "databricks-credentials-missing"
+        assert "DATABRICKS_CLIENT_ID" in str(exc)
+        assert "DATABRICKS_CLIENT_SECRET" not in str(exc)
+        _assert_no_secret(exc)
+
+    def test_sdk_config_for_github_oidc_carries_the_client_id_and_no_secret(self):
+        config = auth.sdk_config(
+            _env(
+                DATABRICKS_AUTH_TYPE="github-oidc",
+                DATABRICKS_CLIENT_ID=CLIENT_ID,
+                DATABRICKS_TOKEN=TOKEN,
+            )
+        )
+        assert config == {
+            "host": HOST,
+            "auth_type": "github-oidc",
+            "config_file": os.devnull,
+            "client_id": CLIENT_ID,
+        }
+
     def test_the_overlay_never_holds_a_credential_value(self):
         overlay = auth.tofu_env_overlay(_env(DATABRICKS_TOKEN=TOKEN))
         assert TOKEN not in overlay.values()

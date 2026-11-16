@@ -165,6 +165,7 @@ class TektonTemplate(BasePipelineTemplate):
             },
         }
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="Tekton",
             secret_surface_hint=(
@@ -372,13 +373,13 @@ class TektonTemplate(BasePipelineTemplate):
         task_definitions.append(validate_task)
 
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="Tekton",
             secret_surface_hint=(
-                "Kubernetes Secrets referenced via `envFrom: - secretRef:` on "
-                "each Task (or `volumeMounts` for key-files like "
-                "GOOGLE_APPLICATION_CREDENTIALS). Create the Secrets in the "
-                "same namespace as the PipelineRun."
+                "ConfigMap or Secret values referenced via `envFrom:` on each "
+                "Task, in the same namespace as the PipelineRun. Cloud access "
+                "comes from the Task's service account identity, not a key."
             ),
         )
         runtime_notes = self._engine_runtime_notes(config, indent="# ")

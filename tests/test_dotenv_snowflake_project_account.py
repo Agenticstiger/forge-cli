@@ -1291,8 +1291,8 @@ def test_opentofu_gets_no_project_authenticator(project: Path) -> None:
     (project / ".env").write_text(_PINNED_WITH_BROWSER.replace("xy12345", "myorg-xy12345"))
     hydrate_dotenv(project)
 
-    tofu = build_tofu_env()
-    tofu.update(SnowflakeIacPlugin().credential_env(tofu))
+    tofu = build_tofu_env(SnowflakeIacPlugin())
+    tofu.update(SnowflakeIacPlugin().credential_env(dict(os.environ)))
 
     assert tofu["SNOWFLAKE_ACCOUNT_NAME"] == "xy12345"
     assert "SNOWFLAKE_AUTHENTICATOR" not in tofu
@@ -1308,8 +1308,8 @@ def test_opentofu_never_gets_the_project_account_with_an_operator_authenticator(
     (project / ".env").write_text(QUICKSTART_ENV.replace("xy12345", "myorg-xy12345"))
     hydrate_dotenv(project)
 
-    tofu = build_tofu_env()
-    tofu.update(SnowflakeIacPlugin().credential_env(tofu))
+    tofu = build_tofu_env(SnowflakeIacPlugin())
+    tofu.update(SnowflakeIacPlugin().credential_env(dict(os.environ)))
 
     assert tofu.get("SNOWFLAKE_ACCOUNT_NAME") != "xy12345"
 

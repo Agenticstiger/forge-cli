@@ -367,12 +367,12 @@ def _generated_pipeline_files() -> Dict[str, str]:
     for provider in PipelineProvider:
         for complexity in PipelineComplexity:
             for install_mode in ("pypi", "dev-source"):
-                for oidc in (None, "aws", "gcp", "azure"):
+                for oidc in ((), ("aws",), ("gcp",), ("snowflake", "databricks", "openbao")):
                     config = PipelineConfig(
                         provider=provider,
                         complexity=complexity,
                         install_mode=install_mode,
-                        oidc_provider=oidc,
+                        cloud_auth=oidc,
                         enable_marketplace_publishing=True,
                     )
                     for name, text in generator.generate_pipeline(config).items():

@@ -29,6 +29,7 @@ except ImportError:
 
     yaml = _YamlFallback()  # type: ignore[assignment]
 
+from . import _keyless
 from ._base import (
     PINNED_ACTIONS,
     BasePipelineTemplate,
@@ -107,6 +108,8 @@ class GitLabCITemplate(BasePipelineTemplate):
             # Stage 11 also gates on non-blank SCHEDULER.
             if spec.num == 11:
                 job["rules"] = [{"if": (f'${spec.toggle_param} == "true" && $SCHEDULER != ""')}]
+            if spec.num in _keyless.CLOUD_STAGE_NUMBERS:
+                self._with_cloud_auth(job, config)
             jobs[f"stage-{spec.num}-{spec.slug.replace('_', '-')}"] = job
 
         pipeline: Dict[str, Any] = {
@@ -115,6 +118,7 @@ class GitLabCITemplate(BasePipelineTemplate):
             **jobs,
         }
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="GitLab CI",
             secret_surface_hint=(
@@ -151,6 +155,7 @@ class GitLabCITemplate(BasePipelineTemplate):
             pipeline["before_script"] = list(pipeline["before_script"]) + [engine_pip]
 
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="GitLab CI",
             secret_surface_hint=(
@@ -163,10 +168,26 @@ class GitLabCITemplate(BasePipelineTemplate):
         notes_block = ("\n" + runtime_notes + "\n") if runtime_notes else ""
         return {".gitlab-ci.yml": banner + notes_block + yaml.dump(pipeline, indent=2)}
 
+    @staticmethod
+    def _with_cloud_auth(job: Dict[str, Any], config: PipelineConfig) -> Dict[str, Any]:
+        """Make ``job`` authenticate keylessly to the platforms the contract binds:
+        an ``id_tokens`` entry each, the script lines that turn the tokens into
+        what the SDKs read, and the SDK variables. A contract that binds no
+        cloud leaves the job as it is."""
+        tokens = _keyless.gitlab_id_tokens(config.cloud_auth)
+        if not tokens:
+            return job
+        job["id_tokens"] = tokens
+        extra = _keyless.gitlab_auth_variables(config.cloud_auth)
+        if extra:
+            job["variables"] = {**job.get("variables", {}), **extra}
+        job["script"] = [*_keyless.gitlab_auth_script(config.cloud_auth), *job["script"]]
+        return job
+
     def _generate_basic_gitlab_pipeline(self, config, commands, env_vars):
         """Generate basic GitLab CI pipeline"""
 
-        return {
+        pipeline = {
             "stages": ["validate", "generate", "plan", "apply", "test", "publish"],
             "variables": env_vars,
             "image": "python:3.12-slim",
@@ -223,6 +244,10 @@ class GitLabCITemplate(BasePipelineTemplate):
                 "only": ["main"],
             },
         }
+        # apply and publish reach the cloud (and a vault:// secretRef).
+        for name in ("apply", "publish"):
+            self._with_cloud_auth(pipeline[name], config)
+        return pipeline
 
     def _generate_standard_gitlab_pipeline(self, config, commands, env_vars):
         """Generate standard GitLab CI pipeline with environments"""
@@ -269,30 +294,6 @@ class GitLabCITemplate(BasePipelineTemplate):
         # Add deployment jobs for each environment
         for env in config.environments:
             deploy_script = []
-            # Add OIDC authentication for GitLab CI if configured.
-            # SECURITY_REVIEW S-005: never write federated creds to a
-            # predictable `/tmp/*.json` path. Use ``mktemp`` + ``chmod 600``
-            # + a ``trap`` cleanup so the credential file exists only for
-            # the lifetime of the single shell invocation.
-            if config.oidc_provider == "gcp":
-                deploy_script.append(
-                    'CRED_FILE="$(mktemp)" '
-                    '&& chmod 600 "$CRED_FILE" '
-                    "&& trap 'rm -f \"$CRED_FILE\"' EXIT "
-                    '&& printf "%s" "${FLUID_OIDC_TOKEN}" > "$CRED_FILE" '
-                    '&& gcloud auth login --cred-file="$CRED_FILE" --quiet'
-                )
-            elif config.oidc_provider == "aws":
-                deploy_script.append(
-                    'CRED_FILE="$(mktemp)" '
-                    '&& chmod 600 "$CRED_FILE" '
-                    "&& trap 'rm -f \"$CRED_FILE\"' EXIT "
-                    "&& aws sts assume-role-with-web-identity"
-                    ' --role-arn "${AWS_ROLE_ARN}"'
-                    ' --web-identity-token "${FLUID_OIDC_TOKEN}"'
-                    ' --role-session-name "fluid-ci-${CI_PIPELINE_ID}"'
-                    ' > "$CRED_FILE"'
-                )
             deploy_script.append(f"FLUID_ENV={env} {commands['generate_transformation']}")
             deploy_script.append(f"FLUID_ENV={env} {commands['generate_schedule']}")
             deploy_script.append(f"FLUID_ENV={env} {commands['apply']}")
@@ -304,11 +305,8 @@ class GitLabCITemplate(BasePipelineTemplate):
                 "dependencies": ["plan"],
             }
 
-            # GitLab native OIDC token injection
-            if config.oidc_provider:
-                deploy_job["id_tokens"] = {
-                    "FLUID_OIDC_TOKEN": {"aud": "https://YOUR_IDENTITY_POOL_AUDIENCE"}
-                }
+            # GitLab native OIDC: one ID token per bound platform, no static key.
+            self._with_cloud_auth(deploy_job, config)
 
             if env == "prod":
                 deploy_job["when"] = "manual"
@@ -340,6 +338,7 @@ class GitLabCITemplate(BasePipelineTemplate):
             "only": ["main"],
             "dependencies": [f"deploy-{config.environments[-1]}"],  # Depends on final environment
         }
+        self._with_cloud_auth(pipeline["publish"], config)
 
         if config.enable_marketplace_publishing:
             pipeline["marketplace-publish"] = {

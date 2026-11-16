@@ -42,9 +42,9 @@ import yaml
 
 from fluid_build.cli import _apply_opentofu_engine as engine
 from fluid_build.cli._common import CLIError
-from fluid_build.iac import runner
+from fluid_build.iac import get_iac_plugin, runner
 from fluid_build.iac import state_migration as mig
-from fluid_build.iac.credentials import build_tofu_env
+from fluid_build.iac.credentials import backend_clouds, build_tofu_env
 
 pytestmark = [pytest.mark.integration, pytest.mark.provider, pytest.mark.aws]
 
@@ -214,7 +214,8 @@ def _reconcile(tmp_path: Path, key: str, provider: str, *, migrate: bool):
     (workdir / "main.tf.json").write_text(
         json.dumps({"terraform": {"backend": _block(key)}}), encoding="utf-8"
     )
-    env = build_tofu_env()
+    # The state backend is S3 (moto) whatever the provider: its cloud's variables pass.
+    env = build_tofu_env(get_iac_plugin(provider), clouds=backend_clouds(_block(key)))
     assert runner.tofu_init(str(workdir), env=env, reconfigure=True).ok
     return mig.reconcile_state_key(
         workdir=workdir,

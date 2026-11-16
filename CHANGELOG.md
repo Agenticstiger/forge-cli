@@ -36,6 +36,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     so FLUID to ODCS to FLUID loses none. The dbt bridge's output is unchanged. MCP `describe`
     returns them, and the contract digest covers them. The ODCS quality rules and the dbt
     `fluid_rule` test are the RFC's steps 2 and 3.
+- **OpenTofu state and plan encryption, opt-in.** `FLUID_STATE_ENCRYPTION` (an operator
+  setting; project dotenv files cannot set it) names one OpenTofu key provider by reference:
+  `aws-kms://<key id, ARN or alias/name>`, `gcp-kms://projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>`,
+  `openbao://<transit mount path>/<key name>` or `pbkdf2+<secret reference>` (for example
+  `pbkdf2+env://FLUID_STATE_PASSPHRASE` or `pbkdf2+vault://kv/lab/state#passphrase`).
+  `fluid apply` and `fluid diff` then emit `terraform.encryption` with `enforced = true` for the
+  state and the saved plan. Key material never lands in `main.tf.json`, the plan, the state or
+  `TF_ENCRYPTION`: a pbkdf2 passphrase resolves through the operator's secret policy and reaches
+  `tofu` as an ephemeral variable (`TF_VAR_fluid_state_passphrase`, in its environment only),
+  an OpenBao key gets `BAO_ADDR` and a token the same way, and the KMS keys use the cloud's own
+  credentials. Needs OpenTofu 1.13, refused with the upgrade otherwise: before 1.13,
+  `tofu init -backend=false` (forge's local state) read an encrypted local state without the
+  encryption configuration and failed. Existing plaintext
+  state is refused with the fix: run `fluid apply --migrate-state-encryption` once to read it
+  through OpenTofu's `unencrypted` fallback and write it back encrypted. A state encrypted with
+  no key set, a wrong key, and a key `tofu` cannot reach each get their own error.
+- **Keyless CI from `fluid generate ci`.** The platforms come from the contract and every
+  overlay (`aws`, `gcp`, `snowflake`, `databricks` bindings; `openbao` for a `vault://` or
+  `openbao://` secret reference). GitHub Actions jobs that reach the cloud get `id-token: write`
+  and one OIDC login per platform: `aws-actions/configure-aws-credentials` v6.3.0 and
+  `google-github-actions/auth` v3.0.0 (pinned by SHA), Snowflake workload identity federation
+  from the job's ID token in a mode-600 file, Databricks `github-oidc`, and an OpenBao JWT login
+  (`FLUID_VAULT_JWT_FILE`). GitHub's ID tokens last about five minutes, so the token file is
+  refreshed every four for the job's later steps, and the logins skip fork and Dependabot pull
+  requests, which get no ID token. GitLab gets `id_tokens` per platform. The header lists the
+  non-secret variables and the cloud-side trust to create, bound to GitHub's immutable subject
+  (`repo:OWNER@OWNER-ID/REPO@REPO-ID:...`, the default for repositories created after
+  2026-07-15). Jenkins has no native OIDC and says it stays on credentials binding. No
+  generated pipeline suggests a static cloud key. `fluid forge` scaffolds the same keyless CI
+  from the project's contract.
+- **Snowflake workload identity federation.** `SNOWFLAKE_AUTHENTICATOR=WORKLOAD_IDENTITY` with
+  `SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER` (`OIDC`, `AWS`, `AZURE`, `GCP`) and, for `OIDC`,
+  `SNOWFLAKE_TOKEN_FILE_PATH` connects forge without a user, password or key; the
+  `snowflakedb/snowflake` OpenTofu provider reads the same variables (2.23 or newer for a token
+  file). `fluid auth login`, `fluid auth status` and `fluid doctor` take such a login without
+  `SNOWFLAKE_USER`.
 
 - **Schema 0.7.7 (preview): semantic relationships and SCD validity windows**
   (RFC-semantics-tier1 §4 and §5). `exposes[].semantics.relationships[]`
@@ -166,6 +202,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: `tofu` runs with an environment allowlist, not a copy of `os.environ`.** It gets
+  the process basics (`PATH`, `HOME`, user, locale, temporary and profile directories), proxies,
+  CA bundles, OpenTofu's settings by name plus `TF_TOKEN_*`, what `opentofu/setup-opentofu`'s
+  default wrapper needs (`TOFU_CLI_PATH`, `GITHUB_OUTPUT`), and the variable families each IaC
+  plugin declares in the new optional `credential_env_prefixes` (`AWS_`;
+  `GOOGLE_`/`GCLOUD_`/`CLOUDSDK_`/`GCE_METADATA_`; `SNOWFLAKE_`; `DATABRICKS_` with `ARM_`,
+  `AZURE_`, `GOOGLE_`; `CONFLUENT_`/`TABLEFLOW_`), plus the state backend's and the encryption
+  key's cloud. Every provider credential path keeps working (profiles with `credential_process`,
+  web identity files, container credentials, application default credentials and
+  impersonation). `TF_CLI_ARGS*`, `TF_VAR_*`, `TF_ENCRYPTION`, `TF_INPUT` and
+  `TF_REATTACH_PROVIDERS` never pass (a `tofu_env_dropped` warning names them), nor do model
+  keys such as `GOOGLE_API_KEY` or `AZURE_OPENAI_API_KEY`. An out-of-tree IaC plugin lists what
+  its provider reads in `credential_env_vars` / `credential_env_prefixes`; one that declares no
+  prefixes is warned about once. `fluid generate iac --validate` uses the same allowlist.
+- **Databricks OIDC auth types keep `DATABRICKS_CLIENT_ID`.** `github-oidc`, `env-oidc`,
+  `file-oidc` and `azure-devops-oidc` exchange the job's token for the service principal the
+  client id names; forge used to blank it for any type but `oauth-m2m`. The client id is now
+  required for them, and `tofu` gets GitHub's `ACTIONS_ID_TOKEN_REQUEST_*` for `github-oidc` only.
+
 - **The secret destination policy covers every scheme, not only `env://`.** A value from
   `vault://`, `aws-sm://`, `file://` or a pack is sent to a host that leaves this machine only
   when the operator allows it: `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` keeps `NAME` and
@@ -291,6 +346,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without auth, a browser `Origin` from another machine gets 403.
 
 ### Removed
+
+- **BREAKING: `PipelineConfig.oidc_provider` and `generate_pipeline_template(oidc_provider=)`.**
+  No CLI flag ever set them, so their OIDC steps never reached a generated pipeline. They are
+  replaced by `cloud_auth`, which `fluid generate ci` fills from the contract. The Azure login
+  step went with them.
 
 - **`fluid_build.secrets.SecretManager` and `build_runners._secret_policy`**, replaced by the
   `fluid_build.secrets` package (no compatibility shim).

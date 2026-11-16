@@ -164,6 +164,7 @@ class CircleCITemplate(BasePipelineTemplate):
             },
         }
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="CircleCI",
             secret_surface_hint=(
@@ -303,6 +304,7 @@ class CircleCITemplate(BasePipelineTemplate):
             executor_env.update(engine_env)
 
         banner = self._credential_banner(
+            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="CircleCI",
             secret_surface_hint=(
