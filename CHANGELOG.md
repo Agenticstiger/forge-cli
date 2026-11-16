@@ -41,7 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SNOWFLAKE_WORKLOAD_IDENTITY_PROVIDER` (`OIDC`, `AWS`, `AZURE`, `GCP`) and, for `OIDC`,
   `SNOWFLAKE_TOKEN_FILE_PATH` connects forge without a user, password or key; the
   `snowflakedb/snowflake` OpenTofu provider reads the same variables (2.23 or newer for a token
-  file).
+  file). `fluid auth login`, `fluid auth status` and `fluid doctor` take such a login without
+  `SNOWFLAKE_USER`.
 
 - **Schema 0.7.7 (preview): semantic relationships and SCD validity windows**
   (RFC-semantics-tier1 §4 and §5). `exposes[].semantics.relationships[]`
