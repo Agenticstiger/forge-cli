@@ -57,7 +57,7 @@ builds:
           - name: amount
             type: decimal(18,2)
           - name: event_time
-            type: timestamp
+            type: timestamp_ltz
       mapping:
         columns:
           - name: customer_email_hash
@@ -70,6 +70,7 @@ builds:
           applicationId: 00fexampleapp0001
           releaseLabel: emr-7.12.0
           executionRoleArn: arn:aws:iam::000000000001:role/fluid-iactest-orders-spark
+          maskKeySecretArn: arn:aws:secretsmanager:eu-west-1:000000000001:secret:fluid-iactest-orders-mask-key-AbCdEf  # pragma: allowlist secret - an ARN, not a value
           source:
             mskClusterArn: arn:aws:kafka:eu-west-1:000000000001:cluster/commerce-events/0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d-1
             auth: msk-iam
@@ -111,7 +112,7 @@ exposes:
         - name: amount
           type: decimal(18,2)
         - name: event_time
-          type: timestamp
+          type: timestamp_ltz
   - exposeId: orders_daily
     kind: table
     binding:

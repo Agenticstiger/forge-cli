@@ -1322,7 +1322,7 @@
             "column": {
               "type": "string",
               "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?![\\s\\S])",
-              "description": "A timestamp column of the stream, or a nested field of one as a dotted path."
+              "description": "A timestamp column of the stream, or a nested field of one as a dotted path. On a Spark build it must be timestamp_ltz: Spark refuses a watermark on TIMESTAMP_NTZ (EVENT_TIME_IS_NOT_ON_TIMESTAMP_TYPE), and the Spark compiler refuses a timestamp (no time zone) watermark column."
             },
             "delay": {
               "$ref": "#/$defs/isoDuration",
@@ -1602,7 +1602,7 @@
           "enum": [
             "hash"
           ],
-          "description": "NEW in v0.7.7 (preview): Mask the value before it lands. hash: write the SHA-256 digest of the source value instead of the value, so the raw value never reaches the table. Opt-in: the default masking is a protected view derived from the table."
+          "description": "NEW in v0.7.7 (preview): Mask the value before it lands. hash = HMAC-SHA256 keyed by parameters.spark.maskKeySecretArn, lowercase hex; null stays null. The raw value never reaches the table, and a keyed digest cannot be reversed by hashing a dictionary of likely values. Opt-in: the default masking is a protected view derived from the table."
         }
       }
     },
@@ -3897,6 +3897,11 @@
           "type": "string",
           "pattern": "^arn:aws[a-zA-Z0-9-]*:iam::[0-9]{12}:role/[A-Za-z0-9_+=,.@/-]{1,512}(?![\\s\\S])",
           "description": "The IAM role the job runs as. Absent: a least-privilege role forge creates for the build."
+        },
+        "maskKeySecretArn": {
+          "type": "string",
+          "pattern": "^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+(?![\\s\\S])",
+          "description": "The AWS Secrets Manager secret holding the HMAC key for maskAtIngest: hash. Required when any mapping column sets maskAtIngest (the cross-field check lives in the Spark compiler)."
         },
         "sparkConf": {
           "type": "object",

@@ -8,7 +8,8 @@
   ``schemaRegistryUrl`` stay valid.
 * ``streamSource`` (``builds[].properties.stream``): ``trigger``, ``watermark``,
   ``checkpoint``, ``startingOffsets``.
-* ``recordMappingColumn.maskAtIngest``: ``hash`` (SHA-256 at ingest).
+* ``recordMappingColumn.maskAtIngest``: ``hash`` (HMAC-SHA256 at ingest, keyed by
+  ``parameters.spark.maskKeySecretArn``).
 * ``$defs.sparkParameters`` at ``builds[].properties.parameters.spark``.
 * Six AWS container kinds in ``packaging.containers`` (``mwaaEnvironment`` shared only), and
   the resolver that reads them without changing the plan summary.
@@ -105,6 +106,10 @@ class TestFixture:
         assert contract["builds"][0]["properties"]["mapping"]["columns"][0]["maskAtIngest"]
         assert contract["builds"][0]["engine"] == "spark"
         assert {"mskClusterArn", "auth", "groupIdPrefix"} <= set(_spark(contract)["source"])
+        assert _spark(contract)["maskKeySecretArn"]
+        # Spark refuses a watermark on TIMESTAMP_NTZ; the fixture's watermark is timestamp_ltz.
+        column = {c["name"]: c["type"] for c in stream["schema"]}[stream["watermark"]["column"]]
+        assert column == "timestamp_ltz"
         assert set(contract["packaging"]["containers"]) == set(PREVIEW_CONTAINER_KINDS)
 
     def test_077_stays_a_preview_and_076_the_default(self):
@@ -351,6 +356,12 @@ class TestStreamFields:
     def test_rejected(self, manager, name, value):
         assert not _valid(manager, _stream_field(name, value)), (name, value)
 
+    def test_the_watermark_column_says_spark_needs_timestamp_ltz(self, manager):
+        watermark = manager._bundled_schemas["0.7.7"]["$defs"]["streamSource"]["properties"][
+            "watermark"
+        ]
+        assert "must be timestamp_ltz" in watermark["properties"]["column"]["description"]
+
     def test_new_fields_are_optional(self, manager):
         contract = _fixture()
         for name in ("registry", "trigger", "watermark", "checkpoint", "startingOffsets"):
@@ -381,10 +392,40 @@ class TestMaskAtIngest:
         self._column(contract)["maskAtIngest"] = value
         assert not _valid(manager, contract)
 
-    def test_the_schema_names_sha256(self, manager):
-        column = manager._bundled_schemas["0.7.7"]["$defs"]["recordMappingColumn"]
-        assert column["properties"]["maskAtIngest"]["enum"] == ["hash"]
-        assert "SHA-256" in column["properties"]["maskAtIngest"]["description"]
+    def test_the_hash_is_a_keyed_hmac(self, manager):
+        defs = manager._bundled_schemas["0.7.7"]["$defs"]
+        mask = defs["recordMappingColumn"]["properties"]["maskAtIngest"]
+        assert mask["enum"] == ["hash"]
+        assert "HMAC-SHA256 keyed by parameters.spark.maskKeySecretArn" in mask["description"]
+        assert "lowercase hex; null stays null" in mask["description"]
+        key = defs["sparkParameters"]["properties"]["maskKeySecretArn"]
+        assert "Spark compiler" in key["description"]
+
+    @pytest.mark.parametrize(
+        "arn",
+        [
+            "arn:aws:secretsmanager:eu-west-1:123456789012:secret:mask-key-AbCdEf",
+            "arn:aws-us-gov:secretsmanager:us-gov-west-1:123456789012:secret:team/mask-AbCdEf",
+            "arn:aws-cn:secretsmanager:cn-north-1:123456789012:secret:k",
+        ],
+    )
+    def test_a_secrets_manager_arn_is_accepted(self, manager, arn):
+        assert _valid(manager, _spark_params(runtime="glue", maskKeySecretArn=arn))
+
+    @pytest.mark.parametrize(
+        "arn",
+        [
+            "arn:aws:secretsmanager:eu-west-1:123456789012:secret:",
+            "arn:aws:secretsmanager:eu-west-1:1234:secret:k",
+            "arn:aws:kms:eu-west-1:123456789012:key/abc",
+            "arn:aws:ssm:eu-west-1:123456789012:parameter/k",
+            "arn:aws:secretsmanager:eu-west-1:123456789012:secret:k\n",
+            "mask-key",
+            "",
+        ],
+    )
+    def test_anything_else_is_refused(self, manager, arn):
+        assert not _valid(manager, _spark_params(runtime="glue", maskKeySecretArn=arn))
 
 
 # ---------------------------------------------------------------------------
