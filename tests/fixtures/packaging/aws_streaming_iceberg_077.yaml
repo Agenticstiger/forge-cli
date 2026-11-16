@@ -1,0 +1,127 @@
+# Every field the 0.7.7 preview adds for AWS streaming to Iceberg, in one contract:
+# streamSource.registry/trigger/watermark/checkpoint/startingOffsets, a mapped column's
+# maskAtIngest, parameters.spark (a streaming build on EMR Serverless and a batch build
+# on EMR on EKS) and the six AWS container kinds in packaging.containers.
+# Pinned by tests/test_schema_077_aws_streaming.py; fluid validate must accept it.
+# It lives outside tests/fixtures/contracts/ on purpose: it declares a packaging block, and
+# tests/iac/test_iac_packaging_default_pin.py pins every contract there to the LEGACY sentinel.
+fluidVersion: "0.7.7"
+kind: DataProduct
+id: commerce.orders-stream
+name: Orders stream (Kafka to Iceberg on AWS)
+domain: commerce
+metadata:
+  layer: Bronze
+  owner:
+    team: commerce-data
+packaging:
+  mode: isolated
+  pool: commerce-platform
+  containers:
+    lfTagVocabulary: shared
+    emrApplication: shared
+    schemaRegistry: shared
+    athenaWorkgroup: shared
+    kmsKey: isolated
+    mwaaEnvironment: shared
+builds:
+  - id: ingest-orders
+    engine: spark
+    pattern: embedded-logic
+    outputs: [orders]
+    properties:
+      stream:
+        kind: kafka
+        topic: commerce.orders
+        format: avro-confluent
+        registry:
+          kind: confluent
+          url: https://schema-registry.example.internal
+          subject: commerce.orders-value
+          version: latest
+          auth:
+            secretRef: env://SCHEMA_REGISTRY_AUTH  # pragma: allowlist secret - a reference, not a value
+        trigger:
+          processingTime: PT1M
+        watermark:
+          column: event_time
+          delay: PT10M
+        checkpoint: s3://commerce-lake/_checkpoints/orders-stream/ingest-orders/
+        startingOffsets: earliest
+        schema:
+          - name: order_id
+            type: string
+            required: true
+          - name: customer_email
+            type: string
+          - name: amount
+            type: decimal(18,2)
+          - name: event_time
+            type: timestamp
+      mapping:
+        columns:
+          - name: customer_email_hash
+            from: customer_email
+            maskAtIngest: hash
+      parameters:
+        spark:
+          runtime: emr-serverless
+          mode: streaming
+          applicationId: 00fexampleapp0001
+          releaseLabel: emr-7.12.0
+          executionRoleArn: arn:aws:iam::000000000001:role/fluid-iactest-orders-spark
+          sparkConf:
+            spark.sql.shuffle.partitions: "8"
+  - id: compact-orders
+    engine: spark
+    pattern: embedded-logic
+    outputs: [orders_daily]
+    properties:
+      sql: >-
+        SELECT CAST(event_time AS DATE) AS order_date, SUM(amount) AS revenue
+        FROM commerce.orders GROUP BY CAST(event_time AS DATE)
+      parameters:
+        spark:
+          runtime: emr-eks
+          mode: batch
+          virtualClusterId: abcdefghij0123456789klmno  # pragma: allowlist secret - a made-up id
+exposes:
+  - exposeId: orders
+    kind: table
+    binding:
+      platform: aws
+      format: iceberg
+      location:
+        database: commerce
+        table: orders
+        bucket: commerce-lake
+        path: iceberg/commerce/orders/
+        region: eu-west-1
+    contract:
+      schema:
+        - name: order_id
+          type: string
+          required: true
+        - name: customer_email_hash
+          type: string
+        - name: amount
+          type: decimal(18,2)
+        - name: event_time
+          type: timestamp
+  - exposeId: orders_daily
+    kind: table
+    binding:
+      platform: aws
+      format: iceberg
+      location:
+        database: commerce
+        table: orders_daily
+        bucket: commerce-lake
+        path: iceberg/commerce/orders_daily/
+        region: eu-west-1
+    contract:
+      schema:
+        - name: order_date
+          type: date
+        - name: revenue
+          type: decimal(18,2)

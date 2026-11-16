@@ -122,6 +122,20 @@ _PREVIEW_FIELDS = {
         "dimensions",
         "the validity window of a slowly changing dimension",
     ),
+    # The AWS streaming container kinds (packaging.containers); every other field the
+    # preview adds for AWS streaming sits under a 0.7.7-only object (stream, mapping) or
+    # under the free-form properties.parameters, so an older schema never names it.
+    **{
+        ("containers", kind): ("packaging", f"the {what} container kind")
+        for kind, what in (
+            ("lfTagVocabulary", "Lake Formation tag vocabulary"),
+            ("emrApplication", "EMR Serverless application"),
+            ("schemaRegistry", "Glue schema registry"),
+            ("athenaWorkgroup", "Athena workgroup"),
+            ("kmsKey", "KMS key"),
+            ("mwaaEnvironment", "MWAA environment"),
+        )
+    },
 }
 
 
