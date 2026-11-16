@@ -1150,7 +1150,8 @@ class TestLiveElementNames:
         _, warnings = validate_semantics_block(contract)
         assert any("`dbt parse` rejects the export" in w for w in warnings), warnings
         exit_code, _ = _generate_with_dbt_validate(contract, tmp_path)
-        output = capsys.readouterr().out
+        # The console wraps dbt's lines at the terminal width, so match across the breaks.
+        output = " ".join(capsys.readouterr().out.split())
         assert exit_code != 0, output
         assert "element `region` is of type" in output and "across the model" in output, output
 
