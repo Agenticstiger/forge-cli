@@ -201,6 +201,28 @@ class _Lint:
         invariants, or the invariant itself when the other rule is a dq or quality rule. A
         dq rule or quality rule that only repeats another of its kind is not reported here.
         """
+        for rule_id, entries in self.rule_ids().items():
+            invariants = [entry for entry in entries if entry[2]]
+            if len(entries) < 2 or not invariants:
+                continue
+            first = entries[0]
+            for entry in invariants:
+                if entry is first and len(invariants) > 1:
+                    continue  # the later invariant names this one
+                other = first if entry is not first else entries[1]
+                self.error(
+                    entry[0],
+                    entry[1],
+                    f"the id {rule_id!r} is also {other[0]}'s: ids are unique within the "
+                    "contract, across exposes, dq.rules and contract.quality, because reports, "
+                    "tests and ODCS rules are keyed by them",
+                    "give the invariant an id of its own",
+                )
+
+    def rule_ids(self) -> Dict[str, List[Tuple[str, Tuple[Any, ...], bool]]]:
+        """Every rule id of the contract, in contract order: ``id -> [(label, path,
+        is_invariant)]`` over ``dq.rules[].id``, ``contract.quality[].rule`` and the
+        invariants' ids."""
         groups: DefaultDict[str, List[Tuple[str, Tuple[Any, ...], bool]]] = defaultdict(list)
         for expose in self.exposes:
             contract = expose.contract
@@ -218,23 +240,7 @@ class _Lint:
                     path = ("exposes", expose.index, "contract", "invariants", j, "id")
                     label = f"{expose.label}.contract.invariants[{inv_id}]"
                     groups[inv_id].append((label, path, True))
-        for rule_id, entries in groups.items():
-            invariants = [entry for entry in entries if entry[2]]
-            if len(entries) < 2 or not invariants:
-                continue
-            first = entries[0]
-            for entry in invariants:
-                if entry is first and len(invariants) > 1:
-                    continue  # the later invariant names this one
-                other = first if entry is not first else entries[1]
-                self.error(
-                    entry[0],
-                    entry[1],
-                    f"the id {rule_id!r} is also {other[0]}'s: ids are unique within the "
-                    "contract, across exposes, dq.rules and contract.quality, because reports, "
-                    "tests and ODCS rules are keyed by them",
-                    "give the invariant an id of its own",
-                )
+        return groups
 
     # -- invariants --------------------------------------------------------------
 
@@ -632,61 +638,10 @@ class _Lint:
         declared = column.get("type") if isinstance(column.get("type"), str) else "?"
         column_type = None if column.get("fields") else fs.column_type(declared)
         is_string = column_type is not None and column_type.type.kind == STRING
-        formats = column.get("identifierFormat")
-        if isinstance(formats, list):
-            if not is_string:
-                self.error(
-                    f"{label}.identifierFormat",
-                    path + ("identifierFormat",),
-                    f"only a string column takes an identifier format; this one is {declared}",
-                )
-            alternatives = []
-            for k, entry in enumerate(formats):
-                try:
-                    alternatives.append(_masks.alternative(entry))
-                except _masks.MaskError as bad:
-                    self.error(
-                        f"{label}.identifierFormat[{k}]", path + ("identifierFormat", k), str(bad)
-                    )
-            if len(alternatives) == len(formats):
-                clash = _masks.overlap(alternatives)
-                if clash is not None:
-                    i, j, example = clash
-                    self.error(
-                        f"{label}.identifierFormat",
-                        path + ("identifierFormat",),
-                        f"alternatives {i} and {j} overlap: {example!r} has both formats, so a value "
-                        "would not say which alternative made it",
-                        "make the alternatives differ in a literal, or in length",
-                    )
-            if any(
-                str(as_dict(r).get("type") or "").strip().lower() == "regex"
-                for r in as_list(column.get("validationRules"))
-            ):
-                self.note(
-                    f"{label}.identifierFormat",
-                    path + ("identifierFormat",),
-                    "the column has both an identifier format and a regex rule: both apply, and only "
-                    "the format can be enumerated by a generator",
-                )
-        placeholders = column.get("placeholders")
-        if isinstance(placeholders, Mapping):
-            if not is_string:
-                self.error(
-                    f"{label}.placeholders",
-                    path + ("placeholders",),
-                    f"only a string column takes placeholders; this one is {declared}",
-                )
-            if not as_list(placeholders.get("values")) and not as_list(
-                placeholders.get("prefixes")
-            ):
-                self.error(
-                    f"{label}.placeholders",
-                    path + ("placeholders",),
-                    "declares neither values nor prefixes, so nothing is a placeholder",
-                    "list placeholder values, prefixes or both",
-                )
-            self.band(placeholders, f"{label}.placeholders", path + ("placeholders",))
+        if isinstance(column.get("identifierFormat"), list):
+            self.formats(column, declared, is_string, label, path)
+        if isinstance(column.get("placeholders"), Mapping):
+            self.placeholders(column["placeholders"], declared, is_string, label, path)
         if nested and "sharedAttribute" in column:
             self.error(
                 f"{label}.sharedAttribute",
@@ -694,6 +649,74 @@ class _Lint:
                 "a nested field carries no shared attribute: no expression or relationship can "
                 "reach it",
             )
+
+    def formats(
+        self,
+        column: Mapping[str, Any],
+        declared: str,
+        is_string: bool,
+        label: str,
+        path: Tuple[Any, ...],
+    ) -> None:
+        """Item 13 on one column: a string column, masks in the grammar, no overlap."""
+        where, at = f"{label}.identifierFormat", path + ("identifierFormat",)
+        if not is_string:
+            self.error(
+                where,
+                at,
+                f"only a string column takes an identifier format; this one is {declared}",
+            )
+        formats = column["identifierFormat"]
+        alternatives = []
+        for k, entry in enumerate(formats):
+            try:
+                alternatives.append(_masks.alternative(entry))
+            except _masks.MaskError as bad:
+                self.error(f"{where}[{k}]", at + (k,), str(bad))
+        if len(alternatives) == len(formats):
+            clash = _masks.overlap(alternatives)
+            if clash is not None:
+                i, j, example = clash
+                self.error(
+                    where,
+                    at,
+                    f"alternatives {i} and {j} overlap: {example!r} has both formats, so a value "
+                    "would not say which alternative made it",
+                    "make the alternatives differ in a literal, or in length",
+                )
+        if any(
+            str(as_dict(r).get("type") or "").strip().lower() == "regex"
+            for r in as_list(column.get("validationRules"))
+        ):
+            self.note(
+                where,
+                at,
+                "the column has both an identifier format and a regex rule: both apply, and only "
+                "the format can be enumerated by a generator",
+            )
+
+    def placeholders(
+        self,
+        block: Mapping[str, Any],
+        declared: str,
+        is_string: bool,
+        label: str,
+        path: Tuple[Any, ...],
+    ) -> None:
+        """Item 14 on one column: a string column, something declared, and its band."""
+        where, at = f"{label}.placeholders", path + ("placeholders",)
+        if not is_string:
+            self.error(
+                where, at, f"only a string column takes placeholders; this one is {declared}"
+            )
+        if not as_list(block.get("values")) and not as_list(block.get("prefixes")):
+            self.error(
+                where,
+                at,
+                "declares neither values nor prefixes, so nothing is a placeholder",
+                "list placeholder values, prefixes or both",
+            )
+        self.band(block, where, at)
 
     # -- 13, 15. relationships ---------------------------------------------------------
 
@@ -958,24 +981,30 @@ class _Lint:
 
     # -- notes ------------------------------------------------------------------------
 
+    def unrelated_pairs(self, expose: Expose, rel: Relationship, target: Expose) -> List[str]:
+        """The column names both ends of ``rel`` carry that nothing relates: not a key of
+        the relationship, not in its sharedColumns, not one shared attribute, and not read on
+        both ends by one invariant."""
+        shared = {c for c in rel.shared_columns if isinstance(c, str)}
+        keys = set(rel.from_columns) | set(rel.to_columns)
+        pairs = []
+        for name in expose.model.columns:
+            if name not in target.model.columns or name in keys or name in shared:
+                continue
+            mine = self.attribute_of.get((expose.expose_id, name))
+            if mine is not None and mine == self.attribute_of.get((target.expose_id, name)):
+                continue
+            if (expose.expose_id, rel.name, name) not in self.related:
+                pairs.append(name)
+        return pairs
+
     def same_named_columns(self) -> None:
         for expose in self.exposes:
             for rel in expose.relationships.values():
                 target = self.by_id.get(rel.to)
                 if target is None or target is expose:
                     continue
-                shared = {c for c in rel.shared_columns if isinstance(c, str)}
-                keys = set(rel.from_columns) | set(rel.to_columns)
-                pairs = []
-                for name in expose.model.columns:
-                    if name not in target.model.columns or name in keys or name in shared:
-                        continue
-                    mine = self.attribute_of.get((expose.expose_id, name))
-                    if mine is not None and mine == self.attribute_of.get((target.expose_id, name)):
-                        continue
-                    if (expose.expose_id, rel.name, name) in self.related:
-                        continue
-                    pairs.append(name)
+                pairs = self.unrelated_pairs(expose, rel, target)
                 if pairs:
                     self.note(
                         expose.relationship_label(rel.name),
