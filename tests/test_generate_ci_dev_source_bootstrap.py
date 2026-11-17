@@ -21,7 +21,6 @@ from __future__ import annotations
 import pytest
 
 from fluid_build.forge.core.pipeline_systems import (
-    PipelineComplexity,
     PipelineConfig,
     PipelineProvider,
     PipelineTemplateGenerator,
@@ -33,7 +32,6 @@ pytestmark = [pytest.mark.unit]
 def _jenkinsfile(install_mode: str) -> str:
     cfg = PipelineConfig(
         provider=PipelineProvider.JENKINS,
-        complexity=PipelineComplexity("standard"),
         install_mode=install_mode,
         sink_platform="snowflake",
     )
@@ -69,18 +67,10 @@ def test_pypi_mode_unaffected():
     assert "data-product-forge" in jf
 
 
-def test_stage8_policy_apply_mode_has_a_shell_default():
-    """Stage 8 must not emit a bare `--mode "$POLICY_APPLY_MODE"`.
-
-    The param is read as a raw shell env var; on the first build after a
-    Jenkinsfile change (or any trigger that doesn't pass it) the param isn't
-    injected, so a bare reference yields `--mode ` (empty) and
-    `fluid policy-apply` rejects it (`invalid choice: ''`). A `:-enforce`
-    shell default — matching the param's own default — keeps it valid.
-    """
+def test_stage8_policy_apply_mode_has_a_default_in_the_environment_block():
+    """Ship reads POLICY_APPLY_MODE from the environment. On the first build after
+    a Jenkinsfile change (or any trigger that does not pass it) the parameter is
+    null, so the environment {} block must fall back to the declared default,
+    which is also what ship defaults to: a blank would be refused by ship."""
     jf = _jenkinsfile("dev-source")
-    assert '--mode "${POLICY_APPLY_MODE}"' not in jf, (
-        "stage 8 emits a bare ${POLICY_APPLY_MODE} — an unset param becomes "
-        "`--mode ` and policy-apply rejects the empty choice."
-    )
-    assert '"${POLICY_APPLY_MODE:-enforce}"' in jf
+    assert "POLICY_APPLY_MODE = \"${params.POLICY_APPLY_MODE == null ? 'enforce' : " in jf

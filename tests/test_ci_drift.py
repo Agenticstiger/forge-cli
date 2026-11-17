@@ -39,10 +39,9 @@ from fluid_build.forge.core.pipeline_templates import PipelineTemplateGenerator
 def _generate_and_record(
     product_root: Path,
     provider: str = "github_actions",
-    complexity: str = "standard",
 ) -> tuple[dict, list[Path], CIStateDocument]:
     """Helper: generate, write, and persist ci-state — mimics slice 7's flow."""
-    config = build_pipeline_config(provider=provider, complexity=complexity)
+    config = build_pipeline_config(provider=provider)
     files = PipelineTemplateGenerator().generate_pipeline(config)
     written = write_pipeline_files(
         files,
@@ -52,9 +51,6 @@ def _generate_and_record(
     )
     doc = build_ci_state_payload(
         provider=provider,
-        complexity=complexity,
-        environments=list(config.environments or []),
-        options={},
         written_files=written,
         product_root=product_root,
         body_contents=files,
@@ -77,32 +73,47 @@ class TestLoadCIState:
         state = load_ci_state(tmp_path)
         assert state is not None
         assert state.provider == "github_actions"
-        assert state.complexity == "standard"
+        assert state.add_ons == []
         assert len(state.files) >= 1
         assert state.files[0].get("sha256")
 
     def test_rejects_wrong_kind(self, tmp_path: Path):
         product_ci_state_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
         product_ci_state_path(tmp_path).write_text(
-            json.dumps(
-                {"kind": "NotCIState", "provider": "github_actions", "complexity": "standard"}
-            )
+            json.dumps({"kind": "NotCIState", "provider": "github_actions"})
         )
         assert load_ci_state(tmp_path) is None
 
     def test_rejects_invalid_provider(self, tmp_path: Path):
         product_ci_state_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
         product_ci_state_path(tmp_path).write_text(
-            json.dumps({"kind": "CIState", "provider": None, "complexity": "standard"})
+            json.dumps({"kind": "CIState", "provider": None})
         )
         assert load_ci_state(tmp_path) is None
 
+    def test_reads_a_record_written_before_one_pipeline_shape(self, tmp_path: Path):
+        """An old record has ``complexity`` and no ``add_ons``: the key is ignored."""
+        _generate_and_record(tmp_path)
+        path = product_ci_state_path(tmp_path)
+        raw = json.loads(path.read_text())
+        raw.pop("add_ons", None)
+        raw.update({"complexity": "advanced", "environments": ["dev"], "options": {}})
+        path.write_text(json.dumps(raw))
+
+        state = load_ci_state(tmp_path)
+
+        assert state is not None
+        assert state.provider == "github_actions"
+        assert state.add_ons == []
+        assert "complexity" not in state.to_payload()
+        assert len(state.files) >= 1
+
     def test_round_trip_through_load(self, tmp_path: Path):
-        _, _, original = _generate_and_record(tmp_path, "gitlab_ci", "basic")
+        _, _, original = _generate_and_record(tmp_path, "gitlab_ci")
         loaded = load_ci_state(tmp_path)
         assert loaded is not None
         assert loaded.provider == original.provider
-        assert loaded.complexity == original.complexity
+        assert loaded.add_ons == original.add_ons
         assert len(loaded.files) == len(original.files)
 
 
@@ -218,7 +229,6 @@ class TestCIStateDocumentRecordedSha:
     def test_returns_sha_for_known_path(self):
         doc = CIStateDocument(
             provider="github_actions",
-            complexity="standard",
             files=[{"path": "a.yml", "sha256": "abc"}],
         )
         assert doc.recorded_sha("a.yml") == "abc"
@@ -226,7 +236,6 @@ class TestCIStateDocumentRecordedSha:
     def test_returns_none_for_unknown_path(self):
         doc = CIStateDocument(
             provider="github_actions",
-            complexity="standard",
             files=[{"path": "a.yml", "sha256": "abc"}],
         )
         assert doc.recorded_sha("b.yml") is None
@@ -234,7 +243,6 @@ class TestCIStateDocumentRecordedSha:
     def test_handles_missing_sha_field(self):
         doc = CIStateDocument(
             provider="github_actions",
-            complexity="standard",
             files=[{"path": "a.yml"}],
         )
         assert doc.recorded_sha("a.yml") is None

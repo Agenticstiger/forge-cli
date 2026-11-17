@@ -3,11 +3,13 @@
 
 """``fluid ship`` as the canonical 11-stage pipeline runner.
 
-Five layers:
+Ship is the only implementation of the 11 stages; a generated CI file is a
+thin wrapper that runs ``fluid ship --stage N`` (tests/forge/core/
+pipeline_systems/test_thin_wrappers.py).
 
-1. Parity: the shell bodies generated CI files ran (``_stage_specs``) are run
-   against a fake ``fluid`` and the argv they record must equal the argv ship
-   builds, stage by stage. This is what keeps the two from drifting.
+Layers:
+
+1. The flags the generated pipelines no longer carry.
 2. Unit: stage selection, flag/env precedence, skips, preconditions, exit codes.
 3. CI-native output for GitHub, GitLab, Azure and plain.
 4. The JSON and JUnit run reports.
@@ -23,7 +25,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -35,12 +36,8 @@ import pytest
 import fluid_build
 from fluid_build.cli import _ci_output, ship
 from fluid_build.cli import _ship_stages as st
-from fluid_build.forge.core.pipeline_systems._base import (
-    PipelineComplexity,
-    PipelineConfig,
-    PipelineProvider,
-)
-from fluid_build.forge.core.pipeline_systems.github_actions import GitHubActionsTemplate
+from fluid_build.cli._ship_table import SHIP_VARIABLES
+from fluid_build.forge.core.pipeline_systems import _thin
 
 LOG = logging.getLogger("test_ship")
 
@@ -139,154 +136,50 @@ def ship_run(argv: List[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 1. Parity with _stage_specs
+# 1. The argv of the stages whose flags a generated pipeline no longer carries
 # ---------------------------------------------------------------------------
 
-_FAKE_FLUID = '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$FAKE_DIR/stage-$$.argv"\n'
 
-_CASES = {
-    "amend": dict(mode="amend", build_id="", targets=["datamesh-manager"]),
-    "dry-run": dict(mode="dry-run", build_id="", targets=["datamesh-manager"]),
-    "amend-and-build": dict(
-        mode="amend-and-build",
-        build_id="build_one",
-        targets=["datamesh-manager", "openmetadata"],
-        allow_data_loss=True,
-        no_verify_digest=True,
-        scheduler="airflow",
-        scheduler_destination="/opt/airflow/dags",
-        scheduler_environment_name="env-a",
-        scheduler_location="eu-west1",
-        scheduler_workspace="ws-1",
-        schedule_sync_dry_run=True,
-        env="staging",
-    ),
-    "amend-with-ignored-build-id": dict(
-        mode="amend", build_id="build_one", scheduler="airflow", targets=["datamesh-manager"]
-    ),
-    # Every knob Jenkins exposes, set away from its default.
-    "every-knob": dict(
-        mode="amend",
-        build_id="",
-        targets=["datamesh-manager"],
-        knobs={
-            "VALIDATE_STRICT": "false",
-            "VERIFY_STRICT": "false",
-            "GENERATE_EMIT": "odcs,policies",
-            "DIFF_EXIT_ON_DRIFT": "false",
-            "DIFF_LAST_APPLIED": ".fluid-ci/last-applied/dev.json",
-            "PLAN_HTML": "true",
-            "POLICY_APPLY_MODE": "check",
-        },
-    ),
-    # A pipeline that applies elsewhere: the shell's RUN_STAGE_7_APPLY=false,
-    # ship's --skip-stage apply. A dry-run mode then skips nothing after stage 7.
-    "dry-run-without-apply": dict(
-        mode="dry-run",
-        build_id="",
-        scheduler="airflow",
-        targets=["datamesh-manager"],
-        apply_in_pipeline=False,
-    ),
-    # Only the word false switches apply off; any other value leaves it on.
-    "dry-run-apply-switch-not-false": dict(
-        mode="dry-run",
-        build_id="",
-        targets=["datamesh-manager"],
-        knobs={"RUN_STAGE_7_APPLY": "TRUE"},
-    ),
-}
-
-
-def _shell_argv(
-    tmp: Path, body: str, env: Dict[str, str], bin_dir: Path, num: int
-) -> Optional[List[str]]:
-    record = tmp / f"rec-{num}"
-    shutil.rmtree(record, ignore_errors=True)
-    record.mkdir()
-    full_env = {
-        "PATH": f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin",
-        "FAKE_DIR": str(record),
-        "HOME": str(tmp),
-        **env,
-    }
-    done = subprocess.run(["sh", "-c", body], cwd=tmp, env=full_env, capture_output=True, text=True)
-    assert done.returncode == 0, f"stage {num} shell failed: {done.stderr}"
-    files = list(record.glob("stage-*.argv"))
-    if not files:
-        return None
-    assert len(files) == 1
-    return files[0].read_text().splitlines()
-
-
-@pytest.mark.parametrize("case", sorted(_CASES))
-def test_ship_argv_equals_the_generated_pipeline_shell(case: str, tmp_path: Path) -> None:
-    c = dict(_CASES[case])
-    env_name = str(c.pop("env", "dev"))
-    mode = str(c["mode"])
-    config = PipelineConfig(
-        provider=PipelineProvider.GITHUB_ACTIONS,
-        complexity=PipelineComplexity.BASIC,
-        contract_path="contract.fluid.yaml",
-        fluid_env_default=env_name,
-        apply_mode_default=mode,
-        apply_build_id_default=str(c["build_id"]),
-        scheduler_default=str(c.get("scheduler", "")),
-    )
-    specs = GitHubActionsTemplate()._stage_specs(config)
-    assert [s.num for s in specs] == list(range(1, 12))
-
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    fluid = bin_dir / "fluid"
-    fluid.write_text(_FAKE_FLUID)
-    fluid.chmod(0o755)
-    (tmp_path / "runtime").mkdir()
-    (tmp_path / "runtime/bundle.tgz").write_bytes(b"x")
-    (tmp_path / "runtime/plan.json").write_text("{}")
-    (tmp_path / "dist/artifacts/policy").mkdir(parents=True)
-    (tmp_path / "dist/artifacts/policy/bindings.json").write_text("{}")
-    (tmp_path / "dist/artifacts/schedule").mkdir()
-    (tmp_path / "dist/artifacts/schedule/dag.py").write_text("")
-
-    sh_env: Dict[str, str] = {}
-    if c.get("allow_data_loss"):
-        sh_env["ALLOW_DATA_LOSS"] = "true"
-    if c.get("no_verify_digest"):
-        sh_env["NO_VERIFY_DIGEST"] = "true"
-    sh_env["PUBLISH_TARGETS"] = " ".join(c["targets"])  # type: ignore[arg-type]
-    for key, var in (
-        ("scheduler_destination", "SCHEDULER_DESTINATION"),
-        ("scheduler_environment_name", "SCHEDULER_ENVIRONMENT_NAME"),
-        ("scheduler_location", "SCHEDULER_LOCATION"),
-        ("scheduler_workspace", "SCHEDULER_WORKSPACE"),
-    ):
-        if c.get(key):
-            sh_env[var] = str(c[key])
-    if c.get("schedule_sync_dry_run"):
-        sh_env["SCHEDULE_SYNC_DRY_RUN"] = "true"
-    if c.get("apply_in_pipeline", True) is False:
-        sh_env["RUN_STAGE_7_APPLY"] = "false"
-    knobs: Dict[str, str] = dict(c.get("knobs", {}))  # type: ignore[call-overload]
-    sh_env.update(knobs)
-
-    # Ship reads the environment the shell gets, plus the defaults the template
-    # bakes into the shell: the variables are read alike, not only the argv built.
-    ship_env = {
-        **sh_env,
-        "FLUID_ENV": env_name,
-        "APPLY_MODE": mode,
-        "APPLY_BUILD_ID": str(c["build_id"]),
-        "SCHEDULER": str(c.get("scheduler", "")),
-    }
-    opts = st.resolve_options(parse(["--yes"]), "contract.fluid.yaml", ship_env)
+def test_plan_checks_sovereignty_and_apply_provisions_opentofu(tmp_path: Path) -> None:
+    """The CI file is a thin wrapper, so these two flags live here and nowhere else:
+    a plan checks data sovereignty, and a cloud apply on a fresh runner gets a
+    pinned tofu (``--ensure-opentofu``) rather than relying on the image."""
+    opts = st.resolve_options(parse(["--yes"]), "contract.fluid.yaml", {})
     ws = st.Workspace(tmp_path)
-    for spec in specs:
-        expected = _shell_argv(tmp_path, spec.command, sh_env, bin_dir, spec.num)
-        action = st.build_stage(spec.num, opts, ws)
-        assert action.argv == expected, f"stage {spec.num} {spec.slug} ({case})"
-        if expected is None:
-            assert action.skip_reason, f"stage {spec.num} skipped without a reason"
+    plan = st.build_stage(6, opts, ws).argv or []
+    apply = st.build_stage(7, opts, ws).argv or []
+    assert "--check-sovereignty" in plan
+    assert apply[0] == "apply" and "--ensure-opentofu" in apply and "--yes" in apply
+
+
+def test_the_parameters_a_pipeline_exposes_become_these_flags(tmp_path: Path) -> None:
+    """What a generated file's ALLOW_DATA_LOSS, NO_VERIFY_DIGEST, DIFF_EXIT_ON_DRIFT,
+    PUBLISH_TARGETS and FLUID_ENV mean in argv: the file holds no flag of its own."""
+    env = {
+        "ALLOW_DATA_LOSS": "true",
+        "NO_VERIFY_DIGEST": "true",
+        "PUBLISH_TARGETS": "datahub fluid-command-center",
+        "FLUID_ENV": "staging",
+    }
+    opts = st.resolve_options(parse(["--yes"]), "contract.fluid.yaml", env)
+    ws = st.Workspace(tmp_path)
+
+    def argv(num: int) -> List[str]:
+        return st.build_stage(num, opts, ws).argv or []
+
+    assert argv(1)[-4:] == ["--format", "tgz", "--out", "runtime/bundle.tgz"]
+    assert "--exit-on-drift" in argv(5) and argv(5)[argv(5).index("--env") + 1] == "staging"
+    apply = argv(7)
+    assert "--allow-data-loss" in apply
+    assert "--no-verify-plan-binding" in apply and "--no-verify-federation" in apply
+    assert "--no-verify-digest" not in apply
+    publish = argv(10)
+    assert publish[publish.index("--env") + 1] == "staging"
+    assert publish[publish.index("--format") + 1] == "json"
+    assert [t for t in publish if t.startswith("--target=")] == [
+        "--target=datahub",
+        "--target=fluid-command-center",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1313,24 +1206,6 @@ def test_publish_targets_fall_back_to_the_legacy_catalog_variable() -> None:
     assert st._resolve_targets(["t"], {"CATALOG": "x"}) == ["t"]
 
 
-def test_catalog_fallback_matches_the_generated_shell(tmp_path: Path) -> None:
-    config = PipelineConfig(
-        provider=PipelineProvider.GITHUB_ACTIONS,
-        complexity=PipelineComplexity.BASIC,
-        contract_path="contract.fluid.yaml",
-    )
-    body = GitHubActionsTemplate()._stage_specs(config)[9].command
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    (bin_dir / "fluid").write_text(_FAKE_FLUID)
-    (bin_dir / "fluid").chmod(0o755)
-    shell = _shell_argv(tmp_path, body, {"CATALOG": "datahub"}, bin_dir, 10)
-    opts = st.resolve_options(
-        parse(["contract.fluid.yaml"]), "contract.fluid.yaml", {"CATALOG": "datahub"}
-    )
-    assert shell == st.build_stage(10, opts, st.Workspace(tmp_path)).argv
-
-
 # ---------------------------------------------------------------------------
 # 8. Review round 3: ship's own exit status, opt-in stages under --stage, the
 #    report's scope, and a workspace that is not what ship expects
@@ -1654,11 +1529,7 @@ def test_a_dry_run_apply_in_an_earlier_step_does_not_make_a_failure_partial(
 
 
 def test_stage_toggles_are_the_generated_pipelines_parameter_names() -> None:
-    config = PipelineConfig(
-        provider=PipelineProvider.GITHUB_ACTIONS, complexity=PipelineComplexity.BASIC
-    )
-    specs = GitHubActionsTemplate()._stage_specs(config)
-    assert st.STAGE_TOGGLES == {spec.num: spec.toggle_param for spec in specs}
+    assert st.STAGE_TOGGLES == {stage.num: stage.toggle for stage in _thin.stages()}
 
 
 def test_a_stage_switched_off_is_skipped_with_stage_too(
@@ -1879,3 +1750,39 @@ def test_stage_three_switched_off_lets_stage_four_skip(
     stage4 = _report(work)["stages"][3]
     assert stage4["status"] == "skipped" and "does not exist" in stage4["skip_reason"]
     assert fake.calls == []
+
+
+class _RecordingEnv(dict):  # type: ignore[type-arg]
+    """An empty environment that records every name it is asked for."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: set = set()
+
+    def get(self, key, default=None):  # type: ignore[no-untyped-def,override]
+        self.seen.add(key)
+        return super().get(key, default)
+
+    def __getitem__(self, key):  # type: ignore[no-untyped-def]
+        self.seen.add(key)
+        return super().__getitem__(key)
+
+    def __contains__(self, key):  # type: ignore[no-untyped-def,override]
+        self.seen.add(key)
+        return super().__contains__(key)
+
+    def __eq__(self, other: object) -> bool:
+        # Equal to another recorder with the same items that was asked the same names.
+        return (
+            isinstance(other, _RecordingEnv)
+            and dict(self) == dict(other)
+            and self.seen == other.seen
+        )
+
+
+def test_ship_variables_are_what_ship_reads() -> None:
+    # A generated wrapper passes SHIP_VARIABLES through: none may be missing.
+    env = _RecordingEnv()
+    st.resolve_options(parse([]), "c", env)
+    st.stage_switches(env)
+    assert env.seen == set(SHIP_VARIABLES) | set(st.STAGE_TOGGLES.values())

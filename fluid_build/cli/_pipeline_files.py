@@ -10,6 +10,7 @@ DO-NOT-EDIT provenance header and records the files in ``ci-state.json``
 """
 
 import hashlib
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -18,7 +19,6 @@ from fluid_build.cli.artifact_paths import CI_HEADER_SCHEMA
 from fluid_build.cli.console import cprint, success
 
 from ..forge.core.pipeline_templates import (
-    PipelineComplexity,
     PipelineConfig,
     PipelineProvider,
 )
@@ -30,22 +30,20 @@ from ..forge.core.pipeline_templates import (
 
 def build_pipeline_config(
     provider: str,
-    complexity: str = "standard",
-    environments: Optional[List[str]] = None,
     *,
-    enable_approvals: bool = False,
-    enable_security_scan: bool = True,
-    enable_marketplace_publishing: bool = False,
+    add_ons: Sequence[str] = (),
     cloud_auth: Sequence[str] = (),
+    default_branch: Optional[str] = None,
 ) -> PipelineConfig:
     """Coerce string inputs into a :class:`PipelineConfig`.
 
     ``cloud_auth`` is the platforms the pipeline authenticates to keylessly
     (``generate_ci._contract_cloud_auth`` reads them from a contract).
 
-    Passing ``environments=None`` lets :meth:`PipelineConfig.__post_init__`
-    pick complexity-appropriate defaults. Raises ``ValueError`` with a helpful
-    message on unknown provider or complexity.
+    ``add_ons`` are the optional jobs ``fluid generate ci --add`` names; forge
+    passes none. ``default_branch`` is the branch whose pushes apply: the
+    remote's default branch (:func:`detect_default_branch`) unless given.
+    Raises ``ValueError`` with a helpful message on an unknown provider.
     """
     provider_aliases = {
         "circleci": "circle_ci",
@@ -58,22 +56,65 @@ def build_pipeline_config(
             f"Unknown CI provider: {provider!r}. "
             f"Valid: {', '.join(p.value for p in PipelineProvider)}"
         ) from exc
-    try:
-        complexity_enum = PipelineComplexity(complexity)
-    except ValueError as exc:
-        raise ValueError(
-            f"Unknown pipeline complexity: {complexity!r}. "
-            f"Valid: {', '.join(c.value for c in PipelineComplexity)}"
-        ) from exc
     return PipelineConfig(
         provider=provider_enum,
-        complexity=complexity_enum,
-        environments=environments,
-        enable_approvals=enable_approvals,
-        enable_security_scan=enable_security_scan,
-        enable_marketplace_publishing=enable_marketplace_publishing,
+        add_ons=tuple(add_ons),
         cloud_auth=tuple(cloud_auth),
+        default_branch=default_branch or detect_default_branch(),
     )
+
+
+def detect_default_branch(directory: Optional[Path] = None) -> str:
+    """The remote's default branch (``origin/HEAD``) of the repository holding
+    ``directory`` (the current one by default), else ``main``."""
+    command = ["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]
+    if directory is not None:
+        command[1:1] = ["-C", str(directory)]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except (FileNotFoundError, OSError):
+        return "main"
+    ref = result.stdout.strip()
+    return ref.split("/", 1)[1] if result.returncode == 0 and "/" in ref else "main"
+
+
+#: What ``fluid generate ci --complexity`` wrote for GitHub before one pipeline
+#: shape replaced the tiers. Left in place, each still runs beside the new file.
+LEGACY_CI_FILES: Dict[str, tuple] = {
+    "github_actions": tuple(
+        f".github/workflows/{name}.yml"
+        for name in (
+            "fluid-basic",
+            "fluid-standard",
+            "fluid-advanced",
+            "fluid-enterprise",
+            "security",
+            "compliance",
+        )
+    ),
+}
+
+
+def legacy_ci_files(system: str, written: Sequence[str], root: Optional[Path] = None) -> List[str]:
+    """The files an earlier ``generate ci`` wrote that this run did not
+    rewrite, relative to ``root`` (the current directory by default)."""
+    base = root or Path(".")
+    done = set(written)
+    return [p for p in LEGACY_CI_FILES.get(system, ()) if p not in done and (base / p).is_file()]
+
+
+def warn_legacy_ci_files(
+    system: str, written: Sequence[str], root: Optional[Path] = None
+) -> List[str]:
+    """Name, on the console, the legacy files :func:`legacy_ci_files` finds."""
+    left = legacy_ci_files(system, written, root)
+    if left:
+        cprint(
+            "These files are from an earlier fluid generate ci and still run beside the "
+            "new pipeline; delete them: " + ", ".join(left),
+            markup=False,
+        )
+    return left
 
 
 # ---------------------------------------------------------------------------

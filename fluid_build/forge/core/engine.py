@@ -525,10 +525,7 @@ class ForgeEngine:
             rprint("\\n[bold cyan]🚀 CI/CD Pipeline Configuration[/bold cyan]")
 
             # Import pipeline components
-            from .pipeline_templates import (
-                PipelineComplexity,
-                PipelineProvider,
-            )
+            from .pipeline_templates import PipelineProvider
 
             # Provider selection
             providers = [p.value for p in PipelineProvider]
@@ -563,82 +560,11 @@ class ForgeEngine:
             )
             selected_provider = providers[choice - 1]
 
-            # Complexity selection
-            complexities = [c.value for c in PipelineComplexity]
-            complexity_table = Table(show_header=True, header_style="bold magenta")
-            complexity_table.add_column("Option", width=8)
-            complexity_table.add_column("Level", width=15)
-            complexity_table.add_column("Features", width=50)
+            # Store pipeline configuration. One pipeline shape: the security,
+            # compliance and SBOM jobs come later with `fluid generate ci --add`.
+            self.project_config["pipeline_config"] = {"provider": selected_provider}
 
-            complexity_features = {
-                "basic": "Simple validate → apply workflow",
-                "standard": "Full workflow with testing and multi-environment",
-                "advanced": "Multi-environment with approvals and security scanning",
-                "enterprise": "Full governance, compliance, and audit capabilities",
-            }
-
-            for i, complexity in enumerate(complexities, 1):
-                complexity_table.add_row(
-                    str(i),
-                    complexity.title(),
-                    complexity_features.get(complexity, "Pipeline complexity level"),
-                )
-
-            rprint("\\n[bold cyan]Pipeline Complexity Levels:[/bold cyan]")
-            self.console.print(complexity_table)
-
-            complexity_choice = IntPrompt.ask(
-                "Select pipeline complexity",
-                default=2,  # Standard as default
-                choices=[str(i) for i in range(1, len(complexities) + 1)],
-            )
-            selected_complexity = complexities[complexity_choice - 1]
-
-            # Environment configuration
-            environments = []
-            if selected_complexity in ["standard", "advanced", "enterprise"]:
-                env_config = Confirm.ask("Configure multiple environments?", default=True)
-                if env_config:
-                    rprint("\\nEnvironments (press Enter when done):")
-                    while True:
-                        env = Prompt.ask("Environment name", default="")
-                        if not env:
-                            break
-                        environments.append(env)
-
-                    if not environments:
-                        environments = ["dev", "staging", "prod"]
-                        rprint(f"[yellow]Using default environments: {environments}[/yellow]")
-                else:
-                    environments = ["dev"]
-            else:
-                environments = ["dev"]
-
-            # Additional options for advanced/enterprise
-            enable_approvals = False
-            enable_security_scan = True
-            enable_marketplace = False
-
-            if selected_complexity in ["advanced", "enterprise"]:
-                enable_approvals = Confirm.ask(
-                    "Enable manual approval gates for production?", default=True
-                )
-                enable_security_scan = Confirm.ask("Enable security scanning?", default=True)
-                enable_marketplace = Confirm.ask("Enable marketplace publishing?", default=False)
-
-            # Store pipeline configuration
-            self.project_config["pipeline_config"] = {
-                "provider": selected_provider,
-                "complexity": selected_complexity,
-                "environments": environments,
-                "enable_approvals": enable_approvals,
-                "enable_security_scan": enable_security_scan,
-                "enable_marketplace_publishing": enable_marketplace,
-            }
-
-            rprint(
-                f"\\n[green]✅ Pipeline configured: {selected_provider} ({selected_complexity})[/green]"
-            )
+            rprint(f"\\n[green]✅ Pipeline configured: {selected_provider}[/green]")
             return True
 
         except Exception as e:
@@ -969,7 +895,7 @@ class ForgeEngine:
         This method remains as a no-op shim for backward compat and
         to satisfy any test/mock that patches it.  The original
         implementation has been preserved under
-        :meth:`_generate_pipeline_files_legacy` so callers that
+        the former generator so callers that
         explicitly opt into the legacy path still have a reachable
         implementation to invoke.
         """
@@ -978,56 +904,6 @@ class ForgeEngine:
             "since slice UX-H; CI now flows through _scaffold_ci_pipeline."
         )
         return
-
-    def _generate_pipeline_files_legacy(self, target_dir: Path) -> None:
-        """Original slice-pre-UX-H pipeline file generator.
-
-        Preserved so any test fixture or out-of-tree plugin that
-        wants the old behavior can still invoke it explicitly.  The
-        live code path no longer calls this.
-        """
-        try:
-            pipeline_config = self.project_config.get("pipeline_config", {})
-            if not pipeline_config:
-                return
-
-            # Import pipeline components
-            from .pipeline_templates import (
-                PipelineComplexity,
-                PipelineConfig,
-                PipelineProvider,
-                PipelineTemplateGenerator,
-            )
-
-            # Create pipeline configuration
-            config = PipelineConfig(
-                provider=PipelineProvider(pipeline_config["provider"]),
-                complexity=PipelineComplexity(pipeline_config["complexity"]),
-                environments=pipeline_config.get("environments", ["dev"]),
-                enable_approvals=pipeline_config.get("enable_approvals", False),
-                enable_security_scan=pipeline_config.get("enable_security_scan", True),
-                enable_marketplace_publishing=pipeline_config.get(
-                    "enable_marketplace_publishing", False
-                ),
-            )
-
-            # Generate pipeline files
-            generator = PipelineTemplateGenerator()
-            pipeline_files = generator.generate_pipeline(config)
-
-            # Write pipeline files
-            for filename, content in pipeline_files.items():
-                file_path = target_dir / filename
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-
-                with file_path.open("w", encoding="utf-8") as f:
-                    f.write(content)
-
-            rprint(f"[green]✅ Generated {len(pipeline_files)} pipeline files[/green]")
-
-        except Exception as e:
-            logger.error(f"Pipeline generation error: {e}")
-            rprint(f"[yellow]⚠️ Pipeline generation failed: {e}[/yellow]")
 
     def _preview_structure(self, structure: Dict[str, Any]) -> None:
         """Preview folder structure"""

@@ -20,7 +20,6 @@ from typing import Dict, List
 from fluid_build import __version__
 from fluid_build.forge.core.pipeline_templates import (
     BasePipelineTemplate,
-    PipelineComplexity,
     PipelineConfig,
     PipelineProvider,
 )
@@ -28,9 +27,7 @@ from fluid_build.forge.core.pipeline_templates import (
 
 def _run_setup(tmp_path: Path, env: Dict[str, str]) -> List[str]:
     script = BasePipelineTemplate()._render_install_setup(
-        PipelineConfig(
-            provider=PipelineProvider.GITHUB_ACTIONS, complexity=PipelineComplexity.STANDARD
-        )
+        PipelineConfig(provider=PipelineProvider.GITHUB_ACTIONS)
     )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

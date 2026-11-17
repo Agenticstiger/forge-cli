@@ -3,6 +3,7 @@
 
 """Unit tests for fluid_build.cli._pipeline_files (config coercion and the file writer)."""
 
+import inspect
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -13,24 +14,14 @@ from fluid_build.cli._pipeline_files import (
     build_pipeline_config,
     write_pipeline_files,
 )
-from fluid_build.forge.core.pipeline_templates import PipelineComplexity, PipelineProvider
+from fluid_build.forge.core.pipeline_templates import PipelineProvider
 
 
 class TestBuildPipelineConfig:
-    def test_coerces_string_provider_and_complexity(self):
-        config = build_pipeline_config(provider="github_actions", complexity="basic")
+    def test_coerces_string_provider(self):
+        config = build_pipeline_config(provider="github_actions")
         assert config.provider == PipelineProvider.GITHUB_ACTIONS
-        assert config.complexity == PipelineComplexity.BASIC
-
-    def test_none_environments_delegates_to_dataclass_defaults(self):
-        config = build_pipeline_config(provider="jenkins", complexity="basic")
-        assert config.environments == ["dev"]
-
-    def test_explicit_environments_preserved(self):
-        config = build_pipeline_config(
-            provider="gitlab_ci", complexity="advanced", environments=["qa", "prod"]
-        )
-        assert config.environments == ["qa", "prod"]
+        assert config.add_ons == ()
 
     def test_circleci_alias(self):
         config = build_pipeline_config(provider="circleci")
@@ -38,23 +29,18 @@ class TestBuildPipelineConfig:
 
     def test_unknown_provider_raises_valueerror(self):
         with pytest.raises(ValueError, match="Unknown CI provider"):
-            build_pipeline_config(provider="nope", complexity="standard")
+            build_pipeline_config(provider="nope")
 
-    def test_unknown_complexity_raises_valueerror(self):
-        with pytest.raises(ValueError, match="Unknown pipeline complexity"):
-            build_pipeline_config(provider="jenkins", complexity="nope")
+    def test_add_ons_plumbed_through(self):
+        config = build_pipeline_config(provider="github_actions", add_ons=["security", "sbom"])
+        assert config.add_ons == ("security", "sbom")
 
-    def test_flags_plumbed_through(self):
-        config = build_pipeline_config(
-            provider="github_actions",
-            complexity="enterprise",
-            enable_approvals=True,
-            enable_security_scan=False,
-            enable_marketplace_publishing=True,
-        )
-        assert config.enable_approvals
-        assert not config.enable_security_scan
-        assert config.enable_marketplace_publishing
+    def test_cloud_auth_plumbed_through(self):
+        config = build_pipeline_config(provider="github_actions", cloud_auth=["aws"])
+        assert config.cloud_auth == ("aws",)
+
+    def test_complexity_is_gone(self):
+        assert "complexity" not in inspect.signature(build_pipeline_config).parameters
 
 
 class TestPrependHeader:
@@ -100,3 +86,32 @@ class TestWritePipelineFiles:
     def test_returns_paths_in_insertion_order(self, tmp_path: Path):
         written = write_pipeline_files({"a.yml": "1", "b.yml": "2", "c.yml": "3"}, tmp_path)
         assert [p.name for p in written] == ["a.yml", "b.yml", "c.yml"]
+
+
+def test_build_pipeline_config_follows_the_remotes_default_branch(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "fluid_build.cli._pipeline_files.detect_default_branch",
+        lambda directory=None: "develop",
+    )
+    assert build_pipeline_config("github_actions").default_branch == "develop"
+    assert build_pipeline_config("github_actions", default_branch="trunk").default_branch == "trunk"
+
+
+def test_detect_default_branch_outside_a_repository_is_main(tmp_path: Path) -> None:
+    from fluid_build.cli._pipeline_files import detect_default_branch
+
+    assert detect_default_branch(tmp_path) == "main"
+
+
+def test_legacy_ci_files_names_what_the_old_tiers_left(tmp_path: Path) -> None:
+    from fluid_build.cli._pipeline_files import legacy_ci_files
+
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "fluid-standard.yml").write_text("on: push\n")
+    (workflows / "fluid-pipeline.yml").write_text("on: push\n")
+    written = [".github/workflows/fluid-pipeline.yml"]
+    assert legacy_ci_files("github_actions", written, tmp_path) == [
+        ".github/workflows/fluid-standard.yml"
+    ]
+    assert legacy_ci_files("gitlab_ci", written, tmp_path) == []

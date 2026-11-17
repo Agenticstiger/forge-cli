@@ -563,31 +563,3 @@ def banner_lines(cloud_auth: Sequence[str], ci_system_name: str) -> List[str]:
         "  See ``fluid_build.credentials.resolver`` for the full resolver chain.",
     ]
     return lines
-
-
-def env_example_lines(cloud_auth: Sequence[str]) -> List[str]:
-    """``.env.ci.example`` body: the non-secret variables, commented."""
-    platforms = normalize(cloud_auth)
-    lines = [
-        "# Variables for the FLUID pipeline. None of them is a secret:",
-        "# the pipeline holds no static cloud key (keyless OIDC).",
-        "#",
-        "# FLUID Configuration",
-        "FLUID_LOG_LEVEL=INFO",
-        "# CONTRACT=contract.fluid.yaml",
-        "",
-    ]
-    if not platforms:
-        lines += [
-            "# The contract binds no cloud platform, so no cloud variable is needed.",
-            "# Re-run `fluid generate ci` after adding a binding.",
-        ]
-    for platform in platforms:
-        lines += [f"# {platform}: {_WHAT[platform]}"]
-        lines += [f"# {name}={example}" for name, example in VARIABLES[platform]]
-        lines += [
-            f"# {name}={example}  # GitLab only"
-            for name, example in _GITLAB_EXTRA_VARIABLES.get(platform, ())
-        ]
-        lines += [""]
-    return lines

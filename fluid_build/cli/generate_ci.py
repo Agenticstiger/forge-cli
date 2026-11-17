@@ -19,7 +19,7 @@ Usage:
     fluid generate ci --system tekton                   # Tekton (2 files)
     fluid generate ci contract.fluid.yaml               # specify contract
     fluid generate ci --out .github/workflows/ci.yml    # custom output (single-file only)
-    fluid generate ci --complexity advanced             # multi-environment + approvals
+    fluid generate ci --add security --add sbom         # + the security scan and SBOM jobs
 """
 
 from __future__ import annotations
@@ -34,6 +34,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from ._common import CLIError
 from ._io import atomic_write
 from ._logging import info
+
+#: The jobs ``--add`` puts beside the pipeline: pipeline_systems._thin.ADD_ONS,
+#: copied so ``fluid --help`` does not import the templates (a test keeps them equal).
+ADD_ONS = ("security", "compliance", "sbom")
 
 #: ``fluid apply --mode`` values and stage-11 schedulers, for the option
 #: choices (kept here so ``--help`` does not import the template modules).
@@ -99,7 +103,7 @@ _SYSTEM_ALIASES: Dict[str, str] = {
 # warning and keep their canonical paths so downstream tooling can find
 # them by convention.
 _PRIMARY_OUTPUT: Dict[str, str] = {
-    "github_actions": ".github/workflows/fluid-standard.yml",
+    "github_actions": ".github/workflows/fluid-pipeline.yml",
     "gitlab_ci": ".gitlab-ci.yml",
     "jenkins": "Jenkinsfile",
     "azure_devops": "azure-pipelines.yml",
@@ -126,7 +130,7 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
   fluid generate ci --system bitbucket       # Bitbucket Pipelines
   fluid generate ci --system circleci        # CircleCI
   fluid generate ci --system tekton          # Tekton (writes tekton/*.yaml)
-  fluid generate ci --complexity advanced    # multi-env with approvals
+  fluid generate ci --add security --add sbom   # + the security scan and SBOM jobs
   fluid generate ci --system jenkins --fluid-env-default aws   # FLUID_ENV defaults to aws
   fluid generate ci --out .github/workflows/ci.yml   # single-file systems only
         """,
@@ -140,15 +144,29 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         help="CI system (default: gitlab)",
     )
     p.add_argument(
-        "--complexity",
-        choices=["basic", "standard", "advanced", "enterprise"],
-        default="standard",
+        "--add",
+        action="append",
+        choices=list(ADD_ONS),
+        default=None,
+        metavar="ADD_ON",
         help=(
-            "Pipeline complexity (default: standard). "
-            "basic = validate+apply; standard = full workflow with testing; "
-            "advanced = multi-env + approvals; enterprise = + governance/compliance."
+            "Add a job beside the pipeline; repeatable: security (a daily scan with "
+            "OSV-Scanner and fluid policy-check), compliance (a weekly policy report "
+            "and lineage check), sbom (an SBOM of the repository)."
         ),
     )
+    p.add_argument(
+        "--default-branch",
+        default=None,
+        metavar="BRANCH",
+        help=(
+            "The branch whose pushes run apply (stages 7-11); pull requests against "
+            "it run plan (stages 1-6). Default: the remote's default branch "
+            "(origin/HEAD), else main. GitLab reads its own $CI_DEFAULT_BRANCH."
+        ),
+    )
+    # Removed: one pipeline shape now; --add carries the jobs the tiers added.
+    p.add_argument("--complexity", default=None, help=argparse.SUPPRESS)
     p.add_argument(
         "--out",
         help=(
@@ -171,17 +189,17 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         choices=["pypi", "dev-source"],
         default="pypi",
         help=(
-            "How the generated Jenkinsfile installs fluid at build time:\n"
-            "  pypi (default)  production. Stage 0 installs FLUID_PACKAGE_SPEC\n"
-            "                  (this forge-cli version, see --fluid-package-spec)\n"
-            "                  into a venv in the workspace; override it at\n"
-            "                  build time with the FLUID_PACKAGE_SPEC parameter.\n"
-            "  dev-source      lab / contributor only. Installs from a\n"
-            "                  /forge-cli-src bind mount in the Jenkins\n"
-            "                  container. Fails LOUD if the mount is\n"
-            "                  missing — no silent fallback to PyPI.\n"
-            "Only the Jenkins template uses this flag today; other CI\n"
-            "systems ignore it."
+            "How the generated pipeline installs fluid, on every system:\n"
+            "  pypi (default)  production. The install step pip-installs\n"
+            "                  FLUID_PACKAGE_SPEC (this forge-cli version, see\n"
+            "                  --fluid-package-spec); Jenkins puts it in a venv\n"
+            "                  in the workspace. Override it with the\n"
+            "                  FLUID_PACKAGE_SPEC variable (a build parameter on\n"
+            "                  Jenkins and Tekton).\n"
+            "  dev-source      lab / contributor only. Imports fluid from a\n"
+            "                  /forge-cli-src bind mount on the runner, and\n"
+            "                  fails if the mount is missing (no fallback to\n"
+            "                  PyPI)."
         ),
     )
     p.add_argument(
@@ -216,20 +234,6 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
             "Default value for Jenkins parameter RUN_STAGE_10_PUBLISH. "
             "When omitted, generated Jenkinsfiles preserve the current "
             "default of false. Only the Jenkins template consumes this today."
-        ),
-    )
-    p.add_argument(
-        "--publish-include-env",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=(
-            "Whether the generated Jenkins Stage 10 command includes "
-            '``--env \\"${FLUID_ENV:-dev}\\"`` on ``fluid publish``, so the '
-            "catalog gets the contract with the overlay stages 5-9 used. "
-            "Default is TRUE. Pass ``--no-publish-include-env`` when the "
-            "pipeline installs a fluid CLI older than ``fluid publish --env``, "
-            "which rejects the flag. Only the Jenkins template consumes this "
-            "today; the other systems always pass --env."
         ),
     )
     p.add_argument(
@@ -715,10 +719,17 @@ def _is_development_version(version: str) -> bool:
     return parsed.is_devrelease or parsed.local is not None
 
 
+#: Why ``--complexity`` is refused: one pipeline shape replaced its tiers.
+_COMPLEXITY_REMOVED = (
+    "--complexity was removed: fluid generate ci writes one pipeline shape, every stage a "
+    "`fluid ship --stage N` step. Add the jobs the advanced and enterprise tiers carried "
+    "with --add security, --add compliance and --add sbom."
+)
+
+
 def run(args, logger: logging.Logger) -> int:
     try:
         from fluid_build.forge.core.pipeline_templates import (
-            PipelineComplexity,
             PipelineConfig,
             PipelineProvider,
             PipelineTemplateGenerator,
@@ -802,15 +813,12 @@ def run(args, logger: logging.Logger) -> int:
                 {"system": system, "choices": sorted(_SYSTEM_ALIASES.keys())},
             )
 
-        complexity_value = getattr(args, "complexity", "standard") or "standard"
-        try:
-            complexity = PipelineComplexity(complexity_value)
-        except ValueError:
-            raise CLIError(
-                1,
-                "generate_ci_unknown_complexity",
-                {"complexity": complexity_value},
-            )
+        if getattr(args, "complexity", None) is not None:
+            raise CLIError(2, "generate_ci_complexity_removed", {"message": _COMPLEXITY_REMOVED})
+        add_ons = tuple(getattr(args, "add", None) or ())
+        from fluid_build.cli._pipeline_files import detect_default_branch, warn_legacy_ci_files
+
+        default_branch = getattr(args, "default_branch", None) or detect_default_branch()
 
         contract_path = getattr(args, "contract", None) or "contract.fluid.yaml"
         workdir, pipeline_contract = _pipeline_location(contract_path)
@@ -830,7 +838,6 @@ def run(args, logger: logging.Logger) -> int:
         )
         verify_strict_default_arg = getattr(args, "verify_strict_default", None)
         publish_stage_default_arg = getattr(args, "publish_stage_default", None)
-        publish_include_env_arg = getattr(args, "publish_include_env", None)
 
         # Engine context drives the bootstrap stage's per-engine pip
         # install. Parsing failures degrade gracefully — the bootstrap
@@ -865,7 +872,8 @@ def run(args, logger: logging.Logger) -> int:
 
         config = PipelineConfig(
             provider=provider,
-            complexity=complexity,
+            add_ons=add_ons,
+            default_branch=default_branch,
             workdir=workdir,
             contract_path=pipeline_contract,
             fluid_package_spec=fluid_package_spec or None,
@@ -890,9 +898,6 @@ def run(args, logger: logging.Logger) -> int:
             ),
             publish_stage_default=(
                 False if publish_stage_default_arg is None else bool(publish_stage_default_arg)
-            ),
-            publish_include_env=(
-                True if publish_include_env_arg is None else bool(publish_include_env_arg)
             ),
         )
         try:
@@ -957,6 +962,10 @@ def run(args, logger: logging.Logger) -> int:
         # CI file expects. Only emitted for systems that actually
         # consume the install-mode flag (currently Jenkins only); for
         # other systems it's a no-op.
+        left = warn_legacy_ci_files(canonical, list(files))
+        if left:
+            info(logger, "generate_ci_legacy_files", files=left)
+
         if canonical == "jenkins":
             from fluid_build.forge.core.pipeline_systems.jenkins import JenkinsTemplate
 

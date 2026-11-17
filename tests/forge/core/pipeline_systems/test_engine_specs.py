@@ -428,7 +428,6 @@ def test_every_emitter_consumes_engine_runtime_for_airbyte(system_name):
     ``_engine_specs.py`` automatically reaches every CI emitter.
     """
     from fluid_build.forge.core.pipeline_systems._base import (
-        PipelineComplexity,
         PipelineConfig,
         PipelineProvider,
     )
@@ -469,7 +468,6 @@ def test_every_emitter_consumes_engine_runtime_for_airbyte(system_name):
 
     cfg = PipelineConfig(
         provider=PipelineProvider.GITHUB_ACTIONS,
-        complexity=PipelineComplexity.BASIC,
         engine="airbyte",
         source_kind="postgres",
         sink_platform="snowflake",
@@ -501,7 +499,6 @@ def test_every_emitter_skips_runtime_block_for_pure_python_engines(system_name):
     import importlib
 
     from fluid_build.forge.core.pipeline_systems._base import (
-        PipelineComplexity,
         PipelineConfig,
         PipelineProvider,
     )
@@ -538,7 +535,6 @@ def test_every_emitter_skips_runtime_block_for_pure_python_engines(system_name):
 
     cfg = PipelineConfig(
         provider=PipelineProvider.GITHUB_ACTIONS,
-        complexity=PipelineComplexity.BASIC,
         engine="dlt",
         source_kind="postgres",
         sink_platform="snowflake",

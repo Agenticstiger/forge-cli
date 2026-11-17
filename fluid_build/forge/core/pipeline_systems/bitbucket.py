@@ -1,277 +1,249 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""BitbucketTemplate — per-system template for Bitbucket CI.
+"""BitbucketTemplate: the thin ``fluid ship`` pipeline for Bitbucket Pipelines.
 
-Extracted from the monolithic ``pipeline_templates.py`` so each CI system's
-quirks stay contained. Inherits the 11-stage rendering scaffold from
-:class:`fluid_build.forge.core.pipeline_systems._base.BasePipelineTemplate`.
+``pull-requests: '**'`` runs the plan step, ``fluid ship --stage 1-6``. The
+default branch runs the plan step, then an apply step, ``fluid ship --stage
+7-11 --yes``, that is a ``deployment`` with ``trigger: manual``: the pipeline
+waits at it until someone presses Run, and the deployment environment's
+permissions and variables apply. The ``custom:`` pipeline ``fluid`` is the
+manual run (Run pipeline) with the same two steps. The plan step's
+``runtime/`` and ``dist/artifacts/`` are step artifacts, which the apply step
+receives and a reviewer can download.
+
+Bitbucket has no step-level environment block, so the shell environment is
+built from the repository and deployment variables, with each generated
+default applied only where a variable is unset (``export NAME="${NAME:-x}"``,
+a checked literal at generation time). Ship reads the result from the
+environment; no variable is expanded inside a script body.
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List, Optional
+import shlex
+from typing import Any, Dict, List, Tuple
 
-try:
-    import yaml
-except ImportError:
-    # Fallback YAML implementation
-    class _YamlFallback:
-        def dump(self, data, **kwargs):
-            return json.dumps(data, indent=kwargs.get("indent", 2))
-
-        def dump_all(self, documents, **kwargs):
-            results = []
-            for doc in documents:
-                results.append(self.dump(doc, **kwargs))
-            return "\n---\n".join(results)
-
-    yaml = _YamlFallback()  # type: ignore[assignment]
-
+from . import _keyless, _thin
 from ._base import (
-    PINNED_ACTIONS,
     BasePipelineTemplate,
-    PipelineComplexity,
     PipelineConfig,
-    PipelineProvider,
-    StageSpec,
-    _pin_action,
+    check_pipeline_literal,
+    check_pipeline_workdir,
+)
+
+PIPELINE_PATH = "bitbucket-pipelines.yml"
+IMAGE = "python:3.12-slim"
+CUSTOM_PIPELINE = "fluid"
+#: The stage knobs ship reads, each with its own default when blank.
+STAGE_KNOBS: Tuple[str, ...] = (
+    "VALIDATE_STRICT",
+    "VERIFY_STRICT",
+    "GENERATE_EMIT",
+    "DIFF_EXIT_ON_DRIFT",
+    "DIFF_LAST_APPLIED",
+    "PLAN_HTML",
+    "POLICY_APPLY_MODE",
 )
 
 
 class BitbucketTemplate(BasePipelineTemplate):
     """Bitbucket Pipelines template"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.provider_name = "Bitbucket Pipelines"
-
-    def _generate_eleven_stage(self, config: PipelineConfig) -> Dict[str, str]:
-        """Emit the canonical 11-stage pipeline as ``bitbucket-pipelines.yml``.
-
-        Uses ``pipelines.custom.fluid-11-stage`` so operators launch it
-        from the Bitbucket UI "Run pipeline" menu and get the
-        ``variables:`` prompt to fill in CONTRACT, FLUID_ENV, APPLY_MODE,
-        etc. Each step runs a single ``[ "$RUN_STAGE_N_SLUG" = "true" ]
-        && <body> || echo 'skipped'`` gate — Bitbucket doesn't support
-        per-step ``when:`` conditionals in ``custom:`` pipelines, so
-        the gating happens at shell level. Empty params stay empty (the
-        underlying fluid CLI re-validates).
-
-        Workdir: ``cd "$WORKDIR"`` is prepended in every step via the
-        ``_render_stage_command`` helper.
-
-        Install-mode: Bitbucket is hosted-only; ``dev-source`` mode is
-        unsupported here and the emit falls back to a ``pypi`` install
-        with a banner comment directing operators to bake forge-cli
-        into a custom image if they need dev-source parity.
-        """
-        # Build variables prompt list — Bitbucket's "custom:" pipelines
-        # take a list of {name, default?, description?} entries.
-        variables_prompt: List[Dict[str, Any]] = []
-        for name, _kind, default, description in self._eleven_stage_parameters(config):
-            v: Dict[str, Any] = {"name": name}
-            if default:
-                v["default"] = default
-            if description:
-                v["description"] = description
-            variables_prompt.append(v)
-
-        setup_script = self._render_install_setup(config)
-
-        # Each stage is one step with a gate
-        stage_steps: List[Dict[str, Any]] = []
-        stage_steps.append(
-            {
-                "step": {
-                    "name": "Setup fluid",
-                    "image": "python:3.12-slim",
-                    "script": [setup_script],
-                }
-            }
-        )
-        for spec in self._stage_specs(config):
-            body = self._render_stage_command(spec, config)
-            # Gate at shell level — Bitbucket custom pipelines don't
-            # expose per-step when: clauses. The ``|| echo`` branch
-            # keeps the step exit-0 when skipped.
-            gate = f'[ "${spec.toggle_param}" = "true" ]'
-            if spec.num == 11:
-                gate = f'[ "${spec.toggle_param}" = "true" ] && [ -n "$SCHEDULER" ]'
-            gated = (
-                f'{gate} && ({body}) || echo "[fluid] stage {spec.num} ({spec.display}) skipped"'
-            )
-            stage_steps.append(
-                {
-                    "step": {
-                        "name": f"{spec.num} \u00b7 {spec.display}",
-                        "image": "python:3.12-slim",
-                        "script": [setup_script, gated],
-                    }
-                }
-            )
-
-        pipeline: Dict[str, Any] = {
-            "image": "python:3.12-slim",
-            "pipelines": {
-                "custom": {
-                    "fluid-11-stage": [
-                        {"variables": variables_prompt},
-                        *stage_steps,
-                    ]
-                }
-            },
-        }
-        banner = self._credential_banner(
-            cloud_auth=config.cloud_auth,
-            comment_prefix="# ",
-            ci_system_name="Bitbucket Pipelines",
-            secret_surface_hint=(
-                "Repository settings \u2192 Pipelines \u2192 Repository variables. "
-                "Mark Secured for credential values."
-            ),
-        )
-        content = banner + json.dumps(pipeline, indent=2, default=str)
-        return {"bitbucket-pipelines.yml": content}
+        self.file_extensions = [".yml"]
 
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
-        """Generate Bitbucket pipeline"""
+        return {PIPELINE_PATH: self._header(config) + _thin.render_yaml(self._pipeline(config))}
 
-        commands = self._get_fluid_commands(config)
-        # Engine specs registry — per-engine pip extras, env vars,
-        # runtime notes. Each Bitbucket step is isolated so pip install
-        # repeats; ``_install_cmd`` keeps that consistent.
-        engine_pip = self._engine_pip_install_command(config)
-        _install_cmd = (
-            f"pip install --quiet data-product-forge && {engine_pip}"
-            if engine_pip
-            else "pip install --quiet data-product-forge"
-        )
-        engine_env = self._engine_runtime_env_vars(config)
+    # ------------------------------------------------------------------
+    # The pipeline
+    # ------------------------------------------------------------------
 
-        pipeline = {
-            "image": "python:3.12-slim",
-            "definitions": {
-                "steps": [
-                    {
-                        "step": {
-                            "name": "Validate",
-                            "script": [
-                                _install_cmd,
-                                commands["doctor"],
-                                commands["validate"],
-                            ],
-                        }
-                    },
-                    {
-                        "step": {
-                            "name": "Plan",
-                            "script": [commands["plan"]],
-                            "artifacts": ["plan.json"],
-                        }
-                    },
-                    {
-                        "step": {
-                            "name": "Test",
-                            "script": [commands["test"], commands["contract_test"]],
-                        }
-                    },
-                ]
-            },
+    @staticmethod
+    def _branch(config: PipelineConfig) -> str:
+        return config.default_branch  # checked by PipelineConfig
+
+    def _pipeline(self, config: PipelineConfig) -> Dict[str, Any]:
+        branch = self._branch(config)
+        add_ons = _thin.check_add_ons(config.add_ons)
+        custom: Dict[str, Any] = {
+            CUSTOM_PIPELINE: [
+                {"variables": self._prompt(config)},
+                self._plan_step(config),
+            ]
+        }
+        # Security beside every plan, the SBOM beside the plan on the default
+        # branch (a parallel group: neither waits for the other); compliance
+        # (fluid verify, which reaches the cloud, with the same variables apply
+        # has) in its own manual pipeline. Bitbucket has no advisory step, so a
+        # failed security scan also stops the apply step after it.
+        beside_pr = [self._add_on_step(config, a) for a in add_ons if a == "security"]
+        beside_branch = [self._add_on_step(config, a) for a in add_ons if a != "compliance"]
+        if "compliance" in add_ons:
+            custom[f"{CUSTOM_PIPELINE}-compliance"] = [self._add_on_step(config, "compliance")]
+        pull_requests = self._beside(self._plan_step(config), beside_pr)
+        on_branch = [
+            *self._beside(self._plan_step(config), beside_branch),
+            self._apply_step(config),
+        ]
+        return {
+            "image": IMAGE,
             "pipelines": {
-                "branches": {"main": [{"step": "Validate"}, {"step": "Plan"}, {"step": "Test"}]}
+                "pull-requests": {"**": pull_requests},
+                "branches": {branch: on_branch},
+                "custom": custom,
             },
         }
 
-        # Add deployment steps for each environment
-        for env in config.environments:
-            deploy_step = {
-                "step": {
-                    "name": f"Deploy to {env.upper()}",
-                    "deployment": env,
-                    "script": [
-                        f"FLUID_ENV={env} {commands['apply']}",
-                        f"FLUID_ENV={env} {commands['contract_test']}",
-                    ],
+    @staticmethod
+    def _beside(plan: Dict[str, Any], others: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [{"parallel": [plan, *others]}] if others else [plan]
+
+    def _prompt(self, config: PipelineConfig) -> List[Dict[str, Any]]:
+        """The Run pipeline form: every parameter but the contract path."""
+        prompt: List[Dict[str, Any]] = []
+        for name, kind, default, description in self._eleven_stage_parameters(config):
+            if name == "CONTRACT" or name in _thin.INSTALL_VARIABLES:
+                continue  # the contract is written into the commands; install knobs never run-time
+            entry: Dict[str, Any] = {"name": name}
+            if default:
+                entry["default"] = default
+            entry["description"] = description
+            if kind == "boolean":
+                entry["allowed-values"] = ["true", "false"]
+            elif kind.startswith("choice:"):
+                options = kind.split(":", 1)[1].split(",")
+                if "" not in options:  # blank is a value (SCHEDULER: none): free text
+                    entry["allowed-values"] = options
+            prompt.append(entry)
+        for knob in STAGE_KNOBS:
+            prompt.append(
+                {
+                    "name": knob,
+                    "description": f"Passed to fluid ship ({knob}); blank keeps ship's default.",
                 }
-            }
+            )
+        return prompt
 
-            if env == "prod":
-                deploy_step["step"]["trigger"] = "manual"
+    def _environment_script(self, config: PipelineConfig) -> str:
+        """Each generated default, applied where the variable is unset, then the
+        run id both steps share. Defaults are checked literals, written inside
+        double quotes, so none can expand or end the quoting."""
+        lines = ["set -eu"]
+        for name, _kind, default, _description in self._eleven_stage_parameters(config):
+            if name == "CONTRACT" or not default:
+                continue
+            safe = check_pipeline_literal(f"{name} default", default)
+            lines.append(f'export {name}="${{{name}:-{safe}}}"')
+        # One run id for both steps, so their ship stages share one report.
+        lines.append('export FLUID_RUN_ID="${FLUID_RUN_ID:-$BITBUCKET_BUILD_NUMBER}"')
+        for key, value in self._engine_runtime_env_vars(config).items():
+            lines.append(f"export {key}={shlex.quote(str(value))}")
+        return "\n".join(lines) + "\n"
 
-            pipeline["pipelines"]["branches"]["main"].append(deploy_step)
-
-        # Airflow DAG sync — self-gates on AIRFLOW_DAGS_DEST env var.
-        pipeline["pipelines"]["branches"]["main"].append(
-            {"step": {"name": "Airflow DAG Sync", "script": [commands["airflow_sync"]]}}
+    def _step(self, config: PipelineConfig, name: str, spec: str, *, yes: bool) -> Dict[str, Any]:
+        command = _thin.ship_command(
+            spec, contract=config.contract_path or _thin.DEFAULT_CONTRACT, yes=yes
         )
+        cd = f'cd "{check_pipeline_workdir(config.workdir)}"\n' if config.workdir else ""
+        return {
+            "name": name,
+            "image": IMAGE,
+            "script": [
+                _keyless.LiteralStr(self._environment_script(config)),
+                # A subshell: its `set -eu` and `set --` stay out of later lines.
+                _keyless.LiteralStr("(\n" + self._render_install_setup(config) + "\n)\n"),
+                _keyless.LiteralStr(cd + command + "\n"),
+            ],
+        }
 
-        # Security + compliance audit step — only emitted for
-        # ADVANCED / ENTERPRISE complexity tiers per the 11-stage
-        # parity contract. The script body carries the canonical
-        # security/scan/policy/audit/vulnerability keywords so CI
-        # search and assertions both succeed.
-        audit = self._security_audit_block(config.complexity)
-        if audit:
-            audit_comment = "\n".join(f"# {ln}" for ln in audit["comment"])
-            audit_step = {
-                "step": {
-                    "name": audit["name"],
-                    "script": [
-                        _install_cmd,
-                        audit_comment,
-                        audit["body"],
-                    ],
-                    "artifacts": ["runtime/compliance-report.json", "runtime/osv-results.sarif"],
-                }
-            }
-            pipeline["pipelines"]["branches"]["main"].append(audit_step)
+    def _plan_step(self, config: PipelineConfig) -> Dict[str, Any]:
+        step = self._step(config, "fluid plan (stages 1-6)", "1-6", yes=False)
+        prefix = f"{check_pipeline_workdir(config.workdir).rstrip('/')}/" if config.workdir else ""
+        # What the apply step receives and what a reviewer downloads.
+        step["artifacts"] = [f"{prefix}{path}**" for path in _thin.CARRIED_PATHS]
+        return {"step": step}
 
-        # Add publishing step (catalog push + visualize + OPDS export)
-        publish_step = {
+    def _add_on_step(self, config: PipelineConfig, add_on: str) -> Dict[str, Any]:
+        cd = f'cd "{check_pipeline_workdir(config.workdir)}"\n' if config.workdir else ""
+        script = "\n".join(
+            _thin.add_on_script(add_on, config.contract_path or _thin.DEFAULT_CONTRACT)
+        )
+        prefix = f"{check_pipeline_workdir(config.workdir).rstrip('/')}/" if config.workdir else ""
+        return {
             "step": {
-                "name": "Publish",
+                "name": _thin.ADD_ON_TITLES[add_on],
+                "image": IMAGE,
                 "script": [
-                    commands["publish_catalog"],
-                    commands["visualize"],
-                    commands["publish_odps"],
+                    _keyless.LiteralStr(self._environment_script(config)),
+                    _keyless.LiteralStr("(\n" + self._render_install_setup(config) + "\n)\n"),
+                    _keyless.LiteralStr(cd + script + "\n"),
                 ],
-                "artifacts": ["pipeline-viz.html", "dependency-graph.png", "odps-catalog.json"],
+                "artifacts": [f"{prefix}runtime/**"],
             }
         }
 
-        if config.enable_marketplace_publishing:
-            publish_step["step"]["script"].append(commands["marketplace_publish"])
-            publish_step["step"]["trigger"] = "manual"
+    def _deployment(self, config: PipelineConfig) -> str:
+        """Bitbucket has test, staging and production until someone adds more."""
+        env = self._pipeline_defaults(config)["FLUID_ENV"].lower()
+        if env in ("dev", "test"):
+            return "test"
+        if env in ("staging", "stage"):
+            return "staging"
+        return "production"
 
-        pipeline["pipelines"]["branches"]["main"].append(publish_step)
+    def _apply_step(self, config: PipelineConfig) -> Dict[str, Any]:
+        step = self._step(config, "fluid apply (stages 7-11)", "7-11", yes=True)
+        # A person presses Run; until then the pipeline waits. The deployment
+        # environment carries its own variables and permissions.
+        step["deployment"] = self._deployment(config)
+        step["trigger"] = "manual"
+        return {"step": step}
 
+    # ------------------------------------------------------------------
+    # Header
+    # ------------------------------------------------------------------
+
+    def _header(self, config: PipelineConfig) -> str:
+        branch = self._branch(config)
+        env_default = self._pipeline_defaults(config)["FLUID_ENV"]
+        lines = [
+            "fluid pipeline, generated by `fluid generate ci --system bitbucket`.",
+            "Each step runs `fluid ship --stage ...` (see `fluid ship --help`).",
+            "",
+            "A pull request runs the plan step (stages 1-6) and keeps runtime/ as a step",
+            f"artifact. A push to {branch} runs it too, then waits at the apply step",
+            "(stages 7-11), a deployment with trigger: manual that someone starts; you can",
+            f"also run the {branch} pipeline by hand on that branch. It never runs on a pull",
+            "request. Run pipeline > Custom: fluid is a manual plan only (stages 1-6): it",
+            "asks for the values below and cannot apply from any branch.",
+            "",
+            f"The apply step deploys to the Bitbucket environment `{self._deployment(config)}`, from",
+            f"FLUID_ENV's default ({env_default}): dev or test gives test, staging or stage gives",
+            "staging, anything else gives production. Create or rename the environment under",
+            "Repository settings > Deployments, and restrict it to the default branch there.",
+            "",
+            "FLUID_PACKAGE_SPEC, FLUID_PIP_INDEX_URL, FLUID_PIP_EXTRA_INDEX_URL and",
+            "FLUID_ALLOW_PRERELEASE are not prompts: set them as repository or deployment",
+            "variables in the project settings, never at run time.",
+            "",
+            "Every other value is a repository or deployment variable of the same name;",
+            "where it is unset the default written in the first script line of each step",
+            "applies. RUN_STAGE_<N>_<NAME>=false switches a stage off (10 and 11 are off",
+            "until set to true).",
+        ]
+        header = "".join(f"# {line}".rstrip() + "\n" for line in lines) + "\n"
         banner = self._credential_banner(
-            cloud_auth=config.cloud_auth,
             comment_prefix="# ",
             ci_system_name="Bitbucket Pipelines",
             secret_surface_hint=(
-                "Repository Settings → Repository Variables (or Deployment "
-                "Variables for env-scoped secrets). Secured variables are "
-                "auto-injected as env vars for every step."
+                "Repository settings > Pipelines > Repository variables (or Deployment "
+                "variables for env-scoped secrets). Mark Secured for credential values."
             ),
+            cloud_auth=config.cloud_auth,
         )
-        # Bitbucket Pipelines doesn't have a top-level env block; per-step
-        # env can be set via `step: { env: { K: V } }`. We emit the engine
-        # env vars as a comment for now since the lab's pre-2/3 contracts
-        # use Jenkins, and a Bitbucket-side first-class wiring is a
-        # follow-up. Operators copy these into per-step `env:` as needed.
-        engine_env_comment = ""
-        if engine_env:
-            engine_env_comment = "\n# Engine env vars (copy into per-step `env:`):\n" + "".join(
-                f"#   {k}: '{v}'\n" for k, v in engine_env.items()
-            )
-        runtime_notes = self._engine_runtime_notes(config, indent="# ")
-        notes_block = ("\n" + runtime_notes + "\n") if runtime_notes else ""
-        return {
-            "bitbucket-pipelines.yml": banner
-            + notes_block
-            + engine_env_comment
-            + yaml.dump(pipeline, indent=2)
-        }
+        notes = self._engine_runtime_notes(config)
+        return header + banner + (notes + "\n" if notes else "")

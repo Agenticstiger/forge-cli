@@ -1154,7 +1154,7 @@ def _finish_agent_run(
 
 
 def _scaffold_ci(request: AuthoringRequest, args: Any, console: Any) -> None:
-    """``--ci`` / ``--ci-complexity`` after a contract is kept, the way blank mode runs it.
+    """``--ci`` after a contract is kept, the way blank mode runs it.
 
     With nobody at the keyboard and no ``--ci``, the scaffolder skips without asking.
     ``--agent`` runs skip it: the caller runs ``fluid generate ci`` itself, as in blank mode.

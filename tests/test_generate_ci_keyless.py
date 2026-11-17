@@ -31,9 +31,8 @@ import yaml
 from fluid_build.cli.generate_ci import _contract_cloud_auth
 from fluid_build.cli.generate_ci import run as generate_ci_run
 from fluid_build.forge.core.pipeline_systems import PipelineConfig, PipelineProvider, _keyless
-from fluid_build.forge.core.pipeline_systems._base import PINNED_ACTIONS, PipelineComplexity
-from fluid_build.forge.core.pipeline_systems.github_actions import GitHubActionsTemplate
-from fluid_build.forge.core.pipeline_systems.gitlab_ci import GitLabCITemplate
+from fluid_build.forge.core.pipeline_systems._base import PINNED_ACTIONS
+from fluid_build.forge.core.pipeline_systems._thin import ADD_ONS
 
 pytestmark = pytest.mark.unit
 
@@ -90,14 +89,14 @@ def _write(path: Path, contract: dict, overlay: dict | None = None) -> None:
         (path / "overlays" / "prod.yaml").write_text(yaml.safe_dump(overlay), encoding="utf-8")
 
 
-def _generate(tmp_path: Path, monkeypatch, system: str, complexity: str) -> Dict[str, str]:
+def _generate(tmp_path: Path, monkeypatch, system: str, add_ons: tuple = ()) -> Dict[str, str]:
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("FLUID_ENV", raising=False)
     args = argparse.Namespace(
         system=system,
         out=None,
         contract="contract.fluid.yaml",
-        complexity=complexity,
+        add=list(add_ons),
         provider=None,
     )
     assert generate_ci_run(args, _LOG) == 0
@@ -165,91 +164,79 @@ def test_all_platforms_in_wiring_order(tmp_path, monkeypatch):
 
 # ── GitHub Actions ──────────────────────────────────────────────────────────
 
+_WORKFLOW = ".github/workflows/fluid-pipeline.yml"
 
-def _cloud_files(tmp_path, monkeypatch, system, complexity):
+
+def _cloud_files(tmp_path, monkeypatch, system, add_ons=()):
     _write(
         tmp_path,
         _contract(*_ALL_CLOUDS, reference="vault://kv/pg#password"),
     )
-    return _generate(tmp_path, monkeypatch, system, complexity)
+    return _generate(tmp_path, monkeypatch, system, add_ons)
 
 
 def _uses(job: dict) -> list:
     return [s["uses"] for s in job["steps"] if "uses" in s]
 
 
-def _step_names(job: dict) -> list:
-    return [s.get("name", "") for s in job["steps"]]
-
-
-@pytest.mark.parametrize("complexity", ["standard", "advanced", "enterprise"])
-def test_github_deploy_jobs_authenticate_keylessly(tmp_path, monkeypatch, complexity):
-    files = _cloud_files(tmp_path, monkeypatch, "github", complexity)
-    wf = _workflow(files, ".github/workflows/fluid-standard.yml")
+def test_github_both_phases_authenticate_keylessly(tmp_path, monkeypatch):
+    files = _cloud_files(tmp_path, monkeypatch, "github", ADD_ONS)
+    wf = _workflow(files, _WORKFLOW)
 
     assert wf["permissions"] == {}
-    deploy = [name for name in wf["jobs"] if name.startswith("deploy-")]
-    assert deploy
-    for name in deploy:
-        job = wf["jobs"][name]
-        assert job["permissions"] == {"contents": "read", "id-token": "write"}
+    assert set(wf["jobs"]) == {"plan", "apply"}
+    for name, job in wf["jobs"].items():
+        assert job["permissions"] == {"contents": "read", "id-token": "write"}, name
         uses = " ".join(_uses(job))
-        assert "aws-actions/configure-aws-credentials@" in uses
-        assert "google-github-actions/auth@" in uses
+        assert "aws-actions/configure-aws-credentials@" in uses, name
+        assert "google-github-actions/auth@" in uses, name
         assert job["env"]["DATABRICKS_AUTH_TYPE"] == "github-oidc"
         assert job["env"]["DATABRICKS_HOST"] == "${{ vars.DATABRICKS_HOST }}"
         assert job["env"]["DATABRICKS_CLIENT_ID"] == "${{ vars.DATABRICKS_CLIENT_ID }}"
         assert job["env"]["SNOWFLAKE_ACCOUNT"] == "${{ vars.SNOWFLAKE_ACCOUNT }}"
         assert job["env"]["FLUID_VAULT_JWT_ROLE"] == "${{ vars.OPENBAO_JWT_ROLE }}"
         assert job["env"]["BAO_ADDR"] == "${{ vars.BAO_ADDR }}"
-        # Every login step runs before the first fluid command.
-        first_fluid = next(i for i, s in enumerate(job["steps"]) if "fluid" in s.get("run", ""))
+        # Every login step runs before the first ship step.
+        first_ship = next(i for i, s in enumerate(job["steps"]) if "fluid ship" in s.get("run", ""))
         auth = [
             i
             for i, s in enumerate(job["steps"])
             if "Authenticate" in s.get("name", "") or "OIDC" in s.get("name", "")
         ]
-        assert len(auth) == 4 and max(auth) < first_fluid
+        assert len(auth) == 4 and max(auth) < first_ship, name
     _assert_no_static_key(files)
 
 
-def test_github_least_privilege_for_jobs_that_never_touch_the_cloud(tmp_path, monkeypatch):
-    files = _cloud_files(tmp_path, monkeypatch, "github", "standard")
-    wf = _workflow(files, ".github/workflows/fluid-standard.yml")
-    for name, job in wf["jobs"].items():
-        if name.startswith("deploy-"):
-            continue
-        assert "id-token" not in job["permissions"], name
-        assert "env" not in job or "DATABRICKS_AUTH_TYPE" not in job["env"], name
+def test_github_least_privilege_for_add_on_jobs_that_never_touch_the_cloud(tmp_path, monkeypatch):
+    files = _cloud_files(tmp_path, monkeypatch, "github", ADD_ONS)
+    security = _workflow(files, ".github/workflows/fluid-security.yml")["jobs"]["security"]
+    assert "id-token" not in security["permissions"]
+    assert "DATABRICKS_AUTH_TYPE" not in security.get("env", {})
+    assert not [u for u in _uses(security) if "configure-aws-credentials" in u]
+    # The SBOM job's id-token is for the attestation, not for a cloud.
+    sbom = _workflow(files, ".github/workflows/fluid-sbom.yml")["jobs"]["sbom"]
+    assert not [u for u in _uses(sbom) if "configure-aws-credentials" in u or "auth@" in u]
+    _assert_no_static_key(files)
 
 
-def test_github_enterprise_compliance_verify_is_keyless_and_scheduled_only(tmp_path, monkeypatch):
-    files = _cloud_files(tmp_path, monkeypatch, "github", "enterprise")
-    wf = _workflow(files, ".github/workflows/compliance.yml")
-    audit = wf["jobs"]["compliance-audit"]
+def test_github_compliance_verify_is_keyless_and_scheduled_only(tmp_path, monkeypatch):
+    files = _cloud_files(tmp_path, monkeypatch, "github", ("compliance",))
+    wf = _workflow(files, ".github/workflows/fluid-compliance.yml")
+    audit = wf["jobs"]["compliance"]
     assert audit["permissions"] == {"contents": "read", "id-token": "write"}
     assert "aws-actions/configure-aws-credentials@" in " ".join(_uses(audit))
     # It reaches the cloud, so it must not run on pull requests.
-    assert "pull_request" not in wf.get("on", wf.get(True))
-    # The security workflow never touches the cloud.
-    security = _workflow(files, ".github/workflows/security.yml")
-    assert "id-token" not in security["jobs"]["security-scan"]["permissions"]
+    assert set(wf.get("on", wf.get(True))) == {"schedule", "workflow_dispatch"}
     _assert_no_static_key(files)
 
 
-def test_github_basic_single_job_is_keyless(tmp_path, monkeypatch):
-    files = _cloud_files(tmp_path, monkeypatch, "github", "basic")
-    wf = _workflow(files, ".github/workflows/fluid-pipeline.yml")
-    job = wf["jobs"]["fluid-pipeline"]
-    assert job["permissions"] == {"contents": "read", "id-token": "write"}
-    assert wf["permissions"] == {}
-    _assert_no_static_key(files)
+def _snowflake_step(files) -> dict:
+    wf = _workflow(files, _WORKFLOW)
+    return next(s for s in wf["jobs"]["apply"]["steps"] if "Snowflake" in s.get("name", ""))
 
 
 def test_github_snowflake_step_is_wif_from_a_masked_token_file(tmp_path, monkeypatch):
-    files = _cloud_files(tmp_path, monkeypatch, "github", "standard")
-    wf = _workflow(files, ".github/workflows/fluid-standard.yml")
-    step = next(s for s in wf["jobs"]["deploy-dev"]["steps"] if "Snowflake" in s.get("name", ""))
+    step = _snowflake_step(_cloud_files(tmp_path, monkeypatch, "github"))
     run = step["run"]
     assert "audience=snowflakecomputing.com" in run
     assert "ACTIONS_ID_TOKEN_REQUEST_URL" in run and "ACTIONS_ID_TOKEN_REQUEST_TOKEN" in run
@@ -277,9 +264,7 @@ def test_github_snowflake_step_is_wif_from_a_masked_token_file(tmp_path, monkeyp
 def test_the_github_token_script_keeps_the_last_token_when_a_refresh_fails(tmp_path, monkeypatch):
     """The generated step, run with stand-ins for curl and sleep: the first token is
     written 0600 and masked, the one refresh gets no token, and the file keeps it."""
-    files = _cloud_files(tmp_path, monkeypatch, "github", "standard")
-    wf = _workflow(files, ".github/workflows/fluid-standard.yml")
-    step = next(s for s in wf["jobs"]["deploy-dev"]["steps"] if "Snowflake" in s.get("name", ""))
+    step = _snowflake_step(_cloud_files(tmp_path, monkeypatch, "github"))
     fakes, state, runner_temp = (tmp_path / name for name in ("bin", "state", "runner"))
     for directory in (fakes, state, runner_temp):
         directory.mkdir()
@@ -328,40 +313,44 @@ def test_the_github_token_script_keeps_the_last_token_when_a_refresh_fails(tmp_p
 
 
 def test_github_openbao_step_uses_the_audience_variable(tmp_path, monkeypatch):
-    files = _cloud_files(tmp_path, monkeypatch, "github", "standard")
-    wf = _workflow(files, ".github/workflows/fluid-standard.yml")
-    step = next(s for s in wf["jobs"]["deploy-dev"]["steps"] if "OpenBao" in s.get("name", ""))
-    assert step["env"] == {"OIDC_AUDIENCE": "${{ vars.OPENBAO_JWT_AUDIENCE }}"}
-    assert "FLUID_VAULT_JWT_FILE=$token_file" in step["run"]
-    assert "::add-mask::" in step["run"] and "umask 077" in step["run"]
-    assert step["if"] == _keyless.GITHUB_HAS_ID_TOKEN
+    files = _cloud_files(tmp_path, monkeypatch, "github")
+    wf = _workflow(files, _WORKFLOW)
+    for job_name in ("plan", "apply"):
+        step = next(s for s in wf["jobs"][job_name]["steps"] if "OpenBao" in s.get("name", ""))
+        assert step["env"] == {"OIDC_AUDIENCE": "${{ vars.OPENBAO_JWT_AUDIENCE }}"}
+        assert "FLUID_VAULT_JWT_FILE=$token_file" in step["run"]
+        assert "::add-mask::" in step["run"] and "umask 077" in step["run"]
+        assert step["if"] == _keyless.GITHUB_HAS_ID_TOKEN
 
 
 def test_github_banner_carries_the_cloud_side_and_the_immutable_subject(tmp_path, monkeypatch):
-    files = _cloud_files(tmp_path, monkeypatch, "github", "standard")
-    text = files[".github/workflows/fluid-standard.yml"]
+    files = _cloud_files(tmp_path, monkeypatch, "github")
+    text = files[_WORKFLOW]
     assert "repo:OWNER@OWNER-ID/REPO@REPO-ID" in text
     assert "2026-07-15" in text
     assert "https://token.actions.githubusercontent.com" in text
     assert "WORKLOAD_IDENTITY = (TYPE = OIDC ISSUER" in text
     assert "bao write auth/jwt/config oidc_discovery_url=" in text
     assert "role_type=jwt user_claim=sub" in text and "bound_subject=" in text
-    example = files[".env.ci.example"]
+    # The non-secret variables the jobs read are named in the banner itself.
     for name in ("AWS_ROLE_ARN", "GCP_SA_EMAIL", "SNOWFLAKE_ACCOUNT", "DATABRICKS_CLIENT_ID"):
-        assert name in example
+        assert name in text
     _assert_no_static_key(files)
 
 
 def test_every_generated_github_action_is_pinned_by_sha(tmp_path, monkeypatch):
-    files = _cloud_files(tmp_path, monkeypatch, "github", "enterprise")
+    files = _cloud_files(tmp_path, monkeypatch, "github", ADD_ONS)
+    seen = 0
     for name, text in files.items():
         if not name.endswith(".yml"):
             continue
         for line in text.splitlines():
             if "uses:" in line:
+                seen += 1
                 ref = line.split("uses:", 1)[1].strip()
                 _, _, sha = ref.partition("@")
                 assert len(sha) == 40 and set(sha) <= set("0123456789abcdef"), (name, ref)
+    assert seen
 
 
 def test_the_new_actions_are_in_the_pin_table_with_a_version_comment():
@@ -370,63 +359,38 @@ def test_the_new_actions_are_in_the_pin_table_with_a_version_comment():
     assert not [key for key in PINNED_ACTIONS if key.startswith("azure/login")]
 
 
-def test_github_eleven_stage_job_is_keyless():
-    cfg = PipelineConfig(
-        provider=PipelineProvider.GITHUB_ACTIONS,
-        complexity=PipelineComplexity.STANDARD,
-        cloud_auth=("aws", "gcp", "snowflake", "databricks", "openbao"),
-    )
-    files = GitHubActionsTemplate()._generate_eleven_stage(cfg)
-    text = files[".github/workflows/fluid-pipeline.yml"]
-    wf = yaml.safe_load(text[text.index("{") :])
-    assert wf["permissions"] == {}
-    job = wf["jobs"]["pipeline"]
-    assert job["permissions"] == {"contents": "read", "id-token": "write"}
-    names = _step_names(job)
-    first_stage = next(i for i, n in enumerate(names) if n.startswith("1 "))
-    assert all(i < first_stage for i, n in enumerate(names) if "OIDC" in n or "Authenticate" in n)
-    assert job["env"]["DATABRICKS_AUTH_TYPE"] == "github-oidc"
-    _assert_no_static_key({"fluid-pipeline.yml": text})
-
-
 def test_a_local_only_contract_gets_no_oidc(tmp_path, monkeypatch):
     _write(tmp_path, _contract(_binding("local", path="out.csv")))
-    for complexity in ("basic", "standard", "advanced", "enterprise"):
-        files = _generate(tmp_path, monkeypatch, "github", complexity)
+    for add_ons in ((), ADD_ONS):
+        files = _generate(tmp_path, monkeypatch, "github", add_ons)
         text = "\n".join(files.values())
         for name, content in files.items():
             if name.endswith((".yml", ".yaml")):
                 data = yaml.safe_load(content)
                 for job_name, job in data["jobs"].items():
-                    if job_name == "supply-chain":
+                    if job_name == "sbom":
                         continue  # attestations, not cloud auth
                     assert "id-token" not in (job.get("permissions") or {}), (name, job_name)
         assert "configure-aws-credentials" not in text
         assert "google-github-actions/auth" not in text
         assert "ACTIONS_ID_TOKEN_REQUEST" not in text
-        assert "binds no cloud platform" in text
+        assert "No cloud platform was detected" in text
         _assert_no_static_key(files)
-    cfg = PipelineConfig(
-        provider=PipelineProvider.GITHUB_ACTIONS, complexity=PipelineComplexity.STANDARD
-    )
-    (workflow,) = GitHubActionsTemplate()._generate_eleven_stage(cfg).values()
-    assert "id-token" not in workflow and "ACTIONS_ID_TOKEN_REQUEST" not in workflow
+        for name in list(files):
+            (tmp_path / name).unlink()
 
 
 # ── GitLab CI ───────────────────────────────────────────────────────────────
 
 
-def _gitlab(tmp_path, monkeypatch, complexity):
-    files = _cloud_files(tmp_path, monkeypatch, "gitlab", complexity)
+def _gitlab(tmp_path, monkeypatch, add_ons=()):
+    files = _cloud_files(tmp_path, monkeypatch, "gitlab", add_ons)
     return files, yaml.safe_load(files[".gitlab-ci.yml"])
 
 
-@pytest.mark.parametrize("complexity", ["basic", "standard", "advanced"])
-def test_gitlab_deploy_jobs_get_id_tokens_per_platform(tmp_path, monkeypatch, complexity):
-    files, ci = _gitlab(tmp_path, monkeypatch, complexity)
-    cloud_jobs = [n for n in ci if n in ("apply", "publish") or n.startswith("deploy-")]
-    assert cloud_jobs
-    for name in cloud_jobs:
+def test_gitlab_both_phases_get_id_tokens_per_platform(tmp_path, monkeypatch):
+    files, ci = _gitlab(tmp_path, monkeypatch, ADD_ONS)
+    for name in ("fluid-plan", "fluid-apply"):
         job = ci[name]
         tokens = job["id_tokens"]
         assert tokens["AWS_OIDC_TOKEN"] == {"aud": "sts.amazonaws.com"}
@@ -445,25 +409,22 @@ def test_gitlab_deploy_jobs_get_id_tokens_per_platform(tmp_path, monkeypatch, co
         assert "SNOWFLAKE_TOKEN_FILE_PATH" in script
         assert "FLUID_VAULT_JWT_FILE" in script and "FLUID_VAULT_JWT_ROLE" in script
         assert "umask 077" in script and "mktemp -d" in script
-        # The login lines come before the first fluid command.
-        assert script.index("AWS_WEB_IDENTITY_TOKEN_FILE") < script.index("fluid ")
+        # The login lines come before the ship command.
+        assert script.index("AWS_WEB_IDENTITY_TOKEN_FILE") < script.index("fluid ship")
     _assert_no_static_key(files)
 
 
-def test_gitlab_jobs_that_never_touch_the_cloud_get_no_token(tmp_path, monkeypatch):
-    _, ci = _gitlab(tmp_path, monkeypatch, "standard")
-    for name, job in ci.items():
-        if (
-            isinstance(job, dict)
-            and "stage" in job
-            and not (name.startswith("deploy-") or name == "publish")
-        ):
-            assert "id_tokens" not in job, name
+def test_gitlab_add_on_jobs_that_never_touch_the_cloud_get_no_token(tmp_path, monkeypatch):
+    _, ci = _gitlab(tmp_path, monkeypatch, ADD_ONS)
+    for name in ("fluid-security", "fluid-sbom"):
+        assert "id_tokens" not in ci[name], name
+    # fluid verify reaches the cloud: the compliance job logs in like apply does.
+    assert set(ci["fluid-compliance"]["id_tokens"]) == set(ci["fluid-apply"]["id_tokens"])
 
 
 def test_gitlab_gcp_credential_file_is_valid_json_for_the_sdk(tmp_path, monkeypatch):
-    _, ci = _gitlab(tmp_path, monkeypatch, "standard")
-    line = next(s for s in ci["deploy-dev"]["script"] if "external_account" in s)
+    _, ci = _gitlab(tmp_path, monkeypatch)
+    line = next(s for s in ci["fluid-apply"]["script"] if "external_account" in s)
     template = line.split("printf '", 1)[1].split("' ", 1)[0]
     rendered = template.replace("%s", "X")
     data = json.loads(rendered)
@@ -472,31 +433,10 @@ def test_gitlab_gcp_credential_file_is_valid_json_for_the_sdk(tmp_path, monkeypa
     assert data["token_url"] == "https://sts.googleapis.com/v1/token"
 
 
-def test_gitlab_eleven_stage_tokens_only_on_cloud_stages():
-    cfg = PipelineConfig(
-        provider=PipelineProvider.GITLAB_CI,
-        complexity=PipelineComplexity.STANDARD,
-        cloud_auth=("aws", "snowflake"),
-    )
-    files = GitLabCITemplate()._generate_eleven_stage(cfg)
-    text = files[".gitlab-ci.yml"]
-    ci = yaml.safe_load(text[text.index("{") :])
-    with_tokens = {n for n, j in ci.items() if isinstance(j, dict) and "id_tokens" in j}
-    assert with_tokens == {
-        "stage-5-diff",
-        "stage-7-apply",
-        "stage-8-policy-apply",
-        "stage-9-verify",
-        "stage-10-publish",
-        "stage-11-schedule-sync",
-    }
-    _assert_no_static_key({".gitlab-ci.yml": text})
-
-
 def test_a_local_only_contract_gets_no_gitlab_token(tmp_path, monkeypatch):
     _write(tmp_path, _contract(_binding("local", path="out.csv")))
-    for complexity in ("basic", "standard", "advanced"):
-        files = _generate(tmp_path, monkeypatch, "gitlab", complexity)
+    for add_ons in ((), ADD_ONS):
+        files = _generate(tmp_path, monkeypatch, "gitlab", add_ons)
         assert "id_tokens" not in files[".gitlab-ci.yml"]
         _assert_no_static_key(files)
 
@@ -508,7 +448,7 @@ def test_a_local_only_contract_gets_no_gitlab_token(tmp_path, monkeypatch):
     "system", ["jenkins", "azure", "bitbucket", "circleci", "tekton", "github", "gitlab"]
 )
 def test_no_system_suggests_a_static_cloud_key(tmp_path, monkeypatch, system):
-    files = _cloud_files(tmp_path, monkeypatch, system, "standard")
+    files = _cloud_files(tmp_path, monkeypatch, system)
     _assert_no_static_key(files)
     for name, text in files.items():
         for needle in ("GOOGLE_APPLICATION_CREDENTIALS=/", "sa-key", "aws-access-key"):
@@ -516,7 +456,7 @@ def test_no_system_suggests_a_static_cloud_key(tmp_path, monkeypatch, system):
 
 
 def test_jenkins_says_it_has_no_native_oidc(tmp_path, monkeypatch):
-    files = _cloud_files(tmp_path, monkeypatch, "jenkins", "standard")
+    files = _cloud_files(tmp_path, monkeypatch, "jenkins")
     text = files["Jenkinsfile"]
     assert "Jenkins has no native OIDC" in text
     assert "never commit" in text.lower() or "never commit" in text
@@ -564,7 +504,7 @@ def test_a_build_on_another_cloud_gets_its_own_login(tmp_path):
 
 def test_the_jenkins_header_names_credentials_binding_not_keyless(tmp_path, monkeypatch):
     _write(tmp_path, _contract(_binding("aws")))
-    text = _generate(tmp_path, monkeypatch, "jenkins", "standard")["Jenkinsfile"]
+    text = _generate(tmp_path, monkeypatch, "jenkins")["Jenkinsfile"]
     lines = text.splitlines()
     header = "\n".join(
         lines[: next(i for i, line in enumerate(lines) if not line.startswith("//"))]
@@ -598,7 +538,7 @@ def test_systems_without_wiring_point_to_their_own_oidc(tmp_path, monkeypatch):
         ("bitbucket", "BITBUCKET_STEP_OIDC_TOKEN"),
         ("circleci", "CIRCLE_OIDC_TOKEN_V2"),
     ):
-        files = _cloud_files(tmp_path, monkeypatch, system, "standard")
+        files = _cloud_files(tmp_path, monkeypatch, system)
         assert needle in "\n".join(files.values()), system
         for name in list(files):
             Path(tmp_path / name).unlink()
@@ -608,11 +548,10 @@ def test_the_pipeline_config_refuses_an_unknown_platform():
     with pytest.raises(ValueError, match="unknown cloud_auth"):
         PipelineConfig(
             provider=PipelineProvider.GITHUB_ACTIONS,
-            complexity=PipelineComplexity.BASIC,
             cloud_auth=("azure",),
         )
 
 
 def test_no_generated_file_leaks_a_cwd_path(tmp_path, monkeypatch):
-    files = _cloud_files(tmp_path, monkeypatch, "gitlab", "standard")
+    files = _cloud_files(tmp_path, monkeypatch, "gitlab")
     assert os.fspath(tmp_path) not in files[".gitlab-ci.yml"]

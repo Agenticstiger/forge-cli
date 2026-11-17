@@ -1382,68 +1382,11 @@ class TestConfigureAdvancedOptions:
 
 
 class TestConfigurePipelineOptions:
-    def _mock_pipeline_imports(self):
-        """Return mock PipelineProvider, PipelineComplexity modules."""
-        mock_provider = MagicMock()
-        mock_provider.__iter__ = MagicMock(
-            return_value=iter(
-                [
-                    MagicMock(value="github_actions"),
-                    MagicMock(value="gitlab_ci"),
-                ]
-            )
-        )
-        mock_complexity = MagicMock()
-        mock_complexity.__iter__ = MagicMock(
-            return_value=iter(
-                [
-                    MagicMock(value="basic"),
-                    MagicMock(value="standard"),
-                    MagicMock(value="advanced"),
-                    MagicMock(value="enterprise"),
-                ]
-            )
-        )
-        return mock_provider, mock_complexity
-
-    def test_basic_pipeline_config_stored(self):
+    def test_provider_is_the_only_question(self):
         engine = _make_engine()
         mock_pp = MagicMock()
-        mock_pp.__iter__ = MagicMock(return_value=iter([MagicMock(value="github_actions")]))
-        mock_pc = MagicMock()
-        mock_pc.__iter__ = MagicMock(return_value=iter([MagicMock(value="basic")]))
-        with (
-            patch(
-                "fluid_build.forge.core.engine.IntPrompt",
-            ) as mock_int_prompt,
-            patch(
-                "fluid_build.forge.core.engine.Confirm",
-            ) as mock_confirm,
-            patch.dict(
-                "sys.modules",
-                {
-                    "fluid_build.forge.core.pipeline_templates": MagicMock(
-                        PipelineProvider=mock_pp,
-                        PipelineComplexity=mock_pc,
-                    )
-                },
-            ),
-        ):
-            # Provider choice=1, complexity choice=1 (basic)
-            mock_int_prompt.ask.side_effect = [1, 1]
-            mock_confirm.ask.return_value = False
-            result = engine._configure_pipeline_options()
-        assert result is True
-        assert "pipeline_config" in engine.project_config
-        assert engine.project_config["pipeline_config"]["complexity"] == "basic"
-
-    def test_standard_complexity_configures_environments(self):
-        engine = _make_engine()
-        mock_pp = MagicMock()
-        mock_pp.__iter__ = MagicMock(return_value=iter([MagicMock(value="github_actions")]))
-        mock_pc = MagicMock()
-        mock_pc.__iter__ = MagicMock(
-            return_value=iter([MagicMock(value="basic"), MagicMock(value="standard")])
+        mock_pp.__iter__ = MagicMock(
+            return_value=iter([MagicMock(value="github_actions"), MagicMock(value="gitlab_ci")])
         )
         with (
             patch("fluid_build.forge.core.engine.IntPrompt") as mock_int_prompt,
@@ -1451,127 +1394,16 @@ class TestConfigurePipelineOptions:
             patch("fluid_build.forge.core.engine.Prompt") as mock_prompt,
             patch.dict(
                 "sys.modules",
-                {
-                    "fluid_build.forge.core.pipeline_templates": MagicMock(
-                        PipelineProvider=mock_pp,
-                        PipelineComplexity=mock_pc,
-                    )
-                },
+                {"fluid_build.forge.core.pipeline_templates": MagicMock(PipelineProvider=mock_pp)},
             ),
         ):
-            mock_int_prompt.ask.side_effect = [1, 2]  # provider=1, complexity=standard
-            # env_config=True, then env names, then empty string to stop
-            mock_confirm.ask.return_value = True
-            mock_prompt.ask.side_effect = ["dev", "prod", ""]
+            mock_int_prompt.ask.side_effect = [2]
             result = engine._configure_pipeline_options()
         assert result is True
-        envs = engine.project_config["pipeline_config"]["environments"]
-        assert "dev" in envs
-        assert "prod" in envs
-
-    def test_environment_defaults_when_user_enters_none(self):
-        engine = _make_engine()
-        mock_pp = MagicMock()
-        mock_pp.__iter__ = MagicMock(return_value=iter([MagicMock(value="github_actions")]))
-        mock_pc = MagicMock()
-        mock_pc.__iter__ = MagicMock(
-            return_value=iter([MagicMock(value="basic"), MagicMock(value="standard")])
-        )
-        with (
-            patch("fluid_build.forge.core.engine.IntPrompt") as mock_int_prompt,
-            patch("fluid_build.forge.core.engine.Confirm") as mock_confirm,
-            patch("fluid_build.forge.core.engine.Prompt") as mock_prompt,
-            patch.dict(
-                "sys.modules",
-                {
-                    "fluid_build.forge.core.pipeline_templates": MagicMock(
-                        PipelineProvider=mock_pp,
-                        PipelineComplexity=mock_pc,
-                    )
-                },
-            ),
-        ):
-            mock_int_prompt.ask.side_effect = [1, 2]  # standard complexity
-            mock_confirm.ask.return_value = True  # configure multiple envs = yes
-            mock_prompt.ask.return_value = ""  # immediately stop — use defaults
-            result = engine._configure_pipeline_options()
-        assert result is True
-        envs = engine.project_config["pipeline_config"]["environments"]
-        assert envs == ["dev", "staging", "prod"]
-
-    def test_no_multi_env_for_standard_uses_single_dev(self):
-        """Line 614: user declines multi-environment config."""
-        engine = _make_engine()
-        mock_pp = MagicMock()
-        mock_pp.__iter__ = MagicMock(return_value=iter([MagicMock(value="github_actions")]))
-        mock_pc = MagicMock()
-        mock_pc.__iter__ = MagicMock(
-            return_value=iter([MagicMock(value="basic"), MagicMock(value="standard")])
-        )
-        with (
-            patch("fluid_build.forge.core.engine.IntPrompt") as mock_int_prompt,
-            patch("fluid_build.forge.core.engine.Confirm") as mock_confirm,
-            patch.dict(
-                "sys.modules",
-                {
-                    "fluid_build.forge.core.pipeline_templates": MagicMock(
-                        PipelineProvider=mock_pp,
-                        PipelineComplexity=mock_pc,
-                    )
-                },
-            ),
-        ):
-            mock_int_prompt.ask.side_effect = [1, 2]  # standard complexity
-            mock_confirm.ask.return_value = False  # decline multi-env
-            result = engine._configure_pipeline_options()
-        assert result is True
-        assert engine.project_config["pipeline_config"]["environments"] == ["dev"]
-
-    def test_advanced_complexity_enables_approval_options(self):
-        """Lines 624-628: advanced complexity triggers approval/security prompts."""
-        engine = _make_engine()
-        mock_pp = MagicMock()
-        mock_pp.__iter__ = MagicMock(return_value=iter([MagicMock(value="github_actions")]))
-        mock_pc = MagicMock()
-        mock_pc.__iter__ = MagicMock(
-            return_value=iter(
-                [
-                    MagicMock(value="basic"),
-                    MagicMock(value="standard"),
-                    MagicMock(value="advanced"),
-                ]
-            )
-        )
-        confirm_answers = iter(
-            [
-                False,  # configure multiple environments? No
-                True,  # enable manual approval gates?
-                True,  # enable security scanning?
-                False,  # enable marketplace publishing?
-            ]
-        )
-        with (
-            patch("fluid_build.forge.core.engine.IntPrompt") as mock_int_prompt,
-            patch("fluid_build.forge.core.engine.Confirm") as mock_confirm,
-            patch.dict(
-                "sys.modules",
-                {
-                    "fluid_build.forge.core.pipeline_templates": MagicMock(
-                        PipelineProvider=mock_pp,
-                        PipelineComplexity=mock_pc,
-                    )
-                },
-            ),
-        ):
-            mock_int_prompt.ask.side_effect = [1, 3]  # advanced complexity (index 3)
-            mock_confirm.ask.side_effect = confirm_answers
-            result = engine._configure_pipeline_options()
-        assert result is True
-        cfg = engine.project_config["pipeline_config"]
-        assert cfg["complexity"] == "advanced"
-        assert cfg["enable_approvals"] is True
-        assert cfg["enable_security_scan"] is True
-        assert cfg["enable_marketplace_publishing"] is False
+        assert engine.project_config["pipeline_config"] == {"provider": "gitlab_ci"}
+        assert mock_int_prompt.ask.call_count == 1
+        mock_confirm.ask.assert_not_called()
+        mock_prompt.ask.assert_not_called()
 
     def test_returns_false_on_import_error(self):
         engine = _make_engine()
@@ -1841,68 +1673,6 @@ class TestGeneratePipelineFiles:
         engine._generate_pipeline_files(tmp_path)
         # No files should have been written
         assert list(tmp_path.iterdir()) == []
-
-    def test_exception_is_caught_and_warned(self, tmp_path):
-        engine = _make_engine()
-        engine.project_config = {
-            "pipeline_config": {
-                "provider": "github_actions",
-                "complexity": "basic",
-                "environments": ["dev"],
-                "enable_approvals": False,
-                "enable_security_scan": True,
-                "enable_marketplace_publishing": False,
-            }
-        }
-        with (
-            patch.dict(
-                "sys.modules",
-                {"fluid_build.forge.core.pipeline_templates": None},
-            ),
-            patch("fluid_build.forge.core.engine.rprint") as mock_rprint,
-        ):
-            # Slice UX-H: the public `_generate_pipeline_files` hook
-            # is now a no-op shim.  Exercise the preserved
-            # `_generate_pipeline_files_legacy` symbol, which still
-            # contains the original try/except/rprint behaviour.
-            engine._generate_pipeline_files_legacy(tmp_path)
-        # Should have printed a warning
-        printed = [str(c) for c in mock_rprint.call_args_list]
-        assert any("warning" in c.lower() or "Pipeline" in c for c in printed)
-
-    def test_writes_pipeline_files_on_success(self, tmp_path):
-        engine = _make_engine()
-        engine.project_config = {
-            "pipeline_config": {
-                "provider": "github_actions",
-                "complexity": "basic",
-                "environments": ["dev"],
-                "enable_approvals": False,
-                "enable_security_scan": True,
-                "enable_marketplace_publishing": False,
-            }
-        }
-        mock_pipeline_gen = MagicMock()
-        mock_pipeline_gen.return_value.generate_pipeline.return_value = {
-            ".github/workflows/ci.yml": "name: CI"
-        }
-        mock_pipeline_provider = MagicMock()
-        mock_pipeline_provider.return_value = "github_actions"
-        mock_pipeline_complexity = MagicMock()
-        mock_pipeline_complexity.return_value = "basic"
-        mock_pipeline_config = MagicMock()
-        mock_module = MagicMock()
-        mock_module.PipelineProvider = mock_pipeline_provider
-        mock_module.PipelineComplexity = mock_pipeline_complexity
-        mock_module.PipelineConfig = mock_pipeline_config
-        mock_module.PipelineTemplateGenerator = mock_pipeline_gen
-        with patch.dict("sys.modules", {"fluid_build.forge.core.pipeline_templates": mock_module}):
-            # Slice UX-H: call the legacy symbol — the shim is a
-            # no-op on the live path now, so the generator can only
-            # be exercised via `_generate_pipeline_files_legacy`.
-            engine._generate_pipeline_files_legacy(tmp_path)
-        # Generator was called
-        mock_pipeline_gen.return_value.generate_pipeline.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

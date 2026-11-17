@@ -429,12 +429,6 @@ def register(subparsers: argparse._SubParsersAction):
         help="Auto-generate a CI/CD pipeline after scaffolding (e.g. 'github_actions'); 'none' skips, 'ask' always prompts",
     )
     parser.add_argument(
-        "--ci-complexity",
-        choices=["basic", "standard", "advanced", "enterprise"],
-        default="standard",
-        help="Complexity of the auto-generated CI pipeline (default: standard)",
-    )
-    parser.add_argument(
         "--no-ci",
         action="store_true",
         help="Skip CI/CD pipeline auto-scaffolding (equivalent to --ci none)",

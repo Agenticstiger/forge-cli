@@ -19,11 +19,11 @@ from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
 from fluid_build.cli._pipeline_files import _comment_prefix_for
 from fluid_build.cli.generate_ci import run as generate_ci_run
 from fluid_build.forge.core.pipeline_templates import (
-    PipelineComplexity,
     PipelineConfig,
     PipelineProvider,
     PipelineTemplateGenerator,
@@ -43,7 +43,7 @@ def _make_args(
     default_publish_target: Optional[str] = None,
     verify_strict_default: Optional[bool] = None,
     publish_stage_default: Optional[bool] = None,
-    publish_include_env: Optional[bool] = None,
+    **extra: Any,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         system=system,
@@ -53,7 +53,7 @@ def _make_args(
         default_publish_target=default_publish_target,
         verify_strict_default=verify_strict_default,
         publish_stage_default=publish_stage_default,
-        publish_include_env=publish_include_env,
+        **extra,
     )
 
 
@@ -62,40 +62,40 @@ def _make_args(
 _GENERATE_CI_EXPECTATIONS = (
     (
         "github",
-        ".github/workflows/fluid-standard.yml",
-        ("name:", "jobs:", "validate:", "runs-on:"),
+        ".github/workflows/fluid-pipeline.yml",
+        ("name:", "jobs:", "plan:", "apply:", "runs-on:", "fluid ship"),
     ),
     (
         "gitlab",
         ".gitlab-ci.yml",
-        ("stages:", "validate:", "image:", "fluid validate"),
+        ("stages:", "fluid-plan:", "fluid-apply:", "image:", "fluid ship"),
     ),
     (
         "jenkins",
         "Jenkinsfile",
-        # 11-stage parameterized template — names are prefixed with stage
-        # number ("2 - validate", "6 - plan") per the perfect-pipeline design.
-        ("pipeline {", "stage('2 - validate')", "stage('6 - plan')", "parameters {", "fluid"),
+        # One stage per pipeline stage, numbered ("2 - validate", "6 - plan"),
+        # each running `fluid ship --stage N`.
+        ("pipeline {", "stage('2 - validate')", "stage('6 - plan')", "parameters {", "fluid ship"),
     ),
     (
         "azure",
         "azure-pipelines.yml",
-        ("stages:", "jobs:", "fluid"),
+        ("stages:", "jobs:", "deployment:", "fluid ship"),
     ),
     (
         "bitbucket",
         "bitbucket-pipelines.yml",
-        ("pipelines:", "step:", "fluid"),
+        ("pipelines:", "step:", "trigger: manual", "fluid ship"),
     ),
     (
         "circleci",
         ".circleci/config.yml",
-        ("version:", "jobs:", "workflows:", "fluid"),
+        ("version:", "jobs:", "workflows:", "type: approval", "fluid ship"),
     ),
     (
         "tekton",
         "tekton/pipeline.yaml",
-        ("apiVersion:", "kind: Pipeline", "fluid"),
+        ("apiVersion:", "kind: Pipeline", "name: fluid-apply", "taskRef:"),
     ),
 )
 
@@ -161,52 +161,45 @@ class TestGenerateCIJenkins:
         assert generate_ci_run(_make_args(), _logger) == 0
 
     def test_default_publish_target_omitted_keeps_datamesh_manager(self, tmp_path, monkeypatch):
-        """Without ``--default-publish-target``, PUBLISH_TARGETS defaults
-        to ``datamesh-manager``, and Stage 10's shell falls back to the same
-        value when a build carries no parameters (a job's first build, or
-        its first after a restart re-seeded it)."""
+        """Without ``--default-publish-target``, PUBLISH_TARGETS defaults to
+        ``datamesh-manager``, and the environment {} block falls back to the same
+        value when a build carries no parameters (a job's first build, or its
+        first after a restart re-seeded it)."""
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()
-        assert "for t in ${PUBLISH_TARGETS:-datamesh-manager}; do" in content
+        assert "params.PUBLISH_TARGETS == null ? 'datamesh-manager'" in content
         assert "name: 'PUBLISH_TARGETS', defaultValue: 'datamesh-manager'" in content
 
-    def test_default_publish_target_opt_in_emits_shell_fallback(self, tmp_path, monkeypatch):
-        """With ``--default-publish-target datamesh-manager``, Stage 10's
-        shell emits ``${PUBLISH_TARGETS:-datamesh-manager}`` so the
-        first Pipeline-from-SCM build Jenkins auto-triggers (before
-        the parameters block is exported as env vars) still publishes
-        to the intended catalog."""
+    def test_default_publish_target_opt_in_reaches_the_parameter_and_its_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """With ``--default-publish-target fluid-command-center`` the parameter
+        default and the environment fallback ship reads are both that value, so
+        the first build Jenkins auto-triggers (before the parameters block is
+        exported) still publishes to the intended catalog."""
         monkeypatch.chdir(tmp_path)
         assert (
             generate_ci_run(_make_args(default_publish_target="fluid-command-center"), _logger) == 0
         )
         content = (tmp_path / "Jenkinsfile").read_text()
-        assert "for t in ${PUBLISH_TARGETS:-fluid-command-center}" in content
-        # The parameter's own default is the same value (it used to stay
-        # datamesh-manager, so Build with Parameters offered another target).
+        assert "params.PUBLISH_TARGETS == null ? 'fluid-command-center'" in content
         assert "name: 'PUBLISH_TARGETS', defaultValue: 'fluid-command-center'" in content
 
     def test_default_publish_target_accepts_arbitrary_catalog(self, tmp_path, monkeypatch):
-        """The flag isn't hard-coded to datamesh-manager — operators on
+        """The flag isn't hard-coded to datamesh-manager: operators on
         Horizon / DataHub / Collibra pick their own primary catalog."""
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(default_publish_target="horizon"), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()
-        assert "for t in ${PUBLISH_TARGETS:-horizon}" in content
+        assert "params.PUBLISH_TARGETS == null ? 'horizon'" in content
 
     def test_default_publish_target_empty_string_treated_as_unset(self, tmp_path, monkeypatch):
-        """An empty or whitespace-only value is treated the same as
-        omitting the flag — bare ``${PUBLISH_TARGETS}`` form, no
-        surprise ``:-`` expansion with nothing on the right side.
-
-        Again we check the actual shell-loop line rather than a bare
-        substring because the template's doc-comment legitimately
-        mentions ``${PUBLISH_TARGETS:-X}`` as an example."""
+        """An empty or whitespace-only value is treated the same as omitting the flag."""
         monkeypatch.chdir(tmp_path)
         assert generate_ci_run(_make_args(default_publish_target="   "), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()
-        assert "for t in ${PUBLISH_TARGETS:-datamesh-manager}; do" in content
+        assert "params.PUBLISH_TARGETS == null ? 'datamesh-manager'" in content
 
     def test_verify_strict_default_override_flips_parameter_default(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -219,25 +212,6 @@ class TestGenerateCIJenkins:
         assert generate_ci_run(_make_args(publish_stage_default=True), _logger) == 0
         content = (tmp_path / "Jenkinsfile").read_text()
         assert "name: 'RUN_STAGE_10_PUBLISH', defaultValue: true" in content
-
-    def test_stage_10_publishes_with_the_env_by_default(self, tmp_path, monkeypatch):
-        """``fluid publish`` takes ``--env``, so stage 10 publishes the overlay
-        stages 5-9 used instead of the base contract."""
-        monkeypatch.chdir(tmp_path)
-        assert generate_ci_run(_make_args(), _logger) == 0
-        content = (tmp_path / "Jenkinsfile").read_text()
-        stage_10 = content[content.index("stage('10 - publish')") :]
-        stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
-        assert '--env "${FLUID_ENV:-dev}"' in stage_10
-
-    def test_publish_include_env_override_omits_stage_10_env_flag(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        assert generate_ci_run(_make_args(publish_include_env=False), _logger) == 0
-        content = (tmp_path / "Jenkinsfile").read_text()
-        assert 'set -- "${CONTRACT:-contract.fluid.yaml}" --format json' in content
-        stage_10 = content[content.index("stage('10 - publish')") :]
-        stage_10 = stage_10[: stage_10.index("stage('11 - schedule sync')")]
-        assert '--env "${FLUID_ENV:-dev}"' not in stage_10
 
 
 class TestGenerateCIStaticSystems:
@@ -290,6 +264,85 @@ class TestGenerateCIStaticSystems:
             ), f"expected token {token!r} missing from custom output for {system}"
 
 
+class TestGenerateCIOptions:
+    """The options ``fluid generate ci`` takes now that every system gets one
+    pipeline shape: ``--add`` for the jobs the tiers carried, ``--default-branch``
+    for the apply trigger, and the removed ``--complexity``."""
+
+    @staticmethod
+    def _run(argv, monkeypatch, tmp_path, capsys):
+        from fluid_build.cli import main as fluid_main
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("COLUMNS", "200")
+        rc = fluid_main(["generate", "ci", "contract.fluid.yaml", *argv])
+        captured = capsys.readouterr()
+        return rc, captured.out + captured.err
+
+    def test_complexity_is_refused_and_names_add(self, tmp_path, monkeypatch, capsys):
+        rc, output = self._run(
+            ["--system", "github", "--complexity", "advanced"], monkeypatch, tmp_path, capsys
+        )
+        assert rc == 2
+        assert "--complexity was removed" in output
+        assert "--add" in output
+        assert not (tmp_path / ".github").exists()  # nothing was written
+
+    def test_add_is_repeatable_and_writes_the_github_add_on_files(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        rc, _ = self._run(
+            ["--system", "github", "--add", "security", "--add", "sbom"],
+            monkeypatch,
+            tmp_path,
+            capsys,
+        )
+        assert rc == 0
+        workflows = sorted(p.name for p in (tmp_path / ".github" / "workflows").iterdir())
+        assert workflows == ["fluid-pipeline.yml", "fluid-sbom.yml", "fluid-security.yml"]
+
+    def test_an_unknown_add_on_is_refused_by_the_parser(self, tmp_path, monkeypatch, capsys):
+        with pytest.raises(SystemExit):
+            self._run(["--system", "github", "--add", "nope"], monkeypatch, tmp_path, capsys)
+
+    def test_a_leftover_tier_file_is_named_in_the_output(self, tmp_path, monkeypatch, capsys):
+        leftover = tmp_path / ".github" / "workflows" / "fluid-standard.yml"
+        leftover.parent.mkdir(parents=True)
+        leftover.write_text("name: old\n", encoding="utf-8")
+        rc, output = self._run(["--system", "github"], monkeypatch, tmp_path, capsys)
+        assert rc == 0
+        assert ".github/workflows/fluid-standard.yml" in output
+        assert leftover.exists()  # named, never deleted for the user
+
+    def test_default_branch_reaches_the_triggers(self, tmp_path, monkeypatch, capsys):
+        rc, _ = self._run(
+            ["--system", "github", "--default-branch", "release"], monkeypatch, tmp_path, capsys
+        )
+        assert rc == 0
+        text = (tmp_path / ".github" / "workflows" / "fluid-pipeline.yml").read_text()
+        triggers = yaml.safe_load(text)
+        triggers = triggers.get("on", triggers.get(True))
+        assert triggers["push"] == {"branches": ["release"]}
+        assert triggers["pull_request"] == {"branches": ["release"]}
+        assert "refs/heads/release" in text and "refs/heads/main" not in text
+
+    def test_default_branch_is_origin_head_else_main(self, tmp_path, monkeypatch, capsys):
+        """Without the option: ``main`` outside a repository with a remote."""
+        rc, _ = self._run(["--system", "github"], monkeypatch, tmp_path, capsys)
+        assert rc == 0
+        text = (tmp_path / ".github" / "workflows" / "fluid-pipeline.yml").read_text()
+        assert "refs/heads/main" in text
+
+    def test_a_branch_name_that_would_break_the_file_is_refused(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        rc, _ = self._run(
+            ["--system", "github", "--default-branch", "a b"], monkeypatch, tmp_path, capsys
+        )
+        assert rc != 0
+        assert not (tmp_path / ".github").exists()
+
+
 # ---------------------------------------------------------------------------
 # 3. Advanced JenkinsTemplate via PipelineTemplateGenerator
 # ---------------------------------------------------------------------------
@@ -302,12 +355,8 @@ class TestJenkinsPipelineTemplateGenerator:
     def generator(self):
         return PipelineTemplateGenerator()
 
-    def _generate(self, generator, complexity="standard", **kwargs):
-        config = PipelineConfig(
-            provider=PipelineProvider.JENKINS,
-            complexity=PipelineComplexity(complexity),
-            **kwargs,
-        )
+    def _generate(self, generator, **kwargs):
+        config = PipelineConfig(provider=PipelineProvider.JENKINS, **kwargs)
         return generator.generate_pipeline(config)
 
     def test_output_contains_jenkinsfile_key(self, generator):
@@ -367,7 +416,7 @@ class TestJenkinsPipelineTemplateGenerator:
         space-separated PUBLISH_TARGETS string parameter."""
         content = self._generate(generator)["Jenkinsfile"]
         assert "name: 'PUBLISH_TARGETS'" in content
-        assert "--target" in content
+        # (the --target flags are ship's: pinned in tests/cli/test_ship_pipeline.py)
 
     def test_output_contains_scheduler_choice(self, generator):
         """Stage 11 schedule-sync exposes --scheduler as a choice with
@@ -389,17 +438,15 @@ class TestJenkinsPipelineTemplateGenerator:
         """Stage 7 destructive-mode gate must be exposed as a param."""
         content = self._generate(generator)["Jenkinsfile"]
         assert "name: 'ALLOW_DATA_LOSS'" in content
-        assert "--allow-data-loss" in content
+        assert "ALLOW_DATA_LOSS = " in content  # ship turns it into --allow-data-loss
 
     def test_output_contains_no_verify_digest_escape_hatch(self, generator):
-        """Stage 7 emergency digest-gate waiver. The single
-        ``NO_VERIFY_DIGEST`` CI-operator param now appends BOTH
-        narrowly-scoped CLI flags so the one knob waives the
-        plan-binding gate and the federation upstream-digest gate."""
+        """Stage 7 emergency digest-gate waiver: one ``NO_VERIFY_DIGEST`` param,
+        which ship turns into BOTH narrowly-scoped flags (the plan-binding gate
+        and the federation upstream-digest gate)."""
         content = self._generate(generator)["Jenkinsfile"]
         assert "name: 'NO_VERIFY_DIGEST'" in content
-        assert "--no-verify-plan-binding" in content
-        assert "--no-verify-federation" in content
+        assert "NO_VERIFY_DIGEST = " in content
         # Old single flag must be fully retired from generated output.
         assert "--no-verify-digest" not in content
 
@@ -407,7 +454,7 @@ class TestJenkinsPipelineTemplateGenerator:
         """Stage 5 --exit-on-drift behavior must be toggleable."""
         content = self._generate(generator)["Jenkinsfile"]
         assert "name: 'DIFF_EXIT_ON_DRIFT'" in content
-        assert "--exit-on-drift" in content
+        assert "DIFF_EXIT_ON_DRIFT = " in content
 
     def test_output_contains_policy_apply_mode(self, generator):
         """Stage 8 must expose check | enforce as a choice."""
@@ -440,12 +487,15 @@ class TestJenkinsPipelineTemplateGenerator:
             "'yaml-single-file' is not a valid `fluid bundle --format` choice "
             "(valid: {yaml, json, tgz}). Template regressed."
         )
-        # And the bundle step itself passes an explicit --format tgz.
-        assert "--format tgz --out runtime/bundle.tgz" in content
+        # (the bundle step's explicit --format tgz is ship's: tests/cli/test_ship_pipeline.py)
 
-    @pytest.mark.parametrize("complexity", ["basic", "standard", "advanced", "enterprise"])
-    def test_all_complexity_levels(self, generator, complexity):
-        result = self._generate(generator, complexity=complexity)
+    @pytest.mark.parametrize(
+        "add_ons",
+        [(), ("security",), ("compliance",), ("sbom",), ("security", "compliance", "sbom")],
+        ids=lambda a: "+".join(a) or "plain",
+    )
+    def test_every_add_on_combination_generates(self, generator, add_ons):
+        result = self._generate(generator, add_ons=add_ons)
         assert "Jenkinsfile" in result
         assert len(result["Jenkinsfile"]) > 0
 
@@ -461,20 +511,19 @@ class TestJenkinsPipelineTemplateGenerator:
 class _JenkinsStage:
     """Parsed representation of a Jenkins stage."""
 
-    __slots__ = ("name", "sh_commands", "when_branch", "has_input", "post_actions")
+    __slots__ = ("name", "sh_commands", "post_actions")
 
     def __init__(self, name: str):
         self.name = name
         self.sh_commands: List[str] = []
-        self.when_branch: Optional[str] = None  # e.g. "main"
-        self.has_input: bool = False
         self.post_actions: List[str] = []  # e.g. ["archiveArtifacts ...", "junit ..."]
 
 
 class _JenkinsPipeline:
     """Minimal parser for a generated Jenkinsfile — enough to extract
-    stage names, ``sh`` commands, ``when`` branch guards, ``input`` gates,
-    and ``post`` actions so we can *simulate* a run.
+    stage names, ``sh`` commands and ``post`` actions so we can *simulate* a
+    run. The apply gate (``Approve apply``, ``lock``, ``changeRequest()``) is
+    pinned structurally in tests/forge/core/pipeline_systems/test_thin_wrappers.py.
     """
 
     def __init__(self, content: str):
@@ -516,15 +565,6 @@ class _JenkinsPipeline:
                     m.group("tsq") or m.group("tdq") or m.group("ssq") or m.group("sdq")
                 )
 
-            # Detect when { branch 'xxx' }
-            when_match = re.search(r"when\s*\{[^}]*branch\s+['\"](\w+)['\"]", body)
-            if when_match:
-                stage.when_branch = when_match.group(1)
-
-            # Detect input gate
-            if "input {" in body or "input{" in body:
-                stage.has_input = True
-
             # Detect post actions
             for m in re.finditer(r"(archiveArtifacts|junit|cleanWs)\b[^}\n]*", body):
                 stage.post_actions.append(m.group(0).strip())
@@ -543,27 +583,15 @@ class _JenkinsPipeline:
 
 
 class _SimulatedJenkinsRunner:
-    """Simulates walking through a parsed Jenkins pipeline, executing
-    ``sh`` commands against a mocked subprocess and honouring ``when``
-    branch guards and ``input`` approval gates.
-    """
+    """Simulates walking through a parsed Jenkins pipeline, executing ``sh``
+    commands in file order against a mocked subprocess."""
 
-    def __init__(
-        self,
-        pipeline: _JenkinsPipeline,
-        *,
-        branch: str = "main",
-        approve_inputs: bool = True,
-        fail_command: Optional[str] = None,
-    ):
+    def __init__(self, pipeline: _JenkinsPipeline, *, fail_command: Optional[str] = None):
         self.pipeline = pipeline
-        self.branch = branch
-        self.approve_inputs = approve_inputs
-        self.fail_command = fail_command  # substring match → exit 1
+        self.fail_command = fail_command  # substring match -> exit 1
 
         # Results
         self.executed_commands: List[str] = []
-        self.skipped_stages: List[str] = []
         self.failed_stage: Optional[str] = None
         self.post_actions_recorded: List[str] = []
         self.cleanup_ran: bool = False
@@ -572,35 +600,22 @@ class _SimulatedJenkinsRunner:
         """Return True if pipeline passed, False if a stage failed."""
         success = True
         for stage in self.pipeline.stages:
-            # -- branch guard --
-            if stage.when_branch and stage.when_branch != self.branch:
-                self.skipped_stages.append(stage.name)
-                continue
-
-            # -- approval gate --
-            if stage.has_input and not self.approve_inputs:
-                self.skipped_stages.append(stage.name)
-                continue
-
-            # -- execute sh commands --
             stage_ok = True
             for cmd in stage.sh_commands:
+                self.executed_commands.append(cmd)
                 if self.fail_command and self.fail_command in cmd:
-                    self.executed_commands.append(cmd)
                     self.failed_stage = stage.name
                     stage_ok = False
                     success = False
                     break
-                self.executed_commands.append(cmd)
 
-            # -- record post actions --
             for action in stage.post_actions:
                 self.post_actions_recorded.append(action)
 
             if not stage_ok:
                 break  # Pipeline halts on first failure
 
-        # -- global post { always } --
+        # -- global post { cleanup } --
         if self.pipeline.global_post_always:
             self.cleanup_ran = True
 
@@ -615,12 +630,7 @@ class TestJenkinsSimulatedRun:
     @pytest.fixture()
     def jenkinsfile(self) -> str:
         gen = PipelineTemplateGenerator()
-        config = PipelineConfig(
-            provider=PipelineProvider.JENKINS,
-            complexity=PipelineComplexity.STANDARD,
-            environments=["dev", "staging", "prod"],
-            enable_marketplace_publishing=True,
-        )
+        config = PipelineConfig(provider=PipelineProvider.JENKINS)
         files = gen.generate_pipeline(config)
         return files["Jenkinsfile"]
 
@@ -631,27 +641,25 @@ class TestJenkinsSimulatedRun:
     # -- happy path --------------------------------------------------------
 
     def test_all_stages_execute_on_main(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main")
+        runner = _SimulatedJenkinsRunner(pipeline)
         assert runner.run() is True
         assert runner.failed_stage is None
         assert len(runner.executed_commands) > 0
 
     def test_fluid_commands_invoked_in_order(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main")
+        runner = _SimulatedJenkinsRunner(pipeline)
         runner.run()
-        cmds = " ".join(runner.executed_commands)
-        # Core fluid commands should appear
-        assert "fluid" in cmds or "fluid_build" in cmds
-        # Validate should come before plan/apply
-        cmd_list = runner.executed_commands
-        validate_idx = next((i for i, c in enumerate(cmd_list) if "validate" in c.lower()), None)
-        plan_idx = next((i for i, c in enumerate(cmd_list) if "plan" in c.lower()), None)
-        assert validate_idx is not None
-        assert plan_idx is not None
-        assert validate_idx < plan_idx
+        ships = [
+            int(m.group(1))
+            for c in runner.executed_commands
+            for m in re.finditer(r"fluid ship \"\$CONTRACT\" --stage (\d+)", c)
+        ]
+        # Each pipeline stage ships exactly once, in order: validate (2) before
+        # plan (6) before apply (7), apply before verify (9).
+        assert ships == list(range(1, 12))
 
     def test_setup_stage_runs_first(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main")
+        runner = _SimulatedJenkinsRunner(pipeline)
         runner.run()
         # First executed command should be from Setup (pip install)
         assert (
@@ -691,58 +699,18 @@ class TestJenkinsSimulatedRun:
     # -- stage failure halts pipeline --------------------------------------
 
     def test_failure_halts_pipeline(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main", fail_command="validate")
+        runner = _SimulatedJenkinsRunner(pipeline, fail_command="--stage 2")
         assert runner.run() is False
         assert runner.failed_stage is not None
-        # Commands after the failing one should NOT have been executed
-        cmds_after_failure = runner.executed_commands[
-            runner.executed_commands.index(
-                next(c for c in runner.executed_commands if "validate" in c)
-            )
-            + 1 :
-        ]
-        # No apply or plan commands after validate failure
-        assert not any("apply" in c for c in cmds_after_failure)
-
-    # -- branch guards -----------------------------------------------------
-
-    def test_non_main_branch_skips_guarded_stages(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="feature/foo")
-        runner.run()
-        # Stages with when { branch 'main' } should be skipped
-        for stage in pipeline.stages:
-            if stage.when_branch == "main":
-                assert stage.name in runner.skipped_stages
-
-    def test_main_branch_does_not_skip_guarded_stages(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main")
-        runner.run()
-        # No stage with when { branch 'main' } should be skipped
-        for stage in pipeline.stages:
-            if stage.when_branch == "main" and not stage.has_input:
-                assert stage.name not in runner.skipped_stages
-
-    # -- approval gate -----------------------------------------------------
-
-    def test_approval_denied_skips_stage(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main", approve_inputs=False)
-        runner.run()
-        # Stages with input gates should be skipped
-        for stage in pipeline.stages:
-            if stage.has_input:
-                assert stage.name in runner.skipped_stages
-
-    def test_approval_granted_runs_stage(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main", approve_inputs=True)
-        runner.run()
-        input_stages = [s for s in pipeline.stages if s.has_input]
-        for stage in input_stages:
-            assert stage.name not in runner.skipped_stages
+        failed = next(c for c in runner.executed_commands if "--stage 2" in c)
+        cmds_after_failure = runner.executed_commands[runner.executed_commands.index(failed) + 1 :]
+        # Nothing after validate ran: no plan, no apply.
+        assert not any("--stage" in c for c in cmds_after_failure)
 
     # -- post actions & cleanup --------------------------------------------
 
     def test_archive_artifacts_recorded(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main")
+        runner = _SimulatedJenkinsRunner(pipeline)
         runner.run()
         all_post = runner.post_actions_recorded
         assert any("archiveArtifacts" in a for a in all_post)
@@ -752,12 +720,12 @@ class TestJenkinsSimulatedRun:
     # run via stage 9 verify which emits a JSON report (not junit XML).
 
     def test_cleanup_always_runs_on_success(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main")
+        runner = _SimulatedJenkinsRunner(pipeline)
         runner.run()
         assert runner.cleanup_ran is True
 
     def test_cleanup_always_runs_on_failure(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main", fail_command="validate")
+        runner = _SimulatedJenkinsRunner(pipeline, fail_command="--stage 2")
         runner.run()
         assert runner.cleanup_ran is True
 
@@ -766,13 +734,10 @@ class TestJenkinsSimulatedRun:
     # --target marketplace). The previous test_marketplace_publish_command_present
     # was dropped along with the standalone marketplace stage.
 
-    def test_marketplace_disabled_no_publish(self):
+    def test_no_marketplace_command_in_the_default_pipeline(self):
+        """Marketplace is a ``--target`` value of ship's stage 10, not a stage."""
         gen = PipelineTemplateGenerator()
-        config = PipelineConfig(
-            provider=PipelineProvider.JENKINS,
-            complexity=PipelineComplexity.STANDARD,
-            enable_marketplace_publishing=False,
-        )
+        config = PipelineConfig(provider=PipelineProvider.JENKINS)
         content = gen.generate_pipeline(config)["Jenkinsfile"]
         pipeline = _JenkinsPipeline(content)
         all_cmds = []
@@ -787,83 +752,76 @@ class TestJenkinsSimulatedRun:
 
 
 class TestGeneratedContractEnvAcrossSystems:
-    """Every generated CI pipeline calls ``fluid validate / plan / apply /
-    contract-tests / publish`` with a contract-path argument. Before the
-    fix, the argument was a bare ``$CONTRACT`` and no CI template's env
-    block injected the var — so Build Now failed on the first shell
-    step. The fix uses ``${CONTRACT:-contract.fluid.yaml}`` in
-    ``_get_fluid_commands()``. This test locks that shape in across all
-    seven supported providers so a regression in any one template is
-    caught.
+    """Every generated CI pipeline names the contract in each ``fluid ship``
+    command. Where the CI system exports parameters to the shell (Jenkins), the
+    command reads ``"$CONTRACT"`` and the ``environment {}`` block defines it
+    with a fallback, so Build Now on a job that has no parameters yet still
+    works; everywhere else the path is written into the command, never read
+    from a variable that no environment block sets. Locked in across all seven
+    providers so a regression in any one template is caught.
     """
 
-    _DEFAULT = "${CONTRACT:-contract.fluid.yaml}"
-    _PRIMARY_FILE = {
-        PipelineProvider.GITHUB_ACTIONS: ".github/workflows/fluid-standard.yml",
-        PipelineProvider.GITLAB_CI: ".gitlab-ci.yml",
-        PipelineProvider.AZURE_DEVOPS: "azure-pipelines.yml",
-        PipelineProvider.JENKINS: "Jenkinsfile",
-        PipelineProvider.BITBUCKET: "bitbucket-pipelines.yml",
-        PipelineProvider.CIRCLE_CI: ".circleci/config.yml",
-        PipelineProvider.TEKTON: "tekton/tasks.yaml",
-    }
+    _PATH = "contracts/p/contract.fluid.yaml"
 
-    @pytest.mark.parametrize("provider", list(_PRIMARY_FILE.keys()))
-    def test_primary_file_uses_default_expansion_not_bare_var(self, provider):
-        cfg = PipelineConfig(
-            provider=provider,
-            complexity=PipelineComplexity.STANDARD,
-            environments=["dev", "prod"],
-        )
+    @pytest.mark.parametrize("provider", list(PipelineProvider), ids=lambda p: p.name)
+    def test_the_contract_is_in_every_ship_command_and_never_bare(self, provider):
+        cfg = PipelineConfig(provider=provider, contract_path=self._PATH)
         files = PipelineTemplateGenerator().generate_pipeline(cfg)
-        primary = files[self._PRIMARY_FILE[provider]]
-
-        # Must contain the default-expansion form at least once.
-        assert self._DEFAULT in primary, (
-            f"{provider.value}: expected {self._DEFAULT!r} in generated "
-            f"{self._PRIMARY_FILE[provider]}"
-        )
-
-        # Must not contain any bare $CONTRACT references (i.e. any
-        # occurrence that is not part of the default-expansion form).
-        without_default = primary.replace(self._DEFAULT, "")
-        assert "$CONTRACT" not in without_default, (
-            f"{provider.value}: generated {self._PRIMARY_FILE[provider]} "
-            f"contains a bare $CONTRACT reference — regression of the "
-            f"A1 Jenkins Build-Now gap"
-        )
+        text = "\n".join(files.values())
+        if provider is PipelineProvider.JENKINS:
+            assert 'fluid ship "$CONTRACT" --stage' in text
+            assert (
+                f"CONTRACT = \"${{params.CONTRACT == null ? '{self._PATH}' : params.CONTRACT}}\""
+                in text
+            )
+        else:
+            assert f"fluid ship {self._PATH} --stage" in text
+            for variable in ("$CONTRACT", "${CONTRACT", "$(params.CONTRACT"):
+                assert variable not in text, f"{provider.value}: {variable}"
 
 
 class TestFluidEnvDefaultAcrossSystems:
-    """``--fluid-env-default`` reaches every system the way Jenkins gets it:
-    the FLUID_ENV parameter's default (the shared ``_eleven_stage_parameters``
-    table) and every shell fallback, in the shared stage specs and in the
-    legacy command set alike. No ``${FLUID_ENV:-dev}`` survives it."""
+    """``--fluid-env-default`` reaches every system the way Jenkins gets it: the
+    FLUID_ENV parameter's default (the shared ``_eleven_stage_parameters``
+    table) and, where the system has one, its fallback. Nothing else changes."""
 
     @staticmethod
-    def _files(provider, complexity, **kwargs):
-        cfg = PipelineConfig(provider=provider, complexity=complexity, **kwargs)
+    def _files(provider, **kwargs):
+        cfg = PipelineConfig(provider=provider, **kwargs)
         return PipelineTemplateGenerator().generate_pipeline(cfg)
 
-    @pytest.mark.parametrize("complexity", list(PipelineComplexity))
-    @pytest.mark.parametrize("provider", list(PipelineProvider))
-    def test_every_fallback_moves_to_the_default(self, provider, complexity):
-        default = self._files(provider, complexity)
-        staging = self._files(provider, complexity, fluid_env_default="staging")
+    @pytest.mark.parametrize("provider", list(PipelineProvider), ids=lambda p: p.name)
+    def test_only_the_fluid_env_default_moves(self, provider):
+        default = self._files(provider)
+        staging = self._files(provider, fluid_env_default="staging")
         assert set(staging) == set(default)
+        changed = 0
         for path, content in staging.items():
-            assert "${FLUID_ENV:-dev}" not in content, path
-            assert content.count("${FLUID_ENV:-staging}") == default[path].count(
-                "${FLUID_ENV:-dev}"
-            ), path
+            before_lines, after_lines = default[path].splitlines(), content.splitlines()
+            assert len(before_lines) == len(after_lines), path
+            for before, after in zip(before_lines, after_lines, strict=True):
+                if before != after:
+                    changed += 1
+                    # The value only: the line is otherwise the one the default writes.
+                    # The list of overlay names in a description is not the default,
+                    # and Bitbucket's environment follows FLUID_ENV (dev -> test).
+                    envs = "(dev | staging | prod)"
+                    expected = (
+                        after.replace(envs, "<envs>")
+                        .replace("staging", "dev")
+                        .replace("<envs>", envs)
+                    )
+                    if path == "bitbucket-pipelines.yml":
+                        expected = expected.replace("`dev`", "`test`")
+                        expected = expected.replace("deployment: dev", "deployment: test")
+                        if " gives " in after:  # the line that explains the mapping
+                            expected = after.replace("(staging)", "(dev)")
+                    assert before == expected, (path, before, after)
+        assert changed, f"{provider.value}: --fluid-env-default changed nothing"
 
-    @pytest.mark.parametrize("provider", list(PipelineProvider))
+    @pytest.mark.parametrize("provider", list(PipelineProvider), ids=lambda p: p.name)
     def test_the_parameter_table_declares_the_default(self, provider):
-        cfg = PipelineConfig(
-            provider=provider,
-            complexity=PipelineComplexity.STANDARD,
-            fluid_env_default="staging",
-        )
+        cfg = PipelineConfig(provider=provider, fluid_env_default="staging")
         template = PipelineTemplateGenerator().templates[provider]
         declared = {
             name: default for name, _k, default, _d in template._eleven_stage_parameters(cfg)
@@ -871,16 +829,15 @@ class TestFluidEnvDefaultAcrossSystems:
         assert declared["FLUID_ENV"] == "staging"
 
     @pytest.mark.parametrize("bad", ["_prod", "p" * 65], ids=["leading-underscore", "65-chars"])
-    @pytest.mark.parametrize("complexity", list(PipelineComplexity))
-    @pytest.mark.parametrize("provider", list(PipelineProvider))
-    def test_a_default_fluid_publish_refuses_is_refused(self, provider, complexity, bad):
-        """One config backs every system and shape, and so does the rule: a
-        default ``fluid publish --env`` refuses (a leading underscore, more
-        than 64 characters) fails generation for each, instead of the publish
-        stage of every build that runs on the defaults, after the apply."""
+    @pytest.mark.parametrize("provider", list(PipelineProvider), ids=lambda p: p.name)
+    def test_a_default_fluid_publish_refuses_is_refused(self, provider, bad):
+        """One config backs every system, and so does the rule: a default
+        ``fluid publish --env`` refuses (a leading underscore, more than 64
+        characters) fails generation for each, instead of the publish stage of
+        every build that runs on the defaults, after the apply."""
         with pytest.raises(ValueError, match="fluid publish --env"):
-            self._files(provider, complexity, environments=["dev"], fluid_env_default=bad)
-        assert self._files(provider, complexity, fluid_env_default="p" * 64)
+            self._files(provider, fluid_env_default=bad)
+        assert self._files(provider, fluid_env_default="p" * 64)
 
 
 # ---------------------------------------------------------------------------
@@ -1047,7 +1004,6 @@ class TestNoGenerateArtifactsFlag:
             contract="contract.fluid.yaml",
             no_generate_artifacts=True,
             provider=None,
-            complexity="basic",
         )
 
         generate_ci_run(args, _logger)
@@ -1071,7 +1027,6 @@ class TestNoGenerateArtifactsFlag:
             contract="contract.fluid.yaml",
             no_generate_artifacts=False,  # flag NOT set
             provider=None,
-            complexity="basic",
         )
 
         generate_ci_run(args, _logger)
@@ -1096,7 +1051,6 @@ class TestNoGenerateArtifactsFlag:
             contract="contract.fluid.yaml",
             no_generate_artifacts=False,
             provider=None,
-            complexity="basic",
         )
 
         generate_ci_run(args, _logger)

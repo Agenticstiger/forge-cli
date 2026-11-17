@@ -1450,13 +1450,17 @@ def test_l26_sub_the_generated_ci_validate_step_passes_with_no_ref_root_variable
     assert generated.returncode == 0, generated.output
 
     text = ci.read_text(encoding="utf-8")
-    steps = re.findall(r"fluid validate (\S+)", text)
-    assert steps, "the generated CI has no validate step to run"
-    contract = re.sub(r"\$\{CONTRACT:-([^}]+)\}", r"\1", steps[0])
+    # Every generated step runs `fluid ship <contract> --stage N`.
+    steps = re.findall(r"fluid ship (\S+) --stage", text)
+    assert steps, "the generated CI has no fluid ship step to run"
+    contract = steps[0]
     assert contract == "products/orders/contract.fluid.yaml"
     assert "REF_ROOT" not in text, "the generated CI must not need the variable"
 
-    run = fluid(["validate", contract], cwd=ws.root)  # from the repo root, in a clean env
+    # What the plan job runs first, from the repo root, in a clean env. The
+    # fixture's owner address is a placeholder, a warning ship's strict default
+    # stops on; this test is about the ref root only.
+    run = fluid(["ship", contract, "--stage", "1-2", "--no-strict"], cwd=ws.root)
     assert run.returncode == 0, run.output
 
 

@@ -28,16 +28,17 @@ import pytest
 import yaml
 
 from fluid_build.cli import build_parser
+from fluid_build.forge.core.pipeline_systems._thin import ADD_ONS
 from fluid_build.forge.core.pipeline_templates import (
-    PipelineComplexity,
     PipelineConfig,
     PipelineProvider,
     PipelineTemplateGenerator,
 )
 
 #: Keys whose values a CI runner executes as shell. CircleCI nests the real
-#: command a level deeper (``- run: {command: ...}``), hence ``command``.
-_SHELL_KEYS = {"run", "script", "commands", "before_script", "after_script", "command"}
+#: command a level deeper (``- run: {command: ...}``), hence ``command``;
+#: an Azure DevOps step runs ``bash``.
+_SHELL_KEYS = {"run", "script", "commands", "before_script", "after_script", "command", "bash"}
 #: Shell operators that terminate one command.
 _SHELL_STOP = re.compile(r"&&|\|\||[;|\n]")
 #: ``${VAR}``, ``${VAR:-default}``, ``$VAR`` and ``${{ ci.expr }}``.
@@ -124,7 +125,7 @@ def _defect(command: str):
     return ("unknown flag", " ".join(unknown)) if unknown else None
 
 
-def _generated_documents(provider, complexity):
+def _generated_documents(provider, add_ons):
     """Yield ``(name, snippets)`` for every generated file.
 
     YAML files are parsed so only true executable positions are read. Files
@@ -132,7 +133,7 @@ def _generated_documents(provider, complexity):
     raw text, which over-reads slightly but is far better than the previous
     behaviour of skipping them entirely and reporting the system as clean.
     """
-    config = PipelineConfig(provider=provider, complexity=complexity)
+    config = PipelineConfig(provider=provider, add_ons=add_ons)
     files = PipelineTemplateGenerator().generate_pipeline(config)
     for name, content in files.items():
         text = str(content)
@@ -158,11 +159,13 @@ def _generated_documents(provider, complexity):
 
 
 @pytest.mark.parametrize("provider", list(PipelineProvider), ids=lambda p: p.name)
-@pytest.mark.parametrize("complexity", list(PipelineComplexity), ids=lambda c: c.name)
-def test_generated_pipeline_runs_only_real_fluid_commands(provider, complexity):
+@pytest.mark.parametrize(
+    "add_ons", [(), tuple(ADD_ONS)], ids=lambda a: "+".join(a) if a else "plain"
+)
+def test_generated_pipeline_runs_only_real_fluid_commands(provider, add_ons):
     defects = []
     seen = 0
-    for name, snippets in _generated_documents(provider, complexity):
+    for name, snippets in _generated_documents(provider, add_ons):
         for snippet in snippets:
             for command in _fluid_invocations(snippet):
                 seen += 1
@@ -172,7 +175,7 @@ def test_generated_pipeline_runs_only_real_fluid_commands(provider, complexity):
     # Coverage guard: a green result must mean "read and checked", never
     # "read nothing". A structural change to a template that moved commands
     # out of the keys above would otherwise silently zero out this system.
-    assert seen, f"{provider.name}/{complexity.name}: no fluid commands found to check"
+    assert seen, f"{provider.name}/{add_ons}: no fluid commands found to check"
     assert not defects, "generated pipeline would fail at runtime:\n  " + "\n  ".join(defects)
 
 
@@ -191,3 +194,10 @@ def test_the_scanner_ignores_shell_comments():
     assert list(_fluid_invocations("# run fluid audit --compliance later\nfluid doctor")) == [
         "fluid doctor"
     ]
+
+
+def test_the_scanner_reads_a_ship_command_against_the_real_parser():
+    """The commands every wrapper runs parse, and a flag ship lacks is caught."""
+    assert _defect("fluid ship --stage 1-6") is None
+    assert _defect("fluid ship 'my contract.fluid.yaml' --stage 7-11 --yes") is None
+    assert _defect("fluid ship --stage 1-6 --no-such-flag") == ("unknown flag", "--no-such-flag")
