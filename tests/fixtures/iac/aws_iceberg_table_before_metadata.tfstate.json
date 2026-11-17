@@ -1,0 +1,210 @@
+{
+ "check_results": null,
+ "lineage": "d1931454-7cbe-d967-80a8-56a37a01f23e",
+ "outputs": {},
+ "resources": [
+  {
+   "instances": [
+    {
+     "attributes": {
+      "arn": "arn:aws:glue:ca-central-1:000000000000:database/sparkinfra_ice_upgrade",
+      "catalog_id": "000000000000",
+      "create_table_default_permission": [
+       {
+        "permissions": [
+         "ALL"
+        ],
+        "principal": [
+         {
+          "data_lake_principal_identifier": "IAM_ALLOWED_PRINCIPALS"
+         }
+        ]
+       }
+      ],
+      "description": "",
+      "federated_database": [],
+      "id": "000000000000:sparkinfra_ice_upgrade",
+      "location_uri": "",
+      "name": "sparkinfra_ice_upgrade",
+      "parameters": null,
+      "region": "ca-central-1",
+      "tags": null,
+      "tags_all": {},
+      "target_database": []
+     },
+     "schema_version": 0,
+     "sensitive_attributes": []
+    }
+   ],
+   "mode": "managed",
+   "name": "lane_sparkinfra_ice_upgrade_sparkinfra_ice_upgrade",
+   "provider": "provider[\"registry.opentofu.org/hashicorp/aws\"]",
+   "type": "aws_glue_catalog_database"
+  },
+  {
+   "instances": [
+    {
+     "attributes": {
+      "arn": "arn:aws:glue:ca-central-1:000000000000:table/sparkinfra_ice_upgrade/events",
+      "catalog_id": "000000000000",
+      "database_name": "sparkinfra_ice_upgrade",
+      "description": "",
+      "id": "000000000000:sparkinfra_ice_upgrade:events",
+      "name": "events",
+      "open_table_format_input": [],
+      "owner": "",
+      "parameters": {
+       "classification": "iceberg",
+       "fluid_version": "0.7.7",
+       "managed_by": "fluid"
+      },
+      "partition_index": [],
+      "partition_keys": [],
+      "region": "ca-central-1",
+      "retention": 0,
+      "storage_descriptor": [
+       {
+        "additional_locations": [],
+        "bucket_columns": [],
+        "columns": [
+         {
+          "comment": "",
+          "name": "event_id",
+          "parameters": {},
+          "type": "string"
+         },
+         {
+          "comment": "",
+          "name": "amount",
+          "parameters": {},
+          "type": "decimal(18,2)"
+         }
+        ],
+        "compressed": false,
+        "input_format": "",
+        "location": "s3://fluid-lane-sparkinfra-ice-upgrade/iceberg/events/",
+        "number_of_buckets": 0,
+        "output_format": "",
+        "parameters": {},
+        "schema_reference": [],
+        "ser_de_info": [],
+        "skewed_info": [],
+        "sort_columns": [],
+        "stored_as_sub_directories": false
+       }
+      ],
+      "table_type": "EXTERNAL_TABLE",
+      "target_table": [],
+      "view_definition": [],
+      "view_expanded_text": "",
+      "view_original_text": ""
+     },
+     "dependencies": [
+      "aws_glue_catalog_database.lane_sparkinfra_ice_upgrade_sparkinfra_ice_upgrade"
+     ],
+     "identity": {
+      "account_id": "000000000000",
+      "catalog_id": "000000000000",
+      "database_name": "sparkinfra_ice_upgrade",
+      "name": "events",
+      "region": "ca-central-1"
+     },
+     "identity_schema_version": 0,
+     "schema_version": 0,
+     "sensitive_attributes": []
+    }
+   ],
+   "mode": "managed",
+   "name": "lane_sparkinfra_ice_upgrade_sparkinfra_ice_upgrade_events",
+   "provider": "provider[\"registry.opentofu.org/hashicorp/aws\"]",
+   "type": "aws_glue_catalog_table"
+  },
+  {
+   "instances": [
+    {
+     "attributes": {
+      "acceleration_status": "",
+      "acl": null,
+      "arn": "arn:aws:s3:::fluid-lane-sparkinfra-ice-upgrade",
+      "bucket": "fluid-lane-sparkinfra-ice-upgrade",
+      "bucket_domain_name": "fluid-lane-sparkinfra-ice-upgrade.s3.amazonaws.com",
+      "bucket_namespace": "global",
+      "bucket_prefix": "",
+      "bucket_region": "ca-central-1",
+      "bucket_regional_domain_name": "fluid-lane-sparkinfra-ice-upgrade.s3.ca-central-1.amazonaws.com",
+      "cors_rule": [],
+      "force_destroy": true,
+      "grant": [
+       {
+        "id": "0000000000000000000000000000000000000000000000000000000000000000",
+        "permissions": [
+         "FULL_CONTROL"
+        ],
+        "type": "CanonicalUser",
+        "uri": ""
+       }
+      ],
+      "hosted_zone_id": "Z1QDHH18159H29",
+      "id": "fluid-lane-sparkinfra-ice-upgrade",
+      "lifecycle_rule": [],
+      "logging": [],
+      "object_lock_configuration": [],
+      "object_lock_enabled": false,
+      "policy": "",
+      "region": "ca-central-1",
+      "replication_configuration": [],
+      "request_payer": "BucketOwner",
+      "server_side_encryption_configuration": [
+       {
+        "rule": [
+         {
+          "apply_server_side_encryption_by_default": [
+           {
+            "kms_master_key_id": "",
+            "sse_algorithm": "AES256"
+           }
+          ],
+          "bucket_key_enabled": false
+         }
+        ]
+       }
+      ],
+      "tags": {
+       "fluid_contract": "lane_sparkinfra_ice_upgrade",
+       "managed_by": "fluid"
+      },
+      "tags_all": {
+       "fluid_contract": "lane_sparkinfra_ice_upgrade",
+       "managed_by": "fluid"
+      },
+      "timeouts": null,
+      "versioning": [
+       {
+        "enabled": false,
+        "mfa_delete": false
+       }
+      ],
+      "website": [],
+      "website_domain": null,
+      "website_endpoint": null
+     },
+     "identity": {
+      "account_id": "000000000000",
+      "bucket": "fluid-lane-sparkinfra-ice-upgrade",
+      "region": "ca-central-1"
+     },
+     "identity_schema_version": 0,
+     "schema_version": 0,
+     "sensitive_attributes": []
+    }
+   ],
+   "mode": "managed",
+   "name": "lane_sparkinfra_ice_upgrade_fluid_lane_sparkinfra_ice_upgrade",
+   "provider": "provider[\"registry.opentofu.org/hashicorp/aws\"]",
+   "type": "aws_s3_bucket"
+  }
+ ],
+ "serial": 1,
+ "terraform_version": "1.13.1",
+ "version": 4
+}
