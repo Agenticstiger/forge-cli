@@ -231,6 +231,18 @@ jobs:
             echo "::warning::pip install -e .[dev,local] failed (attempt ${attempt}/3); retrying in 30s."
             sleep 30
           done
+          # flux-stats is not on PyPI yet, so [profile] does not name it (PyPI refuses a URL
+          # dependency). The real-backend tests (tests/profiler/test_flux_stats_backend.py)
+          # self-skip without it; requirements/flux-stats.txt is the one pin.
+          for attempt in 1 2 3; do
+            pip install -r requirements/flux-stats.txt && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::pip install -r requirements/flux-stats.txt failed 3 times; this is an install failure, not a test failure."
+              exit 1
+            fi
+            echo "::warning::pip install -r requirements/flux-stats.txt failed (attempt ${attempt}/3); retrying in 30s."
+            sleep 30
+          done
           # dbt-duckdb pulls dbt-core, which puts a `dbt` binary on PATH.
           # Without it tests/test_speed_transformation_dbt_e2e.py self-skips
           # on shutil.which("dbt"), so the only test that runs a real
@@ -332,6 +344,18 @@ jobs:
               exit 1
             fi
             echo "::warning::pip install -e .[dev,local] failed (attempt ${attempt}/3); retrying in 30s."
+            sleep 30
+          done
+          # flux-stats is not on PyPI yet, so [profile] does not name it (PyPI refuses a URL
+          # dependency). The real-backend tests (tests/profiler/test_flux_stats_backend.py)
+          # self-skip without it; requirements/flux-stats.txt is the one pin.
+          for attempt in 1 2 3; do
+            pip install -r requirements/flux-stats.txt && break
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::pip install -r requirements/flux-stats.txt failed 3 times; this is an install failure, not a test failure."
+              exit 1
+            fi
+            echo "::warning::pip install -r requirements/flux-stats.txt failed (attempt ${attempt}/3); retrying in 30s."
             sleep 30
           done
           # dbt-duckdb pulls dbt-core, which puts a `dbt` binary on PATH.

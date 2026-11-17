@@ -404,13 +404,16 @@ lineage = [
 # does. It is standard-library only and supports Python 3.10, so it needs no
 # marker.
 #
-# Pinned to a flux-engine commit until flux-stats is released. PyPI refuses an
-# upload whose metadata holds a URL dependency, so this pin becomes a version
-# before any release. PyPI's flux-stats 0.0.1 is a placeholder with no code and
-# is never a candidate. pip clones the repository to install it.
+# flux-stats is not on PyPI yet (PyPI's flux-stats 0.0.1 is a placeholder with no
+# code and is never a candidate), and PyPI refuses an upload whose metadata holds
+# a URL dependency, so this extra cannot name the git commit. Until flux-stats is
+# released, install it from git (the one pin lives in requirements/flux-stats.txt,
+# which CI installs and tests/profiler/test_flux_stats_pin.py keeps in step with
+# ``fluid profile``'s message):
+#   pip install -r requirements/flux-stats.txt
+# It returns here as a version once it is released.
 profile = [
   "duckdb>=1.5.0",
-  "flux-stats @ git+https://github.com/Agenticstiger/flux-engine.git@9ea8edf9bcddd58951f418db13a77253c02bdd7d#subdirectory=packages/flux-stats",
 ]
 
 # AI + MCP together: restores the pre-0.28.0 base behaviour (the
@@ -511,9 +514,10 @@ dev = [
   # it those tests would skip in CI instead of running.
   "pyarrow>=14",
   # litellm, mcp and openlineage left the base install in 0.28.0; the tests
-  # import all three at module level, so dev names them explicitly. ``profile``
-  # brings flux-stats, so the profiler's tests also run against the real
-  # registry (tests/profiler/test_flux_stats_backend.py), not only its stand-in.
+  # import all three at module level, so dev names them explicitly. flux-stats is
+  # not in ``profile`` (it is not on PyPI), so CI installs it from git after
+  # ``.[dev]`` and the profiler's tests also run against the real registry
+  # (tests/profiler/test_flux_stats_backend.py), not only its stand-in.
   "data-product-forge[litellm,mcp,lineage,profile]",
   # ``profile`` brings duckdb and not numpy, so a ``.[dev]`` lane (iac-tests Stage 1)
   # runs the DuckDB tests without what their masking UDFs need (duckdb's create_function

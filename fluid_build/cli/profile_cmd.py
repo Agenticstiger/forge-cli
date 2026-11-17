@@ -120,7 +120,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             str(exc),
             {
                 "read": "nothing: no record was read",
-                "next": "pip install 'data-product-forge[profile]'",
+                "next": f"pip install 'data-product-forge[profile]' && {_stats.FLUX_STATS_INSTALL_COMMAND}",
             },
         ) from None
 

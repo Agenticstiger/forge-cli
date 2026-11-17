@@ -33,8 +33,12 @@ def _norm(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def load_raw() -> dict:
+    return tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+
+
 def load() -> dict:
-    return tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]
+    return load_raw()["project"]
 
 
 def base_requirements(project: dict) -> List[str]:

@@ -102,7 +102,8 @@ def test_without_the_registry_nothing_is_read_and_nothing_written(workspace, cap
     assert rc == 1
     assert "profile_statistics_unavailable" in out
     assert "and flux-stats is not installed" in out
-    assert "next: pip install 'data-product-forge[profile]'" in out
+    assert "next: pip install 'data-product-forge[profile]' && pip install" in out
+    assert "flux-stats @ git+https://github.com/Agenticstiger/flux-engine.git@" in out
     assert not (workspace / "orders.profile.json").exists()
 
 
