@@ -4,7 +4,8 @@
 # (ci.yml `emulated-integration`, Stage 1):
 #   • GCP — goccy/bigquery-emulator + fsouza/fake-gcs-server + gcloud
 #     pubsub, via tests/iac/_gcp_emulator/docker-compose.yml. Keyless.
-#   • AWS — LocalStack (S3 + Glue). Needs LOCALSTACK_AUTH_TOKEN; Glue is a
+#   • AWS — LocalStack (S3 + Glue, and the Spark lane: Glue 5, EMR Serverless
+#     and EMR on EC2 runs with MSK). Needs LOCALSTACK_AUTH_TOKEN; Glue is a
 #     LocalStack Pro feature (Ultimate tier and above).
 #   • Lakekeeper + Kafka Connect — forge-derived Iceberg sink configs on a
 #     real worker against a real Lakekeeper REST catalog. Keyless, in its
@@ -76,7 +77,9 @@ jobs:
   emulated-heavy:
     name: Heavy emulated integration (GCP emulators + LocalStack)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 45, not 25, since the Spark lane joined: about 6 min on a warm laptop, plus the Glue 5
+    # image pull on a cold runner (the pre-pull step below times it).
+    timeout-minutes: 45
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
@@ -164,6 +167,18 @@ jobs:
             exit 1
           }
 
+      # The Spark lane (tests/spark/test_spark_localstack.py) runs Glue 5 jobs, which
+      # LocalStack runs in the real aws-glue-libs image through the mounted docker socket.
+      # Pulling it here, timed and with the disk it leaves, keeps a slow or failed pull out
+      # of the test step's budget and makes it attributable. Same tag the lane measured on.
+      - name: Pre-pull the Glue 5 image for the Spark lane
+        if: steps.gate.outputs.localstack == 'true'
+        run: |
+          start=$(date +%s)
+          docker pull amazon/aws-glue-libs:5.0.8
+          echo "Glue 5 image pulled in $(( $(date +%s) - start ))s"
+          df -h / | tail -1
+
       # Keyless — always. `-m emulated_heavy` selects the GCP emulator
       # tiers, so the lane that names them has to provision them; without
       # this they skipped silently inside a job called "bigquery-emulator".
@@ -183,9 +198,12 @@ jobs:
           }
 
       - name: Run heavy emulated integration tests
-        timeout-minutes: 15
+        timeout-minutes: 35
         env:
           FLUID_LOCALSTACK_ENDPOINT: http://localhost:4566
+          # The Spark lane's opt-in: Glue 5, EMR Serverless and EMR on EC2 runs started by
+          # `fluid spark run`. It skips itself when LocalStack is not reachable.
+          FLUID_SPARK_LOCALSTACK: "1"
           # The IaC round-trips are triple-gated: `tofu` on PATH (installed
           # above), LocalStack reachable, and this opt-in. AWS_* are
           # LocalStack's conventional dummy credentials — NOT the emulator's
@@ -213,8 +231,23 @@ jobs:
           if [ "${{ steps.gate.outputs.localstack }}" = "true" ]; then
             requirements+=(--require "AWS LocalStack=tests/providers/test_aws_localstack_happy_path.py")
             requirements+=(--require "AWS IaC round-trips=tests/iac/test_iac_aws_localstack_e2e.py")
+            requirements+=(--require "Spark lane on LocalStack=tests/spark/test_spark_localstack.py")
           fi
           python scripts/ci/assert_lane_coverage.py emulated-heavy.xml "${requirements[@]}"
+
+      # LocalStack runs the Spark lane's EMR jobs inside its own container, so their Spark
+      # output is only in its log. Always, not on failure: the EMR lane tests are an xfail
+      # while their intermittent failure is open (Trello xZtxKx2N), so the step passes either way.
+      # The lane deletes its S3 buckets on teardown, so there are no run logs left to list.
+      - name: LocalStack log (EMR and Spark output)
+        if: always() && steps.gate.outputs.localstack == 'true'
+        run: |
+          echo "::group::LocalStack log, EMR and Spark lines (last 300)"
+          docker logs fluid-localstack 2>&1 | grep -iE "emr|spark|jobrun|job run|step" | tail -300 || true
+          echo "::endgroup::"
+          echo "::group::LocalStack log (last 400 lines)"
+          docker logs fluid-localstack --tail 400 2>&1 || true
+          echo "::endgroup::"
 
       - name: Stop GCP emulators
         if: always()

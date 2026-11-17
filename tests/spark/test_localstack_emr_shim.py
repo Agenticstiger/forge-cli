@@ -1,0 +1,157 @@
+# Copyright 2025 Agentics Transformation Limited
+# SPDX-License-Identifier: Apache-2.0
+
+"""The LocalStack lane's EMR Serverless shim, offline: botocore parses a list response that
+has no ``id`` (as LocalStack sends it), and the shim fills it before forge's adapter reads it.
+Without the shim, the adapter refuses the summary, as it would on AWS."""
+
+from __future__ import annotations
+
+import copy
+import dataclasses
+import json
+
+import pytest
+
+boto3 = pytest.importorskip("boto3")
+AWSResponse = pytest.importorskip("botocore.awsrequest").AWSResponse
+
+from fluid_build.build_runners.spark import _adapters  # noqa: E402
+from tests.build_runners.spark.conftest import runs_of  # noqa: E402
+
+from ._localstack_emr import with_summary_ids  # noqa: E402
+from .conftest import CONTRACT  # noqa: E402
+
+APP_ARN = "arn:aws:emr-serverless:us-east-1:000000000000:/applications/b2f154e9"
+
+
+class _Raw:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def stream(self, **_kwargs):
+        yield self.body
+
+
+def _localstack_says(client, operation: str, body: dict) -> None:
+    """Answer ``operation`` with ``body``, before anything is sent."""
+
+    def answer(request, **_kwargs):
+        return AWSResponse(
+            request.url, 200, {"Content-Type": "application/json"}, _Raw(json.dumps(body).encode())
+        )
+
+    client.meta.events.register(f"before-send.emr-serverless.{operation}", answer)
+
+
+def _factory(pages, shim):
+    def plain(service, region):
+        client = boto3.client(  # nothing listens on port 9: a missed hook never reaches AWS
+            service,
+            region_name=region,
+            endpoint_url="http://127.0.0.1:9",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",  # pragma: allowlist secret
+        )
+        for operation, body in pages.items():
+            _localstack_says(client, operation, body)
+        return client
+
+    return with_summary_ids(plain) if shim else plain
+
+
+@pytest.fixture
+def by_name():
+    run = runs_of(copy.deepcopy(CONTRACT))[0]
+    return dataclasses.replace(run, region="us-east-1", target={"applicationName": "app-x"})
+
+
+def _app_page(name):
+    return {"applications": [{"arn": APP_ARN, "name": name, "state": "STARTED",
+                              "releaseLabel": "emr-7.12.0", "type": "Spark",
+                              "createdAt": 0, "updatedAt": 0}]}  # fmt: skip
+
+
+def test_the_shim_fills_the_application_id_localstack_leaves_out(by_name):
+    clients = _factory({"ListApplications": _app_page("app-x")}, shim=True)
+    assert _adapters.adapter_for(by_name, clients).application_id() == "b2f154e9"
+
+
+def test_without_the_shim_the_adapter_refuses_the_summary(by_name):
+    clients = _factory({"ListApplications": _app_page("app-x")}, shim=False)
+    with pytest.raises(_adapters.SparkRunError, match="application summary carries no id"):
+        _adapters.adapter_for(by_name, clients).application_id()
+
+
+def test_the_shim_fills_job_run_ids_through_the_paginator(by_name):
+    run = dataclasses.replace(by_name, target={"applicationId": "b2f154e9"})
+    summary = {
+        "arn": f"{APP_ARN}/jobruns/ff81f100", "applicationId": "b2f154e9", "name": run.run_name,
+        "state": "RUNNING", "stateDetails": "", "releaseLabel": "emr-7.12.0",
+        "createdBy": "x", "createdAt": 0, "updatedAt": 0,
+    }  # fmt: skip
+    clients = _factory({"ListJobRuns": {"jobRuns": [summary]}}, shim=True)
+    adapter = _adapters.adapter_for(run, clients)
+    seen = []
+    adapter.get = lambda run_id: seen.append(run_id)  # the read after the list is not the shim's
+    adapter.runs()
+    assert "ff81f100" in seen
+
+
+@pytest.mark.parametrize("shim", [True, False])
+def test_the_shim_fills_a_job_runs_job_run_id(by_name, shim):
+    run = dataclasses.replace(by_name, target={"applicationId": "b2f154e9"})
+    # botocore keeps only the model's members: a non-model "id" is dropped while parsing,
+    # so it never could stand in for jobRunId; the ARN can.
+    job = {"id": "ff81f100", "arn": f"{APP_ARN}/jobruns/ff81f100"}
+    body = {"jobRun": {"applicationId": "b2f154e9", "state": "RUNNING", **job}}
+    adapter = _adapters.adapter_for(run, _factory({"GetJobRun": body}, shim=shim))
+    if shim:
+        assert adapter.get("ff81f100").run_id == "ff81f100"
+    else:
+        with pytest.raises(_adapters.SparkRunError, match="job run carries no jobRunId"):
+            adapter.get("ff81f100")
+
+
+def test_the_emr_conf_shim_reaches_emr_runs_only(monkeypatch):
+    from fluid_build.build_runners.spark import _desired
+
+    from ._localstack_emr import with_spark_conf
+
+    extra = {"spark.jars.packages": "org.example:x:1", "spark.sql.catalog.fluid.s3.endpoint": "e"}
+    monkeypatch.setattr(_desired, "_submit_conf", with_spark_conf(_desired._submit_conf, extra))
+    for runtime, extra_args in (
+        ("emr-serverless", {}),
+        ("emr-ec2", {"clusterId": "j-1"}),
+        ("glue", {}),
+    ):
+        contract = copy.deepcopy(CONTRACT)
+        spark = contract["builds"][0]["properties"]["parameters"]["spark"]
+        spark.update(runtime=runtime, **extra_args)
+        if runtime == "glue":
+            spark.pop("applicationId", None)
+        conf = runs_of(contract)[0].spark_conf
+        reached = all(conf.get(k) == v for k, v in extra.items())
+        assert reached == (runtime != "glue"), runtime
+
+
+@pytest.mark.parametrize("listed", [None, "spark.jars.packages,spark.sql.catalog.fluid.*", "*"])
+def test_product_code_still_refuses_the_lanes_settings_in_a_contract(monkeypatch, listed):
+    """The lane's LocalStack settings come from the test; in a contract they stay refused,
+    whatever the operator lists (#924's absolute deny)."""
+    from fluid_build.build_runners.spark import _desired
+    from fluid_build.spark.policy import SparkPolicyError
+
+    if listed:
+        monkeypatch.setenv(_desired.CONF_ALLOWLIST_ENV, listed)
+    contract = copy.deepcopy(CONTRACT)
+    spark = contract["builds"][0]["properties"]["parameters"]["spark"]
+    spark["sparkConf"] = {
+        "spark.jars.packages": "org.apache.iceberg:iceberg-spark-runtime-3.3_2.12:1.4.3",
+        "spark.sql.catalog.fluid.glue.endpoint": "http://localhost:4566",
+        "spark.sql.catalog.fluid.s3.endpoint": "http://localhost:4566",
+        "spark.sql.catalog.fluid.s3.path-style-access": "true",
+    }
+    with pytest.raises(SparkPolicyError, match="spark.jars.packages") as err:
+        runs_of(contract)
+    assert "never passes" in err.value.fix
