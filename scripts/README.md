@@ -142,7 +142,7 @@ Share that bundle for exact, targeted help.
 * `python -m fluid_build.cli --provider gcp --project <PROJECT> --region <REGION> plan <CONTRACT_GCP> --out <plan.json>`
 * `python -m fluid_build.cli visualize-plan <plan.json>` (if plan exists)
 * `python -m fluid_build.cli contract-tests <CONTRACT_GCP> --baseline <BASELINE_SCHEMA>`
-* `python -m fluid_build.cli --provider <PROVIDER> --project <PROJECT> --region <REGION> scaffold-ci <CONTRACT_GCP> --out <.gitlab-ci.yml>`
+* `python -m fluid_build.cli --provider <PROVIDER> --project <PROJECT> --region <REGION> generate ci <CONTRACT_GCP> --system gitlab --out <.gitlab-ci.yml>`
 * `python -m fluid_build.cli --provider <PROVIDER> --project <PROJECT> --region <REGION> scaffold-composer <CONTRACT_GCP> --out-dir <dags/>`
 * `python -m fluid_build.cli --provider local apply <CONTRACT_LOCAL>` (if local contract exists and `duckdb` installed)
 
@@ -166,7 +166,7 @@ runtime/
         plan_gcp_customer360.log
         visualize_plan.log
         contract_tests.log
-        scaffold_ci.log
+        generate_ci.log
         scaffold_composer.log
         apply_local_high_value_churn.log
         fluid_build.log       # CLI internal log (if FLUID_LOG_FILE is set)

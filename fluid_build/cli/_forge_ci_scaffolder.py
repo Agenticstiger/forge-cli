@@ -293,7 +293,7 @@ def scaffold_ci_pipeline(
         return (None, None)
 
     try:
-        from fluid_build.cli.pipeline_generator import (
+        from fluid_build.cli._pipeline_files import (
             build_pipeline_config,
             write_pipeline_files,
         )
@@ -348,7 +348,7 @@ def scaffold_ci_pipeline(
                         f"{', '.join(drift.drifted)}[/yellow]"
                     )
                     console.print(
-                        "[dim]Delete the files or run 'fluid generate-pipeline --output-dir .' to regenerate explicitly.[/dim]"
+                        "[dim]Delete the files, then run 'fluid forge --ci <provider>' to regenerate them.[/dim]"
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -362,7 +362,7 @@ def scaffold_ci_pipeline(
                         f"{', '.join(drift.missing_from_state)}[/yellow]"
                     )
                     console.print(
-                        "[dim]No ci-state.json recorded these — delete them or run 'fluid generate-pipeline --output-dir .' to regenerate.[/dim]"
+                        "[dim]No ci-state.json recorded these: delete them, then run 'fluid forge --ci <provider>' to regenerate.[/dim]"
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -444,9 +444,7 @@ def scaffold_ci_pipeline(
 
     if console and not dry_run:
         try:
-            console.print(
-                "[dim]Tip: run 'fluid generate-pipeline --help' to regenerate later.[/dim]"
-            )
+            console.print("[dim]Tip: run 'fluid forge --ci <provider>' to regenerate later.[/dim]")
         except Exception:  # noqa: BLE001
             pass
 

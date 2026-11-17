@@ -54,7 +54,6 @@ TEST_MODULES = [
     "test_viz_plan",
     "test_viz_graph",
     "test_viz_graph_enhanced",
-    "test_scaffold_ci",
     "test_scaffold_composer",
     "test_export_opds",
     "test_export_opds_enhanced",

@@ -5,7 +5,7 @@
 
 Before this module, write sites were scattered across ``workspace_config.py``,
 ``forge_contract_factory.py``, ``forge_copilot_memory.py``,
-``forge_copilot_personal_memory.py``, and ``pipeline_generator.py``.  Each one
+``forge_copilot_personal_memory.py``, and ``_pipeline_files.py``.  Each one
 had its own ``Path.write_text`` / ``yaml.dump`` / ``json.dumps`` call, its
 own dry-run branch (when it had one at all), and its own idea of whether to
 log or print on success.

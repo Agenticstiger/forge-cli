@@ -676,7 +676,7 @@ def _run_directory_scan_import(args: Any, logger: logging.Logger) -> int:
 
         # NOTE: CI/CD scaffolding intentionally not generated here.  Users
         # who want Jenkinsfile / GitHub Actions / GitLab CI / Cloud Build
-        # configs should run ``fluid scaffold-ci`` explicitly — import
+        # configs should run ``fluid generate ci`` explicitly: import
         # should produce predictable artifacts, not interactively prompt
         # for cloud-platform-specific files.
 
@@ -686,7 +686,7 @@ def _run_directory_scan_import(args: Any, logger: logging.Logger) -> int:
         # Hint about the complementary CI/CD command
         if RICH_AVAILABLE:
             console.print(
-                "\n[dim]Want CI/CD? Run [bold]fluid scaffold-ci[/bold] "
+                "\n[dim]Want CI/CD? Run [bold]fluid generate ci --system <system>[/bold] "
                 "to generate Jenkins/GitHub Actions/GitLab CI configs.[/dim]"
             )
 

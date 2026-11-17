@@ -7,7 +7,7 @@ The CI/CD generator tests that used to live here were deleted alongside
 ``init.py``'s ``generate_cicd`` and its four platform-specific helpers
 (``generate_jenkinsfile``, ``generate_github_actions``, ``generate_gitlab_ci``,
 ``generate_cloudbuild``) when that dead code was removed.  ``fluid
-scaffold-ci`` has its own implementation and is tested separately.
+generate ci`` is the one CI generator and is tested in ``test_generate_ci.py``.
 """
 
 import logging

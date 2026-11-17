@@ -565,6 +565,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **BREAKING: `fluid scaffold-ci` and `fluid generate-pipeline` are removed; `fluid generate ci` is
+  the one CI generator.** Run `fluid generate ci --system <system>` instead (`github`, `gitlab`,
+  `jenkins`, `azure`, `bitbucket`, `circleci` or `tekton`). `scaffold-ci` rejected `--provider` and
+  wrote a 3-stage pipeline; `generate-pipeline` wrote the same files as `generate ci`, with a
+  `--complexity` tier. `fluid forge` still writes CI through `fluid forge --ci <provider>`.
+
 - **BREAKING: `PipelineConfig.oidc_provider` and `generate_pipeline_template(oidc_provider=)`.**
   No CLI flag ever set them, so their OIDC steps never reached a generated pipeline. They are
   replaced by `cloud_auth`, which `fluid generate ci` fills from the contract. The Azure login

@@ -129,7 +129,7 @@ def demo_mode(args, logger: logging.Logger) -> int:
 
         # NOTE: CI/CD scaffolding intentionally removed from this path.
         # Users who want Jenkinsfile / GitHub Actions / GitLab CI / Cloud
-        # Build configs should run `fluid scaffold-ci` explicitly — init
+        # Build configs should run `fluid generate ci` explicitly: init
         # should produce predictable artifacts, not interactively prompt
         # for cloud-platform-specific files.
 

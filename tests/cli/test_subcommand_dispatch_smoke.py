@@ -3,9 +3,8 @@
 
 """Smoke test: every ``fluid`` subcommand reaches its run() function.
 
-Closes the gap that let ``fluid stats`` and ``fluid generate-pipeline``
-ship while erroring out with "No command function found" at runtime —
-the existing per-subcommand tests called ``run()`` directly, so the
+Closes the gap that let ``fluid stats`` ship while erroring out with
+"No command function found" at runtime; the existing per-subcommand tests called ``run()`` directly, so the
 missing ``set_defaults(func=run)`` in ``register()`` was invisible.
 
 This test introspects every ``_try_register`` entry in
@@ -194,15 +193,15 @@ def test_known_regression_stats_dispatches() -> None:
     )
 
 
-def test_known_regression_generate_pipeline_dispatches() -> None:
-    """Direct regression pin for the same bug on `fluid generate-pipeline`."""
-    from fluid_build.cli import pipeline_generator
+@pytest.mark.parametrize("command", ["scaffold-ci", "generate-pipeline"])
+def test_removed_ci_commands_are_unknown(command: str, capsys) -> None:
+    """``fluid generate ci`` is the one CI generator; the two legacy commands are gone."""
+    from fluid_build.cli import build_parser
 
-    parser = argparse.ArgumentParser()
-    sp = parser.add_subparsers(dest="cmd")
-    pipeline_generator.register(sp)
-    args = parser.parse_args(["generate-pipeline"])
-    assert getattr(args, "func", None) is pipeline_generator.run
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args([command])
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 def test_known_regression_skills_register_wires_func() -> None:

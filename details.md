@@ -201,8 +201,7 @@ fluid verify contract.fluid.yaml     # Post-deployment data quality & compliance
 ```bash
 fluid forge                                  # 🤖 Interactive, AI-powered project creation
 fluid generate-airflow contract.fluid.yaml   # Compile contract → native Airflow DAG
-fluid generate-pipeline contract.fluid.yaml  # Scaffold transformation code
-fluid scaffold-ci contract.fluid.yaml        # Generate CI/CD configs
+fluid generate ci contract.fluid.yaml --system github  # Generate CI/CD configs
 ```
 
 ### Governance & Compliance

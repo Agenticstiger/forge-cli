@@ -518,9 +518,6 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
         ),
     ),
     CoreCommand(
-        "scaffold_ci", "scaffold-ci", (_cmd("scaffold-ci", "Generate CI pipeline (GitLab/GitHub)"),)
-    ),
-    CoreCommand(
         "scaffold_ide",
         "scaffold-ide",
         (
@@ -709,11 +706,6 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
         "product_add",
         "product-add",
         (_cmd("product-add", "Add a source/exposure/dq rule to an existing contract"),),
-    ),
-    CoreCommand(
-        "pipeline_generator",
-        "generate-pipeline",
-        (_cmd("generate-pipeline", "🚀 Generate CI/CD pipeline templates for FLUID projects"),),
     ),
     CoreCommand(
         "ide", "ide", (_cmd("ide", "💻 IDE integration and developer experience features"),)
