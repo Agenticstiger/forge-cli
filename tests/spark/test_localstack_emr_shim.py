@@ -46,8 +46,12 @@ def _localstack_says(client, operation: str, body: dict) -> None:
 
 def _factory(pages, shim):
     def plain(service, region):
-        client = boto3.client(
-            service, region_name=region, aws_access_key_id="test", aws_secret_access_key="test"
+        client = boto3.client(  # nothing listens on port 9: a missed hook never reaches AWS
+            service,
+            region_name=region,
+            endpoint_url="http://127.0.0.1:9",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",  # pragma: allowlist secret
         )
         for operation, body in pages.items():
             _localstack_says(client, operation, body)
