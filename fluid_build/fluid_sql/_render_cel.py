@@ -150,7 +150,10 @@ def render_cel(node: n.Node, model: Model, *, record: str = "message") -> str:
             "binary in CEL"
         )
     out = _Cel(model, record).predicate(node)
-    assert ";" not in out, "every ';' source is refused where it is written"
+    if ";" in out:  # every ';' source is refused where it is written; never emit one
+        raise CelUntranslatable(
+            "its CEL text holds a ';', which Confluent reads as the end of a guard"
+        )
     return out
 
 
