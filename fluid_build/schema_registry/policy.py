@@ -132,9 +132,16 @@ def credential_host_findings(
 
 
 def secret_ref_findings(
-    ref: RegistryRef, stage: str, environ: Optional[Mapping[str, str]]
+    ref: RegistryRef,
+    stage: str,
+    environ: Optional[Mapping[str, str]],
+    url: Optional[str] = None,
 ) -> List[Finding]:
-    """A consumed subject's ``auth.secretRef``: https, and the operator's ``NAME@host`` grant."""
+    """A consumed subject's ``auth.secretRef``: https, and the operator's ``NAME@host`` grant.
+
+    ``url`` is where the credential goes (``RegistryKind.credential_url``), the
+    registry's ``url`` when not given.
+    """
     from fluid_build.secrets.errors import SecretError
     from fluid_build.secrets.policy import (
         check_prefix,
@@ -148,9 +155,10 @@ def secret_ref_findings(
         secret = parse_secret_ref(ref.secret_ref)
     except (SecretError, ValueError):
         return [("error", f"{ref.where}.auth.secretRef: not a secret reference")]
-    host = _host(ref.url or "")
+    target = ref.url if url is None else url
+    host = _host(target or "")
     findings: List[Finding] = []
-    if urlsplit(ref.url or "").scheme != "https" and not is_loopback(host):
+    if urlsplit(target or "").scheme != "https" and not is_loopback(host):
         findings.append(
             ("error", f"{ref.where}.url: a registry credential is sent over https only")
         )
@@ -176,14 +184,71 @@ def secret_ref_findings(
 def subject_findings(
     subject: Subject, *, stage: str, environ: Optional[Mapping[str, str]] = None
 ) -> List[Finding]:
-    """The egress findings for one subject at ``stage`` (``validate`` or ``plan``).
+    """The egress findings for one subject at ``stage`` (``validate``, ``plan``, ``apply``).
 
-    Each registry kind states its own rules (``kinds/``). The public helpers above are
-    the generic rules for an HTTP registry, shared by every kind that has one.
+    :func:`floor_findings` first, for every kind, then what the kind adds
+    (``RegistryKind.egress_findings``): a kind can add rules, never remove the floor.
+    A finding the kind repeats from the floor is listed once.
     """
     from .kinds import get_kind
 
-    return get_kind(subject.ref.kind).egress_findings(subject, stage=stage, environ=environ)
+    findings = floor_findings(subject, stage=stage, environ=environ)
+    floor = set(findings)
+    kind_findings = get_kind(subject.ref.kind).egress_findings(
+        subject, stage=stage, environ=environ
+    )
+    findings.extend(f for f in kind_findings if f not in floor)
+    return findings
+
+
+def floor_findings(
+    subject: Subject, *, stage: str, environ: Optional[Mapping[str, str]] = None
+) -> List[Finding]:
+    """The egress rules forge applies to every registry kind, whatever the kind adds.
+
+    A kind's ``egress_findings`` only adds to these, so a kind that returns ``[]``
+    still cannot send a contract credential over http, to a link-local host or to an
+    ungranted host (review D1 on #926), with the #818 severities:
+
+    * a contract-named ``url``: scheme, host and link-local (:func:`static_host_findings`),
+      an error at every stage;
+    * a consumed subject's ``auth.secretRef``: the credential URL its kind names
+      (``RegistryKind.credential_url``) gets the same host check, then
+      :func:`secret_ref_findings` (https, the listed host, the ``NAME@host`` grant: a
+      missing entry warns at validate and refuses at plan and apply); a kind that names
+      no credential URL is refused;
+    * a consumed subject read with no credential: the DNS-scoped host rule at plan
+      (:func:`resolved_host_findings`).
+
+    A produced subject's credential is the operator's, sent by OpenTofu: its kind
+    states that rule (Confluent: ``SCHEMA_REGISTRY_API_SECRET@host``).
+    """
+    from dataclasses import replace
+
+    from .kinds import get_kind
+
+    ref = subject.ref
+    findings = static_host_findings(ref) if ref.url else []
+    if findings or subject.role != "consumed":
+        return findings
+    if ref.secret_ref:
+        url = get_kind(ref.kind).credential_url(ref)
+        if not url:
+            return [
+                (
+                    "error",
+                    f"{ref.where}.auth: registry kind {ref.kind!r} names no URL to send the "
+                    "credential to, so it is not sent",
+                )
+            ]
+        if url != ref.url:
+            findings = static_host_findings(replace(ref, url=url))
+            if findings:
+                return findings
+        return secret_ref_findings(ref, stage, environ, url=url)
+    if stage == "plan" and ref.url:
+        return resolved_host_findings(ref, environ)
+    return []
 
 
 def validation_findings(

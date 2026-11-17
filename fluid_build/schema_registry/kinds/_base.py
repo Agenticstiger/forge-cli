@@ -55,13 +55,25 @@ class RegistryKind:
     def egress_findings(
         self, subject: Any, *, stage: str, environ: Optional[Mapping[str, str]] = None
     ) -> List[Tuple[str, str]]:
-        """``(severity, message)`` for where a request for ``subject`` would go.
+        """``(severity, message)`` this kind adds for where a request for ``subject`` goes.
 
-        Every kind states its own rules, even when it has none to state (Glue: IAM, no
-        contract-named host): :func:`register_kind` refuses a kind that does not override
-        this, so a new HTTP kind cannot silently skip the host and credential checks.
+        ``policy.floor_findings`` runs first for every kind (url, link-local, the
+        credential's https and ``NAME@host`` grant); this adds the kind's own rules and
+        cannot remove the floor's. Every kind states its rules, even when it has none to
+        add (Glue: IAM, no contract-named host): :func:`register_kind` refuses a kind that
+        does not override this.
         """
         raise NotImplementedError(f"registry kind {self.name!r} states no egress rules")
+
+    def credential_url(self, ref: Any) -> Optional[str]:
+        """Where a consumed subject's ``auth.secretRef`` credential is sent.
+
+        Its scheme must be https and its host is the one the operator's ``NAME@host``
+        grant names (``policy.floor_findings``), and ``fluid apply`` resolves the secret
+        for that host. The registry's own ``url`` by default; a kind with a separate
+        authentication endpoint returns that endpoint's URL.
+        """
+        return getattr(ref, "url", None)
 
     def produced_checks(
         self, subject: Any, *, stage: str, environ: Optional[Mapping[str, str]] = None
