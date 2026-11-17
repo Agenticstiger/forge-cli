@@ -64,7 +64,11 @@ def _scheduler(provider: str) -> str:
     from fluid_build.schedulers.airflow import AirflowScheduler
 
     prefix = {"aws": "aws.athena", "gcp": "gcp.bigquery", "snowflake": "sf.snowflake"}[provider]
-    (code,) = AirflowScheduler().generate(_contract(prefix), provider=provider).values()
+    (code,) = (
+        AirflowScheduler()
+        .generate(_contract(prefix), provider=provider, provider_config={"allow_unmapped": True})
+        .values()
+    )
     return code
 
 
@@ -78,7 +82,12 @@ def _golden(provider: str, only: tuple = ()) -> str:
     if only:
         tasks = [t for t in contract["orchestration"]["tasks"] if t["taskId"] in only]
         contract = {**contract, "orchestration": {**contract["orchestration"], "tasks": tasks}}
-    return render_dag(contract, provider=provider, provider_config=PROVIDER_CONFIG[provider])
+    return render_dag(
+        contract,
+        provider=provider,
+        provider_config=PROVIDER_CONFIG[provider],
+        allow_unmapped=True,
+    )
 
 
 def _init_dag(tmp_path: Path) -> str:
@@ -283,7 +292,7 @@ def test_a_task_named_like_an_imported_name_does_not_shadow_it(task_id: str):
             "dependsOn": [task_id],
         },
     ]
-    tree = ast.parse(render_dag(contract, provider="aws", provider_config={}))
+    tree = ast.parse(render_dag(contract, provider="aws", provider_config={}, allow_unmapped=True))
     assigned = [
         t.id
         for n in tree.body

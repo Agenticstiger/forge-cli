@@ -848,6 +848,8 @@ def _without_clocks(data: bytes) -> str:
 def test_g07_generate_schedule_reads_the_composed_contract(
     fx: Path, flat: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The fixture's one task names an action no emitter maps; this test is about the composed contract.
+    monkeypatch.setenv("FLUID_AIRFLOW_ALLOW_UNMAPPED", "1")
     dags = {}
     for name, contract in (("fx", fx), ("flat", flat)):
         argv = ["generate", "schedule", "contract.fluid.yaml", "--scheduler", "airflow"]
@@ -868,6 +870,8 @@ def test_g07_generate_schedule_reads_the_composed_contract(
 def test_g07_the_deprecated_generate_airflow_alias_agrees(
     fx: Path, flat: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The fixture's one task names an action no emitter maps; this test is about the composed contract.
+    monkeypatch.setenv("FLUID_AIRFLOW_ALLOW_UNMAPPED", "1")
     dags = {}
     for name, contract in (("fx", fx), ("flat", flat)):
         rc, text = run_in(

@@ -238,8 +238,16 @@ def _op(ctx: TaskContext, operator: str, kwargs: List[Tuple[str, str]], *uses: s
     return "\n".join(lines), {operator, *uses}
 
 
+#: Marker in an emitter's ``uses`` set: the task renders as a log line, not as
+#: the action it names. ``render_dag`` refuses these unless the caller opts in.
+UNMAPPED = "__unmapped__"
+
+
 def generic_task(ctx: TaskContext) -> Emitted:
     """A ``PythonOperator`` that logs the action: nothing provider-specific to run.
+
+    The task does nothing the action names, so it is marked ``UNMAPPED`` and the
+    renderer fails closed on it unless told to allow it.
 
     The action and params are concatenated into the callable as ``repr``'d
     literals, never interpolated into a quoted string: ``repr({'k': 'v'})``
@@ -256,7 +264,7 @@ def generic_task(ctx: TaskContext) -> Emitted:
         f"    ),\n"
         f"    dag=dag,\n"
         f")",
-        set(),
+        {UNMAPPED},
     )
 
 

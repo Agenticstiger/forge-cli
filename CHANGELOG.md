@@ -24,19 +24,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table DDL. Differences from the old output, one by one: `tests/schedulers/golden/DIFFERENCES.md`.
   - A DAG id now drops `.` and `-` for AWS too (`sales.orders` is DAG `sales_orders`), as the other
     providers and `generate schedule` already did. The file `fluid export` writes keeps its name.
-  - An AWS task whose action no operator covers logs the action instead of raising "retired" at
-    run time, as the GCP and Snowflake ones did.
+  - A task whose action no operator covers fails closed for every provider. `render_dag` (so
+    `fluid export`, `fluid generate schedule` and `fluid generate-airflow`) raises a `ValueError`
+    naming each such task and action, instead of writing a DAG that logs the action and still
+    succeeds. This is new for GCP and Snowflake, which used to log; AWS raised "retired" at run
+    time before. `FLUID_AIRFLOW_ALLOW_UNMAPPED=1` (`fluid generate-airflow --allow-unmapped`)
+    renders those tasks as log-only tasks and logs a WARNING that lists them.
   - `fluid generate-airflow` is a deprecated alias of `fluid generate schedule --scheduler
     airflow` and says so once. With no `-o` it still prints the one DAG to stdout; `-o` is an
     output directory (written over, so a populated `dags/` works), or a `.py` path for a contract
     that renders one DAG. It takes `--contract-path`, as `generate schedule` does, and must now
     run from the project directory for a contract with scheduled builds. `--dag-id` and
-    `--schedule` are gone: the contract's `orchestration.schedule` is the one source. A contract
+    `--schedule` are removed (argparse rejects them): the contract's `orchestration.schedule` is the one source. A contract
     with builds and no orchestration renders through its builds' triggers; it no longer gets a
     DAG of `echo` placeholders.
   - A schedule written as a bare word (`hourly`, `daily`, `weekly`, `monthly`) is the Airflow
     keyword of that name for AWS too. It used to map to cron: `daily` ran at 02:00, now at 00:00.
   - `generate_airflow_dag_taskflow` (AWS TaskFlow DAGs) is removed; nothing called it.
+
+### Removed
+
+- `fluid generate-airflow --dag-id` and `--schedule`. Set `orchestration.schedule` in the contract
+  for the schedule; the DAG id comes from the contract `id`.
 
 ### Added
 

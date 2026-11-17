@@ -131,7 +131,9 @@ def test_main_scheduler_provider_tasks_are_injection_safe(provider, prefix):
     from fluid_build.schedulers.airflow import AirflowScheduler
 
     contract = _malicious_contract(prefix, "sql")
-    out = AirflowScheduler().generate(contract, provider=provider)
+    out = AirflowScheduler().generate(
+        contract, provider=provider, provider_config={"allow_unmapped": True}
+    )
     (code,) = out.values()
     assert_inert(code)
     assert "touch /tmp/PWNED" in code  # payload preserved as inert data
@@ -155,7 +157,11 @@ def test_main_scheduler_exact_poc_defeated():
             ]
         },
     }
-    (code,) = AirflowScheduler().generate(contract, provider="snowflake").values()
+    (code,) = (
+        AirflowScheduler()
+        .generate(contract, provider="snowflake", provider_config={"allow_unmapped": True})
+        .values()
+    )
     assert_inert(code)
 
 
@@ -167,7 +173,7 @@ def test_main_scheduler_exact_poc_defeated():
 def generate_airflow_dag(contract, provider, **config):
     from fluid_build.schedulers.airflow import render_dag
 
-    return render_dag(contract, provider=provider, provider_config=config)
+    return render_dag(contract, provider=provider, provider_config=config, allow_unmapped=True)
 
 
 def test_gcp_codegen_is_injection_safe():
@@ -281,7 +287,11 @@ def test_benign_contract_still_produces_expected_operators():
             ]
         },
     }
-    (code,) = AirflowScheduler().generate(contract, provider="snowflake").values()
+    (code,) = (
+        AirflowScheduler()
+        .generate(contract, provider="snowflake", provider_config={"allow_unmapped": True})
+        .values()
+    )
     assert_inert(code)
     assert (
         "load = SQLExecuteQueryOperator(" in code

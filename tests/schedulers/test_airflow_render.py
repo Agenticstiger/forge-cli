@@ -32,7 +32,12 @@ def _contract(provider: str, *tasks: dict) -> dict:
 
 
 def _dag(provider: str, *tasks: dict, **config) -> str:
-    return render_dag(_contract(provider, *tasks), provider=provider, provider_config=config)
+    return render_dag(
+        _contract(provider, *tasks),
+        provider=provider,
+        provider_config=config,
+        allow_unmapped=True,
+    )
 
 
 def _norm(source: str) -> str:
@@ -162,7 +167,7 @@ def test_a_dependency_on_a_task_outside_the_dag_is_skipped_not_invented():
     contract = _contract(
         "aws", {"taskId": "t", "action": "aws.s3.ensure_bucket", "dependsOn": ["x"]}
     )
-    source = render_dag(contract, provider="aws")
+    source = render_dag(contract, provider="aws", allow_unmapped=True)
     assert "# dependency on non-DAG task 'x' skipped" in source
     assert ">>" not in source.replace("# dependency", "")
 
@@ -319,3 +324,70 @@ def test_generate_airflow_without_output_prints_only_the_dag(tmp_path, monkeypat
     out = capsys.readouterr().out
     compile(out, "dag", "exec")
     assert not (tmp_path / "dags").exists()
+
+
+# --- an action no emitter maps fails closed ----------------------------------------------------
+
+_UNMAPPED = {
+    "aws": "aws.kinesis.create_stream",
+    "gcp": "gcp.spanner.create_instance",
+    "snowflake": "sf.stage.refresh",
+}
+
+
+@pytest.mark.parametrize("provider", sorted(_UNMAPPED))
+def test_an_unmapped_action_is_refused_and_named(provider: str):
+    contract = _contract(provider, {"taskId": "lost", "action": _UNMAPPED[provider]})
+    with pytest.raises(ValueError) as caught:
+        render_dag(contract, provider=provider)
+    assert "lost" in str(caught.value) and _UNMAPPED[provider] in str(caught.value)
+    assert "FLUID_AIRFLOW_ALLOW_UNMAPPED" in str(caught.value)
+
+
+def test_the_opt_in_renders_the_log_task_and_warns_with_every_task_listed(caplog):
+    contract = _contract(
+        "gcp",
+        {"taskId": "a", "action": "gcp.unknown.one"},
+        {"taskId": "b", "action": "gcp.unknown.two"},
+    )
+    with caplog.at_level("WARNING"):
+        source = render_dag(contract, provider="gcp", allow_unmapped=True)
+    assert "logger.info" in source
+    warning = " ".join(r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+    assert "a (gcp.unknown.one)" in warning and "b (gcp.unknown.two)" in warning
+
+
+def test_the_environment_switch_is_the_same_opt_in(monkeypatch):
+    contract = _contract("aws", {"taskId": "t", "action": "aws.kinesis.create_stream"})
+    with pytest.raises(ValueError):
+        render_dag(contract, provider="aws")
+    monkeypatch.setenv("FLUID_AIRFLOW_ALLOW_UNMAPPED", "1")
+    assert "create_stream" in render_dag(contract, provider="aws")
+
+
+def test_a_mapped_contract_needs_no_opt_in():
+    contract = _contract("aws", {"taskId": "t", "action": "aws.s3.ensure_bucket"})
+    assert "S3CreateBucketOperator" in render_dag(contract, provider="aws")
+
+
+def test_generate_airflow_takes_allow_unmapped_and_restores_the_environment(monkeypatch):
+    import os
+
+    from fluid_build.cli import generate_airflow
+
+    monkeypatch.delenv("FLUID_AIRFLOW_ALLOW_UNMAPPED", raising=False)
+    parser = argparse.ArgumentParser()
+    generate_airflow.register(parser.add_subparsers())
+    args = parser.parse_args(["generate-airflow", "c.yaml", "--allow-unmapped"])
+    assert args.allow_unmapped is True
+
+    seen = {}
+
+    def forward(args, logger, output):
+        seen["env"] = os.environ.get("FLUID_AIRFLOW_ALLOW_UNMAPPED")
+        return 0
+
+    monkeypatch.setattr(generate_airflow, "_forward", forward)
+    assert generate_airflow.run(args, logging.getLogger("t")) == 0
+    assert seen["env"] == "1"
+    assert "FLUID_AIRFLOW_ALLOW_UNMAPPED" not in os.environ

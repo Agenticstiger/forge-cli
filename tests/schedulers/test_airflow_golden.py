@@ -29,7 +29,10 @@ _BUILTINS = set(vars(__import__("builtins")))
 
 def render(provider: str) -> str:
     source = render_dag(
-        CONTRACTS[provider], provider=provider, provider_config=PROVIDER_CONFIG[provider]
+        CONTRACTS[provider],
+        provider=provider,
+        provider_config=PROVIDER_CONFIG[provider],
+        allow_unmapped=True,
     )
     return re.sub(r"Generated: .*", "Generated: <ts>", source).rstrip() + "\n"
 

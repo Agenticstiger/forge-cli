@@ -18,6 +18,7 @@ a hand-off to ``fluid export``) that disagreed with each other and with
 import argparse
 import contextlib
 import logging
+import os
 import shutil
 import sys
 import tempfile
@@ -71,6 +72,13 @@ Examples:
         help="Contract path relative to $FLUID_PROJECT_DIR on the Airflow worker "
         "(see 'fluid generate schedule --help')",
     )
+    p.add_argument(
+        "--allow-unmapped",
+        dest="allow_unmapped",
+        action="store_true",
+        help="Render a task whose action the provider cannot map as a log-only task "
+        "(with a WARNING) instead of refusing",
+    )
     p.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
 
     p.set_defaults(cmd=COMMAND, func=run)
@@ -79,10 +87,26 @@ Examples:
 def run(args, logger: logging.Logger) -> int:
     """Forward to ``fluid generate schedule --scheduler airflow``."""
     warn(logger, f"'generate-airflow' is deprecated. Use '{SUCCESSOR}' instead.")
+    output = getattr(args, "output", None)
+    if not getattr(args, "allow_unmapped", False):
+        return _forward(args, logger, output)
+    from fluid_build.schedulers.airflow import ALLOW_UNMAPPED_ENV
+
+    prior = os.environ.get(ALLOW_UNMAPPED_ENV)
+    os.environ[ALLOW_UNMAPPED_ENV] = "1"
+    try:
+        return _forward(args, logger, output)
+    finally:
+        if prior is None:
+            os.environ.pop(ALLOW_UNMAPPED_ENV, None)
+        else:
+            os.environ[ALLOW_UNMAPPED_ENV] = prior
+
+
+def _forward(args, logger: logging.Logger, output) -> int:
     try:
         from . import generate_schedule
 
-        output = getattr(args, "output", None)
         # A file, or no -o at all (the DAG goes to stdout): render into a
         # scratch directory, then move or print the one DAG.
         to_file = not output or Path(output).suffix == ".py"

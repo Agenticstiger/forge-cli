@@ -14,6 +14,8 @@ build's own DAG is :mod:`fluid_build.schedulers.airflow.fluid_apply`.
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from fluid_build.engines.base import Severity, ValidationIssue
@@ -33,11 +35,15 @@ from fluid_build.schedulers.airflow._operators import (
     HELPERS,
     IMPORTS,
     RESERVED_NAMES,
+    UNMAPPED,
     TaskContext,
     generic_task,
 )
 from fluid_build.schedulers.base import ScheduleEngine, ScheduleGenerationResult, ScheduleIntent
 from fluid_build.schedulers.registry import register_scheduler
+
+#: Set to 1 to render tasks no emitter maps as log-only tasks instead of refusing.
+ALLOW_UNMAPPED_ENV = "FLUID_AIRFLOW_ALLOW_UNMAPPED"
 
 #: Header lines each provider adds to the DAG docstring, as
 #: ``{provider_config key: header key}``.
@@ -78,7 +84,10 @@ class AirflowScheduler(ScheduleEngine):
                 tasks = schedule_intent.tasks
 
         provider = provider or contract.get("provider", "")
-        provider_config = provider_config or {}
+        provider_config = dict(provider_config or {})
+        allow_unmapped = bool(provider_config.pop("allow_unmapped", False)) or (
+            os.environ.get(ALLOW_UNMAPPED_ENV, "").strip().lower() in ("1", "true", "yes")
+        )
         provider_tasks = [t for t in tasks if t.get("type") == "provider_action"]
 
         dag_code = _render(
@@ -89,6 +98,7 @@ class AirflowScheduler(ScheduleEngine):
             provider,
             provider_config,
             provider_tasks,
+            allow_unmapped=allow_unmapped,
         )
         dag_filename = f"{sanitize_identifier(contract_id)}_dag.py"
         return {dag_filename: dag_code}
@@ -151,14 +161,17 @@ def render_dag(
     *,
     provider: Optional[str] = None,
     provider_config: Optional[Dict[str, Any]] = None,
+    allow_unmapped: bool = False,
 ) -> str:
     """The DAG source for ``contract``'s ``orchestration`` section.
 
     ``provider`` defaults to ``contract["provider"]``. ``provider_config`` takes
     ``project`` / ``region`` (gcp), ``account_id`` / ``region`` (aws) and
     ``connection_id`` / ``account`` / ``database`` / ``warehouse`` (snowflake).
-    Raises ``ValueError`` when the contract has no ``orchestration`` section or
-    it has no tasks: callers (a provider's ``export()``) turn that into their own
+    Raises ``ValueError`` when a task names an action the provider cannot render
+    (``allow_unmapped=True``, or ``FLUID_AIRFLOW_ALLOW_UNMAPPED=1``, renders those as
+    log-only tasks and logs a WARNING), when the contract has no ``orchestration``
+    section or it has no tasks: callers (a provider's ``export()``) turn that into their own
     error.
     """
     orchestration = contract.get("orchestration")
@@ -166,10 +179,11 @@ def render_dag(
         raise ValueError("Contract missing orchestration section")
     if not orchestration.get("tasks"):
         raise ValueError("Orchestration has no tasks")
+    config = dict(provider_config or {})
+    if allow_unmapped:
+        config["allow_unmapped"] = True
     (files,) = (
-        AirflowScheduler()
-        .generate(contract, provider=provider, provider_config=provider_config)
-        .values()
+        AirflowScheduler().generate(contract, provider=provider, provider_config=config).values()
     )
     return files
 
@@ -187,8 +201,16 @@ def _render(
     provider: Optional[str],
     provider_config: Dict[str, Any],
     tasks: List[Dict[str, Any]],
+    *,
+    allow_unmapped: bool = False,
 ) -> str:
-    """Assemble one DAG file: header, imports, DAG, helpers, tasks, edges."""
+    """Assemble one DAG file: header, imports, DAG, helpers, tasks, edges.
+
+    A task whose action no emitter maps would render as a log line and run green
+    without doing what the contract says. That is refused (``ValueError`` naming
+    every such task) unless ``allow_unmapped``, which renders the log lines and
+    logs a WARNING listing them.
+    """
     provider_lower = (provider or "").lower()
     emit = EMITTERS.get(provider_lower)
     # One task per id: the DAG is keyed by task id, and two blocks with one id fail
@@ -198,6 +220,7 @@ def _render(
 
     task_blocks: List[str] = []
     uses: set = set()
+    unmapped: List[str] = []
     for task in tasks:
         ctx = TaskContext(
             task=task, var=identifiers[task.get("taskId") or ""], config=provider_config
@@ -205,6 +228,23 @@ def _render(
         code, used = (emit or (lambda c: generic_task(c)))(ctx)
         task_blocks.append(code)
         uses |= used
+        if UNMAPPED in used:
+            unmapped.append(f"{ctx.task_id} ({ctx.action or 'no action'})")
+    if unmapped:
+        listing = ", ".join(unmapped)
+        if not allow_unmapped:
+            raise ValueError(
+                f"{len(unmapped)} task(s) name an action {provider or 'no provider'!r} cannot "
+                f"render, so the DAG would run them as a log line and still succeed: {listing}. "
+                f"Fix the action, or set {ALLOW_UNMAPPED_ENV}=1 "
+                "(generate-airflow --allow-unmapped) to render them as log-only tasks."
+            )
+        logging.getLogger(__name__).warning(
+            "Airflow DAG %s: %d task(s) are log-only, they do not run their action: %s",
+            contract_id,
+            len(unmapped),
+            listing,
+        )
 
     header_kwargs = {
         header_key: provider_config[config_key]
