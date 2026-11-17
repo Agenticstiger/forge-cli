@@ -162,7 +162,9 @@ class TestNonGlueIcebergCatalog:
 # ---------------------------------------------------------------------------
 
 #: The emit of an Iceberg expose with no ``catalog`` (minus the contract YAML
-#: parameter), as forge-cli emitted it before ``location.catalog`` was read.
+#: parameter), as forge-cli emitted it before ``location.catalog`` was read, plus the
+#: first metadata Glue writes for a new table (``_add_iceberg_metadata``), which leaves
+#: ``table_type`` to Glue.
 ABSENT_CATALOG_GOLDEN: Dict[str, Any] = {
     "aws_glue_catalog_database": {
         "analytics_lake_sales": {"name": "sales", "lifecycle": {"ignore_changes": ["parameters"]}}
@@ -172,16 +174,16 @@ ABSENT_CATALOG_GOLDEN: Dict[str, Any] = {
             "name": "orders",
             "database_name": "${aws_glue_catalog_database.analytics_lake_sales.name}",
             "table_type": "EXTERNAL_TABLE",
-            "parameters": {
-                "classification": "iceberg",
-                "managed_by": "fluid",
-                "table_type": "ICEBERG",
-            },
+            "parameters": {"classification": "iceberg", "managed_by": "fluid"},
             "storage_descriptor": {
                 "columns": [{"name": "order_id", "type": "string"}, {"name": "qty", "type": "int"}],
                 "location": "s3://lake/orders/",
             },
-            "lifecycle": {"ignore_changes": ["parameters"]},
+            "open_table_format_input": {
+                "iceberg_input": {"metadata_operation": "CREATE", "version": "2"}
+            },
+            "lifecycle": {"ignore_changes": ["parameters", "open_table_format_input"]},
+            "depends_on": ["aws_s3_bucket.analytics_lake_lake"],
         }
     },
     "aws_s3_bucket": {

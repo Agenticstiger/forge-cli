@@ -1036,11 +1036,14 @@ def _append_output_port_actions(
     reviewed, not what is applied; ``planDigest`` covers them. Never on a managed streaming
     plan, whose apply runs no OpenTofu and checks its actions against its artifacts one for
     one."""
+    # The Spark builds' job runs (``spark.reconcile``), which no OpenTofu resource starts.
+    from fluid_build.cli._spark_apply import planned_actions as _spark_actions
+
     actions = list(plan.get("actions") or [])
     present = {a.get("action_id") for a in actions if isinstance(a, dict)}
     added = [
         action
-        for action in _output_port_actions(contract, args, logger)
+        for action in [*_output_port_actions(contract, args, logger), *_spark_actions(contract)]
         if action.get("action_id") not in present
     ]
     if not added:
