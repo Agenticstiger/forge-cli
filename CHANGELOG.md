@@ -53,8 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     cancels the run on SIGTERM. `fluid spark status <contract>` shows each build's recent runs.
   - A contract's `parameters.spark.sparkConf` sets resource and tuning settings only; the
     operator lists any other key in `FLUID_SPARK_CONF_ALLOWLIST`. Keys that load code or
-    environment into the job (`spark.jars*`, `spark.sql.extensions`, `spark.sql.catalog*`,
-    `spark.plugins`, `extraJavaOptions`, `spark.hadoop.*`, env keys and the like) are refused
+    environment into the job, or move what it writes (`spark.jars*`, `spark.sql.extensions`,
+    `spark.sql.catalog*`, `spark.plugins`, `extraJavaOptions`, `defaultJavaOptions`,
+    `spark.pyspark.*`, `spark.hadoop.*`, env keys, the warehouse and checkpoint location, and
+    the rest of the infrastructure emit's list) are refused
     even when listed, by name or by a prefix such as `spark.sql.*`, as the infrastructure emit
     refuses them. `FLUID_SPARK_WAIT_SECONDS` caps the reconcile's
     waits (default 900).

@@ -88,12 +88,43 @@ _CONF_DENIED = frozenset(
         "spark.plugins",
         # Under the adaptive prefix, but it names a class Spark loads.
         "spark.sql.adaptive.customCostEvaluatorClass",
+        "spark.sql.streaming.stateStore.providerClass",
+        # Move what the job writes, or switch off what the runner relies on.
+        "spark.sql.defaultCatalog",
+        "spark.sql.warehouse.dir",
+        "spark.sql.streaming.checkpointLocation",
+        "spark.sql.streaming.streamingQueryListeners",
+        "spark.sql.variable.substitute",
+        "spark.sql.session.timeZone",
+        "spark.sql.mapKeyDedupPolicy",
+        "spark.driver.userClassPathFirst",
+        "spark.executor.userClassPathFirst",
+        "spark.driver.defaultJavaOptions",
+        "spark.executor.defaultJavaOptions",
+        "spark.authenticate",
+        "spark.master",
     }
 )
 #: The schema's sparkConf key names; checked here too, for a caller that skips the schema.
 _CONF_KEY = re.compile(r"[A-Za-z0-9_.-]{1,256}")
+#: With :data:`_CONF_DENIED`, at least the infrastructure emit's own list
+#: (``iac/providers/aws_identity.py::DENIED_SPARK_CONF``; a test checks the two agree).
 _CONF_DENIED_PREFIXES = (
     "spark.jars",
+    "spark.files.",
+    "spark.plugins.",
+    "spark.pyspark.",
+    "spark.python.",
+    "spark.emr-serverless.executorEnv.",
+    "spark.emr-serverless.lakeformation.",
+    "spark.kerberos.",
+    "spark.security.",
+    "spark.authenticate.",
+    "spark.ssl.",
+    "spark.redaction.",
+    "spark.eventLog.",
+    "spark.ui.",
+    "spark.app.",
     "spark.submit.",
     "spark.sql.extensions",
     "spark.sql.catalog",

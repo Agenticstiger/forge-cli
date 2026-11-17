@@ -401,3 +401,30 @@ def test_without_an_application_id_the_products_own_application_is_used(contract
     contract["builds"][0]["properties"]["parameters"]["spark"].pop("applicationId", None)
     (run,) = _desired.desired_runs(contract, account=ACCOUNT)
     assert run.target == {"applicationName": "fluid-commerce.orders-stream-spark"}
+
+
+def test_every_key_the_infrastructure_emit_denies_is_denied_here():
+    """fluid spark run is no looser than fluid apply: the IaC emit's deny list is a subset."""
+    identity = pytest.importorskip("fluid_build.iac.providers.aws_identity")
+    entries = getattr(identity, "DENIED_SPARK_CONF", None)
+    if entries is None:
+        pytest.skip("the IaC emit's DENIED_SPARK_CONF has not landed")
+    keys = [e[:-1] + "probe" if e.endswith("*") else e for e in entries]
+    assert [k for k in keys if not _desired._conf_denied(k)] == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "spark.driver.defaultJavaOptions",
+        "spark.executor.userClassPathFirst",
+        "spark.emr-serverless.executorEnv.X",
+        "spark.pyspark.python",
+        "spark.sql.warehouse.dir",
+        "spark.sql.streaming.checkpointLocation",
+        "spark.ssl.enabled",
+        "spark.master",
+    ],
+)
+def test_the_wider_deny_list_holds_under_a_star(key):
+    assert not _desired._conf_allowed(key, ["*"])
