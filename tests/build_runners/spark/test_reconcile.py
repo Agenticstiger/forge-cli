@@ -261,9 +261,7 @@ def scheduled(run):
 
 
 def once(run, clock, say=None, **kw):
-    return rc.run_once(
-        run, sleep=clock.sleep, now=clock.now, env=ENV, say=say or (lambda _t: None), **kw
-    )
+    return rc.run_once(run, sleep=clock.sleep, now=clock.now, say=say or (lambda _t: None), **kw)
 
 
 def test_a_scheduled_run_waits_to_succeeded(scheduled, clock, use):
@@ -284,13 +282,6 @@ def test_a_scheduled_run_that_fails_is_an_error(scheduled, clock, use):
     use(FakeAdapter(start_states=("RUNNING", "FAILED"), start_details="exit 1"))
     out = once(scheduled, clock)
     assert (out.action, out.error) == ("failed", True) and "exit 1" in out.message
-
-
-def test_no_wait_returns_once_started(scheduled, clock, use):
-    fake = FakeAdapter(start_states=("PENDING",))
-    use(fake)
-    out = once(scheduled, clock, wait=False)
-    assert (out.action, out.state, out.error, clock.slept) == ("started", "PENDING", False, [])
 
 
 def test_a_run_that_outlives_the_timeout_is_cancelled(scheduled, clock, use):
@@ -334,14 +325,11 @@ def test_ctrl_c_whose_cancel_fails_says_the_run_may_still_be_going(scheduled, cl
     assert "could not be cancelled" in out.message and "by hand" in out.message
 
 
-def test_a_streaming_build_is_reconciled_instead(run, clock, use):
-    fake = FakeAdapter()
-    use(fake)
-    assert once(run, clock).action == "started"
-    fake = FakeAdapter([info("jr9", "FAILED", hash_=run.config_hash)])
-    use(fake)
-    assert once(run, clock).action == "failed"
-    assert once(run, clock, restart=True).action == "started"
+def test_run_once_has_no_run_to_start_for_a_stream(run, clock, use):
+    built = use(FakeAdapter())
+    with pytest.raises(ValueError, match="stream that fluid apply keeps running"):
+        once(run, clock)
+    assert built == []
 
 
 def test_run_once_turns_an_aws_error_into_an_outcome(scheduled, clock, monkeypatch):
@@ -395,7 +383,7 @@ def test_run_build_waits_as_long_as_the_build_says(contract, monkeypatch, runtim
 
     monkeypatch.setattr(rc, "run_once", run_once)
     assert rc.run_build(contract, build, dry_run=False, say=lambda _t: None) == 0
-    assert (seen["build"], seen["timeout"], seen["wait"]) == ("ingest-orders", wait, True)
+    assert (seen["build"], seen["timeout"]) == ("ingest-orders", wait)
 
 
 def test_a_stream_fluid_apply_keeps_running_has_no_run_to_start(contract, use):
@@ -431,6 +419,29 @@ def test_an_unusable_runtime_timeout_is_refused_before_anything_starts(contract,
     with pytest.raises(ValueError, match="execution.runtime.timeout 'soon'"):
         rc.run_build(contract, build, dry_run=False, say=print)
     assert built == []
+
+
+def test_an_interrupted_run_is_cancelled_and_stops_the_apply(contract, use):
+    contract, build = _available_now(contract)
+    fake = FakeAdapter(start_states=("INTERRUPT",))
+    use(fake)
+    said = []
+    with pytest.raises(KeyboardInterrupt):
+        rc.run_build(contract, build, dry_run=False, say=said.append)
+    assert fake.calls == ["start", "cancel new"]
+    assert said[-1].startswith("Spark ingest-orders (emr-serverless): cancelled run new")
+
+
+def test_run_refusal_reads_no_cloud_and_names_what_blocks_a_run(contract):
+    contract, build = _available_now(contract)
+    assert rc.run_refusal(contract, build) is None
+    build["execution"] = {"runtime": {"timeout": "soon"}}
+    assert "execution.runtime.timeout 'soon'" in rc.run_refusal(contract, build)
+    # A stream fluid apply keeps running waits for nothing, so its timeout is not read.
+    del build["properties"]["stream"]["trigger"]
+    assert rc.run_refusal(contract, build) is None
+    contract["fluidVersion"] = "0.7.6"
+    assert "fluidVersion 0.7.7" in rc.run_refusal(contract, build)
 
 
 def test_the_operators_policy_refuses_before_anything_starts(contract, use):

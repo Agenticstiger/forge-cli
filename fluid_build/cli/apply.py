@@ -411,6 +411,30 @@ def _gate_databricks_sdk_for_apply(
         )
 
 
+def _gate_spark_builds_for_apply(contract: Dict[str, Any], build_id: Optional[str]) -> None:
+    """Refuse, before anything is applied, a Spark build the build phase would refuse
+    without starting it (``build_runners.spark._reconcile.run_refusal``): a contract before
+    the managed lane, or an ``execution.runtime.timeout`` it cannot read. The build phase
+    runs after ``tofu apply``, so it used to provision the product and then fail.
+
+    Raises:
+        CLIError: ``apply_spark_invalid``.
+    """
+    from fluid_build.build_runners.base import is_spark_job_build
+    from fluid_build.build_runners.spark._reconcile import run_refusal
+
+    for build in contract.get("builds") or []:
+        if not isinstance(build, dict) or not is_spark_job_build(build):
+            continue
+        if isinstance(build_id, str) and build_id and build.get("id") != build_id:
+            continue
+        refusal = run_refusal(contract, build)
+        if refusal:
+            raise CLIError(
+                1, "apply_spark_invalid", {"error": refusal, "hint": "Nothing was applied."}
+            )
+
+
 def _gate_selected_build_for_apply(contract: Dict[str, Any], build_id: Optional[str]) -> None:
     """Refuse, before anything is applied, a ``--build-id`` that names no build.
 
@@ -2149,6 +2173,7 @@ def run(args, logger: logging.Logger) -> int:
         if needs_build(resolved_mode):
             _gate_build_ids_for_apply(source_contract)
             _gate_selected_build_for_apply(source_contract, resolved_build_id)
+            _gate_spark_builds_for_apply(source_contract, resolved_build_id)
             _gate_databricks_sdk_for_apply(
                 source_contract,
                 resolved_build_id,

@@ -18,8 +18,9 @@ time, because the checkout lives somewhere else there than it does in CI.
 
 A forge Spark build (``engine: spark`` with ``parameters.spark``, on EMR Serverless, Glue, EMR
 on EC2 or EMR on EKS) gets the same DAG: the build phase of that ``fluid apply`` starts one run
-on its runtime and waits for it, and fails the task unless the run succeeded. The task may run
-as long as the run may (``execution.runtime.timeout``), plus :data:`SPARK_TASK_MARGIN_S`. A
+on its runtime and waits for it, and fails the task unless the run succeeded. The task gets the
+three hours every apply DAG's task gets (:data:`APPLY_TASK_TIMEOUT_S`, for ``tofu`` and the
+rest of the apply) plus as long as the run may take (``execution.runtime.timeout``). A
 stream that is not ``trigger.availableNow`` runs continuously and ``fluid apply`` keeps it
 running, so it gets no DAG.
 
@@ -89,8 +90,9 @@ DEFAULT_RETRIES = 3
 #: How long a Spark run may take when the build does not say (``execution.runtime.timeout``):
 #: ``build_runners.spark._reconcile.DEFAULT_RUN_WAIT_S``.
 DEFAULT_SPARK_WAIT_S = 6 * 3600
-#: How much longer than that wait the Airflow task may run, so fluid cancels the run first.
-SPARK_TASK_MARGIN_S = 600
+#: How long an apply DAG's task may run: the ``execution_timeout`` of every DAG here. A
+#: Spark build's task gets this on top of its run's wait, so fluid cancels the run first.
+APPLY_TASK_TIMEOUT_S = 3 * 3600
 MAX_RETRIES = 10
 
 #: Name prefixes of the variables that reach ``fluid apply`` from the worker
@@ -471,8 +473,9 @@ def _check_spark_ids(contract: Dict[str, Any], build_id: str) -> None:
 
 
 def _task_timeout_s(build: Dict[str, Any], build_id: str) -> int:
-    """How long a Spark build's task may run: its run's wait (``execution.runtime.timeout``,
-    else :data:`DEFAULT_SPARK_WAIT_S`) plus :data:`SPARK_TASK_MARGIN_S`, so fluid cancels the
+    """How long a Spark build's task may run: the apply's own :data:`APPLY_TASK_TIMEOUT_S`
+    (``tofu`` and the rest run before the run starts) plus the run's wait
+    (``execution.runtime.timeout``, else :data:`DEFAULT_SPARK_WAIT_S`), so fluid cancels the
     run before Airflow kills the task. A timeout it cannot read is refused, never guessed."""
     from fluid_build.spark.compiler import run_timeout_seconds
 
@@ -480,7 +483,7 @@ def _task_timeout_s(build: Dict[str, Any], build_id: str) -> int:
         wait = run_timeout_seconds(build)
     except ValueError as exc:
         raise ScheduleRenderError(f"build {build_id!r}: {exc}") from exc
-    return (wait or DEFAULT_SPARK_WAIT_S) + SPARK_TASK_MARGIN_S
+    return APPLY_TASK_TIMEOUT_S + (wait or DEFAULT_SPARK_WAIT_S)
 
 
 def scheduled_builds(contract: Dict[str, Any]) -> List[ScheduledBuild]:

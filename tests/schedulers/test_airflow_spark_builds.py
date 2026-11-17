@@ -98,7 +98,7 @@ def test_the_spark_dag_is_the_apply_dag_but_for_its_task_timeout(monkeypatch):
     dbt["execution"]["trigger"]["schedule"] = "0 2 * * *"
     (spark,) = _render(_contract()).values()
     (apply,) = _render(_contract(dbt)).values()
-    assert spark.replace("timedelta(seconds=22200)", "timedelta(hours=3)") == apply
+    assert spark.replace("timedelta(seconds=32400)", "timedelta(hours=3)") == apply
     assert "spark" not in spark.lower()
 
 
@@ -150,8 +150,8 @@ def test_the_task_outlives_the_runtime_timeout_the_run_waits_for(monkeypatch):
     build["execution"]["runtime"] = {"timeout": "PT2H"}
     (source,) = _render(_contract(build)).values()
     loaded = load_dag(source, monkeypatch)
-    # The build phase cancels the run at two hours, before Airflow kills the task.
-    assert loaded.dag["default_args"]["execution_timeout"] == timedelta(hours=2, minutes=10)
+    # The apply's own three hours, then the run's two: fluid cancels the run first.
+    assert loaded.dag["default_args"]["execution_timeout"] == timedelta(hours=5)
     (task,) = loaded.tasks
     assert set(task["env"]) == {
         "FLUID_DAG_CONTRACT",
@@ -164,7 +164,7 @@ def test_the_task_outlives_the_runtime_timeout_the_run_waits_for(monkeypatch):
 def test_without_a_runtime_timeout_the_task_outlives_the_default_wait(monkeypatch):
     (source,) = _render(_contract()).values()
     loaded = load_dag(source, monkeypatch)
-    assert loaded.dag["default_args"]["execution_timeout"] == timedelta(hours=6, minutes=10)
+    assert loaded.dag["default_args"]["execution_timeout"] == timedelta(hours=9)
 
 
 def test_an_apply_dag_keeps_its_three_hours(monkeypatch):

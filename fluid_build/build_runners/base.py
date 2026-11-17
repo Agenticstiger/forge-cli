@@ -380,8 +380,7 @@ def is_spark_job_build(build: Dict[str, Any]) -> bool:
     """True for a build forge's Spark runner runs (``build_runners/spark``): ``engine:
     spark`` with ``properties.parameters.spark``, whatever else it declares (a batch job's
     ``properties.sql`` is Spark SQL for its runtime, not inline SQL for DuckDB)."""
-    engine = build.get("engine")
-    if not isinstance(engine, str) or engine.strip().lower() != "spark":
+    if build.get("engine") != "spark":  # the compiler's and the renderer's spelling
         return False
     props = build.get("properties")
     parameters = props.get("parameters") if isinstance(props, dict) else None
@@ -391,10 +390,8 @@ def is_spark_job_build(build: Dict[str, Any]) -> bool:
 def _spark_without_runner(build: Dict[str, Any]) -> bool:
     """True for an ``engine: spark`` build nothing here can run: no ``parameters.spark``
     for forge's Spark runner, and no platform of its own (``execution.runtime.platform``)."""
-    engine = build.get("engine")
     return (
-        isinstance(engine, str)
-        and engine.strip().lower() == "spark"
+        build.get("engine") == "spark"
         and not is_spark_job_build(build)
         and embedded_sql_platform(build) in LOCAL_SQL_PLATFORMS
     )
@@ -1655,6 +1652,11 @@ def run_builds_from_args(
                     break
             continue
 
+        if is_externally_run_build(build):
+            _report_externally_run_build(build, build_id, report, contract)
+            total_external += 1
+            continue
+
         if is_spark_job_build(build):
             # forge's Spark runner: one run of a scheduled build, waited for. A stream is
             # kept running by this apply's spark.reconcile action, not run here.
@@ -1672,11 +1674,6 @@ def run_builds_from_args(
                 total_failed += 1
                 if args.fail_fast:
                     break
-            continue
-
-        if is_externally_run_build(build):
-            _report_externally_run_build(build, build_id, report, contract)
-            total_external += 1
             continue
 
         if _runs_outside_forge_continuously(build):

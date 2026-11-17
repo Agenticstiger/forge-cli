@@ -349,27 +349,25 @@ def run_once(
     run: DesiredRun,
     *,
     clients: Optional[ClientFactory] = None,
-    wait: bool = True,
     timeout: float = DEFAULT_RUN_WAIT_S,
-    restart: bool = False,
     say: Callable[[str], None] = print,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
-    env: Optional[Mapping[str, str]] = None,
 ) -> Outcome:
-    """One run of a build, for its scheduler (:func:`run_build`).
+    """One run of a scheduled build, for its scheduler (:func:`run_build`): start it and wait
+    for it to end. The outcome is an error unless it SUCCEEDED. Ctrl-C, SIGTERM or SIGHUP
+    while it is waited on cancel it, and the outcome is ``cancelled`` (an error).
 
-    A scheduled build starts a run and, with ``wait``, waits for it to end; the outcome is an
-    error unless it SUCCEEDED. Ctrl-C, SIGTERM or SIGHUP while it is waited on cancel it, and
-    the outcome is ``cancelled`` (an error). A long-running build is reconciled instead
-    (``restart`` starts it again after a failure).
+    Raises:
+        ValueError: ``run`` is a stream; ``fluid apply`` keeps it running (:func:`reconcile`).
     """
     from fluid_build.build_runners._databricks_job_run import interrupt_guard
 
     if not run.scheduled:
-        return reconcile(
-            [run], clients=clients, restart_failed=restart, sleep=sleep, now=now, env=env
-        )[0]
+        raise ValueError(
+            f"Spark build {run.build} is a stream that fluid apply keeps running; it has no "
+            "run to start and wait for"
+        )
     started: List[str] = []
     try:
         adapter = adapter_for(run, clients)
@@ -403,9 +401,6 @@ def run_once(
                     started.append(adapter.start(_token(run)))
                     say(f"Spark {run.build}: started run {started[0]} on {out.where}")
                 run_id = out.run_id = started[0]
-                if not wait:
-                    out.state = adapter.get(run_id).state
-                    return out
                 ended = clock.until(
                     lambda: adapter.get(run_id), lambda i: i.state in TERMINAL, timeout
                 )
@@ -464,8 +459,10 @@ def run_build(
 
     Raises:
         FluidUserError: the operator's policy refuses the build.
-        ValueError: the build does not compile, is not on the managed lane, or its
-            ``execution.runtime.timeout`` cannot be read; nothing was started.
+        ValueError: the build does not compile, or :func:`run_refusal` names why it cannot
+            run; nothing was started.
+        KeyboardInterrupt: Ctrl-C, SIGTERM or SIGHUP while the run was waited on; the run
+            was cancelled, and the apply stops as an interrupt always stops it.
     """
     import copy
 
@@ -474,13 +471,16 @@ def run_build(
     from fluid_build.spark.compiler import run_timeout_seconds
 
     bid = str(build.get("id"))
+    refusal = run_refusal(contract, build)
+    if refusal:
+        raise ValueError(refusal)
     # As fluid plan and fluid apply read it: ``{{ env.* }}`` resolved.
     resolved = resolve_contract_env_templates(copy.deepcopy(dict(contract)))
     runs = desired_runs(resolved, build_id=bid)
     if not runs:
         raise ValueError(
-            f"Spark build {bid}: forge's Spark runner reads a contract of fluidVersion 0.7.7 "
-            "or later; this one is not, so nothing runs it"
+            f"Spark build {bid}: forge's Spark runner runs a build of engine: spark with "
+            "properties.parameters.spark; this one is not, so nothing runs it"
         )
     run = runs[0]
     if not run.scheduled:
@@ -492,6 +492,30 @@ def run_build(
             f"{int(timeout)} s for it to end"
         )
         return 0
-    outcome = run_once(run, clients=clients, wait=True, timeout=timeout, say=say)
+    outcome = run_once(run, clients=clients, timeout=timeout, say=say)
     say(outcome.line())
+    if outcome.action == "cancelled":
+        raise KeyboardInterrupt  # the run was cancelled; stop the apply, as Ctrl-C does
     return 1 if outcome.error else 0
+
+
+def run_refusal(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Optional[str]:
+    """Why :func:`run_build` would refuse ``build`` without starting anything, else ``None``:
+    a contract before the managed lane (fluidVersion 0.7.7), or a run that ends on its own
+    with an ``execution.runtime.timeout`` it cannot read. Reads no cloud, so ``fluid apply``
+    checks it before ``tofu apply`` changes anything."""
+    from fluid_build.spark.compiler import run_timeout_seconds, runs_to_completion
+    from fluid_build.streaming.compiler import managed_lane_enabled
+
+    bid = build.get("id")
+    if not managed_lane_enabled(contract):
+        return (
+            f"Spark build {bid}: forge's Spark runner reads a contract of fluidVersion 0.7.7 "
+            "or later; this one is not, so nothing runs it"
+        )
+    if runs_to_completion(build):
+        try:
+            run_timeout_seconds(build)
+        except ValueError as exc:
+            return f"Spark build {bid}: {exc}"
+    return None

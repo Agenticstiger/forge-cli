@@ -73,9 +73,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   amend-and-build --build-id <id>`, the path every scheduled build takes: it starts one run on
   EMR Serverless, Glue, EMR on EC2 or EMR on EKS, waits for it, and fails unless the run
   succeeded. Ctrl-C, SIGTERM or SIGHUP cancel the run. `execution.runtime.timeout` (an ISO-8601
-  duration, six hours when unset) is how long the run may take. Airflow renders the standard
-  `fluid apply` DAG for it (task `fluid_apply`), whose task timeout is that wait plus ten
-  minutes. Retries come from `execution.retries.maxAttempts`, as for every scheduled build. A
+  duration, six hours when unset) is how long the run may take; an unreadable one is refused
+  before `tofu apply` changes anything. Airflow renders the standard `fluid apply` DAG for it
+  (task `fluid_apply`), whose task timeout is the three hours every apply DAG gets plus that
+  wait. The worker runs the whole apply, `tofu` included, so it needs the apply's permissions
+  and the state backend, as for any scheduled build; the scheduler policy forge emits for a
+  Spark product covers the run only. Retries come from `execution.retries.maxAttempts`, as for
+  every scheduled build. A
   streaming Spark build that is not `trigger.availableNow` gets no DAG: `fluid apply` keeps it
   running. An `engine: spark` build with neither `parameters.spark` nor a runtime platform of its
   own is refused with what to declare, instead of running as a local python script.
