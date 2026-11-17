@@ -18,8 +18,6 @@ metadata:
   layer: Bronze
   owner:
     team: data-engineering
-    email: data-eng@company.com
-
 # ─── Expose: Crawler-managed table ──────────────────────────
 
 exposes:

@@ -298,22 +298,26 @@ def register(subparsers: argparse._SubParsersAction):
         ),
     )
 
-    # Product-metadata flags — let the non-interactive --blueprint scaffold fill
-    # the contract's domain + ownership without prompting (blueprint_mode reads
-    # args.domain / args.owner_team / args.owner_email). Other modes ignore them.
+    # Product-metadata flags: the non-interactive --blueprint and --discover
+    # scaffolds fill the contract's domain + ownership from them without prompting
+    # (both read args.domain / args.owner_team / args.owner_email). Other modes
+    # ignore them. Without --owner-email the contract carries no email.
     p.add_argument(
         "--domain",
-        help="Business domain for the product (e.g. marketing). Used by --blueprint.",
+        help="Business domain (e.g. marketing). Used by --blueprint and --discover.",
     )
     p.add_argument(
         "--owner-team",
         dest="owner_team",
-        help="Owning team for the product. Used by --blueprint.",
+        help="Owning team for the product. Used by --blueprint and --discover.",
     )
     p.add_argument(
         "--owner-email",
         dest="owner_email",
-        help="Owner contact email for the product. Used by --blueprint.",
+        help=(
+            "Owner contact email for the product (left out of the contract when not given). "
+            "Used by --blueprint and --discover."
+        ),
     )
 
     # Use case / persona (advanced — hidden from default --help)

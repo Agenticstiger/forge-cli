@@ -222,7 +222,6 @@ metadata:
   productType: ADP         # Data Mesh vocabulary — Bronze↔SDP, Silver↔ADP, Gold↔CDP
   owner:
     team: customer-platform
-    email: customer-platform@example.com
 
 # WHERE MAY THE DATA LIVE?  Checked at validate time, before any cloud call.
 sovereignty:

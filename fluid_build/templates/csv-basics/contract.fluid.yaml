@@ -11,8 +11,7 @@ tags:
 metadata:
   productType: SDP
   owner:
-    team: data-team
-    email: data-team@company.com
+    team: csv-analytics
 exposes:
 - exposeId: customers_clean
   title: Clean Customer Data

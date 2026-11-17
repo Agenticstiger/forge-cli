@@ -33,7 +33,6 @@ metadata:
   productType: SDP
   owner:
     team: data-engineering
-    email: dataeng@example.com
 exposes:
 - exposeId: product_catalog
   title: Product Catalog with Price Tiers

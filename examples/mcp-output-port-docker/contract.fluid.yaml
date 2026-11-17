@@ -14,7 +14,6 @@ metadata:
   layer: Silver
   owner:
     team: telco-data-platform
-    email: data-platform@example.com
 exposes:
   - exposeId: customer_segments
     title: Customer Segments (Postgres)

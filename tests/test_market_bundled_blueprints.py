@@ -98,8 +98,8 @@ def test_render_applies_defaults_when_params_omitted():
     contract = render_bundled_contract(bp, {"product_name": "Only Name"})
     owner = contract["metadata"]["owner"]
     # Defaults from _COMMON_PARAMS.
-    assert owner["team"] == "data-team"
-    assert owner["email"] == "team@example.com"
+    assert owner["team"] == "data-platform"
+    assert "email" not in owner  # a blank email is left out, never a stand-in
     assert contract["domain"] == "example"
     _assert_valid_074(contract)
 

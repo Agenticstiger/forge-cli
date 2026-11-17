@@ -13,7 +13,6 @@ metadata:
   productType: ADP
   owner:
     team: data-platform
-    email: data-platform@company.com
 exposes:
 - exposeId: transactions_processed
   title: Processed Transactions

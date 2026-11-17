@@ -86,7 +86,6 @@ metadata:
   layer: Gold
   owner:
     team: data-platform
-    email: platform@example.com
 
 # 1. THE LOGIC — How is it built?
 builds:
