@@ -214,10 +214,11 @@ def test_lineage_fixtures_preserve_input_ports_across_odps_exports(
     # surfaces that name the product rather than one of its ports.
     assert [port["name"] for port in odps_standard["inputPorts"]] == expected_ids
     assert [port["contractId"] for port in odps_standard["inputPorts"]] == expected_contract_ids
-    # DMM removes product-to-product consumes from the ODPS inputPorts and
-    # publishes them as first-class Entropy Access agreements instead. This
-    # avoids mirroring upstream products as SourceSystems in the DMM graph.
-    assert "inputPorts" not in dmm_odps
+    # DMM sends the same input ports: Entropy draws the product -> product
+    # edge from each one's contractId (an Access agreement for the pair, sent
+    # as well, takes it over once approved).
+    assert [port["name"] for port in dmm_odps["inputPorts"]] == expected_ids
+    assert [port["contractId"] for port in dmm_odps["inputPorts"]] == expected_contract_ids
     access_edges = {
         (
             preview["payload"]["provider"]["dataProductId"],

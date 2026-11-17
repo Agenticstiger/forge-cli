@@ -18,14 +18,14 @@ What's here:
   shape before round-trip through the ODPS converter.
 * :func:`ensure_odps_output_port_display_names` — DMM display labels
   on ODPS output ports.
-* :func:`remove_odps_product_consume_input_ports` — drop
-  product-level consumes from ODPS input ports (Access resources
-  carry that lineage instead).
 * :func:`ensure_odps_input_port_contract_ids` — backfill / promote
   ``contractId`` from FLUID ``consumes``.
 * :func:`ensure_odps_input_port_source_system_custom_property` —
   legacy DMM compatibility for deployments that still need a
   ``sourceSystem`` custom property.
+* :func:`promote_input_port_native_source_system_fields` — the
+  ``sourceSystemId`` / ``type`` custom properties Entropy links an input
+  port to a SourceSystem by.
 """
 
 from __future__ import annotations
@@ -33,11 +33,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Mapping, Optional
 
-from fluid_build.providers.odps_standard.mappers.ports import (
-    input_port_contract_id,
-    remove_output_port_input_contracts,
+from fluid_build.providers.odps_standard.mappers.ports import input_port_contract_id
+from fluid_build.util.contract import (
+    builds_to_canonical_input_ports,
+    consumes_to_canonical_ports,
+    kind_to_dmm_type,
 )
-from fluid_build.util.contract import consumes_to_canonical_ports, kind_to_dmm_type
 
 LOG = logging.getLogger("fluid.providers.datamesh_manager.odps")
 
@@ -162,116 +163,6 @@ def ensure_odps_output_port_display_names(
         port["customProperties"] = props
 
 
-def remove_odps_product_consume_input_ports(
-    odps_payload: Dict[str, Any], fluid: Mapping[str, Any]
-) -> None:
-    """Remove product-to-product consumes from ODPS input ports.
-
-    Entropy's graph uses Access resources for product-to-product lineage.
-    If we keep product consumes as ODPS input ports, those upstream
-    products have to be mirrored as SourceSystems and the UI renders
-    duplicate graph nodes. Explicit source-system consumes remain as input
-    ports.
-
-    A removed port's ``outputPorts[].inputContracts`` entry goes with it — see
-    :func:`fluid_build.providers.odps_standard.mappers.ports.remove_output_port_input_contracts`.
-
-    Matching strategy: we identify product-consume ports by **both**
-    ``(id, name)`` (the canonical exposeId — matches the inputPort before
-    the dedup-rename in :func:`fluid_build.providers.odps_standard.mappers
-    .ports.map_input_ports`) **and** ``contractId == upstream productId``
-    (which survives the dedup-rename intact). The dedup-rename happens
-    when two consumes share an exposeId — the second gets a productId-tail
-    prefix on its name but the contractId points at the original upstream
-    productId. Without the contractId check, dedup-renamed ports leak
-    through as inputPorts on gold products that consume two ports from
-    the same silver upstream.
-    """
-    input_ports = odps_payload.get("inputPorts")
-    if not isinstance(input_ports, list) or not input_ports:
-        return
-
-    product_port_names: set[str] = set()
-    product_contract_ids: set[str] = set()
-    # The id the exporter actually stamps on a product-consume's input port,
-    # read from the same helper the exporter uses so the convention has one
-    # definition. Matching on it catches a renamed port whatever shape the
-    # rename took, including the numeric-suffix fallback that carries no
-    # ``__`` for the name checks below to find.
-    product_derived_contract_ids: set[str] = set()
-    for canonical in consumes_to_canonical_ports(fluid, logger=LOG):
-        reference = canonical.get("reference")
-        if not reference or canonical.get("source_system_id"):
-            continue
-        for key in ("id", "name"):
-            value = canonical.get(key)
-            if value:
-                product_port_names.add(str(value))
-        product_contract_ids.add(str(reference))
-        derived = input_port_contract_id(canonical)
-        if derived:
-            product_derived_contract_ids.add(str(derived))
-
-    if not product_port_names and not product_contract_ids:
-        return
-
-    def _is_product_consume(port: Any) -> bool:
-        if not isinstance(port, Mapping):
-            return False
-        name = str(port.get("name", ""))
-        # An exact match on the derived contract id is the most specific
-        # signal there is: it is ``{productId}.{exposeId}`` or an id the
-        # author pinned, not the bare productId the checks below fall back
-        # to, so it cannot catch a source-system port that merely shares an
-        # upstream. Being independent of the NAME is what matters — the name
-        # checks below miss two of the three rename shapes, a productId tail
-        # containing ``__`` of its own (``silver.crm__core`` →
-        # ``crm__core__customers``, split at the wrong ``__``) and the
-        # numeric-suffix fallback (``customers_2``, no ``__`` to find at
-        # all). Both leaked a port Entropy cannot resolve, and since the
-        # lineage key mirrors the ports, they leaked twice.
-        if str(port.get("contractId", "")) in product_derived_contract_ids:
-            return True
-        # Fast path — original (pre-Gap-3) behavior. A port whose name is
-        # exactly a canonical product-consume exposeId is a product-consume
-        # regardless of contractId. This is the legacy path that
-        # ``test_removes_input_ports_key_when_only_product_consumes_exist``
-        # exercises (port has only ``name``, no ``contractId``).
-        if name in product_port_names:
-            return True
-        # Dedup-rename path — only since 2026-05 (Gap 3). When the bitol
-        # mapper hits two consumes sharing the same exposeId, it prefixes
-        # the 2nd with the upstream productId tail (``{tail}__{base}``).
-        # That port's NAME no longer matches the canonical exposeId, but
-        # its contractId still points at the upstream product. We require
-        # BOTH (base name matches a canonical exposeId AND contractId
-        # points at an upstream product) to avoid over-matching: a port
-        # whose contractId happens to equal a product-consume's
-        # upstream-productId but whose name is a DIFFERENT exposeId with
-        # its own ``sourceSystem`` is a legit source-system port, not a
-        # product-consume to be stripped.
-        if "__" in name:
-            base = name.split("__", 1)[1]
-            if base in product_port_names:
-                contract_id = str(port.get("contractId", ""))
-                if contract_id in product_contract_ids:
-                    return True
-                head = contract_id.rsplit(".", 1)[0] if "." in contract_id else contract_id
-                if head in product_contract_ids:
-                    return True
-        return False
-
-    retained: List[Any] = []
-    removed: List[Any] = []
-    for port in input_ports:
-        (removed if _is_product_consume(port) else retained).append(port)
-    if retained:
-        odps_payload["inputPorts"] = retained
-    else:
-        odps_payload.pop("inputPorts", None)
-    remove_output_port_input_contracts(odps_payload, removed)
-
-
 def ensure_odps_input_port_contract_ids(
     odps_payload: Dict[str, Any], fluid: Mapping[str, Any]
 ) -> None:
@@ -287,12 +178,21 @@ def ensure_odps_input_port_contract_ids(
       ``{productId}.{exposeId}`` address.
     * **Promote** — port already has a ``contractId`` but it's just
       the upstream product reference; rewrite to expose-level form.
+
+    A port already carrying the id the ODPS export derives for one of the
+    consumes is left alone. Matching is by bare exposeId, and two upstreams
+    sharing one (``silver.b1`` and ``silver.b2`` both exposing ``customers``)
+    collapse to one key: the export renames the second port, and the first
+    port used to be overwritten with the second upstream's contract.
     """
     input_ports = odps_payload.get("inputPorts")
     if not isinstance(input_ports, list) or not input_ports:
         return
 
     canonical_ports = consumes_to_canonical_ports(fluid, logger=LOG)
+    derived_contract_ids = {
+        str(cid) for cid in (input_port_contract_id(c) for c in canonical_ports) if cid
+    }
     explicit_contract_ids: Dict[str, str] = {}
     promoted_contract_ids: Dict[str, str] = {}
     product_references: Dict[str, str] = {}
@@ -321,6 +221,8 @@ def ensure_odps_input_port_contract_ids(
         port_id = str(port_id)
 
         existing = port.get("contractId")
+        if existing and str(existing) in derived_contract_ids:
+            continue
 
         explicit = explicit_contract_ids.get(port_id)
         if explicit:
@@ -397,63 +299,72 @@ def ensure_odps_input_port_source_system_custom_property(
         port["customProperties"] = props
 
 
+def published_source_system_ids(fluid: Mapping[str, Any]) -> set[str]:
+    """The SourceSystem ids a publish upserts for ``fluid``.
+
+    Both publish paths upsert one SourceSystem per build source
+    (``builds[].properties.source``, see
+    :func:`~fluid_build.util.contract.builds_to_canonical_input_ports`) and per
+    explicitly authored ``consumes[].sourceSystem``. Only those ids name a
+    SourceSystem that exists, so only those may become an input port's
+    ``sourceSystemId``.
+    """
+    ids: set[str] = set()
+    for canonical in builds_to_canonical_input_ports(fluid) + consumes_to_canonical_ports(fluid):
+        sys_id = canonical.get("source_system_id")
+        if sys_id:
+            ids.add(str(sys_id))
+    return ids
+
+
 def promote_input_port_native_source_system_fields(
     odps_payload: Dict[str, Any],
+    fluid: Mapping[str, Any],
 ) -> None:
-    """Lift ODPS ``customProperties[sourceSystem|sourceKind]`` into native
-    DMM fields on each input port (``sourceSystemId``, ``type``).
+    """Add the custom properties Entropy links an input port to a SourceSystem by.
 
-    Why this is an overlay rather than baked into the standalone artifact:
-    the ODPS-Bitol v1.0.0 ``InputPort`` schema is closed
-    (``additionalProperties: false``) — only ``name, version, contractId,
-    tags, customProperties, authoritativeDefinitions`` are permitted.
-    ``sourceSystemId`` and ``type`` would fail the spec's JSON-schema
-    validator if emitted by the standalone exporter.
+    The ODPS export records an acquisition source as
+    ``customProperties[sourceSystem|sourceKind]``. Entropy Data reads neither:
+    against Entropy Data CE, an ODPS input port draws a SourceSystem -> product
+    edge only when it carries ``customProperties[sourceSystemId]``, and the
+    edge is labelled from ``customProperties[type]`` (``API`` without it). A
+    native ``sourceSystemId`` / ``type`` field on the port is not ODPS — the
+    v1.0.0 ``InputPort`` is ``additionalProperties: false`` — and Entropy drops
+    it on save, which is why SDPs used to land with their SourceSystem node
+    present and no edge to it.
 
-    DMM (Entropy Data CE), however, ACCEPTS those native fields on
-    InputPort and uses them to render lineage edges in the UI. So:
+    Only a ``sourceSystem`` value naming a SourceSystem this publish upserts
+    (:func:`published_source_system_ids`) is promoted. The ``source-system``
+    lineage mode labels a product consume with its upstream product id; that
+    label is not a SourceSystem, and the port's ``contractId`` already draws
+    the product -> product edge.
 
-      * The standalone ``*.odps-bitol.yaml`` artifact stays spec-clean
-        with source-system info in ``customProperties[]`` only.
-      * The DMM POST payload runs through this overlay, which copies the
-        ``sourceSystem`` / ``sourceKind`` custom property values into the
-        native fields. DMM's UI then renders the lineage edge to the
-        registered SourceSystem entity.
-
-    The customProperties stay in place after promotion — they're the
-    canonical source of truth, and DMM tolerates duplication. Idempotent
-    (won't overwrite an explicit ``sourceSystemId`` set by the author).
+    The export's own properties stay; this only adds. Idempotent, and an
+    author's explicit ``sourceSystemId`` / ``type`` property wins.
     """
     input_ports = odps_payload.get("inputPorts")
     if not isinstance(input_ports, list):
         return
-    promoted_count = 0
+    known = published_source_system_ids(fluid)
     for port in input_ports:
         if not isinstance(port, dict):
             continue
-        custom_props = port.get("customProperties") or []
-        if not isinstance(custom_props, list):
+        props = port.get("customProperties")
+        if not isinstance(props, list):
             continue
-        for prop in custom_props:
-            if not isinstance(prop, Mapping):
-                continue
-            name = prop.get("property")
-            value = prop.get("value")
-            if name == "sourceSystem" and value and not port.get("sourceSystemId"):
-                port["sourceSystemId"] = str(value)
-                promoted_count += 1
-            elif name == "sourceKind" and value and not port.get("type"):
-                # Use DMM's TitleCase enum (Postgres / Kafka / Snowflake / …)
-                # so the lineage UI renders the correct connector icon —
-                # raw lowercase kinds fall back to "API" in DMM's renderer.
-                port["type"] = kind_to_dmm_type(str(value)) or str(value)
-    if promoted_count > 0:
-        LOG.debug(
-            "Promoted source-system fields on %d input port(s) for DMM payload "
-            "(DMM ODPS-Bitol payloads strip unknown native fields; lineage "
-            "still flows via customProperties[sourceSystem])",
-            promoted_count,
-        )
+        values = {
+            prop.get("property"): prop.get("value") for prop in props if isinstance(prop, Mapping)
+        }
+        source_system = values.get("sourceSystem")
+        if not source_system or str(source_system) not in known:
+            continue
+        if not values.get("sourceSystemId"):
+            props.append({"property": "sourceSystemId", "value": str(source_system)})
+        kind = values.get("sourceKind")
+        if kind and not values.get("type"):
+            # Entropy's TitleCase connector names (Postgres, Kafka, …) pick the
+            # icon; a raw lowercase kind renders as a generic API.
+            props.append({"property": "type", "value": kind_to_dmm_type(str(kind)) or str(kind)})
 
 
 __all__ = [
@@ -464,5 +375,5 @@ __all__ = [
     "is_odps_spec",
     "normalize_fluid_for_odps_standard",
     "promote_input_port_native_source_system_fields",
-    "remove_odps_product_consume_input_ports",
+    "published_source_system_ids",
 ]

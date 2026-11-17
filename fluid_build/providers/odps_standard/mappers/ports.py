@@ -25,8 +25,8 @@ Per-port pass-throughs flow through ``expose.odps_passthrough.*`` /
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, MutableMapping
-from typing import Any, Dict, List, Optional, Set, Tuple
+from collections.abc import Mapping
+from typing import Any, Dict, List, Optional, Tuple
 
 from fluid_build.util.contract import (
     builds_to_canonical_input_ports,
@@ -212,77 +212,6 @@ def _consume_to_input_port(
             }
         ]
     return port
-
-
-def consume_input_port_contract_ids(fluid: Mapping[str, Any]) -> Set[str]:
-    """The ``contractId``s an export's input ports carry for ``consumes[]``.
-
-    A publish target that strips input ports by a cruder rule than "is this a
-    product consume" needs this to tell which of the ports it dropped had
-    lineage *derived* from ``consumes[]`` — the only lineage
-    :func:`remove_output_port_input_contracts` may remove.
-
-    An ``expects[]`` port is the case that makes the distinction matter. It is
-    dropped by a "no ``sourceSystemId``" rule just like a product consume, but
-    its expose replays the upstream document's own ``inputContracts`` verbatim
-    through the ODPS pass-through, and nothing else in the payload records that
-    dependency — Access agreements are built from ``consumes[]``. Removing it
-    would lose the upstream, not deduplicate it.
-    """
-    ids: Set[str] = set()
-    for canonical in consumes_to_canonical_ports(fluid):
-        contract_id = input_port_contract_id(canonical)
-        if contract_id:
-            ids.add(str(contract_id))
-    return ids
-
-
-def remove_output_port_input_contracts(
-    odps_payload: MutableMapping[str, Any], removed_ports: Iterable[Any]
-) -> None:
-    """Drop ``outputPorts[].inputContracts`` entries for removed input ports.
-
-    The inverse of :func:`_input_contracts_from_ports`, and it lives beside it
-    so the two cannot drift. A publish target that removes an input port has to
-    remove the lineage entry that mirrors it: forge derives that key from the
-    product's own ``consumes[]``, so one dependency is stated twice in a
-    document, and removing only the port leaves the upstream still named.
-
-    Both Data Mesh Manager publish paths need this — the
-    :class:`DataMeshManagerRegistrar` that backs ``fluid publish --target
-    datamesh-manager`` and ``catalog.register``, and the
-    ``DataMeshManagerProvider`` behind ``fluid datamesh-manager publish``. They
-    strip by different rules (a missing ``sourceSystemId`` vs. a canonical
-    product-consume match), so each passes the ports it dropped and this reads
-    the ``contractId``s off them. Entropy would otherwise have to mirror each
-    upstream product as a SourceSystem to resolve the reference, and render the
-    duplicate graph nodes the strip exists to prevent.
-
-    A dropped port with no ``contractId`` needs no action: it never produced a
-    lineage entry, because :func:`_input_contracts_from_ports` skips it.
-    """
-    contract_ids = {
-        str(port["contractId"])
-        for port in removed_ports
-        if isinstance(port, Mapping) and port.get("contractId")
-    }
-    if not contract_ids:
-        return
-    for port in odps_payload.get("outputPorts") or []:
-        if not isinstance(port, MutableMapping):
-            continue
-        entries = port.get("inputContracts")
-        if not isinstance(entries, list):
-            continue
-        kept = [
-            entry
-            for entry in entries
-            if not (isinstance(entry, Mapping) and str(entry.get("id")) in contract_ids)
-        ]
-        if kept:
-            port["inputContracts"] = kept
-        else:
-            port.pop("inputContracts", None)
 
 
 def _build_input_ports(
