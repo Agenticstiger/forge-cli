@@ -114,23 +114,27 @@ class StatisticsBackend(Protocol):
         """Read *text* back as a profile document; raise :class:`DocumentRefused` if refused."""
 
 
-#: The most digits a number may span, its integer and fraction digits together.
+#: The most digits a number may need written out without an exponent: the
+#: engine's declared-number rule (flux-engine ``concordance/predicate.py``
+#: ``require_number_length``), which flux-stats' ``exact()`` takes too in a
+#: follow-up to flux-engine #54. Drop this pre-check once the pin carries it.
 #: The fidelity check reads values inside a declared range; a profile declares
-#: none, so the seam bounds a number before flux-stats builds its exact value.
-#: Building ``1E+99999999`` takes minutes and gigabytes, and a published value of
-#: more than 4,300 digits cannot be spelled (Python's int-to-string limit). 1,000
-#: digits is far beyond any SQL decimal (38 in DuckDB and Snowflake, 77 in
-#: BigQuery) and leaves room for the sum of any table.
+#: none, so the seam bounds a number before flux-stats builds its exact value:
+#: building ``1E+99999999`` takes minutes and gigabytes. A sum longer than the
+#: 1,000 digits flux-stats spells, or a value below 1 with 1,000 fraction digits
+#: (spelled with its leading zero), is refused by the document check instead,
+#: before anything is written.
 _MAX_DIGITS = 1000
 _INT_LIMIT: int = 10**_MAX_DIGITS  # annotated: int ** int is Any to mypy
 
 
 def _too_many_digits(value: Any) -> bool:
-    """Whether *value* is a finite number of more than :data:`_MAX_DIGITS` digits.
+    """Whether *value* is a finite number needing more than :data:`_MAX_DIGITS` digits.
 
-    Measured without building the number: from an int's size, or from a decimal's
-    coefficient and exponent. Anything that is not a finite number is left to
-    flux-stats' reader, which refuses it by its class.
+    Counted as flux-stats counts, without building the number: an int by its
+    size, a decimal by its coefficient and exponent, a zero as one digit.
+    Anything that is not a finite number is left to flux-stats' reader, which
+    refuses it by its class.
     """
     if isinstance(value, bool):
         return False
@@ -144,7 +148,7 @@ def _too_many_digits(value: Any) -> bool:
     if not isinstance(value, Decimal):
         return False
     _, digits, exponent = value.as_tuple()
-    if not isinstance(exponent, int):  # NaN or infinity
+    if not isinstance(exponent, int) or not any(digits):  # NaN, infinity or zero
         return False
     span = len(digits) + exponent if exponent >= 0 else max(len(digits), -exponent)
     return span > _MAX_DIGITS
@@ -197,9 +201,10 @@ class _FluxStatsBackend:
             kind = None if domain == "category" else self._value_domain(domain)
             shape = self._columns[key] = _Column(column, kind)
         if domain == "number" and _too_many_digits(value):
+            # Worded as flux-stats will word it, and with no digit count: the count
+            # would tell the number's magnitude.
             raise ReadRefused(
-                f"column {column!r} row {row_index}: "
-                f"value class 'number of more than {_MAX_DIGITS} digits'"
+                f"column {column!r} row {row_index}: value class 'over-long number' (FLX-5005)"
             )
         try:
             if domain == "category":

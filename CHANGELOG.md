@@ -151,8 +151,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (MEAS-3) through the one seam `fluid_build/profiler/_stats.py`, so a profile and the
     fidelity check read a value one way and form a number one way. Without `flux-stats`,
     `fluid profile` says so, naming the installed version when it cannot be imported, and
-    reads nothing. A number of more than 1,000 digits is refused by its cell before it is
-    built: a profile declares no range to bound it, and such a number could not be spelled.
+    reads nothing. A number that needs more than 1,000 digits written out is refused by its
+    cell before it is built, as flux-stats will refuse it: a profile declares no range to
+    bound it. A sum longer than the 1,000 digits flux-stats spells is refused with the
+    document, and nothing is written.
   - `[profile]` adds DuckDB and `flux-stats` (`rfc8785` is a base dependency). `[dev]`
     includes it, so CI runs the profiler against the real registry. `fluid --help` and
     `fluid profile --help` load none of the three (`tests/perf/test_startup_budget.py`).

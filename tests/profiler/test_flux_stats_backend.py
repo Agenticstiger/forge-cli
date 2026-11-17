@@ -168,13 +168,22 @@ def test_a_domain_without_a_reader_is_an_error(backend):
 def test_a_number_of_more_than_1000_digits_is_refused_before_it_is_built(backend, value):
     with pytest.raises(ReadRefused) as caught:
         backend.read_value("number", value, column="amount", row_index=7)
-    assert str(caught.value) == (
-        "column 'amount' row 7: value class 'number of more than 1000 digits'"
-    )
+    # As flux-stats words it, with no digit count: the count tells the magnitude.
+    assert str(caught.value) == "column 'amount' row 7: value class 'over-long number' (FLX-5005)"
 
 
 @pytest.mark.parametrize(
-    "value", ["9" * 1000, "0." + "9" * 1000, Decimal("1E+999"), 10**1000 - 1, "NaN", "abc"]
+    "value",
+    [
+        "9" * 1000,
+        "0." + "9" * 1000,
+        Decimal("1E+999"),
+        10**1000 - 1,
+        "0E+99999999",  # a zero is one digit, whatever its exponent
+        "-0E-99999999",
+        "NaN",
+        "abc",
+    ],
 )
 def test_a_number_within_the_bound_is_left_to_flux_stats(backend, value):
     try:
@@ -183,6 +192,19 @@ def test_a_number_within_the_bound_is_left_to_flux_stats(backend, value):
         assert "(FLX-5005)" in str(refused)
     else:
         assert isinstance(read, Fraction)
+
+
+def test_a_sum_longer_than_flux_stats_spells_is_refused_with_the_document(tmp_path, backend):
+    # Four distinct 1000-digit values, ten records each: every value is in bound and
+    # published, and their sum (1002 digits) is past what flux-stats spells.
+    contract = {
+        "exposes": [{"exposeId": "a", "contract": {"schema": [{"name": "n", "type": "integer"}]}}]
+    }
+    rows = [{"n": 10**999 * (5 + i % 4)} for i in range(40)]
+    path = tmp_path / "a.ndjson"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    with pytest.raises(DocumentRefused, match=r"columns\.n\.metrics\.sum"):
+        profile_expose(contract, "a", source=str(path), backend=backend)
 
 
 def test_a_document_flux_stats_cannot_read_is_refused(backend):
