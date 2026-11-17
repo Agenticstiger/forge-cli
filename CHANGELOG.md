@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Spark job runs (schema 0.7.7 preview).** `fluid apply` now starts and reconciles the run of
+  an `engine: spark` build after `tofu apply` provisions it, on EMR Serverless (`StartJobRun`,
+  `mode: STREAMING` with `retryPolicy.maxFailedAttemptsPerHour`), AWS Glue, EMR on EC2
+  (`AddJobFlowSteps` on `clusterId`, client deploy mode) and EMR on EKS. `fluid plan` lists a
+  `spark.reconcile` action per build, covered by `planDigest`, with the build's config hash
+  (the job config, the runner's sha256 and the run settings); apply refuses a bound plan whose
+  Spark actions differ. A streaming job with the same hash is left running; a new hash cancels
+  it, waits, and starts the new config on the same checkpoint; a new topic or cluster on the
+  old checkpoint is refused; a last run that failed (EMR Serverless' thrash guard) is an error
+  naming the run, until the build changes or `fluid spark run --restart`.
+  - `fluid spark run <contract> --build-id <id> [--json]` starts a scheduled build (batch, or
+    a stream with `trigger.availableNow`) for Airflow: it waits, exits 0 on success, 1 when the
+    run failed or was cancelled, 2 when the contract or the operator's policy refuses it, and
+    cancels the run on SIGTERM. `fluid spark status <contract>` shows each build's recent runs.
+  - A contract's `parameters.spark.sparkConf` sets resource and tuning settings only; the
+    operator lists any other key in `FLUID_SPARK_CONF_ALLOWLIST` (settings like `spark.jars`
+    load code that runs with the job's role). `FLUID_SPARK_WAIT_SECONDS` caps the reconcile's
+    waits (default 900).
+  - The caller (the role running `fluid apply` or the MWAA execution role) needs the actions in
+    `build_runners/spark/_adapters.py::CALLER_ACTIONS`, plus `iam:PassRole` on the job role for
+    EMR Serverless and EMR on EKS. boto3 stays in the `[aws]` extra.
+
 - **OpenTofu state and plan encryption, opt-in.** `FLUID_STATE_ENCRYPTION` (an operator
   setting; project dotenv files cannot set it) names one OpenTofu key provider by reference:
   `aws-kms://<key id, ARN or alias/name>`, `gcp-kms://projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>`,
