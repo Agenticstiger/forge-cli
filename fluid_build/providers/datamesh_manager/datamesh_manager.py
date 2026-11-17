@@ -63,6 +63,9 @@ _DEFAULT_DPS_SPECIFICATION = "0.0.1"
 _DEFAULT_ODPS_SPECIFICATION = "odps"
 _DEFAULT_ODPS_LINEAGE_MODE = "contract"
 _ACCESS_ID_UNSAFE = re.compile(r"[^A-Za-z0-9._~-]+")
+# ``GET /api/dataproducts`` returns at most this many per page (``p`` from 0).
+_PRODUCT_PAGE_SIZE = 1000
+_MAX_PRODUCT_PAGES = 1000
 _LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal"}
 _SECRET_ERROR_PATTERNS = (
     re.compile(r"(?i)(x-api-key|api[_-]?key|password|token|secret)([\"'\s:=]+)([^\"'\s,;}]+)"),
@@ -114,6 +117,9 @@ _PROVIDER_TYPE_MAP: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
+from fluid_build.providers.datamesh_manager._odps_helpers import (
+    ensure_odps_archetype_custom_property,
+)
 from fluid_build.providers.datamesh_manager._publish_flow import (
     _PublishFlowMixin,
     drop_unresolved_port_contract_ids,
@@ -334,10 +340,18 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         return resp.status_code in (200, 204)
 
     def list_products(self) -> List[Dict[str, Any]]:
-        """GET all data products."""
+        """GET all data products, every page (Entropy pages the list at 1000)."""
         self._require_api_key()
-        resp = self._request("GET", "/api/dataproducts")
-        return resp.json()
+        products: List[Dict[str, Any]] = []
+        for page in range(_MAX_PRODUCT_PAGES):
+            resp = self._request("GET", f"/api/dataproducts?p={page}")
+            batch = resp.json()
+            if not isinstance(batch, list):
+                return batch if page == 0 else products
+            products.extend(batch)
+            if len(batch) < _PRODUCT_PAGE_SIZE:
+                break
+        return products
 
     def list_teams(self) -> List[Dict[str, Any]]:
         """GET all teams."""
@@ -534,6 +548,9 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             # Entropy links an input port to its SourceSystem by. Wire payload
             # only; the standalone ODPS export keeps the spec's own shape.
             self._promote_input_port_native_source_system_fields(dp, fluid)
+            # Entropy reads the archetype from ``customProperties[type]``; without
+            # it every product shows as a plain "Data Product".
+            ensure_odps_archetype_custom_property(dp, fluid)
         else:
             dp["teamId"] = tid
 

@@ -47,6 +47,10 @@ from fluid_build.api.catalog_publication import (
 
 LOG = logging.getLogger("fluid.acquire.catalog.datamesh_manager")
 
+# ``GET /api/dataproducts`` returns at most this many per page (``p`` from 0).
+_PRODUCT_PAGE_SIZE = 1000
+_MAX_PRODUCT_PAGES = 1000
+
 
 @dataclass
 class DataMeshManagerRegistrar(CatalogRegistrar):
@@ -81,6 +85,25 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         if not self.auto_approve_access:
             env_value = os.environ.get("DMM_AUTO_APPROVE_ACCESS", "").strip().lower()
             self.auto_approve_access = env_value in {"1", "true", "yes", "on"}
+
+    def _endpoint_refusal(self) -> Optional[str]:
+        """Why the key must not go to ``api_url``, or ``None``.
+
+        The same rule as the native provider's ``_normalize_api_url``: an http(s) URL,
+        and plain http only to a local host unless ``DMM_ALLOW_INSECURE_HTTP`` is set.
+        The registrar used to send the key (both ``Authorization`` and ``x-api-key``)
+        over plain http to any host.
+        """
+        from fluid_build.providers.base import ProviderError
+        from fluid_build.providers.datamesh_manager.datamesh_manager import (
+            DataMeshManagerProvider,
+        )
+
+        try:
+            DataMeshManagerProvider._normalize_api_url(str(self.api_url or ""))
+        except ProviderError as exc:
+            return str(exc)
+        return None
 
     # ── Canonical entry point ─────────────────────────────────────────
 
@@ -130,6 +153,11 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                 urn=product_urn,
                 succeeded=False,
                 error="DMM_API_KEY not set; refusing anonymous publish",
+            )
+        refusal = self._endpoint_refusal()
+        if refusal:
+            return RegistrationResult(
+                target=self.target, urn=product_urn, succeeded=False, error=refusal
             )
         contract_urns: List[str] = []
         access_urns: List[str] = []
@@ -248,6 +276,9 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                 succeeded=False,
                 error="DMM_API_KEY not set; refusing anonymous publish",
             )
+        refusal = self._endpoint_refusal()
+        if refusal:
+            return RegistrationResult(target=self.target, urn=urn, succeeded=False, error=refusal)
         payload = CatalogPublicationPayload.from_contract(contract, classifications)
         scoped = tuple(a for a in payload.assets if a.asset_id == expose_id)
         if not scoped:
@@ -275,6 +306,9 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             return RegistrationResult(
                 target=self.target, urn=urn, succeeded=False, error="DMM_API_KEY not set"
             )
+        refusal = self._endpoint_refusal()
+        if refusal:
+            return RegistrationResult(target=self.target, urn=urn, succeeded=False, error=refusal)
         try:
             from fluid_build.util.safe_http import safe_httpx_client
 
@@ -444,6 +478,14 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                     DataMeshManagerRegistrar._inject_build_input_port_source_systems(
                         parsed, payload
                     )
+                    # ── Archetype ────────────────────────────────────
+                    # Entropy reads it from ``customProperties[type]``;
+                    # without it every product shows as a plain "Data Product".
+                    from fluid_build.providers.datamesh_manager._odps_helpers import (
+                        ensure_odps_archetype_custom_property,
+                    )
+
+                    ensure_odps_archetype_custom_property(parsed, payload.contract or {})
                     return parsed
             except Exception:  # noqa: BLE001 — fall through to native
                 LOG.debug(
@@ -609,13 +651,22 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                 timeout=float(self.timeout_seconds),
                 allow_private=True,
             ) as c:
-                r = c.get("/api/dataproducts", headers=self._headers())
-                if r.status_code != 200:
-                    return set()
-                data = r.json()
-                if not isinstance(data, list):
-                    return set()
-                return {str(p.get("id")) for p in data if isinstance(p, dict) and p.get("id")}
+                ids: set[str] = set()
+                # Entropy pages the list at 1000 (``p`` from 0); reading page 0 only
+                # made every upstream past the first 1000 look missing.
+                for page in range(_MAX_PRODUCT_PAGES):
+                    r = c.get("/api/dataproducts", params={"p": page}, headers=self._headers())
+                    if r.status_code != 200:
+                        return set()
+                    data = r.json()
+                    if not isinstance(data, list):
+                        return set()
+                    ids.update(
+                        str(p.get("id")) for p in data if isinstance(p, dict) and p.get("id")
+                    )
+                    if len(data) < _PRODUCT_PAGE_SIZE:
+                        break
+                return ids
         except Exception:  # noqa: BLE001 — best effort; disable pre-flight on failure
             return set()
 
@@ -1152,8 +1203,38 @@ from fluid_build.api.catalog_backend import (  # noqa: E402 — register-on-impo
 
 from ._factory_helpers import pick_endpoint, pick_int, pick_token  # noqa: E402
 
+_ODPS_SPELLINGS = frozenset({"odps", "odps-bitol", "odps_bitol", "bitol"})
+
+
+def _warn_unused_settings(config: dict) -> None:
+    """Say so when a setting asks the registrar for what it does not do.
+
+    It publishes ODPS only (Entropy rejects DPS 0.0.1 with "Supported types: odps"), and
+    links lineage from ``consumes[]`` and build sources whatever ``DMM_ODPS_LINEAGE_MODE``
+    says; ``fluid datamesh-manager publish`` is the path these settings shape.
+    """
+    for key, env in (
+        ("data_product_specification", "DMM_DATA_PRODUCT_SPECIFICATION"),
+        ("provider_hint", "DMM_PROVIDER_HINT"),
+    ):
+        value = config.get(key)
+        if value and str(value).strip().lower() not in _ODPS_SPELLINGS:
+            LOG.warning(
+                "datamesh-manager %s=%r (%s) is not used by fluid publish: it publishes "
+                "ODPS, the only data product format Entropy Data accepts.",
+                key,
+                value,
+                env,
+            )
+    if os.environ.get("DMM_ODPS_LINEAGE_MODE"):
+        LOG.warning(
+            "DMM_ODPS_LINEAGE_MODE is not used by fluid publish: lineage comes from the "
+            "contract's consumes[] and build sources."
+        )
+
 
 def _build_dmm_registrar(config: dict) -> DataMeshManagerRegistrar:
+    _warn_unused_settings(config)
     return DataMeshManagerRegistrar(
         api_url=pick_endpoint(config, default=None) or None,
         api_token=pick_token(config),

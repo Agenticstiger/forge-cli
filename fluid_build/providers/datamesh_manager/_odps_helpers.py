@@ -367,7 +367,75 @@ def promote_input_port_native_source_system_fields(
             props.append({"property": "type", "value": kind_to_dmm_type(str(kind)) or str(kind)})
 
 
+# Canonical Data Mesh mapping, which is also the archetype vocabulary Entropy Data
+# recognises (kebab case only; ``sourceAligned`` shows as a plain "Data Product"):
+#   Bronze / SDP -> source-aligned, Silver / ADP -> aggregate, Gold / CDP -> consumer-aligned
+_ARCHETYPE_BY_PRODUCT_TYPE = {
+    "SDP": "source-aligned",
+    "ADP": "aggregate",
+    "CDP": "consumer-aligned",
+}
+_ARCHETYPE_BY_LAYER = {
+    "bronze": "source-aligned",
+    "raw": "source-aligned",
+    "silver": "aggregate",
+    "curated": "aggregate",
+    "gold": "consumer-aligned",
+    "consumption": "consumer-aligned",
+}
+_ARCHETYPES = frozenset(_ARCHETYPE_BY_PRODUCT_TYPE.values())
+
+
+def _kebab(value: str) -> str:
+    out = []
+    for ch in value.strip():
+        if ch.isupper() and out and out[-1] != "-":
+            out.append("-")
+        out.append("-" if ch in "_ " else ch.lower())
+    return "".join(out)
+
+
+def dmm_archetype(fluid: Mapping[str, Any]) -> Optional[str]:
+    """The Entropy archetype of a FLUID data product, or ``None``.
+
+    ``metadata.archetype`` when set (a known one is spelled the kebab way Entropy reads,
+    ``sourceAligned`` -> ``source-aligned``; anything else goes as written), else
+    ``metadata.productType`` (SDP / ADP / CDP), else ``metadata.layer``.
+    """
+    meta = fluid.get("metadata") if isinstance(fluid.get("metadata"), Mapping) else {}
+    explicit = meta.get("archetype")
+    if explicit:
+        kebab = _kebab(str(explicit))
+        return kebab if kebab in _ARCHETYPES else str(explicit)
+    if str(fluid.get("kind") or "DataProduct").lower() != "dataproduct":
+        return None
+    by_type = _ARCHETYPE_BY_PRODUCT_TYPE.get(str(meta.get("productType") or "").upper())
+    return by_type or _ARCHETYPE_BY_LAYER.get(str(meta.get("layer") or "").lower())
+
+
+def ensure_odps_archetype_custom_property(
+    odps_payload: Dict[str, Any], fluid: Mapping[str, Any]
+) -> None:
+    """Add the product's archetype as ``customProperties[type]`` (DMM overlay only).
+
+    ODPS v1.0.0 has no archetype field; Entropy Data reads it from this custom property
+    (v1.1.0 moves it to a top-level ``type``). A ``type`` the payload already carries wins.
+    """
+    archetype = dmm_archetype(fluid)
+    if not archetype:
+        return
+    props = odps_payload.get("customProperties")
+    if not isinstance(props, list):
+        props = []
+    if any(isinstance(p, Mapping) and p.get("property") == "type" for p in props):
+        return
+    props.append({"property": "type", "value": archetype})
+    odps_payload["customProperties"] = props
+
+
 __all__ = [
+    "dmm_archetype",
+    "ensure_odps_archetype_custom_property",
     "ensure_odps_input_port_contract_ids",
     "ensure_odps_input_port_source_system_custom_property",
     "ensure_odps_output_port_display_names",

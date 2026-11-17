@@ -803,40 +803,14 @@ class _PublishFlowMixin:
             "status": status,
         }
 
-        # Optional info-level fields
-        # Canonical Data Mesh mapping (also DMM API archetype values):
-        #   Bronze / SDP  → "source-aligned"  (raw acquisition)
-        #   Silver / ADP  → "aggregate"       (cleaned, joined, conformed)
-        #   Gold   / CDP  → "consumer-aligned"(consumption marts)
-        # Prior versions had Silver→consumer-aligned and Gold→aggregate
-        # swapped; this is the corrected mapping. metadata.productType is
-        # always populated by the equivalence axiom (forge.product_types),
-        # so prefer that and fall back to the layer alias only when absent.
-        _ARCHETYPE_BY_PRODUCT_TYPE = {
-            "SDP": "source-aligned",
-            "ADP": "aggregate",
-            "CDP": "consumer-aligned",
-        }
-        _ARCHETYPE_BY_LAYER = {
-            "bronze": "source-aligned",
-            "raw": "source-aligned",
-            "silver": "aggregate",
-            "curated": "aggregate",
-            "gold": "consumer-aligned",
-            "consumption": "consumer-aligned",
-        }
-        if meta.get("archetype"):
-            info["archetype"] = meta["archetype"]
-        elif fluid.get("kind"):
-            kind_lower = str(fluid["kind"]).lower()
-            if kind_lower == "dataproduct":
-                product_type = str(meta.get("productType") or "").upper()
-                archetype = _ARCHETYPE_BY_PRODUCT_TYPE.get(product_type)
-                if archetype is None:
-                    layer_lower = str(meta.get("layer", "")).lower()
-                    archetype = _ARCHETYPE_BY_LAYER.get(layer_lower)
-                if archetype is not None:
-                    info["archetype"] = archetype
+        # Optional info-level fields. The archetype mapping (Bronze / SDP ->
+        # source-aligned, Silver / ADP -> aggregate, Gold / CDP -> consumer-aligned)
+        # is shared with the ODPS overlay.
+        from fluid_build.providers.datamesh_manager._odps_helpers import dmm_archetype
+
+        archetype = dmm_archetype(fluid) if fluid.get("kind") or meta.get("archetype") else None
+        if archetype:
+            info["archetype"] = archetype
         if meta.get("maturity"):
             info["maturity"] = meta["maturity"]
 
