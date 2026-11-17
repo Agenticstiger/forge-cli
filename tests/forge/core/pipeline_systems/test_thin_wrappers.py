@@ -582,8 +582,10 @@ def _toggle_defaults(provider: PipelineProvider, files: Dict[str, str]) -> Dict[
         on = workflow.get("on", workflow.get(True))
         inputs = on["workflow_dispatch"]["inputs"]
         for name in names:
-            assert name in workflow["env"], name
-            found[name] = str(inputs[name.lower()]["default"]).lower()
+            # A manual run's switch starts at "default": the variable, else the
+            # generated default the env expression ends with.
+            assert inputs[name.lower()]["default"] == "default", name
+            found[name] = re.search(r"\|\| '(true|false)' \}\}$", workflow["env"][name]).group(1)
     elif provider is P.GITLAB_CI:
         variables = yaml.safe_load(files[".gitlab-ci.yml"])["variables"]
         found = {name: variables[name]["value"] for name in names}
@@ -1328,6 +1330,16 @@ def test_a_github_manual_run_left_at_its_defaults_reads_the_variables() -> None:
     assert env["FLUID_ENV"] == "${{ inputs.fluid_env || vars.FLUID_ENV || 'dev' }}"
     assert env["APPLY_MODE"].startswith("${{ (inputs.apply_mode != 'default' && inputs.apply_mode)")
     assert env["APPLY_MODE"].endswith("|| vars.APPLY_MODE || 'amend' }}")
+    # A switch too: a box is always ticked or not and would hide the variable.
+    for key in ("run_stage_10_publish", "allow_data_loss"):
+        assert inputs[key]["type"] == "choice"
+        assert inputs[key]["options"] == ["default", "true", "false"]
+        assert inputs[key]["default"] == "default"
+    assert env["RUN_STAGE_10_PUBLISH"] == (
+        "${{ (inputs.run_stage_10_publish != 'default' && inputs.run_stage_10_publish)"
+        " || vars.RUN_STAGE_10_PUBLISH || 'false' }}"
+    )
+    assert not any(i["type"] == "boolean" for i in inputs.values())
 
 
 def _jenkins(**kwargs: Any) -> str:

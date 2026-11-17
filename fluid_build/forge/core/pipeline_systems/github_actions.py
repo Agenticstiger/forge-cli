@@ -13,9 +13,8 @@ reviewer before it starts. Each stage is one step running
 step, and ship skips the stage too.
 
 Values reach ship through ``env:`` only: a manual run's input when one is
-given (a box always is), else the repository or environment variable, else the
-generated default. None is expanded inside a ``run:`` script, where it would be
-code. The install variables are never inputs: whoever starts a run could
+chosen, else the repository or environment variable, else the generated
+default. None is expanded inside a ``run:`` script, where it would be code. The install variables are never inputs: whoever starts a run could
 otherwise choose the package the apply job runs.
 """
 
@@ -226,10 +225,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             if name in _VARIABLE_ONLY:
                 continue
             key = name.lower()
-            # Left blank (or "default"), an input takes the repository or
+            # Left blank (or at "default"), an input takes the repository or
             # environment variable of the same name, else the generated default,
-            # as a push or pull request run does. A box is ticked or not: on a
-            # manual run it decides.
+            # as a push or pull request run does. So a switch is a choice, not a
+            # box: a box is always ticked or not, and would hide the variable.
             fallback = f"Blank: vars.{name}, else {default or 'blank'}."
             options = kind.split(":", 1)[1].split(",") if kind.startswith("choice:") else []
             if options and "" in options:
@@ -241,7 +240,8 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     "type": "string",
                     "default": "",
                 }
-            elif options:
+            elif options or kind == "boolean":
+                options = options or ["true", "false"]
                 inputs[key] = {
                     "description": (
                         f"{description} {_FROM_VARIABLE}: vars.{name}, else {default}."
@@ -249,12 +249,6 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     "type": "choice",
                     "options": [_FROM_VARIABLE, *options],
                     "default": _FROM_VARIABLE,
-                }
-            elif kind == "boolean":
-                inputs[key] = {
-                    "description": description,
-                    "type": "boolean",
-                    "default": default == "true",
                 }
             else:
                 inputs[key] = {
@@ -273,9 +267,8 @@ class GitHubActionsTemplate(BasePipelineTemplate):
     ) -> Dict[str, str]:
         """What every step reads: input, else variable, else the default.
 
-        ``format('{0}', inputs.x)`` turns a boolean input into ``'true'`` or
-        ``'false'``; a plain ``inputs.x || ...`` would read an unchecked box
-        as missing and take the variable instead."""
+        A choice left at ``default`` (and every input on a push or pull
+        request, where there are none) falls through to the variable."""
         env: Dict[str, str] = {
             # One run id for both jobs, so their stages share one ship report.
             "FLUID_RUN_ID": "${{ github.run_id }}-${{ github.run_attempt }}",
@@ -286,14 +279,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             key = name.lower()
             if name in _VARIABLE_ONLY:
                 value = f"vars.{name}{_or_default(default)}"
-            elif kind == "boolean":
-                value = (
-                    f"github.event_name == 'workflow_dispatch' && format('{{0}}', inputs.{key})"
-                    f" || vars.{name}{_or_default(default)}"
-                )
             else:
                 chosen = f"inputs.{key}"
-                if kind.startswith("choice:") and "" not in kind.split(":", 1)[1].split(","):
+                choices = kind.split(":", 1)[1].split(",") if kind.startswith("choice:") else []
+                if kind == "boolean" or (choices and "" not in choices):
                     chosen = f"(inputs.{key} != '{_FROM_VARIABLE}' && inputs.{key})"
                 value = f"{chosen} || vars.{name}{_or_default(default)}"
             env[name] = "${{ " + value + " }}"
@@ -445,7 +434,7 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             "RUN_STAGE_<N>_<NAME>, " + ", ".join(STAGE_KNOBS[:3]) + ",",
             ", ".join(STAGE_KNOBS[3:]) + ".",
             "A manual run (Actions > fluid pipeline > Run workflow) can set most of them;",
-            "a blank input (or `default`) keeps the variable, and a box decides.",
+            "an input left blank or at `default` keeps the variable.",
             "FLUID_PACKAGE_SPEC and the FLUID_PIP_* install variables are variables only:",
             "whoever starts a run could otherwise choose the package apply runs.",
             "",
