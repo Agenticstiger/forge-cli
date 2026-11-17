@@ -1063,6 +1063,24 @@ def _append_output_port_actions(
         graph["nodes"] = graph["nodes"] + [a.get("action_id") for a in added]
 
 
+# What a refused credential-shaped placeholder would have reached in fluid plan: the plan
+# resolves the contract only to list a plugin's post-apply actions, which go into plan.json.
+_PLAN_RESOLVE_PURPOSE = (
+    "fluid plan resolves the contract to list what fluid apply makes after tofu apply, and "
+    "those actions are written to plan.json"
+)
+
+
+def _templated_platform(contract: Dict[str, Any]) -> bool:
+    """Whether an expose's ``binding.platform`` is an ``{{ env.* }}`` placeholder."""
+    for expose in contract.get("exposes") or []:
+        binding = expose.get("binding") if isinstance(expose, dict) else None
+        platform = binding.get("platform") if isinstance(binding, dict) else None
+        if isinstance(platform, str) and "{{" in platform:
+            return True
+    return False
+
+
 def _output_port_actions(
     contract: Dict[str, Any], args, logger: logging.Logger
 ) -> List[Dict[str, Any]]:
@@ -1083,13 +1101,32 @@ def _output_port_actions(
     from ._common import resolve_env_templates_in_contract
     from .generate_iac import _resolve_provider
 
+    requested = getattr(args, "provider", None) or "auto"
+    # Look for the hook before resolving anything: only a plugin that plans output ports
+    # reads the resolved contract, and resolving every other one did nothing but log a
+    # refusal for each credential-shaped placeholder (#869 resolved first). A provider the
+    # unresolved contract cannot name (a templated platform) is looked up after resolving.
     try:
-        resolved = resolve_env_templates_in_contract(copy.deepcopy(dict(contract)))
+        unresolved_provider: Optional[str] = _resolve_provider(contract, requested)
+    except CLIError:
+        # Refused as written (a local target, two clouds): resolving can only change that
+        # when a platform is itself a placeholder.
+        if not _templated_platform(contract):
+            return []
+        unresolved_provider = None
+    if unresolved_provider is not None and not callable(
+        getattr(IAC_PLUGINS.get(unresolved_provider), "planned_output_ports", None)
+    ):
+        return []
+    try:
+        resolved = resolve_env_templates_in_contract(
+            copy.deepcopy(dict(contract)), purpose=_PLAN_RESOLVE_PURPOSE
+        )
     except Exception as exc:  # noqa: BLE001 - the plan of everything else still stands
         warn(logger, "plan_output_ports_skipped", error=f"{type(exc).__name__}: {exc}")
         return []
     try:
-        provider = _resolve_provider(resolved, getattr(args, "provider", None) or "auto")
+        provider = _resolve_provider(resolved, requested)
     except CLIError:
         return []
     hook = getattr(IAC_PLUGINS.get(provider), "planned_output_ports", None)

@@ -605,6 +605,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid plan` warned about a `{{ env.PGPASSWORD }}` it never used.** Since the Databricks
+  Genie space joined the plan, `fluid plan` resolved every contract's `{{ env.* }}` before
+  looking for the one plugin hook that reads them, so a contract on any other platform with a
+  credential-shaped placeholder logged a refusal that claimed the value goes to main.tf.json.
+  The plan now resolves only for a provider that plans post-apply actions (or a templated
+  platform), and its refusal says the value would go to plan.json. plan.json and its
+  `planDigest` are unchanged.
 - **Three more Data Mesh Manager lineage corner cases.** When Entropy holds a consumed
   product both as written and under its slug (a stale copy an older publish left), the
   consume now points at the slug, the live one; an unreadable product list now says so
