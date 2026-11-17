@@ -4,8 +4,8 @@
 """No dependency in pyproject.toml is a direct URL.
 
 PyPI refuses an upload whose ``Requires-Dist`` holds a URL (``name @ git+https://...``), so a
-pinned commit in the base list or in any extra blocks a release. A dependency that is not on
-PyPI yet is installed from ``requirements/*.txt`` by CI and by hand, never named here.
+pinned commit in the base list or in any extra blocks a release. A package that is not on PyPI
+yet stays out of the extras until it is released, then comes in as a version range.
 """
 
 from __future__ import annotations
