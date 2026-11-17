@@ -16,7 +16,7 @@ import fluid_build
 from fluid_build.schedulers.airflow import fluid_apply
 from tests.cli._schedule_dag_fixtures import load_dag, run_task
 
-WORKER = {"FLUID_PROJECT_DIR": "", "PGPASSWORD": "pw"}
+WORKER = {"FLUID_PROJECT_DIR": ""}
 
 
 def _spark_build(**edits: Any) -> Dict[str, Any]:
