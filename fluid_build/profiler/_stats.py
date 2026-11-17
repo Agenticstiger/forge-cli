@@ -13,9 +13,11 @@ read a value one way.
 
 So this package forms nothing and reads no value itself. It fetches rows
 (:mod:`~fluid_build.profiler.sources`), hands every value to
-:meth:`StatisticsBackend.read_value`, forms every metric with the registry's
-definition, and has the registry read the finished document back before it is
-written (:meth:`StatisticsBackend.check_document`).
+:meth:`StatisticsBackend.read_value`, places it on the grid with
+:meth:`StatisticsBackend.encoder` where a statistic needs one, forms every metric
+and statistic with the registry's definition, and has the registry read the
+finished document back before it is written
+(:meth:`StatisticsBackend.check_document`).
 
 This module is the only one in forge-cli that may import the registry, and it
 imports it only when a profile runs (:func:`load_backend`), so ``fluid --help``
@@ -31,12 +33,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
-from typing import Any, Dict, FrozenSet, Protocol, Sequence, Tuple, runtime_checkable
+from typing import Any, Callable, Dict, FrozenSet, Protocol, Sequence, Tuple, runtime_checkable
 
 __all__ = [
     "DocumentRefused",
     "MetricDefinition",
     "ReadRefused",
+    "StatisticDefinition",
     "StatisticsBackend",
     "StatisticsUnavailable",
     "load_backend",
@@ -94,11 +97,42 @@ class MetricDefinition(Protocol):
 
 
 @runtime_checkable
+class StatisticDefinition(Protocol):
+    """One registered statistic the fidelity check compares (``mean/1`` ...).
+
+    A ``flux_stats.registry.StatisticDefinition`` measured on no declared shape:
+    no bin edges, no levels, no quantile level, which is all an ungrouped
+    ``mean/1`` needs. ``measure`` takes one group's values as the registry's own
+    measure takes them (for an on-grid statistic, the values
+    :meth:`StatisticsBackend.encoder` placed on the grid) and returns the group
+    as the fidelity check's ``S`` spells it: ``group``, ``k``, then the
+    definition's quantities.
+    """
+
+    @property
+    def identifier(self) -> str:
+        """``<name>/<major>``, for example ``mean/1``."""
+
+    def measure(self, group: str, values: Sequence[Any]) -> Dict[str, Any]:
+        """One group's canonical spelling, ``{"group": ..., "k": ..., ...}``."""
+
+
+@runtime_checkable
 class StatisticsBackend(Protocol):
     """What ``fluid profile`` needs from the statistic registry, and nothing more."""
 
     def metrics(self) -> Tuple[MetricDefinition, ...]:
         """Every registered column metric."""
+
+    def statistics(self) -> Tuple[StatisticDefinition, ...]:
+        """Every registered statistic, measured on no declared shape."""
+
+    def encoder(self, fractional_bits: int) -> Callable[[Fraction], int]:
+        """The grid of ``2**-fractional_bits`` steps: an exact value to its grid point.
+
+        It rounds toward -infinity, as the fidelity check encodes the values it
+        forms ``mean/1`` from (KERNEL-SPEC §12): ``floor(value * 2**fractional_bits)``.
+        """
 
     def read_value(self, domain: str, value: Any, *, column: str, row_index: int) -> Any:
         """Read one raw value of a *domain* column as the fidelity check reads it.
@@ -167,18 +201,44 @@ class _Column:
     domain: Any = None
 
 
+class _Statistic:
+    """A :class:`StatisticDefinition` over one of flux-stats' definitions.
+
+    It measures with no declared shape (``flux_stats.Parameters()``) and spells
+    the group as the registry's ``GroupStatistic.to_document`` does, so the
+    group is the one the fidelity check's ``S`` would write for the same values.
+    """
+
+    def __init__(self, definition: Any, parameters: Any) -> None:
+        self._definition = definition
+        self._parameters = parameters
+
+    @property
+    def identifier(self) -> str:
+        identifier: str = self._definition.identifier
+        return identifier
+
+    def measure(self, group: str, values: Sequence[Any]) -> Dict[str, Any]:
+        state = self._definition.measure(group, values, self._parameters)
+        spelled: Dict[str, Any] = state.to_document(self._definition.kind)
+        return spelled
+
+
 class _FluxStatsBackend:
     """The :class:`StatisticsBackend` over ``flux-stats``."""
 
     def __init__(self) -> None:
         # The package first: when it is missing, this is the import that fails,
         # even with one of its submodules still in sys.modules.
-        from flux_stats import metrics
+        from flux_stats import Parameters, definitions, metrics
         from flux_stats.errors import FluxError
+        from flux_stats.fixedpoint import Grid
         from flux_stats.profile import load_profile_text
         from flux_stats.reading import ValueDomain, category, read_exact
 
         self._metrics = metrics
+        self._statistics = tuple(_Statistic(each, Parameters()) for each in definitions())
+        self._grid = Grid
         self._refused = FluxError
         self._load_profile_text = load_profile_text
         self._category = category
@@ -189,6 +249,13 @@ class _FluxStatsBackend:
     def metrics(self) -> Tuple[MetricDefinition, ...]:
         registered: Tuple[MetricDefinition, ...] = tuple(self._metrics())
         return registered
+
+    def statistics(self) -> Tuple[StatisticDefinition, ...]:
+        return self._statistics
+
+    def encoder(self, fractional_bits: int) -> Callable[[Fraction], int]:
+        quantise: Callable[[Fraction], int] = self._grid(fractional_bits).quantise
+        return quantise
 
     def read_value(self, domain: str, value: Any, *, column: str, row_index: int) -> Any:
         if value is None:

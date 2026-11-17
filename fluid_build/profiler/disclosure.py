@@ -21,6 +21,12 @@ that contribute to it (a non-zero value), and it is withheld when its records ho
 at most two values, where it would count them: ACRO's all-values-the-same check
 withholds the one-value case (:func:`check_sum`).
 
+A mean is checked as a magnitude table's cell too, which is how the output-checking
+guidelines class means (with totals: at least the threshold of units, and no
+dominant contributor) and how ACRO checks a mean cell. Its ``k`` is a count of
+records and is rounded like one, and its ``Sx``, the records' sum on the grid,
+publishes only where the column's ``sum`` would (:func:`check_mean`).
+
 A minimum, a maximum or a quantile is one record's value in most data. The
 DwB/ESSnet "Guidelines for Output Checking" (class 3, maxima, minima and
 percentiles) do not release one by rule of thumb, and clear one when more than the
@@ -80,6 +86,7 @@ __all__ = [
     "Verdict",
     "check_count",
     "check_magnitude",
+    "check_mean",
     "check_order_statistic",
     "check_rounding",
     "check_sum",
@@ -334,6 +341,34 @@ def check_sum(contributions: Sequence[Fraction], rule: DisclosureRule) -> Verdic
         # An all-zero sum is 0 whatever the count, so it gives no count back.
         return Verdict(WITHHELD, "the records hold at most two values, so the sum is a count")
     return check_magnitude(values, rule)
+
+
+def check_mean(values: Sequence[Fraction], encoded: Sequence[int], rule: DisclosureRule) -> Verdict:
+    """Check an ungrouped ``mean/1``: ``k`` records, and ``Sx``, their values' sum on the grid.
+
+    *values* are the column's non-null values and *encoded* the same values on
+    the grid. The mean says no more than the column's ``count`` and ``sum``
+    metrics: in order, the first that fires decides:
+
+    1. ``k`` as a count of records (:func:`check_count`, then
+       :func:`check_rounding`), the checks ``count`` passes; it is published
+       rounded, as ``count`` is;
+    2. *values* as the ``sum`` metric checks them (:func:`check_sum`): ``Sx``
+       gives the sum back to within ``k`` grid steps, so a sum the rule withholds
+       is not published as ``Sx`` either;
+    3. *encoded*, the contributions ``Sx`` itself adds up (:func:`check_sum`):
+       values less than a grid step apart encode alike, so they can hold fewer
+       distinct values than *values* do.
+    """
+    count = len(values)
+    verdict = check_count(count, rule)
+    if verdict.published:
+        verdict = check_rounding(count, rule)
+    if verdict.published:
+        verdict = check_sum(values, rule)
+    if verdict.published:
+        verdict = check_sum([Fraction(units) for units in encoded], rule)
+    return verdict
 
 
 def check_order_statistic(holders: int, rule: DisclosureRule) -> Verdict:

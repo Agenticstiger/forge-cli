@@ -241,6 +241,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     includes it, so CI runs the profiler against the real registry. `fluid --help` and
     `fluid profile --help` load none of the three (`tests/perf/test_startup_budget.py`).
 
+- **`fluid profile` writes FLUX's `mean/1` statistic, so a run checked against the profile
+  can pass and ship.** flux-sim-engine (from 0.6.0) compares each fidelity property with a
+  statistic the pinned profile carries, and refused every property of a metrics-only profile
+  (`FLX-5037`), so `fluxsim ship --profile` withheld the run. For each number column the
+  document now holds an ungrouped `mean/1` (`k`, and `Sx`, the values' sum on the grid),
+  formed by flux-stats' own definition, which answers a `mean` property:
+  - The grid is the document's `encoding.fractionalBits`, set with `--fractional-bits N` (0 to
+    128, default 16, the value FLUX uses when a fidelity block declares no `encoding`). It must
+    equal the fidelity block's, or the engine refuses the property and names both grids. The
+    summary names the grid.
+  - A mean is checked as a magnitude cell, as the output-checking guidelines class means and
+    as ACRO checks a mean cell. It is published only when the column's `count` and `sum` are,
+    and when its values on the grid also pass the sum checks, because values less than a grid
+    step apart floor to one value. `k` is rounded to 5 like `count`. A withheld mean keeps its
+    code and no value, and the engine scores it as censored, never as zero.
+  - Timestamp and category columns get no statistic: a mean of timestamps would publish a sum
+    no metric publishes. Grouped means, histograms, levels, support, quantiles and correlations
+    need the Simulation's declared shape and are not written yet.
+  - Checked with the FLUX guide "From your data to a synthetic copy" on flux-sim-engine
+    0.6.0: its `mean` property scores within the margin, and `fluxsim ship --profile` packs.
+
 - **Schema 0.7.7 (preview): semantic relationships and SCD validity windows**
   (RFC-semantics-tier1 §4 and §5). `exposes[].semantics.relationships[]`
   (`$defs.semanticRelationship`) names a foreign key from the declaring expose, the many side,

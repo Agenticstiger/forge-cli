@@ -6,9 +6,11 @@
 It does what flux-stats does at flux-engine main 9ea8edf9 (``packages/flux-stats``):
 the seven column metrics of ``column_metrics.py``, the order-statistic index of
 ``fixedpoint.order_statistic_index`` (``ceil(level * n)`` clamped to ``[1, n]``),
-the exact spelling of ``spelling.render_exact``, and the value reading of
-``reading.py`` (``exact``, ``parse_rfc3339_ms``, ``nfc``). ``check_document``
-validates against the vendored ``profile-1.schema.json``.
+the exact spelling of ``spelling.render_exact``, the value reading of
+``reading.py`` (``exact``, ``parse_rfc3339_ms``, ``nfc``), the grid of
+``fixedpoint.Grid.quantise`` (``floor(value * 2**bits)``) and the ``mean/1`` group
+of ``definitions.py`` (``k`` and ``Sx``). ``check_document`` validates against the
+vendored ``profile-1.schema.json``.
 
 ``tests/profiler/test_flux_stats_backend.py`` runs the same profiles through the
 real registry wherever flux-stats is installed, and ``[dev]`` installs it in every
@@ -128,6 +130,18 @@ METRICS = (
 )
 
 
+@dataclass(frozen=True)
+class FakeStatistic:
+    identifier: str
+    _spell: Callable[[List[Any]], Dict[str, Any]]
+
+    def measure(self, group: str, values: Sequence[Any]) -> Dict[str, Any]:
+        return {"group": group, "k": len(values), **self._spell(list(values))}
+
+
+STATISTICS = (FakeStatistic("mean/1", lambda units: {"Sx": str(sum(units))}),)
+
+
 def _exact(value: Any, where: str) -> Fraction:
     if isinstance(value, (bool, float)):
         raise ReadRefused(f"{where}: value class {type(value).__name__!r}")
@@ -167,6 +181,12 @@ class FakeBackend:
 
     def metrics(self) -> Tuple[FakeMetric, ...]:
         return METRICS
+
+    def statistics(self) -> Tuple[FakeStatistic, ...]:
+        return STATISTICS
+
+    def encoder(self, fractional_bits: int) -> Callable[[Fraction], int]:
+        return lambda value: (value.numerator << fractional_bits) // value.denominator
 
     def read_value(self, domain: str, value: Any, *, column: str, row_index: int) -> Any:
         where = f"column {column!r} row {row_index}"
