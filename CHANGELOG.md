@@ -473,6 +473,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every Data Mesh Manager / Entropy Data product showed as a plain "Data Product".** The ODPS
+  v1.0.0 payload has no archetype field, and Entropy reads it from `customProperties[type]`
+  in kebab case only. Both publish paths now send it: `metadata.archetype` when set (spelled
+  the way Entropy reads it), else from `metadata.productType` (SDP `source-aligned`, ADP
+  `aggregate`, CDP `consumer-aligned`), else `metadata.layer`. A legacy `metadata.type`
+  (analytical / operational), which went out as `customProperties[type]` and so read as the
+  archetype, goes as `customProperties[fluidType]`.
+- **`fluid publish --target datamesh-manager` sent the API key over plain http to any host.**
+  Like `fluid datamesh-manager publish`, it now refuses a non-local `http://` endpoint unless
+  `DMM_ALLOW_INSECURE_HTTP` is set. It also warns about the settings it does not use
+  (`DMM_DATA_PRODUCT_SPECIFICATION` or `DMM_PROVIDER_HINT` naming anything but ODPS, and
+  `DMM_ODPS_LINEAGE_MODE`), which it used to ignore without a word.
+- **A Data Mesh Manager tenant with more than 1000 products looked smaller than it is.** Both
+  paths read only the first page of `GET /api/dataproducts`, so an upstream past it looked
+  unpublished and its Access agreement was skipped, and `fluid datamesh-manager list` stopped
+  at 1000. Every page is read now.
 - **Data Mesh Manager / Entropy Data kept contracts nothing pointed at.** A contract whose
   expose was removed stayed `active`, linked from no port; `fluid datamesh-manager publish
   --with-contract` also sent an empty umbrella contract at the bare product id; without
