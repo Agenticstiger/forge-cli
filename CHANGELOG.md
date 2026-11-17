@@ -30,8 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A run resolves its Kafka and Avro packages from Maven Central (and Confluent's repository
     for Avro), so the cluster needs egress to them, unless the operator sets
     `FLUID_SPARK_MAVEN_REPOSITORY` to one https mirror (CodeArtifact, Artifactory) that
-    replaces Confluent's repository in `spark.jars.repositories`. It is read from the real
-    environment only; a URL with a user or password, a link-local host or plain http is refused.
+    replaces Confluent's repository in `spark.jars.repositories`. Spark 3.5 still tries Maven
+    Central first; without egress that fails and the resolver falls through to the mirror.
+    It is read from the real environment only; a URL with a user or password, a link-local
+    host or plain http is refused.
   - The caller (the role running `fluid apply` or the MWAA execution role) needs the actions in
     `build_runners/spark/_adapters.py::CALLER_ACTIONS`, plus `iam:PassRole` on the job role for
     EMR Serverless and EMR on EKS. boto3 stays in the `[aws]` extra.
