@@ -1,5 +1,6 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
+
 """An ``enum`` level in the 0.7.7 preview may hold any character but a control character.
 
 A level is a quoted string with its own quote doubled, as SQL writes a string literal

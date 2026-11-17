@@ -1,5 +1,6 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
+
 """``fluid_build.util.column_type`` steps over quoted text when it splits a column type."""
 
 from __future__ import annotations
