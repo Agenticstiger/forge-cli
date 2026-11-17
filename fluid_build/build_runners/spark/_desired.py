@@ -414,21 +414,23 @@ def _allowed_conf(user: Mapping[str, Any], where: str, env: Mapping[str, str]) -
 
     extra = [e.strip() for e in (env.get(CONF_ALLOWLIST_ENV) or "").split(",") if e.strip()]
     out: Dict[str, str] = {}
-    refused = []
+    refused: Dict[str, str] = {}  # name -> why: "name", "denied", "unlisted" or "value"
     for key, value in user.items():
         name, text = str(key), str(value)
-        if (
-            not _CONF_KEY.fullmatch(name)
-            or not _conf_allowed(name, extra)
-            or not text
-            or any(c.isspace() for c in text)
-        ):
-            refused.append(name)
+        if not _CONF_KEY.fullmatch(name):
+            refused[name] = "name"
+        elif _conf_denied(name):
+            refused[name] = "denied"
+        elif not _conf_allowed(name, extra):
+            refused[name] = "unlisted"
+        elif not text or any(c.isspace() for c in text):
+            refused[name] = "value"
         else:
             out[name] = text
     if refused:
+        shown = ", ".join(_conf_name(n) for n in sorted(refused))
         raise SparkPolicyError(
-            what=f"{where}: parameters.spark.sparkConf sets {', '.join(sorted(refused))}",
+            what=f"{where}: parameters.spark.sparkConf sets {shown}",
             why=(
                 "A contract sets Spark resource and tuning settings only (executor and driver "
                 "size, dynamic allocation, shuffle partitions, adaptive execution), with values "
@@ -441,18 +443,37 @@ def _allowed_conf(user: Mapping[str, Any], where: str, env: Mapping[str, str]) -
     return out
 
 
-def _conf_fix(refused: Sequence[str]) -> str:
-    denied = sorted(n for n in refused if _CONF_KEY.fullmatch(n) and _conf_denied(n))
-    listable = sorted(n for n in refused if n not in denied)
-    parts = ["Drop the setting."]
-    if denied:
+def _conf_name(name: str) -> str:
+    """A key as the refusal shows it: quoted when it is not a valid name, so a trailing
+    space or a newline is visible."""
+    return name if _CONF_KEY.fullmatch(name) else repr(name)
+
+
+def _conf_fix(refused: Mapping[str, str]) -> str:
+    """One hint per reason; only a valid, undenied, unlisted key gets the ``export`` hint,
+    the one case the operator's list can change."""
+
+    def names(why: str) -> List[str]:
+        return [_conf_name(n) for n in sorted(refused) if refused[n] == why]
+
+    parts = []
+    if names("name"):
         parts.append(
-            f"Forge never passes {', '.join(denied)}: no {CONF_ALLOWLIST_ENV} entry admits it."
+            f"Fix the key {', '.join(names('name'))}: a Spark setting name holds letters, "
+            "digits, '_', '.' and '-' only, with no spaces."
         )
-    if listable:
+    if names("denied"):
         parts.append(
-            "Or, once it is reviewed, have the operator list it in the real environment: "
-            f'export {CONF_ALLOWLIST_ENV}="{",".join(listable)}".'
+            f"Drop {', '.join(names('denied'))}: forge never passes it, and no "
+            f"{CONF_ALLOWLIST_ENV} entry admits it."
+        )
+    if names("value"):
+        parts.append(f"Give {', '.join(names('value'))} a value without spaces.")
+    if names("unlisted"):
+        parts.append(
+            f"Drop {', '.join(names('unlisted'))}, or, once it is reviewed, have the operator "
+            f'list it in the real environment: export {CONF_ALLOWLIST_ENV}="'
+            f'{",".join(names("unlisted"))}".'
         )
     return " ".join(parts)
 

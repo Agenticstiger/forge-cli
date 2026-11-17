@@ -332,7 +332,7 @@ def test_a_mixed_refusal_names_both_fixes(contract):
     spark["sparkConf"] = {"spark.made.up": "x", "spark.jars": "/a.jar"}
     with pytest.raises(SparkPolicyError) as err:
         _desired.desired_runs(contract, account=ACCOUNT)
-    assert "never passes spark.jars" in err.value.fix
+    assert "Drop spark.jars: forge never passes it" in err.value.fix
     assert f'{_desired.CONF_ALLOWLIST_ENV}="spark.made.up"' in err.value.fix
 
 
@@ -428,3 +428,40 @@ def test_every_key_the_infrastructure_emit_denies_is_denied_here():
 )
 def test_the_wider_deny_list_holds_under_a_star(key):
     assert not _desired._conf_allowed(key, ["*"])
+
+
+@pytest.mark.parametrize(
+    "conf, hint, shown",
+    [
+        ({"spark.jars ": "x"}, "Fix the key 'spark.jars '", "'spark.jars '"),
+        ({"spark.executor.memory": "4g --jars x"}, "a value without spaces", None),
+        ({"spark.executor.memory": ""}, "a value without spaces", None),
+    ],
+)
+def test_a_refusal_the_allowlist_cannot_fix_gives_no_export_hint(contract, conf, hint, shown):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    spark_cfg(contract)["sparkConf"] = conf
+    with pytest.raises(SparkPolicyError) as err:
+        runs_of(contract)
+    assert hint in err.value.fix and "export" not in err.value.fix
+    if shown:
+        assert shown in err.value.what  # a trailing space is visible
+
+
+def test_every_reason_gets_its_own_hint(contract):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    spark_cfg(contract)["sparkConf"] = {
+        "spark.jars ": "x",
+        "spark.plugins": "p",
+        "spark.made.up": "y",
+        "spark.executor.memory": "",
+    }
+    with pytest.raises(SparkPolicyError) as err:
+        runs_of(contract)
+    fix = err.value.fix
+    assert "Fix the key 'spark.jars '" in fix
+    assert "Drop spark.plugins: forge never passes it" in fix
+    assert "Give spark.executor.memory a value without spaces" in fix
+    assert f'export {_desired.CONF_ALLOWLIST_ENV}="spark.made.up"' in fix
