@@ -300,6 +300,7 @@ def _attach_declared_quality(
         if isinstance(p, dict) and isinstance(p.get("name"), str)
     }
 
+    placed: Set[str] = set()  # ids this export placed, as against ones it arrived with
     dq = contract.get("dq")
     rules = dq.get("rules") if isinstance(dq, Mapping) else None
     for rule in rules or []:
@@ -325,20 +326,34 @@ def _attach_declared_quality(
             )
             continue
         base_id = rule.get("id") or rule.get("type")
-        if not columns:  # freshness: a custom rule about the whole object
+        if not columns:
+            # freshness: a custom rule, on the column it names when the schema declares
+            # it, else on the object (as before).
             rule_id = _stable_id(base_id)
             if rule_id in taken:
                 continue
             taken.add(rule_id)
-            _append_quality(obj, {"id": rule_id, **check})
+            _append_quality(properties.get(rule.get("selector")) or obj, {"id": rule_id, **check})
             continue
+        # An ODCS document an earlier export wrote may carry this rule on the schema
+        # object, where a selector that was not exactly one property name put it. The
+        # rule now goes on its columns; the misplaced copy goes, or a re-export of that
+        # document would carry both.
+        if _drop_object_library_check(obj, _stable_id(base_id)):
+            taken.discard(_stable_id(base_id))
         for column in columns:
             # One column keeps the rule's own id; several get one each.
             rule_id = _stable_id(base_id) if len(columns) == 1 else _stable_id(base_id, column)
+            target = properties[column]
+            if rule_id in _quality_ids(target) and rule_id not in placed:
+                continue  # re-export: the rule arrived on this column already
             if rule_id in taken:
-                continue
+                # Another rule or a derived check holds the id (``a b`` and ``a_b``
+                # sanitise alike): a unique one, never a dropped check.
+                rule_id = _claim(rule_id, taken)
             taken.add(rule_id)
-            _append_quality(properties[column], {"id": rule_id, **copy.deepcopy(check)})
+            placed.add(rule_id)
+            _append_quality(target, {"id": rule_id, **check})
 
     for expr in contract.get("quality") or []:
         if not isinstance(expr, Mapping) or not expr.get("expression"):
@@ -348,6 +363,35 @@ def _attach_declared_quality(
             continue
         taken.add(rule_id)
         _append_quality(obj, {"id": rule_id, **_expression_to_quality(expr)})
+
+
+def _quality_ids(target: Mapping[str, Any]) -> Set[str]:
+    """The ids in one ``quality`` array (an object's or a property's own)."""
+    return {
+        str(q["id"])
+        for q in target.get("quality") or []
+        if isinstance(q, Mapping) and q.get("id") is not None
+    }
+
+
+def _drop_object_library_check(obj: Dict[str, Any], rule_id: str) -> bool:
+    """Remove an object-level library check with ``rule_id``; ``True`` when one went.
+
+    Rebinds ``obj["quality"]`` rather than mutating it: the schema mapper hands it the
+    FLUID contract's own pass-through list by reference (see :func:`_append_quality`).
+    """
+    quality = obj.get("quality")
+    if not isinstance(quality, list):
+        return False
+    kept = [
+        q
+        for q in quality
+        if not (isinstance(q, Mapping) and q.get("type") == "library" and q.get("id") == rule_id)
+    ]
+    if len(kept) == len(quality):
+        return False
+    obj["quality"] = kept
+    return True
 
 
 def _existing_ids(obj: Mapping[str, Any]) -> Set[str]:

@@ -295,8 +295,11 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 "Set DMM_API_URL to an http(s) URL."
             ) from exc
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            # Scheme only: the URL can carry userinfo (``ftp://user:secret@h``).
             raise ProviderError(
-                f"Invalid Data Mesh Manager API URL {value!r}. Expected an http(s) URL."
+                f"Invalid Data Mesh Manager API URL (scheme {parsed.scheme or 'none'!r}, "
+                f"{'a' if parsed.netloc else 'no'} host). Expected an http(s) URL in "
+                "DMM_API_URL."
             )
 
         allow_insecure = str(os.getenv("DMM_ALLOW_INSECURE_HTTP", "")).strip().lower() in {
