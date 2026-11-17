@@ -127,7 +127,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`aws_glue_jars.glue_jars_fingerprint`, the same digest the IaC emit's `--extra-jars`
     comes from), so a new pin or `FLUID_SPARK_GLUE_JARS_URL` restarts a running stream onto
     the new jars. The hash of a build that loads no extra jars (every EMR runtime, and Glue
-    without Avro) is unchanged.
+    without Avro) is unchanged; a running Glue Avro stream restarts once after the upgrade,
+    as its hash now includes the jars. Plan and apply need the same
+    `FLUID_SPARK_GLUE_JARS_URL` (apply refuses a plan made with another).
   - The caller (the role running `fluid apply` or the MWAA execution role) needs the actions in
     `build_runners/spark/_adapters.py::CALLER_ACTIONS`, plus `iam:PassRole` on the job role for
     EMR Serverless and EMR on EKS. boto3 stays in the `[aws]` extra.

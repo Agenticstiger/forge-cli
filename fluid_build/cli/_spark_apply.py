@@ -62,9 +62,9 @@ def planned_actions(contract: Mapping[str, Any]) -> List[Dict[str, Any]]:
     if not _has_spark(contract):
         return []
     # The operator's gates are apply's (fluid validate warns about them); they refuse a
-    # build, never change what it compiles to. FLUID_SPARK_MAVEN_REPOSITORY does change it
-    # (the repository the run loads code from), so the plan binds it: apply refuses a
-    # plan made with another value.
+    # build, never change what it compiles to. FLUID_SPARK_MAVEN_REPOSITORY and, on Glue,
+    # FLUID_SPARK_GLUE_JARS_URL do change it (where the run loads code from), so the plan
+    # binds them: apply refuses a plan made with other values.
     runs = _desired(contract, "plan_spark", policy=False)
     return [dict(_comparable(run.plan_action(0))) for run in runs]
 
@@ -114,8 +114,8 @@ def prepare(
                 {
                     "error": "the Spark runs compiled now differ from the bound plan's "
                     "spark.reconcile actions (job config, runner or run settings, which "
-                    "include FLUID_SPARK_MAVEN_REPOSITORY); regenerate it with the same "
-                    "environment as apply"
+                    "include FLUID_SPARK_MAVEN_REPOSITORY and FLUID_SPARK_GLUE_JARS_URL); "
+                    "regenerate it with the same environment as apply"
                 },
             )
     selected = [r for r in runs if build_id is None or r.build == build_id]

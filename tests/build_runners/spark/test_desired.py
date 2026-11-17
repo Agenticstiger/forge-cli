@@ -518,8 +518,14 @@ def test_the_glue_run_hash_holds_the_emits_own_fingerprint(contract, monkeypatch
         return seen[-1]
 
     monkeypatch.setattr(aws_glue_jars, "glue_jars_fingerprint", spy)
+    monkeypatch.setenv(aws_glue_jars.JARS_URL_ENV, JARS_URL)
     runs_of(_glue(contract, True, monkeypatch))
-    assert seen and seen[0].startswith("sha256:")
+    # What the emit computes from its own compile (aws_ingest: its account marker, os.environ)
+    from fluid_build.spark.compiler import compile_job_config
+
+    emitted = compile_job_config(contract, contract["builds"][0], account_ref="${emit_account}")
+    assert seen == [real(emitted.config)]
+    assert seen[0].startswith("sha256:")
 
 
 @pytest.mark.parametrize(
