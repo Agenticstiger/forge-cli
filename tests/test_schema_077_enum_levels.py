@@ -26,7 +26,13 @@ import pytest
 import fluid_build
 from fluid_build.engines.dbt._types import split_parameterized as dbt_split
 from fluid_build.engines.dbt._types import sql_type
-from fluid_build.providers.odcs.mappers.types import fluid_to_logical, fluid_to_physical
+from fluid_build.iac.providers.aws import _hive_outcome
+from fluid_build.iac.providers.gcp import _bq_outcome
+from fluid_build.providers.odcs.mappers.types import (
+    fluid_to_logical,
+    fluid_to_physical,
+    logical_type_options,
+)
 from fluid_build.providers.odcs.mappers.types import split_parameterized as odcs_split
 from fluid_build.schema_manager import FluidSchemaManager
 
@@ -224,3 +230,19 @@ def test_a_quoted_parenthesis_is_still_an_enum(caplog):
 def test_the_splitters_read_unquoted_types_as_before(fluid_type, odcs, dbt):
     assert odcs_split(fluid_type) == odcs
     assert dbt_split(fluid_type) == dbt
+
+
+@pytest.mark.parametrize("outcome", [_hive_outcome, _bq_outcome])
+def test_glue_and_bigquery_take_a_level_in_any_script(outcome):
+    assert outcome("enum('Z\u00fcrich', 'caf\u00e9', '\u65e5\u672c')") == outcome("enum")
+
+
+def test_an_enum_level_is_never_a_length():
+    assert logical_type_options("enum(10)") == {}
+    assert logical_type_options("varchar(10)") == {"maxLength": 10}
+
+
+def test_an_unclosed_quote_in_another_type_reads_as_before():
+    assert odcs_split("varchar(a'b)") == ("varchar", ("a'b",))
+    assert dbt_split("varchar(a'b)") == ("varchar", "a'b")
+    assert fluid_to_physical("varchar(a'b)", "snowflake") == "VARCHAR(a'b)"

@@ -207,7 +207,9 @@ def logical_type_options(fluid_type: str) -> Dict[str, Any]:
     emit the key only when it has content.
     """
     base, params = split_parameterized(fluid_type)
-    if not params:
+    # An enum's parameters are its levels, never a length: ``enum(10)`` names
+    # one level, 10.
+    if not params or base == "enum":
         return {}
     numeric: List[int] = []
     for param in params:

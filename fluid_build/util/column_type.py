@@ -44,11 +44,14 @@ def split_type_params(fluid_type: str) -> Tuple[str, Optional[str]]:
     """Split ``"decimal(18,4)"`` into ``("decimal", "18,4")``.
 
     ``"enum('a)b', 'c')"`` gives ``("enum", "'a)b', 'c'")``: the ``)`` inside
-    the quoted level does not end the list. A type with no parameter list
-    gives ``(type, None)``. So does a type whose parentheses do not close it:
-    an unclosed quote or list, a nested ``(`` outside quotes, or text after
-    the closing ``)``. Callers treat that as an unparameterised type they do
-    not know, as they did before quoted levels existed.
+    the quoted level does not end the list. A quote that never closes is an
+    ordinary character, as it was before quoted levels existed, so
+    ``"varchar(a'b)"`` still gives ``("varchar", "a'b")``.
+
+    A type with no parameter list gives ``(type, None)``. So does a type whose
+    parentheses do not close it: an unclosed list, a nested ``(`` outside
+    quotes, or text after the closing ``)``. Callers treat that as an
+    unparameterised type they do not know, as they always have.
 
     Both parts are stripped of surrounding whitespace; the inside of the list
     is returned as written.
@@ -61,9 +64,8 @@ def split_type_params(fluid_type: str) -> Tuple[str, Optional[str]]:
     while i < len(text):
         char = text[i]
         if char in _QUOTES:
-            i = _scan_quoted(text, i)
-            if i < 0:
-                return text, None
+            end = _scan_quoted(text, i)
+            i = i + 1 if end < 0 else end
             continue
         if char == "(":
             return text, None
@@ -80,8 +82,8 @@ def split_param_list(params: str) -> List[str]:
 
     ``"'a, b', 'c'"`` gives ``["'a, b'", "'c'"]`` and ``"18, 4"`` gives
     ``["18", "4"]``. Empty parts are kept (``"a,,b"`` gives three parts), so a
-    caller decides what an empty part means. An unclosed quote runs to the end
-    of the list, as a part of its own.
+    caller decides what an empty part means. A quote that never closes is an
+    ordinary character: ``"a'b, c"`` gives ``["a'b", "c"]``.
     """
     parts: List[str] = []
     start = 0
@@ -90,7 +92,7 @@ def split_param_list(params: str) -> List[str]:
         char = params[i]
         if char in _QUOTES:
             end = _scan_quoted(params, i)
-            i = len(params) if end < 0 else end
+            i = i + 1 if end < 0 else end
             continue
         if char == ",":
             parts.append(params[start:i].strip())

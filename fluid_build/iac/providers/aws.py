@@ -300,7 +300,9 @@ def _hive_outcome(raw: Any) -> column_types.TypeOutcome:
             "(fields, element, or key and value need contract 0.7.7 or later)",
             column_types.NESTED_FIX_DECLARE,
         )
-    if not rest.isascii():
+    # An enum's parameters are its levels, which may hold any character; Glue
+    # stores the column as a string and never reads them.
+    if base != "enum" and not rest.isascii():
         return column_types.refused(
             f"whose parameters ({rest}) are not ASCII", "Declare the type with ASCII digits."
         )
