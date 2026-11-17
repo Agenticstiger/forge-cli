@@ -145,7 +145,20 @@ def test_real_iceberg_on_glue_round_trip(aws_real_project, aws_account):
     # forge.pii.<col> parameter so analyst dashboards built on the
     # retired Glue registrar's parameter keys keep working.
     assert params.get("forge.pii.amount") == "pii,financial"
+    # The module creates it with open_table_format_input and no table_type (#915):
+    # Glue writes the first metadata and marks the table ICEBERG itself.
     assert table["Parameters"]["table_type"] == "ICEBERG"
+    assert table["Parameters"]["metadata_location"].startswith(f"s3://{bucket}/")
+    (applied,) = [
+        r
+        for r in runner.tofu_state_resources(
+            str(aws_real_project.workdir), env=aws_real_project.env
+        )
+        if r["type"] == "aws_glue_catalog_table"
+    ]
+    (recorded,) = applied["values"]["open_table_format_input"]
+    (iceberg,) = recorded["iceberg_input"]
+    assert (iceberg["metadata_operation"], iceberg["version"]) == ("CREATE", "2")
 
 
 def test_real_kinesis_stream_round_trip(aws_real_project, aws_account):
