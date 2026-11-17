@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -253,9 +255,25 @@ def test_a_value_the_reader_refuses_stops_the_profile(tmp_path):
         profile_expose(ORDERS, "orders", source=_slice(tmp_path, rows), backend=FakeBackend())
 
 
-def test_the_registry_is_not_wired_until_flux_stats_is_published():
-    with pytest.raises(StatisticsUnavailable, match="flux-stats"):
+@pytest.mark.parametrize(
+    ("installed", "state"),
+    [
+        (None, "is not installed"),
+        # PyPI's flux-stats 0.0.1 is a placeholder that installs no flux_stats module.
+        ("0.0.1", "0.0.1 is installed but cannot be imported (ModuleNotFoundError)"),
+    ],
+)
+def test_without_an_importable_flux_stats_nothing_is_read(monkeypatch, installed, state):
+    def version(name):
+        if installed is None:
+            raise importlib.metadata.PackageNotFoundError(name)
+        return installed
+
+    monkeypatch.setitem(sys.modules, "flux_stats", None)
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    with pytest.raises(StatisticsUnavailable) as caught:
         load_backend()
+    assert str(caught.value).endswith(f"and flux-stats {state}")
 
 
 def test_the_sum_of_an_indicator_with_few_ones_is_withheld(tmp_path):

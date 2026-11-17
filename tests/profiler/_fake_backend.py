@@ -3,16 +3,16 @@
 
 """A stand-in for the flux-stats registry, for the tests of ``fluid profile``.
 
-It does what flux-engine's registry does at main 2205253 (``flux_engine/stats``):
+It does what flux-stats does at flux-engine main 9ea8edf9 (``packages/flux-stats``):
 the seven column metrics of ``column_metrics.py``, the order-statistic index of
-``core/fixedpoint.py`` (``ceil(level * n)`` clamped to ``[1, n]``), the exact
-spelling of ``stats/spelling.render_exact``, and the value reading of
-``concordance/boundary/statistic.py`` (``_exact``, ``parse_rfc3339_ms``, ``nfc``).
-``check_document`` validates against the vendored ``profile-1.schema.json``.
+``fixedpoint.order_statistic_index`` (``ceil(level * n)`` clamped to ``[1, n]``),
+the exact spelling of ``spelling.render_exact``, and the value reading of
+``reading.py`` (``exact``, ``parse_rfc3339_ms``, ``nfc``). ``check_document``
+validates against the vendored ``profile-1.schema.json``.
 
-``tests/profiler/test_flux_engine_backend.py`` runs the same profiles through the
-real registry when flux-engine is installed, so this double cannot drift from
-it unnoticed on a machine that has both.
+``tests/profiler/test_flux_stats_backend.py`` runs the same profiles through the
+real registry wherever flux-stats is installed, and ``[dev]`` installs it in every
+CI lane, so this double cannot drift from it unnoticed.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from fluid_build.profiler._stats import DocumentRefused, ReadRefused
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SCHEMA_PATH = FIXTURES / "profile-1.schema.json"
-#: flux-engine main 2205253 (2026-11-16), docs/spec/profile-1.schema.json.
+#: flux-engine docs/spec/profile-1.schema.json, the same bytes at 2205253 and 9ea8edf9.
 # pragma: allowlist nextline secret
 SCHEMA_SHA256 = "fde1dfedd35a20556643ca9102c6886de3982b8761e8730d70d46fdc7c360674"
 
