@@ -123,7 +123,7 @@ def test_protobuf_registers_the_generated_proto_text_with_a_decimal():
         "\n"
         "message orders_v1 {\n"
         "  string id = 1;\n"
-        "  optional confluent.type.Decimal amount = 2;\n"
+        "  optional .confluent.type.Decimal amount = 2;\n"
         "}\n"
     )
     (subject,) = produced_subjects(contract)

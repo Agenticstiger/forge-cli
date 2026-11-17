@@ -280,14 +280,14 @@ class _ProtoWriter:
         if kind in _PROTO_WELL_KNOWN:
             name, imp = _PROTO_WELL_KNOWN[kind]
             self.imports.add(imp)
-            return name, True
+            return f".{name}", True
         if kind == "decimal":
             if self.decimal is None:
                 raise ValueError(
                     f"{path}: {self.decimal_hint or 'this registry has no Protobuf decimal type'}"
                 )
             self.imports.add(self.decimal[1])
-            return self.decimal[0], True
+            return f".{self.decimal[0]}", True
         raise ValueError(f"{path}: a {kind} column has no Protobuf type")
 
     def number(self, raw: Mapping[str, Any], path: str) -> int:
@@ -331,9 +331,32 @@ class _ProtoWriter:
                 )
             owner[number] = path
             numbers.append(number)
+        # proto3 derives a JSON name from each field (underscores dropped, the next letter
+        # capitalised) and protoc refuses two that collide: foo_bar and fooBar.
+        json_names: Dict[str, str] = {}
+        for (fname, _), path in zip(fields, paths, strict=True):
+            key = fname.replace("_", "").casefold()
+            if key in json_names:
+                raise ValueError(
+                    f"{path}: {fname!r} and {json_names[key]!r} have the same Protobuf JSON "
+                    "name; rename one"
+                )
+            json_names[key] = fname
 
         field_names = {n for n, _ in fields}
-        taken: set = set()
+        # A map field defines a nested <Field>Entry type implicitly; nothing else may.
+        entries = {
+            f"{_upper_camel(n)}Entry": p
+            for (n, t), p in zip(fields, paths, strict=True)
+            if t.kind == "map"
+        }
+        clash = sorted(field_names & set(entries))
+        if clash:
+            raise ValueError(
+                f"{entries[clash[0]]}: Protobuf defines {clash[0]} for this map, and a column "
+                "of that name collides with it; rename one"
+            )
+        taken: set = set(entries)
         nested: List[str] = []
         body: List[str] = []
         for (fname, dtype), raw, path, number in zip(fields, raws, paths, numbers, strict=True):

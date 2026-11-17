@@ -118,10 +118,10 @@ message Orders {
   optional double score = 5;
   bool active = 6;
   optional bytes blob = 7;
-  optional google.type.Date born = 8;
-  google.protobuf.Timestamp seen = 9;
-  optional google.protobuf.Timestamp seen_at = 10;
-  confluent.type.Decimal price = 11;
+  optional .google.type.Date born = 8;
+  .google.protobuf.Timestamp seen = 9;
+  optional .google.protobuf.Timestamp seen_at = 10;
+  .confluent.type.Decimal price = 11;
   Address address = 12;
   repeated Lines lines = 13;
   map<string, string> labels = 14;
@@ -170,7 +170,7 @@ def test_a_well_known_type_inside_a_nested_message_is_imported():
         [col("a", "array", 1, element={"type": "struct", "fields": [col("d", "date", 1)]})]
     )
     assert 'import "google/type/date.proto";' in text
-    assert "    optional google.type.Date d = 1;" in text
+    assert "    optional .google.type.Date d = 1;" in text
 
 
 def test_fields_keep_declared_order_not_number_order():
@@ -195,19 +195,47 @@ def test_required_and_optional_labels():
     assert "  S s = 5;" in text and "optional S" not in text
 
 
-def test_nested_message_name_collision_takes_the_field_number():
+def test_columns_whose_json_names_collide_are_refused():
+    # proto3 refuses fields equal after lowercasing with underscores dropped (protoc:
+    # "The JSON camel-case name of field ... conflicts"), so validate refuses them first.
+    raises([col("foo_bar", "string", 1), col("fooBar", "string", 2)], "same Protobuf JSON name")
+    raises(
+        [col("a_b", "struct", 1, fields=[col("x", "string", 1)]), col("AB", "string", 2)],
+        "same Protobuf JSON name",
+    )
+
+
+def test_a_column_named_like_a_maps_entry_type_is_refused():
+    raises(
+        [
+            col(
+                "tags", "map", 1, key={"type": "string", "required": True}, value={"type": "string"}
+            ),
+            col("TagsEntry", "string", 2),
+        ],
+        "Protobuf defines TagsEntry for this map",
+    )
+
+
+def test_a_struct_named_like_a_maps_entry_type_takes_the_field_number():
     text = proto(
         [
-            col("a_b", "struct", 1, fields=[col("x", "string", 1)]),
-            col("AB", "string", 2),
-            col("x_y", "struct", 3, fields=[col("x", "string", 1)]),
-            col("xY", "struct", 4, fields=[col("x", "string", 1)]),
+            col(
+                "tags", "map", 1, key={"type": "string", "required": True}, value={"type": "string"}
+            ),
+            col("tags_entry", "struct", 2, fields=[col("x", "string", 1)]),
         ]
     )
-    assert "  message AB_1 {" in text
-    assert "  AB_1 a_b = 1;" in text
-    assert "  message XY {" in text and "  message XY_4 {" in text
-    assert "  XY x_y = 3;" in text and "  XY_4 xY = 4;" in text
+    # protoc defines TagsEntry for the map itself; the struct's message steps aside.
+    assert "  message TagsEntry_2 {" in text and "  TagsEntry_2 tags_entry = 2;" in text
+    assert "message TagsEntry {" not in text
+
+
+def test_well_known_types_are_absolute_so_a_message_named_google_cannot_shadow_them():
+    text = proto([col("at", "timestamp", 1), col("day", "date", 2)], name="google")
+    assert "message google {" in text
+    assert "optional .google.protobuf.Timestamp at = 1;" in text
+    assert "optional .google.type.Date day = 2;" in text
 
 
 def test_package_and_name_are_sanitised():
@@ -218,7 +246,7 @@ def test_package_and_name_are_sanitised():
 
 def test_the_decimal_arrives_as_the_kinds_type():
     text = proto([col("d", "decimal(5,2)", 1)], decimal=("my.Decimal", "my/decimal.proto"))
-    assert 'import "my/decimal.proto";' in text and "optional my.Decimal d = 1;" in text
+    assert 'import "my/decimal.proto";' in text and "optional .my.Decimal d = 1;" in text
 
 
 # ---------------------------------------------------------------- refusals
