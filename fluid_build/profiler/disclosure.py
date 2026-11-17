@@ -21,6 +21,14 @@ that contribute to it (a non-zero value), and it is withheld when its records ho
 at most two values, where it would count them: ACRO's all-values-the-same check
 withholds the one-value case (:func:`check_sum`).
 
+A mean is checked as a magnitude table's cell too, which is how the output-checking
+guidelines class means (with totals: at least the threshold of units, and no
+dominant contributor) and how ACRO checks a mean cell. Its ``k`` is a count of
+records and is rounded like one, and its ``Sx``, the records' sum on the grid,
+publishes only where the column's ``sum`` would. Next to that exact sum, ``Sx``
+also gives the total of what the values lose below their grid points, so that
+total is checked as a sum as well (:func:`check_mean`).
+
 A minimum, a maximum or a quantile is one record's value in most data. The
 DwB/ESSnet "Guidelines for Output Checking" (class 3, maxima, minima and
 percentiles) do not release one by rule of thumb, and clear one when more than the
@@ -60,11 +68,12 @@ reason names the rule that fired, never a value.
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any, Dict, Iterable, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple, Union
 
 __all__ = [
     "ACRO_DEFAULT",
@@ -77,9 +86,11 @@ __all__ = [
     "SMALL_COUNT",
     "WITHHELD",
     "DisclosureRule",
+    "Exact",
     "Verdict",
     "check_count",
     "check_magnitude",
+    "check_mean",
     "check_order_statistic",
     "check_rounding",
     "check_sum",
@@ -105,6 +116,9 @@ WITHHELD = "C"
 
 #: The largest count a profile can carry: 2^53 - 1, as RFC 8785 serialises it.
 MAX_COUNT = 2**53 - 1
+
+#: An exact number: a contribution to a sum is a fraction, or a whole number.
+Exact = Union[int, Fraction]
 
 #: PROFILE-SPEC's ``UnitInterval``: a decimal string from 0 to 1, with no sign.
 _UNIT_INTERVAL = re.compile(r"(0(\.[0-9]+)?|1(\.0+)?)\Z")
@@ -274,14 +288,29 @@ def sample_size(count: int, rule: DisclosureRule) -> Dict[str, int]:
     return {"min": lowest, "max": min(highest, MAX_COUNT)}
 
 
-def check_magnitude(contributions: Iterable[Fraction], rule: DisclosureRule) -> Verdict:
+def _on_common_scale(values: Sequence[Exact]) -> Tuple[int, List[int]]:
+    """*values* times their least common denominator, as integers, and that multiplier.
+
+    Every check on a sum below reads counts of values, which values are equal, and
+    ratios of sums, and none of them changes when every contribution is multiplied by
+    one positive number. So they run on integers, which Python adds, sorts and
+    compares much faster than fractions, and decide exactly as they would on the
+    fractions.
+    """
+    exact = [value if isinstance(value, (int, Fraction)) else Fraction(value) for value in values]
+    common = math.lcm(*(value.denominator for value in exact))
+    return common, [value.numerator * (common // value.denominator) for value in exact]
+
+
+def check_magnitude(contributions: Iterable[Exact], rule: DisclosureRule) -> Verdict:
     """Check a sum, one contribution per record: dominance (n, k), then the p-ratio.
 
     Each contribution counts by its absolute value (see the module docstring). A
     total of zero is published: no contribution dominates it.
     """
-    sizes = sorted((abs(Fraction(value)) for value in contributions), reverse=True)
-    total = sum(sizes, Fraction(0))
+    _, scaled = _on_common_scale(list(contributions))
+    sizes = sorted((abs(value) for value in scaled), reverse=True)
+    total = sum(sizes)
     if total == 0:
         return PUBLISHED
     share = rule.k * total
@@ -289,16 +318,16 @@ def check_magnitude(contributions: Iterable[Fraction], rule: DisclosureRule) -> 
         return Verdict(
             DOMINANCE_BY_ONE, f"one record makes up at least {rule.dominance_k} of the total"
         )
-    if rule.dominance_n >= 2 and sum(sizes[:2], Fraction(0)) >= share:
+    if rule.dominance_n >= 2 and sum(sizes[:2]) >= share:
         return Verdict(
             DOMINANCE_BY_TWO, f"two records make up at least {rule.dominance_k} of the total"
         )
-    if rule.dominance_n >= 3 and sum(sizes[: rule.dominance_n], Fraction(0)) >= share:
+    if rule.dominance_n >= 3 and sum(sizes[: rule.dominance_n]) >= share:
         return Verdict(
             CONCENTRATION,
             f"{rule.dominance_n} records make up at least {rule.dominance_k} of the total",
         )
-    rest = total - sum(sizes[:2], Fraction(0))
+    rest = total - sum(sizes[:2])
     if rest < rule.p * sizes[0]:
         return Verdict(
             CONCENTRATION,
@@ -307,7 +336,7 @@ def check_magnitude(contributions: Iterable[Fraction], rule: DisclosureRule) -> 
     return PUBLISHED
 
 
-def check_sum(contributions: Sequence[Fraction], rule: DisclosureRule) -> Verdict:
+def check_sum(contributions: Sequence[Exact], rule: DisclosureRule) -> Verdict:
     """Check a sum the way a magnitude table's cell is checked, one contribution per record.
 
     In order, the first that fires decides:
@@ -322,7 +351,7 @@ def check_sum(contributions: Sequence[Fraction], rule: DisclosureRule) -> Verdic
        one-value case;
     3. :func:`check_magnitude`, dominance then the p-ratio.
     """
-    values = [Fraction(value) for value in contributions]
+    _, values = _on_common_scale(contributions)
     contributors = sum(1 for value in values if value != 0)
     counted = check_count(contributors, rule)
     if not counted.published:
@@ -330,10 +359,61 @@ def check_sum(contributions: Sequence[Fraction], rule: DisclosureRule) -> Verdic
             return counted
         return Verdict(SMALL_COUNT, f"fewer than {rule.minimum_cell} records contribute to the sum")
     distinct = set(values)
-    if len(distinct) <= 2 and distinct != {Fraction(0)} and distinct:
+    if len(distinct) <= 2 and distinct != {0} and distinct:
         # An all-zero sum is 0 whatever the count, so it gives no count back.
         return Verdict(WITHHELD, "the records hold at most two values, so the sum is a count")
     return check_magnitude(values, rule)
+
+
+def check_mean(
+    values: Sequence[Exact],
+    encoded: Sequence[int],
+    fractional_bits: int,
+    rule: DisclosureRule,
+) -> Verdict:
+    """Check an ungrouped ``mean/1``: ``k`` records, and ``Sx``, their values' sum on the grid.
+
+    *values* are the column's non-null values and *encoded* the same values on
+    the grid of ``2**-fractional_bits`` steps, each rounded toward -infinity. In
+    order, the first that fires decides:
+
+    1. ``k`` as a count of records (:func:`check_count`, then
+       :func:`check_rounding`), the checks ``count`` passes; it is published
+       rounded, as ``count`` is;
+    2. *values* as the ``sum`` metric checks them (:func:`check_sum`): ``Sx``
+       gives the sum back to within ``k`` grid steps, so a sum the rule withholds
+       is not published as ``Sx`` either;
+    3. *encoded*, the contributions ``Sx`` itself adds up (:func:`check_sum`):
+       values less than a grid step apart encode alike, so they can hold fewer
+       distinct values than *values* do;
+    4. the residues, what each value loses below its grid point
+       (:func:`check_sum`), when any is not zero. Next to the exact ``sum``,
+       ``Sx`` publishes their total, ``sum * 2**fractional_bits - Sx``, so it is
+       checked as the sum it is: one record's residue, or a residue that every
+       record shares (prices that all end in .99), would otherwise give a value
+       or the exact count back. Values on the grid (whole numbers, halves) leave
+       no residue, and then the mean says no more than ``count`` and ``sum``.
+    """
+    count = len(values)
+    verdict = check_count(count, rule)
+    if verdict.published:
+        verdict = check_rounding(count, rule)
+    if not verdict.published:
+        return verdict
+    # The values times their common denominator, so each check runs on integers.
+    common, scaled = _on_common_scale(values)
+    verdict = check_sum(scaled, rule)
+    if verdict.published:
+        verdict = check_sum(encoded, rule)
+    if verdict.published:
+        # What each value loses below its grid point, times the same common denominator.
+        residues = [
+            (whole << fractional_bits) - units * common
+            for whole, units in zip(scaled, encoded, strict=True)
+        ]
+        if any(residues):
+            verdict = check_sum(residues, rule)
+    return verdict
 
 
 def check_order_statistic(holders: int, rule: DisclosureRule) -> Verdict:

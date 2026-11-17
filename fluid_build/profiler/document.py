@@ -30,10 +30,12 @@ from fluid_build.profiler.disclosure import MAX_COUNT, DisclosureRule
 __all__ = [
     "DEFAULT_FRACTIONAL_BITS",
     "DocumentError",
+    "MAX_FRACTIONAL_BITS",
     "PRODUCER_REPOSITORY",
     "SCHEMA_URL",
     "build_document",
     "canonical_bytes",
+    "check_fractional_bits",
     "digest_of",
     "producer_uri",
 ]
@@ -44,14 +46,26 @@ SCHEMA_URL = "https://agenticstiger.github.io/flux/engine/spec/profile/1-0-0/Flu
 #: ``_producer`` names this repository, at the release that wrote the profile.
 PRODUCER_REPOSITORY = "https://github.com/Agenticstiger/forge-cli"
 
-#: The grid a profile declares when nothing in it depends on one. Column metrics
-#: are read in their own domain, never on the grid; 16 is the grid FLUX's own
-#: examples declare, so a metrics-only profile reads like the rest.
+#: The grid a profile declares unless told otherwise: KERNEL-SPEC §12's default,
+#: which a fidelity block that declares no ``encoding`` uses too. ``mean/1`` is
+#: formed on it, and the check compares the two only on one grid (PROFILE-SPEC
+#: §7). Column metrics are read in their own domain, never on the grid.
 DEFAULT_FRACTIONAL_BITS = 16
+
+#: The widest grid PROFILE-SPEC §2 allows.
+MAX_FRACTIONAL_BITS = 128
 
 
 class DocumentError(ValueError):
     """A document that PROFILE-SPEC refuses; the message names where, never a value."""
+
+
+def check_fractional_bits(fractional_bits: Any) -> None:
+    """Refuse a grid PROFILE-SPEC §2 does not allow: a whole number from 0 to 128."""
+    if isinstance(fractional_bits, bool) or not isinstance(fractional_bits, int):
+        raise DocumentError("encoding.fractionalBits is a whole number")
+    if not 0 <= fractional_bits <= MAX_FRACTIONAL_BITS:
+        raise DocumentError(f"encoding.fractionalBits lies from 0 to {MAX_FRACTIONAL_BITS}")
 
 
 def producer_uri(version: str) -> str:
@@ -67,10 +81,7 @@ def build_document(
     fractional_bits: int = DEFAULT_FRACTIONAL_BITS,
 ) -> Dict[str, Any]:
     """Assemble a format 1-0-0 document from tables already checked by *rule*."""
-    if isinstance(fractional_bits, bool) or not isinstance(fractional_bits, int):
-        raise DocumentError("encoding.fractionalBits is a whole number")
-    if not 0 <= fractional_bits <= 128:
-        raise DocumentError("encoding.fractionalBits lies from 0 to 128")
+    check_fractional_bits(fractional_bits)
     if not tables:
         raise DocumentError("tables holds at least one table")
     return {

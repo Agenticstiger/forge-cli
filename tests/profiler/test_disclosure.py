@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import random
 from fractions import Fraction
 
 import pytest
@@ -16,6 +17,7 @@ from fluid_build.profiler.disclosure import (
     DisclosureRule,
     check_count,
     check_magnitude,
+    check_mean,
     check_order_statistic,
     check_rounding,
     check_sum,
@@ -254,3 +256,122 @@ def test_a_positive_count_that_rounds_to_zero_is_withheld():
     assert check_rounding(2, ACRO_DEFAULT).status == "A"
     assert check_rounding(3, ACRO_DEFAULT).published
     assert check_rounding(0, ACRO_DEFAULT).published  # a true zero is check_count's to judge
+
+
+def _on_grid(values, bits=16):
+    return [(value.numerator << bits) // value.denominator for value in values]
+
+
+def _mean(values, rule=ACRO_DEFAULT, bits=16):
+    return check_mean(values, _on_grid(values, bits), bits, rule)
+
+
+def test_a_mean_publishes_only_where_the_count_and_the_sum_would():
+    values = [Fraction(n) for n in range(1, 21)]
+    assert _mean(values).published
+    assert _mean(values[:9]).status == "A"  # k below 10
+    assert _mean([]).status == "A"  # a zero
+    assert _mean([], _rule(zeros_disclosive=False)).published
+    dominated = [Fraction(200)] + [Fraction(1)] * 6 + [Fraction(2)] * 4
+    assert _mean(dominated).status == "O"
+    assert _mean([Fraction(1), Fraction(2)] * 10).status == "C"
+
+
+def test_a_mean_is_withheld_when_its_values_on_the_grid_hold_two():
+    # Four values, so the sum publishes; floored to whole numbers they are 1 and 2.
+    values = [Fraction(n, 10) for n in (11, 12, 13, 24)] * 5
+    assert check_sum(values, ACRO_DEFAULT).published
+    assert _mean(values, bits=0).status == "C"
+
+
+def test_a_mean_whose_count_rounds_to_zero_is_withheld():
+    # A rule whose threshold lets 2 records through still never publishes k = 0.
+    assert _mean([Fraction(3), Fraction(5)], _rule(minimum_cell=1)).status == "A"
+
+
+def _decimals(*texts):
+    return [Fraction(text) for text in texts]
+
+
+@pytest.mark.parametrize(
+    ("values", "bits", "status"),
+    [
+        # Next to the exact sum, Sx gives the residues' total: 0.36 + 0.64 here, which
+        # alone tells this column from 10.50, 10.50, 20 ... 29 (same count, same sum).
+        (_decimals("10.01", "10.99") + [Fraction(n) for n in range(20, 30)], 16, "A"),
+        # 25 split into 12.01 and 12.99: 12 records against 11, with the same metrics.
+        (_decimals("12.01", "12.99") + [Fraction(n) for n in range(20, 31) if n != 25], 16, "A"),
+        # Every value ends in .5: on a grid of whole numbers the residues total k / 2.
+        ([Fraction(2 * n + 1, 2) for n in range(10, 22)], 0, "C"),
+        # Prices that all end in .99 share one residue, so its total is a count.
+        ([n + Fraction(99, 100) for n in range(1, 41)], 16, "C"),
+    ],
+)
+def test_a_mean_whose_residues_would_give_a_count_or_a_value_back_is_withheld(values, bits, status):
+    assert check_sum(values, ACRO_DEFAULT).published  # the sum itself is published
+    assert _mean(values, bits=bits).status == status
+
+
+def test_a_mean_publishes_when_its_values_are_on_the_grid_or_their_residues_pass():
+    halves = [Fraction(2 * n + 1, 2) for n in range(10, 22)]
+    assert _mean(halves, bits=16).published  # every half is on a 16-bit grid
+    cents = [n + Fraction(n * 37 % 100, 100) for n in range(1, 41)]
+    assert _mean(cents, bits=16).published  # varied residues, none dominant
+
+
+def _reference_sum_check(values, rule):
+    """check_sum as it read before it ran on integers: every step on fractions."""
+    values = [Fraction(value) for value in values]
+    contributors = sum(1 for value in values if value != 0)
+    counted = check_count(contributors, rule)
+    if not counted.published:
+        return counted.status
+    distinct = set(values)
+    if len(distinct) <= 2 and distinct != {Fraction(0)} and distinct:
+        return "C"
+    sizes = sorted((abs(value) for value in values), reverse=True)
+    total = sum(sizes, Fraction(0))
+    if total == 0:
+        return "F"
+    share = rule.k * total
+    if sizes[0] >= share:
+        return "O"
+    if rule.dominance_n >= 2 and sum(sizes[:2], Fraction(0)) >= share:
+        return "T"
+    if rule.dominance_n >= 3 and sum(sizes[: rule.dominance_n], Fraction(0)) >= share:
+        return "M"
+    return "M" if total - sum(sizes[:2], Fraction(0)) < rule.p * sizes[0] else "F"
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_the_sum_checks_decide_on_integers_as_they_did_on_fractions(seed):
+    rng = random.Random(seed)
+    rule = _rule(dominance_n=rng.choice([1, 2, 3]), dominance_k=rng.choice(["0.5", "0.90"]))
+    size = rng.choice([0, 3, 12, 40])
+    values = [
+        Fraction(
+            rng.choice([0, rng.randint(-50, 50), rng.randint(1, 10**6)]), rng.choice([1, 3, 4, 100])
+        )
+        for _ in range(size)
+    ]
+    assert check_sum(values, rule).status == _reference_sum_check(values, rule)
+    # Whole numbers, and the same values on any common scale, decide alike.
+    scale = rng.randint(1, 10**9)
+    assert (
+        check_sum([value * scale for value in values], rule).status
+        == check_sum(values, rule).status
+    )
+
+
+def test_a_sum_of_decimals_or_text_is_checked_as_the_same_fractions():
+    from decimal import Decimal
+
+    fractions = [Fraction(n, 4) for n in range(1, 21)] + [Fraction(500)]
+    expected = check_sum(fractions, ACRO_DEFAULT).status
+    assert (
+        check_sum(
+            [Decimal(str(value.numerator / value.denominator)) for value in fractions], ACRO_DEFAULT
+        ).status
+        == expected
+    )
+    assert check_sum([str(value) for value in fractions], ACRO_DEFAULT).status == expected

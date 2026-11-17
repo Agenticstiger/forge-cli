@@ -19,7 +19,7 @@ import argparse
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 COMMAND = "profile"
 
@@ -33,10 +33,16 @@ checks are ACRO 1.1.0's defaults, named "acro-default" in the document:
   - every published count is rounded to a multiple of 5;
   - a sum is withheld when 2 records make up 90% of it, or when what is left
     after the 2 largest is below 10% of the largest;
-  - a min, max or quantile is published only when 10 records hold that value.
+  - a min, max or quantile is published only when 10 records hold that value;
+  - a mean is published only when the column's count and sum are.
 A withheld value keeps its SDMX CL_CONF_STATUS code and no value: A (a small
 count), C (a sum over at most two values), O or T (dominated by one or two
 records) or M (concentration).
+
+For each number column the document also holds mean/1, the statistic the FLUX
+fidelity check compares a mean property with: the number of values and their
+sum on a grid of 2^-N steps. N is --fractional-bits, 16 unless given, and the
+fidelity block's encoding.fractionalBits must be the same.
 
 These are output-checking conventions only. No privacy or anonymity guarantee
 is made or implied: read the document before you share it.
@@ -55,6 +61,8 @@ fluid profile contract.fluid.yaml --expose orders \\
 # to 5, a sum 2 records dominate is withheld, and a min, max or quantile is shown only
 # when 10 records hold it (ACRO 1.1.0 defaults). Output-checking conventions only: no
 # privacy or anonymity guarantee. Pin the printed digest in the FLUX Simulation.
+# Each number column also gets mean/1, which FLUX compares a mean property with, on the
+# grid --fractional-bits names (16 unless given): the fidelity block must declare it.
 """
 
 
@@ -93,8 +101,37 @@ def register(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") 
         "--out",
         help="where to write the profile (default: <exposeId>.profile.json here)",
     )
+    p.add_argument(
+        "--fractional-bits",
+        type=_fractional_bits,
+        default=_DEFAULT_FRACTIONAL_BITS,
+        metavar="N",
+        help=(
+            "the grid mean/1 is formed on, 2^-N steps: the fidelity block's "
+            f"encoding.fractionalBits (default: {_DEFAULT_FRACTIONAL_BITS}, FLUX's default; "
+            f"0 to {_MAX_FRACTIONAL_BITS})"
+        ),
+    )
     p.add_argument("--env", help="environment overlay to apply to the contract first")
     p.set_defaults(func=run)
+
+
+#: The profile document's grid bounds, repeated from ``profiler/document.py`` so
+#: that registering the command imports nothing but the standard library;
+#: ``tests/profiler/test_cli_profile.py`` keeps the two equal.
+_DEFAULT_FRACTIONAL_BITS = 16
+_MAX_FRACTIONAL_BITS = 128
+
+
+def _fractional_bits(text: str) -> int:
+    """``--fractional-bits``: a whole number from 0 to 128, as PROFILE-SPEC §2 allows."""
+    try:
+        bits = int(text, 10)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number") from None
+    if not 0 <= bits <= _MAX_FRACTIONAL_BITS:
+        raise argparse.ArgumentTypeError(f"{bits} is outside 0 to {_MAX_FRACTIONAL_BITS}")
+    return bits
 
 
 def _refusal(event: str, detail: str, context: Dict[str, str]) -> Any:
@@ -138,6 +175,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             table=args.table,
             cwd=Path.cwd(),
             backend=backend,
+            fractional_bits=args.fractional_bits,
         )
         _write(out, result.canonical)
     except (
@@ -293,6 +331,18 @@ def _report(say: Any, result: Any, out: Path) -> None:
             for code, count in withheld.items()
         )
         say(f"Withheld, by CL_CONF_STATUS code: {codes}.")
+    by_definition: Dict[str, List[str]] = {}
+    for column, identifier in result.statistics:
+        by_definition.setdefault(identifier, []).append(repr(column))
+    if by_definition:
+        published = "; ".join(
+            f"{identifier} of {', '.join(columns)}" for identifier, columns in by_definition.items()
+        )
+        say(
+            f"Fidelity statistics: {published}, on fractionalBits {result.fractional_bits}"
+            " (the fidelity block must declare the same).",
+            soft_wrap=True,
+        )
     for name, reason in plan.skipped:
         say(f"Not profiled: column {name!r}: {reason}.")
     if not result.published:
