@@ -97,6 +97,17 @@ class ConfluentSchemaRegistryConnector(BaseCatalogConnector):
 
         return self._apply_filters(mock_products, filters)
 
+    def stream_block(self, subject: str, version: Any = "latest") -> Dict[str, Any]:
+        """A ``properties.stream`` block seeded from ``subject`` in this registry.
+
+        Reads the subject (latest or version N) with no credential, through the same
+        host policy as ``fluid plan``: ``schema_registry/importer.py``.
+        """
+        from fluid_build.schema_registry.importer import ref_for, stream_from_subject
+
+        url = self.config.get("url", "http://localhost:8081")
+        return stream_from_subject(ref_for("confluent", subject, url=url, version=version))
+
     async def _get_catalog_stats_impl(self) -> Dict[str, Any]:
         """Get catalog statistics"""
         return {"total_products": 28, "avg_quality": 0.94, "last_updated": "2024-10-15T12:30:00Z"}

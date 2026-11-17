@@ -143,6 +143,11 @@ def _apply_via_opentofu(
     bound = _bound_tofu_plan(args, plan_data, logger)
 
     eng = _open_engine(args, logger, contract, bound=bound[0] if bound else None)
+    # Consumed subjects whose registry needs a credential: plan leaves them to apply,
+    # which resolves it. Before any tofu apply, saved plan or not (schema_registry/verify.py).
+    _verify_registry_at_apply(
+        eng.contract, eng.provider, dry_run=bool(getattr(args, "dry_run", False))
+    )
     if bound is not None:
         return _apply_bound_plan(eng, args, logger, *bound, applied_state=applied_state)
 
@@ -197,6 +202,15 @@ def _apply_via_opentofu(
         imported.keep()
 
     return _finish_apply(eng, logger, changes, destroyed, applied_state)
+
+
+def _verify_registry_at_apply(
+    contract: Optional[Mapping[str, Any]], provider: str, *, dry_run: bool
+) -> None:
+    """``schema_registry.verify.verify_at_apply``; function-local: it reaches httpx."""
+    from fluid_build.schema_registry.verify import verify_at_apply
+
+    verify_at_apply(contract or {}, dry_run=dry_run, provider=provider)
 
 
 def _open_engine(

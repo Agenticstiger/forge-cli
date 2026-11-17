@@ -439,6 +439,12 @@ def run(args, logger: logging.Logger) -> int:
         # no `packaging` block is returned untouched — no new key, no digest
         # churn. Function-local import: `iac` pulls every provider plugin and
         # must stay off the `fluid --help` cold path.
+        # Consumed Kafka subjects, read from their registry and checked against the
+        # declared stream schema (online: `fluid validate` stays offline). Before the
+        # digests, which cover the subject versions checked. Function-local: httpx/boto3.
+        from fluid_build.schema_registry.verify import attach_registry_checks
+
+        plan = attach_registry_checks(plan, contract, provider=getattr(args, "provider", None))
         from fluid_build.iac.plan_packaging import apply_packaging_to_plan
 
         plan = apply_packaging_to_plan(plan, contract)
