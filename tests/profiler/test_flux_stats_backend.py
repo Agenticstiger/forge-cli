@@ -13,7 +13,9 @@ includes ``[profile]``, so CI runs it. It checks that:
 * the stand-in registry the other tests use (``_fake_backend.FakeBackend``)
   writes byte-identical documents, so those tests exercise the real numbers;
 * a value is read as the fidelity check reads it, and a refused one is named by
-  its column, its row and flux-stats' code, never by itself.
+  its column, its row and flux-stats' code, never by itself;
+* a value is placed on the grid as the check places it, and the ``mean/1`` a
+  profile carries is one the check compares a ``mean`` property with.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from fluid_build.profiler._stats import (
     StatisticsBackend,
     load_backend,
 )
+from fluid_build.profiler.disclosure import ACRO_DEFAULT, round_count
 from fluid_build.profiler.runner import profile_expose
 from tests.profiler._fake_backend import FakeBackend
 
@@ -86,6 +89,7 @@ def test_the_backend_satisfies_the_seam(backend):
     assert isinstance(backend, StatisticsBackend)
     names = {metric.name for metric in backend.metrics()}
     assert {"count", "nullCount", "distinctCount", "sum", "min", "max", "quantiles"} <= names
+    assert "mean/1" in {statistic.identifier for statistic in backend.statistics()}
 
 
 @pytest.mark.parametrize("count", [3, 40, 200])
@@ -230,3 +234,54 @@ def test_a_boolean_column_is_left_out_as_flux_stats_reads_none(tmp_path, backend
     result = profile_expose(contract, "payment", source=_slice(tmp_path, rows), backend=backend)
     assert [name for name, _ in result.plan.skipped] == ["paid"]
     load_profile_text(result.canonical.decode("utf-8"))
+
+
+@pytest.mark.parametrize("fractional_bits", [0, 1, 16, 53, 128])
+@pytest.mark.parametrize(
+    "value",
+    [
+        Fraction(0),
+        Fraction(1, 2),
+        Fraction(-1, 2),
+        Fraction(1, 100000),
+        Fraction(-1, 100000),
+        Fraction(1225, 100),
+        Fraction(-(10**30) - 1, 3),
+    ],
+)
+def test_a_value_is_placed_on_the_grid_as_flux_stats_places_it(backend, fractional_bits, value):
+    from flux_stats.fixedpoint import Grid
+
+    units = backend.encoder(fractional_bits)(value)
+    assert units == Grid(fractional_bits).quantise(value)
+    assert units == FakeBackend().encoder(fractional_bits)(value)
+    assert type(units) is int
+
+
+def test_the_mean_a_profile_carries_is_the_one_the_check_compares(tmp_path, backend):
+    from flux_stats import Check, GroupStatistic
+
+    result = profile_expose(
+        CONTRACT, "payment", source=_slice(tmp_path, _rows(200)), backend=backend
+    )
+    profile, _ = load_profile_text(result.canonical.decode("utf-8"))
+    assert profile.fractional_bits == 16
+    for column in ("amount", "attempts"):
+        (entry,) = profile.column_statistics("payment", column)
+        assert entry.identifier == "mean/1" and entry.group_by is None
+        (group,) = entry.groups
+        assert group.published and group.key == ""
+        reference = group.statistic
+        values = [
+            Fraction(Decimal(str(row[column]))) for row in _rows(200) if row[column] is not None
+        ]
+        # k is the count rounded as every published count is; Sx is the exact sum on the grid.
+        assert reference.k == round_count(len(values), ACRO_DEFAULT)
+        assert reference.sum_x == sum(map(backend.encoder(16), values))
+        exact = sum(values, Fraction(0))
+        assert 0 <= exact - Fraction(reference.sum_x, 2**16) < Fraction(len(values), 2**16)
+        check = Check(subject="mean", tolerance="relative", margin=Fraction(1, 10))
+        same = GroupStatistic(group="", k=reference.k, sum_x=reference.sum_x)
+        assert entry.definition.compare(same, reference, check)
+        higher = GroupStatistic(group="", k=reference.k, sum_x=reference.sum_x * 12 // 10)
+        assert not entry.definition.compare(higher, reference, check)

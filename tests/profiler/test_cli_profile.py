@@ -13,8 +13,8 @@ import sys
 
 import pytest
 
-from fluid_build.cli import main
-from fluid_build.profiler import _stats
+from fluid_build.cli import main, profile_cmd
+from fluid_build.profiler import _stats, document
 from tests.profiler._fake_backend import FakeBackend
 
 pytestmark = pytest.mark.unit
@@ -224,3 +224,64 @@ def test_a_refused_profile_leaves_no_directory_behind(workspace, registry, capsy
     )
     assert rc == 1 and "profile_source_unreadable" in capsys.readouterr().out
     assert not (workspace / "newdir").exists()
+
+
+def _run(argv):
+    try:
+        return main(argv)
+    except SystemExit as exited:  # argparse refuses a bad value by exiting
+        return exited.code
+
+
+def test_the_summary_names_the_fidelity_statistics_and_their_grid(workspace, registry, capsys):
+    assert main(["profile", "contract.fluid.yaml", "--source", "orders.ndjson"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert (
+        "Fidelity statistics: mean/1 of 'amount', on fractionalBits 16 "
+        "(the fidelity block must declare the same)." in out
+    )
+    written = json.loads((workspace / "orders.profile.json").read_bytes())
+    assert written["encoding"] == {"fractionalBits": 16, "rounding": "floor"}
+    (statistic,) = written["tables"]["orders"]["columns"]["amount"]["statistics"]
+    assert statistic["groups"] == [{"group": "", "k": 40, "Sx": str(620 * 2**16), "status": "F"}]
+
+
+def test_fractional_bits_names_the_grid(workspace, registry, capsys):
+    argv = [
+        "profile",
+        "contract.fluid.yaml",
+        "--source",
+        "orders.ndjson",
+        "--fractional-bits",
+        "20",
+    ]
+    assert main(argv) == 0
+    assert "on fractionalBits 20 " in " ".join(capsys.readouterr().out.split())
+    written = json.loads((workspace / "orders.profile.json").read_bytes())
+    assert written["encoding"]["fractionalBits"] == 20
+    (statistic,) = written["tables"]["orders"]["columns"]["amount"]["statistics"]
+    assert statistic["groups"][0]["Sx"] == str(620 * 2**20)
+
+
+@pytest.mark.parametrize("bits", ["-1", "129", "16.5", "x", ""])
+def test_a_grid_out_of_range_is_a_usage_error_and_writes_nothing(workspace, registry, capsys, bits):
+    rc = _run(
+        ["profile", "contract.fluid.yaml", "--source", "orders.ndjson", "--fractional-bits", bits]
+    )
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "--fractional-bits" in err
+    assert not (workspace / "orders.profile.json").exists()
+
+
+def test_the_command_repeats_the_documents_grid_bounds():
+    # Registering the command imports nothing heavy, so it keeps its own copy of the bounds.
+    assert profile_cmd._DEFAULT_FRACTIONAL_BITS == document.DEFAULT_FRACTIONAL_BITS
+    assert profile_cmd._MAX_FRACTIONAL_BITS == document.MAX_FRACTIONAL_BITS
+
+
+def test_profile_help_names_the_mean_and_its_grid(capsys):
+    assert _run(["profile", "--help"]) == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert "mean/1" in text and "--fractional-bits" in text
+    assert "encoding.fractionalBits" in text
