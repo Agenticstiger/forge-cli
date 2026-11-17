@@ -23,6 +23,29 @@ Columns to registry schema (:func:`avro_schema`, :func:`json_schema`):
 :func:`schema_text` is the canonical text: keys sorted, no whitespace, so the same
 columns always give the same bytes and a plan digest stays stable.
 
+Protobuf (:func:`protobuf_schema`, produced subjects only) is canonical proto3 text:
+
+* Scalars: string, ``int32`` (int), ``int64`` (long), float, double, bool, bytes.
+* Well-known types, borrowed from Kafka Connect's ``ProtobufConverter`` mapping in
+  confluentinc/schema-registry (``ProtobufData``: Date -> ``google.type.Date``,
+  Timestamp -> ``google.protobuf.Timestamp``, Decimal -> ``confluent.type.Decimal``):
+  ``date`` is ``google.type.Date`` and ``timestamp``/``timestamp_ltz`` are
+  ``google.protobuf.Timestamp``, for both registry kinds. A ``decimal`` is the kind's
+  ``protobuf_decimal`` (``confluent.type.Decimal`` for Confluent, which has
+  ``confluent/type/decimal.proto`` built in); Glue resolves no decimal type for Protobuf,
+  so a decimal column in a Glue Protobuf subject is refused. An ``import`` line is written
+  only for a type the schema uses.
+* A struct is a nested message, an array a ``repeated`` field, a map a ``map<string, V>``.
+  An array or map of arrays or maps has no Protobuf field and is refused.
+* A nullable scalar or well-known-type field is ``optional``; a required one has no label.
+* Field numbers are the author's: ``protobuf: {field: N}`` on every column, because a
+  number names the field on the wire and must never change once data is written. They are
+  unique within a message, 1 to 536870911, outside the 19000-19999 range Protobuf reserves.
+  Fields are written in declared column order, nested messages first.
+
+The language rules are protobuf.dev's (proto3 language guide, field numbers and field
+labels).
+
 Registry schema to columns (:func:`columns_from_registry`): the inverse, for the
 plan-time comparison and for seeding ``stream.schema`` from a subject. A union other
 than ``[null, T]`` and a JSON Schema ``$ref`` outside the document have no column type,
@@ -210,6 +233,182 @@ def json_schema(columns: Sequence[Mapping[str, Any]], *, title: str) -> Dict[str
         "type": "object",
         **_json_properties(fields),
     }
+
+
+# ── columns → Protobuf ──────────────────────────────────────────────────────────
+
+_PROTO_IDENT = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_PROTO_SCALAR = {
+    "string": "string",
+    "int": "int32",
+    "long": "int64",
+    "float": "float",
+    "double": "double",
+    "boolean": "bool",
+    "binary": "bytes",
+}
+_PROTO_WELL_KNOWN = {
+    "date": ("google.type.Date", "google/type/date.proto"),
+    "timestamp": ("google.protobuf.Timestamp", "google/protobuf/timestamp.proto"),
+    "timestamp_ltz": ("google.protobuf.Timestamp", "google/protobuf/timestamp.proto"),
+}
+_PROTO_MAX_FIELD = 536870911
+_PROTO_RESERVED = range(19000, 20000)
+
+
+def proto_identifier(text: str) -> str:
+    """``text`` as a proto identifier: ``[A-Za-z][A-Za-z0-9_]*`` (Avro name, then an ``f`` prefix)."""
+    name = avro_name(text)
+    return name if name[0].isalpha() else f"f{name}"
+
+
+def _upper_camel(name: str) -> str:
+    return "".join(part[:1].upper() + part[1:] for part in name.split("_"))
+
+
+class _ProtoWriter:
+    def __init__(self, decimal: Optional[Tuple[str, str]], decimal_hint: str) -> None:
+        self.decimal = decimal
+        self.decimal_hint = decimal_hint
+        self.imports: set = set()
+
+    def leaf(self, dtype: LogicalType, path: str) -> Tuple[str, bool]:
+        """``(type text, is scalar or well-known)`` of a non-struct, non-container type."""
+        kind = dtype.kind
+        if kind in _PROTO_SCALAR:
+            return _PROTO_SCALAR[kind], True
+        if kind in _PROTO_WELL_KNOWN:
+            name, imp = _PROTO_WELL_KNOWN[kind]
+            self.imports.add(imp)
+            return name, True
+        if kind == "decimal":
+            if self.decimal is None:
+                raise ValueError(
+                    f"{path}: {self.decimal_hint or 'this registry has no Protobuf decimal type'}"
+                )
+            self.imports.add(self.decimal[1])
+            return self.decimal[0], True
+        raise ValueError(f"{path}: a {kind} column has no Protobuf type")
+
+    def number(self, raw: Mapping[str, Any], path: str) -> int:
+        block = raw.get("protobuf")
+        number = block.get("field") if isinstance(block, Mapping) else None
+        if number is None:
+            raise ValueError(
+                f"{path}: a Protobuf column needs protobuf.field, its field number "
+                "(a number names the field on the wire and never changes once data is written)"
+            )
+        if isinstance(number, bool) or not isinstance(number, int):
+            raise ValueError(f"{path}: protobuf.field must be an integer, not {number!r}")
+        if not 1 <= number <= _PROTO_MAX_FIELD or number in _PROTO_RESERVED:
+            raise ValueError(
+                f"{path}: protobuf.field {number} is out of range: 1 to {_PROTO_MAX_FIELD}, "
+                "except 19000 to 19999, which Protobuf reserves"
+            )
+        return number
+
+    def message(
+        self,
+        name: str,
+        fields: Sequence[Tuple[str, LogicalType]],
+        raws: Sequence[Mapping[str, Any]],
+        parent: str,
+        depth: int,
+    ) -> List[str]:
+        """The lines of ``message name { ... }`` at ``depth`` levels of indentation."""
+        pad = "  " * depth
+        paths = [f"{parent}.{n}" if parent else n for n, _ in fields]
+        numbers: List[int] = []
+        owner: Dict[int, str] = {}
+        for (fname, _), raw, path in zip(fields, raws, paths, strict=True):
+            if not _PROTO_IDENT.fullmatch(fname):
+                raise ValueError(f"{path}: {fname!r} is not a Protobuf identifier")
+            number = self.number(raw, path)
+            if number in owner:
+                raise ValueError(
+                    f"{path}: protobuf.field {number} is also {owner[number]}'s; "
+                    "a field number is unique within its message"
+                )
+            owner[number] = path
+            numbers.append(number)
+
+        field_names = {n for n, _ in fields}
+        taken: set = set()
+        nested: List[str] = []
+        body: List[str] = []
+        for (fname, dtype), raw, path, number in zip(fields, raws, paths, numbers, strict=True):
+            holder, holder_raw, holder_path = dtype, raw, path
+            label = ""
+            if dtype.kind == "array" and dtype.element is not None:
+                holder, holder_raw, holder_path = dtype.element, raw["element"], f"{path}[]"
+                if holder.kind in ("array", "map"):
+                    raise ValueError(
+                        f"{path}: an array of arrays/maps has no Protobuf field; "
+                        "wrap it in a struct"
+                    )
+                label = "repeated "
+            elif dtype.kind == "map" and dtype.value is not None:
+                holder, holder_raw, holder_path = dtype.value, raw["value"], f"{path}{{}}"
+                if holder.kind in ("array", "map"):
+                    raise ValueError(
+                        f"{path}: a map of arrays/maps has no Protobuf field; wrap it in a struct"
+                    )
+            if holder.kind == "struct":
+                msg = _upper_camel(fname)
+                if msg in taken or msg in field_names:
+                    msg = f"{msg}_{number}"
+                    if msg in taken or msg in field_names:
+                        raise ValueError(f"{path}: the nested message name {msg!r} is taken")
+                taken.add(msg)
+                inner = self.message(
+                    msg,
+                    holder.fields,
+                    holder_raw["fields"],
+                    holder_path,
+                    depth + 1,
+                )
+                nested.extend(inner)
+                type_text, simple = msg, False
+            else:
+                type_text, simple = self.leaf(holder, holder_path)
+            if dtype.kind == "map":
+                body.append(f"{pad}  map<string, {type_text}> {fname} = {number};")
+            elif label:
+                body.append(f"{pad}  repeated {type_text} {fname} = {number};")
+            else:
+                optional = "optional " if simple and not dtype.required else ""
+                body.append(f"{pad}  {optional}{type_text} {fname} = {number};")
+        return [f"{pad}message {name} {{", *nested, *body, f"{pad}}}"]
+
+
+def protobuf_schema(
+    columns: Sequence[Mapping[str, Any]],
+    *,
+    name: str,
+    package: str,
+    decimal: Optional[Tuple[str, str]] = None,
+    decimal_hint: str = "",
+) -> str:
+    """The proto3 text of ``columns``: one top message ``name`` in ``package``.
+
+    ``decimal`` is ``(type name, import path)`` for a ``decimal`` column, or ``None`` for a
+    registry that has none (the column then raises :class:`ValueError` with
+    ``decimal_hint``). Every column, nested struct fields included, needs
+    ``protobuf: {field: N}``. Deterministic: the same columns give the same bytes.
+    """
+    fields = parse_fields(list(columns), path="schema")
+    top = proto_identifier(name)
+    segments = [proto_identifier(part) for part in package.split(".") if part]
+    if not segments:
+        raise ValueError("a Protobuf schema needs a package")
+    writer = _ProtoWriter(decimal, decimal_hint)
+    message = writer.message(top, fields, list(columns), "", 0)
+    lines = ['syntax = "proto3";', "", f"package {'.'.join(segments)};", ""]
+    if writer.imports:
+        lines += [f'import "{path}";' for path in sorted(writer.imports)]
+        lines.append("")
+    lines += message
+    return "\n".join(lines) + "\n"
 
 
 #: The value formats a consumed subject is checked in, as the registry names them.

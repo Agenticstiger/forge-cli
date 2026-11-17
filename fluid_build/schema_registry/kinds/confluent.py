@@ -82,6 +82,9 @@ class ConfluentKind(RegistryKind):
     fields = frozenset({"url", "auth"})
     refuses = frozenset({"registryName"})
     checks_compatibility = True
+    # Confluent Schema Registry has confluent/type/decimal.proto built in (ProtobufSchema
+    # KNOWN_DEPENDENCIES), so the subject needs no schema reference.
+    protobuf_decimal = ("confluent.type.Decimal", "confluent/type/decimal.proto")
 
     def field_errors(self, spec: Mapping[str, Any], where: str) -> List[str]:
         errors: List[str] = []
