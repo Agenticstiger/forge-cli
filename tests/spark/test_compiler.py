@@ -16,6 +16,7 @@ from fluid_build.spark.compiler import (
     CONFIG_VERSION,
     CONTRACT_SQL_ALLOWLIST_ENV,
     MSK_BROKERS_PLACEHOLDER,
+    TARGET_ALLOWLIST_ENV,
     compile_job_config,
     spark_builds,
     validation_errors,
@@ -260,17 +261,19 @@ def test_the_kafka_cluster_comes_from_parameters_spark_source(contract, source, 
         job(contract)
 
 
-def test_an_msk_cluster_arn_leaves_one_placeholder_for_the_uploader(contract):
+def test_an_msk_cluster_arn_leaves_one_placeholder_for_the_uploader(contract, monkeypatch):
     arn = "arn:aws:kafka:eu-west-1:000000000005:cluster/orders/abc-1"
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"msk:{arn}")
     contract["builds"][0]["properties"]["parameters"]["spark"]["source"] = {"mskClusterArn": arn}
     source = job(contract).config["source"]
     assert source["bootstrapServers"] == MSK_BROKERS_PLACEHOLDER == "${fluid_msk_bootstrap_brokers}"
     assert (source["mskClusterArn"], source["auth"], source["tls"]) == (arn, "msk-iam", False)
 
 
-def test_tls_is_set_only_for_an_msk_cluster_read_without_iam(contract):
+def test_tls_is_set_only_for_an_msk_cluster_read_without_iam(contract, monkeypatch):
     """MSK's listener without IAM is TLS-only by default; named brokers say what they are."""
     arn = "arn:aws:kafka:eu-west-1:000000000005:cluster/orders/abc-1"
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"msk:{arn}")
     cases = [
         ({"mskClusterArn": arn, "auth": "none"}, True),
         ({"mskClusterArn": arn, "auth": "msk-iam"}, False),
@@ -502,13 +505,12 @@ def test_validate_reports_an_output_part_that_is_not_an_object(contract, part):
     assert "expected an object" in error
 
 
-def test_contract_sql_holding_an_interpolation_is_refused(contract):
-    """The runner refuses any ${...}: compiling one would deploy a job that never starts."""
-    build = _sql_build(contract, "SELECT '${env:HOME}' AS order_id FROM commerce.order_lines")
-    environ = {CONTRACT_SQL_ALLOWLIST_ENV: "commerce.orders-stream"}
-    with pytest.raises(ValueError, match="unresolved interpolation"):
-        job(contract, build, environ=environ)
-    assert any("unresolved interpolation" in e for e in validation_errors(contract))
+def test_validate_reports_contract_text_holding_an_interpolation(contract):
+    """The runner refuses any ${...}, and apply refuses it before upload
+    (spark-config-interpolation); validate reports it first."""
+    _sql_build(contract, "SELECT '${env:HOME}' AS order_id FROM commerce.order_lines")
+    (error,) = validation_errors(contract)
+    assert "unresolved interpolation" in error
 
 
 def test_a_public_broker_address_warns_at_validate_and_refuses_at_compile(contract, monkeypatch):
@@ -571,3 +573,14 @@ def test_validate_prints_each_missing_entry_once(contract, tmp_path, monkeypatch
     assert len(lines) == 3, lines
     assert sum("b-1.msk.example" in line for line in lines) == 1
     assert sum("schema-registry.example.internal" in line for line in lines) == 2
+
+
+def test_an_msk_cluster_the_operator_has_not_listed_is_refused(contract, monkeypatch):
+    """Its brokers come from AWS, so the host allowlist never sees them."""
+    from fluid_build.spark.policy import SparkPolicyError
+
+    arn = "arn:aws:kafka:eu-west-1:000000000005:cluster/payments/abc-1"
+    contract["builds"][0]["properties"]["parameters"]["spark"]["source"] = {"mskClusterArn": arn}
+    monkeypatch.delenv(TARGET_ALLOWLIST_ENV, raising=False)
+    with pytest.raises(SparkPolicyError, match="MSK cluster"):
+        job(contract)

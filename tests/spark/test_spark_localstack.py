@@ -48,7 +48,11 @@ import yaml
 
 from fluid_build.build_runners.spark._desired import CONF_ALLOWLIST_ENV, desired_runs
 from fluid_build.spark import runner_source
-from fluid_build.spark.compiler import CONTRACT_SQL_ALLOWLIST_ENV, MSK_BROKERS_PLACEHOLDER
+from fluid_build.spark.compiler import (
+    CONTRACT_SQL_ALLOWLIST_ENV,
+    MSK_BROKERS_PLACEHOLDER,
+    TARGET_ALLOWLIST_ENV,
+)
 
 from .conftest import CONTRACT
 
@@ -429,6 +433,7 @@ def _fluid(capsys, *argv):
 def lane(ls, monkeypatch, tmp_path):
     """One test's policy and cwd: the operator lists nothing it does not name."""
     monkeypatch.chdir(tmp_path)  # fluid reads the cwd's .env
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"msk:{ls.msk_arn}")  # the run's own cluster
     for name in ("AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_REGION", "AWS_ACCOUNT_ID"):
         assert os.environ.get(name), name
     return ls
