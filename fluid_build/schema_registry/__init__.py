@@ -24,6 +24,11 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
+#: The first schema with a registry block (``$defs/schemaRegistry``: a stream's
+#: ``registry``, an expose's ``binding.properties.registry``), opened as the 0.7.7
+#: preview (``FluidSchemaManager.PREVIEW_VERSIONS``).
+FIRST_VERSION = "0.7.7"
+
 _EXPORTS = {
     "RegistryRef": "reference",
     "Subject": "reference",
@@ -44,7 +49,7 @@ _EXPORTS = {
     "stream_from_subject": "importer",
 }
 
-__all__ = sorted(_EXPORTS)
+__all__ = sorted([*_EXPORTS, "FIRST_VERSION"])
 
 
 def __getattr__(name: str) -> Any:
