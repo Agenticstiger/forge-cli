@@ -179,10 +179,6 @@ def _uses(job: dict) -> list:
     return [s["uses"] for s in job["steps"] if "uses" in s]
 
 
-def _step_names(job: dict) -> list:
-    return [s.get("name", "") for s in job["steps"]]
-
-
 def test_github_both_phases_authenticate_keylessly(tmp_path, monkeypatch):
     files = _cloud_files(tmp_path, monkeypatch, "github", ADD_ONS)
     wf = _workflow(files, _WORKFLOW)

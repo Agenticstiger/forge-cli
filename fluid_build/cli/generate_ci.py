@@ -719,6 +719,14 @@ def _is_development_version(version: str) -> bool:
     return parsed.is_devrelease or parsed.local is not None
 
 
+#: Why ``--complexity`` is refused: one pipeline shape replaced its tiers.
+_COMPLEXITY_REMOVED = (
+    "--complexity was removed: fluid generate ci writes one pipeline shape, every stage a "
+    "`fluid ship --stage N` step. Add the jobs the advanced and enterprise tiers carried "
+    "with --add security, --add compliance and --add sbom."
+)
+
+
 def run(args, logger: logging.Logger) -> int:
     try:
         from fluid_build.forge.core.pipeline_templates import (
@@ -806,23 +814,9 @@ def run(args, logger: logging.Logger) -> int:
             )
 
         if getattr(args, "complexity", None) is not None:
-            raise CLIError(
-                2,
-                "generate_ci_complexity_removed",
-                {
-                    "message": (
-                        "--complexity was removed: fluid generate ci writes one pipeline "
-                        "shape, every stage a `fluid ship --stage N` step. Add the jobs the "
-                        "advanced and enterprise tiers carried with --add security, --add "
-                        "compliance and --add sbom."
-                    )
-                },
-            )
+            raise CLIError(2, "generate_ci_complexity_removed", {"message": _COMPLEXITY_REMOVED})
         add_ons = tuple(getattr(args, "add", None) or ())
-        from fluid_build.cli._pipeline_files import (
-            detect_default_branch,
-            warn_legacy_ci_files,
-        )
+        from fluid_build.cli._pipeline_files import detect_default_branch, warn_legacy_ci_files
 
         default_branch = getattr(args, "default_branch", None) or detect_default_branch()
 

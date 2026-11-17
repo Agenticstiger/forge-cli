@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import textwrap
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 try:
     import yaml
@@ -133,6 +133,78 @@ def _sh_step(lines: List[str], cd: str, indent: str = _STEP_INDENT) -> str:
             raise ValueError(f"shell line cannot sit in a Groovy ''' string: {line!r}")
     body = "\n".join(f"{indent}    {line}" for line in lines)
     return f"{indent}sh '''{cd}set -eu\n{body}'''"
+
+
+def _ship_step(num: int, cd: str, last_applied: bool, indent: str = _STEP_INDENT) -> str:
+    """Stage ``num``'s step: ``fluid ship --stage num``. Ship builds the stage's
+    argv (cli/_ship_stages.py) and reads the parameters from the environment {}
+    block, so no value reaches a script as code and no stage logic lives here.
+    With ``last_applied``, stage 5 diffs against the plan the last build applied
+    for this env, and stage 7 records the plan it applied."""
+    command = f'fluid ship "$CONTRACT" --stage {num}' + (" --yes" if num == 7 else "")
+    lines = [command]
+    if num == 5 and last_applied:
+        lines = [
+            f'BASELINE="$WORKSPACE/{_CI_STATE_DIR}/last-applied/$FLUID_ENV.json"',
+            (
+                'if [ -f "$BASELINE" ]; then export DIFF_LAST_APPLIED="$BASELINE"; '
+                'else echo "stage 5: the last successful build applied no plan for this '
+                "env (or there is none yet): comparing the target with the contract "
+                'alone"; fi'
+            ),
+            command,
+        ]
+    if num == 7 and last_applied:
+        lines += [
+            # Recorded only once apply succeeded (set -e), and only when
+            # it changed the target: a dry run applied nothing.
+            'if [ "$APPLY_MODE" != "dry-run" ]; then',
+            f'  mkdir -p "$WORKSPACE/{_CI_STATE_DIR}/applied"',
+            f'  cp runtime/plan.json "$WORKSPACE/{_CI_STATE_DIR}/applied/$FLUID_ENV.json"',
+            "fi",
+        ]
+    return _sh_step(lines, cd, indent)
+
+
+#: Where each add-on leaves its report, archived with the build.
+_ADD_ON_ARCHIVE = {
+    "security": "runtime/osv-results.sarif",
+    "compliance": "runtime/compliance-report.json",
+    "sbom": "runtime/sbom.spdx.json",
+}
+
+
+def _add_on_stage(add_on: str, contract: str, cd: str, prefix: str, on_main: str = "") -> str:
+    """The stage of one ``--add`` job; ``on_main`` (a ``when`` condition) limits
+    it to the default branch. ``prefix`` roots the archive at the workdir."""
+    condition = f"            when {{ allOf {{ {on_main} }} }}\n" if on_main else ""
+    script = _sh_step(_thin.add_on_script(add_on, contract), cd)
+    return (
+        f"        stage('{_thin.ADD_ON_TITLES[add_on]}') {{\n"
+        f"{condition}"
+        "            steps {\n"
+        f"{script}\n"
+        f"                archiveArtifacts artifacts: '{prefix}{_ADD_ON_ARCHIVE[add_on]}', "
+        "allowEmptyArchive: true\n"
+        "            }\n"
+        "        }\n\n"
+    )
+
+
+def _add_on_stages(
+    add_ons: Sequence[str], contract: str, cd: str, prefix: str, on_main: str
+) -> Tuple[str, str]:
+    """The ``--add`` stages: (before the approval, after apply). Security and
+    the SBOM (on the default branch only) come before; compliance after."""
+    before = "".join(
+        _add_on_stage(a, contract, cd, prefix, on_main if a == "sbom" else "")
+        for a in add_ons
+        if a in ("security", "sbom")
+    )
+    after = "".join(
+        _add_on_stage(a, contract, cd, prefix, on_main) for a in add_ons if a == "compliance"
+    )
+    return before, after
 
 
 class JenkinsTemplate(BasePipelineTemplate):
@@ -621,38 +693,14 @@ EOM
                 "                }"
             )
 
-        # ── Stages 1-11: each runs `fluid ship --stage N` ──────────────────
-        # Ship builds every stage's argv (cli/_ship_stages.py) and reads the
-        # parameters from the environment {} block, so no value reaches a
-        # script as code and no stage logic lives in this file.
-        def ship_step(num: int, indent: str = _STEP_INDENT) -> str:
-            command = f'fluid ship "$CONTRACT" --stage {num}' + (" --yes" if num == 7 else "")
-            lines = [command]
-            if num == 5 and last_applied:
-                lines = [
-                    f'BASELINE="{baseline_dir}/$FLUID_ENV.json"',
-                    (
-                        'if [ -f "$BASELINE" ]; then export DIFF_LAST_APPLIED="$BASELINE"; '
-                        'else echo "stage 5: the last successful build applied no plan for this '
-                        "env (or there is none yet): comparing the target with the contract "
-                        'alone"; fi'
-                    ),
-                    command,
-                ]
-            if num == 7 and last_applied:
-                lines += [
-                    # Recorded only once apply succeeded (set -e), and only when
-                    # it changed the target: a dry run applied nothing.
-                    'if [ "$APPLY_MODE" != "dry-run" ]; then',
-                    f'  mkdir -p "{applied_dir}"',
-                    f'  cp runtime/plan.json "{applied_dir}/$FLUID_ENV.json"',
-                    "fi",
-                ]
-            return _sh_step(lines, CD, indent)
-
-        stage1, stage2, stage3, stage4, stage5, stage6 = (ship_step(n) for n in range(1, 7))
+        # ── Stages 1-11: each runs `fluid ship --stage N` (_ship_step) ────
+        stage1, stage2, stage3, stage4, stage5, stage6 = (
+            _ship_step(n, CD, last_applied) for n in range(1, 7)
+        )
         # Stages 7-11 sit one level deeper, inside the apply stage.
-        stage7, stage8, stage9, stage10, stage11 = (ship_step(n, " " * 8) for n in range(7, 12))
+        stage7, stage8, stage9, stage10, stage11 = (
+            _ship_step(n, CD, last_applied, " " * 8) for n in range(7, 12)
+        )
 
         # ── Pipeline-level blocks ───────────────────────────────────────
         parameters_block = (
@@ -810,33 +858,13 @@ stage('11 - schedule sync') {{
 }}"""
         # --add: the add-on stages. security and sbom run before the approval
         # (sbom on the default branch only); compliance after apply.
-        add_ons = _thin.check_add_ons(config.add_ons)
-        add_on_archive = {
-            "security": "runtime/osv-results.sarif",
-            "compliance": "runtime/compliance-report.json",
-            "sbom": "runtime/sbom.spdx.json",
-        }
-
-        def add_on_stage(add_on: str, when_main: bool) -> str:
-            condition = f"            when {{ allOf {{ {on_main} }} }}\n" if when_main else ""
-            script = _sh_step(
-                _thin.add_on_script(add_on, config.contract_path or "contract.fluid.yaml"), CD
-            )
-            return (
-                f"        stage('{_thin.ADD_ON_TITLES[add_on]}') {{\n"
-                f"{condition}"
-                "            steps {\n"
-                f"{script}\n"
-                f"                archiveArtifacts artifacts: '{W}{add_on_archive[add_on]}', "
-                "allowEmptyArchive: true\n"
-                "            }\n"
-                "        }\n\n"
-            )
-
-        add_ons_before = "".join(
-            add_on_stage(a, a == "sbom") for a in add_ons if a in ("security", "sbom")
+        add_ons_before, add_ons_after = _add_on_stages(
+            _thin.check_add_ons(config.add_ons),
+            config.contract_path or "contract.fluid.yaml",
+            CD,
+            W,
+            on_main,
         )
-        add_ons_after = "".join(add_on_stage(a, True) for a in add_ons if a == "compliance")
         apply_block = f"""        // ═════════════════════════════════════════════════════════════
         // Stages 7-11 change the target, so a change request (a pull
         // request build) stops after stage 6 with its reviewed plan
