@@ -1367,3 +1367,20 @@ def test_jenkins_keeps_the_applied_plan_when_a_later_stage_fails() -> None:
     text = _jenkins(diff_last_applied=True)
     always = text[text.index("always {") : text.index("success {")]
     assert ".fluid-ci/applied/*.json" in always
+
+
+def test_only_the_default_branch_applies_a_manual_run_included() -> None:
+    # A manual run on another branch plans only, as on Azure, Bitbucket,
+    # CircleCI and Jenkins: unreviewed code never reaches stages 7-11.
+    workflow = yaml.safe_load(
+        _files(P.GITHUB_ACTIONS, default_branch="release/1.x")[
+            ".github/workflows/fluid-pipeline.yml"
+        ]
+    )
+    condition = workflow["jobs"]["apply"]["if"]
+    assert condition.startswith("github.ref == 'refs/heads/release/1.x' && (")
+    assert "'push'" in condition and "'workflow_dispatch'" in condition
+    rules = yaml.safe_load(_files(P.GITLAB_CI)[".gitlab-ci.yml"])["fluid-apply"]["rules"]
+    assert [rule for rule in rules if rule.get("when") != "never"] == [
+        {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH", "when": "manual"}
+    ]

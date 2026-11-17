@@ -6,9 +6,9 @@
 One workflow, two jobs. ``plan`` runs stages 1-6 on a pull request, on a push
 to the default branch and on a manual run, and keeps ``runtime/`` and
 ``dist/artifacts/`` as the ``fluid-runtime`` artifact. ``apply`` runs stages
-7-11 after it, on a push to the default branch or a manual run, in the GitHub
-environment named after ``FLUID_ENV``, whose protection rules can require a
-reviewer before it starts. Each stage is one step running
+7-11 after it, on a push to the default branch or a manual run on it (a manual
+run on another branch plans only), in the GitHub environment named after
+``FLUID_ENV``, whose protection rules can require a reviewer before it starts. Each stage is one step running
 ``fluid ship --stage N``: a ``RUN_STAGE_<N>_<NAME>`` of ``false`` hides the
 step, and ship skips the stage too.
 
@@ -380,9 +380,11 @@ class GitHubActionsTemplate(BasePipelineTemplate):
         job.update(
             {
                 "needs": "plan",
+                # Only the default branch applies: a manual run on another
+                # branch plans only, as a pull request does.
                 "if": (
-                    "github.event_name == 'workflow_dispatch' || "
-                    f"(github.event_name == 'push' && github.ref == 'refs/heads/{branch}')"
+                    f"github.ref == 'refs/heads/{branch}' && "
+                    "(github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
                 ),
                 # Its protection rules (required reviewers, a wait timer, the
                 # branches that may deploy) gate stages 7-11.
@@ -424,10 +426,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             "Every stage is one step running `fluid ship --stage N` (see `fluid ship --help`).",
             "",
             f"A pull request against {branch} runs stages 1-6 (plan) and keeps runtime/ as",
-            f"the {RUNTIME_ARTIFACT} artifact. A push to {branch} also runs stages 7-11 (apply)",
-            "in the GitHub environment named after FLUID_ENV (default "
-            f"{env_default}): give it required",
-            "reviewers (Settings > Environments) so nothing is applied unreviewed.",
+            f"the {RUNTIME_ARTIFACT} artifact. A push to {branch}, or a manual run on it, also",
+            "runs stages 7-11 (apply) in the GitHub environment named after FLUID_ENV",
+            f"(default {env_default}): give it required reviewers (Settings > Environments)",
+            "so nothing is applied unreviewed. A manual run on another branch plans only.",
             "",
             "Each value comes from a repository or environment variable of the same",
             "name, else the default written below: FLUID_ENV, APPLY_MODE,",

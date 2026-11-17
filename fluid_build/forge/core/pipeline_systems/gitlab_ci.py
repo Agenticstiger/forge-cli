@@ -8,7 +8,8 @@ Two jobs. ``fluid-plan`` runs stages 1-6 with one ``fluid ship --stage 1-6``
 default branch and on a manual run, and keeps ``runtime/`` and
 ``dist/artifacts/`` as artifacts, with ship's JUnit report as the pipeline's
 test report. ``fluid-apply`` runs ``fluid ship --stage 7-11 --yes`` on the
-default branch or a manual run: a manual job in the environment named after
+default branch only (``$CI_DEFAULT_BRANCH``, the project's own setting; a manual
+run on another branch plans only): a manual job in the environment named after
 ``FLUID_ENV``, one at a time per environment (``resource_group``). The shape
 follows GitLab's OpenTofu CI/CD component: plan on merge requests, apply by
 hand on the default branch.
@@ -201,8 +202,8 @@ class GitLabCITemplate(BasePipelineTemplate):
                 "rules": [
                     {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"', "when": "never"},
                     {"if": '$CI_PIPELINE_SOURCE == "schedule"', "when": "never"},
+                    # The default branch only, a manual (web) run on it included.
                     {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH", "when": "manual"},
-                    {"if": '$CI_PIPELINE_SOURCE == "web"', "when": "manual"},
                 ],
                 "allow_failure": False,
                 "environment": {"name": "$FLUID_ENV"},
@@ -234,6 +235,8 @@ class GitLabCITemplate(BasePipelineTemplate):
             "On the default branch, fluid-apply runs stages 7-11 when someone starts it, in",
             f"the environment named after FLUID_ENV (default {env_default}). Protect that",
             "environment (Settings > CI/CD > Protected environments) to choose who may.",
+            "A pipeline run by hand on another branch plans only. The default branch is",
+            "the project's own ($CI_DEFAULT_BRANCH), whatever --default-branch said.",
             "",
             "Every value below is a default: a project CI/CD variable or the Run pipeline",
             "form overrides it. RUN_STAGE_<N>_<NAME>=false switches a stage off.",

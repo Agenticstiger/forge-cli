@@ -162,7 +162,7 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         help=(
             "The branch whose pushes run apply (stages 7-11); pull requests against "
             "it run plan (stages 1-6). Default: the remote's default branch "
-            "(origin/HEAD), else main."
+            "(origin/HEAD), else main. GitLab reads its own $CI_DEFAULT_BRANCH."
         ),
     )
     # Removed: one pipeline shape now; --add carries the jobs the tiers added.

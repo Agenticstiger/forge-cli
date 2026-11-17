@@ -440,7 +440,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Bitbucket: a manual `deployment` step;
     - CircleCI: an approval job;
     - Tekton: a separate `fluid-apply` Pipeline.
-  - `--default-branch` names that branch (default: `origin/HEAD`, else `main`).
+  - `--default-branch` names that branch (default: `origin/HEAD`, else `main`); GitLab reads its own
+    `$CI_DEFAULT_BRANCH`. A manual run on another branch plans only.
   - `--complexity` exits 2: one pipeline shape replaces the tiers. `--add security`, `--add
     compliance` and `--add sbom` carry what the advanced and enterprise tiers added: the daily
     OSV-Scanner and policy scan, the weekly compliance report and lineage check, and an SBOM (GitHub:
