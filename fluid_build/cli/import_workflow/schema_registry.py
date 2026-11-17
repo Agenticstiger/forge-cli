@@ -18,6 +18,7 @@ must stay light); the registry package loads when an import runs.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -136,6 +137,76 @@ class _Reader:
             close()
 
 
+def _glue_region(reader: Any) -> Optional[str]:
+    """The region a Glue read used: the environment's, else the boto3 client's, else the
+    session's. ``None`` when boto3 cannot tell."""
+    from fluid_build.schema_registry.kinds.glue import env_region
+
+    region = env_region()
+    if region:
+        return region
+    inner = getattr(getattr(reader, "_client", None), "_client", None)
+    name = getattr(getattr(inner, "meta", None), "region_name", None)
+    if isinstance(name, str) and name:
+        return name
+    try:
+        import boto3
+
+        found = boto3.session.Session().region_name
+    except Exception:  # noqa: BLE001 - no boto3, or a broken profile: say nothing
+        return None
+    return found if isinstance(found, str) and found else None
+
+
+def _check_importable(
+    contract: Dict[str, Any], stream: Dict[str, Any], source: str, version: int
+) -> None:
+    """Refuse, before anything is written, a subject that would not become a usable contract."""
+    from fluid_build.schema_manager import FluidSchemaManager
+    from fluid_build.streaming.types import parse_fields
+
+    at = f"subject {source!r} version {version}"
+    columns = stream["schema"]
+    if not columns:
+        raise _refusal(
+            f"{at} declares no fields",
+            "A consumed stream needs at least one column.",
+            "Import a subject that declares fields, or declare the stream by hand.",
+            subject=source,
+            version=version,
+        )
+    try:
+        parse_fields(columns)
+    except ValueError as exc:
+        raise _refusal(
+            f"{at} has a field FLUID cannot use as a column",
+            str(exc),
+            "fluid plan reads every column as a SQL identifier (letters, digits and _, not "
+            "starting with a digit): rename the field in the registry, or declare the stream "
+            "by hand.",
+            subject=source,
+            version=version,
+        ) from exc
+    result = FluidSchemaManager().validate_contract(
+        contract, schema_version="0.7.7", offline_only=True
+    )
+    if result.is_valid:
+        return
+    errors = "; ".join(result.errors)
+    topic_bad = any("stream.topic" in e for e in result.errors)
+    what = f"{at} does not give a valid contract"
+    why = errors
+    fix = "Fix what the validator names in the registry, or declare the stream by hand."
+    if topic_bad:
+        what = f"{at} does not give a valid Kafka topic name ({stream['topic']!r})"
+        why = (
+            "The topic comes from the subject: <topic>-value, else the subject itself. "
+            f"Validator: {errors}"
+        )
+        fix = "Use a subject whose topic is 1-249 characters of letters, digits, '.', '_' and '-'."
+    raise _refusal(what, why, fix, subject=source, version=version)
+
+
 def _build_contract(topic: str, stream: Dict[str, Any], kind: str, subject: str) -> Dict[str, Any]:
     from fluid_build.util.contract import slugify_identifier
 
@@ -169,7 +240,7 @@ def _build_contract(topic: str, stream: Dict[str, Any], kind: str, subject: str)
                 "exposeId": expose_id,
                 "kind": "table",
                 "binding": {"platform": "other", "format": "other", "location": {}},
-                "contract": {"schema": [dict(c) for c in columns]},
+                "contract": {"schema": copy.deepcopy(columns)},
             }
         ],
     }
@@ -245,9 +316,7 @@ class SchemaRegistryImporter(Importer):
                 "no credential: a registry that needs one has to be read another way."
             )
             if kind == "glue":
-                from fluid_build.schema_registry.kinds.glue import env_region
-
-                region = env_region() or "the AWS profile's region"
+                region = _glue_region(reader) or "the AWS profile's region"
                 fix = (
                     f"Check the subject and the registry name. Glue was read in {region}: set "
                     "AWS_REGION (or AWS_DEFAULT_REGION) to the registry's region if it is "
@@ -267,6 +336,7 @@ class SchemaRegistryImporter(Importer):
         stream["registry"]["version"] = read.version
         columns = stream["schema"]
         contract = _build_contract(stream["topic"], stream, kind, source)
+        _check_importable(contract, stream, source, read.version)
         report = ImportReport()
         report.mapped_one_to_one += [
             f"topic {stream['topic']}",

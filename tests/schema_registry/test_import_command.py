@@ -409,3 +409,125 @@ def test_a_glue_read_without_a_contract_takes_the_environments_region(monkeypatc
         monkeypatch.setenv(name, value)
     ref = RegistryRef(kind="glue", origin="import", where="import", subject="orders-value")
     assert get_kind("glue").client(ref).region == expected
+
+
+# ----------------------------------------------- a written contract must be a usable one
+
+
+def _import_confluent(subject="orders-value", *extra):
+    return run(
+        parse("schema-registry", subject, "--registry", "confluent", "--url", URL, *extra), LOG
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "subject"),
+    [
+        ("confluent", "a/b-value"),
+        ("confluent", "a b"),
+        ("confluent", ".."),
+        ("confluent", "заказы-value"),
+        ("glue", "Orders#1"),
+    ],
+)
+def test_a_subject_that_gives_no_valid_topic_is_refused_and_nothing_is_written(fake, kind, subject):
+    argv = ["schema-registry", subject, "--registry", kind]
+    argv += ["--url", URL] if kind == "confluent" else []
+    with pytest.raises(FluidUserError) as exc:
+        run(parse(*argv), LOG)
+    err = exc.value
+    assert subject in err.what and "version 7" in err.what
+    assert "valid Kafka topic name" in err.what
+    assert "<topic>-value, else the subject itself" in err.why
+    assert list(Path(".").glob("contract.*")) == []
+
+
+@pytest.mark.parametrize("name", ["user-id", "first name", "user.id", "naïve", "1x"])
+def test_a_json_property_that_is_not_an_identifier_is_refused(fake, name):
+    fake.data_format = "JSON"
+    fake.text = schema_text(
+        {
+            "type": "object",
+            "properties": {name: {"type": "string"}},
+            "required": [name],
+        }
+    )
+    with pytest.raises(FluidUserError) as exc:
+        _import_confluent()
+    assert "orders-value" in exc.value.what and "version 7" in exc.value.what
+    assert name in exc.value.why
+    assert list(Path(".").glob("contract.*")) == []
+
+
+@pytest.mark.parametrize(
+    ("data_format", "text"),
+    [
+        ("AVRO", '{"type":"record","name":"o","fields":[]}'),
+        ("JSON", '{"type":"object","properties":{}}'),
+    ],
+)
+def test_a_subject_with_no_fields_is_refused(fake, data_format, text):
+    fake.data_format = data_format
+    fake.text = text
+    with pytest.raises(FluidUserError) as exc:
+        _import_confluent()
+    assert exc.value.what == "subject 'orders-value' version 7 declares no fields"
+    assert list(Path(".").glob("contract.*")) == []
+
+
+class TestGlueNotFoundNamesTheRegion:
+    @pytest.fixture(autouse=True)
+    def no_region_env(self, monkeypatch):
+        for name in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+            monkeypatch.delenv(name, raising=False)
+
+    def refusal(self, fake):
+        fake.error = RegistryError("EntityNotFoundException: no such schema", code="x")
+        with pytest.raises(FluidUserError) as exc:
+            run(parse("schema-registry", "orders-value", "--registry", "glue"), LOG)
+        return exc.value.fix
+
+    def test_the_boto3_clients_region_is_named(self, fake):
+        from types import SimpleNamespace
+
+        fake._client = SimpleNamespace(meta=SimpleNamespace(region_name="ap-south-1"))
+        fix = self.refusal(fake)
+        assert "read in ap-south-1" in fix and "profile" not in fix
+
+    def test_the_sessions_region_is_named_when_no_client_was_built(self, fake, monkeypatch):
+        import sys
+        import types
+
+        session = types.SimpleNamespace(
+            Session=lambda: types.SimpleNamespace(region_name="sa-east-1")
+        )
+        monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(session=session))
+        assert "read in sa-east-1" in self.refusal(fake)
+
+    def test_it_falls_back_to_the_profile_when_boto3_cannot_tell(self, fake, monkeypatch):
+        import sys
+        import types
+
+        session = types.SimpleNamespace(Session=lambda: types.SimpleNamespace(region_name=None))
+        monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(session=session))
+        assert "the AWS profile's region" in self.refusal(fake)
+
+    def test_the_environments_region_still_wins(self, fake, monkeypatch):
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        assert "read in us-west-2" in self.refusal(fake)
+
+
+def test_the_written_yaml_has_no_anchors(fake):
+    fake.text = schema_text(
+        {
+            "type": "record",
+            "name": "o",
+            "fields": [
+                {"name": "id", "type": "string"},
+                {"name": "tags", "type": {"type": "array", "items": "string"}},
+            ],
+        }
+    )
+    _import_confluent()
+    text = Path("contract.orders.fluid.yaml").read_text(encoding="utf-8")
+    assert "&id" not in text and "*id" not in text
