@@ -1270,7 +1270,8 @@ def _emit_glue(
         storage["location"] = f"s3://{bucket}/{path}"
     parameters: Dict[str, str] = {"classification": fmt, "managed_by": "fluid"}
     if "iceberg" in str(fmt).lower():
-        # AWS Glue / Athena identify an Iceberg table via this parameter.
+        # AWS Glue / Athena identify an Iceberg table via this parameter. For a Glue-
+        # cataloged Iceberg table Glue sets it itself (_add_iceberg_metadata drops it).
         parameters["table_type"] = "ICEBERG"
 
     # Contract-driven enrichments (absorbed from the retired registrar).
@@ -1351,11 +1352,49 @@ def _emit_glue(
     }
     if description:
         table_body["description"] = description
+    if is_iceberg_format(fmt):
+        _add_iceberg_metadata(table_body, loc, cid, placement)
     table_body.update(_emulator_catalog_id())
 
     resources.setdefault("aws_glue_catalog_table", {})[
         safe_ident(f"{cid}_{database}_{table}")
     ] = table_body
+
+
+def _add_iceberg_metadata(
+    table_body: Dict[str, Any], loc: Mapping[str, Any], cid: str, placement: _Placement
+) -> None:
+    """Have Glue write a new Iceberg table's first metadata file, so Athena reads it at once.
+
+    Without ``open_table_format_input`` the table is registered with no
+    ``metadata_location``, and Athena and every Iceberg engine refuse it until something
+    writes one. Its ``iceberg_input`` arguments are ForceNew in ``hashicorp/aws`` and
+    the block is never read back (``internal/service/glue/catalog_table.go``), so it is
+    also in ``ignore_changes``:
+
+    * a new table is created with it, as ``ignore_changes`` never applies to a create;
+    * a table created before this, whose state has no block, keeps its prior value: no
+      replace, so the data-loss gate stays quiet and the table keeps its data. Give it
+      metadata with ``tofu taint`` or ``--mode replace`` once it is known to be empty;
+    * an engine's commits change ``metadata_location`` and ``previous_metadata_location``,
+      which ``parameters`` (already ignored) holds, and an update keeps both: the
+      provider copies them from the live table into its ``UpdateTable`` call.
+
+    Glue writes the file under the table's location with the applier's credentials, so
+    the table waits for the bucket when this module creates it. Glue also sets
+    ``table_type`` itself, and refuses a create that passes it.
+    """
+    table_body["open_table_format_input"] = {
+        "iceberg_input": {"metadata_operation": "CREATE", "version": "2"}
+    }
+    # Glue sets these itself and refuses the call that passes them ("Cannot use reserved
+    # parameters table_type or metadata_location while creating an iceberg table",
+    # measured on real Glue). A table created before keeps its own: parameters are ignored.
+    table_body["parameters"].pop("table_type", None)
+    table_body["lifecycle"] = {"ignore_changes": ["parameters", "open_table_format_input"]}
+    bucket = loc.get("bucket")
+    if bucket and not placement.bucket_referenced:
+        table_body["depends_on"] = [f"aws_s3_bucket.{safe_ident(f'{cid}_{bucket}')}"]
 
 
 def _emit_s3(
