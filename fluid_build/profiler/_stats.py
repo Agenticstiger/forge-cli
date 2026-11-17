@@ -30,6 +30,7 @@ writes the same bytes.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from typing import Any, Dict, FrozenSet, Protocol, Sequence, Tuple, runtime_checkable
 
@@ -113,6 +114,42 @@ class StatisticsBackend(Protocol):
         """Read *text* back as a profile document; raise :class:`DocumentRefused` if refused."""
 
 
+#: The most digits a number may span, its integer and fraction digits together.
+#: The fidelity check reads values inside a declared range; a profile declares
+#: none, so the seam bounds a number before flux-stats builds its exact value.
+#: Building ``1E+99999999`` takes minutes and gigabytes, and a published value of
+#: more than 4,300 digits cannot be spelled (Python's int-to-string limit). 1,000
+#: digits is far beyond any SQL decimal (38 in DuckDB and Snowflake, 77 in
+#: BigQuery) and leaves room for the sum of any table.
+_MAX_DIGITS = 1000
+_INT_LIMIT: int = 10**_MAX_DIGITS  # annotated: int ** int is Any to mypy
+
+
+def _too_many_digits(value: Any) -> bool:
+    """Whether *value* is a finite number of more than :data:`_MAX_DIGITS` digits.
+
+    Measured without building the number: from an int's size, or from a decimal's
+    coefficient and exponent. Anything that is not a finite number is left to
+    flux-stats' reader, which refuses it by its class.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return abs(value) >= _INT_LIMIT
+    if isinstance(value, str):
+        try:
+            value = Decimal(value)
+        except InvalidOperation:
+            return False
+    if not isinstance(value, Decimal):
+        return False
+    _, digits, exponent = value.as_tuple()
+    if not isinstance(exponent, int):  # NaN or infinity
+        return False
+    span = len(digits) + exponent if exponent >= 0 else max(len(digits), -exponent)
+    return span > _MAX_DIGITS
+
+
 @dataclass(frozen=True)
 class _Column:
     """A column as flux-stats' value readers take one.
@@ -159,6 +196,11 @@ class _FluxStatsBackend:
             # ValueDomain(domain) raises ValueError for a domain with no reader.
             kind = None if domain == "category" else self._value_domain(domain)
             shape = self._columns[key] = _Column(column, kind)
+        if domain == "number" and _too_many_digits(value):
+            raise ReadRefused(
+                f"column {column!r} row {row_index}: "
+                f"value class 'number of more than {_MAX_DIGITS} digits'"
+            )
         try:
             if domain == "category":
                 return self._category(value, shape, row_index=row_index)

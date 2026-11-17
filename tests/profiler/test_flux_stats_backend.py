@@ -154,6 +154,37 @@ def test_a_domain_without_a_reader_is_an_error(backend):
         backend.read_value("boolean", True, column="paid", row_index=0)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1E+99999999",  # building it would take minutes and gigabytes
+        "1e5000",  # past Python's 4,300-digit limit, so it could not be spelled
+        "1e-7000",
+        "9" * 1001,
+        Decimal("1E+1000"),
+        10**1000,
+    ],
+)
+def test_a_number_of_more_than_1000_digits_is_refused_before_it_is_built(backend, value):
+    with pytest.raises(ReadRefused) as caught:
+        backend.read_value("number", value, column="amount", row_index=7)
+    assert str(caught.value) == (
+        "column 'amount' row 7: value class 'number of more than 1000 digits'"
+    )
+
+
+@pytest.mark.parametrize(
+    "value", ["9" * 1000, "0." + "9" * 1000, Decimal("1E+999"), 10**1000 - 1, "NaN", "abc"]
+)
+def test_a_number_within_the_bound_is_left_to_flux_stats(backend, value):
+    try:
+        read = backend.read_value("number", value, column="amount", row_index=0)
+    except ReadRefused as refused:  # NaN and abc: flux-stats refuses them by class
+        assert "(FLX-5005)" in str(refused)
+    else:
+        assert isinstance(read, Fraction)
+
+
 def test_a_document_flux_stats_cannot_read_is_refused(backend):
     with pytest.raises(DocumentRefused, match="FLX-5036"):
         backend.check_document('{"rowCount": 1.5}')
