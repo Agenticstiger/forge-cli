@@ -514,6 +514,10 @@ dev = [
   # brings flux-stats, so the profiler's tests also run against the real
   # registry (tests/profiler/test_flux_stats_backend.py), not only its stand-in.
   "data-product-forge[litellm,mcp,lineage,profile]",
+  # ``profile`` brings duckdb and not numpy, so a ``.[dev]`` lane (iac-tests Stage 1)
+  # runs the DuckDB tests without what their masking UDFs need (duckdb's create_function
+  # requires numpy; see the `local` extra). tests/test_ci_dev_numpy.py keeps it so.
+  "numpy>=1.22.4",
 ]
 
 # Light (in-process) integration-test emulators — Stage 1. moto mocks the
