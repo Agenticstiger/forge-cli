@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from fluid_build.schedulers.airflow import render_dag
-from tests.schedulers.airflow_fixtures import CONTRACTS, PROVIDER_CONFIG
+from tests.schedulers.airflow_fixtures import CONTRACTS
 
 LOG = logging.getLogger("test_airflow_render")
 

@@ -225,7 +225,7 @@ def _render(
         ctx = TaskContext(
             task=task, var=identifiers[task.get("taskId") or ""], config=provider_config
         )
-        code, used = (emit or (lambda c: generic_task(c)))(ctx)
+        code, used = (emit or generic_task)(ctx)
         task_blocks.append(code)
         uses |= used
         if UNMAPPED in used:
