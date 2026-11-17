@@ -260,3 +260,21 @@ def test_the_registrar_stops_when_a_page_repeats():
     route = _mock_entropy([[{"id": f"p{i}"} for i in range(1000)]] * 5)
     assert len(DataMeshManagerRegistrar(api_token="t")._existing_product_ids()) == 1000
     assert len(route.calls) == 2
+
+
+@pytest.mark.parametrize("url", ["http://[::1]\\@evil.com", "http://[not-an-ip]/x", "https://[::1"])
+def test_an_unparseable_endpoint_is_refused_not_raised(url):
+    payload = CatalogPublicationPayload.from_contract(_product(), {})
+    with respx.mock(assert_all_called=False) as mock:
+        sent = mock.route().mock(return_value=httpx.Response(200, json={}))
+        result = DataMeshManagerRegistrar(api_url=url, api_token="t").register_payload(payload)
+    assert not result.succeeded
+    assert "DMM_API_URL" in result.error or "URL" in result.error
+    assert not sent.calls
+
+
+def test_the_native_provider_refuses_an_unparseable_endpoint_with_a_provider_error():
+    from fluid_build.providers.base import ProviderError
+
+    with pytest.raises(ProviderError):
+        DataMeshManagerProvider._normalize_api_url("http://[::1]\\@evil.com")

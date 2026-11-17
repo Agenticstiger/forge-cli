@@ -58,6 +58,7 @@ through a real contract resolver and a real DQ engine.
 
 from __future__ import annotations
 
+import copy
 import math
 import re
 from collections.abc import Mapping, MutableMapping
@@ -305,6 +306,11 @@ def _attach_declared_quality(
         if not isinstance(rule, Mapping):
             continue
         check, reason = _dq_rule_to_quality(rule)
+        columns: List[str] = []
+        if check is not None and rule.get("type") in _DQ_LIBRARY_METRICS:
+            columns, reason = _dq_rule_columns(rule, properties)
+            if not columns:
+                check = None
         if check is None:
             ctx.logger.warning(
                 "dq rule %r (type %r) on expose %r has no ODCS v3.1.0 quality form: %s. "
@@ -318,12 +324,21 @@ def _attach_declared_quality(
                 reason,
             )
             continue
-        rule_id = _stable_id(rule.get("id") or rule.get("type"))
-        if rule_id in taken:
+        base_id = rule.get("id") or rule.get("type")
+        if not columns:  # freshness: a custom rule about the whole object
+            rule_id = _stable_id(base_id)
+            if rule_id in taken:
+                continue
+            taken.add(rule_id)
+            _append_quality(obj, {"id": rule_id, **check})
             continue
-        taken.add(rule_id)
-        target = properties.get(rule.get("selector")) or obj
-        _append_quality(target, {"id": rule_id, **check})
+        for column in columns:
+            # One column keeps the rule's own id; several get one each.
+            rule_id = _stable_id(base_id) if len(columns) == 1 else _stable_id(base_id, column)
+            if rule_id in taken:
+                continue
+            taken.add(rule_id)
+            _append_quality(properties[column], {"id": rule_id, **copy.deepcopy(check)})
 
     for expr in contract.get("quality") or []:
         if not isinstance(expr, Mapping) or not expr.get("expression"):
@@ -418,6 +433,40 @@ def _dq_rule_to_quality(rule: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any
         "invalidValues, duplicateValues, rowCount), a sql query or a named custom engine, "
         f"and a {rule_type!r} rule supplies none of them"
     )
+
+
+def _dq_rule_columns(
+    rule: Mapping[str, Any], properties: Mapping[str, Any]
+) -> Tuple[List[str], str]:
+    """The properties a completeness / uniqueness / valid_values rule checks, or ``([], reason)``.
+
+    ``selector`` reads as ``util/dq_checks.py`` (``fluid test``) reads it: a column, or
+    several comma-separated, matched exactly or, failing that, by the one name that
+    differs only in case. Completeness and valid_values check each listed column;
+    uniqueness checks one, because a list could mean each column or their combination.
+    A rule that selects no column (none, ``*``) or one the schema does not declare is not
+    exported: placed on the schema object, a ``nullValues`` check names no column.
+    """
+    raw = rule.get("selector")
+    text = raw.strip() if isinstance(raw, str) else ""
+    if not text or text == "*":
+        return [], "it selects no column, and the check is about columns"
+    columns: List[str] = []
+    for part in (p.strip() for p in text.split(",")):
+        name = part if part in properties else None
+        if name is None:
+            folded = [c for c in properties if c.lower() == part.lower()]
+            name = folded[0] if len(folded) == 1 else None
+        if name is None:
+            return [], f"it selects {part!r}, which the expose's schema does not declare"
+        if name not in columns:
+            columns.append(name)
+    if rule.get("type") == "uniqueness" and len(columns) > 1:
+        return [], (
+            "a uniqueness rule checks one column; a list could mean each column or their "
+            "combination"
+        )
+    return columns, ""
 
 
 def _dq_threshold(rule: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:

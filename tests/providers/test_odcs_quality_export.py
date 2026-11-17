@@ -281,7 +281,16 @@ def test_declared_quality_does_not_double_on_re_export() -> None:
 def test_mappable_dq_rules_do_not_warn(caplog: pytest.LogCaptureFixture) -> None:
     """The warning must name a real gap, not fire on every rule."""
     fluid = _with_expose_contract(
-        dq={"rules": [{"id": "status_unique", "type": "uniqueness", "severity": "error"}]}
+        dq={
+            "rules": [
+                {
+                    "id": "status_unique",
+                    "type": "uniqueness",
+                    "severity": "error",
+                    "selector": "status",
+                }
+            ]
+        }
     )
     with caplog.at_level(logging.WARNING):
         _render(fluid)

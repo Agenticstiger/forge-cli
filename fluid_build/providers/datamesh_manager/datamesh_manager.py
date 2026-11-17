@@ -283,7 +283,17 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
     @staticmethod
     def _normalize_api_url(value: str) -> str:
         url = str(value or _DEFAULT_API_URL).strip().rstrip("/")
-        parsed = urlparse(url)
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+        except ValueError as exc:
+            # urlparse raises on a malformed bracketed host (``http://[::1]\@x``,
+            # ``http://[not-an-ip]``); that is a bad setting, not a crash. The URL is not
+            # echoed: it can carry userinfo.
+            raise ProviderError(
+                f"Invalid Data Mesh Manager API URL: it does not parse ({exc}). "
+                "Set DMM_API_URL to an http(s) URL."
+            ) from exc
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ProviderError(
                 f"Invalid Data Mesh Manager API URL {value!r}. Expected an http(s) URL."
@@ -295,7 +305,6 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             "yes",
             "on",
         }
-        host = (parsed.hostname or "").lower()
         if parsed.scheme == "http" and host not in _LOCAL_HTTP_HOSTS and not allow_insecure:
             raise ProviderError(
                 "Refusing to send DMM credentials over plain HTTP to a non-local host "

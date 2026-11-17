@@ -505,6 +505,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An ODCS dq rule whose selector was not one property name landed on the schema object.**
+  A completeness rule on `"a, b"`, or with no selector, exported as an object-level
+  `nullValues` check naming no column. A rule now lands on the columns it checks, as `fluid
+  test` reads it: completeness and valid_values one check per listed column (matched in any
+  case), uniqueness one column; a rule that selects no column, a column the schema does not
+  declare, or (uniqueness) several, is not exported, with a warning.
+- **A malformed Data Mesh Manager URL raised a bare `ValueError`.** `DMM_API_URL` like
+  `http://[::1]\@evil.com` crashed `fluid publish --target datamesh-manager` and `fluid
+  datamesh-manager publish`; it is now refused as an invalid URL (without echoing it).
 - **Every Data Mesh Manager / Entropy Data product showed as a plain "Data Product".** The ODPS
   v1.0.0 payload has no archetype field, and Entropy reads it from `customProperties[type]`
   in kebab case only. Both publish paths now send it: `metadata.archetype` when set (spelled
