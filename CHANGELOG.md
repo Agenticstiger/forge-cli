@@ -55,6 +55,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     operator lists any other key in `FLUID_SPARK_CONF_ALLOWLIST` (settings like `spark.jars`
     load code that runs with the job's role). `FLUID_SPARK_WAIT_SECONDS` caps the reconcile's
     waits (default 900).
+  - A run resolves its Kafka and Avro packages from Maven Central (and Confluent's repository
+    for Avro), so the cluster needs egress to them, unless the operator sets
+    `FLUID_SPARK_MAVEN_REPOSITORY` to one https mirror (CodeArtifact, Artifactory) that
+    replaces Confluent's repository in `spark.jars.repositories`. Spark 3.5 still tries Maven
+    Central and spark-packages first; without egress those attempts fail (they can be slow)
+    and the resolver falls through to the mirror. Glue resolves no packages, so the mirror
+    does not apply there. An operator-allowlisted `spark.jars.repositories` in a contract's
+    `sparkConf` overrides the mirror and its checks. The variable is read from the real
+    environment only; a URL with a user or password, a link-local host or plain http is
+    refused.
+  - The Spark runner no longer accepts abbreviated options (found by the spark-infra lane):
+    Glue's own `--conf` argument was read as `--config`, so a Glue run with `sparkConf` loaded
+    the wrong job config. The runner's sha changes; its content-addressed key covers that.
   - The caller (the role running `fluid apply` or the MWAA execution role) needs the actions in
     `build_runners/spark/_adapters.py::CALLER_ACTIONS`, plus `iam:PassRole` on the job role for
     EMR Serverless and EMR on EKS. boto3 stays in the `[aws]` extra.
@@ -514,6 +527,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A malformed Data Mesh Manager URL raised a bare `ValueError`.** `DMM_API_URL` like
   `http://[::1]\@evil.com` crashed `fluid publish --target datamesh-manager` and `fluid
   datamesh-manager publish`; it is now refused as an invalid URL (without echoing it).
+- **Some Data Mesh Manager / Entropy Data lineage still went to the wrong place.** Two
+  upstreams exposing the same port name (`crm.accounts`, `erp.accounts`) each with a
+  `consumes[].sourceSystem`: the first input port got the second's source system and the
+  renamed second port none, and a consume `name`d apart from its exposeId got none; a
+  source system now goes to the port built for its consume (matched by its `contractId`).
+  A product id with an upper-case letter was published lower-cased by `fluid datamesh-manager
+  publish` and as written by `fluid publish --target datamesh-manager`, while consumers named
+  it as written; Entropy ids are case-sensitive, so the edge went nowhere. Both paths now slug
+  the product's id and every `consumes[].productId` the same way (lower case, spaces and `/`
+  as `-`), except an upstream Entropy already holds under the id as written (one forge did
+  not publish), which is consumed as written. A product the registrar published under a
+  mixed-case id is published again under the lower-case one; the old product stays in
+  Entropy until it is deleted there. With `--with-contract` the native path now PUTs the
+  contracts before the product and an output port names only a contract that landed.
 - **Every Data Mesh Manager / Entropy Data product showed as a plain "Data Product".** The ODPS
   v1.0.0 payload has no archetype field, and Entropy reads it from `customProperties[type]`
   in kebab case only. Both publish paths now send it: `metadata.archetype` when set (spelled

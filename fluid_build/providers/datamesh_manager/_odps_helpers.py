@@ -266,17 +266,27 @@ def ensure_odps_input_port_source_system_custom_property(
     if not isinstance(input_ports, list) or not input_ports:
         return
 
+    # Keyed by the port's ``contractId``, the identity the ODPS export builds each
+    # consume's port from (``input_port_contract_id``). The bare exposeId is not one:
+    # two upstreams exposing ``accounts`` share it, the export renames the second port
+    # (``erp__accounts``), and a consume's ``name`` can differ from its exposeId. Keyed
+    # by exposeId, one port got the other upstream's source system and one got none.
     canonical_ports = consumes_to_canonical_ports(fluid, logger=LOG)
-    source_system_by_port: Dict[str, str] = {}
+    # A port with no ``contractId`` (not one the export builds) falls back to the
+    # exposeId, as before.
+    source_system_by_contract: Dict[str, str] = {}
+    source_system_by_expose: Dict[str, str] = {}
     for canonical in canonical_ports:
-        port_id = canonical.get("id")
-        if not port_id:
-            continue
         sys_id = canonical.get("source_system_id")
         if not sys_id and default_from_reference:
             sys_id = canonical.get("reference")
-        if sys_id:
-            source_system_by_port[str(port_id)] = str(sys_id)
+        if not sys_id:
+            continue
+        contract_id = input_port_contract_id(canonical)
+        if contract_id:
+            source_system_by_contract.setdefault(str(contract_id), str(sys_id))
+        if canonical.get("id"):
+            source_system_by_expose.setdefault(str(canonical["id"]), str(sys_id))
 
     for port in input_ports:
         if not isinstance(port, dict):
@@ -288,8 +298,12 @@ def ensure_odps_input_port_source_system_custom_property(
         if any(isinstance(p, Mapping) and p.get("property") == "sourceSystem" for p in props):
             continue
 
-        port_id = port.get("id") or port.get("name")
-        fallback = source_system_by_port.get(str(port_id)) if port_id else None
+        contract_id = port.get("contractId")
+        if contract_id:
+            fallback = source_system_by_contract.get(str(contract_id))
+        else:
+            port_id = port.get("id") or port.get("name")
+            fallback = source_system_by_expose.get(str(port_id)) if port_id else None
         if not fallback and default_from_reference:
             fallback = port.get("reference")
         if not fallback:

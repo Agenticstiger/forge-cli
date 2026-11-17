@@ -249,3 +249,28 @@ class _NoSpark:
         @staticmethod
         def get(name, default=None):
             return default
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # Glue's shape: its own arguments around the job's, --conf from the build's sparkConf
+        ["--JOB_ID", "j_1", "--JOB_RUN_ID", "jr_1", "--job-bookmark-option",
+         "job-bookmark-disable", "--TempDir", "s3://tmp/", "--enable-glue-datacatalog", "true",
+         "--config", "s3://b/_fluid/job.json", "--conf", "spark.sql.shuffle.partitions=8",
+         "--JOB_NAME", "fluid-x-spark", "--fluid-config-hash", "abc"],
+        ["--conf", "spark.a=b", "--config", "s3://b/_fluid/job.json", "--JOB_NAME", "x"],
+        ["--config", "s3://b/_fluid/job.json", "--conf", "spark.a=b", "--co", "x"],
+    ],
+)  # fmt: skip
+def test_glue_arguments_never_stand_in_for_the_config(runner, monkeypatch, argv):
+    """Found by the spark-infra lane: with abbreviations on, Glue's --conf was --config."""
+    read = []
+    session = types.SimpleNamespace(builder=types.SimpleNamespace(getOrCreate=lambda: "spark"))
+    monkeypatch.setitem(sys.modules, "pyspark", types.ModuleType("pyspark"))
+    monkeypatch.setitem(sys.modules, "pyspark.sql", types.SimpleNamespace(SparkSession=session))
+    monkeypatch.setattr(runner, "read_text", lambda spark, path: read.append(path) or "{}")
+    monkeypatch.setattr(runner, "parse_config", lambda text: {})
+    monkeypatch.setattr(runner, "run", lambda spark, config: None)
+    assert runner.main(argv) == 0
+    assert read == ["s3://b/_fluid/job.json"]

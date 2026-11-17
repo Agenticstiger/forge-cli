@@ -58,7 +58,6 @@ through a real contract resolver and a real DQ engine.
 
 from __future__ import annotations
 
-import copy
 import math
 import re
 from collections.abc import Mapping, MutableMapping
