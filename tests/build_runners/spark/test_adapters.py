@@ -481,19 +481,46 @@ def test_where_names_the_target(serverless, glue_run, ec2_run, eks_run):
     assert "app1" in adapter_on(serverless, "emr-serverless")[0].where()
 
 
-def test_a_serverless_summary_without_an_id_is_read_by_its_arn():
-    # LocalStack Pro 2026.8.2 lists job runs with an ARN and no id (seen live).
-    arn = "arn:aws:emr-serverless:ca-central-1:000000000008:/applications/b2f154e9/jobruns/ff81f100"
-    assert ad._summary_id({"arn": arn}) == "ff81f100"
-    assert ad._summary_id({"id": "abc", "arn": arn}) == "abc"
-    with pytest.raises(ad.SparkRunError):
-        ad._summary_id({"name": "x"})
+def test_a_serverless_summary_is_read_by_its_id():
+    assert ad._summary_id({"id": "abc", "arn": ARN}, "job run") == "abc"
 
 
-def test_a_serverless_application_summary_without_an_id_is_read_by_its_arn():
-    arn = "arn:aws:emr-serverless:ca-central-1:000000000008:/applications/b2f154e9"
-    assert ad._application_id({"arn": arn}) == "b2f154e9"
-    assert ad._application_id({"id": "abc", "arn": arn}) == "abc"
+@pytest.mark.parametrize("summary", [{"arn": ARN, "name": "x"}, {"id": ""}, {}])
+def test_a_serverless_summary_without_an_id_is_a_clear_error(summary):
+    """AWS always returns ``id``; an emulator that does not is the test's to shim."""
+    with pytest.raises(ad.SparkRunError, match="job run summary carries no id; its keys: ") as err:
+        ad._summary_id(summary, "job run")
+    for key in summary:
+        assert key in str(err.value)
+    assert "xxxxxxxxxxxx" not in str(err.value)  # the ARN is never parsed for one
+
+
+class _Pages:
+    def __init__(self, pages):
+        self.pages = pages
+
+    def paginate(self, **_kwargs):
+        return iter(self.pages)
+
+
+@pytest.mark.parametrize(
+    "operation, call",
+    [
+        ("list_applications", lambda a: a.application_id()),
+        ("list_job_runs", lambda a: a.runs()),
+    ],
+)
+def test_the_adapter_refuses_a_list_summary_without_an_id(run, serverless, operation, call):
+    target = run if operation == "list_applications" else serverless
+    adapter, _stub = adapter_on(target, "emr-serverless")
+    key = "applications" if operation == "list_applications" else "jobRuns"
+    summary = {"arn": ARN, "name": target.target.get("applicationName") or target.run_name}
+    adapter.client.get_paginator = lambda name: _Pages([{key: [summary]}])
+    what = "application" if operation == "list_applications" else "job run"
+    with pytest.raises(
+        ad.SparkRunError, match=f"{what} summary carries no id; its keys: arn, name"
+    ):
+        call(adapter)
 
 
 def test_a_boto3_without_streaming_job_runs_is_refused(serverless, monkeypatch):

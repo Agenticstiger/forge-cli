@@ -431,7 +431,14 @@ def _fluid(capsys, *argv):
 
 @pytest.fixture
 def lane(ls, monkeypatch, tmp_path):
-    """One test's policy and cwd: the operator lists nothing it does not name."""
+    """One test's policy and cwd: the operator lists nothing it does not name. forge's EMR
+    Serverless clients fill the ``id`` LocalStack leaves out of list summaries
+    (:mod:`._localstack_emr`): the product reads AWS's shape."""
+    from fluid_build.build_runners.spark import _adapters
+
+    from ._localstack_emr import with_summary_ids
+
+    monkeypatch.setattr(_adapters, "default_clients", with_summary_ids(_adapters.default_clients))
     monkeypatch.chdir(tmp_path)  # fluid reads the cwd's .env
     monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"msk:{ls.msk_arn}")  # the run's own cluster
     for name in ("AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_REGION", "AWS_ACCOUNT_ID"):
