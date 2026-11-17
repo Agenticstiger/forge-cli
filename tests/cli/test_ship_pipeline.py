@@ -828,8 +828,6 @@ def test_gitlab_sections(
     monkeypatch.setenv("GITLAB_CI", "true")
     assert ship_run(["--until", "validate"]) == 0
     out = capsys.readouterr().out
-    import re
-
     assert re.search(
         r"\x1b\[0Ksection_start:\d+:fluid_ship_1_bundle\[collapsed=true\]\r\x1b\[0K1 · bundle", out
     )
