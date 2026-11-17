@@ -220,6 +220,7 @@ def test_without_the_mirror_the_defaults_are_unchanged(contract, monkeypatch):
         ("https://mirror.example.internal/maven/?", "query"),
         ("https://mirror.example.internal/maven/#", "fragment"),
         ("https://a..b/maven/", "not a valid DNS name"),
+        ("https://169.254.169.254" + chr(0x3002) + "/", "not a valid DNS name"),
         ("https://169.254.169.254%2e/latest/", "ending in a dot"),
         ("https://mirror.example.internal\\@evil.example/", "user or password"),
     ],

@@ -323,6 +323,8 @@ def maven_repository(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
     elif host.endswith(".") or any(c in parts.netloc for c in "%\\") or parts.port == 0:
         # a host spelt so it does not resolve here may still resolve on the cluster
         problem = "has a host ending in a dot, a % or \\ in it, or port 0"
+    elif not host.isascii():  # an IDN dot (U+3002) would slip past the dot check
+        problem = "has a host that is not a valid DNS name (spell an IDN in punycode)"
     else:
         try:
             link_local = _hostname_is_link_local(host)
