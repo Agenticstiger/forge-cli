@@ -6,8 +6,8 @@
 ``fluid apply`` provisions it with OpenTofu (``iac/providers/aws_ingest.py``): the job
 config and the runner in S3, the EMR Serverless application, the job's role and the Glue
 job. Runs (``build_runners/spark``) find them by these names, never by reading OpenTofu
-state, because Airflow starts a scheduled build with ``fluid spark run`` and has no state
-to read. Both lanes import this one module, so the names cannot drift apart.
+state, so starting a run needs the contract alone. Both lanes import this one module, so the
+names cannot drift apart.
 
 Product and build ids hold hyphens, so ``fluid-a-b-c`` alone could be product ``a-b``
 build ``c`` or product ``a`` build ``b-c``: every per-build name ends in 8 hex characters

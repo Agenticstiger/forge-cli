@@ -1089,9 +1089,9 @@ def _emit_caller_policy(
 ) -> None:
     """A managed policy that lets a scheduler start, watch and stop the product's runs.
 
-    A build that runs to completion is started by ``fluid spark run`` on the scheduler
-    (an MWAA worker, as the environment's execution role), which the platform owns: the
-    policy is the product's, for the platform to attach to that role.
+    A build that runs to completion is started by its scheduler through ``fluid apply
+    --mode amend-and-build`` (an MWAA worker, as the environment's execution role), which
+    the platform owns: the policy is the product's, for the platform to attach to that role.
     """
     key = safe_ident(f"{ctx.cid}_spark_caller")
     blocks.data.setdefault("aws_iam_policy_document", {})[key] = aws_identity.caller_document(

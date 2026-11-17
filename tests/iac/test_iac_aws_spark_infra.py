@@ -1027,7 +1027,7 @@ def test_an_msk_cluster_is_read_only_once_the_operator_lists_it(contract, monkey
     with pytest.raises(SparkPolicyError) as caught:
         emit(contract)
     assert f"msk:{other}" in caught.value.why
-    # The compiler refuses it too (fluid spark run compiles without the IaC).
+    # The compiler refuses it too (a run compiles without the IaC).
     from fluid_build.spark.compiler import compile_job_config
 
     with pytest.raises(SparkPolicyError):

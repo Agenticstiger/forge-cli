@@ -1,7 +1,7 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""reconcile / run_once / run_build / status against an in-memory adapter and a fake clock."""
+"""reconcile / run_once / run_build against an in-memory adapter and a fake clock."""
 
 from __future__ import annotations
 
@@ -165,7 +165,8 @@ def test_a_failed_last_run_with_this_config_is_an_error_not_a_restart(run, clock
     use(fake)
     out = go(run, clock)
     assert (out.action, out.error, fake.calls) == ("failed", True, [])
-    assert "jr9" in out.message and "OOM in driver" in out.message and "--restart" in out.message
+    assert "jr9" in out.message and "OOM in driver" in out.message
+    assert "fix the cause and change the build" in out.message
 
 
 def test_restart_failed_starts_it_anyway(run, clock, use):
@@ -219,7 +220,7 @@ def test_a_scheduled_build_is_reported_and_never_touches_aws(run, clock, use):
     )
     out = go(scheduled, clock)
     assert (out.action, out.error, built) == ("scheduled", False, [])
-    assert "fluid spark run" in out.message
+    assert "fluid apply <contract> --mode amend-and-build --build-id" in out.message
 
 
 def test_an_aws_error_is_that_builds_outcome_and_the_others_still_reconcile(
@@ -350,33 +351,6 @@ def test_run_once_turns_an_aws_error_into_an_outcome(scheduled, clock, monkeypat
     monkeypatch.setattr(rc, "adapter_for", boom)
     out = once(scheduled, clock)
     assert (out.action, out.error, out.message) == ("failed", True, "no application")
-
-
-# --- status ---------------------------------------------------------------------------
-
-
-def test_status_flags_the_runs_that_match_the_contract(run, use):
-    use(
-        FakeAdapter([info("a", "RUNNING", hash_=run.config_hash), info("b", "FAILED", hash_="old")])
-    )
-    (row,) = rc.status([run])
-    assert row["where"] == "fake cluster" and row["configHash"] == run.config_hash
-    assert [(r["runId"], r["current"]) for r in row["runs"]] == [("a", True), ("b", False)]
-
-
-def test_status_limits_runs_and_reports_an_error_as_the_row(run, monkeypatch):
-    monkeypatch.setattr(
-        rc,
-        "adapter_for",
-        lambda r, c=None: FakeAdapter([info(str(i), "RUNNING") for i in range(9)]),
-    )
-    assert len(rc.status([run], limit=2)[0]["runs"]) == 2
-
-    def boom(r, c=None):
-        raise rc.SparkRunError("nope")
-
-    monkeypatch.setattr(rc, "adapter_for", boom)
-    assert rc.status([run])[0]["error"] == "nope"
 
 
 # --- run_build: fluid apply --mode amend-and-build ------------------------------------

@@ -17,12 +17,12 @@ run match the contract, idempotently:
 4. No running job: start one, unless the last run with this hash failed. On EMR Serverless a
    streaming job retries by itself until it fails more often than ``maxFailedAttemptsPerHour``
    in an hour, and then stops: starting it again would fail the same way, so that run is an
-   error, with its id and reason, until the build changes or the operator restarts it
-   (``fluid spark run --restart``).
+   error, with its id and reason, until the build changes.
 
 A scheduled build (batch, or a stream with ``trigger.availableNow``) is never reconciled:
-its scheduler starts it with :func:`run_once` (``fluid spark run``), which waits for the run
-to end and cancels it on Ctrl-C, SIGTERM or SIGHUP, as ``_databricks_job_run`` does.
+its scheduler starts it through ``fluid apply --mode amend-and-build --build-id <id>``, whose
+build phase calls :func:`run_build` and so :func:`run_once`, which waits for the run to end
+and cancels it on Ctrl-C, SIGTERM or SIGHUP, as ``_databricks_job_run`` does.
 
 Polling follows the databricks-sdk run waiter already adapted in ``_databricks_job_run``: a
 poll a second longer each time, at most :data:`MAX_POLL_S`.
@@ -56,7 +56,8 @@ MAX_FAILED_READS = 5
 #: How long a reconcile waits for a cancelled run to stop, and for a started one to leave
 #: its pending states; ``FLUID_SPARK_WAIT_SECONDS`` overrides both.
 DEFAULT_WAIT_S = 900
-#: How long ``fluid spark run`` waits for a scheduled run to end (``--timeout`` overrides).
+#: How long a scheduled run may take before it is cancelled, unless the build says
+#: (``execution.runtime.timeout``).
 DEFAULT_RUN_WAIT_S = 6 * 3600
 WAIT_ENV = "FLUID_SPARK_WAIT_SECONDS"
 
@@ -121,8 +122,8 @@ class _Clock:
         """Poll ``read`` until ``done`` or the budget is spent; the last read either way.
 
         A read that fails (a throttled call) is tried again; :data:`MAX_FAILED_READS` in a
-        row raise the last error, and the run is left as it is (a retried ``fluid spark
-        run`` adopts it), as the Databricks job-run waiter does."""
+        row raise the last error, and the run is left as it is (a retried build adopts
+        it), as the Databricks job-run waiter does."""
         deadline = self.now() + budget
         delay = 1.0
         info = read()
@@ -203,8 +204,8 @@ def _reconcile_one(
         out.action, out.error, out.run_id, out.state = "failed", True, last.run_id, last.state
         out.message = (
             f"{_failure_text(last)}. It is not started again with the same config, which "
-            "would fail the same way: fix the cause, then run fluid spark run "
-            f"<contract> --build-id {run.build} --restart, or change the build"
+            "would fail the same way: fix the cause and change the build, and fluid apply "
+            "starts the new config"
         )
         return out
     if dry_run:
@@ -242,7 +243,7 @@ def _reconcile_one(
         out.error = True
         out.message = _failure_text(started)
     elif started.state == PENDING:
-        out.message = f"still starting after {int(budget)} s; fluid spark status follows it"
+        out.message = f"still starting after {int(budget)} s; the next fluid apply reports it"
     return out
 
 
@@ -293,7 +294,10 @@ def _scheduled(run: DesiredRun) -> Outcome:
         run.build,
         run.runtime,
         "scheduled",
-        message=f"a scheduler starts it: fluid spark run <contract> --build-id {run.build}",
+        message=(
+            "a scheduler starts it: fluid apply <contract> --mode amend-and-build "
+            f"--build-id {run.build}"
+        ),
     )
 
 
@@ -353,12 +357,12 @@ def run_once(
     now: Callable[[], float] = time.monotonic,
     env: Optional[Mapping[str, str]] = None,
 ) -> Outcome:
-    """``fluid spark run``: one run of a build, for a scheduler.
+    """One run of a build, for its scheduler (:func:`run_build`).
 
     A scheduled build starts a run and, with ``wait``, waits for it to end; the outcome is an
     error unless it SUCCEEDED. Ctrl-C, SIGTERM or SIGHUP while it is waited on cancel it, and
-    the outcome is ``cancelled`` (an error), so ``--json`` still prints its one line.
-    A long-running build is reconciled instead (``restart`` starts it again after a failure).
+    the outcome is ``cancelled`` (an error). A long-running build is reconciled instead
+    (``restart`` starts it again after a failure).
     """
     from fluid_build.build_runners._databricks_job_run import interrupt_guard
 
@@ -439,35 +443,6 @@ def run_once(
             failed.run_id = started[0]
             failed.message += f"; run {started[0]} was left going (a retry waits for it)"
         return failed
-
-
-def status(
-    runs: Sequence[DesiredRun], *, clients: Optional[ClientFactory] = None, limit: int = 5
-) -> List[Dict[str, Any]]:
-    """Each build's recent runs, newest first, and whether the newest runs the contract's config."""
-    rows = []
-    for run in runs:
-        row: Dict[str, Any] = {
-            "build": run.build,
-            "runtime": run.runtime,
-            "configHash": run.config_hash,
-        }
-        try:
-            adapter = adapter_for(run, clients)
-            row["where"] = adapter.where()
-            history = adapter.runs()[:limit]
-            row["runs"] = [
-                {
-                    **h.as_dict(),
-                    "details": _clean(h.details),
-                    "current": h.config_hash == run.config_hash,
-                }
-                for h in history
-            ]
-        except Exception as exc:  # noqa: BLE001 - one build's error is its row
-            row["error"] = _error_outcome(run, exc).message
-        rows.append(row)
-    return rows
 
 
 def run_build(
