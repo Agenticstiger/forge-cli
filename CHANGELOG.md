@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **An `enum` level may hold any character (FLUID 0.7.7 preview).** Real data has levels such
+  as `Dr.`, `Cir.` or `>10000`, and the column type pattern refused them. A level is now a
+  quoted string that may hold any character but a control character, with its own quote
+  doubled, as SQL writes a string literal: `enum('Dr.', '>10000', 'O''Brien', 'a, b')`. An
+  unquoted word list such as `enum(IE, United Kingdom)` is read as before. A level with an
+  unescaped quote (`enum('it's')`) and an empty item (`enum(a,,b)`) are refused. The wider text
+  is for enum levels only: every other type keeps the argument characters it had, and 0.7.6 is
+  unchanged. No emitter writes an enum's levels into a SQL type any more: dbt model contracts
+  and casts gave `varchar('a','b')` and ODCS gave `VARCHAR('a','b')` for an enum column, where
+  each now gives the bare string type.
+
 ## [0.31.0] — 2026-11-17
 
 ### Added
