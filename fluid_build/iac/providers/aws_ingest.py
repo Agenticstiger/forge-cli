@@ -44,10 +44,11 @@ import copy
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from ...providers.aws.util import warehouse as _warehouse
+from ...spark import names
 from ..base import UnsupportedBindingError
 from ..naming import TofuExpr, bounded_ident, safe_ident, tofu_ref
 from ..packaging import ContainerDecision, resolve_packaging
@@ -58,13 +59,13 @@ CALLER = "data.aws_caller_identity.fluid_lf_caller.account_id"
 #: The region of a binding that names none.
 REGION_DATA = "fluid_region"
 #: Where a build's artifacts live in its output's bucket.
-ARTIFACT_ROOT = "_fluid/spark"
+ARTIFACT_ROOT = names.ARTIFACT_PREFIX
 #: Where the compiler puts a build's checkpoint by default: ``_checkpoints/<product>/<build>/``.
 _CHECKPOINTS = "_checkpoints"
 #: The roots forge writes in a product's bucket; an output's own data never lives there.
 _RESERVED_ROOTS = (ARTIFACT_ROOT.split("/")[0], _CHECKPOINTS)
-RUNNER_FILE = "forge_spark_runner.py"
-CONFIG_FILE = "job.json"
+RUNNER_FILE = names.RUNNER_FILE
+CONFIG_FILE = names.CONFIG_FILE
 #: Days a Spark log group keeps events.
 LOG_RETENTION_DAYS = 30
 #: The isolated application's caps (EMR Serverless application limits).
@@ -76,18 +77,27 @@ DEFAULT_GLUE_VERSION = "5.0"
 #: Spark's Kafka source names its consumer groups ``spark-kafka-source-...`` unless the
 #: build sets groupIdPrefix.
 SPARK_GROUP_PREFIX = "spark-kafka-source-"
-_MSK_ARN = re.compile(
-    r"arn:aws[a-z-]*:kafka:(?P<region>[a-z0-9-]+):(?P<account>[0-9]{12}):cluster/"
-    r"(?P<name>[A-Za-z0-9_.-]{1,64})/(?P<uuid>[A-Za-z0-9-]{1,128})"
-)
+
+
+@dataclass(frozen=True)
+class Writer:
+    """A Spark job that writes an expose's table: who Lake Formation must let write it."""
+
+    principal: Any  # the job role's ARN; None on emr-ec2 (the cluster's own role)
+    overwrites: bool  # a batch job replaces what it computes
 
 
 @dataclass
 class SparkBlocks:
-    """What the Spark builds add to the module: ``resource`` and ``data`` maps."""
+    """What the Spark builds add to the module: ``resource`` and ``data`` maps, and the
+    jobs that write each expose (for :func:`fluid_build.iac.providers.aws`'s Lake
+    Formation registration)."""
 
     resources: Dict[str, Dict[str, Any]]
     data: Dict[str, Dict[str, Any]]
+    writers: Dict[str, List[Writer]] = field(default_factory=dict)
+    #: expose id -> the key of the role Lake Formation registers its location with.
+    registration_roles: Dict[str, str] = field(default_factory=dict)
 
 
 def _escape(text: str) -> str:
@@ -101,7 +111,8 @@ def _markers(contract: Mapping[str, Any]) -> Tuple[str, str]:
     occurrences in the job config can only come from that argument. Lower-case letters
     and digits, as a bucket name allows.
     """
-    text = json.dumps(contract, sort_keys=True, default=str)
+    # Unsorted: a mapping may mix key types (YAML's unquoted 2024: beside owner:).
+    text = json.dumps(contract, default=str)
     seed = hashlib.sha256(text.encode("utf-8")).hexdigest()
     for attempt in range(100):
         digest = hashlib.sha256(f"{seed}:{attempt}".encode()).hexdigest()
@@ -139,7 +150,7 @@ def _expression(text: str, swaps: Mapping[str, str]) -> Any:
 
 
 def _msk(arn: str, topic: str, group_prefix: Optional[str], where: str) -> aws_identity.MskSource:
-    match = _MSK_ARN.fullmatch(arn)
+    match = aws_identity.MSK_ARN.fullmatch(arn)
     if match is None:
         raise UnsupportedBindingError(
             "spark-msk-arn",
@@ -186,10 +197,71 @@ def spark_blocks(contract: Mapping[str, Any], cid: str) -> SparkBlocks:
     product_tags = {"managed_by": "fluid", "fluid_contract": cid}
     blocks.data.setdefault("aws_caller_identity", {})["fluid_lf_caller"] = {}
     applications: Dict[str, Any] = {}
+    runs: List[aws_identity.CallerRun] = []
+    keys: Dict[str, str] = {}
     for build in builds:
-        _emit_build(blocks, contract, build, ctx, product_tags, applications)
+        bid = str(build.get("id"))
+        key = safe_ident(f"{cid}_{bid}_spark")
+        if key in keys:
+            raise UnsupportedBindingError(
+                "spark-build-id-clash",
+                f"Spark builds {keys[key]!r} and {bid!r} differ only in '-' and '_', so their "
+                "OpenTofu addresses meet and one build's role, artifacts and job would replace "
+                "the other's.",
+                ("Give the builds ids that differ in a letter or digit.",),
+            )
+        keys[key] = bid
+        run = _emit_build(blocks, contract, build, ctx, product_tags, applications)
+        if run is not None:
+            runs.append(run)
     _emit_log_key(blocks, ctx, product_tags)
+    if runs:
+        _emit_caller_policy(blocks, ctx, runs, product_tags)
+    for expose in contract.get("exposes") or []:
+        if isinstance(expose, Mapping) and str(expose.get("exposeId")) in blocks.writers:
+            _emit_registration_role(blocks, ctx, expose, product_tags)
     return blocks
+
+
+def _emit_registration_role(
+    blocks: SparkBlocks, ctx: _Ctx, expose: Mapping[str, Any], tags: Mapping[str, str]
+) -> None:
+    """The role Lake Formation registers a Spark-written location with.
+
+    The service-linked role has no ``s3:PutObject`` on a registered location, and EMR 7.12
+    writes Iceberg with the credentials Lake Formation vends: a location a forge Spark job
+    writes is registered with this role instead, which may read and write the table's
+    prefix. :mod:`aws` uses it in its one ``aws_lakeformation_resource``.
+    """
+    binding = expose.get("binding") or {}
+    gov = (binding.get("governance") or {}).get("lakeFormation") or {}
+    if not (isinstance(gov, Mapping) and gov.get("registerLocation")):
+        return
+    loc = binding.get("location") or {}
+    bucket, prefix = _warehouse.normalize_location(loc, account_ref=ctx.account_marker)
+    expose_id = str(expose.get("exposeId"))
+    key = safe_ident(f"{ctx.cid}_{expose_id}_lf_writer")
+    region = _region(blocks, loc.get("region"))
+    documents = blocks.data.setdefault("aws_iam_policy_document", {})
+    documents[f"{key}_trust"] = aws_identity.registration_trust(ctx.account)
+    documents[f"{key}_access"] = aws_identity.registration_document(
+        ctx.x(bucket), ctx.x(prefix if prefix.endswith("/") else prefix + "/"), region=region
+    )
+    blocks.resources.setdefault("aws_iam_role", {})[key] = {
+        "name": names.registration_role_name(ctx.product, expose_id),
+        "description": (
+            f"The role Lake Formation registers the location of {ctx.product}'s "
+            f"{expose_id} with, so a forge Spark job can write it"
+        ),
+        "assume_role_policy": tofu_ref(f"data.aws_iam_policy_document.{key}_trust.json"),
+        "tags": dict(tags),
+    }
+    blocks.resources.setdefault("aws_iam_role_policy", {})[key] = {
+        "name": "fluid-lakeformation-location",
+        "role": tofu_ref(f"aws_iam_role.{key}.id"),
+        "policy": tofu_ref(f"data.aws_iam_policy_document.{key}_access.json"),
+    }
+    blocks.registration_roles[expose_id] = key
 
 
 def _region(blocks: SparkBlocks, sink_region: Optional[str]) -> Any:
@@ -199,8 +271,10 @@ def _region(blocks: SparkBlocks, sink_region: Optional[str]) -> Any:
     return tofu_ref(f"data.aws_region.{REGION_DATA}.region")
 
 
-def _log_group_name(product: str, build_id: str) -> str:
-    return f"/aws/fluid/spark/{product}/{build_id}"
+def _provider_region(blocks: SparkBlocks) -> TofuExpr:
+    """The provider's region: where the application, the jobs and the log groups live."""
+    blocks.data.setdefault("aws_region", {})[REGION_DATA] = {}
+    return tofu_ref(f"data.aws_region.{REGION_DATA}.region")
 
 
 @dataclass
@@ -215,6 +289,11 @@ class _Build:
     tags: Dict[str, str]
     region: Any
     artifacts: str
+    runner_sha256: str
+
+    @property
+    def runner_key(self) -> str:
+        return names.runner_key(self.ctx.product, self.build_id, self.runner_sha256)
 
     @property
     def runtime(self) -> str:
@@ -224,10 +303,11 @@ class _Build:
     def where(self) -> str:
         return f"Spark build {self.build_id}"
 
-    def object_uri(self, name: str) -> TofuExpr:
-        """``s3://`` of one artifact, through its object so a reader waits for the upload."""
+    def object_uri(self, key: str) -> TofuExpr:
+        """``s3://`` of one artifact key, through the runner object so a reader waits for
+        the upload."""
         bucket = tofu_ref(f"aws_s3_object.{self.key}_runner.bucket")
-        return TofuExpr(f"s3://{bucket}/{_escape(self.artifacts + name)}")
+        return TofuExpr(f"s3://{bucket}/{_escape(key)}")
 
 
 def _emit_build(
@@ -237,11 +317,21 @@ def _emit_build(
     ctx: _Ctx,
     product_tags: Mapping[str, str],
     applications: Dict[str, Any],
-) -> None:
+) -> Optional[aws_identity.CallerRun]:
+    """Emit one build; return what a scheduler needs to start its runs, for a build that
+    runs to completion (batch, or a stream triggered availableNow)."""
+    from fluid_build.spark import runner_source
     from fluid_build.spark.compiler import compile_job_config, spark_parameters
 
     bid = str(build.get("id"))
     aws_identity.refuse_unless_identity_allowed(ctx.product, build)
+    problems = aws_identity.runtime_errors(build)
+    if problems:
+        raise UnsupportedBindingError(
+            "spark-runtime-field",
+            "; ".join(problems) + ".",
+            ("Fix the field the message names; fluid validate reports the same.",),
+        )
     job = compile_job_config(contract, build, account_ref=ctx.account_marker)
     config = copy.deepcopy(dict(job.config))
     b = _Build(
@@ -250,9 +340,10 @@ def _emit_build(
         key=safe_ident(f"{ctx.cid}_{bid}_spark"),
         cfg=spark_parameters(build) or {},
         config=config,
-        tags={**product_tags, "fluid_build": bid},
+        tags={**product_tags, **names.tags(ctx.product, bid)},
         region=_region(blocks, config["sink"].get("region")),
-        artifacts=f"{ARTIFACT_ROOT}/{ctx.product}/{bid}/",
+        artifacts=names.artifact_prefix(ctx.product, bid),
+        runner_sha256=names.runner_sha256(runner_source()),
     )
     expose = next(
         e
@@ -262,9 +353,10 @@ def _emit_build(
     loc = (expose.get("binding") or {}).get("location") or {}
     bucket, data_prefix = _warehouse.normalize_location(loc, account_ref=ctx.account_marker)
 
-    content, msk = _job_content(blocks, b)
-    _emit_artifacts(blocks, b, _bucket_ref(contract, expose, loc, bucket, ctx), content)
-    log_name = _log_group_name(ctx.product, bid)
+    content, cluster, iam = _job_content(blocks, b)
+    bucket_ref = _bucket_ref(contract, expose, loc, bucket, ctx)
+    _emit_artifacts(blocks, b, bucket_ref, content, runner_source())
+    log_name = names.log_group_name(ctx.product, bid)
     blocks.resources.setdefault("aws_cloudwatch_log_group", {})[b.key] = {
         "name": log_name,
         "retention_in_days": LOG_RETENTION_DAYS,
@@ -274,7 +366,7 @@ def _emit_build(
 
     application_id: Any = None
     if b.runtime == "emr-serverless":
-        application_id = _application(blocks, contract, expose, b, msk, applications)
+        application_id = _application(blocks, contract, expose, b, cluster, applications)
     elif b.runtime == "emr-ec2" and not b.cfg.get("clusterId"):
         raise UnsupportedBindingError(
             "spark-emr-ec2-needs-cluster",
@@ -283,6 +375,7 @@ def _emit_build(
             ("Set parameters.spark.clusterId to the running cluster (j-...).",),
         )
     database, table = config["sink"]["table"].split(".", 1)
+    vpc = b.runtime == "glue" and cluster is not None
     access = aws_identity.JobAccess(
         region=b.region,
         account=ctx.account,
@@ -290,40 +383,68 @@ def _emit_build(
         database=database,
         table=table,
         log_group_arn=tofu_ref(f"aws_cloudwatch_log_group.{b.key}.arn"),
-        msk=msk,
+        msk=cluster if iam else None,
         secret_arns=_secret_arns(config, b.region, ctx),
+        glue_vpc=vpc,
     )
     role_arn = _emit_role(blocks, b, access, application_id)
+    overwrites = job.config["mode"] == "batch"
+    blocks.writers.setdefault(str(expose.get("exposeId")), []).append(Writer(role_arn, overwrites))
+    target: Any = application_id
     if b.runtime == "glue":
         _glue_job(blocks, b, job.config["mode"], role_arn)
         args = blocks.resources["aws_glue_job"][b.key]["default_arguments"]
-        args["--config"] = b.object_uri(CONFIG_FILE)
+        args["--config"] = b.object_uri(names.job_config_key(ctx.product, bid))
         args["--continuous-log-logGroup"] = log_name
-        args["--TempDir"] = b.object_uri("tmp/")
-        if msk is not None:
-            _glue_connection(blocks, b, msk)
+        args["--TempDir"] = b.object_uri(b.artifacts + "tmp/")
+        if vpc:
+            _glue_connection(blocks, b, cluster)
+        target = tofu_ref(f"aws_glue_job.{b.key}.name")
+    elif b.runtime == "emr-ec2":
+        target = b.cfg["clusterId"]
+    elif b.runtime == "emr-eks":
+        target = b.cfg["virtualClusterId"]
+    if not (overwrites or (config.get("trigger") or {}).get("availableNow")):
+        return None
+    bucket_arn = aws_identity._join("arn:aws:s3:::", ctx.x(bucket))
+    return aws_identity.CallerRun(
+        sid=safe_ident(bid).replace("_", "").capitalize() + names.build_key(ctx.product, bid),
+        runtime=b.runtime,
+        target=target,
+        role_arn=role_arn,
+        objects=(
+            aws_identity._join(bucket_arn, "/", names.job_config_key(ctx.product, bid)),
+            aws_identity._join(bucket_arn, "/", b.runner_key),
+        ),
+        lookup_application=b.runtime == "emr-serverless" and not b.cfg.get("applicationId"),
+    )
 
 
-def _job_content(blocks: SparkBlocks, b: _Build) -> Tuple[Any, Optional[aws_identity.MskSource]]:
-    """``job.json``'s text, its brokers from the MSK data source when it names a cluster,
-    and the cluster the role reads with MSK IAM."""
+def _job_content(
+    blocks: SparkBlocks, b: _Build
+) -> Tuple[Any, Optional[aws_identity.MskSource], bool]:
+    """``job.json``'s text with its brokers from the MSK data source when it names a
+    cluster; that cluster (its network, and its topic and groups for the role); and
+    whether the job reads it with MSK IAM."""
     from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER
 
     ctx, source = b.ctx, b.config.get("source") or {}
     swaps = {ctx.account_marker: str(ctx.account)}
-    msk: Optional[aws_identity.MskSource] = None
+    cluster: Optional[aws_identity.MskSource] = None
     arn = source.get("mskClusterArn")
     iam = source.get("auth") == "msk-iam"
     if arn:
+        cluster = _msk(arn, source["topic"], source.get("groupIdPrefix"), b.where)
         attr = "bootstrap_brokers_sasl_iam" if iam else "bootstrap_brokers"
-        blocks.data.setdefault("aws_msk_bootstrap_brokers", {})[b.key] = {"cluster_arn": arn}
+        blocks.data.setdefault("aws_msk_bootstrap_brokers", {})[b.key] = {
+            "cluster_arn": arn,
+            "region": cluster.region,
+        }
         if source.get("bootstrapServers") == MSK_BROKERS_PLACEHOLDER:
             source["bootstrapServers"] = ctx.brokers_marker
             swaps[ctx.brokers_marker] = str(
                 tofu_ref(f"data.aws_msk_bootstrap_brokers.{b.key}.{attr}")
             )
-        if iam:
-            msk = _msk(arn, source["topic"], source.get("groupIdPrefix"), b.where)
     elif iam and not b.cfg.get("executionRoleArn"):
         raise UnsupportedBindingError(
             "spark-msk-iam-needs-cluster-arn",
@@ -336,23 +457,33 @@ def _job_content(blocks: SparkBlocks, b: _Build) -> Tuple[Any, Optional[aws_iden
             ),
         )
     text = json.dumps(b.config, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
-    return _expression(text, swaps), msk
+    if "${" in text:
+        # The runner refuses a config that still holds one, and OpenTofu would write the
+        # contract's own literally: fail here, before anything is uploaded.
+        raise UnsupportedBindingError(
+            "spark-config-interpolation",
+            f"{b.where}: the job config holds '${{' from the contract (in properties.sql or "
+            "another field), which the forge Spark runner refuses as an unresolved "
+            "interpolation.",
+            ("Write the text without '${' (in SQL, a literal '$' then '{' works).",),
+        )
+    return _expression(text, swaps), cluster, iam
 
 
-def _emit_artifacts(blocks: SparkBlocks, b: _Build, bucket_ref: Any, content: Any) -> None:
-    from fluid_build.spark import runner_source
-
+def _emit_artifacts(
+    blocks: SparkBlocks, b: _Build, bucket_ref: Any, content: Any, runner: str
+) -> None:
     objects = blocks.resources.setdefault("aws_s3_object", {})
     objects[f"{b.key}_runner"] = {
         "bucket": bucket_ref,
-        "key": b.artifacts + RUNNER_FILE,
-        "content": runner_source(),
+        "key": b.runner_key,
+        "content": runner,
         "content_type": "text/x-python",
         "tags": b.tags,
     }
     objects[f"{b.key}_config"] = {
         "bucket": bucket_ref,
-        "key": b.artifacts + CONFIG_FILE,
+        "key": names.job_config_key(b.ctx.product, b.build_id),
         "content": content,
         "content_type": "application/json",
         "tags": b.tags,
@@ -365,9 +496,7 @@ def _emit_role(
     """The role the job runs as, and its ARN; a named ``executionRoleArn`` as it is."""
     if b.cfg.get("executionRoleArn"):
         return b.cfg["executionRoleArn"]
-    name = bounded_ident(
-        f"fluid-{b.ctx.product}-{b.build_id}-spark", aws_identity.ROLE_NAME_LIMIT, "-"
-    )
+    name = names.execution_role_name(b.ctx.product, b.build_id)
     documents = blocks.data.setdefault("aws_iam_policy_document", {})
     documents[f"{b.key}_access"] = aws_identity.access_document(access)
     policy = tofu_ref(f"data.aws_iam_policy_document.{b.key}_access.json")
@@ -551,9 +680,10 @@ def _application(
         )
     release = cfg.get("releaseLabel") or DEFAULT_RELEASE
     app_key = safe_ident(f"{ctx.cid}_spark")
+    arn = msk.arn if msk else None
     if app_key in applications:
         first_release, first_cluster = applications[app_key]
-        if release != first_release or (msk and first_cluster and msk.arn != first_cluster):
+        if release != first_release or arn != first_cluster:
             raise UnsupportedBindingError(
                 "spark-emr-application-conflict",
                 f"{where} asks for the product's isolated EMR Serverless application with a "
@@ -562,9 +692,9 @@ def _application(
                 ("Give every isolated EMR Serverless build the same releaseLabel and cluster.",),
             )
         return tofu_ref(f"aws_emrserverless_application.{app_key}.id")
-    applications[app_key] = (release, msk.arn if msk else None)
+    applications[app_key] = (release, arn)
     body: Dict[str, Any] = {
-        "name": bounded_ident(f"fluid-{ctx.product}", 64, "-"),
+        "name": names.application_name(ctx.product),
         "release_label": release,
         "type": "spark",
         "auto_stop_configuration": {
@@ -572,9 +702,18 @@ def _application(
             "idle_timeout_minutes": APPLICATION_IDLE_MINUTES,
         },
         "maximum_capacity": {"cpu": APPLICATION_MAX_CPU, "memory": APPLICATION_MAX_MEMORY},
-        "tags": {"managed_by": "fluid", "fluid_contract": ctx.cid},
+        # AWS fills the job queue's defaults (15 concurrent runs, 360-minute timeout) at
+        # create, and a plan to blank them would re-read every document that names the
+        # application (measured in ca-central-1). forge does not size the queue.
+        "lifecycle": {"ignore_changes": ["scheduler_configuration"]},
+        "tags": {
+            "managed_by": "fluid",
+            "fluid_contract": ctx.cid,
+            names.PRODUCT_TAG: ctx.product,
+        },
     }
     if msk is not None:
+        _same_region(b, msk, "the product's isolated EMR Serverless application")
         cluster = _msk_cluster_data(blocks, app_key, msk)
         body["network_configuration"] = {
             "subnet_ids": tofu_ref(f"{cluster}.broker_node_group_info[0].client_subnets"),
@@ -585,8 +724,22 @@ def _application(
 
 
 def _msk_cluster_data(blocks: SparkBlocks, key: str, msk: aws_identity.MskSource) -> str:
-    blocks.data.setdefault("aws_msk_cluster", {})[key] = {"cluster_name": msk.name}
+    blocks.data.setdefault("aws_msk_cluster", {})[key] = {
+        "cluster_name": msk.name,
+        "region": msk.region,
+    }
     return f"data.aws_msk_cluster.{key}"
+
+
+def _same_region(b: _Build, msk: aws_identity.MskSource, what: str) -> None:
+    """A job's network is the cluster's subnets, which exist in the cluster's region only."""
+    if isinstance(b.region, str) and b.region != msk.region:
+        raise UnsupportedBindingError(
+            "spark-msk-region",
+            f"{b.where}: {what} would sit in the MSK cluster's subnets, but the cluster is in "
+            f"{msk.region} and the output in {b.region}.",
+            ("Read a cluster in the output's region, or run the job by bootstrapServers.",),
+        )
 
 
 def _trust(blocks: SparkBlocks, b: _Build, role_name: str, application_id: Any) -> Dict[str, Any]:
@@ -605,7 +758,8 @@ def _trust(blocks: SparkBlocks, b: _Build, role_name: str, application_id: Any) 
     return aws_identity.trust_document(
         b.runtime,
         account=b.ctx.account,
-        region=b.region,
+        # The application is in the provider's region, whatever the output's is.
+        region=_provider_region(blocks),
         role_name=role_name,
         application_id=application_id,
         eks_issuer=issuer,
@@ -616,13 +770,13 @@ def _trust(blocks: SparkBlocks, b: _Build, role_name: str, application_id: Any) 
 def _glue_job(blocks: SparkBlocks, b: _Build, mode: str, role_arn: Any) -> None:
     streaming = mode == "streaming"
     blocks.resources.setdefault("aws_glue_job", {})[b.key] = {
-        "name": bounded_ident(f"fluid-{b.ctx.product}-{b.build_id}", 255, "-"),
+        "name": names.glue_job_name(b.ctx.product, b.build_id),
         "description": f"The forge Spark build {b.build_id}",
         "role_arn": role_arn,
         "glue_version": b.cfg.get("glueVersion") or DEFAULT_GLUE_VERSION,
         "command": {
             "name": "gluestreaming" if streaming else "glueetl",
-            "script_location": b.object_uri(RUNNER_FILE),
+            "script_location": b.object_uri(b.runner_key),
             "python_version": "3",
         },
         "default_arguments": {
@@ -642,10 +796,12 @@ def _glue_job(blocks: SparkBlocks, b: _Build, mode: str, role_arn: Any) -> None:
 def _glue_connection(blocks: SparkBlocks, b: _Build, msk: aws_identity.MskSource) -> None:
     """A Glue ``NETWORK`` connection in one of the MSK cluster's subnets, with its
     security groups: what puts a Glue job's workers where the brokers are."""
+    _same_region(b, msk, "the Glue job's network connection")
     key = b.key
     cluster = _msk_cluster_data(blocks, key, msk)
     blocks.data.setdefault("aws_subnet", {})[key] = {
-        "id": tofu_ref(f"tolist({cluster}.broker_node_group_info[0].client_subnets)[0]")
+        "id": tofu_ref(f"tolist({cluster}.broker_node_group_info[0].client_subnets)[0]"),
+        "region": msk.region,
     }
     from . import aws as _aws  # imported here: aws imports this module
 
@@ -674,7 +830,7 @@ def _emit_log_key(blocks: SparkBlocks, ctx: _Ctx, tags: Mapping[str, str]) -> No
     user guide, *Encrypt log data using AWS KMS*)."""
     key = safe_ident(f"{ctx.cid}_spark_logs")
     # The key and its log groups live in the provider's region.
-    region_expr = _region(blocks, None)
+    region_expr = _provider_region(blocks)
     logs_arn = aws_identity._join(
         "arn:aws:logs:",
         region_expr,
@@ -727,6 +883,33 @@ def _emit_log_key(blocks: SparkBlocks, ctx: _Ctx, tags: Mapping[str, str]) -> No
         "deletion_window_in_days": 30,
         "policy": tofu_ref(f"data.aws_iam_policy_document.{key}_key.json"),
         "tags": dict(tags),
+    }
+
+
+def _emit_caller_policy(
+    blocks: SparkBlocks,
+    ctx: _Ctx,
+    runs: List[aws_identity.CallerRun],
+    tags: Mapping[str, str],
+) -> None:
+    """A managed policy that lets a scheduler start, watch and stop the product's runs.
+
+    A build that runs to completion is started by ``fluid spark run`` on the scheduler
+    (an MWAA worker, as the environment's execution role), which the platform owns: the
+    policy is the product's, for the platform to attach to that role.
+    """
+    key = safe_ident(f"{ctx.cid}_spark_caller")
+    blocks.data.setdefault("aws_iam_policy_document", {})[key] = aws_identity.caller_document(
+        runs, account=ctx.account, region=_provider_region(blocks)
+    )
+    blocks.resources.setdefault("aws_iam_policy", {})[key] = {
+        "name": names.caller_policy_name(ctx.product),
+        "description": (
+            f"Starts, watches and stops the forge Spark runs of {ctx.product}; attach it to "
+            "the scheduler's role (the MWAA execution role)"
+        ),
+        "policy": tofu_ref(f"data.aws_iam_policy_document.{key}.json"),
+        "tags": {**tags, names.PRODUCT_TAG: ctx.product},
     }
 
 

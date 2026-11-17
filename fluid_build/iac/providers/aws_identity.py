@@ -163,9 +163,6 @@ DEFAULT_SPARK_CONF: Tuple[str, ...] = (
 )
 
 _ROLE_ARN = re.compile(r"arn:aws[a-zA-Z0-9-]*:iam::[0-9]{12}:role/[A-Za-z0-9_+=,.@/-]{1,512}")
-#: A Secrets Manager secret ARN ends in ``-`` and six random characters. A partial ARN
-#: (the name only) matches its full ARN through ``-??????``.
-_FULL_SECRET_ARN = re.compile(r".*-[A-Za-z0-9]{6}")
 #: IAM's limit on a role name.
 ROLE_NAME_LIMIT = 64
 
@@ -254,6 +251,63 @@ def identity_findings(
     return errors, missing
 
 
+#: The runtime fields the IaC names, each with the 0.7.7 schema's own pattern: the emit
+#: checks them itself, as ``fluid generate iac`` does not run the schema first.
+_RUNTIME_FIELDS = {
+    "applicationId": re.compile(r"[0-9a-z]{1,64}"),
+    "clusterId": re.compile(r"j-[0-9A-Za-z]{1,254}"),
+    "virtualClusterId": re.compile(r"[0-9a-z]{1,64}"),
+    "glueVersion": re.compile(r"[0-9]+\.[0-9]+"),
+    "releaseLabel": re.compile(r"emr-[0-9]+\.[0-9]+\.[0-9]+"),
+}
+#: An MSK cluster ARN with the name and id the topic and group ARNs are built from.
+MSK_ARN = re.compile(
+    r"arn:aws[a-z-]*:kafka:(?P<region>[a-z0-9-]+):(?P<account>[0-9]{12}):cluster/"
+    r"(?P<name>[A-Za-z0-9_.-]{1,64})/(?P<uuid>[A-Za-z0-9-]{1,128})"
+)
+
+
+def runtime_errors(build: Mapping[str, Any]) -> List[str]:
+    """What keeps the IaC from naming the build's runtime: a field of the wrong shape, a
+    runtime without the cluster it needs, an MSK ARN without its cluster id, or a batch
+    build without an operator-scoped role.
+
+    A batch build runs its own SQL over catalog tables the contract does not list, so a
+    role forge derives could read none of them: it needs ``executionRoleArn``.
+    """
+    from fluid_build.spark.compiler import spark_parameters
+
+    bid = build.get("id")
+    try:
+        cfg = spark_parameters(build) or {}
+    except ValueError as exc:
+        return [str(exc)]
+    errors = []
+    for name, pattern in _RUNTIME_FIELDS.items():
+        value = cfg.get(name)
+        if value is not None and not (isinstance(value, str) and pattern.fullmatch(value)):
+            errors.append(f"Spark build {bid}: parameters.spark.{name}: expected {pattern.pattern}")
+    if cfg.get("runtime") == "emr-eks" and not cfg.get("virtualClusterId"):
+        errors.append(f"Spark build {bid}: runtime emr-eks needs parameters.spark.virtualClusterId")
+    source = cfg.get("source")
+    arn = source.get("mskClusterArn") if isinstance(source, Mapping) else None
+    if isinstance(arn, str) and not MSK_ARN.fullmatch(arn):
+        errors.append(
+            f"Spark build {bid}: parameters.spark.source.mskClusterArn: expected the full "
+            "cluster ARN, arn:aws:kafka:<region>:<account>:cluster/<name>/<uuid>"
+        )
+    props = build.get("properties")
+    stream = props.get("stream") if isinstance(props, Mapping) else None
+    batch = cfg.get("mode") == "batch" or (cfg.get("mode") is None and stream is None)
+    if batch and not cfg.get("executionRoleArn"):
+        errors.append(
+            f"Spark build {bid}: a batch job reads tables its SQL names, which forge cannot "
+            "grant a role it derives; set parameters.spark.executionRoleArn to a role the "
+            "operator scoped to those tables"
+        )
+    return errors
+
+
 def refuse_unless_identity_allowed(
     product_id: Any, build: Mapping[str, Any], environ: Optional[Mapping[str, str]] = None
 ) -> None:
@@ -297,8 +351,13 @@ def _spark_builds_or_empty(contract: Mapping[str, Any]) -> List[Mapping[str, Any
 
 
 def validation_errors(contract: Mapping[str, Any]) -> List[str]:
-    """What ``fluid validate`` refuses about the contract's Spark roles and settings."""
-    return [e for b in _spark_builds_or_empty(contract) for e in identity_findings(b)[0]]
+    """What ``fluid validate`` refuses about the contract's Spark roles, settings and
+    runtime fields."""
+    return [
+        e
+        for b in _spark_builds_or_empty(contract)
+        for e in [*identity_findings(b)[0], *runtime_errors(b)]
+    ]
 
 
 def validation_warnings(contract: Mapping[str, Any]) -> List[str]:
@@ -364,12 +423,17 @@ class JobAccess:
     table: str
     log_group_arn: Any
     msk: Optional[MskSource] = None
-    secret_arns: Tuple[str, ...] = ()
+    secret_arns: Tuple[Any, ...] = ()
+    #: The job's workers sit in a VPC through a Glue NETWORK connection.
+    glue_vpc: bool = False
 
 
-def secret_resource(arn: str) -> str:
-    """A secret ARN as a policy resource: a partial ARN matches its random suffix."""
-    return arn if _FULL_SECRET_ARN.fullmatch(arn) else f"{arn}-??????"
+def secret_resources(arn: Any) -> List[Any]:
+    """A secret as policy resources: as written, and with the random ``-??????`` suffix
+    Secrets Manager appends, since a name or partial ARN cannot be told from a full ARN
+    by its shape (``prod/mask-secret`` ends in six letters too). Keeps an account
+    interpolation an expression."""
+    return [arn, _join(arn, "-??????")]
 
 
 def _join(*parts: Any) -> Any:
@@ -513,7 +577,7 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
             ]
         )
     if access.secret_arns:
-        secrets = [secret_resource(a) for a in access.secret_arns]
+        secrets = [r for a in access.secret_arns for r in secret_resources(a)]
         statements.extend(
             [
                 {
@@ -563,6 +627,29 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
             },
         ]
     )
+    if access.glue_vpc:
+        statements.append(
+            {
+                # A Glue job in a VPC (its NETWORK connection) creates and removes its
+                # workers' network interfaces as its own role; EC2 offers no resource-level
+                # scope for the describe calls. The actions AWSGlueServiceRole grants for it.
+                "sid": "GlueVpc",
+                "effect": "Allow",
+                "actions": [
+                    "ec2:CreateNetworkInterface",
+                    "ec2:CreateTags",
+                    "ec2:DeleteNetworkInterface",
+                    "ec2:DescribeNetworkInterfaces",
+                    "ec2:DescribeRouteTables",
+                    "ec2:DescribeSecurityGroups",
+                    "ec2:DescribeSubnets",
+                    "ec2:DescribeVpcAttribute",
+                    "ec2:DescribeVpcEndpoints",
+                    "ec2:DescribeVpcs",
+                ],
+                "resources": ["*"],
+            }
+        )
     return {"statement": statements}
 
 
@@ -578,6 +665,9 @@ def trust_document(
 ) -> Dict[str, Any]:
     """The ``assume_role_policy`` document for ``runtime`` (not ``emr-ec2``: no role)."""
     if runtime == "emr-serverless":
+        app_arn = _join(
+            "arn:aws:emr-serverless:", region, ":", account, ":/applications/", application_id
+        )
         return {
             "statement": [
                 {
@@ -596,14 +686,8 @@ def trust_document(
                             "test": "ArnLike",
                             "variable": "aws:SourceArn",
                             "values": [
-                                _join(
-                                    "arn:aws:emr-serverless:",
-                                    region,
-                                    ":",
-                                    account,
-                                    ":/applications/",
-                                    application_id,
-                                )
+                                app_arn,
+                                _join(app_arn, "/*"),
                             ],
                         },
                     ],
@@ -661,3 +745,180 @@ def trust_document(
             ]
         }
     raise ValueError(f"no forge-owned role for runtime {runtime!r}")
+
+
+# --- the scheduler that starts the runs (fluid spark run on MWAA) ----------------------
+
+#: What starting, watching and stopping a run takes, per runtime: the actions the runs
+#: lane calls (``build_runners/spark/_adapters.py::CALLER_ACTIONS``; the Service
+#: Authorization Reference pages of EMR Serverless, EMR on EKS, Glue and EMR).
+CALLER_ACTIONS: Dict[str, Tuple[str, ...]] = {
+    "emr-serverless": (
+        "emr-serverless:CancelJobRun",
+        "emr-serverless:GetJobRun",
+        "emr-serverless:ListJobRuns",
+        "emr-serverless:StartJobRun",
+        "emr-serverless:TagResource",
+    ),
+    "glue": ("glue:BatchStopJobRun", "glue:GetJobRun", "glue:GetJobRuns", "glue:StartJobRun"),
+    "emr-ec2": (
+        "elasticmapreduce:AddJobFlowSteps",
+        "elasticmapreduce:CancelSteps",
+        "elasticmapreduce:DescribeStep",
+        "elasticmapreduce:ListSteps",
+    ),
+    "emr-eks": (
+        "emr-containers:CancelJobRun",
+        "emr-containers:DescribeJobRun",
+        "emr-containers:ListJobRuns",
+        "emr-containers:StartJobRun",
+        "emr-containers:TagResource",
+    ),
+}
+#: The service a run's role is passed to, where StartJobRun passes it.
+PASSED_TO = {
+    "emr-serverless": "emr-serverless.amazonaws.com",
+    "emr-eks": "emr-containers.amazonaws.com",
+}
+
+
+@dataclass(frozen=True)
+class CallerRun:
+    """One scheduled build, as the scheduler's policy names it."""
+
+    sid: str
+    runtime: str
+    target: Any  # the application id, Glue job name, cluster id or virtual cluster id
+    role_arn: Any
+    objects: Tuple[Any, ...]
+    #: An isolated EMR Serverless application is found by name: ListApplications.
+    lookup_application: bool = False
+
+
+def caller_document(runs: Sequence[CallerRun], *, account: Any, region: Any) -> Dict[str, Any]:
+    """The least-privilege ``aws_iam_policy_document`` of whatever starts the runs."""
+    statements: List[Dict[str, Any]] = []
+    for run in runs:
+        scope = (region, ":", account, ":")
+        if run.runtime == "emr-serverless":
+            base = _join("arn:aws:emr-serverless:", *scope, "/applications/", run.target)
+            targets = [base, _join(base, "/jobruns/*")]
+        elif run.runtime == "glue":
+            targets = [_join("arn:aws:glue:", *scope, "job/", run.target)]
+        elif run.runtime == "emr-ec2":
+            targets = [_join("arn:aws:elasticmapreduce:", *scope, "cluster/", run.target)]
+        else:
+            base = _join("arn:aws:emr-containers:", *scope, "/virtualclusters/", run.target)
+            targets = [base, _join(base, "/jobruns/*")]
+        statements.append(
+            {
+                "sid": f"Run{run.sid}",
+                "effect": "Allow",
+                "actions": list(CALLER_ACTIONS[run.runtime]),
+                "resources": targets,
+            }
+        )
+        if run.lookup_application:
+            statements.append(
+                {
+                    # No resource-level form: how a run finds an application by its name.
+                    "sid": f"FindApplication{run.sid}",
+                    "effect": "Allow",
+                    "actions": ["emr-serverless:ListApplications"],
+                    "resources": ["*"],
+                }
+            )
+        if run.runtime in PASSED_TO and run.role_arn is not None:
+            statements.append(
+                {
+                    "sid": f"PassRole{run.sid}",
+                    "effect": "Allow",
+                    "actions": ["iam:PassRole"],
+                    "resources": [run.role_arn],
+                    "condition": [
+                        {
+                            "test": "StringEquals",
+                            "variable": "iam:PassedToService",
+                            "values": [PASSED_TO[run.runtime]],
+                        }
+                    ],
+                }
+            )
+        statements.append(
+            {
+                "sid": f"Artifacts{run.sid}",
+                "effect": "Allow",
+                "actions": ["s3:GetObject"],
+                "resources": list(run.objects),
+            }
+        )
+    return {"statement": statements}
+
+
+# --- the Lake Formation registration role of a location a Spark job writes -------------
+
+
+def registration_trust(account: Any) -> Dict[str, Any]:
+    """Lake Formation assumes the role to vend credentials for the registered location."""
+    return {
+        "statement": [
+            {
+                "effect": "Allow",
+                "actions": ["sts:AssumeRole"],
+                "principals": [{"type": "Service", "identifiers": ["lakeformation.amazonaws.com"]}],
+                "condition": [
+                    {"test": "StringEquals", "variable": "aws:SourceAccount", "values": [account]}
+                ],
+            }
+        ]
+    }
+
+
+def registration_document(bucket: Any, prefix: Any, *, region: Any) -> Dict[str, Any]:
+    """Read and write on the registered prefix: what the credentials Lake Formation vends
+    to a writer (EMR 7.12 writes Iceberg with them) can do. The service-linked role has no
+    ``s3:PutObject``, so a write through Lake Formation needs a role like this one."""
+    bucket_arn = _join("arn:aws:s3:::", bucket)
+    objects = _join(bucket_arn, "/", prefix, "*")
+    return {
+        "statement": [
+            {
+                "sid": "ReadWrite",
+                "effect": "Allow",
+                "actions": [
+                    "s3:AbortMultipartUpload",
+                    "s3:DeleteObject",
+                    "s3:GetObject",
+                    "s3:PutObject",
+                ],
+                "resources": [objects],
+            },
+            {
+                "sid": "List",
+                "effect": "Allow",
+                "actions": ["s3:ListBucket"],
+                "resources": [bucket_arn],
+                "condition": [
+                    {"test": "StringLike", "variable": "s3:prefix", "values": [_join(prefix, "*")]}
+                ],
+            },
+            {
+                "sid": "S3Kms",
+                "effect": "Allow",
+                "actions": ["kms:Decrypt", "kms:GenerateDataKey"],
+                "resources": ["*"],
+                "condition": [
+                    {
+                        "test": "StringEquals",
+                        "variable": "kms:ViaService",
+                        "values": [_join("s3.", region, ".amazonaws.com")],
+                    },
+                    {
+                        "test": "StringLike",
+                        "variable": "kms:EncryptionContext:aws:s3:arn",
+                        "values": [bucket_arn, objects],
+                    },
+                ],
+            },
+        ]
+    }
