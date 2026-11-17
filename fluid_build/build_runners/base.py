@@ -387,6 +387,15 @@ def is_spark_job_build(build: Dict[str, Any]) -> bool:
     return isinstance(parameters, dict) and "spark" in parameters
 
 
+def _spark_job_runner(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str]]]:
+    """:func:`_batch_runner_for` of a Spark job: forge's Spark runner starts a run that ends
+    (batch, availableNow) and waits for it; any other stream is kept running by fluid
+    apply's spark.reconcile action, not a batch run."""
+    from fluid_build.spark.compiler import runs_to_completion
+
+    return ("spark builds", None) if runs_to_completion(build) else None
+
+
 def _spark_without_runner(build: Dict[str, Any]) -> bool:
     """True for an ``engine: spark`` build nothing here can run: no ``parameters.spark``
     for forge's Spark runner, and no platform of its own (``execution.runtime.platform``)."""
@@ -433,11 +442,7 @@ def _batch_runner_for(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str
     if is_externally_run_build(build):
         return None
     if is_spark_job_build(build):
-        # A run that ends (batch, availableNow) is started and waited for; any other stream
-        # is kept running by fluid apply's spark.reconcile action, not a batch run.
-        from fluid_build.spark.compiler import runs_to_completion
-
-        return ("spark builds", None) if runs_to_completion(build) else None
+        return _spark_job_runner(build)
     if is_acquisition_build(build):
         return None if name in STREAMING_ACQUISITION_ENGINES else (f"{name} builds", None)
     if is_embedded_sql_build(build):
@@ -1657,25 +1662,6 @@ def run_builds_from_args(
             total_external += 1
             continue
 
-        if is_spark_job_build(build):
-            # forge's Spark runner: one run of a scheduled build, waited for. A stream is
-            # kept running by this apply's spark.reconcile action, not run here.
-            spark_result = _execute_spark_build(contract, build, dry_run=args.dry_run)
-            if spark_result is None:
-                _report_spark_stream(build_id, report)
-                total_external += 1
-                continue
-            _report_build(
-                report, contract_path.parent, product_id, build_id, spark_result, runs_before
-            )
-            if spark_result == 0:
-                total_executed += 1
-            else:
-                total_failed += 1
-                if args.fail_fast:
-                    break
-            continue
-
         if _runs_outside_forge_continuously(build):
             _report_continuous_outside_forge(build, build_id, report)
             total_external += 1
@@ -1703,7 +1689,17 @@ def run_builds_from_args(
                     break
             continue
 
-        if is_embedded_sql_build(build):
+        if is_spark_job_build(build):
+            # forge's Spark runner, ahead of inline SQL (a Spark job's SQL is Spark's): one
+            # run of a scheduled build, waited for. A stream is kept running by this apply's
+            # spark.reconcile action, not run here.
+            spark_result = _execute_spark_build(contract, build, dry_run=args.dry_run)
+            if spark_result is None:
+                _report_spark_stream(build_id, report)
+                total_external += 1
+                continue
+            result = spark_result
+        elif is_embedded_sql_build(build):
             # An inline-SQL build that ALSO declares a dbt(-adapter) engine
             # still runs via the local DuckDB engine below — NOT dbt. Surface
             # that explicitly so ``engine: dbt`` is never silently ignored.
