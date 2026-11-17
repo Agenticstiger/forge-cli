@@ -10,26 +10,36 @@ TRUE. Where there is no exact CEL form, :func:`render_cel` raises
 
 Where the text runs. Confluent's ``CelExecutor`` (data-contract rules,
 ``io.confluent.kafka.schemaregistry.rules.cel``) binds the record to the variable
-``message`` (an Avro record is a map; a NULL Avro field reads as CEL ``null``). A
-``CONDITION`` rule passes only when its expression is TRUE, and an evaluation error
-raises a ``RuleException``: the record fails. The executor treats the text before the
-FIRST ``;`` of an expression as a guard, so the expression emitted here contains no
-``;`` at all, not even inside a string literal (a check whose literal holds one is
-refused).
+``message``. ``CelUtils.toCelValue`` (schema-registry ``schema-rules``,
+``CelUtils.java``) converts it: an Avro record becomes a Map, ``Utf8`` / ``CharSequence``
+a String, ``Integer`` / ``Short`` / ``Byte`` a long, ``Float`` a double, and a null a CEL
+``NullValue``. A ``CONDITION`` rule passes only when its expression is TRUE, and an
+evaluation error raises a ``RuleException``: the record fails. The executor treats the
+text before the FIRST ``;`` of an expression as a guard, so the expression emitted here
+contains no ``;`` at all, not even inside a string literal (a check whose literal holds
+one is refused).
+
+The engine is Google's cel-java, which type-checks, so the text never mixes types and
+never writes the ``null`` literal: every value is a pair, a presence predicate and a
+value expression that is only read where the presence predicate holds. Where a branch
+has no value (a ``CASE`` with no ``ELSE``, a NULL literal) the value is a placeholder of
+the branch's own type (``0``, ``0.0``, ``""``, ``false``) that its presence predicate
+makes unreachable. Every compound sub-expression is parenthesised wherever it is an
+operand: CEL's relational operators are left-associative, so ``a > 0 == b > 1`` would
+read ``((a > 0) == b) > 1``.
 
 FLUID SQL/1's own semantics, not SQL's three-valued logic. FLUID SQL/1 is two-valued
 (§2.5): a comparison with a NULL operand is FALSE and ``NOT`` flips it, so
 ``NOT (x = 1)`` is TRUE when ``x`` is NULL. :func:`~fluid_build.fluid_sql.evaluate` is
 the authority, and the rendering agrees with it on every row: each predicate form is a
 CEL boolean that is TRUE or FALSE and never null, so ``!``, ``&&`` and ``||`` only ever
-see the two values. A value that may be NULL (a nullable column, a ``CASE`` with no
-``ELSE``, ``a + b``) is tested before it is used; CEL's ``&&`` and ``||`` absorb an
-error when the other side decides the result (CEL spec, language definition, "Logical
-Operators" and "Errors"), so ``type(x) != null_type && x > 1`` is FALSE for a null
-``x``. The null test is ``type(x) == null_type`` and never ``x == null``: cel-python
-0.5.0 has no heterogeneous equality (``x != null`` raises for an int ``x``), and the
-type test is standard CEL that cel-go and cel-java run too. A column the contract
-declares ``required`` is never null in its Avro record, so it gets no null test.
+see the two values. A value is read only after its presence test, and CEL's ``&&`` and
+``||`` absorb an error when the other side decides the result (CEL spec, language
+definition, "Logical Operators" and "Errors"). The null test of a column is
+``type(x) == null_type`` and never ``x == null``: cel-python 0.5.0 has no heterogeneous
+equality (``x != null`` raises for an int ``x``), and the type test is standard CEL that
+cel-go and cel-java run too. A column the contract declares ``required`` is never null
+in its Avro record, so it gets no null test.
 
 Exact where the two agree, refused where they do not:
 
@@ -41,19 +51,23 @@ Exact where the two agree, refused where they do not:
   mixed comparison here, and ``double(x)`` rounds above 2^53 where FLUID compares exactly);
 - ``/``, arithmetic on a double column, ``ROUND``, the date differences and ``DATE``
   literals are refused (``Checked.division``, ``Checked.float_arithmetic``);
-- a name through a relationship is refused: a record holds one row.
+- a name through a relationship is refused: a record holds one row;
+- a text longer than :data:`MAX_CEL_CHARS` is refused, and the limit is enforced while the
+  text is built, so a deeply nested check costs a bounded amount of work.
 
-The one known divergence: FLUID SQL/1 integers are unbounded and CEL ``int`` is 64-bit,
-so a ``+``, ``-`` or ``*`` that overflows raises in CEL. The record then FAILS the rule
-(an error is a failure, never a pass), so an overflowing row is refused, never wrongly
-accepted.
+Integer arithmetic stays, with one known consequence: FLUID SQL/1 integers are unbounded
+and CEL ``int`` is 64-bit, and CEL raises on an overflow of ANY intermediate result. A
+valid row whose intermediate ``+``, ``-`` or ``*`` result overflows int64 is therefore
+refused by the rule, though FLUID SQL/1 evaluates it. That fails safe: an error fails the
+record, so such a row is never wrongly accepted.
 
 Borrowed: the CEL language definition (github.com/google/cel-spec, ``doc/langdef.md``:
 logical operators and errors, ``null_type``); Confluent's data-contract rules
-documentation and ``CelExecutor`` for the ``message`` binding and the ``;`` guard split;
-:mod:`fluid_build.fluid_sql._render` for the shape of a renderer. The differential proof
-is ``tests/fluid_sql/test_render_cel.py``: cel-python evaluates the rendering against
-:func:`~fluid_build.fluid_sql.evaluate` on generated rows (a test-only dependency).
+documentation, ``CelExecutor`` and ``CelUtils.java`` for the ``message`` binding, the value
+conversion and the ``;`` guard split; :mod:`fluid_build.fluid_sql._render` for the shape of
+a renderer. The differential proof is ``tests/fluid_sql/test_render_cel.py``: cel-python
+evaluates the rendering against :func:`~fluid_build.fluid_sql.evaluate` on generated rows
+(a test-only dependency).
 """
 
 from __future__ import annotations
@@ -66,8 +80,8 @@ from . import _nodes as n
 from ._checker import PREDICATE, check
 from ._types import BOOL, NUMBER, STRING, Model
 
-#: The largest text emitted: a value tested for NULL is written twice, so nested
-#: ``CASE`` expressions grow quickly, and a rule that large is no rule to keep.
+#: The largest text emitted. A value is written into its presence test and its use, so
+#: nested ``CASE`` and ``COALESCE`` grow fast; the limit is checked on every piece built.
 MAX_CEL_CHARS = 8000
 
 _INT64_MAX = 2**63 - 1
@@ -80,6 +94,8 @@ _CEL_RESERVED = frozenset(
 )
 _PREDICATES = (n.Compare, n.In, n.Between, n.IsNull, n.DistinctFrom, n.Not, n.And, n.Or)
 _OPERATORS = {"=": "==", "<>": "!=", "<": "<", "<=": "<=", ">": ">", ">=": ">="}
+_BLANK = {"int": "0", "double": "0.0", "string": '""', "bool": "false"}
+_ABSENT_TEST = re.compile(r"\(type\((.*)\) != null_type\)\Z")
 
 
 class CelUntranslatable(ValueError):
@@ -90,17 +106,26 @@ class CelUntranslatable(ValueError):
         self.reason = reason
 
 
+def _cap(text: str) -> str:
+    if len(text) > MAX_CEL_CHARS:
+        raise CelUntranslatable(
+            f"its CEL text is longer than {MAX_CEL_CHARS:,} characters: split the check"
+        )
+    return text
+
+
 @dataclass(frozen=True)
 class _V:
-    """A rendered value: its CEL text, whether it may be null, and its class
-    (``int``, ``double``, ``string``, ``bool``, or ``null`` for the NULL literal)."""
+    """A rendered value: ``pres``, CEL that is TRUE when it has a value (not NULL), and
+    ``val``, the CEL of the value itself, read only where ``pres`` holds. Both are atoms
+    (a literal, a name, a call or a parenthesised expression)."""
 
-    expr: str
-    nullable: bool
-    cls: str
+    pres: str
+    val: str
 
-
-_NULL = _V("null", True, "null")
+    def __post_init__(self) -> None:
+        _cap(self.pres)
+        _cap(self.val)
 
 
 def render_cel(node: n.Node, model: Model, *, record: str = "message") -> str:
@@ -125,15 +150,7 @@ def render_cel(node: n.Node, model: Model, *, record: str = "message") -> str:
             "binary in CEL"
         )
     out = _Cel(model, record).predicate(node)
-    if ";" in out:  # every ';' source is refused where it is written; never emit one
-        raise CelUntranslatable(
-            "its CEL text holds a ';', which Confluent reads as the end of a guard"
-        )
-    if len(out) > MAX_CEL_CHARS:
-        raise CelUntranslatable(
-            f"its CEL text is {len(out):,} characters long (at most {MAX_CEL_CHARS:,}): "
-            "split the check"
-        )
+    assert ";" not in out, "every ';' source is refused where it is written"
     return out
 
 
@@ -146,7 +163,7 @@ def _and(*parts: str) -> str:
         return "false"
     if not kept:
         return "true"
-    return kept[0] if len(kept) == 1 else "(" + " && ".join(kept) + ")"
+    return kept[0] if len(kept) == 1 else _cap("(" + " && ".join(kept) + ")")
 
 
 def _or(*parts: str) -> str:
@@ -155,7 +172,7 @@ def _or(*parts: str) -> str:
         return "true"
     if not kept:
         return "false"
-    return kept[0] if len(kept) == 1 else "(" + " || ".join(kept) + ")"
+    return kept[0] if len(kept) == 1 else _cap("(" + " || ".join(kept) + ")")
 
 
 def _not(part: str) -> str:
@@ -163,21 +180,18 @@ def _not(part: str) -> str:
         return "false"
     if part == "false":
         return "true"
-    return f"!({part})"
+    swapped = _ABSENT_TEST.match(part)
+    if swapped and swapped.group(1).count("(") == swapped.group(1).count(")"):
+        return f"(type({swapped.group(1)}) == null_type)"
+    return _cap(f"!{part}" if part.startswith("(") else f"!({part})")
 
 
-def _present(value: _V) -> str:
-    """CEL that is TRUE when ``value`` is not null."""
-    if value.cls == "null":
-        return "false"
-    return f"type({value.expr}) != null_type" if value.nullable else "true"
-
-
-def _absent(value: _V) -> str:
-    """CEL that is TRUE when ``value`` is null."""
-    if value.cls == "null":
-        return "true"
-    return f"type({value.expr}) == null_type" if value.nullable else "false"
+def _ternary(condition: str, then: str, otherwise: str) -> str:
+    if condition == "true" or then == otherwise:
+        return then
+    if condition == "false":
+        return otherwise
+    return _cap(f"({condition} ? {then} : {otherwise})")
 
 
 def _string(text: str) -> str:
@@ -202,7 +216,7 @@ def _string(text: str) -> str:
             out.append(f"\\u{ord(ch):04x}")
         else:
             out.append(ch)
-    return '"' + "".join(out) + '"'
+    return _cap('"' + "".join(out) + '"')
 
 
 class _Cel:
@@ -298,14 +312,14 @@ class _Cel:
         return found.pop() if found else "lit"
 
     def want(self, *nodes: n.Node) -> Optional[str]:
-        """The class an integer literal among ``nodes`` takes: ``double`` beside a double."""
+        """The class the literals among ``nodes`` take: that of the typed operand beside them."""
         found = {c for c in (self.cls(node) for node in nodes) if c != "lit"}
         if {"int", "double"} <= found:
             raise CelUntranslatable(
                 "it compares an integer-typed value with a double-typed one, which CEL does "
                 "not do exactly"
             )
-        return "double" if "double" in found else None
+        return found.pop() if found else None
 
     def integer(self, node: n.Number) -> int:
         if "." in node.text:
@@ -337,9 +351,9 @@ class _Cel:
         if isinstance(node, n.In):
             want = self.want(node.left, *node.items)
             left = self.value(node.left, want)
-            items = ", ".join(self.value(item, want).expr for item in node.items)
-            found = f"{left.expr} in [{items}]"
-            return _and(_present(left), _not(found) if node.negated else found)
+            items = ", ".join(self.value(item, want).val for item in node.items)
+            found = _cap(f"({left.val} in [{items}])")
+            return _and(left.pres, _not(found) if node.negated else found)
         if isinstance(node, n.Between):
             want = self.want(node.left, node.low, node.high)
             x = self.value(node.left, want)
@@ -348,27 +362,27 @@ class _Cel:
                 return _or(self.compare("<", x, low), self.compare(">", x, high))
             return _and(self.compare(">=", x, low), self.compare("<=", x, high))
         if isinstance(node, n.IsNull):
-            operand = self.value(node.operand, None)
-            return _present(operand) if node.negated else _absent(operand)
+            operand = self.value(node.operand, self.want(node.operand))
+            return operand.pres if node.negated else _not(operand.pres)
         if isinstance(node, n.DistinctFrom):
             want = self.want(node.left, node.right)
             left, right = self.value(node.left, want), self.value(node.right, want)
             same = _or(
-                _and(_absent(left), _absent(right)),
-                _and(_present(left), _present(right), f"{left.expr} == {right.expr}"),
+                _and(_not(left.pres), _not(right.pres)),
+                _and(left.pres, right.pres, _cap(f"({left.val} == {right.val})")),
             )
             return same if node.negated else _not(same)
-        value = self.value(node, None)  # a bool column, a bool CASE or COALESCE
-        return _and(_present(value), value.expr)
+        value = self.value(node, "bool")  # a bool column, a bool CASE or COALESCE
+        return _and(value.pres, value.val)
 
     def compare(self, op: str, left: _V, right: _V) -> str:
-        return _and(_present(left), _present(right), f"{left.expr} {_OPERATORS[op]} {right.expr}")
+        return _and(left.pres, right.pres, _cap(f"({left.val} {_OPERATORS[op]} {right.val})"))
 
     # -- values ------------------------------------------------------------------
 
     def value(self, node: n.Node, want: Optional[str]) -> _V:  # noqa: C901 - one per construct
         if isinstance(node, _PREDICATES):
-            return _V(self.predicate(node), False, "bool")
+            return _V("true", self.predicate(node))
         if isinstance(node, n.Number):
             number = self.integer(node)
             if want == "double":
@@ -377,35 +391,27 @@ class _Cel:
                         f"the number {node.text} is not exactly a CEL double (beyond 2^53)"
                     )
                 text = f"{number}.0"
-                return _V(f"({text})" if number < 0 else text, False, "double")
-            return _V(f"({number})" if number < 0 else str(number), False, "int")
+            else:
+                text = str(number)
+            return _V("true", f"({text})" if number < 0 else text)
         if isinstance(node, n.String):
-            return _V(_string(node.value), False, "string")
+            return _V("true", _string(node.value))
         if isinstance(node, n.Bool):
-            return _V("true" if node.value else "false", False, "bool")
+            return _V("true", "true" if node.value else "false")
         if isinstance(node, n.Null):
-            return _NULL
+            return _V("false", _BLANK.get(want or "int", "0"))
         if isinstance(node, n.Column):
-            cls = self.column_class(node)
+            self.column_class(node)
             column = self.model.columns[node.name]
-            return _V(self.column(node.name), not column.required, cls)
+            name = self.column(node.name)
+            return _V("true" if column.required else f"(type({name}) != null_type)", name)
         if isinstance(node, n.Neg):
             operand = self.value(node.operand, want)
-            if operand.cls == "null":
-                return _NULL
-            if not operand.nullable:
-                return _V(f"(-{operand.expr})", False, operand.cls)
-            return _V(f"({_present(operand)} ? -{operand.expr} : null)", True, operand.cls)
+            return _V(operand.pres, _cap(f"(-{operand.val})"))
         if isinstance(node, n.Arith):
             self.cls(node)  # refuses a division and a double operand
             left, right = self.value(node.left, "int"), self.value(node.right, "int")
-            expr = f"({left.expr} {node.op} {right.expr})"
-            guard = _and(_present(left), _present(right))
-            if guard == "true":
-                return _V(expr, False, "int")
-            if guard == "false":
-                return _NULL
-            return _V(f"({guard} ? {expr} : null)", True, "int")
+            return _V(_and(left.pres, right.pres), _cap(f"({left.val} {node.op} {right.val})"))
         if isinstance(node, n.Case):
             return self.case(node, want)
         if isinstance(node, n.Coalesce):
@@ -413,35 +419,36 @@ class _Cel:
         self.cls(node)  # Round, DateDiff, Date: refused with the reason
         raise TypeError(f"not a FLUID SQL/1 node: {node!r}")  # pragma: no cover
 
+    def branch_class(self, nodes: List[n.Node], outer: Optional[str]) -> str:
+        merged = self.merge(nodes)
+        return merged if merged != "lit" else (outer or "int")
+
     def case(self, node: n.Case, outer: Optional[str]) -> _V:
         values = [then for _when, then in node.whens]
         if node.else_ is not None:
             values.append(node.else_)
-        want = "double" if self.merge(values) == "double" else outer
-        tail = _NULL if node.else_ is None else self.value(node.else_, want)
+        want = self.branch_class(values, outer)
+        tail = _V("false", _BLANK[want]) if node.else_ is None else self.value(node.else_, want)
         for when, then in reversed(node.whens):
             condition = self.predicate(when)
             branch = self.value(then, want)
-            cls = branch.cls if branch.cls != "null" else tail.cls
-            nullable = branch.nullable or tail.nullable
-            if condition == "true":
-                tail = branch
-            elif condition != "false":
-                tail = _V(f"({condition} ? {branch.expr} : {tail.expr})", nullable, cls)
+            tail = _V(
+                _ternary(condition, branch.pres, tail.pres),
+                _ternary(condition, branch.val, tail.val),
+            )
         return tail
 
     def coalesce(self, node: n.Coalesce, outer: Optional[str]) -> _V:
-        want = "double" if self.merge(list(node.args)) == "double" else outer
-        args = [v for v in (self.value(arg, want) for arg in node.args) if v.cls != "null"]
+        want = self.branch_class(list(node.args), outer)
+        args = [
+            v for arg in node.args if not isinstance(arg, n.Null) for v in [self.value(arg, want)]
+        ]
         if not args:
-            return _NULL
-        tail = args[-1]
+            return _V("false", _BLANK[want])
+        tail = args[-1].val
         for arg in reversed(args[:-1]):
-            if not arg.nullable:
-                tail = arg  # nothing after it is ever reached
-            else:
-                tail = _V(f"({_present(arg)} ? {arg.expr} : {tail.expr})", tail.nullable, tail.cls)
-        return tail
+            tail = _ternary(arg.pres, arg.val, tail)
+        return _V(_or(*(a.pres for a in args)), tail)
 
     def column(self, name: str) -> str:
         if _IDENT.match(name) and name not in _CEL_RESERVED:

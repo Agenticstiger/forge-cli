@@ -67,12 +67,12 @@ def test_each_invariant_kind():
         "kind": "CONDITION",
         "type": "CEL",
         "mode": "WRITE",
-        "expr": "(type(message.amount) != null_type && message.amount > 0)",
+        "expr": "((type(message.amount) != null_type) && (message.amount > 0))",
         "on_failure": "ERROR",
     }
     assert "doc" not in rules[1]
     assert rules[1]["expr"] == (
-        '(!(message.status == "PAID") || type(message.amount) != null_type)'
+        '(!(message.status == "PAID") || (type(message.amount) != null_type))'
     )
     text = "\n".join(warnings)
     where = "exposes[0].binding.properties.registry"

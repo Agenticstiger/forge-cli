@@ -118,7 +118,7 @@ def confluent_rules(
                 if isinstance(inv.get("when"), str):
                     when = fs.render_cel(fs.parse(inv["when"]), expose.model)
                     cel = (
-                        f"(!({when}) || {cel})"
+                        f"(!{when} || {cel})"
                         if when not in ("true", "false")
                         else (cel if when == "true" else "true")
                     )
