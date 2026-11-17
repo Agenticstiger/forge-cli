@@ -68,6 +68,13 @@ def _writer(sv: Any) -> Tuple[List[Dict[str, Any]], str, Dict[str, str], Dict[st
     return writer_columns(parse_schema(sv.schema), sv.data_format)
 
 
+def _read_version(client: Any, ref: Any) -> Any:
+    """``ref``'s subject version, read with the client of its kind."""
+    if ref.kind == "confluent":
+        return client.get_version(ref.subject, ref.version)
+    return client.get_version(ref.glue_registry, ref.subject, ref.version)
+
+
 def _check(
     subject: Subject,
     *,
@@ -90,12 +97,11 @@ def _check(
         "requested": ref.version,
     }
     at = f"{ref.where} ({ref.label})"
+    # One client per kind: a Confluent read takes (subject, version), a Glue read
+    # (registry, schema name, version).
     client = confluent(ref.url) if ref.kind == "confluent" else glue()
     try:
-        if ref.kind == "confluent":
-            sv = client.get_version(ref.subject, ref.version)
-        else:
-            sv = client.get_version(ref.glue_registry, ref.subject, ref.version)
+        sv = _read_version(client, ref)
         record["version"] = sv.version
         if sv.schema_id is not None:
             record["schemaId"] = sv.schema_id
@@ -123,8 +129,10 @@ def _check(
             )
             try:
                 record["mode"] = client.compatibility_level(ref.subject)
-            except RegistryError:
-                pass
+            except RegistryError as exc:
+                # The mode is context only: without it the registry's verdict is not
+                # decisive (see _READER_MODES) and forge's comparison decides.
+                LOG.debug("schema_registry_mode_unreadable subject=%s: %s", ref.subject, exc)
             ok, messages = client.check_compatibility(
                 ref.subject, sv.version, schema_text(reader), expected
             )

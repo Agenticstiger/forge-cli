@@ -502,7 +502,7 @@ class TestAttach:
         assert any("verified at apply" in m for m in seen)
 
     def test_glue_record_attached(self):
-        result = self.attach({}, glue_contract(), glue=lambda: FakeGlue())
+        result = self.attach({}, glue_contract(), glue=FakeGlue)
         assert result["schemaRegistry"]["checked"][0]["kind"] == "glue"
 
     def test_plan_stays_json_serialisable(self):

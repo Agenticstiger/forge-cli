@@ -129,7 +129,7 @@ class ConfluentRegistry:
                 code = body.get("error_code", code)
                 message = str(body.get("message", message))
             except (ValueError, AttributeError):
-                pass
+                pass  # no JSON error body: the status and raw text above stand
             raise RegistryError(
                 f"HTTP {response.status_code} ({code}): {message[:_MESSAGE_LIMIT]}", code=code
             )
