@@ -385,4 +385,12 @@ def _emit_subjects(resources: Dict[str, Any], contract: Mapping[str, Any], cid: 
         metadata = classification_metadata(contract, expose, f"fluid.{cid}")
         if metadata:
             schema["metadata"] = metadata
+        if ref.options.get("rules") is True:
+            from ...schema_registry.rules import confluent_rules
+
+            rules, rule_errors, _warnings = confluent_rules(contract, subject)
+            if rule_errors:
+                raise UnsupportedBindingError("schema-registry-rules", rule_errors[0])
+            if rules:
+                schema["ruleset"] = {"domain_rules": rules}
         resources.setdefault("confluent_schema", {})[name] = schema

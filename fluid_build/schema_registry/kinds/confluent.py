@@ -79,7 +79,7 @@ class ConfluentKind(RegistryKind):
     default_compatibility = "BACKWARD_TRANSITIVE"
     registering_cloud = "confluent"
     bind_hint = "bind the topic with platform: confluent and format: kafka_topic"
-    fields = frozenset({"url", "auth"})
+    fields = frozenset({"url", "auth", "rules"})
     refuses = frozenset({"registryName"})
     # policy.TOFU_REGISTRY_SECRET_ENV (spelled here: kinds/ cannot import policy at module
     # level); tests/schema_registry/test_egress_floor.py pins that the two agree.
@@ -96,6 +96,8 @@ class ConfluentKind(RegistryKind):
             )
         if "registryName" in spec:
             errors.append(f"{where}.registryName is for kind: glue; a Confluent registry has a url")
+        if "rules" in spec and not isinstance(spec["rules"], bool):
+            errors.append(f"{where}.rules: expected true or false")
         return errors
 
     def location(self, ref: Any) -> Optional[str]:
