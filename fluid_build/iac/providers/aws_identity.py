@@ -407,11 +407,42 @@ def validation_errors(contract: Mapping[str, Any]) -> List[str]:
 
 def validation_warnings(contract: Mapping[str, Any]) -> List[str]:
     """The operator entries the contract's Spark builds still need (#818: warn here)."""
-    return [
+    warnings = [
         f"{m}; the IaC is refused at generate and apply until the operator lists it"
         for b in _spark_builds_or_empty(contract)
         for m in identity_findings(b)[1]
     ]
+    return warnings + _glue_jar_warnings(contract)
+
+
+def _glue_jar_warnings(contract: Mapping[str, Any]) -> List[str]:
+    """A Glue build that needs pinned jars while the operator names no jar prefix."""
+    from fluid_build.spark.compiler import compile_job_config, spark_parameters
+
+    from . import aws_glue_jars
+
+    out = []
+    for build in _spark_builds_or_empty(contract):
+        if (spark_parameters(build) or {}).get("runtime") != "glue":
+            continue
+        try:
+            config = compile_job_config(
+                contract,
+                build,
+                account_ref="000000000000",
+                contract_sql_gate=False,
+                host_gate=False,
+            ).config
+            unset = aws_glue_jars.needed_jars(config) and aws_glue_jars.jars_location() is None
+        except Exception:  # noqa: BLE001 - the Spark compiler's validation reports it
+            continue
+        if unset:
+            out.append(
+                f"Spark build {build.get('id')}: Confluent Avro on Glue needs the pinned "
+                f"jars, and {aws_glue_jars.JARS_URL_ENV} names no prefix; the IaC is refused "
+                "at generate and apply until the operator sets it"
+            )
+    return out
 
 
 # --- the role and its policy -------------------------------------------------
@@ -474,6 +505,8 @@ class JobAccess:
     #: That connection's subnet ARN: the only subnet whose interfaces the role may tag
     #: and delete.
     glue_subnet_arn: Any = None
+    #: Exact objects the job reads besides its own prefixes (Glue's pinned jars).
+    objects: Tuple[Any, ...] = ()
 
 
 def secret_resources(arn: Any) -> List[Any]:
@@ -557,6 +590,17 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
         # With an S3 Bucket Key the encryption context is the bucket's ARN; without one
         # it is the object's.
         object_arns.extend([bucket_arn, *(_join(bucket_arn, "/", p, "*") for p in prefixes)])
+    if access.objects:
+        statements.append(
+            {
+                "sid": "ReadJars",
+                "effect": "Allow",
+                "actions": ["s3:GetObject"],
+                "resources": list(access.objects),
+            }
+        )
+        object_arns.extend(dict.fromkeys(str(a).split("/", 1)[0] for a in access.objects))
+        object_arns.extend(access.objects)
     statements.append(
         {
             "sid": "S3Kms",

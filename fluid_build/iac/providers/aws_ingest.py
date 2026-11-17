@@ -52,7 +52,7 @@ from ...spark import names
 from ..base import UnsupportedBindingError
 from ..naming import TofuExpr, bounded_ident, safe_ident, tofu_ref
 from ..packaging import ContainerDecision, resolve_packaging
-from . import aws_identity
+from . import aws_glue_jars, aws_identity
 
 #: The data source every account reference reads (shared with :mod:`aws`).
 CALLER = "data.aws_caller_identity.fluid_lf_caller.account_id"
@@ -423,6 +423,7 @@ def _emit_build(
         )
     database, table = config["sink"]["table"].split(".", 1)
     vpc = b.runtime == "glue" and cluster is not None
+    jars = _glue_jars(blocks, b) if b.runtime == "glue" else ()
     access = aws_identity.JobAccess(
         region=b.region,
         account=ctx.account,
@@ -434,6 +435,7 @@ def _emit_build(
         secret_arns=_secret_arns(config, b.region, ctx),
         glue_vpc=vpc,
         glue_subnet_arn=tofu_ref(f"data.aws_subnet.{b.key}.arn") if vpc else None,
+        objects=tuple(arn for arn, _, _ in jars),
     )
     role_arn = _emit_role(blocks, b, access, application_id)
     overwrites = job.config["mode"] == "batch"
@@ -447,6 +449,13 @@ def _emit_build(
         args["--config"] = b.object_uri(names.job_config_key(ctx.product, bid))
         args["--continuous-log-logGroup"] = log_name
         args["--TempDir"] = b.object_uri(b.artifacts + "tmp/")
+        if jars:
+            args["--extra-jars"] = ",".join(uri for _, uri, _ in jars)
+            # Glue 5's Hudi bundle carries its own Confluent client classes.
+            args["--user-jars-first"] = "true"
+            blocks.resources["aws_glue_job"][b.key]["lifecycle"] = {
+                "precondition": [check for _, _, check in jars]
+            }
         if vpc:
             _glue_connection(blocks, b, cluster)
         target = tofu_ref(f"aws_glue_job.{b.key}.name")
@@ -468,6 +477,57 @@ def _emit_build(
         ),
         lookup_application=b.runtime == "emr-serverless" and not b.cfg.get("applicationId"),
     )
+
+
+def _glue_jars(blocks: SparkBlocks, b: _Build) -> Tuple[Tuple[str, str, Dict[str, Any]], ...]:
+    """The pinned jars a Glue build adds (:mod:`aws_glue_jars`): each read with its S3
+    checksum, as ``(object ARN, s3 URI, the Glue job's precondition on its sha256)``."""
+    needed = aws_glue_jars.needed_jars(b.config)
+    if not needed:
+        return ()
+    try:
+        location = aws_glue_jars.jars_location()
+    except ValueError as exc:
+        raise UnsupportedBindingError("spark-glue-jars-url", f"{b.where}: {exc}.", ()) from exc
+    if location is None:
+        raise UnsupportedBindingError(
+            "spark-glue-jars-unset",
+            f"{b.where} decodes Confluent Avro on Glue, which ships no ABRiS: the job loads "
+            f"the pinned jars from the platform's prefix, and {aws_glue_jars.JARS_URL_ENV} "
+            "names none.",
+            (
+                f"Have the operator set {aws_glue_jars.JARS_URL_ENV}=s3://<bucket>/<prefix>/ "
+                "and upload the pinned jars there, each single-part with "
+                "--checksum-algorithm SHA256 (aws_glue_jars.AVRO_JARS lists them).",
+                "Or run the build on emr-serverless, which resolves its jars from Maven.",
+            ),
+        )
+    out = []
+    objects = blocks.data.setdefault("aws_s3_object", {})
+    for index, jar in enumerate(needed):
+        name = f"{b.key}_jar_{index}"
+        objects[name] = {
+            "bucket": location.bucket,
+            "key": location.key(jar),
+            "checksum_mode": "ENABLED",
+        }
+        out.append(
+            (
+                f"arn:aws:s3:::{location.bucket}/{location.key(jar)}",
+                f"s3://{location.bucket}/{location.key(jar)}",
+                {
+                    "condition": TofuExpr(
+                        f'${{data.aws_s3_object.{name}.checksum_sha256 == "{jar.sha256_b64}"}}'
+                    ),
+                    "error_message": (
+                        f"s3://{location.bucket}/{location.key(jar)} is not the pinned "
+                        f"{jar.coordinate} (sha256 {jar.sha256}), or was uploaded without "
+                        "a single-part SHA-256 checksum."
+                    ),
+                },
+            )
+        )
+    return tuple(out)
 
 
 def _job_content(
