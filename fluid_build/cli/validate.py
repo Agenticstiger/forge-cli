@@ -1051,6 +1051,18 @@ def _run_contract_rules(
             _spark.validation_warnings(contract),
             anchor="builds",
         )
+        # Their execution role and sparkConf under the operator's allowlists: a missing
+        # entry warns here and is refused when the IaC is generated or applied (#818).
+        from fluid_build.iac.providers import aws_identity as _spark_identity
+
+        _add_findings(
+            validation_result,
+            contract,
+            "contract_spark_identity",
+            _spark_identity.validation_errors(contract),
+            _spark_identity.validation_warnings(contract),
+            anchor="builds",
+        )
 
         # --- Iceberg streaming-sink checks (RFC-streaming-extension §6.8) --
         # Catch the connector's silent-fail-at-first-record traps at validate

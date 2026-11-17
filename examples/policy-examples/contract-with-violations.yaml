@@ -9,8 +9,6 @@ description: "Demonstrates various policy violations"
 metadata:
   owner:
     team: data-engineering
-    email: data-eng@company.com
-
 # Missing schema evolution policy
 
 exposes:

@@ -18,7 +18,6 @@ metadata:
   productType: SDP
   owner:
     team: data-platform
-    email: data-platform@co.example
   classification: confidential
   experimental: [acquisition]
 

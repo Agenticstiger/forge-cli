@@ -90,6 +90,18 @@ class TestConvertScheduleToAirflow:
     def test_passthrough_cron(self):
         assert convert_schedule_to_airflow("0 12 * * 1-5") == "0 12 * * 1-5"
 
+    @pytest.mark.parametrize(
+        "word,expected",
+        [
+            ("hourly", "@hourly"),
+            ("Weekly", "@weekly"),
+            ("monthly", "@monthly"),
+            ("annually", "@yearly"),
+        ],
+    )
+    def test_bare_words_are_the_keywords(self, word, expected):
+        assert convert_schedule_to_airflow(word) == expected
+
     def test_default(self):
         assert convert_schedule_to_airflow("garbage") == "@daily"
 

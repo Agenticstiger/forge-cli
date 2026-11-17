@@ -88,12 +88,43 @@ _CONF_DENIED = frozenset(
         "spark.plugins",
         # Under the adaptive prefix, but it names a class Spark loads.
         "spark.sql.adaptive.customCostEvaluatorClass",
+        "spark.sql.streaming.stateStore.providerClass",
+        # Move what the job writes, or switch off what the runner relies on.
+        "spark.sql.defaultCatalog",
+        "spark.sql.warehouse.dir",
+        "spark.sql.streaming.checkpointLocation",
+        "spark.sql.streaming.streamingQueryListeners",
+        "spark.sql.variable.substitute",
+        "spark.sql.session.timeZone",
+        "spark.sql.mapKeyDedupPolicy",
+        "spark.driver.userClassPathFirst",
+        "spark.executor.userClassPathFirst",
+        "spark.driver.defaultJavaOptions",
+        "spark.executor.defaultJavaOptions",
+        "spark.authenticate",
+        "spark.master",
     }
 )
 #: The schema's sparkConf key names; checked here too, for a caller that skips the schema.
 _CONF_KEY = re.compile(r"[A-Za-z0-9_.-]{1,256}")
+#: With :data:`_CONF_DENIED`, at least the infrastructure emit's own list
+#: (``iac/providers/aws_identity.py::DENIED_SPARK_CONF``; a test checks the two agree).
 _CONF_DENIED_PREFIXES = (
     "spark.jars",
+    "spark.files.",
+    "spark.plugins.",
+    "spark.pyspark.",
+    "spark.python.",
+    "spark.emr-serverless.executorEnv.",
+    "spark.emr-serverless.lakeformation.",
+    "spark.kerberos.",
+    "spark.security.",
+    "spark.authenticate.",
+    "spark.ssl.",
+    "spark.redaction.",
+    "spark.eventLog.",
+    "spark.ui.",
+    "spark.app.",
     "spark.submit.",
     "spark.sql.extensions",
     "spark.sql.catalog",
@@ -349,10 +380,13 @@ def maven_repository(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
     )
 
 
+def _conf_denied(name: str) -> bool:
+    return name in _CONF_DENIED or name.startswith(_CONF_DENIED_PREFIXES)
+
+
 def _conf_allowed(name: str, extra: Sequence[str]) -> bool:
-    if name in _CONF_DENIED or name.startswith(_CONF_DENIED_PREFIXES):
-        listed = name in extra or any(e.endswith("*") and name.startswith(e[:-1]) for e in extra)
-        return listed
+    if _conf_denied(name):  # absolute: no operator entry admits one, as in the IaC emit
+        return False
     if name in _CONF_TUNING or name.startswith(_CONF_TUNING_PREFIXES):
         return True
     return name in extra or any(e.endswith("*") and name.startswith(e[:-1]) for e in extra)
@@ -367,44 +401,81 @@ def _allowed_conf(user: Mapping[str, Any], where: str, env: Mapping[str, str]) -
     catalog, and would get round the contract-SQL allowlist and the host allowlist. So a
     contract sets resource and tuning settings only (:data:`_CONF_TUNING`); the operator
     lists any other key in :data:`CONF_ALLOWLIST_ENV` (a name, or a prefix ending in ``*``).
+    The denied keys (:data:`_CONF_DENIED`, :data:`_CONF_DENIED_PREFIXES`) are refused even
+    when listed, by name or by a prefix such as ``spark.sql.*``: the infrastructure emit
+    never passes them either, so ``fluid spark run`` is no looser than ``fluid apply``.
     A value holds no whitespace: Glue joins the settings into one ``--conf`` argument.
 
     Raises:
-        SparkPolicyError: a setting the operator has not allowed.
+        SparkPolicyError: a setting the operator has not allowed, or a denied one.
     """
     from fluid_build._errors import doc_url
     from fluid_build.spark.policy import SparkPolicyError
 
     extra = [e.strip() for e in (env.get(CONF_ALLOWLIST_ENV) or "").split(",") if e.strip()]
     out: Dict[str, str] = {}
-    refused = []
+    refused: Dict[str, str] = {}  # name -> why: "name", "denied", "unlisted" or "value"
     for key, value in user.items():
         name, text = str(key), str(value)
-        if (
-            not _CONF_KEY.fullmatch(name)
-            or not _conf_allowed(name, extra)
-            or not text
-            or any(c.isspace() for c in text)
-        ):
-            refused.append(name)
+        if not _CONF_KEY.fullmatch(name):
+            refused[name] = "name"
+        elif _conf_denied(name):
+            refused[name] = "denied"
+        elif not _conf_allowed(name, extra):
+            refused[name] = "unlisted"
+        elif not text or any(c.isspace() for c in text):
+            refused[name] = "value"
         else:
             out[name] = text
     if refused:
+        shown = ", ".join(_conf_name(n) for n in sorted(refused))
         raise SparkPolicyError(
-            what=f"{where}: parameters.spark.sparkConf sets {', '.join(sorted(refused))}",
+            what=f"{where}: parameters.spark.sparkConf sets {shown}",
             why=(
                 "A contract sets Spark resource and tuning settings only (executor and driver "
                 "size, dynamic allocation, shuffle partitions, adaptive execution), with values "
                 "without spaces. Other settings can load code or environment into the job, "
                 "which runs with the job's role and reads what that role can read."
             ),
-            fix=(
-                "Drop the setting, or, once it is reviewed, have the operator list it in the "
-                f"real environment: export {CONF_ALLOWLIST_ENV}=\"{','.join(sorted(refused))}\"."
-            ),
+            fix=_conf_fix(refused),
             doc=doc_url(),
         )
     return out
+
+
+def _conf_name(name: str) -> str:
+    """A key as the refusal shows it: quoted when it is not a valid name, so a trailing
+    space or a newline is visible."""
+    return name if _CONF_KEY.fullmatch(name) else repr(name)
+
+
+def _conf_fix(refused: Mapping[str, str]) -> str:
+    """One hint per reason; only a valid, undenied, unlisted key gets the ``export`` hint,
+    the one case the operator's list can change."""
+
+    def names(why: str) -> List[str]:
+        return [_conf_name(n) for n in sorted(refused) if refused[n] == why]
+
+    parts = []
+    if names("name"):
+        parts.append(
+            f"Fix the key {', '.join(names('name'))}: a Spark setting name holds letters, "
+            "digits, '_', '.' and '-' only, with no spaces."
+        )
+    if names("denied"):
+        parts.append(
+            f"Drop {', '.join(names('denied'))}: forge never passes it, and no "
+            f"{CONF_ALLOWLIST_ENV} entry admits it."
+        )
+    if names("value"):
+        parts.append(f"Give {', '.join(names('value'))} a value without spaces.")
+    if names("unlisted"):
+        parts.append(
+            f"Drop {', '.join(names('unlisted'))}, or, once it is reviewed, have the operator "
+            f'list it in the real environment: export {CONF_ALLOWLIST_ENV}="'
+            f'{",".join(names("unlisted"))}".'
+        )
+    return " ".join(parts)
 
 
 def resolve_region(environ: Optional[Mapping[str, str]] = None) -> str:

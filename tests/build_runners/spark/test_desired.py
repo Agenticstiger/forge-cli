@@ -250,12 +250,15 @@ def test_a_project_env_file_cannot_set_the_maven_mirror():
 
 
 def test_an_operator_listed_spark_conf_overrides_the_defaults(contract, monkeypatch):
-    monkeypatch.setenv(_desired.CONF_ALLOWLIST_ENV, "spark.jars")
-    spark_cfg(contract)["sparkConf"] = {"spark.jars": "/mine.jar", "spark.executor.memory": 4}
+    monkeypatch.setenv(_desired.CONF_ALLOWLIST_ENV, "spark.sql.shuffle.service.*")
+    spark_cfg(contract)["sparkConf"] = {
+        "spark.sql.shuffle.service.x": "y",
+        "spark.executor.memory": 4,
+    }
     conf = runs_of(contract)[0].spark_conf
-    assert conf["spark.jars"] == "/mine.jar"
+    assert conf["spark.sql.shuffle.service.x"] == "y"
     assert conf["spark.executor.memory"] == "4"
-    assert "spark.sql.extensions" in conf
+    assert "spark.sql.extensions" in conf and "spark.jars" in conf  # forge's own stay
 
 
 def test_duplicate_build_ids_raise(contract):
@@ -291,21 +294,46 @@ def test_identity_args_and_tags_carry_the_hash_source_and_checkpoint(run):
         "spark.hadoop.fs.s3a.endpoint",
         "spark.executorEnv.AWS_ROLE_ARN",
         "spark.emr-serverless.driverEnv.X",
-        "spark.made.up",
         "spark.sql.adaptive.customCostEvaluatorClass",
     ],
 )
-def test_spark_conf_that_could_load_code_is_refused_unless_the_operator_lists_it(
-    contract, monkeypatch, key
+@pytest.mark.parametrize("listed", [None, "{key}", "spark.*", "spark.sql.*,{key},*"])
+def test_spark_conf_that_could_load_code_is_refused_whatever_the_operator_lists(
+    contract, monkeypatch, key, listed
 ):
     from fluid_build.spark.policy import SparkPolicyError
 
+    if listed:
+        monkeypatch.setenv(_desired.CONF_ALLOWLIST_ENV, listed.format(key=key))
     contract["builds"][0]["properties"]["parameters"]["spark"]["sparkConf"] = {key: "x"}
     with pytest.raises(SparkPolicyError) as err:
         _desired.desired_runs(contract, account=ACCOUNT)
-    assert key in err.value.what and _desired.CONF_ALLOWLIST_ENV in err.value.fix
+    assert key in err.value.what and "never passes" in err.value.fix
+    assert "export" not in err.value.fix  # listing it would not help
+
+
+def test_an_unknown_key_is_refused_until_the_operator_lists_it(contract, monkeypatch):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    key = "spark.made.up"
+    contract["builds"][0]["properties"]["parameters"]["spark"]["sparkConf"] = {key: "x"}
+    with pytest.raises(SparkPolicyError) as err:
+        _desired.desired_runs(contract, account=ACCOUNT)
+    assert f'export {_desired.CONF_ALLOWLIST_ENV}="{key}"' in err.value.fix
+    assert "never passes" not in err.value.fix
     monkeypatch.setenv(_desired.CONF_ALLOWLIST_ENV, key)
     assert _desired.desired_runs(contract, account=ACCOUNT)[0].spark_conf[key] == "x"
+
+
+def test_a_mixed_refusal_names_both_fixes(contract):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    spark = contract["builds"][0]["properties"]["parameters"]["spark"]
+    spark["sparkConf"] = {"spark.made.up": "x", "spark.jars": "/a.jar"}
+    with pytest.raises(SparkPolicyError) as err:
+        _desired.desired_runs(contract, account=ACCOUNT)
+    assert "Drop spark.jars: forge never passes it" in err.value.fix
+    assert f'{_desired.CONF_ALLOWLIST_ENV}="spark.made.up"' in err.value.fix
 
 
 def test_spark_conf_tuning_is_allowed_and_a_value_with_whitespace_is_not(contract):
@@ -373,3 +401,67 @@ def test_without_an_application_id_the_products_own_application_is_used(contract
     contract["builds"][0]["properties"]["parameters"]["spark"].pop("applicationId", None)
     (run,) = _desired.desired_runs(contract, account=ACCOUNT)
     assert run.target == {"applicationName": "fluid-commerce.orders-stream-spark"}
+
+
+def test_every_key_the_infrastructure_emit_denies_is_denied_here():
+    """fluid spark run is no looser than fluid apply: the IaC emit's deny list is a subset."""
+    identity = pytest.importorskip("fluid_build.iac.providers.aws_identity")
+    entries = getattr(identity, "DENIED_SPARK_CONF", None)
+    if entries is None:
+        pytest.skip("the IaC emit's DENIED_SPARK_CONF has not landed")
+    keys = [e[:-1] + "probe" if e.endswith("*") else e for e in entries]
+    assert [k for k in keys if not _desired._conf_denied(k)] == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "spark.driver.defaultJavaOptions",
+        "spark.executor.userClassPathFirst",
+        "spark.emr-serverless.executorEnv.X",
+        "spark.pyspark.python",
+        "spark.sql.warehouse.dir",
+        "spark.sql.streaming.checkpointLocation",
+        "spark.ssl.enabled",
+        "spark.master",
+    ],
+)
+def test_the_wider_deny_list_holds_under_a_star(key):
+    assert not _desired._conf_allowed(key, ["*"])
+
+
+@pytest.mark.parametrize(
+    "conf, hint, shown",
+    [
+        ({"spark.jars ": "x"}, "Fix the key 'spark.jars '", "'spark.jars '"),
+        ({"spark.executor.memory": "4g --jars x"}, "a value without spaces", None),
+        ({"spark.executor.memory": ""}, "a value without spaces", None),
+    ],
+)
+def test_a_refusal_the_allowlist_cannot_fix_gives_no_export_hint(contract, conf, hint, shown):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    spark_cfg(contract)["sparkConf"] = conf
+    with pytest.raises(SparkPolicyError) as err:
+        runs_of(contract)
+    assert hint in err.value.fix and "export" not in err.value.fix
+    if shown:
+        assert shown in err.value.what  # a trailing space is visible
+
+
+def test_every_reason_gets_its_own_hint(contract):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    spark_cfg(contract)["sparkConf"] = {
+        "spark.jars ": "x",
+        "spark.plugins": "p",
+        "spark.made.up": "y",
+        "spark.executor.memory": "",
+    }
+    with pytest.raises(SparkPolicyError) as err:
+        runs_of(contract)
+    fix = err.value.fix
+    assert "Fix the key 'spark.jars '" in fix
+    assert "Drop spark.plugins: forge never passes it" in fix
+    assert "Give spark.executor.memory a value without spaces" in fix
+    assert f'export {_desired.CONF_ALLOWLIST_ENV}="spark.made.up"' in fix

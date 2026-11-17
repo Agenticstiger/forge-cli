@@ -12,7 +12,6 @@ metadata:
   productType: SDP
   owner:
     team: platform-engineering
-    email: platform@company.com
 exposes:
 - exposeId: users_cleaned
   title: Cleaned Users with Environment Tag

@@ -86,6 +86,42 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             env_value = os.environ.get("DMM_AUTO_APPROVE_ACCESS", "").strip().lower()
             self.auto_approve_access = env_value in {"1", "true", "yes", "on"}
 
+    def _with_dmm_product_ids(
+        self, payload: CatalogPublicationPayload
+    ) -> CatalogPublicationPayload:
+        """The payload rebuilt from a contract whose product ids are spelled as the
+        native provider publishes them (``_ids.with_dmm_product_ids``).
+
+        Entropy ids are case-sensitive, and the native provider has always published
+        ``Silver.Sales.Orders`` as ``silver.sales.orders``; this path published it as
+        written and named upstreams as written, so the two paths, and a producer and
+        its consumers, did not meet. Unchanged ids keep the payload as it is.
+        """
+        from fluid_build.providers.datamesh_manager._ids import (
+            needs_existing_ids,
+            with_dmm_product_ids,
+        )
+
+        contract = payload.contract or {}
+        # An upstream Entropy holds as written (one forge did not publish) is kept as
+        # written; reading the list is only worth it when some upstream id would change.
+        held: Optional[set] = None
+        if needs_existing_ids(contract):
+            held = self._read_product_ids()
+            if held is None:
+                LOG.warning(
+                    "Could not list Entropy's data products; every consumes[].productId is "
+                    "slugged, so an upstream Entropy holds only as written is not reached."
+                )
+        normalized = with_dmm_product_ids(contract, held)
+        if normalized == dict(contract) and (
+            payload.product.product_id == normalized.get("id", payload.product.product_id)
+        ):
+            return payload
+        return CatalogPublicationPayload.from_contract(
+            normalized, {col: list(labels) for col, labels in payload.classifications.items()}
+        )
+
     def _endpoint_refusal(self) -> Optional[str]:
         """Why the key must not go to ``api_url``, or ``None``.
 
@@ -145,8 +181,9 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         non-fatal (logged at WARNING) — a missing source-system entity
         only degrades the lineage graph, not the product publish.
         """
-        product_id = payload.product.product_id
-        product_urn = f"dmm://{product_id}"
+        from fluid_build.providers.datamesh_manager._ids import dmm_product_id
+
+        product_urn = f"dmm://{dmm_product_id(payload.product.product_id)}"
         if not self.api_token:
             return RegistrationResult(
                 target=self.target,
@@ -159,6 +196,10 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             return RegistrationResult(
                 target=self.target, urn=product_urn, succeeded=False, error=refusal
             )
+        # Only now, with the key cleared to go to this endpoint: it may read the
+        # product list to spell upstream ids.
+        payload = self._with_dmm_product_ids(payload)
+        product_id = payload.product.product_id
         contract_urns: List[str] = []
         access_urns: List[str] = []
         source_system_urns: List[str] = []
@@ -268,6 +309,10 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         Preserves the per-expose URN shape the orchestrator's
         historical iteration relied on (``dmm://<product>/<expose>``).
         """
+        from fluid_build.providers.datamesh_manager._ids import dmm_product_id
+
+        # The id register_payload and the native provider publish under.
+        product_id = dmm_product_id(product_id)
         urn = f"dmm://{product_id}/{expose_id}"
         if not self.api_token:
             return RegistrationResult(
@@ -279,7 +324,9 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         refusal = self._endpoint_refusal()
         if refusal:
             return RegistrationResult(target=self.target, urn=urn, succeeded=False, error=refusal)
-        payload = CatalogPublicationPayload.from_contract(contract, classifications)
+        payload = self._with_dmm_product_ids(
+            CatalogPublicationPayload.from_contract(contract, classifications)
+        )
         scoped = tuple(a for a in payload.assets if a.asset_id == expose_id)
         if not scoped:
             return RegistrationResult(
@@ -301,6 +348,9 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         return RegistrationResult(target=self.target, urn=urn, succeeded=True)
 
     def unregister(self, product_id: str, expose_id: str) -> RegistrationResult:
+        from fluid_build.providers.datamesh_manager._ids import dmm_product_id
+
+        product_id = dmm_product_id(product_id)
         urn = f"dmm://{product_id}/{expose_id}"
         if not self.api_token:
             return RegistrationResult(
@@ -643,6 +693,10 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         doesn't exist without inflicting a noisy 404 on the operator's
         publish log.
         """
+        return self._read_product_ids() or set()
+
+    def _read_product_ids(self) -> Optional[set]:
+        """Every product id Entropy holds, or ``None`` when the list cannot be read."""
         from fluid_build.util.safe_http import safe_httpx_client
 
         try:
@@ -657,10 +711,10 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                 for page in range(_MAX_PRODUCT_PAGES):
                     r = c.get("/api/dataproducts", params={"p": page}, headers=self._headers())
                     if r.status_code != 200:
-                        return set()
+                        return None
                     data = r.json()
                     if not isinstance(data, list):
-                        return set()
+                        return None
                     before = len(ids)
                     ids.update(
                         str(p.get("id")) for p in data if isinstance(p, dict) and p.get("id")
@@ -671,7 +725,7 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                         break
                 return ids
         except Exception:  # noqa: BLE001 — best effort; disable pre-flight on failure
-            return set()
+            return None
 
     # ── Owner team upsert ────────────────────────────────────────────
     #

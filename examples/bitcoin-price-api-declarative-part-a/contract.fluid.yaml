@@ -9,7 +9,6 @@ metadata:
   layer: Gold
   owner:
     team: data-engineering
-    email: data-engineering@company.com
 
 # Build: API ingestion referencing external Python script
 builds:

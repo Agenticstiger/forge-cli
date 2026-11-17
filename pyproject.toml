@@ -399,11 +399,18 @@ lineage = [
 # output-checked aggregates (PROFILE-SPEC 1-0-0). DuckDB reads the CSV, Parquet
 # and database sources through the sandbox ``fluid init --discover`` uses, with
 # the same floor as ``[local]``. The canonical JSON comes from ``rfc8785``, a base
-# dependency. ``flux-stats``, the statistic registry the profile's numbers are
-# formed by (MEAS-3), joins this extra once it is published; until then
-# ``fluid profile`` says so and reads nothing.
+# dependency. ``flux-stats`` is FLUX's statistic registry and record reader: it
+# reads every value and forms every number (MEAS-3), as the fidelity check
+# does. It is standard-library only and supports Python 3.10, so it needs no
+# marker.
+#
+# Pinned to a flux-engine commit until flux-stats is released. PyPI refuses an
+# upload whose metadata holds a URL dependency, so this pin becomes a version
+# before any release. PyPI's flux-stats 0.0.1 is a placeholder with no code and
+# is never a candidate. pip clones the repository to install it.
 profile = [
   "duckdb>=1.5.0",
+  "flux-stats @ git+https://github.com/Agenticstiger/flux-engine.git@9ea8edf9bcddd58951f418db13a77253c02bdd7d#subdirectory=packages/flux-stats",
 ]
 
 # AI + MCP together: restores the pre-0.28.0 base behaviour (the
@@ -503,8 +510,10 @@ dev = [
   # it those tests would skip in CI instead of running.
   "pyarrow>=14",
   # litellm, mcp and openlineage left the base install in 0.28.0; the tests
-  # import all three at module level, so dev names them explicitly.
-  "data-product-forge[litellm,mcp,lineage]",
+  # import all three at module level, so dev names them explicitly. ``profile``
+  # brings flux-stats, so the profiler's tests also run against the real
+  # registry (tests/profiler/test_flux_stats_backend.py), not only its stand-in.
+  "data-product-forge[litellm,mcp,lineage,profile]",
 ]
 
 # Light (in-process) integration-test emulators — Stage 1. moto mocks the

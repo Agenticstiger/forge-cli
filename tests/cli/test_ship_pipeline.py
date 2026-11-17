@@ -996,11 +996,8 @@ def _cli(cwd: Path, *args: str) -> subprocess.CompletedProcess:
 
 @pytest.fixture
 def hello(tmp_path: Path) -> Path:
-    lines = HELLO.read_text().splitlines()
-    # ``team@example.com`` is a placeholder that ``validate --strict`` rejects.
-    (tmp_path / "contract.fluid.yaml").write_text(
-        "\n".join(line for line in lines if "email:" not in line) + "\n"
-    )
+    # The example as shipped: it passes ``validate --strict`` (no placeholder owner).
+    (tmp_path / "contract.fluid.yaml").write_text(HELLO.read_text())
     return tmp_path
 
 

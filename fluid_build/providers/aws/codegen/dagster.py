@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # from a contract ``taskId``, so without seeding the collision map with these a
 # task called ``json`` or ``aws_s3_resource`` would emit a ``def`` that rebinds
 # a module-level name the rest of the file still depends on. Mirrors
-# ``providers/aws/codegen/airflow._EMITTED_MODULE_NAMES``.
+# ``schedulers/airflow/_operators.RESERVED_NAMES``.
 _EMITTED_MODULE_NAMES = frozenset(
     {
         "op",
@@ -136,7 +136,7 @@ def _unique_op_identifiers(
     become ``a_b`` — so two tasks differing only in punctuation emitted two
     ``def``\\ s with the SAME name: the second shadowed the first and one
     declared task silently vanished from the job. Sanitize, then suffix on
-    collision, exactly as ``codegen/airflow._unique_task_identifiers`` does.
+    collision, exactly as ``codegen_utils.unique_task_identifiers`` does.
 
     The map is keyed by *index* rather than by raw id so that even a contract
     with duplicate ``taskId``\\ s still emits one op per declared task; the

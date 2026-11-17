@@ -515,9 +515,13 @@ class AwsProvider(BaseProvider):
         try:
             # Generate code based on engine
             if engine == "airflow" or engine == "mwaa":
-                from .codegen import generate_airflow_dag
+                from fluid_build.schedulers.airflow import render_dag
 
-                code = generate_airflow_dag(contract, self.account_id, self.region)
+                code = render_dag(
+                    contract,
+                    provider="aws",
+                    provider_config={"account_id": self.account_id, "region": self.region},
+                )
                 filename = f"{safe_id}_dag.py"
 
             elif engine == "dagster":

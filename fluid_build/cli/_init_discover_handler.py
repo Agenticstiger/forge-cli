@@ -203,7 +203,7 @@ def run_discover(args, logger: logging.Logger, *, uri: str) -> int:
             name=f"{project} / {stream.name}",
             domain=getattr(args, "domain", None) or "data",
             owner_team=getattr(args, "owner_team", None) or "data-platform",
-            owner_email=getattr(args, "owner_email", None) or "data-platform@example.com",
+            owner_email=getattr(args, "owner_email", None) or "",
             engine=engine,
             source_kind=source_kind,
             connection=connection,

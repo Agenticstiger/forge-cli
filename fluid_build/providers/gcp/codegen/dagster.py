@@ -150,7 +150,7 @@ def _unique_task_identifiers(
     task silently vanished from the job while the survivor ran twice.
 
     Sanitize, then suffix on collision. Borrowed wholesale from
-    ``providers/aws/codegen/airflow._unique_task_identifiers`` (#623/#630),
+    ``providers/common/codegen_utils.unique_task_identifiers`` (#623/#630),
     which fixed the identical defect on the Airflow path.
     """
     identifiers: Dict[str, str] = {}

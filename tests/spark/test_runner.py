@@ -41,9 +41,13 @@ def test_a_config_the_runner_does_not_run_is_refused(runner, contract, change, m
         runner.parse_config(json.dumps(config))
 
 
-def test_an_unresolved_interpolation_is_refused(runner, contract):
+def test_an_unresolved_interpolation_is_refused(runner, contract, monkeypatch):
+    from fluid_build.spark.compiler import TARGET_ALLOWLIST_ENV
+
+    arn = "arn:aws:kafka:eu-west-1:000000000005:cluster/o/1"
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"msk:{arn}")
     spark = contract["builds"][0]["properties"]["parameters"]["spark"]
-    spark["source"] = {"mskClusterArn": "arn:aws:kafka:eu-west-1:000000000005:cluster/o/1"}
+    spark["source"] = {"mskClusterArn": arn}
     text = config_text(contract)  # the uploader has not filled in the MSK brokers
     with pytest.raises(runner.JobConfigError, match="unresolved"):
         runner.parse_config(text)
@@ -62,6 +66,17 @@ def test_msk_iam_sets_the_sasl_options(runner, contract):
     assert "kafka.sasl.mechanism" not in plain
     with pytest.raises(runner.JobConfigError, match="unknown Kafka auth"):
         runner.kafka_options({**source, "auth": "scram"})
+
+
+def test_tls_without_iam_speaks_ssl_and_iam_stays_sasl_ssl(runner, contract):
+    source = runner.parse_config(config_text(contract))["source"]
+    tls = runner.kafka_options({**source, "auth": "none", "tls": True})
+    assert tls["kafka.security.protocol"] == "SSL"
+    assert "kafka.sasl.mechanism" not in tls
+    plain = runner.kafka_options({**source, "auth": "none", "tls": False})
+    assert "kafka.security.protocol" not in plain
+    iam = runner.kafka_options({**source, "auth": "msk-iam", "tls": True})
+    assert iam["kafka.security.protocol"] == "SASL_SSL"
 
 
 def test_a_registry_credential_comes_from_the_environment(runner, monkeypatch):
@@ -228,9 +243,37 @@ def test_the_key_comes_from_secrets_manager_and_is_never_printed(runner, monkeyp
 
 
 def test_the_key_never_reaches_the_job_config(contract):
+    """The config names the key's secret by ARN, once, and holds nothing else of it."""
     text = config_text(contract)
-    assert MASK_KEY_ARN in text
-    assert "SecretString" not in text and "a-very-secret" not in text
+    assert json.loads(text)["maskKey"] == {"secretArn": MASK_KEY_ARN}
+    assert text.count("secretsmanager") == 1
+
+
+def test_a_batch_run_replaces_the_partitions_it_computes(runner, contract, monkeypatch):
+    calls = []
+
+    class Writer:
+        def option(self, name, value):
+            calls.append((name, value))
+            return self
+
+        def overwritePartitions(self):  # noqa: N802 - PySpark's name
+            calls.append("overwritePartitions")
+
+    class Frame:
+        def writeTo(self, table):  # noqa: N802 - PySpark's name
+            calls.append(table)
+            return Writer()
+
+    config = runner.parse_config(config_text(contract))
+    config.update(mode="batch", source=None, maskedColumns=[], maskKey=None)
+    monkeypatch.setattr(runner, "build_output", lambda spark, cfg: Frame())
+    runner.run(_NoSpark(), config)
+    assert calls == [
+        "fluid.commerce.order_lines",
+        ("check-nullability", "false"),
+        "overwritePartitions",
+    ]
 
 
 def test_a_masked_config_without_its_key_arn_is_refused(runner, contract):

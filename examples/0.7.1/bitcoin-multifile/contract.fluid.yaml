@@ -13,8 +13,6 @@ metadata:
   layer: Gold
   owner:
     team: data-engineering
-    email: data-engineering@company.com
-
 tags:
   - cryptocurrency
   - real-time

@@ -19,8 +19,6 @@ metadata:
   layer: Silver
   owner:
     team: data-engineering
-    email: data-eng@company.com
-
 # ─── Build: Glue Spark ETL Job ──────────────────────────────
 
 build:

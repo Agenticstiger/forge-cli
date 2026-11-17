@@ -894,6 +894,16 @@ _VALIDATION_GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
         ],
         "validate",
     ),
+    "contract_spark_identity": (
+        [
+            "Leave parameters.spark.executionRoleArn out to have forge create a least-privilege "
+            + "role for the build, or ask the operator to list the role in "
+            + "FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST",
+            "Remove a sparkConf key that loads code, sets credentials or moves the catalog or "
+            + "checkpoint; ask the operator to list any other key in FLUID_SPARK_CONF_ALLOWLIST",
+        ],
+        "validate",
+    ),
     # contract rules (fluid validate's checks after JSON Schema)
     "contract_sovereignty": (
         [
@@ -1133,6 +1143,7 @@ _EXAMPLES: Dict[str, str] = {
     "contract_streaming_types": _SHOW_SCHEMA,
     "contract_managed_flink": _VERBOSE,
     "contract_spark": _VERBOSE,
+    "contract_spark_identity": _VERBOSE,
     "contract_sovereignty": "sovereignty:\n  jurisdiction: EU\n  allowedRegions:\n  - europe-west1\n",
     "contract_agent_policy": (
         "exposes:\n- exposeId: orders_raw\n  policy:\n    agentPolicy:\n"

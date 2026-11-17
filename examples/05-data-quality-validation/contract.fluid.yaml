@@ -7,7 +7,6 @@ metadata:
   layer: Bronze
   owner:
     team: "data-quality-team"
-    email: "data-quality@example.com"
 
 builds:
   - id: "clean_sales"

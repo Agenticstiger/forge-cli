@@ -344,7 +344,9 @@ def blueprint_mode(args, logger: logging.Logger) -> int:
         "product_name": project_name,
         "domain": getattr(args, "domain", None) or "analytics",
         "owner_team": getattr(args, "owner_team", None) or "data-platform",
-        "owner_email": getattr(args, "owner_email", None) or "data-platform@example.com",
+        # No placeholder: a blank email is left out of the contract, as
+        # `fluid validate --strict` (and so `fluid ship`) refuses example.com.
+        "owner_email": getattr(args, "owner_email", None) or "",
     }
 
     if getattr(args, "dry_run", False):

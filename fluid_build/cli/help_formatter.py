@@ -568,7 +568,7 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
         "",  # keep existing epilog
     ),
     "generate-airflow": (
-        "Generate an Airflow DAG from a FLUID contract. (Deprecated — use fluid export instead.)",
+        "Generate an Airflow DAG from a FLUID contract. (Deprecated — use fluid generate schedule --scheduler airflow instead.)",
         "",  # keep existing epilog
     ),
     "execute": (

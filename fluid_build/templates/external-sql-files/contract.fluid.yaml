@@ -12,7 +12,6 @@ metadata:
   productType: ADP
   owner:
     team: sales-analytics
-    email: sales-analytics@company.com
 exposes:
 - exposeId: sales_with_revenue
   title: Sales with Revenue Calculations

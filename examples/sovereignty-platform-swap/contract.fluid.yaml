@@ -10,7 +10,6 @@ metadata:
   productType: ADP
   owner:
     team: customer-platform
-    email: customer-platform@example.com
 
 exposes:
   - exposeId: customer_events
