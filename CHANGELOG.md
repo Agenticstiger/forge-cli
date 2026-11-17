@@ -66,17 +66,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Scheduled Spark builds run `fluid spark run` from Airflow.** A build of `engine: spark` with a
-  cron trigger gets a DAG whose one task, `fluid_spark_run`, runs `fluid spark run <contract>
-  --build-id <id> [--env <env>] --json` on the worker, through the same hardened script as the
-  `fluid apply` DAGs (`env -i`, values only as environment variables). The command waits for the
-  run on EMR Serverless, Glue, EMR on EC2 or EMR on EKS and exits 0 only when it succeeded, so
-  the task fails when the run does. `execution.runtime.timeout` (an ISO-8601 duration) is the
-  run's wait, passed as `--timeout`; the task's own timeout is that plus ten minutes (six hours
-  and ten minutes when unset). Retries come from `execution.retries.maxAttempts`, as for every
-  scheduled build. A streaming Spark build that is not `trigger.availableNow` gets no DAG: `fluid
-  apply` keeps it running. The DAG's docstring names the line MWAA needs in `requirements.txt`,
-  `data-product-forge[aws]==<release>` (unpinned for a development build).
+- **Scheduled Spark builds run through `fluid apply`, from Airflow too.** A build of `engine:
+  spark` with `parameters.spark` whose run ends on its own (a batch job, or a stream with
+  `trigger.availableNow`) runs in the build phase of `fluid apply <contract> --mode
+  amend-and-build --build-id <id>`, the path every scheduled build takes: it starts one run on
+  EMR Serverless, Glue, EMR on EC2 or EMR on EKS, waits for it, and fails unless the run
+  succeeded. Ctrl-C, SIGTERM or SIGHUP cancel the run. `execution.runtime.timeout` (an ISO-8601
+  duration, six hours when unset) is how long the run may take; an unreadable one is refused
+  before `tofu apply` changes anything. Airflow renders the standard `fluid apply` DAG for it
+  (task `fluid_apply`), whose task timeout is the three hours every apply DAG gets plus that
+  wait. The worker runs the whole apply, `tofu` included, so it needs the apply's permissions
+  and the state backend, as for any scheduled build; the scheduler policy forge emits for a
+  Spark product covers the run only. Retries come from `execution.retries.maxAttempts`, as for
+  every scheduled build. A
+  streaming Spark build that is not `trigger.availableNow` gets no DAG: `fluid apply` keeps it
+  running. An `engine: spark` build with neither `parameters.spark` nor a runtime platform of its
+  own is refused with what to declare, instead of running as a local python script.
 
 - **Schema 0.7.7 (preview): rules about valid data** (RFC-data-rules.md, implementation step 1).
   `exposes[].contract.invariants[]` declares checks, derived columns (`derive` with `expr`, or
@@ -115,11 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Spark actions differ. A streaming job with the same hash is left running; a new hash cancels
   it, waits, and starts the new config on the same checkpoint; a new topic or cluster on the
   old checkpoint is refused; a last run that failed (EMR Serverless' thrash guard) is an error
-  naming the run, until the build changes or `fluid spark run --restart`.
-  - `fluid spark run <contract> --build-id <id> [--json]` starts a scheduled build (batch, or
-    a stream with `trigger.availableNow`) for Airflow: it waits, exits 0 on success, 1 when the
-    run failed or was cancelled, 2 when the contract or the operator's policy refuses it, and
-    cancels the run on SIGTERM. `fluid spark status <contract>` shows each build's recent runs.
+  naming the run, until the build changes.
+  - A scheduled build (batch, or a stream with `trigger.availableNow`) is not reconciled: its
+    scheduler starts it through `fluid apply --mode amend-and-build` (above). There is no
+    `fluid spark` command: `fluid spark run|status`, on main for part of this cycle and never
+    released, is gone, so nothing is deprecated.
   - A contract's `parameters.spark.sparkConf` sets resource and tuning settings only; the
     operator lists any other key in `FLUID_SPARK_CONF_ALLOWLIST`. Keys that load code or
     environment into the job, or move what it writes (`spark.jars*`, `spark.sql.extensions`,

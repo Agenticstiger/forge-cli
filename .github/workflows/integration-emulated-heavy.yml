@@ -202,7 +202,7 @@ jobs:
         env:
           FLUID_LOCALSTACK_ENDPOINT: http://localhost:4566
           # The Spark lane's opt-in: Glue 5, EMR Serverless and EMR on EC2 runs started by
-          # `fluid spark run`. It skips itself when LocalStack is not reachable.
+          # fluid apply's build phase. It skips itself when LocalStack is not reachable.
           FLUID_SPARK_LOCALSTACK: "1"
           # The IaC round-trips are triple-gated: `tofu` on PATH (installed
           # above), LocalStack reachable, and this opt-in. AWS_* are

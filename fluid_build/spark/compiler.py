@@ -124,6 +124,54 @@ def spark_parameters(build: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     return cfg
 
 
+def runs_to_completion(build: Mapping[str, Any]) -> bool:
+    """Whether a Spark build's run ends on its own, so a scheduler starts it: a batch job, or
+    a stream triggered ``availableNow``. Any other stream keeps running, and ``fluid apply``
+    keeps it so. The mode is :func:`compile_job_config`'s rule: ``parameters.spark.mode``,
+    else streaming when ``properties.stream`` is declared, else batch. Reads the build only;
+    a malformed one is the compiler's to refuse."""
+    props = build.get("properties")
+    if not isinstance(props, Mapping):
+        return True
+    parameters = props.get("parameters")
+    cfg = parameters.get("spark") if isinstance(parameters, Mapping) else None
+    stream = props.get("stream")
+    mode = (cfg.get("mode") if isinstance(cfg, Mapping) else None) or (
+        "streaming" if stream is not None else "batch"
+    )
+    if mode == "batch":
+        return True
+    trigger = stream.get("trigger") if isinstance(stream, Mapping) else None
+    return isinstance(trigger, Mapping) and trigger.get("availableNow") is True
+
+
+def run_timeout_seconds(build: Mapping[str, Any]) -> Optional[int]:
+    """``execution.runtime.timeout``: how long a scheduled run may take before it is cancelled,
+    in seconds; ``None`` when the build does not say.
+
+    Raises:
+        ValueError: not an ISO-8601 duration of days, hours, minutes and seconds of at least
+            one second (``PT2H``). A wait it cannot read is refused, never guessed.
+    """
+    execution = build.get("execution")
+    runtime = execution.get("runtime") if isinstance(execution, Mapping) else None
+    raw = runtime.get("timeout") if isinstance(runtime, Mapping) else None
+    if raw is None:
+        return None
+    from fluid_build.build_runners._late_arrival import parse_iso_duration
+
+    try:
+        parsed = parse_iso_duration(raw) if isinstance(raw, str) else None
+    except OverflowError:
+        parsed = None
+    if parsed is None or parsed.total_seconds() < 1:
+        raise ValueError(
+            f"execution.runtime.timeout {raw!r} is not an ISO-8601 duration of at least one "
+            "second (days, hours, minutes and seconds, as PT2H)"
+        )
+    return int(parsed.total_seconds())
+
+
 def spark_builds(contract: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     """The builds the forge Spark runner runs: ``engine: spark`` with parameters.spark."""
     return [

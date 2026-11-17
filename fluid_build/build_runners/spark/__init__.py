@@ -9,8 +9,9 @@ role, the Glue job); there is no OpenTofu resource for a job run, so runs are st
 - :mod:`._desired` — each build's :class:`~._desired.DesiredRun` and config hash, and the
   ``spark.reconcile`` actions ``fluid plan`` lists;
 - :mod:`._adapters` — one adapter per runtime (start, find, read, cancel);
-- :mod:`._reconcile` — ``fluid apply`` keeps streaming jobs on the declared config;
-  ``fluid spark run`` starts a scheduled build for Airflow; ``fluid spark status``;
+- :mod:`._reconcile` — ``fluid apply`` keeps streaming jobs on the declared config, and
+  its build phase (``--mode amend-and-build``, what a scheduler runs) starts a scheduled
+  build and waits for it;
 - ``fluid_build.cli._spark_apply`` — the two hooks ``fluid plan`` and ``fluid apply`` call
   (in ``cli``: build_runners never depends on it, an import-linter contract).
 

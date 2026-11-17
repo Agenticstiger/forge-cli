@@ -876,7 +876,7 @@ def trust_document(
     raise ValueError(f"no forge-owned role for runtime {runtime!r}")
 
 
-# --- the scheduler that starts the runs (fluid spark run on MWAA) ----------------------
+# --- the scheduler that starts the runs (fluid apply's build phase, on MWAA) -------------
 
 #: The service a run's role is passed to, where StartJobRun passes it (the runtimes in
 #: the runs lane's ``PASS_ROLE``).

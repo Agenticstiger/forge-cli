@@ -1,7 +1,7 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""reconcile / run_once / status against an in-memory adapter and a fake clock."""
+"""reconcile / run_once / run_build against an in-memory adapter and a fake clock."""
 
 from __future__ import annotations
 
@@ -165,7 +165,8 @@ def test_a_failed_last_run_with_this_config_is_an_error_not_a_restart(run, clock
     use(fake)
     out = go(run, clock)
     assert (out.action, out.error, fake.calls) == ("failed", True, [])
-    assert "jr9" in out.message and "OOM in driver" in out.message and "--restart" in out.message
+    assert "jr9" in out.message and "OOM in driver" in out.message
+    assert "fix the cause and change the build" in out.message
 
 
 def test_restart_failed_starts_it_anyway(run, clock, use):
@@ -219,7 +220,7 @@ def test_a_scheduled_build_is_reported_and_never_touches_aws(run, clock, use):
     )
     out = go(scheduled, clock)
     assert (out.action, out.error, built) == ("scheduled", False, [])
-    assert "fluid spark run" in out.message
+    assert "fluid apply <contract> --mode amend-and-build --build-id" in out.message
 
 
 def test_an_aws_error_is_that_builds_outcome_and_the_others_still_reconcile(
@@ -260,9 +261,7 @@ def scheduled(run):
 
 
 def once(run, clock, say=None, **kw):
-    return rc.run_once(
-        run, sleep=clock.sleep, now=clock.now, env=ENV, say=say or (lambda _t: None), **kw
-    )
+    return rc.run_once(run, sleep=clock.sleep, now=clock.now, say=say or (lambda _t: None), **kw)
 
 
 def test_a_scheduled_run_waits_to_succeeded(scheduled, clock, use):
@@ -283,13 +282,6 @@ def test_a_scheduled_run_that_fails_is_an_error(scheduled, clock, use):
     use(FakeAdapter(start_states=("RUNNING", "FAILED"), start_details="exit 1"))
     out = once(scheduled, clock)
     assert (out.action, out.error) == ("failed", True) and "exit 1" in out.message
-
-
-def test_no_wait_returns_once_started(scheduled, clock, use):
-    fake = FakeAdapter(start_states=("PENDING",))
-    use(fake)
-    out = once(scheduled, clock, wait=False)
-    assert (out.action, out.state, out.error, clock.slept) == ("started", "PENDING", False, [])
 
 
 def test_a_run_that_outlives_the_timeout_is_cancelled(scheduled, clock, use):
@@ -333,14 +325,11 @@ def test_ctrl_c_whose_cancel_fails_says_the_run_may_still_be_going(scheduled, cl
     assert "could not be cancelled" in out.message and "by hand" in out.message
 
 
-def test_a_streaming_build_is_reconciled_instead(run, clock, use):
-    fake = FakeAdapter()
-    use(fake)
-    assert once(run, clock).action == "started"
-    fake = FakeAdapter([info("jr9", "FAILED", hash_=run.config_hash)])
-    use(fake)
-    assert once(run, clock).action == "failed"
-    assert once(run, clock, restart=True).action == "started"
+def test_run_once_has_no_run_to_start_for_a_stream(run, clock, use):
+    built = use(FakeAdapter())
+    with pytest.raises(ValueError, match="stream that fluid apply keeps running"):
+        once(run, clock)
+    assert built == []
 
 
 def test_run_once_turns_an_aws_error_into_an_outcome(scheduled, clock, monkeypatch):
@@ -352,31 +341,118 @@ def test_run_once_turns_an_aws_error_into_an_outcome(scheduled, clock, monkeypat
     assert (out.action, out.error, out.message) == ("failed", True, "no application")
 
 
-# --- status ---------------------------------------------------------------------------
+# --- run_build: fluid apply --mode amend-and-build ------------------------------------
 
 
-def test_status_flags_the_runs_that_match_the_contract(run, use):
-    use(
-        FakeAdapter([info("a", "RUNNING", hash_=run.config_hash), info("b", "FAILED", hash_="old")])
-    )
-    (row,) = rc.status([run])
-    assert row["where"] == "fake cluster" and row["configHash"] == run.config_hash
-    assert [(r["runId"], r["current"]) for r in row["runs"]] == [("a", True), ("b", False)]
+def _available_now(contract, **runtime):
+    """The conftest contract's build as a stream that runs to completion."""
+    contract["builds"][0]["properties"]["stream"]["trigger"] = {"availableNow": True}
+    if runtime:
+        contract["builds"][0]["execution"] = {"runtime": runtime}
+    return contract, contract["builds"][0]
 
 
-def test_status_limits_runs_and_reports_an_error_as_the_row(run, monkeypatch):
-    monkeypatch.setattr(
-        rc,
-        "adapter_for",
-        lambda r, c=None: FakeAdapter([info(str(i), "RUNNING") for i in range(9)]),
-    )
-    assert len(rc.status([run], limit=2)[0]["runs"]) == 2
+def test_run_build_starts_a_scheduled_build_and_waits_for_it(contract, use):
+    contract, build = _available_now(contract)
+    fake = FakeAdapter(start_states=("SUCCEEDED",))
+    use(fake)
+    said = []
+    assert rc.run_build(contract, build, dry_run=False, say=said.append) == 0
+    assert fake.calls == ["start"]
+    assert said[-1].startswith("Spark ingest-orders (emr-serverless): succeeded run new")
 
-    def boom(r, c=None):
-        raise rc.SparkRunError("nope")
 
-    monkeypatch.setattr(rc, "adapter_for", boom)
-    assert rc.status([run])[0]["error"] == "nope"
+def test_run_build_fails_when_the_run_does(contract, use):
+    contract, build = _available_now(contract)
+    use(FakeAdapter(start_states=("FAILED",), start_details="exit 1"))
+    said = []
+    assert rc.run_build(contract, build, dry_run=False, say=said.append) == 1
+    assert "exit 1" in said[-1]
+
+
+@pytest.mark.parametrize(
+    "runtime, wait", [({}, rc.DEFAULT_RUN_WAIT_S), ({"timeout": "PT2H"}, 7200)]
+)
+def test_run_build_waits_as_long_as_the_build_says(contract, monkeypatch, runtime, wait):
+    contract, build = _available_now(contract, **runtime)
+    seen = {}
+
+    def run_once(run, **kw):
+        seen.update(kw, build=run.build)
+        return rc.Outcome(run.build, run.runtime, "succeeded")
+
+    monkeypatch.setattr(rc, "run_once", run_once)
+    assert rc.run_build(contract, build, dry_run=False, say=lambda _t: None) == 0
+    assert (seen["build"], seen["timeout"]) == ("ingest-orders", wait)
+
+
+def test_a_stream_fluid_apply_keeps_running_has_no_run_to_start(contract, use):
+    built = use(FakeAdapter())
+    assert rc.run_build(contract, contract["builds"][0], dry_run=False, say=print) is None
+    assert built == []
+
+
+def test_a_dry_run_says_what_it_would_start_and_reads_nothing(contract, use):
+    contract, build = _available_now(contract)
+    built = use(FakeAdapter())
+    said = []
+    assert rc.run_build(contract, build, dry_run=True, say=said.append) == 0
+    assert built == []
+    assert said == [
+        "Spark ingest-orders (emr-serverless): would start one run and wait up to 21600 s "
+        "for it to end"
+    ]
+
+
+def test_a_contract_before_the_managed_lane_is_refused(contract, use):
+    contract, build = _available_now(contract)
+    contract["fluidVersion"] = "0.7.6"
+    built = use(FakeAdapter(start_states=("SUCCEEDED",)))
+    with pytest.raises(ValueError, match="fluidVersion 0.7.7"):
+        rc.run_build(contract, build, dry_run=False, say=print)
+    assert built == []
+
+
+def test_an_unusable_runtime_timeout_is_refused_before_anything_starts(contract, use):
+    contract, build = _available_now(contract, timeout="soon")
+    built = use(FakeAdapter(start_states=("SUCCEEDED",)))
+    with pytest.raises(ValueError, match="execution.runtime.timeout 'soon'"):
+        rc.run_build(contract, build, dry_run=False, say=print)
+    assert built == []
+
+
+def test_an_interrupted_run_is_cancelled_and_stops_the_apply(contract, use):
+    contract, build = _available_now(contract)
+    fake = FakeAdapter(start_states=("INTERRUPT",))
+    use(fake)
+    said = []
+    with pytest.raises(KeyboardInterrupt):
+        rc.run_build(contract, build, dry_run=False, say=said.append)
+    assert fake.calls == ["start", "cancel new"]
+    assert said[-1].startswith("Spark ingest-orders (emr-serverless): cancelled run new")
+
+
+def test_run_refusal_reads_no_cloud_and_names_what_blocks_a_run(contract):
+    contract, build = _available_now(contract)
+    assert rc.run_refusal(contract, build) is None
+    build["execution"] = {"runtime": {"timeout": "soon"}}
+    assert "execution.runtime.timeout 'soon'" in rc.run_refusal(contract, build)
+    # A stream fluid apply keeps running waits for nothing, so its timeout is not read.
+    del build["properties"]["stream"]["trigger"]
+    assert rc.run_refusal(contract, build) is None
+    contract["fluidVersion"] = "0.7.6"
+    assert "fluidVersion 0.7.7" in rc.run_refusal(contract, build)
+
+
+def test_the_operators_policy_refuses_before_anything_starts(contract, use):
+    from fluid_build._errors import FluidUserError
+
+    contract, build = _available_now(contract)
+    build["properties"]["parameters"]["spark"]["sparkConf"] = {"spark.jars": "s3://x/y.jar"}
+    built = use(FakeAdapter(start_states=("SUCCEEDED",)))
+    with pytest.raises(FluidUserError):
+        rc.run_build(contract, build, dry_run=False, say=print)
+    assert built == []
 
 
 # --- redaction ------------------------------------------------------------------------

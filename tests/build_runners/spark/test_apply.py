@@ -190,3 +190,46 @@ def test_spark_builds_on_the_native_engine_are_refused(contract):
         _apply.refuse_without_opentofu(contract, "native")
     assert err.value.event == "apply_spark_needs_opentofu"
     _apply.refuse_without_opentofu({"fluidVersion": "0.7.7", "builds": []}, "native")
+
+
+# --- fluid apply's gate before anything is applied ------------------------------------
+
+
+def _scheduled_build(contract, **runtime):
+    build = contract["builds"][0]
+    build["properties"]["stream"]["trigger"] = {"availableNow": True}
+    if runtime:
+        build["execution"] = {"runtime": runtime}
+    return contract
+
+
+@pytest.mark.parametrize(
+    "change, says",
+    [
+        ({"timeout": "soon"}, "execution.runtime.timeout 'soon'"),
+        ({"fluidVersion": "0.7.6"}, "fluidVersion 0.7.7"),
+    ],
+)
+def test_apply_refuses_a_spark_build_it_cannot_run_before_anything_is_applied(
+    contract, change, says
+):
+    from fluid_build.cli._common import CLIError
+    from fluid_build.cli.apply import _gate_spark_builds_for_apply
+
+    if "timeout" in change:
+        contract = _scheduled_build(contract, timeout=change["timeout"])
+    else:
+        contract = {**_scheduled_build(contract), **change}
+    with pytest.raises(CLIError) as err:
+        _gate_spark_builds_for_apply(contract, None)
+    assert err.value.event == "apply_spark_invalid"
+    assert says in err.value.context["error"]
+    # --build-id selecting another build leaves this one out.
+    _gate_spark_builds_for_apply(contract, "another")
+
+
+def test_apply_lets_a_spark_build_it_can_run_through(contract):
+    from fluid_build.cli.apply import _gate_spark_builds_for_apply
+
+    _gate_spark_builds_for_apply(_scheduled_build(contract, timeout="PT2H"), None)
+    _gate_spark_builds_for_apply(contract, "ingest-orders")

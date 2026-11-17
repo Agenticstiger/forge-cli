@@ -169,7 +169,7 @@ def reconcile_after_apply(
     if dry_run:  # a dry run reads nothing from AWS: the application may not exist yet
         for run in runs:
             what = (
-                "started by a scheduler (fluid spark run)"
+                "started by a scheduler (fluid apply --mode amend-and-build)"
                 if run.scheduled
                 else f"would be reconciled to config {run.config_hash[:12]}"
             )

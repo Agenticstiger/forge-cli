@@ -148,14 +148,15 @@ def _sha(value: Any) -> str:
 
 @dataclass(frozen=True)
 class DesiredRun:
-    """One Spark build's run, as ``fluid apply`` and ``fluid spark run`` start it."""
+    """One Spark build's run, as ``fluid apply`` starts it (a stream after ``tofu apply``, a
+    scheduled build in its build phase)."""
 
     product: str
     build: str
     runtime: str
     mode: str
     #: True for a batch job and for a stream with ``trigger.availableNow``: a run that
-    #: ends, started on a schedule (Airflow, ``fluid spark run``), never kept running.
+    #: ends, started on a schedule (``fluid apply --mode amend-and-build``), never kept running.
     scheduled: bool
     region: str
     config_hash: str
@@ -262,7 +263,8 @@ class DesiredRun:
                 "sourceId": self.source_id,
                 "checkpointId": self.checkpoint_id,
                 "stateImpact": (
-                    "started by a scheduler (fluid spark run); fluid apply does not run it"
+                    "started by a scheduler (fluid apply --mode amend-and-build); a plain "
+                    "fluid apply does not run it"
                     if self.scheduled
                     else "a changed config cancels the running job and starts it again on "
                     "the same checkpoint; a new source on that checkpoint is refused"
@@ -404,7 +406,7 @@ def _allowed_conf(user: Mapping[str, Any], where: str, env: Mapping[str, str]) -
     lists any other key in :data:`CONF_ALLOWLIST_ENV` (a name, or a prefix ending in ``*``).
     The denied keys (:data:`_CONF_DENIED`, :data:`_CONF_DENIED_PREFIXES`) are refused even
     when listed, by name or by a prefix such as ``spark.sql.*``: the infrastructure emit
-    never passes them either, so ``fluid spark run`` is no looser than ``fluid apply``.
+    never passes them either, so a run is no looser than what ``fluid apply`` provisions.
     A value holds no whitespace: Glue joins the settings into one ``--conf`` argument.
 
     Raises:
