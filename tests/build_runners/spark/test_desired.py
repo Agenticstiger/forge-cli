@@ -465,3 +465,104 @@ def test_every_reason_gets_its_own_hint(contract):
     assert "Drop spark.plugins: forge never passes it" in fix
     assert "Give spark.executor.memory a value without spaces" in fix
     assert f'export {_desired.CONF_ALLOWLIST_ENV}="spark.made.up"' in fix
+
+
+# ── Glue: the pinned jars the job loads are part of the run hash ─────────────────────────
+
+
+def _glue(contract, avro, monkeypatch):
+    spark_cfg(contract)["runtime"] = "glue"
+    spark_cfg(contract).pop("applicationId", None)
+    if avro:
+        _avro(contract, monkeypatch)
+    return contract
+
+
+def _bump_one_pin(monkeypatch):
+    import dataclasses
+
+    from fluid_build.iac.providers import aws_glue_jars
+
+    first, *rest = aws_glue_jars.AVRO_JARS
+    bumped = dataclasses.replace(first, sha256="0" * 64)
+    monkeypatch.setattr(aws_glue_jars, "AVRO_JARS", (bumped, *rest))
+
+
+JARS_URL = "s3://platform-jars/glue/avro/"
+
+
+def test_a_new_glue_jar_pin_changes_the_glue_run_hash(contract, monkeypatch):
+    run = runs_of(_glue(contract, True, monkeypatch))[0]
+    _bump_one_pin(monkeypatch)
+    assert runs_of(contract)[0].config_hash != run.config_hash
+
+
+def test_a_new_glue_jars_prefix_changes_the_glue_run_hash(contract, monkeypatch):
+    from fluid_build.iac.providers.aws_glue_jars import JARS_URL_ENV
+
+    monkeypatch.delenv(JARS_URL_ENV, raising=False)
+    run = runs_of(_glue(contract, True, monkeypatch))[0]
+    monkeypatch.setenv(JARS_URL_ENV, JARS_URL)
+    assert runs_of(contract)[0].config_hash != run.config_hash
+
+
+def test_the_glue_run_hash_holds_the_emits_own_fingerprint(contract, monkeypatch):
+    """The same function and inputs as the IaC emit, never a re-derivation."""
+    from fluid_build.iac.providers import aws_glue_jars
+
+    seen = []
+    real = aws_glue_jars.glue_jars_fingerprint
+
+    def spy(config, environ=None):
+        seen.append(real(config, environ))
+        return seen[-1]
+
+    monkeypatch.setattr(aws_glue_jars, "glue_jars_fingerprint", spy)
+    monkeypatch.setenv(aws_glue_jars.JARS_URL_ENV, JARS_URL)
+    runs_of(_glue(contract, True, monkeypatch))
+    # What the emit computes from its own compile (aws_ingest: its account marker, os.environ)
+    from fluid_build.spark.compiler import compile_job_config
+
+    emitted = compile_job_config(contract, contract["builds"][0], account_ref="${emit_account}")
+    assert seen == [real(emitted.config)]
+    assert seen[0].startswith("sha256:")
+
+
+@pytest.mark.parametrize(
+    "runtime, extra",
+    [
+        ("emr-serverless", {}),
+        ("emr-eks", {"virtualClusterId": "vc1"}),
+        ("emr-ec2", {"clusterId": "j-1"}),
+        ("glue", {}),  # a JSON stream: Glue adds no jars
+    ],
+)
+@pytest.mark.parametrize("avro", [False, True])
+def test_a_build_that_loads_no_glue_jars_keeps_its_hash(
+    contract, monkeypatch, runtime, extra, avro
+):
+    if runtime == "glue" and avro:
+        pytest.skip("a Glue Avro build loads the pinned jars")
+    from fluid_build.iac.providers import aws_glue_jars
+
+    spark_cfg(contract).update(runtime=runtime, **extra)
+    if avro:
+        _avro(contract, monkeypatch)
+    before = runs_of(contract)[0].config_hash
+
+    def never(*_a, **_k):
+        raise AssertionError("not a Glue build that adds jars")
+
+    if runtime != "glue":
+        monkeypatch.setattr(aws_glue_jars, "glue_jars_fingerprint", never)
+    _bump_one_pin(monkeypatch)
+    monkeypatch.setenv(aws_glue_jars.JARS_URL_ENV, JARS_URL)
+    assert runs_of(contract)[0].config_hash == before
+
+
+def test_a_malformed_glue_jars_prefix_is_invalid(contract, monkeypatch):
+    from fluid_build.iac.providers.aws_glue_jars import JARS_URL_ENV
+
+    monkeypatch.setenv(JARS_URL_ENV, "https://not-s3/")
+    with pytest.raises(ValueError, match=JARS_URL_ENV):
+        runs_of(_glue(contract, True, monkeypatch))

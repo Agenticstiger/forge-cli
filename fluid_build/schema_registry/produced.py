@@ -23,6 +23,7 @@ _FORMATS = {
     "avro-confluent": "AVRO",
     "json": "JSON",
     "json-confluent": "JSON",
+    "protobuf": "PROTOBUF",
 }
 
 
@@ -35,14 +36,14 @@ class ProducedSubjectError(ValueError):
 
 
 def data_format(subject: Subject) -> str:
-    """``AVRO`` or ``JSON`` from the binding's ``serialization.value`` (Avro when unset)."""
+    """``AVRO``, ``JSON`` or ``PROTOBUF`` from the binding's ``serialization.value`` (Avro when unset)."""
     if not subject.format:
         return "AVRO"
     fmt = _FORMATS.get(subject.format)
     if fmt is None:
         raise ProducedSubjectError(
             "schema-registry-format",
-            f"{subject.ref.where}: forge registers Avro and JSON Schema subjects; "
+            f"{subject.ref.where}: forge registers Avro, JSON Schema and Protobuf subjects; "
             f"serialization.value {subject.format!r} is not one",
         )
     return fmt
@@ -50,7 +51,7 @@ def data_format(subject: Subject) -> str:
 
 def schema_definition(subject: Subject, namespace: str) -> Tuple[str, str]:
     """``(data format, schema text)`` for ``subject``: the expose's columns, derived."""
-    from .schemas import avro_name, derive, schema_text
+    from .schemas import avro_name, derive, proto_identifier, protobuf_schema, schema_text
 
     if not subject.columns:
         raise ProducedSubjectError(
@@ -59,12 +60,29 @@ def schema_definition(subject: Subject, namespace: str) -> Tuple[str, str]:
             "contract.schema, and it declares no columns",
         )
     fmt = data_format(subject)
+    package = ".".join(avro_name(part) for part in namespace.split("."))
+    if fmt == "PROTOBUF":
+        kind = get_kind(subject.ref.kind)
+        try:
+            text = protobuf_schema(
+                subject.columns,
+                name=proto_identifier(avro_name(subject.topic)),
+                package=package,
+                decimal=kind.protobuf_decimal,
+                decimal_hint=kind.protobuf_decimal_hint,
+            )
+        except ValueError as exc:
+            raise ProducedSubjectError(
+                "schema-registry-protobuf", f"{subject.ref.where}: {exc}"
+            ) from exc
+        # proto text, not JSON: registered as written, not through schema_text.
+        return fmt, text
     try:
         document = derive(
             subject.columns,
             fmt,
             name=avro_name(subject.topic),
-            namespace=".".join(avro_name(part) for part in namespace.split(".")),
+            namespace=package,
         )
     except ValueError as exc:
         raise ProducedSubjectError(
@@ -102,7 +120,8 @@ def classification_metadata(
     ``properties`` carries the expose's classification (else the contract's); ``tags``
     maps each personal-data column, by its field's full name (``<namespace>.<record>.
     <field>``, the names :func:`schema_definition` registers), to ``PII`` (Confluent data
-    contracts' field-tag shape). Empty parts are left out.
+    contracts' field-tag shape). Empty parts are left out. Only an Avro subject gets the
+    PII tags; a JSON Schema or Protobuf subject gets the classification property only.
     """
     from fluid_build.api.changelog_rules import _is_pii
 
@@ -127,8 +146,8 @@ def classification_metadata(
     out: dict = {}
     if classification:
         out["properties"] = {"fluid_classification": str(classification)}
-    # Field tags name Avro record fields; a JSON Schema subject's paths are not those
-    # names, so it gets the classification only.
+    # Field tags name Avro record fields; a JSON Schema or Protobuf subject's paths are not
+    # those names, so it gets the classification only.
     avro = str(((binding.get("serialization") or {}).get("value")) or "avro") in (
         "avro",
         "avro-confluent",

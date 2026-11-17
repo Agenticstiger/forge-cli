@@ -14,7 +14,9 @@ not in the checkout's history (a shallow clone). The corpus is every contract
 under ``examples/`` and ``fluid_build/templates/`` that holds no ``$ref``. An
 ODCS export may differ by the one line the 0.7.6 promotion (#752) moved, and
 only as the default moved (see ``_ODCS_OUTPUTS``), and by its expose's version
-replacing the 1.0.0 default (see ``_expose_version_promoted``).
+replacing the 1.0.0 default (see ``_expose_version_promoted``), and by the
+differences a merged PR made on purpose, each registered on its own (see
+``_REGISTERED_DIFFERENCES``).
 
 The baseline-harness scenarios (M-02 to M-07, M-13) are not here: they are run
 by ``repro/baseline/run_baseline.sh`` outside pytest.
@@ -557,6 +559,139 @@ def _expose_versions_promoted(text: Optional[str]) -> Optional[str]:
     return "".join(_expose_version_promoted(d) for d in re.split(r"(?m)^(?=---\n)", text))
 
 
+# Differences from v0.24.0 a merged PR made on purpose, registered one by one: the
+# contract, the command, the output, and the exact text v0.24.0 wrote with what the
+# checkout writes instead and how many times. Nothing is masked: the old side is rewritten
+# by exactly these replacements and then compared byte for byte, so any other change
+# still fails, and a registration that no longer matches what v0.24.0 wrote fails too.
+# Each names its change in ``_INTENTIONAL_CHANGES``, where a test pins it.
+class _Registered(NamedTuple):
+    change: str  # a key of _INTENTIONAL_CHANGES
+    old: str  # exactly what v0.24.0 wrote
+    new: str  # what the checkout writes instead
+    count: int = 1  # how many times v0.24.0 wrote it
+
+
+_FULL_SHARE = "an ODCS dq rule with a full share exports mustBe: 0 (#910)"
+_DEFAULT_OPERATOR = "an ODCS dq threshold without an operator reads as >= (#910)"
+_PARTIAL_SHARE = "an ODCS partial completeness share is mirrored onto the null share (#910)"
+_WARNING_NAMES_THE_FIX = "the ODCS no-quality-form warning names the fix first (#910)"
+
+
+def _full_share(dimension: str, description: str) -> _Registered:
+    """#910: a completeness / uniqueness rule at threshold 1.0 with >= was exported as the
+    passing share (``mustBeGreaterOrEqualTo: 1.0``, "at least one bad row"); it is
+    ``mustBe: 0`` bad rows."""
+    head = f"      dimension: {dimension}\n"
+    tail = f"      description: {description}\n"
+    return _Registered(
+        _FULL_SHARE,
+        f"{head}      mustBeGreaterOrEqualTo: 1.0\n{tail}",
+        f"{head}      mustBe: 0\n{tail}",
+    )
+
+
+def _warning_names_the_fix(lines: int) -> _Registered:
+    """#910: the warning for a dq rule ODCS cannot express names the fix first, because a
+    rule can now be refused for its threshold too. Each warning is two stderr lines (the
+    JSON record and the plain one)."""
+    return _Registered(
+        _WARNING_NAMES_THE_FIX,
+        "so nothing is lost. Restate it as a dq rule",
+        "so nothing is lost. Fix what the reason names, restate it as a dq rule",
+        lines,
+    )
+
+
+_REGISTERED_DIFFERENCES: Dict[Tuple[str, str, str], Tuple[_Registered, ...]] = {
+    # ── odcs.yaml (11) ──
+    ("examples/customer360/contract.fluid.yaml", "odcs", "odcs.yaml"): (
+        _full_share("completeness", "completeness check on customer_id"),
+    ),
+    ("examples/policy-examples/customer-profiles-contract.yaml", "odcs", "odcs.yaml"): (
+        # threshold 0.95 with no operator: v0.24.0 found no operator and wrote mustBe: 0
+        # ("no nulls"); read as >= (as fluid test reads it) it is "at most 5% nulls".
+        _Registered(
+            _DEFAULT_OPERATOR,
+            "      dimension: completeness\n      mustBe: 0\n"
+            "      description: 95% of profiles must have email\n",
+            "      dimension: completeness\n      mustBeLessOrEqualTo: 5\n      unit: percent\n"
+            "      description: 95% of profiles must have email\n",
+        ),
+    ),
+    ("examples/snowflake/billing_history/contract.fluid.yaml", "odcs", "odcs.yaml"): (
+        _full_share("completeness", "completeness check on billing_account_id"),
+    ),
+    ("examples/sovereignty-platform-swap/contract.fluid.yaml", "odcs", "odcs.yaml"): (
+        _full_share("completeness", "completeness check on event_id"),
+    ),
+    ("examples/sovereignty-platform-swap/contract.gcp.yaml", "odcs", "odcs.yaml"): (
+        _full_share("completeness", "completeness check on event_id"),
+    ),
+    ("examples/sovereignty-platform-swap/contract.snowflake.yaml", "odcs", "odcs.yaml"): (
+        _full_share("completeness", "completeness check on event_id"),
+    ),
+    ("templates/csv-basics/contract.fluid.yaml", "odcs", "odcs.yaml"): (
+        _full_share("completeness", "Ensure all customers have email addresses"),
+    ),
+    ("templates/customer-360/contract.fluid.yaml", "odcs", "odcs.yaml"): (
+        _full_share("uniqueness", "Customer IDs must be unique"),
+    ),
+    ("templates/data-quality-validation/contract.fluid.yaml", "odcs", "odcs.yaml"): (
+        _full_share("completeness", "Product ID is required for all products"),
+        _full_share("uniqueness", "Product IDs must be unique"),
+        # threshold 0.95 with >=: v0.24.0 copied the passing share across ("at least
+        # 0.95 nulls"); mirrored it is "at most 5% nulls".
+        _Registered(
+            _PARTIAL_SHARE,
+            "      dimension: completeness\n      mustBeGreaterOrEqualTo: 0.95\n"
+            "      description: Products should have names\n",
+            "      dimension: completeness\n      mustBeLessOrEqualTo: 5\n      unit: percent\n"
+            "      description: Products should have names\n",
+        ),
+    ),
+    ("templates/incremental-processing/contract.fluid.yaml", "odcs", "odcs.yaml"): (
+        _full_share("uniqueness", "Transaction IDs must be unique"),
+    ),
+    ("templates/testing-your-contract/contract.fluid.yaml", "odcs", "odcs.yaml"): (
+        _full_share("completeness", "Revenue cannot be null"),
+    ),
+    # ── stderr of odcs (8) and of odps, which renders ODCS too (8) ──
+    **{
+        (name, command, "stderr"): (_warning_names_the_fix(lines),)
+        for name, lines in (
+            ("examples/policy-examples/customer-profiles-contract.yaml", 2),
+            ("templates/csv-basics/contract.fluid.yaml", 2),
+            ("templates/customer-360/contract.fluid.yaml", 4),
+            ("templates/data-quality-validation/contract.fluid.yaml", 2),
+            ("templates/external-sql-files/contract.fluid.yaml", 2),
+            ("templates/first-dag/contract.fluid.yaml", 2),
+            ("templates/multi-source/contract.fluid.yaml", 4),
+            ("templates/testing-your-contract/contract.fluid.yaml", 2),
+        )
+        for command in ("odcs", "odps")
+    },
+}
+
+
+def _apply_registered(
+    text: Optional[str], key: Tuple[str, str, str]
+) -> Tuple[Optional[str], List[str]]:
+    """``text`` (what v0.24.0 wrote) with the registered differences for ``key`` applied,
+    and a problem for each registration that does not match it exactly."""
+    problems: List[str] = []
+    for reg in _REGISTERED_DIFFERENCES.get(key, ()):
+        found = (text or "").count(reg.old)
+        if found != reg.count:
+            problems.append(
+                f"registered difference ({reg.change}) expects {reg.count} of {reg.old!r} in "
+                f"v0.24.0's {key[2]}, found {found}: update or remove the registration"
+            )
+            continue
+        text = (text or "").replace(reg.old, reg.new)
+    return text, problems
+
+
 def mismatches(
     diff: Differential,
     job: str,
@@ -564,6 +699,7 @@ def mismatches(
     filename: Optional[str],
     *,
     stderr_in_any_order: bool = False,
+    name: Optional[str] = None,
 ) -> List[str]:
     """How the v0.24.0 and the checkout's results for one job differ, masked.
 
@@ -574,8 +710,12 @@ def mismatches(
     """
     found: List[str] = []
     old, new = diff.old.job(job), diff.new.job(job)
+    command = job.split(".", 1)[-1]
     for key in ("rc", "exc", "stdout", "stderr"):
         a, b = old[key], new[key]
+        if key == "stderr" and name:
+            a, problems = _apply_registered(a, (name, command, "stderr"))
+            found += [f"{job}: {p}" for p in problems]
         if key == "stderr" and stderr_in_any_order:
             a, b = "\n".join(sorted(a.splitlines())), "\n".join(sorted(b.splitlines()))
         if a != b:
@@ -584,6 +724,9 @@ def mismatches(
         old_file, new_file = diff.old.out_file(directory, filename), diff.new.out_file(
             directory, filename
         )
+        if name:
+            old_file, problems = _apply_registered(old_file, (name, command, filename))
+            found += [f"{job}: {p}" for p in problems]
         if filename in _ODCS_OUTPUTS:
             old_file = _expose_versions_promoted(old_file)
             old_file, new_file, moved = _recorded_version_moved_with_the_default(old_file, new_file)
@@ -720,7 +863,8 @@ def test_m01_a_contract_without_refs_exports_as_v0_24_0_did(
         prefix = f"{index:03d}"
         job = f"{prefix}.{command}"
         found += [
-            f"[{name}] {m}" for m in mismatches(differential, job, prefix, _OUTPUT_OF[command])
+            f"[{name}] {m}"
+            for m in mismatches(differential, job, prefix, _OUTPUT_OF[command], name=name)
         ]
         succeeded += differential.new.jobs[job]["rc"] == 0
 
@@ -922,6 +1066,26 @@ _INTENTIONAL_CHANGES: Dict[str, Tuple[str, str, str]] = {
         r"expose's `version`|expose version",
         "tests/providers/test_datamesh_manager_contract_hygiene.py",
         r"^test_(the_contract_carries_its_expose_version|odcs_version_defaults)",
+    ),
+    _FULL_SHARE: (
+        r"mustBe: 0",
+        "tests/providers/odcs/test_odcs_dq_threshold_mirroring.py",
+        r"^test_full_share_means_zero_bad_rows",
+    ),
+    _DEFAULT_OPERATOR: (
+        r"without an operator reads as `>=`",
+        "tests/providers/odcs/test_odcs_dq_threshold_mirroring.py",
+        r"^test_a_threshold_without_an_operator_reads_as_at_least",
+    ),
+    _PARTIAL_SHARE: (
+        r"mirrored onto the null share",
+        "tests/providers/odcs/test_odcs_dq_threshold_mirroring.py",
+        r"^test_completeness_95_percent_is_at_most_5_percent_nulls",
+    ),
+    _WARNING_NAMES_THE_FIX: (
+        r"not exported, with a warning",
+        "tests/providers/test_odcs_quality_export.py",
+        r"^test_the_no_quality_form_warning_names_the_fix_first",
     ),
     "fluid docs reads a contract whole, and the output changes": (
         r"fluid docs|`docs`",
@@ -1300,3 +1464,23 @@ def test_m17_the_loader_helpers_third_parties_import_are_still_there(tmp_path: P
     assert _resolve_refs(tree, tmp_path, ref_root=tmp_path) == _resolve_refs(tree, tmp_path)
     with pytest.raises(RefConfinementError):
         _resolve_refs({"x": {"$ref": "../escape.yaml"}}, tmp_path)
+
+
+def test_m10_a_registered_difference_must_match_what_v0_24_0_wrote_exactly() -> None:
+    key = ("templates/customer-360/contract.fluid.yaml", "odcs", "stderr")
+    (reg,) = _REGISTERED_DIFFERENCES[key]
+    line = f"x {reg.old} y\n"
+    applied, problems = _apply_registered(line * reg.count, key)
+    assert not problems and applied == f"x {reg.new} y\n" * reg.count
+    # One occurrence fewer (or more) than registered is a stale registration, not a pass.
+    for wrong in (reg.count - 1, reg.count + 1):
+        _, problems = _apply_registered(line * wrong, key)
+        assert problems and "update or remove the registration" in problems[0]
+    # A contract nothing is registered for is left exactly as v0.24.0 wrote it.
+    assert _apply_registered("anything", ("other.yaml", "odcs", "stderr")) == ("anything", [])
+
+
+def test_m10_every_registered_difference_names_a_pinned_intentional_change() -> None:
+    for regs in _REGISTERED_DIFFERENCES.values():
+        for reg in regs:
+            assert reg.change in _INTENTIONAL_CHANGES, reg.change

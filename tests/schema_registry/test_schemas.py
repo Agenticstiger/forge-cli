@@ -304,7 +304,9 @@ def test_registry_format():
     assert registry_format("json-confluent") == "JSON"
     assert registry_format("avro-confluent") == "AVRO"
     assert registry_format("avro") == "AVRO"
-    assert registry_format("") == "AVRO"
+    # Any other format is refused, never read as Avro (it used to fall through to AVRO).
+    for other in ("", "protobuf", "xml", "JSON", "avro-confluent-v2"):
+        assert registry_format(other) is None
 
 
 def test_derive_dispatches_on_format():

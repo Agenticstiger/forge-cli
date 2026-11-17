@@ -39,6 +39,13 @@ class RegistryKind:
     refuses: FrozenSet[str] = frozenset()
     #: Whether the registry answers a dry-run compatibility check.
     checks_compatibility: bool = False
+    #: How a Protobuf subject carries a ``decimal`` column: ``(message type, import path)``,
+    #: or ``None`` when the registry resolves no decimal type (then :attr:`protobuf_decimal_hint`
+    #: is the refusal's fix text).
+    protobuf_decimal: Optional[Tuple[str, str]] = None
+    #: What to say when a Protobuf subject declares a ``decimal`` column and
+    #: :attr:`protobuf_decimal` is ``None``: the way out for the author.
+    protobuf_decimal_hint: str = ""
     #: The operator variable OpenTofu sends as the registry credential when it registers
     #: this kind's produced subject at the contract's ``url`` (Confluent:
     #: ``SCHEMA_REGISTRY_API_SECRET``), or ``None`` when it sends none (Glue: IAM).

@@ -91,6 +91,11 @@ def _check(
         "requested": ref.version,
     }
     at = f"{ref.where} ({ref.label})"
+    if expected is None:
+        return record, (
+            f"{at}: the stream's format {subject.format!r} is not one the registry check "
+            "reads (json or avro-confluent); nothing was read or compared"
+        )
     # One client per kind: each kind reads its own way (kind.read).
     client = open_client(ref)
     try:

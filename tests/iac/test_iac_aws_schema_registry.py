@@ -242,10 +242,48 @@ def test_unset_serialization_is_avro():
     assert emit(contract)[0]["aws_glue_schema"][SCHEMA_KEY]["data_format"] == "AVRO"
 
 
-def test_protobuf_is_refused():
+def test_protobuf_without_field_numbers_is_refused():
     with pytest.raises(UnsupportedBindingError) as caught:
         AwsIacPlugin().emit(make(serialization="protobuf"))
-    assert caught.value.kind == "schema-registry-format"
+    assert caught.value.kind == "schema-registry-protobuf"
+    assert "protobuf.field" in str(caught.value)
+
+
+def test_protobuf_registers_the_generated_proto_text():
+    contract = make(serialization="protobuf")
+    columns = contract["exposes"][1]["contract"]["schema"]
+    columns[:] = [
+        {"name": "order_id", "type": "string", "required": True, "protobuf": {"field": 1}},
+        {"name": "email", "type": "string", "protobuf": {"field": 2}},
+    ]
+    resources, _ = emit(contract)
+    schema = resources["aws_glue_schema"][SCHEMA_KEY]
+    assert schema["data_format"] == "PROTOBUF"
+    assert schema["schema_definition"] == (
+        'syntax = "proto3";\n'
+        "\n"
+        f"package fluid.{CID};\n"
+        "\n"
+        "message commerce_orders {\n"
+        "  string order_id = 1;\n"
+        "  optional string email = 2;\n"
+        "}\n"
+    )
+    (subject,) = produced_subjects(contract)
+    assert (schema["data_format"], schema["schema_definition"]) == schema_definition(
+        subject, f"fluid.{CID}"
+    )
+
+
+def test_a_decimal_column_in_a_protobuf_subject_is_refused():
+    contract = make(serialization="protobuf")
+    contract["exposes"][1]["contract"]["schema"][:] = [
+        {"name": "amount", "type": "decimal(18,2)", "protobuf": {"field": 1}}
+    ]
+    with pytest.raises(UnsupportedBindingError) as caught:
+        AwsIacPlugin().emit(contract)
+    assert caught.value.kind == "schema-registry-protobuf"
+    assert "resolves no decimal type for Protobuf" in str(caught.value)
 
 
 def test_a_produced_subject_without_columns_is_refused():

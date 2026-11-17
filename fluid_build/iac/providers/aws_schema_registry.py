@@ -16,7 +16,7 @@ OpenTofu (founder decision D7, 2026-11-16). For each Kafka-bound expose whose
   and ``registry_arn`` is left out (``glue:CreateSchema`` with no registry uses
   ``default-registry``).
 * ``aws_glue_schema``: the subject (``registry.subject``, else ``<topic>-value``),
-  ``data_format`` from ``binding.serialization.value`` (Avro unless JSON),
+  ``data_format`` from ``binding.serialization.value`` (Avro unless JSON Schema or Protobuf),
   ``compatibility`` from the contract (default ``BACKWARD_ALL``), and the schema
   derived from the expose's ``contract.schema``, as canonical text so the module and
   its plan digest are stable. A changed definition is a new schema version, and Glue

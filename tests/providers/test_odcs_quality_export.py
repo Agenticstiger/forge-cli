@@ -242,6 +242,18 @@ def test_freshness_rule_exports_as_an_odcs_custom_rule() -> None:
     assert rules["orders_fresh"]["dimension"] == "timeliness"
 
 
+def test_the_no_quality_form_warning_names_the_fix_first(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#910: a rule can now be refused for its threshold too, so the warning's advice
+    leads with fixing what the reason names. The compatibility gate registers this text
+    change against v0.24.0 (tests/fragments/test_compat_gate.py)."""
+    with caplog.at_level(logging.WARNING):
+        _render(_RICH)
+    named = [r.getMessage() for r in caplog.records if "orders_anomaly" in r.getMessage()]
+    assert named and "so nothing is lost. Fix what the reason names, restate it as" in named[0]
+
+
 def test_dq_rule_with_no_odcs_form_warns_and_is_still_parked(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

@@ -106,6 +106,37 @@ def test_the_format_follows_serialization(value, fmt):
         assert document["type"] == "record" and document["namespace"] == "fluid.gold_orders"
 
 
+def test_protobuf_registers_the_generated_proto_text_with_a_decimal():
+    contract = make(serialization="protobuf")
+    contract["exposes"][0]["contract"]["schema"][:] = [
+        {"name": "id", "type": "string", "required": True, "protobuf": {"field": 1}},
+        {"name": "amount", "type": "decimal(18,2)", "protobuf": {"field": 2}},
+    ]
+    schema = emit(contract)["confluent_schema"][KEY]
+    assert schema["format"] == "PROTOBUF"
+    assert schema["schema"] == (
+        'syntax = "proto3";\n'
+        "\n"
+        "package fluid.gold_orders;\n"
+        "\n"
+        'import "confluent/type/decimal.proto";\n'
+        "\n"
+        "message orders_v1 {\n"
+        "  string id = 1;\n"
+        "  optional .confluent.type.Decimal amount = 2;\n"
+        "}\n"
+    )
+    (subject,) = produced_subjects(contract)
+    assert (schema["format"], schema["schema"]) == schema_definition(subject, "fluid.gold_orders")
+    assert "tags" not in schema.get("metadata", {})
+
+
+def test_protobuf_without_field_numbers_is_refused():
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(make(serialization="protobuf"))
+    assert caught.value.kind == "schema-registry-protobuf"
+
+
 def test_the_schema_text_is_canonical_and_equals_produced_schema_definition():
     contract = make()
     schema = emit(contract)["confluent_schema"][KEY]
@@ -185,9 +216,9 @@ def test_no_columns_is_refused():
     assert caught.value.kind == "schema-registry-no-columns"
 
 
-def test_protobuf_is_refused():
+def test_xml_is_refused():
     with pytest.raises(UnsupportedBindingError) as caught:
-        emit(make(serialization="protobuf"))
+        emit(make(serialization="xml"))
     assert caught.value.kind == "schema-registry-format"
 
 

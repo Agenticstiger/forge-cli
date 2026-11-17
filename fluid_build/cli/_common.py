@@ -90,7 +90,13 @@ def load_yaml_json(path: Path) -> Any:
         return _json.load(f)
 
 
-def resolve_env_templates_in_contract(contract: Any) -> Any:
+_APPLY_RESOLVE_PURPOSE = (
+    "The resolved contract is written to main.tf.json, to the OpenTofu state, and to the "
+    "Snowflake table COMMENT"
+)
+
+
+def resolve_env_templates_in_contract(contract: Any, *, purpose: Optional[str] = None) -> Any:
     """Recursively resolve ``{{ env.VAR }}`` placeholders throughout a contract.
 
     Walks dicts and lists and delegates every string to the canonical
@@ -116,6 +122,9 @@ def resolve_env_templates_in_contract(contract: Any) -> Any:
     publish path, kept symmetric here per the CLAUDE.md "extend both" rule.
     Real credentials reach the provider through its own environment
     variables, never through contract text.
+
+    ``purpose`` names where this caller's resolved contract goes, for the warning; the
+    default is the OpenTofu emit path's sinks (``fluid plan`` passes its own).
     """
     from fluid_build.observability.secret_redactor import is_sensitive_key_name
     from fluid_build.providers.snowflake.util.config import ENV_TEMPLATE_RE, resolve_env_templates
@@ -138,13 +147,12 @@ def resolve_env_templates_in_contract(contract: Any) -> Any:
                 seen_sensitive.add(name)
                 log.warning(
                     "Refusing to resolve sensitive-looking env placeholder "
-                    "'{{ env.%s }}' in contract body; leaving it literal. The "
-                    "resolved contract is written to main.tf.json, to the "
-                    "OpenTofu state, and to the Snowflake table COMMENT — a "
+                    "'{{ env.%s }}' in contract body; leaving it literal. %s — a "
                     "credential must not ride along. If this value is not a "
                     "secret, rename the variable outside the "
                     "password/secret/token/key family.",
                     name,
+                    purpose or _APPLY_RESOLVE_PURPOSE,
                 )
 
         # Resolve the non-sensitive placeholders in the same string, leaving
