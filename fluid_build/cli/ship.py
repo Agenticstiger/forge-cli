@@ -81,6 +81,16 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "  fluid ship --apply-mode dry-run --yes     # nothing is written\n"
         ),
     )
+    _add_run_options(p)
+    _add_apply_options(p.add_argument_group("apply"))
+    _add_publish_options(p.add_argument_group("publish and schedule (opt-in stages 10 and 11)"))
+    _add_selection_options(p.add_argument_group("selecting stages"))
+    _add_output_options(p.add_argument_group("output"))
+    p.set_defaults(cmd=COMMAND, func=run)
+
+
+def _add_run_options(p: argparse.ArgumentParser) -> None:
+    """The contract and the switches every run reads."""
     p.add_argument(
         "contract",
         nargs="?",
@@ -113,7 +123,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="Removed: apply runs only the reviewed plan. Use --stage / --until.",
     )
 
-    g = p.add_argument_group("apply")
+
+def _add_apply_options(g: argparse._ArgumentGroup) -> None:
+    """Stage 7's mode and its overrides."""
     g.add_argument(
         "--apply-mode",
         choices=st.APPLY_MODES,
@@ -143,7 +155,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "--no-generate-artifacts", action="store_true", help="Skip stage 3 (generate artifacts)."
     )
 
-    g = p.add_argument_group("publish and schedule (opt-in stages 10 and 11)")
+
+def _add_publish_options(g: argparse._ArgumentGroup) -> None:
+    """The opt-in stages 10 and 11."""
     g.add_argument(
         "--publish", action="store_true", help="Run stage 10 (publish), with --stage too."
     )
@@ -170,7 +184,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "--schedule-sync-dry-run", action="store_true", help="Pass --dry-run to schedule-sync."
     )
 
-    g = p.add_argument_group("selecting stages")
+
+def _add_selection_options(g: argparse._ArgumentGroup) -> None:
+    """Which stages run."""
     g.add_argument("--until", default=None, metavar="STAGE", help="Stop after STAGE.")
     g.add_argument(
         "--stage",
@@ -191,7 +207,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="Print the resolved stage plan (argv and skip reasons), run nothing, exit 0.",
     )
 
-    g = p.add_argument_group("output")
+
+def _add_output_options(g: argparse._ArgumentGroup) -> None:
+    """Log grouping and the run report."""
     g.add_argument(
         "--ci-output",
         choices=_ci_output.MODES,
@@ -206,7 +224,6 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "contract; a relative path is taken from the current directory)."
         ),
     )
-    p.set_defaults(cmd=COMMAND, func=run)
 
 
 @traced_stage("ship")
