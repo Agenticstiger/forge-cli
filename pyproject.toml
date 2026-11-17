@@ -400,7 +400,7 @@ lineage = [
 # and database sources through the sandbox ``fluid init --discover`` uses, with
 # the same floor as ``[local]``. The canonical JSON comes from ``rfc8785``, a base
 # dependency. ``flux-stats`` is FLUX's statistic registry and record reader: it
-# reads every value and forms every number (MEAS-3), as the fidelity check
+# reads every value and forms every number (one definition per statistic), as the fidelity check
 # does. It is standard-library only and supports Python 3.10, so it needs no
 # marker.
 #

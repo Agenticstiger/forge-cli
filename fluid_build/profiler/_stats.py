@@ -3,8 +3,7 @@
 
 """The one seam between ``fluid profile`` and FLUX's statistic registry.
 
-MEAS-3 asks for one implementation of every statistic, shared by the profiler
-and the fidelity check, so that real and synthetic numbers are formed the same
+The profiler and the fidelity check share one implementation of every statistic, so that real and synthetic numbers are formed the same
 way. FLUX keeps that implementation in ``flux-stats``, the registry flux-engine
 releases as a distribution of its own (ADR 0009): one definition per statistic,
 with the pure function that forms it and its canonical spelling. The record
