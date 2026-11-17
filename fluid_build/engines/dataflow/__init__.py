@@ -59,16 +59,12 @@ def _generate_pipeline(
     *,
     transformation_intent: Optional[TransformationIntent] = None,
 ) -> str:
-    """Generate an Apache Beam pipeline script.
-
-    Every contract value reaches the script through a ``codegen_utils`` helper
-    (a literal, a comment or a docstring), so none can end its place and run as code.
-    """
+    """Generate an Apache Beam pipeline script; contract values reach it only as data."""
     # Imported here: ``providers.common`` brings asyncio and ssl, which
     # registering the engine does not need.
     from fluid_build.providers.common.codegen_utils import (
+        escape_for_docstring,
         py_comment_text,
-        py_docstring_text,
         py_str_literal,
     )
 
@@ -78,7 +74,7 @@ def _generate_pipeline(
     props = build.get("properties", {})
 
     # Use embedded SQL from build properties if available (embedded-logic pattern)
-    embedded_sql = props.get("sql", "")
+    embedded_sql = str(props.get("sql") or "")
 
     col_comments = ""
     if columns:
@@ -90,7 +86,7 @@ def _generate_pipeline(
     lines = [
         _HEADER,
         '"""',
-        f"Apache Beam pipeline for '{py_docstring_text(expose_id)}'.",
+        f"Apache Beam pipeline for '{escape_for_docstring(expose_id)}'.",
         "",
         "Run locally:",
         "    python pipeline.py --runner DirectRunner",
@@ -125,7 +121,7 @@ def _generate_pipeline(
     # Transform DoFn
     lines.append("# ── Transform functions ───────────────────────────────────────────\n")
     lines.append("class TransformFn(beam.DoFn):")
-    lines.append(f'    """Transform input records for \'{py_docstring_text(expose_id)}\'."""\n')
+    lines.append(f'    """Transform input records for \'{escape_for_docstring(expose_id)}\'."""\n')
     lines.append("    def process(self, element):")
     lines.append("        # TODO: Implement transformation logic")
     if columns:

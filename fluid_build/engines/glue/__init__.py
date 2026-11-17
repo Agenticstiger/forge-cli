@@ -60,15 +60,11 @@ def _generate_glue_job(
     *,
     transformation_intent: Optional[TransformationIntent] = None,
 ) -> str:
-    """Generate a PySpark Glue ETL job script.
-
-    Every contract value reaches the script through a ``codegen_utils`` helper
-    (a literal, a comment or a block), so none can end its place and run as code.
-    """
+    """Generate a PySpark Glue ETL job script; contract values reach it only as data."""
     # Imported here: ``providers.common`` brings asyncio and ssl, which
     # registering the engine does not need.
     from fluid_build.providers.common.codegen_utils import (
-        py_block_literal,
+        escape_sql_for_python,
         py_comment_text,
         py_str_literal,
     )
@@ -81,7 +77,7 @@ def _generate_glue_job(
     embedded_sql = ""
     props = build.get("properties", {})
     if props.get("sql"):
-        embedded_sql = props["sql"]
+        embedded_sql = str(props["sql"])
 
     col_comments = ""
     if columns:
@@ -123,7 +119,7 @@ def _generate_glue_job(
         summary = py_comment_text(embedded_sql[:200]) + ("..." if len(embedded_sql) > 200 else "")
         lines.append(f"# {summary}")
         lines.append('source_dyf.toDF().createOrReplaceTempView("source")')
-        lines.append(f"result_df = spark.sql({py_block_literal(embedded_sql)})")
+        lines.append(f'result_df = spark.sql("""\n{escape_sql_for_python(embedded_sql)}\n""")')
         lines.append("from awsglue.dynamicframe import DynamicFrame")
         lines.append(
             f"result_dyf = DynamicFrame.fromDF(result_df, glue_ctx, {py_str_literal(expose_id)})\n\n"

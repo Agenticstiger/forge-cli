@@ -68,7 +68,7 @@ def _spark_type(fluid_type: str) -> str:
         "decimal": "DecimalType(18, 2)",
         "numeric": "DecimalType(18, 2)",
     }
-    return mapping.get(fluid_type.lower(), "StringType()")
+    return mapping.get(str(fluid_type).lower(), "StringType()")
 
 
 def _generate_spark_job(
@@ -77,20 +77,15 @@ def _generate_spark_job(
     *,
     transformation_intent: Optional[TransformationIntent] = None,
 ) -> str:
-    """Generate a PySpark transformation script.
-
-    Every contract value reaches the script through a ``codegen_utils`` helper
-    (a literal, a comment, a docstring, a block or an identifier), so none can
-    end its place and run as code.
-    """
+    """Generate a PySpark transformation script; contract values reach it only as data."""
     # Imported here: ``providers.common`` brings asyncio and ssl, which
     # registering the engine does not need.
     from fluid_build.providers.common.codegen_utils import (
-        py_block_literal,
+        escape_for_docstring,
+        escape_sql_for_python,
         py_comment_text,
-        py_docstring_text,
         py_str_literal,
-        sanitize_identifier,
+        unique_identifiers,
     )
 
     exposes = get_exposes(contract)
@@ -100,7 +95,7 @@ def _generate_spark_job(
     pattern = build.get("pattern", "hybrid-reference")
 
     # Use embedded SQL from build properties if available (embedded-logic pattern)
-    embedded_sql = props.get("sql", "")
+    embedded_sql = str(props.get("sql") or "")
 
     col_comments = ""
     if columns:
@@ -112,7 +107,7 @@ def _generate_spark_job(
     lines = [
         _HEADER,
         '"""',
-        f"PySpark transformation job for '{py_docstring_text(expose_id)}'.",
+        f"PySpark transformation job for '{escape_for_docstring(expose_id)}'.",
         "",
         "Run locally:",
         "    spark-submit spark_job.py",
@@ -153,11 +148,15 @@ def _generate_spark_job(
     # Transformation function
     lines.append("# ── Transformation ────────────────────────────────────────────────\n")
     lines.append("def transform(spark, source_df):")
-    lines.append(f'    """Apply transformations to produce \'{py_docstring_text(expose_id)}\'."""')
+    lines.append(
+        f'    """Apply transformations to produce \'{escape_for_docstring(expose_id)}\'."""'
+    )
 
     if embedded_sql:
         lines.append('    source_df.createOrReplaceTempView("source")')
-        lines.append(f"    result_df = spark.sql({py_block_literal(embedded_sql, '    ')})")
+        lines.append(
+            f'    result_df = spark.sql("""\n{escape_sql_for_python(embedded_sql)}\n    """)'
+        )
         lines.append("    return result_df\n")
     elif columns:
         lines.append("    # TODO: Implement transformation logic")
@@ -173,18 +172,20 @@ def _generate_spark_job(
         lines.append("    return source_df\n")
 
     # Multi-stage helper
-    if pattern == "multi-stage" and transformation_intent and transformation_intent.stages:
+    stages = transformation_intent.stages if transformation_intent else []
+    stage_fns = unique_identifiers(f"stage_{s.get('name', 'stage')}" for s in stages)
+    if pattern == "multi-stage" and stages:
         lines.append("")
         lines.append("# ── Multi-stage transformations ────────────────────────────────────\n")
-        for stage in transformation_intent.stages:
+        for stage, stage_fn in zip(stages, stage_fns, strict=True):
             stage_name = stage.get("name", "stage")
-            sql = stage.get("sql", "")
-            lines.append(f"def {sanitize_identifier(f'stage_{stage_name}')}(spark, df):")
-            lines.append(f'    """Stage: {py_docstring_text(stage_name)}."""')
+            sql = str(stage.get("sql") or "")
+            lines.append(f"def {stage_fn}(spark, df):")
+            lines.append(f'    """Stage: {escape_for_docstring(stage_name)}."""')
             if sql:
                 view = py_str_literal(f"{stage_name}_input")
                 lines.append(f"    df.createOrReplaceTempView({view})")
-                lines.append(f"    return spark.sql({py_block_literal(sql, '    ')})")
+                lines.append(f'    return spark.sql("""\n{escape_sql_for_python(sql)}\n    """)')
             else:
                 lines.append(f"    # TODO: Implement stage '{py_comment_text(stage_name)}'")
                 lines.append("    return df")
@@ -204,12 +205,11 @@ def _generate_spark_job(
     )
     lines.append('        source_df = spark.read.parquet("s3a://my-bucket/input/")\n')
 
-    if pattern == "multi-stage" and transformation_intent and transformation_intent.stages:
+    if pattern == "multi-stage" and stages:
         lines.append("        # ── Execute stages ──")
         lines.append("        df = source_df")
-        for stage in transformation_intent.stages:
-            stage_name = stage.get("name", "stage")
-            lines.append(f"        df = {sanitize_identifier(f'stage_{stage_name}')}(spark, df)")
+        for stage_fn in stage_fns:
+            lines.append(f"        df = {stage_fn}(spark, df)")
         lines.append("        result_df = df\n")
     else:
         lines.append("        # ── Transform ──")

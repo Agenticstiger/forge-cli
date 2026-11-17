@@ -161,41 +161,33 @@ def py_comment_text(value: Any) -> str:
 
     A comment ends at a CR as well as at an LF, so a value holding either would
     end the comment and start a statement that runs when the file is imported.
-    datamodel-code-generator shipped that bug twice (CVE-2026-54621 and
-    CVE-2026-54654: its comment escaping handled LF but not CR). Every control
-    character and line separator becomes a space here; anything else is kept as
-    written, so ``orders`` stays ``orders``.
+    datamodel-code-generator's comment escaping handled LF but not CR
+    (CVE-2026-54621). Every control character and line separator becomes a
+    space here; anything else is kept as written, so ``orders`` stays ``orders``.
     """
     return _CONTROL_OR_LINE_BREAK.sub(" ", "" if value is None else str(value))
 
 
-def py_docstring_text(value: Any) -> str:
-    """Return ``value`` as text for a triple-double-quoted docstring in generated source.
+def unique_identifiers(names: Iterable[Any]) -> List[str]:
+    """One distinct Python identifier per name, in order.
 
-    On top of :func:`py_comment_text`, each backslash and double quote is
-    escaped, so the text can neither close the docstring nor start an escape
-    sequence.
+    Each name goes through :func:`sanitize_identifier`, which is not
+    injective, and a collision takes a ``_2``, ``_3``... suffix, as
+    :func:`unique_task_identifiers` does for task ids. Stages named ``a-b``
+    and ``a.b`` become ``stage_a_b`` and ``stage_a_b_2``, so neither generated
+    function replaces the other.
     """
-    return py_comment_text(value).replace("\\", "\\\\").replace('"', '\\"')
-
-
-#: A control character other than tab and line feed.
-_CONTROL_BUT_TAB_OR_LF = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")
-
-
-def py_block_literal(text: Any, closing_indent: str = "") -> str:
-    """Return a string literal for a multi-line block (embedded SQL) in generated source.
-
-    The block reads as written, ``\"\"\"\\n<text>\\n<closing_indent>\"\"\"``,
-    when nothing in it can change the literal: no backslash (an escape), no
-    ``\"\"\"`` (the end of the literal) and no control character but tab and
-    line feed. Otherwise it falls back to :func:`py_str_literal`, a one-line
-    literal that holds the same text.
-    """
-    value = "" if text is None else str(text)
-    if "\\" in value or '"""' in value or _CONTROL_BUT_TAB_OR_LF.search(value):
-        return py_str_literal(value)
-    return f'"""\n{value}\n{closing_indent}"""'
+    used: set = set()
+    identifiers: List[str] = []
+    for name in names:
+        base = sanitize_identifier(name)
+        candidate, suffix = base, 2
+        while candidate in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        identifiers.append(candidate)
+    return identifiers
 
 
 def convert_schedule_to_cron(schedule: str) -> str:

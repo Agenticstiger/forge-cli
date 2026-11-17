@@ -5,9 +5,9 @@
 
 A column name, a column type, the expose id, the contract name, a stage name or
 the embedded SQL reaches the generated script as a string literal, a one-line
-comment, a docstring or a sanitised identifier, so none can end its place and add
-a statement. The generated file must parse, and nothing in it may call what a
-hostile value spelled out.
+comment, an escaped docstring or SQL block, or a unique sanitised identifier, so
+none can end its place and add a statement. The generated file must parse, and
+nothing in it may call what a hostile value spelled out.
 """
 
 from __future__ import annotations
@@ -20,11 +20,7 @@ from fluid_build.engines.base import TransformationIntent
 from fluid_build.engines.dataflow import _generate_pipeline
 from fluid_build.engines.glue import _generate_glue_job
 from fluid_build.engines.spark import _generate_spark_job
-from fluid_build.providers.common.codegen_utils import (
-    py_block_literal,
-    py_comment_text,
-    py_docstring_text,
-)
+from fluid_build.providers.common.codegen_utils import py_comment_text, unique_identifiers
 
 pytestmark = pytest.mark.unit
 
@@ -41,11 +37,12 @@ _HOSTILE = [
 ]
 
 _GENERATORS = [_generate_glue_job, _generate_pipeline, _generate_spark_job]
+_SQL_BLOCK_GENERATORS = [_generate_glue_job, _generate_spark_job]
 
 
-def _contract(expose_id: str = "orders", column: str = "order_id", ctype: str = "string"):
+def _contract(expose_id="orders", column="order_id", ctype="string", name="Orders"):
     return {
-        "name": "Orders",
+        "name": name,
         "exposes": [
             {
                 "exposeId": expose_id,
@@ -55,7 +52,7 @@ def _contract(expose_id: str = "orders", column: str = "order_id", ctype: str = 
     }
 
 
-def _assert_inert(source: str) -> ast.Module:
+def _inert(source: str) -> ast.Module:
     tree = ast.parse(source)
     calls = [
         node
@@ -68,46 +65,78 @@ def _assert_inert(source: str) -> ast.Module:
     return tree
 
 
-def _constants(tree: ast.Module) -> set:
-    return {node.value for node in ast.walk(tree) if isinstance(node, ast.Constant)}
+def _strings(tree: ast.Module) -> list:
+    return [
+        n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    ]
+
+
+def _multi_stage(stages, **contract):
+    intent = TransformationIntent(stages=stages)
+    return _generate_spark_job(
+        _contract(**contract), {"pattern": "multi-stage"}, transformation_intent=intent
+    )
 
 
 @pytest.mark.parametrize("generate", _GENERATORS)
 @pytest.mark.parametrize("value", _HOSTILE)
 def test_a_hostile_column_name_or_type_stays_a_string(generate, value):
-    tree = _assert_inert(generate(_contract(column=value, ctype=value), {}))
-    assert value in _constants(tree)
+    tree = _inert(generate(_contract(column=value, ctype=value), {}))
+    assert value in _strings(tree)
 
 
 @pytest.mark.parametrize("generate", _GENERATORS)
 @pytest.mark.parametrize("value", _HOSTILE)
 def test_a_hostile_expose_id_stays_data(generate, value):
-    _assert_inert(generate(_contract(expose_id=value), {}))
+    _inert(generate(_contract(expose_id=value), {}))
 
 
 @pytest.mark.parametrize("generate", _GENERATORS)
 @pytest.mark.parametrize("value", _HOSTILE)
 def test_hostile_embedded_sql_stays_data(generate, value):
-    _assert_inert(generate(_contract(), {"properties": {"sql": f"SELECT 1 {value}"}}))
+    _inert(generate(_contract(), {"properties": {"sql": f"SELECT 1 {value}"}}))
 
 
 @pytest.mark.parametrize("value", _HOSTILE)
 def test_a_hostile_stage_or_contract_name_stays_data(value):
-    intent = TransformationIntent(stages=[{"name": value, "sql": f"SELECT 2 {value}"}])
-    contract = dict(_contract(), name=value)
-    _assert_inert(
-        _generate_spark_job(contract, {"pattern": "multi-stage"}, transformation_intent=intent)
-    )
+    _inert(_multi_stage([{"name": value, "sql": f"SELECT 2 {value}"}], name=value))
+
+
+@pytest.mark.parametrize("generate", _SQL_BLOCK_GENERATORS)
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT order_id,\n       amount\nFROM source",
+        "SELECT regexp_replace(x, '\\s+', ' ') FROM source",
+        'SELECT "Order Id" FROM source WHERE note = \'a "quoted" word\'',
+    ],
+)
+def test_embedded_sql_keeps_its_block_and_its_text(generate, sql):
+    source = generate(_contract(), {"properties": {"sql": sql}})
+    assert any(sql in value for value in _strings(_inert(source)))
+    assert 'spark.sql("""\n' in source
+
+
+def test_plain_multi_line_sql_reads_as_written():
+    sql = "SELECT order_id,\n       amount\nFROM source"
+    for generate in _SQL_BLOCK_GENERATORS:
+        assert f'"""\n{sql}\n' in generate(_contract(), {"properties": {"sql": sql}})
+
+
+def test_stages_whose_names_sanitise_alike_stay_two_functions():
+    source = _multi_stage([{"name": "a-b", "sql": "SELECT 1"}, {"name": "a.b", "sql": "SELECT 2"}])
+    tree = _inert(source)
+    defs = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    assert defs.count("stage_a_b") == 1 and defs.count("stage_a_b_2") == 1
+    assert source.index("df = stage_a_b(spark, df)") < source.index("df = stage_a_b_2(spark, df)")
+    assert any("SELECT 1" in v for v in _strings(tree))
+    assert any("SELECT 2" in v for v in _strings(tree))
 
 
 @pytest.mark.parametrize("generate", _GENERATORS)
-def test_multi_line_sql_keeps_its_block_and_the_script_parses(generate):
-    sql = "SELECT order_id,\n       amount\nFROM source"
-    source = generate(_contract(), {"properties": {"sql": sql}})
-    tree = _assert_inert(source)
-    if generate is not _generate_pipeline:  # the Beam pipeline quotes SQL in comments only
-        assert any(isinstance(value, str) and sql in value for value in _constants(tree))
-        assert f'"""\n{sql}\n' in source
+def test_a_value_that_is_not_a_string_does_not_stop_generation(generate):
+    _inert(generate(_contract(ctype=None), {"properties": {"sql": 5}}))
+    _inert(generate(_contract(ctype=5), {}))
 
 
 def test_comment_text_is_one_line_and_keeps_plain_text():
@@ -116,23 +145,10 @@ def test_comment_text_is_one_line_and_keeps_plain_text():
     assert py_comment_text(None) == ""
 
 
-def test_docstring_text_cannot_close_the_docstring():
-    text = py_docstring_text('x"""y\\')
-    assert '"""' not in text
-    assert ast.literal_eval(f'"""{text}"""') == 'x"""y\\'
-
-
-@pytest.mark.parametrize(
-    "value, readable",
-    [
-        ("SELECT 1\nFROM t", True),
-        ('SELECT """', False),
-        ("SELECT '\\n'", False),
-        ("SELECT 1\rFROM t", False),
-        ("", True),
-    ],
-)
-def test_a_block_literal_reads_as_written_only_when_it_is_safe(value, readable):
-    literal = py_block_literal(value, "    ")
-    assert literal.startswith('"""') is readable
-    assert ast.literal_eval(literal) == (f"\n{value}\n    " if readable else value)
+def test_unique_identifiers_suffix_a_collision_in_order():
+    assert unique_identifiers(["stage_a-b", "stage_a.b", "stage_a_b", "stage_c"]) == [
+        "stage_a_b",
+        "stage_a_b_2",
+        "stage_a_b_3",
+        "stage_c",
+    ]
