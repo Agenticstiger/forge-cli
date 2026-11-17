@@ -215,6 +215,13 @@ def test_without_the_mirror_the_defaults_are_unchanged(contract, monkeypatch):
         ("https://169.254.169.254/latest/", "link-local"),
         ("https://[fe80::1]/maven/", "link-local"),
         ("https://[::ffff:169.254.169.254]/", "link-local"),
+        ("https://169.254.169.254./latest/", "ending in a dot"),
+        ("https://mirror.example.internal:0/", "port 0"),
+        ("https://mirror.example.internal/maven/?", "query"),
+        ("https://mirror.example.internal/maven/#", "fragment"),
+        ("https://a..b/maven/", "not a valid DNS name"),
+        ("https://169.254.169.254%2e/latest/", "ending in a dot"),
+        ("https://mirror.example.internal\\@evil.example/", "user or password"),
     ],
 )
 def test_a_bad_maven_mirror_is_refused_without_echoing_it(url, rule):

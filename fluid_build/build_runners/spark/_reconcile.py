@@ -423,7 +423,11 @@ def run_once(
         if ended.state not in TERMINAL:
             cancel()
             out.action, out.error = "failed", True
-            out.message = f"still {ended.raw_state} after {int(timeout)} s; it was cancelled"
+            out.message = f"still {ended.raw_state} after {int(timeout)} s; " + (
+                "it was cancelled"
+                if out.cancelled
+                else "it could not be cancelled and may still be going: cancel it by hand"
+            )
         elif ended.state != SUCCEEDED:
             out.action, out.error, out.message = "failed", True, _failure_text(ended)
         else:

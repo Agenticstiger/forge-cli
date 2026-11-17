@@ -318,12 +318,20 @@ def maven_repository(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
         problem = "is not an https URL with a host"
     elif parts.username is not None or parts.password is not None or "@" in parts.netloc:
         problem = "carries a user or password"
-    elif parts.query or parts.fragment or "," in raw or any(c.isspace() for c in raw):
+    elif any(c in raw for c in "?#,") or any(c.isspace() for c in raw):
         problem = "has a query, a fragment, a comma or a space"
-    elif _hostname_is_link_local(host):
-        problem = "names a link-local or metadata address"
+    elif host.endswith(".") or any(c in parts.netloc for c in "%\\") or parts.port == 0:
+        # a host spelt so it does not resolve here may still resolve on the cluster
+        problem = "has a host ending in a dot, a % or \\ in it, or port 0"
     else:
-        return raw
+        try:
+            link_local = _hostname_is_link_local(host)
+        except ValueError:  # IDNA: an empty or over-long label
+            link_local, problem = None, "has a host that is not a valid DNS name"
+        else:
+            problem = "names a link-local or metadata address"
+        if link_local is False:
+            return raw
     raise SparkPolicyError(
         what=f"{MAVEN_REPOSITORY_ENV} {problem}",
         why=(
