@@ -1,47 +1,53 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""flux-stats is pinned in one file, and ``fluid profile`` names the same pin.
+"""``[profile]`` names flux-stats once, and ``fluid profile`` names the same requirement.
 
-flux-stats is not on PyPI yet, and PyPI refuses an upload whose metadata holds a URL
-dependency, so ``[profile]`` cannot name it. CI installs ``requirements/flux-stats.txt``;
-the CLI cannot read that file once installed, so ``_stats`` repeats its line.
+flux-stats comes from PyPI through the ``[profile]`` extra, and ``[dev]`` includes that extra, so
+CI installs it with the rest. The CLI cannot read ``pyproject.toml`` once installed, so ``_stats``
+repeats the requirement in its install message; these tests keep the two equal.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
+from packaging.requirements import Requirement
 
 from fluid_build.profiler import _stats
+from tests.ci_guards import extras_alongside_base as g
 
 pytestmark = pytest.mark.unit
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-REQUIREMENTS = REPO_ROOT / "requirements" / "flux-stats.txt"
+
+def _profile_flux_stats() -> list:
+    requirements = g.load()["optional-dependencies"]["profile"]
+    return [r for r in requirements if g.requirement_name(r) == "flux-stats"]
 
 
-def _pin_lines() -> list:
-    lines = REQUIREMENTS.read_text(encoding="utf-8").splitlines()
-    return [ln.strip() for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
+def test_the_profile_extra_names_flux_stats_once():
+    assert len(_profile_flux_stats()) == 1
 
 
-def test_the_requirements_file_holds_exactly_one_pin():
-    assert len(_pin_lines()) == 1
+def test_the_constant_matches_the_profile_extra():
+    assert _profile_flux_stats() == [_stats.FLUX_STATS_REQUIREMENT]
 
 
-def test_the_constant_matches_the_requirements_file():
-    assert _pin_lines() == [_stats.FLUX_STATS_GIT_REQUIREMENT]
+def test_the_requirement_is_a_range_of_released_versions():
+    requirement = Requirement(_stats.FLUX_STATS_REQUIREMENT)
+    assert requirement.url is None  # PyPI refuses a URL in Requires-Dist
+    assert requirement.marker is None  # flux-stats supports Python 3.10, the floor here
+    assert requirement.specifier.contains("0.6.0")
+    assert requirement.specifier.contains("0.6.9")
+    assert not requirement.specifier.contains("0.0.1")  # the placeholder holds no code
+    assert not requirement.specifier.contains("0.7.0")  # a 0.x minor may rename what is imported
 
 
-def test_the_pin_is_a_full_commit_of_the_flux_stats_subdirectory():
-    req = _stats.FLUX_STATS_GIT_REQUIREMENT
-    sha = req.split("@")[2].split("#")[0]
-    assert len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
-    assert req.endswith("#subdirectory=packages/flux-stats")
+def test_the_install_command_installs_the_extra_that_holds_flux_stats():
+    assert _stats.FLUX_STATS_INSTALL_COMMAND == "pip install 'data-product-forge[profile]'"
+    assert _profile_flux_stats()
 
 
-def test_the_unavailable_message_gives_the_exact_install_command():
+def test_the_unavailable_message_names_the_requirement_and_the_command():
     message = str(_stats._unavailable(ImportError("x")))
-    assert f'pip install "{_stats.FLUX_STATS_GIT_REQUIREMENT}"' in message
+    assert _stats.FLUX_STATS_REQUIREMENT in message
+    assert _stats.FLUX_STATS_INSTALL_COMMAND in message
