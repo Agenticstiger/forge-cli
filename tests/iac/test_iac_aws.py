@@ -95,7 +95,9 @@ class TestAwsGlue:
         tbl = next(iter(res["aws_glue_catalog_table"].values()))
         assert tbl["storage_descriptor"]["location"] == "s3://my-lake/sales/curated/"
 
-    def test_iceberg_format_marks_glue_table_type(self):
+    def test_iceberg_format_has_glue_write_its_metadata(self):
+        """Glue marks the table ICEBERG itself when it writes the first metadata
+        (``open_table_format_input``), and refuses a create that passes table_type."""
         res = _aws().emit(
             _contract(
                 [
@@ -110,9 +112,10 @@ class TestAwsGlue:
                 ]
             )
         )
-        params = next(iter(res["aws_glue_catalog_table"].values()))["parameters"]
-        assert params["table_type"] == "ICEBERG"
-        assert params["classification"] == "iceberg"
+        table = next(iter(res["aws_glue_catalog_table"].values()))
+        assert "table_type" not in table["parameters"]
+        assert table["parameters"]["classification"] == "iceberg"
+        assert table["open_table_format_input"]["iceberg_input"]["metadata_operation"] == "CREATE"
 
     def test_non_iceberg_table_has_no_table_type_parameter(self):
         res = _aws().emit(_contract([_glue_exposure(database="d", table="t", bucket="b")]))
