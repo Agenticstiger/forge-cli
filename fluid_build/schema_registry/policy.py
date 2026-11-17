@@ -58,7 +58,7 @@ def _host(url: str) -> Optional[str]:
         return None
 
 
-def _static_host_findings(ref: RegistryRef) -> List[Finding]:
+def static_host_findings(ref: RegistryRef) -> List[Finding]:
     """What fails at every stage, read from the URL alone: scheme, host, link-local."""
     from fluid_build.build_runners._deployment_host_policy import host_verdict
 
@@ -77,9 +77,7 @@ def _static_host_findings(ref: RegistryRef) -> List[Finding]:
     return [("error", f"{ref.where}.url: the registry may not be used: {why}")]
 
 
-def _resolved_host_findings(
-    ref: RegistryRef, environ: Optional[Mapping[str, str]]
-) -> List[Finding]:
+def resolved_host_findings(ref: RegistryRef, environ: Optional[Mapping[str, str]]) -> List[Finding]:
     """The DNS-scoped host rule for a request this process sends (plan only)."""
     from fluid_build.build_runners._deployment_host_policy import ALLOWLIST_ENV, host_verdict
 
@@ -94,10 +92,10 @@ def _resolved_host_findings(
                 "If this registry is yours, the operator lists its host there (no port).",
             )
         ]
-    return _static_host_findings(ref)
+    return static_host_findings(ref)
 
 
-def _credential_host_findings(
+def credential_host_findings(
     ref: RegistryRef, variable: str, stage: str, environ: Optional[Mapping[str, str]]
 ) -> List[Finding]:
     """A host that receives ``variable``: https, listed, and granted ``variable@host``."""
@@ -133,7 +131,7 @@ def _credential_host_findings(
     return findings
 
 
-def _secret_ref_findings(
+def secret_ref_findings(
     ref: RegistryRef, stage: str, environ: Optional[Mapping[str, str]]
 ) -> List[Finding]:
     """A consumed subject's ``auth.secretRef``: https, and the operator's ``NAME@host`` grant."""
@@ -178,30 +176,14 @@ def _secret_ref_findings(
 def subject_findings(
     subject: Subject, *, stage: str, environ: Optional[Mapping[str, str]] = None
 ) -> List[Finding]:
-    """The egress findings for one subject at ``stage`` (``validate`` or ``plan``)."""
-    ref = subject.ref
-    if ref.kind != "confluent":
-        return []
-    findings = _static_host_findings(ref)
-    if findings:
-        return findings
-    if subject.role == "produced":
-        if ref.secret_ref:
-            findings.append(
-                (
-                    "error",
-                    f"{ref.where}.auth: OpenTofu registers a produced subject with the "
-                    f"operator's {TOFU_REGISTRY_KEY_ENV} / {TOFU_REGISTRY_SECRET_ENV}, not a "
-                    "contract secret; remove auth",
-                )
-            )
-        findings.extend(_credential_host_findings(ref, TOFU_REGISTRY_SECRET_ENV, stage, environ))
-        return findings
-    if ref.secret_ref:
-        findings.extend(_secret_ref_findings(ref, stage, environ))
-    elif stage == "plan":
-        findings.extend(_resolved_host_findings(ref, environ))
-    return findings
+    """The egress findings for one subject at ``stage`` (``validate`` or ``plan``).
+
+    Each registry kind states its own rules (``kinds/``). The public helpers above are
+    the generic rules for an HTTP registry, shared by every kind that has one.
+    """
+    from .kinds import get_kind
+
+    return get_kind(subject.ref.kind).egress_findings(subject, stage=stage, environ=environ)
 
 
 def validation_findings(

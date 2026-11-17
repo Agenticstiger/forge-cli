@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterator, Mapping, Tuple
 
+from ...schema_registry.kinds import get_kind
 from ...schema_registry.produced import (
     ProducedSubjectError,
     cloud_bound,
@@ -55,18 +56,20 @@ def _exposes_by_id(contract: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:
 
 
 def _glue_subjects(contract: Mapping[str, Any]) -> Iterator[Tuple[Subject, Mapping[str, Any]]]:
-    """``(subject, expose)`` for every produced Glue subject; a stray Confluent one refused."""
+    """``(subject, expose)`` for every subject the aws plugin registers; another cloud's refused."""
     exposes = _exposes_by_id(contract)
     for subject in produced_subjects(contract):
         expose = exposes.get(subject.owner, {})
         platform = str((expose.get("binding") or {}).get("platform") or "").lower()
-        if subject.ref.kind == "glue":
+        kind = get_kind(subject.ref.kind)
+        if kind.registering_cloud == "aws":
             yield subject, expose
-        elif platform == "kafka" and not cloud_bound(contract, "confluent"):
+        elif platform == "kafka" and not cloud_bound(contract, kind.name):
             raise UnsupportedBindingError(
                 "schema-registry-route",
-                f"{subject.ref.where}: a Confluent subject is registered by the confluent "
-                "OpenTofu plugin, and this contract is emitted by the aws one",
+                f"{subject.ref.where}: a {kind.title} subject is registered by the "
+                f"{kind.registering_cloud} OpenTofu plugin, and this contract is emitted by "
+                "the aws one",
                 (
                     "Bind the expose with platform: confluent and format: kafka_topic, or",
                     "use kind: glue for a topic on MSK.",
