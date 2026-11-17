@@ -570,6 +570,8 @@ class TestAttachErrorsDoNotEchoThePassword:
 
         class _Con:
             def execute(self, sql, *a, **k):
+                if sql.startswith("CREATE TEMPORARY SECRET"):
+                    return self  # the empty secret the ATTACH names; no credentials in it
                 # Mimic a driver error that quotes the DSN (as mysql_scanner does).
                 raise RuntimeError(f"Failed to connect with parameters {sql}")
 
@@ -612,3 +614,32 @@ class TestAttachErrorsDoNotEchoThePassword:
         }:
             assert form not in text
         assert "***" in text
+
+
+def test_a_postgres_or_mysql_attach_names_an_empty_temporary_secret(monkeypatch):
+    """Without one the scanner asks the persistent secret storage the sandbox turned
+    off (``Unknown secret storage found: 'local_file'``), and no postgres or mysql
+    source attaches at all. ``read_only`` adds READ_ONLY; sqlite needs no secret."""
+    from fluid_build.cli.discover import _jdbc_introspect
+    from fluid_build.providers import _duckdb_sandbox
+
+    statements = []
+
+    class _Recording:
+        def execute(self, sql, *args):
+            statements.append(sql)
+            return self
+
+    def fake_connect(database, *, allow, extensions=(), before_lock=None, **kwargs):
+        before_lock(_Recording())
+        return _Recording()
+
+    monkeypatch.setattr(_duckdb_sandbox, "secure_duckdb_connect", fake_connect)
+    for uri, kind in (("postgresql://u@h:5432/db", "postgres"), ("mysql://u@h:3306/db", "mysql")):
+        statements.clear()
+        _jdbc_introspect.attach_jdbc_source(kind, uri, operator_supplied=True, read_only=True)
+        assert statements[0] == f"CREATE TEMPORARY SECRET source_db (TYPE {kind})"
+        assert statements[1].endswith(f"AS source_db (TYPE {kind}, SECRET source_db, READ_ONLY)")
+    statements.clear()
+    _jdbc_introspect.attach_jdbc_source("sqlite", "sqlite:///x.db", read_only=True)
+    assert statements == ["ATTACH 'x.db' AS source_db (TYPE sqlite, READ_ONLY)"]
