@@ -85,6 +85,9 @@ class ConfluentKind(RegistryKind):
     # level); tests/schema_registry/test_egress_floor.py pins that the two agree.
     operator_credential_env = "SCHEMA_REGISTRY_API_SECRET"  # pragma: allowlist secret - a name
     checks_compatibility = True
+    # Confluent Schema Registry has confluent/type/decimal.proto built in (ProtobufSchema
+    # KNOWN_DEPENDENCIES), so the subject needs no schema reference.
+    protobuf_decimal = ("confluent.type.Decimal", "confluent/type/decimal.proto")
 
     def field_errors(self, spec: Mapping[str, Any], where: str) -> List[str]:
         errors: List[str] = []

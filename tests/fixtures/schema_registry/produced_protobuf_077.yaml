@@ -1,0 +1,140 @@
+# A product that produces two Kafka topics whose values are Protobuf: one registered on the
+# Glue Schema Registry, one on a Confluent registry, each through OpenTofu from
+# binding.properties.registry (0.7.7 preview). Every column carries its field number at
+# protobuf.field. The Confluent topic has a decimal column (confluent.type.Decimal); Glue
+# resolves no Protobuf decimal type, so its topic does not.
+# Pinned by tests/schema_registry/test_protobuf.py; fluid validate must accept it.
+fluidVersion: "0.7.7"
+kind: DataProduct
+id: commerce.orders-proto
+name: Orders as Protobuf
+domain: commerce
+metadata:
+  layer: Silver
+  owner:
+    team: commerce-data
+packaging:
+  mode: isolated
+  pool: commerce-platform
+  containers:
+    cluster: shared
+    schemaRegistry: shared
+exposes:
+  - exposeId: orders_lake
+    kind: table
+    binding:
+      platform: aws
+      format: parquet
+      location:
+        bucket: commerce-lake
+        path: orders/
+        region: eu-west-1
+    contract:
+      schema:
+        - name: order_id
+          type: string
+  - exposeId: orders_glue
+    kind: stream
+    binding:
+      platform: kafka
+      format: kafka_topic
+      location:
+        topic: commerce.orders-glue
+        host: b-1.msk.example:9098
+      serialization:
+        value: protobuf
+      properties:
+        registry:
+          kind: glue
+          registryName: commerce
+    contract:
+      schema:
+        - name: order_id
+          type: string
+          required: true
+          protobuf:
+            field: 1
+        - name: quantity
+          type: int
+          protobuf:
+            field: 2
+        - name: placed_at
+          type: timestamp_ltz
+          required: true
+          protobuf:
+            field: 3
+        - name: ship_date
+          type: date
+          protobuf:
+            field: 4
+        - name: address
+          type: struct
+          protobuf:
+            field: 5
+          fields:
+            - name: city
+              type: string
+              required: true
+              protobuf:
+                field: 1
+            - name: zip
+              type: string
+              protobuf:
+                field: 2
+        - name: lines
+          type: array
+          protobuf:
+            field: 6
+          element:
+            type: struct
+            fields:
+              - name: sku
+                type: string
+                required: true
+                protobuf:
+                  field: 1
+              - name: qty
+                type: int
+                required: true
+                protobuf:
+                  field: 2
+        - name: labels
+          type: map
+          protobuf:
+            field: 7
+          key:
+            type: string
+            required: true
+          value:
+            type: string
+  - exposeId: orders_confluent
+    kind: stream
+    binding:
+      platform: confluent
+      format: kafka_topic
+      location:
+        topic: commerce.orders-confluent
+      serialization:
+        value: protobuf
+      properties:
+        registry:
+          kind: confluent
+          url: https://schema-registry.example.com
+    contract:
+      schema:
+        - name: order_id
+          type: string
+          required: true
+          protobuf:
+            field: 1
+        - name: amount
+          type: decimal(18,2)
+          required: true
+          protobuf:
+            field: 2
+        - name: tags
+          type: array
+          protobuf:
+            field: 3
+          element:
+            type: string

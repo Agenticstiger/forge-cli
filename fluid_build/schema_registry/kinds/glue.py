@@ -56,6 +56,15 @@ class GlueKind(RegistryKind):
     refuses = frozenset({"url", "auth"})
     operator_credential_env = None  # IAM through the AWS SDK: no registry credential
     checks_compatibility = False
+    # Verified live on AWS (2026-11-17): Glue resolves google/protobuf/timestamp.proto and
+    # google/type/date.proto, and neither confluent/type/decimal.proto nor
+    # google/type/decimal.proto.
+    protobuf_decimal = None
+    protobuf_decimal_hint = (
+        "Glue Schema Registry resolves no decimal type for Protobuf (neither "
+        "confluent/type/decimal.proto nor google/type/decimal.proto): carry this topic as "
+        "Avro or JSON Schema, or declare the column string or double"
+    )
 
     def field_errors(self, spec: Mapping[str, Any], where: str) -> List[str]:
         errors: List[str] = []

@@ -1354,6 +1354,26 @@
           "pattern": "^[A-Za-z][A-Za-z0-9_.]*$",
           "description": "NEW in v0.7.7 (preview): The attribute this column carries with every other column of the contract that names the same one (RFC-data-rules.md section 5). The owner is the member that every other member reaches through relationships, following to, on exactly one path; on every row whose path reaches an owner row, a member IS NOT DISTINCT FROM the owner. Never inferred from column names, and not semanticType, which stays a kind of value such as email."
         },
+        "protobuf": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "field"
+          ],
+          "properties": {
+            "field": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 536870911,
+              "not": {
+                "minimum": 19000,
+                "maximum": 19999
+              },
+              "description": "The column's field number in the .proto forge generates when the topic's value is Protobuf (binding.serialization.value: protobuf). Unique within its message (the top level, or the struct it sits in); 1 to 536870911 except 19000 to 19999, which Protobuf reserves. A field number names the field on the wire, so it never changes once data is written."
+            }
+          },
+          "description": "NEW in v0.7.7 (preview): How this column is written when the topic's value is Protobuf (binding.serialization.value: protobuf). Every column of such an expose, nested struct fields included, needs one."
+        },
         "tags": {
           "$ref": "#/$defs/tags",
           "description": "Field-level tags for categorization and data governance."
