@@ -54,6 +54,7 @@ class GlueKind(RegistryKind):
     subject_pattern = _GLUE_NAME
     fields = frozenset({"registryName"})
     refuses = frozenset({"url", "auth"})
+    operator_credential_env = None  # IAM through the AWS SDK: no registry credential
     checks_compatibility = False
 
     def field_errors(self, spec: Mapping[str, Any], where: str) -> List[str]:

@@ -412,8 +412,11 @@ def verify_at_apply(
         from fluid_build.secrets.resolve import resolve_secret
 
         try:
+            # The host the kind sends the credential to (its url unless it names a
+            # separate endpoint): the one policy.floor_findings judged above.
+            target = get_kind(ref.kind).credential_url(ref)
             secret = resolve_secret(
-                ref.secret_ref, host=urlsplit(str(ref.url)).hostname, environ=environ
+                ref.secret_ref, host=urlsplit(str(target)).hostname, environ=environ
             )
         except SecretError as exc:
             errors.append(f"{ref.where}.auth.secretRef: {exc}")
