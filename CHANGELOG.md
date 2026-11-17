@@ -109,7 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file). `fluid auth login`, `fluid auth status` and `fluid doctor` take such a login without
   `SNOWFLAKE_USER`.
 
-- **`fluid profile`: FLUX's profiler, as the `[profile]` extra (groundwork).**
+- **`fluid profile`: FLUX's profiler, as the `[profile]` extra.**
   `fluid profile <contract> --expose <id> --source <file|db-uri> [--table <name>] [--out <file>]`
   reads one expose's records where they live, once and whole (no sampling). It writes a
   profile document in flux-engine's PROFILE-SPEC format 1-0-0: canonical RFC 8785 JSON,
@@ -147,11 +147,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     written, and no directory is made, until the profile is formed. A default name
     (`<exposeId>.profile.json`) needs an exposeId of `[A-Za-z0-9_.-]` alone, otherwise
     `--out` is required. An `--out` that is the source file is refused.
-  - Not wired yet: every statistic is formed by FLUX's shared registry (`flux-stats`, MEAS-3).
-    Until it is published, `fluid profile` says so and reads nothing.
-    `fluid_build/profiler/_stats.py` is the one seam that wires it.
-  - `[profile]` adds DuckDB alone (`rfc8785` is a base dependency). `fluid --help` and
-    `fluid profile --help` stay free of both (`tests/perf/test_startup_budget.py`).
+  - Every value is read, and every statistic formed, by FLUX's shared registry `flux-stats`
+    (MEAS-3) through the one seam `fluid_build/profiler/_stats.py`, so a profile and the
+    fidelity check read a value one way and form a number one way. Without `flux-stats`,
+    `fluid profile` says so, naming the installed version when it cannot be imported, and
+    reads nothing.
+  - `[profile]` adds DuckDB and `flux-stats` (`rfc8785` is a base dependency). `[dev]`
+    includes it, so CI runs the profiler against the real registry. `fluid --help` and
+    `fluid profile --help` load none of the three (`tests/perf/test_startup_budget.py`).
 
 - **Schema 0.7.7 (preview): semantic relationships and SCD validity windows**
   (RFC-semantics-tier1 §4 and §5). `exposes[].semantics.relationships[]`
