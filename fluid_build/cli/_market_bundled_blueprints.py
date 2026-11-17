@@ -237,7 +237,9 @@ _COMMON_PARAMS: List[Dict[str, Any]] = [
         "name": "owner_team",
         "required": False,
         "type": "string",
-        "default": "data-team",
+        # As fluid init --blueprint: data-team is the starter's own value,
+        # which fluid validate --strict (and so fluid ship) refuses.
+        "default": "data-platform",
         "description": "Owning team.",
     },
     {

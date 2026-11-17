@@ -18,8 +18,6 @@ metadata:
   layer: Silver
   owner:
     team: data-engineering
-    email: data-eng@company.com
-
 # ─── Access Policy ────────────────────────────────────────────
 
 accessPolicy:

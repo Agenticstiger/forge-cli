@@ -9,7 +9,6 @@ metadata:
   layer: "Silver"
   owner:
     team: "data-platform"
-    email: "data-platform@example.com"
   tags:
     - "snowflake"
     - "starter"

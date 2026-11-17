@@ -9,7 +9,6 @@ metadata:
   layer: Silver
   owner:
     team: "OTE Finance Data"
-    email: "ote-billing@ote.example"
   businessContext:
     domain: "Finance"
     subdomain: "Billing Operations"
