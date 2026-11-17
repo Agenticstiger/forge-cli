@@ -6,8 +6,9 @@
 One :class:`DesiredRun` per ``engine: spark`` build, from the contract and the operator's
 environment, the same at ``fluid plan`` and ``fluid apply``. Its ``config_hash`` is the
 sha256 of the job config forge generates, the runner's own sha256 and the settings the run
-is started with (runtime, target, release, role, Spark configuration, retries). A running
-job whose hash differs is replaced; one whose hash matches is left alone.
+is started with (runtime, target, release, role, Spark configuration, retries, and on Glue
+the pinned jars it loads). A running job whose hash differs is replaced; one whose hash
+matches is left alone.
 
 ``source_id`` and ``checkpoint_id`` say which stream a streaming job reads and where it
 keeps its position. A checkpoint holds the offsets of one topic on one cluster, so the
@@ -631,6 +632,15 @@ def desired_runs(
             "sparkConf": spark_conf,
             "retry": attempts,
         }
+        if runtime == "glue":
+            # The pinned jars the Glue job loads (--extra-jars), from the same function and
+            # inputs the IaC emit uses: a new pin or prefix restarts a running stream. Absent,
+            # not None, for a build that adds none, so its hash stays what it was.
+            from fluid_build.iac.providers.aws_glue_jars import glue_jars_fingerprint
+
+            jars = glue_jars_fingerprint(config, env)
+            if jars is not None:
+                settings["glueJars"] = jars
         runs.append(
             DesiredRun(
                 product=product,
