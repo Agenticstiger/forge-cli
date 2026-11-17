@@ -13,7 +13,8 @@ this checkout, and the masked outputs are compared. They skip when the tag is
 not in the checkout's history (a shallow clone). The corpus is every contract
 under ``examples/`` and ``fluid_build/templates/`` that holds no ``$ref``. An
 ODCS export may differ by the one line the 0.7.6 promotion (#752) moved, and
-only as the default moved (see ``_ODCS_OUTPUTS``).
+only as the default moved (see ``_ODCS_OUTPUTS``), and by its expose's version
+replacing the 1.0.0 default (see ``_expose_version_promoted``).
 
 The baseline-harness scenarios (M-02 to M-07, M-13) are not here: they are run
 by ``repro/baseline/run_baseline.sh`` outside pytest.
@@ -521,6 +522,41 @@ def _recorded_version_moved_with_the_default(
     return old_rest, new_rest, moved
 
 
+# A per-expose ODCS export carries its expose's ``version`` since the Data Mesh Manager
+# contract-hygiene fix. v0.24.0 wrote ``version: 1.0.0`` (a product-level default FLUID's
+# schema forbids setting) and parked the expose's version in fluidExtras
+# ``exposes.<id>.version``. The old side is rewritten the way the checkout writes it: the
+# expose's version on the first line, its fluidExtras line gone. Only a document that starts
+# ``version: 1.0.0`` and parks exactly one expose version is rewritten, and everything else
+# is still compared byte for byte.
+_EXPOSE_VERSION_LINE = re.compile(r"(?m)^        version: (.+)\n")
+_DEFAULT_ODCS_VERSION = "version: 1.0.0\n"
+
+
+def _expose_version_promoted(document: str) -> str:
+    """One v0.24.0 ODCS document as it reads with its expose's version promoted."""
+    at = document.find("- property: fluidExtras\n")
+    if not document.startswith(_DEFAULT_ODCS_VERSION) or at < 0:
+        return document
+    extras = document[at:]
+    parked = list(_EXPOSE_VERSION_LINE.finditer(extras))
+    if len(parked) != 1:
+        return document
+    line = parked[0]
+    return (
+        f"version: {line.group(1)}\n"
+        + document[len(_DEFAULT_ODCS_VERSION) : at]
+        + extras[: line.start()]
+        + extras[line.end() :]
+    )
+
+
+def _expose_versions_promoted(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    return "".join(_expose_version_promoted(d) for d in re.split(r"(?m)^(?=---\n)", text))
+
+
 def mismatches(
     diff: Differential,
     job: str,
@@ -549,6 +585,7 @@ def mismatches(
             directory, filename
         )
         if filename in _ODCS_OUTPUTS:
+            old_file = _expose_versions_promoted(old_file)
             old_file, new_file, moved = _recorded_version_moved_with_the_default(old_file, new_file)
             found += [f"{job}: {m}" for m in moved]
         if old_file != new_file:
@@ -880,6 +917,11 @@ _INTENTIONAL_CHANGES: Dict[str, Tuple[str, str, str]] = {
         r"split[^.\n]{0,100}comment|comment[^.\n]{0,100}split",
         "tests/test_split_parts.py",
         r"^test_every_comment_of_the_root_is_kept",
+    ),
+    "a per-expose ODCS export carries its expose's version": (
+        r"expose's `version`|expose version",
+        "tests/providers/test_datamesh_manager_contract_hygiene.py",
+        r"^test_(the_contract_carries_its_expose_version|odcs_version_defaults)",
     ),
     "fluid docs reads a contract whole, and the output changes": (
         r"fluid docs|`docs`",
