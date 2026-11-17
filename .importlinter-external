@@ -43,6 +43,9 @@ ignore_imports =
     fluid_build.providers.aws.util.auth -> boto3
     fluid_build.providers.aws.util.config -> boto3
     fluid_build.cli._auth_provider_impls -> boto3
+    # schema_registry/clients.py: GlueRegistry imports boto3 inside _glue()
+    # (try/except ImportError), only when a contract names a Glue registry.
+    fluid_build.schema_registry.clients -> boto3
     # openlineage: imported inside the emit helpers, so it loads only when a
     # build runner actually emits a lineage event.
     fluid_build.build_runners._lineage -> openlineage

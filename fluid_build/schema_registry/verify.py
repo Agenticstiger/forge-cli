@@ -366,8 +366,9 @@ def attach_registry_checks(
     if errors:
         from fluid_build.cli._common import CLIError
 
-        for message in errors:
-            LOG.error("schema_registry_check_failed: %s", message)
+        # The messages reach the user through the CLIError; the log carries the count
+        # only, so nothing read near a resolved credential is written to a log.
+        LOG.error("schema_registry_check_failed count=%d", len(errors))
         raise CLIError(
             1,
             "plan_schema_registry_failed",
@@ -477,8 +478,9 @@ def verify_at_apply(
     if errors:
         from fluid_build.cli._common import CLIError
 
-        for message in errors:
-            LOG.error("schema_registry_check_failed: %s", message)
+        # The messages reach the user through the CLIError; the log carries the count
+        # only, so nothing read near a resolved credential is written to a log.
+        LOG.error("schema_registry_check_failed count=%d", len(errors))
         raise CLIError(
             1,
             "apply_schema_registry_failed",
