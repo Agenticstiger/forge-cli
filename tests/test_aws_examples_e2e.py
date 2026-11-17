@@ -192,10 +192,18 @@ def test_generate_iac_emits_expected_aws_resources_offline(
     assert "aws_secret_access_key" not in lowered, f"{example}: emitted a secret key"
     assert "AKIA" not in text, f"{example}: emitted an AKIA access-key id"
 
-    # Iceberg examples must tag the Glue table so Athena treats it as an
-    # Iceberg table (ACID / time-travel); plain examples must not.
+    # Iceberg examples must make the Glue table an Iceberg table, so Athena treats it as
+    # one (ACID / time-travel): Glue writes its first metadata and marks it ICEBERG itself
+    # (``open_table_format_input``); plain examples must not.
     tables = resources.get("aws_glue_catalog_table", {})
-    table_types = {body.get("parameters", {}).get("table_type") for body in tables.values()}
+    table_types = {
+        (
+            "ICEBERG"
+            if (body.get("open_table_format_input") or {}).get("iceberg_input")
+            else body.get("parameters", {}).get("table_type")
+        )
+        for body in tables.values()
+    }
     if spec["iceberg"]:
         assert "ICEBERG" in table_types, f"{example}: expected an ICEBERG table"
     else:

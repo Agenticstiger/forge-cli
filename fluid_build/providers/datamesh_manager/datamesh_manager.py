@@ -514,25 +514,22 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             team_obj["name"] = tid
             dp["team"] = team_obj
             self._ensure_odps_output_port_display_names(dp, fluid)
-            # Per Entropy's ``dataproduct-0.0.1.json`` schema, ``inputPorts``
-            # are reserved for source-system upstreams (sourceSystemId is a
-            # required field). Product-to-product lineage flows through
-            # Access agreements regardless of ``odps_lineage_mode``;
-            # representing it as inputPorts would create duplicate graph
-            # nodes next to the real edges.
-            self._remove_odps_product_consume_input_ports(dp, fluid)
+            # Product consumes stay ODPS input ports: Entropy draws a
+            # product -> product edge from ``inputPorts[].contractId`` alone
+            # (status ``declared``) and merges it with an approved Access
+            # agreement for the same pair. Lineage carried only by Access
+            # agreements is missing across teams, where an agreement stays
+            # ``requested``.
             self._ensure_odps_input_port_contract_ids(dp, fluid)
             self._ensure_odps_input_port_source_system_custom_property(
                 dp,
                 fluid,
                 default_from_reference=use_source_system_fallback,
             )
-            # Overlay: lift sourceSystem / sourceKind customProperties into
-            # native DMM inputPort fields (sourceSystemId / type). Only
-            # applied to the wire payload; the standalone .odps-bitol.yaml
-            # artifact stays spec-clean (the v1.0.0 InputPort schema is
-            # closed, so native fields would fail JSON-schema validation).
-            self._promote_input_port_native_source_system_fields(dp)
+            # Overlay: the ``sourceSystemId`` / ``type`` custom properties
+            # Entropy links an input port to its SourceSystem by. Wire payload
+            # only; the standalone ODPS export keeps the spec's own shape.
+            self._promote_input_port_native_source_system_fields(dp, fluid)
         else:
             dp["teamId"] = tid
 
@@ -581,6 +578,11 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             )
             if access_previews:
                 result["access_agreements"] = access_previews
+            # A dry run makes no call, so it cannot list them; say that it would.
+            result["stale_access_agreements"] = (
+                "On publish, Access agreements forge made earlier for consumes this "
+                "contract no longer has are cancelled (POST /api/access/{id}/cancel)."
+            )
             if is_odps_payload:
                 result["odps_lineage_mode"] = lineage_mode
             # Also preview per-expose ODCS contracts so the caller can inspect them
@@ -649,6 +651,11 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         )
         if access_results:
             result["access_agreements"] = access_results
+        cancelled = self._cancel_stale_access_agreements(
+            product_id, {str(a["id"]) for a in self._build_access_agreements(fluid, product_id)}
+        )
+        if cancelled:
+            result["cancelled_access_agreements"] = cancelled
 
         return result
 
@@ -741,20 +748,16 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
 
     # ── More ODPS helpers — extracted ───────────────────────────
     # Three more static helpers
-    # (``_remove_odps_product_consume_input_ports``,
-    # ``_ensure_odps_input_port_contract_ids``,
-    # ``_ensure_odps_input_port_source_system_custom_property``) — ~290 LOC
-    # combined — moved to ``_odps_helpers.py``.
+    # (``_ensure_odps_input_port_contract_ids``,
+    # ``_ensure_odps_input_port_source_system_custom_property``,
+    # ``_promote_input_port_native_source_system_fields``) moved to
+    # ``_odps_helpers.py``.
     from ._odps_helpers import (  # noqa: I001
         ensure_odps_input_port_contract_ids as _ensure_odps_input_port_contract_ids_impl,
         ensure_odps_input_port_source_system_custom_property as _ensure_odps_input_port_source_system_custom_property_impl,
         promote_input_port_native_source_system_fields as _promote_input_port_native_source_system_fields_impl,
-        remove_odps_product_consume_input_ports as _remove_odps_product_consume_input_ports_impl,
     )
 
-    _remove_odps_product_consume_input_ports = staticmethod(
-        _remove_odps_product_consume_input_ports_impl
-    )
     _ensure_odps_input_port_contract_ids = staticmethod(_ensure_odps_input_port_contract_ids_impl)
     _ensure_odps_input_port_source_system_custom_property = staticmethod(
         _ensure_odps_input_port_source_system_custom_property_impl

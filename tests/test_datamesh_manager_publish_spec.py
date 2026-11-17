@@ -307,7 +307,7 @@ def test_apply_dry_run_odps_sets_output_port_type_from_binding_platform():
     assert output_ports[0]["type"] == "bigquery"
 
 
-def test_apply_dry_run_odps_maps_product_consumes_to_access_not_input_ports():
+def test_apply_dry_run_odps_maps_product_consumes_to_input_ports_and_access():
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
     result = provider.apply(
@@ -316,11 +316,19 @@ def test_apply_dry_run_odps_maps_product_consumes_to_access_not_input_ports():
         provider_hint="odps",
     )
 
-    # Product-to-product consumes are Entropy Access agreements, not ODPS
-    # inputPorts. Keeping them as inputPorts forces the local CE importer to
-    # mirror upstream products as SourceSystems, which renders duplicate graph
-    # nodes next to the real product lineage.
-    assert "inputPorts" not in result["payload"]
+    # Each product consume is an ODPS input port naming the upstream contract:
+    # Entropy draws the product -> product edge from it, across teams too,
+    # where an Access agreement stays ``requested`` and draws nothing. The
+    # agreements still go out and take the edge over once approved.
+    contract_ids = {port["name"]: port["contractId"] for port in result["payload"]["inputPorts"]}
+    assert contract_ids == {
+        "subscriber_usage_daily": (
+            "bizlab.teleforge.subscriber_usage_daily_lineage_local.subscriber_usage_daily"
+        ),
+        "billing_health_daily": (
+            "bizlab.teleforge.billing_health_daily_lineage_local.billing_health_daily"
+        ),
+    }
     assert len(result["access_agreements"]) == 2
 
 
@@ -464,13 +472,12 @@ def test_apply_publishes_and_approves_access_agreements_when_explicit():
     assert result["access_agreements"][0]["auto_approved"] is True
 
 
-def test_apply_dry_run_odps_source_system_mode_does_not_restore_product_input_ports():
-    """Per Entropy's canonical ``dataproduct-0.0.1.json`` schema, inputPorts
-    represent source-system upstreams and require ``sourceSystemId``.
-    Product-to-product lineage flows through Access agreements regardless
-    of ``odps_lineage_mode`` — putting product references back on
-    inputPorts in source-system mode would double-count upstreams in the
-    Entropy graph (one Access edge + one phantom SourceSystem node)."""
+def test_apply_dry_run_odps_source_system_mode_names_no_phantom_source_system():
+    """``source-system`` mode labels each product consume with its upstream
+    product id (``customProperties[sourceSystem]``). That label must not become
+    the ``sourceSystemId`` Entropy links a SourceSystem by: no SourceSystem with
+    that id is ever upserted, so the graph would gain a phantom node next to
+    the edge the port's ``contractId`` already draws."""
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
     result = provider.apply(
@@ -481,7 +488,9 @@ def test_apply_dry_run_odps_source_system_mode_does_not_restore_product_input_po
     )
 
     assert result["odps_lineage_mode"] == "source-system"
-    assert "inputPorts" not in result["payload"]
+    for port in result["payload"]["inputPorts"]:
+        props = {p["property"] for p in port.get("customProperties") or []}
+        assert "sourceSystemId" not in props, port
     assert len(result["access_agreements"]) == 2
 
 
@@ -532,8 +541,9 @@ def test_apply_odps_source_system_mode_does_not_upsert_product_references():
     )
 
 
-def test_apply_dry_run_odps_promotes_only_retained_source_system_input_ports():
-    """Product consumes are Access-only; explicit source-system ports remain."""
+def test_apply_dry_run_odps_links_only_an_explicit_source_system():
+    """An explicit ``consumes[].sourceSystem`` gets the ``sourceSystemId``
+    Entropy links by; a plain product consume does not."""
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
     result = provider.apply(
@@ -542,17 +552,16 @@ def test_apply_dry_run_odps_promotes_only_retained_source_system_input_ports():
         provider_hint="odps",
     )
 
-    input_ports = result["payload"].get("inputPorts", [])
-    contract_ids = {port["name"]: port["contractId"] for port in input_ports}
-
-    assert contract_ids == {
-        "subscriber_usage_daily": (
-            "bizlab.teleforge.subscriber_usage_daily_lineage_local.subscriber_usage_daily"
-        )
+    linked = {
+        port["name"]: prop["value"]
+        for port in result["payload"]["inputPorts"]
+        for prop in port.get("customProperties") or []
+        if prop["property"] == "sourceSystemId"
     }
+    assert linked == {"subscriber_usage_daily": "bss-crm"}
 
 
-def test_apply_dry_run_odps_product_consume_with_explicit_contract_id_is_access_only():
+def test_apply_dry_run_odps_product_consume_keeps_its_explicit_contract_id():
     provider = DataMeshManagerProvider(api_key="dummy", api_url="https://api.entropy-data.com")
 
     contract = _sample_odps_consumes_contract()
@@ -562,7 +571,9 @@ def test_apply_dry_run_odps_product_consume_with_explicit_contract_id_is_access_
 
     result = provider.apply(contract, dry_run=True, provider_hint="odps")
 
-    assert "inputPorts" not in result["payload"]
+    assert result["payload"]["inputPorts"][0]["contractId"] == (
+        "bizlab.teleforge.subscriber_usage_daily_lineage_local.custom_view"
+    )
     assert result["access_agreements"][0]["payload"]["custom"]["providerContractId"] == (
         "bizlab.teleforge.subscriber_usage_daily_lineage_local.custom_view"
     )

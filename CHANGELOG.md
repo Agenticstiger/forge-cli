@@ -36,6 +36,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     so FLUID to ODCS to FLUID loses none. The dbt bridge's output is unchanged. MCP `describe`
     returns them, and the contract digest covers them. The ODCS quality rules and the dbt
     `fluid_rule` test are the RFC's steps 2 and 3.
+
+- **Spark job runs (schema 0.7.7 preview).** `fluid apply` now starts and reconciles the run of
+  an `engine: spark` build after `tofu apply` provisions it, on EMR Serverless (`StartJobRun`,
+  `mode: STREAMING` with `retryPolicy.maxFailedAttemptsPerHour`), AWS Glue, EMR on EC2
+  (`AddJobFlowSteps` on `clusterId`, client deploy mode) and EMR on EKS. `fluid plan` lists a
+  `spark.reconcile` action per build, covered by `planDigest`, with the build's config hash
+  (the job config, the runner's sha256 and the run settings); apply refuses a bound plan whose
+  Spark actions differ. A streaming job with the same hash is left running; a new hash cancels
+  it, waits, and starts the new config on the same checkpoint; a new topic or cluster on the
+  old checkpoint is refused; a last run that failed (EMR Serverless' thrash guard) is an error
+  naming the run, until the build changes or `fluid spark run --restart`.
+  - `fluid spark run <contract> --build-id <id> [--json]` starts a scheduled build (batch, or
+    a stream with `trigger.availableNow`) for Airflow: it waits, exits 0 on success, 1 when the
+    run failed or was cancelled, 2 when the contract or the operator's policy refuses it, and
+    cancels the run on SIGTERM. `fluid spark status <contract>` shows each build's recent runs.
+  - A contract's `parameters.spark.sparkConf` sets resource and tuning settings only; the
+    operator lists any other key in `FLUID_SPARK_CONF_ALLOWLIST` (settings like `spark.jars`
+    load code that runs with the job's role). `FLUID_SPARK_WAIT_SECONDS` caps the reconcile's
+    waits (default 900).
+  - The caller (the role running `fluid apply` or the MWAA execution role) needs the actions in
+    `build_runners/spark/_adapters.py::CALLER_ACTIONS`, plus `iam:PassRole` on the job role for
+    EMR Serverless and EMR on EKS. boto3 stays in the `[aws]` extra.
+
 - **OpenTofu state and plan encryption, opt-in.** `FLUID_STATE_ENCRYPTION` (an operator
   setting; project dotenv files cannot set it) names one OpenTofu key provider by reference:
   `aws-kms://<key id, ARN or alias/name>`, `gcp-kms://projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>`,
@@ -450,6 +473,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Data Mesh Manager / Entropy Data lineage was missing or stale.** Both publish paths
+  (`fluid publish --target datamesh-manager` and `fluid datamesh-manager publish`) stripped
+  every `consumes[]` input port from the ODPS product and left product-to-product lineage to
+  Access agreements, which stay `requested` across teams, so a cross-team consume drew no edge.
+  Each consume is now an ODPS input port naming the upstream contract, which Entropy draws an
+  edge from. A build source's input port now carries `customProperties[sourceSystemId]` and
+  `[type]`, the only shape Entropy links a SourceSystem by; every source-aligned product used to
+  land with its SourceSystem node and no edge to it. Agreements forge made for consumes a
+  contract no longer has are cancelled on publish (they kept drawing the edge). Checked
+  edge for edge against Entropy Data Community Edition.
 - **`fluid forge data-model from-source --source postgres|mysql` attaches its source again.**
   The shared JDBC attach (`cli/discover/_jdbc_introspect.py::attach_jdbc_source`) ran a bare
   `ATTACH ... (TYPE postgres)` in the DuckDB sandbox, which turns off persistent secret storage.
@@ -458,7 +491,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an empty temporary secret and names it, as the DuckDB build runner already did. `fluid profile`
   reads postgres and mysql tables through the same attach. `fluid init --discover` has its own
   attach in `_jdbc_base.py`, which still fails this way.
-
 - **`fluid forge data-model` gave every expose the foreign entity of every relationship.** In
   the one-expose-per-dataset shape, the target of a relationship got a foreign entity on its own
   key, and the other exposes one on a column they do not have, and `fluid generate

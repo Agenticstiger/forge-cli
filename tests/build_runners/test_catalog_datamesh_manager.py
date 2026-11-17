@@ -108,20 +108,17 @@ def _consuming_contract() -> Dict[str, Any]:
     }
 
 
-class TestProductConsumeLineageIsNotPublishedTwice:
-    """Entropy draws product-to-product lineage from Access agreements, so the
-    registrar strips product-consume ``inputPorts`` — an upstream product would
-    otherwise have to be mirrored as a SourceSystem for the reference to
-    resolve, and the graph would render duplicate nodes.
-
-    Since 0.24.0 the ODPS render also derives ``outputPorts[].inputContracts``
-    from the same ``consumes[]``, so the dependency is stated twice in one
-    document. Stripping only the input port left the upstream named anyway, on
-    the canonical publish path.
+class TestProductConsumeLineageIsPublished:
+    """A product consume reaches Entropy as an ODPS input port naming the
+    upstream contract, and as the matching ``outputPorts[].inputContracts``
+    entry. Entropy draws the product -> product edge from the input port
+    (status ``declared``), merged with an approved Access agreement for the
+    same pair. These ports used to be stripped, which left every consume that
+    crosses a team without an edge: its agreement stays ``requested``.
     """
 
     @respx.mock
-    def test_the_dataproduct_put_names_no_upstream_product(self):
+    def test_the_dataproduct_put_names_the_upstream_contract(self):
         from fluid_build.api.catalog_publication import CatalogPublicationPayload
 
         respx.route(method="PUT").mock(return_value=httpx.Response(200, json={"ok": True}))
@@ -139,9 +136,11 @@ class TestProductConsumeLineageIsNotPublishedTwice:
             bodies
         ), f"no dataproduct PUT fired; urls were {[str(c.request.url) for c in respx.calls]}"
         body = bodies[0]
-        assert "inputPorts" not in body, body.get("inputPorts")
-        for port in body.get("outputPorts") or []:
-            assert "inputContracts" not in port, port["inputContracts"]
+        assert [(p["name"], p["contractId"]) for p in body["inputPorts"]] == [
+            ("customers", "silver.crm.core.customers")
+        ]
+        for port in body["outputPorts"]:
+            assert [e["id"] for e in port["inputContracts"]] == ["silver.crm.core.customers"]
 
     @respx.mock
     def test_a_stated_lineage_survives_even_when_the_product_also_consumes(self):
@@ -173,10 +172,9 @@ class TestProductConsumeLineageIsNotPublishedTwice:
         assert lineage == [[{"id": "vendor.customers_raw", "version": "1"}]], lineage
 
     @respx.mock
-    def test_a_stated_entry_naming_the_consumed_contract_is_still_removed(self):
-        """When the stated id IS the one the consume derives, the consume wins.
-        Keeping it would name an upstream product with no input port to resolve
-        it — the duplicate-graph-node leak this strip exists to prevent."""
+    def test_a_stated_entry_naming_the_consumed_contract_is_kept(self):
+        """When the stated id IS the one the consume derives, the entry stays:
+        the consume's input port is published too, so the id resolves."""
         from fluid_build.api.catalog_publication import CatalogPublicationPayload
 
         respx.route(method="PUT").mock(return_value=httpx.Response(200, json={"ok": True}))
@@ -194,17 +192,14 @@ class TestProductConsumeLineageIsNotPublishedTwice:
             for call in respx.calls
             if "/api/dataproducts/" in str(call.request.url)
         ]
-        for port in bodies[0].get("outputPorts") or []:
-            assert "inputContracts" not in port, port["inputContracts"]
+        for port in bodies[0]["outputPorts"]:
+            assert [e["id"] for e in port["inputContracts"]] == ["silver.crm.core.customers"]
 
     @respx.mock
-    def test_an_imported_documents_own_lineage_is_not_stripped_with_it(self):
-        """The registrar drops an input port that carries no ``sourceSystemId``,
-        which catches an ``expects[]`` port as well as a product consume. Only
-        the consume-derived lineage may go with it: an ``expects[]`` port's
-        expose replays the upstream document's OWN ``inputContracts``, and
-        nothing else in the payload records that dependency, because Access
-        agreements are built from ``consumes[]``.
+    def test_an_imported_documents_own_lineage_is_kept(self):
+        """An ``expects[]`` port's expose replays the upstream document's OWN
+        ``inputContracts``; nothing else in the payload records that
+        dependency, because Access agreements are built from ``consumes[]``.
         """
         from fluid_build.api.catalog_publication import CatalogPublicationPayload
 
@@ -419,14 +414,17 @@ class TestDmmSourceSystemUpsert:
         # kind_to_dmm_type maps Salesforce → "Salesforce" (TitleCase)
         assert "type" in body["custom"]
 
-        # The data-product PUT body must reference the SourceSystem via
-        # inputPorts[].sourceSystemId — otherwise DMM won't draw the
-        # upstream edge on the lineage graph.
+        # The data-product PUT body must reference the SourceSystem through
+        # inputPorts[].customProperties[sourceSystemId] — the only shape
+        # Entropy draws the SourceSystem -> product edge from (a native
+        # ``sourceSystemId`` field is dropped on save).
         dp_body = json.loads(dp_route.calls[0].request.content)
         ips = dp_body.get("inputPorts") or []
         assert ips, "data product must carry inputPorts wiring to the SourceSystem"
         assert any(
-            ip.get("sourceSystemId") == "salesforce" for ip in ips
+            {"property": "sourceSystemId", "value": "salesforce"}
+            in (ip.get("customProperties") or [])
+            for ip in ips
         ), "at least one inputPort must reference the upserted SourceSystem"
 
         # URN surfaces on metadata for catalog observability.

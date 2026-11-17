@@ -675,226 +675,6 @@ def _get_source_system_property(port):
     return None
 
 
-class TestRemoveOdpsProductConsumeInputPorts:
-    """Keep product consumes out of ODPS inputPorts for DMM publish."""
-
-    def test_removes_product_consumes_and_retains_explicit_source_systems(self):
-        fluid = {
-            "consumes": [
-                {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
-                {
-                    "productId": "bronze.telco.party_v1",
-                    "exposeId": "crm_source",
-                    "sourceSystem": "bss-crm",
-                },
-            ],
-        }
-        odps_payload = {
-            "inputPorts": [
-                {"name": "account_source", "contractId": "bronze.telco.party_v1"},
-                {"name": "crm_source", "contractId": "bronze.telco.party_v1"},
-            ]
-        }
-
-        DataMeshManagerProvider._remove_odps_product_consume_input_ports(odps_payload, fluid)
-
-        assert odps_payload["inputPorts"] == [
-            {"name": "crm_source", "contractId": "bronze.telco.party_v1"}
-        ]
-
-    @pytest.mark.parametrize(
-        ("label", "consumes"),
-        [
-            (
-                "productId tail contains __",
-                [
-                    {"productId": "silver.crm.core", "exposeId": "customers"},
-                    {"productId": "silver.crm__core", "exposeId": "customers"},
-                ],
-            ),
-            (
-                # Three consumes sharing an exposeId AND a productId tail: the
-                # first keeps ``customers``, the second takes
-                # ``core__customers``, and the third falls back to
-                # ``customers_2`` — the shape with no ``__`` to match on.
-                "numeric-suffix rename fallback",
-                [
-                    {"productId": "silver.a.core", "exposeId": "customers"},
-                    {"productId": "silver.b.core", "exposeId": "customers"},
-                    {"productId": "silver.c.core", "exposeId": "customers"},
-                ],
-            ),
-            (
-                "exposeId itself contains __",
-                [
-                    {"productId": "silver.crm.core", "exposeId": "cust__omers"},
-                    {"productId": "silver.party", "exposeId": "cust__omers"},
-                ],
-            ),
-        ],
-    )
-    def test_a_renamed_port_is_matched_whatever_shape_the_rename_took(self, label, consumes):
-        """Two consumes sharing an ``exposeId`` make the exporter rename the
-        second, and the rename has three shapes. Matching the name by splitting
-        at the FIRST ``__`` read ``silver.crm__core`` as the boundary and let
-        that port through; the numeric-suffix fallback carries no ``__`` at all.
-        A leaked port is an unresolvable SourceSystem reference, and since the
-        lineage key mirrors the ports, it leaked twice.
-        """
-        from fluid_build.providers.datamesh_manager.datamesh_manager import (
-            DataMeshManagerProvider,
-        )
-
-        contract = {
-            "fluidVersion": "0.7.3",
-            "kind": "DataProduct",
-            "id": "gold.sales.orders",
-            "name": "Orders",
-            "metadata": {"layer": "Gold", "owner": {"team": "dp", "email": "dp@co.example"}},
-            "consumes": consumes,
-            "exposes": [
-                {
-                    "exposeId": "orders",
-                    "kind": "table",
-                    "binding": {
-                        "platform": "snowflake",
-                        "format": "snowflake_table",
-                        "location": {"database": "G", "schema": "S", "table": "O"},
-                    },
-                    "contract": {"schema": [{"name": "id", "type": "string"}]},
-                }
-            ],
-        }
-        payload = DataMeshManagerProvider(api_key="t").apply(contract, dry_run=True)["payload"]
-        assert not payload.get("inputPorts"), (label, payload.get("inputPorts"))
-        lineage = [port.get("inputContracts") for port in payload.get("outputPorts") or []]
-        assert not any(lineage), (label, lineage)
-
-    def test_a_source_system_consume_keeps_its_port_and_its_lineage(self):
-        """The over-match guard. Entropy resolves a source-system port, so it
-        survives — and its lineage entry must survive with it."""
-        from fluid_build.providers.datamesh_manager.datamesh_manager import (
-            DataMeshManagerProvider,
-        )
-
-        contract = {
-            "fluidVersion": "0.7.3",
-            "kind": "DataProduct",
-            "id": "gold.sales.orders",
-            "name": "Orders",
-            "metadata": {"layer": "Gold", "owner": {"team": "dp", "email": "dp@co.example"}},
-            "consumes": [
-                {"productId": "bronze.telco.party", "exposeId": "account_source"},
-                {
-                    "productId": "bronze.telco.party",
-                    "exposeId": "crm_source",
-                    "sourceSystem": "bss-crm",
-                },
-            ],
-            "exposes": [
-                {
-                    "exposeId": "orders",
-                    "kind": "table",
-                    "binding": {
-                        "platform": "snowflake",
-                        "format": "snowflake_table",
-                        "location": {"database": "G", "schema": "S", "table": "O"},
-                    },
-                    "contract": {"schema": [{"name": "id", "type": "string"}]},
-                }
-            ],
-        }
-        payload = DataMeshManagerProvider(api_key="t").apply(contract, dry_run=True)["payload"]
-        assert [ip["name"] for ip in payload["inputPorts"]] == ["crm_source"]
-        assert payload["outputPorts"][0]["inputContracts"] == [
-            {"id": "bronze.telco.party.crm_source", "version": "1.0.0"}
-        ]
-
-    def test_a_removed_ports_derived_lineage_goes_with_it(self):
-        """Since 0.24.0 the ODPS exporter derives ``outputPorts[].inputContracts``
-        from ``consumes[]``, so one product-to-product edge is stated twice in a
-        document. Leaving the lineage behind puts back the duplicate graph nodes
-        this strip exists to prevent."""
-        fluid = {
-            "consumes": [
-                {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
-                {
-                    "productId": "bronze.telco.party_v1",
-                    "exposeId": "crm_source",
-                    "sourceSystem": "bss-crm",
-                },
-            ],
-        }
-        odps_payload = {
-            "inputPorts": [
-                {
-                    "name": "account_source",
-                    "contractId": "bronze.telco.party_v1.account_source",
-                },
-                {"name": "crm_source", "contractId": "bronze.telco.party_v1.crm_source"},
-            ],
-            "outputPorts": [
-                {
-                    "name": "accounts",
-                    "inputContracts": [
-                        {"id": "bronze.telco.party_v1.account_source", "version": "1.0.0"},
-                        {"id": "bronze.telco.party_v1.crm_source", "version": "1.0.0"},
-                    ],
-                }
-            ],
-        }
-
-        DataMeshManagerProvider._remove_odps_product_consume_input_ports(odps_payload, fluid)
-
-        assert odps_payload["inputPorts"] == [
-            {"name": "crm_source", "contractId": "bronze.telco.party_v1.crm_source"}
-        ]
-        # The source-system consume keeps its lineage, because its port is kept.
-        assert odps_payload["outputPorts"][0]["inputContracts"] == [
-            {"id": "bronze.telco.party_v1.crm_source", "version": "1.0.0"}
-        ]
-
-    def test_the_lineage_key_goes_away_when_every_entry_was_a_product_consume(self):
-        fluid = {
-            "consumes": [
-                {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
-            ],
-        }
-        odps_payload = {
-            "inputPorts": [
-                {
-                    "name": "account_source",
-                    "contractId": "bronze.telco.party_v1.account_source",
-                }
-            ],
-            "outputPorts": [
-                {
-                    "name": "accounts",
-                    "inputContracts": [
-                        {"id": "bronze.telco.party_v1.account_source", "version": "1.0.0"}
-                    ],
-                }
-            ],
-        }
-
-        DataMeshManagerProvider._remove_odps_product_consume_input_ports(odps_payload, fluid)
-
-        assert "inputPorts" not in odps_payload
-        assert "inputContracts" not in odps_payload["outputPorts"][0]
-
-    def test_removes_input_ports_key_when_only_product_consumes_exist(self):
-        fluid = {
-            "consumes": [
-                {"productId": "bronze.telco.party_v1", "exposeId": "account_source"},
-            ],
-        }
-        odps_payload = {"inputPorts": [{"name": "account_source"}]}
-
-        DataMeshManagerProvider._remove_odps_product_consume_input_ports(odps_payload, fluid)
-
-        assert "inputPorts" not in odps_payload
-
-
 class TestEnsureOdpsInputPortSourceSystemCustomProperty:
     """Attach ``customProperties[sourceSystem]`` only when the mode requires it."""
 
@@ -1116,19 +896,18 @@ class TestEnsureSourceSystems:
 
 
 class TestCanonicalLineageShape:
-    """Lock in the canonical Entropy lineage model (per ``dataproduct-0.0.1.json``):
+    """Lock in the lineage shape Entropy Data draws from an ODPS product:
 
-    * ``consumes[].productId`` (data-product reference) → **Access agreement** edge.
-      Never appears as an inputPort, never invents a SourceSystem entity.
-    * ``consumes[].sourceSystem`` (explicit external system) → **inputPort**
-      with ``sourceSystemId`` set, plus an upserted SourceSystem entity.
+    * ``consumes[].productId`` (data-product reference) → an **inputPort**
+      whose ``contractId`` names the upstream contract (Entropy draws the
+      product -> product edge from it), plus an **Access agreement**. Never
+      invents a SourceSystem entity.
+    * ``consumes[].sourceSystem`` (explicit external system) → the same
+      inputPort, carrying ``customProperties[sourceSystemId]`` (what Entropy
+      links a SourceSystem by), plus an upserted SourceSystem entity.
 
-    Entropy's native dataproduct schema requires ``inputPorts[].sourceSystemId``,
-    making the two upstream classes structurally distinct. Doubling them up
-    (e.g. inventing a SourceSystem from a product reference) creates duplicate
-    graph nodes next to the real Access edges in the UI. Card 69d2a9b2 was
-    filed against an older branch that emitted that hybrid shape; today's
-    ``main`` keeps the two paths cleanly separated.
+    Inventing a SourceSystem from a product reference would add a phantom node
+    next to the real product edge (card 69d2a9b2).
     """
 
     @staticmethod
@@ -1193,10 +972,9 @@ class TestCanonicalLineageShape:
         return contract
 
     @pytest.mark.parametrize("mode", ("contract", "source-system"))
-    def test_product_consumes_never_appear_as_input_ports(self, mode):
-        """Product-to-product lineage is Access-agreement-only in every
-        mode. Putting it on inputPorts would double-count upstream nodes
-        in the Entropy graph."""
+    def test_product_consumes_are_input_ports_naming_the_upstream_contract(self, mode):
+        """In every mode a product consume is an input port naming the
+        upstream contract, and never a SourceSystem link."""
         provider = _make_provider()
         result = provider._publish_one(
             self._silver_with_two_product_upstreams(),
@@ -1205,8 +983,14 @@ class TestCanonicalLineageShape:
             odps_lineage_mode=mode,
         )
         payload = result["payload"]
-        assert payload.get("inputPorts") in (None, []), payload.get("inputPorts")
-        # Lineage flows through Access agreements regardless of mode.
+        assert {p["name"]: p["contractId"] for p in payload["inputPorts"]} == {
+            "account_source": "bronze.telco.party_v1.account_source",
+            "usage_event_source": "bronze.telco.usage_v1.usage_event_source",
+        }
+        for port in payload["inputPorts"]:
+            props = {c["property"] for c in port.get("customProperties") or []}
+            assert "sourceSystemId" not in props, port
+        # Access agreements go out in every mode as well.
         access = result.get("access_agreements") or []
         assert len(access) == 2
         access_ids = {a["payload"]["id"] for a in access}
@@ -1252,7 +1036,11 @@ class TestCanonicalLineageShape:
         )
         payload = result["payload"]
         ports = payload.get("inputPorts") or []
-        # Only the explicit-source-system consume survives as an input
-        # port; the product-ref consume stays an Access agreement.
-        assert len(ports) == 1, ports
-        assert ports[0]["name"] == "salesforce_export"
+        linked = {
+            port["name"]: prop["value"]
+            for port in ports
+            for prop in port.get("customProperties") or []
+            if prop["property"] == "sourceSystemId"
+        }
+        assert linked == {"salesforce_export": "salesforce-prod"}, ports
+        assert [p["name"] for p in ports] == ["account_source", "salesforce_export"]
