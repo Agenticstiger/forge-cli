@@ -7,63 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **`[profile]` no longer installs flux-stats.** PyPI refuses an upload whose metadata holds a URL
-  dependency, and flux-stats is not on PyPI yet (its 0.0.1 is a placeholder with no code), so
-  the git pin in `[profile]` blocked every release. `[profile]` is now `duckdb` alone. `fluid
-  profile` needs flux-stats from git until it is released: the error names the exact
-  `pip install "flux-stats @ git+https://..."` command, and `requirements/flux-stats.txt` holds
-  the pin that CI installs. Once flux-stats is released, `[profile]` pins a version again. A new
-  test fails if any dependency in `pyproject.toml` is a direct URL.
-
-- **One Airflow renderer.** `fluid export --engine airflow` (the AWS, GCP and Snowflake
-  providers), `fluid generate schedule` and `fluid generate-airflow` all render a contract's
-  `orchestration` section through `fluid_build.schedulers.airflow.render_dag`. The per-provider
-  `codegen/airflow.py` modules, the Snowflake `orchestration/airflow_generator.py` and the
-  provider-action generator behind `generate-airflow` are gone. The same contract and provider
-  settings now give the same DAG whichever command writes it (`fluid generate schedule` reads
-  the project, region and account from the contract's `metadata`, `fluid export` from the
-  provider's own settings, so give both the same). Every provider gets the guards only some had: a task
-  never takes a name the DAG module binds, ids that sanitise alike stay two tasks, an edge to a
-  task outside the DAG is skipped instead of failing the file at import, and an operator is
-  imported only when a task uses it. Ported into the renderer: AWS Redshift, Lambda and Glue
-  catalog tasks, GCP Pub/Sub, Dataflow and BigQuery create-table, Snowflake database, schema and
-  table DDL. Differences from the old output, one by one: `tests/schedulers/golden/DIFFERENCES.md`.
-  - A DAG id now drops `.` and `-` for AWS too (`sales.orders` is DAG `sales_orders`), as the other
-    providers and `generate schedule` already did. The file `fluid export` writes keeps its name.
-  - A task whose action no operator covers fails closed for every provider. `render_dag` (so
-    `fluid export`, `fluid generate schedule` and `fluid generate-airflow`) raises a `ValueError`
-    naming each such task and action, instead of writing a DAG that logs the action and still
-    succeeds. This is new for GCP and Snowflake, which used to log; AWS raised "retired" at run
-    time before. `FLUID_AIRFLOW_ALLOW_UNMAPPED=1` (`fluid generate-airflow --allow-unmapped`)
-    renders those tasks as log-only tasks and logs a WARNING that lists them.
-  - `fluid generate-airflow` is a deprecated alias of `fluid generate schedule --scheduler
-    airflow` and says so once. With no `-o` it still prints the one DAG to stdout; `-o` is an
-    output directory (written over, so a populated `dags/` works), or a `.py` path for a contract
-    that renders one DAG. It takes `--contract-path`, as `generate schedule` does, and must now
-    run from the project directory for a contract with scheduled builds. `--dag-id` and
-    `--schedule` are options of `fluid generate schedule` now (and so of the alias): they
-    override the id and the schedule of the one DAG rendered from an `orchestration` section, and
-    are refused for a scheduled-build DAG, which takes both from its trigger. A contract
-    with builds and no orchestration renders through its builds' triggers; it no longer gets a
-    DAG of `echo` placeholders.
-  - The renderer never writes a placeholder. `fluid generate schedule` now resolves the GCP
-    project (contract `metadata.gcp_project`, then `GOOGLE_CLOUD_PROJECT`, `FLUID_PROJECT`,
-    `GCLOUD_PROJECT`, then Application Default Credentials), the AWS account and the Snowflake
-    account, database and warehouse the way the provider does; before, a missing one rendered
-    `my-project`, `UNKNOWN_DB` or an empty account. A task that needs a value that did not
-    resolve, or that leaves out its Athena query or output location, Snowflake database, schema,
-    table, columns or SQL, BigQuery dataset, table or query, a bucket, topic, subscription, Glue
-    job name, Lambda function or Redshift SQL or cluster, is refused with a `ValueError` naming the task, instead of running `SELECT 1` or
-    creating `unknown-bucket`.
-  - Only `aws.glue.run_job` and `aws.glue.start_job_run` run a Glue job. Any other
-    `aws.glue.<operation>` is unmapped, and fails closed like the rest.
-  - A contract whose `orchestration` section has no `provider_action` task is refused rather
-    than rendered as an empty DAG.
-  - A schedule written as a bare word (`hourly`, `daily`, `weekly`, `monthly`) is the Airflow
-    keyword of that name for AWS too. It used to map to cron: `daily` ran at 02:00, now at 00:00.
-  - `generate_airflow_dag_taskflow` (AWS TaskFlow DAGs) is removed; nothing called it.
+## [0.31.0] — 2026-11-17
 
 ### Added
 
@@ -370,6 +314,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: Lake Formation admins and the LF tag vocabulary stay out of a product's state.**
+  A contract that sets `governance.lakeFormation.admins` is refused: Lake Formation admins belong
+  to the platform's own bootstrap, not to a product. A contract with `tagDefinitions` is refused
+  unless it declares `packaging.containers.lfTagVocabulary: isolated`, so a product owns a tag
+  vocabulary only when it says so. No contract in `examples/` or the templates sets either.
+- **BREAKING: an AWS contract that plans an op the OpenTofu engine does not create is refused.**
+  `fluid validate`, `fluid plan`, `fluid generate iac` and `fluid apply` refuse it with
+  `aws-op-not-emitted` and name every such op at once, with the contract field that planned it
+  and what to do instead. The six ops are `iam.bind_glue_database`, `iam.bind_s3_bucket`,
+  `athena.create_view`, `redshift.ensure_schema`, `redshift.ensure_table` and
+  `events.ensure_schedule`. No bundled schema (0.7.1 to 0.7.7) admits the fields that plan them,
+  so only paths that skip schema validation (`fluid generate iac`, API callers) change.
+- **`[profile]` no longer installs flux-stats.** PyPI refuses an upload whose metadata holds a URL
+  dependency, and flux-stats is not on PyPI yet (its 0.0.1 is a placeholder with no code), so
+  the git pin in `[profile]` blocked every release. `[profile]` is now `duckdb` alone. `fluid
+  profile` needs flux-stats from git until it is released: the error names the exact
+  `pip install "flux-stats @ git+https://..."` command, and `requirements/flux-stats.txt` holds
+  the pin that CI installs. Once flux-stats is released, `[profile]` pins a version again. A new
+  test fails if any dependency in `pyproject.toml` is a direct URL.
+
+- **One Airflow renderer.** `fluid export --engine airflow` (the AWS, GCP and Snowflake
+  providers), `fluid generate schedule` and `fluid generate-airflow` all render a contract's
+  `orchestration` section through `fluid_build.schedulers.airflow.render_dag`. The per-provider
+  `codegen/airflow.py` modules, the Snowflake `orchestration/airflow_generator.py` and the
+  provider-action generator behind `generate-airflow` are gone. The same contract and provider
+  settings now give the same DAG whichever command writes it (`fluid generate schedule` reads
+  the project, region and account from the contract's `metadata`, `fluid export` from the
+  provider's own settings, so give both the same). Every provider gets the guards only some had: a task
+  never takes a name the DAG module binds, ids that sanitise alike stay two tasks, an edge to a
+  task outside the DAG is skipped instead of failing the file at import, and an operator is
+  imported only when a task uses it. Ported into the renderer: AWS Redshift, Lambda and Glue
+  catalog tasks, GCP Pub/Sub, Dataflow and BigQuery create-table, Snowflake database, schema and
+  table DDL. Differences from the old output, one by one: `tests/schedulers/golden/DIFFERENCES.md`.
+  - A DAG id now drops `.` and `-` for AWS too (`sales.orders` is DAG `sales_orders`), as the other
+    providers and `generate schedule` already did. The file `fluid export` writes keeps its name.
+  - A task whose action no operator covers fails closed for every provider. `render_dag` (so
+    `fluid export`, `fluid generate schedule` and `fluid generate-airflow`) raises a `ValueError`
+    naming each such task and action, instead of writing a DAG that logs the action and still
+    succeeds. This is new for GCP and Snowflake, which used to log; AWS raised "retired" at run
+    time before. `FLUID_AIRFLOW_ALLOW_UNMAPPED=1` (`fluid generate-airflow --allow-unmapped`)
+    renders those tasks as log-only tasks and logs a WARNING that lists them.
+  - `fluid generate-airflow` is a deprecated alias of `fluid generate schedule --scheduler
+    airflow` and says so once. With no `-o` it still prints the one DAG to stdout; `-o` is an
+    output directory (written over, so a populated `dags/` works), or a `.py` path for a contract
+    that renders one DAG. It takes `--contract-path`, as `generate schedule` does, and must now
+    run from the project directory for a contract with scheduled builds. `--dag-id` and
+    `--schedule` are options of `fluid generate schedule` now (and so of the alias): they
+    override the id and the schedule of the one DAG rendered from an `orchestration` section, and
+    are refused for a scheduled-build DAG, which takes both from its trigger. A contract
+    with builds and no orchestration renders through its builds' triggers; it no longer gets a
+    DAG of `echo` placeholders.
+  - The renderer never writes a placeholder. `fluid generate schedule` now resolves the GCP
+    project (contract `metadata.gcp_project`, then `GOOGLE_CLOUD_PROJECT`, `FLUID_PROJECT`,
+    `GCLOUD_PROJECT`, then Application Default Credentials), the AWS account and the Snowflake
+    account, database and warehouse the way the provider does; before, a missing one rendered
+    `my-project`, `UNKNOWN_DB` or an empty account. A task that needs a value that did not
+    resolve, or that leaves out its Athena query or output location, Snowflake database, schema,
+    table, columns or SQL, BigQuery dataset, table or query, a bucket, topic, subscription, Glue
+    job name, Lambda function or Redshift SQL or cluster, is refused with a `ValueError` naming the task, instead of running `SELECT 1` or
+    creating `unknown-bucket`.
+  - Only `aws.glue.run_job` and `aws.glue.start_job_run` run a Glue job. Any other
+    `aws.glue.<operation>` is unmapped, and fails closed like the rest.
+  - A contract whose `orchestration` section has no `provider_action` task is refused rather
+    than rendered as an empty DAG.
+  - A schedule written as a bare word (`hourly`, `daily`, `weekly`, `monthly`) is the Airflow
+    keyword of that name for AWS too. It used to map to cron: `daily` ran at 02:00, now at 00:00.
+  - `generate_airflow_dag_taskflow` (AWS TaskFlow DAGs) is removed; nothing called it.
 - **The bundled examples and scaffolds pass `fluid validate --strict`, so `fluid ship` runs them as
   shipped.** `fluid ship` validates with `--strict` by default (#917), and the placeholder owner
   emails in 29 example contracts and 13 templates stopped a first `fluid ship` at stage 2. They
