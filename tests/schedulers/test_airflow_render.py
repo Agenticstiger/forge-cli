@@ -51,7 +51,10 @@ def _norm(source: str) -> str:
     "task,operator",
     [
         (
-            {"action": "aws.redshift.execute_sql", "params": {"sql": "SELECT 1"}},
+            {
+                "action": "aws.redshift.execute_sql",
+                "params": {"sql": "SELECT 1", "cluster": "c"},
+            },
             "RedshiftDataOperator",
         ),
         (
@@ -557,6 +560,9 @@ def test_generate_schedule_takes_dag_id_and_schedule_overrides(tmp_path):
     assert _generate_schedule(path, tmp_path / "dags", dag_id="my_dag", dag_schedule="@daily") == 0
     source = (tmp_path / "dags" / "my_dag_dag.py").read_text(encoding="utf-8")
     assert "dag_id='my_dag'" in source and "schedule='@daily'" in source
+    # Only the DAG id changes: the contract id stays in the header and the tags.
+    assert "sales.orders" in source and "'sales.orders'" in source
+    assert "tags=['fluid', 'auto-generated', 'aws', 'sales.orders']" in source
 
 
 def test_generate_airflow_forwards_dag_id_and_schedule(tmp_path, monkeypatch, capsys):
@@ -595,3 +601,19 @@ def test_a_scheduled_build_dag_refuses_the_overrides_it_cannot_honour(tmp_path, 
     args = parser.parse_args(["schedule", DEMO_CONTRACT_PATH, "-o", "out", *flag])
     assert generate_schedule.run(args, LOG) == 2
     assert not (tmp_path / "out").exists()
+
+
+def test_lambda_without_a_function_and_redshift_without_sql_or_cluster_are_refused():
+    assert "params.function" in _refused("aws", {"taskId": "l", "action": "aws.lambda.invoke"})
+    redshift = {"taskId": "r", "action": "aws.redshift.execute_sql", "params": {"sql": "SELECT 1"}}
+    assert "params.cluster" in _refused("aws", redshift)
+    assert "params.sql" in _refused(
+        "aws",
+        {"taskId": "r", "action": "aws.redshift.execute_sql", "params": {"cluster": "c"}},
+    )
+    ok = {
+        "taskId": "r",
+        "action": "aws.redshift.execute_sql",
+        "params": {"sql": "S", "cluster": "c"},
+    }
+    assert "RedshiftDataOperator(" in render_dag(_contract("aws", ok), provider="aws")

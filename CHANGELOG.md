@@ -46,8 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     account, database and warehouse the way the provider does; before, a missing one rendered
     `my-project`, `UNKNOWN_DB` or an empty account. A task that needs a value that did not
     resolve, or that leaves out its Athena query or output location, Snowflake database, schema,
-    table, columns or SQL, BigQuery dataset, table or query, a bucket, topic, subscription or Glue
-    job name, is refused with a `ValueError` naming the task, instead of running `SELECT 1` or
+    table, columns or SQL, BigQuery dataset, table or query, a bucket, topic, subscription, Glue
+    job name, Lambda function or Redshift SQL or cluster, is refused with a `ValueError` naming the task, instead of running `SELECT 1` or
     creating `unknown-bucket`.
   - Only `aws.glue.run_job` and `aws.glue.start_job_run` run a Glue job. Any other
     `aws.glue.<operation>` is unmapped, and fails closed like the rest.

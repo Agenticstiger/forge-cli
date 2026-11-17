@@ -87,7 +87,7 @@ class AirflowScheduler(ScheduleEngine):
         provider_config = dict(provider_config or {})
         # Per-run overrides ride in provider_config (the base signature is fixed):
         # the DAG id and the schedule a caller asked for on the command line.
-        contract_id = provider_config.pop("dag_id", None) or contract_id
+        dag_id = provider_config.pop("dag_id", None)
         schedule = provider_config.pop("schedule", None) or schedule
         allow_unmapped = bool(provider_config.pop("allow_unmapped", False)) or (
             os.environ.get(ALLOW_UNMAPPED_ENV, "").strip().lower() in ("1", "true", "yes")
@@ -103,8 +103,9 @@ class AirflowScheduler(ScheduleEngine):
             provider_config,
             provider_tasks,
             allow_unmapped=allow_unmapped,
+            dag_id=dag_id,
         )
-        dag_filename = f"{sanitize_identifier(contract_id)}_dag.py"
+        dag_filename = f"{sanitize_identifier(dag_id or contract_id)}_dag.py"
         return {dag_filename: dag_code}
 
     def validate(
@@ -207,6 +208,7 @@ def _render(
     tasks: List[Dict[str, Any]],
     *,
     allow_unmapped: bool = False,
+    dag_id: Optional[str] = None,
 ) -> str:
     """Assemble one DAG file: header, imports, DAG, helpers, tasks, edges.
 
@@ -270,7 +272,7 @@ def _render(
     )
     dag_code += "\n\n" + _generate_imports(uses)
     dag_code += "\n\n" + _generate_dag_definition(
-        contract_id, contract_name, schedule, timezone, provider
+        contract_id, contract_name, schedule, timezone, provider, dag_id
     )
     helpers = [HELPERS[name] for name in HELPER_NAMES if name in uses]
     if helpers:
@@ -326,8 +328,12 @@ def _generate_dag_definition(
     schedule: str,
     timezone: str,
     provider: Optional[str],
+    dag_id: Optional[str] = None,
 ) -> str:
-    """Generate DAG definition with default arguments."""
+    """Generate DAG definition with default arguments.
+
+    ``dag_id`` overrides only the id; the tags and the description keep the contract id.
+    """
     airflow_schedule = convert_schedule_to_airflow(schedule)
     tags = ["fluid", "auto-generated"]
     if provider:
@@ -350,7 +356,7 @@ default_args = {{
 
 # DAG definition
 dag = DAG(
-    dag_id={py_str_literal(sanitize_identifier(contract_id))},
+    dag_id={py_str_literal(sanitize_identifier(dag_id or contract_id))},
     default_args=default_args,
     description={py_str_literal(contract_name)},
     schedule={py_str_literal(airflow_schedule)},

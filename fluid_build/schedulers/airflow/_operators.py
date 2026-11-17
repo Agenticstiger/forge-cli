@@ -484,8 +484,11 @@ def aws_task(ctx: TaskContext) -> Emitted:
             ctx,
             "RedshiftDataOperator",
             [
-                ("sql", py_str_literal(params.get("sql", ""))),
-                ("cluster_identifier", py_str_literal(params.get("cluster", ""))),
+                ("sql", py_str_literal(_need(ctx, "params.sql", params.get("sql")))),
+                (
+                    "cluster_identifier",
+                    py_str_literal(_need(ctx, "params.cluster", params.get("cluster"))),
+                ),
                 ("database", py_str_literal(params.get("database", "dev"))),
                 ("aws_conn_id", "'aws_default'"),
             ],
@@ -495,7 +498,17 @@ def aws_task(ctx: TaskContext) -> Emitted:
             ctx,
             "LambdaInvokeFunctionOperator",
             [
-                ("function_name", py_str_literal(params.get("function"))),
+                (
+                    "function_name",
+                    py_str_literal(
+                        _need(
+                            ctx,
+                            "params.function",
+                            params.get("function"),
+                            params.get("functionName"),
+                        )
+                    ),
+                ),
                 ("payload", json_literal(params.get("payload", {}))),
                 ("aws_conn_id", "'aws_default'"),
             ],
