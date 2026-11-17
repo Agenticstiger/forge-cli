@@ -94,7 +94,7 @@ check = SQLExecuteQueryOperator(
 
 unmapped = PythonOperator(
     task_id='unmapped',
-    python_callable=lambda: logger.info(
+    python_callable=lambda: logger.warning(
         'Action: ' + 'sf.stage.refresh' + ', Params: ' + '{"stage": "S"}'
     ),
     dag=dag,

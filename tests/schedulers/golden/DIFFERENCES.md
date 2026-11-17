@@ -51,3 +51,13 @@ difference follows, with why it is right.
   through `fluid_apply`; a contract with nothing scheduled has nothing to render.
 * `providers/snowflake/orchestration/`: no command called it. It read the `sf.*` action
   vocabulary with `parameters`, not `params`.
+
+## Added after review
+
+| Old | New | Why |
+|---|---|---|
+| A log-only task logged at INFO | WARNING, at render time and when the DAG runs | A task that does not run its action must be visible in the task log. |
+| Any `aws.glue.<operation>` became a `GlueJobOperator` named after the task id | Only `run_job` and `start_job_run`; anything else is unmapped | `aws.glue.delete_table` started a job. |
+| Athena without a query ran `SELECT 1`; no output location and no account gave `s3://results/` | Both refused | Never run or write a made-up value. |
+| `my-project`, `UNKNOWN_DB`, `UNKNOWN_SCHEMA`, `UNKNOWN_TABLE`, `unknown-bucket`, `unknown_dataset` and similar defaults, a default column list for `create_table`, `SELECT 1` for a query | Refused with the task named | Same. `generate schedule` also resolves the project, account and database from the environment. |
+| A contract with no `provider_action` task rendered an empty DAG | Refused | An empty DAG runs green. |

@@ -218,6 +218,17 @@ class TaskContext:
         return (parts[1], parts[2]) if len(parts) >= 3 else ("", "")
 
 
+def _need(ctx: TaskContext, what: str, *values: Any) -> Any:
+    """The first of ``values`` that is set, or a refusal: a made-up name or id is never written."""
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    raise ValueError(
+        f"task {ctx.task_id!r} ({ctx.action}): {what} is not set. Set it in the task's params "
+        "or the provider settings; the renderer does not invent one."
+    )
+
+
 def _data(value: Any) -> str:
     """A contract mapping or list as a Python literal that parses and means the same.
 
@@ -259,7 +270,7 @@ def generic_task(ctx: TaskContext) -> Emitted:
     return (
         f"{ctx.var} = PythonOperator(\n"
         f"    task_id={py_str_literal(ctx.task_id)},\n"
-        f"    python_callable=lambda: logger.info(\n"
+        f"    python_callable=lambda: logger.warning(\n"
         f"        'Action: ' + {py_str_literal(ctx.action)} + ', Params: ' + {params_json}\n"
         f"    ),\n"
         f"    dag=dag,\n"
@@ -276,8 +287,8 @@ def generic_task(ctx: TaskContext) -> Emitted:
 def gcp_task(ctx: TaskContext) -> Emitted:
     service, operation = ctx.service_and_operation
     params = ctx.params
-    project = ctx.config.get("project", "my-project")
-    region = ctx.config.get("region", "us-central1")
+    project = _need(ctx, "the GCP project", ctx.config.get("project"))
+    region = ctx.config.get("region") or "us-central1"
     project_lit, region_lit = py_str_literal(project), py_str_literal(region)
 
     if service == "bigquery":
@@ -286,14 +297,17 @@ def gcp_task(ctx: TaskContext) -> Emitted:
                 ctx,
                 "BigQueryCreateEmptyDatasetOperator",
                 [
-                    ("dataset_id", py_str_literal(params.get("dataset_id", "unknown_dataset"))),
+                    (
+                        "dataset_id",
+                        py_str_literal(_need(ctx, "params.dataset_id", params.get("dataset_id"))),
+                    ),
                     ("project_id", project_lit),
                     ("location", py_str_literal(params.get("location", region))),
                 ],
             )
         if operation == "create_table":
-            dataset_lit = py_str_literal(params.get("dataset_id", "unknown_dataset"))
-            table_lit = py_str_literal(params.get("table_id", "unknown_table"))
+            dataset_lit = py_str_literal(_need(ctx, "params.dataset_id", params.get("dataset_id")))
+            table_lit = py_str_literal(_need(ctx, "params.table_id", params.get("table_id")))
             fields = params.get("schema", [])
             task_id_lit = py_str_literal(ctx.task_id)
             return (
@@ -319,7 +333,7 @@ def gcp_task(ctx: TaskContext) -> Emitted:
             )
         if operation in ("query", "run_query"):
             query: Dict[str, Any] = {
-                "query": params.get("query", "SELECT 1"),
+                "query": _need(ctx, "params.query", params.get("query")),
                 "useLegacySql": False,
             }
             dest_dataset = params.get("destination_dataset")
@@ -344,7 +358,7 @@ def gcp_task(ctx: TaskContext) -> Emitted:
             ctx,
             "GCSCreateBucketOperator",
             [
-                ("bucket_name", py_str_literal(params.get("bucket", "unknown-bucket"))),
+                ("bucket_name", py_str_literal(_need(ctx, "params.bucket", params.get("bucket")))),
                 ("project_id", project_lit),
                 ("storage_class", py_str_literal(params.get("storage_class", "STANDARD"))),
                 ("location", py_str_literal(params.get("location", region))),
@@ -356,7 +370,7 @@ def gcp_task(ctx: TaskContext) -> Emitted:
                 ctx,
                 "PubSubCreateTopicOperator",
                 [
-                    ("topic", py_str_literal(params.get("topic", "unknown-topic"))),
+                    ("topic", py_str_literal(_need(ctx, "params.topic", params.get("topic")))),
                     ("project_id", project_lit),
                 ],
             )
@@ -365,8 +379,13 @@ def gcp_task(ctx: TaskContext) -> Emitted:
                 ctx,
                 "PubSubCreateSubscriptionOperator",
                 [
-                    ("topic", py_str_literal(params.get("topic", "unknown-topic"))),
-                    ("subscription", py_str_literal(params.get("subscription", "unknown-sub"))),
+                    ("topic", py_str_literal(_need(ctx, "params.topic", params.get("topic")))),
+                    (
+                        "subscription",
+                        py_str_literal(
+                            _need(ctx, "params.subscription", params.get("subscription"))
+                        ),
+                    ),
                     ("project_id", project_lit),
                 ],
             )
@@ -416,21 +435,26 @@ def aws_task(ctx: TaskContext) -> Emitted:
                 f"    )"
             )
             return _glue_helper_task(ctx, call, "_ensure_glue_table")
-        return _op(
-            ctx,
-            "GlueJobOperator",
-            [
-                ("job_name", py_str_literal(params.get("job_name", ctx.task_id))),
-                ("region_name", region_lit),
-                ("script_args", _data(params.get("script_args", {}))),
-            ],
-        )
+        if operation in ("run_job", "start_job_run"):
+            return _op(
+                ctx,
+                "GlueJobOperator",
+                [
+                    (
+                        "job_name",
+                        py_str_literal(_need(ctx, "params.job_name", params.get("job_name"))),
+                    ),
+                    ("region_name", region_lit),
+                    ("script_args", _data(params.get("script_args", {}))),
+                ],
+            )
+        return generic_task(ctx)
     if service == "s3" and operation in ("create_bucket", "ensure_bucket"):
         return _op(
             ctx,
             "S3CreateBucketOperator",
             [
-                ("bucket_name", py_str_literal(params.get("bucket", "unknown-bucket"))),
+                ("bucket_name", py_str_literal(_need(ctx, "params.bucket", params.get("bucket")))),
                 ("region_name", py_str_literal(params.get("region", region))),
                 ("aws_conn_id", "'aws_default'"),
             ],
@@ -438,17 +462,18 @@ def aws_task(ctx: TaskContext) -> Emitted:
     if service == "athena":
         # The account-scoped bucket is the one Athena creates for a workgroup
         # that sets no result location of its own.
-        default_output = (
-            f"s3://aws-athena-query-results-{account_id}-{region}/"
-            if account_id
-            else "s3://results/"
+        output = _need(
+            ctx,
+            "params.output_location (or the account id, for the default results bucket)",
+            params.get("output_location"),
+            params.get("outputLocation"),
+            f"s3://aws-athena-query-results-{account_id}-{region}/" if account_id else None,
         )
-        output = params.get("output_location", params.get("outputLocation", default_output))
         return _op(
             ctx,
             "AthenaOperator",
             [
-                ("query", py_str_literal(params.get("query", "SELECT 1"))),
+                ("query", py_str_literal(_need(ctx, "params.query", params.get("query")))),
                 ("database", py_str_literal(params.get("database", "default"))),
                 ("output_location", py_str_literal(output)),
                 ("aws_conn_id", "'aws_default'"),
@@ -505,33 +530,42 @@ def snowflake_task(ctx: TaskContext) -> Emitted:
     # ValueError and never reaches the emitted SQL). py_str_literal below only
     # protects the Python layer.
     if operation == "create_database":
-        sql = (
-            f"CREATE DATABASE IF NOT EXISTS {validate_ident(params.get('database', 'UNKNOWN_DB'))}"
-        )
+        db = validate_ident(_need(ctx, "params.database", params.get("database")))
+        sql = f"CREATE DATABASE IF NOT EXISTS {db}"
     elif operation == "create_schema":
-        db = validate_ident(params.get("database", database or "UNKNOWN_DB"))
-        schema = validate_ident(params.get("schema", "UNKNOWN_SCHEMA"))
+        db = validate_ident(
+            _need(
+                ctx,
+                "the database (params.database or the provider's)",
+                params.get("database"),
+                database,
+            )
+        )
+        schema = validate_ident(_need(ctx, "params.schema", params.get("schema")))
         sql = f"CREATE SCHEMA IF NOT EXISTS {db}.{schema}"
     elif operation == "create_table":
-        db = validate_ident(params.get("database", database or "UNKNOWN_DB"))
+        db = validate_ident(
+            _need(
+                ctx,
+                "the database (params.database or the provider's)",
+                params.get("database"),
+                database,
+            )
+        )
         schema = validate_ident(params.get("schema", "PUBLIC"))
-        table = validate_ident(params.get("table", "UNKNOWN_TABLE"))
-        columns = params.get("columns") or []
+        table = validate_ident(_need(ctx, "params.table", params.get("table")))
+        columns = _need(ctx, "params.columns", params.get("columns"))
         for column in columns:
             if not (isinstance(column, dict) and column.get("name") and column.get("type")):
                 raise ValueError(
                     f"task {ctx.task_id!r}: every create_table column needs a name and a type"
                 )
-        cols = (
-            ", ".join(
-                f"{validate_ident(c['name'])} {validate_sql_type_name(c['type'])}" for c in columns
-            )
-            if columns
-            else "id INTEGER, created_at TIMESTAMP_NTZ"
+        cols = ", ".join(
+            f"{validate_ident(c['name'])} {validate_sql_type_name(c['type'])}" for c in columns
         )
         sql = f"CREATE TABLE IF NOT EXISTS {db}.{schema}.{table} ({cols})"
     elif operation in ("query", "run_query", "execute_sql"):
-        sql = params.get("sql", params.get("query", "SELECT 1"))
+        sql = _need(ctx, "params.sql", params.get("sql"), params.get("query"))
     elif "sql" in params:
         sql = params["sql"]
     else:

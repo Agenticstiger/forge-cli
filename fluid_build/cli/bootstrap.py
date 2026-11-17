@@ -528,7 +528,11 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
     CoreCommand(
         "generate_airflow",
         "generate-airflow",
-        (_cmd("generate-airflow", "Deprecated: use 'fluid generate schedule --scheduler airflow'"),),
+        (
+            _cmd(
+                "generate-airflow", "Deprecated: use 'fluid generate schedule --scheduler airflow'"
+            ),
+        ),
     ),
     CoreCommand(
         "generate", "generate", (_cmd("generate", "Generate artifacts from FLUID contract"),)

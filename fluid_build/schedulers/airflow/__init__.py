@@ -85,6 +85,10 @@ class AirflowScheduler(ScheduleEngine):
 
         provider = provider or contract.get("provider", "")
         provider_config = dict(provider_config or {})
+        # Per-run overrides ride in provider_config (the base signature is fixed):
+        # the DAG id and the schedule a caller asked for on the command line.
+        contract_id = provider_config.pop("dag_id", None) or contract_id
+        schedule = provider_config.pop("schedule", None) or schedule
         allow_unmapped = bool(provider_config.pop("allow_unmapped", False)) or (
             os.environ.get(ALLOW_UNMAPPED_ENV, "").strip().lower() in ("1", "true", "yes")
         )
@@ -216,6 +220,11 @@ def _render(
     # One task per id: the DAG is keyed by task id, and two blocks with one id fail
     # Airflow's import with DuplicateTaskIdFound. The last declaration wins.
     tasks = list({t.get("taskId") or "": t for t in tasks}.values())
+    if not tasks:
+        raise ValueError(
+            "The orchestration section has no provider_action task to render, so the DAG "
+            "would be empty and still run green. Other task types are not rendered here."
+        )
     identifiers = unique_task_identifiers(tasks, reserved=RESERVED_NAMES)
 
     task_blocks: List[str] = []

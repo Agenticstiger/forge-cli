@@ -66,6 +66,18 @@ Examples:
     )
     p.add_argument("--env", help="Environment overlay to apply (dev/test/prod)")
     p.add_argument(
+        "--dag-id",
+        dest="dag_id",
+        default=None,
+        help="Override the DAG id (default: the contract id)",
+    )
+    p.add_argument(
+        "--schedule",
+        dest="dag_schedule",
+        default=None,
+        help="Override the schedule (cron or an Airflow keyword)",
+    )
+    p.add_argument(
         "--contract-path",
         dest="contract_path",
         default=None,
@@ -123,6 +135,8 @@ def _forward(args, logger: logging.Logger, output) -> int:
                         env=getattr(args, "env", None),
                         dag_env=None,
                         dag_contract_path=getattr(args, "contract_path", None),
+                        dag_id=getattr(args, "dag_id", None),
+                        dag_schedule=getattr(args, "dag_schedule", None),
                         list_schedulers=False,
                         verbose=getattr(args, "verbose", False),
                     ),

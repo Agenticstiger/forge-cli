@@ -35,17 +35,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     output directory (written over, so a populated `dags/` works), or a `.py` path for a contract
     that renders one DAG. It takes `--contract-path`, as `generate schedule` does, and must now
     run from the project directory for a contract with scheduled builds. `--dag-id` and
-    `--schedule` are removed (argparse rejects them): the contract's `orchestration.schedule` is the one source. A contract
+    `--schedule` are options of `fluid generate schedule` now (and so of the alias): they
+    override the id and the schedule of the one DAG rendered from an `orchestration` section, and
+    are refused for a scheduled-build DAG, which takes both from its trigger. A contract
     with builds and no orchestration renders through its builds' triggers; it no longer gets a
     DAG of `echo` placeholders.
+  - The renderer never writes a placeholder. `fluid generate schedule` now resolves the GCP
+    project (contract `metadata.gcp_project`, then `GOOGLE_CLOUD_PROJECT`, `FLUID_PROJECT`,
+    `GCLOUD_PROJECT`, then Application Default Credentials), the AWS account and the Snowflake
+    account, database and warehouse the way the provider does; before, a missing one rendered
+    `my-project`, `UNKNOWN_DB` or an empty account. A task that needs a value that did not
+    resolve, or that leaves out its Athena query or output location, Snowflake database, schema,
+    table, columns or SQL, BigQuery dataset, table or query, a bucket, topic, subscription or Glue
+    job name, is refused with a `ValueError` naming the task, instead of running `SELECT 1` or
+    creating `unknown-bucket`.
+  - Only `aws.glue.run_job` and `aws.glue.start_job_run` run a Glue job. Any other
+    `aws.glue.<operation>` is unmapped, and fails closed like the rest.
+  - A contract whose `orchestration` section has no `provider_action` task is refused rather
+    than rendered as an empty DAG.
   - A schedule written as a bare word (`hourly`, `daily`, `weekly`, `monthly`) is the Airflow
     keyword of that name for AWS too. It used to map to cron: `daily` ran at 02:00, now at 00:00.
   - `generate_airflow_dag_taskflow` (AWS TaskFlow DAGs) is removed; nothing called it.
-
-### Removed
-
-- `fluid generate-airflow --dag-id` and `--schedule`. Set `orchestration.schedule` in the contract
-  for the schedule; the DAG id comes from the contract `id`.
 
 ### Added
 

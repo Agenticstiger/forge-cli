@@ -39,16 +39,23 @@ _TASKS = [
         "taskId": "load",
         "type": "provider_action",
         "action": "aws.athena.query",
-        "params": {"query": "SELECT 1"},
+        "params": {"query": "SELECT 1", "output_location": "s3://r/"},
     },
     {
         "taskId": "publish",
         "type": "provider_action",
         "action": "aws.athena.query",
-        "params": {"query": "SELECT 2"},
+        "params": {"query": "SELECT 2", "output_location": "s3://r/"},
         "dependsOn": ["load"],
     },
 ]
+
+
+_CONFIG = {
+    "aws": {"region": "eu-west-1"},
+    "gcp": {"project": "proj", "region": "europe-west1"},
+    "snowflake": {"database": "DB"},
+}
 
 
 def _contract(action_prefix: str = "aws.athena") -> dict:
@@ -66,7 +73,11 @@ def _scheduler(provider: str) -> str:
     prefix = {"aws": "aws.athena", "gcp": "gcp.bigquery", "snowflake": "sf.snowflake"}[provider]
     (code,) = (
         AirflowScheduler()
-        .generate(_contract(prefix), provider=provider, provider_config={"allow_unmapped": True})
+        .generate(
+            _contract(prefix),
+            provider=provider,
+            provider_config={**_CONFIG[provider], "allow_unmapped": True},
+        )
         .values()
     )
     return code
@@ -282,13 +293,13 @@ def test_a_task_named_like_an_imported_name_does_not_shadow_it(task_id: str):
             "taskId": task_id,
             "type": "provider_action",
             "action": "aws.athena.query",
-            "params": {"query": "SELECT 1"},
+            "params": {"query": "SELECT 1", "output_location": "s3://r/"},
         },
         {
             "taskId": "after",
             "type": "provider_action",
             "action": "aws.athena.query",
-            "params": {"query": "SELECT 2"},
+            "params": {"query": "SELECT 2", "output_location": "s3://r/"},
             "dependsOn": [task_id],
         },
     ]

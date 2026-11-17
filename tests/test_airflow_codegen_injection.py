@@ -115,7 +115,7 @@ def _malicious_contract(action_prefix: str, params_key: str) -> dict:
                     "taskId": "t2",
                     "type": "provider_action",
                     "action": f"{action_prefix}.query",
-                    "params": {params_key: "SELECT 2"},
+                    "params": {params_key: "SELECT 2", "query": "SELECT 2"},
                     "dependsOn": [POC_IDENT],
                 },
             ],
@@ -132,7 +132,14 @@ def test_main_scheduler_provider_tasks_are_injection_safe(provider, prefix):
 
     contract = _malicious_contract(prefix, "sql")
     out = AirflowScheduler().generate(
-        contract, provider=provider, provider_config={"allow_unmapped": True}
+        contract,
+        provider=provider,
+        provider_config={
+            "allow_unmapped": True,
+            "project": "proj",
+            "database": "DB",
+            "account_id": "123456789012",
+        },
     )
     (code,) = out.values()
     assert_inert(code)
