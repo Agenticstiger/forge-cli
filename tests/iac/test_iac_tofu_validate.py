@@ -939,7 +939,10 @@ def _assert_confluent_case(case, schema):
 @pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
 @pytest.mark.parametrize("case", sorted(_CONFLUENT_SUBJECT_CONTRACTS))
 def test_a_confluent_schema_registry_subject_passes_tofu_validate(case, tmp_path):
-    """The Confluent subject modules are accepted by the pinned provider's own schema.
+    """The Confluent subject modules are accepted by the provider's own schema.
+
+    The module requires ``~> 2.0`` and writes no lock for confluent, so this is the newest
+    2.x release, as for a user running ``fluid generate iac``.
 
     Rules and tags only reach a registry that runs the data-contract rule executor
     (Confluent Cloud, Confluent Platform Enterprise), so the live job registers the

@@ -9,6 +9,9 @@
 #   • Lakekeeper + Kafka Connect — forge-derived Iceberg sink configs on a
 #     real worker against a real Lakekeeper REST catalog. Keyless, in its
 #     own job (`lakekeeper-integration`).
+#   • Confluent schema registry — `fluid generate iac --provider confluent`
+#     applied by OpenTofu to cp-schema-registry on a KRaft Kafka. Keyless,
+#     in its own job (`confluent-schema-registry`).
 #
 # WHY THIS LANE RUNS NIGHTLY, NOT ON A LABEL AND NOT PER MERGE
 # ------------------------------------------------------------
@@ -475,20 +478,27 @@ jobs:
   #
   # What tests/integration/test_confluent_schema_registry_live.py proves:
   #   - `fluid generate iac --provider confluent` for an Avro and a
-  #     Protobuf produced subject, applied by OpenTofu with the pinned
-  #     confluentinc/confluent provider, registers the schema text forge
-  #     generated, with the schema type and BACKWARD_TRANSITIVE it set;
+  #     Protobuf produced subject, applied by OpenTofu with the
+  #     confluentinc/confluent provider the module requires (`~> 2.0`, so
+  #     the newest 2.x), registers the schemas forge generated, with the
+  #     schema type and BACKWARD_TRANSITIVE it set;
   #   - a second plan finds nothing to change;
   #   - a new nullable column registers as version 2;
-  #   - destroy removes the subjects.
+  #   - destroy deletes the versions the module manages. The provider
+  #     deletes only the version in its state, so an evolved subject keeps
+  #     its earlier versions; the test removes those itself.
   # Rules (`rules: true`) need the rule executor of Confluent Cloud or
   # Platform Enterprise, which the community registry lacks: their
   # attributes are proven by `tofu validate` in iac-tests.yml.
   #
-  # Keyless and self-contained: a single-node KRaft cp-kafka and
-  # cp-schema-registry, one pinned tag family (7.9.4), on a docker network
-  # this job creates and removes. The registry has no authentication; the
-  # test passes the provider placeholder credentials.
+  # Keyless and self-contained, like `lakekeeper-integration`: a single-node
+  # KRaft Kafka (that job's image and settings) and cp-schema-registry (the
+  # Confluent Platform release of its cp-kafka-connect), each pinned by
+  # digest, on a docker network this job creates and removes. Nothing here
+  # is a secret, so there is no `environment:` and no deployment record. It
+  # still gates on the same label as its siblings so un-vouched PR code gets
+  # no runner. The registry has no authentication; the test passes the
+  # provider placeholder credentials.
   confluent-schema-registry:
     name: Confluent schema registry integration
     runs-on: ubuntu-latest
@@ -497,7 +507,6 @@ jobs:
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'ci:integration-emulated')
-    environment: integration-emulated
     permissions:
       contents: read
     env:
@@ -505,7 +514,8 @@ jobs:
       SR_NETWORK: fluid-sr-ci-${{ github.run_id }}-${{ github.run_attempt }}
       SR_KAFKA: fluid-sr-ci-kafka-${{ github.run_id }}-${{ github.run_attempt }}
       SR_REGISTRY: fluid-sr-ci-registry-${{ github.run_id }}-${{ github.run_attempt }}
-      CP_TAG: "7.9.4"
+      KAFKA_IMAGE: apache/kafka:3.9.1@sha256:4ceccc577f03f51f6af8dbfda55194d0d892f4fa7913ffbded567ce3895622ed
+      REGISTRY_IMAGE: confluentinc/cp-schema-registry:7.9.10@sha256:ae63c314e3f78f78d5bdce8c64c0f98ea1dc4d358ef52de2fdae56cda7e82ec0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
@@ -530,32 +540,50 @@ jobs:
       - name: Start Kafka and the schema registry
         run: |
           docker network create "$SR_NETWORK"
-          # Single-node KRaft: one process is broker and controller. The
-          # CLUSTER_ID is a fixed throwaway; the registry keeps its subjects
-          # in this broker's _schemas topic.
+          # Single-node KRaft, one process as broker and controller: the
+          # settings of tests/integration/test_lakekeeper_kafka_connect_live.py.
+          # The registry keeps its subjects in this broker's _schemas topic.
           docker run -d --name "$SR_KAFKA" --network "$SR_NETWORK" --network-alias kafka \
-            -e CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk \
             -e KAFKA_NODE_ID=1 \
             -e KAFKA_PROCESS_ROLES=broker,controller \
-            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:29093 \
-            -e KAFKA_LISTENERS=PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093 \
-            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:29092 \
-            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT \
+            -e KAFKA_LISTENERS=PLAINTEXT://:19092,CONTROLLER://:9093 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:19092 \
             -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
-            -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
             -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
             -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
             -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
             -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
-            "confluentinc/cp-kafka:${CP_TAG}"
+            -e KAFKA_HEAP_OPTS=-Xmx512m \
+            "$KAFKA_IMAGE"
+          # The registry gives up if Kafka is not there when it starts.
+          for i in $(seq 1 60); do
+            if docker exec "$SR_KAFKA" /opt/kafka/bin/kafka-broker-api-versions.sh \
+                --bootstrap-server localhost:19092 >/dev/null 2>&1; then
+              echo "Kafka ready after ~$((i * 2))s"; break
+            fi
+            sleep 2
+          done
+          docker exec "$SR_KAFKA" /opt/kafka/bin/kafka-broker-api-versions.sh \
+            --bootstrap-server localhost:19092 >/dev/null 2>&1 || {
+            echo "::error::Kafka did not answer within 120s."
+            docker logs "$SR_KAFKA" --tail=50 || true
+            exit 1
+          }
           docker run -d --name "$SR_REGISTRY" --network "$SR_NETWORK" -p 127.0.0.1:8081:8081 \
             -e SCHEMA_REGISTRY_HOST_NAME=schema-registry \
             -e SCHEMA_REGISTRY_LISTENERS=http://0.0.0.0:8081 \
-            -e SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS=kafka:29092 \
-            "confluentinc/cp-schema-registry:${CP_TAG}"
+            -e SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS=PLAINTEXT://kafka:19092 \
+            -e SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR=1 \
+            "$REGISTRY_IMAGE"
           for i in $(seq 1 90); do
             if curl -sf http://localhost:8081/subjects >/dev/null 2>&1; then
               echo "Schema registry ready after ~$((i * 2))s"; break
+            fi
+            # A registry that exited will not answer: stop waiting.
+            if [ "$(docker inspect -f '{{.State.Running}}' "$SR_REGISTRY")" != "true" ]; then
+              break
             fi
             sleep 2
           done
