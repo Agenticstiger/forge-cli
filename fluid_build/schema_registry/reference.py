@@ -28,41 +28,16 @@ compiler read from those blocks (``tests/schema_registry/test_reference.py`` pin
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 
-KINDS = ("glue", "confluent")
+from .kinds import all_kinds, get_kind, names
 
-#: Compatibility modes each registry accepts (the schema's lists).
-GLUE_MODES = (
-    "NONE",
-    "DISABLED",
-    "BACKWARD",
-    "BACKWARD_ALL",
-    "FORWARD",
-    "FORWARD_ALL",
-    "FULL",
-    "FULL_ALL",
-)
-CONFLUENT_MODES = (
-    "NONE",
-    "BACKWARD",
-    "BACKWARD_TRANSITIVE",
-    "FORWARD",
-    "FORWARD_TRANSITIVE",
-    "FULL",
-    "FULL_TRANSITIVE",
-)
-#: A produced subject's mode when the contract names none: backward and transitive.
-DEFAULT_COMPATIBILITY = {"glue": "BACKWARD_ALL", "confluent": "BACKWARD_TRANSITIVE"}
 #: Glue's name for the registry it uses when none is named.
 GLUE_DEFAULT_REGISTRY = "default-registry"
 
-_URL = re.compile(r"^https?://[^/?#@\s]+(?:/[^?#\s]*)?$")
-_GLUE_NAME = re.compile(r"^[A-Za-z0-9_$#.-]{1,255}$")
-_SUBJECT = re.compile(r"^[^\x00-\x1f\x7f]{1,255}$")
-_ALLOWED = frozenset({"kind", "url", "registryName", "subject", "version", "compatibility", "auth"})
+#: The fields every kind takes; each kind adds its own (``RegistryKind.fields``).
+_BASE_FIELDS = frozenset({"kind", "subject", "version", "compatibility"})
 
 Version = Union[str, int]
 
@@ -98,12 +73,12 @@ class RegistryRef:
     @property
     def effective_compatibility(self) -> str:
         """The mode a produced subject is registered with: the contract's, else the default."""
-        return self.compatibility or DEFAULT_COMPATIBILITY[self.kind]
+        return self.compatibility or get_kind(self.kind).default_compatibility
 
     @property
     def label(self) -> str:
         """How a message names the subject: ``glue:orders/orders-value@latest``."""
-        where = self.glue_registry if self.kind == "glue" else self.url
+        where = get_kind(self.kind).location(self)
         return f"{self.kind}:{where}/{self.subject}@{self.version}"
 
 
@@ -138,48 +113,28 @@ def shape_errors(spec: Any, where: str) -> List[str]:
     if not isinstance(spec, Mapping):
         return [f"{where}: expected an object"]
     errors: List[str] = []
-    unknown = sorted(str(k) for k in set(spec) - _ALLOWED)
+    allowed = _BASE_FIELDS.union(*(k.fields for k in all_kinds()))
+    unknown = sorted(str(k) for k in set(spec) - allowed)
     if unknown:
         errors.append(f"{where}: unsupported field(s) {unknown}")
-    kind = spec.get("kind")
-    if kind not in KINDS:
-        errors.append(f"{where}.kind: expected glue or confluent")
+    kind_name = spec.get("kind")
+    if kind_name not in names():
+        errors.append(f"{where}.kind: expected {' or '.join(names())}")
         return errors
-    url = spec.get("url")
-    if kind == "confluent":
-        if not isinstance(url, str) or not _URL.fullmatch(url):
-            errors.append(
-                f"{where}.url: a confluent registry needs its http(s) REST endpoint, "
-                "with no credentials, query or fragment"
-            )
-        if "registryName" in spec:
-            errors.append(f"{where}.registryName is for kind: glue; a Confluent registry has a url")
-    else:
-        if "url" in spec:
-            errors.append(
-                f"{where}.url is for kind: confluent; name a Glue registry by registryName"
-            )
-        if "auth" in spec:
-            errors.append(
-                f"{where}.auth is for kind: confluent; a Glue registry authenticates with IAM"
-            )
-        name = spec.get("registryName")
-        if name is not None and not (isinstance(name, str) and _GLUE_NAME.fullmatch(name)):
-            errors.append(f"{where}.registryName: letters, digits and _ $ # . - (1-255)")
+    kind = get_kind(kind_name)
+    errors.extend(kind.field_errors(spec, where))
     subject = spec.get("subject")
     if subject is not None:
-        pattern = _GLUE_NAME if kind == "glue" else _SUBJECT
-        if not (isinstance(subject, str) and pattern.fullmatch(subject)):
-            errors.append(f"{where}.subject: not a {kind} subject name")
+        if not (isinstance(subject, str) and kind.subject_pattern.fullmatch(subject)):
+            errors.append(f"{where}.subject: not a {kind.name} subject name")
     version = spec.get("version", "latest")
     if version != "latest" and (
         isinstance(version, bool) or not isinstance(version, int) or version < 1
     ):
         errors.append(f"{where}.version: expected latest or a version from 1")
     mode = spec.get("compatibility")
-    modes = GLUE_MODES if kind == "glue" else CONFLUENT_MODES
-    if mode is not None and mode not in modes:
-        errors.append(f"{where}.compatibility: {kind} accepts {', '.join(modes)}")
+    if mode is not None and mode not in kind.modes:
+        errors.append(f"{where}.compatibility: {kind.name} accepts {', '.join(kind.modes)}")
     auth = spec.get("auth")
     if auth is not None:
         raw = _mapping(auth).get("secretRef")

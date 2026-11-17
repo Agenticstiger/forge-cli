@@ -332,6 +332,7 @@ def _emit_subjects(resources: Dict[str, Any], contract: Mapping[str, Any], cid: 
     confluentinc/terraform-provider-confluent (MPL-2.0) docs/resources/confluent_schema.md
     and confluent_subject_config.md.
     """
+    from ...schema_registry.kinds import get_kind
     from ...schema_registry.produced import (
         ProducedSubjectError,
         classification_metadata,
@@ -349,13 +350,15 @@ def _emit_subjects(resources: Dict[str, Any], contract: Mapping[str, Any], cid: 
     for subject in produced_subjects(contract):
         expose = exposes.get(subject.owner, {})
         ref = subject.ref
-        if ref.kind != "confluent":
+        kind = get_kind(ref.kind)
+        if kind.registering_cloud != "confluent":
             platform = str((expose.get("binding") or {}).get("platform") or "").lower()
-            if platform == "kafka" and not cloud_bound(contract, "glue"):
+            if platform == "kafka" and not cloud_bound(contract, kind.name):
                 raise UnsupportedBindingError(
                     "schema-registry-route",
-                    f"{ref.where}: a Glue Schema Registry subject is registered by the aws "
-                    "OpenTofu plugin, and this contract is emitted by the confluent one",
+                    f"{ref.where}: a {kind.title} subject is registered by the "
+                    f"{kind.registering_cloud} OpenTofu plugin, and this contract is emitted "
+                    "by the confluent one",
                 )
             continue
         try:
