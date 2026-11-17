@@ -52,8 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     run failed or was cancelled, 2 when the contract or the operator's policy refuses it, and
     cancels the run on SIGTERM. `fluid spark status <contract>` shows each build's recent runs.
   - A contract's `parameters.spark.sparkConf` sets resource and tuning settings only; the
-    operator lists any other key in `FLUID_SPARK_CONF_ALLOWLIST` (settings like `spark.jars`
-    load code that runs with the job's role). `FLUID_SPARK_WAIT_SECONDS` caps the reconcile's
+    operator lists any other key in `FLUID_SPARK_CONF_ALLOWLIST`. Keys that load code or
+    environment into the job, or move what it writes (`spark.jars*`, `spark.sql.extensions`,
+    `spark.sql.catalog*`, `spark.plugins`, `extraJavaOptions`, `defaultJavaOptions`,
+    `spark.pyspark.*`, `spark.hadoop.*`, env keys, the warehouse and checkpoint location, and
+    the rest of the infrastructure emit's list) are refused
+    even when listed, by name or by a prefix such as `spark.sql.*`, as the infrastructure emit
+    refuses them. `FLUID_SPARK_WAIT_SECONDS` caps the reconcile's
     waits (default 900).
   - A run resolves its Kafka and Avro packages from Maven Central (and Confluent's repository
     for Avro), so the cluster needs egress to them, unless the operator sets
@@ -61,8 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     replaces Confluent's repository in `spark.jars.repositories`. Spark 3.5 still tries Maven
     Central and spark-packages first; without egress those attempts fail (they can be slow)
     and the resolver falls through to the mirror. Glue resolves no packages, so the mirror
-    does not apply there. An operator-allowlisted `spark.jars.repositories` in a contract's
-    `sparkConf` overrides the mirror and its checks. The variable is read from the real
+    does not apply there. A contract's `sparkConf` cannot replace it (`spark.jars*` is
+    denied). The variable is read from the real
     environment only; a URL with a user or password, a link-local host or plain http is
     refused.
   - The Spark runner no longer accepts abbreviated options (found by the spark-infra lane):
