@@ -38,6 +38,8 @@ import pytest
 import yaml
 
 from fluid_build.cli import main
+from fluid_build.iac import runner
+from fluid_build.iac.credentials import TOFU_WRAPPER_ENV_NAMES
 
 ENDPOINT = os.environ.get("FLUID_SR_LIVE_ENDPOINT", "").rstrip("/")
 _TOFU = shutil.which("tofu")
@@ -146,6 +148,9 @@ class _Stack:
             "HOME": os.environ.get("HOME", str(root)),
             "TF_IN_AUTOMATION": "1",
             "TF_PLUGIN_CACHE_DIR": str(plugin_cache),
+            # In CI the `tofu` on PATH is setup-opentofu's wrapper, which runs
+            # $TOFU_CLI_PATH/tofu-bin: pass what it needs, as forge's own tofu env does.
+            **{name: os.environ[name] for name in TOFU_WRAPPER_ENV_NAMES if name in os.environ},
             "SCHEMA_REGISTRY_ID": _PLACEHOLDER_ID,
             "SCHEMA_REGISTRY_REST_ENDPOINT": ENDPOINT,
             "SCHEMA_REGISTRY_API_KEY": _PLACEHOLDER_KEY,
@@ -260,9 +265,13 @@ def test_forge_registers_evolves_and_removes_confluent_subjects(tmp_path, monkey
             assert config.status_code == 200, config.text
             assert config.json()["compatibilityLevel"] == "BACKWARD_TRANSITIVE"
 
-        # A second plan has nothing to do.
-        plan = stack.tofu("plan", "-detailed-exitcode", "-input=false", check=False)
-        assert plan.returncode == 0, f"plan found changes (exit {plan.returncode}):\n{plan.stdout}"
+        # A second plan has nothing to do, read from the plan's JSON as forge reads it:
+        # setup-opentofu's wrapper exits 0 for -detailed-exitcode's 2 (changes present),
+        # so in CI the exit code cannot tell.
+        replan = runner.tofu_plan(str(stack.module), out_file="replan.tfplan", env=stack.env)
+        assert replan.ok, replan.stderr or replan.stdout
+        assert any(event.get("type") == "change_summary" for event in replan.events), replan.stdout
+        assert runner.change_summary(replan) == {"add": 0, "change": 0, "remove": 0}, replan.stdout
 
         # A new nullable column is a compatible change: version 2.
         evolved = stack.generate(_contract(run, extra_columns=True))
