@@ -6,8 +6,7 @@ domain: "customer"
 metadata:
   layer: Bronze
   owner:
-    team: "data-team"
-    email: "data@example.com"
+    team: "customer-data"
 
 builds:
   - id: "clean_customers"

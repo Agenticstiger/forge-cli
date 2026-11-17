@@ -8,7 +8,6 @@ metadata:
   layer: Bronze
   owner:
     team: "learning-team"
-    email: "team@example.com"
 
 builds:
   - id: "hello_transformation"

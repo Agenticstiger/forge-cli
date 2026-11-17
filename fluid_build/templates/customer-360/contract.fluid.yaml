@@ -18,7 +18,6 @@ metadata:
   productType: CDP
   owner:
     team: customer-analytics
-    email: customer-analytics@company.com
   businessContext:
     domain: Customer Experience
     subdomain: Customer Intelligence

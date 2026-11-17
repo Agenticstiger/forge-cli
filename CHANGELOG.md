@@ -293,6 +293,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The bundled examples and scaffolds pass `fluid validate --strict`, so `fluid ship` runs them as
+  shipped.** `fluid ship` validates with `--strict` by default (#917), and the placeholder owner emails
+  in 17 examples and 13 templates stopped a first `fluid ship` at stage 2. The examples and templates
+  carry no stand-in owner email any more, and `examples/02-csv-to-data-product` and the `csv-basics`
+  template no longer use the starter team `data-team`. `fluid init` (`--quickstart`, `--blueprint`,
+  `--discover`), `fluid forge --template` and `fluid product-new` leave `metadata.owner.email` out
+  unless you pass one (`--owner-email`), instead of writing `data-platform@example.com`,
+  `team@example.com`, `<team>@company.com` or `owner@example.com`. A test strict-validates every
+  example and template, and the two `fluid init` scaffolds a new user runs first.
 - **BREAKING: `tofu` runs with an environment allowlist, not a copy of `os.environ`.** It gets
   the process basics (`PATH`, `HOME`, user, locale, temporary and profile directories), proxies,
   CA bundles, OpenTofu's settings by name plus `TF_TOKEN_*`, what `opentofu/setup-opentofu`'s

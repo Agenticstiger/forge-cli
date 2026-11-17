@@ -25,7 +25,6 @@ metadata:
   productType: CDP
   owner:
     team: support-ai
-    email: support-ai@example.com
 
 exposes:
   # ─── Vector / embeddings output port (pgvector) ─────────────────────

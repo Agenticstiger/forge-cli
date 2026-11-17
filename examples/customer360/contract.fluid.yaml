@@ -9,7 +9,6 @@ metadata:
   layer: Gold
   owner:
     team: "Customer Platform"
-    email: "cust-platform@example.com"
   businessContext:
     domain: "Customer Experience"
     subdomain: "Customer Intelligence"

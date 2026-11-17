@@ -13,7 +13,6 @@ metadata:
   productType: ADP
   owner:
     team: data-ops
-    email: dataops@example.com
 exposes:
 - exposeId: sales_cleaned
   title: Cleaned Sales

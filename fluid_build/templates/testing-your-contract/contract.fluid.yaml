@@ -12,7 +12,6 @@ metadata:
   productType: SDP
   owner:
     team: data-engineering
-    email: data-eng@company.com
 exposes:
 - exposeId: order_revenue
   title: Order Revenue
