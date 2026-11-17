@@ -3,6 +3,7 @@
 
 """Unit tests for fluid_build.cli._pipeline_files (config coercion and the file writer)."""
 
+import inspect
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -39,8 +40,7 @@ class TestBuildPipelineConfig:
         assert config.cloud_auth == ("aws",)
 
     def test_complexity_is_gone(self):
-        with pytest.raises(TypeError):
-            build_pipeline_config(provider="jenkins", complexity="basic")  # type: ignore[call-arg]
+        assert "complexity" not in inspect.signature(build_pipeline_config).parameters
 
 
 class TestPrependHeader:
@@ -89,9 +89,10 @@ class TestWritePipelineFiles:
 
 
 def test_build_pipeline_config_follows_the_remotes_default_branch(monkeypatch) -> None:
-    import fluid_build.cli._pipeline_files as pf
-
-    monkeypatch.setattr(pf, "detect_default_branch", lambda directory=None: "develop")
+    monkeypatch.setattr(
+        "fluid_build.cli._pipeline_files.detect_default_branch",
+        lambda directory=None: "develop",
+    )
     assert build_pipeline_config("github_actions").default_branch == "develop"
     assert build_pipeline_config("github_actions", default_branch="trunk").default_branch == "trunk"
 

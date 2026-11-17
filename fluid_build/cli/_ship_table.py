@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Dict, Tuple
 
+__all__ = ["SHIP_VARIABLES", "STAGES", "STAGE_NAMES", "STAGE_NUMBERS", "STAGE_TOGGLES"]
+
 #: (number, name, aliases). The names are what ``--stage`` / ``--until`` /
 #: ``--skip-stage`` accept next to the number.
 STAGES: Tuple[Tuple[int, str, Tuple[str, ...]], ...] = (

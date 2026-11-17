@@ -120,8 +120,8 @@ def add_on_script(add_on: str, contract: str = DEFAULT_CONTRACT) -> List[str]:
             "mkdir -p runtime",
             f"fluid policy-check {target} --strict",
             "if command -v osv-scanner >/dev/null 2>&1; then "
-            "osv-scanner scan source -r . --format sarif --output runtime/osv-results.sarif "
-            "|| true; else echo 'osv-scanner is not on the runner: vulnerability scan skipped'; fi",
+            + "osv-scanner scan source -r . --format sarif --output runtime/osv-results.sarif "
+            + "|| true; else echo 'osv-scanner is not on the runner: vulnerability scan skipped'; fi",
         ]
     if add_on == "compliance":
         return [
@@ -133,9 +133,9 @@ def add_on_script(add_on: str, contract: str = DEFAULT_CONTRACT) -> List[str]:
         return [
             "mkdir -p runtime",
             "if command -v syft >/dev/null 2>&1; then "
-            "syft dir:. -o spdx-json=runtime/sbom.spdx.json "
-            "|| echo 'syft failed: no SBOM written'; "
-            "else echo 'syft is not on the runner: no SBOM written'; fi",
+            + "syft dir:. -o spdx-json=runtime/sbom.spdx.json "
+            + "|| echo 'syft failed: no SBOM written'; "
+            + "else echo 'syft is not on the runner: no SBOM written'; fi",
         ]
     raise ValueError(f"unknown add-on {add_on!r}: one of {', '.join(ADD_ONS)}")
 

@@ -1771,6 +1771,14 @@ class _RecordingEnv(dict):  # type: ignore[type-arg]
         self.seen.add(key)
         return super().__contains__(key)
 
+    def __eq__(self, other: object) -> bool:
+        # Equal to another recorder with the same items that was asked the same names.
+        return (
+            isinstance(other, _RecordingEnv)
+            and dict(self) == dict(other)
+            and self.seen == other.seen
+        )
+
 
 def test_ship_variables_are_what_ship_reads() -> None:
     # A generated wrapper passes SHIP_VARIABLES through: none may be missing.
