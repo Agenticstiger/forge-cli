@@ -471,6 +471,9 @@ class JobAccess:
     secret_arns: Tuple[Any, ...] = ()
     #: The job's workers sit in a VPC through a Glue NETWORK connection.
     glue_vpc: bool = False
+    #: That connection's subnet ARN: the only subnet whose interfaces the role may tag
+    #: and delete.
+    glue_subnet_arn: Any = None
 
 
 def secret_resources(arn: Any) -> List[Any]:
@@ -674,8 +677,15 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
     )
     if access.glue_vpc:
         # A Glue job in a VPC (its NETWORK connection) creates, tags and removes its
-        # workers' network interfaces as its own role, as AWSGlueServiceRole grants it:
-        # it tags them aws-glue-service-resource, and tags and deletes only those.
+        # workers' network interfaces as its own role, as AWSGlueServiceRole grants it.
+        # Tagging and deleting are held to interfaces in the connection's own subnet, with
+        # the aws-glue-service-resource tag, so the role cannot tag another team's
+        # interface and then delete it; it never removes tags.
+        in_subnet = {
+            "test": "ArnEquals",
+            "variable": "ec2:Subnet",
+            "values": [access.glue_subnet_arn],
+        }
         statements.extend(
             [
                 {
@@ -697,14 +707,17 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
                 {
                     "sid": "GlueVpcTags",
                     "effect": "Allow",
-                    "actions": ["ec2:CreateTags", "ec2:DeleteTags"],
+                    "actions": ["ec2:CreateTags"],
                     "resources": ["arn:aws:ec2:*:*:network-interface/*"],
                     "condition": [
                         {
                             "test": "ForAllValues:StringEquals",
                             "variable": "aws:TagKeys",
                             "values": ["aws-glue-service-resource"],
-                        }
+                        },
+                        # ForAllValues alone also holds for a request with no tag keys.
+                        {"test": "Null", "variable": "aws:TagKeys", "values": ["false"]},
+                        in_subnet,
                     ],
                 },
                 {
@@ -717,7 +730,8 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
                             "test": "Null",
                             "variable": "aws:ResourceTag/aws-glue-service-resource",
                             "values": ["false"],
-                        }
+                        },
+                        in_subnet,
                     ],
                 },
             ]

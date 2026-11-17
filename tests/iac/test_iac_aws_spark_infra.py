@@ -1084,3 +1084,28 @@ def test_the_glue_role_trusts_only_its_job_and_tags_only_glues_interfaces(contra
     delete = statement(access, "GlueVpcDelete")
     assert delete["condition"][0]["variable"] == "aws:ResourceTag/aws-glue-service-resource"
     assert "ec2:DeleteNetworkInterface" not in statement(access, "GlueVpc")["actions"]
+
+
+def test_the_account_bucket_named_literally_is_still_shared(contract):
+    loc = contract["exposes"][0]["binding"]["location"]
+    loc.update(bucket="000000000005-fluid-data", path="payments/cards/")
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert caught.value.kind == "spark-role-shared-prefix"
+
+
+def test_a_glue_role_tags_and_deletes_only_interfaces_in_its_subnet(contract):
+    params = spark(contract)
+    params.update(runtime="glue")
+    del params["applicationId"]
+    _, data = emit(contract)
+    access = data["aws_iam_policy_document"][f"{KEY}_access"]
+    subnet = {
+        "test": "ArnEquals",
+        "variable": "ec2:Subnet",
+        "values": [f"${{data.aws_subnet.{KEY}.arn}}"],
+    }
+    tags = statement(access, "GlueVpcTags")
+    assert tags["actions"] == ["ec2:CreateTags"] and subnet in tags["condition"]
+    assert {"test": "Null", "variable": "aws:TagKeys", "values": ["false"]} in tags["condition"]
+    assert subnet in statement(access, "GlueVpcDelete")["condition"]

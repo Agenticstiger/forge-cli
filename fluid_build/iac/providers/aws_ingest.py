@@ -433,6 +433,7 @@ def _emit_build(
         msk=cluster if iam else None,
         secret_arns=_secret_arns(config, b.region, ctx),
         glue_vpc=vpc,
+        glue_subnet_arn=tofu_ref(f"data.aws_subnet.{b.key}.arn") if vpc else None,
     )
     role_arn = _emit_role(blocks, b, access, application_id)
     overwrites = job.config["mode"] == "batch"
@@ -596,6 +597,8 @@ def _bucket_ref(
 #: What a forge role's S3 grant may name: a bucket name and a prefix with no IAM
 #: wildcard (``*``, ``?``), policy variable (``$``) or ``..`` segment.
 _BUCKET = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
+#: The account's shared fallback bucket, named literally.
+_ACCOUNT_BUCKET = re.compile(r"[0-9]{12}-fluid-data")
 _PREFIX = re.compile(r"[A-Za-z0-9._=-]+(?:/[A-Za-z0-9._=-]+)*/")
 
 
@@ -647,7 +650,7 @@ def _shared_bucket(
 ) -> bool:
     """Whether the output's bucket holds other products' data: the account's
     ``<account>-fluid-data`` fallback, or a platform pool (packaging ``shared``)."""
-    if _warehouse.bucket_uses_fallback(loc):
+    if _warehouse.bucket_uses_fallback(loc) or _ACCOUNT_BUCKET.fullmatch(str(loc.get("bucket"))):
         return True
     decision = resolve_packaging(contract).decision_for("bucket", expose.get("exposeId"))
     return decision is ContainerDecision.REFERENCED
