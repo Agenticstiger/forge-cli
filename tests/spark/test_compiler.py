@@ -458,7 +458,7 @@ def test_a_missing_credential_grant_warns_at_validate_and_refuses_at_compile(con
         },
     )
     assert validation_errors(contract) == []
-    # The contract-wide secret check names the grant and the registry host
+    # The contract-wide checks name the grant and the registry host
     # (test_validate_prints_each_missing_entry_once); the Spark warnings do not repeat them.
     assert validation_warnings(contract) == []
     with pytest.raises(FluidUserError):
@@ -532,7 +532,7 @@ def test_a_registry_without_a_credential_is_named_by_the_spark_warning(contract,
 
 def test_validate_prints_each_missing_entry_once(contract, tmp_path, monkeypatch, capsys):
     """fluid validate: one warning for the brokers, one for the registry host and one for
-    the credential's grant, each once (the secret check owns the registry's two)."""
+    the credential's grant, each once (the contract-wide checks own the registry's two)."""
     import yaml
 
     from fluid_build.cli import main

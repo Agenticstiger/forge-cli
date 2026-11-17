@@ -646,9 +646,9 @@ def validation_errors(contract: Mapping[str, Any]) -> list[str]:
 def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
     """The operator entries a Spark build lacks, which ``fluid validate`` warns about.
 
-    A registry that receives a credential is left to the contract-wide secret check
-    (``cli/validate.py::_check_secret_refs``), which names both its host entry and the
-    credential's grant; repeating them here would print each twice.
+    A registry that receives a credential is left to the contract-wide checks, which name
+    its host entry (``schema_registry/policy.py``) and the credential's grant
+    (``secrets/policy.py``); repeating them here would print each twice.
     """
     from fluid_build.streaming.compiler import managed_lane_enabled
     from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV
