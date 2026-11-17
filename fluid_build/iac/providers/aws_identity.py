@@ -749,37 +749,28 @@ def trust_document(
 
 # --- the scheduler that starts the runs (fluid spark run on MWAA) ----------------------
 
-#: What starting, watching and stopping a run takes, per runtime: the actions the runs
-#: lane calls (``build_runners/spark/_adapters.py::CALLER_ACTIONS``; the Service
-#: Authorization Reference pages of EMR Serverless, EMR on EKS, Glue and EMR).
-CALLER_ACTIONS: Dict[str, Tuple[str, ...]] = {
-    "emr-serverless": (
-        "emr-serverless:CancelJobRun",
-        "emr-serverless:GetJobRun",
-        "emr-serverless:ListJobRuns",
-        "emr-serverless:StartJobRun",
-        "emr-serverless:TagResource",
-    ),
-    "glue": ("glue:BatchStopJobRun", "glue:GetJobRun", "glue:GetJobRuns", "glue:StartJobRun"),
-    "emr-ec2": (
-        "elasticmapreduce:AddJobFlowSteps",
-        "elasticmapreduce:CancelSteps",
-        "elasticmapreduce:DescribeStep",
-        "elasticmapreduce:ListSteps",
-    ),
-    "emr-eks": (
-        "emr-containers:CancelJobRun",
-        "emr-containers:DescribeJobRun",
-        "emr-containers:ListJobRuns",
-        "emr-containers:StartJobRun",
-        "emr-containers:TagResource",
-    ),
-}
-#: The service a run's role is passed to, where StartJobRun passes it.
+#: The service a run's role is passed to, where StartJobRun passes it (the runtimes in
+#: the runs lane's ``PASS_ROLE``).
 PASSED_TO = {
     "emr-serverless": "emr-serverless.amazonaws.com",
     "emr-eks": "emr-containers.amazonaws.com",
 }
+#: Granted only where a run finds an isolated application by its name.
+_FIND_APPLICATION = "emr-serverless:ListApplications"
+
+
+def caller_actions(runtime: str) -> List[str]:
+    """What starting, watching and stopping a run takes on ``runtime``: the runs lane's own
+    list (``build_runners/spark/_adapters.py::CALLER_ACTIONS``), so the two cannot drift."""
+    from fluid_build.build_runners.spark._adapters import CALLER_ACTIONS
+
+    return sorted(a for a in CALLER_ACTIONS[runtime] if a != _FIND_APPLICATION)
+
+
+def passes_role(runtime: str) -> bool:
+    from fluid_build.build_runners.spark._adapters import PASS_ROLE
+
+    return runtime in PASS_ROLE
 
 
 @dataclass(frozen=True)
@@ -814,7 +805,7 @@ def caller_document(runs: Sequence[CallerRun], *, account: Any, region: Any) -> 
             {
                 "sid": f"Run{run.sid}",
                 "effect": "Allow",
-                "actions": list(CALLER_ACTIONS[run.runtime]),
+                "actions": caller_actions(run.runtime),
                 "resources": targets,
             }
         )
@@ -824,11 +815,11 @@ def caller_document(runs: Sequence[CallerRun], *, account: Any, region: Any) -> 
                     # No resource-level form: how a run finds an application by its name.
                     "sid": f"FindApplication{run.sid}",
                     "effect": "Allow",
-                    "actions": ["emr-serverless:ListApplications"],
+                    "actions": [_FIND_APPLICATION],
                     "resources": ["*"],
                 }
             )
-        if run.runtime in PASSED_TO and run.role_arn is not None:
+        if passes_role(run.runtime) and run.role_arn is not None:
             statements.append(
                 {
                     "sid": f"PassRole{run.sid}",
