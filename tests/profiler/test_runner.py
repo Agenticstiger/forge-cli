@@ -273,7 +273,7 @@ def test_without_an_importable_flux_stats_nothing_is_read(monkeypatch, installed
     monkeypatch.setattr(importlib.metadata, "version", version)
     with pytest.raises(StatisticsUnavailable) as caught:
         load_backend()
-    assert str(caught.value).endswith(f"and flux-stats {state}")
+    assert f"and flux-stats {state}. flux-stats is not on PyPI yet" in str(caught.value)
 
 
 def test_the_sum_of_an_indicator_with_few_ones_is_withheld(tmp_path):

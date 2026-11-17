@@ -233,6 +233,16 @@ def load_backend() -> StatisticsBackend:
         raise _unavailable(error) from None
 
 
+#: The one pin of flux-stats, until it is released. It is not in ``[profile]``: PyPI
+#: refuses an upload whose metadata holds a URL. ``requirements/flux-stats.txt`` holds the
+#: same line for CI; ``tests/profiler/test_flux_stats_pin.py`` keeps the two equal.
+FLUX_STATS_GIT_REQUIREMENT = (
+    "flux-stats @ git+https://github.com/Agenticstiger/flux-engine.git"
+    "@9ea8edf9bcddd58951f418db13a77253c02bdd7d#subdirectory=packages/flux-stats"
+)
+FLUX_STATS_INSTALL_COMMAND = f'pip install "{FLUX_STATS_GIT_REQUIREMENT}"'
+
+
 def _unavailable(error: ImportError) -> StatisticsUnavailable:
     """Say whether ``flux-stats`` is missing, or installed and not importable.
 
@@ -250,7 +260,8 @@ def _unavailable(error: ImportError) -> StatisticsUnavailable:
         state = f"{version} is installed but cannot be imported ({type(error).__name__})"
     return StatisticsUnavailable(
         "fluid profile forms every statistic with flux-stats, the statistic registry "
-        f"FLUX shares with its fidelity check, and flux-stats {state}"
+        f"FLUX shares with its fidelity check, and flux-stats {state}. flux-stats is not on "
+        f"PyPI yet; install it from git with: {FLUX_STATS_INSTALL_COMMAND}"
     )
 
 

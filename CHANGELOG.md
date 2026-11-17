@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`[profile]` no longer installs flux-stats.** PyPI refuses an upload whose metadata holds a URL
+  dependency, and flux-stats is not on PyPI yet (its 0.0.1 is a placeholder with no code), so
+  the git pin in `[profile]` blocked every release. `[profile]` is now `duckdb` alone. `fluid
+  profile` needs flux-stats from git until it is released: the error names the exact
+  `pip install "flux-stats @ git+https://..."` command, and `requirements/flux-stats.txt` holds
+  the pin that CI installs. Once flux-stats is released, `[profile]` pins a version again. A new
+  test fails if any dependency in `pyproject.toml` is a direct URL.
+
 - **One Airflow renderer.** `fluid export --engine airflow` (the AWS, GCP and Snowflake
   providers), `fluid generate schedule` and `fluid generate-airflow` all render a contract's
   `orchestration` section through `fluid_build.schedulers.airflow.render_dag`. The per-provider

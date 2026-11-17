@@ -1,0 +1,5 @@
+# flux-stats is not on PyPI yet, and PyPI refuses a package whose metadata holds a URL
+# dependency, so pyproject.toml's [profile] extra cannot name it. CI installs this file
+# after .[dev,local]; users install it the same way. The one pin: fluid_build/profiler/_stats.py
+# repeats the line below, and tests/profiler/test_flux_stats_pin.py keeps the two equal.
+flux-stats @ git+https://github.com/Agenticstiger/flux-engine.git@9ea8edf9bcddd58951f418db13a77253c02bdd7d#subdirectory=packages/flux-stats
