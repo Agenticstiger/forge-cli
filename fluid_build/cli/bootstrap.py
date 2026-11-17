@@ -508,6 +508,16 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
         (_cmd("test", "Test a FLUID contract against live data (schema, quality, SLAs)"),),
     ),
     CoreCommand(
+        "profile_cmd",
+        "profile",
+        (
+            _cmd(
+                "profile",
+                "Profile an expose's records where they live (aggregates only, output-checked)",
+            ),
+        ),
+    ),
+    CoreCommand(
         "scaffold_ci", "scaffold-ci", (_cmd("scaffold-ci", "Generate CI pipeline (GitLab/GitHub)"),)
     ),
     CoreCommand(
