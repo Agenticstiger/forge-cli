@@ -444,7 +444,7 @@ def desired_runs(
             if cfg.get("applicationId"):
                 target["applicationId"] = str(cfg["applicationId"])
             else:
-                target["applicationName"] = _names.application_name(contract)
+                target["applicationName"] = _names.application_name(product)
         elif runtime == "emr-ec2":
             if not cfg.get("clusterId"):
                 raise ValueError(
