@@ -189,17 +189,17 @@ def register_subcommand(subparsers: argparse._SubParsersAction):
         choices=["pypi", "dev-source"],
         default="pypi",
         help=(
-            "How the generated Jenkinsfile installs fluid at build time:\n"
-            "  pypi (default)  production. Stage 0 installs FLUID_PACKAGE_SPEC\n"
-            "                  (this forge-cli version, see --fluid-package-spec)\n"
-            "                  into a venv in the workspace; override it at\n"
-            "                  build time with the FLUID_PACKAGE_SPEC parameter.\n"
-            "  dev-source      lab / contributor only. Installs from a\n"
-            "                  /forge-cli-src bind mount in the Jenkins\n"
-            "                  container. Fails LOUD if the mount is\n"
-            "                  missing — no silent fallback to PyPI.\n"
-            "Only the Jenkins template uses this flag today; other CI\n"
-            "systems ignore it."
+            "How the generated pipeline installs fluid, on every system:\n"
+            "  pypi (default)  production. The install step pip-installs\n"
+            "                  FLUID_PACKAGE_SPEC (this forge-cli version, see\n"
+            "                  --fluid-package-spec); Jenkins puts it in a venv\n"
+            "                  in the workspace. Override it with the\n"
+            "                  FLUID_PACKAGE_SPEC variable (a build parameter on\n"
+            "                  Jenkins and Tekton).\n"
+            "  dev-source      lab / contributor only. Imports fluid from a\n"
+            "                  /forge-cli-src bind mount on the runner, and\n"
+            "                  fails if the mount is missing (no fallback to\n"
+            "                  PyPI)."
         ),
     )
     p.add_argument(

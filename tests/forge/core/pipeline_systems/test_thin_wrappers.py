@@ -1398,3 +1398,11 @@ def test_an_azure_schedule_runs_the_add_ons_only() -> None:
         "in(variables['Build.Reason'], 'Manual', 'Schedule')"
     )
     assert "condition" not in stages["security"]
+
+
+def test_the_gitlab_header_says_who_may_override_the_install() -> None:
+    # The Run pipeline form takes any variable: only the project setting stops a run
+    # from passing its own FLUID_PACKAGE_SPEC.
+    text = _files(P.GITLAB_CI)[".gitlab-ci.yml"]
+    header = text[: text.index("\nworkflow:")]
+    assert "Minimum role to use" in header and "pipeline variables" in header

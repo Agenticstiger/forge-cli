@@ -240,6 +240,11 @@ class GitLabCITemplate(BasePipelineTemplate):
             "",
             "Every value below is a default: a project CI/CD variable or the Run pipeline",
             "form overrides it. RUN_STAGE_<N>_<NAME>=false switches a stage off.",
+            "",
+            "Set FLUID_PACKAGE_SPEC and the FLUID_PIP_* install variables as project",
+            "CI/CD variables, and keep Settings > CI/CD > Variables > Minimum role to use",
+            "pipeline variables at Maintainer or No one allowed: whoever may set pipeline",
+            "variables can pass FLUID_PACKAGE_SPEC to a run and choose what apply installs.",
         ]
         header = "".join(f"# {line}".rstrip() + "\n" for line in lines) + "\n"
         banner = self._credential_banner(
