@@ -468,3 +468,55 @@ def status(
             row["error"] = _error_outcome(run, exc).message
         rows.append(row)
     return rows
+
+
+def run_build(
+    contract: Mapping[str, Any],
+    build: Mapping[str, Any],
+    *,
+    dry_run: bool,
+    say: Callable[[str], None] = print,
+    clients: Optional[ClientFactory] = None,
+) -> Optional[int]:
+    """The build phase of ``fluid apply --mode amend-and-build`` for one Spark build: how its
+    scheduler runs it.
+
+    A scheduled build (batch, or a stream triggered ``availableNow``) gets one run, waited for
+    until it ends or ``execution.runtime.timeout`` (:data:`DEFAULT_RUN_WAIT_S` when unset)
+    passes: 0 when it SUCCEEDED, 1 otherwise. A dry run says what it would start and reads
+    nothing from AWS. A stream ``fluid apply`` keeps running (its ``spark.reconcile`` action)
+    has no run to start: ``None``.
+
+    Raises:
+        FluidUserError: the operator's policy refuses the build.
+        ValueError: the build does not compile, is not on the managed lane, or its
+            ``execution.runtime.timeout`` cannot be read; nothing was started.
+    """
+    import copy
+
+    from fluid_build._contract_loader import resolve_contract_env_templates
+    from fluid_build.build_runners.spark._desired import desired_runs
+    from fluid_build.spark.compiler import run_timeout_seconds
+
+    bid = str(build.get("id"))
+    # As fluid plan and fluid apply read it: ``{{ env.* }}`` resolved.
+    resolved = resolve_contract_env_templates(copy.deepcopy(dict(contract)))
+    runs = desired_runs(resolved, build_id=bid)
+    if not runs:
+        raise ValueError(
+            f"Spark build {bid}: forge's Spark runner reads a contract of fluidVersion 0.7.7 "
+            "or later; this one is not, so nothing runs it"
+        )
+    run = runs[0]
+    if not run.scheduled:
+        return None
+    timeout = run_timeout_seconds(build) or DEFAULT_RUN_WAIT_S
+    if dry_run:
+        say(
+            f"Spark {run.build} ({run.runtime}): would start one run and wait up to "
+            f"{int(timeout)} s for it to end"
+        )
+        return 0
+    outcome = run_once(run, clients=clients, wait=True, timeout=timeout, say=say)
+    say(outcome.line())
+    return 1 if outcome.error else 0

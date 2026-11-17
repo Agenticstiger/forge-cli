@@ -1,7 +1,7 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""reconcile / run_once / status against an in-memory adapter and a fake clock."""
+"""reconcile / run_once / run_build / status against an in-memory adapter and a fake clock."""
 
 from __future__ import annotations
 
@@ -377,6 +377,97 @@ def test_status_limits_runs_and_reports_an_error_as_the_row(run, monkeypatch):
 
     monkeypatch.setattr(rc, "adapter_for", boom)
     assert rc.status([run])[0]["error"] == "nope"
+
+
+# --- run_build: fluid apply --mode amend-and-build ------------------------------------
+
+
+def _available_now(contract, **runtime):
+    """The conftest contract's build as a stream that runs to completion."""
+    contract["builds"][0]["properties"]["stream"]["trigger"] = {"availableNow": True}
+    if runtime:
+        contract["builds"][0]["execution"] = {"runtime": runtime}
+    return contract, contract["builds"][0]
+
+
+def test_run_build_starts_a_scheduled_build_and_waits_for_it(contract, use):
+    contract, build = _available_now(contract)
+    fake = FakeAdapter(start_states=("SUCCEEDED",))
+    use(fake)
+    said = []
+    assert rc.run_build(contract, build, dry_run=False, say=said.append) == 0
+    assert fake.calls == ["start"]
+    assert said[-1].startswith("Spark ingest-orders (emr-serverless): succeeded run new")
+
+
+def test_run_build_fails_when_the_run_does(contract, use):
+    contract, build = _available_now(contract)
+    use(FakeAdapter(start_states=("FAILED",), start_details="exit 1"))
+    said = []
+    assert rc.run_build(contract, build, dry_run=False, say=said.append) == 1
+    assert "exit 1" in said[-1]
+
+
+@pytest.mark.parametrize(
+    "runtime, wait", [({}, rc.DEFAULT_RUN_WAIT_S), ({"timeout": "PT2H"}, 7200)]
+)
+def test_run_build_waits_as_long_as_the_build_says(contract, monkeypatch, runtime, wait):
+    contract, build = _available_now(contract, **runtime)
+    seen = {}
+
+    def run_once(run, **kw):
+        seen.update(kw, build=run.build)
+        return rc.Outcome(run.build, run.runtime, "succeeded")
+
+    monkeypatch.setattr(rc, "run_once", run_once)
+    assert rc.run_build(contract, build, dry_run=False, say=lambda _t: None) == 0
+    assert (seen["build"], seen["timeout"], seen["wait"]) == ("ingest-orders", wait, True)
+
+
+def test_a_stream_fluid_apply_keeps_running_has_no_run_to_start(contract, use):
+    built = use(FakeAdapter())
+    assert rc.run_build(contract, contract["builds"][0], dry_run=False, say=print) is None
+    assert built == []
+
+
+def test_a_dry_run_says_what_it_would_start_and_reads_nothing(contract, use):
+    contract, build = _available_now(contract)
+    built = use(FakeAdapter())
+    said = []
+    assert rc.run_build(contract, build, dry_run=True, say=said.append) == 0
+    assert built == []
+    assert said == [
+        "Spark ingest-orders (emr-serverless): would start one run and wait up to 21600 s "
+        "for it to end"
+    ]
+
+
+def test_a_contract_before_the_managed_lane_is_refused(contract, use):
+    contract, build = _available_now(contract)
+    contract["fluidVersion"] = "0.7.6"
+    built = use(FakeAdapter(start_states=("SUCCEEDED",)))
+    with pytest.raises(ValueError, match="fluidVersion 0.7.7"):
+        rc.run_build(contract, build, dry_run=False, say=print)
+    assert built == []
+
+
+def test_an_unusable_runtime_timeout_is_refused_before_anything_starts(contract, use):
+    contract, build = _available_now(contract, timeout="soon")
+    built = use(FakeAdapter(start_states=("SUCCEEDED",)))
+    with pytest.raises(ValueError, match="execution.runtime.timeout 'soon'"):
+        rc.run_build(contract, build, dry_run=False, say=print)
+    assert built == []
+
+
+def test_the_operators_policy_refuses_before_anything_starts(contract, use):
+    from fluid_build._errors import FluidUserError
+
+    contract, build = _available_now(contract)
+    build["properties"]["parameters"]["spark"]["sparkConf"] = {"spark.jars": "s3://x/y.jar"}
+    built = use(FakeAdapter(start_states=("SUCCEEDED",)))
+    with pytest.raises(FluidUserError):
+        rc.run_build(contract, build, dry_run=False, say=print)
+    assert built == []
 
 
 # --- redaction ------------------------------------------------------------------------
