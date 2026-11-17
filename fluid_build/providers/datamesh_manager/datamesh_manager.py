@@ -691,19 +691,21 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             if r.get("success") and r.get("contract_id")
         }
 
-        dropped_contract_ids: List[str] = []
-        if is_odps_payload:
-            # A port names only a contract this publish sent or Entropy already has.
-            dropped_contract_ids = drop_unresolved_port_contract_ids(
-                dp, sent_contract_ids, self._contract_exists
+        # Both formats; the DPS payload spells the reference ``dataContractId``.
+        # A port names only a contract this publish sent or Entropy already has.
+        dropped_contract_ids = drop_unresolved_port_contract_ids(
+            dp,
+            sent_contract_ids,
+            self._contract_exists,
+            key="contractId" if is_odps_payload else "dataContractId",
+        )
+        for contract_id in dropped_contract_ids:
+            self._log.warning(
+                "Output port contract %s did not land in Entropy (%s); the port goes "
+                "out without a contractId.",
+                contract_id,
+                "its publish failed" if publish_contract else "--with-contract sends it",
             )
-            for contract_id in dropped_contract_ids:
-                self._log.warning(
-                    "Output port contract %s did not land in Entropy (%s); the port goes "
-                    "out without a contractId.",
-                    contract_id,
-                    "its publish failed" if publish_contract else "--with-contract sends it",
-                )
 
         # PUT data product
         resp = self._request("PUT", f"/api/dataproducts/{product_id}", json_body=dp)

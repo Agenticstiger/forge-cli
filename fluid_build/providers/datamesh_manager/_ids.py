@@ -15,8 +15,8 @@ nowhere. Both publish paths now run the contract through
 spelled one way. A pinned contract id (``exposes[].contract.id``,
 ``consumes[].contractId``) is the author's own and stays as written.
 
-An upstream Entropy already holds under the id as written (one forge did not publish,
-``Acme.Orders``) is consumed as written: the slug is for products forge publishes, and
+An upstream Entropy holds under the id as written and not under its slug (one forge
+did not publish, ``Acme.Orders``) is consumed as written: the slug is for products forge publishes, and
 slugging that upstream would point at a product that does not exist. Callers that can
 read the product list pass it as ``existing_ids``; :func:`needs_existing_ids` says
 whether there is anything to look up.
@@ -59,6 +59,11 @@ def with_dmm_product_ids(
     held = set(existing_ids or ())
     for consume in _consumes(out):
         raw = consume.get("productId")
-        if isinstance(raw, str) and raw not in held:
-            consume["productId"] = dmm_product_id(raw)
+        if not isinstance(raw, str):
+            continue
+        slug = dmm_product_id(raw)
+        # The slug wins whenever Entropy holds it: a product forge published (and so
+        # live), even beside a stale as-written copy an older publish left behind.
+        if slug in held or raw not in held:
+            consume["productId"] = slug
     return out

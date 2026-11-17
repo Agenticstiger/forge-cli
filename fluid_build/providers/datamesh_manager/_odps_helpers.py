@@ -274,7 +274,7 @@ def ensure_odps_input_port_source_system_custom_property(
     canonical_ports = consumes_to_canonical_ports(fluid, logger=LOG)
     # A port with no ``contractId`` (not one the export builds) falls back to the
     # exposeId, as before.
-    source_system_by_contract: Dict[str, str] = {}
+    systems_by_contract: Dict[str, set] = {}
     source_system_by_expose: Dict[str, str] = {}
     for canonical in canonical_ports:
         sys_id = canonical.get("source_system_id")
@@ -284,9 +284,23 @@ def ensure_odps_input_port_source_system_custom_property(
             continue
         contract_id = input_port_contract_id(canonical)
         if contract_id:
-            source_system_by_contract.setdefault(str(contract_id), str(sys_id))
+            systems_by_contract.setdefault(str(contract_id), set()).add(str(sys_id))
         if canonical.get("id"):
             source_system_by_expose.setdefault(str(canonical["id"]), str(sys_id))
+
+    # One contract consumed twice with different source systems cannot tell its ports
+    # apart: link neither rather than give both the first one's.
+    source_system_by_contract: Dict[str, str] = {}
+    for contract_id, systems in systems_by_contract.items():
+        if len(systems) == 1:
+            source_system_by_contract[contract_id] = next(iter(systems))
+        else:
+            LOG.warning(
+                "consumes[] name contract %s with different source systems (%s); none is "
+                "linked. Give each consume its own contractId, or one sourceSystem.",
+                contract_id,
+                ", ".join(sorted(systems)),
+            )
 
     for port in input_ports:
         if not isinstance(port, dict):

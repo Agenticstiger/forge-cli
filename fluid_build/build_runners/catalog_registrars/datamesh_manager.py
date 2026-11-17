@@ -105,7 +105,14 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         contract = payload.contract or {}
         # An upstream Entropy holds as written (one forge did not publish) is kept as
         # written; reading the list is only worth it when some upstream id would change.
-        held = self._existing_product_ids() if needs_existing_ids(contract) else None
+        held: Optional[set] = None
+        if needs_existing_ids(contract):
+            held = self._read_product_ids()
+            if held is None:
+                LOG.warning(
+                    "Could not list Entropy's data products; every consumes[].productId is "
+                    "slugged, so an upstream Entropy holds only as written is not reached."
+                )
         normalized = with_dmm_product_ids(contract, held)
         if normalized == dict(contract) and (
             payload.product.product_id == normalized.get("id", payload.product.product_id)
@@ -686,6 +693,10 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         doesn't exist without inflicting a noisy 404 on the operator's
         publish log.
         """
+        return self._read_product_ids() or set()
+
+    def _read_product_ids(self) -> Optional[set]:
+        """Every product id Entropy holds, or ``None`` when the list cannot be read."""
         from fluid_build.util.safe_http import safe_httpx_client
 
         try:
@@ -700,10 +711,10 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                 for page in range(_MAX_PRODUCT_PAGES):
                     r = c.get("/api/dataproducts", params={"p": page}, headers=self._headers())
                     if r.status_code != 200:
-                        return set()
+                        return None
                     data = r.json()
                     if not isinstance(data, list):
-                        return set()
+                        return None
                     before = len(ids)
                     ids.update(
                         str(p.get("id")) for p in data if isinstance(p, dict) and p.get("id")
@@ -714,7 +725,7 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                         break
                 return ids
         except Exception:  # noqa: BLE001 — best effort; disable pre-flight on failure
-            return set()
+            return None
 
     # ── Owner team upsert ────────────────────────────────────────────
     #
