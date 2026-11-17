@@ -284,7 +284,7 @@ def _emit_registration_role(
             ),
         )
     prefix = _checked_prefix(where, ctx, bucket, path, "the registered location", reserved=False)
-    if placement.bucket_referenced:
+    if _shared_bucket(contract, expose, loc):
         _refuse_unless_products_prefix(where, ctx, bucket, prefix)
     digest = hashlib.sha256(f"{bucket}/{prefix}".encode("utf-8")).hexdigest()[:8]
     key = safe_ident(f"{ctx.cid}_lf_writer_{digest}")

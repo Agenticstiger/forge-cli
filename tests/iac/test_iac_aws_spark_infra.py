@@ -1109,3 +1109,20 @@ def test_a_glue_role_tags_and_deletes_only_interfaces_in_its_subnet(contract):
     assert tags["actions"] == ["ec2:CreateTags"] and subnet in tags["condition"]
     assert {"test": "Null", "variable": "aws:TagKeys", "values": ["false"]} in tags["condition"]
     assert subnet in statement(access, "GlueVpcDelete")["condition"]
+
+
+def test_the_lf_role_writes_only_the_products_prefix_of_the_account_bucket(contract, monkeypatch):
+    """Re-check of #918: the registration role followed the pool rule only, so the account
+    bucket named literally (no packaging block) let it write another product's prefix."""
+    params = spark(contract)
+    params.update(runtime="glue", executionRoleArn=ROLE)
+    del params["applicationId"]
+    monkeypatch.setenv(aws_identity.EXECUTION_ROLE_ALLOWLIST_ENV, ROLE)
+    loc = contract["exposes"][0]["binding"]["location"]
+    loc.update(bucket="000000000005-fluid-data", path="payments/cards/")
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(_with_lake_formation(contract))
+    assert caught.value.kind == "spark-role-shared-prefix"
+    loc["path"] = "commerce.orders-stream/order_lines/"
+    resources, _ = emit(_with_lake_formation(contract))
+    assert any("_lf_writer_" in k for k in resources["aws_iam_role"])
