@@ -18,8 +18,10 @@ What LocalStack runs (measured on LocalStack Pro 2026.8.2):
 - EMR Serverless and EMR on EC2 run LocalStack's own Spark 3.3.0 on Java 8, inside the
   LocalStack container and without ``AWS_ENDPOINT_URL``, whatever the release label says.
   They run a batch build (no Kafka, no mask key), with Spark 3.3 packages and the catalog's
-  endpoints set through the operator's ``sparkConf`` allowlist: forge's own EMR defaults
-  (EMR's Iceberg jar path, Spark 3.5 packages) are EMR's.
+  LocalStack endpoints added to the submitted Spark configuration by the test
+  (:func:`._localstack_emr.with_spark_conf`), not by the contract: a contract's ``sparkConf``
+  can never set those keys, and forge's own EMR defaults (EMR's Iceberg jar path, Spark 3.5
+  packages) are EMR's.
 - MSK is a plaintext Kafka. ``get-bootstrap-brokers`` gives only ``BootstrapBrokerStringTls``,
   whose port speaks no TLS, and there is no SASL/IAM listener: ``auth: msk-iam`` is not tested
   here, and the uploaded config of an ARN read without IAM has ``tls`` set to false.
@@ -46,7 +48,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from fluid_build.build_runners.spark._desired import CONF_ALLOWLIST_ENV, desired_runs
+from fluid_build.build_runners.spark._desired import desired_runs
 from fluid_build.spark import runner_source
 from fluid_build.spark.compiler import (
     CONTRACT_SQL_ALLOWLIST_ENV,
@@ -592,15 +594,26 @@ def test_glue_runs_a_batch_build_over_catalog_tables(lane, capsys, tmp_path, mon
 
 
 def _emr_conf(monkeypatch):
-    """LocalStack's Spark 3.3 needs its own Iceberg and the catalog's LocalStack endpoints;
-    the operator allows the contract to set them."""
-    monkeypatch.setenv(CONF_ALLOWLIST_ENV, "spark.jars.packages,spark.sql.catalog.fluid.*")
-    return {
-        "spark.jars.packages": SPARK33_PACKAGES,
-        "spark.sql.catalog.fluid.glue.endpoint": "http://localhost:4566",
-        "spark.sql.catalog.fluid.s3.endpoint": "http://localhost:4566",
-        "spark.sql.catalog.fluid.s3.path-style-access": "true",
-    }
+    """LocalStack's Spark 3.3 needs its own Iceberg and the catalog's LocalStack endpoints.
+    The test adds them to what forge submits on an EMR runtime; the contract sets none."""
+    from fluid_build.build_runners.spark import _desired
+
+    from ._localstack_emr import with_spark_conf
+
+    monkeypatch.setattr(
+        _desired,
+        "_submit_conf",
+        with_spark_conf(
+            _desired._submit_conf,
+            {
+                "spark.jars.packages": SPARK33_PACKAGES,
+                "spark.sql.catalog.fluid.glue.endpoint": "http://localhost:4566",
+                "spark.sql.catalog.fluid.s3.endpoint": "http://localhost:4566",
+                "spark.sql.catalog.fluid.s3.path-style-access": "true",
+            },
+        ),
+    )
+    return {}
 
 
 def test_emr_serverless_runs_a_batch_build(lane, capsys, tmp_path, monkeypatch):

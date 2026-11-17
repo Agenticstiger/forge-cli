@@ -3,16 +3,21 @@
 
 """LocalStack's EMR Serverless quirk, kept in the tests: forge's product code reads AWS's shape.
 
-LocalStack Pro 2026.8.2 lists EMR Serverless applications and job runs with an ``arn`` and no
+Two of them. First, LocalStack Pro 2026.8.2 lists EMR Serverless applications and job runs with an ``arn`` and no
 ``id``; AWS always returns ``id`` there, and ``jobRunId`` on ``GetJobRun``. The lane's clients
 get a botocore ``after-call`` hook that fills ``id`` from the ARN's last segment on those two
 list calls (paginators included) and ``jobRunId`` on ``GetJobRun`` when it is missing, so
 ``fluid_build.build_runners.spark._adapters`` reads LocalStack's records as it reads AWS's.
+
+Second, LocalStack's EMR runs its own Spark 3.3, which needs Spark 3.3 packages and the
+catalog's LocalStack endpoints: :func:`with_spark_conf` adds them to what forge submits on an
+EMR runtime. A contract's ``sparkConf`` could not carry them (``spark.jars*`` and
+``spark.sql.catalog.*`` are denied whatever the operator lists), and should not.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Dict, Mapping
 
 #: The list calls whose summaries LocalStack sends without ``id``, and the list they carry.
 LISTS = {"ListApplications": "applications", "ListJobRuns": "jobRuns"}
@@ -49,3 +54,21 @@ def with_summary_ids(clients: Callable[[str, str], Any]) -> Callable[[str, str],
         return client
 
     return factory
+
+
+#: The runtimes LocalStack runs on its own Spark 3.3.
+EMR_RUNTIMES = ("emr-serverless", "emr-ec2")
+
+
+def with_spark_conf(
+    submit_conf: Callable[..., Dict[str, str]], extra: Mapping[str, str]
+) -> Callable[..., Dict[str, str]]:
+    """``_desired._submit_conf``, with ``extra`` laid over what it returns on an EMR runtime."""
+
+    def conf(runtime: str, *args: Any, **kwargs: Any) -> Dict[str, str]:
+        out = submit_conf(runtime, *args, **kwargs)
+        if runtime in EMR_RUNTIMES:
+            out.update(extra)
+        return out
+
+    return conf

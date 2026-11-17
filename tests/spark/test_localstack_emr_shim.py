@@ -111,3 +111,25 @@ def test_the_shim_fills_a_job_runs_job_run_id(by_name, shim):
     else:
         with pytest.raises(_adapters.SparkRunError, match="job run carries no jobRunId"):
             adapter.get("ff81f100")
+
+
+def test_the_emr_conf_shim_reaches_emr_runs_only(monkeypatch):
+    from fluid_build.build_runners.spark import _desired
+
+    from ._localstack_emr import with_spark_conf
+
+    extra = {"spark.jars.packages": "org.example:x:1", "spark.sql.catalog.fluid.s3.endpoint": "e"}
+    monkeypatch.setattr(_desired, "_submit_conf", with_spark_conf(_desired._submit_conf, extra))
+    for runtime, extra_args in (
+        ("emr-serverless", {}),
+        ("emr-ec2", {"clusterId": "j-1"}),
+        ("glue", {}),
+    ):
+        contract = copy.deepcopy(CONTRACT)
+        spark = contract["builds"][0]["properties"]["parameters"]["spark"]
+        spark.update(runtime=runtime, **extra_args)
+        if runtime == "glue":
+            spark.pop("applicationId", None)
+        conf = runs_of(contract)[0].spark_conf
+        reached = all(conf.get(k) == v for k, v in extra.items())
+        assert reached == (runtime != "glue"), runtime
