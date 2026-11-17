@@ -67,6 +67,44 @@ pytestmark = [
 
 
 # ---------------------------------------------------------------------------
+# Iceberg-on-Glue: what the emulator can show
+# ---------------------------------------------------------------------------
+
+
+def _assert_glue_creates_iceberg(project: Any, table: str) -> None:
+    """The module asked Glue to create ``table`` as an Iceberg table (#915).
+
+    The table goes out with ``open_table_format_input`` (``CREATE``, format
+    version 2) and without ``parameters.table_type``: real Glue writes the first
+    metadata and sets ``table_type=ICEBERG`` itself, and refuses a create that
+    passes it (Stage 3 asserts ``ICEBERG`` on real AWS). LocalStack accepts the
+    input and does not set ``table_type`` (the nightly of 2026-11-17 read none),
+    so this checks what was sent, in the module and in the applied state.
+    """
+    module = json.loads((project.workdir / "main.tf.json").read_text(encoding="utf-8"))
+    sent = [
+        body
+        for body in module["resource"]["aws_glue_catalog_table"].values()
+        if body["name"] == table
+    ]
+    assert len(sent) == 1, sent
+    assert sent[0]["open_table_format_input"] == {
+        "iceberg_input": {"metadata_operation": "CREATE", "version": "2"}
+    }
+    assert "table_type" not in sent[0]["parameters"]
+
+    applied = [
+        r
+        for r in runner.tofu_state_resources(str(project.workdir), env=project.env)
+        if r["type"] == "aws_glue_catalog_table" and r["values"]["name"] == table
+    ]
+    assert len(applied) == 1, applied
+    (recorded,) = applied[0]["values"]["open_table_format_input"]
+    (iceberg,) = recorded["iceberg_input"]
+    assert (iceberg["metadata_operation"], iceberg["version"]) == ("CREATE", "2")
+
+
+# ---------------------------------------------------------------------------
 # Per-resource-type round-trips
 # ---------------------------------------------------------------------------
 
@@ -86,9 +124,8 @@ def test_iceberg_on_glue_round_trip(localstack_project, localstack_endpoint):
     """The mesh-interface table — S3 + Glue catalog database + Iceberg-typed
     Glue catalog table — provisions in one apply.
 
-    ``Parameters.table_type=ICEBERG`` is the hint Athena uses to query the
-    Iceberg metadata layer; without it the table is a plain Hive external
-    table.
+    The module creates it as an Iceberg table (``open_table_format_input``);
+    real Glue then marks it ``table_type=ICEBERG``, which LocalStack does not.
     """
     contract = aws_iceberg_contract("fluid-ls-iceberg", database="mesh_silver", table="events")
     localstack_project.apply_ok(contract)
@@ -98,7 +135,7 @@ def test_iceberg_on_glue_round_trip(localstack_project, localstack_endpoint):
 
     table = glue.get_table(DatabaseName="mesh_silver", Name="events")["Table"]
     assert table["TableType"] == "EXTERNAL_TABLE"
-    assert table["Parameters"]["table_type"] == "ICEBERG"
+    _assert_glue_creates_iceberg(localstack_project, "events")
     cols = {c["Name"]: c["Type"] for c in table["StorageDescriptor"]["Columns"]}
     assert cols == {"event_id": "string", "occurred_at": "timestamp", "amount": "decimal(12,2)"}
 
@@ -254,9 +291,10 @@ def test_iceberg_plus_kinesis_single_apply(localstack_project, localstack_endpoi
     assert (
         localstack_boto("glue", localstack_endpoint).get_table(
             DatabaseName="ms_silver", Name="events"
-        )["Table"]["Parameters"]["table_type"]
-        == "ICEBERG"
+        )["Table"]["Name"]
+        == "events"
     )
+    _assert_glue_creates_iceberg(localstack_project, "events")
     assert (
         localstack_boto("kinesis", localstack_endpoint).describe_stream(
             StreamName="ls-multi-events"
@@ -281,12 +319,8 @@ def test_full_aws_contract_iceberg_plus_lambda_plus_sfn(localstack_project, loca
     lam = localstack_boto("lambda", localstack_endpoint)
     sfn = localstack_boto("stepfunctions", localstack_endpoint)
 
-    assert (
-        glue.get_table(DatabaseName="full_silver", Name="events")["Table"]["Parameters"][
-            "table_type"
-        ]
-        == "ICEBERG"
-    )
+    assert glue.get_table(DatabaseName="full_silver", Name="events")["Table"]["Name"] == "events"
+    _assert_glue_creates_iceberg(localstack_project, "events")
     assert lam.get_function(FunctionName="fluid-ls-full-fn")["Configuration"]["Runtime"] == (
         "python3.11"
     )
@@ -343,9 +377,9 @@ def test_destroy_removes_provisioned_resources(localstack_project, localstack_en
 def test_athena_can_address_iceberg_table_via_glue_catalog(localstack_project, localstack_endpoint):
     """The architectural validation: an Iceberg-on-Glue table emitted by
     the plugin is addressable by Athena through the Glue catalog. Athena
-    resolves the table via the catalog, recognises
-    ``Parameters.table_type=ICEBERG``, and accepts the query for
-    execution.
+    resolves the table via the catalog and accepts the query for
+    execution. The table is created as Iceberg (``open_table_format_input``);
+    ``table_type=ICEBERG`` is Glue's to set, and LocalStack does not.
 
     LocalStack's Athena query *executor* (the Spark/Trino-shaped
     backend) is flaky — queries linger in ``RUNNING`` past several
@@ -361,10 +395,9 @@ def test_athena_can_address_iceberg_table_via_glue_catalog(localstack_project, l
     localstack_project.apply_ok(contract)
 
     # Glue catalog side — Athena reads from this. The table must be
-    # listed and Iceberg-typed before Athena can address it.
+    # listed and created as Iceberg before Athena can address it.
     glue = localstack_boto("glue", localstack_endpoint)
-    table = glue.get_table(DatabaseName="athena_silver", Name="events")["Table"]
-    assert table["Parameters"]["table_type"] == "ICEBERG"
+    _assert_glue_creates_iceberg(localstack_project, "events")
     tables = {t["Name"] for t in glue.get_tables(DatabaseName="athena_silver")["TableList"]}
     assert "events" in tables
 
