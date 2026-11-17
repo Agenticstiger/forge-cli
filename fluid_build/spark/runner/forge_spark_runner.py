@@ -317,7 +317,9 @@ def read_records(spark, config: dict):
     records = raw.select(*columns)
     for column in ("value", "key"):
         spec = source[column]
-        if spec is not None and spec["format"] != "raw":
+        # from_json returns the declared schema itself, so only Avro (the writer's schema
+        # read by field name) can decode to other types.
+        if spec is not None and spec["format"] == "avro-confluent":
             check_decoded(spark, records, column, spec["schema"])
     return records
 
@@ -355,11 +357,8 @@ def run(spark, config: dict) -> None:
         register_mask(spark, load_mask_key(mask["secretArn"]))
     output = build_output(spark, config)
     if config["mode"] == "batch":
-        writer = output.writeTo(table).option("check-nullability", "false")
-        if sink["write"] == "overwrite":
-            writer.overwritePartitions()
-        else:
-            writer.append()
+        # A batch run replaces the partitions it computes; a stream appends what it reads.
+        output.writeTo(table).option("check-nullability", "false").overwritePartitions()
         log("done", table=table)
         return
     writer = (

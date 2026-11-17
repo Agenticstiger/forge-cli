@@ -228,9 +228,37 @@ def test_the_key_comes_from_secrets_manager_and_is_never_printed(runner, monkeyp
 
 
 def test_the_key_never_reaches_the_job_config(contract):
+    """The config names the key's secret by ARN, once, and holds nothing else of it."""
     text = config_text(contract)
-    assert MASK_KEY_ARN in text
-    assert "SecretString" not in text and "a-very-secret" not in text
+    assert json.loads(text)["maskKey"] == {"secretArn": MASK_KEY_ARN}
+    assert text.count("secretsmanager") == 1
+
+
+def test_a_batch_run_replaces_the_partitions_it_computes(runner, contract, monkeypatch):
+    calls = []
+
+    class Writer:
+        def option(self, name, value):
+            calls.append((name, value))
+            return self
+
+        def overwritePartitions(self):  # noqa: N802 - PySpark's name
+            calls.append("overwritePartitions")
+
+    class Frame:
+        def writeTo(self, table):  # noqa: N802 - PySpark's name
+            calls.append(table)
+            return Writer()
+
+    config = runner.parse_config(config_text(contract))
+    config.update(mode="batch", source=None, maskedColumns=[], maskKey=None)
+    monkeypatch.setattr(runner, "build_output", lambda spark, cfg: Frame())
+    runner.run(_NoSpark(), config)
+    assert calls == [
+        "fluid.commerce.order_lines",
+        ("check-nullability", "false"),
+        "overwritePartitions",
+    ]
 
 
 def test_a_masked_config_without_its_key_arn_is_refused(runner, contract):
