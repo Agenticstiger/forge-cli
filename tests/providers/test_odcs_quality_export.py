@@ -134,8 +134,8 @@ _RICH = _with_expose_contract(
                 "type": "completeness",
                 "severity": "warn",
                 "selector": "amount",
-                "threshold": 5,
-                "operator": "<=",
+                "threshold": 0.95,
+                "operator": ">=",
             },
             {"id": "orders_fresh", "type": "freshness", "severity": "error", "window": "PT1H"},
             {
@@ -211,7 +211,9 @@ def test_dq_threshold_and_operator_become_the_matching_odcs_operator() -> None:
     complete = [r for r in rules if r.get("id") == "amount_complete"]
     assert complete, f"no amount_complete rule exported: {rules}"
     assert complete[0]["metric"] == "nullValues"
+    # threshold is the passing share: >= 95% non-null is <= 5 percent nulls.
     assert complete[0]["mustBeLessOrEqualTo"] == 5
+    assert complete[0]["unit"] == "percent"
     # ODCS types severity as a free string and documents "warning", not "warn".
     assert complete[0]["severity"] == "warning"
 
