@@ -3,13 +3,14 @@
 
 """Foreign-config converters for ``fluid import <tool> <config>``.
 
-Five sources covered:
+Six sources covered:
 
   - ``meltano <project-dir>``    — converts ``meltano.yml`` + plugins
   - ``airbyte --workspace-id``   — converts an Airbyte workspace via REST
   - ``dlt --pipeline-name``      — converts a dlt pipeline state directory
   - ``singer <tap-cfg>``         — converts a single Singer tap+target pair
   - ``dbt <project-dir>``        — converts ``target/manifest.json``
+  - ``schema-registry <subject>`` — a Confluent or Glue subject -> a consumer contract
 
 Each converter returns a contract dict + a translation report describing
 what mapped 1:1, what required defaults, and what the user still needs
@@ -23,6 +24,7 @@ from .dbt import DbtManifestImporter
 from .dlt import DltImporter
 from .meltano import MeltanoImporter
 from .registry import IMPORTERS, Importer, ImportReport, get_importer, register_importer
+from .schema_registry import SchemaRegistryImporter
 from .singer import SingerImporter
 
 __all__ = [
@@ -33,6 +35,7 @@ __all__ = [
     "Importer",
     "ImportReport",
     "MeltanoImporter",
+    "SchemaRegistryImporter",
     "SingerImporter",
     "get_importer",
     "register_importer",
@@ -45,3 +48,4 @@ register_importer("airbyte", AirbyteImporter())
 register_importer("dlt", DltImporter())
 register_importer("singer", SingerImporter())
 register_importer("dbt", DbtManifestImporter())
+register_importer("schema-registry", SchemaRegistryImporter())

@@ -21,8 +21,6 @@ def _aws_region(contract: Mapping[str, Any], environ: Optional[Mapping[str, str]
     environment in the AWS SDK order (``AWS_REGION``, then ``AWS_DEFAULT_REGION``):
     boto3 1.x reads only the second (the same rule as ``cli/_diff_live.py``).
     """
-    import os
-
     from fluid_build.iac.providers.aws import AwsIacPlugin
 
     try:
@@ -31,6 +29,16 @@ def _aws_region(contract: Mapping[str, Any], environ: Optional[Mapping[str, str]
         region = None
     if region:
         return str(region)
+    return env_region(environ)
+
+
+def env_region(environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """The region the environment names, in the AWS SDK order: ``AWS_REGION``, then
+    ``AWS_DEFAULT_REGION``. ``None`` leaves it to boto3, which then takes the profile's
+    region: boto3 1.x reads only ``AWS_DEFAULT_REGION``, so ``AWS_REGION`` alone would be
+    ignored without this (live: an import read us-east-1 with AWS_REGION=us-west-2)."""
+    import os
+
     env = os.environ if environ is None else environ
     return next((env[k] for k in ("AWS_REGION", "AWS_DEFAULT_REGION") if env.get(k)), None)
 
@@ -126,7 +134,7 @@ class GlueKind(RegistryKind):
         from ..clients import GlueRegistry
 
         if contract is None:
-            return GlueRegistry()
+            return GlueRegistry(region=env_region(environ))
         return GlueRegistry(region=_aws_region(contract, environ))
 
     def read(self, client: Any, ref: Any) -> Any:

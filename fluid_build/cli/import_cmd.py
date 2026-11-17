@@ -78,6 +78,16 @@ def _safe_yaml_load(path: Path, max_bytes: int = _YAML_MAX_BYTES) -> Any:
         return yaml.safe_load(f)
 
 
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a version number") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("a version number is 1 or more")
+    return value
+
+
 def register(subparsers: argparse._SubParsersAction) -> None:
     """Register the ``fluid import`` command.
 
@@ -100,6 +110,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "  fluid import dlt <pipeline-name>         — convert a dlt pipeline\n"
             "  fluid import singer <tap-config.json>    — convert a Singer tap+target\n"
             "  fluid import dbt <project-dir|manifest>  — convert target/manifest.json\n"
+            "  fluid import schema-registry <subject> --registry confluent --url <https URL>\n"
+            "  fluid import schema-registry <subject> --registry glue [--registry-name N]\n"
+            "                                           — a registry subject -> a consumer contract\n"
             "  fluid import [--dir <path>]              — legacy dbt/Terraform/SQL scan"
         ),
     )
@@ -109,7 +122,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "tool",
         nargs="?",
-        choices=["meltano", "airbyte", "dlt", "singer", "dbt"],
+        choices=["meltano", "airbyte", "dlt", "singer", "dbt", "schema-registry"],
         default=None,
         help="Foreign tool to import from (omit for a dbt/Terraform/SQL directory scan)",
     )
@@ -117,7 +130,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         "source",
         nargs="?",
         default=None,
-        help="Project dir / workspace id / pipeline name / tap config (required for tool-mode)",
+        help=(
+            "Project dir / workspace id / pipeline name / tap config / registry subject "
+            "(required for tool-mode)"
+        ),
     )
     parser.add_argument(
         "--out",
@@ -147,6 +163,37 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "Airbyte API base URL for `fluid import airbyte` (no default; "
             "falls back to $FLUID_IMPORT_AIRBYTE_URL)"
         ),
+    )
+    parser.add_argument(
+        "--registry",
+        dest="registry",
+        choices=["confluent", "glue"],
+        default=None,
+        help="Registry kind for `fluid import schema-registry` (required there)",
+    )
+    parser.add_argument(
+        "--url",
+        dest="url",
+        default=None,
+        help="Confluent registry https URL (with --registry confluent)",
+    )
+    parser.add_argument(
+        "--registry-name",
+        dest="registry_name",
+        default=None,
+        help=(
+            "Glue registry name (with --registry glue; default: Glue's default registry). "
+            "A Glue import takes its region from the AWS SDK (AWS_REGION, then "
+            "AWS_DEFAULT_REGION, then the profile)"
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        dest="registry_version",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="Subject version to read (default: latest; N pins it)",
     )
     parser.add_argument(
         "--provider",
@@ -539,6 +586,9 @@ def run(args: Any, logger: logging.Logger) -> int:
     for a recognizable dbt / Terraform / SQL project.
     """
     tool = getattr(args, "tool", None)
+    from fluid_build.cli.import_workflow.schema_registry import check_flags
+
+    check_flags(args, tool)
     if tool:
         from fluid_build.cli._import_workflow_handler import run_import_from_tool
 

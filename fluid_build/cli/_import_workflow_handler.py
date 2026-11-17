@@ -46,9 +46,12 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
         raise SchemaValidationError(
             what=f"unknown importer tool: {tool}",
             why=f"`{tool}` is not in the registered importer set.",
-            fix="Use one of: meltano | airbyte | dlt | singer | dbt.",
+            fix="Use one of: meltano | airbyte | dlt | singer | dbt | schema-registry.",
             doc="https://agenticstiger.github.io/forge_docs/cli/import.html",
-            extras={"tool": tool, "supported": ["meltano", "airbyte", "dlt", "singer", "dbt"]},
+            extras={
+                "tool": tool,
+                "supported": ["meltano", "airbyte", "dlt", "singer", "dbt", "schema-registry"],
+            },
         )
 
     options = {"split_by": getattr(args, "split_by", None) or "project"}
@@ -60,6 +63,12 @@ def run_import_from_tool(args, logger: logging.Logger, *, tool: str, source: Opt
     server_url = getattr(args, "server_url", None) or os.environ.get(AIRBYTE_SERVER_URL_ENV)
     if server_url:
         options["server_url"] = server_url
+    if tool == "schema-registry":
+        from fluid_build.cli.import_workflow.schema_registry import REGISTRY_FLAGS
+
+        for dest in REGISTRY_FLAGS:
+            if getattr(args, dest, None) is not None:
+                options[dest] = getattr(args, dest)
 
     cprint(f"📥 Importing {tool} configuration from {source}…")
     try:
