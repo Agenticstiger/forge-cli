@@ -1575,8 +1575,15 @@ def aws_real_project(
     Teardown: best-effort ``tofu destroy`` so applied resources don't
     linger. The session-end ``_aws_live_sweeper`` is the belt-and-
     suspenders net.
+
+    ``tofu`` gets the AWS plugin's environment, not ``tofu_env``: that one is
+    built for the Snowflake plugin, whose allowlist drops ``AWS_REGION``,
+    ``AWS_PROFILE`` and the CI job's OIDC keys, so ``tofu`` would apply with
+    another profile's region (or no credentials) while boto checks this one.
     """
-    project = RealAwsProject(tmp_path, tofu_env)
+    env = build_tofu_env(get_iac_plugin("aws"))
+    env["TF_PLUGIN_CACHE_DIR"] = tofu_env["TF_PLUGIN_CACHE_DIR"]
+    project = RealAwsProject(tmp_path, env)
     try:
         yield project
     finally:
