@@ -376,6 +376,7 @@ def run_once(
                 return
             try:
                 adapter.cancel(started[0])
+                out.cancelled.append(started[0])
                 say(f"Spark {run.build}: cancelled run {started[0]}")
             except Exception as exc:  # noqa: BLE001 - say it; the interrupt goes on
                 say(f"Spark {run.build}: could not cancel run {started[0]}: {_clean(exc)}")
@@ -408,11 +409,15 @@ def run_once(
             # Ctrl-C, SIGTERM or SIGHUP (a killed Airflow task): the guard cancelled the run.
             out.action, out.error, out.state = "cancelled", True, CANCELLING
             out.run_id = started[0] if started else None
-            out.message = (
-                f"interrupted while waiting; run {started[0]} was cancelled"
-                if started
-                else "interrupted before a run started"
-            )
+            if not started:
+                out.message = "interrupted before a run started"
+            elif out.cancelled:
+                out.message = f"interrupted while waiting; run {started[0]} was cancelled"
+            else:
+                out.message = (
+                    f"interrupted while waiting; run {started[0]} could not be cancelled "
+                    "and may still be going: cancel it by hand"
+                )
             return out
         out.state = ended.state
         if ended.state not in TERMINAL:
