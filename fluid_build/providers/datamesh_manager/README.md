@@ -23,7 +23,7 @@ fluid dmm publish contract.fluid.yaml --with-contract
 - **Publish data products** via `PUT /api/dataproducts/{id}`
 - **Publish data contracts** via `PUT /api/datacontracts/{id}`, one ODCS contract per expose at the id its output port names, carrying the expose `version`. A contract in the product's `{productId}.` namespace that its ports no longer name (an expose was removed) is retired (`status: retired`), never deleted. An output port names only a contract the publish sends or Entropy already has
 - **Publish product-to-product lineage** via ODPS input ports and `Access` resources derived from `consumes[]`
-- **Archetype** as `customProperties[type]` (`source-aligned` / `aggregate` / `consumer-aligned`), from `metadata.productType`, else `metadata.layer`
+- **Archetype** as `customProperties[type]` (`source-aligned` / `aggregate` / `consumer-aligned`), from `metadata.archetype` when set, else `metadata.productType`, else `metadata.layer`; a legacy `metadata.type` (analytical / operational) goes as `customProperties[fluidType]`
 - **Auto-create teams** when they don't exist
 - **Input/output port mapping** from FLUID expects/exposes plus explicit source-system consumes
 - **PII detection** from schema field classification

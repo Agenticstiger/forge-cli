@@ -216,3 +216,47 @@ def test_the_native_listing_reads_every_page():
     products = provider.list_products()
     assert len(products) == 1001 and products[-1]["id"] == "late"
     assert asked == ["/api/dataproducts?p=0", "/api/dataproducts?p=1"]
+
+
+@pytest.mark.parametrize("field", ["type", "product_type"])
+def test_a_legacy_product_type_is_not_read_as_the_archetype(field):
+    # The ODPS render carries metadata.product_type / metadata.type (analytical vs
+    # operational) as customProperties[type], which Entropy reads as the archetype.
+    contract = _product(layer="Bronze", **{field: "analytical"})
+    payload = CatalogPublicationPayload.from_contract(contract, {})
+    body = DataMeshManagerRegistrar._render_dmm_data_product_body(payload)
+    assert _custom(body)["type"] == "source-aligned"
+    assert _custom(body)["fluidType"] == "analytical"
+
+
+def test_a_type_that_already_is_an_archetype_is_kept_in_entropys_spelling():
+    from fluid_build.providers.datamesh_manager._odps_helpers import (
+        ensure_odps_archetype_custom_property,
+    )
+
+    body = {"customProperties": [{"property": "type", "value": "consumerAligned"}]}
+    ensure_odps_archetype_custom_property(body, _product(layer="Bronze"))
+    assert body["customProperties"] == [{"property": "type", "value": "consumer-aligned"}]
+
+
+def test_a_server_that_ignores_the_page_is_asked_twice_not_a_thousand_times():
+    provider = DataMeshManagerProvider(api_key="k", api_url=API)
+    full = [{"id": f"p{i}"} for i in range(1000)]
+    asked: List[str] = []
+
+    def request(method: str, path: str, *, json_body: Any = None):
+        asked.append(path)
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = full
+        return resp
+
+    provider._request = request  # type: ignore[method-assign]
+    assert len(provider.list_products()) == 1000
+    assert len(asked) == 2
+
+
+@respx.mock
+def test_the_registrar_stops_when_a_page_repeats():
+    route = _mock_entropy([[{"id": f"p{i}"} for i in range(1000)]] * 5)
+    assert len(DataMeshManagerRegistrar(api_token="t")._existing_product_ids()) == 1000
+    assert len(route.calls) == 2

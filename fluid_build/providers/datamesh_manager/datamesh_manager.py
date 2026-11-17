@@ -343,13 +343,18 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         """GET all data products, every page (Entropy pages the list at 1000)."""
         self._require_api_key()
         products: List[Dict[str, Any]] = []
+        seen: set = set()
         for page in range(_MAX_PRODUCT_PAGES):
             resp = self._request("GET", f"/api/dataproducts?p={page}")
             batch = resp.json()
             if not isinstance(batch, list):
                 return batch if page == 0 else products
-            products.extend(batch)
-            if len(batch) < _PRODUCT_PAGE_SIZE:
+            fresh = [p for p in batch if not (isinstance(p, dict) and str(p.get("id")) in seen)]
+            products.extend(fresh)
+            seen.update(str(p.get("id")) for p in fresh if isinstance(p, dict))
+            # A short page is the last; a page with nothing new means the server
+            # does not page (it ignores ``p``), so asking again would repeat it.
+            if len(batch) < _PRODUCT_PAGE_SIZE or not fresh:
                 break
         return products
 

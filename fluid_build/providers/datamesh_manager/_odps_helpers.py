@@ -416,19 +416,29 @@ def dmm_archetype(fluid: Mapping[str, Any]) -> Optional[str]:
 def ensure_odps_archetype_custom_property(
     odps_payload: Dict[str, Any], fluid: Mapping[str, Any]
 ) -> None:
-    """Add the product's archetype as ``customProperties[type]`` (DMM overlay only).
+    """Make ``customProperties[type]`` the product's archetype (DMM overlay only).
 
     ODPS v1.0.0 has no archetype field; Entropy Data reads it from this custom property
-    (v1.1.0 moves it to a top-level ``type``). A ``type`` the payload already carries wins.
+    (v1.1.0 moves it to a top-level ``type``). The ODPS render can already carry a
+    ``type`` that means something else: the legacy ``metadata.product_type`` /
+    ``metadata.type`` (``analytical`` / ``operational``), which Entropy would read as the
+    archetype. An existing ``type`` that is an archetype is kept, spelled Entropy's way;
+    one that is not is renamed ``fluidType`` when there is an archetype to send.
     """
-    archetype = dmm_archetype(fluid)
-    if not archetype:
-        return
     props = odps_payload.get("customProperties")
     if not isinstance(props, list):
         props = []
-    if any(isinstance(p, Mapping) and p.get("property") == "type" for p in props):
+    existing = [p for p in props if isinstance(p, dict) and p.get("property") == "type"]
+    for prop in existing:
+        kebab = _kebab(str(prop.get("value") or ""))
+        if kebab in _ARCHETYPES:
+            prop["value"] = kebab
+            return
+    archetype = dmm_archetype(fluid)
+    if not archetype:
         return
+    for prop in existing:
+        prop["property"] = "fluidType"
     props.append({"property": "type", "value": archetype})
     odps_payload["customProperties"] = props
 

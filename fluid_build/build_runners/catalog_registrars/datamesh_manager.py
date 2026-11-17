@@ -661,10 +661,13 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                     data = r.json()
                     if not isinstance(data, list):
                         return set()
+                    before = len(ids)
                     ids.update(
                         str(p.get("id")) for p in data if isinstance(p, dict) and p.get("id")
                     )
-                    if len(data) < _PRODUCT_PAGE_SIZE:
+                    # A short page is the last; a page with nothing new means the
+                    # server ignores ``p``, so asking again would only repeat it.
+                    if len(data) < _PRODUCT_PAGE_SIZE or len(ids) == before:
                         break
                 return ids
         except Exception:  # noqa: BLE001 — best effort; disable pre-flight on failure

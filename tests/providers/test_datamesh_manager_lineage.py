@@ -224,7 +224,7 @@ def _native_publish(contract: Dict[str, Any], existing_access: List[Dict] | None
     def fake_request(method: str, path: str, *, json_body: Any = None):
         calls.append((method, path, json_body))
         resp = MagicMock(status_code=200)
-        if method == "GET" and path == "/api/dataproducts":
+        if method == "GET" and path.startswith("/api/dataproducts?p="):
             resp.json.return_value = [{"id": "silver.sales.sessions"}, {"id": "bronze.web.events"}]
         elif method == "GET" and path.startswith("/api/access?"):
             resp.json.return_value = existing_access or []

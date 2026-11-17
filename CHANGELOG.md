@@ -425,9 +425,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Every Data Mesh Manager / Entropy Data product showed as a plain "Data Product".** The ODPS
   v1.0.0 payload has no archetype field, and Entropy reads it from `customProperties[type]`
-  in kebab case only. Both publish paths now send it, from `metadata.productType` (SDP
-  `source-aligned`, ADP `aggregate`, CDP `consumer-aligned`), else `metadata.layer`, else a
-  `metadata.archetype` (spelled the way Entropy reads it).
+  in kebab case only. Both publish paths now send it: `metadata.archetype` when set (spelled
+  the way Entropy reads it), else from `metadata.productType` (SDP `source-aligned`, ADP
+  `aggregate`, CDP `consumer-aligned`), else `metadata.layer`. A legacy `metadata.type`
+  (analytical / operational), which went out as `customProperties[type]` and so read as the
+  archetype, goes as `customProperties[fluidType]`.
 - **`fluid publish --target datamesh-manager` sent the API key over plain http to any host.**
   Like `fluid datamesh-manager publish`, it now refuses a non-local `http://` endpoint unless
   `DMM_ALLOW_INSECURE_HTTP` is set. It also warns about the settings it does not use
