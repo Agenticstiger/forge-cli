@@ -140,6 +140,7 @@ Docs pages are relative to https://agenticstiger.github.io/forge_docs/
 | `ERR_CONTRACT_BUILD_ID` | Rename the id the message names: a letter or _ first, then at most 127 letters, digits, _, - or . | cli/validate.html |
 | `ERR_CONTRACT_PACKAGING` | Fix the packaging block as the message says; plan, generate iac and apply decide from the same block. | cli/validate.html |
 | `ERR_CONTRACT_SEMANTICS` | Write a measure's expr as the column it aggregates (agg: sum, expr: amount), never as an aggregate (SUM(amount)), which aggregates twice. | cli/validate.html |
+| `ERR_CONTRACT_DATA_RULES` | Fix the rule the message names: invariants, identifier formats, placeholders and shared attributes are written as RFC-data-rules.md says, their texts in FLUID SQL/1. | cli/validate.html |
 | `ERR_CONTRACT_EXTENSION` | Fix the extensions block the message names: the plugin that owns that key wrote the message. | cli/validate.html |
 | `ERR_CONTRACT_VALIDATOR_FINDING` | The validator plugin named in brackets wrote this finding: do what it says, or ask that plugin's owner. | cli/validate.html |
 | `ERR_CONTRACT_OVERLAY` | Key the overlay's list entries by id (exposeId, id) instead of position, so each patch lands on the entry it means. | cli/validate.html |

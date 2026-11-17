@@ -92,6 +92,9 @@ def format_schema_error(error: Any) -> str:
             "'lakeflow' (a Databricks Lakeflow Declarative Pipeline) is an engine of the 0.7.7 "
             "preview schema: set the contract's fluidVersion to 0.7.7 to use it"
         )
+    form_message = _invariant_form_message(error, path)
+    if form_message:
+        return form_message
     preview_hint = _preview_field_hint(error, path)
     if preview_hint:
         return preview_hint
@@ -131,9 +134,9 @@ def format_schema_error(error: Any) -> str:
     return f"fails {error.validator}: {error.validator_value!r} (value not shown)"
 
 
-#: Fields of the 0.7.7 preview, by the object that holds them (the last key of its path)
-#: and a key its path must contain: an older schema's message would only say the field
-#: was unexpected.
+#: Fields of the 0.7.7 preview, by the object that holds them (the last named key of its
+#: path: a column's path ends in its index in ``schema``) and a key its path must contain:
+#: an older schema's message would only say the field was unexpected.
 _PREVIEW_FIELDS = {
     ("semantics", "relationships"): ("exposes", "named relationships between exposes"),
     ("typeParams", "validityParams"): (
@@ -154,6 +157,13 @@ _PREVIEW_FIELDS = {
             ("mwaaEnvironment", "MWAA environment"),
         )
     },
+    ("contract", "invariants"): ("exposes", "rules about valid data"),
+    ("schema", "identifierFormat"): ("exposes", "the column's identifier formats"),
+    ("schema", "placeholders"): ("exposes", "the column's placeholder values"),
+    ("schema", "sharedAttribute"): ("exposes", "an attribute shared across exposes"),
+    ("fields", "identifierFormat"): ("exposes", "the field's identifier formats"),
+    ("fields", "placeholders"): ("exposes", "the field's placeholder values"),
+    ("fields", "sharedAttribute"): ("exposes", "an attribute shared across exposes"),
 }
 
 
@@ -164,11 +174,12 @@ def _preview_field_hint(error: Any, path: List[Any]) -> Optional[str]:
     keeps jsonschema's message, which names every unexpected key.
     """
     keys = _unexpected_keys(error)
-    if not keys or not path:
+    named = [part for part in path if isinstance(part, str)]
+    if not keys or not named:
         return None
     hints = []
     for key in keys:
-        field = _PREVIEW_FIELDS.get((path[-1], key))
+        field = _PREVIEW_FIELDS.get((named[-1], key))
         if field is None or field[0] not in path:
             return None
         hints.append(f"'{key}' ({field[1]})")
@@ -176,6 +187,53 @@ def _preview_field_hint(error: Any, path: List[Any]) -> Optional[str]:
         f"{' and '.join(hints)} {'is a field' if len(hints) == 1 else 'are fields'} of the "
         "0.7.7 preview schema: set the contract's fluidVersion to 0.7.7 to use it"
     )
+
+
+def _invariant_form_message(error: Any, path: List[Any]) -> Optional[str]:
+    """What is wrong with the form of a ``contract.invariants[]`` entry, or ``None``.
+
+    The schema's ``oneOf`` over the four forms would print the whole entry and say it
+    matches none of them. This names the problem instead; when the form keys are right
+    and something inside the form is not, it gives the deepest error jsonschema found.
+    """
+    if error.validator != "oneOf" or len(path) < 2 or path[-2] != "invariants":
+        return None
+    entry = error.instance
+    if not isinstance(entry, dict):
+        return None
+    forms = [key for key in ("check", "derive", "dependency") if key in entry]
+    one_form = "an invariant has exactly one form: check, derive with expr, derive with aggregate, or dependency"
+    if not forms:
+        if "expr" in entry or "aggregate" in entry:
+            return "expr and aggregate go with derive, which names the column they determine"
+        return f"no form: {one_form}"
+    if len(forms) > 1:
+        return f"{' and '.join(forms)} together: {one_form}"
+    if forms == ["derive"]:
+        values = [key for key in ("expr", "aggregate") if key in entry]
+        if not values:
+            return (
+                "derive needs expr (a FLUID SQL/1 value) or aggregate (a summary over child rows)"
+            )
+        if len(values) > 1:
+            return "derive takes expr or aggregate, not both"
+        branch = 1 if values == ["expr"] else 2
+    else:
+        extra = [key for key in ("expr", "aggregate") if key in entry]
+        if extra:
+            return f"{' and '.join(extra)} go with derive, not with {forms[0]}"
+        if forms == ["dependency"] and "when" in entry:
+            return "a dependency takes no when in v1: it covers every row whose from columns are not NULL"
+        branch = 0 if forms == ["check"] else 3
+    from jsonschema.exceptions import best_match
+
+    # The form is right, so the error is inside its own branch of the oneOf.
+    inside = [e for e in error.context or [] if list(e.relative_schema_path)[:1] == [branch]]
+    inner = best_match(inside)
+    if inner is None:
+        return None
+    where = ".".join(str(part) for part in inner.relative_path)
+    return f"{where}: {format_schema_error(inner)}" if where else format_schema_error(inner)
 
 
 def _unexpected_keys(error: Any) -> List[str]:
