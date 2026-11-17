@@ -104,6 +104,16 @@ def _escape(text: str) -> str:
     return text.replace("${", "$${").replace("%{", "%%{")
 
 
+def _plain_keys(value: Any) -> Any:
+    """``value`` with every mapping key a string: YAML gives int and date keys too
+    (``2024:``, ``2024-01-01:``), which ``json.dumps`` refuses as keys."""
+    if isinstance(value, Mapping):
+        return {str(k): _plain_keys(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_keys(v) for v in value]
+    return value
+
+
 def _markers(contract: Mapping[str, Any]) -> Tuple[str, str]:
     """Two strings that occur nowhere in the contract: the account and the brokers.
 
@@ -111,8 +121,7 @@ def _markers(contract: Mapping[str, Any]) -> Tuple[str, str]:
     occurrences in the job config can only come from that argument. Lower-case letters
     and digits, as a bucket name allows.
     """
-    # Unsorted: a mapping may mix key types (YAML's unquoted 2024: beside owner:).
-    text = json.dumps(contract, default=str)
+    text = json.dumps(_plain_keys(contract), default=str)
     seed = hashlib.sha256(text.encode("utf-8")).hexdigest()
     for attempt in range(100):
         digest = hashlib.sha256(f"{seed}:{attempt}".encode()).hexdigest()
@@ -219,39 +228,58 @@ def spark_blocks(contract: Mapping[str, Any], cid: str) -> SparkBlocks:
         _emit_caller_policy(blocks, ctx, runs, product_tags)
     for expose in contract.get("exposes") or []:
         if isinstance(expose, Mapping) and str(expose.get("exposeId")) in blocks.writers:
-            _emit_registration_role(blocks, ctx, expose, product_tags)
+            _emit_registration_role(blocks, contract, ctx, expose, product_tags)
     return blocks
 
 
 def _emit_registration_role(
-    blocks: SparkBlocks, ctx: _Ctx, expose: Mapping[str, Any], tags: Mapping[str, str]
+    blocks: SparkBlocks,
+    contract: Mapping[str, Any],
+    ctx: _Ctx,
+    expose: Mapping[str, Any],
+    tags: Mapping[str, str],
 ) -> None:
     """The role Lake Formation registers a Spark-written location with.
 
     The service-linked role has no ``s3:PutObject`` on a registered location, and EMR 7.12
     writes Iceberg with the credentials Lake Formation vends: a location a forge Spark job
-    writes is registered with this role instead, which may read and write the table's
-    prefix. :mod:`aws` uses it in its one ``aws_lakeformation_resource``.
+    writes is registered with this role instead, which may read and write the registered
+    location (Lake Formation scopes what it vends to each table). One role per location,
+    derived as :mod:`aws` registers it (``_lf_location``: the binding's ``path``, or the
+    bucket root of a bucket the product owns), so two exposes on one location share it.
     """
+    from . import aws as _aws  # imported here: aws imports this module
+
     binding = expose.get("binding") or {}
     gov = (binding.get("governance") or {}).get("lakeFormation") or {}
     if not (isinstance(gov, Mapping) and gov.get("registerLocation")):
         return
     loc = binding.get("location") or {}
-    bucket, prefix = _warehouse.normalize_location(loc, account_ref=ctx.account_marker)
+    placement = _aws._placement(resolve_packaging(contract), expose)
+    bucket, path = _aws._lf_location(loc, placement)
+    if not bucket or (placement.bucket_referenced and not path):
+        return  # nothing registered here (aws refuses a pool's root itself)
     expose_id = str(expose.get("exposeId"))
-    key = safe_ident(f"{ctx.cid}_{expose_id}_lf_writer")
+    where = f"exposes[{expose_id}].binding.location"
+    prefix = (
+        _checked_prefix(where, ctx, bucket, path, "the registered location", reserved=False)
+        if path
+        else ""
+    )
+    where_key = f"{bucket}_{path.rstrip('/') or 'root'}"
+    key = safe_ident(f"{ctx.cid}_lf_loc_{where_key}_writer")
+    blocks.registration_roles[expose_id] = key
+    if key in blocks.resources.get("aws_iam_role", {}):
+        return  # another expose on this location made it
     region = _region(blocks, loc.get("region"))
     documents = blocks.data.setdefault("aws_iam_policy_document", {})
     documents[f"{key}_trust"] = aws_identity.registration_trust(ctx.account)
-    documents[f"{key}_access"] = aws_identity.registration_document(
-        ctx.x(bucket), ctx.x(prefix if prefix.endswith("/") else prefix + "/"), region=region
-    )
+    documents[f"{key}_access"] = aws_identity.registration_document(bucket, prefix, region=region)
     blocks.resources.setdefault("aws_iam_role", {})[key] = {
-        "name": names.registration_role_name(ctx.product, expose_id),
+        "name": names.registration_role_name(ctx.product, safe_ident(where_key)),
         "description": (
-            f"The role Lake Formation registers the location of {ctx.product}'s "
-            f"{expose_id} with, so a forge Spark job can write it"
+            f"The role Lake Formation registers a location of {ctx.product} with, so its "
+            "forge Spark jobs can write it"
         ),
         "assume_role_policy": tofu_ref(f"data.aws_iam_policy_document.{key}_trust.json"),
         "tags": dict(tags),
@@ -261,7 +289,6 @@ def _emit_registration_role(
         "role": tofu_ref(f"aws_iam_role.{key}.id"),
         "policy": tofu_ref(f"data.aws_iam_policy_document.{key}_access.json"),
     }
-    blocks.registration_roles[expose_id] = key
 
 
 def _region(blocks: SparkBlocks, sink_region: Optional[str]) -> Any:
@@ -324,7 +351,6 @@ def _emit_build(
     from fluid_build.spark.compiler import compile_job_config, spark_parameters
 
     bid = str(build.get("id"))
-    aws_identity.refuse_unless_identity_allowed(ctx.product, build)
     problems = aws_identity.runtime_errors(build)
     if problems:
         raise UnsupportedBindingError(
@@ -332,6 +358,7 @@ def _emit_build(
             "; ".join(problems) + ".",
             ("Fix the field the message names; fluid validate reports the same.",),
         )
+    aws_identity.refuse_unless_identity_allowed(ctx.product, build)
     job = compile_job_config(contract, build, account_ref=ctx.account_marker)
     config = copy.deepcopy(dict(job.config))
     b = _Build(
@@ -389,7 +416,9 @@ def _emit_build(
     )
     role_arn = _emit_role(blocks, b, access, application_id)
     overwrites = job.config["mode"] == "batch"
-    blocks.writers.setdefault(str(expose.get("exposeId")), []).append(Writer(role_arn, overwrites))
+    # On emr-ec2 the cluster's own role writes, which forge does not know.
+    principal = None if b.runtime == "emr-ec2" else role_arn
+    blocks.writers.setdefault(str(expose.get("exposeId")), []).append(Writer(principal, overwrites))
     target: Any = application_id
     if b.runtime == "glue":
         _glue_job(blocks, b, job.config["mode"], role_arn)
@@ -551,30 +580,39 @@ _PREFIX = re.compile(r"[A-Za-z0-9._=-]+(?:/[A-Za-z0-9._=-]+)*/")
 
 
 def _scoped(b: _Build, bucket: str, prefix: str, what: str) -> str:
+    return _checked_prefix(
+        b.where, b.ctx, bucket, prefix, what, reserved=what == "properties.stream.checkpoint"
+    )
+
+
+def _checked_prefix(
+    where: str, ctx: _Ctx, bucket: str, prefix: str, what: str, *, reserved: bool
+) -> str:
     """``prefix`` ending in ``/``, refused unless it names one place in one bucket.
 
-    The role forge creates can read, overwrite and delete what its prefixes match. An
-    empty prefix is the whole bucket, which a bucketless product shares with every other
+    A role forge creates can read, overwrite and delete what its prefixes match. An empty
+    prefix is the whole bucket, which a bucketless product shares with every other
     (``<account>-fluid-data``); a wildcard or a prefix without its ``/`` reaches its
-    neighbours (``x`` matches ``x_pii/``).
+    neighbours (``x`` matches ``x_pii/``). ``reserved`` lets the prefix sit under forge's
+    own ``_fluid/`` and ``_checkpoints/`` roots (a checkpoint does).
     """
     prefix = prefix if prefix.endswith("/") else prefix + "/"
     segments = prefix.split("/")
-    reserved = what != "properties.stream.checkpoint" and segments[0] in _RESERVED_ROOTS
+    in_reserved = not reserved and segments[0] in _RESERVED_ROOTS
     if (
         _BUCKET.fullmatch(bucket)
         and _PREFIX.fullmatch(prefix)
         and ".." not in segments
         and "." not in segments
-        and not reserved
+        and not in_reserved
     ):
         return prefix
     raise UnsupportedBindingError(
         "spark-role-scope",
-        f"{b.where}: {what} (s3://{b.ctx.shown(bucket)}/{prefix.rstrip('/')}) is not one "
+        f"{where}: {what} (s3://{ctx.shown(bucket)}/{prefix.rstrip('/')}) is not one "
         "prefix of one bucket outside forge's _fluid/ and _checkpoints/ roots, and the "
-        "role forge creates for the build may read, overwrite and delete everything it "
-        "names: an empty path is the whole bucket, and a bucketless product shares "
+        "role forge creates for it may read, overwrite and delete everything it names: "
+        "an empty path is the whole bucket, and a bucketless product shares "
         "<account>-fluid-data with every other.",
         (
             "Set binding.location.path to the table's own prefix (letters, digits, "

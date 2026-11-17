@@ -67,6 +67,18 @@ EXECUTION_ROLE_ALLOWLIST_ENV = "FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST"
 #: Operator-only: ``sparkConf`` keys beyond the built-in tuning list. An entry is a key,
 #: or a prefix that ends in ``.``. It never admits a key in :data:`DENIED_SPARK_CONF`.
 SPARK_CONF_ALLOWLIST_ENV = "FLUID_SPARK_CONF_ALLOWLIST"
+#: Operator-only: the existing runtimes a contract may name, as ``<runtime>:<id>``
+#: (``emr-serverless:00f...``, ``emr-ec2:j-...``, ``emr-eks:<virtual cluster id>``).
+#: The build's role trusts it and the scheduler's policy may start, cancel and add
+#: steps there, so a contract naming another team's cluster would reach it. Unset
+#: allows none; a product's own isolated EMR Serverless application needs no entry.
+TARGET_ALLOWLIST_ENV = "FLUID_SPARK_TARGET_ALLOWLIST"
+#: The field that names the existing runtime, per runtime.
+_TARGET_FIELD = {
+    "emr-serverless": "applicationId",
+    "emr-ec2": "clusterId",
+    "emr-eks": "virtualClusterId",
+}
 
 _OPERATOR_ONLY = (
     "in the OPERATOR environment (a shell or CI variable; a project .env is ignored "
@@ -239,7 +251,17 @@ def identity_findings(
             f"Spark build {bid}: parameters.spark.sparkConf sets {', '.join(unlisted)}, "
             f"which {SPARK_CONF_ALLOWLIST_ENV} does not list"
         )
-    arn = (spark_parameters(build) or {}).get("executionRoleArn")
+    cfg = spark_parameters(build) or {}
+    field = _TARGET_FIELD.get(str(cfg.get("runtime")))
+    target = cfg.get(field) if field else None
+    if isinstance(target, str) and target:
+        entry = f"{cfg['runtime']}:{target}"
+        if entry not in _entries(TARGET_ALLOWLIST_ENV, environ):
+            missing.append(
+                f"Spark build {bid}: parameters.spark.{field} {target} is not in "
+                f"{TARGET_ALLOWLIST_ENV} (as {entry})"
+            )
+    arn = cfg.get("executionRoleArn")
     if arn is not None:
         if not (isinstance(arn, str) and _ROLE_ARN.fullmatch(arn)):
             errors.append(f"Spark build {bid}: parameters.spark.executionRoleArn: a role ARN")
@@ -299,7 +321,8 @@ def runtime_errors(build: Mapping[str, Any]) -> List[str]:
     props = build.get("properties")
     stream = props.get("stream") if isinstance(props, Mapping) else None
     batch = cfg.get("mode") == "batch" or (cfg.get("mode") is None and stream is None)
-    if batch and not cfg.get("executionRoleArn"):
+    # On emr-ec2 a step runs as the cluster's own role, so there is no role to require.
+    if batch and not cfg.get("executionRoleArn") and cfg.get("runtime") != "emr-ec2":
         errors.append(
             f"Spark build {bid}: a batch job reads tables its SQL names, which forge cannot "
             "grant a role it derives; set parameters.spark.executionRoleArn to a role the "
@@ -320,7 +343,10 @@ def refuse_unless_identity_allowed(
         return
     bid = build.get("id")
     raise SparkPolicyError(
-        what=f"Spark build {bid!r} names a role or Spark settings the operator has not allowed",
+        what=(
+            f"Spark build {bid!r} names a role, a runtime or Spark settings the operator "
+            "has not allowed"
+        ),
         why=" ".join(f"{m}." for m in [*errors, *missing])
         + " A contract that names an existing role runs the job, and the code the "
         "product's SQL reaches, with everything that role can do; a Spark setting can "
@@ -330,6 +356,8 @@ def refuse_unless_identity_allowed(
             "the build. Otherwise, once the role and settings are reviewed, have the "
             f"operator list them {_OPERATOR_ONLY}: {EXECUTION_ROLE_ALLOWLIST_ENV} takes a "
             "role ARN or a path prefix ending in '/'; "
+            f"{TARGET_ALLOWLIST_ENV} takes <runtime>:<id> of an existing application, "
+            "cluster or virtual cluster; "
             f"{SPARK_CONF_ALLOWLIST_ENV} takes a key or a prefix ending in '.'. A key "
             "that loads code, sets credentials or moves the catalog or checkpoint cannot "
             "be listed."

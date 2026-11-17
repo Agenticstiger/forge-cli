@@ -110,6 +110,11 @@ def operator_policy(monkeypatch):
         "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST",
     ):
         monkeypatch.delenv(name, raising=False)
+    # The operator lists the runtimes the examples name, and nothing else.
+    monkeypatch.setenv(
+        aws_identity.TARGET_ALLOWLIST_ENV,
+        f"emr-serverless:00fabc123def,emr-ec2:j-1ABCDEF,emr-eks:{VIRTUAL_CLUSTER}",
+    )
 
 
 @pytest.fixture
@@ -815,7 +820,7 @@ def _with_lake_formation(contract, **gov):
 def test_a_location_a_spark_job_writes_is_registered_with_a_role_that_can_write(contract):
     resources, data = emit(_with_lake_formation(contract))
     (registration,) = resources["aws_lakeformation_resource"].values()
-    role = "commerce_orders_stream_order_lines_lf_writer"
+    role = "commerce_orders_stream_lf_loc_commerce_lake_iceberg_commerce_order_lines_writer"
     assert registration["use_service_linked_role"] is False
     assert registration["role_arn"] == f"${{aws_iam_role.{role}.arn}}"
     # The role and its policy exist before Lake Formation (re-)registers the location.
@@ -857,7 +862,7 @@ def test_lake_formation_without_registration_still_grants_the_writer(contract):
     contract["exposes"][0]["binding"]["governance"] = {"lakeFormation": {"grants": []}}
     resources, data = emit(contract)
     assert "aws_lakeformation_resource" not in resources
-    assert "commerce_orders_stream_order_lines_lf_writer" not in resources.get("aws_iam_role", {})
+    assert not any(k.endswith("_writer") for k in resources.get("aws_iam_role", {}))
     assert resources["aws_lakeformation_permissions"]
 
 
@@ -882,3 +887,91 @@ def test_the_lake_formation_write_path_passes_tofu_validate(contract, tmp_path):
         [_TOFU, "validate", "-no-color"], cwd=tmp_path, capture_output=True, text=True
     )
     assert done.returncode == 0, done.stderr or done.stdout
+
+
+# --- review round 2 ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "runtime, field, value",
+    [
+        ("emr-serverless", "applicationId", "00fvictim"),
+        ("emr-ec2", "clusterId", "j-VICTIM1234"),
+        ("emr-eks", "virtualClusterId", "victimvc"),
+    ],
+)
+def test_an_existing_runtime_is_named_only_once_the_operator_lists_it(
+    contract, runtime, field, value
+):
+    params = spark(contract)
+    params.pop("applicationId")
+    params.update({"runtime": runtime, field: value})
+    (warning,) = aws_identity.validation_warnings(contract)
+    assert f"{runtime}:{value}" in warning
+    with pytest.raises(SparkPolicyError) as caught:
+        emit(contract)
+    assert aws_identity.TARGET_ALLOWLIST_ENV in caught.value.why
+
+
+def test_an_isolated_application_needs_no_operator_entry(contract, monkeypatch):
+    monkeypatch.delenv(aws_identity.TARGET_ALLOWLIST_ENV)
+    del spark(contract)["applicationId"]
+    contract["packaging"] = {"containers": {"emrApplication": "isolated"}}
+    assert aws_identity.validation_warnings(contract) == []
+    emit(contract)
+
+
+def test_a_contract_with_date_keys_still_emits(contract):
+    import datetime
+
+    contract["metadata"]["retention"] = {datetime.date(2024, 1, 1): "x"}
+    emit(contract)
+
+
+def test_the_registration_role_covers_the_registered_bucket_root(contract):
+    del contract["exposes"][0]["binding"]["location"]["path"]
+    resources, data = emit(_with_lake_formation(contract))
+    (registration,) = resources["aws_lakeformation_resource"].values()
+    assert registration["arn"] == "arn:aws:s3:::commerce-lake"
+    role = registration["role_arn"].removeprefix("${aws_iam_role.").removesuffix(".arn}")
+    rw = statement(data["aws_iam_policy_document"][f"{role}_access"], "ReadWrite")
+    assert rw["resources"] == ["arn:aws:s3:::commerce-lake/*"]
+
+
+def test_two_exposes_on_one_location_share_its_registration_role(contract):
+    second = copy.deepcopy(contract["exposes"][0])
+    second["exposeId"] = "order_lines_v2"
+    second["binding"]["location"]["table"] = "order_lines_v2"
+    contract["exposes"].append(second)
+    build = copy.deepcopy(contract["builds"][0])
+    build["id"] = "ingest-v2"
+    build["outputs"] = ["order_lines_v2"]
+    contract["builds"].append(build)
+    for expose in contract["exposes"]:
+        expose["binding"]["governance"] = {"lakeFormation": {"registerLocation": True}}
+    resources, _ = emit(contract)
+    (registration,) = resources["aws_lakeformation_resource"].values()
+    writers = [k for k in resources["aws_iam_role"] if k.endswith("_writer")]
+    assert len(writers) == 1
+    assert registration["role_arn"] == f"${{aws_iam_role.{writers[0]}.arn}}"
+
+
+def test_the_registration_role_is_scoped_even_with_an_operator_role(contract, monkeypatch):
+    params = spark(contract)
+    params.update(runtime="glue", executionRoleArn=ROLE)
+    del params["applicationId"]
+    monkeypatch.setenv(aws_identity.EXECUTION_ROLE_ALLOWLIST_ENV, ROLE)
+    contract["exposes"][0]["binding"]["location"]["path"] = "*"
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(_with_lake_formation(contract))
+    assert caught.value.kind == "spark-role-scope"
+
+
+def test_a_batch_build_on_emr_on_ec2_runs_as_the_clusters_role(contract):
+    params = spark(contract)
+    params.update(runtime="emr-ec2", clusterId="j-1ABCDEF", mode="batch")
+    del params["applicationId"], params["source"], params["maskKeySecretArn"]
+    props = contract["builds"][0]["properties"]
+    props.pop("stream"), props.pop("mapping")
+    props["sql"] = "SELECT order_id, order_id AS email_hash FROM commerce.raw_orders"
+    assert not any("batch job" in e for e in aws_identity.validation_errors(contract))
