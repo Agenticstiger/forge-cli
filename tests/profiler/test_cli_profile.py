@@ -106,6 +106,9 @@ def test_an_unknown_expose_is_named_with_the_ones_there_are(workspace, registry,
 
 
 def test_an_unreadable_source_is_reported_with_its_password_masked(workspace, registry, capsys):
+    # The read itself is the [profile] extra's (DuckDB): without it the command stops
+    # earlier, at "needs duckdb", as a lane without the extra (iac Stage 1) shows.
+    pytest.importorskip("duckdb")
     secret = "pw-77123"  # pragma: allowlist secret
     rc = main(
         [
