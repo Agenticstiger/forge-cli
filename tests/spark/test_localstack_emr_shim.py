@@ -133,3 +133,25 @@ def test_the_emr_conf_shim_reaches_emr_runs_only(monkeypatch):
         conf = runs_of(contract)[0].spark_conf
         reached = all(conf.get(k) == v for k, v in extra.items())
         assert reached == (runtime != "glue"), runtime
+
+
+@pytest.mark.parametrize("listed", [None, "spark.jars.packages,spark.sql.catalog.fluid.*", "*"])
+def test_product_code_still_refuses_the_lanes_settings_in_a_contract(monkeypatch, listed):
+    """The lane's LocalStack settings come from the test; in a contract they stay refused,
+    whatever the operator lists (#924's absolute deny)."""
+    from fluid_build.build_runners.spark import _desired
+    from fluid_build.spark.policy import SparkPolicyError
+
+    if listed:
+        monkeypatch.setenv(_desired.CONF_ALLOWLIST_ENV, listed)
+    contract = copy.deepcopy(CONTRACT)
+    spark = contract["builds"][0]["properties"]["parameters"]["spark"]
+    spark["sparkConf"] = {
+        "spark.jars.packages": "org.apache.iceberg:iceberg-spark-runtime-3.3_2.12:1.4.3",
+        "spark.sql.catalog.fluid.glue.endpoint": "http://localhost:4566",
+        "spark.sql.catalog.fluid.s3.endpoint": "http://localhost:4566",
+        "spark.sql.catalog.fluid.s3.path-style-access": "true",
+    }
+    with pytest.raises(SparkPolicyError, match="spark.jars.packages") as err:
+        runs_of(contract)
+    assert "never passes" in err.value.fix
