@@ -1,0 +1,1366 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenticstiger.github.io/flux/engine/spec/profile/1-0-0/FluxProfile.json",
+  "title": "FLUX profile document, format 1-0-0",
+  "description": "Aggregate statistics of the data a FLUX bundle imitates, computed where the data lives. Counts are JSON integers and every other number is a decimal string. The shape is checked here; docs/spec/PROFILE-SPEC.md states the rules a schema cannot express (registered definitions, sorted groups and levels, cells that line up with their statuses, names that refer to columns and tables of the profile).",
+  "type": "object",
+  "required": [
+    "_producer",
+    "_schemaURL",
+    "encoding",
+    "disclosureRules",
+    "tables"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "_producer": {
+      "type": "string",
+      "format": "uri",
+      "description": "The tool that wrote the profile (OpenLineage BaseFacet)."
+    },
+    "_schemaURL": {
+      "const": "https://agenticstiger.github.io/flux/engine/spec/profile/1-0-0/FluxProfile.json",
+      "description": "This schema's $id (OpenLineage BaseFacet)."
+    },
+    "encoding": {
+      "$ref": "#/$defs/Encoding"
+    },
+    "disclosureRules": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/DisclosureRule"
+      }
+    },
+    "tables": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Table"
+      }
+    },
+    "relationships": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Relationship"
+      }
+    },
+    "queries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Query"
+      }
+    }
+  },
+  "$defs": {
+    "Count": {
+      "description": "A count: a JSON integer from 0 to 2^53 - 1.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "Decimal": {
+      "description": "An exact decimal written as a string: no exponent, no plus sign, no leading zeros, and at most 1000 digits.",
+      "type": "string",
+      "maxLength": 1002,
+      "pattern": "^-?(?=(?:\\.?[0-9]){1,1000}$)(0|[1-9][0-9]*)(\\.[0-9]+)?$"
+    },
+    "UnitInterval": {
+      "description": "A decimal string from 0 to 1.",
+      "allOf": [
+        {
+          "$ref": "#/$defs/Decimal"
+        },
+        {
+          "pattern": "^(0(\\.[0-9]+)?|1(\\.0+)?)$"
+        }
+      ]
+    },
+    "Units": {
+      "description": "An integer on the grid, written as a string with at most 1000 digits, as S writes an encoded sum.",
+      "type": "string",
+      "maxLength": 1001,
+      "pattern": "^-?(0|[1-9][0-9]{0,999})$"
+    },
+    "Name": {
+      "description": "A non-empty name, in Unicode Normalization Form C.",
+      "type": "string",
+      "minLength": 1
+    },
+    "GroupKey": {
+      "description": "A group key: the empty string for an ungrouped statistic.",
+      "type": "string"
+    },
+    "Status": {
+      "description": "An SDMX CL_CONF_STATUS 1.4 code; F is published.",
+      "enum": [
+        "A",
+        "C",
+        "D",
+        "E",
+        "F",
+        "G",
+        "M",
+        "N",
+        "O",
+        "P",
+        "S",
+        "T",
+        "X"
+      ]
+    },
+    "SuppressedStatus": {
+      "description": "A CL_CONF_STATUS code other than F.",
+      "enum": [
+        "A",
+        "C",
+        "D",
+        "E",
+        "G",
+        "M",
+        "N",
+        "O",
+        "P",
+        "S",
+        "T",
+        "X"
+      ]
+    },
+    "SampleSize": {
+      "description": "The band the number of records behind a statistic lies in.",
+      "type": "object",
+      "required": [
+        "min"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "min": {
+          "$ref": "#/$defs/Count"
+        },
+        "max": {
+          "$ref": "#/$defs/Count"
+        }
+      }
+    },
+    "Encoding": {
+      "type": "object",
+      "required": [
+        "fractionalBits",
+        "rounding"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "fractionalBits": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 128
+        },
+        "rounding": {
+          "const": "floor"
+        }
+      }
+    },
+    "DisclosureRule": {
+      "description": "A disclosure rule in ACRO's terms; an absent field was not applied.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "minimumCell": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "zerosDisclosive": {
+          "type": "boolean"
+        },
+        "roundingBase": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "dominance": {
+          "type": "object",
+          "required": [
+            "n",
+            "k"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "n": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "k": {
+              "$ref": "#/$defs/UnitInterval"
+            }
+          }
+        },
+        "pRatio": {
+          "$ref": "#/$defs/UnitInterval"
+        }
+      }
+    },
+    "SuppressedGroup": {
+      "type": "object",
+      "required": [
+        "group",
+        "status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "$ref": "#/$defs/GroupKey"
+        },
+        "status": {
+          "$ref": "#/$defs/SuppressedStatus"
+        }
+      }
+    },
+    "MeanGroup": {
+      "type": "object",
+      "required": [
+        "group",
+        "k",
+        "status",
+        "Sx"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "$ref": "#/$defs/GroupKey"
+        },
+        "k": {
+          "$ref": "#/$defs/Count"
+        },
+        "status": {
+          "const": "F"
+        },
+        "Sx": {
+          "$ref": "#/$defs/Units"
+        }
+      }
+    },
+    "MarginalHistogramGroup": {
+      "type": "object",
+      "required": [
+        "group",
+        "k",
+        "status",
+        "binCounts"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "$ref": "#/$defs/GroupKey"
+        },
+        "k": {
+          "$ref": "#/$defs/Count"
+        },
+        "status": {
+          "const": "F"
+        },
+        "binCounts": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Count"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "cellStatus": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Status"
+          }
+        }
+      }
+    },
+    "LevelHistogramGroup": {
+      "type": "object",
+      "required": [
+        "group",
+        "k",
+        "status",
+        "levelCounts"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "$ref": "#/$defs/GroupKey"
+        },
+        "k": {
+          "$ref": "#/$defs/Count"
+        },
+        "status": {
+          "const": "F"
+        },
+        "levelCounts": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Count"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "cellStatus": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Status"
+          }
+        }
+      }
+    },
+    "SupportGroup": {
+      "type": "object",
+      "required": [
+        "group",
+        "k",
+        "status",
+        "support"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "$ref": "#/$defs/GroupKey"
+        },
+        "k": {
+          "$ref": "#/$defs/Count"
+        },
+        "status": {
+          "const": "F"
+        },
+        "support": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Name"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "CorrelationGroup": {
+      "type": "object",
+      "required": [
+        "group",
+        "k",
+        "status",
+        "Sx",
+        "Sy",
+        "Sxx",
+        "Sxy",
+        "Syy"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "$ref": "#/$defs/GroupKey"
+        },
+        "k": {
+          "$ref": "#/$defs/Count"
+        },
+        "status": {
+          "const": "F"
+        },
+        "Sx": {
+          "$ref": "#/$defs/Units"
+        },
+        "Sy": {
+          "$ref": "#/$defs/Units"
+        },
+        "Sxx": {
+          "$ref": "#/$defs/Units"
+        },
+        "Sxy": {
+          "$ref": "#/$defs/Units"
+        },
+        "Syy": {
+          "$ref": "#/$defs/Units"
+        }
+      }
+    },
+    "QuantileGroup": {
+      "type": "object",
+      "required": [
+        "group",
+        "k",
+        "status",
+        "quantileWitness",
+        "quantileBelow",
+        "quantileAtOrBelow"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "$ref": "#/$defs/GroupKey"
+        },
+        "k": {
+          "$ref": "#/$defs/Count"
+        },
+        "status": {
+          "const": "F"
+        },
+        "quantileWitness": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Units"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quantileBelow": {
+          "$ref": "#/$defs/Count"
+        },
+        "quantileAtOrBelow": {
+          "$ref": "#/$defs/Count"
+        }
+      }
+    },
+    "Mean": {
+      "type": "object",
+      "required": [
+        "definition",
+        "sampleSize",
+        "disclosure",
+        "groups"
+      ],
+      "properties": {
+        "definition": {
+          "const": "mean/1"
+        },
+        "sampleSize": {
+          "$ref": "#/$defs/SampleSize"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Name"
+        },
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/MeanGroup"
+              },
+              {
+                "$ref": "#/$defs/SuppressedGroup"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "MarginalHistogram": {
+      "type": "object",
+      "required": [
+        "definition",
+        "sampleSize",
+        "disclosure",
+        "groups",
+        "bins"
+      ],
+      "properties": {
+        "definition": {
+          "const": "marginalHistogram/1"
+        },
+        "sampleSize": {
+          "$ref": "#/$defs/SampleSize"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Name"
+        },
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/MarginalHistogramGroup"
+              },
+              {
+                "$ref": "#/$defs/SuppressedGroup"
+              }
+            ]
+          }
+        },
+        "bins": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "$ref": "#/$defs/Decimal"
+          }
+        }
+      }
+    },
+    "LevelHistogram": {
+      "type": "object",
+      "required": [
+        "definition",
+        "sampleSize",
+        "disclosure",
+        "groups",
+        "levels"
+      ],
+      "properties": {
+        "definition": {
+          "const": "levelHistogram/1"
+        },
+        "sampleSize": {
+          "$ref": "#/$defs/SampleSize"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Name"
+        },
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/LevelHistogramGroup"
+              },
+              {
+                "$ref": "#/$defs/SuppressedGroup"
+              }
+            ]
+          }
+        },
+        "levels": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/Name"
+          }
+        }
+      }
+    },
+    "Support": {
+      "type": "object",
+      "required": [
+        "definition",
+        "sampleSize",
+        "disclosure",
+        "groups"
+      ],
+      "properties": {
+        "definition": {
+          "const": "support/1"
+        },
+        "sampleSize": {
+          "$ref": "#/$defs/SampleSize"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Name"
+        },
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/SupportGroup"
+              },
+              {
+                "$ref": "#/$defs/SuppressedGroup"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "Correlation": {
+      "type": "object",
+      "required": [
+        "definition",
+        "sampleSize",
+        "disclosure",
+        "groups"
+      ],
+      "properties": {
+        "definition": {
+          "const": "correlation/1"
+        },
+        "sampleSize": {
+          "$ref": "#/$defs/SampleSize"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Name"
+        },
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/CorrelationGroup"
+              },
+              {
+                "$ref": "#/$defs/SuppressedGroup"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "Quantile": {
+      "type": "object",
+      "required": [
+        "definition",
+        "sampleSize",
+        "disclosure",
+        "groups",
+        "level"
+      ],
+      "properties": {
+        "definition": {
+          "const": "quantile/1"
+        },
+        "sampleSize": {
+          "$ref": "#/$defs/SampleSize"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/Name"
+        },
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/QuantileGroup"
+              },
+              {
+                "$ref": "#/$defs/SuppressedGroup"
+              }
+            ]
+          }
+        },
+        "level": {
+          "$ref": "#/$defs/UnitInterval"
+        }
+      }
+    },
+    "ColumnStatistic": {
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Mean"
+            },
+            {
+              "$ref": "#/$defs/MarginalHistogram"
+            },
+            {
+              "$ref": "#/$defs/LevelHistogram"
+            },
+            {
+              "$ref": "#/$defs/Support"
+            },
+            {
+              "$ref": "#/$defs/Quantile"
+            }
+          ]
+        },
+        {
+          "properties": {
+            "groupBy": {
+              "$ref": "#/$defs/Name"
+            }
+          },
+          "required": []
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "PairStatistic": {
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Correlation"
+            }
+          ]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "PeriodStatistic": {
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Mean"
+            }
+          ]
+        },
+        {
+          "properties": {
+            "of": {
+              "$ref": "#/$defs/Name"
+            }
+          },
+          "required": [
+            "of"
+          ]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RelationshipStatistic": {
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Mean"
+            },
+            {
+              "$ref": "#/$defs/MarginalHistogram"
+            },
+            {
+              "$ref": "#/$defs/Quantile"
+            }
+          ]
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "QueryStatistic": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/LevelHistogram"
+        },
+        {
+          "properties": {
+            "levels": {
+              "const": [
+                "false",
+                "true"
+              ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "Metrics": {
+      "description": "OpenLineage's columnMetrics names, as integer counts and decimal strings.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure",
+                "value"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "count/1"
+                },
+                "status": {
+                  "const": "F"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                },
+                "value": {
+                  "$ref": "#/$defs/Count"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "count/1"
+                },
+                "status": {
+                  "$ref": "#/$defs/SuppressedStatus"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                }
+              }
+            }
+          ]
+        },
+        "nullCount": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure",
+                "value"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "nullCount/1"
+                },
+                "status": {
+                  "const": "F"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                },
+                "value": {
+                  "$ref": "#/$defs/Count"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "nullCount/1"
+                },
+                "status": {
+                  "$ref": "#/$defs/SuppressedStatus"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                }
+              }
+            }
+          ]
+        },
+        "distinctCount": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure",
+                "value"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "distinctCount/1"
+                },
+                "status": {
+                  "const": "F"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                },
+                "value": {
+                  "$ref": "#/$defs/Count"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "distinctCount/1"
+                },
+                "status": {
+                  "$ref": "#/$defs/SuppressedStatus"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                }
+              }
+            }
+          ]
+        },
+        "sum": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure",
+                "value"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "sum/1"
+                },
+                "status": {
+                  "const": "F"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                },
+                "value": {
+                  "$ref": "#/$defs/Decimal"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "sum/1"
+                },
+                "status": {
+                  "$ref": "#/$defs/SuppressedStatus"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                }
+              }
+            }
+          ]
+        },
+        "min": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure",
+                "value"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "min/1"
+                },
+                "status": {
+                  "const": "F"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                },
+                "value": {
+                  "$ref": "#/$defs/Decimal"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "min/1"
+                },
+                "status": {
+                  "$ref": "#/$defs/SuppressedStatus"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                }
+              }
+            }
+          ]
+        },
+        "max": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure",
+                "value"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "max/1"
+                },
+                "status": {
+                  "const": "F"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                },
+                "value": {
+                  "$ref": "#/$defs/Decimal"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "max/1"
+                },
+                "status": {
+                  "$ref": "#/$defs/SuppressedStatus"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                }
+              }
+            }
+          ]
+        },
+        "quantiles": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure",
+                "values"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "quantiles/1"
+                },
+                "status": {
+                  "const": "F"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                },
+                "values": {
+                  "type": "object",
+                  "minProperties": 1,
+                  "propertyNames": {
+                    "$ref": "#/$defs/UnitInterval"
+                  },
+                  "additionalProperties": {
+                    "$ref": "#/$defs/Decimal"
+                  }
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "definition",
+                "status",
+                "sampleSize",
+                "disclosure"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "definition": {
+                  "const": "quantiles/1"
+                },
+                "status": {
+                  "$ref": "#/$defs/SuppressedStatus"
+                },
+                "sampleSize": {
+                  "$ref": "#/$defs/SampleSize"
+                },
+                "disclosure": {
+                  "$ref": "#/$defs/Name"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "TimestampMetricValues": {
+      "description": "A timestamp column's min, max and quantile values: integer milliseconds since the epoch.",
+      "properties": {
+        "min": {
+          "properties": {
+            "value": {
+              "$ref": "#/$defs/Units"
+            }
+          }
+        },
+        "max": {
+          "properties": {
+            "value": {
+              "$ref": "#/$defs/Units"
+            }
+          }
+        },
+        "quantiles": {
+          "properties": {
+            "values": {
+              "additionalProperties": {
+                "$ref": "#/$defs/Units"
+              }
+            }
+          }
+        }
+      }
+    },
+    "Column": {
+      "type": "object",
+      "required": [
+        "domain"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "enum": [
+            "category",
+            "number",
+            "timestamp"
+          ]
+        },
+        "metrics": {
+          "$ref": "#/$defs/Metrics"
+        },
+        "statistics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnStatistic"
+          }
+        }
+      },
+      "if": {
+        "required": [
+          "domain"
+        ],
+        "properties": {
+          "domain": {
+            "const": "timestamp"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "metrics": {
+            "$ref": "#/$defs/TimestampMetricValues"
+          }
+        }
+      }
+    },
+    "Table": {
+      "type": "object",
+      "required": [
+        "columns"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "rowCount": {
+          "$ref": "#/$defs/Count"
+        },
+        "columns": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "columnPairs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "columns",
+              "statistics"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "columns": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {
+                  "$ref": "#/$defs/Name"
+                }
+              },
+              "statistics": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/PairStatistic"
+                }
+              }
+            }
+          }
+        },
+        "periods": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "column",
+              "period",
+              "statistics"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "column": {
+                "$ref": "#/$defs/Name"
+              },
+              "period": {
+                "const": "P1M"
+              },
+              "statistics": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/PeriodStatistic"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "Key": {
+      "type": "object",
+      "required": [
+        "table",
+        "columns"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "table": {
+          "$ref": "#/$defs/Name"
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Name"
+          }
+        }
+      }
+    },
+    "Relationship": {
+      "type": "object",
+      "required": [
+        "parent",
+        "child",
+        "statistics"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "parent": {
+          "$ref": "#/$defs/Key"
+        },
+        "child": {
+          "$ref": "#/$defs/Key"
+        },
+        "statistics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RelationshipStatistic"
+          }
+        }
+      }
+    },
+    "Query": {
+      "type": "object",
+      "required": [
+        "name",
+        "statistics"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/Name"
+        },
+        "statistics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/QueryStatistic"
+          }
+        }
+      }
+    }
+  }
+}

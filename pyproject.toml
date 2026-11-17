@@ -394,6 +394,18 @@ lineage = [
   "python-dateutil>=2.8.2",
 ]
 
+# ``fluid profile``: FLUX's profiler (flux-engine ADR 0003, amended 2026-11-16).
+# It reads an expose's records where they live and writes a profile document of
+# output-checked aggregates (PROFILE-SPEC 1-0-0). DuckDB reads the CSV, Parquet
+# and database sources through the sandbox ``fluid init --discover`` uses, with
+# the same floor as ``[local]``. The canonical JSON comes from ``rfc8785``, a base
+# dependency. ``flux-stats``, the statistic registry the profile's numbers are
+# formed by (MEAS-3), joins this extra once it is published; until then
+# ``fluid profile`` says so and reads nothing.
+profile = [
+  "duckdb>=1.5.0",
+]
+
 # AI + MCP together: restores the pre-0.28.0 base behaviour (the
 # ``fastapi[standard]`` precedent).
 standard = [
@@ -534,7 +546,7 @@ test-emulators-heavy = [
 
 # One-shot install for contributors
 all = [
-  "data-product-forge[local,aws,gcp,snowflake,viz,odps,tui,copilot,postgres,docs,litellm,mcp,lineage,dev]"
+  "data-product-forge[local,aws,gcp,snowflake,viz,odps,tui,copilot,postgres,docs,litellm,mcp,lineage,profile,dev]"
 ]
 
 [project.scripts]
@@ -905,6 +917,15 @@ module = [
     # misspelt verdict code fail here instead of falling through.
     "fluid_build.build_runners._deployment_host_policy",
     "fluid_build.streaming.policy",
+    # fluid profile: the output checks, the document and the parts around them
+    # decide which aggregate leaves the data owner's environment, so a silent
+    # Any is a silent leak.
+    "fluid_build.profiler._stats",
+    "fluid_build.profiler.disclosure",
+    "fluid_build.profiler.document",
+    "fluid_build.profiler.runner",
+    "fluid_build.profiler.sources",
+    "fluid_build.cli.profile_cmd",
 ]
 strict = true
 
