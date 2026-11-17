@@ -30,6 +30,18 @@ Each sha256 was computed from the artifact downloaded from Maven Central or
 packages.confluent.io, whose published sha1 matched. ``checksum_sha256`` is what S3
 reports for a single-part upload made with ``--checksum-algorithm SHA256``: the base64 of
 the digest.
+
+What the check covers: ``tofu plan`` and ``apply`` read each object and refuse a digest
+that is not the pin. A Glue run reads the jars when it starts, which no plan sees, so the
+platform keeps the prefix write-once: only its own principal may ``s3:PutObject`` there,
+with S3 Object Lock (or a bucket policy that denies overwriting) on the prefix.
+
+Filling the prefix (the platform, once per Glue release): download each jar below from
+Maven Central or packages.confluent.io, check its sha256 against this table, and upload it
+single-part with ``aws s3 cp <jar> s3://<bucket>/<prefix>/<file> --checksum-algorithm
+SHA256`` (:func:`upload_commands`). A recent AWS CLI defaults to CRC64NVME, which leaves no
+SHA-256 for the check. The applier needs ``s3:GetObject`` (and ``kms:Decrypt`` for SSE-KMS)
+on those keys; the job role gets exactly that.
 """
 
 from __future__ import annotations
@@ -57,6 +69,25 @@ class GlueJar:
     sha256_b64: str  # as S3 reports checksum_sha256
 
 
+# verified on Glue 5.0 (2026-11-17), ca-central-1, two gluestreaming probe runs.
+#: What Glue 5.0 ships, by loading each class (probe 1, no extra jars). A later Glue
+#: release that drops or changes one of these needs this table and the lock re-checked.
+GLUE5_BUNDLED: Mapping[str, str] = {
+    "spark": "3.5.4-amzn-0 (Scala 2.12.18)",
+    "spark-sql-kafka-0-10_2.12": "3.5.4-amzn-0, /usr/lib/spark/connector/lib",
+    "spark-token-provider-kafka-0-10_2.12": "3.5.4-amzn-0, /usr/lib/spark/connector/lib",
+    "kafka-clients": "3.4.1, /usr/share/aws/glue-streaming/lib",
+    "commons-pool2": "2.11.1, /usr/share/aws/glue-streaming/lib",
+    "aws-msk-iam-auth": "2.2.0, /usr/share/aws/glue-streaming/lib",
+    "spark-avro_2.12": "3.5.4-amzn-0",
+    "iceberg-spark-runtime-3.5_2.12": "1.7.1-amzn-1 (--datalake-formats iceberg)",
+    "abris": "absent",
+    "confluent schema-registry client": "only inside hudi-utilities-bundle_2.12-0.15.0-amzn-5",
+}
+#: Probe 2 (these jars, --user-jars-first): ABRiS from_avro decoded a Confluent-framed
+#: record from a registry the driver served; CachedSchemaRegistryClient and RestService
+#: loaded from kafka-schema-registry-client-6.2.1.jar, ABRiS from abris_2.12-6.4.0.jar, and
+#: AvroDataToCatalyst from Glue's spark-avro. The set is used as proven: none is dropped.
 #: What a Confluent Avro (``avro-confluent``) build adds on Glue 5.
 AVRO_JARS: Tuple[GlueJar, ...] = (
     GlueJar(

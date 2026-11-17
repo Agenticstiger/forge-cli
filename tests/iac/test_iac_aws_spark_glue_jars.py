@@ -19,7 +19,7 @@ from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.module import build_module
 from fluid_build.iac.providers import aws_glue_jars, aws_identity
 from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV
-from tests.iac.test_iac_aws_spark_infra import CONTRACT, KEY, VIRTUAL_CLUSTER
+from tests.iac.test_iac_aws_spark_infra import CONTRACT, KEY, MSK_ARN, VIRTUAL_CLUSTER
 
 pytestmark = [pytest.mark.unit, pytest.mark.provider]
 
@@ -38,7 +38,7 @@ def operator(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(
         aws_identity.TARGET_ALLOWLIST_ENV,
-        f"emr-serverless:00fabc123def,emr-eks:{VIRTUAL_CLUSTER}",
+        f"emr-serverless:00fabc123def,emr-eks:{VIRTUAL_CLUSTER},msk:{MSK_ARN}",
     )
     monkeypatch.setenv(HOST_ALLOWLIST_ENV, "example.internal")
     monkeypatch.setenv(
@@ -108,6 +108,19 @@ def test_a_malformed_prefix_is_refused(monkeypatch):
     with pytest.raises(UnsupportedBindingError) as caught:
         emit(glue(avro=True))
     assert caught.value.kind == "spark-glue-jars-url"
+    assert any(
+        aws_glue_jars.JARS_URL_ENV in w for w in aws_identity.validation_warnings(glue(avro=True))
+    )
+
+
+def test_a_key_only_avro_stream_needs_the_jars_too():
+    config = {"source": {"value": {"format": "json"}, "key": {"format": "avro-confluent"}}}
+    assert aws_glue_jars.needed_jars(config) == aws_glue_jars.AVRO_JARS
+
+
+def test_the_bucket_root_is_a_valid_jar_prefix():
+    location = aws_glue_jars.jars_location({aws_glue_jars.JARS_URL_ENV: "s3://platform-jars"})
+    assert location.key(aws_glue_jars.AVRO_JARS[0]) == "abris_2.12-6.4.0.jar"
 
 
 def test_an_avro_build_loads_exactly_the_pinned_jars_and_checks_each(monkeypatch):

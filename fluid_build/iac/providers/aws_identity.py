@@ -422,6 +422,11 @@ def _glue_jar_warnings(contract: Mapping[str, Any]) -> List[str]:
     from . import aws_glue_jars
 
     out = []
+    try:
+        location = aws_glue_jars.jars_location()
+        malformed = None
+    except ValueError as exc:
+        location, malformed = None, str(exc)
     for build in _spark_builds_or_empty(contract):
         if (spark_parameters(build) or {}).get("runtime") != "glue":
             continue
@@ -433,10 +438,12 @@ def _glue_jar_warnings(contract: Mapping[str, Any]) -> List[str]:
                 contract_sql_gate=False,
                 host_gate=False,
             ).config
-            unset = aws_glue_jars.needed_jars(config) and aws_glue_jars.jars_location() is None
+            needed = bool(aws_glue_jars.needed_jars(config))
         except Exception:  # noqa: BLE001 - the Spark compiler's validation reports it
             continue
-        if unset:
+        if needed and malformed:
+            out.append(f"Spark build {build.get('id')}: {malformed}; the IaC is refused")
+        elif needed and location is None:
             out.append(
                 f"Spark build {build.get('id')}: Confluent Avro on Glue needs the pinned "
                 f"jars, and {aws_glue_jars.JARS_URL_ENV} names no prefix; the IaC is refused "

@@ -451,11 +451,12 @@ def _emit_build(
         args["--TempDir"] = b.object_uri(b.artifacts + "tmp/")
         if jars:
             args["--extra-jars"] = ",".join(uri for _, uri, _ in jars)
-            # Glue 5's Hudi bundle carries its own Confluent client classes.
+            # Glue 5's hudi-utilities bundle carries its own copy of the Confluent
+            # registry client classes; ours must win (measured: with this flag the client
+            # loads from our pinned jar). Only Avro builds add jars, so only they set it.
             args["--user-jars-first"] = "true"
-            blocks.resources["aws_glue_job"][b.key]["lifecycle"] = {
-                "precondition": [check for _, _, check in jars]
-            }
+            lifecycle = blocks.resources["aws_glue_job"][b.key].setdefault("lifecycle", {})
+            lifecycle.setdefault("precondition", []).extend(check for _, _, check in jars)
         if vpc:
             _glue_connection(blocks, b, cluster)
         target = tofu_ref(f"aws_glue_job.{b.key}.name")
