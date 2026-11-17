@@ -288,6 +288,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client id names; forge used to blank it for any type but `oauth-m2m`. The client id is now
   required for them, and `tofu` gets GitHub's `ACTIONS_ID_TOKEN_REQUEST_*` for `github-oidc` only.
 
+- **`fluid ship` is now the canonical 11-stage pipeline runner, the same on a laptop and in CI.**
+  It runs `bundle`, `validate`, `generate artifacts`, `validate artifacts`, `diff`, `plan`,
+  `apply`, `policy-apply` and `verify`, plus `publish` (`--publish`) and `schedule-sync`
+  (`--schedule-sync`), each as its own `fluid` process with the argv the generated CI files
+  use (a test runs both and compares). Select stages with `--stage 6-9`, `--until plan` and
+  `--skip-stage`, see the resolved plan with `--explain`, and set mode, build id, data-loss and
+  digest overrides, targets and scheduler with flags or the `APPLY_MODE`, `APPLY_BUILD_ID`,
+  `PUBLISH_TARGETS`, `SCHEDULER` ... variables the pipelines already export (flag, then
+  variable, then default). Breaking changes:
+  - `apply` runs the reviewed `runtime/plan.json` against `runtime/bundle.tgz`, never a
+    re-plan from the contract.
+  - `diff`, `policy-apply` and `verify` now run, and `validate` and `validate-artifacts` are
+    strict by default (`--no-strict` drops it). `--env` defaults to `dev`.
+  - `--skip-plan` is removed and exits 2; `--stage` and `--until` replace it.
+  - `--skip-bundle` is ignored: ship always bundles, so no stage plans or applies a stale
+    `runtime/bundle.tgz`.
+  - The exit status is ship's own: 0 every selected stage passed or was skipped, 1 a stage
+    failed, 2 ship refused its arguments, 3 a stage failed after apply changed something (those
+    changes are live), 130 interrupted. Ship no longer relays the failing stage's exit code,
+    which the run report keeps: a stage's own 2 (`diff` could not inspect a target) read as a
+    refused argument, and no code told a caller that apply had already changed something.
+  - A contract outside the current directory runs in its own directory (its `runtime/` lands
+    beside it). A contract stage 1 would refuse (no file, a symlink, a system path) or an
+    environment name a stage would refuse exits 2 before anything is written.
+  - Every run that starts a stage writes `runtime/ship-report.json` and
+    `runtime/ship-junit.xml` (`--report-dir`; a relative path is taken from the current
+    directory). Calls that continue one run (same run id, env, mode and contract) merge into
+    one report, each call keeping its own records for the stages it selected; a run that
+    bundles starts a new one. `--publish` and `--schedule-sync` add their stage under `--stage`
+    too. Output is grouped for GitHub Actions, GitLab and Azure Pipelines (`--ci-output`). On
+    GitHub nothing a stage prints, nor ship's own reading of the contract and its overlays,
+    can issue a workflow command.
 - **The secret destination policy covers every scheme, not only `env://`.** A value from
   `vault://`, `aws-sm://`, `file://` or a pack is sent to a host that leaves this machine only
   when the operator allows it: `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` keeps `NAME` and

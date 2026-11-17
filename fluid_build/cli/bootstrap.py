@@ -466,7 +466,7 @@ CORE_COMMANDS: Tuple[CoreCommand, ...] = (
     CoreCommand(
         "ship",
         "ship",
-        (_cmd("ship", "Run validate → bundle → plan → apply in sequence (the happy path)"),),
+        (_cmd("ship", "Run the 11-stage pipeline: bundle → validate → … → apply → verify"),),
     ),
     CoreCommand(
         "apply",
