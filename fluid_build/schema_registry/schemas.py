@@ -212,9 +212,23 @@ def json_schema(columns: Sequence[Mapping[str, Any]], *, title: str) -> Dict[str
     }
 
 
-def registry_format(stream_format: str) -> str:
-    """The registry's schema type for a FLUID value format: ``AVRO`` or ``JSON``."""
-    return "JSON" if stream_format in ("json", "json-confluent") else "AVRO"
+#: The value formats a consumed subject is checked in, as the registry names them.
+_REGISTRY_FORMATS = {
+    "json": "JSON",
+    "json-confluent": "JSON",
+    "avro": "AVRO",
+    "avro-confluent": "AVRO",
+}
+
+
+def registry_format(stream_format: str) -> Optional[str]:
+    """The registry's schema type for a stream's value format: ``AVRO`` or ``JSON``.
+
+    ``None`` for any other format: the check refuses it, never reads it as Avro. The
+    0.7.7 schema allows only ``json`` and ``avro-confluent`` on a stream, and ``fluid
+    plan`` validates first, so only an unvalidated contract gets here with another.
+    """
+    return _REGISTRY_FORMATS.get(stream_format)
 
 
 def derive(

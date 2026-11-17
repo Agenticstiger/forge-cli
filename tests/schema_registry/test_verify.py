@@ -202,6 +202,16 @@ class TestConfluent:
         assert "holds a JSON schema" in error and "reads AVRO" in error
         assert not any(c[0] == "check_compatibility" for c in client.calls)
 
+    @pytest.mark.parametrize("fmt", ["protobuf", "xml"])
+    def test_a_format_the_check_does_not_read_is_refused_not_read_as_avro(self, fmt):
+        # Regression (#913): any format other than json/avro-confluent fell through to
+        # AVRO, so an unvalidated protobuf stream was compared as Avro. Now it is
+        # refused before a client is built (run() fails the test if one is).
+        records, errors, _ = run(confluent_contract(fmt=fmt))
+        (error,) = errors
+        assert f"format {fmt!r} is not one the registry check reads" in error
+        assert records[0]["result"] == "incompatible"
+
     def test_json_stream_against_an_avro_subject_is_an_error(self):
         _, errors, _ = run(confluent_contract(fmt="json"), confluent=FakeConfluent())
         assert errors and "holds a AVRO schema" in errors[0] and "reads JSON" in errors[0]
