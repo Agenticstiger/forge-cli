@@ -17,12 +17,12 @@ run match the contract, idempotently:
 4. No running job: start one, unless the last run with this hash failed. On EMR Serverless a
    streaming job retries by itself until it fails more often than ``maxFailedAttemptsPerHour``
    in an hour, and then stops: starting it again would fail the same way, so that run is an
-   error, with its id and reason, until the build changes or the operator restarts it
-   (``fluid spark run --restart``).
+   error, with its id and reason, until the build changes.
 
 A scheduled build (batch, or a stream with ``trigger.availableNow``) is never reconciled:
-its scheduler starts it with :func:`run_once` (``fluid spark run``), which waits for the run
-to end and cancels it on Ctrl-C, SIGTERM or SIGHUP, as ``_databricks_job_run`` does.
+its scheduler starts it through ``fluid apply --mode amend-and-build --build-id <id>``, whose
+build phase calls :func:`run_build` and so :func:`run_once`, which waits for the run to end
+and cancels it on Ctrl-C, SIGTERM or SIGHUP, as ``_databricks_job_run`` does.
 
 Polling follows the databricks-sdk run waiter already adapted in ``_databricks_job_run``: a
 poll a second longer each time, at most :data:`MAX_POLL_S`.
@@ -56,7 +56,8 @@ MAX_FAILED_READS = 5
 #: How long a reconcile waits for a cancelled run to stop, and for a started one to leave
 #: its pending states; ``FLUID_SPARK_WAIT_SECONDS`` overrides both.
 DEFAULT_WAIT_S = 900
-#: How long ``fluid spark run`` waits for a scheduled run to end (``--timeout`` overrides).
+#: How long a scheduled run may take before it is cancelled, unless the build says
+#: (``execution.runtime.timeout``).
 DEFAULT_RUN_WAIT_S = 6 * 3600
 WAIT_ENV = "FLUID_SPARK_WAIT_SECONDS"
 
@@ -121,8 +122,8 @@ class _Clock:
         """Poll ``read`` until ``done`` or the budget is spent; the last read either way.
 
         A read that fails (a throttled call) is tried again; :data:`MAX_FAILED_READS` in a
-        row raise the last error, and the run is left as it is (a retried ``fluid spark
-        run`` adopts it), as the Databricks job-run waiter does."""
+        row raise the last error, and the run is left as it is (a retried build adopts
+        it), as the Databricks job-run waiter does."""
         deadline = self.now() + budget
         delay = 1.0
         info = read()
@@ -203,8 +204,8 @@ def _reconcile_one(
         out.action, out.error, out.run_id, out.state = "failed", True, last.run_id, last.state
         out.message = (
             f"{_failure_text(last)}. It is not started again with the same config, which "
-            "would fail the same way: fix the cause, then run fluid spark run "
-            f"<contract> --build-id {run.build} --restart, or change the build"
+            "would fail the same way: fix the cause and change the build, and fluid apply "
+            "starts the new config"
         )
         return out
     if dry_run:
@@ -242,7 +243,7 @@ def _reconcile_one(
         out.error = True
         out.message = _failure_text(started)
     elif started.state == PENDING:
-        out.message = f"still starting after {int(budget)} s; fluid spark status follows it"
+        out.message = f"still starting after {int(budget)} s; the next fluid apply reports it"
     return out
 
 
@@ -293,7 +294,10 @@ def _scheduled(run: DesiredRun) -> Outcome:
         run.build,
         run.runtime,
         "scheduled",
-        message=f"a scheduler starts it: fluid spark run <contract> --build-id {run.build}",
+        message=(
+            "a scheduler starts it: fluid apply <contract> --mode amend-and-build "
+            f"--build-id {run.build}"
+        ),
     )
 
 
@@ -345,27 +349,25 @@ def run_once(
     run: DesiredRun,
     *,
     clients: Optional[ClientFactory] = None,
-    wait: bool = True,
     timeout: float = DEFAULT_RUN_WAIT_S,
-    restart: bool = False,
     say: Callable[[str], None] = print,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
-    env: Optional[Mapping[str, str]] = None,
 ) -> Outcome:
-    """``fluid spark run``: one run of a build, for a scheduler.
+    """One run of a scheduled build, for its scheduler (:func:`run_build`): start it and wait
+    for it to end. The outcome is an error unless it SUCCEEDED. Ctrl-C, SIGTERM or SIGHUP
+    while it is waited on cancel it, and the outcome is ``cancelled`` (an error).
 
-    A scheduled build starts a run and, with ``wait``, waits for it to end; the outcome is an
-    error unless it SUCCEEDED. Ctrl-C, SIGTERM or SIGHUP while it is waited on cancel it, and
-    the outcome is ``cancelled`` (an error), so ``--json`` still prints its one line.
-    A long-running build is reconciled instead (``restart`` starts it again after a failure).
+    Raises:
+        ValueError: ``run`` is a stream; ``fluid apply`` keeps it running (:func:`reconcile`).
     """
     from fluid_build.build_runners._databricks_job_run import interrupt_guard
 
     if not run.scheduled:
-        return reconcile(
-            [run], clients=clients, restart_failed=restart, sleep=sleep, now=now, env=env
-        )[0]
+        raise ValueError(
+            f"Spark build {run.build} is a stream that fluid apply keeps running; it has no "
+            "run to start and wait for"
+        )
     started: List[str] = []
     try:
         adapter = adapter_for(run, clients)
@@ -399,9 +401,6 @@ def run_once(
                     started.append(adapter.start(_token(run)))
                     say(f"Spark {run.build}: started run {started[0]} on {out.where}")
                 run_id = out.run_id = started[0]
-                if not wait:
-                    out.state = adapter.get(run_id).state
-                    return out
                 ended = clock.until(
                     lambda: adapter.get(run_id), lambda i: i.state in TERMINAL, timeout
                 )
@@ -441,30 +440,82 @@ def run_once(
         return failed
 
 
-def status(
-    runs: Sequence[DesiredRun], *, clients: Optional[ClientFactory] = None, limit: int = 5
-) -> List[Dict[str, Any]]:
-    """Each build's recent runs, newest first, and whether the newest runs the contract's config."""
-    rows = []
-    for run in runs:
-        row: Dict[str, Any] = {
-            "build": run.build,
-            "runtime": run.runtime,
-            "configHash": run.config_hash,
-        }
+def run_build(
+    contract: Mapping[str, Any],
+    build: Mapping[str, Any],
+    *,
+    dry_run: bool,
+    say: Callable[[str], None] = print,
+    clients: Optional[ClientFactory] = None,
+) -> Optional[int]:
+    """The build phase of ``fluid apply --mode amend-and-build`` for one Spark build: how its
+    scheduler runs it.
+
+    A scheduled build (batch, or a stream triggered ``availableNow``) gets one run, waited for
+    until it ends or ``execution.runtime.timeout`` (:data:`DEFAULT_RUN_WAIT_S` when unset)
+    passes: 0 when it SUCCEEDED, 1 otherwise. A dry run says what it would start and reads
+    nothing from AWS. A stream ``fluid apply`` keeps running (its ``spark.reconcile`` action)
+    has no run to start: ``None``.
+
+    Raises:
+        FluidUserError: the operator's policy refuses the build.
+        ValueError: the build does not compile, or :func:`run_refusal` names why it cannot
+            run; nothing was started.
+        KeyboardInterrupt: Ctrl-C, SIGTERM or SIGHUP while the run was waited on; the run
+            was cancelled, and the apply stops as an interrupt always stops it.
+    """
+    import copy
+
+    from fluid_build._contract_loader import resolve_contract_env_templates
+    from fluid_build.build_runners.spark._desired import desired_runs
+    from fluid_build.spark.compiler import run_timeout_seconds
+
+    bid = str(build.get("id"))
+    refusal = run_refusal(contract, build)
+    if refusal:
+        raise ValueError(refusal)
+    # As fluid plan and fluid apply read it: ``{{ env.* }}`` resolved.
+    resolved = resolve_contract_env_templates(copy.deepcopy(dict(contract)))
+    runs = desired_runs(resolved, build_id=bid)
+    if not runs:
+        raise ValueError(
+            f"Spark build {bid}: forge's Spark runner runs a build of engine: spark with "
+            "properties.parameters.spark; this one is not, so nothing runs it"
+        )
+    run = runs[0]
+    if not run.scheduled:
+        return None
+    timeout = run_timeout_seconds(build) or DEFAULT_RUN_WAIT_S
+    if dry_run:
+        say(
+            f"Spark {run.build} ({run.runtime}): would start one run and wait up to "
+            f"{int(timeout)} s for it to end"
+        )
+        return 0
+    outcome = run_once(run, clients=clients, timeout=timeout, say=say)
+    say(outcome.line())
+    if outcome.action == "cancelled":
+        raise KeyboardInterrupt  # the run was cancelled; stop the apply, as Ctrl-C does
+    return 1 if outcome.error else 0
+
+
+def run_refusal(contract: Mapping[str, Any], build: Mapping[str, Any]) -> Optional[str]:
+    """Why :func:`run_build` would refuse ``build`` without starting anything, else ``None``:
+    a contract before the managed lane (fluidVersion 0.7.7), or a run that ends on its own
+    with an ``execution.runtime.timeout`` it cannot read. Reads no cloud, so ``fluid apply``
+    checks it before ``tofu apply`` changes anything."""
+    from fluid_build.spark.compiler import run_timeout_seconds, runs_to_completion
+    from fluid_build.streaming.compiler import managed_lane_enabled
+
+    bid = build.get("id")
+    if not managed_lane_enabled(contract):
+        return (
+            f"Spark build {bid}: forge's Spark runner reads a contract of fluidVersion 0.7.7 "
+            "or later; this one is not, so nothing runs it"
+        )
+    if runs_to_completion(build):
         try:
-            adapter = adapter_for(run, clients)
-            row["where"] = adapter.where()
-            history = adapter.runs()[:limit]
-            row["runs"] = [
-                {
-                    **h.as_dict(),
-                    "details": _clean(h.details),
-                    "current": h.config_hash == run.config_hash,
-                }
-                for h in history
-            ]
-        except Exception as exc:  # noqa: BLE001 - one build's error is its row
-            row["error"] = _error_outcome(run, exc).message
-        rows.append(row)
-    return rows
+            run_timeout_seconds(build)
+        except ValueError as exc:
+            return f"Spark build {bid}: {exc}"
+    return None

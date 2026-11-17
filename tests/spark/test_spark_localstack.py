@@ -1,8 +1,9 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""The Spark lane on LocalStack: ``fluid spark run`` starts the runner on Glue 5, EMR
-Serverless and EMR on EC2, against MSK, the Glue catalog, S3 and Secrets Manager.
+"""The Spark lane on LocalStack: the build phase of ``fluid apply --mode amend-and-build
+--build-id`` (the path a scheduler runs) starts the runner on Glue 5, EMR Serverless and EMR
+on EC2, against MSK, the Glue catalog, S3 and Secrets Manager.
 
 Opt-in: ``FLUID_SPARK_LOCALSTACK=1`` and a LocalStack Pro at ``FLUID_LOCALSTACK_ENDPOINT``
 (default ``http://localhost:4566``) with glue, emr-serverless, emr, kafka, s3 and
@@ -27,10 +28,11 @@ What LocalStack runs (measured on LocalStack Pro 2026.8.2):
   here, and the uploaded config of an ARN read without IAM has ``tls`` set to false.
 - EMR on EKS is not emulated.
 
-Nothing in forge yet provisions a Spark build's infrastructure, so the test does it in that
-lane's place: the Glue job, the EMR Serverless application, the EMR cluster and the Iceberg
-tables, the upload of ``job.json`` and the runner, and ``${fluid_msk_bootstrap_brokers}``
-filled in from ``get-bootstrap-brokers``.
+The test provisions what ``tofu apply`` would, in its place (the IaC round-trips are
+``tests/iac``'s): the Glue job, the EMR Serverless application, the EMR cluster and the
+Iceberg tables, the upload of ``job.json`` and the runner, and
+``${fluid_msk_bootstrap_brokers}`` filled in from ``get-bootstrap-brokers``. Then it runs the
+build phase that follows ``tofu apply`` (``build_runners.run_builds_from_args``).
 """
 
 from __future__ import annotations
@@ -421,14 +423,39 @@ def _provision(stack, contract, tmp_path, *, fill_brokers=True):
     return run, json.loads(run.job_text), str(path)
 
 
-def _fluid(capsys, *argv):
-    from fluid_build.cli import main
+def _apply_build(monkeypatch, path, build_id):
+    """The build phase of ``fluid apply <contract> --mode amend-and-build --build-id
+    <build_id>``: its exit code and the outcome of the build's run (``None`` when no run
+    was started)."""
+    import argparse
+    import logging
 
-    capsys.readouterr()
-    code = main(list(argv))
-    out = capsys.readouterr().out
-    lines = [line for line in out.splitlines() if line.startswith(("{", "["))]
-    return code, json.loads(lines[-1]) if lines else out
+    from fluid_build.build_runners import base
+    from fluid_build.build_runners.spark import _reconcile
+
+    outcomes = []
+    real = _reconcile.run_once
+
+    def run_once(*args, **kwargs):
+        outcome = real(*args, **kwargs)
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(_reconcile, "run_once", run_once)
+    args = argparse.Namespace(
+        contract=path,
+        build_id=build_id,
+        dry_run=False,
+        fail_fast=True,
+        delay=0,
+        no_output=True,
+        sample_rows=None,
+        env=None,
+        mode="amend-and-build",
+        allow_skipped_builds=False,
+    )
+    code = base.run_builds_from_args(args, logging.getLogger("spark-localstack"), force_run=True)
+    return code, outcomes[-1] if outcomes else None
 
 
 @pytest.fixture
@@ -501,9 +528,9 @@ def test_glue_streams_a_topic_into_an_iceberg_table(lane, capsys, tmp_path, monk
         topic=topic,
     )
 
-    code, outcome = _fluid(capsys, "spark", "run", path, "--build-id", "ingest-orders", "--json")
+    code, outcome = _apply_build(monkeypatch, path, "ingest-orders")
     assert code == 0, outcome
-    assert outcome["state"] == "SUCCEEDED", outcome
+    assert outcome.state == "SUCCEEDED", outcome
 
     rows = _helper(lane, _catalog(config), dump=[table])[table]
     assert rows == LINES
@@ -514,14 +541,10 @@ def test_glue_streams_a_topic_into_an_iceberg_table(lane, capsys, tmp_path, monk
     )
     assert checkpoint.get("KeyCount", 0) > 0
 
-    code, status = _fluid(capsys, "spark", "status", path, "--build-id", "ingest-orders", "--json")
-    assert code == 0, status
-    # LocalStack's GetJobRun(s) return no Arguments, so the run's --fluid-config-hash (and
-    # with it "current") cannot be read back here; AWS returns them.
-    assert status[0]["runs"][0]["state"] == "SUCCEEDED", status
 
-
-def test_a_config_left_with_the_broker_placeholder_fails_its_run(lane, capsys, tmp_path):
+def test_a_config_left_with_the_broker_placeholder_fails_its_run(
+    lane, capsys, tmp_path, monkeypatch
+):
     """The runner refuses a job config whose ${...} the uploader did not fill."""
     contract = _contract(
         lane,
@@ -534,8 +557,8 @@ def test_a_config_left_with_the_broker_placeholder_fails_its_run(lane, capsys, t
     contract["builds"][0]["properties"]["stream"]["trigger"] = {"availableNow": True}
     run, _, path = _provision(lane, contract, tmp_path, fill_brokers=False)
     _glue_job(lane, run.target["glueJobName"], run.runner_uri, run.role_arn)
-    code, outcome = _fluid(capsys, "spark", "run", path, "--build-id", "unfilled", "--json")
-    assert code == 1 and outcome["state"] == "FAILED", outcome
+    code, outcome = _apply_build(monkeypatch, path, "unfilled")
+    assert code == 1 and outcome.state == "FAILED", outcome
 
 
 def _seed(stack, config, table):
@@ -575,13 +598,13 @@ def _run_batch(stack, capsys, tmp_path, monkeypatch, runtime, **spark):
         _catalog(config),
         sql=[f"CREATE TABLE fluid.{stack.database}.{target} ({LINES_DDL}) USING iceberg"],
     )
-    code, outcome = _fluid(capsys, "spark", "run", path, "--build-id", build, "--json")
-    if code != 0 and not outcome.get("runId"):
-        pytest.fail(json.dumps(outcome, indent=1))
+    code, outcome = _apply_build(monkeypatch, path, build)
+    if code != 0 and (outcome is None or not outcome.run_id):
+        pytest.fail(json.dumps(outcome.as_dict() if outcome else None, indent=1))
     if code != 0 and runtime == "glue":
-        pytest.fail(f"{outcome}\n{_failure(_glue_logs(stack, outcome['runId']))}")
-    assert code == 0, outcome
-    assert outcome["state"] == "SUCCEEDED", outcome
+        pytest.fail(f"{outcome.as_dict()}\n{_failure(_glue_logs(stack, outcome.run_id))}")
+    assert code == 0, outcome.as_dict()
+    assert outcome.state == "SUCCEEDED", outcome.as_dict()
     table = f"fluid.{stack.database}.{target}"
     rows = _helper(stack, _catalog(config), dump=[table])[table]
     assert rows == [r for r in LINES if r["qty"] > 1]

@@ -133,9 +133,6 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install --quiet --upgrade pip
           .venv/bin/pip install --quiet -e '.[dev]'
-          # Not in [profile]: flux-stats is not on PyPI yet. Stage 1 runs tests/profiler, whose
-          # real-backend tests self-skip without it.
-          .venv/bin/pip install --quiet -r requirements/flux-stats.txt
 
       # Same distribution as the ci.yml test matrix, which runs these tests
       # under xdist on every PR: one process took five minutes of this job.

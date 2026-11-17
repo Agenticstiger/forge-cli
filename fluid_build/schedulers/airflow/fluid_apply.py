@@ -16,11 +16,13 @@ from CI or from the scheduler. The contract path and ``--env`` are fixed when
 the DAG is generated; the project directory is read on the worker at run
 time, because the checkout lives somewhere else there than it does in CI.
 
-A build of ``engine: spark`` (a forge Spark job on EMR Serverless, Glue, EMR on EC2 or EMR on
-EKS) is run differently: ``fluid apply`` provisions it and a scheduler starts each run, so its
-DAG executes ``fluid spark run <contract> --build-id <id> [--env <env>] --json``, which waits for
-the run and fails the task unless it succeeded. A stream that is not ``trigger.availableNow``
-runs continuously and ``fluid apply`` keeps it running, so it gets no DAG.
+A forge Spark build (``engine: spark`` with ``parameters.spark``, on EMR Serverless, Glue, EMR
+on EC2 or EMR on EKS) gets the same DAG: the build phase of that ``fluid apply`` starts one run
+on its runtime and waits for it, and fails the task unless the run succeeded. The task gets the
+three hours every apply DAG's task gets (:data:`APPLY_TASK_TIMEOUT_S`, for ``tofu`` and the
+rest of the apply) plus as long as the run may take (``execution.runtime.timeout``). A
+stream that is not ``trigger.availableNow`` runs continuously and ``fluid apply`` keeps it
+running, so it gets no DAG.
 
 Rendering rules:
 
@@ -85,10 +87,12 @@ DEFAULT_CONTRACT_PATH = "contract.fluid.yaml"
 PROJECT_DIR_ENV = "FLUID_PROJECT_DIR"
 
 DEFAULT_RETRIES = 3
-#: How long ``fluid spark run`` waits for a run to end (``build_runners.spark._reconcile``).
+#: How long a Spark run may take when the build does not say (``execution.runtime.timeout``):
+#: ``build_runners.spark._reconcile.DEFAULT_RUN_WAIT_S``.
 DEFAULT_SPARK_WAIT_S = 6 * 3600
-#: How much longer than that wait the Airflow task may run, so the command ends the run first.
-SPARK_TASK_MARGIN_S = 600
+#: How long an apply DAG's task may run: the ``execution_timeout`` of every DAG here. A
+#: Spark build's task gets this on top of its run's wait, so fluid cancels the run first.
+APPLY_TASK_TIMEOUT_S = 3 * 3600
 MAX_RETRIES = 10
 
 #: Name prefixes of the variables that reach ``fluid apply`` from the worker
@@ -235,11 +239,9 @@ class ScheduledBuild:
     schedule: str
     timezone: str
     retries: int
-    #: ``apply`` runs ``fluid apply``; ``spark`` runs ``fluid spark run`` (an ``engine: spark`` build).
-    command: str = "apply"
-    #: Seconds ``fluid spark run`` may wait for the run to end (``execution.runtime.timeout``);
-    #: ``None`` leaves its own default.
-    run_timeout_s: Optional[int] = None
+    #: Seconds the task may run; ``None`` for the default three hours. A Spark build's run may
+    #: take its ``execution.runtime.timeout``, and the task outlives that wait.
+    task_timeout_s: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +250,7 @@ class ScheduledBuild:
 
 
 def _managed_lane(contract: Any) -> bool:
-    """Whether ``fluid spark run`` can start this contract's Spark builds at all.
+    """Whether forge's Spark runner runs this contract's Spark builds at all.
 
     It reads the contract through the managed lane, which exists from schema 0.7.7 on; an
     older contract's Spark build is refused there, so it keeps its ``fluid apply`` DAG.
@@ -266,9 +268,8 @@ def _managed_lane(contract: Any) -> bool:
 def _spark_kind(build: Dict[str, Any], managed: bool = True) -> Optional[str]:
     """``scheduled`` or ``streaming`` for a forge Spark build, ``None`` for any other build.
 
-    The rule is the compiler's (``fluid_build.spark.compiler``): ``parameters.spark.mode``,
-    else ``streaming`` when ``properties.stream`` is declared, else ``batch``. A batch job
-    and a stream with ``trigger.availableNow`` end on their own, so a scheduler starts them.
+    A batch job and a stream with ``trigger.availableNow`` end on their own, so a scheduler
+    starts them (the compiler's rule, ``fluid_build.spark.compiler.runs_to_completion``).
     """
     if build.get("engine") != "spark" or not managed:
         return None
@@ -276,16 +277,11 @@ def _spark_kind(build: Dict[str, Any], managed: bool = True) -> Optional[str]:
     if not isinstance(props, dict):
         return None
     parameters = props.get("parameters")
-    cfg = parameters.get("spark") if isinstance(parameters, dict) else None
-    if not isinstance(cfg, dict):
+    if not isinstance(parameters, dict) or not isinstance(parameters.get("spark"), dict):
         return None
-    stream = props.get("stream")
-    mode = cfg.get("mode") or ("streaming" if stream is not None else "batch")
-    if mode == "batch":
-        return "scheduled"
-    trigger = stream.get("trigger") if isinstance(stream, dict) else None
-    available_now = isinstance(trigger, dict) and trigger.get("availableNow") is True
-    return "scheduled" if available_now else "streaming"
+    from fluid_build.spark.compiler import runs_to_completion
+
+    return "scheduled" if runs_to_completion(build) else "streaming"
 
 
 def _trigger_schedule(build: Dict[str, Any], managed: bool = True) -> Optional[Dict[str, Any]]:
@@ -455,7 +451,7 @@ def _retries(build: Dict[str, Any]) -> int:
     return max(0, min(attempts - 1, MAX_RETRIES))
 
 
-#: The ids ``fluid spark run`` accepts (``fluid_build.spark.compiler``): narrower than the
+#: The ids forge's Spark runner accepts (``fluid_build.spark.compiler``): narrower than the
 #: ids a ``fluid apply`` DAG takes, so a Spark build whose id it would refuse on every run
 #: is refused here, once, instead.
 _SPARK_BUILD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
@@ -466,8 +462,8 @@ def _check_spark_ids(contract: Dict[str, Any], build_id: str) -> None:
     product = contract.get("id")
     if not _SPARK_BUILD_ID.fullmatch(build_id):
         raise ScheduleRenderError(
-            f"Spark build id {build_id!r}: `fluid spark run` takes letters, digits, _ and -, "
-            "starting with a letter or digit"
+            f"Spark build id {build_id!r}: forge's Spark runner takes letters, digits, _ and "
+            "-, starting with a letter or digit"
         )
     if not isinstance(product, str) or not _SPARK_PRODUCT_ID.fullmatch(product) or ".." in product:
         raise ScheduleRenderError(
@@ -476,29 +472,18 @@ def _check_spark_ids(contract: Dict[str, Any], build_id: str) -> None:
         )
 
 
-def _run_timeout_s(build: Dict[str, Any], build_id: str) -> Optional[int]:
-    """``execution.runtime.timeout`` of a Spark build, in seconds; ``None`` when not set.
-
-    An ISO-8601 duration of days, hours, minutes and seconds (``PT2H``): the task has to
-    outlive the run's own wait, so a value it cannot read is refused, never guessed.
-    """
-    execution = build.get("execution")
-    runtime = execution.get("runtime") if isinstance(execution, dict) else None
-    raw = runtime.get("timeout") if isinstance(runtime, dict) else None
-    if raw is None:
-        return None
-    from fluid_build.build_runners._late_arrival import parse_iso_duration
+def _task_timeout_s(build: Dict[str, Any], build_id: str) -> int:
+    """How long a Spark build's task may run: the apply's own :data:`APPLY_TASK_TIMEOUT_S`
+    (``tofu`` and the rest run before the run starts) plus the run's wait
+    (``execution.runtime.timeout``, else :data:`DEFAULT_SPARK_WAIT_S`), so fluid cancels the
+    run before Airflow kills the task. A timeout it cannot read is refused, never guessed."""
+    from fluid_build.spark.compiler import run_timeout_seconds
 
     try:
-        parsed = parse_iso_duration(raw) if isinstance(raw, str) else None
-    except OverflowError:
-        parsed = None
-    if parsed is None or parsed.total_seconds() < 1:
-        raise ScheduleRenderError(
-            f"build {build_id!r}: execution.runtime.timeout {raw!r} is not an ISO-8601 duration "
-            "of at least one second (days, hours, minutes and seconds, as PT2H)"
-        )
-    return int(parsed.total_seconds())
+        wait = run_timeout_seconds(build)
+    except ValueError as exc:
+        raise ScheduleRenderError(f"build {build_id!r}: {exc}") from exc
+    return APPLY_TASK_TIMEOUT_S + (wait or DEFAULT_SPARK_WAIT_S)
 
 
 def scheduled_builds(contract: Dict[str, Any]) -> List[ScheduledBuild]:
@@ -536,8 +521,7 @@ def scheduled_builds(contract: Dict[str, Any]) -> List[ScheduledBuild]:
                 ),
                 timezone=_validate_timezone(trigger.get("timezone"), build_id),
                 retries=_retries(build),
-                command="spark" if spark else "apply",
-                run_timeout_s=_run_timeout_s(build, build_id) if spark else None,
+                task_timeout_s=_task_timeout_s(build, build_id) if spark else None,
             )
         )
     return out
@@ -691,16 +675,6 @@ _APPLY_TAIL = (
     f'set -- "$@" --mode {APPLY_MODE} --build-id "$FLUID_DAG_BUILD_ID" --yes',
 )
 
-# ``fluid spark run`` starts one run of the build, waits for it, and exits 0 only when it
-# succeeded; ``--json`` prints one JSON line. ``FLUID_DAG_RUN_TIMEOUT`` is the wait in
-# seconds, empty to leave the command's default.
-_SPARK_TAIL = (
-    'set -- spark run "$contract"',
-    'if [ -n "$FLUID_DAG_ENV" ]; then set -- "$@" --env "$FLUID_DAG_ENV"; fi',
-    'set -- "$@" --build-id "$FLUID_DAG_BUILD_ID" --json',
-    'if [ -n "${FLUID_DAG_RUN_TIMEOUT:-}" ]; then set -- "$@" --timeout "$FLUID_DAG_RUN_TIMEOUT"; fi',
-)
-
 _SCRIPT_END = (
     'bin="${FLUID_BIN:-fluid}"',
     # env(1) would read a name holding "=" as one more variable, not the program.
@@ -710,7 +684,6 @@ _SCRIPT_END = (
 
 
 BASH_SCRIPT_LINES = _SCRIPT_HEAD + _APPLY_TAIL + _SCRIPT_END
-SPARK_SCRIPT_LINES = _SCRIPT_HEAD + _SPARK_TAIL + _SCRIPT_END
 
 
 def _wrap(words: List[str], indent: str, width: int = 76) -> str:
@@ -753,54 +726,6 @@ _DAG_DOC = (
 )
 
 
-def _mwaa_requirement() -> str:
-    """The ``requirements.txt`` line a managed Airflow (MWAA) needs to run ``fluid`` here.
-
-    A release is pinned: the DAG was generated for it. A development build is not on PyPI,
-    so it is left unpinned.
-    """
-    import fluid_build
-
-    version = str(getattr(fluid_build, "__version__", "") or "")
-    pinned = bool(version) and not any(mark in version for mark in (".dev", "+", "unknown"))
-    return f"data-product-forge[aws]=={version}" if pinned else "data-product-forge[aws]"
-
-
-def _spark_dag_doc() -> str:
-    return (
-        '"""Scheduled fluid Spark build, generated by fluid. Edit the contract, not this file.\n'
-        "\n"
-        "Every run executes this on the Airflow worker, with the constants below\n"
-        "filled in (`--env` is left out when FLUID_ENV_NAME is empty):\n"
-        "\n"
-        '    cd "$FLUID_PROJECT_DIR"\n'
-        '    fluid spark run "$FLUID_PROJECT_DIR/$CONTRACT_PATH" --env "$FLUID_ENV_NAME" \\\\\n'
-        '        --build-id "$BUILD_ID" --json\n'
-        "\n"
-        "`fluid spark run` starts one run of the build on its runtime (EMR Serverless,\n"
-        "Glue, EMR on EC2 or EMR on EKS), waits for it, prints one JSON line and exits 0\n"
-        "only when the run succeeded. A killed task cancels the run.\n"
-        "\n"
-        "Worker requirements:\n"
-        "\n"
-        "- FLUID_PROJECT_DIR names the directory that holds the product checkout.\n"
-        "- `fluid` is on PATH, or FLUID_BIN names the executable.\n"
-        "- On MWAA, add this line to requirements.txt:\n"
-        "\n"
-        f"    {_mwaa_requirement()}\n"
-        "\n"
-        "- The AWS credentials the run needs are in the worker environment. Only\n"
-        "  these reach the fluid process:\n"
-        "\n" + _wrap(list(PASSTHROUGH_NAMES), "    ") + "\n\n"
-        "  every name matching\n"
-        "\n" + _wrap([f"{prefix}*" for prefix in PASSTHROUGH_PREFIXES], "    ") + "\n\n"
-        "  the variables the contract reads (CONTRACT_ENV_NAMES), and any names\n"
-        "  listed, space separated, in FLUID_DAG_ENV_PASSTHROUGH. fluid starts with\n"
-        "  nothing else, and never with a variable whose name starts AIRFLOW.\n"
-        '"""'
-    )
-
-
 def render_dag(
     *,
     product_id: str,
@@ -811,24 +736,15 @@ def render_dag(
 ) -> str:
     """Render one DAG file. Inputs must already be validated."""
     lit = py_str_literal
-    spark = build.command == "spark"
-    script = "".join(
-        f"        {lit(line)},\n" for line in (SPARK_SCRIPT_LINES if spark else BASH_SCRIPT_LINES)
-    )
-    # The task outlives the run's own wait by ten minutes, so ``fluid spark run`` times the
-    # run out and cancels it before Airflow kills the task.
-    wait_s = build.run_timeout_s or DEFAULT_SPARK_WAIT_S
+    script = "".join(f"        {lit(line)},\n" for line in BASH_SCRIPT_LINES)
     task_timeout = (
-        f"timedelta(seconds={int(wait_s) + SPARK_TASK_MARGIN_S})" if spark else "timedelta(hours=3)"
+        f"timedelta(seconds={int(build.task_timeout_s)})"
+        if build.task_timeout_s
+        else "timedelta(hours=3)"
     )
-    run_timeout = str(int(build.run_timeout_s)) if spark and build.run_timeout_s else ""
-    description = (
-        f"fluid spark run {product_id} --build-id {build.build_id}"
-        if spark
-        else f"fluid apply {product_id} --build-id {build.build_id}"
-    )
+    description = f"fluid apply {product_id} --build-id {build.build_id}"
     return (
-        f"{_spark_dag_doc() if spark else _DAG_DOC}\n"
+        f"{_DAG_DOC}\n"
         "\n"
         "from datetime import timedelta\n"
         "\n"
@@ -876,15 +792,14 @@ def render_dag(
         "    doc_md=__doc__,\n"
         ") as dag:\n"
         "    BashOperator(\n"
-        + ('        task_id="fluid_spark_run",\n' if spark else '        task_id="fluid_apply",\n')
-        + "        bash_command=BASH_COMMAND,\n"
+        '        task_id="fluid_apply",\n'
+        "        bash_command=BASH_COMMAND,\n"
         "        env={\n"
         '            "FLUID_DAG_CONTRACT": CONTRACT_PATH,\n'
         '            "FLUID_DAG_ENV": FLUID_ENV_NAME,\n'
         '            "FLUID_DAG_BUILD_ID": BUILD_ID,\n'
         '            "FLUID_DAG_CONTRACT_ENV": CONTRACT_ENV_NAMES,\n'
-        + (f'            "FLUID_DAG_RUN_TIMEOUT": {lit(run_timeout)},\n' if spark else "")
-        + "        },\n"
+        "        },\n"
         "        append_env=True,\n"
         "        skip_on_exit_code=None,\n"
         "    )\n"
@@ -930,7 +845,6 @@ def render_fluid_apply_dags(
 __all__ = [
     "APPLY_MODE",
     "BASH_SCRIPT_LINES",
-    "SPARK_SCRIPT_LINES",
     "DEFAULT_CONTRACT_PATH",
     "DEFAULT_ENGINE",
     "PASSTHROUGH_NAMES",

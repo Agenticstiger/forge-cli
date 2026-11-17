@@ -323,6 +323,12 @@ class TestBatchBuildWarning:
                 id="dlt-without-acquisition",
             ),
             pytest.param(
+                _build("spark"),
+                "forge-cli runs spark builds as batch runs, which end, and its spark runner "
+                "refuses",
+                id="spark-names-its-runner",
+            ),
+            pytest.param(
                 _build("kafka-connect"),
                 "runs kafka-connect builds without pattern: acquisition",
                 id="connector-without-acquisition",
@@ -462,6 +468,8 @@ def _dispatch(build: Dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(base, "_execute_acquisition_build", _record("acquisition"))
     monkeypatch.setattr(base, "_execute_embedded_sql_build", _record("inline-sql"))
+    monkeypatch.setattr(base, "_execute_spark_build", _record("spark"))
+    monkeypatch.setattr(base, "_refuse_spark_without_runner", _record("spark refused"))
     monkeypatch.setattr(dbt_runner, "execute_dbt_build", _record("dbt"))
     monkeypatch.setattr(python_runner, "execute_build", _record("python"))
     (tmp_path / "contract.fluid.yaml").write_text("id: p\n", "utf-8")
@@ -508,7 +516,6 @@ def test_validate_warns_exactly_when_apply_runs_the_build_as_a_batch_run(
 @pytest.mark.parametrize(
     "build",
     [
-        pytest.param(_build("spark", pattern="hybrid-reference"), id="spark"),
         pytest.param(_build("custom", execution=_runtime("local")), id="custom-on-local"),
         pytest.param(_build("dlt", pattern="hybrid-reference"), id="dlt-not-acquisition"),
         pytest.param(_build("kafka-connect"), id="kafka-connect-no-pattern"),
@@ -521,6 +528,74 @@ def test_apply_hands_a_local_script_to_the_python_runner(
     # manual, so a continuous one is refused there, not passed off as a job
     # some platform keeps running.
     assert _dispatch(build, tmp_path, monkeypatch) == ["python"]
+
+
+_SPARK_JOB = {"parameters": {"spark": {"runtime": "emr-serverless"}}}
+
+
+@pytest.mark.parametrize(
+    "build, runner",
+    [
+        # No parameters.spark and no platform of its own: refused, never a local script.
+        pytest.param(_build("spark", pattern="hybrid-reference"), "spark refused", id="spark"),
+        pytest.param(_build("spark", execution=_runtime("local")), "spark refused", id="local"),
+        # forge's Spark runner, even when the build carries Spark SQL for its runtime.
+        pytest.param(_build("spark", properties=_SPARK_JOB), "spark", id="spark-job"),
+        pytest.param(
+            _build("spark", pattern="embedded-logic", properties={**_SPARK_JOB, **_SQL}),
+            "spark",
+            id="spark-job-with-sql",
+        ),
+        # Without parameters.spark, inline Spark SQL still runs on the local DuckDB.
+        pytest.param(
+            _build("spark", pattern="embedded-logic", properties=_SQL), "inline-sql", id="sql"
+        ),
+    ],
+)
+def test_apply_hands_a_spark_build_to_the_spark_runner_or_refuses_it(
+    build: Dict[str, Any], runner: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build["execution"]["trigger"]["type"] = "schedule"
+    assert _dispatch(build, tmp_path, monkeypatch) == [runner]
+
+
+def test_a_spark_build_with_no_platform_is_not_a_python_script() -> None:
+    from fluid_build.build_runners.base import _batch_runner_for
+
+    assert _batch_runner_for({"id": "b", "engine": "spark"}) == ("spark builds", "spark")
+    on_aws = {"id": "b", "engine": "spark", "execution": {"runtime": {"platform": "aws"}}}
+    assert _batch_runner_for(on_aws) is None
+
+
+def test_apply_says_what_a_spark_build_without_a_runner_needs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    import argparse
+    import logging
+
+    from fluid_build.build_runners import base
+    from fluid_build.build_runners.python import runner as python_runner
+
+    monkeypatch.setattr(python_runner, "execute_build", lambda *a, **k: pytest.fail("python"))
+    (tmp_path / "contract.fluid.yaml").write_text("id: p\n", "utf-8")
+    (tmp_path / "ingest.py").write_text("print('ran')\n", "utf-8")
+    args = argparse.Namespace(
+        contract=str(tmp_path / "contract.fluid.yaml"),
+        build_id=None,
+        dry_run=False,
+        fail_fast=False,
+        delay=0,
+        no_output=True,
+        sample_rows=None,
+        env=None,
+        mode="amend-and-build",
+        allow_skipped_builds=False,
+    )
+    contract = {"id": "p", "builds": [{"id": "b", "engine": "spark"}]}
+    assert base.run_builds_from_args(args, logging.getLogger("t"), contract=contract) == 1
+    out = " ".join(capsys.readouterr().out.split())
+    assert "engine 'spark' with no runtime platform" in out
+    assert "properties.parameters.spark" in out and "execution.runtime.platform" in out
 
 
 class TestValidateCli:

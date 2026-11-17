@@ -404,16 +404,15 @@ lineage = [
 # does. It is standard-library only and supports Python 3.10, so it needs no
 # marker.
 #
-# flux-stats is not on PyPI yet (PyPI's flux-stats 0.0.1 is a placeholder with no
-# code and is never a candidate), and PyPI refuses an upload whose metadata holds
-# a URL dependency, so this extra cannot name the git commit. Until flux-stats is
-# released, install it from git (the one pin lives in requirements/flux-stats.txt,
-# which CI installs and tests/profiler/test_flux_stats_pin.py keeps in step with
-# ``fluid profile``'s message):
-#   pip install -r requirements/flux-stats.txt
-# It returns here as a version once it is released.
+# flux-stats comes from PyPI. 0.6.0 is the first release that holds the record
+# reader the profiler uses (PyPI's 0.0.1 is a placeholder with no code). It is
+# versioned 0.x, where a minor release may change the names
+# fluid_build/profiler/_stats.py imports, so the range stops at the next minor.
+# That module repeats the requirement in its install message, and
+# tests/profiler/test_flux_stats_pin.py keeps the two equal.
 profile = [
   "duckdb>=1.5.0",
+  "flux-stats>=0.6.0,<0.7",
 ]
 
 # AI + MCP together: restores the pre-0.28.0 base behaviour (the
@@ -514,9 +513,8 @@ dev = [
   # it those tests would skip in CI instead of running.
   "pyarrow>=14",
   # litellm, mcp and openlineage left the base install in 0.28.0; the tests
-  # import all three at module level, so dev names them explicitly. flux-stats is
-  # not in ``profile`` (it is not on PyPI), so CI installs it from git after
-  # ``.[dev]`` and the profiler's tests also run against the real registry
+  # import all three at module level, so dev names them explicitly. ``profile``
+  # brings flux-stats, so the profiler's tests also run against the real registry
   # (tests/profiler/test_flux_stats_backend.py), not only its stand-in.
   "data-product-forge[litellm,mcp,lineage,profile]",
   # ``profile`` brings duckdb and not numpy, so a ``.[dev]`` lane (iac-tests Stage 1)

@@ -369,9 +369,41 @@ STREAMING_ACQUISITION_ENGINES = frozenset({"kafka-connect", "debezium"})
 
 #: Engines whose job can run on a platform the build names in
 #: ``execution.runtime.platform``, such as a Spark or Glue streaming job on
-#: Databricks or AWS Glue. Without such a platform the python runner runs the
-#: build's script locally, as for any engine without a runner of its own.
+#: Databricks or AWS Glue. Without such a platform the python runner runs a glue
+#: or custom build's script locally, as for any engine without a runner of its
+#: own; a spark build goes to forge's Spark runner (:func:`is_spark_job_build`)
+#: or is refused (:func:`_refuse_spark_without_runner`).
 PLATFORM_RUN_ENGINES = frozenset({"spark", "glue", "custom"})
+
+
+def is_spark_job_build(build: Dict[str, Any]) -> bool:
+    """True for a build forge's Spark runner runs (``build_runners/spark``): ``engine:
+    spark`` with ``properties.parameters.spark``, whatever else it declares (a batch job's
+    ``properties.sql`` is Spark SQL for its runtime, not inline SQL for DuckDB)."""
+    if build.get("engine") != "spark":  # the compiler's and the renderer's spelling
+        return False
+    props = build.get("properties")
+    parameters = props.get("parameters") if isinstance(props, dict) else None
+    return isinstance(parameters, dict) and "spark" in parameters
+
+
+def _spark_job_runner(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str]]]:
+    """:func:`_batch_runner_for` of a Spark job: forge's Spark runner starts a run that ends
+    (batch, availableNow) and waits for it; any other stream is kept running by fluid
+    apply's spark.reconcile action, not a batch run."""
+    from fluid_build.spark.compiler import runs_to_completion
+
+    return ("spark builds", None) if runs_to_completion(build) else None
+
+
+def _spark_without_runner(build: Dict[str, Any]) -> bool:
+    """True for an ``engine: spark`` build nothing here can run: no ``parameters.spark``
+    for forge's Spark runner, and no platform of its own (``execution.runtime.platform``)."""
+    return (
+        build.get("engine") == "spark"
+        and not is_spark_job_build(build)
+        and embedded_sql_platform(build) in LOCAL_SQL_PLATFORMS
+    )
 
 
 def _batch_runner_for(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str]]]:
@@ -383,14 +415,17 @@ def _batch_runner_for(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str
     them; inline SQL and the duckdb, airbyte, meltano and dlt runners run the
     build each time ``fluid apply`` runs it, with ``refusing_runner`` None.
     The checks follow the dispatcher's order, so they name the runner that gets
-    the build. The python runner takes every build the others do not: python,
-    no engine, spark, glue, custom, and an ingestion engine declared without
-    ``pattern: acquisition``; it runs the build's script locally.
+    the build. forge's Spark runner takes a Spark job (``parameters.spark``) that
+    runs to completion, and refuses a spark build with neither that nor a platform
+    of its own (``refusing_runner`` ``spark``). The python runner takes every build
+    the others do not: python, no engine, glue, custom, and an ingestion engine
+    declared without ``pattern: acquisition``; it runs the build's script locally.
 
-    None for a connector, which stays running, and for a build forge-cli does
-    not run: inline SQL on a platform with no embedded-SQL executor, and a
-    spark, glue or custom build that declares a ``runtime.platform`` other
-    than the local one, where that platform runs the job. The dispatcher
+    None for a connector, which stays running, for a Spark stream ``fluid apply``
+    keeps running, and for a build forge-cli does not run: inline SQL on a
+    platform with no embedded-SQL executor, and a spark, glue or custom build that
+    declares a ``runtime.platform`` other than the local one, where that platform
+    runs the job. The dispatcher
     leaves a continuous one of those to its platform
     (:func:`_runs_outside_forge_continuously`).
     """
@@ -406,6 +441,8 @@ def _batch_runner_for(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str
     name = (engine or "").strip().lower()
     if is_externally_run_build(build):
         return None
+    if is_spark_job_build(build):
+        return _spark_job_runner(build)
     if is_acquisition_build(build):
         return None if name in STREAMING_ACQUISITION_ENGINES else (f"{name} builds", None)
     if is_embedded_sql_build(build):
@@ -418,6 +455,8 @@ def _batch_runner_for(build: Dict[str, Any]) -> Optional[Tuple[str, Optional[str
         return "dbt builds", "dbt"
     if name in PLATFORM_RUN_ENGINES and embedded_sql_platform(build) not in LOCAL_SQL_PLATFORMS:
         return None
+    if _spark_without_runner(build):
+        return "spark builds", "spark"
     if not name:
         return "builds with no engine", "python"
     if name in ACQUISITION_ENGINES:
@@ -472,7 +511,9 @@ def continuous_trigger_warnings(contract: Dict[str, Any]) -> List[str]:
                 ": this build runs only when fluid apply runs builds, and no scheduler starts it"
             )
         remedy = CONTINUOUS_REMEDY
-        if refuser == "python" and str(engine or "").strip().lower() in PLATFORM_RUN_ENGINES:
+        if refuser in ("python", "spark") and str(engine or "").strip().lower() in (
+            PLATFORM_RUN_ENGINES
+        ):
             # Naming that platform is what leaves the job to it.
             remedy = remedy[:-1] + ", named in execution.runtime.platform."
         warnings.append(
@@ -536,6 +577,53 @@ def _report_continuous_outside_forge(build: Dict[str, Any], build_id: str, repor
         markup=False,
     )
     _record_run_elsewhere(build_id, report)
+
+
+def _execute_spark_build(
+    contract: Dict[str, Any], build: Dict[str, Any], *, dry_run: bool
+) -> Optional[int]:
+    """Run a Spark job build on its runtime (``build_runners/spark``): 0 when its run
+    succeeded, 1 when it failed or was refused, None for a stream ``fluid apply`` keeps
+    running."""
+    from fluid_build._errors import FluidUserError
+
+    from .spark._reconcile import run_build
+
+    build_id = build.get("id", "unknown")
+    cprint(f"\n🚀 Build '{build_id}' - forge's Spark runner", markup=False)
+    try:
+        return run_build(
+            contract, build, dry_run=dry_run, say=lambda text: cprint(f"   {text}", markup=False)
+        )
+    except FluidUserError as exc:
+        _print_typed_error(exc)
+    except (ValueError, KeyError, TypeError) as exc:
+        cprint(f"   ❌ {exc}", markup=False)
+    return 1
+
+
+def _report_spark_stream(build_id: str, report: Any) -> None:
+    """Say that a Spark stream is kept running by ``fluid apply``, not run here; recorded as
+    :func:`_report_externally_run_build` records a Flink job."""
+    cprint(
+        f"\n⏭️  Build '{build_id}' is a Spark stream: fluid apply keeps it running "
+        "(its spark.reconcile action); there is no run to start here.",
+        markup=False,
+    )
+    _record_run_elsewhere(build_id, report)
+
+
+def _refuse_spark_without_runner(build_id: str) -> int:
+    """Refuse an ``engine: spark`` build nothing here runs, rather than run it as a local
+    python script; return exit code 1."""
+    cprint(
+        f"\n❌ Build '{build_id}' - engine 'spark' with no runtime platform: forge-cli runs a "
+        "Spark build only on forge's Spark runner, which needs properties.parameters.spark "
+        "(its runtime: emr-serverless, emr-ec2, emr-eks or glue). Declare it, or name the "
+        "platform that runs the job in execution.runtime.platform.",
+        markup=False,
+    )
+    return 1
 
 
 # Acquisition-engine registry: ``engine name → (module path, callable name)``.
@@ -1601,7 +1689,17 @@ def run_builds_from_args(
                     break
             continue
 
-        if is_embedded_sql_build(build):
+        if is_spark_job_build(build):
+            # forge's Spark runner, ahead of inline SQL (a Spark job's SQL is Spark's): one
+            # run of a scheduled build, waited for. A stream is kept running by this apply's
+            # spark.reconcile action, not run here.
+            spark_result = _execute_spark_build(contract, build, dry_run=args.dry_run)
+            if spark_result is None:
+                _report_spark_stream(build_id, report)
+                total_external += 1
+                continue
+            result = spark_result
+        elif is_embedded_sql_build(build):
             # An inline-SQL build that ALSO declares a dbt(-adapter) engine
             # still runs via the local DuckDB engine below — NOT dbt. Surface
             # that explicitly so ``engine: dbt`` is never silently ignored.
@@ -1651,6 +1749,8 @@ def run_builds_from_args(
                 # / replace-and-build) append ``--full-refresh`` to dbt.
                 apply_mode=getattr(args, "mode", None),
             )
+        elif _spark_without_runner(build):
+            result = _refuse_spark_without_runner(build_id)
         else:
             # Resolve script path
             script_path = resolve_script_path(contract_path, build)

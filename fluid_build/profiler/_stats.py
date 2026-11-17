@@ -115,8 +115,8 @@ class StatisticsBackend(Protocol):
 
 #: The most digits a number may need written out without an exponent: the
 #: engine's declared-number rule (flux-engine ``concordance/predicate.py``
-#: ``require_number_length``), which flux-stats' ``exact()`` takes too in a
-#: follow-up to flux-engine #54. Drop this pre-check once the pin carries it.
+#: ``require_number_length``), which flux-stats' ``exact()`` takes too since
+#: 0.6.0, so this pre-check can be dropped.
 #: The fidelity check reads values inside a declared range; a profile declares
 #: none, so the seam bounds a number before flux-stats builds its exact value:
 #: building ``1E+99999999`` takes minutes and gigabytes. A sum longer than the
@@ -233,22 +233,21 @@ def load_backend() -> StatisticsBackend:
         raise _unavailable(error) from None
 
 
-#: The one pin of flux-stats, until it is released. It is not in ``[profile]``: PyPI
-#: refuses an upload whose metadata holds a URL. ``requirements/flux-stats.txt`` holds the
-#: same line for CI; ``tests/profiler/test_flux_stats_pin.py`` keeps the two equal.
-FLUX_STATS_GIT_REQUIREMENT = (
-    "flux-stats @ git+https://github.com/Agenticstiger/flux-engine.git"
-    "@9ea8edf9bcddd58951f418db13a77253c02bdd7d#subdirectory=packages/flux-stats"
-)
-FLUX_STATS_INSTALL_COMMAND = f'pip install "{FLUX_STATS_GIT_REQUIREMENT}"'
+#: The flux-stats range ``[profile]`` names in ``pyproject.toml``. The CLI cannot read
+#: that file once installed, so the install message repeats it;
+#: ``tests/profiler/test_flux_stats_pin.py`` keeps the two equal.
+FLUX_STATS_REQUIREMENT = "flux-stats>=0.6.0,<0.7"
+#: The extra carries the range, and pip replaces a copy outside it (the 0.0.1
+#: placeholder, or a release newer than this module knows).
+FLUX_STATS_INSTALL_COMMAND = "pip install 'data-product-forge[profile]'"
 
 
 def _unavailable(error: ImportError) -> StatisticsUnavailable:
     """Say whether ``flux-stats`` is missing, or installed and not importable.
 
     PyPI's ``flux-stats`` 0.0.1 is a placeholder that installs no ``flux_stats``
-    module, so ``pip install flux-stats`` leaves a distribution that cannot be
-    imported. The message names its version rather than calling it missing.
+    module, so a copy of it leaves a distribution that cannot be imported. The
+    message names the installed version rather than calling it missing.
     """
     from importlib import metadata
 
@@ -260,8 +259,8 @@ def _unavailable(error: ImportError) -> StatisticsUnavailable:
         state = f"{version} is installed but cannot be imported ({type(error).__name__})"
     return StatisticsUnavailable(
         "fluid profile forms every statistic with flux-stats, the statistic registry "
-        f"FLUX shares with its fidelity check, and flux-stats {state}. flux-stats is not on "
-        f"PyPI yet; install it from git with: {FLUX_STATS_INSTALL_COMMAND}"
+        f"FLUX shares with its fidelity check, and flux-stats {state}. It needs "
+        f"{FLUX_STATS_REQUIREMENT}; install it with: {FLUX_STATS_INSTALL_COMMAND}"
     )
 
 

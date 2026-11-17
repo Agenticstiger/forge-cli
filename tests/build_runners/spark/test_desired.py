@@ -404,7 +404,8 @@ def test_without_an_application_id_the_products_own_application_is_used(contract
 
 
 def test_every_key_the_infrastructure_emit_denies_is_denied_here():
-    """fluid spark run is no looser than fluid apply: the IaC emit's deny list is a subset."""
+    """A run is no looser than what fluid apply provisions: the IaC emit's deny list is a
+    subset."""
     identity = pytest.importorskip("fluid_build.iac.providers.aws_identity")
     entries = getattr(identity, "DENIED_SPARK_CONF", None)
     if entries is None:

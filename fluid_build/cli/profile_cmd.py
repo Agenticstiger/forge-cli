@@ -34,7 +34,9 @@ checks are ACRO 1.1.0's defaults, named "acro-default" in the document:
   - a sum is withheld when 2 records make up 90% of it, or when what is left
     after the 2 largest is below 10% of the largest;
   - a min, max or quantile is published only when 10 records hold that value.
-A withheld value keeps its SDMX CL_CONF_STATUS code (A, O, T or M) and no value.
+A withheld value keeps its SDMX CL_CONF_STATUS code and no value: A (a small
+count), C (a sum over at most two values), O or T (dominated by one or two
+records) or M (concentration).
 
 These are output-checking conventions only. No privacy or anonymity guarantee
 is made or implied: read the document before you share it.
@@ -120,7 +122,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             str(exc),
             {
                 "read": "nothing: no record was read",
-                "next": f"pip install 'data-product-forge[profile]' && {_stats.FLUX_STATS_INSTALL_COMMAND}",
+                "next": _stats.FLUX_STATS_INSTALL_COMMAND,
             },
         ) from None
 
