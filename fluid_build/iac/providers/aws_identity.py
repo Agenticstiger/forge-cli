@@ -512,8 +512,6 @@ class JobAccess:
     #: That connection's subnet ARN: the only subnet whose interfaces the role may tag
     #: and delete.
     glue_subnet_arn: Any = None
-    #: Exact objects the job reads besides its own prefixes (Glue's pinned jars).
-    objects: Tuple[Any, ...] = ()
 
 
 def secret_resources(arn: Any) -> List[Any]:
@@ -597,17 +595,6 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
         # With an S3 Bucket Key the encryption context is the bucket's ARN; without one
         # it is the object's.
         object_arns.extend([bucket_arn, *(_join(bucket_arn, "/", p, "*") for p in prefixes)])
-    if access.objects:
-        statements.append(
-            {
-                "sid": "ReadJars",
-                "effect": "Allow",
-                "actions": ["s3:GetObject"],
-                "resources": list(access.objects),
-            }
-        )
-        object_arns.extend(dict.fromkeys(str(a).split("/", 1)[0] for a in access.objects))
-        object_arns.extend(access.objects)
     statements.append(
         {
             "sid": "S3Kms",

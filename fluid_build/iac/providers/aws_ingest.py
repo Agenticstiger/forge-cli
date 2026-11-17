@@ -423,7 +423,7 @@ def _emit_build(
         )
     database, table = config["sink"]["table"].split(".", 1)
     vpc = b.runtime == "glue" and cluster is not None
-    jars = _glue_jars(blocks, b) if b.runtime == "glue" else ()
+    jars = _glue_jars(blocks, b, bucket_ref) if b.runtime == "glue" else ()
     access = aws_identity.JobAccess(
         region=b.region,
         account=ctx.account,
@@ -435,7 +435,6 @@ def _emit_build(
         secret_arns=_secret_arns(config, b.region, ctx),
         glue_vpc=vpc,
         glue_subnet_arn=tofu_ref(f"data.aws_subnet.{b.key}.arn") if vpc else None,
-        objects=tuple(arn for arn, _, _ in jars),
     )
     role_arn = _emit_role(blocks, b, access, application_id)
     overwrites = job.config["mode"] == "batch"
@@ -450,13 +449,11 @@ def _emit_build(
         args["--continuous-log-logGroup"] = log_name
         args["--TempDir"] = b.object_uri(b.artifacts + "tmp/")
         if jars:
-            args["--extra-jars"] = ",".join(uri for _, uri, _ in jars)
+            args["--extra-jars"] = TofuExpr(",".join(jars))
             # Glue 5's hudi-utilities bundle carries its own copy of the Confluent
             # registry client classes; ours must win (measured: with this flag the client
             # loads from our pinned jar). Only Avro builds add jars, so only they set it.
             args["--user-jars-first"] = "true"
-            lifecycle = blocks.resources["aws_glue_job"][b.key].setdefault("lifecycle", {})
-            lifecycle.setdefault("precondition", []).extend(check for _, _, check in jars)
         if vpc:
             _glue_connection(blocks, b, cluster)
         target = tofu_ref(f"aws_glue_job.{b.key}.name")
@@ -480,9 +477,22 @@ def _emit_build(
     )
 
 
-def _glue_jars(blocks: SparkBlocks, b: _Build) -> Tuple[Tuple[str, str, Dict[str, Any]], ...]:
-    """The pinned jars a Glue build adds (:mod:`aws_glue_jars`): each read with its S3
-    checksum, as ``(object ARN, s3 URI, the Glue job's precondition on its sha256)``."""
+def _glue_jars(blocks: SparkBlocks, b: _Build, bucket_ref: Any) -> Tuple[TofuExpr, ...]:
+    """The pinned jars a Glue build adds (:mod:`aws_glue_jars`), as ``s3://`` URIs of the
+    build's own verified copies.
+
+    Each jar is read from the platform's prefix with its S3 checksum and copied into the
+    build's content-addressed artifact prefix (``aws_glue_jars.copy_key``), where the job
+    loads it from:
+
+    - the copy's ``precondition``: the source's ``checksum_sha256`` is the pin, at plan;
+    - ``copy_if_match`` is the ETag that plan read, so S3 copies those bytes or nothing;
+    - the copy is written with a SHA-256 checksum, and its ``postcondition`` checks it.
+
+    A later swap in the platform's prefix never reaches the job: the copy is not re-made
+    while its pin and source are unchanged, and a new pin is a new key. The job role reads
+    its own artifact prefix only, never the platform's.
+    """
     needed = aws_glue_jars.needed_jars(b.config)
     if not needed:
         return ()
@@ -503,32 +513,56 @@ def _glue_jars(blocks: SparkBlocks, b: _Build) -> Tuple[Tuple[str, str, Dict[str
                 "Or run the build on emr-serverless, which resolves its jars from Maven.",
             ),
         )
-    out = []
-    objects = blocks.data.setdefault("aws_s3_object", {})
+    uris = []
+    sources = blocks.data.setdefault("aws_s3_object", {})
+    copies = blocks.resources.setdefault("aws_s3_object_copy", {})
     for index, jar in enumerate(needed):
         name = f"{b.key}_jar_{index}"
-        objects[name] = {
+        where = f"s3://{location.bucket}/{location.key(jar)}"
+        sources[name] = {
             "bucket": location.bucket,
             "key": location.key(jar),
             "checksum_mode": "ENABLED",
         }
-        out.append(
-            (
-                f"arn:aws:s3:::{location.bucket}/{location.key(jar)}",
-                f"s3://{location.bucket}/{location.key(jar)}",
-                {
-                    "condition": TofuExpr(
-                        f'${{data.aws_s3_object.{name}.checksum_sha256 == "{jar.sha256_b64}"}}'
-                    ),
-                    "error_message": (
-                        f"s3://{location.bucket}/{location.key(jar)} is not the pinned "
-                        f"{jar.coordinate} (sha256 {jar.sha256}), or was uploaded without "
-                        "a single-part SHA-256 checksum."
-                    ),
-                },
-            )
-        )
-    return tuple(out)
+        key = aws_glue_jars.copy_key(b.ctx.product, b.build_id, jar)
+        copies[name] = {
+            "bucket": bucket_ref,
+            "key": key,
+            "source": f"{location.bucket}/{location.key(jar)}",
+            "copy_if_match": tofu_ref(f"data.aws_s3_object.{name}.etag"),
+            "checksum_algorithm": "SHA256",
+            # The product's tags, not the platform object's (S3 copies a source's tags
+            # unless told to replace them).
+            "tagging_directive": "REPLACE",
+            "tags": dict(b.tags),
+            "lifecycle": {
+                "precondition": [
+                    {
+                        "condition": TofuExpr(
+                            f"${{data.aws_s3_object.{name}.checksum_sha256 == "
+                            f'"{jar.sha256_b64}"}}'
+                        ),
+                        "error_message": (
+                            f"{where} is not the pinned {jar.coordinate} (sha256 "
+                            f"{jar.sha256}), or was uploaded without a single-part SHA-256 "
+                            "checksum."
+                        ),
+                    }
+                ],
+                "postcondition": [
+                    {
+                        "condition": TofuExpr(f'${{self.checksum_sha256 == "{jar.sha256_b64}"}}'),
+                        "error_message": (
+                            f"The copy of {jar.coordinate} is not the pinned bytes (sha256 "
+                            f"{jar.sha256})."
+                        ),
+                    }
+                ],
+            },
+        }
+        bucket = tofu_ref(f"aws_s3_object_copy.{name}.bucket")
+        uris.append(TofuExpr(f"s3://{bucket}/{_escape(key)}"))
+    return tuple(uris)
 
 
 def _job_content(

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import json
 import shutil
 import subprocess
 
@@ -123,35 +124,54 @@ def test_the_bucket_root_is_a_valid_jar_prefix():
     assert location.key(aws_glue_jars.AVRO_JARS[0]) == "abris_2.12-6.4.0.jar"
 
 
-def test_an_avro_build_loads_exactly_the_pinned_jars_and_checks_each(monkeypatch):
+def test_an_avro_build_loads_only_its_own_verified_copies(monkeypatch):
     monkeypatch.setenv(aws_glue_jars.JARS_URL_ENV, "s3://platform-jars/spark/glue5")
     contract = glue(avro=True)
     assert aws_identity.validation_warnings(contract) == []
     resources, data = emit(contract)
     job = resources["aws_glue_job"][KEY]
-    uris = [f"s3://platform-jars/spark/glue5/{j.file}" for j in aws_glue_jars.AVRO_JARS]
-    assert job["default_arguments"]["--extra-jars"] == ",".join(uris)
-    assert job["default_arguments"]["--user-jars-first"] == "true"
-    lookups = data["aws_s3_object"]
-    assert len(lookups) == len(aws_glue_jars.AVRO_JARS)
+    copies = resources["aws_s3_object_copy"]
+    prefix = "_fluid/spark/commerce.orders-stream/ingest-orders/jars/"
+    uris = []
     for index, jar in enumerate(aws_glue_jars.AVRO_JARS):
-        assert lookups[f"{KEY}_jar_{index}"] == {
+        name = f"{KEY}_jar_{index}"
+        assert data["aws_s3_object"][name] == {
             "bucket": "platform-jars",
             "key": f"spark/glue5/{jar.file}",
             "checksum_mode": "ENABLED",
         }
-        check = job["lifecycle"]["precondition"][index]
-        assert check["condition"] == (
-            f'${{data.aws_s3_object.{KEY}_jar_{index}.checksum_sha256 == "{jar.sha256_b64}"}}'
+        copy = copies[name]
+        # Content-addressed in the build's own artifact prefix.
+        assert copy["key"] == f"{prefix}{jar.sha256[:16]}/{jar.file}"
+        assert copy["bucket"] == "${aws_s3_bucket.commerce_orders_stream_commerce_lake.id}"
+        assert copy["source"] == f"platform-jars/spark/glue5/{jar.file}"
+        # S3 copies the bytes the plan verified, or nothing.
+        assert copy["copy_if_match"] == f"${{data.aws_s3_object.{name}.etag}}"
+        assert copy["checksum_algorithm"] == "SHA256"
+        assert copy["tagging_directive"] == "REPLACE"
+        (pre,) = copy["lifecycle"]["precondition"]
+        assert pre["condition"] == (
+            f'${{data.aws_s3_object.{name}.checksum_sha256 == "{jar.sha256_b64}"}}'
         )
-        assert jar.sha256 in check["error_message"]
-    access = data["aws_iam_policy_document"][f"{KEY}_access"]
-    read = next(s for s in access["statement"] if s["sid"] == "ReadJars")
-    assert read["resources"] == [
-        f"arn:aws:s3:::platform-jars/spark/glue5/{j.file}" for j in aws_glue_jars.AVRO_JARS
-    ]
-    kms = next(s for s in access["statement"] if s["sid"] == "S3Kms")
-    assert "arn:aws:s3:::platform-jars" in kms["condition"][1]["values"]
+        (post,) = copy["lifecycle"]["postcondition"]
+        assert post["condition"] == f'${{self.checksum_sha256 == "{jar.sha256_b64}"}}'
+        uris.append(f"s3://${{aws_s3_object_copy.{name}.bucket}}/{copy['key']}")
+    assert job["default_arguments"]["--extra-jars"] == ",".join(uris)
+    assert "platform-jars" not in job["default_arguments"]["--extra-jars"]
+    assert job["default_arguments"]["--user-jars-first"] == "true"
+    # The job role reads its own artifact prefix only, never the platform's.
+    access = json.dumps(data["aws_iam_policy_document"][f"{KEY}_access"])
+    assert "platform-jars" not in access
+    assert "_fluid/spark/commerce.orders-stream/ingest-orders/*" in access
+
+
+def test_a_new_pin_is_a_new_copy_key(monkeypatch):
+    first = aws_glue_jars.copy_key("p", "b", aws_glue_jars.AVRO_JARS[0])
+    bumped = aws_glue_jars.GlueJar(
+        "za.co.absa:abris_2.12:6.4.1", "abris_2.12-6.4.1.jar", 1, "f" * 64, ""
+    )
+    assert aws_glue_jars.copy_key("p", "b", bumped) != first
+    assert first.startswith("_fluid/spark/p/b/jars/")
 
 
 def test_an_avro_build_on_emr_serverless_adds_no_glue_jars(monkeypatch):

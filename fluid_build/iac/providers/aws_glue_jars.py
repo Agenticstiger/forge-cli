@@ -5,11 +5,14 @@
 
 Glue documents no Maven route (no ``--packages``), so a forge Spark build on
 ``runtime: glue`` takes its missing jars from an S3 prefix the platform fills
-(:data:`JARS_URL_ENV`), through ``--extra-jars``. OpenTofu reads each object with
-``checksum_mode = "ENABLED"`` and the Glue job's ``lifecycle.precondition`` compares its
-``checksum_sha256`` with the pin below, so ``tofu plan`` and ``apply`` fail before a job
-can load a jar that was swapped. The EMR runtimes resolve pinned Maven coordinates at run
-time instead (``build_runners/spark``).
+(:data:`JARS_URL_ENV`). OpenTofu reads each object with ``checksum_mode = "ENABLED"`` and
+copies it into the build's own content-addressed artifact prefix (:func:`copy_key`): the
+copy's ``precondition`` compares the source's ``checksum_sha256`` with the pin below, the
+copy is made only from the ETag that plan verified (``copy_if_match``), and its own
+SHA-256 is checked again after (``postcondition``). The Glue job loads those copies
+through ``--extra-jars``, so a jar swapped in the platform's prefix after apply never
+reaches a run. The EMR runtimes resolve pinned Maven coordinates at run time instead
+(``build_runners/spark``).
 
 What Glue 5 already ships, measured with a Glue 5.0 ``gluestreaming`` job in
 ca-central-1 (2026-11-17; Spark 3.5.4-amzn-0, Scala 2.12.18), by loading each class:
@@ -31,17 +34,18 @@ packages.confluent.io, whose published sha1 matched. ``checksum_sha256`` is what
 reports for a single-part upload made with ``--checksum-algorithm SHA256``: the base64 of
 the digest.
 
-What the check covers: ``tofu plan`` and ``apply`` read each object and refuse a digest
-that is not the pin. A Glue run reads the jars when it starts, which no plan sees, so the
-platform keeps the prefix write-once: only its own principal may ``s3:PutObject`` there,
-with S3 Object Lock (or a bucket policy that denies overwriting) on the prefix.
+What the check covers: ``tofu plan`` refuses a source whose digest is not the pin, apply
+copies exactly the verified bytes, and runs read only the build's copies, which the job role
+alone reads (it gets no read on the platform's prefix). A new pin is a new copy key. As
+defence in depth the platform still keeps its prefix write-once: only its own principal may
+``s3:PutObject`` there, with S3 Object Lock or a bucket policy that denies overwriting.
 
 Filling the prefix (the platform, once per Glue release): download each jar below from
 Maven Central or packages.confluent.io, check its sha256 against this table, and upload it
 single-part with ``aws s3 cp <jar> s3://<bucket>/<prefix>/<file> --checksum-algorithm
 SHA256`` (:func:`upload_commands`). A recent AWS CLI defaults to CRC64NVME, which leaves no
 SHA-256 for the check. The applier needs ``s3:GetObject`` (and ``kms:Decrypt`` for SSE-KMS)
-on those keys; the job role gets exactly that.
+on those keys, and ``s3:PutObject`` on the build's artifact prefix for the copies.
 """
 
 from __future__ import annotations
@@ -196,6 +200,14 @@ def glue_jars_fingerprint(
     where = f"s3://{location.bucket}/{location.prefix}" if location else ""
     text = "\n".join([where, *(f"{jar.file}={jar.sha256}" for jar in needed)])
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def copy_key(product: str, build: str, jar: GlueJar) -> str:
+    """Where the build keeps its verified copy of ``jar``: its own artifact prefix,
+    content-addressed like the runner (a new pin is a new key)."""
+    from fluid_build.spark import names
+
+    return f"{names.artifact_prefix(product, build)}jars/{jar.sha256[:16]}/{jar.file}"
 
 
 def upload_commands(location: JarsLocation) -> Tuple[str, ...]:
