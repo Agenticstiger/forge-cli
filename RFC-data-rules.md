@@ -2,7 +2,7 @@
 
 **Status:** Proposed (2026-11-16) · **Target schema:** 0.7.7 (preview, per `schema_manager.PREVIEW_VERSIONS`) · **Scope:** `$defs.exposeContract` (`invariants`), `$defs.column` (`identifierFormat`, `placeholders`, `sharedAttribute`), `$defs.semanticRelationship` (`sharedColumns`), one expression language (FLUID SQL/1), and five consumers: the validator, the dbt bridge, the ODCS exporter, the MCP query compiler and FLUX
 
-**Related:** `RFC-semantics-tier1.md` (#445; its §4 relationships and §5 validity windows landed in #894) · `RFC-data-profile-port.md` (#845; measured statistics stay out of the contract) · flux-engine ADR 0008 and `docs/spec/EXPR-SPEC-2.md` (Agenticstiger/flux-engine#38, restructured in #39), which implement §2; every EXPR-SPEC-2 section number cited here is #38's, which #39's follow-up renumbers · FLUX relational data requirements v3, §5.1 (REL-9), §5.3 (COL-4, COL-7) and §5.5 (DQ-3)
+**Related:** `RFC-semantics-tier1.md` (#445; its §4 relationships and §5 validity windows landed in #894) · `RFC-data-profile-port.md` (#845; measured statistics stay out of the contract) · flux-engine ADR 0008 and `docs/spec/EXPR-SPEC-2.md` (Agenticstiger/flux-engine#38, restructured in #39), which implement §2; every EXPR-SPEC-2 section number cited here is #38's, which #39's follow-up renumbers
 
 ---
 
@@ -76,7 +76,7 @@ Where each kind sits:
 
 ---
 
-## 1. Invariants (DQ-3)
+## 1. Invariants
 
 ### 1.1 Shape
 
@@ -152,7 +152,7 @@ An entry has exactly one form: `check`; `derive` with `expr`; `derive` with `agg
 
 ### 1.2 The six kinds
 
-| Kind (DQ-3) | Written as | Example |
+| Kind | Written as | Example |
 |---|---|---|
 | Arithmetic within a row | `derive` and `expr` | `derive: gross`, `expr: "ROUND(net * (1 + tax_rate), 2)"` |
 | Date order | `check` | `"activation_date <= first_use_date AND first_use_date <= min_term_end"` |
@@ -220,7 +220,7 @@ This is what dbt, the ODCS exporter, `fluid profile` and FLUX's own check comput
 
 ### 1.6 What FLUX reads, and what stays in FLUX
 
-FLUX will read every invariant, format, placeholder declaration and shared attribute of the contracts that a Simulation pins, through the contract digest. Changing any of them changes the digest, and the plan refuses until the Simulation pins the new digest (REL-2's rule). EXPR-SPEC-2 §1 left open where rules are declared and which digest covers them. This RFC answers it: the FLUID contract, under the contract digest.
+FLUX will read every invariant, format, placeholder declaration and shared attribute of the contracts that a Simulation pins, through the contract digest. Changing any of them changes the digest, and the plan refuses until the Simulation pins the new digest (the rule that keys come from the contract). EXPR-SPEC-2 §1 left open where rules are declared and which digest covers them. This RFC answers it: the FLUID contract, under the contract digest.
 
 What stays in FLUX documents:
 
@@ -449,7 +449,7 @@ Nine changes follow for EXPR-SPEC-2 as #38 wrote it. The restructured spec (Agen
 
 ---
 
-## 3. Identifier formats (COL-4)
+## 3. Identifier formats
 
 ```yaml
 contract:
@@ -472,7 +472,7 @@ contract:
 
   A mask is 1 to 64 characters, with at least one symbol. There are no repeat counts (COBOL's `9(5)`): write `99999`, so that `(` and `)` stay literal. Prefixes are separate, so `ACC` needs no escaping. Lower-case codes are not in v1; a regex rule covers them.
 - **Compiled regex.** Consumers get one anchored regex per column. The example compiles to `^((MSC|TWR)[0-9]{5}|LEGACY-[A-Z][0-9]-[0-9]{2}[A-Z]{2})$`. Runs of one symbol become counts, and literals are escaped. Only groups, alternation, character ranges and counts appear, so the same text works in ECMA-262 (ODCS `logicalTypeOptions.pattern`), POSIX ERE, RE2 and Python. XSD and I-Regexp (RFC 9485) match whole values and have no anchors, so they take the body without `^` and `$`; that body is an I-Regexp. Python consumers match with `re.fullmatch`, because Python's `$` also matches before a trailing newline.
-- **Enumerable.** An alternative holds `|prefixes|` × 10^d × 26^a × 36^x values, for a mask with d `9`s, a `A`s and x `X`s, so a generator can enumerate them. FLUX's keyed Feistel permutation will decode an ordinal into the mask's mixed radix (COL-4), so every value is unique by construction. Prefix weights, and prefixes taken from a linked row, are FLUX settings.
+- **Enumerable.** An alternative holds `|prefixes|` × 10^d × 26^a × 36^x values, for a mask with d `9`s, a `A`s and x `X`s, so a generator can enumerate them. FLUX's keyed Feistel permutation will decode an ordinal into the mask's mixed radix, so every value is unique by construction. Prefix weights, and prefixes taken from a linked row, are FLUX settings.
 - **No overlap.** Expand every alternative into one pattern per prefix: the prefix's characters, then the mask's. Two patterns from different alternatives overlap when they have the same length and, at every position, character sets that intersect (a literal is a set of one). An overlap is a validation error. Two prefixes of one alternative never overlap, because distinct prefixes of one length differ in a literal. Such a value would not say which alternative made it, and a generator could not keep values unique.
 - **Uniqueness** comes from the column's key or unique flag, not from the format.
 - **Regex rules.** A `validationRules` entry with `type: regex` and `identifierFormat` both apply. A regex can say what a mask cannot (lower case, variable length), but cannot be enumerated. The validator notes a column that declares both.
@@ -481,7 +481,7 @@ contract:
 
 ---
 
-## 4. Placeholder values (COL-7)
+## 4. Placeholder values
 
 ```yaml
     - name: product_code
@@ -504,15 +504,15 @@ contract:
 
 - ODCS `invalidValues` with `arguments.pattern` describes the valid values. To count `TBD_*` it would need a negated pattern, which POSIX ERE (Snowflake) and RE2 (BigQuery) cannot write, and nothing can generate from.
 - ODCS `missingValues` takes a list of values and no pattern, in v3.1.0 and v3.2.0 alike. Frictionless `missingValues` is a list too. Soda's `missing regex` was the only pattern form found, and its regex is written in the engine's dialect.
-- FLUX needs to know that a value is a placeholder, so that it can generate one and list it in the evidence pack (EVD-4). That a value fails a check is not enough.
+- FLUX needs to know that a value is a placeholder, so that it can generate one and list it in the evidence pack's What Was Not Proven list. That a value fails a check is not enough.
 
 So `placeholders` is a declaration that the exporters render into those rules (Consumer impact matrix).
 
-**Sentinels and placeholders are different.** A sentinel stands in for no value, such as `UNKNOWN` in place of NULL. Sentinels stay in column `quality[]` as ODCS `missingValues` (COL-5). A placeholder stands in for a real value that is not known yet, such as `TBD_0042` in place of a product code. The same text should not be both.
+**Sentinels and placeholders are different.** A sentinel stands in for no value, such as `UNKNOWN` in place of NULL. Sentinels stay in column `quality[]` as ODCS `missingValues`. A placeholder stands in for a real value that is not known yet, such as `TBD_0042` in place of a product code. The same text should not be both.
 
 ---
 
-## 5. Shared attributes (REL-9)
+## 5. Shared attributes
 
 **Through one link.**
 
@@ -549,10 +549,10 @@ semantics:
 - On every row of another member whose path reaches an owner row, the value `IS NOT DISTINCT FROM` the owner's. A broken path, a NULL foreign key or an orphan on any hop, leaves the row uncovered.
 - Validation errors: no owner, two candidates, two paths to the owner, one expose carrying the attribute twice, or members of different types.
 - A name matches `^[A-Za-z][A-Za-z0-9_.]*$` and is local to the contract. Equivalence across contracts is out of scope.
-- FLUX will generate the attribute once, on the owner, and copy it along the path: REL-9's one source per attribute. dbt and ODCS consumers check it with the same joins.
+- FLUX will generate the attribute once, on the owner, and copy it along the path: the one source per attribute. dbt and ODCS consumers check it with the same joins.
 - `semanticType` keeps its meaning, a kind of value such as `email` (founder pick, 2026-11-16). Two columns with the same `semanticType` are not one attribute.
 
-**Never inferred from names.** Two columns with the same name on the two ends of a relationship are not assumed to be one attribute: `status` on accounts and `status` on subscriptions usually differ. `fluid validate` notes each same-name pair that is neither shared nor related by an invariant, so that the author decides. FLUX's REL-9 strictness setting may refuse such a pair in a run.
+**Never inferred from names.** Two columns with the same name on the two ends of a relationship are not assumed to be one attribute: `status` on accounts and `status` on subscriptions usually differ. `fluid validate` notes each same-name pair that is neither shared nor related by an invariant, so that the author decides. FLUX's strictness setting for shared attributes may refuse such a pair in a run.
 
 **One source per value** (EXPR-SPEC-2 §10). A column has at most one source among:
 
@@ -672,4 +672,4 @@ Each step is its own PR:
 - COBOL PICTURE symbols: IBM Enterprise COBOL language reference, "Symbols used in the PICTURE clause"
 - Frictionless Table Schema `missingValues`: specs.frictionlessdata.io/table-schema/; Soda missing metrics (`missing regex`): docs.soda.io
 - RFC 9485, I-Regexp: an interoperable regular expression format
-- Internal: flux-engine ADR 0008 and EXPR-SPEC-2 (Agenticstiger/flux-engine#38, restructured in #39); FLUX relational data requirements v3; #894 (relationships and validity); #845 (data profile port); `fluid_build/providers/odcs/mappers/quality.py` (contract quality as ODCS `sql` rules); `fluid_build/engines/dbt/_test_mapping.py`; `fluid_build/iac/row_access.py` (sqlglot predicate parsing)
+- Internal: flux-engine ADR 0008 and EXPR-SPEC-2 (Agenticstiger/flux-engine#38, restructured in #39); #894 (relationships and validity); #845 (data profile port); `fluid_build/providers/odcs/mappers/quality.py` (contract quality as ODCS `sql` rules); `fluid_build/engines/dbt/_test_mapping.py`; `fluid_build/iac/row_access.py` (sqlglot predicate parsing)

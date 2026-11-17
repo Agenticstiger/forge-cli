@@ -210,7 +210,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`<exposeId>.profile.json`) needs an exposeId of `[A-Za-z0-9_.-]` alone, otherwise
     `--out` is required. An `--out` that is the source file is refused.
   - Every value is read, and every statistic formed, by FLUX's shared registry `flux-stats`
-    (MEAS-3) through the one seam `fluid_build/profiler/_stats.py`, so a profile and the
+    (one definition per statistic) through the one seam `fluid_build/profiler/_stats.py`, so a profile and the
     fidelity check read a value one way and form a number one way. Without `flux-stats`,
     `fluid profile` says so, naming the installed version when it cannot be imported, and
     reads nothing. A number that needs more than 1,000 digits written out is refused by its
