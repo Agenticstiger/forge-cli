@@ -172,9 +172,12 @@ def _generate_spark_job(
         lines.append("    return source_df\n")
 
     # Multi-stage helper
-    stages = transformation_intent.stages if transformation_intent else []
-    stage_fns = unique_identifiers(f"stage_{s.get('name', 'stage')}" for s in stages)
-    if pattern == "multi-stage" and stages:
+    stages = (transformation_intent.stages if transformation_intent else None) or []
+    multi_stage = pattern == "multi-stage" and bool(stages)
+    stage_fns = (
+        unique_identifiers(f"stage_{s.get('name', 'stage')}" for s in stages) if multi_stage else []
+    )
+    if multi_stage:
         lines.append("")
         lines.append("# ── Multi-stage transformations ────────────────────────────────────\n")
         for stage, stage_fn in zip(stages, stage_fns, strict=True):
@@ -205,7 +208,7 @@ def _generate_spark_job(
     )
     lines.append('        source_df = spark.read.parquet("s3a://my-bucket/input/")\n')
 
-    if pattern == "multi-stage" and stages:
+    if multi_stage:
         lines.append("        # ── Execute stages ──")
         lines.append("        df = source_df")
         for stage_fn in stage_fns:

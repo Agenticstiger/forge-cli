@@ -367,9 +367,11 @@ def escape_for_docstring(value: Any) -> str:
     blank rather than the literal text ``None``) — matching ``py_str_literal``'s
     ``None`` handling so the two codegen escapers behave consistently. This is
     the single source of truth shared by every provider's DAG-header builder
-    (the snowflake provider's former local copy delegated here).
+    (the snowflake provider's former local copy delegated here). A NUL becomes
+    the escape ``\\x00``: Python refuses a source file that holds one.
     """
-    return ("" if value is None else str(value)).replace("\\", "\\\\").replace('"', '\\"')
+    text = "" if value is None else str(value)
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\x00", "\\x00")
 
 
 def generate_file_header(contract_id: str, contract_name: str, provider: str, **kwargs: Any) -> str:
@@ -431,6 +433,9 @@ def escape_sql_for_python(sql: str) -> str:
     escaped = escaped.replace('"', '\\"')
     # Escape triple quotes if present
     escaped = escaped.replace('"""', '\\"\\"\\""')
+    # A CR would reach the generated value as LF (Python reads a bare CR as a
+    # line end), and Python refuses a source file that holds a NUL.
+    escaped = escaped.replace("\r", "\\r").replace("\x00", "\\x00")
 
     return escaped
 

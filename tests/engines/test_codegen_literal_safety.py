@@ -152,3 +152,23 @@ def test_unique_identifiers_suffix_a_collision_in_order():
         "stage_a_b_3",
         "stage_c",
     ]
+
+
+@pytest.mark.parametrize("generate", _SQL_BLOCK_GENERATORS)
+def test_a_nul_or_a_cr_in_the_sql_keeps_the_script_parseable_and_the_text_whole(generate):
+    sql = "SELECT 1\x00\r\nFROM source\r"
+    source = generate(_contract(expose_id="ord\x00ers"), {"properties": {"sql": sql}})
+    assert any(sql in value for value in _strings(_inert(source)))
+
+
+@pytest.mark.parametrize("pattern", ["multi-stage", "hybrid-reference"])
+def test_stages_that_are_none_or_not_dicts_do_not_stop_generation(pattern):
+    intent = TransformationIntent()
+    intent.stages = None
+    _inert(_generate_spark_job(_contract(), {"pattern": pattern}, transformation_intent=intent))
+    intent.stages = ["not-a-dict"]
+    _inert(
+        _generate_spark_job(
+            _contract(), {"pattern": "hybrid-reference"}, transformation_intent=intent
+        )
+    )
