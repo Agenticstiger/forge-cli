@@ -379,7 +379,11 @@ def _door_dmm_publish_one(contract: Dict[str, Any], tmp_path: Path) -> List[str]
             )
         except ProviderError as exc:
             raise DoorRefused(str(exc)) from exc
-    body = request.call_args_list[0][1]["json_body"]
+    body = next(
+        c[1]["json_body"]
+        for c in request.call_args_list
+        if c[0][0] == "PUT" and c[0][1].startswith("/api/dataproducts/")
+    )
     return _port_contract_ids(body)
 
 

@@ -112,14 +112,28 @@ _RETIRED = "retired"
 
 
 def output_port_contract_ids(product: Optional[Mapping[str, Any]]) -> List[str]:
-    """The ``outputPorts[].contractId`` values of a data product body, in order."""
+    """The contract ids a data product body's output ports name, in order: ODPS
+    ``contractId`` and the DPS 0.0.1 spelling ``dataContractId``."""
     ids: List[str] = []
     ports = product.get("outputPorts") if isinstance(product, Mapping) else None
     for port in ports if isinstance(ports, list) else []:
-        cid = port.get("contractId") if isinstance(port, Mapping) else None
-        if isinstance(cid, str) and cid and cid not in ids:
-            ids.append(cid)
+        if not isinstance(port, Mapping):
+            continue
+        for key in ("contractId", "dataContractId"):
+            cid = port.get(key)
+            if isinstance(cid, str) and cid and cid not in ids:
+                ids.append(cid)
     return ids
+
+
+def is_live_contract(found: Optional[bool], body: Any) -> Optional[bool]:
+    """Whether a read contract is one a port may name: ``True``, ``False`` (absent or
+    retired), or ``None`` when the read could not tell."""
+    if found is None:
+        return None
+    if not found:
+        return False
+    return not (isinstance(body, Mapping) and body.get("status") == _RETIRED)
 
 
 def stale_contract_candidates(
@@ -707,8 +721,9 @@ class _PublishFlowMixin:
             return None, None
 
     def _contract_exists(self, contract_id: str) -> Optional[bool]:
-        found, _ = self._read_json_or_none(f"/api/datacontracts/{quote(contract_id, safe='')}")
-        return found
+        """A retired contract counts as absent: a port must not link to one."""
+        found, body = self._read_json_or_none(f"/api/datacontracts/{quote(contract_id, safe='')}")
+        return is_live_contract(found, body)
 
     def _existing_product(self, product_id: str) -> Optional[Dict[str, Any]]:
         """The product as Entropy holds it before this publish, or ``None``."""

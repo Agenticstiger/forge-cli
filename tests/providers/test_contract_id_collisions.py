@@ -463,7 +463,11 @@ class TestDataMeshManagerMatchesTheOdpsFile:
                 data_product_specification=specification,
             )
 
-        body = request.call_args_list[0][1]["json_body"]
+        body = next(
+            c[1]["json_body"]
+            for c in request.call_args_list
+            if c[0][0] == "PUT" and c[0][1].startswith("/api/dataproducts/")
+        )
         by_name = {p.get("name") or p.get("id"): p for p in body.get("outputPorts") or []}
         assert by_name["items"][reference_key] == "urn:acme:contract:items:1"
         assert by_name["prices"][reference_key] == f"{PRODUCT_ID}.prices"

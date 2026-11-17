@@ -894,8 +894,11 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             return None, None
 
     def _contract_exists(self, contract_id: str) -> Optional[bool]:
-        found, _ = self._read_json(f"/api/datacontracts/{quote(contract_id, safe='')}")
-        return found
+        """A retired contract counts as absent: a port must not link to one."""
+        from fluid_build.providers.datamesh_manager._publish_flow import is_live_contract
+
+        found, body = self._read_json(f"/api/datacontracts/{quote(contract_id, safe='')}")
+        return is_live_contract(found, body)
 
     def _retire_stale_contracts(
         self,

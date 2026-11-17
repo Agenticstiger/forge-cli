@@ -218,6 +218,7 @@ def _native_publish(
     store: Optional[Dict[str, Dict[str, Any]]] = None,
     *,
     publish_contract: bool = True,
+    spec: str = "odps",
 ):
     store = dict(store or {})
     calls: List[tuple] = []
@@ -243,7 +244,7 @@ def _native_publish(
     provider._request = request  # type: ignore[method-assign]
     provider._ensure_team = lambda *a, **k: None  # type: ignore[method-assign]
     result = provider._publish_one(
-        contract, publish_contract=publish_contract, data_product_specification="odps"
+        contract, publish_contract=publish_contract, data_product_specification=spec
     )
     contracts = {
         path.rsplit("/", 1)[-1]: body
@@ -318,3 +319,34 @@ def test_odcs_version_defaults_when_the_expose_has_none(version):
     expose = _expose("kpis") if version is None else _expose("kpis", version=version)
     body = OdcsProvider().render(_product(expose), expose_id="kpis")
     assert body["version"] == "1.0.0"
+
+
+def test_a_dps_port_still_naming_its_contract_keeps_it_active():
+    # The DPS 0.0.1 payload spells the reference ``dataContractId``.
+    store = {f"{PID}.kpis": _contract(f"{PID}.kpis")}
+    result, contracts, product, _ = _native_publish(
+        _product(), _existing_product(f"{PID}.kpis"), store, publish_contract=False, spec="0.0.1"
+    )
+    assert product["outputPorts"][0]["dataContractId"] == f"{PID}.kpis"
+    assert "retired_contracts" not in result
+    assert contracts == {}
+
+
+def test_a_port_does_not_link_to_a_contract_a_publish_retired():
+    # ``old`` was retired when its expose went; the expose is back, but this publish sends
+    # no contract, so the port must not point at the retired one.
+    store = {f"{PID}.old": _contract(f"{PID}.old", status="retired")}
+    _, _, product, _ = _native_publish(
+        _product(_expose("old")), None, store, publish_contract=False
+    )
+    assert "contractId" not in product["outputPorts"][0]
+
+
+@respx.mock
+def test_the_registrar_does_not_link_to_a_retired_contract(monkeypatch):
+    from fluid_build.api import catalog_publication
+
+    monkeypatch.setattr(catalog_publication, "_render_odcs_yaml", lambda *a, **k: None)
+    store = {f"{PID}.kpis": _contract(f"{PID}.kpis", status="retired")}
+    _, _, product = _registrar_publish(_product(), None, store)
+    assert "contractId" not in product["outputPorts"][0]
