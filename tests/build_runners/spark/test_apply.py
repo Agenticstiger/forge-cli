@@ -75,6 +75,32 @@ def test_prepare_refuses_a_plan_made_with_another_maven_mirror(contract, monkeyp
     assert _desired.MAVEN_REPOSITORY_ENV in err.value.context["error"]
 
 
+def test_prepare_refuses_a_plan_made_with_another_glue_jars_prefix(contract, monkeypatch):
+    from fluid_build.iac.providers.aws_glue_jars import JARS_URL_ENV
+    from fluid_build.secrets.policy import ALLOWLIST_ENV
+
+    ref = "aws-sm://commerce/registry#user_info"  # pragma: allowlist secret
+    monkeypatch.setenv(ALLOWLIST_ENV, f"{ref}@registry.example.internal")
+    monkeypatch.delenv(JARS_URL_ENV, raising=False)
+    spark = contract["builds"][0]["properties"]["parameters"]["spark"]
+    spark["runtime"] = "glue"
+    spark.pop("applicationId", None)
+    contract["builds"][0]["properties"]["stream"].update(
+        format="avro-confluent",
+        registry={
+            "kind": "confluent",
+            "url": "https://registry.example.internal",
+            "auth": {"secretRef": ref},
+        },
+    )
+    plan = _bound_plan(contract)
+    monkeypatch.setenv(JARS_URL_ENV, "s3://platform-jars/glue/avro/")
+    with pytest.raises(CLIError) as err:
+        _apply.prepare(contract, build_id=None, verified_plan=plan, dry_run=True)
+    assert err.value.event == "apply_spark_artifact_mismatch"
+    assert JARS_URL_ENV in err.value.context["error"]
+
+
 def test_prepare_refuses_a_plan_that_starts_runs_the_contract_dropped(contract):
     plan = _bound_plan(contract)
     contract["builds"] = []
