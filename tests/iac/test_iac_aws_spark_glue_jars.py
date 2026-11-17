@@ -186,3 +186,23 @@ def test_the_pinned_jar_checks_pass_tofu_validate(monkeypatch, tmp_path):
         [_TOFU, "validate", "-no-color"], cwd=tmp_path, capture_output=True, text=True
     )
     assert done.returncode == 0, done.stderr or done.stdout
+
+
+def test_the_run_fingerprint_follows_the_pins_and_the_prefix(monkeypatch):
+    avro = {"source": {"value": {"format": "avro-confluent"}}}
+    json_config = {"source": {"value": {"format": "json"}}}
+    env = {aws_glue_jars.JARS_URL_ENV: JARS}
+    assert aws_glue_jars.glue_jars_fingerprint(json_config, env) is None
+    first = aws_glue_jars.glue_jars_fingerprint(avro, env)
+    assert first.startswith("sha256:")
+    assert aws_glue_jars.glue_jars_fingerprint(avro, env) == first
+    moved = {aws_glue_jars.JARS_URL_ENV: "s3://platform-jars/spark/glue5-1/"}
+    assert aws_glue_jars.glue_jars_fingerprint(avro, moved) != first
+    bumped = (
+        aws_glue_jars.GlueJar(
+            "za.co.absa:abris_2.12:6.4.1", "abris_2.12-6.4.1.jar", 1, "0" * 64, ""
+        ),
+        *aws_glue_jars.AVRO_JARS[1:],
+    )
+    monkeypatch.setattr(aws_glue_jars, "AVRO_JARS", bumped)
+    assert aws_glue_jars.glue_jars_fingerprint(avro, env) != first

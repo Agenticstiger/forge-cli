@@ -177,6 +177,27 @@ def jars_location(environ: Optional[Mapping[str, str]] = None) -> Optional[JarsL
     return JarsLocation(match["bucket"], match["prefix"])
 
 
+def glue_jars_fingerprint(
+    config: Mapping[str, object], environ: Optional[Mapping[str, str]] = None
+) -> Optional[str]:
+    """What a Glue run loads besides Glue itself, as one digest: the pinned jars' sha256s
+    and the prefix they come from, for a build that needs them; None otherwise.
+
+    For the runs lane's run hash (``build_runners/spark``): a pin bump or a new prefix
+    changes the Glue job's ``--extra-jars``, and a running stream must restart to load
+    them. Raises ValueError on a malformed prefix, as :func:`jars_location` does.
+    """
+    import hashlib
+
+    needed = needed_jars(config)
+    if not needed:
+        return None
+    location = jars_location(environ)
+    where = f"s3://{location.bucket}/{location.prefix}" if location else ""
+    text = "\n".join([where, *(f"{jar.file}={jar.sha256}" for jar in needed)])
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def upload_commands(location: JarsLocation) -> Tuple[str, ...]:
     """How the platform fills the prefix: single-part uploads with a SHA-256 checksum."""
     return tuple(
