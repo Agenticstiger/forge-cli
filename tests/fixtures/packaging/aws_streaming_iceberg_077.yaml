@@ -90,6 +90,8 @@ builds:
           runtime: emr-eks
           mode: batch
           virtualClusterId: abcdefghij0123456789klmno  # pragma: allowlist secret - a made-up id
+          # A batch job reads tables its SQL names: forge cannot derive its role.
+          executionRoleArn: arn:aws:iam::000000000001:role/fluid-iactest-orders-compact
 exposes:
   - exposeId: orders
     kind: table

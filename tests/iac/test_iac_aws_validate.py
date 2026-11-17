@@ -189,14 +189,15 @@ def _init_and_validate(workdir: Path, env: Dict[str, str]) -> None:
 
 def test_iceberg_on_glue_validates(tofu_binary, tofu_env, tmp_path):
     """The Iceberg-on-Glue path emits a module the real Glue provider
-    schema accepts — including the ``table_type=ICEBERG`` parameter."""
+    schema accepts — including the metadata Glue writes for a new Iceberg table."""
     text = build_module(_plugin(), _ICEBERG_CONTRACT)
     (tmp_path / "main.tf.json").write_text(text, encoding="utf-8")
     _init_and_validate(tmp_path, tofu_env)
 
     # The module must carry the Iceberg hint — guards against a silent regression.
     table = next(iter(json.loads(text)["resource"]["aws_glue_catalog_table"].values()))
-    assert table["parameters"]["table_type"] == "ICEBERG"
+    # Glue marks it ICEBERG itself when it writes the first metadata (#915).
+    assert table["open_table_format_input"]["iceberg_input"]["metadata_operation"] == "CREATE"
 
 
 def test_redshift_serverless_contract_validates(tofu_binary, tofu_env, tmp_path):

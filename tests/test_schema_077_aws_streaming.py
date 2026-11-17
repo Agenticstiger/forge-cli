@@ -768,12 +768,13 @@ class TestPackagingResolver:
 # ---------------------------------------------------------------------------
 
 
-def _fluid(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+def _fluid(*args: str, cwd: Path, extra_env: Dict[str, str] = None) -> subprocess.CompletedProcess:
     env = {
         k: v
         for k, v in os.environ.items()
         if k not in {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"}
     }
+    env.update(extra_env or {})
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env["COLUMNS"] = "200"
     return subprocess.run(
@@ -798,8 +799,34 @@ class TestCommands:
 
     def test_generate_iac_aws_runs(self, tmp_path):
         out = tmp_path / "iac"
+        # The operator lists the roles and runtimes the fixture names (the Spark identity
+        # policy: missing entries warn in validate and are refused here).
+        operator = {
+            "FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST": "arn:aws:iam::000000000001:role/",
+            "FLUID_SPARK_TARGET_ALLOWLIST": (
+                "emr-serverless:00fexampleapp0001,"
+                "emr-eks:abcdefghij0123456789klmno,"  # pragma: allowlist secret - an id
+                "msk:arn:aws:kafka:eu-west-1:000000000001:cluster/commerce-events/"
+                "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d-1"
+            ),
+            # The batch build's own SQL, reviewed.
+            "FLUID_SPARK_CONTRACT_SQL_ALLOWLIST": "commerce.orders-stream/compact-orders",
+            # The registry the job reads, and the credential it sends there (#818).
+            "FLUID_ACQUISITION_DEPLOYMENT_HOST_ALLOWLIST": "schema-registry.example.internal",
+            "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST": (
+                "SCHEMA_REGISTRY_AUTH@schema-registry.example.internal"
+            ),
+        }
         done = _fluid(
-            "generate", "iac", str(FIXTURE), "--provider", "aws", "--out", str(out), cwd=tmp_path
+            "generate",
+            "iac",
+            str(FIXTURE),
+            "--provider",
+            "aws",
+            "--out",
+            str(out),
+            cwd=tmp_path,
+            extra_env=operator,
         )
         assert done.returncode == 0, done.stdout + done.stderr
         assert json.loads((out / "main.tf.json").read_text())["resource"]
