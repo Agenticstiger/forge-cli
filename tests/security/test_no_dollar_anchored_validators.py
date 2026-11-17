@@ -1217,11 +1217,6 @@ _ACCEPTED: Dict[Tuple[str, str, str], str] = {
         r"^[a-z0-9][a-z0-9-_.]*[a-z0-9]$|^[a-z0-9]$",
     ): "the token was stripped and its whitespace replaced with '-' just before",
     (
-        "fluid_build/engines/dbt/_types.py",
-        "split_parameterized",
-        r"^([A-Za-z_][A-Za-z0-9_ ]*?)\s*\(\s*([^()]*)\s*\)$",
-    ): "matches fluid_type.strip() and returns the captured parts",
-    (
         "fluid_build/exporters/sodacl.py",
         "_convert_dq_rule",
         r"^[A-Za-z_][A-Za-z0-9_]*$",

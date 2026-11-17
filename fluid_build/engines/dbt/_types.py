@@ -45,6 +45,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from fluid_build.util.column_type import split_param_list, split_type_params
+
 # The pre-existing generic mapping — must stay byte-for-byte identical to the
 # historical ``models._sql_type`` table (skeleton-cast behavior is pinned).
 _GENERIC: Dict[str, str] = {
@@ -313,28 +315,28 @@ _PARAMETRIC: Dict[str, frozenset] = {
 }
 
 # ``base(args)`` — one level of parentheses, no nesting (no FLUID scalar
-# maps to a constructed type such as ``struct<...>``).
-_PARAM_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_ ]*?)\s*\(\s*([^()]*)\s*\)$")
+# maps to a constructed type such as ``struct<...>``). The base is checked
+# here; :func:`split_type_params` steps over quoted ``enum`` levels.
+_BASE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_ ]*")
 
 
 def split_parameterized(fluid_type: str) -> Tuple[str, Optional[str]]:
     """Split ``"decimal(18,4)"`` into ``("decimal", "18,4")``.
 
     Returns ``(fluid_type, None)`` for an unparameterized type. Whitespace
-    inside the argument list is normalised so ``number(12, 2)`` and
+    around each argument is normalised so ``number(12, 2)`` and
     ``number(12,2)`` emit the same SQL — generated artifacts must be
-    byte-stable for the same contract intent.
+    byte-stable for the same contract intent. A quoted ``enum`` level keeps
+    its text: ``enum('a, b')`` gives ``("enum", "'a, b'")``.
     """
     if not isinstance(fluid_type, str):
         return "", None
-    match = _PARAM_RE.match(fluid_type.strip())
-    if match is None:
+    base, args = split_type_params(fluid_type)
+    if args is None or not _BASE_RE.fullmatch(base):
         return fluid_type.strip(), None
-    base, args = match.group(1).strip(), match.group(2).strip()
     if not args:
         return base, None
-    normalized = ",".join(part.strip() for part in args.split(","))
-    return base, normalized
+    return base, ",".join(split_param_list(args))
 
 
 def _lookup(table: Mapping[str, str], base: str, fallback: str) -> str:
@@ -381,7 +383,9 @@ def sql_type(fluid_type: str, adapter: Optional[str] = None) -> str:
     else:
         resolved = _lookup(table, base, _ADAPTER_FALLBACK[adapter_key])
 
-    if args and resolved in _PARAMETRIC[adapter_key]:
+    # An enum's parameters are its levels, never a length or a precision, so
+    # the string type that holds the column takes none of them.
+    if args and resolved in _PARAMETRIC[adapter_key] and base.lower() != "enum":
         return f"{resolved}({args})"
     return resolved
 

@@ -9,6 +9,8 @@ import logging
 import re
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from fluid_build.util.column_type import split_param_list, split_type_params
+
 logger = logging.getLogger(__name__)
 
 # FLUID source type → ODCS v3.1.0 logicalType.
@@ -140,10 +142,9 @@ _LOGICAL_TO_FLUID: Dict[str, str] = {
 # split the parameter suffix off before consulting the tables; a whole-string
 # lookup sends every parameterized column to the ``string`` default and throws
 # away exactly the precision/scale/length the contract took the trouble to state.
-_PARAMETERIZED_TYPE_RE = re.compile(
-    r"^\s*(?P<base>[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*?)"
-    r"\s*(?:\(\s*(?P<params>[^()]*?)\s*\))?\s*$"
-)
+# :func:`split_type_params` finds the parameter list, stepping over quoted ``enum`` levels;
+# the base must be one or more words.
+_PARAMETERIZED_BASE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*")
 
 
 def split_parameterized(fluid_type: str) -> Tuple[str, Tuple[str, ...]]:
@@ -151,22 +152,21 @@ def split_parameterized(fluid_type: str) -> Tuple[str, Tuple[str, ...]]:
 
     ``"decimal(18,4)"`` → ``("decimal", ("18", "4"))``;
     ``"VARCHAR( 255 )"`` → ``("varchar", ("255",))``;
-    ``"timestamp"``     → ``("timestamp", ())``.
+    ``"timestamp"``     → ``("timestamp", ())``;
+    ``"enum('a)b', 'c, d')"`` → ``("enum", ("'a)b'", "'c, d'"))``.
 
     The base is lower-cased so the tables stay case-insensitive. A type that
     does not match the parameterized grammar is returned lower-cased with no
     parameters, which keeps the callers' behaviour identical to a plain lookup.
     """
     raw = str(fluid_type).strip()
-    match = _PARAMETERIZED_TYPE_RE.match(raw)
-    if not match:
+    base, params_raw = split_type_params(raw)
+    if not _PARAMETERIZED_BASE_RE.fullmatch(base):
         return raw.lower(), ()
-    base = re.sub(r"\s+", " ", match.group("base")).lower()
-    params_raw = match.group("params")
+    base = re.sub(r"\s+", " ", base).lower()
     if not params_raw:
         return base, ()
-    params = tuple(p.strip() for p in params_raw.split(",") if p.strip())
-    return base, params
+    return base, tuple(p for p in split_param_list(params_raw) if p)
 
 
 def fluid_to_logical(fluid_type: str) -> str:
@@ -207,7 +207,9 @@ def logical_type_options(fluid_type: str) -> Dict[str, Any]:
     emit the key only when it has content.
     """
     base, params = split_parameterized(fluid_type)
-    if not params:
+    # An enum's parameters are its levels, never a length: ``enum(10)`` names
+    # one level, 10.
+    if not params or base == "enum":
         return {}
     numeric: List[int] = []
     for param in params:
@@ -639,7 +641,9 @@ def fluid_to_physical(fluid_type: str, provider: Optional[str]) -> Optional[str]
             physical = table.get(base)
             if physical is None:
                 return None
-            if not params or keys in _UNPARAMETERIZED_PHYSICAL_PROVIDERS:
+            # An enum's parameters are its levels, not a length: the string
+            # type that holds the column takes none of them.
+            if not params or base == "enum" or keys in _UNPARAMETERIZED_PHYSICAL_PROVIDERS:
                 return physical
             return f"{physical}({','.join(params)})"
     return fluid_to_logical(fluid_type)

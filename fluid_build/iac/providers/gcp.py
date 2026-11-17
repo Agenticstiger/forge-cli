@@ -154,7 +154,9 @@ def _bq_outcome(raw: Any) -> column_types.TypeOutcome:
             "with fields, and this emitter does not write either yet",
             column_types.NESTED_FIX,
         )
-    if not rest.isascii():
+    # An enum's parameters are its levels, which may hold any character;
+    # BigQuery stores the column as STRING and never reads them.
+    if base != "enum" and not rest.isascii():
         return column_types.refused(
             f"whose parameters ({rest}) are not ASCII", "Declare the type with ASCII digits."
         )
