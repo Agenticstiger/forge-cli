@@ -117,7 +117,11 @@ _PROVIDER_TYPE_MAP: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
-from fluid_build.providers.datamesh_manager._ids import dmm_product_id, with_dmm_product_ids
+from fluid_build.providers.datamesh_manager._ids import (
+    dmm_product_id,
+    needs_existing_ids,
+    with_dmm_product_ids,
+)
 from fluid_build.providers.datamesh_manager._odps_helpers import (
     ensure_odps_archetype_custom_property,
 )
@@ -359,6 +363,17 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 break
         return products
 
+    def _held_product_ids(self) -> Optional[set]:
+        """The product ids Entropy holds, or ``None`` when they cannot be read."""
+        try:
+            products = self.list_products()
+        except Exception as exc:  # noqa: BLE001 — only informs how upstream ids are spelled
+            self._log.warning("Could not list data products: %s", exc)
+            return None
+        if not isinstance(products, list):
+            return None
+        return {str(p.get("id")) for p in products if isinstance(p, dict) and p.get("id")}
+
     def list_teams(self) -> List[Dict[str, Any]]:
         """GET all teams."""
         self._require_api_key()
@@ -495,7 +510,10 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
     ) -> Dict[str, Any]:
         # One spelling of every product id, this one's and its upstreams' (Entropy ids
         # are case-sensitive): see ``_ids.with_dmm_product_ids``.
-        fluid = with_dmm_product_ids(fluid)
+        fluid = with_dmm_product_ids(
+            fluid,
+            self._held_product_ids() if not dry_run and needs_existing_ids(fluid) else None,
+        )
         dp = self._to_data_product(
             fluid,
             data_product_specification=data_product_specification,

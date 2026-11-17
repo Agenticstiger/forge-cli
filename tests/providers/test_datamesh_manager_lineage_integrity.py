@@ -212,3 +212,66 @@ def test_a_contract_that_failed_to_render_leaves_its_port_without_a_contract_id(
     assert ports == {"ok": "p.ok", "broken": None}
     order = [p for m, p, _ in calls if m == "PUT"]
     assert order.index("/api/datacontracts/p.ok") < order.index("/api/dataproducts/p")
+
+
+# ── C, the other side: an upstream Entropy holds under a mixed-case id ───
+
+
+def test_an_upstream_entropy_holds_as_written_is_consumed_as_written_native():
+    # Not published by forge (forge would have slugged it): Entropy has "Acme.Orders".
+    consumer = _product("hub", consumes=[{"productId": "Acme.Orders", "exposeId": "orders"}])
+    result, product, calls = _native(consumer, existing=("Acme.Orders",))
+    assert [p["contractId"] for p in product["inputPorts"]] == ["Acme.Orders.orders"]
+    access = [b for m, p, b in calls if m == "PUT" and p.startswith("/api/access/")]
+    assert [a["provider"]["dataProductId"] for a in access] == ["Acme.Orders"]
+
+
+@respx.mock
+def test_an_upstream_entropy_holds_as_written_is_consumed_as_written_registrar():
+    consumer = _product("hub", consumes=[{"productId": "Acme.Orders", "exposeId": "orders"}])
+    _, product, puts = _registrar(consumer, existing=("Acme.Orders",))
+    assert [p["contractId"] for p in product["inputPorts"]] == ["Acme.Orders.orders"]
+    access = [b for p, b in puts if p.startswith("/api/access/")]
+    assert [a["provider"]["dataProductId"] for a in access] == ["Acme.Orders"]
+
+
+def test_a_dry_run_slugs_an_upstream_it_cannot_look_up():
+    provider = DataMeshManagerProvider(api_key="k", api_url=API)
+    provider._request = MagicMock(side_effect=AssertionError("dry run sent a request"))
+    consumer = _product(
+        "hub", consumes=[{"productId": "Silver.Sales.Orders", "exposeId": "orders"}]
+    )
+    result = provider._publish_one(consumer, dry_run=True, data_product_specification="odps")
+    assert [p["contractId"] for p in result["payload"]["inputPorts"]] == [
+        "silver.sales.orders.orders"
+    ]
+
+
+@respx.mock
+def test_the_legacy_registrar_entry_points_use_the_slugged_id():
+    respx.put(url__regex=rf"{API}/api/.*").mock(return_value=httpx.Response(200, json={}))
+    deleted = respx.delete(url__regex=rf"{API}/api/dataproducts/.*").mock(
+        return_value=httpx.Response(200)
+    )
+    registrar = DataMeshManagerRegistrar(api_token="t")
+    contract = _product("Silver.Sales.Orders", "orders")
+    assert registrar.register("Silver.Sales.Orders", "orders", contract, {}).succeeded
+    paths = [c.request.url.path for c in respx.calls if c.request.method == "PUT"]
+    assert "/api/dataproducts/silver.sales.orders" in paths
+    assert "/api/datacontracts/silver.sales.orders.orders" in paths
+    assert registrar.unregister("Silver.Sales.Orders", "orders").succeeded
+    assert [c.request.url.path for c in deleted.calls] == ["/api/dataproducts/silver.sales.orders"]
+
+
+def test_the_upstream_lookup_waits_for_the_endpoint_check(monkeypatch):
+    # Looking up how upstream ids are spelled reads the product list with the key; a
+    # refused plain-http endpoint must see no request at all.
+    monkeypatch.delenv("DMM_ALLOW_INSECURE_HTTP", raising=False)
+    consumer = _product("hub", consumes=[{"productId": "Acme.Orders", "exposeId": "orders"}])
+    payload = CatalogPublicationPayload.from_contract(consumer, {})
+    with respx.mock(assert_all_called=False) as mock:
+        sent = mock.route().mock(return_value=httpx.Response(200, json=[]))
+        result = DataMeshManagerRegistrar(
+            api_url="http://dmm.example.com", api_token="t"
+        ).register_payload(payload)
+    assert not result.succeeded and not sent.calls
