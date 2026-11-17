@@ -677,6 +677,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fluid profile --help` names every code a withheld value can carry.** It listed A, O, T and
+  M, but the profiler also withholds a sum whose records hold at most two values with C
+  (`fluid_build/profiler/disclosure.py`), as FLUX's PROFILE-SPEC lists. The help now names all
+  five, each with what it means, as the run's summary line already did.
 - **`fluid plan` warned about a `{{ env.PGPASSWORD }}` it never used.** Since the Databricks
   Genie space joined the plan, `fluid plan` resolved every contract's `{{ env.* }}` before
   looking for the one plugin hook that reads them, so a contract on any other platform with a
