@@ -59,6 +59,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Scheduled Spark builds run `fluid spark run` from Airflow.** A build of `engine: spark` with a
+  cron trigger gets a DAG whose one task, `fluid_spark_run`, runs `fluid spark run <contract>
+  --build-id <id> [--env <env>] --json` on the worker, through the same hardened script as the
+  `fluid apply` DAGs (`env -i`, values only as environment variables). The command waits for the
+  run on EMR Serverless, Glue, EMR on EC2 or EMR on EKS and exits 0 only when it succeeded, so
+  the task fails when the run does. `execution.runtime.timeout` (an ISO-8601 duration) is the
+  run's wait, passed as `--timeout`; the task's own timeout is that plus ten minutes (six hours
+  and ten minutes when unset). Retries come from `execution.retries.maxAttempts`, as for every
+  scheduled build. A streaming Spark build that is not `trigger.availableNow` gets no DAG: `fluid
+  apply` keeps it running. The DAG's docstring names the line MWAA needs in `requirements.txt`,
+  `data-product-forge[aws]==<release>` (unpinned for a development build).
+
 - **Schema 0.7.7 (preview): rules about valid data** (RFC-data-rules.md, implementation step 1).
   `exposes[].contract.invariants[]` declares checks, derived columns (`derive` with `expr`, or
   with an `aggregate` over child rows), and functional dependencies. Each carries an optional
