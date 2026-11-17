@@ -187,9 +187,10 @@ def retired_contract_body(
 
 
 def drop_unresolved_port_contract_ids(
-    product: Mapping[str, Any], sent_ids: set, exists: Any
+    product: Mapping[str, Any], sent_ids: set, exists: Any, *, key: str = "contractId"
 ) -> List[str]:
-    """Remove each ``outputPorts[].contractId`` that names a contract nobody has.
+    """Remove each ``outputPorts[].<key>`` (ODPS ``contractId``, DPS ``dataContractId``)
+    that names a contract nobody has.
 
     A port's contract resolves when this publish sends it, or when ``exists(id)`` says
     Entropy has it. ``exists`` returns ``True``, ``False`` (absent: the reference is
@@ -198,11 +199,11 @@ def drop_unresolved_port_contract_ids(
     dropped: List[str] = []
     ports = product.get("outputPorts")
     for port in ports if isinstance(ports, list) else []:
-        cid = port.get("contractId") if isinstance(port, dict) else None
+        cid = port.get(key) if isinstance(port, dict) else None
         if not isinstance(cid, str) or not cid or cid in sent_ids:
             continue
         if exists(cid) is False:
-            del port["contractId"]
+            del port[key]
             dropped.append(cid)
     return dropped
 

@@ -288,10 +288,23 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
     @staticmethod
     def _normalize_api_url(value: str) -> str:
         url = str(value or _DEFAULT_API_URL).strip().rstrip("/")
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+        except ValueError as exc:
+            # urlparse raises on a malformed bracketed host (``http://[::1]\@x``,
+            # ``http://[not-an-ip]``); that is a bad setting, not a crash. The URL is not
+            # echoed: it can carry userinfo.
             raise ProviderError(
-                f"Invalid Data Mesh Manager API URL {value!r}. Expected an http(s) URL."
+                f"Invalid Data Mesh Manager API URL: it does not parse ({exc}). "
+                "Set DMM_API_URL to an http(s) URL."
+            ) from exc
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            # Scheme only: the URL can carry userinfo (a user and password before ``@``).
+            raise ProviderError(
+                f"Invalid Data Mesh Manager API URL (scheme {parsed.scheme or 'none'!r}, "
+                f"{'a' if parsed.netloc else 'no'} host). Expected an http(s) URL in "
+                "DMM_API_URL."
             )
 
         allow_insecure = str(os.getenv("DMM_ALLOW_INSECURE_HTTP", "")).strip().lower() in {
@@ -300,7 +313,6 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             "yes",
             "on",
         }
-        host = (parsed.hostname or "").lower()
         if parsed.scheme == "http" and host not in _LOCAL_HTTP_HOSTS and not allow_insecure:
             raise ProviderError(
                 "Refusing to send DMM credentials over plain HTTP to a non-local host "
@@ -679,19 +691,21 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             if r.get("success") and r.get("contract_id")
         }
 
-        dropped_contract_ids: List[str] = []
-        if is_odps_payload:
-            # A port names only a contract this publish sent or Entropy already has.
-            dropped_contract_ids = drop_unresolved_port_contract_ids(
-                dp, sent_contract_ids, self._contract_exists
+        # Both formats; the DPS payload spells the reference ``dataContractId``.
+        # A port names only a contract this publish sent or Entropy already has.
+        dropped_contract_ids = drop_unresolved_port_contract_ids(
+            dp,
+            sent_contract_ids,
+            self._contract_exists,
+            key="contractId" if is_odps_payload else "dataContractId",
+        )
+        for contract_id in dropped_contract_ids:
+            self._log.warning(
+                "Output port contract %s did not land in Entropy (%s); the port goes "
+                "out without a contractId.",
+                contract_id,
+                "its publish failed" if publish_contract else "--with-contract sends it",
             )
-            for contract_id in dropped_contract_ids:
-                self._log.warning(
-                    "Output port contract %s did not land in Entropy (%s); the port goes "
-                    "out without a contractId.",
-                    contract_id,
-                    "its publish failed" if publish_contract else "--with-contract sends it",
-                )
 
         # PUT data product
         resp = self._request("PUT", f"/api/dataproducts/{product_id}", json_body=dp)

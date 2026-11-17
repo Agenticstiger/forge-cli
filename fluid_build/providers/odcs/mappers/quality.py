@@ -299,12 +299,18 @@ def _attach_declared_quality(
         if isinstance(p, dict) and isinstance(p.get("name"), str)
     }
 
+    placed: Set[str] = set()  # ids this export placed, as against ones it arrived with
     dq = contract.get("dq")
     rules = dq.get("rules") if isinstance(dq, Mapping) else None
     for rule in rules or []:
         if not isinstance(rule, Mapping):
             continue
         check, reason = _dq_rule_to_quality(rule)
+        columns: List[str] = []
+        if check is not None and rule.get("type") in _DQ_LIBRARY_METRICS:
+            columns, reason = _dq_rule_columns(rule, properties)
+            if not columns:
+                check = None
         if check is None:
             ctx.logger.warning(
                 "dq rule %r (type %r) on expose %r has no ODCS v3.1.0 quality form: %s. "
@@ -318,12 +324,35 @@ def _attach_declared_quality(
                 reason,
             )
             continue
-        rule_id = _stable_id(rule.get("id") or rule.get("type"))
-        if rule_id in taken:
+        base_id = rule.get("id") or rule.get("type")
+        if not columns:
+            # freshness: a custom rule, on the column it names when the schema declares
+            # it, else on the object (as before).
+            rule_id = _stable_id(base_id)
+            if rule_id in taken:
+                continue
+            taken.add(rule_id)
+            _append_quality(properties.get(rule.get("selector")) or obj, {"id": rule_id, **check})
             continue
-        taken.add(rule_id)
-        target = properties.get(rule.get("selector")) or obj
-        _append_quality(target, {"id": rule_id, **check})
+        # An ODCS document an earlier export wrote may carry this rule on the schema
+        # object, where a selector that was not exactly one property name put it. The
+        # rule now goes on its columns; the misplaced copy goes, or a re-export of that
+        # document would carry both.
+        if _drop_object_library_check(obj, _stable_id(base_id)):
+            taken.discard(_stable_id(base_id))
+        for column in columns:
+            # One column keeps the rule's own id; several get one each.
+            rule_id = _stable_id(base_id) if len(columns) == 1 else _stable_id(base_id, column)
+            target = properties[column]
+            if rule_id in _quality_ids(target) and rule_id not in placed:
+                continue  # re-export: the rule arrived on this column already
+            if rule_id in taken:
+                # Another rule or a derived check holds the id (``a b`` and ``a_b``
+                # sanitise alike): a unique one, never a dropped check.
+                rule_id = _claim(rule_id, taken)
+            taken.add(rule_id)
+            placed.add(rule_id)
+            _append_quality(target, {"id": rule_id, **check})
 
     for expr in contract.get("quality") or []:
         if not isinstance(expr, Mapping) or not expr.get("expression"):
@@ -333,6 +362,35 @@ def _attach_declared_quality(
             continue
         taken.add(rule_id)
         _append_quality(obj, {"id": rule_id, **_expression_to_quality(expr)})
+
+
+def _quality_ids(target: Mapping[str, Any]) -> Set[str]:
+    """The ids in one ``quality`` array (an object's or a property's own)."""
+    return {
+        str(q["id"])
+        for q in target.get("quality") or []
+        if isinstance(q, Mapping) and q.get("id") is not None
+    }
+
+
+def _drop_object_library_check(obj: Dict[str, Any], rule_id: str) -> bool:
+    """Remove an object-level library check with ``rule_id``; ``True`` when one went.
+
+    Rebinds ``obj["quality"]`` rather than mutating it: the schema mapper hands it the
+    FLUID contract's own pass-through list by reference (see :func:`_append_quality`).
+    """
+    quality = obj.get("quality")
+    if not isinstance(quality, list):
+        return False
+    kept = [
+        q
+        for q in quality
+        if not (isinstance(q, Mapping) and q.get("type") == "library" and q.get("id") == rule_id)
+    ]
+    if len(kept) == len(quality):
+        return False
+    obj["quality"] = kept
+    return True
 
 
 def _existing_ids(obj: Mapping[str, Any]) -> Set[str]:
@@ -418,6 +476,40 @@ def _dq_rule_to_quality(rule: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any
         "invalidValues, duplicateValues, rowCount), a sql query or a named custom engine, "
         f"and a {rule_type!r} rule supplies none of them"
     )
+
+
+def _dq_rule_columns(
+    rule: Mapping[str, Any], properties: Mapping[str, Any]
+) -> Tuple[List[str], str]:
+    """The properties a completeness / uniqueness / valid_values rule checks, or ``([], reason)``.
+
+    ``selector`` reads as ``util/dq_checks.py`` (``fluid test``) reads it: a column, or
+    several comma-separated, matched exactly or, failing that, by the one name that
+    differs only in case. Completeness and valid_values check each listed column;
+    uniqueness checks one, because a list could mean each column or their combination.
+    A rule that selects no column (none, ``*``) or one the schema does not declare is not
+    exported: placed on the schema object, a ``nullValues`` check names no column.
+    """
+    raw = rule.get("selector")
+    text = raw.strip() if isinstance(raw, str) else ""
+    if not text or text == "*":
+        return [], "it selects no column, and the check is about columns"
+    columns: List[str] = []
+    for part in (p.strip() for p in text.split(",")):
+        name = part if part in properties else None
+        if name is None:
+            folded = [c for c in properties if c.lower() == part.lower()]
+            name = folded[0] if len(folded) == 1 else None
+        if name is None:
+            return [], f"it selects {part!r}, which the expose's schema does not declare"
+        if name not in columns:
+            columns.append(name)
+    if rule.get("type") == "uniqueness" and len(columns) > 1:
+        return [], (
+            "a uniqueness rule checks one column; a list could mean each column or their "
+            "combination"
+        )
+    return columns, ""
 
 
 def _dq_threshold(rule: Mapping[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:

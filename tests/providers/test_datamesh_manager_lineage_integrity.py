@@ -275,3 +275,103 @@ def test_the_upstream_lookup_waits_for_the_endpoint_check(monkeypatch):
             api_url="http://dmm.example.com", api_token="t"
         ).register_payload(payload)
     assert not result.succeeded and not sent.calls
+
+
+# ── C2: a slug Entropy holds wins over a stale as-written copy ───────────
+
+
+def test_the_slug_wins_when_entropy_holds_both_spellings_native():
+    # A registrar publish before the slug fix left "Acme.Orders"; the next one wrote
+    # "acme.orders". The live product is the slug.
+    consumer = _product("hub", consumes=[{"productId": "Acme.Orders", "exposeId": "o"}])
+    _, product, calls = _native(consumer, existing=("Acme.Orders", "acme.orders"))
+    assert [p["contractId"] for p in product["inputPorts"]] == ["acme.orders.o"]
+    access = [b for m, p, b in calls if m == "PUT" and p.startswith("/api/access/")]
+    assert [a["provider"]["dataProductId"] for a in access] == ["acme.orders"]
+
+
+@respx.mock
+def test_the_slug_wins_when_entropy_holds_both_spellings_registrar():
+    consumer = _product("hub", consumes=[{"productId": "Acme.Orders", "exposeId": "o"}])
+    _, product, _ = _registrar(consumer, existing=("Acme.Orders", "acme.orders"))
+    assert [p["contractId"] for p in product["inputPorts"]] == ["acme.orders.o"]
+
+
+def test_an_unreadable_product_list_slugs_and_says_so(caplog):
+    import logging
+
+    from fluid_build.build_runners.catalog_registrars import datamesh_manager as reg_mod
+
+    registrar = DataMeshManagerRegistrar(api_token="t")
+    consumer = _product("hub", consumes=[{"productId": "Acme.Orders", "exposeId": "o"}])
+    payload = CatalogPublicationPayload.from_contract(consumer, {})
+    with patch.object(reg_mod.DataMeshManagerRegistrar, "_read_product_ids", return_value=None):
+        with caplog.at_level(logging.WARNING):
+            out = registrar._with_dmm_product_ids(payload)
+    assert out.contract["consumes"][0]["productId"] == "acme.orders"
+    assert any("could not" in r.getMessage().lower() for r in caplog.records), caplog.text
+
+
+# ── A2: the DPS payload drops a dangling dataContractId too ──────────────
+
+
+def test_a_dps_port_whose_contract_failed_names_none():
+    from fluid_build.providers.odcs import OdcsProvider
+
+    real = OdcsProvider.render
+
+    def render(self, fluid, *args, expose_id=None, **kw):
+        if expose_id == "broken":
+            raise RuntimeError("cannot render")
+        return real(self, fluid, *args, expose_id=expose_id, **kw)
+
+    calls: List[tuple] = []
+
+    def request(method: str, path: str, *, json_body: Any = None):
+        calls.append((method, path, json_body))
+        if method == "GET" and path.startswith(("/api/dataproducts/", "/api/datacontracts/")):
+            raise ProviderError(f"Entropy Data API error 404 on GET {path}: none")
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = []
+        return resp
+
+    provider = DataMeshManagerProvider(api_key="k", api_url=API)
+    provider._request = request  # type: ignore[method-assign]
+    provider._ensure_team = lambda *a, **k: None  # type: ignore[method-assign]
+    with patch.object(OdcsProvider, "render", render):
+        provider._publish_one(
+            _product("p", "ok", "broken"),
+            publish_contract=True,
+            data_product_specification="0.0.1",
+        )
+    product = next(b for m, p, b in calls if m == "PUT" and p == "/api/dataproducts/p")
+    ports = {p["id"]: p.get("dataContractId") for p in product["outputPorts"]}
+    assert ports == {"ok": "p.ok", "broken": None}
+
+
+# ── B2: one contract consumed twice with different source systems ────────
+
+
+def test_a_contract_consumed_with_two_source_systems_links_neither(caplog):
+    import logging
+
+    consumes = [
+        {
+            "productId": "crm",
+            "exposeId": "a",
+            "name": "one",
+            "contractId": "shared",
+            "sourceSystem": "s1",
+        },
+        {
+            "productId": "crm",
+            "exposeId": "a",
+            "name": "two",
+            "contractId": "shared",
+            "sourceSystem": "s2",
+        },
+    ]
+    with caplog.at_level(logging.WARNING):
+        _, product, _ = _native(_product("hub", consumes=consumes))
+    assert all(_custom(p).get("sourceSystemId") is None for p in product["inputPorts"])
+    assert any("shared" in r.getMessage() for r in caplog.records), caplog.text
