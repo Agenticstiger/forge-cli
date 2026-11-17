@@ -195,6 +195,8 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
         return {
             "stage": "plan",
             "displayName": "Plan (stages 1-6)",
+            # A scheduled run is for the add-ons: it plans and applies nothing.
+            "condition": "ne(variables['Build.Reason'], 'Schedule')",
             "jobs": [{"job": "plan", "pool": {"vmImage": "ubuntu-latest"}, "steps": steps}],
         }
 
@@ -219,10 +221,11 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
             "stage": "apply",
             "displayName": "Apply (stages 7-11)",
             "dependsOn": "plan",
-            # Never a pull request: only the default branch, whether pushed to or
-            # run by hand there.
+            # Never a pull request or a scheduled run: only the default branch,
+            # whether pushed to or run by hand there.
             "condition": (
-                f"and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/{branch}'))"
+                f"and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/{branch}'), "
+                "ne(variables['Build.Reason'], 'Schedule'))"
             ),
             "jobs": [
                 {
@@ -242,7 +245,8 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
         when = {
             "security": None,  # every run: pull requests and the default branch
             "sbom": f"eq(variables['Build.SourceBranch'], 'refs/heads/{branch}')",
-            "compliance": "eq(variables['Build.Reason'], 'Manual')",
+            # fluid verify reaches the cloud: a run by hand or a schedule you add.
+            "compliance": "in(variables['Build.Reason'], 'Manual', 'Schedule')",
         }[add_on]
         script = self._cd(config) + "\n".join(
             _thin.add_on_script(add_on, config.contract_path or _thin.DEFAULT_CONTRACT)
@@ -292,7 +296,8 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
             "also runs stages 7-11 (apply) as a deployment job in the Azure DevOps",
             f"environment named after FLUID_ENV (default {env_default}). Add approvals and",
             "checks to that environment (Pipelines > Environments) so nothing is applied",
-            "unreviewed. A pull request never reaches apply.",
+            "unreviewed. A pull request never reaches apply, and a scheduled run (add one",
+            "under Triggers for the add-ons) plans and applies nothing.",
             "",
             "FLUID_PACKAGE_SPEC, FLUID_PIP_INDEX_URL, FLUID_PIP_EXTRA_INDEX_URL and",
             "FLUID_ALLOW_PRERELEASE are not parameters: set them as pipeline or variable-group",

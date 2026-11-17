@@ -1384,3 +1384,17 @@ def test_only_the_default_branch_applies_a_manual_run_included() -> None:
     assert [rule for rule in rules if rule.get("when") != "never"] == [
         {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH", "when": "manual"}
     ]
+
+
+def test_an_azure_schedule_runs_the_add_ons_only() -> None:
+    # A schedule added for the add-ons must not plan or apply (as on GitLab and CircleCI).
+    document = yaml.safe_load(
+        _files(P.AZURE_DEVOPS, add_ons=("security", "compliance", "sbom"))["azure-pipelines.yml"]
+    )
+    stages = {stage["stage"]: stage for stage in document["stages"]}
+    assert stages["plan"]["condition"] == "ne(variables['Build.Reason'], 'Schedule')"
+    assert "ne(variables['Build.Reason'], 'Schedule')" in stages["apply"]["condition"]
+    assert stages["compliance"]["condition"] == (
+        "in(variables['Build.Reason'], 'Manual', 'Schedule')"
+    )
+    assert "condition" not in stages["security"]
