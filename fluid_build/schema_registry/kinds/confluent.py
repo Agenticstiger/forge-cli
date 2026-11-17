@@ -80,6 +80,7 @@ class ConfluentKind(RegistryKind):
     registering_cloud = "confluent"
     bind_hint = "bind the topic with platform: confluent and format: kafka_topic"
     fields = frozenset({"url", "auth"})
+    refuses = frozenset({"registryName"})
     checks_compatibility = True
 
     def field_errors(self, spec: Mapping[str, Any], where: str) -> List[str]:

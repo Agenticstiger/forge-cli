@@ -30,6 +30,9 @@ class RegistryKind:
     subject_pattern: "re.Pattern[str]" = _ANY_SUBJECT
     #: The spec fields this kind adds beyond kind, subject, version and compatibility.
     fields: FrozenSet[str] = frozenset()
+    #: Other kinds' fields that :meth:`field_errors` refuses with its own message; any
+    #: other kind's field gets the generic "is for kind: X" refusal (``reference``).
+    refuses: FrozenSet[str] = frozenset()
     #: Whether the registry answers a dry-run compatibility check.
     checks_compatibility: bool = False
 
@@ -52,8 +55,13 @@ class RegistryKind:
     def egress_findings(
         self, subject: Any, *, stage: str, environ: Optional[Mapping[str, str]] = None
     ) -> List[Tuple[str, str]]:
-        """``(severity, message)`` for where a request for ``subject`` would go."""
-        return []
+        """``(severity, message)`` for where a request for ``subject`` would go.
+
+        Every kind states its own rules, even when it has none to state (Glue: IAM, no
+        contract-named host): :func:`register_kind` refuses a kind that does not override
+        this, so a new HTTP kind cannot silently skip the host and credential checks.
+        """
+        raise NotImplementedError(f"registry kind {self.name!r} states no egress rules")
 
     def produced_checks(
         self, subject: Any, *, stage: str, environ: Optional[Mapping[str, str]] = None
@@ -108,9 +116,15 @@ _KINDS: Dict[str, RegistryKind] = {}
 
 
 def register_kind(kind: RegistryKind) -> RegistryKind:
-    """Add ``kind``; a name already registered is refused."""
+    """Add ``kind``. A name already registered is refused, and so is a kind that states
+    no egress rules (fail closed: see :meth:`RegistryKind.egress_findings`)."""
     if kind.name in _KINDS:
         raise ValueError(f"registry kind {kind.name!r} is already registered")
+    if type(kind).egress_findings is RegistryKind.egress_findings:
+        raise TypeError(
+            f"registry kind {kind.name!r} states no egress rules: override egress_findings "
+            "(return [] only for a kind that sends nothing to a contract-named host)"
+        )
     _KINDS[kind.name] = kind
     return kind
 

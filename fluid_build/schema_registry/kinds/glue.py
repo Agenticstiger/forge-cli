@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from ._base import RegistryKind
 
@@ -53,6 +53,7 @@ class GlueKind(RegistryKind):
     bind_hint = "bind an AWS expose (the Glue registry's product)"
     subject_pattern = _GLUE_NAME
     fields = frozenset({"registryName"})
+    refuses = frozenset({"url", "auth"})
     checks_compatibility = False
 
     def field_errors(self, spec: Mapping[str, Any], where: str) -> List[str]:
@@ -69,6 +70,13 @@ class GlueKind(RegistryKind):
         if name is not None and not (isinstance(name, str) and _GLUE_NAME.fullmatch(name)):
             errors.append(f"{where}.registryName: letters, digits and _ $ # . - (1-255)")
         return errors
+
+    def egress_findings(
+        self, subject: Any, *, stage: str, environ: Optional[Mapping[str, str]] = None
+    ) -> List[Tuple[str, str]]:
+        """None: Glue is reached through the AWS SDK with IAM. A contract names no host
+        and no secret for it (``field_errors`` refuses ``url`` and ``auth``)."""
+        return []
 
     def location(self, ref: Any) -> str:
         return str(ref.glue_registry)

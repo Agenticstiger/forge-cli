@@ -38,6 +38,8 @@ GLUE_DEFAULT_REGISTRY = "default-registry"
 
 #: The fields every kind takes; each kind adds its own (``RegistryKind.fields``).
 _BASE_FIELDS = frozenset({"kind", "subject", "version", "compatibility"})
+#: The kind fields :class:`RegistryRef` models itself; any other goes to ``options``.
+_MODELLED = frozenset({"url", "registryName", "auth"})
 
 Version = Union[str, int]
 
@@ -52,7 +54,8 @@ class RegistryRef:
 
     ``subject`` is ``None`` only for a kafka-connect block, which names no subject.
     ``secret_ref`` is the ``auth.secretRef`` text as written; it is a reference,
-    never a value.
+    never a value. ``options`` holds a kind's own fields beyond the ones modelled here
+    (``url``, ``registryName``, ``auth``), for that kind's methods to read.
     """
 
     kind: str
@@ -64,6 +67,7 @@ class RegistryRef:
     version: Version = "latest"
     compatibility: Optional[str] = None
     secret_ref: Optional[str] = None
+    options: Mapping[str, Any] = field(default_factory=dict, hash=False, repr=False)
 
     @property
     def glue_registry(self) -> str:
@@ -123,6 +127,11 @@ def shape_errors(spec: Any, where: str) -> List[str]:
         return errors
     kind = get_kind(kind_name)
     errors.extend(kind.field_errors(spec, where))
+    # Another kind's field is refused too: those this kind explains, by field_errors
+    # above; any other, here, so a new kind's field is never silently ignored.
+    for name in sorted((set(spec) & allowed) - _BASE_FIELDS - kind.fields - kind.refuses):
+        owner = next(k.name for k in all_kinds() if name in k.fields)
+        errors.append(f"{where}.{name} is for kind: {owner}")
     subject = spec.get("subject")
     if subject is not None:
         if not (isinstance(subject, str) and kind.subject_pattern.fullmatch(subject)):
@@ -159,6 +168,11 @@ def from_registry(spec: Mapping[str, Any], *, topic: str, origin: str, where: st
         version=spec.get("version", "latest"),
         compatibility=spec.get("compatibility"),
         secret_ref=auth.get("secretRef") if isinstance(auth.get("secretRef"), str) else None,
+        options={
+            name: spec[name]
+            for name in sorted(get_kind(spec["kind"]).fields - _MODELLED)
+            if name in spec
+        },
     )
 
 

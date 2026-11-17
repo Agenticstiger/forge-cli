@@ -162,14 +162,16 @@ def _check(
     return record, None
 
 
-def _factories(clients: Mapping[str, Any]) -> Mapping[str, Any]:
-    """The client factories, keyed by kind name. Any other keyword is a caller's typo
-    (``enviorn=``), which ``**clients`` would otherwise swallow: refused."""
-    unknown = sorted(set(clients) - set(names()))
+def _factories(clients: Mapping[str, Any], kinds: Optional[List[str]] = None) -> Mapping[str, Any]:
+    """The client factories, keyed by kind name (``kinds``: the ones that may be read
+    here, every kind by default). Any other keyword is a caller's typo (``enviorn=``),
+    which ``**clients`` would otherwise swallow: refused."""
+    accepted = list(names()) if kinds is None else kinds
+    unknown = sorted(set(clients) - set(accepted))
     if unknown:
         raise TypeError(
             f"unexpected keyword argument(s) {unknown}: client factories are keyed by "
-            f"registry kind ({', '.join(names())})"
+            f"registry kind ({', '.join(accepted)})"
         )
     return clients
 
@@ -380,7 +382,8 @@ def verify_at_apply(
     from .policy import subject_findings
     from .reference import RegistryShapeError, checked_subjects, produced_subjects
 
-    clients = _factories(clients)
+    # Apply reads only subjects with a credential: kinds that take auth.
+    clients = _factories(clients, [k.name for k in all_kinds() if "auth" in k.fields])
 
     errors: List[str] = []
     warnings: List[str] = []

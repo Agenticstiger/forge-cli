@@ -13,9 +13,14 @@ from fluid_build.schema_registry import kinds
 from fluid_build.schema_registry.clients import SubjectVersion
 from fluid_build.schema_registry.kinds import RegistryKind, get_kind, register_kind
 from fluid_build.schema_registry.produced import cloud_bound, produced_set_errors
-from fluid_build.schema_registry.reference import RegistryRef, Subject, shape_errors
+from fluid_build.schema_registry.reference import (
+    RegistryRef,
+    Subject,
+    from_registry,
+    shape_errors,
+)
 from fluid_build.schema_registry.schemas import avro_schema, schema_text
-from fluid_build.schema_registry.verify import _for_provider, verify_consumed
+from fluid_build.schema_registry.verify import _for_provider, verify_at_apply, verify_consumed
 
 from .conftest import consumed_contract
 
@@ -102,6 +107,9 @@ class Tidal(RegistryKind):
     subject_pattern = re.compile(r"^[a-z-]{1,40}$")
     fields = frozenset({"tide"})
 
+    def egress_findings(self, subject, *, stage, environ=None):
+        return []
+
     def location(self, ref):
         return "the-sea"
 
@@ -148,7 +156,34 @@ def test_shape_errors_accepts_the_new_kind(tidal):
         "w.compatibility: tidal accepts OFF, ON"
     ]
     assert shape_errors({"kind": "nope"}, "w") == ["w.kind: expected glue or confluent or tidal"]
-    assert shape_errors({"kind": "glue", "tide": "x"}, "w") == []  # a known field of another kind
+    # Another kind's field is refused, never silently ignored.
+    assert shape_errors({"kind": "glue", "tide": "x"}, "w") == ["w.tide is for kind: tidal"]
+    assert shape_errors({"kind": "confluent", "url": "https://x", "tide": "x"}, "w") == [
+        "w.tide is for kind: tidal"
+    ]
+
+
+def test_the_new_kinds_own_field_reaches_its_ref(tidal):
+    ref = from_registry({"kind": "tidal", "tide": "high"}, topic="t", origin="o", where="w")
+    assert ref.options == {"tide": "high"}
+    # The two built-in kinds model their fields on the ref itself.
+    glue = from_registry({"kind": "glue", "registryName": "r"}, topic="t", origin="o", where="w")
+    assert glue.options == {} and glue.registry_name == "r"
+
+
+def test_a_kind_that_states_no_egress_rules_is_refused():
+    class Silent(RegistryKind):
+        name = "silent"
+
+    with pytest.raises(TypeError, match="states no egress rules"):
+        register_kind(Silent())
+    assert "silent" not in kinds.names()
+
+
+def test_apply_takes_factories_only_for_kinds_that_take_auth():
+    # Apply reads only credentialed subjects; a Glue factory there is a caller's mistake.
+    with pytest.raises(TypeError, match=r"\['glue'\].*\(confluent\)"):
+        verify_at_apply({}, dry_run=True, glue=lambda: None)
 
 
 def test_ref_compatibility_and_label_use_the_new_kind(tidal):
