@@ -86,6 +86,35 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             env_value = os.environ.get("DMM_AUTO_APPROVE_ACCESS", "").strip().lower()
             self.auto_approve_access = env_value in {"1", "true", "yes", "on"}
 
+    def _with_dmm_product_ids(
+        self, payload: CatalogPublicationPayload
+    ) -> CatalogPublicationPayload:
+        """The payload rebuilt from a contract whose product ids are spelled as the
+        native provider publishes them (``_ids.with_dmm_product_ids``).
+
+        Entropy ids are case-sensitive, and the native provider has always published
+        ``Silver.Sales.Orders`` as ``silver.sales.orders``; this path published it as
+        written and named upstreams as written, so the two paths, and a producer and
+        its consumers, did not meet. Unchanged ids keep the payload as it is.
+        """
+        from fluid_build.providers.datamesh_manager._ids import (
+            needs_existing_ids,
+            with_dmm_product_ids,
+        )
+
+        contract = payload.contract or {}
+        # An upstream Entropy holds as written (one forge did not publish) is kept as
+        # written; reading the list is only worth it when some upstream id would change.
+        held = self._existing_product_ids() if needs_existing_ids(contract) else None
+        normalized = with_dmm_product_ids(contract, held)
+        if normalized == dict(contract) and (
+            payload.product.product_id == normalized.get("id", payload.product.product_id)
+        ):
+            return payload
+        return CatalogPublicationPayload.from_contract(
+            normalized, {col: list(labels) for col, labels in payload.classifications.items()}
+        )
+
     def _endpoint_refusal(self) -> Optional[str]:
         """Why the key must not go to ``api_url``, or ``None``.
 
@@ -145,8 +174,9 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         non-fatal (logged at WARNING) — a missing source-system entity
         only degrades the lineage graph, not the product publish.
         """
-        product_id = payload.product.product_id
-        product_urn = f"dmm://{product_id}"
+        from fluid_build.providers.datamesh_manager._ids import dmm_product_id
+
+        product_urn = f"dmm://{dmm_product_id(payload.product.product_id)}"
         if not self.api_token:
             return RegistrationResult(
                 target=self.target,
@@ -159,6 +189,10 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             return RegistrationResult(
                 target=self.target, urn=product_urn, succeeded=False, error=refusal
             )
+        # Only now, with the key cleared to go to this endpoint: it may read the
+        # product list to spell upstream ids.
+        payload = self._with_dmm_product_ids(payload)
+        product_id = payload.product.product_id
         contract_urns: List[str] = []
         access_urns: List[str] = []
         source_system_urns: List[str] = []
@@ -268,6 +302,10 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         Preserves the per-expose URN shape the orchestrator's
         historical iteration relied on (``dmm://<product>/<expose>``).
         """
+        from fluid_build.providers.datamesh_manager._ids import dmm_product_id
+
+        # The id register_payload and the native provider publish under.
+        product_id = dmm_product_id(product_id)
         urn = f"dmm://{product_id}/{expose_id}"
         if not self.api_token:
             return RegistrationResult(
@@ -279,7 +317,9 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         refusal = self._endpoint_refusal()
         if refusal:
             return RegistrationResult(target=self.target, urn=urn, succeeded=False, error=refusal)
-        payload = CatalogPublicationPayload.from_contract(contract, classifications)
+        payload = self._with_dmm_product_ids(
+            CatalogPublicationPayload.from_contract(contract, classifications)
+        )
         scoped = tuple(a for a in payload.assets if a.asset_id == expose_id)
         if not scoped:
             return RegistrationResult(
@@ -301,6 +341,9 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         return RegistrationResult(target=self.target, urn=urn, succeeded=True)
 
     def unregister(self, product_id: str, expose_id: str) -> RegistrationResult:
+        from fluid_build.providers.datamesh_manager._ids import dmm_product_id
+
+        product_id = dmm_product_id(product_id)
         urn = f"dmm://{product_id}/{expose_id}"
         if not self.api_token:
             return RegistrationResult(
