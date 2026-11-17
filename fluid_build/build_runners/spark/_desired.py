@@ -349,10 +349,13 @@ def maven_repository(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
     )
 
 
+def _conf_denied(name: str) -> bool:
+    return name in _CONF_DENIED or name.startswith(_CONF_DENIED_PREFIXES)
+
+
 def _conf_allowed(name: str, extra: Sequence[str]) -> bool:
-    if name in _CONF_DENIED or name.startswith(_CONF_DENIED_PREFIXES):
-        listed = name in extra or any(e.endswith("*") and name.startswith(e[:-1]) for e in extra)
-        return listed
+    if _conf_denied(name):  # absolute: no operator entry admits one, as in the IaC emit
+        return False
     if name in _CONF_TUNING or name.startswith(_CONF_TUNING_PREFIXES):
         return True
     return name in extra or any(e.endswith("*") and name.startswith(e[:-1]) for e in extra)
@@ -367,10 +370,13 @@ def _allowed_conf(user: Mapping[str, Any], where: str, env: Mapping[str, str]) -
     catalog, and would get round the contract-SQL allowlist and the host allowlist. So a
     contract sets resource and tuning settings only (:data:`_CONF_TUNING`); the operator
     lists any other key in :data:`CONF_ALLOWLIST_ENV` (a name, or a prefix ending in ``*``).
+    The denied keys (:data:`_CONF_DENIED`, :data:`_CONF_DENIED_PREFIXES`) are refused even
+    when listed, by name or by a prefix such as ``spark.sql.*``: the infrastructure emit
+    never passes them either, so ``fluid spark run`` is no looser than ``fluid apply``.
     A value holds no whitespace: Glue joins the settings into one ``--conf`` argument.
 
     Raises:
-        SparkPolicyError: a setting the operator has not allowed.
+        SparkPolicyError: a setting the operator has not allowed, or a denied one.
     """
     from fluid_build._errors import doc_url
     from fluid_build.spark.policy import SparkPolicyError
@@ -398,13 +404,26 @@ def _allowed_conf(user: Mapping[str, Any], where: str, env: Mapping[str, str]) -
                 "without spaces. Other settings can load code or environment into the job, "
                 "which runs with the job's role and reads what that role can read."
             ),
-            fix=(
-                "Drop the setting, or, once it is reviewed, have the operator list it in the "
-                f"real environment: export {CONF_ALLOWLIST_ENV}=\"{','.join(sorted(refused))}\"."
-            ),
+            fix=_conf_fix(refused),
             doc=doc_url(),
         )
     return out
+
+
+def _conf_fix(refused: Sequence[str]) -> str:
+    denied = sorted(n for n in refused if _CONF_KEY.fullmatch(n) and _conf_denied(n))
+    listable = sorted(n for n in refused if n not in denied)
+    parts = ["Drop the setting."]
+    if denied:
+        parts.append(
+            f"Forge never passes {', '.join(denied)}: no {CONF_ALLOWLIST_ENV} entry admits it."
+        )
+    if listable:
+        parts.append(
+            "Or, once it is reviewed, have the operator list it in the real environment: "
+            f'export {CONF_ALLOWLIST_ENV}="{",".join(listable)}".'
+        )
+    return " ".join(parts)
 
 
 def resolve_region(environ: Optional[Mapping[str, str]] = None) -> str:
