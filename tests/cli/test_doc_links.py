@@ -72,7 +72,7 @@ RETIRED_HOSTS = frozenset(
 # (underscore) is exactly the one that shipped - a 404 inside the MCP output
 # port's own security warning.
 ORG = "github.com/Agenticstiger"
-ORG_REPOS = frozenset({"forge-cli", "forge_docs", "flux", "forge-cli-sdk"})
+ORG_REPOS = frozenset({"forge-cli", "forge_docs", "flux", "flux-engine", "forge-cli-sdk"})
 
 # Tokens meaning "replace this" that render as a plausible address.
 # `github.com/yourusername/fluid-mono` does not look like a placeholder in a
