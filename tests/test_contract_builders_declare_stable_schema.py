@@ -89,6 +89,21 @@ def test_the_discover_emitter(pinned: str) -> None:
     assert contract["fluidVersion"] == pinned
 
 
+def test_the_schema_registry_importer(pinned: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """It needs the registry block, so it follows the stable schema once that has it."""
+    from fluid_build.cli.import_workflow.schema_registry import contract_version
+    from fluid_build.schema_registry import FIRST_VERSION
+
+    assert FIRST_VERSION in FluidSchemaManager.BUNDLED_VERSIONS
+    # The newest stable schema (pinned) predates the block: the first schema with it.
+    assert contract_version() == FIRST_VERSION != pinned
+    # A stable schema that has it: that one.
+    monkeypatch.setattr(
+        FluidSchemaManager, "latest_bundled_version", classmethod(lambda c: "9.9.9")
+    )
+    assert contract_version() == "9.9.9"
+
+
 # ── The fence ──────────────────────────────────────────────────────────────
 
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "fluid_build"
@@ -114,6 +129,7 @@ BUILDERS = (
     "cli/import_workflow/dbt.py",
     "cli/import_workflow/dlt.py",
     "cli/import_workflow/meltano.py",
+    "cli/import_workflow/schema_registry.py",
     "cli/import_workflow/singer.py",
     "cli/product_new.py",
     "forge/product_types.py",

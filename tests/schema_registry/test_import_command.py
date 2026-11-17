@@ -15,6 +15,7 @@ import yaml
 from fluid_build._errors import FluidUserError
 from fluid_build.cli import build_parser
 from fluid_build.cli.import_cmd import run
+from fluid_build.cli.import_workflow.schema_registry import contract_version
 from fluid_build.schema_manager import FluidSchemaManager
 from fluid_build.schema_registry import clients
 from fluid_build.schema_registry.clients import RegistryError, SubjectVersion
@@ -85,7 +86,7 @@ def in_tmp(tmp_path, monkeypatch):
 def validate(path: Path):
     contract = yaml.safe_load(path.read_text(encoding="utf-8"))
     return FluidSchemaManager().validate_contract(
-        contract, schema_version="0.7.7", offline_only=True
+        contract, schema_version=contract["fluidVersion"], offline_only=True
     )
 
 
@@ -200,7 +201,7 @@ class TestConfluent:
             "schema": COLUMNS,
             "registry": {"kind": "confluent", "url": URL, "version": 7},
         }
-        assert contract["id"] == "orders" and contract["fluidVersion"] == "0.7.7"
+        assert contract["id"] == "orders" and contract["fluidVersion"] == contract_version()
         assert validate(path).is_valid
         assert fake.versions == [("orders-value", "latest")]
         assert fake.built == [((URL,), {})]

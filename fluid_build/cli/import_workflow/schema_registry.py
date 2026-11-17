@@ -4,8 +4,8 @@
 """Schema-registry subject -> FLUID consumer contract importer.
 
 ``fluid import schema-registry <subject> --registry confluent --url <https URL>`` or
-``... --registry glue [--registry-name NAME]`` reads one subject and writes a 0.7.7 contract
-with one build whose ``properties.stream`` is what
+``... --registry glue [--registry-name NAME]`` reads one subject and writes a contract (on
+the schema :func:`contract_version` names) with one build whose ``properties.stream`` is what
 :func:`fluid_build.schema_registry.importer.stream_from_subject` returns, with
 ``registry.version`` always set to the version actually read (also for a latest import).
 A Glue import takes its region from the AWS SDK's own resolution (``AWS_REGION``, then
@@ -36,7 +36,7 @@ REGISTRY_FLAGS = {
 }
 
 _KINDS = ("confluent", "glue")
-# The subject's schema types that become a consumed stream format in 0.7.7.
+# The subject's schema types that become a consumed stream format.
 _CONSUMABLE = ("AVRO", "JSON")
 
 
@@ -158,6 +158,23 @@ def _glue_region(reader: Any) -> Optional[str]:
     return found if isinstance(found, str) and found else None
 
 
+def contract_version() -> str:
+    """The ``fluidVersion`` an imported contract declares.
+
+    The newest stable schema (``FluidSchemaManager.latest_bundled_version``) once it carries
+    the registry block, and until then the first schema that does
+    (:data:`fluid_build.schema_registry.FIRST_VERSION`, a preview today). Neither is typed
+    here, so a promotion moves the import with it.
+    """
+    from fluid_build.schema_manager import FluidSchemaManager, SchemaVersion
+    from fluid_build.schema_registry import FIRST_VERSION
+
+    stable = FluidSchemaManager.latest_bundled_version()
+    if SchemaVersion.parse(stable) >= SchemaVersion.parse(FIRST_VERSION):
+        return stable
+    return FIRST_VERSION
+
+
 def _check_importable(
     contract: Dict[str, Any], stream: Dict[str, Any], source: str, version: int
 ) -> None:
@@ -188,7 +205,7 @@ def _check_importable(
             version=version,
         ) from exc
     result = FluidSchemaManager().validate_contract(
-        contract, schema_version="0.7.7", offline_only=True
+        contract, schema_version=contract["fluidVersion"], offline_only=True
     )
     if result.is_valid:
         return
@@ -207,14 +224,16 @@ def _check_importable(
     raise _refusal(what, why, fix, subject=source, version=version)
 
 
-def _build_contract(topic: str, stream: Dict[str, Any], kind: str, subject: str) -> Dict[str, Any]:
+def _build_contract(
+    topic: str, stream: Dict[str, Any], kind: str, subject: str, version: str
+) -> Dict[str, Any]:
     from fluid_build.util.contract import slugify_identifier
 
     cid = slugify_identifier(topic, fallback="imported-stream")
     expose_id = cid.replace("-", "_")
     columns = stream["schema"]
     return {
-        "fluidVersion": "0.7.7",
+        "fluidVersion": version,
         "kind": "DataProduct",
         "id": cid,
         "name": f"{topic} (imported from a {kind} schema registry)",
@@ -294,8 +313,8 @@ class SchemaRegistryImporter(Importer):
             read = reader.read
             raise _refusal(
                 f"subject {source!r} (version {read.version}) is {exc}, not Avro or JSON Schema",
-                "FLUID 0.7.7 has no consumed stream format for Protobuf, so no stream block "
-                "can carry it.",
+                f"FLUID {contract_version()} has no consumed stream format for Protobuf, so no "
+                "stream block can carry it.",
                 "Import an Avro or JSON Schema subject, or declare the stream by hand.",
                 subject=source,
                 version=read.version,
@@ -335,7 +354,7 @@ class SchemaRegistryImporter(Importer):
         # Pinned to the version read, also when the read was "latest".
         stream["registry"]["version"] = read.version
         columns = stream["schema"]
-        contract = _build_contract(stream["topic"], stream, kind, source)
+        contract = _build_contract(stream["topic"], stream, kind, source, contract_version())
         _check_importable(contract, stream, source, read.version)
         report = ImportReport()
         report.mapped_one_to_one += [
