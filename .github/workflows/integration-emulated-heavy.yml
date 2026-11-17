@@ -235,6 +235,20 @@ jobs:
           fi
           python scripts/ci/assert_lane_coverage.py emulated-heavy.xml "${requirements[@]}"
 
+      # LocalStack runs the Spark lane's EMR jobs inside its own container, so their Spark
+      # output is only in its log. Always, not on failure: the EMR lane tests are a strict
+      # xfail while their cause is open (Trello xZtxKx2N), so the step passes either way.
+      # The lane deletes its S3 buckets on teardown, so there are no run logs left to list.
+      - name: LocalStack log (EMR and Spark output)
+        if: always() && steps.gate.outputs.localstack == 'true'
+        run: |
+          echo "::group::LocalStack log, EMR and Spark lines (last 300)"
+          docker logs fluid-localstack 2>&1 | grep -iE "emr|spark|jobrun|job run|step" | tail -300 || true
+          echo "::endgroup::"
+          echo "::group::LocalStack log (last 400 lines)"
+          docker logs fluid-localstack --tail 400 2>&1 || true
+          echo "::endgroup::"
+
       - name: Stop GCP emulators
         if: always()
         run: docker compose -f tests/iac/_gcp_emulator/docker-compose.yml down || true

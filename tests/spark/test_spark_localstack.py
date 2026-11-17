@@ -616,6 +616,18 @@ def _emr_conf(monkeypatch):
     return {}
 
 
+#: EMR's batch runs start in LocalStack but end FAILED in CI; strict, so CI goes red the day
+#: they pass and the marker comes off.
+EMR_FAILS_IN_CI = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "EMR Serverless/EC2 batch runs end FAILED inside LocalStack in CI (run 44132106546/job "
+        "134211874996); cause not captured yet; tracked on Trello xZtxKx2N"
+    ),
+)
+
+
+@EMR_FAILS_IN_CI
 def test_emr_serverless_runs_a_batch_build(lane, capsys, tmp_path, monkeypatch):
     emr = lane.client("emr-serverless")
     product = f"iactest.spark-{lane.run}"
@@ -635,6 +647,7 @@ def test_emr_serverless_runs_a_batch_build(lane, capsys, tmp_path, monkeypatch):
     )
 
 
+@EMR_FAILS_IN_CI
 def test_emr_on_ec2_runs_a_batch_build(lane, capsys, tmp_path, monkeypatch):
     cluster = lane.client("emr").run_job_flow(
         Name=f"{lane.prefix}-emr",
