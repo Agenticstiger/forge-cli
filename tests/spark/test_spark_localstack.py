@@ -616,13 +616,15 @@ def _emr_conf(monkeypatch):
     return {}
 
 
-#: EMR's batch runs start in LocalStack but end FAILED in CI; strict, so CI goes red the day
-#: they pass and the marker comes off.
+#: EMR's batch runs in LocalStack are intermittent in CI: they ended FAILED in run 44132106546
+#: and passed in 44135418368 (same code). Not strict while the cause is open, so CI is green
+#: either way; the heavy job prints LocalStack's log every run for whoever takes the card.
 EMR_FAILS_IN_CI = pytest.mark.xfail(
-    strict=True,
+    strict=False,
     reason=(
-        "EMR Serverless/EC2 batch runs end FAILED inside LocalStack in CI (run 44132106546/job "
-        "134211874996); cause not captured yet; tracked on Trello xZtxKx2N"
+        "EMR Serverless/EC2 batch runs in LocalStack are intermittent in CI: FAILED in run "
+        "44132106546 (job 134211874996), passed in run 44135418368; cause not captured yet; "
+        "tracked on Trello xZtxKx2N"
     ),
 )
 

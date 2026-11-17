@@ -236,8 +236,8 @@ jobs:
           python scripts/ci/assert_lane_coverage.py emulated-heavy.xml "${requirements[@]}"
 
       # LocalStack runs the Spark lane's EMR jobs inside its own container, so their Spark
-      # output is only in its log. Always, not on failure: the EMR lane tests are a strict
-      # xfail while their cause is open (Trello xZtxKx2N), so the step passes either way.
+      # output is only in its log. Always, not on failure: the EMR lane tests are an xfail
+      # while their intermittent failure is open (Trello xZtxKx2N), so the step passes either way.
       # The lane deletes its S3 buckets on teardown, so there are no run logs left to list.
       - name: LocalStack log (EMR and Spark output)
         if: always() && steps.gate.outputs.localstack == 'true'
