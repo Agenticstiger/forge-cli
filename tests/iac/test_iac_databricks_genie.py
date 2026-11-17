@@ -1602,6 +1602,28 @@ def test_the_plan_reads_the_contract_as_the_apply_does(monkeypatch):
     assert not any("{{" in reader for reader in listed["readers"])
 
 
+def test_a_refusal_in_the_plan_names_the_plan_not_the_apply_sinks(monkeypatch, caplog):
+    """The plan resolves the contract only to list the space; its refusal of a credential-
+    shaped placeholder says that, not that the value goes to main.tf.json and the state."""
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, "wh-1")
+    doc = site_contract()
+    doc["description"] = "{{ env.FLUID_TEST_API_TOKEN }}"
+    with caplog.at_level(logging.WARNING):
+        _planned_spaces(doc)
+    (line,) = [r.getMessage() for r in caplog.records if "Refusing to resolve" in r.getMessage()]
+    assert "fluid plan" in line and "main.tf.json" not in line
+
+
+def test_a_templated_platform_is_resolved_before_the_plan_looks_for_its_hook(monkeypatch):
+    """The plan looks for the hook before resolving, unless a platform is a placeholder."""
+    monkeypatch.setenv(dbx.WAREHOUSE_ENV, "wh-1")
+    monkeypatch.setenv("FLUID_TEST_CLOUD", "databricks")
+    doc = site_contract()
+    for expose in doc["exposes"]:
+        expose["binding"]["platform"] = "{{ env.FLUID_TEST_CLOUD }}"
+    assert len(_planned_spaces(doc)) == 1
+
+
 def test_the_plan_lists_the_space_only_for_the_provider_the_apply_runs(monkeypatch):
     monkeypatch.setenv(dbx.WAREHOUSE_ENV, "wh-1")
     doc = site_contract()
