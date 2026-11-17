@@ -468,3 +468,126 @@ jobs:
           for project in fluid-lk-ci fluid-lk-auth-ci; do
             docker compose -p "$project" down -v --remove-orphans || true
           done
+
+  # ────────────────────────────────────────────────────────────────────
+  # Confluent schema registry lane — forge's registry writes on a real
+  # registry.
+  #
+  # What tests/integration/test_confluent_schema_registry_live.py proves:
+  #   - `fluid generate iac --provider confluent` for an Avro and a
+  #     Protobuf produced subject, applied by OpenTofu with the pinned
+  #     confluentinc/confluent provider, registers the schema text forge
+  #     generated, with the schema type and BACKWARD_TRANSITIVE it set;
+  #   - a second plan finds nothing to change;
+  #   - a new nullable column registers as version 2;
+  #   - destroy removes the subjects.
+  # Rules (`rules: true`) need the rule executor of Confluent Cloud or
+  # Platform Enterprise, which the community registry lacks: their
+  # attributes are proven by `tofu validate` in iac-tests.yml.
+  #
+  # Keyless and self-contained: a single-node KRaft cp-kafka and
+  # cp-schema-registry, one pinned tag family (7.9.4), on a docker network
+  # this job creates and removes. The registry has no authentication; the
+  # test passes the provider placeholder credentials.
+  confluent-schema-registry:
+    name: Confluent schema registry integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'ci:integration-emulated')
+    environment: integration-emulated
+    permissions:
+      contents: read
+    env:
+      # Names unique to this run, so the cleanup removes only what it created.
+      SR_NETWORK: fluid-sr-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      SR_KAFKA: fluid-sr-ci-kafka-${{ github.run_id }}-${{ github.run_attempt }}
+      SR_REGISTRY: fluid-sr-ci-registry-${{ github.run_id }}-${{ github.run_attempt }}
+      CP_TAG: "7.9.4"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # Same action SHA, version and checksum as the emulated-heavy job above
+      # and iac-tests.yml's first matrix entry: the provider is fetched by the
+      # same tofu everywhere.
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4  # v2.0.2
+        with:
+          tofu_version: 1.12.12
+          checksums: 723df4d3044ca2e1fd8469d715a24869889c53e7f45458b1f2ea2e40e344789d  # 1.12.12 linux_amd64 zip  # pragma: allowlist secret
+
+      - name: Install fluid-build
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,local]"
+
+      - name: Start Kafka and the schema registry
+        run: |
+          docker network create "$SR_NETWORK"
+          # Single-node KRaft: one process is broker and controller. The
+          # CLUSTER_ID is a fixed throwaway; the registry keeps its subjects
+          # in this broker's _schemas topic.
+          docker run -d --name "$SR_KAFKA" --network "$SR_NETWORK" --network-alias kafka \
+            -e CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk \
+            -e KAFKA_NODE_ID=1 \
+            -e KAFKA_PROCESS_ROLES=broker,controller \
+            -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:29093 \
+            -e KAFKA_LISTENERS=PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:29092 \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT \
+            -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+            -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+            -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+            -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+            "confluentinc/cp-kafka:${CP_TAG}"
+          docker run -d --name "$SR_REGISTRY" --network "$SR_NETWORK" -p 127.0.0.1:8081:8081 \
+            -e SCHEMA_REGISTRY_HOST_NAME=schema-registry \
+            -e SCHEMA_REGISTRY_LISTENERS=http://0.0.0.0:8081 \
+            -e SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS=kafka:29092 \
+            "confluentinc/cp-schema-registry:${CP_TAG}"
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:8081/subjects >/dev/null 2>&1; then
+              echo "Schema registry ready after ~$((i * 2))s"; break
+            fi
+            sleep 2
+          done
+          curl -sf http://localhost:8081/subjects >/dev/null || {
+            echo "::error::The schema registry did not answer within 180s."
+            docker logs "$SR_KAFKA" --tail=50 || true
+            docker logs "$SR_REGISTRY" --tail=50 || true
+            exit 1
+          }
+
+      - name: Run the Confluent schema registry live test
+        timeout-minutes: 15
+        env:
+          FLUID_SR_LIVE_ENDPOINT: http://localhost:8081
+        run: python -m pytest -v -m emulated_heavy tests/integration/test_confluent_schema_registry_live.py --junitxml=confluent-sr.xml
+
+      # pytest exits 0 on an all-skipped run. This does not.
+      - name: Assert the lane actually exercised the registry
+        if: always()
+        run: |
+          python scripts/ci/assert_lane_coverage.py confluent-sr.xml \
+            --require "Confluent schema registry=tests/integration/test_confluent_schema_registry_live.py"
+
+      - name: Collect container logs on failure
+        if: failure()
+        run: |
+          docker logs "$SR_REGISTRY" --tail=100 || true
+          docker logs "$SR_KAFKA" --tail=100 || true
+
+      # Only what this run created: its two containers and its network.
+      - name: Remove the containers and network
+        if: always()
+        run: |
+          docker rm -f "$SR_REGISTRY" "$SR_KAFKA" || true
+          docker network rm "$SR_NETWORK" || true

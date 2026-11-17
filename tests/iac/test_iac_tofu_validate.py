@@ -820,3 +820,141 @@ def test_retention_and_kms_pass_tofu_validate(kms, bucket_policy, tmp_path):
 # Catalog-style enrichment (table COMMENT + per-column comments) is
 # covered without any schema change at
 # ``tests/iac/test_iac_snowflake.py::TestSnowflakeCatalogEnrichment``.
+
+
+def _confluent_subject_contract(
+    contract_id, topic, serialization, columns, *, registry=None, **expose
+):
+    """A 0.7.7 product whose only expose is a Kafka topic on a Confluent registry.
+
+    No Tableflow and no Cloud ids: the module holds ``confluent_subject_config`` and
+    ``confluent_schema`` only, and the provider reads its registry from ``SCHEMA_REGISTRY_*``.
+    """
+    contract_block = {"schema": columns, **expose.pop("contract", {})}
+    return {
+        "fluidVersion": "0.7.7",
+        "kind": "DataProduct",
+        "id": contract_id,
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "kind": "stream",
+                "binding": {
+                    "platform": "confluent",
+                    "format": "kafka_topic",
+                    "location": {"topic": topic},
+                    "serialization": {"value": serialization},
+                    "properties": {
+                        "registry": {
+                            "kind": "confluent",
+                            "url": "https://schema-registry.example.com",
+                            **(registry or {}),
+                        }
+                    },
+                },
+                "contract": contract_block,
+                **expose,
+            }
+        ],
+    }
+
+
+_CONFLUENT_SUBJECT_CONTRACTS = {
+    # Avro with `rules: true`: each error-severity row check is a CEL domain rule.
+    "avro-rules": _confluent_subject_contract(
+        "demo.sr.rules",
+        "demo.orders",
+        "avro",
+        [
+            {"name": "id", "type": "string", "required": True},
+            {"name": "amount", "type": "long"},
+            {"name": "status", "type": "string", "required": True},
+        ],
+        registry={"rules": True},
+        contract={
+            "invariants": [
+                {"id": "amount_positive", "check": "amount > 0"},
+                {"id": "paid_has_amount", "when": "status = 'PAID'", "check": "amount IS NOT NULL"},
+            ]
+        },
+    ),
+    # Protobuf: a field number per column, and a decimal that imports confluent.type.Decimal.
+    "protobuf-decimal": _confluent_subject_contract(
+        "demo.sr.proto",
+        "demo.orders-proto",
+        "protobuf",
+        [
+            {"name": "order_id", "type": "string", "required": True, "protobuf": {"field": 1}},
+            {
+                "name": "amount",
+                "type": "decimal(18,2)",
+                "required": True,
+                "protobuf": {"field": 2},
+            },
+        ],
+    ),
+    # Avro with a classification and a personal-data column: confluent_schema.metadata.
+    "avro-classified": _confluent_subject_contract(
+        "demo.sr.class",
+        "demo.orders-pii",
+        "avro",
+        [
+            {"name": "id", "type": "string", "required": True},
+            {"name": "email", "type": "string", "sensitivity": "pii"},
+        ],
+        policy={"classification": "Confidential"},
+    ),
+}
+
+
+def _confluent_resources(case):
+    """The module `fluid generate iac --provider confluent` writes for one sample, parsed."""
+    text = build_module(IAC_PLUGINS["confluent"], _CONFLUENT_SUBJECT_CONTRACTS[case])
+    resources = json.loads(text)["resource"]
+    # Subjects only: no Tableflow, no catalog integration.
+    assert sorted(resources) == ["confluent_schema", "confluent_subject_config"]
+    (schema,) = resources["confluent_schema"].values()
+    return text, schema
+
+
+def _assert_confluent_case(case, schema):
+    if case == "avro-rules":
+        rules = schema["ruleset"]["domain_rules"]
+        assert [r["name"] for r in rules] == ["amount_positive", "paid_has_amount"]
+        assert all(r["type"] == "CEL" and r["on_failure"] == "ERROR" for r in rules)
+        assert rules[0]["expr"] == "((type(message.amount) != null_type) && (message.amount > 0))"
+        assert 'message.status == "PAID"' in rules[1]["expr"]
+    elif case == "protobuf-decimal":
+        assert schema["format"] == "PROTOBUF"
+        assert 'import "confluent/type/decimal.proto";' in schema["schema"]
+        assert ".confluent.type.Decimal amount = 2;" in schema["schema"]
+    else:
+        assert schema["format"] == "AVRO"
+        assert schema["metadata"]["properties"] == {"fluid_classification": "Confidential"}
+        assert [(t["key"].rsplit(".", 1)[-1], t["value"]) for t in schema["metadata"]["tags"]] == [
+            ("email", ["PII"])
+        ]
+
+
+@pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
+@pytest.mark.parametrize("case", sorted(_CONFLUENT_SUBJECT_CONTRACTS))
+def test_a_confluent_schema_registry_subject_passes_tofu_validate(case, tmp_path):
+    """The Confluent subject modules are accepted by the pinned provider's own schema.
+
+    Rules and tags only reach a registry that runs the data-contract rule executor
+    (Confluent Cloud, Confluent Platform Enterprise), so the live job registers the
+    rule-free subjects and this proves the rest against the provider's attributes.
+    """
+    plugin = IAC_PLUGINS["confluent"]
+    text, schema = _confluent_resources(case)
+    _assert_confluent_case(case, schema)
+    (tmp_path / "main.tf.json").write_text(text)
+    write_dependency_lock(plugin, tmp_path)
+    _tofu_init_or_skip(tmp_path)
+    validate = subprocess.run(
+        [_TOFU, "validate", "-no-color"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert validate.returncode == 0, validate.stderr or validate.stdout
