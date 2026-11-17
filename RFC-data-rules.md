@@ -270,11 +270,11 @@ integer     = digit , { digit } ;
 (* name, number and string are lexical: see below *)
 ```
 
-- Keywords and function names are case-insensitive. A name is case-sensitive and names a column exactly as `contract.schema[].name` spells it. A name that is a keyword, or that does not match `[A-Za-z_][A-Za-z0-9_]*`, is double-quoted (`"order"`, `"Net Amount"`), with `""` for a quote inside it.
+- Keywords and function names are case-insensitive. A name is case-sensitive and names a column exactly as `contract.schema[].name` spells it. A name that is a keyword, or that does not match `[A-Za-z_][A-Za-z0-9_]*`, is double-quoted (`"end"`, `"Net Amount"`), with `""` for a quote inside it. The keywords are the grammar's own words: `AND`, `BETWEEN`, `CASE`, `DATE`, `DISTINCT`, `ELSE`, `END`, `FALSE`, `FROM`, `IN`, `IS`, `NOT`, `NULL`, `OR`, `THEN`, `TRUE`, `WHEN`. Function names are not keywords (a column may be called `round`), and neither are SQL's other reserved words (`order` may stand bare), though any name may be quoted.
 - Strings are single-quoted, with `''` for a quote inside. A number is digits with an optional fraction (`3`, `1.50`); there is no exponent, and a leading `-` is negation. The digits after the point are the literal's scale.
 - An `IN` list holds literals of one type. The `NULL` literal is never an `IN` item, nor an operand of `=`, `<>`, `!=`, `<`, `<=`, `>`, `>=` or `BETWEEN`: such a comparison would always be FALSE (§2.5), so the validator refuses it and points to `IS NULL`. `a IS [NOT] DISTINCT FROM NULL` is allowed and means `a IS [NOT] NULL`.
 - Whitespace is space, tab and newline. The text holds no `;`, and `--` and `/*` are refused wherever they stand outside a string literal or a quoted name, before parsing: SQL reads them as comments (sqlglot reads `net--1 > 0` as `net`). A double negation is written `net - -1`.
-- The text is NFC-normalized before it is parsed. It is at most 4,096 code points long and nests at most 64 levels deep, the limits of EXPR-SPEC-2 §3.
+- The text is NFC-normalized before it is parsed. It is at most 4,096 code points long, and so is its canonical text (EXPR-SPEC-2 §11's form, which adds a space after each comma, so that every canonical text parses back), and it nests at most 64 levels deep, the limits of EXPR-SPEC-2 §3. Depth: a literal or a column reference is 1 deep, and every other construct, and every pair of parentheses, is one deeper than the deepest thing directly inside it, so a chain of 63 `+` or `AND` over 64 names is 64 deep. `ROUND` takes at most 38 decimal places, the widest `DECIMAL` scale (founder picks, 2026-11-16, for both limits).
 - Precedence, tightest first: unary `-`; `*` and `/`; `+` and `-`; comparisons, `IN`, `BETWEEN` and `IS`; `NOT`; `AND`; `OR`. Comparisons do not chain.
 
 ### 2.2 Names and the row scope
@@ -299,11 +299,11 @@ Six types: bool, number, string, date, timestamp, and timestamp with time zone. 
 | `float`, `float4`, `float8`, `float32`, `float64`, `double`, `double precision`, `real` | number, read as the shortest decimal that converts back to the same double, so `f = 0.1` holds where `f` stores 0.1, as engines compare it (FLUX's decimal-backed floats, decision Q4, keep at most 15 significant digits); never a `derive` target |
 | `string`, `text`, `varchar`, `varchar2`, `nvarchar`, `char`, `nchar`, `character`, `clob`, `uuid`, `uniqueidentifier`, `guid`, `enum` | string |
 | `date` | date |
-| `datetime`, `datetime2`, `smalldatetime`, `timestamp`, `timestamp_ntz`, `timestampntz` | timestamp (no time zone) |
-| `timestamptz`, `timestamp_tz`, `timestamp_ltz` | timestamp with time zone (an instant) |
+| `datetime`, `datetime2`, `smalldatetime`, `timestamp`, `timestamp_ntz`, `timestampntz`, `timestamp without time zone` | timestamp (no time zone) |
+| `timestamptz`, `timestamp_tz`, `timestamp_ltz`, `timestamp with time zone` | timestamp with time zone (an instant) |
 | every other type (`time`, `interval`, `money`, `variant`, `json`, `array`, `struct`, `map`, the binary and spatial types and so on) | none: an expression cannot name the column |
 
-A `decimal`-family column without `(p,s)` has no declared scale. An expression can read it, but a `derive` target needs `(p,s)`.
+A `decimal`-family column without `(p,s)` has no declared scale. An expression can read it, but a `derive` target needs `(p,s)`. `decimal(p)` is scale 0, as in SQL. Precision is read up to 1,000, PostgreSQL's limit; a wider declaration has no FLUID SQL/1 type.
 
 Type rules:
 
@@ -311,6 +311,7 @@ Type rules:
 - `<`, `<=`, `>`, `>=` and `BETWEEN` take numbers, strings, dates or timestamps, one type throughout. Strings compare by the code points of the text as stored; only the contract's own texts (names, literals, placeholder values and prefixes) are NFC-normalized. A date never meets a timestamp, and a timestamp never meets a timestamp with time zone, because FLUID SQL/1 has no `CAST` and the two readings of a zoneless value differ by engine.
 - `+`, `-`, `*`, `/` and unary `-` take numbers. There is no date or string arithmetic beyond the date differences.
 - The value branches of `CASE` and `COALESCE` share one type. The `NULL` literal may stand for any of them, but not for all of them.
+- More generally, the `NULL` literal takes its type from a typed operand beside it: an arithmetic operand, a date difference's argument, an `IS [NOT] DISTINCT FROM` operand, a `CASE` or `COALESCE` branch. Anywhere else (an `IN` item, an operand of a comparison or `BETWEEN`, `IS [NOT] NULL`, unary minus, `ROUND`'s argument, a predicate position, a whole value) it is refused, and so is a construct whose operands are all `NULL` literals.
 - A predicate position takes a bool: `check`, `when`, `aggregate.filter`, `CASE WHEN` and the operands of `AND`, `OR` and `NOT`.
 - A string literal compared with a column whose `validationRules` declare an `enum` must be one of its values. This is flux-expr/1's closed-set rule, and it turns a typo such as `kind = 'base_fe'` into a validation error.
 
@@ -345,7 +346,7 @@ Why two-valued: a row whose predicate is not TRUE does not satisfy it. Deequ's `
 
 | Call | Result |
 |---|---|
-| `ROUND(x, s)` | x rounded to s decimal places, ties away from zero, as warehouses round fixed-point numbers (founder pick, 2026-11-16); s is a non-negative integer literal; NULL gives NULL |
+| `ROUND(x, s)` | x rounded to s decimal places, ties away from zero, as warehouses round fixed-point numbers (founder pick, 2026-11-16); s is an integer literal from 0 to 38; NULL gives NULL |
 | `ROUND(x, s, 'HALF_TO_EVEN')` | ties to the even neighbor (banker's rounding), in Snowflake's spelling; `'HALF_AWAY_FROM_ZERO'` spells the default |
 | `COALESCE(a, b, ...)` | the first argument that is not NULL, else NULL; two or more arguments |
 | `CASE WHEN c THEN a ... [ELSE b] END` | as in SQL; without `ELSE`, NULL |
@@ -442,9 +443,9 @@ Nine changes follow for EXPR-SPEC-2 as #38 wrote it. The restructured spec (Agen
 8. A rule read from FLUID compares and groups strings by the code points of the stored text, without NFC normalization (§2.3), as SQL consumers do. EXPR-SPEC-2 §4 and §9 normalize first, which differs only on text that is not in NFC.
 9. The explicit `link.` root also takes a chain (`link.a.b.col`), which the copies of a `sharedAttribute` over several links need; EXPR-SPEC-2 §5 lists it for one link only.
 
-**Conformance vectors.** forge-cli keeps `fluid-sql-vectors.json` beside the validator. Each vector gives a text, its verdict (accepted, or refused with a reason), its syntax tree, its type and scale, and its value against given rows. The validator runs the file. flux-engine runs the same file through its parser, as EXPR-SPEC-2 §12 runs flux-expr/1's vectors. DuckDB is the oracle for the SQL renderings, with the exact-rational exceptions that EXPR-SPEC-2 §12 already names. The vectors define the subset; neither parser does.
+**Conformance vectors.** forge-cli keeps `fluid-sql-vectors.json` beside the validator (`fluid_build/fluid_sql/`, shipped in the wheel; the file's own `description`, `encoding`, `limits`, `reasonCodes` and `nodes` keys document its format). Each vector gives a text, its verdict (accepted, or refused with a reason), its syntax tree, its type and scale, and its value against given rows. The validator runs the file. flux-engine runs the same file through its parser, as EXPR-SPEC-2 §12 runs flux-expr/1's vectors. DuckDB is the oracle for the SQL renderings, with the exact-rational exceptions that EXPR-SPEC-2 §12 already names. The vectors define the subset; neither parser does.
 
-**Parser.** The validator parses with sqlglot, already a base dependency (`iac/row_access.py` parses row-filter predicates the same way). It accepts only the node types the grammar derives. sqlglot 30 reads `MONTHS_BETWEEN` as its own node, which carries Oracle's meaning, and `DATE '...'` as a cast. The validator accepts each only in the shape the grammar derives and gives it FLUID's meaning, and no renderer passes a FLUID text through sqlglot's dialect generators. The import stays inside the function, so `fluid --help` keeps the module budget that `tests/perf/test_startup_budget.py` pins.
+**Parser.** The validator parses with its own recursive-descent parser for exactly the grammar of §2.1, over a standard-library lexer, as flux-expr/1 does (founder decision, 2026-11-16, amending this paragraph's first version). sqlglot was the first choice, and its tree cannot carry FLUID's meaning: it reads `x NOT IN (1, 2)` and `NOT x IN (1, 2)` as one tree although they differ when `x` is NULL (FALSE and TRUE), it reads `DATE '...'`, `CAST('...' AS DATE)` and `'...'::DATE` as one cast, and `NVL`, `IFNULL` and `COALESCE` as one function. Every refusal carries the position of the first character the grammar cannot read. No renderer passes a FLUID text through sqlglot's dialect generators either. The modules are imported only when `fluid validate` runs, so `fluid --help` keeps the module budget that `tests/perf/test_startup_budget.py` pins.
 
 ---
 
