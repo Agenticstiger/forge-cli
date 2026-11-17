@@ -188,13 +188,15 @@ class TestAirflowSchedulerGeneration:
 
     def test_generic_provider_fallback(self, scheduler, gcp_contract):
         # Without specifying provider, should still generate
-        files = scheduler.generate(gcp_contract)
+        files = scheduler.generate(gcp_contract, provider_config={"project": "my-proj"})
         assert len(files) == 1
         content = list(files.values())[0]
         assert "from airflow import DAG" in content
 
     def test_task_dependencies_in_output(self, scheduler, gcp_contract):
-        files = scheduler.generate(gcp_contract, provider="gcp")
+        files = scheduler.generate(
+            gcp_contract, provider="gcp", provider_config={"project": "my-proj"}
+        )
         content = list(files.values())[0]
         assert "create_dataset >> run_transform" in content
 

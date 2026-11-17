@@ -129,9 +129,11 @@ def _plan_composer_dag(
     # not derivable, so the operator supplies it via `dag_gcs_bucket`.
     dag_bucket = properties.get("dag_gcs_bucket")
     try:
-        from ..codegen.airflow import generate_airflow_dag
+        from fluid_build.schedulers.airflow import render_dag
 
-        dag_content = generate_airflow_dag(contract, project, location)
+        dag_content = render_dag(
+            contract, provider="gcp", provider_config={"project": project, "region": location}
+        )
     except Exception as exc:  # noqa: BLE001 — DAG rendering is best-effort
         logger.warning(format_event("composer_dag_render_failed", error=str(exc)))
         dag_content = None

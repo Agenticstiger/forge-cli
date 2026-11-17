@@ -236,7 +236,7 @@ def _generate_deployment(contract_id: str, contract_name: str, schedule: str, ti
     cron_schedule = _convert_schedule(schedule)
     # Build the tag list in Python and emit its repr: one literal whose quotes
     # and escaping repr() supplies, so a quote in the contract id cannot break
-    # out of the hand-written list. Same idiom as aws/codegen/airflow.py.
+    # out of the hand-written list. Same idiom as schedulers/airflow/_operators.py.
     tags = ["fluid", "auto-generated", "snowflake", str(contract_id)]
     # These two console lines are emitted as plain literals, without the ``f``
     # prefix they used to carry. Nothing in them needs run-time evaluation, and
