@@ -15,12 +15,12 @@ import pytest
 
 from fluid_build.cli._common import CLIError
 from fluid_build.schema_registry import kinds, policy
-from fluid_build.schema_registry.kinds import RegistryKind, register_kind
+from fluid_build.schema_registry.kinds import RegistryKind, get_kind, register_kind
 from fluid_build.schema_registry.policy import subject_findings, validation_findings
 from fluid_build.schema_registry.reference import checked_subjects
 from fluid_build.schema_registry.verify import verify_at_apply, verify_consumed
 
-from .conftest import consumed_contract
+from .conftest import consumed_contract, produced_contract
 from .test_verify import COLUMNS
 
 pytestmark = pytest.mark.unit
@@ -39,6 +39,7 @@ class Leaky(RegistryKind):
     default_compatibility = "BACKWARD"
     registering_cloud = "nowhere"
     fields = frozenset({"url", "auth"})
+    operator_credential_env = None
 
     def egress_findings(self, subject, *, stage, environ=None):
         return []
@@ -161,3 +162,78 @@ def test_the_floor_runs_even_when_the_kind_adds_nothing(leaky):
     assert Leaky().egress_findings(subject, stage="plan") == []
     assert policy.floor_findings(subject, stage="plan", environ={})
     assert subject_findings(subject, stage="plan", environ={})
+
+
+# ------------------------------------------------------- produced subjects (review D3)
+
+
+class LeakyProducer(RegistryKind):
+    """A kind whose produced subjects OpenTofu registers with an operator credential, and
+    that states no egress rules of its own."""
+
+    name = "leaky-producer"
+    title = "Leaky producer"
+    modes = ("BACKWARD",)
+    default_compatibility = "BACKWARD"
+    registering_cloud = "nowhere"
+    fields = frozenset({"url"})
+    operator_credential_env = "LEAKY_REGISTRY_SECRET"  # pragma: allowlist secret - a name
+
+    def egress_findings(self, subject, *, stage, environ=None):
+        return []
+
+    def location(self, ref):
+        return ref.url
+
+
+@pytest.fixture
+def leaky_producer():
+    yield register_kind(LeakyProducer())
+    kinds._base._KINDS.pop("leaky-producer", None)
+
+
+def _produced(url):
+    return produced_contract({"kind": "leaky-producer", "url": url}, bound=False)
+
+
+def test_the_operator_credential_over_http_is_refused_at_validate(leaky_producer):
+    errors, _ = validation_findings(_produced("http://sr.example.com"), environ={})
+    assert any("a registry credential is sent over https only" in e for e in errors), errors
+
+
+def test_an_ungranted_operator_credential_host_warns_at_validate_and_refuses_at_plan(
+    leaky_producer,
+):
+    contract = _produced("https://sr.example.com")
+    _, warnings = validation_findings(contract, environ={})
+    assert any(HOSTS in w for w in warnings)
+    assert any("LEAKY_REGISTRY_SECRET may not be sent to 'sr.example.com'" in w for w in warnings)
+    _, plan_errors, _ = verify_consumed(contract, environ={})
+    assert any(
+        "LEAKY_REGISTRY_SECRET may not be sent to 'sr.example.com'" in e for e in plan_errors
+    )
+
+
+def test_a_granted_operator_credential_host_passes_the_floor(leaky_producer):
+    from fluid_build.schema_registry.reference import produced_subjects
+
+    (subject,) = produced_subjects(_produced("https://sr.example.com"))
+    env = {HOSTS: "sr.example.com", GRANTS: "LEAKY_REGISTRY_SECRET@sr.example.com"}
+    assert subject_findings(subject, stage="plan", environ=env) == []
+
+
+def test_a_kind_that_states_no_operator_credential_is_refused():
+    class Unstated(RegistryKind):
+        name = "unstated"
+
+        def egress_findings(self, subject, *, stage, environ=None):
+            return []
+
+    with pytest.raises(TypeError, match="states no operator credential"):
+        register_kind(Unstated())
+    assert "unstated" not in kinds.names()
+
+
+def test_the_built_in_kinds_state_their_operator_credential():
+    assert get_kind("confluent").operator_credential_env == policy.TOFU_REGISTRY_SECRET_ENV
+    assert get_kind("glue").operator_credential_env is None

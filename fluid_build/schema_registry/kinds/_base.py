@@ -9,6 +9,10 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
+#: The default of :attr:`RegistryKind.operator_credential_env`: not stated. A kind must
+#: state it (``None`` included), and :func:`register_kind` refuses one that does not.
+_UNSTATED: Any = object()
+
 _ANY_SUBJECT = re.compile(r"^[^\x00-\x1f\x7f]{1,255}$")
 
 
@@ -35,6 +39,13 @@ class RegistryKind:
     refuses: FrozenSet[str] = frozenset()
     #: Whether the registry answers a dry-run compatibility check.
     checks_compatibility: bool = False
+    #: The operator variable OpenTofu sends as the registry credential when it registers
+    #: this kind's produced subject at the contract's ``url`` (Confluent:
+    #: ``SCHEMA_REGISTRY_API_SECRET``), or ``None`` when it sends none (Glue: IAM).
+    #: ``policy.floor_findings`` judges that host for it: https, listed, and granted
+    #: ``<variable>@host``. Every kind states it; :func:`register_kind` refuses one that
+    #: does not.
+    operator_credential_env: Optional[str] = _UNSTATED
 
     # -- shape --------------------------------------------------------------
 
@@ -131,13 +142,21 @@ _KINDS: Dict[str, RegistryKind] = {}
 
 def register_kind(kind: RegistryKind) -> RegistryKind:
     """Add ``kind``. A name already registered is refused, and so is a kind that states
-    no egress rules (fail closed: see :meth:`RegistryKind.egress_findings`)."""
+    no egress rules (fail closed: see :meth:`RegistryKind.egress_findings`) or does not
+    say which operator credential OpenTofu sends for it (:attr:`RegistryKind.operator_credential_env`).
+    """
     if kind.name in _KINDS:
         raise ValueError(f"registry kind {kind.name!r} is already registered")
     if type(kind).egress_findings is RegistryKind.egress_findings:
         raise TypeError(
             f"registry kind {kind.name!r} states no egress rules: override egress_findings "
             "(return [] only for a kind that sends nothing to a contract-named host)"
+        )
+    if kind.operator_credential_env is _UNSTATED:
+        raise TypeError(
+            f"registry kind {kind.name!r} states no operator credential: set "
+            "operator_credential_env to the variable OpenTofu sends for a produced subject, "
+            "or None when it sends none"
         )
     _KINDS[kind.name] = kind
     return kind

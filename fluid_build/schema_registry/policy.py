@@ -220,8 +220,10 @@ def floor_findings(
     * a consumed subject read with no credential: the DNS-scoped host rule at plan
       (:func:`resolved_host_findings`).
 
-    A produced subject's credential is the operator's, sent by OpenTofu: its kind
-    states that rule (Confluent: ``SCHEMA_REGISTRY_API_SECRET@host``).
+    * a produced subject: OpenTofu sends the operator's registry credential
+      (``RegistryKind.operator_credential_env``; Confluent: ``SCHEMA_REGISTRY_API_SECRET``)
+      to the contract's ``url``, so that host gets :func:`credential_host_findings`
+      (https, listed, granted ``<variable>@host``, with the same severities).
     """
     from dataclasses import replace
 
@@ -229,8 +231,17 @@ def floor_findings(
 
     ref = subject.ref
     findings = static_host_findings(ref) if ref.url else []
-    if findings or subject.role != "consumed":
+    if findings:
         return findings
+    if subject.role == "produced":
+        # OpenTofu registers it with the operator's credential, sent to the contract's
+        # url: the host must be https, listed and granted <variable>@host (review D3).
+        variable = get_kind(ref.kind).operator_credential_env
+        if variable and ref.url:
+            return credential_host_findings(ref, variable, stage, environ)
+        return []
+    if subject.role != "consumed":
+        return []
     if ref.secret_ref:
         url = get_kind(ref.kind).credential_url(ref)
         if not url:

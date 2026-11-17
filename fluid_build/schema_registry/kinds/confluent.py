@@ -81,6 +81,9 @@ class ConfluentKind(RegistryKind):
     bind_hint = "bind the topic with platform: confluent and format: kafka_topic"
     fields = frozenset({"url", "auth"})
     refuses = frozenset({"registryName"})
+    # policy.TOFU_REGISTRY_SECRET_ENV (spelled here: kinds/ cannot import policy at module
+    # level); tests/schema_registry/test_egress_floor.py pins that the two agree.
+    operator_credential_env = "SCHEMA_REGISTRY_API_SECRET"  # pragma: allowlist secret - a name
     checks_compatibility = True
 
     def field_errors(self, spec: Mapping[str, Any], where: str) -> List[str]:
