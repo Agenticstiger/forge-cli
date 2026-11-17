@@ -473,6 +473,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Data Mesh Manager / Entropy Data kept contracts nothing pointed at.** A contract whose
+  expose was removed stayed `active`, linked from no port; `fluid datamesh-manager publish
+  --with-contract` also sent an empty umbrella contract at the bare product id; without
+  `--with-contract`, output ports named contracts nobody had published; and the registrar
+  (`fluid publish --target datamesh-manager`) PUT a contract pinned by `exposes[].contract.id`
+  at the derived id, so its port pointed elsewhere. Now both paths retire (`status: retired`,
+  never delete) a contract in the product's `{productId}.` namespace its ports no longer name,
+  and an umbrella an earlier publish left; no umbrella is sent; a port keeps a `contractId`
+  only for a contract this publish sends or Entropy has; and the contract goes to the id it
+  names. Every per-expose ODCS contract now carries its expose's `version` instead of `1.0.0`.
 - **ODCS exports inverted completeness, uniqueness and valid_values thresholds.** FLUID's
   `threshold` is the share of rows that pass; ODCS `nullValues`, `duplicateValues` and
   `invalidValues` count the rows that fail, and the export copied the threshold across, so

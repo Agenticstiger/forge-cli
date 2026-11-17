@@ -60,7 +60,9 @@ ORG = os.environ["FLUID_DMM_LIVE_ORG"]
 Edge = Tuple[str, str]
 
 
-def _product(pid: str, team: str, *, consumes=(), source: bool = False) -> Dict[str, Any]:
+def _product(
+    pid: str, team: str, *, consumes=(), source: bool = False, exposes=("out",)
+) -> Dict[str, Any]:
     contract: Dict[str, Any] = {
         "fluidVersion": "0.7.7",
         "kind": "DataProduct",
@@ -69,15 +71,16 @@ def _product(pid: str, team: str, *, consumes=(), source: bool = False) -> Dict[
         "metadata": {"owner": {"team": team}},
         "exposes": [
             {
-                "exposeId": "out",
+                "exposeId": expose_id,
                 "kind": "table",
                 "binding": {
                     "platform": "local",
                     "format": "parquet",
-                    "location": {"path": f"out/{pid}.parquet"},
+                    "location": {"path": f"out/{pid}.{expose_id}.parquet"},
                 },
                 "contract": {"schema": [{"name": "id", "type": "VARCHAR"}]},
             }
+            for expose_id in exposes
         ],
     }
     if consumes:
@@ -145,11 +148,12 @@ def _cleanup(prefix: str) -> None:
         ]
         for pid in sorted(
             mine,
-            key=lambda i: ("sdp", "adp", "cdp", "xteam").index(i.rsplit(".", 1)[-1]),
+            key=lambda i: ("sdp", "adp", "cdp", "xteam", "multi").index(i.rsplit(".", 1)[-1]),
             reverse=True,
         ):
             c.delete(f"/api/dataproducts/{pid}", headers=headers)
-            c.delete(f"/api/datacontracts/{pid}.out", headers=headers)
+            for suffix in (".out", ".extra", ""):
+                c.delete(f"/api/datacontracts/{pid}{suffix}", headers=headers)
         c.delete(f"/api/sourcesystems/kafka-{prefix}stream", headers=headers)
 
 
@@ -198,3 +202,37 @@ def test_the_graph_holds_exactly_the_contracts_lineage(run, publish):
     # Drop a consume: its edge goes, nothing else moves.
     publish(_product(cdp, "audit-team", consumes=[adp]))
     assert _graph_edges(nodes) == {(source, sdp), (sdp, adp), (adp, cdp), (sdp, xteam)}
+
+
+def _contract_status(contract_id: str) -> Any:
+    with httpx.Client(base_url=API, timeout=30) as c:
+        r = c.get(f"/api/datacontracts/{contract_id}", headers={"x-api-key": KEY})
+    return r.json().get("status") if r.status_code == 200 else r.status_code
+
+
+@pytest.mark.parametrize(
+    "publish", [_publish_registrar, _publish_native], ids=["registrar", "native"]
+)
+def test_a_dropped_expose_retires_its_contract_and_an_umbrella_is_retired(run, publish):
+    pid = f"{run}.multi"
+    # An umbrella an earlier forge published at the bare product id.
+    umbrella = {
+        "apiVersion": "v3.1.0",
+        "kind": "DataContract",
+        "id": pid,
+        "version": "1.0.0",
+        "status": "active",
+        "team": {"name": "audit-team"},
+        "schema": [],
+        "customProperties": [{"property": "umbrella", "value": True}],
+    }
+    with httpx.Client(base_url=API, timeout=30) as c:
+        r = c.put(f"/api/datacontracts/{pid}", json=umbrella, headers={"x-api-key": KEY})
+        assert r.status_code < 300, r.text
+    publish(_product(pid, "audit-team", exposes=("out", "extra")))
+    assert _contract_status(f"{pid}.extra") == "active"
+
+    publish(_product(pid, "audit-team", exposes=("out",)))
+    assert _contract_status(f"{pid}.out") == "active"
+    assert _contract_status(f"{pid}.extra") == "retired"
+    assert _contract_status(pid) == "retired"

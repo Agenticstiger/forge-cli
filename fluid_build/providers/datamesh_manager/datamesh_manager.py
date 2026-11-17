@@ -114,7 +114,11 @@ _PROVIDER_TYPE_MAP: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
-from fluid_build.providers.datamesh_manager._publish_flow import _PublishFlowMixin
+from fluid_build.providers.datamesh_manager._publish_flow import (
+    _PublishFlowMixin,
+    drop_unresolved_port_contract_ids,
+    output_port_contract_ids,
+)
 
 
 class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
@@ -588,9 +592,11 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             # Also preview per-expose ODCS contracts so the caller can inspect them
             if publish_contract:
                 result["odcs_contracts"] = self._preview_odcs_per_expose(fluid, product_id)
-                result["odcs_product_umbrella"] = self._preview_product_umbrella_contract(
-                    fluid, product_id
-                )
+            result["stale_contracts"] = (
+                "On publish, contracts in this product's namespace that its output ports "
+                "named before and no longer do are retired (status: retired), and an output "
+                "port drops a contractId that names a contract Entropy does not have."
+            )
             return result
 
         # Ensure team exists
@@ -606,6 +612,23 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 fluid,
                 tid,
             )
+
+        # What the product named before this publish: the contracts it no longer names
+        # are retired below.
+        existing_product = self._existing_product(product_id)
+        dropped_contract_ids: List[str] = []
+        if is_odps_payload and not publish_contract:
+            # No contract goes out with this publish, so a port may only name one
+            # Entropy already has; otherwise the product links to nothing.
+            dropped_contract_ids = drop_unresolved_port_contract_ids(
+                dp, set(), self._contract_exists
+            )
+            for contract_id in dropped_contract_ids:
+                self._log.warning(
+                    "Output port contract %s is not in Entropy and this publish does not "
+                    "send it (--with-contract does); the port goes out without a contractId.",
+                    contract_id,
+                )
 
         # PUT data product
         resp = self._request("PUT", f"/api/dataproducts/{product_id}", json_body=dp)
@@ -631,19 +654,6 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
             )
             result["odcs_contracts"] = odcs_results
 
-            # Publish a thin umbrella ODCS contract at ``{product_id}`` so any
-            # lineage reference that points at the bare product ID (rather than
-            # at a specific ``{product_id}.{expose_id}``) still resolves in the
-            # DMM UI. This is defensive: ``_ensure_odps_input_port_contract_ids``
-            # promotes product-level contract IDs to expose-level at publish
-            # time, so our own pipeline should not emit product-level
-            # references. But hand-written silvers, stale pipelines, or
-            # cross-repo consumers that spell ``contractId: bronze.telco.party_v1``
-            # literally would otherwise render as a broken link. See
-            # ``_render_product_umbrella_contract`` for the stub body shape.
-            umbrella_result = self._publish_product_umbrella_contract(fluid, product_id)
-            result["odcs_product_umbrella"] = umbrella_result
-
         access_results = self._publish_access_agreements(
             fluid,
             product_id,
@@ -656,6 +666,18 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         )
         if cancelled:
             result["cancelled_access_agreements"] = cancelled
+
+        keep_ids = set(output_port_contract_ids(dp))
+        keep_ids.update(
+            str(r["contract_id"])
+            for r in result.get("odcs_contracts") or []
+            if r.get("success") and r.get("contract_id")
+        )
+        retired = self._retire_stale_contracts(product_id, existing_product, keep_ids)
+        if retired:
+            result["retired_contracts"] = sorted(retired)
+        if dropped_contract_ids:
+            result["unresolved_contract_ids"] = dropped_contract_ids
 
         return result
 

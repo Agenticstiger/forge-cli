@@ -21,7 +21,7 @@ fluid dmm publish contract.fluid.yaml --with-contract
 ## Features
 
 - **Publish data products** via `PUT /api/dataproducts/{id}`
-- **Publish data contracts** via `PUT /api/datacontracts/{id}`
+- **Publish data contracts** via `PUT /api/datacontracts/{id}`, one ODCS contract per expose at the id its output port names, carrying the expose `version`. A contract in the product's `{productId}.` namespace that its ports no longer name (an expose was removed) is retired (`status: retired`), never deleted. An output port names only a contract the publish sends or Entropy already has
 - **Publish product-to-product lineage** via ODPS input ports and `Access` resources derived from `consumes[]`
 - **Auto-create teams** when they don't exist
 - **Input/output port mapping** from FLUID expects/exposes plus explicit source-system consumes

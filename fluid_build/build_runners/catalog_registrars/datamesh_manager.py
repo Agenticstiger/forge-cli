@@ -37,6 +37,7 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from fluid_build.api.catalog import CatalogRegistrar, RegistrationResult
 from fluid_build.api.catalog_publication import (
@@ -145,12 +146,30 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             self._ensure_owner_team(payload)
             for sys_urn in self._ensure_source_systems(payload):
                 source_system_urns.append(sys_urn)
+            # What the product named before this publish: the contracts it no longer
+            # names are retired once the new product is in.
+            from fluid_build.providers.datamesh_manager._publish_flow import (
+                output_port_contract_ids,
+            )
+
+            existing_product = self._get_json_or_none(
+                f"/api/dataproducts/{quote(product_id, safe='')}"
+            )
+            sent_contract_ids: set[str] = set()
             for asset in payload.assets:
-                contract_id = f"{product_id}.{asset.asset_id}"
-                contract_urn = f"dmm://datacontracts/{contract_id}"
-                self._put_data_contract(contract_id, asset)
-                contract_urns.append(contract_urn)
-            self._put_data_product(payload)
+                body = self._render_dmm_data_contract_body(asset)
+                if body is None:
+                    # No ODCS for this asset: nothing to PUT. Its output port keeps a
+                    # contractId only if Entropy already has that contract (below).
+                    continue
+                # The id the contract names for itself, which is the id its output
+                # port names (both resolve through ``expose_contract_id``); a pinned
+                # ``exposes[].contract.id`` used to be PUT at the derived id instead.
+                contract_id = str(body.get("id") or f"{product_id}.{asset.asset_id}")
+                self._put_data_contract(contract_id, asset, body=body)
+                sent_contract_ids.add(contract_id)
+                contract_urns.append(f"dmm://datacontracts/{contract_id}")
+            product_body = self._put_data_product(payload, sent_contract_ids=sent_contract_ids)
             # Pre-flight: enumerate existing DMM DataProduct IDs so we can
             # SKIP access-agreement PUTs whose upstream product doesn't
             # exist yet (DMM otherwise returns a generic ``404`` mid-publish
@@ -179,6 +198,9 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                 product_id, {str(a["id"]) for a in agreements}
             ):
                 access_urns.append(f"dmm://access/{access_id}?cancelled=stale")
+            keep_ids = set(output_port_contract_ids(product_body)) | sent_contract_ids
+            for contract_id in self._retire_stale_contracts(product_id, existing_product, keep_ids):
+                contract_urns.append(f"dmm://datacontracts/{contract_id}?retired=stale")
         except Exception as exc:  # noqa: BLE001 — both HTTP + transport errors
             return RegistrationResult(
                 target=self.target,
@@ -291,7 +313,12 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             "Content-Type": "application/json",
         }
 
-    def _put_data_product(self, payload: CatalogPublicationPayload) -> None:
+    def _put_data_product(
+        self,
+        payload: CatalogPublicationPayload,
+        *,
+        sent_contract_ids: Optional[set] = None,
+    ) -> Dict[str, Any]:
         """``PUT /api/dataproducts/{id}`` with the ODPS-shaped payload.
 
         We prefer the pre-rendered ODPS YAML when available (parsed
@@ -300,9 +327,23 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         minimal native shape — derived directly from the canonical
         payload — when ODPS rendering wasn't available.
         """
+        from fluid_build.providers.datamesh_manager._publish_flow import (
+            drop_unresolved_port_contract_ids,
+        )
         from fluid_build.util.safe_http import safe_httpx_client
 
         body = self._render_dmm_data_product_body(payload)
+        if sent_contract_ids is not None:
+            # A port names only a contract that exists: one this publish sent, or one
+            # Entropy already has. Otherwise the product links to a contract nobody has.
+            for contract_id in drop_unresolved_port_contract_ids(
+                body, sent_contract_ids, self._contract_exists
+            ):
+                LOG.warning(
+                    "Output port contract %s was not sent (no ODCS for it) and is not in "
+                    "Entropy; the port goes out without a contractId.",
+                    contract_id,
+                )
         with safe_httpx_client(
             base_url=self.api_url,
             timeout=float(self.timeout_seconds),
@@ -317,8 +358,15 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                 raise _HttpStatusError(
                     f"DMM PUT /data-products returned {r.status_code}: " + (r.text or "")[:512]
                 )
+        return body
 
-    def _put_data_contract(self, contract_id: str, asset: AssetPayload) -> None:
+    def _put_data_contract(
+        self,
+        contract_id: str,
+        asset: AssetPayload,
+        *,
+        body: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """``PUT /api/datacontracts/{contract_id}`` with the ODCS body.
 
         ``contract_id`` is ``{product_id}.{asset_id}`` to match DMM's
@@ -327,7 +375,8 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         """
         from fluid_build.util.safe_http import safe_httpx_client
 
-        body = self._render_dmm_data_contract_body(asset)
+        if body is None:
+            body = self._render_dmm_data_contract_body(asset)
         if body is None:
             # No ODCS available — silently skip the contract PUT rather
             # than POSTing an empty body that DMM would reject. The
@@ -339,7 +388,7 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             allow_private=True,
         ) as c:
             r = c.put(
-                f"/api/datacontracts/{contract_id}",
+                f"/api/datacontracts/{quote(contract_id, safe='')}",
                 json=body,
                 headers=self._headers(),
             )
@@ -817,6 +866,85 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
 
     # ── Access agreements — product-to-product lineage in DMM ────────
 
+    def _get_json_or_none(self, path: str) -> Optional[Any]:
+        """``GET path`` as JSON, or ``None`` when it is absent or could not be read."""
+        found, body = self._read_json(path)
+        return body if found else None
+
+    def _read_json(self, path: str) -> tuple:
+        """``GET path`` as ``(found, body)``: ``(True, body)``, ``(False, None)`` on a 404,
+        ``(None, None)`` when it could not be read."""
+        from fluid_build.util.safe_http import safe_httpx_client
+
+        try:
+            with safe_httpx_client(
+                base_url=self.api_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
+                r = c.get(path, headers=self._headers())
+            if r.status_code == 404:
+                return False, None
+            if r.status_code >= 400:
+                LOG.warning("DMM GET %s returned %s", path, r.status_code)
+                return None, None
+            return True, r.json()
+        except Exception as exc:  # noqa: BLE001 — a read here only informs a reconcile
+            LOG.warning("Could not read %s: %s", path, exc)
+            return None, None
+
+    def _contract_exists(self, contract_id: str) -> Optional[bool]:
+        """A retired contract counts as absent: a port must not link to one."""
+        from fluid_build.providers.datamesh_manager._publish_flow import is_live_contract
+
+        found, body = self._read_json(f"/api/datacontracts/{quote(contract_id, safe='')}")
+        return is_live_contract(found, body)
+
+    def _retire_stale_contracts(
+        self,
+        product_id: str,
+        existing_product: Optional[Any],
+        keep_ids: set,
+    ) -> List[str]:
+        """Re-PUT each contract the product no longer names with ``status: retired``.
+
+        Never deleted, best effort, and only contracts that are forge's (see
+        :func:`~fluid_build.providers.datamesh_manager._publish_flow.stale_contract_candidates`).
+        The native provider's ``_retire_stale_contracts`` does the same.
+        """
+        from fluid_build.providers.datamesh_manager._publish_flow import (
+            retired_contract_body,
+            stale_contract_candidates,
+        )
+        from fluid_build.util.safe_http import safe_httpx_client
+
+        retired: List[str] = []
+        existing = existing_product if isinstance(existing_product, dict) else None
+        for contract_id in stale_contract_candidates(existing, product_id, keep_ids):
+            path = f"/api/datacontracts/{quote(contract_id, safe='')}"
+            found, current = self._read_json(path)
+            body = retired_contract_body(current, contract_id, product_id) if found else None
+            if body is None:
+                continue
+            try:
+                with safe_httpx_client(
+                    base_url=self.api_url,
+                    timeout=float(self.timeout_seconds),
+                    allow_private=True,
+                ) as c:
+                    r = c.put(path, json=body, headers=self._headers())
+                if r.status_code >= 400:
+                    LOG.warning(
+                        "Could not retire stale contract %s: HTTP %s", contract_id, r.status_code
+                    )
+                    continue
+            except Exception as exc:  # noqa: BLE001 — best effort, like the access reconcile
+                LOG.warning("Could not retire stale contract %s: %s", contract_id, exc)
+                continue
+            LOG.info("Retired contract %s: no output port names it any more", contract_id)
+            retired.append(contract_id)
+        return retired
+
     def _cancel_stale_access_agreements(self, product_id: str, keep_ids: set[str]) -> List[str]:
         """``POST /api/access/{id}/cancel`` for each agreement forge made for a
         consume the contract no longer has; returns the cancelled ids.
@@ -829,8 +957,6 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         so both publish paths cancel the same set. Best effort: a failure is
         logged and the publish still succeeds.
         """
-        from urllib.parse import quote
-
         from fluid_build.providers.datamesh_manager._publish_flow import (
             _ACCESS_PAGE_SIZE,
             stale_access_agreement_ids,

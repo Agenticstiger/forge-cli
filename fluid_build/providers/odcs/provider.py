@@ -298,6 +298,13 @@ class OdcsProvider(BaseProvider):
         scoped_id = expose_contract_id(fluid, exposes[0], expose_id=expose_id)
         if scoped_id:
             scoped["_scoped_id"] = scoped_id
+        # The per-port contract is that port's contract, so it carries the port's
+        # version (the ODPS output port's ``version`` is the same field). FLUID has no
+        # product-level version, so without this every contract said 1.0.0 and a
+        # breaking change to a port went out under the version it broke.
+        expose_version = exposes[0].get("version")
+        if expose_version not in (None, ""):
+            scoped["_scoped_version"] = str(expose_version)
         # Only stamp a scoped status when the port actually declares one —
         # defaulting to "active" here used to mask the contract-root
         # ``lifecycle.state``, so every per-port export claimed "active".

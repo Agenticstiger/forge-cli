@@ -115,7 +115,7 @@ def to_odcs(ctx: ExportCtx) -> None:
             "Expected one of: fluid['id'], fluid['contract']['id'], or fluid['metadata']['id']"
         )
 
-    odcs["version"] = metadata.get("version", "1.0.0")
+    odcs["version"] = fluid.get("_scoped_version") or metadata.get("version", "1.0.0")
     odcs["apiVersion"] = ODCS_API_VERSION
     odcs["kind"] = ODCS_KIND
     odcs["id"] = contract_id
