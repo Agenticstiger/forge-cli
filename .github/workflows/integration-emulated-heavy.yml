@@ -9,7 +9,7 @@
 #   • Lakekeeper + Kafka Connect — forge-derived Iceberg sink configs on a
 #     real worker against a real Lakekeeper REST catalog. Keyless, in its
 #     own job (`lakekeeper-integration`).
-#   • Confluent schema registry — `fluid generate iac --provider confluent`
+#   • Confluent schema registry: `fluid generate iac --provider confluent`
 #     applied by OpenTofu to cp-schema-registry on a KRaft Kafka. Keyless,
 #     in its own job (`confluent-schema-registry`).
 #
@@ -473,7 +473,7 @@ jobs:
           done
 
   # ────────────────────────────────────────────────────────────────────
-  # Confluent schema registry lane — forge's registry writes on a real
+  # Confluent schema registry lane: forge's registry writes on a real
   # registry.
   #
   # What tests/integration/test_confluent_schema_registry_live.py proves:

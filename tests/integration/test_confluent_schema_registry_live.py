@@ -208,6 +208,8 @@ def _purge(*subjects: str) -> None:
             try:
                 httpx.delete(f"{ENDPOINT}/subjects/{subject}", params=params, timeout=15)
             except httpx.HTTPError:
+                # Best effort: the job throws the registry away, and a failed cleanup
+                # must not hide the test's own result.
                 pass
 
 
