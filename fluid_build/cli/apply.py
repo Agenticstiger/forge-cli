@@ -2170,6 +2170,11 @@ def run(args, logger: logging.Logger) -> int:
     # keeps handing it the attested plan (``plan_kwargs``), which embeds it.
     build_kwargs: Dict[str, Any] = plan_kwargs or {"contract": source_contract}
 
+    if apply_engine != "opentofu":
+        # A Spark build's infrastructure and runs come with the OpenTofu engine only.
+        from fluid_build.cli._spark_apply import refuse_without_opentofu
+
+        refuse_without_opentofu(source_contract, apply_engine)
     if apply_engine == "opentofu":
         # Apply-time plugin hooks run on EVERY engine. They used to be
         # invoked only from the native path's YAML branch, several hundred
@@ -2184,7 +2189,19 @@ def run(args, logger: logging.Logger) -> int:
         if _hook_rc != 0:
             return _hook_rc
         engine_kwargs = _state_for_job_runs(source_contract, resolved_mode, resolved_build_id)
+        # Spark job runs: compiled and checked against the bound plan before tofu apply,
+        # reconciled after it (``cli/_spark_apply.py``).
+        from fluid_build.cli import _spark_apply as _spark
+
+        spark_runs = _spark.prepare(
+            source_contract,
+            build_id=resolved_build_id,
+            verified_plan=verified_plan_data,
+            dry_run=effective_dry_run,
+        )
         rc = apply_via_opentofu(args, logger, contract=source_contract, **engine_kwargs)
+        if rc == 0:
+            rc = _spark.reconcile_after_apply(spark_runs, logger, dry_run=effective_dry_run)
         # The OpenTofu engine provisions infrastructure only. Build-augmented
         # modes (amend-and-build / replace-and-build) still need their build
         # phase to run — mirror the native dispatch below so ``--build`` is

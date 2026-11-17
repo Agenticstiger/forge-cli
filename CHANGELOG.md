@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Spark job runs (schema 0.7.7 preview).** `fluid apply` now starts and reconciles the run of
+  an `engine: spark` build after `tofu apply` provisions it, on EMR Serverless (`StartJobRun`,
+  `mode: STREAMING` with `retryPolicy.maxFailedAttemptsPerHour`), AWS Glue, EMR on EC2
+  (`AddJobFlowSteps` on `clusterId`, client deploy mode) and EMR on EKS. `fluid plan` lists a
+  `spark.reconcile` action per build, covered by `planDigest`, with the build's config hash
+  (the job config, the runner's sha256 and the run settings); apply refuses a bound plan whose
+  Spark actions differ. A streaming job with the same hash is left running; a new hash cancels
+  it, waits, and starts the new config on the same checkpoint; a new topic or cluster on the
+  old checkpoint is refused; a last run that failed (EMR Serverless' thrash guard) is an error
+  naming the run, until the build changes or `fluid spark run --restart`.
+  - `fluid spark run <contract> --build-id <id> [--json]` starts a scheduled build (batch, or
+    a stream with `trigger.availableNow`) for Airflow: it waits, exits 0 on success, 1 when the
+    run failed or was cancelled, 2 when the contract or the operator's policy refuses it, and
+    cancels the run on SIGTERM. `fluid spark status <contract>` shows each build's recent runs.
+  - A contract's `parameters.spark.sparkConf` sets resource and tuning settings only; the
+    operator lists any other key in `FLUID_SPARK_CONF_ALLOWLIST` (settings like `spark.jars`
+    load code that runs with the job's role). `FLUID_SPARK_WAIT_SECONDS` caps the reconcile's
+    waits (default 900).
+  - The caller (the role running `fluid apply` or the MWAA execution role) needs the actions in
+    `build_runners/spark/_adapters.py::CALLER_ACTIONS`, plus `iam:PassRole` on the job role for
+    EMR Serverless and EMR on EKS. boto3 stays in the `[aws]` extra.
+
 - **OpenTofu state and plan encryption, opt-in.** `FLUID_STATE_ENCRYPTION` (an operator
   setting; project dotenv files cannot set it) names one OpenTofu key provider by reference:
   `aws-kms://<key id, ARN or alias/name>`, `gcp-kms://projects/<p>/locations/<l>/keyRings/<r>/cryptoKeys/<k>`,
@@ -45,6 +67,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `snowflakedb/snowflake` OpenTofu provider reads the same variables (2.23 or newer for a token
   file). `fluid auth login`, `fluid auth status` and `fluid doctor` take such a login without
   `SNOWFLAKE_USER`.
+
+- **`fluid profile`: FLUX's profiler, as the `[profile]` extra (groundwork).**
+  `fluid profile <contract> --expose <id> --source <file|db-uri> [--table <name>] [--out <file>]`
+  reads one expose's records where they live, once and whole (no sampling). It writes a
+  profile document in flux-engine's PROFILE-SPEC format 1-0-0: canonical RFC 8785 JSON,
+  `rowCount`, and the OpenLineage column metrics that apply to each column whose FLUID type
+  has a domain (`count`, `nullCount`, `distinctCount`; `sum` for numbers; `min`, `max`,
+  `quantiles` for numbers and timestamps). It prints the digest a FLUX Simulation pins. Only aggregates leave, after ACRO 1.1.0's
+  output-checking defaults (flux-engine ADR 0003, amended 2026-11-16):
+  - a count below 10 records is withheld, and so is a zero;
+  - every published count is rounded to a multiple of 5, and a positive count that rounds
+    to 0 (a column of 1 or 2 distinct values) is withheld, as a 0 would read as a zero cell;
+  - a sum is withheld under dominance (2, 0.90) or the p-ratio 0.10. It is also withheld when
+    fewer than 10 records contribute to it, or when its records hold at most two values: a
+    magnitude table's cell threshold, and ACRO's all-values-the-same check widened to two
+    values. With `min` and `max` published, such a sum gives each count back exactly;
+  - a min, max or quantile is published only when 10 records hold that value (the DwB
+    output-checking guidelines, class 3).
+
+  A withheld value keeps its SDMX `CL_CONF_STATUS` code and no value. These are
+  output-checking conventions only, with no privacy or anonymity guarantee.
+  - Sources:
+    - A `.ndjson`/`.jsonl` file is read as FLUX's committed slice is (binary floats refused).
+    - A CSV is read as text, and a Parquet file natively, through the DuckDB sandbox
+      `fluid init --discover` uses. A `TIMESTAMP WITH TIME ZONE` is read as its UTC instant.
+    - A `postgres://`, `mysql://` or `sqlite:///` database is attached read-only by the same
+      `attach_jdbc_source` as discover, now one shared function with a `read_only` option.
+      A sqlite path that does not exist is refused, not created.
+    - An NDJSON line Python cannot parse (nested too deeply, an integer over 4,300 digits) is
+      refused by line, and so is an infinite date or timestamp, by column, rather than read as
+      year 9999.
+    - Every value is held in memory while it is measured.
+  - Not profiled yet: binary floats, nested values, bytes, a bare time, intervals,
+    geospatial values and booleans. FLUX's reader refuses a boolean as a category value. Each
+    left-out column is named, with the reason.
+  - The document is written owner-only and never through a symbolic link. Nothing is
+    written, and no directory is made, until the profile is formed. A default name
+    (`<exposeId>.profile.json`) needs an exposeId of `[A-Za-z0-9_.-]` alone, otherwise
+    `--out` is required. An `--out` that is the source file is refused.
+  - Not wired yet: every statistic is formed by FLUX's shared registry (`flux-stats`, MEAS-3).
+    Until it is published, `fluid profile` says so and reads nothing.
+    `fluid_build/profiler/_stats.py` is the one seam that wires it.
+  - `[profile]` adds DuckDB alone (`rfc8785` is a base dependency). `fluid --help` and
+    `fluid profile --help` stay free of both (`tests/perf/test_startup_budget.py`).
 
 - **Schema 0.7.7 (preview): semantic relationships and SCD validity windows**
   (RFC-semantics-tier1 §4 and §5). `exposes[].semantics.relationships[]`
@@ -379,6 +445,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Data Mesh Manager / Entropy Data lineage was missing or stale.** Both publish paths
+  (`fluid publish --target datamesh-manager` and `fluid datamesh-manager publish`) stripped
+  every `consumes[]` input port from the ODPS product and left product-to-product lineage to
+  Access agreements, which stay `requested` across teams, so a cross-team consume drew no edge.
+  Each consume is now an ODPS input port naming the upstream contract, which Entropy draws an
+  edge from. A build source's input port now carries `customProperties[sourceSystemId]` and
+  `[type]`, the only shape Entropy links a SourceSystem by; every source-aligned product used to
+  land with its SourceSystem node and no edge to it. Agreements forge made for consumes a
+  contract no longer has are cancelled on publish (they kept drawing the edge). Checked
+  edge for edge against Entropy Data Community Edition.
+- **`fluid forge data-model from-source --source postgres|mysql` attaches its source again.**
+  The shared JDBC attach (`cli/discover/_jdbc_introspect.py::attach_jdbc_source`) ran a bare
+  `ATTACH ... (TYPE postgres)` in the DuckDB sandbox, which turns off persistent secret storage.
+  With no secret named in the ATTACH, the scanner looked for a default one there and failed
+  with `Unknown secret storage found: 'local_file'` before it connected. The attach now creates
+  an empty temporary secret and names it, as the DuckDB build runner already did. `fluid profile`
+  reads postgres and mysql tables through the same attach. `fluid init --discover` has its own
+  attach in `_jdbc_base.py`, which still fails this way.
 - **`fluid forge data-model` gave every expose the foreign entity of every relationship.** In
   the one-expose-per-dataset shape, the target of a relationship got a foreign entity on its own
   key, and the other exposes one on a column they do not have, and `fluid generate

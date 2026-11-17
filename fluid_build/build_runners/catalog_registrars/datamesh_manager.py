@@ -105,17 +105,15 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
            UI shows "Add Data Contract…" on every output port even
            though the wire payload includes the right ``contractId``.
         3. ``PUT /api/dataproducts/{product_id}`` — the ODPS-shaped
-           data product. Build-driven ``inputPorts`` (with proper
-           ``sourceSystemId`` populated by the renderer below) survive;
-           product-to-product ``inputPorts`` are stripped because
-           Entropy's ``dataproduct-0.0.1.json`` schema requires every
-           inputPort to carry a ``sourceSystemId`` (i.e. external
-           systems only) — product-to-product lineage flows through
-           Access agreements instead.
+           data product. Every input port the ODPS render produced is
+           sent: a product consume's port names the upstream contract,
+           which is what Entropy draws the product -> product edge from,
+           and a build source's port names its SourceSystem through the
+           ``sourceSystemId`` custom property.
         4. ``PUT /api/access/{access_id}`` per ``contract.consumes[]``
-           entry — one Access Agreement per upstream output port. DMM's
-           UI renders these as edges between products on the lineage
-           graph.
+           entry — one Access Agreement per upstream output port — then
+           ``POST /api/access/{id}/cancel`` for each agreement forge made
+           earlier for a consume the contract no longer has.
 
         Failures on the data-product PUT short-circuit; failures on
         individual contracts or access agreements are surfaced via the
@@ -160,7 +158,8 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             # provider's Gap-9 pre-flight check in
             # ``providers/datamesh_manager/_publish_flow.py``.
             existing_pids = self._existing_product_ids()
-            for agreement in self._build_access_agreements(payload):
+            agreements = self._build_access_agreements(payload)
+            for agreement in agreements:
                 upstream = (agreement.get("provider") or {}).get("dataProductId")
                 if existing_pids and upstream and str(upstream) not in existing_pids:
                     import logging
@@ -176,6 +175,10 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                     continue
                 self._put_access_agreement(agreement)
                 access_urns.append(f"dmm://access/{agreement['id']}")
+            for access_id in self._cancel_stale_access_agreements(
+                product_id, {str(a["id"]) for a in agreements}
+            ):
+                access_urns.append(f"dmm://access/{access_id}?cancelled=stale")
         except Exception as exc:  # noqa: BLE001 — both HTTP + transport errors
             return RegistrationResult(
                 target=self.target,
@@ -380,74 +383,18 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                     #      ``"1.0.0"`` so DMM doesn't flag the port as
                     #      malformed.
                     DataMeshManagerRegistrar._overlay_dmm_output_port_fields(parsed, payload)
-                    # Strip product-to-product ``inputPorts``. DMM /
-                    # Entropy treat ``inputPorts`` as references to
-                    # SourceSystem entities (external producers) with
-                    # required ``sourceSystemId`` + custom-property
-                    # ``sourceSystem`` definitions that don't exist for
-                    # product-to-product flow. Cross-product lineage
-                    # belongs on the per-asset ODCS contract (which we
-                    # PUT separately) and on DMM Access agreements
-                    # (not modelled here). Mirrors the
-                    # ``_remove_odps_product_consume_input_ports`` step
-                    # in the richer async ``DataMeshManagerProvider``.
                     # ── Input ports ──────────────────────────────────
-                    # The ODPS render emits ``inputPorts`` derived from
-                    # both ``consumes[]`` (product-to-product) and
-                    # ``builds[].properties.source`` (SDP acquisition).
-                    # Entropy rejects any inputPort that lacks
-                    # ``sourceSystemId`` (its dataproduct-0.0.1.json
-                    # schema treats inputPorts as references to
-                    # SourceSystem entities only). For product-to-
-                    # product flows the lineage moves to Access
-                    # agreements (see ``_build_access_agreements``); for
-                    # SDP build sources we INJECT the
-                    # ``sourceSystemId`` here from the canonical
-                    # build-port helper so the port survives the strip
-                    # and DMM renders the lineage edge "this product ←
-                    # this Postgres source system" in its graph.
+                    # Kept as rendered. A product consume's port carries the
+                    # upstream contract id, and Entropy draws the product ->
+                    # product edge from it (status ``declared``, merged with an
+                    # approved Access agreement for the same pair). Lineage
+                    # carried only by Access agreements was missing across
+                    # teams, where an agreement stays ``requested``. A build
+                    # source's port gets the ``sourceSystemId`` / ``type``
+                    # custom properties Entropy links it to its SourceSystem by.
                     DataMeshManagerRegistrar._inject_build_input_port_source_systems(
                         parsed, payload
                     )
-                    if "inputPorts" in parsed and isinstance(parsed["inputPorts"], list):
-                        # Deferred: this module is imported purely for its
-                        # ``register_catalog_backend`` side effect, so building
-                        # the backend registry does not pull the ODPS provider
-                        # in with it.
-                        from fluid_build.providers.odps_standard.mappers.ports import (
-                            consume_input_port_contract_ids,
-                            remove_output_port_input_contracts,
-                        )
-
-                        kept: List[Any] = []
-                        removed: List[Any] = []
-                        for ip in parsed["inputPorts"]:
-                            keep = isinstance(ip, dict) and ip.get("sourceSystemId")
-                            (kept if keep else removed).append(ip)
-                        parsed["inputPorts"] = kept
-                        if not kept:
-                            parsed.pop("inputPorts", None)
-                        # The ODPS render derives
-                        # ``outputPorts[].inputContracts`` from the same
-                        # ``consumes[]``, so a stripped port stays named in the
-                        # output port's lineage unless it goes with it — which
-                        # would put back the unresolvable SourceSystem
-                        # reference this strip exists to remove.
-                        #
-                        # Only the consume-derived ones, though. The rule above
-                        # also drops an ``expects[]`` port, whose expose replays
-                        # the upstream document's OWN ``inputContracts``; that
-                        # is the only record of the dependency, since Access
-                        # agreements are built from ``consumes[]``.
-                        consume_ids = consume_input_port_contract_ids(payload.contract or {})
-                        remove_output_port_input_contracts(
-                            parsed,
-                            [
-                                ip
-                                for ip in removed
-                                if isinstance(ip, dict) and str(ip.get("contractId")) in consume_ids
-                            ],
-                        )
                     return parsed
             except Exception:  # noqa: BLE001 — fall through to native
                 LOG.debug(
@@ -845,32 +792,87 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
     def _inject_build_input_port_source_systems(
         odps_payload: Dict[str, Any], payload: CatalogPublicationPayload
     ) -> None:
-        """Wire ``sourceSystemId`` + ``type`` onto each build-driven
-        input port by promoting from ODPS ``customProperties``.
+        """Add the ``sourceSystemId`` / ``type`` custom properties to each
+        build-source input port.
 
-        The standalone ODPS-Bitol v1.0.0 artifact carries source-system
-        info under ``customProperties[sourceSystem|sourceKind]`` because
-        the Bitol ``InputPort`` schema is closed and forbids native
-        ``sourceSystemId`` / ``type`` fields. DMM (Entropy Data),
-        however, both accepts those native fields AND uses them to
-        render the lineage edge in the UI. So we delegate to the
-        existing ``promote_input_port_native_source_system_fields``
-        helper (battle-tested in the legacy provider) which copies the
-        customProperties values into the native fields. Without this
-        promotion, the downstream strip-step removes every input port
-        for lack of ``sourceSystemId`` and the SDP lands with no
-        upstream lineage edge in DMM's graph.
-
-        Idempotent: skips ports that already carry an explicit
-        ``sourceSystemId``.
+        The ODPS export records the source as
+        ``customProperties[sourceSystem|sourceKind]``; Entropy links an input
+        port to a SourceSystem only by ``customProperties[sourceSystemId]`` and
+        labels the edge from ``customProperties[type]``. See
+        :func:`~fluid_build.providers.datamesh_manager._odps_helpers.promote_input_port_native_source_system_fields`.
         """
         from fluid_build.providers.datamesh_manager._odps_helpers import (
+            ensure_odps_input_port_source_system_custom_property,
             promote_input_port_native_source_system_fields,
         )
 
-        promote_input_port_native_source_system_fields(odps_payload)
+        contract = payload.contract or {}
+        # A legacy ``consumes[].sourceSystem`` gets its ``sourceSystem`` label
+        # first, as the native provider's default mode does, so the
+        # SourceSystem ``_ensure_source_systems`` upserts for it is linked too.
+        ensure_odps_input_port_source_system_custom_property(
+            odps_payload, contract, default_from_reference=False
+        )
+        promote_input_port_native_source_system_fields(odps_payload, contract)
 
     # ── Access agreements — product-to-product lineage in DMM ────────
+
+    def _cancel_stale_access_agreements(self, product_id: str, keep_ids: set[str]) -> List[str]:
+        """``POST /api/access/{id}/cancel`` for each agreement forge made for a
+        consume the contract no longer has; returns the cancelled ids.
+
+        An approved agreement keeps drawing its edge after the consume is gone.
+        Cancel with an ``endTimestamp`` of now ends it immediately and keeps
+        its history; ``DELETE`` refuses an active agreement. Which agreements are
+        stale is decided by the native provider's
+        :func:`~fluid_build.providers.datamesh_manager._publish_flow.stale_access_agreement_ids`,
+        so both publish paths cancel the same set. Best effort: a failure is
+        logged and the publish still succeeds.
+        """
+        from urllib.parse import quote
+
+        from fluid_build.providers.datamesh_manager._publish_flow import (
+            _ACCESS_PAGE_SIZE,
+            stale_access_agreement_ids,
+            stale_access_cancel_body,
+        )
+        from fluid_build.util.safe_http import safe_httpx_client
+
+        cancelled: List[str] = []
+        try:
+            with safe_httpx_client(
+                base_url=self.api_url,
+                timeout=float(self.timeout_seconds),
+                allow_private=True,
+            ) as c:
+                r = c.get(
+                    "/api/access",
+                    params={"consumerDataProductId": product_id, "pageSize": _ACCESS_PAGE_SIZE},
+                    headers=self._headers(),
+                )
+                if r.status_code != 200:
+                    LOG.warning(
+                        "DMM GET /access returned %s; stale agreements of %s not cancelled",
+                        r.status_code,
+                        product_id,
+                    )
+                    return cancelled
+                for access_id in stale_access_agreement_ids(r.json(), product_id, keep_ids):
+                    cr = c.post(
+                        f"/api/access/{quote(access_id, safe='')}/cancel",
+                        json=stale_access_cancel_body(),
+                        headers=self._headers(),
+                    )
+                    if cr.status_code >= 400:
+                        LOG.warning(
+                            "DMM POST /access/%s/cancel returned %s", access_id, cr.status_code
+                        )
+                        continue
+                    LOG.info("Cancelled stale Access lineage %s", access_id)
+                    cancelled.append(access_id)
+        except Exception as exc:  # noqa: BLE001 — reconcile is best effort
+            LOG.warning("Could not cancel stale Access agreements of %s: %s", product_id, exc)
+        return cancelled
 
     @staticmethod
     def _build_access_agreements(
@@ -882,10 +884,8 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         agreement at ``/api/access/{id}`` declares "consumer X reads
         from provider Y's output port Z" and the DMM UI renders that
         as a directed edge between the two products on the lineage
-        graph. Without these, ``consumes[]`` has no native DMM
-        representation (Entropy's data-product schema rejects
-        product-to-product ``inputPorts`` — see the strip step in
-        ``_render_dmm_data_product_body``).
+        graph, and an approved one takes over the ``declared`` edge the
+        consume's input port draws.
 
         Agreement id is deterministic
         (``{consumer}__uses__{provider}__{output_port}``, matching the
@@ -988,22 +988,18 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
                     )
 
 
-# Access-agreement ids must be URL-safe (DMM routes by id). Slug rule
-# matches the legacy provider's: alphanumeric + dot/dash/underscore.
-_ACCESS_ID_UNSAFE = __import__("re").compile(r"[^A-Za-z0-9._-]")
-
-
 def _slug_access_id(consumer: str, provider: str, output_port: str) -> str:
-    # The slug uses ``__uses__`` to match the native provider's
-    # ``_access_agreement_id`` format (see
-    # ``providers/datamesh_manager/_publish_flow.py``). Previously the
-    # registrar slugged with ``__consumes__`` — different access IDs in
-    # DMM for the same conceptual edge, so a contract re-published through
-    # the registrar would create a parallel access record next to the
-    # native provider's existing one, and DMM could end up with two
-    # competing approval states for one upstream→downstream lineage edge.
-    raw = f"{consumer}__uses__{provider}__{output_port}"
-    return _ACCESS_ID_UNSAFE.sub("_", raw).strip("_")
+    """The Access-agreement id for one consume edge: the native provider's own.
+
+    Both publish paths cancel the forge agreements whose ids the current publish
+    did not mint, so they must mint the same id for the same edge. The registrar
+    used to slug with its own rule, per character and without ``~``, which
+    differed from the native one (runs collapsed, ``~`` kept) for an id holding
+    either.
+    """
+    from fluid_build.providers.datamesh_manager._publish_flow import _PublishFlowMixin
+
+    return _PublishFlowMixin._access_agreement_id(consumer, provider, output_port)
 
 
 class _HttpStatusError(Exception):
