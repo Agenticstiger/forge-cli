@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is for enum levels only: every other type keeps the argument characters it had, and 0.7.6 is
   unchanged. No emitter writes an enum's levels into a SQL type any more: dbt model contracts
   and casts gave `varchar('a','b')` and ODCS gave `VARCHAR('a','b')` for an enum column, where
-  each now gives the bare string type.
+  each now gives the bare string type. ODCS no longer reads `enum(10)` as a `maxLength` of 10,
+  and the Glue and BigQuery type checks take a level in any script (`enum('Zürich')`).
 
 ## [0.31.0] — 2026-11-17
 
