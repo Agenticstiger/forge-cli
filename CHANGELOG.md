@@ -471,6 +471,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and an umbrella an earlier publish left; no umbrella is sent; a port keeps a `contractId`
   only for a contract this publish sends or Entropy has; and the contract goes to the id it
   names. Every per-expose ODCS contract now carries its expose's `version` instead of `1.0.0`.
+- **ODCS exports inverted completeness, uniqueness and valid_values thresholds.** FLUID's
+  `threshold` is the share of rows that pass; ODCS `nullValues`, `duplicateValues` and
+  `invalidValues` count the rows that fail, and the export copied the threshold across, so
+  `threshold: 1.0, operator: ">="` came out as "at least one null". A full share now exports
+  `mustBe: 0`. A partial completeness share is mirrored onto the null share as a percentage
+  (`>= 0.95` becomes `mustBeLessOrEqualTo: 5` with `unit: percent`); valid_values exports
+  `mustBe: 0` whatever its threshold, as `fluid test` checks it; a partial uniqueness share,
+  which no ODCS metric equals, is not exported, with a warning. That is what the SodaCL
+  exporter already did. A threshold without an operator reads as `>=`, as `fluid test` reads
+  it; one that is not a number from 0 to 1 is not exported. Every ODCS export is affected,
+  including the contracts `fluid publish --target datamesh-manager` sends.
 - **Data Mesh Manager / Entropy Data lineage was missing or stale.** Both publish paths
   (`fluid publish --target datamesh-manager` and `fluid datamesh-manager publish`) stripped
   every `consumes[]` input port from the ODPS product and left product-to-product lineage to
