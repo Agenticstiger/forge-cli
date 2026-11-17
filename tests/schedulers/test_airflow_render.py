@@ -581,3 +581,17 @@ def test_generate_airflow_forwards_dag_id_and_schedule(tmp_path, monkeypatch, ca
     assert generate_airflow.run(args, LOG) == 0
     source = (tmp_path / "d.py").read_text(encoding="utf-8")
     assert "dag_id='custom'" in source and "schedule='@hourly'" in source
+
+
+@pytest.mark.parametrize("flag", [["--dag-id", "mine"], ["--schedule", "@daily"]])
+def test_a_scheduled_build_dag_refuses_the_overrides_it_cannot_honour(tmp_path, monkeypatch, flag):
+    from fluid_build.cli import generate_schedule
+    from tests.cli._schedule_dag_fixtures import DEMO_CONTRACT_PATH, write_project
+
+    write_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    parser = argparse.ArgumentParser()
+    generate_schedule.register_subcommand(parser.add_subparsers())
+    args = parser.parse_args(["schedule", DEMO_CONTRACT_PATH, "-o", "out", *flag])
+    assert generate_schedule.run(args, LOG) == 2
+    assert not (tmp_path / "out").exists()
