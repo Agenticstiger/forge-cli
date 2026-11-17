@@ -18,7 +18,7 @@ from fluid_build.iac import get_iac_plugin
 from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.module import build_module
 from fluid_build.iac.providers import aws_identity, aws_ingest
-from fluid_build.spark import runner_source
+from fluid_build.spark import names, runner_source
 from fluid_build.spark.compiler import CONTRACT_SQL_ALLOWLIST_ENV
 from fluid_build.spark.policy import SparkPolicyError
 from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV
@@ -151,12 +151,13 @@ def test_the_runner_and_job_config_are_objects_in_the_outputs_bucket(contract):
     objects = resources["aws_s3_object"]
     runner, config = objects[f"{KEY}_runner"], objects[f"{KEY}_config"]
     prefix = "_fluid/spark/commerce.orders-stream/ingest-orders/"
-    assert runner["key"] == prefix + "forge_spark_runner.py"
+    sha = names.runner_sha256(runner_source())
+    assert runner["key"] == f"{prefix}runner/{sha[:16]}/forge_spark_runner.py"
     assert runner["content"] == runner_source()
     assert config["key"] == prefix + "job.json"
     # The product's own bucket, by reference, so the objects wait for it.
     assert runner["bucket"] == "${aws_s3_bucket.commerce_orders_stream_commerce_lake.id}"
-    assert data["aws_msk_bootstrap_brokers"][KEY] == {"cluster_arn": MSK_ARN}
+    assert data["aws_msk_bootstrap_brokers"][KEY] == {"cluster_arn": MSK_ARN, "region": "eu-west-1"}
 
 
 def test_the_job_config_takes_the_iam_brokers_from_the_msk_data_source(contract):
@@ -167,17 +168,22 @@ def test_the_job_config_takes_the_iam_brokers_from_the_msk_data_source(contract)
     assert config["source"]["auth"] == "msk-iam"
 
 
-def test_contract_text_in_the_job_config_stays_a_literal(contract, monkeypatch):
+def test_contract_text_holding_an_interpolation_is_refused(contract, monkeypatch):
+    """The runner refuses a config that still holds ``${``, and OpenTofu would write the
+    contract's own literally (escaped): it is refused before anything is uploaded."""
     props = contract["builds"][0]["properties"]
     props.pop("mapping")
     props["sql"] = "SELECT order_id, '${file(\"/etc/passwd\")}' AS email_hash FROM source_events"
     monkeypatch.setenv(CONTRACT_SQL_ALLOWLIST_ENV, "commerce.orders-stream")
-    resources, _ = emit(contract)
-    rendered = json.loads(
-        build_module(get_iac_plugin("aws"), contract)
-    )  # the renderer escapes every literal ${
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert caught.value.kind == "spark-config-interpolation"
+
+
+def test_the_rendered_job_config_interpolates_only_forges_own_references(contract):
+    rendered = json.loads(build_module(get_iac_plugin("aws"), contract))
     content = rendered["resource"]["aws_s3_object"][f"{KEY}_config"]["content"]
-    assert '$${file(\\"/etc/passwd\\")}' in content
+    assert content.count("${") == 1
     assert "${data.aws_msk_bootstrap_brokers." in content
 
 
@@ -244,13 +250,13 @@ def test_the_role_is_least_privilege(contract):
     assert statement(access, "LakeFormationCredentials")["actions"] == [
         "lakeformation:GetDataAccess"
     ]
-    assert statement(access, "Secrets")["resources"] == [MASK_KEY]
+    assert statement(access, "Secrets")["resources"] == [MASK_KEY, f"{MASK_KEY}-??????"]
     secrets_kms = statement(access, "SecretsKms")["condition"]
     assert secrets_kms[0]["values"] == ["secretsmanager.eu-west-1.amazonaws.com"]
     assert secrets_kms[1] == {
         "test": "StringLike",
         "variable": "kms:EncryptionContext:SecretARN",
-        "values": [MASK_KEY],
+        "values": [MASK_KEY, f"{MASK_KEY}-??????"],
     }
     assert statement(access, "Logs")["resources"] == [
         f"${{aws_cloudwatch_log_group.{KEY}.arn}}",
@@ -290,16 +296,17 @@ def test_msk_iam_by_broker_list_needs_the_cluster_arn_for_a_forge_role(contract,
 def test_emr_serverless_trusts_only_its_application(contract):
     resources, data = emit(contract)
     role = resources["aws_iam_role"][KEY]
-    assert role["name"] == "fluid-commerce.orders-stream-ingest-orders-spark"
+    assert role["name"] == names.execution_role_name("commerce.orders-stream", "ingest-orders")
     trust = data["aws_iam_policy_document"][f"{KEY}_trust"]["statement"][0]
     assert trust["principals"] == [
         {"type": "Service", "identifiers": ["emr-serverless.amazonaws.com"]}
     ]
     source_arn = trust["condition"][1]
-    assert source_arn["values"] == [
-        "arn:aws:emr-serverless:eu-west-1:${data.aws_caller_identity.fluid_lf_caller.account_id}"
-        ":/applications/00fabc123def"
-    ]
+    app = (
+        "arn:aws:emr-serverless:${data.aws_region.fluid_region.region}"
+        ":${data.aws_caller_identity.fluid_lf_caller.account_id}:/applications/00fabc123def"
+    )
+    assert source_arn["values"] == [app, f"{app}/*"]
     assert resources["aws_iam_role_policy"][KEY]["role"] == f"${{aws_iam_role.{KEY}.id}}"
     # The domain's application is referenced, never created.
     assert "aws_emrserverless_application" not in resources
@@ -334,7 +341,10 @@ def test_an_isolated_application_auto_stops_is_capped_and_sits_by_the_brokers(co
     assert app["network_configuration"]["subnet_ids"] == (
         f"${{{cluster}.broker_node_group_info[0].client_subnets}}"
     )
-    assert data["aws_msk_cluster"]["commerce_orders_stream_spark"] == {"cluster_name": "orders"}
+    assert data["aws_msk_cluster"]["commerce_orders_stream_spark"] == {
+        "cluster_name": "orders",
+        "region": "eu-west-1",
+    }
     trust = data["aws_iam_policy_document"][f"{KEY}_trust"]["statement"][0]
     assert trust["condition"][1]["values"][0].endswith(
         ":/applications/${aws_emrserverless_application.commerce_orders_stream_spark.id}"
@@ -350,7 +360,8 @@ def test_glue_runs_the_runner_as_a_streaming_job_with_iceberg(contract):
     assert job["command"]["name"] == "gluestreaming"
     assert job["command"]["script_location"] == (
         f"s3://${{aws_s3_object.{KEY}_runner.bucket}}"
-        "/_fluid/spark/commerce.orders-stream/ingest-orders/forge_spark_runner.py"
+        "/_fluid/spark/commerce.orders-stream/ingest-orders/runner/"
+        f"{names.runner_sha256(runner_source())[:16]}/forge_spark_runner.py"
     )
     args = job["default_arguments"]
     assert args["--datalake-formats"] == "iceberg"
@@ -378,8 +389,16 @@ def test_a_glue_batch_job_is_glueetl(contract, monkeypatch):
     props.pop("stream"), props.pop("mapping")
     props["sql"] = "SELECT order_id, order_id AS email_hash FROM commerce.raw_orders"
     monkeypatch.setenv(CONTRACT_SQL_ALLOWLIST_ENV, "commerce.orders-stream")
+    # A batch job reads tables its SQL names: forge cannot derive its role.
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert caught.value.kind == "spark-runtime-field"
+    assert any("batch job" in e for e in aws_identity.validation_errors(contract))
+    params["executionRoleArn"] = ROLE
+    monkeypatch.setenv(aws_identity.EXECUTION_ROLE_ALLOWLIST_ENV, ROLE)
     resources, data = emit(contract)
     assert resources["aws_glue_job"][KEY]["command"]["name"] == "glueetl"
+    assert resources["aws_glue_job"][KEY]["role_arn"] == ROLE
     assert "aws_glue_connection" not in resources
     assert "MskConnect" not in json.dumps(data)
 
@@ -575,7 +594,7 @@ def test_a_forge_role_never_gets_a_whole_bucket_or_a_wildcard(contract, path):
     contract["exposes"][0]["binding"]["location"]["path"] = path
     with pytest.raises(UnsupportedBindingError) as caught:
         emit(contract)
-    assert caught.value.kind == "spark-role-scope"
+    assert caught.value.kind in ("spark-role-scope", "spark-config-interpolation")
 
 
 def test_a_prefix_without_its_slash_gets_one(contract):
@@ -635,3 +654,231 @@ def test_a_refusal_never_shows_the_internal_account_marker(contract):
         emit(contract)
     assert "s3://<account>-fluid-data/" in str(caught.value)
     assert "fluidacct" not in str(caught.value)
+
+
+# --- review round 1 (defect scan, delivery review) ---------------------------------
+
+
+def test_names_tell_hyphenated_ids_apart():
+    """``fluid-a-b-c`` alone is product a-b build c, or product a build b-c."""
+    assert names.execution_role_name("a-b", "c") != names.execution_role_name("a", "b-c")
+    assert names.glue_job_name("a-b", "c") != names.glue_job_name("a", "b-c")
+    assert names.run_name("a-b", "c") != names.run_name("a", "b-c")
+    long = names.execution_role_name("p" * 80, "b" * 80)
+    assert len(long) <= 64 and long.endswith(f"-{names.build_key('p' * 80, 'b' * 80)}-spark")
+
+
+def test_two_build_ids_that_meet_at_one_address_are_refused(contract):
+    second = copy.deepcopy(contract["builds"][0])
+    second["id"] = "ingest_orders"
+    contract["builds"].append(second)
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert caught.value.kind == "spark-build-id-clash"
+
+
+def test_a_contract_mixing_key_types_still_emits(contract):
+    contract["metadata"]["labels"] = {2024: "year", "owner": "x"}
+    emit(contract)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [("applicationId", "*"), ("applicationId", ["x"]), ("glueVersion", [1])],
+)
+def test_runtime_fields_are_checked_before_they_reach_the_module(contract, field, value):
+    spark(contract)[field] = value
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert caught.value.kind == "spark-runtime-field"
+    assert any(field in e for e in aws_identity.validation_errors(contract))
+
+
+def test_emr_on_eks_without_its_virtual_cluster_is_refused_not_a_key_error(contract):
+    params = spark(contract)
+    params.update(runtime="emr-eks")
+    del params["applicationId"]
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert caught.value.kind == "spark-runtime-field"
+
+
+def test_a_cluster_arn_without_its_id_fails_validate_too(contract):
+    spark(contract)["source"][
+        "mskClusterArn"
+    ] = "arn:aws:kafka:eu-west-1:000000000005:cluster/orders"
+    assert any("mskClusterArn" in e for e in aws_identity.validation_errors(contract))
+
+
+@pytest.mark.parametrize("runtime", ["emr-serverless", "glue"])
+def test_the_network_follows_the_cluster_whatever_the_auth(contract, runtime):
+    params = spark(contract)
+    params["source"]["auth"] = "none"
+    del params["applicationId"]
+    params["runtime"] = runtime
+    contract["packaging"] = {"containers": {"emrApplication": "isolated"}}
+    resources, data = emit(contract)
+    if runtime == "glue":
+        assert KEY in resources["aws_glue_connection"]
+    else:
+        app = resources["aws_emrserverless_application"]["commerce_orders_stream_spark"]
+        assert "network_configuration" in app
+    assert "MskConnect" not in json.dumps(data)  # no IAM grants without MSK IAM
+
+
+def test_an_isolated_application_refuses_builds_on_different_networks(contract, monkeypatch):
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "msk.example")
+    del spark(contract)["applicationId"]
+    contract["packaging"] = {"containers": {"emrApplication": "isolated"}}
+    second = copy.deepcopy(contract["builds"][0])
+    second["id"] = "replay"
+    contract["builds"].insert(0, second)
+    second_params = second["properties"]["parameters"]["spark"]
+    second_params["source"] = {"bootstrapServers": "b-1.msk.example:9098"}
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert caught.value.kind == "spark-emr-application-conflict"
+
+
+def test_msk_lookups_go_to_the_clusters_region(contract):
+    _, data = emit(contract)
+    assert data["aws_msk_bootstrap_brokers"][KEY]["region"] == "eu-west-1"
+
+
+def test_a_name_locator_secret_keeps_its_account_interpolation(contract, monkeypatch):
+    from fluid_build.iac.module import render_tofu_json
+
+    params = spark(contract)
+    stream = contract["builds"][0]["properties"]["stream"]
+    stream.update(format="avro-confluent")
+    stream["registry"] = {
+        "kind": "confluent",
+        "url": "https://registry.example.internal",
+        "auth": {"secretRef": "aws-sm://commerce/registry-secret"},  # pragma: allowlist secret
+    }
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "example.internal")
+    monkeypatch.setenv(
+        "FLUID_ACQUISITION_SECRET_REF_ALLOWLIST",
+        "aws-sm://commerce/registry-secret@registry.example.internal",
+    )
+    del params["maskKeySecretArn"]
+    contract["builds"][0]["properties"]["mapping"]["columns"][1].pop("maskAtIngest")
+    _, data = emit(contract)
+    secrets = statement(data["aws_iam_policy_document"][f"{KEY}_access"], "Secrets")
+    rendered = render_tofu_json({"data": {"x": {"y": {"r": secrets["resources"]}}}})
+    assert "$${data.aws_caller_identity" not in rendered
+    assert rendered.count("${data.aws_caller_identity.fluid_lf_caller.account_id}") == 2
+
+
+def test_a_glue_job_in_a_vpc_can_create_its_network_interfaces(contract):
+    params = spark(contract)
+    params.update(runtime="glue")
+    del params["applicationId"]
+    _, data = emit(contract)
+    vpc = statement(data["aws_iam_policy_document"][f"{KEY}_access"], "GlueVpc")
+    assert "ec2:CreateNetworkInterface" in vpc["actions"]
+
+
+def test_a_streaming_build_gets_no_caller_policy(contract):
+    resources, _ = emit(contract)
+    assert "aws_iam_policy" not in resources
+
+
+def test_a_run_to_completion_build_gets_the_schedulers_policy(contract):
+    contract["builds"][0]["properties"]["stream"]["trigger"] = {"availableNow": True}
+    resources, data = emit(contract)
+    policy = resources["aws_iam_policy"]["commerce_orders_stream_spark_caller"]
+    assert policy["name"] == "fluid-commerce.orders-stream-spark-caller"
+    document = data["aws_iam_policy_document"]["commerce_orders_stream_spark_caller"]
+    sids = {s["sid"] for s in document["statement"]}
+    run = next(s for s in document["statement"] if s["sid"].startswith("Run"))
+    assert "emr-serverless:StartJobRun" in run["actions"]
+    assert run["resources"][0].endswith(":/applications/00fabc123def")
+    passrole = next(s for s in document["statement"] if s["sid"].startswith("PassRole"))
+    assert passrole["resources"] == [f"${{aws_iam_role.{KEY}.arn}}"]
+    assert passrole["condition"][0]["values"] == ["emr-serverless.amazonaws.com"]
+    artifacts = next(s for s in document["statement"] if s["sid"].startswith("Artifacts"))
+    assert artifacts["resources"][0].endswith("/ingest-orders/job.json")
+    assert not any(s.startswith("FindApplication") for s in sids)
+
+
+# --- Lake Formation writes (item 4) ---------------------------------------------------
+
+
+def _with_lake_formation(contract, **gov):
+    contract["exposes"][0]["binding"]["governance"] = {
+        "lakeFormation": {"registerLocation": True, **gov}
+    }
+    return contract
+
+
+def test_a_location_a_spark_job_writes_is_registered_with_a_role_that_can_write(contract):
+    resources, data = emit(_with_lake_formation(contract))
+    (registration,) = resources["aws_lakeformation_resource"].values()
+    role = "commerce_orders_stream_order_lines_lf_writer"
+    assert registration["use_service_linked_role"] is False
+    assert registration["role_arn"] == f"${{aws_iam_role.{role}.arn}}"
+    # The role and its policy exist before Lake Formation (re-)registers the location.
+    assert registration["depends_on"] == [f"aws_iam_role.{role}", f"aws_iam_role_policy.{role}"]
+    trust = data["aws_iam_policy_document"][f"{role}_trust"]["statement"][0]
+    assert trust["principals"] == [
+        {"type": "Service", "identifiers": ["lakeformation.amazonaws.com"]}
+    ]
+    access = data["aws_iam_policy_document"][f"{role}_access"]
+    rw = statement(access, "ReadWrite")
+    assert "s3:PutObject" in rw["actions"]
+    assert rw["resources"] == ["arn:aws:s3:::commerce-lake/iceberg/commerce/order_lines/*"]
+    name = resources["aws_iam_role"][role]["name"]
+    assert len(name) <= 64 and name.endswith("-lf")
+
+
+def test_the_job_role_may_commit_to_the_table_through_lake_formation(contract):
+    resources, _ = emit(_with_lake_formation(contract))
+    grant = resources["aws_lakeformation_permissions"][
+        "commerce_orders_stream_lf_spark_writer_order_lines_0"
+    ]
+    assert grant["principal"] == f"${{aws_iam_role.{KEY}.arn}}"
+    # A stream appends: no DELETE, and no DATA_LOCATION_ACCESS (the table exists).
+    assert grant["permissions"] == ["ALTER", "DESCRIBE", "INSERT", "SELECT"]
+
+
+def test_a_location_no_spark_job_writes_keeps_the_service_linked_role(contract):
+    contract.pop("builds")
+    resources, _ = emit(_with_lake_formation(contract))
+    (registration,) = resources["aws_lakeformation_resource"].values()
+    assert registration == {
+        "arn": "arn:aws:s3:::commerce-lake/iceberg/commerce/order_lines/",
+        "use_service_linked_role": True,
+    }
+    assert "aws_iam_role" not in resources
+
+
+def test_lake_formation_without_registration_still_grants_the_writer(contract):
+    contract["exposes"][0]["binding"]["governance"] = {"lakeFormation": {"grants": []}}
+    resources, data = emit(contract)
+    assert "aws_lakeformation_resource" not in resources
+    assert "commerce_orders_stream_order_lines_lf_writer" not in resources.get("aws_iam_role", {})
+    assert resources["aws_lakeformation_permissions"]
+
+
+def test_emr_on_ec2_gets_no_grant_for_a_role_forge_does_not_know(contract):
+    params = spark(contract)
+    params.update(runtime="emr-ec2", clusterId="j-1ABCDEF")
+    del params["applicationId"]
+    resources, _ = emit(_with_lake_formation(contract))
+    assert not any("spark_writer" in k for k in resources.get("aws_lakeformation_permissions", {}))
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(_TOFU is None, reason="tofu not on PATH")
+def test_the_lake_formation_write_path_passes_tofu_validate(contract, tmp_path):
+    from tests.iac.test_iac_tofu_validate import _tofu_init_or_skip
+
+    (tmp_path / "main.tf.json").write_text(
+        build_module(get_iac_plugin("aws"), _with_lake_formation(contract))
+    )
+    _tofu_init_or_skip(tmp_path)
+    done = subprocess.run(
+        [_TOFU, "validate", "-no-color"], cwd=tmp_path, capture_output=True, text=True
+    )
+    assert done.returncode == 0, done.stderr or done.stdout

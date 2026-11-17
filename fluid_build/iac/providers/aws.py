@@ -661,6 +661,9 @@ class AwsIacPlugin:
         cid = safe_ident(contract.get("id") or contract.get("name") or "product")
         base_tags = {"managed_by": "fluid", "fluid_contract": cid}
         packaging = resolve_packaging(contract)
+        # forge Spark builds (``aws_ingest``): their artifacts, log groups, roles and
+        # runtime, and which exposes they write. Empty without one.
+        spark = aws_ingest.spark_blocks(contract, cid)
 
         # Account-level Lake Formation settings: admins (refused) + LF-tag
         # definitions. Emitted once per contract, before per-exposure
@@ -729,6 +732,8 @@ class AwsIacPlugin:
                 row_filters=row_filters,
                 masked_views=masked_views,
                 lf_tags=lf_tags,
+                spark_writers=spark.writers.get(str(_expose_id(exposure))) or (),
+                spark_registration_role=spark.registration_roles.get(str(_expose_id(exposure))),
             )
         # Produced Kafka subjects on the Glue Schema Registry (aws_schema_registry.py).
         emit_schema_registry(resources, contract, cid, base_tags)
@@ -744,9 +749,7 @@ class AwsIacPlugin:
         # Glue ETL jobs / Step Functions / the Lambda schedule path —
         # the planner's build & orchestration ops.
         _emit_from_actions(resources, actions, cid, contract)
-        # forge Spark builds: their artifacts, log groups, roles and runtime
-        # (application, Glue job), from ``aws_ingest``. Nothing without one.
-        aws_ingest.merge(resources, aws_ingest.spark_blocks(contract, cid).resources)
+        aws_ingest.merge(resources, spark.resources)
         # Second pass — wire ordering edges that the literal-string fields
         # on Redshift external schemas / planned-action resources don't
         # carry by value. See :func:`_wire_aws_deps`.
@@ -3389,9 +3392,18 @@ def _emit_lakeformation(
     row_filters: Optional[Mapping[int, RowFilter]] = None,
     masked_views: Sequence["_LfMaskedView"] = (),
     lf_tags: Sequence[Mapping[str, str]] = (),
+    spark_writers: Sequence["aws_ingest.Writer"] = (),
+    spark_registration_role: Optional[str] = None,
 ) -> None:
     """Emit per-exposure LF resources. No-op when the binding has no
     ``governance.lakeFormation`` block.
+
+    ``spark_writers`` are the forge Spark jobs that write this table
+    (:mod:`aws_ingest`): each job role gets ``INSERT``, ``ALTER``, ``DESCRIBE`` and
+    ``SELECT`` on it (and ``DELETE`` for a batch job, which overwrites), what an Iceberg
+    commit through Lake Formation takes. ``spark_registration_role`` is the role
+    ``aws_ingest`` made for a location such a job writes: the location is registered with
+    it, as the service-linked role cannot write.
 
     ``lf_tags`` is :func:`lf_tag_associations`: the table's one
     ``aws_lakeformation_resource_lf_tags``, naming a tag this module creates by
@@ -3439,13 +3451,28 @@ def _emit_lakeformation(
         # LF service role access to every other tenant's data.
         _require_pool_prefix(placement, path, what="governance.lakeFormation.registerLocation")
         loc_key = safe_ident(f"{cid}_lf_loc_{bucket}_{path or 'root'}")
-        resources.setdefault("aws_lakeformation_resource", {})[loc_key] = {
+        registration: Dict[str, Any] = {
             "arn": _lf_s3_arn(loc, bucket, f"/{path}" if path else ""),
             # ``use_service_linked_role: true`` is the default safe path
             # — LF uses the AWSServiceRoleForLakeFormationDataAccess SLR
             # to access objects under the registered location.
             "use_service_linked_role": True,
         }
+        if spark_registration_role:
+            # A forge Spark job writes here, with the credentials LF vends, and the SLR
+            # cannot write: register with the role that can. Created, with its policy,
+            # before the (re-)registration. Moving a registered location from the SLR to
+            # it re-registers it: LF vends no credentials for it in between.
+            registration = {
+                "arn": registration["arn"],
+                "role_arn": tofu_ref(f"aws_iam_role.{spark_registration_role}.arn"),
+                "use_service_linked_role": False,
+                "depends_on": [
+                    f"aws_iam_role.{spark_registration_role}",
+                    f"aws_iam_role_policy.{spark_registration_role}",
+                ],
+            }
+        resources.setdefault("aws_lakeformation_resource", {})[loc_key] = registration
 
     db_key = safe_ident(f"{cid}_{database}")
     table_key = safe_ident(f"{cid}_{database}_{table}") if table else None
@@ -3539,6 +3566,29 @@ def _emit_lakeformation(
         # grants on the same exposure don't collide.
         body_key = safe_ident(f"{cid}_lf_grant_{table or database}_{idx}")
         resources.setdefault("aws_lakeformation_permissions", {})[body_key] = body
+
+    # 2a. The forge Spark jobs that write the table, through Lake Formation.
+    if table_key:
+        for idx, writer in enumerate(spark_writers):
+            if writer.principal is None:
+                continue  # emr-ec2: the cluster's own role, which forge does not know
+            permissions = ["ALTER", "DESCRIBE", "INSERT", "SELECT"]
+            if writer.overwrites:
+                permissions.append("DELETE")
+            resources.setdefault("aws_lakeformation_permissions", {})[
+                safe_ident(f"{cid}_lf_spark_writer_{table}_{idx}")
+            ] = {
+                "principal": writer.principal,
+                "permissions": sorted(permissions),
+                "table": [
+                    {
+                        "database_name": tofu_ref(
+                            f"aws_glue_catalog_table.{table_key}.database_name"
+                        ),
+                        "name": tofu_ref(f"aws_glue_catalog_table.{table_key}.name"),
+                    }
+                ],
+            }
 
     # 2b. The S3 bucket policy for the grantees above (by default only those in
     #     another AWS account) is emitted once per bucket, over every exposure
