@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each now gives the bare string type. ODCS no longer reads `enum(10)` as a `maxLength` of 10,
   and the Glue and BigQuery type checks take a level in any script (`enum('Zürich')`).
 
+### Fixed
+
+- **The Glue, Dataflow and Spark job generators keep contract values as data.** `fluid generate
+  transformation` wrote column names and types, the expose id, the contract name, stage names and
+  embedded SQL into the generated script between hand-written quotes. A value holding a quote, a
+  line break or `"""` could end its place and add a statement that runs with the script. Every
+  value now goes through the shared code-generation helpers: a string literal (`repr`), a
+  one-line comment, a docstring or a sanitised identifier. Embedded SQL keeps its readable `"""`
+  block only when nothing in it can end the block. The string literals these scripts write now
+  use single quotes, and multi-line embedded SQL no longer breaks the Glue script, whose summary
+  comment it used to spill over several lines.
+
 ## [0.31.0] — 2026-11-17
 
 ### Added

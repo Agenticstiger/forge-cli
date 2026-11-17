@@ -60,7 +60,19 @@ def _generate_glue_job(
     *,
     transformation_intent: Optional[TransformationIntent] = None,
 ) -> str:
-    """Generate a PySpark Glue ETL job script."""
+    """Generate a PySpark Glue ETL job script.
+
+    Every contract value reaches the script through a ``codegen_utils`` helper
+    (a literal, a comment or a block), so none can end its place and run as code.
+    """
+    # Imported here: ``providers.common`` brings asyncio and ssl, which
+    # registering the engine does not need.
+    from fluid_build.providers.common.codegen_utils import (
+        py_block_literal,
+        py_comment_text,
+        py_str_literal,
+    )
+
     exposes = get_exposes(contract)
     expose_id = get_expose_id(exposes[0]) if exposes else "output"
     columns = _build_column_list(exposes)
@@ -73,7 +85,9 @@ def _generate_glue_job(
 
     col_comments = ""
     if columns:
-        col_comments = "\n".join(f"#   - {c['name']} ({c['type']})" for c in columns)
+        col_comments = "\n".join(
+            f"#   - {py_comment_text(c['name'])} ({py_comment_text(c['type'])})" for c in columns
+        )
         col_comments = f"# Target columns:\n{col_comments}\n"
 
     lines = [
@@ -106,19 +120,23 @@ def _generate_glue_job(
     lines.append("# ── Transform ─────────────────────────────────────────────────────\n")
     if embedded_sql:
         lines.append("# Embedded SQL from contract build properties:")
-        lines.append(f"# {embedded_sql[:200]}{'...' if len(embedded_sql) > 200 else ''}")
+        summary = py_comment_text(embedded_sql[:200]) + ("..." if len(embedded_sql) > 200 else "")
+        lines.append(f"# {summary}")
         lines.append('source_dyf.toDF().createOrReplaceTempView("source")')
-        lines.append(f'result_df = spark.sql("""\n{embedded_sql}\n""")')
+        lines.append(f"result_df = spark.sql({py_block_literal(embedded_sql)})")
         lines.append("from awsglue.dynamicframe import DynamicFrame")
-        lines.append(f'result_dyf = DynamicFrame.fromDF(result_df, glue_ctx, "{expose_id}")\n\n')
+        lines.append(
+            f"result_dyf = DynamicFrame.fromDF(result_df, glue_ctx, {py_str_literal(expose_id)})\n\n"
+        )
     else:
-        lines.append(f"# TODO: Implement transformation logic for '{expose_id}'")
+        lines.append(f"# TODO: Implement transformation logic for '{py_comment_text(expose_id)}'")
         lines.append("result_dyf = ApplyMapping.apply(")
         lines.append("    frame=source_dyf,")
         lines.append("    mappings=[")
         if columns:
             for c in columns:
-                lines.append(f'        ("{c["name"]}", "string", "{c["name"]}", "{c["type"]}"),')
+                name, ctype = py_str_literal(c["name"]), py_str_literal(c["type"])
+                lines.append(f'        ({name}, "string", {name}, {ctype}),')
         else:
             lines.append(
                 '        # TODO: Add column mappings — ("src_col", "src_type", "dst_col", "dst_type")'
@@ -132,7 +150,7 @@ def _generate_glue_job(
     lines.append("    frame=result_dyf,")
     lines.append('    connection_type="s3",')
     lines.append("    connection_options={")
-    lines.append(f'        "path": "s3://my-bucket/{expose_id}/",')
+    lines.append(f'        "path": {py_str_literal(f"s3://my-bucket/{expose_id}/")},')
     lines.append("    },")
     lines.append('    format="parquet",')
     lines.append(")\n\n")

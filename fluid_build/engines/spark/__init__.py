@@ -77,7 +77,22 @@ def _generate_spark_job(
     *,
     transformation_intent: Optional[TransformationIntent] = None,
 ) -> str:
-    """Generate a PySpark transformation script."""
+    """Generate a PySpark transformation script.
+
+    Every contract value reaches the script through a ``codegen_utils`` helper
+    (a literal, a comment, a docstring, a block or an identifier), so none can
+    end its place and run as code.
+    """
+    # Imported here: ``providers.common`` brings asyncio and ssl, which
+    # registering the engine does not need.
+    from fluid_build.providers.common.codegen_utils import (
+        py_block_literal,
+        py_comment_text,
+        py_docstring_text,
+        py_str_literal,
+        sanitize_identifier,
+    )
+
     exposes = get_exposes(contract)
     expose_id = get_expose_id(exposes[0]) if exposes else "output"
     columns = _build_column_list(exposes)
@@ -89,13 +104,15 @@ def _generate_spark_job(
 
     col_comments = ""
     if columns:
-        col_comments = "\n".join(f"#   - {c['name']} ({c['type']})" for c in columns)
+        col_comments = "\n".join(
+            f"#   - {py_comment_text(c['name'])} ({py_comment_text(c['type'])})" for c in columns
+        )
         col_comments = f"# Target columns:\n{col_comments}\n"
 
     lines = [
         _HEADER,
         '"""',
-        f"PySpark transformation job for '{expose_id}'.",
+        f"PySpark transformation job for '{py_docstring_text(expose_id)}'.",
         "",
         "Run locally:",
         "    spark-submit spark_job.py",
@@ -129,25 +146,26 @@ def _generate_spark_job(
         lines.append(col_comments)
         lines.append("OUTPUT_SCHEMA = StructType([")
         for c in columns:
-            lines.append(
-                f'    StructField("{c["name"]}", {_spark_type(c["type"])}, nullable=True),'
-            )
+            field = py_str_literal(c["name"])
+            lines.append(f"    StructField({field}, {_spark_type(c['type'])}, nullable=True),")
         lines.append("])\n\n")
 
     # Transformation function
     lines.append("# ── Transformation ────────────────────────────────────────────────\n")
     lines.append("def transform(spark, source_df):")
-    lines.append(f'    """Apply transformations to produce \'{expose_id}\'."""')
+    lines.append(f'    """Apply transformations to produce \'{py_docstring_text(expose_id)}\'."""')
 
     if embedded_sql:
         lines.append('    source_df.createOrReplaceTempView("source")')
-        lines.append(f'    result_df = spark.sql("""\n{embedded_sql}\n    """)')
+        lines.append(f"    result_df = spark.sql({py_block_literal(embedded_sql, '    ')})")
         lines.append("    return result_df\n")
     elif columns:
         lines.append("    # TODO: Implement transformation logic")
         lines.append("    result_df = source_df.select(")
         for c in columns:
-            lines.append(f'        F.col("{c["name"]}"),  # TODO: transform or derive')
+            lines.append(
+                f"        F.col({py_str_literal(c['name'])}),  # TODO: transform or derive"
+            )
         lines.append("    )")
         lines.append("    return result_df\n")
     else:
@@ -161,13 +179,14 @@ def _generate_spark_job(
         for stage in transformation_intent.stages:
             stage_name = stage.get("name", "stage")
             sql = stage.get("sql", "")
-            lines.append(f"def stage_{stage_name}(spark, df):")
-            lines.append(f'    """Stage: {stage_name}."""')
+            lines.append(f"def {sanitize_identifier(f'stage_{stage_name}')}(spark, df):")
+            lines.append(f'    """Stage: {py_docstring_text(stage_name)}."""')
             if sql:
-                lines.append(f'    df.createOrReplaceTempView("{stage_name}_input")')
-                lines.append(f'    return spark.sql("""\n{sql}\n    """)')
+                view = py_str_literal(f"{stage_name}_input")
+                lines.append(f"    df.createOrReplaceTempView({view})")
+                lines.append(f"    return spark.sql({py_block_literal(sql, '    ')})")
             else:
-                lines.append(f"    # TODO: Implement stage '{stage_name}'")
+                lines.append(f"    # TODO: Implement stage '{py_comment_text(stage_name)}'")
                 lines.append("    return df")
             lines.append("\n")
 
@@ -176,7 +195,8 @@ def _generate_spark_job(
     lines.append("# ── Main ──────────────────────────────────────────────────────────\n")
     lines.append("def main():")
     contract_name = contract.get("name", "fluid-spark-job")
-    lines.append(f'    spark = SparkSession.builder.appName("{contract_name}").getOrCreate()\n')
+    app_name = py_str_literal(contract_name)
+    lines.append(f"    spark = SparkSession.builder.appName({app_name}).getOrCreate()\n")
     lines.append("    try:")
     lines.append("        # ── Read ──")
     lines.append(
@@ -189,7 +209,7 @@ def _generate_spark_job(
         lines.append("        df = source_df")
         for stage in transformation_intent.stages:
             stage_name = stage.get("name", "stage")
-            lines.append(f"        df = stage_{stage_name}(spark, df)")
+            lines.append(f"        df = {sanitize_identifier(f'stage_{stage_name}')}(spark, df)")
         lines.append("        result_df = df\n")
     else:
         lines.append("        # ── Transform ──")
@@ -199,7 +219,9 @@ def _generate_spark_job(
     lines.append("        # TODO: Replace with your actual data sink")
     lines.append("        result_df.write \\")
     lines.append('            .mode("overwrite") \\')
-    lines.append(f'            .parquet("s3a://my-bucket/output/{expose_id}/")\n')
+    lines.append(
+        f"            .parquet({py_str_literal(f's3a://my-bucket/output/{expose_id}/')})\n"
+    )
     lines.append("    finally:")
     lines.append("        spark.stop()\n")
     lines.append("")

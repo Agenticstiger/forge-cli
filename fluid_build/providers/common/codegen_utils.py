@@ -150,6 +150,54 @@ def py_str_literal(value: Any) -> str:
     return repr("" if value is None else str(value))
 
 
+#: Every control character and Unicode line separator. Python ends a comment
+#: (and a physical line) at LF, CR LF or a bare CR; the rest are kept out of
+#: generated source too, since a NUL makes the file unparseable.
+_CONTROL_OR_LINE_BREAK = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def py_comment_text(value: Any) -> str:
+    """Return ``value`` as one line of text for a ``#`` comment in generated source.
+
+    A comment ends at a CR as well as at an LF, so a value holding either would
+    end the comment and start a statement that runs when the file is imported.
+    datamodel-code-generator shipped that bug twice (CVE-2026-54621 and
+    CVE-2026-54654: its comment escaping handled LF but not CR). Every control
+    character and line separator becomes a space here; anything else is kept as
+    written, so ``orders`` stays ``orders``.
+    """
+    return _CONTROL_OR_LINE_BREAK.sub(" ", "" if value is None else str(value))
+
+
+def py_docstring_text(value: Any) -> str:
+    """Return ``value`` as text for a triple-double-quoted docstring in generated source.
+
+    On top of :func:`py_comment_text`, each backslash and double quote is
+    escaped, so the text can neither close the docstring nor start an escape
+    sequence.
+    """
+    return py_comment_text(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+#: A control character other than tab and line feed.
+_CONTROL_BUT_TAB_OR_LF = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def py_block_literal(text: Any, closing_indent: str = "") -> str:
+    """Return a string literal for a multi-line block (embedded SQL) in generated source.
+
+    The block reads as written, ``\"\"\"\\n<text>\\n<closing_indent>\"\"\"``,
+    when nothing in it can change the literal: no backslash (an escape), no
+    ``\"\"\"`` (the end of the literal) and no control character but tab and
+    line feed. Otherwise it falls back to :func:`py_str_literal`, a one-line
+    literal that holds the same text.
+    """
+    value = "" if text is None else str(text)
+    if "\\" in value or '"""' in value or _CONTROL_BUT_TAB_OR_LF.search(value):
+        return py_str_literal(value)
+    return f'"""\n{value}\n{closing_indent}"""'
+
+
 def convert_schedule_to_cron(schedule: str) -> str:
     """
     Convert FLUID schedule notation to cron expression.
