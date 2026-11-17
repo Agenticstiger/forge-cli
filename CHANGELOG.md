@@ -254,8 +254,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A mean is checked as a magnitude cell, as the output-checking guidelines class means and
     as ACRO checks a mean cell. It is published only when the column's `count` and `sum` are,
     and when its values on the grid also pass the sum checks, because values less than a grid
-    step apart floor to one value. `k` is rounded to 5 like `count`. A withheld mean keeps its
-    code and no value, and the engine scores it as censored, never as zero.
+    step apart floor to one value. Next to the exact `sum`, `Sx` also gives the total of what
+    the values lose below their grid points (`sum * 2^N - Sx`), so that total must pass the sum
+    checks too: one record's residue, or a residue every record shares (prices that all end in
+    .99), withholds the mean. Values on the grid, such as whole numbers, leave no residue. A
+    withheld mean keeps its code and no value, and the engine scores it as censored, never as
+    zero.
+  - `k` is rounded to 5 like `count`, so the profile's mean is the exact sum over the rounded
+    count, which can be off the records' own mean by up to 2/k of it (20% at 12 records, under
+    1% from 200). An exact mean next to the exact sum would give the exact count back.
   - Timestamp and category columns get no statistic: a mean of timestamps would publish a sum
     no metric publishes. Grouped means, histograms, levels, support, quantiles and correlations
     need the Simulation's declared shape and are not written yet.

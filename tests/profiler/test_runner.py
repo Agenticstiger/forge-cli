@@ -381,11 +381,18 @@ def test_values_closer_than_a_grid_step_withhold_the_mean_but_not_the_sum(tmp_pa
 
 
 @pytest.mark.parametrize(
-    ("fractional_bits", "sx"),
-    [(0, 600), (1, 1240), (16, 620 * 2**16), (128, 620 * 2**128)],
+    ("fractional_bits", "group"),
+    [
+        # Every value ends in .5, so on whole numbers each loses 0.5: next to the exact
+        # sum, Sx would give the count back, and the shared residue withholds it.
+        (0, {"group": "", "status": "C"}),
+        (1, {"group": "", "k": 40, "Sx": "1240", "status": "F"}),
+        (16, {"group": "", "k": 40, "Sx": str(620 * 2**16), "status": "F"}),
+        (128, {"group": "", "k": 40, "Sx": str(620 * 2**128), "status": "F"}),
+    ],
 )
-def test_the_mean_is_formed_on_the_grid_the_document_declares(tmp_path, fractional_bits, sx):
-    # 0.5, 10.5, 20.5 and 30.5, ten records each: floored to whole numbers they sum to 600.
+def test_the_mean_is_formed_on_the_grid_the_document_declares(tmp_path, fractional_bits, group):
+    # 0.5, 10.5, 20.5 and 30.5, ten records each: on a grid of halves or finer, no residue.
     result = profile_expose(
         ORDERS,
         "orders",
@@ -395,7 +402,7 @@ def test_the_mean_is_formed_on_the_grid_the_document_declares(tmp_path, fraction
     )
     assert result.document["encoding"]["fractionalBits"] == fractional_bits
     assert result.fractional_bits == fractional_bits
-    assert _mean(result)[1] == {"group": "", "k": 40, "Sx": str(sx), "status": "F"}
+    assert _mean(result)[1] == group
 
 
 def test_a_negative_value_is_floored_toward_minus_infinity(tmp_path):
@@ -441,3 +448,23 @@ def test_a_grid_out_of_range_is_refused_before_a_record_is_read(tmp_path, fracti
             backend=FakeBackend(),
             fractional_bits=fractional_bits,
         )
+
+
+def test_a_decimal_column_publishes_its_mean_when_the_residues_pass_the_sum_checks(tmp_path):
+    # Cents are never on a binary grid; varied cents leave varied residues.
+    values = [f"{n}.{n * 37 % 100:02d}" for n in range(1, 41)]
+    result = profile_expose(
+        ORDERS, "orders", source=_slice(tmp_path, _amounts(values)), backend=FakeBackend()
+    )
+    group = _mean(result)[1]
+    assert group["status"] == "F" and group["k"] == 40
+
+
+def test_prices_that_all_end_in_99_withhold_the_mean_but_not_the_sum(tmp_path):
+    # One residue shared by every record: its total, sum * 2**16 - Sx, would be a count.
+    values = [f"{n}.99" for n in range(1, 41)]
+    result = profile_expose(
+        ORDERS, "orders", source=_slice(tmp_path, _amounts(values)), backend=FakeBackend()
+    )
+    assert _metrics(result, "amount")["sum"]["status"] == "F"
+    assert _mean(result)[1] == {"group": "", "status": "C"}

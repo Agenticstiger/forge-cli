@@ -25,7 +25,9 @@ A mean is checked as a magnitude table's cell too, which is how the output-check
 guidelines class means (with totals: at least the threshold of units, and no
 dominant contributor) and how ACRO checks a mean cell. Its ``k`` is a count of
 records and is rounded like one, and its ``Sx``, the records' sum on the grid,
-publishes only where the column's ``sum`` would (:func:`check_mean`).
+publishes only where the column's ``sum`` would. Next to that exact sum, ``Sx``
+also gives the total of what the values lose below their grid points, so that
+total is checked as a sum as well (:func:`check_mean`).
 
 A minimum, a maximum or a quantile is one record's value in most data. The
 DwB/ESSnet "Guidelines for Output Checking" (class 3, maxima, minima and
@@ -343,12 +345,17 @@ def check_sum(contributions: Sequence[Fraction], rule: DisclosureRule) -> Verdic
     return check_magnitude(values, rule)
 
 
-def check_mean(values: Sequence[Fraction], encoded: Sequence[int], rule: DisclosureRule) -> Verdict:
+def check_mean(
+    values: Sequence[Fraction],
+    encoded: Sequence[int],
+    fractional_bits: int,
+    rule: DisclosureRule,
+) -> Verdict:
     """Check an ungrouped ``mean/1``: ``k`` records, and ``Sx``, their values' sum on the grid.
 
     *values* are the column's non-null values and *encoded* the same values on
-    the grid. The mean says no more than the column's ``count`` and ``sum``
-    metrics: in order, the first that fires decides:
+    the grid of ``2**-fractional_bits`` steps, each rounded toward -infinity. In
+    order, the first that fires decides:
 
     1. ``k`` as a count of records (:func:`check_count`, then
        :func:`check_rounding`), the checks ``count`` passes; it is published
@@ -358,7 +365,14 @@ def check_mean(values: Sequence[Fraction], encoded: Sequence[int], rule: Disclos
        is not published as ``Sx`` either;
     3. *encoded*, the contributions ``Sx`` itself adds up (:func:`check_sum`):
        values less than a grid step apart encode alike, so they can hold fewer
-       distinct values than *values* do.
+       distinct values than *values* do;
+    4. the residues, what each value loses below its grid point
+       (:func:`check_sum`), when any is not zero. Next to the exact ``sum``,
+       ``Sx`` publishes their total, ``sum * 2**fractional_bits - Sx``, so it is
+       checked as the sum it is: one record's residue, or a residue that every
+       record shares (prices that all end in .99), would otherwise give a value
+       or the exact count back. Values on the grid (whole numbers, halves) leave
+       no residue, and then the mean says no more than ``count`` and ``sum``.
     """
     count = len(values)
     verdict = check_count(count, rule)
@@ -368,6 +382,13 @@ def check_mean(values: Sequence[Fraction], encoded: Sequence[int], rule: Disclos
         verdict = check_sum(values, rule)
     if verdict.published:
         verdict = check_sum([Fraction(units) for units in encoded], rule)
+    if verdict.published:
+        scale = 1 << fractional_bits
+        residues = [
+            Fraction(value) * scale - units for value, units in zip(values, encoded, strict=True)
+        ]
+        if any(residues):
+            verdict = check_sum(residues, rule)
     return verdict
 
 

@@ -61,6 +61,8 @@ fluid profile contract.fluid.yaml --expose orders \\
 # to 5, a sum 2 records dominate is withheld, and a min, max or quantile is shown only
 # when 10 records hold it (ACRO 1.1.0 defaults). Output-checking conventions only: no
 # privacy or anonymity guarantee. Pin the printed digest in the FLUX Simulation.
+# Each number column also gets mean/1, which FLUX compares a mean property with, on the
+# grid --fractional-bits names (16 unless given): the fidelity block must declare it.
 """
 
 

@@ -261,29 +261,58 @@ def _on_grid(values, bits=16):
     return [(value.numerator << bits) // value.denominator for value in values]
 
 
+def _mean(values, rule=ACRO_DEFAULT, bits=16):
+    return check_mean(values, _on_grid(values, bits), bits, rule)
+
+
 def test_a_mean_publishes_only_where_the_count_and_the_sum_would():
     values = [Fraction(n) for n in range(1, 21)]
-    assert check_mean(values, _on_grid(values), ACRO_DEFAULT).published
-    few = values[:9]
-    assert check_mean(few, _on_grid(few), ACRO_DEFAULT).status == "A"  # k below 10
-    assert check_mean([], [], ACRO_DEFAULT).status == "A"  # a zero
-    assert check_mean([], [], _rule(zeros_disclosive=False)).published
+    assert _mean(values).published
+    assert _mean(values[:9]).status == "A"  # k below 10
+    assert _mean([]).status == "A"  # a zero
+    assert _mean([], _rule(zeros_disclosive=False)).published
     dominated = [Fraction(200)] + [Fraction(1)] * 6 + [Fraction(2)] * 4
-    assert check_mean(dominated, _on_grid(dominated), ACRO_DEFAULT).status == "O"
-    two = [Fraction(1), Fraction(2)] * 10
-    assert check_mean(two, _on_grid(two), ACRO_DEFAULT).status == "C"
+    assert _mean(dominated).status == "O"
+    assert _mean([Fraction(1), Fraction(2)] * 10).status == "C"
 
 
 def test_a_mean_is_withheld_when_its_values_on_the_grid_hold_two():
     # Four values, so the sum publishes; floored to whole numbers they are 1 and 2.
     values = [Fraction(n, 10) for n in (11, 12, 13, 24)] * 5
     assert check_sum(values, ACRO_DEFAULT).published
-    assert check_mean(values, _on_grid(values, 0), ACRO_DEFAULT).status == "C"
-    assert check_mean(values, _on_grid(values, 16), ACRO_DEFAULT).published
+    assert _mean(values, bits=0).status == "C"
 
 
 def test_a_mean_whose_count_rounds_to_zero_is_withheld():
     # A rule whose threshold lets 2 records through still never publishes k = 0.
-    rule = _rule(minimum_cell=1)
-    values = [Fraction(3), Fraction(5)]
-    assert check_mean(values, _on_grid(values), rule).status == "A"
+    assert _mean([Fraction(3), Fraction(5)], _rule(minimum_cell=1)).status == "A"
+
+
+def _decimals(*texts):
+    return [Fraction(text) for text in texts]
+
+
+@pytest.mark.parametrize(
+    ("values", "bits", "status"),
+    [
+        # Next to the exact sum, Sx gives the residues' total: 0.36 + 0.64 here, which
+        # alone tells this column from 10.50, 10.50, 20 ... 29 (same count, same sum).
+        (_decimals("10.01", "10.99") + [Fraction(n) for n in range(20, 30)], 16, "A"),
+        # 25 split into 12.01 and 12.99: 12 records against 11, with the same metrics.
+        (_decimals("12.01", "12.99") + [Fraction(n) for n in range(20, 31) if n != 25], 16, "A"),
+        # Every value ends in .5: on a grid of whole numbers the residues total k / 2.
+        ([Fraction(2 * n + 1, 2) for n in range(10, 22)], 0, "C"),
+        # Prices that all end in .99 share one residue, so its total is a count.
+        ([n + Fraction(99, 100) for n in range(1, 41)], 16, "C"),
+    ],
+)
+def test_a_mean_whose_residues_would_give_a_count_or_a_value_back_is_withheld(values, bits, status):
+    assert check_sum(values, ACRO_DEFAULT).published  # the sum itself is published
+    assert _mean(values, bits=bits).status == status
+
+
+def test_a_mean_publishes_when_its_values_are_on_the_grid_or_their_residues_pass():
+    halves = [Fraction(2 * n + 1, 2) for n in range(10, 22)]
+    assert _mean(halves, bits=16).published  # every half is on a 16-bit grid
+    cents = [n + Fraction(n * 37 % 100, 100) for n in range(1, 41)]
+    assert _mean(cents, bits=16).published  # varied residues, none dominant

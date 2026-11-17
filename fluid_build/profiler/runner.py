@@ -108,8 +108,9 @@ _RECORD_COUNTS = frozenset({"count", "nullCount"})
 
 #: The fidelity statistics published, each with the domains it is formed for. As
 #: with :data:`_METRICS`, a statistic not named here is not published. ``mean/1``
-#: is formed ungrouped, over a number column only: there it says no more than the
-#: column's ``count`` and ``sum`` (:func:`disclosure.check_mean`), while over a
+#: is formed ungrouped, over a number column only: there it publishes where the
+#: column's ``count`` and ``sum`` do, and what it adds, the values' residues below
+#: the grid, passes the sum checks (:func:`disclosure.check_mean`). Over a
 #: timestamp it would publish a sum that no metric publishes. The rest need a
 #: declared shape (bin edges, levels, a quantile level or a ``groupBy``) that
 #: only the Simulation's fidelity block holds.
@@ -358,7 +359,7 @@ def _column_statistics(
             continue
         encode = backend.encoder(fractional_bits)
         encoded = [encode(value) for value in present]
-        verdict = _check_statistic(identifier, present, encoded, rule)
+        verdict = _check_statistic(identifier, present, encoded, fractional_bits, rule)
         if verdict.published and not present:
             continue  # no record to form it over, and the rule publishes a zero
         if verdict.published:
@@ -384,11 +385,12 @@ def _check_statistic(
     identifier: str,
     present: Sequence[Any],
     encoded: Sequence[int],
+    fractional_bits: int,
     rule: disclosure.DisclosureRule,
 ) -> disclosure.Verdict:
-    """Check one ungrouped statistic of a column's non-null values."""
+    """Check one ungrouped statistic of a column's non-null values and their grid points."""
     if identifier == "mean/1":
-        return disclosure.check_mean(present, encoded, rule)
+        return disclosure.check_mean(present, encoded, fractional_bits, rule)
     raise AssertionError(f"no disclosure rule for statistic {identifier!r}")
 
 
