@@ -407,11 +407,49 @@ def validation_errors(contract: Mapping[str, Any]) -> List[str]:
 
 def validation_warnings(contract: Mapping[str, Any]) -> List[str]:
     """The operator entries the contract's Spark builds still need (#818: warn here)."""
-    return [
+    warnings = [
         f"{m}; the IaC is refused at generate and apply until the operator lists it"
         for b in _spark_builds_or_empty(contract)
         for m in identity_findings(b)[1]
     ]
+    return warnings + _glue_jar_warnings(contract)
+
+
+def _glue_jar_warnings(contract: Mapping[str, Any]) -> List[str]:
+    """A Glue build that needs pinned jars while the operator names no jar prefix."""
+    from fluid_build.spark.compiler import compile_job_config, spark_parameters
+
+    from . import aws_glue_jars
+
+    out = []
+    try:
+        location = aws_glue_jars.jars_location()
+        malformed = None
+    except ValueError as exc:
+        location, malformed = None, str(exc)
+    for build in _spark_builds_or_empty(contract):
+        if (spark_parameters(build) or {}).get("runtime") != "glue":
+            continue
+        try:
+            config = compile_job_config(
+                contract,
+                build,
+                account_ref="000000000000",
+                contract_sql_gate=False,
+                host_gate=False,
+            ).config
+            needed = bool(aws_glue_jars.needed_jars(config))
+        except Exception:  # noqa: BLE001 - the Spark compiler's validation reports it
+            continue
+        if needed and malformed:
+            out.append(f"Spark build {build.get('id')}: {malformed}; the IaC is refused")
+        elif needed and location is None:
+            out.append(
+                f"Spark build {build.get('id')}: Confluent Avro on Glue needs the pinned "
+                f"jars, and {aws_glue_jars.JARS_URL_ENV} names no prefix; the IaC is refused "
+                "at generate and apply until the operator sets it"
+            )
+    return out
 
 
 # --- the role and its policy -------------------------------------------------

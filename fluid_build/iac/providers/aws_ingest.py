@@ -52,7 +52,7 @@ from ...spark import names
 from ..base import UnsupportedBindingError
 from ..naming import TofuExpr, bounded_ident, safe_ident, tofu_ref
 from ..packaging import ContainerDecision, resolve_packaging
-from . import aws_identity
+from . import aws_glue_jars, aws_identity
 
 #: The data source every account reference reads (shared with :mod:`aws`).
 CALLER = "data.aws_caller_identity.fluid_lf_caller.account_id"
@@ -423,6 +423,7 @@ def _emit_build(
         )
     database, table = config["sink"]["table"].split(".", 1)
     vpc = b.runtime == "glue" and cluster is not None
+    jars = _glue_jars(blocks, b, bucket_ref) if b.runtime == "glue" else ()
     access = aws_identity.JobAccess(
         region=b.region,
         account=ctx.account,
@@ -447,6 +448,12 @@ def _emit_build(
         args["--config"] = b.object_uri(names.job_config_key(ctx.product, bid))
         args["--continuous-log-logGroup"] = log_name
         args["--TempDir"] = b.object_uri(b.artifacts + "tmp/")
+        if jars:
+            args["--extra-jars"] = TofuExpr(",".join(jars))
+            # Glue 5's hudi-utilities bundle carries its own copy of the Confluent
+            # registry client classes; ours must win (measured: with this flag the client
+            # loads from our pinned jar). Only Avro builds add jars, so only they set it.
+            args["--user-jars-first"] = "true"
         if vpc:
             _glue_connection(blocks, b, cluster)
         target = tofu_ref(f"aws_glue_job.{b.key}.name")
@@ -470,6 +477,94 @@ def _emit_build(
     )
 
 
+def _glue_jars(blocks: SparkBlocks, b: _Build, bucket_ref: Any) -> Tuple[TofuExpr, ...]:
+    """The pinned jars a Glue build adds (:mod:`aws_glue_jars`), as ``s3://`` URIs of the
+    build's own verified copies.
+
+    Each jar is read from the platform's prefix with its S3 checksum and copied into the
+    build's content-addressed artifact prefix (``aws_glue_jars.copy_key``), where the job
+    loads it from:
+
+    - the copy's ``precondition``: the source's ``checksum_sha256`` is the pin, at plan;
+    - ``copy_if_match`` is the ETag that plan read, so S3 copies those bytes or nothing;
+    - the copy is written with a SHA-256 checksum, and its ``postcondition`` checks it.
+
+    A later swap in the platform's prefix never reaches the job: the copy is not re-made
+    while its pin and source are unchanged, and a new pin is a new key. The job role reads
+    its own artifact prefix only, never the platform's.
+    """
+    needed = aws_glue_jars.needed_jars(b.config)
+    if not needed:
+        return ()
+    try:
+        location = aws_glue_jars.jars_location()
+    except ValueError as exc:
+        raise UnsupportedBindingError("spark-glue-jars-url", f"{b.where}: {exc}.", ()) from exc
+    if location is None:
+        raise UnsupportedBindingError(
+            "spark-glue-jars-unset",
+            f"{b.where} decodes Confluent Avro on Glue, which ships no ABRiS: the job loads "
+            f"the pinned jars from the platform's prefix, and {aws_glue_jars.JARS_URL_ENV} "
+            "names none.",
+            (
+                f"Have the operator set {aws_glue_jars.JARS_URL_ENV}=s3://<bucket>/<prefix>/ "
+                "and upload the pinned jars there, each single-part with "
+                "--checksum-algorithm SHA256 (aws_glue_jars.AVRO_JARS lists them).",
+                "Or run the build on emr-serverless, which resolves its jars from Maven.",
+            ),
+        )
+    uris = []
+    sources = blocks.data.setdefault("aws_s3_object", {})
+    copies = blocks.resources.setdefault("aws_s3_object_copy", {})
+    for index, jar in enumerate(needed):
+        name = f"{b.key}_jar_{index}"
+        where = f"s3://{location.bucket}/{location.key(jar)}"
+        sources[name] = {
+            "bucket": location.bucket,
+            "key": location.key(jar),
+            "checksum_mode": "ENABLED",
+        }
+        key = aws_glue_jars.copy_key(b.ctx.product, b.build_id, jar)
+        copies[name] = {
+            "bucket": bucket_ref,
+            "key": key,
+            "source": f"{location.bucket}/{location.key(jar)}",
+            "copy_if_match": tofu_ref(f"data.aws_s3_object.{name}.etag"),
+            "checksum_algorithm": "SHA256",
+            # The product's tags, not the platform object's (S3 copies a source's tags
+            # unless told to replace them).
+            "tagging_directive": "REPLACE",
+            "tags": dict(b.tags),
+            "lifecycle": {
+                "precondition": [
+                    {
+                        "condition": TofuExpr(
+                            f"${{data.aws_s3_object.{name}.checksum_sha256 == "
+                            f'"{jar.sha256_b64}"}}'
+                        ),
+                        "error_message": (
+                            f"{where} is not the pinned {jar.coordinate} (sha256 "
+                            f"{jar.sha256}), or was uploaded without a single-part SHA-256 "
+                            "checksum."
+                        ),
+                    }
+                ],
+                "postcondition": [
+                    {
+                        "condition": TofuExpr(f'${{self.checksum_sha256 == "{jar.sha256_b64}"}}'),
+                        "error_message": (
+                            f"The copy of {jar.coordinate} is not the pinned bytes (sha256 "
+                            f"{jar.sha256})."
+                        ),
+                    }
+                ],
+            },
+        }
+        bucket = tofu_ref(f"aws_s3_object_copy.{name}.bucket")
+        uris.append(TofuExpr(f"s3://{bucket}/{_escape(key)}"))
+    return tuple(uris)
+
+
 def _job_content(
     blocks: SparkBlocks, b: _Build
 ) -> Tuple[Any, Optional[aws_identity.MskSource], bool]:
@@ -485,7 +580,11 @@ def _job_content(
     iam = source.get("auth") == "msk-iam"
     if arn:
         cluster = _msk(arn, source["topic"], source.get("groupIdPrefix"), b.where)
-        attr = "bootstrap_brokers_sasl_iam" if iam else "bootstrap_brokers"
+        # MSK IAM reads the SASL/IAM listener. Without IAM the job takes the TLS listener:
+        # MSK encrypts client traffic by default, and its plaintext list is then empty (a
+        # plaintext listener is named by bootstrapServers instead). The compiler marks such
+        # a source ``tls`` for the runner; this only fills the brokers.
+        attr = "bootstrap_brokers_sasl_iam" if iam else "bootstrap_brokers_tls"
         blocks.data.setdefault("aws_msk_bootstrap_brokers", {})[b.key] = {
             "cluster_arn": arn,
             "region": cluster.region,
