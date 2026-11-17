@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import random
 from fractions import Fraction
 
 import pytest
@@ -316,3 +317,61 @@ def test_a_mean_publishes_when_its_values_are_on_the_grid_or_their_residues_pass
     assert _mean(halves, bits=16).published  # every half is on a 16-bit grid
     cents = [n + Fraction(n * 37 % 100, 100) for n in range(1, 41)]
     assert _mean(cents, bits=16).published  # varied residues, none dominant
+
+
+def _reference_sum_check(values, rule):
+    """check_sum as it read before it ran on integers: every step on fractions."""
+    values = [Fraction(value) for value in values]
+    contributors = sum(1 for value in values if value != 0)
+    counted = check_count(contributors, rule)
+    if not counted.published:
+        return counted.status
+    distinct = set(values)
+    if len(distinct) <= 2 and distinct != {Fraction(0)} and distinct:
+        return "C"
+    sizes = sorted((abs(value) for value in values), reverse=True)
+    total = sum(sizes, Fraction(0))
+    if total == 0:
+        return "F"
+    share = rule.k * total
+    if sizes[0] >= share:
+        return "O"
+    if rule.dominance_n >= 2 and sum(sizes[:2], Fraction(0)) >= share:
+        return "T"
+    if rule.dominance_n >= 3 and sum(sizes[: rule.dominance_n], Fraction(0)) >= share:
+        return "M"
+    return "M" if total - sum(sizes[:2], Fraction(0)) < rule.p * sizes[0] else "F"
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_the_sum_checks_decide_on_integers_as_they_did_on_fractions(seed):
+    rng = random.Random(seed)
+    rule = _rule(dominance_n=rng.choice([1, 2, 3]), dominance_k=rng.choice(["0.5", "0.90"]))
+    size = rng.choice([0, 3, 12, 40])
+    values = [
+        Fraction(
+            rng.choice([0, rng.randint(-50, 50), rng.randint(1, 10**6)]), rng.choice([1, 3, 4, 100])
+        )
+        for _ in range(size)
+    ]
+    assert check_sum(values, rule).status == _reference_sum_check(values, rule)
+    # Whole numbers, and the same values on any common scale, decide alike.
+    scale = rng.randint(1, 10**9)
+    assert (
+        check_sum([value * scale for value in values], rule).status
+        == check_sum(values, rule).status
+    )
+
+
+def test_a_sum_of_decimals_or_text_is_checked_as_the_same_fractions():
+    from decimal import Decimal
+
+    fractions = [Fraction(n, 4) for n in range(1, 21)] + [Fraction(500)]
+    expected = check_sum(fractions, ACRO_DEFAULT).status
+    assert (
+        check_sum(
+            [Decimal(str(value.numerator / value.denominator)) for value in fractions], ACRO_DEFAULT
+        ).status
+        == expected
+    )
+    assert check_sum([str(value) for value in fractions], ACRO_DEFAULT).status == expected
