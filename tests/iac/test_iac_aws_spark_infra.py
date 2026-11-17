@@ -810,6 +810,11 @@ def test_a_run_to_completion_build_gets_the_schedulers_policy(contract):
 # --- Lake Formation writes (item 4) ---------------------------------------------------
 
 
+def registration_role_key(resources):
+    (registration,) = resources["aws_lakeformation_resource"].values()
+    return registration["role_arn"].removeprefix("${aws_iam_role.").removesuffix(".arn}")
+
+
 def _with_lake_formation(contract, **gov):
     contract["exposes"][0]["binding"]["governance"] = {
         "lakeFormation": {"registerLocation": True, **gov}
@@ -820,7 +825,7 @@ def _with_lake_formation(contract, **gov):
 def test_a_location_a_spark_job_writes_is_registered_with_a_role_that_can_write(contract):
     resources, data = emit(_with_lake_formation(contract))
     (registration,) = resources["aws_lakeformation_resource"].values()
-    role = "commerce_orders_stream_lf_loc_commerce_lake_iceberg_commerce_order_lines_writer"
+    role = registration_role_key(resources)
     assert registration["use_service_linked_role"] is False
     assert registration["role_arn"] == f"${{aws_iam_role.{role}.arn}}"
     # The role and its policy exist before Lake Formation (re-)registers the location.
@@ -862,7 +867,7 @@ def test_lake_formation_without_registration_still_grants_the_writer(contract):
     contract["exposes"][0]["binding"]["governance"] = {"lakeFormation": {"grants": []}}
     resources, data = emit(contract)
     assert "aws_lakeformation_resource" not in resources
-    assert not any(k.endswith("_writer") for k in resources.get("aws_iam_role", {}))
+    assert not any("_lf_writer_" in k for k in resources.get("aws_iam_role", {}))
     assert resources["aws_lakeformation_permissions"]
 
 
@@ -928,14 +933,38 @@ def test_a_contract_with_date_keys_still_emits(contract):
     emit(contract)
 
 
-def test_the_registration_role_covers_the_registered_bucket_root(contract):
-    del contract["exposes"][0]["binding"]["location"]["path"]
-    resources, data = emit(_with_lake_formation(contract))
-    (registration,) = resources["aws_lakeformation_resource"].values()
-    assert registration["arn"] == "arn:aws:s3:::commerce-lake"
-    role = registration["role_arn"].removeprefix("${aws_iam_role.").removesuffix(".arn}")
-    rw = statement(data["aws_iam_policy_document"][f"{role}_access"], "ReadWrite")
-    assert rw["resources"] == ["arn:aws:s3:::commerce-lake/*"]
+@pytest.mark.parametrize(
+    "location",
+    [{"path": None}, {"bucket": "{{ env.FLUID_TEST_UNSET_LAKE }}"}],
+    ids=["bucket-root", "unresolved-template"],
+)
+def test_a_spark_written_registration_is_one_named_prefix(contract, location, monkeypatch):
+    monkeypatch.delenv("FLUID_TEST_UNSET_LAKE", raising=False)
+    loc = contract["exposes"][0]["binding"]["location"]
+    for k, v in location.items():
+        if v is None:
+            loc.pop(k)
+        else:
+            loc[k] = v
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(_with_lake_formation(contract))
+    assert caught.value.kind == "spark-lf-registration-scope"
+
+
+def test_locations_that_fold_alike_get_their_own_roles(contract):
+    second = copy.deepcopy(contract["exposes"][0])
+    second["exposeId"] = "order_lines_v2"
+    second["binding"]["location"].update(table="order_lines_v2", path="iceberg_commerce/v2/")
+    contract["exposes"][0]["binding"]["location"]["path"] = "iceberg/commerce/v2/"
+    contract["exposes"].append(second)
+    build = copy.deepcopy(contract["builds"][0])
+    build["id"] = "ingest-v2"
+    build["outputs"] = ["order_lines_v2"]
+    contract["builds"].append(build)
+    for expose in contract["exposes"]:
+        expose["binding"]["governance"] = {"lakeFormation": {"registerLocation": True}}
+    resources, _ = emit(contract)
+    assert len([k for k in resources["aws_iam_role"] if "_lf_writer_" in k]) == 2
 
 
 def test_two_exposes_on_one_location_share_its_registration_role(contract):
@@ -951,7 +980,7 @@ def test_two_exposes_on_one_location_share_its_registration_role(contract):
         expose["binding"]["governance"] = {"lakeFormation": {"registerLocation": True}}
     resources, _ = emit(contract)
     (registration,) = resources["aws_lakeformation_resource"].values()
-    writers = [k for k in resources["aws_iam_role"] if k.endswith("_writer")]
+    writers = [k for k in resources["aws_iam_role"] if "_lf_writer_" in k]
     assert len(writers) == 1
     assert registration["role_arn"] == f"${{aws_iam_role.{writers[0]}.arn}}"
 

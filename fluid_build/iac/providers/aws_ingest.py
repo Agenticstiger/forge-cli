@@ -245,8 +245,9 @@ def _emit_registration_role(
     writes Iceberg with the credentials Lake Formation vends: a location a forge Spark job
     writes is registered with this role instead, which may read and write the registered
     location (Lake Formation scopes what it vends to each table). One role per location,
-    derived as :mod:`aws` registers it (``_lf_location``: the binding's ``path``, or the
-    bucket root of a bucket the product owns), so two exposes on one location share it.
+    derived as :mod:`aws` registers it (``_lf_location``), so two exposes on one location
+    share it. The location must be one named prefix: never a bucket root, nor a bucket a
+    template could not name.
     """
     from . import aws as _aws  # imported here: aws imports this module
 
@@ -257,17 +258,34 @@ def _emit_registration_role(
     loc = binding.get("location") or {}
     placement = _aws._placement(resolve_packaging(contract), expose)
     bucket, path = _aws._lf_location(loc, placement)
-    if not bucket or (placement.bucket_referenced and not path):
-        return  # nothing registered here (aws refuses a pool's root itself)
+    if not bucket:
+        return  # nothing registered (no location.bucket)
     expose_id = str(expose.get("exposeId"))
     where = f"exposes[{expose_id}].binding.location"
-    prefix = (
-        _checked_prefix(where, ctx, bucket, path, "the registered location", reserved=False)
-        if path
-        else ""
-    )
-    where_key = f"{bucket}_{path.rstrip('/') or 'root'}"
-    key = safe_ident(f"{ctx.cid}_lf_loc_{where_key}_writer")
+    if "${" in bucket or not path:
+        # A template that did not resolve falls back to the account bucket, and a bucket
+        # root may hold other teams' tables: a role that can write a whole bucket, or a
+        # bucket forge cannot name, is refused rather than created.
+        raise UnsupportedBindingError(
+            "spark-lf-registration-scope",
+            f"{where}: a location a forge Spark job writes is registered with a role that "
+            "can write it, so it must be one named prefix: "
+            + (
+                "the bucket template did not resolve to a name."
+                if "${" in bucket
+                else "registerLocation without location.path would register, and let the "
+                "role write, the whole bucket."
+            ),
+            (
+                "Set location.path to the table's own prefix, and the bucket literally or "
+                "through a template that resolves here.",
+                "Or register the location outside forge (governance.lakeFormation without "
+                "registerLocation).",
+            ),
+        )
+    prefix = _checked_prefix(where, ctx, bucket, path, "the registered location", reserved=False)
+    digest = hashlib.sha256(f"{bucket}/{prefix}".encode("utf-8")).hexdigest()[:8]
+    key = safe_ident(f"{ctx.cid}_lf_writer_{digest}")
     blocks.registration_roles[expose_id] = key
     if key in blocks.resources.get("aws_iam_role", {}):
         return  # another expose on this location made it
@@ -276,7 +294,7 @@ def _emit_registration_role(
     documents[f"{key}_trust"] = aws_identity.registration_trust(ctx.account)
     documents[f"{key}_access"] = aws_identity.registration_document(bucket, prefix, region=region)
     blocks.resources.setdefault("aws_iam_role", {})[key] = {
-        "name": names.registration_role_name(ctx.product, safe_ident(where_key)),
+        "name": names.registration_role_name(ctx.product, digest),
         "description": (
             f"The role Lake Formation registers a location of {ctx.product} with, so its "
             "forge Spark jobs can write it"
