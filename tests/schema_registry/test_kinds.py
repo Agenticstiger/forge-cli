@@ -99,6 +99,7 @@ class Tidal(RegistryKind):
     """A throwaway kind: no core module knows it."""
 
     name = "tidal"
+    operator_credential_env = None
     title = "Tidal"
     modes = ("OFF", "ON")
     default_compatibility = "ON"

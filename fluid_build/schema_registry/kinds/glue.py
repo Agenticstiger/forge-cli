@@ -54,6 +54,7 @@ class GlueKind(RegistryKind):
     subject_pattern = _GLUE_NAME
     fields = frozenset({"registryName"})
     refuses = frozenset({"url", "auth"})
+    operator_credential_env = None  # IAM through the AWS SDK: no registry credential
     checks_compatibility = False
     # Verified live on AWS (2026-11-17): Glue resolves google/protobuf/timestamp.proto and
     # google/type/date.proto, and neither confluent/type/decimal.proto nor

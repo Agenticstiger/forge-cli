@@ -406,6 +406,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     too. Output is grouped for GitHub Actions, GitLab and Azure Pipelines (`--ci-output`). On
     GitHub nothing a stage prints, nor ship's own reading of the contract and its overlays,
     can issue a workflow command.
+- **`fluid ship` reads the switches a generated pipeline sets, and every stage knob Jenkins had.**
+  `RUN_STAGE_<N>_<NAME>=false` switches a stage off, with `--stage` too (a CI step names a stage,
+  it does not decide on it): a step whose stage is off says so and exits 0, writing no report.
+  `true` switches on stage 10 or 11 in a run that does not name its stages; an explicit
+  `--publish` or `--schedule-sync` beats its own switch. New options, each with its variable:
+  `--emit` (`GENERATE_EMIT`) for stage 3, `--exit-on-drift` / `--no-exit-on-drift`
+  (`DIFF_EXIT_ON_DRIFT`) and `--last-applied` (`DIFF_LAST_APPLIED`) for stage 5, `--plan-html` /
+  `--no-plan-html` (`PLAN_HTML`) for stage 6, `--policy-mode` (`POLICY_APPLY_MODE`) for stage 8,
+  and `--verify-strict` / `--no-verify-strict` (`VERIFY_STRICT`) for stage 9, beside `--strict` /
+  `--no-strict` (`VALIDATE_STRICT`). Each flag beats its variable both ways. Stages 2 and 4 write
+  `runtime/validate-report.json` and `runtime/validate-artifacts-report.json`. After a dry-run
+  apply, stage 8 checks the policy bindings only when stage 7 is in the pipeline, as the Jenkins
+  pipeline did; without it, it enforces them. The generated pipelines' shell bodies read the same
+  variables, and the parity test drives every knob through both, from the same environment.
 - **The secret destination policy covers every scheme, not only `env://`.** A value from
   `vault://`, `aws-sm://`, `file://` or a pack is sent to a host that leaves this machine only
   when the operator allows it: `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` keeps `NAME` and

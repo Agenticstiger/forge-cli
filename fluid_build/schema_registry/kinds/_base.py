@@ -9,6 +9,10 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
+#: The default of :attr:`RegistryKind.operator_credential_env`: not stated. A kind must
+#: state it (``None`` included), and :func:`register_kind` refuses one that does not.
+_UNSTATED: Any = object()
+
 _ANY_SUBJECT = re.compile(r"^[^\x00-\x1f\x7f]{1,255}$")
 
 
@@ -42,6 +46,13 @@ class RegistryKind:
     #: What to say when a Protobuf subject declares a ``decimal`` column and
     #: :attr:`protobuf_decimal` is ``None``: the way out for the author.
     protobuf_decimal_hint: str = ""
+    #: The operator variable OpenTofu sends as the registry credential when it registers
+    #: this kind's produced subject at the contract's ``url`` (Confluent:
+    #: ``SCHEMA_REGISTRY_API_SECRET``), or ``None`` when it sends none (Glue: IAM).
+    #: ``policy.floor_findings`` judges that host for it: https, listed, and granted
+    #: ``<variable>@host``. Every kind states it; :func:`register_kind` refuses one that
+    #: does not.
+    operator_credential_env: Optional[str] = _UNSTATED
 
     # -- shape --------------------------------------------------------------
 
@@ -62,13 +73,27 @@ class RegistryKind:
     def egress_findings(
         self, subject: Any, *, stage: str, environ: Optional[Mapping[str, str]] = None
     ) -> List[Tuple[str, str]]:
-        """``(severity, message)`` for where a request for ``subject`` would go.
+        """``(severity, message)`` this kind adds for where a request for ``subject`` goes.
 
-        Every kind states its own rules, even when it has none to state (Glue: IAM, no
-        contract-named host): :func:`register_kind` refuses a kind that does not override
-        this, so a new HTTP kind cannot silently skip the host and credential checks.
+        ``policy.floor_findings`` runs first for every kind (url, link-local, the
+        credential's https and ``NAME@host`` grant); this adds the kind's own rules and
+        cannot remove the floor's. Every kind states its rules, even when it has none to
+        add (Glue: IAM, no contract-named host): :func:`register_kind` refuses a kind that
+        does not override this.
         """
         raise NotImplementedError(f"registry kind {self.name!r} states no egress rules")
+
+    def credential_url(self, ref: Any) -> Optional[str]:
+        """Where a consumed subject's ``auth.secretRef`` credential is sent.
+
+        Its scheme must be https and its host is the one the operator's ``NAME@host``
+        grant names (``policy.floor_findings``), and ``fluid apply`` resolves the secret
+        for that host. The registry's own ``url`` by default; a kind with a separate
+        authentication endpoint returns that endpoint's URL. The kind's :meth:`client`
+        must send the credential to this URL and nowhere else: it is the only host the
+        floor judges for the credential.
+        """
+        return getattr(ref, "url", None)
 
     def produced_checks(
         self, subject: Any, *, stage: str, environ: Optional[Mapping[str, str]] = None
@@ -124,13 +149,21 @@ _KINDS: Dict[str, RegistryKind] = {}
 
 def register_kind(kind: RegistryKind) -> RegistryKind:
     """Add ``kind``. A name already registered is refused, and so is a kind that states
-    no egress rules (fail closed: see :meth:`RegistryKind.egress_findings`)."""
+    no egress rules (fail closed: see :meth:`RegistryKind.egress_findings`) or does not
+    say which operator credential OpenTofu sends for it (:attr:`RegistryKind.operator_credential_env`).
+    """
     if kind.name in _KINDS:
         raise ValueError(f"registry kind {kind.name!r} is already registered")
     if type(kind).egress_findings is RegistryKind.egress_findings:
         raise TypeError(
             f"registry kind {kind.name!r} states no egress rules: override egress_findings "
             "(return [] only for a kind that sends nothing to a contract-named host)"
+        )
+    if kind.operator_credential_env is _UNSTATED:
+        raise TypeError(
+            f"registry kind {kind.name!r} states no operator credential: set "
+            "operator_credential_env to the variable OpenTofu sends for a produced subject, "
+            "or None when it sends none"
         )
     _KINDS[kind.name] = kind
     return kind
