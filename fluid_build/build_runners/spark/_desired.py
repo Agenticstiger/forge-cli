@@ -45,6 +45,11 @@ _KAFKA_PACKAGE = "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
 _MSK_IAM_PACKAGE = "software.amazon.msk:aws-msk-iam-auth:2.2.0"
 _AVRO_PACKAGES = ("org.apache.spark:spark-avro_2.12:3.5.1", "za.co.absa:abris_2.12:6.4.0")
 _CONFLUENT_REPOSITORY = "https://packages.confluent.io/maven/"
+#: Operator-only: one https Maven repository (a CodeArtifact or Artifactory mirror that
+#: proxies Maven Central and Confluent's repository) a run resolves its packages from,
+#: in place of :data:`_CONFLUENT_REPOSITORY`. Unset: Maven Central, and Confluent's
+#: repository for Avro. The cluster needs egress to the one it uses.
+MAVEN_REPOSITORY_ENV = "FLUID_SPARK_MAVEN_REPOSITORY"
 
 #: Operator-only: Spark settings a contract's ``sparkConf`` may set beyond the tuning ones,
 #: comma-separated names or ``prefix*`` (``spark.sql.streaming.*``). Unset: tuning only.
@@ -269,12 +274,79 @@ def _submit_conf(
             if "avro-confluent" in formats:
                 packages.extend(_AVRO_PACKAGES)
                 conf["spark.jars.repositories"] = _CONFLUENT_REPOSITORY
+            mirror = maven_repository(env)
+            if mirror:
+                conf["spark.jars.repositories"] = mirror
             conf["spark.jars.packages"] = ",".join(packages)
     if policy:
         conf.update(_allowed_conf(user, where, env))
     else:  # planning: the operator's list is apply's to check
         conf.update({str(k): str(v) for k, v in user.items()})
     return conf
+
+
+def maven_repository(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """The operator's Maven mirror (:data:`MAVEN_REPOSITORY_ENV`), or ``None`` when unset.
+
+    One https URL with a host, no user or password, no query or fragment, and no comma
+    (``spark.jars.repositories`` is a list). A link-local or metadata host is refused. A
+    credential never goes in the URL: use a mirror the job's role reaches with IAM, such
+    as CodeArtifact through a VPC endpoint. The variable is protected, so a project's
+    ``.env`` cannot set it.
+
+    Raises:
+        SparkPolicyError: a URL that breaks one of those rules (the message names the
+            rule, never the URL).
+    """
+    from urllib.parse import urlsplit
+
+    from fluid_build._errors import doc_url
+    from fluid_build._net import _hostname_is_link_local
+    from fluid_build.spark.policy import SparkPolicyError
+
+    env = os.environ if env is None else env
+    raw = (env.get(MAVEN_REPOSITORY_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname
+        parts.port  # noqa: B018 - raises on a bad port
+    except ValueError:
+        parts, host = None, None
+    if parts is None or parts.scheme.lower() != "https" or not host:
+        problem = "is not an https URL with a host"
+    elif parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        problem = "carries a user or password"
+    elif any(c in raw for c in "?#,") or any(c.isspace() for c in raw):
+        problem = "has a query, a fragment, a comma or a space"
+    elif host.endswith(".") or any(c in parts.netloc for c in "%\\") or parts.port == 0:
+        # a host spelt so it does not resolve here may still resolve on the cluster
+        problem = "has a host ending in a dot, a % or \\ in it, or port 0"
+    elif not host.isascii():  # an IDN dot (U+3002) would slip past the dot check
+        problem = "has a host that is not a valid DNS name (spell an IDN in punycode)"
+    else:
+        try:
+            link_local = _hostname_is_link_local(host)
+        except ValueError:  # IDNA: an empty or over-long label
+            link_local, problem = None, "has a host that is not a valid DNS name"
+        else:
+            problem = "names a link-local or metadata address"
+        if link_local is False:
+            return raw
+    raise SparkPolicyError(
+        what=f"{MAVEN_REPOSITORY_ENV} {problem}",
+        why=(
+            "A Spark run resolves its packages from this repository, so it must be one "
+            "https mirror, reached without a credential in the URL."
+        ),
+        fix=(
+            f"Set {MAVEN_REPOSITORY_ENV} to one https URL such as "
+            "https://<domain>-<account>.d.codeartifact.<region>.amazonaws.com/maven/<repo>/, "
+            "reached with the job role's IAM permissions, or unset it."
+        ),
+        doc=doc_url(),
+    )
 
 
 def _conf_allowed(name: str, extra: Sequence[str]) -> bool:

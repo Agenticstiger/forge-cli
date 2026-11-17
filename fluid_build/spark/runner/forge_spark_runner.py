@@ -388,7 +388,10 @@ def read_text(spark, path: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run one forge Spark job config.")
+    # allow_abbrev=False: Glue's own --conf would otherwise be read as --config.
+    parser = argparse.ArgumentParser(
+        description="Run one forge Spark job config.", allow_abbrev=False
+    )
     parser.add_argument("--config", required=True, help="the job.json, a path or s3:// URI")
     # Glue passes its own --JOB_NAME and friends; they are not this runner's.
     args, _ = parser.parse_known_args(argv)

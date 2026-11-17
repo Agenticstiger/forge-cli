@@ -55,6 +55,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     operator lists any other key in `FLUID_SPARK_CONF_ALLOWLIST` (settings like `spark.jars`
     load code that runs with the job's role). `FLUID_SPARK_WAIT_SECONDS` caps the reconcile's
     waits (default 900).
+  - A run resolves its Kafka and Avro packages from Maven Central (and Confluent's repository
+    for Avro), so the cluster needs egress to them, unless the operator sets
+    `FLUID_SPARK_MAVEN_REPOSITORY` to one https mirror (CodeArtifact, Artifactory) that
+    replaces Confluent's repository in `spark.jars.repositories`. Spark 3.5 still tries Maven
+    Central and spark-packages first; without egress those attempts fail (they can be slow)
+    and the resolver falls through to the mirror. Glue resolves no packages, so the mirror
+    does not apply there. An operator-allowlisted `spark.jars.repositories` in a contract's
+    `sparkConf` overrides the mirror and its checks. The variable is read from the real
+    environment only; a URL with a user or password, a link-local host or plain http is
+    refused.
+  - The Spark runner no longer accepts abbreviated options (found by the spark-infra lane):
+    Glue's own `--conf` argument was read as `--config`, so a Glue run with `sparkConf` loaded
+    the wrong job config. The runner's sha changes; its content-addressed key covers that.
   - The caller (the role running `fluid apply` or the MWAA execution role) needs the actions in
     `build_runners/spark/_adapters.py::CALLER_ACTIONS`, plus `iam:PassRole` on the job role for
     EMR Serverless and EMR on EKS. boto3 stays in the `[aws]` extra.

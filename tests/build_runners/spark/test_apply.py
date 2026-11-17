@@ -63,6 +63,18 @@ def test_prepare_refuses_a_tampered_config_hash(contract):
     assert err.value.event == "apply_spark_artifact_mismatch"
 
 
+def test_prepare_refuses_a_plan_made_with_another_maven_mirror(contract, monkeypatch):
+    from fluid_build.build_runners.spark import _desired
+
+    monkeypatch.delenv(_desired.MAVEN_REPOSITORY_ENV, raising=False)
+    plan = _bound_plan(contract)
+    monkeypatch.setenv(_desired.MAVEN_REPOSITORY_ENV, "https://mirror.example.internal/maven/")
+    with pytest.raises(CLIError) as err:
+        _apply.prepare(contract, build_id=None, verified_plan=plan, dry_run=True)
+    assert err.value.event == "apply_spark_artifact_mismatch"
+    assert _desired.MAVEN_REPOSITORY_ENV in err.value.context["error"]
+
+
 def test_prepare_refuses_a_plan_that_starts_runs_the_contract_dropped(contract):
     plan = _bound_plan(contract)
     contract["builds"] = []
