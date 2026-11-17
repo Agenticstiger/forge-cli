@@ -284,6 +284,8 @@ def _emit_registration_role(
             ),
         )
     prefix = _checked_prefix(where, ctx, bucket, path, "the registered location", reserved=False)
+    if placement.bucket_referenced:
+        _refuse_unless_products_prefix(where, ctx, bucket, prefix)
     digest = hashlib.sha256(f"{bucket}/{prefix}".encode("utf-8")).hexdigest()[:8]
     key = safe_ident(f"{ctx.cid}_lf_writer_{digest}")
     blocks.registration_roles[expose_id] = key
@@ -424,7 +426,7 @@ def _emit_build(
     access = aws_identity.JobAccess(
         region=b.region,
         account=ctx.account,
-        s3=_s3_grants(b, bucket, data_prefix),
+        s3=_s3_grants(b, bucket, data_prefix, shared=_shared_bucket(contract, expose, loc)),
         database=database,
         table=table,
         log_group_arn=tofu_ref(f"aws_cloudwatch_log_group.{b.key}.arn"),
@@ -640,7 +642,39 @@ def _checked_prefix(
     )
 
 
-def _s3_grants(b: _Build, bucket: str, data_prefix: str) -> Tuple[aws_identity.S3Grant, ...]:
+def _shared_bucket(
+    contract: Mapping[str, Any], expose: Mapping[str, Any], loc: Mapping[str, Any]
+) -> bool:
+    """Whether the output's bucket holds other products' data: the account's
+    ``<account>-fluid-data`` fallback, or a platform pool (packaging ``shared``)."""
+    if _warehouse.bucket_uses_fallback(loc):
+        return True
+    decision = resolve_packaging(contract).decision_for("bucket", expose.get("exposeId"))
+    return decision is ContainerDecision.REFERENCED
+
+
+def _refuse_unless_products_prefix(where: str, ctx: _Ctx, bucket: str, prefix: str) -> None:
+    """In a bucket other products share, a role forge creates writes the product's own
+    ``<product>/`` prefix only: any other prefix could be another product's table."""
+    if prefix.startswith(f"{ctx.product}/"):
+        return
+    raise UnsupportedBindingError(
+        "spark-role-shared-prefix",
+        f"{where}: s3://{ctx.shown(bucket)}/{prefix} is in a bucket other products share, "
+        f"and the role forge creates may write only this product's own {ctx.product}/ "
+        "prefix there; any other prefix could hold another product's table.",
+        (
+            f"Set binding.location.path under {ctx.product}/ (for example "
+            f"{ctx.product}/<table>/).",
+            "Or give the product its own bucket (binding.location.bucket, owned).",
+            "Or set parameters.spark.executionRoleArn to a role the operator scoped.",
+        ),
+    )
+
+
+def _s3_grants(
+    b: _Build, bucket: str, data_prefix: str, *, shared: bool = False
+) -> Tuple[aws_identity.S3Grant, ...]:
     """The prefixes the job writes (data, checkpoint, Glue's TempDir) and reads (artifacts).
 
     For a role forge creates, every prefix is checked to be one place (:func:`_scoped`),
@@ -651,6 +685,8 @@ def _s3_grants(b: _Build, bucket: str, data_prefix: str) -> Tuple[aws_identity.S
     owned = not b.cfg.get("executionRoleArn")
     if owned:
         data_prefix = _scoped(b, bucket, data_prefix, "the output's location")
+        if shared:
+            _refuse_unless_products_prefix(b.where, b.ctx, bucket, data_prefix)
     by_bucket: Dict[str, Tuple[List[str], List[str]]] = {bucket: ([data_prefix], [b.artifacts])}
     checkpoint = str(b.config.get("checkpoint") or "")
     if checkpoint:
@@ -820,6 +856,7 @@ def _trust(blocks: SparkBlocks, b: _Build, role_name: str, application_id: Any) 
         application_id=application_id,
         eks_issuer=issuer,
         eks_namespace=namespace,
+        glue_job=(names.glue_job_name(b.ctx.product, b.build_id) if b.runtime == "glue" else None),
     )
 
 

@@ -60,19 +60,22 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fluid_build._errors import doc_url
+from fluid_build.spark.compiler import TARGET_ALLOWLIST_ENV as _TARGET_ALLOWLIST_ENV
 
 #: Operator-only: the roles a contract's ``executionRoleArn`` may name. An entry is a
 #: role ARN, or an ARN prefix that ends in ``/`` (a role path). Unset allows none.
 EXECUTION_ROLE_ALLOWLIST_ENV = "FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST"
 #: Operator-only: ``sparkConf`` keys beyond the built-in tuning list. An entry is a key,
-#: or a prefix that ends in ``.``. It never admits a key in :data:`DENIED_SPARK_CONF`.
+#: or a prefix that ends in ``*``. It never admits a key in :data:`DENIED_SPARK_CONF`.
 SPARK_CONF_ALLOWLIST_ENV = "FLUID_SPARK_CONF_ALLOWLIST"
 #: Operator-only: the existing runtimes a contract may name, as ``<runtime>:<id>``
-#: (``emr-serverless:00f...``, ``emr-ec2:j-...``, ``emr-eks:<virtual cluster id>``).
-#: The build's role trusts it and the scheduler's policy may start, cancel and add
-#: steps there, so a contract naming another team's cluster would reach it. Unset
-#: allows none; a product's own isolated EMR Serverless application needs no entry.
-TARGET_ALLOWLIST_ENV = "FLUID_SPARK_TARGET_ALLOWLIST"
+#: (``emr-serverless:00f...``, ``emr-ec2:j-...``, ``emr-eks:<virtual cluster id>``), and
+#: the MSK clusters it may read, as ``msk:<cluster ARN>``. The build's role trusts the
+#: runtime and reads the cluster, and the scheduler's policy may start, cancel and add
+#: steps there, so a contract naming another team's would reach it. Unset allows none; a
+#: product's own isolated EMR Serverless application needs no entry. One list with the
+#: Spark compiler, which applies the MSK entries too.
+TARGET_ALLOWLIST_ENV = _TARGET_ALLOWLIST_ENV
 #: The field that names the existing runtime, per runtime.
 _TARGET_FIELD = {
     "emr-serverless": "applicationId",
@@ -93,18 +96,18 @@ _OPERATOR_ONLY = (
 #: the job config owns), or switch off a setting the runner relies on.
 DENIED_SPARK_CONF: Tuple[str, ...] = (
     "spark.jars",
-    "spark.jars.",
+    "spark.jars.*",
     "spark.files",
-    "spark.files.",
+    "spark.files.*",
     "spark.archives",
-    "spark.submit.",
-    "spark.pyspark.",
-    "spark.python.",
+    "spark.submit.*",
+    "spark.pyspark.*",
+    "spark.python.*",
     "spark.plugins",
-    "spark.plugins.",
+    "spark.plugins.*",
     "spark.extraListeners",
     "spark.sql.extensions",
-    "spark.sql.catalog.",
+    "spark.sql.catalog.*",
     "spark.sql.catalogImplementation",
     "spark.sql.defaultCatalog",
     "spark.sql.warehouse.dir",
@@ -114,6 +117,9 @@ DENIED_SPARK_CONF: Tuple[str, ...] = (
     "spark.sql.variable.substitute",
     "spark.sql.session.timeZone",
     "spark.sql.mapKeyDedupPolicy",
+    # A class a setting names is code the job loads.
+    "spark.sql.adaptive.customCostEvaluatorClass",
+    "spark.sql.streaming.stateStore.providerClass",
     "spark.driver.extraClassPath",
     "spark.driver.extraJavaOptions",
     "spark.driver.extraLibraryPath",
@@ -124,28 +130,28 @@ DENIED_SPARK_CONF: Tuple[str, ...] = (
     "spark.executor.userClassPathFirst",
     "spark.driver.defaultJavaOptions",
     "spark.executor.defaultJavaOptions",
-    "spark.executorEnv.",
-    "spark.yarn.",
-    "spark.kubernetes.",
-    "spark.emr-serverless.driverEnv.",
-    "spark.emr-serverless.executorEnv.",
-    "spark.emr-serverless.lakeformation.",
-    "spark.hadoop.",
-    "spark.kerberos.",
-    "spark.security.",
+    "spark.executorEnv.*",
+    "spark.yarn.*",
+    "spark.kubernetes.*",
+    "spark.emr-serverless.driverEnv.*",
+    "spark.emr-serverless.executorEnv.*",
+    "spark.emr-serverless.lakeformation.*",
+    "spark.hadoop.*",
+    "spark.kerberos.*",
+    "spark.security.*",
     "spark.authenticate",
-    "spark.authenticate.",
-    "spark.ssl.",
-    "spark.redaction.",
-    "spark.eventLog.",
-    "spark.ui.",
+    "spark.authenticate.*",
+    "spark.ssl.*",
+    "spark.redaction.*",
+    "spark.eventLog.*",
+    "spark.ui.*",
     "spark.master",
-    "spark.app.",
+    "spark.app.*",
 )
 
 #: Allowed with no operator entry: sizing and tuning settings, which change how fast and
 #: how wide the job runs, never what it runs or as whom. Exact keys, or prefixes that
-#: end in ``.``.
+#: end in ``*``.
 DEFAULT_SPARK_CONF: Tuple[str, ...] = (
     "spark.driver.cores",
     "spark.driver.memory",
@@ -155,19 +161,18 @@ DEFAULT_SPARK_CONF: Tuple[str, ...] = (
     "spark.executor.memory",
     "spark.executor.memoryOverhead",
     "spark.executor.instances",
-    "spark.dynamicAllocation.",
+    "spark.dynamicAllocation.*",
     "spark.default.parallelism",
-    "spark.memory.",
+    "spark.memory.*",
     "spark.network.timeout",
     "spark.task.maxFailures",
     "spark.sql.shuffle.partitions",
-    "spark.sql.adaptive.",
+    "spark.sql.adaptive.*",
     "spark.sql.files.maxPartitionBytes",
     "spark.sql.files.maxRecordsPerFile",
     "spark.sql.autoBroadcastJoinThreshold",
     "spark.sql.streaming.minBatchesToRetain",
-    "spark.sql.streaming.stateStore.providerClass",
-    "spark.sql.iceberg.",
+    "spark.sql.iceberg.*",
     "spark.emr-serverless.driver.disk",
     "spark.emr-serverless.executor.disk",
     "spark.emr-serverless.driver.disk.type",
@@ -180,7 +185,9 @@ ROLE_NAME_LIMIT = 64
 
 
 def _matches(key: str, entries: Sequence[str]) -> bool:
-    return any(key == e or (e.endswith(".") and key.startswith(e)) for e in entries)
+    """``key`` is an entry, or starts with an entry that ends in ``*`` (the one grammar the
+    runs lane's ``_desired.py`` reads too)."""
+    return any(key == e or (e.endswith("*") and key.startswith(e[:-1])) for e in entries)
 
 
 def _entries(name: str, environ: Optional[Mapping[str, str]]) -> List[str]:
@@ -260,6 +267,16 @@ def identity_findings(
             missing.append(
                 f"Spark build {bid}: parameters.spark.{field} {target} is not in "
                 f"{TARGET_ALLOWLIST_ENV} (as {entry})"
+            )
+    source = cfg.get("source")
+    cluster = source.get("mskClusterArn") if isinstance(source, Mapping) else None
+    if isinstance(cluster, str) and cluster:
+        from fluid_build.spark.compiler import cluster_listed
+
+        if not cluster_listed(cluster, environ):
+            missing.append(
+                f"Spark build {bid}: parameters.spark.source.mskClusterArn {cluster} is not "
+                f"in {TARGET_ALLOWLIST_ENV} (as msk:{cluster})"
             )
     arn = cfg.get("executionRoleArn")
     if arn is not None:
@@ -357,8 +374,8 @@ def refuse_unless_identity_allowed(
             f"operator list them {_OPERATOR_ONLY}: {EXECUTION_ROLE_ALLOWLIST_ENV} takes a "
             "role ARN or a path prefix ending in '/'; "
             f"{TARGET_ALLOWLIST_ENV} takes <runtime>:<id> of an existing application, "
-            "cluster or virtual cluster; "
-            f"{SPARK_CONF_ALLOWLIST_ENV} takes a key or a prefix ending in '.'. A key "
+            "cluster or virtual cluster, or msk:<cluster ARN>; "
+            f"{SPARK_CONF_ALLOWLIST_ENV} takes a key or a prefix ending in '*'. A key "
             "that loads code, sets credentials or moves the catalog or checkpoint cannot "
             "be listed."
         ),
@@ -656,27 +673,54 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
         ]
     )
     if access.glue_vpc:
-        statements.append(
-            {
-                # A Glue job in a VPC (its NETWORK connection) creates and removes its
-                # workers' network interfaces as its own role; EC2 offers no resource-level
-                # scope for the describe calls. The actions AWSGlueServiceRole grants for it.
-                "sid": "GlueVpc",
-                "effect": "Allow",
-                "actions": [
-                    "ec2:CreateNetworkInterface",
-                    "ec2:CreateTags",
-                    "ec2:DeleteNetworkInterface",
-                    "ec2:DescribeNetworkInterfaces",
-                    "ec2:DescribeRouteTables",
-                    "ec2:DescribeSecurityGroups",
-                    "ec2:DescribeSubnets",
-                    "ec2:DescribeVpcAttribute",
-                    "ec2:DescribeVpcEndpoints",
-                    "ec2:DescribeVpcs",
-                ],
-                "resources": ["*"],
-            }
+        # A Glue job in a VPC (its NETWORK connection) creates, tags and removes its
+        # workers' network interfaces as its own role, as AWSGlueServiceRole grants it:
+        # it tags them aws-glue-service-resource, and tags and deletes only those.
+        statements.extend(
+            [
+                {
+                    "sid": "GlueVpc",
+                    "effect": "Allow",
+                    "actions": [
+                        "ec2:CreateNetworkInterface",
+                        "ec2:DescribeNetworkInterfaces",
+                        "ec2:DescribeRouteTables",
+                        "ec2:DescribeSecurityGroups",
+                        "ec2:DescribeSubnets",
+                        "ec2:DescribeVpcAttribute",
+                        "ec2:DescribeVpcEndpoints",
+                        "ec2:DescribeVpcs",
+                    ],
+                    # EC2 offers no resource-level scope for these.
+                    "resources": ["*"],
+                },
+                {
+                    "sid": "GlueVpcTags",
+                    "effect": "Allow",
+                    "actions": ["ec2:CreateTags", "ec2:DeleteTags"],
+                    "resources": ["arn:aws:ec2:*:*:network-interface/*"],
+                    "condition": [
+                        {
+                            "test": "ForAllValues:StringEquals",
+                            "variable": "aws:TagKeys",
+                            "values": ["aws-glue-service-resource"],
+                        }
+                    ],
+                },
+                {
+                    "sid": "GlueVpcDelete",
+                    "effect": "Allow",
+                    "actions": ["ec2:DeleteNetworkInterface"],
+                    "resources": ["arn:aws:ec2:*:*:network-interface/*"],
+                    "condition": [
+                        {
+                            "test": "Null",
+                            "variable": "aws:ResourceTag/aws-glue-service-resource",
+                            "values": ["false"],
+                        }
+                    ],
+                },
+            ]
         )
     return {"statement": statements}
 
@@ -690,6 +734,7 @@ def trust_document(
     application_id: Any = None,
     eks_issuer: Any = None,
     eks_namespace: Any = None,
+    glue_job: Any = None,
 ) -> Dict[str, Any]:
     """The ``assume_role_policy`` document for ``runtime`` (not ``emr-ec2``: no role)."""
     if runtime == "emr-serverless":
@@ -723,19 +768,23 @@ def trust_document(
             ]
         }
     if runtime == "glue":
+        condition = [{"test": "StringEquals", "variable": "aws:SourceAccount", "values": [account]}]
+        if glue_job is not None:
+            # Only the build's own Glue job may assume it (the confused-deputy guard).
+            condition.append(
+                {
+                    "test": "ArnLike",
+                    "variable": "aws:SourceArn",
+                    "values": [_join("arn:aws:glue:", region, ":", account, ":job/", glue_job)],
+                }
+            )
         return {
             "statement": [
                 {
                     "effect": "Allow",
                     "actions": ["sts:AssumeRole"],
                     "principals": [{"type": "Service", "identifiers": ["glue.amazonaws.com"]}],
-                    "condition": [
-                        {
-                            "test": "StringEquals",
-                            "variable": "aws:SourceAccount",
-                            "values": [account],
-                        }
-                    ],
+                    "condition": condition,
                 }
             ]
         }

@@ -60,6 +60,12 @@ CONFIG_VERSION = 1
 #: :mod:`fluid_build.spark.policy`. Defined here so the compiler needs no policy import
 #: to name it in a message.
 CONTRACT_SQL_ALLOWLIST_ENV = "FLUID_SPARK_CONTRACT_SQL_ALLOWLIST"
+#: Operator-only: the existing runtimes and MSK clusters a contract may name, as
+#: ``<runtime>:<id>`` or ``msk:<cluster ARN>``. A job reads whichever cluster its build
+#: names, with a role that may read it, so a contract naming another team's cluster would
+#: read that team's topics. Unset allows none. The IaC applies the same list
+#: (``iac/providers/aws_identity.py``).
+TARGET_ALLOWLIST_ENV = "FLUID_SPARK_TARGET_ALLOWLIST"
 #: The Spark catalog the runner registers for the Glue catalog, and the default one,
 #: so contract SQL names a table as ``<database>.<table>``.
 CATALOG = "fluid"
@@ -233,6 +239,38 @@ def _refuse_unless_hosts_allowed(source: Mapping[str, Any], environ: Any, *, lis
         if names:
             env[HOST_ALLOWLIST_ENV] = ",".join(filter(None, [env.get(HOST_ALLOWLIST_ENV), *names]))
     refuse_unless_source_hosts_allowed({"source": source}, environ=env)
+
+
+def cluster_listed(arn: str, environ: Any = None) -> bool:
+    """Whether the operator lists the MSK cluster ``arn`` (``msk:<arn>``, exact)."""
+    env = os.environ if environ is None else environ
+    entries = {e.strip() for e in (env.get(TARGET_ALLOWLIST_ENV) or "").split(",")}
+    return f"msk:{arn}" in entries
+
+
+def _refuse_unless_cluster_listed(product: Any, bid: Any, arn: str, environ: Any) -> None:
+    """The MSK cluster an ARN source names needs the operator's entry: its brokers come
+    from AWS, so the host allowlist never sees them (``fluid validate`` warns instead)."""
+    from fluid_build._errors import doc_url
+    from fluid_build.spark.policy import SparkPolicyError
+
+    if cluster_listed(arn, environ):
+        return
+    raise SparkPolicyError(
+        what=f"Spark build {bid!r} reads an MSK cluster the operator has not listed",
+        why=(
+            f"parameters.spark.source.mskClusterArn {arn} is not in {TARGET_ALLOWLIST_ENV} "
+            f"(as msk:{arn}). The job reads the cluster its contract names, with a role that "
+            "may read it, so a contract could read another team's topics. An unset list "
+            "allows none."
+        ),
+        fix=(
+            "If this cluster is the product's, have the operator list it in the OPERATOR "
+            f'environment (not a project .env): export {TARGET_ALLOWLIST_ENV}="msk:{arn}" '
+            "(comma-separated with any other entries)."
+        ),
+        doc=doc_url(),
+    )
 
 
 def _refuse_unless_mask_key_allowed(arn: str, environ: Any) -> None:
@@ -520,6 +558,8 @@ def compile_job_config(
         _refuse_unless_hosts_allowed(
             _source_hosts(kafka, registry and registry["url"]), environ, listed=host_gate
         )
+        if kafka["mskClusterArn"] and host_gate:
+            _refuse_unless_cluster_listed(product, bid, kafka["mskClusterArn"], environ)
         offsets = stream_spec.get("startingOffsets", "latest")
         if offsets not in ("earliest", "latest"):
             raise ValueError(f"{swhere}.startingOffsets: expected earliest or latest")

@@ -805,7 +805,9 @@ class TestCommands:
             "FLUID_SPARK_EXECUTION_ROLE_ALLOWLIST": "arn:aws:iam::000000000001:role/",
             "FLUID_SPARK_TARGET_ALLOWLIST": (
                 "emr-serverless:00fexampleapp0001,"
-                "emr-eks:abcdefghij0123456789klmno"  # pragma: allowlist secret - an id
+                "emr-eks:abcdefghij0123456789klmno,"  # pragma: allowlist secret - an id
+                "msk:arn:aws:kafka:eu-west-1:000000000001:cluster/commerce-events/"
+                "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d-1"
             ),
             # The batch build's own SQL, reviewed.
             "FLUID_SPARK_CONTRACT_SQL_ALLOWLIST": "commerce.orders-stream/compact-orders",

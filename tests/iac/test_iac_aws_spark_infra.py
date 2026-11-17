@@ -113,7 +113,7 @@ def operator_policy(monkeypatch):
     # The operator lists the runtimes the examples name, and nothing else.
     monkeypatch.setenv(
         aws_identity.TARGET_ALLOWLIST_ENV,
-        f"emr-serverless:00fabc123def,emr-ec2:j-1ABCDEF,emr-eks:{VIRTUAL_CLUSTER}",
+        f"emr-serverless:00fabc123def,emr-ec2:j-1ABCDEF,emr-eks:{VIRTUAL_CLUSTER},msk:{MSK_ARN}",
     )
 
 
@@ -193,15 +193,18 @@ def test_the_rendered_job_config_interpolates_only_forges_own_references(contrac
 
 
 def test_a_bucketless_output_uses_the_account_bucket_everywhere(contract):
-    del contract["exposes"][0]["binding"]["location"]["bucket"]
+    location = contract["exposes"][0]["binding"]["location"]
+    del location["bucket"]
+    # The shared account bucket: the product writes its own prefix only.
+    location["path"] = "commerce.orders-stream/order_lines/"
     resources, data = emit(contract)
     account = "${data.aws_caller_identity.fluid_lf_caller.account_id}"
     config = resources["aws_s3_object"][f"{KEY}_config"]
     assert config["bucket"] == f"{account}-fluid-data"
-    assert f'"s3://{account}-fluid-data/iceberg/commerce/order_lines/"' in config["content"]
+    assert f'"s3://{account}-fluid-data/commerce.orders-stream/order_lines/"' in config["content"]
     access = data["aws_iam_policy_document"][f"{KEY}_access"]
     assert statement(access, "ReadWrite0")["resources"][0] == (
-        f"arn:aws:s3:::{account}-fluid-data/iceberg/commerce/order_lines/*"
+        f"arn:aws:s3:::{account}-fluid-data/commerce.orders-stream/order_lines/*"
     )
 
 
@@ -246,11 +249,10 @@ def test_the_role_is_least_privilege(contract):
         "values": ["s3.eu-west-1.amazonaws.com"],
     }
     glue = statement(access, "GlueTable")
+    glue_arn = "arn:aws:glue:eu-west-1:${data.aws_caller_identity.fluid_lf_caller.account_id}"
     assert glue["resources"][1:] == [
-        "arn:aws:glue:eu-west-1:${data.aws_caller_identity.fluid_lf_caller.account_id}"
-        ":database/commerce",
-        "arn:aws:glue:eu-west-1:${data.aws_caller_identity.fluid_lf_caller.account_id}"
-        ":table/commerce/order_lines",
+        glue_arn + ":database/commerce",
+        glue_arn + ":table/commerce/order_lines",
     ]
     assert statement(access, "LakeFormationCredentials")["actions"] == [
         "lakeformation:GetDataAccess"
@@ -919,7 +921,8 @@ def test_an_existing_runtime_is_named_only_once_the_operator_lists_it(
 
 
 def test_an_isolated_application_needs_no_operator_entry(contract, monkeypatch):
-    monkeypatch.delenv(aws_identity.TARGET_ALLOWLIST_ENV)
+    # Only the cluster it reads is listed: the product's own application needs no entry.
+    monkeypatch.setenv(aws_identity.TARGET_ALLOWLIST_ENV, f"msk:{MSK_ARN}")
     del spark(contract)["applicationId"]
     contract["packaging"] = {"containers": {"emrApplication": "isolated"}}
     assert aws_identity.validation_warnings(contract) == []
@@ -935,7 +938,13 @@ def test_a_contract_with_date_keys_still_emits(contract):
 
 @pytest.mark.parametrize(
     "location",
-    [{"path": None}, {"bucket": "{{ env.FLUID_TEST_UNSET_LAKE }}"}],
+    [
+        {"path": None},
+        {
+            "bucket": "{{ env.FLUID_TEST_UNSET_LAKE }}",
+            "path": "commerce.orders-stream/order_lines/",
+        },
+    ],
     ids=["bucket-root", "unresolved-template"],
 )
 def test_a_spark_written_registration_is_one_named_prefix(contract, location, monkeypatch):
@@ -1004,3 +1013,74 @@ def test_a_batch_build_on_emr_on_ec2_runs_as_the_clusters_role(contract):
     props.pop("stream"), props.pop("mapping")
     props["sql"] = "SELECT order_id, order_id AS email_hash FROM commerce.raw_orders"
     assert not any("batch job" in e for e in aws_identity.validation_errors(contract))
+
+
+# --- independent security review of #918 (HIGH, MEDIUM) --------------------------------
+
+
+def test_an_msk_cluster_is_read_only_once_the_operator_lists_it(contract, monkeypatch):
+    """A contract naming another team's cluster would get Connect/ReadData on its topics."""
+    other = "arn:aws:kafka:eu-west-1:000000000005:cluster/payments-team/1111-2222"
+    spark(contract)["source"]["mskClusterArn"] = other
+    (warning,) = [w for w in aws_identity.validation_warnings(contract) if f"msk:{other}" in w]
+    assert aws_identity.TARGET_ALLOWLIST_ENV in warning
+    with pytest.raises(SparkPolicyError) as caught:
+        emit(contract)
+    assert f"msk:{other}" in caught.value.why
+    # The compiler refuses it too (fluid spark run compiles without the IaC).
+    from fluid_build.spark.compiler import compile_job_config
+
+    with pytest.raises(SparkPolicyError):
+        compile_job_config(contract, contract["builds"][0], account_ref="000000000005")
+
+
+@pytest.mark.parametrize(
+    "location, packaging",
+    [
+        ({"bucket": None, "path": "payments/cards/"}, None),
+        ({"bucket": "shared-pool", "path": "payments/cards/"}, {"mode": "shared", "pool": "p"}),
+    ],
+    ids=["fallback-bucket", "pool-bucket"],
+)
+def test_a_shared_bucket_prefix_must_be_the_products(contract, location, packaging):
+    loc = contract["exposes"][0]["binding"]["location"]
+    for k, v in location.items():
+        if v is None:
+            loc.pop(k)
+        else:
+            loc[k] = v
+    if packaging:
+        contract["packaging"] = packaging
+    with pytest.raises(UnsupportedBindingError) as caught:
+        emit(contract)
+    assert caught.value.kind == "spark-role-shared-prefix"
+    loc["path"] = "commerce.orders-stream/order_lines/"
+    emit(contract)
+
+
+def test_conf_prefixes_share_the_runs_lanes_star_grammar(contract, monkeypatch):
+    spark(contract)["sparkConf"] = {"spark.sql.streaming.metricsEnabled": "true"}
+    monkeypatch.setenv(aws_identity.SPARK_CONF_ALLOWLIST_ENV, "spark.sql.streaming.*")
+    emit(contract)
+    for key in (
+        "spark.sql.adaptive.customCostEvaluatorClass",
+        "spark.sql.streaming.stateStore.providerClass",
+    ):
+        spark(contract)["sparkConf"] = {key: "x"}
+        assert any(key in e for e in aws_identity.validation_errors(contract))
+
+
+def test_the_glue_role_trusts_only_its_job_and_tags_only_glues_interfaces(contract):
+    params = spark(contract)
+    params.update(runtime="glue")
+    del params["applicationId"]
+    _, data = emit(contract)
+    trust = data["aws_iam_policy_document"][f"{KEY}_trust"]["statement"][0]
+    job = names.glue_job_name("commerce.orders-stream", "ingest-orders")
+    assert trust["condition"][1]["values"][0].endswith(f":job/{job}")
+    access = data["aws_iam_policy_document"][f"{KEY}_access"]
+    tags = statement(access, "GlueVpcTags")
+    assert tags["condition"][0]["values"] == ["aws-glue-service-resource"]
+    delete = statement(access, "GlueVpcDelete")
+    assert delete["condition"][0]["variable"] == "aws:ResourceTag/aws-glue-service-resource"
+    assert "ec2:DeleteNetworkInterface" not in statement(access, "GlueVpc")["actions"]

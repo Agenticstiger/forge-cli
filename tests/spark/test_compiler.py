@@ -16,6 +16,7 @@ from fluid_build.spark.compiler import (
     CONFIG_VERSION,
     CONTRACT_SQL_ALLOWLIST_ENV,
     MSK_BROKERS_PLACEHOLDER,
+    TARGET_ALLOWLIST_ENV,
     compile_job_config,
     spark_builds,
     validation_errors,
@@ -261,8 +262,9 @@ def test_the_kafka_cluster_comes_from_parameters_spark_source(contract, source, 
         job(contract)
 
 
-def test_an_msk_cluster_arn_leaves_one_placeholder_for_the_uploader(contract):
+def test_an_msk_cluster_arn_leaves_one_placeholder_for_the_uploader(contract, monkeypatch):
     arn = "arn:aws:kafka:eu-west-1:000000000005:cluster/orders/abc-1"
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"msk:{arn}")
     contract["builds"][0]["properties"]["parameters"]["spark"]["source"] = {"mskClusterArn": arn}
     source = job(contract).config["source"]
     assert source["bootstrapServers"] == MSK_BROKERS_PLACEHOLDER == "${fluid_msk_bootstrap_brokers}"
@@ -475,3 +477,14 @@ def test_a_missing_credential_grant_warns_at_validate_and_refuses_at_compile(con
     ] = "http://schema-registry.example.internal"
     (error,) = validation_errors(contract)
     assert "https only" in error
+
+
+def test_an_msk_cluster_the_operator_has_not_listed_is_refused(contract, monkeypatch):
+    """Its brokers come from AWS, so the host allowlist never sees them."""
+    from fluid_build.spark.policy import SparkPolicyError
+
+    arn = "arn:aws:kafka:eu-west-1:000000000005:cluster/payments/abc-1"
+    contract["builds"][0]["properties"]["parameters"]["spark"]["source"] = {"mskClusterArn": arn}
+    monkeypatch.delenv(TARGET_ALLOWLIST_ENV, raising=False)
+    with pytest.raises(SparkPolicyError, match="MSK cluster"):
+        job(contract)

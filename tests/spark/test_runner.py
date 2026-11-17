@@ -41,9 +41,13 @@ def test_a_config_the_runner_does_not_run_is_refused(runner, contract, change, m
         runner.parse_config(json.dumps(config))
 
 
-def test_an_unresolved_interpolation_is_refused(runner, contract):
+def test_an_unresolved_interpolation_is_refused(runner, contract, monkeypatch):
+    from fluid_build.spark.compiler import TARGET_ALLOWLIST_ENV
+
+    arn = "arn:aws:kafka:eu-west-1:000000000005:cluster/o/1"
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"msk:{arn}")
     spark = contract["builds"][0]["properties"]["parameters"]["spark"]
-    spark["source"] = {"mskClusterArn": "arn:aws:kafka:eu-west-1:000000000005:cluster/o/1"}
+    spark["source"] = {"mskClusterArn": arn}
     text = config_text(contract)  # the uploader has not filled in the MSK brokers
     with pytest.raises(runner.JobConfigError, match="unresolved"):
         runner.parse_config(text)
