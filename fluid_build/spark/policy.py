@@ -16,7 +16,7 @@ from typing import Any, Mapping, Optional
 
 from fluid_build._errors import FluidUserError, doc_url
 from fluid_build.spark.compiler import CONTRACT_SQL_ALLOWLIST_ENV
-from fluid_build.streaming.policy import contract_sql_entry
+from fluid_build.streaming.policy import contract_sql_refusal
 
 
 @dataclass
@@ -43,13 +43,14 @@ def refuse_unless_contract_sql_allowed(
     if not isinstance(props, Mapping) or props.get("sql") is None:
         return
     env = os.environ if environ is None else environ
-    entries = [e.strip() for e in (env.get(CONTRACT_SQL_ALLOWLIST_ENV) or "").split(",")]
-    build_id = build.get("id")
-    pinned = contract_sql_entry(product_id, build)
-    if {str(product_id), f"{product_id}/{build_id}", pinned} & set(entries):
+    raw = env.get(CONTRACT_SQL_ALLOWLIST_ENV) or ""
+    refusal = contract_sql_refusal(
+        product_id, build, [e.strip() for e in raw.split(",") if e.strip()]
+    )
+    if refusal is None:
         return
-    stale = any(e.startswith(f"{product_id}/{build_id}@") for e in entries)
-    kept = [e for e in entries if e and not e.startswith(f"{product_id}/{build_id}@")]
+    stale, listed = refusal
+    build_id = build.get("id")
     raise SparkPolicyError(
         what=f"Spark build {build_id!r} runs SQL written in the contract",
         why=(
@@ -67,8 +68,7 @@ def refuse_unless_contract_sql_allowed(
             "Declare the output with properties.stream and properties.mapping, which forge "
             "compiles into a query that reads only the stream; or, once this SQL is reviewed, "
             "have the operator list it in the real environment (a project .env cannot set it), "
-            f'pinned to what was reviewed: export {CONTRACT_SQL_ALLOWLIST_ENV}="'
-            f'{",".join([*kept, pinned])}".'
+            f'pinned to what was reviewed: export {CONTRACT_SQL_ALLOWLIST_ENV}="{listed}".'
         ),
         doc=doc_url(),
     )

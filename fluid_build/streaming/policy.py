@@ -468,6 +468,23 @@ def contract_sql_entry(product_id: Any, build: Mapping[str, Any]) -> str:
     return f"{product_id}/{build.get('id')}@sha256:{digest}"
 
 
+def contract_sql_refusal(
+    product_id: Any, build: Mapping[str, Any], entries: List[str]
+) -> Optional[Tuple[bool, str]]:
+    """None when ``entries`` approve the build's SQL; otherwise whether an entry pins other
+    SQL for the build (it changed after review), and the list to export with it pinned.
+
+    The managed Flink lane and the Spark runner share this rule, each with its variable.
+    """
+    build_id = build.get("id")
+    pinned = contract_sql_entry(product_id, build)
+    if {str(product_id), f"{product_id}/{build_id}", pinned} & set(entries):
+        return None
+    mine = f"{product_id}/{build_id}@"
+    stale = any(e.startswith(mine) for e in entries)
+    return stale, ",".join([*(e for e in entries if not e.startswith(mine)), pinned])
+
+
 def refuse_unless_contract_sql_allowed(
     product_id: Any, build: Mapping[str, Any], environ: Optional[Mapping[str, str]] = None
 ) -> None:
@@ -488,14 +505,10 @@ def refuse_unless_contract_sql_allowed(
     if not isinstance(props, Mapping) or props.get("sql") is None:
         return
     build_id = build.get("id")
-    pinned = contract_sql_entry(product_id, build)
-    entries = _entries(CONTRACT_SQL_ALLOWLIST_ENV, environ)
-    if {str(product_id), f"{product_id}/{build_id}", pinned} & set(entries):
+    refusal = contract_sql_refusal(product_id, build, _entries(CONTRACT_SQL_ALLOWLIST_ENV, environ))
+    if refusal is None:
         return
-    stale = any(e.startswith(f"{product_id}/{build_id}@") for e in entries)
-    listed = ",".join(
-        [*(e for e in entries if not e.startswith(f"{product_id}/{build_id}@")), pinned]
-    )
+    stale, listed = refusal
     raise FlinkPolicyError(
         what=f"managed Flink build {build_id!r} runs SQL written in the contract",
         why=(
