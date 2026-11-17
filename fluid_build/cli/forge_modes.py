@@ -31,8 +31,6 @@ except ImportError:  # pragma: no cover - exercised via non-Rich fallbacks
 
 
 from fluid_build.cli._forge_ci_scaffolder import (  # noqa: E402,F401
-    _CI_COMPLEXITY_CHOICES,
-    _CI_COMPLEXITY_VALUES,
     _CI_PROVIDER_ALIASES,
     _CI_PROVIDER_CHOICES,
     _CI_PROVIDER_VALUES,
@@ -63,7 +61,7 @@ def _scaffold_ci_pipeline(
     ask_dialog_question_fn: Callable[[Any, Any], Any],
     get_cli_arg_fn: Callable[[Any, str, Any], Any],
     dry_run: bool,
-) -> tuple[Optional[str], Optional[str]]:
+) -> Optional[str]:
     """Thin re-export shim.
 
     The body lived inline at ~230 LOC before extraction; it now lives

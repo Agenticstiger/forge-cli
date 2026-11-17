@@ -11,6 +11,7 @@ quirks stay contained. Inherits the 11-stage rendering scaffold from
 from __future__ import annotations
 
 import json
+import textwrap
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -30,18 +31,13 @@ except ImportError:
 
     yaml = _YamlFallback()  # type: ignore[assignment]
 
+from . import _thin
 from ._base import (
     APPLY_MODES,
     BUNDLE_PATH,
-    PINNED_ACTIONS,
     SCHEDULERS,
     BasePipelineTemplate,
-    PipelineComplexity,
     PipelineConfig,
-    PipelineProvider,
-    StageSpec,
-    _pin_action,
-    apply_build_id_sh,
     check_pipeline_workdir,
     sh_param,
 )
@@ -137,13 +133,6 @@ def _sh_step(lines: List[str], cd: str, indent: str = _STEP_INDENT) -> str:
             raise ValueError(f"shell line cannot sit in a Groovy ''' string: {line!r}")
     body = "\n".join(f"{indent}    {line}" for line in lines)
     return f"{indent}sh '''{cd}set -eu\n{body}'''"
-
-
-def _needs_bundle(stage: int) -> str:
-    return (
-        f'if [ ! -f {BUNDLE_PATH} ]; then echo "stage {stage} reads {BUNDLE_PATH}, '
-        'which stage 1 writes: run stage 1 in the same build" >&2; exit 1; fi'
-    )
 
 
 class JenkinsTemplate(BasePipelineTemplate):
@@ -249,12 +238,11 @@ class JenkinsTemplate(BasePipelineTemplate):
                     "Pass pip --pre (pulls alpha/rc releases). Leave false in prod.",
                 ),
             ]
-        toggles = {spec.num: spec for spec in self._stage_specs(config)}
+        toggles = {stage.num: stage.toggle for stage in _thin.stages()}
 
         def toggle(num: int, description: str) -> _Param:
-            spec = toggles[num]
-            on = self._stage_default_run(spec, config)
-            return _Param(spec.toggle_param, "boolean", "true" if on else "false", description)
+            on = self._stage_toggle_default(num, config)
+            return _Param(toggles[num], "boolean", "true" if on else "false", description)
 
         rows += [
             toggle(
@@ -417,6 +405,13 @@ class JenkinsTemplate(BasePipelineTemplate):
                 d["SCHEDULE_SYNC_DRY_RUN"],
                 "Stage 11: --dry-run (log the planned subprocess argv without executing).",
             ),
+            _Param(
+                "APPLY_APPROVAL",
+                "boolean",
+                "true",
+                "Stages 7-11: a person approves the reviewed plan (an input step) before "
+                "apply. Off for an unattended job.",
+            ),
         ]
         return {row.name: row for row in rows}
 
@@ -459,33 +454,13 @@ class JenkinsTemplate(BasePipelineTemplate):
         # on every archiveArtifacts handles reference-only contracts that
         # legitimately produce no plan.json / artifacts/ / reports.
         W = f"{workdir}/" if workdir else ""
-        env_flag = f'--env "{v("FLUID_ENV")}"'
-        # The DAG stage 3 renders applies this path relative to the checkout
-        # (FLUID_PROJECT_DIR on the Airflow worker); a bundle does not record it.
-        project_contract = f"{W}{v('CONTRACT')}"
         last_applied = bool(config.diff_last_applied)
         applied_dir = f"$WORKSPACE/{_CI_STATE_DIR}/applied"
         baseline_dir = f"$WORKSPACE/{_CI_STATE_DIR}/last-applied"
-        dry_run_applied = (
-            f'[ "{v("RUN_STAGE_7_APPLY")}" = "true" ] && [ "{v("APPLY_MODE")}" = "dry-run" ]'
-        )
-
-        def skip_after_dry_run(stage: int, what: str) -> List[str]:
-            # A dry-run build writes nothing: not the target, not the bindings,
-            # not the catalog, not the scheduler (whose DAG would apply for real).
-            return [
-                f"if {dry_run_applied}; then",
-                (
-                    f'  echo "stage {stage}: stage 7 ran as a dry run and applied nothing, so '
-                    f'{what} — skipped (APPLY_MODE amend or amend-and-build applies)"'
-                ),
-                "  exit 0",
-                "fi",
-            ]
+        toggles = {stage.num: stage.toggle for stage in _thin.stages()}
 
         def when(num: int, extra: str = "") -> str:
-            toggle_name = {spec.num: spec.toggle_param for spec in self._stage_specs(config)}[num]
-            expression = _when_on(P[toggle_name])
+            expression = _when_on(P[toggles[num]])
             if extra:
                 expression = f"{expression} && {extra}"
             return f"            when {{ expression {{ return {expression} }} }}"
@@ -646,209 +621,38 @@ EOM
                 "                }"
             )
 
-        # ── Stages 1-11 ─────────────────────────────────────────────────
-        stage1 = _sh_step(
-            [
-                "mkdir -p runtime",
-                f'fluid bundle "{v("CONTRACT")}" {env_flag} --format tgz --out {BUNDLE_PATH}',
-            ],
-            CD,
-        )
-        stage2 = _sh_step(
-            [
-                "mkdir -p runtime",
-                _needs_bundle(2),
-                f"set -- {BUNDLE_PATH} {env_flag} --report runtime/validate-report.json",
-                f'if [ "{v("VALIDATE_STRICT")}" = "true" ]; then set -- "$@" --strict; fi',
-                'fluid validate "$@"',
-            ],
-            CD,
-        )
-        stage3 = _sh_step(
-            [
-                _needs_bundle(3),
-                (
-                    f"fluid generate artifacts {BUNDLE_PATH} {env_flag} "
-                    f'--contract-path "{project_contract}" '
-                    f'--out dist/artifacts/ --emit "{v("GENERATE_EMIT")}"'
-                ),
-            ],
-            CD,
-        )
-        stage4 = _sh_step(
-            [
-                "mkdir -p runtime",
-                (
-                    "fluid validate-artifacts dist/artifacts/ "
-                    "--manifest dist/artifacts/MANIFEST.json "
-                    "--report runtime/validate-artifacts-report.json"
-                ),
-            ],
-            CD,
-        )
-        stage5_lines = [
-            "mkdir -p runtime",
-            _needs_bundle(5),
-            f"set -- {BUNDLE_PATH} {env_flag} --out runtime/diff-report.json",
-            f'if [ "{v("DIFF_EXIT_ON_DRIFT")}" = "true" ]; then set -- "$@" --exit-on-drift; fi',
-        ]
-        if last_applied:
-            stage5_lines += [
-                f'BASELINE="{baseline_dir}/{v("FLUID_ENV")}.json"',
-                (
-                    'if [ -f "$BASELINE" ]; then set -- "$@" --last-applied "$BASELINE"; '
-                    'else echo "stage 5: the last successful build applied no plan for this env '
-                    '(or there is none yet): comparing the target with the contract alone"; fi'
-                ),
-            ]
-        stage5_lines.append('fluid diff "$@"')
-        stage5 = _sh_step(stage5_lines, CD)
-        stage6 = _sh_step(
-            [
-                "mkdir -p runtime",
-                _needs_bundle(6),
-                # --check-sovereignty: a strict sovereignty violation fails the
-                # plan stage, before stage 7 reaches a cloud.
-                (
-                    f"set -- {BUNDLE_PATH} {env_flag} "
-                    f'--mode "{v("APPLY_MODE")}" --out runtime/plan.json --check-sovereignty'
-                ),
-                (
-                    f'if [ "{v("PLAN_HTML")}" = "true" ]; then '
-                    'set -- "$@" --html runtime/plan.html; fi'
-                ),
-                'fluid plan "$@"',
-            ],
-            CD,
-        )
-        stage7_lines = [
-            "mkdir -p runtime",
-            _needs_bundle(7),
-            f'MODE="{v("APPLY_MODE")}"',
-            (
-                f'set -- runtime/plan.json --bundle {BUNDLE_PATH} --mode "$MODE" {env_flag} '
-                "--yes --ensure-opentofu --report runtime/apply-report.html"
-            ),
-            apply_build_id_sh(v("APPLY_BUILD_ID")).strip(),
-            f'if [ "{v("ALLOW_DATA_LOSS")}" = "true" ]; then set -- "$@" --allow-data-loss; fi',
-            (
-                f'if [ "{v("NO_VERIFY_DIGEST")}" = "true" ]; then '
-                'set -- "$@" --no-verify-plan-binding --no-verify-federation; fi'
-            ),
-            'fluid apply "$@"',
-        ]
-        if last_applied:
-            stage7_lines += [
-                # Recorded only once apply succeeded (set -e), and only when
-                # it changed the target: a dry run applied nothing.
-                'if [ "$MODE" != "dry-run" ]; then',
-                f'  mkdir -p "{applied_dir}"',
-                f'  cp runtime/plan.json "{applied_dir}/{v("FLUID_ENV")}.json"',
-                "fi",
-            ]
-        stage7 = _sh_step(stage7_lines, CD)
-        stage8 = _sh_step(
-            [
-                "mkdir -p runtime",
-                f'POLICY_MODE="{v("POLICY_APPLY_MODE")}"',
-                f'if {dry_run_applied} && [ "$POLICY_MODE" = "enforce" ]; then',
-                (
-                    '  echo "stage 8: stage 7 ran as a dry run and wrote nothing, so the bindings '
-                    'are checked (--mode check), not enforced"'
-                ),
-                "  POLICY_MODE=check",
-                "fi",
-                "if [ -f dist/artifacts/policy/bindings.json ]; then",
-                '  set -- dist/artifacts/policy/bindings.json --mode "$POLICY_MODE"',
-                '  if fluid policy-apply "$@" > runtime/policy-apply-report.json 2>&1; then',
-                "    cat runtime/policy-apply-report.json",
-                "  else",
-                "    cat runtime/policy-apply-report.json; exit 1",
-                "  fi",
-                "else",
-                '  echo "no dist/artifacts/policy/bindings.json — skipping stage 8"',
-                "fi",
-            ],
-            CD,
-        )
-        stage9 = _sh_step(
-            [
-                *skip_after_dry_run(9, "there is nothing to verify"),
-                "mkdir -p runtime",
-                _needs_bundle(9),
-                f"set -- {BUNDLE_PATH} {env_flag} --out runtime/verify-report.json",
-                f'if [ "{v("VERIFY_STRICT")}" = "true" ]; then set -- "$@" --strict; fi',
-                'fluid verify "$@"',
-            ],
-            CD,
-        )
-        publish_env = f" {env_flag}" if config.publish_include_env else ""
-        stage10 = _sh_step(
-            [
-                *skip_after_dry_run(10, "there is no applied product to publish"),
-                "mkdir -p runtime",
-                f'set -- "{v("CONTRACT")}"{publish_env} --format json',
-                # PUBLISH_TARGETS is a space-separated list: each word is ONE
-                # `--target=<word>` argument, and `set -f` keeps a word from
-                # being a glob. A word may not carry an endpoint
-                # (`name:https://...`): the agent's catalog credential
-                # (FLUID_API_KEY...) would go to whatever the parameter names.
-                "set -f",
-                f"for t in {v('PUBLISH_TARGETS')}; do",
-                (
-                    '  case "$t" in *:*) echo "PUBLISH_TARGETS names catalogs, not endpoints: '
-                    'set the endpoint on the agent (FLUID_CC_ENDPOINT...)" >&2; exit 2 ;; esac'
-                ),
-                '  set -- "$@" "--target=$t"',
-                "done",
-                "set +f",
-                "rc=0",
-                'fluid publish "$@" > runtime/publish-report.json || rc=$?',
-                "cat runtime/publish-report.json",
-                'exit "$rc"',
-            ],
-            CD,
-        )
-        stage11 = _sh_step(
-            [
-                *skip_after_dry_run(11, "there is no applied product to schedule"),
-                f'SCHEDULER_V="{v("SCHEDULER")}"',
-                'if [ -z "$SCHEDULER_V" ]; then',
-                '  echo "SCHEDULER is blank: no scheduler to sync to — skipping stage 11"',
-                "  exit 0",
-                "fi",
-                (
-                    "if [ ! -d dist/artifacts/schedule ] || "
-                    '[ -z "$(ls -A dist/artifacts/schedule 2>/dev/null)" ]; then'
-                ),
-                (
-                    '  echo "no dist/artifacts/schedule/ DAGs to sync — skipping stage 11 '
-                    "(reference-only contract, stage 3 not run, or no scheduled build or "
-                    'orchestration.engine)"'
-                ),
-                "  exit 0",
-                "fi",
-                "mkdir -p runtime",
-                # --delete-scope product: this product's DAGs go to
-                # <destination>/<contract id>/ and nothing outside it is deleted,
-                # so every product's job can share one DAG root.
-                (
-                    'set -- --scheduler "$SCHEDULER_V" --dags-dir dist/artifacts/schedule/ '
-                    f"{env_flag} --delete-scope product --report runtime/schedule-sync-report.json"
-                ),
-                f'DEST="{v("SCHEDULER_DESTINATION")}"',
-                'if [ -n "$DEST" ]; then set -- "$@" --destination "$DEST"; fi',
-                f'ENV_NAME="{v("SCHEDULER_ENVIRONMENT_NAME")}"',
-                'if [ -n "$ENV_NAME" ]; then set -- "$@" --environment-name "$ENV_NAME"; fi',
-                f'LOCATION="{v("SCHEDULER_LOCATION")}"',
-                'if [ -n "$LOCATION" ]; then set -- "$@" --location "$LOCATION"; fi',
-                f'WORKSPACE_NAME="{v("SCHEDULER_WORKSPACE")}"',
-                'if [ -n "$WORKSPACE_NAME" ]; then set -- "$@" --workspace "$WORKSPACE_NAME"; fi',
-                f'if [ "{v("SCHEDULE_SYNC_DRY_RUN")}" = "true" ]; then set -- "$@" --dry-run; fi',
-                'fluid schedule-sync "$@"',
-            ],
-            CD,
-        )
+        # ── Stages 1-11: each runs `fluid ship --stage N` ──────────────────
+        # Ship builds every stage's argv (cli/_ship_stages.py) and reads the
+        # parameters from the environment {} block, so no value reaches a
+        # script as code and no stage logic lives in this file.
+        def ship_step(num: int, indent: str = _STEP_INDENT) -> str:
+            command = f'fluid ship "$CONTRACT" --stage {num}' + (" --yes" if num == 7 else "")
+            lines = [command]
+            if num == 5 and last_applied:
+                lines = [
+                    f'BASELINE="{baseline_dir}/$FLUID_ENV.json"',
+                    (
+                        'if [ -f "$BASELINE" ]; then export DIFF_LAST_APPLIED="$BASELINE"; '
+                        'else echo "stage 5: the last successful build applied no plan for this '
+                        "env (or there is none yet): comparing the target with the contract "
+                        'alone"; fi'
+                    ),
+                    command,
+                ]
+            if num == 7 and last_applied:
+                lines += [
+                    # Recorded only once apply succeeded (set -e), and only when
+                    # it changed the target: a dry run applied nothing.
+                    'if [ "$APPLY_MODE" != "dry-run" ]; then',
+                    f'  mkdir -p "{applied_dir}"',
+                    f'  cp runtime/plan.json "{applied_dir}/$FLUID_ENV.json"',
+                    "fi",
+                ]
+            return _sh_step(lines, CD, indent)
+
+        stage1, stage2, stage3, stage4, stage5, stage6 = (ship_step(n) for n in range(1, 7))
+        # Stages 7-11 sit one level deeper, inside the apply stage.
+        stage7, stage8, stage9, stage10, stage11 = (ship_step(n, " " * 8) for n in range(7, 12))
 
         # ── Pipeline-level blocks ───────────────────────────────────────
         parameters_block = (
@@ -871,7 +675,16 @@ EOM
         env_lines = [
             "        FLUID_LOG_LEVEL = 'INFO'",
             "        FLUID_CONFIG_PATH = './fluid_config'",
+            "        // fluid ship reads every parameter from here. A build that has",
+            "        // none yet (a new job's first) gets each declared default.",
+            '        FLUID_RUN_ID = "${env.BUILD_TAG}"',
         ]
+        for name in ("CONTRACT", *_thin.ship_variables(), "APPLY_APPROVAL"):
+            if name in P:
+                default = _groovy_sq(P[name].default)
+                env_lines.append(
+                    f'        {name} = "${{params.{name} == null ? {default} : params.{name}}}"'
+                )
         if install_mode == "pypi":
             env_lines += [
                 "        // Stage 0 installs fluid here; every stage runs it from here.",
@@ -941,6 +754,118 @@ EOM
 
         stage3_when = when(3)
         stage4_when = when(4, f"fileExists('{W}dist/artifacts/MANIFEST.json')")
+        branch = config.default_branch or "main"
+        on_main = (
+            "not { changeRequest() }; "
+            f"anyOf {{ expression {{ return env.BRANCH_NAME == null }}; branch '{branch}' }}"
+        )
+        apply_stages = f"""stage('7 - apply') {{
+    {when(7).strip()}
+    steps {{
+{stage7}
+        // `fluid apply --report` writes runtime/apply-report.html for the
+        // modes that apply DDL; a *-and-build mode hands over to the build
+        // runner, whose record of each run is the JSON under .fluid/runs/.
+        archiveArtifacts artifacts: '{W}runtime/apply-report.html,{W}**/.fluid/runs/**/*.json', fingerprint: true, allowEmptyArchive: true
+    }}
+}}
+
+// Stage 8: enforces the IAM / GRANT bindings stage 3 wrote (checks them
+// after a dry-run apply); skipped without dist/artifacts/policy/bindings.json.
+stage('8 - policy apply') {{
+    {when(8).strip()}
+    steps {{
+{stage8}
+    }}
+}}
+
+// Stage 9: reconciles the applied target with the contract; skipped after
+// a dry-run apply, which applied nothing.
+stage('9 - verify') {{
+    {when(9).strip()}
+    steps {{
+{stage9}
+        archiveArtifacts artifacts: '{W}runtime/verify-report.json', fingerprint: true, allowEmptyArchive: true
+    }}
+}}
+
+// Stage 10: publishes to the PUBLISH_TARGETS catalogs (names, never endpoints).
+stage('10 - publish') {{
+    {when(10).strip()}
+    steps {{
+{stage10}
+    }}
+}}
+
+// Stage 11: syncs the generated DAGs to SCHEDULER; skipped without one, or
+// without DAGs in dist/artifacts/schedule/.
+stage('11 - schedule sync') {{
+    {when(11).strip()}
+    steps {{
+{stage11}
+        archiveArtifacts artifacts: '{W}runtime/schedule-sync-report.json', fingerprint: true, allowEmptyArchive: true
+    }}
+}}"""
+        # --add: the add-on stages. security and sbom run before the approval
+        # (sbom on the default branch only); compliance after apply.
+        add_ons = _thin.check_add_ons(config.add_ons)
+        add_on_archive = {
+            "security": "runtime/osv-results.sarif",
+            "compliance": "runtime/compliance-report.json",
+            "sbom": "runtime/sbom.spdx.json",
+        }
+
+        def add_on_stage(add_on: str, when_main: bool) -> str:
+            condition = f"            when {{ allOf {{ {on_main} }} }}\n" if when_main else ""
+            script = _sh_step(
+                _thin.add_on_script(add_on, config.contract_path or "contract.fluid.yaml"), CD
+            )
+            return (
+                f"        stage('{_thin.ADD_ON_TITLES[add_on]}') {{\n"
+                f"{condition}"
+                "            steps {\n"
+                f"{script}\n"
+                f"                archiveArtifacts artifacts: '{W}{add_on_archive[add_on]}', "
+                "allowEmptyArchive: true\n"
+                "            }\n"
+                "        }\n\n"
+            )
+
+        add_ons_before = "".join(
+            add_on_stage(a, a == "sbom") for a in add_ons if a in ("security", "sbom")
+        )
+        add_ons_after = "".join(add_on_stage(a, True) for a in add_ons if a == "compliance")
+        apply_block = f"""        // ═════════════════════════════════════════════════════════════
+        // Stages 7-11 change the target, so a change request (a pull
+        // request build) stops after stage 6 with its reviewed plan
+        // archived. A branch build applies on {branch} only (or in a job
+        // that builds no branch), after a person approves the plan
+        // (APPLY_APPROVAL), one build per environment at a time.
+        // ═════════════════════════════════════════════════════════════
+        stage('Approve apply') {{
+            when {{
+                allOf {{
+                    {on_main}
+                    expression {{ return {_when_on(P['APPLY_APPROVAL'])} }}
+                    expression {{ return {_when_on(P[toggles[7]])} }}
+                }}
+            }}
+            steps {{
+                input message: "Apply the reviewed plan (runtime/plan.json) to ${{env.FLUID_ENV}}?", ok: 'Apply'
+                // A newer build that passes here aborts older ones still
+                // waiting, so a stale plan is never applied after a newer one.
+                milestone(label: 'apply approved')
+            }}
+        }}
+
+        stage('apply (stages 7-11)') {{
+            when {{ allOf {{ {on_main} }} }}
+            options {{ lock(resource: "fluid-apply-${{env.FLUID_ENV}}", inversePrecedence: true) }}
+            stages {{
+{textwrap.indent(apply_stages, ' ' * 16)}
+            }}
+        }}
+"""
 
         jenkins_pipeline = f"""
 pipeline {{
@@ -1071,7 +996,6 @@ pipeline {{
         stage('5 - diff (drift gate)') {{
 {when(5)}
             steps {{
-                // ``fluid diff`` takes ``--out``, NOT ``--report``.
 {stage5}
                 archiveArtifacts artifacts: '{W}runtime/diff-report.json', fingerprint: true, allowEmptyArchive: true
             }}
@@ -1093,99 +1017,15 @@ pipeline {{
             }}
         }}
 
-        // ═════════════════════════════════════════════════════════════
-        // Stage 7 — apply (structural)
-        // Six-mode DDL matrix. Destructive modes (replace*) require
-        // ALLOW_DATA_LOSS when FLUID_ENV != dev or target has rows.
-        // ═════════════════════════════════════════════════════════════
-        stage('7 - apply') {{
-{when(7)}
-            // SECURITY: parameters reach the shell as the environment
-            // variables Jenkins exports for them, never Groovy-
-            // concatenated into the script: a pattern that expanded
-            //   "--mode amend-and-build --build-id " + params.APPLY_BUILD_ID
-            // unquoted let APPLY_BUILD_ID="x --allow-data-loss" add argv
-            // tokens (auth-gate bypass). POSIX `set --` + if/then/fi
-            // composes argv so each "$VAR" expansion is one token.
-            steps {{
-{stage7}
-                // `fluid apply --report` writes runtime/apply-report.html for the
-                // modes that apply DDL; a *-and-build mode hands over to the
-                // build runner, whose record of each run is the JSON under the
-                // source contract's .fluid/runs/.
-                archiveArtifacts artifacts: '{W}runtime/apply-report.html,{W}**/.fluid/runs/**/*.json', fingerprint: true, allowEmptyArchive: true
-            }}
-        }}
-
-        // ═════════════════════════════════════════════════════════════
-        // Stage 8 — policy apply (structural)
-        // Enforces IAM/GRANT bindings. Runs AFTER apply (GRANTs need
-        // target objects) and BEFORE verify (transform on under-authed
-        // objects surfaces as policy failure, not masked build error).
-        // Self-gated on dist/artifacts/policy/bindings.json existence.
-        // ═════════════════════════════════════════════════════════════
-        stage('8 - policy apply') {{
-{when(8)}
-            steps {{
-                // ``fluid policy-apply`` does NOT accept a --report flag;
-                // its report goes to stdout, captured to the file.
-{stage8}
-                archiveArtifacts artifacts: '{W}runtime/policy-apply-report.json', fingerprint: true, allowEmptyArchive: true
-            }}
-        }}
-
-        // ═════════════════════════════════════════════════════════════
-        // Stage 9 — verify (structural)
-        // Post-apply reconciliation. Catches silent DDL coercions
-        // (TIMESTAMP_NTZ → LTZ, Redshift length truncations, etc.).
-        // ═════════════════════════════════════════════════════════════
-        stage('9 - verify') {{
-{when(9)}
-            steps {{
-                // ``fluid verify`` takes ``--out``, NOT ``--report``.
-{stage9}
-                archiveArtifacts artifacts: '{W}runtime/verify-report.json', fingerprint: true, allowEmptyArchive: true
-            }}
-        }}
-
-        // ═════════════════════════════════════════════════════════════
-        // Stage 10 — publish (publication)
-        // Multi-target catalog publisher. Push to CC / DMM / DataHub /
-        // Collibra / Alation / marketplace / blob storage. The result
-        // document (`--format json`) is archived.
-        // ═════════════════════════════════════════════════════════════
-        stage('10 - publish') {{
-{when(10)}
-            steps {{
-{stage10}
-                archiveArtifacts artifacts: '{W}runtime/publish-report.json', fingerprint: true, allowEmptyArchive: true
-            }}
-        }}
-
-        // ═════════════════════════════════════════════════════════════
-        // Stage 11 — schedule sync (publication, Path A only)
-        // Pushes generated DAGs to the scheduler's control plane.
-        // Path B (EventBridge / MWAA / Snowflake Tasks) is applied in
-        // Stage 7 via SchedulePlanner.
-        // ═════════════════════════════════════════════════════════════
-        stage('11 - schedule sync') {{
-{when(11)}
-            steps {{
-                // Use POSIX `set --` rather than bash arrays so this runs
-                // under Jenkins's default `/bin/sh` invocation. Each $VAR
-                // is quoted — one argv token per expansion — so a
-                // malicious value stays a single token that our CLI then
-                // rejects in _validate_destination / _validate_safe_ident.
-                // Self-gated on a scheduler and on generated DAG files
-                // (reference-only contracts, stage 3 not run, or no
-                // scheduled build): nothing to sync is not a failure.
-{stage11}
-                archiveArtifacts artifacts: '{W}runtime/schedule-sync-report.json', fingerprint: true, allowEmptyArchive: true
-            }}
-        }}
+{add_ons_before}{apply_block}{add_ons_after}
     }}
 
     post {{
+        always {{
+            // ship's run report: every stage's status, reason, argv and exit code.
+            archiveArtifacts artifacts: '{W}runtime/ship-report.json,{W}runtime/ship-junit.xml', allowEmptyArchive: true
+            junit allowEmptyResults: true, testResults: '{W}runtime/ship-junit.xml'
+        }}
         success {{
 {post_success_block}
         }}
@@ -1246,10 +1086,15 @@ pipeline {{
                 "",
             ]
         lines += [
-            "Every parameter below has a default, and every stage reads it with the",
-            "same default as its fallback: Jenkins runs a job's first build, and its",
-            "first after the job lost its parameter definitions (a restart that",
-            "re-seeds jobs from job-dsl or JCasC), with no parameters exported.",
+            "Every stage runs `fluid ship --stage N` (see `fluid ship --help`), which",
+            "reads the parameters from the environment {} block. Each parameter has a",
+            "default there too: Jenkins runs a job's first build, and its first after",
+            "the job lost its parameter definitions (a restart that re-seeds jobs",
+            "from job-dsl or JCasC), with no parameters.",
+            "",
+            "A change request (pull request build) stops after stage 6. A branch build",
+            "applies after a person approves (APPLY_APPROVAL, an input step), one build",
+            "per environment at a time (lockable-resources).",
             "",
         ]
         return "".join(f"// {line}".rstrip() + "\n" for line in lines)
@@ -1257,7 +1102,7 @@ pipeline {{
     @staticmethod
     def required_plugins(config: PipelineConfig) -> List[str]:
         """The Jenkins plugins (update-center ids) the generated file needs."""
-        plugins = ["workflow-aggregator", "git"]
+        plugins = ["workflow-aggregator", "git", "lockable-resources", "junit"]
         if config.diff_last_applied:
             plugins.append("copyartifact")
         return plugins

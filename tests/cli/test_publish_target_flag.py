@@ -258,93 +258,81 @@ class TestTargetResolution:
 
 
 class TestPipelineTemplateCommands:
-    """``_get_fluid_commands`` now exposes stage-5 (diff), stage-9 (verify),
-    and a ``--target``-aware stage-10 (publish). These are referenced by
-    every CI template; tests pin the shape so Phase 7's 6-CI-system port
-    can't silently drop them."""
+    """The diff (stage 5), verify (stage 9) and ``--target``-aware publish
+    (stage 10) commands every generated pipeline runs are built by ``fluid
+    ship`` (``_ship_stages.build_stage``), not by a template: these tests pin
+    their argv so a generated pipeline cannot silently drop them."""
 
-    def _cmds(self):
-        from fluid_build.forge.core.pipeline_templates import BasePipelineTemplate
+    @staticmethod
+    def _argv(num, env=None, tmp_path=None):
+        from fluid_build.cli import _ship_stages as st
+        from fluid_build.cli import ship
 
-        return BasePipelineTemplate()._get_fluid_commands()
+        parser = argparse.ArgumentParser()
+        ship.register(parser.add_subparsers(dest="command"))
+        opts = st.resolve_options(
+            parser.parse_args(["ship", "--yes"]), "contract.fluid.yaml", env or {}
+        )
+        return st.build_stage(num, opts, st.Workspace(tmp_path or Path.cwd())).argv
 
     def test_diff_command_present_with_exit_on_drift(self):
-        cmds = self._cmds()
-        assert "diff" in cmds
-        assert "--exit-on-drift" in cmds["diff"]
-        # Must reference the ${CONTRACT} default so Build Now works.
-        assert "${CONTRACT:-contract.fluid.yaml}" in cmds["diff"]
+        argv = self._argv(5, {"FLUID_ENV": "staging"})
+        assert argv[0] == "diff"
+        assert "--exit-on-drift" in argv
+        # Reads the stage-1 bundle, which already names the contract.
+        assert argv[1] == "runtime/bundle.tgz"
         # Must pass --env so dev/staging/prod have different drift baselines.
-        assert "--env" in cmds["diff"]
+        assert argv[argv.index("--env") + 1] == "staging"
 
     def test_verify_command_present_with_strict(self):
-        cmds = self._cmds()
-        assert "verify" in cmds
-        assert "--strict" in cmds["verify"]
-        assert "${CONTRACT:-contract.fluid.yaml}" in cmds["verify"]
-        # Writes a JSON report — CI artifact uploads need a deterministic
-        # path. ``fluid verify`` accepts ``--out`` (NOT ``--report`` —
-        # that's apply's flag); the prior assertion pinned a runtime bug.
-        assert "--out" in cmds["verify"]
-        assert "verify-report.json" in cmds["verify"]
+        argv = self._argv(9)
+        assert argv[0] == "verify"
+        assert "--strict" in argv
+        # Writes a JSON report: CI artifact uploads need a deterministic path.
+        # ``fluid verify`` accepts ``--out`` (NOT ``--report``: that's apply's flag).
+        assert argv[argv.index("--out") + 1] == "runtime/verify-report.json"
 
     def test_publish_catalog_uses_target_flag(self):
-        cmds = self._cmds()
-        # --target is the canonical flag post-Phase 5. Must appear.
-        assert "--target" in cmds["publish_catalog"]
+        argv = self._argv(10, {"PUBLISH_TARGETS": "datahub"})
+        # --target is the canonical flag; ``--catalog`` is a deprecated alias.
+        assert "--target=datahub" in argv
+        assert "--catalog" not in argv
 
     def test_publish_catalog_supports_multiple_targets_env(self):
-        """PUBLISH_TARGETS is the space-separated multi-target env; the
-        template expands it into ``--target X --target Y``. Without this,
-        teams publishing to 3 catalogs would need 3 separate CI jobs."""
-        cmd = self._cmds()["publish_catalog"]
-        assert "PUBLISH_TARGETS" in cmd
+        """PUBLISH_TARGETS is the space-separated multi-target env; ship expands
+        it into one ``--target`` each. Without this, teams publishing to 3
+        catalogs would need 3 separate CI jobs."""
+        argv = self._argv(10, {"PUBLISH_TARGETS": "datahub fluid-command-center collibra"})
+        assert [a for a in argv if a.startswith("--target=")] == [
+            "--target=datahub",
+            "--target=fluid-command-center",
+            "--target=collibra",
+        ]
 
     def test_publish_catalog_falls_back_to_single_catalog_env(self):
-        """When PUBLISH_TARGETS is unset, fall back to the legacy single
-        CATALOG env so existing CI installations keep working."""
-        cmd = self._cmds()["publish_catalog"]
-        assert "${CATALOG:-datamesh-manager}" in cmd
+        """When PUBLISH_TARGETS is unset, fall back to the legacy single CATALOG
+        env so existing CI installations keep working."""
+        assert "--target=datahub" in self._argv(10, {"CATALOG": "datahub"})
+        assert "--target=datamesh-manager" in self._argv(10, {})
 
     def test_publish_catalog_publishes_the_env_the_other_stages_use(self):
-        """Both branches pass ``--env``, as diff/plan/apply/verify do, so the
-        catalog gets the overlay's binding and not the base contract's."""
-        cmd = self._cmds()["publish_catalog"]
-        assert cmd.count('--env "${FLUID_ENV:-dev}"') == 2
+        """Publish passes ``--env``, as diff/plan/apply/verify do, so the catalog
+        gets the overlay's binding and not the base contract's."""
+        argv = self._argv(10, {"FLUID_ENV": "aws"})
+        assert argv[argv.index("--env") + 1] == "aws"
+        for num in (5, 6, 7, 9):
+            assert "aws" in (self._argv(num, {"FLUID_ENV": "aws"}) or []), num
 
-    @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
-    @pytest.mark.parametrize(
-        ("branch_env", "expected_target"),
-        [
-            ({"PUBLISH_TARGETS": "command-center"}, "command-center"),
-            (
-                {"DMM_API_URL": "https://dmm.example", "CATALOG": "datamesh-manager"},
-                "datamesh-manager",
-            ),
-        ],
-    )
-    def test_publish_catalog_passes_a_hostile_env_as_one_argument(
-        self, tmp_path, branch_env, expected_target
-    ):
-        """Run the rendered command with ``sh`` and a ``fluid`` stub that prints
-        its argv. Unquoted, a FLUID_ENV holding spaces became extra flags: a
-        second ``--target command-center:<endpoint>`` sends the API key to that
-        endpoint. ``fluid publish --env`` then refuses the one odd token."""
-        _run_rendered_publish(
-            tmp_path,
-            self._cmds()["publish_catalog"],
-            branch_env,
-            ["publish", "c.yaml", "--target", expected_target, "--env"],
-        )
+    def test_a_hostile_env_is_refused_before_any_stage_runs(self):
+        """An unquoted FLUID_ENV holding spaces used to become extra flags in the
+        shell: a second ``--target command-center:<endpoint>`` sends the API key
+        to that endpoint. Ship holds the name to the grammar every stage's
+        ``--env`` accepts, up front, and builds argv as a list, never a shell
+        line."""
+        from fluid_build.cli import _ship_stages as st
 
-    def test_publish_catalog_no_longer_uses_deprecated_flag(self):
-        """After Phase 5, the template must not emit ``fluid publish
-        ... --catalog`` — that flag is a deprecation-warned alias and
-        generated pipelines shouldn't perpetuate the warning."""
-        cmd = self._cmds()["publish_catalog"]
-        # ``--catalog`` as a CLI flag must NOT appear; bare word "catalog"
-        # in a comment is fine but we guard the flag form specifically.
-        assert "--catalog " not in cmd and "--catalog $" not in cmd
+        with pytest.raises(st.ShipUsageError, match="is not an environment name"):
+            self._argv(10, {"FLUID_ENV": _HOSTILE_ENV})
 
 
 # ---------------------------------------------------------------------------
@@ -443,21 +431,3 @@ class TestOdcsOutputPortLinkage:
 
 
 _HOSTILE_ENV = "aws --target command-center:https://elsewhere.example $(touch pwned) `touch pwned2`"
-
-
-def _run_rendered_publish(
-    tmp_path: Path, command: str, extra_env: dict, expected_prefix: list
-) -> None:
-    """Run a rendered stage-10 shell body with a ``fluid`` stub; assert the
-    hostile ``FLUID_ENV`` reaches ``fluid`` as one argument and runs nothing."""
-    stub = tmp_path / "fluid"
-    stub.write_text('#!/bin/sh\nfor a in "$@"; do printf \'%s\\n\' "$a"; done\n')
-    stub.chmod(0o755)
-    env = {"PATH": f"{tmp_path}:/usr/bin:/bin", "CONTRACT": "c.yaml", "FLUID_ENV": _HOSTILE_ENV}
-    env.update(extra_env)
-    out = subprocess.run(
-        ["sh", "-c", command], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30
-    )
-    assert out.returncode == 0, out.stderr
-    assert out.stdout.splitlines() == [*expected_prefix, _HOSTILE_ENV]
-    assert not list(tmp_path.glob("pwned*"))

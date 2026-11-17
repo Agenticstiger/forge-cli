@@ -4,8 +4,7 @@
 """Tests for the auto-CI hook inside ``run_ai_copilot_mode``.
 
 These tests exercise ``_resolve_ci_choice`` and ``_scaffold_ci_pipeline``
-directly, plus the forge argparse wiring for ``--ci`` / ``--ci-complexity``
-/ ``--no-ci``. Full end-to-end ``run_ai_copilot_mode`` coverage for
+directly, plus the forge argparse wiring for ``--ci`` / ``--no-ci``. Full end-to-end ``run_ai_copilot_mode`` coverage for
 non-interactive silent-skip already lives in ``test_forge_modes_ext.py``.
 """
 
@@ -19,7 +18,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from fluid_build.cli.forge_modes import (
-    _CI_COMPLEXITY_VALUES,
     _CI_PROVIDER_VALUES,
     _resolve_ci_choice,
     _scaffold_ci_pipeline,
@@ -33,7 +31,6 @@ def _get_cli_arg(args, name, default=None):
 def _make_args(**overrides):
     defaults = dict(
         ci=None,
-        ci_complexity="standard",
         no_ci=False,
         non_interactive=True,
         dry_run=False,
@@ -51,7 +48,7 @@ class TestResolveCiChoice(unittest.TestCase):
     def test_killswitch_forces_skip(self):
         with patch.dict(os.environ, {"FLUID_FORGE_AUTO_CI": "0"}, clear=False):
             args = _make_args(ci="github_actions")
-            prov, _ = _resolve_ci_choice(
+            prov = _resolve_ci_choice(
                 args,
                 {},
                 is_interactive=False,
@@ -62,7 +59,7 @@ class TestResolveCiChoice(unittest.TestCase):
 
     def test_no_ci_flag_forces_skip(self):
         args = _make_args(no_ci=True, ci="github_actions")
-        prov, _ = _resolve_ci_choice(
+        prov = _resolve_ci_choice(
             args,
             {},
             is_interactive=True,
@@ -73,7 +70,7 @@ class TestResolveCiChoice(unittest.TestCase):
 
     def test_ci_none_sentinel_skips(self):
         args = _make_args(ci="none")
-        prov, _ = _resolve_ci_choice(
+        prov = _resolve_ci_choice(
             args,
             {},
             is_interactive=True,
@@ -83,8 +80,8 @@ class TestResolveCiChoice(unittest.TestCase):
         self.assertIsNone(prov)
 
     def test_explicit_provider_non_interactive(self):
-        args = _make_args(ci="github_actions", ci_complexity="advanced")
-        prov, complexity = _resolve_ci_choice(
+        args = _make_args(ci="github_actions")
+        prov = _resolve_ci_choice(
             args,
             {},
             is_interactive=False,
@@ -92,13 +89,12 @@ class TestResolveCiChoice(unittest.TestCase):
             get_cli_arg_fn=_get_cli_arg,
         )
         self.assertEqual(prov, "github_actions")
-        self.assertEqual(complexity, "advanced")
 
     def test_non_interactive_without_flag_and_no_context_skips(self):
         """Non-interactive + no flag + empty context → silent skip."""
         args = _make_args()  # ci=None, non_interactive=True
         ask_mock = MagicMock()
-        prov, _ = _resolve_ci_choice(
+        prov = _resolve_ci_choice(
             args,
             {},  # no ci-state / memory context either
             is_interactive=False,
@@ -118,24 +114,20 @@ class TestResolveCiChoice(unittest.TestCase):
         """
         args = _make_args()  # ci=None, non_interactive=True
         ask_mock = MagicMock()
-        prov, complexity = _resolve_ci_choice(
+        prov = _resolve_ci_choice(
             args,
-            {"ci_provider": "github_actions", "ci_complexity": "advanced"},
+            {"ci_provider": "github_actions"},
             is_interactive=False,
             ask_dialog_question_fn=ask_mock,
             get_cli_arg_fn=_get_cli_arg,
         )
         self.assertEqual(prov, "github_actions")
-        # complexity in args wins over context when both are set, but
-        # context["ci_complexity"] is the fallback.  _make_args sets
-        # ci_complexity="standard" by default, which is used here.
-        self.assertEqual(complexity, "standard")
         ask_mock.assert_not_called()
 
     def test_non_interactive_with_unknown_provider_in_context_skips(self):
         """Unknown provider in context falls back to silent skip."""
         args = _make_args()
-        prov, _ = _resolve_ci_choice(
+        prov = _resolve_ci_choice(
             args,
             {"ci_provider": "not-a-real-provider"},
             is_interactive=False,
@@ -146,14 +138,9 @@ class TestResolveCiChoice(unittest.TestCase):
 
     def test_interactive_ask_opens_menu_and_uses_memory_default(self):
         args = _make_args(ci="ask", non_interactive=False)
-        # Fake dialog result — user picks jenkins then keeps advanced complexity
-        ask_mock = MagicMock(
-            side_effect=[
-                MagicMock(value="jenkins"),
-                MagicMock(value="advanced"),
-            ]
-        )
-        prov, complexity = _resolve_ci_choice(
+        # Fake dialog result: the user picks jenkins
+        ask_mock = MagicMock(return_value=MagicMock(value="jenkins"))
+        prov = _resolve_ci_choice(
             args,
             {"ci_provider": "github_actions"},
             is_interactive=True,
@@ -161,13 +148,13 @@ class TestResolveCiChoice(unittest.TestCase):
             get_cli_arg_fn=_get_cli_arg,
         )
         self.assertEqual(prov, "jenkins")
-        self.assertEqual(complexity, "advanced")
-        self.assertEqual(ask_mock.call_count, 2)
+        # The provider is the only question.
+        self.assertEqual(ask_mock.call_count, 1)
 
     def test_interactive_menu_cancel_returns_none(self):
         args = _make_args(non_interactive=False)
         ask_mock = MagicMock(return_value=MagicMock(value=None))
-        prov, _ = _resolve_ci_choice(
+        prov = _resolve_ci_choice(
             args,
             {},
             is_interactive=True,
@@ -175,13 +162,12 @@ class TestResolveCiChoice(unittest.TestCase):
             get_cli_arg_fn=_get_cli_arg,
         )
         self.assertIsNone(prov)
-        # Only one call — we bail before complexity prompt
         self.assertEqual(ask_mock.call_count, 1)
 
     def test_unknown_provider_flag_warns_and_skips(self):
         args = _make_args(ci="not-a-real-provider")
         console = MagicMock()
-        prov, _ = _resolve_ci_choice(
+        prov = _resolve_ci_choice(
             args,
             {},
             is_interactive=False,
@@ -193,17 +179,6 @@ class TestResolveCiChoice(unittest.TestCase):
         console.print.assert_called()
         self.assertIn("Unknown CI provider", str(console.print.call_args))
 
-    def test_invalid_complexity_falls_back_to_standard(self):
-        args = _make_args(ci="jenkins", ci_complexity="hyperdrive")
-        _, complexity = _resolve_ci_choice(
-            args,
-            {},
-            is_interactive=False,
-            ask_dialog_question_fn=MagicMock(),
-            get_cli_arg_fn=_get_cli_arg,
-        )
-        self.assertEqual(complexity, "standard")
-
 
 # ---------------------------------------------------------------------------
 # _scaffold_ci_pipeline — full hook with real PipelineTemplateGenerator
@@ -214,8 +189,8 @@ class TestScaffoldCiPipeline(unittest.TestCase):
     def test_explicit_flag_writes_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp)
-            args = _make_args(ci="github_actions", ci_complexity="basic")
-            prov, complexity = _scaffold_ci_pipeline(
+            args = _make_args(ci="github_actions")
+            prov = _scaffold_ci_pipeline(
                 args,
                 target,
                 {},
@@ -225,7 +200,6 @@ class TestScaffoldCiPipeline(unittest.TestCase):
                 dry_run=False,
             )
             self.assertEqual(prov, "github_actions")
-            self.assertEqual(complexity, "basic")
             created = list(target.rglob("*.yml"))
             self.assertTrue(any(".github/workflows" in str(p) for p in created))
 
@@ -233,7 +207,7 @@ class TestScaffoldCiPipeline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp)
             args = _make_args(no_ci=True)
-            prov, _ = _scaffold_ci_pipeline(
+            prov = _scaffold_ci_pipeline(
                 args,
                 target,
                 {},
@@ -250,7 +224,7 @@ class TestScaffoldCiPipeline(unittest.TestCase):
             target = Path(tmp)
             args = _make_args()
             ask_mock = MagicMock()
-            prov, _ = _scaffold_ci_pipeline(
+            prov = _scaffold_ci_pipeline(
                 args,
                 target,
                 {},
@@ -267,7 +241,7 @@ class TestScaffoldCiPipeline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp)
             args = _make_args(ci="jenkins", dry_run=True)
-            prov, _ = _scaffold_ci_pipeline(
+            prov = _scaffold_ci_pipeline(
                 args,
                 target,
                 {},
@@ -290,8 +264,8 @@ class TestScaffoldCiPipeline(unittest.TestCase):
             for name in ("fluid-basic.yml", "fluid-pipeline.yml"):
                 (wf / name).write_text("# existing\n")
 
-            args = _make_args(ci="github_actions", ci_complexity="basic")
-            prov, _ = _scaffold_ci_pipeline(
+            args = _make_args(ci="github_actions")
+            prov = _scaffold_ci_pipeline(
                 args,
                 target,
                 {},
@@ -309,7 +283,7 @@ class TestScaffoldCiPipeline(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 target = Path(tmp)
                 args = _make_args(ci="github_actions")
-                prov, _ = _scaffold_ci_pipeline(
+                prov = _scaffold_ci_pipeline(
                     args,
                     target,
                     {},
@@ -324,8 +298,8 @@ class TestScaffoldCiPipeline(unittest.TestCase):
     def test_gitlab_ci_provider_writes_gitlab_yaml(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp)
-            args = _make_args(ci="gitlab_ci", ci_complexity="standard")
-            prov, _ = _scaffold_ci_pipeline(
+            args = _make_args(ci="gitlab_ci")
+            prov = _scaffold_ci_pipeline(
                 args,
                 target,
                 {},
@@ -356,7 +330,7 @@ class TestForgeCiParser(unittest.TestCase):
         parser = self._parser()
         args = parser.parse_args(["forge"])
         self.assertIsNone(args.ci)
-        self.assertEqual(args.ci_complexity, "standard")
+        self.assertFalse(hasattr(args, "ci_complexity"))
         self.assertFalse(args.no_ci)
 
     def test_ci_explicit_provider(self):
@@ -384,14 +358,14 @@ class TestForgeCiParser(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(["forge", "--ci", "not-real"])
 
-    def test_rejects_unknown_complexity(self):
+    def test_ci_complexity_flag_is_gone(self):
         parser = self._parser()
         with self.assertRaises(SystemExit):
-            parser.parse_args(["forge", "--ci-complexity", "hyperdrive"])
+            parser.parse_args(["forge", "--ci-complexity", "standard"])
 
 
 # ---------------------------------------------------------------------------
-# Taxonomy — ci_provider / ci_complexity normalization
+# Taxonomy: ci_provider normalization
 # ---------------------------------------------------------------------------
 
 
@@ -421,20 +395,12 @@ class TestCiTaxonomyNormalization(unittest.TestCase):
         self.assertIsNone(normalize_ci_provider(""))
         self.assertIsNone(normalize_ci_provider(None))
 
-    def test_complexity_normalization(self):
-        from fluid_build.cli.forge_copilot_taxonomy import normalize_ci_complexity
-
-        self.assertEqual(normalize_ci_complexity("BASIC"), "basic")
-        self.assertEqual(normalize_ci_complexity(" standard "), "standard")
-        self.assertIsNone(normalize_ci_complexity("hyperdrive"))
-        self.assertIsNone(normalize_ci_complexity(None))
-
-    def test_normalize_copilot_context_canonicalizes_ci_fields(self):
+    def test_normalize_copilot_context_canonicalizes_ci_provider_and_drops_complexity(self):
         from fluid_build.cli.forge_copilot_taxonomy import normalize_copilot_context
 
-        result = normalize_copilot_context({"ci_provider": "gh", "ci_complexity": "ADVANCED"})
+        result = normalize_copilot_context({"ci_provider": "gh", "ci_complexity": "advanced"})
         self.assertEqual(result["ci_provider"], "github_actions")
-        self.assertEqual(result["ci_complexity"], "advanced")
+        self.assertNotIn("ci_complexity", result)
 
     def test_normalize_copilot_context_drops_invalid_ci_values(self):
         from fluid_build.cli.forge_copilot_taxonomy import normalize_copilot_context
@@ -464,12 +430,6 @@ class TestCiConstants(unittest.TestCase):
 
         enum_values = {_normalise(p.value) for p in PipelineProvider}
         self.assertEqual(_CI_PROVIDER_VALUES, enum_values)
-
-    def test_complexity_values_match_pipeline_complexity_enum(self):
-        from fluid_build.forge.core.pipeline_templates import PipelineComplexity
-
-        enum_values = {c.value for c in PipelineComplexity}
-        self.assertEqual(_CI_COMPLEXITY_VALUES, enum_values)
 
 
 if __name__ == "__main__":

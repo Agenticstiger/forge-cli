@@ -113,7 +113,7 @@ class TestWritePipelineFilesWithHeader:
         expected_comment: str,
         tmp_path: Path,
     ):
-        config = build_pipeline_config(provider=provider, complexity="standard")
+        config = build_pipeline_config(provider=provider)
         files = PipelineTemplateGenerator().generate_pipeline(config)
 
         written = write_pipeline_files(
@@ -136,7 +136,7 @@ class TestWritePipelineFilesWithHeader:
         expected_comment: str,
         tmp_path: Path,
     ):
-        config = build_pipeline_config(provider=provider, complexity="standard")
+        config = build_pipeline_config(provider=provider)
         files = PipelineTemplateGenerator().generate_pipeline(config)
 
         # Capture the original (unheaded) content so we can assert the body survives
@@ -158,7 +158,7 @@ class TestWritePipelineFilesWithHeader:
 
 class TestWritePipelineFilesHeaderOptOut:
     def test_inject_header_false_produces_clean_output(self, tmp_path: Path):
-        config = build_pipeline_config(provider="gitlab_ci", complexity="basic")
+        config = build_pipeline_config(provider="gitlab_ci")
         files = PipelineTemplateGenerator().generate_pipeline(config)
 
         written = write_pipeline_files(
@@ -175,8 +175,8 @@ class TestWritePipelineFilesHeaderOptOut:
 
 
 class TestBuildCIStatePayload:
-    def test_records_provider_complexity_and_files(self, tmp_path: Path):
-        config = build_pipeline_config(provider="github_actions", complexity="standard")
+    def test_records_provider_add_ons_and_files(self, tmp_path: Path):
+        config = build_pipeline_config(provider="github_actions")
         files = PipelineTemplateGenerator().generate_pipeline(config)
         written = write_pipeline_files(
             files,
@@ -187,17 +187,13 @@ class TestBuildCIStatePayload:
 
         doc = build_ci_state_payload(
             provider="github_actions",
-            complexity="standard",
-            environments=["dev", "staging"],
-            options={"enable_approvals": False},
+            add_ons=["security"],
             written_files=written,
             product_root=tmp_path,
         )
 
         assert doc.provider == "github_actions"
-        assert doc.complexity == "standard"
-        assert doc.environments == ["dev", "staging"]
-        assert doc.options == {"enable_approvals": False}
+        assert doc.add_ons == ["security"]
         assert len(doc.files) == len(written)
         for entry in doc.files:
             assert "path" in entry
@@ -212,9 +208,6 @@ class TestBuildCIStatePayload:
 
         doc = build_ci_state_payload(
             provider="github_actions",
-            complexity="standard",
-            environments=[],
-            options={},
             written_files=written,
             product_root=tmp_path,
         )
@@ -231,9 +224,6 @@ class TestWriteCIState:
     def test_writes_to_dot_fluid_ci_state_json(self, tmp_path: Path):
         doc = build_ci_state_payload(
             provider="github_actions",
-            complexity="standard",
-            environments=["dev"],
-            options={},
             written_files=[],
             product_root=tmp_path,
         )
@@ -249,9 +239,7 @@ class TestWriteCIState:
     def test_payload_has_envelope_and_kind(self, tmp_path: Path):
         doc = build_ci_state_payload(
             provider="jenkins",
-            complexity="advanced",
-            environments=["prod"],
-            options={"enable_approvals": True},
+            add_ons=["compliance", "sbom"],
             written_files=[],
             product_root=tmp_path,
         )
@@ -265,40 +253,33 @@ class TestWriteCIState:
         assert data["schema_version"] == ENVELOPE_SCHEMA_VERSION
         assert data["kind"] == "CIState"
         assert data["provider"] == "jenkins"
-        assert data["complexity"] == "advanced"
-        assert data["environments"] == ["prod"]
-        assert data["options"]["enable_approvals"] is True
+        assert data["add_ons"] == ["compliance", "sbom"]
+        assert "complexity" not in data
 
 
 class TestEndToEndGenerate:
     """Integration: generating a pipeline produces both header AND ci-state."""
 
     def test_github_actions_end_to_end(self, tmp_path: Path):
-        config = build_pipeline_config(provider="github_actions", complexity="standard")
+        config = build_pipeline_config(provider="github_actions")
         files = PipelineTemplateGenerator().generate_pipeline(config)
         written = write_pipeline_files(
             files,
             tmp_path,
-            command="fluid forge --ci github_actions --ci-complexity standard",
+            command="fluid forge --ci github_actions",
             tool_version="0.7.9",
         )
 
         doc = build_ci_state_payload(
             provider="github_actions",
-            complexity="standard",
-            environments=list(config.environments or []),
-            options={
-                "enable_approvals": bool(config.enable_approvals),
-                "enable_security_scan": bool(config.enable_security_scan),
-                "enable_marketplace_publishing": bool(config.enable_marketplace_publishing),
-            },
+            add_ons=list(config.add_ons),
             written_files=written,
             product_root=tmp_path,
         )
         write_ci_state(
             doc,
             tmp_path,
-            command="fluid forge --ci github_actions --ci-complexity standard",
+            command="fluid forge --ci github_actions",
             tool_version="0.7.9",
         )
 

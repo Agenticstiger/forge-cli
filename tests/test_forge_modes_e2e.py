@@ -81,7 +81,6 @@ def _bare_args(**overrides) -> Namespace:
         show_memory=False,
         reset_memory=False,
         ci=None,
-        ci_complexity="standard",
         no_ci=False,
         scaffold=None,
         agent_loop=False,

@@ -96,7 +96,7 @@ class StatusSummary:
     last_forge_flow: Optional[str] = None
     last_init_at: Optional[str] = None
     ci_provider: Optional[str] = None
-    ci_complexity: Optional[str] = None
+    ci_add_ons: List[str] = field(default_factory=list)
     ci_file_count: int = 0
     ci_pristine_count: int = 0
     ci_drifted_count: int = 0
@@ -223,7 +223,7 @@ def _gather_ci_state(product_root: Path, summary: StatusSummary) -> None:
         return
 
     summary.ci_provider = state.provider
-    summary.ci_complexity = state.complexity
+    summary.ci_add_ons = list(state.add_ons)
     summary.ci_file_count = len(state.files)
 
     # Build a pseudo-generated_files dict so classify_ci_drift can
@@ -317,8 +317,9 @@ def _format_last_forge(summary: StatusSummary) -> str:
 def _format_ci(summary: StatusSummary) -> str:
     if not summary.ci_provider:
         return "—"
+    add_ons = f"{', '.join(summary.ci_add_ons)}, " if summary.ci_add_ons else ""
     return (
-        f"{summary.ci_provider} (complexity={summary.ci_complexity}, "
+        f"{summary.ci_provider} ({add_ons}"
         f"{summary.ci_file_count} file{'s' if summary.ci_file_count != 1 else ''})"
     )
 

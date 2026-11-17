@@ -118,7 +118,7 @@ def _write_ci_state(
     product_root: Path,
     *,
     provider: str = "github_actions",
-    complexity: str = "standard",
+    add_ons: list | None = None,
     files: list | None = None,
 ) -> None:
     path = product_ci_state_path(product_root)
@@ -126,9 +126,7 @@ def _write_ci_state(
     body = dump_json_with_envelope(
         {
             "provider": provider,
-            "complexity": complexity,
-            "environments": ["dev"],
-            "options": {},
+            "add_ons": add_ons or [],
             "files": files or [{"path": ".github/workflows/ci.yml", "sha256": "abc"}],
         },
         kind="CIState",
@@ -177,7 +175,7 @@ class TestBuildStatusSummaryFullState:
         _write_contract(tmp_path, product_id="customer-360", domain="retail")
         _write_forge_receipt(tmp_path, flow="copilot")
         _write_init_receipt(tmp_path)
-        _write_ci_state(tmp_path, provider="github_actions", complexity="standard")
+        _write_ci_state(tmp_path, provider="github_actions")
         monkeypatch.chdir(tmp_path)
 
         summary = build_status_summary()
@@ -190,8 +188,29 @@ class TestBuildStatusSummaryFullState:
         assert summary.last_forge_at == "2026-04-11T14:22:18Z"
         assert summary.last_init_at == "2026-04-11T14:00:00Z"
         assert summary.ci_provider == "github_actions"
-        assert summary.ci_complexity == "standard"
+        assert summary.ci_add_ons == []
         assert summary.ci_file_count == 1
+
+    def test_ci_state_add_ons_shown_next_to_provider(self, tmp_path, monkeypatch):
+        from fluid_build.cli.status import _format_ci
+
+        _write_contract(tmp_path)
+        _write_ci_state(tmp_path, add_ons=["security", "sbom"])
+        monkeypatch.chdir(tmp_path)
+
+        summary = build_status_summary()
+
+        assert summary.ci_add_ons == ["security", "sbom"]
+        assert _format_ci(summary) == "github_actions (security, sbom, 1 file)"
+
+    def test_ci_state_without_add_ons_shows_the_provider_only(self, tmp_path, monkeypatch):
+        from fluid_build.cli.status import _format_ci
+
+        _write_contract(tmp_path)
+        _write_ci_state(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        assert _format_ci(build_status_summary()) == "github_actions (1 file)"
 
 
 class TestAuthoringModeDetection:

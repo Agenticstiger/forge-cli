@@ -100,9 +100,36 @@ STAGE_TOGGLES: Dict[int, str] = {
     11: "RUN_STAGE_11_SCHEDULE_SYNC",
 }
 
+#: Every variable :func:`resolve_options` reads, the switches aside: the job
+#: environment a generated wrapper passes through to ship. A test holds this
+#: to what ``resolve_options`` actually reads.
+SHIP_VARIABLES: Tuple[str, ...] = (
+    "FLUID_ENV",
+    "APPLY_MODE",
+    "APPLY_BUILD_ID",
+    "ALLOW_DATA_LOSS",
+    "NO_VERIFY_DIGEST",
+    "PUBLISH_TARGETS",
+    "CATALOG",
+    "SCHEDULER",
+    "SCHEDULER_DESTINATION",
+    "SCHEDULER_ENVIRONMENT_NAME",
+    "SCHEDULER_LOCATION",
+    "SCHEDULER_WORKSPACE",
+    "SCHEDULE_SYNC_DRY_RUN",
+    "VALIDATE_STRICT",
+    "VERIFY_STRICT",
+    "GENERATE_EMIT",
+    "DIFF_EXIT_ON_DRIFT",
+    "DIFF_LAST_APPLIED",
+    "PLAN_HTML",
+    "POLICY_APPLY_MODE",
+)
+
 VALIDATE_REPORT = "runtime/validate-report.json"
 VALIDATE_ARTIFACTS_REPORT = "runtime/validate-artifacts-report.json"
 PLAN_HTML_PATH = "runtime/plan.html"
+SCHEDULE_SYNC_REPORT = "runtime/schedule-sync-report.json"
 
 
 class ShipUsageError(Exception):
@@ -747,6 +774,8 @@ def _schedule_sync(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
             *_env_args(o),
             "--delete-scope",
             "product",
+            "--report",
+            SCHEDULE_SYNC_REPORT,
         ]
         for flag, value in (
             ("--destination", o.scheduler_destination),

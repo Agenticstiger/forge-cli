@@ -22,15 +22,12 @@ Per-system classes live in sibling modules
 each CI system's quirks stay contained and the file count is bounded.
 """
 
-import functools
-import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from fluid_build._env_names import ENV_NAME_RULE, is_env_name
-from fluid_build.cli.console import cprint
 
 from . import _keyless
 
@@ -169,65 +166,6 @@ def default_fluid_package_spec(extras: Optional[List[str]] = None) -> str:
     return f"{FLUID_PACKAGE_NAME}{suffix}=={__version__}"
 
 
-def _needs_bundle(stage: int) -> str:
-    """POSIX sh: fail with a reason when stage 1's bundle is missing, rather
-    than with the reading command's bare "not found"."""
-    return (
-        f"if [ ! -f {BUNDLE_PATH} ]; then "
-        f'echo "stage {stage} reads {BUNDLE_PATH}, which stage 1 writes; '
-        'run stage 1 in the same build" >&2; exit 1; fi; '
-    )
-
-
-def _skip_after_dry_run(stage: int, what: str) -> str:
-    """POSIX sh (after ``MODE`` is set): end the stage when stage 7 ran as a
-    dry run. A dry-run build writes nothing: not the target, the catalog or
-    the scheduler (whose DAG would apply for real)."""
-    return (
-        'if [ "$MODE" = dry-run ] && [ "${RUN_STAGE_7_APPLY:-true}" != "false" ]; then '
-        f'echo "stage {stage}: APPLY_MODE dry-run applied nothing, so {what} — skipped '
-        '(APPLY_MODE amend or amend-and-build applies)"; '
-        "exit 0; fi; "
-    )
-
-
-def apply_build_id_sh(build_id_expansion: str) -> str:
-    """POSIX sh (after ``MODE`` and ``set --`` are set): append ``--build-id``
-    only when the mode runs builds, and say so when a build id is ignored.
-
-    ``fluid apply`` refuses ``--build-id`` with any other mode
-    (``apply_build_id_requires_build_mode``), and the mode is never
-    rewritten to fit the id: the plan stage 6 made is for APPLY_MODE, and
-    ``fluid apply`` refuses a plan made for a different mode.
-    """
-    modes = "|".join(BUILD_APPLY_MODES)
-    return (
-        f'BUILD_ID="{build_id_expansion}"; '
-        f'case "$MODE" in {modes}) '
-        'if [ -n "$BUILD_ID" ]; then set -- "$@" --build-id "$BUILD_ID"; fi ;; '
-        '*) if [ -n "$BUILD_ID" ]; then echo "APPLY_BUILD_ID is not passed on: '
-        'APPLY_MODE $MODE runs no build (amend-and-build and replace-and-build do)"; fi ;; '
-        "esac; "
-    )
-
-
-try:
-    import yaml
-except ImportError:
-    # Fallback YAML implementation
-    class _YamlFallback:
-        def dump(self, data, **kwargs):
-            return json.dumps(data, indent=kwargs.get("indent", 2))
-
-        def dump_all(self, documents, **kwargs):
-            results = []
-            for doc in documents:
-                results.append(self.dump(doc, **kwargs))
-            return "\n---\n".join(results)
-
-    yaml = _YamlFallback()
-
-
 class PipelineProvider(Enum):
     """Supported CI/CD providers"""
 
@@ -240,28 +178,11 @@ class PipelineProvider(Enum):
     TEKTON = "tekton"
 
 
-class PipelineComplexity(Enum):
-    """Pipeline complexity levels"""
-
-    BASIC = "basic"  # Simple validate -> apply workflow
-    STANDARD = "standard"  # Full workflow with testing
-    ADVANCED = "advanced"  # Multi-environment with approvals
-    ENTERPRISE = "enterprise"  # Full governance and compliance
-
-
 @dataclass
 class PipelineConfig:
     """Configuration for pipeline generation"""
 
     provider: PipelineProvider
-    complexity: PipelineComplexity
-    environments: List[str] = None
-    enable_approvals: bool = False
-    enable_security_scan: bool = True
-    enable_performance_monitoring: bool = True
-    enable_marketplace_publishing: bool = False
-    notification_channels: List[str] = None
-    custom_steps: List[Dict[str, Any]] = None
     # The cloud platforms the contract (and its overlays) bind, plus "openbao"
     # when a secretRef uses vault:// or openbao://: what the pipeline
     # authenticates to without a static key (``_keyless.CLOUD_AUTH_PLATFORMS``).
@@ -338,20 +259,11 @@ class PipelineConfig:
     # ``datamesh-manager``. Common values: ``fluid-command-center``,
     # ``datamesh-manager``, ``horizon``, ``datahub``, ``collibra``.
     default_publish_target: Optional[str] = None
-    # Generation defaults for the stage-9 verify strictness, the stage-10
-    # publish toggle, and whether stage 10 passes ``--env`` to
-    # ``fluid publish``. These exist so scenario-specific launchpads can ask
-    # ``fluid generate ci`` to emit the intended default behavior directly
-    # instead of patching the generated Jenkinsfile text.
-    #
-    # ``publish_include_env`` defaults to True: ``fluid publish --env`` loads
-    # the contract with the same overlay stages 5-9 used, so a run for the
-    # aws overlay publishes the aws binding. ``--no-publish-include-env``
-    # keeps the old command for a CLI older than ``fluid publish --env``,
-    # which rejects the flag with ``unrecognized arguments: --env dev``.
+    # Generation defaults for the stage-9 verify strictness (VERIFY_STRICT)
+    # and the stage-10 publish switch (RUN_STAGE_10_PUBLISH), so a launchpad
+    # can ask ``fluid generate ci`` for the behavior it wants directly.
     verify_strict_default: bool = True
     publish_stage_default: bool = False
-    publish_include_env: bool = True
     # The contract the pipeline builds, relative to ``workdir`` (the CONTRACT
     # parameter's default and every stage's fallback for it). ``fluid
     # generate ci`` sets it to the contract it was given.
@@ -388,22 +300,17 @@ class PipelineConfig:
     # ``--env`` accepts it (:func:`check_env_name`), however the config was
     # built.
     fluid_env_default: Optional[str] = None
+    # The branch whose pushes run the apply phase; pull requests against it
+    # run the plan phase (``fluid generate ci --default-branch``).
+    default_branch: str = "main"
+    # The opt-in jobs beside the pipeline (``fluid generate ci --add``), from
+    # ``_thin.ADD_ONS``: security, compliance, sbom.
+    add_ons: Tuple[str, ...] = ()
 
     def __post_init__(self):
-        if self.environments is None:
-            if self.complexity == PipelineComplexity.BASIC:
-                self.environments = ["dev"]
-            elif self.complexity == PipelineComplexity.STANDARD:
-                self.environments = ["dev", "staging"]
-            else:
-                self.environments = ["dev", "staging", "prod"]
-
-        if self.notification_channels is None:
-            self.notification_channels = []
-
-        if self.custom_steps is None:
-            self.custom_steps = []
-
+        branch = check_pipeline_literal("default branch", self.default_branch or "")
+        if not branch or re.search(r"[\s*?\[\]~^:]", branch) or branch.startswith("-"):
+            raise ValueError(f"default branch {branch!r} is not a branch name")
         if self.package_extras is None:
             self.package_extras = []
 
@@ -463,14 +370,6 @@ class PipelineTemplateGenerator:
         """List available pipeline providers"""
         return [provider.value for provider in PipelineProvider]
 
-    def get_provider_features(self, provider: PipelineProvider) -> Dict[str, Any]:
-        """Get features supported by a provider"""
-        template = self.templates.get(provider)
-        if not template:
-            return {}
-
-        return template.get_features()
-
 
 class BasePipelineTemplate:
     """Base class for pipeline templates"""
@@ -482,179 +381,6 @@ class BasePipelineTemplate:
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
         """Generate pipeline configuration"""
         raise NotImplementedError
-
-    def get_features(self) -> Dict[str, Any]:
-        """Get supported features"""
-        return {
-            "multi_environment": True,
-            "approvals": True,
-            "security_scanning": True,
-            "artifact_management": True,
-            "notifications": True,
-            "parallel_execution": True,
-            "matrix_builds": True,
-        }
-
-    def _get_fluid_commands(self, config: Optional["PipelineConfig"] = None) -> Dict[str, str]:
-        """Get standard FLUID commands for different stages.
-
-        Contract-path commands use the POSIX parameter-expansion default
-        ``${CONTRACT:-contract.fluid.yaml}`` so Build Now works out of the
-        box against the canonical filename. Operators who keep the
-        contract under a different name export ``CONTRACT`` in the CI
-        job / agent env to override. ``$BUILD_ID`` remains CI-injected —
-        when unset, ``apply`` falls through to the plan-file branch for
-        non-dbt contracts.
-        """
-        commands = {
-            "validate": "fluid validate ${CONTRACT:-contract.fluid.yaml}",
-            # 11-stage pipeline stage 5 — drift gate. Runs BEFORE plan so the
-            # plan is never computed against a drifted baseline. --exit-on-drift
-            # makes any drift a hard fail; local inspection runs omit the flag.
-            "diff": (
-                "fluid diff ${CONTRACT:-contract.fluid.yaml} --exit-on-drift "
-                "--env ${FLUID_ENV:-dev}"
-            ),
-            # --check-sovereignty: the plan stage runs the contract's own
-            # sovereignty policy (the provider hook, else the policy engine)
-            # and a strict violation fails it, before stage 7 touches a cloud.
-            # A contract with no sovereignty block prints NOT CHECKED and passes.
-            "plan": (
-                "fluid plan ${CONTRACT:-contract.fluid.yaml} --out runtime/plan.json "
-                "--check-sovereignty"
-            ),
-            # A build id needs `--mode amend-and-build` alongside
-            # `--build-id`: the id only FILTERS, it does not opt into running
-            # builds (`fluid apply --help`). The retired `--build` did both.
-            # --ensure-opentofu lets a cloud apply provision a pinned,
-            # SHA-256-verified `tofu` (no root/gpg) on a fresh runner; it is
-            # idempotent (skips when tofu is present) and a no-op for
-            # native/local applies that never touch the OpenTofu engine.
-            "apply": (
-                'if [ -n "$BUILD_ID" ]; then '
-                "fluid apply ${CONTRACT:-contract.fluid.yaml} "
-                "--mode amend-and-build --build-id $BUILD_ID "
-                "--ensure-opentofu --yes; "
-                "else "
-                "fluid apply runtime/plan.json --ensure-opentofu --yes; "
-                "fi"
-            ),
-            # 11-stage pipeline stage 8 — enforce policy bindings against the
-            # freshly-applied schema. GRANT statements require the target
-            # objects to exist, so policy-apply runs AFTER apply but BEFORE
-            # verify — a transform running on an under-authorized object
-            # would otherwise mask the policy gap as a build failure.
-            # Skipped silently when bindings.json is absent (e.g. a
-            # reference-only contract that delegates policy to upstream).
-            "policy_apply": (
-                "if [ -f dist/artifacts/policy/bindings.json ]; then "
-                "fluid policy-apply dist/artifacts/policy/bindings.json "
-                "--mode enforce; "
-                "elif [ -f runtime/policy/bindings.json ]; then "
-                "fluid policy-apply runtime/policy/bindings.json "
-                "--mode enforce; "
-                "fi"
-            ),
-            # 11-stage pipeline stage 9 — post-apply reconciliation. --strict
-            # fails on any schema mismatch (not just missing objects), which
-            # catches silent type coercions (TIMESTAMP_NTZ→LTZ, etc.). Writes
-            # a JSON report for CI artifact uploads.
-            # ``fluid verify`` takes ``--out``, NOT ``--report`` — the
-            # latter is the apply CLI's flag. Mixing the two produces a
-            # runtime "unrecognized arguments" failure under stage 9.
-            "verify": (
-                "fluid verify ${CONTRACT:-contract.fluid.yaml} --strict "
-                "--env ${FLUID_ENV:-dev} --out runtime/verify-report.json"
-            ),
-            "test": "fluid test ${CONTRACT:-contract.fluid.yaml}",
-            "contract_test": "fluid contract-tests ${CONTRACT:-contract.fluid.yaml}",
-            "generate_transformation": "fluid generate speed-transformation",
-            "generate_schedule": "fluid generate schedule",
-            # ``PLAN`` must default to where the ``plan`` command above
-            # actually writes (runtime/plan.json), and ``viz-graph`` defaults
-            # to ``--format svg`` -- without an explicit png it writes SVG
-            # bytes into a .png.
-            "visualize": (
-                "fluid viz-plan ${PLAN:-runtime/plan.json} --out pipeline-viz.html "
-                "&& fluid viz-graph ${CONTRACT:-contract.fluid.yaml} "
-                "--format png --out dependency-graph.png"
-            ),
-            # Canonical key: ``publish_odps`` emits the LF/ODPI ODPS v4.1
-            # JSON via the (non-deprecated) ``fluid generate standard
-            # --format odps-v4.1`` path. The ``publish_opds`` alias below
-            # keeps pre-2026-05 templates / overrides resolving.
-            "publish_odps": ("fluid generate standard --format odps-v4.1 --out odps-catalog.json"),
-            "publish_opds": ("fluid generate standard --format odps-v4.1 --out odps-catalog.json"),
-            "marketplace_publish": "fluid marketplace publish --catalog odps-catalog.json",
-            # Plain `fluid doctor` — `--extended` requires scripts/diagnose.sh
-            # in the workspace, which fresh forge-generated variants don't
-            # ship. Users who set up extended diagnostics can edit the
-            # generated file to opt in.
-            "doctor": "fluid doctor",
-            # Airflow DAG deployment: rsync the generated ``dags/`` directory
-            # to an operator-supplied destination. Skipped when
-            # $AIRFLOW_DAGS_DEST is unset or dags/ doesn't exist.
-            "airflow_sync": (
-                'if [ -d dags/ ] && [ -n "$AIRFLOW_DAGS_DEST" ]; then '
-                'rsync -av --delete dags/ "$AIRFLOW_DAGS_DEST"/; '
-                "fi"
-            ),
-            # Stage 10 — Catalog publish. Push the contract (+ ODPS/ODCS
-            # exports) to one or more catalogs. Uses ``--target`` (repeatable)
-            # per the 11-stage pipeline design: ``PUBLISH_TARGETS`` is a
-            # space-separated list (e.g. ``command-center datahub``) that the
-            # shell expands into ``--target X --target Y``. Falls back to the
-            # legacy ``${CATALOG:-datamesh-manager}`` single-target form so
-            # existing environments keep working.
-            "publish_catalog": (
-                'if [ -n "$DMM_API_URL" ] || [ -n "$PUBLISH_TARGETS" ]; then '
-                'if [ -n "$PUBLISH_TARGETS" ]; then '
-                'TARGETS=""; for t in $PUBLISH_TARGETS; do TARGETS="$TARGETS --target $t"; done; '
-                # ``--env`` is quoted: unquoted, a FLUID_ENV holding spaces
-                # word-splits into extra flags (``--target cc:<endpoint>``
-                # would send the API key elsewhere).
-                "fluid publish ${CONTRACT:-contract.fluid.yaml} $TARGETS "
-                '--env "${FLUID_ENV:-dev}"; '
-                "else "
-                "fluid publish ${CONTRACT:-contract.fluid.yaml} "
-                '--target ${CATALOG:-datamesh-manager} --env "${FLUID_ENV:-dev}"; '
-                "fi; "
-                "fi"
-            ),
-        }
-        # The contract ``fluid generate ci`` was given is every command's
-        # fallback for CONTRACT, not the literal default name, and the
-        # FLUID_ENV default is every command's fallback for FLUID_ENV.
-        d = self._pipeline_defaults(config)
-        fallbacks = {
-            "${CONTRACT:-contract.fluid.yaml}": sh_param("CONTRACT", d["CONTRACT"]),
-            "${FLUID_ENV:-dev}": sh_param("FLUID_ENV", d["FLUID_ENV"]),
-        }
-        rendered: Dict[str, str] = {}
-        for key, command in commands.items():
-            for literal, fallback in fallbacks.items():
-                command = command.replace(literal, fallback)
-            rendered[key] = command
-        return rendered
-
-    def _get_common_environment_vars(self) -> Dict[str, str]:
-        """Get common environment variables"""
-        return {
-            "FLUID_LOG_LEVEL": "INFO",
-            "FLUID_CONFIG_PATH": "./fluid_config",
-            "PYTHONPATH": ".",
-            "PIP_CACHE_DIR": ".pip-cache",
-        }
-
-    # ── EngineRuntime registry integration (used by ALL CI emitters) ──
-    #
-    # The three helpers below pull the per-engine bootstrap + runtime
-    # facts from ``_engine_specs`` so each subclass (github_actions,
-    # gitlab_ci, circle_ci, azure_devops, bitbucket, tekton, jenkins)
-    # can consume them in its native dialect without re-implementing
-    # the engine→pip / engine→env-var dispatch logic. Adding a new
-    # engine means one entry in ``_engine_specs.py`` and EVERY CI
-    # emitter picks it up automatically.
 
     def _engine_pip_install_command(self, config: "PipelineConfig") -> str:
         """One-line ``pip install <engine extras>`` command, or "" if none.
@@ -676,24 +402,6 @@ class BasePipelineTemplate:
             sink_platform=getattr(config, "sink_platform", None),
         )
         return render_pip_install_command(bootstrap)
-
-    def _install_command(self, config: "PipelineConfig") -> str:
-        """Combined ``pip install`` for forge-cli + per-engine extras.
-
-        Returns ``"pip install --quiet data-product-forge"`` when the
-        contract has no engine declared OR the registry has no extras;
-        otherwise returns ``"pip install --quiet data-product-forge && <engine pip install>"``.
-
-        Used by every CI emitter as the install step body so adding a
-        new engine to ``_engine_specs.py`` reaches every CI system
-        automatically (the alternative — an ``Install engine extras``
-        step BEFORE the FLUID install step — fails because some emitters
-        run pip install across many isolated jobs).
-        """
-        engine_pip = self._engine_pip_install_command(config)
-        if engine_pip:
-            return f"pip install --quiet data-product-forge && {engine_pip}"
-        return "pip install --quiet data-product-forge"
 
     def _engine_runtime_env_vars(self, config: "PipelineConfig") -> Dict[str, str]:
         """Per-engine env vars (e.g. AIRBYTE_PROJECT_DIR for engine='airbyte').
@@ -721,72 +429,6 @@ class BasePipelineTemplate:
             getattr(config, "engine", None),
             indent=indent,
         )
-
-    def _security_audit_block(self, complexity: "PipelineComplexity") -> Dict[str, Any]:
-        """Return a CI-system-agnostic security + compliance audit payload.
-
-        For ``ADVANCED`` and ``ENTERPRISE`` tiers the generated pipelines
-        must include a security/compliance signal so operators can wire
-        SAST + policy + audit into their delivery process. We DON'T pin
-        a specific scanner here — different orgs have different licensed
-        tooling — but we DO emit:
-
-        * a short shell body that exercises ``fluid`` 's own security
-          surface (``fluid policy-check``,
-          ``fluid policy-apply``, ``fluid policy-check --format json``), and
-        * the canonical step name + comment-banner with the keywords
-          (``security scan``, ``vulnerability``, ``policy``, ``audit``,
-          ``osv-scanner``, ``sast``) so CI assertions and operator search
-          both succeed.
-
-        Returns ``{"name", "comment", "body"}`` — each subclass adapts
-        the trio into its native primitive (Azure DevOps stage / Bitbucket
-        step / CircleCI job / Tekton task). Returns an empty dict when
-        complexity ≤ STANDARD so the helper is a no-op for tiers that
-        don't need it.
-        """
-        if complexity not in (PipelineComplexity.ADVANCED, PipelineComplexity.ENTERPRISE):
-            return {}
-        # The shell body. Single POSIX sh body so every CI system can
-        # paste it as-is. ``|| true`` on the optional scanner so a
-        # missing osv-scanner binary doesn't fail the pipeline — operators
-        # promote it from "advisory" to "blocking" by removing the
-        # ``|| true`` once the binary is on the runner.
-        body = (
-            "set -eu\n"
-            # Both outputs below land in runtime/, which nothing guarantees
-            # exists at this stage; `|| true` would otherwise swallow the
-            # redirect failure and leave the artifact upload empty.
-            "mkdir -p runtime\n"
-            "# FLUID security scan + compliance audit — advanced/enterprise tier.\n"
-            "# Surfaces: policy violations (via fluid policy-check), policy\n"
-            "# binding dry-run (via fluid policy-apply --mode check), and an\n"
-            "# optional osv-scanner vulnerability scan.\n"
-            'fluid policy-check "${CONTRACT:-contract.fluid.yaml}" --strict || true\n'
-            "if [ -f dist/artifacts/policy/bindings.json ]; then\n"
-            "  fluid policy-apply dist/artifacts/policy/bindings.json "
-            "--mode check || true\n"
-            "fi\n"
-            'fluid policy-check "${CONTRACT:-contract.fluid.yaml}" --format json '
-            "--output runtime/compliance-report.json || true\n"
-            "# Optional: OSV-Scanner vulnerability scan if the binary is on the runner.\n"
-            "if command -v osv-scanner >/dev/null 2>&1; then\n"
-            "  osv-scanner scan source -r . --format sarif "
-            "--output runtime/osv-results.sarif || true\n"
-            "fi\n"
-        )
-        comment_lines = [
-            "Security + compliance audit (advanced/enterprise tier).",
-            "Runs fluid policy-check --strict, a policy-binding dry-run via",
-            "fluid policy-apply --mode check, a JSON compliance report, and",
-            "an optional OSV-Scanner vulnerability scan. Any SCA scanner can",
-            "replace it without breaking the rest of the stage.",
-        ]
-        return {
-            "name": "Security and Compliance Audit",
-            "comment": comment_lines,
-            "body": body,
-        }
 
     def _credential_banner(
         self,
@@ -823,26 +465,6 @@ class BasePipelineTemplate:
             f"{p}",
         ]
         return "\n".join(lines) + "\n"
-
-    def _generate_env_ci_example(self, cloud_auth: Tuple[str, ...] = ()) -> str:
-        """``.env.ci.example``: the non-secret variables the keyless setup needs."""
-        return "\n".join(_keyless.env_example_lines(cloud_auth)) + "\n"
-
-    # ------------------------------------------------------------------
-    # 11-stage pipeline helpers (Phase 7-rest)
-    #
-    # ``_stage_specs(config)`` returns the canonical, provider-neutral list
-    # of the 11 pipeline stages. Every CI-system subclass iterates this list
-    # and wraps ``_render_stage_command(spec, config)`` in its native
-    # primitive (GitHub Actions step, GitLab job, Azure stage, etc.).
-    #
-    # Keeping the command strings here — not in each subclass — ensures
-    # that upgrading the canonical contract (e.g. "stage 6 now passes a
-    # new flag") propagates to every CI system without N-way drift.
-    # JenkinsTemplate renders its own Groovy, but runs the same chain with
-    # the same defaults (``_pipeline_defaults``), which the tests in
-    # ``tests/forge/core/pipeline_systems/`` hold the two to.
-    # ------------------------------------------------------------------
 
     #: The ``APPLY_MODE`` default when ``PipelineConfig.apply_mode_default``
     #: is unset. Jenkins keeps its own (dry-run).
@@ -914,332 +536,18 @@ class BasePipelineTemplate:
         """``sh_param`` for ``name`` with its default from ``defaults``."""
         return sh_param(name, defaults[name], keep_blank=name in self.keep_blank_parameters)
 
-    def _stage_specs(self, config: Optional["PipelineConfig"] = None) -> List["StageSpec"]:
-        """Return the 11 pipeline stages in order.
-
-        Toggle defaults follow the same semantics Jenkins uses:
-        stages 10 (publish) and 11 (schedule-sync) default OFF so they
-        must be opt-in per run, matching the "don't push by default"
-        principle. All structural stages (1-9) default ON.
-
-        Stage 3 (generate artifacts) is controlled by the subclass's
-        :attr:`config.generates_artifacts` rather than the static default
-        here — the subclass applies the override when rendering.
-
-        The chain: stage 1 bundles the contract with its env overlay, and
-        stages 2, 3, 5, 6 and 9 read that bundle, so each checks the same
-        frozen document stage 7 applies. Stage 7 applies stage 6's plan
-        with ``--bundle``. Stage 10 publishes the contract with ``--env``
-        (the catalog records the contract as authored, overlay applied).
-        """
-        d = self._pipeline_defaults(config)
-        p = functools.partial(self._sh, defaults=d)
-        env = f'--env "{p("FLUID_ENV")}"'
-        workdir = (getattr(config, "workdir", None) or "").strip("/") if config else ""
-        project_contract = f"{workdir}/{p('CONTRACT')}" if workdir else p("CONTRACT")
-        return [
-            StageSpec(
-                num=1,
-                slug="bundle",
-                display="bundle",
-                toggle_param="RUN_STAGE_1_BUNDLE",
-                default_run=True,
-                command=(
-                    "set -eu; mkdir -p runtime; "
-                    f'fluid bundle "{p("CONTRACT")}" {env} '
-                    f"--format tgz --out {BUNDLE_PATH}"
-                ),
-            ),
-            StageSpec(
-                num=2,
-                slug="validate",
-                display="validate",
-                toggle_param="RUN_STAGE_2_VALIDATE",
-                default_run=True,
-                # VALIDATE_STRICT=false drops --strict, as `fluid ship` reads it.
-                command=(
-                    f"set -eu; {_needs_bundle(2)}"
-                    f"set -- {BUNDLE_PATH} {env} --report runtime/validate-report.json; "
-                    'if [ "${VALIDATE_STRICT:-true}" != "false" ]; then set -- "$@" --strict; fi; '
-                    'fluid validate "$@"'
-                ),
-            ),
-            StageSpec(
-                num=3,
-                slug="generate_artifacts",
-                display="generate artifacts",
-                toggle_param="RUN_STAGE_3_GENERATE_ARTIFACTS",
-                default_run=True,  # overridden by config.generates_artifacts at render time
-                # ``--contract-path``: the path the scheduled DAG applies,
-                # relative to the checkout (FLUID_PROJECT_DIR on the worker).
-                # A bundle does not record it.
-                command=(
-                    f"set -eu; {_needs_bundle(3)}"
-                    f"set -- {BUNDLE_PATH} {env} "
-                    f'--contract-path "{project_contract}" --out dist/artifacts/; '
-                    'if [ -n "${GENERATE_EMIT:-}" ]; then set -- "$@" --emit "$GENERATE_EMIT"; fi; '
-                    'fluid generate artifacts "$@"'
-                ),
-            ),
-            StageSpec(
-                num=4,
-                slug="validate_artifacts",
-                display="validate artifacts",
-                toggle_param="RUN_STAGE_4_VALIDATE_ARTIFACTS",
-                default_run=True,
-                command=(
-                    "set -- dist/artifacts/ --report runtime/validate-artifacts-report.json; "
-                    'if [ "${VALIDATE_STRICT:-true}" != "false" ]; then set -- "$@" --strict; fi; '
-                    'fluid validate-artifacts "$@"'
-                ),
-            ),
-            StageSpec(
-                num=5,
-                slug="diff",
-                display="diff (drift gate)",
-                toggle_param="RUN_STAGE_5_DIFF",
-                default_run=True,
-                command=(
-                    f"set -eu; {_needs_bundle(5)}"
-                    f"set -- {BUNDLE_PATH}; "
-                    'if [ "${DIFF_EXIT_ON_DRIFT:-true}" != "false" ]; then '
-                    'set -- "$@" --exit-on-drift; fi; '
-                    f'set -- "$@" {env} --out runtime/diff-report.json; '
-                    'if [ -n "${DIFF_LAST_APPLIED:-}" ]; then '
-                    'set -- "$@" --last-applied "$DIFF_LAST_APPLIED"; fi; '
-                    'fluid diff "$@"'
-                ),
-            ),
-            StageSpec(
-                num=6,
-                slug="plan",
-                display="plan",
-                toggle_param="RUN_STAGE_6_PLAN",
-                default_run=True,
-                # The plan records the mode it was made for, and stage 7's
-                # ``apply_plan_mode_mismatch`` gate refuses any other. So
-                # stage 6 plans for APPLY_MODE, the one mode stage 7 applies.
-                # --check-sovereignty makes a strict sovereignty violation fail
-                # the plan stage, before stage 7 reaches a cloud.
-                command=(
-                    f'set -eu; {_needs_bundle(6)}MODE="{p("APPLY_MODE")}"; '
-                    f"set -- {BUNDLE_PATH} "
-                    f'--out runtime/plan.json --mode "$MODE" {env} --check-sovereignty; '
-                    'if [ "${PLAN_HTML:-false}" = "true" ]; then '
-                    'set -- "$@" --html runtime/plan.html; fi; '
-                    'fluid plan "$@"'
-                ),
-            ),
-            StageSpec(
-                num=7,
-                slug="apply",
-                display="apply",
-                toggle_param="RUN_STAGE_7_APPLY",
-                default_run=True,
-                # Stage 7 uses POSIX ``set --`` + if/then/fi so
-                # parameter-controlled flags (mode, allow-data-loss,
-                # no-verify-*, build-id) stay as individual argv
-                # tokens regardless of unquoted env-var expansion. This
-                # is the security-hardened pattern from stage 11 applied
-                # here — avoids the ``${APPLY_BUILD_FLAG}`` argument-
-                # smuggling bug fixed in commit D2.
-                #
-                # NO_VERIFY_DIGEST is the single CI-operator knob; when
-                # true it appends BOTH --no-verify-plan-binding and
-                # --no-verify-federation so the one-knob waives the
-                # plan-binding gate and the federation upstream-digest
-                # gate together (the digest gate is split into two
-                # narrowly-scoped flags at the CLI).
-                #
-                # The mode is APPLY_MODE as given, never rewritten: a build
-                # id reaches ``--build-id`` only with a build mode, which is
-                # the only place ``fluid apply`` accepts one.
-                command=(
-                    f'set -eu; {_needs_bundle(7)}MODE="{p("APPLY_MODE")}"; '
-                    # --ensure-opentofu provisions a pinned, SHA-256-verified
-                    # `tofu` (no root/gpg) when a cloud apply needs it; it is
-                    # idempotent (skips when tofu is present) and a no-op for
-                    # native/local applies that never touch the OpenTofu engine.
-                    f'set -- runtime/plan.json --bundle {BUNDLE_PATH} --mode "$MODE" '
-                    f"{env} --yes --ensure-opentofu "
-                    "--report runtime/apply-report.html; "
-                    f"{apply_build_id_sh(p('APPLY_BUILD_ID'))}"
-                    'if [ "${ALLOW_DATA_LOSS:-false}" = "true" ]; then '
-                    'set -- "$@" --allow-data-loss; fi; '
-                    'if [ "${NO_VERIFY_DIGEST:-false}" = "true" ]; then '
-                    'set -- "$@" --no-verify-plan-binding --no-verify-federation; fi; '
-                    'fluid apply "$@"'
-                ),
-            ),
-            StageSpec(
-                num=8,
-                slug="policy_apply",
-                display="policy apply",
-                toggle_param="RUN_STAGE_8_POLICY_APPLY",
-                default_run=True,
-                # Self-gates on bindings.json existence so reference-only
-                # contracts (that delegate policy upstream) skip cleanly.
-                # After a dry-run apply the bindings are checked, not
-                # enforced: a dry run writes nothing, access bindings included.
-                command=(
-                    f'set -eu; MODE="{p("APPLY_MODE")}"; '
-                    'POLICY_MODE="${POLICY_APPLY_MODE:-enforce}"; '
-                    'case "$POLICY_MODE" in enforce|check) ;; *) '
-                    'echo "POLICY_APPLY_MODE must be enforce or check" >&2; exit 2 ;; esac; '
-                    'if [ "$MODE" = dry-run ] && [ "${RUN_STAGE_7_APPLY:-true}" != "false" ] '
-                    '&& [ "$POLICY_MODE" = enforce ]; then POLICY_MODE=check; '
-                    'echo "APPLY_MODE dry-run applied nothing: policy bindings are checked, '
-                    'not enforced"; fi; '
-                    "if [ -f dist/artifacts/policy/bindings.json ]; then "
-                    'set -- dist/artifacts/policy/bindings.json --mode "$POLICY_MODE"; '
-                    'fluid policy-apply "$@"; '
-                    "fi"
-                ),
-            ),
-            StageSpec(
-                num=9,
-                slug="verify",
-                display="verify",
-                toggle_param="RUN_STAGE_9_VERIFY",
-                default_run=True,
-                # ``fluid verify`` accepts ``--out``, NOT ``--report``
-                # (the latter is apply's flag). It reconciles what stage 7
-                # applied, so after a dry run (nothing applied) it is skipped.
-                command=(
-                    f'set -eu; MODE="{p("APPLY_MODE")}"; '
-                    f"{_skip_after_dry_run(9, 'there is nothing to verify')}{_needs_bundle(9)}"
-                    f"set -- {BUNDLE_PATH}; "
-                    'if [ "${VERIFY_STRICT:-true}" != "false" ]; then set -- "$@" --strict; fi; '
-                    f'set -- "$@" {env} --out runtime/verify-report.json; '
-                    'fluid verify "$@"'
-                ),
-            ),
-            StageSpec(
-                num=10,
-                slug="publish",
-                display="publish",
-                toggle_param="RUN_STAGE_10_PUBLISH",
-                default_run=False,  # opt-in — typically branch-gated to main
-                # ``PUBLISH_TARGETS`` is a space-separated list; each word
-                # becomes ONE ``--target=<word>`` argv token (``set -f`` so a
-                # word is never a glob). The legacy single-target
-                # ``CATALOG`` variable is still read when it is unset.
-                # A word may not carry an endpoint (``name:https://...``): the
-                # runner's catalog credential would go to whatever it names.
-                # After a dry-run apply there is nothing applied to publish.
-                command=(
-                    f'set -eu; MODE="{p("APPLY_MODE")}"; '
-                    f"{_skip_after_dry_run(10, 'there is no applied product to publish')}"
-                    "mkdir -p runtime; "
-                    f'set -- "{p("CONTRACT")}" {env} --format json; '
-                    "set -f; for t in ${PUBLISH_TARGETS:-${CATALOG:-"
-                    f'{d["PUBLISH_TARGETS"]}'
-                    '}}; do case "$t" in *:*) echo "PUBLISH_TARGETS names catalogs, '
-                    'not endpoints" >&2; exit 2 ;; esac; set -- "$@" "--target=$t"; done; '
-                    'set +f; fluid publish "$@"'
-                ),
-            ),
-            StageSpec(
-                num=11,
-                slug="schedule_sync",
-                display="schedule sync",
-                toggle_param="RUN_STAGE_11_SCHEDULE_SYNC",
-                default_run=False,  # opt-in — Path-A only
-                # Scheduler-variant params (SCHEDULER, SCHEDULER_DESTINATION,
-                # SCHEDULER_ENVIRONMENT_NAME, SCHEDULER_LOCATION,
-                # SCHEDULER_WORKSPACE, SCHEDULE_SYNC_DRY_RUN) flow through
-                # env vars. Same POSIX ``set --`` + if/then/fi pattern
-                # as stage 7 so empty params never reach argv. This is
-                # the security-hardened Jenkins stage-11 pattern.
-                command=(
-                    f'set -eu; MODE="{p("APPLY_MODE")}"; '
-                    f"{_skip_after_dry_run(11, 'there is no applied product to schedule')}"
-                    f'SCHEDULER_V="{p("SCHEDULER")}"; '
-                    'if [ -z "$SCHEDULER_V" ]; then echo "SCHEDULER is blank: '
-                    'no scheduler to sync to — skipping stage 11"; exit 0; fi; '
-                    # Self-gate: skip cleanly when there's nothing to
-                    # sync. Three cases are collapsed into one INFO-
-                    # level skip: (a) reference-only contract where
-                    # stage 3 auto-skipped the schedule emitter,
-                    # (b) stage 3 was toggled off so dist/artifacts/
-                    # never materialised, (c) contract has no
-                    # orchestration.engine so fluid generate
-                    # schedule produced zero DAGs. In all three the
-                    # pre-stage-11 pipeline (bundle → apply →
-                    # verify) may have succeeded and the correct
-                    # posture is "nothing to do, move on" — not
-                    # FAILURE. Matches stage 8's bindings.json gate.
-                    "if [ ! -d dist/artifacts/schedule ] || "
-                    '[ -z "$(ls -A dist/artifacts/schedule 2>/dev/null)" ]; then '
-                    'echo "no dist/artifacts/schedule/ DAGs to sync '
-                    "— skipping stage 11 (reference-only contract, "
-                    "stage 3 not run, or no orchestration.engine "
-                    'configured)"; exit 0; fi; '
-                    # ``--delete-scope product``: deletion stays inside
-                    # ``<destination>/<contract id>/``, so products sharing
-                    # one DAG root never remove each other's DAGs.
-                    'set -- --scheduler "$SCHEDULER_V" '
-                    "--dags-dir dist/artifacts/schedule/ "
-                    f"{env} --delete-scope product; "
-                    f'DEST="{p("SCHEDULER_DESTINATION")}"; '
-                    'if [ -n "$DEST" ]; then set -- "$@" --destination "$DEST"; fi; '
-                    'if [ -n "${SCHEDULER_ENVIRONMENT_NAME:-}" ]; then '
-                    'set -- "$@" --environment-name "$SCHEDULER_ENVIRONMENT_NAME"; fi; '
-                    'if [ -n "${SCHEDULER_LOCATION:-}" ]; then '
-                    'set -- "$@" --location "$SCHEDULER_LOCATION"; fi; '
-                    'if [ -n "${SCHEDULER_WORKSPACE:-}" ]; then '
-                    'set -- "$@" --workspace "$SCHEDULER_WORKSPACE"; fi; '
-                    'if [ "${SCHEDULE_SYNC_DRY_RUN:-false}" = "true" ]; then '
-                    'set -- "$@" --dry-run; fi; '
-                    'fluid schedule-sync "$@"'
-                ),
-            ),
-        ]
-
-    def _render_stage_command(self, spec: "StageSpec", config: "PipelineConfig") -> str:
-        """Return the fully-rendered sh command body for a stage.
-
-        When ``config.workdir`` is set (subfolder checkout), prepends
-        ``cd "<workdir>" && `` so the fluid CLI sees the contract file
-        regardless of the CI system's default working directory. For a
-        compound command (containing ``; `` or starting with ``set -eu``),
-        the ``cd`` and the command are joined inside a single-line
-        equivalent that keeps the compound structure intact under POSIX
-        sh — wrapping in parentheses would spawn a subshell and prevent
-        ``set -eu`` from propagating to parent shell flags.
-
-        Each sh body reads CONTRACT and FLUID_ENV with their declared
-        defaults as fallbacks (``"${CONTRACT:-<contract>}"``,
-        ``"${FLUID_ENV:-<env>}"``) so Build Now works without the
-        operator pre-setting every env var. Credential-bearing env vars
-        (SNOWFLAKE_*, AWS_*, DMM_*) are NOT defaulted here — they come
-        from the CI system's secret store per the credential banner.
-        """
-        body = spec.command
-        if config.workdir:
-            # The workdir is written between double quotes into a shell
-            # body: refuse (at generation time) anything that could end the
-            # quoting or expand, rather than escaping it.
-            workdir = check_pipeline_workdir(config.workdir)
-            body = f'cd "{workdir}" && {body}'
-        return body
-
-    def _stage_default_run(self, spec: "StageSpec", config: "PipelineConfig") -> bool:
-        """Return whether a stage should run by default for this config.
-
-        Stage 3 (generate artifacts) is the one override: it turns OFF
-        for reference-only contracts (where ``config.generates_artifacts``
-        is False — the contract points at externally-owned dbt/Airflow
-        artifacts and fluid wouldn't own them). All other stages follow
-        the static default on the :class:`StageSpec`.
-        """
-        if spec.slug == "generate_artifacts":
+    @staticmethod
+    def _stage_toggle_default(num: int, config: "PipelineConfig") -> bool:
+        """Whether stage ``num`` runs by default: every stage but the opt-in
+        10 and 11, except stage 3 for a reference-only contract (fluid owns
+        no artifacts there). ``fluid generate ci`` sets 10 and 11 on request."""
+        if num == 3:
             return bool(config.generates_artifacts)
-        if spec.slug == "publish":
-            return bool(getattr(config, "publish_stage_default", False))
-        if spec.slug == "schedule_sync":
-            return bool(getattr(config, "schedule_sync_default", False))
-        return spec.default_run
+        if num == 10:
+            return bool(config.publish_stage_default)
+        if num == 11:
+            return bool(config.schedule_sync_default)
+        return True
 
     def _render_install_setup(self, config: "PipelineConfig") -> str:
         """Return the shared install-setup sh script for the Setup stage.
@@ -1307,21 +615,6 @@ class BasePipelineTemplate:
             "fluid --version" + engine_install
         )
 
-    def _stage_toggle_defaults(self, config: "PipelineConfig") -> Dict[str, bool]:
-        """Return ``{toggle_param: default_bool}`` for the 11 stages.
-
-        Each CI-system subclass uses this to declare its native build-
-        parameter surface (GitHub Actions workflow_dispatch inputs,
-        GitLab variables, Azure DevOps parameters, etc.) without
-        hardcoding the list. Keys are UPPER_SNAKE (e.g.
-        ``RUN_STAGE_3_GENERATE_ARTIFACTS``) to match Jenkins and the
-        env-var form every CI system accepts.
-        """
-        return {
-            spec.toggle_param: self._stage_default_run(spec, config)
-            for spec in self._stage_specs(config)
-        }
-
     def _eleven_stage_parameters(self, config: "PipelineConfig") -> List[Tuple[str, str, str, str]]:
         """Return the canonical build-parameter declaration set.
 
@@ -1355,13 +648,15 @@ class BasePipelineTemplate:
             ),
         ]
         # 11 stage toggles
-        for spec in self._stage_specs(config):
+        from . import _thin  # _thin imports this module
+
+        for stage in _thin.stages():
             params.append(
                 (
-                    spec.toggle_param,
+                    stage.toggle,
                     "boolean",
-                    "true" if self._stage_default_run(spec, config) else "false",
-                    f"Stage {spec.num}: toggle {spec.display}.",
+                    "true" if self._stage_toggle_default(stage.num, config) else "false",
+                    f"Stage {stage.num}: run {stage.name} (false switches it off).",
                 )
             )
         # Apply-mode matrix
@@ -1391,7 +686,7 @@ class BasePipelineTemplate:
                     "NO_VERIFY_DIGEST",
                     "boolean",
                     d["NO_VERIFY_DIGEST"],
-                    "Stage 7: emergency escape — waives BOTH the plan-binding "
+                    "Stage 7: emergency escape that waives BOTH the plan-binding "
                     "and federation upstream-digest gates "
                     "(--no-verify-plan-binding --no-verify-federation). Audit log flag.",
                 ),
@@ -1472,53 +767,3 @@ class BasePipelineTemplate:
                 ]
             )
         return params
-
-
-@dataclass(frozen=True)
-class StageSpec:
-    """Canonical spec for one of the 11 pipeline stages.
-
-    Immutable so subclasses can't mutate the shared list they receive
-    from :meth:`BasePipelineTemplate._stage_specs`. Each subclass
-    iterates the specs in order and wraps
-    :meth:`BasePipelineTemplate._render_stage_command(spec, config)`
-    in its native CI primitive (GitHub Actions ``steps:``, GitLab
-    ``script:``, Azure DevOps ``steps:``, Bitbucket ``script:``,
-    CircleCI ``steps:``, Tekton ``taskSpec.steps``).
-    """
-
-    num: int
-    """1-11."""
-
-    slug: str
-    """snake_case identifier; matches the toggle-param suffix and test
-    assertion strings. Example: ``bundle``, ``generate_artifacts``,
-    ``schedule_sync``."""
-
-    display: str
-    """Human-readable stage name for display in CI UI. Example:
-    ``bundle``, ``generate artifacts``, ``schedule sync``. Note the
-    spaces — this is the label that appears in pipeline visualisations
-    and build logs."""
-
-    toggle_param: str
-    """UPPER_SNAKE boolean parameter name that each CI system exposes
-    to let operators skip the stage. Example: ``RUN_STAGE_1_BUNDLE``.
-    Systems that support per-stage conditionals (Jenkins, GitHub
-    Actions, GitLab, Azure DevOps, CircleCI, Tekton) emit ``when:``
-    / ``rules:`` / ``condition:`` clauses referencing this name;
-    systems that don't (Bitbucket) ignore the toggle and emit the
-    stage unconditionally."""
-
-    default_run: bool
-    """Whether the stage runs by default when the operator doesn't
-    override the toggle param. True for stages 1-9 (structural);
-    False for stages 10 (publish) and 11 (schedule-sync) — both are
-    opt-in because they push beyond the CI environment."""
-
-    command: str
-    """Shell body executed by the stage. Uses POSIX sh syntax
-    (``set --`` + ``if/then/fi``, not bash arrays) so it runs under
-    any CI system's default shell. References env vars with the
-    ``${VAR:-default}`` expansion idiom so fresh environments work
-    without every parameter pre-set."""

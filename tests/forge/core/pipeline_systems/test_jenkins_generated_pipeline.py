@@ -26,9 +26,11 @@ from typing import Dict, List
 import pytest
 
 from fluid_build import __version__
+from fluid_build.cli import _ship_stages as st
+from fluid_build.cli import ship
 from fluid_build.cli.generate_ci import run as generate_ci_run
+from fluid_build.forge.core.pipeline_systems import _thin
 from fluid_build.forge.core.pipeline_templates import (
-    PipelineComplexity,
     PipelineConfig,
     PipelineProvider,
     PipelineTemplateGenerator,
@@ -71,16 +73,15 @@ _GCP = "exposes:\n  - binding:\n      platform: gcp\n      format: bigquery_tabl
 
 
 def _jenkinsfile(**kwargs: object) -> str:
-    config = PipelineConfig(
-        provider=PipelineProvider.JENKINS, complexity=PipelineComplexity.STANDARD, **kwargs
-    )
+    config = PipelineConfig(provider=PipelineProvider.JENKINS, **kwargs)
     return PipelineTemplateGenerator().generate_pipeline(config)["Jenkinsfile"]
 
 
 def _stage(content: str, label: str) -> str:
     start = content.index(f"stage('{label}')")
-    nxt = content.find("\n        stage('", start + 10)
-    return content[start : nxt if nxt != -1 else content.index("    post {")]
+    # The next stage, at any depth: stages 7-11 sit inside the apply stage.
+    nxt = re.search(r"\n\s+stage\('", content[start + 10 :])
+    return content[start : start + 10 + nxt.start() if nxt else content.index("    post {")]
 
 
 def _sh_bodies(text: str) -> List[str]:
@@ -100,6 +101,13 @@ def _declared(content: str) -> Dict[str, str]:
     return declared
 
 
+def _environment_fallbacks(content: str) -> Dict[str, str]:
+    """``{NAME: fallback}`` of the ``environment {}`` entries ship reads."""
+    return dict(
+        re.findall(r'^\s+(\w+) = "\$\{params\.\1 == null \? \'([^\']*)\' : ', content, re.M)
+    )
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     """A git repository holding the product under contracts/customer_subscriptions/."""
@@ -115,9 +123,7 @@ def repo(tmp_path: Path) -> Path:
 
 def _generate(cwd: Path, contract: str, monkeypatch: pytest.MonkeyPatch, **options: object) -> str:
     monkeypatch.chdir(cwd)
-    args = argparse.Namespace(
-        system="jenkins", complexity="standard", out="Jenkinsfile", contract=contract, **options
-    )
+    args = argparse.Namespace(system="jenkins", out="Jenkinsfile", contract=contract, **options)
     assert generate_ci_run(args, _LOG) == 0
     return (cwd / "Jenkinsfile").read_text(encoding="utf-8")
 
@@ -127,14 +133,12 @@ def _generate(cwd: Path, contract: str, monkeypatch: pytest.MonkeyPatch, **optio
 
 def test_generated_from_the_repository_root_names_the_contract_from_there(repo, monkeypatch):
     content = _generate(repo, "contracts/customer_subscriptions/contract.fluid.yaml", monkeypatch)
-    assert (
-        "name: 'CONTRACT', defaultValue: 'contracts/customer_subscriptions/contract.fluid.yaml'"
-        in content
-    )
+    path = "contracts/customer_subscriptions/contract.fluid.yaml"
+    assert f"name: 'CONTRACT', defaultValue: '{path}'" in content
     assert 'cd "' not in content  # runs at the checkout root
-    assert 'fluid bundle "${CONTRACT:-contracts/customer_subscriptions/contract.fluid.yaml}"' in (
-        content
-    )
+    # Ship is given the contract through the environment, with the same fallback.
+    assert f"CONTRACT = \"${{params.CONTRACT == null ? '{path}' : params.CONTRACT}}\"" in content
+    assert 'fluid ship "$CONTRACT" --stage 1' in _stage(content, "1 - bundle")
 
 
 def test_generated_from_the_contract_directory_cds_there(repo, monkeypatch):
@@ -142,11 +146,10 @@ def test_generated_from_the_contract_directory_cds_there(repo, monkeypatch):
     content = _generate(product, "contract.fluid.yaml", monkeypatch)
     assert "name: 'CONTRACT', defaultValue: 'contract.fluid.yaml'" in content
     assert 'cd "contracts/customer_subscriptions" && set -eu' in content
-    # The scheduled DAG applies the contract relative to the checkout.
-    assert (
-        '--contract-path "contracts/customer_subscriptions/${CONTRACT:-contract.fluid.yaml}"'
-        in content
-    )
+    # Every ship step runs from the product's directory, archives from the root.
+    for label in ("1 - bundle", "6 - plan", "7 - apply"):
+        assert 'cd "contracts/customer_subscriptions" && set -eu' in _stage(content, label)
+    assert "archiveArtifacts artifacts: 'contracts/customer_subscriptions/runtime/" in content
 
 
 def test_a_contract_outside_the_current_directory_is_named_from_its_repository_root(
@@ -277,7 +280,7 @@ def test_the_workspace_is_removed_with_the_core_deleteDir_step():
     post = content[content.index("    post {") :]
     cleanup = post[post.index("cleanup {") :]
     assert "deleteDir()" in cleanup[: cleanup.index("}")]
-    assert "//   workflow-aggregator, git\n" in content
+    assert "//   workflow-aggregator, git, lockable-resources, junit\n" in content
 
 
 # ── (4) every read falls back to the declared default ─────────────────────
@@ -306,18 +309,25 @@ def test_every_parameter_read_falls_back_to_the_default_it_declares(options):
     content = _jenkinsfile(**options)
     declared = _declared(content)
     assert len(declared) >= 30
-    shells = "\n".join(_sh_bodies(content))
+    fallbacks = _environment_fallbacks(content)
+    # Ship reads each of these from the environment: a parameterless build gets
+    # exactly what the parameter declares.
+    # (CATALOG is the legacy name of PUBLISH_TARGETS; DIFF_LAST_APPLIED is set by
+    # stage 5's own shell, from the last build's plan.)
+    assert set(_thin.ship_variables()) - {"CATALOG", "DIFF_LAST_APPLIED"} <= set(fallbacks)
+    for name, fallback in fallbacks.items():
+        assert fallback == declared[name], (name, fallback, declared[name])
+    # The install's shell reads (stage 0) fall back the same way, and never bare.
+    install = "\n".join(_sh_bodies(_stage(content, "0 — Bootstrap FLUID [pypi]")))
     for name, default in declared.items():
-        for op, fallback in re.findall(r"\$\{" + name + r"(:-|-)([^}]*)\}", shells):
+        for op, fallback in re.findall(r"\$\{" + name + r"(:-|-)([^}]*)\}", install):
             assert fallback == default, (name, op, fallback, default)
-        # Never read without a fallback: a parameterless build exports none.
-        assert not re.search(r"\$\{" + name + r"\}", shells), name
-        assert not re.search(r"\$" + name + r"\b", shells), name
+        if name not in fallbacks:
+            assert not re.search(r"\$\{" + name + r"\}", install), name
+            assert not re.search(r"\$" + name + r"\b", install), name
     # Every stage toggle's when{} falls back to the declared default too.
     for name, default in re.findall(r"params\.(RUN_STAGE_\w+) == null \? (true|false)", content):
         assert declared[name] == default, name
-    # GENERATE_EMIT has one.
-    assert '--emit "${GENERATE_EMIT:-odcs,odps-bitol,schedule,policies}"' in content
 
 
 def test_the_demo_defaults_become_the_parameters_defaults():
@@ -364,22 +374,6 @@ def test_a_single_build_is_the_build_id_default_and_two_are_none(repo, monkeypat
     assert _declared(_generate(product, "contract.fluid.yaml", monkeypatch))["APPLY_BUILD_ID"] == ""
 
 
-def test_stages_2_3_5_6_9_read_the_bundle_stage_1_made_for_the_env():
-    content = _jenkinsfile()
-    stage1 = _stage(content, "1 - bundle")
-    assert '--env "${FLUID_ENV:-dev}" --format tgz --out runtime/bundle.tgz' in stage1
-    for label, command in (
-        ("2 - validate", "set -- runtime/bundle.tgz --env"),
-        ("3 - generate artifacts", "fluid generate artifacts runtime/bundle.tgz --env"),
-        ("5 - diff (drift gate)", "set -- runtime/bundle.tgz --env"),
-        ("6 - plan", "set -- runtime/bundle.tgz --env"),
-        ("9 - verify", "set -- runtime/bundle.tgz --env"),
-    ):
-        assert command in _stage(content, label), label
-    stage7 = _stage(content, "7 - apply")
-    assert "set -- runtime/plan.json --bundle runtime/bundle.tgz --mode" in stage7
-
-
 # ── (5b) FLUID_ENV defaults to --fluid-env-default ───────────────────────
 
 
@@ -390,12 +384,17 @@ def test_the_fluid_env_default_is_the_parameter_default_and_every_fallback(repo,
     product = repo / "contracts" / "customer_subscriptions"
     content = _generate(product, "contract.fluid.yaml", monkeypatch, fluid_env_default="aws")
     assert _declared(content)["FLUID_ENV"] == "aws"
+    # Ship reads FLUID_ENV from the environment {} block, with the default as fallback.
+    assert _environment_fallbacks(content)["FLUID_ENV"] == "aws"
+    # Stage 0's name check is the one shell read left.
     reads = re.findall(r"\$\{FLUID_ENV(:-|-)([^}]*)\}", "\n".join(_sh_bodies(content)))
-    # Stage 0's name check and stages 1, 2, 3, 5, 6, 7, 9, 10 and 11 (4 and 8
-    # take no --env): every one falls back to aws.
-    assert len(reads) == 10
-    assert set(reads) == {(":-", "aws")}
-    assert "FLUID_ENV:-dev" not in content
+    assert reads == [(":-", "aws")]
+    assert "FLUID_ENV:-dev" not in content and "'dev'" not in _environment_block(content)
+
+
+def _environment_block(content: str) -> str:
+    start = content.index("    environment {")
+    return content[start : content.index("\n    }\n", start)]
 
 
 def test_without_the_option_only_dev_is_the_default(repo, monkeypatch):
@@ -409,19 +408,14 @@ def test_without_the_option_only_dev_is_the_default(repo, monkeypatch):
         _generate(product, "contract.fluid.yaml", monkeypatch, fluid_env_default="dev") == default
     )
     staging = _generate(product, "contract.fluid.yaml", monkeypatch, fluid_env_default="staging")
-    assert staging == default.replace("${FLUID_ENV:-dev}", "${FLUID_ENV:-staging}").replace(
-        "name: 'FLUID_ENV', defaultValue: 'dev'", "name: 'FLUID_ENV', defaultValue: 'staging'"
+    assert staging == (
+        default.replace("${FLUID_ENV:-dev}", "${FLUID_ENV:-staging}")
+        .replace(
+            "name: 'FLUID_ENV', defaultValue: 'dev'", "name: 'FLUID_ENV', defaultValue: 'staging'"
+        )
+        .replace("params.FLUID_ENV == null ? 'dev'", "params.FLUID_ENV == null ? 'staging'")
     )
     assert staging != default
-
-
-@pytest.mark.parametrize(("exported", "env"), [({}, "aws"), ({"FLUID_ENV": "gcp"}, "gcp")])
-def test_a_parameterless_bundle_is_for_the_fluid_env_default(tmp_path, exported, env):
-    """Stage 1 run with no parameters bundles for the default; a FLUID_ENV the
-    build was given still wins."""
-    proc, argv = _run_stage_body(tmp_path, "1 - bundle", exported, fluid_env_default="aws")
-    assert proc.returncode == 0, proc.stderr
-    assert argv is not None and argv[argv.index("--env") + 1] == env
 
 
 #: Values a stage's ``--env`` would refuse, and whether a programmatic
@@ -524,35 +518,54 @@ def test_the_option_is_on_the_command_line(repo, monkeypatch):
 # ── (6) the archive steps read what the stages write ─────────────────────
 
 
-def test_every_archived_runtime_report_is_one_its_stage_writes():
+_SHIP_OWN_FILES = {"runtime/ship-report.json", "runtime/ship-junit.xml"}
+
+
+@pytest.mark.parametrize("number", range(1, 12))
+def test_every_archived_runtime_report_is_one_its_stage_writes(number, tmp_path):
+    """Each stage archives only runtime/ files ship's own argv for that stage writes."""
     content = _jenkinsfile()
-    labels = re.findall(r"stage\('(\d+ - [^']+)'\)", content)
-    assert len(labels) == 11
-    for label in labels:
-        stage = _stage(content, label)
-        shells = "\n".join(_sh_bodies(stage))
-        for pattern in re.findall(r"archiveArtifacts artifacts: '([^']+)'", stage):
-            for path in pattern.split(","):
-                if not path.startswith("runtime/") or path == "runtime/bundle.tgz":
-                    continue
-                written = re.search(
-                    r"(--out|--report|--html|>)\s+" + re.escape(path) + r"(?![\w./-])", shells
-                )
-                assert written, f"stage {label} archives {path} but writes no such file"
-
-
-def test_stage_10_publishes_json_to_the_registered_target_with_the_env():
-    content = _jenkinsfile(default_publish_target="fluid-command-center")
-    stage10 = _stage(content, "10 - publish")
-    assert (
-        'set -- "${CONTRACT:-contract.fluid.yaml}" --env "${FLUID_ENV:-dev}" --format json'
-        in stage10
+    label = next(
+        l for l in re.findall(r"stage\('(\d+ - [^']+)'\)", content) if l.startswith(f"{number} ")
     )
-    assert "for t in ${PUBLISH_TARGETS:-fluid-command-center}; do" in stage10
-    assert 'set -- "$@" "--target=$t"' in stage10
-    assert "command-center" not in stage10.replace("fluid-command-center", "")
+    opts = st.resolve_options(
+        _parse_ship(["--yes", "--publish", "--schedule-sync"]),
+        "contract.fluid.yaml",
+        {"SCHEDULER": "airflow", "PLAN_HTML": "true"},
+    )
+    (tmp_path / "dist" / "artifacts" / "policy").mkdir(parents=True)
+    (tmp_path / "dist" / "artifacts" / "policy" / "bindings.json").write_text("{}")
+    (tmp_path / "dist" / "artifacts" / "schedule").mkdir()
+    (tmp_path / "dist" / "artifacts" / "schedule" / "dag.py").write_text("")
+    argv = st.build_stage(number, opts, st.Workspace(tmp_path)).argv
+    assert argv, f"stage {number} did not build an argv"
+    written = {tok for tok in argv if tok.startswith("runtime/")}
+    for pattern in re.findall(r"archiveArtifacts artifacts: '([^']+)'", _stage(content, label)):
+        for path in pattern.split(","):
+            if path.startswith("runtime/") and path != "runtime/bundle.tgz":
+                assert path in written, f"stage {label} archives {path} but ship writes {written}"
+    # The run's own report is archived after every build, and is ship's.
+    post = content[content.index("    post {") :]
+    for path in _SHIP_OWN_FILES:
+        assert path in post
+
+
+def _parse_ship(argv):
+    parser = argparse.ArgumentParser()
+    ship.register(parser.add_subparsers(dest="command"))
+    return parser.parse_args(["ship", *argv])
+
+
+def test_stage_10_publishes_to_the_registered_target_with_the_catalog_credentials_named():
+    content = _jenkinsfile(default_publish_target="fluid-command-center")
+    assert _environment_fallbacks(content)["PUBLISH_TARGETS"] == "fluid-command-center"
+    assert _declared(content)["PUBLISH_TARGETS"] == "fluid-command-center"
+    assert 'fluid ship "$CONTRACT" --stage 10' in _stage(content, "10 - publish")
+    # The catalog credential is named for the operator, never bound.
+    head = content[: content.index("pipeline {")]
+    banner_and_env = content[content.index("    environment {") :]
     for var in ("FLUID_CC_ENDPOINT", "FLUID_API_KEY", "FLUID_CC_ORG_ID"):
-        assert var in content[: content.index("pipeline {")], var
+        assert var in head or var in banner_and_env, var
 
 
 # ── (5) the last applied plan reaches stage 5 across builds ──────────────
@@ -561,18 +574,19 @@ def test_stage_10_publishes_json_to_the_registered_target_with_the_env():
 def test_last_applied_is_copied_from_the_last_successful_build_when_asked_for():
     content = _jenkinsfile(diff_last_applied=True)
     head = content[: content.index("pipeline {")]
-    assert "workflow-aggregator, git, copyartifact" in head
+    assert "workflow-aggregator, git, lockable-resources, junit, copyartifact" in head
     assert 'copyArtifactPermission("/${env.JOB_NAME}")' in content
     stage0 = _stage(content, "0 — Bootstrap FLUID [pypi]")
     # Emptied first: nothing committed at that path can pose as a baseline.
     assert stage0.index('rm -rf "$WORKSPACE/.fluid-ci"') < stage0.index("copyArtifacts(")
     assert "selector: lastSuccessful()" in stage0 and "optional: true" in stage0
     stage5 = _stage(content, "5 - diff (drift gate)")
-    assert 'BASELINE="$WORKSPACE/.fluid-ci/last-applied/${FLUID_ENV:-dev}.json"' in stage5
-    assert 'set -- "$@" --last-applied "$BASELINE"' in stage5
+    assert 'BASELINE="$WORKSPACE/.fluid-ci/last-applied/$FLUID_ENV.json"' in stage5
+    # Ship reads the baseline from DIFF_LAST_APPLIED, and says so when there is none.
+    assert 'export DIFF_LAST_APPLIED="$BASELINE"' in stage5
     stage7 = _stage(content, "7 - apply")
-    assert 'if [ "$MODE" != "dry-run" ]; then' in stage7
-    assert 'cp runtime/plan.json "$WORKSPACE/.fluid-ci/applied/${FLUID_ENV:-dev}.json"' in stage7
+    assert 'if [ "$APPLY_MODE" != "dry-run" ]; then' in stage7
+    assert 'cp runtime/plan.json "$WORKSPACE/.fluid-ci/applied/$FLUID_ENV.json"' in stage7
     post = content[content.index("    post {") :]
     success = post[post.index("success {") : post.index("failure {")]
     assert "archiveArtifacts artifacts: '.fluid-ci/applied/*.json'" in success
@@ -581,14 +595,17 @@ def test_last_applied_is_copied_from_the_last_successful_build_when_asked_for():
 def test_without_last_applied_the_file_needs_no_copyartifact_plugin():
     content = _jenkinsfile()
     assert "copyArtifact" not in content and "copyartifact" not in content
-    assert "--last-applied" not in content
+    assert "--last-applied" not in content and "DIFF_LAST_APPLIED=" not in content
 
 
 def test_generate_ci_output_lists_the_plugins(repo, monkeypatch, capsys):
     product = repo / "contracts" / "customer_subscriptions"
     _generate(product, "contract.fluid.yaml", monkeypatch, diff_last_applied=True)
     out = " ".join(capsys.readouterr().out.split())
-    assert "Jenkins plugins required: workflow-aggregator, git, copyartifact" in out
+    assert (
+        "Jenkins plugins required: workflow-aggregator, git, lockable-resources, junit, "
+        "copyartifact" in out
+    )
 
 
 def test_a_relative_or_unsafe_scheduler_destination_default_is_refused(repo, monkeypatch):
@@ -604,92 +621,6 @@ def test_a_relative_or_unsafe_scheduler_destination_default_is_refused(repo, mon
                 scheduler_default="airflow",
                 scheduler_destination_default=bad,
             )
-
-
-# ── stages 8 and 9 after a dry run ────────────────────────────────────────
-
-
-def _run_stage_body(tmp_path: Path, label: str, env: Dict[str, str], **options: object):
-    """Run a stage's one ``sh`` body with a recording ``fluid`` stub."""
-    (body,) = _sh_bodies(_stage(_jenkinsfile(**options), label))
-    stub = tmp_path / "bin"
-    stub.mkdir(exist_ok=True)
-    log = tmp_path / "called"
-    log.unlink(missing_ok=True)
-    fluid = stub / "fluid"
-    fluid.write_text(f"#!/bin/sh\necho \"$@\" > '{log}'\n", encoding="utf-8")
-    fluid.chmod(fluid.stat().st_mode | stat.S_IXUSR)
-    (tmp_path / "runtime").mkdir(exist_ok=True)
-    (tmp_path / "runtime" / "bundle.tgz").write_bytes(b"")
-    (tmp_path / "dist" / "artifacts" / "schedule" / "p").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "dist" / "artifacts" / "schedule" / "p" / "b_dag.py").write_text("")
-    proc = subprocess.run(
-        ["sh", "-c", body],
-        cwd=tmp_path,
-        env={"PATH": f"{stub}{os.pathsep}{os.environ['PATH']}", **env},
-        capture_output=True,
-        text=True,
-    )
-    return proc, (log.read_text().split() if log.exists() else None)
-
-
-@pytest.mark.parametrize(
-    ("label", "command"),
-    [
-        ("9 - verify", "verify"),
-        ("10 - publish", "publish"),
-        ("11 - schedule sync", "schedule-sync"),
-    ],
-)
-@pytest.mark.parametrize(("mode", "runs"), [(None, False), ("dry-run", False), ("amend", True)])
-def test_stages_9_to_11_act_only_on_an_apply_that_changed_something(
-    tmp_path, label, command, mode, runs
-):
-    """A dry-run build writes nothing: no verify of an apply that did not
-    happen, no catalog entry for it, no DAG that would apply it for real."""
-    env = {"APPLY_MODE": mode} if mode else {}
-    proc, argv = _run_stage_body(tmp_path, label, env, scheduler_default="airflow")
-    assert proc.returncode == 0, proc.stderr
-    assert (argv is not None) is runs
-    if runs:
-        assert argv[0] == command
-    else:
-        assert "applied nothing" in proc.stdout
-
-
-def test_a_publish_target_cannot_carry_an_endpoint(tmp_path):
-    """``name:endpoint`` would send the agent's catalog credential to whatever
-    a Build with Parameters user names."""
-    proc, argv = _run_stage_body(
-        tmp_path,
-        "10 - publish",
-        {
-            "APPLY_MODE": "amend",
-            "PUBLISH_TARGETS": "datahub fluid-command-center:https://evil.test",
-        },
-    )
-    assert proc.returncode == 2
-    assert argv is None
-    assert "names catalogs, not endpoints" in proc.stderr
-
-
-def test_stage_8_checks_rather_than_enforces_after_a_dry_run(tmp_path):
-    (body,) = _sh_bodies(_stage(_jenkinsfile(), "8 - policy apply"))
-    stub = tmp_path / "bin"
-    stub.mkdir()
-    fluid = stub / "fluid"
-    fluid.write_text('#!/bin/sh\necho "ARGV $*"\n', encoding="utf-8")
-    fluid.chmod(fluid.stat().st_mode | stat.S_IXUSR)
-    (tmp_path / "dist" / "artifacts" / "policy").mkdir(parents=True)
-    (tmp_path / "dist" / "artifacts" / "policy" / "bindings.json").write_text("{}")
-    for mode, expected in ((None, "check"), ("amend", "enforce")):
-        env = {"PATH": f"{stub}{os.pathsep}{os.environ['PATH']}"}
-        if mode:
-            env["APPLY_MODE"] = mode
-        out = subprocess.run(
-            ["sh", "-c", body], cwd=tmp_path, env=env, check=True, capture_output=True, text=True
-        ).stdout
-        assert f"ARGV policy-apply dist/artifacts/policy/bindings.json --mode {expected}" in out
 
 
 def test_the_generated_file_has_no_groovy_escape_in_a_shell_body():

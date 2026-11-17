@@ -8,7 +8,8 @@
   Airflow the second sync replaced (and ``--delete-scope product`` deleted)
   the first. The env is now in both.
 * Stage 6: the generated plan stage did not run ``--check-sovereignty``, for
-  any CI system, so a strict sovereignty violation first failed at apply.
+  any CI system, so a strict sovereignty violation first failed at apply. Every
+  generated plan phase now runs ship's stage 6, which carries the flag.
 * ``--env gcp`` with no gcp overlay applied the local base unchanged with a
   warning (measured: silver validate and plan rc 0). When the workspace's
   ``expected-environments`` (which fluid-demo-env keeps) declares gcp for the
@@ -20,10 +21,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 
 import pytest
 import yaml
 
+from fluid_build.cli import _ship_stages as st
+from fluid_build.cli import ship
+from fluid_build.forge.core.pipeline_templates import PipelineProvider
 from fluid_build.schedulers.airflow import fluid_apply
 from tests.cli._schedule_dag_fixtures import DEMO_CONTRACT, DEMO_CONTRACT_PATH, load_dag
 
@@ -97,57 +102,40 @@ def test_each_env_gets_its_own_schedule_directory(tmp_path, monkeypatch):
         assert scopes == [f"{_PRODUCT}__{env}"]
 
 
-# ── Stage 6: every generated plan stage checks sovereignty ────────────────
+# ── Stage 6: every generated plan phase runs the stage that checks sovereignty ─
 
 
-def _strings(node):
-    if isinstance(node, str):
-        yield node
-    elif isinstance(node, dict):
-        for value in node.values():
-            yield from _strings(value)
-    elif isinstance(node, list):
-        for value in node:
-            yield from _strings(value)
-
-
-def _plan_commands(provider, complexity):
-    """Every rendered command that runs ``fluid plan`` (Jenkins: stage 6's body)."""
+def _stage_specs(provider):
+    """Every ``--stage`` spec the provider's generated files run: ``fluid ship
+    --stage 1-6``, ``--stage 6``, or Tekton's ``ship-stage`` task parameter."""
     from fluid_build.forge.core.pipeline_templates import PipelineConfig, PipelineTemplateGenerator
 
-    files = PipelineTemplateGenerator().generate_pipeline(
-        PipelineConfig(provider=provider, complexity=complexity)
-    )
-    found = []
-    for text in files.values():
-        if provider.value == "jenkins":
-            start = text.index("stage('6 - plan')")
-            found.append(text[start : text.index("stage('7", start)])
-            continue
-        for doc in yaml.safe_load_all(text):
-            found.extend(s for s in _strings(doc) if "fluid plan" in s)
-    return found
+    files = PipelineTemplateGenerator().generate_pipeline(PipelineConfig(provider=provider))
+    text = "\n".join(files.values())
+    specs = re.findall(r"--stage\s+['\"]?(\d+(?:-\d+)?)", text)
+    specs += re.findall(r"name: ship-stage\n\s+value: ['\"]?(\d+(?:-\d+)?)", text)
+    return specs
 
 
-def _cases():
-    from fluid_build.forge.core.pipeline_templates import PipelineComplexity, PipelineProvider
+def _covers(spec, number):
+    low, _, high = spec.partition("-")
+    return int(low) <= number <= int(high or low)
 
-    return [(p, c) for p in PipelineProvider for c in PipelineComplexity]
+
+@pytest.mark.parametrize("provider", list(PipelineProvider), ids=lambda v: v.value)
+def test_every_generated_plan_phase_runs_stage_six(provider):
+    specs = _stage_specs(provider)
+    assert specs, "no ship command rendered"
+    assert any(_covers(spec, 6) for spec in specs), specs
 
 
-@pytest.mark.parametrize(
-    "provider, complexity", _cases(), ids=lambda v: getattr(v, "value", str(v))
-)
-def test_every_generated_plan_stage_checks_sovereignty(provider, complexity):
-    commands = _plan_commands(provider, complexity)
-    if provider.value == "tekton" and complexity.value == "basic":
-        # The basic Tekton pipeline references a `fluid-plan` Task it does not
-        # render; there is no plan command in it to carry the flag.
-        assert commands == []
-        return
-    assert commands, "no plan command rendered"
-    for command in commands:
-        assert "--check-sovereignty" in command, command
+def test_stage_six_checks_sovereignty_so_a_violation_fails_at_plan(tmp_path):
+    """The flag is ship's, not a generated file's: stage 6 of ship carries it
+    whatever CI system runs it."""
+    parser = argparse.ArgumentParser()
+    ship.register(parser.add_subparsers(dest="command"))
+    opts = st.resolve_options(parser.parse_args(["ship"]), "contract.fluid.yaml", {})
+    assert "--check-sovereignty" in (st.build_stage(6, opts, st.Workspace(tmp_path)).argv or [])
 
 
 # ── --env for a declared environment with no overlay is refused ───────────

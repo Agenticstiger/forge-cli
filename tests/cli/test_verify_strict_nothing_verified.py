@@ -251,30 +251,37 @@ def test_the_json_report_counts_both_kinds_of_skip(tmp_path: Path) -> None:
 
 def _jenkins_stage9_flags(verify_strict: str) -> List[str]:
     """The flags stage 9 of a generated Jenkinsfile adds to ``fluid verify`` when
-    the build's VERIFY_STRICT parameter is ``verify_strict``: the Jenkinsfile's
-    own shell line, run with ``sh``."""
+    the build's VERIFY_STRICT parameter is ``verify_strict``. The Jenkinsfile
+    exports the parameter (with the default it declares) and runs
+    ``fluid ship --stage 9``; ship's own argv for the stage is what runs."""
+    import argparse
+
+    from fluid_build.cli import _ship_stages as st
+    from fluid_build.cli import ship
     from fluid_build.forge.core.pipeline_templates import (
-        PipelineComplexity,
         PipelineConfig,
         PipelineProvider,
         PipelineTemplateGenerator,
     )
 
-    cfg = PipelineConfig(provider=PipelineProvider.JENKINS, complexity=PipelineComplexity.BASIC)
-    jenkinsfile = PipelineTemplateGenerator().generate_pipeline(cfg)["Jenkinsfile"]
-    [line] = [
-        ln.strip()
-        for ln in jenkinsfile.splitlines()
-        if "VERIFY_STRICT" in ln and 'set -- "$@" --strict' in ln
-    ]
-    proc = subprocess.run(
-        ["sh", "-c", f'set -- verify; {line}; shift; printf "%s\\n" "$@"'],
-        env={**os.environ, "VERIFY_STRICT": verify_strict},
-        capture_output=True,
-        text=True,
-        check=True,
+    jenkinsfile = PipelineTemplateGenerator().generate_pipeline(
+        PipelineConfig(provider=PipelineProvider.JENKINS)
+    )["Jenkinsfile"]
+    # Declared strict by default, and exported to ship under the same name.
+    assert (
+        "VERIFY_STRICT = \"${params.VERIFY_STRICT == null ? 'true' : params.VERIFY_STRICT}\""
+        in (jenkinsfile)
     )
-    return [arg for arg in proc.stdout.splitlines() if arg]
+    assert 'fluid ship "$CONTRACT" --stage 9' in jenkinsfile
+
+    parser = argparse.ArgumentParser()
+    ship.register(parser.add_subparsers(dest="command"))
+    opts = st.resolve_options(
+        parser.parse_args(["ship"]), "contract.fluid.yaml", {"VERIFY_STRICT": verify_strict}
+    )
+    argv = st.build_stage(9, opts, st.Workspace(Path.cwd())).argv or []
+    assert argv[:1] == ["verify"]
+    return [arg for arg in argv if arg == "--strict"]
 
 
 @pytest.mark.parametrize("escape", ["--warn-only", "VERIFY_STRICT=false"])

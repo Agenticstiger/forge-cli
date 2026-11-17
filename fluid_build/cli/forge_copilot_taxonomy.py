@@ -9,10 +9,8 @@ __all__ = [
     "USE_CASE_CHOICES",
     "USE_CASE_LABELS",
     "CI_PROVIDER_VALUES",
-    "CI_COMPLEXITY_VALUES",
     "clean_text",
     "canonicalize_use_case_text",
-    "normalize_ci_complexity",
     "normalize_ci_provider",
     "normalize_use_case",
     "normalize_copilot_context",
@@ -87,8 +85,6 @@ CI_PROVIDER_VALUES = frozenset(
         "tekton",
     }
 )
-
-CI_COMPLEXITY_VALUES = frozenset({"basic", "standard", "advanced", "enterprise"})
 
 CI_PROVIDER_ALIASES = {
     "gh": "github_actions",
@@ -196,15 +192,6 @@ def normalize_ci_provider(value: Any) -> Optional[str]:
     return None
 
 
-def normalize_ci_complexity(value: Any) -> Optional[str]:
-    """Canonicalize a CI complexity string into a ``PipelineComplexity`` value."""
-    text = clean_text(value)
-    if not text:
-        return None
-    key = text.lower().strip()
-    return key if key in CI_COMPLEXITY_VALUES else None
-
-
 def normalize_copilot_context(context: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize known copilot context fields without dropping unknown keys."""
     normalized = dict(context)
@@ -223,9 +210,6 @@ def normalize_copilot_context(context: Dict[str, Any]) -> Dict[str, Any]:
         normalized["ci_provider"] = ci_provider
     else:
         normalized.pop("ci_provider", None)
-    ci_complexity = normalize_ci_complexity(normalized.get("ci_complexity"))
-    if ci_complexity:
-        normalized["ci_complexity"] = ci_complexity
-    else:
-        normalized.pop("ci_complexity", None)
+    # The pipeline has one shape; a stale complexity preference is dropped.
+    normalized.pop("ci_complexity", None)
     return normalized

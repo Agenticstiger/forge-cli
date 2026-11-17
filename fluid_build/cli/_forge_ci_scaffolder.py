@@ -8,7 +8,7 @@ CI scaffolding block is a coherent ~400 LOC self-contained group). The
 two entry points consumers care about are:
 
 * :func:`scaffold_ci_pipeline` — top-level: resolve provider +
-  complexity, run drift detection, write the ci-state.json record.
+  run drift detection, write the ci-state.json record.
 * :func:`resolve_ci_choice` — the precedence-ordered resolver
   (kill-switch → ``--no-ci`` → ``--ci <provider>`` → recorded
   ci-state → memory → menu → silent skip).
@@ -41,14 +41,6 @@ _CI_PROVIDER_CHOICES = [
     {"label": "None (skip)", "value": "none"},
 ]
 
-_CI_COMPLEXITY_CHOICES = [
-    {"label": "Basic — validate → apply", "value": "basic"},
-    {"label": "Standard — full workflow with tests", "value": "standard"},
-    {"label": "Advanced — multi-env, approvals, security", "value": "advanced"},
-    {"label": "Enterprise — full governance and compliance", "value": "enterprise"},
-]
-
-_CI_COMPLEXITY_VALUES = {c["value"] for c in _CI_COMPLEXITY_CHOICES}
 _CI_PROVIDER_VALUES = {c["value"] for c in _CI_PROVIDER_CHOICES if c["value"] != "none"}
 _CI_PROVIDER_ALIASES = {
     "circle_ci": "circleci",
@@ -97,11 +89,10 @@ def prompt_ci_menu(
     ask_dialog_question_fn: Callable[[Any, Any], Any],
     *,
     memory_default: Optional[str],
-    complexity_default: str,
-) -> tuple[Optional[str], str]:
-    """Interactive CI provider + complexity menu.
+) -> Optional[str]:
+    """Interactive CI provider menu.
 
-    Returns ``(provider, complexity)``; ``provider`` is ``None`` when
+    Returns the provider, or ``None`` when
     the user selects *None (skip)* or the prompt is cancelled.
     """
     if console:
@@ -127,23 +118,9 @@ def prompt_ci_menu(
     provider_result = ask_dialog_question_fn(console, provider_question)
     provider_value = getattr(provider_result, "value", None)
     if not provider_value or provider_value == "none":
-        return (None, complexity_default)
+        return None
 
-    complexity_question = _CiQuestion(
-        id="ci_complexity",
-        field="ci_complexity",
-        prompt="Pipeline complexity?",
-        type="choice",
-        choices=list(_CI_COMPLEXITY_CHOICES),
-        required=False,
-        allow_skip=True,
-        default=complexity_default if complexity_default in _CI_COMPLEXITY_VALUES else "standard",
-    )
-    complexity_result = ask_dialog_question_fn(console, complexity_question)
-    resolved_complexity = getattr(complexity_result, "value", None) or complexity_default
-    if resolved_complexity not in _CI_COMPLEXITY_VALUES:
-        resolved_complexity = "standard"
-    return (provider_value, resolved_complexity)
+    return provider_value
 
 
 def resolve_ci_choice(
@@ -154,8 +131,8 @@ def resolve_ci_choice(
     ask_dialog_question_fn: Callable[[Any, Any], Any],
     get_cli_arg_fn: Callable[[Any, str, Any], Any],
     console: Any = None,
-) -> tuple[Optional[str], str]:
-    """Resolve (provider, complexity) for the auto-CI hook.
+) -> Optional[str]:
+    """Resolve the provider for the auto-CI hook.
 
     Precedence (highest first):
         1. ``FLUID_FORGE_AUTO_CI=0`` env kill switch
@@ -165,8 +142,7 @@ def resolve_ci_choice(
         5. Recorded ci-state (from slice 7) — auto-selects the same
            provider that produced the committed CI files so re-runs on
            any teammate's machine refresh them without prompting.  Set
-           by the caller in ``context["ci_provider"]`` /
-           ``context["ci_complexity"]``.  ci-state beats personal
+           by the caller in ``context["ci_provider"]``.  ci-state beats personal
            memory because it is product-scoped (committed next to the
            CI files it describes).
         6. Personal memory default → used only as preselection in the
@@ -177,27 +153,22 @@ def resolve_ci_choice(
     """
     # 1. Kill switch
     if ci_killswitch_enabled():
-        return (None, "standard")
+        return None
 
     # 2. Explicit "no CI"
     if get_cli_arg_fn(args, "no_ci", False):
-        return (None, "standard")
-
-    raw_complexity = (
-        get_cli_arg_fn(args, "ci_complexity", None) or context.get("ci_complexity") or "standard"
-    )
-    complexity = raw_complexity if raw_complexity in _CI_COMPLEXITY_VALUES else "standard"
+        return None
 
     ci_flag = normalize_ci_provider(get_cli_arg_fn(args, "ci", None))
 
     # 2b. Explicit "none" sentinel from --ci
     if ci_flag == "none":
-        return (None, complexity)
+        return None
 
     # 3. Explicit provider value (not the "ask" sentinel)
     if ci_flag and ci_flag != "ask":
         if ci_flag in _CI_PROVIDER_VALUES:
-            return (ci_flag, complexity)
+            return ci_flag
         # Unknown provider — warn and skip rather than crash.
         if console:
             try:
@@ -206,7 +177,7 @@ def resolve_ci_choice(
                 )
             except Exception:  # noqa: BLE001
                 pass
-        return (None, complexity)
+        return None
 
     # 4/5/6/7. Interactive path
     if is_interactive:
@@ -217,16 +188,15 @@ def resolve_ci_choice(
             console,
             ask_dialog_question_fn,
             memory_default=memory_default,
-            complexity_default=complexity,
         )
 
     # 8. Non-interactive with a recorded ci-state provider → use it.
     recorded_provider = normalize_ci_provider(context.get("ci_provider"))
     if recorded_provider in _CI_PROVIDER_VALUES:
-        return (recorded_provider, complexity)
+        return recorded_provider
 
     # 9. Non-interactive with no flag and no ci-state → silent skip
-    return (None, complexity)
+    return None
 
 
 def _cloud_auth(target_dir: Path) -> Tuple[str, ...]:
@@ -248,16 +218,16 @@ def scaffold_ci_pipeline(
     ask_dialog_question_fn: Callable[[Any, Any], Any],
     get_cli_arg_fn: Callable[[Any, str, Any], Any],
     dry_run: bool,
-) -> tuple[Optional[str], Optional[str]]:
+) -> Optional[str]:
     """Resolve the CI choice and invoke ``PipelineTemplateGenerator``.
 
-    Returns ``(provider, complexity)`` when files were generated (or
-    planned in dry-run), otherwise ``(None, None)``.
+    Returns the provider when files were generated (or planned in
+    dry-run), otherwise ``None``.
     """
     is_interactive = not bool(get_cli_arg_fn(args, "non_interactive", False))
 
     # Slice 8: a committed ci-state.json in the target dir records the
-    # provider/complexity that last produced the committed CI files.
+    # provider that last produced the committed CI files.
     # Thread its values into context BEFORE resolve_ci_choice runs so
     # the recorded choice beats personal memory.
     try:
@@ -270,9 +240,8 @@ def scaffold_ci_pipeline(
     if recorded is not None:
         context = dict(context)
         context["ci_provider"] = normalize_ci_provider(recorded.provider)
-        context["ci_complexity"] = recorded.complexity
 
-    provider, complexity = resolve_ci_choice(
+    provider = resolve_ci_choice(
         args,
         context,
         is_interactive=is_interactive,
@@ -290,7 +259,7 @@ def scaffold_ci_pipeline(
                 console.print("[dim]CI scaffolding skipped.[/dim]")
             except Exception:  # noqa: BLE001
                 pass
-        return (None, None)
+        return None
 
     try:
         from fluid_build.cli._pipeline_files import (
@@ -306,12 +275,10 @@ def scaffold_ci_pipeline(
                 )
             except Exception:  # noqa: BLE001
                 pass
-        return (None, None)
+        return None
 
     try:
-        config = build_pipeline_config(
-            provider=provider, complexity=complexity, cloud_auth=_cloud_auth(target_dir)
-        )
+        config = build_pipeline_config(provider=provider, cloud_auth=_cloud_auth(target_dir))
         files = PipelineTemplateGenerator().generate_pipeline(config)
     except Exception as exc:  # noqa: BLE001
         if console:
@@ -319,7 +286,7 @@ def scaffold_ci_pipeline(
                 console.print(literal_error_text(f"CI generation failed: {exc}", "yellow"))
             except Exception:  # noqa: BLE001
                 pass
-        return (None, None)
+        return None
 
     # Drift-aware collision check (slice 8).
     try:
@@ -352,7 +319,7 @@ def scaffold_ci_pipeline(
                     )
                 except Exception:  # noqa: BLE001
                     pass
-            return (None, None)
+            return None
 
         if drift.missing_from_state:
             if console:
@@ -366,7 +333,7 @@ def scaffold_ci_pipeline(
                     )
                 except Exception:  # noqa: BLE001
                     pass
-            return (None, None)
+            return None
 
         if drift.pristine and console:
             try:
@@ -378,14 +345,12 @@ def scaffold_ci_pipeline(
 
     if console:
         try:
-            console.print(
-                f"\n[bold blue]🛠  Generating {provider} pipeline ({complexity})…[/bold blue]"
-            )
+            console.print(f"\n[bold blue]🛠  Generating {provider} pipeline…[/bold blue]")
         except Exception:  # noqa: BLE001
             pass
 
     try:
-        command_str = f"fluid forge --ci {provider} --ci-complexity {complexity}"
+        command_str = f"fluid forge --ci {provider}"
         try:
             from fluid_build import __version__ as tool_version
         except Exception:  # pragma: no cover — defensive
@@ -404,7 +369,7 @@ def scaffold_ci_pipeline(
                 console.print(literal_error_text(f"Could not write CI files: {exc}", "yellow"))
             except Exception:  # noqa: BLE001
                 pass
-        return (None, None)
+        return None
 
     # Emit ci-state.json so other machines can detect drift.
     if not dry_run:
@@ -416,15 +381,7 @@ def scaffold_ci_pipeline(
 
             doc = build_ci_state_payload(
                 provider=provider,
-                complexity=complexity,
-                environments=list(getattr(config, "environments", []) or []),
-                options={
-                    "enable_approvals": bool(getattr(config, "enable_approvals", False)),
-                    "enable_security_scan": bool(getattr(config, "enable_security_scan", True)),
-                    "enable_marketplace_publishing": bool(
-                        getattr(config, "enable_marketplace_publishing", False)
-                    ),
-                },
+                add_ons=list(getattr(config, "add_ons", ()) or ()),
                 written_files=written_paths,
                 product_root=target_dir,
                 body_contents=files,
@@ -448,12 +405,10 @@ def scaffold_ci_pipeline(
         except Exception:  # noqa: BLE001
             pass
 
-    return (provider, complexity)
+    return provider
 
 
 __all__ = [
-    "_CI_COMPLEXITY_CHOICES",
-    "_CI_COMPLEXITY_VALUES",
     "_CI_PROVIDER_ALIASES",
     "_CI_PROVIDER_CHOICES",
     "_CI_PROVIDER_VALUES",

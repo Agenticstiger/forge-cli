@@ -18,7 +18,6 @@ from fluid_build.cli.artifact_paths import CI_HEADER_SCHEMA
 from fluid_build.cli.console import cprint, success
 
 from ..forge.core.pipeline_templates import (
-    PipelineComplexity,
     PipelineConfig,
     PipelineProvider,
 )
@@ -30,12 +29,8 @@ from ..forge.core.pipeline_templates import (
 
 def build_pipeline_config(
     provider: str,
-    complexity: str = "standard",
-    environments: Optional[List[str]] = None,
     *,
-    enable_approvals: bool = False,
-    enable_security_scan: bool = True,
-    enable_marketplace_publishing: bool = False,
+    add_ons: Sequence[str] = (),
     cloud_auth: Sequence[str] = (),
 ) -> PipelineConfig:
     """Coerce string inputs into a :class:`PipelineConfig`.
@@ -43,9 +38,9 @@ def build_pipeline_config(
     ``cloud_auth`` is the platforms the pipeline authenticates to keylessly
     (``generate_ci._contract_cloud_auth`` reads them from a contract).
 
-    Passing ``environments=None`` lets :meth:`PipelineConfig.__post_init__`
-    pick complexity-appropriate defaults. Raises ``ValueError`` with a helpful
-    message on unknown provider or complexity.
+    ``add_ons`` are the optional jobs ``fluid generate ci --add`` names; forge
+    passes none. Raises ``ValueError`` with a helpful message on an unknown
+    provider.
     """
     provider_aliases = {
         "circleci": "circle_ci",
@@ -58,20 +53,9 @@ def build_pipeline_config(
             f"Unknown CI provider: {provider!r}. "
             f"Valid: {', '.join(p.value for p in PipelineProvider)}"
         ) from exc
-    try:
-        complexity_enum = PipelineComplexity(complexity)
-    except ValueError as exc:
-        raise ValueError(
-            f"Unknown pipeline complexity: {complexity!r}. "
-            f"Valid: {', '.join(c.value for c in PipelineComplexity)}"
-        ) from exc
     return PipelineConfig(
         provider=provider_enum,
-        complexity=complexity_enum,
-        environments=environments,
-        enable_approvals=enable_approvals,
-        enable_security_scan=enable_security_scan,
-        enable_marketplace_publishing=enable_marketplace_publishing,
+        add_ons=tuple(add_ons),
         cloud_auth=tuple(cloud_auth),
     )
 

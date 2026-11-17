@@ -1,385 +1,246 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""GitLabCITemplate — per-system template for Gitlab Ci CI.
+"""GitLabCITemplate: the thin ``fluid ship`` pipeline for GitLab CI.
 
-Extracted from the monolithic ``pipeline_templates.py`` so each CI system's
-quirks stay contained. Inherits the 11-stage rendering scaffold from
-:class:`fluid_build.forge.core.pipeline_systems._base.BasePipelineTemplate`.
+Two jobs. ``fluid-plan`` runs stages 1-6 with one ``fluid ship --stage 1-6``
+(ship prints a collapsible section per stage) on a merge request, on the
+default branch and on a manual run, and keeps ``runtime/`` and
+``dist/artifacts/`` as artifacts, with ship's JUnit report as the pipeline's
+test report. ``fluid-apply`` runs ``fluid ship --stage 7-11 --yes`` on the
+default branch or a manual run: a manual job in the environment named after
+``FLUID_ENV``, one at a time per environment (``resource_group``). The shape
+follows GitLab's OpenTofu CI/CD component: plan on merge requests, apply by
+hand on the default branch.
+
+Every value is a CI/CD variable that ship reads from the job environment:
+the defaults below, which a project variable or the Run pipeline form
+overrides. ``RUN_STAGE_<N>_<NAME>`` switches a stage off (or 10 and 11 on);
+ship skips a switched-off stage inside the job.
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Tuple
 
-try:
-    import yaml
-except ImportError:
-    # Fallback YAML implementation
-    class _YamlFallback:
-        def dump(self, data, **kwargs):
-            return json.dumps(data, indent=kwargs.get("indent", 2))
+from . import _keyless, _thin
+from ._base import BasePipelineTemplate, PipelineConfig, check_pipeline_workdir
 
-        def dump_all(self, documents, **kwargs):
-            results = []
-            for doc in documents:
-                results.append(self.dump(doc, **kwargs))
-            return "\n---\n".join(results)
-
-    yaml = _YamlFallback()  # type: ignore[assignment]
-
-from . import _keyless
-from ._base import (
-    PINNED_ACTIONS,
-    BasePipelineTemplate,
-    PipelineComplexity,
-    PipelineConfig,
-    PipelineProvider,
-    StageSpec,
-    _pin_action,
+PIPELINE_PATH = ".gitlab-ci.yml"
+IMAGE = "python:3.12-slim"
+#: The stage knobs ship reads, each with its own default when blank.
+STAGE_KNOBS: Tuple[str, ...] = (
+    "VALIDATE_STRICT",
+    "VERIFY_STRICT",
+    "GENERATE_EMIT",
+    "DIFF_EXIT_ON_DRIFT",
+    "DIFF_LAST_APPLIED",
+    "PLAN_HTML",
+    "POLICY_APPLY_MODE",
 )
 
 
 class GitLabCITemplate(BasePipelineTemplate):
     """GitLab CI pipeline template"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.provider_name = "GitLab CI"
         self.file_extensions = [".yml"]
 
-    def _generate_eleven_stage(self, config: PipelineConfig) -> Dict[str, str]:
-        """Emit the canonical 11-stage pipeline as a ``.gitlab-ci.yml``.
-
-        Each stage becomes a separate job in its own pipeline stage so
-        they run sequentially (GitLab parallelizes jobs within the same
-        stage). ``rules:`` with ``$RUN_STAGE_N_<SLUG> == "true"``
-        implements the per-stage toggle — GitLab evaluates ``rules:``
-        before any shell runs, so the gate is injection-proof.
-
-        Workdir: ``default.before_script`` prepends ``cd "$CI_WORKDIR"``
-        when set, so every job step runs in the contract folder.
-        Stage-body commands ALSO carry a ``cd`` prefix as defence-in-
-        depth (same pattern as GitHub Actions).
-
-        Parameters are declared in ``variables:`` so the GitLab
-        "Run pipeline" UI surfaces them as editable fields.
-        """
-        # variables: block — GitLab's native parameter surface.
-        variables: Dict[str, str] = {}
-        for name, kind, default, _desc in self._eleven_stage_parameters(config):
-            # GitLab strings all go through as strings; booleans are
-            # encoded as "true"/"false" and evaluated in ``rules:``.
-            variables[name] = default
-
-        # Stages list — 1 setup stage + 11 pipeline stages.
-        stages = ["setup"] + [f"stage-{spec.num}" for spec in self._stage_specs(config)]
-
-        jobs: Dict[str, Any] = {}
-
-        # Setup job
-        setup_script = self._render_install_setup(config)
-        if config.workdir:
-            setup_script = f'cd "{config.workdir}" && {setup_script.replace(chr(10), "; ")}'
-        else:
-            setup_script = setup_script.replace("\n", "; ")
-        jobs["setup"] = {
-            "stage": "setup",
-            "image": "python:3.12-slim",
-            "script": [setup_script],
-        }
-
-        # 11 stage jobs
-        for spec in self._stage_specs(config):
-            body = self._render_stage_command(spec, config)
-            rule_expr = (
-                f'$({spec.toggle_param}) == "true"'
-                if False
-                # GitLab uses $VAR (not $(VAR)) in rules:if
-                else (f'${spec.toggle_param} == "true"')
-            )
-            job: Dict[str, Any] = {
-                "stage": f"stage-{spec.num}",
-                "image": "python:3.12-slim",
-                "rules": [{"if": rule_expr}],
-                "script": [body],
-            }
-            # Stage 11 also gates on non-blank SCHEDULER.
-            if spec.num == 11:
-                job["rules"] = [{"if": (f'${spec.toggle_param} == "true" && $SCHEDULER != ""')}]
-            if spec.num in _keyless.CLOUD_STAGE_NUMBERS:
-                self._with_cloud_auth(job, config)
-            jobs[f"stage-{spec.num}-{spec.slug.replace('_', '-')}"] = job
-
-        pipeline: Dict[str, Any] = {
-            "stages": stages,
-            "variables": variables,
-            **jobs,
-        }
-        banner = self._credential_banner(
-            cloud_auth=config.cloud_auth,
-            comment_prefix="# ",
-            ci_system_name="GitLab CI",
-            secret_surface_hint=(
-                "Settings \u2192 CI/CD \u2192 Variables. "
-                "Protect + mask any credential-bearing values."
-            ),
-        )
-        content = banner + json.dumps(pipeline, indent=2, default=str)
-        return {".gitlab-ci.yml": content}
-
     def generate(self, config: PipelineConfig) -> Dict[str, str]:
-        """Generate GitLab CI pipeline"""
+        return {PIPELINE_PATH: self._header(config) + _thin.render_yaml(self._pipeline(config))}
 
-        commands = self._get_fluid_commands(config)
-        env_vars = self._get_common_environment_vars()
-        # Engine specs registry — merge per-engine env vars (e.g.
-        # AIRBYTE_PROJECT_DIR for engine='airbyte') so they reach every
-        # job via GitLab CI's top-level ``variables:`` block.
-        env_vars.update(self._engine_runtime_env_vars(config))
+    def _pipeline(self, config: PipelineConfig) -> Dict[str, Any]:
+        add_ons = _thin.check_add_ons(config.add_ons)
+        rules: List[Dict[str, str]] = [
+            {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
+            # A branch with an open merge request runs its merge request
+            # pipeline only, not a second branch pipeline.
+            {"if": "$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS", "when": "never"},
+            {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"},
+            {"if": '$CI_PIPELINE_SOURCE == "web"'},
+        ]
+        if add_ons:  # their scheduled runs (Build > Pipeline schedules)
+            rules.append({"if": '$CI_PIPELINE_SOURCE == "schedule"'})
+        pipeline: Dict[str, Any] = {
+            "workflow": {"rules": rules},
+            "variables": self._variables(config),
+            "stages": ["plan", "apply"],
+            "fluid-plan": self._plan_job(config),
+            "fluid-apply": self._apply_job(config),
+        }
+        for add_on in add_ons:
+            pipeline[f"fluid-{add_on}"] = self._add_on_job(add_on, config)
+        return pipeline
 
-        if config.complexity == PipelineComplexity.BASIC:
-            pipeline = self._generate_basic_gitlab_pipeline(config, commands, env_vars)
-        elif config.complexity == PipelineComplexity.STANDARD:
-            pipeline = self._generate_standard_gitlab_pipeline(config, commands, env_vars)
-        else:
-            pipeline = self._generate_advanced_gitlab_pipeline(config, commands, env_vars)
+    #: When each add-on runs: security beside every plan, compliance on a
+    #: schedule or by hand, the SBOM on the default branch and on a schedule.
+    _ADD_ON_RULES = {
+        "security": [
+            {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'},
+            {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"},
+            {"if": '$CI_PIPELINE_SOURCE == "schedule"'},
+        ],
+        "compliance": [
+            {"if": '$CI_PIPELINE_SOURCE == "schedule"'},
+            {"if": '$CI_PIPELINE_SOURCE == "web"'},
+        ],
+        "sbom": [
+            {"if": '$CI_PIPELINE_SOURCE == "schedule"'},
+            {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"},
+        ],
+    }
 
-        # Splice the per-engine pip-install command into ``before_script``
-        # so every job picks up the engine extras (dlt[snowflake], airbyte,
-        # meltanolabs-tap-postgres, etc.). Pulled from the same registry
-        # as Jenkins; consistent across CI systems.
-        engine_pip = self._engine_pip_install_command(config)
-        if engine_pip and "before_script" in pipeline:
-            pipeline["before_script"] = list(pipeline["before_script"]) + [engine_pip]
-
-        banner = self._credential_banner(
-            cloud_auth=config.cloud_auth,
-            comment_prefix="# ",
-            ci_system_name="GitLab CI",
-            secret_surface_hint=(
-                "Project Settings → CI/CD → Variables. GitLab auto-injects them as "
-                "env for every job — mark as Masked + Protected to scope to "
-                "protected branches."
-            ),
-        )
-        runtime_notes = self._engine_runtime_notes(config, indent="# ")
-        notes_block = ("\n" + runtime_notes + "\n") if runtime_notes else ""
-        return {".gitlab-ci.yml": banner + notes_block + yaml.dump(pipeline, indent=2)}
-
-    @staticmethod
-    def _with_cloud_auth(job: Dict[str, Any], config: PipelineConfig) -> Dict[str, Any]:
-        """Make ``job`` authenticate keylessly to the platforms the contract binds:
-        an ``id_tokens`` entry each, the script lines that turn the tokens into
-        what the SDKs read, and the SDK variables. A contract that binds no
-        cloud leaves the job as it is."""
-        tokens = _keyless.gitlab_id_tokens(config.cloud_auth)
-        if not tokens:
-            return job
-        job["id_tokens"] = tokens
-        extra = _keyless.gitlab_auth_variables(config.cloud_auth)
-        if extra:
-            job["variables"] = {**job.get("variables", {}), **extra}
-        job["script"] = [*_keyless.gitlab_auth_script(config.cloud_auth), *job["script"]]
+    def _add_on_job(self, add_on: str, config: PipelineConfig) -> Dict[str, Any]:
+        """An add-on runs beside the plan, never blocks it, and keeps what it wrote."""
+        job = self._job(config, "plan", "")
+        script = _thin.add_on_script(add_on, self._contract(config))
+        auth = _keyless.gitlab_auth_script(config.cloud_auth) if add_on == "compliance" else []
+        job["script"] = [*auth, *script]
+        if add_on != "compliance":
+            job.pop("id_tokens", None)
+            job.pop("variables", None)
+        job["rules"] = self._ADD_ON_RULES[add_on]
+        job["needs"] = []
+        job["allow_failure"] = add_on != "security"
+        job["artifacts"] = {
+            "when": "always",
+            "expire_in": "30 days",
+            "paths": [self._in_workdir(config, "runtime/")],
+        }
         return job
 
-    def _generate_basic_gitlab_pipeline(self, config, commands, env_vars):
-        """Generate basic GitLab CI pipeline"""
-
-        pipeline = {
-            "stages": ["validate", "generate", "plan", "apply", "test", "publish"],
-            "variables": env_vars,
-            "image": "python:3.12-slim",
-            "before_script": ["pip install --quiet data-product-forge"],
-            "validate": {
-                "stage": "validate",
-                "script": [commands["doctor"], commands["validate"]],
-                "rules": [{"if": "$CI_PIPELINE_SOURCE == 'push'"}],
-            },
-            "generate": {
-                "stage": "generate",
-                "script": [
-                    commands["generate_transformation"],
-                    commands["generate_schedule"],
-                ],
-            },
-            "plan": {
-                "stage": "plan",
-                "script": [commands["plan"]],
-                "artifacts": {"paths": ["plan.json"], "expire_in": "1 day"},
-            },
-            "apply": {
-                "stage": "apply",
-                "script": [commands["apply"]],
-                "dependencies": ["plan"],
-                "only": ["main"],
-                "when": "manual",
-            },
-            "test": {
-                "stage": "test",
-                "script": [commands["test"], commands["contract_test"]],
-                "artifacts": {
-                    "reports": {"junit": "test-results/*.xml"},
-                    "paths": ["test-results/"],
-                },
-            },
-            "airflow_sync": {
-                "stage": "deploy",
-                "script": [commands["airflow_sync"]],
-                "only": ["main"],
-            },
-            "publish": {
-                "stage": "publish",
-                "script": [
-                    commands["publish_catalog"],
-                    commands["visualize"],
-                    commands["publish_odps"],
-                ],
-                "artifacts": {
-                    "paths": ["pipeline-viz.html", "dependency-graph.png", "odps-catalog.json"],
-                    "expire_in": "30 days",
-                    "when": "always",
-                },
-                "only": ["main"],
-            },
+    def _variables(self, config: PipelineConfig) -> Dict[str, Any]:
+        """The defaults, each with what the Run pipeline form shows."""
+        variables: Dict[str, Any] = {
+            # One run id for both jobs, so their stages share one ship report.
+            "FLUID_RUN_ID": "$CI_PIPELINE_ID",
         }
-        # apply and publish reach the cloud (and a vault:// secretRef).
-        for name in ("apply", "publish"):
-            self._with_cloud_auth(pipeline[name], config)
-        return pipeline
-
-    def _generate_standard_gitlab_pipeline(self, config, commands, env_vars):
-        """Generate standard GitLab CI pipeline with environments"""
-
-        pipeline = {
-            "stages": ["validate", "generate", "test", "plan", "deploy", "publish"],
-            "variables": env_vars,
-            "image": "python:3.12-slim",
-            "before_script": ["pip install --quiet data-product-forge"],
-        }
-
-        # Add validation, generation, and testing jobs
-        pipeline.update(
-            {
-                "validate": {
-                    "stage": "validate",
-                    "script": [commands["doctor"], commands["validate"]],
-                },
-                "generate-artifacts": {
-                    "stage": "generate",
-                    "script": [
-                        commands["generate_transformation"],
-                        commands["generate_schedule"],
-                    ],
-                },
-                "unit-tests": {
-                    "stage": "test",
-                    "script": ["fluid test ${CONTRACT:-contract.fluid.yaml} --no-data"],
-                    "artifacts": {"reports": {"junit": "test-results/unit.xml"}},
-                },
-                "integration-tests": {
-                    "stage": "test",
-                    "script": ["fluid test ${CONTRACT:-contract.fluid.yaml}"],
-                    "artifacts": {"reports": {"junit": "test-results/integration.xml"}},
-                },
-                "plan": {
-                    "stage": "plan",
-                    "script": [commands["plan"]],
-                    "artifacts": {"paths": ["plan.json"]},
-                },
+        for name, kind, default, description in self._eleven_stage_parameters(config):
+            if name == "CONTRACT":
+                continue  # written into the ship commands
+            entry: Dict[str, Any] = {"value": default, "description": description}
+            if kind == "boolean":
+                entry["options"] = ["true", "false"]
+            elif kind.startswith("choice:"):
+                options = kind.split(":", 1)[1].split(",")
+                if "" in options:  # blank is a value (SCHEDULER: none): free text
+                    entry["description"] = (
+                        f"{description} One of: {', '.join(o for o in options if o)}, or blank."
+                    )
+                else:
+                    entry["options"] = options
+            variables[name] = entry
+        for knob in STAGE_KNOBS:
+            variables[knob] = {
+                "value": "",
+                "description": f"Passed to fluid ship (see fluid ship --help); blank keeps "
+                f"ship's default for {knob}.",
             }
-        )
+        variables.update(self._engine_runtime_env_vars(config))
+        return variables
 
-        # Add deployment jobs for each environment
-        for env in config.environments:
-            deploy_script = []
-            deploy_script.append(f"FLUID_ENV={env} {commands['generate_transformation']}")
-            deploy_script.append(f"FLUID_ENV={env} {commands['generate_schedule']}")
-            deploy_script.append(f"FLUID_ENV={env} {commands['apply']}")
-
-            deploy_job = {
-                "stage": "deploy",
-                "script": deploy_script,
-                "environment": {"name": env},
-                "dependencies": ["plan"],
-            }
-
-            # GitLab native OIDC: one ID token per bound platform, no static key.
-            self._with_cloud_auth(deploy_job, config)
-
-            if env == "prod":
-                deploy_job["when"] = "manual"
-                deploy_job["only"] = ["main"]
-            elif env == "staging":
-                deploy_job["only"] = ["main", "develop"]
-
-            pipeline[f"deploy-{env}"] = deploy_job
-
-        # Airflow DAG sync — no-op when dags/ is empty or AIRFLOW_DAGS_DEST is unset.
-        pipeline["airflow-sync"] = {
-            "stage": "deploy",
-            "script": [commands["airflow_sync"]],
-            "only": ["main"],
-            "dependencies": [f"deploy-{config.environments[-1]}"],
-        }
-
-        # Add publishing job
-        pipeline["publish"] = {
-            "stage": "publish",
-            "script": [
-                commands["publish_catalog"],
-                commands["visualize"],
-                commands["publish_odps"],
-            ],
+    def _job(self, config: PipelineConfig, stage: str, command: str) -> Dict[str, Any]:
+        before: List[str] = []
+        if config.workdir:
+            before.append(f'cd "{check_pipeline_workdir(config.workdir)}"')
+        # A subshell: GitLab runs before_script and script in one shell, so the
+        # install's `set -eu` and `set --` would otherwise reach every later line.
+        before.append(_keyless.LiteralStr("(\n" + self._render_install_setup(config) + "\n)\n"))
+        job: Dict[str, Any] = {
+            "stage": stage,
+            "image": IMAGE,
+            "before_script": before,
+            "script": [*_keyless.gitlab_auth_script(config.cloud_auth), command],
             "artifacts": {
-                "paths": ["pipeline-viz.html", "dependency-graph.png", "odps-catalog.json"]
+                "when": "always",
+                "expire_in": "30 days",
+                "paths": self._carried(config),
+                "reports": {"junit": self._in_workdir(config, "runtime/ship-junit.xml")},
             },
-            "only": ["main"],
-            "dependencies": [f"deploy-{config.environments[-1]}"],  # Depends on final environment
         }
-        self._with_cloud_auth(pipeline["publish"], config)
+        tokens = _keyless.gitlab_id_tokens(config.cloud_auth)
+        if tokens:
+            job["id_tokens"] = tokens
+        auth_vars = _keyless.gitlab_auth_variables(config.cloud_auth)
+        if auth_vars:
+            job["variables"] = auth_vars
+        return job
 
-        if config.enable_marketplace_publishing:
-            pipeline["marketplace-publish"] = {
-                "stage": "publish",
-                "script": [commands["marketplace_publish"]],
-                "only": ["main"],
-                "when": "manual",
-                "dependencies": ["publish"],
-            }
+    def _plan_job(self, config: PipelineConfig) -> Dict[str, Any]:
+        command = _thin.ship_command(
+            f"{_thin.PLAN_STAGES[0]}-{_thin.PLAN_STAGES[-1]}", contract=self._contract(config)
+        )
+        job = self._job(config, "plan", command)
+        job["artifacts"]["expose_as"] = "fluid plan"
+        # A scheduled pipeline runs the add-ons only.
+        job["rules"] = [
+            {"if": '$CI_PIPELINE_SOURCE == "schedule"', "when": "never"},
+            {"when": "on_success"},
+        ]
+        return job
 
-        return pipeline
-
-    def _generate_advanced_gitlab_pipeline(self, config, commands, env_vars):
-        """Generate advanced GitLab CI pipeline with security and compliance"""
-
-        pipeline = self._generate_standard_gitlab_pipeline(config, commands, env_vars)
-
-        # Add security stage
-        pipeline["stages"].insert(-1, "security")
-
-        # Add security jobs
-        pipeline.update(
+    def _apply_job(self, config: PipelineConfig) -> Dict[str, Any]:
+        command = _thin.ship_command(
+            f"{_thin.APPLY_STAGES[0]}-{_thin.APPLY_STAGES[-1]}",
+            contract=self._contract(config),
+            yes=True,
+        )
+        job = self._job(config, "apply", command)
+        job.update(
             {
-                "security-scan": {
-                    "stage": "security",
-                    "script": [
-                        "fluid policy-check ${CONTRACT:-contract.fluid.yaml} --strict",
-                        "osv-scanner scan source -r .",
-                    ],
-                    "artifacts": {"reports": {"sast": "security-report.json"}},
-                },
-                "compliance-check": {
-                    "stage": "security",
-                    "script": [
-                        "fluid policy-check ${CONTRACT:-contract.fluid.yaml} "
-                        "--format json --output compliance-report.json"
-                    ],
-                    "artifacts": {"paths": ["compliance-report.json"]},
-                    "only": ["main"],
-                },
+                "needs": [{"job": "fluid-plan", "artifacts": True}],
+                # A person starts apply; until then the pipeline is blocked,
+                # not passed. Protect the environment to choose who may.
+                "rules": [
+                    {"if": '$CI_PIPELINE_SOURCE == "merge_request_event"', "when": "never"},
+                    {"if": '$CI_PIPELINE_SOURCE == "schedule"', "when": "never"},
+                    {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH", "when": "manual"},
+                    {"if": '$CI_PIPELINE_SOURCE == "web"', "when": "manual"},
+                ],
+                "allow_failure": False,
+                "environment": {"name": "$FLUID_ENV"},
+                # One apply per environment at a time; a second one waits.
+                "resource_group": "fluid-$FLUID_ENV",
             }
         )
+        return job
 
-        return pipeline
+    @staticmethod
+    def _contract(config: PipelineConfig) -> str:
+        return config.contract_path or _thin.DEFAULT_CONTRACT
+
+    @staticmethod
+    def _in_workdir(config: PipelineConfig, path: str) -> str:
+        return f"{config.workdir.rstrip('/')}/{path}" if config.workdir else path
+
+    def _carried(self, config: PipelineConfig) -> List[str]:
+        return [self._in_workdir(config, path) for path in _thin.CARRIED_PATHS]
+
+    def _header(self, config: PipelineConfig) -> str:
+        env_default = self._pipeline_defaults(config)["FLUID_ENV"]
+        lines = [
+            "fluid pipeline, generated by `fluid generate ci --system gitlab`.",
+            "Each job runs `fluid ship --stage ...` (see `fluid ship --help`), one",
+            "collapsible section per stage.",
+            "",
+            "A merge request runs stages 1-6 (fluid-plan) and keeps runtime/ as an artifact.",
+            "On the default branch, fluid-apply runs stages 7-11 when someone starts it, in",
+            f"the environment named after FLUID_ENV (default {env_default}). Protect that",
+            "environment (Settings > CI/CD > Protected environments) to choose who may.",
+            "",
+            "Every value below is a default: a project CI/CD variable or the Run pipeline",
+            "form overrides it. RUN_STAGE_<N>_<NAME>=false switches a stage off.",
+        ]
+        header = "".join(f"# {line}".rstrip() + "\n" for line in lines) + "\n"
+        banner = self._credential_banner(
+            comment_prefix="# ",
+            ci_system_name="GitLab CI",
+            secret_surface_hint=(
+                "Settings > CI/CD > Variables. Mark credentials Masked and Protected."
+            ),
+            cloud_auth=config.cloud_auth,
+        )
+        notes = self._engine_runtime_notes(config)
+        return header + banner + (notes + "\n" if notes else "")

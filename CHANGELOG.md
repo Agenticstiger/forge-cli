@@ -425,6 +425,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     too. Output is grouped for GitHub Actions, GitLab and Azure Pipelines (`--ci-output`). On
     GitHub nothing a stage prints, nor ship's own reading of the contract and its overlays,
     can issue a workflow command.
+- **BREAKING: `fluid generate ci` writes a thin `fluid ship` wrapper for every CI system; `--complexity` is removed.**
+  Every stage is a step (GitHub, Jenkins) or a section (GitLab and the others) running
+  `fluid ship --stage N`, so the 11 stages have one implementation, and a value reaches ship
+  through the job environment, never a script body.
+  - A pull request or merge request runs stages 1-6 and keeps `runtime/` (the bundle, the reviewed
+    plan, the reports) as an artifact. A push to the default branch also runs stages 7-11 in a second
+    job behind the system's own gate:
+    - GitHub: an `environment:` named after `FLUID_ENV`;
+    - GitLab: a manual job with `environment` and `resource_group`;
+    - Jenkins: an `input` approval (`APPLY_APPROVAL`), a `milestone`, then a per-environment `lock`; a
+      change request stops after stage 6;
+    - Azure DevOps: a deployment job;
+    - Bitbucket: a manual `deployment` step;
+    - CircleCI: an approval job;
+    - Tekton: a separate `fluid-apply` Pipeline.
+  - `--default-branch` names that branch (default: `origin/HEAD`, else `main`).
+  - `--complexity` exits 2: one pipeline shape replaces the tiers. `--add security`, `--add
+    compliance` and `--add sbom` carry what the advanced and enterprise tiers added: the daily
+    OSV-Scanner and policy scan, the weekly compliance report and lineage check, and an SBOM (GitHub:
+    anchore SPDX with an attestation; elsewhere `syft` when the runner has it).
+  - The security and compliance workflows install fluid before they run it; the old ones never did.
+  - GitHub writes `.github/workflows/fluid-pipeline.yml` (was `fluid-standard.yml`), and
+    `generate ci` names any file the old tiers left (`fluid-basic.yml` ... `security.yml`,
+    `compliance.yml`) for you to delete. A manual run's inputs, then repository or environment
+    variables, then the defaults set every value.
+  - `--publish-include-env` is removed: ship always passes `--env` to `fluid publish`.
+  - `fluid forge` asks for the CI provider only; `--ci-complexity` is removed, and the CI state
+    records the provider and add-ons.
+  - The generated files are checked in the tests: actionlint and zizmor on GitHub, the published
+    GitLab and CircleCI schemas, and structure checks for Azure DevOps, Bitbucket, Tekton and
+    Jenkins.
+  - `fluid ship` stage 11 writes `runtime/schedule-sync-report.json`, as Jenkins' stage 11 did.
 - **`fluid ship` reads the switches a generated pipeline sets, and every stage knob Jenkins had.**
   `RUN_STAGE_<N>_<NAME>=false` switches a stage off, with `--stage` too (a CI step names a stage,
   it does not decide on it): a step whose stage is off says so and exits 0, writing no report.

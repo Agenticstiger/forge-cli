@@ -28,7 +28,7 @@ The file's consumers in slices 7 and 8:
 
 * **Slice 7** (this slice): ``_scaffold_ci_pipeline`` writes
   ``ci-state.json`` immediately after ``write_pipeline_files`` succeeds,
-  recording the provider, complexity, environments, options, and the
+  recording the provider, the add-ons, and the
   sha256 of every generated file.
 
 * **Slice 8** (next): ``_resolve_ci_choice`` reads the recorded provider
@@ -66,17 +66,13 @@ class CIStateDocument:
     """In-memory representation of the ci-state payload."""
 
     provider: str
-    complexity: str
-    environments: List[str] = field(default_factory=list)
-    options: Dict[str, Any] = field(default_factory=dict)
+    add_ons: List[str] = field(default_factory=list)
     files: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_payload(self) -> Dict[str, Any]:
         return {
             "provider": self.provider,
-            "complexity": self.complexity,
-            "environments": list(self.environments),
-            "options": dict(self.options),
+            "add_ons": list(self.add_ons),
             "files": list(self.files),
         }
 
@@ -126,9 +122,7 @@ class CIStateDriftReport:
 def build_ci_state_payload(
     *,
     provider: str,
-    complexity: str,
-    environments: Optional[List[str]] = None,
-    options: Optional[Dict[str, Any]] = None,
+    add_ons: Optional[List[str]] = None,
     written_files: List[Path],
     product_root: Path,
     body_contents: Optional[Dict[str, str]] = None,
@@ -184,9 +178,7 @@ def build_ci_state_payload(
 
     return CIStateDocument(
         provider=provider,
-        complexity=complexity,
-        environments=list(environments or []),
-        options=dict(options or {}),
+        add_ons=list(add_ons or []),
         files=files,
     )
 
@@ -212,25 +204,21 @@ def load_ci_state(product_root: Path) -> Optional[CIStateDocument]:
         return None
 
     provider = raw.get("provider")
-    complexity = raw.get("complexity")
-    if not isinstance(provider, str) or not isinstance(complexity, str):
+    if not isinstance(provider, str):
         return None
 
-    environments = raw.get("environments") or []
-    if not isinstance(environments, list):
-        environments = []
-    options = raw.get("options") or {}
-    if not isinstance(options, dict):
-        options = {}
+    # A record written before the pipeline had one shape carries
+    # ``complexity``, ``environments`` and ``options``; they are ignored.
+    add_ons = raw.get("add_ons") or []
+    if not isinstance(add_ons, list):
+        add_ons = []
     files = raw.get("files") or []
     if not isinstance(files, list):
         files = []
 
     return CIStateDocument(
         provider=provider,
-        complexity=complexity,
-        environments=[str(e) for e in environments if isinstance(e, str)],
-        options=dict(options),
+        add_ons=[str(a) for a in add_ons if isinstance(a, str)],
         files=[entry for entry in files if isinstance(entry, dict)],
     )
 

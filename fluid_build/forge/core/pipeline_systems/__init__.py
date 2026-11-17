@@ -14,16 +14,14 @@ module is now a thin shim that re-exports everything from this
 package (back-compat for tests + downstream tools).
 """
 
-from typing import List, Tuple
+from typing import Dict, Tuple
 
 from ._base import (
     PINNED_ACTIONS,
     BasePipelineTemplate,
-    PipelineComplexity,
     PipelineConfig,
     PipelineProvider,
     PipelineTemplateGenerator,
-    StageSpec,
     _pin_action,
 )
 from .azure_devops import AzureDevOpsTemplate
@@ -37,54 +35,30 @@ from .tekton import TektonTemplate
 
 def generate_pipeline_template(
     provider: str,
-    complexity: str = "standard",
-    environments: List[str] = None,
-    enable_marketplace: bool = False,
     cloud_auth: Tuple[str, ...] = (),
-):
-    """Generate pipeline template for the given provider.
+    add_ons: Tuple[str, ...] = (),
+) -> Dict[str, str]:
+    """The pipeline files for ``provider`` (github_actions, gitlab_ci, ...).
 
-    Convenience wrapper around :class:`PipelineTemplateGenerator` —
-    constructs a :class:`PipelineConfig` from string args and returns
-    the generated file map.
-
-    Args:
-        provider: CI/CD provider (github_actions, gitlab_ci, etc.)
-        complexity: Pipeline complexity (basic, standard, advanced, enterprise)
-        environments: List of deployment environments
-        enable_marketplace: Enable marketplace publishing
-        cloud_auth: platforms the deploy jobs authenticate to without a static key
-            (any of "aws", "gcp", "snowflake", "databricks", "openbao")
-
-    Returns:
-        Dictionary of filename -> content for pipeline files
+    Convenience wrapper around :class:`PipelineTemplateGenerator`:
+    ``cloud_auth`` names the platforms the jobs authenticate to without a
+    static key (any of "aws", "gcp", "snowflake", "databricks", "openbao"),
+    ``add_ons`` the jobs beside the pipeline (security, compliance, sbom).
     """
     try:
         provider_enum = PipelineProvider(provider)
-        complexity_enum = PipelineComplexity(complexity)
     except ValueError as e:
         raise ValueError(f"Invalid parameter: {e}")
-
-    config = PipelineConfig(
-        provider=provider_enum,
-        complexity=complexity_enum,
-        environments=environments,
-        enable_marketplace_publishing=enable_marketplace,
-        cloud_auth=cloud_auth,
-    )
-
-    generator = PipelineTemplateGenerator()
-    return generator.generate_pipeline(config)
+    config = PipelineConfig(provider=provider_enum, cloud_auth=cloud_auth, add_ons=add_ons)
+    return PipelineTemplateGenerator().generate_pipeline(config)
 
 
 __all__ = [
     "BasePipelineTemplate",
     "PINNED_ACTIONS",
-    "PipelineComplexity",
     "PipelineConfig",
     "PipelineProvider",
     "PipelineTemplateGenerator",
-    "StageSpec",
     "_pin_action",
     "GitHubActionsTemplate",
     "GitLabCITemplate",

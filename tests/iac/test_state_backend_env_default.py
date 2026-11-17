@@ -356,7 +356,6 @@ def test_apply_help_still_fits_its_cap_with_debug_logging(monkeypatch: pytest.Mo
 
 def _generated_pipeline_files() -> Dict[str, str]:
     from fluid_build.forge.core.pipeline_templates import (
-        PipelineComplexity,
         PipelineConfig,
         PipelineProvider,
         PipelineTemplateGenerator,
@@ -365,28 +364,45 @@ def _generated_pipeline_files() -> Dict[str, str]:
     generator = PipelineTemplateGenerator()
     files: Dict[str, str] = {}
     for provider in PipelineProvider:
-        for complexity in PipelineComplexity:
+        for add_ons in ((), ("security", "compliance", "sbom")):
             for install_mode in ("pypi", "dev-source"):
                 for oidc in ((), ("aws",), ("gcp",), ("snowflake", "databricks", "openbao")):
                     config = PipelineConfig(
                         provider=provider,
-                        complexity=complexity,
+                        add_ons=add_ons,
                         install_mode=install_mode,
                         cloud_auth=oidc,
-                        enable_marketplace_publishing=True,
                     )
                     for name, text in generator.generate_pipeline(config).items():
-                        label = f"{provider.value}/{complexity.value}/{install_mode}/{oidc}/{name}"
+                        label = f"{provider.value}/{len(add_ons)}/{install_mode}/{oidc}/{name}"
                         files[label] = text
     return files
 
 
 def test_no_generated_pipeline_passes_the_state_backend_flag() -> None:
     files = _generated_pipeline_files()
-    assert len(files) >= 7 * 4 * 2 * 4
-    assert any("fluid apply" in text for text in files.values())
+    assert len(files) >= 7 * 2 * 2 * 4
+    assert any("fluid ship" in text for text in files.values())
     offenders = sorted(label for label, text in files.items() if "state-backend" in text)
     assert offenders == []
+
+
+def test_ship_does_not_pass_the_state_backend_flag_to_apply(tmp_path: Path) -> None:
+    """Every generated pipeline applies through ``fluid ship``: its apply argv is
+    the only place a flag could be added, and it adds none."""
+    import argparse
+
+    from fluid_build.cli import _ship_stages as st
+    from fluid_build.cli import ship
+
+    parser = argparse.ArgumentParser()
+    ship.register(parser.add_subparsers(dest="command"))
+    opts = st.resolve_options(
+        parser.parse_args(["ship", "--yes"]), "contract.fluid.yaml", {"FLUID_STATE_BACKEND": "s3"}
+    )
+    argv = st.build_stage(7, opts, st.Workspace(tmp_path)).argv or []
+    assert argv[0] == "apply"
+    assert not any("state-backend" in token for token in argv)
 
 
 def test_no_scheduled_dag_passes_the_state_backend_flag() -> None:
