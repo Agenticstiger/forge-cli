@@ -86,6 +86,28 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
             env_value = os.environ.get("DMM_AUTO_APPROVE_ACCESS", "").strip().lower()
             self.auto_approve_access = env_value in {"1", "true", "yes", "on"}
 
+    @staticmethod
+    def _with_dmm_product_ids(payload: CatalogPublicationPayload) -> CatalogPublicationPayload:
+        """The payload rebuilt from a contract whose product ids are spelled as the
+        native provider publishes them (``_ids.with_dmm_product_ids``).
+
+        Entropy ids are case-sensitive, and the native provider has always published
+        ``Silver.Sales.Orders`` as ``silver.sales.orders``; this path published it as
+        written and named upstreams as written, so the two paths, and a producer and
+        its consumers, did not meet. Unchanged ids keep the payload as it is.
+        """
+        from fluid_build.providers.datamesh_manager._ids import with_dmm_product_ids
+
+        contract = payload.contract or {}
+        normalized = with_dmm_product_ids(contract)
+        if normalized == dict(contract) and (
+            payload.product.product_id == normalized.get("id", payload.product.product_id)
+        ):
+            return payload
+        return CatalogPublicationPayload.from_contract(
+            normalized, {col: list(labels) for col, labels in payload.classifications.items()}
+        )
+
     def _endpoint_refusal(self) -> Optional[str]:
         """Why the key must not go to ``api_url``, or ``None``.
 
@@ -145,6 +167,7 @@ class DataMeshManagerRegistrar(CatalogRegistrar):
         non-fatal (logged at WARNING) — a missing source-system entity
         only degrades the lineage graph, not the product publish.
         """
+        payload = self._with_dmm_product_ids(payload)
         product_id = payload.product.product_id
         product_urn = f"dmm://{product_id}"
         if not self.api_token:

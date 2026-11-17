@@ -117,6 +117,7 @@ _PROVIDER_TYPE_MAP: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
+from fluid_build.providers.datamesh_manager._ids import dmm_product_id, with_dmm_product_ids
 from fluid_build.providers.datamesh_manager._odps_helpers import (
     ensure_odps_archetype_custom_property,
 )
@@ -492,6 +493,9 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         odps_lineage_mode: Optional[str] = None,
         auto_approve_access: Optional[bool] = None,
     ) -> Dict[str, Any]:
+        # One spelling of every product id, this one's and its upstreams' (Entropy ids
+        # are case-sensitive): see ``_ids.with_dmm_product_ids``.
+        fluid = with_dmm_product_ids(fluid)
         dp = self._to_data_product(
             fluid,
             data_product_specification=data_product_specification,
@@ -638,18 +642,37 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         # What the product named before this publish: the contracts it no longer names
         # are retired below.
         existing_product = self._existing_product(product_id)
+
+        # One ODCS data contract per expose, BEFORE the product, as the registrar
+        # does: an output port may then name only a contract that landed. The product
+        # used to go first, so a contract that failed to render, PUT or validate left
+        # its port naming nothing.
+        odcs_results: Optional[List[Dict[str, Any]]] = None
+        if publish_contract:
+            odcs_results = self._publish_odcs_per_expose(
+                fluid,
+                product_id,
+                validate_generated_contracts=validate_generated_contracts,
+                validation_mode=validation_mode,
+            )
+        sent_contract_ids = {
+            str(r["contract_id"])
+            for r in odcs_results or []
+            if r.get("success") and r.get("contract_id")
+        }
+
         dropped_contract_ids: List[str] = []
-        if is_odps_payload and not publish_contract:
-            # No contract goes out with this publish, so a port may only name one
-            # Entropy already has; otherwise the product links to nothing.
+        if is_odps_payload:
+            # A port names only a contract this publish sent or Entropy already has.
             dropped_contract_ids = drop_unresolved_port_contract_ids(
-                dp, set(), self._contract_exists
+                dp, sent_contract_ids, self._contract_exists
             )
             for contract_id in dropped_contract_ids:
                 self._log.warning(
-                    "Output port contract %s is not in Entropy and this publish does not "
-                    "send it (--with-contract does); the port goes out without a contractId.",
+                    "Output port contract %s did not land in Entropy (%s); the port goes "
+                    "out without a contractId.",
                     contract_id,
+                    "its publish failed" if publish_contract else "--with-contract sends it",
                 )
 
         # PUT data product
@@ -665,15 +688,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         }
         if is_odps_payload:
             result["odps_lineage_mode"] = lineage_mode
-
-        # Publish one ODCS data contract per expose, linked via dataContractId
-        if publish_contract:
-            odcs_results = self._publish_odcs_per_expose(
-                fluid,
-                product_id,
-                validate_generated_contracts=validate_generated_contracts,
-                validation_mode=validation_mode,
-            )
+        if odcs_results is not None:
             result["odcs_contracts"] = odcs_results
 
         access_results = self._publish_access_agreements(
@@ -689,12 +704,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
         if cancelled:
             result["cancelled_access_agreements"] = cancelled
 
-        keep_ids = set(output_port_contract_ids(dp))
-        keep_ids.update(
-            str(r["contract_id"])
-            for r in result.get("odcs_contracts") or []
-            if r.get("success") and r.get("contract_id")
-        )
+        keep_ids = set(output_port_contract_ids(dp)) | sent_contract_ids
         retired = self._retire_stale_contracts(product_id, existing_product, keep_ids)
         if retired:
             result["retired_contracts"] = sorted(retired)
@@ -1246,8 +1256,10 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                     node = None
                     break
             if node and isinstance(node, str):
-                # Sanitise: the API needs a valid URL path segment
-                return node.strip().lower().replace(" ", "-").replace("/", "-")
+                # Sanitise: the API needs a valid URL path segment. The same slug
+                # is applied to every consumes[].productId (``_ids``), so both ends
+                # of an edge spell the product one way.
+                return dmm_product_id(node)
         raise ProviderError(
             "FLUID contract is missing a product id.  Set 'id', 'metadata.id', or 'metadata.name'."
         )

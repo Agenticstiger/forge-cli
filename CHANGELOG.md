@@ -505,6 +505,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Some Data Mesh Manager / Entropy Data lineage still went to the wrong place.** Two
+  upstreams exposing the same port name (`crm.accounts`, `erp.accounts`) each with a
+  `consumes[].sourceSystem`: the first input port got the second's source system and the
+  renamed second port none, and a consume `name`d apart from its exposeId got none; a
+  source system now goes to the port built for its consume (matched by its `contractId`).
+  A product id with an upper-case letter was published lower-cased by `fluid datamesh-manager
+  publish` and as written by `fluid publish --target datamesh-manager`, while consumers named
+  it as written; Entropy ids are case-sensitive, so the edge went nowhere. Both paths now slug
+  the product's id and every `consumes[].productId` the same way (lower case, spaces and `/`
+  as `-`); a product the registrar published under a mixed-case id is published again under
+  the lower-case one. With `--with-contract` the native path now PUTs the contracts before
+  the product and an output port names only a contract that landed.
 - **Every Data Mesh Manager / Entropy Data product showed as a plain "Data Product".** The ODPS
   v1.0.0 payload has no archetype field, and Entropy reads it from `customProperties[type]`
   in kebab case only. Both publish paths now send it: `metadata.archetype` when set (spelled
