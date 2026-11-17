@@ -184,7 +184,7 @@ def _skip_after_dry_run(stage: int, what: str) -> str:
     dry run. A dry-run build writes nothing: not the target, the catalog or
     the scheduler (whose DAG would apply for real)."""
     return (
-        'if [ "$MODE" = dry-run ] && [ "${RUN_STAGE_7_APPLY:-true}" = "true" ]; then '
+        'if [ "$MODE" = dry-run ] && [ "${RUN_STAGE_7_APPLY:-true}" != "false" ]; then '
         f'echo "stage {stage}: APPLY_MODE dry-run applied nothing, so {what} — skipped '
         '(APPLY_MODE amend or amend-and-build applies)"; '
         "exit 0; fi; "
@@ -956,7 +956,13 @@ class BasePipelineTemplate:
                 display="validate",
                 toggle_param="RUN_STAGE_2_VALIDATE",
                 default_run=True,
-                command=(f"set -eu; {_needs_bundle(2)}fluid validate {BUNDLE_PATH} {env} --strict"),
+                # VALIDATE_STRICT=false drops --strict, as `fluid ship` reads it.
+                command=(
+                    f"set -eu; {_needs_bundle(2)}"
+                    f"set -- {BUNDLE_PATH} {env} --report runtime/validate-report.json; "
+                    'if [ "${VALIDATE_STRICT:-true}" != "false" ]; then set -- "$@" --strict; fi; '
+                    'fluid validate "$@"'
+                ),
             ),
             StageSpec(
                 num=3,
@@ -969,8 +975,10 @@ class BasePipelineTemplate:
                 # A bundle does not record it.
                 command=(
                     f"set -eu; {_needs_bundle(3)}"
-                    f"fluid generate artifacts {BUNDLE_PATH} {env} "
-                    f'--contract-path "{project_contract}" --out dist/artifacts/'
+                    f"set -- {BUNDLE_PATH} {env} "
+                    f'--contract-path "{project_contract}" --out dist/artifacts/; '
+                    'if [ -n "${GENERATE_EMIT:-}" ]; then set -- "$@" --emit "$GENERATE_EMIT"; fi; '
+                    'fluid generate artifacts "$@"'
                 ),
             ),
             StageSpec(
@@ -979,7 +987,11 @@ class BasePipelineTemplate:
                 display="validate artifacts",
                 toggle_param="RUN_STAGE_4_VALIDATE_ARTIFACTS",
                 default_run=True,
-                command="fluid validate-artifacts dist/artifacts/ --strict",
+                command=(
+                    "set -- dist/artifacts/ --report runtime/validate-artifacts-report.json; "
+                    'if [ "${VALIDATE_STRICT:-true}" != "false" ]; then set -- "$@" --strict; fi; '
+                    'fluid validate-artifacts "$@"'
+                ),
             ),
             StageSpec(
                 num=5,
@@ -989,8 +1001,13 @@ class BasePipelineTemplate:
                 default_run=True,
                 command=(
                     f"set -eu; {_needs_bundle(5)}"
-                    f"fluid diff {BUNDLE_PATH} --exit-on-drift {env} "
-                    "--out runtime/diff-report.json"
+                    f"set -- {BUNDLE_PATH}; "
+                    'if [ "${DIFF_EXIT_ON_DRIFT:-true}" != "false" ]; then '
+                    'set -- "$@" --exit-on-drift; fi; '
+                    f'set -- "$@" {env} --out runtime/diff-report.json; '
+                    'if [ -n "${DIFF_LAST_APPLIED:-}" ]; then '
+                    'set -- "$@" --last-applied "$DIFF_LAST_APPLIED"; fi; '
+                    'fluid diff "$@"'
                 ),
             ),
             StageSpec(
@@ -1006,8 +1023,11 @@ class BasePipelineTemplate:
                 # the plan stage, before stage 7 reaches a cloud.
                 command=(
                     f'set -eu; {_needs_bundle(6)}MODE="{p("APPLY_MODE")}"; '
-                    f"fluid plan {BUNDLE_PATH} "
-                    f'--out runtime/plan.json --mode "$MODE" {env} --check-sovereignty'
+                    f"set -- {BUNDLE_PATH} "
+                    f'--out runtime/plan.json --mode "$MODE" {env} --check-sovereignty; '
+                    'if [ "${PLAN_HTML:-false}" = "true" ]; then '
+                    'set -- "$@" --html runtime/plan.html; fi; '
+                    'fluid plan "$@"'
                 ),
             ),
             StageSpec(
@@ -1062,8 +1082,12 @@ class BasePipelineTemplate:
                 # After a dry-run apply the bindings are checked, not
                 # enforced: a dry run writes nothing, access bindings included.
                 command=(
-                    f'set -eu; MODE="{p("APPLY_MODE")}"; POLICY_MODE=enforce; '
-                    'if [ "$MODE" = dry-run ]; then POLICY_MODE=check; '
+                    f'set -eu; MODE="{p("APPLY_MODE")}"; '
+                    'POLICY_MODE="${POLICY_APPLY_MODE:-enforce}"; '
+                    'case "$POLICY_MODE" in enforce|check) ;; *) '
+                    'echo "POLICY_APPLY_MODE must be enforce or check" >&2; exit 2 ;; esac; '
+                    'if [ "$MODE" = dry-run ] && [ "${RUN_STAGE_7_APPLY:-true}" != "false" ] '
+                    '&& [ "$POLICY_MODE" = enforce ]; then POLICY_MODE=check; '
                     'echo "APPLY_MODE dry-run applied nothing: policy bindings are checked, '
                     'not enforced"; fi; '
                     "if [ -f dist/artifacts/policy/bindings.json ]; then "
@@ -1084,8 +1108,10 @@ class BasePipelineTemplate:
                 command=(
                     f'set -eu; MODE="{p("APPLY_MODE")}"; '
                     f"{_skip_after_dry_run(9, 'there is nothing to verify')}{_needs_bundle(9)}"
-                    f"fluid verify {BUNDLE_PATH} --strict "
-                    f"{env} --out runtime/verify-report.json"
+                    f"set -- {BUNDLE_PATH}; "
+                    'if [ "${VERIFY_STRICT:-true}" != "false" ]; then set -- "$@" --strict; fi; '
+                    f'set -- "$@" {env} --out runtime/verify-report.json; '
+                    'fluid verify "$@"'
                 ),
             ),
             StageSpec(
