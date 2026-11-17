@@ -96,3 +96,18 @@ def test_the_shim_fills_job_run_ids_through_the_paginator(by_name):
     adapter.get = lambda run_id: seen.append(run_id)  # the read after the list is not the shim's
     adapter.runs()
     assert "ff81f100" in seen
+
+
+@pytest.mark.parametrize("shim", [True, False])
+def test_the_shim_fills_a_job_runs_job_run_id(by_name, shim):
+    run = dataclasses.replace(by_name, target={"applicationId": "b2f154e9"})
+    # botocore keeps only the model's members: a non-model "id" is dropped while parsing,
+    # so it never could stand in for jobRunId; the ARN can.
+    job = {"id": "ff81f100", "arn": f"{APP_ARN}/jobruns/ff81f100"}
+    body = {"jobRun": {"applicationId": "b2f154e9", "state": "RUNNING", **job}}
+    adapter = _adapters.adapter_for(run, _factory({"GetJobRun": body}, shim=shim))
+    if shim:
+        assert adapter.get("ff81f100").run_id == "ff81f100"
+    else:
+        with pytest.raises(_adapters.SparkRunError, match="job run carries no jobRunId"):
+            adapter.get("ff81f100")

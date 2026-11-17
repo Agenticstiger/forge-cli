@@ -482,17 +482,26 @@ def test_where_names_the_target(serverless, glue_run, ec2_run, eks_run):
 
 
 def test_a_serverless_summary_is_read_by_its_id():
-    assert ad._summary_id({"id": "abc", "arn": ARN}, "job run") == "abc"
+    assert ad._required_id({"id": "abc", "arn": ARN}, "job run summary") == "abc"
+    assert ad._required_id({"jobRunId": "jr", "id": "x"}, "job run", "jobRunId") == "jr"
 
 
 @pytest.mark.parametrize("summary", [{"arn": ARN, "name": "x"}, {"id": ""}, {}])
 def test_a_serverless_summary_without_an_id_is_a_clear_error(summary):
     """AWS always returns ``id``; an emulator that does not is the test's to shim."""
     with pytest.raises(ad.SparkRunError, match="job run summary carries no id; its keys: ") as err:
-        ad._summary_id(summary, "job run")
+        ad._required_id(summary, "job run summary")
     for key in summary:
         assert key in str(err.value)
     assert "xxxxxxxxxxxx" not in str(err.value)  # the ARN is never parsed for one
+
+
+def test_a_serverless_job_run_without_a_job_run_id_is_a_clear_error(serverless):
+    """GetJobRun's jobRun carries jobRunId on AWS; an ``id`` alone is not read as one."""
+    adapter, stub = adapter_on(serverless, "emr-serverless")
+    adapter.client.get_job_run = lambda **_k: {"jobRun": {"id": "jr1", "state": "RUNNING"}}
+    with pytest.raises(ad.SparkRunError, match="job run carries no jobRunId; its keys: id, state"):
+        adapter.get("jr1")
 
 
 class _Pages:

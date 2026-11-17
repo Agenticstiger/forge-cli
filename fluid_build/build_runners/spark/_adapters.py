@@ -192,17 +192,18 @@ _SERVERLESS = {
 }
 
 
-def _summary_id(summary: Mapping[str, Any], what: str) -> str:
-    """An EMR Serverless list summary's ``id`` (AWS always returns it).
+def _required_id(record: Mapping[str, Any], what: str, key: str = "id") -> str:
+    """An EMR Serverless record's id field (AWS always returns it: ``id`` on list summaries,
+    ``jobRunId`` on a job run).
 
     Raises:
-        SparkRunError: a summary without one, naming the keys it has.
+        SparkRunError: a record without it, naming the keys it has (never their values).
     """
-    ident = summary.get("id")
+    ident = record.get(key)
     if not ident:
         raise SparkRunError(
-            f"an EMR Serverless {what} summary carries no id; its keys: "
-            f"{', '.join(sorted(map(str, summary))) or 'none'}"
+            f"an EMR Serverless {what} carries no {key}; its keys: "
+            f"{', '.join(sorted(map(str, record))) or 'none'}"
         )
     return str(ident)
 
@@ -234,7 +235,7 @@ class EmrServerless(Adapter):
         found = []
         for page in self.client.get_paginator("list_applications").paginate():
             found += [
-                _summary_id(a, "application")
+                _required_id(a, "application summary")
                 for a in page.get("applications") or []
                 if a.get("name") == name and a.get("state") not in ("TERMINATING", "TERMINATED")
             ]
@@ -260,7 +261,7 @@ class EmrServerless(Adapter):
         ident = _identity(driver.get("entryPointArguments") or [], job.get("tags"))
         raw = str(job.get("state") or "")
         return RunInfo(
-            run_id=str(job.get("jobRunId") or job.get("id")),
+            run_id=_required_id(job, "job run", "jobRunId"),
             state=_SERVERLESS.get(raw, PENDING),
             raw_state=raw,
             attempt=job.get("attempt"),
@@ -279,13 +280,17 @@ class EmrServerless(Adapter):
         found: Dict[str, Mapping[str, Any]] = {}
         for page in paginator.paginate(applicationId=app, states=sorted(_SERVERLESS_ACTIVE)):
             found.update(
-                {_summary_id(j, "job run"): j for j in page.get("jobRuns") or [] if self._mine(j)}
+                {
+                    _required_id(j, "job run summary"): j
+                    for j in page.get("jobRuns") or []
+                    if self._mine(j)
+                }
             )
         active = set(found)
         for number, page in enumerate(paginator.paginate(applicationId=app)):
             for j in page.get("jobRuns") or []:
                 if self._mine(j):
-                    found.setdefault(_summary_id(j, "job run"), j)
+                    found.setdefault(_required_id(j, "job run summary"), j)
             if number + 1 >= self.LOOKBACK_PAGES:
                 break
         ordered = sorted(found.items(), key=lambda kv: _ts(kv[1].get("createdAt")), reverse=True)
