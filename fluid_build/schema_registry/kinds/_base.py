@@ -71,7 +71,9 @@ class RegistryKind:
         Its scheme must be https and its host is the one the operator's ``NAME@host``
         grant names (``policy.floor_findings``), and ``fluid apply`` resolves the secret
         for that host. The registry's own ``url`` by default; a kind with a separate
-        authentication endpoint returns that endpoint's URL.
+        authentication endpoint returns that endpoint's URL. The kind's :meth:`client`
+        must send the credential to this URL and nowhere else: it is the only host the
+        floor judges for the credential.
         """
         return getattr(ref, "url", None)
 
