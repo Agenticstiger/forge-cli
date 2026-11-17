@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import logging
 import os
 import secrets
@@ -72,7 +73,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "Environment variables read when the flag is absent: FLUID_ENV, APPLY_MODE, "
             "APPLY_BUILD_ID, ALLOW_DATA_LOSS, NO_VERIFY_DIGEST, PUBLISH_TARGETS, SCHEDULER, "
             "SCHEDULER_DESTINATION, SCHEDULER_ENVIRONMENT_NAME, SCHEDULER_LOCATION, "
-            "SCHEDULER_WORKSPACE, SCHEDULE_SYNC_DRY_RUN.\n\n"
+            "SCHEDULER_WORKSPACE, SCHEDULE_SYNC_DRY_RUN, VALIDATE_STRICT, VERIFY_STRICT, "
+            "GENERATE_EMIT, DIFF_EXIT_ON_DRIFT, DIFF_LAST_APPLIED, PLAN_HTML, POLICY_APPLY_MODE, "
+            "and RUN_STAGE_<N>_<NAME>: false switches a stage off, even one --stage names "
+            "(a run with nothing left says so and exits 0); true switches on 10 or 11 when "
+            "--stage is not given."
+            "\n\n"
             "Examples:\n"
             "  fluid ship --explain                      # show the plan, run nothing\n"
             "  fluid ship contract.fluid.yaml --env dev --yes\n"
@@ -83,6 +89,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
     _add_run_options(p)
     _add_apply_options(p.add_argument_group("apply"))
+    _add_stage_options(p.add_argument_group("stage options"))
     _add_publish_options(p.add_argument_group("publish and schedule (opt-in stages 10 and 11)"))
     _add_selection_options(p.add_argument_group("selecting stages"))
     _add_output_options(p.add_argument_group("output"))
@@ -104,13 +111,16 @@ def _add_run_options(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--strict",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Pass --strict to validate and validate-artifacts (default; --no-strict drops it).",
+        default=None,
+        help=(
+            "Pass --strict to validate and validate-artifacts (default: on unless "
+            "$VALIDATE_STRICT is false; --no-strict drops it)."
+        ),
     )
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="Same as --apply-mode dry-run: plan and apply write nothing.",
+        help="Same as --apply-mode dry-run: apply changes nothing in the target.",
     )
     p.add_argument(
         "--skip-bundle",
@@ -148,11 +158,60 @@ def _add_apply_options(g: argparse._ArgumentGroup) -> None:
         action="store_true",
         help="Pass --no-verify-plan-binding --no-verify-federation to apply.",
     )
-    g.add_argument(
-        "--no-verify-strict", action="store_true", help="Drop --strict from the verify stage."
-    )
+
+
+def _add_stage_options(g: argparse._ArgumentGroup) -> None:
+    """What single stages pass to their command."""
     g.add_argument(
         "--no-generate-artifacts", action="store_true", help="Skip stage 3 (generate artifacts)."
+    )
+    g.add_argument(
+        "--emit",
+        default=None,
+        metavar="LIST",
+        help="Stage 3 --emit, comma-separated (default: $GENERATE_EMIT, else every emitter).",
+    )
+    g.add_argument(
+        "--exit-on-drift",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Stage 5 fails on drift (default: on unless $DIFF_EXIT_ON_DRIFT is false; "
+            "--no-exit-on-drift reports drift without failing)."
+        ),
+    )
+    g.add_argument(
+        "--last-applied",
+        default=None,
+        metavar="PLAN",
+        help=(
+            "Stage 5 compares with the plan the last apply ran, so a change the contract makes "
+            "is pending, not drift (default: $DIFF_LAST_APPLIED)."
+        ),
+    )
+    g.add_argument(
+        "--plan-html",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Stage 6 also writes runtime/plan.html (default: off unless $PLAN_HTML is true).",
+    )
+    g.add_argument(
+        "--policy-mode",
+        choices=st.POLICY_MODES,
+        default=None,
+        help=(
+            "Stage 8 mode (default: $POLICY_APPLY_MODE, else enforce); check after a dry-run "
+            "apply either way."
+        ),
+    )
+    g.add_argument(
+        "--verify-strict",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Pass --strict to stage 9 (default: on unless $VERIFY_STRICT is false; "
+            "--no-verify-strict drops it)."
+        ),
     )
 
 
@@ -231,6 +290,9 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     """Run the selected pipeline stages in order; stop at the first failure."""
     try:
         return _run(args, logger)
+    except _NothingToRun as exc:
+        _out(f"fluid ship: {exc}")
+        return report.EXIT_OK
     except st.ShipUsageError as exc:
         logger.error("fluid ship: %s", _ci_output.oneline(str(exc)))
         return report.EXIT_USAGE
@@ -302,6 +364,18 @@ def _run_selected(
     return _finish(records, rows, ctx)
 
 
+class _NothingToRun(Exception):
+    """Every stage the flags selected is switched off: exit 0, no report (the
+    step that owns a switched-off stage writes nothing for it)."""
+
+    def __init__(self, stages: List[int]) -> None:
+        names = ", ".join(f"{num} {st.STAGE_NAMES[num]}" for num in stages)
+        switches = ", ".join(f"{st.STAGE_TOGGLES[num]}=false" for num in stages)
+        verb = "is" if len(stages) == 1 else "are"
+        noun = "stage" if len(stages) == 1 else "stages"
+        super().__init__(f"{noun} {names} {verb} switched off ({switches}): nothing to run")
+
+
 @dataclass
 class _Context:
     """What every stage of one run shares."""
@@ -346,14 +420,27 @@ def _prepare(
     project_dir, args.contract = st.project_location(args.contract)
     st.check_contract_path(os.path.join(project_dir, args.contract))
     opts = st.resolve_options(args, args.contract, os.environ)
-    selected, not_selected = st.select_stages(
-        publish=bool(args.publish),
-        schedule_sync=bool(args.schedule_sync),
+    # RUN_STAGE_<N>_<NAME>: the switches a generated pipeline passes through.
+    # An explicit --publish or --schedule-sync beats its own switch; a true
+    # switch adds its stage only to a run that does not name its stages, so a
+    # CI step running --stage 3 never publishes.
+    switched_on, switched_off = st.stage_switches(os.environ)
+    switched_off -= {10} if args.publish else set()
+    switched_off -= {11} if args.schedule_sync else set()
+    whole_run = args.stage is None
+    select = functools.partial(
+        st.select_stages,
+        publish=bool(args.publish) or (whole_run and 10 in switched_on),
+        schedule_sync=bool(args.schedule_sync) or (whole_run and 11 in switched_on),
         stage_spec=args.stage,
         until=args.until,
         skip_stages=args.skip_stage or [],
     )
+    selected, not_selected = select(switched_off=switched_off)
     if not selected:
+        flagged, _ = select()  # what the flags alone left to run
+        if flagged:  # all of it switched off: a CI step whose stage is off
+            raise _NothingToRun(flagged)
         raise st.ShipUsageError("no stage left to run (check --stage, --until and --skip-stage)")
     if 10 in selected and not st.dry_run_applied_nothing(opts):  # stage 10 will publish
         st.check_targets(opts.targets)
@@ -549,10 +636,13 @@ def _assume_outputs(
     elif num == 6:
         ws.assume.add(st.PLAN_PATH)
     elif num == 3 and action.argv is not None:
-        # Policy bindings are always written (empty when no policy is declared);
-        # schedule DAGs only for a contract that declares something to schedule.
-        ws.assume.update({"dist/artifacts", st.POLICY_BINDINGS})
-        if st.schedules_expected(opts):
+        # Policy bindings are written whenever --emit includes policies (empty when
+        # no policy is declared); schedule DAGs when it includes schedule and the
+        # contract declares something to schedule.
+        ws.assume.add("dist/artifacts")
+        if st.emits(opts, "policies"):
+            ws.assume.add(st.POLICY_BINDINGS)
+        if st.emits(opts, "schedule") and st.schedules_expected(opts):
             ws.assume.add(st.SCHEDULE_DIR)
 
 

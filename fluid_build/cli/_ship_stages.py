@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import (
     Any,
     Callable,
+    Collection,
     Dict,
     Iterator,
     List,
@@ -78,6 +79,30 @@ STAGE_NAMES: Dict[int, str] = {num: name for num, name, _ in STAGES}
 NEEDS_BUNDLE = frozenset({2, 3, 5, 6, 7, 9})
 OPT_IN_FLAG = {10: "--publish", 11: "--schedule-sync"}
 APPLY_STAGE = 7
+POLICY_MODES: Tuple[str, ...] = ("enforce", "check")
+
+#: The switch a generated pipeline exposes for each stage, read from the
+#: environment: ``false`` switches a stage off (like ``--skip-stage``, and with
+#: ``--stage`` too, since a CI step names a stage it does not decide on), and
+#: ``true`` switches on the opt-in stages 10 and 11 when ``--stage`` is not
+#: given (a step that names its stage would otherwise run them too).
+STAGE_TOGGLES: Dict[int, str] = {
+    1: "RUN_STAGE_1_BUNDLE",
+    2: "RUN_STAGE_2_VALIDATE",
+    3: "RUN_STAGE_3_GENERATE_ARTIFACTS",
+    4: "RUN_STAGE_4_VALIDATE_ARTIFACTS",
+    5: "RUN_STAGE_5_DIFF",
+    6: "RUN_STAGE_6_PLAN",
+    7: "RUN_STAGE_7_APPLY",
+    8: "RUN_STAGE_8_POLICY_APPLY",
+    9: "RUN_STAGE_9_VERIFY",
+    10: "RUN_STAGE_10_PUBLISH",
+    11: "RUN_STAGE_11_SCHEDULE_SYNC",
+}
+
+VALIDATE_REPORT = "runtime/validate-report.json"
+VALIDATE_ARTIFACTS_REPORT = "runtime/validate-artifacts-report.json"
+PLAN_HTML_PATH = "runtime/plan.html"
 
 
 class ShipUsageError(Exception):
@@ -97,6 +122,8 @@ class ShipOptions:
     allow_data_loss: bool = False
     no_verify_digest: bool = False
     no_verify_strict: bool = False
+    # False: --no-generate-artifacts, or RUN_STAGE_3_GENERATE_ARTIFACTS=false (stage 3
+    # is not in this pipeline, so stage 4 skips instead of asking for its output).
     generate_artifacts: bool = True
     targets: List[str] = field(default_factory=lambda: [DEFAULT_PUBLISH_TARGET])
     scheduler: str = ""
@@ -110,6 +137,11 @@ class ShipOptions:
     # generated shell's RUN_STAGE_7_APPLY=false), so a dry-run mode skips nothing.
     # ``--stage 9`` alone keeps it True: stage 7 runs in another step of the run.
     apply_in_pipeline: bool = True
+    emit: str = ""  # stage 3 --emit; blank: every emitter
+    diff_exit_on_drift: bool = True  # stage 5 --exit-on-drift
+    diff_last_applied: str = ""  # stage 5 --last-applied: the plan the last apply ran
+    plan_html: bool = False  # stage 6 --html runtime/plan.html
+    policy_mode: str = "enforce"  # stage 8 --mode, unless stage 7 ran as a dry run
 
 
 @dataclass
@@ -136,6 +168,14 @@ def _text(flag: Optional[str], env: Mapping[str, str], name: str, default: str) 
 
 def _truth(flag: bool, env: Mapping[str, str], name: str) -> bool:
     return bool(flag) or env.get(name, "") == "true"
+
+
+def _off_unless_true(flag: Optional[bool], env: Mapping[str, str], name: str) -> bool:
+    """A switch that is off by default: the flag when given (``--x`` or
+    ``--no-x``), else on only for the exact word ``true`` in the variable."""
+    if flag is not None:
+        return bool(flag)
+    return env.get(name, "") == "true"
 
 
 def check_apply_mode(mode: str, where: str) -> str:
@@ -193,6 +233,32 @@ def _resolve_targets(flags: Sequence[object], env: Mapping[str, str]) -> List[st
     )
 
 
+def _on_unless_false(flag: Optional[bool], env: Mapping[str, str], name: str) -> bool:
+    """A switch that is on by default: the flag when given, else off only for
+    the exact word ``false`` in the variable (as the generated pipelines read it)."""
+    if flag is not None:
+        return bool(flag)
+    return env.get(name, "") != "false"
+
+
+def _resolve_policy_mode(flag: object, env: Mapping[str, str]) -> str:
+    """``--policy-mode`` > ``$POLICY_APPLY_MODE`` > enforce."""
+    where = "--policy-mode" if flag is not None else "POLICY_APPLY_MODE"
+    value = str(flag) if flag is not None else (env.get("POLICY_APPLY_MODE") or "enforce")
+    if value not in POLICY_MODES:
+        raise ShipUsageError(f"{where} {value!r} is not a policy mode: {', '.join(POLICY_MODES)}")
+    return value
+
+
+def stage_switches(env: Mapping[str, str]) -> Tuple[Set[int], Set[int]]:
+    """``(switched on, switched off)`` by the ``RUN_STAGE_<N>_<NAME>`` variables:
+    ``true`` switches on stage 10 or 11 (the others are on anyway), ``false``
+    switches any stage off. Any other value leaves the default."""
+    on = {num for num in (10, 11) if env.get(STAGE_TOGGLES[num], "") == "true"}
+    off = {num for num, name in STAGE_TOGGLES.items() if env.get(name, "") == "false"}
+    return on, off
+
+
 def _resolve_env_name(flag_env: Optional[str], env: Mapping[str, str]) -> str:
     """``--env`` > ``$FLUID_ENV`` > dev, refused up front when a stage would refuse it."""
     value = _text(flag_env, env, "FLUID_ENV", DEFAULT_ENV) or DEFAULT_ENV
@@ -213,6 +279,7 @@ def resolve_options(args: object, contract: str, env: Mapping[str, str]) -> Ship
     build_id = _resolve_build_id(get("build_id"), env)
     targets = _resolve_targets(get("target") or [], env)
     env_name = _resolve_env_name(str(get("env")) if get("env") else None, env)
+    switched_off = stage_switches(env)[1]
 
     return ShipOptions(
         contract=contract,
@@ -220,11 +287,11 @@ def resolve_options(args: object, contract: str, env: Mapping[str, str]) -> Ship
         mode=mode,
         build_id=build_id,
         yes=bool(get("yes")),
-        strict=bool(get("strict", True)),
+        strict=_on_unless_false(get("strict"), env, "VALIDATE_STRICT"),
         allow_data_loss=_truth(bool(get("allow_data_loss")), env, "ALLOW_DATA_LOSS"),
         no_verify_digest=_truth(bool(get("no_verify_digest")), env, "NO_VERIFY_DIGEST"),
-        no_verify_strict=bool(get("no_verify_strict")),
-        generate_artifacts=not get("no_generate_artifacts"),
+        no_verify_strict=not _on_unless_false(get("verify_strict"), env, "VERIFY_STRICT"),
+        generate_artifacts=not get("no_generate_artifacts") and 3 not in switched_off,
         targets=targets,
         scheduler=opt("scheduler", "SCHEDULER"),
         scheduler_destination=opt("scheduler_destination", "SCHEDULER_DESTINATION"),
@@ -235,7 +302,13 @@ def resolve_options(args: object, contract: str, env: Mapping[str, str]) -> Ship
             bool(get("schedule_sync_dry_run")), env, "SCHEDULE_SYNC_DRY_RUN"
         ),
         skip_bundle=bool(get("skip_bundle")),
-        apply_in_pipeline=APPLY_STAGE not in {resolve_stage(t) for t in get("skip_stage") or []},
+        apply_in_pipeline=APPLY_STAGE
+        not in {resolve_stage(t) for t in get("skip_stage") or []} | switched_off,
+        emit=opt("emit", "GENERATE_EMIT"),
+        diff_exit_on_drift=_on_unless_false(get("exit_on_drift"), env, "DIFF_EXIT_ON_DRIFT"),
+        diff_last_applied=opt("last_applied", "DIFF_LAST_APPLIED"),
+        plan_html=_off_unless_true(get("plan_html"), env, "PLAN_HTML"),
+        policy_mode=_resolve_policy_mode(get("policy_mode"), env),
     )
 
 
@@ -338,7 +411,7 @@ def _why_not_chosen(num: int, stage_spec: Optional[str]) -> str:
     if stage_spec is not None:
         return "not in --stage"
     if num in OPT_IN_FLAG:
-        return f"opt-in: pass {OPT_IN_FLAG[num]}"
+        return f"opt-in: pass {OPT_IN_FLAG[num]} or set {STAGE_TOGGLES[num]}=true"
     return "not selected"
 
 
@@ -349,8 +422,13 @@ def select_stages(
     stage_spec: Optional[str] = None,
     until: Optional[str] = None,
     skip_stages: Sequence[str] = (),
+    switched_off: Collection[int] = (),
 ) -> Tuple[List[int], Dict[int, str]]:
-    """The stage numbers to consider, plus why each other stage is not in the set."""
+    """The stage numbers to consider, plus why each other stage is not in the set.
+    ``switched_off``: the stages a ``RUN_STAGE_<N>_<NAME>=false`` variable turned off.
+    A switched-off stage that no flag removed first is reported as switched off, in
+    or out of ``--stage``: per-stage CI steps share one report, and the step that
+    owns the stage writes nothing for it."""
     chosen = _initial_stages(stage_spec, publish, schedule_sync)
     why: Dict[int, str] = {}
     if until is not None:
@@ -362,6 +440,9 @@ def select_stages(
         if num in chosen:
             chosen.discard(num)
             why[num] = "--skip-stage"
+    for num in sorted(switched_off):
+        chosen.discard(num)
+        why.setdefault(num, f"{STAGE_TOGGLES[num]}=false")
     for num in STAGE_NUMBERS:
         if num not in chosen:
             why.setdefault(num, _why_not_chosen(num, stage_spec))
@@ -441,6 +522,13 @@ def _contract_reference_only(contract: str) -> bool:
         return bool(_contract_is_reference_only(contract))
 
 
+def emits(opts: ShipOptions, key: str) -> bool:
+    """Whether stage 3's ``--emit`` (blank: every emitter) includes ``key``."""
+    if not opts.emit.strip():
+        return True
+    return key in {part.strip() for part in opts.emit.split(",")}
+
+
 def schedules_expected(opts: ShipOptions) -> bool:
     """Whether stage 3 writes schedule DAGs for this contract, by the rule
     ``generate artifacts`` applies (an ``orchestration.engine``, or a build with
@@ -488,7 +576,14 @@ def _bundle(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
 
 
 def _validate(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
-    a.argv = ["validate", BUNDLE_PATH, *_env_args(o), *(["--strict"] if o.strict else [])]
+    a.argv = [
+        "validate",
+        BUNDLE_PATH,
+        *_env_args(o),
+        "--report",
+        VALIDATE_REPORT,
+        *(["--strict"] if o.strict else []),
+    ]
 
 
 def _generate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
@@ -506,6 +601,7 @@ def _generate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
             o.contract,
             "--out",
             ARTIFACTS_DIR,
+            *(["--emit", o.emit] if o.emit else []),
         ]
 
 
@@ -513,18 +609,31 @@ def _validate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
     if not ws.has_dir(ARTIFACTS_DIR):
         a.skip_reason = f"{ARTIFACTS_DIR} does not exist (stage 3 wrote nothing)"
         return
-    a.argv = ["validate-artifacts", ARTIFACTS_DIR, *(["--strict"] if o.strict else [])]
+    a.argv = [
+        "validate-artifacts",
+        ARTIFACTS_DIR,
+        "--report",
+        VALIDATE_ARTIFACTS_REPORT,
+        *(["--strict"] if o.strict else []),
+    ]
 
 
 def _diff(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
     a.argv = [
         "diff",
         BUNDLE_PATH,
-        "--exit-on-drift",
+        *(["--exit-on-drift"] if o.diff_exit_on_drift else []),
         *_env_args(o),
         "--out",
         "runtime/diff-report.json",
     ]
+    if o.diff_last_applied:
+        a.argv += ["--last-applied", o.diff_last_applied]
+        if not ws.has_file(o.diff_last_applied):
+            a.notes.append(
+                f"no plan at {o.diff_last_applied} yet (a first run): the target is "
+                "compared with the contract alone"
+            )
 
 
 def _plan(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
@@ -537,6 +646,7 @@ def _plan(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
         o.mode,
         *_env_args(o),
         "--check-sovereignty",
+        *(["--html", PLAN_HTML_PATH] if o.plan_html else []),
     ]
 
 
@@ -576,8 +686,8 @@ def _policy_apply(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
     if not ws.has_file(POLICY_BINDINGS):
         a.skip_reason = f"{POLICY_BINDINGS} does not exist (no policy bindings to apply)"
         return
-    mode = "enforce"
-    if o.mode == "dry-run":
+    mode = o.policy_mode
+    if dry_run_applied_nothing(o) and mode == "enforce":
         mode = "check"
         a.notes.append(
             "APPLY_MODE dry-run applied nothing: policy bindings are checked, not enforced"
