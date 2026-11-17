@@ -22,7 +22,7 @@ python -m fluid_build.cli version
 - viz-graph — Graphviz DOT for lineage.
 - viz-plan — static HTML for plan.json.
 - contract-tests — schema compatibility.
-- scaffold-ci — emit GitLab/GitHub pipeline.
+- generate ci: emit a GitHub, GitLab, Jenkins or other CI pipeline.
 - scaffold-composer — emit Airflow DAG.
 - product-new — scaffold a new product.
 - product-add — add source/exposure/dq (prompt embedded).

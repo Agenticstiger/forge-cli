@@ -253,7 +253,6 @@ def test_lint_covers_every_advertised_verb():
     # surfaces, deprecated aliases, etc.).
     deliberately_excluded = {
         "skills",  # industry skills installer; future verb
-        "scaffold-ci",  # alias for generate ci
         "docs",  # placeholder for the docs browser
         "memory",  # internal memory inspection
         "secrets",  # credential management; future

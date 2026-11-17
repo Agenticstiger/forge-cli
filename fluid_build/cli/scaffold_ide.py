@@ -6,7 +6,7 @@ forge-cli from any agentic IDE (Kiro, Cursor, Claude Code, Cline, or a generic
 target).
 
 Design: one canonical pack, multiple per-IDE adapters that translate paths and
-frontmatter. Sibling to ``scaffold-ci``. The pack is:
+frontmatter. Sibling to ``generate ci``. The pack is:
 
 * the Agent Skills in ``fluid_build/agent_skills/skills/`` (agentskills.io
   ``SKILL.md`` format), copied into ``.claude/skills/`` for Claude Code, into

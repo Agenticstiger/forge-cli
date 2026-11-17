@@ -595,13 +595,6 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
             "  fluid validate contract.fluid.yaml --strict --format json"
         ),
     ),
-    "scaffold-ci": (
-        "Generate a ready-to-use CI/CD pipeline configuration for GitLab or GitHub Actions.",
-        (
-            "  fluid scaffold-ci contract.fluid.yaml --system github\n"
-            "  fluid scaffold-ci contract.fluid.yaml --system gitlab --out .gitlab-ci.yml"
-        ),
-    ),
     "export-opds": (
         "[deprecated alias] Export a FLUID contract to LF/ODPI ODPS v4.1 JSON. "
         "Prefer `fluid generate standard --format odps-v4.1` for new scripts. "
@@ -777,15 +770,6 @@ _COMMAND_ENRICHMENT: dict[str, tuple[str, str]] = {
             "  fluid version --verbose\n"
             "  fluid version --format json\n"
             "  fluid version --short"
-        ),
-    ),
-    "generate-pipeline": (
-        "Create dynamic DataOps CI/CD pipeline configs for GitHub Actions, GitLab CI, Jenkins, and more.",
-        (
-            "  fluid generate-pipeline --provider github_actions\n"
-            "  fluid generate-pipeline --provider gitlab_ci --complexity enterprise\n"
-            "  fluid generate-pipeline --interactive\n"
-            "  fluid generate-pipeline --provider jenkins --enable-approvals --enable-security-scan"
         ),
     ),
 }

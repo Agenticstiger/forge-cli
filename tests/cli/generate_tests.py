@@ -23,7 +23,6 @@ COMMANDS = [
     "contract_tests",
     "viz_plan",
     "viz_graph",
-    "scaffold_ci",
     "scaffold_composer",
     "export_opds",
     "opds",

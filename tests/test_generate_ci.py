@@ -20,9 +20,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from fluid_build.cli._pipeline_files import _comment_prefix_for
 from fluid_build.cli.generate_ci import run as generate_ci_run
-from fluid_build.cli.pipeline_generator import _comment_prefix_for
-from fluid_build.cli.scaffold_ci import _DEFAULT_PATHS, _TEMPLATES, GITHUB, GITLAB, JENKINS
 from fluid_build.forge.core.pipeline_templates import (
     PipelineComplexity,
     PipelineConfig,
@@ -58,12 +57,8 @@ def _make_args(
     )
 
 
-# ``generate_ci.run`` now delegates to
-# :class:`PipelineTemplateGenerator`, which emits canonical file paths
-# and a richer stage set than the legacy ``scaffold_ci`` constants.
-# The static constants (``GITHUB`` / ``GITLAB`` / ``JENKINS``) remain
-# the output shape for the legacy ``fluid scaffold-ci`` command and
-# are still covered by their own test classes below.
+# ``generate_ci.run`` delegates to :class:`PipelineTemplateGenerator`,
+# which emits the canonical file path for each system.
 _GENERATE_CI_EXPECTATIONS = (
     (
         "github",
@@ -103,78 +98,6 @@ _GENERATE_CI_EXPECTATIONS = (
         ("apiVersion:", "kind: Pipeline", "fluid"),
     ),
 )
-
-
-# Back-compat alias for the scaffold-ci legacy-constant tests below.
-_STATIC_SYSTEM_CASES = (
-    ("github", ".github/workflows/fluid.yml", GITHUB, ("name: FLUID", "runs-on: ubuntu-latest")),
-    ("gitlab", ".gitlab-ci.yml", GITLAB, ("stages:", "validate:")),
-    ("jenkins", "Jenkinsfile", JENKINS, ("pipeline {", "stage('Validate')")),
-)
-
-
-# ---------------------------------------------------------------------------
-# 1. Static JENKINS template
-# ---------------------------------------------------------------------------
-
-
-class TestJenkinsStaticTemplate:
-    """Validate the ``JENKINS`` constant in scaffold_ci.py."""
-
-    def test_is_nonempty_string(self):
-        assert isinstance(JENKINS, str)
-        assert len(JENKINS.strip()) > 0
-
-    def test_contains_pipeline_block(self):
-        assert "pipeline {" in JENKINS
-
-    def test_contains_stages_block(self):
-        assert "stages {" in JENKINS
-
-    def test_contains_validate_stage(self):
-        assert "stage('Validate')" in JENKINS
-
-    def test_contains_plan_stage(self):
-        assert "stage('Plan')" in JENKINS
-
-    def test_contains_apply_stage(self):
-        assert "stage('Apply')" in JENKINS
-
-    def test_contains_test_stage(self):
-        assert "stage('Test')" in JENKINS
-
-    def test_uses_groovy_comment_syntax(self):
-        """Template should use ``//`` comments, not ``#`` (YAML style)."""
-        first_line = JENKINS.strip().splitlines()[0]
-        assert first_line.startswith("//")
-
-    def test_references_fluid_commands(self):
-        # Generated CI calls the public ``fluid`` console script rather
-        # than the internal ``python -m fluid_build.cli`` path — avoids
-        # assuming ``fluid_build`` is importable on the CI runner.
-        assert "fluid validate" in JENKINS
-        assert "fluid apply" in JENKINS
-        assert "fluid generate speed-transformation" in JENKINS
-
-    def test_has_dbt_airflow_publish_stages(self):
-        """B1 demo requires these three deploy/publish hooks."""
-        # dbt deployment rides on `fluid apply --build`, asserted above.
-        assert "Airflow DAG Sync" in JENKINS
-        assert "stage('Publish')" in JENKINS
-        assert "fluid publish" in JENKINS
-
-    def test_has_post_cleanup(self):
-        assert "cleanWs()" in JENKINS
-
-    def test_has_approval_gate(self):
-        assert "input {" in JENKINS
-
-    def test_registered_in_templates_dict(self):
-        assert "jenkins" in _TEMPLATES
-        assert _TEMPLATES["jenkins"] is JENKINS
-
-    def test_default_output_path(self):
-        assert _DEFAULT_PATHS["jenkins"] == "Jenkinsfile"
 
 
 # ---------------------------------------------------------------------------
@@ -319,16 +242,6 @@ class TestGenerateCIJenkins:
 
 class TestGenerateCIStaticSystems:
     """Cross-system coverage for ``fluid generate ci`` default paths and output."""
-
-    @pytest.mark.parametrize(
-        ("system", "default_path", "template", "tokens"),
-        _STATIC_SYSTEM_CASES,
-    )
-    def test_registered_in_templates_dict(self, system, default_path, template, tokens):
-        assert _TEMPLATES[system] is template
-        assert _DEFAULT_PATHS[system] == default_path
-        for token in tokens:
-            assert token in template
 
     @pytest.mark.parametrize(
         ("system", "default_path", "tokens"),
@@ -866,54 +779,6 @@ class TestJenkinsSimulatedRun:
         for stage in pipeline.stages:
             all_cmds.extend(stage.sh_commands)
         assert not any("marketplace" in c.lower() for c in all_cmds)
-
-
-# ---------------------------------------------------------------------------
-# 5. Simulated run of the STATIC Jenkins template (generate ci)
-# ---------------------------------------------------------------------------
-
-
-class TestStaticJenkinsSimulatedRun:
-    """Simulate a run of the simpler static JENKINS template from
-    ``scaffold_ci.py`` (the one produced by ``fluid generate ci --system jenkins``).
-    """
-
-    @pytest.fixture()
-    def pipeline(self) -> _JenkinsPipeline:
-        return _JenkinsPipeline(JENKINS)
-
-    def test_stages_parsed(self, pipeline):
-        names = [s.name for s in pipeline.stages]
-        assert "Validate" in names
-        assert "Plan" in names
-        assert "Test" in names
-        assert "Apply" in names
-
-    def test_happy_path_on_main(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main")
-        assert runner.run() is True
-        assert len(runner.executed_commands) >= 4  # at least 4 fluid commands
-
-    def test_apply_skipped_on_feature_branch(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="feature/x")
-        runner.run()
-        # Apply stage has when { branch 'main' }
-        assert "Apply" in runner.skipped_stages
-
-    def test_apply_requires_approval(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main", approve_inputs=False)
-        runner.run()
-        assert "Apply" in runner.skipped_stages
-
-    def test_cleanup_runs(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main")
-        runner.run()
-        assert runner.cleanup_ran is True
-
-    def test_validate_failure_halts_pipeline(self, pipeline):
-        runner = _SimulatedJenkinsRunner(pipeline, branch="main", fail_command="validate")
-        assert runner.run() is False
-        assert not any("apply" in c for c in runner.executed_commands)
 
 
 # ---------------------------------------------------------------------------

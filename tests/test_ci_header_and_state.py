@@ -17,6 +17,12 @@ from pathlib import Path
 
 import pytest
 
+from fluid_build.cli._pipeline_files import (
+    _comment_prefix_for,
+    _render_header,
+    build_pipeline_config,
+    write_pipeline_files,
+)
 from fluid_build.cli.artifact_ci_state import (
     build_ci_state_payload,
     write_ci_state,
@@ -24,12 +30,6 @@ from fluid_build.cli.artifact_ci_state import (
 from fluid_build.cli.artifact_paths import (
     ENVELOPE_SCHEMA_VERSION,
     product_ci_state_path,
-)
-from fluid_build.cli.pipeline_generator import (
-    _comment_prefix_for,
-    _render_header,
-    build_pipeline_config,
-    write_pipeline_files,
 )
 from fluid_build.forge.core.pipeline_templates import PipelineTemplateGenerator
 

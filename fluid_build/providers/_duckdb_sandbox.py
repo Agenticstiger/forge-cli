@@ -1120,8 +1120,8 @@ def _private_ca_bundle(bundle: str) -> str:
     false)`` replaced a 333 KB trust store with 14 bytes, while an ungranted
     sibling in the same directory stayed refused. The OS is the only thing that
     stops it: ``/etc/ssl/cert.pem`` is root-owned, so an unprivileged ``fluid``
-    cannot write it -- but ``cli/scaffold_ci.py`` generates a ``python:3.12-slim``
-    job, which runs as root, and that job runs ``fluid apply``. Contract SQL
+    cannot write it -- but a CI image such as ``python:3.12-slim``
+    runs as root, and that job runs ``fluid apply``. Contract SQL
     could have installed its own CA into the trust store of the container it was
     built in. Found by the world-class inspection of the first version of this
     fix, which granted the store itself.

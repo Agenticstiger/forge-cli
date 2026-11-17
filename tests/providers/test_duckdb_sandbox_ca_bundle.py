@@ -281,7 +281,7 @@ def test_the_granted_copy_cannot_be_written_and_the_host_store_is_not_granted() 
     store directly: ``COPY (SELECT 'ATTACKER CA') TO '<store>' (FORMAT CSV,
     USE_TMP_FILE false)`` replaced a 333 KB trust store with 14 bytes, while an
     ungranted sibling stayed refused. Only file ownership stopped it, and
-    ``cli/scaffold_ci.py`` generates a root ``python:3.12-slim`` job that runs
+    a CI image such as ``python:3.12-slim`` runs as root and the job runs
     ``fluid apply``.
 
     Two barriers now, and this asserts both: the host store is not in

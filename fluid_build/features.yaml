@@ -260,7 +260,6 @@ command_groups:
     description: "Project scaffolding and code generation"
     commands:
       - forge
-      - scaffold-ci
       - scaffold-composer
       - generate-airflow
       - product-new

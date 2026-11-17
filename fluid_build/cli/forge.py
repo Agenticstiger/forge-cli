@@ -580,7 +580,7 @@ def _run_blank_mode(args: Any, logger: logging.Logger) -> int:
     # mode (``_write_forge_receipt``).
 
     # In --agent mode we skip the interactive CI-pipeline prompt entirely.
-    # The agent can shell-run ``fluid scaffold-ci --system <name>`` separately
+    # The agent can shell-run ``fluid generate ci --system <name>`` separately
     # if it wants CI scaffolding. Without this guard, blank-mode under
     # --agent hits an EOFError trying to read from a closed stdin.
     if not bool(get_cli_arg(args, "agent", False)):

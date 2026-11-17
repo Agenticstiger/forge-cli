@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from fluid_build.cli._pipeline_files import build_pipeline_config, write_pipeline_files
 from fluid_build.cli.artifact_ci_state import (
     CIStateDocument,
     CIStateDriftReport,
@@ -32,7 +33,6 @@ from fluid_build.cli.artifact_ci_state import (
     write_ci_state,
 )
 from fluid_build.cli.artifact_paths import product_ci_state_path
-from fluid_build.cli.pipeline_generator import build_pipeline_config, write_pipeline_files
 from fluid_build.forge.core.pipeline_templates import PipelineTemplateGenerator
 
 

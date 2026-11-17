@@ -98,7 +98,7 @@ contract-tests → runs if a baseline.schema.json exists (e.g., examples/custome
 
 Scaffolding
 
-scaffold-ci → .gitlab-ci.yml in the output folder.
+generate ci --system gitlab → .gitlab-ci.yml in the output folder.
 
 scaffold-composer → minimal DAG under composer/dags/.
 

@@ -10,7 +10,7 @@ The front door to FLUID - intelligently routes users to the right experience:
 - Template: Specific use case templates
 - Blank: Empty project skeleton
 
-Strategy: Router pattern - delegates to existing commands (product-new, scaffold-ci)
+Strategy: Router pattern - delegates to existing commands (product-new, generate ci)
 """
 
 import argparse

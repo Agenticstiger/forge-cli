@@ -32,7 +32,6 @@ tests/cli/
 ├── test_contract_tests.py   # Tests for contract-tests command
 ├── test_viz_plan.py         # Tests for viz-plan command
 ├── test_viz_graph.py        # Tests for viz-graph command
-├── test_scaffold_ci.py      # Tests for scaffold-ci command
 ├── test_scaffold_composer.py # Tests for scaffold-composer command
 ├── test_export_opds.py      # Tests for export command
 ├── test_opds.py             # Tests for opds command
