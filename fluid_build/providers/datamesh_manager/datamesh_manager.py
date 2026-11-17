@@ -295,7 +295,7 @@ class DataMeshManagerProvider(_PublishFlowMixin, BaseProvider):
                 "Set DMM_API_URL to an http(s) URL."
             ) from exc
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            # Scheme only: the URL can carry userinfo (``ftp://user:secret@h``).
+            # Scheme only: the URL can carry userinfo (a user and password before ``@``).
             raise ProviderError(
                 f"Invalid Data Mesh Manager API URL (scheme {parsed.scheme or 'none'!r}, "
                 f"{'a' if parsed.netloc else 'no'} host). Expected an http(s) URL in "

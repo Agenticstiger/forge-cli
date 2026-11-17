@@ -283,7 +283,12 @@ def test_the_native_provider_refuses_an_unparseable_endpoint_with_a_provider_err
 def test_a_refused_url_never_echoes_its_userinfo():
     from fluid_build.providers.base import ProviderError
 
-    for url in ("ftp://user:s3cret@h", "user:s3cret@h/x", "http://u:s3cret@[::1]\\@evil.com"):
+    marker = "s3cret"  # a fake password, joined into URLs below
+    for url in (
+        f"ftp://user:{marker}@h",
+        f"user:{marker}@h/x",
+        f"http://u:{marker}@[::1]\\@evil.com",
+    ):
         with pytest.raises(ProviderError) as err:
             DataMeshManagerProvider._normalize_api_url(url)
-        assert "s3cret" not in str(err.value)
+        assert marker not in str(err.value)
