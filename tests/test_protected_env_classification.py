@@ -363,3 +363,11 @@ def test_the_groups_agree_with_the_modules_that_read_them() -> None:
 
     assert PROVIDER_ENV_VARS["gemini"] == "GOOGLE_API_KEY"
     assert PROVIDER_ENV_VARS["github"] == "GITHUB_API_KEY"
+
+
+def test_a_project_dotenv_cannot_move_the_schema_registry_tofu_sends_its_key_to():
+    """The confluentinc provider sends SCHEMA_REGISTRY_API_KEY/SECRET to this endpoint."""
+    from fluid_build.credentials.protected_env import is_protected_env_key
+
+    assert is_protected_env_key("SCHEMA_REGISTRY_REST_ENDPOINT")
+    assert is_protected_env_key("SCHEMA_REGISTRY_ID")
