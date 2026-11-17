@@ -12,9 +12,11 @@ reviewer before it starts. Each stage is one step running
 ``fluid ship --stage N``: a ``RUN_STAGE_<N>_<NAME>`` of ``false`` hides the
 step, and ship skips the stage too.
 
-Values reach ship through ``env:`` only: a manual run's input, else the
-repository or environment variable, else the generated default. None is
-expanded inside a ``run:`` script, where it would be code.
+Values reach ship through ``env:`` only: a manual run's input when one is
+given (a box always is), else the repository or environment variable, else the
+generated default. None is expanded inside a ``run:`` script, where it would be
+code. The install variables are never inputs: whoever starts a run could
+otherwise choose the package the apply job runs.
 """
 
 from __future__ import annotations
@@ -33,13 +35,10 @@ MAX_DISPATCH_INPUTS = 25
 #: Read from repository or environment variables only, never asked on a
 #: manual run (the 25-input limit): the install knobs. The contract path is
 #: written into the steps.
-_VARIABLE_ONLY: Tuple[str, ...] = (
-    "CONTRACT",
-    "FLUID_PACKAGE_SPEC",
-    "FLUID_PIP_INDEX_URL",
-    "FLUID_PIP_EXTRA_INDEX_URL",
-    "FLUID_ALLOW_PRERELEASE",
-)
+_VARIABLE_ONLY: Tuple[str, ...] = ("CONTRACT", *_thin.INSTALL_VARIABLES)
+
+#: A choice input's value for "not chosen here": the variable, else the default.
+_FROM_VARIABLE = "default"
 #: The stage knobs ship reads, each with its own default when unset.
 STAGE_KNOBS: Tuple[str, ...] = (
     "VALIDATE_STRICT",
@@ -227,22 +226,29 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             if name in _VARIABLE_ONLY:
                 continue
             key = name.lower()
+            # Left blank (or "default"), an input takes the repository or
+            # environment variable of the same name, else the generated default,
+            # as a push or pull request run does. A box is ticked or not: on a
+            # manual run it decides.
+            fallback = f"Blank: vars.{name}, else {default or 'blank'}."
             options = kind.split(":", 1)[1].split(",") if kind.startswith("choice:") else []
             if options and "" in options:
                 # GitHub refuses a blank choice option, and blank is a value
                 # here (SCHEDULER: none): a string input naming the choices.
                 named = ", ".join(o for o in options if o)
                 inputs[key] = {
-                    "description": f"{description} One of: {named}, or blank.",
+                    "description": f"{description} One of: {named}. {fallback}",
                     "type": "string",
-                    "default": default,
+                    "default": "",
                 }
             elif options:
                 inputs[key] = {
-                    "description": description,
+                    "description": (
+                        f"{description} {_FROM_VARIABLE}: vars.{name}, else {default}."
+                    ),
                     "type": "choice",
-                    "options": options,
-                    "default": default,
+                    "options": [_FROM_VARIABLE, *options],
+                    "default": _FROM_VARIABLE,
                 }
             elif kind == "boolean":
                 inputs[key] = {
@@ -251,7 +257,11 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     "default": default == "true",
                 }
             else:
-                inputs[key] = {"description": description, "type": "string", "default": default}
+                inputs[key] = {
+                    "description": f"{description} {fallback}",
+                    "type": "string",
+                    "default": "",
+                }
         if len(inputs) > MAX_DISPATCH_INPUTS:
             raise ValueError(
                 f"{len(inputs)} workflow_dispatch inputs; GitHub allows {MAX_DISPATCH_INPUTS}"
@@ -282,7 +292,10 @@ class GitHubActionsTemplate(BasePipelineTemplate):
                     f" || vars.{name}{_or_default(default)}"
                 )
             else:
-                value = f"inputs.{key} || vars.{name}{_or_default(default)}"
+                chosen = f"inputs.{key}"
+                if kind.startswith("choice:") and "" not in kind.split(":", 1)[1].split(","):
+                    chosen = f"(inputs.{key} != '{_FROM_VARIABLE}' && inputs.{key})"
+                value = f"{chosen} || vars.{name}{_or_default(default)}"
             env[name] = "${{ " + value + " }}"
         for knob in STAGE_KNOBS:
             env[knob] = "${{ vars." + knob + " }}"
@@ -427,12 +440,14 @@ class GitHubActionsTemplate(BasePipelineTemplate):
             f"{env_default}): give it required",
             "reviewers (Settings > Environments) so nothing is applied unreviewed.",
             "",
-            "A manual run (Actions > fluid pipeline > Run workflow) takes inputs. Otherwise",
-            "each value comes from a repository or environment variable of the same name,",
-            "else the default written below: FLUID_ENV, APPLY_MODE, RUN_STAGE_<N>_<NAME>,",
-            ", ".join(STAGE_KNOBS[:4]) + ",",
-            ", ".join(STAGE_KNOBS[4:]) + ",",
-            "FLUID_PACKAGE_SPEC and the FLUID_PIP_* install variables.",
+            "Each value comes from a repository or environment variable of the same",
+            "name, else the default written below: FLUID_ENV, APPLY_MODE,",
+            "RUN_STAGE_<N>_<NAME>, " + ", ".join(STAGE_KNOBS[:3]) + ",",
+            ", ".join(STAGE_KNOBS[3:]) + ".",
+            "A manual run (Actions > fluid pipeline > Run workflow) can set most of them;",
+            "a blank input (or `default`) keeps the variable, and a box decides.",
+            "FLUID_PACKAGE_SPEC and the FLUID_PIP_* install variables are variables only:",
+            "whoever starts a run could otherwise choose the package apply runs.",
             "",
             "A pull request from a fork gets no ID token, so its stages 5 and 6 cannot",
             "reach the cloud.",

@@ -73,7 +73,6 @@ class BitbucketTemplate(BasePipelineTemplate):
             CUSTOM_PIPELINE: [
                 {"variables": self._prompt(config)},
                 self._plan_step(config),
-                self._apply_step(config),
             ]
         }
         # Security beside every plan, the SBOM beside the plan on the default
@@ -107,8 +106,8 @@ class BitbucketTemplate(BasePipelineTemplate):
         """The Run pipeline form: every parameter but the contract path."""
         prompt: List[Dict[str, Any]] = []
         for name, kind, default, description in self._eleven_stage_parameters(config):
-            if name == "CONTRACT":
-                continue  # written into the ship commands
+            if name == "CONTRACT" or name in _thin.INSTALL_VARIABLES:
+                continue  # the contract is written into the commands; install knobs never run-time
             entry: Dict[str, Any] = {"name": name}
             if default:
                 entry["default"] = default
@@ -187,11 +186,20 @@ class BitbucketTemplate(BasePipelineTemplate):
             }
         }
 
+    def _deployment(self, config: PipelineConfig) -> str:
+        """Bitbucket has test, staging and production until someone adds more."""
+        env = self._pipeline_defaults(config)["FLUID_ENV"].lower()
+        if env in ("dev", "test"):
+            return "test"
+        if env in ("staging", "stage"):
+            return "staging"
+        return "production"
+
     def _apply_step(self, config: PipelineConfig) -> Dict[str, Any]:
         step = self._step(config, "fluid apply (stages 7-11)", "7-11", yes=True)
         # A person presses Run; until then the pipeline waits. The deployment
         # environment carries its own variables and permissions.
-        step["deployment"] = self._pipeline_defaults(config)["FLUID_ENV"]
+        step["deployment"] = self._deployment(config)
         step["trigger"] = "manual"
         return {"step": step}
 
@@ -208,18 +216,24 @@ class BitbucketTemplate(BasePipelineTemplate):
             "",
             "A pull request runs the plan step (stages 1-6) and keeps runtime/ as a step",
             f"artifact. A push to {branch} runs it too, then waits at the apply step",
-            "(stages 7-11), a deployment with trigger: manual that someone starts. It never",
-            "runs on a pull request. Run pipeline > Custom: fluid is the manual run: it asks",
-            "for the values below, then runs the same two steps.",
+            "(stages 7-11), a deployment with trigger: manual that someone starts; you can",
+            f"also run the {branch} pipeline by hand on that branch. It never runs on a pull",
+            "request. Run pipeline > Custom: fluid is a manual plan only (stages 1-6): it",
+            "asks for the values below and cannot apply from any branch.",
             "",
-            f"The apply step deploys to the environment named {env_default} (FLUID_ENV's",
-            "default). Create an environment with that name under Repository settings >",
-            "Deployments, or edit `deployment:` to one you have, and set its permissions.",
+            f"The apply step deploys to the Bitbucket environment `{self._deployment(config)}`, from",
+            f"FLUID_ENV's default ({env_default}): dev or test gives test, staging or stage gives",
+            "staging, anything else gives production. Create or rename the environment under",
+            "Repository settings > Deployments, and restrict it to the default branch there.",
             "",
-            "Every value is a repository or deployment variable of the same name; where",
-            "it is unset the default written in the first script line of each step applies.",
-            "RUN_STAGE_<N>_<NAME>=false switches a stage off (10 and 11 are off until set",
-            "to true).",
+            "FLUID_PACKAGE_SPEC, FLUID_PIP_INDEX_URL, FLUID_PIP_EXTRA_INDEX_URL and",
+            "FLUID_ALLOW_PRERELEASE are not prompts: set them as repository or deployment",
+            "variables in the project settings, never at run time.",
+            "",
+            "Every other value is a repository or deployment variable of the same name;",
+            "where it is unset the default written in the first script line of each step",
+            "applies. RUN_STAGE_<N>_<NAME>=false switches a stage off (10 and 11 are off",
+            "until set to true).",
         ]
         header = "".join(f"# {line}".rstrip() + "\n" for line in lines) + "\n"
         banner = self._credential_banner(

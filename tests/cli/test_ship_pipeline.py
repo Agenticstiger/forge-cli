@@ -25,7 +25,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -37,6 +36,7 @@ import pytest
 import fluid_build
 from fluid_build.cli import _ci_output, ship
 from fluid_build.cli import _ship_stages as st
+from fluid_build.cli._ship_table import SHIP_VARIABLES
 from fluid_build.forge.core.pipeline_systems import _thin
 
 LOG = logging.getLogger("test_ship")
@@ -1777,4 +1777,4 @@ def test_ship_variables_are_what_ship_reads() -> None:
     env = _RecordingEnv()
     st.resolve_options(parse([]), "c", env)
     st.stage_switches(env)
-    assert env.seen == set(st.SHIP_VARIABLES) | set(st.STAGE_TOGGLES.values())
+    assert env.seen == set(SHIP_VARIABLES) | set(st.STAGE_TOGGLES.values())

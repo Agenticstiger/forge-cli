@@ -10,6 +10,7 @@ DO-NOT-EDIT provenance header and records the files in ``ci-state.json``
 """
 
 import hashlib
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -32,6 +33,7 @@ def build_pipeline_config(
     *,
     add_ons: Sequence[str] = (),
     cloud_auth: Sequence[str] = (),
+    default_branch: Optional[str] = None,
 ) -> PipelineConfig:
     """Coerce string inputs into a :class:`PipelineConfig`.
 
@@ -39,8 +41,9 @@ def build_pipeline_config(
     (``generate_ci._contract_cloud_auth`` reads them from a contract).
 
     ``add_ons`` are the optional jobs ``fluid generate ci --add`` names; forge
-    passes none. Raises ``ValueError`` with a helpful message on an unknown
-    provider.
+    passes none. ``default_branch`` is the branch whose pushes apply: the
+    remote's default branch (:func:`detect_default_branch`) unless given.
+    Raises ``ValueError`` with a helpful message on an unknown provider.
     """
     provider_aliases = {
         "circleci": "circle_ci",
@@ -57,7 +60,61 @@ def build_pipeline_config(
         provider=provider_enum,
         add_ons=tuple(add_ons),
         cloud_auth=tuple(cloud_auth),
+        default_branch=default_branch or detect_default_branch(),
     )
+
+
+def detect_default_branch(directory: Optional[Path] = None) -> str:
+    """The remote's default branch (``origin/HEAD``) of the repository holding
+    ``directory`` (the current one by default), else ``main``."""
+    command = ["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]
+    if directory is not None:
+        command[1:1] = ["-C", str(directory)]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except (FileNotFoundError, OSError):
+        return "main"
+    ref = result.stdout.strip()
+    return ref.split("/", 1)[1] if result.returncode == 0 and "/" in ref else "main"
+
+
+#: What ``fluid generate ci --complexity`` wrote for GitHub before one pipeline
+#: shape replaced the tiers. Left in place, each still runs beside the new file.
+LEGACY_CI_FILES: Dict[str, tuple] = {
+    "github_actions": tuple(
+        f".github/workflows/{name}.yml"
+        for name in (
+            "fluid-basic",
+            "fluid-standard",
+            "fluid-advanced",
+            "fluid-enterprise",
+            "security",
+            "compliance",
+        )
+    ),
+}
+
+
+def legacy_ci_files(system: str, written: Sequence[str], root: Optional[Path] = None) -> List[str]:
+    """The files an earlier ``generate ci`` wrote that this run did not
+    rewrite, relative to ``root`` (the current directory by default)."""
+    base = root or Path(".")
+    done = set(written)
+    return [p for p in LEGACY_CI_FILES.get(system, ()) if p not in done and (base / p).is_file()]
+
+
+def warn_legacy_ci_files(
+    system: str, written: Sequence[str], root: Optional[Path] = None
+) -> List[str]:
+    """Name, on the console, the legacy files :func:`legacy_ci_files` finds."""
+    left = legacy_ci_files(system, written, root)
+    if left:
+        cprint(
+            "These files are from an earlier fluid generate ci and still run beside the "
+            "new pipeline; delete them: " + ", ".join(left),
+            markup=False,
+        )
+    return left
 
 
 # ---------------------------------------------------------------------------

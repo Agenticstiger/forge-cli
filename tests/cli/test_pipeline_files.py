@@ -86,3 +86,31 @@ class TestWritePipelineFiles:
     def test_returns_paths_in_insertion_order(self, tmp_path: Path):
         written = write_pipeline_files({"a.yml": "1", "b.yml": "2", "c.yml": "3"}, tmp_path)
         assert [p.name for p in written] == ["a.yml", "b.yml", "c.yml"]
+
+
+def test_build_pipeline_config_follows_the_remotes_default_branch(monkeypatch) -> None:
+    import fluid_build.cli._pipeline_files as pf
+
+    monkeypatch.setattr(pf, "detect_default_branch", lambda directory=None: "develop")
+    assert build_pipeline_config("github_actions").default_branch == "develop"
+    assert build_pipeline_config("github_actions", default_branch="trunk").default_branch == "trunk"
+
+
+def test_detect_default_branch_outside_a_repository_is_main(tmp_path: Path) -> None:
+    from fluid_build.cli._pipeline_files import detect_default_branch
+
+    assert detect_default_branch(tmp_path) == "main"
+
+
+def test_legacy_ci_files_names_what_the_old_tiers_left(tmp_path: Path) -> None:
+    from fluid_build.cli._pipeline_files import legacy_ci_files
+
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "fluid-standard.yml").write_text("on: push\n")
+    (workflows / "fluid-pipeline.yml").write_text("on: push\n")
+    written = [".github/workflows/fluid-pipeline.yml"]
+    assert legacy_ci_files("github_actions", written, tmp_path) == [
+        ".github/workflows/fluid-standard.yml"
+    ]
+    assert legacy_ci_files("gitlab_ci", written, tmp_path) == []

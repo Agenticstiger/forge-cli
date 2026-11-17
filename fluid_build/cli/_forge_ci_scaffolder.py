@@ -264,6 +264,8 @@ def scaffold_ci_pipeline(
     try:
         from fluid_build.cli._pipeline_files import (
             build_pipeline_config,
+            detect_default_branch,
+            warn_legacy_ci_files,
             write_pipeline_files,
         )
         from fluid_build.forge.core.pipeline_templates import PipelineTemplateGenerator
@@ -278,7 +280,11 @@ def scaffold_ci_pipeline(
         return None
 
     try:
-        config = build_pipeline_config(provider=provider, cloud_auth=_cloud_auth(target_dir))
+        config = build_pipeline_config(
+            provider=provider,
+            cloud_auth=_cloud_auth(target_dir),
+            default_branch=detect_default_branch(target_dir),
+        )
         files = PipelineTemplateGenerator().generate_pipeline(config)
     except Exception as exc:  # noqa: BLE001
         if console:
@@ -363,6 +369,8 @@ def scaffold_ci_pipeline(
             command=command_str,
             tool_version=str(tool_version),
         )
+        if not dry_run:
+            warn_legacy_ci_files(provider, list(files), target_dir)
     except OSError as exc:
         if console:
             try:

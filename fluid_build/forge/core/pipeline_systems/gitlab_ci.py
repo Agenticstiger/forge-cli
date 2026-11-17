@@ -120,6 +120,11 @@ class GitLabCITemplate(BasePipelineTemplate):
         for name, kind, default, description in self._eleven_stage_parameters(config):
             if name == "CONTRACT":
                 continue  # written into the ship commands
+            if name in _thin.INSTALL_VARIABLES:
+                # A plain default, not on the Run pipeline form: what pip
+                # installs is set as a project CI/CD variable, never per run.
+                variables[name] = default
+                continue
             entry: Dict[str, Any] = {"value": default, "description": description}
             if kind == "boolean":
                 entry["options"] = ["true", "false"]

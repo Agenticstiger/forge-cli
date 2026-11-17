@@ -13,7 +13,7 @@ id. Nothing starts it by itself.
 
 Every value is a Task or Pipeline parameter copied into the step environment
 under its own name. Ship reads it there. The stage spec and the ``--yes``
-switch reach the script the same way (``FLUID_SHIP_STAGE``, ``FLUID_SHIP_YES``):
+switch reach the script the same way (``SHIP_STAGE``, ``SHIP_YES``):
 a ``$(params.x)`` written inside a script is substituted as text, so it would
 be code.
 """
@@ -106,21 +106,21 @@ class TektonTemplate(BasePipelineTemplate):
 
     def _task(self, config: PipelineConfig) -> Dict[str, Any]:
         contract = config.contract_path or _thin.DEFAULT_CONTRACT
-        ship = _thin.ship_command('"$FLUID_SHIP_STAGE"', contract=contract)
+        ship = _thin.ship_command('"$SHIP_STAGE"', contract=contract)
         cd = f'cd "{check_pipeline_workdir(config.workdir)}"\n' if config.workdir else ""
         script = (
             "#!/bin/sh\n"
             "set -eu\n"
             # A subshell: its `set -eu` and `set --` stay out of the lines after it.
             "(\n" + self._render_install_setup(config) + "\n)\n" + cd + "set --\n"
-            'if [ "$FLUID_SHIP_YES" = "true" ]; then\n'
+            'if [ "$SHIP_YES" = "true" ]; then\n'
             "  set -- --yes\n"
             "fi\n"
             f'{ship} "$@"\n'
         )
         env: List[Dict[str, str]] = [
-            {"name": "FLUID_SHIP_STAGE", "value": f"$(params.{STAGE_PARAM})"},
-            {"name": "FLUID_SHIP_YES", "value": f"$(params.{YES_PARAM})"},
+            {"name": "SHIP_STAGE", "value": f"$(params.{STAGE_PARAM})"},
+            {"name": "SHIP_YES", "value": f"$(params.{YES_PARAM})"},
             {"name": RUN_ID, "value": f"$(params.{RUN_ID})"},
         ]
         env += [

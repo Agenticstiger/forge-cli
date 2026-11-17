@@ -87,8 +87,8 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
         ``True`` or ``False``)."""
         parameters: List[Dict[str, Any]] = []
         for name, kind, default, description in self._eleven_stage_parameters(config):
-            if name == "CONTRACT":
-                continue  # written into the ship commands
+            if name == "CONTRACT" or name in _thin.INSTALL_VARIABLES:
+                continue  # the contract is written into the commands; install knobs never run-time
             entry: Dict[str, Any] = {
                 "name": name,
                 "displayName": description,
@@ -294,7 +294,12 @@ class AzureDevOpsTemplate(BasePipelineTemplate):
             "checks to that environment (Pipelines > Environments) so nothing is applied",
             "unreviewed. A pull request never reaches apply.",
             "",
-            "Every value is a parameter on the Run pipeline form, copied into a variable of",
+            "FLUID_PACKAGE_SPEC, FLUID_PIP_INDEX_URL, FLUID_PIP_EXTRA_INDEX_URL and",
+            "FLUID_ALLOW_PRERELEASE are not parameters: set them as pipeline or variable-group",
+            "variables in the project settings, never at run time (whoever queues a run could",
+            "otherwise install their own package into the apply job).",
+            "",
+            "Every other value is a parameter on the Run pipeline form, copied into a variable of",
             "the same name that ship reads from the environment. RUN_STAGE_<N>_<NAME> set to",
             "false switches a stage off (10 and 11 are off until set to true).",
         ]

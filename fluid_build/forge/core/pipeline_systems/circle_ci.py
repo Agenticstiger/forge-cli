@@ -27,6 +27,8 @@ from ._base import (
     check_pipeline_workdir,
 )
 
+RUN_COMPLIANCE = "run_compliance"
+SCHEDULED = "<< pipeline.trigger_source >>"
 CONFIG_PATH = ".circleci/config.yml"
 IMAGE = "cimg/python:3.12"
 PROJECT_DIR = "~/project"
@@ -78,8 +80,15 @@ class CircleCITemplate(BasePipelineTemplate):
             beside.append("security")
         if "sbom" in add_ons:
             beside.append({"sbom": {"filters": only_default}})
+        # A scheduled run starts no plan and parks no approval; a run that asks for
+        # the compliance workflow does not start the plan either.
+        plan_when: Dict[str, Any] = {"equal": ["scheduled_pipeline", SCHEDULED]}
+        unless = [plan_when]
+        if "compliance" in add_ons:
+            unless.append("<< pipeline.parameters.run_compliance >>")
         workflows: Dict[str, Any] = {
             "fluid": {
+                "when": {"not": unless[0]} if len(unless) == 1 else {"not": {"or": unless}},
                 "jobs": [
                     "plan",
                     *beside,
@@ -97,17 +106,17 @@ class CircleCITemplate(BasePipelineTemplate):
                             "filters": only_default,
                         }
                     },
-                ]
+                ],
             }
         }
         if "compliance" in add_ons:
-            # fluid verify reaches the cloud, so it runs only when a pipeline is
-            # triggered through the API or by a schedule you own, never by a push.
+            # fluid verify reaches the cloud, so it runs only on a schedule you own,
+            # or on a manual or API run that sets run_compliance: never on a push.
             workflows["fluid-compliance"] = {
                 "when": {
                     "or": [
-                        {"equal": ["api", "<< pipeline.trigger_source >>"]},
-                        {"equal": ["scheduled_pipeline", "<< pipeline.trigger_source >>"]},
+                        {"equal": ["scheduled_pipeline", SCHEDULED]},
+                        "<< pipeline.parameters.run_compliance >>",
                     ]
                 },
                 "jobs": [{"compliance": {"filters": only_default}}],
@@ -124,8 +133,8 @@ class CircleCITemplate(BasePipelineTemplate):
         boolean reaches ship as ``true`` or ``false``."""
         parameters: Dict[str, Any] = {}
         for name, kind, default, description in self._eleven_stage_parameters(config):
-            if name == "CONTRACT":
-                continue  # written into the ship commands
+            if name == "CONTRACT" or name in _thin.INSTALL_VARIABLES:
+                continue  # the contract is written into the commands; install knobs never run-time
             entry: Dict[str, Any] = {
                 "type": "string",
                 "default": default,
@@ -153,12 +162,21 @@ class CircleCITemplate(BasePipelineTemplate):
                 "default": "",
                 "description": f"Passed to fluid ship ({knob}); blank keeps ship's default.",
             }
+        # Not a value ship reads: it starts the compliance workflow on a manual run.
+        if "compliance" in _thin.check_add_ons(config.add_ons):
+            parameters[RUN_COMPLIANCE] = {
+                "type": "boolean",
+                "default": False,
+                "description": "Run the compliance workflow (fluid verify) instead of the plan.",
+            }
         return parameters
 
     def _environment(self, config: PipelineConfig) -> Dict[str, str]:
         # One run id for both jobs, so their stages share one ship report.
         env: Dict[str, str] = {"FLUID_RUN_ID": "<< pipeline.number >>"}
         for key in self._parameters(config):
+            if key == RUN_COMPLIANCE:
+                continue
             env[key.upper()] = f"<< pipeline.parameters.{key} >>"
         env.update(self._engine_runtime_env_vars(config))
         return env
@@ -202,9 +220,16 @@ class CircleCITemplate(BasePipelineTemplate):
     def _keep_steps(self, config: PipelineConfig) -> List[Dict[str, Any]]:
         runtime, artifacts = self._carried_paths(config)
         return [
-            {"store_artifacts": {"path": runtime, "destination": "runtime"}},
-            {"store_artifacts": {"path": artifacts, "destination": "dist-artifacts"}},
-            {"store_test_results": {"path": runtime}},
+            # when: always, so the reports of a failed plan are kept too.
+            {"store_artifacts": {"path": runtime, "destination": "runtime", "when": "always"}},
+            {
+                "store_artifacts": {
+                    "path": artifacts,
+                    "destination": "dist-artifacts",
+                    "when": "always",
+                }
+            },
+            {"store_test_results": {"path": runtime, "when": "always"}},
         ]
 
     def _plan_job(self, config: PipelineConfig) -> Dict[str, Any]:
@@ -238,7 +263,13 @@ class CircleCITemplate(BasePipelineTemplate):
                     "command": _keyless.LiteralStr(self._cd(config) + "\n".join(lines) + "\n"),
                 }
             },
-            {"store_artifacts": {"path": self._carried_paths(config)[0], "destination": add_on}},
+            {
+                "store_artifacts": {
+                    "path": self._carried_paths(config)[0],
+                    "destination": add_on,
+                    "when": "always",
+                }
+            },
         ]
         return job
 
@@ -264,6 +295,12 @@ class CircleCITemplate(BasePipelineTemplate):
             f"{branch} only, the workflow then waits at approve-apply (a hold job: press",
             "Approve in the CircleCI UI) before the apply job (stages 7-11). To run it by",
             "hand, trigger a pipeline on the branch from the API with the parameters below.",
+            "A scheduled pipeline starts no plan. With the compliance add-on, a scheduled",
+            "run, or an API run with run_compliance=true, starts only fluid-compliance.",
+            "",
+            "FLUID_PACKAGE_SPEC, FLUID_PIP_INDEX_URL, FLUID_PIP_EXTRA_INDEX_URL and",
+            "FLUID_ALLOW_PRERELEASE are not pipeline parameters: set them as project",
+            "environment variables in the project settings, never at run time.",
             "",
             "Every value is a pipeline parameter (lower-case name, e.g. fluid_env) copied",
             "into the job environment under its upper-case name. A stage switched off with",

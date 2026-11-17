@@ -516,53 +516,6 @@ def _git_toplevel(directory: Path) -> Optional[Path]:
     return Path(result.stdout.strip()).resolve()
 
 
-#: What ``fluid generate ci --complexity`` wrote for GitHub before one pipeline
-#: shape replaced the tiers. Left in place, each still runs beside the new file.
-_LEGACY_FILES: Dict[str, Tuple[str, ...]] = {
-    "github_actions": tuple(
-        f".github/workflows/{name}.yml"
-        for name in (
-            "fluid-basic",
-            "fluid-standard",
-            "fluid-advanced",
-            "fluid-enterprise",
-            "security",
-            "compliance",
-        )
-    ),
-}
-
-
-def _warn_legacy_files(system: str, written: set, logger: logging.Logger) -> None:
-    """Name the files an earlier ``generate ci`` wrote that this run replaced."""
-    left = [p for p in _LEGACY_FILES.get(system, ()) if p not in written and os.path.isfile(p)]
-    if not left:
-        return
-    from fluid_build.cli.console import cprint
-
-    info(logger, "generate_ci_legacy_files", files=left)
-    cprint(
-        "These files are from an earlier fluid generate ci and still run beside the new "
-        "pipeline; delete them: " + ", ".join(left),
-        markup=False,
-    )
-
-
-def _default_branch() -> str:
-    """The remote's default branch (``origin/HEAD``), else ``main``."""
-    try:
-        result = subprocess.run(
-            ["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except (FileNotFoundError, OSError):
-        return "main"
-    ref = result.stdout.strip()
-    return ref.split("/", 1)[1] if result.returncode == 0 and "/" in ref else "main"
-
-
 def _pipeline_location(contract_arg: str) -> Tuple[Optional[str], str]:
     """``(workdir, contract)``: where the pipeline runs, and the contract from there.
 
@@ -866,7 +819,12 @@ def run(args, logger: logging.Logger) -> int:
                 },
             )
         add_ons = tuple(getattr(args, "add", None) or ())
-        default_branch = getattr(args, "default_branch", None) or _default_branch()
+        from fluid_build.cli._pipeline_files import (
+            detect_default_branch,
+            warn_legacy_ci_files,
+        )
+
+        default_branch = getattr(args, "default_branch", None) or detect_default_branch()
 
         contract_path = getattr(args, "contract", None) or "contract.fluid.yaml"
         workdir, pipeline_contract = _pipeline_location(contract_path)
@@ -1010,7 +968,9 @@ def run(args, logger: logging.Logger) -> int:
         # CI file expects. Only emitted for systems that actually
         # consume the install-mode flag (currently Jenkins only); for
         # other systems it's a no-op.
-        _warn_legacy_files(canonical, set(files), logger)
+        left = warn_legacy_ci_files(canonical, list(files))
+        if left:
+            info(logger, "generate_ci_legacy_files", files=left)
 
         if canonical == "jenkins":
             from fluid_build.forge.core.pipeline_systems.jenkins import JenkinsTemplate

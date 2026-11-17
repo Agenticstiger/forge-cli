@@ -36,7 +36,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import pytest
 import yaml
 
-from fluid_build.cli._ship_stages import SHIP_VARIABLES, STAGE_TOGGLES
+from fluid_build.cli._ship_table import SHIP_VARIABLES, STAGE_TOGGLES
 from fluid_build.forge.core.pipeline_systems import _thin
 from fluid_build.forge.core.pipeline_systems._thin import ADD_ON_TITLES, ADD_ONS
 from fluid_build.forge.core.pipeline_templates import (
@@ -209,7 +209,8 @@ def _phase_ship_commands(provider: PipelineProvider, files: Dict[str, str]) -> D
                 item["step"] for item in main["pipelines"]["custom"]["fluid"] if "step" in item
             ]
             plan = commands(list(_walk_shell(steps[0])))
-            apply = commands(list(_walk_shell(steps[1])))
+            branch = main["pipelines"]["branches"]["main"]
+            apply = commands(list(_walk_shell(branch[-1]["step"])))
     return {"plan": plan, "apply": apply}
 
 
@@ -918,11 +919,12 @@ def test_bitbucket_structure(config):
     assert seen
     on_branch = list(steps(pipelines["branches"]["main"]))
     apply = on_branch[-1]
-    assert apply["trigger"] == "manual" and apply["deployment"] == "dev"
+    assert apply["trigger"] == "manual" and apply["deployment"] == "test"
     # A pull request never reaches the apply step.
     assert not [s for s in steps(pipelines["pull-requests"]["**"]) if "deployment" in s]
     custom = list(steps(pipelines["custom"]["fluid"][1:]))
-    assert [s["name"] for s in custom] == ["fluid plan (stages 1-6)", "fluid apply (stages 7-11)"]
+    # The manual run plans only: apply stays in the default branch's pipeline.
+    assert [s["name"] for s in custom] == ["fluid plan (stages 1-6)"]
     assert pipelines["custom"]["fluid"][0]["variables"]
 
 
@@ -1225,3 +1227,131 @@ def test_gitlab_and_tekton_follow_the_hosts_own_default_branch(provider):
     if provider is P.GITLAB_CI:
         assert "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH" in text
     assert "refs/heads/main" not in text
+
+
+def _runtime_inputs(provider: PipelineProvider, files: Dict[str, str]) -> set:
+    """Every name a person can set when starting a run."""
+    document = next(d for _, d in _documents(files) if isinstance(d, dict))
+    if provider is P.AZURE_DEVOPS:
+        return {p["name"] for p in document["parameters"]}
+    if provider is P.CIRCLE_CI:
+        return {name.upper() for name in document["parameters"]}
+    names = set()
+    for items in document["pipelines"]["custom"].values():
+        for item in items:
+            names |= {v["name"] for v in item.get("variables", [])}
+    return names
+
+
+@pytest.mark.parametrize(
+    "provider", [P.AZURE_DEVOPS, P.BITBUCKET, P.CIRCLE_CI], ids=["azure", "bitbucket", "circleci"]
+)
+@pytest.mark.parametrize("config", sorted(_CONFIGS))
+def test_the_install_knobs_are_never_a_run_time_input(provider, config):
+    files = _files(provider, **_CONFIGS[config])
+    inputs = _runtime_inputs(provider, files)
+    assert inputs, "the check needs a run-time surface to look at"
+    assert not inputs & set(_thin.INSTALL_VARIABLES)
+    # The install step still falls back to the generated pin, for a project variable.
+    assert "${FLUID_PACKAGE_SPEC:-" in "".join(files.values())
+
+
+@pytest.mark.parametrize(
+    "env, deployment",
+    [
+        ("dev", "test"),
+        ("test", "test"),
+        ("staging", "staging"),
+        ("stage", "staging"),
+        ("prod", "production"),
+    ],
+)
+def test_bitbucket_deployment_is_one_of_its_default_environments(env, deployment):
+    files = _files(P.BITBUCKET, fluid_env_default=env)
+    document = yaml.safe_load(files["bitbucket-pipelines.yml"])
+    apply = document["pipelines"]["branches"]["main"][-1]["step"]
+    assert apply["deployment"] == deployment
+
+
+def test_circleci_a_scheduled_run_starts_no_plan_and_compliance_is_opt_in():
+    files = _files(P.CIRCLE_CI, add_ons=("compliance",))
+    document = yaml.safe_load(files[".circleci/config.yml"])
+    workflows = document["workflows"]
+    assert "scheduled_pipeline" in json.dumps(workflows["fluid"]["when"])
+    assert "run_compliance" in json.dumps(workflows["fluid"]["when"])
+    assert "run_compliance" in json.dumps(workflows["fluid-compliance"]["when"])
+    assert document["parameters"]["run_compliance"]["default"] is False
+    steps = [s for job in document["jobs"].values() for s in job["steps"] if isinstance(s, dict)]
+    kept = [s for s in steps if "store_artifacts" in s or "store_test_results" in s]
+    assert kept and all(next(iter(s.values()))["when"] == "always" for s in kept)
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: who chooses what a run installs, and what a manual run reads
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("config", sorted(_CONFIGS), ids=sorted(_CONFIGS))
+def test_github_and_gitlab_never_ask_a_run_for_the_install_knobs(config: str) -> None:
+    # Whoever starts a run must not choose the package the apply job installs.
+    github = yaml.safe_load(
+        _files(PipelineProvider.GITHUB_ACTIONS, **_CONFIGS[config])[
+            ".github/workflows/fluid-pipeline.yml"
+        ]
+    )
+    inputs = (
+        github[True]["workflow_dispatch"]["inputs"]
+        if True in github
+        else github["on"]["workflow_dispatch"]["inputs"]
+    )
+    for name in _thin.INSTALL_VARIABLES:
+        assert name.lower() not in inputs
+        assert github["env"][name].startswith("${{ vars." + name)
+    gitlab = yaml.safe_load(
+        _files(PipelineProvider.GITLAB_CI, **_CONFIGS[config])[".gitlab-ci.yml"]
+    )
+    for name in _thin.INSTALL_VARIABLES:
+        # A plain default: not on the Run pipeline form.
+        assert isinstance(gitlab["variables"][name], str), name
+
+
+def test_a_github_manual_run_left_at_its_defaults_reads_the_variables() -> None:
+    workflow = yaml.safe_load(
+        _files(PipelineProvider.GITHUB_ACTIONS)[".github/workflows/fluid-pipeline.yml"]
+    )
+    on = workflow[True] if True in workflow else workflow["on"]
+    inputs = on["workflow_dispatch"]["inputs"]
+    assert inputs["fluid_env"]["default"] == ""
+    assert inputs["apply_mode"]["default"] == "default"
+    assert inputs["apply_mode"]["options"][0] == "default"
+    env = workflow["env"]
+    assert env["FLUID_ENV"] == "${{ inputs.fluid_env || vars.FLUID_ENV || 'dev' }}"
+    assert env["APPLY_MODE"].startswith("${{ (inputs.apply_mode != 'default' && inputs.apply_mode)")
+    assert env["APPLY_MODE"].endswith("|| vars.APPLY_MODE || 'amend' }}")
+
+
+def _jenkins(**kwargs: Any) -> str:
+    return _files(PipelineProvider.JENKINS, **kwargs)["Jenkinsfile"]
+
+
+def test_jenkins_checks_when_before_it_takes_the_apply_lock() -> None:
+    # A change request must not queue on the lock only to skip the stage.
+    text = _jenkins()
+    stage = text[text.index("stage('apply (stages 7-11)')") :]
+    assert stage.index("beforeOptions true") < stage.index("lock(resource:")
+
+
+def test_jenkins_approval_does_not_depend_on_stage_7s_switch() -> None:
+    # With stage 7 off, stages 8-11 still change the target: approval stays.
+    text = _jenkins()
+    approve = text[
+        text.index("stage('Approve apply')") : text.index("stage('apply (stages 7-11)')")
+    ]
+    assert "APPLY_APPROVAL" in approve
+    assert "RUN_STAGE_7_APPLY" not in approve
+
+
+def test_jenkins_keeps_the_applied_plan_when_a_later_stage_fails() -> None:
+    text = _jenkins(diff_last_applied=True)
+    always = text[text.index("always {") : text.index("success {")]
+    assert ".fluid-ci/applied/*.json" in always

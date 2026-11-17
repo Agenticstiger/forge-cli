@@ -588,8 +588,9 @@ def test_last_applied_is_copied_from_the_last_successful_build_when_asked_for():
     assert 'if [ "$APPLY_MODE" != "dry-run" ]; then' in stage7
     assert 'cp runtime/plan.json "$WORKSPACE/.fluid-ci/applied/$FLUID_ENV.json"' in stage7
     post = content[content.index("    post {") :]
-    success = post[post.index("success {") : post.index("failure {")]
-    assert "archiveArtifacts artifacts: '.fluid-ci/applied/*.json'" in success
+    # Archived whatever the build's result: a stage after apply may fail.
+    always = post[post.index("always {") : post.index("success {")]
+    assert "archiveArtifacts artifacts: '.fluid-ci/applied/*.json'" in always
 
 
 def test_without_last_applied_the_file_needs_no_copyartifact_plugin():

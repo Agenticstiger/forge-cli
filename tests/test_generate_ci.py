@@ -803,7 +803,20 @@ class TestFluidEnvDefaultAcrossSystems:
                 if before != after:
                     changed += 1
                     # The value only: the line is otherwise the one the default writes.
-                    assert before == after.replace("staging", "dev"), (path, before, after)
+                    # The list of overlay names in a description is not the default,
+                    # and Bitbucket's environment follows FLUID_ENV (dev -> test).
+                    envs = "(dev | staging | prod)"
+                    expected = (
+                        after.replace(envs, "<envs>")
+                        .replace("staging", "dev")
+                        .replace("<envs>", envs)
+                    )
+                    if path == "bitbucket-pipelines.yml":
+                        expected = expected.replace("`dev`", "`test`")
+                        expected = expected.replace("deployment: dev", "deployment: test")
+                        if " gives " in after:  # the line that explains the mapping
+                            expected = after.replace("(staging)", "(dev)")
+                    assert before == expected, (path, before, after)
         assert changed, f"{provider.value}: --fluid-env-default changed nothing"
 
     @pytest.mark.parametrize("provider", list(PipelineProvider), ids=lambda p: p.name)

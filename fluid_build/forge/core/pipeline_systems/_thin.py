@@ -66,7 +66,7 @@ class Stage:
 
 def stages() -> List[Stage]:
     """The 11 stages, from ship's own table."""
-    from fluid_build.cli._ship_stages import STAGE_NAMES, STAGE_TOGGLES
+    from fluid_build.cli._ship_table import STAGE_NAMES, STAGE_TOGGLES
 
     return [Stage(num, STAGE_NAMES[num], STAGE_TOGGLES[num]) for num in sorted(STAGE_NAMES)]
 
@@ -88,6 +88,19 @@ def ship_command(spec: str, *, contract: str = DEFAULT_CONTRACT, yes: bool = Fal
         words.append("--yes")
     return " ".join(words)
 
+
+#: What the install step reads: which package pip installs and from where.
+#: Never a run-time input or prompt of a generated pipeline. Whoever starts a
+#: run could otherwise point pip at their own package and run it in the
+#: default-branch apply job, with its deploy credentials. A maintainer sets
+#: them as a project, repository or library variable; the install falls back
+#: to the version that generated the file.
+INSTALL_VARIABLES: Tuple[str, ...] = (
+    "FLUID_PACKAGE_SPEC",
+    "FLUID_PIP_INDEX_URL",
+    "FLUID_PIP_EXTRA_INDEX_URL",
+    "FLUID_ALLOW_PRERELEASE",
+)
 
 #: The job title each add-on gets.
 ADD_ON_TITLES = {
@@ -116,11 +129,12 @@ def add_on_script(add_on: str, contract: str = DEFAULT_CONTRACT) -> List[str]:
             f"fluid policy-check {target} --format json --output runtime/compliance-report.json",
             f"fluid verify {target} --reconcile-lineage --warn-only",
         ]
-    if add_on == "sbom":
+    if add_on == "sbom":  # advisory, as the vulnerability scan is
         return [
             "mkdir -p runtime",
             "if command -v syft >/dev/null 2>&1; then "
-            "syft dir:. -o spdx-json=runtime/sbom.spdx.json; "
+            "syft dir:. -o spdx-json=runtime/sbom.spdx.json "
+            "|| echo 'syft failed: no SBOM written'; "
             "else echo 'syft is not on the runner: no SBOM written'; fi",
         ]
     raise ValueError(f"unknown add-on {add_on!r}: one of {', '.join(ADD_ONS)}")
@@ -163,6 +177,6 @@ def render_yaml(document: Any) -> str:
 def ship_variables() -> Tuple[str, ...]:
     """Every variable ship reads, the switches included: what a wrapper
     passes through its job environment."""
-    from fluid_build.cli._ship_stages import SHIP_VARIABLES, STAGE_TOGGLES
+    from fluid_build.cli._ship_table import SHIP_VARIABLES, STAGE_TOGGLES
 
     return tuple(SHIP_VARIABLES) + tuple(STAGE_TOGGLES[n] for n in sorted(STAGE_TOGGLES))

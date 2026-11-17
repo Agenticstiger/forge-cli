@@ -18,8 +18,6 @@ import argparse
 from pathlib import Path
 from typing import Any, Dict
 
-import pytest
-
 # ---------------------------------------------------------------------------
 # UX-H.3 — CLI flag is registered on the forge parser
 # ---------------------------------------------------------------------------

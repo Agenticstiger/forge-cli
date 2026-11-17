@@ -727,12 +727,14 @@ EOM
         else:
             runtime_notes_block = ""
 
-        post_success = []
+        post_always: List[str] = []
         if last_applied:
-            post_success = [
+            post_always = [
                 "            // Carry forward every env's applied plan this build did not",
                 "            // replace, so the next build's baseline is the last apply per env",
-                "            // even when this one applied nothing.",
+                "            // even when this one applied nothing. Kept on failure too: a",
+                "            // build whose stage 9 fails after stage 7 applied still changed",
+                "            // the target, and stage 7 records its plan only after apply passed.",
                 _sh_step(
                     [
                         f'mkdir -p "{applied_dir}"',
@@ -749,8 +751,8 @@ EOM
                     "fingerprint: true, allowEmptyArchive: true"
                 ),
             ]
-        post_success.append("            echo '✅ 11-stage pipeline completed successfully'")
-        post_success_block = "\n".join(post_success)
+        post_always_block = "\n".join(post_always)
+        post_success_block = "            echo '✅ 11-stage pipeline completed successfully'"
 
         stage3_when = when(3)
         stage4_when = when(4, f"fileExists('{W}dist/artifacts/MANIFEST.json')")
@@ -847,7 +849,6 @@ stage('11 - schedule sync') {{
                 allOf {{
                     {on_main}
                     expression {{ return {_when_on(P['APPLY_APPROVAL'])} }}
-                    expression {{ return {_when_on(P[toggles[7]])} }}
                 }}
             }}
             steps {{
@@ -859,7 +860,10 @@ stage('11 - schedule sync') {{
         }}
 
         stage('apply (stages 7-11)') {{
-            when {{ allOf {{ {on_main} }} }}
+            when {{
+                beforeOptions true
+                allOf {{ {on_main} }}
+            }}
             options {{ lock(resource: "fluid-apply-${{env.FLUID_ENV}}", inversePrecedence: true) }}
             stages {{
 {textwrap.indent(apply_stages, ' ' * 16)}
@@ -1025,6 +1029,7 @@ pipeline {{
             // ship's run report: every stage's status, reason, argv and exit code.
             archiveArtifacts artifacts: '{W}runtime/ship-report.json,{W}runtime/ship-junit.xml', allowEmptyArchive: true
             junit allowEmptyResults: true, testResults: '{W}runtime/ship-junit.xml'
+{post_always_block}
         }}
         success {{
 {post_success_block}
