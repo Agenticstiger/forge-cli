@@ -10,7 +10,6 @@ metadata:
   layer: Gold
   owner:
     team: data-engineering
-    email: data-engineering@company.com
 
 # Optional tags (supported by schema)
 tags:

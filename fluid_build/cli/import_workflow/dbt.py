@@ -99,7 +99,7 @@ _TYPE_ALIASES = {
     "time with time zone": "time",
 }
 
-_DEFAULT_OWNER = {"team": "imported", "email": "import@forge.local"}
+_DEFAULT_OWNER = {"team": "imported"}
 
 
 @dataclass

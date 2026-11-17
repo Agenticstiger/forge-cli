@@ -870,7 +870,7 @@ class TestEndpointMatch:
         ],
     )
     def test_default_ports_and_unreadable_urls(self, a, b, same):
-        from fluid_build.schema_registry.verify import _same_endpoint
+        from fluid_build.schema_registry.kinds.confluent import _same_endpoint
 
         assert _same_endpoint(a, b) is same
 

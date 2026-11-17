@@ -325,7 +325,6 @@ def build_contract(
             "productType": spec.product_type,
             "owner": {
                 "team": owner,
-                "email": f"{owner}@company.com",
             },
         },
         "consumes": list(spec.consumes),

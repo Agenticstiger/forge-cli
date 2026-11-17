@@ -36,6 +36,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
+from .kinds import all_kinds, get_kind, names
 from .reference import RegistryShapeError, Subject
 
 LOG = logging.getLogger(__name__)
@@ -68,18 +69,10 @@ def _writer(sv: Any) -> Tuple[List[Dict[str, Any]], str, Dict[str, str], Dict[st
     return writer_columns(parse_schema(sv.schema), sv.data_format)
 
 
-def _read_version(client: Any, ref: Any) -> Any:
-    """``ref``'s subject version, read with the client of its kind."""
-    if ref.kind == "confluent":
-        return client.get_version(ref.subject, ref.version)
-    return client.get_version(ref.glue_registry, ref.subject, ref.version)
-
-
 def _check(
     subject: Subject,
     *,
-    confluent: Callable[[str], Any],
-    glue: Callable[[], Any],
+    open_client: Callable[[Any], Any],
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     """Read and compare one subject. ``(record, error or None)``."""
     from .clients import RegistryError
@@ -87,21 +80,21 @@ def _check(
     from .schemas import UnsupportedSchema, column_paths, derive, registry_format, schema_text
 
     ref = subject.ref
+    kind = get_kind(ref.kind)
     expected = registry_format(subject.format)
     record: Dict[str, Any] = {
         "build": subject.owner,
         "topic": subject.topic,
         "kind": ref.kind,
-        "registry": ref.url if ref.kind == "confluent" else ref.glue_registry,
+        "registry": kind.location(ref),
         "subject": ref.subject,
         "requested": ref.version,
     }
     at = f"{ref.where} ({ref.label})"
-    # One client per kind: a Confluent read takes (subject, version), a Glue read
-    # (registry, schema name, version).
-    client = confluent(ref.url) if ref.kind == "confluent" else glue()
+    # One client per kind: each kind reads its own way (kind.read).
+    client = open_client(ref)
     try:
-        sv = _read_version(client, ref)
+        sv = kind.read(client, ref)
         record["version"] = sv.version
         if sv.schema_id is not None:
             record["schemaId"] = sv.schema_id
@@ -118,7 +111,7 @@ def _check(
                 f"{at}: stream.schema reads {path!r}, and version {sv.version} gives it no "
                 f"column type ({skipped[path]})"
             )
-        if ref.kind == "confluent":
+        if kind.checks_compatibility:
             name = full.rpartition(".")[2] or subject.topic
             reader = derive(
                 subject.columns,
@@ -128,14 +121,12 @@ def _check(
                 names=names,
             )
             try:
-                record["mode"] = client.compatibility_level(ref.subject)
+                record["mode"] = kind.mode(client, ref)
             except RegistryError as exc:
                 # The mode is context only: without it the registry's verdict is not
                 # decisive (see _READER_MODES) and forge's comparison decides.
                 LOG.debug("schema_registry_mode_unreadable subject=%s: %s", ref.subject, exc)
-            ok, messages = client.check_compatibility(
-                ref.subject, sv.version, schema_text(reader), expected
-            )
+            ok, messages = kind.verdict(client, ref, sv.version, schema_text(reader), expected)
             # The registry judges the declared schema as the subject's next version under
             # the subject's mode. Only a BACKWARD mode asks what plan asks (can this
             # reader read version N's records); FORWARD and FULL also ask whether the
@@ -171,76 +162,40 @@ def _check(
     return record, None
 
 
-def _aws_region(contract: Mapping[str, Any], environ: Optional[Mapping[str, str]]) -> Optional[str]:
-    """The region a Glue registry is read in: where ``fluid apply`` puts the product.
-
-    The AWS emitter's own region (every AWS binding's ``location.region``), else the
-    environment in the AWS SDK order (``AWS_REGION``, then ``AWS_DEFAULT_REGION``):
-    boto3 1.x reads only the second (the same rule as ``cli/_diff_live.py``).
-    """
-    import os
-
-    from fluid_build.iac.providers.aws import AwsIacPlugin
-
-    try:
-        region = AwsIacPlugin().provider_block_for(contract).get("region")
-    except Exception:  # noqa: BLE001 - an unemittable contract: fall back to the env
-        region = None
-    if region:
-        return str(region)
-    env = os.environ if environ is None else environ
-    return next((env[k] for k in ("AWS_REGION", "AWS_DEFAULT_REGION") if env.get(k)), None)
-
-
-def _same_endpoint(a: str, b: str) -> bool:
-    """Whether two registry URLs are one endpoint: scheme, host, port (default filled
-    in) and path, ignoring case and a trailing slash. An unreadable URL is no match."""
-    from urllib.parse import urlsplit
-
-    def key(url: str) -> Any:
-        try:
-            parts = urlsplit(url.strip())
-            scheme = parts.scheme.lower()
-            port = parts.port or {"https": 443, "http": 80}.get(scheme)
-        except ValueError:  # an unreadable port or IPv6 literal
-            return None
-        return scheme, (parts.hostname or "").lower(), port, parts.path.rstrip("/")
-
-    first = key(a)
-    return first is not None and first == key(b)
-
-
-def _operator_endpoint(
-    subject: Subject,
-    environ: Optional[Mapping[str, str]],
-    errors: List[str],
-    warnings: List[str],
-) -> None:
-    """A produced Confluent subject lands in the operator's ``SCHEMA_REGISTRY_REST_ENDPOINT``.
-
-    OpenTofu registers it in the provider-level registry, so a contract naming one
-    registry and an environment naming another would register the schema somewhere
-    the contract never said: refused. Unset is a warning: apply needs it.
-    """
-    import os
-
-    from .policy import TOFU_REGISTRY_ENDPOINT_ENV
-
-    env = os.environ if environ is None else environ
-    endpoint = env.get(TOFU_REGISTRY_ENDPOINT_ENV)
-    ref = subject.ref
-    if not endpoint:
-        warnings.append(
-            f"{ref.where}: OpenTofu registers subject {ref.subject!r} in the registry "
-            f"{TOFU_REGISTRY_ENDPOINT_ENV} names, and it is unset; fluid apply needs it set "
-            f"to {ref.url} with SCHEMA_REGISTRY_ID, SCHEMA_REGISTRY_API_KEY and "
-            "SCHEMA_REGISTRY_API_SECRET"
+def _factories(clients: Mapping[str, Any], kinds: Optional[List[str]] = None) -> Mapping[str, Any]:
+    """The client factories, keyed by kind name (``kinds``: the ones that may be read
+    here, every kind by default). Any other keyword is a caller's typo (``enviorn=``),
+    which ``**clients`` would otherwise swallow: refused."""
+    accepted = list(names()) if kinds is None else kinds
+    unknown = sorted(set(clients) - set(accepted))
+    if unknown:
+        raise TypeError(
+            f"unexpected keyword argument(s) {unknown}: client factories are keyed by "
+            f"registry kind ({', '.join(accepted)})"
         )
-    elif not _same_endpoint(endpoint, str(ref.url)):
-        errors.append(
-            f"{ref.where}: the contract registers subject {ref.subject!r} in {ref.url}, and "
-            f"{TOFU_REGISTRY_ENDPOINT_ENV} points OpenTofu at another registry"
+    return clients
+
+
+def _opener(
+    clients: Mapping[str, Any],
+    *,
+    contract: Optional[Mapping[str, Any]] = None,
+    environ: Optional[Mapping[str, str]] = None,
+    credential: Optional[str] = None,
+) -> Callable[[Any], Any]:
+    """``ref -> client``: each kind opens its own client, or the factory a caller passed
+    under that kind's name."""
+
+    def open_client(ref: Any) -> Any:
+        return get_kind(ref.kind).client(
+            ref,
+            contract=contract,
+            environ=environ,
+            credential=credential,
+            factory=clients.get(ref.kind),
         )
+
+    return open_client
 
 
 def _for_provider(produced: List[Subject], provider: Optional[str]) -> List[Subject]:
@@ -251,14 +206,12 @@ def _for_provider(produced: List[Subject], provider: Optional[str]) -> List[Subj
         return produced
     from fluid_build.iac.provider_match import canonical_cloud
 
-    from .produced import REGISTERING_CLOUD
-
     # The flag as the provider gate reads it (aliases, case, spaces): an unreadable
     # spelling filters nothing out, so it can never skip a check.
     cloud = canonical_cloud(str(provider).strip().lower())
-    if cloud not in REGISTERING_CLOUD.values():
+    if cloud not in {k.registering_cloud for k in all_kinds()}:
         return produced
-    return [s for s in produced if REGISTERING_CLOUD.get(s.ref.kind) == cloud]
+    return [s for s in produced if get_kind(s.ref.kind).registering_cloud == cloud]
 
 
 def _produced_checks(
@@ -279,28 +232,30 @@ def _produced_checks(
         more_errors, more_warnings = produced_findings(contract, subject)
         errors.extend(more_errors)
         warnings.extend(more_warnings)
-        if subject.ref.kind == "confluent":
-            found: List[str] = []
-            _operator_endpoint(subject, environ, errors, found)
-            # Apply is where OpenTofu registers it: an unset endpoint cannot register.
-            (errors if stage == "apply" else warnings).extend(found)
+        kind_errors, kind_warnings = get_kind(subject.ref.kind).produced_checks(
+            subject, stage=stage, environ=environ
+        )
+        errors.extend(kind_errors)
+        warnings.extend(kind_warnings)
 
 
 def verify_consumed(
     contract: Mapping[str, Any],
     *,
     environ: Optional[Mapping[str, str]] = None,
-    confluent: Optional[Callable[[str], Any]] = None,
-    glue: Optional[Callable[[], Any]] = None,
     provider: Optional[str] = None,
+    **clients: Any,
 ) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
     """Check every consumed subject and the egress of every produced one.
 
-    Returns ``(records, errors, warnings)``. ``confluent`` and ``glue`` build the
-    clients (tests pass fakes).
+    Returns ``(records, errors, warnings)``. ``clients`` are factories keyed by kind
+    name (``confluent=``, ``glue=``) that replace the real client of that kind (tests
+    pass fakes); each is called as its kind's ``client`` method calls it.
     """
     from .policy import subject_findings
     from .reference import checked_subjects, malformed_produced, produced_subjects
+
+    clients = _factories(clients)
 
     errors: List[str] = list(malformed_produced(contract))
     warnings: List[str] = []
@@ -311,15 +266,8 @@ def verify_consumed(
     except RegistryShapeError as exc:
         return records, [*errors, str(exc)], warnings
     _produced_checks(contract, _for_provider(produced, provider), "plan", environ, errors, warnings)
-    if confluent is None:
-        from .clients import ConfluentRegistry
 
-        confluent = ConfluentRegistry
-    if glue is None:
-        from .clients import GlueRegistry
-
-        region = _aws_region(contract, environ)
-        glue = lambda: GlueRegistry(region=region)  # noqa: E731
+    open_client = _opener(clients, contract=contract, environ=environ)
     for subject in consumed:
         refused = [m for s, m in subject_findings(subject, stage="plan", environ=environ)]
         if refused:
@@ -335,14 +283,14 @@ def verify_consumed(
                     "build": subject.owner,
                     "topic": subject.topic,
                     "kind": subject.ref.kind,
-                    "registry": subject.ref.url,
+                    "registry": get_kind(subject.ref.kind).location(subject.ref),
                     "subject": subject.ref.subject,
                     "requested": subject.ref.version,
                     "result": "verified-at-apply",
                 }
             )
             continue
-        record, error = _check(subject, confluent=confluent, glue=glue)
+        record, error = _check(subject, open_client=open_client)
         if error:
             record["result"] = "incompatible"
             errors.append(error)
@@ -412,8 +360,8 @@ def verify_at_apply(
     *,
     dry_run: bool = False,
     environ: Optional[Mapping[str, str]] = None,
-    confluent: Optional[Callable[..., Any]] = None,
     provider: Optional[str] = None,
+    **clients: Any,
 ) -> List[Dict[str, Any]]:
     """``fluid apply``'s check of each consumed subject whose registry needs a credential.
 
@@ -434,6 +382,9 @@ def verify_at_apply(
     from .policy import subject_findings
     from .reference import RegistryShapeError, checked_subjects, produced_subjects
 
+    # Apply reads only subjects with a credential: kinds that take auth.
+    clients = _factories(clients, [k.name for k in all_kinds() if "auth" in k.fields])
+
     errors: List[str] = []
     warnings: List[str] = []
     try:
@@ -450,10 +401,6 @@ def verify_at_apply(
     except RegistryShapeError as exc:
         consumed, errors = [], [*errors, str(exc)]
     subjects = [s for s in consumed if s.ref.secret_ref]
-    if confluent is None:
-        from .clients import ConfluentRegistry
-
-        confluent = ConfluentRegistry
     records: List[Dict[str, Any]] = []
     for subject in subjects:
         ref = subject.ref
@@ -475,10 +422,8 @@ def verify_at_apply(
             secret.get_secret_value() if hasattr(secret, "get_secret_value") else str(secret)
         )
 
-        def client(url: str, _credential: str = credential) -> Any:
-            return confluent(url, credential=_credential)
-
-        record, error = _check(subject, confluent=client, glue=lambda: None)
+        open_client = _opener(clients, environ=environ, credential=credential)
+        record, error = _check(subject, open_client=open_client)
         record["result"] = "incompatible" if error else record.get("result", "compatible")
         if error:
             errors.append(error)

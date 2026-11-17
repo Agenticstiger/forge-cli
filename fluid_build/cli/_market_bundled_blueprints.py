@@ -47,7 +47,9 @@ metadata:
   layer: Bronze
   owner:
     team: {{ owner_team | tojson }}
+    {% if owner_email %}
     email: {{ owner_email | tojson }}
+    {% endif %}
 builds:
   - id: "{{ name_slug }}_build"
     pattern: "embedded-logic"
@@ -84,7 +86,9 @@ metadata:
   layer: Silver
   owner:
     team: {{ owner_team | tojson }}
+    {% if owner_email %}
     email: {{ owner_email | tojson }}
+    {% endif %}
 builds:
   - id: "{{ name_slug }}_daily"
     pattern: "embedded-logic"
@@ -140,7 +144,9 @@ metadata:
   layer: Bronze
   owner:
     team: {{ owner_team | tojson }}
+    {% if owner_email %}
     email: {{ owner_email | tojson }}
+    {% endif %}
 builds:
   - id: "{{ bq_table }}_build"
     pattern: "embedded-logic"
@@ -181,7 +187,9 @@ metadata:
   layer: Bronze
   owner:
     team: {{ owner_team | tojson }}
+    {% if owner_email %}
     email: {{ owner_email | tojson }}
+    {% endif %}
 builds:
   - id: "{{ sf_build }}_build"
     pattern: "embedded-logic"
@@ -229,15 +237,17 @@ _COMMON_PARAMS: List[Dict[str, Any]] = [
         "name": "owner_team",
         "required": False,
         "type": "string",
-        "default": "data-team",
+        # As fluid init --blueprint: data-team is the starter's own value,
+        # which fluid validate --strict (and so fluid ship) refuses.
+        "default": "data-platform",
         "description": "Owning team.",
     },
     {
         "name": "owner_email",
         "required": False,
         "type": "string",
-        "default": "team@example.com",
-        "description": "Owner contact email.",
+        "default": "",
+        "description": "Owner contact email (left out of the contract when blank).",
     },
 ]
 

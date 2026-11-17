@@ -7,7 +7,6 @@ metadata:
   layer: Silver
   owner:
     team: "analytics-team"
-    email: "analytics@example.com"
 
 builds:
   - id: "sales_time_series"

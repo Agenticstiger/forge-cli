@@ -348,7 +348,7 @@ def _generate_deployment(contract_id: str, contract_name: str, schedule: str, ti
 
     # ``tags`` used to be assembled from hand-quoted text with the RAW contract
     # id spliced in; building the list here and emitting its repr escapes every
-    # element at once (the idiom aws/codegen/airflow.py uses).
+    # element at once (the idiom schedulers/airflow/_operators.py uses).
     tags = ["fluid", "auto-generated", "gcp", str(contract_id)]
     deployment_name = f"{flow_name}-deployment"
     # The two cprint lines kept an ``f`` prefix into the generated file, so a

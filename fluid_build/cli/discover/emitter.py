@@ -54,7 +54,7 @@ def emit_contract(
             # vocabulary they use.
             "layer": "Bronze",
             "productType": "SDP",
-            "owner": {"team": owner_team, "email": owner_email},
+            "owner": {"team": owner_team, **({"email": owner_email} if owner_email else {})},
         },
         "builds": [
             {

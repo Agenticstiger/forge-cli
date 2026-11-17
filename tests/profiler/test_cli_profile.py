@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import stat
 import sys
@@ -89,12 +90,19 @@ def test_out_names_where_the_document_goes(workspace, registry):
     assert (workspace / "profiles" / "o.json").is_file()
 
 
-def test_without_the_registry_nothing_is_read_and_nothing_written(workspace, capsys):
+def _not_installed(name):
+    raise importlib.metadata.PackageNotFoundError(name)
+
+
+def test_without_the_registry_nothing_is_read_and_nothing_written(workspace, capsys, monkeypatch):
+    monkeypatch.setitem(sys.modules, "flux_stats", None)
+    monkeypatch.setattr(importlib.metadata, "version", _not_installed)
     rc = main(["profile", "contract.fluid.yaml", "--source", "does-not-exist.ndjson"])
-    out = capsys.readouterr().out
+    out = " ".join(capsys.readouterr().out.split())  # the console may wrap
     assert rc == 1
     assert "profile_statistics_unavailable" in out
-    assert "flux-stats" in out
+    assert "and flux-stats is not installed" in out
+    assert "next: pip install 'data-product-forge[profile]'" in out
     assert not (workspace / "orders.profile.json").exists()
 
 

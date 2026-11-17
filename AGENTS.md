@@ -123,7 +123,6 @@ forge-cli/
 │   │   └── schedule_sync.py  # Stage 11 — Path-A DAG push (Phase 7-rest)
 │   ├── providers/            # Provider plugins: local, gcp, aws, snowflake, odps, odcs
 │   │   ├── aws/plan/schedule.py    # SchedulePlanner — Path-B (EventBridge/MWAA) via stage 6
-│   │   └── snowflake/orchestration/  # Path-B for Snowflake Tasks + MWAA
 │   ├── build_runners/        # dbt + python script runners (extracted from legacy cli/execute.py)
 │   ├── forge/                # AI-assisted project creation engine
 │   │   └── core/
@@ -155,6 +154,7 @@ forge-cli/
 | Provider plugins (planning) | `fluid_build/providers/{local,gcp,aws,snowflake,odps,odcs}/` — `plan()` emits abstract actions |
 | **IaC emitter (apply)** | `fluid_build/iac/` — modular OpenTofu plugin registry. `cli/_apply_opentofu_engine.py` compiles the contract to `main.tf.json` and shells `tofu` for cloud providers. `cli/generate_iac.py` is `fluid generate iac` for review-only emit. One plugin per cloud at `iac/providers/{aws,gcp,snowflake}.py` (dbt-adapter pattern). |
 | Path-B schedulers | `fluid_build/providers/aws/plan/schedule.py` (EventBridge/MWAA/Lambda/Step-Functions via stage 6 `SchedulePlanner`) |
+| Airflow DAGs | `fluid_build/schedulers/airflow/` is the one renderer. `render_dag()` (`__init__.py`, operators in `_operators.py`) renders a contract's `orchestration` section for gcp/aws/snowflake; `fluid_apply.py` renders a scheduled build. `fluid generate schedule`, `fluid export --engine airflow` and `fluid generate-airflow` (a deprecated alias of the first) all come through it. Task variables go through `codegen_utils.unique_task_identifiers`. |
 | Contract schemas | `fluid_build/schemas/*.json` (0.7.2 is latest; `SchemaManager.latest_bundled_version()` is the dynamic lookup) |
 | Policy engine | `fluid_build/policy/` (compiler, agent_policy, sovereignty, guardrails) |
 | Plan-binding helpers | `fluid_build/forge/core/plan_digest.py` — `inject_digests`, `verify_plan_binding`, `PlanBindingError` |
@@ -162,7 +162,7 @@ forge-cli/
 | Bundle builder | `fluid_build/forge/core/bundle.py` — deterministic tgz + MANIFEST + fragment extraction + `$source` sentinel |
 | Build runners | `fluid_build/build_runners/{dbt,python}/` — extracted from legacy `cli/execute.py` in Phase 1 |
 | Masking at landing | `fluid_build/build_runners/_masking.py` — the DuckDB runner applies `exposes[].policy.privacy.masking[]` inside the COPY (file, S3, BigQuery staging, DLQ); secrets only from env (`FLUID_PII_HASH_SECRET`, `FLUID_PII_TOKENIZATION_KEY`, `FLUID_PII_ENCRYPTION_SECRET_KEY`, or `params.saltEnv`/`keyEnv`), held in UDF closures, never in SQL; an unappliable rule refuses the build, and so does a DuckDB without numpy (its `create_function` needs it; `[local]` names numpy, and the refusal names the extra). `cli/_verify_masking.py` is stage 9's shape check (local DuckDB, Athena in the count query) |
-| FLUX profiler (`fluid profile`, `[profile]` extra) | `fluid_build/profiler/` — reads one expose's records where they live (`sources.py`: an NDJSON slice as flux-engine reads one; CSV/Parquet and postgres/mysql/sqlite through the DuckDB sandbox and `cli/discover/_jdbc_introspect.attach_jdbc_source`), applies ACRO's output checks (`disclosure.py`) and writes a PROFILE-SPEC 1-0-0 document (`document.py`, RFC 8785, digest `sha256:`). Every statistic comes from FLUX's registry through the one seam `_stats.py` (unwired until `flux-stats` is published); never import `flux_engine` here (`tests/profiler/test_boundary.py`) |
+| FLUX profiler (`fluid profile`, `[profile]` extra) | `fluid_build/profiler/` — reads one expose's records where they live (`sources.py`: an NDJSON slice as flux-engine reads one; CSV/Parquet and postgres/mysql/sqlite through the DuckDB sandbox and `cli/discover/_jdbc_introspect.attach_jdbc_source`), applies ACRO's output checks (`disclosure.py`) and writes a PROFILE-SPEC 1-0-0 document (`document.py`, RFC 8785, digest `sha256:`). Every value is read, and every statistic formed, by FLUX's registry `flux-stats` through the one seam `_stats.py`, which imports it only when a profile runs; never import `flux_engine` here (`tests/profiler/test_boundary.py`) |
 | CI template generator | `fluid_build/forge/core/pipeline_templates.py` — 7-system generator; Jenkins ships the full 11-stage parameterized template with `--install-mode {pypi,dev-source}` |
 | Forge (AI creation) | `fluid_build/forge/` (templates, generators, extensions) |
 | Log redaction (global) | `fluid_build/observability/secret_redactor.py` — `SecretRedactingFilter` wired into Python logging |

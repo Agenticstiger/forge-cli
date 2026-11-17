@@ -352,7 +352,9 @@ def test_an_unedited_starter_scaffold_is_flagged_value_by_value(
     pointers = {i["pointer"] for i in _issues(doc, "ERR_CONTRACT_TEMPLATE_RESIDUE")}
     assert {"/id", "/name", "/metadata/owner/team", "/exposes/0/exposeId"} <= pointers
     assert any(p.startswith("/builds/0") for p in pointers)
-    assert _issues(doc, "ERR_CONTRACT_PLACEHOLDER_EMAIL"), "the starter writes a stand-in email"
+    # It writes no stand-in email: a blank one is left out of the contract.
+    assert not _issues(doc, "ERR_CONTRACT_PLACEHOLDER_EMAIL")
+    assert "email" not in contract["metadata"]["owner"]
 
 
 @pytest.mark.parametrize(

@@ -37,7 +37,8 @@ def stream_from_subject(
         RegistryError: the subject could not be read, or the host is refused.
         UnsupportedSchema: the schema has a construct no column type carries.
     """
-    from .clients import ConfluentRegistry, GlueRegistry, RegistryError, parse_schema
+    from .clients import RegistryError, parse_schema
+    from .kinds import get_kind
     from .policy import subject_findings
     from .reference import Subject
     from .schemas import columns_from_registry
@@ -49,21 +50,17 @@ def stream_from_subject(
     refused = [m for s, m in subject_findings(probe, stage="plan", environ=environ) if s == "error"]
     if refused:
         raise RegistryError("; ".join(refused))
-    if ref.kind == "confluent":
-        reader = client or ConfluentRegistry(str(ref.url))
-        try:
-            sv = reader.get_version(ref.subject, ref.version)
-        finally:
-            if client is None:
-                reader.close()
-    else:
-        sv = (client or GlueRegistry()).get_version(ref.glue_registry, ref.subject, ref.version)
+    kind = get_kind(ref.kind)
+    reader = client if client is not None else kind.client(ref)
+    try:
+        sv = kind.read(reader, ref)
+    finally:
+        # Only a client built here is closed (a Glue client has nothing to close).
+        close = getattr(reader, "close", None)
+        if client is None and callable(close):
+            close()
     columns = columns_from_registry(parse_schema(sv.schema), sv.data_format)
-    registry: Dict[str, Any] = {"kind": ref.kind}
-    if ref.kind == "confluent":
-        registry["url"] = ref.url
-    elif ref.registry_name:
-        registry["registryName"] = ref.registry_name
+    registry: Dict[str, Any] = {"kind": ref.kind, **kind.registry_block(ref)}
     if ref.subject != f"{topic}-value":
         registry["subject"] = ref.subject
     if ref.version != "latest":

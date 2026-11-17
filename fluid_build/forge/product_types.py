@@ -765,7 +765,7 @@ class ProductTypeAnswer:
     name: str
     domain: str = "analytics"
     owner_team: str = "data-team"
-    owner_email: str = "data-team@example.com"
+    owner_email: str = ""  # blank: left out of the contract
     description: Optional[str] = None
     # default_factory, not a literal: a dataclass default is evaluated once at
     # class-creation time, so a literal here freezes the version at whatever was
@@ -906,7 +906,10 @@ def shape_contract(answer: ProductTypeAnswer) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {
         "layer": pt.layer,
         "productType": pt.code,
-        "owner": {"team": answer.owner_team, "email": answer.owner_email},
+        "owner": {
+            "team": answer.owner_team,
+            **({"email": answer.owner_email} if answer.owner_email else {}),
+        },
     }
     normalize_metadata_in_place(metadata)
 

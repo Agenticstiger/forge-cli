@@ -13,7 +13,6 @@ metadata:
   productType: ADP
   owner:
     team: analytics-team
-    email: analytics-team@company.com
 exposes:
 - exposeId: customers_cleaned
   title: Cleaned Customer Data

@@ -34,7 +34,7 @@ SAMPLE = {
     "metadata": {
         "layer": "Gold",
         "productType": "CDP",
-        "owner": {"team": "Data", "email": "owner@example.com"},
+        "owner": {"team": "Data"},
     },
     "consumes": [],
     "builds": [

@@ -19,7 +19,6 @@ metadata:
   layer: Silver
   owner:
     team: platform-data
-    email: platform-data@example.com
 
 exposes:
   # ─── Kinesis Data Stream (ingest plane) ───────────────────────────

@@ -61,6 +61,15 @@ _ENV_VARS = (
     "GITHUB_STEP_SUMMARY",
     "GITLAB_CI",
     "TF_BUILD",
+    "CATALOG",
+    "VALIDATE_STRICT",
+    "VERIFY_STRICT",
+    "GENERATE_EMIT",
+    "DIFF_EXIT_ON_DRIFT",
+    "DIFF_LAST_APPLIED",
+    "PLAN_HTML",
+    "POLICY_APPLY_MODE",
+    *st.STAGE_TOGGLES.values(),
 )
 
 
@@ -155,6 +164,21 @@ _CASES = {
     "amend-with-ignored-build-id": dict(
         mode="amend", build_id="build_one", scheduler="airflow", targets=["datamesh-manager"]
     ),
+    # Every knob Jenkins exposes, set away from its default.
+    "every-knob": dict(
+        mode="amend",
+        build_id="",
+        targets=["datamesh-manager"],
+        knobs={
+            "VALIDATE_STRICT": "false",
+            "VERIFY_STRICT": "false",
+            "GENERATE_EMIT": "odcs,policies",
+            "DIFF_EXIT_ON_DRIFT": "false",
+            "DIFF_LAST_APPLIED": ".fluid-ci/last-applied/dev.json",
+            "PLAN_HTML": "true",
+            "POLICY_APPLY_MODE": "check",
+        },
+    ),
     # A pipeline that applies elsewhere: the shell's RUN_STAGE_7_APPLY=false,
     # ship's --skip-stage apply. A dry-run mode then skips nothing after stage 7.
     "dry-run-without-apply": dict(
@@ -163,6 +187,13 @@ _CASES = {
         scheduler="airflow",
         targets=["datamesh-manager"],
         apply_in_pipeline=False,
+    ),
+    # Only the word false switches apply off; any other value leaves it on.
+    "dry-run-apply-switch-not-false": dict(
+        mode="dry-run",
+        build_id="",
+        targets=["datamesh-manager"],
+        knobs={"RUN_STAGE_7_APPLY": "TRUE"},
     ),
 }
 
@@ -234,27 +265,21 @@ def test_ship_argv_equals_the_generated_pipeline_shell(case: str, tmp_path: Path
             sh_env[var] = str(c[key])
     if c.get("schedule_sync_dry_run"):
         sh_env["SCHEDULE_SYNC_DRY_RUN"] = "true"
-    apply_in_pipeline = c.get("apply_in_pipeline", True) is not False
-    if not apply_in_pipeline:
+    if c.get("apply_in_pipeline", True) is False:
         sh_env["RUN_STAGE_7_APPLY"] = "false"
+    knobs: Dict[str, str] = dict(c.get("knobs", {}))  # type: ignore[call-overload]
+    sh_env.update(knobs)
 
-    opts = st.ShipOptions(
-        contract="contract.fluid.yaml",
-        env=env_name,
-        mode=mode,
-        build_id=str(c["build_id"]),
-        yes=True,
-        allow_data_loss=bool(c.get("allow_data_loss")),
-        no_verify_digest=bool(c.get("no_verify_digest")),
-        targets=list(c["targets"]),  # type: ignore[arg-type]
-        scheduler=str(c.get("scheduler", "")),
-        scheduler_destination=str(c.get("scheduler_destination", "")),
-        scheduler_environment_name=str(c.get("scheduler_environment_name", "")),
-        scheduler_location=str(c.get("scheduler_location", "")),
-        scheduler_workspace=str(c.get("scheduler_workspace", "")),
-        schedule_sync_dry_run=bool(c.get("schedule_sync_dry_run")),
-        apply_in_pipeline=apply_in_pipeline,
-    )
+    # Ship reads the environment the shell gets, plus the defaults the template
+    # bakes into the shell: the variables are read alike, not only the argv built.
+    ship_env = {
+        **sh_env,
+        "FLUID_ENV": env_name,
+        "APPLY_MODE": mode,
+        "APPLY_BUILD_ID": str(c["build_id"]),
+        "SCHEDULER": str(c.get("scheduler", "")),
+    }
+    opts = st.resolve_options(parse(["--yes"]), "contract.fluid.yaml", ship_env)
     ws = st.Workspace(tmp_path)
     for spec in specs:
         expected = _shell_argv(tmp_path, spec.command, sh_env, bin_dir, spec.num)
@@ -996,11 +1021,8 @@ def _cli(cwd: Path, *args: str) -> subprocess.CompletedProcess:
 
 @pytest.fixture
 def hello(tmp_path: Path) -> Path:
-    lines = HELLO.read_text().splitlines()
-    # ``team@example.com`` is a placeholder that ``validate --strict`` rejects.
-    (tmp_path / "contract.fluid.yaml").write_text(
-        "\n".join(line for line in lines if "email:" not in line) + "\n"
-    )
+    # The example as shipped: it passes ``validate --strict`` (no placeholder owner).
+    (tmp_path / "contract.fluid.yaml").write_text(HELLO.read_text())
     return tmp_path
 
 
@@ -1624,3 +1646,236 @@ def test_a_dry_run_apply_in_an_earlier_step_does_not_make_a_failure_partial(
     monkeypatch.setattr(ship.subprocess, "run", FakeRun({"policy-apply": 1}))
     assert ship_run(["--stage", "8", "--dry-run"]) == 1  # the dry run changed nothing
     assert _report(work)["exit_code"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 9. The pipeline's switches: RUN_STAGE_<N>_<NAME> and Jenkins' stage knobs
+# ---------------------------------------------------------------------------
+
+
+def test_stage_toggles_are_the_generated_pipelines_parameter_names() -> None:
+    config = PipelineConfig(
+        provider=PipelineProvider.GITHUB_ACTIONS, complexity=PipelineComplexity.BASIC
+    )
+    specs = GitHubActionsTemplate()._stage_specs(config)
+    assert st.STAGE_TOGGLES == {spec.num: spec.toggle_param for spec in specs}
+
+
+def test_a_stage_switched_off_is_skipped_with_stage_too(
+    work: Path,
+    fake: FakeRun,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUN_STAGE_5_DIFF", "false")
+    assert ship_run(["--yes"]) == 0
+    assert "diff" not in fake.stages and "plan" in fake.stages
+    assert _report(work)["stages"][4]["skip_reason"] == "RUN_STAGE_5_DIFF=false"
+    fake.calls.clear()
+    before = (work / "runtime/ship-report.json").read_text()
+    capsys.readouterr()
+    assert ship_run(["--stage", "diff"]) == 0  # the step of a stage that is off
+    assert fake.calls == []
+    assert "stage 5 diff is switched off (RUN_STAGE_5_DIFF=false): nothing to run" in (
+        capsys.readouterr().out
+    )
+    assert (work / "runtime/ship-report.json").read_text() == before  # writes nothing
+
+
+def test_flags_that_leave_nothing_are_still_refused_with_a_switch_set(
+    work: Path, fake: FakeRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUN_STAGE_5_DIFF", "false")
+    assert ship_run(["--stage", "diff", "--skip-stage", "diff"]) == 2
+    assert fake.calls == []
+
+
+def test_a_switched_off_stage_outside_stage_is_reported_as_switched_off(
+    work: Path, fake: FakeRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Per-stage CI steps share one report, and the step that owns a stage
+    # that is off writes nothing: the first step records the switch.
+    monkeypatch.setenv("RUN_STAGE_5_DIFF", "false")
+    assert ship_run(["--stage", "bundle"]) == 0
+    assert _report(work)["stages"][4]["skip_reason"] == "RUN_STAGE_5_DIFF=false"
+
+
+def test_the_switch_for_stage_ten_or_eleven_turns_it_on_and_publish_beats_it(
+    work: Path, fake: FakeRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUN_STAGE_10_PUBLISH", "true")
+    assert ship_run(["--yes"]) == 0
+    assert fake.stages[-1] == "publish"
+    monkeypatch.setenv("RUN_STAGE_10_PUBLISH", "false")
+    fake.calls.clear()
+    assert ship_run(["--yes", "--publish"]) == 0  # the flag beats its own switch
+    assert fake.stages[-1] == "publish"
+    fake.calls.clear()
+    assert ship_run(["--yes"]) == 0
+    assert "publish" not in fake.stages
+
+
+def test_apply_switched_off_means_a_dry_run_still_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opts = st.resolve_options(parse(["--dry-run"]), "c", {"RUN_STAGE_7_APPLY": "false"})
+    assert not opts.apply_in_pipeline
+    assert st.resolve_options(parse(["--dry-run"]), "c", {}).apply_in_pipeline
+
+
+def test_only_the_exact_words_switch_a_stage() -> None:
+    on, off = st.stage_switches({"RUN_STAGE_5_DIFF": "FALSE", "RUN_STAGE_10_PUBLISH": "1"})
+    assert on == set() and off == set()
+    on, off = st.stage_switches({"RUN_STAGE_5_DIFF": "false", "RUN_STAGE_9_VERIFY": "true"})
+    assert on == set() and off == {5}  # true only matters for 10 and 11
+
+
+@pytest.mark.parametrize(
+    "flags,env,strict",
+    [
+        ([], {}, True),
+        ([], {"VALIDATE_STRICT": "false"}, False),
+        (["--strict"], {"VALIDATE_STRICT": "false"}, True),
+        (["--no-strict"], {"VALIDATE_STRICT": "true"}, False),
+    ],
+)
+def test_validate_strict_takes_the_flag_then_the_variable(
+    flags: List[str], env: Dict[str, str], strict: bool
+) -> None:
+    assert st.resolve_options(parse(flags), "c", env).strict is strict
+
+
+def test_each_jenkins_knob_reaches_its_stage(tmp_path: Path) -> None:
+    env = {
+        "GENERATE_EMIT": "odcs,policies",
+        "DIFF_EXIT_ON_DRIFT": "false",
+        "DIFF_LAST_APPLIED": "base/dev.json",
+        "PLAN_HTML": "true",
+        "POLICY_APPLY_MODE": "check",
+        "VERIFY_STRICT": "false",
+    }
+    opts = st.resolve_options(parse([]), "contract.fluid.yaml", env)
+    (tmp_path / "dist/artifacts/policy").mkdir(parents=True)
+    (tmp_path / "dist/artifacts/policy/bindings.json").write_text("{}")
+    ws = st.Workspace(tmp_path)
+
+    def argv(num: int) -> List[str]:
+        return st.build_stage(num, opts, ws).argv or []
+
+    assert argv(3)[-2:] == ["--emit", "odcs,policies"]
+    assert "--exit-on-drift" not in argv(5) and argv(5)[-2:] == ["--last-applied", "base/dev.json"]
+    assert any("a first run" in n for n in st.build_stage(5, opts, ws).notes)
+    assert argv(6)[-2:] == ["--html", "runtime/plan.html"]
+    assert argv(8)[-2:] == ["--mode", "check"]
+    assert "--strict" not in argv(9)
+
+
+def test_the_flags_beat_the_knob_variables(tmp_path: Path) -> None:
+    env = {"GENERATE_EMIT": "odcs", "DIFF_LAST_APPLIED": "env.json", "POLICY_APPLY_MODE": "check"}
+    flags = ["--emit", "schedule", "--last-applied", "flag.json", "--policy-mode", "enforce"]
+    opts = st.resolve_options(parse(flags), "c", env)
+    assert (opts.emit, opts.diff_last_applied, opts.policy_mode) == (
+        "schedule",
+        "flag.json",
+        "enforce",
+    )
+
+
+def test_a_policy_mode_that_is_not_one_is_refused(work: Path, fake: FakeRun) -> None:
+    with pytest.raises(st.ShipUsageError, match="not a policy mode"):
+        st.resolve_options(parse([]), "c", {"POLICY_APPLY_MODE": "yolo"})
+
+
+def test_stage_eight_enforces_after_a_dry_run_only_without_apply_in_the_pipeline(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "dist/artifacts/policy").mkdir(parents=True)
+    (tmp_path / "dist/artifacts/policy/bindings.json").write_text("{}")
+    ws = st.Workspace(tmp_path)
+    with_apply = st.build_stage(8, _opts(mode="dry-run"), ws)
+    without = st.build_stage(8, _opts(mode="dry-run", apply_in_pipeline=False), ws)
+    assert with_apply.argv[-2:] == ["--mode", "check"]  # type: ignore[index]
+    assert without.argv[-2:] == ["--mode", "enforce"]  # type: ignore[index]
+
+
+def test_validate_and_validate_artifacts_write_their_reports(tmp_path: Path) -> None:
+    (tmp_path / "dist/artifacts").mkdir(parents=True)
+    ws = st.Workspace(tmp_path)
+    assert "runtime/validate-report.json" in (st.build_stage(2, _opts(), ws).argv or [])
+    assert "runtime/validate-artifacts-report.json" in (st.build_stage(4, _opts(), ws).argv or [])
+
+
+def test_explain_names_the_switch_that_turned_a_stage_off(
+    work: Path, fake: FakeRun, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUN_STAGE_8_POLICY_APPLY", "false")
+    assert ship_run(["--explain"]) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "8 policy-apply" in ln)
+    assert "RUN_STAGE_8_POLICY_APPLY=false" in line
+
+
+def test_a_true_switch_adds_its_stage_only_to_a_run_that_names_none(
+    work: Path, fake: FakeRun, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A CI step runs --stage N with the job's variables: it must not publish too.
+    monkeypatch.setenv("RUN_STAGE_10_PUBLISH", "true")
+    monkeypatch.setenv("RUN_STAGE_11_SCHEDULE_SYNC", "true")
+    assert ship_run(["--stage", "bundle-validate"]) == 0
+    assert fake.stages == ["bundle", "validate"]
+    capsys.readouterr()
+    assert ship_run(["--explain"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "fluid publish" in next(ln for ln in lines if "10 publish" in ln)
+    assert "not run" not in next(ln for ln in lines if "11 schedule-sync" in ln)
+
+
+def test_explain_says_how_to_switch_on_an_opt_in_stage(
+    work: Path, fake: FakeRun, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert ship_run(["--explain"]) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "10 publish" in ln)
+    assert "opt-in: pass --publish or set RUN_STAGE_10_PUBLISH=true" in line
+
+
+@pytest.mark.parametrize(
+    "emit,policy_runs",
+    [("", True), ("odcs", False), ("odcs, policies", True)],
+)
+def test_explain_assumes_only_the_outputs_emit_writes(
+    work: Path, fake: FakeRun, capsys: pytest.CaptureFixture[str], emit: str, policy_runs: bool
+) -> None:
+    assert ship_run(["--explain", "--emit", emit] if emit else ["--explain"]) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "8 policy-apply" in ln)
+    assert ("fluid policy-apply" in line) is policy_runs, line
+
+
+@pytest.mark.parametrize(
+    "flags,env,field_name,value",
+    [
+        (["--exit-on-drift"], {"DIFF_EXIT_ON_DRIFT": "false"}, "diff_exit_on_drift", True),
+        (["--no-exit-on-drift"], {}, "diff_exit_on_drift", False),
+        ([], {"DIFF_EXIT_ON_DRIFT": "false"}, "diff_exit_on_drift", False),
+        (["--no-plan-html"], {"PLAN_HTML": "true"}, "plan_html", False),
+        (["--plan-html"], {}, "plan_html", True),
+        ([], {"PLAN_HTML": "true"}, "plan_html", True),
+        (["--verify-strict"], {"VERIFY_STRICT": "false"}, "no_verify_strict", False),
+        (["--no-verify-strict"], {}, "no_verify_strict", True),
+        ([], {"VERIFY_STRICT": "false"}, "no_verify_strict", True),
+    ],
+)
+def test_a_stage_flag_beats_its_variable_both_ways(
+    flags: List[str], env: Dict[str, str], field_name: str, value: bool
+) -> None:
+    assert getattr(st.resolve_options(parse(flags), "c", env), field_name) is value
+
+
+def test_stage_three_switched_off_lets_stage_four_skip(
+    work: Path, fake: FakeRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Its step finds no dist/artifacts/: stage 3 is not in this pipeline, so
+    # stage 4 skips, as the generated shell does, instead of being refused.
+    monkeypatch.setenv("RUN_STAGE_3_GENERATE_ARTIFACTS", "false")
+    assert ship_run(["--stage", "validate-artifacts"]) == 0
+    stage4 = _report(work)["stages"][3]
+    assert stage4["status"] == "skipped" and "does not exist" in stage4["skip_reason"]
+    assert fake.calls == []

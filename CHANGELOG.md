@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **One Airflow renderer.** `fluid export --engine airflow` (the AWS, GCP and Snowflake
+  providers), `fluid generate schedule` and `fluid generate-airflow` all render a contract's
+  `orchestration` section through `fluid_build.schedulers.airflow.render_dag`. The per-provider
+  `codegen/airflow.py` modules, the Snowflake `orchestration/airflow_generator.py` and the
+  provider-action generator behind `generate-airflow` are gone. The same contract and provider
+  settings now give the same DAG whichever command writes it (`fluid generate schedule` reads
+  the project, region and account from the contract's `metadata`, `fluid export` from the
+  provider's own settings, so give both the same). Every provider gets the guards only some had: a task
+  never takes a name the DAG module binds, ids that sanitise alike stay two tasks, an edge to a
+  task outside the DAG is skipped instead of failing the file at import, and an operator is
+  imported only when a task uses it. Ported into the renderer: AWS Redshift, Lambda and Glue
+  catalog tasks, GCP Pub/Sub, Dataflow and BigQuery create-table, Snowflake database, schema and
+  table DDL. Differences from the old output, one by one: `tests/schedulers/golden/DIFFERENCES.md`.
+  - A DAG id now drops `.` and `-` for AWS too (`sales.orders` is DAG `sales_orders`), as the other
+    providers and `generate schedule` already did. The file `fluid export` writes keeps its name.
+  - A task whose action no operator covers fails closed for every provider. `render_dag` (so
+    `fluid export`, `fluid generate schedule` and `fluid generate-airflow`) raises a `ValueError`
+    naming each such task and action, instead of writing a DAG that logs the action and still
+    succeeds. This is new for GCP and Snowflake, which used to log; AWS raised "retired" at run
+    time before. `FLUID_AIRFLOW_ALLOW_UNMAPPED=1` (`fluid generate-airflow --allow-unmapped`)
+    renders those tasks as log-only tasks and logs a WARNING that lists them.
+  - `fluid generate-airflow` is a deprecated alias of `fluid generate schedule --scheduler
+    airflow` and says so once. With no `-o` it still prints the one DAG to stdout; `-o` is an
+    output directory (written over, so a populated `dags/` works), or a `.py` path for a contract
+    that renders one DAG. It takes `--contract-path`, as `generate schedule` does, and must now
+    run from the project directory for a contract with scheduled builds. `--dag-id` and
+    `--schedule` are options of `fluid generate schedule` now (and so of the alias): they
+    override the id and the schedule of the one DAG rendered from an `orchestration` section, and
+    are refused for a scheduled-build DAG, which takes both from its trigger. A contract
+    with builds and no orchestration renders through its builds' triggers; it no longer gets a
+    DAG of `echo` placeholders.
+  - The renderer never writes a placeholder. `fluid generate schedule` now resolves the GCP
+    project (contract `metadata.gcp_project`, then `GOOGLE_CLOUD_PROJECT`, `FLUID_PROJECT`,
+    `GCLOUD_PROJECT`, then Application Default Credentials), the AWS account and the Snowflake
+    account, database and warehouse the way the provider does; before, a missing one rendered
+    `my-project`, `UNKNOWN_DB` or an empty account. A task that needs a value that did not
+    resolve, or that leaves out its Athena query or output location, Snowflake database, schema,
+    table, columns or SQL, BigQuery dataset, table or query, a bucket, topic, subscription, Glue
+    job name, Lambda function or Redshift SQL or cluster, is refused with a `ValueError` naming the task, instead of running `SELECT 1` or
+    creating `unknown-bucket`.
+  - Only `aws.glue.run_job` and `aws.glue.start_job_run` run a Glue job. Any other
+    `aws.glue.<operation>` is unmapped, and fails closed like the rest.
+  - A contract whose `orchestration` section has no `provider_action` task is refused rather
+    than rendered as an empty DAG.
+  - A schedule written as a bare word (`hourly`, `daily`, `weekly`, `monthly`) is the Airflow
+    keyword of that name for AWS too. It used to map to cron: `daily` ran at 02:00, now at 00:00.
+  - `generate_airflow_dag_taskflow` (AWS TaskFlow DAGs) is removed; nothing called it.
+
 ### Added
 
 - **Schema 0.7.7 (preview): rules about valid data** (RFC-data-rules.md, implementation step 1).
@@ -114,7 +164,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file). `fluid auth login`, `fluid auth status` and `fluid doctor` take such a login without
   `SNOWFLAKE_USER`.
 
-- **`fluid profile`: FLUX's profiler, as the `[profile]` extra (groundwork).**
+- **`fluid profile`: FLUX's profiler, as the `[profile]` extra.**
   `fluid profile <contract> --expose <id> --source <file|db-uri> [--table <name>] [--out <file>]`
   reads one expose's records where they live, once and whole (no sampling). It writes a
   profile document in flux-engine's PROFILE-SPEC format 1-0-0: canonical RFC 8785 JSON,
@@ -152,11 +202,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     written, and no directory is made, until the profile is formed. A default name
     (`<exposeId>.profile.json`) needs an exposeId of `[A-Za-z0-9_.-]` alone, otherwise
     `--out` is required. An `--out` that is the source file is refused.
-  - Not wired yet: every statistic is formed by FLUX's shared registry (`flux-stats`, MEAS-3).
-    Until it is published, `fluid profile` says so and reads nothing.
-    `fluid_build/profiler/_stats.py` is the one seam that wires it.
-  - `[profile]` adds DuckDB alone (`rfc8785` is a base dependency). `fluid --help` and
-    `fluid profile --help` stay free of both (`tests/perf/test_startup_budget.py`).
+  - Every value is read, and every statistic formed, by FLUX's shared registry `flux-stats`
+    (MEAS-3) through the one seam `fluid_build/profiler/_stats.py`, so a profile and the
+    fidelity check read a value one way and form a number one way. Without `flux-stats`,
+    `fluid profile` says so, naming the installed version when it cannot be imported, and
+    reads nothing. A number that needs more than 1,000 digits written out is refused by its
+    cell before it is built, as flux-stats will refuse it: a profile declares no range to
+    bound it. A sum longer than the 1,000 digits flux-stats spells is refused with the
+    document, and nothing is written.
+  - `[profile]` adds DuckDB and `flux-stats` (`rfc8785` is a base dependency). `[dev]`
+    includes it, so CI runs the profiler against the real registry. `fluid --help` and
+    `fluid profile --help` load none of the three (`tests/perf/test_startup_budget.py`).
 
 - **Schema 0.7.7 (preview): semantic relationships and SCD validity windows**
   (RFC-semantics-tier1 §4 and §5). `exposes[].semantics.relationships[]`
@@ -287,6 +343,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The bundled examples and scaffolds pass `fluid validate --strict`, so `fluid ship` runs them as
+  shipped.** `fluid ship` validates with `--strict` by default (#917), and the placeholder owner
+  emails in 29 example contracts and 13 templates stopped a first `fluid ship` at stage 2. They
+  carry no stand-in owner email any more, and `examples/02-csv-to-data-product`, the `csv-basics`
+  template and the `fluid market` blueprints' default no longer use the starter team `data-team`.
+  The scaffolds leave `metadata.owner.email` out instead of writing a stand-in
+  (`data-platform@example.com`, `team@example.com`, `<team>@company.com`, `owner@example.com`,
+  `import@forge.local`): `fluid init` (`--quickstart`, `--blueprint`, `--discover`), `fluid market
+  --instantiate`, `fluid forge --template`, `fluid product-new` and the `fluid import` workflows.
+  `--owner-email` sets it for `fluid init --blueprint` and `--discover`, as the `owner_email`
+  parameter does for `fluid market --instantiate`. A test strict-validates every example contract
+  and template, and the two `fluid init` scaffolds a new user runs first.
 - **BREAKING: `tofu` runs with an environment allowlist, not a copy of `os.environ`.** It gets
   the process basics (`PATH`, `HOME`, user, locale, temporary and profile directories), proxies,
   CA bundles, OpenTofu's settings by name plus `TF_TOKEN_*`, what `opentofu/setup-opentofu`'s
@@ -338,6 +406,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     too. Output is grouped for GitHub Actions, GitLab and Azure Pipelines (`--ci-output`). On
     GitHub nothing a stage prints, nor ship's own reading of the contract and its overlays,
     can issue a workflow command.
+- **`fluid ship` reads the switches a generated pipeline sets, and every stage knob Jenkins had.**
+  `RUN_STAGE_<N>_<NAME>=false` switches a stage off, with `--stage` too (a CI step names a stage,
+  it does not decide on it): a step whose stage is off says so and exits 0, writing no report.
+  `true` switches on stage 10 or 11 in a run that does not name its stages; an explicit
+  `--publish` or `--schedule-sync` beats its own switch. New options, each with its variable:
+  `--emit` (`GENERATE_EMIT`) for stage 3, `--exit-on-drift` / `--no-exit-on-drift`
+  (`DIFF_EXIT_ON_DRIFT`) and `--last-applied` (`DIFF_LAST_APPLIED`) for stage 5, `--plan-html` /
+  `--no-plan-html` (`PLAN_HTML`) for stage 6, `--policy-mode` (`POLICY_APPLY_MODE`) for stage 8,
+  and `--verify-strict` / `--no-verify-strict` (`VERIFY_STRICT`) for stage 9, beside `--strict` /
+  `--no-strict` (`VALIDATE_STRICT`). Each flag beats its variable both ways. Stages 2 and 4 write
+  `runtime/validate-report.json` and `runtime/validate-artifacts-report.json`. After a dry-run
+  apply, stage 8 checks the policy bindings only when stage 7 is in the pipeline, as the Jenkins
+  pipeline did; without it, it enforces them. The generated pipelines' shell bodies read the same
+  variables, and the parity test drives every knob through both, from the same environment.
 - **The secret destination policy covers every scheme, not only `env://`.** A value from
   `vault://`, `aws-sm://`, `file://` or a pack is sent to a host that leaves this machine only
   when the operator allows it: `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST` keeps `NAME` and

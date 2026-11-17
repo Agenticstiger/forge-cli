@@ -11,7 +11,6 @@ tags:
 metadata:
   owner:
     team: your-team
-    email: your-team@company.com
 exposes:
 - exposeId: hello_message
   title: Hello Message

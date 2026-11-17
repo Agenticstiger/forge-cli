@@ -124,10 +124,12 @@ FORBIDDEN_ON_HELP = (
     # Gone with the lazy core commands: the forge data-model registration and
     # the copilot schemas were what pulled it onto the --help path.
     "pydantic",
-    # ``fluid profile`` reads records through DuckDB and writes RFC 8785 JSON;
-    # both load only when it runs (``fluid_build/profiler``).
+    # ``fluid profile`` reads records through DuckDB, forms its statistics with
+    # flux-stats and writes RFC 8785 JSON; all three load only when it runs
+    # (``fluid_build/profiler``).
     "duckdb",
     "rfc8785",
+    "flux_stats",
 )
 
 _BUILD_PARSER_PROBE = (

@@ -184,7 +184,7 @@ def _detect_features() -> Dict[str, bool]:
         features["agent_policy"] = False
 
     try:
-        from fluid_build.runtimes.airflow_provider_actions import AirflowDAGGenerator
+        from fluid_build.schedulers.airflow import AirflowScheduler  # noqa: F401
 
         features["airflow_generation"] = True
     except ImportError:

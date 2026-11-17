@@ -7,7 +7,6 @@ metadata:
   layer: Silver
   owner:
     team: "revenue-ops-team"
-    email: "revenue-ops@example.com"
 
 builds:
   - id: "customer_revenue_metrics"

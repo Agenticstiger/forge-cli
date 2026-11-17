@@ -66,7 +66,7 @@ class SingerImporter(Importer):
             "metadata": {
                 "layer": "Bronze",
                 "productType": "SDP",
-                "owner": {"team": "imported", "email": "import@forge.local"},
+                "owner": {"team": "imported"},
             },
             "builds": [
                 {

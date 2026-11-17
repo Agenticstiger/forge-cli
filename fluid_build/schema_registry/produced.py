@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence, Tuple
 
+from .kinds import get_kind
 from .reference import Subject
 
 #: The value formats a produced subject may declare, by registry schema type.
@@ -137,10 +138,6 @@ def classification_metadata(
     return out
 
 
-#: The cloud whose OpenTofu plugin registers a subject of each registry kind.
-REGISTERING_CLOUD = {"glue": "aws", "confluent": "confluent"}
-
-
 def cloud_bound(contract: Mapping[str, Any], kind: str) -> bool:
     """Whether an expose binds the cloud that registers a ``kind`` subject.
 
@@ -151,7 +148,7 @@ def cloud_bound(contract: Mapping[str, Any], kind: str) -> bool:
     """
     from fluid_build.iac.provider_match import is_cloud
 
-    cloud = REGISTERING_CLOUD[kind]
+    cloud = get_kind(kind).registering_cloud
     return any(
         is_cloud((e.get("binding") or {}), cloud)
         for e in contract.get("exposes") or []
@@ -178,12 +175,8 @@ def produced_findings(contract: Mapping[str, Any], subject: Subject) -> Tuple[li
     if not cloud_bound(contract, subject.ref.kind):
         # An error, like the emitter's refusal: no OpenTofu run of this contract would
         # register it, and a produced topic with no subject is a silent gap.
-        cloud = REGISTERING_CLOUD[subject.ref.kind]
-        fix = (
-            "bind an AWS expose (the Glue registry's product)"
-            if cloud == "aws"
-            else "bind the topic with platform: confluent and format: kafka_topic"
-        )
+        kind = get_kind(subject.ref.kind)
+        cloud, fix = kind.registering_cloud, kind.bind_hint
         errors.append(
             f"{subject.ref.where}: no expose binds {cloud}, so no OpenTofu module registers "
             f"subject {subject.ref.subject!r}; {fix}"
@@ -194,8 +187,9 @@ def produced_findings(contract: Mapping[str, Any], subject: Subject) -> Tuple[li
 def produced_set_errors(contract: Mapping[str, Any], produced: Sequence[Subject]) -> list:
     """What the emitters refuse across subjects, said at validate and plan instead.
 
-    An owned Glue registry needs a name (``schema-registry-unnamed``), and one subject
-    produced twice in one registry is refused (``schema-registry-duplicate-subject``).
+    A kind may refuse more (an owned Glue registry needs a name,
+    ``schema-registry-unnamed``), and one subject produced twice in one registry is
+    refused (``schema-registry-duplicate-subject``).
     """
     errors: list = []
     exposes = {
@@ -206,23 +200,11 @@ def produced_set_errors(contract: Mapping[str, Any], produced: Sequence[Subject]
     seen: dict = {}
     for subject in produced:
         ref = subject.ref
-        if (
-            ref.kind == "glue"
-            and not ref.registry_name
-            and owns_registry(contract, exposes.get(subject.owner, {}))
-        ):
-            errors.append(
-                f"{ref.where}: packaging.containers.schemaRegistry is isolated, so this "
-                "product creates its registry, and the registry has no registryName"
-            )
+        kind = get_kind(ref.kind)
+        errors.extend(kind.produced_errors(contract, subject, exposes.get(subject.owner, {})))
         # The emitters' own resource names: one Confluent subject per module whatever
         # its url, and Glue names compared as OpenTofu names (punctuation folded).
-        from fluid_build.iac.naming import safe_ident
-
-        if ref.kind == "glue":
-            key = ("glue", safe_ident(f"{ref.glue_registry}_{ref.subject}"))
-        else:
-            key = ("confluent", safe_ident(str(ref.subject)))
+        key = (kind.name, kind.produced_key(ref))
         if key in seen:
             errors.append(
                 f"{ref.where}: subject {ref.subject!r} is also produced by {seen[key]}; "

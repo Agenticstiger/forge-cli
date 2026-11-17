@@ -34,7 +34,6 @@ metadata:
   layer: "Gold"
   owner:
     team: "data-engineering"
-    email: "data-eng@company.com"
   businessContext:
     domain: "Finance"
     subdomain: "Cryptocurrency Analytics"

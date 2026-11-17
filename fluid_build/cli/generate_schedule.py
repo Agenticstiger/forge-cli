@@ -107,6 +107,20 @@ Examples:
         ),
     )
     p.add_argument(
+        "--dag-id",
+        dest="dag_id",
+        default=None,
+        help="Override the DAG id of an Airflow DAG rendered from an 'orchestration' section "
+        "(default: the contract id)",
+    )
+    p.add_argument(
+        "--schedule",
+        dest="dag_schedule",
+        default=None,
+        help="Override the schedule (cron or an Airflow keyword) of an Airflow DAG rendered "
+        "from an 'orchestration' section",
+    )
+    p.add_argument(
         "--list",
         dest="list_schedulers",
         action="store_true",
@@ -171,6 +185,16 @@ def run(args: Any, logger: logging.Logger) -> int:
             return 1
 
         if fluid_apply.uses_fluid_apply_dags(contract, engine=scheduler_name):
+            if getattr(args, "dag_id", None) or getattr(args, "dag_schedule", None):
+                raise CLIError(
+                    2,
+                    "generate_schedule_override_not_supported",
+                    {
+                        "hint": "--dag-id and --schedule override the one DAG of an "
+                        "'orchestration' section; a scheduled build gets its DAG id and "
+                        "schedule from its own trigger"
+                    },
+                )
             try:
                 files = fluid_apply.render_fluid_apply_dags(
                     contract,
@@ -233,23 +257,13 @@ def run(args: Any, logger: logging.Logger) -> int:
 
         # --- Resolve provider ---
         provider = contract.get("provider", "")
-        provider_config: Dict[str, Any] = {}
-        # Extract provider-specific config from contract metadata
-        metadata = contract.get("metadata", {})
-        if provider == "gcp":
-            provider_config = {
-                "project": metadata.get("gcp_project", "my-project"),
-                "region": metadata.get("gcp_region", "us-central1"),
-            }
-        elif provider == "aws":
-            provider_config = {
-                "region": metadata.get("aws_region", "us-east-1"),
-                "account_id": metadata.get("aws_account_id", ""),
-            }
-        elif provider == "snowflake":
-            provider_config = {
-                "connection_id": metadata.get("snowflake_connection_id", "snowflake_default"),
-            }
+        from fluid_build.schedulers.airflow._config import resolve_provider_config
+
+        provider_config: Dict[str, Any] = resolve_provider_config(provider, contract)
+        if getattr(args, "dag_id", None):
+            provider_config["dag_id"] = args.dag_id
+        if getattr(args, "dag_schedule", None):
+            provider_config["schedule"] = args.dag_schedule
 
         # --- Generate ---
         files = scheduler.generate(
