@@ -139,6 +139,9 @@ class Column:
     enum: Tuple[str, ...] = ()
     placeholder_values: Tuple[str, ...] = ()
     placeholder_prefixes: Tuple[str, ...] = ()
+    #: The contract declares the column ``required``: a registry that carries the
+    #: value as an Avro record never holds NULL in it (``render_cel`` skips its null test).
+    required: bool = False
 
     def is_placeholder(self, value: str) -> bool:
         """Whether ``value`` is one of this column's placeholders (§4)."""

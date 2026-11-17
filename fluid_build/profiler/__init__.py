@@ -20,7 +20,7 @@ The package has five parts, each its own module:
 * :mod:`~fluid_build.profiler._stats` is the one seam to FLUX's statistic
   registry (``flux-stats``). Every statistic is formed by the registry's
   definition, never here, so a profile and a fidelity check of the same records
-  hold the same numbers (MEAS-3).
+  hold the same numbers (one definition per statistic).
 * :mod:`~fluid_build.profiler.disclosure` decides what may be published, with
   ACRO's output-checking defaults.
 * :mod:`~fluid_build.profiler.document` writes the canonical document and its

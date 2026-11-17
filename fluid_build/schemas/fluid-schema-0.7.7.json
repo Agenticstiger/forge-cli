@@ -1604,6 +1604,11 @@
         "auth": {
           "$ref": "#/$defs/acquisitionPattern/properties/kafka-connect/properties/schema_registry/properties/auth",
           "description": "kind confluent only: the registry credential, as a secret reference, the same shape as kafka-connect schema_registry.auth. Glue authenticates with the job's IAM role."
+        },
+        "rules": {
+          "type": "boolean",
+          "default": false,
+          "description": "kind confluent only, on a subject an expose produces, and Avro only: true registers the expose's error-severity row checks (contract.invariants[] with a check and no mustBe* bound) as Confluent data-contract rules (CEL CONDITION rules in mode WRITE, onFailure ERROR) that Confluent's serializers enforce on every record. Other invariants (derive, aggregate, dependency, a check with a bound, a warning or info check) are reported as not enforced by the registry; a check with no exact CEL form is refused. Needs Confluent Platform Enterprise 7.4+ with the rule set extension, or Confluent Cloud's Stream Governance Advanced package."
         }
       },
       "allOf": [
@@ -1632,6 +1637,14 @@
                   ]
                 },
                 "description": "auth is for kind: confluent; a Glue registry authenticates with the job's IAM role"
+              },
+              {
+                "not": {
+                  "required": [
+                    "rules"
+                  ]
+                },
+                "description": "rules is for kind: confluent; Glue has no data-contract rules"
               },
               {
                 "properties": {

@@ -400,7 +400,7 @@ lineage = [
 # and database sources through the sandbox ``fluid init --discover`` uses, with
 # the same floor as ``[local]``. The canonical JSON comes from ``rfc8785``, a base
 # dependency. ``flux-stats`` is FLUX's statistic registry and record reader: it
-# reads every value and forms every number (MEAS-3), as the fidelity check
+# reads every value and forms every number (one definition per statistic), as the fidelity check
 # does. It is standard-library only and supports Python 3.10, so it needs no
 # marker.
 #
@@ -482,6 +482,7 @@ dev = [
   "pytest-xdist>=3.5",           # Parallelize the unit suite (-n auto) → CI test matrix under ~10 min; also isolates per-worker so a leaked-thread test can't OOM the whole run
   "respx>=0.21",                 # HTTPX request mocking — used by acquisition test matrix
   "hypothesis>=6.100",           # Property-based testing — used by tests/property/
+  "cel-python>=0.5.0,<0.6",      # Test-only: the differential proof of render_cel (tests/fluid_sql/test_render_cel.py); never imported by fluid_build
   "deepdiff>=7.0",               # Structural diff — used by OdcsProvider.roundtrip_check
   "tomli>=2.0 ; python_version < '3.11'",   # tests/ci_guards resolves pyproject extras; tomllib is 3.11+
   "bashlex>=0.18",               # Real bash parser — tests/test_ci_dbt_ceiling.py parses workflow run-blocks properly instead of tokenising them (three regex/shlex attempts all had false-green paths)

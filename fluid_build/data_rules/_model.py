@@ -136,6 +136,7 @@ def build(contract: Mapping[str, Any]) -> List[Expose]:
                 enum=enum_values(column),
                 placeholder_values=values,
                 placeholder_prefixes=prefixes,
+                required=column.get("required") is True,
             )
         semantics = as_dict(raw.get("semantics"))
         for position, rel in enumerate(as_list(semantics.get("relationships"))):
