@@ -77,7 +77,7 @@ def test_confluent_attributes_match_the_old_constants():
     )
     assert confluent.default_compatibility == "BACKWARD_TRANSITIVE"
     assert confluent.registering_cloud == "confluent"
-    assert confluent.fields == {"url", "auth"}
+    assert confluent.fields == {"url", "auth", "rules"}
     assert confluent.checks_compatibility is True
 
 

@@ -294,4 +294,10 @@ def validation_findings(
             more_errors, more_warnings = produced_findings(contract, subject)
             errors.extend(more_errors)
             warnings.extend(more_warnings)
+        if subject.ref.options.get("rules") is True:
+            from .rules import confluent_rules
+
+            _rules, rule_errors, rule_warnings = confluent_rules(contract, subject)
+            errors.extend(rule_errors)
+            warnings.extend(rule_warnings)
     return errors, warnings

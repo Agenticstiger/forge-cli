@@ -482,6 +482,7 @@ dev = [
   "pytest-xdist>=3.5",           # Parallelize the unit suite (-n auto) → CI test matrix under ~10 min; also isolates per-worker so a leaked-thread test can't OOM the whole run
   "respx>=0.21",                 # HTTPX request mocking — used by acquisition test matrix
   "hypothesis>=6.100",           # Property-based testing — used by tests/property/
+  "cel-python>=0.5.0,<0.6",      # Test-only: the differential proof of render_cel (tests/fluid_sql/test_render_cel.py); never imported by fluid_build
   "deepdiff>=7.0",               # Structural diff — used by OdcsProvider.roundtrip_check
   "tomli>=2.0 ; python_version < '3.11'",   # tests/ci_guards resolves pyproject extras; tomllib is 3.11+
   "bashlex>=0.18",               # Real bash parser — tests/test_ci_dbt_ceiling.py parses workflow run-blocks properly instead of tokenising them (three regex/shlex attempts all had false-green paths)
