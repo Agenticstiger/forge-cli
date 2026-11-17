@@ -306,8 +306,20 @@ def test_ctrl_c_while_waiting_cancels_the_run_and_is_a_cancelled_outcome(schedul
     said = []
     out = once(scheduled, clock, say=said.append)
     assert (out.action, out.error, out.run_id) == ("cancelled", True, "new")
+    assert out.cancelled == ["new"] and "was cancelled" in out.message
     assert fake.calls == ["start", "cancel new"]
     assert any("cancelled run new" in line for line in said)
+
+
+def test_ctrl_c_whose_cancel_fails_says_the_run_may_still_be_going(scheduled, clock, use):
+    class Stuck(FakeAdapter):
+        def cancel(self, run_id):
+            raise RuntimeError("AccessDeniedException")
+
+    use(Stuck(start_states=("RUNNING", "INTERRUPT")))
+    out = once(scheduled, clock, say=lambda _line: None)
+    assert (out.action, out.error, out.run_id, out.cancelled) == ("cancelled", True, "new", [])
+    assert "could not be cancelled" in out.message and "by hand" in out.message
 
 
 def test_a_streaming_build_is_reconciled_instead(run, clock, use):
