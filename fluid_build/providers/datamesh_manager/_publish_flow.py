@@ -16,8 +16,9 @@ import json
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional
+from urllib.parse import quote
 
 # Regex to strip URL-unsafe characters from access-agreement IDs.
 # Lifted from the host module so the extracted methods are self-
@@ -36,6 +37,75 @@ from fluid_build.util.contract import (
 )
 
 LOG = logging.getLogger("fluid.providers.datamesh_manager.publish")
+
+# Entropy pages ``GET /api/access`` (pageSize 2..10000). One consumer with more
+# agreements than this is far outside what a contract's ``consumes[]`` makes.
+_ACCESS_PAGE_SIZE = 10000
+
+# What forge stamps on the agreements it creates (``custom``), so a reconcile
+# only ever touches its own.
+_FORGE_ACCESS_MARKER = {"managedBy": "forge-cli", "source": "fluid.consumes"}
+
+# How far a stale agreement's end is backdated; see ``stale_access_cancel_body``.
+_CANCEL_CLOCK_MARGIN = timedelta(minutes=10)
+
+# Agreement states with nothing left to cancel.
+_ENDED_ACCESS = frozenset({"cancelled", "rejected"})
+
+
+def stale_access_agreement_ids(
+    existing: Any, consumer_product_id: str, keep_ids: set[str]
+) -> List[str]:
+    """Ids of forge-made agreements of ``consumer_product_id`` not in ``keep_ids``.
+
+    ``existing`` is a ``GET /api/access`` body. An agreement qualifies only when
+    forge made it (``custom`` carries :data:`_FORGE_ACCESS_MARKER`), its consumer
+    is this product, and it has not ended (``info.active`` is not ``False`` and
+    ``info.status`` is not ``cancelled`` or ``rejected``): an agreement a person
+    made, or one already over, is left alone. Shared by both publish paths.
+    """
+    stale: List[str] = []
+    for agreement in existing if isinstance(existing, list) else []:
+        if not isinstance(agreement, Mapping):
+            continue
+        access_id = agreement.get("id")
+        custom = agreement.get("custom") or {}
+        consumer = agreement.get("consumer") or {}
+        info = agreement.get("info") or {}
+        if (
+            not access_id
+            or str(access_id) in keep_ids
+            or not isinstance(custom, Mapping)
+            or any(custom.get(k) != v for k, v in _FORGE_ACCESS_MARKER.items())
+            or not isinstance(consumer, Mapping)
+            or consumer.get("dataProductId") != consumer_product_id
+            or (
+                isinstance(info, Mapping)
+                and (info.get("active") is False or info.get("status") in _ENDED_ACCESS)
+            )
+        ):
+            continue
+        stale.append(str(access_id))
+    return stale
+
+
+def stale_access_cancel_body() -> Dict[str, str]:
+    """The ``POST /api/access/{id}/cancel`` body that ends an agreement now.
+
+    Without ``endTimestamp`` Entropy ends it after the data contract's notice
+    period, or at the end of today, and the edge stays drawn until then. An
+    ``endTimestamp`` not in the server's future deactivates it immediately; one
+    even a second in its future leaves it active until Entropy's own sweep, and
+    a later cancel cannot move that end earlier. So the end is backdated by
+    :data:`_CANCEL_CLOCK_MARGIN`, which absorbs clock skew between this machine
+    and the server (Entropy accepts an end before the agreement's start). The
+    reason lands in Entropy's audit trail as ``info.terminationReason``.
+    """
+    end = datetime.now(timezone.utc) - _CANCEL_CLOCK_MARGIN
+    return {
+        "endTimestamp": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "reason": "The FLUID contract no longer consumes this output port (forge-cli publish).",
+    }
 
 
 class _PublishFlowMixin:
@@ -162,6 +232,48 @@ class _PublishFlowMixin:
                 raise
 
         return results
+
+    def _cancel_stale_access_agreements(
+        self, consumer_product_id: str, keep_ids: set[str]
+    ) -> List[str]:
+        """Cancel the agreements forge made for consumes the contract no longer has.
+
+        An approved agreement keeps drawing its edge after the consume is
+        removed, so the graph names an upstream the product no longer reads.
+        ``POST /api/access/{id}/cancel`` with :func:`stale_access_cancel_body`
+        ends it now and keeps its history; ``DELETE`` refuses an active
+        agreement anyway. Re-adding the consume later re-PUTs the agreement,
+        which Entropy reactivates. Best effort: a failure is logged, never raised —
+        the product itself is already published.
+        """
+        try:
+            resp = self._request(
+                "GET",
+                f"/api/access?consumerDataProductId={quote(consumer_product_id, safe='')}"
+                f"&pageSize={_ACCESS_PAGE_SIZE}",
+            )
+            existing = resp.json()
+        except Exception as exc:  # noqa: BLE001 — reconcile is best effort
+            self._log.warning(
+                "Could not list Access agreements of %s to cancel stale ones: %s",
+                consumer_product_id,
+                exc,
+            )
+            return []
+        cancelled: List[str] = []
+        for access_id in stale_access_agreement_ids(existing, consumer_product_id, keep_ids):
+            try:
+                self._request(
+                    "POST",
+                    f"/api/access/{quote(access_id, safe='')}/cancel",
+                    json_body=stale_access_cancel_body(),
+                )
+            except ProviderError as exc:
+                self._log.warning("Could not cancel stale Access %s: %s", access_id, exc)
+                continue
+            self._log.info("Cancelled stale Access lineage %s", access_id)
+            cancelled.append(access_id)
+        return cancelled
 
     def _build_access_agreements(
         self,
