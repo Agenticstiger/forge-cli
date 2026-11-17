@@ -64,6 +64,17 @@ def test_msk_iam_sets_the_sasl_options(runner, contract):
         runner.kafka_options({**source, "auth": "scram"})
 
 
+def test_tls_without_iam_speaks_ssl_and_iam_stays_sasl_ssl(runner, contract):
+    source = runner.parse_config(config_text(contract))["source"]
+    tls = runner.kafka_options({**source, "auth": "none", "tls": True})
+    assert tls["kafka.security.protocol"] == "SSL"
+    assert "kafka.sasl.mechanism" not in tls
+    plain = runner.kafka_options({**source, "auth": "none", "tls": False})
+    assert "kafka.security.protocol" not in plain
+    iam = runner.kafka_options({**source, "auth": "msk-iam", "tls": True})
+    assert iam["kafka.security.protocol"] == "SASL_SSL"
+
+
 def test_a_registry_credential_comes_from_the_environment(runner, monkeypatch):
     monkeypatch.setenv("REGISTRY_USER_INFO", "user:secret")  # pragma: allowlist secret
     assert runner.resolve_secret("env://REGISTRY_USER_INFO") == "user:secret"

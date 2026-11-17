@@ -265,7 +265,21 @@ def test_an_msk_cluster_arn_leaves_one_placeholder_for_the_uploader(contract):
     contract["builds"][0]["properties"]["parameters"]["spark"]["source"] = {"mskClusterArn": arn}
     source = job(contract).config["source"]
     assert source["bootstrapServers"] == MSK_BROKERS_PLACEHOLDER == "${fluid_msk_bootstrap_brokers}"
-    assert (source["mskClusterArn"], source["auth"]) == (arn, "msk-iam")
+    assert (source["mskClusterArn"], source["auth"], source["tls"]) == (arn, "msk-iam", False)
+
+
+def test_tls_is_set_only_for_an_msk_cluster_read_without_iam(contract):
+    """MSK's listener without IAM is TLS-only by default; named brokers say what they are."""
+    arn = "arn:aws:kafka:eu-west-1:000000000005:cluster/orders/abc-1"
+    cases = [
+        ({"mskClusterArn": arn, "auth": "none"}, True),
+        ({"mskClusterArn": arn, "auth": "msk-iam"}, False),
+        ({"bootstrapServers": BROKERS, "auth": "none"}, False),
+        ({"bootstrapServers": BROKERS, "auth": "msk-iam"}, False),
+    ]
+    for spec, tls in cases:
+        contract["builds"][0]["properties"]["parameters"]["spark"]["source"] = spec
+        assert job(contract).config["source"]["tls"] is tls, spec
 
 
 def test_kafka_auth_defaults_to_none_for_brokers_and_takes_group_id_prefix(contract):

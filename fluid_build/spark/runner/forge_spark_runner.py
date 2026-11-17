@@ -158,6 +158,8 @@ def kafka_options(source: dict) -> dict:
         options.update(_MSK_IAM)
     elif source["auth"] != "none":
         raise JobConfigError(f"unknown Kafka auth {source['auth']!r}")
+    elif source.get("tls"):
+        options["kafka.security.protocol"] = "SSL"
     return options
 
 

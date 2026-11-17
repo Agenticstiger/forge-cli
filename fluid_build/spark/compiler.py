@@ -75,8 +75,8 @@ _BROKER = r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252}[A-Za-z0-9])?:[0-9]{1,5}"
 _BROKERS = re.compile(rf"{_BROKER}(?:,{_BROKER})*")
 #: The brokers of an MSK cluster named by ARN: the spark-infra uploader fills this in when
 #: it renders the job config, from the cluster's broker string for the source's ``auth``
-#: (``bootstrap_brokers_sasl_iam`` for msk-iam); the runner refuses a config that still
-#: holds it.
+#: (``bootstrap_brokers_sasl_iam`` for msk-iam, ``bootstrap_brokers_tls`` for none); the
+#: runner refuses a config that still holds it.
 MSK_BROKERS_PLACEHOLDER = "${fluid_msk_bootstrap_brokers}"
 _MSK_ARN = re.compile(r"arn:aws[a-z-]*:kafka:[a-z0-9-]+:[0-9]{12}:cluster/[A-Za-z0-9_./-]{1,256}")
 _SECRET_ARN = re.compile(
@@ -174,6 +174,9 @@ def _kafka(cfg: Mapping[str, Any], where: str) -> dict[str, Any]:
         "bootstrapServers": MSK_BROKERS_PLACEHOLDER if servers is None else servers,
         "mskClusterArn": arn,
         "auth": auth,
+        # MSK's listener without IAM is TLS-only by default, so an unauthenticated read of
+        # a cluster named by ARN speaks SSL; msk-iam is SASL_SSL either way.
+        "tls": arn is not None and auth == "none",
         "groupIdPrefix": prefix,
     }
 

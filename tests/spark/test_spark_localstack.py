@@ -20,8 +20,9 @@ What LocalStack runs (measured on LocalStack Pro 2026.8.2):
   They run a batch build (no Kafka, no mask key), with Spark 3.3 packages and the catalog's
   endpoints set through the operator's ``sparkConf`` allowlist: forge's own EMR defaults
   (EMR's Iceberg jar path, Spark 3.5 packages) are EMR's.
-- MSK is a plaintext Kafka. ``get-bootstrap-brokers`` gives only ``BootstrapBrokerStringTls``
-  and there is no SASL/IAM listener, so ``auth: msk-iam`` is not tested here.
+- MSK is a plaintext Kafka. ``get-bootstrap-brokers`` gives only ``BootstrapBrokerStringTls``,
+  whose port speaks no TLS, and there is no SASL/IAM listener: ``auth: msk-iam`` is not tested
+  here, and the uploaded config of an ARN read without IAM has ``tls`` set to false.
 - EMR on EKS is not emulated.
 
 Nothing in forge yet provisions a Spark build's infrastructure, so the test does it in that
@@ -404,6 +405,9 @@ def _provision(stack, contract, tmp_path, *, fill_brokers=True):
     text = run.job_text
     if fill_brokers:
         text = text.replace(MSK_BROKERS_PLACEHOLDER, stack.brokers)
+        # LocalStack's "Tls" listener is plaintext (a TLS handshake meets EOF), where MSK's
+        # is TLS: the runner would speak SSL to it.
+        text = text.replace('"tls": true', '"tls": false')
     _put(stack, run.job_uri, text)
     _put(stack, run.runner_uri, runner_source())
     path = tmp_path / "contract.fluid.yaml"
