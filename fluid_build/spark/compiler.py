@@ -57,8 +57,9 @@ from fluid_build.streaming.types import parse_fields
 #: The version of the job config's shape. The runner refuses any other.
 CONFIG_VERSION = 1
 #: Operator-only: the builds whose own ``properties.sql`` the job may run, as in
-#: :mod:`fluid_build.spark.policy`. Defined here so the compiler needs no policy import
-#: to name it in a message.
+#: :mod:`fluid_build.spark.policy`. Defined here so naming it in a message needs no
+#: module-level policy import: the policy reaches build_runners (through
+#: streaming.policy), which a tier-0 leaf importing this module must not.
 CONTRACT_SQL_ALLOWLIST_ENV = "FLUID_SPARK_CONTRACT_SQL_ALLOWLIST"
 #: Operator-only: the existing runtimes and MSK clusters a contract may name, as
 #: ``<runtime>:<id>`` or ``msk:<cluster ARN>``. A job reads whichever cluster its build
@@ -78,9 +79,10 @@ _PRODUCT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _BUILD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _BROKER = r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,252}[A-Za-z0-9])?:[0-9]{1,5}"
 _BROKERS = re.compile(rf"{_BROKER}(?:,{_BROKER})*")
-#: The brokers of an MSK cluster named by ARN: the spark-infra uploader fills this in from
-#: the cluster's ``bootstrap_brokers_sasl_iam`` when it renders the job config; the runner
-#: refuses a config that still holds it.
+#: The brokers of an MSK cluster named by ARN: the spark-infra uploader fills this in when
+#: it renders the job config, from the cluster's broker string for the source's ``auth``
+#: (``bootstrap_brokers_sasl_iam`` for msk-iam, ``bootstrap_brokers_tls`` for none); the
+#: runner refuses a config that still holds it.
 MSK_BROKERS_PLACEHOLDER = "${fluid_msk_bootstrap_brokers}"
 _MSK_ARN = re.compile(r"arn:aws[a-z-]*:kafka:[a-z0-9-]+:[0-9]{12}:cluster/[A-Za-z0-9_./-]{1,256}")
 _SECRET_ARN = re.compile(
@@ -99,7 +101,6 @@ _REGISTRY_SECRET_SCHEMES = ("env", "aws-sm")
 class SparkJob:
     """One build's job config, as the runner reads it."""
 
-    build_id: str
     config: Mapping[str, Any]
 
     @property
@@ -179,6 +180,9 @@ def _kafka(cfg: Mapping[str, Any], where: str) -> dict[str, Any]:
         "bootstrapServers": MSK_BROKERS_PLACEHOLDER if servers is None else servers,
         "mskClusterArn": arn,
         "auth": auth,
+        # MSK's listener without IAM is TLS-only by default, so an unauthenticated read of
+        # a cluster named by ARN speaks SSL; msk-iam is SASL_SSL either way.
+        "tls": arn is not None and auth == "none",
         "groupIdPrefix": prefix,
     }
 
@@ -192,21 +196,20 @@ def _source_hosts(kafka: Mapping[str, Any], registry_url: Optional[str]) -> dict
     return source
 
 
-def _is_address(host: str) -> bool:
+def _needs_entry(host: str) -> bool:
+    """Whether the host rule wants an operator entry for ``host``: every host name (the job
+    resolves it itself), and a public address. A private address needs none, and a
+    link-local one is refused even with one."""
     import ipaddress
 
     try:
-        ipaddress.ip_address(host)
+        return ipaddress.ip_address(host.split("%", 1)[0]).is_global
     except ValueError:
-        return False  # a host name
-    return True
+        return True  # a host name
 
 
 def _unlisted_names(source: Mapping[str, Any], environ: Any) -> list[str]:
-    """The broker and registry host names the operator's host allowlist does not list.
-
-    An address is left out: it keeps the deployment host rule, applied either way.
-    """
+    """The broker and registry hosts that need an operator entry the allowlist lacks."""
     from fluid_build.secrets.policy import is_loopback
     from fluid_build.streaming.policy import is_listed
 
@@ -215,7 +218,7 @@ def _unlisted_names(source: Mapping[str, Any], environ: Any) -> list[str]:
         hosts.append(urlsplit(source["schemaRegistryUrl"]).hostname or "")
     unlisted = []
     for host in filter(None, hosts):
-        if _is_address(host) or is_loopback(host) or is_listed(host, environ):
+        if not _needs_entry(host) or is_loopback(host) or is_listed(host, environ):
             continue
         if host not in unlisted:
             unlisted.append(host)
@@ -231,14 +234,28 @@ def _refuse_unless_hosts_allowed(source: Mapping[str, Any], environ: Any, *, lis
     :func:`validation_warnings` reports the missing entries (policy #818: a missing
     entry warns at validate and refuses at run time).
     """
-    from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV, refuse_unless_source_hosts_allowed
+    from fluid_build.spark.policy import SparkPolicyError
+    from fluid_build.streaming.policy import (
+        HOST_ALLOWLIST_ENV,
+        FlinkPolicyError,
+        refuse_unless_source_hosts_allowed,
+    )
 
     env = dict(os.environ if environ is None else environ)
     if not listed:
         names = _unlisted_names(source, env)
         if names:
             env[HOST_ALLOWLIST_ENV] = ",".join(filter(None, [env.get(HOST_ALLOWLIST_ENV), *names]))
-    refuse_unless_source_hosts_allowed({"source": source}, environ=env)
+    try:
+        refuse_unless_source_hosts_allowed({"source": source}, environ=env)
+    except FlinkPolicyError as exc:
+        # The rule is the managed Flink lane's; the refusal is this Spark job's.
+        raise SparkPolicyError(
+            what=exc.what.replace("the managed Flink lane", "a forge Spark job"),
+            why=exc.why,
+            fix=exc.fix,
+            doc=exc.doc,
+        ) from None
 
 
 def cluster_listed(arn: str, environ: Any = None) -> bool:
@@ -321,28 +338,6 @@ def _refuse_unless_credential_allowed(
     check_prefix(ref, environ)
     if granted:
         refuse_unless_allowed(ref, host=parts.hostname, environ=environ)
-
-
-def _missing_grant(spec: Any, environ: Any) -> Optional[str]:
-    """The ``FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`` entry a registry credential lacks."""
-    from fluid_build.secrets.errors import SecretError
-    from fluid_build.secrets.policy import refuse_unless_allowed
-    from fluid_build.secrets.ref import parse_secret_ref
-
-    auth = spec.get("auth") if isinstance(spec, Mapping) else None
-    raw = auth.get("secretRef") if isinstance(auth, Mapping) else None
-    url = spec.get("url") if isinstance(spec, Mapping) else None
-    if not isinstance(raw, str) or not isinstance(url, str):
-        return None
-    try:
-        ref, host = parse_secret_ref(raw), urlsplit(url).hostname
-    except (SecretError, ValueError):
-        return None  # validation_errors reports it
-    try:
-        refuse_unless_allowed(ref, host=host, environ=environ)
-    except SecretError:
-        return f"{ref.canonical}@{host}"
-    return None
 
 
 def _registry(
@@ -451,6 +446,15 @@ def _watermark(spec: Any, stream: Any, where: str) -> Optional[dict[str, Any]]:
     return {"column": column, "delay": _interval(_seconds(spec["delay"], f"{where}.watermark"))}
 
 
+def _object(value: Any, where: str) -> Mapping[str, Any]:
+    """An optional object of the contract: {} when absent, refused when not an object."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{where}: expected an object")
+    return value
+
+
 def _contract_sql(sql: Any, bid: str) -> str:
     if not isinstance(sql, str) or not re.match(r"(?is)^\s*SELECT\b", sql) or ";" in sql:
         raise ValueError(f"Spark build {bid}: properties.sql must be a single SELECT without ;")
@@ -506,8 +510,6 @@ def compile_job_config(
             "on a schedule, set parameters.spark.mode: streaming with "
             "properties.stream.trigger.availableNow: true"
         )
-    if stream_spec is None and mapping is not None:
-        raise ValueError(f"{where}: properties.mapping maps properties.stream")
 
     outputs = build.get("outputs")
     if not isinstance(outputs, list) or len(outputs) != 1:
@@ -520,10 +522,10 @@ def compile_job_config(
     if len(targets) != 1:
         raise ValueError(f"{where}: output must identify one expose")
     index, expose = targets[0]
-    binding = expose.get("binding") or {}
+    binding = _object(expose.get("binding"), f"exposes[{index}].binding")
     if binding.get("format") != "iceberg":
         raise ValueError(f"{where}: the output's binding.format must be iceberg")
-    loc = binding.get("location") or {}
+    loc = _object(binding.get("location"), f"exposes[{index}].binding.location")
     if bucket_uses_fallback(loc) and not account_ref:
         raise ValueError(
             f"{where}: the output names no bucket, so its warehouse is the account's "
@@ -537,7 +539,8 @@ def compile_job_config(
         raise ValueError(f"{where}: the output needs one database and table")
     database, table = (validate_ident(p) for p in parts)
     fields = parse_fields(
-        (expose.get("contract") or {}).get("schema"), path=f"exposes[{index}].contract.schema"
+        _object(expose.get("contract"), f"exposes[{index}].contract").get("schema"),
+        path=f"exposes[{index}].contract.schema",
     )
     bucket, _ = normalize_location(loc, account_ref=account_ref)
 
@@ -630,14 +633,12 @@ def compile_job_config(
             "warehouse": resolved.warehouse,
             "region": resolved.region,
             "table": f"{database}.{table}",
-            # A batch job replaces what it computes; a stream appends what it reads.
-            "write": "append" if mode == "streaming" else "overwrite",
         },
         "maskedColumns": masked,
         # The secret's ARN, never its value: the runner reads the key with the job's role.
         "maskKey": {"secretArn": mask_key} if masked else None,
     }
-    return SparkJob(bid, config)
+    return SparkJob(config)
 
 
 def validation_errors(contract: Mapping[str, Any]) -> list[str]:
@@ -659,13 +660,21 @@ def validation_errors(contract: Mapping[str, Any]) -> list[str]:
     for build in builds:
         try:
             # A stand-in account: a bucketless binding validates; apply passes the real one.
-            compile_job_config(
+            job = compile_job_config(
                 contract,
                 build,
                 account_ref="000000000000",
                 contract_sql_gate=False,
                 host_gate=False,
             )
+            # Apply refuses it before upload (iac/providers/aws_ingest.py,
+            # spark-config-interpolation); validate says so first.
+            if "${" in job.text.replace(MSK_BROKERS_PLACEHOLDER, ""):
+                errors.append(
+                    f"Spark build {build.get('id')}: the job config would hold '${{', which "
+                    "the runner refuses as an unresolved interpolation; take it out of the "
+                    "contract (properties.sql included)"
+                )
         except FluidUserError as exc:
             errors.append(f"Spark build {build.get('id')}: {exc.what}. {exc.why}")
         except (ValueError, KeyError, TypeError) as exc:
@@ -674,7 +683,12 @@ def validation_errors(contract: Mapping[str, Any]) -> list[str]:
 
 
 def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
-    from fluid_build.secrets.policy import ALLOWLIST_ENV as SECRET_REF_ALLOWLIST_ENV
+    """The operator entries a Spark build lacks, which ``fluid validate`` warns about.
+
+    A registry that receives a credential is left to the contract-wide checks, which name
+    its host entry (``schema_registry/policy.py``) and the credential's grant
+    (``secrets/policy.py``); repeating them here would print each twice.
+    """
     from fluid_build.streaming.compiler import managed_lane_enabled
     from fluid_build.streaming.policy import HOST_ALLOWLIST_ENV
 
@@ -700,20 +714,15 @@ def validation_warnings(contract: Mapping[str, Any]) -> list[str]:
             kafka = _kafka(spark_parameters(build) or {}, f"Spark build {build.get('id')}")
             registry = stream.get("registry")
             url = registry.get("url") if isinstance(registry, Mapping) else None
+            if isinstance(registry, Mapping) and registry.get("auth") is not None:
+                url = None  # the secret check names this host
             source = _source_hosts(kafka, url if isinstance(url, str) else None)
             names = _unlisted_names(source, None)
         except ValueError:
             continue  # validation_errors reports it
         if names:
             warnings.append(
-                f"Build {build.get('id')}: {', '.join(names)} is not in {HOST_ALLOWLIST_ENV}; "
-                "the job is refused at run time until the operator lists it"
-            )
-        grant = _missing_grant(stream.get("registry"), None)
-        if grant:
-            warnings.append(
-                f"Build {build.get('id')}: the registry credential needs the operator's grant "
-                f"{grant} in {SECRET_REF_ALLOWLIST_ENV}; the job is refused at compile and run "
-                "time until it is listed"
+                f"Build {build.get('id')}: not in {HOST_ALLOWLIST_ENV}: {', '.join(names)}; "
+                "the job is refused at compile and run time until the operator lists them"
             )
     return warnings

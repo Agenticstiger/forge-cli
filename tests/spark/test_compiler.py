@@ -83,7 +83,6 @@ def test_the_sink_is_the_glue_table_at_the_canonical_warehouse(contract):
         "warehouse": get_iceberg_warehouse(location, account_ref=""),
         "region": "eu-west-1",
         "table": "commerce.order_lines",
-        "write": "append",
     }
 
 
@@ -268,7 +267,22 @@ def test_an_msk_cluster_arn_leaves_one_placeholder_for_the_uploader(contract, mo
     contract["builds"][0]["properties"]["parameters"]["spark"]["source"] = {"mskClusterArn": arn}
     source = job(contract).config["source"]
     assert source["bootstrapServers"] == MSK_BROKERS_PLACEHOLDER == "${fluid_msk_bootstrap_brokers}"
-    assert (source["mskClusterArn"], source["auth"]) == (arn, "msk-iam")
+    assert (source["mskClusterArn"], source["auth"], source["tls"]) == (arn, "msk-iam", False)
+
+
+def test_tls_is_set_only_for_an_msk_cluster_read_without_iam(contract, monkeypatch):
+    """MSK's listener without IAM is TLS-only by default; named brokers say what they are."""
+    arn = "arn:aws:kafka:eu-west-1:000000000005:cluster/orders/abc-1"
+    monkeypatch.setenv(TARGET_ALLOWLIST_ENV, f"msk:{arn}")
+    cases = [
+        ({"mskClusterArn": arn, "auth": "none"}, True),
+        ({"mskClusterArn": arn, "auth": "msk-iam"}, False),
+        ({"bootstrapServers": BROKERS, "auth": "none"}, False),
+        ({"bootstrapServers": BROKERS, "auth": "msk-iam"}, False),
+    ]
+    for spec, tls in cases:
+        contract["builds"][0]["properties"]["parameters"]["spark"]["source"] = spec
+        assert job(contract).config["source"]["tls"] is tls, spec
 
 
 def test_kafka_auth_defaults_to_none_for_brokers_and_takes_group_id_prefix(contract):
@@ -423,8 +437,8 @@ def test_validate_reports_the_operators_policy_and_warns_about_contract_sql(cont
     monkeypatch.setenv(HOST_ALLOWLIST_ENV, "example.internal")
     assert validation_errors(contract) == []
     (warning,) = validation_warnings(contract)
-    assert "b-1.msk.example, b-2.msk.example is not in" in warning
-    with pytest.raises(FluidUserError, match="Kafka bootstrap server"):
+    assert f"not in {HOST_ALLOWLIST_ENV}: b-1.msk.example, b-2.msk.example;" in warning
+    with pytest.raises(SparkPolicyError, match="Kafka bootstrap server"):
         job(contract)
     # A link-local broker is refused at every stage.
     source_of(contract)["bootstrapServers"] = "169.254.169.254:9092"
@@ -461,9 +475,9 @@ def test_a_missing_credential_grant_warns_at_validate_and_refuses_at_compile(con
         },
     )
     assert validation_errors(contract) == []
-    grants = [w for w in validation_warnings(contract) if SECRET_REF_ALLOWLIST_ENV in w]
-    assert len(grants) == 1
-    assert f"{ref}@schema-registry.example.internal" in grants[0]
+    # The contract-wide checks name the grant and the registry host
+    # (test_validate_prints_each_missing_entry_once); the Spark warnings do not repeat them.
+    assert validation_warnings(contract) == []
     with pytest.raises(FluidUserError):
         job(contract)
     environ = {
@@ -477,6 +491,88 @@ def test_a_missing_credential_grant_warns_at_validate_and_refuses_at_compile(con
     ] = "http://schema-registry.example.internal"
     (error,) = validation_errors(contract)
     assert "https only" in error
+
+
+@pytest.mark.parametrize("part", ["binding", "location", "contract"])
+def test_validate_reports_an_output_part_that_is_not_an_object(contract, part):
+    """A schema-invalid output is an error line, never an unhandled exception."""
+    expose = contract["exposes"][0]
+    if part == "location":
+        expose["binding"]["location"] = "x"
+    else:
+        expose[part] = "x"
+    (error,) = validation_errors(contract)
+    assert "expected an object" in error
+
+
+def test_validate_reports_contract_text_holding_an_interpolation(contract):
+    """The runner refuses any ${...}, and apply refuses it before upload
+    (spark-config-interpolation); validate reports it first."""
+    _sql_build(contract, "SELECT '${env:HOME}' AS order_id FROM commerce.order_lines")
+    (error,) = validation_errors(contract)
+    assert "unresolved interpolation" in error
+
+
+def test_a_public_broker_address_warns_at_validate_and_refuses_at_compile(contract, monkeypatch):
+    """Policy #818 for an address as for a name; a private address needs no entry."""
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "example.internal")
+    source_of(contract)["bootstrapServers"] = "8.8.8.8:9092"
+    assert validation_errors(contract) == []
+    (warning,) = validation_warnings(contract)
+    assert f"not in {HOST_ALLOWLIST_ENV}: 8.8.8.8;" in warning
+    with pytest.raises(SparkPolicyError, match="Kafka bootstrap server"):
+        job(contract)
+    source_of(contract)["bootstrapServers"] = "10.0.0.5:9092"
+    assert validation_warnings(contract) == []
+    assert job(contract).config["source"]["bootstrapServers"] == "10.0.0.5:9092"
+
+
+def test_a_host_refusal_is_the_spark_jobs_not_the_flink_lanes(contract, monkeypatch):
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "example.internal")
+    with pytest.raises(SparkPolicyError) as refused:
+        job(contract)
+    assert refused.value.code == "SparkPolicyError"
+    assert refused.value.what.startswith("a forge Spark job may not use")
+    assert "Flink" not in refused.value.what
+
+
+def test_a_registry_without_a_credential_is_named_by_the_spark_warning(contract, monkeypatch):
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "msk.example")
+    contract["builds"][0]["properties"]["stream"].update(
+        format="avro-confluent",
+        registry={"kind": "confluent", "url": "https://schema-registry.example.internal"},
+    )
+    (warning,) = validation_warnings(contract)
+    assert f"not in {HOST_ALLOWLIST_ENV}: schema-registry.example.internal;" in warning
+
+
+def test_validate_prints_each_missing_entry_once(contract, tmp_path, monkeypatch, capsys):
+    """fluid validate: one warning for the brokers, one for the registry host and one for
+    the credential's grant, each once (the contract-wide checks own the registry's two)."""
+    import yaml
+
+    from fluid_build.cli import main
+
+    monkeypatch.setenv(HOST_ALLOWLIST_ENV, "example.org")
+    monkeypatch.chdir(tmp_path)
+    ref = "env://SCHEMA_REGISTRY_AUTH"  # pragma: allowlist secret
+    contract["builds"][0]["properties"]["stream"].update(
+        format="avro-confluent",
+        registry={
+            "kind": "confluent",
+            "url": "https://schema-registry.example.internal",
+            "auth": {"secretRef": ref},
+        },
+    )
+    (tmp_path / "c.fluid.yaml").write_text(yaml.safe_dump(contract), encoding="utf-8")
+    capsys.readouterr()
+    assert main(["validate", "c.fluid.yaml", "--offline"]) == 0
+    lines = [
+        line for line in capsys.readouterr().out.splitlines() if line[:4].strip()[:1].isdigit()
+    ]
+    assert len(lines) == 3, lines
+    assert sum("b-1.msk.example" in line for line in lines) == 1
+    assert sum("schema-registry.example.internal" in line for line in lines) == 2
 
 
 def test_an_msk_cluster_the_operator_has_not_listed_is_refused(contract, monkeypatch):
