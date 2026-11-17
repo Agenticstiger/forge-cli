@@ -161,6 +161,86 @@ def test_a_json_stream_adds_no_avro_package(run):
     assert "spark.jars.repositories" not in run.spark_conf
 
 
+def _avro(contract, monkeypatch):
+    ref = "aws-sm://commerce/registry#user_info"  # pragma: allowlist secret
+    monkeypatch.setenv(SECRET_REF_ALLOWLIST_ENV, f"{ref}@registry.example.internal")
+    _stream(contract).update(
+        format="avro-confluent",
+        registry={
+            "kind": "confluent",
+            "url": "https://registry.example.internal",
+            "auth": {"secretRef": ref},
+        },
+    )
+
+
+MIRROR = "https://mirror.example.internal/maven/proxy/"
+USERINFO_URL = "https://u:p@mirror.example.internal/maven/"  # pragma: allowlist secret
+
+
+def test_the_maven_mirror_replaces_the_confluent_repository(contract, monkeypatch):
+    _avro(contract, monkeypatch)
+    before = runs_of(contract)[0]
+    monkeypatch.setenv(_desired.MAVEN_REPOSITORY_ENV, MIRROR)
+    after = runs_of(contract)[0]
+    assert after.spark_conf["spark.jars.repositories"] == MIRROR
+    assert _desired._CONFLUENT_REPOSITORY not in after.spark_conf.values()
+    assert after.spark_conf["spark.jars.packages"] == before.spark_conf["spark.jars.packages"]
+    assert after.config_hash != before.config_hash  # a new artifact source restarts the job
+
+
+def test_the_maven_mirror_serves_a_json_stream_too(contract, monkeypatch):
+    monkeypatch.setenv(_desired.MAVEN_REPOSITORY_ENV, MIRROR)
+    assert runs_of(contract)[0].spark_conf["spark.jars.repositories"] == MIRROR
+
+
+def test_without_the_mirror_the_defaults_are_unchanged(contract, monkeypatch):
+    monkeypatch.delenv(_desired.MAVEN_REPOSITORY_ENV, raising=False)
+    assert _desired.maven_repository({}) is None
+    assert _desired.maven_repository({_desired.MAVEN_REPOSITORY_ENV: "  "}) is None
+    assert "spark.jars.repositories" not in runs_of(contract)[0].spark_conf
+
+
+@pytest.mark.parametrize(
+    "url, rule",
+    [
+        ("http://mirror.example.internal/maven/", "https URL"),
+        ("mirror.example.internal/maven/", "https URL"),
+        ("https:///maven/", "https URL"),
+        ("https://mirror.example.internal:99999/", "https URL"),
+        (USERINFO_URL, "user or password"),
+        ("https://user@mirror.example.internal/maven/", "user or password"),
+        ("https://mirror.example.internal/maven/?token=x", "query"),
+        ("https://a.example.internal/,https://b.example.internal/", "comma"),
+        ("https://169.254.169.254/latest/", "link-local"),
+        ("https://[fe80::1]/maven/", "link-local"),
+        ("https://[::ffff:169.254.169.254]/", "link-local"),
+    ],
+)
+def test_a_bad_maven_mirror_is_refused_without_echoing_it(url, rule):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    with pytest.raises(SparkPolicyError) as err:
+        _desired.maven_repository({_desired.MAVEN_REPOSITORY_ENV: url})
+    text = str(err.value) + repr(err.value.__dict__)
+    assert rule in text
+    assert url not in text
+
+
+def test_a_bad_maven_mirror_refuses_the_run(contract, monkeypatch):
+    from fluid_build.spark.policy import SparkPolicyError
+
+    monkeypatch.setenv(_desired.MAVEN_REPOSITORY_ENV, "http://mirror.example.internal/")
+    with pytest.raises(SparkPolicyError):
+        runs_of(contract)
+
+
+def test_a_project_env_file_cannot_set_the_maven_mirror():
+    from fluid_build.credentials.protected_env import is_protected_env_key
+
+    assert is_protected_env_key(_desired.MAVEN_REPOSITORY_ENV)
+
+
 def test_an_operator_listed_spark_conf_overrides_the_defaults(contract, monkeypatch):
     monkeypatch.setenv(_desired.CONF_ALLOWLIST_ENV, "spark.jars")
     spark_cfg(contract)["sparkConf"] = {"spark.jars": "/mine.jar", "spark.executor.memory": 4}
