@@ -405,7 +405,7 @@ def applies_changes(opts: ShipOptions) -> bool:
     return opts.mode != "dry-run"
 
 
-def _dry_run_applied_nothing(opts: ShipOptions) -> bool:
+def dry_run_applied_nothing(opts: ShipOptions) -> bool:
     """As the generated shell decides it: stage 7 is in this pipeline, as a dry
     run. A pipeline without stage 7 applies elsewhere, so its mode says nothing
     about what is live, and verify, publish and schedule-sync run."""
@@ -413,7 +413,7 @@ def _dry_run_applied_nothing(opts: ShipOptions) -> bool:
 
 
 def _skip_after_dry_run(opts: ShipOptions, what: str) -> Optional[str]:
-    if _dry_run_applied_nothing(opts):
+    if dry_run_applied_nothing(opts):
         return f"APPLY_MODE dry-run applied nothing, so {what}"
     return None
 
@@ -693,7 +693,7 @@ def check_preconditions(
     for num in selected:
         ws = Workspace(root, produced)
         message = missing_input(num, ws)
-        if message and not (num == 9 and _dry_run_applied_nothing(opts)):
+        if message and not (num == 9 and dry_run_applied_nothing(opts)):
             # verify is skipped after a dry run, so it reads nothing
             raise ShipUsageError(message)
         if num == 4 and not ws.has_dir(ARTIFACTS_DIR) and _generation_expected(opts):
@@ -715,6 +715,22 @@ def _generation_expected(opts: ShipOptions) -> bool:
     return opts.generate_artifacts and not _contract_reference_only(opts.contract)
 
 
+def check_contract_path(path: str) -> None:
+    """Refuse, before anything is written, a contract stage 1 would refuse: the
+    input checks ``fluid bundle`` runs (``cli/security.validate_cli_path``: a
+    symlinked file, a system path, ...), on the normalised path ship hands the
+    stages. A symlink is refused, not followed: one planted in a checkout could
+    point the run at a file outside it. The message becomes ship's own line."""
+    from fluid_build.cli.core import FluidCLIError
+    from fluid_build.cli.security import validate_cli_path
+
+    try:
+        with _quiet_probe():  # its path is the checkout's text: nothing is printed
+            validate_cli_path(path, mode="read", file_type="contract")
+    except FluidCLIError as exc:
+        raise ShipUsageError(str(exc.message)) from None
+
+
 def project_location(contract: str, cwd: Optional[str] = None) -> Tuple[str, str]:
     """``(directory to run in, contract path relative to it in POSIX form)``.
 
@@ -725,8 +741,8 @@ def project_location(contract: str, cwd: Optional[str] = None) -> Tuple[str, str
     its own directory.
 
     Directories are compared resolved (macOS's /tmp is /private/tmp); the
-    contract file is not resolved: a symlinked contract runs where the link is,
-    under the link's name, as ``fluid bundle <link>`` would read it.
+    contract file is not, so :func:`check_contract_path` sees a symlinked
+    contract as the link it is, and refuses it instead of following it.
     """
     base = os.path.realpath(cwd or os.getcwd())
     given = os.path.join(base, contract)

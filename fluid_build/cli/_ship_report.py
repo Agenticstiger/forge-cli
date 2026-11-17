@@ -11,7 +11,8 @@ Standard library only (``xml.etree`` is imported where used).
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Collection, Dict, List, Optional
 
@@ -73,12 +74,14 @@ class StageRecord:
         }
 
 
-def exit_status(records: List[StageRecord], *, applies: bool) -> int:
+def exit_status(records: List[StageRecord], *, applies: bool, applied_earlier: bool = False) -> int:
     """The exit status ``records`` end with: 0 when no stage failed, else 1, or 3
     when the first failure came after apply passed in a mode that changes
-    something (``applies``: every mode but dry-run). Refused arguments (2) and
-    Ctrl-C (130) are decided by the caller, before or instead of this."""
-    applied = False
+    something (``applies``: every mode but dry-run). ``applied_earlier``: apply
+    passed in an earlier invocation of the same run (one CI step per stage), so
+    a failure now is partial too; it never turns a 0 into a failure. Refused
+    arguments (2) and Ctrl-C (130) are decided by the caller."""
+    applied = applies and applied_earlier
     for rec in sorted(records, key=lambda r: r.number):
         if rec.status == FAILED:
             return EXIT_PARTIAL if applied else EXIT_FAILED
@@ -137,7 +140,7 @@ def junit_xml(records: List[StageRecord]) -> bytes:
             "testcase",
             {
                 "classname": "fluid.ship",
-                "name": f"{rec.number} {rec.name}",
+                "name": _xml_safe(f"{rec.number} {rec.name}"),
                 "time": f"{rec.duration_seconds:.3f}",
             },
         )
@@ -169,22 +172,25 @@ def write_reports(directory: Path, report: Dict[str, Any], records: List[StageRe
 
 def _from_dict(raw: Dict[str, Any]) -> StageRecord:
     """One record of an earlier report; ``ValueError`` when it is not one ship wrote
-    (the file sits in the checkout, so its content is not trusted to be well formed)."""
+    (the file sits in the checkout, so its content is not trusted to be well formed).
+    Text fields are kept as text, and a duration must be a finite number."""
     status = str(raw["status"])
     number = int(raw["number"])
     if status not in (PASSED, FAILED, SKIPPED, NOT_RUN) or not 1 <= number <= 11:
         raise ValueError(f"not a ship stage record: {number} {status}")
     exit_code = raw.get("exit_code")
+    reason = raw.get("skip_reason") if status in (SKIPPED, NOT_RUN) else raw.get("failure_reason")
+    duration = float(raw.get("duration_seconds") or 0.0)
+    if not math.isfinite(duration):
+        raise ValueError(f"not a duration: {duration}")
     return StageRecord(
         number=number,
         name=str(raw["name"]),
         status=status,
-        reason=(
-            raw.get("skip_reason") if status in (SKIPPED, NOT_RUN) else raw.get("failure_reason")
-        ),
+        reason=None if reason is None else str(reason),
         argv=[str(a) for a in raw.get("argv") or []],
         exit_code=None if exit_code is None else int(exit_code),
-        duration_seconds=float(raw.get("duration_seconds") or 0.0),
+        duration_seconds=duration,
     )
 
 
@@ -215,4 +221,8 @@ def merge_with_previous(
         old = {int(s["number"]): _from_dict(s) for s in previous["stages"]}
     except _UNREADABLE:
         return current
-    return [old[r.number] if r.number in old and r.number not in selected else r for r in current]
+    # An earlier record keeps its outcome; the stage's name is always this version's.
+    return [
+        replace(old[r.number], name=r.name) if r.number in old and r.number not in selected else r
+        for r in current
+    ]

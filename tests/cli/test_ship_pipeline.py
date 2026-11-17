@@ -1165,10 +1165,21 @@ def _previous_report(*stages: Dict[str, object]) -> str:
         _previous_report({"number": 99, "name": "x", "status": "passed"}),
         # json reads Infinity; int() of it raises OverflowError
         _previous_report({"number": 2, "name": "v", "status": "passed", "exit_code": float("inf")}),
+        _previous_report(
+            {"number": 2, "name": "v", "status": "passed", "duration_seconds": float("nan")}
+        ),
         "[" * 100_000,  # json.loads raises RecursionError
         "not json",
     ],
-    ids=["bad-code", "bad-status", "bad-number", "overflow", "deep-nesting", "not-json"],
+    ids=[
+        "bad-code",
+        "bad-status",
+        "bad-number",
+        "overflow",
+        "nan-duration",
+        "deep-nesting",
+        "not-json",
+    ],
 )
 def test_a_malformed_earlier_report_is_overwritten_not_trusted(
     work: Path, fake: FakeRun, monkeypatch: pytest.MonkeyPatch, payload: str
@@ -1212,7 +1223,8 @@ def test_a_failed_stage_says_how_to_re_run_it(
     monkeypatch.setattr(ship.subprocess, "run", FakeRun({"validate": 1}))
     with caplog.at_level(logging.ERROR):
         assert ship_run(["--yes"]) == 1
-    assert "run the same command with --stage 2" in caplog.text
+    assert "After the fix, run the same command again" in caplog.text
+    assert "to go on from that stage with this bundle, use --stage 2-9" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -1455,21 +1467,30 @@ def test_a_non_ascii_digit_is_an_unknown_stage_not_a_crash(
     assert ship_run(["--until", token]) == 2 and fake.calls == []
 
 
-def test_a_symlinked_contract_runs_where_the_link_is(
-    work: Path, fake: FakeRun, tmp_path_factory: pytest.TempPathFactory
+def test_a_symlinked_or_system_contract_is_refused_before_anything_is_written(
+    work: Path,
+    fake: FakeRun,
+    tmp_path_factory: pytest.TempPathFactory,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # fluid bundle refuses a symlinked input (cli/security.py, F6): a link planted
+    # in a checkout could point the run at a file outside it. Ship refuses it as
+    # stage 1 would, before a run id or a runtime/ is written.
     shared = tmp_path_factory.mktemp("shared")
     (shared / "real.fluid.yaml").write_text("fluidVersion: '0.7.5'\nid: x.y\n")
     (work / "proj").mkdir()
     (work / "proj/contract.fluid.yaml").symlink_to(shared / "real.fluid.yaml")
-    assert ship_run(["proj/contract.fluid.yaml", "--until", "bundle"]) == 0
-    assert fake.calls[-1][1] == "proj/contract.fluid.yaml"
     outside = tmp_path_factory.mktemp("outside")
     (outside / "contract.fluid.yaml").symlink_to(shared / "real.fluid.yaml")
-    assert ship_run([str(outside / "contract.fluid.yaml"), "--until", "bundle"]) == 0
-    assert fake.calls[-1][1] == "contract.fluid.yaml"
-    assert (outside / "runtime/ship-report.json").is_file()
-    assert not (shared / "runtime").exists() and not (shared / ".fluid").exists()
+    with caplog.at_level(logging.ERROR):
+        assert ship_run(["proj/contract.fluid.yaml", "--until", "bundle"]) == 2
+        assert ship_run([str(outside / "contract.fluid.yaml"), "--explain"]) == 2
+        if Path("/etc/hosts").is_file():
+            assert ship_run(["/etc/hosts", "--until", "bundle"]) == 2
+    assert "Symlinked contract paths are not allowed" in caplog.text
+    assert fake.calls == [] and not (work / ".fluid").exists()
+    assert [p.name for p in outside.iterdir()] == ["contract.fluid.yaml"]
+    assert not (shared / "runtime").exists()
 
 
 def test_a_missing_contract_is_refused_before_anything_is_written(
@@ -1533,3 +1554,75 @@ def test_a_run_id_that_cannot_be_kept_does_not_stop_the_run(
     assert "cannot keep the run id" in caplog.text
     ids = {env["FLUID_RUN_ID"] for env in fake.envs}
     assert len(ids) == 1 and _report(work)["run_id"] in ids
+
+
+def test_the_abort_hint_goes_on_through_apply_before_it_publishes(
+    work: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(ship.subprocess, "run", FakeRun({"diff": 1}))
+    with caplog.at_level(logging.ERROR):
+        assert ship_run(["--yes", "--publish"]) == 1
+    assert "use --stage 5-10" in caplog.text
+    resumed = st.select_stages(publish=True, schedule_sync=False, stage_spec="5-10")[0]
+    assert resumed.index(7) < resumed.index(10)  # apply runs again before publish
+    caplog.clear()
+    monkeypatch.setattr(ship.subprocess, "run", FakeRun({"verify": 1}))
+    with caplog.at_level(logging.ERROR):
+        assert ship_run(["--stage", "9", "--yes"]) == 1
+    assert "run the same command again." in caplog.text and "use --stage" not in caplog.text
+
+
+def test_a_later_steps_failure_after_an_earlier_steps_apply_exits_three(
+    work: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("FLUID_RUN_ID", "job-1")
+    monkeypatch.setattr(ship.subprocess, "run", FakeRun())
+    assert ship_run(["--stage", "1-7", "--yes"]) == 0
+    monkeypatch.setattr(ship.subprocess, "run", FakeRun({"verify": 1}))
+    with caplog.at_level(logging.ERROR):
+        assert ship_run(["--stage", "8-9", "--yes"]) == 3
+    assert "its changes are live" in caplog.text and _report(work)["exit_code"] == 3
+    monkeypatch.setattr(ship.subprocess, "run", FakeRun())
+    assert ship_run(["--stage", "9", "--yes"]) == 0  # an earlier step's failure is not this one's
+    assert _report(work)["exit_code"] == 0
+
+
+def test_a_bad_target_is_refused_up_front_whenever_stage_ten_will_publish(
+    work: Path, fake: FakeRun
+) -> None:
+    argv = ["--skip-stage", "apply", "--dry-run", "--publish", "--target", "a:b", "--yes"]
+    assert ship_run(argv) == 2 and fake.calls == []
+    # a dry run with apply in the pipeline skips publish, as the generated shell does
+    assert ship_run(["--stage", "10", "--dry-run", "--target", "a:b"]) == 0
+    assert fake.calls == []
+
+
+def test_merged_records_get_this_versions_names_and_text_reasons(
+    work: Path, fake: FakeRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FLUID_RUN_ID", "run-1")
+    Path("runtime").mkdir()
+    Path("runtime/bundle.tgz").write_bytes(b"x")
+    odd_name = "a" + chr(1) + "b" + chr(0xD800)
+    odd = {"number": 1, "name": odd_name, "status": "not-run", "skip_reason": 5}
+    head = {"run_id": "run-1", "env": "dev", "mode": "amend", "contract": "contract.fluid.yaml"}
+    Path("runtime/ship-report.json").write_text(
+        json.dumps({**head, "exit_code": 0, "stages": [odd]})
+    )
+    assert ship_run(["--stage", "validate"]) == 0
+    stage1 = _report(work)["stages"][0]
+    assert stage1["name"] == "bundle" and stage1["skip_reason"] == "5"
+    ET.parse(work / "runtime/ship-junit.xml")  # well formed
+
+
+def test_a_dry_run_apply_in_an_earlier_step_does_not_make_a_failure_partial(
+    work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FLUID_RUN_ID", "job-1")
+    (work / "dist/artifacts/policy").mkdir(parents=True)
+    (work / "dist/artifacts/policy/bindings.json").write_text("{}")
+    monkeypatch.setattr(ship.subprocess, "run", FakeRun())
+    assert ship_run(["--stage", "1-7", "--dry-run", "--yes"]) == 0
+    monkeypatch.setattr(ship.subprocess, "run", FakeRun({"policy-apply": 1}))
+    assert ship_run(["--stage", "8", "--dry-run"]) == 1  # the dry run changed nothing
+    assert _report(work)["exit_code"] == 1

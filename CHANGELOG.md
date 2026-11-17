@@ -310,8 +310,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     which the run report keeps: a stage's own 2 (`diff` could not inspect a target) read as a
     refused argument, and no code told a caller that apply had already changed something.
   - A contract outside the current directory runs in its own directory (its `runtime/` lands
-    beside it), and a symlinked contract runs where the link is. An environment name a stage
-    would refuse, or a contract path with no file, exits 2 before any stage runs.
+    beside it). A contract stage 1 would refuse (no file, a symlink, a system path) or an
+    environment name a stage would refuse exits 2 before anything is written.
   - Every run that starts a stage writes `runtime/ship-report.json` and
     `runtime/ship-junit.xml` (`--report-dir`; a relative path is taken from the current
     directory). Calls that continue one run (same run id, env, mode and contract) merge into

@@ -1,7 +1,7 @@
 # Copyright 2025 Agentics Transformation Limited
 # SPDX-License-Identifier: Apache-2.0
 
-"""``fluid ship`` — the canonical 11-stage pipeline runner.
+"""``fluid ship``: the canonical 11-stage pipeline runner.
 
 One runner, used identically on a laptop and in CI::
 
@@ -327,6 +327,7 @@ def _prepare(
     # Every stage gets the contract as a POSIX path relative to the directory it
     # runs in (``generate artifacts --contract-path`` refuses any other form).
     project_dir, args.contract = st.project_location(args.contract)
+    st.check_contract_path(os.path.join(project_dir, args.contract))
     opts = st.resolve_options(args, args.contract, os.environ)
     selected, not_selected = st.select_stages(
         publish=bool(args.publish),
@@ -337,7 +338,7 @@ def _prepare(
     )
     if not selected:
         raise st.ShipUsageError("no stage left to run (check --stage, --until and --skip-stage)")
-    if 10 in selected and opts.mode != "dry-run":
+    if 10 in selected and not st.dry_run_applied_nothing(opts):  # stage 10 will publish
         st.check_targets(opts.targets)
     return opts, selected, not_selected, project_dir
 
@@ -371,7 +372,7 @@ def _attempt(num: int, rec: report.StageRecord, ctx: _Context) -> Optional[int]:
         ctx.ci.info(f"stage {num} {rec.name}: {note}")
     if action.argv is None:
         rec.status, rec.reason = report.SKIPPED, action.skip_reason
-        ctx.ci.info(f"stage {num} {rec.name}: skipped — {rec.reason}")
+        ctx.ci.info(f"stage {num} {rec.name}: skipped ({rec.reason})")
         return None
     rec.argv = _safe_argv(action.argv)
     missing = st.missing_input(num, st.Workspace())
@@ -396,15 +397,24 @@ def _attempt(num: int, rec: report.StageRecord, ctx: _Context) -> Optional[int]:
 
 
 def _report_abort(num: int, rec: report.StageRecord, ctx: _Context) -> None:
-    ctx.ci.failure(num, rec.name, int(rec.exit_code or 1))
+    """Name the failed stage and how to go on. Going on runs every stage of this
+    command from the failed one: with --publish, plan and apply run again before
+    stage 10 publishes."""
+    code = int(rec.exit_code or 1)
+    ctx.ci.failure(num, rec.name, code)
+    rest = [n for n in ctx.selected if n >= num]
+    resume = (
+        ""
+        if rest == ctx.selected
+        else f"; to go on from that stage with this bundle, use --stage {st.compact_spec(rest)}"
+    )
     ctx.logger.error(
-        "Ship aborted at stage %d %s (exit %d%s). To re-run that stage alone, run the "
-        "same command with --stage %d.",
+        "Ship aborted at stage %d %s (exit %d%s). After the fix, run the same command again%s.",
         num,
         rec.name,
-        int(rec.exit_code or 1),
+        code,
         ", interrupted" if rec.reason == "interrupted" else "",
-        num,
+        resume,
     )
 
 
@@ -419,12 +429,21 @@ def _finish(
         if rec.status == report.NOT_RUN and rec.reason is None:
             rec.reason = "an earlier stage failed"
     interrupted = any(r.reason == "interrupted" for r in ordered)
-    exit_code = (
-        report.EXIT_INTERRUPTED
-        if interrupted
-        else report.exit_status(ordered, applies=st.applies_changes(ctx.opts))
-    )
-    _write_reports(ctx, ordered, interrupted)
+    merged = _merged(ctx, ordered)
+    applies = st.applies_changes(ctx.opts)
+    if interrupted:
+        exit_code = run_code = report.EXIT_INTERRUPTED
+    else:
+        # An apply that passed in an earlier step of this run (one CI step per
+        # stage) makes a failure in this step partial too.
+        applied_earlier = any(
+            r.number == st.APPLY_STAGE and r.status == report.PASSED
+            for r in merged
+            if r.number not in ctx.selected
+        )
+        exit_code = report.exit_status(ordered, applies=applies, applied_earlier=applied_earlier)
+        run_code = report.exit_status(merged, applies=applies)
+    _write_reports(ctx, merged, run_code)
     ctx.ci.summary(rows)
     if exit_code == report.EXIT_PARTIAL:
         ctx.logger.error(
@@ -564,41 +583,38 @@ def _child_env(run_id: str) -> Dict[str, str]:
     return env
 
 
-def _write_reports(ctx: _Context, ordered: List[report.StageRecord], interrupted: bool) -> None:
-    """The report of the whole run: this invocation's records, plus those an
-    earlier invocation of the same run left for the stages not selected now.
-    Its ``exit_code`` is the run's status, which per-stage CI steps spread over
-    several invocations."""
+def _merged(ctx: _Context, ordered: List[report.StageRecord]) -> List[report.StageRecord]:
+    """The records of the whole run: this invocation's, plus those an earlier
+    invocation of the same run left for the stages not selected now. A run that
+    bundles is a new run and keeps none."""
+    if ctx.fresh:
+        return ordered
     opts = ctx.opts
-    directory = Path(ctx.report_dir)
+    return report.merge_with_previous(
+        Path(ctx.report_dir),
+        ctx.run_id,
+        ordered,
+        selected=ctx.selected,
+        env=opts.env,
+        mode=opts.mode,
+        contract=opts.contract,
+    )
+
+
+def _write_reports(ctx: _Context, merged: List[report.StageRecord], run_code: int) -> None:
+    """Write the run's report. Its ``exit_code`` is the run's status, which
+    per-stage CI steps spread over several invocations."""
+    opts = ctx.opts
     try:
-        merged = (
-            ordered
-            if ctx.fresh
-            else report.merge_with_previous(
-                directory,
-                ctx.run_id,
-                ordered,
-                selected=ctx.selected,
-                env=opts.env,
-                mode=opts.mode,
-                contract=opts.contract,
-            )
-        )
-        status = (
-            report.EXIT_INTERRUPTED
-            if interrupted
-            else report.exit_status(merged, applies=st.applies_changes(opts))
-        )
         body = report.build_report(
             merged,
             run_id=ctx.run_id,
             env=opts.env,
             mode=opts.mode,
             contract=opts.contract,
-            exit_code=status,
+            exit_code=run_code,
         )
-        report.write_reports(directory, body, merged)
+        report.write_reports(Path(ctx.report_dir), body, merged)
     except (OSError, ValueError) as exc:
         ctx.logger.warning(
             "fluid ship: could not write the run report to %s: %s",
@@ -630,7 +646,7 @@ def _run_stage(
     A negative return code (killed by a signal) is reported as 1.
     """
     cmd = fluid_bin + [stage] + argv
-    # Sanitise argv before logging — a stage may carry credential-bearing
+    # Sanitise argv before logging: a stage may carry credential-bearing
     # flags (``--*-secret`` / ``--*-token``) the operator passed through.
     shown = shlex.join(["fluid", stage, *_safe_argv(argv)])
     if ci is not None:
