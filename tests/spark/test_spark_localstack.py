@@ -355,7 +355,7 @@ def _wait(read, done=("SUCCEEDED", "FAILED", "ERROR", "STOPPED", "TIMEOUT")):
         if state["JobRunState"] in done:
             return state
         time.sleep(5)
-    pytest.fail("the Glue run did not end")
+    raise TimeoutError(f"the Glue run did not end in {RUN_TIMEOUT_S} s")
 
 
 def _catalog(config):
