@@ -1126,3 +1126,24 @@ def test_the_lf_role_writes_only_the_products_prefix_of_the_account_bucket(contr
     loc["path"] = "commerce.orders-stream/order_lines/"
     resources, _ = emit(_with_lake_formation(contract))
     assert any("_lf_writer_" in k for k in resources["aws_iam_role"])
+
+
+@pytest.mark.parametrize(
+    "auth, listener", [("none", "bootstrap_brokers_tls"), ("msk-iam", "bootstrap_brokers_sasl_iam")]
+)
+def test_the_job_config_is_the_compilers_with_only_the_brokers_filled(contract, auth, listener):
+    """One writer for job.json: the compiler. The IaC fills the MSK broker placeholder and
+    nothing else; without IAM it reads the TLS listener, as MSK encrypts client traffic by
+    default and its plaintext list is then empty (#922)."""
+    from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER, compile_job_config
+
+    spark(contract)["source"]["auth"] = auth
+    resources, _ = emit(contract)
+    text = resources["aws_s3_object"][f"{KEY}_config"]["content"]
+    filled = f"${{data.aws_msk_bootstrap_brokers.{KEY}.{listener}}}"
+    assert filled in text
+    compiled = compile_job_config(
+        contract, contract["builds"][0], account_ref="000000000005"
+    ).config
+    rendered = json.loads(text.replace(filled, MSK_BROKERS_PLACEHOLDER))
+    assert rendered == compiled

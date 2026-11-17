@@ -546,7 +546,11 @@ def _job_content(
     iam = source.get("auth") == "msk-iam"
     if arn:
         cluster = _msk(arn, source["topic"], source.get("groupIdPrefix"), b.where)
-        attr = "bootstrap_brokers_sasl_iam" if iam else "bootstrap_brokers"
+        # MSK IAM reads the SASL/IAM listener. Without IAM the job takes the TLS listener:
+        # MSK encrypts client traffic by default, and its plaintext list is then empty (a
+        # plaintext listener is named by bootstrapServers instead). The compiler marks such
+        # a source ``tls`` for the runner; this only fills the brokers.
+        attr = "bootstrap_brokers_sasl_iam" if iam else "bootstrap_brokers_tls"
         blocks.data.setdefault("aws_msk_bootstrap_brokers", {})[b.key] = {
             "cluster_arn": arn,
             "region": cluster.region,
