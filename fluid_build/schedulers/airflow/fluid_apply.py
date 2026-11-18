@@ -124,6 +124,19 @@ DEFAULT_ENGINE = "airflow"
 #: destructive mode.
 APPLY_MODE = "amend-and-build"
 
+#: What a keepalive DAG passes to ``fluid apply`` after the contract and ``--env``, before
+#: ``--build-id <stream> --yes``: reconcile that one stream, restarting it when it stopped, and
+#: change nothing else. The one place the reconcile-only apply is named. PLACEHOLDER: the
+#: reconcile-only apply path does not exist yet; set the real arguments here once it does.
+KEEPALIVE_APPLY_ARGS: Tuple[str, ...] = ("--mode", "reconcile")
+
+#: How often a keepalive DAG reconciles its stream, unless the build's
+#: ``execution.orchestration.airflow.dagConfig.schedule`` names another cron.
+KEEPALIVE_SCHEDULE = "*/5 * * * *"
+
+#: How long one keepalive run may take before Airflow stops it; the next run tries again.
+KEEPALIVE_TASK_TIMEOUT_S = 30 * 60
+
 #: Contract path baked into the DAG when the caller cannot know the real one
 #: (a bundle carries no source path). Matches fluid's own discovery default
 #: and the generated CI pipelines' ``CONTRACT`` default.
@@ -337,6 +350,8 @@ class ScheduledDag:
     tasks: Tuple[BuildTask, ...]
     #: ``(build id, why)``: builds a task depends on that no DAG runs, so none waits for them.
     unwaited: Tuple[Tuple[str, str], ...] = ()
+    #: A keepalive DAG: its one task reconciles an always-on stream (:data:`KEEPALIVE_APPLY_ARGS`).
+    keepalive: bool = False
 
 
 # Where a build stands in the schedule (:func:`_classify`).
@@ -434,6 +449,40 @@ def _outside_why(build: Dict[str, Any], managed: bool) -> str:
     return "a job that runs on its own platform (a Flink job, for example)"
 
 
+def _keeps_alive(build: Dict[str, Any], managed: bool) -> bool:
+    """Whether a keepalive DAG watches the build: a forge Spark stream (one that is not
+    ``trigger.availableNow``) that declares ``execution.retries``, on Airflow's engine."""
+    if _spark_kind(build, managed) != "streaming":
+        return False
+    execution = build.get("execution")
+    if not isinstance(execution, dict) or not isinstance(execution.get("retries"), dict):
+        return False
+    own = execution.get("orchestration")
+    return not (isinstance(own, dict) and own.get("engine") not in (None, "", DEFAULT_ENGINE))
+
+
+def _keepalive_schedule(build: Dict[str, Any]) -> str:
+    """The cron a keepalive DAG runs on: ``execution.orchestration.airflow.dagConfig.schedule``,
+    else :data:`KEEPALIVE_SCHEDULE`."""
+    own = (build.get("execution") or {}).get("orchestration")
+    airflow = own.get("airflow") if isinstance(own, dict) else None
+    config = airflow.get("dagConfig") if isinstance(airflow, dict) else None
+    value = config.get("schedule") if isinstance(config, dict) else None
+    if value in (None, ""):
+        return KEEPALIVE_SCHEDULE
+    where = f"{build.get('id')!r}: execution.orchestration.airflow.dagConfig.schedule"
+    try:
+        cron = _validate_schedule(value, str(build.get("id")))
+    except ScheduleRenderError as exc:
+        raise ScheduleRenderError(f"{where}: {exc}") from None
+    if cron == "@once":
+        raise ScheduleRenderError(
+            f"{where}: a keepalive DAG reconciles the stream on a recurring cron, and @once "
+            "is not one"
+        )
+    return cron
+
+
 def _trigger_schedule(build: Dict[str, Any], managed: bool = True) -> Optional[Dict[str, Any]]:
     """The build's cron trigger, or ``None`` when it has none Airflow should run."""
     kind, trigger = _classify(build, managed)
@@ -447,7 +496,11 @@ def has_scheduled_builds(contract: Dict[str, Any]) -> bool:
     if not isinstance(builds, list):
         return False
     managed = _managed_lane(contract)
-    return any(isinstance(b, dict) and _classify(b, managed)[0] in _DAG_TRIGGERS for b in builds)
+    return any(
+        isinstance(b, dict)
+        and (_classify(b, managed)[0] in _DAG_TRIGGERS or _keeps_alive(b, managed))
+        for b in builds
+    )
 
 
 def runs_only_outside_schedulers(contract: Dict[str, Any]) -> bool:
@@ -457,7 +510,9 @@ def runs_only_outside_schedulers(contract: Dict[str, Any]) -> bool:
     if not builds:
         return False
     managed = _managed_lane(contract)
-    return all(_classify(b, managed)[0] == _OUTSIDE for b in builds)
+    return all(
+        _classify(b, managed)[0] == _OUTSIDE and not _keeps_alive(b, managed) for b in builds
+    )
 
 
 def has_explicit_tasks(contract: Dict[str, Any]) -> bool:
@@ -987,6 +1042,30 @@ class _BuildGraph:
                 "schedule (trigger.type: schedule)"
             )
 
+    def keepalives(self) -> List[ScheduledDag]:
+        """One keepalive DAG per always-on stream that declares ``execution.retries``.
+
+        Its one task reconciles the stream every few minutes, so a stream a Spot interruption
+        or a failed driver stopped starts again; the build's own retries bound how often. It
+        has no outlets: a stream updates its tables all the time, and an asset event on every
+        run would start each DAG scheduled on them.
+        """
+        out: List[ScheduledDag] = []
+        for build in self.builds:
+            if not _keeps_alive(build, self.managed):
+                continue
+            build_id = _task_build_id(build)
+            _check_spark_ids(self.contract, build_id)
+            out.append(
+                ScheduledDag(
+                    build_id=build_id,
+                    schedule=DagSchedule(cron=_keepalive_schedule(build), timezone="UTC"),
+                    tasks=(BuildTask(build_id, 0, KEEPALIVE_TASK_TIMEOUT_S),),
+                    keepalive=True,
+                )
+            )
+        return out
+
     def _why_no_task(self, build: Dict[str, Any]) -> str:
         kind, trigger = _classify(build, self.managed)
         if kind == _OUTSIDE:
@@ -1055,6 +1134,7 @@ def scheduled_dags(contract: Dict[str, Any]) -> List[ScheduledDag]:
         return []
     graph = _BuildGraph(contract, [b for b in raw_builds if isinstance(b, dict)])
     dags = [dag for members in graph.groups() if (dag := graph.dag(members)) is not None]
+    dags += graph.keepalives()
     seen: Set[str] = set()
     for task in (t for dag in dags for t in dag.tasks):
         if task.build_id in seen:
@@ -1278,6 +1358,15 @@ _SCRIPT_END = (
 
 BASH_SCRIPT_LINES = _SCRIPT_HEAD + _APPLY_TAIL + _SCRIPT_END
 
+_KEEPALIVE_TAIL = (
+    'set -- apply "$contract"',
+    'if [ -n "$FLUID_DAG_ENV" ]; then set -- "$@" --env "$FLUID_DAG_ENV"; fi',
+    'set -- "$@" ' + " ".join(KEEPALIVE_APPLY_ARGS) + ' --build-id "$FLUID_DAG_BUILD_ID" --yes',
+)
+
+#: The script of a keepalive DAG's task: :data:`BASH_SCRIPT_LINES` but for the apply arguments.
+KEEPALIVE_SCRIPT_LINES = _SCRIPT_HEAD + _KEEPALIVE_TAIL + _SCRIPT_END
+
 
 def _wrap(words: List[str], indent: str, width: int = 76) -> str:
     lines: List[str] = []
@@ -1315,6 +1404,21 @@ _ONE_BUILD_RUN = (
     '    cd "$FLUID_PROJECT_DIR"\n'
     '    fluid apply "$FLUID_PROJECT_DIR/$CONTRACT_PATH" --env "$FLUID_ENV_NAME" \\\\\n'
     '        --mode amend-and-build --build-id "$BUILD_ID" --yes\n'
+)
+
+_KEEPALIVE_RUN = (
+    "Every run reconciles one always-on stream on the Airflow worker, with the\n"
+    "constants below filled in (`--env` is left out when FLUID_ENV_NAME is empty):\n"
+    "\n"
+    '    cd "$FLUID_PROJECT_DIR"\n'
+    '    fluid apply "$FLUID_PROJECT_DIR/$CONTRACT_PATH" --env "$FLUID_ENV_NAME" \\\\\n'
+    f'        {" ".join(KEEPALIVE_APPLY_ARGS)} --build-id "$BUILD_ID" --yes\n'
+    "\n"
+    "It starts the stream again when it stopped (a Spot interruption, a failed\n"
+    "driver) and changes nothing else; the build's execution.retries bound the\n"
+    "restarts, so the task itself never retries. It runs on SCHEDULE, one run\n"
+    "at a time, with no catch-up. The build's\n"
+    "execution.orchestration.airflow.dagConfig.schedule sets SCHEDULE.\n"
 )
 
 _BUILDS_RUN = (
@@ -1447,7 +1551,7 @@ def _schedule_expr(schedule: DagSchedule) -> str:
     )
 
 
-def render_build_task(task: BuildTask, *, only: bool) -> str:
+def render_build_task(task: BuildTask, *, only: bool, keepalive: bool = False) -> str:
     """The source of one build's node: a BashOperator that runs ``fluid apply --build-id``.
 
     This is the one function that decides what runs a build; the DAG's schedule and its edges
@@ -1458,7 +1562,8 @@ def render_build_task(task: BuildTask, *, only: bool) -> str:
     """
     lit = py_str_literal
     if only:
-        head, task_id, build_id = "    BashOperator(\n", '"fluid_apply"', "BUILD_ID"
+        name = '"fluid_keepalive"' if keepalive else '"fluid_apply"'
+        head, task_id, build_id = "    BashOperator(\n", name, "BUILD_ID"
     else:
         head = f"    tasks[{lit(task.build_id)}] = BashOperator(\n"
         task_id = build_id = lit(task.build_id)
@@ -1523,6 +1628,11 @@ _IMPORTS = (
 
 def _dag_doc(product_id: str, dag: ScheduledDag) -> Tuple[str, str]:
     """The DAG file's docstring and the DAG's ``description``."""
+    if dag.keepalive:
+        return (
+            _doc("Scheduled fluid build", _KEEPALIVE_RUN, []),
+            f"keep fluid stream {product_id} {dag.build_id} running",
+        )
     only = len(dag.tasks) == 1
     notes = [] if only else [_TRIGGER_RULES_NOTE]
     notes += [n for n in (_schedule_note(dag.schedule), _unwaited_note(dag.unwaited)) if n]
@@ -1560,7 +1670,7 @@ def _dag_tasks(dag: ScheduledDag) -> Tuple[str, str]:
             '        "retry_delay": timedelta(minutes=5),\n'
             f'        "execution_timeout": {_timeout_expr(task.task_timeout_s)},\n'
         )
-        return default_args, render_build_task(task, only=True)
+        return default_args, render_build_task(task, only=True, keepalive=dag.keepalive)
     nodes = "".join(render_build_task(t, only=False) for t in dag.tasks)
     default_args = '        "owner": "fluid",\n        "retry_delay": timedelta(minutes=5),\n'
     return default_args, f"    tasks = {{}}\n{nodes}\n{_edges(dag.tasks)}"
@@ -1579,7 +1689,8 @@ def render_scheduled_dag(
     doc, description = _dag_doc(product_id, dag)
     default_args, body = _dag_tasks(dag)
     uses_assets = bool(dag.schedule.datasets) or any(t.outlets for t in dag.tasks)
-    script = "".join(f"        {lit(line)},\n" for line in BASH_SCRIPT_LINES)
+    lines = KEEPALIVE_SCRIPT_LINES if dag.keepalive else BASH_SCRIPT_LINES
+    script = "".join(f"        {lit(line)},\n" for line in lines)
     return (
         f"{doc}\n"
         "\n"
@@ -1697,6 +1808,10 @@ __all__ = [
     "render_fluid_apply_dags",
     "render_scheduled_dag",
     "rendered_dag_of",
+    "KEEPALIVE_APPLY_ARGS",
+    "KEEPALIVE_SCHEDULE",
+    "KEEPALIVE_SCRIPT_LINES",
+    "KEEPALIVE_TASK_TIMEOUT_S",
     "runs_only_outside_schedulers",
     "schedule_scope_for",
     "scheduled_builds",

@@ -261,8 +261,23 @@ def rules_and_any() -> Dict[str, Any]:
     return _with_builds(contract, contract["builds"][0], staging, mart, notify, report)
 
 
-#: Contracts that use ``builds[].dependencies`` and dataset triggers.
+def kept_alive_stream() -> Dict[str, Any]:
+    """The Spark contract whose stream declares execution.retries: a keepalive DAG beside the
+    daily batch, on a cadence the build's Airflow DAG config sets."""
+    contract = copy.deepcopy(SPARK_CONTRACT)
+    contract["builds"][0]["execution"] = {
+        "retries": {"maxAttempts": 5},
+        "orchestration": {
+            "engine": "airflow",
+            "airflow": {"dagId": "events_keepalive", "dagConfig": {"schedule": "*/10 * * * *"}},
+        },
+    }
+    return contract
+
+
+#: Contracts that use ``builds[].dependencies``, dataset triggers or a kept-alive stream.
 GRAPH_CASES: Dict[str, Tuple[Dict[str, Any], Optional[str], str]] = {
     "events_pipeline": (events_pipeline(), None, "contracts/events/contract.fluid.yaml"),
     "rules_and_any": (rules_and_any(), "aws", "contract.fluid.yaml"),
+    "kept_alive_stream": (kept_alive_stream(), "aws", "native.fluid.yaml"),
 }
