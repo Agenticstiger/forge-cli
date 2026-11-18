@@ -34,7 +34,8 @@ from flux_stats.fidelity import expose_from_contract, parse_fidelity_block  # no
 from flux_stats.profile import load_profile_text  # noqa: E402
 
 from fluid_build.cli import main  # noqa: E402
-from fluid_build.profiler import _stats, bundle  # noqa: E402
+from fluid_build.profiler import _stats, bundle, disclosure, runner  # noqa: E402
+from fluid_build.profiler._stats import DeclaredStatistic  # noqa: E402
 from fluid_build.profiler.runner import ProfileError, profile_expose  # noqa: E402
 from tests.profiler.test_flux_stats_backend import _slice  # noqa: E402
 
@@ -317,7 +318,7 @@ _ONE_CODE = (
         pytest.param(0, 10, "0.5", "C", id="none-below"),
     ],
 )
-def test_a_quantile_needs_none_or_ten_records_below_and_above_its_witness(
+def test_a_quantile_needs_ten_records_below_and_above_its_witness(
     tmp_path, low, high, level, status
 ):
     amounts = ["1"] * low + ["50"] * (120 - low - high) + ["99"] * high
@@ -378,6 +379,87 @@ def test_a_group_withheld_for_its_size_withholds_its_siblings_in_a_grouped_histo
     assert result.withheld["D"] == 3
     # The column's own histogram is no group of the groupBy.
     assert _entry(result, "amount", "marginalHistogram/1")["groups"][0]["status"] == "F"
+
+
+def _three_bands(market: str, count: int) -> List[Dict[str, Any]]:
+    # A third of the records each at 10, 50 and 90: the median is a 50 that a third
+    # hold, with a third below it and a third above it.
+    return [
+        {"amount": ("10", "50", "90")[n % 3], "market": market, "qty": "1"} for n in range(count)
+    ]
+
+
+def test_a_group_withheld_for_its_size_withholds_its_siblings_in_a_grouped_quantile(tmp_path):
+    rows = [*_three_bands("DE", 3)] + [
+        row for market in MARKETS for row in _three_bands(market, 39)
+    ]
+    result = _profile(tmp_path, rows, [{**PROPERTIES[5], "groupBy": "market"}])
+    grouped = _entry(result, "amount", "quantile/1", "market")
+    # Every other market's median passes its own checks, and goes with the small one.
+    assert {g["status"] for g in grouped["groups"]} == {"C"}
+    assert result.withheld["D"] == 3
+
+
+@pytest.mark.parametrize("kind", ["marginalHistogram", "levelHistogram", "quantile"])
+def test_the_sibling_rule_reaches_every_histogram_and_quantile_of_the_column(kind):
+    # A level histogram needs a second categorical column to be grouped by, which this
+    # module's contract lacks, so the rule is checked on its own.
+    passed = disclosure.PUBLISHED
+    beside = runner._Beside(crowded=frozenset(), small=frozenset({("market", "tier")}))
+
+    def declared(kind: str, column: str) -> DeclaredStatistic:
+        return DeclaredStatistic(
+            identifier=f"{kind}/1",
+            kind=kind,
+            column=column,
+            group_by="tier",
+            shape={},
+            columns=(column, "tier"),
+            read_as={},
+        )
+
+    withheld = runner._withheld_beside(declared(kind, "market"), [passed, passed], beside)
+    assert [verdict.status for verdict in withheld] == ["D", "D"]
+    # The same groupBy on another column, and a mean, are left to their own checks.
+    assert runner._withheld_beside(declared(kind, "channel"), [passed], beside) == [passed]
+    assert runner._withheld_beside(declared("mean", "market"), [passed], beside) == [passed]
+
+
+def test_a_quantile_beside_a_histogram_of_another_column_is_published(tmp_path):
+    histogram_of_qty = {**PROPERTIES[2], "column": "qty"}
+    result = _profile(tmp_path, _rows(), [histogram_of_qty, PROPERTIES[5]])
+    (group,) = _entry(result, "amount", "quantile/1")["groups"]
+    assert group["status"] == "F"
+
+
+def test_a_small_group_of_one_column_leaves_another_columns_groups_published(tmp_path):
+    rows = _rows()
+    for index, row in enumerate(rows[:15]):
+        row["market"] = "DE"
+        if index < 12:
+            row["amount"] = None  # DE holds 15 records, 3 of them with an amount
+    by_market = [
+        {**PROPERTIES[2], "groupBy": "market"},
+        {**PROPERTIES[2], "column": "qty", "groupBy": "market"},
+    ]
+    result = _profile(tmp_path, rows, by_market)
+    amount = _entry(result, "amount", "marginalHistogram/1", "market")
+    assert {g["status"] for g in amount["groups"]} == {"C"}
+    qty = _entry(result, "qty", "marginalHistogram/1", "market")
+    assert {g["status"] for g in qty["groups"]} == {"F"}
+
+
+def test_rows_no_group_holds_that_the_block_refuses_withhold_a_grouped_histogram(tmp_path):
+    # One row with no market holds an amount outside the declared range: the profile
+    # cannot read it as the block does, so it cannot vouch for it.
+    rows = _rows()
+    rows[6]["market"] = None
+    rows[6]["amount"] = "500"
+    by_market = {**PROPERTIES[2], "groupBy": "market"}
+    result = _profile(tmp_path, rows, [by_market], market_null="exclude")
+    grouped = _entry(result, "amount", "marginalHistogram/1", "market")
+    assert {g["status"] for g in grouped["groups"]} == {"C"}
+    assert result.withheld["D"] == len(grouped["groups"])
 
 
 def test_few_rows_no_group_holds_withhold_a_grouped_histogram(tmp_path):

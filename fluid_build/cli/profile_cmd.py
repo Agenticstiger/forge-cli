@@ -63,8 +63,8 @@ What the checks leave readable: a grouped statistic lists every group the data
 forms, published or withheld. A key is always a level the bundle declares (a
 value outside the declared support is refused), so its presence says only that
 the level holds at least one record. A group withheld for its size withholds
-every group of its groupBy's histograms and quantiles too, and a quantile is
-published only as the one histogram or quantile of its column. A withheld cell of
+every group of its groupBy's histograms and quantiles on its column too, and a
+quantile is published only as the one histogram or quantile of its column. A withheld cell of
 a histogram is not secondarily suppressed: the rounded counts still bound it,
 inside 0 to 9 records, and never above the threshold.
 
@@ -86,7 +86,7 @@ fluid profile contract.fluid.yaml --expose orders \\
 # when 10 records hold it (ACRO 1.1.0 defaults), a quantile only when at least 10
 # records lie below it and 10 above it, and only as its column's one histogram or
 # quantile. A group of fewer than 10 records withholds every group of its groupBy's
-# histograms and quantiles. A histogram's or a quantile's withheld values all read C,
+# histograms and quantiles on its column. A histogram's or a quantile's withheld values all read C,
 # whatever withheld them. Output-checking conventions only: no privacy or anonymity
 # guarantee. Pin the printed digest in the FLUX Simulation.
 # Each number column also gets mean/1, which FLUX compares a mean property with, on the
