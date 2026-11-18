@@ -451,7 +451,8 @@ class _Compiler:
         alternatives = [_masks.alternative(entry) for entry in formats]
         values, prefixes = self.exemptions(expose, fallback["column"])
         exempt = [_masks.literal_regex(v) for v in values]
-        exempt += [_masks.literal_regex(p) + ".*" for p in prefixes]
+        # [\s\S]*, not .*: a placeholder is any text after its prefix, a line break too.
+        exempt += [_masks.literal_regex(p) + "[\\s\\S]*" for p in prefixes]
         body = _masks.column_body(alternatives)
         pattern = "^" + ("(" + "|".join([body, *exempt]) + ")" if exempt else body) + "$"
         try:

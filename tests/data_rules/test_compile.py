@@ -473,7 +473,7 @@ def test_placeholders_are_counted_and_exempt_from_formats() -> None:
     )
     rules = _by_id(contract)
     fmt = rules["code.identifierFormat"]
-    assert fmt.pattern == "^((P[0-9]{5})|XXXXX|TBD_%.*)$"
+    assert fmt.pattern == "^((P[0-9]{5})|XXXXX|TBD_%[\\s\\S]*)$"
     # A foreign key inherits the placeholders of the column it copies (RFC §3).
     sales = [r for r in compile_rules(contract) if r.expose == "sales"][0]
     assert sales.pattern == fmt.pattern

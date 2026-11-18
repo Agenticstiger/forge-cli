@@ -145,9 +145,19 @@ def run(args, logger: logging.Logger) -> int:
         macro_path.write_text(MACRO, encoding="utf-8")
         info(logger, "dbt_tests_macro_written", out=str(macro_path))
     for skipped in rendered.skipped:
+        if skipped.adapters:
+            logger.warning(
+                "declared rule %r on expose %r cannot run on the %s adapter(s): %s. Its "
+                "fluid_rule test fails there, naming the rule; it runs on the others.",
+                skipped.id,
+                skipped.expose,
+                ", ".join(skipped.adapters),
+                skipped.reason,
+            )
+            continue
         logger.warning(
-            "declared rule %r on expose %r has no dbt test: %s. It is not tested; nothing "
-            "approximates it.",
+            "declared rule %r on expose %r has no dbt test: %s. It is not tested, and nothing "
+            "approximates it; run fluid validate on the contract to see what to change.",
             skipped.id,
             skipped.expose,
             skipped.reason,
@@ -196,8 +206,21 @@ def _first_macro_path(project: Path) -> str:
         doc = {}
     paths = doc.get("macro-paths") if isinstance(doc, dict) else None
     first = paths[0] if isinstance(paths, list) and paths and isinstance(paths[0], str) else None
-    if not first or Path(first).is_absolute() or ".." in Path(first).parts:
+    if not first:
         return "macros"
+    if Path(first).is_absolute() or ".." in Path(first).parts:
+        raise CLIError(
+            1,
+            "dbt_tests_no_macro_dir",
+            {
+                "path": str(project),
+                "detail": (
+                    f"{project}'s first macro-paths entry {first!r} is outside the project, "
+                    "so fluid does not write the fluid_rule macro there. Pass --macros-dir "
+                    "<a folder dbt loads macros from>."
+                ),
+            },
+        )
     return first
 
 

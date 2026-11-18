@@ -780,7 +780,7 @@ def _exempt_pattern(pattern: str, values: List[str], prefixes: List[str]) -> str
     if values:
         parts.append("^(" + "|".join(map(literal_regex, values)) + ")$")
     if prefixes:
-        parts.append("^(" + "|".join(map(literal_regex, prefixes)) + ").*")
+        parts.append("^(" + "|".join(map(literal_regex, prefixes)) + ")[\\s\\S]*")
     return "|".join(parts)
 
 
