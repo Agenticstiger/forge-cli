@@ -213,8 +213,10 @@ _GUIDANCE: Dict[str, Tuple[List[str], Optional[str]]] = {
     ),
     "diagnostics_scope_unsupported": (
         [
-            "Validate one contract at a time: fluid validate <product>/contract.fluid.yaml "
-            "--format sarif",
+            (
+                "Validate one contract at a time: fluid validate <product>/contract.fluid.yaml "
+                "--format sarif"
+            ),
             "Or drop --diagnostics / --format sarif to validate the workspace or bundle as a whole",
             "Run --list-versions or --show-schema without --format sarif",
         ],

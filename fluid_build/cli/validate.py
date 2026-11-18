@@ -2000,8 +2000,6 @@ def _exit_code(result: ValidationResult, args: Any) -> int:
 
 def _output_sarif_results(result: ValidationResult, args: Any, report: Any) -> int:
     """The findings as one SARIF 2.1.0 log on stdout; the exit code as for text."""
-    import json
-
     from fluid_build import __version__
     from fluid_build.diagnostics.render import to_sarif
 
@@ -2039,8 +2037,6 @@ def _cli_error_sarif(error: CLIError, args: Any) -> None:
     has a document to read. The message is the first line of the error only: a
     YAML parser appends the offending source line, a contract value, below it.
     """
-    import json
-
     from fluid_build import __version__
     from fluid_build._error_catalog import docs_url_for, fix_for, is_catalogued, slug_for
     from fluid_build.diagnostics.build import redacted, shown_path
