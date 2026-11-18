@@ -173,6 +173,8 @@ class TestABundle:
 
     def _bundle(self, capsys) -> None:
         Path("runtime").mkdir()
+        # The dbt project the build runs (repository "./"), which the bundle packs.
+        Path("dbt_project.yml").write_text("name: orders\nprofile: orders\n", encoding="utf-8")
         argv = ("bundle", _write(_CONTRACT), "--format", "tgz", "--out", "runtime/bundle.tgz")
         assert _fluid(*argv) == 0
         capsys.readouterr()
@@ -186,7 +188,12 @@ class TestABundle:
         assert "treated as errors" not in out
         report = json.loads(Path("runtime/validate-report.json").read_text(encoding="utf-8"))
         assert report["status"] == "pass"
-        assert [i["message"] for i in report["issues"] if i["severity"] == "info"] == [NOTE]
+        notes = [i["message"] for i in report["issues"] if i["code"] == "CONTRACT-RULE"]
+        assert notes == [NOTE]
+        assert sorted(i["code"] for i in report["issues"] if i["severity"] == "info") == [
+            "CONTRACT-RULE",
+            "DBT-PROJECT-BOUND",
+        ]
         assert not [i for i in report["issues"] if i["severity"] == "warning"]
 
     def test_json_carries_it_as_info(self, workspace: Path, capsys) -> None:
@@ -194,5 +201,5 @@ class TestABundle:
         argv = ("validate", "runtime/bundle.tgz", "--offline", "--strict", "--format", "json")
         assert _fluid(*argv) == 0
         report = json.loads(capsys.readouterr().out)
-        (note,) = [i for i in report["issues"] if i["severity"] == "info"]
+        (note,) = [i for i in report["issues"] if i["code"] == "CONTRACT-RULE"]
         assert (note["code"], note["message"]) == ("CONTRACT-RULE", NOTE)

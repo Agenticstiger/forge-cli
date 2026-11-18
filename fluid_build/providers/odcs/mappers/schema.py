@@ -252,11 +252,12 @@ def _extract_schema(fluid: Mapping[str, Any], include_quality: bool = True) -> L
             continue
 
         provider = _expose_provider(expose)
+        dialect = _rule_dialect(expose)
         properties: List[Dict[str, Any]] = []
         for fld in contract_schema:
             if not isinstance(fld, Mapping):
                 continue
-            properties.append(_field_to_property(fld, provider, include_quality))
+            properties.append(_field_to_property(fld, provider, include_quality, dialect))
         if not properties:
             continue
 
@@ -394,6 +395,13 @@ def _expose_provider(expose: Mapping[str, Any]) -> Optional[str]:
     return expose.get("provider")
 
 
+def _rule_dialect(expose: Mapping[str, Any]) -> Optional[str]:
+    """The SQL dialect a generated quality query of this expose is written in, if any."""
+    from fluid_build.data_rules._compile import platform_dialect
+
+    return platform_dialect(expose)[0]
+
+
 def _platform_to_physical_type(provider: Optional[str]) -> str:
     if not provider:
         return "table"
@@ -419,7 +427,10 @@ def _binding_object_name(expose: Mapping[str, Any]) -> Optional[str]:
 
 
 def _field_to_property(
-    fld: Mapping[str, Any], provider: Optional[str], include_quality: bool = True
+    fld: Mapping[str, Any],
+    provider: Optional[str],
+    include_quality: bool = True,
+    dialect: Optional[str] = None,
 ) -> Dict[str, Any]:
     prop: Dict[str, Any] = {
         "name": fld.get("name", "unknown"),
@@ -498,7 +509,7 @@ def _field_to_property(
     if include_quality:
         from . import quality as quality_mapper  # local import to avoid cycle
 
-        qchecks = quality_mapper.to_odcs_property(fld)
+        qchecks = quality_mapper.to_odcs_property(fld, dialect)
         if qchecks:
             prop["quality"] = qchecks
 

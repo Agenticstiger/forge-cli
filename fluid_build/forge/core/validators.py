@@ -9,6 +9,7 @@ Routes files inside a ``.tgz`` bundle to the right validator:
     contract.resolved.yaml → JSON Schema validator, after $source unwrap
     sources/sql/*          → sqlglot parse with dialect from binding.platform
     sources/openapi/*      → openapi-spec-validator
+    sources/dbt/<build>/*  → one finding per packed dbt project (dbt parses its Jinja SQL)
 
 Everything pluggable. ``sqlglot`` and ``openapi_spec_validator`` are
 soft-imported — absent = INFO skip unless ``--strict``.
@@ -34,7 +35,11 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import yaml
 
-from fluid_build.forge.core.bundle import SOURCE_SENTINEL, validate_manifest
+from fluid_build.forge.core.bundle import (
+    DBT_SOURCES_PREFIX,
+    SOURCE_SENTINEL,
+    validate_manifest,
+)
 from fluid_build.util.ref_confinement import (
     RefConfinementError,
     confine_ref,
@@ -487,6 +492,67 @@ def _read_tgz_file(tar: tarfile.TarFile, path: str) -> bytes:
     return data
 
 
+def _packed_dbt_project_issues(
+    dbt_files: Dict[str, List[str]], contract: Optional[Dict[str, Any]]
+) -> List[ValidationIssue]:
+    """One finding per dbt project the bundle packs under ``sources/dbt/<build id>/``.
+
+    An INFO naming what is bound (dbt's Jinja SQL is dbt's to parse), or a
+    WARNING for a project without its ``dbt_project.yml`` or one that no dbt
+    build of the bundled contract runs: ``fluid apply`` refuses both.
+    """
+    builds = {
+        build.get("id"): build
+        for build in (contract or {}).get("builds") or []
+        if isinstance(build, dict)
+    }
+    issues: List[ValidationIssue] = []
+    for build_id, rels in sorted(dbt_files.items()):
+        where = f"{DBT_SOURCES_PREFIX}{build_id}/"
+        engine = str((builds.get(build_id) or {}).get("engine") or "").strip().lower()
+        if build_id not in builds or not (engine == "dbt" or engine.startswith("dbt-")):
+            issues.append(
+                ValidationIssue(
+                    file=where,
+                    validator="dbt",
+                    severity="warning",
+                    message=(
+                        f"packs a dbt project for build {build_id!r}, which is not a dbt build "
+                        "of the bundled contract; fluid apply refuses the bundle"
+                    ),
+                    code="DBT-PROJECT-ORPHAN",
+                )
+            )
+        elif "dbt_project.yml" not in rels:
+            issues.append(
+                ValidationIssue(
+                    file=where,
+                    validator="dbt",
+                    severity="warning",
+                    message=(
+                        f"the packed dbt project of build {build_id!r} has no dbt_project.yml; "
+                        "re-run fluid bundle"
+                    ),
+                    code="DBT-PROJECT-INCOMPLETE",
+                )
+            )
+        else:
+            issues.append(
+                ValidationIssue(
+                    file=where,
+                    validator="dbt",
+                    severity="info",
+                    message=(
+                        f"binds the dbt project of build {build_id!r} ({len(rels)} files); "
+                        "fluid validate does not parse dbt's Jinja SQL. Run `dbt parse` on the "
+                        "project in CI"
+                    ),
+                    code="DBT-PROJECT-BOUND",
+                )
+            )
+    return issues
+
+
 def validate_bundle(
     tgz_path: Path,
     *,
@@ -504,6 +570,7 @@ def validate_bundle(
          the "validate dbt separately" INFO.
       4. ``sources/sql/*``: sqlglot parse.
       5. ``sources/openapi/*``: openapi-spec-validator.
+      6. ``sources/dbt/<build id>/*``: one finding per packed dbt project.
 
     On ``fail_fast``, stop at first error-severity issue. Warnings and
     infos never stop traversal regardless of flag (they're advisory).
@@ -569,7 +636,10 @@ def validate_bundle(
                     )
                 )
 
-        # Iterate files deterministically; dispatch per pattern.
+        # Iterate files deterministically; dispatch per pattern. A packed dbt
+        # project is reported once per build, after the loop: its SQL is Jinja,
+        # which only dbt itself parses.
+        dbt_files: Dict[str, List[str]] = {}
         for path in declared_files:
             if path == "MANIFEST.json":
                 continue  # already re-verified
@@ -592,6 +662,9 @@ def validate_bundle(
                 issues.extend(validate_sql(path, _resolve(path), dialect=dialect, strict=strict))
             elif path.startswith("sources/openapi/"):
                 issues.extend(validate_openapi(path, _resolve(path), strict=strict))
+            elif path.startswith(DBT_SOURCES_PREFIX) and "/" in path[len(DBT_SOURCES_PREFIX) :]:
+                build_id, _, rel = path[len(DBT_SOURCES_PREFIX) :].partition("/")
+                dbt_files.setdefault(build_id, []).append(rel)
             else:
                 issues.append(
                     ValidationIssue(
@@ -607,6 +680,8 @@ def validate_bundle(
                 )
             if fail_fast and any(i.severity == "error" for i in issues):
                 break
+
+        issues.extend(_packed_dbt_project_issues(dbt_files, resolved_contract))
 
         # Emit the dbt-external-project INFO if applicable. Read from the
         # unwrapped contract so it fires regardless of which build uses it.

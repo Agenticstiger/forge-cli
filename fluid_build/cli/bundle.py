@@ -94,6 +94,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "content-addressable bundle with a MANIFEST.json, SHA-256 per "
             "file, a merkle root, and inline SQL/OpenAPI extracted into "
             "sources/ (replaced by {'$source': 'sources/...'} sentinels). "
+            "The dbt project of each dbt build is packed under "
+            "sources/dbt/<build id>/ (the files dbt reads; never profiles.yml, "
+            "target/, logs/ or dbt_packages/), so the plan binds it and "
+            "apply refuses a checkout whose files differ. "
             "The tgz format is the canonical input to every downstream "
             "stage of the 11-stage pipeline."
         ),
@@ -235,6 +239,34 @@ def bundle_contract_id(compiled: Dict[str, Any]) -> str:
         or (data_product.get("id") if isinstance(data_product, dict) else None)
         or ""
     )
+
+
+def _dbt_projects(
+    compiled: Dict[str, Any], contract_path: Path
+) -> Optional[Tuple[Dict[str, Any], str]]:
+    """The dbt project of each dbt build as the tgz packs it, and the lines that report
+    them; ``None`` after saying why they cannot be packed.
+
+    Found as the dbt runner finds it (anchored at this contract, confined to its
+    workspace) and read as it is on disk
+    (``build_runners/dbt/project_files.py``). Function-local import: the build
+    runners stay off the ``--help`` path.
+    """
+    from fluid_build.build_runners.dbt.project_files import (
+        DbtProjectFilesError,
+        collect_bundle_projects,
+    )
+
+    try:
+        projects = collect_bundle_projects(compiled, contract_path.resolve())
+    except DbtProjectFilesError as e:
+        sys.stderr.write(f"❌ Bundle tgz build failed: {e}\n")
+        return None
+    report = "".join(
+        f"   dbt project: {build_id} ({len(files)} files, sources/dbt/{build_id}/)\n"
+        for build_id, files in projects.items()
+    )
+    return projects, report
 
 
 def _restores_logging_state(fn):
@@ -448,12 +480,17 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             overlay_path=overlay_path,
             overlay_warnings=[warning.message for warning in overlay_warnings],
         )
+        packed = _dbt_projects(compiled, Path(contract_path))
+        if packed is None:
+            return 1
+        dbt_projects, dbt_report = packed
         try:
             digest = build_bundle_tgz(
                 compiled,
                 Path(out),
                 contract_id=str(contract_id_raw),
                 source=source,
+                dbt_projects=dbt_projects,
             )
         except Exception as e:
             sys.stderr.write(f"❌ Bundle tgz build failed: {e}\n")
@@ -461,6 +498,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
         sys.stderr.write(f"✅ Bundle written to {out}\n")
         sys.stderr.write(f"   digest: {digest}\n")
+        sys.stderr.write(dbt_report)
         if env:
             applied = source.get("overlay") or "none (base contract)"
             sys.stderr.write(f"   env: {env} (overlay: {applied})\n")

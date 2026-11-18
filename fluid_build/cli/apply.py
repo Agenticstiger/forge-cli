@@ -1074,6 +1074,17 @@ def _verify_plan_digests(
 
     try:
         verify_plan_binding(plan_data, bundle_path=bundle_path)
+        if bundle_path is not None:
+            # The dbt projects the bundle packs: the checkout must still hold them,
+            # where the build runner will read them (its anchor for a plan).
+            from fluid_build._contract_loader import resolve_source_contract
+
+            _bind_dbt_projects(
+                plan_data.get("contract") or {},
+                Path(bundle_path),
+                lambda: resolve_source_contract(args.contract, plan_data=plan_data),
+                "the plan",
+            )
     except PlanBindingError as exc:
         # ``exc.kind`` is either ``bundle-mismatch`` or ``plan-tamper``.
         # Surface it as the stable event field so CI log parsers can match.
@@ -1082,6 +1093,170 @@ def _verify_plan_digests(
             f"apply_plan_digest_{exc.kind.replace('-', '_')}",
             context={"kind": exc.kind, "error": str(exc)},
         )
+
+
+def _bind_dbt_projects(
+    contract: Dict[str, Any],
+    bundle_path: Path,
+    locate: Callable[[], Tuple[Optional[Path], str]],
+    subject: str,
+) -> None:
+    """The dbt half of the stage-7 binding: the checkout holds the dbt code the bundle packs.
+
+    For each build whose project the bundle packs under ``sources/dbt/<build id>/``,
+    the build must be a dbt build of ``contract``, its project must be where the
+    dbt runner will read it (``resolve_dbt_project_path`` from the source contract
+    ``locate`` returns, where the runner anchors ``subject``), and the files dbt
+    reads there must be those bytes; and a dbt build the bundle packs nothing for
+    is refused too, so a bundle made before projects were packed is refused for a
+    contract with a dbt build. A contract without one binds nothing, and nothing is
+    looked up for it. Raises :class:`PlanBindingError` ``bundle-mismatch`` with what
+    differs.
+
+    The bound files are then set for this run, so the dbt runner checks the
+    directory it is about to run again, just before dbt starts
+    (``build_runners/dbt/runner.py::execute_dbt_build``).
+    """
+    from fluid_build.build_runners.dbt.project_files import (
+        BoundProject,
+        binds_dbt_project,
+        set_bound_projects,
+    )
+
+    from ..forge.core.bundle import read_bundle_dbt_trees
+    from ..forge.core.plan_digest import PlanBindingError
+
+    trees = read_bundle_dbt_trees(bundle_path)
+    builds = {
+        build.get("id"): build
+        for build in contract.get("builds") or []
+        if isinstance(build, dict) and isinstance(build.get("id"), str)
+    }
+    unpacked = sorted(i for i, b in builds.items() if binds_dbt_project(b) and i not in trees)
+    if unpacked:
+        raise PlanBindingError(
+            "bundle-mismatch",
+            f"{bundle_path} packs no dbt project for the dbt builds {unpacked}, so their dbt "
+            "code is not bound (a bundle made before fluid bundle packed dbt projects packs "
+            "none). Re-run ``fluid bundle`` and ``fluid plan``.",
+        )
+    if not trees:
+        return
+    anchor, why = locate()
+    bound: Dict[str, BoundProject] = {}
+    for build_id, files in sorted(trees.items()):
+        project = BoundProject(build_id=build_id, files=dict(files), bundle=str(bundle_path))
+        _check_bound_build(builds.get(build_id), project, anchor, f"{subject} {why}")
+        bound[build_id] = project
+    set_bound_projects(bound)
+
+
+def _check_bound_build(
+    build: Optional[Dict[str, Any]], bound: Any, anchor: Optional[Path], why: str
+) -> None:
+    """One packed project (a ``BoundProject``) against the checkout, as
+    :func:`_bind_dbt_projects` describes; ``why`` says why ``anchor`` is ``None``."""
+    from fluid_build.build_runners.dbt.project_files import binds_dbt_project, check_project
+    from fluid_build.build_runners.dbt.runner import resolve_dbt_project_path
+
+    from ..forge.core.plan_digest import PlanBindingError
+
+    build_id, files, bundle_path = bound.build_id, bound.files, bound.bundle
+    if build is None or not binds_dbt_project(build):
+        raise PlanBindingError(
+            "bundle-mismatch",
+            f"{bundle_path} packs a dbt project for build {build_id!r}, which is not a dbt "
+            "build of the contract it carries. Re-run ``fluid bundle`` and ``fluid plan``.",
+        )
+    if anchor is None:
+        raise PlanBindingError(
+            "bundle-mismatch",
+            f"{bundle_path} packs the dbt project of build {build_id!r}, and the checkout "
+            f"to check it against cannot be found: {why}. Run ``fluid apply`` in the "
+            "checkout the bundle was built from.",
+        )
+    project = resolve_dbt_project_path(anchor, dict(build))
+    if project is None:
+        raise PlanBindingError(
+            "bundle-mismatch",
+            f"{bundle_path} packs the dbt project of build {build_id!r} ({len(files)} files), "
+            f"and there is none where the build runs it: no dbt_project.yml for repository "
+            f"{build.get('repository', './')!r} from {anchor.parent}, or it is outside the "
+            "contract's workspace. Run ``fluid apply`` in the checkout the bundle was "
+            "built from.",
+        )
+    problem = check_project(project, files)
+    if problem is not None:
+        raise PlanBindingError(
+            "bundle-mismatch",
+            f"the dbt project of build {build_id!r} at {project} differs from the copy "
+            f"{bundle_path} packs: {problem}. Re-run ``fluid bundle`` and ``fluid plan`` to "
+            "bind the files as they are now, or restore them.",
+        )
+
+
+def _verify_bundle_dbt_projects(args, contract: Dict[str, Any], logger: logging.Logger) -> None:
+    """``fluid apply <bundle.tgz>``: the checkout holds the dbt code the bundle packs.
+
+    The plan-less twin of the check ``fluid apply plan.json`` runs (:func:`_bind_dbt_projects`),
+    anchored where the build runner anchors a bundle (the source contract its MANIFEST
+    records). ``--no-verify-plan-binding`` skips it, logged at WARNING.
+    """
+    from ..forge.core.plan_digest import PlanBindingError, is_bundle_path
+
+    if not is_bundle_path(str(args.contract)):
+        return
+    from fluid_build._contract_loader import resolve_source_contract
+    from fluid_build.build_runners.dbt.project_files import binds_dbt_project
+
+    from ..forge.core.bundle import read_bundle_dbt_trees
+
+    dbt_builds = [b for b in contract.get("builds") or [] if binds_dbt_project(b)]
+    if not dbt_builds and not read_bundle_dbt_trees(Path(args.contract)):
+        return
+    if getattr(args, "no_verify_plan_binding", False):
+        logger.warning(
+            "--no-verify-plan-binding: the dbt projects the bundle packs were NOT checked "
+            "against the checkout. Make sure this is recorded in the change log."
+        )
+        return
+    try:
+        _bind_dbt_projects(
+            contract,
+            Path(args.contract),
+            lambda: resolve_source_contract(args.contract),
+            "the bundle",
+        )
+    except PlanBindingError as exc:
+        raise CLIError(
+            1,
+            f"apply_plan_digest_{exc.kind.replace('-', '_')}",
+            context={"kind": exc.kind, "error": str(exc)},
+        )
+
+
+def _scopes_dbt_binding(fn: Callable[..., int]) -> Callable[..., int]:
+    """One binding scope per ``fluid apply``: its dbt runner re-checks what its own gate bound.
+
+    The bound files live in a context variable (``set_bound_projects``); this resets
+    it when the run returns, so a later apply in the same process starts unbound.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def _wrapper(args: argparse.Namespace, logger: logging.Logger) -> int:
+        from fluid_build.build_runners.dbt.project_files import (
+            reset_bound_projects,
+            set_bound_projects,
+        )
+
+        token = set_bound_projects(None)
+        try:
+            return fn(args, logger)
+        finally:
+            reset_bound_projects(token)
+
+    return _wrapper
 
 
 def _check_plan_mode(plan_data: Dict[str, Any], resolved_mode) -> None:
@@ -1956,6 +2131,7 @@ def _run_orchestrated_apply(
 
 @_traced_stage("apply")
 @reports_apply_run
+@_scopes_dbt_binding
 def run(args, logger: logging.Logger) -> int:
     """
     Main execution function for the apply command
@@ -2118,6 +2294,9 @@ def run(args, logger: logging.Logger) -> int:
     # and the native provider (see ``_load_apply_source``).
     try:
         source_contract = _load_apply_source(args, verified_plan_data, logger)
+        # A bundle given directly: its packed dbt projects against the checkout,
+        # as a plan's are checked by ``_load_verified_plan``.
+        _verify_bundle_dbt_projects(args, source_contract, logger)
     except CLIError as exc:
         _log_apply_failure(logger, start_time, exc)
         raise

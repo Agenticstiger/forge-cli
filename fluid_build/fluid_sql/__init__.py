@@ -13,9 +13,10 @@ to this module, is the conformance suite that forge-cli and flux-expr/2 both run
 - :func:`check` resolves its names against a :class:`Model` (one expose) and
   infers its type and static scale.
 - :func:`evaluate` computes its value for a row, exactly.
-- :func:`canonical` writes the canonical text; :func:`render_duckdb` the SQL a
-  DuckDB consumer runs (§2.8), and :func:`render_cel` the CEL a Confluent data-contract
-  rule runs (refusing what has no exact form).
+- :func:`canonical` writes the canonical text; :func:`render_sql` the SQL an engine
+  runs (§2.8; one of :data:`DIALECTS`, :func:`render_duckdb` for DuckDB), and
+  :func:`render_cel` the CEL a Confluent data-contract rule runs (refusing what has
+  no exact form).
 
 Standard library only, and never imported by ``fluid --help``.
 """
@@ -29,11 +30,31 @@ from ._evaluate import add_months, evaluate, months_between, round_fraction, yea
 from ._lexer import FUNCTIONS, KEYWORDS, MAX_CODE_POINTS, MAX_DEPTH, MAX_ROUND_PLACES
 from ._nodes import Node, from_json, to_json, walk
 from ._parser import parse
-from ._render import render_duckdb
+from ._render import (
+    DIALECTS,
+    MAX_RENDERED_CHARS,
+    RenderTooLarge,
+    column_reader,
+    exact_number_type,
+    number_literal,
+    render_duckdb,
+    render_sql,
+    sql_literal,
+    sql_name,
+)
 from ._render_cel import CelUntranslatable, render_cel
 from ._types import Column, ColumnType, Link, Model, SqlType, column_type
 
 __all__ = [
+    "DIALECTS",
+    "MAX_RENDERED_CHARS",
+    "RenderTooLarge",
+    "column_reader",
+    "exact_number_type",
+    "number_literal",
+    "render_sql",
+    "sql_literal",
+    "sql_name",
     "FUNCTIONS",
     "KEYWORDS",
     "MAX_CODE_POINTS",

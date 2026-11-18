@@ -59,6 +59,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table is refused beside a bucket-root output, a location forge registers with Lake Formation,
   and an output whose lifecycle expires its objects; a topic takes their place. The managed Flink
   lane refuses the block.
+- **A BigQuery table is partitioned and clustered as its binding declares.**
+  `binding.location.partitionBy` was read only with `lifecycle.expire`, and
+  `binding.properties.cluster_by` (honoured on Snowflake) was read by nobody on BigQuery. Both
+  were dropped without a word, and `fluid validate --strict` passed. A `partitionBy` naming one
+  DATE, TIMESTAMP or DATETIME column now partitions the table by day on it with or without
+  retention; retention adds only the partitions' expiry. `cluster_by` (a list, or one column as
+  a string) becomes the table's `clustering`, in the declared order: at most four top-level,
+  non-repeated columns of a type BigQuery clusters by. The provider changes clustering in place.
+  A `partitionBy` BigQuery cannot honour (more than one column, or one that is not a DATE,
+  TIMESTAMP or DATETIME column), a column it cannot cluster by, and either key on a view are now
+  refused at validate, naming the field; before, they were ignored. BigQuery cannot partition an
+  existing table, so a live table whose contract already declared `partitionBy` without
+  retention now plans a replacement, which `fluid apply` refuses without `--allow-data-loss`.
+  Adding retention later on the same column is an in-place change.
+
+- **The bundle packs the dbt project a build runs, and `fluid apply` refuses a checkout whose dbt
+  files changed.** A dbt build's models were read from the checkout at apply time, so a model
+  edited after `fluid plan` ran unreviewed. `fluid bundle --format tgz` now packs the dbt project
+  of each dbt build, found where the dbt runner reads it, under `sources/dbt/<build id>/`, byte for
+  byte: `dbt_project.yml`, `packages.yml`, `dependencies.yml`, `package-lock.yml`, `selectors.yml`,
+  `.dbtignore`, and every file under the directories the `*-paths` keys name, read as dbt-core
+  reads them (defaults models, macros, seeds, snapshots, tests, analyses and functions; a null key
+  takes its default; the deprecated `source-paths` and `data-paths`). It never packs
+  `profiles.yml`, `target/`, `logs/`, `dbt_packages/` (or what `target-path`, `log-path` and
+  `packages-install-path` name), or a file dbt never reads by its name (one starting with `.`, `#`
+  or `~`), and it refuses what it cannot bind: a symbolic link, a file dbt reads inside a hidden or
+  `__pycache__` directory (`.sql`, `.py`, `.csv`, `.md`, `.yml`, `.yaml`), an output directory
+  inside a read one, a `*-paths` entry outside the project, a `*-paths` or output entry written as
+  Jinja, a directory it cannot list, a missing or templated project, a file over 64 MiB and more
+  than 128 MiB of dbt files in one bundle. Each file is in the MANIFEST and under its merkle root,
+  so the same tree bundles to the same bytes. `fluid plan <bundle>` records each project's files as
+  `dbtProjects` under `planDigest`, and `fluid apply` compares the checkout with the bundle's copy
+  before anything runs; the dbt runner compares the directory it runs again, just before dbt
+  starts. A changed, added or removed file, and a dbt build the bundle packs no project for (as in
+  a bundle made before this change), fail with `apply_plan_digest_bundle_mismatch`, naming the
+  files; `--no-verify-plan-binding` skips the check, logged at WARNING. `fluid validate <bundle>`
+  reports one finding per packed project. Run `fluid generate dbt-tests` before `fluid bundle` and
+  the generated tests are bound with the models. Installed packages are not bound: dbt reads
+  whatever `packages-install-path` holds and `fluid apply` neither installs nor checks it, so
+  install them from `package-lock.yml` in the job that applies. A Git `repository` is not packed
+  (its ref pins it), a plan made from a contract file binds no dbt project, and plan and apply run
+  in the same checkout path (the plan records it). The Databricks job emitter now uploads the same
+  file selection.
 - **BigQuery holds the nested columns a contract declares.** A 0.7.7 column that declares its
   `element`, `fields`, or `key` and `value` was refused on BigQuery. It is now written as
   BigQuery holds it: an array as a REPEATED field of its element's type, a struct as a RECORD
@@ -103,6 +146,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
   task's `buildStepRef`: no generated DAG runs one.
 
+- **Declared invariants become ODCS quality rules.** On a 0.7.7 contract, `fluid generate
+  standard --format odcs` now writes each `exposes[].contract.invariants[]` entry, each
+  identifier format and placeholder declaration, each `sharedColumns` entry and each member of a
+  `sharedAttribute` as an executable ODCS quality rule. A check, derived column, summary over
+  child rows, functional dependency (once per direction with `bothWays`) or shared attribute is a
+  `sql` rule on the schema object whose query returns the violating rows, or violating rows times
+  100 divided by covered rows with `unit: percent`, compared with the invariant's own operator and
+  unit. The query is printed from the parsed expression in the expose's platform dialect (DuckDB,
+  Snowflake, BigQuery, Databricks, PostgreSQL or Athena), names the rule's own object `${table}`
+  and a linked expose by its quoted binding location, and joins a link to the target rows whose
+  key occurs once, so a missing or ambiguous link reads as NULL and no row is counted twice. An
+  identifier format sets the property's `logicalTypeOptions.pattern` and adds an `invalidValues`
+  rule with `arguments.pattern`; bounded placeholders add a `sql` rule counting placeholder rows,
+  unbounded ones a `text` rule; a derived column gets `transformLogic` and
+  `transformSourceObjects` where it has none. A declaration with no exact SQL (a platform with no
+  dialect, a link to another platform, one `fluid validate` refuses) becomes a `text` rule that
+  says why, and a logged warning. Every generated rule carries `customProperties`
+  `{property: fluidGenerated, value: true}`; an import that restores the declarations from
+  `fluidExtras` drops those rules, so FLUID -> ODCS -> FLUID loses no declaration and a re-export
+  is unchanged. Placeholder values are now exempt from the existing `invalidValues` rules: they
+  join an enum's `validValues` and extend a regex rule's pattern, and an enum on a column with
+  placeholder prefixes becomes a `sql` rule. `RFC-data-rules.md` describes the mapping.
+
+- **`fluid ship --require-artifacts KEYS` fails the run unless stage 3 writes what it promised.**
+  The keys are `generate artifacts`' emit keys: `odcs` needs one ODCS file per `exposes[]` port
+  of the bundled contract, `odps-bitol` the ODPS product, `opds` the OPDS document, `policies`
+  `policy/bindings.json` and `schedule` at least one schedule file. Ship removes the earlier
+  `dist/artifacts/MANIFEST.json` before stage 3 runs. A file counts only when the new MANIFEST
+  lists it and its digest on disk matches, so output left by an earlier run never passes. Stage 3
+  then fails with exit 1 and names every missing file (the port, for ODCS), in the log, in
+  `ship-report.json` and in the JUnit report. A run that cannot meet the requirement is refused
+  with exit 2 before stage 1, and `--explain` shows why: stage 3 does not run in this invocation
+  (`--stage`, `--until`, `--skip-stage`, `--no-generate-artifacts`, `RUN_STAGE_3_GENERATE_ARTIFACTS=false`),
+  or `--emit` / `GENERATE_EMIT` leaves a required key out.
+
 - **`fluid validate --diagnostics` and `--format sarif` point each finding at the line its author
   wrote.** A contract composed from `$ref` fragments and an `--env` overlay used to report most
   findings as a path into the composed document. With `--diagnostics`, each finding carries the
@@ -133,8 +211,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Withheld, by the check (CL_CONF_STATUS code): A (small count) 3.` A new line counts the
   histogram cells withheld inside published groups. Every other statistic keeps the check's code,
   and a profile 0.32.0 wrote still reads.
+- **`fluid profile --help` says what a published `min` or `max` leaves readable.** A `min` or
+  `max` shows that no record lies below or above it, a range of no records that no check
+  withholds (FLUX ADR 0012, amended 2026-11-18). A quantile whose value is the column's smallest
+  or largest shows the same, and under the defaults, which hold zeros disclosive, it is withheld
+  for that. The help and the output checks' documentation now say so. Nothing the profiler
+  writes changes.
+
 
 ### Fixed
+
+- **`fluid ship` generates artifacts for a reference-only contract.** Stage 3 skipped every
+  contract with a `hybrid-reference`, `reference` or `external-reference` build, even with
+  `--emit`, so stage 4 skipped too and the run exited 0 with no `MANIFEST.json`. `fluid generate
+  artifacts` has written ODCS, ODPS and policy artifacts for such contracts since May: they do
+  not depend on where the transformation runs. Stage 3 now runs for them as well. Stage 4 fails,
+  instead of skipping, when stage 3 was to write `dist/artifacts/` and did not; it still skips
+  under `--no-generate-artifacts`. A CI file from `fluid generate ci` still switches stage 3 off
+  by default for a reference-only contract.
 
 - **A quoted enum list in `validationRules` reads as SQL writes it.** Every reader cut an enum
   rule's `constraint` at every comma, so `constraint: "'base_fee', 'usage', 'fee, late'"` listed
