@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1 <= p <= 1000 and 0 <= s <= p)". Leading zeros still read by value, so `decimal(0012, 02)` is
   `decimal(12, 2)`. The conformance vectors gain 13 cases at the bounds, from `decimal(1)` and
   `decimal(1000, 1000)` to `decimal(0)` and `decimal(1000,1001)`.
+- **The ODCS export of a Databricks product names the Unity Catalog catalog its table is in.**
+  A Databricks binding names the catalog `location.database` (the emitter refuses
+  `location.catalog`, which selects an Iceberg catalog), but the ODCS exporter read only
+  `location.catalog`. Every contract `fluid apply` can deploy therefore exported
+  `catalog: ${DATABRICKS_CATALOG}`, and a consumer of the document (`datacontract test`, DQX, a
+  catalog) could not find the table. The `servers[]` entry now carries `location.database` as
+  `catalog`, with `location.catalog` as a fallback. The import maps a Databricks server's
+  `catalog` back to `location.database`, where it used to drop it, so an imported contract plans
+  and applies. The Entropy Data publish's companion ODCS contract gains the same `catalog` key
+  beside the keys it already wrote.
 
 ## [0.32.0] — 2026-11-18
 
