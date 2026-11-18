@@ -155,16 +155,18 @@ def test_the_plugin_is_discoverable_like_an_installed_package_only_inside_the_bl
         md.distribution("acme-onprem")
 
 
-def test_a_relative_root_stays_importable_after_the_working_directory_changes(
-    tmp_path, monkeypatch
-):
-    monkeypatch.chdir(tmp_path)
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    with installed_plugin(Path("site"), "acme-onprem", IAC_GROUPS, {IAC_MODULE: IAC_SOURCE}):
-        assert sys.path[0] == str(tmp_path / "site")
-        monkeypatch.chdir(elsewhere)
-        assert __import__(IAC_MODULE).OnPremPlugin.name == "onprem"
+def test_a_relative_root_stays_importable_after_the_working_directory_changes(tmp_path):
+    # Its own MonkeyPatch, undone at the end of the block: the test-wide one is
+    # undone after _no_inherited_policy has put the working directory back, and
+    # would then move the process into tmp_path/env for the next test.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.chdir(tmp_path)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        with installed_plugin(Path("site"), "acme-onprem", IAC_GROUPS, {IAC_MODULE: IAC_SOURCE}):
+            assert sys.path[0] == str(tmp_path / "site")
+            patch.chdir(elsewhere)
+            assert __import__(IAC_MODULE).OnPremPlugin.name == "onprem"
 
 
 def test_it_cleans_up_when_the_body_raises(tmp_path):

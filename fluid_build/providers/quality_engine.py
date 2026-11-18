@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fluid_build.providers._sql_safety import quote_string_literal_for
 from fluid_build.providers.validation_provider import ValidationIssue
+from fluid_build.util.column_type import read_enum_list
 
 LOG = logging.getLogger("fluid.providers.quality_engine")
 
@@ -174,7 +175,7 @@ def value_domain(rule: Dict[str, Any], columns: Any = None, column: Optional[str
     name = sub.get("selector") or ""
     enum = _column_constraint(columns, name, "enum")
     return ValueDomain(
-        values=tuple(v.strip() for v in re.split(r"[|,]", enum) if v.strip()) if enum else (),
+        values=tuple(read_enum_list(enum, "|,")) if enum else (),
         pattern=extract_value_pattern(sub, columns),
         bounds=tuple(parse_range(_column_constraint(columns, name, "range"))),
         reference=extract_reference(sub, columns),
@@ -492,7 +493,7 @@ def extract_valid_values(rule: Dict[str, Any], columns: Any = None) -> List[str]
                 return values
     enum = _column_constraint(columns, rule.get("selector") or "", "enum")
     if enum:
-        return [v.strip() for v in re.split(r"[|,]", enum) if v.strip()]
+        return read_enum_list(enum, "|,")
     return []
 
 

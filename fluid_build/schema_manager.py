@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Mapping, Opti
 
 import yaml
 
+from ._linear_patterns import linear_equivalent
 from ._validation_issues import json_pointer, message_pointer
 from .errors import ValidationError as FluidValidationError
 
@@ -383,15 +384,20 @@ def _end_anchored(pattern: str) -> str:
 
 @functools.lru_cache(maxsize=None)
 def _compiled_pattern(pattern: str) -> re.Pattern[str]:
-    return re.compile(_end_anchored(pattern))
+    return re.compile(_end_anchored(linear_equivalent(pattern)))
 
 
 def _pattern_keyword(validator: Any, pattern: str, instance: Any, schema: Any) -> Iterator[Any]:
-    """jsonschema's ``pattern`` keyword, with ``$`` read as ECMA-262 reads it."""
+    """jsonschema's ``pattern`` keyword, with ``$`` read as ECMA-262 reads it.
+
+    A pattern a bundled schema shipped that backtracks on long runs of spaces runs as
+    its linear-time equivalent (:mod:`fluid_build._linear_patterns`), here and in the
+    line-break check below. The message still quotes the schema's own pattern.
+    """
     if not validator.is_type(instance, "string") or _compiled_pattern(pattern).search(instance):
         return
     message = f"{instance!r} does not match {pattern!r}"
-    if re.search(pattern, instance):  # only the final line break fails
+    if re.search(linear_equivalent(pattern), instance):  # only the final line break fails
         message += LINE_BREAK_HINT
     yield jsonschema.ValidationError(message)
 
@@ -423,7 +429,8 @@ def _end_anchored_validator(validator_class: Any) -> Any:
 
 def schema_validator(schema: Mapping[str, Any], default: Any = None) -> Any:
     """A jsonschema validator for ``schema``, in the dialect it declares, whose
-    ``pattern`` ends at the end of the value (:func:`_end_anchored`). Validate
+    ``pattern`` ends at the end of the value (:func:`_end_anchored`) and runs a
+    known backtracking pattern as its linear-time equivalent. Validate
     against a FLUID schema, or a vendored or plugin one, through this, never
     ``validator_for`` directly. ``default`` is the dialect of a schema that
     declares none, jsonschema's newest when not given. Raises ``ImportError``

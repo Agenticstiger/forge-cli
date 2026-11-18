@@ -13,12 +13,12 @@ left out, so the lint still reports on the rest.
 
 from __future__ import annotations
 
-import re
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from fluid_build import fluid_sql as fs
+from fluid_build.util.column_type import read_enum_list
 
 
 def nfc(value: Any) -> Any:
@@ -75,9 +75,11 @@ class Expose:
 
 
 def enum_values(column: Mapping[str, Any]) -> Tuple[str, ...]:
-    """The values a column's ``validationRules`` enum lists, read as every forge reader reads
-    them: split at commas (the dbt bridge) and at ``|`` too (``fluid test``), so a literal is
-    refused only when no reader would accept it."""
+    """The values a column's ``validationRules`` enum lists (RFC 2.3), read twice: split at
+    commas (as the dbt bridge splits them) and at ``|`` too (as ``fluid test`` does), so a
+    literal is refused only when neither reading lists it. A value written as a quoted string
+    is read as SQL reads one, so ``'a, b'`` is one value and ``'O''Brien'`` is ``O'Brien``;
+    a list with no quoted value reads as it always has."""
     values: List[str] = []
     for rule in as_list(column.get("validationRules")):
         if not isinstance(rule, Mapping) or str(rule.get("type") or "").strip().lower() != "enum":
@@ -85,9 +87,9 @@ def enum_values(column: Mapping[str, Any]) -> Tuple[str, ...]:
         constraint = rule.get("constraint")
         if not isinstance(constraint, str):
             continue
-        for part in constraint.split(",") + re.split(r"[|,]", constraint):
-            part = nfc(part.strip())
-            if part and part not in values:
+        for part in read_enum_list(constraint) + read_enum_list(constraint, "|,"):
+            part = nfc(part)
+            if part not in values:
                 values.append(part)
     return tuple(values)
 

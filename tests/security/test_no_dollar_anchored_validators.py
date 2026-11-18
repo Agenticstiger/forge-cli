@@ -1461,15 +1461,16 @@ _ACCEPTED: Dict[Tuple[str, str, str], str] = {
     (
         "fluid_build/schema_manager.py",
         "_pattern_keyword",
-        "<run time: _end_anchored(pattern)>",
+        "<run time: _end_anchored(linear_equivalent(pattern))>",
     ): (
         "jsonschema's pattern keyword: _end_anchored() turns every $ into \\Z, and .search "
-        "is what JSON Schema itself runs"
+        "is what JSON Schema itself runs; linear_equivalent() only swaps a known "
+        "backtracking pattern for one that matches the same values"
     ),
     (
         "fluid_build/schema_manager.py",
         "_pattern_keyword",
-        "<run time: pattern>",
+        "<run time: linear_equivalent(pattern)>",
     ): "only picks the error message, after the \\Z check above has refused the value",
 }
 

@@ -67,6 +67,7 @@ from typing import Any, Mapping, Sequence
 
 # Key recognition lives in ``util.contract`` so ``fluid diff`` judges a key the way this
 # engine builds one without importing every engine; re-exported for ``_tm.*`` callers.
+from ...util.column_type import read_enum_list
 from ...util.contract import column_is_key, is_truthy  # noqa: F401
 
 # ── Package prefixes / canonical test names ───────────────────────────────
@@ -322,7 +323,7 @@ def column_enum_values(col: Mapping[str, Any]) -> list[Any]:
     for rule in _rules_of_type(col, "enum"):
         constraint = rule.get("constraint")
         if isinstance(constraint, str):
-            vals = [v.strip() for v in constraint.split(",") if v.strip()]
+            vals = read_enum_list(constraint)
             if vals:
                 return vals
     return []
