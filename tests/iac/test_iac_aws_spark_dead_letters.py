@@ -239,3 +239,12 @@ def test_two_builds_never_share_a_dead_letters_table(contract):
     with pytest.raises(UnsupportedBindingError) as caught:
         emit(contract)
     assert caught.value.kind == "spark-address-conflict"
+
+
+def test_a_tls_source_needs_no_write_entry_and_gets_no_grant(contract):
+    """Without MSK IAM the cluster's own ACLs decide who writes the topic: forge grants
+    nothing, so the operator lists nothing."""
+    contract["builds"][0]["properties"]["parameters"]["spark"]["source"]["auth"] = "none"
+    _, data = emit(with_dead_letters(contract, sink="topic", topic="commerce.orders.dlq"))
+    sids = {s.get("sid") for s in data["aws_iam_policy_document"][f"{KEY}_access"]["statement"]}
+    assert not sids & {"MskDeadLetterTopic", "MskIdempotentWrite"}

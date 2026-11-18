@@ -408,3 +408,13 @@ def test_the_runner_names_the_columns_the_compiler_does(runner):
     )
     aliases = [s.rsplit(" AS ", 1)[1].strip("`") for s in runner.DEAD_LETTER_SELECT]
     assert aliases == [name for name, _, _ in dead_letter.COLUMNS]
+
+
+def test_a_seed_names_every_partition_the_topic_has_now(runner):
+    """Spark refuses starting offsets that leave a partition out; one added since starts
+    at its beginning, as the output reads a partition it discovers."""
+    seed = '{"source.events": {"0": 9, "1": 3}}'
+    assert runner.with_every_partition(seed, [0, 1, 2]) == (
+        '{"source.events": {"0": 9, "1": 3, "2": -2}}'
+    )
+    assert runner.with_every_partition(seed, None) == seed  # unknown: as read
