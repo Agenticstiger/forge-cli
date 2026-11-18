@@ -1501,7 +1501,7 @@
         "deadLetter": {
           "type": "object",
           "additionalProperties": false,
-          "description": "NEW in v0.7.7 (preview): What forge's Spark runner does with a record it cannot land: a value or key that is not the declared JSON or Avro, a field of another type, or a required field that is null. With deadLetter, each such record goes to a dead-letter sink, with its raw bytes, the reason, and its topic, partition and offset, and the stream keeps running; without it, or with enabled: false, the first such record fails the stream. The keys follow the acquisition lane's dlq (enabled, maxRecordsBeforeAbort, alertOn). A Spark stream only: managed Flink refuses the key.",
+          "description": "NEW in v0.7.7 (preview): What forge's Spark runner does with a record it cannot land: a value or key that is not the declared JSON, a field of another type, or a required field that is null (an Avro stream's dead letters are not supported yet). With deadLetter, each such record goes to a dead-letter sink, with its raw bytes, the reason, and its topic, partition and offset, and the stream keeps running; without it, or with enabled: false, the first such record fails the stream. The keys follow the acquisition lane's dlq (enabled, maxRecordsBeforeAbort, alertOn). A Spark stream only: managed Flink refuses the key.",
           "properties": {
             "enabled": {
               "type": "boolean",

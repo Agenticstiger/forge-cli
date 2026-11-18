@@ -280,14 +280,7 @@ def identity_findings(
                 f"Spark build {bid}: parameters.spark.source.mskClusterArn {cluster} is not "
                 f"in {TARGET_ALLOWLIST_ENV} (as msk:{cluster})"
             )
-        topic = _dead_letter_topic(build)
-        entry = f"msk-write:{cluster}/{topic}"
-        if topic and not cfg.get("executionRoleArn"):
-            if entry not in _entries(TARGET_ALLOWLIST_ENV, environ):
-                missing.append(
-                    f"Spark build {bid}: properties.stream.deadLetter.topic {topic} is not in "
-                    f"{TARGET_ALLOWLIST_ENV} (as {entry}); the role forge creates would write it"
-                )
+        missing += _unlisted_dead_letter_topic(build, cfg, cluster, environ)
     arn = cfg.get("executionRoleArn")
     # A local run (runtime local) ignores the AWS role: it runs as its machine's user.
     if arn is not None and cfg.get("runtime") != "local":
@@ -315,6 +308,27 @@ MSK_ARN = re.compile(
     r"arn:aws[a-z-]*:kafka:(?P<region>[a-z0-9-]+):(?P<account>[0-9]{12}):cluster/"
     r"(?P<name>[A-Za-z0-9_.-]{1,64})/(?P<uuid>[A-Za-z0-9-]{1,128})"
 )
+
+
+def _unlisted_dead_letter_topic(
+    build: Mapping[str, Any],
+    cfg: Mapping[str, Any],
+    cluster: str,
+    environ: Optional[Mapping[str, str]],
+) -> List[str]:
+    """The dead letters' topic, when the role forge creates would write it unlisted: on MSK
+    with IAM (the compiler's default for a cluster ARN), the one auth it grants."""
+    topic = _dead_letter_topic(build)
+    source = cfg.get("source") if isinstance(cfg.get("source"), Mapping) else {}
+    if not topic or cfg.get("executionRoleArn") or source.get("auth", "msk-iam") != "msk-iam":
+        return []
+    entry = f"msk-write:{cluster}/{topic}"
+    if entry in _entries(TARGET_ALLOWLIST_ENV, environ):
+        return []
+    return [
+        f"Spark build {build.get('id')}: properties.stream.deadLetter.topic {topic} is not in "
+        f"{TARGET_ALLOWLIST_ENV} (as {entry}); the role forge creates would write it"
+    ]
 
 
 def _dead_letter_topic(build: Mapping[str, Any]) -> Optional[str]:
@@ -542,6 +556,27 @@ class JobAccess:
     dead_letter_topic: Optional[str] = None
 
 
+def _dead_letter_topic_statements(msk: MskSource, topic: str) -> List[Dict[str, Any]]:
+    """Writing the dead letters' topic. They are the records' own bytes: no registry is read
+    or written. A Kafka producer is idempotent by default (KIP-679), and MSK authorizes that
+    on the cluster, never on a topic."""
+    scope, tail = f"{msk.region}:{msk.account}", f"{msk.name}/{msk.uuid}"
+    return [
+        {
+            "sid": "MskDeadLetterTopic",
+            "effect": "Allow",
+            "actions": ["kafka-cluster:DescribeTopic", "kafka-cluster:WriteData"],
+            "resources": [f"arn:aws:kafka:{scope}:topic/{tail}/{topic}"],
+        },
+        {
+            "sid": "MskIdempotentWrite",
+            "effect": "Allow",
+            "actions": ["kafka-cluster:WriteDataIdempotently"],
+            "resources": [msk.arn],
+        },
+    ]
+
+
 def secret_resources(arn: Any) -> List[Any]:
     """A secret as policy resources: as written, and with the random ``-??????`` suffix
     Secrets Manager appends, since a name or partial ARN cannot be told from a full ARN
@@ -696,27 +731,7 @@ def access_document(access: JobAccess) -> Dict[str, Any]:
             ]
         )
         if access.dead_letter_topic:
-            # The dead letters are the records' own bytes: no registry is read or written.
-            # A Kafka producer is idempotent by default (KIP-679), and MSK authorizes that
-            # on the cluster, never on a topic.
-            statements.extend(
-                [
-                    {
-                        "sid": "MskDeadLetterTopic",
-                        "effect": "Allow",
-                        "actions": ["kafka-cluster:DescribeTopic", "kafka-cluster:WriteData"],
-                        "resources": [
-                            f"arn:aws:kafka:{scope}:topic/{tail}/{access.dead_letter_topic}"
-                        ],
-                    },
-                    {
-                        "sid": "MskIdempotentWrite",
-                        "effect": "Allow",
-                        "actions": ["kafka-cluster:WriteDataIdempotently"],
-                        "resources": [msk.arn],
-                    },
-                ]
-            )
+            statements.extend(_dead_letter_topic_statements(msk, access.dead_letter_topic))
     if access.secret_arns:
         secrets = [r for a in access.secret_arns for r in secret_resources(a)]
         statements.extend(

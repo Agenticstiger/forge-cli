@@ -713,7 +713,6 @@ def compile_job_config(
     source: Optional[dict[str, Any]] = None
     source_sql: Optional[str] = None
     dead_letters: Optional[dict[str, Any]] = None
-    check_sql: Optional[str] = None
     streaming: dict[str, Any] = {"trigger": None, "watermark": None, "checkpoint": None}
     masked: list[str] = []
     if stream_spec is not None:
@@ -735,20 +734,7 @@ def compile_job_config(
         offsets = stream_spec.get("startingOffsets", "latest")
         if offsets not in ("earliest", "latest"):
             raise ValueError(f"{swhere}.startingOffsets: expected earliest or latest")
-        dead = dead_letter.parse(stream_spec.get("deadLetter"), swhere)
-        if dead is not None:
-            _refuse_corrupt_column_name(stream, swhere)
-            if "avro-confluent" in (stream.format, stream.key_format):
-                raise ValueError(
-                    f"{swhere}.deadLetter: an Avro stream's dead letters are not supported "
-                    "yet: the decoder's permissive mode would also turn a schema registry "
-                    "outage into dead letters"
-                )
-            if dead["topic"] is not None and dead["topic"] == stream_spec.get("topic"):
-                raise ValueError(
-                    f"{swhere}.deadLetter.topic: the stream's own topic; the stream would read "
-                    "its dead letters again"
-                )
+        dead = _parsed_dead_letters(stream_spec, stream, swhere)
         decoders = _decoders(stream, registry, dead_letters=dead is not None)
         source = {
             "kind": "kafka",
@@ -771,7 +757,7 @@ def compile_job_config(
             dead_letters = _dead_letter_block(
                 dead, database, table, streaming["checkpoint"], local, swhere
             )
-            check_sql = dead_letter.check_select(stream, decoders)
+            dead_letters["check"] = dead_letter.check_select(stream, decoders)
         if sql is None:
             select = compile_select(
                 stream,
@@ -815,12 +801,38 @@ def compile_job_config(
         "maskKey": {"secretArn": mask_key} if masked else None,
     }
     if dead_letters is not None:
-        # A build that masks fields at ingest sends no raw bytes: they hold those in clear.
-        dead_letters["raw"] = not masked
-        # Only then: a stream without dead letters keeps the job config, and the hash, it had.
-        config["deadLetter"] = dead_letters
-        config["sql"]["check"] = check_sql
+        _add_dead_letters(config, dead_letters, masked=bool(masked))
     return SparkJob(config)
+
+
+def _parsed_dead_letters(stream_spec: Mapping[str, Any], stream: Any, where: str) -> Any:
+    """``properties.stream.deadLetter``, checked against the stream it routes; None when
+    the stream has none."""
+    dead = dead_letter.parse(stream_spec.get("deadLetter"), where)
+    if dead is None:
+        return None
+    _refuse_corrupt_column_name(stream, where)
+    if "avro-confluent" in (stream.format, stream.key_format):
+        raise ValueError(
+            f"{where}.deadLetter: an Avro stream's dead letters are not supported yet: the "
+            "decoder's permissive mode would also turn a schema registry outage into dead "
+            "letters"
+        )
+    if dead["topic"] is not None and dead["topic"] == stream_spec.get("topic"):
+        raise ValueError(
+            f"{where}.deadLetter.topic: the stream's own topic; the stream would read its dead "
+            "letters again"
+        )
+    return dead
+
+
+def _add_dead_letters(config: dict[str, Any], block: dict[str, Any], *, masked: bool) -> None:
+    """The ``deadLetter`` block and its ``sql.check``, only for a stream that has them: one
+    without keeps the job config, and the hash, it had."""
+    # A build that masks fields at ingest sends no raw bytes: they hold those in clear.
+    block["raw"] = not masked
+    config["sql"]["check"] = block.pop("check")
+    config["deadLetter"] = block
 
 
 def _refuse_corrupt_column_name(stream: Any, where: str) -> None:

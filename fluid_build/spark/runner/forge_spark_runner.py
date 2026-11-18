@@ -734,10 +734,48 @@ def dead_letter_start(spark, config: dict) -> str | None:
     checkpoint = config["checkpoint"]
     done = [int(n) for n in _names(spark, f"{checkpoint}commits") if n.isdigit()]
     if done:
-        return source_offsets(_read_small(spark, f"{checkpoint}offsets/{max(done)}"), 2)
-    if "0" in _names(spark, f"{checkpoint}sources/0"):
-        return source_offsets(_read_small(spark, f"{checkpoint}sources/0/0"), 1)
-    return None
+        found = source_offsets(_read_small(spark, f"{checkpoint}offsets/{max(done)}"), 2)
+    elif "0" in _names(spark, f"{checkpoint}sources/0"):
+        found = source_offsets(_read_small(spark, f"{checkpoint}sources/0/0"), 1)
+    else:
+        return None
+    return with_every_partition(found, topic_partitions(spark, config)) if found else None
+
+
+def with_every_partition(offsets: str, partitions: list | None) -> str:
+    """``offsets`` with each partition of the topic it lacks (one added since) at its start
+    (``-2``), as the output query reads a partition it discovers: Spark refuses specific
+    starting offsets that do not name every partition. Unchanged when they are unknown."""
+    if partitions is None:
+        return offsets
+    parsed = json.loads(offsets)
+    for topic, parts in parsed.items():
+        for partition in partitions:
+            parts.setdefault(str(partition), -2)
+    return json.dumps(parsed, sort_keys=True)
+
+
+def topic_partitions(spark, config: dict) -> list | None:
+    """The source topic's partitions, from Kafka with the job's own connection settings;
+    None when they cannot be read (Spark then reports what it lacks)."""
+    try:
+        jvm = spark.sparkContext._jvm
+        props = jvm.java.util.Properties()
+        for key, value in kafka_options(config["source"]).items():
+            if key.startswith("kafka."):
+                props.setProperty(key[len("kafka.") :], str(value))
+        deserializer = "org.apache.kafka.common.serialization.ByteArrayDeserializer"
+        props.setProperty("key.deserializer", deserializer)
+        props.setProperty("value.deserializer", deserializer)
+        consumer = jvm.org.apache.kafka.clients.consumer.KafkaConsumer(props)
+        try:
+            found = consumer.partitionsFor(config["source"]["topic"])
+            return sorted(int(info.partition()) for info in found) if found else None
+        finally:
+            consumer.close()
+    except Exception as exc:  # noqa: BLE001 - Py4J's error: logged, the seed stays as read
+        log("dead_letters_partitions_unknown", error=type(exc).__name__)
+        return None
 
 
 def await_initial_offsets(spark, checkpoint: str, query, timeout: float = 300.0) -> str | None:

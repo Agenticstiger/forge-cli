@@ -429,12 +429,7 @@ def _emit_build(
     database, table = config["sink"]["table"].split(".", 1)
     vpc = b.runtime == "glue" and cluster is not None
     jars = _glue_jars(blocks, b, bucket_ref) if b.runtime == "glue" else ()
-    dead = config.get("deadLetter") or {}
-    dead_table = dead["table"].split(".", 1)[1] if dead.get("sink") == "table" else None
-    dead_prefix = None
-    if dead_table:
-        _refuse_unsupported_dead_letter_table(b, contract, expose, data_prefix)
-        dead_prefix = _dead_letter_prefix(data_prefix, dead_table)
+    dead_table, dead_prefix, dead_topic = _dead_letters(b, contract, expose, data_prefix, iam)
     access = aws_identity.JobAccess(
         region=b.region,
         account=ctx.account,
@@ -453,19 +448,12 @@ def _emit_build(
         glue_vpc=vpc,
         glue_subnet_arn=tofu_ref(f"data.aws_subnet.{b.key}.arn") if vpc else None,
         dead_letter_table=dead_table,
-        dead_letter_topic=dead.get("topic") if dead.get("sink") == "topic" and iam else None,
+        dead_letter_topic=dead_topic,
     )
     role_arn = _emit_role(blocks, b, access, application_id)
     if dead_table and dead_prefix:
-        _emit_dead_letter_table(
-            blocks,
-            contract,
-            expose,
-            b,
-            dead_table,
-            dead_prefix,
-            None if b.runtime == "emr-ec2" else role_arn,
-        )
+        principal = None if b.runtime == "emr-ec2" else role_arn
+        _emit_dead_letter_table(blocks, contract, expose, b, dead_table, dead_prefix, principal)
     overwrites = job.config["mode"] == "batch"
     # On emr-ec2 the cluster's own role writes, which forge does not know.
     principal = None if b.runtime == "emr-ec2" else role_arn
@@ -826,11 +814,7 @@ def _s3_grants(
             _refuse_unless_products_prefix(b.where, b.ctx, bucket, data_prefix)
     by_bucket: Dict[str, Tuple[List[str], List[str]]] = {bucket: ([data_prefix], [b.artifacts])}
     if dead_letters is not None:
-        if owned:
-            dead_letters = _scoped(b, bucket, dead_letters, "the dead letters' location")
-            if shared:
-                _refuse_unless_products_prefix(b.where, b.ctx, bucket, dead_letters)
-        by_bucket[bucket][0].append(dead_letters)
+        by_bucket[bucket][0].append(_dead_letter_grant(b, bucket, dead_letters, owned, shared))
     checkpoint = str(b.config.get("checkpoint") or "")
     if checkpoint:
         ck_bucket, ck_prefix = _split_s3(checkpoint)
@@ -864,6 +848,31 @@ def _s3_grants(
         )
         for name, (write, read) in by_bucket.items()
     )
+
+
+def _dead_letters(
+    b: _Build, contract: Mapping[str, Any], expose: Mapping[str, Any], data_prefix: str, iam: bool
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """The stream's dead letters on AWS: ``(table, its prefix, topic)``. The topic only on
+    MSK with IAM, where the role needs a grant to write it."""
+    dead = b.config.get("deadLetter") or {}
+    if dead.get("sink") == "topic":
+        return None, None, (dead.get("topic") if iam else None)
+    if dead.get("sink") != "table":
+        return None, None, None
+    table = dead["table"].split(".", 1)[1]
+    _refuse_unsupported_dead_letter_table(b, contract, expose, data_prefix)
+    return table, _dead_letter_prefix(data_prefix, table), None
+
+
+def _dead_letter_grant(b: _Build, bucket: str, prefix: str, owned: bool, shared: bool) -> str:
+    """The dead letters' prefix a role forge creates writes, checked as the output's is."""
+    if not owned:
+        return prefix
+    prefix = _scoped(b, bucket, prefix, "the dead letters' location")
+    if shared:
+        _refuse_unless_products_prefix(b.where, b.ctx, bucket, prefix)
+    return prefix
 
 
 def _dead_letter_prefix(data_prefix: str, dead_table: str) -> str:
