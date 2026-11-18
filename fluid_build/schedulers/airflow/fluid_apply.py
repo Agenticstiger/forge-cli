@@ -490,6 +490,34 @@ def _trigger_schedule(build: Dict[str, Any], managed: bool = True) -> Optional[D
     return trigger if kind == _CRON else None
 
 
+def _keepalive_dags(
+    contract: Dict[str, Any], builds: List[Dict[str, Any]], managed: bool
+) -> List[ScheduledDag]:
+    """One keepalive DAG per always-on stream that declares ``execution.retries``.
+
+    Its one task runs ``fluid apply --mode reconcile`` for the stream every few minutes, so a
+    stream a Spot interruption or a failed driver stopped starts again, within the restart
+    budget the build's ``execution.retries`` sets. A stream is in no build graph (nothing waits
+    for it), so this reads the builds alone. It has no outlets: a stream updates its tables all
+    the time, and an asset event on every run would start each DAG scheduled on them.
+    """
+    out: List[ScheduledDag] = []
+    for build in builds:
+        if not _keeps_alive(build, managed):
+            continue
+        build_id = _task_build_id(build)
+        _check_spark_ids(contract, build_id)
+        out.append(
+            ScheduledDag(
+                build_id=build_id,
+                schedule=DagSchedule(cron=_keepalive_schedule(build), timezone="UTC"),
+                tasks=(BuildTask(build_id, 0, KEEPALIVE_TASK_TIMEOUT_S),),
+                keepalive=True,
+            )
+        )
+    return out
+
+
 def has_scheduled_builds(contract: Dict[str, Any]) -> bool:
     """True when at least one build declares a trigger a DAG runs on (no validation): a cron,
     datasets, or both."""
@@ -1043,30 +1071,6 @@ class _BuildGraph:
                 "schedule (trigger.type: schedule)"
             )
 
-    def keepalives(self) -> List[ScheduledDag]:
-        """One keepalive DAG per always-on stream that declares ``execution.retries``.
-
-        Its one task reconciles the stream every few minutes, so a stream a Spot interruption
-        or a failed driver stopped starts again; the build's own retries bound how often. It
-        has no outlets: a stream updates its tables all the time, and an asset event on every
-        run would start each DAG scheduled on them.
-        """
-        out: List[ScheduledDag] = []
-        for build in self.builds:
-            if not _keeps_alive(build, self.managed):
-                continue
-            build_id = _task_build_id(build)
-            _check_spark_ids(self.contract, build_id)
-            out.append(
-                ScheduledDag(
-                    build_id=build_id,
-                    schedule=DagSchedule(cron=_keepalive_schedule(build), timezone="UTC"),
-                    tasks=(BuildTask(build_id, 0, KEEPALIVE_TASK_TIMEOUT_S),),
-                    keepalive=True,
-                )
-            )
-        return out
-
     def _why_no_task(self, build: Dict[str, Any]) -> str:
         kind, trigger = _classify(build, self.managed)
         if kind == _OUTSIDE:
@@ -1135,7 +1139,7 @@ def scheduled_dags(contract: Dict[str, Any]) -> List[ScheduledDag]:
         return []
     graph = _BuildGraph(contract, [b for b in raw_builds if isinstance(b, dict)])
     dags = [dag for members in graph.groups() if (dag := graph.dag(members)) is not None]
-    dags += graph.keepalives()
+    dags += _keepalive_dags(contract, graph.builds, graph.managed)
     seen: Set[str] = set()
     for task in (t for dag in dags for t in dag.tasks):
         if task.build_id in seen:
