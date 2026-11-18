@@ -197,6 +197,17 @@ Use Cases:
             "that verified nothing."
         ),
     )
+    p.add_argument(
+        "--require-every-port",
+        dest="require_every_port",
+        action="store_true",
+        help=(
+            "Exit non-zero unless every expose was verified: one that was skipped (no "
+            "verifier for its binding, or a reference-only table not built yet) fails "
+            "the run and is named, so one verified port never stands for all. "
+            "--warn-only does not downgrade it. Not with --expose."
+        ),
+    )
 
     p.add_argument("--out", help="Output verification report to JSON file")
 
@@ -1377,6 +1388,31 @@ def _named(names: List[str], limit: int = 5) -> str:
     return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
 
 
+def _unverified_ports(unsupported: List[str], not_built: List[str]) -> List[str]:
+    """Each expose that was not verified, with why, in the order they were checked."""
+    return [f"{name} (no verifier for the binding)" for name in unsupported] + [
+        f"{name} (reference-only, not built yet)" for name in not_built
+    ]
+
+
+def _unverified_ports_fail(
+    args: argparse.Namespace, unsupported: List[str], not_built: List[str]
+) -> bool:
+    """Does ``--require-every-port`` fail? Every expose has to be verified: a
+    skipped one fails the run, however many others passed. ``--warn-only`` does
+    not downgrade it, as it downgrades no check a caller asked for by name."""
+    if not getattr(args, "require_every_port", False):
+        return False
+    missing = _unverified_ports(unsupported, not_built)
+    if not missing:
+        return False
+    console_error(
+        f"--require-every-port: {len(missing)} expose(s) were not verified: "
+        f"{'; '.join(missing)}. Every expose has to be verified for this run to pass."
+    )
+    return True
+
+
 def _nothing_verified_fails(
     args: argparse.Namespace, checked: int, unsupported: List[str], not_built: List[str]
 ) -> bool:
@@ -1541,6 +1577,17 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     elif isinstance(exposes, dict):
         exposes_dict = exposes
 
+    if args.expose_id and getattr(args, "require_every_port", False):
+        raise CLIError(
+            2,
+            "verify_require_every_port_with_expose",
+            {
+                "message": (
+                    "--require-every-port checks every expose; --expose verifies one. "
+                    "Drop one of them."
+                ),
+            },
+        )
     if args.expose_id:
         if args.expose_id not in exposes_dict:
             raise CLIError(
@@ -2136,6 +2183,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             },
             "results": results,
         }
+        if getattr(args, "require_every_port", False):
+            report["require_every_port"] = {
+                "unverified": _unverified_ports(unsupported_exposes, not_built_exposes)
+            }
         if reconcile_report is not None:
             report["reconcile"] = reconcile_report.to_dict()
         if lineage_report is not None:
@@ -2215,6 +2266,8 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     checked_count = len(results) - unsupported_count - not_built_count + probe_check_count
     if _nothing_verified_fails(args, checked_count, unsupported_exposes, not_built_exposes):
+        return 1
+    if _unverified_ports_fail(args, unsupported_exposes, not_built_exposes):
         return 1
 
     # Exit with error code if strict mode and CRITICAL issues found.

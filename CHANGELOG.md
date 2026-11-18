@@ -213,6 +213,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--explain` says why. A release run reads only local files: it opens no network connection
   of its own.
 
+- **`fluid verify --require-every-port` fails unless every expose was verified.** `--strict`
+  fails only a run that verified nothing, so a run that verified one port passed while its
+  others were skipped. With the flag, each skipped expose fails the run (exit 1) and is named
+  with why: no verifier for the binding, or a reference-only table not built yet. It needs no
+  `--strict`, `--warn-only` does not downgrade it, and `--expose` beside it is refused (exit
+  2). The `--out` report lists the unverified exposes under `require_every_port`. `fluid ship
+  --release-dir` passes it to stage 9, so a release never stands for a port nobody verified.
+
 ### Changed
 
 - **`ship-report.json` is versioned: `"schema": "fluid-ship-report/2"`.** Every stage has one
