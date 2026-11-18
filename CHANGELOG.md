@@ -30,8 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generation with what to change. A dependency on a stream that `fluid apply` keeps running is
   not waited for, and the DAG's documentation says so. A contract whose only builds are such
   streams now gets "No build needs a DAG" from `fluid generate schedule`, not "No scheduler
-  engine specified". `fluid validate` warns about an Airflow task's `buildStepRef`: no
-  generated DAG runs one.
+  engine specified", and `fluid scaffold-composer` agrees. With `--overwrite`, `fluid generate
+  schedule` removes the DAG files an earlier run wrote into the output directory for the same
+  product and env that the contract no longer makes (a build that now runs as a task of
+  another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
+  task's `buildStepRef`: no generated DAG runs one.
 
 ### Fixed
 

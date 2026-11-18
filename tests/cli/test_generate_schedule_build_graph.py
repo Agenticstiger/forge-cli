@@ -109,3 +109,58 @@ def test_dag_id_and_schedule_overrides_stay_refused_for_a_build_graph(
     with caplog.at_level(logging.ERROR):
         assert _generate(tmp_path, monkeypatch, "--dag-id", "x") == 2
     assert "generate_schedule_override_not_supported" in caplog.text
+
+
+def test_the_composer_scaffold_agrees_that_streams_need_no_dag(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    from types import SimpleNamespace
+
+    from fluid_build.cli.scaffold_composer import run as scaffold_composer
+
+    contract = tmp_path / "contract.fluid.yaml"
+    stream = dict(SPARK_CONTRACT["builds"][0], execution={"trigger": {"cron": "@daily"}})
+    contract.write_text(yaml.safe_dump(dict(SPARK_CONTRACT, builds=[stream])), "utf-8")
+    args = SimpleNamespace(contract=str(contract), env=None, out_dir=str(tmp_path / "dags"))
+    assert scaffold_composer(args, LOG) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "as a stream that fluid apply keeps running" in out and "No DAG written." in out
+    assert not (tmp_path / "dags").exists()
+
+
+def test_regenerating_removes_a_dag_whose_build_now_runs_in_another(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """With --overwrite, a fluid apply DAG an earlier run wrote for this product and env that
+    the contract no longer makes is removed: left there, its build would run twice."""
+    contract = events_pipeline()
+    contract["builds"][2].pop("dependencies")
+    contract["builds"][2]["execution"] = {"trigger": {"type": "schedule", "schedule": "@daily"}}
+    _project(tmp_path, contract)
+    assert _generate(tmp_path, monkeypatch) == 0
+    out = tmp_path / "out"
+    assert (out / "daily_users_dag.py").exists()
+    other_env = fluid_apply_render(contract, "aws")["daily_users_dag.py"]
+    (out / "daily_users_other_env_dag.py").write_text(other_env, encoding="utf-8")
+    (out / "not_ours_dag.py").write_text(
+        '"""A DAG someone wrote."""\nPRODUCT_ID = "platform.events"\n'
+    )
+    capsys.readouterr()
+
+    _project(tmp_path, events_pipeline())  # daily-users depends on daily-curated again
+    assert _generate(tmp_path, monkeypatch, "--overwrite") == 0
+    assert sorted(p.name for p in out.iterdir()) == [
+        "daily_curated_dag.py",
+        "daily_users_other_env_dag.py",
+        "hourly_marts_dag.py",
+        "not_ours_dag.py",
+    ]
+    assert "daily_users_dag.py: an earlier run wrote it for this product and env" in (
+        " ".join(capsys.readouterr().out.split())
+    )
+
+
+def fluid_apply_render(contract: dict, env: str) -> dict:
+    from fluid_build.schedulers.airflow import fluid_apply
+
+    return fluid_apply.render_fluid_apply_dags(contract, env=env, contract_path=CONTRACT)

@@ -43,7 +43,8 @@ def should_generate_dag(contract: dict, template: str = None) -> bool:
 
     Auto-generate DAGs when:
     1. Contract has explicit orchestration config
-    2. A build has a cron trigger (what ``generate_dag_for_project`` writes a DAG for)
+    2. A build has a trigger a DAG runs on, a cron or datasets (what
+       ``generate_dag_for_project`` writes a DAG for)
     3. Template is orchestration-focused (customer-360, sales-analytics, ml-features, data-quality)
     4. Project has multiple provider actions (complex pipeline)
     """
@@ -101,8 +102,8 @@ def generate_dag_for_project(
             fluid_apply.has_scheduled_builds(loaded) or fluid_apply.has_explicit_tasks(loaded)
         ):
             return _no_dag(
-                "the contract schedules nothing (no build has a cron trigger and there "
-                "are no orchestration.tasks)",
+                "the contract schedules nothing (no build has a trigger a DAG runs on, a "
+                "cron or datasets, and there are no orchestration.tasks)",
                 logger,
                 console,
             )

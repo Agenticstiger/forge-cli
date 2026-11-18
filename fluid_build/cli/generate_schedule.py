@@ -32,7 +32,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 from fluid_build.cli.console import cprint
 
@@ -204,17 +204,22 @@ def run(args: Any, logger: logging.Logger) -> int:
                         "schedule from its own trigger"
                     },
                 )
+            dag_env = getattr(args, "dag_env", None) or getattr(args, "env", None)
             try:
                 files = fluid_apply.render_fluid_apply_dags(
                     contract,
-                    env=getattr(args, "dag_env", None) or getattr(args, "env", None),
+                    env=dag_env,
                     contract_path=_dag_contract_path(args, contract_path),
                 )
             except fluid_apply.ScheduleRenderError as exc:
                 raise CLIError(
                     2, "generate_schedule_invalid_schedule", {"error": str(exc)}
                 ) from exc
-            return _write_files(args, files, scheduler_name)
+            # Rendered above, so both are valid. A DAG an earlier run wrote here for this
+            # product and env that the contract no longer makes (its build now runs as a task
+            # of another build's DAG, or not at all) would otherwise keep running beside them.
+            owner = (fluid_apply.validate_id(contract.get("id"), kind="contract.id"), dag_env or "")
+            return _write_files(args, files, scheduler_name, owner=owner)
 
         # Synthesize orchestration from builds when the contract lacks one.
         if not contract.get("orchestration") and contract.get("builds"):
@@ -295,13 +300,27 @@ def run(args: Any, logger: logging.Logger) -> int:
         return 1
 
 
-def _write_files(args: Any, files: Dict[str, str], scheduler_name: str) -> int:
-    """Write *files* under the resolved output directory; return the exit code."""
+def _write_files(
+    args: Any,
+    files: Dict[str, str],
+    scheduler_name: str,
+    *,
+    owner: Optional[Tuple[str, str]] = None,
+) -> int:
+    """Write *files* under the resolved output directory; return the exit code.
+
+    With ``--overwrite`` and an ``owner`` (``(product id, env)``), the fluid apply DAGs an
+    earlier run wrote there for that product and env that *files* no longer holds are
+    removed: the directory then holds the DAGs the contract makes, as ``schedule-sync``
+    mirrors a product's directory.
+    """
+    output_dir = _resolve_output_dir(args, scheduler_name)
+    if owner is not None and getattr(args, "overwrite", False) and output_dir.is_dir():
+        _retire_stale_dags(output_dir, files, owner)
+
     if not files:
         cprint("No files generated.")
         return 0
-
-    output_dir = _resolve_output_dir(args, scheduler_name)
 
     if output_dir.exists() and not getattr(args, "overwrite", False):
         if any(output_dir.iterdir()):
@@ -319,6 +338,21 @@ def _write_files(args: Any, files: Dict[str, str], scheduler_name: str) -> int:
 
     _print_summary(output_dir, files, scheduler_name)
     return 0
+
+
+def _retire_stale_dags(output_dir: Path, files: Dict[str, str], owner: Tuple[str, str]) -> None:
+    from fluid_build.schedulers.airflow import fluid_apply
+
+    for path in sorted(output_dir.glob("*.py")):
+        if path.name not in files and fluid_apply.rendered_dag_of(path) == owner:
+            path.unlink()
+            cprint(
+                f"Removed {path}: an earlier run wrote it for this product and env, and the "
+                "contract no longer makes that DAG.",
+                markup=False,
+                emoji=False,
+                soft_wrap=True,
+            )
 
 
 def _dag_contract_path(args: Any, contract_path: Path) -> str:
