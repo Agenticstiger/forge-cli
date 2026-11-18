@@ -27,6 +27,18 @@ def clients(service, region):
     return boto3.client(service, region_name=region)
 
 
+def upload(run):
+    """The job config where the run reads it, as OpenTofu uploads it."""
+    bucket, _, key = run.job_uri.removeprefix("s3://").partition("/")
+    s3 = boto3.client("s3", region_name=REGION)
+    s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": REGION})
+    s3.put_object(Bucket=bucket, Key=key, Body=run.job_text.encode("utf-8"))
+    from fluid_build.spark import runner_source
+
+    runner_key = run.runner_uri.removeprefix(f"s3://{bucket}/")
+    s3.put_object(Bucket=bucket, Key=runner_key, Body=runner_source().encode("utf-8"))
+
+
 def test_emr_serverless_runs_and_get_read_back_name_tags_and_arguments(run):
     with mock_aws():
         emr = boto3.client("emr-serverless", region_name=REGION)
@@ -77,6 +89,7 @@ def test_glue_start_then_get_job_runs_round_trips_the_arguments(run):
             Role=run.role_arn,
             Command={"Name": "glueetl", "ScriptLocation": glue_run.runner_uri},
         )
+        upload(glue_run)
         adapter = ad.adapter_for(glue_run, clients)
         run_id = adapter.start("tok")
         info = adapter.get(run_id)
@@ -103,6 +116,7 @@ def test_sigterm_while_waiting_cancels_the_moto_run(run):
             run, scheduled=True, mode="batch", retry_attempts=None, target={"applicationId": app_id}
         )
         backend = emrserverless_backends["123456789012"][REGION]
+        upload(scheduled)
         # moto's ListJobRuns fails on an application with no runs (AWS returns none).
         emr.start_job_run(
             applicationId=app_id, clientToken="seed", executionRoleArn=run.role_arn, name="other"
