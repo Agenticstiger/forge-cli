@@ -255,6 +255,48 @@ def test_an_entry_naming_the_placeholder_changes_nothing():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "connection, entry",
+    [
+        ({"secretRef": PGPASSWORD_REF, "host": "{{ env.PGHOST }}"}, "PGPASSWORD"),
+        (
+            {"secretRef": "vault://kv/orders/pg#password", "uri": "postgres://{{ env.H }}/db"},
+            "vault://kv/orders/pg#password@*",
+        ),
+    ],
+)
+def test_an_entry_for_any_host_leaves_nothing_to_warn_about(connection, entry):
+    """Apply clears whatever the placeholder renders to, so there is nothing to warn about."""
+    environ = {ALLOWLIST_ENV: entry, "FLUID_SECRET_SCHEMES": "env,vault"}
+    (finding,) = lint_secret_refs(_conn(**connection), environ)
+    assert finding.ok and finding.deferred is None
+
+
+@pytest.mark.unit
+def test_validate_strict_stays_green_under_an_entry_for_any_host(monkeypatch):
+    from fluid_build.cli import validate as validate_cmd
+    from fluid_build.schema_manager import ValidationResult
+
+    monkeypatch.setenv(ALLOWLIST_ENV, "PGPASSWORD")
+    result = ValidationResult(is_valid=True, schema_version=None)
+    validate_cmd._check_secret_refs(
+        result, _conn(secretRef=PGPASSWORD_REF, host="{{ env.PGHOST }}")
+    )
+    assert result.is_valid and not result.errors and not result.warnings
+
+
+@pytest.mark.unit
+def test_a_keyword_string_with_a_placeholder_is_judged_as_written():
+    """Apply reads ``Server=...;Database=...`` whole as one host no entry names."""
+    contract = _conn(
+        secretRef=PGPASSWORD_REF, connection_string="Server={{ env.PGHOST }};Database=d"
+    )
+    (finding,) = lint_secret_refs(contract, {})
+    assert isinstance(finding.error, AcquisitionSecretPolicyError)
+    assert finding.deferred is None
+
+
+@pytest.mark.unit
 def test_a_literal_destination_beside_a_placeholder_is_still_judged():
     contract = _conn(secretRef="env://PG", host="{{ env.PGHOST }}", uri=f"postgres://{REMOTE}/db")
     (finding,) = lint_secret_refs(contract, {})

@@ -696,13 +696,35 @@ def renders_at_apply(field_name: str, value: Any) -> bool:
 
     The field waits whole: a literal host beside a placeholder in one host list
     (``h1,{{ env.H }}``) is judged by apply alone, which judges every host. An
-    object-store URI names a bucket, never a host, so it never waits.
+    object-store URI names a bucket, never a host, so it never waits, and nor
+    does text that does not read as a destination (:func:`_reads_as_destination`).
     """
     if not isinstance(value, str) or not _ENV_PLACEHOLDER.search(value):
         return False
     if field_name != "host" and _is_object_store_uri(value.strip()):
         return False
-    return any(_ENV_PLACEHOLDER.search(part) for part in _deciding_parts(field_name, value))
+    scheme, host = _deciding_parts(field_name, value)
+    if not _reads_as_destination(scheme, host):
+        return False
+    return any(_ENV_PLACEHOLDER.search(part) for part in (scheme, host))
+
+
+#: A URI scheme (RFC 3986 section 3.1), once each placeholder in it stands for a word.
+_SCHEME_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*")
+#: A host list once its placeholders are taken out: names, IPv6 literals, ports, commas.
+_HOST_LIST_TEXT = re.compile(r"[A-Za-z0-9._%\-\[\]:,]*")
+
+
+def _reads_as_destination(scheme: str, host: str) -> bool:
+    """Whether ``scheme`` and ``host`` read as a URI scheme and a host list, placeholders aside.
+
+    A keyword string (``Server={{ env.H }};Database=d``) does not: apply reads
+    it whole as one host that no allowlist entry names, so the lint judges it
+    as written too, and never quotes it in a notice.
+    """
+    if scheme and not _SCHEME_TEXT.fullmatch(_ENV_PLACEHOLDER.sub("x", scheme)):
+        return False
+    return _HOST_LIST_TEXT.fullmatch(_ENV_PLACEHOLDER.sub("", host)) is not None
 
 
 def _deciding_parts(field_name: str, value: str) -> Tuple[str, str]:
@@ -740,6 +762,19 @@ def _without_port(host: str) -> str:
     if host.startswith("[") and "]" in host:
         return host.partition("]")[0] + "]"
     return host.partition(":")[0]
+
+
+def allows_any_host(
+    ref: Union[SecretRef, str], environ: Optional[Mapping[str, str]] = None
+) -> bool:
+    """Whether the operator's allowlist lets ``ref`` go to any host.
+
+    ``<ref>@*``, or a bare variable name for an ``env://`` reference. A
+    destination the lint leaves to apply then needs no entry, whatever it
+    renders to, an empty host included.
+    """
+    parsed = parse_secret_ref(ref) if isinstance(ref, str) else ref
+    return _grants_allow(parsed, None, destination_grants(environ))
 
 
 def destinations_rendered_at_apply(connection: Mapping[str, Any]) -> List[str]:
@@ -784,7 +819,8 @@ def deferred_destination_notice(
             "fluid apply renders {{ env.NAME }} placeholders from the environment it runs "
             "in, then judges the host they name against the destination allowlist. This "
             "check does not read the environment, so it leaves that host to apply; an "
-            "allowlist entry naming the placeholder itself never matches."
+            "allowlist entry naming the placeholder itself never matches. A variable "
+            "unset there renders empty, and an empty host is refused."
         ),
         fix=(
             f"Unless it renders to a loopback host, allow that host in {_OPERATOR_ONLY} "

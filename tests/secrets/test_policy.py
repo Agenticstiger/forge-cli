@@ -500,6 +500,8 @@ def test_a_destination_field_that_is_not_a_string_cannot_be_cleared(uri):
         ("server", "{{ env.MSSQL }}:1433", True),
         ("uri", "//{{ env.PGHOST }}/db", True),
         ("uri", "s3://{{ env.BUCKET }}/raw", False),
+        ("connection_string", "Server={{ env.PGHOST }};Database=d", False),
+        ("connection_string", "Url=https://{{ env.H }}/x;Database=d", False),
         ("uri", "postgresql://db.example.com/{{ env.DB }}", False),
         ("uri", "postgresql://{{ env.PGUSER }}@db.example.com/db", False),
         ("uri", "postgresql://db.example.com/db?options={{ env.X }}", False),
@@ -523,6 +525,7 @@ def test_the_deferred_notice_names_the_entry_apply_needs_and_no_value(monkeypatc
     assert "connection.host ('{{ env.PGHOST }}')" in notice.what
     assert f'{ALLOWLIST_ENV}="vault://kv/acme/pg#password@<host>"' in notice.fix
     assert "(with PGHOST as set there)" in notice.fix
+    assert "unset there renders empty, and an empty host is refused" in notice.why
     assert "db.private-value.internal" not in str(notice)
 
 

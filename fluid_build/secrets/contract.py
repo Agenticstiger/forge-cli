@@ -40,6 +40,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Set
 
 from .errors import SecretError
 from .policy import (
+    allows_any_host,
     check_prefix,
     check_scheme,
     connection_host,
@@ -179,10 +180,14 @@ def _check_destinations(
     A destination whose host is a ``{{ env.NAME }}`` placeholder is taken out
     and left to apply (:func:`~fluid_build.secrets.policy.renders_at_apply`);
     the rest of the connection is judged as ``fluid apply`` would, unless
-    nothing that names a destination is left.
+    nothing that names a destination is left. No notice when the operator lets
+    the reference go to any host: apply clears whatever the placeholder
+    renders to, and ``fluid validate --strict`` stays green.
     """
     if site.connection is None:
         if site.url and renders_at_apply("uri", site.url):
+            if allows_any_host(ref, environ):
+                return None
             return deferred_destination_notice(ref, {"deployment.server_url": site.url})
         host = connection_host({"uri": site.url}) if site.url else None
         refuse_unless_allowed(ref, host=host, environ=environ)
@@ -194,6 +199,8 @@ def _check_destinations(
     literal = {key: value for key, value in site.connection.items() if key not in waiting}
     if connection_hosts(literal):
         refuse_unless_allowed(ref, connection=literal, environ=environ)
+    if allows_any_host(ref, environ):
+        return None
     return deferred_destination_notice(
         ref, {f"connection.{name}": str(site.connection[name]) for name in waiting}
     )
