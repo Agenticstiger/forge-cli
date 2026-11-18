@@ -219,6 +219,15 @@ def prefix_matches(locator: str, prefix: str) -> bool:
 
 
 def _policy_error(what: str, why: str, fix: str) -> SecretPolicyError:
+    """A refusal; its ``what`` never puts ``: `` right after the reference.
+
+    The log redactor reads ``<word>: <next word>`` as an assignment when the
+    word is credential-shaped, and a reference often ends in one
+    (``#password``, ``.../token``): ``vault://kv/pg#password: the vault://
+    scheme ...`` came out with ``the`` masked. So each message names the
+    reference and goes on with ``cannot resolve, because`` or ``was not
+    fetched, because``.
+    """
     return SecretPolicyError(what=what, why=why, fix=fix, doc=doc_url("secrets"))
 
 
@@ -229,7 +238,7 @@ def check_scheme(ref: SecretRef, environ: Optional[Mapping[str, str]] = None) ->
         return
     current = ",".join(sorted(schemes))
     raise _policy_error(
-        f"{ref.canonical}: the {ref.scheme}:// scheme is not enabled",
+        f"{ref.canonical} cannot resolve, because the {ref.scheme}:// scheme is not enabled",
         "The operator decides which secret stores a contract may read from.",
         f"Set it in the operator environment (a shell or CI variable, not a project .env): "
         f'{SCHEMES_ENV}="{current},{ref.scheme}".',
@@ -245,7 +254,8 @@ def check_prefix(ref: SecretRef, environ: Optional[Mapping[str, str]] = None) ->
         return
     listed = ", ".join(f"{ref.scheme}://{p}" for p in prefixes) or "none"
     raise _policy_error(
-        f"{ref.canonical}: the locator is outside the prefixes allowed for {ref.scheme}://",
+        f"{ref.canonical} cannot resolve, because its locator is outside the prefixes "
+        f"allowed for {ref.scheme}://",
         f"The operator allows {ref.scheme}:// references under: {listed}.",
         f"If this is intended, add a prefix in the operator environment: "
         f'{PREFIXES_ENV}="{ref.scheme}://<prefix>/" (comma-separated, one per entry).',
@@ -271,7 +281,8 @@ def check_stage(
     name = normalize_stage(stage)
     if name in NEVER_RESOLVE_STAGES:
         raise _policy_error(
-            f"{ref.canonical}: `fluid {name}` never fetches a secret value",
+            f"{ref.canonical} was not fetched, because `fluid {name}` never fetches a "
+            "secret value",
             f"{name} checks references against the policy and the grammar without "
             "reading them; only the stage that sends a value fetches it.",
             "Nothing to change here: the value is read when fluid apply runs.",
@@ -281,7 +292,7 @@ def check_stage(
         return
     current = ",".join(sorted(stages))
     raise _policy_error(
-        f"{ref.canonical}: the {name} stage may not fetch secret values",
+        f"{ref.canonical} was not fetched, because the {name} stage may not fetch secret values",
         f"The operator lets these stages fetch values: {current}.",
         f"If {name} must send this value, set it in the operator environment: "
         f'{STAGES_ENV}="{current},{name}".',

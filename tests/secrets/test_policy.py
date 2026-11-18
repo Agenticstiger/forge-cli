@@ -24,6 +24,7 @@ from fluid_build.secrets.policy import (
     enabled_schemes,
     locator_prefixes,
     prefix_matches,
+    refuse_destination_overrides,
     refuse_unless_allowed,
     renders_at_apply,
     variable_allowed,
@@ -520,3 +521,51 @@ def test_the_deferred_notice_names_the_entry_apply_needs_and_no_value(monkeypatc
     assert f'{ALLOWLIST_ENV}="vault://kv/acme/pg#password@<host>"' in notice.fix
     assert "{{ env.PGHOST }} set" in notice.fix
     assert "db.private-value.internal" not in str(notice)
+
+
+# ── refusals survive the log redactor ────────────────────────────────────────
+
+#: References that end in a word the redactor reads as a credential key.
+_KEY_SHAPED_REFS = [
+    "vault://kv/orders/pg#password",
+    "vault://kv/app/token#secret",
+    "aws-sm://fluid/acme/api_key",
+    "file:///run/secrets/token",
+    "env://DB_PASSWORD",
+]
+
+
+def _every_refusal(ref_text: str):
+    ref = parse_secret_ref(ref_text)
+    other = "env" if ref.scheme == "file" else "file"
+    yield lambda: check_scheme(ref, {SCHEMES_ENV: other})
+    yield lambda: check_prefix(ref, {PREFIXES_ENV: f"{ref.scheme}://nowhere/"})
+    yield lambda: check_stage(ref, None, {})
+    yield lambda: check_stage(ref, "validate", {})
+    yield lambda: check_stage(ref, "verify", {})
+    yield lambda: refuse_unless_allowed(ref, connection={"host": REMOTE}, environ={})
+    yield lambda: refuse_unless_allowed(ref, connection={"host": ""}, environ={})
+    yield lambda: refuse_unless_allowed(ref, connection={}, environ={})
+    yield lambda: refuse_destination_overrides({"database.password": "x"}, where="extra_config")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("ref_text", _KEY_SHAPED_REFS)
+def test_every_refusal_survives_the_log_redactor(ref_text, monkeypatch):
+    """``<ref>: the vault:// scheme ...`` lost ``the`` to the bare ``key: value`` rule.
+
+    The rule stays as it is (secret_redactor._ASSIGNMENT_RE is pinned): the
+    messages do not put a colon after a reference.
+    """
+    from fluid_build.observability import secret_redactor
+
+    # Only the patterns: a value another test registered must not mask a word here.
+    monkeypatch.setattr(secret_redactor, "_known_secrets", ())
+    monkeypatch.setattr(secret_redactor, "_known_secret_set", set())
+    for raise_refusal in _every_refusal(ref_text):
+        with pytest.raises(SecretPolicyError) as info:
+            raise_refusal()
+        text = str(info.value)
+        assert secret_redactor.redact_secret_text(text) == text, text
+    notice = str(deferred_destination_notice(ref_text, {"connection.host": "{{ env.PGHOST }}"}))
+    assert secret_redactor.redact_secret_text(notice) == notice, notice
