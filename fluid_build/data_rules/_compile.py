@@ -454,7 +454,22 @@ class _Compiler:
         exempt += [_masks.literal_regex(p) + ".*" for p in prefixes]
         body = _masks.column_body(alternatives)
         pattern = "^" + ("(" + "|".join([body, *exempt]) + ")" if exempt else body) + "$"
-        return Rule(status=EXECUTABLE, pattern=pattern, **fallback)
+        try:
+            dialect = self.dialect_of(expose)
+        except _Refused:
+            # No SQL for the platform: the pattern alone still serves a regex consumer (ODCS).
+            return Rule(status=EXECUTABLE, pattern=pattern, **fallback)
+        query = _RowQuery(self, expose, dialect)
+        column = query.column(None, fallback["column"])
+        return Rule(
+            status=EXECUTABLE,
+            pattern=pattern,
+            dialect=dialect,
+            counts=query.counts(
+                f"({column} IS NOT NULL)", f"(NOT {regex_sql(dialect, column, pattern)})"
+            ),
+            **fallback,
+        )
 
     def exemptions(self, expose: Expose, name: str) -> Tuple[List[str], List[str]]:
         """The placeholders a column's own checks exempt: its own, and those of every column its
@@ -707,6 +722,24 @@ def _counts(
         return " ".join(parts)
 
     return counts
+
+
+def regex_sql(dialect: str, column: str, pattern: str) -> str:
+    """Whether ``column`` matches ``pattern``, an anchored ``^...$`` regex built only from
+    groups, alternation, classes and counts (§3), in ``dialect``. Trino (joni) and Spark
+    (Java) read ``^`` and ``$`` at line breaks or before a final newline, so they get ``\\A``
+    and ``\\z``; DuckDB and BigQuery (RE2), PostgreSQL and Snowflake match the whole text."""
+    if dialect in ("athena", "databricks") and pattern.startswith("^") and pattern.endswith("$"):
+        pattern = "\\A" + pattern[1:-1] + "\\z"
+    literal = fs.sql_literal(dialect, pattern)
+    return {
+        "duckdb": f"regexp_matches({column}, {literal})",
+        "snowflake": f"REGEXP_LIKE({column}, {literal})",
+        "bigquery": f"REGEXP_CONTAINS({column}, {literal})",
+        "databricks": f"({column} RLIKE {literal})",
+        "postgres": f"({column} ~ {literal})",
+        "athena": f"regexp_like({column}, {literal})",
+    }[dialect]
 
 
 def placeholder_sql(
