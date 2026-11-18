@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A BigQuery table is partitioned and clustered as its binding declares.**
+  `binding.location.partitionBy` was read only with `lifecycle.expire`, and
+  `binding.properties.cluster_by` (honoured on Snowflake) was read by nobody on BigQuery. Both
+  were dropped without a word, and `fluid validate --strict` passed. A `partitionBy` naming one
+  DATE, TIMESTAMP or DATETIME column now partitions the table by day on it with or without
+  retention; retention adds only the partitions' expiry. `cluster_by` (a list, or one column as
+  a string) becomes the table's `clustering`, in the declared order: at most four top-level,
+  non-repeated columns of a type BigQuery clusters by. The provider changes clustering in place.
+  A `partitionBy` BigQuery cannot honour (more than one column, or one that is not a DATE,
+  TIMESTAMP or DATETIME column), a column it cannot cluster by, and either key on a view are now
+  refused at validate, naming the field; before, they were ignored. BigQuery cannot partition an
+  existing table, so a live table whose contract already declared `partitionBy` without
+  retention now plans a replacement, which `fluid apply` refuses without `--allow-data-loss`.
+  Adding retention later on the same column is an in-place change.
+
 - **The bundle packs the dbt project a build runs, and `fluid apply` refuses a checkout whose dbt
   files changed.** A dbt build's models were read from the checkout at apply time, so a model
   edited after `fluid plan` ran unreviewed. `fluid bundle --format tgz` now packs the dbt project

@@ -780,6 +780,29 @@ def test_bigquery_nested_columns_pass_tofu_validate(restricted, tmp_path):
     _assert_tofu_validates(tmp_path, module)
 
 
+@pytest.mark.skipif(_TOFU is None, reason="tofu binary not installed")
+def test_bigquery_partitioning_and_clustering_pass_tofu_validate(tmp_path):
+    """``time_partitioning.field`` without an expiry and ``clustering`` are accepted by
+    the real provider schema."""
+    contract = _bigquery_nested_contract(restricted=False)
+    schema = contract["exposes"][0]["contract"]["schema"]
+    schema += [
+        {"name": "event_date", "type": "date", "required": True},
+        {"name": "region", "type": "string"},
+        {"name": "customer_id", "type": "bigint"},
+    ]
+    binding = contract["exposes"][0]["binding"]
+    binding["location"]["partitionBy"] = ["event_date"]
+    binding["properties"] = {"cluster_by": ["region", "customer_id"]}
+    module = build_module(IAC_PLUGINS["gcp"], contract)
+    document = json.loads(module)
+    [table] = document["resource"]["google_bigquery_table"].values()
+    assert table["time_partitioning"] == {"type": "DAY", "field": "event_date"}
+    assert table["clustering"] == ["region", "customer_id"]
+    assert "terraform_data" in document["resource"]
+    _assert_tofu_validates(tmp_path, module)
+
+
 def _lf_bucket_policy_contract(bucket_policy, packaging):
     """A same-account and a cross-account LF grantee on one bucket."""
     lake_formation = {

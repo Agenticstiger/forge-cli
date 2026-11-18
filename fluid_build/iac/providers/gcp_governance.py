@@ -26,6 +26,14 @@ to that; the emitter logs it. dbt-bigquery's ``partition_by`` +
 ``partition_expiration_days`` is the same pair. BigQuery cannot partition an
 existing table, so adding it replaces the table (see :func:`partition_trigger_input`).
 
+**Layout** is ``binding.location.partitionBy`` and ``binding.properties.cluster_by``
+(:func:`layout_for`). A ``partitionBy`` column partitions the table by day on it with
+or without retention; retention only adds the partitions' expiry. ``cluster_by``
+becomes the table's ``clustering``, in the declared order: at most four top-level,
+non-repeated columns of a type BigQuery clusters by (BigQuery's "clustered tables"
+page). The provider updates clustering in place, so it needs no replacement trigger.
+A view stores no rows, so either key on a view is refused.
+
 **Encryption** is ``binding.encryption.kms``: ``product`` (the default when the block
 is present) is a Cloud KMS key this product creates in the dataset's location
 (``google_kms_key_ring`` + ``google_kms_crypto_key``, 90-day rotation), usable by the
@@ -70,7 +78,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
 
 from .. import column_types
 from ..access import normalize_access_grants
@@ -134,6 +142,25 @@ PARTITION_TYPE = "DAY"
 #: The column types BigQuery time-unit partitioning accepts.
 _PARTITION_COLUMN_TYPES = frozenset({"DATE", "TIMESTAMP", "DATETIME"})
 
+#: BigQuery clusters a table by at most this many columns.
+CLUSTERING_MAX_COLUMNS = 4
+
+#: The column types BigQuery clusters by, top-level and not REPEATED. ``RANGE`` is one
+#: too, but no FLUID column type becomes a RANGE.
+_CLUSTERING_COLUMN_TYPES = frozenset(
+    {
+        "BIGNUMERIC",
+        "BOOL",
+        "DATE",
+        "DATETIME",
+        "GEOGRAPHY",
+        "INT64",
+        "NUMERIC",
+        "STRING",
+        "TIMESTAMP",
+    }
+)
+
 #: ``accessPolicy`` verbs that read the rows; their principals are the expose's readers.
 READ_VERBS = frozenset({"read", "select", "query", "admin", "owner"})
 
@@ -152,6 +179,16 @@ class BqRetention:
     @property
     def expiration_ms(self) -> int:
         return self.days * _MS_PER_DAY
+
+
+@dataclass(frozen=True)
+class BqLayout:
+    """How one BigQuery table lays out its rows."""
+
+    #: The column ``binding.location.partitionBy`` names, or ``None``.
+    partition_field: Optional[str] = None
+    #: ``binding.properties.cluster_by``, in its order.
+    clustering: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -336,38 +373,8 @@ def retention_for(
             ("Set lifecycle.retention (e.g. P30D), or drop expire: true.",),
         )
     days = _period_days(period, where=where)
-    loc = (exposure.get("binding") or {}).get("location") or {}
-    partition_by = loc.get("partitionBy") if isinstance(loc, Mapping) else None
-    field: Optional[str] = None
-    if partition_by:
-        columns = list(partition_by) if isinstance(partition_by, (list, tuple)) else []
-        if len(columns) != 1 or not isinstance(columns[0], str):
-            raise UnsupportedBindingError(
-                "retention-partition-column",
-                f"{where}.binding.location.partitionBy is {partition_by!r}; a BigQuery table "
-                "is partitioned by at most one column.",
-                (
-                    "Name one DATE, TIMESTAMP or DATETIME column, or drop partitionBy to "
-                    "partition by ingestion time.",
-                ),
-            )
-        from .gcp import _bq_type
-
-        schema = (exposure.get("contract") or {}).get("schema") or []
-        declared = {c.get("name"): c for c in schema if isinstance(c, Mapping)}
-        column = declared.get(columns[0])
-        if column is None or _bq_type(column.get("type")) not in _PARTITION_COLUMN_TYPES:
-            raise UnsupportedBindingError(
-                "retention-partition-column",
-                f"{where}.binding.location.partitionBy names {columns[0]!r}, which is not a "
-                "DATE, TIMESTAMP or DATETIME column of the expose's schema, so BigQuery "
-                "cannot partition by it.",
-                (
-                    "Name a date or timestamp column, or drop partitionBy to partition by "
-                    "ingestion time.",
-                ),
-            )
-        field = columns[0]
+    field = _partition_column(exposure, where, retention=True)
+    if field is not None:
         LOG.info(
             "bigquery_retention_event_time %s: partitioned by %s, so each row expires %s "
             "after the date in %s, not after it was written (a backfill of older rows is "
@@ -381,6 +388,70 @@ def retention_for(
     return BqRetention(period=str(period), days=days, field=field)
 
 
+def _partition_column(exposure: Mapping[str, Any], where: str, *, retention: bool) -> Optional[str]:
+    """The one DATE, TIMESTAMP or DATETIME column ``binding.location.partitionBy`` names.
+
+    ``None`` when it names none. Anything else is refused: BigQuery partitions a table
+    by one time column, so a second column, or a column of another type, would be
+    dropped. ``retention`` says the expose also expires its partitions, where dropping
+    ``partitionBy`` still partitions the table, by ingestion time.
+    """
+    loc = (exposure.get("binding") or {}).get("location") or {}
+    partition_by = loc.get("partitionBy") if isinstance(loc, Mapping) else None
+    if not partition_by:
+        return None
+    if retention:
+        kind = "retention-partition-column"
+        one_fix = (
+            "Name one DATE, TIMESTAMP or DATETIME column, or drop partitionBy to partition by "
+            "ingestion time."
+        )
+        type_fix = (
+            "Name a date or timestamp column, or drop partitionBy to partition by ingestion time."
+        )
+    else:
+        kind = "partition-column"
+        one_fix = (
+            "Name one DATE, TIMESTAMP or DATETIME column, and cluster by the others "
+            "(binding.properties.cluster_by)."
+        )
+        type_fix = (
+            "Name a date or timestamp column, or cluster by this one instead "
+            "(binding.properties.cluster_by)."
+        )
+    columns = list(partition_by) if isinstance(partition_by, (list, tuple)) else []
+    if len(columns) != 1 or not isinstance(columns[0], str):
+        raise UnsupportedBindingError(
+            kind,
+            f"{where}.binding.location.partitionBy is {partition_by!r}; a BigQuery table "
+            "is partitioned by at most one column.",
+            (one_fix,),
+        )
+    from .gcp import _bq_type
+
+    declared = _declared_columns(exposure)
+    column = declared.get(columns[0])
+    if column is None or _bq_type(column.get("type")) not in _PARTITION_COLUMN_TYPES:
+        spelled = _spelled(declared, columns[0]) if column is None else ""
+        raise UnsupportedBindingError(
+            kind,
+            f"{where}.binding.location.partitionBy names {columns[0]!r}, which is not a "
+            "DATE, TIMESTAMP or DATETIME column of the expose's schema, so BigQuery "
+            f"cannot partition by it{spelled}.",
+            (type_fix,),
+        )
+    return columns[0]
+
+
+def _spelled(declared: Mapping[str, Any], name: str) -> str:
+    """`` (the schema spells it 'Region')`` when a declared column differs from ``name``
+    only in case: a binding names its columns exactly as the schema declares them."""
+    for declared_name in declared:
+        if declared_name.casefold() == name.casefold():
+            return f" (the schema spells it {declared_name!r})"
+    return ""
+
+
 def _declared_columns(exposure: Mapping[str, Any]) -> Dict[Any, Mapping[str, Any]]:
     """The expose's top-level schema columns by name (a column without a string name is
     the schema check's to report)."""
@@ -391,7 +462,7 @@ def _declared_columns(exposure: Mapping[str, Any]) -> Dict[Any, Mapping[str, Any
     }
 
 
-def partition_trigger_input(retention: BqRetention) -> Dict[str, str]:
+def partition_trigger_input(field: Optional[str]) -> Dict[str, str]:
     """What forces the table's replacement: the partitioning's shape, not its expiry.
 
     BigQuery cannot partition an existing table, and the provider plans adding
@@ -399,10 +470,113 @@ def partition_trigger_input(retention: BqRetention) -> Dict[str, str]:
     refuses. A ``terraform_data`` holding this value is the table's
     ``replace_triggered_by`` (the OpenTofu docs' pattern for a plain value): created
     for a table that exists, or changed, it plans the table's replacement, which the
-    data-loss gate refuses without ``--allow-data-loss``. The period is left out, so a
-    new retention is an in-place change of ``expiration_ms``.
+    data-loss gate refuses without ``--allow-data-loss``. ``field`` is the partition
+    column, ``None`` for ingestion time. The period is left out, so a new retention
+    on a table partitioned the same way is an in-place change of ``expiration_ms``.
     """
-    return {"type": PARTITION_TYPE, "field": retention.field or ""}
+    return {"type": PARTITION_TYPE, "field": field or ""}
+
+
+def layout_for(exposure: Mapping[str, Any], index: int = 0, *, is_view: bool = False) -> BqLayout:
+    """The partition column and clustering ``exposure`` declares; refuses what BigQuery
+    cannot lay out as declared, naming the field."""
+    where = _where(exposure, index)
+    binding = exposure.get("binding") or {}
+    loc = binding.get("location") or {}
+    properties = binding.get("properties") or {}
+    cluster_by = properties.get("cluster_by") if isinstance(properties, Mapping) else None
+    if is_view:
+        declared = [
+            key
+            for key, value in (
+                (
+                    "binding.location.partitionBy",
+                    loc.get("partitionBy") if isinstance(loc, Mapping) else None,
+                ),
+                ("binding.properties.cluster_by", cluster_by),
+            )
+            if value not in (None, "", [], ())
+        ]
+        if declared:
+            raise UnsupportedBindingError(
+                "layout-view",
+                f"{where}.{' and '.join(declared)} {'are' if len(declared) > 1 else 'is'} set "
+                "on a BigQuery view, which stores no rows to partition or cluster.",
+                ("Set it on the expose of the table the view reads, or drop it here.",),
+            )
+        return BqLayout()
+    return BqLayout(
+        partition_field=_partition_column(exposure, where, retention=_expire_requested(exposure)),
+        clustering=_clustering(
+            exposure, cluster_by, where=f"{where}.binding.properties.cluster_by"
+        ),
+    )
+
+
+def _clustering(exposure: Mapping[str, Any], raw: Any, *, where: str) -> Tuple[str, ...]:
+    """``binding.properties.cluster_by`` as BigQuery's ``clustering``, in its order.
+
+    One column may be written as a string, as the Snowflake emitter reads it. Each
+    must be a top-level column of the expose of a type BigQuery clusters by.
+    """
+    if raw in (None, "", [], ()):
+        return ()
+    columns = [raw] if isinstance(raw, str) else raw
+    if not isinstance(columns, (list, tuple)) or not all(
+        isinstance(name, str) and name for name in columns
+    ):
+        raise UnsupportedBindingError(
+            "cluster-by",
+            f"{where} is {raw!r}; it must name the columns to cluster by.",
+            ("Write cluster_by as a list of column names, in priority order.",),
+        )
+    if len(columns) > CLUSTERING_MAX_COLUMNS:
+        raise UnsupportedBindingError(
+            "cluster-by",
+            f"{where} names {len(columns)} columns; BigQuery clusters a table by at most "
+            f"{CLUSTERING_MAX_COLUMNS}.",
+            (
+                f"Keep the {CLUSTERING_MAX_COLUMNS} columns queries filter on most, in "
+                "priority order.",
+            ),
+        )
+    problems = _cluster_column_problems(exposure, columns, where=where)
+    if problems:
+        raise UnsupportedBindingError(
+            "cluster-by",
+            "; ".join(problems)
+            + ". BigQuery clusters by top-level, non-repeated BIGNUMERIC, BOOL, DATE, "
+            "DATETIME, GEOGRAPHY, INT64, NUMERIC, STRING or TIMESTAMP columns, each once.",
+            ("Name declared columns of those types, in priority order.",),
+        )
+    return tuple(columns)
+
+
+def _cluster_column_problems(exposure: Mapping[str, Any], columns: Any, *, where: str) -> List[str]:
+    """What is wrong with each cluster column: named twice, not declared, or of a type
+    BigQuery does not cluster by (a REPEATED one included)."""
+    from .gcp import _bq_field
+
+    declared = _declared_columns(exposure)
+    seen: Set[str] = set()
+    problems: List[str] = []
+    for position, name in enumerate(columns):
+        named = f"{where}[{position}] names {name!r}"
+        if name.casefold() in seen:
+            problems.append(f"{named} again")
+            continue
+        seen.add(name.casefold())
+        if name not in declared:
+            problems.append(
+                f"{named}, which is not a column of the expose's schema" + _spelled(declared, name)
+            )
+            continue
+        field = _bq_field(declared[name])
+        repeated = field["mode"] == "REPEATED"
+        if repeated or field["type"] not in _CLUSTERING_COLUMN_TYPES:
+            shown = f"REPEATED {field['type']}" if repeated else field["type"]
+            problems.append(f"{named}, whose type is {shown}")
+    return problems
 
 
 def encryption_for(
@@ -693,6 +867,7 @@ def validate_bigquery_governance(
     loc = binding.get("location") or {}
     where = _where(exposure, index)
     retention_for(exposure, index, is_view=is_view)
+    layout_for(exposure, index, is_view=is_view)
     encryption_for(binding, dataset_location(loc), where=f"{where}.binding")
     gcp_grants(normalize_access_grants(contract), binding, where=f"{where} accessPolicy")
     if is_view and restrictions_for(exposure, index):
@@ -802,7 +977,9 @@ def refuse_unsupported_target(exposure: Mapping[str, Any], index: int, target: s
 
 __all__ = [
     "BqEncryption",
+    "BqLayout",
     "BqRetention",
+    "CLUSTERING_MAX_COLUMNS",
     "ALL_ROWS_POLICY_ID",
     "FINE_GRAINED_READER_ROLE",
     "KEY_ROTATION_PERIOD",
@@ -820,6 +997,7 @@ __all__ = [
     "gcp_owned",
     "governance_labels",
     "kms_location",
+    "layout_for",
     "partition_trigger_input",
     "product_key_name",
     "product_key_ring",
