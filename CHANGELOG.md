@@ -80,6 +80,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these scripts write now use single quotes. The Glue script's SQL summary comment is one line, so
   multi-line SQL no longer spills out of it as code, and a column type or SQL that is not a string no
   longer stops generation.
+- **A quoted enum list in `validationRules` reads as SQL writes it.** Every reader cut an enum
+  rule's `constraint` at every comma, so `constraint: "'base_fee', 'usage', 'fee, late'"` listed
+  `'base_fee'`, `'usage'`, `'fee` and `late'`. The data-rules lint kept the quotes and refused
+  even `kind = 'base_fee'` in `fluid validate`, the dbt bridge wrote those four strings into an
+  `accepted_values` test, `fluid test` checked rows against them, and the ODCS exporter listed
+  `fee` and `late` as two values. A value may now be a quoted string, written as SQL writes one
+  and as FLUID 0.7.7 writes an `enum` type's levels: `'fee, late'` is one value and `'O''Brien'`
+  is `O'Brien`, for all four readers. A list in which no value opens with a quote reads exactly as
+  before, `O'Brien, D'Arcy` included. The ODCS exporter used to strip a quote from either end of
+  every value; it now keeps a quote that does not wrap a quoted string, so `'80s` stays `'80s`.
+  When a value holds a comma, the lint's refusal and the ODCS rule's description quote each value,
+  so the list they print reads one way. `RFC-data-rules.md` section 2.3 gives the grammar.
 - **A FLUID SQL/1 expression can name an enum column whose quoted level holds a parenthesis.**
   FLUID SQL/1 read a column type up to its first `)`, so a column typed `enum('a (b)', 'c')` had
   no FLUID SQL/1 type, and `fluid validate` refused every invariant, derive or registry rule that

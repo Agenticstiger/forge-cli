@@ -315,6 +315,8 @@ Type rules:
 - A predicate position takes a bool: `check`, `when`, `aggregate.filter`, `CASE WHEN` and the operands of `AND`, `OR` and `NOT`.
 - A string literal compared with a column whose `validationRules` declare an `enum` must be one of its values. This is flux-expr/1's closed-set rule, and it turns a typo such as `kind = 'base_fe'` into a validation error.
 
+An `enum` rule's `constraint` lists its values, separated by commas, each written as a level of a FLUID 0.7.7 `enum` column type is: a quoted string or a list of words. A quoted string is written as SQL writes a string literal, between single or double quotes, with its own quote doubled, and holds any character but a control character, so `'Dr.', '>10000', 'O''Brien', 'a, b'` lists four values, the last of them `a, b`. A value is a quoted string when it opens with a quote, holds no control character, and only spaces follow the matching closing quote, up to the next comma or the end. It keeps its text as written: `' a'` keeps its space, and `''` is the empty string. Any other value, quotes included, is its text up to the next comma, trimmed, and names nothing when empty, so a list of words reads as written (`IE, United Kingdom`) and an apostrophe inside a word is an ordinary character (`O'Brien, D'Arcy` lists two values). The list is also read with `|` separating values, as `fluid test` reads it (`active | ended`), and a literal must be one of the values that either reading lists.
+
 ### 2.4 Exact numbers
 
 - Every number is an exact rational. `+`, `-` and `*` are exact, and `/` gives the exact quotient: `1 / 3` is one third. Nothing is binary floating point: a float column's value is read as the shortest decimal that converts back to the same double (§2.3).

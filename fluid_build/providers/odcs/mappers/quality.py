@@ -63,6 +63,8 @@ import re
 from collections.abc import Mapping, MutableMapping
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from fluid_build.util.column_type import read_enum_list, write_enum_list
+
 from .base import (
     ExportCtx,
     ImportCtx,
@@ -777,17 +779,16 @@ def _validation_rule_to_quality(
             "description": message or f"Field '{name}' must match pattern: {constraint}",
         }
     if val_type == "enum":
-        # The constraint is a single string, so a comma-separated list is the
-        # only reading available; a value with no comma is one allowed value.
-        values = [v.strip().strip("'\"") for v in constraint.split(",")]
-        values = [v for v in values if v]
+        # The constraint is one string: values separated by commas, each a
+        # quoted string as SQL writes one or plain text (RFC-data-rules.md 2.3).
+        values = read_enum_list(constraint)
         return {
             "type": "library",
             "metric": "invalidValues",
             "mustBe": 0,
             "arguments": {"validValues": values},
             "dimension": "conformity",
-            "description": message or f"Field '{name}' must be one of: {', '.join(values)}",
+            "description": message or f"Field '{name}' must be one of: {write_enum_list(values)}",
         }
     if val_type == "range":
         return {

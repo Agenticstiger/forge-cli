@@ -8,8 +8,10 @@ holds any character but a control character, with its own quote doubled:
 ``enum('Dr.', '>10000', 'O''Brien', 'a, b')``. That is how SQL writes a
 string literal (PostgreSQL, MySQL and DuckDB spell their ENUM levels the same
 way). A reader that ends the list at the first ``)`` or cuts it at every
-comma breaks such a level apart, so the two functions here step over quoted
+comma breaks such a level apart, so the functions here step over quoted
 text and split only at the commas and the closing parenthesis outside it.
+:func:`read_enum_list` reads a ``validationRules`` enum list the same way
+(``RFC-data-rules.md`` section 2.3).
 
 The module is a leaf: it imports nothing from ``fluid_build``, so any mapper
 can use it without pulling a provider in.
@@ -17,9 +19,12 @@ can use it without pulling a provider in.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+import re
+from typing import List, Optional, Sequence, Tuple
 
 _QUOTES = ("'", '"')
+#: What a quoted level may not hold: FLUID 0.7.7's ``[^'\x00-\x1f\x7f-\x9f]``.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def _scan_quoted(text: str, start: int) -> int:
@@ -100,3 +105,79 @@ def split_param_list(params: str) -> List[str]:
         i += 1
     parts.append(params[start:].strip())
     return parts
+
+
+def _skip_spaces(text: str, i: int) -> int:
+    while i < len(text) and text[i].isspace():
+        i += 1
+    return i
+
+
+def _quoted_value(text: str, start: int, separators: str) -> Optional[Tuple[str, int]]:
+    """The quoted string that opens at ``start`` and the index the next value
+    starts at, or ``None`` when no quoted value opens there: no quote, one that
+    never closes, a control character inside, or text after the closing quote."""
+    if start >= len(text) or text[start] not in _QUOTES:
+        return None
+    end = _scan_quoted(text, start)
+    if end < 0:
+        return None
+    after = _skip_spaces(text, end)
+    body = text[start + 1 : end - 1]
+    if (after < len(text) and text[after] not in separators) or _CONTROL.search(body):
+        return None
+    quote = text[start]
+    return body.replace(quote + quote, quote), after + 1
+
+
+def read_enum_list(text: str, separators: str = ",") -> List[str]:
+    """The values an enum list names, each value ended by a character of ``separators``.
+
+    A value that opens with a quote is a quoted string when the quote closes
+    and only spaces follow it before the next separator or the end: its value
+    is the text between the quotes, each doubled quote read as one, as SQL and
+    FLUID 0.7.7's enum levels write it. ``'a, b', 'O''Brien'`` gives
+    ``["a, b", "O'Brien"]``. The value is kept as written, so ``' a'`` keeps
+    its space and ``''`` is the empty value. A quoted string may not hold a
+    control character, as in the 0.7.7 type pattern.
+
+    Every other value is its text up to the next separator, stripped, and is
+    left out when empty, as a plain split reads it. A quote inside such a
+    value is an ordinary character: ``O'Brien, D'Arcy`` gives
+    ``["O'Brien", "D'Arcy"]``, and ``'a'b, c`` gives ``["'a'b", "c"]``. A list
+    in which no value opens with a quote reads as a split at every separator,
+    each part stripped and the empty parts left out.
+
+    The scan is linear in the length of ``text``.
+    """
+    values: List[str] = []
+    i = 0
+    while i <= len(text):
+        start = _skip_spaces(text, i)
+        quoted = _quoted_value(text, start, separators)
+        if quoted is not None:
+            value, i = quoted
+            values.append(value)
+            continue
+        stop = start
+        while stop < len(text) and text[stop] not in separators:
+            stop += 1
+        value = text[start:stop].strip()
+        if value:
+            values.append(value)
+        i = stop + 1
+    return values
+
+
+def write_enum_list(values: Sequence[str]) -> str:
+    """``values`` as one comma-separated list, for a message. When one of them
+    holds a comma, opens with a quote, is empty or has a space at an end, each
+    is written as a quoted string (``'a, b', 'c'``), so the list reads one way:
+    :func:`read_enum_list` reads it back to ``values``, unless a value it had
+    to quote holds a control character."""
+    if any(
+        "," in value or value[:1] in _QUOTES or value != value.strip() or not value
+        for value in values
+    ):
+        return ", ".join("'" + value.replace("'", "''") + "'" for value in values)
+    return ", ".join(values)
