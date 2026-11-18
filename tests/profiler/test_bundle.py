@@ -239,11 +239,33 @@ def test_a_number_too_long_to_write_out_is_refused(tmp_path):
 
 
 def test_a_document_nested_too_deeply_to_read_is_refused(tmp_path):
-    _write(tmp_path, "deep.flux.yml", "kind: Simulation\nx: " + "[" * 5000 + "]" * 5000 + "\n")
+    _write(tmp_path, "deep.flux.yml", "kind: Simulation\nx: " + "[" * 2000 + "]" * 2000 + "\n")
     with pytest.raises(BundleError) as refused:
         read_bundle_block(tmp_path, "orders")
     assert refused.value.event == "profile_bundle_unreadable"
     assert "nests too deeply" in str(refused.value)
+
+
+def test_a_merge_key_chain_that_writes_out_too_many_pairs_is_refused(tmp_path):
+    # Any *.flux.yml is read, so the chain need not sit in the Simulation.
+    lines = ["kind: Segment", "a0: &a0 {k0: 1, k1: 2}"]
+    lines += [f"a{n}: &a{n} {{<<: [*a{n - 1}, *a{n - 1}]}}" for n in range(1, 30)]
+    _write(tmp_path, "bomb.flux.yml", "\n".join(lines) + "\n")
+    _write(tmp_path, "s.flux.yml", SIMULATION)
+    with pytest.raises(BundleError) as refused:
+        read_bundle_block(tmp_path, "orders")
+    assert refused.value.event == "profile_bundle_unreadable"
+    assert "bomb.flux.yml" in str(refused.value) and "merge key" in str(refused.value)
+
+
+def test_a_merge_key_inside_the_bound_reads_as_the_engine_reads_it(tmp_path):
+    _write(
+        tmp_path,
+        "s.flux.yml",
+        _simulation_with("base: &base {fractionalBits: 8}\nencoding: {<<: *base, rounding: floor}"),
+    )
+    block = read_bundle_block(tmp_path, "orders").raw
+    assert block["encoding"] == {"fractionalBits": 8, "rounding": "floor"}
 
 
 def test_the_module_imports_no_registry():

@@ -73,6 +73,7 @@ _MOST_INTEGER_DIGITS: int = sys.int_info.default_max_str_digits
 _INTEGER_TAG = "tag:yaml.org,2002:int"
 _FLOAT_TAG = "tag:yaml.org,2002:float"
 _TIMESTAMP_TAG = "tag:yaml.org,2002:timestamp"
+_MERGE_TAG = "tag:yaml.org,2002:merge"
 
 #: The most digits a number in a block may need written out: the engine's rule for a
 #: declared number, flux-stats' ``MOST_DIGITS``, counted as its
@@ -85,6 +86,9 @@ _MOST_NUMBER_DIGITS = 1000
 #: billions of values; a real block holds a few hundred, a few levels deep.
 _MOST_BLOCK_VALUES = 100_000
 _DEEPEST_BLOCK = 64
+#: The most characters of a key a refusal's path names: the path is built for every
+#: value, so an aliased long key must not be copied whole at each level.
+_KEY_IN_PATH = 40
 
 
 class BundleError(Exception):
@@ -128,6 +132,27 @@ def _exact_loader(name: str) -> Any:
 
     class ExactLoader(yaml.SafeLoader):
         """A float is its source text as a Decimal, a timestamp a string, a long int refused."""
+
+        def flatten_mapping(self, node: Any) -> None:
+            # A merge key (``<<``) copies its mappings' pairs while the document is
+            # built, before _canonicalise counts a value, and a chain of merges doubles
+            # at each level; so the pairs a merge adds are counted first, and a merge
+            # past the block's bound is refused before its list is built.
+            merged = len(node.value)
+            for key_node, value_node in node.value:
+                if key_node.tag != _MERGE_TAG:
+                    continue
+                parts = value_node.value if isinstance(value_node, yaml.SequenceNode) else []
+                for part in parts if parts else [value_node]:
+                    if isinstance(part, yaml.MappingNode):
+                        self.flatten_mapping(part)
+                        merged += len(part.value)
+                        if merged > _MOST_BLOCK_VALUES:
+                            raise refuse(
+                                node,
+                                f"a merge key (<<) writes out more than {_MOST_BLOCK_VALUES} pairs",
+                            )
+            super().flatten_mapping(node)
 
     def refuse(node: Any, why: str) -> BundleError:
         mark = node.start_mark
@@ -287,7 +312,8 @@ def _canonicalise(
                     f"{name}: {where} has two keys that both read as {key!r}",
                     {"next": "keep one of them"},
                 )
-            canonical[key] = _canonicalise(raw_value, name, f"{where}.{key}", budget, depth + 1)
+            step = key if len(key) <= _KEY_IN_PATH else f"{key[:_KEY_IN_PATH]}..."
+            canonical[key] = _canonicalise(raw_value, name, f"{where}.{step}", budget, depth + 1)
         return {key: canonical[key] for key in sorted(canonical)}
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
         return [_canonicalise(item, name, where, budget, depth + 1) for item in value]
