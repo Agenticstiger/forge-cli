@@ -119,6 +119,18 @@ class TestSelection:
         assert set(read_project_files(project)) == {"dbt_project.yml", "models/a.sql"}
 
 
+def _refusal(project: Path, **kwargs) -> str:
+    """Why :func:`read_project_files` refuses ``project``."""
+    with pytest.raises(DbtProjectFilesError) as exc:
+        read_project_files(project, **kwargs)
+    return str(exc.value)
+
+
+def _link(target: Path, link: Path) -> Path:
+    os.symlink(target, link)
+    return link.parent
+
+
 class TestRefusals:
     @pytest.mark.parametrize(
         "paths, why",
@@ -133,81 +145,65 @@ class TestRefusals:
     def test_a_path_key_outside_plain_directories(
         self, tmp_path: Path, paths: str, why: str
     ) -> None:
-        project = _project(tmp_path, f"name: p\nmodel-paths: {paths}\n")
-        with pytest.raises(DbtProjectFilesError, match="model-paths") as exc:
-            read_project_files(project)
-        assert why in str(exc.value)
+        text = _refusal(_project(tmp_path, f"name: p\nmodel-paths: {paths}\n"))
+        assert "model-paths" in text and why in text
 
     def test_a_linked_file(self, tmp_path: Path) -> None:
         project = _project(tmp_path)
-        outside = tmp_path / "outside.sql"
-        outside.write_text("select 'secret'", encoding="utf-8")
-        os.symlink(outside, project / "models" / "leak.sql")
-        with pytest.raises(DbtProjectFilesError, match="models/leak.sql.*symbolic link"):
-            read_project_files(project)
+        _write(tmp_path, {"outside.sql": "select 'secret'"})
+        _link(tmp_path / "outside.sql", project / "models" / "leak.sql")
+        assert "models/leak.sql in the dbt project is a symbolic link" in _refusal(project)
 
     def test_a_linked_directory(self, tmp_path: Path) -> None:
         project = _project(tmp_path)
-        shared = tmp_path / "shared_macros"
-        _write(shared, {"x.sql": "select 1"})
-        os.symlink(shared, project / "macros" / "shared")
-        with pytest.raises(DbtProjectFilesError, match="macros/shared.*symbolic link"):
-            read_project_files(project)
+        _write(tmp_path / "shared_macros", {"x.sql": "select 1"})
+        _link(tmp_path / "shared_macros", project / "macros" / "shared")
+        assert "macros/shared in the dbt project is a symbolic link" in _refusal(project)
 
     def test_a_path_key_through_a_link(self, tmp_path: Path) -> None:
         project = _project(tmp_path, "name: p\nmodel-paths: [lnk/leak]\n")
         _write(tmp_path / "elsewhere", {"leak/a.sql": "select 1"})
-        os.symlink(tmp_path / "elsewhere", project / "lnk")
-        with pytest.raises(DbtProjectFilesError, match="through the symbolic link 'lnk'"):
-            read_project_files(project)
+        _link(tmp_path / "elsewhere", project / "lnk")
+        assert "through the symbolic link 'lnk'" in _refusal(project)
 
     def test_a_linked_top_level_file(self, tmp_path: Path) -> None:
         project = _project(tmp_path)
-        real = tmp_path / "shared_packages.yml"
-        real.write_text("packages: []\n", encoding="utf-8")
+        _write(tmp_path, {"shared_packages.yml": "packages: []\n"})
         (project / "packages.yml").unlink()
-        os.symlink(real, project / "packages.yml")
-        with pytest.raises(DbtProjectFilesError, match="packages.yml.*symbolic link"):
-            read_project_files(project)
+        _link(tmp_path / "shared_packages.yml", project / "packages.yml")
+        assert "packages.yml in the dbt project is a symbolic link" in _refusal(project)
 
     def test_an_unreadable_dbt_project_yml(self, tmp_path: Path) -> None:
-        project = _project(tmp_path, "name: [unclosed\n")
-        with pytest.raises(DbtProjectFilesError, match="dbt_project.yml.*could not be read"):
-            read_project_files(project)
+        text = _refusal(_project(tmp_path, "name: [unclosed\n"))
+        assert "dbt_project.yml in" in text and "could not be read" in text
 
     def test_a_file_over_the_member_limit(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         project = _project(tmp_path)
         monkeypatch.setattr(pf, "MAX_FILE_BYTES", 100)
-        (project / "seeds" / "big.csv").write_text("x" * 101, encoding="utf-8")
-        with pytest.raises(DbtProjectFilesError, match="seeds/big.csv is over 100 bytes"):
-            read_project_files(project)
+        _write(project, {"seeds/big.csv": "x" * 101})
+        assert "seeds/big.csv is over 100 bytes" in _refusal(project)
 
     def test_a_project_over_the_bundle_limit(self, tmp_path: Path) -> None:
-        with pytest.raises(DbtProjectFilesError, match="the most one bundle packs"):
-            read_project_files(_project(tmp_path), budget=10)
+        assert "the most one bundle packs" in _refusal(_project(tmp_path), budget=10)
 
 
-def _contract(*builds: Dict) -> Dict:
-    return {"id": "demo.p", "builds": list(builds)}
-
-
-def _dbt_build(build_id: str = "transform", repository: str = "./dbt", **extra) -> Dict:
-    return {"id": build_id, "engine": "dbt-duckdb", "repository": repository, **extra}
+#: A dbt build whose project is ``./dbt``; tests vary it with ``{**DBT, ...}``.
+DBT: Dict = {"id": "transform", "engine": "dbt-duckdb", "repository": "./dbt"}
 
 
 class TestWhichBuildsBindAProject:
     @pytest.mark.parametrize(
         "build, binds",
         [
-            (_dbt_build(), True),
+            (DBT, True),
             ({"id": "t", "engine": "dbt"}, True),
-            (_dbt_build(execution={"runtime": {"platform": "databricks"}}), True),
-            (_dbt_build(repository="https://github.com/o/r?tag=v1"), False),
-            (_dbt_build(repository="git@github.com:o/r.git"), False),
-            (_dbt_build(pattern="embedded-logic", properties={"sql": "SELECT 1"}), False),
-            (_dbt_build(properties={"language": "flink_sql"}), False),
+            ({**DBT, "execution": {"runtime": {"platform": "databricks"}}}, True),
+            ({**DBT, "repository": "https://github.com/o/r?tag=v1"}, False),
+            ({**DBT, "repository": "git@github.com:o/r.git"}, False),
+            ({**DBT, "pattern": "embedded-logic", "properties": {"sql": "SELECT 1"}}, False),
+            ({**DBT, "properties": {"language": "flink_sql"}}, False),
             ({"id": "t", "engine": "sql", "properties": {"sql": "SELECT 1"}}, False),
             ({"id": "t", "engine": "spark"}, False),
             ("not a build", False),
@@ -217,40 +213,44 @@ class TestWhichBuildsBindAProject:
         assert binds_dbt_project(build) is binds
 
 
+def _collect_refusal(contract: Dict, contract_dir: Path) -> str:
+    """Why :func:`collect_bundle_projects` refuses ``contract`` in ``contract_dir``."""
+    with pytest.raises(DbtProjectFilesError) as exc:
+        collect_bundle_projects(contract, contract_dir / "contract.fluid.yaml")
+    return str(exc.value)
+
+
 class TestCollectBundleProjects:
     def test_each_dbt_build_by_id(self, tmp_path: Path) -> None:
         _project(tmp_path)
-        contract = _contract(
-            _dbt_build("a"), _dbt_build("b"), {"id": "c", "engine": "sql", "properties": {}}
-        )
+        builds = [{**DBT, "id": "a"}, {**DBT, "id": "b"}, {"id": "c", "engine": "sql"}]
+        contract = {"id": "demo.p", "builds": builds}
         projects = collect_bundle_projects(contract, tmp_path / "contract.fluid.yaml")
         assert sorted(projects) == ["a", "b"]
         assert set(projects["a"]) == READ
 
     def test_a_missing_project_names_the_build_and_the_path(self, tmp_path: Path) -> None:
-        with pytest.raises(DbtProjectFilesError, match=r"build 'transform': no dbt_project.yml"):
-            collect_bundle_projects(_contract(_dbt_build()), tmp_path / "contract.fluid.yaml")
+        text = _collect_refusal({"builds": [DBT]}, tmp_path)
+        assert text.startswith("build 'transform': no dbt_project.yml at ")
 
     def test_a_project_outside_the_workspace(self, tmp_path: Path) -> None:
         _project(tmp_path)
-        contract_path = tmp_path / "product" / "contract.fluid.yaml"
-        contract_path.parent.mkdir()
-        with pytest.raises(DbtProjectFilesError, match="outside the contract's workspace"):
-            collect_bundle_projects(_contract(_dbt_build(repository="../dbt")), contract_path)
+        (tmp_path / "product").mkdir()
+        contract = {"builds": [{**DBT, "repository": "../dbt"}]}
+        assert "outside the contract's workspace" in _collect_refusal(
+            contract, tmp_path / "product"
+        )
 
     @pytest.mark.parametrize("bad_id", [None, "../escape", "a/b", ".hidden", ""])
     def test_an_id_that_cannot_be_a_bundle_path(self, tmp_path: Path, bad_id) -> None:
         _project(tmp_path)
-        build = _dbt_build()
-        build["id"] = bad_id
-        with pytest.raises(DbtProjectFilesError, match=r"builds\[0\]: a dbt build needs an id"):
-            collect_bundle_projects(_contract(build), tmp_path / "contract.fluid.yaml")
+        text = _collect_refusal({"builds": [{**DBT, "id": bad_id}]}, tmp_path)
+        assert text.startswith("builds[0]: a dbt build needs an id")
 
     def test_two_builds_with_one_id(self, tmp_path: Path) -> None:
         _project(tmp_path)
-        contract = _contract(_dbt_build("a"), _dbt_build("a"))
-        with pytest.raises(DbtProjectFilesError, match="two dbt builds share the id 'a'"):
-            collect_bundle_projects(contract, tmp_path / "contract.fluid.yaml")
+        contract = {"builds": [{**DBT, "id": "a"}, {**DBT, "id": "a"}]}
+        assert "two dbt builds share the id 'a'" in _collect_refusal(contract, tmp_path)
 
     def test_the_limit_counts_every_project_together(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -258,9 +258,8 @@ class TestCollectBundleProjects:
         project = _project(tmp_path)
         one = sum(len(data) for data in read_project_files(project).values())
         monkeypatch.setattr(pf, "MAX_PROJECT_BYTES", one + one // 2)
-        contract = _contract(_dbt_build("a"), _dbt_build("b"))
-        with pytest.raises(DbtProjectFilesError, match="build 'b'"):
-            collect_bundle_projects(contract, tmp_path / "contract.fluid.yaml")
+        contract = {"builds": [{**DBT, "id": "a"}, {**DBT, "id": "b"}]}
+        assert _collect_refusal(contract, tmp_path).startswith("build 'b': its files pass")
 
 
 class TestCheck:
@@ -296,7 +295,7 @@ class TestCheck:
         expected = {f"models/m{i:02}.sql": "sha256:a" for i in range(13)}
         text = diff_trees(expected, {}).describe()
         assert text.startswith("removed models/m00.sql, ")
-        assert text.endswith("models/m09.sql and 3 more")
+        assert text.endswith("models/m05.sql (+7 more)")
 
 
 class TestBoundProjects:

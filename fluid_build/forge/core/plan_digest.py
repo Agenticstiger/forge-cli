@@ -313,24 +313,21 @@ def is_bundle_path(path: str) -> bool:
 DBT_PROJECTS_FIELD = "dbtProjects"
 
 
-def dbt_projects_record(trees: Mapping[str, Mapping[str, str]]) -> Dict[str, Any]:
+def dbt_projects_record(bundle_path: Path) -> Dict[str, Any]:
     """``{build id: {"digest": <merkle root>, "files": {path: sha256:<hex>}}}`` for a plan.
 
-    ``trees`` is what :func:`~fluid_build.forge.core.bundle.read_bundle_dbt_trees`
-    returns; paths are relative to each project. ``{}`` when no project is bound.
+    The dbt projects the bundle at ``bundle_path`` packs
+    (:func:`~fluid_build.forge.core.bundle.read_bundle_dbt_trees`), paths relative
+    to each project; ``{}`` when it packs none. The caller has verified the
+    bundle's MANIFEST.
     """
-    from fluid_build.forge.core.bundle import merkle_root
+    from fluid_build.forge.core.bundle import merkle_root, read_bundle_dbt_trees
 
+    trees = read_bundle_dbt_trees(bundle_path)
     return {
         build_id: {"digest": merkle_root(files), "files": dict(sorted(files.items()))}
         for build_id, files in sorted(trees.items())
     }
-
-
-def _bundle_dbt_record(bundle_path: Path) -> Dict[str, Any]:
-    from fluid_build.forge.core.bundle import read_bundle_dbt_trees
-
-    return dbt_projects_record(read_bundle_dbt_trees(bundle_path))
 
 
 def inject_digests(
@@ -379,7 +376,7 @@ def inject_digests(
     # The dbt projects the bundle packs, bound under planDigest. Read after
     # ``read_bundle_digest`` has verified the MANIFEST; only a bundle binds them,
     # so a raw plan carries no record.
-    record = _bundle_dbt_record(bundle_path) if bundle_path else {}
+    record = dbt_projects_record(bundle_path) if bundle_path else {}
     if record:
         out[DBT_PROJECTS_FIELD] = record
     else:
@@ -556,11 +553,15 @@ def verify_plan_binding(
             f"plan (emergency hotfix only; logged prominently).",
         )
 
-    # 3. The dbt projects (after the tamper check, so an edited record reports
-    #    plan-tamper): a bound plan's record is the bundle's, and only a bound
-    #    plan has one.
+    # 3. The dbt projects, after the tamper check so an edited record reports
+    #    plan-tamper.
+    _verify_dbt_projects_record(plan, bundle_path if expected_bundle else None)
+
+
+def _verify_dbt_projects_record(plan: Dict[str, Any], bundle_path: Optional[Path]) -> None:
+    """A bound plan's ``dbtProjects`` is the record of its bundle's; a raw plan has none."""
     recorded = plan.get(DBT_PROJECTS_FIELD) or {}
-    if not expected_bundle:
+    if bundle_path is None:
         if recorded:
             raise PlanBindingError(
                 "binding-mode-mismatch",
@@ -568,7 +569,7 @@ def verify_plan_binding(
                 "plan made from a bundle binds dbt projects. Re-run ``fluid plan``.",
             )
         return
-    bundled = _bundle_dbt_record(bundle_path)
+    bundled = dbt_projects_record(bundle_path)
     if recorded != bundled:
         raise PlanBindingError(
             "bundle-mismatch",

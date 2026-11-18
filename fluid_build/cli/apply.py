@@ -1106,10 +1106,8 @@ def _bind_dbt_projects(
     from fluid_build.build_runners.dbt.project_files import (
         BoundProject,
         binds_dbt_project,
-        check_project,
         set_bound_projects,
     )
-    from fluid_build.build_runners.dbt.runner import resolve_dbt_project_path
 
     from ..forge.core.bundle import read_bundle_dbt_trees
     from ..forge.core.plan_digest import PlanBindingError
@@ -1132,42 +1130,54 @@ def _bind_dbt_projects(
     anchor, why = locate()
     bound: Dict[str, BoundProject] = {}
     for build_id, files in sorted(trees.items()):
-        build = builds.get(build_id)
-        if build is None or not binds_dbt_project(build):
-            raise PlanBindingError(
-                "bundle-mismatch",
-                f"{bundle_path} packs a dbt project for build {build_id!r}, which is not a dbt "
-                "build of the contract it carries. Re-run ``fluid bundle`` and ``fluid plan``.",
-            )
-        if anchor is None:
-            raise PlanBindingError(
-                "bundle-mismatch",
-                f"{bundle_path} packs the dbt project of build {build_id!r}, and the checkout "
-                f"to check it against cannot be found: {subject} {why}. Run ``fluid apply`` "
-                "in the checkout the bundle was built from.",
-            )
-        project = resolve_dbt_project_path(anchor, dict(build))
-        if project is None:
-            raise PlanBindingError(
-                "bundle-mismatch",
-                f"{bundle_path} packs the dbt project of build {build_id!r} ({len(files)} files), "
-                f"and there is none where the build runs it: no dbt_project.yml for repository "
-                f"{build.get('repository', './')!r} from {anchor.parent}, or it is outside the "
-                "contract's workspace. Run ``fluid apply`` in the checkout the bundle was "
-                "built from.",
-            )
-        problem = check_project(project, files)
-        if problem is not None:
-            raise PlanBindingError(
-                "bundle-mismatch",
-                f"the dbt project of build {build_id!r} at {project} differs from the copy "
-                f"{bundle_path} packs: {problem}. Re-run ``fluid bundle`` and ``fluid plan`` to "
-                "bind the files as they are now, or restore them.",
-            )
-        bound[build_id] = BoundProject(
-            build_id=build_id, files=dict(files), bundle=str(bundle_path)
-        )
+        project = BoundProject(build_id=build_id, files=dict(files), bundle=str(bundle_path))
+        _check_bound_build(builds.get(build_id), project, anchor, f"{subject} {why}")
+        bound[build_id] = project
     set_bound_projects(bound)
+
+
+def _check_bound_build(
+    build: Optional[Dict[str, Any]], bound: Any, anchor: Optional[Path], why: str
+) -> None:
+    """One packed project (a ``BoundProject``) against the checkout, as
+    :func:`_bind_dbt_projects` describes; ``why`` says why ``anchor`` is ``None``."""
+    from fluid_build.build_runners.dbt.project_files import binds_dbt_project, check_project
+    from fluid_build.build_runners.dbt.runner import resolve_dbt_project_path
+
+    from ..forge.core.plan_digest import PlanBindingError
+
+    build_id, files, bundle_path = bound.build_id, bound.files, bound.bundle
+    if build is None or not binds_dbt_project(build):
+        raise PlanBindingError(
+            "bundle-mismatch",
+            f"{bundle_path} packs a dbt project for build {build_id!r}, which is not a dbt "
+            "build of the contract it carries. Re-run ``fluid bundle`` and ``fluid plan``.",
+        )
+    if anchor is None:
+        raise PlanBindingError(
+            "bundle-mismatch",
+            f"{bundle_path} packs the dbt project of build {build_id!r}, and the checkout "
+            f"to check it against cannot be found: {why}. Run ``fluid apply`` in the "
+            "checkout the bundle was built from.",
+        )
+    project = resolve_dbt_project_path(anchor, dict(build))
+    if project is None:
+        raise PlanBindingError(
+            "bundle-mismatch",
+            f"{bundle_path} packs the dbt project of build {build_id!r} ({len(files)} files), "
+            f"and there is none where the build runs it: no dbt_project.yml for repository "
+            f"{build.get('repository', './')!r} from {anchor.parent}, or it is outside the "
+            "contract's workspace. Run ``fluid apply`` in the checkout the bundle was "
+            "built from.",
+        )
+    problem = check_project(project, files)
+    if problem is not None:
+        raise PlanBindingError(
+            "bundle-mismatch",
+            f"the dbt project of build {build_id!r} at {project} differs from the copy "
+            f"{bundle_path} packs: {problem}. Re-run ``fluid bundle`` and ``fluid plan`` to "
+            "bind the files as they are now, or restore them.",
+        )
 
 
 def _verify_bundle_dbt_projects(args, contract: Dict[str, Any], logger: logging.Logger) -> None:

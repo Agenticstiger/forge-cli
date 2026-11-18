@@ -37,7 +37,7 @@ import hashlib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 #: Top-level project files dbt reads; ``profiles.yml`` is never one of them.
 PROJECT_FILES: Tuple[str, ...] = (
@@ -182,16 +182,8 @@ def _walk(
         return  # dbt tolerates a missing default directory
     for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
         here = Path(dirpath)
-        dirnames.sort()  # the same walk, so the same first link reported, on every file system
-        for name in list(dirnames):
-            child = here / name
-            if name.startswith(".") or name == "__pycache__":
-                dirnames.remove(name)
-            elif child.is_symlink():
-                links.append(child.relative_to(project).as_posix())
-                dirnames.remove(name)
-            elif child.resolve() in skip:
-                dirnames.remove(name)
+        # Sorted, so every file system walks alike and reports the same first link.
+        dirnames[:] = [n for n in sorted(dirnames) if _descend(project, here / n, links, skip)]
         for name in sorted(filenames):
             path = here / name
             if name.startswith(".") or name.lower() in _PROFILE_NAMES:
@@ -201,6 +193,17 @@ def _walk(
                 links.append(rel)
             elif path.is_file():
                 found[rel] = path
+
+
+def _descend(project: Path, child: Path, links: List[str], skip: FrozenSet[Path]) -> bool:
+    """Whether the walk enters ``child``: not hidden, a cache, a link (collected) or a
+    directory dbt writes into."""
+    if child.name.startswith(".") or child.name == "__pycache__":
+        return False
+    if child.is_symlink():
+        links.append(child.relative_to(project).as_posix())
+        return False
+    return child.resolve() not in skip
 
 
 def load_project_config(project: Path) -> Mapping[str, Any]:
@@ -357,10 +360,6 @@ def collect_bundle_projects(
 # ---------------------------------------------------------------------------
 
 
-#: How many paths of each kind a mismatch names before it counts the rest.
-_SHOWN = 10
-
-
 @dataclass(frozen=True)
 class TreeDiff:
     """How a project on disk differs from the files a bundle binds."""
@@ -373,15 +372,14 @@ class TreeDiff:
         return bool(self.changed or self.added or self.removed)
 
     def describe(self) -> str:
-        """``changed a.sql, b.sql; added c.sql; removed d.sql`` (the first few of each)."""
+        """``changed a.sql, b.sql; added c.sql; removed d.sql``: a few of each, then a count.
+
+        Listed as the state-drift report lists paths (``iac/drift.py::shown``).
+        """
+        from fluid_build.iac.drift import shown
+
         kinds = (("changed", self.changed), ("added", self.added), ("removed", self.removed))
-        return "; ".join(f"{label} {_listed(paths)}" for label, paths in kinds if paths)
-
-
-def _listed(paths: Sequence[str]) -> str:
-    shown = ", ".join(paths[:_SHOWN])
-    rest = len(paths) - _SHOWN
-    return f"{shown} and {rest} more" if rest > 0 else shown
+        return "; ".join(f"{label} {shown(list(paths))}" for label, paths in kinds if paths)
 
 
 def diff_trees(expected: Mapping[str, str], actual: Mapping[str, str]) -> TreeDiff:

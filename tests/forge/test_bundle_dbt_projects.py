@@ -123,34 +123,40 @@ class TestPacking:
         assert read_bundle_dbt_trees(tgz) == {}
 
 
+def _refusal(out: Path, projects: Dict[str, Dict[str, bytes]]) -> str:
+    """Why ``build_bundle_tgz`` refuses ``projects``; nothing is written."""
+    with pytest.raises(ValueError) as exc:
+        build_bundle_tgz(CONTRACT, out, dbt_projects=projects)
+    assert not out.exists()
+    return str(exc.value)
+
+
 class TestRefusals:
     @pytest.mark.parametrize("build_id", ["../x", "a/b", ".hidden", "", "a\\b"])
     def test_a_build_id_that_is_not_one_directory(self, tmp_path: Path, build_id: str) -> None:
-        with pytest.raises(ValueError, match="cannot be a bundle directory"):
-            build_bundle_tgz(CONTRACT, tmp_path / "b.tgz", dbt_projects={build_id: PROJECT})
+        text = _refusal(tmp_path / "b.tgz", {build_id: PROJECT})
+        assert "cannot be a bundle directory" in text
 
     @pytest.mark.parametrize(
         "rel", ["../escape.sql", "/abs.sql", "models/../../x.sql", "models/.h.sql", "a//b.sql"]
     )
     def test_a_file_path_that_is_not_plain(self, tmp_path: Path, rel: str) -> None:
-        with pytest.raises(ValueError, match="not a plain relative path"):
-            build_bundle_tgz(CONTRACT, tmp_path / "b.tgz", dbt_projects={"transform": {rel: b"x"}})
+        text = _refusal(tmp_path / "b.tgz", {"transform": {rel: b"x"}})
+        assert "not a plain relative path" in text
 
     def test_more_dbt_bytes_than_a_bundle_carries(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(bundle_mod, "MAX_DBT_SOURCE_BYTES", 10)
-        with pytest.raises(ValueError, match="bytes of dbt project files at most"):
-            build_bundle_tgz(CONTRACT, tmp_path / "b.tgz", dbt_projects={"transform": PROJECT})
+        text = _refusal(tmp_path / "b.tgz", {"transform": PROJECT})
+        assert "bytes of dbt project files at most" in text
 
     def test_more_entries_than_the_reader_takes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(bundle_mod, "MAX_BUNDLE_MEMBERS", 8)
-        out = tmp_path / "b.tgz"
-        with pytest.raises(ValueError, match="entries"):
-            build_bundle_tgz(CONTRACT, out, dbt_projects={"transform": PROJECT})
-        assert not out.exists()
+        text = _refusal(tmp_path / "b.tgz", {"transform": PROJECT})
+        assert "entries (files and directories)" in text
 
     @pytest.mark.parametrize(
         "rel",
@@ -160,10 +166,7 @@ class TestRefusals:
         ],
     )
     def test_a_path_the_tar_format_cannot_hold(self, tmp_path: Path, rel: str) -> None:
-        out = tmp_path / "b.tgz"
-        with pytest.raises(ValueError, match="too long a path"):
-            build_bundle_tgz(CONTRACT, out, dbt_projects={"transform": {rel: b"x"}})
-        assert not out.exists()
+        assert "too long a path" in _refusal(tmp_path / "b.tgz", {"transform": {rel: b"x"}})
 
     def test_a_long_path_the_format_splits_is_packed(self, tmp_path: Path) -> None:
         rel = "models/" + "d" * 110 + "/x.sql"  # 150 bytes: prefix + name
@@ -265,6 +268,13 @@ class TestPlanRecord:
         assert again[DBT_PROJECTS_FIELD] == plan[DBT_PROJECTS_FIELD]
 
 
+def _kind(plan: Dict[str, Any], bundle: Any = None) -> str:
+    """The ``PlanBindingError`` kind ``verify_plan_binding`` refuses ``plan`` with."""
+    with pytest.raises(PlanBindingError) as exc:
+        verify_plan_binding(plan, bundle_path=bundle)
+    return exc.value.kind
+
+
 class TestVerify:
     def test_the_plan_and_its_bundle_pass(self, bound) -> None:
         tgz, plan = bound
@@ -273,30 +283,22 @@ class TestVerify:
     def test_an_edited_record_is_plan_tamper(self, bound) -> None:
         tgz, plan = bound
         plan[DBT_PROJECTS_FIELD]["transform"]["files"]["models/orders.sql"] = _sha(b"x")
-        with pytest.raises(PlanBindingError) as exc:
-            verify_plan_binding(plan, bundle_path=tgz)
-        assert exc.value.kind == "plan-tamper"
+        assert _kind(plan, tgz) == "plan-tamper"
 
     def test_a_record_that_is_not_the_bundles_is_bundle_mismatch(self, bound) -> None:
         tgz, plan = bound
         plan[DBT_PROJECTS_FIELD]["transform"]["files"]["models/orders.sql"] = _sha(b"x")
         plan["planDigest"] = compute_plan_digest(plan)  # re-signed: not a tamper
-        with pytest.raises(PlanBindingError) as exc:
-            verify_plan_binding(plan, bundle_path=tgz)
-        assert exc.value.kind == "bundle-mismatch"
+        assert _kind(plan, tgz) == "bundle-mismatch"
 
     def test_a_stripped_record_is_bundle_mismatch(self, bound) -> None:
         tgz, plan = bound
         del plan[DBT_PROJECTS_FIELD]
         plan["planDigest"] = compute_plan_digest(plan)
-        with pytest.raises(PlanBindingError) as exc:
-            verify_plan_binding(plan, bundle_path=tgz)
-        assert exc.value.kind == "bundle-mismatch"
+        assert _kind(plan, tgz) == "bundle-mismatch"
 
     def test_a_raw_plan_carrying_a_record_is_refused(self) -> None:
         plan = inject_digests(_plan())
         plan[DBT_PROJECTS_FIELD] = {"transform": {"digest": "sha256:0", "files": {}}}
         plan["planDigest"] = compute_plan_digest(plan)
-        with pytest.raises(PlanBindingError) as exc:
-            verify_plan_binding(plan)
-        assert exc.value.kind == "binding-mode-mismatch"
+        assert _kind(plan) == "binding-mode-mismatch"
