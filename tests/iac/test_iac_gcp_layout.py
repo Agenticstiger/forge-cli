@@ -186,9 +186,9 @@ def test_four_cluster_columns_are_held_and_a_fifth_is_refused():
 @pytest.mark.parametrize(
     "cluster_by, says",
     [
-        (["score"], "cluster_by[0] names 'score', which is a FLOAT64 column"),
-        (["payload"], "cluster_by[0] names 'payload', which is a JSON column"),
-        (["region", "tags"], "cluster_by[1] names 'tags', which is a REPEATED STRING column"),
+        (["score"], "cluster_by[0] names 'score', whose type is FLOAT64"),
+        (["payload"], "cluster_by[0] names 'payload', whose type is JSON"),
+        (["region", "tags"], "cluster_by[1] names 'tags', whose type is REPEATED STRING"),
         (["region", "nope"], "cluster_by[1] names 'nope', which is not a column of the expose's"),
         (["region", "region"], "cluster_by[1] names 'region' again"),
     ],
@@ -286,4 +286,4 @@ def test_strict_validate_refuses_an_unclusterable_column_and_passes_a_good_layou
     bad = _contract(partition_by=["event_date"], cluster_by=["score"])
     assert _run("validate", tmp_path, bad) == 1
     seen = capsys.readouterr()
-    assert "cluster_by[0] names 'score', which is a FLOAT64 column" in seen.out + seen.err
+    assert "cluster_by[0] names 'score', whose type is FLOAT64" in seen.out + seen.err

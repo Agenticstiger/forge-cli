@@ -575,7 +575,7 @@ def _cluster_column_problems(exposure: Mapping[str, Any], columns: Any, *, where
         repeated = field["mode"] == "REPEATED"
         if repeated or field["type"] not in _CLUSTERING_COLUMN_TYPES:
             shown = f"REPEATED {field['type']}" if repeated else field["type"]
-            problems.append(f"{named}, which is a {shown} column")
+            problems.append(f"{named}, whose type is {shown}")
     return problems
 
 
