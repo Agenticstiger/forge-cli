@@ -610,27 +610,30 @@ class LocalRuns:
         record = _read_json(where / RUN_FILE)
         if not record:
             raise SparkRunError(f"local run {run_id} of {self.build} has no record in {where}")
+        # The lock first: while any of the run's processes lives it is active, whatever
+        # its status says, and once none does, the end it recorded (if any) is there.
+        held = _held(where / LOCK_FILE)
         status = _read_json(where / STATUS_FILE)
-        held = "ended" not in status and _held(where / LOCK_FILE)
-        if not held and "ended" not in status:
-            # Every run process has exited, so an end it recorded is there now.
-            status = _read_json(where / STATUS_FILE)
         cancelled = (where / CANCEL_FILE).exists()
+        signalled = status.get("stopSignal")
         details, lost = "", False
-        if "ended" in status:
-            code = status.get("exitCode")
-            if code == 0:  # its work was done, whether or not a cancel came after
-                state, raw = SUCCEEDED, "SUCCEEDED"
-            elif cancelled:
-                state, raw = CANCELLED, "CANCELLED"
-            else:
-                state, raw = FAILED, f"FAILED (exit {code})"
-                details = f"log {where / LOG_FILE}: {_log_tail(where / LOG_FILE)}"
-        elif held:
-            state = CANCELLING if cancelled else RUNNING if status.get("started") else PENDING
+        if held:
+            stopping = cancelled or signalled
+            state = CANCELLING if stopping else RUNNING if status.get("started") else PENDING
             raw = state
+        elif "ended" in status and status.get("exitCode") == 0:
+            state, raw = SUCCEEDED, "SUCCEEDED"  # its work was done, cancelled or not
         elif cancelled:
             state, raw = CANCELLED, "CANCELLED"
+        elif signalled:
+            # Stopped from outside forge (its machine shut down, a kill), as a job run
+            # cancelled by hand on AWS: it did not fail, and its config starts again.
+            state, raw = CANCELLED, f"STOPPED (signal {signalled})"
+            details = "a signal from outside forge stopped it (its machine shut down, or a kill)"
+        elif "ended" in status:
+            code = status.get("exitCode")
+            state, raw = FAILED, f"FAILED (exit {code})"
+            details = f"log {where / LOG_FILE}: {_log_tail(where / LOG_FILE)}"
         else:
             state, raw, lost = FAILED, "LOST", True
             details = (
@@ -663,16 +666,16 @@ class LocalRuns:
         is still the run's (a group id is not reused while a member lives). A run that
         has ended keeps the end it recorded."""
         where = self._run_dir(run_id)
-        if "ended" in _read_json(where / STATUS_FILE):
-            return
+        lock = where / LOCK_FILE
+        if not _held(lock):
+            return  # every process of the run has exited: nothing is left to stop
         _replace(where / CANCEL_FILE, f"{time.time()}\n".encode("utf-8"))
         group = _read_json(where / RUN_FILE).get("pgid")
         if not isinstance(group, int):
             # Not in run.json yet (an apply stopped while it started the run): the
             # supervisor's pid, its group's id, which it records before anything else.
             group = _read_json(where / STATUS_FILE).get("supervisorPid")
-        lock = where / LOCK_FILE
-        if not isinstance(group, int) or group <= 1:
+        if not isinstance(group, int) or not 1 < group < 2**31:
             return  # not started yet: the supervisor reads the mark and starts nothing
         deadline = now() + grace
         for signum in (signal.SIGTERM, signal.SIGKILL):
@@ -814,7 +817,7 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
         # Stopped while it starts (Ctrl-C, or the SIGTERM run_once turns into one): the
         # caller has no run id to cancel yet, so the run is stopped here.
         with suppress(Exception):
-            runs.cancel(run_id)
+            runs.cancel(run_id, grace=5.0)  # the supervisor finishes a stop it outlasts
         raise
     runs.prune()
     return run_id

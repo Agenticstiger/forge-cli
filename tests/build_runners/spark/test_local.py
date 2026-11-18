@@ -76,6 +76,15 @@ if mode == "batch":
 if os.environ.get("STUB_STREAM_EXIT"):
     print("stub: the stream failed", flush=True)
     sys.exit(int(os.environ["STUB_STREAM_EXIT"]))
+if os.environ.get("STUB_GRANDCHILD"):
+    # A process of the run that ignores SIGTERM and holds every inherited descriptor,
+    # the run's lock among them.
+    import subprocess
+    subprocess.Popen(
+        [sys.executable, "-c",
+         "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"],
+        close_fds=False,
+    )
 stop = []
 if os.environ.get("STUB_IGNORE_TERM"):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -571,6 +580,37 @@ def test_a_marked_run_that_ignores_sigterm_is_killed_after_the_supervisor_s_grac
     started.append((runs, run_id))
     (runs.dir / "runs" / run_id / "cancel").write_text("1\n")
     assert wait_for(lambda: runs.get(run_id), lambda i: i.state == CANCELLED).state == CANCELLED
+
+
+def test_nothing_of_a_stopped_run_outlives_it(host, started, monkeypatch):
+    """A process of the run that ignores SIGTERM and holds its lock: the run is still going
+    while it lives, and the supervisor's group goes with spark-submit."""
+    monkeypatch.setattr(_local, "STOP_GRACE_S", 0.5)
+    run = the_run(local_contract())
+    run_id = start_run(with_env(host, STUB_GRANDCHILD="1"), run, "t", runner_text=runner_source())
+    runs = LocalRuns(host, run.product, run.build)
+    started.append((runs, run_id))
+    (runs.dir / "runs" / run_id / "cancel").write_text("1\n")
+    assert wait_for(lambda: runs.get(run_id), lambda i: i.state == CANCELLED).state == CANCELLED
+
+
+def test_a_stop_signal_from_outside_forge_is_a_stop_not_a_failure(host, started):
+    """The machine shutting down sends every process SIGTERM: the stream stopped, it did
+    not fail, so the next apply starts it again, as for a job run cancelled by hand on AWS."""
+    run = the_run(local_contract())
+    (first,) = rc.reconcile([run], local_host=host)
+    runs = LocalRuns(host, run.product, run.build)
+    started.append((runs, first.run_id))
+    status = json.loads((runs.dir / "runs" / first.run_id / "status.json").read_text())
+    os.kill(status["supervisorPid"], signal.SIGTERM)
+    stopped = wait_for(lambda: runs.get(first.run_id), lambda i: i.state == CANCELLED)
+    assert (stopped.state, stopped.raw_state) == (
+        CANCELLED,
+        f"STOPPED (signal {int(signal.SIGTERM)})",
+    )
+    (again,) = rc.reconcile([run], local_host=host)
+    started.append((runs, again.run_id))
+    assert (again.action, again.error) == ("started", False) and again.run_id != first.run_id
 
 
 def test_a_cancel_finds_a_run_whose_process_group_was_never_recorded(host, started):

@@ -18,9 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by default `.fluid/spark-artifacts` beside the contract. spark-submit reads both from there.
   A stream follows `spark.reconcile` as on AWS: it is left alone while its config hash is
   unchanged, stopped and started again on the same checkpoint when the hash changes, and stopped
-  when the contract no longer runs the build locally. A stream that stopped without recording
-  an end (its machine restarted) starts again on the next apply; one that failed does not until
-  its config changes, as on AWS. A batch or `availableNow` build runs once
+  when the contract no longer runs the build locally. A stream stopped from outside forge (its
+  machine shut down or restarted, a kill) starts again on the next apply, as one cancelled by hand
+  on AWS does; one that failed does not until its config changes. A batch or `availableNow` build
+  runs once
   under `fluid apply --mode amend-and-build --build-id <id>`, the command a generated DAG runs, and
   reports SUCCEEDED or FAILED. Run state lives under `.fluid/<product>/runtime/spark/<build>/`.
   The output is a table in an Iceberg REST catalog (`location.catalog` lakekeeper, rest or

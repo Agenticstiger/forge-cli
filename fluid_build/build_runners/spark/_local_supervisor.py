@@ -8,15 +8,18 @@
 Standard library only, and never imported: forge-cli runs it by path with ``-I -S``, so
 no working directory, ``PYTHON*`` variable or site directory reaches ``sys.path``. It
 keeps the run's lock (taken by forge-cli and inherited) and hands it on to spark-submit,
-so the lock is held while any of the run's processes lives. It writes ``status.json``
+so the lock is held while any of the run's processes lives, and ends them all when
+spark-submit has ended. It writes ``status.json``
 when it starts (its pid, which is its process group's id), when spark-submit has started,
 and again when it has ended, with its exit code.
 
 A stop is honoured whenever it comes: SIGTERM, SIGINT or SIGHUP, or the ``cancel`` mark
 forge-cli writes in the run directory before it signals the run's process group. Before
 spark-submit has started, nothing starts. After, the run's processes get SIGTERM, and
-spark-submit SIGKILL once ``--grace`` seconds have passed, so a run stops even when the
-signals of the ``fluid apply`` that cancelled it came too early or were cut short.
+SIGKILL once ``--grace`` seconds have passed (this supervisor's whole group, itself
+included, when it leads one), so a run stops even when the signals of the ``fluid apply``
+that cancelled it came too early or were cut short. A signal with no mark came from
+outside forge (the machine shutting down, a kill): ``stopSignal`` records it first.
 """
 
 import argparse
@@ -39,24 +42,29 @@ def _write(path, data):
 
 def _signal(child, signum, group):
     """``signum`` to the run's processes: the whole group when this supervisor leads it
-    (forge-cli starts it in a session of its own), else spark-submit alone."""
+    (forge-cli starts it in a session of its own), else spark-submit alone. The group's
+    SIGKILL ends this supervisor too, before it records an end: the run then reads as
+    cancelled (the mark) or stopped (``stopSignal``)."""
     try:
-        if group and signum != signal.SIGKILL:
-            os.killpg(os.getpgrp(), signum)  # this supervisor's handler only notes it
+        if group:
+            os.killpg(os.getpgrp(), signum)  # SIGTERM: this supervisor's handler notes it
         else:
             child.send_signal(signum)
     except OSError:
         pass
 
 
-def _wait(child, cancel_path, stopping, grace):
+def _wait(child, cancel_path, stopping, grace, status_path, status):
     """spark-submit's exit code once it has ended. A stop that came at any time gets the
-    run SIGTERM, then spark-submit SIGKILL after ``grace`` seconds."""
+    run SIGTERM, then SIGKILL after ``grace`` seconds."""
     group = os.getpgrp() == os.getpid()
     since = None
     while True:
         if since is None and (stopping or os.path.exists(cancel_path)):
             since = time.monotonic()
+            if not os.path.exists(cancel_path):
+                status["stopSignal"] = stopping[0]
+                _write(status_path, status)
             _signal(child, signal.SIGTERM, group)
         elif since is not None and time.monotonic() - since > grace:
             _signal(child, signal.SIGKILL, group)
@@ -90,6 +98,8 @@ def main(argv=None):
         _write(status_path, {**status, "ended": time.time(), "exitCode": 2})
         return 2
     if stopping or os.path.exists(cancel_path):
+        if not os.path.exists(cancel_path):
+            status["stopSignal"] = stopping[0]
         _write(status_path, {**status, "ended": time.time(), "exitCode": None})
         return 0
     with open(os.path.join(args.run_dir, "driver.log"), "ab", buffering=0) as log:
@@ -108,8 +118,12 @@ def main(argv=None):
             return 1
         status.update(pid=child.pid, started=time.time())
         _write(status_path, status)
-        code = _wait(child, cancel_path, stopping, args.grace)
+        code = _wait(child, cancel_path, stopping, args.grace, status_path, status)
     _write(status_path, {**status, "ended": time.time(), "exitCode": code})
+    if os.getpgrp() == os.getpid():
+        # Nothing of the run outlives spark-submit, as a cluster ends a job's containers
+        # with its driver: the rest of this group goes, this supervisor with it.
+        os.killpg(os.getpgrp(), signal.SIGKILL)
     return 0
 
 
