@@ -436,7 +436,7 @@ def test_exact_number_type_per_dialect() -> None:
     for dialect in ("duckdb", "databricks", "athena"):
         assert fs.exact_number_type(dialect, 4) == "DECIMAL(38, 4)"
     assert fs.exact_number_type("bigquery", None) == "FLOAT64"
-    assert fs.exact_number_type("postgres", None) == "DOUBLE PRECISION"
+    assert fs.exact_number_type("postgres", None) == "NUMERIC"  # exact; round() takes it
     for dialect in ("duckdb", "snowflake", "databricks", "athena"):
         assert fs.exact_number_type(dialect, None) == "DOUBLE"
     assert fs.exact_number_type("duckdb", 99) == "DECIMAL(38, 38)"
@@ -451,13 +451,14 @@ def test_division_and_comparison_use_the_exact_type_per_dialect() -> None:
         "postgres": "NUMERIC(38, 4)",
         "duckdb": "DECIMAL(38, 4)",
         "databricks": "DECIMAL(38, 4)",
-        "athena": "DECIMAL(38, 4)",
+        "athena": "DECIMAL(38, 18)",  # Trino divides at the larger operand scale
     }
     for dialect, name in names.items():
         assert "CAST(" in render("x / y", cols, dialect)
         assert f" AS {name}) / NULLIF(" in render("x / y", cols, dialect)
-        assert f"AS {name})" in render("x = y", cols, dialect, fs.PREDICATE)
-    doubles = {"bigquery": "FLOAT64", "postgres": "DOUBLE PRECISION", "duckdb": "DOUBLE"}
+        compared = name if dialect != "athena" else "DECIMAL(38, 4)"
+        assert f"AS {compared})" in render("x = y", cols, dialect, fs.PREDICATE)
+    doubles = {"bigquery": "FLOAT64", "postgres": "NUMERIC", "duckdb": "DOUBLE"}
     for dialect, name in doubles.items():
         assert f"AS {name})" in render("f / y", cols, dialect)
 
@@ -541,3 +542,23 @@ def test_node_module_is_the_one_the_renderer_uses() -> None:
     assert not _Renderer("athena", compile_text("1", {})[1], fs.column_reader("athena")).whole_units
     _unused: Optional[int] = None
     assert _unused is None
+
+
+def test_bigquery_reads_a_decimal_literal_as_bignumeric() -> None:
+    cols = {"net": "decimal(12,2)"}
+    sql = render("ROUND(net * 1.15, 2)", cols, "bigquery")
+    assert "BIGNUMERIC '1.15'" in sql and " 1.15" not in sql
+    assert "* 2)" in render("net * 2", cols, "bigquery")  # an integer stays INT64
+    parses(sql, "bigquery")
+
+
+def test_postgres_rounds_a_quotient_or_a_float_in_numeric() -> None:
+    cols = {"net": "decimal(12,2)", "qty": "integer", "f": "double"}
+    for text in ("ROUND(net / qty / 12, 2)", "ROUND(f * 2, 2)", "ROUND(f, 2, 'HALF_TO_EVEN')"):
+        sql = render(text, cols, "postgres")
+        assert "DOUBLE PRECISION" not in sql
+        parses(sql, "postgres")
+
+
+def test_athena_divides_with_eighteen_places_at_least() -> None:
+    assert "AS DECIMAL(38, 18)) / NULLIF(" in render("net / 3", {"net": "decimal(12,2)"}, "athena")

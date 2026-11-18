@@ -81,7 +81,9 @@ def exact_number_type(dialect: str, scale: Optional[int]) -> str:
     """The engine's exact decimal type with ``scale`` digits of scale, or its double when
     ``scale`` is ``None`` (unbounded: approximate in the engine either way)."""
     if scale is None:
-        return {"bigquery": "FLOAT64", "postgres": "DOUBLE PRECISION"}.get(dialect, "DOUBLE")
+        # PostgreSQL's NUMERIC without a typmod is exact and unbounded, and round(x, s),
+        # mod and trunc take no double precision there.
+        return {"bigquery": "FLOAT64", "postgres": "NUMERIC"}.get(dialect, "DOUBLE")
     scale = min(max(scale, 0), 38)
     name = {"snowflake": "NUMBER", "bigquery": "BIGNUMERIC", "postgres": "NUMERIC"}.get(
         dialect, "DECIMAL"
@@ -239,6 +241,9 @@ class _Renderer:
         if isinstance(node, _PREDICATES):
             return self.truth(node)
         if isinstance(node, n.Number):
+            if self.dialect == "bigquery" and "." in node.text:
+                # BigQuery reads 1.15 as FLOAT64, which turns NUMERIC arithmetic binary.
+                return f"BIGNUMERIC {sql_literal(self.dialect, node.text)}"
             return node.text
         if isinstance(node, n.String):
             return sql_literal(self.dialect, node.value)
@@ -290,11 +295,14 @@ class _Renderer:
 
     def exact_type(self, node: n.Node) -> str:
         """The engine's exact type for a dividend: a decimal of its scale, or the double
-        when its scale is unbounded (it is a float or a quotient already)."""
+        when its scale is unbounded (it is a float or a quotient already). Trino gives a
+        quotient of decimals the larger operand scale, so Athena's dividend carries at least
+        18 places (20 integer digits remain)."""
         sql_type = self.types.get(id(node))
         if sql_type is None or sql_type.kind != NUMBER or sql_type.scale is None:
             return exact_number_type(self.dialect, None)
-        return exact_number_type(self.dialect, sql_type.scale)
+        scale = max(sql_type.scale, 18) if self.dialect == "athena" else sql_type.scale
+        return exact_number_type(self.dialect, scale)
 
     def round(self, node: n.Round) -> str:
         value = self.value(node.arg)
