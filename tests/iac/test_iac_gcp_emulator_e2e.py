@@ -271,6 +271,131 @@ def test_emu_bigquery_sdk_create_read():
     assert cols == {"event_id": "STRING", "occurred_at": "TIMESTAMP"}
 
 
+def _nested_contract(dataset: str) -> Dict[str, Any]:
+    """A 0.7.7 table with an array of strings, a struct, an array of structs and a map."""
+    return {
+        "fluidVersion": "0.7.7",
+        "id": "emu.bq.nested",
+        "name": "BQ nested",
+        "exposes": [
+            {
+                "exposeId": "orders",
+                "binding": {
+                    "platform": "gcp",
+                    "format": "bigquery_table",
+                    "location": {"dataset": dataset, "table": "orders"},
+                },
+                "contract": {
+                    "schema": [
+                        {"name": "id", "type": "string", "required": True},
+                        {
+                            "name": "tags",
+                            "type": "array",
+                            "required": True,
+                            "element": {"type": "string", "required": True},
+                        },
+                        {
+                            "name": "address",
+                            "type": "struct",
+                            "fields": [
+                                {"name": "street", "type": "string"},
+                                {"name": "zip", "type": "string"},
+                            ],
+                        },
+                        {
+                            "name": "items",
+                            "type": "array",
+                            "required": True,
+                            "element": {
+                                "type": "struct",
+                                "required": True,
+                                "fields": [
+                                    {"name": "sku", "type": "string", "required": True},
+                                    {"name": "qty", "type": "integer"},
+                                ],
+                            },
+                        },
+                        {
+                            "name": "attrs",
+                            "type": "map",
+                            "required": True,
+                            "key": {"type": "string", "required": True},
+                            "value": {"type": "string"},
+                        },
+                    ]
+                },
+            }
+        ],
+    }
+
+
+def test_emu_bigquery_nested_table_plan_clean(gcp_emulator_project):
+    """Emitter half: REPEATED and RECORD fields plan against the emulator: dataset and
+    table."""
+    contract = _nested_contract(f"emu_nested_{uuid.uuid4().hex[:8]}")
+    gcp_emulator_project.emit(contract)
+    init = gcp_emulator_project.init()
+    assert init.ok, init.stderr or init.stdout
+    plan = gcp_emulator_project.plan()
+    assert plan.ok, plan.stderr or plan.stdout
+    assert runner.change_summary(plan)["add"] == 2
+
+
+def test_emu_bigquery_nested_columns_round_trip_rows():
+    """Emulator half: the emitted schema, read as the BigQuery API's own field JSON,
+    makes a table the emulator stores and queries: arrays, records and a map as
+    key and value records."""
+    import json
+
+    from google.cloud import bigquery
+
+    from fluid_build.iac import build_module, get_iac_plugin
+
+    dataset_id = f"{GCP_EMULATOR_PROJECT}.emu_nested_rows_{uuid.uuid4().hex[:8]}"
+    module = json.loads(build_module(get_iac_plugin("gcp"), _nested_contract("unused")))
+    [table_body] = module["resource"]["google_bigquery_table"].values()
+    schema = [bigquery.SchemaField.from_api_repr(f) for f in json.loads(table_body["schema"])]
+
+    bq = gcp_emulator_bigquery_client()
+    dataset = bigquery.Dataset(dataset_id)
+    dataset.location = "US"
+    bq.create_dataset(dataset, exists_ok=True)
+    table = bigquery.Table(f"{dataset_id}.orders", schema=schema)
+    bq.create_table(table)
+
+    got = {f.name: f for f in bq.get_table(table.reference).schema}
+    assert (got["tags"].field_type, got["tags"].mode) == ("STRING", "REPEATED")
+    assert (got["address"].field_type, [f.name for f in got["address"].fields]) == (
+        "RECORD",
+        ["street", "zip"],
+    )
+    assert (got["items"].field_type, got["items"].mode) == ("RECORD", "REPEATED")
+    assert [f.name for f in got["attrs"].fields] == ["key", "value"]
+
+    errors = bq.insert_rows_json(
+        table.reference,
+        [
+            {
+                "id": "o1",
+                "tags": ["a", "b"],
+                "address": {"street": "Main 1", "zip": "8000"},
+                "items": [{"sku": "s1", "qty": 2}, {"sku": "s2", "qty": 1}],
+                "attrs": [{"key": "channel", "value": "web"}],
+            }
+        ],
+    )
+    assert errors == []
+    rows = list(
+        bq.query(
+            "SELECT id, ARRAY_LENGTH(tags) AS n_tags, address.zip AS zip, "
+            "(SELECT SUM(i.qty) FROM UNNEST(items) AS i) AS qty, "
+            "(SELECT a.value FROM UNNEST(attrs) AS a WHERE a.key = 'channel') AS channel "
+            f"FROM `{dataset_id}.orders`"
+        ).result()
+    )
+    assert [tuple(r.values()) for r in rows] == [("o1", 2, "8000", 3, "web")]
+
+
 def test_emu_gcs_sdk_create_read():
     """Emulator half: create a bucket via google-cloud-storage against
     the fake-gcs-server, read it back."""

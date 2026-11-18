@@ -80,7 +80,40 @@ def _location_from_server(server: Mapping[str, Any]) -> Dict[str, Any]:
     ):
         if key in server:
             location[key] = server[key]
+    databricks_catalog_to_location(server, location)
     return location
+
+
+def databricks_catalog_to_location(server: Mapping[str, Any], location: Dict[str, Any]) -> None:
+    """Put a Databricks server's ``catalog`` where a FLUID Databricks binding names it.
+
+    ODCS's DatabricksServer ``catalog`` is the Unity Catalog catalog, which a
+    FLUID Databricks binding names ``location.database``: the Databricks emitter
+    creates the table there and refuses ``location.catalog``, which selects an
+    Iceberg catalog (``iac/providers/databricks.py``). The importers dropped the
+    key, so an imported contract named no catalog to apply to, and the export
+    (:func:`_server_details_from_location`) read only ``location.catalog``, so a
+    contract forge can deploy exported the ``${DATABRICKS_CATALOG}`` placeholder
+    and its server named no table. The export now reads ``location.database``,
+    with ``location.catalog`` as a fallback. A ``database`` the server already
+    names is kept; other server types are left alone, since a Trino or Iceberg
+    ``catalog`` is something else.
+    """
+    if (
+        str(server.get("type") or "").lower() == "databricks"
+        and server.get("catalog")
+        and "database" not in location
+    ):
+        location["database"] = server["catalog"]
+
+
+def _databricks_catalog_from_location(location: Mapping[str, Any]) -> Optional[Any]:
+    """The Unity Catalog catalog a FLUID Databricks binding names, for the ODCS ``catalog``.
+
+    ``location.database``, else ``location.catalog`` for a contract that names it
+    there; :func:`databricks_catalog_to_location` is the import's half and says why.
+    """
+    return location.get("database") or location.get("catalog") or None
 
 
 # ----- FLUID → ODCS --------------------------------------------------------
@@ -293,9 +326,12 @@ def _server_details_from_location(location: Mapping[str, Any], provider: str) ->
         ):
             details.setdefault(required_key, env_var)
     elif p == "databricks":
-        for key in ("host", "catalog", "schema"):
+        for key in ("host", "schema"):
             if key in location:
                 details[key] = location[key]
+        catalog = _databricks_catalog_from_location(location)
+        if catalog:
+            details["catalog"] = catalog
         # ODCS DatabricksServer requires {host, catalog, schema}.
         for required_key, env_var in (
             ("host", "${DATABRICKS_HOST}"),

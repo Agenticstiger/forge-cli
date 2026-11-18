@@ -20,7 +20,7 @@ import sys
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -108,10 +108,114 @@ class LoadedDag:
     dag: Dict[str, Any] = field(default_factory=dict)
     tasks: List[Dict[str, Any]] = field(default_factory=list)
     namespace: Dict[str, Any] = field(default_factory=dict)
+    #: ``(upstream task_id, downstream task_id)`` for every ``a >> b`` the file ran.
+    edges: List[Tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class StubAsset:
+    """What the DAG built an ``Asset`` (Airflow 3) or a ``Dataset`` (Airflow 2) from."""
+
+    uri: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class StubAny:
+    assets: Tuple[Any, ...]
+    kind: str
+
+
+@dataclass(frozen=True)
+class StubCron:
+    cron: str
+    timezone: str
+
+
+@dataclass(frozen=True)
+class StubAssetOrTime:
+    timetable: StubCron
+    assets: Any
+    kind: str
+
+
+def _module(name: str, **attrs: Any) -> types.ModuleType:
+    mod = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(mod, key, value)
+    return mod
+
+
+def _asset_or_time(*, timetable: StubCron, assets: Any) -> StubAssetOrTime:
+    return StubAssetOrTime(timetable, assets, "AssetOrTimeSchedule")
+
+
+def _dataset_or_time(*, timetable: StubCron, datasets: Any) -> StubAssetOrTime:
+    return StubAssetOrTime(timetable, datasets, "DatasetOrTimeSchedule")
+
+
+def _asset_modules(airflow3: bool) -> Tuple[Dict[str, Any], Dict[str, Optional[types.ModuleType]]]:
+    """The asset names a DAG imports, where each Airflow keeps them: ``airflow.sdk``'s own
+    attributes (Airflow 3), and the other modules (``None`` makes an import fail)."""
+    modules: Dict[str, Optional[types.ModuleType]] = {
+        "airflow.timetables": _module("airflow.timetables"),
+        "airflow.timetables.trigger": _module(
+            "airflow.timetables.trigger",
+            CronTriggerTimetable=lambda cron, *, timezone: StubCron(cron, timezone),
+        ),
+    }
+    if not airflow3:
+        modules["airflow.timetables.assets"] = None
+        modules["airflow.datasets"] = _module(
+            "airflow.datasets",
+            Dataset=lambda uri: StubAsset(uri, "Dataset"),
+            DatasetAny=lambda *assets: StubAny(tuple(assets), "DatasetAny"),
+        )
+        modules["airflow.timetables.datasets"] = _module(
+            "airflow.timetables.datasets", DatasetOrTimeSchedule=_dataset_or_time
+        )
+        return {}, modules
+    modules["airflow.timetables.assets"] = _module(
+        "airflow.timetables.assets", AssetOrTimeSchedule=_asset_or_time
+    )
+    modules["airflow.datasets"] = None  # Airflow 3.4 removed it
+    modules["airflow.timetables.datasets"] = None
+    sdk = {
+        "Asset": lambda uri: StubAsset(uri, "Asset"),
+        "AssetAny": lambda *assets: StubAny(tuple(assets), "AssetAny"),
+    }
+    return sdk, modules
+
+
+#: ``None`` in sys.modules makes the import raise ImportError: Airflow 2 has neither.
+_AIRFLOW2_ONLY: Dict[str, Optional[types.ModuleType]] = {
+    "airflow.sdk": None,
+    "airflow.providers": None,
+}
+
+
+def _airflow3_modules(dag: type, bash: type, sdk: Dict[str, Any]) -> Dict[str, types.ModuleType]:
+    """``airflow.sdk`` and apache-airflow-providers-standard's BashOperator, as Airflow 3 has them."""
+    names = (
+        "airflow.providers",
+        "airflow.providers.standard",
+        "airflow.providers.standard.operators",
+    )
+    modules = {name: _module(name) for name in names}
+    modules["airflow.providers.standard.operators.bash"] = _module(
+        "airflow.providers.standard.operators.bash", BashOperator=bash
+    )
+    modules["airflow.sdk"] = _module("airflow.sdk", DAG=dag, **sdk)
+    return modules
 
 
 def load_dag(source: str, monkeypatch: pytest.MonkeyPatch, *, airflow3: bool = True) -> LoadedDag:
-    """Import a generated DAG against stub Airflow 3 (or 2) modules."""
+    """Import a generated DAG against stub Airflow 3.4 (or 2.9+) modules.
+
+    The stubs keep each name in the module Airflow keeps it in, and nothing more: Airflow 3.4
+    has no ``airflow.datasets``, Airflow 2 no ``airflow.sdk``, so an import path a generated file
+    should not take fails here as it would there.
+    """
     loaded = LoadedDag()
 
     class _DAG:
@@ -126,40 +230,29 @@ def load_dag(source: str, monkeypatch: pytest.MonkeyPatch, *, airflow3: bool = T
 
     class _BashOperator:
         def __init__(self, **kwargs: Any) -> None:
+            self.task_id = kwargs.get("task_id")
             loaded.tasks.append(kwargs)
 
-    def module(name: str, **attrs: Any) -> types.ModuleType:
-        mod = types.ModuleType(name)
-        for key, value in attrs.items():
-            setattr(mod, key, value)
-        return mod
+        def __rshift__(self, other: "_BashOperator") -> "_BashOperator":
+            loaded.edges.append((self.task_id, other.task_id))
+            return other
 
+        def __rrshift__(self, others: List["_BashOperator"]) -> "_BashOperator":
+            loaded.edges.extend((o.task_id, self.task_id) for o in others)
+            return self
+
+    sdk, asset_modules = _asset_modules(airflow3)
     stubs: Dict[str, Optional[types.ModuleType]] = {
-        "pendulum": module(
+        "pendulum": _module(
             "pendulum", datetime=lambda *a, **kw: ("pendulum.datetime", a, kw.get("tz"))
         ),
         # Airflow 2 names; an Airflow 3 install keeps these importable too.
-        "airflow": module("airflow", DAG=_DAG),
-        "airflow.operators": module("airflow.operators"),
-        "airflow.operators.bash": module("airflow.operators.bash", BashOperator=_BashOperator),
+        "airflow": _module("airflow", DAG=_DAG),
+        "airflow.operators": _module("airflow.operators"),
+        "airflow.operators.bash": _module("airflow.operators.bash", BashOperator=_BashOperator),
+        **asset_modules,
     }
-    if airflow3:
-        stubs.update(
-            {
-                "airflow.sdk": module("airflow.sdk", DAG=_DAG),
-                "airflow.providers": module("airflow.providers"),
-                "airflow.providers.standard": module("airflow.providers.standard"),
-                "airflow.providers.standard.operators": module(
-                    "airflow.providers.standard.operators"
-                ),
-                "airflow.providers.standard.operators.bash": module(
-                    "airflow.providers.standard.operators.bash", BashOperator=_BashOperator
-                ),
-            }
-        )
-    else:
-        # ``None`` in sys.modules makes the import raise ImportError.
-        stubs.update({"airflow.sdk": None, "airflow.providers": None})
+    stubs.update(_airflow3_modules(_DAG, _BashOperator, sdk) if airflow3 else _AIRFLOW2_ONLY)
     for name, mod in stubs.items():
         monkeypatch.setitem(sys.modules, name, mod)
 
