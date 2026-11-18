@@ -1647,9 +1647,11 @@ def _partition_table(
     if field:
         partitioning["field"] = field
     body["time_partitioning"] = partitioning
-    _replace_when(
-        resources, body, safe_ident(f"{tbl_name}_partitioning"), _gov.partition_trigger_input(field)
-    )
+    trigger = safe_ident(f"{tbl_name}_partitioning")
+    resources.setdefault("terraform_data", {})[trigger] = {
+        "input": _gov.partition_trigger_input(field)
+    }
+    _replace_triggered_by(body, trigger)
 
 
 #: The value of the contract's decimal-parameters marker (:func:`_decimal_parameters_marker`).
@@ -1679,9 +1681,7 @@ def _decimal_parameters_marker(
         "input": dict(_DECIMAL_PARAMETERS_MARKER_INPUT)
     }
     if any(_has_decimal_parameters(field) for field in _bq_fields(schema)):
-        body.setdefault("lifecycle", {}).setdefault("replace_triggered_by", []).append(
-            f"terraform_data.{marker}"
-        )
+        _replace_triggered_by(body, marker)
 
 
 def _has_decimal_parameters(field: Mapping[str, Any]) -> bool:
@@ -1690,13 +1690,9 @@ def _has_decimal_parameters(field: Mapping[str, Any]) -> bool:
     )
 
 
-def _replace_when(
-    resources: Dict[str, Any], body: Dict[str, Any], trigger: str, value: Mapping[str, str]
-) -> None:
-    """A ``terraform_data`` holding ``value`` as the table's ``replace_triggered_by``: the
-    OpenTofu documentation's pattern for a plain value. Created for a table that exists,
-    or changed, it plans the table's replacement."""
-    resources.setdefault("terraform_data", {})[trigger] = {"input": dict(value)}
+def _replace_triggered_by(body: Dict[str, Any], trigger: str) -> None:
+    """Replace the table when ``terraform_data.<trigger>`` is created or changes: the
+    OpenTofu documentation's ``replace_triggered_by`` pattern for a plain value."""
     body.setdefault("lifecycle", {}).setdefault("replace_triggered_by", []).append(
         f"terraform_data.{trigger}"
     )
