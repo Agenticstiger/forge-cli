@@ -303,7 +303,7 @@ Six types: bool, number, string, date, timestamp, and timestamp with time zone. 
 | `timestamptz`, `timestamp_tz`, `timestamp_ltz`, `timestamp with time zone` | timestamp with time zone (an instant) |
 | every other type (`time`, `interval`, `money`, `variant`, `json`, `array`, `struct`, `map`, the binary and spatial types and so on) | none: an expression cannot name the column |
 
-A `decimal`-family column without `(p,s)` has no declared scale. An expression can read it, but a `derive` target needs `(p,s)`. `decimal(p)` is scale 0, as in SQL. Precision is read up to 1,000, PostgreSQL's limit; a wider declaration has no FLUID SQL/1 type.
+A `decimal`-family column without `(p,s)` has no declared scale. An expression can read it, but a `derive` target needs `(p,s)`. `decimal(p)` is scale 0, as in SQL. `p` and `s` are unsigned integers, read by value, so `decimal(0012, 02)` is `decimal(12, 2)`. As the SQL standard requires, a declaration has a FLUID SQL/1 type only when 1 <= p and 0 <= s <= p, and precision is read up to 1,000, PostgreSQL's limit. So `decimal(0)`, `decimal(0,2)`, `decimal(5,6)` and `decimal(1001,2)` have none. PostgreSQL 15 and later also accept a negative scale or one above the precision; FLUID SQL/1 does not.
 
 Type rules:
 

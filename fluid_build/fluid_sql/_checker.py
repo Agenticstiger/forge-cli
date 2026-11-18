@@ -39,7 +39,7 @@ from fluid_build.util.column_type import write_enum_list
 from . import _nodes as n
 from ._canonical import canonical
 from ._errors import FluidSqlError
-from ._types import BOOL, DATE, NUMBER, ORDERABLE, STRING, Column, Model, SqlType
+from ._types import BOOL, DATE, NUMBER, ORDERABLE, STRING, Column, Model, SqlType, decimal_hint
 
 PREDICATE = "predicate"
 VALUE = "value"
@@ -124,7 +124,8 @@ def check_derive_target(target: Column) -> None:
     if column_type is None:
         raise FluidSqlError(
             "derive-target",
-            f"the derive target {target.name} ({target.declared}) has no FLUID SQL/1 type",
+            f"the derive target {target.name} ({target.declared}) has no FLUID SQL/1 type"
+            + decimal_hint(target.declared),
         )
     if column_type.is_float:
         raise FluidSqlError(
@@ -257,7 +258,7 @@ class _Checker:
             raise FluidSqlError(
                 "untyped-column",
                 f"{node.name} ({column.declared}) has no FLUID SQL/1 type, so no expression can "
-                "name it",
+                "name it" + decimal_hint(column.declared),
                 node.pos,
             )
         self.reads.add((node.relationship, node.name))

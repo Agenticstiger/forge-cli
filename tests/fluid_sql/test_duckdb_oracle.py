@@ -49,7 +49,10 @@ def _sql_type(model: Model, name: str) -> str:
         if column.type.is_float:
             return "DOUBLE"
         if column.type.precision is not None:
-            return f"DECIMAL({min(column.type.precision, 38)}, {column.type.type.scale})"
+            # DuckDB's DECIMAL is at most 38 digits wide, its scale at most its width, so a
+            # wider column (decimal(1000, 1000)) is clamped; the vectors' values fit the clamp.
+            width = min(column.type.precision, 38)
+            return f"DECIMAL({width}, {min(column.type.type.scale, width)})"
         return "BIGINT" if column.type.type.scale == 0 else "DECIMAL(38, 10)"
     return {
         "bool": "BOOLEAN",

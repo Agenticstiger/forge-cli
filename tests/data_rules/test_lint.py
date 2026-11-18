@@ -1517,14 +1517,24 @@ def test_mixed_type_prefixes_on_a_foreign_key_do_not_crash():
     _lint(contract)
 
 
-def test_a_huge_decimal_precision_has_no_type_and_does_not_crash():
+@pytest.mark.parametrize(
+    "declared",
+    ["decimal(" + "9" * 4400 + ",2)", "decimal(5,6)", "numeric(0,2)", "decimal(0)"],
+    ids=["huge-precision", "scale-above-precision", "precision-0-scale-2", "precision-0"],
+)
+def test_a_decimal_outside_the_sql_bounds_has_no_type_and_the_error_says_why(declared):
+    """RFC 2.3: decimal(p,s) has a FLUID SQL/1 type only when 1 <= p <= 1000 and
+    0 <= s <= p; a huge precision is refused without int() ever reading it."""
     contract = _contract()
     _expose_of(contract, "invoices")["contract"]["schema"].append(
-        {"name": "huge", "type": "decimal(" + "9" * 4400 + ",2)"}
+        {"name": "ratio", "type": declared}
     )
-    _add_invariant(contract, "invoices", {"id": "huge_check", "check": "huge > 0"})
+    _add_invariant(contract, "invoices", {"id": "ratio_check", "check": "ratio > 0"})
     finding = _pick(_lint(contract), "has no FLUID SQL/1 type")
-    assert "huge" in finding.message
+    assert (
+        f"ratio ({declared}) has no FLUID SQL/1 type, so no expression can name it "
+        "(a decimal is decimal(p) or decimal(p, s), with 1 <= p <= 1000 and 0 <= s <= p)"
+    ) in finding.message, finding.message
 
 
 def test_the_quality_note_has_its_own_fix():
