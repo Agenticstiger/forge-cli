@@ -169,6 +169,9 @@ class ProfileResult:
     fractional_bits: int = DEFAULT_FRACTIONAL_BITS
     #: Each published fidelity statistic, as ``(column, definition, groupBy)``.
     statistics: Tuple[Tuple[str, str, Optional[str]], ...] = ()
+    #: Each fidelity statistic written with every group withheld, as
+    #: ``(column, definition, groupBy)``: a run scores it censored.
+    withheld_statistics: Tuple[Tuple[str, str, Optional[str]], ...] = ()
     #: Each declared property the document does not answer, with the reason.
     left_out: Tuple[Tuple[str, str], ...] = ()
 
@@ -536,6 +539,7 @@ def profile_expose(
         withheld=dict(sorted(tally.items())),
         fractional_bits=fractional_bits,
         statistics=_published_statistics(columns_doc),
+        withheld_statistics=_withheld_statistics(columns_doc),
         left_out=tuple(left_out),
     )
 
@@ -713,4 +717,16 @@ def _published_statistics(
         for name, column in columns.items()
         for statistic in column.get("statistics", ())
         if all(group["status"] == disclosure.FREE for group in statistic["groups"])
+    )
+
+
+def _withheld_statistics(
+    columns: Mapping[str, Mapping[str, Any]],
+) -> Tuple[Tuple[str, str, Optional[str]], ...]:
+    """Each fidelity statistic with no published group: column, definition, groupBy."""
+    return tuple(
+        (name, statistic["definition"], statistic.get("groupBy"))
+        for name, column in columns.items()
+        for statistic in column.get("statistics", ())
+        if not any(group["status"] == disclosure.FREE for group in statistic["groups"])
     )

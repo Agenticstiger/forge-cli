@@ -19,7 +19,7 @@ import argparse
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 COMMAND = "profile"
 
@@ -386,6 +386,16 @@ def _plural(count: int, word: str) -> str:
     return f"{count} {word}" + ("" if count == 1 else "s")
 
 
+def _named(statistics: Any) -> List[str]:
+    """``mean/1 of 'amount' by 'market'`` for each statistic, once."""
+    return list(
+        dict.fromkeys(
+            f"{identifier} of {column!r}" + (f" by {group_by!r}" if group_by else "")
+            for column, identifier, group_by in statistics
+        )
+    )
+
+
 def _report(say: Any, result: Any, out: Path) -> None:
     """Tell the owner what the document holds, then print the pin."""
     plan = result.plan
@@ -400,16 +410,17 @@ def _report(say: Any, result: Any, out: Path) -> None:
             for code, count in withheld.items()
         )
         say(f"Withheld, by CL_CONF_STATUS code: {codes}.")
-    named = list(
-        dict.fromkeys(
-            f"{identifier} of {column!r}" + (f" by {group_by!r}" if group_by else "")
-            for column, identifier, group_by in result.statistics
-        )
-    )
+    named = _named(result.statistics)
+    whole = _named(result.withheld_statistics)
     if named:
         say(
             f"Fidelity statistics: {'; '.join(named)}, on fractionalBits {result.fractional_bits}"
             " (the fidelity block must declare the same).",
+            soft_wrap=True,
+        )
+    if whole:
+        say(
+            f"Withheld whole, so a run scores them censored: {'; '.join(whole)}.",
             soft_wrap=True,
         )
     for description, reason in result.left_out:

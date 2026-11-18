@@ -274,6 +274,9 @@ def test_a_rare_support_member_withholds_the_group_and_siblings_of_a_grouped_mea
     assert result.withheld["D"] == 3
     assert ("amount", "mean/1", "market") not in result.statistics
     assert ("amount", "mean/1", None) in result.statistics
+    assert ("market", "support/1", None) in result.withheld_statistics
+    assert ("amount", "mean/1", "market") in result.withheld_statistics
+    assert ("amount", "mean/1", None) not in result.withheld_statistics
     # The histogram's DE cell is a one: withheld by its cell, the group is published.
     (group,) = _entry(result, "market", "levelHistogram/1")["groups"]
     assert group["cellStatus"][0] == "A" and group["levelCounts"][0] is None
@@ -521,3 +524,33 @@ def test_a_block_written_with_bare_null_keys_and_bare_floats_profiles_as_the_quo
         bundle=block,
     )
     assert bare.digest == quoted.digest
+
+
+def test_the_report_names_the_statistics_written_with_every_group_withheld(
+    tmp_path, monkeypatch, capsys
+):
+    rows = _rows()
+    rows[0]["market"] = "DE"  # a support member one record holds: support and grouped mean A/D
+    directory = _bundle(tmp_path, PROPERTIES)
+    monkeypatch.chdir(tmp_path)
+    rc = main(
+        [
+            "profile",
+            str(directory / "payment.fluid.yml"),
+            "--source",
+            _slice(tmp_path, rows),
+            "--bundle",
+            str(directory),
+            "--out",
+            "payment.profile.json",
+        ]
+    )
+    out = " ".join(capsys.readouterr().out.split())
+    assert rc == 0, out
+    assert "Withheld whole, so a run scores them censored: " in out
+    line = out.split("Withheld whole, so a run scores them censored: ")[1].split(". ")[0]
+    assert "support/1 of 'market'" in line and "mean/1 of 'amount' by 'market'" in line
+    assert "mean/1 of 'amount';" not in line and not line.endswith("mean/1 of 'amount'")
+    # A statistic with a published group stays on the published line only.
+    published = out.split("Fidelity statistics: ")[1].split(", on fractionalBits")[0]
+    assert "support/1" not in published
