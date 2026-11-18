@@ -693,8 +693,14 @@ def renders_at_apply(field_name: str, value: Any) -> bool:
     its user name or path. The same rule as
     ``kafka_connect.iceberg_sink_validation._rendered_at_run``; Terraform defers
     a check on a value known only after apply the same way.
+
+    The field waits whole: a literal host beside a placeholder in one host list
+    (``h1,{{ env.H }}``) is judged by apply alone, which judges every host. An
+    object-store URI names a bucket, never a host, so it never waits.
     """
     if not isinstance(value, str) or not _ENV_PLACEHOLDER.search(value):
+        return False
+    if field_name != "host" and _is_object_store_uri(value.strip()):
         return False
     return any(_ENV_PLACEHOLDER.search(part) for part in _deciding_parts(field_name, value))
 
@@ -703,22 +709,37 @@ def _deciding_parts(field_name: str, value: str) -> Tuple[str, str]:
     """The scheme and the host part of a written destination, the parts that decide the host.
 
     ``host`` is all host part. A URI's user name, password, path, query and
-    fragment never decide where it goes, so they are left out.
+    fragment never decide where it goes, so they are left out. A URI without a
+    scheme may start with ``//``, as :func:`_field_hosts` reads it.
     """
     text = value.strip()
     if field_name == "host":
         return "", text
     scheme, sep, rest = text.partition("://")
     if not sep:
-        scheme, rest = "", text
+        scheme, rest = "", text[2:] if text.startswith("//") else text
     authority = re.split(r"[/?#]", rest, maxsplit=1)[0]
     return scheme, authority.rpartition("@")[2]
 
 
 def _shown_destination(name: str, value: str) -> str:
-    """What the deferred notice quotes of ``value``: only its :func:`_deciding_parts`."""
-    scheme, host = _deciding_parts(name.rpartition(".")[2], value)
+    """What the deferred notice quotes of ``value``: its :func:`_deciding_parts`, without a port.
+
+    The allowlist entry takes no port. And a password written inline with an
+    unencoded ``/``, ``?`` or ``#`` ends the authority inside itself, so the
+    start of that password stands where a port would.
+    """
+    field_name = name.rpartition(".")[2]
+    scheme, host = _deciding_parts(field_name, value)
+    if field_name != "host":
+        host = ",".join(_without_port(piece) for piece in host.split(","))
     return f"{scheme}://{host}" if scheme else host
+
+
+def _without_port(host: str) -> str:
+    if host.startswith("[") and "]" in host:
+        return host.partition("]")[0] + "]"
+    return host.partition(":")[0]
 
 
 def destinations_rendered_at_apply(connection: Mapping[str, Any]) -> List[str]:
@@ -739,17 +760,24 @@ def deferred_destination_notice(
     (``connection.host``), to its value as written. Only the contract's own
     text is quoted: the lint never reads the environment, so it never prints a
     value a placeholder names. Of a URI it quotes the scheme and the host part
-    alone, never a user name or password written inline, nor the path.
+    alone, without a port: not the path, nor a password written inline, even
+    one that holds an unencoded ``/``, ``?`` or ``#``.
     """
     parsed = parse_secret_ref(ref) if isinstance(ref, str) else ref
-    shown = {name: _shown_destination(name, value) for name, value in written.items()}
-    fields = ", ".join(f"{name} ({value!r})" for name, value in shown.items())
+    fields = ", ".join(
+        f"{name} ({_shown_destination(name, value)!r})" for name, value in written.items()
+    )
     variables = sorted(
-        {match.group(1) for value in shown.values() for match in _ENV_PLACEHOLDER.finditer(value)}
+        {
+            match.group(1)
+            for name, value in written.items()
+            for part in _deciding_parts(name.rpartition(".")[2], value)
+            for match in _ENV_PLACEHOLDER.finditer(part)
+        }
     )
     return SecretPolicyError(
         what=(
-            f"{parsed.canonical} is sent to the host {fields} renders to, which only "
+            f"{parsed.canonical} is sent to whatever host {fields} renders to, which only "
             "fluid apply knows"
         ),
         why=(

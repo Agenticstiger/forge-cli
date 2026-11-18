@@ -23,7 +23,7 @@ A destination whose host is a ``{{ env.NAME }}`` placeholder is left to
 the host it names: the lint does not read the environment, and no allowlist
 entry can match the placeholder. Such a finding carries ``deferred`` (a
 warning naming the entry apply needs) instead of an error; every destination
-written literally is still judged here.
+field written without a placeholder is still judged here.
 
 Any other ``secretRef`` string is linted for grammar, scheme and prefix only:
 no stage resolves it, so it is sent nowhere. That includes meltano's,
@@ -174,7 +174,7 @@ def lint_site(site: RefSite, environ: Optional[Mapping[str, str]] = None) -> Ref
 def _check_destinations(
     ref: SecretRef, site: RefSite, environ: Optional[Mapping[str, str]]
 ) -> Optional[SecretError]:
-    """Judge every destination written literally; the notice for those apply renders.
+    """Judge every destination field written literally; the notice for those apply renders.
 
     A destination whose host is a ``{{ env.NAME }}`` placeholder is taken out
     and left to apply (:func:`~fluid_build.secrets.policy.renders_at_apply`);

@@ -498,6 +498,8 @@ def test_a_destination_field_that_is_not_a_string_cannot_be_cleared(uri):
         ("uri", "{{ env.SCHEME }}://db.example.com/x", True),
         ("uri", "postgresql://u@{{ env.PGHOST }}/db", True),
         ("server", "{{ env.MSSQL }}:1433", True),
+        ("uri", "//{{ env.PGHOST }}/db", True),
+        ("uri", "s3://{{ env.BUCKET }}/raw", False),
         ("uri", "postgresql://db.example.com/{{ env.DB }}", False),
         ("uri", "postgresql://{{ env.PGUSER }}@db.example.com/db", False),
         ("uri", "postgresql://db.example.com/db?options={{ env.X }}", False),
@@ -543,11 +545,34 @@ def test_the_deferred_notice_quotes_only_the_part_of_a_uri_that_decides_the_host
             },
         )
     )
-    assert "connection.uri ('postgresql://{{ env.PGHOST }}:5432')" in notice
+    assert "connection.uri ('postgresql://{{ env.PGHOST }}')" in notice
     assert "deployment.server_url ('https://{{ env.AIRBYTE_HOST }}')" in notice
     assert "(with AIRBYTE_HOST, PGHOST as set there)" in notice
-    for hidden in ("etl:", "inline-pw", "PGDATABASE", "sslpassword", "/api"):
+    for hidden in ("etl:", "inline-pw", "PGDATABASE", "sslpassword", "/api", ":5432"):
         assert hidden not in notice, hidden
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "uri, shown",
+    [
+        (
+            "postgres://{{ env.PGUSER }}:pw-start/rest@db.example.com/orders",  # pragma: allowlist secret
+            "postgres://{{ env.PGUSER }}",
+        ),
+        (
+            "{{ env.SCHEME }}://etl:pw-start?rest@db.example.com/orders",  # pragma: allowlist secret
+            "{{ env.SCHEME }}://etl",
+        ),
+        ("postgres://db.example.com:{{ env.PGPORT }}/orders", "postgres://db.example.com"),
+    ],
+)
+def test_the_deferred_notice_never_quotes_what_stands_where_a_port_would(uri, shown):
+    """An unencoded ``/``, ``?`` or ``#`` in an inline password ends the authority inside it."""
+    notice = str(deferred_destination_notice("env://PGPASSWORD", {"connection.uri": uri}))
+    assert f"connection.uri ({shown!r})" in notice
+    assert "pw-start" not in notice and "rest@" not in notice
+    assert "(with  as set there)" not in notice
 
 
 # ── refusals survive the log redactor ────────────────────────────────────────
