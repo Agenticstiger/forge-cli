@@ -248,9 +248,11 @@ def _add_databricks_catalog(srv: Dict[str, Any]) -> None:
     ODCS's DatabricksServer calls the catalog ``catalog``; a FLUID Databricks
     binding names it ``location.database``, which the loop above copies as
     ``database`` (the Bitol mapper's ``databricks_catalog_to_location`` says
-    why). ``catalog`` is added beside the copied keys, which stay as they were.
+    why). ``catalog`` is set from it, as the Bitol export sets it: a copied
+    ``location.catalog`` names an Iceberg catalog, not this one. The other
+    copied keys stay as they were.
     """
-    if srv.get("type") == "databricks" and "catalog" not in srv and srv.get("database"):
+    if srv.get("type") == "databricks" and srv.get("database"):
         srv["catalog"] = srv["database"]
 
 

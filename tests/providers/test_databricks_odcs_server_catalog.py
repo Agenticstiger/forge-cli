@@ -284,3 +284,14 @@ class TestEntropyDataContract:
         # The keys this payload carried before stay as they were.
         assert servers[0]["database"] == "workspace"
         assert servers[0]["table"] == "orders"
+
+    def test_database_wins_as_the_bitol_export_decides(self) -> None:
+        # A copied ``location.catalog`` is an Iceberg catalog; both ODCS writers
+        # name the Unity Catalog catalog from ``location.database``.
+        location = {"database": "uc_catalog", "catalog": "iceberg_catalog", "schema": "s"}
+        provider = DataMeshManagerProvider(api_key="fake", api_url="https://test.com")
+
+        dc = provider._build_data_contract_odcs(_contract(location), "sales.orders")
+
+        assert dc["servers"][0]["catalog"] == "uc_catalog"
+        assert _server_details_from_location(location, "databricks")["catalog"] == "uc_catalog"

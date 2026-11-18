@@ -37,8 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalog) could not find the table. The `servers[]` entry now carries `location.database` as
   `catalog`, with `location.catalog` as a fallback. The import maps a Databricks server's
   `catalog` back to `location.database`, where it used to drop it, so an imported contract plans
-  and applies. The Entropy Data publish's companion ODCS contract gains the same `catalog` key
-  beside the keys it already wrote.
+  and applies. The Entropy Data publish's companion ODCS contract now names the catalog the same
+  way, beside the keys it already wrote.
 
 ## [0.32.0] — 2026-11-18
 
