@@ -162,6 +162,7 @@ def _build_data_contract_odcs(
                 for k, v in location.items():
                     if v and not str(v).startswith("{{"):
                         srv[k] = v
+            _add_databricks_catalog(srv)
             fmt_val = binding.get("format")
             if fmt_val:
                 srv["format"] = str(fmt_val)
@@ -239,6 +240,20 @@ def _build_data_contract_odcs(
     dc["customProperties"] = custom_props
 
     return dc
+
+
+def _add_databricks_catalog(srv: Dict[str, Any]) -> None:
+    """Name a Databricks server's Unity Catalog catalog the way ODCS does.
+
+    ODCS's DatabricksServer calls the catalog ``catalog``; a FLUID Databricks
+    binding names it ``location.database``, which the loop above copies as
+    ``database`` (the Bitol mapper's ``databricks_catalog_to_location`` says
+    why). ``catalog`` is set from it, as the Bitol export sets it: a copied
+    ``location.catalog`` names an Iceberg catalog, not this one. The other
+    copied keys stay as they were.
+    """
+    if srv.get("type") == "databricks" and srv.get("database"):
+        srv["catalog"] = srv["database"]
 
 
 def _odcs_logical_type(fluid_type: str) -> str:
