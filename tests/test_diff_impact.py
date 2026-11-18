@@ -166,7 +166,7 @@ def test_a_missing_consumer_link_and_plan_read_unknown_not_no_impact(
     impact = _impact("new_nullable_field", tmp_path, capsys, monkeypatch)
 
     assert impact["consumer_interface"]["status"] == "changed"
-    consumers = impact["consumer_interface"]["consumers"]
+    consumers = impact["consumer_interface"]["readers"]
     assert consumers["status"] == "unknown" and "fluid.workspace.yaml" in consumers["reason"]
     resources = impact["resource_impact"]
     assert resources["status"] == "unknown" and "--plan" in resources["reason"]
@@ -179,7 +179,7 @@ def test_a_removed_required_field_breaks_the_workspace_reader(
 
     interface = impact["consumer_interface"]
     assert interface["status"] == "breaking"
-    [reader] = interface["consumers"]["items"]
+    [reader] = interface["readers"]["items"]
     assert reader["product_id"] == "finance.revenue" and reader["source"] == "workspace"
     assert reader["breaking_changes"]
 
@@ -403,7 +403,7 @@ def test_a_workspace_contract_with_odd_consumes_does_not_stop_the_report(
     rc, out = _diff(capsys, "json", None)
 
     assert rc == 0
-    [reader] = json.loads(out)["impact"]["consumer_interface"]["consumers"]["items"]
+    [reader] = json.loads(out)["impact"]["consumer_interface"]["readers"]["items"]
     assert reader["product_id"] == "finance.revenue"
 
 
@@ -484,5 +484,5 @@ def test_a_renamed_product_still_finds_the_readers_of_its_old_id(
 
     assert interface["status"] == "breaking"
     assert interface["changes"][0]["kind"] == "product_id_changed"
-    [reader] = interface["consumers"]["items"]
+    [reader] = interface["readers"]["items"]
     assert reader["product_id"] == "finance.revenue" and reader["breaking_changes"] == ["id"]

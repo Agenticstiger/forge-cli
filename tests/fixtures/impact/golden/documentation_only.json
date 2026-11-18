@@ -3,7 +3,7 @@
   "consumer_interface": {
     "status": "unchanged",
     "changes": [],
-    "consumers": {
+    "readers": {
       "status": "known",
       "reason": "readers outside the workspace, or in files not named contract.fluid.yaml, are not listed",
       "items": [

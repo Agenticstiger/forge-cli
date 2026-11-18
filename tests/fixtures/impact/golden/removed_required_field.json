@@ -11,7 +11,7 @@
         "expose_id": "orders"
       }
     ],
-    "consumers": {
+    "readers": {
       "status": "known",
       "reason": "readers outside the workspace, or in files not named contract.fluid.yaml, are not listed",
       "items": [

@@ -11,7 +11,7 @@
         "expose_id": "orders"
       }
     ],
-    "consumers": {
+    "readers": {
       "status": "unknown",
       "reason": "no fluid.workspace.yaml above ws/orders: products that read this one are not searched",
       "items": []

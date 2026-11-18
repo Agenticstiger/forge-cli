@@ -55,8 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`fluid diff --baseline --impact` reports what a contract change reaches, for a pull
   request.** Next to the changelog, an impact section in three parts: the consumer interface
-  (each change a reader sees, and the workspace products whose `consumes[]` read this one, or
-  the contract's own `consumers[]`, each marked breaking or not); governance and target (access
+  (each change a reader sees, and the workspace products whose `consumes[]` read this one,
+  each marked breaking or not); governance and target (access
   grants added or removed, a grant marked broad when it covers a domain, a public principal,
   admin or manage, or every expose; each expose's platform, format and location; its
   partitioning; and the policy and input changes the changelog found); and resource impact,

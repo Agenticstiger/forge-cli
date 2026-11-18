@@ -7,8 +7,7 @@ The changelog (:func:`fluid_build.api.changelog.compare_contracts`) says what
 changed. This report says what that reaches, in three sections:
 
 * **consumer interface**: the changes a reader of an expose sees, and the
-  products that read it (from the workspace, and the contract's own
-  ``consumers[]``);
+  products in the workspace whose ``consumes[]`` read it;
 * **governance and target**: access grants, where each expose lands (platform,
   format, location), its partitioning, and the policy changes the changelog
   found;
@@ -145,7 +144,7 @@ def _list(value: Any) -> List[Any]:
 def find_consumers(
     product_ids: Sequence[str], contract_path: Path, new: Mapping[str, Any]
 ) -> Dict[str, Any]:
-    """The products that read one of ``product_ids``: the workspace's, then the declared ones.
+    """The products in the workspace that read one of ``product_ids``.
 
     ``product_ids`` is the product's id, and its id before the change when that
     differs: a reader still names the old one. ``status`` is ``known`` when one
@@ -158,16 +157,10 @@ def find_consumers(
     from fluid_build.util.upstream_discovery import discover_upstream_products
     from fluid_build.util.workspace_root import find_workspace_root
 
+    # The contract's own ``consumers[]`` is reserved and read by nothing yet
+    # (its schema description says so, and a test holds it): the readers here
+    # are the workspace's.
     items: List[Dict[str, Any]] = []
-    for declared in _list(new.get("consumers")):
-        if isinstance(declared, Mapping) and declared.get("name"):
-            items.append(
-                {
-                    "product_id": str(declared["name"]),
-                    "expose_ids": sorted(str(e) for e in _list(declared.get("exposeIds"))),
-                    "source": "declared",
-                }
-            )
 
     root = find_workspace_root(contract_path.resolve().parent)
     if root is None:
@@ -227,7 +220,7 @@ def _consumer_interface(
     return {
         "status": status,
         "changes": [_change_dict(c, e) for c, e in interface],
-        "consumers": {**consumers, "items": affected},
+        "readers": {**consumers, "items": affected},
     }
 
 
@@ -671,7 +664,7 @@ def _render(impact: Mapping[str, Any], style: _Style) -> str:
     if not interface["changes"]:
         lines.append("- No column, field, expose or stream changed.")
     lines += [_change_line(c, style) for c in interface["changes"]]
-    lines += list(_consumer_lines(interface["consumers"], style))
+    lines += list(_consumer_lines(interface["readers"], style))
     lines.append("")
 
     governance = impact["governance_and_target"]
