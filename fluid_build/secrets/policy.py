@@ -696,14 +696,29 @@ def renders_at_apply(field_name: str, value: Any) -> bool:
     """
     if not isinstance(value, str) or not _ENV_PLACEHOLDER.search(value):
         return False
-    if field_name == "host":
-        return True
+    return any(_ENV_PLACEHOLDER.search(part) for part in _deciding_parts(field_name, value))
+
+
+def _deciding_parts(field_name: str, value: str) -> Tuple[str, str]:
+    """The scheme and the host part of a written destination, the parts that decide the host.
+
+    ``host`` is all host part. A URI's user name, password, path, query and
+    fragment never decide where it goes, so they are left out.
+    """
     text = value.strip()
+    if field_name == "host":
+        return "", text
     scheme, sep, rest = text.partition("://")
-    if sep and _ENV_PLACEHOLDER.search(scheme):
-        return True
-    authority = re.split(r"[/?#]", rest if sep else text, maxsplit=1)[0]
-    return _ENV_PLACEHOLDER.search(authority.rpartition("@")[2]) is not None
+    if not sep:
+        scheme, rest = "", text
+    authority = re.split(r"[/?#]", rest, maxsplit=1)[0]
+    return scheme, authority.rpartition("@")[2]
+
+
+def _shown_destination(name: str, value: str) -> str:
+    """What the deferred notice quotes of ``value``: only its :func:`_deciding_parts`."""
+    scheme, host = _deciding_parts(name.rpartition(".")[2], value)
+    return f"{scheme}://{host}" if scheme else host
 
 
 def destinations_rendered_at_apply(connection: Mapping[str, Any]) -> List[str]:
@@ -723,12 +738,14 @@ def deferred_destination_notice(
     ``written`` maps each such field, as the user knows it
     (``connection.host``), to its value as written. Only the contract's own
     text is quoted: the lint never reads the environment, so it never prints a
-    value a placeholder names.
+    value a placeholder names. Of a URI it quotes the scheme and the host part
+    alone, never a user name or password written inline, nor the path.
     """
     parsed = parse_secret_ref(ref) if isinstance(ref, str) else ref
-    fields = ", ".join(f"{name} ({value!r})" for name, value in written.items())
+    shown = {name: _shown_destination(name, value) for name, value in written.items()}
+    fields = ", ".join(f"{name} ({value!r})" for name, value in shown.items())
     variables = sorted(
-        {match.group(1) for value in written.values() for match in _ENV_PLACEHOLDER.finditer(value)}
+        {match.group(1) for value in shown.values() for match in _ENV_PLACEHOLDER.finditer(value)}
     )
     return SecretPolicyError(
         what=(

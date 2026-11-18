@@ -524,6 +524,32 @@ def test_the_deferred_notice_names_the_entry_apply_needs_and_no_value(monkeypatc
     assert "db.private-value.internal" not in str(notice)
 
 
+#: A placeholder host beside a login written inline and a path.
+_URI_WITH_INLINE_LOGIN = (
+    "postgresql://etl:inline-pw@{{ env.PGHOST }}:5432"  # pragma: allowlist secret
+    "/{{ env.PGDATABASE }}?sslpassword=x"  # pragma: allowlist secret
+)
+
+
+@pytest.mark.unit
+def test_the_deferred_notice_quotes_only_the_part_of_a_uri_that_decides_the_host():
+    """Before the notice, the lint printed a URI's host alone; a password inline stays out."""
+    notice = str(
+        deferred_destination_notice(
+            "vault://kv/acme/pg#password",
+            {
+                "connection.uri": _URI_WITH_INLINE_LOGIN,
+                "deployment.server_url": "https://{{ env.AIRBYTE_HOST }}/api/v1",
+            },
+        )
+    )
+    assert "connection.uri ('postgresql://{{ env.PGHOST }}:5432')" in notice
+    assert "deployment.server_url ('https://{{ env.AIRBYTE_HOST }}')" in notice
+    assert "(with AIRBYTE_HOST, PGHOST as set there)" in notice
+    for hidden in ("etl:", "inline-pw", "PGDATABASE", "sslpassword", "/api"):
+        assert hidden not in notice, hidden
+
+
 # ── refusals survive the log redactor ────────────────────────────────────────
 
 #: References that end in a word the redactor reads as a credential key.
