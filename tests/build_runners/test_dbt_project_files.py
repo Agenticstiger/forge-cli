@@ -38,6 +38,7 @@ READ = {
     "package-lock.yml",
     "dependencies.yml",
     "selectors.yml",
+    ".dbtignore",
     "models/orders.sql",
     "models/schema.yml",
     "models/staging/stg_orders.sql",
@@ -113,6 +114,14 @@ class TestSelection:
         assert "models/orders.sql" in files
         assert not any(rel.startswith(("models/compiled/", "models/pkg/")) for rel in files)
 
+    def test_an_output_directory_is_skipped_whatever_its_case(self, tmp_path: Path) -> None:
+        # On a case-insensitive file system Target/ opens target/: it is skipped by
+        # identity, not by name. On a case-sensitive one there is no Target/ at all.
+        project = _project(tmp_path, "name: p\nmodel-paths: [Target, models]\n")
+        files = set(read_project_files(project))
+        assert "models/orders.sql" in files
+        assert not any(rel.lower().startswith("target/") for rel in files)
+
     def test_a_missing_default_directory_is_no_error(self, tmp_path: Path) -> None:
         project = tmp_path / "p"
         _write(project, {"dbt_project.yml": "name: p\n", "models/a.sql": "select 1"})
@@ -184,6 +193,19 @@ class TestRefusals:
         monkeypatch.setattr(pf, "MAX_FILE_BYTES", 100)
         _write(project, {"seeds/big.csv": "x" * 101})
         assert "seeds/big.csv is over 100 bytes" in _refusal(project)
+
+    def test_a_file_swapped_for_a_link_after_the_walk_is_not_read(self, tmp_path: Path) -> None:
+        _write(tmp_path, {"secret.txt": "s3cret", "models/.keep": ""})
+        link = _link(tmp_path / "secret.txt", tmp_path / "models" / "a.sql") / "a.sql"
+        with pytest.raises(DbtProjectFilesError, match="models/a.sql could not be read"):
+            pf._read_bounded(link, "models/a.sql")
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+    def test_a_file_swapped_for_a_fifo_is_not_read(self, tmp_path: Path) -> None:
+        fifo = tmp_path / "pipe.sql"
+        os.mkfifo(fifo)
+        with pytest.raises(DbtProjectFilesError, match="no longer a regular file"):
+            pf._read_bounded(fifo, "models/pipe.sql")
 
     def test_a_project_over_the_bundle_limit(self, tmp_path: Path) -> None:
         assert "the most one bundle packs" in _refusal(_project(tmp_path), budget=10)

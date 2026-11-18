@@ -35,17 +35,21 @@ from __future__ import annotations
 import contextvars
 import hashlib
 import os
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 #: Top-level project files dbt reads; ``profiles.yml`` is never one of them.
+#: ``.dbtignore`` is the one hidden file taken: dbt reads it to skip files, so an
+#: edit to it changes what runs as surely as an edit to a model.
 PROJECT_FILES: Tuple[str, ...] = (
     "dbt_project.yml",
     "packages.yml",
     "dependencies.yml",
     "package-lock.yml",
     "selectors.yml",
+    ".dbtignore",
 )
 
 #: ``dbt_project.yml`` path keys and dbt-core's defaults for them.
@@ -149,16 +153,27 @@ def path_key_problem(project: Path, rel: PurePosixPath) -> Optional[str]:
     return None
 
 
-def _output_dirs(project: Path, config: Mapping[str, Any]) -> FrozenSet[Path]:
-    """The resolved directories dbt writes into, configured or by default."""
+#: A directory by identity, ``(st_dev, st_ino)``: a case-insensitive file system
+#: names ``Target`` and ``target`` differently and opens the same directory.
+_DirId = Tuple[int, int]
+
+
+def _dir_id(path: Path) -> Optional[_DirId]:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _output_dirs(project: Path, config: Mapping[str, Any]) -> FrozenSet[_DirId]:
+    """The directories dbt writes into (configured or by default) that exist, by identity."""
     dirs = set()
     for key, default in _OUTPUT_KEYS.items():
         value = config.get(key, default)
-        if isinstance(value, str) and value:
-            try:
-                dirs.add((project / value).resolve())
-            except (OSError, RuntimeError):
-                continue
+        found = _dir_id(project / value) if isinstance(value, str) and value else None
+        if found is not None:
+            dirs.add(found)
     return frozenset(dirs)
 
 
@@ -167,7 +182,7 @@ def _walk(
     base: Path,
     found: Dict[str, Path],
     links: List[str],
-    skip: FrozenSet[Path],
+    skip: FrozenSet[_DirId],
 ) -> None:
     """Add every regular, visible file under ``base``; collect the links met.
 
@@ -178,7 +193,7 @@ def _walk(
     if base.is_symlink():
         links.append(base.relative_to(project).as_posix())
         return
-    if not base.is_dir() or base.resolve() in skip:
+    if not base.is_dir() or _dir_id(base) in skip:
         return  # dbt tolerates a missing default directory
     for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
         here = Path(dirpath)
@@ -195,7 +210,7 @@ def _walk(
                 found[rel] = path
 
 
-def _descend(project: Path, child: Path, links: List[str], skip: FrozenSet[Path]) -> bool:
+def _descend(project: Path, child: Path, links: List[str], skip: FrozenSet[_DirId]) -> bool:
     """Whether the walk enters ``child``: not hidden, a cache, a link (collected) or a
     directory dbt writes into."""
     if child.name.startswith(".") or child.name == "__pycache__":
@@ -203,7 +218,7 @@ def _descend(project: Path, child: Path, links: List[str], skip: FrozenSet[Path]
     if child.is_symlink():
         links.append(child.relative_to(project).as_posix())
         return False
-    return child.resolve() not in skip
+    return _dir_id(child) not in skip
 
 
 def load_project_config(project: Path) -> Mapping[str, Any]:
@@ -256,12 +271,25 @@ def read_project_files(project: Path, *, budget: int = MAX_PROJECT_BYTES) -> Dic
 
 
 def _read_bounded(path: Path, rel: str) -> bytes:
-    """A file's bytes, refusing one over :data:`MAX_FILE_BYTES` without reading it all."""
+    """A file's bytes, refusing one over :data:`MAX_FILE_BYTES` without reading it all.
+
+    Opened without following a link (``O_NOFOLLOW``, where the platform has it) and
+    read only when it is a regular file, so a file swapped for a link or a FIFO after
+    the walk selected it is refused rather than read.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)  # Windows: no newline translation
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        with path.open("rb") as handle:
-            data = handle.read(MAX_FILE_BYTES + 1)
+        fd = os.open(path, flags)
     except OSError as exc:
         raise DbtProjectFilesError(f"{rel} could not be read ({exc.strerror or exc})") from exc
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise DbtProjectFilesError(f"{rel} is no longer a regular file; it was not read")
+        try:
+            data = handle.read(MAX_FILE_BYTES + 1)
+        except OSError as exc:
+            raise DbtProjectFilesError(f"{rel} could not be read ({exc.strerror or exc})") from exc
     if len(data) > MAX_FILE_BYTES:
         raise DbtProjectFilesError(
             f"{rel} is over {MAX_FILE_BYTES} bytes, the largest file a bundle carries. Load "
@@ -429,6 +457,11 @@ def bound_project(build_id: str) -> Optional[BoundProject]:
     return None if bound is None else bound.get(build_id)
 
 
+def binding_active() -> bool:
+    """Whether the running ``fluid apply`` bound dbt projects (its bundle packs some)."""
+    return _BOUND.get() is not None
+
+
 def set_bound_projects(
     projects: Optional[Mapping[str, BoundProject]],
 ) -> "contextvars.Token[Optional[Mapping[str, BoundProject]]]":
@@ -449,6 +482,7 @@ __all__ = [
     "DbtProjectFilesError",
     "ProjectSelection",
     "TreeDiff",
+    "binding_active",
     "binds_dbt_project",
     "bound_project",
     "check_project",

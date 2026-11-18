@@ -421,10 +421,21 @@ DBT_SOURCES_PREFIX = "sources/dbt/"
 MAX_DBT_SOURCE_BYTES = 128 * 1024 * 1024
 
 
-def _plain_segments(path: str) -> bool:
-    """True for a relative POSIX path of plain names: no ``..``, ``.``, empty or hidden part."""
-    if not path or "\\" in path or "\x00" in path or path.startswith("/"):
+#: The hidden files a packed dbt project may hold, at its root only: dbt reads
+#: ``.dbtignore`` to skip files (``build_runners/dbt/project_files.py``).
+_DBT_ROOT_DOTFILES = frozenset({".dbtignore"})
+
+
+def _plain_segments(path: str, *, allowed_root: frozenset = frozenset()) -> bool:
+    """True for a relative POSIX path of plain names: no ``..``, ``.``, empty or hidden
+    part (but a top-level name in ``allowed_root``), and no control character, which
+    would let one MANIFEST line pass for two."""
+    if not path or "\\" in path or path.startswith("/"):
         return False
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in path):
+        return False
+    if path in allowed_root:
+        return True
     return all(part and not part.startswith(".") for part in path.split("/"))
 
 
@@ -441,7 +452,7 @@ def _dbt_source_files(projects: Mapping[str, Mapping[str, bytes]]) -> Dict[str, 
         if not _plain_segments(build_id) or "/" in build_id:
             raise ValueError(f"dbt project build id {build_id!r} cannot be a bundle directory")
         for rel in sorted(projects[build_id]):
-            if not _plain_segments(rel):
+            if not _plain_segments(rel, allowed_root=_DBT_ROOT_DOTFILES):
                 raise ValueError(
                     f"dbt project file {rel!r} of build {build_id!r} is not a plain relative path"
                 )

@@ -313,6 +313,32 @@ class TestApplyRefusesAChangedCheckout:
         assert "cannot be found: the plan records" in exc.value.context["error"]
         assert _dbt_runs(ws) == []
 
+    def test_an_edited_dbtignore_is_a_change(self, ws: Path) -> None:
+        (ws / "dbt" / ".dbtignore").write_text("seeds/\n", encoding="utf-8")
+        _plan(_bundle())
+        (ws / "dbt" / ".dbtignore").write_text("tests/\n", encoding="utf-8")
+        with pytest.raises(CLIError) as exc:
+            _apply()
+        assert "changed .dbtignore" in exc.value.context["error"]
+
+    def test_the_runner_refuses_a_project_the_bundle_did_not_pack(self, ws: Path) -> None:
+        from fluid_build.build_runners.dbt.project_files import (
+            BoundProject,
+            reset_bound_projects,
+            set_bound_projects,
+        )
+        from fluid_build.build_runners.dbt.runner import _check_bound_project
+
+        other = BoundProject(build_id="other", files={}, bundle="runtime/bundle.tgz")
+        token = set_bound_projects({"other": other})
+        try:
+            with pytest.raises(CLIError) as exc:
+                _check_bound_project("transform", ws / "dbt")
+        finally:
+            reset_bound_projects(token)
+        assert "does not pack" in exc.value.context["error"]
+        _check_bound_project("transform", ws / "dbt")  # no binding: nothing to check
+
     def test_the_binding_ends_with_the_apply(self, ws: Path) -> None:
         from fluid_build.build_runners.dbt.project_files import bound_project
 

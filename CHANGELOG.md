@@ -14,22 +14,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model edited after `fluid plan` ran unreviewed. `fluid bundle --format tgz` now packs the dbt
   project of each dbt build, found where the dbt runner reads it, under
   `sources/dbt/<build id>/`: `dbt_project.yml`, `packages.yml`, `dependencies.yml`,
-  `package-lock.yml`, `selectors.yml` and the directories the `*-paths` keys name (dbt's
-  defaults: models, macros, seeds, snapshots, tests, analyses), byte for byte. It never packs
-  `profiles.yml`, a hidden file such as `.user.yml`, `target/`, `logs/` or `dbt_packages/`
-  (or the paths `target-path`, `log-path` and `packages-install-path` name), and it refuses a
-  symbolic link, a `*-paths` entry outside the project, a missing project, a file over 64 MiB and
-  more than 128 MiB of dbt files in one bundle. Each file is in the MANIFEST and under its merkle
-  root, so the same tree bundles to the same bytes. `fluid plan <bundle>` records each project's
-  files as `dbtProjects` under `planDigest`, and `fluid apply` compares the checkout with the
-  bundle's copy before anything runs; the dbt runner compares the directory it runs again, just
-  before dbt starts. A changed, added or removed file fails with
-  `apply_plan_digest_bundle_mismatch`, naming the files; `--no-verify-plan-binding` skips the
-  check, logged at WARNING. `fluid validate <bundle>` reports one finding per packed project.
-  Run `fluid generate dbt-tests` before `fluid bundle` and the generated tests are bound with
-  the models. A Git `repository` is not packed (its ref pins it), and a plan made from a
-  contract file binds no dbt project. The Databricks job emitter now uploads the same file
-  selection.
+  `package-lock.yml`, `selectors.yml`, `.dbtignore` and the directories the `*-paths` keys name
+  (dbt's defaults: models, macros, seeds, snapshots, tests, analyses), byte for byte. It never
+  packs `profiles.yml`, another hidden file such as `.user.yml`, `target/`, `logs/` or
+  `dbt_packages/` (or the paths `target-path`, `log-path` and `packages-install-path` name),
+  and it refuses a symbolic link, a `*-paths` entry outside the project, a missing project, a
+  file over 64 MiB and more than 128 MiB of dbt files in one bundle. Each file is in the
+  MANIFEST and under its merkle root, so the same tree bundles to the same bytes. `fluid plan
+  <bundle>` records each project's files as `dbtProjects` under `planDigest`, and `fluid apply`
+  compares the checkout with the bundle's copy before anything runs; the dbt runner compares the
+  directory it runs again, just before dbt starts, and refuses a project the bundle did not
+  pack. A changed, added or removed file fails with `apply_plan_digest_bundle_mismatch`, naming
+  the files; `--no-verify-plan-binding` skips the check, logged at WARNING. `fluid validate
+  <bundle>` reports one finding per packed project. Run `fluid generate dbt-tests` before
+  `fluid bundle` and the generated tests are bound with the models. The packages `dbt deps`
+  installs are bound by their lock file, not their installed copy; a Git `repository` is not
+  packed (its ref pins it); and a plan made from a contract file binds no dbt project. The
+  Databricks job emitter now uploads the same file selection.
 
 ### Fixed
 

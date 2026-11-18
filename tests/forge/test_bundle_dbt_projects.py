@@ -138,11 +138,26 @@ class TestRefusals:
         assert "cannot be a bundle directory" in text
 
     @pytest.mark.parametrize(
-        "rel", ["../escape.sql", "/abs.sql", "models/../../x.sql", "models/.h.sql", "a//b.sql"]
+        "rel",
+        [
+            "../escape.sql",
+            "/abs.sql",
+            "models/../../x.sql",
+            "models/.h.sql",
+            "a//b.sql",
+            "models/.dbtignore",  # .dbtignore is read at the project root only
+            "models/a\nb.sql",  # one MANIFEST line must not pass for two
+            "models/a\x7fb.sql",
+        ],
     )
     def test_a_file_path_that_is_not_plain(self, tmp_path: Path, rel: str) -> None:
         text = _refusal(tmp_path / "b.tgz", {"transform": {rel: b"x"}})
         assert "not a plain relative path" in text
+
+    def test_the_root_dbtignore_is_packed(self, tmp_path: Path) -> None:
+        tgz = tmp_path / "b.tgz"
+        build_bundle_tgz(CONTRACT, tgz, dbt_projects={"transform": {".dbtignore": b"x/\n"}})
+        assert read_bundle_dbt_trees(tgz) == {"transform": {".dbtignore": _sha(b"x/\n")}}
 
     def test_more_dbt_bytes_than_a_bundle_carries(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

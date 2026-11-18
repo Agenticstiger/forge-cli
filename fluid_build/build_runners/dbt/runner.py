@@ -922,31 +922,36 @@ def _check_bound_project(build_id: str, project_dir: Path) -> None:
     ``fluid apply`` compared the checkout with the copy the bundle packs before
     anything ran (``cli/apply.py::_bind_dbt_projects``) and set the bound files for
     the run. This compares the exact directory dbt is about to read, now: a file
-    changed while the apply provisioned, or a project found elsewhere than the
-    gate found it, is refused with the gate's event. Nothing is bound outside a
-    ``fluid apply`` of a bundle that packs dbt projects.
+    changed while the apply provisioned, a project found elsewhere than the gate
+    found it, or a project the bundle did not pack at all, is refused with the
+    gate's event. Nothing is bound outside a ``fluid apply`` of a bundle that
+    packs dbt projects, and then nothing is checked.
     """
-    from .project_files import bound_project, check_project
+    from .project_files import binding_active, bound_project, check_project
 
+    if not binding_active():
+        return
     bound = bound_project(build_id)
     if bound is None:
-        return
-    problem = check_project(project_dir, bound.files)
-    if problem is None:
-        return
+        error = (
+            f"build {build_id!r} runs the dbt project at {project_dir}, which the bundle this "
+            "apply binds does not pack (a repository fluid bundle reads as a Git source is "
+            "not packed). dbt did not run. Name the project's directory in repository, then "
+            "re-run ``fluid bundle`` and ``fluid plan``."
+        )
+    else:
+        problem = check_project(project_dir, bound.files)
+        if problem is None:
+            return
+        error = (
+            f"the dbt project of build {build_id!r} at {project_dir} differs from the copy "
+            f"{bound.bundle} packs: {problem}. dbt did not run. Re-run ``fluid bundle`` and "
+            "``fluid plan`` to bind the files as they are now, or restore them."
+        )
     from fluid_build._contract_loader import CLIError
 
     raise CLIError(
-        1,
-        "apply_plan_digest_bundle_mismatch",
-        {
-            "kind": "bundle-mismatch",
-            "error": (
-                f"the dbt project of build {build_id!r} at {project_dir} differs from the copy "
-                f"{bound.bundle} packs: {problem}. dbt did not run. Re-run ``fluid bundle`` and "
-                "``fluid plan`` to bind the files as they are now, or restore them."
-            ),
-        },
+        1, "apply_plan_digest_bundle_mismatch", {"kind": "bundle-mismatch", "error": error}
     )
 
 
