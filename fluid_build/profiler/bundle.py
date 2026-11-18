@@ -18,6 +18,20 @@ This module only finds that mapping; the registry's own parser reads it
 (:meth:`fluid_build.profiler._stats.StatisticsBackend.read_block`), so the
 profiler implements no grammar of its own and imports no registry here.
 
+The file is read the way the FLUX engine reads it, and the block is returned in
+the engine's canonical form, so the registry's parser sees what the engine's
+sees. This is a port, not an import (the profiler never imports the engine):
+
+* the loader is ``flux_engine/seam/resolve.py`` ``ExactLoader``: a float scalar
+  is its source text as a ``Decimal``, a timestamp stays a string, and an
+  integer too long to form is refused;
+* the canonical form is ``flux_engine/core/canonical.py`` ``coerce_key``,
+  ``canonicalise`` and ``_render_decimal`` (KERNEL-SPEC 2.1): every mapping key
+  is an NFC string (``True`` is ``"true"``, ``None`` is ``"null"``, an integer
+  its digits), every string is NFC, a ``Decimal`` becomes its string spelling,
+  and a float key or an integer outside the JCS safe range is refused. The
+  engine parses the block from that form (``stages/pipeline.py``).
+
 A refusal names the file and the keys it looked for, never a value from a
 record. Nothing in a bundle is a record, but an operator's terminal output
 travels, so a YAML error is reduced to its line number.
@@ -25,9 +39,12 @@ travels, so a YAML error is reduced to its line number.
 
 from __future__ import annotations
 
+import sys
+import unicodedata
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "BUNDLE_NAMESPACE",
@@ -45,6 +62,17 @@ _SUFFIXES = (".flux.yml", ".flux.yaml")
 #: The largest document read: a Simulation is hand-written text, and a larger file
 #: is not one.
 _MAX_BYTES = 4 * 1024 * 1024
+
+
+#: The largest integer JCS (RFC 8785) writes exactly: 2**53 - 1.
+_JCS_MAX_SAFE_INTEGER = 2**53 - 1
+
+#: The most digits an integer may have: CPython's own limit on int/text conversion.
+_MOST_INTEGER_DIGITS: int = sys.int_info.default_max_str_digits
+
+_INTEGER_TAG = "tag:yaml.org,2002:int"
+_FLOAT_TAG = "tag:yaml.org,2002:float"
+_TIMESTAMP_TAG = "tag:yaml.org,2002:timestamp"
 
 
 class BundleError(Exception):
@@ -82,6 +110,131 @@ def _documents(directory: Path) -> List[Path]:
     ]
 
 
+def _exact_loader(name: str) -> Any:
+    """The engine's ``ExactLoader``, built on first use so PyYAML stays off the cold path."""
+    import yaml
+
+    class ExactLoader(yaml.SafeLoader):
+        """A float is its source text as a Decimal, a timestamp a string, a long int refused."""
+
+    def refuse(node: Any, why: str) -> BundleError:
+        mark = node.start_mark
+        return BundleError(
+            "profile_bundle_unreadable",
+            f"{name} line {mark.line + 1}, column {mark.column + 1}: {why}",
+            {"next": "write the value as the FLUX engine reads it, or name another bundle"},
+        )
+
+    def construct_float(loader: Any, node: Any) -> Decimal:
+        text = str(loader.construct_scalar(node)).replace("_", "")
+        if ":" in text:
+            raise refuse(node, "a sexagesimal number has no decimal spelling; write plain decimal")
+        try:
+            value = Decimal(text)
+        except InvalidOperation:
+            raise refuse(node, "a scalar read as a float is not a decimal number") from None
+        if not value.is_finite():
+            raise refuse(node, "an infinite or not-a-number value is not allowed")
+        return value
+
+    def construct_int(loader: Any, node: Any) -> int:
+        too_long = f"an integer of more than {_MOST_INTEGER_DIGITS} digits is too long to read"
+        digits = sum(ch.isdigit() for ch in str(loader.construct_scalar(node)))
+        if digits > _MOST_INTEGER_DIGITS:
+            raise refuse(node, too_long)
+        try:
+            value = int(loader.construct_yaml_int(node))
+        except (ValueError, IndexError):
+            raise refuse(node, "a scalar read as an integer has no integer value") from None
+        if abs(value) >= 10**_MOST_INTEGER_DIGITS:
+            raise refuse(node, too_long)
+        return value
+
+    ExactLoader.add_constructor(_FLOAT_TAG, construct_float)
+    ExactLoader.add_constructor(_INTEGER_TAG, construct_int)
+
+    def construct_timestamp(loader: Any, node: Any) -> Any:
+        return loader.construct_scalar(node)
+
+    ExactLoader.add_constructor(_TIMESTAMP_TAG, construct_timestamp)
+    return ExactLoader
+
+
+def _nfc(text: str) -> str:
+    return unicodedata.normalize("NFC", text)
+
+
+def _render_decimal(value: Decimal) -> str:
+    """The declared scale is kept; negative zero is folded onto the positive spelling."""
+    rendered = format(value, "f")
+    if rendered.startswith("-") and value == 0:
+        rendered = rendered[1:]
+    return rendered
+
+
+def _coerce_key(key: Any, name: str, where: str) -> str:
+    if isinstance(key, str):
+        return _nfc(key)
+    if isinstance(key, bool):
+        return "true" if key else "false"
+    if isinstance(key, float):
+        raise BundleError(
+            "profile_bundle_unreadable",
+            f"{name}: {where} has a float key, which has no canonical spelling",
+            {"next": "quote the key so it is a string"},
+        )
+    if isinstance(key, int):
+        return str(key)
+    if key is None:
+        return "null"
+    if isinstance(key, Decimal):
+        return _render_decimal(key)
+    raise BundleError(
+        "profile_bundle_unreadable",
+        f"{name}: {where} has a key of class {type(key).__name__!r}",
+        {"next": "quote the key so it is a string"},
+    )
+
+
+def _canonicalise(value: Any, name: str, where: str) -> Any:
+    """*value* as JSON-ready Python (KERNEL-SPEC 2.1), mirroring the engine's ``canonicalise``."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if abs(value) > _JCS_MAX_SAFE_INTEGER:
+            raise BundleError(
+                "profile_bundle_unreadable",
+                f"{name}: {where} holds an integer outside the range 2^53 - 1 that FLUX reads",
+                {"next": "write a smaller integer, or quote it as a string"},
+            )
+        return value
+    if isinstance(value, Decimal):
+        return _render_decimal(value)
+    if isinstance(value, str):
+        return _nfc(value)
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        canonical: Dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = _coerce_key(raw_key, name, where)
+            if key in canonical:
+                raise BundleError(
+                    "profile_bundle_unreadable",
+                    f"{name}: {where} has two keys that both read as {key!r}",
+                    {"next": "keep one of them"},
+                )
+            canonical[key] = _canonicalise(raw_value, name, f"{where}.{key}")
+        return {key: canonical[key] for key in sorted(canonical)}
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return [_canonicalise(item, name, where) for item in value]
+    raise BundleError(
+        "profile_bundle_unreadable",
+        f"{name}: {where} holds a value of class {type(value).__name__!r}",
+        {"next": "write plain YAML scalars, lists and mappings"},
+    )
+
+
 def _load(path: Path) -> Any:
     """One document, or a :class:`BundleError` that names the file and the line."""
     import yaml
@@ -100,7 +253,9 @@ def _load(path: Path) -> Any:
             "profile_bundle_unreadable", f"{path.name} cannot be read: {reason}"
         ) from None
     try:
-        return yaml.safe_load(text)
+        return yaml.load(
+            text, Loader=_exact_loader(path.name)
+        )  # nosec B506 - a SafeLoader subclass
     except yaml.YAMLError as exc:
         mark = getattr(exc, "problem_mark", None)
         where = f" at line {mark.line + 1}" if mark is not None else ""
@@ -157,4 +312,5 @@ def read_bundle_block(directory: Path, expose_id: str) -> BundleBlock:
             f"{path.name}: {where} is not a mapping",
             {"next": "declare the fidelity block as FLUX's fidelity grammar spells it"},
         )
+    block = _canonicalise(block, path.name, where)
     return BundleBlock(raw=block, simulation=path.name, expose_id=expose_id)

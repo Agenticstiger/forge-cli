@@ -123,6 +123,83 @@ def test_a_linked_document_is_not_read(tmp_path):
     assert refused.value.event == "profile_bundle_no_simulation"
 
 
+def _simulation_with(block_text):
+    indented = "".join(f"          {line}\n" for line in block_text.strip("\n").split("\n"))
+    return (
+        "kind: Simulation\nid: s\nextensions:\n  com.agentics.flux/1:\n    emits:\n"
+        f"      orders:\n        fidelity:\n{indented}"
+    )
+
+
+def test_a_bare_null_key_is_the_string_null(tmp_path):
+    _write(tmp_path, "s.flux.yml", _simulation_with("columns:\n  aborted_at: {null: fail}"))
+    block = read_bundle_block(tmp_path, "orders").raw
+    assert block == {"columns": {"aborted_at": {"null": "fail"}}}
+
+
+def test_yes_and_true_keys_read_as_the_json_spellings(tmp_path):
+    _write(tmp_path, "s.flux.yml", _simulation_with("columns: {yes: 1, off: 2, 7: 3}"))
+    assert read_bundle_block(tmp_path, "orders").raw == {"columns": {"7": 3, "false": 2, "true": 1}}
+
+
+def test_a_bare_float_is_its_source_text(tmp_path):
+    _write(
+        tmp_path,
+        "s.flux.yml",
+        _simulation_with("properties: [{level: 0.5, tolerance: 1.10, big: 1e3}]"),
+    )
+    (entry,) = read_bundle_block(tmp_path, "orders").raw["properties"]
+    assert entry["level"] == "0.5"
+    assert entry["tolerance"] == "1.10"
+    assert isinstance(entry["big"], str)
+
+
+def test_an_unquoted_timestamp_stays_the_string_written(tmp_path):
+    _write(
+        tmp_path,
+        "s.flux.yml",
+        _simulation_with("columns: {at: {range: {min: 2024-01-01T00:00:00Z, max: 2024-02-01}}}"),
+    )
+    got = read_bundle_block(tmp_path, "orders").raw["columns"]["at"]["range"]
+    assert got == {"max": "2024-02-01", "min": "2024-01-01T00:00:00Z"}
+
+
+def test_strings_and_keys_are_nfc(tmp_path):
+    nfd = "cafe\u0301"
+    _write(tmp_path, "s.flux.yml", _simulation_with(f'columns: {{"{nfd}": {{note: "{nfd}"}}}}'))
+    assert read_bundle_block(tmp_path, "orders").raw == {
+        "columns": {"caf\u00e9": {"note": "caf\u00e9"}}
+    }
+
+
+def test_a_bare_float_key_is_its_decimal_spelling_as_the_engine_reads_it(tmp_path):
+    _write(tmp_path, "s.flux.yml", _simulation_with("columns: {0.50: x}"))
+    assert read_bundle_block(tmp_path, "orders").raw == {"columns": {"0.50": "x"}}
+
+
+def test_a_binary_float_key_is_refused_and_names_the_file():
+    # The loader never builds a float, so this is the canonical form's own guard.
+    with pytest.raises(BundleError) as refused:
+        bundle._canonicalise({0.5: "x"}, "s.flux.yml", "fidelity")
+    assert refused.value.event == "profile_bundle_unreadable"
+    assert "s.flux.yml" in str(refused.value) and "float key" in str(refused.value)
+
+
+def test_an_integer_outside_the_safe_range_is_refused(tmp_path):
+    _write(tmp_path, "s.flux.yml", _simulation_with("rows: 9007199254740993"))
+    with pytest.raises(BundleError) as refused:
+        read_bundle_block(tmp_path, "orders")
+    assert refused.value.event == "profile_bundle_unreadable"
+    assert "s.flux.yml" in str(refused.value) and "integer" in str(refused.value)
+
+
+def test_an_integer_too_long_to_form_is_refused_with_its_position(tmp_path):
+    _write(tmp_path, "s.flux.yml", _simulation_with("rows: " + "9" * 5000))
+    with pytest.raises(BundleError) as refused:
+        read_bundle_block(tmp_path, "orders")
+    assert "too long" in str(refused.value) and "line" in str(refused.value)
+
+
 def test_the_module_imports_no_registry():
     import ast
     import inspect

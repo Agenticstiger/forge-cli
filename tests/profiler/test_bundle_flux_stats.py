@@ -499,3 +499,25 @@ def test_a_flux_stats_without_the_grammar_refuses_before_reading(tmp_path, monke
     assert rc == 1
     assert "profile_statistics_unavailable" in out
     assert "needs a flux-stats release that carries flux_stats.fidelity" in out
+
+
+def test_a_block_written_with_bare_null_keys_and_bare_floats_profiles_as_the_quoted_one(tmp_path):
+    (tmp_path / "quoted").mkdir()
+    (tmp_path / "bare").mkdir()
+    quoted = _profile(tmp_path / "quoted", _rows(), [PROPERTIES[0], PROPERTIES[5]])
+    directory = _bundle(tmp_path / "bare", [PROPERTIES[0], PROPERTIES[5]])
+    path = directory / "simulation.flux.yml"
+    text = path.read_text(encoding="utf-8")
+    assert "'null':" in text and "level: '0.5'" in text
+    path.write_text(text.replace("'null':", "null:").replace("level: '0.5'", "level: 0.5"))
+    block = bundle.read_bundle_block(directory, EXPOSE)
+    assert block.raw["columns"]["market"]["null"] == "fail"
+    bare = profile_expose(
+        CONTRACT,
+        EXPOSE,
+        source=_slice(tmp_path / "bare", _rows()),
+        backend=_stats.load_backend(),
+        cwd=tmp_path / "bare",
+        bundle=block,
+    )
+    assert bare.digest == quoted.digest
