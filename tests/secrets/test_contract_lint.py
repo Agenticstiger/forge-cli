@@ -314,6 +314,46 @@ def test_validate_reports_a_deferred_destination_as_a_warning():
     assert any("PGPASSWORD@<host>" in warning for warning in result.warnings)
 
 
+#: A reference that ends in a word the log redactor reads as a credential key.
+VAULT_PASSWORD_REF = "vault://kv/orders/pg#password"  # pragma: allowlist secret
+
+
+@pytest.mark.unit
+def test_validate_lines_survive_the_redactor_that_prints_them(monkeypatch):
+    """validate prints ``<pointer>: <what>`` through the secret redactor.
+
+    Every pointer ends in ``secretRef``, which the redactor's ``key: value``
+    rule leaves alone. A pointer that ended in ``password`` would mask the
+    reference after it, as ``<ref>: ...`` once masked the word after a
+    reference.
+    """
+    from fluid_build.cli import validate as validate_cmd
+    from fluid_build.observability import secret_redactor
+    from fluid_build.schema_manager import ValidationResult
+    from fluid_build.secrets.policy import SCHEMES_ENV
+
+    # Only the patterns: a value another test registered must not mask a word here.
+    monkeypatch.setattr(secret_redactor, "_known_secrets", ())
+    monkeypatch.setattr(secret_redactor, "_known_secret_set", set())
+    monkeypatch.setenv(SCHEMES_ENV, "env")
+    contract = {
+        "builds": [
+            {"properties": {"source": {"connection": {"secretRef": ref, "host": host}}}}
+            for ref, host in (
+                (VAULT_PASSWORD_REF, REMOTE),
+                (PGPASSWORD_REF, "{{ env.PGHOST }}"),
+                (PGPASSWORD_REF, ""),
+            )
+        ],
+        "exposes": [{"binding": {"auth": {"secretRef": VAULT_PASSWORD_REF}}}],
+    }
+    result = ValidationResult(is_valid=True, schema_version=None)
+    validate_cmd._check_secret_refs(result, contract)
+    assert len(result.errors) == 3 and len(result.warnings) == 1
+    for line in result.errors + result.warnings:
+        assert secret_redactor.redact_secret_text(line) == line, line
+
+
 @pytest.mark.unit
 def test_secrets_check_shows_a_deferred_destination():
     from fluid_build.cli import secrets as secrets_cmd
