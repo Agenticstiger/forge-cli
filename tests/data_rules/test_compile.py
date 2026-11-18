@@ -604,3 +604,33 @@ def test_every_dialect_writes_sql_sqlglot_parses(dialect: str) -> None:
 def test_an_unknown_dialect_is_refused() -> None:
     with pytest.raises(ValueError):
         compile_rules(_billing(), dialect="oracle")
+
+
+def test_a_summary_function_never_reaches_sql_as_written() -> None:
+    contract = _billing()
+    agg = contract["exposes"][0]["contract"]["invariants"][2]["aggregate"]
+    agg["function"] = "max(0) AS x FROM t) AS s ON TRUE) AS q; DROP TABLE victim; --"
+    errors = [f.display for f in lint_contract(contract) if f.severity == "error"]
+    assert any("is not a summary function" in e for e in errors)
+    rule = _by_id(contract)["billed"]
+    assert rule.status == UNSUPPORTED and rule.counts is None
+    assert "DROP" not in rule.reason.upper() or "validator refuses it" in rule.reason
+
+
+def test_a_summary_function_is_refused_even_when_the_lint_is_bypassed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fluid_build.data_rules import _compile
+
+    monkeypatch.setattr(_compile, "analyze", lambda contract: ([], {}))
+    contract = _billing()
+    contract["exposes"][0]["contract"]["invariants"][2]["aggregate"]["function"] = "avg"
+    rule = _by_id(contract)["billed"]
+    assert rule.status == UNSUPPORTED and "not a summary function" in rule.reason
+
+
+def test_a_non_finite_if_none_is_unsupported() -> None:
+    contract = _billing()
+    contract["exposes"][0]["contract"]["invariants"][2]["aggregate"]["ifNone"] = float("nan")
+    rule = _by_id(contract)["billed"]
+    assert rule.status == UNSUPPORTED and rule.counts is None

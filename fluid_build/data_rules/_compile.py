@@ -155,13 +155,22 @@ def compile_rules(contract: Mapping[str, Any], dialect: Optional[str] = None) ->
     return _Compiler(contract, findings, routes, dialect).run()
 
 
+#: The SQL of each summary function (§1.2). A closed map: the contract's text never reaches SQL,
+#: so a ``function`` the schema would refuse cannot carry SQL into an export that skipped
+#: ``fluid validate``.
+_SUMMARIES = {"count": "COUNT", "sum": "SUM", "min": "MIN", "max": "MAX"}
+
+
 def _literal(value: Any) -> str:
-    """A number from the contract as exact SQL text (never ``1e-07``)."""
-    if isinstance(value, bool):
-        raise ValueError("not a number")
+    """A number from the contract as exact SQL text (never ``1e-07``, never ``NaN``)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _Refused(f"{value!r} is not a number")
     if isinstance(value, int):
         return str(value)
-    return format(Decimal(repr(value)) if isinstance(value, float) else Decimal(value), "f")
+    number = Decimal(repr(value))
+    if not number.is_finite():
+        raise _Refused(f"{value!r} is not a finite number")
+    return format(number, "f")
 
 
 class _Refused(Exception):
@@ -696,6 +705,8 @@ class _RowQuery:
             raise _Refused("the summary names no child relationship")
         compiler.same_dialect(dialect, child, f"in a summary over {child.expose_id}")
         function = agg.get("function")
+        if not isinstance(function, str) or function not in _SUMMARIES:
+            raise _Refused(f"{function!r} is not a summary function ({', '.join(_SUMMARIES)})")
         filter_sql = None
         if isinstance(agg.get("filter"), str):
             node = fs.parse(agg["filter"])
@@ -721,7 +732,7 @@ class _RowQuery:
                 value = f'({value} COLLATE "C")'
             if filter_sql is not None:
                 value = f"CASE WHEN {filter_sql} THEN {value} END"
-            inner = f"{str(function).upper()}({value})"
+            inner = f"{_SUMMARIES[function]}({value})"
         keys = ", ".join(f"{q('c')}.{q(c)}" for c in rel.from_columns)
         on = " AND ".join(
             f"{q('t')}.{q(t)} = {q('s')}.{q(f)}"

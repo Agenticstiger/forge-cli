@@ -819,6 +819,32 @@ def _enum_with_prefixes(
     }
 
 
+def _enum_rule(
+    name: str,
+    constraint: str,
+    message: Any,
+    placeholders: Tuple[List[str], List[str]],
+    dialect: Optional[str],
+) -> Dict[str, Any]:
+    """An enum ``validationRules`` entry as an ``invalidValues`` rule whose ``validValues`` also
+    hold the column's placeholder values (``RFC-data-rules.md`` 4); with placeholder prefixes,
+    a ``sql`` rule (:func:`_enum_with_prefixes`)."""
+    # The constraint is one string: values separated by commas, each a
+    # quoted string as SQL writes one or plain text (RFC-data-rules.md 2.3).
+    values = read_enum_list(constraint)
+    exempt_values, exempt_prefixes = placeholders
+    if exempt_prefixes:
+        return _enum_with_prefixes(name, values + exempt_values, exempt_prefixes, message, dialect)
+    return {
+        "type": "library",
+        "metric": "invalidValues",
+        "mustBe": 0,
+        "arguments": {"validValues": values + [v for v in exempt_values if v not in values]},
+        "dimension": "conformity",
+        "description": message or f"Field '{name}' must be one of: {write_enum_list(values)}",
+    }
+
+
 def _validation_rule_to_quality(
     validation: Mapping[str, Any],
     name: str,
@@ -856,22 +882,7 @@ def _validation_rule_to_quality(
             "description": message or f"Field '{name}' must match pattern: {constraint}",
         }
     if val_type == "enum":
-        # The constraint is one string: values separated by commas, each a
-        # quoted string as SQL writes one or plain text (RFC-data-rules.md 2.3).
-        values = read_enum_list(constraint)
-        if exempt_prefixes:
-            return _enum_with_prefixes(
-                name, values + exempt_values, exempt_prefixes, message, dialect
-            )
-        valid = values + [v for v in exempt_values if v not in values]
-        return {
-            "type": "library",
-            "metric": "invalidValues",
-            "mustBe": 0,
-            "arguments": {"validValues": valid},
-            "dimension": "conformity",
-            "description": message or f"Field '{name}' must be one of: {write_enum_list(values)}",
-        }
+        return _enum_rule(name, str(constraint), message, placeholders, dialect)
     if val_type == "range":
         return {
             "type": "text",

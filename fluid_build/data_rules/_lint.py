@@ -521,7 +521,14 @@ class _Lint:
             summary = column.type.type
             reads.add((child.expose_id, column.name))
         else:
-            return None  # the schema's enum reports it
+            # The schema's enum refuses it too, but an export may run on a contract no one
+            # validated: the lint says so itself, so every consumer refuses the summary.
+            self.error(
+                f"{label}.function",
+                path + ("function",),
+                f"{function!r} is not a summary function: count, sum, min or max",
+            )
+            return None
         if "filter" in agg:
             checked = self.text(
                 child, child.model, agg["filter"], fs.PREDICATE, label, path, "filter"
