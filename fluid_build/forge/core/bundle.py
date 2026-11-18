@@ -181,13 +181,14 @@ def build_manifest(
     ``"<path>:<hash>\\n"`` sequence — simple, deterministic, easy to
     reproduce with shell tools (``sha256sum | sort | sha256sum``).
 
-    ``source`` (optional) is the provenance block :func:`make_bundle_source`
-    builds: where the source contract lives relative to the bundle, which
-    environment overlay was applied, and the overlay warnings its merge raised.
-    It is metadata about the bundle, not bundle content, so it is deliberately
+    ``source`` (optional) is the MANIFEST ``source`` block: which environment
+    overlay was applied and the overlay warnings its merge raised. It must hold
+    no path: :func:`build_bundle_tgz` takes the paths of the record
+    :func:`make_bundle_source` builds (:data:`PROVENANCE_KEYS`) out before it
+    calls this, and writes them to the provenance file beside the bundle. It is
+    metadata about the bundle, not bundle content, so it is deliberately
     OUTSIDE the merkle root — the digest still identifies the resolved contract
-    alone, and two bundles of the same contract written to different
-    directories keep one digest.
+    alone.
     """
     per_file: Dict[str, str] = {}
     for path in sorted(files.keys()):

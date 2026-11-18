@@ -23,6 +23,7 @@ surface.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import tarfile
@@ -173,6 +174,22 @@ class TestBundleRecordsWhatItWasBuiltFrom:
         assert read_bundle_source(Path(a))["contract"] != read_bundle_source(Path(b))["contract"]
         assert _manifest(a)["digest"] == _manifest(b)["digest"]
         assert Path(a).read_bytes() == Path(b).read_bytes()
+
+
+class TestAttestation:
+    def test_the_subject_is_the_packet_file_and_the_merkle_root_a_parameter(self, ws: Path) -> None:
+        argv = ["bundle", _C, "--format", "tgz", "--out", "runtime/b.tgz", "--attest"]
+        assert bundle_cmd.run(_parse(bundle_cmd.register, argv), LOG) == 0
+        tgz = Path("runtime/b.tgz")
+        statement = json.loads(Path("runtime/b.tgz.intoto.jsonl").read_text(encoding="utf-8"))
+        assert statement["subject"] == [
+            {"name": "b.tgz", "digest": {"sha256": hashlib.sha256(tgz.read_bytes()).hexdigest()}}
+        ]
+        params = statement["predicate"]["buildDefinition"]["externalParameters"]
+        assert params["bundleDigest"] == _manifest(tgz)["digest"]
+        assert params["packetDigest"] == "sha256:" + hashlib.sha256(tgz.read_bytes()).hexdigest()
+        assert params["sourceContract"] == "../" + _C
+        assert params["sign_mode"] == "none"
 
 
 class TestPlanFromABundle:
