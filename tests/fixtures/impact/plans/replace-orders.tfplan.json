@@ -1,0 +1,33 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.8.0",
+  "resource_changes": [
+    {
+      "address": "google_bigquery_table.orders",
+      "mode": "managed",
+      "type": "google_bigquery_table",
+      "name": "orders",
+      "action_reason": "replace_because_cannot_update",
+      "change": {
+        "actions": ["delete", "create"],
+        "before": {"labels": {"owner": "sales-data"}, "sample": "a-row-value-the-report-must-not-copy"},
+        "after": {"labels": {"owner": "sales-data"}},
+        "replace_paths": [["time_partitioning", 0, "field"]]
+      }
+    },
+    {
+      "address": "google_bigquery_dataset.sales",
+      "mode": "managed",
+      "type": "google_bigquery_dataset",
+      "name": "sales",
+      "change": {"actions": ["no-op"], "before": {}, "after": {}}
+    },
+    {
+      "address": "data.google_project.this",
+      "mode": "data",
+      "type": "google_project",
+      "name": "this",
+      "change": {"actions": ["read"]}
+    }
+  ]
+}
