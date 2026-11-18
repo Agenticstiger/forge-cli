@@ -73,6 +73,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list the way the other type readers do, stepping over quoted text; only a type whose parameter
   list holds a parenthesis inside quotes reads differently. The conformance vectors gain three
   cases for a level holding a parenthesis, a comma and a doubled quote.
+- **`decimal(p,s)` has a FLUID SQL/1 type only within the SQL standard's bounds.** FLUID SQL/1
+  read `decimal(0)`, `decimal(0,2)` and `numeric(10,11)` as numbers of scale 0, 2 and 11, so
+  `fluid validate` accepted a rule naming such a column that the FLUX engine refuses. A
+  decimal-family column now has a type only when 1 <= p and 0 <= s <= p (and p is at most
+  1,000, as before), and the refusal says so: "(a decimal is decimal(p) or decimal(p, s), with
+  1 <= p <= 1000 and 0 <= s <= p)". Leading zeros still read by value, so `decimal(0012, 02)` is
+  `decimal(12, 2)`. The conformance vectors gain 13 cases at the bounds, from `decimal(1)` and
+  `decimal(1000, 1000)` to `decimal(0)` and `decimal(1000,1001)`.
 - **The Snowflake provider's redaction helper masks a credential whose key is quoted.**
   `redact_string` returned the value in the clear for `{'client_secret': '…'}`,
   `{"<PREFIX>_TOKEN": "…"}`, `"id_token": "…"` and `{'private_key': '…'}`: only a key with its own

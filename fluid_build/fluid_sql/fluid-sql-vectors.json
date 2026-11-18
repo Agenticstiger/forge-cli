@@ -393,6 +393,52 @@
      ]
     }
    }
+  },
+  "decimals": {
+   "columns": {
+    "decimal_id": {
+     "type": "string"
+    },
+    "p1": {
+     "type": "decimal(1)"
+    },
+    "p1_s1": {
+     "type": "decimal(1,1)"
+    },
+    "p1000_s1000": {
+     "type": "decimal(1000, 1000)"
+    },
+    "padded": {
+     "type": "decimal(0012, 02)"
+    },
+    "padded_wide": {
+     "type": "numeric(000012, 00002)"
+    },
+    "p0": {
+     "type": "decimal(0)"
+    },
+    "p0_s0": {
+     "type": "numeric(0,0)"
+    },
+    "p0_s2": {
+     "type": "decimal(0, 2)"
+    },
+    "p1_s2": {
+     "type": "dec(1 ,2)"
+    },
+    "p10_s11": {
+     "type": "numeric(10,11)"
+    },
+    "p1000_s1001": {
+     "type": "decimal(1000,1001)"
+    },
+    "big0": {
+     "type": "bignumeric(0)"
+    },
+    "zeros": {
+     "type": "decimal(0000, 0)"
+    }
+   }
   }
  },
  "vectors": [
@@ -13808,6 +13854,232 @@
    "site": "predicate",
    "model": "invoices",
    "note": "a wider declaration has no FLUID SQL/1 type",
+   "expect": {
+    "verdict": "refused",
+    "reason": "untyped-column"
+   }
+  },
+  {
+   "id": "type-decimal-precision-1",
+   "text": "p1",
+   "site": "value",
+   "model": "decimals",
+   "note": "RFC 2.3: decimal(p,s) has a FLUID SQL/1 type only when 1 <= p and 0 <= s <= p, as the SQL standard requires; decimal(1) is the narrowest, scale 0",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "column",
+     "name": "p1"
+    },
+    "canonical": "p1",
+    "type": "number",
+    "scale": "0",
+    "eval": [
+     {
+      "row": {
+       "p1": "7"
+      },
+      "result": "7"
+     }
+    ]
+   }
+  },
+  {
+   "id": "type-decimal-scale-equal-to-precision",
+   "text": "p1_s1",
+   "site": "value",
+   "model": "decimals",
+   "note": "RFC 2.3: decimal(p,s) has a FLUID SQL/1 type only when 1 <= p and 0 <= s <= p, as the SQL standard requires; the scale may equal the precision",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "column",
+     "name": "p1_s1"
+    },
+    "canonical": "p1_s1",
+    "type": "number",
+    "scale": "1",
+    "eval": [
+     {
+      "row": {
+       "p1_s1": "0.5"
+      },
+      "result": "0.5"
+     },
+     {
+      "row": {
+       "p1_s1": "-0.9"
+      },
+      "result": "-0.9"
+     }
+    ]
+   }
+  },
+  {
+   "id": "type-decimal-precision-and-scale-1000",
+   "text": "p1000_s1000 > 0",
+   "site": "predicate",
+   "model": "decimals",
+   "note": "RFC 2.3: decimal(p,s) has a FLUID SQL/1 type only when 1 <= p and 0 <= s <= p, as the SQL standard requires; p and s both at 1000, PostgreSQL's limit",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "compare",
+     "op": ">",
+     "left": {
+      "node": "column",
+      "name": "p1000_s1000"
+     },
+     "right": {
+      "node": "number",
+      "value": "0"
+     }
+    },
+    "canonical": "p1000_s1000 > 0",
+    "type": "bool",
+    "eval": [
+     {
+      "row": {
+       "p1000_s1000": "0.25"
+      },
+      "result": true
+     }
+    ]
+   }
+  },
+  {
+   "id": "type-decimal-leading-zeros",
+   "text": "padded",
+   "site": "value",
+   "model": "decimals",
+   "note": "p and s are unsigned integers, read by value: decimal(0012, 02) is decimal(12, 2)",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "column",
+     "name": "padded"
+    },
+    "canonical": "padded",
+    "type": "number",
+    "scale": "2",
+    "eval": [
+     {
+      "row": {
+       "padded": "1.50"
+      },
+      "result": "1.50"
+     }
+    ]
+   }
+  },
+  {
+   "id": "type-decimal-leading-zeros-past-four-digits",
+   "text": "padded_wide",
+   "site": "value",
+   "model": "decimals",
+   "note": "leading zeros do not count toward the widest precision read: numeric(000012, 00002) is numeric(12, 2)",
+   "expect": {
+    "verdict": "accepted",
+    "tree": {
+     "node": "column",
+     "name": "padded_wide"
+    },
+    "canonical": "padded_wide",
+    "type": "number",
+    "scale": "2",
+    "eval": [
+     {
+      "row": {
+       "padded_wide": "1.50"
+      },
+      "result": "1.50"
+     }
+    ]
+   }
+  },
+  {
+   "id": "type-decimal-precision-0",
+   "text": "p0 > 0",
+   "site": "predicate",
+   "model": "decimals",
+   "note": "RFC 2.3: decimal(p,s) has a FLUID SQL/1 type only when 1 <= p and 0 <= s <= p, as the SQL standard requires; decimal(0) has none",
+   "expect": {
+    "verdict": "refused",
+    "reason": "untyped-column"
+   }
+  },
+  {
+   "id": "type-decimal-precision-0-scale-0",
+   "text": "p0_s0 > 0",
+   "site": "predicate",
+   "model": "decimals",
+   "note": "RFC 2.3: decimal(p,s) has a FLUID SQL/1 type only when 1 <= p and 0 <= s <= p, as the SQL standard requires; numeric(0,0) has none",
+   "expect": {
+    "verdict": "refused",
+    "reason": "untyped-column"
+   }
+  },
+  {
+   "id": "type-decimal-precision-0-scale-2",
+   "text": "p0_s2 > 0",
+   "site": "predicate",
+   "model": "decimals",
+   "note": "RFC 2.3: decimal(p,s) has a FLUID SQL/1 type only when 1 <= p and 0 <= s <= p, as the SQL standard requires; decimal(0, 2) has none",
+   "expect": {
+    "verdict": "refused",
+    "reason": "untyped-column"
+   }
+  },
+  {
+   "id": "type-decimal-scale-above-precision",
+   "text": "p1_s2 > 0",
+   "site": "predicate",
+   "model": "decimals",
+   "note": "RFC 2.3: decimal(p,s) has a FLUID SQL/1 type only when 1 <= p and 0 <= s <= p, as the SQL standard requires; dec(1 ,2) has none",
+   "expect": {
+    "verdict": "refused",
+    "reason": "untyped-column"
+   }
+  },
+  {
+   "id": "type-numeric-scale-above-precision",
+   "text": "p10_s11 > 0",
+   "site": "predicate",
+   "model": "decimals",
+   "note": "RFC 2.3: decimal(p,s) has a FLUID SQL/1 type only when 1 <= p and 0 <= s <= p, as the SQL standard requires; numeric(10,11) has none",
+   "expect": {
+    "verdict": "refused",
+    "reason": "untyped-column"
+   }
+  },
+  {
+   "id": "type-decimal-scale-1001",
+   "text": "p1000_s1001 > 0",
+   "site": "predicate",
+   "model": "decimals",
+   "note": "RFC 2.3: decimal(p,s) has a FLUID SQL/1 type only when 1 <= p and 0 <= s <= p, as the SQL standard requires; decimal(1000,1001) has none",
+   "expect": {
+    "verdict": "refused",
+    "reason": "untyped-column"
+   }
+  },
+  {
+   "id": "type-bignumeric-precision-0",
+   "text": "big0 > 0",
+   "site": "predicate",
+   "model": "decimals",
+   "note": "RFC 2.3: decimal(p,s) has a FLUID SQL/1 type only when 1 <= p and 0 <= s <= p, as the SQL standard requires; bignumeric(0) has none",
+   "expect": {
+    "verdict": "refused",
+    "reason": "untyped-column"
+   }
+  },
+  {
+   "id": "type-decimal-precision-written-0000",
+   "text": "zeros > 0",
+   "site": "predicate",
+   "model": "decimals",
+   "note": "RFC 2.3: decimal(p,s) has a FLUID SQL/1 type only when 1 <= p and 0 <= s <= p, as the SQL standard requires; decimal(0000, 0) is precision 0",
    "expect": {
     "verdict": "refused",
     "reason": "untyped-column"

@@ -48,7 +48,7 @@ from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, Optional, Se
 
 from fluid_build import fluid_sql as fs
 from fluid_build._validation_issues import json_pointer
-from fluid_build.fluid_sql._types import NUMBER, ORDERABLE, STRING
+from fluid_build.fluid_sql._types import NUMBER, ORDERABLE, STRING, decimal_hint
 
 from . import _masks
 from ._model import Expose, Relationship, as_dict, as_list, build, by_id, nfc
@@ -481,7 +481,7 @@ class _Lint:
                     f"{label}.column",
                     path + ("column",),
                     f"{column.name} ({column.declared}) has no FLUID SQL/1 type, so nothing can "
-                    "summarize it",
+                    "summarize it" + decimal_hint(column.declared),
                 )
                 return None
             kind = column.type.type.kind

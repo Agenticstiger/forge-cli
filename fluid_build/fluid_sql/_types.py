@@ -51,6 +51,7 @@ _TIMESTAMPTZ_TYPES = frozenset(
 )
 #: The widest DECIMAL precision read (PostgreSQL's limit): a wider declaration has no FLUID
 #: SQL/1 type, so no contract can make a value of unbounded width (flux-expr/2 reads it so too).
+#: A precision below 1, or a scale above the precision, has none either (RFC 2.3).
 MAX_DECIMAL_PRECISION = 1000
 #: A type's base name. ``split_type_params`` finds where its parameter list ends, stepping
 #: over quoted text, so an enum level may hold a parenthesis: ``enum('a (b)')`` is a string.
@@ -113,10 +114,11 @@ def column_type(declared: object) -> Optional[ColumnType]:
         places = (sized.group("s") or "0").lstrip("0") or "0"
         if len(digits) > 4 or len(places) > 4:
             return None
-        precision = int(digits)
-        if precision > MAX_DECIMAL_PRECISION:
+        precision, scale = int(digits), int(places)
+        # The SQL standard's rule, 1 <= p and 0 <= s <= p (DuckDB and SQL Server keep it;
+        # PostgreSQL 15 dropped the scale's part). Anything else has no FLUID SQL/1 type.
+        if not 1 <= precision <= MAX_DECIMAL_PRECISION or scale > precision:
             return None
-        scale = int(places)
         return ColumnType(SqlType(NUMBER, scale), declared_scale=True, precision=precision)
     if base in _FLOAT_TYPES:
         return ColumnType(SqlType(NUMBER, None), is_float=True)
@@ -129,6 +131,20 @@ def column_type(declared: object) -> Optional[ColumnType]:
     if base in _TIMESTAMPTZ_TYPES:
         return ColumnType(SqlType(TIMESTAMPTZ))
     return None
+
+
+def decimal_hint(declared: object) -> str:
+    """Why a ``decimal(p,s)`` declaration has no FLUID SQL/1 type, as a parenthesis to end a
+    message with, or ``""`` for any other declaration."""
+    if not isinstance(declared, str) or column_type(declared) is not None:
+        return ""
+    base, params = split_type_params(" ".join(declared.strip().lower().split()))
+    if base not in _DECIMAL_TYPES or params is None:
+        return ""
+    return (
+        f" (a decimal is decimal(p) or decimal(p, s), with 1 <= p <= {MAX_DECIMAL_PRECISION}"
+        " and 0 <= s <= p)"
+    )
 
 
 @dataclass(frozen=True)
