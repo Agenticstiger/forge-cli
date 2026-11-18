@@ -260,6 +260,18 @@ def test_a_file_whose_digest_changed_does_not_count(
     assert "digest its MANIFEST does not list" in str(_stage3(work)["failure_reason"])
 
 
+def test_a_manifest_key_that_leads_out_of_dist_artifacts_does_not_count(work: Path) -> None:
+    """The MANIFEST is the checkout's: ``schedule/../..`` names nothing stage 3 wrote."""
+    (work / "outside.txt").write_bytes(b"x")
+    manifest = work / st.ARTIFACTS_MANIFEST
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"files": {"schedule/../../outside.txt": _sha(b"x")}}))
+    opts = st.ShipOptions(contract="contract.fluid.yaml", require_artifacts=("schedule",))
+    assert st.missing_required_artifacts(opts, work) == [
+        "schedule: dist/artifacts/schedule/../../outside.txt outside dist/artifacts/"
+    ]
+
+
 def test_output_an_earlier_run_left_never_counts(
     work: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

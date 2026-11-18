@@ -862,8 +862,13 @@ def _unwritten(root: Path, files: Mapping[str, object], rel: str) -> Optional[st
 
     if rel not in files:
         return "not in its MANIFEST"
-    path = root / ARTIFACTS_DIR / rel
+    base = root / ARTIFACTS_DIR
+    path = base / rel
     try:
+        # The MANIFEST is the checkout's: a key that leads out of dist/artifacts/
+        # (``schedule/../..``, a symlinked directory) names nothing stage 3 wrote.
+        if not path.resolve().is_relative_to(base.resolve()):
+            return "outside dist/artifacts/"
         if path.is_symlink() or not path.is_file():
             return "listed in its MANIFEST but not on disk"
         if "sha256:" + _sha256_file(path) != files[rel]:
