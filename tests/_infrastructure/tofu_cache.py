@@ -117,7 +117,8 @@ def tofu_plugin_cache(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Opti
     Autouse and session-scoped, so ``os.environ`` carries it before any other fixture runs:
     ``build_tofu_env()`` passes both variables through, and a test that calls ``tofu``
     without an environment of its own inherits them. Yields the directory (``None`` when
-    :func:`provider_cache` sets nothing).
+    :func:`provider_cache` sets nothing). Workers share the cache safely on OpenTofu 1.12.2
+    or later (see the module docstring).
     """
     with provider_cache(tmp_path_factory) as cache:
         yield cache

@@ -221,7 +221,8 @@ not its own 0.75 GB copy of `hashicorp/aws`. The cache lives in the run's basete
 run removes it with the rest, and pytest keeps the basetemp of a failed run. To keep providers
 between runs, point `TF_PLUGIN_CACHE_DIR` at a directory that exists; it is used as given. A
 test that builds `tofu`'s environment with `build_tofu_env()` gets the cache from it, and one
-that starts `tofu` directly inherits it.
+that starts `tofu` directly inherits it. If every test that needs a provider fails with
+"Unrecognized remote plugin message", an install was killed half way: delete the cache directory.
 
 ### Writing Good Tests
 
