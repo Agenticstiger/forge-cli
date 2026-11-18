@@ -15,8 +15,8 @@ name-shape rule.
 
 Vendored because importing litellm takes seconds and dotenv hydration runs on
 every command. Generated from the litellm 1.83.14, 1.97.0, 1.105.0, 1.106.0,
-1.108.0 and 1.109.0 wheels (FLUID's floor, the last release Python 3.10 can
-import, and the newest), as the union of:
+1.108.0, 1.109.0 and 1.110.0 wheels (FLUID's floor, the last release Python 3.10
+can import, and the newest), as the union of:
 
 * ``<PROVIDER>_API_BASE`` for every ``litellm.provider_list`` entry (``-``
   read as ``_``);
@@ -284,6 +284,7 @@ LITELLM_ENDPOINT_NAMES: FrozenSet[str] = frozenset(
         "VLLM_API_BASE",
         "VOLCENGINE_API_BASE",
         "VOYAGE_API_BASE",
+        "WALLY_API_BASE",
         "WANDB_API_BASE",
         "WATSONX_API_BASE",
         "WATSONX_IAM_URL",
