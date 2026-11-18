@@ -72,12 +72,15 @@ import shutil
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import yaml
 
 from fluid_build.forge.core.bundle import _slug, build_manifest, validate_manifest
 from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
+
+if TYPE_CHECKING:
+    from fluid_build.spark.compiler import SparkJob
 
 LOG = logging.getLogger("fluid.forge.core.artifact_fanout")
 
@@ -817,64 +820,10 @@ def _emit_spark(
     policies (contract SQL, hosts) are not applied: ``fluid validate`` reports
     them and ``fluid apply`` enforces them.
     """
-    # The pair ``fluid generate iac`` loads its contract with, so the bytes are its own.
-    from fluid_build.cli._common import (
-        load_contract_with_overlay,
-        resolve_env_templates_in_contract,
-    )
-    from fluid_build.spark.compiler import (
-        MSK_BROKERS_PLACEHOLDER,
-        compile_job_config,
-        spark_builds,
-    )
-    from fluid_build.spark.policy import SparkPolicyError
-    from fluid_build.streaming.compiler import managed_lane_enabled
+    from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER
 
-    try:
-        contract = resolve_env_templates_in_contract(
-            load_contract_with_overlay(str(source), overlay_env, logger)
-        )
-        if not managed_lane_enabled(contract):
-            return []
-        builds = spark_builds(contract)
-    except Exception as exc:  # noqa: BLE001 - every emitter reports a FanoutError
-        raise FanoutError(f"Spark builds of {source} could not be read: {exc}", key="spark")
-    jobs = []
-    seen: Dict[str, str] = {}
-    for build in builds:
-        bid = str(build.get("id"))
-        try:
-            job = compile_job_config(
-                contract,
-                build,
-                account_ref=SPARK_ACCOUNT_PLACEHOLDER,
-                contract_sql_gate=False,
-                host_gate=False,
-            )
-        except (ValueError, KeyError, TypeError, SparkPolicyError) as exc:
-            message = str(exc)
-            if not message.startswith(f"Spark build {bid}"):
-                message = f"Spark build {bid}: {message}"
-            raise FanoutError(message, key="spark") from exc
-        # One file per build on any file system, as the module keys one object per build.
-        key = bid.casefold().replace("-", "_")
-        if key in seen:
-            raise FanoutError(
-                f"Spark builds {seen[key]!r} and {bid!r} would write one job.json (ids that "
-                "differ only in case or in '-' and '_' name one file); give each its own id",
-                key="spark",
-            )
-        seen[key] = bid
-        if "${" in _text_tofu_checks(job.config, MSK_BROKERS_PLACEHOLDER):
-            raise FanoutError(
-                f"Spark build {bid}: the job config holds '${{' from the contract, which the "
-                "forge Spark runner refuses as an unresolved interpolation, so fluid apply "
-                "uploads no config for it",
-                key="spark",
-            )
-        jobs.append((bid, job))
     written: List[Path] = []
-    for bid, job in jobs:
+    for bid, job in _spark_jobs(source, overlay_env, logger):
         # compile_job_config accepts only an id of letters, digits, _ and -.
         path = out_dir / bid / "job.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -894,6 +843,74 @@ def _emit_spark(
                 extra={"build": bid, "values": deferred, "digest": job.digest},
             )
     return written
+
+
+def _spark_jobs(
+    source: Path, overlay_env: Optional[str], logger: logging.Logger
+) -> List[Tuple[str, SparkJob]]:
+    """``(build id, SparkJob)`` for each forge Spark build, all checked before any is written."""
+    # The pair ``fluid generate iac`` loads its contract with, so the bytes are its own.
+    from fluid_build.cli._common import (
+        load_contract_with_overlay,
+        resolve_env_templates_in_contract,
+    )
+    from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER, spark_builds
+    from fluid_build.streaming.compiler import managed_lane_enabled
+
+    try:
+        contract = resolve_env_templates_in_contract(
+            load_contract_with_overlay(str(source), overlay_env, logger)
+        )
+        if not managed_lane_enabled(contract):
+            return []
+        builds = spark_builds(contract)
+    except Exception as exc:  # noqa: BLE001 - every emitter reports a FanoutError
+        raise FanoutError(f"Spark builds of {source} could not be read: {exc}", key="spark")
+    jobs = []
+    seen: Dict[str, str] = {}
+    for build in builds:
+        bid = str(build.get("id"))
+        job = _compile_spark_build(contract, build, bid)
+        # One file per build on any file system, as the module keys one object per build.
+        key = bid.casefold().replace("-", "_")
+        if key in seen:
+            raise FanoutError(
+                f"Spark builds {seen[key]!r} and {bid!r} would write one job.json (ids that "
+                "differ only in case or in '-' and '_' name one file); give each its own id",
+                key="spark",
+            )
+        seen[key] = bid
+        if "${" in _text_tofu_checks(job.config, MSK_BROKERS_PLACEHOLDER):
+            raise FanoutError(
+                f"Spark build {bid}: the job config holds '${{' from the contract, which the "
+                "forge Spark runner refuses as an unresolved interpolation, so fluid apply "
+                "uploads no config for it",
+                key="spark",
+            )
+        jobs.append((bid, job))
+    return jobs
+
+
+def _compile_spark_build(
+    contract: Mapping[str, Any], build: Mapping[str, Any], bid: str
+) -> SparkJob:
+    """The build's job as ``fluid apply`` compiles it, a compiler refusal as a FanoutError."""
+    from fluid_build.spark.compiler import compile_job_config
+    from fluid_build.spark.policy import SparkPolicyError
+
+    try:
+        return compile_job_config(
+            contract,
+            build,
+            account_ref=SPARK_ACCOUNT_PLACEHOLDER,
+            contract_sql_gate=False,
+            host_gate=False,
+        )
+    except (ValueError, KeyError, TypeError, SparkPolicyError) as exc:
+        message = str(exc)
+        if not message.startswith(f"Spark build {bid}"):
+            message = f"Spark build {bid}: {message}"
+        raise FanoutError(message, key="spark") from exc
 
 
 def _text_tofu_checks(config: Mapping[str, Any], brokers_placeholder: str) -> str:
