@@ -36,7 +36,7 @@ _DEFINITION_CODES = frozenset({"ERR_CONTRACT_SCHEMA_REQUIRED"})
 #: The keys a list item of a contract is named by, in the order they are tried.
 _PORT_KEYS = ("exposeId", "id", "productId", "name", "ref")
 _PORT_LISTS = ("exposes", "consumes")
-_IDENT = re.compile(r"^[A-Za-z_][\w-]*$")
+_IDENT = re.compile(r"[A-Za-z_][\w-]*")
 
 Path_ = Tuple[Union[str, int], ...]
 
@@ -70,9 +70,9 @@ def dotted(path: Sequence[Union[str, int]]) -> str:
     for part in path:
         if isinstance(part, int):
             text += f"[{part}]"
-        elif text and _IDENT.match(part):
+        elif text and _IDENT.fullmatch(part):
             text += f".{part}"
-        elif _IDENT.match(part):
+        elif _IDENT.fullmatch(part):
             text = part
         else:
             text += f"[{part!r}]"
