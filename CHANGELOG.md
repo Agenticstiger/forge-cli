@@ -53,6 +53,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the same checkout path (the plan records it). The Databricks job emitter now uploads the same
   file selection.
 
+- **`fluid diff --baseline --impact` reports what a contract change reaches, for a pull
+  request.** Next to the changelog, an impact section in three parts: the consumer interface
+  (each change a reader sees, and the workspace products whose `consumes[]` read this one,
+  each marked breaking or not); governance and target (access
+  grants added or removed, a grant marked broad when it covers a domain, a public principal,
+  admin or manage, or every expose; each expose's platform, format and location; its
+  partitioning; and the policy and input changes the changelog found); and resource impact,
+  read from `--plan` (the plan.json of `fluid plan --tofu`, or `tofu show -json`), resource by
+  resource, with each replacement's reason and the paths that force it. What the report cannot
+  see reads `unknown` with the reason: no workspace to search, no plan, or a plan.json that
+  does not say what a provider replaces. A partition change is a replacement only when the
+  plan replaces that expose's table; a plan that does not name the table leaves it unknown. `--format markdown` adds an Impact section, and `--format json` and
+  `--out` add an `impact` block (`version: "1.0"`). No value from the plan is copied into it.
+  `--plan` implies `--impact`; without `--baseline` both are refused. Without the flags, the
+  version diff is unchanged.
+
 - **`fluid generate artifacts` writes each forge Spark build's `job.json`.** A new `spark` emit
   key, on by default (the generated Jenkinsfile's `GENERATE_EMIT` default lists it), writes
   `spark/<build id>/job.json` for every Spark build (`engine: spark` with `parameters.spark`,
@@ -231,6 +247,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run still going after `FLUID_SPARK_WAIT_SECONDS` also refuses the apply before anything is
   destroyed. `--dry-run` reads and says what it would cancel. The first apply after the upgrade
   adds the three tags to each Spark build's log group in place.
+
+- **A Spark stream on AWS can read its own checkpoint.** The role forge creates for a Spark build
+  could read and write `<prefix>/*` and list `<prefix>/*`, but Hadoop's `getFileStatus` first asks
+  for the directory's own key (a HEAD of `_checkpoints/<product>/<build>`) and lists it by that
+  slashless name, which S3 refused with 403, so every stream failed within minutes of starting.
+  The role may now read that one key, which holds no data, and list the directory by its exact
+  name (no sibling `<build>-x` matches) as well as under it, for every prefix it is granted, on
+  every AWS runtime.
 
 - **`fluid ship` generates artifacts for a reference-only contract.** Stage 3 skipped every
   contract with a `hybrid-reference`, `reference` or `external-reference` build, even with
