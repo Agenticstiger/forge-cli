@@ -24,7 +24,8 @@ Output layout (full default emit set)::
     ├── schedule/<product-id>[__<env>]/    # one directory per product, so
     │   └── <build-id>_dag.py               #   schedule-sync never deletes
     │                                       #   another product's DAGs (Path A)
-    └── policy/bindings.json                # compiled IAM/GRANT bindings
+    ├── policy/bindings.json                # compiled IAM/GRANT bindings
+    └── spark/<build-id>/job.json           # forge Spark job config, as OpenTofu uploads it
 
 Note on terminology: **OPDS** is fluid's name for the Linux Foundation / ODPI
 Open Data Product *Specification* v4.1. Upstream abbreviates it *ODPS*, but that
@@ -63,6 +64,7 @@ Upstream specs:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -70,12 +72,15 @@ import shutil
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import yaml
 
 from fluid_build.forge.core.bundle import _slug, build_manifest, validate_manifest
 from fluid_build.util.safe_yaml import UnsafeYamlError, load_yaml_safe
+
+if TYPE_CHECKING:
+    from fluid_build.spark.compiler import SparkJob
 
 LOG = logging.getLogger("fluid.forge.core.artifact_fanout")
 
@@ -93,6 +98,7 @@ EMIT_KEYS: Tuple[str, ...] = (
     "opds",
     "schedule",
     "policies",
+    "spark",
 )
 
 # Default emit set. Every schema-pinned emitter validates against its vendored
@@ -107,9 +113,11 @@ EMIT_KEYS: Tuple[str, ...] = (
 #                  default set once that validation went green.
 # - schedule     → DAG/flow files; shape is scheduler-specific not schema-pinned
 # - policies     → compiled IAM bindings; shape is internal
+# - spark        → each forge Spark build's job.json, the bytes OpenTofu uploads
+#                  (nothing for a contract without one)
 #
-# All five emit keys are on by default (the historical card's target set:
-# odcs + odps-bitol + opds + schedule + policies). Order matches ``EMIT_KEYS``
+# All six emit keys are on by default (odcs + odps-bitol + opds + schedule +
+# policies + spark). Order matches ``EMIT_KEYS``
 # because ``parse_emit_set`` canonicalises every resolved set into ``EMIT_KEYS``
 # order for a stable MANIFEST hash — so ``parse_emit_set(None) == DEFAULT_EMIT``.
 DEFAULT_EMIT: Tuple[str, ...] = (
@@ -118,6 +126,7 @@ DEFAULT_EMIT: Tuple[str, ...] = (
     "opds",
     "schedule",
     "policies",
+    "spark",
 )
 
 # Emit keys auto-skipped purely on the basis of the build *pattern*.
@@ -785,12 +794,168 @@ def _emit_policies(contract_path: Path, out_dir: Path, logger: logging.Logger) -
     return [out]
 
 
+#: What a job.json holds where its bucket is the account's shared one
+#: (``<account>-fluid-data``): OpenTofu writes the deploying account's id there at
+#: apply, as it writes the MSK broker list over the compiler's
+#: ``MSK_BROKERS_PLACEHOLDER``. The IaC emitter shows the account the same way.
+SPARK_ACCOUNT_PLACEHOLDER = "<account>"
+
+
+def _emit_spark(
+    source: Path, out_dir: Path, logger: logging.Logger, *, overlay_env: Optional[str] = None
+) -> List[Path]:
+    """Each forge Spark build's ``job.json`` at ``spark/<build id>/job.json``.
+
+    The bytes are the compiler's (``spark/compiler.py::compile_job_config``,
+    ``SparkJob.text``) for the contract as ``fluid generate iac`` and ``fluid
+    apply`` read it (aliases normalised, ``{{ env.* }}`` resolved): the object
+    OpenTofu uploads to ``_fluid/spark/<product>/<build>/job.json``
+    (``iac/providers/aws_ingest.py``), so the MANIFEST hash is the hash of the
+    deployed config. Two values only ``tofu apply`` knows stay placeholders:
+    :data:`SPARK_ACCOUNT_PLACEHOLDER` for an account-bucket warehouse and the
+    compiler's MSK broker placeholder for a source named by its cluster ARN; each
+    such build is logged. ``source`` is the fanout's input (a bundle or a
+    contract). What the OpenTofu module refuses to upload is refused here too: two
+    builds writing one file, and a config holding ``${``. The operator's upload
+    policies (contract SQL, hosts) are not applied: ``fluid validate`` reports
+    them and ``fluid apply`` enforces them.
+    """
+    from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER
+
+    written: List[Path] = []
+    for bid, job in _spark_jobs(source, overlay_env, logger):
+        # compile_job_config accepts only an id of letters, digits, _ and -.
+        path = out_dir / bid / "job.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(job.text.encode("utf-8"))
+        written.append(path)
+        deferred = [
+            label
+            for token, label in (
+                (SPARK_ACCOUNT_PLACEHOLDER, "the deploying account"),
+                (MSK_BROKERS_PLACEHOLDER, "the MSK broker list"),
+            )
+            if token in job.text
+        ]
+        if deferred:
+            logger.info(
+                "generate_artifacts_spark_apply_time_values",
+                extra={"build": bid, "values": deferred, "digest": job.digest},
+            )
+    return written
+
+
+def _spark_jobs(
+    source: Path, overlay_env: Optional[str], logger: logging.Logger
+) -> List[Tuple[str, SparkJob]]:
+    """``(build id, SparkJob)`` for each forge Spark build, all checked before any is written."""
+    # The pair ``fluid generate iac`` loads its contract with, so the bytes are its own.
+    from fluid_build.cli._common import (
+        load_contract_with_overlay,
+        resolve_env_templates_in_contract,
+    )
+    from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER, spark_builds
+    from fluid_build.streaming.compiler import managed_lane_enabled
+
+    try:
+        contract = resolve_env_templates_in_contract(
+            load_contract_with_overlay(str(source), overlay_env, logger)
+        )
+        if not managed_lane_enabled(contract):
+            return []
+        builds = spark_builds(contract)
+    except Exception as exc:  # noqa: BLE001 - every emitter reports a FanoutError
+        raise FanoutError(f"Spark builds of {source} could not be read: {exc}", key="spark")
+    jobs = []
+    seen: Dict[str, str] = {}
+    for build in builds:
+        bid = str(build.get("id"))
+        job = _compile_spark_build(contract, build, bid)
+        # One file per build on any file system, as the module keys one object per build.
+        key = bid.casefold().replace("-", "_")
+        if key in seen:
+            raise FanoutError(
+                f"Spark builds {seen[key]!r} and {bid!r} would write one job.json (ids that "
+                "differ only in case or in '-' and '_' name one file); give each its own id",
+                key="spark",
+            )
+        seen[key] = bid
+        if "${" in _text_tofu_checks(job.config, MSK_BROKERS_PLACEHOLDER):
+            raise FanoutError(
+                f"Spark build {bid}: the job config holds '${{' from the contract, which the "
+                "forge Spark runner refuses as an unresolved interpolation, so fluid apply "
+                "uploads no config for it",
+                key="spark",
+            )
+        jobs.append((bid, job))
+    return jobs
+
+
+def _compile_spark_build(
+    contract: Mapping[str, Any], build: Mapping[str, Any], bid: str
+) -> SparkJob:
+    """The build's job as ``fluid apply`` compiles it, a compiler refusal as a FanoutError."""
+    from fluid_build.spark.compiler import compile_job_config
+    from fluid_build.spark.policy import SparkPolicyError
+
+    try:
+        return compile_job_config(
+            contract,
+            build,
+            account_ref=SPARK_ACCOUNT_PLACEHOLDER,
+            contract_sql_gate=False,
+            host_gate=False,
+        )
+    except (ValueError, KeyError, TypeError, SparkPolicyError) as exc:
+        message = str(exc)
+        if not message.startswith(f"Spark build {bid}"):
+            message = f"Spark build {bid}: {message}"
+        raise FanoutError(message, key="spark") from exc
+
+
+def _text_tofu_checks(config: Mapping[str, Any], brokers_placeholder: str) -> str:
+    """The config text as the OpenTofu module checks it for ``${`` before the upload.
+
+    The module fills the MSK broker list only where it belongs, an MSK cluster
+    source's ``bootstrapServers`` (``aws_ingest.py::_job_content``): the
+    placeholder anywhere else is a ``${`` it refuses.
+    """
+    checked = copy.deepcopy(dict(config))
+    source = checked.get("source")
+    if (
+        isinstance(source, dict)
+        and source.get("mskClusterArn")
+        and source.get("bootstrapServers") == brokers_placeholder
+    ):
+        source["bootstrapServers"] = ""
+    return json.dumps(checked, sort_keys=True, ensure_ascii=False)
+
+
+def _clear_spark(directory: Path) -> None:
+    """Remove the ``<build id>/job.json`` files an earlier fanout wrote, and nothing else.
+
+    ``--out`` may name a directory that holds a ``spark/`` folder of its own (a
+    project's Spark sources): only files of the shape this key writes are removed,
+    then the directories left empty.
+    """
+    if not directory.is_dir() or directory.is_symlink():
+        return
+    for job in sorted(directory.glob("*/job.json")):
+        if job.is_file() and not job.is_symlink() and not job.parent.is_symlink():
+            job.unlink()
+            if not any(job.parent.iterdir()):
+                job.parent.rmdir()
+    if not any(directory.iterdir()):
+        directory.rmdir()
+
+
 _DISPATCH = {
     "odps-bitol": ("odps-bitol", _emit_odps_bitol),
     "odcs": ("odcs", _emit_odcs),
     "opds": ("opds", _emit_opds),
     "schedule": ("schedule", _emit_schedule),
     "policies": ("policy", _emit_policies),
+    "spark": ("spark", _emit_spark),
 }
 
 
@@ -878,6 +1043,7 @@ def run_fanout(
         target = out_dir / sub
         if target.exists():
             shutil.rmtree(target)
+    _clear_spark(out_dir / "spark")
 
     dag_contract_path = contract_path
     if dag_contract_path is None:
@@ -933,6 +1099,9 @@ def run_fanout(
                     warn_no_env=_is_tgz_input(bundle_or_contract)
                     or _declares_overlays(bundle_or_contract),
                 )
+            elif key == "spark":
+                # The original input: the contract as generate iac and apply load it.
+                files = _emit_spark(bundle_or_contract, subdir, logger, overlay_env=overlay_env)
             else:
                 files = fn(resolved_contract, subdir, logger)
             written.extend(files)
