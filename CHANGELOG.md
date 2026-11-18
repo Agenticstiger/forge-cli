@@ -143,6 +143,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another build's DAG would otherwise run twice). `fluid validate` warns about an Airflow
   task's `buildStepRef`: no generated DAG runs one.
 
+- **`fluid generate dbt-tests` runs declared invariants as dbt tests.** On a 0.7.7 contract each
+  declared invariant, identifier format, bounded placeholder declaration, shared column and
+  shared attribute becomes one `fluid_rule` generic test on its model, and the `fluid_rule`
+  macro is written to `<project>/<first macro-paths entry>/fluid/fluid_rule.sql` (the nearest
+  `dbt_project.yml` above `--out`; the new `--macros-dir` overrides it, and a file fluid did not
+  write is never overwritten). Each test carries its SQL for every engine forge renders, and the
+  macro picks by `target.type` (DuckDB, Snowflake, BigQuery, Databricks or Spark, PostgreSQL,
+  Athena or Trino), so one project runs on DuckDB locally and on Athena live; an adapter with no
+  rendering fails that test with a message naming the rule. The SQL is printed from the parsed
+  expression and joins linked models with `ref()`; the band is compared exactly, in rows or as
+  `100 * violating` against `value * covered`; `severity: warning` and `info` warn. Every piece
+  of contract text reaches dbt as a Jinja string literal, so `{{` in a name or literal stays
+  data. A rule no engine can run is logged with its reason and not tested. A column's
+  placeholder values and prefixes are now exempt from its own `accepted_values` and range tests,
+  through a `where` config per adapter.
+
 - **Declared invariants become ODCS quality rules.** On a 0.7.7 contract, `fluid generate
   standard --format odcs` now writes each `exposes[].contract.invariants[]` entry, each
   identifier format and placeholder declaration, each `sharedColumns` entry and each member of a

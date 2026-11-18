@@ -63,6 +63,11 @@ expose; column-targeting rules attach under the matching
 ``columns[].tests`` entry, ``"*"``-targeting rules attach at the
 model level.
 
+On a 0.7.7 contract each declared invariant, identifier format, bounded placeholder
+declaration and shared attribute also becomes one model-level ``fluid_rule`` test
+(:mod:`fluid_build.data_rules._dbt`), and a column's placeholders are exempt from its own
+``accepted_values`` and range tests through a ``where`` config.
+
 The sentinel ``# managed-by: fluid`` header lets re-runs detect and
 overwrite without clobbering hand-edits outside that block (the runner
 enforces the boundary).
@@ -70,7 +75,8 @@ enforces the boundary).
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, List, Mapping, Sequence
 
 # The single shared contract → dbt-test mapping. Reached via module attribute
 # access (``_tm.<fn>``) so a ``patch("...engines.dbt._test_mapping.<fn>")``
@@ -89,7 +95,23 @@ from ..engines.dbt.schema_yml import TESTS_KEY_LEGACY, normalize_tests_key
 MANAGED_BY_SENTINEL = "# managed-by: fluid"
 
 
+@dataclass(frozen=True)
+class DbtTests:
+    """What :func:`render_project_tests` writes: the schema.yml text, whether it calls the
+    ``fluid_rule`` macro (which the project must then carry), and the declared rules it
+    could not render, each with its reason."""
+
+    yaml: str
+    uses_fluid_rule: bool
+    skipped: List[Any] = field(default_factory=list)
+
+
 def render_dbt_tests(contract: Mapping[str, Any], *, tests_key: str | None = None) -> str:
+    """:func:`render_project_tests`'s schema.yml text."""
+    return render_project_tests(contract, tests_key=tests_key).yaml
+
+
+def render_project_tests(contract: Mapping[str, Any], *, tests_key: str | None = None) -> DbtTests:
     """Render a parsed FLUID contract as a dbt schema.yml string.
 
     The returned text is a single multi-doc YAML stream. Callers should
@@ -127,13 +149,41 @@ def render_dbt_tests(contract: Mapping[str, Any], *, tests_key: str | None = Non
         if model_block is not None:
             models.append(model_block)
 
+    # Declared invariants (0.7.7): one ``fluid_rule`` test each, at model level.
+    rule_tests, skipped = _rule_tests(contract)
+    for model in models:
+        extra = rule_tests.get(model["name"])
+        if extra:
+            model[resolved_tests_key] = list(model.get(resolved_tests_key) or []) + extra
+            # dbt reads a model's keys in any order; keep columns last, as before.
+            if "columns" in model:
+                model["columns"] = model.pop("columns")
+
     doc: dict[str, Any] = {"version": 2, "models": models}
     body = yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
-    return (
+    text = (
         f"{MANAGED_BY_SENTINEL}\n"
         "# Generated from fluid contract — do not edit between the sentinels.\n"
         f"{body}"
     )
+    return DbtTests(text, any(rule_tests.values()), skipped)
+
+
+def _rule_tests(contract: Mapping[str, Any]) -> tuple[dict[str, list[Any]], list[Any]]:
+    """The ``fluid_rule`` tests by model name, and the rules skipped (``data_rules._dbt``)."""
+    from ..data_rules import FIRST_VERSION, _version
+
+    version = _version(contract)
+    if not version or version < FIRST_VERSION:
+        return {}, []
+    from ..data_rules._dbt import rule_tests
+
+    names = {
+        e.get("exposeId"): _model_name(e)
+        for e in contract.get("exposes") or []
+        if isinstance(e, Mapping) and isinstance(e.get("exposeId"), str)
+    }
+    return rule_tests(contract, names.get)
 
 
 def _expose_to_model(
@@ -286,7 +336,7 @@ def _columns_with_tests(
             col_block["description"] = desc
         col_tests = _tm.merge_tests(
             list(tests_by_column.get(name) or []),
-            _tm.constraint_tests(col),
+            _exempt_placeholders(col, _tm.constraint_tests(col)),
         )
         if col_tests:
             col_block[tests_key] = col_tests
@@ -300,4 +350,40 @@ def _columns_with_tests(
             continue
         out.append({"name": col_name, tests_key: col_tests})
 
+    return out
+
+
+#: The tests a column's own ``validationRules`` and enum produce, from which a placeholder is
+#: exempt (``RFC-data-rules.md`` section 4).
+_PLACEHOLDER_EXEMPT_TESTS = frozenset({"accepted_values", _tm.RANGE_TEST_NAME})
+
+
+def _exempt_placeholders(col: Mapping[str, Any], tests: list[Any]) -> list[Any]:
+    """``tests`` with a ``where`` config that leaves the column's placeholder rows out of its
+    ``accepted_values`` and range tests; unchanged when the column declares no placeholders."""
+    block = col.get("placeholders")
+    if not isinstance(block, Mapping):
+        return tests
+
+    def texts(key: str) -> list[str]:
+        raw = block.get(key)
+        return [v for v in raw if isinstance(v, str) and v] if isinstance(raw, list) else []
+
+    from ..data_rules._dbt import placeholder_where
+
+    try:
+        where = placeholder_where(str(col.get("name")), texts("values"), texts("prefixes"))
+    except ValueError:  # a column name no dialect can quote: leave the test as it was
+        return tests
+    if where is None:
+        return tests
+    out: list[Any] = []
+    for test in tests:
+        if isinstance(test, Mapping) and len(test) == 1:
+            ((name, body),) = test.items()
+            if name in _PLACEHOLDER_EXEMPT_TESTS and isinstance(body, Mapping):
+                config = dict(body.get("config") or {})
+                config["where"] = where
+                test = {name: {**body, "config": config}}
+        out.append(test)
     return out
