@@ -17,6 +17,7 @@ stop. A target that no longer exists holds no run.
 from __future__ import annotations
 
 import time
+from functools import partial
 from typing import Callable, List, Mapping, Optional, Sequence
 
 from fluid_build.build_runners.spark._adapters import (
@@ -56,17 +57,27 @@ def gone(exc: BaseException) -> bool:
     )
 
 
+def _ended(info: RunInfo) -> bool:
+    return info.state in TERMINAL
+
+
 def _cancel_all(
     adapter: Adapter, active: Sequence[RunInfo], out: Outcome, clock: _Clock, budget: float
 ) -> None:
     """Cancel ``active`` (one already cancelling is only waited for), then wait for each to
-    end; ``out`` is the error when one is still going after ``budget``."""
+    end; ``out`` is the error when one is still going after ``budget``. A run that ended by
+    itself after it was listed refuses the cancel, and is left out."""
     for info in active:
         if info.state != CANCELLING:
-            adapter.cancel(info.run_id)
+            try:
+                adapter.cancel(info.run_id)
+            except Exception:
+                if adapter.get(info.run_id).state not in TERMINAL:
+                    raise
+                continue
         out.cancelled.append(info.run_id)
     for run_id in out.cancelled:
-        ended = clock.until(lambda i=run_id: adapter.get(i), lambda i: i.state in TERMINAL, budget)
+        ended = clock.until(partial(adapter.get, run_id), _ended, budget)
         if ended.state not in TERMINAL:
             out.action, out.error, out.run_id, out.state = "failed", True, run_id, ended.state
             out.message = (

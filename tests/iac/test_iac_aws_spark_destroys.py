@@ -209,6 +209,21 @@ def _ec2_running(clients, cluster="j-1ABCDEF"):
     return emr
 
 
+def test_a_step_that_ended_by_itself_after_it_was_listed_needs_no_cancel():
+    clients = Clients()
+    emr = _ec2_running(clients)
+    emr.add_response(
+        "cancel_steps",
+        {"CancelStepsInfoList": [{"StepId": "s-1", "Status": "FAILED", "Reason": "done"}]},
+        {"ClusterId": "j-1ABCDEF", "StepIds": ["s-1"], "StepCancellationOption": "SEND_INTERRUPT"},
+    )
+    emr.add_response(
+        "describe_step", {"Step": _step("COMPLETED")}, {"ClusterId": "j-1ABCDEF", "StepId": "s-1"}
+    )
+    assert run([log_group("emr-ec2", "clusterId=j-1ABCDEF")], clients) == []
+    clients.done()
+
+
 def test_an_emr_on_ec2_build_that_goes_has_its_step_cancelled_first():
     clients = Clients()
     no_holders(clients)
