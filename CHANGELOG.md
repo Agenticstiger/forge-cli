@@ -216,7 +216,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`fluid verify --require-every-port` fails unless every expose was verified.** `--strict`
   fails only a run that verified nothing, so a run that verified one port passed while its
   others were skipped. With the flag, each skipped expose fails the run (exit 1) and is named
-  with why: no verifier for the binding, or a reference-only table not built yet. It needs no
+  with why: no verifier for the binding, a reference-only table not built yet, an entry with
+  no `exposeId` (never checked), or an id declared twice. A contract with no expose fails too.
+  The run's message names every one of them. It needs no
   `--strict`, `--warn-only` does not downgrade it, and `--expose` beside it is refused (exit
   2). The `--out` report lists the unverified exposes under `require_every_port`. `fluid ship
   --release-dir` passes it to stage 9, so a release never stands for a port nobody verified.

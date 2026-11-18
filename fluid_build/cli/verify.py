@@ -20,7 +20,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fluid_build.cli.console import cprint, cprint_literal, success, warning
 from fluid_build.cli.console import error as console_error
@@ -1388,22 +1388,38 @@ def _named(names: List[str], limit: int = 5) -> str:
     return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
 
 
-def _unverified_ports(unsupported: List[str], not_built: List[str]) -> List[str]:
-    """Each expose that was not verified, with why, in the order they were checked."""
-    return [f"{name} (no verifier for the binding)" for name in unsupported] + [
-        f"{name} (reference-only, not built yet)" for name in not_built
-    ]
+def _unverified_ports(
+    unsupported: List[str], not_built: List[str], uncheckable: Sequence[str] = ()
+) -> List[str]:
+    """Each expose that was not verified, with why: those verify could not tell
+    apart first, then the skipped ones in the order they were checked."""
+    return (
+        list(uncheckable)
+        + [f"{name} (no verifier for the binding)" for name in unsupported]
+        + [f"{name} (reference-only, not built yet)" for name in not_built]
+    )
 
 
 def _unverified_ports_fail(
-    args: argparse.Namespace, unsupported: List[str], not_built: List[str]
+    args: argparse.Namespace,
+    unsupported: List[str],
+    not_built: List[str],
+    uncheckable: Sequence[str] = (),
+    *,
+    verified: int,
 ) -> bool:
     """Does ``--require-every-port`` fail? Every expose has to be verified: a
-    skipped one fails the run, however many others passed. ``--warn-only`` does
-    not downgrade it, as it downgrades no check a caller asked for by name."""
+    skipped one fails the run, however many others passed, and a contract with
+    no expose verified none. ``--warn-only`` does not downgrade it, as it
+    downgrades no check a caller asked for by name."""
     if not getattr(args, "require_every_port", False):
         return False
-    missing = _unverified_ports(unsupported, not_built)
+    missing = _unverified_ports(unsupported, not_built, uncheckable)
+    if not missing and verified == 0:
+        console_error(
+            "--require-every-port: the contract declares no expose, so no port was verified."
+        )
+        return True
     if not missing:
         return False
     console_error(
@@ -1534,6 +1550,18 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     # so its parent is NOT the project root.
     _hydrate_dotenv_into_environ(Path.cwd(), getattr(args, "env", None))
 
+    if args.expose_id and getattr(args, "require_every_port", False):
+        raise CLIError(
+            2,
+            "verify_require_every_port_with_expose",
+            {
+                "message": (
+                    "--require-every-port checks every expose; --expose verifies one. "
+                    "Drop one of them."
+                ),
+            },
+        )
+
     from fluid_build.cli.plan import compile_managed_streaming
 
     streaming = compile_managed_streaming(contract, logger, command="verify")
@@ -1567,27 +1595,26 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
     # Get exposes to verify
     exposes = contract.get("exposes", [])
 
-    # Convert list to dict for easier processing
+    # Convert list to dict for easier processing. An entry with no id, or a
+    # second entry with an id already seen, is never checked on its own: it is
+    # listed, so --require-every-port can name it (the last of a duplicate
+    # id is the one checked, as before).
     exposes_dict = {}
+    uncheckable: List[str] = []
     if isinstance(exposes, list):
-        for expose in exposes:
+        for index, expose in enumerate(exposes):
             expose_id = expose.get("exposeId") or expose.get("id")
-            if expose_id:
-                exposes_dict[expose_id] = expose
+            if not expose_id:
+                uncheckable.append(f"exposes[{index}] (no exposeId, so it is never checked)")
+                continue
+            if expose_id in exposes_dict:
+                uncheckable.append(
+                    f"{expose_id} (declared twice: only exposes[{index}] is checked)"
+                )
+            exposes_dict[expose_id] = expose
     elif isinstance(exposes, dict):
         exposes_dict = exposes
 
-    if args.expose_id and getattr(args, "require_every_port", False):
-        raise CLIError(
-            2,
-            "verify_require_every_port_with_expose",
-            {
-                "message": (
-                    "--require-every-port checks every expose; --expose verifies one. "
-                    "Drop one of them."
-                ),
-            },
-        )
     if args.expose_id:
         if args.expose_id not in exposes_dict:
             raise CLIError(
@@ -2185,7 +2212,7 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         }
         if getattr(args, "require_every_port", False):
             report["require_every_port"] = {
-                "unverified": _unverified_ports(unsupported_exposes, not_built_exposes)
+                "unverified": _unverified_ports(unsupported_exposes, not_built_exposes, uncheckable)
             }
         if reconcile_report is not None:
             report["reconcile"] = reconcile_report.to_dict()
@@ -2264,10 +2291,14 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
         )
         return 1
 
-    checked_count = len(results) - unsupported_count - not_built_count + probe_check_count
-    if _nothing_verified_fails(args, checked_count, unsupported_exposes, not_built_exposes):
+    # The per-port gate first: when it is asked for, its message names every port.
+    verified_ports = len(results) - unsupported_count - not_built_count
+    if _unverified_ports_fail(
+        args, unsupported_exposes, not_built_exposes, uncheckable, verified=verified_ports
+    ):
         return 1
-    if _unverified_ports_fail(args, unsupported_exposes, not_built_exposes):
+    checked_count = verified_ports + probe_check_count
+    if _nothing_verified_fails(args, checked_count, unsupported_exposes, not_built_exposes):
         return 1
 
     # Exit with error code if strict mode and CRITICAL issues found.

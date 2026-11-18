@@ -153,10 +153,17 @@ def test_the_report_lists_the_unverified_ports(mixed: Path, tmp_path: Path) -> N
     assert "require_every_port" not in json.loads(out.read_text())
 
 
-def test_expose_beside_it_is_refused(mixed: Path) -> None:
+def test_expose_beside_it_is_refused(mixed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(CLIError) as err:
         _verify(mixed, "--require-every-port", "--expose", "ids")
     assert err.value.exit_code == 2
+    assert err.value.event == "verify_require_every_port_with_expose"
+    # before the managed-streaming path, which refuses --expose its own way
+    import fluid_build.cli.plan as plan
+
+    monkeypatch.setattr(plan, "compile_managed_streaming", lambda *a, **k: ["streaming"])
+    with pytest.raises(CLIError) as err:
+        _verify(mixed, "--require-every-port", "--expose", "ids")
     assert err.value.event == "verify_require_every_port_with_expose"
 
 
@@ -173,3 +180,50 @@ def test_ship_passes_it_to_stage_nine_only_for_a_release(tmp_path: Path) -> None
     assert "--require-every-port" not in verify_argv("--yes")
     release = verify_argv("--yes", "--release-dir", "rel")
     assert release[:2] == ["verify", st.BUNDLE_PATH] and "--require-every-port" in release
+
+
+def test_an_expose_without_an_id_is_named_not_skipped_silently(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pytest.importorskip("duckdb")
+    _built(tmp_path, "ids")
+    unnamed = _aws_parquet("x")
+    del unnamed["exposeId"]
+    contract = _write(tmp_path, [_local_csv("ids"), unnamed])
+    assert _verify(contract, "--strict") == 0  # as before: the entry is never checked
+    capsys.readouterr()
+    assert _verify(contract, "--require-every-port") == 1
+    assert "exposes[1] (no exposeId, so it is never checked)" in _printed(capsys)
+
+
+def test_a_duplicate_id_never_lets_one_expose_stand_for_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pytest.importorskip("duckdb")
+    _built(tmp_path, "ids")
+    contract = _write(tmp_path, [_aws_parquet("ids"), _local_csv("ids")])
+    assert _verify(contract, "--require-every-port") == 1
+    assert "ids (declared twice: only exposes[1] is checked)" in _printed(capsys)
+
+
+def test_a_contract_with_no_expose_verified_none(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    contract = _write(tmp_path, [])
+    assert _verify(contract, "--strict") == 0
+    capsys.readouterr()
+    assert _verify(contract, "--require-every-port") == 1
+    assert "the contract declares no expose, so no port was verified" in _printed(capsys)
+
+
+def test_every_skipped_port_is_named_even_when_nothing_was_verified(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The per-port gate runs first, so the nothing-verified message (which
+    names five and counts the rest) never hides a port."""
+    contract = _write(tmp_path, [_aws_parquet(f"a{i}") for i in range(7)])
+    assert _verify(contract, "--strict", "--require-every-port") == 1
+    text = _printed(capsys)
+    assert "--require-every-port: 7 expose(s) were not verified" in text
+    assert all(f"a{i} (no verifier for the binding)" in text for i in range(7))
+    assert "nothing was verified" not in text
