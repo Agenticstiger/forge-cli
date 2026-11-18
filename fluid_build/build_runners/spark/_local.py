@@ -20,6 +20,13 @@ Spark 3.5):
   beside the contract. A supervisor (``_local_supervisor.py``, run with ``python -I -S``)
   waits for spark-submit and records how it ended. An exclusive ``flock`` the run's
   processes hold says whether the run is still going; a reused pid cannot fake it.
+- **The runner runs from the run's own directory.** spark-submit runs the runner as a
+  script, so its directory is first on the driver's ``sys.path``: run from the project's
+  tree, a ``json.py`` placed beside it would be imported in its place. So a directory root's
+  runner is pulled, its sha256 checked, into the run's directory, which forge has just
+  created under a name nobody can guess (an ``s3://`` root's is downloaded by spark-submit
+  into a directory of its own), and the driver runs with ``PYTHONSAFEPATH`` set. Every
+  path under ``.fluid`` must resolve inside it: a link out of it is refused.
 
 Every variable here is the operator's: a project's dotenv file cannot set one
 (``credentials/protected_env.py``). POSIX only, for ``fcntl.flock``.
@@ -59,6 +66,7 @@ from fluid_build.build_runners.spark._adapters import (
     SparkRunError,
 )
 from fluid_build.build_runners.spark._desired import DesiredRun
+from fluid_build.spark.names import RUNNER_FILE
 
 #: Operator-only: the spark-submit to run, an absolute path or a name on ``PATH``.
 #: Unset: ``spark-submit`` on ``PATH``.
@@ -104,6 +112,23 @@ def require_posix() -> None:
             "runtime local runs on Linux or macOS: a local run is tracked with fcntl.flock, "
             "which this system lacks"
         ) from exc
+
+
+def _confined(workspace: Path, path: Path) -> Path:
+    """``path`` resolved, if it stays inside the workspace's ``.fluid`` directory once every
+    link is followed (``FileStateStore._confine``'s rule for the build runners' state).
+
+    Raises:
+        SparkRunError: it resolves outside, through a link the project holds.
+    """
+    base = (Path(workspace) / ".fluid").resolve()
+    resolved = Path(path).resolve()
+    if resolved != base and base not in resolved.parents:
+        raise SparkRunError(
+            f"{path} resolves to {resolved}, outside {base}: a link under .fluid points out "
+            "of the project; remove it"
+        )
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -204,7 +229,9 @@ def _read_properties(path: Optional[Path]) -> Dict[str, str]:
 def _root(env: Mapping[str, str], workspace: Path) -> str:
     raw = (env.get(LOCAL_ROOT_ENV) or "").strip()
     if not raw:
-        return str((Path(workspace) / DEFAULT_ROOT).resolve())
+        # Inside the project: it must stay there (a link out of it would send forge's writes
+        # where the project points them).
+        return str(_confined(Path(workspace), Path(workspace) / DEFAULT_ROOT))
     if raw.startswith("s3://"):
         if not _S3_ROOT.fullmatch(raw) or ".." in raw or "//" in raw[5:]:
             raise SparkRunError(
@@ -347,17 +374,42 @@ def _union(first: str, second: str, *, by_artifact: bool) -> str:
     return ",".join(items)
 
 
-def submit_argv(sub: Submitter, run: DesiredRun) -> List[str]:
+def submit_argv(sub: Submitter, run: DesiredRun, runner: Optional[str] = None) -> List[str]:
     """spark-submit's argv for ``run`` (bound to the artifact root): client mode, so the
     driver is the run's own process and stopping the run stops the job, as the EMR on EC2
-    adapter submits a step."""
+    adapter submits a step. ``runner`` is the runner spark-submit runs (:func:`pull_runner`),
+    else the one at the artifact root."""
     argv = [sub.executable, "--name", run.run_name, "--deploy-mode", "client"]
     if sub.properties_file is not None:
         argv += ["--properties-file", str(sub.properties_file)]
     conf = merge_conf(run.spark_conf, sub.properties)
     for name in sorted(conf):
         argv += ["--conf", f"{name}={conf[name]}"]
-    return [*argv, run.runner_uri, *run.entry_args()]
+    return [*argv, runner or run.runner_uri, *run.entry_args()]
+
+
+def pull_runner(sub: Submitter, run: DesiredRun, where: Path) -> Optional[str]:
+    """The runner spark-submit runs: a directory root's, read from the layout and checked
+    against its sha256, written into the run's own directory ``where``; ``None`` for an
+    ``s3://`` root, whose runner spark-submit downloads into a directory of its own.
+
+    Raises:
+        SparkRunError: the layout's runner is not the one the run was compiled with.
+    """
+    if sub.on_s3:
+        return None
+    try:
+        body = Path(run.runner_uri).read_bytes()
+    except OSError as exc:
+        raise SparkRunError(f"{run.runner_uri} cannot be read: {exc.strerror}") from exc
+    if hashlib.sha256(body).hexdigest() != run.runner_sha256:
+        raise SparkRunError(
+            f"{run.runner_uri} is not the runner this run was compiled with (its sha256 "
+            "differs); run fluid apply again"
+        )
+    copy = where / RUNNER_FILE
+    copy.write_bytes(body)
+    return str(copy)
 
 
 # --- artifacts -----------------------------------------------------------------------
@@ -446,8 +498,9 @@ def _held(lock: Path) -> bool:
     import fcntl
 
     try:
-        fd = os.open(lock, os.O_RDWR)
-    except FileNotFoundError:
+        # Never through a link: a lock the project placed as one is no run's.
+        fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+    except OSError:
         return False
     try:
         try:
@@ -493,13 +546,14 @@ class LocalRuns:
     def _run_dir(self, run_id: str) -> Path:
         if not _RUN_ID.fullmatch(run_id):
             raise SparkRunError(f"{run_id!r} is not a local run id")
-        return self.dir / "runs" / run_id
+        return _confined(self.host.workspace, self.dir / "runs" / run_id)
 
     def runs(self) -> List[RunInfo]:
         """Every run of the build this machine has a record of, newest first."""
         base = self.dir / "runs"
         if not base.is_dir():
             return []
+        base = _confined(self.host.workspace, base)
         infos = [
             self.get(entry.name)
             for entry in base.iterdir()
@@ -593,7 +647,12 @@ def builds_with_runs(host: LocalHost, product: str) -> List[str]:
     base = host.runtime_dir(product)
     if not base.is_dir():
         return []
-    return sorted(entry.name for entry in base.iterdir() if (entry / "runs").is_dir())
+    base = _confined(host.workspace, base)
+    return sorted(
+        entry.name
+        for entry in base.iterdir()
+        if not entry.is_symlink() and (entry / "runs").is_dir()
+    )
 
 
 @contextmanager
@@ -602,7 +661,7 @@ def _locked(path: Path) -> Iterator[None]:
     import fcntl
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
@@ -628,8 +687,8 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
     sub = submitter(host)
     bound = run.bind(local_root=sub.root)
     publish(sub, bound, runner_text)
-    argv = submit_argv(sub, bound)
     runs = LocalRuns(host, run.product, run.build)
+    _confined(host.workspace, runs.dir)  # before anything is created through a link
     with _locked(runs.dir / "start.lock"):
         going = [r for r in runs.runs() if r.active and r.config_hash == run.config_hash]
         if going:
@@ -638,6 +697,7 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
         run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(created)) + "-" + uuid.uuid4().hex[:8]
         where = runs.dir / "runs" / run_id
         where.mkdir(parents=True)
+        argv = submit_argv(sub, bound, pull_runner(sub, bound, where))
         record = {
             "runId": run_id,
             "product": run.product,
@@ -651,7 +711,7 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
             "created": created,
             "argv": argv,
         }
-        fd = os.open(where / LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.open(where / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             # Taken before the supervisor exists and handed to it: the run is never seen
             # as stopped while it starts.
@@ -677,7 +737,8 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
                     pass_fds=(fd,),
                     start_new_session=True,
                     cwd=str(where),
-                    env=dict(host.env),
+                    # The driver puts no script directory on sys.path (Python 3.11+).
+                    env={**host.env, "PYTHONSAFEPATH": "1"},
                 )
             except OSError as exc:
                 raise SparkRunError(

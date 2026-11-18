@@ -56,10 +56,17 @@ argv = sys.argv[1:]
 out = os.environ.get("STUB_OUT")
 if out:
     with open(os.path.join(out, "argv-%d.json" % os.getpid()), "w") as handle:
-        json.dump(argv, handle)
+        json.dump(dict(argv=argv, safepath=os.environ.get("PYTHONSAFEPATH")), handle)
 config = argv[argv.index("--config") + 1]
 runner = argv[argv.index("--config") - 1]
 assert os.path.isfile(config) and os.path.isfile(runner), (config, runner)
+if os.environ.get("STUB_RUN_RUNNER"):
+    # As Spark's PythonRunner does: the runner as a script. Without PYTHONSAFEPATH, so only
+    # where the runner sits decides what its imports find.
+    import subprocess
+    env = dict(os.environ)
+    env.pop("PYTHONSAFEPATH", None)
+    sys.exit(subprocess.run([sys.executable, runner, "--config", config], env=env).returncode)
 mode = json.load(open(config))["mode"]
 print("stub: started", mode, flush=True)
 if mode == "batch":
@@ -300,6 +307,11 @@ def test_merge_conf_unions_lists_and_lets_the_file_name_the_iceberg_runtime():
         "spark.sql.shuffle.partitions": "8",
     }
     assert merge_conf(forge, {}) == forge
+
+
+def argv_of(host):
+    (path,) = Path(host.env["STUB_OUT"]).glob("argv-*.json")
+    return json.loads(path.read_text())
 
 
 def test_the_argv_is_client_mode_with_the_file_and_never_a_shell(tmp_path, stub):
@@ -566,3 +578,74 @@ def test_a_failed_stream_is_not_restarted_and_says_how_to_retry_it_here(host):
     assert (again.action, again.error, again.run_id) == ("failed", True, first.run_id)
     assert "the stream failed" in again.message
     assert f"remove {runs.dir / 'runs' / first.run_id}" in again.message
+
+
+def test_a_module_placed_beside_the_published_runner_is_never_imported(host):
+    """spark-submit runs the runner as a script, so the script's directory is first on the
+    driver's sys.path: a json.py a project placed beside the published runner would run."""
+    run = the_run(batch_contract())
+    sub = submitter(host)
+    layout = Path(run.bind(local_root=sub.root).runner_uri).parent
+    layout.mkdir(parents=True)
+    marker = Path(host.workspace) / "planted-module-ran"
+    (layout / "json.py").write_text(f"open({str(marker)!r}, 'w').close()\n", encoding="utf-8")
+    out = rc.run_once(
+        run, local_host=with_env(host, STUB_RUN_RUNNER="1"), timeout=60, say=lambda _: 0
+    )
+    assert out.run_id and not marker.exists()
+    seen = argv_of(host)
+    runner = seen["argv"][seen["argv"].index("--config") - 1]
+    assert Path(runner).parent.name == out.run_id  # the run's own directory
+    assert seen["safepath"] == "1"
+
+
+def test_the_layout_s_runner_must_be_the_compiled_one(host):
+    run = the_run(batch_contract())
+    sub = submitter(host)
+    bound = run.bind(local_root=sub.root)
+    _local.publish(sub, bound, runner_source())
+    Path(bound.runner_uri).write_text("print('not the runner')\n", encoding="utf-8")
+    where = Path(host.workspace) / "run"
+    where.mkdir()
+    with pytest.raises(SparkRunError, match="sha256 differs"):
+        _local.pull_runner(sub, bound, where)
+
+
+def test_a_link_out_of_dot_fluid_is_refused(host, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    fluid = Path(host.workspace) / ".fluid"
+    fluid.mkdir()
+    (fluid / "spark-artifacts").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(SparkRunError, match="outside"):
+        submitter(host)
+    assert list(outside.iterdir()) == []
+
+
+def test_a_linked_state_directory_is_refused_and_skipped(host, tmp_path):
+    run = the_run(local_contract())
+    outside = tmp_path / "elsewhere"
+    (outside / "runs").mkdir(parents=True)
+    base = host.runtime_dir(run.product)
+    base.mkdir(parents=True)
+    (base / run.build).symlink_to(outside, target_is_directory=True)
+    with pytest.raises(SparkRunError, match="outside"):
+        start_run(host, run, "t", runner_text=runner_source())
+    assert [p.name for p in outside.iterdir()] == ["runs"]
+    assert rc.stop_removed(run.product, set(), host) == []
+
+
+def test_a_lock_placed_as_a_link_is_no_run_s(tmp_path):
+    import fcntl
+
+    target = tmp_path / "held"
+    target.write_text("")
+    link = tmp_path / "lock"
+    link.symlink_to(target)
+    fd = os.open(target, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        assert _local._held(target) is True
+        assert _local._held(link) is False
+    finally:
+        os.close(fd)
