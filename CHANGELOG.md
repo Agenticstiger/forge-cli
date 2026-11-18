@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fluid policy apply` grants a Lakekeeper table in Lakekeeper.** An Iceberg expose whose
+  `binding.location.catalog` is `lakekeeper` used to compile to a warning ("enforce it in the
+  catalog's own access control"). `fluid policy compile` now writes one `provider: lakekeeper`
+  binding per table and principal, from `accessPolicy.grants` (scoped by `resources`), the
+  deprecated `metadata.policies` and the expose's `policy.authz` readers (`select`) and writers
+  (`modify`). `read`, `select` and `query` become `select`; `write`, `insert`, `update`, `delete`,
+  `manage` and `admin` become `modify`; `create`, which Lakekeeper grants only on a namespace or
+  warehouse, is reported. `binding.principals` maps a logical principal to a Lakekeeper `user:`
+  (its id `oidc~<subject>`, name or e-mail), `serviceAccount:` or `role:`. A `group:` names the
+  Lakekeeper role of that name, since Lakekeeper with OpenFGA reads no group from the identity
+  provider. Stage 8 reads each table's direct grants through Lakekeeper's management API and
+  sends only the difference, in one request per table. It grants what the contract declares,
+  revokes any other `describe`, `select` or `modify` on that table, and never touches ownership
+  or grant management. `--mode check` makes the same reads and changes nothing. A table not
+  created yet is reported as pending in check mode and fails in enforce mode. A principal
+  Lakekeeper does not know stops the changes on its table. The operator signs forge in with
+  `FLUID_LAKEKEEPER_CREDENTIAL_REF`, a secret reference to `client_id:client_secret`, plus
+  `FLUID_LAKEKEEPER_OAUTH2_SERVER_URI` and `FLUID_LAKEKEEPER_SCOPE`, or with
+  `FLUID_LAKEKEEPER_TOKEN_REF`. These names are operator-only. The reference must be allowed for
+  the catalog's host in `FLUID_ACQUISITION_SECRET_REF_ALLOWLIST`, both URLs must be https, and
+  redirects are not followed. A private CA works through `REQUESTS_CA_BUNDLE` or
+  `SSL_CERT_FILE`. A Lakekeeper exposure in a file that also holds cloud bindings goes to
+  Lakekeeper, and the rest to the provider, as before.
+
 - **A BigQuery table is partitioned and clustered as its binding declares.**
   `binding.location.partitionBy` was read only with `lifecycle.expire`, and
   `binding.properties.cluster_by` (honoured on Snowflake) was read by nobody on BigQuery. Both
