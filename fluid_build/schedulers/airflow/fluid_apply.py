@@ -977,7 +977,7 @@ class _BuildGraph:
         build that writes it runs outside any DAG, so the trigger would never fire."""
         tasked = {t.build_id for dag in dags for t in dag.tasks}
         for where, expose_id, writers in self.expose_refs:
-            if not writers or any(b.get("id") in tasked for b in writers):
+            if not writers or any(_expose_writer_id(b) in tasked for b in writers):
                 continue
             names = ", ".join(repr(b.get("id")) for b in writers)
             raise ScheduleRenderError(
@@ -1028,6 +1028,12 @@ class _BuildGraph:
             if uri and uri not in uris and any(w is build for w in writers):
                 uris.append(uri)
         return tuple(uris)
+
+
+def _expose_writer_id(build: Mapping[str, Any]) -> Optional[str]:
+    """A build's id when it is one a task can carry (a string), else ``None``."""
+    build_id = build.get("id")
+    return build_id if isinstance(build_id, str) else None
 
 
 def _expose_id(expose: Mapping[str, Any]) -> Any:

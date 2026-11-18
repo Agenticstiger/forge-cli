@@ -360,3 +360,18 @@ def test_a_self_trigger_says_how_outputs_change_who_writes_what():
     assert "a build with no outputs counts as writing every expose no build lists" in _refused(
         contract
     )
+
+
+def test_a_writer_whose_id_is_no_string_is_no_task_and_no_crash():
+    contract = copy.deepcopy(SPARK_CONTRACT)
+    contract["builds"] = [
+        {"id": ["w"], "outputs": ["events_daily"]},
+        {
+            "id": "consumer",
+            "outputs": [],
+            "execution": {
+                "trigger": {"type": "dataset", "datasets": [_expose_ref("events_daily")]}
+            },
+        },
+    ]
+    assert "which no DAG runs" in _refused(contract)
