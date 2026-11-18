@@ -508,15 +508,22 @@ def _hive_key(value: str) -> Optional[str]:
 def _bq_contract_key(value: str) -> Optional[str]:
     """The BigQuery column type apply creates for a declared type.
 
-    ``None`` for an array: BigQuery reports a repeated column by its element
-    type and a ``REPEATED`` mode, so the two cannot be compared by type name.
+    ``None`` for an array or a map: BigQuery reports a repeated column by its
+    element type and a ``REPEATED`` mode (a map is a repeated record of its keys
+    and values), so the two cannot be compared by type name. A struct is a RECORD
+    however the contract spells it (``struct``, ``record`` or ``row``).
     """
+    from fluid_build.iac.column_types import split_type
     from fluid_build.iac.providers.gcp import _bq_type
 
     from .verify import _bq_canonical_type
 
-    key = _bq_canonical_type(_bq_type(value))
-    return None if key in ("", "array") else key
+    base = split_type(value)[0]
+    if base in ("array", "map"):
+        return None
+    if base in ("struct", "record", "row"):
+        return "record"
+    return _bq_canonical_type(_bq_type(value)) or None
 
 
 def _bq_target_key(value: str) -> Optional[str]:
