@@ -136,6 +136,13 @@ _SNOWFLAKE: Dict[str, str] = {
     # A zoned timestamp keeps its zone (the fold would make it TIMESTAMP_NTZ).
     "timestamptz": "timestamp_tz",
     "timestamp with time zone": "timestamp_tz",
+    # A JSON value may be an array or a scalar: VARIANT holds any, OBJECT (where the fold
+    # puts ``json``) only a key-value map.
+    "json": "variant",
+    "jsonb": "variant",
+    # Snowflake has no MONEY, and a bare NUMBER is NUMBER(38,0), which drops the cents.
+    # NUMBER(19,4) is SQL Server's MONEY.
+    "money": "number(19,4)",
 }
 
 _REDSHIFT: Dict[str, str] = {
@@ -331,6 +338,87 @@ _PARAMETRIC: Dict[str, frozenset] = {
     "": frozenset({"varchar", "char", "decimal", "numeric", "timestamp"}),
 }
 
+# What a declaration's arguments mean, by the family of the type that declares them: a
+# length, a precision and scale, or fractional-second digits. They carry over only to a
+# type of the same family and only when well formed for it (:func:`_keeps_arguments`), so
+# a ``bigint(20)`` display width is never a NUMBER precision and a ``bignumeric(40,20)``
+# held as VARCHAR keeps none of its precision.
+_LENGTH_TYPES = frozenset(
+    {
+        "string",
+        "str",
+        "text",
+        "varchar",
+        "varchar2",
+        "nvarchar",
+        "nvarchar2",
+        "char",
+        "nchar",
+        "character",
+        "character varying",
+        "clob",
+        "binary",
+        "varbinary",
+        "bytes",
+        "blob",
+        "bytea",
+        "raw",
+    }
+)
+_DECIMAL_TYPES = frozenset({"number", "decimal", "dec", "numeric", "bignumeric", "money"})
+_TIME_TYPES = frozenset(
+    {
+        "time",
+        "timestamp",
+        "timestamp_ntz",
+        "timestamp_tz",
+        "timestamp_ltz",
+        "timestamptz",
+        "datetime",
+        "datetime2",
+        "timestamp with time zone",
+        "timestamp without time zone",
+    }
+)
+_ARGUMENT_FAMILIES = (
+    ("length", _LENGTH_TYPES),
+    ("decimal", _DECIMAL_TYPES),
+    ("time", _TIME_TYPES),
+)
+# Adapters whose character types take ``MAX`` for a length (Redshift's VARCHAR(MAX)).
+# Elsewhere ``varchar(max)`` is the bare type, which already holds the longest value.
+_MAX_LENGTH_ADAPTERS = frozenset({"redshift"})
+_DIGITS_RE = re.compile(r"[0-9]+", re.ASCII)
+
+
+def _argument_family(name: str) -> Optional[str]:
+    key = name.lower()
+    return next((family for family, names in _ARGUMENT_FAMILIES if key in names), None)
+
+
+def _keeps_arguments(args: str, base: str, resolved: str, adapter_key: str) -> bool:
+    """Whether ``base(args)`` keeps its arguments as ``resolved(args)`` on the adapter.
+
+    Only within a family. A length keeps one integer of at least 1 (``MAX`` where the
+    adapter has it) and a time at most 9 fractional-second digits; anything else gives
+    the bare type, which holds the same values (``varchar(0)``, ``string(1,2)``,
+    ``timestamp(12)``). A decimal keeps what it declares, so a precision the warehouse
+    cannot take is refused where an emitter checks it (Databricks) or fails there, never
+    narrowed without a word.
+    """
+    family = _argument_family(base)
+    if family is None or family != _argument_family(resolved):
+        return False
+    if resolved not in _PARAMETRIC[adapter_key]:
+        return False
+    if family == "decimal":
+        return True
+    if not _DIGITS_RE.fullmatch(args):
+        return family == "length" and args.lower() == "max" and adapter_key in _MAX_LENGTH_ADAPTERS
+    digits = args.lstrip("0")
+    return digits != "" if family == "length" else len(digits) <= 1
+
+
 # ``base(args)`` — one level of parentheses, no nesting (no FLUID scalar
 # maps to a constructed type such as ``struct<...>``). The base is checked
 # here; :func:`split_type_params` steps over quoted ``enum`` levels.
@@ -377,11 +465,12 @@ def sql_type(fluid_type: str, adapter: Optional[str] = None) -> str:
     of one generated project must agree) for the skeleton casts in
     ``models.py``; unknown adapters fall back to generic.
 
-    Parameterized declarations keep their arguments whenever the resolved
-    type can carry them: ``number(12,2)`` → ``number(12,2)`` on Snowflake,
-    ``varchar(25)`` → ``varchar(25)``. When the resolved type takes no
-    arguments the declaration degrades to the bare type rather than
-    emitting SQL the warehouse rejects — ``array(4)`` → ``array``.
+    Parameterized declarations keep their arguments when the resolved type
+    is of the same family and can carry them: ``number(12,2)`` →
+    ``number(12,2)`` on Snowflake, ``varchar(25)`` → ``varchar(25)``. Otherwise
+    the declaration degrades to the bare type rather than emitting SQL the
+    warehouse rejects — ``array(4)`` → ``array``, ``bigint(20)`` → ``number``
+    (:func:`_keeps_arguments`).
     """
     if not isinstance(fluid_type, str):
         return "varchar"
@@ -403,14 +492,10 @@ def sql_type(fluid_type: str, adapter: Optional[str] = None) -> str:
             resolved = _lookup(_GENERIC, base, "varchar")
     else:
         resolved = _lookup(table, base, _ADAPTER_FALLBACK[adapter_key])
-        if not known_type(fluid_type, adapter_key):
-            # The catch-all takes none of an unknown type's arguments: a
-            # ``bignumeric(40,20)`` on Snowflake is VARCHAR, never VARCHAR(40,20).
-            return resolved
 
-    # An enum's parameters are its levels, never a length or a precision, so
-    # the string type that holds the column takes none of them.
-    if args and resolved in _PARAMETRIC[adapter_key] and base.lower() != "enum":
+    # An enum's parameters are its levels, never a length or a precision, and a type
+    # the table does not know keeps none of its arguments: neither is in a family.
+    if args and _keeps_arguments(args, base, resolved, adapter_key):
         return f"{resolved}({args})"
     return resolved
 
@@ -432,6 +517,12 @@ def known_type(fluid_type: str, adapter: str) -> bool:
     key = split_parameterized(fluid_type)[0].lower()
     return table is not None and (key in table or _ALIASES.get(key) in table)
 
+
+# Every spelling of an integer, which legitimately has scale 0 (:func:`precision_warnings`).
+_INTEGER_SPELLINGS = frozenset(
+    {"integer", "int16", "int32", "int64", "mediumint", "longint", "bigserial"}
+    | {name for name, canonical in _ALIASES.items() if canonical == "integer"}
+)
 
 # Types whose *unparameterized* spelling silently defaults to scale 0 on an
 # adapter, so a monetary value declared with them loses its cents. Keyed by
@@ -484,9 +575,9 @@ def precision_warnings(contract: Mapping[str, Any], build: Mapping[str, Any]) ->
             if args is not None:
                 continue  # author was explicit — nothing to warn about
             key = base.lower()
-            # ``integer`` (and its aliases) legitimately means scale 0 —
-            # only the decimal-capable spellings lose information.
-            if key == "integer" or _ALIASES.get(key) == "integer":
+            # An integer type legitimately means scale 0 — only the
+            # decimal-capable spellings lose information.
+            if key in _INTEGER_SPELLINGS:
                 continue
             default = at_risk.get(sql_type(declared, adapter))
             if default is None:

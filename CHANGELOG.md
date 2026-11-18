@@ -254,23 +254,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changed the other's column back. On BigQuery, dbt wrote `string` for `int16`, `int64`,
   `float32`, `float64`, `binary`, `geometry` and other types the emitter writes as INT64, FLOAT64,
   BYTES or GEOGRAPHY, and `timestamp` for a `timestamp_ntz` the emitter writes as DATETIME. On
-  Snowflake, the emitter wrote VARCHAR for `smallint`, `money`, `json`, `geography`,
-  `timestamp_ntz` and others dbt writes as NUMBER, OBJECT, GEOGRAPHY or TIMESTAMP_NTZ, while dbt
-  wrote `varchar` for `int64`, `float64` and `bytes`; a `timestamptz` is TIMESTAMP_TZ in both now
-  (the emitter wrote VARCHAR, dbt TIMESTAMP_NTZ). Each adapter now has one table: dbt's BigQuery
-  types come from the emitter's, and the Snowflake emitter types through dbt's, as Databricks
-  already did; on BigQuery dbt's contract drops a `varchar(n)` length, as the emitter writes
-  STRING. A BigQuery `decimal(p,s)` was a bare NUMERIC, which is NUMERIC(38,9), while dbt wrote
-  `numeric(p,s)`; it is now NUMERIC(P,S), or BIGNUMERIC(P,S) where only BIGNUMERIC holds the
-  range. A decimal wider than a BIGNUMERIC still warns, and one with a precision of 0 or a scale
-  above its precision is now refused at validate. BigQuery cannot give an existing NUMERIC column
-  a precision, so the first plan after this change replaces each live table that declares a
-  decimal with a precision, once, which `fluid apply` refuses without `--allow-data-loss`; declare
-  the column `decimal` to keep the table as it is. A table adopted into an empty state is replaced
-  the same way, as a partitioned table already is. Each contract with a BigQuery table gains one
-  `terraform_data` that records this, so that plan adds one more resource. After it, a new decimal
-  column, a changed precision and a decimal made bare are planned in place, and BigQuery refuses
-  at apply a change it cannot make in place.
+  Snowflake, the emitter wrote VARCHAR for `smallint`, `json`, `geography`, `timestamp_ntz`,
+  `timestamptz` and others, while dbt wrote `varchar` for `int64`, `float64` and `bytes`. Each
+  adapter now has one table: dbt's BigQuery types come from the emitter's, and the Snowflake
+  emitter types through dbt's, as Databricks already did; on BigQuery dbt's contract drops a
+  `varchar(n)` length, as the emitter writes STRING. On Snowflake a `json` column is VARIANT,
+  which holds any JSON value (OBJECT holds only an object), `money` is NUMBER(19,4) (a bare NUMBER
+  is NUMBER(38,0) and drops the cents), and `timestamptz` is TIMESTAMP_TZ. A declared type keeps
+  its arguments only in a type of the same family: `varchar(max)` is a bare VARCHAR except on
+  Redshift, a `tinyint(1)` display width no longer becomes NUMBER(1), and `timestamp(12)` is a
+  bare TIMESTAMP_NTZ. A Snowflake table applied before this change keeps the types the emitter
+  wrote then, and Snowflake cannot change a live column to another type (its `ALTER COLUMN` only
+  lengthens text or changes a NUMBER), so a column whose type changes here needs its table
+  migrated; a table a dbt build replaces already has dbt's types. A BigQuery `decimal(p,s)` was a
+  bare NUMERIC, which is NUMERIC(38,9), while dbt wrote `numeric(p,s)`; it is now NUMERIC(P,S), or
+  BIGNUMERIC(P,S) where only BIGNUMERIC holds the range. A decimal wider than a BIGNUMERIC still
+  warns, and one with a precision of 0 or a scale above its precision is now refused at validate.
+  BigQuery cannot give an existing NUMERIC column a precision, so the first plan after this change
+  replaces each live table that declares a decimal with a precision, once, which `fluid apply`
+  refuses without `--allow-data-loss`; declare the column `decimal` to keep the table as it is. A
+  table adopted into an empty state is replaced the same way, as a partitioned table already is.
+  Each contract with a BigQuery table gains one `terraform_data` that records this, so that plan
+  adds one more resource. After it, a new decimal column, a changed precision and a decimal made
+  bare are planned in place, and BigQuery refuses at apply a change it cannot make in place.
 
 - **A Spark stream on AWS can read its own checkpoint.** The role forge creates for a Spark build
   could read and write `<prefix>/*` and list `<prefix>/*`, but Hadoop's `getFileStatus` first asks
