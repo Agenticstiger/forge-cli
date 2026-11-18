@@ -542,7 +542,7 @@ class DotEnvCredentialStore:
         # A reader takes the first OpenBao / Vault token that is set, so while
         # the operator has one, a project file's BAO_TOKEN or VAULT_TOKEN would
         # be read in its place. The operator's wins.
-        refused_tokens = refused_project_vault_tokens(combined, operator)
+        refused_tokens = refused_project_vault_tokens(combined, operator, _PROJECT_EXPORTS)
         for key in refused_tokens:
             del combined[key]
 

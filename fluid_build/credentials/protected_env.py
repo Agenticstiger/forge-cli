@@ -1665,13 +1665,15 @@ def operator_vault_token_file(operator: Mapping[str, Optional[str]]) -> Optional
             return None
         if not path.read_text(encoding="utf-8").strip():
             return None
-    except (OSError, RuntimeError, UnicodeDecodeError):
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError):
         return None
     return str(path)
 
 
 def refused_project_vault_tokens(
-    project: Mapping[str, Optional[str]], operator: Mapping[str, Optional[str]]
+    project: Mapping[str, Optional[str]],
+    operator: Mapping[str, Optional[str]],
+    exported: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, str]:
     """The Vault token variables in ``project`` that may not load, with the token that wins.
 
@@ -1687,20 +1689,22 @@ def refused_project_vault_tokens(
     (``FLUID_VAULT_WRAPPED_TOKEN``, ``FLUID_VAULT_JWT_ROLE``) are protected and
     are read first in any case.
 
-    ``project`` and ``operator`` are as in :func:`unpaired_endpoints`. An
-    operator value equal to the project file's own value for that name is the
-    project's earlier export (a second load in one run), not the operator's
-    token. Returns each refused name, as the project file spells it, with what
-    the operator holds: a variable name or the token file's path.
+    ``project`` and ``operator`` are as in :func:`unpaired_endpoints`.
+    ``exported`` is what project files exported into ``os.environ`` earlier in
+    this process (``dotenv_store._PROJECT_EXPORTS``): a value still there is a
+    project's, on a second load in one run or for another project, not the
+    operator's token. A value the operator set is theirs, even one equal to the
+    project file's. Returns each refused name, as the project file spells it,
+    with what the operator holds: a variable name or the token file's path.
     """
     operator_values = {k.strip().upper(): v for k, v in operator.items()}
-    supplied = {k.strip().upper(): v for k, v in project.items() if v}
+    exports = {k.strip().upper(): v for k, v in (exported or {}).items()}
     theirs = next(
         (
             name
             for name in VAULT_TOKEN_NAMES
             if (operator_values.get(name) or "").strip()
-            and supplied.get(name) != operator_values.get(name)
+            and exports.get(name) != operator_values.get(name)
         ),
         None,
     ) or operator_vault_token_file(operator)

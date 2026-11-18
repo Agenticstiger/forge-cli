@@ -29,6 +29,7 @@ from tests._dotenv_pairing_support import drop_new_names, hermetic_env
 
 OPERATOR_TOKEN = "operator-fake-vault-token"  # pragma: allowlist secret
 PROJECT_TOKEN = "project-fake-vault-token"  # pragma: allowlist secret
+OTHER_PROJECT_TOKEN = "other-project-fake-vault-token"  # pragma: allowlist secret
 
 posix_only = pytest.mark.skipif(os.name == "nt", reason="ownership and links are POSIX checks")
 
@@ -77,10 +78,8 @@ def test_a_project_token_yields_to_the_operator_s_token_file(tmp_path):
         {},
         {"VAULT_TOKEN": ""},
         {"BAO_TOKEN": "   "},
-        # the project's own earlier export, on a second load in one run
-        {"BAO_TOKEN": PROJECT_TOKEN},
     ],
-    ids=["no-token", "blank-vault", "blank-bao", "second-load"],
+    ids=["no-token", "blank-vault", "blank-bao"],
 )
 def test_a_project_token_loads_when_the_operator_has_none(tmp_path, operator):
     home = tmp_path / "home"
@@ -89,6 +88,31 @@ def test_a_project_token_loads_when_the_operator_has_none(tmp_path, operator):
         {"BAO_TOKEN": PROJECT_TOKEN}, {**operator, "HOME": str(home)}
     )
     assert refused == {}
+
+
+@pytest.mark.unit
+def test_a_project_s_earlier_export_is_not_the_operator_s_token(tmp_path):
+    """A second load in one run finds the first one's export in os.environ."""
+    home = tmp_path / "home"
+    home.mkdir()
+    refused = refused_project_vault_tokens(
+        {"BAO_TOKEN": PROJECT_TOKEN},
+        {"BAO_TOKEN": PROJECT_TOKEN, "HOME": str(home)},
+        exported={"BAO_TOKEN": PROJECT_TOKEN},
+    )
+    assert refused == {}
+
+
+@pytest.mark.unit
+def test_an_operator_token_equal_to_the_project_s_is_the_operator_s(tmp_path):
+    """Only what a project file exported is the project's: here its BAO_TOKEN would win."""
+    home = tmp_path / "home"
+    home.mkdir()
+    refused = refused_project_vault_tokens(
+        {"BAO_TOKEN": OTHER_PROJECT_TOKEN, "VAULT_TOKEN": PROJECT_TOKEN},
+        {"VAULT_TOKEN": PROJECT_TOKEN, "HOME": str(home)},
+    )
+    assert refused == {"BAO_TOKEN": "VAULT_TOKEN", "VAULT_TOKEN": "VAULT_TOKEN"}
 
 
 @pytest.mark.unit
@@ -175,5 +199,20 @@ def test_a_project_brings_its_own_token_when_the_operator_has_none(hermetic, tmp
     from fluid_build.secrets import _vault
 
     assert _hydrate(tmp_path, f"BAO_TOKEN={PROJECT_TOKEN}\n", caplog) == []
+    assert os.environ["BAO_TOKEN"] == PROJECT_TOKEN
+    assert _vault.auth_method() == "token:BAO_TOKEN"
+
+
+@pytest.mark.unit
+def test_a_second_hydration_keeps_the_project_s_own_token(hermetic, tmp_path, caplog):
+    """The first hydration's export is the project's, not an operator token, on the next."""
+    from fluid_build.cli._common import hydrate_dotenv
+    from fluid_build.secrets import _vault
+
+    assert _hydrate(tmp_path, f"BAO_TOKEN={PROJECT_TOKEN}\n", caplog) == []
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        hydrate_dotenv(tmp_path / "project")
+    assert not [r for r in caplog.records if r.getMessage().startswith("Ignored ")]
     assert os.environ["BAO_TOKEN"] == PROJECT_TOKEN
     assert _vault.auth_method() == "token:BAO_TOKEN"
