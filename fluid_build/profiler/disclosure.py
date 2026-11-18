@@ -51,6 +51,19 @@ for the group's record count, :func:`publish_cells` for a histogram's cells,
 :func:`check_support` for a support's members and :func:`check_quantile` for a
 quantile's witness.
 
+What the group checks leave readable, on purpose:
+
+* A grouped statistic lists every group the data forms, published or withheld.
+  A key is always a level the bundle declares (a value outside the declared
+  support is refused), so its presence says only that the level holds at least
+  one record.
+* When one group of a grouped mean or support is withheld, every other group of
+  it is withheld too, under ``D``, so the withheld one cannot be recovered by
+  differencing against the ungrouped figures.
+* A withheld cell or group of a histogram or a quantile is not secondarily
+  suppressed. The rounded counts still bound it: it holds somewhere inside 0 to 9
+  records, and never above the threshold.
+
 Where this differs from ACRO 1.1.0, on purpose:
 
 * ACRO's threshold mask is ``count < safe_threshold``, so it also catches a zero

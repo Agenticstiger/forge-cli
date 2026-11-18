@@ -124,9 +124,12 @@ _RECORD_COUNTS = frozenset({"count", "nullCount"})
 #: is formed ungrouped, over a number column only: there it publishes where the
 #: column's ``count`` and ``sum`` do, and what it adds, the values' residues below
 #: the grid, passes the sum checks (:func:`disclosure.check_mean`). Over a
-#: timestamp it would publish a sum that no metric publishes. The rest need a
-#: declared shape (bin edges, levels, a quantile level or a ``groupBy``) that
-#: only the Simulation's fidelity block holds.
+#: timestamp it would publish a sum that no metric publishes. The rest
+#: are formed only from a Simulation's fidelity block, which names the column each
+#: one reads. A histogram's bin edges, a quantile's level and a ``groupBy`` are
+#: shapes only that block holds, while a ``support`` needs the column and nothing
+#: more. A correlation is not answered at all (its moments need the exact record
+#: count, which the output checks round).
 _STATISTICS: Tuple[Tuple[str, FrozenSet[str]], ...] = (("mean/1", frozenset({NUMBER})),)
 
 

@@ -54,6 +54,13 @@ siblings, under D (secondary suppression), so it cannot be recovered from the
 column's published total. A correlation is not answered: its moments need the
 exact record count, which the output checks round.
 
+What the checks leave readable: a grouped statistic lists every group the data
+forms, published or withheld. A key is always a level the bundle declares (a
+value outside the declared support is refused), so its presence says only that
+the level holds at least one record. A withheld cell or group of a histogram or
+a quantile is not secondarily suppressed: the rounded counts still bound it,
+inside 0 to 9 records, and never above the threshold.
+
 These are output-checking conventions only. No privacy or anonymity guarantee
 is made or implied: read the document before you share it.
 """
