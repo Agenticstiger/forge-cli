@@ -82,43 +82,28 @@ def _empty_provider_config() -> str:
 # fall back to a self-referential ``SELECT * FROM <itself>``.
 _VIEW_BODY_KEYS = ("query", "statement", "sql", "viewDefinition")
 
-# FLUID column type → Snowflake SQL type.
-_SF_TYPES = {
-    "string": "VARCHAR",
-    "str": "VARCHAR",
-    "text": "VARCHAR",
-    "varchar": "VARCHAR",
-    "char": "VARCHAR",
-    "integer": "NUMBER(38,0)",
-    "int": "NUMBER(38,0)",
-    "bigint": "NUMBER(38,0)",
-    "int64": "NUMBER(38,0)",
-    "long": "NUMBER(38,0)",
-    "float": "FLOAT",
-    "double": "FLOAT",
-    "float64": "FLOAT",
-    "real": "FLOAT",
-    "boolean": "BOOLEAN",
-    "bool": "BOOLEAN",
-    "date": "DATE",
-    "time": "TIME",
-    "timestamp": "TIMESTAMP_NTZ",
-    "datetime": "TIMESTAMP_NTZ",
-    "variant": "VARIANT",
-    "object": "OBJECT",
-    "array": "ARRAY",
-    "binary": "BINARY",
-    "bytes": "BINARY",
-}
+#: Snowflake's decimal spellings, all NUMBER, which this emitter writes as NUMBER.
+_SF_DECIMALS = frozenset({"NUMBER", "DECIMAL", "NUMERIC"})
 
 
 def _sf_type(raw: Any) -> str:
-    """FLUID column type → Snowflake SQL type."""
-    t = str(raw or "VARCHAR").strip().lower()
-    if t.startswith(("decimal", "numeric", "number")):
-        # decimal(10,2) → NUMBER(10,2); a bare type widens to a safe default.
-        return f"NUMBER{t[t.index('('):]}" if "(" in t else "NUMBER(38,0)"
-    return _SF_TYPES.get(t, "VARCHAR")
+    """FLUID column type → Snowflake SQL type, through the dbt engine's table.
+
+    The Databricks emitter types its columns the same way, so a dbt model and the
+    table ``fluid apply`` creates agree (``tests/iac/test_iac_type_table_drift.py``
+    holds the two together). Spelled as this emitter always wrote its types: upper
+    case, and a decimal as NUMBER, NUMBER(38,0) when it declares no precision.
+    Imported here, not at module scope: ``fluid_build.engines`` loads every engine
+    package, and the IaC package is imported by every ``fluid apply``.
+    """
+    from ...engines.dbt import _types as dbt_types
+
+    resolved = dbt_types.sql_type(str(raw or "string"), "snowflake")
+    base, args = dbt_types.split_parameterized(resolved)
+    base = base.upper()
+    if base in _SF_DECIMALS:
+        return f"NUMBER({args})" if args else "NUMBER(38,0)"
+    return f"{base}({args})" if args else base
 
 
 @dataclass(frozen=True)

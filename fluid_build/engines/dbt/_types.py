@@ -73,6 +73,12 @@ _GENERIC: Dict[str, str] = {
 # datacontract-cli's sql_type_converter per-adapter choices where FLUID has an
 # equivalent type; semi-structured fallbacks use each platform's native
 # JSON-ish type instead of the generic ``varchar``.
+#
+# BigQuery's types come from the BigQuery IaC emitter's table
+# (``iac/providers/gcp.py::_bq_sql_type``, through :func:`_bigquery_type`), so a dbt
+# model and the table ``fluid apply`` creates agree. This table types only what that
+# emitter refuses (a bare ``array`` or ``struct``). Snowflake and Databricks go the
+# other way: their IaC emitters type through this module.
 _BIGQUERY: Dict[str, str] = {
     "string": "string",  # BigQuery rejects varchar
     "integer": "int64",
@@ -119,6 +125,17 @@ _SNOWFLAKE: Dict[str, str] = {
     "varbinary": "varbinary",
     "geography": "geography",
     "geometry": "geometry",
+    # Spellings the alias fold leaves to the varchar fallback. The Snowflake IaC
+    # emitter, which types through this table, wrote the first three as these types.
+    "int64": "number",
+    "float64": "float",
+    "bytes": "binary",
+    "int32": "number",
+    "int16": "number",
+    "float32": "float",
+    # A zoned timestamp keeps its zone (the fold would make it TIMESTAMP_NTZ).
+    "timestamptz": "timestamp_tz",
+    "timestamp with time zone": "timestamp_tz",
 }
 
 _REDSHIFT: Dict[str, str] = {
@@ -372,6 +389,10 @@ def sql_type(fluid_type: str, adapter: Optional[str] = None) -> str:
     base, args = split_parameterized(fluid_type)
 
     adapter_key = adapter.lower() if adapter else ""
+    if adapter_key == "bigquery":
+        emitted = _bigquery_type(fluid_type)
+        if emitted is not None:
+            return emitted
     table = _ADAPTER_TABLES.get(adapter_key)
     if table is None:
         adapter_key = ""
@@ -382,12 +403,26 @@ def sql_type(fluid_type: str, adapter: Optional[str] = None) -> str:
             resolved = _lookup(_GENERIC, base, "varchar")
     else:
         resolved = _lookup(table, base, _ADAPTER_FALLBACK[adapter_key])
+        if not known_type(fluid_type, adapter_key):
+            # The catch-all takes none of an unknown type's arguments: a
+            # ``bignumeric(40,20)`` on Snowflake is VARCHAR, never VARCHAR(40,20).
+            return resolved
 
     # An enum's parameters are its levels, never a length or a precision, so
     # the string type that holds the column takes none of them.
     if args and resolved in _PARAMETRIC[adapter_key] and base.lower() != "enum":
         return f"{resolved}({args})"
     return resolved
+
+
+def _bigquery_type(fluid_type: str) -> Optional[str]:
+    """The type the BigQuery IaC emitter writes for ``fluid_type``, spelled for SQL
+    (``int64``, ``numeric(18,4)``); ``None`` for a type that emitter refuses. Imported
+    here, not at module scope: the IaC package is the emitter's, and loading the dbt
+    engine must not load it."""
+    from fluid_build.iac.providers.gcp import _bq_sql_type
+
+    return _bq_sql_type(fluid_type)
 
 
 def known_type(fluid_type: str, adapter: str) -> bool:

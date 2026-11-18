@@ -23,7 +23,7 @@ import json
 import pytest
 
 from fluid_build.iac import build_module, get_iac_plugin
-from fluid_build.iac.providers.gcp import _bq_decimal, _bq_field
+from fluid_build.iac.providers.gcp import _bq_decimal, _bq_field, _bq_sql_type
 
 pytestmark = [pytest.mark.unit, pytest.mark.provider, pytest.mark.gcp]
 
@@ -88,6 +88,14 @@ def test_the_limits_are_bigquerys():
     assert _bq_decimal("decimal(2,5)") is None
     assert _bq_decimal("decimal") is None
     assert _bq_decimal("string(10)") is None
+
+
+def test_the_dbt_spelling_matches_the_table():
+    assert _bq_sql_type("decimal(18,4)") == "numeric(18,4)"
+    assert _bq_sql_type("decimal(10)") == "numeric(10)"
+    assert _bq_sql_type("decimal(38,10)") == "bignumeric(38,10)"
+    assert _bq_sql_type("decimal(60,2)") == "bignumeric"
+    assert _bq_sql_type("array") is None
 
 
 MARKER = "sales_decimals_decimal_parameters"

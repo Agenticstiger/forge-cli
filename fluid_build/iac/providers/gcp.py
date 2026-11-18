@@ -63,7 +63,9 @@ from . import gcp_governance as _gov
 # (``varchar(255)`` is ``varchar``). Every entry is a type a BigQuery table schema
 # takes; ``_bq_outcome`` classifies the rest. A ``decimal(p,s)`` is a NUMERIC(P,S), or a
 # BIGNUMERIC(P,S) when a NUMERIC cannot hold its range (:func:`_bq_decimal`); a bare
-# ``number`` or ``decimal`` is a bare NUMERIC.
+# ``number`` or ``decimal`` is a bare NUMERIC. This table is also the dbt engine's for
+# BigQuery (``engines/dbt/_types.py`` reads :func:`_bq_sql_type`), so a dbt model and
+# the table it builds into agree.
 _BQ_TYPES = column_types.expand(
     {
         "STRING": "string, str, text, varchar, varchar2, nvarchar, char, nchar, character, clob, "
@@ -241,6 +243,20 @@ def _bq_parameters(raw: Any) -> Dict[str, str]:
         return {}
     _kind, precision, scale = decimal
     return {"precision": str(precision), **({"scale": str(scale)} if scale else {})}
+
+
+def _bq_sql_type(raw: Any) -> Optional[str]:
+    """The GoogleSQL spelling of the type ``raw`` is written as (``int64``,
+    ``numeric(18,4)``), for the dbt engine's model contracts and casts; ``None`` for a
+    type this emitter refuses, which the dbt engine types itself."""
+    outcome = _bq_outcome(raw)
+    if outcome.target is None:
+        return None
+    decimal = _bq_decimal(raw)
+    if decimal is None:
+        return outcome.target.lower()
+    kind, precision, scale = decimal
+    return f"{kind.lower()}({precision}{'' if scale is None else f',{scale}'})"
 
 
 def _bq_type(raw: Any) -> str:
