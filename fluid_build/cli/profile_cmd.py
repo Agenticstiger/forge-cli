@@ -39,7 +39,9 @@ checks are ACRO 1.1.0's defaults, named "acro-default" in the document:
   - a mean is published only when the column's count and sum are.
 A withheld value keeps its SDMX CL_CONF_STATUS code and no value: A (a small
 count), C (a sum over at most two values), O or T (dominated by one or two
-records), M (concentration) or D (secondary suppression).
+records), M (concentration) or D (secondary suppression). A histogram's withheld
+groups and cells are all written C, whatever withheld them, so their code says
+nothing of their size; the summary counts them by the check.
 
 For each number column the document also holds mean/1, the statistic the FLUX
 fidelity check compares a mean property with: the number of values and their
@@ -393,6 +395,23 @@ _CODE_MEANING = {
 }
 
 
+def _codes(counts: Dict[str, int]) -> str:
+    """``A (small count) 3, D (secondary suppression) 1``."""
+    return ", ".join(
+        f"{code} ({_CODE_MEANING.get(code, 'withheld')}) {count}" for code, count in counts.items()
+    )
+
+
+def _histograms_withheld(result: Any) -> bool:
+    """Whether a count table, a histogram, has a group the checks withheld."""
+    from fluid_build.profiler.disclosure import COUNT_TABLES
+
+    return any(
+        each[1].partition("/")[0] in COUNT_TABLES
+        for each in (*result.withheld_statistics, *result.partly_withheld_statistics)
+    )
+
+
 def _plural(count: int, word: str) -> str:
     return f"{count} {word}" + ("" if count == 1 else "s")
 
@@ -432,11 +451,16 @@ def _report(say: Any, result: Any, out: Path, *, answered_block: bool = False) -
         f"{_plural(result.published, 'value')} published, {sum(withheld.values())} withheld."
     )
     if withheld:
-        codes = ", ".join(
-            f"{code} ({_CODE_MEANING.get(code, 'withheld')}) {count}"
-            for code, count in withheld.items()
+        say(f"Withheld, by CL_CONF_STATUS code: {_codes(withheld)}.")
+    cells: Dict[str, int] = dict(result.withheld_cells)
+    if cells:
+        say(f"Withheld histogram cells, by CL_CONF_STATUS code: {_codes(cells)}.")
+    if cells or _histograms_withheld(result):
+        say(
+            "The document writes C for every withheld group and cell of a histogram, "
+            "whatever withheld it, so its code says nothing of its size.",
+            soft_wrap=True,
         )
-        say(f"Withheld, by CL_CONF_STATUS code: {codes}.")
     named = _named(result.statistics)
     whole = _named(result.withheld_statistics)
     if named:

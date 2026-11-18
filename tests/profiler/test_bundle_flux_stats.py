@@ -210,8 +210,10 @@ def test_the_document_answers_every_declared_property(tmp_path):
     assert levels["levels"] == ["DE", "FR", "GB", "IE"]
     (level_group,) = levels["groups"]
     # DE is declared and no record holds it: a zero cell is withheld, the rest are published.
+    # A histogram's withheld cell is written C, whatever withheld it; the result keeps why.
     assert level_group["levelCounts"] == [None, 40, 40, 40]
-    assert level_group["cellStatus"] == ["A", "F", "F", "F"]
+    assert level_group["cellStatus"] == ["C", "F", "F", "F"]
+    assert result.withheld_cells == {"A": 1}
     assert _entry(result, "market", "support/1")["groups"][0]["support"] == ["FR", "GB", "IE"]
 
 
@@ -286,8 +288,14 @@ def test_a_rare_support_member_withholds_the_group_and_siblings_of_a_grouped_mea
     assert ("amount", "mean/1", None, None) not in result.withheld_statistics
     # The histogram's DE cell is a one: withheld by its cell, the group is published.
     (group,) = _entry(result, "market", "levelHistogram/1")["groups"]
-    assert group["cellStatus"][0] == "A" and group["levelCounts"][0] is None
+    assert group["cellStatus"][0] == "C" and group["levelCounts"][0] is None
     load_profile_text(result.canonical.decode("utf-8"))
+
+
+_ONE_CODE = (
+    "The document writes C for every withheld group and cell of a histogram, "
+    "whatever withheld it, so its code says nothing of its size."
+)
 
 
 @pytest.mark.parametrize(
@@ -394,16 +402,18 @@ def test_a_zero_cell_is_withheld_and_the_group_published(tmp_path):
     ]
     result = _profile(tmp_path, rows, properties)
     (group,) = _entry(result, "amount", "marginalHistogram/1")["groups"]
-    assert group["binCounts"] == [None, 120] and group["cellStatus"] == ["A", "F"]
+    assert group["binCounts"] == [None, 120] and group["cellStatus"] == ["C", "F"]
+    assert result.withheld_cells == {"A": 1}
 
 
 def test_a_small_table_withholds_the_histogram_whole(tmp_path):
     rows = [{"amount": "10", "market": "IE", "qty": "1"} for _ in range(6)]
     result = _profile(tmp_path, rows, [PROPERTIES[2], PROPERTIES[3]])
+    # Withheld for a small count, and written C: the status says nothing of the size.
     assert _entry(result, "amount", "marginalHistogram/1")["groups"] == [
-        {"group": "", "status": "A"}
+        {"group": "", "status": "C"}
     ]
-    assert _entry(result, "market", "levelHistogram/1")["groups"] == [{"group": "", "status": "A"}]
+    assert _entry(result, "market", "levelHistogram/1")["groups"] == [{"group": "", "status": "C"}]
     assert result.withheld["A"] >= 2
 
 
@@ -556,6 +566,9 @@ def test_the_command_writes_the_document_and_names_what_it_answers(tmp_path, mon
     assert "levelHistogram/1 of 'market'" in out and "quantile/1 of 'amount'" in out
     assert "Not answered: correlation of 'amount' and 'qty':" in out
     assert "a run that checks it is refused (FLX-5037)." in out
+    # The DE level holds no record: its cell is withheld, written C, and counted by its check.
+    assert "Withheld histogram cells, by CL_CONF_STATUS code: A (small count) 1." in out
+    assert _ONE_CODE in out
     written = (tmp_path / "payment.profile.json").read_bytes()
     load_profile_text(written.decode("utf-8"))
 
@@ -699,6 +712,7 @@ def test_a_statistic_with_some_groups_withheld_is_named_with_its_counts(tmp_path
     ]
     published = statuses.count("F")
     assert 0 < published < len(statuses)
+    assert set(statuses) == {"F", "C"}
     named = ("amount", "marginalHistogram/1", "market", "over bins 0, 50, 100")
     assert result.partly_withheld_statistics == ((*named, published, len(statuses)),)
     assert named not in result.statistics
@@ -726,3 +740,25 @@ def test_the_report_names_the_statistics_withheld_in_part(tmp_path, monkeypatch,
         "Partly withheld, so a run that checks them scores only the published groups: "
         "marginalHistogram/1 of 'amount' over bins 0, 50, 100 by 'market' (3 of 4 groups)." in out
     )
+    assert _ONE_CODE in out and "Withheld histogram cells" not in out
+
+
+def test_a_report_with_no_withheld_histogram_value_says_nothing_of_c(tmp_path, monkeypatch, capsys):
+    rows = [{"amount": AMOUNTS[n % 5], "market": MARKETS[n % 3], "qty": "1"} for n in range(120)]
+    directory = _bundle(tmp_path, [PROPERTIES[2]])
+    monkeypatch.chdir(tmp_path)
+    rc = main(
+        [
+            "profile",
+            str(directory / "payment.fluid.yml"),
+            "--source",
+            _slice(tmp_path, rows),
+            "--bundle",
+            str(directory),
+            "--out",
+            "payment.profile.json",
+        ]
+    )
+    out = " ".join(capsys.readouterr().out.split())
+    assert rc == 0, out
+    assert _ONE_CODE not in out and "Withheld histogram cells" not in out

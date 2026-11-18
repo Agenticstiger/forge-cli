@@ -39,12 +39,20 @@ records below its witness and the records above it must each be none or at least
 ``minimumCell`` (FLUX ADR 0011's three cells, founder decision 2026-11-18): a rank
 of 3 would say that three records lie below the witness.
 
-A withheld value carries an SDMX ``CL_CONF_STATUS`` 1.4 code and no value: ``A``
-for a small count (a zero cell, a cell below the threshold, or a value too few
-records hold), ``O`` and ``T`` for dominance by one or two records, ``M`` for
+A verdict names the check that fired with an SDMX ``CL_CONF_STATUS`` 1.4 code:
+``A`` for a small count (a zero cell, a cell below the threshold, or a value too
+few records hold), ``O`` and ``T`` for dominance by one or two records, ``M`` for
 the p-ratio, another measure of concentration, ``C`` for a sum whose records
 hold at most two values, and ``D`` for a group the sender withholds so that
 another cannot be recovered (secondary suppression, :func:`suppress_secondary`).
+A withheld value is written with that code and no value, except in a count table
+(:data:`COUNT_TABLES`, PROFILE-SPEC §3), whose withheld groups and cells are all
+written ``C``, whatever withheld them (:func:`written_status`, FLUX ADR 0011): a
+code that named the check would tell a reader a range, ``A`` that a cell holds
+fewer than ``minimumCell`` records, and a total the reader knows can turn the
+range into the count. The profiler's summary still counts them by the check, as
+ACRO's outcome table keeps each suppressed cell's reasons apart from the table it
+releases.
 
 The groups of a statistic the Simulation's fidelity block declares are checked
 group by group, each as a cell of a table of records (the ESSnet/DwB output
@@ -66,7 +74,7 @@ What the group checks leave readable, on purpose:
   leaves out of every group count as one more group there, never written.
 * A withheld cell or group of a histogram or a quantile is not secondarily
   suppressed. The rounded counts still bound it: it holds somewhere inside 0 to 9
-  records, and never above the threshold.
+  records, and never above the threshold. A histogram's ``C`` adds nothing to that.
 
 Where this differs from ACRO 1.1.0, on purpose:
 
@@ -104,6 +112,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 __all__ = [
     "ACRO_DEFAULT",
     "CONCENTRATION",
+    "COUNT_TABLES",
     "DOMINANCE_BY_ONE",
     "DOMINANCE_BY_TWO",
     "FREE",
@@ -129,6 +138,7 @@ __all__ = [
     "round_count",
     "sample_size",
     "suppress_secondary",
+    "written_status",
 ]
 
 # SDMX ``CL_CONF_STATUS`` 1.4 codes, with PROFILE-SPEC §3's paraphrase of each
@@ -150,6 +160,28 @@ WITHHELD = "C"
 #: Secondary suppression set by the sender: a group that passed every check on its own
 #: and is withheld so that a withheld sibling cannot be recovered from it.
 SECONDARY = "D"
+
+#: The declared statistics whose groups are count tables (PROFILE-SPEC §3): a histogram
+#: over bins and one over levels. Every group and cell of one that a check withholds is
+#: written ``C`` (:func:`written_status`).
+COUNT_TABLES = frozenset({"marginalHistogram", "levelHistogram"})
+
+
+def written_status(status: str, kind: str) -> str:
+    """The status a document writes for a value that a check gave *status*.
+
+    *kind* is the declared property the value belongs to (``mean``, ``quantile``,
+    ``marginalHistogram`` and so on). A value of a count table that any check
+    withholds is written ``C``, so its status says nothing about its size (FLUX
+    ADR 0011, PROFILE-SPEC §3): ``A`` would say that a cell holds fewer than
+    ``minimumCell`` records, and cells of 10, 9, 9 and 10 records written ``F``,
+    ``A``, ``A``, ``F`` give both withheld cells as 9 to a reader who knows the
+    total. Every other value keeps the code of the check that withheld it.
+    """
+    if status != FREE and kind in COUNT_TABLES:
+        return WITHHELD
+    return status
+
 
 #: The largest count a profile can carry: 2^53 - 1, as RFC 8785 serialises it.
 MAX_COUNT = 2**53 - 1
@@ -480,8 +512,9 @@ class Cells:
     """A histogram group's cells after the checks.
 
     ``verdict`` is :data:`PUBLISHED`, or ``A`` when every cell is withheld and the
-    group goes whole. ``statuses`` holds one code per cell and ``counts`` the
-    published count of each, rounded, or ``None`` where the cell is withheld
+    group goes whole. ``statuses`` holds the code of the check that decided each
+    cell, which a document writes through :func:`written_status`, and ``counts``
+    the published count of each, rounded, or ``None`` where the cell is withheld
     (PROFILE-SPEC §3: a cell is null exactly when its status is not ``F``).
     """
 

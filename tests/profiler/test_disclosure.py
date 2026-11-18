@@ -508,6 +508,37 @@ def test_a_quantile_rank_that_rounds_to_zero_withholds_the_group():
     assert verdict.status == "F"  # nothing below the witness is a zero rank, not a small one
 
 
+@pytest.mark.parametrize(
+    ("status", "kind", "written"),
+    [
+        ("A", "marginalHistogram", "C"),
+        ("A", "levelHistogram", "C"),
+        ("D", "levelHistogram", "C"),
+        ("C", "marginalHistogram", "C"),
+        ("F", "marginalHistogram", "F"),
+        ("F", "levelHistogram", "F"),
+        ("A", "mean", "A"),
+        ("D", "mean", "D"),
+        ("A", "support", "A"),
+        ("A", "quantile", "A"),
+        ("O", "mean", "O"),
+    ],
+)
+def test_a_count_table_writes_c_for_whatever_withheld_a_value(status, kind, written):
+    assert disclosure.written_status(status, kind) == written
+
+
+def test_one_withheld_code_hides_the_size_a_total_gives_back():
+    # PROFILE-SPEC section 3: cells of 10, 9, 9 and 10 records, written F, A, A, F under a
+    # known total, give both withheld cells as 9; written F, C, C, F they read as a code
+    # that names no check.
+    cells = disclosure.publish_cells([10, 9, 9, 10], ACRO_DEFAULT)
+    assert cells.statuses == ("F", "A", "A", "F")
+    written = [disclosure.written_status(code, "levelHistogram") for code in cells.statuses]
+    assert written == ["F", "C", "C", "F"]
+    assert disclosure.COUNT_TABLES == {"marginalHistogram", "levelHistogram"}
+
+
 def _published():
     return disclosure.PUBLISHED
 
