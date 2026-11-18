@@ -77,9 +77,10 @@ def _project(root: Path, dbt_project: str = "name: p\nprofile: p\n") -> Path:
             "models/profiles.yml": "secret: 2",
             "models/Profiles.YAML": "secret: 3",
             "seeds/profiles.yaml": "secret: 4",
-            "models/.hidden.sql": "select 3",
+            "models/.DS_Store": "junk",
+            "models/.gitkeep": "",
             ".git/config": "[credential]",
-            "models/.ipynb_checkpoints/x.sql": "select 4",
+            "models/.cache/notes.txt": "not read by dbt",
             "models/__pycache__/m.cpython-312.pyc": "x",
             "README.md": "not read by dbt",
             "config/dbt/profiles.yml": "p: {}",
@@ -114,13 +115,36 @@ class TestSelection:
         assert "models/orders.sql" in files
         assert not any(rel.startswith(("models/compiled/", "models/pkg/")) for rel in files)
 
-    def test_an_output_directory_is_skipped_whatever_its_case(self, tmp_path: Path) -> None:
-        # On a case-insensitive file system Target/ opens target/: it is skipped by
-        # identity, not by name. On a case-sensitive one there is no Target/ at all.
+    def test_an_output_directory_is_refused_whatever_its_case(self, tmp_path: Path) -> None:
+        # Compared by identity, not by name: on a case-insensitive file system Target/ is
+        # target/, where dbt writes. On a case-sensitive one there is no Target/ to read.
         project = _project(tmp_path, "name: p\nmodel-paths: [Target, models]\n")
+        if (project / "Target").is_dir():
+            assert "the directory dbt writes its output into" in _refusal(project)
+        else:
+            files = set(read_project_files(project))
+            assert not any(rel.lower().startswith("target/") for rel in files)
+
+    def test_function_paths_and_the_deprecated_keys_are_read_as_dbt_reads_them(
+        self, tmp_path: Path
+    ) -> None:
+        project = tmp_path / "p"
+        _write(
+            project,
+            {
+                "dbt_project.yml": "name: p\nsource-paths: [src]\ndata-paths: [data]\n",
+                "src/m.sql": "select 1",
+                "data/s.csv": "id\n1",
+                "functions/f.sql": "select 1",
+                "models/ignored.sql": "select 2",
+            },
+        )
         files = set(read_project_files(project))
-        assert "models/orders.sql" in files
-        assert not any(rel.lower().startswith("target/") for rel in files)
+        assert files == {"dbt_project.yml", "src/m.sql", "data/s.csv", "functions/f.sql"}
+
+    def test_a_null_path_key_takes_dbts_default(self, tmp_path: Path) -> None:
+        project = _project(tmp_path, "name: p\nmodel-paths:\nmacro-paths: ~\n")
+        assert {"models/orders.sql", "macros/m.sql"} <= set(read_project_files(project))
 
     def test_a_missing_default_directory_is_no_error(self, tmp_path: Path) -> None:
         project = tmp_path / "p"
@@ -156,6 +180,54 @@ class TestRefusals:
     ) -> None:
         text = _refusal(_project(tmp_path, f"name: p\nmodel-paths: {paths}\n"))
         assert "model-paths" in text and why in text
+
+    @pytest.mark.parametrize(
+        "entry", ["\"{{ env_var('M', 'models') }}\"", '"{% if 1 %}models{% endif %}"']
+    )
+    def test_a_path_key_written_as_jinja(self, tmp_path: Path, entry: str) -> None:
+        text = _refusal(_project(tmp_path, f"name: p\nmodel-paths: [{entry}]\n"))
+        assert "a Jinja expression" in text
+
+    def test_an_output_path_written_as_jinja(self, tmp_path: Path) -> None:
+        text = _refusal(_project(tmp_path, "name: p\ntarget-path: \"{{ env_var('T') }}\"\n"))
+        assert "target-path" in text and "a Jinja expression" in text
+
+    def test_a_path_key_naming_the_output_directory(self, tmp_path: Path) -> None:
+        project = _project(tmp_path, "name: p\nmodel-paths: [target]\n")
+        assert "the directory dbt writes its output into" in _refusal(project)
+
+    def test_an_output_directory_linked_to_a_read_one(self, tmp_path: Path) -> None:
+        project = _project(tmp_path, "name: p\ntarget-path: out\n")
+        _link(project / "models" / "staging", project / "out")
+        assert "writes into through a symbolic link" in _refusal(project)
+
+    @pytest.mark.parametrize(
+        "rel", ["models/.wip.sql", "seeds/.old.CSV", "models/.ipynb_checkpoints/m-checkpoint.py"]
+    )
+    def test_a_hidden_file_dbt_reads(self, tmp_path: Path, rel: str) -> None:
+        project = _project(tmp_path)
+        _write(project, {rel: "select 1"})
+        assert f"{rel} is a hidden file dbt reads" in _refusal(project)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root reads any directory")
+    def test_a_directory_that_cannot_be_listed(self, tmp_path: Path) -> None:
+        project = _project(tmp_path)
+        locked = project / "models" / "locked"
+        _write(locked, {"a.sql": "select 1"})
+        locked.chmod(0)
+        try:
+            assert "models/locked in the dbt project could not be listed" in _refusal(project)
+        finally:
+            locked.chmod(0o755)
+
+    def test_a_dbt_project_yml_dbt_cannot_load(self, tmp_path: Path) -> None:
+        # PyYAML raises a plain ValueError for a timestamp out of range.
+        project = _project(tmp_path, "name: p\nvars: {start: 2024-13-45}\n")
+        assert "could not be read (ValueError)" in _refusal(project)
+
+    def test_an_output_path_with_a_nul_byte(self, tmp_path: Path) -> None:
+        project = _project(tmp_path, 'name: p\ntarget-path: "a\\0b"\n')
+        assert set(read_project_files(project)) == READ
 
     def test_a_linked_file(self, tmp_path: Path) -> None:
         project = _project(tmp_path)
@@ -198,14 +270,14 @@ class TestRefusals:
         _write(tmp_path, {"secret.txt": "s3cret", "models/.keep": ""})
         link = _link(tmp_path / "secret.txt", tmp_path / "models" / "a.sql") / "a.sql"
         with pytest.raises(DbtProjectFilesError, match="models/a.sql could not be read"):
-            pf._read_bounded(link, "models/a.sql")
+            pf.read_project_file(link, "models/a.sql")
 
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
     def test_a_file_swapped_for_a_fifo_is_not_read(self, tmp_path: Path) -> None:
         fifo = tmp_path / "pipe.sql"
         os.mkfifo(fifo)
         with pytest.raises(DbtProjectFilesError, match="no longer a regular file"):
-            pf._read_bounded(fifo, "models/pipe.sql")
+            pf.read_project_file(fifo, "models/pipe.sql")
 
     def test_a_project_over_the_bundle_limit(self, tmp_path: Path) -> None:
         assert "the most one bundle packs" in _refusal(_project(tmp_path), budget=10)
@@ -228,6 +300,12 @@ class TestWhichBuildsBindAProject:
             ({**DBT, "properties": {"language": "flink_sql"}}, False),
             ({"id": "t", "engine": "sql", "properties": {"sql": "SELECT 1"}}, False),
             ({"id": "t", "engine": "spark"}, False),
+            ({"id": "t", "engine": 5}, False),
+            ({"id": "t", "engine": ["dbt"]}, False),
+            ({**DBT, "pattern": 3}, False),
+            ({**DBT, "properties": ["sql"]}, False),
+            ({**DBT, "repository": 5}, False),
+            ({**DBT, "repository": None}, False),
             ("not a build", False),
         ],
     )
@@ -268,6 +346,10 @@ class TestCollectBundleProjects:
         _project(tmp_path)
         text = _collect_refusal({"builds": [{**DBT, "id": bad_id}]}, tmp_path)
         assert text.startswith("builds[0]: a dbt build needs an id")
+
+    def test_a_templated_repository(self, tmp_path: Path) -> None:
+        contract = {"builds": [{**DBT, "repository": "{{ env.DBT_DIR }}"}]}
+        assert "is a template" in _collect_refusal(contract, tmp_path)
 
     def test_two_builds_with_one_id(self, tmp_path: Path) -> None:
         _project(tmp_path)

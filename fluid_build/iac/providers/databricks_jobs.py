@@ -523,6 +523,7 @@ def _project_files(
     from ...build_runners.dbt.project_files import (
         DbtProjectFilesError,
         load_project_config,
+        read_project_file,
         select_project_files,
     )
 
@@ -557,10 +558,31 @@ def _project_files(
                 "Replace the link with the file itself, or use a GIT source.",
             )
         )
+    for name in selection.unlisted:
+        refusals.append(
+            _refusal(
+                "project-unreadable",
+                f"{where} {name} in the dbt project could not be listed, so its files would "
+                "not be uploaded.",
+                "Make it readable, or use a GIT source.",
+            )
+        )
+    # A hidden file dbt would read (selection.hidden) is left out of the upload, so
+    # the job's dbt does not read it either.
     files = []
     total = 0
     for rel, path in selection.files.items():
-        data = path.read_bytes()
+        try:
+            data = read_project_file(path, rel)
+        except DbtProjectFilesError as exc:
+            refusals.append(
+                _refusal(
+                    "project-unreadable",
+                    f"{where} {exc}.",
+                    "Fix the file, or use a GIT source.",
+                )
+            )
+            continue
         if len(data) > MAX_FILE_BYTES:
             refusals.append(
                 _refusal(

@@ -89,7 +89,7 @@ NEVER_PACKED = {
     "logs/dbt.log": "log\n",
     "dbt_packages/pkg/macros/x.sql": "select 1\n",
     ".user.yml": "id: 1\n",
-    "models/.scratch.sql": "select 2\n",
+    "models/.DS_Store": "junk\n",
 }
 
 
@@ -338,6 +338,25 @@ class TestApplyRefusesAChangedCheckout:
             reset_bound_projects(token)
         assert "does not pack" in exc.value.context["error"]
         _check_bound_project("transform", ws / "dbt")  # no binding: nothing to check
+
+    def test_a_bundle_that_packs_no_project_is_refused(self, ws: Path) -> None:
+        """A bundle made before projects were packed binds no dbt code: refused, not run."""
+        import yaml
+
+        from fluid_build.forge.core.bundle import build_bundle_tgz, make_bundle_source
+
+        out = ws / "runtime" / "bundle.tgz"
+        source = make_bundle_source(ws / "contract.fluid.yaml", out)
+        contract = yaml.safe_load(CONTRACT)
+        build_bundle_tgz(contract, out, contract_id=contract["id"], source=source)
+        _plan(out)
+        with pytest.raises(CLIError) as exc:
+            _apply()
+        assert exc.value.event == "apply_plan_digest_bundle_mismatch"
+        assert "packs no dbt project for the dbt builds ['transform']" in (
+            exc.value.context["error"]
+        )
+        assert _dbt_runs(ws) == []
 
     def test_the_binding_ends_with_the_apply(self, ws: Path) -> None:
         from fluid_build.build_runners.dbt.project_files import bound_project

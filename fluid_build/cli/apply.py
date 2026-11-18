@@ -1095,9 +1095,10 @@ def _bind_dbt_projects(
     dbt runner will read it (``resolve_dbt_project_path`` from the source contract
     ``locate`` returns, where the runner anchors ``subject``), and the files dbt
     reads there must be those bytes; and a dbt build the bundle packs nothing for
-    is refused too. A bundle that packs no project (one made before projects were
-    packed) binds none, and nothing is looked up for it. Raises
-    :class:`PlanBindingError` ``bundle-mismatch`` with what differs.
+    is refused too, so a bundle made before projects were packed is refused for a
+    contract with a dbt build. A contract without one binds nothing, and nothing is
+    looked up for it. Raises :class:`PlanBindingError` ``bundle-mismatch`` with what
+    differs.
 
     The bound files are then set for this run, so the dbt runner checks the
     directory it is about to run again, just before dbt starts
@@ -1113,8 +1114,6 @@ def _bind_dbt_projects(
     from ..forge.core.plan_digest import PlanBindingError
 
     trees = read_bundle_dbt_trees(bundle_path)
-    if not trees:
-        return
     builds = {
         build.get("id"): build
         for build in contract.get("builds") or []
@@ -1125,8 +1124,11 @@ def _bind_dbt_projects(
         raise PlanBindingError(
             "bundle-mismatch",
             f"{bundle_path} packs no dbt project for the dbt builds {unpacked}, so their dbt "
-            "code is not bound. Re-run ``fluid bundle`` and ``fluid plan``.",
+            "code is not bound (a bundle made before fluid bundle packed dbt projects packs "
+            "none). Re-run ``fluid bundle`` and ``fluid plan``.",
         )
+    if not trees:
+        return
     anchor, why = locate()
     bound: Dict[str, BoundProject] = {}
     for build_id, files in sorted(trees.items()):
@@ -1192,10 +1194,12 @@ def _verify_bundle_dbt_projects(args, contract: Dict[str, Any], logger: logging.
     if not is_bundle_path(str(args.contract)):
         return
     from fluid_build._contract_loader import resolve_source_contract
+    from fluid_build.build_runners.dbt.project_files import binds_dbt_project
 
     from ..forge.core.bundle import read_bundle_dbt_trees
 
-    if not read_bundle_dbt_trees(Path(args.contract)):
+    dbt_builds = [b for b in contract.get("builds") or [] if binds_dbt_project(b)]
+    if not dbt_builds and not read_bundle_dbt_trees(Path(args.contract)):
         return
     if getattr(args, "no_verify_plan_binding", False):
         logger.warning(
