@@ -154,22 +154,32 @@ def _db(statements: List[str]) -> Any:
 def _billing_db() -> Any:
     return _db(
         [
-            "CREATE TABLE invoices (invoice_id VARCHAR, contract_id VARCHAR, net DECIMAL(12,2), "
-            "tax_rate DECIMAL(5,4), gross DECIMAL(12,2), billed_base_fee DECIMAL(12,2), "
-            "issue_date DATE, due_date DATE, status VARCHAR)",
+            (
+                "CREATE TABLE invoices (invoice_id VARCHAR, contract_id VARCHAR, net DECIMAL(12,2), "
+                + "tax_rate DECIMAL(5,4), gross DECIMAL(12,2), billed_base_fee DECIMAL(12,2), "
+                + "issue_date DATE, due_date DATE, status VARCHAR)"
+            ),
             # i1 holds everything; i2 is off by a cent, due before issue and links to a key
             # two contracts hold; i3 has a NULL key and NULL dates; i4 links to no contract.
-            "INSERT INTO invoices VALUES "
-            "('i1','c1',100,0.2,120,10,'2026-01-01','2026-02-01','A'),"
-            "('i2','c2',100,0.2,121,0,'2026-03-01','2026-02-01','B'),"
-            "('i3',NULL,1,0,1,NULL,NULL,'2026-01-01','A'),"
-            "('i4','c9',1,0,1,0,'2026-01-01','2026-01-02','A')",
-            "CREATE TABLE invoice_lines (line_id VARCHAR, invoice_id VARCHAR, kind VARCHAR, "
-            "amount DECIMAL(12,2))",
-            "INSERT INTO invoice_lines VALUES ('l1','i1','base_fee',10),('l2','i1','other',5),"
-            "('l3','i2','other',3)",
-            "CREATE TABLE contracts (contract_id VARCHAR, monthly_fee DECIMAL(12,2), "
-            "status VARCHAR)",
+            (
+                "INSERT INTO invoices VALUES "
+                + "('i1','c1',100,0.2,120,10,'2026-01-01','2026-02-01','A'),"
+                + "('i2','c2',100,0.2,121,0,'2026-03-01','2026-02-01','B'),"
+                + "('i3',NULL,1,0,1,NULL,NULL,'2026-01-01','A'),"
+                + "('i4','c9',1,0,1,0,'2026-01-01','2026-01-02','A')"
+            ),
+            (
+                "CREATE TABLE invoice_lines (line_id VARCHAR, invoice_id VARCHAR, kind VARCHAR, "
+                + "amount DECIMAL(12,2))"
+            ),
+            (
+                "INSERT INTO invoice_lines VALUES ('l1','i1','base_fee',10),('l2','i1','other',5),"
+                + "('l3','i2','other',3)"
+            ),
+            (
+                "CREATE TABLE contracts (contract_id VARCHAR, monthly_fee DECIMAL(12,2), "
+                + "status VARCHAR)"
+            ),
             "INSERT INTO contracts VALUES ('c1',10,'A'),('c2',5,'B'),('c2',5,'B')",
         ]
     )
@@ -279,8 +289,10 @@ def test_a_dependency_is_counted_by_g3_per_direction() -> None:
             "CREATE TABLE g (gid VARCHAR, gname VARCHAR)",
             # g1: a, a, b, NULL -> keeps the two a rows: 2 violating (a NULL to is a value).
             # g2: x, y (a tie) -> 1. A NULL key is not covered forward.
-            "INSERT INTO g VALUES ('g1','a'),('g1','a'),('g1','b'),('g1',NULL),"
-            "('g2','x'),('g2','y'),(NULL,'a')",
+            (
+                "INSERT INTO g VALUES ('g1','a'),('g1','a'),('g1','b'),('g1',NULL),"
+                + "('g2','x'),('g2','y'),(NULL,'a')"
+            ),
         ]
     )
     counts = _run(db, contract)
@@ -349,8 +361,10 @@ def test_summaries_count_min_max_and_if_none() -> None:
             "CREATE TABLE p (pid VARCHAR, n INTEGER, first VARCHAR, top DECIMAL(8,2))",
             "INSERT INTO p VALUES ('p1',2,'B',5),('p2',0,'none',NULL),('p3',1,'x',1)",
             "CREATE TABLE c (cid VARCHAR, pid VARCHAR, name VARCHAR, v DECIMAL(8,2))",
-            "INSERT INTO c VALUES ('1','p1','B',5),('2','p1','a',500),('3','p3','y',2),"
-            "('4',NULL,'z',1)",
+            (
+                "INSERT INTO c VALUES ('1','p1','B',5),('2','p1','a',500),('3','p3','y',2),"
+                + "('4',NULL,'z',1)"
+            ),
         ]
     )
     counts = _run(db, contract)
@@ -405,14 +419,20 @@ def test_a_shared_attribute_follows_its_route_without_fan_out() -> None:
             "CREATE TABLE accounts (account_id VARCHAR, segment VARCHAR)",
             "INSERT INTO accounts VALUES ('a1','SMB'),('a2','ENT'),('a3','X'),('a3','Y')",
             "CREATE TABLE contracts (contract_id VARCHAR, account_id VARCHAR)",
-            "INSERT INTO contracts VALUES ('c1','a1'),('c2','a2'),('c3',NULL),('c4','a3'),"
-            "('c5','a1'),('c5','a2')",
-            "CREATE TABLE invoices (invoice_id VARCHAR, contract_id VARCHAR, "
-            "customer_segment VARCHAR)",
+            (
+                "INSERT INTO contracts VALUES ('c1','a1'),('c2','a2'),('c3',NULL),('c4','a3'),"
+                + "('c5','a1'),('c5','a2')"
+            ),
+            (
+                "CREATE TABLE invoices (invoice_id VARCHAR, contract_id VARCHAR, "
+                + "customer_segment VARCHAR)"
+            ),
             # i1 holds, i2 differs, i3's contract has no account, i4's account is ambiguous,
             # i5's contract is ambiguous, i6 has no contract, i7's contract does not exist.
-            "INSERT INTO invoices VALUES ('i1','c1','SMB'),('i2','c2','SMB'),('i3','c3','SMB'),"
-            "('i4','c4','X'),('i5','c5','SMB'),('i6',NULL,'SMB'),('i7','c9','SMB')",
+            (
+                "INSERT INTO invoices VALUES ('i1','c1','SMB'),('i2','c2','SMB'),('i3','c3','SMB'),"
+                + "('i4','c4','X'),('i5','c5','SMB'),('i6',NULL,'SMB'),('i7','c9','SMB')"
+            ),
         ]
     )
     counts = _run(db, contract)
@@ -462,8 +482,10 @@ def test_placeholders_are_counted_and_exempt_from_formats() -> None:
         [
             "CREATE TABLE products (code VARCHAR, alt VARCHAR)",
             # TBD_x does not start with the prefix TBD_% (SUBSTR, not LIKE): % is literal.
-            "INSERT INTO products VALUES ('P00001',''),('XXXXX',''),('TBD_%1',''),('TBD_x',''),"
-            "(NULL,'')",
+            (
+                "INSERT INTO products VALUES ('P00001',''),('XXXXX',''),('TBD_%1',''),('TBD_x',''),"
+                + "(NULL,'')"
+            ),
         ]
     )
     assert _run(db, contract)["code.placeholders"] == (5, 2, 40.0)
