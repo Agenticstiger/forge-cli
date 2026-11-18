@@ -173,13 +173,14 @@ def _add_artifact_options(g: argparse._ArgumentGroup) -> None:
     )
     g.add_argument(
         "--require-artifacts",
+        action="append",
         default=None,
         metavar="LIST",
         help=(
             "Stage 3 fails unless this run writes each of these, comma-separated: odcs (one "
             "file per exposes[] port), odps-bitol (the product), opds, policies, schedule. "
             "Files an earlier run left never count. Needs stage 3 in this invocation, with "
-            "every key in --emit."
+            "every key in --emit. Repeatable."
         ),
     )
 
@@ -457,6 +458,8 @@ def _prepare(
     if not selected:
         flagged, _ = select()  # what the flags alone left to run
         if flagged:  # all of it switched off: a CI step whose stage is off
+            # ...unless the step asked for artifacts: a switched-off stage 3 writes none.
+            st.check_required_artifacts(selected, not_selected, opts)
             raise _NothingToRun(flagged)
         raise st.ShipUsageError("no stage left to run (check --stage, --until and --skip-stage)")
     if 10 in selected and not st.dry_run_applied_nothing(opts):  # stage 10 will publish

@@ -346,6 +346,43 @@ def test_a_run_stage_switch_that_turns_stage_three_off_is_refused(
     assert f"{st.STAGE_TOGGLES[3]}=false" in caplog.text
 
 
+def test_a_per_stage_step_whose_stage_three_is_switched_off_is_refused(
+    work: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``--stage 3`` alone with stage 3 switched off has nothing to run (exit 0),
+    except when it asked for artifacts: then nothing writes them."""
+    fake = _install(monkeypatch, FakeStages(dict(_ALL_OUTPUTS)))
+    monkeypatch.setenv(st.STAGE_TOGGLES[3], "false")
+    assert _ship(["--stage", "3"]) == 0
+    assert _ship(["--stage", "3", *_KEYS]) == 2
+    assert fake.calls == []
+    assert f"it does not run ({st.STAGE_TOGGLES[3]}=false)" in caplog.text
+
+
+def test_every_use_of_the_flag_counts(work: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    opts = st.resolve_options(
+        _parse(["--require-artifacts", "schedule", "--require-artifacts", "odcs"]),
+        "contract.fluid.yaml",
+        {},
+    )
+    assert opts.require_artifacts == ("odcs", "schedule")
+    _install(monkeypatch, FakeStages(dict(_ALL_OUTPUTS)))
+    assert (
+        _ship(
+            [
+                "--until",
+                "artifacts",
+                "--require-artifacts",
+                "odcs",
+                "--require-artifacts",
+                "schedule",
+            ]
+        )
+        == 1
+    )
+    assert "schedule: stage 3 wrote no schedule file" in str(_stage3(work)["failure_reason"])
+
+
 def test_a_required_key_left_out_of_emit_is_refused(
     work: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

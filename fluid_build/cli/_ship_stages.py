@@ -288,10 +288,12 @@ def resolve_options(args: object, contract: str, env: Mapping[str, str]) -> Ship
 
 
 def _resolve_required_artifacts(flag: object) -> Tuple[str, ...]:
-    """``--require-artifacts odcs,odps-bitol`` -> the keys in canonical order."""
+    """``--require-artifacts odcs,odps-bitol`` (repeatable: every use counts) ->
+    the keys in canonical order."""
     if flag is None:
         return ()
-    keys = {part.strip() for part in str(flag).split(",") if part.strip()}
+    values = flag if isinstance(flag, (list, tuple)) else [flag]
+    keys = {part.strip() for value in values for part in str(value).split(",") if part.strip()}
     if not keys:
         raise ShipUsageError("--require-artifacts names no artifact")
     unknown = sorted(keys - set(REQUIRABLE_ARTIFACTS))
@@ -606,7 +608,10 @@ def _validate_artifacts(a: StageAction, o: ShipOptions, ws: Workspace) -> None:
                 f"{ARTIFACTS_DIR} does not exist, but stage 3 generate-artifacts was to write "
                 "it; pass --no-generate-artifacts when this pipeline generates no artifacts"
             )
-        a.skip_reason = f"{ARTIFACTS_DIR} does not exist (--no-generate-artifacts)"
+        a.skip_reason = (
+            f"{ARTIFACTS_DIR} does not exist (stage 3 is off: --no-generate-artifacts "
+            f"or {STAGE_TOGGLES[3]}=false)"
+        )
         return
     a.argv = [
         "validate-artifacts",
@@ -957,7 +962,10 @@ def _key_problems(key: str, root: Path, files: Mapping[str, object]) -> List[str
     if key == "policies":
         why = _unwritten(root, files, "policy/bindings.json")
         return [f"policies: {POLICY_BINDINGS} {why}"] if why else []
-    what = "schedule file (the contract declares no orchestration.engine and no scheduled build)"
+    what = (
+        "schedule file (orchestration.engine is none, or it is unset and no build has a "
+        "schedule trigger)"
+    )
     return _one_or_more(root, files, key, what, lambda rel: rel.startswith("schedule/"))
 
 
