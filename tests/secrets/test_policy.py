@@ -19,6 +19,7 @@ from fluid_build.secrets.policy import (
     check_prefix,
     check_scheme,
     check_stage,
+    connection_hosts,
     enabled_schemes,
     locator_prefixes,
     prefix_matches,
@@ -405,3 +406,76 @@ def test_variable_allowed_ignores_non_env_grants():
 def test_allowlist_lists_env_entries_only():
     environ = {ALLOWLIST_ENV: f"A, B@{REMOTE}, vault://kv/a#f@{REMOTE}, C@, aws-sm://n@*"}
     assert allowlist(environ) == [("A", None), ("B", REMOTE)]
+
+
+# ── a host that names no host ────────────────────────────────────────────────
+
+
+def _any_host_entry(ref_text: str) -> str:
+    ref = parse_secret_ref(ref_text)
+    return ref.locator if ref.scheme == "env" else f"{ref.canonical}@*"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("ref_text", ANY_SCHEME_REFS)
+@pytest.mark.parametrize("blank", ["", "   ", None])
+def test_a_blank_host_is_a_destination_the_policy_cannot_clear(ref_text, blank):
+    """A client given no host picks one: libpq reads PGHOST, which a project .env may set.
+
+    Seen live on 0.31.0 and 0.32.0: an unset ``{{ env.PGHOST }}`` rendered to
+    ``""``, the policy found "none to judge", and the duckdb and dlt runners sent
+    the secret to the PGHOST a project .env had set.
+    """
+    with pytest.raises(AcquisitionSecretPolicyError) as info:
+        refuse_unless_allowed(ref_text, connection={"host": blank}, environ={})
+    assert "connection.host is empty" in info.value.what
+    assert "PGHOST" in info.value.why
+    entry = _any_host_entry(ref_text)
+    assert f'{ALLOWLIST_ENV}="{entry}"' in info.value.fix
+    # the entry it names is the only kind that admits it: any host
+    refuse_unless_allowed(ref_text, connection={"host": blank}, environ={ALLOWLIST_ENV: entry})
+    assert connection_hosts({"host": blank}) == [None]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "connection",
+    [
+        {"host": "", "uri": "postgresql://localhost/db"},
+        {"host": "", "uri": "s3://bucket/key"},
+        {"host": None, "connection_string": "mongodb://127.0.0.1:27017/db"},
+    ],
+    ids=["loopback-uri-decoy", "object-store-beside", "null-host"],
+)
+def test_no_other_field_vouches_for_a_blank_host(connection):
+    """The duckdb and dlt sources read ``host`` alone, so a loopback uri cannot clear it."""
+    with pytest.raises(AcquisitionSecretPolicyError) as info:
+        refuse_unless_allowed("env://PG", connection=connection, environ={})
+    assert "connection.host is empty" in info.value.what
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("host", [5432, ["db.example.com"], {"name": "x"}, b"localhost", True])
+def test_a_host_that_is_not_a_string_cannot_be_cleared(host):
+    with pytest.raises(AcquisitionSecretPolicyError) as info:
+        refuse_unless_allowed("env://PG", connection={"host": host}, environ={})
+    assert "could not be determined" in info.value.what
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "connection",
+    [{"uri": ""}, {"uri": None}, {"endpoint": "  "}, {"uri": "", "server": None}],
+)
+def test_empty_destination_fields_are_not_none_to_judge(connection):
+    """Only an object store has no host to judge; empty fields leave the client to choose."""
+    with pytest.raises(AcquisitionSecretPolicyError) as info:
+        refuse_unless_allowed("env://PG", connection=connection, environ={})
+    assert "could not be determined" in info.value.what
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("uri", [5, ["s3://b"]])
+def test_a_destination_field_that_is_not_a_string_cannot_be_cleared(uri):
+    with pytest.raises(AcquisitionSecretPolicyError):
+        refuse_unless_allowed("env://PG", connection={"uri": uri}, environ={})

@@ -23,6 +23,7 @@ from typing import Any, Dict, List
 import pytest
 
 from fluid_build.credentials.host_db_env import (
+    ATTACH_HOST_ENV,
     HOST_CREDENTIAL_ENV,
     host_credential_env_suppressed,
 )
@@ -166,3 +167,58 @@ def test_a_sqlite_source_needs_no_window(monkeypatch: pytest.MonkeyPatch) -> Non
     with pytest.raises(Exception):
         runner._attach_external_databases(_Con(), _Ctx())
     assert not any("ATTACH" in c for c in calls), calls
+
+
+def test_the_acquisition_attach_hides_where_libpq_would_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DSN with no host makes libpq take PGHOST or PGHOSTADDR, which no policy judged.
+
+    Seen live on 0.32.0 with DuckDB's postgres extension: a connection with no
+    host beside a loopback ``uri`` (which this DSN ignores) passed the secret
+    policy, and libpq sent the password to the PGHOST a project .env had set.
+    """
+    from fluid_build.build_runners.duckdb import runner as duckdb_runner
+
+    monkeypatch.setenv("PGHOST", "project-chosen.example")
+    monkeypatch.setenv("PGHOSTADDR", "203.0.113.7")
+    seen: Dict[str, Any] = {}
+
+    def spy(_con: Any, statement: str, password: Any) -> None:
+        seen["PGHOST"] = os.environ.get("PGHOST")
+        seen["PGHOSTADDR"] = os.environ.get("PGHOSTADDR")
+        seen["statement"] = statement
+
+    monkeypatch.setattr(duckdb_runner, "_attach_with_password_masked", spy)
+
+    class _Conn:
+        raw = {"user": "alice", "database": "sales", "password": CONTRACT_PASSWORD}
+
+    class _Source:
+        kind = "postgres"
+        connection = _Conn()
+
+    class _Ctx:
+        build_id = "ingest"
+        source = _Source()
+
+    class _Con:
+        def execute(self, _sql: str) -> None:
+            return None
+
+    duckdb_runner.DuckdbRunner()._attach_external_databases(_Con(), _Ctx())
+
+    assert "host=" not in seen["statement"]
+    assert seen["PGHOST"] is None and seen["PGHOSTADDR"] is None
+    assert os.environ["PGHOST"] == "project-chosen.example"
+    assert os.environ["PGHOSTADDR"] == "203.0.113.7"
+
+
+def test_the_discover_window_leaves_pghost_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """In `fluid init --discover` the operator, not a contract, names the server."""
+    monkeypatch.setenv("PGHOST", "operator.example")
+    with host_credential_env_suppressed():
+        assert os.environ["PGHOST"] == "operator.example"
+    with host_credential_env_suppressed(also=ATTACH_HOST_ENV):
+        assert "PGHOST" not in os.environ
+    assert os.environ["PGHOST"] == "operator.example"

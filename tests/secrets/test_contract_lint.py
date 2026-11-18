@@ -218,3 +218,10 @@ def test_validate_fails_closed_when_the_lint_itself_crashes(monkeypatch):
     validate_cmd._check_secret_refs(result, {})
     assert result.is_valid is False
     assert any("NOT checked" in error for error in result.errors)
+
+
+@pytest.mark.unit
+def test_a_blank_host_is_refused_at_validate_as_at_apply():
+    (finding,) = lint_secret_refs(_conn(secretRef="env://PG", host=""), {})
+    assert isinstance(finding.error, AcquisitionSecretPolicyError)
+    assert "connection.host is empty" in finding.error.what

@@ -401,6 +401,16 @@ def _port_is_readable(port: Any) -> bool:
     return False
 
 
+def _blank(raw: Any) -> bool:
+    """``None``, or a string of whitespace only: a field that names nothing."""
+    return raw is None or (isinstance(raw, str) and not raw.strip())
+
+
+def _is_object_store_uri(text: str) -> bool:
+    """Whether ``text`` is an object-store URI, whose authority is a bucket, not a host."""
+    return "://" in text and text.partition("://")[0].strip().lower() in _OBJECT_STORE_SCHEMES
+
+
 def connection_hosts(connection: Mapping[str, Any]) -> List[Optional[str]]:
     """Every destination this connection block could send a credential to.
 
@@ -413,20 +423,31 @@ def connection_hosts(connection: Mapping[str, Any]) -> List[Optional[str]]:
     not one we can clear. An object-store URI (``s3://bucket/...``) is skipped
     rather than reported as a host: its authority is a bucket.
 
+    A ``host`` that is present but names no host (empty, ``null``, not a
+    string) is ``None`` too, not the absence of a destination: a database
+    client given no host picks one itself, and libpq reads ``PGHOST``, which a
+    project dotenv file may set (``credentials/protected_env.py`` pairs it only
+    with ``PGPASSWORD``). An unset ``{{ env.PGHOST }}`` renders to exactly that.
+    Any other destination field that is empty names nothing and is skipped.
+
     Every host of a host list counts (:func:`_authority_hosts`), and a ``port``
     that is not a port number adds a ``None`` (:func:`_port_is_readable`).
     """
     out: List[Optional[str]] = []
     for field_name in _HOST_FIELDS:
-        raw = connection.get(field_name)
-        if raw is None or not isinstance(raw, (str, bytes)) or str(raw).strip() == "":
+        if field_name not in connection:
             continue
-        text = str(raw).strip()
+        raw = connection[field_name]
         if field_name == "host":
-            out.append(text)
+            out.append(raw.strip() if isinstance(raw, str) and raw.strip() else None)
             continue
-        scheme = text.partition("://")[0].strip().lower() if "://" in text else ""
-        if scheme in _OBJECT_STORE_SCHEMES:
+        if _blank(raw):
+            continue
+        if not isinstance(raw, str):
+            out.append(None)
+            continue
+        text = raw.strip()
+        if _is_object_store_uri(text):
             continue
         try:
             parsed = urlsplit(text if "//" in text else f"//{text}")
@@ -528,27 +549,79 @@ def _suggested_entry(ref: SecretRef, host: Optional[str]) -> str:
     return f"{ref.canonical}@{host}" if host else f"{ref.canonical}@*"
 
 
+def _names_an_object_store(connection: Mapping[str, Any]) -> bool:
+    """Whether a destination field of ``connection`` is an object-store URI."""
+    return any(
+        isinstance(connection.get(field_name), str)
+        and _is_object_store_uri(connection[field_name].strip())
+        for field_name in _HOST_FIELDS
+        if field_name != "host"
+    )
+
+
 def _destination_targets(
     connection: Optional[Mapping[str, Any]], host: Optional[str]
 ) -> Optional[List[Optional[str]]]:
-    """Every destination to judge, or ``None`` when the connection has none to judge."""
+    """Every destination to judge, or ``None`` when the connection has none to judge.
+
+    ``None`` only for a connection whose one destination is an object store (the
+    known gap :func:`refuse_unless_allowed` names). Fields that are present but
+    empty are not that: they leave the client to pick its host, so the result is
+    a destination this policy cannot clear, as for a connection naming none.
+    """
     targets: List[Optional[str]] = []
     if connection is not None:
         targets.extend(connection_hosts(connection))
-        if not targets and any(field_name in connection for field_name in _HOST_FIELDS):
+        if not targets and _names_an_object_store(connection):
             return None
     if host is not None or not targets:
         targets.append(host)
     return targets
 
 
+def _what_sent(parsed: SecretRef) -> str:
+    if parsed.scheme == "env":
+        return f"environment variable {parsed.locator!r}"
+    return f"secret {parsed.canonical}"
+
+
+#: Where an allowlist entry must be set, for the fix of every destination refusal.
+_OPERATOR_ONLY = (
+    "the OPERATOR environment (a shell or CI variable, not a project .env, which is "
+    "ignored for this setting)"
+)
+
+
+def _host_is_blank(connection: Mapping[str, Any]) -> bool:
+    """Whether ``connection`` has a ``host`` that is empty or ``null`` (not one left out)."""
+    return "host" in connection and _blank(connection["host"])
+
+
+def _blank_host_refusal(parsed: SecretRef) -> AcquisitionSecretPolicyError:
+    """The refusal for a connection whose ``host`` is present and names no host."""
+    return AcquisitionSecretPolicyError(
+        what=(
+            f"the contract would send {_what_sent(parsed)} as a credential to a host the "
+            "client picks itself, because connection.host is empty"
+        ),
+        why=(
+            "A database client given no host picks one on its own: libpq reads PGHOST, "
+            "which a project .env file may set. So this check cannot tell where the value "
+            "goes, and a destination it cannot read is not one it can clear."
+        ),
+        fix=(
+            "Name the host in connection.host. A placeholder such as {{ env.PGHOST }} "
+            "renders empty when the variable is not set where fluid apply runs, so set it "
+            f"there. To send the value to any host instead, set it in {_OPERATOR_ONLY}: "
+            f'{ALLOWLIST_ENV}="{_suggested_entry(parsed, None)}".'
+        ),
+        doc=doc_url("secrets"),
+    )
+
+
 def _destination_refusal(parsed: SecretRef, target: Optional[str]) -> AcquisitionSecretPolicyError:
     where = f"host {target!r}" if target else "a host that could not be determined"
-    what_sent = (
-        f"environment variable {parsed.locator!r}"
-        if parsed.scheme == "env"
-        else f"secret {parsed.canonical}"
-    )
+    what_sent = _what_sent(parsed)
     entry = _suggested_entry(parsed, target)
     any_host = _suggested_entry(parsed, None)
     return AcquisitionSecretPolicyError(
@@ -560,8 +633,7 @@ def _destination_refusal(parsed: SecretRef, target: Optional[str]) -> Acquisitio
             "destination that leaves this machine does."
         ),
         fix=(
-            "If this is intended, set it in the OPERATOR environment (a shell or CI "
-            f"variable, not a project .env, which is ignored for this setting): "
+            f"If this is intended, set it in {_OPERATOR_ONLY}: "
             f'{ALLOWLIST_ENV}="{entry}" for that host only, or '
             f'{ALLOWLIST_ENV}="{any_host}" for any host. A host written with a port '
             "never matches, so leave the port off."
@@ -585,9 +657,11 @@ def refuse_unless_allowed(
     ``connection`` is the preferred argument: EVERY destination it carries has
     to clear, so a decoy loopback field cannot mask a remote sibling. ``host``
     is for call sites that know their one destination directly (an
-    orchestrator URL). A connection whose every destination field names an
-    object store has no host to judge, and passes: that credential is not
-    covered here (a known gap).
+    orchestrator URL). A connection whose only destination is an object store
+    has no host to judge, and passes: that credential is not covered here (a
+    known gap). A ``host`` that is present but empty is judged as a host this
+    policy cannot read (:func:`connection_hosts`), so it passes only under an
+    entry for any host.
     """
     parsed = parse_secret_ref(ref) if isinstance(ref, str) else ref
     targets = _destination_targets(connection, host)
@@ -597,4 +671,6 @@ def refuse_unless_allowed(
     for target in targets:
         if is_loopback(target) or _grants_allow(parsed, target, grants):
             continue
+        if target is None and connection is not None and _host_is_blank(connection):
+            raise _blank_host_refusal(parsed)
         raise _destination_refusal(parsed, target)

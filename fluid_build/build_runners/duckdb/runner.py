@@ -47,7 +47,7 @@ from fluid_build.api.runner import (
 )
 from fluid_build.api.schema import SchemaFingerprint
 from fluid_build.api.source import AcquisitionMode
-from fluid_build.credentials.host_db_env import host_credential_env_suppressed
+from fluid_build.credentials.host_db_env import ATTACH_HOST_ENV, host_credential_env_suppressed
 from fluid_build.providers._duckdb_compat import first_row
 from fluid_build.providers._duckdb_sandbox import (
     DuckDBAllowlist,
@@ -883,8 +883,10 @@ class DuckdbRunner:
             # The contract chose this host, and libpq / mysql_scanner would
             # read this machine's credentials for it (see host_db_env). The
             # declared DSN still carries its own, so a real source is
-            # unaffected.
-            with host_credential_env_suppressed():
+            # unaffected. PGHOST and PGHOSTADDR go too: the DSN leaves out an
+            # empty host, and libpq would take one from them that the secret
+            # policy never judged (ATTACH_HOST_ENV).
+            with host_credential_env_suppressed(also=ATTACH_HOST_ENV):
                 _attach_with_password_masked(con, attach_sql, conn.get("password"))
         elif kind == "sqlite":
             conn = dict(ctx.source.connection.raw)
