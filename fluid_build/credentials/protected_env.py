@@ -71,7 +71,11 @@ credentials, which is what they are for. They may not carry a setting that:
 
 Credentials (API keys, tokens, passwords) stay loadable: an API key from
 ``.env`` can never be paired with a FLUID endpoint, proxy or SDK config file
-from ``.env``, because those are protected.
+from ``.env``, because those are protected. One credential yields to the
+operator's instead: a project's ``BAO_TOKEN`` / ``VAULT_TOKEN`` does not load
+while the operator has an OpenBao or Vault token of their own
+(:func:`refused_project_vault_tokens`), since a reader takes the first token
+that is set.
 
 Third-party endpoints (an LLM SDK's base URL, a warehouse host or account, a
 driver's port) follow a pairing rule instead of a ban, because a project that
@@ -164,7 +168,10 @@ __all__ = [
     "PROTECTED_ENV_KEYS",
     "PROTECTED_ENV_PREFIXES",
     "UNLISTED_LLM_ENDPOINTS",
+    "VAULT_TOKEN_NAMES",
     "is_protected_env_key",
+    "operator_vault_token_file",
+    "refused_project_vault_tokens",
     "unpaired_endpoints",
 ]
 
@@ -1630,6 +1637,80 @@ def operator_pgpass_for_any_host(operator: Mapping[str, Optional[str]]) -> Optio
     if any(line.startswith("*:") for line in lines):
         return str(path)
     return None
+
+
+#: OpenBao's and Vault's token variables, in the order readers take them: OpenBao
+#: reads ``BAO_*`` and falls back to ``VAULT_*``, and forge's vault resolver
+#: (``secrets/_vault.py::token_for``) does the same, then the token helper's file.
+VAULT_TOKEN_NAMES: Tuple[str, ...] = ("BAO_TOKEN", "VAULT_TOKEN")
+
+
+def operator_vault_token_file(operator: Mapping[str, Optional[str]]) -> Optional[str]:
+    """The operator's token helper file, ``~/.vault-token``, when it holds a token.
+
+    ``bao login`` and ``vault login`` write it. Found and checked as forge's
+    vault resolver reads it (``secrets/_vault.py::_token_file``): under the home
+    directory (``HOME``, ``USERPROFILE`` on Windows, from the operator's
+    environment), a regular file and not a link, owned by this user, not blank.
+    """
+    values = {k.strip().upper(): v for k, v in operator.items()}
+    home = values.get("USERPROFILE" if os.name == "nt" else "HOME")
+    try:
+        path = (Path(str(home)) if home else Path.home()) / ".vault-token"
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        getuid = getattr(os, "getuid", None)
+        if getuid is not None and info.st_uid != getuid():
+            return None
+        if not path.read_text(encoding="utf-8").strip():
+            return None
+    except (OSError, RuntimeError, UnicodeDecodeError):
+        return None
+    return str(path)
+
+
+def refused_project_vault_tokens(
+    project: Mapping[str, Optional[str]], operator: Mapping[str, Optional[str]]
+) -> Dict[str, str]:
+    """The Vault token variables in ``project`` that may not load, with the token that wins.
+
+    A reader takes the first token that is set, so a project file's
+    ``BAO_TOKEN`` was used in place of the operator's exported ``VAULT_TOKEN``
+    or their ``bao login``, to read the operator's own store: its address
+    (``BAO_ADDR`` / ``VAULT_ADDR``) is protected, so a project token only picks
+    which identity reads it. The operator's token wins (founder decision,
+    2026-11-18): while the operator has a ``BAO_TOKEN``, a ``VAULT_TOKEN`` or a
+    token helper file, a project file's ``BAO_TOKEN`` and ``VAULT_TOKEN`` do not
+    load. A project still brings its own when the operator has none, as for a
+    local dev store. The tokens forge obtains itself
+    (``FLUID_VAULT_WRAPPED_TOKEN``, ``FLUID_VAULT_JWT_ROLE``) are protected and
+    are read first in any case.
+
+    ``project`` and ``operator`` are as in :func:`unpaired_endpoints`. An
+    operator value equal to the project file's own value for that name is the
+    project's earlier export (a second load in one run), not the operator's
+    token. Returns each refused name, as the project file spells it, with what
+    the operator holds: a variable name or the token file's path.
+    """
+    operator_values = {k.strip().upper(): v for k, v in operator.items()}
+    supplied = {k.strip().upper(): v for k, v in project.items() if v}
+    theirs = next(
+        (
+            name
+            for name in VAULT_TOKEN_NAMES
+            if (operator_values.get(name) or "").strip()
+            and supplied.get(name) != operator_values.get(name)
+        ),
+        None,
+    ) or operator_vault_token_file(operator)
+    if theirs is None:
+        return {}
+    return {
+        key: theirs
+        for key, value in project.items()
+        if value and value.strip() and key.strip().upper() in VAULT_TOKEN_NAMES
+    }
 
 
 def _pgpass_pairing(name: str) -> Tuple[str, ...]:
