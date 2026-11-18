@@ -562,3 +562,11 @@ def test_postgres_rounds_a_quotient_or_a_float_in_numeric() -> None:
 
 def test_athena_divides_with_eighteen_places_at_least() -> None:
     assert "AS DECIMAL(38, 18)) / NULLIF(" in render("net / 3", {"net": "decimal(12,2)"}, "athena")
+
+
+def test_bigquery_half_even_stays_exact_and_postgres_rounds_a_float_in_numeric() -> None:
+    sql = render("ROUND(m, 2, 'HALF_TO_EVEN')", {"m": "decimal(12,4)"}, "bigquery")
+    assert "BIGNUMERIC '0.5'" in sql and "BIGNUMERIC '0.01'" in sql and " 0.5" not in sql
+    parses(sql, "bigquery")
+    float_round = render("ROUND(f, 2)", {"f": "double"}, "postgres")
+    assert float_round.startswith("ROUND(CAST(") and "AS NUMERIC), 2)" in float_round

@@ -91,6 +91,14 @@ def exact_number_type(dialect: str, scale: Optional[int]) -> str:
     return f"{name}(38, {scale})"
 
 
+def number_literal(dialect: str, text: str) -> str:
+    """An exact number literal: BigQuery reads ``1.15`` as FLOAT64, which turns NUMERIC
+    arithmetic binary, so a fraction is ``BIGNUMERIC '1.15'`` there."""
+    if dialect == "bigquery" and "." in text:
+        return f"BIGNUMERIC {sql_literal(dialect, text)}"
+    return text
+
+
 def column_reader(dialect: str, alias: str = "t") -> ColumnSql:
     """A ``column_sql`` that reads the expose's columns from ``alias`` and each
     relationship's target from an alias named like the relationship."""
@@ -241,10 +249,7 @@ class _Renderer:
         if isinstance(node, _PREDICATES):
             return self.truth(node)
         if isinstance(node, n.Number):
-            if self.dialect == "bigquery" and "." in node.text:
-                # BigQuery reads 1.15 as FLOAT64, which turns NUMERIC arithmetic binary.
-                return f"BIGNUMERIC {sql_literal(self.dialect, node.text)}"
-            return node.text
+            return number_literal(self.dialect, node.text)
         if isinstance(node, n.String):
             return sql_literal(self.dialect, node.value)
         if isinstance(node, n.Bool):
@@ -307,6 +312,9 @@ class _Renderer:
     def round(self, node: n.Round) -> str:
         value = self.value(node.arg)
         arg = self.types.get(id(node.arg))
+        if self.dialect == "postgres" and (arg is None or arg.scale is None):
+            # PostgreSQL has no round(double precision, integer): a float rounds in NUMERIC.
+            value = f"CAST({value} AS NUMERIC)"
         exact = arg is not None and arg.scale is not None and arg.scale <= node.scale
         if node.mode == n.DEFAULT_ROUND_MODE or exact:
             # The two modes differ only on a tie, and no digit is cut when the places
@@ -316,15 +324,16 @@ class _Renderer:
             return f"ROUND({value}, {node.scale}, 'HALF_TO_EVEN')"
         if self.dialect == "databricks":
             return f"bround({value}, {node.scale})"
-        # Half to even in fixed point: y = x * 10^s, then back by * 10^-s (a DECIMAL
+        # Half to even in fixed point: y = x * 10^s, then back by * 10^-s (an exact
         # literal, so the engine stays in DECIMAL instead of dividing in DOUBLE).
         up = "1" + "0" * node.scale
         down = "1" if node.scale == 0 else "0." + "0" * (node.scale - 1) + "1"
+        half, down = number_literal(self.dialect, "0.5"), number_literal(self.dialect, down)
         y = f"({value} * {up})"
         trunc = f"{'truncate' if self.dialect == 'athena' else 'TRUNC'}({y})"
         even = f"({trunc} % 2)" if self.dialect == "duckdb" else f"MOD({trunc}, 2)"
         return (
-            f"((CASE WHEN ABS({y} - {trunc}) = 0.5 THEN {trunc} + "
+            f"((CASE WHEN ABS({y} - {trunc}) = {half} THEN {trunc} + "
             f"(CASE WHEN {even} = 0 THEN 0 ELSE SIGN({y}) END) "
             f"ELSE ROUND({y}) END) * {down})"
         )

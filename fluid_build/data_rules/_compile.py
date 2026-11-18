@@ -853,7 +853,7 @@ class _RowQuery:
 
     def literal(self, value: Any, sql_type: fs.SqlType) -> str:
         if sql_type.kind == NUMBER:
-            return _literal(value)
+            return fs.number_literal(self.dialect, _literal(value))
         if sql_type.kind == STRING:
             return fs.sql_literal(self.dialect, value)
         if sql_type.kind == "date":

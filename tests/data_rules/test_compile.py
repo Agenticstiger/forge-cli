@@ -739,3 +739,10 @@ def test_a_foreign_key_inherits_the_format_and_placeholders_down_its_chain() -> 
         "a1": expected,
     }
     assert "copies" in formats["b2"].description
+
+
+def test_a_decimal_if_none_is_exact_on_bigquery() -> None:
+    contract = _billing()
+    contract["exposes"][0]["contract"]["invariants"][2]["aggregate"]["ifNone"] = 0.5
+    rule = {r.id: r for r in compile_rules(contract, dialect="bigquery")}["billed"]
+    assert "BIGNUMERIC '0.5'" in rule.counts(lambda e: fs.sql_name("bigquery", e))
