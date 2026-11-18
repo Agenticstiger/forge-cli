@@ -86,6 +86,9 @@ class RunInfo:
     attempt: Optional[int] = None
     details: str = ""
     created: float = 0.0
+    #: The run's processes stopped without recording how it ended (a local run whose
+    #: machine restarted, or that was killed): it did not fail, so its config starts again.
+    lost: bool = False
 
     @property
     def active(self) -> bool:

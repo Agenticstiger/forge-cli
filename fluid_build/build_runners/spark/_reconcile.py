@@ -204,6 +204,7 @@ def _reconcile_one(
         and last is not None
         and last.config_hash == run.config_hash
         and last.state == FAILED
+        and not last.lost
         and not restart_failed
     ):
         out.action, out.error, out.run_id, out.state = "failed", True, last.run_id, last.state
@@ -246,6 +247,11 @@ def _reconcile_one(
     started = clock.until(lambda: adapter.get(run_id), lambda i: i.state != PENDING, budget)
     out.action = "restarted" if out.cancelled else "started"
     out.run_id, out.state = run_id, started.state
+    if last is not None and last.lost and not active:
+        out.message = (
+            f"run {last.run_id} stopped without recording how it ended (its machine "
+            "restarted, or its processes were killed), so the same config started again"
+        )
     if started.state in TERMINAL:
         # A long-running job that ends at once failed, whatever it reports.
         out.error = True

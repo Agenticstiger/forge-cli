@@ -1507,6 +1507,13 @@ def _simple_apply_provider(contract: Dict[str, Any], logger: logging.Logger) -> 
     return name
 
 
+class _ApplyDeclined(Exception):
+    """The user declined apply's confirmation prompt, so nothing was applied. Raised past
+    the apply (as Click's ``confirm(abort=True)`` raises ``Abort``) so that nothing after
+    it runs either, such as the local Spark runs' reconcile; ``run`` returns 0 for it, the
+    exit code a decline has always had."""
+
+
 def _run_simple_apply(
     *,
     args,
@@ -1525,7 +1532,8 @@ def _run_simple_apply(
     config (or a flat ``plan.json`` is supplied): detect provider, resolve
     actions, show the preview / confirmation, honour ``--dry-run``, dispatch
     to the provider, write rollback state, then render + report. Returns the
-    process exit code (``0`` success / ``1`` failure).
+    process exit code (``0`` success / ``1`` failure); raises ``_ApplyDeclined`` when the
+    user declines the confirmation prompt.
 
     The actions come from ``gated_contract`` (the contract as the pre-apply
     gate checked it) and ``plan_data`` (the digest-verified plan), never from
@@ -1653,13 +1661,13 @@ def _run_simple_apply(
 
             if not confirm_action("\nProceed with execution?", default=False, console=console):
                 console.print("[yellow]Operation cancelled[/yellow]")
-                return 0
+                raise _ApplyDeclined
         else:
             logger.info(f"About to execute {len(actions)} actions")
             response = input("Proceed? [y/N]: ").strip().lower()
             if response not in ["y", "yes"]:
                 logger.info("Operation cancelled")
-                return 0
+                raise _ApplyDeclined
 
     # Dry run mode
     if args.dry_run:
@@ -1820,7 +1828,8 @@ def _run_orchestrated_apply(
     governance / …) or a legacy nested-plan orchestration format. Builds the
     ``ExecutionContext``, runs the engine's async plan, emits the final
     report / notifications / metrics, and returns the exit code (``0``
-    success / ``1`` failure).
+    success / ``1`` failure); raises ``_ApplyDeclined`` when the user declines the
+    confirmation prompt.
 
     Same gate-ordering guarantee as ``_run_simple_apply``: every apply gate
     runs in ``run()`` before this helper is called.
@@ -1860,7 +1869,7 @@ def _run_orchestrated_apply(
     if not args.yes and not args.dry_run and os.isatty(0):
         if not _confirm_execution(plan, console):
             logger.info("Execution cancelled by user")
-            return 0
+            raise _ApplyDeclined
 
     # Initialize orchestration engine
     engine = FluidOrchestrationEngine(context)
@@ -2530,28 +2539,31 @@ def run(args, logger: logging.Logger) -> int:
         # delegated to the build runner and returned before this point.
         # See the gate block above ``resolve_apply_engine``.
 
-        # Simple mode execution
-        if use_simple_mode:
-            rc = _run_simple_apply(
-                args=args,
-                contract=contract,
-                gated_contract=gated_contract,
-                resolved_mode=resolved_mode,
-                execution_id=execution_id,
-                start_time=start_time,
-                logger=logger,
-                plan_data=verified_plan_data,
-            )
-        else:
-            # Complex orchestration mode — extracted to _run_orchestrated_apply().
-            rc = _run_orchestrated_apply(
-                args=args,
-                contract=contract,
-                plan=plan,
-                execution_id=execution_id,
-                start_time=start_time,
-                logger=logger,
-            )
+        try:
+            # Simple mode execution
+            if use_simple_mode:
+                rc = _run_simple_apply(
+                    args=args,
+                    contract=contract,
+                    gated_contract=gated_contract,
+                    resolved_mode=resolved_mode,
+                    execution_id=execution_id,
+                    start_time=start_time,
+                    logger=logger,
+                    plan_data=verified_plan_data,
+                )
+            else:
+                # Complex orchestration mode — extracted to _run_orchestrated_apply().
+                rc = _run_orchestrated_apply(
+                    args=args,
+                    contract=contract,
+                    plan=plan,
+                    execution_id=execution_id,
+                    start_time=start_time,
+                    logger=logger,
+                )
+        except _ApplyDeclined:
+            return 0  # declined at the prompt: nothing was applied, and nothing starts
         if rc:
             return rc
         # Local Spark streams, after the apply that succeeded, as after tofu apply.

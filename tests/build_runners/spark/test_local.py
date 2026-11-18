@@ -396,6 +396,24 @@ def test_an_s3_compatible_endpoint_gets_path_style_requests(tmp_path, stub, monk
     _local.publish(sub, the_run(local_contract()).bind(local_root=sub.root), runner_source())
     assert seen["config"].s3 == {"addressing_style": "path"}
     assert seen["region_name"] == "us-east-1" and len(seen["keys"]) == 2
+    # An endpoint that is down fails the apply in seconds.
+    assert (seen["config"].connect_timeout, seen["config"].read_timeout) == (10, 60)
+    assert seen["config"].retries == {"mode": "standard", "max_attempts": 3}
+
+
+def test_an_s3_client_that_cannot_be_made_is_a_named_error(tmp_path, stub, monkeypatch):
+    import boto3
+
+    def client(service, **kwargs):
+        raise ValueError("Invalid endpoint: not-a-url")
+
+    monkeypatch.setattr(boto3, "client", client)
+    sub = submitter(
+        LocalHost(tmp_path, {SUBMIT_EXECUTABLE_ENV: str(stub), LOCAL_ROOT_ENV: "s3://lake"})
+    )
+    run = the_run(local_contract()).bind(local_root=sub.root)
+    with pytest.raises(SparkRunError, match="no S3 client could be made for it: ValueError"):
+        _local.publish(sub, run, runner_source())
 
 
 # --- runs ------------------------------------------------------------------------------
@@ -530,6 +548,104 @@ def test_a_run_cancelled_before_it_started_starts_nothing(tmp_path):
         os.close(lock)
     status = json.loads((where / "status.json").read_text())
     assert "ended" in status and status["exitCode"] is None and "pid" not in status
+
+
+def test_a_cancel_mark_alone_stops_a_run(host, started):
+    """A cancel whose signals never reached the run (it came before the run's process group
+    was recorded, or the apply that sent it was stopped): the supervisor honours the mark."""
+    run = the_run(local_contract())
+    run_id = start_run(host, run, "t", runner_text=runner_source())
+    runs = LocalRuns(host, run.product, run.build)
+    started.append((runs, run_id))
+    (runs.dir / "runs" / run_id / "cancel").write_text("1\n")
+    assert wait_for(lambda: runs.get(run_id), lambda i: i.state == CANCELLED).state == CANCELLED
+
+
+def test_a_marked_run_that_ignores_sigterm_is_killed_after_the_supervisor_s_grace(
+    host, started, monkeypatch
+):
+    monkeypatch.setattr(_local, "STOP_GRACE_S", 0.5)
+    run = the_run(local_contract())
+    run_id = start_run(with_env(host, STUB_IGNORE_TERM="1"), run, "t", runner_text=runner_source())
+    runs = LocalRuns(host, run.product, run.build)
+    started.append((runs, run_id))
+    (runs.dir / "runs" / run_id / "cancel").write_text("1\n")
+    assert wait_for(lambda: runs.get(run_id), lambda i: i.state == CANCELLED).state == CANCELLED
+
+
+def test_a_cancel_finds_a_run_whose_process_group_was_never_recorded(host, started):
+    run = the_run(local_contract())
+    run_id = start_run(host, run, "t", runner_text=runner_source())
+    runs = LocalRuns(host, run.product, run.build)
+    started.append((runs, run_id))
+    record = runs.dir / "runs" / run_id / "run.json"
+    data = json.loads(record.read_text())
+    del data["pgid"]  # as when the apply that started it stopped before it recorded it
+    record.write_text(json.dumps(data))
+    runs.cancel(run_id, grace=2.0)
+    assert runs.get(run_id).state == CANCELLED
+
+
+def test_an_interrupted_start_stops_the_run_it_started(host, monkeypatch):
+    run = the_run(local_contract())
+    wait = _local._wait_started
+
+    def interrupted(where, process):
+        wait(where, process)
+        raise KeyboardInterrupt  # Ctrl-C as the run starts: the caller has no run id yet
+
+    monkeypatch.setattr(_local, "_wait_started", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        start_run(host, run, "t", runner_text=runner_source())
+    (info,) = LocalRuns(host, run.product, run.build).runs()
+    assert info.state == CANCELLED
+
+
+def test_a_late_cancel_leaves_a_finished_run_as_it_ended(host):
+    run = the_run(batch_contract())
+    out = rc.run_once(run, local_host=host, timeout=30, say=lambda _: 0)
+    runs = LocalRuns(host, run.product, run.build)
+    runs.cancel(out.run_id)
+    where = runs.dir / "runs" / out.run_id
+    assert not (where / "cancel").exists()
+    (where / "cancel").write_text("1\n")  # a cancel that read the run just before it ended
+    assert runs.get(out.run_id).state == SUCCEEDED
+
+
+def test_an_end_recorded_while_the_run_is_read_is_its_end(tmp_path, monkeypatch):
+    """The supervisor records the end and exits between the read of status.json and the
+    check of the lock: the run ended, it was not lost."""
+    runs = LocalRuns(LocalHost(tmp_path), "p", "b")
+    run_id = "20261118T120000Z-0123abcd"
+    where = runs.dir / "runs" / run_id
+    where.mkdir(parents=True)
+    (where / "run.json").write_text(json.dumps({"configHash": "h", "created": 1.0}))
+    (where / "status.json").write_text(json.dumps({"started": 1.0}))
+
+    def ended_meanwhile(lock):
+        ended = {"started": 1.0, "ended": 2.0, "exitCode": 0}
+        (where / "status.json").write_text(json.dumps(ended))
+        return False
+
+    monkeypatch.setattr(_local, "_held", ended_meanwhile)
+    assert runs.get(run_id).state == SUCCEEDED
+
+
+def test_a_lost_stream_starts_again(host, started):
+    """Killed with its machine (no end recorded): it did not fail, so fluid apply starts
+    the same config again on its checkpoint, as a retry policy restarts one on AWS."""
+    run = the_run(local_contract())
+    (first,) = rc.reconcile([run], local_host=host)
+    runs = LocalRuns(host, run.product, run.build)
+    started.append((runs, first.run_id))
+    status = json.loads((runs.dir / "runs" / first.run_id / "status.json").read_text())
+    os.killpg(status["supervisorPid"], signal.SIGKILL)
+    lost = wait_for(lambda: runs.get(first.run_id), lambda i: i.state == FAILED)
+    assert (lost.raw_state, lost.lost) == ("LOST", True)
+    (again,) = rc.reconcile([run], local_host=host)
+    started.append((runs, again.run_id))
+    assert (again.action, again.error) == ("started", False) and again.run_id != first.run_id
+    assert "stopped without recording how it ended" in again.message
 
 
 def test_a_spark_submit_that_cannot_start_is_a_failed_run(host):

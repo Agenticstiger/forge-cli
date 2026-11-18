@@ -50,7 +50,7 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
@@ -494,11 +494,21 @@ def _put_s3(files: Any, env: Mapping[str, str]) -> None:
         ) from exc
     custom = any(env.get(v) for v in ("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"))
     region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or "us-east-1"
-    client = boto3.client(
-        "s3",
-        region_name=region,
-        config=Config(s3={"addressing_style": "path"}) if custom else None,
+    # Bounded: an endpoint that is down fails the apply in seconds, not after botocore's
+    # default 60 s timeouts and five legacy attempts.
+    config = Config(
+        connect_timeout=10,
+        read_timeout=60,
+        retries={"mode": "standard", "max_attempts": 3},
+        **({"s3": {"addressing_style": "path"}} if custom else {}),
     )
+    try:
+        client = boto3.client("s3", region_name=region, config=config)
+    except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
+        raise SparkRunError(
+            f"{LOCAL_ROOT_ENV} is an s3:// root, and no S3 client could be made for it: "
+            f"{type(exc).__name__}"
+        ) from exc
     for uri, body in files:
         bucket, _, key = uri.removeprefix("s3://").partition("/")
         try:
@@ -601,24 +611,28 @@ class LocalRuns:
         if not record:
             raise SparkRunError(f"local run {run_id} of {self.build} has no record in {where}")
         status = _read_json(where / STATUS_FILE)
+        held = "ended" not in status and _held(where / LOCK_FILE)
+        if not held and "ended" not in status:
+            # Every run process has exited, so an end it recorded is there now.
+            status = _read_json(where / STATUS_FILE)
         cancelled = (where / CANCEL_FILE).exists()
-        details = ""
+        details, lost = "", False
         if "ended" in status:
             code = status.get("exitCode")
-            if cancelled:
-                state, raw = CANCELLED, "CANCELLED"
-            elif code == 0:
+            if code == 0:  # its work was done, whether or not a cancel came after
                 state, raw = SUCCEEDED, "SUCCEEDED"
+            elif cancelled:
+                state, raw = CANCELLED, "CANCELLED"
             else:
                 state, raw = FAILED, f"FAILED (exit {code})"
                 details = f"log {where / LOG_FILE}: {_log_tail(where / LOG_FILE)}"
-        elif _held(where / LOCK_FILE):
+        elif held:
             state = CANCELLING if cancelled else RUNNING if status.get("started") else PENDING
             raw = state
         elif cancelled:
             state, raw = CANCELLED, "CANCELLED"
         else:
-            state, raw = FAILED, "LOST"
+            state, raw, lost = FAILED, "LOST", True
             details = (
                 "its processes stopped without recording how they ended (killed, or the "
                 f"machine restarted); log {where / LOG_FILE}: {_log_tail(where / LOG_FILE)}"
@@ -632,6 +646,7 @@ class LocalRuns:
             checkpoint_id=record.get("checkpointId"),
             details=details,
             created=float(record.get("created") or 0),
+            lost=lost,
         )
 
     def cancel(
@@ -642,13 +657,20 @@ class LocalRuns:
         sleep: Any = time.sleep,
         now: Any = time.monotonic,
     ) -> None:
-        """Stop a run: SIGTERM to its process group, SIGKILL if it is still going after
+        """Stop a run: the ``cancel`` mark, which its supervisor honours whenever it
+        lands, then SIGTERM to its process group, and SIGKILL if it is still going after
         ``grace`` seconds. Each signal is sent while the run's lock is held, so the group
-        is still the run's (a group id is not reused while a member lives)."""
+        is still the run's (a group id is not reused while a member lives). A run that
+        has ended keeps the end it recorded."""
         where = self._run_dir(run_id)
-        (where / CANCEL_FILE).write_text(f"{time.time()}\n", encoding="utf-8")
-        record = _read_json(where / RUN_FILE)
-        group = record.get("pgid")
+        if "ended" in _read_json(where / STATUS_FILE):
+            return
+        _replace(where / CANCEL_FILE, f"{time.time()}\n".encode("utf-8"))
+        group = _read_json(where / RUN_FILE).get("pgid")
+        if not isinstance(group, int):
+            # Not in run.json yet (an apply stopped while it started the run): the
+            # supervisor's pid, its group's id, which it records before anything else.
+            group = _read_json(where / STATUS_FILE).get("supervisorPid")
         lock = where / LOCK_FILE
         if not isinstance(group, int) or group <= 1:
             return  # not started yet: the supervisor reads the mark and starts nothing
@@ -764,6 +786,8 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
                         str(where),
                         "--lock-fd",
                         str(fd),
+                        "--grace",
+                        str(STOP_GRACE_S),
                         "--",
                         *argv,
                     ],
@@ -777,13 +801,21 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
                     env={**host.env, "PYTHONSAFEPATH": "1"},
                 )
             except OSError as exc:
+                shutil.rmtree(where, ignore_errors=True)  # it never ran: nothing to report
                 raise SparkRunError(
                     f"the local run's supervisor did not start: {exc.strerror}"
                 ) from exc
             _write_json(where / RUN_FILE, {**record, "pgid": process.pid})
         finally:
             os.close(fd)
-    _wait_started(where, process)
+    try:
+        _wait_started(where, process)
+    except BaseException:
+        # Stopped while it starts (Ctrl-C, or the SIGTERM run_once turns into one): the
+        # caller has no run id to cancel yet, so the run is stopped here.
+        with suppress(Exception):
+            runs.cancel(run_id)
+        raise
     runs.prune()
     return run_id
 

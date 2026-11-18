@@ -109,6 +109,21 @@ def test_prepare_refuses_a_local_run_this_machine_cannot_start(monkeypatch):
     assert run.local
 
 
+def test_prepare_checks_a_local_run_against_the_contract_s_directory(tmp_path, monkeypatch):
+    from fluid_build.build_runners.spark import _local
+
+    seen = []
+    real = _local.default_host
+
+    def default_host(workspace=None):
+        seen.append(workspace)
+        return real(workspace)
+
+    monkeypatch.setattr(_local, "default_host", default_host)
+    _apply.prepare(contract(), build_id=None, verified_plan=None, dry_run=False, workspace=tmp_path)
+    assert seen == [tmp_path]
+
+
 def test_plan_lists_a_local_reconcile_action_apply_checks_it_against():
     (action,) = _apply.planned_actions(contract())
     assert (action["provider"], action["payload"]["runtime"]) == ("local", "local")
@@ -265,6 +280,20 @@ def test_fluid_apply_starts_leaves_alone_and_stops_a_local_stream(tmp_path, caps
         assert main(["apply", str(path), "--yes"]) == 0
     out = capsys.readouterr().out
     assert "Spark ingest-orders (local): stopped run" in out and "CANCELLED" in out
+
+
+def test_a_declined_apply_starts_no_local_run(tmp_path, monkeypatch):
+    """No at apply's prompt applies nothing, and starts no local Spark run either."""
+    from fluid_build.cli import apply as apply_cli
+    from fluid_build.cli import main
+
+    monkeypatch.setattr(apply_cli, "confirm_action", lambda *a, **k: False)
+    monkeypatch.setattr(apply_cli.os, "isatty", lambda fd: True)
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    data = stream_contract()
+    assert main(["apply", str(write(tmp_path, data))]) == 0
+    assert not (tmp_path / ".fluid" / "spark-artifacts").exists()
+    assert not (tmp_path / ".fluid" / data["id"] / "runtime" / "spark").exists()
 
 
 def test_an_aws_apply_leaves_this_machine_s_local_runs_alone(tmp_path, monkeypatch):
