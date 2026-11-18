@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -108,26 +107,6 @@ def _under_home(prefix: str, suffix: str) -> TofuExpr:
     literal = suffix.replace("${", "$${").replace("%{", "%%{")
     return TofuExpr(prefix + _HOME + literal)
 
-
-#: Top-level project files dbt reads; ``profiles.yml`` is never one of them here.
-_PROJECT_FILES = (
-    "dbt_project.yml",
-    "packages.yml",
-    "dependencies.yml",
-    "package-lock.yml",
-    "selectors.yml",
-)
-#: ``dbt_project.yml`` path keys and dbt-core's defaults for them.
-_PATH_KEYS = {
-    "model-paths": ("models",),
-    "macro-paths": ("macros",),
-    "seed-paths": ("seeds",),
-    "snapshot-paths": ("snapshots",),
-    "test-paths": ("tests",),
-    "analysis-paths": ("analyses",),
-    "docs-paths": (),
-    "asset-paths": (),
-}
 
 #: Git host → the Databricks ``git_source.provider`` value.
 _GIT_PROVIDERS = {
@@ -535,47 +514,41 @@ def _git_source(
 def _project_files(
     project: Path, where: str, refusals: List[UnsupportedBindingError]
 ) -> List[Tuple[str, bytes]]:
-    """``(path relative to the project, bytes)`` for every file dbt reads, sorted."""
-    import yaml
+    """``(path relative to the project, bytes)`` for every file dbt reads, sorted.
+
+    The selection is the one ``fluid bundle`` packs
+    (``build_runners/dbt/project_files.py``): the files a bundle binds are the
+    files uploaded here.
+    """
+    from ...build_runners.dbt.project_files import (
+        DbtProjectFilesError,
+        load_project_config,
+        select_project_files,
+    )
 
     try:
-        config = yaml.safe_load((project / "dbt_project.yml").read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        config = load_project_config(project)
+    except DbtProjectFilesError as exc:
         refusals.append(
             _refusal(
                 "project-unreadable",
                 f"{where} dbt_project.yml in {project} could not be read "
-                f"({type(exc).__name__}).",
+                f"({type(exc.__cause__ or exc).__name__}).",
                 "Fix it; dbt parse reads it the same way.",
             )
         )
         return []
-    config = config if isinstance(config, Mapping) else {}
-    found: Dict[str, Path] = {}
-    links: List[str] = []
-    for name in _PROJECT_FILES:
-        path = project / name
-        if path.is_symlink():
-            links.append(name)
-        elif path.is_file():
-            found[name] = path
-    for key, default in _PATH_KEYS.items():
-        entries = config.get(key, list(default))
-        for entry in [entries] if isinstance(entries, str) else entries or []:
-            rel = PurePosixPath(str(entry))
-            problem = _path_key_problem(project, rel)
-            if problem is not None:
-                refusals.append(
-                    _refusal(
-                        "project-path",
-                        f"{where} dbt_project.yml {key} names {str(entry)!r}, {problem}; only "
-                        "the directories dbt reads, inside the project, are uploaded.",
-                        "Name a plain directory inside the project, or use a GIT source.",
-                    )
-                )
-                continue
-            _walk(project, project / rel, found, links)
-    for name in links:
+    selection = select_project_files(project, config)
+    for key, entry, problem in selection.bad_paths:
+        refusals.append(
+            _refusal(
+                "project-path",
+                f"{where} dbt_project.yml {key} names {entry!r}, {problem}; only "
+                "the directories dbt reads, inside the project, are uploaded.",
+                "Name a plain directory inside the project, or use a GIT source.",
+            )
+        )
+    for name in selection.links:
         refusals.append(
             _refusal(
                 "project-link",
@@ -586,8 +559,8 @@ def _project_files(
         )
     files = []
     total = 0
-    for rel in sorted(found):
-        data = found[rel].read_bytes()
+    for rel, path in selection.files.items():
+        data = path.read_bytes()
         if len(data) > MAX_FILE_BYTES:
             refusals.append(
                 _refusal(
@@ -611,57 +584,6 @@ def _project_files(
             )
         )
     return files
-
-
-def _path_key_problem(project: Path, rel: PurePosixPath) -> Optional[str]:
-    """Why a ``*-paths`` entry is not a plain directory inside the project, or ``None``.
-
-    Every component is checked, not just the last: ``lnk/leak`` with ``lnk`` a
-    link would walk wherever ``lnk`` points, and ``.git`` holds the checkout's
-    credentials (``actions/checkout`` persists a token in ``.git/config``).
-    """
-    if rel.is_absolute() or ".." in rel.parts:
-        return "outside the project"
-    if not rel.parts:
-        return "the project root, which would upload everything in it"
-    hidden = [part for part in rel.parts if part.startswith(".")]
-    if hidden:
-        return f"the hidden directory {hidden[0]!r}"
-    for depth in range(1, len(rel.parts) + 1):
-        if project.joinpath(*rel.parts[:depth]).is_symlink():
-            return f"through the symbolic link {'/'.join(rel.parts[:depth])!r}"
-    return None
-
-
-def _walk(project: Path, base: Path, found: Dict[str, Path], links: List[str]) -> None:
-    """Add every regular, visible file under ``base``; collect the links met.
-
-    A file is added only if it resolves inside the project, whatever the walk
-    met on the way (:func:`_path_key_problem` checks the entry itself first).
-    """
-    root = project.resolve()
-    if base.is_symlink():
-        links.append(base.relative_to(project).as_posix())
-        return
-    if not base.is_dir():
-        return  # dbt tolerates a missing default directory
-    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
-        here = Path(dirpath)
-        for name in list(dirnames):
-            if name.startswith(".") or name == "__pycache__":
-                dirnames.remove(name)
-            elif (here / name).is_symlink():
-                links.append((here / name).relative_to(project).as_posix())
-                dirnames.remove(name)
-        for name in filenames:
-            path = here / name
-            if name.startswith(".") or name == "profiles.yml":
-                continue
-            rel = path.relative_to(project).as_posix()
-            if path.is_symlink() or not path.resolve().is_relative_to(root):
-                links.append(rel)
-            elif path.is_file():
-                found[rel] = path
 
 
 def _commands(build: Mapping[str, Any], where: str, refusals: List[UnsupportedBindingError]):

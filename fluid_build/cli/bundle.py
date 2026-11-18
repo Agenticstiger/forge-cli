@@ -94,6 +94,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
             "content-addressable bundle with a MANIFEST.json, SHA-256 per "
             "file, a merkle root, and inline SQL/OpenAPI extracted into "
             "sources/ (replaced by {'$source': 'sources/...'} sentinels). "
+            "The dbt project of each dbt build is packed under "
+            "sources/dbt/<build id>/ (the files dbt reads; never profiles.yml, "
+            "target/, logs/ or dbt_packages/), so the plan binds it and "
+            "apply refuses a checkout whose files differ. "
             "The tgz format is the canonical input to every downstream "
             "stage of the 11-stage pipeline."
         ),
@@ -448,12 +452,26 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
             overlay_path=overlay_path,
             overlay_warnings=[warning.message for warning in overlay_warnings],
         )
+        # The dbt project each dbt build runs, found as the dbt runner finds it
+        # (anchored at this contract, confined to its workspace), packed as it is
+        # on disk. Function-local: the build runners stay off the --help path.
+        from fluid_build.build_runners.dbt.project_files import (
+            DbtProjectFilesError,
+            collect_bundle_projects,
+        )
+
+        try:
+            dbt_projects = collect_bundle_projects(compiled, Path(contract_path).resolve())
+        except DbtProjectFilesError as e:
+            sys.stderr.write(f"❌ Bundle tgz build failed: {e}\n")
+            return 1
         try:
             digest = build_bundle_tgz(
                 compiled,
                 Path(out),
                 contract_id=str(contract_id_raw),
                 source=source,
+                dbt_projects=dbt_projects,
             )
         except Exception as e:
             sys.stderr.write(f"❌ Bundle tgz build failed: {e}\n")
@@ -461,6 +479,10 @@ def run(args: argparse.Namespace, logger: logging.Logger) -> int:
 
         sys.stderr.write(f"✅ Bundle written to {out}\n")
         sys.stderr.write(f"   digest: {digest}\n")
+        for build_id, files in dbt_projects.items():
+            sys.stderr.write(
+                f"   dbt project: {build_id} ({len(files)} files, " f"sources/dbt/{build_id}/)\n"
+            )
         if env:
             applied = source.get("overlay") or "none (base contract)"
             sys.stderr.write(f"   env: {env} (overlay: {applied})\n")

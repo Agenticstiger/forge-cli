@@ -1614,6 +1614,14 @@ def _display_plan_simple(plan: Dict[str, Any], logger: logging.Logger, output_pa
             cprint(line)
         cprint()
 
+    # The dbt code the plan binds: fluid apply refuses a checkout whose files differ.
+    for build_id, bound in sorted((plan.get("dbtProjects") or {}).items()):
+        files = bound.get("files") if isinstance(bound, dict) else None
+        digest = bound.get("digest") if isinstance(bound, dict) else None
+        cprint_literal(f"dbt project bound: {build_id} ({len(files or {})} files, {digest})")
+    if plan.get("dbtProjects"):
+        cprint()
+
     if total > 0:
         for action in plan["actions"]:
             step = action.get("step", "?")
