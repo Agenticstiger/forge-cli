@@ -415,8 +415,9 @@ def test_allowlist_lists_env_entries_only():
 
 
 def _any_host_entry(ref_text: str) -> str:
-    ref = parse_secret_ref(ref_text)
-    return ref.locator if ref.scheme == "env" else f"{ref.canonical}@*"
+    """The fix's entry for any host: ``<ref>@*``, or an env:// variable's bare name."""
+    entry = _entry(ref_text, "*")
+    return entry.removesuffix("@*") if ref_text.startswith("env://") else entry
 
 
 @pytest.mark.unit

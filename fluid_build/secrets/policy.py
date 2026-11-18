@@ -219,15 +219,6 @@ def prefix_matches(locator: str, prefix: str) -> bool:
 
 
 def _policy_error(what: str, why: str, fix: str) -> SecretPolicyError:
-    """A refusal; its ``what`` never puts ``: `` right after the reference.
-
-    The log redactor reads ``<word>: <next word>`` as an assignment when the
-    word is credential-shaped, and a reference often ends in one
-    (``#password``, ``.../token``): ``vault://kv/pg#password: the vault://
-    scheme ...`` came out with ``the`` masked. So each message names the
-    reference and goes on with ``cannot resolve, because`` or ``was not
-    fetched, because``.
-    """
     return SecretPolicyError(what=what, why=why, fix=fix, doc=doc_url("secrets"))
 
 
@@ -446,29 +437,29 @@ def connection_hosts(connection: Mapping[str, Any]) -> List[Optional[str]]:
     """
     out: List[Optional[str]] = []
     for field_name in _HOST_FIELDS:
-        if field_name not in connection:
-            continue
-        raw = connection[field_name]
-        if field_name == "host":
-            out.append(raw.strip() if isinstance(raw, str) and raw.strip() else None)
-            continue
-        if _blank(raw):
-            continue
-        if not isinstance(raw, str):
-            out.append(None)
-            continue
-        text = raw.strip()
-        if _is_object_store_uri(text):
-            continue
-        try:
-            parsed = urlsplit(text if "//" in text else f"//{text}")
-        except ValueError:
-            out.append(None)
-            continue
-        out.extend(_authority_hosts(parsed.netloc))
+        if field_name in connection:
+            out.extend(_field_hosts(field_name, connection[field_name]))
     if not _port_is_readable(connection.get("port")):
         out.append(None)
     return out
+
+
+def _field_hosts(field_name: str, raw: Any) -> List[Optional[str]]:
+    """The destinations one present field names, as :func:`connection_hosts` counts them."""
+    if field_name == "host":
+        return [raw.strip() if isinstance(raw, str) and raw.strip() else None]
+    if _blank(raw):
+        return []
+    if not isinstance(raw, str):
+        return [None]
+    text = raw.strip()
+    if _is_object_store_uri(text):
+        return []
+    try:
+        parsed = urlsplit(text if "//" in text else f"//{text}")
+    except ValueError:
+        return [None]
+    return _authority_hosts(parsed.netloc)
 
 
 def connection_host(connection: Mapping[str, Any]) -> Optional[str]:
