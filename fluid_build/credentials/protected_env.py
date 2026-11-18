@@ -789,6 +789,12 @@ NOT_PROCESS_ENV: FrozenSet[str] = frozenset(
         "FLUID_OK",
         "FLUID_X",
         "FLUID_STORE_",
+        # spelled by the plugin-author test kit (fluid_build/testing/env.py): a switch it
+        # sets for the code under test, which the CLI itself never reads, and the name
+        # prefixes it drops from a test's environment
+        "FLUID_NO_TELEMETRY",
+        "FLUID_PLUGIN",
+        "FLUID_STATE",
         # name prefixes for other things: Iceberg volumes, IAM roles, and the
         # head of the f-strings that build ``FLUID_<NAME>_MCP_*``
         "FLUID_",
