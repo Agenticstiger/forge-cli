@@ -769,13 +769,33 @@ def main(argv: list[str] | None = None) -> int:
         description="Run one forge Spark job config.", allow_abbrev=False
     )
     parser.add_argument("--config", required=True, help="the job.json, a path or s3:// URI")
+    parser.add_argument(
+        "--fluid-job-sha256", help="the sha256 of the job config fluid apply started the run on"
+    )
     # Glue passes its own --JOB_NAME and friends; they are not this runner's.
     args, _ = parser.parse_known_args(argv)
     from pyspark.sql import SparkSession
 
     spark = SparkSession.builder.getOrCreate()
-    run(spark, parse_config(read_text(spark, args.config)))
+    text = checked_text(read_text(spark, args.config), args.fluid_job_sha256, args.config)
+    run(spark, parse_config(text))
     return 0
+
+
+def checked_text(text: str, expected: str | None, where: str) -> str:
+    """The job config's text, refused before the job reads anything unless it is the one
+    ``fluid apply`` started the run on (``--fluid-job-sha256``, which every runtime passes):
+    a config another apply or a hand put there since would run under this run's hash."""
+    if expected is None:
+        return text
+    found = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if found != expected.lower():
+        raise JobConfigError(
+            f"the job config at {where} is not the one fluid apply started this run on (its "
+            f"sha256 is {found}; the run's is {expected}); nothing was read. Run fluid apply "
+            "again: it starts a run on the config it uploads"
+        )
+    return text
 
 
 if __name__ == "__main__":

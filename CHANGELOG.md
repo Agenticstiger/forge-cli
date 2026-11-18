@@ -59,6 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table is refused beside a bucket-root output, a location forge registers with Lake Formation,
   and an output whose lifecycle expires its objects; a topic takes their place. The managed Flink
   lane refuses the block.
+- **A Spark run starts only on the job config `fluid apply` compiled.** Every runtime, local
+  included, now passes the sha256 of the job config at submit (`--fluid-job-sha256`), and forge's
+  Spark runner refuses any other config before it reads anything. On AWS, `fluid apply` first
+  reads the config OpenTofu uploaded back from S3 and starts nothing unless it is the one this
+  apply compiled (the account and the MSK brokers OpenTofu fills in aside), so a config another
+  apply or a hand put there since never runs under the run's config hash. A scheduler's role
+  already reads the object. The runner changed, so each running Spark stream restarts once on
+  its next apply.
 
 ### Fixed
 

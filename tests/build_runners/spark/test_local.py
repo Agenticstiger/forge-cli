@@ -12,6 +12,7 @@ the lock, the exit codes and the signals are the ones a real local run goes thro
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import signal
@@ -426,6 +427,15 @@ def test_an_s3_client_that_cannot_be_made_is_a_named_error(tmp_path, stub, monke
 
 
 # --- runs ------------------------------------------------------------------------------
+
+
+def test_spark_submit_is_handed_the_sha256_of_the_config_it_reads(host):
+    run = the_run(batch_contract())
+    out = rc.run_once(run, local_host=host, timeout=30, say=lambda _: 0)
+    assert out.state == SUCCEEDED
+    argv = argv_of(host)["argv"]
+    config = Path(argv[argv.index("--config") + 1]).read_bytes()
+    assert argv[-2:] == ["--fluid-job-sha256", hashlib.sha256(config).hexdigest()]
 
 
 def test_a_batch_run_goes_to_succeeded(host):

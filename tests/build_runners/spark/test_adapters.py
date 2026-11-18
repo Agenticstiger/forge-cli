@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import hashlib
+import io
 
 import pytest
 
@@ -31,9 +33,28 @@ def stubbed(service, region="eu-west-1"):
     return client, stub
 
 
-def adapter_on(run, service):
+class ConfigBucket:
+    """The S3 the job config is read back from before a start: it holds ``body``."""
+
+    def __init__(self, body):
+        self.body, self.read = body, []
+
+    def get_object(self, Bucket, Key):  # noqa: N803 - boto3's names
+        self.read.append(f"s3://{Bucket}/{Key}")
+        return {"Body": io.BytesIO(self.body)}
+
+
+def adapter_on(run, service, body=None):
     client, stub = stubbed(service, run.region)
-    return ad.adapter_for(run, lambda s, r: client), stub
+    bucket = ConfigBucket(run.job_text.encode("utf-8") if body is None else body)
+    return ad.adapter_for(run, lambda s, r: bucket if s == "s3" else client), stub
+
+
+def started(run):
+    """``run`` as an adapter starts it: with the sha256 of the job config it read back."""
+    return dataclasses.replace(
+        run, job_sha256=hashlib.sha256(run.job_text.encode("utf-8")).hexdigest()
+    )
 
 
 def identity_of(run):
@@ -62,10 +83,7 @@ def _serverless_start(run):
         "jobDriver": {
             "sparkSubmit": {
                 "entryPoint": run.runner_uri,
-                "entryPointArguments": [
-                    "--config", run.job_uri, "--fluid-config-hash", run.config_hash,
-                    "--fluid-source", run.source_id, "--fluid-checkpoint", run.checkpoint_id,
-                ],
+                "entryPointArguments": started(run).entry_args(),
                 "sparkSubmitParameters": ad._submit_parameters(run.spark_conf),
             }
         },
@@ -249,6 +267,7 @@ def test_glue_start_passes_identity_and_conf_as_arguments(glue_run):
         "--fluid-config-hash": glue_run.config_hash,
         "--fluid-source": glue_run.source_id,
         "--fluid-checkpoint": glue_run.checkpoint_id,
+        "--fluid-job-sha256": started(glue_run).job_sha256,
         "--conf": " --conf ".join(f"{k}={v}" for k, v in conf),
     }
     stub.add_response(
@@ -309,7 +328,7 @@ def ec2_run(run):
 def test_ec2_start_adds_a_spark_submit_step_that_continues_on_failure(ec2_run):
     adapter, stub = adapter_on(ec2_run, "emr")
     args = ["spark-submit", "--deploy-mode", "client", *ad._conf_params(ec2_run.spark_conf)]
-    args += [ec2_run.runner_uri, *ec2_run.entry_args()]
+    args += [ec2_run.runner_uri, *started(ec2_run).entry_args()]
     stub.add_response(
         "add_job_flow_steps",
         {"StepIds": ["s-1"]},
@@ -431,7 +450,7 @@ def test_eks_start_sets_cluster_release_and_retry_policy(eks_run):
             "releaseLabel": "emr-7.12.0",
             "jobDriver": {"sparkSubmitJobDriver": {
                 "entryPoint": eks_run.runner_uri,
-                "entryPointArguments": eks_run.entry_args(),
+                "entryPointArguments": started(eks_run).entry_args(),
                 "sparkSubmitParameters": ad._submit_parameters(eks_run.spark_conf),
             }},
             "tags": eks_run.tags(),
@@ -568,3 +587,37 @@ def test_ec2_history_pages_until_this_builds_last_step(ec2_run):
     )
     assert [(r.run_id, r.state) for r in adapter.runs()] == [("s-mine", "FAILED")]
     stub.assert_no_pending_responses()
+
+
+# --- the job config, read back before a start -------------------------------------------
+
+
+def test_the_arguments_carry_the_config_s_identity_then_its_sha256(serverless):
+    args = started(serverless).entry_args()
+    assert args[:2] == ["--config", serverless.job_uri]
+    assert args[-2:] == ["--fluid-job-sha256", started(serverless).job_sha256]
+    # The identity a run is read back by stays where it was.
+    assert ad._identity(args) == identity_of(serverless)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"{}", b"not json", "{\u00e9".encode("latin-1")],
+    ids=["another config", "not json", "not utf-8"],
+)
+def test_a_config_this_apply_did_not_compile_starts_nothing(serverless, body):
+    adapter, stub = adapter_on(serverless, "emr-serverless", body=body)
+    with pytest.raises(ad.SparkRunError, match="not the job config this apply compiled"):
+        adapter.start("tok")
+    stub.assert_no_pending_responses()  # nothing was sent to EMR
+
+
+def test_a_config_that_cannot_be_read_starts_nothing(serverless):
+    class Denied:
+        def get_object(self, **_):
+            raise RuntimeError("AccessDenied")
+
+    client, _ = stubbed("emr-serverless")
+    adapter = ad.adapter_for(serverless, lambda s, r: Denied() if s == "s3" else client)
+    with pytest.raises(ad.SparkRunError, match="cannot be read to check it"):
+        adapter.start("tok")

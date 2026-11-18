@@ -179,6 +179,9 @@ class DesiredRun:
     checkpoint: Optional[str] = None
     topic: Optional[str] = None
     job_text: str = field(default="", repr=False, compare=False)
+    #: The sha256 of the job config the run's runtime reads, once ``fluid apply`` has read
+    #: it back (or written it, for a local run): the runner refuses any other config.
+    job_sha256: Optional[str] = field(default=None, compare=False)
 
     @property
     def long_running(self) -> bool:
@@ -186,7 +189,10 @@ class DesiredRun:
 
     @property
     def needs_account(self) -> bool:
-        return any(ACCOUNT_TOKEN in v for v in (self.job_uri, self.runner_uri, self.role_arn))
+        return any(
+            ACCOUNT_TOKEN in v
+            for v in (self.job_uri, self.runner_uri, self.role_arn, self.job_text)
+        )
 
     @property
     def needs_region(self) -> bool:
@@ -226,6 +232,8 @@ class DesiredRun:
             region=region if region and self.needs_region else self.region,
             job_uri=sub(self.job_uri),
             runner_uri=sub(self.runner_uri),
+            # The config as OpenTofu uploads it (its account filled in), to check it against.
+            job_text=sub(self.job_text),
             role_arn=sub(self.role_arn),
             checkpoint=sub(self.checkpoint) if self.checkpoint else self.checkpoint,
         )
@@ -242,7 +250,28 @@ class DesiredRun:
         return args
 
     def entry_args(self) -> List[str]:
-        return ["--config", self.job_uri, *self.identity_args()]
+        args = ["--config", self.job_uri, *self.identity_args()]
+        if self.job_sha256:
+            args += ["--fluid-job-sha256", self.job_sha256]
+        return args
+
+    def config_matches(self, body: bytes) -> bool:
+        """Whether ``body``, the job config read back from where the runtime reads it, is
+        the one this run was compiled to: the same JSON, the MSK brokers OpenTofu fills in
+        for ``MSK_BROKERS_PLACEHOLDER`` aside."""
+        from fluid_build.spark.compiler import MSK_BROKERS_PLACEHOLDER
+
+        try:
+            uploaded, planned = json.loads(body.decode("utf-8")), json.loads(self.job_text)
+        except ValueError:  # UnicodeDecodeError included
+            return False
+        if not isinstance(uploaded, dict) or not isinstance(planned, dict):
+            return False
+        source = uploaded.get("source")
+        filled = (planned.get("source") or {}).get("bootstrapServers") == MSK_BROKERS_PLACEHOLDER
+        if filled and isinstance(source, dict) and source.get("bootstrapServers"):
+            uploaded["source"] = {**source, "bootstrapServers": MSK_BROKERS_PLACEHOLDER}
+        return uploaded == planned
 
     def tags(self) -> Dict[str, str]:
         tags = {

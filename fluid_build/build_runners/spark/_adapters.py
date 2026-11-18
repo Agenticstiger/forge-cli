@@ -163,7 +163,38 @@ class Adapter:
 
     def __init__(self, run: DesiredRun, clients: ClientFactory) -> None:
         self.run = run
+        self.clients = clients
         self.client = clients(self.service, run.region)
+
+    def checked(self) -> DesiredRun:
+        """The run, with the sha256 of the job config its runtime reads
+        (``--fluid-job-sha256``), once the config read back from S3 is the one this apply
+        compiled: the runner then refuses any other, so a config another apply or a hand
+        put there since never runs under this run's config hash.
+
+        Raises:
+            SparkRunError: the config cannot be read, or is another one; nothing started.
+        """
+        import dataclasses
+        import hashlib
+
+        r = self.run
+        bucket, _, key = r.job_uri.removeprefix("s3://").partition("/")
+        try:
+            body = self.clients("s3", r.region).get_object(Bucket=bucket, Key=key)["Body"].read()
+        except Exception as exc:  # noqa: BLE001 - botocore's errors; named, then raised
+            code = str((getattr(exc, "response", None) or {}).get("Error", {}).get("Code") or "")
+            raise SparkRunError(
+                f"Spark build {r.build}: {r.job_uri} cannot be read to check it before the run "
+                f"starts ({code or type(exc).__name__}); nothing was started"
+            ) from exc
+        if not r.config_matches(body):
+            raise SparkRunError(
+                f"Spark build {r.build}: {r.job_uri} is not the job config this apply compiled "
+                "(another apply, or a hand, has changed it since); nothing was started. Run "
+                "fluid apply again: it uploads the config and starts the run on it"
+            )
+        return dataclasses.replace(r, job_sha256=hashlib.sha256(body).hexdigest())
 
     def runs(self) -> List[RunInfo]:  # newest first
         raise NotImplementedError
@@ -309,7 +340,7 @@ class EmrServerless(Adapter):
         return self._info(job["jobRun"])
 
     def start(self, token: str) -> str:
-        r = self.run
+        r = self.checked()
         request: Dict[str, Any] = {
             "applicationId": self.application_id(),
             "clientToken": token,
@@ -385,7 +416,7 @@ class Glue(Adapter):
         return self._info(self.client.get_job_run(JobName=self.job_name, RunId=run_id)["JobRun"])
 
     def start(self, token: str) -> str:
-        r = self.run
+        r = self.checked()
         args = r.entry_args()
         arguments = {args[i]: args[i + 1] for i in range(0, len(args), 2)}
         if r.spark_conf:
@@ -470,7 +501,7 @@ class EmrEc2(Adapter):
         return self._info(self.client.describe_step(ClusterId=self.cluster, StepId=run_id)["Step"])
 
     def start(self, token: str) -> str:
-        r = self.run
+        r = self.checked()
         args = [
             "spark-submit",
             # Client mode: the driver is the step's own process, so cancelling the step
@@ -553,7 +584,7 @@ class EmrEks(Adapter):
         return self._info(out["jobRun"])
 
     def start(self, token: str) -> str:
-        r = self.run
+        r = self.checked()
         request: Dict[str, Any] = {
             "name": r.run_name,
             "virtualClusterId": self.cluster,

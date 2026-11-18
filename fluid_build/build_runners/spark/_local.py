@@ -40,6 +40,7 @@ which follow ``java.util.Properties.load``, as spark-submit reads ``--properties
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -748,6 +749,10 @@ def start_run(host: LocalHost, run: DesiredRun, token: str, *, runner_text: str)
     sub = submitter(host)
     bound = run.bind(local_root=sub.root)
     publish(sub, bound, runner_text)
+    # What publish wrote, which the runner checks before it reads anything.
+    bound = dataclasses.replace(
+        bound, job_sha256=hashlib.sha256(bound.job_text.encode("utf-8")).hexdigest()
+    )
     runs = LocalRuns(host, run.product, run.build)
     _confined(host.workspace, runs.dir)  # before anything is created through a link
     with _locked(runs.dir / "start.lock"):
