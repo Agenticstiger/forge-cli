@@ -18,7 +18,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import pytest
 import yaml
@@ -34,6 +34,7 @@ from fluid_build.forge.core.artifact_validators import (
     validate_spark_job_json,
 )
 from fluid_build.iac import get_iac_plugin
+from fluid_build.iac.base import UnsupportedBindingError
 from fluid_build.iac.module import build_module
 from fluid_build.iac.providers import aws_identity
 from fluid_build.spark.compiler import CONTRACT_SQL_ALLOWLIST_ENV, MSK_BROKERS_PLACEHOLDER
@@ -258,7 +259,7 @@ class TestTheBytesAreTheUploadedObject:
         assert text.replace(MSK_BROKERS_PLACEHOLDER, brokers) == _uploads(contract)["stream-raw"]
 
 
-def _uploads_as_generate_iac_reads(path: Path) -> Dict[str, str]:
+def _uploads_as_generate_iac_reads(path: Path, env: Optional[str] = None) -> Dict[str, str]:
     """The uploads of the contract at ``path`` loaded as ``fluid generate iac`` loads it."""
     from fluid_build.cli._common import (
         load_contract_with_overlay,
@@ -266,7 +267,7 @@ def _uploads_as_generate_iac_reads(path: Path) -> Dict[str, str]:
     )
 
     return _uploads(
-        resolve_env_templates_in_contract(load_contract_with_overlay(str(path), None, LOG))
+        resolve_env_templates_in_contract(load_contract_with_overlay(str(path), env, LOG))
     )
 
 
@@ -304,6 +305,19 @@ class TestTheContractIsReadAsApplyReadsIt:
     def test_a_singular_build_key(self, tmp_path: Path, contract: Dict[str, Any]) -> None:
         contract["build"] = contract.pop("builds")[1]
         self._same(tmp_path, contract)
+
+    def test_the_env_overlay_is_applied(self, tmp_path: Path, contract: Dict[str, Any]) -> None:
+        source = _write(tmp_path, contract)
+        sql = contract["builds"][1]["properties"]["sql"].replace("COUNT(*)", "COUNT(1)")
+        overlay = {"builds": [{"id": "daily-curated", "properties": {"sql": sql}}]}
+        (tmp_path / "overlays").mkdir()
+        (tmp_path / "overlays" / "dev.yaml").write_text(yaml.safe_dump(overlay), encoding="utf-8")
+        out = tmp_path / "artifacts"
+        _fan_out(source, out, env="dev")
+        uploads = _uploads_as_generate_iac_reads(source, "dev")
+        assert "COUNT(1)" in uploads["daily-curated"]
+        for build_id, content in uploads.items():
+            assert (out / "spark" / build_id / "job.json").read_text(encoding="utf-8") == content
 
 
 class TestTheEmitKey:
@@ -367,6 +381,23 @@ class TestTheEmitKey:
         props["sql"] = props["sql"].replace("COUNT(*)", "COUNT('${x}')")
         out = tmp_path / "a"
         with pytest.raises(FanoutError, match="holds '\\$\\{'"):
+            _fan_out(_write(tmp_path, contract), out)
+        assert not (out / "spark").exists()
+
+    @pytest.mark.parametrize("msk_source", [False, True], ids=["no-msk", "msk-source"])
+    def test_the_broker_placeholder_outside_the_broker_list_is_refused(
+        self, tmp_path: Path, contract: Dict[str, Any], msk_source: bool
+    ) -> None:
+        # OpenTofu fills the placeholder only in an MSK source's bootstrapServers.
+        if msk_source:
+            spark = contract["builds"][0]["properties"]["parameters"]["spark"]
+            spark["source"] = {"mskClusterArn": MSK_ARN, "auth": "msk-iam"}
+        props = contract["builds"][1]["properties"]
+        props["sql"] = props["sql"].replace("COUNT(*)", f"COUNT('{MSK_BROKERS_PLACEHOLDER}')")
+        with pytest.raises(UnsupportedBindingError, match="holds '\\$\\{'"):
+            _uploads(contract)
+        out = tmp_path / "a"
+        with pytest.raises(FanoutError, match="daily-curated: the job config holds '\\$\\{'"):
             _fan_out(_write(tmp_path, contract), out)
         assert not (out / "spark").exists()
 

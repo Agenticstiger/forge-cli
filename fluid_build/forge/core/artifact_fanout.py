@@ -64,6 +64,7 @@ Upstream specs:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -71,7 +72,7 @@ import shutil
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 import yaml
 
@@ -797,7 +798,9 @@ def _emit_policies(contract_path: Path, out_dir: Path, logger: logging.Logger) -
 SPARK_ACCOUNT_PLACEHOLDER = "<account>"
 
 
-def _emit_spark(source: Path, out_dir: Path, logger: logging.Logger) -> List[Path]:
+def _emit_spark(
+    source: Path, out_dir: Path, logger: logging.Logger, *, overlay_env: Optional[str] = None
+) -> List[Path]:
     """Each forge Spark build's ``job.json`` at ``spark/<build id>/job.json``.
 
     The bytes are the compiler's (``spark/compiler.py::compile_job_config``,
@@ -829,7 +832,7 @@ def _emit_spark(source: Path, out_dir: Path, logger: logging.Logger) -> List[Pat
 
     try:
         contract = resolve_env_templates_in_contract(
-            load_contract_with_overlay(str(source), None, logger)
+            load_contract_with_overlay(str(source), overlay_env, logger)
         )
         if not managed_lane_enabled(contract):
             return []
@@ -862,7 +865,7 @@ def _emit_spark(source: Path, out_dir: Path, logger: logging.Logger) -> List[Pat
                 key="spark",
             )
         seen[key] = bid
-        if "${" in job.text.replace(MSK_BROKERS_PLACEHOLDER, ""):
+        if "${" in _text_tofu_checks(job.config, MSK_BROKERS_PLACEHOLDER):
             raise FanoutError(
                 f"Spark build {bid}: the job config holds '${{' from the contract, which the "
                 "forge Spark runner refuses as an unresolved interpolation, so fluid apply "
@@ -891,6 +894,24 @@ def _emit_spark(source: Path, out_dir: Path, logger: logging.Logger) -> List[Pat
                 extra={"build": bid, "values": deferred, "digest": job.digest},
             )
     return written
+
+
+def _text_tofu_checks(config: Mapping[str, Any], brokers_placeholder: str) -> str:
+    """The config text as the OpenTofu module checks it for ``${`` before the upload.
+
+    The module fills the MSK broker list only where it belongs, an MSK cluster
+    source's ``bootstrapServers`` (``aws_ingest.py::_job_content``): the
+    placeholder anywhere else is a ``${`` it refuses.
+    """
+    checked = copy.deepcopy(dict(config))
+    source = checked.get("source")
+    if (
+        isinstance(source, dict)
+        and source.get("mskClusterArn")
+        and source.get("bootstrapServers") == brokers_placeholder
+    ):
+        source["bootstrapServers"] = ""
+    return json.dumps(checked, sort_keys=True, ensure_ascii=False)
 
 
 def _clear_spark(directory: Path) -> None:
@@ -1063,7 +1084,7 @@ def run_fanout(
                 )
             elif key == "spark":
                 # The original input: the contract as generate iac and apply load it.
-                files = _emit_spark(bundle_or_contract, subdir, logger)
+                files = _emit_spark(bundle_or_contract, subdir, logger, overlay_env=overlay_env)
             else:
                 files = fn(resolved_contract, subdir, logger)
             written.extend(files)
