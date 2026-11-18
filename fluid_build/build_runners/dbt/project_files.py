@@ -269,7 +269,7 @@ def _walk(
 
     def unlisted(error: OSError) -> None:
         name = Path(error.filename) if error.filename else base
-        selection.unlisted.append(_rel(project, name))
+        selection.unlisted.append(Path(os.path.relpath(name, project)).as_posix())
 
     for dirpath, dirnames, filenames in os.walk(base, onerror=unlisted, followlinks=False):
         here = Path(dirpath)
@@ -307,35 +307,37 @@ def _descend(
     if child.is_symlink():
         selection.links.append(rel)
         return False
-    if child.name.startswith("."):
-        selection.hidden.extend(_dbt_files_under(project, child))
-        return False
     identity = _dir_id(child)
+    if identity in skip:
+        return False
     if identity in linked:
         selection.bad_paths.append(
             ("output", rel, "a directory dbt writes into through a symbolic link")
         )
         return False
-    return identity not in skip
+    if child.name.startswith("."):
+        selection.hidden.extend(_dbt_files_under(project, child, selection))
+        return False
+    return True
 
 
 def _dbt_reads(name: str) -> bool:
     return Path(name).suffix.lower() in DBT_EXTENSIONS
 
 
-def _dbt_files_under(project: Path, directory: Path) -> List[str]:
-    """The files under a hidden ``directory`` dbt would read (it walks hidden ones too)."""
+def _dbt_files_under(project: Path, directory: Path, selection: ProjectSelection) -> List[str]:
+    """The files under a hidden ``directory`` dbt would read (it walks hidden ones too);
+    a directory that cannot be listed is recorded, as in :func:`_walk`."""
+
+    def unlisted(error: OSError) -> None:
+        name = Path(error.filename) if error.filename else directory
+        selection.unlisted.append(Path(os.path.relpath(name, project)).as_posix())
+
     found = []
-    for dirpath, _dirnames, filenames in os.walk(directory, followlinks=False):
-        found.extend(_rel(project, Path(dirpath) / n) for n in sorted(filenames) if _dbt_reads(n))
+    for dirpath, _dirnames, filenames in os.walk(directory, onerror=unlisted, followlinks=False):
+        here = Path(os.path.relpath(dirpath, project)).as_posix()
+        found.extend(f"{here}/{n}" for n in sorted(filenames) if _dbt_reads(n))
     return sorted(found)
-
-
-def _rel(project: Path, path: Path) -> str:
-    try:
-        return path.relative_to(project).as_posix()
-    except ValueError:
-        return path.as_posix()
 
 
 def load_project_config(project: Path) -> Mapping[str, Any]:
@@ -507,13 +509,19 @@ def collect_bundle_projects(
                 f"builds[{index}]: two dbt builds share the id {build_id!r}; give each its own id"
             )
         repository = str(build.get("repository", "./"))
-        if "{{" in repository:
+        if "{{" in repository or "{%" in repository:
             raise DbtProjectFilesError(
                 f"build {build_id!r}: repository {repository!r} is a template, so the dbt "
                 "project it names is only known when the build runs; name the project's "
                 "directory literally"
             )
-        project = resolve_dbt_project_path(contract_path, dict(build))
+        try:
+            project = resolve_dbt_project_path(contract_path, dict(build))
+        except (OSError, ValueError) as exc:
+            raise DbtProjectFilesError(
+                f"build {build_id!r}: repository {repository[:80]!r} is not a usable path "
+                f"({type(exc).__name__}); name the dbt project's directory"
+            ) from exc
         if project is None:
             expected = (contract_path.parent / repository).resolve()
             raise DbtProjectFilesError(

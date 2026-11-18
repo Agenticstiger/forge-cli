@@ -347,9 +347,22 @@ class TestCollectBundleProjects:
         text = _collect_refusal({"builds": [{**DBT, "id": bad_id}]}, tmp_path)
         assert text.startswith("builds[0]: a dbt build needs an id")
 
-    def test_a_templated_repository(self, tmp_path: Path) -> None:
-        contract = {"builds": [{**DBT, "repository": "{{ env.DBT_DIR }}"}]}
+    @pytest.mark.parametrize("repository", ["{{ env.DBT_DIR }}", "{% if 1 %}dbt{% endif %}"])
+    def test_a_templated_repository(self, tmp_path: Path, repository: str) -> None:
+        contract = {"builds": [{**DBT, "repository": repository}]}
         assert "is a template" in _collect_refusal(contract, tmp_path)
+
+    @pytest.mark.parametrize("repository", ["a\x00b", "a" * 5000])
+    def test_a_repository_that_is_no_usable_path(self, tmp_path: Path, repository: str) -> None:
+        contract = {"builds": [{**DBT, "repository": repository}]}
+        assert "is not a usable path" in _collect_refusal(contract, tmp_path)
+
+    def test_a_hidden_output_directory_in_a_read_one_is_skipped(self, tmp_path: Path) -> None:
+        project = _project(tmp_path, "name: p\npackages-install-path: models/.pk\n")
+        _write(project, {"models/.pk/pkg/m.sql": "select 1"})
+        files = set(read_project_files(project))
+        assert "models/orders.sql" in files
+        assert not any(rel.startswith("models/.pk/") for rel in files)
 
     def test_two_builds_with_one_id(self, tmp_path: Path) -> None:
         _project(tmp_path)

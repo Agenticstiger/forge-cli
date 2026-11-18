@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dbt_packages/` (or what `target-path`, `log-path` and `packages-install-path` name) or a
   hidden file dbt does not read, and it refuses what it cannot bind: a symbolic link, a hidden
   file dbt reads (`.sql`, `.py`, `.csv`, `.md`, `.yml`, `.yaml`), a `*-paths` entry outside the
-  project, written as Jinja or naming an output directory, a directory it cannot list, a missing
-  or templated project, a file over 64 MiB and more than 128 MiB of dbt files in one bundle.
+  project or naming an output directory, a `*-paths` or output entry written as Jinja, a
+  directory it cannot list, a missing or templated project, a file over 64 MiB and more than
+  128 MiB of dbt files in one bundle.
   Each file is in the MANIFEST and under its merkle root, so the same tree bundles to the same
   bytes. `fluid plan <bundle>` records each project's files as `dbtProjects` under
   `planDigest`, and `fluid apply` compares the checkout with the bundle's copy before anything

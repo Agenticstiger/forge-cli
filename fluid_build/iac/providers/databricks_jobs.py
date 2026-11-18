@@ -523,7 +523,6 @@ def _project_files(
     from ...build_runners.dbt.project_files import (
         DbtProjectFilesError,
         load_project_config,
-        read_project_file,
         select_project_files,
     )
 
@@ -569,9 +568,18 @@ def _project_files(
         )
     # A hidden file dbt would read (selection.hidden) is left out of the upload, so
     # the job's dbt does not read it either.
+    return _upload_files(selection.files, where, refusals)
+
+
+def _upload_files(
+    selected: Mapping[str, Path], where: str, refusals: List[UnsupportedBindingError]
+) -> List[Tuple[str, bytes]]:
+    """The selected files' bytes, within the workspace upload's limits."""
+    from ...build_runners.dbt.project_files import DbtProjectFilesError, read_project_file
+
     files = []
     total = 0
-    for rel, path in selection.files.items():
+    for rel, path in selected.items():
         try:
             data = read_project_file(path, rel)
         except DbtProjectFilesError as exc:
