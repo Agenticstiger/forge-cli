@@ -321,8 +321,12 @@ def test_policy_apply_skips_without_bindings(tmp_path: Path) -> None:
     assert action.argv is None and "bindings.json" in (action.skip_reason or "")
 
 
-def test_validate_artifacts_skips_without_the_directory(tmp_path: Path) -> None:
-    action = st.build_stage(4, _opts(), st.Workspace(tmp_path))
+def test_validate_artifacts_without_the_directory_fails_unless_generation_is_off(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(st.ShipUsageError, match="stage 3 generate-artifacts was to write it"):
+        st.build_stage(4, _opts(), st.Workspace(tmp_path))
+    action = st.build_stage(4, _opts(generate_artifacts=False), st.Workspace(tmp_path))
     assert action.argv is None and "dist/artifacts/" in (action.skip_reason or "")
 
 
@@ -363,12 +367,13 @@ def test_build_id_defaults_to_the_contracts_only_build(
     )
 
 
-def test_reference_only_contract_skips_generate_artifacts(work: Path) -> None:
+def test_reference_only_contract_still_generates_artifacts(work: Path) -> None:
+    # Its transformation lives elsewhere; its ODCS, ODPS and policy artifacts do not.
     (work / "contract.fluid.yaml").write_text(
         "fluidVersion: '0.7.5'\nid: x.y\nbuilds:\n  - id: b\n    pattern: hybrid-reference\n"
     )
     action = st.build_stage(3, _opts(), st.Workspace(work))
-    assert action.argv is None and "reference-only" in (action.skip_reason or "")
+    assert action.argv is not None and action.argv[:2] == ["generate", "artifacts"]
     off = st.build_stage(3, _opts(generate_artifacts=False), st.Workspace(work))
     assert "--no-generate-artifacts" in (off.skip_reason or "")
 
@@ -602,17 +607,19 @@ def test_stage_four_without_artifacts_is_refused_when_generation_is_expected(
     assert ship_run(["--stage", "bundle,artifacts,validate-artifacts"]) == 0
 
 
-def test_stage_four_skips_with_a_reason_when_generation_is_off_or_reference_only(
+def test_stage_four_skips_with_a_reason_only_when_generation_is_off(
     work: Path, fake: FakeRun
 ) -> None:
     assert ship_run(["--stage", "validate-artifacts", "--no-generate-artifacts"]) == 0
-    (work / "contract.fluid.yaml").write_text(
-        "fluidVersion: '0.7.5'\nid: x.y\nbuilds:\n  - id: b\n    pattern: hybrid-reference\n"
-    )
-    assert ship_run(["--stage", "validate-artifacts"]) == 0
     assert fake.calls == []
     stage4 = json.loads((work / "runtime/ship-report.json").read_text())["stages"][3]
     assert stage4["status"] == "skipped" and "dist/artifacts/" in stage4["skip_reason"]
+    # A reference-only contract generates too, so stage 4 alone needs stage 3's output.
+    (work / "contract.fluid.yaml").write_text(
+        "fluidVersion: '0.7.5'\nid: x.y\nbuilds:\n  - id: b\n    pattern: hybrid-reference\n"
+    )
+    assert ship_run(["--stage", "validate-artifacts"]) == 2
+    assert fake.calls == []
 
 
 def test_the_ignored_build_id_note_appears_only_for_an_id_the_operator_gave(work: Path) -> None:
