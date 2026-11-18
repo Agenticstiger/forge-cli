@@ -43,6 +43,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retention now plans a replacement, which `fluid apply` refuses without `--allow-data-loss`.
   Adding retention later on the same column is an in-place change.
 
+- **A bundle's bytes no longer depend on where it was written, and a plan is bound to those
+  bytes.** `MANIFEST.json` recorded the source contract's path relative to `--out`, so the same
+  checkout bundled to `out.tgz` and to `x/y/out.tgz` gave two different packets with one digest.
+  The checkout paths (`source.contract`, `source.overlay`) now go to `<bundle>.provenance.json`
+  beside the bundle, which names the packet's sha256 and is ignored when it names other bytes;
+  `MANIFEST.json` keeps the path-free `env` and overlay warnings. A bundle copied without the file
+  anchors relative paths at its own directory, as before when no source was recorded, and paths
+  inside an older bundle's MANIFEST are not read. `fluid bundle` prints the packet's sha256 next
+  to the merkle digest. `fluid plan` on a bundle records `packetDigest`, under `planDigest`, and
+  `fluid apply` refuses another file with the same contract (`apply_plan_digest_packet_mismatch`)
+  or a bound plan without one (`apply_plan_digest_packet_missing`): plan again. `fluid bundle
+  --attest` now names the bundle file's sha256 as the in-toto subject, in bare hex; it named the
+  merkle root with a `sha256:` prefix, which no verifier matches against the file. The merkle
+  root, the packet digest and the checkout paths are its external parameters.
+
 - **The bundle packs the dbt project a build runs, and `fluid apply` refuses a checkout whose dbt
   files changed.** A dbt build's models were read from the checkout at apply time, so a model
   edited after `fluid plan` ran unreviewed. `fluid bundle --format tgz` now packs the dbt project
@@ -250,8 +265,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for that. The help and the output checks' documentation now say so. Nothing the profiler
   writes changes.
 
-
 ### Fixed
+
+- **A Spark stream on AWS can read its own checkpoint.** The role forge creates for a Spark build
+  could read and write `<prefix>/*` and list `<prefix>/*`, but Hadoop's `getFileStatus` first asks
+  for the directory's own key (a HEAD of `_checkpoints/<product>/<build>`) and lists it by that
+  slashless name, which S3 refused with 403, so every stream failed within minutes of starting.
+  The role may now read that one key, which holds no data, and list the directory by its exact
+  name (no sibling `<build>-x` matches) as well as under it, for every prefix it is granted, on
+  every AWS runtime.
 
 - **`fluid ship` generates artifacts for a reference-only contract.** Stage 3 skipped every
   contract with a `hybrid-reference`, `reference` or `external-reference` build, even with
