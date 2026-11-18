@@ -1351,9 +1351,6 @@ def _doc(title: str, run: str, notes: List[str]) -> str:
     )
 
 
-_DAG_DOC = _doc("Scheduled fluid build", _ONE_BUILD_RUN, [])
-
-
 def _schedule_note(schedule: DagSchedule) -> Optional[str]:
     if not schedule.datasets:
         return None
