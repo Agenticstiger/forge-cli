@@ -533,9 +533,13 @@ class _FluxStatsBackend:
         declaration = statistic._declaration
         try:
             by = parsed.columns[statistic.group_by] if statistic.group_by else None
-            keys = grammar.reading.group_keys(
-                rows, by, declared_only=statistic.kind == "levelHistogram"
-            )
+            # A group's key is published even when the group is withheld, so every key
+            # must be a level the block declares: a key read from the records would
+            # publish a record's value. flux-stats refuses an undeclared key for a level
+            # histogram only and groups the other properties by whatever the rows hold;
+            # the engine's synthetic rows hold declared levels alone, so a check loses
+            # no group it could compare.
+            keys = grammar.reading.group_keys(rows, by, declared_only=True)
             return tuple(
                 self._measured(grammar, parsed, declaration, statistic, rows, key, indices)
                 for key, indices in keys

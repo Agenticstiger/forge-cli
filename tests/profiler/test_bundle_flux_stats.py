@@ -330,14 +330,36 @@ def test_a_null_under_null_fail_is_refused_naming_no_value(tmp_path):
     assert "FLX-5005" in str(refused.value) and "null is refused" in str(refused.value)
 
 
-def test_a_value_outside_the_declared_support_is_refused(tmp_path):
+@pytest.mark.parametrize(
+    "properties",
+    [
+        pytest.param([PROPERTIES[3]], id="level-histogram"),
+        # A group key is published, so every grouped property refuses a key the block
+        # does not declare: one read from the records would publish a record's value.
+        pytest.param([PROPERTIES[1]], id="mean-by-market"),
+        pytest.param([{**PROPERTIES[2], "groupBy": "market"}], id="histogram-by-market"),
+        pytest.param([{**PROPERTIES[5], "groupBy": "market"}], id="quantile-by-market"),
+    ],
+)
+def test_a_value_outside_the_declared_support_is_refused(tmp_path, properties):
     rows = _rows()
     rows[7]["market"] = "ZZ-secret-market"
     with pytest.raises(ProfileError) as refused:
-        _profile(tmp_path, rows, [PROPERTIES[3]])
+        _profile(tmp_path, rows, properties)
     assert refused.value.event == "profile_bundle_record_refused"
     assert "outside the declared support" in str(refused.value)
     assert "ZZ-secret-market" not in str(refused.value)
+
+
+def test_a_support_member_outside_the_declaration_is_withheld_with_its_group(tmp_path):
+    # A support lists what the records hold, as the engine reads it, so an undeclared
+    # member is not refused; one record holds it, so the whole support is withheld.
+    rows = _rows()
+    rows[7]["market"] = "ZZ-secret-market"
+    result = _profile(tmp_path, rows, [PROPERTIES[4]])
+    (entry,) = _entries(result, "market")
+    assert entry["groups"] == [{"group": "", "status": "A"}]
+    assert b"ZZ-secret-market" not in result.canonical
 
 
 def test_a_value_outside_the_declared_range_is_refused(tmp_path):

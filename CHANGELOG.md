@@ -30,7 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the rest of the profile is. A withheld group of a mean or a support also withholds its
   siblings under `D` (secondary suppression), so it cannot be recovered from the column's
   published total. A grouped statistic lists every group the data forms, and each key is a
-  level the bundle declares, so a key says only that its level holds at least one record. A
+  level the bundle declares (a record whose `groupBy` value the block does not declare is
+  refused), so a key says only that its level holds at least one record. A
   correlation is not answered, because its moments need the exact record count, which the
   checks round. The report names every property left out and every statistic withheld whole
   or in part, since a run scores those censored or over the published groups only.
